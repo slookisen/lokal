@@ -108,6 +108,17 @@ export async function runOrganicOwnerGateS3cTests(opts: { log?: boolean } = {}):
   assertEq([dropOrganicSentences(""), dropOrganicSentences(undefined), dropOrganicSentences(7)], ["", "", ""], "unit-drop-7: empty / non-string → \"\"");
   assertEq(dropOrganicSentences(EN_TEXT), "The farm is in Hurdal.", "unit-drop-8: English «organic» sentence dropped");
   assertEq(dropOrganicSentences(SV_TEXT), KEPT, "unit-drop-9: Swedish «ekologiskt» sentence dropped");
+  // Review fix-up: a sentence ends only at [.!?…]+ before whitespace / end; kept sentences verbatim.
+  assertEq(dropOrganicSentences("Vi selger 1.5 kg lam til kr 49.90. Alt er økologisk."), "Vi selger 1.5 kg lam til kr 49.90.", "unit-drop-10: «1.5» and «kr 49.90» kept verbatim");
+  assertEq(dropOrganicSentences("Vi har 1.5 tonn økologisk honning. Velkommen!"), "Velkommen!", "unit-drop-11: «1.5 tonn økologisk honning» drops the whole sentence, no «Vi har 1.» fragment");
+  assertEq(dropOrganicSentences("Vi har ca. 20 kyr, f.eks. NRF. Alt er økologisk."), "Vi har ca. 20 kyr, f.eks. NRF.", "unit-drop-12: «f.eks.» mid-sentence kept verbatim");
+  assertEq(dropOrganicSentences("Skriv til post@gard.no for bestilling. Alt er økologisk."), "Skriv til post@gard.no for bestilling.", "unit-drop-13: e-mail address intact");
+  assertEq(dropOrganicSentences("Se https://www.gard.no/butikk.html?a=1 for mer. Alt er økologisk!"), "Se https://www.gard.no/butikk.html?a=1 for mer.", "unit-drop-14: URL intact");
+  assertEq(dropOrganicSentences("Ca. 20 kyr, f.eks. økologisk melk. Vi har også sau."), "Ca. 20 kyr, f.eks. Vi har også sau.", "unit-drop-15: abbreviation before a space may end a piece — claim-free pieces verbatim, the claim piece dropped");
+  assertEq(dropOrganicSentences("Hei… Alt er økologisk… Velkommen."), "Hei… Velkommen.", "unit-drop-16: «…» ends a sentence");
+  for (const t of ["Vi har 1.5 tonn økologisk honning. Velkommen!", "Ca. 20 kyr, f.eks. økologisk melk. Vi har også sau.", "Økologisk.Gården ligger i Hurdal.", "Les mer på https://okologisk.example.no/ nå."]) {
+    assertTrue(!containsOrganicClaim(dropOrganicSentences(t)), `unit-drop-17: never outputs a claim («${t}»)`, dropOrganicSentences(t));
+  }
 
   assertEq(validOwnerOrgNr(VALID_ORG), VALID_ORG_DIGITS, "unit-org-1: spaces removed, MOD11 valid");
   assertEq(validOwnerOrgNr("974760673"), "974760673", "unit-org-2: another valid number");
@@ -325,6 +336,13 @@ export async function runOrganicOwnerGateS3cTests(opts: { log?: boolean } = {}):
       html = await portal(U, { organic: "1", orgnr: "<script>alert(1)</script>" });
       assertTrue(!html.includes("<script>alert(1)</script>"), "s1-on-17: unknown orgnr value is not reflected");
 
+      // Another author holds the about lock → the save is skipped → no notice.
+      seed(U, { verified: false, about: "Gammel tekst om gården.", ownerAbout: false });
+      db.prepare("UPDATE agent_knowledge SET curated_fields = ? WHERE agent_id = ?").run(JSON.stringify({ about: { locked_at: "2026-09-01T10:00:00.000Z", by: "admin" } }), U);
+      r = await up(U, { description: OWNER_TEXT });
+      assertEq([r.body?.skipped_fields, aboutOf(U)], [[{ field: "description", reason: "locked_by_admin" }], "Gammel tekst om gården."], "s1-lock-1: description locked by admin → skipped");
+      assertTrue(!("organic_notice" in (r.body || {})), "s1-lock-2: skipped description → no organic_notice", r.body);
+
       // Verified producer: no notice, no message, portal as with flags off.
       seed(V, { verified: true, about: "Gammel tekst.", ownerAbout: false });
       r = await up(V, { description: OWNER_TEXT });
@@ -406,7 +424,17 @@ export async function runOrganicOwnerGateS3cTests(opts: { log?: boolean } = {}):
       seed(N, { verified: false, about: "Gård i Hurdal.", ownerAbout: false, orgNr: "974760673" });
       db.prepare("INSERT OR REPLACE INTO agent_owner_org_nr (agent_id, owner_org_nr, owner_org_nr_at) VALUES (?, ?, ?)").run(N, "974760673", NOW.toISOString());
 
+      // Flags off: no owner_org_nr candidate, result shape as before S3c.
+      flags(false, false);
       let res = await run();
+      assertTrue(res.accepted && !("owner_org_nr_candidates" in res), "sync-0a: flags off → no owner_org_nr_candidates field", Object.keys(res));
+      assertEq(reviews(U).filter((x) => x.match_method === "owner_org_nr").length, 0, "sync-0b: flags off → no owner_org_nr review row");
+      flags(true, false);
+      res = await run();
+      assertTrue(!("owner_org_nr_candidates" in res) && reviews(U).length === 0, "sync-0c: one flag only → as off");
+      flags(true, true);
+
+      res = await run();
       assertEq(res.accepted, true, "sync-1: register run accepted");
       const rv = reviews(U);
       assertEq(rv.map((x) => [x.org_nr, x.match_method, x.state]), [[VALID_ORG_DIGITS, "owner_org_nr", "pending"]], "sync-2: a pending review row with match_method owner_org_nr");
@@ -436,6 +464,28 @@ export async function runOrganicOwnerGateS3cTests(opts: { log?: boolean } = {}):
       await run();
       assertEq([statusOf(U).debio_status, statusOf(U).debio_verified, statusOf(U).debio_match_method], ["okologisk", 1, "review"], "sync-12: the next run keeps the approved match (method review)");
       assertEq(agentOrgNr(U), null, "sync-13: agents.org_nr never written");
+
+      // listMatchReview shows what the owner typed.
+      const listed = sync.listMatchReview(db, "all").filter((x) => x.agent.id === U);
+      assertTrue(listed.length > 0 && listed.every((x) => x.agent.owner_org_nr === VALID_ORG_DIGITS), "sync-14: listMatchReview carries agent.owner_org_nr", listed.map((x) => x.agent));
+
+      // A NEW owner number removes stale PENDING owner_org_nr rows only.
+      const ins = db.prepare(`INSERT INTO debio_match_review (agent_id, entity_key, org_nr, status, match_method, state, first_seen_at, last_seen_at)
+        VALUES (?, ?, ?, 'okologisk', ?, ?, ?, ?)`);
+      const iso = NOW.toISOString();
+      ins.run(U, "stale-pending", "911111111", "owner_org_nr", "pending", iso, iso);
+      ins.run(U, "stale-rejected", "911111112", "owner_org_nr", "rejected", iso, iso);
+      ins.run(U, "name-pending", "911111113", "name", "pending", iso, iso);
+      ins.run(U, "same-pending", "974760673", "owner_org_nr", "pending", iso, iso);
+      ins.run(OTHER, "other-pending", "911111114", "owner_org_nr", "pending", iso, iso);
+      const keys = (id: string) => (db.prepare("SELECT entity_key, state FROM debio_match_review WHERE agent_id = ? ORDER BY entity_key").all(id) as any[]).map((x) => `${x.entity_key}:${x.state}`);
+      const before = keys(U);
+      const pr = await postOrgNr(U, "974760673");
+      assertEq(pr.body?.__redirect, `/eier/${U}/portal?organic=1&orgnr=saved`, "stale-1: new number saved");
+      assertEq(keys(U), before.filter((k) => k !== "stale-pending:pending"), "stale-2: only the stale pending owner_org_nr row removed (approved / rejected / other method / same number kept)");
+      assertEq(keys(OTHER), ["other-pending:pending"], "stale-3: other agents untouched");
+      const prBad = await postOrgNr(U, "92360901");
+      assertEq([prBad.body?.__redirect, keys(U).length], [`/eier/${U}/portal?organic=1&orgnr=invalid`, before.length - 1], "stale-4: an invalid number removes nothing");
       process.env.RFB_DEBIO_REGISTER_SYNC = "";
       delete process.env.RFB_DEBIO_REGISTER_SYNC;
       db.prepare("DELETE FROM agent_debio_status").run();

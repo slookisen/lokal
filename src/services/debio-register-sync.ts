@@ -56,6 +56,7 @@ import { emailDomain, isFreeMailDomain } from "./claim-domain-rule";
 import { nameSimilarity, normaliseForMatch } from "./name-matcher";
 import { certValidOn, debioRegisterStale, readDebioRegisterState, DEBIO_REGISTER_STALE_DAYS, DEBIO_REGISTER_SYNC_ENV, debioRegisterSyncEnabled } from "./debio-approval";
 import { debioSwitchOffAgentIds } from "../owner-features/enforce";
+import { organicOwnerGateActive } from "./description-quality";
 
 // The flag lives in debio-approval (read side, no import cycle); re-exported here.
 export { DEBIO_REGISTER_SYNC_ENV, debioRegisterSyncEnabled };
@@ -95,8 +96,12 @@ export interface SyncDebioRegisterResult {
   would_reset: number;
   changes: number;
   owner_switch_off: number;
-  /** Økologi S3c: review candidates added from an owner-supplied org.nr. (agent_owner_org_nr). */
-  owner_org_nr_candidates: number;
+  /**
+   * Økologi S3c: review candidates added from an owner-supplied org.nr.
+   * (agent_owner_org_nr). Present only with RFB_ORGANIC_CLAIM_GATE and
+   * RFB_ORGANIC_OWNER_GATE on (absent = the result is as before S3c).
+   */
+  owner_org_nr_candidates?: number;
   finnoko_helper: "ok" | "failed";
   stale: boolean;
   warnings: string[];
@@ -632,7 +637,7 @@ function emptyResult(dryRun: boolean): SyncDebioRegisterResult {
     matched: { org_nr: 0, tag_org_nr: 0, finnoko_domain: 0, name_postal: 0, street_postal: 0, street_city: 0, review: 0 },
     status_counts: { okologisk: 0, karens: 0, annet: 0, ingen: 0 },
     verified: 0, review_candidates: 0, would_reset: 0, changes: 0, owner_switch_off: 0,
-    owner_org_nr_candidates: 0, finnoko_helper: "ok", stale: false, warnings: [], errors: [],
+    finnoko_helper: "ok", stale: false, warnings: [], errors: [],
   };
 }
 
@@ -753,7 +758,9 @@ export async function syncDebioRegister(db: Database.Database = getDb(), opts: S
   // the register knows → a review candidate (match_method 'owner_org_nr'),
   // never a status. A rejected agent|entity pair is not proposed again; an
   // existing candidate for the same entity is merged into this one.
-  for (const m of matchedList) {
+  const ownerOrgNrOn = organicOwnerGateActive(env);
+  if (ownerOrgNrOn) result.owner_org_nr_candidates = 0;
+  for (const m of ownerOrgNrOn ? matchedList : []) {
     if (m.entity || !m.p.ownerOrgNr) continue;
     const e = ix.byOrgNr.get(m.p.ownerOrgNr);
     if (!e || rejectedPairs.has(`${m.p.id}|${e.key}`)) continue;
@@ -761,7 +768,7 @@ export async function syncDebioRegister(db: Database.Database = getDb(), opts: S
     const reasons = ["owner_supplied_org_nr", ...(same ? same.reasons.filter((r) => r !== "owner_supplied_org_nr") : [])];
     m.review = [{ entity: e, method: "owner_org_nr", score: Math.max(0.9, same?.score ?? 0), reasons },
       ...m.review.filter((c) => c.entity.key !== e.key)];
-    result.owner_org_nr_candidates++;
+    result.owner_org_nr_candidates = (result.owner_org_nr_candidates ?? 0) + 1;
   }
 
   type Planned = { p: Producer; d: Decision; review: Candidate[] };
@@ -829,7 +836,8 @@ export async function syncDebioRegister(db: Database.Database = getDb(), opts: S
 
 export interface MatchReviewItem {
   id: number;
-  agent: { id: string; name: string | null; city: string | null; postal_code: string | null; org_nr: string | null };
+  /** owner_org_nr: økologi S3c — the org.nr. the owner typed in the portal (agent_owner_org_nr), null when none. */
+  agent: { id: string; name: string | null; city: string | null; postal_code: string | null; org_nr: string | null; owner_org_nr: string | null };
   debio: { sid: string | null; org_nr: string | null; status: string; cert_valid_to: string | null; product_groups: string[]; postal_code: string | null; city: string | null; source_url: string | null };
   match_method: string;
   score: number | null;
@@ -847,18 +855,21 @@ function jsonList(v: unknown): string[] {
 
 /** Review candidates (agent side + Debio sid / city / postal code + reason codes; no Debio names). */
 export function listMatchReview(db: Database.Database, state: "pending" | "approved" | "rejected" | "all" = "pending", limit = 200): MatchReviewItem[] {
+  const ownerOrgNr = hasOwnerOrgNrTable(db);
   const rows = db.prepare(`
-    SELECT r.*, a.name AS agent_name, a.city AS agent_city, a.org_nr AS agent_org_nr, k.postal_code AS agent_postal
+    SELECT r.*, a.name AS agent_name, a.city AS agent_city, a.org_nr AS agent_org_nr, k.postal_code AS agent_postal,
+           ${ownerOrgNr ? "o.owner_org_nr" : "NULL"} AS agent_owner_org_nr
     FROM debio_match_review r
     LEFT JOIN agents a ON a.id = r.agent_id
     LEFT JOIN agent_knowledge k ON k.agent_id = r.agent_id
+    ${ownerOrgNr ? "LEFT JOIN agent_owner_org_nr o ON o.agent_id = r.agent_id" : ""}
     WHERE (? = 'all' OR r.state = ?)
     ORDER BY r.score DESC, r.id ASC
     LIMIT ?
   `).all(state, state, limit) as any[];
   return rows.map((r) => ({
     id: r.id,
-    agent: { id: r.agent_id, name: r.agent_name ?? null, city: r.agent_city ?? null, postal_code: r.agent_postal ?? null, org_nr: r.agent_org_nr ?? null },
+    agent: { id: r.agent_id, name: r.agent_name ?? null, city: r.agent_city ?? null, postal_code: r.agent_postal ?? null, org_nr: r.agent_org_nr ?? null, owner_org_nr: r.agent_owner_org_nr ?? null },
     debio: {
       sid: r.debio_sid, org_nr: r.org_nr, status: r.status, cert_valid_to: r.cert_valid_to,
       product_groups: jsonList(r.product_groups), postal_code: r.postal_code, city: r.city,

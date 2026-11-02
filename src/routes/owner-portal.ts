@@ -2709,10 +2709,18 @@ router.post("/eier/:agentId/org-nr", express.urlencoded({ extended: false }), (r
     const db = getDb();
     const exists = db.prepare("SELECT 1 FROM agents WHERE id = ?").get(agentId);
     if (!exists) return res.redirect(303, `${base}?status=error`);
-    db.prepare(
-      `INSERT INTO agent_owner_org_nr (agent_id, owner_org_nr, owner_org_nr_at) VALUES (?, ?, ?)
-       ON CONFLICT(agent_id) DO UPDATE SET owner_org_nr = excluded.owner_org_nr, owner_org_nr_at = excluded.owner_org_nr_at`
-    ).run(agentId, orgNr, new Date().toISOString());
+    db.transaction(() => {
+      db.prepare(
+        `INSERT INTO agent_owner_org_nr (agent_id, owner_org_nr, owner_org_nr_at) VALUES (?, ?, ?)
+         ON CONFLICT(agent_id) DO UPDATE SET owner_org_nr = excluded.owner_org_nr, owner_org_nr_at = excluded.owner_org_nr_at`
+      ).run(agentId, orgNr, new Date().toISOString());
+      // A new number makes the earlier owner-supplied candidates stale: their
+      // PENDING review rows go. Approved / rejected decisions are kept.
+      db.prepare(
+        `DELETE FROM debio_match_review
+          WHERE agent_id = ? AND state = 'pending' AND match_method = 'owner_org_nr' AND (org_nr IS NULL OR org_nr <> ?)`
+      ).run(agentId, orgNr);
+    })();
     console.log(`[owner-portal] owner org.nr. candidate stored for agent ${agentId}`);
     return res.redirect(303, `${base}?organic=1&orgnr=saved`);
   } catch (err) {
