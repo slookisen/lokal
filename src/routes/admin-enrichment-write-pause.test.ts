@@ -683,6 +683,9 @@ export async function runAdminEnrichmentWritePauseTests(
         // experiences pause before every apply tick (the services it drives do
         // not check it themselves).
         "services/experience-orgnr-job.ts",
+        // Step 3m: the gårdssalg review-queue parking daily job checks the
+        // experiences pause before every apply run.
+        "services/gardssalg-website-review-queue-park-job.ts",
         // The description proposals job itself no longer imports the guard:
         // its mechanics moved VERBATIM into services/proposal-file-queue.ts
         // (tillegg 2026-10-15 «4b-forslag»), which checks the experiences

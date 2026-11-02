@@ -556,6 +556,11 @@ import {
 // for a BLANK hjemmeside; this one only judges whether an EXISTING
 // hjemmeside is verifiably the producer's own).
 import {
+  getGardssalgWebsiteReviewQueueParkJobStatus,
+  runGardssalgWebsiteReviewQueuePark,
+  runGardssalgWebsiteReviewQueueParkJob,
+} from "../services/gardssalg-website-review-queue-park-job";
+import {
   loadGardssalgWebsiteVerificationCohort,
   scanGardssalgWebsiteVerificationRows,
   planGardssalgWebsiteVerificationRemediation,
@@ -8106,54 +8111,29 @@ router.post("/admin/gardssalg-website-review-judge", requireAdmin, async (req: R
 // is one column + one route on the existing table).
 router.post("/admin/gardssalg-website-review-queue-park", requireAdmin, (req: Request, res: Response) => {
   const body = (req.body ?? {}) as { apply?: unknown };
-  const apply = body.apply === true;
+  // Thin wrapper: the selection + guarded UPDATE live in
+  // runGardssalgWebsiteReviewQueuePark, shared with the daily job (step 3m).
+  res.json(runGardssalgWebsiteReviewQueuePark(getExpDb("experiences"), { apply: body.apply === true }));
+});
 
-  const db = getExpDb("experiences");
-  const candidates = db
-    .prepare(
-      `SELECT provider_id, reason FROM gardssalg_website_review_queue
-        WHERE reason IN ('verification_failed', 'candidate_evidence_failed')
-          AND parked_since IS NULL
-        ORDER BY updated_at ASC`,
-    )
-    .all() as Array<{ provider_id: string; reason: string }>;
+// ─── Server-side daily job for the parking above (step «3m») — read-only status
+// + manual run. Same pattern as admin/gardssalg-website-verification-job-run
+// (3f). Registered ahead of every `/:id` route. ─────────────────────────────
+router.get("/admin/gardssalg-website-review-queue-park-job-status", requireAdmin, (_req: Request, res: Response) => {
+  res.json({ success: true, ...getGardssalgWebsiteReviewQueueParkJobStatus() });
+});
 
-  // A true no-op on an empty selection — never throws, dry-run or apply.
-  if (candidates.length === 0) {
-    res.json({ would_park: 0, parked: 0, results: [] });
-    return;
+// Manual run, same code path as the daily tick. Dry-run unless `apply` is
+// exactly the JSON boolean true. Write-pause is checked inside the run (apply only).
+router.post("/admin/gardssalg-website-review-queue-park-job-run", requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const body = (req.body ?? {}) as { apply?: unknown };
+    const report = await runGardssalgWebsiteReviewQueueParkJob({ apply: body.apply === true, trigger: "manual" });
+    res.json({ success: true, ...report });
+  } catch (err) {
+    console.error("[opplevelser] admin/gardssalg-website-review-queue-park-job-run failed", err);
+    res.status(500).json({ success: false, error: "Internal error" });
   }
-
-  if (!apply) {
-    res.json({
-      would_park: candidates.length,
-      parked: 0,
-      results: candidates.map((c) => ({ provider_id: c.provider_id, reason: c.reason })),
-    });
-    return;
-  }
-
-  const stampPark = db.prepare(
-    `UPDATE gardssalg_website_review_queue
-        SET parked_since = datetime('now'), updated_at = datetime('now')
-      WHERE provider_id = ? AND parked_since IS NULL`,
-  );
-  let parked = 0;
-  for (const c of candidates) {
-    const result = stampPark.run(c.provider_id);
-    if (result.changes > 0) parked++;
-    // changes === 0 means a concurrent call already parked this row between
-    // our SELECT and this UPDATE — correctly excluded from `parked`, but the
-    // row still reports in `results` below since it WAS a would-park
-    // candidate at selection time; `results` mirrors the selected set
-    // identically across dry-run and apply, `parked` is what actually landed.
-  }
-
-  res.json({
-    would_park: candidates.length,
-    parked,
-    results: candidates.map((c) => ({ provider_id: c.provider_id, reason: c.reason })),
-  });
 });
 
 // ─── gardssalg_website_review_queue triage read (2026-10-11) ─────────────────
