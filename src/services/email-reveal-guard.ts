@@ -51,10 +51,14 @@
  * reason, the counts and at most five profile ids. Never an e-mail address,
  * never an IP.
  *
- * Not in this slice: S-A2 (verified AI readers via reverse DNS — hook:
- * emailRevealLimitFor), S-A4 (trap address), S-D (contact form), the
- * «Vis e-post» reveal endpoint, the profile pages and the RFB/Opplevagent
- * surfaces.
+ * Slice 2 wires the finn-tannlege.com clinic profile pages (/klinikk/:slug,
+ * /klinikk/id/:id: mailto: line and JSON-LD `email`) and their «Vis e-post»
+ * endpoint GET /klinikk/id/:id/epost (routes/dental-seo.ts) to the same
+ * dental counter.
+ *
+ * Not yet: S-A2 (verified AI readers via reverse DNS — hook:
+ * emailRevealLimitFor), S-A4 (trap address), S-D (contact form) and the
+ * RFB/Opplevagent surfaces.
  */
 
 import crypto from "crypto";
