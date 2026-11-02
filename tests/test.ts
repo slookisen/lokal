@@ -46477,6 +46477,24 @@ runSerial(async () => {
   }
 });
 
+// Step 3f: the gårdssalg website-verification sweep as a server-side daily job.
+// Serial: in-memory DBs.
+runSerial(async () => {
+  console.log("\n── 3f: gardssalg-website-verification-job (server-side) ──");
+  try {
+    const { runGardssalgWebsiteVerificationJobTests } = require("../src/services/gardssalg-website-verification-job.test") as
+      typeof import("../src/services/gardssalg-website-verification-job.test");
+    const wj = await runGardssalgWebsiteVerificationJobTests({ log: false });
+    passed += wj.passed;
+    failed += wj.failed;
+    for (const f of wj.failures) failures.push("gardssalg-website-verification-job: " + f);
+    console.log(`  gardssalg-website-verification-job: ${wj.passed} passed, ${wj.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-website-verification-job: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-felles-
 // serverjobbramme, «Innsnevring 2026-10-28», skive 3k med punkt b: the
 // needs_review content judge without an LLM — candidate GET (batches 1..4),

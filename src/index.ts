@@ -2350,6 +2350,42 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
   setInterval(() => { void experienceOrgnrDailyTick(); }, 10 * 60_000);
 }
 
+// ─── Gårdssalg website-verification sweep — server-side daily job (step 3f) ───
+//
+// Same pattern as experience-orgnr-daily above: checks every 10 minutes, fires
+// once inside GARDSSALG_WEBSITE_VERIFICATION_JOB_WINDOW_HOUR_UTC (default 05),
+// stamp persisted in boot_job_state. OFF by default:
+// GARDSSALG_WEBSITE_VERIFICATION_JOB_ENABLED=true turns it on; flipping it back
+// is the rollback. No LLM. Manual/dry runs:
+// POST /api/opplevelser/admin/gardssalg-website-verification-job-run.
+if (process.env.ENABLE_EXPERIENCES === "1") {
+  let lastGardssalgWvRunAt: Date | null = null;
+  let gardssalgWvRunning = false;
+  const gardssalgWvDailyTick = trackJob("gardssalg-website-verification-daily", async () => {
+    if (gardssalgWvRunning) return;
+    gardssalgWvRunning = true;
+    const now = new Date();
+    try {
+      const { tickGardssalgWebsiteVerificationDaily } = await import("./services/gardssalg-website-verification-job");
+      const t = await tickGardssalgWebsiteVerificationDaily({ now, lastRunAt: lastGardssalgWvRunAt });
+      lastGardssalgWvRunAt = t.lastRunAt;
+      const r = t.report;
+      if (!r) return;
+      console.log(
+        `[gardssalg-website-verification-daily] run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} stop=${r.stop_reason ?? "-"} ` +
+          `pages=${r.totals.pages} scanned=${r.totals.scanned} written=${r.totals.provenance_written} ` +
+          `enqueued=${r.totals.enqueued} errors=${r.totals.errors} envelope=${r.envelope_recorded}`,
+      );
+    } catch (err) {
+      console.error("[gardssalg-website-verification-daily] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      gardssalgWvRunning = false;
+    }
+  });
+  setTimeout(() => { void gardssalgWvDailyTick(); }, 9 * 60_000);
+  setInterval(() => { void gardssalgWvDailyTick(); }, 10 * 60_000);
+}
+
 // ─── dev-request 2026-10-21-rfb-produktimport-fra-egen-nettside, runde 2
 // (punkt 5): the product-import dry-run measurement survives a deploy. Once,
 // 45 s after boot and only with PRODUCT_IMPORT_DRYRUN_ENABLED=1, a run the
