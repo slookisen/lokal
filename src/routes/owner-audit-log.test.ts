@@ -12,7 +12,9 @@
  *       «Ja» / «Nei», «(tom)», lists, «N varer», opening hours, long text cut
  *       by code point with «…» after the address strip, internal pipeline
  *       notes out of about/description, every e-mail form stripEmailAddresses
- *       promises (and handles / prices left alone).
+ *       promises (and handles / prices / versions left alone); the text is
+ *       returned normalised only when an address was replaced; timing: long
+ *       values (200k code points, adversarial shapes) stay far under 50 ms.
  *   (w) who: «Du» / «Rett fra Bonden» / «Automatisk fra nettsiden din» for
  *       the notes the real writers store.
  *   (a) AC1–AC3, the API on the real router and the real writers, in-memory
@@ -298,6 +300,21 @@ export async function runOwnerAuditLogTests(opts: { log?: boolean } = {}): Promi
         ["survivor: «@ kveld»", "Ring 4740000000 @ kveld", "Ring 4740000000 @ kveld"],
         ["survivor: price", "Pris 50 kr @ 2 stk", "Pris 50 kr @ 2 stk"],
         ["survivor: «at» in prose / brackets without a dotted domain", "Vi håper at du kommer (at) gården", "Vi håper at du kommer (at) gården"],
+        // review round 2
+        ["[@]", "Skriv ola[@]gard.no nå", "Skriv … nå"],
+        ["(@)", "Skriv ola (@) gard.no nå", "Skriv … nå"],
+        ["@ then a space", "Skriv ola@ gard.no nå", "Skriv … nå"],
+        ["%2540 (double-encoded)", "Skriv ola%2540gard.no nå", "Skriv … nå"],
+        ["&#064; / &#X40;", "Skriv ola&#064;gard.no eller ola&#X40;gard.no", "Skriv … eller …"],
+        ["survivor: handle with a dot", "Følg oss @gard.butikk på Instagram", "Følg oss @gard.butikk på Instagram"],
+        ["survivor: decimal price", "Pris 50 kr @ 2.50 per stk", "Pris 50 kr @ 2.50 per stk"],
+        ["survivor: clock time", "Åpent fra kl @ 10.00", "Åpent fra kl @ 10.00"],
+        ["survivor: version numbers", "Versjon 1.2.3 @ 4.5", "Versjon 1.2.3 @ 4.5"],
+        ["survivor: «40%40»", "Rabatt 40%40 kr", "Rabatt 40%40 kr"],
+        ["survivor: an encoded «@» without a host after it", "Rabattkode SOMMER%4020 og A&#64;B", "Rabattkode SOMMER%4020 og A&#64;B"],
+        ["not caught (documented): cut «ola@» before more words", "Kontakt ola@ og mer", "Kontakt ola@ og mer"],
+        ["normalised text unchanged without an address: m², ½, ﬁ, ZWJ emoji", "Areal 10 m² og ½ kg, ﬁne varer 👨\u200D👩\u200D👧", "Areal 10 m² og ½ kg, ﬁne varer 👨\u200D👩\u200D👧"],
+        ["normalised only when an address was replaced", "10 m² ola@gard.no", "10 m2 …"],
       ];
       for (const [what, input, expected] of forms) {
         assertEq(f("text", input), expected, `v9 (B1): ${what}`);
@@ -323,6 +340,27 @@ export async function runOwnerAuditLogTests(opts: { log?: boolean } = {}): Promi
       } finally {
         if (prevTz === undefined) delete process.env.TZ; else process.env.TZ = prevTz;
       }
+      // Round 2, ReDoS: long values without an address stay fast, through shortText (cap) and stripEmailAddresses alone (linear).
+      const ms = (fn: () => void) => { const t0 = process.hrtime.bigint(); fn(); return Number(process.hrtime.bigint() - t0) / 1e6; };
+      const N = 200_000;
+      const shapes: Array<[string, string]> = [
+        ["letters", "a".repeat(N)], ["«a.»", "a.".repeat(N / 2)], ["«a-»", "a-".repeat(N / 2)], ["letters + « @»", "a".repeat(N - 2) + " @"],
+        ["«a @ »", "a @ ".repeat(N / 4)], ["«a [at] »", "a [at] ".repeat(Math.floor(N / 7))], ["«a (at) a (dot) »", "a (at) a (dot) ".repeat(Math.floor(N / 15))],
+        ["quotes", '"' + "a".repeat(63) + '" '.repeat(N / 2)], ["«æø.»", "æø.".repeat(Math.floor(N / 3))], ["«@a.»", "@a.".repeat(Math.floor(N / 3))],
+        ["«x @ a.a.…1»", "x @ " + "a.".repeat(N / 2 - 4) + "1"],
+      ];
+      for (const [what, v] of shapes) {
+        f("text", v); // warm
+        const viaFormat = Math.max(ms(() => f("text", v)), ms(() => f("text", v)));
+        const viaStrip = Math.max(ms(() => lg.stripEmailAddresses(v)), ms(() => lg.stripEmailAddresses(v)));
+        assertTrue(viaFormat < 50 && viaStrip < 50, `v14 (ReDoS): 200k ${what} — the shown value and stripEmailAddresses alone each under 50 ms`, `format ${viaFormat.toFixed(1)} ms, strip ${viaStrip.toFixed(1)} ms`);
+      }
+      // The cap keeps what the owner sees: an early address is still stripped, the cut word is dropped, the value ends with «…».
+      const longText = `Skriv til ola@gard.no. ${"Lang tekst om gården vår. ".repeat(100)}`;
+      const shownLong = f("text", longText);
+      assertTrue(shownLong.startsWith("Skriv til …. Lang tekst") && shownLong.endsWith("…") && Array.from(shownLong).length <= lg.OWNER_AUDIT_TEXT_MAX && !shownLong.includes("@"),
+        "v15: a value longer than the strip cap: early address stripped, cut to 80 with «…»", shownLong);
+      assertEq([f("text", "x".repeat(5000)), lg.OWNER_AUDIT_STRIP_MAX], ["…", 1000], "v15: one word longer than the cap is dropped whole (no half token, no half address) and shows «…»");
       const row = (field_name: string, old_value: string | null, new_value: string | null) =>
         ({ id: field_name, field_name, old_value, new_value, changed_by: "system", changed_at: "2026-10-01T00:00:00Z", notes: null });
       assertEq(lg.ownerAuditFeedRows([row("is_verified", "1", "true"), row("opening_hours", "[]", null), row("about", "Tekst  her", "Tekst her"),
@@ -435,7 +473,8 @@ export async function runOwnerAuditLogTests(opts: { log?: boolean } = {}): Promi
         ["Om produsenten", "Liten familiegård.", "Ny tekst om gården. Skriv til … for bestilling.", "Du"],
         ["Om produsenten", "(tom)", lg.formatOwnerAuditValue("text", TYNNE_ABOUT), "Automatisk fra nettsiden din"],
       ], "a2 (AC1): about → «Om produsenten»; the address inside the text is gone; a long text is cut with «…»");
-      expectRow("phone", "Telefon", "+47 400 00 000", "+47 400 00 001", "Du", "a2: the owner's phone save");
+      const ownerPhone = byField("phone").find((x) => x.who === "Du") ?? {};
+      assertEq([ownerPhone.label, ownerPhone.old_value, ownerPhone.new_value], ["Telefon", "+47 400 00 000", "+47 400 00 001"], "a2: the owner's phone save");
       assertEq(byField("phone").map((x) => x.who).sort(), ["Du", "Rett fra Bonden"], "a2 (AC2): the owner-relay phone write (customer service) → «Rett fra Bonden»");
       expectRow("order_notifications_opt_in", "Ta imot bestillinger", "Nei", "Ja", "Du", "a2: order notifications → «Ta imot bestillinger: Nei → Ja»");
       expectRow("visibility.profile", "Profilen er synlig", "Ja", "Nei", "Du", "a2: the pause → «Profilen er synlig: Ja → Nei»");
@@ -483,9 +522,41 @@ export async function runOwnerAuditLogTests(opts: { log?: boolean } = {}): Promi
       const F = "al-noop";
       insAgent.run(F, `Gård ${F}`, `post@${F}.example.no`, `https://${F}.example.no`, `key-${F}`, "[]", 1, "2026-10-01T00:00:00.000Z");
       for (let i = 0; i < 3; i++) audit(F, "phone", `+47 1${i}`, `+47 2${i}`, "owner", `2026-09-0${i + 1}T09:00:00.000Z`, null);
-      for (let i = 0; i < 60; i++) audit(F, "is_verified", "1", "true", "system", `2026-10-01T00:${String(Math.floor(i / 60)).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}.000Z`, "noop");
+      // 60 newer look-alike rows sharing ONE timestamp: the second batch continues on rowid (keyset).
+      for (let i = 0; i < 60; i++) audit(F, "is_verified", "1", "true", "system", "2026-10-01T00:00:00.000Z", "noop");
       assertEq([lg.readOwnerAuditFeed(db, F, 3).length, lg.readOwnerAuditFeed(db, F, 2).map((x) => x.old_value), lg.readOwnerAuditFeed(db, F, 200).length],
         [3, ["+47 12", "+47 11"], 3], "a7b (N1): 60 newer rows that read the same do not shrink the answer — limit 3 → 3, limit 2 → the 2 newest shown rows");
+      audit(F, "phone", "+47 30", "+47 31", "owner", "ikke en tid", null);
+      assertEq(lg.readOwnerAuditFeed(db, F, 200).map((x) => [x.old_value, x.when]), [["+47 12", "03.09.2026, 11:00"], ["+47 11", "02.09.2026, 11:00"], ["+47 10", "01.09.2026, 11:00"], ["+47 30", ""]],
+        "a7c: a row with an unreadable time sorts last and is still read (keyset on -1)");
+      // The keyset continuation reaches a row with an unreadable time (COALESCE -1), not only the first batch.
+      const H = "al-badtime";
+      insAgent.run(H, `Gård ${H}`, `post@${H}.example.no`, `https://${H}.example.no`, `key-${H}`, "[]", 1, "2026-10-01T00:00:00.000Z");
+      for (let i = 0; i < 60; i++) audit(H, "is_verified", "1", "true", "system", "2026-10-01T00:00:00.000Z", "noop");
+      audit(H, "phone", "+47 40", "+47 41", "owner", "ikke en tid", null);
+      assertEq(lg.readOwnerAuditFeed(db, H, 1).map((x) => [x.new_value, x.changed_at]), [["+47 41", ""]],
+        "a7c: past a first batch of look-alike rows, the second query still reaches the row with an unreadable time");
+      // Technical rows never use up the scan window: SQL drops them before the bound applies.
+      const J = "al-technical";
+      insAgent.run(J, `Gård ${J}`, `post@${J}.example.no`, `https://${J}.example.no`, `key-${J}`, "[]", 1, "2026-10-01T00:00:00.000Z");
+      audit(J, "phone", "+47 50", "+47 51", "owner", "2026-06-01T09:00:00.000Z", null);
+      db.transaction(() => { for (let i = 0; i < 1100; i++) audit(J, "origin", "a", `b${i}`, "admin", "2026-10-01T00:00:00.000Z", "x"); })();
+      assertEq(lg.readOwnerAuditFeed(db, J, 20).map((x) => x.new_value), ["+47 51"], "a7e: 1100 newer technical rows do not fill the scan window (filtered in SQL)");
+      // Round 2: the refill is bounded. An owner re-saving with different whitespace makes rows SQL keeps and JS drops.
+      const G = "al-bounded";
+      insAgent.run(G, `Gård ${G}`, `post@${G}.example.no`, `https://${G}.example.no`, `key-${G}`, "[]", 1, "2026-10-01T00:00:00.000Z");
+      audit(G, "phone", "+47 1", "+47 2", "owner", "2026-06-01T09:00:00.000Z", null); // older than the scan window
+      const insMany = db.transaction(() => {
+        for (let i = 0; i < 3000; i++) audit(G, "about", "Vi  har egg", "Vi har  egg", "owner", "2026-07-01T09:00:00.000Z", null);
+      });
+      insMany();
+      audit(G, "phone", "+47 2", "+47 3", "owner", "2026-08-01T09:00:00.000Z", null); // newest
+      const t0 = process.hrtime.bigint();
+      const bounded = lg.readOwnerAuditFeed(db, G, 20);
+      const took = Number(process.hrtime.bigint() - t0) / 1e6;
+      assertEq([bounded.map((x) => x.new_value), lg.OWNER_AUDIT_SCAN_MAX], [["+47 3"], 1000],
+        "a7d (round 2): 3000 look-alike rows — the scan stops after OWNER_AUDIT_SCAN_MAX rows and returns the newest shown rows found (the row beyond the window is not reached)");
+      assertTrue(took < 500, "a7d: … in bounded time", `${took.toFixed(1)} ms`);
       // Auth unchanged.
       assertEq((await invoke(myAudit, makeReq({ params: { agentId: A } }))).status, 401, "a8: no session → 401");
       assertEq((await feed(A, tokB)).status, 403, "a8: another agent's session → 403");
