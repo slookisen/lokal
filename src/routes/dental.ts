@@ -78,11 +78,8 @@ import { getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
 import { toDentalClinicCard } from "../services/dental-clinic-card";
 import { hasAcuteVaktQuote } from "../services/dental-acute-claim";
 import { emailRevealGuardEnabled, revealEmailFor } from "../services/email-reveal-guard";
-import {
-  enrichmentWritePauseBlock,
-  ENRICHMENT_WRITE_PAUSE_HTTP_STATUS,
-  type EnrichmentWritePausedBody,
-} from "../services/enrichment-write-pause";
+import { ENRICHMENT_WRITE_PAUSE_HTTP_STATUS } from "../services/enrichment-write-pause";
+import { dentalEnrichmentWritePauseBlock } from "../services/dental-enrichment-write-pause";
 
 const router = Router();
 
@@ -110,9 +107,6 @@ const router = Router();
 // assessment, no clinic content; same reasoning as the /admin/run-verifier
 // exemption in the service), and the non-enrichment admin writes (POST
 // /agents, /exclusions, /agents/bulk-import).
-function dentalEnrichmentWritePauseBlock(): EnrichmentWritePausedBody | null {
-  return enrichmentWritePauseBlock(() => getDb("rfb"), "dental");
-}
 
 // ─── Admin auth ─────────────────────────────────────────────────────
 // Same shape as marketplace.ts:getAdminKey() — accept either env var

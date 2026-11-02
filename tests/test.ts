@@ -23155,6 +23155,7 @@ let _pr103RestoreModules: (() => void) | null = null;
     const stats = await geocodeTick(50, {
       fetchImpl: fetchTick as unknown as typeof fetch,
       sleep: noSleep,
+      pauseBlock: () => null, // main DB (pause table) is not set up in this block
     });
 
     assertEq(stats.processed, 2,
@@ -23201,6 +23202,7 @@ let _pr103RestoreModules: (() => void) | null = null;
     const stats1 = await geocodeTick(50, {
       fetchImpl: fetchMiss as unknown as typeof fetch,
       sleep: noSleep,
+      pauseBlock: () => null, // main DB (pause table) is not set up in this block
     });
     assertEq(stats1.no_match, 1,
       "pr103-15a: first tick reports no_match=1");
@@ -23218,6 +23220,7 @@ let _pr103RestoreModules: (() => void) | null = null;
     const stats2 = await geocodeTick(50, {
       fetchImpl: fetchCount as unknown as typeof fetch,
       sleep: noSleep,
+      pauseBlock: () => null, // main DB (pause table) is not set up in this block
     });
     assertEq(stats2.processed, 0,
       "pr103-15d: second tick processed=0 (no_match row skipped)");
@@ -23240,6 +23243,7 @@ let _pr103RestoreModules: (() => void) | null = null;
     const stats = await geocodeTick(50, {
       fetchImpl: fetchUnused as unknown as typeof fetch,
       sleep: noSleep,
+      pauseBlock: () => null, // main DB (pause table) is not set up in this block
     });
     assertEq(stats.processed, 0,
       "pr103-16a: empty-address row never processed");
@@ -51581,6 +51585,24 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("dental-enrichment-write-pause: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Same fence on the admin-dental-* apply sweeps + the geocode worker (own
+// in-memory dental/main DBs, restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dental skrivepause: admin-dental-* apply-sveip + geocode-worker ──");
+  try {
+    const { runAdminDentalWritePauseTests } = require("../src/routes/admin-dental-write-pause.test") as
+      typeof import("../src/routes/admin-dental-write-pause.test");
+    const r = await runAdminDentalWritePauseTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-dental-write-pause: " + f);
+    console.log(`  admin-dental-write-pause: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-dental-write-pause: unexpected error: " + String(err?.message || err));
   }
 });
 
