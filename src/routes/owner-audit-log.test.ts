@@ -8,8 +8,11 @@
  *       category names are seo.ts formatCat's; technical and unknown fields
  *       are not in it (fail closed).
  *   (v) values: Norwegian date and time (Europe/Oslo, summer and winter, ISO
- *       and SQLite text), «Ja» / «Nei», «(tom)», lists, «N varer», opening
- *       hours, long text cut with «…», e-mail addresses removed.
+ *       and SQLite text, zone-less text read as UTC also under TZ=Europe/Oslo),
+ *       «Ja» / «Nei», «(tom)», lists, «N varer», opening hours, long text cut
+ *       by code point with «…» after the address strip, internal pipeline
+ *       notes out of about/description, every e-mail form stripEmailAddresses
+ *       promises (and handles / prices left alone).
  *   (w) who: «Du» / «Rett fra Bonden» / «Automatisk fra nettsiden din» for
  *       the notes the real writers store.
  *   (a) AC1–AC3, the API on the real router and the real writers, in-memory
@@ -217,9 +220,14 @@ export async function runOwnerAuditLogTests(opts: { log?: boolean } = {}): Promi
         assertEq(lg.OWNER_AUDIT_FIELDS[field].label, reg.getOwnerFeature(key).label.no, `t2: ${field} uses the «Mine valg» label of ${key}`);
       }
       const seo = require("./seo") as typeof import("./seo");
-      for (const key of [...Object.keys(lg.OWNER_AUDIT_CATEGORY_NAMES), "organic", "unknown_key"]) {
+      const { PLATFORM_CATEGORIES } = require("../services/search-enrich") as typeof import("../services/search-enrich");
+      const catKeys = [...new Set([...PLATFORM_CATEGORIES, "bread", "berries", ...Object.keys(lg.OWNER_AUDIT_CATEGORY_NAMES), "organic", "unknown_key"])];
+      for (const key of catKeys) {
         assertEq(lg.formatOwnerAuditValue("categories", JSON.stringify([key])), seo.formatCat(key), `t3: category ${key} reads as on the public profile (formatCat)`);
       }
+      assertTrue(PLATFORM_CATEGORIES.every((k) => Object.prototype.hasOwnProperty.call(lg.OWNER_AUDIT_CATEGORY_NAMES, k)), "t3: every platform category has a Norwegian name in the copy");
+      assertEq(["constructor", "__proto__", "toString"].map((k) => lg.formatOwnerAuditValue("categories", JSON.stringify([k]))), ["constructor", "__proto__", "toString"],
+        "t3: an inherited object key is never looked up as a category name (no function text)");
       const technical = ["data_source", "agent_knowledge.data_source", "origin", "agent_claims", "catalog_hidden", "field_provenance",
         "field_provenance.address", "curated_fields", "owner_locks", "claimed_via", "agents.row", "magic_links", "owner_profile_pause",
         "owner_order_email_change.pending", "business_type", "retail_focus", "verification_status", "merge", "tags", "notes",
@@ -258,10 +266,68 @@ export async function runOwnerAuditLogTests(opts: { log?: boolean } = {}): Promi
       assertEq([f("text", "Skriv til Post.Gård@Gård-Eksempel.no eller ring"), f("text", "Kontakt: ola@gard"), f("text", "Følg oss @gardsbutikk")],
         ["Skriv til … eller ring", "Kontakt: …", "Følg oss @gardsbutikk"], "v9: e-mail addresses (also with æøå, also cut) become «…»; a handle is not an address");
       assertEq(f("products", JSON.stringify([{ name: "Bestill på ost@gard.no" }])), "Bestill på …", "v9: … also inside list items");
+      // B1: every form stripEmailAddresses promises (lg comment), one by one.
+      const forms: Array<[string, string, string]> = [
+        ["[at]", "Skriv ola [at] gard.no nå", "Skriv … nå"],
+        ["(at)", "Skriv ola(at)gard.no nå", "Skriv … nå"],
+        ["«at»", "Skriv ola «at» gard.no nå", "Skriv … nå"],
+        ["«[at]»", "Skriv ola«[at]»gard.no nå", "Skriv … nå"],
+        ["{at}", "Skriv ola {at} gard.no nå", "Skriv … nå"],
+        ["<at>", "Skriv ola <at> gard.no nå", "Skriv … nå"],
+        ["(at) … (dot)", "Skriv ola (at) gard (dot) no nå", "Skriv … nå"],
+        ["spaced @", "Skriv ola @ gard.no nå", "Skriv … nå"],
+        ["fullwidth ＠", "Skriv ola\uFF20gard.no nå", "Skriv … nå"],
+        ["small ﹫", "Skriv ola\uFE6Bgard.no nå", "Skriv … nå"],
+        ["&#64;", "Skriv ola&#64;gard.no nå", "Skriv … nå"],
+        ["&#x40;", "Skriv ola&#x40;gard.no nå", "Skriv … nå"],
+        ["&commat;", "Skriv ola&commat;gard.no nå", "Skriv … nå"],
+        ["%40", "Se https://x.no/?r=ola%40gard.no nå", "Se https://x.no/?r=… nå"],
+        ["cut local@ at the end", "Kontakt ola@", "Kontakt …"],
+        ["cut local@ before punctuation", "Kontakt ola@, takk", "Kontakt …, takk"],
+        ["zero-width space in the local part", "Skriv ol\u200Ba@gard.no nå", "Skriv … nå"],
+        ["zero-width space in the domain", "Skriv ola@ga\u200Brd.no nå", "Skriv … nå"],
+        ["soft hyphen in the domain", "Skriv ola@ga\u00ADrd.no nå", "Skriv … nå"],
+        ["word joiner (other \\p{Cf})", "Skriv ola@gard\u2060.no nå", "Skriv … nå"],
+        ["decomposed å in the domain", "Skriv ola@ga\u030Ard.no nå", "Skriv … nå"],
+        ["decomposed å in the local part", "Skriv pa\u030Al@gard.no nå", "Skriv … nå"],
+        ["quoted local part", 'Skriv "ola nordmann"@gard.no nå', "Skriv … nå"],
+        ["IP-literal domain", "Skriv ola@[127.0.0.1] nå", "Skriv … nå"],
+        ["apostrophe in the local part", "Skriv o'brien@gard.no nå", "Skriv … nå"],
+        ["two addresses", "a@b.no, c@d.no", "…, …"],
+        ["survivor: handle", "Følg oss @gardsbutikk", "Følg oss @gardsbutikk"],
+        ["survivor: «@ kveld»", "Ring 4740000000 @ kveld", "Ring 4740000000 @ kveld"],
+        ["survivor: price", "Pris 50 kr @ 2 stk", "Pris 50 kr @ 2 stk"],
+        ["survivor: «at» in prose / brackets without a dotted domain", "Vi håper at du kommer (at) gården", "Vi håper at du kommer (at) gården"],
+      ];
+      for (const [what, input, expected] of forms) {
+        assertEq(f("text", input), expected, `v9 (B1): ${what}`);
+      }
+      // M6: strip before cut — an address across the 80-character boundary leaves nothing behind.
+      const boundary = f("text", "x".repeat(70) + " ola.nordmann@gard.no og mer tekst her");
+      assertTrue(!boundary.includes("@") && !boundary.includes("ola") && !boundary.includes("nordmann"), "v9 (M6): the address is stripped before the cut, so no part of it survives", boundary);
+      // Truncation by code point: an emoji at the cut is never split.
+      const emoji = f("text", "a".repeat(78) + "😀😀😀");
+      assertEq([emoji, Array.from(emoji).length, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(emoji)],
+        ["a".repeat(78) + "😀…", 80, false], "v11: text is cut by code point — 80 characters, no half emoji");
+      // N5: internal pipeline notes are not shown in about/description.
+      assertEq([f("prose", "Gård i Valdres. Kontakt ikke verifisert."), f("prose", "Venter på verifisering."), lg.OWNER_AUDIT_FIELDS.about.kind, lg.OWNER_AUDIT_FIELDS.description.kind],
+        ["Gård i Valdres.", "(tom)", "prose", "prose"], "v12 (N5): about/description read without internal pipeline notes");
+      // M20: zone-less SQLite text is UTC even when the process runs in Oslo time.
+      const prevTz = process.env.TZ;
+      try {
+        process.env.TZ = "Europe/Oslo";
+        const naiveShifted = new Date("2026-07-02 10:15:00").toISOString() !== "2026-07-02T10:15:00.000Z";
+        assertEq([lg.parseOwnerAuditTime("2026-07-02 10:15:00")?.toISOString(), lg.formatOwnerAuditTime("2026-07-02 10:15:00"), lg.parseOwnerAuditTime("2026-01-02")?.toISOString()],
+          ["2026-07-02T10:15:00.000Z", "02.07.2026, 12:15", "2026-01-02T00:00:00.000Z"],
+          `v13 (M20): under TZ=Europe/Oslo zone-less text is still read as UTC (a plain Date parse ${naiveShifted ? "is" : "would be"} shifted)`);
+      } finally {
+        if (prevTz === undefined) delete process.env.TZ; else process.env.TZ = prevTz;
+      }
       const row = (field_name: string, old_value: string | null, new_value: string | null) =>
         ({ id: field_name, field_name, old_value, new_value, changed_by: "system", changed_at: "2026-10-01T00:00:00Z", notes: null });
       assertEq(lg.ownerAuditFeedRows([row("is_verified", "1", "true"), row("opening_hours", "[]", null), row("about", "Tekst  her", "Tekst her"),
-        row("categories", '["honey"]', '[ "honey" ]'), row("email", " a@b.no ", "a@b.no")]), [],
+        row("categories", '["honey"]', '[ "honey" ]'), row("email", " a@b.no ", "a@b.no"),
+        row("description", "Gård i Valdres. Kontakt ikke verifisert.", "Gård i Valdres.")]), [],
         "v10: a row whose values read the same before and after (raw text differs) is not shown — nothing changed for the owner");
       assertEq(lg.ownerAuditFeedRows([row("email", "a@b.no", "c@d.no")]).map((x) => [x.label, x.values_hidden, x.old_value, x.new_value]), [["E-post", true, null, null]],
         "v10: … while a real e-mail change is shown, without values");
@@ -280,15 +346,26 @@ export async function runOwnerAuditLogTests(opts: { log?: boolean } = {}): Promi
         w("system", "auto.updates=automatic; kilde=website_homepage https://al.example.no; run-1"),
         w("system", 'tynne_profiler_slice2: godkjent av dommer ("ok") — kilde: https://al.example.no'),
         w("system", "rfb-contact-extraction https://al.example.no/kontakt batch:b2"),
-        w("system", "address-sweep kind=x kilde=website_about https://al.example.no/om-oss"),
         w("system", "batch:b-brreg source:brreg"),
         w("system", "batch-y: internal note removed"),
         w("system", null),
         w("unknown", "auto.updates=fill_empty; kilde=website_homepage"),
       ], ["Du", "Du", "Rett fra Bonden", "Rett fra Bonden", "Rett fra Bonden", "Rett fra Bonden",
-        "Automatisk fra nettsiden din", "Automatisk fra nettsiden din", "Automatisk fra nettsiden din", "Automatisk fra nettsiden din",
+        "Automatisk fra nettsiden din", "Automatisk fra nettsiden din", "Automatisk fra nettsiden din",
         "Rett fra Bonden", "Rett fra Bonden", "Rett fra Bonden", "Rett fra Bonden"],
       "w1: owner → «Du»; admin / CS / support → «Rett fra Bonden»; a system write with a website source → «Automatisk fra nettsiden din»; other system → «Rett fra Bonden»");
+      // N2: only the writers' own note formats count; a free-text reason that mentions a website does not.
+      assertEq([
+        w("system", "batch-y: Daniel ba om retting — kilde: https://gard.example.no"),
+        w("system", "batch-x: fjernet tekst, kilde=website_homepage https://gard.example.no"),
+        w("system", "address-sweep kind=x kilde=website_about https://gard.example.no/om-oss"),
+        w("system", "batch-z: rfb-contact-extraction https://gard.example.no batch:b1"),
+        w("system", " auto.updates=fill_empty; kilde=website_homepage https://x.no; run"),
+        w("system", "AUTO.UPDATES=fill_empty; kilde=website_homepage https://x.no; run"),
+        w("system", "auto.updates=fill_empty"),
+        w("system", 'tynne_profiler_slice2: godkjent av dommer ("ok") — kilde: https://x.no og mer'),
+        w("system", "rfb-contact-extraction https://x.no/kontakt"),
+      ], Array(9).fill("Rett fra Bonden"), "w2 (N2): a reason that only mentions «kilde: https://…» / «kilde=website_…», or a writer prefix not at the start or not in its own format, stays «Rett fra Bonden»");
     }
 
     // ── (a) the API on the real writers ──────────────────────────────────
@@ -402,6 +479,13 @@ export async function runOwnerAuditLogTests(opts: { log?: boolean } = {}): Promi
         [20, "is_verified", false], "a7: limit 20 → the 20 newest shown rows (23 newer technical rows do not count)");
       assertEq([(await feed(A, tokA, "2")).body?.count, (await feed(A, tokA, "-1")).body?.count, (await feed(A, tokA, "abc")).body?.count, (await feed(A, tokA, "999")).body?.count],
         [2, 1, 20, 22], "a7: limit 2 → 2; a negative limit → 1 (never «no limit»); junk → 20; above 200 → capped");
+      // N1: rows that read the same are dropped after SQL, yet the owner still gets `limit` rows.
+      const F = "al-noop";
+      insAgent.run(F, `Gård ${F}`, `post@${F}.example.no`, `https://${F}.example.no`, `key-${F}`, "[]", 1, "2026-10-01T00:00:00.000Z");
+      for (let i = 0; i < 3; i++) audit(F, "phone", `+47 1${i}`, `+47 2${i}`, "owner", `2026-09-0${i + 1}T09:00:00.000Z`, null);
+      for (let i = 0; i < 60; i++) audit(F, "is_verified", "1", "true", "system", `2026-10-01T00:${String(Math.floor(i / 60)).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}.000Z`, "noop");
+      assertEq([lg.readOwnerAuditFeed(db, F, 3).length, lg.readOwnerAuditFeed(db, F, 2).map((x) => x.old_value), lg.readOwnerAuditFeed(db, F, 200).length],
+        [3, ["+47 12", "+47 11"], 3], "a7b (N1): 60 newer rows that read the same do not shrink the answer — limit 3 → 3, limit 2 → the 2 newest shown rows");
       // Auth unchanged.
       assertEq((await invoke(myAudit, makeReq({ params: { agentId: A } }))).status, 401, "a8: no session → 401");
       assertEq((await feed(A, tokB)).status, 403, "a8: another agent's session → 403");
@@ -475,10 +559,10 @@ export async function runOwnerAuditLogTests(opts: { log?: boolean } = {}): Promi
     }
 
     // ── (p) the portal script on the real API answer ─────────────────────
-    async function runScript(agentId: string, token: string): Promise<string> {
+    async function runScript(agentId: string, token: string, override?: unknown): Promise<string> {
       const page = await invoke(portalPage, makeReq({ params: { agentId }, token }));
       const code = inlineJsScripts(String(page.body || "")).find((c) => c.includes("my-audit")) || "";
-      const answer = (await feed(agentId, token)).body;
+      const answer = override ?? (await feed(agentId, token)).body;
       const ul: any = { innerHTML: "" };
       const form: any = { addEventListener() { /* save not exercised here */ }, querySelector() { return {}; }, submit() { /* idem */ } };
       const document = { getElementById(x: string) { return x === "ep-audit" ? ul : x === "ep-profile-form" ? form : null; } };
@@ -498,6 +582,12 @@ export async function runOwnerAuditLogTests(opts: { log?: boolean } = {}): Promi
       }
       assertTrue(!html.includes("@") && !html.includes("endret av") && !html.includes("Support") && !html.includes("(tomt)") && !html.includes("null") && !html.includes("undefined") && !/<strong>[a-z_.]+<\/strong>/.test(html),
         "p2: no address, no old wording, no raw field name, no null/undefined", html);
+      // M22: the script escapes every field it renders, the label included.
+      const evil = { success: true, audits: [{ id: "x", field_name: "phone", label: '<img src=x onerror="a">&', old_value: "<b>", new_value: "&", values_hidden: false, who: "<i>", changed_at: "2026-10-01T00:00:00.000Z", when: "<u>" },
+        { id: "y", field_name: "email", label: "<script>E</script>", old_value: null, new_value: null, values_hidden: true, who: "Du", changed_at: "2026-10-01T00:00:00.000Z", when: "01.10.2026, 02:00" }] };
+      const esc = await runScript(A, tokA, evil);
+      assertTrue(esc.includes("<strong>&lt;img src=x onerror=&quot;a&quot;&gt;&amp;</strong>: &lt;b&gt; → &amp;") && esc.includes("&lt;u&gt; · &lt;i&gt;") && esc.includes("<strong>&lt;script&gt;E&lt;/script&gt;</strong> endret")
+        && !/<img|<script|<b>|<i>|<u>/.test(esc), "p3 (M22): label, values, when and who are HTML-escaped by the portal script", esc);
     }
 
     // ── (e) AC4: the empty state ─────────────────────────────────────────
