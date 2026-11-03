@@ -61,9 +61,16 @@
  * and its «Vis e-post» endpoint GET /produsent/:slug/epost (routes/seo.ts)
  * to the rfb counter, which the RFB REST/A2A/MCP answers of S-A5 will share.
  *
+ * Slice 4 wires the opplevagent.no gårdssalg producer profile page
+ * /kategori/gardssalg/produsent/:providerSlug («E-post» fact row mailto: and
+ * JSON-LD `email`, on top of the AC4 under-review gate) and its «Vis e-post»
+ * endpoint GET /kategori/gardssalg/produsent/:providerSlug/epost
+ * (routes/experiences-seo.ts) to the experiences counter. The Opplevagent
+ * MCP/REST/A2A answers give no producer e-mail (S-A0), so nothing else there.
+ *
  * Not yet: S-A2 (verified AI readers via reverse DNS — hook:
- * emailRevealLimitFor), S-A4 (trap address), S-D (contact form), the RFB
- * REST/A2A/MCP answers (S-A5) and the Opplevagent surfaces.
+ * emailRevealLimitFor), S-A4 (trap address), S-D (contact form) and the RFB
+ * REST/A2A/MCP answers (S-A5).
  */
 
 import crypto from "crypto";
