@@ -501,6 +501,9 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   // (behind STOCK_CHECK_EMAIL_ENABLED) and the /eier portal banner (behind
   // OWNER_ORDERABILITY_PORTAL_ENABLED). B1a: all three surfaces are also only
   // for a subject in OWNER_FEATURES_ALLOWED_SUBJECTS until Daniel's rollout GO.
+  // B2b-3: «Mine valg» (page.ts) shows STOCK_CHECK_SOFT_EXPIRY_DESCRIPTION
+  // instead of this description for a producer with the soft-expiry rule
+  // active (services/stock-soft-expiry.ts stockSoftExpiryActiveFor).
   entry({
     key: "products.stock_check", group: "products", type: "switch",
     label: t("Minn meg på å bekrefte lagerstatus", "Remind me to confirm stock"),
@@ -1416,6 +1419,18 @@ export function ownerFeatureStatus(e: OwnerFeatureEntry, env: NodeJS.ProcessEnv 
  * description (whileFlagOff), so a flag-off answer is the one from before.
  * Otherwise the entry itself.
  */
+/**
+ * B2b-3 (dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier):
+ * the `products.stock_check` description for a producer with the soft-expiry
+ * rule active (flag AND allowlist). Chosen per producer at render time in
+ * «Mine valg» (page.ts); the registry entry keeps the description for the
+ * rule off.
+ */
+export const STOCK_CHECK_SOFT_EXPIRY_DESCRIPTION: LocalizedText = t(
+  "Vi sier fra før lagerstatusen på en vare ikke lenger er bekreftet nylig. Da ser kundene datoen for siste bekreftelse. Du får høyst én e-post hver 14. dag.",
+  "We let you know before the stock status of an item is no longer recently confirmed; customers then see the date it was last confirmed. You get at most one e-mail every 14 days.",
+);
+
 export function ownerFeatureEntryForEnv(e: OwnerFeatureEntry, env: NodeJS.ProcessEnv = process.env): OwnerFeatureEntry {
   const flag = e.whileFlagOffFlag ?? e.liveFlag;
   return flag && e.whileFlagOff && !envFlagOn(env, flag) ? { ...e, ...e.whileFlagOff } : e;
