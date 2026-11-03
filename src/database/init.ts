@@ -587,7 +587,9 @@ function initSchema(db: Database.Database): void {
       failed_attempts INTEGER DEFAULT 0,          -- Wrong codes entered; the 5th expires the claim
       review_reason TEXT,                         -- Admin queue: 'no_known_email' | 'listed_email_wrong' | 'has_owner' | 'shared_address'
       claimant_email_typed TEXT,                  -- Audit: the address the claimant typed, kept when claimant_email becomes the owner's address
-      recommendation TEXT                         -- Claim domain rule (2026-10-27): 'domain_match_independent' | 'domain_code_sent' | 'free_mail_needs_extra' | 'has_owner' | 'needs_review' | 'shared_address' (2026-10-29: the code's address is the known e-mail of >1 RFB profile)
+      recommendation TEXT,                        -- Claim domain rule (2026-10-27): 'domain_match_independent' | 'domain_code_sent' | 'free_mail_needs_extra' | 'has_owner' | 'needs_review' | 'shared_address' (2026-10-29: the code's address is the known e-mail of >1 RFB profile)
+      claim_assessment TEXT,                      -- Owner-claim auto-assessment (2026-10-30, slice A, record-only): JSON from claim-assessment.ts; NULL = not assessed
+      claim_assessment_at TEXT                    -- When claim_assessment was written (ISO-8601)
     );
 
     -- ════════════════════════════════════════════════════════════
@@ -1540,6 +1542,18 @@ function initSchema(db: Database.Database): void {
   // platform cap counts resends). Additive and idempotent; existing rows
   // start at 0/NULL. A rollback leaves them in place.
   for (const col of ["resend_count INTEGER DEFAULT 0", "resent_at TEXT"]) {
+    try {
+      db.exec(`ALTER TABLE agent_claims ADD COLUMN ${col}`);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
+  // dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk,
+  // slice A (record-only): the stored owner-claim auto-assessment (JSON,
+  // services/claim-assessment.ts) and when it was written. Written only with
+  // CLAIM_AUTO_ASSESSMENT_ENABLED === "true". Additive and idempotent;
+  // existing rows keep NULL. A rollback leaves them in place.
+  for (const col of ["claim_assessment TEXT", "claim_assessment_at TEXT"]) {
     try {
       db.exec(`ALTER TABLE agent_claims ADD COLUMN ${col}`);
     } catch {

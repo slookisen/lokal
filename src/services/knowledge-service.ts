@@ -10,8 +10,14 @@ import { normalizeEmail } from "./blocklist-service";
 import { customerRuleSql } from "./customer-rule";
 import {
   type ClaimRecommendation, type DomainHttpsCheck, claimDomainRuleEnabled, emailDomain, emailDomainMatchesWebsite,
-  getDomainHttpsCheck, isFreeMailDomain, isHostedPlatformHost, isRootWebsite, websiteHost,
+  getDomainHttpsCheck, isFreeMailDomain, isHostedPlatformHost, isRootWebsite, registrableDomain, websiteHost,
 } from "./claim-domain-rule";
+import {
+  type ClaimAssessment, type ClaimAssessmentDeps, type ClaimAssessmentInput, CLAIM_ASSESSMENT_TOTAL_TIMEOUT_MS,
+  assessClaim, claimAssessmentEnabled, getClaimAssessmentDeps, normalizeOrgNr, normalizePhoneDigits, recordClaimIp,
+  trackClaimAssessment,
+} from "./claim-assessment";
+import { isInferenceSource } from "./cross-source-validator";
 
 // ─── PR-95 (2026-06-01): Debio cert relabelling ──────────────────────
 //
@@ -702,6 +708,28 @@ export interface ClaimReviewEntry {
   has_owner: number;
   source: string | null;
   created_at: string;
+  /** The stored owner-claim auto-assessment (claim-assessment.ts, record-only),
+   *  or null when none was made (flag off, or a row from before it). */
+  assessment: ClaimAssessment | null;
+}
+
+/** A log-safe kind for an assessment error (code or name, never the message). */
+function claimAssessmentErrorKind(err: unknown): string {
+  if (err instanceof Error && err.message === "assessment timeout") return "timeout";
+  const code = (err as { code?: unknown } | null)?.code;
+  if (typeof code === "string" && /^[A-Z0-9_]{1,40}$/.test(code)) return code;
+  return err instanceof Error && /^[A-Za-z]{1,40}$/.test(err.name) ? err.name : "error";
+}
+
+/** The stored claim_assessment JSON, parsed; null when absent or unreadable. */
+export function parseStoredClaimAssessment(raw: string | null | undefined): ClaimAssessment | null {
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw);
+    return v && typeof v === "object" && !Array.isArray(v) ? (v as ClaimAssessment) : null;
+  } catch {
+    return null;
+  }
 }
 
 /** One plausible address and nothing else (a listed field can hold two
@@ -1293,7 +1321,19 @@ class KnowledgeService {
   async requestClaimWithDomainRule(
     agentId: string,
     opts: Parameters<KnowledgeService["requestClaim"]>[1],
-    deps: { env?: NodeJS.ProcessEnv; httpsCheck?: DomainHttpsCheck } = {},
+    deps: { env?: NodeJS.ProcessEnv; httpsCheck?: DomainHttpsCheck; clientIp?: string; assessmentDeps?: Partial<ClaimAssessmentDeps> } = {},
+  ): Promise<ClaimRequestResult> {
+    const result = await this.requestClaimByDomainRule(agentId, opts, deps);
+    // Owner-claim auto-assessment, slice A (record-only): started only after
+    // the claim row is written, never awaited here, never able to throw here.
+    this.startClaimAssessment(agentId, opts, result, deps);
+    return result;
+  }
+
+  private async requestClaimByDomainRule(
+    agentId: string,
+    opts: Parameters<KnowledgeService["requestClaim"]>[1],
+    deps: { env?: NodeJS.ProcessEnv; httpsCheck?: DomainHttpsCheck },
   ): Promise<ClaimRequestResult> {
     if (!claimDomainRuleEnabled(deps.env ?? process.env)) return this.requestClaim(agentId, opts);
     let httpsAnswered = false;
@@ -1312,6 +1352,179 @@ class KnowledgeService {
       }
     }
     return this.requestClaim(agentId, { ...opts, domainRule: { httpsAnswered } });
+  }
+
+  // ─── Owner-claim auto-assessment, slice A (record-only) ──────────────────
+  // dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk §A.
+  // With CLAIM_AUTO_ASSESSMENT_ENABLED === "true" (default off), every NEW
+  // claim row (a code sent, or a new queue entry) gets claim_assessment +
+  // claim_assessment_at. Fire-and-forget on purpose: the network checks
+  // (website, Brreg, RDAP, DNS) take up to a few seconds, and slice A must
+  // not change the response, its timing, the status code, any e-mail or any
+  // ownership — so the submission never waits for them and never sees their
+  // errors. Failures are logged (console.warn, no PII) and leave the column NULL.
+
+  private startClaimAssessment(
+    agentId: string,
+    opts: Parameters<KnowledgeService["requestClaim"]>[1],
+    result: ClaimRequestResult,
+    deps: { env?: NodeJS.ProcessEnv; clientIp?: string; assessmentDeps?: Partial<ClaimAssessmentDeps> },
+  ): void {
+    try {
+      if (!claimAssessmentEnabled(deps.env ?? process.env)) return;
+      const claimId = result.kind === "code_sent" ? result.claimId
+        : result.kind === "queued" && result.created ? result.claimId : null;
+      if (!claimId) return;
+      const sameIp = recordClaimIp(deps.clientIp);
+      const run = (async (): Promise<void> => {
+        // Off the request path: not even the DB reads run before the response.
+        await new Promise<void>((r) => setImmediate(r));
+        try {
+          const input = this.gatherClaimAssessmentInput(claimId, agentId, opts, sameIp);
+          if (!input) return;
+          const assessDeps = { ...getClaimAssessmentDeps(), ...(deps.assessmentDeps ?? {}) };
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const assessment = await Promise.race([
+            assessClaim(input, assessDeps),
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(() => reject(new Error("assessment timeout")), CLAIM_ASSESSMENT_TOTAL_TIMEOUT_MS);
+              (timer as any).unref?.();
+            }),
+          ]).finally(() => { if (timer) clearTimeout(timer); });
+          getDb().prepare("UPDATE agent_claims SET claim_assessment = ?, claim_assessment_at = ? WHERE id = ?")
+            .run(JSON.stringify(assessment), assessDeps.now().toISOString(), claimId);
+        } catch (err) {
+          // Only the claim id and an error kind: an error message may carry the claimant's domain or address.
+          console.warn(`[claim-assessment] claim ${claimId} not assessed: ${claimAssessmentErrorKind(err)}`);
+        }
+      })();
+      trackClaimAssessment(run);
+    } catch (err) {
+      console.warn(`[claim-assessment] not started: ${claimAssessmentErrorKind(err)}`);
+    }
+  }
+
+  /** The DB facts assessClaim needs for a claim row, or null when the row is gone. */
+  gatherClaimAssessmentInput(
+    claimId: string,
+    agentId: string,
+    opts: { claimantName: string; claimantEmail: string; claimantPhone?: string },
+    sameIp: number | null = null,
+  ): ClaimAssessmentInput | null {
+    const db = getDb();
+    const claim = db.prepare("SELECT id, recommendation, review_reason FROM agent_claims WHERE id = ? AND agent_id = ?")
+      .get(claimId, agentId) as { id: string; recommendation: string | null; review_reason: string | null } | undefined;
+    if (!claim) return null;
+    const row = db.prepare(
+      `SELECT a.origin, a.org_nr, a.tags, k.phone, k.address, k.postal_code, k.website, k.field_provenance
+         FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id WHERE a.id = ?`
+    ).get(agentId) as {
+      origin: string | null; org_nr: string | null; tags: string | null; phone: string | null; address: string | null;
+      postal_code: string | null; website: string | null; field_provenance: string | null;
+    } | undefined;
+    if (!row) return null;
+    const email = normalizeEmail(opts.claimantEmail);
+    const domain = emailDomain(email);
+    const reg = domain ? registrableDomain(domain.replace(/^www\./, "")) : null;
+
+    let orgNr = normalizeOrgNr(row.org_nr);
+    if (!orgNr && row.tags) {
+      const m = String(row.tags).match(/org_nr:(\d{9})(?!\d)/);
+      if (m) orgNr = m[1]!;
+    }
+    const phoneDigits = normalizePhoneDigits(row.phone);
+    const addr = typeof row.address === "string" && /\d/.test(row.address) && row.address.trim().length >= 6
+      ? row.address.trim().toLowerCase().replace(/\s+/g, " ") : null;
+    const host = websiteHost(row.website);
+
+    // Siblings: other RFB profiles with the same org.nr, phone or street address + postal code.
+    const siblingIds = new Set<string>();
+    const rfb = "COALESCE(a.vertical_id, 'rfb') = 'rfb'";
+    if (orgNr) {
+      for (const r of db.prepare(`SELECT a.id FROM agents a WHERE a.id <> ? AND ${rfb} AND (a.org_nr = ? OR a.tags LIKE ?) LIMIT 20`)
+        .all(agentId, orgNr, `%org_nr:${orgNr}%`) as Array<{ id: string }>) siblingIds.add(r.id);
+    }
+    if (phoneDigits) {
+      for (const r of db.prepare(
+        `SELECT k.agent_id AS id, k.phone FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
+          WHERE k.agent_id <> ? AND ${rfb}
+            AND REPLACE(REPLACE(REPLACE(REPLACE(k.phone, ' ', ''), '-', ''), '.', ''), char(160), '') LIKE ? LIMIT 50`
+      ).all(agentId, `%${phoneDigits}`) as Array<{ id: string; phone: string }>) {
+        if (normalizePhoneDigits(r.phone) === phoneDigits) siblingIds.add(r.id);
+      }
+    }
+    if (addr) {
+      for (const r of db.prepare(
+        `SELECT k.agent_id AS id FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
+          WHERE k.agent_id <> ? AND ${rfb} AND LOWER(TRIM(k.address)) = ? AND COALESCE(k.postal_code, '') = ? LIMIT 20`
+      ).all(agentId, addr, String(row.postal_code ?? "")) as Array<{ id: string }>) siblingIds.add(r.id);
+    }
+    const siblings = [...siblingIds].map((id) => ({ independentWebsiteHost: this.independentWebsiteHost(id) }));
+
+    // Another farm (not this one, not a sibling) with a website or e-mail on the claimant's domain.
+    let otherFarmHasDomain = false;
+    if (reg && !isFreeMailDomain(reg)) {
+      // No LIMIT before the exact (JS) filter: the LIKE prefilter only narrows
+      // to rows naming the domain, and the scan stops at the first real match.
+      const rows = db.prepare(
+        `SELECT k.agent_id AS id, k.website, k.email FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
+          WHERE k.agent_id <> ? AND ${rfb} AND (LOWER(k.website) LIKE ? OR LOWER(k.email) LIKE ?)`
+      ).iterate(agentId, `%${reg}%`, `%${reg}%`) as IterableIterator<{ id: string; website: string | null; email: string | null }>;
+      const regOf = (h: string | null): string | null => (h ? registrableDomain(h.replace(/^www\./, "")) : null);
+      for (const r of rows) {
+        if (!siblingIds.has(r.id) && (regOf(websiteHost(r.website)) === reg || regOf(emailDomain(normalizeEmail(r.email))) === reg)) {
+          otherFarmHasDomain = true;
+          break;
+        }
+      }
+    }
+
+    // Enrichment provenance with a source_url (never the owner's or a self-registration's word, never inference).
+    const enrichment: ClaimAssessmentInput["enrichment"] = { emails: [], phones: [] };
+    let prov: Record<string, unknown> = {};
+    try {
+      const v = row.field_provenance ? JSON.parse(row.field_provenance) : {};
+      if (v && typeof v === "object" && !Array.isArray(v)) prov = v as Record<string, unknown>;
+    } catch { /* unreadable provenance → no enrichment evidence */ }
+    const records = (raw: unknown): Array<{ value: string; sourceUrl: string }> => {
+      const arr = Array.isArray(raw) ? raw : raw && typeof raw === "object" ? [raw] : [];
+      return arr.filter((r: any) => r && typeof r.value === "string" && typeof r.source_url === "string" && r.source_url.trim() &&
+        typeof r.source_type === "string" && !isInferenceSource(r.source_type) &&
+        !/^(owner|self|registration|admin|claim|customer)/i.test(r.source_type.trim()))
+        .map((r: any) => ({ value: String(r.value), sourceUrl: String(r.source_url) }));
+    };
+    enrichment.emails = records(prov.email);
+    enrichment.phones = records(prov.phone);
+
+    const count = (where: string, ...params: unknown[]): number => (db.prepare(
+      `SELECT COUNT(*) AS n FROM agent_claims WHERE ${where} AND datetime(created_at) >= datetime('now', '-24 hours')`
+    ).get(...params) as { n: number }).n;
+    const sameEmail = count("LOWER(TRIM(claimant_email)) = ?", email);
+    const sameDomain = reg ? count("(LOWER(TRIM(claimant_email)) LIKE ? OR LOWER(TRIM(claimant_email)) LIKE ?)", `%@${reg}`, `%.${reg}`) : 0;
+
+    const sharedAddress = claim.recommendation === "shared_address" || claim.review_reason === "shared_address" ||
+      this.isSharedKnownEmail(email);
+
+    return {
+      claimantName: opts.claimantName,
+      claimantEmail: email,
+      claimantPhone: opts.claimantPhone ?? null,
+      profile: {
+        orgNr,
+        orgNrIndependent: row.origin !== "self_registered",
+        phone: row.phone,
+        address: row.address,
+        postalCode: row.postal_code,
+        websiteHost: host && !isHostedPlatformHost(host) ? host : null,
+        independentWebsiteHost: this.independentWebsiteHost(agentId),
+        hasOwner: this.agentHasOwner(agentId),
+      },
+      siblings,
+      sharedAddress,
+      otherFarmHasDomain,
+      enrichment,
+      recentClaims: { sameEmail, sameDomain, sameIp },
+    };
   }
 
   /** Would a code send on this profile pass rule 4 and the platform cap now?
@@ -1781,15 +1994,18 @@ class KnowledgeService {
       SELECT c.id AS claim_id, c.agent_id, a.name AS agent_name, k.email AS listed_email,
              c.claimant_name, c.claimant_email, c.claimant_phone, c.review_reason AS reason,
              c.recommendation, c.code_sent_to AS proven_email, ${customerRuleSql("a")} AS has_owner,
-             c.source, c.created_at
+             c.source, c.created_at, c.claim_assessment
         FROM agent_claims c
         JOIN agents a ON a.id = c.agent_id
         LEFT JOIN agent_knowledge k ON k.agent_id = c.agent_id
        WHERE c.status = 'pending_review'
        ORDER BY c.created_at ASC, c.id ASC
        LIMIT ?
-    `).all(limit) as ClaimReviewEntry[];
-    return { total, entries };
+    `).all(limit) as Array<Omit<ClaimReviewEntry, "assessment"> & { claim_assessment: string | null }>;
+    return {
+      total,
+      entries: entries.map(({ claim_assessment, ...e }) => ({ ...e, assessment: parseStoredClaimAssessment(claim_assessment) })),
+    };
   }
 
   /**
