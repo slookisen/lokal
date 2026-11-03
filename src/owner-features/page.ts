@@ -29,6 +29,7 @@ import { escapeHtml } from "../routes/owner-portal";
 import {
   OWNER_FEATURE_GROUPS,
   OWNER_FEATURE_REGISTRY,
+  STOCK_CHECK_SOFT_EXPIRY_DESCRIPTION,
   findOwnerFeature,
   ownerFeatureEntryForEnv,
   ownerFeatureStatus,
@@ -59,6 +60,7 @@ import {
 } from "./anchors";
 import { OPPLEVAGENT_PRICE_MESSAGE } from "./price-message";
 import { OWNER_TOKEN_CSS } from "../owner-ui/tokens";
+import { stockSoftExpiryActiveFor } from "../services/stock-soft-expiry";
 
 /** Entries that need this key on are shown only when it is on (spec «Grensesnitt»). */
 export const OWNER_PAGE_REVEAL_KEY = "orders.enabled";
@@ -596,6 +598,16 @@ function ordersExplainHtml(m: OwnerPageModel): string {
           </details>`;
 }
 
+/**
+ * A row's description for this owner. B2b-3: `products.stock_check` follows
+ * the soft-expiry rule when it is active for the producer; every other row
+ * (and the rule off) → the entry's description as before.
+ */
+export function ownerRowDescription(agentId: string, e: OwnerFeatureEntry, env: NodeJS.ProcessEnv = process.env): LocalizedText {
+  if (e.key === "products.stock_check" && stockSoftExpiryActiveFor(agentId, env)) return STOCK_CHECK_SOFT_EXPIRY_DESCRIPTION;
+  return ownerFeatureEntryForEnv(e, env).description;
+}
+
 function rowHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeature, swap: string): string {
   const badges =
     (isNew(e, ctx.now) ? ` <span class="mv-badge mv-badge-new">Nytt</span>` : "") +
@@ -617,7 +629,7 @@ function rowHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeature, 
     if (confirm) ctx.confirmPlaced = true;
   }
   return `<li class="mv-item" id="${esc(ownerRowAnchor(e.key))}" data-key="${esc(e.key)}">
-          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong>${badges}<p class="mv-desc">${esc(ownerFeatureEntryForEnv(e).description.no)}</p>${reason}${explain}${rowExtraHtml(ctx, e, r)}</div>
+          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong>${badges}<p class="mv-desc">${esc(ownerRowDescription(ctx.m.agent.id, e).no)}</p>${reason}${explain}${rowExtraHtml(ctx, e, r)}</div>
           <div class="mv-item-ctl">${controlHtml(ctx, e, r, swap)}</div>${noticeAtHtml(ctx, ownerRowAnchor(e.key))}${confirm}
         </li>`;
 }

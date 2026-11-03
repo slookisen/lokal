@@ -19,7 +19,8 @@ import { OUTREACH_RETURN_COOKIE, outreachReturnPathFor } from "../services/produ
 import { getProducerPaymentStatus } from "../services/payment-service";
 import { isOverridableCsLock, csLockNote } from "../services/owner-cs-lock";
 import { customerRuleSql } from "../services/customer-rule";
-import { getSupplyGraphStaleDays } from "../services/supply-graph";
+import { getSupplyGraphHardStaleDays, getSupplyGraphStaleDays } from "../services/supply-graph";
+import { stockSoftExpiryActiveFor } from "../services/stock-soft-expiry";
 import { writeOrderNotificationsOptInWithAudit } from "../services/order-opt-in";
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
 import {
@@ -2762,15 +2763,28 @@ function formatOwnerPrice(price: number | null, unit: string | null): string {
 }
 
 /** The B1 card. Pure rendering of listOwnerProductOrderability(). */
-export function ownerOrderabilityCardHtml(agentId: string, o: OwnerOrderabilityOverview, bannerHtml = ""): string {
+export function ownerOrderabilityCardHtml(agentId: string, o: OwnerOrderabilityOverview, bannerHtml = "", env: NodeJS.ProcessEnv = process.env): string {
   const id = encodeURIComponent(agentId);
   const total = o.products.length;
+  // B2b-3: with the soft-expiry rule active the texts follow it; off → unchanged.
+  const soft = stockSoftExpiryActiveFor(agentId, env);
+  const stockMeta = (p: OwnerOrderabilityOverview["products"][number]): string => {
+    if (soft && p.needs_producer_confirmation && p.stock_confirmed_at) {
+      return ` <span class="ep-audit-meta" data-stock-soft="1">Lagerstatus sist bekreftet ${escapeHtml(formatOwnerDate(p.stock_confirmed_at))}. Kundene ser at den ikke er bekreftet nylig.</span>`;
+    }
+    if (!p.stock_expires_at) return "";
+    return ` <span class="ep-audit-meta">${soft ? "Lagerstatus bekreftet til" : "Lagerstatus gjelder til"} ${escapeHtml(formatOwnerDate(p.stock_expires_at))}</span>`;
+  };
+  const staleDays = getSupplyGraphStaleDays();
+  const validity = soft
+    ? `En bekreftelse på lager gjelder i ${staleDays} dager. Etter det kan kundene fortsatt bestille i opptil ${getSupplyGraphHardStaleDays()} dager, med datoen for siste bekreftelse synlig.`
+    : `En bekreftelse på lager gjelder i ${staleDays} dager.`;
   const profileHtml = o.profile_reasons.length
     ? `<div class="ep-alert ep-alert-error" role="note" data-orderability-profile="blocked">Ingen varer kan bestilles før dette er ordnet:<ul>${o.profile_reasons.map((r) => `<li>${escapeHtml(orderabilityReasonTextNb(r))}</li>`).join("")}</ul></div>`
     : "";
   const rows = o.products.map((p) => {
     const status = p.orderable
-      ? `<strong class="ep-orderable-yes">Kan bestilles</strong>${p.stock_expires_at ? ` <span class="ep-audit-meta">Lagerstatus gjelder til ${escapeHtml(formatOwnerDate(p.stock_expires_at))}</span>` : ""}`
+      ? `<strong class="ep-orderable-yes">Kan bestilles</strong>${stockMeta(p)}`
       : `<strong class="ep-orderable-no">Kan ikke bestilles</strong><ul class="ep-orderable-reasons">${p.reasons.map((r) => `<li data-reason="${escapeHtml(r.code)}">${escapeHtml(orderabilityReasonTextNb(r))}</li>`).join("")}</ul>`;
     const noPrice = p.missing_price
       ? `<div class="ep-audit-meta" data-missing-price="1">Mangler pris — legg inn pris før du bekrefter at varen er på lager.</div>`
@@ -2798,7 +2812,7 @@ export function ownerOrderabilityCardHtml(agentId: string, o: OwnerOrderabilityO
   return `<div class="ep-card" id="${ORDERABILITY_ANCHOR}">
         <h2>Varer som kan bestilles</h2>
         ${bannerHtml}
-        <p data-orderable-count="${o.orderable_count}">${o.orderable_count} av ${total} ${total === 1 ? "vare" : "varer"} kan bestilles nå. En bekreftelse på lager gjelder i ${getSupplyGraphStaleDays()} dager.</p>
+        <p data-orderable-count="${o.orderable_count}">${o.orderable_count} av ${total} ${total === 1 ? "vare" : "varer"} kan bestilles nå. ${validity}</p>
         ${profileHtml}
         ${list}
         <h3 style="margin-top:20px;">Legg til vare</h3>
@@ -2871,14 +2885,21 @@ function orderabilityBack(agentId: string, status: string, extra = ""): string {
 //   confirmable under the B1 rule. Same owner checks as the B1 POSTs.
 
 /** The B2 banner: the orderable items whose stock status expires within 3 days. "" when none. */
-export function stockCheckBannerHtml(agentId: string, items: StockCheckItem[]): string {
+export function stockCheckBannerHtml(agentId: string, items: StockCheckItem[], env: NodeJS.ProcessEnv = process.env): string {
   if (items.length === 0) return "";
   const id = encodeURIComponent(agentId);
-  const lis = items.map((i) => `<li data-product-id="${escapeHtml(i.id)}">${escapeHtml(i.name)} <span class="ep-audit-meta">gjelder til ${escapeHtml(formatStockCheckDate(i.expires_at))}</span></li>`).join("");
+  // B2b-3: soft-expiry texts when the rule is active for the producer; off → unchanged.
+  const soft = stockSoftExpiryActiveFor(agentId, env);
+  const one = items.length === 1;
+  const lis = items.map((i) => `<li data-product-id="${escapeHtml(i.id)}">${escapeHtml(i.name)} <span class="ep-audit-meta">${soft ? "bekreftet til" : "gjelder til"} ${escapeHtml(formatStockCheckDate(i.expires_at))}</span></li>`).join("");
   const hidden = items.map((i) => `<input type="hidden" name="id" value="${escapeHtml(i.id)}">`).join("");
+  const heading = soft ? "Lagerstatusen er snart ikke lenger bekreftet nylig" : "Lagerstatusen går snart ut";
+  const para = soft
+    ? `Kundene kan fortsatt bestille ${one ? "varen" : "varene"}, men de ser at lagerstatusen ikke er bekreftet nylig. Bekreft ${one ? "den" : "dem"} for å fornye datoen.`
+    : `Når den har gått ut, kan kundene ikke bestille ${one ? "varen" : "varene"} før du har bekreftet ${one ? "den" : "dem"} igjen.`;
   return `<div class="ep-alert ep-alert-error" role="note" data-stock-check-banner="1">
-          <strong>Lagerstatusen går snart ut</strong>
-          <p style="margin:6px 0;">Når den har gått ut, kan kundene ikke bestille ${items.length === 1 ? "varen" : "varene"} før du har bekreftet ${items.length === 1 ? "den" : "dem"} igjen.</p>
+          <strong>${heading}</strong>
+          <p style="margin:6px 0;">${para}</p>
           <ul>${lis}</ul>
           <form method="post" action="/eier/${id}/varer/bekreft-lagerpaminnelse" style="margin:8px 0 0;">
             ${hidden}

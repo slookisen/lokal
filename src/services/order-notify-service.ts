@@ -50,6 +50,8 @@ import { isOrderAutocompleteEnabled } from "./order-lifecycle";
 import { PRICE_BY_AGREEMENT, PARTIAL_SUM_LABEL } from "./order-pricing";
 import { formatOsloDayLabel } from "./order-cap-notice";
 import type { StockCheckEmailInput } from "./stock-check-reminder";
+import { stockSoftExpiryActiveFor } from "./stock-soft-expiry";
+import { getSupplyGraphHardStaleDays } from "./supply-graph";
 
 const APP_URL = process.env.APP_URL || "https://rettfrabonden.com";
 
@@ -714,7 +716,14 @@ export async function sendProducerOrderCapNotice(input: { agent_id: string; coun
  * shows what will be confirmed; nothing changes before the owner presses the
  * button there.
  */
-export function renderStockCheckReminderEmail(input: StockCheckEmailInput): {
+/**
+ * B2 reminder e-mail. B2b-3: with the soft-expiry rule active for the producer
+ * (stockSoftExpiryActiveFor — flag AND allowlist; `env` for tests) the lead,
+ * item lines and «why» describe the soft rule (still orderable, customers see
+ * the stock status is not recently confirmed, hard stop after
+ * getSupplyGraphHardStaleDays()). Rule off → byte-identical to before.
+ */
+export function renderStockCheckReminderEmail(input: StockCheckEmailInput, env: NodeJS.ProcessEnv = process.env): {
   subject: string; textContent: string; htmlContent: string;
 } {
   const date = (iso: string) => {
@@ -722,12 +731,20 @@ export function renderStockCheckReminderEmail(input: StockCheckEmailInput): {
     return Number.isNaN(d.getTime()) ? "" : d.toLocaleDateString("nb-NO", { timeZone: "Europe/Oslo", day: "2-digit", month: "2-digit", year: "numeric" });
   };
   const one = input.items.length === 1;
+  const soft = stockSoftExpiryActiveFor(input.agent_id, env);
   const subject = "Bekreft at varene fortsatt er på lager";
-  const lead = one
-    ? "Lagerstatusen for denne varen går snart ut:"
-    : `Lagerstatusen for ${input.items.length} av varene dine går snart ut:`;
-  const lines = input.items.map((i) => `${i.name} (gjelder til ${date(i.expires_at)})`);
-  const why = "Når lagerstatusen har gått ut, kan kundene ikke bestille varen hos deg gjennom Rett fra Bonden før du har bekreftet den igjen.";
+  const lead = soft
+    ? (one
+      ? "Lagerstatusen for denne varen er snart ikke lenger bekreftet nylig:"
+      : `Lagerstatusen for ${input.items.length} av varene dine er snart ikke lenger bekreftet nylig:`)
+    : (one
+      ? "Lagerstatusen for denne varen går snart ut:"
+      : `Lagerstatusen for ${input.items.length} av varene dine går snart ut:`);
+  const lines = input.items.map((i) => `${i.name} (${soft ? "bekreftet til" : "gjelder til"} ${date(i.expires_at)})`);
+  const why = soft
+    ? "Kundene kan fortsatt bestille varen, men fra denne datoen ser de at lagerstatusen ikke er bekreftet nylig. Når du bekrefter varen, fornyes datoen. " +
+      `Har ingen bekreftet varen på ${getSupplyGraphHardStaleDays()} dager, kan den ikke bestilles før du har bekreftet den igjen.`
+    : "Når lagerstatusen har gått ut, kan kundene ikke bestille varen hos deg gjennom Rett fra Bonden før du har bekreftet den igjen.";
   const how = `Lenken viser først hvilke varer som blir bekreftet. Ingenting endres før du trykker «Bekreft». Lenken gjelder til ${date(input.link_expires_at)}.`;
   const portalUrl = `${APP_URL}/eier/${encodeURIComponent(input.agent_id)}/portal`;
   const notAny = "Har du ikke varen lenger, kan du endre lagerstatusen når du er logget inn";
