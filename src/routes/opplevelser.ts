@@ -2109,13 +2109,32 @@ const ADMISSION_VERDICT_STAMP_MAX_CHARS = 500;
 
 type AdmissionOutcome = { status: "match" | "mismatch" | "unresolved"; reason: string };
 
+// dev-request 2026-10-31-opplevagent-admisjonsgate-script-json-stripping,
+// slice 1 (diagnostics only): for every row whose evidence page was fetched,
+// record how much text the judge saw (visibleTextOf) vs how much the page
+// ships as script-embedded string literals (gardssalgEmbeddedPageText).
+// Evidence only — the judge input is unchanged.
+const ADMISSION_DIAGNOSTIC_SAMPLE_CHARS = 300;
+type AdmissionDiagnostic = {
+  evidence_url: string;
+  visible_chars: number;
+  embedded_chars: number;
+  script_blocks: number;
+  visible_sample: string;
+  embedded_sample: string;
+  verdict: AdmissionOutcome["status"];
+};
+
 /**
  * Run one NOT-YET-INSERTED bulk-load row through the admission gate: fetch
  * its own evidence_url and ask the fail-closed judge whether the candidate's
  * composed content (title/category/price) is substantiated by that page.
  * Never throws — every failure path resolves to `unresolved` (fail-closed).
  */
-async function judgeBulkLoadCandidate(r: BulkRow, evidenceUrl: string): Promise<AdmissionOutcome> {
+async function judgeBulkLoadCandidate(
+  r: BulkRow,
+  evidenceUrl: string,
+): Promise<AdmissionOutcome & { diagnostic?: AdmissionDiagnostic }> {
   const judgeRow: HoldoutExperienceRow = {
     // Synthetic id — the row does not exist yet; the judge only echoes this
     // into nothing (its prompt uses title/description/category/price).
@@ -2135,11 +2154,28 @@ async function judgeBulkLoadCandidate(r: BulkRow, evidenceUrl: string): Promise<
       reason: `henting av evidensside feilet: ${fetchResult.reason} (${fetchResult.persistence})`,
     };
   }
-  const judged = await judgeExperienceContentMatch(judgeRow, visibleTextOf(fetchResult.html));
-  if (!judged.ok) return { status: "unresolved", reason: judged.reasoning };
-  return judged.verdict === "MATCH"
-    ? { status: "match", reason: judged.reasoning }
-    : { status: "mismatch", reason: judged.reasoning };
+  const visibleText = visibleTextOf(fetchResult.html);
+  const judged = await judgeExperienceContentMatch(judgeRow, visibleText);
+  const outcome: AdmissionOutcome = !judged.ok
+    ? { status: "unresolved", reason: judged.reasoning }
+    : judged.verdict === "MATCH"
+      ? { status: "match", reason: judged.reasoning }
+      : { status: "mismatch", reason: judged.reasoning };
+  const embeddedText = gardssalgEmbeddedPageText(fetchResult.html);
+  const diagnostic: AdmissionDiagnostic = {
+    evidence_url: evidenceUrl,
+    visible_chars: visibleText.length,
+    embedded_chars: embeddedText.length,
+    script_blocks: (fetchResult.html.match(/<script\b/gi) || []).length,
+    visible_sample: visibleText.slice(0, ADMISSION_DIAGNOSTIC_SAMPLE_CHARS),
+    embedded_sample: embeddedText.slice(0, ADMISSION_DIAGNOSTIC_SAMPLE_CHARS),
+    verdict: outcome.status,
+  };
+  console.log(
+    `[opplevelser] admission-gate diagnostic url=${evidenceUrl} verdict=${outcome.status} ` +
+      `visible_chars=${diagnostic.visible_chars} embedded_chars=${diagnostic.embedded_chars} script_blocks=${diagnostic.script_blocks}`,
+  );
+  return { ...outcome, diagnostic };
 }
 
 router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response) => {
@@ -2231,6 +2267,8 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
     verdict: "match" | "mismatch" | "unresolved";
     reason: string;
   }> = [];
+  // Bounded by ADMISSION_GATE_MAX_JUDGED (one entry per successful fetch).
+  const admissionGateDiagnostics: AdmissionDiagnostic[] = [];
 
   // ── 2–3. Classify + (conditionally) insert, one provider at a time. ─
   for (let i = 0; i < providerNames.length; i++) {
@@ -2441,7 +2479,9 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
             admissionGate.capped++;
           } else {
             admissionGate.judged++;
-            admission = await judgeBulkLoadCandidate(r, evidenceUrl);
+            const { diagnostic, ...judgedOutcome } = await judgeBulkLoadCandidate(r, evidenceUrl);
+            admission = judgedOutcome;
+            if (diagnostic) admissionGateDiagnostics.push(diagnostic);
             admissionGate[admission.status]++;
           }
           admissionGateResults.push({
@@ -2537,7 +2577,7 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
           dry_run: true,
           note: "admission gate kjøres kun i apply-modus: hver NY rad med evidence_url dømmes mot sin egen evidensside før den slippes inn som verified",
         }
-      : { ...admissionGate, results: admissionGateResults },
+      : { ...admissionGate, results: admissionGateResults, diagnostics: admissionGateDiagnostics },
     ...(cappedProviders > 0 ? { capped_providers: cappedProviders } : {}),
   });
 });
