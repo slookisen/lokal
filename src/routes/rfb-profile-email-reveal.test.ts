@@ -31,6 +31,10 @@
  *       address, Retry-After), CCBot (403), unknown slug / no e-mail /
  *       non-producer (404); Cache-Control: private, X-Robots-Tag and meta
  *       noindex
+ *   P   an owner-paused / owner-hidden profile (owner_profile_pause row, read
+ *       via OWNER_PAUSE_ENABLED, and via OWNER_FEATURES_ENFORCE + allowlist as
+ *       visibility.profile off): the reveal endpoint is 404 with no address
+ *       (within the limit, switch on) and the page withholds it too
  *   G   the guard's log lines carry no e-mail address and no IP
  *
  * The byte-identity of switch-off against main itself was checked when the
@@ -138,10 +142,13 @@ export async function runRfbProfileEmailRevealTests(opts: { log?: boolean } = {}
   const eq = (actual: unknown, expected: unknown, label: string) =>
     ok(JSON.stringify(actual) === JSON.stringify(expected), `${label} (expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)})`);
 
-  const envKeys = ["EMAIL_REVEAL_GUARD_RFB", "EMAIL_REVEAL_PER_IP_PER_HOUR"];
+  const envKeys = ["EMAIL_REVEAL_GUARD_RFB", "EMAIL_REVEAL_PER_IP_PER_HOUR", "OWNER_PAUSE_ENABLED", "OWNER_FEATURES_ENFORCE", "OWNER_FEATURES_ALLOWED_SUBJECTS"];
   const prevEnv = Object.fromEntries(envKeys.map((k) => [k, process.env[k]]));
   delete process.env.EMAIL_REVEAL_GUARD_RFB;
   delete process.env.EMAIL_REVEAL_PER_IP_PER_HOUR;
+  delete process.env.OWNER_PAUSE_ENABLED;
+  delete process.env.OWNER_FEATURES_ENFORCE;
+  delete process.env.OWNER_FEATURES_ALLOWED_SUBJECTS;
 
   const initMod = require("../database/init") as typeof import("../database/init");
   const prevMainDb = initMod.__peekDbForTesting();
@@ -393,6 +400,44 @@ export async function runRfbProfileEmailRevealTests(opts: { log?: boolean } = {}
       ok(en.status === 200, "R16: unprefixed reveal works for a fresh IP");
       const enOver = await get(`/en/produsent/${slugs[1]}/epost`, ip);
       ok(enOver.status === 429 && enOver.text.includes("try again later") && !leaks(enOver.text, emails[1]!), "R17: /en reveal over the limit -> 429 in English, no address");
+    }
+
+    // ── P: owner-paused / owner-hidden profile ────────────────────────────
+    // contact.email_mode (the only owner choice about e-mail) is not among
+    // owner-features/enforce.ts's ENFORCED_OWNER_FEATURE_KEYS, so no owner
+    // choice removes `email` through withoutHiddenFields today; the reveal
+    // endpoint's withoutHiddenFields call mirrors the page for the day one is.
+    freshGuard();
+    {
+      const ip = "203.0.113.80";
+      const pid = P[0]!.id;
+      testDb.prepare("INSERT INTO owner_profile_pause (agent_id, paused_at, pause_until, set_by) VALUES (?, '2026-10-01T00:00:00.000Z', NULL, 'owner')").run(pid);
+      try {
+        ok(shows(await page(slugs[0]!, ip), 0), "P0: pause row, both flags off -> the row has no effect (page shows the e-mail)");
+        eq((await reveal(slugs[0]!, ip)).status, 200, "P0b: ... and the reveal endpoint answers 200");
+        for (const [label, setEnv] of [
+          ["OWNER_PAUSE_ENABLED=1", () => { process.env.OWNER_PAUSE_ENABLED = "1"; }],
+          ["OWNER_FEATURES_ENFORCE=1 + allowlist (visibility.profile off)", () => { process.env.OWNER_FEATURES_ENFORCE = "1"; process.env.OWNER_FEATURES_ALLOWED_SUBJECTS = `rfb:${pid}`; }],
+        ] as Array<[string, () => void]>) {
+          freshGuard();
+          setEnv();
+          try {
+            const pg = await page(slugs[0]!, "203.0.113.81");
+            ok(pg.status === 200 && !leaks(pg.text, emails[0]!) && !jsonLdHasEmail(pg.text) && onlyPlatformMailto(pg.text) && pg.text.includes("Midlertidig pause"),
+              `P1: ${label} -> the page is the pause page and withholds the address`);
+            const rv = await reveal(slugs[0]!, "203.0.113.81");
+            ok(rv.status === 404 && !leaks(rv.text, emails[0]!) && onlyPlatformMailto(rv.text), `P2: ${label} -> the reveal endpoint is 404 with no address (within the limit)`);
+            eq(rv.headers["x-robots-tag"], "noindex, nofollow", `P3: ${label} -> the 404 is noindex`);
+            eq((await reveal(slugs[1]!, "203.0.113.81")).status, 200, `P4: ${label} -> an unpaused producer still reveals (200)`);
+          } finally {
+            delete process.env.OWNER_PAUSE_ENABLED;
+            delete process.env.OWNER_FEATURES_ENFORCE;
+            delete process.env.OWNER_FEATURES_ALLOWED_SUBJECTS;
+          }
+        }
+      } finally {
+        testDb.prepare("DELETE FROM owner_profile_pause WHERE agent_id = ?").run(pid);
+      }
     }
 
     // ── G: log lines ──────────────────────────────────────────────────────
