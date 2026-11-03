@@ -56,9 +56,14 @@
  * endpoint GET /klinikk/id/:id/epost (routes/dental-seo.ts) to the same
  * dental counter.
  *
+ * Slice 3 wires the rettfrabonden.com producer profile page /produsent/:slug
+ * (mailto: line on the producer and umbrella contact card, JSON-LD `email`)
+ * and its «Vis e-post» endpoint GET /produsent/:slug/epost (routes/seo.ts)
+ * to the rfb counter, which the RFB REST/A2A/MCP answers of S-A5 will share.
+ *
  * Not yet: S-A2 (verified AI readers via reverse DNS — hook:
- * emailRevealLimitFor), S-A4 (trap address), S-D (contact form) and the
- * RFB/Opplevagent surfaces.
+ * emailRevealLimitFor), S-A4 (trap address), S-D (contact form), the RFB
+ * REST/A2A/MCP answers (S-A5) and the Opplevagent surfaces.
  */
 
 import crypto from "crypto";
