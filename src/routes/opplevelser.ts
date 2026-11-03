@@ -431,6 +431,9 @@ import {
   selectExperiencesForPriceFreshnessCheck,
   resolvePriceProvenanceUrl,
   type PriceFreshnessTarget,
+  // Stamp name_collision at first harvest in bulk-load (additive; the
+  // recheck-backfill sweep keeps stamping already-present rows).
+  flagNameCollision,
 } from "../services/experience-store";
 // dev-request 2026-08-17-forsyningskjede-samarbeid-og-kvalitetsoppdatering,
 // Skive 3 ("Kvalitetsstyrt oppdatering av ikke-tomme felt — erstatter
@@ -2253,6 +2256,12 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
   // follows the same convention.
   let rejectedBlocklisted = 0;
   const rejectedBlocklistedProviders: Array<{ provider_name: string; matched_by?: string; matched_value?: string }> = [];
+  // Providers whose Brreg verdict carried name_collision:true (>=2 Brreg
+  // entities share the name, kommune didn't disambiguate) — stamped via
+  // flagNameCollision() at first harvest in apply mode, counted only in
+  // dry-run. Never cleared here.
+  let flaggedNameCollision = 0;
+  const flaggedNameCollisionProviders: string[] = [];
 
   // Admission-gate tallies (see the block comment above ADMISSION_GATE_MAX_
   // JUDGED). `judged` = rows the gate actually evaluated (fetch + judge
@@ -2329,6 +2338,10 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
           }
         }
         providersInserted += 1;
+        if (verdict.name_collision === true) {
+          flaggedNameCollision++;
+          flaggedNameCollisionProviders.push(name);
+        }
         continue;
       }
 
@@ -2390,6 +2403,14 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
           setBrregVerification(providerId, (verdict.brreg_active ?? 0) as 0 | 1, verdict.org_nr ?? undefined);
         }
         providersInserted += 1;
+      }
+
+      // Stamp name_collision for both the existing and the freshly created
+      // provider (set-only; never cleared here).
+      if (verdict.name_collision === true) {
+        flagNameCollision(providerId);
+        flaggedNameCollision++;
+        flaggedNameCollisionProviders.push(name);
       }
 
       // ── insert this provider's experiences (idempotent by title). ───
@@ -2568,6 +2589,8 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
     excluded_inactive: excludedInactive,
     rejected_blocklisted: rejectedBlocklisted,
     rejected_blocklisted_providers: rejectedBlocklistedProviders,
+    flagged_name_collision: flaggedNameCollision,
+    flagged_name_collision_providers: flaggedNameCollisionProviders,
     // Admission-gate report (faithfulness-inflow slice). Dry-run spends zero
     // fetch/judge budget by design, so it can only announce that the gate
     // WOULD run on apply — it cannot pre-compute verdicts without paying the
