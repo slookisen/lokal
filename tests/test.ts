@@ -11209,8 +11209,10 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     /if \(isDisplayablePhone\(k\.phone\)\) umbContactItems\.push\(`<div class="ct-item">[\s\S]{0,200}tel:\$\{k\.phone/.test(seoSrc),
     "phase5.11-a5: umbrella phone uses tel: link (same pattern as producer), gated by isDisplayablePhone"
   );
+  // E-post-skjerming slice 3: the line reads shownEmail (k.email unless the
+  // EMAIL_REVEAL_GUARD_RFB limit withholds it; switch off → k.email).
   assertTrue(
-    /if \(k\.email\) umbContactItems\.push\(`<div class="ct-item">[\s\S]{0,200}mailto:\$\{k\.email/.test(seoSrc),
+    /if \(shownEmail\) umbContactItems\.push\(`<div class="ct-item">[\s\S]{0,200}mailto:\$\{shownEmail/.test(seoSrc),
     "phase5.11-a5: umbrella email uses mailto: link"
   );
   assertTrue(
@@ -51557,6 +51559,8 @@ runSerial(async () => {
 // into Finn-tannlege REST (/api/tannlege/agents[/:id]) and A2A message/send.
 // Slice 2 adds the clinic profile pages and the «Vis e-post» endpoint (same
 // counter; switch off = byte-identical pages).
+// Slice 3 adds the RFB producer profile page and its «Vis e-post» endpoint
+// (EMAIL_REVEAL_GUARD_RFB, the rfb counter; switch off = byte-identical).
 // Switch off = byte-identical answers; MCP tannlege_info untouched. Sets env
 // flags and swaps the dental db-factory (restored in finally) — runSerial,
 // tail position.
@@ -51567,6 +51571,8 @@ runSerial(async () => {
     ["dental email reveal guard", () => (require("../src/routes/dental-email-reveal-guard.test") as typeof import("../src/routes/dental-email-reveal-guard.test")).runDentalEmailRevealGuardTests({ log: false })],
     // slice 2: the clinic profile pages (/klinikk/:slug, /klinikk/id/:id) and «Vis e-post» (GET /klinikk/id/:id/epost).
     ["dental profile email reveal", () => (require("../src/routes/dental-profile-email-reveal.test") as typeof import("../src/routes/dental-profile-email-reveal.test")).runDentalProfileEmailRevealTests({ log: false })],
+    // slice 3: the RFB producer profile page (/produsent/:slug, producer + umbrella card) and «Vis e-post» (GET /produsent/:slug/epost).
+    ["rfb profile email reveal", () => (require("../src/routes/rfb-profile-email-reveal.test") as typeof import("../src/routes/rfb-profile-email-reveal.test")).runRfbProfileEmailRevealTests({ log: false })],
   ] as Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]>) {
     try {
       const r = await load();
