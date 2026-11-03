@@ -51698,6 +51698,9 @@ runSerial(async () => {
 // counter; switch off = byte-identical pages).
 // Slice 3 adds the RFB producer profile page and its «Vis e-post» endpoint
 // (EMAIL_REVEAL_GUARD_RFB, the rfb counter; switch off = byte-identical).
+// Slice 4 adds the Opplevagent gårdssalg producer profile page and its «Vis
+// e-post» endpoint (EMAIL_REVEAL_GUARD_EXPERIENCES, the experiences counter;
+// switch off = byte-identical).
 // Switch off = byte-identical answers; MCP tannlege_info untouched. Sets env
 // flags and swaps the dental db-factory (restored in finally) — runSerial,
 // tail position.
@@ -51710,6 +51713,8 @@ runSerial(async () => {
     ["dental profile email reveal", () => (require("../src/routes/dental-profile-email-reveal.test") as typeof import("../src/routes/dental-profile-email-reveal.test")).runDentalProfileEmailRevealTests({ log: false })],
     // slice 3: the RFB producer profile page (/produsent/:slug, producer + umbrella card) and «Vis e-post» (GET /produsent/:slug/epost).
     ["rfb profile email reveal", () => (require("../src/routes/rfb-profile-email-reveal.test") as typeof import("../src/routes/rfb-profile-email-reveal.test")).runRfbProfileEmailRevealTests({ log: false })],
+    // slice 4: the Opplevagent gårdssalg profile page (/kategori/gardssalg/produsent/:providerSlug) and «Vis e-post» (…/:providerSlug/epost).
+    ["experiences profile email reveal", () => (require("../src/routes/experiences-profile-email-reveal.test") as typeof import("../src/routes/experiences-profile-email-reveal.test")).runExperiencesProfileEmailRevealTests({ log: false })],
   ] as Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]>) {
     try {
       const r = await load();
