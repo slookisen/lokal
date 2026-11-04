@@ -627,6 +627,41 @@ export type ClaimRequestResult =
  *  code went to is no longer the one the rules would send to today (the
  *  profile got an owner, its address changed or is shared), so nothing is
  *  sent to it. */
+/** Slice C1: the profile just before grantClaimOwnership, stored as JSON in
+ *  agent_claims.pre_grant_state and restored by revokeClaimOwnership. */
+export interface ClaimPreGrantState {
+  v: 1;
+  is_verified: number | null;
+  claimed_at: string | null;
+  claimed_via: string | null;
+  has_knowledge: boolean;
+  data_source: string | null;
+}
+
+/** How a revoke left the profile (revokeClaimOwnership). */
+export type ClaimRevokeRestored = "snapshot" | "partial_no_snapshot" | "kept_other_owner";
+
+/** The stored snapshot, or null when absent or not in the expected shape. */
+export function parseClaimPreGrantState(raw: string | null | undefined): ClaimPreGrantState | null {
+  if (!raw) return null;
+  try {
+    const o = JSON.parse(raw) as Record<string, unknown>;
+    if (!o || typeof o !== "object" || o.v !== 1) return null;
+    const numOrNull = (x: unknown): number | null => (typeof x === "number" ? x : null);
+    const strOrNull = (x: unknown): string | null => (typeof x === "string" ? x : null);
+    return {
+      v: 1,
+      is_verified: numOrNull(o.is_verified),
+      claimed_at: strOrNull(o.claimed_at),
+      claimed_via: strOrNull(o.claimed_via),
+      has_knowledge: o.has_knowledge === true,
+      data_source: strOrNull(o.data_source),
+    };
+  } catch {
+    return null;
+  }
+}
+
 export type ClaimResendRefusal =
   | "not_found" | "verified" | "pending_review" | "closed" | "expired"
   | "already_resent" | "too_early" | "platform" | "not_allowed";
@@ -1900,6 +1935,25 @@ class KnowledgeService {
     const now = new Date().toISOString();
     const tokenExpiry = new Date(Date.now() + CLAIM_TOKEN_VALID_MS).toISOString();
 
+    // Slice C1 (dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-
+    // ettklikk): the profile as it is BEFORE this grant touches it, kept on the
+    // claim so POST /admin/agents/claim-revoke can put it back
+    // (revokeClaimOwnership). Written only; nothing below reads it, so the
+    // grant's outcome is unchanged.
+    const preAgent = db.prepare("SELECT is_verified, claimed_at, claimed_via FROM agents WHERE id = ?").get(claim.agent_id) as
+      { is_verified: number | null; claimed_at: string | null; claimed_via: string | null } | undefined;
+    const preKnowledge = db.prepare("SELECT data_source FROM agent_knowledge WHERE agent_id = ?").get(claim.agent_id) as
+      { data_source: string | null } | undefined;
+    const preGrantState: ClaimPreGrantState = {
+      v: 1,
+      is_verified: preAgent?.is_verified ?? null,
+      claimed_at: preAgent?.claimed_at ?? null,
+      claimed_via: preAgent?.claimed_via ?? null,
+      has_knowledge: !!preKnowledge,
+      data_source: preKnowledge?.data_source ?? null,
+    };
+    db.prepare("UPDATE agent_claims SET pre_grant_state = ? WHERE id = ?").run(JSON.stringify(preGrantState), claimId);
+
     // SET reads the row as it was, so claimant_email_typed gets the typed address.
     db.prepare(`
       UPDATE agent_claims SET status = 'verified', claim_token = ?, claim_token_expires_at = ?, verified_at = ?,
@@ -2048,6 +2102,85 @@ class KnowledgeService {
     db.prepare("UPDATE agent_claims SET status = 'rejected', notes = COALESCE(?, notes) WHERE id = ? AND status = 'pending_review'")
       .run(note ?? null, claimId);
     return { ok: true, agentId: claim.agent_id };
+  }
+
+  /**
+   * Slice C1 (dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-
+   * ettklikk): undoes grantClaimOwnership for one verified claim, in one
+   * transaction. The claim becomes 'revoked' (claim_token NULL, token expiry
+   * now, revoked_at + note), so getClaimByToken, createMagicLink,
+   * verifyMagicLink, resendClaimToken and the /eier claimant-address login
+   * stop seeing it. Unexpired /eier and /selger login rows (magic_links) for
+   * this agent and the claim's address are expired too — unless another
+   * verified claim on the agent has the same address.
+   *
+   * The profile (agents.is_verified/claimed_at/claimed_via,
+   * agent_knowledge.data_source) is restored from the pre-grant snapshot only
+   * when no other verified claim on the agent remains; otherwise the other
+   * owner keeps the stamps (ownerRemains true, restored "kept_other_owner").
+   *   - snapshot: is_verified back to the snapshot value; claimed_at/
+   *     claimed_via back to the snapshot (the grant only filled them when
+   *     claimed_at was empty); data_source back to 'auto' only when the grant
+   *     flipped it ('auto' → 'hybrid') and it is still 'hybrid' (an owner
+   *     edit since then is kept). restored "snapshot".
+   *   - no snapshot (granted before C1): claimed_at/claimed_via are cleared
+   *     only when claimed_via is 'claim' or 'admin_approval' (a grant's
+   *     stamp); is_verified and data_source are left as they are, since what
+   *     they were before cannot be known. restored "partial_no_snapshot".
+   */
+  revokeClaimOwnership(claimId: string, note?: string):
+    | { ok: true; agentId: string; restored: ClaimRevokeRestored; ownerRemains: boolean; sessionsRevoked: number }
+    | { ok: false; error: "not_found" | "not_verified" } {
+    const db = getDb();
+    return db.transaction(() => {
+      const claim = db.prepare("SELECT id, agent_id, status, claimant_email, pre_grant_state FROM agent_claims WHERE id = ?").get(claimId) as
+        { id: string; agent_id: string; status: string; claimant_email: string | null; pre_grant_state: string | null } | undefined;
+      if (!claim) return { ok: false as const, error: "not_found" as const };
+      if (claim.status !== "verified") return { ok: false as const, error: "not_verified" as const };
+      const now = new Date().toISOString();
+
+      const changed = db.prepare(`
+        UPDATE agent_claims SET status = 'revoked', claim_token = NULL, claim_token_expires_at = ?, revoked_at = ?, revoke_note = ?
+         WHERE id = ? AND status = 'verified'
+      `).run(now, now, note ?? null, claimId);
+      if (changed.changes === 0) return { ok: false as const, error: "not_verified" as const };
+
+      const others = db.prepare("SELECT claimant_email FROM agent_claims WHERE agent_id = ? AND status = 'verified' AND id != ?")
+        .all(claim.agent_id, claimId) as Array<{ claimant_email: string | null }>;
+      const ownerRemains = others.length > 0;
+
+      // Login rows bound to this agent + this claim's address. Kept when
+      // another verified claim on the agent has the same address.
+      let sessionsRevoked = 0;
+      const email = normalizeEmail(claim.claimant_email);
+      if (email && !others.some((o) => normalizeEmail(o.claimant_email) === email)) {
+        const past = new Date(Date.now() - 1000).toISOString();
+        sessionsRevoked = db.prepare(`
+          UPDATE magic_links SET expires_at = ?
+           WHERE agent_id = ? AND LOWER(TRIM(email)) = ? AND datetime(expires_at) > datetime('now')
+        `).run(past, claim.agent_id, email).changes;
+      }
+
+      if (ownerRemains) {
+        return { ok: true as const, agentId: claim.agent_id, restored: "kept_other_owner" as const, ownerRemains, sessionsRevoked };
+      }
+
+      const snap = parseClaimPreGrantState(claim.pre_grant_state);
+      if (!snap) {
+        db.prepare(`
+          UPDATE agents SET claimed_at = NULL, claimed_via = NULL
+           WHERE id = ? AND claimed_via IN ('claim', 'admin_approval')
+        `).run(claim.agent_id);
+        return { ok: true as const, agentId: claim.agent_id, restored: "partial_no_snapshot" as const, ownerRemains, sessionsRevoked };
+      }
+
+      db.prepare("UPDATE agents SET is_verified = ?, claimed_at = ?, claimed_via = ? WHERE id = ?")
+        .run(snap.is_verified, snap.claimed_at, snap.claimed_via, claim.agent_id);
+      if (snap.has_knowledge && snap.data_source === "auto") {
+        db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ? AND data_source = 'hybrid'").run(claim.agent_id);
+      }
+      return { ok: true as const, agentId: claim.agent_id, restored: "snapshot" as const, ownerRemains, sessionsRevoked };
+    })();
   }
 
   getClaimByToken(token: string): { agentId: string; claimantName: string; claimantEmail: string } | null {
