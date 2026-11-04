@@ -673,7 +673,7 @@ export type ClaimResendResult =
 /** What verifyClaim answers besides success: the claim's state, so the page
  *  knows whether to keep the code field (K1/K3). */
 export type ClaimVerifyStatus =
-  | "not_found" | "verified" | "pending_review" | "expired" | "rejected" | "superseded" | "invalid_code";
+  | "not_found" | "verified" | "pending_review" | "expired" | "rejected" | "superseded" | "invalid_code" | "revoked";
 
 const NB_MONTHS = ["januar", "februar", "mars", "april", "mai", "juni", "juli", "august", "september", "oktober", "november", "desember"];
 
@@ -1872,6 +1872,16 @@ class KnowledgeService {
       const locked = Number(claim.failed_attempts ?? 0) >= claimLimits().maxFailedAttempts;
       return { success: false, status: "expired", error: `${locked ? "For mange feil koder. Kravet er utløpt." : "Koden er utløpt."} ${askAgain()}` };
     }
+    // Slice C1: an owner claim an admin revoked (POST /admin/agents/claim-revoke)
+    // is closed for good — its old code must never grant the profile again.
+    if (claim.status === "revoked") {
+      return { success: false, status: "revoked", error: "Eierskapet fra dette kravet er trukket tilbake. Mener du at det er feil, ta kontakt med oss." };
+    }
+    // Only an open code can be verified; any other status (also one added
+    // later) is refused here instead of falling through to the code check.
+    if (claim.status !== "code_sent") {
+      return { success: false, status: "expired", error: `Koden er ikke lenger gyldig. ${askAgain()}` };
+    }
     // A code from before decision 11=A went to whatever address the claimant
     // typed, so it is not accepted (the row itself is left as it is).
     if (!claim.code_sent_to) {
@@ -1880,7 +1890,7 @@ class KnowledgeService {
 
     // Check expiry
     if (new Date(claim.expires_at) < new Date()) {
-      db.prepare("UPDATE agent_claims SET status = 'expired' WHERE id = ?").run(claimId);
+      db.prepare("UPDATE agent_claims SET status = 'expired' WHERE id = ? AND status = 'code_sent'").run(claimId);
       return { success: false, status: "expired", error: `Koden er utløpt. ${askAgain()}` };
     }
 
@@ -1952,7 +1962,27 @@ class KnowledgeService {
       has_knowledge: !!preKnowledge,
       data_source: preKnowledge?.data_source ?? null,
     };
-    db.prepare("UPDATE agent_claims SET pre_grant_state = ? WHERE id = ?").run(JSON.stringify(preGrantState), claimId);
+    // Baseline rule: the snapshot is the profile before its FIRST current
+    // owner, not the live state. When another verified claim already owns the
+    // agent, the live state is that owner's post-grant state, so a revoke of
+    // both (in any order) would end at "owned" with no verified claim. So:
+    //   - no other verified claim → the live state above;
+    //   - other verified claims, all with a snapshot → the earliest one's
+    //     snapshot (by verified_at, then id), copied as is;
+    //   - any other verified claim without a snapshot (granted before C1) →
+    //     NULL: the baseline is unknown, so the last revoke restores only
+    //     partly ("partial_no_snapshot") instead of to a wrong state.
+    // revokeClaimOwnership restores only from the LAST verified claim, so
+    // every claim that can be last carries the same baseline.
+    const otherOwners = db.prepare(
+      "SELECT pre_grant_state FROM agent_claims WHERE agent_id = ? AND status = 'verified' AND id != ? ORDER BY verified_at ASC, id ASC"
+    ).all(claim.agent_id, claimId) as Array<{ pre_grant_state: string | null }>;
+    const storedSnapshot: string | null = otherOwners.length === 0
+      ? JSON.stringify(preGrantState)
+      : otherOwners.every((o) => parseClaimPreGrantState(o.pre_grant_state) !== null)
+        ? otherOwners[0]!.pre_grant_state
+        : null;
+    db.prepare("UPDATE agent_claims SET pre_grant_state = ? WHERE id = ?").run(storedSnapshot, claimId);
 
     // SET reads the row as it was, so claimant_email_typed gets the typed address.
     db.prepare(`
@@ -2140,9 +2170,10 @@ class KnowledgeService {
       const now = new Date().toISOString();
 
       const changed = db.prepare(`
-        UPDATE agent_claims SET status = 'revoked', claim_token = NULL, claim_token_expires_at = ?, revoked_at = ?, revoke_note = ?
+        UPDATE agent_claims SET status = 'revoked', claim_token = NULL, claim_token_expires_at = ?, revoked_at = ?, revoke_note = ?,
+               verification_code = NULL, expires_at = ?
          WHERE id = ? AND status = 'verified'
-      `).run(now, now, note ?? null, claimId);
+      `).run(now, now, note ?? null, now, claimId);
       if (changed.changes === 0) return { ok: false as const, error: "not_verified" as const };
 
       const others = db.prepare("SELECT claimant_email FROM agent_claims WHERE agent_id = ? AND status = 'verified' AND id != ?")

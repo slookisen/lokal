@@ -19,11 +19,18 @@
  *   (login)   unexpired magic_links rows for this agent + the claim's address
  *             are expired; other addresses / agents are left; a shared
  *             address with a remaining verified claim keeps its rows.
+ *   (reverify) a revoked claim's old code is refused (status 'revoked'),
+ *             never overwritten by 'expired', and no resend path revives it.
+ *   (order)   two owners revoked in grant order end at the original profile
+ *             (the later grant carries the first owner's baseline); with a
+ *             pre-C1 owner the baseline is unknown → partial_no_snapshot.
+ *   (trust)   the route recalculates agents.trust_score.
  *   (route)   POST /admin/agents/claim-revoke: 403 without / with a wrong
  *             X-Admin-Key, 400 on a bad body, 404 unknown, 409 pending, 409 on
  *             a second revoke, 200 shape.
  *   (mig)     an 11=A-shaped agent_claims table is rebuilt with 'revoked' in
- *             the status CHECK, rows unchanged; a second boot does not rebuild.
+ *             the status CHECK, rows unchanged, foreign_keys restored (OFF and
+ *             ON); a second boot does not rebuild.
  *
  * Fresh in-memory SQLite with the real schema and an in-process server with
  * the real admin-agents router. getDb() singleton, ADMIN_KEY and the require
@@ -288,6 +295,79 @@ export async function runRfbClaimRevokeTests(opts: { log?: boolean } = {}): Prom
       eq(live("tok-rv-shared"), true, "login/shared: … the session still works");
     }
 
+    // ══ (reverify) a revoked claim cannot be verified again ══════════════
+    {
+      agent("rv-x");
+      const before = profile("rv-x");
+      const c = codeClaim("rv-x", "555555");
+      const v = knowledgeService.verifyClaim(c, "555555", "rv-x");
+      ok(v.success, "reverify: first verify succeeds");
+      ok(knowledgeService.revokeClaimOwnership(c).ok, "reverify: revoke succeeds");
+      const row = claimRow(c);
+      eq([row.verification_code, !!row.expires_at && Date.parse(row.expires_at) <= Date.now()], [null, true], "reverify: revoke clears the code and ends its expiry");
+      const again = knowledgeService.verifyClaim(c, "555555", "rv-x");
+      eq([again.success, again.status, again.claimToken], [false, "revoked", undefined], "reverify: verifyClaim with the same code is refused with status 'revoked'");
+      eq(claimRow(c).status, "revoked", "reverify: the status stays 'revoked'");
+      eq(profile("rv-x"), before, "reverify: the profile is not granted again");
+      eq(owned("rv-x"), 0, "reverify: still not owned");
+      // The old code restored by hand (a stale row) is still refused.
+      db.prepare("UPDATE agent_claims SET verification_code = '555555', expires_at = ? WHERE id = ?").run(new Date(Date.now() + 3_600_000).toISOString(), c);
+      eq(knowledgeService.verifyClaim(c, "555555", "rv-x").status, "revoked", "reverify: refused even with a live code on the row");
+      db.prepare("UPDATE agent_claims SET expires_at = ? WHERE id = ?").run(new Date(Date.now() - 3_600_000).toISOString(), c);
+      knowledgeService.verifyClaim(c, "555555", "rv-x");
+      eq(claimRow(c).status, "revoked", "reverify: an expired code does not overwrite 'revoked' with 'expired'");
+      const rs = knowledgeService.resendClaimCode(c, "rv-x");
+      eq([rs.kind, (rs as any).reason], ["refused", "closed"], "reverify: «Send koden på nytt» refuses a revoked claim");
+      eq(claimRow(c).status, "revoked", "reverify: … and leaves it 'revoked'");
+      eq(knowledgeService.resendClaimToken("rv-x", row.claimant_email).success, false, "reverify: resendClaimToken finds no claim to revive");
+      eq(knowledgeService.getClaimByToken(v.claimToken!), null, "reverify: the old token still does not resolve");
+    }
+
+    // ══ (order) two owners revoked in grant order (A, then B) ════════════
+    {
+      agent("rv-o");
+      const before = profile("rv-o");
+      const a = codeClaim("rv-o", "666666");
+      ok(knowledgeService.verifyClaim(a, "666666", "rv-o").success, "order: owner A verified");
+      const b = queuedClaim("rv-o", "b@rv-o.example.test", "has_owner");
+      ok(knowledgeService.approveClaimReview(b).ok, "order: owner B approved while A owns");
+      eq(claimRow(b).pre_grant_state, claimRow(a).pre_grant_state, "order: B carries A's baseline, not A's post-grant state");
+      const ra = knowledgeService.revokeClaimOwnership(a);
+      eq(ra.ok && ra.restored, "kept_other_owner", "order: revoking A first keeps B's stamps");
+      const rb = knowledgeService.revokeClaimOwnership(b);
+      eq(rb.ok && [rb.restored, rb.ownerRemains], ["snapshot", false], "order: revoking B last restores from the baseline");
+      eq(profile("rv-o"), before, "order: the profile is exactly as before A's grant");
+      eq(owned("rv-o"), 0, "order: no longer owned");
+    }
+
+    // ══ (order) a pre-C1 owner + a new owner: baseline unknown ═══════════
+    {
+      agent("rv-p", { isVerified: 1, claimedAt: "2026-07-22T07:14:21.000Z", claimedVia: "claim", dataSource: "hybrid" });
+      db.prepare(`INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, status, verified_at)
+                  VALUES ('rv-p-legacy', 'rv-p', 'Eier', 'eier@rv-p.example.test', 'verified', '2026-07-22T07:14:21.000Z')`).run();
+      const b = queuedClaim("rv-p", "b@rv-p.example.test", "has_owner");
+      ok(knowledgeService.approveClaimReview(b).ok, "order/legacy: new owner approved");
+      eq(claimRow(b).pre_grant_state, null, "order/legacy: no snapshot stored when an existing owner has none");
+      knowledgeService.revokeClaimOwnership("rv-p-legacy");
+      const rb = knowledgeService.revokeClaimOwnership(b);
+      eq(rb.ok && rb.restored, "partial_no_snapshot", "order/legacy: the last revoke restores only partly");
+      eq(profile("rv-p"), { is_verified: 1, claimed_at: null, claimed_via: null, data_source: "hybrid" }, "order/legacy: owner stamps cleared, the rest left");
+      eq(owned("rv-p"), 0, "order/legacy: no longer owned");
+    }
+
+    // ══ (trust) the route recalculates the trust score ═══════════════════
+    {
+      const { trustScoreService } = require("../services/trust-score-service") as typeof import("../services/trust-score-service");
+      agent("rv-t");
+      const c = codeClaim("rv-t", "777777");
+      ok(knowledgeService.verifyClaim(c, "777777", "rv-t").success, "trust: verify succeeds");
+      db.prepare("UPDATE agents SET trust_score = 0.4242 WHERE id = 'rv-t'").run();
+      eq((await revoke({ claimId: c })).status, 200, "trust: revoke → 200");
+      const ts = (db.prepare("SELECT trust_score FROM agents WHERE id = 'rv-t'").get() as { trust_score: number }).trust_score;
+      eq(ts, trustScoreService.calculate("rv-t"), "trust: trust_score was recalculated for the revoked profile (trustScoreService.update)");
+      ok(ts !== 0.4242, "trust: … the sentinel value is gone");
+    }
+
     // ══ (route) auth, body, unknown, pending ═════════════════════════════
     {
       agent("rv-r");
@@ -337,6 +417,17 @@ export async function runRfbClaimRevokeTests(opts: { log?: boolean } = {}): Prom
       eq(idx, ["idx_agent_claims_agent", "idx_agent_claims_email", "idx_agent_claims_status"], "mig: the indexes are recreated");
       eq(old.pragma("foreign_keys", { simple: true }), 0, "mig: the foreign_keys setting is restored as it was");
       old.prepare("UPDATE agent_claims SET status = 'revoked' WHERE id = 'm1'").run();
+      initMod.__initSchemaForTesting(old);
+      // The same rebuild with foreign_keys ON: the setting must come back ON.
+      old.exec("ALTER TABLE agent_claims RENAME TO agent_claims_fresh");
+      old.exec(sql.replace(",'revoked')", ")"));
+      old.exec("INSERT INTO agent_claims SELECT * FROM agent_claims_fresh WHERE status != 'revoked'");
+      old.exec("DROP TABLE agent_claims_fresh");
+      old.pragma("foreign_keys = ON");
+      initMod.__initSchemaForTesting(old);
+      ok(((old.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_claims'").get() as { sql: string }).sql).includes("'revoked'"), "mig: rebuilt again with foreign_keys ON");
+      eq(old.pragma("foreign_keys", { simple: true }), 1, "mig: foreign_keys ON is restored as it was");
+      eq((old.prepare("SELECT COUNT(*) AS n FROM agent_claims").get() as { n: number }).n, 1, "mig: … rows copied (orphan agent row kept)");
       initMod.__initSchemaForTesting(old);
       eq((old.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_claims'").get() as { sql: string }).sql, sql, "mig: a later boot does not rebuild again");
       old.close();
