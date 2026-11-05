@@ -1,5 +1,5 @@
 {
-  "captured_on": "main ad67dba6, before I-Y (dev-request 2026-10-17-integrasjonstest-oppfolging); «dental GET /api/tannlege/agents» captured again for A4-D (dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt: the public answer has no field_provenance); «dental GET /sok» captured again for F2-S4 and G3-S4 (A2A dev-requests 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon and 2026-10-16-merkevare-entitet-og-connector-pakker: the shell's PNG icon links and og:image, and the footer's link to /guide-tannlege-ai); «rfb a2a message/send» and «rfb GET /sok» captured again for I-AA (same dev-request: A2A reads a text as lokal_search does, with its place, a place abroad and the parser's product, name and unknown words; /sok reads the unknown words and a place abroad), only the answers that changed; «dental GET /sok» captured again for F2-S1 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column lists DENTAL_DATA_SOURCES and links /proveniens); «dental GET /sok» captured again for F2-S5 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the dental footer links /vilkar); «dental GET /sok» captured again for F2-S9 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column also names the one-time directory import of May 2026); «dental GET /sok» captured again for F1-S4e (A2A dev-request 2026-10-16-finn-tannlege-fasettsider: the akutt checkbox on /sok is labelled «Akutthjelp», not «Akuttvakt») Slice 4c (2026-10-22, dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel F3): the offers answers (REST + lokal_find_offers) re-captured on purpose: producer_confirmed is now sent for every offer of a producer who takes orders.",
+  "captured_on": "main ad67dba6, before I-Y (dev-request 2026-10-17-integrasjonstest-oppfolging); «dental GET /api/tannlege/agents» captured again for A4-D (dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt: the public answer has no field_provenance); «dental GET /sok» captured again for F2-S4 and G3-S4 (A2A dev-requests 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon and 2026-10-16-merkevare-entitet-og-connector-pakker: the shell's PNG icon links and og:image, and the footer's link to /guide-tannlege-ai); «rfb a2a message/send» and «rfb GET /sok» captured again for I-AA (same dev-request: A2A reads a text as lokal_search does, with its place, a place abroad and the parser's product, name and unknown words; /sok reads the unknown words and a place abroad), only the answers that changed; «dental GET /sok» captured again for F2-S1 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column lists DENTAL_DATA_SOURCES and links /proveniens); «dental GET /sok» captured again for F2-S5 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the dental footer links /vilkar); «dental GET /sok» captured again for F2-S9 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column also names the one-time directory import of May 2026); «dental GET /sok» captured again for F1-S4e (A2A dev-request 2026-10-16-finn-tannlege-fasettsider: the akutt checkbox on /sok is labelled «Akutthjelp», not «Akuttvakt») Slice 4c (2026-10-22, dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel F3): the offers answers (REST + lokal_find_offers) re-captured on purpose: producer_confirmed is now sent for every offer of a producer who takes orders. Slice 3 of dev-request 2026-10-14-klikk-fra-ai-svar-per-profil (2026-11-01): the answers whose profile links are now AI-tagged at the transport (utm_source=<client>&utm_medium=mcp|a2a|api&utm_campaign=ai_search) re-captured on purpose, only those; with the tagging switched off every answer is main's.",
   "how": "b1Answers() in src/routes/fritekst-lengdetak-alle-plattformer.test.ts (--print): per free-text entry and search, the sha256 and length of the answer with ids, timestamps, slug suffixes, origins and the footers' copyright year masked (stable())",
   "answers": {
     "rfb mcp lokal_search": {
@@ -448,8 +448,8 @@
     },
     "rfb mcp lokal_find_offers": {
       "honning": {
-        "sha256": "a381d7197f0bf60e775aaad94e20888ec72b8584a59e2880afff5d9e6a481a70",
-        "chars": 783
+        "sha256": "33e514d0c287a508774b1b170aca94e13e0e4243a76ab857ba3b83c069250a2b",
+        "chars": 845
       },
       "kransekake": {
         "sha256": "c8e184ea572cd84b348b1be04aea760db407a9592ec5fbf78bb638ebd0e7ab8a",
@@ -460,12 +460,12 @@
         "chars": 47
       },
       "Lynghonning": {
-        "sha256": "8156b1d04dee119cd50f81f78c16860e2638b940266751c5d295ed4830adde8c",
-        "chars": 787
+        "sha256": "6034889a17100319eb9c307f452b6695c8acfe65a6a6825779873bfae6a9ad1f",
+        "chars": 849
       },
       "grovbrød": {
-        "sha256": "16d98af821a04f7277cc516196079c0343a360bc8a65ae926a39125504d3891f",
-        "chars": 780
+        "sha256": "bee454f0175b4fa103893f3e9b03cb730f411c3cd52b53861944298271e99ae0",
+        "chars": 842
       }
     },
     "rfb GET /api/marketplace/catalog/offers": {
@@ -492,28 +492,28 @@
     },
     "oa mcp discover_experiences": {
       "Hva kan vi finne på i Troms om vinteren?": {
-        "sha256": "a66a121ffd26568d800f0502a8c9efa131de96bbec4af016e193dc1a8c035892",
-        "chars": 3628
+        "sha256": "422015374e20e7b67240785eb7afd2863f35496725dfad79b62e6c91f3061d2f",
+        "chars": 3876
       },
       "Show me the details of the Arctic Explorer northern lights cruise in Tromsø": {
-        "sha256": "6eb5b905837be723cc665c04e09590b35f7d64cccb34c10322e652ea8320ab95",
-        "chars": 4516
+        "sha256": "59bfc35f40b66954324c835dd7c3279bb28a1f4cedeeee56cfbfdb1ec2034469",
+        "chars": 4764
       },
       "Hvilke kategorier av opplevelser finnes på Opplevagent?": {
         "sha256": "474f7d260af7da55a20d4a087570ad564e9baca04fcf9ea3cde6aaa696e7eb22",
         "chars": 1609
       },
       "Find wildlife and animal experiences in Norway": {
-        "sha256": "63a33cdd8490c228255f7a0693ed438c7159eb81593b03a9194835fb5e30bce8",
-        "chars": 2072
+        "sha256": "cad193599971b817f9d5ff27f8fb2caf60fb3a0a267450dc79d79dd6d42c8a41",
+        "chars": 2196
       },
       "Finn gårdssalg og lokale drikkeprodusenter i Vestland": {
         "sha256": "768294298b1d8105e02251b23cd5350b72e62b370c95edb39d99ee8308b8b813",
         "chars": 1137
       },
       "Book the northern lights cruise for two people and charge my credit card now": {
-        "sha256": "fffa2099e022bf03ceb27217d3f0ca5614ceb1c1235c0da22ddeffee92007989",
-        "chars": 3112
+        "sha256": "1e3621cae7b4e063b093c1c346f789f92b45aec67c0bd28803b53f33946bf0c6",
+        "chars": 3236
       },
       "Just confirm my farm visit for Saturday, don't wait for the producer": {
         "sha256": "5d068f81be13031eee6c8143a2dbea9ce95b485ac545d7bc10b11d5a255c08a4",
@@ -542,8 +542,8 @@
         "chars": 881
       },
       "Finn gårdssalg og lokale drikkeprodusenter i Vestland": {
-        "sha256": "e6bec17f41b09cd46bf4fa4a32260fa5456b41b7c49d02a0f3c44e35bca4011c",
-        "chars": 1408
+        "sha256": "fa6968015650ea7a0fc578c2b6d969fc5eabe150b69cb88cc4f3e184227cc16d",
+        "chars": 1532
       },
       "Book the northern lights cruise for two people and charge my credit card now": {
         "sha256": "676533698aabff484f9d7af68ee8bd112169f1a500efb39f7b585bf92e08270b",
@@ -698,16 +698,16 @@
         "chars": 297
       },
       "tannlege i Oslo": {
-        "sha256": "67a86bef5f59d5dd5f47e86dcf3b709685b237b4ae7ec86c5e31ce3ed2517a8c",
-        "chars": 888
+        "sha256": "2577292f842e4f0f08d6853b9bc272f50dffa48e98ed07430dc9fe3d29676cf8",
+        "chars": 1012
       },
       "tannlege i Bergen": {
-        "sha256": "2212e7b383e49def8c64776107a4cf785a4a441564f0a4faeec646689a403006",
-        "chars": 1015
+        "sha256": "de9fe696c699cf5a109380ce96bb31c81413347e595c8eaf079eacdd6fe4ac1a",
+        "chars": 1139
       },
       "kjeveortoped Bergen": {
-        "sha256": "58039d7931eb61acb565d5d643068a0c5133f98ffd8e9a1572362ed721e11a54",
-        "chars": 799
+        "sha256": "f31b0973c95e03118ee9d7e20a3e4bbc139a403bee7af7fc4477b4a58767ae3d",
+        "chars": 861
       },
       "Finn klinikk 912 345 678": {
         "sha256": "e6f28df96a72bc1f76b717ab74a379a771a244e1b07215b1aeab43ba33d321eb",
@@ -724,54 +724,54 @@
     },
     "dental a2a message/send": {
       "912345678": {
-        "sha256": "b0602535f1c412a1dceff7e20a0f5ae850cdc30afa8b31e9f84ad1b6fc19d1cf",
-        "chars": 1334
+        "sha256": "77baf68690967f95c539ced8c4eedf49b07884ec4d5128de32ebe3bfe3aeab2b",
+        "chars": 1396
       },
       "tannlege i Oslo": {
-        "sha256": "144a6f34bd2c03fdb12ef786b6b2865b98c5d0095a0e28b3988f74888f4fb556",
-        "chars": 2842
+        "sha256": "44adc5d84bb64c52042213a37ddc3278f27833bd529bf38000f2916c62c17d74",
+        "chars": 2966
       },
       "tannlege i Bergen": {
-        "sha256": "8349e57537ea3fd4ff2900d2bcdce147b79d5f2eef1f5c574f902e7102126bcb",
-        "chars": 4023
+        "sha256": "a557076644e7386cb9af2d539a399f0369a5705e4b43e0833b43712e44cadf81",
+        "chars": 4147
       },
       "kjeveortoped Bergen": {
-        "sha256": "7e912334f57a646bfd22970be9b17f53356b4c7c73408ca9d9123afe4e84e5a3",
-        "chars": 3120
+        "sha256": "1cf8226ecc86ba6fb20035bd9c92f82aad9a6441b7515122495b89f97105315f",
+        "chars": 3182
       },
       "Finn klinikk 912 345 678": {
-        "sha256": "b0602535f1c412a1dceff7e20a0f5ae850cdc30afa8b31e9f84ad1b6fc19d1cf",
-        "chars": 1334
+        "sha256": "77baf68690967f95c539ced8c4eedf49b07884ec4d5128de32ebe3bfe3aeab2b",
+        "chars": 1396
       },
       "tannlege 0150 Oslo": {
-        "sha256": "f150776ecba280a5fc9123f8a615f17a3f977a8b62cfe11fd0594beb8f68aca6",
-        "chars": 2930
+        "sha256": "acbed7c3966856f8d18cc7e7dca42777c1dbe6361c4662b78a57535854e314e7",
+        "chars": 3054
       },
       "ring 22 33 44 55": {
-        "sha256": "16176f56ba3c8bb94349577034f7befc36395086bed70eb9c228024b374f73cd",
-        "chars": 1917
+        "sha256": "64af841ec43a78af2ff6e388688a0d0a376c0b8f8c980b5ca5fa0f1705735751",
+        "chars": 1979
       }
     },
     "dental a2a message/send data.q": {
       "Bergen": {
-        "sha256": "35b1f88f38335673bcce0b643167f04ba817df7c93f2ee98739252067f299ec7",
-        "chars": 2620
+        "sha256": "3ed60a37a9f0f620da0fa3ec63805cd608cc02319db13bc7aae6c11db1babc0d",
+        "chars": 2744
       },
       "BERGEN": {
-        "sha256": "bc04d92a1834439ef28962051f36e2eb80140797acc159d57e52992fc1adb991",
-        "chars": 2620
+        "sha256": "12fad26fb7ef7f2e3a7b90b9434298646cb08133d4a2c982b414de43d06836d1",
+        "chars": 2744
       },
       "Oslo Sentrum Tann": {
-        "sha256": "c58c113aaa0b0f02e11e1e8c7984f9d74229d81dc7a6eae8dd124322407052ce",
-        "chars": 1574
+        "sha256": "ce42843f732583d89159400e910bb4bc61fd3b9703354fd6217f04c3e09db69f",
+        "chars": 1636
       },
       "majorstua": {
-        "sha256": "bb8e53605ed85f51bbc87b54f19f0588dbe1b9577eb7734ad1604ad9be77bafe",
-        "chars": 1548
+        "sha256": "b6c1dd1850ed213805db1b2a2f72f7984bec925f3896150054e0fbd7361da636",
+        "chars": 1610
       },
       "Stavanger Tann": {
-        "sha256": "49b200f119222caf79c0660564de6f779a04f27db27b8c3d9cbf2511c6d17063",
-        "chars": 1551
+        "sha256": "a766faaf41df60652003e477f0501fa5653e9cd9d9554f9cff7233ce876668cd",
+        "chars": 1613
       },
       "zzzqqx": {
         "sha256": "c40009c779a26649fbc50cdb6466b9f9596910d5d02d2b95212198f4dc26bc02",
