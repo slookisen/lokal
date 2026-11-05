@@ -46600,6 +46600,25 @@ runSerial(async () => {
   }
 });
 
+// Skive 3j: gårdssalg website-judge as a file queue — candidate GET, the
+// no-LLM apply step with its deterministic re-checks and the hourly job.
+// api.anthropic.com and global fetch are counted and asserted zero. Serial.
+runSerial(async () => {
+  console.log("\n── 3j: gardssalg-website-judgement-job (candidates, apply, job) ──");
+  try {
+    const { runGardssalgWebsiteJudgementJobTests } = require("../src/services/gardssalg-website-judgement-job.test") as
+      typeof import("../src/services/gardssalg-website-judgement-job.test");
+    const wj = await runGardssalgWebsiteJudgementJobTests({ log: false });
+    passed += wj.passed;
+    failed += wj.failed;
+    for (const f of wj.failures) failures.push("gardssalg-website-judgement-job: " + f);
+    console.log(`  gardssalg-website-judgement-job: ${wj.passed} passed, ${wj.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-website-judgement-job: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // Tillegg 2026-10-15 «4b-forslag»: gårdssalg visit-text proposals — the
 // candidates GET, the shared apply function behind POST /admin/gardssalg-
 // visit-proposals-write (server re-fetch + verbatim evidence + overlap) and
