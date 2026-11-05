@@ -13,9 +13,11 @@
 import {
   detectContactForms,
   formSkipReason,
-  producerRegistrableDomain,
-  urlIsOnDomain,
+  producerOwnHost,
+  urlIsOnProducerHost,
+  parseMaxLength,
   decodeEntities,
+  CONTACT_FORM_MAX_HTML_CHARS,
   type ContactFormField,
   type DetectedContactForm,
 } from "./contact-form-detector";
@@ -167,7 +169,7 @@ export function runContactFormDetectorTests(opts: { log?: boolean } = {}): TestS
       "annet_domene: page on another domain",
     );
     // The producer's "website" is a hosted platform: never same-site.
-    assertEq(producerRegistrableDomain("https://gard.wixsite.com/gard"), null, "platform website → no producer domain");
+    assertEq(producerOwnHost("https://gard.wixsite.com/gard"), null, "platform website → no producer domain");
     assertEq(
       only(page(PLAIN_FORM), "https://gard.wixsite.com/gard/kontakt", "https://gard.wixsite.com/gard")?.skipReason,
       "annet_domene",
@@ -184,8 +186,8 @@ export function runContactFormDetectorTests(opts: { log?: boolean } = {}): TestS
     const sub = PLAIN_FORM.replace('action="/send"', 'action="https://skjema.gard.no/send"');
     assertEq(only(page(sub))?.sameSiteAsProducer, true, "subdomain action is same site");
     assertEq(only(page(PLAIN_FORM), "https://gard.no/kontakt", "gard.no")?.sameSiteAsProducer, true, "bare website value");
-    assertEq(urlIsOnDomain("https://a.b.gard.no/x", "gard.no"), true, "urlIsOnDomain: deep subdomain");
-    assertEq(urlIsOnDomain("https://ostegard.no/x", "gard.no"), false, "urlIsOnDomain: suffix without dot is not a subdomain");
+    assertEq(urlIsOnProducerHost("https://a.b.gard.no/x", "gard.no"), true, "urlIsOnProducerHost: deep subdomain");
+    assertEq(urlIsOnProducerHost("https://ostegard.no/x", "gard.no"), false, "urlIsOnProducerHost: suffix without dot is not a subdomain");
   }
 
   // 7. Required phone.
@@ -306,6 +308,224 @@ export function runContactFormDetectorTests(opts: { log?: boolean } = {}): TestS
     assertEq(decodeEntities("Sp&oslash;rsm&aring;l &laquo;x&raquo; &#8212; &#xE6;"), "Spørsmål «x» — æ", "entities decoded");
     const f = only(page(`<form><label for="a">E-post</label><input id="a" name="a1"><label for="b">Sp&oslash;rsm&aring;l</label><input id="b" name="b1"></form>`));
     assertEq([roleOf(f, "a1"), roleOf(f, "b1")], ["email", "message"], "label via for= with entities: e-post + spørsmål");
+  }
+
+  // 15. Review B1: a submit control's formaction / formmethod overrides the form's.
+  {
+    // Reviewer's exact repro.
+    const b1 = only(
+      page(`<form action="/x"><input type="email" name="epost"><textarea name="melding"></textarea><button formaction="https://evil.com/x">Send</button></form>`),
+    );
+    assertEq(b1?.action, "https://www.gard.no/x", "B1: form action itself is on the producer site");
+    assertEq(b1?.submitActions, [{ action: "https://evil.com/x", method: null }], "B1: button formaction recorded");
+    assertEq(b1?.sameSiteAsProducer, false, "B1: button formaction to evil.com → not same site");
+    assertEq(b1?.skipReason, "annet_domene", "B1: skip annet_domene");
+    const FIELDS = `<input type="email" name="epost"><textarea name="melding"></textarea>`;
+    const sub = only(page(`<form action="/x">${FIELDS}<input type="submit" formaction="https://evil.com/x"></form>`));
+    assertEq(sub?.skipReason, "annet_domene", "B1: input type=submit formaction off-site");
+    const img = only(page(`<form action="/x">${FIELDS}<input type="image" src="/b.png" formaction="//evil.com/x"></form>`));
+    assertEq(img?.skipReason, "annet_domene", "B1: input type=image protocol-relative formaction off-site");
+    const js = only(page(`<form action="/x">${FIELDS}<button type="submit" formaction="javascript:alert(1)">Send</button></form>`));
+    assertEq(js?.sameSiteAsProducer, false, "B1: javascript: formaction → not same site");
+    const ftp = only(page(`<form action="/x">${FIELDS}<button formaction="ftp://www.gard.no/x">Send</button></form>`));
+    assertEq(ftp?.sameSiteAsProducer, false, "B1: ftp: formaction on own host → not same site");
+    const own = only(page(`<form action="/x">${FIELDS}<button formaction="/y" formmethod="POST">Send</button></form>`));
+    assertEq(own?.submitActions, [{ action: "https://www.gard.no/y", method: "post" }], "B1: own formaction + formmethod recorded");
+    assertEq(own?.sameSiteAsProducer, true, "B1: own-site formaction stays same site");
+    const empty = only(page(`<form action="/x">${FIELDS}<button formaction="">Send</button></form>`, '<base href="https://evil.com/">'));
+    assertEq(empty?.submitActions[0]?.action, PAGE, "B1: empty formaction → document URL, not <base>");
+    const plainBtn = only(page(`<form action="/x">${FIELDS}<button type="button" formaction="https://evil.com/x">Vis</button><button type="reset" formaction="https://evil.com/r">Nullstill</button></form>`));
+    assertEq([plainBtn?.submitActions.length, plainBtn?.sameSiteAsProducer], [0, true], "B1: type=button/reset never submit");
+    const invalidType = only(page(`<form action="/x">${FIELDS}<button type="bogus" formaction="https://evil.com/x">Send</button></form>`));
+    assertEq(invalidType?.skipReason, "annet_domene", "B1: invalid button type defaults to submit");
+    const methodOnly = only(page(`<form action="/x" method="post">${FIELDS}<button formmethod="get">Send</button></form>`));
+    assertEq(methodOnly?.submitActions, [{ action: "https://www.gard.no/x", method: "get" }], "B1: formmethod alone recorded with form action");
+    const outside = only(page(`<form id="k" action="/x">${FIELDS}</form><button form="k" formaction="https://evil.com/x">Send</button>`));
+    assertEq(outside?.skipReason, "annet_domene", "B1: form= submit button outside the form is read");
+    const upper = only(page(`<form action="/x">${FIELDS}<BUTTON FORMACTION="https://evil.com/x">Send</BUTTON></form>`));
+    assertEq(upper?.skipReason, "annet_domene", "B1: upper-case FORMACTION");
+  }
+
+  // 16. Review B2: own host or a subdomain of it — never sibling, parent or co-tenant.
+  {
+    const FORM = `<form action="/x"><input type="email" name="epost"><textarea name="melding"></textarea></form>`;
+    const ABS = (u: string) => `<form action="${u}"><input type="email" name="epost"><textarea name="melding"></textarea></form>`;
+    // Reviewer's exact repros.
+    assertEq(only(page(FORM), "https://b.oslo.no/x", "https://a.oslo.no")?.sameSiteAsProducer, false, "B2: b.oslo.no is not a.oslo.no");
+    assertEq(only(page(FORM), "https://oslo.no", "https://a.oslo.no")?.sameSiteAsProducer, false, "B2: parent oslo.no is not a.oslo.no");
+    assertEq(
+      only(page(ABS("https://other.webador.no/x")), "https://gard.webador.no/kontakt", "https://gard.webador.no")?.sameSiteAsProducer,
+      false,
+      "B2: other.webador.no action is another tenant",
+    );
+    assertEq(only(page(FORM), "https://other.webador.no/x", "https://gard.webador.no")?.sameSiteAsProducer, false, "B2: page on other tenant");
+    assertEq(only(page(FORM), "https://shop.gard.no/x", "https://sub.gard.no")?.sameSiteAsProducer, false, "B2: sibling shop.gard.no");
+    assertEq(only(page(ABS("https://shop.gard.no/x")), "https://sub.gard.no/k", "https://sub.gard.no")?.sameSiteAsProducer, false, "B2: sibling action");
+    assertEq(only(page(FORM), "https://gard.no/x", "https://sub.gard.no")?.sameSiteAsProducer, false, "B2: parent gard.no of sub.gard.no");
+    // Still same site.
+    assertEq(only(page(FORM), "https://gard.webador.no/kontakt", "https://gard.webador.no")?.sameSiteAsProducer, true, "B2: own tenant host");
+    assertEq(only(page(FORM), "https://a.oslo.no/kontakt", "https://a.oslo.no")?.sameSiteAsProducer, true, "B2: own host a.oslo.no");
+    assertEq(only(page(FORM), "https://www.sub.gard.no/k", "https://sub.gard.no")?.sameSiteAsProducer, true, "B2: www of own host");
+    assertEq(only(page(FORM), "https://gard.no/k", "https://www.gard.no")?.sameSiteAsProducer, true, "B2: www. stripped from producer");
+    assertEq(only(page(ABS("https://skjema.sub.gard.no/x")), "https://sub.gard.no/k", "https://sub.gard.no")?.sameSiteAsProducer, true, "B2: subdomain of own host");
+    assertEq(producerOwnHost("https://www.Sub.Gard.no/om"), "sub.gard.no", "B2: producerOwnHost keeps subdomains, strips www.");
+    assertEq(producerOwnHost("https://co.uk"), null, "B2: bare public suffix is nobody's host");
+    assertEq(producerOwnHost("https://www.facebook.com/gard"), null, "B2: social platform is never the producer's host");
+    assertEq(urlIsOnProducerHost("https://gard.priv.no/x", "other.priv.no"), false, "B2: other.priv.no");
+  }
+
+  // 17. Review N6: tests for the mutants that survived.
+  {
+    // M1: page on a foreign domain, absolute action back to the producer.
+    const m1 = only(
+      page(PLAIN_FORM.replace('action="/send"', 'action="https://www.gard.no/send"')),
+      "https://evil.example.com/kontakt",
+    );
+    assertEq([m1?.sameSiteAsProducer, m1?.skipReason], [false, "annet_domene"], "N6/M1: foreign page with producer action");
+    // M4: non-http protocol on the producer's host.
+    const m4 = only(page(PLAIN_FORM.replace('action="/send"', 'action="ftp://gard.no/x"')));
+    assertEq(m4?.skipReason, "annet_domene", "N6/M4: ftp://gard.no action");
+    assertEq(urlIsOnProducerHost("ftp://gard.no/x", "gard.no"), false, "N6/M4: urlIsOnProducerHost rejects ftp");
+    // M9: <form> markup inside <script> is not a form.
+    const m9 = detectContactForms(
+      page(`<script>var t = '<form action="https://evil.com"><textarea name="m"></textarea></form>';</script>` + PLAIN_FORM),
+      PAGE,
+      SITE,
+    );
+    assertEq([m9.formsTotal, m9.forms[0]?.action], [1, "https://www.gard.no/send"], "N6/M9: <script> content is raw text");
+    // M8: a nested <form> is ignored; the outer form's action stands.
+    const m8 = detectContactForms(
+      page(`<form action="/a"><form action="https://evil.com/x"><input type="email" name="e"><textarea name="m"></textarea></form>`),
+      PAGE,
+      SITE,
+    );
+    assertEq([m8.formsTotal, m8.forms[0]?.action, m8.forms[0]?.sameSiteAsProducer], [1, "https://www.gard.no/a", true], "N6/M8: nested form ignored");
+    // M13: captcha iframe inside the form.
+    const m13 = only(page(PLAIN_FORM.replace("<button", '<iframe src="https://www.google.com/recaptcha/api2/anchor?k=x"></iframe><button')));
+    assertEq([m13?.captcha, m13?.skipReason], [true, "captcha"], "N6/M13: recaptcha iframe in form");
+  }
+
+  // 18. Review N1: prefer a <textarea> as the message field and use its maxlength.
+  {
+    const f = only(
+      page(`<form><input type="text" name="melding_kort" maxlength="20"><input type="email" name="e"><textarea name="melding" maxlength="2000"></textarea></form>`),
+      PAGE,
+      SITE,
+      100,
+    );
+    assertEq([f?.messageMaxLength, f?.skipReason], [2000, null], "N1: textarea preferred over text input named melding");
+    const single = only(page(`<form><input type="email" name="e"><input type="text" name="melding" maxlength="50"></form>`), PAGE, SITE, 60);
+    assertEq([single?.messageMaxLength, single?.skipReason], [50, "melding_for_lang"], "N1: only a text input → its maxlength");
+  }
+
+  // 19. Review N2: more captcha shapes.
+  {
+    const cases: Array<[string, string, string]> = [
+      ["cookiebot data-src recaptcha", PLAIN_FORM, '<script type="text/plain" data-cookieconsent="marketing" data-src="https://www.google.com/recaptcha/api.js"></script>'],
+      ["link preload recaptcha", PLAIN_FORM, '<link rel="preload" as="script" href="https://www.gstatic.com/recaptcha/releases/x/recaptcha__en.js">'],
+      ["altcha widget", PLAIN_FORM.replace("<button", '<altcha-widget challengeurl="/altcha"></altcha-widget><button'), ""],
+      ["altcha script", PLAIN_FORM, '<script type="module" src="https://cdn.jsdelivr.net/npm/altcha/dist/altcha.min.js"></script>'],
+      ["arkose script", PLAIN_FORM, '<script src="https://client-api.arkoselabs.com/v2/ABC/api.js" data-callback="setup"></script>'],
+      ["funcaptcha", PLAIN_FORM, '<script src="https://api.funcaptcha.com/fc/api/"></script>'],
+      ["friendly-challenge script", PLAIN_FORM, '<script type="module" src="https://cdn.jsdelivr.net/npm/friendly-challenge@0.9.12/widget.module.min.js" async defer></script>'],
+      ["image captcha", PLAIN_FORM.replace("<button", '<img src="/captcha.php?r=1"><button'), ""],
+    ];
+    for (const [name, body, head] of cases) {
+      assertEq(only(page(body, head))?.skipReason, "captcha", `N2: ${name} → captcha`);
+    }
+  }
+
+  // 20. Review N3: messageLength must be a finite number >= 0.
+  {
+    for (const bad of [NaN, -1, Infinity]) {
+      let threw = false;
+      try {
+        detectContactForms(page(PLAIN_FORM), PAGE, SITE, bad);
+      } catch (e) {
+        threw = e instanceof RangeError;
+      }
+      assertEq(threw, true, `N3: detectContactForms throws on messageLength ${bad}`);
+      let threw2 = false;
+      try {
+        formSkipReason({ captcha: false, sameSiteAsProducer: true, phoneRequired: false, messageMaxLength: 10, fields: [] }, bad);
+      } catch (e) {
+        threw2 = e instanceof RangeError;
+      }
+      assertEq(threw2, true, `N3: formSkipReason throws on messageLength ${bad}`);
+    }
+  }
+
+  // 21. Review N4: maxlength parsed as a browser does.
+  {
+    assertEq(
+      ["10.5", "10abc", " 10", "+7", "-0", "-5", "abc", "", "99999999999999999999"].map((v) => parseMaxLength(v)),
+      [10, 10, 10, 7, 0, null, null, null, null],
+      "N4: leading-integer maxlength parsing",
+    );
+    const f = only(page(`<form><input type="email" name="e"><textarea name="m" maxlength="10.5"></textarea></form>`), PAGE, SITE, 11);
+    assertEq([f?.messageMaxLength, f?.skipReason], [10, "melding_for_lang"], "N4: maxlength 10.5 → 10, 11 chars too long");
+  }
+
+  // 22. Review N5: raw-text elements do not open forms.
+  {
+    const EVIL = `<form action="https://evil.com/x"><input type="email" name="e"><textarea name="m"></textarea></form>`;
+    for (const tag of ["title", "xmp", "noscript", "template", "textarea", "style"]) {
+      const s = detectContactForms(page(`<${tag}><form action="/own"></${tag}>${EVIL}`), PAGE, SITE);
+      assertEq(
+        [s.formsTotal, s.forms[0]?.action, s.forms[0]?.skipReason],
+        [1, "https://evil.com/x", "annet_domene"],
+        `N5: unclosed <form> inside <${tag}> does not hide the real form`,
+      );
+    }
+    const tpl = detectContactForms(page(`<template>${EVIL}</template>`), PAGE, SITE);
+    assertEq(tpl.formsTotal, 0, "N5: a form inside <template> is inert");
+    const ns = detectContactForms(page(`<noscript><iframe src="https://www.google.com/recaptcha/api/fallback"></iframe></noscript>${PLAIN_FORM}`), PAGE, SITE);
+    assertEq(ns.pageCaptcha, true, "N5: captcha in <noscript> fallback still marks the page");
+  }
+
+  // 23. Review N8: an apostrophe in an unquoted attribute value does not swallow the page.
+  {
+    const s = detectContactForms(page(`<img alt=Ola's src=/x.png>${PLAIN_FORM}<p>Gården's butikk</p>`), PAGE, SITE);
+    assertEq([s.formsTotal, s.forms.length, s.forms[0]?.fields.length], [1, 1, 9], "N8: alt=Ola's keeps the form");
+    const f = only(page(`<form><input type=email name=e><textarea name=gjest's-melding></textarea></form>`));
+    assertEq(f?.fields.map((x) => x.name), ["e", "gjest's-melding"], "N8: unquoted value keeps its apostrophe");
+  }
+
+  // 23b. Review B3: an unquoted "<" inside a tag ends that tag attempt; the next tag is read.
+  {
+    const s = detectContactForms(page(`<b <form action="/a"><input type="email" name="e"><textarea name="m"></textarea></form>`), PAGE, SITE);
+    assertEq([s.formsTotal, s.forms[0]?.action], [1, "https://www.gard.no/a"], "B3: '<b <form' → the form is still a tag");
+  }
+
+  // 24. Review B3: tokenizing is linear — 2 MB of adversarial input in well under 2 s each.
+  {
+    const MB2 = CONTACT_FORM_MAX_HTML_CHARS;
+    const fill = (unit: string): string => unit.repeat(Math.ceil(MB2 / unit.length)).slice(0, MB2);
+    const shapes: Array<[string, string]> = [
+      ['"<a".repeat(1e6)', "<a".repeat(1_000_000)],
+      ["<a b= (repeated)", fill("<a b=")],
+      ['<a b=" (repeated)', fill('<a b="')],
+      ["<a b=' (repeated)", fill("<a b='")],
+      ['<a b="<a c=\' (mixed quotes)', fill("<a b=\"<a c='")],
+      ["<a x=y' (unquoted + quote)", fill("<a x=y'")],
+      ["</a (close tags)", fill("</a ")],
+      ["<!-- (comments)", fill("<!--")],
+      ["<script> + </script (unterminated)", "<script>" + fill("</script ")],
+      ['<form><textarea> + "<a" unclosed', "<form><textarea name=m>" + fill("<a")],
+      ["<a = = (bare equals)", fill("<a = =")],
+      // Shapes found by fuzzing a no-memo variant (quadratic there: ~1 s at 40 KB).
+      ['<a"=" (quote after name)', fill('<a"="')],
+      ["<a'x=' (quoted value swallows next tag)", fill("<a'x='")],
+      ['""="<a', fill('""="<a')],
+      ['<a<a"="', fill('<a<a"="')],
+    ];
+    for (const [name, html] of shapes) {
+      const t0 = Date.now();
+      detectContactForms(html, PAGE, SITE);
+      const ms = Date.now() - t0;
+      if (log) console.log(`    timing ${name}: ${html.length} chars in ${ms} ms`);
+      assertEq(ms < 2000, true, `B3: ${name} (${html.length} chars) under 2 s`);
+    }
   }
 
   return { passed, failed, failures };
