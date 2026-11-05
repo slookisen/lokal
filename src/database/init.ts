@@ -4467,6 +4467,31 @@ function initSchema(db: Database.Database): void {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_agents_org_nr ON agents(org_nr) WHERE org_nr IS NOT NULL`);
   } catch { /* partial index unsupported or already created */ }
 
+  // ─── Økologi S3c (A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-
+  // register-og-tekstrevisjon): an org.nr. the OWNER typed in the portal ────
+  // (POST /eier/:agentId/org-nr). A CANDIDATE only: the Debio register sync
+  // turns it into a pending debio_match_review row (match_method
+  // 'owner_org_nr') that a person approves. Never copied into agents.org_nr,
+  // which the sync treats as a safe automatic match.
+  //
+  // A side table, NOT new columns on `agents`: a wider `agents` row flips
+  // SQLite's index choice for the unordered public scans (see the økologi S1
+  // note at agent_debio_status; dyre-oppslag-tak, strukturerte-lister-tak and
+  // name-search-fts fail with two extra TEXT columns on `agents`).
+  //   owner_org_nr    : 9 digits, MOD11-checked
+  //   owner_org_nr_at : ISO-8601 of the owner's save
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_owner_org_nr (
+        agent_id TEXT PRIMARY KEY,
+        owner_org_nr TEXT NOT NULL,
+        owner_org_nr_at TEXT NOT NULL
+      )
+    `);
+  } catch (err) {
+    console.error("Migration agent_owner_org_nr (økologi S3c) failed:", err);
+  }
+
   // ─── agents_org_nr_audit / agents_org_nr_review_queue (dev-request ─────
   // 2026-07-26-rfb-outreach-tilsig-blokkerdiagnose-og-orgnr, Steg 2) ────────
   //

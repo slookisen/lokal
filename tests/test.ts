@@ -51898,6 +51898,30 @@ runSerial(async () => {
 });
 
 // A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
+// tekstrevisjon, S3c (the owner's own text): RFB_ORGANIC_CLAIM_GATE +
+// RFB_ORGANIC_OWNER_GATE — owner save stored unchanged with organic_notice,
+// portal message + org.nr. form, POST /eier/:id/org-nr (candidate only, never
+// agents.org_nr), register sync → pending owner_org_nr review row, profile
+// page NO/EN/SV drops organic sentences from owner-written about for a
+// producer without a valid Debio status. Swaps the getDb() singleton, env
+// vars, fetch and console.log (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-28-rfb-okologisk-merking S3c: eierens egen tekst og org.nr. ──");
+  try {
+    const { runOrganicOwnerGateS3cTests } = require("../src/routes/organic-owner-gate-s3c.test") as
+      typeof import("../src/routes/organic-owner-gate-s3c.test");
+    const r = await runOrganicOwnerGateS3cTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("organic-owner-gate-s3c: " + f);
+    console.log(`  organic-owner-gate-s3c: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("organic-owner-gate-s3c: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
 // tekstrevisjon, S1: status from Debio's full register — normalizer, < 2500
 // rows rejected, the match methods, support signals → review only, review
 // approve/reject, AC1.4 reset, > 7 days stale, profile wording (AC1.5), flag

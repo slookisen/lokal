@@ -24,7 +24,7 @@ import { safeHonestCatalogCount } from "../services/honest-count";
 import { resolveRouteIntent } from "../services/route-intent";
 import { knowledgeService, productPriceText, parseProductPrice, OWNER_PRODUCT_SOURCES } from "../services/knowledge-service";
 import { catalogNameNorm, softStockByNameNorm, stockSoftExpiryBuyerText, type SoftStockFields } from "../services/stock-soft-expiry";
-import { containsOrganicClaim, isOrganicClaimUmbrella } from "../services/organic-claims";
+import { containsOrganicClaim, isOrganicClaimUmbrella, dropOrganicSentences } from "../services/organic-claims";
 import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenFields, hidesAddress, hidesPrices, debioSwitchOffAgentIds } from "../owner-features/enforce";
 import { debioApprovalText, debioProcessText, debioRegisterSyncEnabled, finnokoSearchUrl, readDebioStatusRow } from "../services/debio-approval";
 import { publicCountsShown } from "../services/public-stats-threshold";
@@ -56,7 +56,7 @@ import { getTrafficStats, getTrafficStatsSnapshot } from "../services/traffic-st
 import { publicTrafficYearBlock, TRAFFIC_YEAR_KEYS, trafficYearCell, trafficYearLangOf, type TrafficYearKey } from "../services/traffic-year-compute";
 import { aiDeliveriesYearPeriodLabel } from "../services/profile-year-compute";
 import { isDisplayablePhone } from "../services/contact-normalizer";
-import { isJunkDescription, stripInternalNotes, normalizeProse } from "../services/description-quality";
+import { isJunkDescription, stripInternalNotes, normalizeProse, organicOwnerGateActive } from "../services/description-quality";
 import { getProfileActivity } from "../services/profile-activity-service";
 import { recordAiPageDelivery } from "../services/profile-ai-deliveries";
 import { recordAiProfileClick } from "../services/profile-ai-clicks";
@@ -5513,6 +5513,21 @@ function passesRoleGate(
   return true;
 }
 
+/**
+ * Økologi S3c: is agent_knowledge.about owner-written (curated_fields.about.by
+ * === "owner")? Tolerant: unreadable JSON / no row = false.
+ */
+function ownerWroteAbout(agentId: string): boolean {
+  try {
+    const row = getDb().prepare("SELECT curated_fields FROM agent_knowledge WHERE agent_id = ?").get(agentId) as { curated_fields?: string | null } | undefined;
+    if (!row?.curated_fields) return false;
+    const parsed = JSON.parse(row.curated_fields);
+    return !!parsed && typeof parsed === "object" && parsed.about?.by === "owner";
+  } catch {
+    return false;
+  }
+}
+
 // ─── E-mail on the producer profile (dev-request
 // 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting, slice 3: S-A1 and
 // S-A3 on rettfrabonden.com /produsent/:slug) ──────────────────────────────
@@ -5805,7 +5820,16 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // lede, umbrella "about", LocalBusiness JSON-LD, <meta name="description">)
     // so a junk value never reaches any public output for this page.
     const rawDescription = agent.description || "";
-    const rawAbout = k.about || "";
+    // Økologi S3c (RFB_ORGANIC_CLAIM_GATE + RFB_ORGANIC_OWNER_GATE, both
+    // default off): an OWNER-written about (curated_fields.about.by "owner")
+    // of a producer without a valid Debio status (the badge's signal) loses
+    // every sentence with an organic claim before any about-derived output
+    // (body, JSON-LD, umbrella text) — and so does a published EN/SV
+    // translation of it. Nothing left = empty, so the existing fallbacks
+    // apply. Read-side only; the stored text is unchanged.
+    const ownerOrganicFilter = organicOwnerGateActive() && info?.agent.debioVerified !== true &&
+      ownerWroteAbout(agent.id);
+    const rawAbout = ownerOrganicFilter ? dropOrganicSentences(k.about || "") : (k.about || "");
     // stripInternalNotes: an enrichment routine's own working note appended to
     // real producer prose ("… NB: nettside midlertidig utilgjengelig — kontakt
     // bør bekreftes av verifier.") must not reach a customer, but the prose in
@@ -5825,9 +5849,12 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       ? getPublishedProfileTranslations(getDb(), "rfb", "agent", agent.id, lang)
       : {};
     const displayDescription = (safeDescription && profileTranslations.description) || safeDescription;
-    const displayAbout = (safeAbout && profileTranslations.about) || safeAbout;
+    const aboutTranslation = ownerOrganicFilter && profileTranslations.about
+      ? dropOrganicSentences(profileTranslations.about)
+      : profileTranslations.about;
+    const displayAbout = (safeAbout && aboutTranslation) || safeAbout;
     const descriptionIsNb = lang !== "no" && !!safeDescription && !profileTranslations.description;
-    const aboutIsNb = lang !== "no" && !!safeAbout && !profileTranslations.about;
+    const aboutIsNb = lang !== "no" && !!safeAbout && !aboutTranslation;
     if (rawDescription && !safeDescription) {
       console.log(`[description-guard] suppressed junk agent.description for ${agent.id} (${agent.name}) on /produsent/${slug}`);
     }

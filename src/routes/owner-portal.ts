@@ -3,7 +3,9 @@ import { getDb } from "../database/init";
 import { emailService } from "../services/email-service";
 import { slugify } from "../utils/slug";
 import { getOwnerStats } from "../services/owner-stats-service";
-import { looksLikeCodeArtifact } from "../services/description-quality";
+import { looksLikeCodeArtifact, organicOwnerGateActive, hasValidDebioStatus } from "../services/description-quality";
+import { containsOrganicClaim } from "../services/organic-claims";
+import { validOwnerOrgNr } from "../services/debio-register-client";
 import {
   listOwnerTranslations,
   setOwnerTranslation,
@@ -712,6 +714,78 @@ function ownerProfileDisplayValue(dbField: string, stored: unknown): string {
 // 4. Update database + audit log
 // 5. Return updated fields + skipped fields
 
+// ─────────────────────────────────────────────────────────────────
+// Økologi S3c (A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-
+// register-og-tekstrevisjon): the owner's own text and «økologisk»
+// ─────────────────────────────────────────────────────────────────
+// Behind RFB_ORGANIC_CLAIM_GATE AND RFB_ORGANIC_OWNER_GATE (both default
+// off; either off = byte-identical to before). The owner's save is never
+// refused or altered; the portal explains that the word needs Debio's
+// approval and takes an org.nr. as a CANDIDATE (agent_owner_org_nr) for the
+// register sync's human review — never agents.org_nr.
+
+/** The message at the description field, verbatim from the dev-request. */
+export const OWNER_ORGANIC_NOTICE_TEXT =
+  "Ordet økologisk kan bare vises når Debio har godkjent virksomheten. Legg inn organisasjonsnummer, så sjekker vi registeret automatisk.";
+/** After a valid org.nr. was stored. */
+export const OWNER_ORG_NR_SAVED_TEXT =
+  "Takk. Vi sjekker nummeret mot Debios register ved neste kjøring, og en person godkjenner treffet før ordet kan vises.";
+/** After an org.nr. that failed the 9-digit / MOD11 check. */
+export const OWNER_ORG_NR_INVALID_TEXT =
+  "Organisasjonsnummeret er ikke gyldig. Sjekk at det har 9 siffer og prøv igjen.";
+
+/** agents.debio_verified read tolerantly (a DB without the column = no status). */
+function ownerAgentHasValidDebioStatus(agentId: string): boolean {
+  try {
+    const row = getDb().prepare("SELECT debio_verified FROM agents WHERE id = ?").get(agentId) as { debio_verified?: unknown } | undefined;
+    return hasValidDebioStatus(row ?? null);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * S3c save notice: flags on, the request saved `description` (not skipped)
+ * and it carries an organic claim, and the producer has no valid Debio status.
+ */
+function ownerOrganicNoticeFor(agentId: string, description: unknown, skipped: Array<{ field: string }>): boolean {
+  if (!organicOwnerGateActive()) return false;
+  if (typeof description !== "string" || !containsOrganicClaim(description)) return false;
+  if (skipped.some((s) => s.field === "description")) return false;
+  return !ownerAgentHasValidDebioStatus(agentId);
+}
+
+/** The owner-supplied org.nr. candidate (tolerant: no table = none). */
+function readOwnerOrgNr(agentId: string): string | null {
+  try {
+    const row = getDb().prepare("SELECT owner_org_nr FROM agent_owner_org_nr WHERE agent_id = ?").get(agentId) as { owner_org_nr?: string } | undefined;
+    return row?.owner_org_nr ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * S3c portal block under the description field: the message, the org.nr.
+ * result line, and an org.nr. input. The input and button belong to the
+ * separate form #ep-orgnr-form (HTML `form` attribute) rendered after the
+ * profile form, so no form is nested and the profile save never sends it.
+ */
+function ownerOrganicNoticeHtml(orgNrState: string, storedOwnerOrgNr: string | null): string {
+  const result = orgNrState === "saved"
+    ? `<div class="ep-alert ep-alert-ok" role="status" data-orgnr-status="saved">${escapeHtml(OWNER_ORG_NR_SAVED_TEXT)}</div>`
+    : orgNrState === "invalid"
+      ? `<div class="ep-alert ep-alert-error" role="alert" data-orgnr-status="invalid">${escapeHtml(OWNER_ORG_NR_INVALID_TEXT)}</div>`
+      : "";
+  return `<div class="ep-lock" data-organic-notice="1" role="note">${escapeHtml(OWNER_ORGANIC_NOTICE_TEXT)}</div>
+          ${result}
+          <div class="ep-field" style="margin-top:8px;">
+            <label for="ep-org-nr">Organisasjonsnummer</label>
+            <input id="ep-org-nr" name="org_nr" form="ep-orgnr-form" type="text" inputmode="numeric" autocomplete="off" maxlength="20" value="${escapeHtml(storedOwnerOrgNr ?? "")}" aria-label="Organisasjonsnummer">
+            <button type="submit" form="ep-orgnr-form" class="ep-btn ep-btn-secondary" style="margin-top:8px;">Send organisasjonsnummer</button>
+          </div>`;
+}
+
 router.post("/api/agents/:id/update-profile", (req: Request, res: Response) => {
   try {
     const { id } = req.params;
@@ -919,11 +993,19 @@ router.post("/api/agents/:id/update-profile", (req: Request, res: Response) => {
       `[owner-portal] Updated ${id}: ${Object.keys(updatedFields).length} fields, ${auditIds.length} audit records`
     );
 
+    // Økologi S3c (RFB_ORGANIC_CLAIM_GATE + RFB_ORGANIC_OWNER_GATE): the
+    // owner's text is stored exactly as given; when the saved description
+    // carries an organic claim and the producer has no valid Debio status, the
+    // answer says so (organic_notice) and the portal explains how to get the
+    // word shown. Flags off = the answer is byte-identical to before.
+    const organicNotice = ownerOrganicNoticeFor(id, bodyFields.description, skippedFields);
+
     return res.json({
       success: true,
       updated_fields: Object.keys(updatedFields),
       skipped_fields: skippedFields,
       audit_ids: auditIds,
+      ...(organicNotice ? { organic_notice: true } : {}),
     });
   } catch (error) {
     console.error("[owner-portal] Error in update-profile:", error);
@@ -2085,6 +2167,24 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       { key: "description",  dbField: "about",         label: FL.about,         type: "textarea" },
     ];
 
+    // Økologi S3c: the «økologisk needs Debio» message at the description
+    // field — after a save that set organic=1, or when the stored owner text
+    // carries an organic claim — for a producer without a valid Debio status,
+    // only with both flags on (off = the portal is byte-identical to before).
+    let organicNoticeHtml = "";
+    if (organicOwnerGateActive()) {
+      try {
+        const aboutByOwner = (curatedFields.about || {}).by === "owner";
+        const wantNotice = req.query.organic === "1" || (aboutByOwner && containsOrganicClaim(knowledge.about));
+        if (wantNotice && !ownerAgentHasValidDebioStatus(agentId)) {
+          organicNoticeHtml = ownerOrganicNoticeHtml(String(req.query.orgnr || ""), readOwnerOrgNr(agentId));
+        }
+      } catch (e) {
+        console.error("[owner-portal] organic notice failed:", e instanceof Error ? e.message : "error");
+        organicNoticeHtml = "";
+      }
+    }
+
     const fieldHtml = fieldDefs.map((fd) => {
       const value = ownerProfileDisplayValue(fd.dbField, (knowledge as any)[fd.dbField]);
       const lockInfo = curatedFields[fd.dbField] || {};
@@ -2100,7 +2200,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
         return `<div class="ep-field">
           <label for="${inputName}">${escapeHtml(fd.label)}</label>
           <textarea id="${inputName}" name="${inputName}" aria-label="${escapeHtml(fd.label)}" ${lockedByOther ? "disabled" : ""}>${escapeHtml(value)}</textarea>
-          ${lockedHtml}
+          ${lockedHtml}${fd.key === "description" && organicNoticeHtml ? `\n          ${organicNoticeHtml}` : ""}
         </div>`;
       }
       return `<div class="ep-field">
@@ -2153,7 +2253,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
             <button type="submit" class="ep-btn ep-btn-primary">Lagre alle endringer</button>
             <a href="${escapeHtml(backUrl)}" class="ep-btn ep-btn-secondary">Avbryt</a>
           </div>
-        </form>
+        </form>${organicNoticeHtml ? `\n        <form id="ep-orgnr-form" method="post" action="/eier/${encodeURIComponent(agent.id)}/org-nr"></form>` : ""}
       </div>
 
       ${autoUpdatesCardHtml}${ownerFeaturesCardHtml}${ownerSelgerCardHtml(agent.id)}${productImportCard}${orderabilityCardHtml}${ownerOrdersEntryCardHtml(agent.id, pendingOrderCount)}${ordersOrMovedCardHtml}${paymentCardHtml}${pauseCardHtml}
@@ -2581,11 +2681,68 @@ router.post("/eier/:agentId/save", express.urlencoded({ extended: false }), asyn
       body: JSON.stringify(payload),
     });
     if (resp.ok) {
-      return res.redirect(303, `${base}?status=saved`);
+      // Økologi S3c: organic_notice is only ever set with both flags on.
+      let organic = false;
+      if (organicOwnerGateActive()) {
+        try { organic = ((await resp.json()) as any)?.organic_notice === true; } catch { organic = false; }
+      }
+      return res.redirect(303, `${base}?status=saved${organic ? "&organic=1" : ""}`);
     }
     return res.redirect(303, `${base}?status=error`);
   } catch (err) {
     console.error("[owner-portal] POST /eier/:agentId/save error:", err);
+    return res.redirect(303, `${base}?status=error`);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────
+// POST /eier/:agentId/org-nr — økologi S3c: the owner's org.nr. CANDIDATE
+// ─────────────────────────────────────────────────────────────────
+// Only with RFB_ORGANIC_CLAIM_GATE and RFB_ORGANIC_OWNER_GATE on (else 404).
+// Same guards as /eier/:agentId/save. A valid number (9 digits, MOD11) goes to
+// agent_owner_org_nr — never agents.org_nr, which the Debio register sync
+// treats as a safe automatic match. The sync turns it into a pending
+// debio_match_review row (match_method 'owner_org_nr') a person approves.
+router.post("/eier/:agentId/org-nr", express.urlencoded({ extended: false }), (req: Request, res: Response, next) => {
+  if (!organicOwnerGateActive()) return next();
+  const agentId = String((req.params as any).agentId || "");
+  const session = verifyOwnerSession(req);
+  const base = `/eier/${encodeURIComponent(agentId)}/portal`;
+  if (!session.valid) {
+    return res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
+  }
+  if (!ownerSessionAllows(agentId, session)) {
+    return session.agentId === agentId
+      ? res.status(403).send(ownerNotVerifiedPage(agentId))
+      : res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
+  }
+  if (isCrossSiteWrite(req, "/eier/:agentId/org-nr")) {
+    return res.status(403).send(portalWriteRefusedPage(base));
+  }
+  try {
+    const orgNr = validOwnerOrgNr((req.body as any)?.org_nr);
+    if (!orgNr) {
+      return res.redirect(303, `${base}?organic=1&orgnr=invalid`);
+    }
+    const db = getDb();
+    const exists = db.prepare("SELECT 1 FROM agents WHERE id = ?").get(agentId);
+    if (!exists) return res.redirect(303, `${base}?status=error`);
+    db.transaction(() => {
+      db.prepare(
+        `INSERT INTO agent_owner_org_nr (agent_id, owner_org_nr, owner_org_nr_at) VALUES (?, ?, ?)
+         ON CONFLICT(agent_id) DO UPDATE SET owner_org_nr = excluded.owner_org_nr, owner_org_nr_at = excluded.owner_org_nr_at`
+      ).run(agentId, orgNr, new Date().toISOString());
+      // A new number makes the earlier owner-supplied candidates stale: their
+      // PENDING review rows go. Approved / rejected decisions are kept.
+      db.prepare(
+        `DELETE FROM debio_match_review
+          WHERE agent_id = ? AND state = 'pending' AND match_method = 'owner_org_nr' AND (org_nr IS NULL OR org_nr <> ?)`
+      ).run(agentId, orgNr);
+    })();
+    console.log(`[owner-portal] owner org.nr. candidate stored for agent ${agentId}`);
+    return res.redirect(303, `${base}?organic=1&orgnr=saved`);
+  } catch (err) {
+    console.error("[owner-portal] POST /eier/:agentId/org-nr error:", err instanceof Error ? err.message : "error");
     return res.redirect(303, `${base}?status=error`);
   }
 });
