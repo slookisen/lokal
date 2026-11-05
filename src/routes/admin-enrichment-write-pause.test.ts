@@ -683,6 +683,10 @@ export async function runAdminEnrichmentWritePauseTests(
         // experiences pause before every apply tick (the services it drives do
         // not check it themselves).
         "services/experience-orgnr-job.ts",
+        // Step 3f: the gårdssalg website-verification daily job checks the
+        // experiences pause before every apply page (and treats a pause thrown
+        // by the apply as paused).
+        "services/gardssalg-website-verification-job.ts",
         // The description proposals job itself no longer imports the guard:
         // its mechanics moved VERBATIM into services/proposal-file-queue.ts
         // (tillegg 2026-10-15 «4b-forslag»), which checks the experiences

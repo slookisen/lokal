@@ -561,6 +561,7 @@ import {
 import {
   loadGardssalgWebsiteVerificationCohort,
   scanGardssalgWebsiteVerificationRows,
+  scanGardssalgWebsiteVerificationPage,
   planGardssalgWebsiteVerificationRemediation,
   applyGardssalgWebsiteVerification,
   getGardssalgWebsiteVerificationSweepOffset,
@@ -4201,7 +4202,7 @@ async function crFetchGardssalgContent(
  * A shared adapter is not a style preference here: every field this contract
  * grows is, by construction, one a caller needed and could not see.
  */
-function gsWvFetchFnFromGardssalgCrawler(): GsWvFetchFn {
+export function gsWvFetchFnFromGardssalgCrawler(): GsWvFetchFn {
   return async (homepageUrl: string) => {
     const fetched = await crFetchGardssalgContent(homepageUrl);
     if (!fetched.ok) {
@@ -27011,15 +27012,14 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
     // See gsWvFetchFnFromGardssalgCrawler's doc comment.
     const fetchFn: GsWvFetchFn = gsWvFetchFnFromGardssalgCrawler();
 
-    let cohort = loadGardssalgWebsiteVerificationCohort(expDb, scope, cohortParam);
-    if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
-      const idSet = new Set(
-        (body.providerIds as unknown[])
-          .filter((v): v is string => typeof v === "string" && v.trim() !== "")
-          .map((v) => v.trim())
-      );
-      cohort = cohort.filter((p) => idSet.has(p.id));
-    }
+    const providerIds =
+      Array.isArray(body.providerIds) && body.providerIds.length > 0
+        ? (body.providerIds as unknown[])
+            .filter((v): v is string => typeof v === "string" && v.trim() !== "")
+            .map((v) => v.trim())
+        : undefined;
+    // A non-empty providerIds array whose entries are all invalid still
+    // narrows the cohort to nothing (empty id set), as before.
 
     // Paginate BEFORE scanning — mirrors the GET audit route's own
     // `cohortRows.slice(pageOffset, pageOffset + limit)` pattern, so only the
@@ -27047,20 +27047,14 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
     // out of this repo's scope) is what will actually let production
     // benefit from this mechanism; tracked as its own follow-up.
     const usePersistedOffset = limit !== undefined && offset === undefined;
-    const total = cohort.length;
-    let pageOffset: number | undefined;
-    if (limit !== undefined) {
-      pageOffset = usePersistedOffset ? getGardssalgWebsiteVerificationSweepOffset(expDb, cohortParam) : (offset as number);
-      cohort = cohort.slice(pageOffset, pageOffset + limit);
-    }
-
-    const { summary, rows } = await scanGardssalgWebsiteVerificationRows(cohort, fetchFn, CR_CONCURRENCY);
-    const nextOffset =
-      limit === undefined
-        ? undefined
-        : (pageOffset as number) + rows.length < total
-          ? (pageOffset as number) + rows.length
-          : null;
+    const { summary, rows, total, pageOffset, nextOffset } = await scanGardssalgWebsiteVerificationPage(expDb, {
+      scope,
+      cohort: cohortParam,
+      fetchFn,
+      concurrency: CR_CONCURRENCY,
+      providerIds,
+      page: limit !== undefined ? { limit, offset: usePersistedOffset ? "persisted" : (offset as number) } : undefined,
+    });
     const pagination =
       limit === undefined
         ? undefined
@@ -27141,6 +27135,32 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
     if (sendEnrichmentWritePausedIfPaused(err, res)) return;
     console.error("[gardssalg-website-verification-remediation] failed:", err);
     res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── Server-side daily job for the sweep above (step «3f») — read-only status
+// + manual run. Same pattern as admin/experience-orgnr-job-run (3n). Registered
+// ahead of every `/:id` route. ──────────────────────────────────────────────
+import {
+  getGardssalgWebsiteVerificationJobStatus,
+  runGardssalgWebsiteVerificationJob,
+} from "../services/gardssalg-website-verification-job";
+
+router.get("/admin/gardssalg-website-verification-job-status", requireAdmin, (_req: Request, res: Response) => {
+  res.json({ success: true, ...getGardssalgWebsiteVerificationJobStatus() });
+});
+
+// Manual run, same code path as the daily tick. Dry-run unless `apply` is
+// exactly the JSON boolean true. Write-pause is checked inside the run (apply
+// only); a dry-run reads the shared persisted offset but never advances it.
+router.post("/admin/gardssalg-website-verification-job-run", requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const body = (req.body ?? {}) as { apply?: unknown };
+    const report = await runGardssalgWebsiteVerificationJob({ apply: body.apply === true, trigger: "manual" });
+    res.json({ success: true, ...report });
+  } catch (err) {
+    console.error("[opplevelser] admin/gardssalg-website-verification-job-run failed", err);
+    res.status(500).json({ success: false, error: "Internal error" });
   }
 });
 
