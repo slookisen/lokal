@@ -13,7 +13,7 @@
 
 import { Router, Request, Response } from "express";
 import { marketplaceRegistry } from "../services/marketplace-registry";
-import { knowledgeService } from "../services/knowledge-service";
+import { knowledgeService, publicOwnerAboutText } from "../services/knowledge-service";
 import { slugify } from "../utils/slug";
 import { failsProducerRoleGate, withoutOwnerHidden } from "../services/agent-visibility";
 import { getConfig } from "../config/vertical-config";
@@ -402,10 +402,12 @@ router.get("/llms-full.txt", (_req: Request, res: Response) => {
           // Redact PII from about text before including in AI-readable dump.
           // Emails and Norwegian phone numbers must not appear in /llms-full.txt.
           // Take extra chars before redaction so truncation doesn't expose a partial address.
-          const aboutRedacted = k.about.substring(0, 300)
+          // Økologi S3c-2: owner-text read step (gate off = k.about unchanged).
+          const aboutRedacted = publicOwnerAboutText(a.id, k.about).substring(0, 300)
             .replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, "[e-post]")
             .replace(/(\+47|0047)?[\s\-.]?\d{3}[\s\-.]?\d{2}[\s\-.]?\d{3}/g, "[tlf]");
-          parts.push(aboutRedacted.substring(0, 120));
+          // (Only empty when the read step dropped every sentence.)
+          if (aboutRedacted) parts.push(aboutRedacted.substring(0, 120));
         }
         lines.push(parts.join(" | "));
       }

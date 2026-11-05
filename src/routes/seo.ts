@@ -22,7 +22,7 @@ import { Router, Request, Response } from "express";
 import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { resolveRouteIntent } from "../services/route-intent";
-import { knowledgeService, productPriceText, parseProductPrice, OWNER_PRODUCT_SOURCES } from "../services/knowledge-service";
+import { knowledgeService, productPriceText, parseProductPrice, OWNER_PRODUCT_SOURCES, ownerWroteAbout, publicOwnerAboutText } from "../services/knowledge-service";
 import { catalogNameNorm, softStockByNameNorm, stockSoftExpiryBuyerText, type SoftStockFields } from "../services/stock-soft-expiry";
 import { containsOrganicClaim, isOrganicClaimUmbrella, dropOrganicSentences } from "../services/organic-claims";
 import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenFields, hidesAddress, hidesPrices, debioSwitchOffAgentIds } from "../owner-features/enforce";
@@ -256,9 +256,12 @@ export function applyPublishedTranslations<T extends { id: string; description?:
     const t = map.get(r.id);
     if (!t) continue;
     if (t.description && r.description) r.description = t.description;
-    if (t.about && "about" in r && r.about) r.about = t.about;
+    // Økologi S3c-2: a published translation of an owner-written about loses
+    // its organic sentences as the Norwegian text does (gate off = t.about).
+    const tAbout = t.about ? publicOwnerAboutText(r.id, t.about) : t.about;
+    if (tAbout && "about" in r && r.about) r.about = tAbout;
     const k = knowledgeById?.get(r.id);
-    if (k && t.about && k.about) k.about = t.about;
+    if (k && tAbout && k.about) k.about = tAbout;
   }
   return rows;
 }
@@ -5042,7 +5045,9 @@ export function renderRelatedSection(
   if (!rows.length) return "";
   const items = rows.map((r) => {
     const slug = slugify(r.name);
-    let previewSource = r.description || r.about || "";
+    // Økologi S3c-2: the about preview (only when there is no description)
+    // gets the owner-text read step (gate off = r.about unchanged).
+    let previewSource = r.description || publicOwnerAboutText(r.id, r.about) || "";
     if (previewSource && isJunkDescription(previewSource)) {
       console.log(`[description-guard] suppressed junk description (related-producer preview) for ${r.id} (${r.name})`);
       previewSource = "";
@@ -5511,21 +5516,6 @@ function passesRoleGate(
     return false;
   }
   return true;
-}
-
-/**
- * Økologi S3c: is agent_knowledge.about owner-written (curated_fields.about.by
- * === "owner")? Tolerant: unreadable JSON / no row = false.
- */
-function ownerWroteAbout(agentId: string): boolean {
-  try {
-    const row = getDb().prepare("SELECT curated_fields FROM agent_knowledge WHERE agent_id = ?").get(agentId) as { curated_fields?: string | null } | undefined;
-    if (!row?.curated_fields) return false;
-    const parsed = JSON.parse(row.curated_fields);
-    return !!parsed && typeof parsed === "object" && parsed.about?.by === "owner";
-  } catch {
-    return false;
-  }
 }
 
 // ─── E-mail on the producer profile (dev-request
