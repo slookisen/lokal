@@ -25,6 +25,12 @@
  *          claimant e-mail required (403).
  *   AC12   4th fetch the same UTC day → the Norwegian limit message on the
  *          card, no fetch button.
+ *   AC3c   (Skive 3c) the lead sentence fits the selection (never «kryss av
+ *          for» when everything is ticked), «N av M valgt» above the list and
+ *          at «Publiser valgte», «Velg alle» / «Velg ingen» (no-JS: ?valg=alle
+ *          / ?valg=ingen, read-only, «fjern» boxes untouched, any other value
+ *          ignored), a short reason on a row that is not preselected, and
+ *          publishing with nothing ticked writes nothing.
  *   zero   zero-result page: «Fant ingen produkter med pris på nettsiden.
  *          Legg dem inn selv.» + the outcome in plain Norwegian.
  *
@@ -242,7 +248,8 @@ export async function runOwnerProductImportPortalTests(opts: { log?: boolean } =
 
     const portalFor = (id: string, token = tokens[id], query: Record<string, string> = {}) => invoke(H.portal, { params: { agentId: id }, token, query });
     const hentFor = (id: string, token = tokens[id], headers?: Record<string, string>) => invoke(H.hent, { params: { agentId: id }, token, body: {}, headers });
-    const pageFor = (id: string, runId: string, token = tokens[id]) => invoke(H.page, { params: { agentId: id, runId }, token });
+    const pageFor = (id: string, runId: string, token = tokens[id], query: Record<string, any> = {}) =>
+      invoke(H.page, { params: { agentId: id, runId }, token, query });
     const publishFor = (id: string, runId: string, body: any, token = tokens[id], headers?: Record<string, string>) =>
       invoke(H.publish, { params: { agentId: id, runId }, token, body, headers });
     const runIdFrom = (r: Res, id: string): string => {
@@ -372,6 +379,53 @@ export async function runOwnerProductImportPortalTests(opts: { log?: boolean } =
         "card: latest run status, link to the suggestions, fetches left");
     }
 
+    const idHonPre = candId(run1, "Honning");
+    // ─── AC3c: lead text, counter, «Velg alle» / «Velg ingen» ───────────────
+    {
+      const ticked = (h: string) => (h.match(/name="velg" value="[^"]*" checked/g) || []).length;
+      const fjernTicked = (h: string) => (h.match(/name="fjern" value="[^"]*" checked/g) || []).length;
+      const boxes = (h: string) => (h.match(/name="velg" value="/g) || []).length;
+      const idEple = candId(run1, "Eplecider");
+      const before = totalChanges();
+      const def = html(await pageFor(OWN, run1));
+      const total = boxes(def);
+      assertTrue(total === 5 && ticked(def) === 4, "AC3c: default preselection unchanged (all but the uncertain row)");
+      assertTrue(def.includes(`4 av 5 valgt`) && def.includes('data-valg-count-at="top"') && def.includes('data-valg-count-at="submit"'),
+        "AC3c: «N av M valgt» above the list and at «Publiser valgte»");
+      assertTrue(def.includes("4 av 5 varer er valgt. Varer vi er usikre på, er ikke valgt.") && def.includes("beholdes med mindre du krysser av for å fjerne dem"),
+        "AC3c: lead says some are not selected and why; existing products kept");
+      assertTrue(def.includes(`href="/eier/${OWN}/produktimport/${run1}?valg=alle"`) && def.includes(">Velg alle</a>")
+        && def.includes(`href="/eier/${OWN}/produktimport/${run1}?valg=ingen"`) && def.includes(">Velg ingen</a>"),
+        "AC3c: «Velg alle» / «Velg ingen» work as plain GET links");
+      const eRow = def.slice(def.indexOf(`data-candidate-id="${idEple}"`), def.indexOf("</li>", def.indexOf(`data-candidate-id="${idEple}"`)));
+      assertTrue(eRow.includes('data-not-preselected="alcohol"') && eRow.includes("(usikker: alkohol)"), "AC3c: a row not preselected shows a short reason");
+      assertTrue(def.includes("<script>") && def.includes('[data-import-select-root="1"]') && def.includes('name="velg"]'),
+        "AC3c: inline script toggles only the «velg» boxes");
+
+      const none = html(await pageFor(OWN, run1, tokens[OWN], { valg: "ingen" }));
+      assertTrue(ticked(none) === 0 && boxes(none) === total && none.includes("0 av 5 valgt"), "AC3c: ?valg=ingen → 0 suggestion boxes ticked");
+      assertTrue(none.includes('name="fjern" value="Egg"') && none.includes('name="fjern" value="Gammel ost"') && fjernTicked(none) === 0,
+        "AC3c: ?valg=ingen leaves the «fjern» boxes as they were");
+      const all = html(await pageFor(OWN, run1, tokens[OWN], { valg: "alle" }));
+      assertTrue(ticked(all) === total && new RegExp(`name="velg" value="${idEple}" checked`).test(all) && all.includes("5 av 5 valgt"),
+        "AC3c: ?valg=alle ticks the uncertain suggestions too");
+      assertTrue(fjernTicked(all) === 0 && all.includes('name="fjern" value="Egg"'), "AC3c: ?valg=alle does not tick any «fjern» box");
+      assertTrue(!/kryss av for/i.test(all) && all.includes("Alle varene vi fant er valgt. Fjern krysset for varer du ikke vil legge inn"),
+        "AC3c: everything ticked → no «kryss av for» in the text");
+      for (const bad of ["ALLE", "alt", "<script>", ""]) {
+        assertEq(html(await pageFor(OWN, run1, tokens[OWN], { valg: bad })), def, `AC3c: invalid valg=${JSON.stringify(bad)} is ignored`);
+      }
+      assertEq(html(await pageFor(OWN, run1, tokens[OWN], { valg: ["alle", "ingen"] })), def, "AC3c: a repeated valg is ignored");
+      assertEq((await pageFor("pi-other", run1, tokens[OWN], { valg: "alle" })).status, 403, "AC3c: ?valg does not loosen the owner check");
+      assertEq(totalChanges(), before, "AC3c: GET with ?valg writes nothing");
+
+      const p0 = await publishFor(OWN, run1, { [`navn_${idHonPre}`]: "Honning", [`pris_${idHonPre}`]: "120", [`enhet_${idHonPre}`]: "" });
+      assertTrue(p0.status === 400 && html(p0).includes('data-publish-error="1"') && html(p0).includes("Velg minst én vare") && ticked(html(p0)) === 0,
+        "AC3c: «Publiser valgte» with nothing ticked → clear Norwegian message, nothing ticked");
+      assertEq(totalChanges(), before, "AC3c: publishing with nothing ticked writes nothing");
+      assertTrue(!productsOf(OWN).some((p) => p.name === "Honning"), "AC3c: nothing published");
+    }
+
     // ─── Publish: guards ────────────────────────────────────────────────────
     const idHon = candId(run1, "Honning");
     const idLam = candId(run1, "Lammelår");
@@ -458,6 +512,8 @@ export async function runOwnerProductImportPortalTests(opts: { log?: boolean } =
       const rid = runIdFrom(f, "pi-n1");
       await oi.__awaitOwnerFetchForTesting(rid);
       const h = html(await pageFor("pi-n1", rid));
+      assertTrue(!/kryss av for/i.test(h) && h.includes("Alle varene vi fant er valgt.") && h.includes("1 av 1 valgt"),
+        "AC3c: every suggestion preselected → the text does not say «kryss av for»");
       const idL = candId(rid, "Lammelår");
       const row = h.slice(h.indexOf(`data-candidate-id="${idL}"`), h.indexOf("</li>", h.indexOf(`data-candidate-id="${idL}"`)));
       assertTrue(row.includes('data-kind="changed"') && row.includes('data-name-locked="1"') && !row.includes(`name="navn_${idL}"`),

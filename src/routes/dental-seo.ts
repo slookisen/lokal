@@ -62,7 +62,9 @@ import { servePublicFile } from "./public-file";
 import { DENTAL_NAME_WORDS, isPublicDentalServiceHost, DENTAL_CLINIC_CLASSES } from "../services/dental-catalog-class";
 import { normalizeHostname } from "../services/dental-hjemmeside-classifier";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
+import { isHiddenImportRow } from "../services/dental-import-display";
 import { shownDentalAgent } from "../services/dental-places-display";
+import { emailRevealGuardEnabled, isCcBotUserAgent, revealEmailFor } from "../services/email-reveal-guard";
 import { placesDisplayPolicyEnabled } from "../services/places-display-policy";
 import { planDentalSearch, MAX_POSTSTED_IN, MAX_TERM_CHARS, type DentalSearchPlan, type DentalSearchTolkning } from "../services/dental-query-parser";
 import { capFreeText } from "../utils/free-text";
@@ -1800,6 +1802,45 @@ export function dentalVerificationSection(
   return `<div class="section-box verification-meta"><h2>Kontroll og kilder</h2><ul style="list-style:none;padding:0;font-size:.9rem;color:var(--g700);line-height:1.7">${lines.map((l) => `<li>${escapeHtml(l)}</li>`).join("")}</ul></div>`;
 }
 
+// ─── E-mail on the clinic profile (dev-request
+// 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting, slice 2: S-A1 and
+// S-A3 on /klinikk/:slug and /klinikk/id/:id) ───────────────────────────────
+// With EMAIL_REVEAL_GUARD_DENTAL on, the profile page gives the clinic's
+// e-mail (the mailto: line and JSON-LD `email`) only within the per-IP limit
+// of services/email-reveal-guard.ts — the SAME counter as the REST and A2A
+// answers of slice 1, so pages and API share one budget per client, and a
+// profile seen again in the window is free. Over the limit the contact card
+// shows «Vis e-post», a plain link to GET /klinikk/id/:id/epost (no script),
+// and the address is nowhere in the HTML; JSON-LD has no `email`. CCBot
+// (S-A3) gets neither the address nor «Vis e-post», also on its first
+// request. With the switch on the page depends on the client, so it is
+// Cache-Control: private (finn-tannlege.com has no HTML cache in process; the
+// header keeps any shared cache in front from handing one client's variant to
+// another). Switch off: revealEmailFor is not called and the page and its
+// headers are byte-identical to main. The guard's log line carries profile
+// ids and counts only, never an address or an IP.
+export const DENTAL_EMAIL_REVEAL_LABEL = "Vis e-post";
+
+/** The path of the «Vis e-post» endpoint for a clinic id. */
+export function dentalEmailRevealPath(id: string): string {
+  return `/klinikk/id/${encodeURIComponent(id)}/epost`;
+}
+
+/**
+ * How the profile shows the clinic's e-mail to this request: null = switch
+ * off (change nothing); "show" = as today; "reveal" = «Vis e-post» without the
+ * address; "none" = nothing (CCBot, or no e-mail stored).
+ */
+function profileEmailView(req: Request, res: Response, agent: { id?: string; epost?: string | null }): "show" | "reveal" | "none" | null {
+  if (!emailRevealGuardEnabled("dental")) return null;
+  res.set("Cache-Control", "private");
+  const id = agent.id;
+  if (!agent.epost || !id) return "none";
+  const allowed = revealEmailFor(req, "dental", [id]);
+  if (allowed !== null && allowed.has(id)) return "show";
+  return isCcBotUserAgent(req.get("user-agent")) ? "none" : "reveal";
+}
+
 function renderClinicProfile(
   stored: DentalAgentRow,
   req: Request,
@@ -1815,7 +1856,11 @@ function renderClinicProfile(
   // dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning: the
   // synthetic schema-probe row 404s exactly like a rejected clinic, on both
   // /klinikk/id/:id and /klinikk/:slug (both render through here).
-  if (agent.verification_status === "rejected" || isDentalSyntheticProbeId(agent.id)) {
+  // A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon
+  // (F2-S10): so does a row the May 2026 directory import added on its own
+  // (no org.nr., no Brreg fields): its name came from the import too, and a
+  // noindex page would still show it (switch IMPORT_VALUES_HIDDEN).
+  if (agent.verification_status === "rejected" || isDentalSyntheticProbeId(agent.id) || isHiddenImportRow(stored)) {
     sendDentalNotFound(res,
       `<div class="container"><div class="empty-state" style="padding:80px 0"><h3>Klinikk ikke funnet</h3><p>Siden du leter etter finnes ikke.</p><a href="/" class="btn-secondary" style="margin-top:16px">Til forsiden</a></div></div>`,
       { title: "Ikke funnet — Finn-tannlege.com" }
@@ -1825,6 +1870,10 @@ function renderClinicProfile(
 
   const slug = slugifyClinic(agent.navn, agent.org_nr ?? undefined);
   const canonical = clinicProfileUrl(agent);
+  // Slice 2 (S-A1/S-A3): the e-mail this request may see. Switch off → null →
+  // agent.epost, exactly as before.
+  const emailView = profileEmailView(req, res, agent);
+  const shownEmail = emailView === null || emailView === "show" ? agent.epost : null;
 
   // ── Header badges
   // dev-request 2026-10-06-dental-nedlagte-og-akuttpastander (skive A): a
@@ -1904,7 +1953,8 @@ function renderClinicProfile(
   else if (stored.adresse && (postnummer || agent.poststed)) infoItems.push(`<div class="info-item"><div class="info-label">Postnummer og sted</div><div class="info-value">${[postnummer, agent.poststed].filter(Boolean).map((v) => escapeHtml(v!)).join(" ")}</div></div>`);
   { const h = safeTelHref(agent.telefon); if (h) infoItems.push(`<div class="info-item"><div class="info-label">Telefon</div><div class="info-value"><a href="${h}">${escapeHtml(agent.telefon)}</a></div></div>`); }
   { const h = safeTelHref(agent.mobil); if (h) infoItems.push(`<div class="info-item"><div class="info-label">Mobil</div><div class="info-value"><a href="${h}">${escapeHtml(agent.mobil)}</a></div></div>`); }
-  if (agent.epost) infoItems.push(`<div class="info-item"><div class="info-label">E-post</div><div class="info-value"><a href="mailto:${escapeHtml(agent.epost)}">${escapeHtml(agent.epost)}</a></div></div>`);
+  if (shownEmail) infoItems.push(`<div class="info-item"><div class="info-label">E-post</div><div class="info-value"><a href="mailto:${escapeHtml(shownEmail)}">${escapeHtml(shownEmail)}</a></div></div>`);
+  else if (emailView === "reveal") infoItems.push(`<div class="info-item"><div class="info-label">E-post</div><div class="info-value"><a href="${escapeHtml(dentalEmailRevealPath(agent.id ?? ""))}" rel="nofollow">${DENTAL_EMAIL_REVEAL_LABEL}</a></div></div>`);
   { const u = safeUrl(agent.hjemmeside); if (u) infoItems.push(`<div class="info-item"><div class="info-label">Hjemmeside</div><div class="info-value"><a href="${escapeHtml(addUtmParams(u, CLINIC_SITE_UTM.source, "referral", CLINIC_SITE_UTM.campaign))}" rel="nofollow noopener" target="_blank">${escapeHtml(u.replace(/^https?:\/\//,""))}</a></div></div>`); }
   // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5d):
   // directory_url is NEVER the clinic's own homepage (that's `hjemmeside`
@@ -2024,7 +2074,7 @@ function renderClinicProfile(
     // orch-PR-20260613: no real image field in DentalAgent; image is omitted
     // rather than falling back to favicon.svg which is a quality negative.
     ...(isDisplayablePhone(agent.telefon) ? { telephone: agent.telefon } : {}),
-    ...(agent.epost ? { email: agent.epost } : {}),
+    ...(shownEmail ? { email: shownEmail } : {}),
     ...(safeUrl(agent.hjemmeside) ? { sameAs: safeUrl(agent.hjemmeside) } : {}),
     address: {
       "@type": "PostalAddress",
@@ -2237,6 +2287,44 @@ router.get("/klinikk/id/:id", (req: Request, res: Response) => {
     return;
   }
   renderClinicProfile(agent, req, res);
+});
+
+// «Vis e-post» (slice 2, S-A1): read-only, no DB write. Only with
+// EMAIL_REVEAL_GUARD_DENTAL on; off → next(), so the path answers exactly as
+// on main (the catch-all 404) and nothing new is exposed. On: the same guard
+// and counter as the profile page and the REST/A2A answers. Within the limit
+// → 200 with the address; over it → 429 «prøv igjen senere» without it;
+// CCBot → 403 without it; an unknown, rejected or test clinic, or one with no
+// e-mail → the profile's 404. Always Cache-Control: private and noindex.
+router.get("/klinikk/id/:id/epost", (req: Request, res: Response, next) => {
+  if (!emailRevealGuardEnabled("dental")) { next(); return; }
+  res.set("Cache-Control", "private");
+  res.set("X-Robots-Tag", "noindex, nofollow");
+  const stored = getDentalAgentById(String(req.params.id));
+  const agent = stored ? shownDentalAgent(stored) : null;
+  if (!agent || !agent.epost || agent.verification_status === "rejected" || isDentalSyntheticProbeId(agent.id)) {
+    sendDentalNotFound(res,
+      `<div class="container"><div class="empty-state" style="padding:80px 0"><h3>Klinikk ikke funnet</h3><p>Siden du leter etter finnes ikke.</p><a href="/" class="btn-secondary" style="margin-top:16px">Til forsiden</a></div></div>`,
+      { title: "Ikke funnet — Finn-tannlege.com" }
+    );
+    return;
+  }
+  const allowed = revealEmailFor(req, "dental", [agent.id]);
+  const back = `<p style="margin-top:20px"><a href="${escapeHtml(clinicProfileUrl(agent))}">&larr; Tilbake til ${escapeHtml(agent.navn)}</a></p>`;
+  const shell = (body: string) => dentalShell(
+    `<main><div class="container" style="padding-top:32px;padding-bottom:48px"><div class="section-box"><h1 style="font-size:1.4rem">E-post til ${escapeHtml(agent.navn)}</h1>${body}${back}</div></div></main>`,
+    { title: `E-post til ${agent.navn} | Finn-tannlege.com`, robots: "noindex, nofollow", canonical: null }
+  );
+  if (allowed !== null && allowed.has(agent.id)) {
+    res.status(200).send(shell(`<p style="font-size:1.05rem"><a href="mailto:${escapeHtml(agent.epost)}">${escapeHtml(agent.epost)}</a></p>`));
+    return;
+  }
+  if (isCcBotUserAgent(req.get("user-agent"))) {
+    res.status(403).send(shell(`<p>E-postadressen vises ikke for denne klienten.</p>`));
+    return;
+  }
+  res.set("Retry-After", "3600");
+  res.status(429).send(shell(`<p>Grensen for hvor mange e-postadresser som kan vises herfra, er nådd. Prøv igjen senere, eller kontakt klinikken på telefon eller via nettsiden.</p>`));
 });
 
 router.get("/klinikk/:slug", (req: Request, res: Response) => {
@@ -2683,8 +2771,12 @@ Filterparametre (query string):
 - q             fritekst — matcher navn eller poststed
 - fylke         fylkesnavn (f.eks. "Oslo", "Vestland")
 - specialty     spesialitet (f.eks. "endodonti", "kjeveortopedi")
-- helfo         "true" — kun klinikker med Helfo-direkteoppgjørsavtale
-- acute_vakt    1 — kun klinikker med akuttvakt-tilbud
+- helfo         "true" — kun klinikker med Helfo-direkteoppgjørsavtale med kilde
+- acute_vakt    1 — kun klinikker som oppgir akuttvakt med kilde
+
+Feltene helfo_agreement og acute_vakt i svaret påstår Helfo-avtale og akuttvakt
+bare med kilde, som klinikkortet: "true" uten kilde gis som "unknown", og 1 uten
+kilde som null. Filtrene gir bare klinikker der feltet i svaret har verdien.
 - enrichment_state  "raw" | "enriched"
 - limit         maks antall resultater (standard 50, maks 500)
 - offset        sidebladering

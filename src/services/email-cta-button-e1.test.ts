@@ -118,10 +118,11 @@ export async function runEmailCtaButtonE1Tests(opts: { log?: boolean } = {}): Pr
       },
       {
         id: "claim-confirmation",
-        send: () => svc.sendClaimConfirmation(TO, "Test Gård", "https://rettfrabonden.com/selger?x=1&y=2", "agent-e1"),
-        href: "https://rettfrabonden.com/selger?x=1&amp;y=2",
-        rawUrl: "https://rettfrabonden.com/selger?x=1&y=2",
-        label: "Gå til dashboarden din",
+        // K5: the button is the one-time owner-portal login, new label.
+        send: () => svc.sendClaimConfirmation(TO, "Test Gård", "https://rettfrabonden.com/magic-link-verify?token=ABC&x=1", "agent-e1"),
+        href: "https://rettfrabonden.com/magic-link-verify?token=ABC&amp;x=1",
+        rawUrl: "https://rettfrabonden.com/magic-link-verify?token=ABC&x=1",
+        label: "Logg inn i eierportalen",
         green: "#2d5f2e",
       },
       {

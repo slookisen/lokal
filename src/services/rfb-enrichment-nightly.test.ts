@@ -192,12 +192,16 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
     // already loaded by an earlier suite in this process
   }
   const initMod = require("../database/init") as typeof import("../database/init");
+  // skive B (dev-request 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-forverring): the about
+  // LLM judges approve everything here — this suite tests other guards.
+  const { useApproveAllAboutJudges } = require("../../tests/helpers/hcr-about-judges") as typeof import("../../tests/helpers/hcr-about-judges");
   const job = require("./rfb-enrichment-nightly") as typeof import("./rfb-enrichment-nightly");
   const meterMod = require("./llm-call-meter") as typeof import("./llm-call-meter");
   const ledger = require("./run-ledger") as typeof import("./run-ledger");
   const pause = require("./enrichment-write-pause") as typeof import("./enrichment-write-pause");
   const routes = require("../routes/admin-rfb-enrichment-nightly") as typeof import("../routes/admin-rfb-enrichment-nightly");
   const poolExplainRouter = (require("../routes/admin-pool-blocker-explain") as typeof import("../routes/admin-pool-blocker-explain")).default;
+  const restoreAboutJudges = useApproveAllAboutJudges();
   const runVerifierMod = require("../routes/admin-run-verifier") as typeof import("../routes/admin-run-verifier");
 
   const prevEnv: Record<string, string | undefined> = {};
@@ -1741,6 +1745,7 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
     failed++;
     failures.push(`rfb-enrichment-nightly: unexpected error: ${err instanceof Error ? err.stack || err.message : String(err)}`);
   } finally {
+    restoreAboutJudges();
     (globalThis as any).fetch = prevFetch;
     for (const k of ENV_KEYS) {
       if (prevEnv[k] === undefined) delete process.env[k];

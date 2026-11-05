@@ -72,7 +72,9 @@ export async function runRfbSelgerEnButikkTests(opts: { log?: boolean } = {}): P
     eq([hiddenOf(page, "findDefault"), hiddenOf(page, "findResults")], [true, true], "a: søkefelt og trefliste er skjult");
     eq(page.el("findAlert").innerHTML, "", "a: ingen «Henter butikken»-melding blir stående");
     ok2(/id="btnSingleStoreClaim"[^>]*>Dette er min butikk</.test(html), "a: knappen heter «Dette er min butikk»");
-    ok2(/<h2[^>]*>Ta over siden til butikken din<\/h2>/.test(html) && !/singleStore[\s\S]{0,400}Registrer/.test(html.slice(html.indexOf('id="singleStore"'), html.indexOf('id="findDefault"'))),
+    // K2 (2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post): the store block now stands before the
+    // registration hero, so it ends where the hero starts.
+    ok2(/<h2[^>]*>Ta over siden til butikken din<\/h2>/.test(html) && !/Registrer/.test(html.slice(html.indexOf('id="singleStore"'), html.indexOf('class="claim-hero"'))),
       "a: overskriften sier ta over siden, ikke registrer");
     // knappen starter den eksisterende claim-flyten (kode på e-post)
     page.el("btnSingleStoreClaim").click();

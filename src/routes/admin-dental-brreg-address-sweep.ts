@@ -74,6 +74,8 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/db-factory";
+import { dentalEnrichmentWritePauseBlock } from "../services/dental-enrichment-write-pause";
+import { ENRICHMENT_WRITE_PAUSE_HTTP_STATUS } from "../services/enrichment-write-pause";
 import {
   fetchBrregAddressEvidence,
   type BrregAddressEvidence,
@@ -314,6 +316,15 @@ router.post("/brreg-address-sweep", async (req: Request, res: Response) => {
   }
   try {
     const write = body.write === true;
+    // Enrichment write-pause fence: apply/write mode only, before the first write.
+    // Dry-run and read paths stay open.
+    if (write) {
+      const pauseBlock = dentalEnrichmentWritePauseBlock();
+      if (pauseBlock) {
+        res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+        return;
+      }
+    }
     const limitRaw = typeof body.limit === "number" && Number.isFinite(body.limit) ? Math.floor(body.limit) : 25;
     const limit = Math.max(1, Math.min(BRREG_ADDRESS_SWEEP_CAP, limitRaw));
 
@@ -580,6 +591,15 @@ async function correctMixed(body: Record<string, unknown>, res: Response): Promi
   }
   try {
     const apply = body.apply === true;
+    // Enrichment write-pause fence: apply/write mode only, before the first write.
+    // Dry-run and read paths stay open.
+    if (apply) {
+      const pauseBlock = dentalEnrichmentWritePauseBlock();
+      if (pauseBlock) {
+        res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+        return;
+      }
+    }
     const limitRaw = typeof body.limit === "number" && Number.isFinite(body.limit) ? Math.floor(body.limit) : 25;
     const limit = Math.max(1, Math.min(BRREG_ADDRESS_SWEEP_CAP, limitRaw));
     const afterId = typeof body.after_id === "string" ? body.after_id : "";

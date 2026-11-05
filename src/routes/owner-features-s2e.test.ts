@@ -51,6 +51,7 @@ const SAVED_ENV = [
   ALLOW_ENV, "OWNER_VERIFIED_OWNER_GATE_ENABLED", "OWNER_UNIFIED_SESSION_ENABLED", "OWNER_PAUSE_ENABLED",
   "OWNER_ORDER_EMAIL_ENABLED", "OWNER_FEATURES_ENFORCE", "ADMIN_KEY", "ANALYTICS_ADMIN_KEY",
   "ORDER_REMINDER_HOURS", "ORDER_AUTOCANCEL_HOURS", "ORDER_CAP_NEW_PER_PRODUCER_PER_DAY", "ORDER_CAP_NOTICE_ENABLED",
+  "OWNER_AUTO_UPDATES_ENABLED",
 ];
 const OWNED_ID = "s2e-owned";
 const EMPTY_ID = "s2e-empty";
@@ -272,8 +273,9 @@ export async function runOwnerFeaturesS2eTests(opts: { log?: boolean } = {}): Pr
       return i < 0 ? "" : b.slice(i, b.indexOf("</li>", i));
     };
     const mainView = (b: string) => b.slice(0, b.indexOf(`id="planlagt"`) > 0 ? b.indexOf(`id="planlagt"`) : b.length);
-    const SOON = reg.OWNER_FEATURE_REGISTRY.filter((e) => e.status === "coming_soon");
-    const LIVE = reg.OWNER_FEATURE_REGISTRY.filter((e) => e.status !== "coming_soon");
+    // Run-time status: a liveFlag entry with its flag off (auto.updates, OWNER_AUTO_UPDATES_ENABLED cleared above) is planned.
+    const SOON = reg.OWNER_FEATURE_REGISTRY.filter((e) => reg.ownerFeatureStatus(e) === "coming_soon");
+    const LIVE = reg.OWNER_FEATURE_REGISTRY.filter((e) => reg.ownerFeatureStatus(e) !== "coming_soon");
 
     // ═══ AC25 — «Planlagt» ═════════════════════════════════════════════════
     {
@@ -302,7 +304,7 @@ export async function runOwnerFeaturesS2eTests(opts: { log?: boolean } = {}): Pr
       const before = JSON.stringify(rs.resolveOwnerFeatures("rfb", OWNED_ID, { db }).features);
       const w0 = writes(OWNED_ID);
       const i1 = await post(H.interest, OWNED_ID, { key: KEY });
-      assertEq([i1.status, loc(i1)], [303, `/eier/${OWNED_ID}/valg?melding=interesse#planlagt-${KEY}`], "AC25: «Gi meg beskjed» → 303 back to the row");
+      assertEq([i1.status, loc(i1)], [303, `/eier/${OWNED_ID}/valg?melding=interesse&ved=planlagt-${KEY}#planlagt-${KEY}`], "AC25: «Gi meg beskjed» → 303 back to the row");
       const rows1 = db.prepare("SELECT vertical, subject_id, key, registered_at, actor_detail FROM owner_feature_interest").all() as any[];
       assertEq(rows1.map((r) => [r.vertical, r.subject_id, r.key, r.actor_detail]), [["rfb", OWNED_ID, KEY, `post@${OWNED_ID}.example.no`]], "AC25: one interest row (subject, key, who)");
       assertTrue(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(String(rows1[0]?.registered_at)), "AC25: the interest row has its time (ISO)");
@@ -346,7 +348,7 @@ export async function runOwnerFeaturesS2eTests(opts: { log?: boolean } = {}): Pr
       assertEq(writes(OWNED_ID), w1, "AC25: …and nothing written");
       assertEq(JSON.stringify(rs.resolveOwnerFeatures("rfb", OWNED_ID, { db }).features), before, "AC25: …and no effect");
       const ps = await post(H.sett, OWNED_ID, { key: "orders.daily_cap", value: "5", confirmed: "1" });
-      assertEq([loc(ps), writes(OWNED_ID)], [`/eier/${OWNED_ID}/valg?melding=sperret&nokkel=orders.daily_cap`, w1], "AC25: the page form for a coming_soon key is refused too, nothing written");
+      assertEq([loc(ps), writes(OWNED_ID)], [`/eier/${OWNED_ID}/valg?melding=sperret&nokkel=orders.daily_cap&ved=valg-orders.daily_cap#valg-orders.daily_cap`, w1], "AC25: the page form for a coming_soon key is refused too, nothing written");
     }
 
     // ═══ AC26 — two levels ═════════════════════════════════════════════════
@@ -390,7 +392,7 @@ export async function runOwnerFeaturesS2eTests(opts: { log?: boolean } = {}): Pr
       assertTrue(row(fb, "orders.enabled").includes(">På<"), "AC26: …while its orders row says «På»");
       const w = writes(FIX);
       const choose = await post(H.niva, FIX, { level: "ta_imot_bestillinger", confirmed: "1" });
-      assertEq([loc(choose), writes(FIX)], [`/eier/${FIX}/valg?melding=niva_valgt#niva`, w], "AC26: the owner chooses «Ta imot bestillinger» — nothing to change, nothing in the audit");
+      assertEq([loc(choose), writes(FIX)], [`/eier/${FIX}/valg?melding=niva_valgt&ved=niva#niva`, w], "AC26: the owner chooses «Ta imot bestillinger» — nothing to change, nothing in the audit");
       assertTrue((await pageHtml(FIX)).includes(`aria-current="true" data-level="ta_imot_bestillinger"`), "AC26: …and only now is the level marked");
       const choice = db.prepare("SELECT level, actor_detail, batch_id FROM owner_feature_level_choice WHERE subject_id = ?").get(FIX) as any;
       assertEq(choice, { level: "ta_imot_bestillinger", actor_detail: OWNER_EMAIL, batch_id: null }, "AC26: the owner's choice is stored with who");
@@ -416,7 +418,7 @@ export async function runOwnerFeaturesS2eTests(opts: { log?: boolean } = {}): Pr
       assertEq(withState.map((e) => e.key), [], "AC27: no planned row shows a value");
       const status = b.slice(b.indexOf(`class="mv-status"`), b.indexOf("</div>", b.indexOf(`class="mv-status"`)));
       const statusKeys = [...status.matchAll(/data-status-key="([^"]+)"/g)].map((m) => m[1]);
-      assertEq(statusKeys, pg.OWNER_PAGE_STATUS_KEYS.filter((k) => reg.getOwnerFeature(k).status !== "coming_soon"), "AC27: «Slik er du nå» lists only built entries");
+      assertEq(statusKeys, pg.OWNER_PAGE_STATUS_KEYS.filter((k) => reg.ownerFeatureStatus(reg.getOwnerFeature(k)) !== "coming_soon"), "AC27: «Slik er du nå» lists only built entries");
       assertTrue(!statusKeys.includes("notify.report") && !mainView(b).includes("Månedlig"), "AC27: «Rapport: Månedlig» is gone");
       for (const text of ["Milepæler: På", "Si fra når noe endres på profilen min: På", "Minn meg på å bekrefte lagerstatus: På", "Rapport om profilen din:"]) {
         assertTrue(!b.includes(text) && !b.replace(/<[^>]+>/g, "").includes(text), `AC27: no «${text}» on the page`);
@@ -509,11 +511,11 @@ export async function runOwnerFeaturesS2eTests(opts: { log?: boolean } = {}): Pr
       const pr = row(b, "visibility.profile");
       assertTrue(pr.includes("Slå av") && pr.includes("Be om sletting") && pr.includes("mailto:kontakt@rettfrabonden.com"), "AC29: the pause row (switch + «Be om sletting»)");
       const s1 = await post(H.sett, OWNED_ID, { key: "visibility.profile", value: "false" });
-      assertEq(loc(s1), `/eier/${OWNED_ID}/valg?bekreft=visibility.profile&verdi=0#bekreft`, "AC29: pausing asks first (confirm panel)");
+      assertEq(loc(s1), `/eier/${OWNED_ID}/valg?bekreft=visibility.profile&verdi=0#valg-visibility.profile`, "AC29: pausing asks first (confirm panel)");
       const cp = await pageHtml(OWNED_ID, { bekreft: "visibility.profile", verdi: "0" });
       assertTrue(cp.includes(`name="until" type="date"`) && cp.includes("Profilen blir borte fra søk og AI-assistenter"), "AC29: the confirm panel keeps the optional resume date");
       const tooLate = await post(H.sett, OWNED_ID, { key: "visibility.profile", value: "false", confirmed: "1", until: "2001-01-01" });
-      assertEq([loc(tooLate), count("SELECT COUNT(*) AS n FROM owner_profile_pause WHERE agent_id = ?", OWNED_ID)], [`/eier/${OWNED_ID}/valg?melding=ugyldig_dato`, 0], "AC29: a past resume date → refused, nothing written");
+      assertEq([loc(tooLate), count("SELECT COUNT(*) AS n FROM owner_profile_pause WHERE agent_id = ?", OWNED_ID)], [`/eier/${OWNED_ID}/valg?melding=ugyldig_dato&ved=valg-visibility.profile#valg-visibility.profile`, 0], "AC29: a past resume date → refused, nothing written");
       const until = new Date(Date.now() + 10 * 86_400_000).toISOString().slice(0, 10);
       const s2 = await post(H.sett, OWNED_ID, { key: "visibility.profile", value: "false", confirmed: "1", until });
       const pauseRow = db.prepare("SELECT pause_until, set_by FROM owner_profile_pause WHERE agent_id = ?").get(OWNED_ID) as any;
@@ -541,7 +543,7 @@ export async function runOwnerFeaturesS2eTests(opts: { log?: boolean } = {}): Pr
         "AC29: a direct PUT of orders.email → 409 confirm_by_email, column untouched");
       const NEW = "ny@s2e-adresse.example.no";
       const oe = await post(H.orderEmail, OWNED_ID, { email: NEW });
-      assertEq([loc(oe), confirms.length, confirms[0]?.to], [`/eier/${OWNED_ID}/valg?melding=ordre_epost_sendt#valg-orders.email`, 1, NEW], "AC29: the form mails a confirmation to the NEW address");
+      assertEq([loc(oe), confirms.length, confirms[0]?.to], [`/eier/${OWNED_ID}/valg?melding=ordre_epost_sendt&ved=valg-orders.email#valg-orders.email`, 1, NEW], "AC29: the form mails a confirmation to the NEW address");
       assertEq(portalMod.currentOrderRecipient(OWNED_ID), `post@${OWNED_ID}.example.no`, "AC29: until the click orders still go to the old address");
       assertTrue(row(await pageHtml(OWNED_ID), "orders.email").includes(`Venter på bekreftelse fra <strong>${NEW}</strong>`), "AC29: the row shows the pending change");
       const tok = confirms[0].confirmUrl.split("/").pop() || "";
@@ -572,7 +574,7 @@ export async function runOwnerFeaturesS2eTests(opts: { log?: boolean } = {}): Pr
         "AC30: stored as the owner's explicit choice");
       assertEq((db.prepare("SELECT answer FROM owner_feature_intro WHERE subject_id = ?").get(OWNED_ID) as any)?.answer, "yes", "AC30: the consent record with its time");
       const n = await post(H.intro, NEWS_NO_ID, { answer: "no" });
-      assertEq(loc(n), `/eier/${NEWS_NO_ID}/valg?melding=intro_nei`, "AC30: «Nei takk» → message");
+      assertEq(loc(n), `/eier/${NEWS_NO_ID}/valg?melding=intro_nei&ved=gruppe-comms#gruppe-comms`, "AC30: «Nei takk» → message");
       const bn = await pageHtml(NEWS_NO_ID);
       assertTrue(row(bn, "comms.news").includes(">Av<") && !bn.includes(`id="velkommen"`), "AC30: «Nei takk» → the row says «Av», no card");
       // Principle 8: set in the row first → the card does not ask again.
@@ -602,8 +604,8 @@ export async function runOwnerFeaturesS2eTests(opts: { log?: boolean } = {}): Pr
       assertTrue(groups.length >= 4 && groups.includes("gruppe-orders"), "principle 9: every group card can be folded (<details open>)");
       const rowForms = b.match(/<form method="post" action="\/eier\/[^"]+\/valg\/(sett|interesse|ordre-epost)" class="mv-ctl-form" data-mv-row="[^"]+">/g) || [];
       assertTrue(rowForms.length > 5 && rowForms.every((f) => /data-mv-row="(gruppe-[a-z]+|planlagt)"/.test(f)), "principle 9: row forms name the card the script swaps after a save");
-      assertTrue(b.includes(`<div id="mv-toast-slot">`) && pg.OWNER_PAGE_SCRIPT.includes("getElementById(\"bekreft\")") && pg.OWNER_PAGE_SCRIPT.includes("f.submit()"),
-        "principle 9: the script swaps the card + message; confirm panels and errors fall back to a normal load");
+      assertTrue(b.includes(`<div id="mv-toast-slot">`) && !pg.OWNER_PAGE_SCRIPT.includes("window.location") && pg.OWNER_PAGE_SCRIPT.includes("f.submit()"),
+        "principle 9: the script swaps the card + message (T5: the confirm panel too, in its row); errors fall back to the plain form POST");
       await post(H.sett, OTHER_ID, { key: "orders.enabled", value: "false", confirmed: "1" });
     }
 

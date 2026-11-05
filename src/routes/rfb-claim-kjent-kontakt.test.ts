@@ -381,7 +381,9 @@ export async function runRfbClaimKjentKontaktTests(opts: { log?: boolean } = {})
       eq(claimRow(r1.body.data.claimId).status, "superseded", "ac4: the earlier code gets status 'superseded' (not deleted)");
       eq(claimsOf("ac4").length, rowsBefore + 1, "ac4: all rows are kept");
       const old = await verify("ac4", r1.body.data.claimId, claimRow(r1.body.data.claimId).verification_code);
-      eq([old.status, old.body?.error], [400, "Claim is superseded"], "ac4: a superseded code no longer works");
+      // K3 (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post): Norwegian, says to use the newest e-mail.
+      eq([old.status, old.body?.data?.status, String(old.body?.error).startsWith("Denne koden er erstattet av en nyere")], [400, "superseded", true],
+        "ac4: a superseded code no longer works");
 
       // Platform-wide cap: CLAIM_CODE_SENDS_PER_HOUR_MAX sends in the last hour.
       const capped = db.prepare("SELECT COUNT(*) AS n FROM agent_claims WHERE code_sent_to IS NOT NULL AND datetime(created_at) >= datetime('now', '-1 hours')").get() as { n: number };
@@ -420,12 +422,14 @@ export async function runRfbClaimKjentKontaktTests(opts: { log?: boolean } = {})
       const wrong = code === "999999" ? "999998" : "999999";
 
       const cross = await verify("ac5-other", id, code);
-      eq([cross.status, cross.body?.error], [400, "Claim not found"], "ac5: verify under another profile's :id → not found");
+      eq([cross.status, cross.body?.data?.status, String(cross.body?.error).startsWith("Vi finner ikke dette kravet")], [400, "not_found", true],
+        "ac5: verify under another profile's :id → not found (K3: Norwegian)");
       eq([claimRow(id).status, claimRow(id).failed_attempts], ["code_sent", 0], "ac5: … and it does not touch the claim");
 
       for (let i = 1; i <= 4; i++) {
         const v = await verify("ac5", id, wrong);
-        eq([v.status, v.body?.error], [400, "Invalid verification code"], `ac5: wrong code ${i} → invalid`);
+        eq([v.status, v.body?.data?.status, v.body?.data?.attemptsLeft, String(v.body?.error).includes(`Du har ${5 - i} forsøk igjen`)],
+          [400, "invalid_code", 5 - i, true], `ac5: wrong code ${i} → invalid, ${5 - i} tries left (K3)`);
       }
       eq([claimRow(id).status, claimRow(id).failed_attempts], ["code_sent", 4], "ac5: 4 wrong codes — still open, counted");
       const fifth = await verify("ac5", id, wrong);
@@ -475,8 +479,13 @@ export async function runRfbClaimKjentKontaktTests(opts: { log?: boolean } = {})
       eq(a.status, 200, "ac6: approve → 200");
       eq([a.body?.isVerified, a.body?.loginLinkSent, a.body?.sentTo], [true, true, maskEmail("kari@gmail.example.test")], "ac6: badge (discovery origin), login link sent, masked");
       eq([mails.length, mails[mails.length - 1]?.to], [before + 1, "kari@gmail.example.test"], "ac6: one mail, to the approved address");
-      ok(/\/api\/marketplace\/auth\/m\/[0-9a-f]{64}/.test(mails[mails.length - 1]?.text ?? ""), "ac6: the mail carries a one-time login link");
-      ok(!(mails[mails.length - 1]?.text ?? "").includes("claim_"), "ac6: the claim token itself is never mailed");
+      // K5: the one-time link is an owner-portal login (/magic-link-verify) for the approved address and this agent.
+      const ac6Token = ((mails[mails.length - 1]?.text ?? "").match(/\/magic-link-verify\?token=([0-9a-f]{64})/) ?? [])[1] ?? "";
+      const ac6Link = db.prepare("SELECT id, email, agent_id, used FROM magic_links WHERE token = ?").get(ac6Token) as any;
+      ok(!!ac6Link && ac6Link.id.startsWith("mlclaim_") && [ac6Link.email, ac6Link.agent_id, ac6Link.used].join("|") === "kari@gmail.example.test|ac2|0",
+        "ac6: the mail carries a one-time owner-portal login link for the approved address and this profile");
+      ok(!/\/api\/marketplace\/auth\/m\//.test(mails[mails.length - 1]?.text ?? ""), "ac6: … no longer the /selger marketplace link");
+      ok(!(mails[mails.length - 1]?.text ?? "").includes("claim_") && !(mails[mails.length - 1]?.html ?? "").includes("claim_"), "ac6: the claim token itself is never mailed");
       const row = claimRow(queuedNoEmail);
       eq([row.status, row.verification_method, row.claimant_email], ["verified", "manual", "kari@gmail.example.test"], "ac6: the claim is verified, manual, bound to the approved address");
       ok(!!row.claim_token && knowledgeService.getClaimByToken(row.claim_token)?.agentId === "ac2", "ac6: the token authorizes the profile");
@@ -494,7 +503,7 @@ export async function runRfbClaimKjentKontaktTests(opts: { log?: boolean } = {})
       ok(["annen@ac3.example.test", "kopi@ac3.example.test"].includes(hasOwnerEntry.claimant_email) && claimRow(hasOwnerEntry.id).claimant_email_typed === hasOwnerEntry.claimant_email,
         "ac6: … the address the claimant typed is kept for audit");
       eq(knowledgeService.getClaimByToken(ownerToken)?.agentId, "ac3", "ac6: the existing owner's token still works after a second owner is approved");
-      ok(!mails.some((m) => m.to === "post@ac3.example.test" && m.subject.startsWith("Gratulerer")), "ac6: the existing owner gets no mail");
+      ok(!mails.some((m) => m.to === "post@ac3.example.test" && m.subject.startsWith("Profilen til")), "ac6: the existing owner gets no mail");
       eq((await invoke(approveH, makeReq({ headers: admin, body: { claimId: claimsOf("ac3").find((c) => c.status === "pending_review").id, email: "ikke en adresse" } }))).status, 400,
         "ac6: an invalid approved address → 400");
 

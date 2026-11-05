@@ -180,7 +180,13 @@ export async function runRfbForProdusenterTests(opts: { log?: boolean } = {}): P
     assertTrue(no.body.includes("Forhåndsbetaling med kort via Stripe er planlagt") && en.body.includes("Prepayment by card through Stripe is planned"), "#betaling: prepayment described as planned");
     // Registry: what the page calls planned is coming_soon; what it calls available is live.
     const { OWNER_FEATURE_REGISTRY } = require("../owner-features/registry") as typeof import("../owner-features/registry");
-    const status = (k: string) => OWNER_FEATURE_REGISTRY.find((e) => e.key === k && e.verticals.includes("rfb"))?.status;
+    // Run-time status (ownerFeatureStatus): auto.updates is live only with OWNER_AUTO_UPDATES_ENABLED,
+    // and the page's «planlagt» sentences about it are left out only then.
+    const { ownerFeatureStatus } = require("../owner-features/registry") as typeof import("../owner-features/registry");
+    const status = (k: string) => {
+      const e = OWNER_FEATURE_REGISTRY.find((x) => x.key === k && x.verticals.includes("rfb"));
+      return e ? ownerFeatureStatus(e) : undefined;
+    };
     for (const k of ["products.import", "orders.pause", "orders.pickup_times", "notify.report", "stats.public_counts", "contact.phone", "contact.email_mode", "contact.address", "auto.updates", "payments.prepay", "orders.auto_confirm"]) {
       assertTrue(status(k) === "coming_soon", `truth: ${k} is coming_soon (page says «planlagt» / does not offer it) — rewrite the text when it goes live`);
     }
@@ -195,7 +201,7 @@ export async function runRfbForProdusenterTests(opts: { log?: boolean } = {}): P
     const todayList = (no.body.match(/Dette kan du velge i dag:<\/p>\s*<ul class="fp-list">([\s\S]*?)<\/ul>/) || ["", ""])[1];
     const todayLabels = [...todayList.matchAll(/<strong>([\s\S]*?)<\/strong>/g)].map((m) => decode(m[1]));
     assertTrue(todayLabels.length > 0, "#mine-valg: the «i dag» list is present");
-    for (const e of OWNER_FEATURE_REGISTRY.filter((x) => x.verticals.includes("rfb") && x.status === "coming_soon")) {
+    for (const e of OWNER_FEATURE_REGISTRY.filter((x) => x.verticals.includes("rfb") && ownerFeatureStatus(x) === "coming_soon")) {
       assertTrue(!todayLabels.includes(e.label.no), `#mine-valg «i dag» list does not contain coming_soon «${e.label.no}»`);
     }
     const { OWNER_LEVELS } = require("../owner-features/changes") as typeof import("../owner-features/changes");

@@ -234,9 +234,12 @@ export async function runOwnerPagesInlineScriptSyntaxT0cTests(opts: { log?: bool
       return { ctx, ul, btn, form, listeners, location, calls };
     }
     const json = (ok: boolean, body: unknown) => Promise.resolve({ ok, json: () => Promise.resolve(body) });
+    // The my-audit row shape (owner-audit-log.ts): finished text, an e-mail
+    // field without values.
     const audits = [
-      { field_name: "phone", changed_by: "owner", changed_at: "2026-10-01T10:00:00.000Z", old_value: 'a"<b>&', new_value: "+47 400 00 001" },
-      { field_name: "about", changed_by: "admin", changed_at: "2026-10-02T10:00:00.000Z", old_value: null, new_value: "Ny tekst" },
+      { id: "a1", field_name: "phone", label: "Telefon", old_value: 'a"<b>&', new_value: "+47 400 00 001", values_hidden: false, who: "Du", changed_at: "2026-10-01T10:00:00.000Z", when: "01.10.2026, 12:00" },
+      { id: "a2", field_name: "about", label: "Om produsenten", old_value: "(tom)", new_value: "Ny tekst", values_hidden: false, who: "Rett fra Bonden", changed_at: "2026-10-02T10:00:00.000Z", when: "02.10.2026, 12:00" },
+      { id: "a3", field_name: "email", label: "E-post", old_value: null, new_value: null, values_hidden: true, who: "Du", changed_at: "2026-10-03T10:00:00.000Z", when: "03.10.2026, 12:00" },
     ];
 
     {
@@ -245,10 +248,12 @@ export async function runOwnerPagesInlineScriptSyntaxT0cTests(opts: { log?: bool
       vm.runInContext(code, e1.ctx);
       for (let i = 0; i < 5; i++) await flush();
       assertTrue(!e1.ul.innerHTML.includes("Laster"), "p-01: «Endringslogg» no longer says «Laster ...»");
-      assertTrue((e1.ul.innerHTML.match(/<li class="ep-audit-item">/g) || []).length === 2, "p-02: one list item per audit row", e1.ul.innerHTML);
-      assertTrue(e1.ul.innerHTML.includes("<strong>phone</strong> endret av Du") && e1.ul.innerHTML.includes("endret av Support"), "p-03: field and actor are shown");
+      assertTrue((e1.ul.innerHTML.match(/<li class="ep-audit-item">/g) || []).length === 3, "p-02: one list item per audit row", e1.ul.innerHTML);
+      assertTrue(e1.ul.innerHTML.includes("<strong>Telefon</strong>: ") && e1.ul.innerHTML.includes("01.10.2026, 12:00 · Du") && e1.ul.innerHTML.includes("02.10.2026, 12:00 · Rett fra Bonden"),
+        "p-03: the Norwegian name, the time and who are shown", e1.ul.innerHTML);
       assertTrue(e1.ul.innerHTML.includes("a&quot;&lt;b&gt;&amp;") && !e1.ul.innerHTML.includes('a"<b>'), "p-04: values are HTML-escaped", e1.ul.innerHTML);
-      assertTrue(e1.ul.innerHTML.includes("(tomt)"), "p-05: a null value shows (tomt)");
+      assertTrue(e1.ul.innerHTML.includes("<strong>Om produsenten</strong>: (tom) → Ny tekst"), "p-05: the API's «(tom)» is shown as sent", e1.ul.innerHTML);
+      assertTrue(e1.ul.innerHTML.includes("<strong>E-post</strong> endret<div") && !e1.ul.innerHTML.includes("null"), "p-05b: an e-mail row shows no values (and never «null»)", e1.ul.innerHTML);
 
       // p2: empty feed.
       const e2 = makeEnv(() => json(true, { success: true, audits: [] }));

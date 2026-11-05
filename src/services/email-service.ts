@@ -26,6 +26,29 @@ export function maskEmails(s: string): string {
   return s.replace(/[^\s<>"'(),;:]+@[^\s<>"'(),;:]+/g, "[email]");
 }
 
+// ─── Contact-form copy (sendAdminContactFormCopy) ─────────────────
+const CONTACT_FORM_PLATFORM_LABELS: Record<"rfb" | "experiences" | "dental", string> = {
+  rfb: "Rett fra Bonden",
+  experiences: "Opplevagent",
+  dental: "Finn-tannlege",
+};
+const CONTACT_FORM_COPY_SUBJECT_MAX = 150;
+// C0 + DEL + C1 controls (CR/LF among them) and the Unicode line/paragraph separators.
+const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g;
+// Bidi embedding/override/isolate marks: they can make a subject display reversed.
+const BIDI_CHARS_RE = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+
+/** Visitor text for a header or a one-line field: controls → space, bidi marks dropped, runs collapsed. */
+function toOneLine(s: string): string {
+  return String(s ?? "").replace(CONTROL_CHARS_RE, " ").replace(BIDI_CHARS_RE, "").replace(/\s+/g, " ").trim();
+}
+
+/** Caps at `max` code points (never splits a surrogate pair), ending in "…" when cut. */
+function capChars(s: string, max: number): string {
+  const chars = Array.from(s);
+  return chars.length <= max ? s : chars.slice(0, max - 1).join("").trimEnd() + "…";
+}
+
 export interface EmailOptions {
   to: string;
   subject: string;
@@ -60,6 +83,13 @@ export interface EmailOptions {
    * Omitted/false leaves the logging unchanged.
    */
   redactRecipientInLogs?: boolean;
+  /**
+   * Contact-form copy (2026-11-01): the subject carries free text a visitor
+   * wrote, so the send log must not repeat it. When set, every log line in
+   * sendEmail shows this value instead of the subject; the mail itself still
+   * carries the real subject. Omitted leaves the logging unchanged.
+   */
+  logSubjectAs?: string;
   /**
    * Full RFC 5322 From header, e.g. `"Opplevagent" <kontakt@rettfrabonden.com>`.
    *
@@ -292,17 +322,25 @@ export class EmailService {
     }
   }
 
+  /**
+   * «Profilen til X er nå din» — sent when Daniel approves a claim by hand
+   * (POST /admin/agents/claim-review-approve). K5 (dev-request
+   * 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post, text approved by Daniel):
+   * `loginUrl` is a one-time, 15-minute /magic-link-verify link straight into
+   * the owner portal (/eier), and the mail names the portal address
+   * (<host>/eier/<agentId>) the owner logs in on later with this address.
+   */
   async sendClaimConfirmation(
     email: string,
     agentName: string,
-    dashboardUrl: string,
-    agentId?: string
+    loginUrl: string,
+    agentId: string
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     try {
-      const subject = `Gratulerer! ${agentName} er nå ditt på ${this.brand}`;
+      const subject = `Profilen til ${agentName} er nå din på ${this.brand}`;
 
-      const htmlContent = this.generateClaimConfirmationHtml(agentName, dashboardUrl, agentId);
-      const textContent = this.generateClaimConfirmationText(agentName, dashboardUrl, agentId);
+      const htmlContent = this.generateClaimConfirmationHtml(agentName, loginUrl, agentId);
+      const textContent = this.generateClaimConfirmationText(agentName, loginUrl, agentId);
 
       return await this.sendEmail({
         to: email,
@@ -328,6 +366,7 @@ export class EmailService {
     const redact = options.redactRecipientInLogs === true;
     const logTo = (to: string) => (redact ? "[redacted]" : to);
     const logErr = (msg: string) => (redact ? maskEmails(msg) : msg);
+    const logSubject = (subject: string) => options.logSubjectAs ?? subject;
     // ── Test-send guard (dev-request 2026-07-26-booking-test-send-guard) ──
     // Applied FIRST, ahead of the dry-run short-circuit and every other
     // branch below, so there is no code path on which a test-flagged email
@@ -345,7 +384,7 @@ export class EmailService {
         logger.warn('Test-send redirect applied', {
           intendedRecipient: logTo(options.to),
           redirectedTo: logTo(redirected.to),
-          subject: redirected.subject,
+          subject: logSubject(redirected.subject),
         });
         options = { ...options, ...redirected };
       } catch (err) {
@@ -357,7 +396,7 @@ export class EmailService {
               : 'test_send_redirect_failed';
         logger.error('Test-send BLOCKED — nothing sent', {
           intendedRecipient: logTo(options.to),
-          subject: options.subject,
+          subject: logSubject(options.subject),
           error,
         });
         return { success: false, error };
@@ -370,7 +409,7 @@ export class EmailService {
     if (!this.isConfigured || (this.transporter === this.envTransporter && isEmailForceDryRun())) {
       logger.info('DRY RUN: Would send email', {
         to: logTo(options.to),
-        subject: options.subject,
+        subject: logSubject(options.subject),
       });
       return { success: true, messageId: 'DRY_RUN' };
     }
@@ -416,7 +455,7 @@ export class EmailService {
 
       logger.info('Email sent successfully', {
         to: logTo(options.to),
-        subject: options.subject,
+        subject: logSubject(options.subject),
         messageId: info.messageId as string,
       });
 
@@ -901,24 +940,20 @@ Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
   }
 
   /**
-   * The «slå på bestillinger» link in the claim confirmation. F7 (dev-request
-   * 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel): with the agent
-   * id it points at the portal card, /eier/<id>/portal#bestillinger, where
-   * the switch is. The login link (dashboardUrl) goes through /selger, a page
-   * with no such switch, so appending #bestillinger to it led nowhere. The
-   * portal sends a not-yet-logged-in owner to the login page for that agent.
-   * Without an agent id the old behaviour stays (callers that only have a
-   * dashboard URL).
+   * Where the owner logs in later: <APP_URL>/eier/<agentId>. `text` is the
+   * same address without the scheme (default «rettfrabonden.com/eier/<id>»),
+   * as the claim confirmation shows it; `url` is what it links to. K5
+   * replaced F7's order-toggle link (/eier/<id>/portal#bestillinger): the
+   * login link now lands in the portal itself, where that switch is.
    */
-  private orderToggleUrl(dashboardUrl: string, agentId?: string): string {
-    if (agentId) {
-      const base = (process.env.APP_URL || 'https://rettfrabonden.com').replace(/\/+$/, '');
-      return `${base}/eier/${encodeURIComponent(agentId)}/portal#bestillinger`;
-    }
-    return dashboardUrl.includes('#') ? dashboardUrl : `${dashboardUrl}#bestillinger`;
+  private ownerPortalAddress(agentId: string): { url: string; text: string } {
+    const base = (process.env.APP_URL || 'https://rettfrabonden.com').replace(/\/+$/, '');
+    const url = `${base}/eier/${encodeURIComponent(agentId)}`;
+    return { url, text: url.replace(/^https?:\/\//i, '') };
   }
 
-  private generateClaimConfirmationHtml(agentName: string, dashboardUrl: string, agentId?: string): string {
+  private generateClaimConfirmationHtml(agentName: string, loginUrl: string, agentId: string): string {
+    const portal = this.ownerPortalAddress(agentId);
     return `
 <!DOCTYPE html>
 <html lang="no">
@@ -935,13 +970,6 @@ Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
       background: #ffffff;
       padding: 40px 20px;
     }
-    .success-box {
-      background: #e8f5e9;
-      border-left: 4px solid #2d5f2e;
-      padding: 20px;
-      margin: 20px 0;
-      border-radius: 4px;
-    }
     .logo {
       font-size: 20px;
       font-weight: bold;
@@ -952,44 +980,45 @@ Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
 </head>
 <body>
   <div class="container">
-    <div class="logo">🌾 ${this.brand}</div>
-    <h1>Gratulerer!</h1>
-    <div class="success-box">
-      <p><strong>${this.escapeHtml(agentName)}</strong> er nå ditt på ${this.brand}.</p>
-    </div>
-    <p>Din agent er klar. Du kan nå:</p>
+    <div class="logo">🌾 ${this.escapeHtml(this.brand)}</div>
+    <h1>Hei!</h1>
+    <p>Profilen til <strong>${this.escapeHtml(agentName)}</strong> er nå koblet til deg, og du kan endre den selv når du vil.</p>
+    <p>I eierportalen kan du:</p>
     <ul>
-      <li>Oppdatere informasjon om produkter og åpningstider</li>
-      <li>Se hvor dine produkter blir funnet av kundene</li>
-      <li>Følge med på interaksjoner og preferanser</li>
+      <li>rette varer, åpningstider og kontaktinfo</li>
+      <li>se hvor ofte profilen blir vist og besøkt</li>
+      <li>velge om du vil få bestillinger fra kunder på e-post</li>
     </ul>
-    ${ctaButtonHtml({ href: this.escapeHtml(dashboardUrl), label: "Gå til dashboarden din", color: "#2d5f2e", radius: "6px", margin: "20px 0" })}
-    <p>Vil du motta bestillinger fra kunder på e-post? Du kan slå det på (og av igjen) med ett klikk i <a href="${this.escapeHtml(this.orderToggleUrl(dashboardUrl, agentId))}">dashboarden din</a>.</p>
-    <p>Lykke til!</p>
+    ${ctaButtonHtml({ href: this.escapeHtml(loginUrl), label: "Logg inn i eierportalen", color: "#2d5f2e", radius: "6px", margin: "20px 0" })}
+    <p>Lenken virker i 15 minutter. Senere logger du inn på <a href="${this.escapeHtml(portal.url)}">${this.escapeHtml(portal.text)}</a> med denne e-postadressen.</p>
+    <p>Har du spørsmål, svarer du bare på denne e-posten.</p>
+    <p>Hilsen Daniel, ${this.escapeHtml(this.brand)}</p>
   </div>
 </body>
 </html>
     `;
   }
 
-  private generateClaimConfirmationText(agentName: string, dashboardUrl: string, agentId?: string): string {
+  private generateClaimConfirmationText(agentName: string, loginUrl: string, agentId: string): string {
+    const portal = this.ownerPortalAddress(agentId);
     return `
-Gratulerer!
+Hei!
 
-${agentName} er nå ditt på ${this.brand}.
+Profilen til ${agentName} er nå koblet til deg, og du kan endre den selv når du vil.
 
-Din agent er klar. Du kan nå:
-- Oppdatere informasjon om produkter og åpningstider
-- Se hvor dine produkter blir funnet av kundene
-- Følge med på interaksjoner og preferanser
+I eierportalen kan du:
+- rette varer, åpningstider og kontaktinfo
+- se hvor ofte profilen blir vist og besøkt
+- velge om du vil få bestillinger fra kunder på e-post
 
-Gå til dashboarden din:
-${dashboardUrl}
+Logg inn i eierportalen:
+${loginUrl}
 
-Vil du motta bestillinger fra kunder på e-post? Du kan slå det på (og av igjen) med ett klikk her:
-${this.orderToggleUrl(dashboardUrl, agentId)}
+Lenken virker i 15 minutter. Senere logger du inn på ${portal.text} med denne e-postadressen.
 
-Lykke til!
+Har du spørsmål, svarer du bare på denne e-posten.
+
+Hilsen Daniel, ${this.brand}
     `;
   }
 
@@ -1185,6 +1214,70 @@ ${this.brand} | ${getConfig().domain}`;
         error: error instanceof Error ? error.message : String(error),
       });
       return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Copy of a public contact-form submission (POST /api/contact) to the admin
+   * — Daniel asked for it 2026-11-01; until then the form only wrote a CRM
+   * thread and nothing reached an inbox. Same recipient and skip rule as
+   * sendAdminClaimNotification above.
+   *
+   * Text-only on purpose (no htmlContent): every field is visitor input, so
+   * nothing in it can ever be rendered as HTML. Reply-To is the visitor, so
+   * «Svar» goes straight to them; the visitor's subject is flattened to one
+   * line (no CR/LF or other control characters reach the header) and the
+   * whole subject is capped. Never throws; logs carry neither the message
+   * nor the visitor's address.
+   */
+  async sendAdminContactFormCopy(opts: {
+    platform: "rfb" | "experiences" | "dental";
+    name: string;
+    email: string;
+    subject: string;
+    message: string;
+    threadId: string;
+  }): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const adminEmail = process.env.ADMIN_NOTIFICATION_EMAIL;
+    if (!adminEmail) {
+      logger.info('ADMIN_NOTIFICATION_EMAIL not set — skipping contact-form copy');
+      return { success: true, messageId: 'NO_ADMIN_EMAIL' };
+    }
+
+    try {
+      const label = CONTACT_FORM_PLATFORM_LABELS[opts.platform] ?? String(opts.platform);
+      const visitorSubject = toOneLine(opts.subject);
+      const subject = capChars(`[Kontaktskjema · ${label}] ${visitorSubject || 'Ny melding'}`, CONTACT_FORM_COPY_SUBJECT_MAX);
+      const textContent = [
+        `Plattform: ${label}`,
+        `Navn: ${toOneLine(opts.name)}`,
+        `E-post: ${toOneLine(opts.email)}`,
+        `Emne: ${visitorSubject || '(ikke oppgitt)'}`,
+        '',
+        opts.message,
+        '',
+        `CRM-tråd: ${opts.threadId}`,
+        'Svar på denne e-posten går rett til avsenderen. Svaret havner ikke av seg selv i CRM-tråden.',
+      ].join('\n');
+
+      return await this.sendEmail({
+        to: adminEmail,
+        subject,
+        textContent,
+        replyTo: opts.email.replace(CONTROL_CHARS_RE, ''),
+        // Not outreach (see EmailOptions.omitAgentHeader), and the mail carries
+        // a consumer's address and free text, so keep both out of the send log.
+        omitAgentHeader: true,
+        redactRecipientInLogs: true,
+        logSubjectAs: `[Kontaktskjema · ${label}]`,
+      });
+    } catch (error) {
+      logger.error('Error sending admin contact-form copy', {
+        platform: opts.platform,
+        threadId: opts.threadId,
+        error: maskEmails(error instanceof Error ? error.message : String(error)),
+      });
+      return { success: false, error: maskEmails(error instanceof Error ? error.message : 'Unknown error') };
     }
   }
 

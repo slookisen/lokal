@@ -2324,6 +2324,38 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Migration gardssalg_visit_proposal_failures failed:", err);
   }
 
+  // ─── experience_content_judgement_files / _failures (A2A dev-request
+  // 2026-10-06-experiences-enrichment-plattformjobb-og-felles-serverjobbramme,
+  // «Innsnevring 2026-10-28», skive 3k med punkt b) — the once-per-file
+  // ledger + per-path failure counter for the content-judgement job
+  // (services/experience-content-judgement-job.ts), same shape and same
+  // semantics as the proposal tables above (shared mechanics in
+  // services/proposal-file-queue.ts). Additive, idempotent.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS experience_content_judgement_files (
+        path TEXT PRIMARY KEY,
+        sha TEXT NOT NULL,
+        processed_at TEXT NOT NULL,
+        result_json TEXT
+      )
+    `);
+  } catch (err) {
+    console.error("Migration experience_content_judgement_files failed:", err);
+  }
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS experience_content_judgement_failures (
+        path TEXT PRIMARY KEY,
+        fail_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        last_failed_at TEXT
+      )
+    `);
+  } catch (err) {
+    console.error("Migration experience_content_judgement_failures failed:", err);
+  }
+
   // ─── experience_data_corrections (POST /admin/experiences-data-corrections,
   // routes/opplevelser.ts) ───────────────────────────────────────────────
   // One row per APPLIED, source-backed factual correction of one logical

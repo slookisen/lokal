@@ -20,6 +20,11 @@
 // No candidates are shown without a session for this agent (→ login page,
 // with the rfb_owner_return cookie so the /eier magic link comes back here)
 // or without a verified owner (segment B → «ta over profilen» via /selger).
+// Without a session on a profile that has no verified owner by the customer
+// rule (agentHasVerifiedOwner), the visitor also gets «ta over profilen»
+// instead of the login (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post
+// K4): the /eier login only mails agent_knowledge.email, so it is a dead end
+// there. The token stays valid, so the same link works after the claim.
 // The token alone never shows candidates and never grants a write.
 //
 // POST needs, in this order: a valid token for this agent, the owner session,
@@ -37,6 +42,7 @@ import express, { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
 import { isCrossSiteWrite } from "../middleware/same-origin-write";
 import {
+  agentHasVerifiedOwner,
   escapeHtml,
   isVerifiedOwner,
   ownerProductsNeedClaimantLoginPage,
@@ -220,7 +226,9 @@ router.get(PATH, (req: Request, res: Response) => {
     if (!session.valid || session.agentId !== agentId) {
       logOutreachOpened(tok.campaign, agentId, "no_session");
       setReturnCookie(res, agentId, token);
-      return res.send(loginPage(agentId));
+      // K4: no verified owner yet → the /eier login is a dead end (it only mails
+      // agent_knowledge.email, which the profile may not list): claim flow first.
+      return res.send(agentHasVerifiedOwner(agentId) ? loginPage(agentId) : claimPage(agentId));
     }
     if (!ownerIsVerified(agentId, session)) {
       logOutreachOpened(tok.campaign, agentId, "not_verified");

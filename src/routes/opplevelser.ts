@@ -431,6 +431,9 @@ import {
   selectExperiencesForPriceFreshnessCheck,
   resolvePriceProvenanceUrl,
   type PriceFreshnessTarget,
+  // Stamp name_collision at first harvest in bulk-load (additive; the
+  // recheck-backfill sweep keeps stamping already-present rows).
+  flagNameCollision,
 } from "../services/experience-store";
 // dev-request 2026-08-17-forsyningskjede-samarbeid-og-kvalitetsoppdatering,
 // Skive 3 ("Kvalitetsstyrt oppdatering av ikke-tomme felt — erstatter
@@ -678,7 +681,25 @@ import { titleTokens, titleSimilarity, CONTENT_TRANSFER_SIMILARITY_MIN } from ".
 // CLASSIFIED fetcher. It owns the charset-correct decode that used to be done
 // here via decodeHtmlBytes (PR lokal#365), and adds the named failure reason,
 // the one-shot transient retry and the empty-body check.
-import { fetchPage, discoverContentLinks, visibleTextOf, type FetchPageResult, type FetchPersistence } from "../services/fetch-page";
+import {
+  fetchPage,
+  discoverContentLinks,
+  rankContentLinks,
+  CONTENT_LINK_SCORE_ABOUT,
+  visibleTextOf,
+  type FetchPageResult,
+  type FetchPersistence,
+} from "../services/fetch-page";
+import {
+  isAboutFallbackPath,
+  urlIsInSection,
+  pickAboutPageCandidate,
+  aboutPageTextIncluded,
+  resolveAboutPageMode,
+  aboutPagePreviewRequested,
+  type AboutPageMode,
+  type AboutPageEvaluation,
+} from "../services/about-page-candidate";
 import {
   renderPage,
   shouldEscalateToRender,
@@ -2091,13 +2112,32 @@ const ADMISSION_VERDICT_STAMP_MAX_CHARS = 500;
 
 type AdmissionOutcome = { status: "match" | "mismatch" | "unresolved"; reason: string };
 
+// dev-request 2026-10-31-opplevagent-admisjonsgate-script-json-stripping,
+// slice 1 (diagnostics only): for every row whose evidence page was fetched,
+// record how much text the judge saw (visibleTextOf) vs how much the page
+// ships as script-embedded string literals (gardssalgEmbeddedPageText).
+// Evidence only — the judge input is unchanged.
+const ADMISSION_DIAGNOSTIC_SAMPLE_CHARS = 300;
+type AdmissionDiagnostic = {
+  evidence_url: string;
+  visible_chars: number;
+  embedded_chars: number;
+  script_blocks: number;
+  visible_sample: string;
+  embedded_sample: string;
+  verdict: AdmissionOutcome["status"];
+};
+
 /**
  * Run one NOT-YET-INSERTED bulk-load row through the admission gate: fetch
  * its own evidence_url and ask the fail-closed judge whether the candidate's
  * composed content (title/category/price) is substantiated by that page.
  * Never throws — every failure path resolves to `unresolved` (fail-closed).
  */
-async function judgeBulkLoadCandidate(r: BulkRow, evidenceUrl: string): Promise<AdmissionOutcome> {
+async function judgeBulkLoadCandidate(
+  r: BulkRow,
+  evidenceUrl: string,
+): Promise<AdmissionOutcome & { diagnostic?: AdmissionDiagnostic }> {
   const judgeRow: HoldoutExperienceRow = {
     // Synthetic id — the row does not exist yet; the judge only echoes this
     // into nothing (its prompt uses title/description/category/price).
@@ -2117,11 +2157,28 @@ async function judgeBulkLoadCandidate(r: BulkRow, evidenceUrl: string): Promise<
       reason: `henting av evidensside feilet: ${fetchResult.reason} (${fetchResult.persistence})`,
     };
   }
-  const judged = await judgeExperienceContentMatch(judgeRow, visibleTextOf(fetchResult.html));
-  if (!judged.ok) return { status: "unresolved", reason: judged.reasoning };
-  return judged.verdict === "MATCH"
-    ? { status: "match", reason: judged.reasoning }
-    : { status: "mismatch", reason: judged.reasoning };
+  const visibleText = visibleTextOf(fetchResult.html);
+  const judged = await judgeExperienceContentMatch(judgeRow, visibleText);
+  const outcome: AdmissionOutcome = !judged.ok
+    ? { status: "unresolved", reason: judged.reasoning }
+    : judged.verdict === "MATCH"
+      ? { status: "match", reason: judged.reasoning }
+      : { status: "mismatch", reason: judged.reasoning };
+  const embeddedText = gardssalgEmbeddedPageText(fetchResult.html);
+  const diagnostic: AdmissionDiagnostic = {
+    evidence_url: evidenceUrl,
+    visible_chars: visibleText.length,
+    embedded_chars: embeddedText.length,
+    script_blocks: (fetchResult.html.match(/<script\b/gi) || []).length,
+    visible_sample: visibleText.slice(0, ADMISSION_DIAGNOSTIC_SAMPLE_CHARS),
+    embedded_sample: embeddedText.slice(0, ADMISSION_DIAGNOSTIC_SAMPLE_CHARS),
+    verdict: outcome.status,
+  };
+  console.log(
+    `[opplevelser] admission-gate diagnostic url=${evidenceUrl} verdict=${outcome.status} ` +
+      `visible_chars=${diagnostic.visible_chars} embedded_chars=${diagnostic.embedded_chars} script_blocks=${diagnostic.script_blocks}`,
+  );
+  return { ...outcome, diagnostic };
 }
 
 router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response) => {
@@ -2199,6 +2256,12 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
   // follows the same convention.
   let rejectedBlocklisted = 0;
   const rejectedBlocklistedProviders: Array<{ provider_name: string; matched_by?: string; matched_value?: string }> = [];
+  // Providers whose Brreg verdict carried name_collision:true (>=2 Brreg
+  // entities share the name, kommune didn't disambiguate) — stamped via
+  // flagNameCollision() at first harvest in apply mode, counted only in
+  // dry-run. Never cleared here.
+  let flaggedNameCollision = 0;
+  const flaggedNameCollisionProviders: string[] = [];
 
   // Admission-gate tallies (see the block comment above ADMISSION_GATE_MAX_
   // JUDGED). `judged` = rows the gate actually evaluated (fetch + judge
@@ -2213,6 +2276,8 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
     verdict: "match" | "mismatch" | "unresolved";
     reason: string;
   }> = [];
+  // Bounded by ADMISSION_GATE_MAX_JUDGED (one entry per successful fetch).
+  const admissionGateDiagnostics: AdmissionDiagnostic[] = [];
 
   // ── 2–3. Classify + (conditionally) insert, one provider at a time. ─
   for (let i = 0; i < providerNames.length; i++) {
@@ -2273,6 +2338,10 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
           }
         }
         providersInserted += 1;
+        if (verdict.name_collision === true) {
+          flaggedNameCollision++;
+          flaggedNameCollisionProviders.push(name);
+        }
         continue;
       }
 
@@ -2334,6 +2403,14 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
           setBrregVerification(providerId, (verdict.brreg_active ?? 0) as 0 | 1, verdict.org_nr ?? undefined);
         }
         providersInserted += 1;
+      }
+
+      // Stamp name_collision for both the existing and the freshly created
+      // provider (set-only; never cleared here).
+      if (verdict.name_collision === true) {
+        flagNameCollision(providerId);
+        flaggedNameCollision++;
+        flaggedNameCollisionProviders.push(name);
       }
 
       // ── insert this provider's experiences (idempotent by title). ───
@@ -2423,7 +2500,9 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
             admissionGate.capped++;
           } else {
             admissionGate.judged++;
-            admission = await judgeBulkLoadCandidate(r, evidenceUrl);
+            const { diagnostic, ...judgedOutcome } = await judgeBulkLoadCandidate(r, evidenceUrl);
+            admission = judgedOutcome;
+            if (diagnostic) admissionGateDiagnostics.push(diagnostic);
             admissionGate[admission.status]++;
           }
           admissionGateResults.push({
@@ -2510,6 +2589,8 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
     excluded_inactive: excludedInactive,
     rejected_blocklisted: rejectedBlocklisted,
     rejected_blocklisted_providers: rejectedBlocklistedProviders,
+    flagged_name_collision: flaggedNameCollision,
+    flagged_name_collision_providers: flaggedNameCollisionProviders,
     // Admission-gate report (faithfulness-inflow slice). Dry-run spends zero
     // fetch/judge budget by design, so it can only announce that the gate
     // WOULD run on apply — it cannot pre-compute verdicts without paying the
@@ -2519,7 +2600,7 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
           dry_run: true,
           note: "admission gate kjøres kun i apply-modus: hver NY rad med evidence_url dømmes mot sin egen evidensside før den slippes inn som verified",
         }
-      : { ...admissionGate, results: admissionGateResults },
+      : { ...admissionGate, results: admissionGateResults, diagnostics: admissionGateDiagnostics },
     ...(cappedProviders > 0 ? { capped_providers: cappedProviders } : {}),
   });
 });
@@ -2994,6 +3075,15 @@ type CrFetchOutcome =
        * gardssalg-website-verification.ts's `candidateHost`.
        */
       finalUrl?: string;
+      /**
+       * dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse:
+       * set ONLY by crFetchGardssalgContent when its caller passed the
+       * aboutPage option (about-page run). Every fetched sub-page that is an
+       * about page (discovered with CONTENT_LINK_SCORE_ABOUT, or an about
+       * fallback path) whose final URL stayed inside the crawl's own section,
+       * in fetch order; `url` is that final URL.
+       */
+      aboutPages?: Array<{ url: string; html: string }>;
     }
   | { ok: false; reason: string; persistence: FetchPersistence; status: number | null };
 
@@ -3737,6 +3827,41 @@ export function gardssalgOrderContentPathsForNeed(needsDriven: boolean): readonl
   return [...visitFirst, ...rest];
 }
 
+// dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse, spec 5:
+// the about-page fallback paths, in this order.
+const GARDSSALG_ABOUT_FALLBACK_PATHS: readonly string[] = ["/om-oss", "/om"];
+
+/**
+ * A gårdssalg row that still needs a description: about_text blank or THIN —
+ * failing meetsAboutCheapBar, the same «thin» gardssalgReplaceableFieldAction
+ * fills/replaces. PURE.
+ */
+export function gardssalgAboutNeedsDescription(aboutText: string | null | undefined): boolean {
+  if (aboutText === null || aboutText === undefined || String(aboutText).trim() === "") return true;
+  return !meetsAboutCheapBar(aboutText);
+}
+
+/**
+ * The fallback-path order for an about-page run (ENRICHMENT_ABOUT_PAGE_ENABLED
+ * or a dry-run preview; spec 5). `needsDescription=false` returns
+ * gardssalgOrderContentPathsForNeed(needsDriven) unchanged. For a row that
+ * needs a description (gardssalgAboutNeedsDescription), /om-oss and /om move
+ * to just ahead of the first visit path of that same order; every other path
+ * keeps its relative order. Membership never changes. PURE.
+ */
+export function gardssalgOrderContentPathsForAboutNeed(
+  needsDriven: boolean,
+  needsDescription: boolean
+): readonly string[] {
+  const base = gardssalgOrderContentPathsForNeed(needsDriven);
+  if (!needsDescription) return base;
+  const about = GARDSSALG_ABOUT_FALLBACK_PATHS.filter((p) => base.includes(p));
+  const rest = base.filter((p) => !GARDSSALG_ABOUT_FALLBACK_PATHS.includes(p));
+  const firstVisit = rest.findIndex((p) => GARDSSALG_VISIT_PATH_SET.has(p));
+  const at = firstVisit === -1 ? rest.length : firstVisit;
+  return [...rest.slice(0, at), ...about, ...rest.slice(at)];
+}
+
 /**
  * Fetch a gårdssalg provider's homepage + up to 4 of its content sub-pages
  * (GARDSSALG_CONTENT_PATHS), concatenated, stopping once 5 pages total have
@@ -3780,7 +3905,17 @@ async function crFetchGardssalgContent(
   // Del A2 — OPTIONAL, additive, defaults to false so every pre-existing
   // call site keeps today's fallback-path ordering byte-identical. See
   // gardssalgOrderContentPathsForNeed()'s own doc comment above.
-  needsDrivenOrdering: boolean = false
+  needsDrivenOrdering: boolean = false,
+  // dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse —
+  // OPTIONAL; passed only by the content-refresh run when the about-page
+  // logic is on (ENRICHMENT_ABOUT_PAGE_ENABLED or a dry-run preview). Unset =
+  // today's crawl, byte-identical, for this caller and every other one. When
+  // set: a discovered about link gets one of the GARDSSALG_MAX_PAGES - 1
+  // sub-page slots (no extra fetch), the fallback list puts /om-oss and /om
+  // ahead of the visit paths for a row that needs a description
+  // (gardssalgOrderContentPathsForAboutNeed), and the fetched about pages
+  // come back as `aboutPages`.
+  aboutPage?: { needsDescription: boolean }
 ): Promise<CrFetchOutcome> {
   const fetchUrl = /^https?:\/\//i.test(homepageUrl) ? homepageUrl : `https://${homepageUrl}`;
   const primary = await crFetchPage(fetchUrl);
@@ -3868,6 +4003,8 @@ async function crFetchGardssalgContent(
   // the homepage itself (that's implicit — primary always succeeded to get
   // this far).
   const fetchedPaths: string[] = [];
+  // About-page run only (the aboutPage option); see CrFetchOutcome.aboutPages.
+  const aboutPagesOut: Array<{ url: string; html: string }> = [];
   try {
     // Final url, not the requested one — a cross-host redirect otherwise leaves
     // the whole sub-page crawl pointed at a host that no longer serves the site.
@@ -3923,22 +4060,53 @@ async function crFetchGardssalgContent(
     // Fallback fires only when discovery yields nothing INSIDE the section,
     // which is the site shape fetch-page.ts documents as having no crawlable
     // internal links at all.
-    const discovered = discoverContentLinks(primaryHtml, primaryUrl, GARDSSALG_MAX_PAGES)
-      .filter((href) => href.startsWith(base));
+    let targets: Array<{ url: string; label: string; about?: boolean }>;
+    if (!aboutPage) {
+      const discovered = discoverContentLinks(primaryHtml, primaryUrl, GARDSSALG_MAX_PAGES)
+        .filter((href) => href.startsWith(base));
 
-    const targets: Array<{ url: string; label: string }> =
-      discovered.length > 0
-        ? // Recorded relative to `base` so pagesFetchedPaths keeps the shape
-          // the products diagnostic already reads.
-          discovered.map((href) => ({ url: href, label: href.slice(base.length) || "/" }))
-        : // Del A2: need-driven ordering of the FALLBACK list only — link
-          // discovery above still always takes priority when it finds
-          // anything inside the section.
-          gardssalgOrderContentPathsForNeed(needsDrivenOrdering).map((p) => ({ url: `${base}${p}`, label: p }));
+      targets =
+        discovered.length > 0
+          ? // Recorded relative to `base` so pagesFetchedPaths keeps the shape
+            // the products diagnostic already reads.
+            discovered.map((href) => ({ url: href, label: href.slice(base.length) || "/" }))
+          : // Del A2: need-driven ordering of the FALLBACK list only — link
+            // discovery above still always takes priority when it finds
+            // anything inside the section.
+            gardssalgOrderContentPathsForNeed(needsDrivenOrdering).map((p) => ({ url: `${base}${p}`, label: p }));
+    } else {
+      // About-page run: the same discovery and section filter, with the best
+      // IN-SECTION about link guaranteed a place among the first
+      // GARDSSALG_MAX_PAGES - 1 targets (the sub-page slots). Eligible means
+      // it passes the very `base` prefix filter below (which also pins the
+      // protocol — an absolute http:// link on an https site does not) AND
+      // urlIsInSection (no sibling section sharing the prefix), so the
+      // reserved link is never one the filter then drops; the filter only
+      // removes other entries, which can only move the reserved link forward.
+      const discovered = rankContentLinks(primaryHtml, primaryUrl, GARDSSALG_MAX_PAGES, {
+        reserveAboutSlotWithin: GARDSSALG_MAX_PAGES - 1,
+        aboutEligible: (url) => url.startsWith(base) && urlIsInSection(url, base),
+      }).filter((l) => l.url.startsWith(base));
+      targets =
+        discovered.length > 0
+          ? discovered.map((l) => ({
+              url: l.url,
+              label: l.url.slice(base.length) || "/",
+              about: l.score === CONTENT_LINK_SCORE_ABOUT,
+            }))
+          : gardssalgOrderContentPathsForAboutNeed(needsDrivenOrdering, aboutPage.needsDescription).map((p) => ({
+              url: `${base}${p}`,
+              label: p,
+              about: isAboutFallbackPath(p),
+            }));
+    }
 
     for (const t of targets) {
       if (pagesFetched >= GARDSSALG_MAX_PAGES) break;
-      let sub = await crFetchHtml(t.url);
+      // crFetchHtml(t.url) is exactly this; the page result is kept for the
+      // about page's final URL.
+      const subRes = await crFetchPage(t.url);
+      let sub = subRes.ok ? subRes.html : null;
       // ── Sub-page escalation (Daniel, live session 2026-08-15) ───────────
       //
       // Rendering used to run on the PRIMARY page only, and on a JS-built site
@@ -3985,6 +4153,13 @@ async function crFetchGardssalgContent(
         pages.push({ label: t.label, html: sub });
         pagesFetched++;
         fetchedPaths.push(t.label);
+        // Only the producer's own section counts as its about page — the
+        // final URL after a redirect must still be inside `base`.
+        // A page identical to the homepage (a soft 404, or a redirect back to
+        // the front page) is not an about page of its own.
+        if (aboutPage && t.about && subRes.ok && sub !== primaryHtml && urlIsInSection(subRes.finalUrl || t.url, base)) {
+          aboutPagesOut.push({ url: subRes.finalUrl || t.url, html: sub });
+        }
       }
     }
   } catch {
@@ -3999,6 +4174,7 @@ async function crFetchGardssalgContent(
     pages,
     render: renderReport,
     finalUrl: primaryUrl,
+    ...(aboutPage ? { aboutPages: aboutPagesOut } : {}),
   };
 }
 
@@ -4393,8 +4569,51 @@ export type GardssalgContentRefreshInput = {
   cohort?: unknown;
   /** false = no model call of any kind (server-side job). Default true. */
   llm?: boolean;
+  /**
+   * dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse, spec
+   * 6: run the about-page logic for THIS call without
+   * ENRICHMENT_ABOUT_PAGE_ENABLED. Honoured ONLY in a dry run (apply=false);
+   * an apply call ignores it. Unset = today's behaviour.
+   */
+  aboutPagePreview?: boolean;
 };
 export type GardssalgContentRefreshOutcome = { status: number; body: any };
+
+/**
+ * One row's about_text choice in an about-page run (the before/after report;
+ * dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse):
+ *   - stored_about_text: the row's about_text before the run;
+ *     needs_description: blank or thin (gardssalgAboutNeedsDescription) — the
+ *     only rows whose about pages are evaluated;
+ *   - homepage_candidate: summarizeAbout(homepage) and its source_url;
+ *   - about_pages: every fetched about page with its candidate and verdict
+ *     ("not_evaluated" for a row that does not need a description);
+ *   - about_page_in_content_text: an about page's prose is within the first
+ *     GARDSSALG_REWRITE_SOURCE_CHAR_CAP chars of contentText — the part the
+ *     LLM rewrite/fill actually read this run;
+ *   - deterministic_choice: the raw candidate handed to the judge;
+ *     candidate_source: the judge-approved candidate's source (null = none);
+ *   - about_text_action / about_text_after / about_text_source_url: what the
+ *     run would write for about_text (filled/replaced/rewritten), predicted
+ *     from the row snapshot exactly like changed[]; owner_locked: the field
+ *     is owner/admin-locked, so nothing is written for it.
+ */
+export type GardssalgAboutCandidateReport = {
+  provider_id: string;
+  homepage_url: string;
+  stored_about_text: string | null;
+  needs_description: boolean;
+  homepage_candidate: { text: string; source_url: string };
+  about_pages: AboutPageEvaluation[];
+  about_page_in_content_text: boolean;
+  deterministic_choice: "about_page" | "homepage";
+  candidate_source: "about_page" | "homepage" | null;
+  about_text_action: "filled" | "replaced" | "rewritten" | null;
+  about_text_after: string | null;
+  about_text_source_url: string | null;
+  owner_locked: boolean;
+  subpages_fetched: string[];
+};
 
 export async function runGardssalgContentRefresh(
   input: GardssalgContentRefreshInput
@@ -4406,6 +4625,14 @@ export async function runGardssalgContentRefresh(
   // Rows whose deterministic extraction found a cheap-bar-passing candidate
   // that only a judge could admit — meaningful only when llmAllowed=false.
   let judgeRequiredRows = 0;
+  // dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse: the env
+  // flag, or a DRY run's explicit preview — never a preview that writes.
+  // null = every about-page branch below is skipped (today's behaviour).
+  const aboutPageMode: AboutPageMode | null = resolveAboutPageMode({
+    dryRun,
+    previewRequested: input.aboutPagePreview === true,
+  });
+  const aboutPageCandidates: GardssalgAboutCandidateReport[] = [];
 
   // Enrichment write-pause fence (del 1) — apply only; dry-run is never blocked.
   if (apply) {
@@ -4811,9 +5038,13 @@ export async function runGardssalgContentRefresh(
     // Eligible(t.products) === true means products is still BLANK, so its
     // negation is "products already filled" here.
     const gsNeedsDrivenOrdering = !gardssalgProductsEligible(t.products) && !!(t.about_text && t.about_text.trim());
+    // About-page run only: a row whose about_text is blank or thin.
+    const gsAboutNeedsDescription = aboutPageMode ? gardssalgAboutNeedsDescription(t.about_text) : false;
     let fetched: CrFetchOutcome;
     try {
-      fetched = await crFetchGardssalgContent(t.hjemmeside, gsNeedsDrivenOrdering);
+      fetched = aboutPageMode
+        ? await crFetchGardssalgContent(t.hjemmeside, gsNeedsDrivenOrdering, { needsDescription: gsAboutNeedsDescription })
+        : await crFetchGardssalgContent(t.hjemmeside, gsNeedsDrivenOrdering);
     } catch (e: any) {
       errors.push({ provider_id: providerId, error: e?.message ?? String(e), persistence: "internal" });
       // NO parking strike here. fetchPage() never throws — it returns a
@@ -4928,9 +5159,35 @@ export async function runGardssalgContentRefresh(
     // never reaches the LLM (unchanged from before).
     // llm:false: the judge is a model call -> no extractive candidate can be
     // admitted; the row is reported as judge_required below instead.
-    const candidateAbout = (llmAllowed && (await meetsGardssalgAboutQualityBar(aboutSummary, t.navn, "about")))
-      ? aboutSummary
-      : null;
+    // dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse
+    // (about-page run only; aboutPick stays null otherwise): for a row whose
+    // about_text is blank or thin, the producer's own about page may supply
+    // the deterministic candidate instead of the homepage, through the same
+    // guards as RFB (pickAboutPageCandidate: quality bar, substantiation
+    // against the about page itself, code artifact, theme spam, clearly more
+    // substantial). The chosen text still goes through the SAME judge below;
+    // if the judge rejects it, the homepage candidate is judged as before.
+    const aboutPick =
+      aboutPageMode && gsAboutNeedsDescription
+        ? pickAboutPageCandidate({ homepageCandidate: aboutSummary, aboutPages: fetched.aboutPages ?? [], producerName: t.navn })
+        : null;
+    const aboutPageChosen = aboutPick?.chosen ?? null;
+    // The raw deterministic about candidate of this row (diagnostics below).
+    const aboutRaw = aboutPageChosen ? aboutPageChosen.text : aboutSummary;
+    let candidateAboutSource: "about_page" | "homepage" = "homepage";
+    let candidateAbout: string | null;
+    if (!aboutPageChosen) {
+      candidateAbout = (llmAllowed && (await meetsGardssalgAboutQualityBar(aboutSummary, t.navn, "about")))
+        ? aboutSummary
+        : null;
+    } else if (llmAllowed && (await meetsGardssalgAboutQualityBar(aboutPageChosen.text, t.navn, "about"))) {
+      candidateAbout = aboutPageChosen.text;
+      candidateAboutSource = "about_page";
+    } else {
+      candidateAbout = (llmAllowed && (await meetsGardssalgAboutQualityBar(aboutSummary, t.navn, "about")))
+        ? aboutSummary
+        : null;
+    }
     const candidateVisitRaw = (llmAllowed && (await meetsGardssalgAboutQualityBar(visitSummary, t.navn, "visit")))
       ? visitSummary
       : null;
@@ -4994,7 +5251,12 @@ export async function runGardssalgContentRefresh(
         : false;
 
     const provenance: GsProvenanceMap = {};
-    if (candidateAbout) provenance.about_text = { source_url: fetched.fetchUrl, snippet: candidateAbout.slice(0, 120) };
+    if (candidateAbout) {
+      provenance.about_text = {
+        source_url: candidateAboutSource === "about_page" && aboutPageChosen ? aboutPageChosen.url : fetched.fetchUrl,
+        snippet: candidateAbout.slice(0, 120),
+      };
+    }
     if (candidateVisit) provenance.visit_text = { source_url: fetched.fetchUrl, snippet: candidateVisit.slice(0, 120) };
     if (candidateHours) provenance.opening_hours_text = { source_url: fetched.fetchUrl, snippet: candidateHours };
 
@@ -5368,7 +5630,7 @@ export async function runGardssalgContentRefresh(
       : extractiveFieldDiagOutcome("visit_text", visitSummary, candidateVisit, t.visit_text);
     fieldDiagnostic.push({
       provider_id: providerId,
-      about_text: extractiveFieldDiagOutcome("about_text", aboutSummary, candidateAbout, t.about_text),
+      about_text: extractiveFieldDiagOutcome("about_text", aboutRaw, candidateAbout, t.about_text),
       visit_text: visitFieldDiagOutcome,
       opening_hours_text: hoursFieldDiagOutcome,
       products: mapProductsOutcomeToFieldDiagnostic(productsOutcomeForFieldDiag),
@@ -5380,10 +5642,35 @@ export async function runGardssalgContentRefresh(
     // rest for 14 days before the subscription-side judge ever sees it.
     const judgeRequiredThisRow =
       !llmAllowed &&
-      ((isBlank(t.about_text) && !isBlank(aboutSummary) && meetsAboutCheapBar(aboutSummary)) ||
+      ((isBlank(t.about_text) && !isBlank(aboutRaw) && meetsAboutCheapBar(aboutRaw)) ||
         (isBlank(t.visit_text) && !isBlank(visitSummary) && meetsAboutCheapBar(visitSummary)) ||
         (isBlank(t.opening_hours_text) && !isBlank(hoursTrigger) && !jsonLdHours));
     if (judgeRequiredThisRow) judgeRequiredRows++;
+    if (aboutPageMode) {
+      const reportAboutAction = wouldWriteActions.about_text ?? null;
+      const aboutTextOwnerLocked = isGardssalgFieldOwnerLocked(t, "about_text");
+      // What the LLM rewrite/fill actually read: the first
+      // GARDSSALG_REWRITE_SOURCE_CHAR_CAP chars of contentText.
+      const llmSourceText = contentText.slice(0, GARDSSALG_REWRITE_SOURCE_CHAR_CAP);
+      aboutPageCandidates.push({
+        provider_id: providerId,
+        homepage_url: fetched.fetchUrl,
+        stored_about_text: t.about_text ?? null,
+        needs_description: gsAboutNeedsDescription,
+        homepage_candidate: { text: aboutSummary, source_url: fetched.fetchUrl },
+        about_pages: aboutPick
+          ? aboutPick.evaluated
+          : (fetched.aboutPages ?? []).map((p) => ({ url: p.url, candidate: "", verdict: "not_evaluated" as const })),
+        about_page_in_content_text: (fetched.aboutPages ?? []).some((p) => aboutPageTextIncluded(p.html, llmSourceText)),
+        deterministic_choice: aboutPageChosen ? "about_page" : "homepage",
+        candidate_source: candidateAbout ? candidateAboutSource : null,
+        about_text_action: reportAboutAction as GardssalgAboutCandidateReport["about_text_action"],
+        about_text_after: reportAboutAction ? (rewriteAbout ?? candidateAbout ?? generatedAbout ?? null) : null,
+        about_text_source_url: reportAboutAction ? (provenance.about_text?.source_url ?? fetched.fetchUrl) : null,
+        owner_locked: aboutTextOwnerLocked,
+        subpages_fetched: fetched.pagesFetchedPaths ?? [],
+      });
+    }
     if (wouldWrite.length === 0) {
       // Del B (dev-request 2026-09-08-drikke-no-yield-backoff): mirrors the
       // generic content-refresh route's recordProviderContentYield(id, false)
@@ -5466,7 +5753,13 @@ export async function runGardssalgContentRefresh(
           fetched.fetchUrl,
           undefined,
           rewriteFields.length > 0 ? rewriteFields : undefined,
-          contaminatedFields.length > 0 ? contaminatedFields : undefined
+          contaminatedFields.length > 0 ? contaminatedFields : undefined,
+          undefined,
+          // About-page candidate written as-is (not the rewrite): its
+          // provenance is the about page, not the homepage.
+          !rewriteAbout && candidateAbout && candidateAboutSource === "about_page" && aboutPageChosen
+            ? { about_text: aboutPageChosen.url }
+            : undefined
         );
         if (written.length > 0) {
           const actions: Record<string, GsFieldAction> = {};
@@ -5564,11 +5857,20 @@ export async function runGardssalgContentRefresh(
     // attempted/yield contract. 0/0 whenever GARDSSALG_HEADLESS_FALLBACK_
     // ENABLED is off or no processed row was eligible; never absent.
     ...tallyGardssalgRenderStats(renderDiagnostic),
+    // dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse:
+    // ABSENT unless the about-page logic ran (flag off = unchanged response).
+    ...(aboutPageMode ? { about_page_mode: aboutPageMode, about_page_candidates: aboutPageCandidates } : {}),
   } };
 }
 
 router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Request, res: Response) => {
-  const body = (req.body ?? {}) as { providerIds?: unknown; limit?: unknown; apply?: unknown; cohort?: unknown };
+  const body = (req.body ?? {}) as {
+    providerIds?: unknown;
+    limit?: unknown;
+    apply?: unknown;
+    cohort?: unknown;
+    about_page_preview?: unknown;
+  };
   // apply: dry-run by default. apply=1/"1"/true (body) or ?apply=1.
   const apply =
     body.apply === true ||
@@ -5579,13 +5881,24 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     req.query?.apply === "true";
   // The HTTP route keeps its historical behaviour: model calls allowed
   // (each still behind its own env switch, e.g. GARDSSALG_VISIT_LLM_ENABLED).
+  // dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse, spec
+  // 6: `about_page_preview: true` runs the about-page logic for this call
+  // without ENRICHMENT_ABOUT_PAGE_ENABLED — in a DRY RUN only; with apply it
+  // is ignored (and said so in the response).
+  const aboutPagePreview = aboutPagePreviewRequested(body.about_page_preview);
   const out = await runGardssalgContentRefresh({
     apply,
     limit: body.limit,
     providerIds: body.providerIds,
     cohort: body.cohort,
     llm: true,
+    ...(aboutPagePreview && !apply ? { aboutPagePreview: true } : {}),
   });
+  // Only when the preview really changed nothing: with the env flag on the
+  // logic runs anyway (about_page_mode: "env_flag").
+  if (aboutPagePreview && apply && out.status === 200 && out.body && typeof out.body === "object" && !out.body.about_page_mode) {
+    out.body.about_page_preview_ignored = "apply";
+  }
   res.status(out.status).json(out.body);
 });
 
@@ -10477,6 +10790,88 @@ router.post("/admin/gardssalg-claim-revoke", requireAdmin, (req: Request, res: R
   txn();
 
   res.json({ success: true, dry_run: false, provider_id: providerId, revoked, claimed_at_reset: claimedAtReset });
+});
+
+// ─── GET /api/opplevelser/admin/gardssalg-content-audit (admin, read-only) ──
+//
+// Lists gardssalg_content_audit rows for ONE producer, optionally after a
+// point in time, so an operator can see "which fields were changed by which
+// source after time T" before deciding on a manual rollback. No writes.
+//
+// Query: provider_id (required, ≤200 chars), since (optional ISO 8601 date or
+// datetime; a value without a zone designator is read as UTC), field
+// (optional exact field_name), limit (optional, default 200, clamped 1–1000).
+//
+// changed_at is stored both as SQLite `YYYY-MM-DD HH:MM:SS` (column default)
+// and as ISO `...T...Z` by some writers, so filtering and ordering go through
+// SQLite datetime() (second precision) instead of comparing raw strings.
+function normalizeAuditSince(raw: string): { iso: string; sql: string } | null {
+  let s = raw.trim();
+  if (!s) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    s = `${s}T00:00:00Z`;
+  } else {
+    s = s.replace(/^(\d{4}-\d{2}-\d{2}) (\d)/, "$1T$2");
+    if (/T\d/.test(s) && !/(Z|[+-]\d{2}:?\d{2})$/i.test(s)) s = `${s}Z`;
+  }
+  const ms = Date.parse(s);
+  if (Number.isNaN(ms)) return null;
+  const iso = new Date(ms).toISOString();
+  return { iso, sql: iso.slice(0, 19).replace("T", " ") };
+}
+
+router.get("/admin/gardssalg-content-audit", requireAdmin, (req: Request, res: Response) => {
+  const rawProvider = req.query.provider_id;
+  const providerId = typeof rawProvider === "string" ? rawProvider.trim() : "";
+  if (!providerId || providerId.length > 200) {
+    return res.status(400).json({ error: "provider_id_required" });
+  }
+
+  let since: { iso: string; sql: string } | null = null;
+  const rawSince = req.query.since;
+  if (rawSince !== undefined && rawSince !== "") {
+    since = typeof rawSince === "string" ? normalizeAuditSince(rawSince) : null;
+    if (!since) return res.status(400).json({ error: "invalid_since" });
+  }
+
+  const rawField = req.query.field;
+  const field = typeof rawField === "string" && rawField.trim() ? rawField.trim() : null;
+
+  const parsedLimit = typeof req.query.limit === "string" ? Number.parseInt(req.query.limit, 10) : NaN;
+  const limit = Number.isFinite(parsedLimit) ? Math.min(1000, Math.max(1, parsedLimit)) : 200;
+
+  try {
+    const expDb = getExpDb("experiences");
+    const where: string[] = ["provider_id = @provider_id"];
+    const params: Record<string, string | number> = { provider_id: providerId, fetch_limit: limit + 1 };
+    if (since) { where.push("datetime(changed_at) >= datetime(@since)"); params.since = since.sql; }
+    if (field) { where.push("field_name = @field"); params.field = field; }
+    const fetched = expDb.prepare(
+      `SELECT id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at, notes
+         FROM gardssalg_content_audit
+        WHERE ${where.join(" AND ")}
+        ORDER BY datetime(changed_at) ASC, changed_at ASC, rowid ASC
+        LIMIT @fetch_limit`,
+    ).all(params) as Array<{
+      id: string; field_name: string; old_value: string | null; new_value: string | null;
+      source_url: string | null; batch_id: string | null; changed_by: string; changed_at: string; notes: string | null;
+    }>;
+    const truncated = fetched.length > limit;
+    const rows = truncated ? fetched.slice(0, limit) : fetched;
+    const byChangedBy: Record<string, number> = {};
+    for (const r of rows) byChangedBy[r.changed_by] = (byChangedBy[r.changed_by] ?? 0) + 1;
+    return res.json({
+      provider_id: providerId,
+      since: since ? since.iso : null,
+      count: rows.length,
+      truncated,
+      by_changed_by: byChangedBy,
+      rows,
+    });
+  } catch (err) {
+    console.error("[opplevelser] admin/gardssalg-content-audit failed", err);
+    return res.status(500).json({ error: "internal_error" });
+  }
 });
 
 // ─── POST /api/opplevelser/admin/gardssalg-owner-email-confirm (admin) ─────
@@ -29032,6 +29427,11 @@ const SWEEP_ELIGIBLE_WHERE = "evidence_url IS NOT NULL AND canonical_id IS NULL"
 // prefixes passed explicitly below) and the unaliased COUNT(*) queries.
 const SWEEP_IN_SCOPE_WHERE = experienceInScopeSql("category", "provider_id");
 const SWEEP_IN_SCOPE_WHERE_ALIASED = experienceInScopeSql("e.category", "e.provider_id");
+// The queue ordering (never-checked first, then oldest-checked) as ONE
+// constant, shared verbatim by the sweep below and the read-only candidate
+// GET of the content-judgement job (step 3k, further down) so the two can
+// never serve the rows in a different order.
+const SWEEP_QUEUE_ORDER_BY = "admission_checked_at IS NULL DESC, admission_checked_at ASC";
 
 // ─── Quarantine-exit promotion (dev-request 2026-09-02-experiences-
 // karantene-utgang-match-til-verified) ──────────────────────────────────────
@@ -29087,6 +29487,82 @@ const SWEEP_IN_SCOPE_WHERE_ALIASED = experienceInScopeSql("e.category", "e.provi
 // batch_id = this SAME sweep call's batchId, additive/reversible via POST
 // /admin/experiences-admission-promotion-rollback below.
 const PROMOTION_ELIGIBLE_CONFIDENCE = new Set(["high", "medium"]);
+
+// ─── Shared per-row decision + write (A2A dev-request 2026-10-06-
+// experiences-enrichment-plattformjobb-og-felles-serverjobbramme,
+// «Innsnevring 2026-10-28», skive 3k med punkt b) ─────────────────────────
+// Extracted VERBATIM from the sweep handler below when the server-side
+// content-judgement job (services/experience-content-judgement-job.ts, via
+// applyExperienceContentJudgements() further down) became the second caller
+// — same pattern as applyPrewrittenExperienceDescriptions(): the sweep and
+// the job decide promotion and write a verdict through exactly this code, so
+// the two paths cannot drift. Neither function calls an LLM or fetches.
+
+export type ContentJudgeSweepVerdict = "MATCH" | "MISMATCH" | "unresolved";
+
+/** The four promotion requirements (see the block comment above), each
+ *  evaluated separately. `row` is the state going INTO this write. */
+export type ContentJudgePromotionDecision = {
+  wasNeedsReview: boolean;
+  judgeOk: boolean;
+  brregActiveOk: boolean;
+  sourceVerified: boolean;
+  confidenceOk: boolean;
+  missing: string[];
+  eligible: boolean;
+};
+
+export function evaluateContentJudgePromotion(
+  row: Pick<ContentJudgeSweepRow, "verification_status" | "confidence" | "evidence_url_verification" | "p_brreg_active" | "p_field_provenance">,
+  verdict: ContentJudgeSweepVerdict,
+): ContentJudgePromotionDecision {
+  const wasNeedsReview = row.verification_status === "needs_review";
+  const judgeOk = verdict === "MATCH";
+  const brregActiveOk = row.p_brreg_active === 1;
+  const sourceVerified =
+    isHjemmesideVerified(row.p_field_provenance) || isEvidenceUrlVerified(row.evidence_url_verification);
+  const confidenceOk = row.confidence !== null && PROMOTION_ELIGIBLE_CONFIDENCE.has(row.confidence);
+  const missing: string[] = [];
+  if (!judgeOk) missing.push("judge");
+  if (!brregActiveOk) missing.push("brreg_active");
+  if (!sourceVerified) missing.push("source_verified");
+  if (!confidenceOk) missing.push("confidence");
+  return { wasNeedsReview, judgeOk, brregActiveOk, sourceVerified, confidenceOk, missing, eligible: wasNeedsReview && missing.length === 0 };
+}
+
+const CONTENT_JUDGE_PROMOTION_AUDIT_INSERT_SQL = `INSERT INTO experience_admission_promotion_audit
+         (id, experience_id, batch_id, from_status, to_status, reason, promoted_at)
+       VALUES (?, ?, ?, 'needs_review', 'verified', ?, datetime('now'))`;
+
+/** The apply-mode write for ONE row: MISMATCH -> needs_review; an eligible
+ *  row -> verified + one promotion-audit row under `batchId`; then exactly
+ *  one admission_verdict stamp (`promoted:` in place of `match:` on a
+ *  promotion). Touches no other column. */
+export function writeContentJudgeVerdict(
+  expDb: ReturnType<typeof getExpDb>,
+  rowId: string,
+  verdict: ContentJudgeSweepVerdict,
+  reason: string,
+  eligibleForPromotion: boolean,
+  batchId: string,
+): { promoted: boolean } {
+  let promoted = false;
+  if (verdict === "MISMATCH") {
+    expDb.prepare(`UPDATE experiences SET verification_status = 'needs_review' WHERE id = ?`).run(rowId);
+  } else if (eligibleForPromotion) {
+    expDb.prepare(`UPDATE experiences SET verification_status = 'verified' WHERE id = ?`).run(rowId);
+    promoted = true;
+    expDb.prepare(CONTENT_JUDGE_PROMOTION_AUDIT_INSERT_SQL).run(crypto.randomUUID(), rowId, batchId, reason);
+  }
+  const verdictKey: "match" | "mismatch" | "unresolved" =
+    verdict === "MATCH" ? "match" : verdict === "MISMATCH" ? "mismatch" : "unresolved";
+  // MATCH and unresolved are stamped too (see block comment above) — never
+  // skipped just because there's no status change to make. A promoted row's
+  // stamp gets the `promoted:` prefix IN PLACE OF the normal `match:` stamp —
+  // one admission_verdict write per row per call, never two.
+  stampExperienceAdmissionVerdict(rowId, promoted ? `promoted: ${reason}` : `${verdictKey}: ${reason}`, expDb);
+  return { promoted };
+}
 
 type ContentJudgeSweepRow = {
   id: string;
@@ -29194,8 +29670,7 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
         .get() as { n: number }
     ).n;
 
-    const sweepOrderBy =
-      sampleMode === "random" ? "RANDOM()" : "admission_checked_at IS NULL DESC, admission_checked_at ASC";
+    const sweepOrderBy = sampleMode === "random" ? "RANDOM()" : SWEEP_QUEUE_ORDER_BY;
 
     const rows = expDb
       .prepare(
@@ -29268,12 +29743,6 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
     );
     const needsReviewBefore = (needsReviewCountStmt.get() as { n: number }).n;
 
-    const insertPromotionAudit = expDb.prepare(
-      `INSERT INTO experience_admission_promotion_audit
-         (id, experience_id, batch_id, from_status, to_status, reason, promoted_at)
-       VALUES (?, ?, ?, 'needs_review', 'verified', ?, datetime('now'))`,
-    );
-
     for (const row of rows) {
       const evidenceUrl = (row.evidence_url ?? "").trim();
 
@@ -29341,34 +29810,21 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
       // verification_status`, which was read by the SELECT BEFORE this loop
       // ran and is never mutated in place — the authoritative "status going
       // INTO this iteration" value.
-      const wasNeedsReview = row.verification_status === "needs_review";
-      const judgeOk = outcome.verdict === "MATCH";
-      const brregActiveOk = row.p_brreg_active === 1;
-      const sourceVerified =
-        isHjemmesideVerified(row.p_field_provenance) || isEvidenceUrlVerified(row.evidence_url_verification);
-      const confidenceOk = row.confidence !== null && PROMOTION_ELIGIBLE_CONFIDENCE.has(row.confidence);
-      const missingPromotionReqs: string[] = [];
-      if (!judgeOk) missingPromotionReqs.push("judge");
-      if (!brregActiveOk) missingPromotionReqs.push("brreg_active");
-      if (!sourceVerified) missingPromotionReqs.push("source_verified");
-      if (!confidenceOk) missingPromotionReqs.push("confidence");
-      const eligibleForPromotion = wasNeedsReview && missingPromotionReqs.length === 0;
+      // The four requirements + the write live in the shared
+      // evaluateContentJudgePromotion()/writeContentJudgeVerdict() above
+      // (skive 3k) — the content-judgement job uses the same two.
+      const {
+        wasNeedsReview,
+        brregActiveOk,
+        sourceVerified,
+        confidenceOk,
+        missing: missingPromotionReqs,
+        eligible: eligibleForPromotion,
+      } = evaluateContentJudgePromotion(row, outcome.verdict);
 
       let promoted = false;
       if (applyMode) {
-        if (outcome.verdict === "MISMATCH") {
-          expDb.prepare(`UPDATE experiences SET verification_status = 'needs_review' WHERE id = ?`).run(row.id);
-        } else if (eligibleForPromotion) {
-          expDb.prepare(`UPDATE experiences SET verification_status = 'verified' WHERE id = ?`).run(row.id);
-          promoted = true;
-          insertPromotionAudit.run(crypto.randomUUID(), row.id, batchId, outcome.reason);
-        }
-        // MATCH and unresolved are stamped too (see block comment above) —
-        // never skipped just because there's no status change to make. A
-        // promoted row's stamp gets the `promoted:` prefix IN PLACE OF the
-        // normal `match:` stamp — one admission_verdict write per row per
-        // call, never two.
-        stampExperienceAdmissionVerdict(row.id, promoted ? `promoted: ${outcome.reason}` : `${verdictKey}: ${outcome.reason}`);
+        promoted = writeContentJudgeVerdict(expDb, row.id, outcome.verdict, outcome.reason, eligibleForPromotion, batchId).promoted;
         if (isBoilerplate) {
           expDb.prepare(`UPDATE experiences SET description = NULL WHERE id = ?`).run(row.id);
         }
@@ -29456,6 +29912,331 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
     console.error("[opplevelser] admin/experiences-content-judge-sweep failed", err);
     res.status(500).json({ error: "Internal error" });
   }
+});
+
+// ─── Content-judgement queue (A2A dev-request 2026-10-06-experiences-
+// enrichment-plattformjobb-og-felles-serverjobbramme, «Innsnevring
+// 2026-10-28», skive 3k med punkt b) ───────────────────────────────────────
+//
+// The sweep above calls an LLM judge from this server. Daniel's rule
+// (Endring 2026-10-08): a platform job never calls an LLM — Claude Code on
+// his subscription (a read-only Cloud Routine) judges, commits the verdicts
+// as a file to A2A, and a job here stores them without an LLM, re-checking
+// everything deterministically. Three pieces:
+//
+//   GET /admin/experiences-content-judge-candidates   read-only: the rows the
+//       sweep would select (SAME SWEEP_ELIGIBLE_WHERE + SWEEP_IN_SCOPE_WHERE,
+//       SAME SWEEP_QUEUE_ORDER_BY), public catalog fields only. Punkt b: it
+//       does NOT stop at queue_exhausted — `batches` (1..4, default 1) lets
+//       one call return up to 4 × SWEEP_MAX_LIMIT rows, running on into the
+//       oldest-checked re-pass rows by the same ordering. No writes, no fetch.
+//   applyExperienceContentJudgements()   the no-LLM store step the job
+//       (services/experience-content-judgement-job.ts) calls per file; every
+//       write goes through the shared evaluateContentJudgePromotion() /
+//       writeContentJudgeVerdict() the sweep uses.
+//   GET /admin/experiences-content-judgements-status   read-only job status.
+//
+// The boilerplate-description nulling stays sweep-only (it needs the fetched
+// page text; this lane never fetches) — see the job module's header.
+import { EnrichmentWritePausedError } from "../services/enrichment-write-pause";
+import {
+  EXPERIENCE_CONTENT_JUDGEMENTS_MAX_ITEMS,
+  EXPERIENCE_CONTENT_JUDGEMENTS_MAX_REASONING_CHARS,
+  EXPERIENCE_CONTENT_JUDGEMENTS_SCHEMA,
+  EXPERIENCE_CONTENT_JUDGEMENT_MAX_ID_CHARS,
+  getExperienceContentJudgementsStatus,
+} from "../services/experience-content-judgement-job";
+
+export const CONTENT_JUDGE_CANDIDATES_MAX_BATCHES = 4;
+/** Per-file circuit breaker: at most this many `mismatch` demotions of rows
+ *  that were `verified` going in. Items past it are rejected `demotion_cap`
+ *  (nothing written, so they can be judged again by a later file). */
+export const CONTENT_JUDGEMENT_MAX_DEMOTIONS_PER_FILE = 25;
+/** Only public catalog rows go through the subscription lane: a row hidden
+ *  itself (experiences.catalog_hidden) or via its provider
+ *  (experience_providers.catalog_hidden) is neither served by the candidate
+ *  GET nor written by the apply step. The sweep's own selection is
+ *  unchanged. */
+const CONTENT_JUDGEMENT_PUBLIC_WHERE =
+  "COALESCE(catalog_hidden, 0) = 0 AND NOT EXISTS (SELECT 1 FROM experience_providers hp WHERE hp.id = experiences.provider_id AND COALESCE(hp.catalog_hidden, 0) = 1)";
+const CONTENT_JUDGEMENT_PUBLIC_WHERE_ALIASED = "COALESCE(e.catalog_hidden, 0) = 0 AND COALESCE(p.catalog_hidden, 0) = 0";
+/** Log-safe form of a file-supplied identifier. */
+function contentJudgementLogSafe(v: unknown, max: number): string {
+  return String(v ?? "-").replace(/[^A-Za-z0-9._:\-]/g, "").slice(0, max);
+}
+/** A created_at further ahead of the server clock than this is rejected —
+ *  a future timestamp would defeat the stale-verdict check. */
+const CONTENT_JUDGEMENT_MAX_CLOCK_SKEW_MS = 10 * 60_000;
+
+export type ContentJudgeCandidate = {
+  id: string;
+  provider_id: string | null;
+  title: string;
+  description: string | null;
+  category: string | null;
+  evidence_url: string | null;
+  verification_status: string;
+  confidence: string | null;
+  admission_checked_at: string | null;
+};
+
+/** The read-only core of GET /admin/experiences-content-judge-candidates.
+ *  `limit`/`batches` take the raw query values. */
+export function selectContentJudgeCandidates(
+  expDb: ReturnType<typeof getExpDb>,
+  raw: { limit?: unknown; batches?: unknown } = {},
+): {
+  batch_size: number;
+  batches: number;
+  scanned: number;
+  rows: ContentJudgeCandidate[];
+  remaining: number;
+  never_checked_remaining: number;
+  queue_exhausted: boolean;
+  skipped_out_of_scope: number;
+  judgement_schema: string;
+  max_items_per_file: number;
+} {
+  // Same parse as the sweep's query `limit`: non-numeric -> default, <=0 ->
+  // default, clamped to SWEEP_MAX_LIMIT.
+  let requestedLimit = SWEEP_DEFAULT_LIMIT;
+  if (typeof raw.limit === "string") {
+    const n = parseInt(raw.limit, 10);
+    requestedLimit = Number.isFinite(n) ? n : SWEEP_DEFAULT_LIMIT;
+  }
+  if (requestedLimit <= 0) requestedLimit = SWEEP_DEFAULT_LIMIT;
+  const batchSize = Math.min(SWEEP_MAX_LIMIT, requestedLimit);
+  let batches = 1;
+  if (typeof raw.batches === "string") {
+    const n = parseInt(raw.batches, 10);
+    if (Number.isFinite(n) && n >= 1) batches = Math.min(CONTENT_JUDGE_CANDIDATES_MAX_BATCHES, n);
+  }
+
+  // Counts measured exactly like the sweep's (same predicates, same tables).
+  const totalEligible = (
+    expDb
+      .prepare(`SELECT COUNT(*) AS n FROM experiences WHERE ${SWEEP_ELIGIBLE_WHERE} AND ${SWEEP_IN_SCOPE_WHERE} AND ${CONTENT_JUDGEMENT_PUBLIC_WHERE}`)
+      .get() as { n: number }
+  ).n;
+  const skippedOutOfScope = (
+    expDb
+      .prepare(`SELECT COUNT(*) AS n FROM experiences WHERE ${SWEEP_ELIGIBLE_WHERE} AND NOT (${SWEEP_IN_SCOPE_WHERE}) AND ${CONTENT_JUDGEMENT_PUBLIC_WHERE}`)
+      .get() as { n: number }
+  ).n;
+  const neverCheckedRemaining = (
+    expDb
+      .prepare(
+        `SELECT COUNT(*) AS n FROM experiences WHERE ${SWEEP_ELIGIBLE_WHERE} AND ${SWEEP_IN_SCOPE_WHERE} AND ${CONTENT_JUDGEMENT_PUBLIC_WHERE} AND admission_checked_at IS NULL`,
+      )
+      .get() as { n: number }
+  ).n;
+  // Same FROM/JOIN/WHERE/ORDER BY as the sweep's row SELECT; only the
+  // public catalog columns are returned.
+  const rows = expDb
+    .prepare(
+      `SELECT e.id, e.provider_id, e.title, e.description, e.category, e.evidence_url,
+              e.verification_status, e.confidence, e.admission_checked_at
+         FROM experiences e
+         LEFT JOIN experience_providers p ON p.id = e.provider_id
+        WHERE ${SWEEP_ELIGIBLE_WHERE} AND ${SWEEP_IN_SCOPE_WHERE_ALIASED} AND ${CONTENT_JUDGEMENT_PUBLIC_WHERE_ALIASED}
+        ORDER BY ${SWEEP_QUEUE_ORDER_BY}
+        LIMIT ?`,
+    )
+    .all(batchSize * batches) as ContentJudgeCandidate[];
+
+  return {
+    batch_size: batchSize,
+    batches,
+    scanned: rows.length,
+    rows,
+    remaining: Math.max(0, totalEligible - rows.length),
+    never_checked_remaining: neverCheckedRemaining,
+    queue_exhausted: neverCheckedRemaining === 0,
+    skipped_out_of_scope: skippedOutOfScope,
+    judgement_schema: EXPERIENCE_CONTENT_JUDGEMENTS_SCHEMA,
+    max_items_per_file: EXPERIENCE_CONTENT_JUDGEMENTS_MAX_ITEMS,
+  };
+}
+
+router.get("/admin/experiences-content-judge-candidates", requireAdmin, (req: Request, res: Response) => {
+  try {
+    const out = selectContentJudgeCandidates(getExpDb("experiences"), { limit: req.query?.limit, batches: req.query?.batches });
+    res.json({ success: true, ...out });
+  } catch (err) {
+    console.error("[opplevelser] admin/experiences-content-judge-candidates failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+type ContentJudgementItem = { id: string; evidence_url: unknown; verdict: unknown; reasoning: unknown; invalidId?: boolean };
+
+export type ContentJudgementItemResult = {
+  id: string;
+  result: "written" | "rejected";
+  reason?: string;
+  verdict?: "match" | "mismatch";
+  promoted?: boolean;
+  promotion?: { applicable: boolean; status: "not_applicable" | "held" | "promoted"; missing?: string[] };
+};
+
+export type ExperienceContentJudgementsResult =
+  | { ok: false; error: string }
+  | {
+      ok: true;
+      batch_id: string;
+      totals: { written: number; rejected: number; match: number; mismatch: number; promoted: number };
+      results: ContentJudgementItemResult[];
+    };
+
+/** SQLite `datetime('now')` ("YYYY-MM-DD HH:MM:SS", UTC) or ISO -> ms. */
+function contentJudgementTsMs(ts: string): number {
+  const t = ts.trim();
+  const iso = t.includes("T") ? t : t.replace(" ", "T");
+  return Date.parse(/(Z|[+-]\d{2}:?\d{2})$/.test(iso) ? iso : `${iso}Z`);
+}
+
+/**
+ * Stores one judgement file's items (the content-judgement job's apply
+ * step). NEVER calls an LLM, never fetches. Structural problems that make
+ * the file untrustworthy as a whole (not 1..50 objects with string ids,
+ * duplicate ids, bad/future created_at) -> {ok:false}; a malformed verdict
+ * / evidence_url / reasoning rejects only that item. Each item is then
+ * re-checked and written in ITS OWN transaction (see the job's header for
+ * the full list of re-checks); the write-pause is asserted inside every
+ * transaction, and a pause throws (the queue counts it as a per-file
+ * failure and retries — already-written items are then `stale_verdict`).
+ */
+export async function applyExperienceContentJudgements(
+  db: ReturnType<typeof getExpDb>,
+  rawItems: unknown,
+  opts: { createdAt: unknown; runId?: unknown; now?: Date; logTag?: string },
+): Promise<ExperienceContentJudgementsResult> {
+  if (!Array.isArray(rawItems) || rawItems.length < 1 || rawItems.length > EXPERIENCE_CONTENT_JUDGEMENTS_MAX_ITEMS) {
+    return { ok: false, error: `items must be an array of 1..${EXPERIENCE_CONTENT_JUDGEMENTS_MAX_ITEMS} items` };
+  }
+  if (typeof opts.createdAt !== "string" || !Number.isFinite(Date.parse(opts.createdAt))) {
+    return { ok: false, error: "created_at must be a valid timestamp" };
+  }
+  const createdAtMs = Date.parse(opts.createdAt);
+  const nowMs = (opts.now ?? new Date()).getTime();
+  if (createdAtMs > nowMs + CONTENT_JUDGEMENT_MAX_CLOCK_SKEW_MS) {
+    return { ok: false, error: "created_at is in the future" };
+  }
+  const items: ContentJudgementItem[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < rawItems.length; i++) {
+    const r = rawItems[i];
+    if (!r || typeof r !== "object" || Array.isArray(r)) return { ok: false, error: `items[${i}] must be an object` };
+    const o = r as Record<string, unknown>;
+    if (typeof o.id !== "string" || o.id.trim() === "") return { ok: false, error: `items[${i}].id must be a non-empty string` };
+    const id = o.id.trim();
+    if (id.length > EXPERIENCE_CONTENT_JUDGEMENT_MAX_ID_CHARS) {
+      // Item-level: rejected as `invalid_id`, reported under a bounded,
+      // log-safe form of the id; never looked up.
+      items.push({ id: contentJudgementLogSafe(id, EXPERIENCE_CONTENT_JUDGEMENT_MAX_ID_CHARS), evidence_url: null, verdict: null, reasoning: null, invalidId: true });
+      continue;
+    }
+    if (seen.has(id)) return { ok: false, error: `duplicate id in items: ${contentJudgementLogSafe(id, EXPERIENCE_CONTENT_JUDGEMENT_MAX_ID_CHARS)}` };
+    seen.add(id);
+    items.push({ id, evidence_url: o.evidence_url, verdict: o.verdict, reasoning: o.reasoning });
+  }
+
+  const batchId = `content-judgement-job-${new Date(nowMs).toISOString().slice(0, 19).replace(/[:T]/g, "")}-${crypto.randomUUID()}`;
+  const eligibleStmt = db.prepare(`SELECT 1 FROM experiences WHERE id = ? AND ${SWEEP_ELIGIBLE_WHERE} AND ${CONTENT_JUDGEMENT_PUBLIC_WHERE}`);
+  let demotions = 0;
+  const inScopeStmt = db.prepare(`SELECT 1 FROM experiences WHERE id = ? AND ${SWEEP_IN_SCOPE_WHERE}`);
+  const rowStmt = db.prepare(
+    `SELECT e.id, e.evidence_url, e.admission_checked_at, e.updated_at, e.verification_status,
+            e.confidence, e.evidence_url_verification,
+            p.brreg_active AS p_brreg_active, p.field_provenance AS p_field_provenance
+       FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+      WHERE e.id = ?`,
+  );
+  type Row = Pick<
+    ContentJudgeSweepRow,
+    "id" | "evidence_url" | "admission_checked_at" | "verification_status" | "confidence" | "evidence_url_verification" | "p_brreg_active" | "p_field_provenance"
+  > & { updated_at: string | null };
+  /** A non-null timestamp newer than the file (or unparseable: fail closed). */
+  const newerThanFile = (ts: string | null): boolean => {
+    if (ts === null || ts.trim() === "") return false;
+    const ms = contentJudgementTsMs(ts);
+    return !Number.isFinite(ms) || ms > createdAtMs;
+  };
+
+  const applyOne = db.transaction((it: ContentJudgementItem, verdict: "MATCH" | "MISMATCH", reasoning: string): ContentJudgementItemResult => {
+    // The SAME shared experiences pause helper every apply:true route in
+    // this file uses; thrown so the transaction rolls back.
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) throw new EnrichmentWritePausedError(pauseBlock);
+    const row = rowStmt.get(it.id) as Row | undefined;
+    if (!row) return { id: it.id, result: "rejected", reason: "not_found" };
+    if (!eligibleStmt.get(it.id)) return { id: it.id, result: "rejected", reason: "not_eligible" };
+    if (!inScopeStmt.get(it.id)) return { id: it.id, result: "rejected", reason: "out_of_scope" };
+    if ((row.evidence_url ?? "").trim() !== String(it.evidence_url).trim()) return { id: it.id, result: "rejected", reason: "evidence_changed" };
+    if (newerThanFile(row.admission_checked_at)) return { id: it.id, result: "rejected", reason: "stale_verdict" };
+    if (newerThanFile(row.updated_at)) return { id: it.id, result: "rejected", reason: "content_changed" };
+    // Circuit breaker: a verified row demoted by a mismatch cannot be rolled
+    // back by the promotion-rollback route, so a file may demote at most
+    // CONTENT_JUDGEMENT_MAX_DEMOTIONS_PER_FILE of them.
+    const demotes = verdict === "MISMATCH" && row.verification_status === "verified";
+    if (demotes && demotions >= CONTENT_JUDGEMENT_MAX_DEMOTIONS_PER_FILE) return { id: it.id, result: "rejected", reason: "demotion_cap" };
+    // The client verdict is the "judge" requirement only; the other three
+    // are read from the row as it stands now, inside this transaction.
+    const decision = evaluateContentJudgePromotion(row, verdict);
+    const { promoted } = writeContentJudgeVerdict(db, row.id, verdict, reasoning, decision.eligible, batchId);
+    if (demotes) demotions++;
+    return {
+      id: it.id,
+      result: "written",
+      verdict: verdict === "MATCH" ? "match" : "mismatch",
+      promoted,
+      promotion: {
+        applicable: decision.wasNeedsReview,
+        status: !decision.wasNeedsReview ? "not_applicable" : promoted ? "promoted" : "held",
+        ...(decision.wasNeedsReview && !promoted ? { missing: decision.missing } : {}),
+      },
+    };
+  });
+
+  const results: ContentJudgementItemResult[] = [];
+  for (const it of items) {
+    if (it.invalidId) {
+      results.push({ id: it.id, result: "rejected", reason: "invalid_id" });
+      continue;
+    }
+    if (it.verdict !== "match" && it.verdict !== "mismatch") {
+      results.push({ id: it.id, result: "rejected", reason: "invalid_verdict" });
+      continue;
+    }
+    if (typeof it.evidence_url !== "string" || it.evidence_url.trim() === "") {
+      results.push({ id: it.id, result: "rejected", reason: "invalid_evidence_url" });
+      continue;
+    }
+    const reasoning = typeof it.reasoning === "string" ? it.reasoning.replace(/\s+/g, " ").trim() : "";
+    if (reasoning === "" || reasoning.length > EXPERIENCE_CONTENT_JUDGEMENTS_MAX_REASONING_CHARS) {
+      results.push({ id: it.id, result: "rejected", reason: "invalid_reasoning" });
+      continue;
+    }
+    results.push(applyOne(it, it.verdict === "match" ? "MATCH" : "MISMATCH", reasoning));
+  }
+
+  const totals = { written: 0, rejected: 0, match: 0, mismatch: 0, promoted: 0 };
+  for (const r of results) {
+    totals[r.result]++;
+    if (r.verdict) totals[r.verdict]++;
+    if (r.promoted) totals.promoted++;
+  }
+  console.log(
+    `[${opts.logTag ?? "experience-content-judgements"}] run_id=${contentJudgementLogSafe(opts.runId, 80)} ` +
+      `batch_id=${batchId} ` +
+      results.map((r) => `${contentJudgementLogSafe(r.id, EXPERIENCE_CONTENT_JUDGEMENT_MAX_ID_CHARS)}=${r.result}${r.reason ? ":" + r.reason : ""}${r.verdict ? ":" + r.verdict : ""}${r.promoted ? ":promoted" : ""}`).join(" "),
+  );
+  return { ok: true, batch_id: batchId, totals, results };
+}
+
+router.get("/admin/experiences-content-judgements-status", requireAdmin, (_req: Request, res: Response) => {
+  res.json({ success: true, ...getExperienceContentJudgementsStatus(getExpDb("experiences") as any) });
 });
 
 // ─── POST /api/opplevelser/admin/experiences-admission-promotion-rollback ──

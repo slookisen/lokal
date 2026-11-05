@@ -139,6 +139,7 @@ import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-mer
 import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
 import adminAgentsBusinessTypeRoutes from "./routes/admin-agents-business-type";
 import adminTestProducerRoutes from "./routes/admin-test-producer";
+import adminTestClaimFixtureRoutes from "./routes/admin-test-claim-fixture";
 import adminOwnerFeaturesInterestRoutes from "./routes/admin-owner-features-interest";
 import adminOwnerFeaturesSwitchProbeRoutes from "./routes/admin-owner-features-switch-probe";
 import adminGardssalgSwitchProbeRoutes from "./routes/admin-gardssalg-switch-probe";
@@ -964,6 +965,10 @@ app.use("/admin/agents/business-type", adminLimiter, adminAgentsBusinessTypeRout
 // orders (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt):
 // dry-run default, arm/retire, refuses every non-fixture row.
 app.use("/admin/test-producer", adminLimiter, adminTestProducerRoutes);
+// POST /admin/test-claim-fixture — the ONE hidden, UNCLAIMED claim-test profile
+// (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post AC6): dry-run
+// default, arm (create/reset) / retire, refuses every other row.
+app.use("/admin/test-claim-fixture", adminLimiter, adminTestClaimFixtureRoutes);
 // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2e: «Gi meg beskjed» counts per planned key (read-only).
 app.use("/admin/owner-features/interest", adminLimiter, adminOwnerFeaturesInterestRoutes);
 // S2d-3: the switch probe («bryterprobe») on the hidden test producer — behind
@@ -2232,6 +2237,42 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
   });
   setTimeout(() => { void gardssalgVisitProposalsTick(); }, 6 * 60_000);
   setInterval(() => { void gardssalgVisitProposalsTick(); }, 60 * 60_000);
+}
+
+// ─── A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
+// felles-serverjobbramme, «Innsnevring 2026-10-28», skive 3k med punkt b:
+// needs_review content judgements — same file-queue mechanics as the two
+// proposal jobs above (services/proposal-file-queue.ts), reading
+// `experiences-content-judgements/` in slookisen/A2A (verdicts a Cloud
+// Routine rendered on Daniel's subscription) and storing them through
+// applyExperienceContentJudgements(), which re-checks every item and writes
+// through the same shared code as POST /admin/experiences-content-judge-
+// sweep. Never calls an LLM. OFF by default:
+// EXPERIENCE_CONTENT_JUDGEMENT_JOB_ENABLED === "true" turns it on; flipping
+// it back is the rollback. First tick 9 minutes after boot, hourly after
+// that; an overlapping tick is skipped.
+if (process.env.ENABLE_EXPERIENCES === "1") {
+  let experienceContentJudgementsRunning = false;
+  const experienceContentJudgementsTick = trackJob("experience-content-judgements", async () => {
+    if (experienceContentJudgementsRunning) return;
+    experienceContentJudgementsRunning = true;
+    try {
+      const { tickExperienceContentJudgements } = await import("./services/experience-content-judgement-job");
+      const r = await tickExperienceContentJudgements();
+      if (r.skipped_reason === "disabled") return;
+      console.log(
+        `[experience-content-judgements] tick run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
+          `listed=${r.files_listed} processed=${r.processed.length} written=${r.written} ` +
+          `github_error=${r.github_error ? "yes" : "no"} envelope=${r.envelope_recorded}`,
+      );
+    } catch (err) {
+      console.error("[experience-content-judgements] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      experienceContentJudgementsRunning = false;
+    }
+  });
+  setTimeout(() => { void experienceContentJudgementsTick(); }, 9 * 60_000);
+  setInterval(() => { void experienceContentJudgementsTick(); }, 60 * 60_000);
 }
 
 // ─── A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-

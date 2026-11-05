@@ -51,6 +51,10 @@ import {
   type OwnerPageVariant,
 } from "../owner-features/page";
 import { readOwnerFeatureInterest, recordOwnerFeatureInterest } from "../owner-features/interest";
+import {
+  OWNER_ANCHOR_FALLBACK, OWNER_ANCHOR_LEVEL, OWNER_ANCHOR_LEVEL_PREVIEW, OWNER_ANCHOR_PLANNED,
+  isOwnerPageAnchor, ownerBatchAnchor, ownerPageTail, ownerPlannedAnchor, ownerRowAnchor, ownerUndoAnchor,
+} from "../owner-features/anchors";
 
 // ─────────────────────────────────────────────────────────────────
 // «Mine valg» for gårdssalg owners — dev-request 2026-10-22-opplevagent-
@@ -78,7 +82,11 @@ import { readOwnerFeatureInterest, recordOwnerFeatureInterest } from "../owner-f
 //      SAME sessionFromRequest) → 401;
 //   5. the session belongs to this producer → 403;
 //   6. a live verified claim for the row (isGardssalgProviderClaimed) → 403;
-//   POSTs/PUT also: Origin check (403) and a per-session write limit (429).
+//   POSTs/PUT also: Origin check (403) and a per-session write limit (429;
+//   the page POSTs: 303 «For mange endringer», T5).
+// T5 (anchor contract, owner-features/anchors.ts, same as RFB): every page
+// POST outcome after the checks answers 303 with the anchor of the card or
+// row the form sits in; a message carries `ved=<id>` so it stands there.
 // The paths sit under the claim prefixes, so the opplevagent.no host gate
 // (gardssalgClaimHostGate) applies to them as to the rest of the portal.
 
@@ -164,6 +172,7 @@ const PAGE_MESSAGES: Record<string, { ok: boolean; text: string }> = {
   angre_endret: { ok: false, text: "Endringen kan ikke angres fordi valget er endret siden." },
   ugyldig: { ok: false, text: "Verdien er ikke gyldig." },
   feil: { ok: false, text: "Klarte ikke å lagre. Prøv igjen." },
+  for_mange: { ok: false, text: "For mange endringer. Prøv igjen om litt." },
   niva_valgt: { ok: true, text: "Nivået er valgt. Valgene dine var allerede slik, så ingenting annet er endret." },
   interesse: { ok: true, text: "Takk! Vi har notert at du vil ha dette. Ingenting er endret, og vi sender ingen e-post nå." },
   interesse_finnes: { ok: true, text: "Du har allerede sagt fra om dette." },
@@ -276,7 +285,13 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
     return { ok: true, provider, slug, token: session.token };
   }
 
-  function writeGuard(req: Request, token: string): ((res: Response) => Response) | null {
+  /** T5: 303 back to the page — `query` with the message placed at `anchor`, and `#anchor`. */
+  const backTo = (res: Response, slug: string, query: string, anchor: string, opts: { place?: boolean } = {}): Response => {
+    res.redirect(303, PAGE_PATH(slug, ownerPageTail(query, anchor, opts)));
+    return res;
+  };
+
+  function writeGuard(req: Request, token: string, anchor: string | (() => string)): ((res: Response) => Response) | null {
     if (isCrossSiteWrite(req)) {
       const slug = String((req.params as any).providerSlug || "");
       return simplePage(403, WRITE_GUARD_REFUSED_TITLE, writeGuardRefusedBody({
@@ -284,7 +299,11 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
       }));
     }
     const capKey = crypto.createHash("sha256").update(token).digest("hex");
-    if (writeCap.isOver(capKey)) return simplePage(429, "For mange endringer", `<h1>For mange endringer</h1><p>Prøv igjen om litt.</p>`);
+    if (writeCap.isOver(capKey)) {
+      const slug = String((req.params as any).providerSlug || "");
+      const at = typeof anchor === "function" ? anchor() : anchor;
+      return (res: Response) => backTo(res, slug, "melding=for_mange", at);
+    }
     writeCap.record(capKey);
     return null;
   }
@@ -292,6 +311,11 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
   const fail = (where: string) => (res: Response, e: unknown) => {
     console.error(`[gardssalg-owner-features] ${where} failed:`, e);
     return simplePage(500, "Feil", `<h1>Noe gikk galt</h1><p>Prøv igjen senere.</p>`)(res);
+  };
+  /** T5: a page POST that failed → 303 «Klarte ikke å lagre» at its anchor. */
+  const failBack = (where: string) => (req: Request, res: Response, e: unknown, anchor: string) => {
+    console.error(`[gardssalg-owner-features] ${where} failed:`, e);
+    return backTo(res, String((req.params as any).providerSlug || ""), "melding=feil", anchor);
   };
 
   function batchNotice(providerId: string, batchId: number): OwnerPageNotice | null {
@@ -352,8 +376,13 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
       const resolvedKey = (k: string) => own(resolved.byKey, k);
 
       let notice: OwnerPageNotice | null = null;
+      // T5: the card or row the message stands in (`ved=`, or the saved batch's own row/card).
+      let noticeAt: string | null = isOwnerPageAnchor(qs("ved")) ? qs("ved") : null;
       const changedId = Number.parseInt(qs("endret"), 10);
-      if (Number.isFinite(changedId) && changedId > 0) notice = batchNotice(provider.id, changedId);
+      if (Number.isFinite(changedId) && changedId > 0) {
+        notice = batchNotice(provider.id, changedId);
+        if (notice && !noticeAt) noticeAt = ownerBatchAnchor(VERTICAL, provider.id, changedId, getRfbDb());
+      }
       const msg = own(PAGE_MESSAGES, qs("melding"));
       if (!notice && msg) notice = { ok: msg.ok, text: msg.text };
       if (!notice && qs("melding") === "sperret") {
@@ -401,6 +430,7 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
         level: currentOwnerLevel(VERTICAL, provider.id, resolved, { registry }),
         showIntro: false,
         notice,
+        noticeAt,
         confirm,
         levelPreview,
         log,
@@ -420,40 +450,42 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
     "/kategori/gardssalg/eier/:providerSlug/valg/sett",
     generalLimiter,
     express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+    let anchor = OWNER_ANCHOR_FALLBACK;
     try {
       const g = pageGate(req);
       if (!g.ok) return g.send(res);
-      const guard = writeGuard(req, g.token);
-      if (guard) return guard(res);
       const { provider, slug } = g;
       const registry = GARDSSALG_OWNER_FEATURE_REGISTRY;
       const body = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
       const key = typeof body.key === "string" ? body.key : "";
       const e = findOwnerFeature(key, registry);
-      if (!e) return res.redirect(303, PAGE_PATH(slug, "?melding=ugyldig"));
+      if (e) anchor = ownerRowAnchor(e.key);
+      const guard = writeGuard(req, g.token, anchor);
+      if (guard) return guard(res);
+      if (!e) return backTo(res, slug, "melding=ugyldig", anchor);
       const value = formValue(e, body.value);
       if (body.confirmed !== "1" && typeof value === "boolean" && (value ? e.confirmOn : e.confirmOff)
           && canAttempt(resolveOwnerFeatures(VERTICAL, provider.id, { registry }).byKey[key])) {
-        return res.redirect(303, PAGE_PATH(slug, `?bekreft=${encodeURIComponent(key)}&verdi=${value ? "1" : "0"}#bekreft`));
+        return backTo(res, slug, `bekreft=${encodeURIComponent(key)}&verdi=${value ? "1" : "0"}`, anchor, { place: false });
       }
       const out = applyOwnerSingleChange(VERTICAL, provider.id, key, value, { actor: "owner", detail: sessionEmail(g.token) }, { registry });
       const r = out.result;
       if (r.kind === "ok") {
-        if (!r.changed) return res.redirect(303, PAGE_PATH(slug, "?melding=ingen_endring"));
+        if (!r.changed) return backTo(res, slug, "melding=ingen_endring", anchor);
         console.log(`[gardssalg-owner-features] owner set ${key} for provider ${provider.id} (page)`);
-        return res.redirect(303, PAGE_PATH(slug, `?endret=${out.batchId}#valg-${encodeURIComponent(key)}`));
+        return backTo(res, slug, `endret=${out.batchId}`, anchor, { place: false });
       }
       if (r.kind === "blocked") {
         // A requirement checked only on switch-on (the enable gate) is not on
         // the resolved row; send the owner to the row's own check.
         const resolvedRow = resolveOwnerFeatures(VERTICAL, provider.id, { registry }).byKey[key];
         const melding = r.block === "requirement_not_met" && !resolvedRow?.reason ? "krav" : "sperret";
-        return res.redirect(303, PAGE_PATH(slug, `?melding=${melding}&nokkel=${encodeURIComponent(key)}#valg-${encodeURIComponent(key)}`));
+        return backTo(res, slug, `melding=${melding}&nokkel=${encodeURIComponent(key)}`, anchor);
       }
-      if (r.kind === "invalid_value") return res.redirect(303, PAGE_PATH(slug, "?melding=ugyldig"));
-      return res.redirect(303, PAGE_PATH(slug, "?melding=feil"));
+      if (r.kind === "invalid_value") return backTo(res, slug, "melding=ugyldig", anchor);
+      return backTo(res, slug, "melding=feil", anchor);
     } catch (e) {
-      return fail("POST valg/sett")(res, e);
+      return failBack("POST valg/sett")(req, res, e, anchor);
     }
   });
 
@@ -461,28 +493,29 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
     "/kategori/gardssalg/eier/:providerSlug/valg/niva",
     generalLimiter,
     express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+    const anchor = OWNER_ANCHOR_LEVEL;
     try {
       const g = pageGate(req);
       if (!g.ok) return g.send(res);
-      const guard = writeGuard(req, g.token);
+      const guard = writeGuard(req, g.token, anchor);
       if (guard) return guard(res);
       const { provider, slug } = g;
       const body = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
       const level = findOwnerLevel(body.level, GARDSSALG_OWNER_LEVELS);
-      if (!level) return res.redirect(303, PAGE_PATH(slug, "?melding=ugyldig"));
-      if (body.confirmed !== "1") return res.redirect(303, PAGE_PATH(slug, `?niva=${encodeURIComponent(level.key)}#bekreft`));
+      if (!level) return backTo(res, slug, "melding=ugyldig", anchor);
+      if (body.confirmed !== "1") return backTo(res, slug, `niva=${encodeURIComponent(level.key)}`, OWNER_ANCHOR_LEVEL_PREVIEW, { place: false });
       const out = applyOwnerLevel(VERTICAL, provider.id, level.key, { actor: "owner", detail: sessionEmail(g.token) }, { registry: GARDSSALG_OWNER_FEATURE_REGISTRY });
-      if (out.kind !== "ok") return res.redirect(303, PAGE_PATH(slug, "?melding=feil"));
+      if (out.kind !== "ok") return backTo(res, slug, "melding=feil", anchor);
       if (out.batchId) {
         console.log(`[gardssalg-owner-features] owner chose level ${level.key} for provider ${provider.id}: ${out.changed.join(",")}`);
-        return res.redirect(303, PAGE_PATH(slug, `?endret=${out.batchId}#niva`));
+        return backTo(res, slug, `endret=${out.batchId}`, anchor, { place: false });
       }
       if (out.skipped.length) {
-        return res.redirect(303, PAGE_PATH(slug, `?melding=hoppet&nokkel=${encodeURIComponent(out.skipped.map((s) => s.key).join(","))}#niva`));
+        return backTo(res, slug, `melding=hoppet&nokkel=${encodeURIComponent(out.skipped.map((s) => s.key).join(","))}`, anchor);
       }
-      return res.redirect(303, PAGE_PATH(slug, "?melding=niva_valgt#niva"));
+      return backTo(res, slug, "melding=niva_valgt", anchor);
     } catch (e) {
-      return fail("POST valg/niva")(res, e);
+      return failBack("POST valg/niva")(req, res, e, anchor);
     }
   });
 
@@ -490,22 +523,34 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
     "/kategori/gardssalg/eier/:providerSlug/valg/angre",
     generalLimiter,
     express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+    let anchor = OWNER_ANCHOR_FALLBACK;
     try {
       const g = pageGate(req);
       if (!g.ok) return g.send(res);
-      const guard = writeGuard(req, g.token);
-      if (guard) return guard(res);
       const { provider, slug } = g;
       const body = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
       const batchId = Number.parseInt(String(body.batch ?? ""), 10);
-      if (!Number.isFinite(batchId) || batchId <= 0) return res.redirect(303, PAGE_PATH(slug, "?melding=angre_umulig"));
+      // T5: «Angre» returns to the row or card that was undone (read after the Origin check).
+      let placed = false;
+      const undoAnchor = () => {
+        if (!placed) { anchor = ownerUndoAnchor(VERTICAL, provider.id, batchId, getRfbDb()); placed = true; }
+        return anchor;
+      };
+      const guard = writeGuard(req, g.token, undoAnchor);
+      if (guard) return guard(res);
+      undoAnchor();
+      if (!Number.isFinite(batchId) || batchId <= 0) return backTo(res, slug, "melding=angre_umulig", anchor);
       const out = undoOwnerChange(VERTICAL, provider.id, batchId, { actor: "owner", detail: sessionEmail(g.token) }, { registry: GARDSSALG_OWNER_FEATURE_REGISTRY });
-      if (out.kind === "ok") return res.redirect(303, PAGE_PATH(slug, out.batchId ? `?endret=${out.batchId}` : "?melding=angret"));
-      if (out.kind === "changed_since") return res.redirect(303, PAGE_PATH(slug, "?melding=angre_endret"));
-      if (out.kind === "blocked") return res.redirect(303, PAGE_PATH(slug, `?melding=sperret&nokkel=${encodeURIComponent(out.key)}`));
-      return res.redirect(303, PAGE_PATH(slug, "?melding=angre_umulig"));
+      if (out.kind === "ok") {
+        return out.batchId
+          ? backTo(res, slug, `endret=${out.batchId}`, anchor, { place: false })
+          : backTo(res, slug, "melding=angret", anchor);
+      }
+      if (out.kind === "changed_since") return backTo(res, slug, "melding=angre_endret", anchor);
+      if (out.kind === "blocked") return backTo(res, slug, `melding=sperret&nokkel=${encodeURIComponent(out.key)}`, anchor);
+      return backTo(res, slug, "melding=angre_umulig", anchor);
     } catch (e) {
-      return fail("POST valg/angre")(res, e);
+      return failBack("POST valg/angre")(req, res, e, anchor);
     }
   });
 
@@ -513,20 +558,23 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
     "/kategori/gardssalg/eier/:providerSlug/valg/interesse",
     generalLimiter,
     express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+    let anchor = OWNER_ANCHOR_PLANNED;
     try {
       const g = pageGate(req);
       if (!g.ok) return g.send(res);
-      const guard = writeGuard(req, g.token);
-      if (guard) return guard(res);
       const { provider, slug } = g;
       const body = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
       const key = typeof body.key === "string" ? body.key : "";
+      const planned = findOwnerFeature(key, GARDSSALG_OWNER_FEATURE_REGISTRY);
+      if (planned && planned.status === "coming_soon") anchor = ownerPlannedAnchor(planned.key);
+      const guard = writeGuard(req, g.token, anchor);
+      if (guard) return guard(res);
       const out = recordOwnerFeatureInterest(VERTICAL, provider.id, key, sessionEmail(g.token));
-      if (out.kind !== "ok") return res.redirect(303, PAGE_PATH(slug, "?melding=ugyldig#planlagt"));
+      if (out.kind !== "ok") return backTo(res, slug, "melding=ugyldig", OWNER_ANCHOR_PLANNED);
       if (out.created) console.log(`[gardssalg-owner-features] owner interest in ${key} for provider ${provider.id}`);
-      return res.redirect(303, PAGE_PATH(slug, `?melding=${out.created ? "interesse" : "interesse_finnes"}#planlagt-${encodeURIComponent(key)}`));
+      return backTo(res, slug, `melding=${out.created ? "interesse" : "interesse_finnes"}`, ownerPlannedAnchor(key));
     } catch (e) {
-      return fail("POST valg/interesse")(res, e);
+      return failBack("POST valg/interesse")(req, res, e, anchor);
     }
   });
 

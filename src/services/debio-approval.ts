@@ -74,6 +74,20 @@ export function readDebioStatusRow(db: Database.Database, agentId: string): Debi
   }
 }
 
+/**
+ * Økologi S3b: the agents row's `debio_verified` for the organic-claim write
+ * gate (description-quality.ts organicClaimGateApplies). An unknown agent or
+ * an older schema without the column reads as 0 — no valid status.
+ */
+export function readDebioVerified(db: Database.Database, agentId: string): { debio_verified: unknown } {
+  try {
+    const row = db.prepare("SELECT debio_verified FROM agents WHERE id = ?").get(agentId) as { debio_verified?: unknown } | undefined;
+    return { debio_verified: row?.debio_verified ?? 0 };
+  } catch {
+    return { debio_verified: 0 };
+  }
+}
+
 /** Is a certificate valid-to date (YYYY-MM-DD) today or later? */
 export function certValidOn(validTo: unknown, now: Date = new Date()): boolean {
   return typeof validTo === "string" && /^\d{4}-\d{2}-\d{2}/.test(validTo) && validTo.slice(0, 10) >= now.toISOString().slice(0, 10);

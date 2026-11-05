@@ -170,6 +170,7 @@ import { EXPERIENCE_TAGS, type ExperienceTag } from "../services/experience-tags
 // imported here rather than duplicated, so each stamp keeps exactly one
 // reader.
 import { isGardssalgContactEmailFlaggedForReview } from "./opplevelser";
+import { emailRevealGuardEnabled, isCcBotUserAgent, revealEmailFor } from "../services/email-reveal-guard";
 // dev-request 2026-08-07-orch-fylke-2024-migrasjon: the /fylke/:fylke 301
 // fallback below reuses norway-fylke.ts's own historical-alias map
 // (ALIAS_TO_CANONICAL), merged-legacy equivalence classes
@@ -448,6 +449,7 @@ function oaProfileLabels(lang: Lang) {
     provAll: "Alle opplevelser fra denne tilbyderen →", provUnmatched: "Tilbyder er ikke matchet ennå.",
     gsKicker: "Gårdssalg &amp; smaking", gsCrumb: "Gårdssalg og smaking", gsAbout: "Om produsenten", gsVisit: "Besøket", gsPractical: "Praktisk info",
     gsReserve: "Reserver", gsAddress: "Adresse", gsHours: "Åpningstider", gsSite: "Nettside", gsEmail: "E-post",
+    gsEmailReveal: "Vis e-post",
     gsMeta: (navn: string, sted: string) => `${navn}${sted ? " i " + sted : ""} — produsentprofil på Opplevagent med fakta om produsenten.`,
   };
   const en: typeof no = {
@@ -469,6 +471,7 @@ function oaProfileLabels(lang: Lang) {
     provAll: "All experiences from this provider →", provUnmatched: "Provider not matched yet.",
     gsKicker: "Farm sales &amp; tasting", gsCrumb: "Farm sales and tasting", gsAbout: "About the producer", gsVisit: "The visit", gsPractical: "Practical information",
     gsReserve: "Reserve", gsAddress: "Address", gsHours: "Opening hours", gsSite: "Website", gsEmail: "Email",
+    gsEmailReveal: "Show e-mail",
     gsMeta: (navn: string, sted: string) => `${navn}${sted ? " in " + sted : ""} — producer profile on Opplevagent with facts about the producer.`,
   };
   const sv: typeof no = {
@@ -490,6 +493,7 @@ function oaProfileLabels(lang: Lang) {
     provAll: "Alla upplevelser från denna arrangör →", provUnmatched: "Arrangören är inte matchad ännu.",
     gsKicker: "Gårdsförsäljning &amp; provsmakning", gsCrumb: "Gårdsförsäljning och provsmakning", gsAbout: "Om producenten", gsVisit: "Besöket", gsPractical: "Praktisk information",
     gsReserve: "Reservera", gsAddress: "Adress", gsHours: "Öppettider", gsSite: "Webbplats", gsEmail: "E-post",
+    gsEmailReveal: "Visa e-post",
     gsMeta: (navn: string, sted: string) => `${navn}${sted ? " i " + sted : ""} — producentprofil på Opplevagent med fakta om producenten.`,
   };
   if (lang === "en") return en;
@@ -6172,6 +6176,59 @@ export function decideOwnerCtaSwap(
   };
 }
 
+// ─── E-mail on the gårdssalg producer profile (dev-request
+// 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting, slice 4: S-A1
+// and S-A3 on opplevagent.no /kategori/gardssalg/produsent/:providerSlug) ───
+// With EMAIL_REVEAL_GUARD_EXPERIENCES on, the profile page gives the
+// producer's own e-mail (the «E-post» fact row's mailto: and JSON-LD `email`)
+// only within the per-IP limit of services/email-reveal-guard.ts — one
+// experiences counter per client, and a profile seen again in the window is
+// free. Over the limit the fact row shows «Vis e-post», a plain link to GET
+// /kategori/gardssalg/produsent/:providerSlug/epost (no script), and the
+// address is nowhere in the HTML; JSON-LD has no `email`. CCBot (S-A3) gets
+// neither the address nor «Vis e-post», also on its first request, and spends
+// no budget. The guard comes on top of the AC4 review gate (epostUnderReview):
+// a flagged address is still shown nowhere, costs nothing and is never
+// revealed by the endpoint either. With the switch on the page depends on the
+// client, so it is Cache-Control: private. Switch off: revealEmailFor is not
+// called and the page and its headers are byte-identical to main. Platform
+// addresses (kontakt@opplevagent.no) are not producer e-mail and are left
+// alone. The guard's log line carries profile ids and counts only, never an
+// address or an IP.
+
+/** The path of the «Vis e-post» endpoint for a producer slug (localized like the profile's links). */
+export function gardssalgEmailRevealPath(slug: string, lang: Lang = "no"): string {
+  return localizedPath(`/kategori/gardssalg/produsent/${encodeURIComponent(slug)}/epost`, lang);
+}
+
+/**
+ * The producer's e-mail as the «Vis e-post» endpoint may give it: the stored
+ * address unless empty or under review (AC4), and only for a row that is
+ * neither hidden nor the test producer (those reach the profile page only in
+ * an admin's «Vis som offentlig» request). null = 404.
+ */
+function gardssalgRevealableEmail(provider: GardssalgProviderRow): string | null {
+  if (Number(provider.catalog_hidden) === 1 || Number(provider.is_test_provider) === 1) return null;
+  const epost = provider.epost;
+  if (!epost || isGardssalgContactEmailFlaggedForReview(provider.field_provenance, epost)) return null;
+  return epost;
+}
+
+/**
+ * How the profile shows the producer's e-mail to this request: null = switch
+ * off (change nothing); "show" = as today; "reveal" = «Vis e-post» without the
+ * address; "none" = nothing (CCBot, or no e-mail shown).
+ */
+function gardssalgProfileEmailView(req: Request, provider: GardssalgProviderRow, email: string | null): "show" | "reveal" | "none" | null {
+  if (!emailRevealGuardEnabled("experiences")) return null;
+  const providerId = String(provider.id ?? "");
+  if (!email || !providerId) return "none";
+  const allowed = revealEmailFor(req, "experiences", [providerId]);
+  if (allowed !== null && allowed.has(providerId)) return "show";
+  // No «Vis e-post» for CCBot, nor where the endpoint would answer 404.
+  return isCcBotUserAgent(req.get("user-agent")) || gardssalgRevealableEmail(provider) === null ? "none" : "reveal";
+}
+
 router.get(
   "/kategori/gardssalg/produsent/:providerSlug",
   (req: Request, res: Response, next: NextFunction) => {
@@ -6308,7 +6365,12 @@ router.get(
     // the two would fix nothing). telefon is untouched — this gate is
     // email-only.
     const epostUnderReview = isGardssalgContactEmailFlaggedForReview(provider.field_provenance, provider.epost);
-    if (provider.epost && !epostUnderReview) facts.push([L.gsEmail, `<a href="mailto:${escapeHtml(provider.epost)}">${escapeHtml(provider.epost)}</a>`]);
+    // Slice 4 (S-A1/S-A3): the e-mail this request may see, on top of the
+    // review gate. Switch off → null → exactly the line below as before.
+    const emailView = gardssalgProfileEmailView(req, provider, provider.epost && !epostUnderReview ? provider.epost : null);
+    const emailShown = emailView === null || emailView === "show";
+    if (provider.epost && !epostUnderReview && emailShown) facts.push([L.gsEmail, `<a href="mailto:${escapeHtml(provider.epost)}">${escapeHtml(provider.epost)}</a>`]);
+    else if (emailView === "reveal") facts.push([L.gsEmail, `<a href="${escapeHtml(gardssalgEmailRevealPath(slug, uiLang))}" rel="nofollow">${escapeHtml(L.gsEmailReveal)}</a>`]);
     const factsRows = facts.map(([k, v]) => `<tr><th scope="row">${escapeHtml(k)}</th><td>${v}</td></tr>`).join("");
     const factsBlock = facts.length
       ? `<table class="facts"><caption class="skip-link">Praktisk info</caption><tbody>${factsRows}</tbody></table>
@@ -6424,7 +6486,7 @@ router.get(
     if (isDisplayablePhone(provider.telefon)) ld.telephone = provider.telefon;
     // Same review gate as the visible "E-post" fact row above — see
     // epostUnderReview's comment there (AC4).
-    if (provider.epost && !epostUnderReview) ld.email = provider.epost;
+    if (provider.epost && !epostUnderReview && emailShown) ld.email = provider.epost;
     // Machine signal must match reality: an InStock Offer pointing at /book
     // while booking is paused told agents a visit could be reserved, so a
     // paused page says nothing about booking. dev-request 2026-10-16-rfb-
@@ -6620,10 +6682,88 @@ ${switcherOn ? oaSiteFooter({ lang }) : oaSiteFooter({})}
 </html>`;
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
-    res.setHeader("Cache-Control", "public, max-age=300");
+    // Slice 4: with the guard on the page depends on the client → private.
+    res.setHeader("Cache-Control", emailView === null ? "public, max-age=300" : "private");
     recordAiPageDelivery(req, res, "ai_page_profile", [String(provider.id)], "experiences");
     recordAiProfileClick(req, res, String(provider.id), "experiences");
     res.send(html);
+  },
+);
+
+// «Vis e-post» (slice 4, S-A1): read-only, no DB write. Only with
+// EMAIL_REVEAL_GUARD_EXPERIENCES on; off → next(), so the path answers exactly
+// as on main (the router's catch-all 404) and nothing new is exposed. On: the
+// same guard and experiences counter as the profile page. Within the limit →
+// 200 with the address; over it → 429 «prøv igjen senere» without it; CCBot →
+// 403 without it; a slug with no public profile (unknown, hidden, merged, test
+// producer) or no public e-mail (none stored, or under review — AC4) → 404.
+// Always Cache-Control: private and noindex. Four path segments, so it cannot
+// collide with the profile route or /kategori/:category/:kommune.
+router.get(
+  "/kategori/gardssalg/produsent/:providerSlug/epost",
+  (req: Request, res: Response, next: NextFunction) => {
+    if (!emailRevealGuardEnabled("experiences")) return next();
+    res.setHeader("Cache-Control", "private");
+    res.setHeader("X-Robots-Tag", "noindex, nofollow");
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    const slug = String(req.params.providerSlug || "");
+    const uiLang: Lang = isOpplevagentLangSwitcherEnabled() && (req.lang === "en" || req.lang === "sv") ? req.lang : "no";
+    const en = uiLang === "en";
+    const sv = uiLang === "sv";
+    try {
+      let provider: GardssalgProviderRow | null = null;
+      if (slug) {
+        ensureProviderSlugs();
+        provider = getGardssalgProviderBySlug(slug);
+      }
+      const email = provider ? gardssalgRevealableEmail(provider) : null;
+      const profilePath = localizedPath(`/kategori/gardssalg/produsent/${encodeURIComponent(slug)}`, uiLang);
+      const page = (title: string, body: string) => `<!doctype html>
+<html lang="${htmlLangAttr(uiLang)}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHtml(title)} | Opplevagent</title>
+<meta name="robots" content="noindex, nofollow">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+${pwaHeadTags()}
+<style>${BROWSE_CSS}${OA_CHROME_CSS}</style>
+</head>
+<body>
+<a class="skip-link" href="#main">${en ? "Skip to content" : sv ? "Hoppa till innehållet" : "Hopp til innhold"}</a>
+${oaSiteNav({ lang: uiLang })}
+<main id="main" class="container"><div class="head" style="padding:48px 0;max-width:720px"><h1>${escapeHtml(title)}</h1>${body}</div></main>
+${oaSiteFooter({ lang: uiLang })}
+</body>
+</html>`;
+      if (!provider || !email) {
+        const title = en ? "Not found" : sv ? "Hittades inte" : "Ikke funnet";
+        res.status(404).send(page(title, `<p><a href="${localizedPath("/kategori/gardssalg", uiLang)}">${en ? "Farm sales and tasting →" : sv ? "Gårdsförsäljning och provsmakning →" : "Gårdssalg og smaking →"}</a></p>`));
+        return;
+      }
+      const name = String(provider.navn || "");
+      const title = en ? `E-mail for ${name}` : sv ? `E-post till ${name}` : `E-post til ${name}`;
+      const back = `<p style="margin-top:20px"><a href="${escapeHtml(profilePath)}">&larr; ${en ? "Back to" : sv ? "Tillbaka till" : "Tilbake til"} ${escapeHtml(name)}</a></p>`;
+      const id = String(provider.id);
+      const allowed = revealEmailFor(req, "experiences", [id]);
+      if (allowed !== null && allowed.has(id)) {
+        res.status(200).send(page(title, `<p style="font-size:1.05rem"><a href="mailto:${escapeHtml(email)}">${escapeHtml(email)}</a></p>${back}`));
+        return;
+      }
+      if (isCcBotUserAgent(req.get("user-agent"))) {
+        res.status(403).send(page(title, `<p>${en ? "The e-mail address is not shown to this client." : sv ? "E-postadressen visas inte för den här klienten." : "E-postadressen vises ikke for denne klienten."}</p>${back}`));
+        return;
+      }
+      res.setHeader("Retry-After", "3600");
+      res.status(429).send(page(title, `<p>${en
+        ? "The limit for how many e-mail addresses can be shown from here has been reached. Please try again later, or contact the producer by phone or through their website."
+        : sv
+          ? "Gränsen för hur många e-postadresser som kan visas härifrån är nådd. Försök igen senare, eller kontakta producenten per telefon eller via webbplatsen."
+          : "Grensen for hvor mange e-postadresser som kan vises herfra, er nådd. Prøv igjen senere, eller kontakt produsenten på telefon eller via nettsiden."}</p>${back}`));
+    } catch (err) {
+      console.error("SEO /kategori/gardssalg/produsent/:providerSlug/epost error:", err instanceof Error ? err.message : String(err));
+      res.status(500).send(en ? "Internal error" : "Intern feil");
+    }
   },
 );
 

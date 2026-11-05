@@ -249,7 +249,8 @@ export async function runOwnerFeaturesS2bTests(opts: { log?: boolean } = {}): Pr
       if ((await post(H.sett, OWNED_ID, { key: "nope.key", value: "x" })).status === 303) okCount++;
     }
     assertEq(okCount, featuresMod.OWNER_FEATURES_WRITES_PER_MINUTE, "rate limit: 30 page writes per minute allowed");
-    assertEq((await post(H.sett, OWNED_ID, { key: "nope.key", value: "x" })).status, 429, "rate limit: 31st page write → 429 (shared per-session cap)");
+    const over = await post(H.sett, OWNED_ID, { key: "nope.key", value: "x" });
+    assertEq([over.status, loc(over)], [303, `/eier/${OWNED_ID}/valg?melding=for_mange#mv-toast-slot`], "rate limit: 31st page write → 303 «For mange endringer» (T5; shared per-session cap)");
     assertEq((await page(OWNED_ID)).status, 200, "rate limit: page reads not limited");
     resetCap();
 
@@ -331,24 +332,24 @@ export async function runOwnerFeaturesS2bTests(opts: { log?: boolean } = {}): Pr
 
     // ── One switch: confirm panel → write → audit + batch → undo ─────────────
     const s1 = await post(H.sett, OWNED_ID, { key: "orders.enabled", value: "true" });
-    assertEq([s1.status, loc(s1)], [303, `/eier/${OWNED_ID}/valg?bekreft=orders.enabled&verdi=1#bekreft`], "switch: confirmOn entry → in-page confirm panel first");
+    assertEq([s1.status, loc(s1)], [303, `/eier/${OWNED_ID}/valg?bekreft=orders.enabled&verdi=1#valg-orders.enabled`], "switch: confirmOn entry → in-page confirm panel first (T5: anchored at its row)");
     assertEq([optInCol(OWNED_ID), audits(OWNED_ID).length], [0, 0], "switch: nothing written before confirm");
     const cp = html(await page(OWNED_ID, { bekreft: "orders.enabled", verdi: "1" }));
-    assertTrue(cp.includes(`id="bekreft"`) && cp.includes("Du får bestillinger på e-post og må svare kunden."), "switch: confirm panel shows the registry confirmOn text");
+    assertTrue(cp.includes(`data-confirm-key="orders.enabled"`) && cp.includes("Du får bestillinger på e-post og må svare kunden."), "switch: confirm panel shows the registry confirmOn text");
     const s2 = await post(H.sett, OWNED_ID, { key: "orders.enabled", value: "true", confirmed: "1" });
     const b1 = batches(OWNED_ID);
     assertEq([s2.status, optInCol(OWNED_ID), audits(OWNED_ID).length, b1.length, b1[0]?.kind], [303, 1, 1, 1, "single"], "switch: confirmed → column 1, one audit row, one batch");
     assertEq(loc(s2), `/eier/${OWNED_ID}/valg?endret=${b1[0].id}#valg-orders.enabled`, "switch: 303 back with the change id");
     assertEq([audits(OWNED_ID)[0].key, audits(OWNED_ID)[0].actor, audits(OWNED_ID)[0].actor_detail], ["orders.enabled", "owner", `post@${OWNED_ID}.example.no`], "switch: audit row actor owner + session e-mail");
     const pAfter = html(await page(OWNED_ID, { endret: String(b1[0].id) }));
-    assertTrue(pAfter.includes("Lagret: «Ta imot bestillinger» er På.") && pAfter.includes(`name="batch" value="${b1[0].id}"`) && pAfter.includes(">Angre<"), "switch: message at the bottom with «Angre»");
-    assertTrue(pAfter.indexOf(`class="mv-toast`) > pAfter.indexOf(`id="endringslogg"`), "switch: message is at the bottom");
+    assertTrue(pAfter.includes("Lagret: «Ta imot bestillinger» er På.") && pAfter.includes(`name="batch" value="${b1[0].id}"`) && pAfter.includes(">Angre<"), "switch: message with «Angre»");
+    assertTrue(row(pAfter, "orders.enabled").includes(`class="mv-toast mv-toast-inline`), "switch (T5): the message stands in the row that changed");
     assertTrue(pAfter.includes(`data-key="orders.email"`), "page: orders.* rows revealed once orders are on");
     assertTrue(!pAfter.includes(`aria-current="true" data-level=`), "level (S2e): a single switch marks no level (only the owner's level choice does)");
     const noop = await post(H.sett, OWNED_ID, { key: "orders.enabled", value: "true", confirmed: "1" });
     assertEq([loc(noop).includes("melding=ingen_endring"), audits(OWNED_ID).length, batches(OWNED_ID).length], [true, 1, 1], "switch: no-op writes nothing");
     const cs = await post(H.sett, OWNED_ID, { key: "visibility.leaderboard", value: "false", confirmed: "1" });
-    assertEq([loc(cs), audits(OWNED_ID).length, settingsRows(OWNED_ID)], [`/eier/${OWNED_ID}/valg?melding=sperret&nokkel=visibility.leaderboard`, 1, 0], "switch: coming_soon blocked, nothing written");
+    assertEq([loc(cs), audits(OWNED_ID).length, settingsRows(OWNED_ID)], [`/eier/${OWNED_ID}/valg?melding=sperret&nokkel=visibility.leaderboard&ved=valg-visibility.leaderboard#valg-visibility.leaderboard`, 1, 0], "switch: coming_soon blocked, nothing written");
     assertTrue(html(await page(OWNED_ID, { melding: "sperret", nokkel: "visibility.leaderboard" })).includes("Kan ikke endres: Kommer snart."), "switch: blocked message with Norwegian reason");
     const inv = await post(H.sett, OWNED_ID, { key: "orders.enabled", value: "kanskje", confirmed: "1" });
     assertEq([loc(inv).includes("melding=ugyldig"), audits(OWNED_ID).length], [true, 1], "switch: invalid value → message, nothing written");
@@ -366,7 +367,7 @@ export async function runOwnerFeaturesS2bTests(opts: { log?: boolean } = {}): Pr
 
     // ── Levels (S2e: «Bare synlig» / «Ta imot bestillinger») ────────────────
     const lv0 = await post(H.niva, OWNED_ID, { level: "ta_imot_bestillinger" });
-    assertEq(loc(lv0), `/eier/${OWNED_ID}/valg?niva=ta_imot_bestillinger#bekreft`, "level: unconfirmed → preview panel");
+    assertEq(loc(lv0), `/eier/${OWNED_ID}/valg?niva=ta_imot_bestillinger#niva-forhandsvis`, "level: unconfirmed → preview panel (T5: inside the level card)");
     const prev = html(await page(OWNED_ID, { niva: "ta_imot_bestillinger" }));
     assertTrue(prev.includes("Bytte til «Ta imot bestillinger»?") && prev.includes("<strong>Ta imot bestillinger</strong>: Av → På") && prev.includes("Bekreft «Ta imot bestillinger»"), "level: preview lists the live change");
     const auditsBefore = audits(OWNED_ID).length;
@@ -388,7 +389,7 @@ export async function runOwnerFeaturesS2bTests(opts: { log?: boolean } = {}): Pr
     assertEq(loc(await post(H.niva, OWNED_ID, { level: "bogus", confirmed: "1" })).includes("melding=ugyldig"), true, "level: unknown level refused");
     // Unmet requirement: skipped with reason.
     const lu = await post(H.niva, UNBADGED_ID, { level: "ta_imot_bestillinger", confirmed: "1" });
-    assertEq([loc(lu), optInCol(UNBADGED_ID), audits(UNBADGED_ID).length], [`/eier/${UNBADGED_ID}/valg?melding=hoppet&nokkel=orders.enabled#niva`, 0, 0], "level: unmet requirement → key skipped, nothing written");
+    assertEq([loc(lu), optInCol(UNBADGED_ID), audits(UNBADGED_ID).length], [`/eier/${UNBADGED_ID}/valg?melding=hoppet&nokkel=orders.enabled&ved=niva#niva`, 0, 0], "level: unmet requirement → key skipped, nothing written");
     assertTrue(html(await page(UNBADGED_ID, { melding: "hoppet", nokkel: "orders.enabled" })).includes("«Ta imot bestillinger»: Krever at profilen er verifisert"), "level: skipped message carries the Norwegian reason");
     assertTrue(!html(await page(UNBADGED_ID)).includes(`aria-current="true" data-level=`), "level (S2e): a level that could not apply is not marked as chosen");
     // The undo/preview machinery over multi-key presets (fixture levels: the S2b «Aktiv» / «Full fart» presets).
