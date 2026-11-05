@@ -46,7 +46,7 @@ import { Router, Request, Response } from "express";
 import { runDebioCrossCheck, DEFAULT_SINCE_ISO, DebioSource } from "../services/debio-cross-check";
 import { syncDebioVerifications } from "../services/debio-verification-service";
 import { startJob } from "../services/job-tracker";
-import { syncDebioRegister, listMatchReview, decideMatchReview } from "../services/debio-register-sync";
+import { syncDebioRegister, listMatchReview, decideMatchReview, manualDebioLink } from "../services/debio-register-sync";
 import { getDb } from "../database/init";
 
 const router = Router();
@@ -222,6 +222,32 @@ router.get("/match-review", (req: Request, res: Response) => {
   const state = (["pending", "approved", "rejected", "all"].includes(raw) ? raw : "pending") as "pending" | "approved" | "rejected" | "all";
   const items = listMatchReview(getDb(), state);
   res.json({ success: true, state, count: items.length, items });
+});
+
+// POST /admin/debio/match-review/manual
+//   body { agent_id, debio_sid, reason, apply? }   (økologi S1d)
+//   Links a producer to a register entry the sync never proposed. Dry run
+//   unless apply is literally true. The candidate is built the way the sync
+//   builds one (match_method 'manual', reasons ["manual: <reason>"]) and
+//   approved through the same path as POST /match-review/:id. Missing field →
+//   400; unknown agent or sid → 404; not an active producer → 409; register
+//   unavailable / too few rows → 502. Registered before /match-review/:id.
+let manualLinkFetch: typeof fetch | undefined;
+/** Tests only: the register fetch used by POST /match-review/manual (undefined = real fetch). */
+export function __setManualLinkFetchForTesting(f: typeof fetch | undefined): void {
+  manualLinkFetch = f;
+}
+
+router.post("/match-review/manual", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const out = await manualDebioLink(getDb(), req.body ?? {}, { fetchImpl: manualLinkFetch });
+    if (!out.ok) { res.status(out.http).json({ success: false, error: out.error, ...(out.detail ? { detail: out.detail } : {}) }); return; }
+    const { ok: _ok, ...rest } = out;
+    res.json({ success: true, ...rest });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: "manual Debio link failed", detail: err?.message || String(err) });
+  }
 });
 
 // POST /admin/debio/match-review/:id   body { action: "approve" | "reject" }

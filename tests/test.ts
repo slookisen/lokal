@@ -52007,6 +52007,26 @@ runSerial(async () => {
   }
 });
 
+// økologi S1d: manual Debio register link (POST /admin/debio/match-review/manual,
+// dry run by default) + the profile-name tagline fix in the name match. Pins
+// the getDb() singleton and sets ADMIN_KEY / OWNER_FEATURES_* (restored in
+// finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── økologi S1d: manuell Debio-registerkobling ──");
+  try {
+    const { runDebioRegisterS1dTests } = require("../src/services/debio-register-s1d.test") as
+      typeof import("../src/services/debio-register-s1d.test");
+    const r = await runDebioRegisterS1dTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("debio-register-s1d: " + f);
+    console.log(`  debio-register-s1d: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("debio-register-s1d: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // A2A dev-request 2026-10-21-rfb-produktimport-fra-egen-nettside, Skive 1:
 // product extractor (Shopify / WooCommerce / JSON-LD / grounded LLM tiers,
 // robots.txt, same-host + SSRF) and the flag-gated dry-run measurement
