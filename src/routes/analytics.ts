@@ -17,12 +17,16 @@ import {
   type TopProducerRow,
   type CityStatsRow,
   type UmbrellaTrafficBucket,
+  computeAiAgentBreakdown,
+  AI_AGENT_RAW_MAX_HOURS,
 } from "../services/admin-stats-compute";
 import { computeTrafficReport, deviceForSession, type TrafficReport } from "../services/traffic-report";
 import { computeHistoryView, type HistoryView } from "../services/traffic-history-compute";
 import { computeTrafficAlertsFromDb } from "../services/traffic-alerts";
 import { getTrafficHistoryJobState } from "../services/traffic-history";
 import { getRetentionWindowDays } from "../services/traffic-stats-compute";
+import { getTrafficStatsSnapshot } from "../services/traffic-stats";
+import { adminTrafficYearBody } from "../services/traffic-year-compute";
 import { computeAiLookupBreakdown, type AiLookupBreakdown } from "../services/search-stats-compute";
 import { AI_DELIVERY_WINDOW_DAYS, computeAiDeliveries, computeAiDeliveryTopProfiles } from "../services/profile-ai-deliveries-compute";
 import { computePartnerReport, partnerReportToCsv, PartnerReportInputError } from "../services/partner-report-service";
@@ -301,6 +305,28 @@ router.get("/utm", (req: Request, res: Response) => {
 });
 
 /**
+ * GET /admin/analytics/ai-agents?hours=24&days=90&vertical=
+ * ai-sok B5: views per AI agent (OAI-SearchBot vs ChatGPT-User vs GPTBot, …)
+ * from raw rows (`raw`, last `hours`, max 168) and, separately, from the
+ * nightly rollup (`rollup`, rolled-up days within the last `days`, max 400).
+ */
+router.get("/ai-agents", (req: Request, res: Response) => {
+  try {
+    const hours = parseInt(req.query.hours as string) || 24;
+    const days = parseInt(req.query.days as string) || 90;
+    const out = computeAiAgentBreakdown(getDb(), hours, days, parseVertical(req), Date.now());
+    res.json({
+      timeframe: `last ${Math.max(1, Math.min(AI_AGENT_RAW_MAX_HOURS, hours))} hours (raw)`,
+      timestamp: new Date().toISOString(),
+      ...out,
+    });
+  } catch (err) {
+    console.error("[analytics] ai-agents error:", err);
+    res.status(500).json({ error: "ai-agents breakdown failed" });
+  }
+});
+
+/**
  * GET /admin/analytics/summary/:hours
  * High-level analytics for the last N hours
  */
@@ -373,10 +399,13 @@ router.get("/producers", async (req: Request, res: Response) => {
  * Query params:
  *   vertical=rfb|dental|experiences (default: all, or host-locked)
  *   limit=10 (default; max 50)
+ *   days=60 (default AI_DELIVERY_WINDOW_DAYS; 1–3650): the window of `window`
+ *     and `top`, for the dashboard's «Med i AI-søk» card in the chosen period.
  */
 router.get("/ai-deliveries", (req: Request, res: Response) => {
   try {
     const limit = Math.max(1, Math.min(50, parseInt(req.query.limit as string) || 10));
+    const windowDays = Math.max(1, Math.min(3650, parseInt(req.query.days as string) || AI_DELIVERY_WINDOW_DAYS));
     const vertical = parseVertical(req);
     const db = getDb();
     const now = Date.now();
@@ -387,15 +416,39 @@ router.get("/ai-deliveries", (req: Request, res: Response) => {
     const topVertical = vertical ?? "rfb";
     res.json({
       vertical: vertical || "all",
-      windowDays: AI_DELIVERY_WINDOW_DAYS,
-      window: computeAiDeliveries(db, vertical, undefined, AI_DELIVERY_WINDOW_DAYS, now),
+      windowDays,
+      window: computeAiDeliveries(db, vertical, undefined, windowDays, now),
       allTime: computeAiDeliveries(db, vertical, undefined, null, now),
       topVertical,
-      top: withNames(computeAiDeliveryTopProfiles(db, topVertical, AI_DELIVERY_WINDOW_DAYS, now, limit)),
+      top: withNames(computeAiDeliveryTopProfiles(db, topVertical, windowDays, now, limit)),
       topAllTime: withNames(computeAiDeliveryTopProfiles(db, topVertical, null, now, limit)),
     });
   } catch (err) {
     console.error("[analytics] ai-deliveries error:", err);
+    res.status(500).json({ error: "internal error" });
+  }
+});
+
+/**
+ * GET /admin/analytics/year?vertical=rfb|dental|experiences
+ * The five numbers of the site's strip over the last 12 months, each with its
+ * start date (dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S2): the
+ * dashboard's cards when one site and «Siste år» are chosen. Read from the
+ * same off-thread snapshot as the strip and /api/traffic-stats
+ * (getTrafficStatsSnapshot), never computed on the request; `ready: false`
+ * with `year: null` while the first computation after boot runs. One site
+ * only: the strips are per site, and «Alle» uses the stored history.
+ */
+router.get("/year", (req: Request, res: Response) => {
+  const vertical = parseVertical(req);
+  if (!vertical) {
+    res.status(400).json({ error: "vertical must be rfb, dental or experiences" });
+    return;
+  }
+  try {
+    res.json(adminTrafficYearBody(vertical, getTrafficStatsSnapshot(vertical)));
+  } catch (err) {
+    console.error("[analytics] year error:", err);
     res.status(500).json({ error: "internal error" });
   }
 });
@@ -949,6 +1002,7 @@ router.get("/traffic-classification", async (req: Request, res: Response) => {
     classification,
     classes: rep.classes,
     coverage: rep.coverage,
+    aiAgents: rep.aiAgents,
     bots: rep.bots,
     otherUaSamples: rep.otherUaSamples,
     humanSessions: rep.human.topSessions,
@@ -1662,7 +1716,10 @@ router.get("/producer-outcomes", requireAdminAuth, (req: Request, res: Response)
 //   - pageViews_via_members: member producers' /produsent/<slug>
 //   - human_pageviews_profile / human_pageviews_members: the same, by people
 //   - ai_bot_pageviews:      either page set, by AI assistants and AI
-//                            crawlers (the shared traffic classifier)
+//                            crawlers (the shared traffic classifier); kept
+//                            for older readers, the dashboard shows the split:
+//   - ai_search_pageviews:   … by AI assistants fetching for someone
+//   - ai_crawler_pageviews:  … by autonomous AI crawlers
 //   - search_referrals:      either page set, by people arriving from a
 //                            search engine (Google, Bing, DuckDuckGo referrer)
 //   - active_members:        count of agent_affiliations rows where

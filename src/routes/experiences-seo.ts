@@ -25,6 +25,7 @@
 
 import express, { Router, Request, Response, NextFunction } from "express";
 import { createSitemapCache, resolveSitemapCacheTtlMs, logSlowSitemap } from "./sitemap-cache-util";
+import { isAsPublicView } from "../services/agent-visibility";
 import * as QRCode from "qrcode";
 // dev-request 2026-07-19-opplevagent-kart-fylke-gardssalg, slice 1: reads the
 // vendored Leaflet assets (src/public/leaflet/) off disk for the
@@ -35,7 +36,9 @@ import * as fs from "fs";
 import * as path from "path";
 import { analyticsService } from "../services/analytics-service";
 import { recordAiPageDelivery } from "../services/profile-ai-deliveries";
+import { recordAiProfileClick } from "../services/profile-ai-clicks";
 import { aiDeliveriesTileFor } from "../services/profile-ai-deliveries-tile";
+import { TRAFFIC_YEAR_KEYS, trafficYearCell, trafficYearLangOf, type TrafficYear, type TrafficYearKey } from "../services/traffic-year-compute";
 import { filterQueryText } from "../services/search-tracking";
 import { getExperiencesAgentCard, OPPLEVAGENT_CUSTOM_GPT_URL } from "../services/experiences-agent-card";
 import { getJWKS } from "../services/agent-card-signing";
@@ -167,6 +170,7 @@ import { EXPERIENCE_TAGS, type ExperienceTag } from "../services/experience-tags
 // imported here rather than duplicated, so each stamp keeps exactly one
 // reader.
 import { isGardssalgContactEmailFlaggedForReview } from "./opplevelser";
+import { emailRevealGuardEnabled, isCcBotUserAgent, revealEmailFor } from "../services/email-reveal-guard";
 // dev-request 2026-08-07-orch-fylke-2024-migrasjon: the /fylke/:fylke 301
 // fallback below reuses norway-fylke.ts's own historical-alias map
 // (ALIAS_TO_CANONICAL), merged-legacy equivalence classes
@@ -228,6 +232,8 @@ import {
 // — the SAME shared choke point POST /api/opplevelser/book and the
 // book_gardssalg MCP tool use, never re-derived here.
 import { checkBookingSlotAllowed } from "../services/gardssalg-opening-hours";
+// «Mine valg» booking.pause (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg O1a).
+import { gardssalgBookingPausedByOwner, GARDSSALG_NOT_TAKING_REQUESTS_TEXT } from "../services/gardssalg-booking-gate";
 import { getOaHomeCounters } from "../services/oa-home-counters";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { safeHonestCatalogCount } from "../services/honest-count";
@@ -271,6 +277,17 @@ import { CATEGORY_COLORS, CATEGORY_COLOR_FALLBACK } from "../services/category-p
 // of re-implementing it here.
 import { parseNameLocationSuffix, normaliseHint } from "../services/location-suffix-parser";
 import { capFreeText, capName } from "../utils/free-text";
+import { OPPLEVAGENT_PRICE_MESSAGE } from "../owner-features/price-message";
+// dev-request O4 (= G4), slice O4a: «For tilbydere» with sections and FAQ,
+// behind FOR_TILBYDERE_FAQ_ENABLED. The text is data in its own module.
+import {
+  isForTilbydereFaqEnabled,
+  buildForTilbydereFaqLd,
+  FOR_TILBYDERE_SECTIONS,
+  FOR_TILBYDERE_FAQ_META,
+  type ForTilbydereSection,
+} from "./experiences-for-tilbydere-faq";
+import { faqPairsFromJsonLd, type FaqPair } from "../services/faq-section";
 
 const router = Router();
 
@@ -432,6 +449,7 @@ function oaProfileLabels(lang: Lang) {
     provAll: "Alle opplevelser fra denne tilbyderen →", provUnmatched: "Tilbyder er ikke matchet ennå.",
     gsKicker: "Gårdssalg &amp; smaking", gsCrumb: "Gårdssalg og smaking", gsAbout: "Om produsenten", gsVisit: "Besøket", gsPractical: "Praktisk info",
     gsReserve: "Reserver", gsAddress: "Adresse", gsHours: "Åpningstider", gsSite: "Nettside", gsEmail: "E-post",
+    gsEmailReveal: "Vis e-post",
     gsMeta: (navn: string, sted: string) => `${navn}${sted ? " i " + sted : ""} — produsentprofil på Opplevagent med fakta om produsenten.`,
   };
   const en: typeof no = {
@@ -453,6 +471,7 @@ function oaProfileLabels(lang: Lang) {
     provAll: "All experiences from this provider →", provUnmatched: "Provider not matched yet.",
     gsKicker: "Farm sales &amp; tasting", gsCrumb: "Farm sales and tasting", gsAbout: "About the producer", gsVisit: "The visit", gsPractical: "Practical information",
     gsReserve: "Reserve", gsAddress: "Address", gsHours: "Opening hours", gsSite: "Website", gsEmail: "Email",
+    gsEmailReveal: "Show e-mail",
     gsMeta: (navn: string, sted: string) => `${navn}${sted ? " in " + sted : ""} — producer profile on Opplevagent with facts about the producer.`,
   };
   const sv: typeof no = {
@@ -474,6 +493,7 @@ function oaProfileLabels(lang: Lang) {
     provAll: "Alla upplevelser från denna arrangör →", provUnmatched: "Arrangören är inte matchad ännu.",
     gsKicker: "Gårdsförsäljning &amp; provsmakning", gsCrumb: "Gårdsförsäljning och provsmakning", gsAbout: "Om producenten", gsVisit: "Besöket", gsPractical: "Praktisk information",
     gsReserve: "Reservera", gsAddress: "Adress", gsHours: "Öppettider", gsSite: "Webbplats", gsEmail: "E-post",
+    gsEmailReveal: "Visa e-post",
     gsMeta: (navn: string, sted: string) => `${navn}${sted ? " i " + sted : ""} — producentprofil på Opplevagent med fakta om producenten.`,
   };
   if (lang === "en") return en;
@@ -1662,6 +1682,35 @@ export const GARDSSALG_TYPE_SLUG_ALIASES: Record<string, string> = {
 // Homepage UI strings (NO/EN). Phase-1 i18n: only the landing page
 // is genuinely bilingual; browse/detail stay NO-canonical for now.
 // ─────────────────────────────────────────────────────────────
+/**
+ * The 12-month strip's own strings (dev-request 2026-10-22-statistikk-samme-tall-12-mnd,
+ * S2). Kept outside homeStrings(), whose en/sv copy is frozen by
+ * experiences-seo-forside-copy.test.ts.
+ */
+export function counterYearStrings(lang: Lang) {
+  if (lang === "en") return {
+    pageViews: "Page views,",
+    deliveries: "In AI searches",
+    deliveriesNote: "times a provider was among the results an AI assistant fetched, summed over all providers",
+    deliveriesExplain: "In AI searches: times a provider was among the results an AI assistant (ChatGPT, Claude …) fetched for someone who asked (a search, a place, a category, the profile page, MCP or A2A), summed over all providers. It does not show how many people saw it.",
+    dailySums: "The numbers are daily sums over the last 12 months, or from the date under the number when the count is younger.",
+  };
+  if ((lang as string) === "sv") return {
+    pageViews: "Sidvisningar",
+    deliveries: "Med i AI-sökningar",
+    deliveriesNote: "gånger en arrangör fanns bland träffarna en AI-assistent hämtade, summerat över alla arrangörer",
+    deliveriesExplain: "Med i AI-sökningar: gånger en arrangör fanns bland träffarna en AI-assistent (ChatGPT, Claude …) hämtade åt någon som frågade (sökning, plats, kategori, profilsidan, MCP eller A2A), summerat över alla arrangörer. Siffran visar inte hur många som såg den.",
+    dailySums: "Siffrorna är summor per dag för de senaste 12 månaderna, eller från datumet under siffran när räkningen är yngre.",
+  };
+  return {
+    pageViews: "Sidevisninger",
+    deliveries: "Med i AI-søk",
+    deliveriesNote: "ganger en tilbyder var blant treffene en AI-assistent hentet, summert over alle tilbydere",
+    deliveriesExplain: "Med i AI-søk: ganger en tilbyder var blant treffene en AI-assistent (ChatGPT, Claude …) hentet for noen som spurte (søk, sted, kategori, profilsiden, MCP eller A2A), summert over alle tilbydere. Tallet viser ikke hvor mange som så det.",
+    dailySums: "Tallene er summer per dag over de siste 12 månedene, eller fra datoen under tallet når tellingen er yngre.",
+  };
+}
+
 export function homeStrings(lang: Lang) {
   const no = {
     // dev-request 2026-10-16-opplevagent-stedssider-kvalitet, E4-S3: Daniel's
@@ -1977,43 +2026,47 @@ router.get("/", (req: Request, res: Response) => {
   // for the exact scoping/exclusion rules this reuses from the RFB homepage
   // pattern). Read defensively — must never break the homepage.
   const numFmt = lang === "en" ? "en-US" : "nb-NO";
-  let counters = { pageViews: 0, uniqueVisitors: 0, realVisitors: 0, humanVisits: 0, humanViews: 0, aiSearchViews: 0, aiLookups: 0, aiSearchTotal: 0, aiCrawlerViews: 0, otherBotViews: 0, botViews: 0, windowDays: 60, realHumans: 0, botAndAi: 0, opplevelser: 0, tilbydere: 0, kommuner: 0, sinceDate: null as string | null };
+  let counters = { pageViews: 0, uniqueVisitors: 0, realVisitors: 0, humanVisits: 0, humanViews: 0, aiSearchViews: 0, aiLookups: 0, aiSearchTotal: 0, aiCrawlerViews: 0, otherBotViews: 0, botViews: 0, windowDays: 60, realHumans: 0, botAndAi: 0, opplevelser: 0, tilbydere: 0, kommuner: 0, sinceDate: null as string | null, year: null as TrafficYear | null };
   try {
     counters = getOaHomeCounters();
   } catch {
     // Analytics/catalog DB not open — render the strip with 0s rather than
     // failing the whole homepage.
   }
-  // Since-date: the oldest analytics datapoint the counters above are drawn
-  // from (counters.sinceDate, from oa-home-counters.ts). Omit entirely when
-  // null (no analytics rows yet) or unparseable — never render
-  // "since Invalid Date".
-  let sinceDateFragment = "";
-  if (counters.sinceDate) {
-    const sinceD = new Date(counters.sinceDate);
-    if (!isNaN(sinceD.getTime())) {
-      const formattedSinceDate = sinceD.toLocaleDateString(numFmt, { day: "numeric", month: "short", year: "numeric" });
-      sinceDateFragment = ` &middot; ${S.counterSincePre} ${formattedSinceDate}`;
-    }
-  }
+  // dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S2: five equal
+  // numbers over the last 12 months, each with «siste 12 måneder» or
+  // «siden <dato>» (traffic-year-compute.ts). That per-number start date
+  // replaces the old «Tall siden <oldest raw row>» fragment, which described
+  // the 60-day raw window (counters.sinceDate is still computed).
+  const year = counters.year;
+  const Y = counterYearStrings(lang);
+  const yearLang = trafficYearLangOf(lang);
+  const yearCell = (key: TrafficYearKey) => trafficYearCell(year, key, yearLang, numFmt);
+  const yearNum = (n: number | undefined) => (n === undefined ? "–" : n.toLocaleString(numFmt));
+  const yearLabels: Record<TrafficYearKey, string> = {
+    humanVisits: S.counterHumanVisits,
+    humanViews: S.counterHumanViews,
+    aiSearch: S.counterAiSearch,
+    aiCrawlerViews: S.counterCrawlers,
+    aiDeliveries: Y.deliveries,
+  };
+  const yearItemsHtml = TRAFFIC_YEAR_KEYS.map((key) => {
+    const c = yearCell(key);
+    const title = key === "aiDeliveries" ? Y.deliveriesExplain : key === "aiSearch" || key === "aiCrawlerViews" ? S.counterAiExplain : "";
+    return `      <div class="counter-item" data-stat="${key}"${title ? ` title="${title}"` : ""}><div class="counter-val${key === "aiSearch" ? " counter-val-accent" : ""}">${c.value}</div><div class="counter-lbl">${yearLabels[key]}</div>${c.period ? `<div class="counter-period">${c.period}</div>` : ""}</div>
+      <div class="counter-sep" aria-hidden="true"></div>`;
+  }).join("\n");
   const counterStripHtml = `
   <div class="counters" aria-label="${S.counterAria}">
     <div class="counters-inner">
-      <div class="counter-item"><div class="counter-val">${counters.humanVisits.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterHumanVisits}</div></div>
-      <div class="counter-sep" aria-hidden="true"></div>
-      <div class="counter-item"><div class="counter-val">${counters.humanViews.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterHumanViews}</div></div>
-      <div class="counter-sep" aria-hidden="true"></div>
-      <div class="counter-item" title="${S.counterAiExplain}"><div class="counter-val counter-val-accent">${counters.aiSearchTotal.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterAiSearch}</div></div>
-      <div class="counter-sep" aria-hidden="true"></div>
-      <div class="counter-item" title="${S.counterAiExplain}"><div class="counter-val">${counters.aiCrawlerViews.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterCrawlers}</div></div>
-      <div class="counter-sep" aria-hidden="true"></div>
+${yearItemsHtml}
       <div class="counter-item"><div class="counter-val">${counters.opplevelser.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterExperiences}</div></div>
       <div class="counter-sep" aria-hidden="true"></div>
       <div class="counter-item"><div class="counter-val">${counters.tilbydere.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterProviders}</div></div>
       <div class="counter-sep" aria-hidden="true"></div>
       <div class="counter-item"><div class="counter-val">${counters.kommuner.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterMunicipalities}</div></div>
     </div>
-    <div class="counter-note">${S.counterTotalPre} ${counters.windowDays} ${S.counterWindowPost}: ${counters.pageViews.toLocaleString(numFmt)} = ${S.counterPeople} ${counters.humanViews.toLocaleString(numFmt)} + ${S.counterAiPages} ${counters.aiSearchViews.toLocaleString(numFmt)} + ${S.counterAiCrawlersLc} ${counters.aiCrawlerViews.toLocaleString(numFmt)} + ${S.counterOtherBots} ${counters.otherBotViews.toLocaleString(numFmt)}. ${S.counterAiSearch} = ${counters.aiSearchViews.toLocaleString(numFmt)} ${S.counterAiPagesNote} + ${counters.aiLookups.toLocaleString(numFmt)} ${S.counterAiLookupsNote}. ${S.counterVisitDef} ${S.counterAiExplain}${sinceDateFragment}</div>
+    ${year ? `<div class="counter-note">${Y.pageViews} ${yearCell("humanViews").period}: ${yearNum(year?.pageViews.value)} = ${S.counterPeople} ${yearNum(year?.humanViews.value)} + ${S.counterAiPages} ${yearNum(year?.aiSearchViews.value)} + ${S.counterAiCrawlersLc} ${yearNum(year?.aiCrawlerViews.value)} + ${S.counterOtherBots} ${yearNum(year?.otherBotViews.value)}. ${S.counterAiSearch} ${yearCell("aiSearch").period} = ${yearNum(year?.aiSearch.pages)} ${S.counterAiPagesNote} + ${yearNum(year?.aiSearch.lookups)} ${S.counterAiLookupsNote}. ${Y.deliveries} ${yearCell("aiDeliveries").period}: ${Y.deliveriesNote}. ${S.counterVisitDef} ${Y.dailySums} ${S.counterAiExplain}</div>` : ""}
     <div class="network-strip">${S.networkLabel}
       <a href="https://rettfrabonden.com" rel="noopener">rettfrabonden.com</a> &middot;
       <a href="https://finn-tannlege.com" rel="noopener">finn-tannlege.com</a>
@@ -2300,6 +2353,7 @@ ${ldScripts}
   .counter-val{font-size:1.25rem;font-weight:800;color:var(--fjord-700);letter-spacing:-.02em;line-height:1}
   .counter-val.counter-val-accent{color:var(--coral-500)}
   .counter-lbl{margin-top:3px;font-size:.68rem;font-weight:600;color:var(--mist);text-transform:uppercase;letter-spacing:.04em}
+  .counter-period{margin-top:2px;font-size:.64rem;color:var(--mist)}
   .counter-sep{width:1px;height:26px;background:var(--line)}
   @media(max-width:640px){.counter-sep{display:none}}
 
@@ -2729,7 +2783,7 @@ function buildExperiencesSitemapXml(): string {
   // every request (rfb PR #302 fixed the same pattern for city pages).
   let gardssalgProvidersForSitemap: GardssalgProviderRow[] | null = null;
   if (gardssalgVisible()) {
-    try { gardssalgProvidersForSitemap = listGardssalgProviders(5000, 0); } catch { gardssalgProvidersForSitemap = null; }
+    try { gardssalgProvidersForSitemap = listGardssalgProviders(5000, 0, undefined, "sitemap"); } catch { gardssalgProvidersForSitemap = null; }
   }
   try {
     for (const row of listPublishedCategories()) {
@@ -2894,7 +2948,9 @@ export function __resetExperiencesSitemapCacheForTesting(): void {
 router.get("/sitemap.xml", (_req: Request, res: Response) => {
   const startedAt = Date.now();
   try {
-    const xml = getExperiencesSitemapXml();
+    // «Vis som offentlig» (O2a): an admin's as-public view neither reads nor
+    // fills the cache (it may list the hidden test producer).
+    const xml = isAsPublicView() ? buildExperiencesSitemapXml() : getExperiencesSitemapXml();
     res.setHeader("Content-Type", "application/xml; charset=utf-8");
     res.setHeader("Cache-Control", `public, max-age=${Math.floor(resolveSitemapCacheTtlMs() / 1000)}`);
     res.send(xml);
@@ -5094,7 +5150,8 @@ router.get("/opplevelser", (req: Request, res: Response) => {
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
-  recordAiPageDelivery(req, res, "ai_page_list", rows.map((r) => r.id).filter((i): i is string => !!i), "experiences");
+  // «Med i AI-søk» (S1, 2026-10-25): the generic «Alle opplevelser» list answers
+  // no search, place or category, so it is not counted.
   res.send(html);
 });
 
@@ -6119,6 +6176,59 @@ export function decideOwnerCtaSwap(
   };
 }
 
+// ─── E-mail on the gårdssalg producer profile (dev-request
+// 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting, slice 4: S-A1
+// and S-A3 on opplevagent.no /kategori/gardssalg/produsent/:providerSlug) ───
+// With EMAIL_REVEAL_GUARD_EXPERIENCES on, the profile page gives the
+// producer's own e-mail (the «E-post» fact row's mailto: and JSON-LD `email`)
+// only within the per-IP limit of services/email-reveal-guard.ts — one
+// experiences counter per client, and a profile seen again in the window is
+// free. Over the limit the fact row shows «Vis e-post», a plain link to GET
+// /kategori/gardssalg/produsent/:providerSlug/epost (no script), and the
+// address is nowhere in the HTML; JSON-LD has no `email`. CCBot (S-A3) gets
+// neither the address nor «Vis e-post», also on its first request, and spends
+// no budget. The guard comes on top of the AC4 review gate (epostUnderReview):
+// a flagged address is still shown nowhere, costs nothing and is never
+// revealed by the endpoint either. With the switch on the page depends on the
+// client, so it is Cache-Control: private. Switch off: revealEmailFor is not
+// called and the page and its headers are byte-identical to main. Platform
+// addresses (kontakt@opplevagent.no) are not producer e-mail and are left
+// alone. The guard's log line carries profile ids and counts only, never an
+// address or an IP.
+
+/** The path of the «Vis e-post» endpoint for a producer slug (localized like the profile's links). */
+export function gardssalgEmailRevealPath(slug: string, lang: Lang = "no"): string {
+  return localizedPath(`/kategori/gardssalg/produsent/${encodeURIComponent(slug)}/epost`, lang);
+}
+
+/**
+ * The producer's e-mail as the «Vis e-post» endpoint may give it: the stored
+ * address unless empty or under review (AC4), and only for a row that is
+ * neither hidden nor the test producer (those reach the profile page only in
+ * an admin's «Vis som offentlig» request). null = 404.
+ */
+function gardssalgRevealableEmail(provider: GardssalgProviderRow): string | null {
+  if (Number(provider.catalog_hidden) === 1 || Number(provider.is_test_provider) === 1) return null;
+  const epost = provider.epost;
+  if (!epost || isGardssalgContactEmailFlaggedForReview(provider.field_provenance, epost)) return null;
+  return epost;
+}
+
+/**
+ * How the profile shows the producer's e-mail to this request: null = switch
+ * off (change nothing); "show" = as today; "reveal" = «Vis e-post» without the
+ * address; "none" = nothing (CCBot, or no e-mail shown).
+ */
+function gardssalgProfileEmailView(req: Request, provider: GardssalgProviderRow, email: string | null): "show" | "reveal" | "none" | null {
+  if (!emailRevealGuardEnabled("experiences")) return null;
+  const providerId = String(provider.id ?? "");
+  if (!email || !providerId) return "none";
+  const allowed = revealEmailFor(req, "experiences", [providerId]);
+  if (allowed !== null && allowed.has(providerId)) return "show";
+  // No «Vis e-post» for CCBot, nor where the endpoint would answer 404.
+  return isCcBotUserAgent(req.get("user-agent")) || gardssalgRevealableEmail(provider) === null ? "none" : "reveal";
+}
+
 router.get(
   "/kategori/gardssalg/produsent/:providerSlug",
   (req: Request, res: Response, next: NextFunction) => {
@@ -6255,7 +6365,12 @@ router.get(
     // the two would fix nothing). telefon is untouched — this gate is
     // email-only.
     const epostUnderReview = isGardssalgContactEmailFlaggedForReview(provider.field_provenance, provider.epost);
-    if (provider.epost && !epostUnderReview) facts.push([L.gsEmail, `<a href="mailto:${escapeHtml(provider.epost)}">${escapeHtml(provider.epost)}</a>`]);
+    // Slice 4 (S-A1/S-A3): the e-mail this request may see, on top of the
+    // review gate. Switch off → null → exactly the line below as before.
+    const emailView = gardssalgProfileEmailView(req, provider, provider.epost && !epostUnderReview ? provider.epost : null);
+    const emailShown = emailView === null || emailView === "show";
+    if (provider.epost && !epostUnderReview && emailShown) facts.push([L.gsEmail, `<a href="mailto:${escapeHtml(provider.epost)}">${escapeHtml(provider.epost)}</a>`]);
+    else if (emailView === "reveal") facts.push([L.gsEmail, `<a href="${escapeHtml(gardssalgEmailRevealPath(slug, uiLang))}" rel="nofollow">${escapeHtml(L.gsEmailReveal)}</a>`]);
     const factsRows = facts.map(([k, v]) => `<tr><th scope="row">${escapeHtml(k)}</th><td>${v}</td></tr>`).join("");
     const factsBlock = facts.length
       ? `<table class="facts"><caption class="skip-link">Praktisk info</caption><tbody>${factsRows}</tbody></table>
@@ -6371,7 +6486,7 @@ router.get(
     if (isDisplayablePhone(provider.telefon)) ld.telephone = provider.telefon;
     // Same review gate as the visible "E-post" fact row above — see
     // epostUnderReview's comment there (AC4).
-    if (provider.epost && !epostUnderReview) ld.email = provider.epost;
+    if (provider.epost && !epostUnderReview && emailShown) ld.email = provider.epost;
     // Machine signal must match reality: an InStock Offer pointing at /book
     // while booking is paused told agents a visit could be reserved, so a
     // paused page says nothing about booking. dev-request 2026-10-16-rfb-
@@ -6567,9 +6682,88 @@ ${switcherOn ? oaSiteFooter({ lang }) : oaSiteFooter({})}
 </html>`;
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
-    res.setHeader("Cache-Control", "public, max-age=300");
+    // Slice 4: with the guard on the page depends on the client → private.
+    res.setHeader("Cache-Control", emailView === null ? "public, max-age=300" : "private");
     recordAiPageDelivery(req, res, "ai_page_profile", [String(provider.id)], "experiences");
+    recordAiProfileClick(req, res, String(provider.id), "experiences");
     res.send(html);
+  },
+);
+
+// «Vis e-post» (slice 4, S-A1): read-only, no DB write. Only with
+// EMAIL_REVEAL_GUARD_EXPERIENCES on; off → next(), so the path answers exactly
+// as on main (the router's catch-all 404) and nothing new is exposed. On: the
+// same guard and experiences counter as the profile page. Within the limit →
+// 200 with the address; over it → 429 «prøv igjen senere» without it; CCBot →
+// 403 without it; a slug with no public profile (unknown, hidden, merged, test
+// producer) or no public e-mail (none stored, or under review — AC4) → 404.
+// Always Cache-Control: private and noindex. Four path segments, so it cannot
+// collide with the profile route or /kategori/:category/:kommune.
+router.get(
+  "/kategori/gardssalg/produsent/:providerSlug/epost",
+  (req: Request, res: Response, next: NextFunction) => {
+    if (!emailRevealGuardEnabled("experiences")) return next();
+    res.setHeader("Cache-Control", "private");
+    res.setHeader("X-Robots-Tag", "noindex, nofollow");
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    const slug = String(req.params.providerSlug || "");
+    const uiLang: Lang = isOpplevagentLangSwitcherEnabled() && (req.lang === "en" || req.lang === "sv") ? req.lang : "no";
+    const en = uiLang === "en";
+    const sv = uiLang === "sv";
+    try {
+      let provider: GardssalgProviderRow | null = null;
+      if (slug) {
+        ensureProviderSlugs();
+        provider = getGardssalgProviderBySlug(slug);
+      }
+      const email = provider ? gardssalgRevealableEmail(provider) : null;
+      const profilePath = localizedPath(`/kategori/gardssalg/produsent/${encodeURIComponent(slug)}`, uiLang);
+      const page = (title: string, body: string) => `<!doctype html>
+<html lang="${htmlLangAttr(uiLang)}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHtml(title)} | Opplevagent</title>
+<meta name="robots" content="noindex, nofollow">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+${pwaHeadTags()}
+<style>${BROWSE_CSS}${OA_CHROME_CSS}</style>
+</head>
+<body>
+<a class="skip-link" href="#main">${en ? "Skip to content" : sv ? "Hoppa till innehållet" : "Hopp til innhold"}</a>
+${oaSiteNav({ lang: uiLang })}
+<main id="main" class="container"><div class="head" style="padding:48px 0;max-width:720px"><h1>${escapeHtml(title)}</h1>${body}</div></main>
+${oaSiteFooter({ lang: uiLang })}
+</body>
+</html>`;
+      if (!provider || !email) {
+        const title = en ? "Not found" : sv ? "Hittades inte" : "Ikke funnet";
+        res.status(404).send(page(title, `<p><a href="${localizedPath("/kategori/gardssalg", uiLang)}">${en ? "Farm sales and tasting →" : sv ? "Gårdsförsäljning och provsmakning →" : "Gårdssalg og smaking →"}</a></p>`));
+        return;
+      }
+      const name = String(provider.navn || "");
+      const title = en ? `E-mail for ${name}` : sv ? `E-post till ${name}` : `E-post til ${name}`;
+      const back = `<p style="margin-top:20px"><a href="${escapeHtml(profilePath)}">&larr; ${en ? "Back to" : sv ? "Tillbaka till" : "Tilbake til"} ${escapeHtml(name)}</a></p>`;
+      const id = String(provider.id);
+      const allowed = revealEmailFor(req, "experiences", [id]);
+      if (allowed !== null && allowed.has(id)) {
+        res.status(200).send(page(title, `<p style="font-size:1.05rem"><a href="mailto:${escapeHtml(email)}">${escapeHtml(email)}</a></p>${back}`));
+        return;
+      }
+      if (isCcBotUserAgent(req.get("user-agent"))) {
+        res.status(403).send(page(title, `<p>${en ? "The e-mail address is not shown to this client." : sv ? "E-postadressen visas inte för den här klienten." : "E-postadressen vises ikke for denne klienten."}</p>${back}`));
+        return;
+      }
+      res.setHeader("Retry-After", "3600");
+      res.status(429).send(page(title, `<p>${en
+        ? "The limit for how many e-mail addresses can be shown from here has been reached. Please try again later, or contact the producer by phone or through their website."
+        : sv
+          ? "Gränsen för hur många e-postadresser som kan visas härifrån är nådd. Försök igen senare, eller kontakta producenten per telefon eller via webbplatsen."
+          : "Grensen for hvor mange e-postadresser som kan vises herfra, er nådd. Prøv igjen senere, eller kontakt produsenten på telefon eller via nettsiden."}</p>${back}`));
+    } catch (err) {
+      console.error("SEO /kategori/gardssalg/produsent/:providerSlug/epost error:", err instanceof Error ? err.message : String(err));
+      res.status(500).send(en ? "Internal error" : "Intern feil");
+    }
   },
 );
 
@@ -6608,6 +6802,9 @@ function bookingErrorMessage(code: string): string {
     // booking): plain "not activated" fact, no "coming soon" promise.
     case "paused":
       return BOOKING_NOT_ACTIVATED_INTEREST_MSG;
+    // «Mine valg» booking.pause (O1a): the owner is not taking requests now.
+    case "not_taking":
+      return GARDSSALG_NOT_TAKING_REQUESTS_TEXT.no;
     // dev-request 2026-07-14-booking-flyt-v1, slice 1 ("myk åpningstids-
     // validering"). The no-JS fallback has no natural place for a "resend
     // with confirmation" step (see the POST handler below for why this path
@@ -6683,9 +6880,14 @@ router.get(
     const panelClaimCta = provider.claimed_at == null
       ? ` Er dette din bedrift? <a href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}">Ta over profilen og aktiver booking</a>.`
       : "";
+    // «Mine valg» booking.pause (O1a): said up front, so the guest does not
+    // fill in a request that the POST below refuses.
+    const ownerPaused = !notLive && gardssalgBookingPausedByOwner(provider.id);
     const pausedNotice = notLive
       ? `<div class="notice-paused" role="status"><strong>Booking ikke aktivert</strong>${BOOKING_NOT_ACTIVATED_INTEREST_MSG}${panelClaimCta}</div>`
-      : "";
+      : ownerPaused
+        ? `<div class="notice-paused" role="status" data-owner-paused="1"><strong>Tar ikke imot forespørsler nå</strong>${escapeHtml(GARDSSALG_NOT_TAKING_REQUESTS_TEXT.no)}</div>`
+        : "";
 
     const html = `<!doctype html>
 <html lang="nb">
@@ -6854,6 +7056,13 @@ router.post(
     // producer notification when paused, full stop.
     if (isBookingPaused(provider.booking_live, provider.catalog_hidden, provider.is_test_provider)) {
       res.redirect(303, `${backTo}?error=paused`);
+      return;
+    }
+    // «Mine valg» booking.pause (dev-request 2026-10-22-opplevagent-mine-valg-
+    // gardssalg O1a): the owner's seasonal pause refuses the request with the
+    // not-taking line; the profile stays visible.
+    if (gardssalgBookingPausedByOwner(provider.id)) {
+      res.redirect(303, `${backTo}?error=not_taking`);
       return;
     }
 
@@ -7040,7 +7249,8 @@ ${BROWSE_CSS}
 // time-guarded via visitTimeReached() — "bekreft oppmøte" only after the
 // visit — while "angre" (undo, back to reserved) is always available so a
 // mis-click on «Ikke møtt» is never permanent (billable/commission hangs on
-// this). Confirmed attendance counts toward the commission base.
+// this). The page itself only says that attendance is registered, plus the
+// price message (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, O1b).
 const BEKREFT_STATUS_LABEL: Record<string, string> = {
   reserved: "Reservert — oppmøte ikke registrert ennå",
   confirmed_attended: "Oppmøte bekreftet",
@@ -7153,7 +7363,8 @@ ${BROWSE_CSS}
       ${booking.notes ? `<div><strong>Kommentar fra gjesten:</strong> ${escapeHtml(booking.notes)}</div>` : ""}
     </div>
     ${actionsHtml}
-    <p class="hint">Denne siden er for produsenten. Bekreftet oppmøte regnes med i provisjonsgrunnlaget; «Ikke møtt» holdes utenfor. Lenken er personlig for denne reservasjonen.</p>
+    <p class="hint">Denne siden er for produsenten. Oppmøtet blir registrert. Lenken er personlig for denne reservasjonen.</p>
+    <p class="hint" data-price-message="1">${escapeHtml(OPPLEVAGENT_PRICE_MESSAGE)}</p>
   </div>
 </main>
 </body>
@@ -9407,6 +9618,7 @@ router.get("/opplevelse/:slug", (req: Request, res: Response, next: NextFunction
   res.setHeader("Cache-Control", "public, max-age=300");
   if (noindex) res.setHeader("X-Robots-Tag", NOINDEX_FOLLOW);
   recordAiPageDelivery(req, res, "ai_page_profile", [exp.id], "experiences");
+  recordAiProfileClick(req, res, exp.id, "experiences");
   res.send(renderOpplevelseDetail(exp, provider, related, baseUrl(), req.lang, noindex));
 });
 
@@ -9903,8 +10115,34 @@ function forTilbydereSearchForm(currentQ: string): string {
   </div>`;
 }
 
+// The three ownership steps and the e-mail-verification note under them.
+// Shared by the old /for-tilbydere page and the sectioned page behind
+// FOR_TILBYDERE_FAQ_ENABLED (#ta-over), so the strings live in one place.
+// Interpolated at the same indentation as before, so the old page's HTML is
+// byte-identical.
+const FOR_TILBYDERE_STEPS_HTML = `<div class="ft-steps">
+      <div class="ft-step">
+        <span class="n" aria-hidden="true">1</span>
+        <h3>Finn profilen din</h3>
+        <p>Søk over, eller finn bedriften i katalogen. Hver produsent har en egen profilside på Opplevagent.</p>
+      </div>
+      <div class="ft-step">
+        <span class="n" aria-hidden="true">2</span>
+        <h3>Klikk «Er dette din bedrift?»</h3>
+        <p>På profilsiden finner du knappen «Er dette din bedrift?». Den starter overtakelsen — ingen registrering eller passord.</p>
+      </div>
+      <div class="ft-step">
+        <span class="n" aria-hidden="true">3</span>
+        <h3>Bekreft via e-post</h3>
+        <p>Vi sender en magisk innloggingslenke til adressen som er registrert for bedriften hos Brønnøysundregistrene eller på bedriftens egen nettside. Klikk lenken — ferdig verifisert.</p>
+      </div>
+    </div>`;
+const FOR_TILBYDERE_STEPS_NOTE_HTML = `<p style="font-size:.86rem;color:var(--mist);max-width:64ch">E-postverifiseringen er hele sikkerheten: bare den som har tilgang til bedriftens registrerte adresse kan ta eierskap. Har du ikke tilgang til den adressen, hjelper vi deg manuelt på <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>.</p>`;
+
 // Shared head/body shell for the two pages — S1 chrome composition, same
 // BROWSE_CSS-then-OA_CHROME_CSS order as renderGardssalgCatalogPage().
+// `extraCss` is appended right after FOR_TILBYDERE_CSS with no separator, so
+// a caller that omits it gets byte-identical HTML.
 function forTilbyderePage(opts: {
   title: string;
   metaDesc: string;
@@ -9912,6 +10150,7 @@ function forTilbyderePage(opts: {
   canonical: string;  // full <link rel="canonical" …> tag, or "" for none
   jsonLd: string;
   main: string;
+  extraCss?: string;
 }): string {
   return `<!doctype html>
 <html lang="no">
@@ -9928,7 +10167,7 @@ ${opts.jsonLd}
 <style>
 ${BROWSE_CSS}
 ${OA_CHROME_CSS}
-${FOR_TILBYDERE_CSS}
+${FOR_TILBYDERE_CSS}${opts.extraCss || ""}
 </style>
 </head>
 <body>
@@ -9942,7 +10181,117 @@ ${oaSiteFooter({})}
 </html>`;
 }
 
+// ─── «For tilbydere» with sections and FAQ (dev-request O4 = G4, slice O4a) ──
+// Served by GET /for-tilbydere only while FOR_TILBYDERE_FAQ_ENABLED is on
+// (default off: the page above is served unchanged). All the text is data in
+// experiences-for-tilbydere-faq.ts (one file for Daniel's text review); this
+// renderer escapes every string. The visible FAQ is read back out of the same
+// FAQPage object the JSON-LD serialises (faqPairsFromJsonLd), so markup and
+// text cannot drift. Accordion = <details>/<summary>, no JS, no inline
+// handlers. The clickable «Mine valg» demo is slice O4b.
+
+const FOR_TILBYDERE_FAQ_CSS = `
+  .ftf-menu{margin:18px 0 6px}
+  .ftf-menu ul{list-style:none;display:flex;flex-wrap:wrap;gap:8px;padding:0;margin:0}
+  .ftf-menu a{display:inline-block;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-pill);padding:6px 14px;font-size:.86rem;font-weight:600;color:var(--fjord-900)}
+  .ftf-menu a:hover{border-color:var(--fjord-800);text-decoration:none}
+  .ftf-sec{scroll-margin-top:80px}
+  .ftf-faq{margin:12px 0 0;max-width:64ch}
+  .ftf-qa{border-bottom:1px solid var(--line);padding:10px 0}
+  .ftf-qa summary{cursor:pointer;font-weight:700;color:var(--fjord-900)}
+  .ftf-qa p{margin-top:6px;font-size:.93rem;color:var(--ink-soft)}
+  .ftf-price{font-weight:600;color:var(--fjord-900)}
+`;
+
+/** Visible FAQ accordion; every question and answer is escaped. Exported for the escaping test. */
+export function renderForTilbydereFaqAccordion(pairs: readonly FaqPair[]): string {
+  if (pairs.length === 0) return "";
+  return `<div class="ftf-faq">${pairs
+    .map((p) => `<details class="ftf-qa"><summary>${escapeHtml(p.q)}</summary><p>${escapeHtml(p.a)}</p></details>`)
+    .join("")}</div>`;
+}
+
+function forTilbydereFaqSectionHtml(s: ForTilbydereSection, faqLd: object): string {
+  const h = `ftf-${s.id}-h`;
+  const paras = s.paragraphs.map((p) => `<p>${escapeHtml(p)}</p>`).join("\n    ");
+  const bullets = s.bullets && s.bullets.length
+    ? `<ul class="ft-edit-list">${s.bullets.map((b) => `<li>${escapeHtml(b)}</li>`).join("")}</ul>`
+    : "";
+  const links = (s.links || [])
+    .map((l) => `<p><a href="${escapeHtml(l.href)}">${escapeHtml(l.label)}</a></p>`)
+    .join("");
+  let extra = "";
+  if (s.id === "ta-over") {
+    extra = `${forTilbydereSearchForm("")}
+    ${FOR_TILBYDERE_STEPS_HTML}
+    ${FOR_TILBYDERE_STEPS_NOTE_HTML}`;
+  } else if (s.id === "sporsmal") {
+    extra = renderForTilbydereFaqAccordion(faqPairsFromJsonLd(faqLd));
+  }
+  // Daniel's «Prisbudskapet», verbatim from owner-features/price-message.ts.
+  const price = s.id === "pris" ? `<p class="ftf-price" data-price-message="1">${escapeHtml(OPPLEVAGENT_PRICE_MESSAGE)}</p>` : "";
+  const body = [price, paras, bullets, extra, links].filter((x) => x !== "").join("\n    ");
+  return `<section class="ft-section ftf-sec" id="${escapeHtml(s.id)}" aria-labelledby="${escapeHtml(h)}">
+    <h2 id="${escapeHtml(h)}">${escapeHtml(s.title)}</h2>
+    ${body}
+  </section>`;
+}
+
+/** The whole sectioned page (flag on). Exported for tests. */
+export function renderForTilbydereFaqPage(): string {
+  const url = baseUrl();
+  const canonical = `${url}/for-tilbydere`;
+  const M = FOR_TILBYDERE_FAQ_META;
+  const faqLd = buildForTilbydereFaqLd(canonical);
+  const jsonLd = [
+    {
+      "@context": "https://schema.org",
+      "@type": "WebPage",
+      name: M.webPageName,
+      description: M.metaDesc,
+      url: canonical,
+    },
+    {
+      "@context": "https://schema.org",
+      "@type": "BreadcrumbList",
+      itemListElement: [
+        { "@type": "ListItem", position: 1, name: "Forsiden", item: `${url}/` },
+        { "@type": "ListItem", position: 2, name: "For tilbydere", item: canonical },
+      ],
+    },
+    faqLd,
+  ]
+    .map((o) => jsonLdScriptTag(o))
+    .join("\n");
+  const menu = `<nav class="ftf-menu" aria-label="${escapeHtml(M.menuLabel)}"><ul>${FOR_TILBYDERE_SECTIONS
+    .map((s) => `<li><a href="#${escapeHtml(s.id)}">${escapeHtml(s.menu)}</a></li>`)
+    .join("")}</ul></nav>`;
+  const main = `
+  <nav class="breadcrumb" aria-label="Brødsmulesti"><a href="/">Forsiden</a> · For tilbydere</nav>
+  <header class="head ft-hero">
+    <h1>${escapeHtml(M.h1)}</h1>
+    <p class="lede">${escapeHtml(M.lede)}</p>
+  </header>
+  ${menu}
+  ${FOR_TILBYDERE_SECTIONS.map((s) => forTilbydereFaqSectionHtml(s, faqLd)).join("\n  ")}`;
+  return forTilbyderePage({
+    title: M.title,
+    metaDesc: M.metaDesc,
+    robotsMeta: `<meta name="robots" content="index, follow">`,
+    canonical: `<link rel="canonical" href="${canonical}">`,
+    jsonLd,
+    main,
+    extraCss: FOR_TILBYDERE_FAQ_CSS,
+  });
+}
+
 router.get("/for-tilbydere", (_req: Request, res: Response) => {
+  if (isForTilbydereFaqEnabled()) {
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.send(renderForTilbydereFaqPage());
+    return;
+  }
   const url = baseUrl();
   const canonical = `${url}/for-tilbydere`;
   const jsonLd = [
@@ -9980,24 +10329,8 @@ router.get("/for-tilbydere", (_req: Request, res: Response) => {
 
   <section class="ft-section" aria-labelledby="ft-steg-h">
     <h2 id="ft-steg-h">Slik tar du eierskap — tre steg</h2>
-    <div class="ft-steps">
-      <div class="ft-step">
-        <span class="n" aria-hidden="true">1</span>
-        <h3>Finn profilen din</h3>
-        <p>Søk over, eller finn bedriften i katalogen. Hver produsent har en egen profilside på Opplevagent.</p>
-      </div>
-      <div class="ft-step">
-        <span class="n" aria-hidden="true">2</span>
-        <h3>Klikk «Er dette din bedrift?»</h3>
-        <p>På profilsiden finner du knappen «Er dette din bedrift?». Den starter overtakelsen — ingen registrering eller passord.</p>
-      </div>
-      <div class="ft-step">
-        <span class="n" aria-hidden="true">3</span>
-        <h3>Bekreft via e-post</h3>
-        <p>Vi sender en magisk innloggingslenke til adressen som er registrert for bedriften hos Brønnøysundregistrene eller på bedriftens egen nettside. Klikk lenken — ferdig verifisert.</p>
-      </div>
-    </div>
-    <p style="font-size:.86rem;color:var(--mist);max-width:64ch">E-postverifiseringen er hele sikkerheten: bare den som har tilgang til bedriftens registrerte adresse kan ta eierskap. Har du ikke tilgang til den adressen, hjelper vi deg manuelt på <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>.</p>
+    ${FOR_TILBYDERE_STEPS_HTML}
+    ${FOR_TILBYDERE_STEPS_NOTE_HTML}
   </section>
 
   <section class="ft-section" aria-labelledby="ft-rediger-h">
@@ -10124,7 +10457,7 @@ router.get("/slik-fungerer-det", (_req: Request, res: Response) => {
       <li><b>2. Dere får forespørselen</b><span>På e-posten deres, med navn, tidspunkt og antall.</span></li>
       <li><b>3. Dere bekrefter selv</b><span>Ingenting er avtalt før dere har sagt ja. Dere kan foreslå et annet tidspunkt eller avslå.</span></li>
     </ol>
-    <div class="sf-note"><b>Det koster ingenting.</b> Verken profilen, overtakelsen eller påmeldingene. Vi tar ikke betalt fra gjesten og tar ingen andel av et salg — Opplevagent håndterer ikke betaling i det hele tatt, og selger ikke alkohol. Systemet avtaler et besøk; alt annet skjer hos dere.</div>
+    <div class="sf-note" data-price-message="1"><b>Hva koster det?</b> ${escapeHtml(OPPLEVAGENT_PRICE_MESSAGE)} Vi tar ikke betalt fra gjesten — Opplevagent håndterer ikke betaling i det hele tatt, og selger ikke alkohol. Systemet avtaler et besøk; alt annet skjer hos dere.</div>
   </section>
 
   <section class="ft-section" aria-labelledby="sf-lov-h">

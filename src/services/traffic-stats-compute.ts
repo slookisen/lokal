@@ -26,6 +26,9 @@ import { computeTrafficReport } from "./traffic-report";
 import { getRetentionWindowDays } from "./retention-window";
 import { computeQueryStats } from "./admin-stats-compute";
 import { computeAiDeliveries } from "./profile-ai-deliveries-compute";
+import { computeTrafficYear, type TrafficYear } from "./traffic-year-compute";
+
+export type { TrafficYear, TrafficYearCount } from "./traffic-year-compute";
 
 export interface TrafficStats {
   pageViews: number;
@@ -74,6 +77,13 @@ export interface TrafficStats {
   /** @deprecated old aggregate: aiSearchViews + botViews + aiQueries. */
   botAndAi: number;
   aiQueries: number;
+  /**
+   * The public 12-month block (dev-request 2026-10-22-statistikk-samme-tall-12-mnd,
+   * S2): the strips' five numbers with their start dates, from the stored
+   * daily sums (traffic-year-compute.ts). The fields above keep their
+   * 60-day meaning. null when it could not be computed (never shown as 0).
+   */
+  year: TrafficYear | null;
 }
 
 // The runtime retention window (RFB_AUTO_PRUNE_DAYS, default 60): moved to
@@ -98,6 +108,7 @@ export function emptyTrafficStats(windowDays: number = getRetentionWindowDays())
     realHumans: 0,
     botAndAi: 0,
     aiQueries: 0,
+    year: null,
   };
 }
 
@@ -136,6 +147,15 @@ export function computeTrafficStats(
   // S7 (Daniel 2026-10-14): «AI-søk» also counts AI agents' lookups over MCP/A2A.
   const aiLookups = q.aiLookups?.total ?? 0;
 
+  // The 12-month block reads stored day rows plus the raw rows after the last
+  // stored day; a failure there must not take the 60-day numbers with it.
+  let year: TrafficYear | null = null;
+  try {
+    year = computeTrafficYear(db, vertical, nowMs);
+  } catch {
+    year = null;
+  }
+
   return {
     pageViews: report.totals.views,
     uniqueVisitors: report.totals.visitors,
@@ -153,5 +173,6 @@ export function computeTrafficStats(
     realHumans: humanViews,
     botAndAi: aiSearchViews + botViews + aiQueries,
     aiQueries,
+    year,
   };
 }

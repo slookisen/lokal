@@ -29,25 +29,25 @@ const server = new McpServer({
   name: "lokal",
   version: "0.11.0",
   description: "Local food marketplace for Norway — search 350+ farms, shops and producers. " +
-    "Find fresh vegetables, organic produce, meat, fish, dairy, honey, bread and more. " +
+    "Find fresh vegetables, fruit, meat, fish, dairy, honey, bread and more. " +
     "A2A-compatible agent marketplace. Lokal mat-markedsplass for Norge.",
 });
 
 // ─── Tool 1: Search (Natural Language) ──────────────────────
 // The most important tool. Users say things like:
 //   "finn ferske grønnsaker nær Grünerløkka"
-//   "økologisk honning i Oslo"
+//   "honning i Oslo"
 //   "hvor kan jeg kjøpe egg lokalt?"
 
 server.tool(
   "lokal_search",
   "Search for local food in Norway using natural language. Supports Norwegian and English. " +
-  "Find fresh vegetables, organic produce, meat, fish, dairy, honey, bread, berries, eggs, and herbs " +
+  "Find fresh vegetables, fruit, meat, fish, dairy, honey, bread, berries, eggs, and herbs " +
   "from 350+ local farms and producers across Oslo, Bergen, Trondheim, and more. " +
   "USE THIS FOR PROXIMITY / 'near me' / 'nær meg' QUESTIONS: if you know the user's coordinates, " +
   "pass lat + lng (and optionally radius_km) and results are filtered and ranked by real distance; " +
   "query may then be empty. " +
-  "Examples: 'fresh vegetables near Grünerløkka', 'organic honey Oslo', 'local eggs'.",
+  "Examples: 'fresh vegetables near Grünerløkka', 'honey Oslo', 'local eggs'.",
   {
     query: z.string().default("").describe("Naturlig språk søk etter lokal mat (norsk eller engelsk). Kan være tom når lat/lng er oppgitt."),
     lat: z.number().min(-90).max(90).optional().describe("Brukerens breddegrad (WGS84) for nærhetssøk"),
@@ -131,11 +131,11 @@ server.tool(
   "lokal_discover",
   "Structured search in the Lokal food agent registry. Filter by food categories " +
   "(vegetables, fruit, honey, dairy, eggs, meat, fish, bread, berries, herbs), " +
-  "tags (organic, seasonal, fresh, local, budget), agent role, and geographic distance. " +
+  "tags (seasonal, fresh, local, budget; \"organic\" matches only Debio-approved producers from Debio's public register), agent role, and geographic distance. " +
   "Returns ranked agents with trust scores and A2A endpoints.",
   {
     categories: z.array(z.string()).optional().describe("Kategorier: vegetables, fruit, berries, dairy, eggs, meat, fish, bread, honey, herbs"),
-    tags: z.array(z.string()).optional().describe("Tags: organic, seasonal, budget, local, fresh"),
+    tags: z.array(z.string()).optional().describe("Tags: seasonal, budget, local, fresh. The tag \"organic\" matches only Debio-approved producers (from Debio's public register)."),
     role: z.enum(["producer", "consumer", "logistics", "quality", "price-intel"]).default("producer").describe("Agentrolle"),
     lat: z.number().optional().describe("Breddegrad for avstandsfilter"),
     lng: z.number().optional().describe("Lengdegrad for avstandsfilter"),
@@ -249,7 +249,7 @@ server.tool(
     url: z.string().url().describe("Agentens URL/endepunkt"),
     role: z.enum(["producer", "consumer", "logistics", "quality", "price-intel"]).describe("Agentrolle"),
     categories: z.array(z.string()).describe("Kategorier: vegetables, fruit, honey, etc."),
-    tags: z.array(z.string()).describe("Tags: organic, local, fresh, etc."),
+    tags: z.array(z.string()).describe("Tags: local, fresh, seasonal, etc."),
     city: z.string().default("Oslo").describe("By"),
     lat: z.number().optional().describe("Breddegrad"),
     lng: z.number().optional().describe("Lengdegrad"),

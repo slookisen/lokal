@@ -39,10 +39,12 @@ import {
   fireTextFor,
   resolveActiveWindowHour,
   resolveWindowMin,
+  resolveFinishedLookbackMin,
   DEFAULT_ALLOWLIST,
   type DispatchPlan,
 } from "../services/loop-dispatch";
 import type { RunEnvelope } from "../types/run-envelope";
+import { emailService } from "../services/email-service";
 
 const router = Router();
 
@@ -206,8 +208,7 @@ async function fireRoutine(
   }
 }
 
-function planNow(): DispatchPlan {
-  const runs = listRecentRuns({ sinceHours: 1, limit: 500 });
+export function planNow(): DispatchPlan {
   // dev-requests/2026-07-08-spine-24-7-active-window.md: default 0/24 (24/7) so the
   // spine fires whenever there's fresh next_suggested work, day or night. computeWakeList's
   // own internal defaults (5/21) stay untouched for other callers/tests; only this route's
@@ -220,6 +221,15 @@ function planNow(): DispatchPlan {
   // budget. Same env-knob pattern as the active window: pure default stays 12,
   // DISPATCH_WINDOW_MIN restores the old behavior without a code revert.
   const windowMin = resolveWindowMin(process.env.DISPATCH_WINDOW_MIN);
+  // computeWakeList's freshness is finished_at-based, but listRecentRuns filters on
+  // started_at: a run that started >1h ago and finished recently was invisible, so its
+  // next_suggested never fired. finishedSinceMinutes adds `OR finished_at >= now-N`.
+  // DISPATCH_PLAN_FINISHED_LOOKBACK_MIN=0 turns it off (rollback without deploy).
+  const finishedSinceMinutes = resolveFinishedLookbackMin(
+    process.env.DISPATCH_PLAN_FINISHED_LOOKBACK_MIN,
+    windowMin,
+  );
+  const runs = listRecentRuns({ sinceHours: 1, finishedSinceMinutes, limit: 500 });
   const { map: routines } = parseRoutines();
   return computeWakeList(
     runs.map((r) => ({
@@ -238,6 +248,124 @@ function planNow(): DispatchPlan {
       fireable: Object.keys(routines),
     },
   );
+}
+
+// ── P0 alert at first /fire 401/403 per agent per UTC day ──────────────────────
+// dev-requests/2026-10-30-fire-feil-detektor-og-varsel-ved-4xx.md (slice 2): in
+// Sept-Oct 2026 /fire for experiences-enrichment returned 401 "Token is not
+// authorized for this routine" 158 times over 41 days and nobody noticed — the
+// FIRE-FAILURES note only lives in the dispatcher's own envelope. The dispatcher
+// now e-mails ONE P0 alert (existing admin channel, ADMIN_NOTIFICATION_EMAIL) at
+// the first 401/403 per agent per UTC day. Other statuses (5xx, 0/network, 429,
+// other 4xx) do not alert. Dedup is durable: alerted agents are recorded in the
+// dispatcher envelope's `wakes_failed` claim meta (`alerted: [...]`) and read back
+// from the run-ledger, so a process restart does not re-alert. If the ledger read
+// fails we fall back to an in-memory set (at most once per process/agent/day).
+
+type FireAlertSendFn = (opts: {
+  to: string;
+  subject: string;
+  textContent: string;
+  omitAgentHeader?: boolean;
+}) => Promise<{ success: boolean; messageId?: string; error?: string }>;
+let _fireAlertSendOverride: FireAlertSendFn | null = null;
+export function __setFireAlertSendForTesting(fn: FireAlertSendFn | null): void {
+  _fireAlertSendOverride = fn;
+}
+/** In-memory fast path / ledger-failure fallback: `${utcDay}|${agent}`. */
+const _alertedInMemory = new Set<string>();
+export function __resetFireAlertStateForTesting(): void {
+  _alertedInMemory.clear();
+}
+
+export function utcDayOf(d: Date | number | string): string {
+  return new Date(d).toISOString().slice(0, 10);
+}
+
+/** Pure: agents whose /fire returned 401/403 and that were not yet alerted today (deduped, order kept). */
+export function selectFireAuthAlerts(
+  fired: ReadonlyArray<{ agent: string; ok: boolean; status: number }>,
+  alreadyAlertedToday: ReadonlySet<string>,
+): string[] {
+  const out: string[] = [];
+  for (const f of fired) {
+    if (f.ok || (f.status !== 401 && f.status !== 403)) continue;
+    if (alreadyAlertedToday.has(f.agent) || out.includes(f.agent)) continue;
+    out.push(f.agent);
+  }
+  return out;
+}
+
+/** Pure: agents already alerted on the UTC day of `now`, from loop-dispatcher ledger runs. */
+export function alertedTodayFromRuns(
+  runs: ReadonlyArray<{
+    agent: string;
+    started_at: string;
+    finished_at?: string | null;
+    claims?: ReadonlyArray<{ meta?: Record<string, unknown> | null }>;
+  }>,
+  now: Date | number = Date.now(),
+): Set<string> {
+  const today = utcDayOf(now);
+  const out = new Set<string>();
+  for (const r of runs) {
+    if (r.agent !== "loop-dispatcher") continue;
+    if (utcDayOf(r.finished_at || r.started_at) !== today) continue;
+    for (const c of r.claims ?? []) {
+      const a = c?.meta?.alerted;
+      if (c?.meta?.kind === "wakes_failed" && Array.isArray(a)) {
+        for (const x of a) if (typeof x === "string") out.add(x);
+      }
+    }
+  }
+  return out;
+}
+
+function alertedToday(now: Date): Set<string> {
+  const day = utcDayOf(now);
+  const set = new Set<string>();
+  for (const k of _alertedInMemory) if (k.startsWith(`${day}|`)) set.add(k.slice(day.length + 1));
+  try {
+    const runs = listRecentRuns({ agent: "loop-dispatcher", sinceHours: 26, limit: 500 });
+    for (const a of alertedTodayFromRuns(runs, now)) set.add(a);
+  } catch {
+    /* ledger unreadable: in-memory set alone bounds this to once per process/agent/day */
+  }
+  return set;
+}
+
+/** Best-effort: e-mail one P0 alert per agent. Never throws. Returns agents actually e-mailed. */
+async function sendFireAuthAlerts(
+  agents: string[],
+  fired: ReadonlyArray<DispatchFired>,
+  now: Date,
+): Promise<string[]> {
+  const sent: string[] = [];
+  for (const agent of agents) {
+    try {
+      const f = fired.find((x) => x.agent === agent && !x.ok);
+      const status = f?.status ?? 0;
+      const subject = `[P0] loop-dispatch: /fire HTTP${status} for ${agent}`;
+      const text = [
+        `Agent: ${agent}`,
+        `Status: HTTP${status}`,
+        `Detail: ${(f?.detail ?? "").slice(0, 200)}`,
+        `Time (UTC): ${now.toISOString()}`,
+        "",
+        "The routine's FIRE token is likely revoked/expired; only Daniel can re-issue it (claude.ai/code/routines).",
+        "Further 401/403 for this agent today will not alert again.",
+      ].join("\n");
+      console.error(`[loop-dispatch] P0 ALERT ${subject}`);
+      const to = (process.env.ADMIN_NOTIFICATION_EMAIL || "").trim();
+      if (!to) continue;
+      const send: FireAlertSendFn = _fireAlertSendOverride ?? ((o) => emailService.sendEmail(o));
+      const res = await send({ to, subject, textContent: text, omitAgentHeader: true });
+      if (res?.success) sent.push(agent);
+    } catch (err) {
+      console.error("[loop-dispatch] P0 alert send failed:", err);
+    }
+  }
+  return sent;
 }
 
 /** One fired-wake attempt (routine /fire call outcome). */
@@ -345,6 +473,17 @@ export async function runDispatchTick(mode: "shadow" | "active"): Promise<Dispat
         .map((f) => `${f.agent}=HTTP${f.status}${f.detail ? ` ${f.detail.slice(0, 100)}` : ""}`)
         .join("; ")}`
     : "";
+  // Slice 2 (see comment block above): decide which agents get a first-401/403 P0 alert today.
+  // The marker is recorded in the envelope claim meta BEFORE the e-mail goes out so the
+  // envelope record is never delayed or skipped by the alert.
+  let alertAgents: string[] = [];
+  try {
+    alertAgents = selectFireAuthAlerts(fired, alertedToday(new Date()));
+    const day = utcDayOf(new Date());
+    for (const a of alertAgents) _alertedInMemory.add(`${day}|${a}`);
+  } catch {
+    alertAgents = [];
+  }
   const finishedAt = new Date().toISOString();
   const envelope: RunEnvelope = {
     run_id: `run-${finishedAt.replace(/[:.]/g, "-")}-loop-dispatcher-fly`,
@@ -368,6 +507,7 @@ export async function runDispatchTick(mode: "shadow" | "active"): Promise<Dispat
               meta: {
                 kind: "wakes_failed",
                 statuses: firedFailed.map((f) => ({ agent: f.agent, status: f.status })),
+                ...(alertAgents.length ? { alerted: alertAgents } : {}),
               },
             },
           ]
@@ -390,6 +530,13 @@ export async function runDispatchTick(mode: "shadow" | "active"): Promise<Dispat
       recordRun(envelope);
     } catch {
       /* best-effort — the dispatch already happened */
+    }
+  }
+  if (alertAgents.length > 0) {
+    try {
+      await sendFireAuthAlerts(alertAgents, fired, new Date());
+    } catch {
+      /* best-effort — an alert failure must never break the tick */
     }
   }
 

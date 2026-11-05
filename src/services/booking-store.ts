@@ -15,6 +15,7 @@ import { z } from "zod";
 import { getDb } from "../database/db-factory";
 import { emailService } from "./email-service";
 import { crmFromHeader } from "./crm-platform-identity";
+import { tokenLogLabel } from "../utils/log-label";
 
 const VERTICAL = "experiences";
 const APP_URL = process.env.APP_URL || "https://opplevagent.no";
@@ -561,8 +562,9 @@ ${statusUrl ? `<p>Du kan når som helst se gjeldende status her: <a href="${stat
     ],
   });
 
-  // Producer confirm link — logged so Daniel can verify manually
-  console.log(`[booking] ${booking.booking_ref} confirm_url=${confirmUrl}`);
+  // Producer confirm link sent. Never log the URL itself: it carries the
+  // producer's confirm_token (T1, eierportal bølge 0) — log a hash label.
+  console.log(`[booking] ${booking.booking_ref} confirm link sent (token ${tokenLogLabel(booking.confirm_token)})`);
 }
 
 // ─── Producer notification email (dev-request 2026-07-12-gardssalg-dark-

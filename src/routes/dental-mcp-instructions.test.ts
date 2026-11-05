@@ -163,7 +163,8 @@ const BARE_FLAG_WORDS = /\b(flagged|null)\b/i;
  * and tannlege_info's description on purpose. A change to any other name, title, description, inputSchema,
  * annotations or execution needs its own dev-request and a new value here.
  */
-const TOOLS_LIST_REST_SHA256 = "7e8f058d618a2511aa1fe9c6ebf8e97d52544d6339c6abc25ca56ca2bd57b386";
+// 2026-10-25 (A2A dev-request 2026-10-23-dental-mcp-openworldhint-true): openWorldHint true -> false on tannlege_search, tannlege_info and tannlege_akutt (as lokal#916 did for RFB/Opplevagent); both pins below moved for that reason only.
+const TOOLS_LIST_REST_SHA256 = "5af8c097e1d689acf391b64f3d612e32381d21684a5b7f62ae1a315983316c9c";
 
 /**
  * sha256 of `{ tools }` (the tools/list result) as served: the hash the live checks compare, whose first 12
@@ -172,13 +173,13 @@ const TOOLS_LIST_REST_SHA256 = "7e8f058d618a2511aa1fe9c6ebf8e97d52544d6339c6abc2
  * tannlege_stats' description («(akuttvakt)» → «(akutt)»), which D10b leaves out, so D10b holds and this moves.
  * Every change to the dental tools/list changes it, so it gets a new value here.
  */
-const TOOLS_LIST_SHA256 = "c57aed91e529ad5bc766403dc31c5d9e23634e6b63675c0f2b73fd6cfa173923";
+const TOOLS_LIST_SHA256 = "987132e422f5866786ab4dd36700a33335d30a7c13430d11eb6df618bfe2e9ce";
 
 /** title, annotations and inputSchema of the two tools D3a edits, as tools/list serves them (D10); tannlege_akutt's titles are G3-S6d's. */
 const LOCKED_TOOL_FIELDS: Record<string, unknown> = {
   tannlege_akutt: {
     title: "Find dental clinics for emergency care in Norway",
-    annotations: { title: "Find dental clinics for emergency care", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    annotations: { title: "Find dental clinics for emergency care", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: {
       $schema: "http://json-schema.org/draft-07/schema#", type: "object",
       properties: { fylke: { description: "Limit to clinics in this county. Examples: 'Oslo', 'Vestland'", type: "string" } },
@@ -355,7 +356,7 @@ export async function runDentalMcpInstructionsTests(opts: { log?: boolean } = {}
       eq(createHash("sha256").update(JSON.stringify(rest)).digest("hex"), TOOLS_LIST_REST_SHA256,
         "D10b: apart from the two descriptions, tools/list is byte-identical to its pinned baseline (G3-S6d)");
       eq(createHash("sha256").update(JSON.stringify({ tools })).digest("hex"), TOOLS_LIST_SHA256,
-        "D10c: the whole tools/list is the pinned F1-S4e baseline (c57aed91e529)");
+        "D10c: the whole tools/list is the pinned F1-S4e baseline (987132e422f5)");
 
       // D11–D13 (G3-S6d): every dental text that describes the claim says it as F1-S4c made it.
       const schemaTexts = (t: Record<string, any>): string[] =>

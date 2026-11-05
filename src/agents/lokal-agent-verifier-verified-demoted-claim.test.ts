@@ -190,6 +190,53 @@ export function runLokalAgentVerifierVerifiedDemotedClaimTests(
     assertEq(findClaim(mixedEnvelope, "agents_reverified")?.value, 3, "c5-e2: agents_reverified = 3");
     assertEq(findClaim(mixedEnvelope, "agents_verified")?.value, 5, "c5-e3: agents_verified stays 5");
 
+    // ── review_required re-evaluation claims (dev-request
+    // 2026-09-15-review-required-koen-promoteres-ikke-aarsak-usynlig, AC2/AC3):
+    // reevaluated counts every review_required-origin row; promoted only
+    // those that reached verified. ──────────────────────────────────────────
+    const rrResults: VerifierResult[] = [
+      makeResult({ agent_id: "rr-up", prior_verification_status: "review_required", new_verification_status: "verified" }),
+      makeResult({ agent_id: "rr-up-2", prior_verification_status: "review_required", new_verification_status: "verified" }),
+      makeResult({ agent_id: "rr-stay", prior_verification_status: "review_required", new_verification_status: "review_required" }),
+      makeResult({ agent_id: "rr-down", prior_verification_status: "review_required", new_verification_status: "data_insufficient" }),
+      // not review_required-origin: reaches verified, must count in neither
+      makeResult({ agent_id: "pv-up", prior_verification_status: "pending_verify", new_verification_status: "verified" }),
+      // demoted INTO review_required: not a re-evaluation of a review_required row
+      makeResult({ agent_id: "v-down", prior_verification_status: "verified", new_verification_status: "review_required" }),
+    ];
+    const rrEnvelope = buildRunEnvelope({
+      run_id: "run-rr",
+      started_at: "2026-10-31T00:00:00.000Z",
+      finished_at: "2026-10-31T00:01:00.000Z",
+      results: rrResults,
+    });
+    const rrRe = findClaim(rrEnvelope, "review_required_reevaluated");
+    const rrPro = findClaim(rrEnvelope, "review_required_promoted");
+    assertTrue(!!rrRe, "rr-01: buildRunEnvelope includes the review_required_reevaluated claim");
+    assertTrue(!!rrPro, "rr-02: buildRunEnvelope includes the review_required_promoted claim");
+    assertEq(rrRe?.value, 4, `rr-03: four review_required-origin rows re-evaluated (got ${rrRe?.value})`);
+    assertEq(rrPro?.value, 2, `rr-04: two review_required-origin rows promoted to verified (got ${rrPro?.value})`);
+    assertEq((rrEnvelope as any).claims.filter((c: any) => c.meta?.kind === "review_required_reevaluated").length, 1,
+      "rr-05: review_required_reevaluated emitted exactly once");
+
+    // zero review_required-origin rows -> both claims present with value 0
+    const rrZero = buildRunEnvelope({
+      run_id: "run-rr-zero",
+      started_at: "2026-10-31T00:00:00.000Z",
+      finished_at: "2026-10-31T00:01:00.000Z",
+      results: mixed,
+    });
+    assertEq(findClaim(rrZero, "review_required_reevaluated")?.value, 0, "rr-06: reevaluated is 0 (not omitted) with no review_required-origin rows");
+    assertEq(findClaim(rrZero, "review_required_promoted")?.value, 0, "rr-07: promoted is 0 (not omitted) with no review_required-origin rows");
+    const rrEmpty = buildRunEnvelope({
+      run_id: "run-rr-empty",
+      started_at: "2026-10-31T00:00:00.000Z",
+      finished_at: "2026-10-31T00:01:00.000Z",
+      results: [],
+    });
+    assertEq(findClaim(rrEmpty, "review_required_reevaluated")?.value, 0, "rr-08: reevaluated is 0 on an empty batch");
+    assertEq(findClaim(rrEmpty, "review_required_promoted")?.value, 0, "rr-09: promoted is 0 on an empty batch");
+
     return { passed, failed, failures };
   })();
 }

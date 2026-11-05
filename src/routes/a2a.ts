@@ -14,10 +14,13 @@ import {
 } from "../services/a2a-traffic-classifier";
 import { hashIP } from "../services/analytics-service";
 import { discoveryService } from "../services/discovery-service";
-import { knowledgeService, relabelCertifications, productEntries } from "../services/knowledge-service";
+import { knowledgeService, relabelCertifications, productEntries, parseProductPrice } from "../services/knowledge-service";
+import { catalogNameNorm, softStockByNameNorm, stockSoftExpiryBuyerTextNb } from "../services/stock-soft-expiry";
+import { stripOrganicEntries } from "../services/organic-claims";
+import { textEntries } from "../utils/text-entries";
 import { redactPII } from "../utils/pii-redact";
 import { getDb } from "../database/init";
-import { isAgentIdPubliclyVisible } from "../services/agent-visibility";
+import { isAgentIdPubliclyVisible, isDelistedAgentId, ownerHidesAgent } from "../services/agent-visibility";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
 import { signAgentCard, getJWKS } from "../services/agent-card-signing";
@@ -29,7 +32,19 @@ import { a2aMessageData, capA2aData } from "../utils/a2a-message";
 import { capFreeText } from "../utils/free-text";
 import { logInternalError, rpcInternalErrorReply } from "../utils/internal-error";
 import { searchCountable } from "../services/search-tracking";
+import { publicAgentInfo, publicFieldChoices } from "../owner-features/enforce";
 import { readSearchText, geocodeSearchPlace, discoveryQueryOf, outsideNorwayText, noProductMatchText } from "../services/rfb-search-reading";
+import {
+  isOrderAgentActionsEnabled,
+  orderIdForTaskRequest,
+  getOrderTask,
+  cancelOrderTask,
+  managePickupOrderSkill,
+  rfbJsonRpcMethods,
+  A2A_TASK_NOT_FOUND,
+  A2A_TASK_NOT_CANCELABLE,
+  type OrderTaskRpcResult,
+} from "../services/order-a2a-task";
 
 // ─── A2A Routes ──────────────────────────────────────────────
 // Two protocols served here:
@@ -159,13 +174,15 @@ router.get("/a2a", (_req: Request, res: Response) => {
       },
       security: [],
       interfaces: [
-        { type: "json-rpc", url: `${process.env.BASE_URL || "https://rettfrabonden.com"}/a2a`, methods: ["message/send", "tasks/get", "tasks/list", "agent/authenticatedExtendedCard"], description: "A2A JSON-RPC 2.0 endpoint" },
+        { type: "json-rpc", url: `${process.env.BASE_URL || "https://rettfrabonden.com"}/a2a`, methods: rfbJsonRpcMethods(), description: "A2A JSON-RPC 2.0 endpoint" },
         { type: "rest", url: `${process.env.BASE_URL || "https://rettfrabonden.com"}/api/marketplace`, description: "REST API for search, discovery, registration" },
       ],
       skills: [
-        { id: "discover-local-food-agents", name: "Discover Local Food Agents", description: `Search ${agents.length}+ verified local food producers in Norway`, tags: ["local food", "organic", "farm direct", "Norway"], examples: ["Find organic farms near Oslo", "finn grønnsaker i Bergen"] },
+        { id: "discover-local-food-agents", name: "Discover Local Food Agents", description: `Search ${agents.length}+ verified local food producers in Norway`, tags: ["local food", "farm direct", "Norway"], examples: ["Find farms near Oslo", "finn grønnsaker i Bergen"] },
         { id: "agent-conversation", name: "Start Agent Negotiation", description: "Initiate buyer-seller conversation between agents", tags: ["negotiate", "order", "transaction"], examples: ["negotiate delivery of tomatoes"] },
         { id: "build-shopping-cart", name: "Build a shopping cart", description: `Cart and order flow is available via the MCP server (POST /mcp): find offers with lokal_find_offers, then lokal_cart_create, lokal_cart_add_item, lokal_cart_view and lokal_cart_submit (${isPaymentsEnabled() ? "pickup order; producers that take prepayment return a Stripe payment link the buyer approves themselves, the others are paid at pickup" : "pickup order, no payment"}). Not available through message/send on /a2a.`, tags: ["cart", "order", "local food", "pickup", "mcp"], examples: ["MCP tools/call lokal_find_offers {items: [\"potet\"], near: \"Oslo\"}", "MCP tools/call lokal_cart_create"] },
+        // Fase B3 (mine ordrer): only with ORDER_AGENT_ACTIONS_ENABLED on; off, the card is unchanged.
+        ...(isOrderAgentActionsEnabled() ? [managePickupOrderSkill()] : []),
       ],
       "x-lokal": { type: "registry", region: "Norway", stats: { totalAgents: agents.length, cities: cities.slice(0, 30) } },
     };
@@ -229,6 +246,18 @@ router.post("/a2a", (req: Request, res: Response) => {
       case "tasks/list":
       case "ListTasks": // A2A v1.0
         handleTasksList(params, id, res);
+        break;
+      case "tasks/cancel":
+      case "CancelTask": // A2A v1.0
+        // Fase B3: only the buyer's pickup order can be cancelled, and only
+        // with ORDER_AGENT_ACTIONS_ENABLED on. Off: "Method not found" as before.
+        if (!isOrderAgentActionsEnabled()) {
+          res.json({ jsonrpc: "2.0", error: { code: -32601, message: `Method not found: ${method}` }, id });
+          break;
+        }
+        handleTasksCancel(params, id, res).catch((err) => {
+          if (!res.headersSent) res.json(rpcInternalError(id, "POST /a2a tasks/cancel", err));
+        });
         break;
       case "agent/authenticatedExtendedCard":
         handleExtendedCard(params, id, req, res);
@@ -462,7 +491,7 @@ async function handleMessageSend(params: any, id: any, req: Request, res: Respon
     // the producers there are no matches, nor counted as discovered.
     const discoverMeta: DiscoverMeta = {};
     const found = hasIntent && !outsideNorway
-      ? marketplaceRegistry.discover(query, discoverMeta, { trackDiscovery: countable, countUnmatched: false })
+      ? marketplaceRegistry.discover(query, discoverMeta, { trackDiscovery: countable, countUnmatched: false, audience: "ai" })
       : [];
     const unmatchedTerms = discoverMeta.unmatchedTerms;
     const results = unmatchedTerms ? [] : found;
@@ -594,10 +623,32 @@ async function handleMessageSend(params: any, id: any, req: Request, res: Respon
 // Check the status of a previously submitted task.
 // Part of the A2A task lifecycle (Gap 7 fix).
 
-function handleTasksGet(params: any, id: any, res: Response) {
+function taskIdOf(params: any): any {
   // v1.0 GetTask may address the task by resource name "tasks/<id>".
-  const taskId = params?.taskId || params?.id
+  return params?.taskId || params?.id
     || (typeof params?.name === "string" ? params.name.replace(/^tasks\//, "") : undefined);
+}
+
+function marketplaceTaskExists(taskId: string): boolean {
+  return !!marketplaceRegistry.getTask(taskId);
+}
+
+function sendOrderTaskReply(r: OrderTaskRpcResult, id: any, res: Response): void {
+  res.json("error" in r ? { jsonrpc: "2.0", error: r.error, id } : { jsonrpc: "2.0", result: r.result, id });
+}
+
+function handleTasksGet(params: any, id: any, res: Response) {
+  const taskId = taskIdOf(params);
+  // Fase B3: with ORDER_AGENT_ACTIONS_ENABLED on, an order id ("order:<id>",
+  // or the bare id with metadata.buyer_ref and no marketplace task of that id)
+  // is the buyer's pickup order. Off, or any other id: unchanged.
+  if (typeof taskId === "string" && taskId && isOrderAgentActionsEnabled()) {
+    const orderId = orderIdForTaskRequest(taskId, params, marketplaceTaskExists);
+    if (orderId !== null) {
+      sendOrderTaskReply(getOrderTask(orderId, params), id, res);
+      return;
+    }
+  }
   if (!taskId) {
     res.json({
       jsonrpc: "2.0",
@@ -622,6 +673,28 @@ function handleTasksGet(params: any, id: any, res: Response) {
     result: { task: toA2ATask(task) },
     id,
   });
+}
+
+// ─── tasks/cancel (Fase B3) ──────────────────────────────────
+// Only reached with ORDER_AGENT_ACTIONS_ENABLED on. A pickup order: the
+// buyer's withdraw / cancel through the shared order-action layer (channel
+// 'a2a'). A marketplace task finishes inside message/send, so it cannot be
+// cancelled.
+
+async function handleTasksCancel(params: any, id: any, res: Response) {
+  const taskId = taskIdOf(params);
+  if (typeof taskId !== "string" || !taskId) {
+    res.json({ jsonrpc: "2.0", error: { code: -32602, message: "Invalid params: 'taskId' required" }, id });
+    return;
+  }
+  const orderId = orderIdForTaskRequest(taskId, params, marketplaceTaskExists);
+  if (orderId === null) {
+    res.json(marketplaceTaskExists(taskId)
+      ? { jsonrpc: "2.0", error: { code: A2A_TASK_NOT_CANCELABLE, message: `Task cannot be canceled: ${taskId}` }, id }
+      : { jsonrpc: "2.0", error: { code: A2A_TASK_NOT_FOUND, message: `Task not found: ${taskId}` }, id });
+    return;
+  }
+  sendOrderTaskReply(await cancelOrderTask(orderId, params), id, res);
 }
 
 // ─── tasks/list ──────────────────────────────────────────────
@@ -660,6 +733,30 @@ function handleExtendedCard(params: any, id: any, req: Request, res: Response) {
 // This is the core of the dummy-agent system: every seller has
 // an agent that can answer based on what we know about them.
 
+/**
+ * B2b-2 (bestillinger, «myk utløp»): agent/info's product list. A product
+ * whose catalog row is in the soft window (STOCK_SOFT_EXPIRY_ENABLED on and
+ * the producer on the owner-features allowlist, stock-soft-expiry.ts) gets
+ * stock_confirmed_at, needs_producer_confirmation: true and stock_note (the
+ * buyer text with the date: the producer confirms the order). Nothing in the
+ * window → the info object as it was, untouched.
+ */
+export function withSoftStockProducts<T extends { knowledge: any }>(info: T, agentId: string): T {
+  const products = info?.knowledge?.products;
+  if (!Array.isArray(products) || products.length === 0) return info;
+  const soft = softStockByNameNorm(getDb(), agentId);
+  if (soft.size === 0) return info;
+  let changed = false;
+  const out = products.map((p: any) => {
+    if (!p || typeof p !== "object" || typeof p.name !== "string") return p;
+    const f = soft.get(catalogNameNorm(parseProductPrice(p).cleanName));
+    if (!f) return p;
+    changed = true;
+    return { ...p, ...f, stock_note: stockSoftExpiryBuyerTextNb(f.stock_confirmed_at) };
+  });
+  return changed ? { ...info, knowledge: { ...info.knowledge, products: out } } : info;
+}
+
 function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
   const agentId = params?.agentId;
   if (!agentId) {
@@ -672,7 +769,11 @@ function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
   }
 
   const info = knowledgeService.getAgentInfo(agentId);
-  if (!info) {
+  // S2c-2 (dev-request 2026-10-22-rfb-mine-valg-eierbrytere): a profile whose
+  // owner hid it (visibility.profile) or hid it from AI assistants
+  // (visibility.ai_assistants) reads like an unknown id. No query unless
+  // OWNER_FEATURES_ENFORCE is on and the id is allowlisted.
+  if (!info || ownerHidesAgent(String(agentId), "ai_assistants") || isDelistedAgentId(String(agentId))) {
     res.json({
       jsonrpc: "2.0",
       error: { code: -32602, message: `Agent not found: ${agentId}` },
@@ -698,7 +799,9 @@ function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
         toA2ADataArtifact({
           artifactId: `info-${agentId}`,
           name: "agent-info",
-          data: info,
+          // S2c-1: without what the owner hid (not enforced = as before).
+          // B2b-2: products in the stock rule's soft window carry the date.
+          data: withSoftStockProducts(publicAgentInfo(info, publicFieldChoices(agentId)), String(agentId)),
         }),
       ],
     },
@@ -778,7 +881,8 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
   // 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt): 404 like an unknown id
   // for the hidden test fixture, a non-RFB-vertical row, or an unvetted
   // self-registered agent — see isQuarantinedFromPublicView.
-  if (marketplaceRegistry.isQuarantinedFromPublicView(req.params.id as string)) {
+  // S2c-2: audience "ai" — an A2A card is for AI agents (visibility.ai_assistants).
+  if (marketplaceRegistry.isQuarantinedFromPublicView(req.params.id as string, { audience: "ai" })) {
     res.status(404).json({ error: "Agent not found" });
     return;
   }
@@ -815,11 +919,14 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
       // Integration test 2026-10-17 (I-G): products is DB JSON. Stored as
       // text, `products?.map` threw, and so did `p.name` on a null product;
       // it is read in getAgentInfo's fixed shape (productEntries).
+      // Økologi S0: no organic claim without a valid Debio status
+      // (organic-claims.ts) — organic:false, organic words out of specialties.
       products: productEntries(knowledge.products).map((p: any) => ({
-        name: p.name, category: p.category, seasonal: p.seasonal, months: p.months, organic: p.organic,
+        name: p.name, category: p.category, seasonal: p.seasonal, months: p.months,
+        organic: isDebioVerified ? p.organic : (p.organic === undefined ? undefined : false),
         price: p.price, priceUnit: p.priceUnit,
       })),
-      specialties: knowledge.specialties,
+      specialties: isDebioVerified ? knowledge.specialties : stripOrganicEntries(textEntries(knowledge.specialties)),
       certifications: relabelCertifications(knowledge.certifications, isDebioVerified),
       paymentMethods: knowledge.paymentMethods,
       deliveryOptions: knowledge.deliveryOptions,
@@ -1148,6 +1255,8 @@ router.get("/api/agents/:id/metrics", (req: Request, res: Response) => {
 // GET /api/leaderboard — Top sellers (social proof)
 router.get("/api/leaderboard", (req: Request, res: Response) => {
   const limit = parseInt(req.query.limit as string) || 10;
+  // S2c-2: getLeaderboard leaves out profiles whose owner switched off
+  // «Vis meg på topplister» (visibility.leaderboard) or the profile.
   const leaderboard = conversationService.getLeaderboard(limit);
   res.json({ success: true, data: leaderboard });
 });

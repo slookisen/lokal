@@ -46,6 +46,8 @@ import { Router, Request, Response } from "express";
 import { runDebioCrossCheck, DEFAULT_SINCE_ISO, DebioSource } from "../services/debio-cross-check";
 import { syncDebioVerifications } from "../services/debio-verification-service";
 import { startJob } from "../services/job-tracker";
+import { syncDebioRegister, listMatchReview, decideMatchReview } from "../services/debio-register-sync";
+import { getDb } from "../database/init";
 
 const router = Router();
 
@@ -188,6 +190,52 @@ router.post("/sync", async (req: Request, res: Response) => {
       detail: err?.message || String(err),
     });
   }
+});
+
+// ─── Økologi S1: Debio full-register sync + match review ─────────────
+// A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
+// tekstrevisjon, slice S1 (services/debio-register-sync.ts).
+//
+// POST /admin/debio/register-sync   body { dry_run?: boolean } (default true)
+//   Fetches the register, matches, and returns the counts (rows fetched /
+//   normalized / rejected, matches per method, review candidates, would-
+//   reset). dry_run:false writes. Runs regardless of RFB_DEBIO_REGISTER_SYNC
+//   (manual ops); the daily scheduler runs only with the flag on.
+router.post("/register-sync", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const dryRun = req.body?.dry_run !== false;
+  try {
+    const result = await syncDebioRegister(getDb(), { dryRun });
+    res.json({ success: result.accepted, ...result });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: "Debio register sync failed", detail: err?.message || String(err) });
+  }
+});
+
+// GET /admin/debio/match-review?state=pending|approved|rejected|all
+//   Candidates below the sure threshold: the agent side, the Debio sid,
+//   org.nr., status, validity, product groups, postal code, city, method,
+//   score and reason codes — no Debio person names.
+router.get("/match-review", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const raw = String(req.query?.state ?? "pending");
+  const state = (["pending", "approved", "rejected", "all"].includes(raw) ? raw : "pending") as "pending" | "approved" | "rejected" | "all";
+  const items = listMatchReview(getDb(), state);
+  res.json({ success: true, state, count: items.length, items });
+});
+
+// POST /admin/debio/match-review/:id   body { action: "approve" | "reject" }
+//   approve → the agent gets the candidate's status (never automatic);
+//   reject → the candidate is never proposed again for that agent.
+router.post("/match-review/:id", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const id = Number(req.params.id);
+  const action = req.body?.action;
+  if (!Number.isInteger(id) || id <= 0) { res.status(400).json({ success: false, error: "invalid id" }); return; }
+  if (action !== "approve" && action !== "reject") { res.status(400).json({ success: false, error: "action must be approve or reject" }); return; }
+  const out = decideMatchReview(getDb(), id, action);
+  if (!out) { res.status(404).json({ success: false, error: "review row not found" }); return; }
+  res.json({ success: true, ...out });
 });
 
 export default router;

@@ -63,6 +63,9 @@
 
 import Database from "better-sqlite3";
 import * as initMod from "../database/init";
+// skive B (dev-request 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-forverring): the about
+// LLM judges approve everything here — this suite tests other guards.
+import { useApproveAllAboutJudges } from "../../tests/helpers/hcr-about-judges";
 
 export interface TestSummary {
   passed: number;
@@ -132,6 +135,7 @@ export function runAdminKnowledgeAboutSubstantiationTests(
   let passed = 0;
   let failed = 0;
   const failures: string[] = [];
+  const restoreAboutJudges = useApproveAllAboutJudges();
 
   function assertEq(actual: unknown, expected: unknown, label: string): void {
     if (JSON.stringify(actual) === JSON.stringify(expected)) {
@@ -375,6 +379,7 @@ export function runAdminKnowledgeAboutSubstantiationTests(
         "as-16: sibling agent appears in changed[] with 'about'",
       );
     } finally {
+      restoreAboutJudges();
       (globalThis as any).fetch = prevFetch;
       initMod.__setDbForTesting(prevDb);
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;

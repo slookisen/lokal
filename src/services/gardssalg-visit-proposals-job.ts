@@ -35,6 +35,8 @@ import type Database from "better-sqlite3";
 import {
   __resetProposalQueueDroppedLogForTesting,
   getProposalQueueStatus,
+  getProposalQueueExtras,
+  type ProposalQueueExtras,
   runProposalFileQueueTick,
   type ProposalApplyFn,
   type ProposalQueueConfig,
@@ -111,16 +113,20 @@ export async function tickGardssalgVisitProposals(
 export function getGardssalgVisitProposalsStatus(
   expDb: Database.Database,
   env: Record<string, string | undefined> = process.env,
+  opts: { mainDb?: () => Database.Database; now?: Date } = {},
 ): {
   enabled: boolean;
   token_present: boolean;
   schema: string;
   dir: string;
   files: Array<{ path: string; sha: string; processed_at: string; status: string | null; error: string | null; totals: unknown }>;
-} {
+} & ProposalQueueExtras {
+  const enabled = gardssalgVisitProposalsJobEnabled(env);
+  const token_present = (env.A2A_READ_PAT ?? "").trim() !== "";
   return {
-    enabled: gardssalgVisitProposalsJobEnabled(env),
-    token_present: (env.A2A_READ_PAT ?? "").trim() !== "",
+    enabled,
+    token_present,
+    ...getProposalQueueExtras(expDb, { filesTable: GARDSSALG_VISIT_PROPOSALS_FILES_TABLE, failuresTable: GARDSSALG_VISIT_PROPOSALS_FAILURES_TABLE, agent: GARDSSALG_VISIT_PROPOSALS_AGENT, enabled, tokenPresent: token_present }, opts),
     schema: GARDSSALG_VISIT_PROPOSALS_SCHEMA,
     dir: GARDSSALG_VISIT_PROPOSALS_DIR,
     files: getProposalQueueStatus(expDb, GARDSSALG_VISIT_PROPOSALS_FILES_TABLE),

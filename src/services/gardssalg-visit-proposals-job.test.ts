@@ -357,6 +357,84 @@ export function runGardssalgVisitProposalsJobTests(opts: { log?: boolean } = {})
         assertEq(st.body.files.length, 2, "c4-2: status lists both processed files");
         assertEq(st.body.schema, job.GARDSSALG_VISIT_PROPOSALS_SCHEMA, "c4-3: status carries schema");
         globalThis.fetch = prevFetch2;
+
+        // ── D. status extras: last_tick / last_applied_at / failures / health / stalled ──
+        {
+          const ledger = require("./run-ledger") as typeof import("./run-ledger");
+          const mainDbConn = init.getDb() as any;
+          const realNow = new Date();
+          const iso = (msAgo: number) => new Date(realNow.getTime() - msAgo).toISOString();
+          const AGENT = job.GARDSSALG_VISIT_PROPOSALS_AGENT;
+          const statusEnv = { GARDSSALG_VISIT_PROPOSALS_JOB_ENABLED: "true", A2A_READ_PAT: "github_pat_SECRETSECRET" };
+          const st2 = (env: Record<string, string | undefined> = statusEnv) =>
+            job.getGardssalgVisitProposalsStatus(expDb, env, { mainDb: () => mainDbConn, now: realNow });
+          const clearRuns = () => mainDbConn.prepare("DELETE FROM runs WHERE agent = ?").run(AGENT);
+          const record = (run_id: string, status: "failed" | "partial" | "completed", startMsAgo: number, errors?: Array<{ message: string; meta?: Record<string, unknown> }>) =>
+            ledger.recordRun({
+              run_id, vertical: "experiences", agent: AGENT, trigger_source: "cron",
+              started_at: iso(startMsAgo), finished_at: iso(startMsAgo - 60_000), status,
+              claims: [], evidence: [], notes: "status test", ...(errors ? { errors } : {}),
+            } as any, mainDbConn);
+          const H = 3600_000;
+          const baseKeys = Object.keys(job.getGardssalgVisitProposalsStatus(expDb, statusEnv, { mainDb: () => mainDbConn, now: realNow }));
+          for (const k of ["enabled", "token_present", "schema", "dir", "files"]) assertTrue(baseKeys.includes(k), `d0-${k}: existing field ${k} kept`);
+
+          // The tick above stamped processed_at with the wall clock; age those rows so d1 sees an old last-applied.
+          expDb.prepare("UPDATE gardssalg_visit_proposal_files SET processed_at = '2026-10-16T12:00:00.000Z'").run();
+
+          // d1: all-github-failed day -> health github_error, error carries HTTP 401, stalled (last applied > 48h old).
+          clearRuns();
+          record("run-d1-github-failed", "failed", 30 * 60_000, [{ message: "GET proposals/dir -> HTTP 401", meta: {} }]);
+          const s1 = st2();
+          assertEq(s1.health, "github_error", "d1-1: failed ledger row -> github_error");
+          assertEq(s1.last_tick?.status, "failed", "d1-2: last_tick.status failed");
+          assertEq(s1.last_tick?.skipped_reason, "github_error", "d1-3: last_tick.skipped_reason github_error");
+          assertTrue(String(s1.last_tick?.error).includes("HTTP 401"), "d1-4: last_tick.error contains HTTP 401");
+          assertTrue(typeof s1.last_applied_at === "string" && Date.parse(s1.last_applied_at as string) < realNow.getTime() - 48 * H, "d1-5: last_applied_at is the old applied file");
+          assertEq(s1.stalled, true, "d1-6: stalled when last applied > 48h and health != ok");
+          assertTrue(!JSON.stringify(s1).includes("github_pat_"), "d1-7: no token value anywhere in the JSON");
+          assertEq(s1.files.length, 2, "d1-8: files[] unchanged");
+
+          // d2: same failure but an applied file only 1h old (before the failed tick) -> not stalled.
+          expDb.prepare("INSERT INTO gardssalg_visit_proposal_files (path, sha, processed_at, result_json) VALUES (?, ?, ?, ?)")
+            .run("d2/fresh-applied.json", "sha-d2", iso(H), JSON.stringify({ status: "applied", totals: { written: 1 } }));
+          const s2 = st2();
+          assertEq([s2.health, s2.stalled], ["github_error", false], "d2-1: recent applied -> github_error but not stalled");
+          assertEq(s2.last_applied_at, iso(H), "d2-2: last_applied_at = newest applied processed_at");
+
+          // d3: all green -> ok / stalled false; a later processed file proves recovery from an older failed tick.
+          clearRuns();
+          record("run-d3-ok", "completed", 20 * 60_000);
+          const s3 = st2();
+          assertEq([s3.health, s3.stalled, s3.last_tick?.status, s3.failures], ["ok", false, "completed", []], "d3-1: all green -> ok, not stalled, no failures");
+          assertEq(s3.last_tick?.error, undefined, "d3-2: no error key on a clean tick");
+          clearRuns();
+          record("run-d3-old-failed", "failed", 3 * H, [{ message: "GET x -> HTTP 401", meta: {} }]);
+          assertEq(st2().health, "ok", "d3-3: file processed after the failed tick -> recovered (ok)");
+
+          // d4: per-file failures -> file_errors, last_error truncated to 200, max 20 rows; null ledger -> last_tick null.
+          clearRuns();
+          const insF = expDb.prepare("INSERT INTO gardssalg_visit_proposal_failures (path, fail_count, last_error, last_failed_at) VALUES (?, ?, ?, ?)");
+          for (let i = 0; i < 25; i++) insF.run(`d4/f${i}.json`, 2, "E".repeat(500), iso(i * 1000));
+          const s4 = st2();
+          assertEq(s4.last_tick, null, "d4-1: no ledger row -> last_tick null");
+          assertEq(s4.health, "file_errors", "d4-2: failures present, no github error -> file_errors");
+          assertEq(s4.failures.length, 20, "d4-3: failures capped at 20");
+          assertEq(s4.failures[0].last_error?.length, 200, "d4-4: last_error truncated to 200");
+          assertEq(s4.failures[0].path, "d4/f0.json", "d4-5: newest failure first");
+          for (const k of ["path", "fail_count", "last_error", "last_failed_at"]) assertTrue(k in s4.failures[0], `d4-6: failure entry has ${k}`);
+          record("run-d4-long", "failed", 10 * 60_000, [{ message: "GET " + "p".repeat(400) + " -> HTTP 401", meta: {} }]);
+          assertEq(st2().last_tick?.error?.length, 200, "d4-7: last_tick.error truncated to 200");
+          mainDbConn.prepare("DELETE FROM runs WHERE agent = ?").run(AGENT);
+          expDb.prepare("DELETE FROM gardssalg_visit_proposal_failures").run();
+
+          // d5: guards.
+          const s5a = st2({ A2A_READ_PAT: "github_pat_SECRETSECRET" });
+          assertEq([s5a.health, s5a.stalled], ["disabled", false], "d5-1: flag off -> disabled, never stalled");
+          const s5b = st2({ GARDSSALG_VISIT_PROPOSALS_JOB_ENABLED: "true" });
+          assertEq([s5b.health, s5b.stalled], ["no_token", false], "d5-2: no token -> no_token, never stalled");
+          expDb.prepare("DELETE FROM gardssalg_visit_proposal_files WHERE path = ?").run("d2/fresh-applied.json");
+        }
       }
     } finally {
       if (restoreMainDb) restoreMainDb();

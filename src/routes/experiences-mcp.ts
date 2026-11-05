@@ -121,7 +121,12 @@ import {
 // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 item 7: one
 // source for the booking note (discover_gardssalg) and the "not taking
 // requests now" line (book_gardssalg) for owned profiles that are off.
-import { gardssalgBookingStatus, gardssalgNotTakingRequestsText } from "../services/gardssalg-booking-gate";
+import {
+  gardssalgBookingStatus,
+  gardssalgNotTakingRequestsText,
+  gardssalgBookingPausedByOwner,
+  GARDSSALG_NOT_TAKING_REQUESTS_TEXT,
+} from "../services/gardssalg-booking-gate";
 // dev-request 2026-07-14-booking-flyt-v1, slice 1 ("myk åpningstidsvalidering")
 // — the SAME shared choke point POST /api/opplevelser/book and the no-JS SSR
 // fallback use, never re-derived here.
@@ -149,6 +154,7 @@ import { createMcpRateLimiters, MCP_RATE_LIMIT_PROFILES } from "../middleware/mc
 import { conversationService, buildRequestMeta, type RequestMeta } from "../services/conversation-service";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
+import { isAsPublicView } from "../services/agent-visibility";
 import { capName } from "../utils/free-text";
 import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
 import { MCP_MAX_TOOL_INPUT_ELEMENTS } from "../services/mcp-input-limits";
@@ -1010,7 +1016,7 @@ export function registerExperienceTools(
         // .all() call each time, but never mutate a store function's return
         // value on principle.
         const categories = [...listCategories()];
-        categories.push({ category: GARDSSALG_CATEGORY, count: countGardssalgProviders() });
+        categories.push({ category: GARDSSALG_CATEGORY, count: countGardssalgProviders(undefined, "mcp") });
         const result = {
           count: categories.length,
           categories,
@@ -1240,7 +1246,7 @@ export function registerExperienceTools(
         // expandDrinkWords: a drink word in `query` («cider», «sider», «øl»)
         // also finds producers of that kind, as producer_type does (dev-request
         // 2026-10-17-integrasjonstest-oppfolging, AI-5).
-        const results = searchGardssalgProviders(filter, limit ?? 20, { expandDrinkWords: true });
+        const results = searchGardssalgProviders(filter, limit ?? 20, { expandDrinkWords: true, surface: "mcp" });
 
         const summary =
           results.length === 0
@@ -1375,6 +1381,12 @@ export function registerExperienceTools(
       },
     },
     async ({ provider_id, provider_query, requested_weekday, experience_id, slot_at, party_size, guest_name, guest_email, guest_phone, notes, confirm_outside_hours }) => {
+      // «Vis som offentlig» (dev-request 2026-10-22-opplevagent-mine-valg-
+      // gardssalg, O2a) is a read-only admin view of the public surfaces: no
+      // visit request is ever created inside it.
+      if (isAsPublicView()) {
+        return jsonToolResult({ success: false, reason: "as_public_read_only", message: "The as-public view is read-only; no visit request was sent." }, true);
+      }
       try {
         // ─── Step 0 (dev-request 2026-09-16-opplevagent-en-setning-booking-
         // via-ai): «hos X» → provider_id. provider_id, when given, wins
@@ -1386,7 +1398,7 @@ export function registerExperienceTools(
         if (!resolvedProviderId) {
           const pq = typeof provider_query === "string" ? provider_query.trim() : "";
           if (!pq) return jsonToolResult(providerQueryMissingPayload(), true);
-          const resolution = resolveGardssalgProviderByQuery(pq);
+          const resolution = resolveGardssalgProviderByQuery(pq, { surface: "mcp" });
           if (resolution.kind === "none") return jsonToolResult(providerNotFoundPayload(pq));
           if (resolution.kind === "ambiguous") return jsonToolResult(providerAmbiguousPayload(pq, resolution.candidates));
           resolvedProviderId = resolution.provider.id;
@@ -1479,6 +1491,31 @@ export function registerExperienceTools(
                   (notTaking ? notTaking.no : BOOKING_NOT_ACTIVATED_MSG) +
                   (providerInfo?.profile_url ? ` Gjesten kan ta kontakt via profilsiden: ${providerInfo.profile_url}.` : "") +
                   (notTaking ? ` / ${notTaking.en}` : " / Booking is not activated for this producer yet.") +
+                  (providerInfo?.profile_url ? ` The guest can get in touch via the profile page: ${providerInfo.profile_url}.` : ""),
+              }, null, 2),
+            }],
+          };
+        }
+
+        // «Mine valg» booking.pause (dev-request 2026-10-22-opplevagent-mine-
+        // valg-gardssalg O1a): the owner's seasonal pause — same not-taking
+        // line as above (G1 item 7). Off unless OA_OWNER_FEATURES_ENABLED and
+        // the producer is allowlisted.
+        if (gardssalgBookingPausedByOwner(parsed.data.provider_id)) {
+          const t = GARDSSALG_NOT_TAKING_REQUESTS_TEXT;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: false,
+                pending: false,
+                rejected: true,
+                reason: "owner_paused",
+                provider: providerInfo,
+                message:
+                  (providerInfo?.navn ? `${providerInfo.navn}: ` : "") + t.no +
+                  (providerInfo?.profile_url ? ` Gjesten kan ta kontakt via profilsiden: ${providerInfo.profile_url}.` : "") +
+                  ` / ${t.en}` +
                   (providerInfo?.profile_url ? ` The guest can get in touch via the profile page: ${providerInfo.profile_url}.` : ""),
               }, null, 2),
             }],

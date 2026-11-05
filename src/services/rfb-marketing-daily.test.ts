@@ -86,6 +86,9 @@
 import Database from "better-sqlite3";
 import fs from "fs";
 import path from "path";
+// skive B (dev-request 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-forverring): the about
+// LLM judges approve everything here — this suite tests other guards.
+import { useApproveAllAboutJudges } from "../../tests/helpers/hcr-about-judges";
 
 export interface TestSummary {
   passed: number;
@@ -155,6 +158,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
   let passed = 0;
   let failed = 0;
   const failures: string[] = [];
+  const restoreAboutJudges = useApproveAllAboutJudges();
 
   function assertEq(actual: unknown, expected: unknown, label: string): void {
     if (JSON.stringify(actual) === JSON.stringify(expected)) {
@@ -423,7 +427,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq(r.results[0].preview_text, expected.text, "c3: preview is the exact template render");
       assertEq(r.results[0].subject, expected.subject, "c4: subject from the A/B rule");
       assertEq(r.results[0].profile_url, "https://rettfrabonden.com/produsent/alfa-gard", "c5: canonical profile URL");
-      assertEq(r.social_proof?.line, "Katalogen har i dag over 100 norske matprodusenter.", "c6: social proof from the agent_knowledge count (152 → over 100)");
+      assertEq(r.social_proof?.line, "100", "c6: {N} label from the agent_knowledge count (152 → 100)");
       assertEq(t.calls.length, 0, "c7: nothing sent");
       assertEq(counts(), before, "c8: nothing written (no ledger, no CRM, no cap, no envelope)");
       assertEq(r.envelope_recorded, false, "c9: dry run records no envelope");
@@ -494,7 +498,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq(r.skipped_reason, "paused", "d11: paused lane → skipped");
       assertEq(t.calls.length, 0, "d12: paused lane → no e-mail");
       assertEq(runsRows().length, runsBefore + 1, "d13: a paused apply run still records an envelope");
-      assertEq(JSON.parse(runsRows().slice(-1)[0].claims)[0], { type: "emails_sent", value: 0, meta: { lane: "rfb-marketing", channel: "resend_smtp", table: "rfb_marketing_send_ledger", template: "rfb-outreach-v2", agent_ids: [] } }, "d14: envelope claims emails_sent 0");
+      assertEq(JSON.parse(runsRows().slice(-1)[0].claims)[0], { type: "emails_sent", value: 0, meta: { lane: "rfb-marketing", channel: "resend_smtp", table: "rfb_marketing_send_ledger", template: "rfb-outreach-v4", agent_ids: [] } }, "d14: envelope claims emails_sent 0");
       const dry = await run(false, { transport: t });
       assertEq([dry.skipped_reason, runsRows().length], ["paused", runsBefore + 1], "d15: paused dry run → skipped, no envelope");
       const up = await callRoute(laneRouter, { method: "POST", headers: auth, body: { paused: false, by: "daniel" } });
@@ -511,8 +515,11 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
     setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "3" });
     const eTransport = makeTransport();
     const eNow = new Date();
+    let eResults: Array<Record<string, any>> = [];
+    const r_e_rows = () => eResults;
     {
       const r = await run(true, { transport: eTransport, trigger: "cron", now: eNow });
+      eResults = r.results.filter((x) => x.status === "sent") as any;
       assertEq(r.skipped_reason, null, "e1: not skipped");
       assertEq(r.stopped_reason, null, "e2: not stopped");
       assertEq([r.summary.sent, r.summary.first_touch_sent, r.summary.second_touch_sent], [3, 2, 1], "e3: 3 sent — both first-touch, then the oldest second-touch");
@@ -527,11 +534,11 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
         profileUrl: "https://rettfrabonden.com/produsent/haugerud-gard-regenerativt",
         producerCountTotal: 154,
       });
-      assertEq(eTransport.calls[0].subject, "Har vi info riktig om Haugerud Gård (Regenerativt)?", "e5: subject A for …a (even)");
+      assertEq(eTransport.calls[0].subject, "Har vi riktig info om Haugerud Gård (Regenerativt)?", "e5: subject A for …a (even)");
       assertEq(eTransport.calls[0].textContent, hauge.text, "e6: body is the template, byte for byte");
       assertTrue(hauge.text.includes("https://rettfrabonden.com/produsent/haugerud-gard-regenerativt"), "e7: canonical å→a slug in the link");
-      assertEq(eTransport.calls[1].subject, "Profil-utkast for Bakke Honning", "e8: subject B for …b (odd)");
-      assertEq(eTransport.calls[0].from, identity.crmFromHeader("rfb"), "e9: From is the RFB platform identity");
+      assertEq(eTransport.calls[1].subject, "Spørsmål om varene til Bakke Honning", "e8: subject B for …b (odd)");
+      assertEq(eTransport.calls[0].from, "\"Daniel Fredriksen\" <kontakt@rettfrabonden.com>", "e9: From is Daniel Fredriksen at the platform address (AC3)");
       assertEq(eTransport.calls[0].replyTo, identity.resolveCrmIdentity("rfb").replyTo, "e10: Reply-To is the RFB identity's");
       assertTrue(String(eTransport.calls[0].htmlContent).includes("<p>"), "e11: html alternative derived from the text by the compose path");
       assertEq(r.results.filter((x) => x.status === "sent").every((x) => typeof x.thread_id === "string"), true, "e12: every sent row carries its CRM thread id");
@@ -565,6 +572,29 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq([claims[0].type, claims[0].value], ["emails_sent", 3], "e21: emails_sent 3");
       assertEq(claims[0].meta.agent_ids, ["f-0000-000a", "f-0000-000b", "s-0000-0001"], "e22: claim names the agents");
       assertEq([claims[1].meta.kind, claims[1].value, claims[2].meta.kind, claims[2].value], ["rfb_marketing_first_touch_sent", 2, "rfb_marketing_second_touch_sent", 1], "e23: first/second-touch split claims");
+
+      // dev-request 2026-10-22-rfb-utsending-v4: AC3 (From, Reply-To unchanged), AC4 (no first mail in the
+      // CRM → new mail with subject A, no threading headers), AC6 (template + arm per send, in CRM and results).
+      const [e0, e1, e2] = eTransport.calls;
+      assertEq([e0.from, e1.from, e2.from], Array(3).fill("\"Daniel Fredriksen\" <kontakt@rettfrabonden.com>"), "e24: AC3 From is Daniel Fredriksen on every send (address unchanged)");
+      assertEq(e0.replyTo, identity.resolveCrmIdentity("rfb").replyTo, "e25: AC3 Reply-To unchanged");
+      assertEq(e0.inReplyToMessageId, undefined, "e26: a first mail carries no threading header");
+      assertEq(e2.subject, "Har vi riktig info om Gammel Gård?", "e27: AC4 second touch without a first mail in the CRM → new mail with subject A (arm B agent ends …1)");
+      assertEq(e2.inReplyToMessageId, undefined, "e28: AC4 …and no In-Reply-To/References");
+      assertTrue(String(e2.textContent).startsWith("Hei igjen,\n\nJeg skrev til dere "), "e29: the second touch is text I, not the first text again");
+      assertTrue(!String(e2.textContent).includes("katalog") && !String(e0.textContent).toLowerCase().includes("katalog"), "e30: no «katalog» in any sent text");
+      assertTrue(!String(e0.textContent).includes("selger?agent=") && String(e0.textContent).includes("svarer dere bare på denne e-posten, så hjelper jeg dere med å ta den over."), "e31: H asks for a reply instead of carrying {eier_url} (Daniel 2026-11-01)");
+      assertEq(
+        r_e_rows().map((x) => [x.agent_id, x.template, x.subject_variant]),
+        [["f-0000-000a", "rfb-outreach-v4", "A"], ["f-0000-000b", "rfb-outreach-v4", "B"], ["s-0000-0001", "rfb-outreach-v4-followup", "B"]],
+        "e32: AC6 run result rows carry template and subject arm per send",
+      );
+      const metaRows = db.prepare(`SELECT raw_metadata FROM crm_messages WHERE direction = 'out' ORDER BY rowid`).all() as Array<{ raw_metadata: string }>;
+      assertEq(
+        metaRows.map((m) => { const j = JSON.parse(m.raw_metadata); return [j.template, j.subject_arm]; }),
+        [["rfb-outreach-v4", "A"], ["rfb-outreach-v4", "B"], ["rfb-outreach-v4-followup", "B"]],
+        "e33: AC6 the CRM message rows record template and subject arm",
+      );
     }
 
     // ── (f) restart / second tick: never exceeds the cap, never re-sends ──
@@ -1883,9 +1913,9 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       try {
         const r = await daily.runRfbMarketingDaily({ apply: true, trigger: "manual", deps: { healthProbe: healthy } });
         assertEq([r.summary.sent, mails.length], [1, 1], "s1: sent through emailService.sendRaw");
-        assertEq(mails[0].from, identity.crmFromHeader("rfb"), "s2: From header on the wire");
+        assertEq(mails[0].from, "\"Daniel Fredriksen\" <kontakt@rettfrabonden.com>", "s2: From header on the wire");
         assertEq(mails[0].replyTo, identity.resolveCrmIdentity("rfb").replyTo, "s3: Reply-To on the wire");
-        assertTrue(String(mails[0].text).startsWith("Hei,\n\nJeg har laget en profil for Wire Gård"), "s4: plain-text part is the template");
+        assertTrue(String(mails[0].text).startsWith("Hei,\n\nJeg har ett spørsmål om Wire Gård:"), "s4: plain-text part is the template");
         assertTrue(String(mails[0].html).includes("Wire Gård") && String(mails[0].html).includes("<p>"), "s5: html part derived from it");
         assertEq(r.results[0].message_id, "stub-wire-1", "s6: transport message id recorded");
       } finally {
@@ -1969,10 +1999,51 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
         emailSvc.transporter = origTransporter;
       }
     }
+
+    // ── (v4) second touch threads on the first mail when the CRM has it (AC4) ─
+    {
+      freshDb();
+      seedProducer("t-0000-0002", "Trådgård AS, Voss", "post@tradgard-test.no", { secondTouchDaysAgo: 60 });
+      db.prepare(`UPDATE outreach_sent_log SET sent_at = '2026-08-12 08:20:00' WHERE agent_id = ?`).run("t-0000-0002");
+      db.prepare(`INSERT INTO crm_threads (id, contact_id, subject, category, vertical_id) VALUES ('compose-first-1', 'c-first', 'Spørsmål om varene til Trådgård', 'marketing', 'rfb')`).run();
+      db.prepare(
+        `INSERT INTO rfb_marketing_send_ledger (day, run_id, agent_id, recipient_email, touch, subject_variant, status, reserved_at, thread_id, message_id)
+         VALUES ('2026-08-12', 'run-first', 't-0000-0002', 'post@tradgard-test.no', 'first', 'B', 'sent', '2026-08-12T08:20:00.000Z', 'compose-first-1', '<first-mail-1@mail.rettfrabonden.com>')`,
+      ).run();
+      setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "3" });
+      const vTransport = makeTransport();
+      const vr = await run(true, { transport: vTransport, now: new Date("2026-10-27T08:20:00.000Z") });
+      assertEq(vr.summary.second_touch_sent, 1, "v1: the second touch was sent");
+      const m = vTransport.calls[0];
+      assertEq(m.inReplyToMessageId, "<first-mail-1@mail.rettfrabonden.com>", "v2: AC4 In-Reply-To/References point at the first mail's Message-ID");
+      assertEq(m.subject, "Re: Spørsmål om varene til Trådgård", "v3: AC4 subject is «Re: <first subject>»");
+      assertEq(m.from, "\"Daniel Fredriksen\" <kontakt@rettfrabonden.com>", "v4: AC3 From");
+      assertTrue(String(m.textContent).includes("Jeg skrev til dere i august om Trådgård på Rett fra Bonden."), "v5: {måned} from the first send, {navn} washed");
+      assertEq([vr.results[0].template, vr.results[0].threaded], ["rfb-outreach-v4-followup", true], "v6: AC6 result row: template, threaded");
+      const meta = db.prepare(`SELECT raw_metadata FROM crm_messages WHERE direction = 'out' ORDER BY rowid DESC LIMIT 1`).get() as { raw_metadata: string };
+      assertEq(JSON.parse(meta.raw_metadata).in_reply_to, "<first-mail-1@mail.rettfrabonden.com>", "v7: the CRM row records in_reply_to");
+
+      // A first mail whose Message-ID is unusable (DRY_RUN / synthetic) → new mail with subject A.
+      freshDb();
+      seedProducer("t-0000-0003", "Dryrun Gård", "post@dryrun-test.no", { secondTouchDaysAgo: 60 });
+      db.prepare(`UPDATE outreach_sent_log SET sent_at = '2026-08-12 08:20:00' WHERE agent_id = ?`).run("t-0000-0003");
+      db.prepare(`INSERT INTO crm_threads (id, contact_id, subject, category, vertical_id) VALUES ('compose-first-2', 'c-first', 'Spørsmål om varene til Dryrun Gård', 'marketing', 'rfb')`).run();
+      db.prepare(
+        `INSERT INTO rfb_marketing_send_ledger (day, run_id, agent_id, recipient_email, touch, subject_variant, status, reserved_at, thread_id, message_id)
+         VALUES ('2026-08-12', 'run-first', 't-0000-0003', 'post@dryrun-test.no', 'first', 'B', 'sent', '2026-08-12T08:20:00.000Z', 'compose-first-2', 'DRY_RUN')`,
+      ).run();
+      setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "3" });
+      const wTransport = makeTransport();
+      const wr = await run(true, { transport: wTransport, now: new Date("2026-10-27T08:20:00.000Z") });
+      assertEq(wr.summary.second_touch_sent, 1, "v8: the second touch was sent");
+      assertEq([wTransport.calls[0].inReplyToMessageId, wTransport.calls[0].subject], [undefined, "Har vi riktig info om Dryrun Gård?"], "v9: AC4 unusable first Message-ID → new mail, subject A, no threading header");
+      assertEq(wr.results[0].threaded, false, "v10: result row says not threaded");
+    }
   } catch (err) {
     failed++;
     failures.push(`rfb-marketing-daily: unexpected error: ${err instanceof Error ? err.stack || err.message : String(err)}`);
   } finally {
+    restoreAboutJudges();
     daily.__setRfbMarketingHealthProbeForTesting(null);
     daily.__setRfbMarketingRefreshFetchForTesting(null);
     emailSvc.isConfigured = origConfigured;

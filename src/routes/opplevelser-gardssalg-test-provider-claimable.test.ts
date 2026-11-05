@@ -90,6 +90,13 @@
  *       documented fact (see the route's own "SPEC DISCREPANCY" comment in
  *       opplevelser.ts) rather than silently assuming the row behaves like
  *       `claimable`'s.
+ *
+ * EXTENDED 2026-10-31 (O2c, dev-request 2026-10-22-opplevagent-mine-valg-
+ * gardssalg): optional location on the test row so the switch probe can
+ * reach it on the A2A surface.
+ *   (t) valid kommune/lat/lon stored on the test row only and audited;
+ *       invalid lat/lon/kommune → 400 with nothing written; omission keeps
+ *       the stored location; a real provider's row never changes
  */
 
 export interface TestSummary {
@@ -543,6 +550,90 @@ export function runOpplevelserGardssalgTestProviderClaimableTests(
       });
       assertEq(hijackEditable.status, 409, "q1: claimableEditable write against a real provider's slug -> 409, refused");
       assertEq(diffRows(realBeforeEditable, readRow("prov-real")), [], "q2: NO column on the real row changed (whole-row diff)");
+
+      // ── (t) O2c: optional location (kommune, lat + lon) on the test row ──
+      {
+        const locAudit = () =>
+          expDb
+            .prepare(`SELECT field_name, old_value, new_value, changed_by FROM gardssalg_content_audit WHERE batch_id = 'admin-test-provider-location' ORDER BY field_name`)
+            .all() as Array<{ field_name: string; old_value: string | null; new_value: string; changed_by: string }>;
+        const realBeforeLoc = readRow("prov-real");
+        expDb.prepare(`UPDATE experience_providers SET kommune = NULL, lat = NULL, lon = NULL WHERE id = ?`).run(plainId);
+
+        // Invalid input → 400, nothing written (whole-row diff on the test row too).
+        const bad: Array<[string, Record<string, unknown>]> = [
+          ["lat without lon", { lat: 60.32 }],
+          ["lon without lat", { lon: 6.65 }],
+          ["lat out of range", { lat: 91, lon: 6.65 }],
+          ["lon out of range", { lat: 60.32, lon: -181 }],
+          ["lat as a string", { lat: "60.32", lon: 6.65 }],
+          ["lat null", { lat: null, lon: 6.65 }],
+          ["kommune empty", { kommune: "   " }],
+          ["kommune not a string", { kommune: 42 }],
+          ["kommune too long", { kommune: "x".repeat(101) }],
+          ["kommune control char", { kommune: "Ullens\nvang" }],
+          ["valid kommune + bad lat", { kommune: "Ullensvang", lat: 200, lon: 6.65 }],
+        ];
+        for (const [label, extra] of bad) {
+          const before = readRow(plainId);
+          const r = await callRoute(opplevelserRouter, { headers: auth, body: { email: "daniel@example.com", ...extra } });
+          assertEq(r.status, 400, `t1: ${label} -> 400`);
+          assertTrue(typeof r.body?.error === "string" && /Ingenting er skrevet/.test(r.body.error), `t2: ${label} -> Norwegian error, nothing written`);
+          assertEq(diffRows(before, readRow(plainId)), [], `t3: ${label} -> test row untouched`);
+        }
+        assertEq(locAudit(), [], "t4: no location audit row from a refused call");
+
+        // Valid location stored on the test row, audited per changed field, echoed in the response.
+        const ok = await callRoute(opplevelserRouter, {
+          headers: auth,
+          body: { email: "daniel@example.com", kommune: "  Ullensvang ", lat: 60.3201, lon: 6.6502 },
+        });
+        assertEq(ok.status, 200, "t5: valid location -> 200");
+        assertEq(ok.body.location, { kommune: "Ullensvang", lat: 60.3201, lon: 6.6502 }, "t6: response carries the stored location (kommune trimmed)");
+        const row = readRow(plainId);
+        assertEq([row.kommune, row.lat, row.lon, row.catalog_hidden, row.is_test_provider], ["Ullensvang", 60.3201, 6.6502, 1, 1], "t7: stored on the test row, which stays hidden");
+        assertEq(
+          locAudit().map((a) => [a.field_name, a.old_value, a.new_value, a.changed_by]),
+          [["kommune", null, "Ullensvang", "admin"], ["lat", null, "60.3201", "admin"], ["lon", null, "6.6502", "admin"]],
+          "t8: one audit row per changed field",
+        );
+
+        // Omission leaves the location untouched (and audits nothing new).
+        const omit = await callRoute(opplevelserRouter, { headers: auth, body: { email: "daniel@example.com" } });
+        assertEq(omit.status, 200, "t9: call without location -> 200");
+        assertEq(omit.body.location, { kommune: "Ullensvang", lat: 60.3201, lon: 6.6502 }, "t10: omitted -> stored location unchanged, still reported");
+        const row2 = readRow(plainId);
+        assertEq([row2.kommune, row2.lat, row2.lon], ["Ullensvang", 60.3201, 6.6502], "t11: omitted -> columns unchanged");
+        assertEq(locAudit().length, 3, "t12: omitted -> no new audit row");
+
+        // Only kommune → lat/lon kept; same value again → no audit row.
+        const onlyK = await callRoute(opplevelserRouter, { headers: auth, body: { email: "daniel@example.com", kommune: "Ullensvang" } });
+        assertEq([onlyK.status, onlyK.body.location], [200, { kommune: "Ullensvang", lat: 60.3201, lon: 6.6502 }], "t13: only kommune -> coordinates kept");
+        assertEq(locAudit().length, 3, "t14: an unchanged value is not audited again");
+
+        // owner_email dry-run: the location is in the plan, nothing written.
+        const beforeDry = readRow(plainId);
+        const dry = await callRoute(opplevelserRouter, {
+          headers: auth,
+          body: { email: "daniel@example.com", owner_email: "eier@test.invalid", lat: 59.9, lon: 10.7 },
+        });
+        assertEq(dry.body?.dry_run, true, "t15: owner_email without apply -> dry run");
+        assertTrue((dry.body?.changes ?? []).some((c: any) => c.field === "lat" && c.new === 59.9), "t16: the dry-run plan lists the location change");
+        assertEq(diffRows(beforeDry, readRow(plainId)), [], "t17: dry run wrote nothing");
+
+        // A real provider's slug with a location → 409, real row byte-identical.
+        const hijack = await callRoute(opplevelserRouter, {
+          headers: auth,
+          body: { email: "daniel@example.com", slug: "ekte-bryggeri", kommune: "Oslo", lat: 59.9, lon: 10.7 },
+        });
+        assertEq(hijack.status, 409, "t18: location against a real provider's slug -> 409");
+        assertEq(diffRows(realBeforeLoc, readRow("prov-real")), [], "t19: the real (non-test) row never changed through the whole section");
+        assertEq(
+          (expDb.prepare(`SELECT COUNT(*) AS n FROM gardssalg_content_audit WHERE batch_id = 'admin-test-provider-location' AND provider_id != ?`).get(plainId) as { n: number }).n,
+          0,
+          "t20: no location audit row for any other provider",
+        );
+      }
     } finally {
       if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;

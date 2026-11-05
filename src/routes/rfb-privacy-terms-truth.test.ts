@@ -144,8 +144,8 @@ export async function runRfbPrivacyTermsTruthTests(opts: { log?: boolean } = {})
     "ground truth: offsite backups keep 7 daily + 4 weekly copies (selectBackupsToDelete defaults)"
   );
   assertTrue(
-    /svar «fjern», så slettes profilen/.test(outreachTemplateSrc) && /https:\/\/rettfrabonden\.com\/personvern/.test(outreachTemplateSrc),
-    "ground truth: the outreach e-mail links /personvern and tells producers to reply «fjern» to have the profile deleted"
+    /svarer dere bare «fjern», så tar jeg siden ned innen et døgn/.test(outreachTemplateSrc) && /https:\/\/rettfrabonden\.com\/personvern/.test(outreachTemplateSrc),
+    "ground truth: the outreach e-mail links /personvern and tells producers to reply «fjern» to have the profile taken down within a day"
   );
   assertTrue(
     /CREATE TABLE IF NOT EXISTS agent_blocklist/.test(dbInitSrc) &&

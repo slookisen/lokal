@@ -63,6 +63,11 @@ export async function runProfileAiDeliveriesS2Tests(opts: { log?: boolean } = {}
   const prevLog = console.log;
   if (!log) console.log = () => { /* silence registry chatter */ };
 
+  // «Med i AI-søk» (S1, 2026-10-25): the counting starts on a configured day;
+  // a day a year back here so today's rows count whatever the clock says.
+  const prevCountingSince = process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE;
+  const yearAgo = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE = yearAgo;
   const prevDentalPath = process.env.DENTAL_DB_PATH;
   const prevExpPath = process.env.EXPERIENCES_DB_PATH;
   process.env.DENTAL_DB_PATH = ":memory:";
@@ -154,6 +159,17 @@ export async function runProfileAiDeliveriesS2Tests(opts: { log?: boolean } = {}
       flush();
       assertEq(rowsFor("dental", "ai_page_list").filter((x) => x.ai_vendor === "claude").length, 2, "(a) Claude-User on /fylke/Oslo: each clinic counted under claude");
       assertEq(total("rfb"), 0, "(a) nothing is written under rfb");
+
+      // «Med i AI-søk» (S1): /sok with no query and no filter is the generic
+      // «all clinics» list and counts nothing; a filter alone still counts.
+      const beforeEmpty = total("dental");
+      const empty = await invoke(dentalRouter, "/sok", CHATGPT_USER, { ip: "203.0.113.70" });
+      assertEq(empty.status, 200, "(a) dental /sok without a query renders 200");
+      flush();
+      assertEq(total("dental"), beforeEmpty, "(a) S1: dental /sok without query or filter (the generic list) counts nothing");
+      await invoke(dentalRouter, "/sok?fylke=Oslo", CHATGPT_USER, { ip: "203.0.113.71" });
+      flush();
+      assertEq(total("dental"), beforeEmpty + 2, "(a) S1: dental /sok with a filter still counts each clinic");
     }
 
     // ── (b) dental profile page + tile ─────────────────────────────────
@@ -173,9 +189,15 @@ export async function runProfileAiDeliveriesS2Tests(opts: { log?: boolean } = {}
       assertTrue(prof.length === 1 && prof[0].profile_id === dentalIds[0] && prof[0].ai_vendor === "chatgpt" && prof[0].n === 1, "(b) ChatGPT-User on the profile page: ai_page_profile +1 under chatgpt");
 
       const withTile = await invoke(dentalRouter, clinic, HUMAN, { ip: "198.51.100.32" });
-      assertTrue(withTile.body.includes('data-stat="aiDeliveries"'), "(b) the clinic page has the «Med i AI-svar» tile");
-      assertTrue(withTile.body.includes("Med i AI-svar"), "(b) tile label «Med i AI-svar»");
-      assertTrue(withTile.body.includes("sendt til AI-en &middot; 60d"), "(b) tile meta «sendt til AI-en · 60d»");
+      assertTrue(withTile.body.includes('data-stat="aiDeliveries"'), "(b) the clinic page has the «Med i AI-søk» tile");
+      assertTrue(withTile.body.includes("<span>Med i AI-søk</span>"), "(b) tile label «Med i AI-søk»");
+      assertTrue(!withTile.body.includes("Med i AI-svar"), "(b) the old name «Med i AI-svar» is gone");
+      assertTrue(withTile.body.includes("ganger profilen var blant treffene en AI-assistent hentet &middot; siste 12 måneder"), "(b) tile subtitle, a full window after the counting started");
+      process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE = new Date().toISOString().slice(0, 10);
+      const sinceTxt = new Date().toLocaleDateString("nb-NO", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
+      const fresh = await invoke(dentalRouter, clinic, HUMAN, { ip: "198.51.100.33" });
+      assertTrue(fresh.body.includes(`ganger profilen var blant treffene en AI-assistent hentet &middot; siden ${sinceTxt}`), "(b) tile subtitle «siden <dato>» in the first window");
+      process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE = yearAgo;
       assertTrue(withTile.body.includes("Tallet viser ikke hvor mange som så den."), "(b) help text: it does not show how many saw it");
       assertTrue(withTile.body.includes("ChatGPT 1"), "(b) per-AI split in the tooltip");
       assertTrue(!withTile.body.includes("${"), "(b) rendered HTML has no literal ${");
@@ -222,6 +244,14 @@ export async function runProfileAiDeliveriesS2Tests(opts: { log?: boolean } = {}
       flush();
       assertTrue(rowsFor("experiences", "ai_page_list").some((x) => x.profile_id === "gs-fossmoen" && x.ai_vendor === "chatgpt" && x.n === 2), "(c) the gårdssalg catalogue page counts its producers (second list, same producer)");
 
+      // «Med i AI-søk» (S1): the generic «Alle opplevelser» list counts nothing.
+      const beforeAll = total("experiences");
+      const all = await invoke(expRouter, "/opplevelser", CHATGPT_USER, { ip: "203.0.113.51" });
+      assertEq(all.status, 200, "(c) /opplevelser renders 200");
+      assertTrue(all.body.includes("Hvalsafari i Tromsø"), "(c) /opplevelser lists the experience");
+      flush();
+      assertEq(total("experiences"), beforeAll, "(c) S1: ChatGPT-User on /opplevelser (the generic list) counts nothing");
+
       for (const [label, ua] of [["GPTBot", GPTBOT], ["Googlebot", GOOGLEBOT], ["a person", HUMAN], ["curl", CURL]] as Array<[string, string]>) {
         const before = total("experiences");
         await invoke(expRouter, "/kategori/gardssalg", ua, { ip: "198.51.100.77" });
@@ -244,7 +274,7 @@ export async function runProfileAiDeliveriesS2Tests(opts: { log?: boolean } = {}
       flush();
       assertTrue(rowsFor("experiences", "ai_page_profile").some((x) => x.profile_id === expId && x.ai_vendor === "chatgpt" && x.n === 1), "(c) an AI fetch of the experience page counts ai_page_profile");
       const detail = await invoke(expRouter, `/opplevelse/${expSlug}`, HUMAN, { ip: "198.51.100.41" });
-      assertTrue(detail.body.includes('data-stat="aiDeliveries"') && detail.body.includes("sendt til AI-en &middot; 60d"), "(c) the experience page has the «Med i AI-svar · 60d» tile");
+      assertTrue(detail.body.includes('data-stat="aiDeliveries"') && detail.body.includes("<span>Med i AI-søk</span>") && detail.body.includes("ganger profilen var blant treffene en AI-assistent hentet &middot; siste 12 måneder"), "(c) the experience page has the «Med i AI-søk» tile");
       assertTrue(detail.body.includes("Tallet viser ikke hvor mange som så den."), "(c) experience tile help text");
       assertTrue(!detail.body.includes("${"), "(c) the experience page has no literal ${");
 
@@ -259,7 +289,7 @@ export async function runProfileAiDeliveriesS2Tests(opts: { log?: boolean } = {}
       flush();
       assertTrue(rowsFor("experiences", "ai_page_profile").some((x) => x.profile_id === "gs-fossmoen" && x.ai_vendor === "claude" && x.n === 1), "(c) an AI fetch of the producer page counts ai_page_profile under the provider id");
       const gs = await invoke(expRouter, gsPath, HUMAN, { ip: "198.51.100.43" });
-      assertTrue(gs.body.includes('data-stat="aiDeliveries"') && gs.body.includes("Med i AI-svar") && gs.body.includes("sendt til AI-en &middot; 60d"), "(c) the producer page has the «Med i AI-svar · 60d» tile");
+      assertTrue(gs.body.includes('data-stat="aiDeliveries"') && gs.body.includes("<span>Med i AI-søk</span>") && gs.body.includes("ganger profilen var blant treffene en AI-assistent hentet &middot; siste 12 måneder"), "(c) the producer page has the «Med i AI-søk» tile");
       assertTrue(gs.body.includes("Tallet viser ikke hvor mange som så den.") && gs.body.includes("Claude 1"), "(c) producer tile help text and per-AI split");
       assertTrue(!gs.body.includes("${"), "(c) the producer page has no literal ${");
 
@@ -377,12 +407,19 @@ export async function runProfileAiDeliveriesS2Tests(opts: { log?: boolean } = {}
         ins.run("experiences", "gs-fossmoen", old, "a2a", "unknown", 4);
         const { getGardssalgOwnerStats } = require("./gardssalg-owner-stats-service") as typeof import("./gardssalg-owner-stats-service");
         const o = getGardssalgOwnerStats("/kategori/gardssalg/produsent/fossmoen-frukt", "gs-fossmoen");
-        assertEq(o.aiDeliveries?.window.total, 7, "(f) gårdssalg owner stats: 60 d");
+        assertEq(`${o.aiDeliveries?.window.windowDays}:${o.aiDeliveries?.window.total}`, "365:11", "(f) gårdssalg owner stats: 12 months since statistikk S2d (the 90-day-old row counts)");
         assertEq(o.aiDeliveries?.allTime.total, 11, "(f) gårdssalg owner stats: whole period");
         assertEq(o.aiDeliveries?.allTime.byChannel.a2a, 4, "(f) whole period per channel");
+        // S1: rows before the configured start day stay in the table but are not counted.
+        process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE = compute.utcDay(now - 30 * 24 * 60 * 60 * 1000);
+        const o2 = getGardssalgOwnerStats("/kategori/gardssalg/produsent/fossmoen-frukt", "gs-fossmoen");
+        assertEq(o2.aiDeliveries?.allTime.total, 7, "(f) S1: whole period leaves out rows before countingSince");
+        assertEq(o2.aiDeliveries?.allTime.countingSince, compute.utcDay(now - 30 * 24 * 60 * 60 * 1000), "(f) S1: countingSince is the configured day");
+        assertEq((mainDb.prepare("SELECT COUNT(*) AS n FROM profile_ai_deliveries WHERE day = ?").get(old) as { n: number }).n, 1, "(f) S1: the older row is kept");
+        process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE = yearAgo;
         assertEq(getGardssalgOwnerStats("/x").aiDeliveries, undefined, "(f) without a provider id the payload is unchanged");
         const claimSrc = fs.readFileSync(path.join(__dirname, "../routes/gardssalg-claim.ts"), "utf8");
-        assertTrue(claimSrc.includes("getGardssalgOwnerStats(path, providerId)") && claimSrc.includes("Med i AI-svar, sendt til AI-en (hele perioden)"), "(f) the gårdssalg portal shows 60 d and the whole period");
+        assertTrue(claimSrc.includes("getGardssalgOwnerStats(path, providerId)") && claimSrc.includes("Med i AI-søk: ganger profilen var blant treffene en AI-assistent hentet (") && !claimSrc.includes("Med i AI-svar, sendt"), "(f) the gårdssalg portal shows 12 months and the whole period");
         assertTrue(!/vist i ChatGPT/i.test(claimSrc), "(f) portal wording: never «vist i ChatGPT»");
       }
   } catch (err: any) {
@@ -391,6 +428,7 @@ export async function runProfileAiDeliveriesS2Tests(opts: { log?: boolean } = {}
   } finally {
     console.log = prevLog;
     (require("./profile-ai-deliveries") as typeof import("./profile-ai-deliveries")).__resetAiDeliveriesForTesting();
+    if (prevCountingSince === undefined) delete process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE; else process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE = prevCountingSince;
     if (prevDentalPath === undefined) delete process.env.DENTAL_DB_PATH; else process.env.DENTAL_DB_PATH = prevDentalPath;
     if (prevExpPath === undefined) delete process.env.EXPERIENCES_DB_PATH; else process.env.EXPERIENCES_DB_PATH = prevExpPath;
     try { (require("../database/db-factory") as typeof import("../database/db-factory")).__resetDbFactoryForTesting(); } catch { /* best effort */ }

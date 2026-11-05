@@ -390,7 +390,7 @@ export class AnalyticsService {
       trackPageViews: true,
       trackSearchQueries: true,
       trackAgentViews: true,
-      skipPaths: ["/health", "/openapi.yaml", "/.well-known/", "/admin/"],
+      skipPaths: ["/health", "/openapi.yaml", "/.well-known/", "/admin/", "/avmeld/"],
       ...options,
     };
   }

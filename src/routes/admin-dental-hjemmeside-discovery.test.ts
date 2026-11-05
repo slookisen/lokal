@@ -480,7 +480,7 @@ export async function runAdminDentalHjemmesideDiscoveryTests(
 
     // ── (j) agentIds cap ───────────────────────────────────────────────────
     const cap = routeMod.DENTAL_WD_BATCH_CAP;
-    assertEq(cap, 25, "j0: DENTAL_WD_BATCH_CAP is 25");
+    assertEq(cap, 40, "j0: DENTAL_WD_BATCH_CAP is 40 (A6-K)");
     const tooMany = Array.from({ length: cap + 1 }, (_, i) => `bulk-${i}`);
     const overCap = await postDiscovery({ agentIds: tooMany });
     assertEq(overCap.status, 400, "j1: more than DENTAL_WD_BATCH_CAP agentIds -> 400");

@@ -59,6 +59,17 @@ primary_region = 'arn'
   # Gate is `=== "true"`; fail-safe: anything else = off. Rollback: set to
   # 'false' or remove the line — no deploy-side state.
   CATALOG_SYNC_SCHEDULER_ENABLED = 'true'
+  # dev-request 2026-10-16-indexnow-alle-verter, S3: turns on the IndexNow
+  # sitemap-diff sync in src/index.ts (first tick boot + 10 min, then hourly;
+  # the tick skips 06:30-09:30 UTC and runs younger than 30 min). It submits
+  # new / advanced-lastmod / removed entity URLs for rettfrabonden.com,
+  # finn-tannlege.com and opplevagent.no and records them in
+  # indexnow_submissions (src/services/indexnow-sync.ts). Shipped flag-OFF in
+  # S2 (#1139); Daniel GO 2026-10-28 (A2A
+  # daniel-responses/2026-10-28-live-svar-byggeko-sjekkliste-punkt-3.md, 3.6).
+  # Gate is `=== "true"`; fail-safe: anything else = off. Rollback: set to
+  # 'false' or remove the line — no cleanup needed.
+  INDEXNOW_SYNC_ENABLED = 'true'
   # dev-request 2026-08-14-fetch-vegg-headless-fallback.md Slice 4: turns on
   # admin-rfb-website-discovery.ts's headless-render fallback for JS-built
   # producer sites. The route already exists and is already tested — it was

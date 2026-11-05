@@ -620,6 +620,9 @@ export async function runAdminEnrichmentWritePauseTests(
         // — plus its own test file, which sets up pause state directly via
         // the service to prove the wiring.
         "routes/admin-agents-content-correction.ts",
+        // S2w: the content-correction tests set pause state via the service
+        // to prove the list/product fields are gated too.
+        "routes/admin-agents-content-quality.test.ts",
       "routes/admin-agents-description-code-artifact-sweep.test.ts",
         "routes/admin-agents-description-code-artifact-sweep.ts",
       "routes/admin-agents-internal-note-sweep.ts",
@@ -675,6 +678,11 @@ export async function runAdminEnrichmentWritePauseTests(
         // the experiences pause before fetching/applying; its test file sets
         // the pause via the service to prove that.
         "services/experience-description-proposals-job.test.ts",
+        // A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
+        // felles-serverjobbramme, step 3n: the org.nr daily job checks the
+        // experiences pause before every apply tick (the services it drives do
+        // not check it themselves).
+        "services/experience-orgnr-job.ts",
         // The description proposals job itself no longer imports the guard:
         // its mechanics moved VERBATIM into services/proposal-file-queue.ts
         // (tillegg 2026-10-15 «4b-forslag»), which checks the experiences
@@ -683,6 +691,11 @@ export async function runAdminEnrichmentWritePauseTests(
         // pause via the service to prove it, same convention as the others.
         "services/proposal-file-queue.ts",
         "services/gardssalg-visit-proposals-job.test.ts",
+        // experience-content-judgement-job (skive 3k, same dev-request): the
+        // job runs on the same queue; its apply step re-checks the pause per
+        // row through opplevelser.ts's shared helper. Its test file sets the
+        // pause via the service to prove both.
+        "services/experience-content-judgement-job.test.ts",
         // gardssalg-content-refresh-job («4b-det», A2A dev-request 2026-10-06-
         // experiences-enrichment-plattformjobb-og-felles-serverjobbramme,
         // tillegg 2026-10-15): the daily job drives the SAME shared core as
@@ -698,11 +711,33 @@ export async function runAdminEnrichmentWritePauseTests(
         // the pause via the service to prove the writing steps stop.
         "services/rfb-enrichment-nightly.test.ts",
         "services/rfb-enrichment-nightly.ts",
+        // dev-request 2026-11-01-rfb-hold-profilen-oppdatert: the owner refresh
+        // (step 6 of the nightly run, which checks the pause) — its test file
+        // sets the pause via the service to prove the owner step stops.
+        "services/rfb-owner-refresh.test.ts",
         // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-
         // places-treffvakt (S3): the Places match guard's test file sets the
         // rfb pause via the service to prove both google-rating routes still
         // answer 423 before any Places call (acceptance h).
         "routes/rfb-places-match-guard.test.ts",
+        // dev-request 2026-10-27-dental-skrivepause-gjerde-mangler-paa-
+        // tannlege-put (P0): the dental router (PUT /agents/:id, claim-batch,
+        // stage-v-drift-result, google-places-batch write mode) checks the
+        // dental pause through one shared helper; its test file sets/clears
+        // the pause via the service to prove the wiring.
+        "routes/dental.ts",
+        "routes/dental-enrichment-write-pause.test.ts",
+        // The shared dental helper (enrichmentWritePauseBlock(() => getDb("rfb"),
+        // "dental")) used by dental.ts, the admin-dental-* apply sweeps and the
+        // geocode worker, plus the sweeps' own direct pause-constant imports.
+        "services/dental-enrichment-write-pause.ts",
+        "routes/admin-dental-brreg-address-sweep.ts",
+        "routes/admin-dental-hjemmeside-cleanup.ts",
+        "routes/admin-dental-hjemmeside-discovery.ts",
+        "routes/admin-dental-offentlig-klinikk-hjemmeside-korrigering.ts",
+        "routes/admin-dental-schema-probe-sweep.ts",
+        "routes/admin-dental-wrong-entity-retro-sanitize.ts",
+        "routes/admin-dental-write-pause.test.ts",
       ].sort(),
       "ewp-125: the guard is imported by exactly the gated surfaces, the shared write primitives, its own admin route, and the test files",
     );

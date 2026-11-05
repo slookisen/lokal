@@ -14,8 +14,9 @@
  *            cannot_deliver — plus the existing page buttons «Hentet»
  *            (complete) and the legacy «Klar for henting» (mark_ready).
  *   buyer  : withdraw (pending), cancel (after confirmation), picked_up,
- *            message — types and service-level rules only; no buyer channel
- *            exists yet, and `message` is answered 501 until Fase B2.
+ *            message — the buyer channels are MCP (lokal_order_cancel /
+ *            lokal_order_picked_up) and the order card /ordre/:id (Fase B1,
+ *            buyer-order-actions.ts); `message` is answered 501 until Fase B2.
  *   system : auto_complete, producer_no_response (only for an order whose
  *            producer e-mail was sent, notify_sent_at), payment_expired.
  *   admin  : everything.
@@ -52,8 +53,9 @@ import {
 } from "./cart-service";
 import { isPaymentsLifecycleActive, onOrderTransitioned, type OrderPaymentEffect } from "./payment-service";
 import type { PaymentsStripeClient } from "./payment-provider";
+import { markOrderItemsSoldOut, refreshStockConfirmationForOrder, stockSoftExpiryActiveFor } from "./stock-soft-expiry";
 import { sendBuyerOrderReceipt, type ReceiptEvent } from "./order-receipt-service";
-import { sendAdminOrderAlert } from "./order-notify-service";
+import { sendAdminOrderAlert, sendProducerBuyerCancelNotice } from "./order-notify-service";
 import {
   autoCompleteDueMs,
   isOrderAutocompleteEnabled,
@@ -89,6 +91,12 @@ export interface OrderActionOptions {
   pickupTime?: string | null;
   /** Free-text reason for logs; the stored cancel_reason comes from the action. */
   reason?: string | null;
+  /**
+   * B2b-1 «Utsolgt», decline by the seller only: the order's products to set
+   * 'out_of_stock' (empty = none, a plain decline). Ignored unless the soft-expiry
+   * rule is active for the producer (stock-soft-expiry.ts).
+   */
+  soldOut?: { productIds?: readonly string[] | null } | null;
   /** The payment step's Stripe client; null/absent = no payment step (payments off, system jobs). */
   payments?: PaymentsStripeClient | null;
   /** Injectable clock and env (tests). */
@@ -315,6 +323,19 @@ export async function applyOrderAction(
     `${actor.ref ? ` ref=${actor.ref}` : ""} ${order.status}→${spec.to}`,
   );
 
+  // B2b-1 (soft stock expiry): the producer's confirmation of the order
+  // confirms the stock of its producer_dashboard items; «Utsolgt» on a decline
+  // sets the chosen items to out of stock. Only with the rule active for the
+  // producer; never fails the action.
+  if (actor.role === "seller" && (action === "confirm" || (action === "decline" && opts.soldOut)) && stockSoftExpiryActiveFor(order.agent_id, env)) {
+    try {
+      if (action === "confirm") refreshStockConfirmationForOrder(db, orderId, order.agent_id, now);
+      else markOrderItemsSoldOut(db, orderId, order.agent_id, opts.soldOut?.productIds ?? null, now);
+    } catch (err) {
+      console.error(`[order-actions] B2b-1 stock write failed order=${orderId} action=${action}:`, err instanceof Error ? err.message : "error");
+    }
+  }
+
   // Payment step (unchanged rules). The automatic close moves no money.
   let payment_effect: OrderPaymentEffect = "none";
   if (opts.payments && action !== "auto_complete") {
@@ -325,6 +346,11 @@ export async function applyOrderAction(
 
   const receipt = receiptEventFor(spec.to);
   if (receipt) void sendBuyerOrderReceipt(orderId, receipt).catch(() => { /* never fails the action */ });
+  // Fase B1: the buyer's own withdraw / cancel (MCP, order card) is told to
+  // the producer by e-mail. Not for a replay (returned above) or an admin.
+  if (actor.role === "buyer" && (action === "withdraw" || action === "cancel")) {
+    void sendProducerBuyerCancelNotice(orderId, action).catch(() => { /* never fails the action */ });
+  }
 
   return { success: true, order_id: orderId, action, status: spec.to, replayed: false, payment_effect };
 }

@@ -113,8 +113,13 @@ export async function runAgentStatsViewHonestyTests(opts: { log?: boolean } = {}
   testDb.pragma("foreign_keys = OFF");
 
   let resetStatsCache: ((clock?: (() => number) | null) => void) | undefined;
+  // «Mine valg» S2f: this suite checks how views are counted, on fixtures far
+  // below the public threshold (PUBLIC_STATS_MIN_VIEWS, 20): it runs with the
+  // threshold off (0) and checks once, at the end, that 20 leaves the counts out.
+  const prevMinViews = process.env.PUBLIC_STATS_MIN_VIEWS;
 
   try {
+    process.env.PUBLIC_STATS_MIN_VIEWS = "0";
     __setDbForTesting(testDb as any);
     __initSchemaForTesting(testDb as any);
 
@@ -197,15 +202,17 @@ export async function runAgentStatsViewHonestyTests(opts: { log?: boolean } = {}
         [{ agent_id: "low-trust", view_source: "discovery", is_owner: 0, traffic_category: "human" }],
         "a5: a profile visit books exactly one row: own-domain Referer → 'discovery', human, not owner",
       );
-      // The rendered tiles carry the real window, not template text (2026-10-13:
-      // S5 put ${statsDays} inside plain quotes, so the page showed it literally).
-      const days = require("../services/retention-window").getRetentionWindowDays();
+      // The rendered tiles carry no template text (2026-10-13: S5 put
+      // ${statsDays} inside plain quotes, so the page showed it literally).
+      // Since statistikk S2c the period («siste 12 måneder» / «siden <dato>»)
+      // comes from the stats payload's labels, never «· 60d».
       assertTrue(
         !profile.body.includes("${") &&
-          profile.body.includes(`Den viser at informasjonen din blir funnet av mennesker som søker via ChatGPT, Claude og lignende AI-tjenester, siste ${days} dager.`) &&
-          profile.body.includes(`Sidevisninger fra mennesker, siste ${days} dager`) &&
-          profile.body.includes(`mennesker &middot; ${days}d`) && profile.body.includes(`AI-agenter &middot; ${days}d`),
-        `a6: the rendered stat tiles and the approved AI tooltip show the window (${days} days), no raw \${…}`,
+          profile.body.includes("Den viser at informasjonen din blir funnet av mennesker som søker via ChatGPT, Claude og lignende AI-tjenester\"") &&
+          profile.body.includes('title="Sidevisninger fra mennesker"') &&
+          profile.body.includes('<span class="pf-stat-meta">mennesker</span>') && profile.body.includes('<span class="pf-stat-meta">AI-agenter</span>') &&
+          !/&middot; \d+d\b/.test(profile.body),
+        "a6: the rendered stat tiles and the approved AI tooltip carry no fixed window and no raw ${…}",
       );
     }
 
@@ -364,6 +371,13 @@ export async function runAgentStatsViewHonestyTests(opts: { log?: boolean } = {}
       clock += 2_000;
       const after = await stats();
       assertEq(after.humanViews, before.humanViews + 1, "e2: after the TTL the payload is recomputed (new human view visible)");
+
+      // (f) the public threshold back at its default (20): these few views leave the counts out.
+      delete process.env.PUBLIC_STATS_MIN_VIEWS;
+      (require("../services/public-stats-threshold") as typeof import("../services/public-stats-threshold")).__resetPublicStatsThresholdCacheForTesting();
+      const below = await stats();
+      assertTrue(below.publicCounts === false && !("humanViews" in below) && !("aiBreakdown" in below) && !("year" in below),
+        "f1: below PUBLIC_STATS_MIN_VIEWS (20) the stats payload has publicCounts:false and no counts");
     }
 
     if (log) console.log(`\nagent-stats-view-honesty: ${passed} passed, ${failed} failed`);
@@ -371,6 +385,8 @@ export async function runAgentStatsViewHonestyTests(opts: { log?: boolean } = {}
     failed++;
     failures.push(`unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
   } finally {
+    if (prevMinViews === undefined) delete process.env.PUBLIC_STATS_MIN_VIEWS; else process.env.PUBLIC_STATS_MIN_VIEWS = prevMinViews;
+    try { (require("../services/public-stats-threshold") as typeof import("../services/public-stats-threshold")).__resetPublicStatsThresholdCacheForTesting(); } catch { /* ignore */ }
     try { resetStatsCache?.(null); } catch { /* ignore */ }
     if (prevDb) __setDbForTesting(prevDb);
     try {

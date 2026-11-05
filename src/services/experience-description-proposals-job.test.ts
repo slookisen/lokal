@@ -574,6 +574,49 @@ export function runExperienceDescriptionProposalsJobTests(opts: { log?: boolean 
         if (prevPat === undefined) delete process.env.A2A_READ_PAT; else process.env.A2A_READ_PAT = prevPat;
       }
 
+      // ── pj-8x: status extras (last_tick / last_applied_at / failures / health / stalled). ──
+      {
+        const ledger = require("./run-ledger") as typeof import("./run-ledger");
+        const mainDbConn = init.getDb() as any;
+        const realNow = new Date();
+        const iso = (msAgo: number) => new Date(realNow.getTime() - msAgo).toISOString();
+        const AGENT = job.EXPERIENCE_PROPOSALS_AGENT;
+        const sEnv = { EXPERIENCE_PROPOSALS_JOB_ENABLED: "true", A2A_READ_PAT: "github_pat_SECRETSECRET" };
+        const st = (e: Record<string, string | undefined> = sEnv) =>
+          job.getExperienceDescriptionProposalsStatus(expDb, e, { mainDb: () => mainDbConn, now: realNow });
+        mainDbConn.prepare("DELETE FROM runs WHERE agent = ?").run(AGENT);
+        expDb.prepare("DELETE FROM experience_description_proposal_failures").run();
+        expDb.prepare("UPDATE experience_description_proposal_files SET processed_at = '2026-10-07T12:00:00.000Z'").run();
+        const record = (run_id: string, status: "failed" | "completed", errors?: Array<{ message: string; meta?: Record<string, unknown> }>) =>
+          ledger.recordRun({
+            run_id, vertical: "experiences", agent: AGENT, trigger_source: "cron",
+            started_at: iso(30 * 60_000), finished_at: iso(29 * 60_000), status,
+            claims: [], evidence: [], notes: "status test", ...(errors ? { errors } : {}),
+          } as any, mainDbConn);
+        record("run-pj8x-failed", "failed", [{ message: "GET x -> HTTP 401", meta: {} }]);
+        const a = st();
+        assertEq(a.health, "github_error", "pj-8x-1: failed ledger row -> github_error");
+        assertTrue(String(a.last_tick?.error).includes("HTTP 401"), "pj-8x-2: last_tick.error contains HTTP 401");
+        assertEq(a.stalled, true, "pj-8x-3: stalled (last applied > 48h ago)");
+        assertTrue(!JSON.stringify(a).includes("github_pat_"), "pj-8x-4: no token value in the JSON");
+        assertTrue(Array.isArray(a.files) && a.files.length >= 6, "pj-8x-5: files[] unchanged");
+        mainDbConn.prepare("DELETE FROM runs WHERE agent = ?").run(AGENT);
+        record("run-pj8x-ok", "completed");
+        expDb.prepare("INSERT INTO experience_description_proposal_files (path, sha, processed_at, result_json) VALUES (?, ?, ?, ?)")
+          .run("pj8x/fresh.json", "sha-x", iso(10 * 60_000), JSON.stringify({ status: "applied" }));
+        const b = st();
+        assertEq([b.health, b.stalled, b.failures], ["ok", false, []], "pj-8x-6: all green -> ok, not stalled");
+        expDb.prepare("INSERT INTO experience_description_proposal_failures (path, fail_count, last_error, last_failed_at) VALUES (?, 2, ?, ?)")
+          .run("pj8x/bad.json", "E".repeat(500), iso(1000));
+        const c = st();
+        assertEq(c.health, "file_errors", "pj-8x-7: failures present -> file_errors");
+        assertEq(c.failures[0].last_error?.length, 200, "pj-8x-8: failures.last_error truncated to 200");
+        assertEq([st({ A2A_READ_PAT: "x" }).health, st({ EXPERIENCE_PROPOSALS_JOB_ENABLED: "true" }).health], ["disabled", "no_token"], "pj-8x-9: disabled / no_token");
+        expDb.prepare("DELETE FROM experience_description_proposal_failures WHERE path = ?").run("pj8x/bad.json");
+        expDb.prepare("DELETE FROM experience_description_proposal_files WHERE path = ?").run("pj8x/fresh.json");
+        mainDbConn.prepare("DELETE FROM runs WHERE agent = ?").run(AGENT);
+      }
+
       // ── pj-9: pure helpers. ─────────────────────────────────────────
       assertEq(job.experienceProposalsDateIsRecent("2026-10-07", NOW), true, "pj-9a: today is recent");
       assertEq(job.experienceProposalsDateIsRecent("2026-09-24", NOW), true, "pj-9b: 13 days ago is recent");

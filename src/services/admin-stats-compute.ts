@@ -33,8 +33,8 @@ import { humanAgentViewSql } from "../database/analytics-sql";
 import { notPubliclyListableAgentIdsSql } from "./agent-visibility";
 import { computeTrafficReport, groupOf, type TrafficReport, type SessionRow } from "./traffic-report";
 import { isPageViewStatus } from "./page-view-definition";
-import { storedClientClass } from "./traffic-classifier";
-import { computeAiLookupBreakdown, computeQueryStats, notBotSearchSql, type QueryStats } from "./search-stats-compute";
+import { aiAgentEntryByToken, aiAgentTokenCaseSql, emptyAiAgents, storedClientClass, type AiAgentPurpose, type AiAgents, type AiAgentVendor } from "./traffic-classifier";
+import { computeAiLookupBreakdown, computeQueryStats, notBotSearchSql, siteSearchCount, type QueryStats } from "./search-stats-compute";
 import { computeHistoryView } from "./traffic-history-compute";
 import { slugify } from "../utils/slug";
 import {
@@ -95,6 +95,8 @@ export interface AdminSummary {
   trafficBySource: Record<string, number>;
   /** Page views by AI vendor over AI search + AI crawlers. */
   agentTraffic: { chatgpt: number; claude: number; other: number };
+  /** agentTraffic split by vendor × purpose (AI_AGENT_REGISTRY). */
+  aiAgents: AiAgents;
   ownerStats: { pageViews: number; queries: number; cookieViews?: number; scriptViews?: number; unknownViews?: number };
   // ── dev-request 2026-10-13-statistikk-riktig-for-investorer, S1 ──
   /** Visits (30 min inactivity rule), every client class. */
@@ -115,6 +117,12 @@ export interface AdminSummary {
   searchesByChannel?: { web: number; api: number; mcp: number; a2a: number };
   /** Searches by crawlers and other bots, not in totalQueries. */
   botSearches?: number;
+  /**
+   * «Søk (nettsider og API)»: web + api only (siteSearchCount), without the AI
+   * assistants' channels mcp/a2a/ai (dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S2).
+   * totalQueries keeps its meaning for older readers.
+   */
+  siteSearches?: number;
 }
 
 export function emptyAdminSummary(): AdminSummary {
@@ -126,6 +134,7 @@ export function emptyAdminSummary(): AdminSummary {
     topSearchTerms: [],
     trafficBySource: {},
     agentTraffic: { chatgpt: 0, claude: 0, other: 0 },
+    aiAgents: emptyAiAgents(),
     ownerStats: { pageViews: 0, queries: 0 },
   };
 }
@@ -171,8 +180,10 @@ export function summaryFromReport(report: TrafficReport, q: QueryStats): AdminSu
     topSearchTerms: q.topSearchTerms,
     searchesByChannel: q.byChannel,
     botSearches: q.botQueries,
+    siteSearches: siteSearchCount(q.byChannel),
     trafficBySource,
     agentTraffic: { ...report.aiVendors },
+    aiAgents: report.aiAgents,
     ownerStats: {
       pageViews: report.owner.views,
       queries: q.ownerQueries,
@@ -265,6 +276,71 @@ export function computeUtmBreakdown(db: Db, hours: number, vertical: string | un
   `).all(...(oldestRaw ? [cutoff.slice(0, 10), oldestRaw] : [cutoff.slice(0, 10)]), ...vp) as any[];
   rolled.forEach(add);
   return [...merged.values()].sort((a, b) => b.views - a.views).slice(0, 200);
+}
+
+// ── /ai-agents (ai-sok B5) ─────────────────────────────────────────────
+
+export interface AiAgentRow {
+  agent: string;
+  vendor: AiAgentVendor | "unknown";
+  purpose: AiAgentPurpose | "unknown";
+  views: number;
+  sessions: number;
+}
+
+/** Hard caps: the raw side runs one instr() CASE per row on the main thread. */
+export const AI_AGENT_RAW_MAX_HOURS = 168;
+export const AI_AGENT_ROLLUP_MAX_DAYS = 400;
+
+function aiAgentRow(agent: string, views: number, sessions: number): AiAgentRow {
+  const e = aiAgentEntryByToken(agent);
+  return { agent, vendor: e ? e.vendor : "unknown", purpose: e ? e.purpose : "unknown", views, sessions };
+}
+
+/**
+ * ai-sok B5: page views per AI agent token (OAI-SearchBot, GPTBot,
+ * ChatGPT-User, Claude-SearchBot, ClaudeBot, Claude-User, …), owner rows
+ * excluded, all status codes (a fetch is a fetch), same token rule as the
+ * nightly rollup (aiAgentTokenCaseSql). Two separate, non-overlapping views:
+ *  - raw: the last `hours` (<= AI_AGENT_RAW_MAX_HOURS) of analytics_page_views;
+ *    sessions are distinct over the window.
+ *  - rollup: page_view_ai_agent_daily for the last `days`
+ *    (<= AI_AGENT_ROLLUP_MAX_DAYS), whole days strictly before the raw table's
+ *    oldest surviving day; sessions are a sum of per-day distinct sessions.
+ * Sorted by views desc. Bounded: indexed created_at window + tiny rollup table.
+ */
+export function computeAiAgentBreakdown(
+  db: Db, hours: number, days: number, vertical: string | undefined, nowMs: number,
+): { raw: AiAgentRow[]; rollup: AiAgentRow[]; rollupFromDay: string; rollupBeforeDay: string | null } {
+  const h = Math.max(1, Math.min(AI_AGENT_RAW_MAX_HOURS, Math.floor(hours) || 24));
+  const d = Math.max(1, Math.min(AI_AGENT_ROLLUP_MAX_DAYS, Math.floor(days) || 90));
+  const cutoff = new Date(nowMs - h * 3600 * 1000).toISOString().replace("T", " ").slice(0, 19);
+  const V = vertical ? " AND vertical_id = ?" : "";
+  const vp: string[] = vertical ? [vertical] : [];
+  const raw = (db.prepare(`
+    SELECT agent, COUNT(*) AS views, COUNT(DISTINCT session_id) AS sessions
+    FROM (
+      SELECT ${aiAgentTokenCaseSql("session_id")} AS agent, session_id
+      FROM analytics_page_views
+      WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)${V}
+    )
+    WHERE agent IS NOT NULL
+    GROUP BY agent
+  `).all(cutoff, ...vp) as Array<{ agent: string; views: number; sessions: number }>)
+    .map((r) => aiAgentRow(r.agent, r.views, r.sessions));
+  const oldestRaw = ((db.prepare(
+    "SELECT MIN(created_at) AS d FROM analytics_page_views"
+  ).get() as { d: string | null } | undefined)?.d || "").slice(0, 10) || null;
+  const fromDay = new Date(nowMs - d * 86400 * 1000).toISOString().slice(0, 10);
+  const rollup = (db.prepare(`
+    SELECT agent, SUM(view_count) AS views, SUM(session_count) AS sessions
+    FROM page_view_ai_agent_daily
+    WHERE day >= ? ${oldestRaw ? "AND day < ?" : ""}${V}
+    GROUP BY agent
+  `).all(...(oldestRaw ? [fromDay, oldestRaw] : [fromDay]), ...vp) as Array<{ agent: string; views: number; sessions: number }>)
+    .map((r) => aiAgentRow(r.agent, r.views || 0, r.sessions || 0));
+  const byViews = (a: AiAgentRow, b: AiAgentRow) => b.views - a.views || (a.agent < b.agent ? -1 : a.agent > b.agent ? 1 : 0);
+  return { raw: raw.sort(byViews), rollup: rollup.sort(byViews), rollupFromDay: fromDay, rollupBeforeDay: oldestRaw };
 }
 
 // ── /producers ────────────────────────────────────────────────────────
@@ -535,6 +611,8 @@ export interface TopPageRow {
   visitors: number;
   humanViews?: number;
   aiViews?: number;
+  aiSearchViews?: number;
+  aiCrawlerViews?: number;
   botViews?: number;
   humanVisitors?: number;
 }
@@ -566,8 +644,12 @@ export interface UmbrellaTrafficBucket {
   /** The same, by people only (the shared classifier). */
   human_pageviews_profile: number;
   human_pageviews_members: number;
-  /** AI assistants and AI crawlers (classifier groups ai_search + ai_crawler). */
+  /** AI assistants and AI crawlers (classifier groups ai_search + ai_crawler); kept for older readers. */
   ai_bot_pageviews: number;
+  /** The same split: AI assistants fetching for someone (ai_search) … */
+  ai_search_pageviews: number;
+  /** … and autonomous AI crawlers (ai_crawler). */
+  ai_crawler_pageviews: number;
   /** People's page views arriving from a search engine (referrer Google, Bing, DuckDuckGo). */
   search_referrals: number;
 }
@@ -629,7 +711,8 @@ export function computeUmbrellaTraffic(db: Db, sinceHours: number, nowMs: number
     const b: UmbrellaTrafficBucket = {
       id: u.id, name: u.name, umbrella_type: u.umbrella_type, active_members: (memberCountStmt.get(u.id) as { c: number }).c,
       pageViews_total: 0, pageViews_via_profile: 0, pageViews_via_members: 0,
-      human_pageviews_profile: 0, human_pageviews_members: 0, ai_bot_pageviews: 0, search_referrals: 0,
+      human_pageviews_profile: 0, human_pageviews_members: 0, ai_bot_pageviews: 0,
+      ai_search_pageviews: 0, ai_crawler_pageviews: 0, search_referrals: 0,
     };
     buckets.push(b);
     const add = (path: string, profile: boolean) => {
@@ -676,6 +759,8 @@ export function computeUmbrellaTraffic(db: Db, sinceHours: number, nowMs: number
         if (profile) b.pageViews_via_profile += 1; else b.pageViews_via_members += 1;
         if (human) { if (profile) b.human_pageviews_profile += 1; else b.human_pageviews_members += 1; }
         if (ai) b.ai_bot_pageviews += 1;
+        if (g === "ai_search") b.ai_search_pageviews += 1;
+        else if (g === "ai_crawler") b.ai_crawler_pageviews += 1;
         if (fromSearch) b.search_referrals += 1;
       }
     }

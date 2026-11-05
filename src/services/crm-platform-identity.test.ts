@@ -248,6 +248,65 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
             String(sent[0]?.from).includes("<kontakt@rettfrabonden.com>"),
             "pi16: every platform still sends FROM the one Resend-verified address — the brand is the display name, not a second domain");
 
+          // ── pi16fd1-pi16fd10: allow-listed fromDisplayName on /threads/:id/send ──
+          // A thank-you reply on a thread that started with cold outreach must
+          // carry the outreach sender name ("Daniel Fredriksen"), same address,
+          // same reply-to. Anything off the allow-list is refused BEFORE any
+          // outbox row or transport call.
+          {
+            const { GARDSSALG_OUTREACH_FROM_NAME } = require("./email-service") as typeof import("./email-service");
+            const fdContact = require("./crm-service").crmService.resolveContact("takk@example.no", null, "experiences");
+            db.prepare(`INSERT INTO crm_threads (id, contact_id, subject, category, severity, vertical_id)
+                        VALUES ('pi-fdn-thread','${fdContact.id}','Emne','innkommende','normal','experiences')`).run();
+            const outboxCount = () =>
+              (db.prepare(`SELECT COUNT(*) n FROM crm_outbox WHERE thread_id = 'pi-fdn-thread'`).get() as any).n as number;
+            const base = { intent: "resend_send", toEmails: ["takk@example.no"], createdBy: "daniel" };
+
+            // (a) no override → platform display name
+            sent.length = 0;
+            const rA = await post("/threads/pi-fdn-thread/send", { ...base, subject: "Takk A", bodyText: "Takk for svaret A" });
+            assertEq(rA.status, 200, "pi16fd1: a send without fromDisplayName succeeds");
+            assertEq(sent[0]?.from, '"Opplevagent" <kontakt@rettfrabonden.com>',
+              "pi16fd2: …and keeps the thread platform's display name");
+
+            // (b) allow-listed override → outreach sender name, same address + reply-to
+            sent.length = 0;
+            const rB = await post("/threads/pi-fdn-thread/send", {
+              ...base, subject: "Takk B", bodyText: "Takk for svaret B", fromDisplayName: GARDSSALG_OUTREACH_FROM_NAME,
+            });
+            assertEq(rB.status, 200, "pi16fd3: a send with the allow-listed fromDisplayName succeeds");
+            assertEq(sent.length, 1, "pi16fd3b: …and reaches the transport exactly once");
+            assertEq(sent[0]?.from, '"Daniel Fredriksen" <kontakt@rettfrabonden.com>',
+              "pi16fd4: …with the outreach sender name on the SAME address — the takksvar matches the outreach");
+            assertEq(sent[0]?.replyTo, "kontakt@opplevagent.no",
+              "pi16fd5: …and the thread platform's reply-to unchanged");
+            const sentAction = db.prepare(
+              `SELECT payload FROM crm_actions WHERE thread_id = 'pi-fdn-thread' AND type = 'sent' ORDER BY rowid DESC LIMIT 1`,
+            ).get() as { payload: string } | undefined;
+            assertEq(sentAction ? JSON.parse(sentAction.payload).fromDisplayName : undefined, "Daniel Fredriksen",
+              "pi16fd6: …and the override is recorded in the 'sent' action payload");
+
+            // (c) a name off the allow-list → 400, nothing queued, nothing sent
+            sent.length = 0;
+            const beforeC = outboxCount();
+            const rC = await post("/threads/pi-fdn-thread/send", {
+              ...base, subject: "Takk C", bodyText: "Takk for svaret C", fromDisplayName: "Rett fra Bonden Kundeservice",
+            });
+            assertEq(rC.status, 400, "pi16fd7: a fromDisplayName off the allow-list is a 400");
+            assertTrue(sent.length === 0 && outboxCount() === beforeC,
+              "pi16fd8: …and neither reaches the transport nor queues an outbox row");
+
+            // (d) empty string → 400 (not silently treated as 'no override')
+            sent.length = 0;
+            const beforeD = outboxCount();
+            const rD = await post("/threads/pi-fdn-thread/send", {
+              ...base, subject: "Takk D", bodyText: "Takk for svaret D", fromDisplayName: "",
+            });
+            assertEq(rD.status, 400, "pi16fd9: an empty fromDisplayName is a 400");
+            assertTrue(sent.length === 0 && outboxCount() === beforeD,
+              "pi16fd10: …and neither reaches the transport nor queues an outbox row");
+          }
+
           // ── pi16b-pi16d: the REAL sendRaw must honour the override ──
           //
           // Everything above stubs sendRaw, so it tests what the ROUTE builds

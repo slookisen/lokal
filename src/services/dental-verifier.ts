@@ -296,8 +296,9 @@ export function interpretBrregResult(verified: BrregVerifyResult): DentalBrregOu
  * (klinikk, offentlig_klinikk) (DENTAL_CLINIC_CLASS_SQL -- the SAME clause
  * the claim-pool/Places auto-select already use, so this verifier's notion
  * of "clinic" can never drift from theirs), not permanently closed
- * (is_inactive), not checked within the 30-day re-verify cycle, oldest
- * last_verified_at first with NULLs (never-verified rows) first.
+ * (is_inactive), not checked within the 30-day re-verify cycle.
+ * enrichment_state='enriched' rows are ordered before all others, then
+ * oldest last_verified_at first with NULLs (never-verified rows) first.
  *
  * Deliberately does NOT touch dental_agents.worker_id/claimed_at (the
  * enrichment-SKILL claim-pool lock, dental-claim-service.ts) -- this
@@ -340,7 +341,11 @@ export function pickDentalVerifierBatch(
           -- bound from the JS constant, so the two must be kept in sync by
           -- hand if either ever changes.
           AND (last_verified_at IS NULL OR last_verified_at <= datetime('now','-30 days'))
-     ORDER BY COALESCE(last_verified_at, '1970-01-01') ASC, id ASC
+     -- Enriched rows first (they carry the most rich-field data, so they
+     -- are the ones that can actually reach 'verified'); raw rows stay
+     -- eligible, just later. Then oldest/never-verified first.
+     ORDER BY CASE WHEN enrichment_state = 'enriched' THEN 0 ELSE 1 END ASC,
+              COALESCE(last_verified_at, '1970-01-01') ASC, id ASC
         LIMIT ?`
     )
     .all(limit) as DentalVerifierCandidateRow[];

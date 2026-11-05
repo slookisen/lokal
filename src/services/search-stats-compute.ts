@@ -33,6 +33,25 @@ export interface QueryStats {
   aiLookups?: AiLookups;
 }
 
+/**
+ * «Søk (nettsider og API)» in admin (dev-request
+ * 2026-10-22-statistikk-samme-tall-12-mnd, S2): searches on the sites' search
+ * pages and the API only. The AI assistants' channels (mcp, a2a, ai) are left
+ * out; they belong to «AI-søk». One function for the card, the compare strip,
+ * the month/week table and its CSV.
+ */
+export const SITE_SEARCH_CHANNELS = ["web", "api"] as const;
+
+export function siteSearchCount(byChannel: Partial<Record<string, number>> | null | undefined): number {
+  if (!byChannel) return 0;
+  let n = 0;
+  for (const ch of SITE_SEARCH_CHANNELS) {
+    const v = byChannel[ch];
+    if (typeof v === "number" && Number.isFinite(v)) n += v;
+  }
+  return n;
+}
+
 function tableExists(db: Db, name: string): boolean {
   return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
 }

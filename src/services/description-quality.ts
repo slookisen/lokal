@@ -30,6 +30,8 @@
 // signal, or several weaker nav-word signals *clustered together*) rather
 // than penalizing any single normal-sounding word in isolation.
 
+import { containsOrganicClaim, isDebioVerifiedValue, stripOrganicFromEntry } from "./organic-claims";
+
 // Strong, near-unambiguous nav/menu tokens that legitimately show up on
 // scraped nav bars and skip-links, but essentially never as ordinary words
 // in a farm/producer self-description written in flowing prose. Used for
@@ -865,4 +867,208 @@ export function countThemeSpamStrongHits(text: string | null | undefined): numbe
     if (m) n += m.length;
   }
   return n;
+}
+
+// ─── Organic-claim write gate (økologi S3b) ────────────────────────────────
+// A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
+// tekstrevisjon, S3 punkt 1 (automatic doors only). S0/S0b hide organic
+// claims at render time for a producer without a valid Debio status, S2
+// cleaned the stored texts; this is the WRITE-time half for the automated /
+// admin content doors (enrichment, sweeps, harvest, content-correction), so
+// new claims stop being stored in the first place. The owner portal is a
+// later slice (S3c) and does not use these helpers.
+//
+// "Valid status" is the S0 criterion every list-field read filter uses
+// (organic-claims.ts isDebioVerifiedValue on `agents.debio_verified`), which
+// the S1 register sync derives (= 1 iff debio_status 'okologisk' with a
+// valid certificate). The word list is organic-claims.ts's — no new list.
+//
+// Rules (dev-request S3.1 «Automatiske dører»):
+//   - list fields (tags, specialties, certifications, categories, product
+//     names, products[].organic): the organic words are stripped with the
+//     existing deterministic entry rule (stripOrganicFromEntry); an entry
+//     left empty is dropped, `organic: true` becomes false;
+//   - free text (about, description, a product note): never cut — a text
+//     with an organic claim is refused with REFUSED_ORGANIC_CLAIM_UNVERIFIED.
+//
+// Behind RFB_ORGANIC_CLAIM_GATE (default off). Off = every door behaves
+// byte-identically to before. PURE (no DB): callers pass the agents row's
+// debio_verified.
+
+export const ORGANIC_CLAIM_GATE_ENV = "RFB_ORGANIC_CLAIM_GATE";
+/** Outcome code of a refused free-text write (logged + returned by the doors). */
+export const REFUSED_ORGANIC_CLAIM_UNVERIFIED = "refused_organic_claim_unverified";
+/** Outcome code logged when list entries were stripped of organic words. */
+export const STRIPPED_ORGANIC_CLAIM_UNVERIFIED = "stripped_organic_claim_unverified";
+
+/** Is the organic-claim write gate on? Read per call (same spelling as RFB_DEBIO_REGISTER_SYNC). */
+export function organicClaimGateEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = env[ORGANIC_CLAIM_GATE_ENV];
+  return v === "1" || v === "true";
+}
+
+/** The agent fields the gate reads: the agents row's debio_verified. */
+export interface OrganicGateAgent {
+  debio_verified?: unknown;
+}
+
+/** Does this producer have a valid Debio status (the S0 rule)? */
+export function hasValidDebioStatus(agent: OrganicGateAgent | null | undefined): boolean {
+  return !!agent && isDebioVerifiedValue(agent.debio_verified);
+}
+
+/**
+ * Does `text` carry an organic claim for a producer WITHOUT a valid Debio
+ * status? false for a verified producer, for empty/non-string text and for
+ * the other-meaning phrases (økonomi, økosystem, økologisk mangfold …).
+ * Does not look at the flag — callers check organicClaimGateEnabled().
+ */
+export function hasUnverifiedOrganicClaim(text: unknown, agent: OrganicGateAgent | null | undefined): boolean {
+  if (hasValidDebioStatus(agent)) return false;
+  return containsOrganicClaim(text);
+}
+
+/**
+ * Should the gate act on a write for this agent right now? Flag on AND no
+ * valid status. When false the caller writes exactly what it was given.
+ */
+export function organicClaimGateApplies(
+  agent: OrganicGateAgent | null | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return organicClaimGateEnabled(env) && !hasValidDebioStatus(agent);
+}
+
+/**
+ * A list of text entries (tags, specialties, certifications) with the organic
+ * words stripped: an entry left with nothing meaningful is dropped, every
+ * other entry — and every non-string element — is kept in place, unchanged.
+ * No de-duplication (a list without organic words comes back equal).
+ * `changed` = something was stripped.
+ */
+export function stripOrganicListForWrite<T>(list: readonly T[]): { list: T[]; changed: boolean } {
+  const out: T[] = [];
+  let changed = false;
+  for (const item of list) {
+    if (typeof item !== "string") { out.push(item); continue; }
+    const cleaned = stripOrganicFromEntry(item);
+    if (cleaned === null) { changed = true; continue; }
+    if (cleaned !== item) changed = true;
+    out.push(cleaned as unknown as T);
+  }
+  return { list: out, changed };
+}
+
+/**
+ * Categories are keys («vegetables», «organic»): a key carrying an organic
+ * word is dropped whole (S0b's stripOrganicCategories rule), others kept.
+ */
+export function stripOrganicCategoriesForWrite<T>(list: readonly T[]): { list: T[]; changed: boolean } {
+  const out = list.filter((c) => !(typeof c === "string" && containsOrganicClaim(c)));
+  return { list: out, changed: out.length !== list.length };
+}
+
+export type OrganicProductsGate<T> =
+  | { ok: true; products: T[]; changed: boolean }
+  | { ok: false; field: string };
+
+/**
+ * A products list for an unverified producer: names stripped of organic words
+ * (a product whose name is left empty is dropped), `organic: true` → false.
+ * A product whose free-text `note` (or `description`) carries an organic
+ * claim cannot be cut deterministically, so the whole list is refused
+ * ({ ok: false, field: "products[i].note" }). Plain-string entries are
+ * treated as names. Non-object/non-string entries are kept as they are.
+ */
+export function gateOrganicProductsForWrite<T>(products: readonly T[]): OrganicProductsGate<T> {
+  const out: T[] = [];
+  let changed = false;
+  for (let i = 0; i < products.length; i++) {
+    const p = products[i] as unknown;
+    if (typeof p === "string") {
+      const cleaned = stripOrganicFromEntry(p);
+      if (cleaned === null) { changed = true; continue; }
+      if (cleaned !== p) changed = true;
+      out.push(cleaned as unknown as T);
+      continue;
+    }
+    if (!p || typeof p !== "object" || Array.isArray(p)) { out.push(p as T); continue; }
+    const obj = p as Record<string, unknown>;
+    for (const textKey of ["note", "description"]) {
+      if (containsOrganicClaim(obj[textKey])) return { ok: false, field: `products[${i}].${textKey}` };
+    }
+    let next: Record<string, unknown> = obj;
+    if (typeof obj.name === "string") {
+      const cleaned = stripOrganicFromEntry(obj.name);
+      if (cleaned === null) { changed = true; continue; }
+      if (cleaned !== obj.name) { next = { ...next, name: cleaned }; changed = true; }
+    }
+    if (obj.organic) { next = { ...next, organic: false }; changed = true; }
+    out.push(next as T);
+  }
+  return { ok: true, products: out, changed };
+}
+
+export interface OrganicFieldsGate {
+  /** A shallow copy of the input with the list fields stripped (text fields left as given). */
+  data: Record<string, unknown>;
+  /** Free-text fields with an organic claim: `key` is the body key, `field` the exact path. */
+  refused: Array<{ key: string; field: string }>;
+  /** Body keys whose list entries were stripped. */
+  stripped: string[];
+}
+
+/** Body keys the gate reads as free text (refused whole) and as lists (stripped). */
+const ORGANIC_GATE_TEXT_KEYS = ["about", "description"] as const;
+const ORGANIC_GATE_LIST_KEYS = ["specialties", "certifications", "tags"] as const;
+
+/**
+ * The organic-claim gate over one write body for a producer WITHOUT a valid
+ * Debio status (the caller checks organicClaimGateApplies first): about /
+ * description with an organic claim are listed in `refused`; specialties,
+ * certifications and tags are stripped (stripOrganicListForWrite), categories
+ * lose organic keys, products go through gateOrganicProductsForWrite (a note
+ * with a claim → refused key "products"), skills[].tags are stripped. Keys
+ * that are absent or not arrays are left exactly as given. Never mutates the
+ * input.
+ */
+export function gateOrganicFieldsForWrite(input: Record<string, unknown>): OrganicFieldsGate {
+  const data: Record<string, unknown> = { ...input };
+  const refused: Array<{ key: string; field: string }> = [];
+  const stripped: string[] = [];
+  for (const k of ORGANIC_GATE_TEXT_KEYS) {
+    if (typeof data[k] === "string" && containsOrganicClaim(data[k])) refused.push({ key: k, field: k });
+  }
+  for (const k of ORGANIC_GATE_LIST_KEYS) {
+    const v = data[k];
+    if (!Array.isArray(v)) continue;
+    const g = stripOrganicListForWrite(v);
+    if (g.changed) { data[k] = g.list; stripped.push(k); }
+  }
+  if (Array.isArray(data.categories)) {
+    const g = stripOrganicCategoriesForWrite(data.categories as unknown[]);
+    if (g.changed) { data.categories = g.list; stripped.push("categories"); }
+  }
+  if (Array.isArray(data.products)) {
+    const g = gateOrganicProductsForWrite(data.products as unknown[]);
+    if (!g.ok) refused.push({ key: "products", field: g.field });
+    else if (g.changed) { data.products = g.products; stripped.push("products"); }
+  }
+  if (Array.isArray(data.skills)) {
+    let changed = false;
+    const skills = (data.skills as unknown[]).map((sk) => {
+      if (!sk || typeof sk !== "object" || !Array.isArray((sk as { tags?: unknown }).tags)) return sk;
+      const g = stripOrganicListForWrite((sk as { tags: unknown[] }).tags);
+      if (!g.changed) return sk;
+      changed = true;
+      return { ...(sk as object), tags: g.list };
+    });
+    if (changed) { data.skills = skills; stripped.push("skills"); }
+  }
+  return { data, refused, stripped };
+}
+
+/** One log line per gate outcome (agent id + field), the doors' shared spelling. */
+export function logOrganicClaimGate(door: string, outcome: string, agentId: string, field: string): void {
+  console.log(`[organic-claim-gate] ${door}: ${outcome} agent=${agentId} field=${field}`);
 }

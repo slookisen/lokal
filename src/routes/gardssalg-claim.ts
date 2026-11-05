@@ -20,12 +20,14 @@ import {
   CLAIM_MANUAL_FALLBACK_EMAIL,
   CLAIM_EDITABLE_FIELDS,
   GARDSSALG_OWNER_SESSION_COOKIE,
+  isGardssalgProviderClaimed,
   type ClaimProviderRow,
 } from "../services/gardssalg-claim";
 import { getGardssalgOwnerStats } from "../services/gardssalg-owner-stats-service";
 import { emailService } from "../services/email-service";
 import { generalLimiter } from "../middleware/security";
 import { ownerBookingEnableBlock, type OwnerBookingBlock } from "../services/gardssalg-booking-gate";
+import { createGardssalgOwnerFeaturesRouter, gardssalgOwnerFeaturesTabOpen } from "./gardssalg-owner-features";
 
 // ─────────────────────────────────────────────────────────────────
 // GÅRDSSALG PRODUCER OWNER-CLAIM — dev-request 2026-07-21-opplevagent-
@@ -504,6 +506,9 @@ router.get("/kategori/gardssalg/eier/:providerSlug", generalLimiter, async (req:
 // nothing — no live derivation can produce it, so a client naming it still
 // lands on issueClaimMagicLink()'s "invalid_selection" (there is no such
 // candidate to match), which is what the j2 regression test pins.
+//
+// "outreach_delivered" (OA-01, 2026-10-31): the Opplevagent-outreach tier —
+// listed so a producer offered it next to another address can pick it.
 const CLAIM_EMAIL_SOURCES = [
   "brreg_contact",
   "verified_domain_address",
@@ -512,6 +517,7 @@ const CLAIM_EMAIL_SOURCES = [
   "found_contact_page",
   "found_site_other",
   "found_umbrella_member",
+  "outreach_delivered",
 ] as const;
 function parseSelectedSource(value: unknown): (typeof CLAIM_EMAIL_SOURCES)[number] | undefined {
   return typeof value === "string" && (CLAIM_EMAIL_SOURCES as readonly string[]).includes(value)
@@ -617,13 +623,18 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
     else if (status === "resumed") alert = `<div class="gc-alert gc-alert-ok" role="status">Profilen er synlig igjen.</div>`;
     else if (status === "visibility_error") alert = `<div class="gc-alert gc-alert-error" role="alert">Klarte ikke å endre synligheten. Prøv igjen.</div>`;
     else if (status === "release_error") alert = `<div class="gc-alert gc-alert-error" role="alert">Klarte ikke å gi tilbake feltet. Prøv igjen.</div>`;
+    else if (status === "managed_in_mine_valg") alert = `<div class="gc-alert gc-alert-error" role="alert">Dette velger du nå i «Mine valg». Ingen endringer er lagret.</div>`;
 
     // content_source='manual' locks the content fields only; the booking
     // switch is the owner's consent and follows the shared gate instead.
     const locked = provider.content_source === "manual";
     const bookingBlock = portalBookingBlock(provider);
     const bookingDisabled = !!bookingBlock;
-    const nothingEditable = locked && bookingDisabled;
+    // O1b (v2 principle 7, «Én bryter, ett sted»): with the «Mine valg» tab
+    // open, the booking checkbox and the pause card live only there.
+    const mineValg = mineValgOwnsBookingAndPause(provider.id);
+    const nothingEditable = locked && (mineValg || bookingDisabled);
+    const visibilityState = getOwnedVisibilityStateById(provider.id) ?? "visible";
     let products: string[] = [];
     try { const p = JSON.parse(provider.products || "[]"); if (Array.isArray(p)) products = p.filter((x) => typeof x === "string"); } catch { /* ignore */ }
 
@@ -654,7 +665,7 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
         ${alert}
         ${locked ? `<div class="gc-alert gc-alert-error" role="alert">Teksten i denne profilen er låst av Opplevagent-support. Kontakt ${CLAIM_MANUAL_FALLBACK_EMAIL} for å endre den. Booking kan du fortsatt slå av og på selv.</div>` : ""}
       </div>
-      <div class="gc-card">
+      ${mineValgCardHtml(slug, provider.id)}<div class="gc-card">
         <h2>Profilinformasjon</h2>
         <form id="gc-profile-form" method="post" action="/kategori/gardssalg/eier/${encodeURIComponent(slug)}/save" novalidate>
           <div class="gc-field">
@@ -682,11 +693,11 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
             <input id="f-website" name="field_hjemmeside" type="url" value="${escapeHtml(provider.hjemmeside || "")}" ${locked ? "disabled" : ""}>
             ${lockNote("hjemmeside")}
           </div>
-          <div class="gc-field gc-toggle-row">
+          ${mineValg ? "" : `<div class="gc-field gc-toggle-row">
             <input id="f-booking" name="field_booking_live" type="checkbox" value="1" style="width:auto;min-height:0;" ${provider.booking_live ? "checked" : ""} ${bookingDisabled ? "disabled" : ""}>
             <label for="f-booking" style="margin:0;">Aktiver reservasjoner (booking) for besøkende</label>
           </div>
-          ${bookingBlock ? bookingBlockAlertHtml(bookingBlock) : ""}
+          `}${!mineValg && bookingBlock ? bookingBlockAlertHtml(bookingBlock) : ""}
           <div class="gc-form-actions">
             <button type="submit" id="gc-save-btn" class="gc-btn gc-btn-primary" ${nothingEditable ? "disabled" : ""}>Lagre alle endringer</button>
             <a href="/kategori/gardssalg/produsent/${encodeURIComponent(slug)}" class="gc-btn gc-btn-secondary">Se profilen</a>
@@ -695,7 +706,7 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
         </form>
         <form id="gc-release-form" method="post" action="${releaseAction}"></form>
       </div>
-      ${visibilityCardHtml(slug, getOwnedVisibilityStateById(provider.id) ?? "visible")}
+      ${mineValg && ownerControlsVisibility(visibilityState) ? mineValgMovedCardHtml(slug) : visibilityCardHtml(slug, visibilityState)}
       <div class="gc-card">
         <h2>Statistikk</h2>
         <div id="gc-stats" class="gc-stats"><div class="gc-stat"><div class="gc-stat-num">…</div><div class="gc-stat-label">Laster</div></div></div>
@@ -712,13 +723,16 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
             el.innerHTML =
               '<div class="gc-stat"><div class="gc-stat-num">' + j.stats.humanViews + '</div><div class="gc-stat-label">Sidevisninger fra mennesker (' + j.stats.windowDays + ' dager)</div></div>' +
               '<div class="gc-stat" title="Ganger en AI-assistent (ChatGPT, Claude, Perplexity …) hentet siden din for noen som spurte"><div class="gc-stat-num">' + j.stats.aiSearchViews + '</div><div class="gc-stat-label">AI-søk (' + j.stats.windowDays + ' dager)</div></div>';
-            // «Med i AI-svar»: sent to the AI, not seen by a person; a minimum.
+            // «Med i AI-søk»: among the results an AI fetched, not seen by a person; a minimum.
+            // The window is the last 12 months with the public tile's label (statistikk S2d).
             var dl = j.stats.aiDeliveries;
             if (dl && dl.window && dl.allTime) {
-              var dlTip = "Antall ganger profilen er sendt til AI-assistenter som ChatGPT og Claude som svar på spørsmål. Tallet viser ikke hvor mange som så den.";
+              var dlTip = "Antall ganger profilen var blant treffene en AI-assistent som ChatGPT eller Claude hentet for noen som spurte. Forsiden telles ikke. Tallet viser ikke hvor mange som så den.";
+              var dlSinceMs = dl.allTime.countingSince ? Date.parse(dl.allTime.countingSince + "T00:00:00Z") : NaN;
+              var dlSince = isNaN(dlSinceMs) ? "" : new Date(dlSinceMs).toLocaleDateString("nb-NO", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
               el.innerHTML +=
-                '<div class="gc-stat" title="' + dlTip + '"><div class="gc-stat-num">' + dl.window.total + '</div><div class="gc-stat-label">Med i AI-svar, sendt til AI-en (' + dl.window.windowDays + ' dager)</div></div>' +
-                '<div class="gc-stat" title="' + dlTip + '"><div class="gc-stat-num">' + dl.allTime.total + '</div><div class="gc-stat-label">Med i AI-svar, sendt til AI-en (hele perioden)</div></div>';
+                '<div class="gc-stat" title="' + dlTip + '"><div class="gc-stat-num">' + dl.window.total + '</div><div class="gc-stat-label">Med i AI-søk: ganger profilen var blant treffene en AI-assistent hentet (' + dl.windowLabel + ')</div></div>' +
+                '<div class="gc-stat" title="' + dlTip + '"><div class="gc-stat-num">' + dl.allTime.total + '</div><div class="gc-stat-label">Med i AI-søk: ganger profilen var blant treffene en AI-assistent hentet (' + (dlSince ? 'siden ' + dlSince : 'hele perioden') + ')</div></div>';
             }
             if (note && j.stats.notAvailable && j.stats.notAvailable.length) {
               note.textContent = "Ikke tilgjengelig ennå: " + j.stats.notAvailable.join(", ") + ".";
@@ -740,8 +754,8 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
               products: String(fd.get("field_products") || "").split(",").map(function (s) { return s.trim(); }).filter(Boolean),
               hjemmeside: fd.get("field_hjemmeside"),
             }`};
-            payload.booking_live = fd.get("field_booking_live") ? 1 : 0;
-            var btn = document.getElementById("gc-save-btn");
+            ${mineValg ? "" : `payload.booking_live = fd.get("field_booking_live") ? 1 : 0;
+            `}var btn = document.getElementById("gc-save-btn");
             var settled = false;
             function showReceipt(success, message) {
               if (statusEl) {
@@ -788,6 +802,53 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
   }
 });
 
+// «Mine valg» tab (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg,
+// O1a): a link card, only while the tab is open for this producer
+// (OA_OWNER_FEATURES_ENABLED + allowlist + test producer). Otherwise nothing
+// is added and the portal is exactly as before.
+function mineValgCardHtml(slug: string, providerId: string): string {
+  if (!gardssalgOwnerFeaturesTabOpen(providerId)) return "";
+  return `<div class="gc-card" data-mine-valg="1">
+        <h2>Mine valg</h2>
+        <p>Bestem hvem som finner deg og om du tar imot besøk, og se hva profilen har gjort for deg.</p>
+        <div class="gc-form-actions"><a href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}/valg" class="gc-btn gc-btn-primary">Åpne «Mine valg»</a></div>
+      </div>`;
+}
+
+// O1b (v2 principle 7, «Én bryter, ett sted»): while the «Mine valg» tab is
+// open for this producer (flag + allowlist + test producer, the same check as
+// the tab itself, plus the live claim the tab requires), «Ta imot besøk»
+// (booking.enabled ↔ booking_live) and the profile pause (visibility.profile)
+// are chosen there only. The portal then shows no booking checkbox and no
+// pause card, and its old write paths (the save form's booking field, the
+// update-profile API's booking_live, the pause/resume endpoints) change
+// neither. Tab not open → the portal and those paths are exactly as before.
+function mineValgOwnsBookingAndPause(providerId: string): boolean {
+  try {
+    return gardssalgOwnerFeaturesTabOpen(providerId) && isGardssalgProviderClaimed(providerId);
+  } catch {
+    return false;
+  }
+}
+
+/** The owner's own pause applies only to a visible or owner-paused profile (removed / quality-hidden are not the owner's switch). */
+function ownerControlsVisibility(state: OwnedVisibilityState): boolean {
+  return state === "visible" || state === "owner_pause";
+}
+
+/** Pointer that replaces the pause card while «Mine valg» owns booking and the pause. */
+function mineValgMovedCardHtml(slug: string): string {
+  const valg = `/kategori/gardssalg/eier/${encodeURIComponent(slug)}/valg`;
+  return `<div class="gc-card" data-moved-to-mine-valg="1">
+        <h2>Besøk og pause</h2>
+        <p>Om du tar imot besøk, og pause av profilen, velger du nå i «Mine valg».</p>
+        <div class="gc-form-actions">
+          <a href="${valg}#gruppe-booking" class="gc-btn gc-btn-secondary">Gå til besøk i «Mine valg»</a>
+          <a href="${valg}#gruppe-visibility" class="gc-btn gc-btn-secondary">Gå til pause i «Mine valg»</a>
+        </div>
+      </div>`;
+}
+
 // ─────────────────────────────────────────────────────────────────
 // POST /kategori/gardssalg/eier/:providerSlug/save — no-JS fallback for the
 // portal form (forwards to the JSON update-profile endpoint with the
@@ -820,7 +881,8 @@ router.post(
           products: String(b.field_products || "").split(",").map((s: string) => s.trim()).filter(Boolean),
           hjemmeside: b.field_hjemmeside,
         };
-    payload.booking_live = b.field_booking_live ? 1 : 0;
+    // O1b: with «Mine valg» open, a posted booking field is ignored (booking_live unchanged).
+    if (!mineValgOwnsBookingAndPause(provider.id)) payload.booking_live = b.field_booking_live ? 1 : 0;
     const outcome = updateClaimedProviderProfile(provider.id, payload);
     if (!outcome.ok && outcome.error === "booking_blocked") return res.redirect(303, `${base}?status=booking_blocked`);
     if (!outcome.ok) return res.redirect(303, `${base}?status=error`);
@@ -907,6 +969,9 @@ for (const action of ["pause", "resume"] as const) {
     const session = sessionFromRequest(req);
     if (!session.valid) return res.status(401).json({ success: false, error: "session_invalid" });
     if (session.providerId !== providerId) return res.status(403).json({ success: false, error: "forbidden" });
+    if (mineValgOwnsBookingAndPause(providerId)) {
+      return res.status(409).json({ success: false, error: "managed_in_mine_valg", message: "Pause av profilen velger du nå i «Mine valg»." });
+    }
     return visibilityJson(res, run(providerId));
     },
   );
@@ -924,6 +989,7 @@ for (const action of ["pause", "resume"] as const) {
     if (!session.valid || session.providerId !== provider.id) {
       return res.redirect(303, `/kategori/gardssalg/eier/${encodeURIComponent(slug)}`);
     }
+    if (mineValgOwnsBookingAndPause(provider.id)) return res.redirect(303, `${base}?status=managed_in_mine_valg`);
     const outcome = run(provider.id);
     return res.redirect(303, `${base}?status=${outcome.ok ? (action === "pause" ? "paused" : "resumed") : "visibility_error"}`);
   });
@@ -994,6 +1060,12 @@ router.post("/api/opplevelser/gardssalg-claim/:providerId/update-profile", gener
 
   const body: Record<string, unknown> = {};
   for (const f of CLAIM_EDITABLE_FIELDS) if (f in (req.body || {})) body[f] = (req.body as any)[f];
+  // O1b: with «Mine valg» open, booking_live is chosen there only; a posted value is ignored.
+  let ignoredFields: string[] | null = null;
+  if ("booking_live" in body && mineValgOwnsBookingAndPause(providerId)) {
+    delete body.booking_live;
+    ignoredFields = ["booking_live"];
+  }
 
   const outcome = updateClaimedProviderProfile(providerId, body);
   if (!outcome.ok && outcome.error === "booking_blocked") {
@@ -1007,7 +1079,10 @@ router.post("/api/opplevelser/gardssalg-claim/:providerId/update-profile", gener
     });
   }
   if (!outcome.ok) return res.status(404).json({ success: false, error: outcome.error });
-  return res.json({ success: true, updated_fields: outcome.updatedFields, skipped_fields: outcome.skippedFields });
+  return res.json({
+    success: true, updated_fields: outcome.updatedFields, skipped_fields: outcome.skippedFields,
+    ...(ignoredFields ? { ignored_fields: ignoredFields, message: "Besøk velger du nå i «Mine valg»." } : {}),
+  });
 });
 
 // G1 pkt 2: «gi tilbake» as JSON — {field} -> 200 {released} | 400 unknown_field
@@ -1080,6 +1155,10 @@ router.get("/api/opplevelser/gardssalg-claim/:providerId/session-status", genera
     return res.json({ isOwner: false });
   }
 });
+
+// «Mine valg» for gårdssalg owners (O1a): the tab and its JSON API, behind
+// OA_OWNER_FEATURES_ENABLED + the allowlist; the same shell and session.
+router.use(createGardssalgOwnerFeaturesRouter({ shell, sessionFromRequest }));
 
 export default router;
 export type { ClaimProviderRow };

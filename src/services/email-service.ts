@@ -26,6 +26,29 @@ export function maskEmails(s: string): string {
   return s.replace(/[^\s<>"'(),;:]+@[^\s<>"'(),;:]+/g, "[email]");
 }
 
+// ─── Contact-form copy (sendAdminContactFormCopy) ─────────────────
+const CONTACT_FORM_PLATFORM_LABELS: Record<"rfb" | "experiences" | "dental", string> = {
+  rfb: "Rett fra Bonden",
+  experiences: "Opplevagent",
+  dental: "Finn-tannlege",
+};
+const CONTACT_FORM_COPY_SUBJECT_MAX = 150;
+// C0 + DEL + C1 controls (CR/LF among them) and the Unicode line/paragraph separators.
+const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g;
+// Bidi embedding/override/isolate marks: they can make a subject display reversed.
+const BIDI_CHARS_RE = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+
+/** Visitor text for a header or a one-line field: controls → space, bidi marks dropped, runs collapsed. */
+function toOneLine(s: string): string {
+  return String(s ?? "").replace(CONTROL_CHARS_RE, " ").replace(BIDI_CHARS_RE, "").replace(/\s+/g, " ").trim();
+}
+
+/** Caps at `max` code points (never splits a surrogate pair), ending in "…" when cut. */
+function capChars(s: string, max: number): string {
+  const chars = Array.from(s);
+  return chars.length <= max ? s : chars.slice(0, max - 1).join("").trimEnd() + "…";
+}
+
 export interface EmailOptions {
   to: string;
   subject: string;
@@ -61,6 +84,13 @@ export interface EmailOptions {
    */
   redactRecipientInLogs?: boolean;
   /**
+   * Contact-form copy (2026-11-01): the subject carries free text a visitor
+   * wrote, so the send log must not repeat it. When set, every log line in
+   * sendEmail shows this value instead of the subject; the mail itself still
+   * carries the real subject. Omitted leaves the logging unchanged.
+   */
+  logSubjectAs?: string;
+  /**
    * Full RFC 5322 From header, e.g. `"Opplevagent" <kontakt@rettfrabonden.com>`.
    *
    * Steg 3 of the CRM platform split. A reviewer measured that wiring only
@@ -79,6 +109,13 @@ export interface EmailOptions {
    * leaves the header exactly as before.
    */
   omitAgentHeader?: boolean;
+  /**
+   * dev-request 2026-10-22-opplevagent-utsending-v4 (endring 7): Message-ID of
+   * the message this one answers (angle brackets included). Sets both
+   * `In-Reply-To` and `References` so the mail lands in the same thread.
+   * Omitted leaves the headers exactly as before.
+   */
+  inReplyToMessageId?: string;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -285,17 +322,25 @@ export class EmailService {
     }
   }
 
+  /**
+   * «Profilen til X er nå din» — sent when Daniel approves a claim by hand
+   * (POST /admin/agents/claim-review-approve). K5 (dev-request
+   * 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post, text approved by Daniel):
+   * `loginUrl` is a one-time, 15-minute /magic-link-verify link straight into
+   * the owner portal (/eier), and the mail names the portal address
+   * (<host>/eier/<agentId>) the owner logs in on later with this address.
+   */
   async sendClaimConfirmation(
     email: string,
     agentName: string,
-    dashboardUrl: string,
-    agentId?: string
+    loginUrl: string,
+    agentId: string
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     try {
-      const subject = `Gratulerer! ${agentName} er nå ditt på ${this.brand}`;
+      const subject = `Profilen til ${agentName} er nå din på ${this.brand}`;
 
-      const htmlContent = this.generateClaimConfirmationHtml(agentName, dashboardUrl, agentId);
-      const textContent = this.generateClaimConfirmationText(agentName, dashboardUrl, agentId);
+      const htmlContent = this.generateClaimConfirmationHtml(agentName, loginUrl, agentId);
+      const textContent = this.generateClaimConfirmationText(agentName, loginUrl, agentId);
 
       return await this.sendEmail({
         to: email,
@@ -321,6 +366,7 @@ export class EmailService {
     const redact = options.redactRecipientInLogs === true;
     const logTo = (to: string) => (redact ? "[redacted]" : to);
     const logErr = (msg: string) => (redact ? maskEmails(msg) : msg);
+    const logSubject = (subject: string) => options.logSubjectAs ?? subject;
     // ── Test-send guard (dev-request 2026-07-26-booking-test-send-guard) ──
     // Applied FIRST, ahead of the dry-run short-circuit and every other
     // branch below, so there is no code path on which a test-flagged email
@@ -338,7 +384,7 @@ export class EmailService {
         logger.warn('Test-send redirect applied', {
           intendedRecipient: logTo(options.to),
           redirectedTo: logTo(redirected.to),
-          subject: redirected.subject,
+          subject: logSubject(redirected.subject),
         });
         options = { ...options, ...redirected };
       } catch (err) {
@@ -350,7 +396,7 @@ export class EmailService {
               : 'test_send_redirect_failed';
         logger.error('Test-send BLOCKED — nothing sent', {
           intendedRecipient: logTo(options.to),
-          subject: options.subject,
+          subject: logSubject(options.subject),
           error,
         });
         return { success: false, error };
@@ -363,7 +409,7 @@ export class EmailService {
     if (!this.isConfigured || (this.transporter === this.envTransporter && isEmailForceDryRun())) {
       logger.info('DRY RUN: Would send email', {
         to: logTo(options.to),
-        subject: options.subject,
+        subject: logSubject(options.subject),
       });
       return { success: true, messageId: 'DRY_RUN' };
     }
@@ -375,6 +421,10 @@ export class EmailService {
       if (options.listUnsubscribe) {
         headers['List-Unsubscribe'] = options.listUnsubscribe;
         if (options.listUnsubscribePost) headers['List-Unsubscribe-Post'] = options.listUnsubscribePost;
+      }
+      if (options.inReplyToMessageId) {
+        headers['In-Reply-To'] = options.inReplyToMessageId;
+        headers['References'] = options.inReplyToMessageId;
       }
 
       const mailOptions: Record<string, unknown> = {
@@ -405,7 +455,7 @@ export class EmailService {
 
       logger.info('Email sent successfully', {
         to: logTo(options.to),
-        subject: options.subject,
+        subject: logSubject(options.subject),
         messageId: info.messageId as string,
       });
 
@@ -444,6 +494,59 @@ export class EmailService {
       subject: `Logg inn på eierportalen for ${agentName} — Rett fra Bonden`,
       htmlContent: buildOwnerMagicLinkHtml(agentName, verifyUrl),
       textContent: buildOwnerMagicLinkText(agentName, verifyUrl),
+    });
+  }
+
+  /**
+   * dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S1b punkt 7: the owner
+   * asked for orders to go to a new address. Sent to that NEW address; the
+   * link opens a confirm page (GET changes nothing). A new mail of its own —
+   * no existing template is touched.
+   */
+  async sendOwnerOrderEmailConfirm(opts: {
+    to: string;
+    agentName: string;
+    confirmUrl: string;
+    validHours: number;
+  }): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const { to, agentName, confirmUrl, validHours } = opts;
+    const safeName = epEscape(agentName);
+    const safeUrl = epEscape(confirmUrl);
+    const html = `<!DOCTYPE html>
+<html lang="nb">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',sans-serif;line-height:1.6;color:#333;max-width:600px;margin:0 auto;padding:40px 20px;">
+  <div style="font-size:22px;font-weight:700;color:#2D5016;border-bottom:3px solid #2D5016;padding-bottom:16px;margin-bottom:24px;">Rett fra <span style="color:#D4A373;">Bonden</span></div>
+  <h1 style="font-size:20px;color:#1a1a1a;">Bekreft ny adresse for bestillinger</h1>
+  <p>Eieren av <strong>${safeName}</strong> har bedt om at bestillinger fra kunder på Rett fra Bonden skal sendes til denne e-postadressen.</p>
+  <p>Klikk knappen under for å bekrefte. Til du har bekreftet, går bestillingene til den gamle adressen.</p>
+  <p style="text-align:center;"><a href="${safeUrl}" style="display:inline-block;background:#2D5016;color:#ffffff;padding:14px 32px;text-decoration:none;border-radius:8px;font-weight:700;">Bekreft adressen</a></p>
+  <p style="font-size:14px;color:#666;">Eller kopier og lim inn denne lenken i nettleseren:<br><code style="word-break:break-all;">${safeUrl}</code></p>
+  <p>Lenken er gyldig i ${validHours} timer.</p>
+  <p>Hvis du ikke kjenner til dette, kan du trygt ignorere e-posten. Da endres ingenting.</p>
+  <p style="margin-top:36px;padding-top:18px;border-top:1px solid #eee;font-size:13px;color:#666;">Mvh,<br>Rett fra Bonden — kontakt@rettfrabonden.com<br>https://rettfrabonden.com</p>
+</body>
+</html>`;
+    const text = `Bekreft ny adresse for bestillinger
+
+Eieren av ${agentName} har bedt om at bestillinger fra kunder på Rett fra Bonden skal sendes til denne e-postadressen.
+
+Åpne lenken under for å bekrefte. Til du har bekreftet, går bestillingene til den gamle adressen.
+
+${confirmUrl}
+
+Lenken er gyldig i ${validHours} timer.
+
+Hvis du ikke kjenner til dette, kan du trygt ignorere e-posten. Da endres ingenting.
+
+Mvh,
+Rett fra Bonden — kontakt@rettfrabonden.com
+https://rettfrabonden.com`;
+    return await this.sendEmail({
+      to,
+      subject: `Bekreft ny adresse for bestillinger — ${agentName}`,
+      htmlContent: html,
+      textContent: text,
     });
   }
 
@@ -501,15 +604,22 @@ export class EmailService {
     to: string,
     providerName: string,
     profileUrl: string,
-    opts: { isTestSend?: boolean; template?: GardssalgOutreachTemplate } = {},
+    opts: {
+      isTestSend?: boolean;
+      template?: GardssalgOutreachTemplate;
+      /** v4 render context (subject arm, {eier_url}, {måned}, first subject). */
+      ctx?: GardssalgOutreachRenderCtx;
+      /** Message-ID of the first mail; set on the v4 follow-up so it threads. */
+      inReplyToMessageId?: string;
+    } = {},
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     // dev-request 2026-08-15-outreach-ab-standard-vs-personlig-drikke:
     // opts.template selects the rendered draft ("standard" HTML template vs
-    // the RFB-style plain-text "personal" variant). Omitted = "standard",
-    // byte-identical to the pre-existing behaviour. Sender identity is the
-    // SAME for both variants — the draft text is the experiment's only
-    // variable.
-    const rendered = renderGardssalgOutreachVariant(opts.template ?? "standard", providerName, profileUrl);
+    // the RFB-style plain-text "personal" variant; since 2026-10-22 also the
+    // v4 texts E/F). Omitted = "standard", byte-identical to the pre-existing
+    // behaviour. Sender identity is the SAME for every variant — the draft
+    // text is the experiment's only variable.
+    const rendered = renderGardssalgOutreachVariant(opts.template ?? "standard", providerName, profileUrl, opts.ctx);
     // G1 point 6 (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg): signed
     // List-Unsubscribe + One-Click (RFC 8058) on cold gårdssalg mail. Headers only —
     // no template text changes. Behind OUTREACH_UNSUBSCRIBE_ENABLED (the /avmeld route's
@@ -521,8 +631,12 @@ export class EmailService {
       ...(rendered.html !== undefined ? { htmlContent: rendered.html } : {}),
       textContent: rendered.text,
       replyTo: GARDSSALG_OUTREACH_REPLY_TO,
-      from: crmFromHeader("experiences"),
+      // dev-request 2026-10-22-opplevagent-utsending-v4 (endring 5): the
+      // outreach goes out in Daniel's name. Address and Reply-To unchanged;
+      // every other Opplevagent mail keeps crmFromHeader("experiences").
+      from: gardssalgOutreachFromHeader(),
       isTestSend: opts.isTestSend,
+      ...(opts.inReplyToMessageId ? { inReplyToMessageId: opts.inReplyToMessageId } : {}),
       ...(unsub ? { listUnsubscribe: unsub.listUnsubscribe, listUnsubscribePost: unsub.listUnsubscribePost } : {}),
     });
   }
@@ -655,20 +769,6 @@ export class EmailService {
       margin: 20px 0;
       border-radius: 4px;
     }
-    .cta-button {
-      display: inline-block;
-      background: #2d5f2e;
-      color: white;
-      padding: 14px 32px;
-      text-decoration: none;
-      border-radius: 6px;
-      font-weight: bold;
-      margin: 20px 0;
-      text-align: center;
-    }
-    .cta-button:hover {
-      background: #1e4620;
-    }
     .agent-link {
       color: #2d5f2e;
       text-decoration: none;
@@ -710,7 +810,7 @@ export class EmailService {
 
     <p style="font-weight: bold; margin-top: 20px;">Det tar mindre enn 5 minutter. Klikk her:</p>
 
-    <a href="${this.escapeHtml(claimUrl)}" class="cta-button">Krav din agent på ${this.brand}</a>
+    ${ctaButtonHtml({ href: this.escapeHtml(claimUrl), label: `Krav din agent på ${this.brand}`, color: "#2d5f2e", radius: "6px", margin: "20px 0" })}
 
     <p style="font-size: 14px; color: #666; margin-top: 25px;">Har du spørsmål? Svar på denne e-posten eller kontakt oss på <a href="mailto:${this.supportEmail}" class="footer-link">${this.supportEmail}</a>.</p>
 
@@ -840,24 +940,20 @@ Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
   }
 
   /**
-   * The «slå på bestillinger» link in the claim confirmation. F7 (dev-request
-   * 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel): with the agent
-   * id it points at the portal card, /eier/<id>/portal#bestillinger, where
-   * the switch is. The login link (dashboardUrl) goes through /selger, a page
-   * with no such switch, so appending #bestillinger to it led nowhere. The
-   * portal sends a not-yet-logged-in owner to the login page for that agent.
-   * Without an agent id the old behaviour stays (callers that only have a
-   * dashboard URL).
+   * Where the owner logs in later: <APP_URL>/eier/<agentId>. `text` is the
+   * same address without the scheme (default «rettfrabonden.com/eier/<id>»),
+   * as the claim confirmation shows it; `url` is what it links to. K5
+   * replaced F7's order-toggle link (/eier/<id>/portal#bestillinger): the
+   * login link now lands in the portal itself, where that switch is.
    */
-  private orderToggleUrl(dashboardUrl: string, agentId?: string): string {
-    if (agentId) {
-      const base = (process.env.APP_URL || 'https://rettfrabonden.com').replace(/\/+$/, '');
-      return `${base}/eier/${encodeURIComponent(agentId)}/portal#bestillinger`;
-    }
-    return dashboardUrl.includes('#') ? dashboardUrl : `${dashboardUrl}#bestillinger`;
+  private ownerPortalAddress(agentId: string): { url: string; text: string } {
+    const base = (process.env.APP_URL || 'https://rettfrabonden.com').replace(/\/+$/, '');
+    const url = `${base}/eier/${encodeURIComponent(agentId)}`;
+    return { url, text: url.replace(/^https?:\/\//i, '') };
   }
 
-  private generateClaimConfirmationHtml(agentName: string, dashboardUrl: string, agentId?: string): string {
+  private generateClaimConfirmationHtml(agentName: string, loginUrl: string, agentId: string): string {
+    const portal = this.ownerPortalAddress(agentId);
     return `
 <!DOCTYPE html>
 <html lang="no">
@@ -874,23 +970,6 @@ Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
       background: #ffffff;
       padding: 40px 20px;
     }
-    .success-box {
-      background: #e8f5e9;
-      border-left: 4px solid #2d5f2e;
-      padding: 20px;
-      margin: 20px 0;
-      border-radius: 4px;
-    }
-    .cta-button {
-      display: inline-block;
-      background: #2d5f2e;
-      color: white;
-      padding: 14px 32px;
-      text-decoration: none;
-      border-radius: 6px;
-      font-weight: bold;
-      margin: 20px 0;
-    }
     .logo {
       font-size: 20px;
       font-weight: bold;
@@ -901,44 +980,45 @@ Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
 </head>
 <body>
   <div class="container">
-    <div class="logo">🌾 ${this.brand}</div>
-    <h1>Gratulerer!</h1>
-    <div class="success-box">
-      <p><strong>${this.escapeHtml(agentName)}</strong> er nå ditt på ${this.brand}.</p>
-    </div>
-    <p>Din agent er klar. Du kan nå:</p>
+    <div class="logo">🌾 ${this.escapeHtml(this.brand)}</div>
+    <h1>Hei!</h1>
+    <p>Profilen til <strong>${this.escapeHtml(agentName)}</strong> er nå koblet til deg, og du kan endre den selv når du vil.</p>
+    <p>I eierportalen kan du:</p>
     <ul>
-      <li>Oppdatere informasjon om produkter og åpningstider</li>
-      <li>Se hvor dine produkter blir funnet av kundene</li>
-      <li>Følge med på interaksjoner og preferanser</li>
+      <li>rette varer, åpningstider og kontaktinfo</li>
+      <li>se hvor ofte profilen blir vist og besøkt</li>
+      <li>velge om du vil få bestillinger fra kunder på e-post</li>
     </ul>
-    <a href="${this.escapeHtml(dashboardUrl)}" class="cta-button">Gå til dashboarden din</a>
-    <p>Vil du motta bestillinger fra kunder på e-post? Du kan slå det på (og av igjen) med ett klikk i <a href="${this.escapeHtml(this.orderToggleUrl(dashboardUrl, agentId))}">dashboarden din</a>.</p>
-    <p>Lykke til!</p>
+    ${ctaButtonHtml({ href: this.escapeHtml(loginUrl), label: "Logg inn i eierportalen", color: "#2d5f2e", radius: "6px", margin: "20px 0" })}
+    <p>Lenken virker i 15 minutter. Senere logger du inn på <a href="${this.escapeHtml(portal.url)}">${this.escapeHtml(portal.text)}</a> med denne e-postadressen.</p>
+    <p>Har du spørsmål, svarer du bare på denne e-posten.</p>
+    <p>Hilsen Daniel, ${this.escapeHtml(this.brand)}</p>
   </div>
 </body>
 </html>
     `;
   }
 
-  private generateClaimConfirmationText(agentName: string, dashboardUrl: string, agentId?: string): string {
+  private generateClaimConfirmationText(agentName: string, loginUrl: string, agentId: string): string {
+    const portal = this.ownerPortalAddress(agentId);
     return `
-Gratulerer!
+Hei!
 
-${agentName} er nå ditt på ${this.brand}.
+Profilen til ${agentName} er nå koblet til deg, og du kan endre den selv når du vil.
 
-Din agent er klar. Du kan nå:
-- Oppdatere informasjon om produkter og åpningstider
-- Se hvor dine produkter blir funnet av kundene
-- Følge med på interaksjoner og preferanser
+I eierportalen kan du:
+- rette varer, åpningstider og kontaktinfo
+- se hvor ofte profilen blir vist og besøkt
+- velge om du vil få bestillinger fra kunder på e-post
 
-Gå til dashboarden din:
-${dashboardUrl}
+Logg inn i eierportalen:
+${loginUrl}
 
-Vil du motta bestillinger fra kunder på e-post? Du kan slå det på (og av igjen) med ett klikk her:
-${this.orderToggleUrl(dashboardUrl, agentId)}
+Lenken virker i 15 minutter. Senere logger du inn på ${portal.text} med denne e-postadressen.
 
-Lykke til!
+Har du spørsmål, svarer du bare på denne e-posten.
+
+Hilsen Daniel, ${this.brand}
     `;
   }
 
@@ -972,17 +1052,6 @@ Lykke til!
       color: #2d5f2e;
       margin-bottom: 20px;
     }
-    .cta-button {
-      display: inline-block;
-      background: #2d5f2e;
-      color: white;
-      padding: 14px 32px;
-      text-decoration: none;
-      border-radius: 6px;
-      font-weight: bold;
-      margin: 25px 0;
-      text-align: center;
-    }
     .footer {
       margin-top: 30px;
       padding-top: 15px;
@@ -998,7 +1067,7 @@ Lykke til!
     <h1 style="font-size: 20px;">Logg inn</h1>
     <p>Du ba om å logge inn for å administrere <strong>${this.escapeHtml(agentName)}</strong>.</p>
     <p>Klikk knappen under for å logge inn. Lenken er gyldig i 15 minutter.</p>
-    <a href="${this.escapeHtml(magicUrl)}" class="cta-button">Logg inn n\u00e5</a>
+    ${ctaButtonHtml({ href: this.escapeHtml(magicUrl), label: "Logg inn n\u00e5", color: "#2d5f2e", radius: "6px", margin: "25px 0" })}
     <p style="font-size: 13px; color: #666;">Eller kopier denne lenken:</p>
     <p style="font-size: 12px; color: #999; word-break: break-all;">${this.escapeHtml(magicUrl)}</p>
     <div class="footer">
@@ -1101,7 +1170,9 @@ ${this.brand} | ${getConfig().domain}`;
     agentId: string,
     claimantName: string,
     claimantEmail: string,
-    reason: string
+    reason: string,
+    /** The claim domain rule's advice: the rule and what Daniel can do. */
+    recommendation?: string
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     const adminEmail = process.env.ADMIN_NOTIFICATION_EMAIL;
     if (!adminEmail) {
@@ -1123,12 +1194,13 @@ ${this.brand} | ${getConfig().domain}`;
             ${row('Navn', claimantName)}
             ${row('E-post', claimantEmail)}
             ${row('Grunn', reason)}
+            ${recommendation ? row('Anbefaling', recommendation) : ''}
             ${row('Tidspunkt', new Date().toLocaleString('nb-NO', { timeZone: 'Europe/Oslo' }))}
           </table>
           <p>Køen: GET ${this.escapeHtml(queuePath)} (X-Admin-Key)</p>
           <p style="color: #888; font-size: 12px;">Automatisk varsling fra ${this.brand}</p>
         </div>`;
-      const textContent = `Eierkrav venter på godkjenning på ${this.brand}\n\nIngen kode er sendt. Kravet gir verken tilgang eller merke før det er godkjent.\n\nProdusent: ${agentName} (${agentId})\nNavn: ${claimantName}\nE-post: ${claimantEmail}\nGrunn: ${reason}\nTidspunkt: ${new Date().toISOString()}\n\nKøen: GET ${queuePath} (X-Admin-Key)`;
+      const textContent = `Eierkrav venter på godkjenning på ${this.brand}\n\nIngen kode er sendt. Kravet gir verken tilgang eller merke før det er godkjent.\n\nProdusent: ${agentName} (${agentId})\nNavn: ${claimantName}\nE-post: ${claimantEmail}\nGrunn: ${reason}\n${recommendation ? `Anbefaling: ${recommendation}\n` : ''}Tidspunkt: ${new Date().toISOString()}\n\nKøen: GET ${queuePath} (X-Admin-Key)`;
 
       return await this.sendEmail({
         to: adminEmail,
@@ -1142,6 +1214,70 @@ ${this.brand} | ${getConfig().domain}`;
         error: error instanceof Error ? error.message : String(error),
       });
       return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Copy of a public contact-form submission (POST /api/contact) to the admin
+   * — Daniel asked for it 2026-11-01; until then the form only wrote a CRM
+   * thread and nothing reached an inbox. Same recipient and skip rule as
+   * sendAdminClaimNotification above.
+   *
+   * Text-only on purpose (no htmlContent): every field is visitor input, so
+   * nothing in it can ever be rendered as HTML. Reply-To is the visitor, so
+   * «Svar» goes straight to them; the visitor's subject is flattened to one
+   * line (no CR/LF or other control characters reach the header) and the
+   * whole subject is capped. Never throws; logs carry neither the message
+   * nor the visitor's address.
+   */
+  async sendAdminContactFormCopy(opts: {
+    platform: "rfb" | "experiences" | "dental";
+    name: string;
+    email: string;
+    subject: string;
+    message: string;
+    threadId: string;
+  }): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const adminEmail = process.env.ADMIN_NOTIFICATION_EMAIL;
+    if (!adminEmail) {
+      logger.info('ADMIN_NOTIFICATION_EMAIL not set — skipping contact-form copy');
+      return { success: true, messageId: 'NO_ADMIN_EMAIL' };
+    }
+
+    try {
+      const label = CONTACT_FORM_PLATFORM_LABELS[opts.platform] ?? String(opts.platform);
+      const visitorSubject = toOneLine(opts.subject);
+      const subject = capChars(`[Kontaktskjema · ${label}] ${visitorSubject || 'Ny melding'}`, CONTACT_FORM_COPY_SUBJECT_MAX);
+      const textContent = [
+        `Plattform: ${label}`,
+        `Navn: ${toOneLine(opts.name)}`,
+        `E-post: ${toOneLine(opts.email)}`,
+        `Emne: ${visitorSubject || '(ikke oppgitt)'}`,
+        '',
+        opts.message,
+        '',
+        `CRM-tråd: ${opts.threadId}`,
+        'Svar på denne e-posten går rett til avsenderen. Svaret havner ikke av seg selv i CRM-tråden.',
+      ].join('\n');
+
+      return await this.sendEmail({
+        to: adminEmail,
+        subject,
+        textContent,
+        replyTo: opts.email.replace(CONTROL_CHARS_RE, ''),
+        // Not outreach (see EmailOptions.omitAgentHeader), and the mail carries
+        // a consumer's address and free text, so keep both out of the send log.
+        omitAgentHeader: true,
+        redactRecipientInLogs: true,
+        logSubjectAs: `[Kontaktskjema · ${label}]`,
+      });
+    } catch (error) {
+      logger.error('Error sending admin contact-form copy', {
+        platform: opts.platform,
+        threadId: opts.threadId,
+        error: maskEmails(error instanceof Error ? error.message : String(error)),
+      });
+      return { success: false, error: maskEmails(error instanceof Error ? error.message : 'Unknown error') };
     }
   }
 
@@ -1172,6 +1308,37 @@ function epEscape(s: string): string {
   } as Record<string, string>)[c]!);
 }
 
+/**
+ * dev-request 2026-10-31-rfb-utgaende-eposter-design-og-lesbarhet, E1: a
+ * "bulletproof" button for the owner mails (claim invitation, claim
+ * confirmation, both magic links, gårdssalg claim). Those buttons used to get
+ * their colours only from a `.cta-button` rule in <style>; Gmail and other
+ * clients drop or override it and paint the link text in their own blue,
+ * about 1.15:1 on the dark green. Every colour is now inline: the cell has
+ * `bgcolor` (Outlook ignores CSS backgrounds) plus an inline background, the
+ * <a> has background, white text, padding and radius, and the label sits in
+ * a white <span> for clients that recolour the <a> itself. `href` and `label`
+ * go in as given — callers pass them escaped, as they did into the old <a>.
+ */
+function ctaButtonHtml(opts: {
+  href: string;
+  label: string;
+  /** The template's own green; white on it must stay ≥ 4.5:1 (WCAG AA). */
+  color: string;
+  radius: string;
+  margin: string;
+  center?: boolean;
+}): string {
+  const { href, label, color, radius, margin, center } = opts;
+  return `<table role="presentation" border="0" cellspacing="0" cellpadding="0"${center ? ' align="center"' : ""} style="margin:${margin};border-collapse:separate;">
+      <tr>
+        <td align="center" bgcolor="${color}" style="background:${color};border-radius:${radius};">
+          <a href="${href}" style="display:inline-block;background:${color};color:#ffffff;padding:14px 32px;text-decoration:none;border-radius:${radius};font-weight:bold;"><span style="color:#ffffff;">${label}</span></a>
+        </td>
+      </tr>
+    </table>`;
+}
+
 function buildOwnerMagicLinkHtml(agentName: string, verifyUrl: string): string {
   const safeName = epEscape(agentName);
   const safeUrl = epEscape(verifyUrl);
@@ -1188,8 +1355,6 @@ function buildOwnerMagicLinkHtml(agentName: string, verifyUrl: string): string {
     .logo span { color: #D4A373; }
     h1 { font-size: 20px; color: #1a1a1a; margin: 18px 0 14px 0; }
     p { margin: 12px 0; font-size: 15px; line-height: 1.7; }
-    .cta-button { display: inline-block; background: #2D5016; color: #ffffff !important; padding: 14px 32px; text-decoration: none; border-radius: 8px; font-weight: 700; margin: 18px 0; }
-    .cta-button:hover { background: #3a6b1e; }
     .footer { margin-top: 36px; padding-top: 18px; border-top: 1px solid #eee; font-size: 13px; color: #666; }
     code { word-break: break-all; background: #f5f5f5; padding: 4px 6px; display: inline-block; border-radius: 4px; }
   </style>
@@ -1204,9 +1369,7 @@ function buildOwnerMagicLinkHtml(agentName: string, verifyUrl: string): string {
 
     <p>Klikk lenken under for å logge inn på eierportalen for <strong>${safeName}</strong>.</p>
 
-    <p style="text-align:center;">
-      <a href="${safeUrl}" class="cta-button">Logg inn på eierportalen</a>
-    </p>
+    ${ctaButtonHtml({ href: safeUrl, label: "Logg inn på eierportalen", color: "#2D5016", radius: "8px", margin: "18px auto", center: true })}
 
     <p style="font-size: 14px; color: #666;">
       Eller kopier og lim inn denne lenken i nettleseren:
@@ -1264,8 +1427,6 @@ function buildGardssalgClaimMagicLinkHtml(providerName: string, verifyUrl: strin
     .logo { font-size: 22px; font-weight: 700; color: #0f5a50; }
     h1 { font-size: 20px; color: #1a1a1a; margin: 18px 0 14px 0; }
     p { margin: 12px 0; font-size: 15px; line-height: 1.7; }
-    .cta-button { display: inline-block; background: #0f5a50; color: #ffffff !important; padding: 14px 32px; text-decoration: none; border-radius: 8px; font-weight: 700; margin: 18px 0; }
-    .cta-button:hover { background: #0e3c36; }
     .footer { margin-top: 36px; padding-top: 18px; border-top: 1px solid #eee; font-size: 13px; color: #666; }
     code { word-break: break-all; background: #f5f5f5; padding: 4px 6px; display: inline-block; border-radius: 4px; }
   </style>
@@ -1280,9 +1441,7 @@ function buildGardssalgClaimMagicLinkHtml(providerName: string, verifyUrl: strin
 
     <p>Klikk lenken under for å logge inn på eierportalen for <strong>${safeName}</strong> på Opplevagent.</p>
 
-    <p style="text-align:center;">
-      <a href="${safeUrl}" class="cta-button">Logg inn på eierportalen</a>
-    </p>
+    ${ctaButtonHtml({ href: safeUrl, label: "Logg inn på eierportalen", color: "#0f5a50", radius: "8px", margin: "18px auto", center: true })}
 
     <p style="font-size: 14px; color: #666;">
       Eller kopier og lim inn denne lenken i nettleseren:
@@ -1491,7 +1650,7 @@ kontakt@opplevagent.no
 // (kontakt@opplevagent.no), never the personal gmail the RFB template used
 // to carry (removed 2026-08-15, Daniel live) — and never the RFB identity:
 // the draft STYLE is borrowed, the platform separation is not.
-export type GardssalgOutreachTemplate = "standard" | "personal";
+export type GardssalgOutreachTemplate = "standard" | "personal" | "personal-v4" | "personal-v4-followup";
 
 export function renderGardssalgOutreachPersonal(
   providerName: string,
@@ -1523,6 +1682,135 @@ Du kan når som helst protestere – svar «fjern», så fjerner jeg profilen me
   };
 }
 
+// ─── Gårdssalg outreach v4 (dev-request 2026-10-22-opplevagent-utsending-v4) ──
+//
+// Texts E (first) and F (follow-up) from marketing-drafts/2026-10-22-
+// utsendingstekster-v4-opplevagent.md, approved by Daniel 2026-10-22 and used
+// VERBATIM: only the table's fields are substituted. Text-only, one paragraph
+// per line, no «katalog»/«registrert»/«oppføring».
+
+/** Daniel's mobile number as he gave it live 2026-10-22 (fixed value, not a per-recipient field). */
+export const GARDSSALG_OUTREACH_SIGNATURE_PHONE = "905 737 34";
+
+/** Display name for the cold outreach only (the address is the platform's shared one). */
+export const GARDSSALG_OUTREACH_FROM_NAME = "Daniel Fredriksen";
+
+/**
+ * `"Daniel Fredriksen" <kontakt@rettfrabonden.com>`. The ADDRESS is taken from
+ * the platform identity (crmFromHeader) so it can never drift from it; only the
+ * display name differs from the other Opplevagent mail.
+ */
+export function gardssalgOutreachFromHeader(): string {
+  const m = /<([^<>\s]+@[^<>\s]+)>/.exec(crmFromHeader("experiences"));
+  return `"${GARDSSALG_OUTREACH_FROM_NAME}" <${m ? m[1] : "kontakt@rettfrabonden.com"}>`;
+}
+
+/**
+ * Shared producer-name wash (also for the RFB lane later). Cut at the first
+ * « — » or «, » and drop everything from there, then drop ONE trailing « AS»,
+ * « SA», « DA», « ANS» or « ENK». Used in subject and text, never in URLs.
+ */
+export function cleanOutreachProviderName(raw: string): string {
+  const name = (raw ?? "").trim();
+  const cuts = [name.indexOf(" — "), name.indexOf(", ")].filter((i) => i >= 0);
+  let out = cuts.length > 0 ? name.slice(0, Math.min(...cuts)) : name;
+  out = out.trim().replace(/ (AS|SA|DA|ANS|ENK)$/, "").trim();
+  return out === "" ? name : out;
+}
+
+export type GardssalgOutreachSubjectArm = "A" | "B";
+
+export interface GardssalgOutreachRenderCtx {
+  /** Subject arm for text E; alternates every first mail. Default "A". */
+  arm?: GardssalgOutreachSubjectArm;
+  /** `{eier_url}`. Default: derived from the profile URL (same slug). */
+  eierUrl?: string;
+  /** `{måned}` phrase for text F, see gardssalgOutreachMonthPhrase(). Required for F. */
+  monthPhrase?: string;
+  /** Subject of the first mail, when it exists in the CRM: F becomes `Re: <it>`. */
+  firstSubject?: string | null;
+}
+
+const NORWEGIAN_MONTHS = [
+  "januar", "februar", "mars", "april", "mai", "juni",
+  "juli", "august", "september", "oktober", "november", "desember",
+];
+
+function osloYearMonth(d: Date): { year: number; month: number } {
+  const parts = new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Oslo", year: "numeric", month: "numeric" }).formatToParts(d);
+  return {
+    year: Number(parts.find((p) => p.type === "year")?.value),
+    month: Number(parts.find((p) => p.type === "month")?.value),
+  };
+}
+
+/**
+ * `{måned}` for text F, from the month the first mail was sent (Oslo time):
+ * same month as now -> «tidligere denne måneden»; same year -> «i september»;
+ * last year -> «i desember i fjor»; older -> «i desember 2024».
+ */
+export function gardssalgOutreachMonthPhrase(firstSentAt: Date, now: Date): string {
+  const a = osloYearMonth(firstSentAt);
+  const b = osloYearMonth(now);
+  if (a.year === b.year && a.month === b.month) return "tidligere denne måneden";
+  const name = NORWEGIAN_MONTHS[a.month - 1];
+  if (a.year === b.year) return `i ${name}`;
+  if (a.year === b.year - 1) return `i ${name} i fjor`;
+  return `i ${name} ${a.year}`;
+}
+
+export function gardssalgOutreachSubjectA(providerName: string): string {
+  return `Har vi riktig info om ${cleanOutreachProviderName(providerName)}?`;
+}
+
+export function gardssalgOutreachSubjectB(providerName: string): string {
+  return `Spørsmål om besøk hos ${cleanOutreachProviderName(providerName)}`;
+}
+
+/** Text E — first contact. */
+export function renderGardssalgOutreachV4First(
+  providerName: string,
+  profileUrl: string,
+  ctx: GardssalgOutreachRenderCtx = {},
+): { subject: string; text: string; html?: string } {
+  const navn = cleanOutreachProviderName(providerName);
+  const eierUrl = ctx.eierUrl ?? profileUrl.replace("/kategori/gardssalg/produsent/", "/kategori/gardssalg/eier/");
+  const subject = ctx.arm === "B" ? gardssalgOutreachSubjectB(providerName) : gardssalgOutreachSubjectA(providerName);
+  const paragraphs = [
+    `Hei,`,
+    `Jeg har ett spørsmål om ${navn}: tar dere imot besøk? Jeg heter Daniel Fredriksen og driver Opplevagent, en gratis oversikt over bryggerier, siderier og brennerier i Norge som man kan besøke. Dere står der allerede:`,
+    `${profileUrl}`,
+    `Besøk er det vi oftest tar feil av, så et kort svar hjelper mye. Er noe annet feil, kan dere bare svare på denne e-posten, så retter jeg det.`,
+    `Grunnen til at jeg gjør dette, er at mange nå spør ChatGPT og lignende tjenester om hvor de kan dra på smaking. Små produsenter kommer ofte ikke med i svarene, fordi informasjonen om dem er spredt eller gammel. Opplevagent samler den og setter den opp slik at disse tjenestene kan lese den. Det erstatter ikke nettsiden deres, men gjør at dere blir funnet der folk nå spør.`,
+    `Det koster ingenting å stå der, og dere binder dere ikke til noe. Vil dere styre siden selv, kan dere ta den over her, uten passord: ${eierUrl}`,
+    `Vil dere ikke være med, svarer dere bare «fjern», så tar jeg siden ned innen et døgn.`,
+    `Vennlig hilsen\nDaniel Fredriksen\nOpplevagent\n${GARDSSALG_OUTREACH_SIGNATURE_PHONE}`,
+    `Slik behandler jeg opplysningene: https://opplevagent.no/personvern`,
+  ];
+  return { subject, text: paragraphs.join("\n\n") };
+}
+
+/** Text F — follow-up (threaded as `Re: <first subject>` when the first mail is known). */
+export function renderGardssalgOutreachV4Followup(
+  providerName: string,
+  profileUrl: string,
+  ctx: GardssalgOutreachRenderCtx = {},
+): { subject: string; text: string; html?: string } {
+  if (!ctx.monthPhrase) throw new Error("renderGardssalgOutreachV4Followup: monthPhrase is required");
+  const navn = cleanOutreachProviderName(providerName);
+  const first = ctx.firstSubject?.trim();
+  const subject = first ? (/^Re: /i.test(first) ? first : `Re: ${first}`) : gardssalgOutreachSubjectA(providerName);
+  const paragraphs = [
+    `Hei igjen,`,
+    `Jeg skrev til dere ${ctx.monthPhrase} om ${navn} på Opplevagent. Det holder med ett ord: tar dere imot besøk, ja eller nei?`,
+    `${profileUrl}`,
+    `Det er gratis å stå der. Vil dere ikke være med, svarer dere «fjern». Jeg skriver ikke igjen om dette.`,
+    `Vennlig hilsen\nDaniel Fredriksen`,
+    `Slik behandler jeg opplysningene: https://opplevagent.no/personvern`,
+  ];
+  return { subject, text: paragraphs.join("\n\n") };
+}
+
 /**
  * The one variant dispatcher both the send path and the CRM-filing path go
  * through (same single-source rule as renderGardssalgOutreach itself, per
@@ -1533,7 +1821,10 @@ export function renderGardssalgOutreachVariant(
   template: GardssalgOutreachTemplate,
   providerName: string,
   profileUrl: string,
+  ctx?: GardssalgOutreachRenderCtx,
 ): { subject: string; text: string; html?: string } {
+  if (template === "personal-v4") return renderGardssalgOutreachV4First(providerName, profileUrl, ctx);
+  if (template === "personal-v4-followup") return renderGardssalgOutreachV4Followup(providerName, profileUrl, ctx);
   return template === "personal"
     ? renderGardssalgOutreachPersonal(providerName, profileUrl)
     : renderGardssalgOutreach(providerName, profileUrl);

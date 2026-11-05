@@ -900,8 +900,19 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
       const none = notifySvc.renderOrderNotificationEmailV2(base);
       const v1 = notifySvc.renderOrderNotificationEmailV1({ ...base, buyer_name: "Ignored", buyer_email: "ignored@example.com" });
       assertTrue(!none.textContent.includes("Kunde:"), "render-04: v2 with no buyer fields has no «Kunde» block");
-      assertEq(none.textContent, v1.textContent, "render-05: v2 without buyer fields renders the identical text body to v1");
-      assertEq(none.htmlContent, v1.htmlContent, "render-06: v2 without buyer fields renders the identical HTML body to v1");
+      // Fase A2: v2 differs from v1 ONLY by the new main button (compact per-order view) and the «Se alle ordrene dine» link.
+      const a2Text = none.textContent
+        .replace("Se og bekreft bestillingen", "Bekreft eller avslå ordren her")
+        .replace("/kompakt", "")
+        .replace(/Se alle ordrene dine \(krever innlogging\): \S+\n\n/, "");
+      const a2Html = none.htmlContent
+        .replace(/ style="display:inline-block;[^"]*"/, "")
+        .replace("Se og bekreft bestillingen", "Bekreft eller avslå ordren her")
+        .replace("/kompakt", "")
+        .replace("</a><br>", "</a> — her bekrefter eller avslår du ordren.<br>")
+        .replace(/<p><a href="[^"]*\/ordrer">Se alle ordrene dine<\/a> \(krever innlogging\)<\/p>\n/, "");
+      assertEq(a2Text, v1.textContent, "render-05: v2 without buyer fields renders the v1 text body (apart from the Fase A2 links)");
+      assertEq(a2Html, v1.htmlContent, "render-06: v2 without buyer fields renders the v1 HTML body (apart from the Fase A2 links)");
       assertTrue(!v1.textContent.includes("Ignored") && !v1.htmlContent.includes("ignored@example.com"), "render-07: v1 ignores buyer fields entirely");
       assertEq(notifySvc.renderOrderNotificationEmail("v1", { ...base, buyer_email: "kari@example.com" }).replyTo, D, "render-08: dispatcher 'v1' → v1 (default Reply-To)");
       assertEq(notifySvc.renderOrderNotificationEmail("v2", { ...base, buyer_email: "kari@example.com" }).replyTo, "kari@example.com", "render-09: dispatcher 'v2' → v2 (buyer Reply-To)");

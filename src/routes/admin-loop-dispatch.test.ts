@@ -16,7 +16,9 @@
  *       NAMES are listed in override_ignored.
  *   d5  envelope status: completed / partial / failed.
  *   d6  runDispatchTick records the envelope with dispatchEnvelopeStatus().
- * Pure — env is injected; no DB, no network.
+ *   d7  planNow lists runs by finished_at too (long run finished recently still wakes);
+ *       listRecentRuns finishedSinceMinutes; DISPATCH_PLAN_FINISHED_LOOKBACK_MIN knob (pinned in-memory DB).
+ * d1-d6 are pure — env is injected; no DB, no network.
  *
  * Two ways to run:
  *   1. Standalone:  npx tsx src/routes/admin-loop-dispatch.test.ts
@@ -25,7 +27,10 @@
 
 import fs from "fs";
 import path from "path";
-import { dispatchEnvelopeStatus, fireRoutineEnvStem, parseRoutines } from "./admin-loop-dispatch";
+import { dispatchEnvelopeStatus, fireRoutineEnvStem, parseRoutines, planNow } from "./admin-loop-dispatch";
+import { __pinInMemoryDbForTesting } from "../database/init";
+import { listRecentRuns, recordRun } from "../services/run-ledger";
+import { resolveFinishedLookbackMin } from "../services/loop-dispatch";
 
 export interface TestSummary {
   passed: number;
@@ -185,6 +190,87 @@ export function runAdminLoopDispatchTests(opts: { log?: boolean } = {}): TestSum
     );
     assertEq((src.match(/status: "completed",/g) || []).length, 1, "d6: the only hardcoded completed is the fire-marker (success-only)");
     assertTrue(/if \(r\.ok\) \{[\s\S]{0,400}firemarker-[\s\S]{0,300}status: "completed",/.test(src), "d6: that completed sits inside the r.ok fire-marker block");
+
+    // ── d7: finished_at lookback (long run started >1h ago, finished recently) ──
+    // Bug: planNow() listed runs by started_at >= now-1h, computeWakeList judges freshness
+    // by finished_at, so a run >60 min long never had its next_suggested seen.
+    const envKeys = ["FIRE_ROUTINES", "DISPATCH_PLAN_FINISHED_LOOKBACK_MIN", "DISPATCH_WINDOW_MIN", "DISPATCH_ACTIVE_START_UTC", "DISPATCH_ACTIVE_END_UTC"];
+    const savedEnv: Record<string, string | undefined> = {};
+    for (const k of envKeys) savedEnv[k] = process.env[k];
+    const restoreDb = __pinInMemoryDbForTesting();
+    try {
+      for (const k of envKeys) delete process.env[k];
+      process.env.FIRE_ROUTINES = JSON.stringify({ orchestrator: { trig: "trig_o", token: "tok_o" } });
+      const min = (m: number) => new Date(Date.now() - m * 60_000).toISOString();
+      let seq = 0;
+      const put = (agent: string, startAgoMin: number, finAgoMin: number | null, next: string[] | null) => {
+        recordRun({
+          run_id: `d7-${++seq}`,
+          vertical: "rfb",
+          agent,
+          trigger_source: "cron",
+          started_at: min(startAgoMin),
+          finished_at: finAgoMin === null ? (null as any) : min(finAgoMin),
+          status: "completed",
+          claims: [],
+          evidence: [],
+          next_suggested: next ?? undefined,
+        });
+      };
+      const wakes = () => planNow().wake.map((w) => w.agent);
+      const clear = () => { const { getDb } = require("../database/init"); getDb().prepare("DELETE FROM runs").run(); };
+
+      // 1. started 110 min ago, finished 5 min ago, self-continue → exactly one wake
+      put("platform-orchestrator", 110, 5, ["platform-orchestrator"]);
+      assertEq(wakes(), ["platform-orchestrator"], "d7.1: long run finished recently -> one wake of platform-orchestrator");
+
+      // 5. knob 0 disables the OR-part → run invisible again (old behaviour)
+      process.env.DISPATCH_PLAN_FINISHED_LOOKBACK_MIN = "0";
+      assertEq(wakes(), [], "d7.5: DISPATCH_PLAN_FINISHED_LOOKBACK_MIN=0 disables the finished_at lookback");
+      delete process.env.DISPATCH_PLAN_FINISHED_LOOKBACK_MIN;
+
+      // 2. a newer run/fire-marker for the same agent after it finished → already continued
+      put("platform-orchestrator", 1, 1, []);
+      assertEq(wakes(), [], "d7.2: newer run for platform-orchestrator after finish -> no wake (already continued)");
+
+      // 3a. finished 50 min ago (outside 45-min window) → no wake
+      clear();
+      put("platform-orchestrator", 110, 50, ["platform-orchestrator"]);
+      assertEq(wakes(), [], "d7.3a: finished 50 min ago (outside window) -> no wake");
+      // 3b. still in flight (finished_at null) → no wake
+      clear();
+      put("platform-orchestrator", 110, null, ["platform-orchestrator"]);
+      assertEq(wakes(), [], "d7.3b: started 110 min ago, in flight -> no wake");
+
+      // 4. listRecentRuns default behaviour unchanged; option adds the finished-recently run
+      clear();
+      put("platform-orchestrator", 120, 1, ["x"]);
+      put("platform-orchestrator", 30, 20, null);
+      put("platform-orchestrator", 120, 90, null);
+      assertEq(listRecentRuns({ sinceHours: 1 }).length, 1, "d7.4: without finishedSinceMinutes only started_at-fresh rows");
+      assertEq(listRecentRuns({ sinceHours: 1, finishedSinceMinutes: 0 }).length, 1, "d7.4: finishedSinceMinutes=0 == unset");
+      assertEq(listRecentRuns({ sinceHours: 1, finishedSinceMinutes: 60 }).length, 2, "d7.4: with option, run started 2h ago finished 1 min ago is included (90-min-old finish still excluded)");
+      assertEq(listRecentRuns({ sinceHours: 1, finishedSinceMinutes: 60, agent: "nobody" }).length, 0, "d7.4: agent filter ANDs with the OR-part");
+      // started_at-fresh rows stay in even when finished_at is old or NULL (pins the OR, not finished_at-only)
+      clear();
+      put("platform-orchestrator", 30, null, null);
+      assertEq(listRecentRuns({ sinceHours: 1, finishedSinceMinutes: 5 }).length, 1, "d7.4: in-flight run started 30 min ago is still listed with the option");
+
+      // knob parsing
+      assertEq(resolveFinishedLookbackMin(undefined, 45), 60, "d7: default lookback = windowMin + 15");
+      assertEq(resolveFinishedLookbackMin("0", 45), 0, "d7: 0 disables");
+      assertEq(resolveFinishedLookbackMin("90", 45), 90, "d7: valid integer overrides");
+      assertEq(resolveFinishedLookbackMin("-5", 45), 60, "d7: negative -> default");
+      assertEq(resolveFinishedLookbackMin("abc", 45), 60, "d7: garbage -> default");
+      assertEq(resolveFinishedLookbackMin("1.5", 45), 60, "d7: non-integer -> default");
+      assertEq(resolveFinishedLookbackMin("999999999999", 45), 1440, "d7: huge value clamped to 1440");
+      process.env.DISPATCH_PLAN_FINISHED_LOOKBACK_MIN = "999999999999";
+      assertEq(Array.isArray(planNow().wake), true, "d7: planNow does not throw on a huge knob value");
+      delete process.env.DISPATCH_PLAN_FINISHED_LOOKBACK_MIN;
+    } finally {
+      for (const k of envKeys) { if (savedEnv[k] === undefined) delete process.env[k]; else process.env[k] = savedEnv[k]; }
+      restoreDb();
+    }
   } catch (err) {
     failed++;
     failures.push(`admin-loop-dispatch: unexpected error: ${err instanceof Error ? err.stack || err.message : String(err)}`);

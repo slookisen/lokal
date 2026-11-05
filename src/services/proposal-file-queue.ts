@@ -32,7 +32,7 @@ import type Database from "better-sqlite3";
 import { getDb as getExpDbDefault } from "../database/db-factory";
 import { getDb as getMainDbDefault } from "../database/init";
 import { enrichmentWritePauseBlock } from "./enrichment-write-pause";
-import { recordRun } from "./run-ledger";
+import { listRecentRuns, recordRun } from "./run-ledger";
 
 export const PROPOSAL_QUEUE_REPO = "slookisen/A2A";
 export const PROPOSAL_QUEUE_MAX_AGE_DAYS = 14;
@@ -57,7 +57,16 @@ export type ProposalApplyResult =
 export type ProposalApplyFn = (
   expDb: Database.Database,
   items: unknown[],
-  opts: { dryRun: false; homepageFetchImpl: typeof fetch; logTag: string },
+  opts: {
+    dryRun: false;
+    homepageFetchImpl: typeof fetch;
+    logTag: string;
+    // Additive (content-judgement lane, skive 3k): the tick's clock and
+    // whatever file-level fields the caller's `validate` passed through as
+    // `context`. Existing callers ignore both.
+    now?: Date;
+    fileContext?: Record<string, unknown>;
+  },
 ) => Promise<ProposalApplyResult>;
 
 export interface ProposalQueueConfig {
@@ -72,16 +81,25 @@ export interface ProposalQueueConfig {
   failuresTable: string;
   /** Flag check — the caller's own env switch. */
   enabled: (env: Record<string, string | undefined>) => boolean;
-  /** Structural check of a parsed file; item-level validation is apply's. */
-  validate: (parsed: unknown) => { items: unknown[] } | { error: string };
+  /** Structural check of a parsed file; item-level validation is apply's.
+   *  `context` (optional) is handed to apply as `opts.fileContext`. */
+  validate: (parsed: unknown) => { items: unknown[]; context?: Record<string, unknown> } | { error: string };
   apply: ProposalApplyFn;
   /** The id of a written row in an apply result row (for the evidence list). */
   writtenId: (result: Record<string, unknown>) => string | null;
   /** The envelope's claims for a tick — `written` and `processed` are the
-   *  tick's totals; the caller names the claim kinds. */
-  claims: (totals: { written: number; processed: number }) => Array<{ type: "db_state_change"; value: number; meta: Record<string, unknown> }>;
+   *  tick's totals, `totals` the per-key sum of every applied file's totals;
+   *  the caller names the claim kinds. */
+  claims: (totals: { written: number; processed: number; totals: Record<string, number> }) => Array<{ type: "db_state_change"; value: number; meta: Record<string, unknown> }>;
+  /** Optional evidence for claims past index 1 (indexes 0/1 are always the
+   *  written ids and the processed paths). */
+  extraEvidence?: Array<{ claimIdx: number; id: (result: Record<string, unknown>) => string | null }>;
   maxAgeDays?: number;
   filesPerTick?: number;
+  /** Optional per-UTC-day cap on recorded files (rows of `filesTable`
+   *  whose processed_at falls on the tick's UTC day, errors included).
+   *  Unset = no daily cap (the original behaviour). */
+  maxFilesPerDay?: number;
   maxAttemptsPerTick?: number;
   maxFileBytes?: number;
   maxFailures?: number;
@@ -121,6 +139,9 @@ export interface ProposalQueueTickReport {
    *  apply) — not recorded as processed unless fail_count reached the cap. */
   failures: Array<{ path: string; fail_count: number; error: string }>;
   written: number;
+  /** True when `maxFilesPerDay` stopped this tick from evaluating further
+   *  files (the rest wait for the next UTC day). Always false without a cap. */
+  daily_cap_reached: boolean;
   envelope_recorded: boolean;
 }
 
@@ -273,6 +294,7 @@ export async function runProposalFileQueueTick(
     processed: [],
     failures: [],
     written: 0,
+    daily_cap_reached: false,
     envelope_recorded: false,
   };
 
@@ -319,9 +341,16 @@ export async function runProposalFileQueueTick(
      ON CONFLICT(path) DO UPDATE SET
        fail_count = fail_count + 1, last_error = excluded.last_error, last_failed_at = excluded.last_failed_at`,
   );
+  const maxFilesPerDay = config.maxFilesPerDay;
+  // processed_at is SQLite datetime('now') ("YYYY-MM-DD HH:MM:SS", UTC);
+  // the day compared is the tick's own UTC day.
+  const filesRecordedToday = (): number =>
+    (expDb.prepare(`SELECT COUNT(*) AS n FROM ${config.filesTable} WHERE substr(processed_at, 1, 10) = ?`).get(today) as { n: number }).n;
   const failCountOf = (path: string): number =>
     (expDb.prepare(`SELECT fail_count FROM ${config.failuresTable} WHERE path = ?`).get(path) as { fail_count: number } | undefined)?.fail_count ?? 0;
   const writtenIds: string[] = [];
+  const extraEvidenceIds: string[][] = (config.extraEvidence ?? []).map(() => []);
+  const summedTotals: Record<string, number> = {};
 
   const recordFile = (f: ContentsEntry, outcome: ProposalFileOutcome, resultJson: unknown): void => {
     recordFileStmt.run(f.path, f.sha, JSON.stringify(resultJson));
@@ -428,6 +457,11 @@ export async function runProposalFileQueueTick(
     let attempts = 0;
     for (const f of candidates) {
       if (evaluated >= filesPerTick || attempts >= maxAttemptsPerTick) break;
+      if (maxFilesPerDay !== undefined && filesRecordedToday() >= maxFilesPerDay) {
+        report.daily_cap_reached = true;
+        console.log(`[${tag}] daily cap of ${maxFilesPerDay} file(s) reached for ${today} — remaining files left for the next UTC day`);
+        break;
+      }
       if (enrichmentWritePauseBlock(mainDb, "experiences")) {
         console.log(`[${tag}] write-pause became active mid-tick — remaining files left for a later tick`);
         break;
@@ -467,7 +501,7 @@ export async function runProposalFileQueueTick(
       }
       let out: ProposalApplyResult;
       try {
-        out = await apply(expDb, v.items, { dryRun: false, homepageFetchImpl, logTag: tag });
+        out = await apply(expDb, v.items, { dryRun: false, homepageFetchImpl, logTag: tag, now, fileContext: v.context });
       } catch (err) {
         // review N2: an unexpected exception in the apply step is a per-file
         // failure (same cap), never a tick-killer.
@@ -482,6 +516,13 @@ export async function runProposalFileQueueTick(
         for (const r of out.results) {
           const id = config.writtenId(r);
           if (id) writtenIds.push(id);
+          (config.extraEvidence ?? []).forEach((x, i) => {
+            const extraId = x.id(r);
+            if (extraId) extraEvidenceIds[i].push(extraId);
+          });
+        }
+        for (const [k, n] of Object.entries(out.totals)) {
+          if (typeof n === "number" && Number.isFinite(n)) summedTotals[k] = (summedTotals[k] ?? 0) + n;
         }
       }
       evaluated++;
@@ -495,7 +536,7 @@ export async function runProposalFileQueueTick(
     ...report.failures.map((x) => ({ message: x.error, meta: { path: x.path, fail_count: x.fail_count } })),
     ...(report.github_error ? [{ message: report.github_error, meta: {} }] : []),
   ];
-  const claims = config.claims({ written: report.written, processed: report.processed.length });
+  const claims = config.claims({ written: report.written, processed: report.processed.length, totals: summedTotals });
   try {
     if (allGithubFailed) {
       // At most ONE `failed` envelope per UTC day: a fixed run_id per day,
@@ -531,6 +572,7 @@ export async function runProposalFileQueueTick(
           evidence: [
             { claim_idx: 0, ids: writtenIds },
             { claim_idx: 1, ids: report.processed.map((p) => p.path) },
+            ...(config.extraEvidence ?? []).map((x, i) => ({ claim_idx: x.claimIdx, ids: extraEvidenceIds[i] })),
           ],
           notes: [
             ...report.processed.map((p) => `${p.path}: ${p.status}${p.totals ? ` written=${p.totals.written} rejected=${p.totals.rejected ?? 0} skipped=${p.totals.skipped_recorded ?? 0}` : ` (${p.error})`}`),
@@ -561,4 +603,98 @@ export function getProposalQueueStatus(
     try { parsed = r.result_json ? JSON.parse(r.result_json) : null; } catch { parsed = null; }
     return { path: r.path, sha: r.sha, processed_at: r.processed_at, status: parsed?.status ?? null, error: parsed?.error ?? null, totals: parsed?.totals ?? null };
   });
+}
+
+export const PROPOSAL_QUEUE_STALL_HOURS = 48;
+const STATUS_ERROR_MAX_CHARS = 200;
+const STATUS_RUN_LOOKBACK_HOURS = 24 * 30;
+
+export type ProposalQueueHealth = "disabled" | "no_token" | "github_error" | "file_errors" | "ok";
+
+export interface ProposalQueueExtras {
+  last_tick: {
+    run_id: string;
+    started_at: string;
+    finished_at: string;
+    status: string;
+    skipped_reason?: string;
+    error?: string;
+  } | null;
+  last_applied_at: string | null;
+  failures: Array<{ path: string; fail_count: number; last_error: string | null; last_failed_at: string | null }>;
+  health: ProposalQueueHealth;
+  stalled: boolean;
+}
+
+const truncStatus = (v: unknown): string => String(v ?? "").slice(0, STATUS_ERROR_MAX_CHARS);
+
+/**
+ * Additive observability for one queue (dev-request 2026-10-25-forslagsko-
+ * status-eksponerer-github-feil). Read-only. Never includes a token: the only
+ * free text surfaced is the ledger's first error message / a failures row's
+ * last_error, both truncated to 200 chars (GithubFetchError messages are
+ * `GET <path> -> HTTP <status>` and carry no credentials).
+ */
+export function getProposalQueueExtras(
+  expDb: Database.Database,
+  cfg: { filesTable: string; failuresTable: string; agent: string; enabled: boolean; tokenPresent: boolean },
+  opts: { mainDb?: () => Database.Database; now?: Date } = {},
+): ProposalQueueExtras {
+  const now = opts.now ?? new Date();
+
+  let last_tick: ProposalQueueExtras["last_tick"] = null;
+  let tickErrorHasNonFilePath = false;
+  try {
+    const db = (opts.mainDb ?? getMainDbDefault)();
+    const rec = listRecentRuns({ agent: cfg.agent, limit: 1, sinceHours: STATUS_RUN_LOOKBACK_HOURS, db })[0];
+    if (rec) {
+      const firstErr = rec.errors?.[0];
+      last_tick = {
+        run_id: rec.run_id,
+        started_at: rec.started_at,
+        finished_at: rec.finished_at,
+        status: rec.status,
+        ...(rec.status === "failed" ? { skipped_reason: "github_error" } : {}),
+        ...(firstErr ? { error: truncStatus(firstErr.message) } : {}),
+      };
+      // A github-level error entry is the one pushed without a path in meta.
+      tickErrorHasNonFilePath = (rec.errors ?? []).some((e) => !(e.meta && (e.meta as any).path));
+    }
+  } catch { last_tick = null; }
+
+  const fileRows = expDb
+    .prepare(`SELECT processed_at, result_json FROM ${cfg.filesTable} ORDER BY processed_at DESC`)
+    .all() as Array<{ processed_at: string; result_json: string | null }>;
+  let last_applied_at: string | null = null;
+  for (const r of fileRows) {
+    let parsed: any = null;
+    try { parsed = r.result_json ? JSON.parse(r.result_json) : null; } catch { parsed = null; }
+    if (parsed?.status === "applied") { last_applied_at = r.processed_at; break; }
+  }
+  const newestProcessedAt = fileRows[0]?.processed_at ?? null;
+
+  const failures = (expDb
+    .prepare(`SELECT path, fail_count, last_error, last_failed_at FROM ${cfg.failuresTable} ORDER BY last_failed_at DESC, path ASC LIMIT 20`)
+    .all() as Array<{ path: string; fail_count: number; last_error: string | null; last_failed_at: string | null }>)
+    .map((f) => ({ path: f.path, fail_count: f.fail_count, last_error: f.last_error == null ? null : truncStatus(f.last_error), last_failed_at: f.last_failed_at }));
+
+  // A github failure is only current when no file was processed after it
+  // (a later successful tick that processed something proves recovery).
+  const tickIsGithubFailure =
+    !!last_tick &&
+    (last_tick.status === "failed" || (last_tick.status === "partial" && tickErrorHasNonFilePath)) &&
+    !(newestProcessedAt && newestProcessedAt > last_tick.finished_at);
+
+  let health: ProposalQueueHealth;
+  if (!cfg.enabled) health = "disabled";
+  else if (!cfg.tokenPresent) health = "no_token";
+  else if (tickIsGithubFailure) health = "github_error";
+  else if (failures.length > 0) health = "file_errors";
+  else health = "ok";
+
+  const appliedMs = last_applied_at ? Date.parse(last_applied_at) : NaN;
+  const old = Number.isNaN(appliedMs) || now.getTime() - appliedMs > PROPOSAL_QUEUE_STALL_HOURS * 3600_000;
+  const stalled = cfg.enabled && cfg.tokenPresent && health !== "ok" && old;
+
+  return { last_tick, last_applied_at, failures, health, stalled };
 }

@@ -55,6 +55,8 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/db-factory";
+import { dentalEnrichmentWritePauseBlock } from "../services/dental-enrichment-write-pause";
+import { ENRICHMENT_WRITE_PAUSE_HTTP_STATUS } from "../services/enrichment-write-pause";
 import { isPublicDentalServiceHost } from "../services/dental-catalog-class";
 import {
   discoverDentalClinicWebsite,
@@ -87,12 +89,12 @@ function requireAdmin(req: Request, res: Response): boolean {
 }
 
 // Hard per-call cap on how many candidate rows are actually run through
-// discovery in a single POST. Deliberately mirrors DENTAL_WD_BATCH_CAP (25,
-// admin-dental-hjemmeside-discovery.ts) rather than HJEMMESIDE_CLEANUP_
+// discovery in a single POST. Deliberately kept at 25, the value DENTAL_WD_BATCH_CAP
+// (admin-dental-hjemmeside-discovery.ts) had before A6-K, rather than HJEMMESIDE_CLEANUP_
 // BATCH_CAP (200, admin-dental-hjemmeside-cleanup.ts): like that route (and
 // unlike the pure-SQL cleanup sweep), each candidate here can trigger a real
 // Brreg lookup, a page fetch, and possibly a Brave search call — the same
-// per-row network cost the discovery batch route already caps at 25/call
+// per-row network cost the discovery batch route caps per call
 // for exactly this wall-clock reason.
 export const OFFENTLIG_KLINIKK_KORRIGERING_BATCH_CAP = 25;
 
@@ -378,6 +380,15 @@ router.post("/", async (req: Request, res: Response) => {
       : OFFENTLIG_KLINIKK_KORRIGERING_BATCH_CAP;
 
   try {
+    // Enrichment write-pause fence: apply/write mode only, before the first write.
+    // Dry-run and read paths stay open.
+    if (!dryRun) {
+      const pauseBlock = dentalEnrichmentWritePauseBlock();
+      if (pauseBlock) {
+        res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+        return;
+      }
+    }
     const db = getDb("dental");
     const trueCandidates = findTrueCandidates(db);
     const batch = trueCandidates.slice(offset, offset + limit);

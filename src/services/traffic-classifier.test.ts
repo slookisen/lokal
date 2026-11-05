@@ -25,6 +25,13 @@ import {
   uaFromSessionId,
   isScannerUA,
   aiVendorBucket,
+  aiAssistantVendor,
+  AI_AGENT_REGISTRY,
+  AI_SEARCH_PATTERNS,
+  AI_CRAWLER_PATTERNS,
+  addAiAgentViews,
+  emptyAiAgents,
+  mergeAiAgents,
   storedClientClass,
   isVelocityScraper,
   SCRAPER_UNIQUE_PAGES_PER_10_MIN,
@@ -277,6 +284,55 @@ export function runTrafficClassifierTests(opts: { log?: boolean } = {}): TestSum
   assertEq(storedClientClass("h1:RFB-ContactVerifier/1.0", "dev"), "dev", "sc4 owner override dev wins");
   assertEq(storedClientClass("h1:Mozilla/5.0 (compatible; Claude-SearchBot/1.0)", null), "ai_crawler", "sc5 legacy row without stored class");
   assertEq(aiVendorBucket("Mozilla/5.0 (compatible; ExaSearchBot/1.0)"), "other", "v6 ExaSearchBot → other");
+
+  // ── G2-S2: AI_AGENT_REGISTRY drives classification, vendor and purpose ──
+  // The derived lists must equal the two hand-written lists they replaced, in
+  // the same order (order is binding: ai_search before ai_crawler).
+  const OLD_SEARCH = ["ChatGPT-User", "Claude-User", "Claude-Web", "Perplexity-User", "DuckAssistBot"];
+  const OLD_CRAWLER = [
+    "GPTBot", "OAI-SearchBot", "Claude-SearchBot", "ClaudeBot", "anthropic-ai", "PerplexityBot", "Google-Extended", "GoogleOther",
+    "Amazonbot", "Bytespider", "CCBot", "meta-externalagent", "meta-external", "Applebot-Extended", "cohere-ai", "YouBot",
+    "cloud-crawler", "NotHumanSearch", "ExaSearchBot", "Reflectionbot", "AgentFitBot", "AgenstryBot", "MCPCensus",
+    "rokmcp-collector", "WellknownBot",
+  ];
+  assertEq(JSON.stringify(AI_SEARCH_PATTERNS), JSON.stringify(OLD_SEARCH), "reg1 AI_SEARCH_PATTERNS derived = the old list, same order");
+  assertEq(JSON.stringify(AI_CRAWLER_PATTERNS), JSON.stringify(OLD_CRAWLER), "reg2 AI_CRAWLER_PATTERNS derived = the old list, same order");
+  assertEq(new Set(AI_AGENT_REGISTRY.map((e) => e.token)).size, AI_AGENT_REGISTRY.length, "reg3 no duplicate token in the registry");
+  // Regression matrix: every registry token, as a UA, lands where the old lists put it.
+  for (const t of OLD_SEARCH) expectBucket(`Mozilla/5.0 (compatible; ${t}/1.0)`, "ai_search", `reg4 ${t}`);
+  for (const t of OLD_CRAWLER) expectBucket(`Mozilla/5.0 (compatible; ${t}/1.0)`, "ai_crawler", `reg5 ${t}`);
+  // Vendor bucket: identical to the old regex for every registry token and the known edge UAs.
+  const oldVendor = (ua: string) =>
+    /GPTBot|ChatGPT|OAI-SearchBot/i.test(ua) ? "chatgpt" : /Claude|anthropic/i.test(ua) ? "claude" : /Perplexity/i.test(ua) ? "perplexity" : "other";
+  const vendorUas = [...OLD_SEARCH, ...OLD_CRAWLER].map((t) => `Mozilla/5.0 (compatible; ${t}/1.0)`)
+    .concat(["", "Mozilla/5.0 chatgpt-foo", "ClaudeThing/2", "perplexity.ai-fetch", "desktop:2ffb0ccf37cd549d"]);
+  for (const ua of vendorUas) assertEq(aiAssistantVendor(ua), oldVendor(ua), `reg6 vendor unchanged: ${JSON.stringify(ua.slice(0, 50))}`);
+  // aiAgents: purpose per agent (the OpenAI trio is the acceptance case).
+  const ag = emptyAiAgents();
+  addAiAgentViews(ag, "Mozilla/5.0 (compatible; OAI-SearchBot/1.0)", "ai_crawler", 4);
+  addAiAgentViews(ag, "Mozilla/5.0 (compatible; GPTBot/1.4)", "ai_crawler", 3);
+  addAiAgentViews(ag, "Mozilla/5.0 (compatible; ChatGPT-User/1.0)", "ai_search", 2);
+  addAiAgentViews(ag, "Mozilla/5.0 (compatible; Claude-SearchBot/1.0)", "ai_crawler", 5);
+  addAiAgentViews(ag, "Mozilla/5.0 (compatible; Claude-User/1.0)", "ai_search", 1);
+  addAiAgentViews(ag, "Mozilla/5.0 (compatible; Perplexity-User/1.0)", "ai_search", 6);
+  addAiAgentViews(ag, "Mozilla/5.0 (compatible; Google-Extended)", "ai_crawler", 7);
+  addAiAgentViews(ag, "Mozilla/5.0 (compatible; Amazonbot/0.1)", "ai_crawler", 8);
+  assertEq(JSON.stringify(ag.chatgpt), JSON.stringify({ user: 2, search: 4, training: 3 }), "ag1 chatgpt: ChatGPT-User user 2, OAI-SearchBot search 4, GPTBot training 3");
+  assertEq(JSON.stringify(ag.claude), JSON.stringify({ user: 1, search: 5, training: 0 }), "ag2 claude: Claude-User user 1, Claude-SearchBot search 5");
+  assertEq(ag.perplexity.user, 6, "ag3 perplexity has its own bucket");
+  assertEq(ag.google.training, 7, "ag4 google has its own bucket");
+  assertEq(ag.other.training, 8, "ag5 Amazonbot → other training");
+  // A bucketed stored AI row has no registry token: the group decides the purpose.
+  const ag2 = emptyAiAgents();
+  addAiAgentViews(ag2, "desktop:2ffb0ccf37cd549d", "ai_search", 2);
+  addAiAgentViews(ag2, "", "ai_crawler", 3);
+  assertEq(ag2.other.user + ag2.other.training, 5, "ag6 unmatched UA still counted (user for ai_search, training for ai_crawler)");
+  const merged = emptyAiAgents();
+  mergeAiAgents(merged, ag);
+  mergeAiAgents(merged, ag);
+  mergeAiAgents(merged, undefined);
+  mergeAiAgents(merged, { chatgpt: { user: 1 } });
+  assertEq(merged.chatgpt.user, 5, "ag7 mergeAiAgents adds blocks, tolerates missing/partial ones (rows stored before aiAgents)");
 
   // ── velocity heuristic (strict thresholds) ──────────────────────────────
   assertEq(SCRAPER_UNIQUE_PAGES_PER_10_MIN, 60, "vel0 10-minute threshold is 60 unique pages");

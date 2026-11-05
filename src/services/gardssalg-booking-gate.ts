@@ -30,6 +30,7 @@
 import crypto from "crypto";
 import type Database from "better-sqlite3";
 import { isBookingPaused } from "./booking-store";
+import { gardssalgOwnerBookingPaused } from "../owner-features/gardssalg";
 
 /** True when the provider has an address a booking request can be sent to.
  *  Same rule the admin lever has always applied (non-empty, trimmed epost). */
@@ -150,6 +151,25 @@ export const GARDSSALG_BOOKING_NOTE_OPENS_SOON =
 export const GARDSSALG_BOOKING_NOTE_NOT_TAKING =
   "Produsenten tar ikke imot forespørsler nå; ta kontakt via profilsiden. / The producer is not taking requests right now; visit the profile page to get in touch.";
 
+/** The not-taking line (G1 item 7), also the refusal for the owner's
+ *  booking.pause («Mine valg», O1a). One source for every channel. */
+export const GARDSSALG_NOT_TAKING_REQUESTS_TEXT: { no: string; en: string } = {
+  no: "Produsenten tar ikke imot forespørsler nå.",
+  en: "The producer is not taking requests right now.",
+};
+
+/**
+ * The owner's seasonal pause («Mine valg» booking.pause, dev-request
+ * 2026-10-22-opplevagent-mine-valg-gardssalg O1a): true when a new request
+ * must be refused with GARDSSALG_NOT_TAKING_REQUESTS_TEXT. Only while
+ * OA_OWNER_FEATURES_ENABLED is on and the producer is allowlisted
+ * (owner-features/gardssalg.ts); otherwise always false. The profile stays
+ * visible — this never touches catalog_hidden or booking_live.
+ */
+export function gardssalgBookingPausedByOwner(providerId: string | null | undefined): boolean {
+  return gardssalgOwnerBookingPaused(providerId);
+}
+
 export interface GardssalgBookingStatus {
   live: boolean;
   mode: "request" | "paused";
@@ -169,8 +189,13 @@ function hasOwner(claimedAt: string | null | undefined): boolean {
 export function gardssalgBookingStatus(row: {
   booking_live: number | null | undefined;
   claimed_at?: string | null;
+  /** experience_providers.id — lets the owner's booking.pause apply (O1a). */
+  id?: string | null;
 }): GardssalgBookingStatus {
   const live = !isBookingPaused(row.booking_live);
+  if (live && gardssalgBookingPausedByOwner(row.id)) {
+    return { live: false, mode: "paused", note: GARDSSALG_BOOKING_NOTE_NOT_TAKING };
+  }
   if (live) return { live, mode: "request", note: GARDSSALG_BOOKING_NOTE_LIVE };
   return {
     live,
@@ -185,8 +210,5 @@ export function gardssalgBookingStatus(row: {
  *  "Booking er ikke aktivert … ennå" copy). */
 export function gardssalgNotTakingRequestsText(claimedAt: string | null | undefined): { no: string; en: string } | null {
   if (!hasOwner(claimedAt)) return null;
-  return {
-    no: "Produsenten tar ikke imot forespørsler nå.",
-    en: "The producer is not taking requests right now.",
-  };
+  return GARDSSALG_NOT_TAKING_REQUESTS_TEXT;
 }

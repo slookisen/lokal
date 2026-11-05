@@ -466,7 +466,7 @@ export function handleExperiencesMessageSend(
       // asking "where can I book X" must show honest booking status per
       // result, not silently filter out paused producers.
 
-      const results = searchGardssalgProviders(gardssalgFilter, 20);
+      const results = searchGardssalgProviders(gardssalgFilter, 20, { surface: "a2a" });
       const hasGeo = typeof gardssalgFilter.lat === "number" && typeof gardssalgFilter.lng === "number";
 
       const summaryText =

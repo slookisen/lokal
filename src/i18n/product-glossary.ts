@@ -27,8 +27,16 @@
 // Add words here, not special cases in templates. Keys are lower-case
 // Norwegian; values are lower-case too (capitalisation is restored from the
 // input: "Kjøtt" → "Meat", "kjøtt" → "meat").
+//
+// Økologi S3e: «økologisk» is a legally protected term. A name carrying an
+// organic claim (organic-claims.ts, the ONE shared word list — pure, no
+// project imports) is translated only with `organicAllowed: true` (a
+// producer with a valid Debio status); otherwise it is returned unchanged,
+// like an untranslatable name, so an unverified producer's
+// "Økologisk storfekjøtt" never becomes a freshly generated "Organic beef".
 
 import type { Lang } from "./t";
+import { containsOrganicClaim } from "../services/organic-claims";
 
 type Entry = { en: string; sv?: string };
 
@@ -197,15 +205,34 @@ function lookupToken(tok: string, lang: Lang): string | null {
   return w === null ? null : recase(tok, w);
 }
 
+export interface TranslateProductNameOptions {
+  /**
+   * Økologi S3e: may an organic word be translated? Default false (fail
+   * closed): a name with an organic claim — or whose translation would carry
+   * one — is returned unchanged. Pass true only for a producer with a valid
+   * Debio status.
+   */
+  organicAllowed?: boolean;
+}
+
 /**
  * Translate a product name for display in `lang`. Returns the input unchanged
- * for Norwegian, for unknown names, and for any name where a single word is
- * unknown (never half-translated).
+ * for Norwegian, for unknown names, for any name where a single word is
+ * unknown (never half-translated), and — unless `opts.organicAllowed` — for a
+ * name with an organic claim.
  */
-export function translateProductName(name: string, lang: Lang): string {
+export function translateProductName(name: string, lang: Lang, opts: TranslateProductNameOptions = {}): string {
   if (!name || lang === "no") return name;
   const trimmed = name.trim();
   if (!trimmed) return name;
+  if (opts.organicAllowed === true) return translateKnown(name, trimmed, lang);
+  if (containsOrganicClaim(trimmed)) return name;
+  const out = translateKnown(name, trimmed, lang);
+  // A phrase or word whose OUTPUT carries an organic word is blocked the same way.
+  return out !== name && containsOrganicClaim(out) ? name : out;
+}
+
+function translateKnown(name: string, trimmed: string, lang: Lang): string {
   const low = trimmed.toLowerCase();
   const phrase = pick(PRODUCT_PHRASES[low], lang) ?? pick(PRODUCT_WORDS[low], lang);
   if (phrase !== null) return recase(trimmed, phrase);
@@ -236,7 +263,8 @@ export function glossaryCoverage(freq: Array<[string, number]>, lang: Lang, isCa
   let translated = 0, total = 0;
   for (const [n, c] of freq) {
     total += c;
-    if (isCategoryWord(n) || translateProductName(n, lang) !== n) translated += c;
+    // Vocabulary coverage, not a display: organic words count as known.
+    if (isCategoryWord(n) || translateProductName(n, lang, { organicAllowed: true }) !== n) translated += c;
   }
   return { translated, total, pct: total ? Math.round((translated / total) * 100) : 0 };
 }

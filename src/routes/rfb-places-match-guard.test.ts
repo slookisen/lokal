@@ -50,6 +50,19 @@
  * /admin/places-usage counts them (B1: 0 with the lever off, 1 on); the
  * single route logs its call (S2) and answers without `found` (S4).
  *
+ * A5 (same dev-request, Daniel's answer to question 25): Google's formatted
+ * address is no longer fetched (places-match.ts PLACES_ADDRESS_FETCH_ENABLED
+ * = false). The S3 and S4-A2 route scenarios run with that switch forced ON,
+ * its rollback position, where the address behaviour is main's; the Places
+ * log then marks a call whose mask asked for the address ("+address", before
+ * "+rating"). The "A5" sections run in the production default (off): no mask
+ * carries places.formattedAddress, the batch sends no agent to Google with
+ * rating, phone and address off (skipped_places_contact_disabled) while its
+ * Brreg-first address is still written, the Details fallback is off whatever
+ * max_details_calls says, no Places address or address part reaches a
+ * column, a provenance record or a log line, and GET /admin/places-usage
+ * shows address_field_calls_this_month 0.
+ *
  * Harness: better-sqlite3 ":memory:" + __setDbForTesting/__initSchemaForTesting,
  * the real marketplace router driven through router.handle() with a fake
  * req/res, globalThis.fetch and console.warn stubbed (restored in finally).
@@ -577,8 +590,8 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
         ["google-rating-batch+rating", "text_search_enterprise"],
         ["google-rating-batch", "text_search_enterprise"],
         ["google-rating-batch", "text_search_pro"],
-        ["google-rating-batch-details", "place_details"],
-      ], "A2-T01: only the call whose mask asked for a rating field gets the +rating mark; the SKU is unchanged");
+        ["google-rating-batch-details+address", "place_details"],
+      ], "A2-T01: only the call whose mask asked for a rating field gets the +rating mark; the SKU is unchanged (A5: an address mask gets +address)");
       tdb.prepare(`INSERT INTO places_api_call_log (vertical, endpoint, sku, called_at) VALUES ('rfb', 'google-rating-batch+rating', 'text_search_enterprise', '2000-01-01T00:00:00.000Z')`).run();
       assertEq(tracker.getPlacesRatingFieldCallsThisMonth(tdb as any), 1, "A2-T02: rating-field calls this month = 1 (an older month's row is not counted)");
       assertEq(tracker.getPlacesUsageThisMonth(tdb as any, "rfb").find((r) => r.sku === "text_search_enterprise")?.calls_this_month, 2,
@@ -592,6 +605,47 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
       assertEq(tracker.getPlacesRatingFieldCallsThisMonth(bare as any), 0, "A2-T04: no log table → logging and counting never throw (0)");
     } finally {
       bare.close();
+    }
+  }
+
+  // ═════════════════════════════════════════════════════════════════════
+  // A5 (pure): the formatted address out of the Places masks, and its log mark
+  // ═════════════════════════════════════════════════════════════════════
+  {
+    const tracker = require("../services/places-usage-tracker") as typeof import("../services/places-usage-tracker");
+    assertEq([pm.PLACES_ADDRESS_FETCH_ENABLED, pm.placesAddressFetchEnabled()], [false, false],
+      "A5-U01: PLACES_ADDRESS_FETCH_ENABLED defaults to false, and that is what the routes read");
+    const text = "places.id,places.displayName,places.formattedAddress,places.addressComponents";
+    assertEq(pm.withoutPlacesAddressField(text, false), "places.id,places.displayName,places.addressComponents",
+      "A5-U02: off → places.formattedAddress dropped, addressComponents (the match guard) and the order kept");
+    assertEq(pm.withoutPlacesAddressField(text, true), text, "A5-U03: on → the mask unchanged");
+    assertEq(pm.withoutPlacesAddressField("formattedAddress,internationalPhoneNumber", false), "internationalPhoneNumber",
+      "A5-U04: the Place Details spelling is dropped too");
+    assertEq(pm.withoutPlacesAddressField(text), "places.id,places.displayName,places.addressComponents", "A5-U05: the default follows the switch (off)");
+    try {
+      pm.__setPlacesAddressFetchForTesting(true);
+      assertEq([pm.placesAddressFetchEnabled(), pm.withoutPlacesAddressField(text)], [true, text], "A5-U06: the test override turns the default on");
+    } finally {
+      pm.__setPlacesAddressFetchForTesting(null);
+    }
+    assertEq(
+      [text, "formattedAddress", "places.addressComponents", "places.formattedAddresses", ""].map((m) => pm.fieldMaskRequestsAddress(m)),
+      [true, true, false, false, false],
+      "A5-U07: fieldMaskRequestsAddress — either spelling; addressComponents does not count; whole names only",
+    );
+    const tdb = new Database(":memory:");
+    try {
+      tdb.exec(`CREATE TABLE places_api_call_log (id INTEGER PRIMARY KEY AUTOINCREMENT, vertical TEXT NOT NULL,
+        endpoint TEXT NOT NULL, sku TEXT NOT NULL, called_at TEXT NOT NULL DEFAULT (datetime('now')))`);
+      tracker.logPlacesCall(tdb as any, "rfb", "google-rating", "text_search_enterprise", "places.rating,places.formattedAddress");
+      tracker.logPlacesCall(tdb as any, "rfb", "google-rating-batch", "text_search_pro", pm.withoutPlacesAddressField(text, false));
+      const rows = tdb.prepare(`SELECT endpoint FROM places_api_call_log ORDER BY id`).all() as Array<{ endpoint: string }>;
+      assertEq(rows.map((r) => r.endpoint), ["google-rating+address+rating", "google-rating-batch"],
+        "A5-T01: an address mask gets +address before +rating; a mask without it gets no mark");
+      assertEq([tracker.getPlacesAddressFieldCallsThisMonth(tdb as any), tracker.getPlacesRatingFieldCallsThisMonth(tdb as any)], [1, 1],
+        "A5-T02: address-field calls 1, and the rating count still reads the +rating row");
+    } finally {
+      tdb.close();
     }
   }
 
@@ -616,6 +670,8 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
   // Google answers only the fields the FieldMask asks for ("places.<f>" in
   // Text Search, "<f>" in Place Details). false answers every field (S4-A2).
   let placesHonorMask = true;
+  // Brreg's search answer (enheter); null answers 404 as before (A5 sections).
+  let brregAnswer: unknown[] | null = null;
   const placesCalls: Array<{ url: string; mask: string | undefined }> = [];
   let brregCalls = 0;
   const warnings: string[] = [];
@@ -644,7 +700,13 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
         const det = masked(JSON.parse(JSON.stringify(detailsAnswer)), mask, "");
         return { ok: true, status: 200, json: async () => det, text: async () => "" } as any;
       }
-      if (u.includes("brreg.no")) brregCalls++;
+      if (u.includes("brreg.no")) {
+        brregCalls++;
+        if (brregAnswer) {
+          const enheter = JSON.parse(JSON.stringify(brregAnswer));
+          return { ok: true, status: 200, json: async () => ({ _embedded: { enheter } }), text: async () => "" } as any;
+        }
+      }
       return { ok: false, status: 404, json: async () => ({}), text: async () => "" } as any;
     };
     console.warn = (...args: unknown[]) => {
@@ -657,6 +719,10 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
     // position of GOOGLE_RATING_FETCH_ENABLED; the production default (off)
     // is the "S4-A2" section after (h). Restored in finally.
     pm.__setGoogleRatingFetchForTesting(true);
+    // A5: the S3 and S4-A2 scenarios run with address fetch forced ON, the
+    // rollback position of PLACES_ADDRESS_FETCH_ENABLED; the production
+    // default (off) is the "A5" section at the end. Restored in finally.
+    pm.__setPlacesAddressFetchForTesting(true);
 
     // knowledge null: the agent has no agent_knowledge row at all.
     const insertAgent = (id: string, name: string, city: string | null, knowledge: Record<string, unknown> | null = {}) => {
@@ -874,8 +940,8 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
         "R31 (g): single route logs the [places-match-guard] line");
       assertEq(maskFields(lastMask()), maskFields(OLD_MASKS.single + ",places.addressComponents"),
         "R32 (g): single-route mask = the old mask + places.addressComponents");
-      assertEq(logRows().slice(-1), [{ endpoint: "google-rating+rating", sku: "text_search_enterprise" }],
-        "R32b (g, review round 1 S2): the single route logs its call, marked as a rating call");
+      assertEq(logRows().slice(-1), [{ endpoint: "google-rating+address+rating", sku: "text_search_enterprise" }],
+        "R32b (g, review round 1 S2): the single route logs its call, marked as a rating call (and, A5 switch on, an address call)");
 
       insertAgent("pmg-g2", "Bergen Mathall", "Bergen", { postal_code: "5013" });
       placesAnswer = [MATHALLEN_OSLO, BERGEN_MATHALL];
@@ -985,9 +1051,9 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
           "A2-R11: max_details_calls 1 → the phone from one Details call, as on main's repeat run");
         assertEq(maskFields(lastMask()), ["internationalPhoneNumber"], "A2-R12: …which asks for the phone only (Text Search gave the address)");
         assertEq(logRows().slice(logFrom), [
-          { endpoint: "google-rating-batch", sku: "text_search_pro" },
+          { endpoint: "google-rating-batch+address", sku: "text_search_pro" },
           { endpoint: "google-rating-batch-details", sku: "place_details" },
-        ], "A2-R13: both calls are in the Places log, neither marked as a rating call");
+        ], "A2-R13: both calls are in the Places log, neither marked as a rating call (A5 switch on: the Text Search one as an address call)");
       } finally {
         detailsAnswer = {};
       }
@@ -1156,7 +1222,7 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
         assertEq([r.row?.status, r.row?.googleRating, row("a2-on").google_rating, row("a2-on").phone, r.body?.data?.rating_calls],
           ["enriched", 4.6, 4.6, "+4764870000", 1],
           "A2-R46: lever set back on → rating, address and phone from the first call again, rating_calls 1 (rollback without a revert)");
-        assertEq(ratingLogRows(), [{ endpoint: "google-rating-batch+rating", sku: "text_search_enterprise" }],
+        assertEq(ratingLogRows(), [{ endpoint: "google-rating-batch+address+rating", sku: "text_search_enterprise" }],
           "A2-R47 (B1): …and the Places log holds exactly 1 row marked as a rating call");
         const on = await usage();
         assertEq([on?.rating_field_calls_this_month, on?.enterprise_calls_this_month], [1, 1],
@@ -1173,11 +1239,165 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
         pm.__setGoogleRatingFetchForTesting(null);
       }
     }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // A5: both routes in the production default (rating, phone and address
+    // off). The stubbed Places answers still carry formattedAddress (and the
+    // Details answer too): the routes must neither ask for it nor take it.
+    // ═════════════════════════════════════════════════════════════════════
+    pm.__setPlacesAddressFetchForTesting(null);
+    pm.__setGoogleRatingFetchForTesting(null);
+    db.prepare(`DELETE FROM places_api_call_log`).run();
+    const a5CallsFrom = placesCalls.length;
+    const addrLogRows = () => logRows().filter((r) => r.endpoint.includes(tracker.PLACES_ADDRESS_ENDPOINT_SUFFIX));
+    // A Brreg entity for "Haugen Gård" (1400 Ski): the Brreg-first address.
+    const BRREG_HAUGEN = {
+      organisasjonsnummer: "912345678", navn: "HAUGEN GÅRD",
+      forretningsadresse: { adresse: ["Gårdsvegen 12"], postnummer: "1400", poststed: "SKI" },
+    };
+    assertEq([pm.placesAddressFetchEnabled(), pm.googleRatingFetchEnabled()], [false, false], "A5-R00: the scenarios below run with the production default");
+
+    // ── include_address_phone: no agent to Google, Brreg's address as before ──
+    {
+      insertAgent("a5-b", "Haugen Gård", "Ski", { postal_code: "1400" });
+      placesAnswer = [HAUGEN_SKI];
+      detailsAnswer = { formattedAddress: "Haugenveien 5, 1400 Ski", internationalPhoneNumber: "+47 64 87 00 00" };
+      brregAnswer = [BRREG_HAUGEN];
+      __clearBrregCacheForTesting();
+      const brregBefore = brregCalls;
+      try {
+        const r = await runBatch("a5-b", true, 5);
+        assertEq(placesCalls.length, a5CallsFrom, "A5-R01: include_address_phone with rating, phone and address off → no Places call (Text Search or Details, max_details_calls 5)");
+        assertEq([r.status, r.row?.status, r.row?.addressWritten, r.row?.phoneWritten], [200, "skipped_places_contact_disabled", true, false],
+          "A5-R02: the row reports skipped_places_contact_disabled, and the Brreg address is written as before");
+        assertTrue(brregCalls > brregBefore, "A5-R03: …from the Brreg-first lookup, now without a Places hit");
+        const k = row("a5-b");
+        assertEq([k.address, k.phone, k.google_rating, k.google_enterprise_fetched_at], ["Gårdsvegen 12, 1400 SKI", null, null, null],
+          "A5-R04: Brreg's address stored; no phone, no rating, no Enterprise marker");
+        const prov = JSON.parse(k.field_provenance ?? "{}");
+        assertEq([Object.keys(prov), (prov.address ?? []).map((x: any) => x.source_type)], [["address"], ["brreg"]],
+          "A5-R05: the address provenance is brreg only, no google_places record");
+        assertEq([r.body?.data?.places_api_calls, r.body?.data?.details_calls, r.body?.data?.pro_calls, r.body?.data?.enterprise_calls], [0, 0, 0, 0],
+          "A5-R06: no call counted");
+      } finally {
+        brregAnswer = null;
+        detailsAnswer = {};
+      }
+    }
+
+    // ── Places has an address, the profile has none, Brreg has nothing ───
+    {
+      insertAgent("a5-p", "Haugen Gård — Ski", "Ski", { postal_code: "1400" });
+      placesAnswer = [HAUGEN_SKI];
+      placesHonorMask = false; // Google would answer with formattedAddress anyway
+      try {
+        const r = await runBatch("a5-p", true, 5);
+        assertEq([r.row?.status, r.row?.addressWritten, r.row?.phoneWritten], ["skipped_places_contact_disabled", false, false],
+          "A5-R07: nothing written for a profile without a Brreg address");
+        const k = row("a5-p");
+        assertEq([k?.address ?? null, k?.phone ?? null, JSON.parse(k?.field_provenance || "{}")], [null, null, {}],
+          "A5-R08: the profile is still without an address, and no google_places record is written for it");
+      } finally {
+        placesHonorMask = true;
+      }
+    }
+
+    // ── the flag-less batch is unchanged (skipped_rating_fetch_disabled) ─
+    {
+      insertAgent("a5-x", "Haugen Gård", "Ski", { postal_code: "1400" });
+      const r = await runBatch("a5-x", false);
+      assertEq([r.row?.status, placesCalls.length], ["skipped_rating_fetch_disabled", a5CallsFrom], "A5-R09: flag-less batch → skipped_rating_fetch_disabled, no call");
+    }
+
+    // ── rating set back on (S4-A2 rollback), address still off ──────────
+    {
+      pm.__setGoogleRatingFetchForTesting(true);
+      const warnBefore = warnings.length;
+      try {
+        insertAgent("a5-r", "Haugen Gård — Ski", "Ski", { postal_code: "1400" });
+        placesAnswer = [HAUGEN_SKI];
+        detailsAnswer = { formattedAddress: "Haugenveien 5, 1400 Ski" };
+        placesHonorMask = false; // the answer carries formattedAddress although not asked for
+        const r = await runBatch("a5-r", true, 5);
+        assertEq(maskFields(lastMask()).includes("places.formattedAddress"), false, "A5-R10: the Enterprise batch mask has no places.formattedAddress");
+        assertEq(maskFields(lastMask()).includes("places.addressComponents"), true, "A5-R11: …but still places.addressComponents for the match guard");
+        assertEq([r.row?.status, r.row?.addressWritten, r.body?.data?.details_calls], ["enriched", false, 0],
+          "A5-R12: rating written, no Places address, and no Details call although max_details_calls is 5");
+        const k = row("a5-r");
+        assertEq(k.address, null, "A5-R13: no address stored from Places");
+        const provText = String(k.field_provenance ?? "");
+        assertTrue(!provText.includes("Haugenveien") && !provText.includes("1400") && !provText.includes("Ski"),
+          "A5-R14: no street, postal code or town from Places in field_provenance");
+        assertTrue(!warnings.slice(warnBefore).some((l) => l.includes("Haugenveien")), "A5-R15: …nor in a log line");
+
+        // a mismatch logs the producer's own postal code and town, nothing from the place's address
+        insertAgent("a5-m", "Haugen Gård", "Ski", { postal_code: "1400" });
+        placesAnswer = [HAUGEN_OPPDAL];
+        const wb = warnings.length;
+        await runBatch("a5-m");
+        const lines = warnings.slice(wb).filter((l) => l.startsWith("[places-match-guard]"));
+        assertTrue(lines.length === 1 && !lines[0]!.includes("7340") && !lines[0]!.includes("Oppdal"),
+          "A5-R16: the match-guard line carries no postal code or town from Places (addressComponents in memory only)");
+
+        // the single route: no formattedAddress in the mask, no placeAddress in the answer
+        insertAgent("a5-s", "Bergen Mathall", "Bergen", { postal_code: "5013" });
+        placesAnswer = [BERGEN_MATHALL];
+        const s = await runSingle("a5-s");
+        assertEq(maskFields(lastMask()).includes("places.formattedAddress"), false, "A5-R17: the single-route mask has no places.formattedAddress");
+        assertEq([s.body?.hasRating, s.body?.placeAddress], [true, ""], "A5-R18: the single route reports no Places address");
+        assertEq(row("a5-s").address, null, "A5-R19: …and stores none");
+
+        // Google honours the mask, so the Text Search answer has no address: only the
+        // code gate keeps the Details fallback from firing at max_details_calls 5
+        insertAgent("a5-d", "Haugen Gård — Ski", "Ski", { postal_code: "1400" });
+        placesAnswer = [HAUGEN_SKI];
+        placesHonorMask = true;
+        const callsBefore = placesCalls.length;
+        const d = await runBatch("a5-d", true, 5);
+        assertEq([d.row?.addressWritten, d.body?.data?.details_calls, placesCalls.length - callsBefore], [false, 0, 1],
+          "A5-R12b: mask honoured, no Places address → still no Details call although max_details_calls is 5");
+        assertEq(row("a5-d").address, null, "A5-R12c: …and no address stored from Places");
+      } finally {
+        pm.__setGoogleRatingFetchForTesting(null);
+        placesHonorMask = true;
+        detailsAnswer = {};
+      }
+    }
+
+    // ── every A5 call, the Places log and GET /admin/places-usage ────────
+    {
+      const a5Masks = placesCalls.slice(a5CallsFrom).map((c) => c.mask ?? "");
+      assertTrue(a5Masks.length >= 3 && a5Masks.every((m) => !pm.fieldMaskRequestsAddress(m)),
+        "A5-R20: no Places call in the A5 scenarios sent places.formattedAddress (Text Search or Details spelling)");
+      assertEq([logRows().length, addrLogRows().length], [a5Masks.length, 0], "A5-R21: every call logged, none marked as an address call");
+      const off = await usage();
+      assertEq(off?.address_field_calls_this_month, 0, "A5-R22: GET /admin/places-usage → address_field_calls_this_month 0");
+    }
+
+    // ── switch on: main's behaviour returns ───────────────────────────────
+    {
+      pm.__setPlacesAddressFetchForTesting(true);
+      try {
+        insertAgent("a5-on", "Haugen Gård", "Ski", { postal_code: "1400" });
+        placesAnswer = [HAUGEN_SKI];
+        __clearBrregCacheForTesting();
+        const r = await runBatch("a5-on");
+        assertEq([r.row?.status, r.row?.addressWritten, row("a5-on").address], ["enriched_addr_phone_only", true, "Haugenveien 5, 1400 Ski"],
+          "A5-R23: switch on → the Places address pass as on main (S4-A2 repeat-run Pro mask)");
+        assertEq(maskFields(lastMask()), maskFields(OLD_MASKS.batchPro + ",places.addressComponents"), "A5-R24: …with main's Pro mask byte for byte");
+        assertEq(addrLogRows().length, 1, "A5-R25: …logged as an address call");
+        const on = await usage();
+        assertEq(on?.address_field_calls_this_month, 1, "A5-R26: GET /admin/places-usage → address_field_calls_this_month 1");
+      } finally {
+        pm.__setPlacesAddressFetchForTesting(null);
+      }
+    }
   } catch (err: any) {
     failed++;
     failures.push("rfb-places-match-guard: unexpected error: " + String(err?.stack || err?.message || err));
   } finally {
     pm.__setGoogleRatingFetchForTesting(null);
+    pm.__setPlacesAddressFetchForTesting(null);
     console.warn = prevWarn;
     (globalThis as any).fetch = prevFetch;
     if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;

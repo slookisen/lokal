@@ -1,4 +1,4 @@
-// ─── «Med i AI-svar»: reads over profile_ai_deliveries ──────────────────
+// ─── «Med i AI-søk» (was «Med i AI-svar»): reads over profile_ai_deliveries ─
 // dev-request 2026-10-14-med-i-ai-svar-per-profil, S1. How many times a
 // profile was sent to an AI assistant (ChatGPT, Claude …) as part of what we
 // delivered: a list page or the profile page an assistant fetched for someone,
@@ -17,18 +17,58 @@ export type AiDeliveryChannel = (typeof AI_DELIVERY_CHANNELS)[number];
 export const AI_DELIVERY_VENDORS = ["chatgpt", "claude", "perplexity", "other", "unknown"] as const;
 export type AiDeliveryVendor = (typeof AI_DELIVERY_VENDORS)[number];
 
+/**
+ * «Med i AI-søk» (dev-request 2026-10-25 statistikk, S1): the day the counting
+ * restarted, when the front page's featured list stopped counting. Rows before
+ * it stay in profile_ai_deliveries but are never counted or shown.
+ * PROFILE_AI_DELIVERIES_COUNTING_SINCE ('YYYY-MM-DD') overrides the default.
+ */
+export const DEFAULT_AI_DELIVERIES_COUNTING_SINCE = "2026-10-26";
+
+/** The configured first counted day ('YYYY-MM-DD', UTC); an invalid override falls back to the default. */
+export function aiDeliveriesCountingSince(): string {
+  const raw = (process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE ?? "").trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw) && !Number.isNaN(Date.parse(raw + "T00:00:00Z"))
+    && new Date(raw + "T00:00:00Z").toISOString().slice(0, 10) === raw) return raw;
+  return DEFAULT_AI_DELIVERIES_COUNTING_SINCE;
+}
+
 /** Window of the public tile and the API (days, today included). */
 export const AI_DELIVERY_WINDOW_DAYS = 60;
+
+/** Display name and subtitle of the count (S1, 2026-10-25), shared by the server-rendered tiles. */
+export const AI_DELIVERIES_LABEL = { nb: "Med i AI-søk", en: "In AI searches" } as const;
+export const AI_DELIVERIES_SUBTITLE = {
+  nb: "ganger profilen var blant treffene en AI-assistent hentet",
+  en: "times the profile was among the results an AI assistant fetched",
+} as const;
+
+/**
+ * The period a count covers, for the subtitle: «siden <dato>» while the
+ * counting is younger than the window (or for the whole period), else
+ * «siste N d».
+ */
+export function aiDeliveriesPeriodLabel(
+  countingSince: string | null, windowDays: number | null, nowMs: number, lang: "nb" | "en" = "nb",
+): string {
+  const sinceMs = countingSince ? Date.parse(countingSince + "T00:00:00Z") : NaN;
+  const partial = windowDays === null || (!Number.isNaN(sinceMs) && nowMs - sinceMs < (windowDays - 1) * 24 * 60 * 60 * 1000);
+  if (partial && !Number.isNaN(sinceMs)) {
+    const d = new Date(sinceMs).toLocaleDateString(lang === "en" ? "en-GB" : "nb-NO", { day: "numeric", month: "short", timeZone: "UTC" });
+    return (lang === "en" ? "since " : "siden ") + d;
+  }
+  if (windowDays === null) return lang === "en" ? "whole period" : "hele perioden";
+  return lang === "en" ? `last ${windowDays} d` : `siste ${windowDays} d`;
+}
 
 export interface AiDeliveries {
   /** null = the whole period since the counting started. */
   windowDays: number | null;
   /**
-   * First day ('YYYY-MM-DD', UTC) with any delivery in the vertical (all
-   * verticals without one), whatever the profile: when the counting started
-   * there. null = nothing counted yet. Shown as «fra/siden <dato>» so a new
-   * count is never read as a full 60 days, and a profile at 0 shows the date
-   * instead of 0 (Daniel 2026-10-15).
+   * First counted day ('YYYY-MM-DD', UTC): aiDeliveriesCountingSince(), the
+   * same for every vertical and profile. null only when there is no table.
+   * Shown as «fra/siden <dato>» so a new count is never read as a full 60
+   * days, and a profile at 0 shows the date instead of 0 (Daniel 2026-10-15).
    */
   countingSince: string | null;
   total: number;
@@ -55,6 +95,14 @@ function firstDay(windowDays: number, nowMs: number): string {
   return utcDay(nowMs - (windowDays - 1) * 24 * 60 * 60 * 1000);
 }
 
+/** First counted day: the window's first day, never before the counting started; all days since then with windowDays = null. */
+function firstCountedDay(windowDays: number | null, nowMs: number): string {
+  const since = aiDeliveriesCountingSince();
+  if (windowDays === null) return since;
+  const w = firstDay(windowDays, nowMs);
+  return w > since ? w : since;
+}
+
 export function emptyAiDeliveries(windowDays: number | null): AiDeliveries {
   return {
     windowDays,
@@ -75,12 +123,11 @@ export function computeAiDeliveries(
 ): AiDeliveries {
   const out = emptyAiDeliveries(windowDays);
   if (!tableExists(db)) return out;
-  out.countingSince = countingSince(db, vertical);
-  const where = ["1 = 1"];
-  const params: string[] = [];
+  out.countingSince = aiDeliveriesCountingSince();
+  const where = ["day >= ?"];
+  const params: string[] = [firstCountedDay(windowDays, nowMs)];
   if (vertical !== undefined) { where.push("vertical_id = ?"); params.push(vertical); }
   if (profileId !== undefined) { where.push("profile_id = ?"); params.push(profileId); }
-  if (windowDays !== null) { where.push("day >= ?"); params.push(firstDay(windowDays, nowMs)); }
   const rows = db.prepare(`
     SELECT channel, ai_vendor, SUM(count) AS n FROM profile_ai_deliveries
     WHERE ${where.join(" AND ")}
@@ -95,24 +142,15 @@ export function computeAiDeliveries(
   return out;
 }
 
-/** First day with any delivery in the vertical (all verticals without one); null when none. Uses the (vertical_id, day) index. */
-function countingSince(db: Db, vertical: string | undefined): string | null {
-  const row = (vertical !== undefined
-    ? db.prepare("SELECT MIN(day) AS d FROM profile_ai_deliveries WHERE vertical_id = ?").get(vertical)
-    : db.prepare("SELECT MIN(day) AS d FROM profile_ai_deliveries").get()) as { d: string | null } | undefined;
-  return row?.d ?? null;
-}
-
 /** The profiles sent to AI assistants most often in the window. */
 export function computeAiDeliveryTopProfiles(
   db: Db, vertical: string, windowDays: number | null, nowMs: number, limit = 10,
 ): AiDeliveryTopProfile[] {
   if (!tableExists(db)) return [];
-  const sinceSql = windowDays !== null ? " AND day >= ?" : "";
-  const params: Array<string | number> = [vertical, ...(windowDays !== null ? [firstDay(windowDays, nowMs)] : []), limit];
+  const params: Array<string | number> = [vertical, firstCountedDay(windowDays, nowMs), limit];
   return db.prepare(`
     SELECT profile_id AS profileId, SUM(count) AS total FROM profile_ai_deliveries
-    WHERE vertical_id = ?${sinceSql}
+    WHERE vertical_id = ? AND day >= ?
     GROUP BY profile_id
     ORDER BY total DESC, profile_id
     LIMIT ?

@@ -431,6 +431,9 @@ import {
   selectExperiencesForPriceFreshnessCheck,
   resolvePriceProvenanceUrl,
   type PriceFreshnessTarget,
+  // Stamp name_collision at first harvest in bulk-load (additive; the
+  // recheck-backfill sweep keeps stamping already-present rows).
+  flagNameCollision,
 } from "../services/experience-store";
 // dev-request 2026-08-17-forsyningskjede-samarbeid-og-kvalitetsoppdatering,
 // Skive 3 ("Kvalitetsstyrt oppdatering av ikke-tomme felt — erstatter
@@ -678,7 +681,25 @@ import { titleTokens, titleSimilarity, CONTENT_TRANSFER_SIMILARITY_MIN } from ".
 // CLASSIFIED fetcher. It owns the charset-correct decode that used to be done
 // here via decodeHtmlBytes (PR lokal#365), and adds the named failure reason,
 // the one-shot transient retry and the empty-body check.
-import { fetchPage, discoverContentLinks, visibleTextOf, type FetchPageResult, type FetchPersistence } from "../services/fetch-page";
+import {
+  fetchPage,
+  discoverContentLinks,
+  rankContentLinks,
+  CONTENT_LINK_SCORE_ABOUT,
+  visibleTextOf,
+  type FetchPageResult,
+  type FetchPersistence,
+} from "../services/fetch-page";
+import {
+  isAboutFallbackPath,
+  urlIsInSection,
+  pickAboutPageCandidate,
+  aboutPageTextIncluded,
+  resolveAboutPageMode,
+  aboutPagePreviewRequested,
+  type AboutPageMode,
+  type AboutPageEvaluation,
+} from "../services/about-page-candidate";
 import {
   renderPage,
   shouldEscalateToRender,
@@ -795,7 +816,12 @@ import {
   maskEmail,
   isGardssalgProviderClaimed,
   getOwnedVisibilityState,
+  // O2a (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg) — the
+  // owner login of POST /admin/gardssalg/test-provider below.
+  deriveOrgLinkedEmailCandidates,
+  CATALOG_HIDDEN_REASON_TEST_FIXTURE,
 } from "../services/gardssalg-claim";
+import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
 import {
   emailService,
   // dev-request 2026-08-09-outreach-send-uten-crm-spor: the pilot-send route
@@ -805,6 +831,9 @@ import {
   // goes through the variant dispatcher so BOTH A/B arms keep that rule.
   renderGardssalgOutreachVariant,
   GardssalgOutreachTemplate,
+  GardssalgOutreachSubjectArm,
+  GardssalgOutreachRenderCtx,
+  gardssalgOutreachMonthPhrase,
   GARDSSALG_OUTREACH_REPLY_TO,
 } from "../services/email-service";
 import { crmService } from "../services/crm-service";
@@ -815,7 +844,8 @@ import { CRM_SENDER_ADDRESS } from "../services/crm-platform-identity";
 // was removed; a merge with main's independently-built AC6 slice (#508)
 // silently dropped the import since neither side's diff hunk touched the
 // same line the other needed, tsc caught it as the two branches combined.
-import { normalizeDomain, normalizeEmail, isBlocked, add as blocklistAdd } from "../services/blocklist-service";
+import { normalizeDomain, normalizeEmail, isBlocked, add as blocklistAdd, loadOwnerRemovedMatcher } from "../services/blocklist-service";
+import type { GardssalgTerminalStatus } from "../services/experience-store";
 import {
   countRecipientAddressTypes,
   isColdRecipientAllowed,
@@ -915,6 +945,8 @@ import {
   hasBookingRequestEmail,
   setGardssalgBookingAdminBrake,
   gardssalgBookingStatus,
+  gardssalgBookingPausedByOwner,
+  GARDSSALG_NOT_TAKING_REQUESTS_TEXT,
 } from "../services/gardssalg-booking-gate";
 // dev-request 2026-09-16-opplevagent-en-setning-booking-via-ai: name →
 // provider resolution + requested-weekday guard + the shared honest-outcome
@@ -1369,7 +1401,7 @@ router.get("/discover", (req: Request, res: Response) => {
       if (typeof filter.radius_km === "number") gsFilter.radius_km = filter.radius_km;
       const hasGeo = typeof gsFilter.lat === "number" && typeof gsFilter.lng === "number";
 
-      const gsResults = searchGardssalgProviders(gsFilter, limit);
+      const gsResults = searchGardssalgProviders(gsFilter, limit, { surface: "rest" });
       res.json({
         vertical: "gardssalg",
         query: gsFilter,
@@ -2080,13 +2112,32 @@ const ADMISSION_VERDICT_STAMP_MAX_CHARS = 500;
 
 type AdmissionOutcome = { status: "match" | "mismatch" | "unresolved"; reason: string };
 
+// dev-request 2026-10-31-opplevagent-admisjonsgate-script-json-stripping,
+// slice 1 (diagnostics only): for every row whose evidence page was fetched,
+// record how much text the judge saw (visibleTextOf) vs how much the page
+// ships as script-embedded string literals (gardssalgEmbeddedPageText).
+// Evidence only — the judge input is unchanged.
+const ADMISSION_DIAGNOSTIC_SAMPLE_CHARS = 300;
+type AdmissionDiagnostic = {
+  evidence_url: string;
+  visible_chars: number;
+  embedded_chars: number;
+  script_blocks: number;
+  visible_sample: string;
+  embedded_sample: string;
+  verdict: AdmissionOutcome["status"];
+};
+
 /**
  * Run one NOT-YET-INSERTED bulk-load row through the admission gate: fetch
  * its own evidence_url and ask the fail-closed judge whether the candidate's
  * composed content (title/category/price) is substantiated by that page.
  * Never throws — every failure path resolves to `unresolved` (fail-closed).
  */
-async function judgeBulkLoadCandidate(r: BulkRow, evidenceUrl: string): Promise<AdmissionOutcome> {
+async function judgeBulkLoadCandidate(
+  r: BulkRow,
+  evidenceUrl: string,
+): Promise<AdmissionOutcome & { diagnostic?: AdmissionDiagnostic }> {
   const judgeRow: HoldoutExperienceRow = {
     // Synthetic id — the row does not exist yet; the judge only echoes this
     // into nothing (its prompt uses title/description/category/price).
@@ -2106,11 +2157,28 @@ async function judgeBulkLoadCandidate(r: BulkRow, evidenceUrl: string): Promise<
       reason: `henting av evidensside feilet: ${fetchResult.reason} (${fetchResult.persistence})`,
     };
   }
-  const judged = await judgeExperienceContentMatch(judgeRow, visibleTextOf(fetchResult.html));
-  if (!judged.ok) return { status: "unresolved", reason: judged.reasoning };
-  return judged.verdict === "MATCH"
-    ? { status: "match", reason: judged.reasoning }
-    : { status: "mismatch", reason: judged.reasoning };
+  const visibleText = visibleTextOf(fetchResult.html);
+  const judged = await judgeExperienceContentMatch(judgeRow, visibleText);
+  const outcome: AdmissionOutcome = !judged.ok
+    ? { status: "unresolved", reason: judged.reasoning }
+    : judged.verdict === "MATCH"
+      ? { status: "match", reason: judged.reasoning }
+      : { status: "mismatch", reason: judged.reasoning };
+  const embeddedText = gardssalgEmbeddedPageText(fetchResult.html);
+  const diagnostic: AdmissionDiagnostic = {
+    evidence_url: evidenceUrl,
+    visible_chars: visibleText.length,
+    embedded_chars: embeddedText.length,
+    script_blocks: (fetchResult.html.match(/<script\b/gi) || []).length,
+    visible_sample: visibleText.slice(0, ADMISSION_DIAGNOSTIC_SAMPLE_CHARS),
+    embedded_sample: embeddedText.slice(0, ADMISSION_DIAGNOSTIC_SAMPLE_CHARS),
+    verdict: outcome.status,
+  };
+  console.log(
+    `[opplevelser] admission-gate diagnostic url=${evidenceUrl} verdict=${outcome.status} ` +
+      `visible_chars=${diagnostic.visible_chars} embedded_chars=${diagnostic.embedded_chars} script_blocks=${diagnostic.script_blocks}`,
+  );
+  return { ...outcome, diagnostic };
 }
 
 router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response) => {
@@ -2188,6 +2256,12 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
   // follows the same convention.
   let rejectedBlocklisted = 0;
   const rejectedBlocklistedProviders: Array<{ provider_name: string; matched_by?: string; matched_value?: string }> = [];
+  // Providers whose Brreg verdict carried name_collision:true (>=2 Brreg
+  // entities share the name, kommune didn't disambiguate) — stamped via
+  // flagNameCollision() at first harvest in apply mode, counted only in
+  // dry-run. Never cleared here.
+  let flaggedNameCollision = 0;
+  const flaggedNameCollisionProviders: string[] = [];
 
   // Admission-gate tallies (see the block comment above ADMISSION_GATE_MAX_
   // JUDGED). `judged` = rows the gate actually evaluated (fetch + judge
@@ -2202,6 +2276,8 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
     verdict: "match" | "mismatch" | "unresolved";
     reason: string;
   }> = [];
+  // Bounded by ADMISSION_GATE_MAX_JUDGED (one entry per successful fetch).
+  const admissionGateDiagnostics: AdmissionDiagnostic[] = [];
 
   // ── 2–3. Classify + (conditionally) insert, one provider at a time. ─
   for (let i = 0; i < providerNames.length; i++) {
@@ -2262,6 +2338,10 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
           }
         }
         providersInserted += 1;
+        if (verdict.name_collision === true) {
+          flaggedNameCollision++;
+          flaggedNameCollisionProviders.push(name);
+        }
         continue;
       }
 
@@ -2323,6 +2403,14 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
           setBrregVerification(providerId, (verdict.brreg_active ?? 0) as 0 | 1, verdict.org_nr ?? undefined);
         }
         providersInserted += 1;
+      }
+
+      // Stamp name_collision for both the existing and the freshly created
+      // provider (set-only; never cleared here).
+      if (verdict.name_collision === true) {
+        flagNameCollision(providerId);
+        flaggedNameCollision++;
+        flaggedNameCollisionProviders.push(name);
       }
 
       // ── insert this provider's experiences (idempotent by title). ───
@@ -2412,7 +2500,9 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
             admissionGate.capped++;
           } else {
             admissionGate.judged++;
-            admission = await judgeBulkLoadCandidate(r, evidenceUrl);
+            const { diagnostic, ...judgedOutcome } = await judgeBulkLoadCandidate(r, evidenceUrl);
+            admission = judgedOutcome;
+            if (diagnostic) admissionGateDiagnostics.push(diagnostic);
             admissionGate[admission.status]++;
           }
           admissionGateResults.push({
@@ -2499,6 +2589,8 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
     excluded_inactive: excludedInactive,
     rejected_blocklisted: rejectedBlocklisted,
     rejected_blocklisted_providers: rejectedBlocklistedProviders,
+    flagged_name_collision: flaggedNameCollision,
+    flagged_name_collision_providers: flaggedNameCollisionProviders,
     // Admission-gate report (faithfulness-inflow slice). Dry-run spends zero
     // fetch/judge budget by design, so it can only announce that the gate
     // WOULD run on apply — it cannot pre-compute verdicts without paying the
@@ -2508,7 +2600,7 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
           dry_run: true,
           note: "admission gate kjøres kun i apply-modus: hver NY rad med evidence_url dømmes mot sin egen evidensside før den slippes inn som verified",
         }
-      : { ...admissionGate, results: admissionGateResults },
+      : { ...admissionGate, results: admissionGateResults, diagnostics: admissionGateDiagnostics },
     ...(cappedProviders > 0 ? { capped_providers: cappedProviders } : {}),
   });
 });
@@ -2983,6 +3075,15 @@ type CrFetchOutcome =
        * gardssalg-website-verification.ts's `candidateHost`.
        */
       finalUrl?: string;
+      /**
+       * dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse:
+       * set ONLY by crFetchGardssalgContent when its caller passed the
+       * aboutPage option (about-page run). Every fetched sub-page that is an
+       * about page (discovered with CONTENT_LINK_SCORE_ABOUT, or an about
+       * fallback path) whose final URL stayed inside the crawl's own section,
+       * in fetch order; `url` is that final URL.
+       */
+      aboutPages?: Array<{ url: string; html: string }>;
     }
   | { ok: false; reason: string; persistence: FetchPersistence; status: number | null };
 
@@ -3726,6 +3827,41 @@ export function gardssalgOrderContentPathsForNeed(needsDriven: boolean): readonl
   return [...visitFirst, ...rest];
 }
 
+// dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse, spec 5:
+// the about-page fallback paths, in this order.
+const GARDSSALG_ABOUT_FALLBACK_PATHS: readonly string[] = ["/om-oss", "/om"];
+
+/**
+ * A gårdssalg row that still needs a description: about_text blank or THIN —
+ * failing meetsAboutCheapBar, the same «thin» gardssalgReplaceableFieldAction
+ * fills/replaces. PURE.
+ */
+export function gardssalgAboutNeedsDescription(aboutText: string | null | undefined): boolean {
+  if (aboutText === null || aboutText === undefined || String(aboutText).trim() === "") return true;
+  return !meetsAboutCheapBar(aboutText);
+}
+
+/**
+ * The fallback-path order for an about-page run (ENRICHMENT_ABOUT_PAGE_ENABLED
+ * or a dry-run preview; spec 5). `needsDescription=false` returns
+ * gardssalgOrderContentPathsForNeed(needsDriven) unchanged. For a row that
+ * needs a description (gardssalgAboutNeedsDescription), /om-oss and /om move
+ * to just ahead of the first visit path of that same order; every other path
+ * keeps its relative order. Membership never changes. PURE.
+ */
+export function gardssalgOrderContentPathsForAboutNeed(
+  needsDriven: boolean,
+  needsDescription: boolean
+): readonly string[] {
+  const base = gardssalgOrderContentPathsForNeed(needsDriven);
+  if (!needsDescription) return base;
+  const about = GARDSSALG_ABOUT_FALLBACK_PATHS.filter((p) => base.includes(p));
+  const rest = base.filter((p) => !GARDSSALG_ABOUT_FALLBACK_PATHS.includes(p));
+  const firstVisit = rest.findIndex((p) => GARDSSALG_VISIT_PATH_SET.has(p));
+  const at = firstVisit === -1 ? rest.length : firstVisit;
+  return [...rest.slice(0, at), ...about, ...rest.slice(at)];
+}
+
 /**
  * Fetch a gårdssalg provider's homepage + up to 4 of its content sub-pages
  * (GARDSSALG_CONTENT_PATHS), concatenated, stopping once 5 pages total have
@@ -3769,7 +3905,17 @@ async function crFetchGardssalgContent(
   // Del A2 — OPTIONAL, additive, defaults to false so every pre-existing
   // call site keeps today's fallback-path ordering byte-identical. See
   // gardssalgOrderContentPathsForNeed()'s own doc comment above.
-  needsDrivenOrdering: boolean = false
+  needsDrivenOrdering: boolean = false,
+  // dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse —
+  // OPTIONAL; passed only by the content-refresh run when the about-page
+  // logic is on (ENRICHMENT_ABOUT_PAGE_ENABLED or a dry-run preview). Unset =
+  // today's crawl, byte-identical, for this caller and every other one. When
+  // set: a discovered about link gets one of the GARDSSALG_MAX_PAGES - 1
+  // sub-page slots (no extra fetch), the fallback list puts /om-oss and /om
+  // ahead of the visit paths for a row that needs a description
+  // (gardssalgOrderContentPathsForAboutNeed), and the fetched about pages
+  // come back as `aboutPages`.
+  aboutPage?: { needsDescription: boolean }
 ): Promise<CrFetchOutcome> {
   const fetchUrl = /^https?:\/\//i.test(homepageUrl) ? homepageUrl : `https://${homepageUrl}`;
   const primary = await crFetchPage(fetchUrl);
@@ -3857,6 +4003,8 @@ async function crFetchGardssalgContent(
   // the homepage itself (that's implicit — primary always succeeded to get
   // this far).
   const fetchedPaths: string[] = [];
+  // About-page run only (the aboutPage option); see CrFetchOutcome.aboutPages.
+  const aboutPagesOut: Array<{ url: string; html: string }> = [];
   try {
     // Final url, not the requested one — a cross-host redirect otherwise leaves
     // the whole sub-page crawl pointed at a host that no longer serves the site.
@@ -3912,22 +4060,53 @@ async function crFetchGardssalgContent(
     // Fallback fires only when discovery yields nothing INSIDE the section,
     // which is the site shape fetch-page.ts documents as having no crawlable
     // internal links at all.
-    const discovered = discoverContentLinks(primaryHtml, primaryUrl, GARDSSALG_MAX_PAGES)
-      .filter((href) => href.startsWith(base));
+    let targets: Array<{ url: string; label: string; about?: boolean }>;
+    if (!aboutPage) {
+      const discovered = discoverContentLinks(primaryHtml, primaryUrl, GARDSSALG_MAX_PAGES)
+        .filter((href) => href.startsWith(base));
 
-    const targets: Array<{ url: string; label: string }> =
-      discovered.length > 0
-        ? // Recorded relative to `base` so pagesFetchedPaths keeps the shape
-          // the products diagnostic already reads.
-          discovered.map((href) => ({ url: href, label: href.slice(base.length) || "/" }))
-        : // Del A2: need-driven ordering of the FALLBACK list only — link
-          // discovery above still always takes priority when it finds
-          // anything inside the section.
-          gardssalgOrderContentPathsForNeed(needsDrivenOrdering).map((p) => ({ url: `${base}${p}`, label: p }));
+      targets =
+        discovered.length > 0
+          ? // Recorded relative to `base` so pagesFetchedPaths keeps the shape
+            // the products diagnostic already reads.
+            discovered.map((href) => ({ url: href, label: href.slice(base.length) || "/" }))
+          : // Del A2: need-driven ordering of the FALLBACK list only — link
+            // discovery above still always takes priority when it finds
+            // anything inside the section.
+            gardssalgOrderContentPathsForNeed(needsDrivenOrdering).map((p) => ({ url: `${base}${p}`, label: p }));
+    } else {
+      // About-page run: the same discovery and section filter, with the best
+      // IN-SECTION about link guaranteed a place among the first
+      // GARDSSALG_MAX_PAGES - 1 targets (the sub-page slots). Eligible means
+      // it passes the very `base` prefix filter below (which also pins the
+      // protocol — an absolute http:// link on an https site does not) AND
+      // urlIsInSection (no sibling section sharing the prefix), so the
+      // reserved link is never one the filter then drops; the filter only
+      // removes other entries, which can only move the reserved link forward.
+      const discovered = rankContentLinks(primaryHtml, primaryUrl, GARDSSALG_MAX_PAGES, {
+        reserveAboutSlotWithin: GARDSSALG_MAX_PAGES - 1,
+        aboutEligible: (url) => url.startsWith(base) && urlIsInSection(url, base),
+      }).filter((l) => l.url.startsWith(base));
+      targets =
+        discovered.length > 0
+          ? discovered.map((l) => ({
+              url: l.url,
+              label: l.url.slice(base.length) || "/",
+              about: l.score === CONTENT_LINK_SCORE_ABOUT,
+            }))
+          : gardssalgOrderContentPathsForAboutNeed(needsDrivenOrdering, aboutPage.needsDescription).map((p) => ({
+              url: `${base}${p}`,
+              label: p,
+              about: isAboutFallbackPath(p),
+            }));
+    }
 
     for (const t of targets) {
       if (pagesFetched >= GARDSSALG_MAX_PAGES) break;
-      let sub = await crFetchHtml(t.url);
+      // crFetchHtml(t.url) is exactly this; the page result is kept for the
+      // about page's final URL.
+      const subRes = await crFetchPage(t.url);
+      let sub = subRes.ok ? subRes.html : null;
       // ── Sub-page escalation (Daniel, live session 2026-08-15) ───────────
       //
       // Rendering used to run on the PRIMARY page only, and on a JS-built site
@@ -3974,6 +4153,13 @@ async function crFetchGardssalgContent(
         pages.push({ label: t.label, html: sub });
         pagesFetched++;
         fetchedPaths.push(t.label);
+        // Only the producer's own section counts as its about page — the
+        // final URL after a redirect must still be inside `base`.
+        // A page identical to the homepage (a soft 404, or a redirect back to
+        // the front page) is not an about page of its own.
+        if (aboutPage && t.about && subRes.ok && sub !== primaryHtml && urlIsInSection(subRes.finalUrl || t.url, base)) {
+          aboutPagesOut.push({ url: subRes.finalUrl || t.url, html: sub });
+        }
       }
     }
   } catch {
@@ -3988,6 +4174,7 @@ async function crFetchGardssalgContent(
     pages,
     render: renderReport,
     finalUrl: primaryUrl,
+    ...(aboutPage ? { aboutPages: aboutPagesOut } : {}),
   };
 }
 
@@ -4382,8 +4569,51 @@ export type GardssalgContentRefreshInput = {
   cohort?: unknown;
   /** false = no model call of any kind (server-side job). Default true. */
   llm?: boolean;
+  /**
+   * dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse, spec
+   * 6: run the about-page logic for THIS call without
+   * ENRICHMENT_ABOUT_PAGE_ENABLED. Honoured ONLY in a dry run (apply=false);
+   * an apply call ignores it. Unset = today's behaviour.
+   */
+  aboutPagePreview?: boolean;
 };
 export type GardssalgContentRefreshOutcome = { status: number; body: any };
+
+/**
+ * One row's about_text choice in an about-page run (the before/after report;
+ * dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse):
+ *   - stored_about_text: the row's about_text before the run;
+ *     needs_description: blank or thin (gardssalgAboutNeedsDescription) — the
+ *     only rows whose about pages are evaluated;
+ *   - homepage_candidate: summarizeAbout(homepage) and its source_url;
+ *   - about_pages: every fetched about page with its candidate and verdict
+ *     ("not_evaluated" for a row that does not need a description);
+ *   - about_page_in_content_text: an about page's prose is within the first
+ *     GARDSSALG_REWRITE_SOURCE_CHAR_CAP chars of contentText — the part the
+ *     LLM rewrite/fill actually read this run;
+ *   - deterministic_choice: the raw candidate handed to the judge;
+ *     candidate_source: the judge-approved candidate's source (null = none);
+ *   - about_text_action / about_text_after / about_text_source_url: what the
+ *     run would write for about_text (filled/replaced/rewritten), predicted
+ *     from the row snapshot exactly like changed[]; owner_locked: the field
+ *     is owner/admin-locked, so nothing is written for it.
+ */
+export type GardssalgAboutCandidateReport = {
+  provider_id: string;
+  homepage_url: string;
+  stored_about_text: string | null;
+  needs_description: boolean;
+  homepage_candidate: { text: string; source_url: string };
+  about_pages: AboutPageEvaluation[];
+  about_page_in_content_text: boolean;
+  deterministic_choice: "about_page" | "homepage";
+  candidate_source: "about_page" | "homepage" | null;
+  about_text_action: "filled" | "replaced" | "rewritten" | null;
+  about_text_after: string | null;
+  about_text_source_url: string | null;
+  owner_locked: boolean;
+  subpages_fetched: string[];
+};
 
 export async function runGardssalgContentRefresh(
   input: GardssalgContentRefreshInput
@@ -4395,6 +4625,14 @@ export async function runGardssalgContentRefresh(
   // Rows whose deterministic extraction found a cheap-bar-passing candidate
   // that only a judge could admit — meaningful only when llmAllowed=false.
   let judgeRequiredRows = 0;
+  // dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse: the env
+  // flag, or a DRY run's explicit preview — never a preview that writes.
+  // null = every about-page branch below is skipped (today's behaviour).
+  const aboutPageMode: AboutPageMode | null = resolveAboutPageMode({
+    dryRun,
+    previewRequested: input.aboutPagePreview === true,
+  });
+  const aboutPageCandidates: GardssalgAboutCandidateReport[] = [];
 
   // Enrichment write-pause fence (del 1) — apply only; dry-run is never blocked.
   if (apply) {
@@ -4800,9 +5038,13 @@ export async function runGardssalgContentRefresh(
     // Eligible(t.products) === true means products is still BLANK, so its
     // negation is "products already filled" here.
     const gsNeedsDrivenOrdering = !gardssalgProductsEligible(t.products) && !!(t.about_text && t.about_text.trim());
+    // About-page run only: a row whose about_text is blank or thin.
+    const gsAboutNeedsDescription = aboutPageMode ? gardssalgAboutNeedsDescription(t.about_text) : false;
     let fetched: CrFetchOutcome;
     try {
-      fetched = await crFetchGardssalgContent(t.hjemmeside, gsNeedsDrivenOrdering);
+      fetched = aboutPageMode
+        ? await crFetchGardssalgContent(t.hjemmeside, gsNeedsDrivenOrdering, { needsDescription: gsAboutNeedsDescription })
+        : await crFetchGardssalgContent(t.hjemmeside, gsNeedsDrivenOrdering);
     } catch (e: any) {
       errors.push({ provider_id: providerId, error: e?.message ?? String(e), persistence: "internal" });
       // NO parking strike here. fetchPage() never throws — it returns a
@@ -4884,8 +5126,14 @@ export async function runGardssalgContentRefresh(
     // LLM trigger above — a hit here means generateGardssalgOpeningHours
     // FromSource is never even called (see candidateHours below). Scanned
     // over combinedHtml (homepage + every fetched sub-page), same scope as
-    // the regex trigger.
-    const jsonLdHours = extractJsonLdOpeningHours(combinedHtml);
+    // the regex trigger. Spec B: like the LLM path's output, the JSON-LD
+    // value must pass classifyGardssalgFieldDefect (fail-closed) — a
+    // defective one is treated as if JSON-LD had found nothing.
+    const jsonLdHoursRaw = extractJsonLdOpeningHours(combinedHtml);
+    const jsonLdHours =
+      jsonLdHoursRaw && !classifyGardssalgFieldDefect("opening_hours_text", jsonLdHoursRaw).defective
+        ? jsonLdHoursRaw
+        : null;
 
     // Kvalitetsgate-redesign (dev-request 2026-07-20-gardssalg-kvalitetsgate-
     // redesign, slice 2/3/4): about_text/visit_text candidates are judged by
@@ -4911,9 +5159,35 @@ export async function runGardssalgContentRefresh(
     // never reaches the LLM (unchanged from before).
     // llm:false: the judge is a model call -> no extractive candidate can be
     // admitted; the row is reported as judge_required below instead.
-    const candidateAbout = (llmAllowed && (await meetsGardssalgAboutQualityBar(aboutSummary, t.navn, "about")))
-      ? aboutSummary
-      : null;
+    // dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse
+    // (about-page run only; aboutPick stays null otherwise): for a row whose
+    // about_text is blank or thin, the producer's own about page may supply
+    // the deterministic candidate instead of the homepage, through the same
+    // guards as RFB (pickAboutPageCandidate: quality bar, substantiation
+    // against the about page itself, code artifact, theme spam, clearly more
+    // substantial). The chosen text still goes through the SAME judge below;
+    // if the judge rejects it, the homepage candidate is judged as before.
+    const aboutPick =
+      aboutPageMode && gsAboutNeedsDescription
+        ? pickAboutPageCandidate({ homepageCandidate: aboutSummary, aboutPages: fetched.aboutPages ?? [], producerName: t.navn })
+        : null;
+    const aboutPageChosen = aboutPick?.chosen ?? null;
+    // The raw deterministic about candidate of this row (diagnostics below).
+    const aboutRaw = aboutPageChosen ? aboutPageChosen.text : aboutSummary;
+    let candidateAboutSource: "about_page" | "homepage" = "homepage";
+    let candidateAbout: string | null;
+    if (!aboutPageChosen) {
+      candidateAbout = (llmAllowed && (await meetsGardssalgAboutQualityBar(aboutSummary, t.navn, "about")))
+        ? aboutSummary
+        : null;
+    } else if (llmAllowed && (await meetsGardssalgAboutQualityBar(aboutPageChosen.text, t.navn, "about"))) {
+      candidateAbout = aboutPageChosen.text;
+      candidateAboutSource = "about_page";
+    } else {
+      candidateAbout = (llmAllowed && (await meetsGardssalgAboutQualityBar(aboutSummary, t.navn, "about")))
+        ? aboutSummary
+        : null;
+    }
     const candidateVisitRaw = (llmAllowed && (await meetsGardssalgAboutQualityBar(visitSummary, t.navn, "visit")))
       ? visitSummary
       : null;
@@ -4977,7 +5251,12 @@ export async function runGardssalgContentRefresh(
         : false;
 
     const provenance: GsProvenanceMap = {};
-    if (candidateAbout) provenance.about_text = { source_url: fetched.fetchUrl, snippet: candidateAbout.slice(0, 120) };
+    if (candidateAbout) {
+      provenance.about_text = {
+        source_url: candidateAboutSource === "about_page" && aboutPageChosen ? aboutPageChosen.url : fetched.fetchUrl,
+        snippet: candidateAbout.slice(0, 120),
+      };
+    }
     if (candidateVisit) provenance.visit_text = { source_url: fetched.fetchUrl, snippet: candidateVisit.slice(0, 120) };
     if (candidateHours) provenance.opening_hours_text = { source_url: fetched.fetchUrl, snippet: candidateHours };
 
@@ -5351,7 +5630,7 @@ export async function runGardssalgContentRefresh(
       : extractiveFieldDiagOutcome("visit_text", visitSummary, candidateVisit, t.visit_text);
     fieldDiagnostic.push({
       provider_id: providerId,
-      about_text: extractiveFieldDiagOutcome("about_text", aboutSummary, candidateAbout, t.about_text),
+      about_text: extractiveFieldDiagOutcome("about_text", aboutRaw, candidateAbout, t.about_text),
       visit_text: visitFieldDiagOutcome,
       opening_hours_text: hoursFieldDiagOutcome,
       products: mapProductsOutcomeToFieldDiagnostic(productsOutcomeForFieldDiag),
@@ -5363,10 +5642,35 @@ export async function runGardssalgContentRefresh(
     // rest for 14 days before the subscription-side judge ever sees it.
     const judgeRequiredThisRow =
       !llmAllowed &&
-      ((isBlank(t.about_text) && !isBlank(aboutSummary) && meetsAboutCheapBar(aboutSummary)) ||
+      ((isBlank(t.about_text) && !isBlank(aboutRaw) && meetsAboutCheapBar(aboutRaw)) ||
         (isBlank(t.visit_text) && !isBlank(visitSummary) && meetsAboutCheapBar(visitSummary)) ||
         (isBlank(t.opening_hours_text) && !isBlank(hoursTrigger) && !jsonLdHours));
     if (judgeRequiredThisRow) judgeRequiredRows++;
+    if (aboutPageMode) {
+      const reportAboutAction = wouldWriteActions.about_text ?? null;
+      const aboutTextOwnerLocked = isGardssalgFieldOwnerLocked(t, "about_text");
+      // What the LLM rewrite/fill actually read: the first
+      // GARDSSALG_REWRITE_SOURCE_CHAR_CAP chars of contentText.
+      const llmSourceText = contentText.slice(0, GARDSSALG_REWRITE_SOURCE_CHAR_CAP);
+      aboutPageCandidates.push({
+        provider_id: providerId,
+        homepage_url: fetched.fetchUrl,
+        stored_about_text: t.about_text ?? null,
+        needs_description: gsAboutNeedsDescription,
+        homepage_candidate: { text: aboutSummary, source_url: fetched.fetchUrl },
+        about_pages: aboutPick
+          ? aboutPick.evaluated
+          : (fetched.aboutPages ?? []).map((p) => ({ url: p.url, candidate: "", verdict: "not_evaluated" as const })),
+        about_page_in_content_text: (fetched.aboutPages ?? []).some((p) => aboutPageTextIncluded(p.html, llmSourceText)),
+        deterministic_choice: aboutPageChosen ? "about_page" : "homepage",
+        candidate_source: candidateAbout ? candidateAboutSource : null,
+        about_text_action: reportAboutAction as GardssalgAboutCandidateReport["about_text_action"],
+        about_text_after: reportAboutAction ? (rewriteAbout ?? candidateAbout ?? generatedAbout ?? null) : null,
+        about_text_source_url: reportAboutAction ? (provenance.about_text?.source_url ?? fetched.fetchUrl) : null,
+        owner_locked: aboutTextOwnerLocked,
+        subpages_fetched: fetched.pagesFetchedPaths ?? [],
+      });
+    }
     if (wouldWrite.length === 0) {
       // Del B (dev-request 2026-09-08-drikke-no-yield-backoff): mirrors the
       // generic content-refresh route's recordProviderContentYield(id, false)
@@ -5449,7 +5753,13 @@ export async function runGardssalgContentRefresh(
           fetched.fetchUrl,
           undefined,
           rewriteFields.length > 0 ? rewriteFields : undefined,
-          contaminatedFields.length > 0 ? contaminatedFields : undefined
+          contaminatedFields.length > 0 ? contaminatedFields : undefined,
+          undefined,
+          // About-page candidate written as-is (not the rewrite): its
+          // provenance is the about page, not the homepage.
+          !rewriteAbout && candidateAbout && candidateAboutSource === "about_page" && aboutPageChosen
+            ? { about_text: aboutPageChosen.url }
+            : undefined
         );
         if (written.length > 0) {
           const actions: Record<string, GsFieldAction> = {};
@@ -5547,11 +5857,20 @@ export async function runGardssalgContentRefresh(
     // attempted/yield contract. 0/0 whenever GARDSSALG_HEADLESS_FALLBACK_
     // ENABLED is off or no processed row was eligible; never absent.
     ...tallyGardssalgRenderStats(renderDiagnostic),
+    // dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse:
+    // ABSENT unless the about-page logic ran (flag off = unchanged response).
+    ...(aboutPageMode ? { about_page_mode: aboutPageMode, about_page_candidates: aboutPageCandidates } : {}),
   } };
 }
 
 router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Request, res: Response) => {
-  const body = (req.body ?? {}) as { providerIds?: unknown; limit?: unknown; apply?: unknown; cohort?: unknown };
+  const body = (req.body ?? {}) as {
+    providerIds?: unknown;
+    limit?: unknown;
+    apply?: unknown;
+    cohort?: unknown;
+    about_page_preview?: unknown;
+  };
   // apply: dry-run by default. apply=1/"1"/true (body) or ?apply=1.
   const apply =
     body.apply === true ||
@@ -5562,13 +5881,24 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     req.query?.apply === "true";
   // The HTTP route keeps its historical behaviour: model calls allowed
   // (each still behind its own env switch, e.g. GARDSSALG_VISIT_LLM_ENABLED).
+  // dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse, spec
+  // 6: `about_page_preview: true` runs the about-page logic for this call
+  // without ENRICHMENT_ABOUT_PAGE_ENABLED — in a DRY RUN only; with apply it
+  // is ignored (and said so in the response).
+  const aboutPagePreview = aboutPagePreviewRequested(body.about_page_preview);
   const out = await runGardssalgContentRefresh({
     apply,
     limit: body.limit,
     providerIds: body.providerIds,
     cohort: body.cohort,
     llm: true,
+    ...(aboutPagePreview && !apply ? { aboutPagePreview: true } : {}),
   });
+  // Only when the preview really changed nothing: with the env flag on the
+  // logic runs anyway (about_page_mode: "env_flag").
+  if (aboutPagePreview && apply && out.status === 200 && out.body && typeof out.body === "object" && !out.body.about_page_mode) {
+    out.body.about_page_preview_ignored = "apply";
+  }
   res.status(out.status).json(out.body);
 });
 
@@ -9946,7 +10276,7 @@ router.post("/admin/booking-test-send", requireAdmin, async (req: Request, res: 
     if (!rawProviderQuery) {
       return res.status(400).json(providerQueryMissingPayload());
     }
-    const resolution = resolveGardssalgProviderByQuery(rawProviderQuery, { includeHidden: true });
+    const resolution = resolveGardssalgProviderByQuery(rawProviderQuery, { includeHidden: true, surface: "rest" });
     if (resolution.kind === "none") {
       return res.status(404).json(providerNotFoundPayload(rawProviderQuery));
     }
@@ -10049,7 +10379,8 @@ router.post("/admin/booking-test-send", requireAdmin, async (req: Request, res: 
 // deriveOrgLinkedEmailCandidatesWithHarvest(), so an admin running the claim
 // E2E against a producer whose address came off their own website must be
 // able to name that tier here too. Still its own copy, not an import, for the
-// coupling reason stated above.
+// coupling reason stated above. "outreach_delivered" added with OA-01
+// (2026-10-31), same reason.
 const ADMIN_CLAIM_TEST_SEND_SOURCES = [
   "brreg_contact",
   "verified_domain_address",
@@ -10058,6 +10389,7 @@ const ADMIN_CLAIM_TEST_SEND_SOURCES = [
   "found_contact_page",
   "found_site_other",
   "found_umbrella_member",
+  "outreach_delivered",
 ] as const;
 function parseAdminSelectedSource(value: unknown): (typeof ADMIN_CLAIM_TEST_SEND_SOURCES)[number] | undefined {
   return typeof value === "string" && (ADMIN_CLAIM_TEST_SEND_SOURCES as readonly string[]).includes(value)
@@ -10458,6 +10790,88 @@ router.post("/admin/gardssalg-claim-revoke", requireAdmin, (req: Request, res: R
   txn();
 
   res.json({ success: true, dry_run: false, provider_id: providerId, revoked, claimed_at_reset: claimedAtReset });
+});
+
+// ─── GET /api/opplevelser/admin/gardssalg-content-audit (admin, read-only) ──
+//
+// Lists gardssalg_content_audit rows for ONE producer, optionally after a
+// point in time, so an operator can see "which fields were changed by which
+// source after time T" before deciding on a manual rollback. No writes.
+//
+// Query: provider_id (required, ≤200 chars), since (optional ISO 8601 date or
+// datetime; a value without a zone designator is read as UTC), field
+// (optional exact field_name), limit (optional, default 200, clamped 1–1000).
+//
+// changed_at is stored both as SQLite `YYYY-MM-DD HH:MM:SS` (column default)
+// and as ISO `...T...Z` by some writers, so filtering and ordering go through
+// SQLite datetime() (second precision) instead of comparing raw strings.
+function normalizeAuditSince(raw: string): { iso: string; sql: string } | null {
+  let s = raw.trim();
+  if (!s) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    s = `${s}T00:00:00Z`;
+  } else {
+    s = s.replace(/^(\d{4}-\d{2}-\d{2}) (\d)/, "$1T$2");
+    if (/T\d/.test(s) && !/(Z|[+-]\d{2}:?\d{2})$/i.test(s)) s = `${s}Z`;
+  }
+  const ms = Date.parse(s);
+  if (Number.isNaN(ms)) return null;
+  const iso = new Date(ms).toISOString();
+  return { iso, sql: iso.slice(0, 19).replace("T", " ") };
+}
+
+router.get("/admin/gardssalg-content-audit", requireAdmin, (req: Request, res: Response) => {
+  const rawProvider = req.query.provider_id;
+  const providerId = typeof rawProvider === "string" ? rawProvider.trim() : "";
+  if (!providerId || providerId.length > 200) {
+    return res.status(400).json({ error: "provider_id_required" });
+  }
+
+  let since: { iso: string; sql: string } | null = null;
+  const rawSince = req.query.since;
+  if (rawSince !== undefined && rawSince !== "") {
+    since = typeof rawSince === "string" ? normalizeAuditSince(rawSince) : null;
+    if (!since) return res.status(400).json({ error: "invalid_since" });
+  }
+
+  const rawField = req.query.field;
+  const field = typeof rawField === "string" && rawField.trim() ? rawField.trim() : null;
+
+  const parsedLimit = typeof req.query.limit === "string" ? Number.parseInt(req.query.limit, 10) : NaN;
+  const limit = Number.isFinite(parsedLimit) ? Math.min(1000, Math.max(1, parsedLimit)) : 200;
+
+  try {
+    const expDb = getExpDb("experiences");
+    const where: string[] = ["provider_id = @provider_id"];
+    const params: Record<string, string | number> = { provider_id: providerId, fetch_limit: limit + 1 };
+    if (since) { where.push("datetime(changed_at) >= datetime(@since)"); params.since = since.sql; }
+    if (field) { where.push("field_name = @field"); params.field = field; }
+    const fetched = expDb.prepare(
+      `SELECT id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at, notes
+         FROM gardssalg_content_audit
+        WHERE ${where.join(" AND ")}
+        ORDER BY datetime(changed_at) ASC, changed_at ASC, rowid ASC
+        LIMIT @fetch_limit`,
+    ).all(params) as Array<{
+      id: string; field_name: string; old_value: string | null; new_value: string | null;
+      source_url: string | null; batch_id: string | null; changed_by: string; changed_at: string; notes: string | null;
+    }>;
+    const truncated = fetched.length > limit;
+    const rows = truncated ? fetched.slice(0, limit) : fetched;
+    const byChangedBy: Record<string, number> = {};
+    for (const r of rows) byChangedBy[r.changed_by] = (byChangedBy[r.changed_by] ?? 0) + 1;
+    return res.json({
+      provider_id: providerId,
+      since: since ? since.iso : null,
+      count: rows.length,
+      truncated,
+      by_changed_by: byChangedBy,
+      rows,
+    });
+  } catch (err) {
+    console.error("[opplevelser] admin/gardssalg-content-audit failed", err);
+    return res.status(500).json({ error: "internal_error" });
+  }
 });
 
 // ─── POST /api/opplevelser/admin/gardssalg-owner-email-confirm (admin) ─────
@@ -12201,7 +12615,7 @@ router.post("/admin/gardssalg-set-content-field", requireAdmin, (req: Request, r
 // requirement.
 //
 // Body: { provider_id: string, terminal_status: "krever_eier" | "dod_kilde"
-// | null, reason: string, source_url?: string }.
+// | "eier_fjernet" (producer asked for removal; dev-request 2026-10-01) | null, reason: string, source_url?: string }.
 //
 // `terminal_status: null` CLEARS the column — this IS the rollback path for
 // this endpoint (dev-request's own Rollback section); no separate rollback
@@ -12232,11 +12646,11 @@ router.post("/admin/gardssalg-set-terminal-status", requireAdmin, (req: Request,
   }
 
   const rawTerminalStatus = body.terminal_status;
-  if (rawTerminalStatus !== null && rawTerminalStatus !== "krever_eier" && rawTerminalStatus !== "dod_kilde") {
+  if (rawTerminalStatus !== null && rawTerminalStatus !== "krever_eier" && rawTerminalStatus !== "dod_kilde" && rawTerminalStatus !== "eier_fjernet") {
     res.status(400).json({ error: "invalid_terminal_status" });
     return;
   }
-  const terminalStatus = rawTerminalStatus as "krever_eier" | "dod_kilde" | null;
+  const terminalStatus = rawTerminalStatus as GardssalgTerminalStatus | null;
 
   const reason = typeof body.reason === "string" ? body.reason.trim() : "";
   if (!reason) {
@@ -15810,6 +16224,7 @@ router.post("/admin/gardssalg-mojibake-backfill", requireAdmin, async (req: Requ
 // NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
 
 import { getDb as getRfbDb } from "../database/init";
+import { storedClientClass } from "../services/traffic-classifier";
 import { getDb as getExpDb } from "../database/db-factory";
 import { buildCrossPlatformIdentity, type CrossPlatformMatch } from "../services/cross-platform-match";
 import { getRfbSendIndexForOpplevagent } from "../services/outreach-suppression-signals";
@@ -16538,6 +16953,70 @@ router.post("/admin/gardssalg-nace-agent-bridge", requireAdmin, (req: Request, r
 // catalog_hidden=1 row to stay publicly slug-reachable (e.g. a
 // admin-authenticated preview path, or a distinct non-catalog_hidden test
 // marker the public routes explicitly special-case).
+//
+// ── O2a (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, «v2 for
+// Opplevagent», slice O2a): the fixture state and `owner_email` ─────────────
+// Fixture state: every call now also writes catalog_hidden_reason =
+// 'test_fixture' next to catalog_hidden=1. Before, the reason stayed NULL,
+// which getOwnedVisibilityState() reads as `removed` (owner «fjernet» card,
+// no pause in «Mine valg»). With the reason the row is still hidden on every
+// public surface, reads as «not removed, not paused» to its owner, stays
+// reachable on the claim/portal lookup (gardssalg-visibility.ts, `claim`),
+// and shows in an admin's «Vis som offentlig» view. Re-running the endpoint
+// resets an owner pause on the test row to that fixture state.
+//
+// `owner_email` (optional; mirrors POST /admin/test-producer's S2d-1
+// `owner_email` for RFB): sets the test row's OWNER LOGIN so Daniel can ask
+// for a magic link through the normal owner flow and reach «Mine valg»
+// (/kategori/gardssalg/eier/<slug>/valg) as a verified owner:
+//   * DRY-RUN by default when `owner_email` is given — `apply` must be an
+//     explicit truthy form (same parse as POST /admin/gardssalg-claim-grant);
+//     the dry-run returns the planned per-field changes and writes nothing,
+//     not even the base upsert. Without `owner_email` the endpoint behaves
+//     exactly as before (it writes; no dry-run).
+//   * apply → after the base upsert, ONE more UPDATE pinned in its own WHERE
+//     to `org_nr = TEST000000 AND is_test_provider = 1` sets what the
+//     self-serve claim tier (c) stored_epost_verified needs (the same fields
+//     `claimable` sets): epost = owner_email, brreg_verified = 1,
+//     content_source = 'manual'. The magic link is then requested at
+//     GET /kategori/gardssalg/eier/<slug> (POST .../<id>/request) and sent
+//     to owner_email only; clicking it is the verified claim
+//     (verifyClaimToken: gardssalg_claims.used = 1, claimed_at only if NULL).
+//     This endpoint sends NO e-mail and never touches gardssalg_claims or
+//     claimed_at — an existing claim and its timestamp stay as they are.
+//     content_source='manual' locks the portal's text fields (as with
+//     `claimable`); the «Mine valg» switches (booking_live, the owner pause)
+//     are not locked by it.
+//   * one gardssalg_content_audit row per changed owner-login field
+//     (changed_by 'admin', batch 'admin-test-provider-owner-login').
+//   * the response carries `owner_login` { email, verified_owner (a live
+//     verified claim, isGardssalgProviderClaimed), claim_ready (owner_email
+//     is a self-serve candidate), allowlisted (`gardssalg:<id>` in
+//     OWNER_FEATURES_ALLOWED_SUBJECTS), valg_path, claim_url,
+//     magic_link_request }. The tab also needs OA_OWNER_FEATURES_ENABLED
+//     and the allowlist entry (env changes, not done here).
+//   * mutually exclusive with `claimable`, `claimableEditable` and
+//     `claimEmail` (they write the same columns) → 400, nothing written.
+//
+// ── O2c: optional location (`kommune`, `lat` + `lon`) ───────────────────────
+// The «Mine valg» switch probe reaches the test row on the A2A gårdssalg
+// search only by place (that skill returns at most 20 hits and takes no free
+// text), so a row without coordinates or kommune reads as not observable on
+// `a2a`. These optional fields set the row's existing `kommune`, `lat` and
+// `lon` columns:
+//   * `lat` and `lon` together or not at all, finite JSON numbers, lat in
+//     [-90, 90], lon in [-180, 180]; `kommune` a non-empty trimmed string of
+//     at most 100 characters. Anything else → 400, nothing written.
+//   * Omitted → the stored location is left as it is (never cleared).
+//   * The write is one UPDATE pinned in its own WHERE to the test row
+//     (`org_nr = TEST000000 AND is_test_provider = 1`), with one
+//     gardssalg_content_audit row per changed field (changed_by 'admin',
+//     batch 'admin-test-provider-location').
+//   * With `owner_email` and no apply, the location changes are part of the
+//     dry-run plan and nothing is written.
+//   * The response always carries the stored `location` { kommune, lat, lon }.
+// The row stays catalog_hidden=1 / test_fixture: a location does not make it
+// public; only an admin's as-public request («Vis som offentlig») sees it.
 const TEST_PROVIDER_ORG_NR = "TEST000000";
 const TEST_PROVIDER_DEFAULT_NAME = "TEST — Ikke book (booking-flyt-v1 slice 0)";
 const TEST_PROVIDER_DEFAULT_SLUG = "test-ikke-book-slice0";
@@ -16634,6 +17113,61 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
     claimEmail = candidate;
   }
 
+  // O2a `owner_email` (see the doc comment above TEST_PROVIDER_ORG_NR).
+  let ownerEmail: string | null = null;
+  if (req.body?.owner_email !== undefined) {
+    if (claimVariant || (typeof req.body?.claimEmail === "string" && req.body.claimEmail.trim())) {
+      res.status(400).json({
+        error: "'owner_email' kan ikke kombineres med 'claimable', 'claimableEditable' eller 'claimEmail' — velg én",
+      });
+      return;
+    }
+    const candidate = typeof req.body.owner_email === "string" ? req.body.owner_email.trim().toLowerCase() : "";
+    if (!candidate || candidate.length > 254 || !EMAIL_SHAPE_RE.test(candidate) || /[\x00-\x1f\x7f]/.test(candidate)) {
+      res.status(400).json({ error: "'owner_email' må være en gyldig e-postadresse (eier-innloggingen for «Mine valg»)" });
+      return;
+    }
+    ownerEmail = candidate;
+  }
+  const ownerApply =
+    req.body?.apply === true ||
+    req.body?.apply === 1 ||
+    req.body?.apply === "1" ||
+    req.body?.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+
+  // O2c location (see the doc comment above TEST_PROVIDER_ORG_NR).
+  const location: { kommune?: string; lat?: number; lon?: number } = {};
+  {
+    const b = req.body ?? {};
+    const hasLat = b.lat !== undefined;
+    const hasLon = b.lon !== undefined;
+    if (hasLat !== hasLon) {
+      res.status(400).json({ error: "'lat' og 'lon' må oppgis sammen (eller ingen av dem). Ingenting er skrevet." });
+      return;
+    }
+    if (hasLat) {
+      const okLat = typeof b.lat === "number" && Number.isFinite(b.lat) && b.lat >= -90 && b.lat <= 90;
+      const okLon = typeof b.lon === "number" && Number.isFinite(b.lon) && b.lon >= -180 && b.lon <= 180;
+      if (!okLat || !okLon) {
+        res.status(400).json({ error: "'lat' må være et tall i [-90, 90] og 'lon' et tall i [-180, 180]. Ingenting er skrevet." });
+        return;
+      }
+      location.lat = b.lat;
+      location.lon = b.lon;
+    }
+    if (b.kommune !== undefined) {
+      const k = typeof b.kommune === "string" ? b.kommune.trim() : "";
+      if (!k || k.length > 100 || /[\x00-\x1f\x7f]/.test(k)) {
+        res.status(400).json({ error: "'kommune' må være en ikke-tom tekst på høyst 100 tegn. Ingenting er skrevet." });
+        return;
+      }
+      location.kommune = k;
+    }
+  }
+  const hasLocation = Object.keys(location).length > 0;
+
   const expDb = getExpDb("experiences");
 
   try {
@@ -16676,6 +17210,39 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
       return;
     }
 
+    // O2a: with `owner_email` and no explicit apply → the plan only, no write.
+    if (ownerEmail !== null && !ownerApply) {
+      const current = existing
+        ? (expDb
+            .prepare(
+              `SELECT navn, slug, epost, producer_type, catalog_hidden, catalog_hidden_reason, is_test_provider, booking_live,
+                      brreg_verified, content_source, claimed_at, kommune, lat, lon
+                 FROM experience_providers WHERE id = ?`,
+            )
+            .get(existing.id) as Record<string, unknown>)
+        : null;
+      const target: Record<string, unknown> = {
+        navn: name, slug, producer_type: "test-gardssalg", catalog_hidden: 1,
+        catalog_hidden_reason: CATALOG_HIDDEN_REASON_TEST_FIXTURE, is_test_provider: 1, booking_live: 1,
+        epost: ownerEmail, brreg_verified: 1, content_source: "manual",
+        ...location,
+      };
+      const changes = Object.entries(target)
+        .filter(([k, v]) => String(current?.[k] ?? null) !== String(v))
+        .map(([k, v]) => ({ field: k, old: current?.[k] ?? null, new: v }));
+      res.json({
+        success: true,
+        dry_run: true,
+        target: existing ? "existing" : "create",
+        provider_id: existing?.id ?? null,
+        slug,
+        changes,
+        // Never written by this endpoint (only a clicked magic link sets it).
+        claimed_at: current?.claimed_at ?? null,
+      });
+      return;
+    }
+
     // createProvider() covers the ProviderSchema-known fields (navn/org_nr/epost/
     // verification_status); the raw UPDATE below sets the columns the schema
     // doesn't (producer_type/booking_live/catalog_hidden/is_test_provider/rfb_seed_source) plus
@@ -16690,16 +17257,101 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
           verification_status: "verified",
         });
 
+    // O2a: the owner-login fields as they were before this call (for the audit).
+    const before = ownerEmail !== null
+      ? (expDb
+          .prepare(`SELECT epost, brreg_verified, content_source FROM experience_providers WHERE id = ?`)
+          .get(providerId) as { epost: string | null; brreg_verified: number | null; content_source: string | null } | undefined)
+      : undefined;
+
     expDb
       .prepare(
         `UPDATE experience_providers
             SET navn = @navn, epost = @email, slug = @slug,
                 producer_type = 'test-gardssalg', rfb_seed_source = NULL,
-                catalog_hidden = 1, is_test_provider = 1, booking_live = 1, commission_rate = 0,
+                catalog_hidden = 1, catalog_hidden_reason = @fixtureReason, is_test_provider = 1, booking_live = 1, commission_rate = 0,
                 verification_status = 'verified', updated_at = datetime('now')
           WHERE id = @id`
       )
-      .run({ id: providerId, navn: name, email, slug });
+      .run({ id: providerId, navn: name, email, slug, fixtureReason: CATALOG_HIDDEN_REASON_TEST_FIXTURE });
+
+    // ── O2c location (kommune / lat + lon) ──
+    if (hasLocation) {
+      const locTx = expDb.transaction(() => {
+        const prev = expDb
+          .prepare(`SELECT kommune, lat, lon FROM experience_providers WHERE id = ? AND org_nr = ? AND is_test_provider = 1`)
+          .get(providerId, TEST_PROVIDER_ORG_NR) as Record<string, unknown> | undefined;
+        if (!prev) return false;
+        const sets = Object.keys(location).map((k) => `${k} = @${k}`);
+        // Pinned to the test row in its own WHERE: org_nr AND is_test_provider.
+        const r = expDb
+          .prepare(
+            `UPDATE experience_providers SET ${sets.join(", ")}, updated_at = datetime('now')
+              WHERE id = @id AND org_nr = @testOrgNr AND is_test_provider = 1`,
+          )
+          .run({ ...location, id: providerId, testOrgNr: TEST_PROVIDER_ORG_NR });
+        if (r.changes !== 1) return false;
+        const audit = expDb.prepare(
+          `INSERT INTO gardssalg_content_audit (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at, notes)
+           VALUES (?, ?, ?, ?, ?, NULL, 'admin-test-provider-location', 'admin', datetime('now'), 'POST /admin/gardssalg/test-provider location')`,
+        );
+        for (const [field, next] of Object.entries(location)) {
+          const old = prev[field];
+          if (String(old ?? "") !== String(next)) audit.run(crypto.randomUUID(), providerId, field, old == null ? null : String(old), String(next));
+        }
+        return true;
+      });
+      if (!locTx()) {
+        res.status(409).json({
+          error: `Nekter stedsskriv: raden er ikke testprodusenten (org_nr != ${TEST_PROVIDER_ORG_NR} eller is_test_provider != 1).`,
+          provider_id: providerId,
+        });
+        return;
+      }
+    }
+
+    // ── O2a owner login (owner_email + apply) ──
+    let ownerLogin: Record<string, unknown> | null = null;
+    if (ownerEmail !== null) {
+      const ownerTx = expDb.transaction(() => {
+        // Pinned to the test row in its own WHERE: org_nr AND is_test_provider.
+        const r = expDb
+          .prepare(
+            `UPDATE experience_providers
+                SET epost = @ownerEmail, brreg_verified = 1, content_source = 'manual', updated_at = datetime('now')
+              WHERE id = @id AND org_nr = @testOrgNr AND is_test_provider = 1`
+          )
+          .run({ id: providerId, ownerEmail, testOrgNr: TEST_PROVIDER_ORG_NR });
+        if (r.changes !== 1) return false;
+        const audit = expDb.prepare(
+          `INSERT INTO gardssalg_content_audit (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at, notes)
+           VALUES (?, ?, ?, ?, ?, NULL, 'admin-test-provider-owner-login', 'admin', datetime('now'), 'POST /admin/gardssalg/test-provider owner_email')`,
+        );
+        const after: Record<string, string> = { epost: ownerEmail as string, brreg_verified: "1", content_source: "manual" };
+        for (const [field, next] of Object.entries(after)) {
+          const prev = before ? (before as Record<string, unknown>)[field] : null;
+          if (String(prev ?? "") !== next) audit.run(crypto.randomUUID(), providerId, field, prev == null ? null : String(prev), next);
+        }
+        return true;
+      });
+      if (!ownerTx()) {
+        res.status(409).json({
+          error: `Nekter owner_email-skriv: raden er ikke testprodusenten (org_nr != ${TEST_PROVIDER_ORG_NR} eller is_test_provider != 1).`,
+          provider_id: providerId,
+        });
+        return;
+      }
+      const row = getClaimProviderById(providerId);
+      ownerLogin = {
+        email: ownerEmail,
+        verified_owner: isGardssalgProviderClaimed(providerId),
+        claim_ready: !!row && deriveOrgLinkedEmailCandidates(row).some((c) => c.email === ownerEmail),
+        allowlisted: isSubjectAllowedForOwnerFeatures("gardssalg", providerId),
+        valg_path: `/kategori/gardssalg/eier/${encodeURIComponent(slug)}/valg`,
+        claim_url: `${APP_URL}/kategori/gardssalg/eier/${encodeURIComponent(slug)}`,
+        magic_link_request: `POST /kategori/gardssalg/eier/${providerId}/request`,
+      };
+    }
 
     // ── claimable / claimableEditable opt-in (see this route's doc comment) ──
     // Sets exactly the two fields tier (c) stored_epost_verified needs:
@@ -16749,12 +17401,16 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
     // claimableEditable overwrote it, the general `email` otherwise (see
     // this route's doc comment's "JUDGMENT CALL" note on why these can
     // differ).
-    const currentEpost = claimReady ? claimEmail : email;
+    const currentEpost = claimReady ? claimEmail : ownerEmail !== null ? ownerEmail : email;
 
     console.log(
       `[test-provider] upserted hidden test provider id=${providerId} slug=${slug} epost=${currentEpost} ` +
         `(catalog_hidden=1, is_test_provider=1, booking_live=1, claimable=${claimable}, claimableEditable=${claimableEditable})`
     );
+
+    const storedLocation = expDb
+      .prepare(`SELECT kommune, lat, lon FROM experience_providers WHERE id = ?`)
+      .get(providerId) as { kommune: string | null; lat: number | null; lon: number | null } | undefined;
 
     res.json({
       success: true,
@@ -16762,8 +17418,15 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
       slug,
       booking_url: `${APP_URL}/kategori/gardssalg/book/${slug}`,
       epost: currentEpost,
+      location: {
+        kommune: storedLocation?.kommune ?? null,
+        lat: storedLocation?.lat ?? null,
+        lon: storedLocation?.lon ?? null,
+      },
+      catalog_hidden_reason: CATALOG_HIDDEN_REASON_TEST_FIXTURE,
       claimable,
       claimableEditable,
+      ...(ownerLogin ? { dry_run: false, owner_login: ownerLogin } : {}),
       ...(claimReady
         ? {
             claim_url: `${APP_URL}/kategori/gardssalg/eier/${slug}`,
@@ -16818,7 +17481,8 @@ router.post("/admin/rfb-knowledge-enrich", requireAdmin, (req: Request, res: Res
               a.org_nr AS org_nr, a.city AS city,
               k.about AS about, k.address AS address, k.phone AS phone,
               k.email AS email, k.products AS products,
-              k.verification_review_reason AS verification_review_reason
+              k.verification_review_reason AS verification_review_reason,
+              k.field_provenance AS field_provenance
          FROM agents a
          LEFT JOIN agent_knowledge k ON k.agent_id = a.id
         WHERE a.is_active = 1`
@@ -17293,7 +17957,7 @@ export async function computeGardssalgSecondLineVerification(input: {
   email: string | null;
   field_provenance: Record<string, unknown>;
   brreg_verified: boolean;
-  terminal_status: "krever_eier" | "dod_kilde" | null;
+  terminal_status: GardssalgTerminalStatus | null;
   org_nr?: string | null;
   evidence?: readonly { source_url: string; content_excerpt: string }[];
   brregLookupFn?: (orgNr: string) => Promise<{ exists: boolean; active: boolean; name: string | null }>;
@@ -17311,7 +17975,8 @@ export async function computeGardssalgSecondLineVerification(input: {
   const brreg_ok =
     input.brreg_verified === true &&
     input.terminal_status !== "krever_eier" &&
-    input.terminal_status !== "dod_kilde";
+    input.terminal_status !== "dod_kilde" &&
+    input.terminal_status !== "eier_fjernet";
 
   const email = (input.email ?? "").trim() || null;
   const email_present = !!email;
@@ -17431,7 +18096,37 @@ export type GardssalgReadinessTier =
   | "dublettkonflikt"
   | "navnekollisjon"
   | "krever_eier"
-  | "dod_kilde";
+  | "dod_kilde"
+  // dev-request 2026-10-01-opplevagent-eier-fjernet-som-terminal: the
+  // producer asked to be removed. Highest precedence together with
+  // krever_eier/dod_kilde; derived from an explicit terminal_status or a
+  // "fjern oss" blocklist match (see computeGardssalgReadinessRows).
+  | "eier_fjernet";
+
+// dev-request 2026-10-01-opplevagent-eier-fjernet-som-terminal: effective
+// terminal status of a provider row. (c) explicit column value, else (a) the
+// row is hidden with catalog_hidden_reason='remove_request' (written by
+// POST /admin/gardssalg-provider-visibility mode remove_request), else (b) a
+// "fjern oss" blocklist match on org_nr / hjemmeside / epost -> eier_fjernet.
+// (a) covers remove_request rows the blocklist cannot match (no org.nr /
+// website / e-post, or the best-effort blocklist write failed). Rows with
+// reason NULL or 'quality' fall through to (b) unchanged.
+export function deriveGardssalgTerminalStatus(
+  stored: string | null | undefined,
+  ids: {
+    org_nr?: string | null;
+    hjemmeside?: string | null;
+    epost?: string | null;
+    catalog_hidden?: number | null;
+    catalog_hidden_reason?: string | null;
+  },
+  ownerRemovedMatcher: (ids: { orgNr?: string | null; website?: string | null; email?: string | null }) => boolean,
+): GardssalgTerminalStatus | null {
+  if (stored === "krever_eier" || stored === "dod_kilde" || stored === "eier_fjernet") return stored;
+  if (ids.catalog_hidden === 1 && ids.catalog_hidden_reason === "remove_request") return "eier_fjernet";
+  if (ownerRemovedMatcher({ orgNr: ids.org_nr, website: ids.hjemmeside, email: ids.epost })) return "eier_fjernet";
+  return null;
+}
 
 export function computeGardssalgReadinessTier(input: {
   has_website: boolean;
@@ -17451,7 +18146,7 @@ export function computeGardssalgReadinessTier(input: {
   // must never be recounted as unreachable/no_website/etc. NULL/undefined
   // means "no terminal status", falls through to the existing checks
   // unchanged.
-  terminal_status?: "krever_eier" | "dod_kilde" | null;
+  terminal_status?: GardssalgTerminalStatus | null;
   // dev-request 2026-08-28-gardssalg-kildebredde-wiring, Grep 2: the
   // GS_SECOND_LINE_VERIFICATION_ENABLED-gated 2.linje stamp (field_provenance.
   // second_line_verification, isGardssalgSecondLineVerified below). Optional
@@ -17613,7 +18308,7 @@ export function computeGardssalgReadinessRows(
   // surfaced so a caller can see WHY a row landed in krever_eier/dod_kilde
   // without a separate lookup — same additive-surfacing precedent as
   // hjemmeside/epost below.
-  terminal_status: "krever_eier" | "dod_kilde" | null;
+  terminal_status: GardssalgTerminalStatus | null;
   /** The stored homepage URL. See the construction site below for why. */
   hjemmeside: string | null;
   /** The stored outreach address. See the construction site below for why. */
@@ -17657,6 +18352,7 @@ export function computeGardssalgReadinessRows(
     content_source: string | null;
     booking_live: number | null;
     catalog_hidden: number | null;
+    catalog_hidden_reason: string | null;
     is_test_provider: number | null;
     slug: string | null;
     field_provenance: string | null;
@@ -17673,7 +18369,7 @@ export function computeGardssalgReadinessRows(
   // every row must appear exactly once here.
   let sql = `SELECT id, navn, org_nr, kommune, hjemmeside, epost, telefon,
                 about_text, visit_text, opening_hours_text, products,
-                content_source, booking_live, catalog_hidden, is_test_provider, slug,
+                content_source, booking_live, catalog_hidden, catalog_hidden_reason, is_test_provider, slug,
                 field_provenance, brreg_verified, antall_ansatte, terminal_status,
                 geocode_confidence, name_collision
            FROM experience_providers
@@ -17752,6 +18448,8 @@ export function computeGardssalgReadinessRows(
   // blocking override (computeGardssalgOutreachPreflight, below) reads
   // `enabled`.
   const sizeGateThreshold = getGardssalgSizeGateConfig(expDb).threshold;
+  // One blocklist query per call (not per row) — see loadOwnerRemovedMatcher.
+  const ownerRemovedMatcher = loadOwnerRemovedMatcher();
 
   return rows.map((p) => {
     const has_website = present(p.hjemmeside);
@@ -17790,8 +18488,11 @@ export function computeGardssalgReadinessRows(
       p.antall_ansatte === null && isGardssalgAntallAnsatteBrregConsulted(p.field_provenance);
     const size_flag = computeGardssalgSizeFlag(p.antall_ansatte, sizeGateThreshold, antallAnsatteBrregConsulted);
     const size_flag_reason: GardssalgSizeFlagReason = antallAnsatteBrregConsulted ? "no_registered_figure" : null;
-    const terminal_status =
-      p.terminal_status === "krever_eier" || p.terminal_status === "dod_kilde" ? p.terminal_status : null;
+    // dev-request 2026-10-01-opplevagent-eier-fjernet-som-terminal: an explicit
+    // terminal_status wins; otherwise a row hidden with
+    // catalog_hidden_reason='remove_request', or whose org.nr / domain / e-post
+    // sits on the blocklist with a "fjern oss" reason, is derived as eier_fjernet.
+    const terminal_status = deriveGardssalgTerminalStatus(p.terminal_status, p, ownerRemovedMatcher);
     // dev-request 2026-09-09-navnekollisjon-feil-enhet-ved-harvest-og-bridge,
     // AC3: see computeGardssalgReadinessTier's own `name_collision` doc
     // comment for what this stamp means and why it excludes a row here.
@@ -17904,6 +18605,9 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
     // than omitting the key.
     krever_eier: 0,
     dod_kilde: 0,
+    // dev-request 2026-10-01-opplevagent-eier-fjernet-som-terminal: producer
+    // asked for removal — own bucket, same discipline as the two above.
+    eier_fjernet: 0,
     // dev-request 2026-08-07-dublett-evidensbasis-og-pool-avblokkering,
     // slice 1: NOT a tier — the count of rows carrying the informational
     // name_token/host_name candidate flag (rows may sit in any tier).
@@ -18102,13 +18806,14 @@ router.post("/admin/gardssalg-second-line-verify", requireAdmin, async (req: Req
     return row !== undefined;
   };
 
+  const ownerRemovedMatcher = loadOwnerRemovedMatcher();
   const results: GardssalgSecondLineVerifyResultItem[] = [];
 
   for (const id of ids) {
     const row = expDb
       .prepare(
         `SELECT id, navn, kommune, epost, hjemmeside, about_text, products, field_provenance,
-                brreg_verified, terminal_status, org_nr
+                brreg_verified, terminal_status, org_nr, catalog_hidden, catalog_hidden_reason
            FROM experience_providers WHERE id = ?`,
       )
       .get(id) as
@@ -18124,6 +18829,8 @@ router.post("/admin/gardssalg-second-line-verify", requireAdmin, async (req: Req
           brreg_verified: number | null;
           terminal_status: string | null;
           org_nr: string | null;
+          catalog_hidden: number | null;
+          catalog_hidden_reason: string | null;
         }
       | undefined;
 
@@ -18137,8 +18844,7 @@ router.post("/admin/gardssalg-second-line-verify", requireAdmin, async (req: Req
       continue;
     }
 
-    const terminal_status =
-      row.terminal_status === "krever_eier" || row.terminal_status === "dod_kilde" ? row.terminal_status : null;
+    const terminal_status = deriveGardssalgTerminalStatus(row.terminal_status, row, ownerRemovedMatcher);
     if (terminal_status) {
       results.push({ provider_id: id, outcome: "disqualified_terminal", detail: terminal_status });
       continue;
@@ -19707,6 +20413,13 @@ export type GardssalgOutreachSendResultRow = {
   // false when the mail went out but the CRM write failed. Absent on test
   // sends, which are deliberately not filed.
   crm_recorded?: boolean;
+  // dev-request 2026-10-22-opplevagent-utsending-v4 (AC7): on a `sent` row, the
+  // template that went out and, for the v4 first mail, the subject arm. The
+  // run-ledger claim and the CRM message carry the same values.
+  template?: GardssalgOutreachTemplate;
+  subject_arm?: GardssalgOutreachSubjectArm;
+  // v4 follow-up only: true = sent as a reply in the first mail's thread.
+  threaded?: boolean;
   // Incident 2026-09-27/28 (prod volume full: every sent_log INSERT threw
   // AFTER the mail had already gone out, so no cooldown/budget row existed
   // and the next day's run mailed the same six producers again). The send
@@ -19803,6 +20516,59 @@ export type GardssalgOutreachEligibleRow = Extract<GardssalgOutreachEligibility,
  * Looping callers stop on db_write_failed / reservation_kept — see
  * gardssalgOutreachBatchStopReason.
  */
+/** CRM thread id for one producer's outreach conversation (first + follow-up). */
+function gardssalgOutreachThreadId(providerId: string): string {
+  return `opplevagent-outreach-${providerId}`;
+}
+
+/** The first outbound message in the producer's outreach thread, or null. */
+export function findGardssalgOutreachFirstMessage(
+  rfbDb: ReturnType<typeof getRfbDb>,
+  providerId: string,
+): { message_id: string; subject: string | null; sent_at: string | null } | null {
+  const row = rfbDb
+    .prepare(
+      `SELECT id, subject, sent_at FROM crm_messages
+        WHERE thread_id = ? AND direction = 'out'
+        ORDER BY sent_at ASC, rowid ASC LIMIT 1`,
+    )
+    .get(gardssalgOutreachThreadId(providerId)) as { id: string; subject: string | null; sent_at: string | null } | undefined;
+  return row ? { message_id: row.id, subject: row.subject, sent_at: row.sent_at } : null;
+}
+
+/**
+ * A stored message id usable in In-Reply-To/References: `<id@host>`. A bare
+ * `id@host` is wrapped; anything else (DRY_RUN, the synthetic `outreach-…`
+ * fallback id) is not a real Message-ID and returns null.
+ */
+export function normaliseGardssalgMessageIdHeader(raw: string | null | undefined): string | null {
+  const v = (raw ?? "").trim();
+  if (/^<[^<>\s@]+@[^<>\s@]+>$/.test(v)) return v;
+  if (/^[^<>\s@]+@[^<>\s@]+$/.test(v)) return `<${v}>`;
+  return null;
+}
+
+/**
+ * Subject arm for the NEXT v4 first mail: A and B alternate, starting at A,
+ * counted over the v4 first mails already filed in the CRM (the closing quote
+ * keeps `personal-v4-followup` out of the count).
+ */
+export function nextGardssalgOutreachSubjectArm(rfbDb: ReturnType<typeof getRfbDb>): GardssalgOutreachSubjectArm {
+  const row = rfbDb
+    .prepare(
+      `SELECT COUNT(*) AS n FROM crm_messages
+        WHERE direction = 'out' AND raw_metadata LIKE '%"template":"personal-v4"%'`,
+    )
+    .get() as { n: number };
+  return row.n % 2 === 0 ? "A" : "B";
+}
+
+function parseSentLogTimestamp(raw: string): Date {
+  // sent_log default is `YYYY-MM-DD HH:MM:SS` (UTC, no zone); ISO strings pass through.
+  const t = raw.includes("T") ? raw : raw.replace(" ", "T") + "Z";
+  return new Date(t);
+}
+
 export async function sendGardssalgOutreachToEligibleProvider(
   expDb: ReturnType<typeof getExpDb>,
   elig: GardssalgOutreachEligibleRow,
@@ -19849,6 +20615,46 @@ export async function sendGardssalgOutreachToEligibleProvider(
   if (sendTimeBounce) {
     console.warn(`[${opts.source}] recipient hard-bounced/complained since eligibility — NOT sending`, { providerId, email });
     return { provider_id: providerId, status: "skipped", reason: "hard_bounced" };
+  }
+
+  // dev-request 2026-10-22-opplevagent-utsending-v4: render context for the v4
+  // texts, built BEFORE the reservation (the follow-up's {måned} and thread
+  // come from the FIRST send, which the reservation below would otherwise
+  // muddy). Read-only; nothing is written here.
+  let renderCtx: GardssalgOutreachRenderCtx | undefined;
+  let inReplyToMessageId: string | undefined;
+  let subjectArm: GardssalgOutreachSubjectArm | undefined;
+  if (template === "personal-v4") {
+    subjectArm = nextGardssalgOutreachSubjectArm(getRfbDb());
+    renderCtx = {
+      arm: subjectArm,
+      eierUrl: `https://opplevagent.no/kategori/gardssalg/eier/${elig.slug ?? ""}`,
+    };
+  } else if (template === "personal-v4-followup") {
+    let first: ReturnType<typeof findGardssalgOutreachFirstMessage> = null;
+    let firstSentAt: Date | null = null;
+    try {
+      first = findGardssalgOutreachFirstMessage(getRfbDb(), providerId);
+      const sentLogRow = expDb
+        .prepare(`SELECT MIN(sent_at) AS first_at FROM experience_outreach_sent_log WHERE provider_id = ? AND is_test = 0`)
+        .get(providerId) as { first_at: string | null } | undefined;
+      const raw = first?.sent_at ?? sentLogRow?.first_at ?? null;
+      firstSentAt = raw ? parseSentLogTimestamp(raw) : null;
+    } catch (lookupErr) {
+      console.error(`[${opts.source}] first-send lookup failed — NOT sending`, { providerId, error: errMsg(lookupErr) });
+      return { provider_id: providerId, status: "skipped", reason: `first_send_lookup_failed: ${errMsg(lookupErr)}` };
+    }
+    if (!firstSentAt || Number.isNaN(firstSentAt.getTime())) {
+      return { provider_id: providerId, status: "skipped", reason: "followup_without_prior_send" };
+    }
+    const threadId = normaliseGardssalgMessageIdHeader(first?.message_id);
+    const firstSubject = threadId ? (first?.subject ?? null) : null;
+    if (threadId && firstSubject) inReplyToMessageId = threadId;
+    renderCtx = {
+      monthPhrase: gardssalgOutreachMonthPhrase(firstSentAt, new Date()),
+      // No usable first message: a new mail with subject A (spec endring 7).
+      firstSubject: inReplyToMessageId ? firstSubject : null,
+    };
   }
 
   // Reserve BEFORE sending. sent_at takes the column DEFAULT exactly as the
@@ -19904,6 +20710,8 @@ export async function sendGardssalgOutreachToEligibleProvider(
     const sendResult = await emailService.sendGardssalgOutreach(email, providerName, profileUrl, {
       isTestSend: isTest,
       template,
+      ctx: renderCtx,
+      ...(inReplyToMessageId ? { inReplyToMessageId } : {}),
     });
     if (!sendResult.success) {
       // Rejected — nothing left the building. Release the reservation so the
@@ -19949,11 +20757,11 @@ export async function sendGardssalgOutreachToEligibleProvider(
     let crmRecorded: boolean | undefined;
     if (!isTest) {
       try {
-        const rendered = renderGardssalgOutreachVariant(template, providerName, profileUrl);
+        const rendered = renderGardssalgOutreachVariant(template, providerName, profileUrl, renderCtx);
         crmService.ingestThread(
           {
-            threadId: `opplevagent-outreach-${providerId}`,
-            subject: rendered.subject,
+            threadId: gardssalgOutreachThreadId(providerId),
+            subject: template === "personal-v4-followup" ? (renderCtx?.firstSubject ?? rendered.subject) : rendered.subject,
             category: "marketing",
             messages: [
               {
@@ -19973,6 +20781,8 @@ export async function sendGardssalgOutreachToEligibleProvider(
                   provider_id: providerId,
                   reply_to: GARDSSALG_OUTREACH_REPLY_TO,
                   template,
+                  ...(subjectArm ? { subject_arm: subjectArm } : {}),
+                  ...(inReplyToMessageId ? { in_reply_to: inReplyToMessageId } : {}),
                 },
               },
             ],
@@ -19996,6 +20806,9 @@ export async function sendGardssalgOutreachToEligibleProvider(
       ...(logFailure === undefined ? {} : { reason: logFailure, db_write_failed: true as const }),
       log_recorded: logFailure === undefined,
       ...(crmRecorded === undefined ? {} : { crm_recorded: crmRecorded }),
+      template,
+      ...(subjectArm ? { subject_arm: subjectArm } : {}),
+      ...(template === "personal-v4-followup" ? { threaded: inReplyToMessageId !== undefined } : {}),
     };
   } catch (err) {
     // Every write above has its own catch, so only the send itself lands
@@ -20829,6 +21642,171 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
   res.json(prep.response);
 });
 
+// ─── GET /admin/gardssalg-outreach-v4-measurement (admin, read-only) ───────
+//
+// dev-request 2026-10-22-opplevagent-utsending-v4, endring 10 / AC8: per v4
+// send (CRM crm_messages, direction 'out', template personal-v4 or
+// personal-v4-followup), the numbers the 4-week evaluation needs: human page
+// views of the profile page and of /eier/<slug> in the 72 hours after the send,
+// whether a login link was requested (gardssalg_claims row), whether the
+// profile was taken over (claimed_at), reply and «fjern». Reads existing
+// tables only (analytics_page_views keeps path without query string and no
+// IP/UA, raw retention 60 days) — no schema change, no write path.
+const GARDSSALG_V4_MEASUREMENT_WINDOW_HOURS = 72;
+const GARDSSALG_V4_MEASUREMENT_DEFAULT_DAYS = 28;
+const GARDSSALG_V4_MEASUREMENT_MAX_DAYS = 60;
+
+/** `YYYY-MM-DD HH:MM:SS` (UTC) — the format SQLite's datetime('now') columns hold. */
+function toSqliteUtc(d: Date): string {
+  return d.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+}
+
+/** Human page views (shared definition, see profile-activity-service getViews30) of one exact path in [from, to). */
+function countGardssalgHumanViews(rfbDb: ReturnType<typeof getRfbDb>, path: string, from: Date, to: Date): number {
+  const sessions = rfbDb
+    .prepare(
+      `SELECT session_id, MAX(client_class) AS client_class, COUNT(*) AS views
+         FROM analytics_page_views
+        WHERE path = ?
+          AND (is_owner IS NULL OR is_owner = 0)
+          AND created_at >= ? AND created_at < ?
+          AND (status_code IS NULL OR (status_code >= 200 AND status_code < 300) OR status_code = 304)
+          AND session_id IS NOT NULL
+        GROUP BY session_id`,
+    )
+    .all(path, toSqliteUtc(from), toSqliteUtc(to)) as Array<{ session_id: string; client_class: string | null; views: number }>;
+  let human = 0;
+  for (const s of sessions) {
+    if (storedClientClass(s.session_id, s.client_class) === "human") human += s.views;
+  }
+  return human;
+}
+
+interface GardssalgV4MeasurementRow {
+  slug: string | null;
+  provider_id: string;
+  sent_at: string;
+  arm: string | null;
+  template: string;
+  window_complete: boolean;
+  views_profile_72h: number | null;
+  views_eier_72h: number | null;
+  claim_link_requested: boolean;
+  claimed: boolean;
+  replied: boolean;
+  unsubscribed: boolean;
+}
+
+export function computeGardssalgV4Measurement(
+  expDb: ReturnType<typeof getExpDb>,
+  rfbDb: ReturnType<typeof getRfbDb>,
+  opts: { days: number; now?: Date },
+) {
+  const now = opts.now ?? new Date();
+  const cutoff = new Date(now.getTime() - opts.days * 24 * 60 * 60 * 1000);
+  // LIKE (not json_extract): raw_metadata may hold malformed JSON on old rows.
+  const msgs = rfbDb
+    .prepare(
+      `SELECT sent_at, to_emails, raw_metadata FROM crm_messages
+        WHERE direction = 'out' AND raw_metadata LIKE '%"template"%personal-v4%' AND datetime(sent_at) >= datetime(?)
+        ORDER BY sent_at ASC, rowid ASC`,
+    )
+    .all(cutoff.toISOString()) as Array<{ sent_at: string; to_emails: string | null; raw_metadata: string | null }>;
+
+  const providerStmt = expDb.prepare(`SELECT slug, claimed_at FROM experience_providers WHERE id = ?`);
+  const claimStmt = expDb.prepare(
+    `SELECT COUNT(*) AS n FROM gardssalg_claims WHERE provider_id = ? AND is_test = 0 AND created_at >= ?`,
+  );
+  // Two statements instead of one OR: thread_id is indexed (idx_crm_messages_thread);
+  // from_email has no index on crm_messages, so that lookup is a scan, run once per
+  // send (a handful of v4 sends per week). datetime() normalises ISO ('T…Z') and
+  // space-format timestamps so same-day replies compare correctly.
+  const replyByThreadStmt = rfbDb.prepare(
+    `SELECT id, body_text FROM crm_messages
+      WHERE direction = 'in' AND thread_id = ?
+        AND datetime(COALESCE(sent_at, received_at)) >= datetime(?)`,
+  );
+  const replyByAddressStmt = rfbDb.prepare(
+    `SELECT id, body_text FROM crm_messages
+      WHERE direction = 'in' AND LOWER(from_email) = ?
+        AND datetime(COALESCE(sent_at, received_at)) >= datetime(?)`,
+  );
+  const unsubStmt = rfbDb.prepare(
+    `SELECT COUNT(*) AS n FROM email_bounces WHERE LOWER(TRIM(email)) = ? AND bounce_type = 'unsubscribe' AND datetime(bounced_at) >= datetime(?)`,
+  );
+
+  const sends: GardssalgV4MeasurementRow[] = [];
+  for (const m of msgs) {
+    let meta: Record<string, unknown> = {};
+    try { meta = JSON.parse(m.raw_metadata || "{}"); } catch { /* skipped below */ }
+    const template = typeof meta.template === "string" ? meta.template : null;
+    const providerId = typeof meta.provider_id === "string" ? meta.provider_id : null;
+    if ((template !== "personal-v4" && template !== "personal-v4-followup") || !providerId) continue;
+    const provider = providerStmt.get(providerId) as { slug: string | null; claimed_at: string | null } | undefined;
+    const slug = provider?.slug ?? null;
+    const sentAt = new Date(m.sent_at);
+    const windowEnd = new Date(sentAt.getTime() + GARDSSALG_V4_MEASUREMENT_WINDOW_HOURS * 60 * 60 * 1000);
+    const sinceSql = toSqliteUtc(sentAt);
+    let recipient = "";
+    try { recipient = String((JSON.parse(m.to_emails || "[]") as unknown[])[0] ?? "").trim().toLowerCase(); } catch { /* none */ }
+
+    const replyRows = [
+      ...(replyByThreadStmt.all(gardssalgOutreachThreadId(providerId), m.sent_at) as Array<{ id: string; body_text: string | null }>),
+      ...(recipient ? (replyByAddressStmt.all(recipient, m.sent_at) as Array<{ id: string; body_text: string | null }>) : []),
+    ];
+    const replies = replyRows.filter((r, i) => replyRows.findIndex((x) => x.id === r.id) === i);
+    const fjernReply = replies.some((r) => /\bfjern\b/i.test(r.body_text ?? ""));
+    const unsubscribed = fjernReply || (recipient !== "" && (unsubStmt.get(recipient, m.sent_at) as { n: number }).n > 0);
+
+    sends.push({
+      slug,
+      provider_id: providerId,
+      sent_at: m.sent_at,
+      arm: typeof meta.subject_arm === "string" ? meta.subject_arm : null,
+      template,
+      window_complete: windowEnd.getTime() <= now.getTime(),
+      views_profile_72h: slug ? countGardssalgHumanViews(rfbDb, `/kategori/gardssalg/produsent/${slug}`, sentAt, windowEnd) : null,
+      views_eier_72h: slug ? countGardssalgHumanViews(rfbDb, `/kategori/gardssalg/eier/${slug}`, sentAt, windowEnd) : null,
+      claim_link_requested: (claimStmt.get(providerId, sinceSql) as { n: number }).n > 0,
+      claimed: !!provider?.claimed_at,
+      replied: replies.length > 0,
+      unsubscribed,
+    });
+  }
+
+  const summarise = (t: string) => {
+    const rows = sends.filter((s) => s.template === t);
+    return {
+      sends: rows.length,
+      replied: rows.filter((s) => s.replied).length,
+      unsubscribed: rows.filter((s) => s.unsubscribed).length,
+      claim_link_requested: rows.filter((s) => s.claim_link_requested).length,
+      claimed: rows.filter((s) => s.claimed).length,
+      with_views_72h: rows.filter((s) => (s.views_profile_72h ?? 0) + (s.views_eier_72h ?? 0) > 0).length,
+    };
+  };
+  return {
+    success: true,
+    window_hours: GARDSSALG_V4_MEASUREMENT_WINDOW_HOURS,
+    days: opts.days,
+    summary: { first: summarise("personal-v4"), followup: summarise("personal-v4-followup"), total_sends: sends.length },
+    sends,
+  };
+}
+
+router.get("/admin/gardssalg-outreach-v4-measurement", requireAdmin, (req: Request, res: Response) => {
+  const raw = Number(req.query.days);
+  const days = Number.isFinite(raw) && raw >= 1
+    ? Math.min(Math.floor(raw), GARDSSALG_V4_MEASUREMENT_MAX_DAYS)
+    : GARDSSALG_V4_MEASUREMENT_DEFAULT_DAYS;
+  try {
+    res.json(computeGardssalgV4Measurement(getExpDb("experiences"), getRfbDb(), { days }));
+  } catch (err) {
+    console.error("[gardssalg-outreach-v4-measurement] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
 // ─── GET  /api/opplevelser/admin/gardssalg-outreach-size-gate (admin) ──────
 // ─── POST /api/opplevelser/admin/gardssalg-outreach-size-gate (admin) ──────
 //
@@ -21019,6 +21997,13 @@ const GARDSSALG_OUTREACH_BOUNCE_LOOKBACK_HOURS = 48;
 // choice, same spirit as GARDSSALG_AUTOSVAR_SCAN_MAX_LIMIT above.
 const GARDSSALG_AUTOSVAR_APPLY_DAILY_BATCH_SIZE = 20;
 
+/** Send days of the cron job (weekday in Europe/Oslo). */
+export const GARDSSALG_OUTREACH_SEND_WEEKDAYS: readonly string[] = ["Tue", "Thu"];
+
+function osloWeekdayShort(d: Date): string {
+  return new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Oslo", weekday: "short" }).format(d);
+}
+
 /** Pure scheduling guard, same shape as analytics-service's shouldRunAutoPrune. */
 export function shouldRunGardssalgOutreachDaily(opts: {
   now: Date;
@@ -21029,6 +22014,11 @@ export function shouldRunGardssalgOutreachDaily(opts: {
   const windowHourUtc = opts.windowHourUtc ?? GARDSSALG_OUTREACH_DAILY_WINDOW_HOUR_UTC;
   const minHoursBetween = opts.minHoursBetween ?? 20;
   if (opts.now.getUTCHours() !== windowHourUtc) return false;
+  // dev-request 2026-10-22-opplevagent-utsending-v4 (endring 8): cron sends only
+  // on Tuesday and Thursday, by the weekday in Europe/Oslo (08Z is 09/10 local,
+  // so the Oslo date equals the UTC date; going through Intl keeps it right
+  // across the 25.10.2026 switch to winter time). Manual admin runs bypass this.
+  if (!GARDSSALG_OUTREACH_SEND_WEEKDAYS.includes(osloWeekdayShort(opts.now))) return false;
   if (opts.lastRunAt) {
     const deltaMs = opts.now.getTime() - opts.lastRunAt.getTime();
     if (deltaMs < minHoursBetween * 3600_000) return false;
@@ -21163,7 +22153,7 @@ let gardssalgOutreachDailyApplyInFlight = false;
 /**
  * The daily send. `apply: false` is a full dry run (guards evaluated, list
  * computed, nothing written, no envelope). `apply: true` sends up to
- * (daily_cap − sent today) emails with the reviewed `personal` template and
+ * (daily_cap − sent today) emails (v4 texts E/F, dev-request 2026-10-22-opplevagent-utsending-v4) and
  * records a run envelope whatever the outcome. Throws only if the selection
  * itself fails (a DB error) — per-provider send failures are rows, not
  * exceptions, so an error on provider 3 never loses providers 1–2.
@@ -21314,6 +22304,16 @@ async function runGardssalgOutreachDailyOnce(
         (c) => c.touch === "second" && sentIds.includes(c.provider_id),
       ).length;
       const firstTouchSent = sentIds.length - secondTouchSent;
+      // dev-request 2026-10-22-opplevagent-utsending-v4 (AC7): which template
+      // (and subject arm) each send used, so ledger and CRM tell old from new.
+      const sentRows = results.filter((r) => r.status === "sent");
+      const templatesSent = Array.from(new Set(sentRows.map((r) => r.template).filter((t): t is GardssalgOutreachTemplate => !!t)));
+      const templateLabel = templatesSent.length === 0 ? "personal-v4" : templatesSent.length === 1 ? templatesSent[0] : "mixed";
+      const sendsMeta = sentRows.map((r) => ({
+        provider_id: r.provider_id,
+        template: r.template ?? null,
+        subject_arm: r.subject_arm ?? null,
+      }));
       // Incident 2026-09-27/28: a stopped run is never `completed`, even with
       // no error row (a delivered send whose sent_log confirm failed) — a
       // routine that reads only the status must notice. Clean runs: unchanged.
@@ -21322,7 +22322,7 @@ async function runGardssalgOutreachDailyOnce(
       const notes =
         (report.skipped_reason ? `skipped: ${report.skipped_reason}. ` : "") +
         `sent=${report.summary.sent} errors=${report.summary.error} budget=${report.budget} ` +
-        `daily_cap=${report.daily_cap} sent_today_before=${report.sent_today_before} template=personal` +
+        `daily_cap=${report.daily_cap} sent_today_before=${report.sent_today_before} template=${templateLabel}` +
         // Incident 2026-09-27/28 — only on a run that hit a sent_log write
         // failure or a stop, so a clean run's notes are byte-identical to before.
         (report.log_not_recorded > 0 ? ` log_not_recorded=${report.log_not_recorded}` : "") +
@@ -21346,7 +22346,13 @@ async function runGardssalgOutreachDailyOnce(
             {
               type: "emails_sent",
               value: report.summary.sent,
-              meta: { lane: "gardssalg-outreach", table: "experience_outreach_sent_log", template: "personal", provider_ids: sentIds },
+              meta: {
+                lane: "gardssalg-outreach",
+                table: "experience_outreach_sent_log",
+                template: templateLabel,
+                sends: sendsMeta,
+                provider_ids: sentIds,
+              },
             },
             { type: "custom", value: firstTouchSent, meta: { kind: "gardssalg_outreach_first_touch_sent" } },
             { type: "custom", value: secondTouchSent, meta: { kind: "gardssalg_outreach_second_touch_sent" } },
@@ -21473,6 +22479,10 @@ async function runGardssalgOutreachDailyOnce(
     recipient_email: e.epost,
     touch: (hasPriorSend.get(e.provider_id) ? "second" : "first") as "first" | "second",
   }));
+  // dev-request 2026-10-22-opplevagent-utsending-v4: text E for a first touch,
+  // text F for a second.
+  const templateFor = (providerId: string): GardssalgOutreachTemplate =>
+    candidates.find((c) => c.provider_id === providerId)?.touch === "second" ? "personal-v4-followup" : "personal-v4";
 
   const results: GardssalgOutreachSendResultRow[] = [];
   // Incident 2026-09-27/28: stop at the first row that stops the batch, same
@@ -21515,7 +22525,7 @@ async function runGardssalgOutreachDailyOnce(
       continue;
     }
     const row = await sendGardssalgOutreachToEligibleProvider(expDb, elig, {
-      template: "personal",
+      template: templateFor(elig.provider_id),
       isTest: false,
       source: "gardssalg-outreach-daily-run",
     });
@@ -28346,15 +29356,18 @@ router.post("/admin/experiences-wrong-content-rate", requireAdmin, async (req: R
 //     advancement reason. Dry-run: reported only.
 //
 // Boilerplate-description nulling: a SEPARATE, independently-counted check —
-// not the judge verdict — for rows whose `description` is a byte-identical
-// copy of the evidence_url page's own visible text (a verbatim harvest-time
-// dump, not the "own summary" the schema's own comment requires — see
-// init-experiences.ts). Evaluated whenever the evidence_url fetch itself
-// succeeded (there must be real page text to compare against), independent of
+// not the judge verdict — for rows whose `description` is a full copy of the
+// evidence_url page's own visible text (`pageText`, compared whitespace-
+// normalized; a verbatim harvest-time dump, not the "own summary" the
+// schema's own comment requires — see init-experiences.ts). A description
+// equal to the page's og:/meta description or a ~300-char summary is the
+// owner's own genuine text and is NEVER nulled. Evaluated whenever the
+// evidence_url fetch itself succeeded (pageText non-null), independent of
 // what the judge verdict on that same row was — a MATCH row's description can
 // still be boilerplate. Apply mode: description is set to NULL (a blank field
 // is honest; a future content-writer can refill it later — this endpoint
-// never fabricates a replacement). Dry-run: reported only, zero writes.
+// never fabricates a replacement). Dry-run: reported only (per-row
+// description_nulled shows the decision), zero writes.
 //
 // `apply` must be exactly boolean `true` to write anything; anything else
 // (absent, false, or any other value) is a dry-run. Response:
@@ -28414,6 +29427,11 @@ const SWEEP_ELIGIBLE_WHERE = "evidence_url IS NOT NULL AND canonical_id IS NULL"
 // prefixes passed explicitly below) and the unaliased COUNT(*) queries.
 const SWEEP_IN_SCOPE_WHERE = experienceInScopeSql("category", "provider_id");
 const SWEEP_IN_SCOPE_WHERE_ALIASED = experienceInScopeSql("e.category", "e.provider_id");
+// The queue ordering (never-checked first, then oldest-checked) as ONE
+// constant, shared verbatim by the sweep below and the read-only candidate
+// GET of the content-judgement job (step 3k, further down) so the two can
+// never serve the rows in a different order.
+const SWEEP_QUEUE_ORDER_BY = "admission_checked_at IS NULL DESC, admission_checked_at ASC";
 
 // ─── Quarantine-exit promotion (dev-request 2026-09-02-experiences-
 // karantene-utgang-match-til-verified) ──────────────────────────────────────
@@ -28469,6 +29487,82 @@ const SWEEP_IN_SCOPE_WHERE_ALIASED = experienceInScopeSql("e.category", "e.provi
 // batch_id = this SAME sweep call's batchId, additive/reversible via POST
 // /admin/experiences-admission-promotion-rollback below.
 const PROMOTION_ELIGIBLE_CONFIDENCE = new Set(["high", "medium"]);
+
+// ─── Shared per-row decision + write (A2A dev-request 2026-10-06-
+// experiences-enrichment-plattformjobb-og-felles-serverjobbramme,
+// «Innsnevring 2026-10-28», skive 3k med punkt b) ─────────────────────────
+// Extracted VERBATIM from the sweep handler below when the server-side
+// content-judgement job (services/experience-content-judgement-job.ts, via
+// applyExperienceContentJudgements() further down) became the second caller
+// — same pattern as applyPrewrittenExperienceDescriptions(): the sweep and
+// the job decide promotion and write a verdict through exactly this code, so
+// the two paths cannot drift. Neither function calls an LLM or fetches.
+
+export type ContentJudgeSweepVerdict = "MATCH" | "MISMATCH" | "unresolved";
+
+/** The four promotion requirements (see the block comment above), each
+ *  evaluated separately. `row` is the state going INTO this write. */
+export type ContentJudgePromotionDecision = {
+  wasNeedsReview: boolean;
+  judgeOk: boolean;
+  brregActiveOk: boolean;
+  sourceVerified: boolean;
+  confidenceOk: boolean;
+  missing: string[];
+  eligible: boolean;
+};
+
+export function evaluateContentJudgePromotion(
+  row: Pick<ContentJudgeSweepRow, "verification_status" | "confidence" | "evidence_url_verification" | "p_brreg_active" | "p_field_provenance">,
+  verdict: ContentJudgeSweepVerdict,
+): ContentJudgePromotionDecision {
+  const wasNeedsReview = row.verification_status === "needs_review";
+  const judgeOk = verdict === "MATCH";
+  const brregActiveOk = row.p_brreg_active === 1;
+  const sourceVerified =
+    isHjemmesideVerified(row.p_field_provenance) || isEvidenceUrlVerified(row.evidence_url_verification);
+  const confidenceOk = row.confidence !== null && PROMOTION_ELIGIBLE_CONFIDENCE.has(row.confidence);
+  const missing: string[] = [];
+  if (!judgeOk) missing.push("judge");
+  if (!brregActiveOk) missing.push("brreg_active");
+  if (!sourceVerified) missing.push("source_verified");
+  if (!confidenceOk) missing.push("confidence");
+  return { wasNeedsReview, judgeOk, brregActiveOk, sourceVerified, confidenceOk, missing, eligible: wasNeedsReview && missing.length === 0 };
+}
+
+const CONTENT_JUDGE_PROMOTION_AUDIT_INSERT_SQL = `INSERT INTO experience_admission_promotion_audit
+         (id, experience_id, batch_id, from_status, to_status, reason, promoted_at)
+       VALUES (?, ?, ?, 'needs_review', 'verified', ?, datetime('now'))`;
+
+/** The apply-mode write for ONE row: MISMATCH -> needs_review; an eligible
+ *  row -> verified + one promotion-audit row under `batchId`; then exactly
+ *  one admission_verdict stamp (`promoted:` in place of `match:` on a
+ *  promotion). Touches no other column. */
+export function writeContentJudgeVerdict(
+  expDb: ReturnType<typeof getExpDb>,
+  rowId: string,
+  verdict: ContentJudgeSweepVerdict,
+  reason: string,
+  eligibleForPromotion: boolean,
+  batchId: string,
+): { promoted: boolean } {
+  let promoted = false;
+  if (verdict === "MISMATCH") {
+    expDb.prepare(`UPDATE experiences SET verification_status = 'needs_review' WHERE id = ?`).run(rowId);
+  } else if (eligibleForPromotion) {
+    expDb.prepare(`UPDATE experiences SET verification_status = 'verified' WHERE id = ?`).run(rowId);
+    promoted = true;
+    expDb.prepare(CONTENT_JUDGE_PROMOTION_AUDIT_INSERT_SQL).run(crypto.randomUUID(), rowId, batchId, reason);
+  }
+  const verdictKey: "match" | "mismatch" | "unresolved" =
+    verdict === "MATCH" ? "match" : verdict === "MISMATCH" ? "mismatch" : "unresolved";
+  // MATCH and unresolved are stamped too (see block comment above) — never
+  // skipped just because there's no status change to make. A promoted row's
+  // stamp gets the `promoted:` prefix IN PLACE OF the normal `match:` stamp —
+  // one admission_verdict write per row per call, never two.
+  stampExperienceAdmissionVerdict(rowId, promoted ? `promoted: ${reason}` : `${verdictKey}: ${reason}`, expDb);
+  return { promoted };
+}
 
 type ContentJudgeSweepRow = {
   id: string;
@@ -28576,8 +29670,7 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
         .get() as { n: number }
     ).n;
 
-    const sweepOrderBy =
-      sampleMode === "random" ? "RANDOM()" : "admission_checked_at IS NULL DESC, admission_checked_at ASC";
+    const sweepOrderBy = sampleMode === "random" ? "RANDOM()" : SWEEP_QUEUE_ORDER_BY;
 
     const rows = expDb
       .prepare(
@@ -28650,12 +29743,6 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
     );
     const needsReviewBefore = (needsReviewCountStmt.get() as { n: number }).n;
 
-    const insertPromotionAudit = expDb.prepare(
-      `INSERT INTO experience_admission_promotion_audit
-         (id, experience_id, batch_id, from_status, to_status, reason, promoted_at)
-       VALUES (?, ?, ?, 'needs_review', 'verified', ?, datetime('now'))`,
-    );
-
     for (const row of rows) {
       const evidenceUrl = (row.evidence_url ?? "").trim();
 
@@ -28689,24 +29776,20 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
       };
       const pageText: string | null = evidenceOutcome.pageText;
 
-      // Boilerplate-description check: SEPARATE from the judge verdict above,
-      // only meaningful when a real fetch actually happened (currentSummary
-      // !== null) — a fetch failure leaves nothing to compare the stored
-      // description against, so it is never counted as boilerplate on doubt.
-      //
-      // Compares against `evidenceOutcome.currentSummary` — the SAME
-      // extractive summary (meta-description-first, capped ~300 chars) the
-      // content-refresh writer would produce for this page today — NOT
-      // `pageText` (the full, uncapped visible page body). `row.description`
-      // is always meta-derived-or-capped-paragraph, so it can never equal
-      // the full body text; comparing it against `pageText` made this check
-      // dead code (see dev-request diagnosis). `currentSummary` is the
-      // apples-to-apples comparison: "is the stored description still
-      // exactly what this page would currently produce?"
-      const isBoilerplate =
-        row.description !== null &&
-        evidenceOutcome.currentSummary !== null &&
-        row.description === evidenceOutcome.currentSummary;
+      // Boilerplate-description check: SEPARATE from the judge verdict above.
+      // Nulls ONLY a description that is a full copy of the evidence page's
+      // visible text (`pageText`, whitespace-normalized on both sides) — a
+      // verbatim harvest-time body dump. It must NEVER match the page's
+      // og:/meta description or a ~300-char summary of a longer page
+      // (`currentSummary`): that is exactly what a legitimate content-writer
+      // stores, so comparing against it nulled a producer's OWN genuine
+      // description (prod dry-run, row eb215876). `pageText` is null on
+      // fetch failure / dead / parked / empty url, so nothing is ever nulled
+      // on doubt.
+      const normWs = (t: string): string => t.replace(/\s+/g, " ").trim();
+      const normDescription = row.description !== null ? normWs(row.description) : "";
+      const normPageText = pageText !== null ? normWs(pageText) : "";
+      const isBoilerplate = normDescription !== "" && normPageText !== "" && normDescription === normPageText;
       if (isBoilerplate) counts.description_nulled++;
 
       const verdictKey: "match" | "mismatch" | "unresolved" =
@@ -28727,40 +29810,28 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
       // verification_status`, which was read by the SELECT BEFORE this loop
       // ran and is never mutated in place — the authoritative "status going
       // INTO this iteration" value.
-      const wasNeedsReview = row.verification_status === "needs_review";
-      const judgeOk = outcome.verdict === "MATCH";
-      const brregActiveOk = row.p_brreg_active === 1;
-      const sourceVerified =
-        isHjemmesideVerified(row.p_field_provenance) || isEvidenceUrlVerified(row.evidence_url_verification);
-      const confidenceOk = row.confidence !== null && PROMOTION_ELIGIBLE_CONFIDENCE.has(row.confidence);
-      const missingPromotionReqs: string[] = [];
-      if (!judgeOk) missingPromotionReqs.push("judge");
-      if (!brregActiveOk) missingPromotionReqs.push("brreg_active");
-      if (!sourceVerified) missingPromotionReqs.push("source_verified");
-      if (!confidenceOk) missingPromotionReqs.push("confidence");
-      const eligibleForPromotion = wasNeedsReview && missingPromotionReqs.length === 0;
+      // The four requirements + the write live in the shared
+      // evaluateContentJudgePromotion()/writeContentJudgeVerdict() above
+      // (skive 3k) — the content-judgement job uses the same two.
+      const {
+        wasNeedsReview,
+        brregActiveOk,
+        sourceVerified,
+        confidenceOk,
+        missing: missingPromotionReqs,
+        eligible: eligibleForPromotion,
+      } = evaluateContentJudgePromotion(row, outcome.verdict);
 
-      let descriptionNulled = false;
       let promoted = false;
       if (applyMode) {
-        if (outcome.verdict === "MISMATCH") {
-          expDb.prepare(`UPDATE experiences SET verification_status = 'needs_review' WHERE id = ?`).run(row.id);
-        } else if (eligibleForPromotion) {
-          expDb.prepare(`UPDATE experiences SET verification_status = 'verified' WHERE id = ?`).run(row.id);
-          promoted = true;
-          insertPromotionAudit.run(crypto.randomUUID(), row.id, batchId, outcome.reason);
-        }
-        // MATCH and unresolved are stamped too (see block comment above) —
-        // never skipped just because there's no status change to make. A
-        // promoted row's stamp gets the `promoted:` prefix IN PLACE OF the
-        // normal `match:` stamp — one admission_verdict write per row per
-        // call, never two.
-        stampExperienceAdmissionVerdict(row.id, promoted ? `promoted: ${outcome.reason}` : `${verdictKey}: ${outcome.reason}`);
+        promoted = writeContentJudgeVerdict(expDb, row.id, outcome.verdict, outcome.reason, eligibleForPromotion, batchId).promoted;
         if (isBoilerplate) {
           expDb.prepare(`UPDATE experiences SET description = NULL WHERE id = ?`).run(row.id);
-          descriptionNulled = true;
         }
       }
+      // Per-row flag mirrors the boilerplate decision in BOTH modes (in apply
+      // mode the UPDATE above ran under exactly this condition).
+      const descriptionNulled = isBoilerplate;
 
       const actionText = promoted
         ? "verification_status -> verified (promoted fra needs_review); admission_verdict stemplet (promoted)"
@@ -28841,6 +29912,331 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
     console.error("[opplevelser] admin/experiences-content-judge-sweep failed", err);
     res.status(500).json({ error: "Internal error" });
   }
+});
+
+// ─── Content-judgement queue (A2A dev-request 2026-10-06-experiences-
+// enrichment-plattformjobb-og-felles-serverjobbramme, «Innsnevring
+// 2026-10-28», skive 3k med punkt b) ───────────────────────────────────────
+//
+// The sweep above calls an LLM judge from this server. Daniel's rule
+// (Endring 2026-10-08): a platform job never calls an LLM — Claude Code on
+// his subscription (a read-only Cloud Routine) judges, commits the verdicts
+// as a file to A2A, and a job here stores them without an LLM, re-checking
+// everything deterministically. Three pieces:
+//
+//   GET /admin/experiences-content-judge-candidates   read-only: the rows the
+//       sweep would select (SAME SWEEP_ELIGIBLE_WHERE + SWEEP_IN_SCOPE_WHERE,
+//       SAME SWEEP_QUEUE_ORDER_BY), public catalog fields only. Punkt b: it
+//       does NOT stop at queue_exhausted — `batches` (1..4, default 1) lets
+//       one call return up to 4 × SWEEP_MAX_LIMIT rows, running on into the
+//       oldest-checked re-pass rows by the same ordering. No writes, no fetch.
+//   applyExperienceContentJudgements()   the no-LLM store step the job
+//       (services/experience-content-judgement-job.ts) calls per file; every
+//       write goes through the shared evaluateContentJudgePromotion() /
+//       writeContentJudgeVerdict() the sweep uses.
+//   GET /admin/experiences-content-judgements-status   read-only job status.
+//
+// The boilerplate-description nulling stays sweep-only (it needs the fetched
+// page text; this lane never fetches) — see the job module's header.
+import { EnrichmentWritePausedError } from "../services/enrichment-write-pause";
+import {
+  EXPERIENCE_CONTENT_JUDGEMENTS_MAX_ITEMS,
+  EXPERIENCE_CONTENT_JUDGEMENTS_MAX_REASONING_CHARS,
+  EXPERIENCE_CONTENT_JUDGEMENTS_SCHEMA,
+  EXPERIENCE_CONTENT_JUDGEMENT_MAX_ID_CHARS,
+  getExperienceContentJudgementsStatus,
+} from "../services/experience-content-judgement-job";
+
+export const CONTENT_JUDGE_CANDIDATES_MAX_BATCHES = 4;
+/** Per-file circuit breaker: at most this many `mismatch` demotions of rows
+ *  that were `verified` going in. Items past it are rejected `demotion_cap`
+ *  (nothing written, so they can be judged again by a later file). */
+export const CONTENT_JUDGEMENT_MAX_DEMOTIONS_PER_FILE = 25;
+/** Only public catalog rows go through the subscription lane: a row hidden
+ *  itself (experiences.catalog_hidden) or via its provider
+ *  (experience_providers.catalog_hidden) is neither served by the candidate
+ *  GET nor written by the apply step. The sweep's own selection is
+ *  unchanged. */
+const CONTENT_JUDGEMENT_PUBLIC_WHERE =
+  "COALESCE(catalog_hidden, 0) = 0 AND NOT EXISTS (SELECT 1 FROM experience_providers hp WHERE hp.id = experiences.provider_id AND COALESCE(hp.catalog_hidden, 0) = 1)";
+const CONTENT_JUDGEMENT_PUBLIC_WHERE_ALIASED = "COALESCE(e.catalog_hidden, 0) = 0 AND COALESCE(p.catalog_hidden, 0) = 0";
+/** Log-safe form of a file-supplied identifier. */
+function contentJudgementLogSafe(v: unknown, max: number): string {
+  return String(v ?? "-").replace(/[^A-Za-z0-9._:\-]/g, "").slice(0, max);
+}
+/** A created_at further ahead of the server clock than this is rejected —
+ *  a future timestamp would defeat the stale-verdict check. */
+const CONTENT_JUDGEMENT_MAX_CLOCK_SKEW_MS = 10 * 60_000;
+
+export type ContentJudgeCandidate = {
+  id: string;
+  provider_id: string | null;
+  title: string;
+  description: string | null;
+  category: string | null;
+  evidence_url: string | null;
+  verification_status: string;
+  confidence: string | null;
+  admission_checked_at: string | null;
+};
+
+/** The read-only core of GET /admin/experiences-content-judge-candidates.
+ *  `limit`/`batches` take the raw query values. */
+export function selectContentJudgeCandidates(
+  expDb: ReturnType<typeof getExpDb>,
+  raw: { limit?: unknown; batches?: unknown } = {},
+): {
+  batch_size: number;
+  batches: number;
+  scanned: number;
+  rows: ContentJudgeCandidate[];
+  remaining: number;
+  never_checked_remaining: number;
+  queue_exhausted: boolean;
+  skipped_out_of_scope: number;
+  judgement_schema: string;
+  max_items_per_file: number;
+} {
+  // Same parse as the sweep's query `limit`: non-numeric -> default, <=0 ->
+  // default, clamped to SWEEP_MAX_LIMIT.
+  let requestedLimit = SWEEP_DEFAULT_LIMIT;
+  if (typeof raw.limit === "string") {
+    const n = parseInt(raw.limit, 10);
+    requestedLimit = Number.isFinite(n) ? n : SWEEP_DEFAULT_LIMIT;
+  }
+  if (requestedLimit <= 0) requestedLimit = SWEEP_DEFAULT_LIMIT;
+  const batchSize = Math.min(SWEEP_MAX_LIMIT, requestedLimit);
+  let batches = 1;
+  if (typeof raw.batches === "string") {
+    const n = parseInt(raw.batches, 10);
+    if (Number.isFinite(n) && n >= 1) batches = Math.min(CONTENT_JUDGE_CANDIDATES_MAX_BATCHES, n);
+  }
+
+  // Counts measured exactly like the sweep's (same predicates, same tables).
+  const totalEligible = (
+    expDb
+      .prepare(`SELECT COUNT(*) AS n FROM experiences WHERE ${SWEEP_ELIGIBLE_WHERE} AND ${SWEEP_IN_SCOPE_WHERE} AND ${CONTENT_JUDGEMENT_PUBLIC_WHERE}`)
+      .get() as { n: number }
+  ).n;
+  const skippedOutOfScope = (
+    expDb
+      .prepare(`SELECT COUNT(*) AS n FROM experiences WHERE ${SWEEP_ELIGIBLE_WHERE} AND NOT (${SWEEP_IN_SCOPE_WHERE}) AND ${CONTENT_JUDGEMENT_PUBLIC_WHERE}`)
+      .get() as { n: number }
+  ).n;
+  const neverCheckedRemaining = (
+    expDb
+      .prepare(
+        `SELECT COUNT(*) AS n FROM experiences WHERE ${SWEEP_ELIGIBLE_WHERE} AND ${SWEEP_IN_SCOPE_WHERE} AND ${CONTENT_JUDGEMENT_PUBLIC_WHERE} AND admission_checked_at IS NULL`,
+      )
+      .get() as { n: number }
+  ).n;
+  // Same FROM/JOIN/WHERE/ORDER BY as the sweep's row SELECT; only the
+  // public catalog columns are returned.
+  const rows = expDb
+    .prepare(
+      `SELECT e.id, e.provider_id, e.title, e.description, e.category, e.evidence_url,
+              e.verification_status, e.confidence, e.admission_checked_at
+         FROM experiences e
+         LEFT JOIN experience_providers p ON p.id = e.provider_id
+        WHERE ${SWEEP_ELIGIBLE_WHERE} AND ${SWEEP_IN_SCOPE_WHERE_ALIASED} AND ${CONTENT_JUDGEMENT_PUBLIC_WHERE_ALIASED}
+        ORDER BY ${SWEEP_QUEUE_ORDER_BY}
+        LIMIT ?`,
+    )
+    .all(batchSize * batches) as ContentJudgeCandidate[];
+
+  return {
+    batch_size: batchSize,
+    batches,
+    scanned: rows.length,
+    rows,
+    remaining: Math.max(0, totalEligible - rows.length),
+    never_checked_remaining: neverCheckedRemaining,
+    queue_exhausted: neverCheckedRemaining === 0,
+    skipped_out_of_scope: skippedOutOfScope,
+    judgement_schema: EXPERIENCE_CONTENT_JUDGEMENTS_SCHEMA,
+    max_items_per_file: EXPERIENCE_CONTENT_JUDGEMENTS_MAX_ITEMS,
+  };
+}
+
+router.get("/admin/experiences-content-judge-candidates", requireAdmin, (req: Request, res: Response) => {
+  try {
+    const out = selectContentJudgeCandidates(getExpDb("experiences"), { limit: req.query?.limit, batches: req.query?.batches });
+    res.json({ success: true, ...out });
+  } catch (err) {
+    console.error("[opplevelser] admin/experiences-content-judge-candidates failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+type ContentJudgementItem = { id: string; evidence_url: unknown; verdict: unknown; reasoning: unknown; invalidId?: boolean };
+
+export type ContentJudgementItemResult = {
+  id: string;
+  result: "written" | "rejected";
+  reason?: string;
+  verdict?: "match" | "mismatch";
+  promoted?: boolean;
+  promotion?: { applicable: boolean; status: "not_applicable" | "held" | "promoted"; missing?: string[] };
+};
+
+export type ExperienceContentJudgementsResult =
+  | { ok: false; error: string }
+  | {
+      ok: true;
+      batch_id: string;
+      totals: { written: number; rejected: number; match: number; mismatch: number; promoted: number };
+      results: ContentJudgementItemResult[];
+    };
+
+/** SQLite `datetime('now')` ("YYYY-MM-DD HH:MM:SS", UTC) or ISO -> ms. */
+function contentJudgementTsMs(ts: string): number {
+  const t = ts.trim();
+  const iso = t.includes("T") ? t : t.replace(" ", "T");
+  return Date.parse(/(Z|[+-]\d{2}:?\d{2})$/.test(iso) ? iso : `${iso}Z`);
+}
+
+/**
+ * Stores one judgement file's items (the content-judgement job's apply
+ * step). NEVER calls an LLM, never fetches. Structural problems that make
+ * the file untrustworthy as a whole (not 1..50 objects with string ids,
+ * duplicate ids, bad/future created_at) -> {ok:false}; a malformed verdict
+ * / evidence_url / reasoning rejects only that item. Each item is then
+ * re-checked and written in ITS OWN transaction (see the job's header for
+ * the full list of re-checks); the write-pause is asserted inside every
+ * transaction, and a pause throws (the queue counts it as a per-file
+ * failure and retries — already-written items are then `stale_verdict`).
+ */
+export async function applyExperienceContentJudgements(
+  db: ReturnType<typeof getExpDb>,
+  rawItems: unknown,
+  opts: { createdAt: unknown; runId?: unknown; now?: Date; logTag?: string },
+): Promise<ExperienceContentJudgementsResult> {
+  if (!Array.isArray(rawItems) || rawItems.length < 1 || rawItems.length > EXPERIENCE_CONTENT_JUDGEMENTS_MAX_ITEMS) {
+    return { ok: false, error: `items must be an array of 1..${EXPERIENCE_CONTENT_JUDGEMENTS_MAX_ITEMS} items` };
+  }
+  if (typeof opts.createdAt !== "string" || !Number.isFinite(Date.parse(opts.createdAt))) {
+    return { ok: false, error: "created_at must be a valid timestamp" };
+  }
+  const createdAtMs = Date.parse(opts.createdAt);
+  const nowMs = (opts.now ?? new Date()).getTime();
+  if (createdAtMs > nowMs + CONTENT_JUDGEMENT_MAX_CLOCK_SKEW_MS) {
+    return { ok: false, error: "created_at is in the future" };
+  }
+  const items: ContentJudgementItem[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < rawItems.length; i++) {
+    const r = rawItems[i];
+    if (!r || typeof r !== "object" || Array.isArray(r)) return { ok: false, error: `items[${i}] must be an object` };
+    const o = r as Record<string, unknown>;
+    if (typeof o.id !== "string" || o.id.trim() === "") return { ok: false, error: `items[${i}].id must be a non-empty string` };
+    const id = o.id.trim();
+    if (id.length > EXPERIENCE_CONTENT_JUDGEMENT_MAX_ID_CHARS) {
+      // Item-level: rejected as `invalid_id`, reported under a bounded,
+      // log-safe form of the id; never looked up.
+      items.push({ id: contentJudgementLogSafe(id, EXPERIENCE_CONTENT_JUDGEMENT_MAX_ID_CHARS), evidence_url: null, verdict: null, reasoning: null, invalidId: true });
+      continue;
+    }
+    if (seen.has(id)) return { ok: false, error: `duplicate id in items: ${contentJudgementLogSafe(id, EXPERIENCE_CONTENT_JUDGEMENT_MAX_ID_CHARS)}` };
+    seen.add(id);
+    items.push({ id, evidence_url: o.evidence_url, verdict: o.verdict, reasoning: o.reasoning });
+  }
+
+  const batchId = `content-judgement-job-${new Date(nowMs).toISOString().slice(0, 19).replace(/[:T]/g, "")}-${crypto.randomUUID()}`;
+  const eligibleStmt = db.prepare(`SELECT 1 FROM experiences WHERE id = ? AND ${SWEEP_ELIGIBLE_WHERE} AND ${CONTENT_JUDGEMENT_PUBLIC_WHERE}`);
+  let demotions = 0;
+  const inScopeStmt = db.prepare(`SELECT 1 FROM experiences WHERE id = ? AND ${SWEEP_IN_SCOPE_WHERE}`);
+  const rowStmt = db.prepare(
+    `SELECT e.id, e.evidence_url, e.admission_checked_at, e.updated_at, e.verification_status,
+            e.confidence, e.evidence_url_verification,
+            p.brreg_active AS p_brreg_active, p.field_provenance AS p_field_provenance
+       FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+      WHERE e.id = ?`,
+  );
+  type Row = Pick<
+    ContentJudgeSweepRow,
+    "id" | "evidence_url" | "admission_checked_at" | "verification_status" | "confidence" | "evidence_url_verification" | "p_brreg_active" | "p_field_provenance"
+  > & { updated_at: string | null };
+  /** A non-null timestamp newer than the file (or unparseable: fail closed). */
+  const newerThanFile = (ts: string | null): boolean => {
+    if (ts === null || ts.trim() === "") return false;
+    const ms = contentJudgementTsMs(ts);
+    return !Number.isFinite(ms) || ms > createdAtMs;
+  };
+
+  const applyOne = db.transaction((it: ContentJudgementItem, verdict: "MATCH" | "MISMATCH", reasoning: string): ContentJudgementItemResult => {
+    // The SAME shared experiences pause helper every apply:true route in
+    // this file uses; thrown so the transaction rolls back.
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) throw new EnrichmentWritePausedError(pauseBlock);
+    const row = rowStmt.get(it.id) as Row | undefined;
+    if (!row) return { id: it.id, result: "rejected", reason: "not_found" };
+    if (!eligibleStmt.get(it.id)) return { id: it.id, result: "rejected", reason: "not_eligible" };
+    if (!inScopeStmt.get(it.id)) return { id: it.id, result: "rejected", reason: "out_of_scope" };
+    if ((row.evidence_url ?? "").trim() !== String(it.evidence_url).trim()) return { id: it.id, result: "rejected", reason: "evidence_changed" };
+    if (newerThanFile(row.admission_checked_at)) return { id: it.id, result: "rejected", reason: "stale_verdict" };
+    if (newerThanFile(row.updated_at)) return { id: it.id, result: "rejected", reason: "content_changed" };
+    // Circuit breaker: a verified row demoted by a mismatch cannot be rolled
+    // back by the promotion-rollback route, so a file may demote at most
+    // CONTENT_JUDGEMENT_MAX_DEMOTIONS_PER_FILE of them.
+    const demotes = verdict === "MISMATCH" && row.verification_status === "verified";
+    if (demotes && demotions >= CONTENT_JUDGEMENT_MAX_DEMOTIONS_PER_FILE) return { id: it.id, result: "rejected", reason: "demotion_cap" };
+    // The client verdict is the "judge" requirement only; the other three
+    // are read from the row as it stands now, inside this transaction.
+    const decision = evaluateContentJudgePromotion(row, verdict);
+    const { promoted } = writeContentJudgeVerdict(db, row.id, verdict, reasoning, decision.eligible, batchId);
+    if (demotes) demotions++;
+    return {
+      id: it.id,
+      result: "written",
+      verdict: verdict === "MATCH" ? "match" : "mismatch",
+      promoted,
+      promotion: {
+        applicable: decision.wasNeedsReview,
+        status: !decision.wasNeedsReview ? "not_applicable" : promoted ? "promoted" : "held",
+        ...(decision.wasNeedsReview && !promoted ? { missing: decision.missing } : {}),
+      },
+    };
+  });
+
+  const results: ContentJudgementItemResult[] = [];
+  for (const it of items) {
+    if (it.invalidId) {
+      results.push({ id: it.id, result: "rejected", reason: "invalid_id" });
+      continue;
+    }
+    if (it.verdict !== "match" && it.verdict !== "mismatch") {
+      results.push({ id: it.id, result: "rejected", reason: "invalid_verdict" });
+      continue;
+    }
+    if (typeof it.evidence_url !== "string" || it.evidence_url.trim() === "") {
+      results.push({ id: it.id, result: "rejected", reason: "invalid_evidence_url" });
+      continue;
+    }
+    const reasoning = typeof it.reasoning === "string" ? it.reasoning.replace(/\s+/g, " ").trim() : "";
+    if (reasoning === "" || reasoning.length > EXPERIENCE_CONTENT_JUDGEMENTS_MAX_REASONING_CHARS) {
+      results.push({ id: it.id, result: "rejected", reason: "invalid_reasoning" });
+      continue;
+    }
+    results.push(applyOne(it, it.verdict === "match" ? "MATCH" : "MISMATCH", reasoning));
+  }
+
+  const totals = { written: 0, rejected: 0, match: 0, mismatch: 0, promoted: 0 };
+  for (const r of results) {
+    totals[r.result]++;
+    if (r.verdict) totals[r.verdict]++;
+    if (r.promoted) totals.promoted++;
+  }
+  console.log(
+    `[${opts.logTag ?? "experience-content-judgements"}] run_id=${contentJudgementLogSafe(opts.runId, 80)} ` +
+      `batch_id=${batchId} ` +
+      results.map((r) => `${contentJudgementLogSafe(r.id, EXPERIENCE_CONTENT_JUDGEMENT_MAX_ID_CHARS)}=${r.result}${r.reason ? ":" + r.reason : ""}${r.verdict ? ":" + r.verdict : ""}${r.promoted ? ":promoted" : ""}`).join(" "),
+  );
+  return { ok: true, batch_id: batchId, totals, results };
+}
+
+router.get("/admin/experiences-content-judgements-status", requireAdmin, (_req: Request, res: Response) => {
+  res.json({ success: true, ...getExperienceContentJudgementsStatus(getExpDb("experiences") as any) });
 });
 
 // ─── POST /api/opplevelser/admin/experiences-admission-promotion-rollback ──
@@ -30925,6 +32321,7 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
     orgNrs?: unknown;
     hidden?: unknown;
     apply?: unknown;
+    override_owner_removed?: unknown;
     mode?: unknown;
     confirm_owned?: unknown;
   };
@@ -30956,6 +32353,9 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
     req.query?.apply === "1" ||
     req.query?.apply === "true";
   const dryRun = !apply;
+  // dev-request 2026-10-01-opplevagent-eier-fjernet-som-terminal: explicit,
+  // per-call override of the owner-removed unhide guard (strictly boolean true).
+  const overrideOwnerRemoved = body.override_owner_removed === true;
 
   const providerIds = Array.isArray(body.providerIds)
     ? (body.providerIds as unknown[]).filter((v): v is string => typeof v === "string" && v.trim() !== "").map((v) => v.trim())
@@ -30975,11 +32375,11 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
   try {
     const expDb = getExpDb("experiences");
     const byId = expDb.prepare(
-      `SELECT id, navn, org_nr, hjemmeside, epost, catalog_hidden, catalog_hidden_reason, content_source FROM experience_providers
+      `SELECT id, navn, org_nr, hjemmeside, epost, catalog_hidden, catalog_hidden_reason, is_test_provider, content_source, terminal_status FROM experience_providers
         WHERE id = ? AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
     );
     const byOrgNr = expDb.prepare(
-      `SELECT id, navn, org_nr, hjemmeside, epost, catalog_hidden, catalog_hidden_reason, content_source FROM experience_providers
+      `SELECT id, navn, org_nr, hjemmeside, epost, catalog_hidden, catalog_hidden_reason, is_test_provider, content_source, terminal_status FROM experience_providers
         WHERE org_nr = ? AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
     );
     type PvRow = {
@@ -30990,7 +32390,10 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
       epost: string | null;
       catalog_hidden: number | null;
       catalog_hidden_reason: string | null;
+      // O2a: getOwnedVisibilityState() reads the test fixture's reason only with it.
+      is_test_provider: number | null;
       content_source: string | null;
+      terminal_status: string | null;
     };
 
     const matched = new Map<string, PvRow>();
@@ -31007,6 +32410,9 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
     }
 
     const skippedLocked: Array<{ id: string; navn: string; org_nr: string | null }> = [];
+    const skippedOwnerRemoved: Array<{ id: string; navn: string; org_nr: string | null; outcome: "skipped_owner_removed" }> = [];
+    const overriddenOwnerRemoved: Array<{ id: string; navn: string; org_nr: string | null }> = [];
+    const ownerRemovedMatcher = hidden ? null : loadOwnerRemovedMatcher();
     const skippedOwned: Array<{ id: string; navn: string; org_nr: string | null; state: string }> = [];
     const unchanged: Array<{ id: string; navn: string; org_nr: string | null }> = [];
     const changed: Array<{
@@ -31057,6 +32463,17 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
       if (currentlyHidden === hidden && (!owned || (row.catalog_hidden_reason ?? null) === targetReason)) {
         unchanged.push({ id: row.id, navn: row.navn, org_nr: row.org_nr });
         continue;
+      }
+      // Owner-removed guard: a producer that asked for removal (explicit
+      // terminal_status, hidden with catalog_hidden_reason='remove_request',
+      // or org.nr/domain/e-post on the blocklist with a "fjern oss" reason)
+      // must not be unhidden by accident.
+      if (!hidden && ownerRemovedMatcher && deriveGardssalgTerminalStatus(row.terminal_status, row, ownerRemovedMatcher) === "eier_fjernet") {
+        if (!overrideOwnerRemoved) {
+          skippedOwnerRemoved.push({ id: row.id, navn: row.navn, org_nr: row.org_nr, outcome: "skipped_owner_removed" });
+          continue;
+        }
+        overriddenOwnerRemoved.push({ id: row.id, navn: row.navn, org_nr: row.org_nr });
       }
       let blocklistInserted: number | undefined;
       if (!dryRun) {
@@ -31115,6 +32532,8 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
       changed,
       unchanged,
       skipped_locked: skippedLocked,
+      skipped_owner_removed: skippedOwnerRemoved,
+      ...(overrideOwnerRemoved ? { override_owner_removed: true, overridden_owner_removed: overriddenOwnerRemoved } : {}),
       skipped_owned: skippedOwned,
       not_found: notFound,
       ...(!dryRun && hidden ? { blocklist_inserted_total: blocklistInsertedTotal } : {}),
@@ -31263,7 +32682,7 @@ router.post("/book", async (req: Request, res: Response) => {
       res.status(400).json(providerQueryMissingPayload());
       return;
     }
-    const resolution = resolveGardssalgProviderByQuery(rawProviderQuery);
+    const resolution = resolveGardssalgProviderByQuery(rawProviderQuery, { surface: "rest" });
     if (resolution.kind === "none") {
       res.status(200).json(providerNotFoundPayload(rawProviderQuery));
       return;
@@ -31325,6 +32744,21 @@ router.post("/book", async (req: Request, res: Response) => {
       paused: true,
       provider: providerInfo,
       message: BOOKING_NOT_ACTIVATED_MSG,
+    });
+    return;
+  }
+  // «Mine valg» booking.pause (dev-request 2026-10-22-opplevagent-mine-valg-
+  // gardssalg O1a): the owner's seasonal pause refuses a new request with the
+  // G1 item 7 line; the profile stays visible. Off unless
+  // OA_OWNER_FEATURES_ENABLED and the producer is allowlisted.
+  if (gardssalgBookingPausedByOwner(parsed.data.provider_id)) {
+    res.status(200).json({
+      success: false,
+      paused: true,
+      reason: "owner_paused",
+      provider: providerInfo,
+      message: GARDSSALG_NOT_TAKING_REQUESTS_TEXT.no,
+      message_en: GARDSSALG_NOT_TAKING_REQUESTS_TEXT.en,
     });
     return;
   }
@@ -37430,6 +38864,32 @@ router.post("/admin/gardssalg-content-refresh-job-run", requireAdmin, async (req
   const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
   const report = await runGardssalgContentRefreshDaily({ apply, trigger: "manual" });
   res.json({ success: true, ...report });
+});
+
+// ─── Server-side experiences org.nr job, step 3n (A2A dev-request
+// 2026-10-06-experiences-enrichment-plattformjobb-og-felles-serverjobbramme,
+// «Innsnevring 2026-10-28») — read-only status + manual run ────────────────
+import {
+  getExperienceOrgnrJobStatus,
+  runExperienceOrgnrDaily,
+} from "../services/experience-orgnr-job";
+
+router.get("/admin/experience-orgnr-job-status", requireAdmin, (_req: Request, res: Response) => {
+  res.json({ success: true, ...getExperienceOrgnrJobStatus() });
+});
+
+// Manual run, same code path as the daily tick. Dry-run unless `apply` is
+// exactly the JSON boolean true. The write-pause is checked inside the run
+// (apply only); a dry-run reads the shared cursor but never advances it.
+router.post("/admin/experience-orgnr-job-run", requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const body = (req.body ?? {}) as { apply?: unknown };
+    const report = await runExperienceOrgnrDaily({ apply: body.apply === true, trigger: "manual" });
+    res.json({ success: true, ...report });
+  } catch (err) {
+    console.error("[opplevelser] admin/experience-orgnr-job-run failed", err);
+    res.status(500).json({ success: false, error: "Internal error" });
+  }
 });
 
 export default router;

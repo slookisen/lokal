@@ -326,19 +326,19 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
       }
 
       // ── (a) scheduling guard ───────────────────────────────────────────
-      assertEq(shouldRunGardssalgOutreachDaily({ now: new Date("2026-09-06T07:59:00Z"), lastRunAt: null }), false, "a1: 07:59Z -> not in window");
-      assertEq(shouldRunGardssalgOutreachDaily({ now: new Date("2026-09-06T08:00:00Z"), lastRunAt: null }), true, "a2: 08:00Z, never run -> run");
+      assertEq(shouldRunGardssalgOutreachDaily({ now: new Date("2026-09-08T07:59:00Z"), lastRunAt: null }), false, "a1: 07:59Z -> not in window");
+      assertEq(shouldRunGardssalgOutreachDaily({ now: new Date("2026-09-08T08:00:00Z"), lastRunAt: null }), true, "a2: Tuesday 08:00Z, never run -> run");
       assertEq(
-        shouldRunGardssalgOutreachDaily({ now: new Date("2026-09-06T08:30:00Z"), lastRunAt: new Date("2026-09-06T08:05:00Z") }),
+        shouldRunGardssalgOutreachDaily({ now: new Date("2026-09-08T08:30:00Z"), lastRunAt: new Date("2026-09-08T08:05:00Z") }),
         false,
         "a3: 08:30Z, ran 25 min ago -> no second run",
       );
       assertEq(
-        shouldRunGardssalgOutreachDaily({ now: new Date("2026-09-07T08:10:00Z"), lastRunAt: new Date("2026-09-06T08:50:00Z") }),
+        shouldRunGardssalgOutreachDaily({ now: new Date("2026-09-10T08:10:00Z"), lastRunAt: new Date("2026-09-08T08:50:00Z") }),
         true,
-        "a4: next day 08:10Z, ran 23h20m ago -> run",
+        "a4: Thursday 08:10Z, ran 47h20m ago -> run",
       );
-      assertEq(shouldRunGardssalgOutreachDaily({ now: new Date("2026-09-06T09:00:00Z"), lastRunAt: null }), false, "a5: 09:00Z -> not in window");
+      assertEq(shouldRunGardssalgOutreachDaily({ now: new Date("2026-09-08T09:00:00Z"), lastRunAt: null }), false, "a5: 09:00Z -> not in window");
 
       // ── (b) lane switch ────────────────────────────────────────────────
       const laneDefault = await callRoute(opplevelserRouter, { headers: auth });
@@ -389,7 +389,11 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
         ["post@alpha-sideri.no", "post@beta-bryggeri.no"],
         "e6: sent to the two producers' own addresses",
       );
-      assertTrue(sent.every((m) => String(m.subject).startsWith("Har vi riktig info om")), "e7: personal template subject on every mail");
+      assertEq(
+        sent.map((m) => String(m.subject)),
+        ["Har vi riktig info om Alpha Sideri?", "Spørsmål om besøk hos Beta Bryggeri"],
+        "e7: v4 first mails alternate subject arm A then B (dev-request 2026-10-22-opplevagent-utsending-v4)",
+      );
       assertTrue(real.results.every((r) => r.status === "sent" && r.crm_recorded === true), "e8: every row sent + CRM-filed");
       assertTrue(real.run_id.includes("-manual-"), "e9: manual run ids are distinct from the cron id");
       const runs = runsFor();
@@ -398,6 +402,18 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
       assertEq(runs[1].status, "completed", "e11: envelope status completed");
       assertEq(claims[0].type, "emails_sent", "e12: first claim is emails_sent");
       assertEq(claims[0].value, 2, "e13: emails_sent = 2");
+      // AC7 (dev-request 2026-10-22-opplevagent-utsending-v4): the run-ledger names template and subject arm per send.
+      assertEq(claims[0].meta?.template, "personal-v4", "e13b: emails_sent claim carries template personal-v4");
+      assertEq(
+        claims[0].meta?.sends,
+        [
+          { provider_id: "prov-alpha", template: "personal-v4", subject_arm: "A" },
+          { provider_id: "prov-beta", template: "personal-v4", subject_arm: "B" },
+        ],
+        "e13c: emails_sent claim lists template + subject arm for every send",
+      );
+      assertTrue(String(runs[1].notes).includes("template=personal-v4"), "e13d: envelope notes name template=personal-v4");
+      assertEq(real.results.map((r) => [r.template, r.subject_arm]), [["personal-v4", "A"], ["personal-v4", "B"]], "e13e: result rows carry template + arm");
       assertEq(claims[1].meta?.kind, "gardssalg_outreach_first_touch_sent", "e14: first-touch claim present");
       assertEq(claims[1].value, 2, "e15: first_touch_sent = 2");
       // dev-request 2026-10-08-mottakerpolicy-alle-adresser: address types of the run's candidates.
@@ -672,22 +688,24 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
           (rfbDb.prepare(`SELECT last_completed_at FROM boot_job_state WHERE job = ?`).get(stateKey) as { last_completed_at: string } | undefined)
             ?.last_completed_at ?? null;
         const runsBefore = runsFor().length;
-        const early = await tickGardssalgOutreachDaily({ now: new Date("2026-11-02T07:59:00Z"), lastRunAt: null });
+        const early = await tickGardssalgOutreachDaily({ now: new Date("2026-11-03T07:59:00Z"), lastRunAt: null });
         assertEq([early.report, stamp()], [null, null], "m1: 07:59Z -> outside the window, nothing run, nothing stamped");
-        const first = await tickGardssalgOutreachDaily({ now: new Date("2026-11-02T08:09:00Z"), lastRunAt: null });
+        const first = await tickGardssalgOutreachDaily({ now: new Date("2026-11-03T08:09:00Z"), lastRunAt: null });
         assertEq(
           [first.report?.trigger, first.report?.envelope_recorded, first.lastRunAt?.toISOString(), stamp()],
-          ["cron", true, "2026-11-02T08:09:00.000Z", "2026-11-02T08:09:00.000Z"],
+          ["cron", true, "2026-11-03T08:09:00.000Z", "2026-11-03T08:09:00.000Z"],
           "m2: no run yet today -> the tick runs the job and persists the stamp",
         );
-        const restarted = await tickGardssalgOutreachDaily({ now: new Date("2026-11-02T08:52:00Z"), lastRunAt: null });
+        const restarted = await tickGardssalgOutreachDaily({ now: new Date("2026-11-03T08:52:00Z"), lastRunAt: null });
         assertEq(
           [restarted.report, restarted.lastRunAt?.toISOString(), runsFor().length],
-          [null, "2026-11-02T08:09:00.000Z", runsBefore + 1],
+          [null, "2026-11-03T08:09:00.000Z", runsBefore + 1],
           "m3: restart at 08:52Z (memory empty) after the 08:09Z run -> skipped, no second envelope",
         );
-        const nextDay = await tickGardssalgOutreachDaily({ now: new Date("2026-11-03T08:05:00Z"), lastRunAt: null });
-        assertEq([nextDay.report !== null, stamp()], [true, "2026-11-03T08:05:00.000Z"], "m4: next day 08:05Z -> runs again");
+        const wednesday = await tickGardssalgOutreachDaily({ now: new Date("2026-11-04T08:05:00Z"), lastRunAt: null });
+        assertEq([wednesday.report, stamp()], [null, "2026-11-03T08:09:00.000Z"], "m4a: Wednesday 08:05Z -> not a send day, nothing run, stamp unchanged");
+        const nextDay = await tickGardssalgOutreachDaily({ now: new Date("2026-11-05T08:05:00Z"), lastRunAt: null });
+        assertEq([nextDay.report !== null, stamp()], [true, "2026-11-05T08:05:00.000Z"], "m4: Thursday 08:05Z -> runs again");
         const indexSrc = require("fs").readFileSync(require("path").join(__dirname, "..", "index.ts"), "utf8") as string;
         assertTrue(
           indexSrc.includes("tickGardssalgOutreachDaily({ now, lastRunAt: lastGardssalgOutreachRunAt })"),
