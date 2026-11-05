@@ -52246,3 +52246,22 @@ runSerial(async () => {
     }
   }
 });
+
+// dev-request 2026-10-03-rfb-kontaktskjema-henvendelser, slice 1: the pure,
+// offline contact-form detector + skip reasons (services/contact-form-detector.ts).
+// No network, no DB, nothing submitted.
+runSerial(async () => {
+  console.log("\n── contact-form-detector: kontaktskjema-kartlegging (offline, ingen innsending) ──");
+  try {
+    const { runContactFormDetectorTests } = require("../src/services/contact-form-detector.test") as
+      typeof import("../src/services/contact-form-detector.test");
+    const r = runContactFormDetectorTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("contact-form-detector: " + f);
+    console.log(`  contact-form-detector: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("contact-form-detector: unexpected error: " + String(err?.message || err));
+  }
+});
