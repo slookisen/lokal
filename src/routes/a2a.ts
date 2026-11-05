@@ -14,7 +14,7 @@ import {
 } from "../services/a2a-traffic-classifier";
 import { hashIP } from "../services/analytics-service";
 import { discoveryService } from "../services/discovery-service";
-import { knowledgeService, relabelCertifications, productEntries, parseProductPrice } from "../services/knowledge-service";
+import { knowledgeService, relabelCertifications, productEntries, parseProductPrice, publicOwnerAboutText } from "../services/knowledge-service";
 import { catalogNameNorm, softStockByNameNorm, stockSoftExpiryBuyerTextNb } from "../services/stock-soft-expiry";
 import { stripOrganicEntries } from "../services/organic-claims";
 import { textEntries } from "../utils/text-entries";
@@ -910,6 +910,9 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
       console.log(`[description-guard] suppressed junk knowledge.about (agent.json x-knowledge) for ${req.params.id} (${card.name})`);
       safeAbout = undefined;
     }
+    // Økologi S3c-2: owner-written about of a producer without a valid Debio
+    // status → no organic sentence (gate off = unchanged).
+    safeAbout = publicOwnerAboutText(req.params.id as string, safeAbout);
     const enriched: Record<string, any> = { ...card };
     enriched["x-knowledge"] = {
       address: knowledge.address,

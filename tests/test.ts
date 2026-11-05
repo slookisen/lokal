@@ -51922,6 +51922,30 @@ runSerial(async () => {
 });
 
 // A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
+// tekstrevisjon, S3c-2 (the owner's own text on every public read):
+// getAgentInfo (GET /agents/:id/info, MCP lokal_info), A2A agent.json
+// x-knowledge, /llms-full.txt and the SEO translation / related-preview
+// helpers drop organic sentences from an owner-written about of a producer
+// without a valid Debio status, behind RFB_ORGANIC_CLAIM_GATE +
+// RFB_ORGANIC_OWNER_GATE. Swaps the getDb() singleton, env vars and
+// console.log (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-28-rfb-okologisk-merking S3c-2: eiertekst på alle offentlige lesesider ──");
+  try {
+    const { runOrganicOwnerGateS3c2Tests } = require("../src/routes/organic-owner-gate-s3c2.test") as
+      typeof import("../src/routes/organic-owner-gate-s3c2.test");
+    const r = await runOrganicOwnerGateS3c2Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("organic-owner-gate-s3c2: " + f);
+    console.log(`  organic-owner-gate-s3c2: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("organic-owner-gate-s3c2: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
 // tekstrevisjon, S1: status from Debio's full register — normalizer, < 2500
 // rows rejected, the match methods, support signals → review only, review
 // approve/reject, AC1.4 reset, > 7 days stale, profile wording (AC1.5), flag

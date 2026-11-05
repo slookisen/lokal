@@ -2,9 +2,9 @@ import { v4 as uuid } from "uuid";
 import crypto from "crypto";
 import { getDb } from "../database/init";
 import { isDisplayablePhone, validatePhoneForWrite, stripTrailingContactLabel, stripLeadingContactLabel } from "./contact-normalizer";
-import { isJunkDescription, normalizeProse } from "./description-quality";
+import { isJunkDescription, normalizeProse, organicOwnerGateActive } from "./description-quality";
 import { textEntries } from "../utils/text-entries";
-import { productsWithoutOrganicFlag, stripOrganicEntries } from "./organic-claims";
+import { productsWithoutOrganicFlag, stripOrganicEntries, dropOrganicSentences } from "./organic-claims";
 import { debioStatusShown } from "./debio-approval";
 import { normalizeEmail } from "./blocklist-service";
 import { customerRuleSql } from "./customer-rule";
@@ -210,6 +210,58 @@ export function ownerLockedFieldKeys(curatedFieldsJson: string | null | undefine
     // unreadable → no locks (same as parseCuratedFields)
   }
   return out;
+}
+
+// ─── Økologi S3c / S3c-2: the owner's own `about` on public reads ──────────
+// dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
+// tekstrevisjon. With RFB_ORGANIC_CLAIM_GATE + RFB_ORGANIC_OWNER_GATE both on
+// (organicOwnerGateActive, default off), an OWNER-written about
+// (curated_fields.about.by === "owner") of a producer without a valid Debio
+// status loses every sentence with an organic claim (dropOrganicSentences)
+// on every public read. Read-side only; the stored text is unchanged.
+
+/** Parsed curated_fields says `about` is owner-written (`about.by === "owner"`). */
+export function aboutIsOwnerWritten(curatedFields: unknown): boolean {
+  return !!curatedFields && typeof curatedFields === "object" &&
+    (curatedFields as { about?: { by?: unknown } | null }).about?.by === "owner";
+}
+
+/**
+ * Is agent_knowledge.about owner-written (curated_fields.about.by ===
+ * "owner")? Tolerant: unreadable JSON / no row = false.
+ */
+export function ownerWroteAbout(agentId: string): boolean {
+  try {
+    const row = getDb().prepare("SELECT curated_fields FROM agent_knowledge WHERE agent_id = ?").get(agentId) as { curated_fields?: string | null } | undefined;
+    if (!row?.curated_fields) return false;
+    return aboutIsOwnerWritten(JSON.parse(row.curated_fields));
+  } catch {
+    return false;
+  }
+}
+
+/** The producer has a valid Debio status (debioStatusShown). Tolerant: no row / error = false. */
+function debioStatusShownFor(agentId: string): boolean {
+  try {
+    const db = getDb();
+    const agent = db.prepare("SELECT id, debio_verified FROM agents WHERE id = ?").get(agentId) as { id?: unknown; debio_verified?: unknown } | undefined;
+    return debioStatusShown(agent, db);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Økologi S3c-2: `about` (agent_knowledge.about or a published translation
+ * of it) as a public surface that does not read getAgentInfo may show it.
+ * Gate off, empty text, non-owner text or a valid Debio status → `about`
+ * unchanged (same value, no DB read while the gate is off); otherwise
+ * dropOrganicSentences(about) ("" when nothing is left).
+ */
+export function publicOwnerAboutText<T extends string | null | undefined>(agentId: string, about: T): T | string {
+  if (!about || !organicOwnerGateActive()) return about;
+  if (!ownerWroteAbout(agentId)) return about;
+  return debioStatusShownFor(agentId) ? about : dropOrganicSentences(about);
 }
 
 export interface SeasonalProduct {
@@ -844,6 +896,13 @@ class KnowledgeService {
     // (X-Claim-Token for this agent) reads the stored lists unchanged, so a
     // save from there never drops what the public view filters.
     const filterOrganic = !debioVerified && !opts.ownerView;
+    // Økologi S3c-2 (RFB_ORGANIC_CLAIM_GATE + RFB_ORGANIC_OWNER_GATE, both
+    // default off): the same read step as the profile page — an OWNER-written
+    // about of a producer without a valid Debio status loses every sentence
+    // with an organic claim on this public read (info API, MCP, A2A, cards).
+    // Not for the owner's own editor (ownerView). Stored text unchanged.
+    const ownerAboutOrganicFilter = organicOwnerGateActive() && debioVerified !== true && !opts.ownerView &&
+      aboutIsOwnerWritten(knowledge?.curatedFields);
     const storedProducts = productEntries(knowledge?.products);
 
     return {
@@ -878,7 +937,9 @@ class KnowledgeService {
         // this seller" endpoints (GET /agents/:id/info, MCP lokal_info),
         // so scraped nav/boilerplate junk (e.g. "Skip to content ... Meny")
         // must never be returned as if it were a real description/about text.
-        about: this.guardedDescriptionField(agentId, agent.name, "knowledge.about", knowledge?.about),
+        about: ownerAboutOrganicFilter
+          ? dropOrganicSentences(this.guardedDescriptionField(agentId, agent.name, "knowledge.about", knowledge?.about))
+          : this.guardedDescriptionField(agentId, agent.name, "knowledge.about", knowledge?.about),
         description: this.guardedDescriptionField(agentId, agent.name, "agent.description", agent.description),
         specialties: filterOrganic ? stripOrganicEntries(textEntries(knowledge?.specialties)) : textEntries(knowledge?.specialties),
         // PR-95: rewrite certifications to reflect debio_verified flag.
