@@ -17,6 +17,7 @@ import { PRICE_BY_AGREEMENT } from "../services/order-pricing";
 import { randomUUID } from "crypto";
 import { soldOutChoices, stockSoftExpiryActiveFor } from "../services/stock-soft-expiry";
 import { isOrderMessagesEnabled, listOrderMessages, orderTakesMessages, ORDER_MESSAGE_MAX_CHARS, type OrderMessageRow } from "../services/order-messages";
+import { OWNER_ORDERS_THEME_CSS, ownerThemeHtml } from "../owner-ui/tokens";
 
 export type OwnerOrdersTab = "venter" | "kommende" | "avsluttet";
 export const OWNER_ORDERS_TABS: ReadonlyArray<{ key: OwnerOrdersTab; label: string }> = [
@@ -452,6 +453,8 @@ export function renderOrdersPage(opts: {
   done: string;
   error: string;
   now?: Date;
+  /** T6: the shared owner theme (dark mode, token classes); allowlisted subjects only. */
+  ownerTheme?: boolean;
 }): string {
   const base = `/eier/${encodeURIComponent(opts.agentId)}/ordrer`;
   const tabs = OWNER_ORDERS_TABS.map((t) =>
@@ -464,13 +467,15 @@ export function renderOrdersPage(opts: {
     }),
   ).join("\n");
   const empty = opts.orders.length ? "" : `<p class="mo-empty">${opts.tab === "venter" ? "Ingen ordrer venter på svar." : opts.tab === "kommende" ? "Ingen kommende henting." : "Ingen avsluttede ordrer ennå."}</p>`;
-  return ordersShell(`Mine ordrer · ${opts.producerName}`, `
+  const body = `
 <p class="mo-sub"><a href="/eier/${encodeURIComponent(opts.agentId)}/portal">← Eierportalen</a></p>
 <h1>Mine ordrer</h1>
 <p class="mo-sub">${esc(opts.producerName)}</p>
 ${bannerHtml(opts.done, opts.error)}
 <nav class="mo-tabs" aria-label="Ordrer">${tabs}</nav>
-${rows}${empty}`);
+${rows}${empty}`;
+  return ordersShell(`Mine ordrer · ${opts.producerName}`,
+    opts.ownerTheme ? `<style>${OWNER_ORDERS_THEME_CSS}</style>${ownerThemeHtml(body)}` : body);
 }
 
 /** The single-order view opened from the e-mail (token). Shows that order only. */

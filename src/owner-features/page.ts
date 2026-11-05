@@ -29,7 +29,11 @@ import { escapeHtml } from "../routes/owner-portal";
 import {
   OWNER_FEATURE_GROUPS,
   OWNER_FEATURE_REGISTRY,
+  STOCK_CHECK_SOFT_EXPIRY_DESCRIPTION,
   findOwnerFeature,
+  ownerFeatureEntryForEnv,
+  ownerFeatureStatus,
+  visibleOwnerFeatureOptions,
   type LocalizedText,
   type OwnerFeatureEntry,
   type OwnerFeatureGroup,
@@ -55,6 +59,8 @@ import {
   ownerRowAnchor,
 } from "./anchors";
 import { OPPLEVAGENT_PRICE_MESSAGE } from "./price-message";
+import { OWNER_TOKEN_CSS } from "../owner-ui/tokens";
+import { stockSoftExpiryActiveFor } from "../services/stock-soft-expiry";
 
 /** Entries that need this key on are shown only when it is on (spec «Grensesnitt»). */
 export const OWNER_PAGE_REVEAL_KEY = "orders.enabled";
@@ -296,9 +302,9 @@ export function ownerStatsAreLow(st: OwnerPageStats): boolean {
 
 const esc = (v: unknown): string => escapeHtml(String(v ?? ""));
 
-/** Is the entry built (shown in the main view with its value)? */
+/** Is the entry built (shown in the main view with its value)? A liveFlag entry with its flag off is not. */
 export function isOwnerFeatureBuilt(e: OwnerFeatureEntry): boolean {
-  return e.status !== "coming_soon";
+  return ownerFeatureStatus(e) !== "coming_soon";
 }
 
 /**
@@ -350,7 +356,7 @@ const ACTOR_LABELS: Record<string, string> = {
 };
 
 function isNew(e: OwnerFeatureEntry, now: Date): boolean {
-  if (e.status !== "live") return false;
+  if (ownerFeatureStatus(e) !== "live") return false;
   const since = new Date(`${e.since}T00:00:00Z`).getTime();
   if (Number.isNaN(since)) return false;
   const age = now.getTime() - since;
@@ -418,7 +424,7 @@ function controlHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeatu
       );
     }
     case "choice": {
-      const opts = (e.options || []).map((o) =>
+      const opts = visibleOwnerFeatureOptions(e).map((o) =>
         `<option value="${esc(o.value)}"${o.value === r.value ? " selected" : ""}>${esc(o.label.no)}</option>`).join("");
       return form(
         `<label class="mv-sr" for="${esc(fieldId)}">${esc(e.label.no)}</label>` +
@@ -592,6 +598,16 @@ function ordersExplainHtml(m: OwnerPageModel): string {
           </details>`;
 }
 
+/**
+ * A row's description for this owner. B2b-3: `products.stock_check` follows
+ * the soft-expiry rule when it is active for the producer; every other row
+ * (and the rule off) → the entry's description as before.
+ */
+export function ownerRowDescription(agentId: string, e: OwnerFeatureEntry, env: NodeJS.ProcessEnv = process.env): LocalizedText {
+  if (e.key === "products.stock_check" && stockSoftExpiryActiveFor(agentId, env)) return STOCK_CHECK_SOFT_EXPIRY_DESCRIPTION;
+  return ownerFeatureEntryForEnv(e, env).description;
+}
+
 function rowHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeature, swap: string): string {
   const badges =
     (isNew(e, ctx.now) ? ` <span class="mv-badge mv-badge-new">Nytt</span>` : "") +
@@ -613,7 +629,7 @@ function rowHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeature, 
     if (confirm) ctx.confirmPlaced = true;
   }
   return `<li class="mv-item" id="${esc(ownerRowAnchor(e.key))}" data-key="${esc(e.key)}">
-          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong>${badges}<p class="mv-desc">${esc(e.description.no)}</p>${reason}${explain}${rowExtraHtml(ctx, e, r)}</div>
+          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong>${badges}<p class="mv-desc">${esc(ownerRowDescription(ctx.m.agent.id, e).no)}</p>${reason}${explain}${rowExtraHtml(ctx, e, r)}</div>
           <div class="mv-item-ctl">${controlHtml(ctx, e, r, swap)}</div>${noticeAtHtml(ctx, ownerRowAnchor(e.key))}${confirm}
         </li>`;
 }
@@ -668,7 +684,7 @@ function plannedHtml(ctx: RenderCtx, registry: OwnerFeatureEntry[]): string {
       : rowForm(m, "/interesse", "planlagt",
           `<input type="hidden" name="key" value="${esc(e.key)}"><button type="submit" class="ep-btn ep-btn-secondary">Gi meg beskjed</button>`);
     return `<li class="mv-item mv-item-planned" id="${esc(ownerPlannedAnchor(e.key))}" data-planned-key="${esc(e.key)}">
-          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong> <span class="mv-badge">${esc(groupLabel.get(e.group) ?? "")}</span><p class="mv-desc">${esc(e.description.no)}</p></div>
+          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong> <span class="mv-badge">${esc(groupLabel.get(e.group) ?? "")}</span><p class="mv-desc">${esc(ownerFeatureEntryForEnv(e).description.no)}</p></div>
           <div class="mv-item-ctl">${ctl}</div>${noticeAtHtml(ctx, ownerPlannedAnchor(e.key))}
         </li>`;
   }).join("");
@@ -962,34 +978,39 @@ export const OWNER_PAGE_SCRIPT = `
 })();
 `;
 
-/** Page-only CSS on top of PORTAL_PALETTE_CSS: layout, ≥ 44 px targets, dark mode. */
+/**
+ * Page-only CSS on top of PORTAL_PALETTE_CSS: layout, ≥ 44 px targets, dark
+ * mode. T6: the colours are the shared owner tokens (src/owner-ui/tokens.ts),
+ * which switch with prefers-color-scheme; the dark block only re-colours the
+ * shell's ep-* classes (kept dark-only, as the gårdssalg shell has its own
+ * light ep-* colours).
+ */
 export const OWNER_PAGE_CSS = `
-  :root { color-scheme: light dark; }
-  .mv-page, .mv-page * { overflow-wrap: anywhere; }
+${OWNER_TOKEN_CSS}  .mv-page, .mv-page * { overflow-wrap: anywhere; }
   .mv-page { max-width: 100%; }
   .mv-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
-  .mv-desc { margin: 4px 0 0; font-size: 0.88rem; color: #595959; }
-  .mv-reason { margin: 4px 0 0; font-size: 0.85rem; color: #92400e; }
-  .mv-explain { margin: 4px 0 0; font-size: 0.85rem; color: #404040; font-style: italic; }
-  .mv-note { font-size: 0.88rem; color: #595959; margin: 12px 0 0; }
-  .mv-check { margin: 8px 0 0; font-size: 0.9rem; font-weight: 600; color: #2D5016; }
-  .mv-check-missing { color: #92400e; }
+  .mv-desc { margin: 4px 0 0; font-size: 0.88rem; color: var(--ow-muted); }
+  .mv-reason { margin: 4px 0 0; font-size: 0.85rem; color: var(--ow-warn); }
+  .mv-explain { margin: 4px 0 0; font-size: 0.85rem; color: var(--ow-text-soft); font-style: italic; }
+  .mv-note { font-size: 0.88rem; color: var(--ow-muted); margin: 12px 0 0; }
+  .mv-check { margin: 8px 0 0; font-size: 0.9rem; font-weight: 600; color: var(--ow-accent); }
+  .mv-check-missing { color: var(--ow-warn); }
   .mv-list { list-style: none; margin: 0; padding: 0; }
-  .mv-item { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; padding: 12px 0; border-bottom: 1px solid #f0f0e8; }
+  .mv-item { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; padding: 12px 0; border-bottom: 1px solid var(--ow-divider); }
   .mv-item:last-child { border-bottom: none; }
   .mv-item-text { flex: 1 1 220px; min-width: 0; }
   .mv-item-ctl { flex: 0 1 auto; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; max-width: 100%; }
   .mv-ctl-form, .mv-confirm-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0; max-width: 100%; }
   .mv-confirm-form { flex-direction: column; align-items: stretch; }
-  .mv-ctl-form select, .mv-ctl-form input:not([type=hidden]), .mv-confirm-form input:not([type=hidden]) { min-height: 44px; max-width: 100%; padding: 8px 10px; font-size: 1rem; font-family: inherit; border: 1px solid #d4d4d4; border-radius: 8px; background: #fff; color: #1a1a1a; }
+  .mv-ctl-form select, .mv-ctl-form input:not([type=hidden]), .mv-confirm-form input:not([type=hidden]) { min-height: 44px; max-width: 100%; padding: 8px 10px; font-size: 1rem; font-family: inherit; border: 1px solid var(--ow-input-border); border-radius: 8px; background: var(--ow-input-bg); color: var(--ow-input-text); }
   .mv-state { display: inline-flex; align-items: center; min-height: 44px; font-weight: 600; }
-  .mv-always { color: #2D5016; }
-  .mv-asked { color: #2D5016; }
-  .mv-badge { display: inline-block; font-size: 0.72rem; font-weight: 600; padding: 2px 8px; border-radius: 999px; background: #f0f0e8; color: #404040; vertical-align: middle; }
-  .mv-badge-new { background: #e7f2dc; color: #2D5016; }
+  .mv-always { color: var(--ow-accent); }
+  .mv-asked { color: var(--ow-accent); }
+  .mv-badge { display: inline-block; font-size: 0.72rem; font-weight: 600; padding: 2px 8px; border-radius: 999px; background: var(--ow-badge-bg); color: var(--ow-badge-text); vertical-align: middle; }
+  .mv-badge-new { background: var(--ow-badge-new-bg); color: var(--ow-badge-new-text); }
   .mv-levels { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: 1fr; gap: 12px; }
-  .mv-level { border: 1px solid #e5e5e5; border-radius: 10px; padding: 14px; display: flex; flex-direction: column; gap: 6px; }
-  .mv-level[aria-current="true"] { border-color: #2D5016; box-shadow: inset 0 0 0 1px #2D5016; }
+  .mv-level { border: 1px solid var(--ow-border); border-radius: 10px; padding: 14px; display: flex; flex-direction: column; gap: 6px; }
+  .mv-level[aria-current="true"] { border-color: var(--ow-accent-line); box-shadow: inset 0 0 0 1px var(--ow-accent-line); }
   @media (min-width: 640px) { .mv-levels { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
   .mv-status { margin-top: 16px; }
   .mv-status h3 { font-size: 0.95rem; margin: 0 0 6px; }
@@ -997,55 +1018,43 @@ export const OWNER_PAGE_CSS = `
   .mv-fold-summary { min-height: 44px; display: flex; align-items: center; cursor: pointer; list-style: none; }
   .mv-fold-summary::-webkit-details-marker { display: none; }
   .mv-fold-summary h2 { margin: 0; flex: 1 1 auto; }
-  .mv-fold-summary::after { content: "▾"; margin-left: 8px; color: #2D5016; }
+  .mv-fold-summary::after { content: "▾"; margin-left: 8px; color: var(--ow-accent); }
   details:not([open]) > .mv-fold-summary::after { content: "▸"; }
-  .mv-more summary, .mv-explain-box summary { min-height: 44px; display: flex; align-items: center; cursor: pointer; font-weight: 600; color: #2D5016; }
+  .mv-more summary, .mv-explain-box summary { min-height: 44px; display: flex; align-items: center; cursor: pointer; font-weight: 600; color: var(--ow-accent); }
   .mv-explain-box { margin-top: 8px; font-size: 0.9rem; }
   .mv-explain-box h3 { font-size: 0.92rem; margin: 10px 0 4px; }
   .mv-explain-box ul { margin: 0; padding-left: 18px; }
   .mv-jump { display: flex; flex-wrap: wrap; gap: 4px 8px; margin-top: 12px; }
-  .mv-jump a { display: inline-flex; align-items: center; min-height: 44px; padding: 0 10px; border: 1px solid #e5e5e5; border-radius: 999px; font-size: 0.88rem; text-decoration: none; }
+  .mv-jump a { display: inline-flex; align-items: center; min-height: 44px; padding: 0 10px; border: 1px solid var(--ow-border); border-radius: 999px; font-size: 0.88rem; text-decoration: none; }
   @media (min-width: 900px) { .mv-jump { display: none; } }
-  .mv-confirm { border-color: #2D5016; }
-  .mv-confirm-inline { flex: 1 1 100%; min-width: 0; margin-top: 12px; padding: 12px 14px; border: 1px solid #2D5016; border-radius: 10px; }
+  .mv-confirm { border-color: var(--ow-accent-line); }
+  .mv-confirm-inline { flex: 1 1 100%; min-width: 0; margin-top: 12px; padding: 12px 14px; border: 1px solid var(--ow-accent-line); border-radius: 10px; }
   .mv-confirm-inline h3 { font-size: 1rem; margin: 0 0 6px; }
   .mv-item > .mv-toast { flex: 1 1 100%; }
   .mv-toast { position: sticky; bottom: 0; z-index: 10; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; margin-top: 16px; padding: 10px 14px; border-radius: 10px; font-size: 0.95rem; box-shadow: 0 -2px 8px rgba(0,0,0,0.08); }
-  .mv-toast-ok { background: #f0fdf4; color: #166534; border: 1px solid #bbf7d0; }
-  .mv-toast-error { background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; }
+  .mv-toast-ok { background: var(--ow-ok-bg); color: var(--ow-ok-text); border: 1px solid var(--ow-ok-line); }
+  .mv-toast-error { background: var(--ow-err-bg); color: var(--ow-err-text); border: 1px solid var(--ow-err-line); }
   .mv-toast.mv-toast-inline { position: static; box-shadow: none; margin-top: 8px; }
   .mv-pager { align-items: center; }
   .mv-stats { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
   @media (min-width: 640px) { .mv-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
-  .mv-stat { border: 1px solid #e5e5e5; border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-  .mv-stat strong { font-size: 1.4rem; color: #2D5016; }
+  .mv-stat { border: 1px solid var(--ow-border); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .mv-stat strong { font-size: 1.4rem; color: var(--ow-accent); }
   .mv-stat span { font-size: 0.88rem; font-weight: 600; }
-  .mv-stat small { font-size: 0.78rem; color: #595959; }
+  .mv-stat small { font-size: 0.78rem; color: var(--ow-muted); }
   @media (prefers-color-scheme: dark) {
-    body { background: #12150e; color: #ebe8dc; }
-    a, .ep-logo { color: #b9d99a; }
-    .ep-logo span { color: #e2bf97; }
-    .ep-card { background: #1c2116; border-color: #313b27; box-shadow: none; }
-    .ep-card h1, .ep-card h2, .mv-always, .mv-asked, .mv-more summary, .mv-explain-box summary, .mv-check { color: #b9d99a; }
-    .mv-fold-summary::after { color: #b9d99a; }
-    .ep-card h2, .mv-item, .ep-audit-item { border-color: #313b27; }
-    .ep-btn-primary { background: #4c7d2c; color: #fff; }
-    .ep-btn-primary:hover, .ep-btn-primary:focus { background: #5a9134; }
-    .ep-btn-secondary { background: transparent; color: #cfe6b8; border-color: #8fb86e; }
-    .ep-btn-secondary:hover { background: #26301d; }
-    .ep-btn-ghost { color: #b5b0a0; }
-    .mv-desc, .mv-note, .ep-audit-meta, .mv-explain { color: #b5b0a0; }
-    .mv-reason, .mv-check-missing { color: #f5c27a; }
-    .mv-badge { background: #2a3022; color: #d8d4c4; }
-    .mv-badge-new { background: #2f4a1c; color: #cfe6b8; }
-    .mv-level, .mv-jump a, .mv-stat { border-color: #313b27; }
-    .mv-stat strong { color: #b9d99a; }
-    .mv-stat small { color: #b5b0a0; }
-    .mv-level[aria-current="true"] { border-color: #8fb86e; box-shadow: inset 0 0 0 1px #8fb86e; }
-    .mv-confirm-inline { border-color: #8fb86e; }
-    .mv-ctl-form select, .mv-ctl-form input:not([type=hidden]), .mv-confirm-form input:not([type=hidden]) { background: #12150e; color: #ebe8dc; border-color: #4a5640; }
-    .mv-toast-ok { background: #15301d; color: #bbf7d0; border-color: #24543a; }
-    .mv-toast-error { background: #3a1616; color: #fecaca; border-color: #6b2525; }
+    body { background: var(--ow-page-bg); color: var(--ow-text); }
+    a, .ep-logo { color: var(--ow-accent); }
+    .ep-logo span { color: var(--ow-logo-accent); }
+    .ep-card { background: var(--ow-surface); border-color: var(--ow-border); box-shadow: none; }
+    .ep-card h1, .ep-card h2 { color: var(--ow-accent); }
+    .ep-card h2, .ep-audit-item { border-color: var(--ow-divider); }
+    .ep-btn-primary { background: var(--ow-btn-primary-bg); color: var(--ow-btn-primary-text); }
+    .ep-btn-primary:hover, .ep-btn-primary:focus { background: var(--ow-btn-primary-hover); }
+    .ep-btn-secondary { background: var(--ow-btn-secondary-bg); color: var(--ow-btn-secondary-text); border-color: var(--ow-accent-line); }
+    .ep-btn-secondary:hover { background: var(--ow-btn-secondary-hover); }
+    .ep-btn-ghost { color: var(--ow-faint); }
+    .ep-audit-meta { color: var(--ow-faint); }
   }
 `;
 

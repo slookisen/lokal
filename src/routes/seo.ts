@@ -28,6 +28,7 @@ import { containsOrganicClaim, isOrganicClaimUmbrella } from "../services/organi
 import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenFields, hidesAddress, hidesPrices, debioSwitchOffAgentIds } from "../owner-features/enforce";
 import { debioApprovalText, debioProcessText, debioRegisterSyncEnabled, finnokoSearchUrl, readDebioStatusRow } from "../services/debio-approval";
 import { publicCountsShown } from "../services/public-stats-threshold";
+import { emailRevealGuardEnabled, isCcBotUserAgent, revealEmailFor } from "../services/email-reveal-guard";
 // dev-request 2026-10-17-integrasjonstest-oppfolging, I-G: knowledge list
 // fields read by type (see "knowledge fields read by type" below).
 import { textEntries } from "../utils/text-entries";
@@ -83,6 +84,18 @@ import {
   type SalgskanalCategorySlug,
 } from "../services/salgskanal-matcher";
 import { addUtmParams } from "../utils/url-utm";
+// dev-request 2026-09-24-ai-sok-bli-svaret-rfb, slice B6: /mat/<kategori>/<sted>.
+import {
+  isRfbMatLandingEnabled,
+  isMatLandingComboIndexable,
+  matCategoryBySlug,
+  matLandingPath,
+  collectMatLandingCombos,
+  buildMatLandingAnswerFirst,
+  buildMatLandingFaqJsonLd,
+  type MatLandingCombo,
+  type MatLandingChannels,
+} from "../services/rfb-mat-landing";
 import {
   normalizeOpeningHours,
   parseOpeningHoursText,
@@ -99,7 +112,7 @@ import {
 import { INDEXNOW_KEY } from "../services/indexnow-service";
 import { t, htmlLangAttr, ogLocale, localizedPath, isSvLocaleEnabled, type Lang, isLangCookieRedirectEnabled } from "../i18n/t";
 import { rfbLangSessionMiddleware } from "../i18n/middleware";
-import { translateProductName, translateDeliveryTerm } from "../i18n/product-glossary";
+import { translateProductName, translateDeliveryTerm, type TranslateProductNameOptions } from "../i18n/product-glossary";
 import { getPublishedProfileTranslationsBulk } from "../services/profile-translations";
 import { fieldHasOnlyInferenceSources } from "../services/cross-source-validator";
 import { getPublishedProfileTranslations } from "../services/profile-translations";
@@ -546,15 +559,22 @@ export function buildBmEventJsonLd(
  * Grønnsaker, Frukt". A product name that is exactly a known category word
  * is the same product under its category label; everything else is the
  * producer's own wording and is returned unchanged. Norwegian: unchanged.
+ *
+ * Økologi S3e: `opts.organicAllowed` (default false) is passed to the
+ * glossary — an organic word is translated only for a producer with a valid
+ * Debio status (`info.agent.debioVerified`); without it a name with an
+ * organic claim stays the producer's own Norwegian text. The category
+ * shortcut is checked the same way (no CATEGORY_MAP word is organic today;
+ * the guard keeps it so if one is added).
  */
-export function productLabel(name: string, lang: Lang): string {
+export function productLabel(name: string, lang: Lang, opts: TranslateProductNameOptions = {}): string {
   if (!name || lang === "no") return name;
   const key = CATEGORY_NAME_TO_KEY[name.trim().toLowerCase()];
-  if (key) return catLabel(key, lang);
+  if (key && (opts.organicAllowed === true || !containsOrganicClaim(name))) return catLabel(key, lang);
   // Daniel 2026-09-03: «ja kjør ordlisten for produktene også» — everything
   // that is not a bare category word goes through the curated glossary,
   // which returns the name unchanged unless every word of it is known.
-  return translateProductName(name, lang);
+  return translateProductName(name, lang, opts);
 }
 
 /** True iff a product name is exactly a known category word (any case). */
@@ -585,8 +605,8 @@ export function isCategoryWord(name: string): boolean {
  *   the number.
  * Without a price: the whole name (through productLabel) and null.
  */
-export function splitNamePrice(rawName: string, lang: Lang): { name: string; price: number | null } {
-  const whole = { name: productLabel(rawName, lang), price: null };
+export function splitNamePrice(rawName: string, lang: Lang, opts: TranslateProductNameOptions = {}): { name: string; price: number | null } {
+  const whole = { name: productLabel(rawName, lang, opts), price: null };
   const m = rawName.match(/^(.+?)\s*[–\-—]\s*(kr\.?\s*\d.*)$/i)
     || rawName.match(/^(.+?)\s+(kr\.?\s*\d.*)$/i);
   if (!m) return whole;
@@ -597,7 +617,7 @@ export function splitNamePrice(rawName: string, lang: Lang): { name: string; pri
   if (price === null) return whole;
   const depth = (s: string): number => (s.match(/\(/g) || []).length - (s.match(/\)/g) || []).length;
   const closes = Math.max(0, Math.min(depth(head), -depth(m[2])));
-  return { name: productLabel(head + ")".repeat(closes), lang), price };
+  return { name: productLabel(head + ")".repeat(closes), lang, opts), price };
 }
 
 function catEmoji(cat: string): string {
@@ -1047,7 +1067,7 @@ export function isOpenNow(openingHours: unknown, at: Date = new Date()): { isOpe
 
 // ─── PR-84: Ultra-rich card for positions 1-3 (claimed top producers) ───
 
-function producerCardUltraRich(a: any, knowledge: any, lang: Lang = "no"): string {
+function producerCardUltraRich(a: any, knowledge: any, lang: Lang = "no", organicAllowed = false): string {
   const postal = knowledge?.postalCode ? ` ${escapeHtml(knowledge.postalCode)}` : "";
   const cityText = cardLocationText(a, postal);
   const slug = slugify(a.name);
@@ -1075,7 +1095,7 @@ function producerCardUltraRich(a: any, knowledge: any, lang: Lang = "no"): strin
   let productLine = "";
   if (products.length) {
     // I-G: a text entry is its own name (it used to show as the emoji alone).
-    const top = products.slice(0, 3).map((p: any) => `${catEmoji(p.category || "")} ${escapeHtml(productLabel(productNameText(p), lang))}`).join(", ");
+    const top = products.slice(0, 3).map((p: any) => `${catEmoji(p.category || "")} ${escapeHtml(productLabel(productNameText(p), lang, { organicAllowed }))}`).join(", ");
     const more = products.length > 3 ? ` <span class="pc-more">+${products.length - 3} ${escapeHtml(lang === "en" ? "products" : "produkter")}</span>` : "";
     productLine = `<div class="pc-products">${top}${more}</div>`;
   }
@@ -1511,16 +1531,21 @@ router.get("/", (req: Request, res: Response) => {
     // (description on the row, about on the knowledge object). The rich cards
     // read the stored rating; whether it shows is RATING_DISPLAY_MODE's (S4-A1a).
     const featuredKnowledge = new Map<string, any>();
+    // Økologi S3e: whose product names may carry a translated organic word.
+    const featuredOrganicAllowed = new Set<string>();
+    const featuredDebioOff = debioSwitchOffAgentIds(featured.slice(0, 3).filter((a: any) => a.isClaimed).map((a: any) => a.id));
     // S2c-1: the owners' contact / price choices, one lookup for the page.
     const featuredChoices = publicFieldChoicesForMany(featured.slice(0, 11).filter((a: any) => a.isClaimed).map((a: any) => a.id));
     featured.forEach((a: any, i: number) => {
       if (i < 11 && a.isClaimed) {
-        featuredKnowledge.set(a.id, withoutHiddenFields(knowledgeService.getAgentInfo(a.id, { withGoogleRating: true })?.knowledge || {}, featuredChoices.get(a.id)));
+        const featuredInfo = knowledgeService.getAgentInfo(a.id, { withGoogleRating: true });
+        featuredKnowledge.set(a.id, withoutHiddenFields(featuredInfo?.knowledge || {}, featuredChoices.get(a.id)));
+        if (featuredInfo?.agent.debioVerified === true && !featuredDebioOff.has(a.id)) featuredOrganicAllowed.add(a.id);
       }
     });
     applyPublishedTranslations(featured, lang, featuredKnowledge);
     const featuredCards = featured.map((a: any, i: number) => {
-      if (i < 3 && a.isClaimed) return producerCardUltraRich(a, featuredKnowledge.get(a.id) || {}, lang);
+      if (i < 3 && a.isClaimed) return producerCardUltraRich(a, featuredKnowledge.get(a.id) || {}, lang, featuredOrganicAllowed.has(a.id));
       if (i < 11 && a.isClaimed) return producerCardMediumRich(a, featuredKnowledge.get(a.id) || {}, lang);
       return producerCard(a, undefined, lang);
     }).join("");
@@ -4125,6 +4150,199 @@ router.get("/kategori/:slug", (req: Request, res: Response) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════
+// GET /mat/:kategori/:sted — produkt×sted landing pages
+// dev-request 2026-09-24-ai-sok-bli-svaret-rfb, slice B6. The pattern of
+// Opplevagent's /kategori/:category/:kommune (one gate for route + sitemap,
+// answer-first opening, FAQPage) on the RFB catalogue; the taxonomy, the gate
+// and the text builders live in services/rfb-mat-landing.ts. Behind
+// RFB_MAT_LANDING_ENABLED (default off: the route falls through to the normal
+// 404 and the sitemap has no /mat/ entries). `/kategori/<slug>` stays the
+// sales-channel page.
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * The producers a /mat page may list and count: the public list surfaces'
+ * set (getActiveAgents(): active, vetted, listable, non-umbrella, not
+ * delisted), minus a non-producer role (the /produsent role gate), the
+ * owner's visibility.profile / visibility.search_engines choices (empty
+ * unless OWNER_FEATURES_ENFORCE is on), and the slugs the sitemap leaves out
+ * because /produsent/<slug> would 404.
+ */
+function matLandingBaseAgents(): any[] {
+  const hidden = new Set<string>([...ownerHiddenAgentIds("profile"), ...ownerHiddenAgentIds("search_engines")]);
+  return marketplaceRegistry.getActiveAgents().filter((a: any) => {
+    if (failsProducerRoleGate(a.role, false)) return false;
+    if (hidden.has(a.id)) return false;
+    const slug = slugify(String(a.name || ""));
+    return slug.length >= 2 && !SITEMAP_EXCLUDED_PRODUCER_SLUGS.has(slug);
+  });
+}
+
+/** Ids among `ids` that have an agent_knowledge row — one query. */
+function matLandingKnowledgeIds(ids: readonly string[]): Set<string> {
+  if (ids.length === 0) return new Set();
+  const rows = getDb()
+    .prepare(`SELECT agent_id FROM agent_knowledge WHERE agent_id IN (${ids.map(() => "?").join(",")})`)
+    .all(...ids) as Array<{ agent_id: string }>;
+  return new Set(rows.map((r) => r.agent_id));
+}
+
+/**
+ * THE gate for /mat/<kategori>/<sted>: the combinations the route serves and
+ * the sitemap lists, each with its listed producers. A producer counts when it
+ * passes matLandingBaseAgents() and would get a producer page in the sitemap
+ * (WO-17: a knowledge row or a claim); a combination is kept when
+ * isMatLandingComboIndexable() holds for that count. One registry pass and one
+ * knowledge lookup per call — no query per combination. `knowledgeIds` lets
+ * the sitemap reuse the knowledge rows it has already read.
+ */
+function matLandingGatedCombos(opts: {
+  only?: { categorySlug: string; placeSlug: string };
+  knowledgeIds?: (ids: readonly string[]) => Set<string>;
+} = {}): MatLandingCombo<any>[] {
+  const combos = collectMatLandingCombos(matLandingBaseAgents(), {
+    categoriesOf: (a: any) => a.categories,
+    placeSlugsOf: (a: any) => placeSlugsForCity(a.city || a.location?.city || "", a.location),
+    only: opts.only,
+  });
+  const candidateIds = new Set<string>();
+  for (const c of combos.values()) for (const a of c.producers) candidateIds.add(a.id);
+  const known = (opts.knowledgeIds ?? matLandingKnowledgeIds)([...candidateIds]);
+  const out: MatLandingCombo<any>[] = [];
+  for (const c of combos.values()) {
+    const producers = c.producers.filter((a: any) => known.has(a.id) || !!(a.claimed_by_user_id ?? a.claimed_by));
+    if (isMatLandingComboIndexable(producers.length)) out.push({ ...c, producers });
+  }
+  return out.sort((x, y) => matLandingPath(x.category.slug, x.placeSlug).localeCompare(matLandingPath(y.category.slug, y.placeSlug)));
+}
+
+/** Pickup/delivery channel counts for the listed producers (agent_salgskanal), one query; zeros on a failed read. */
+function matLandingChannels(ids: readonly string[]): MatLandingChannels {
+  const ch: MatLandingChannels = { gardsbutikk: 0, rekoRing: 0, selvplukk: 0, hjemlevering: 0 };
+  if (ids.length === 0) return ch;
+  try {
+    const rows = getDb()
+      .prepare(`SELECT DISTINCT agent_id, category_slug FROM agent_salgskanal WHERE agent_id IN (${ids.map(() => "?").join(",")})`)
+      .all(...ids) as Array<{ agent_id: string; category_slug: string }>;
+    for (const r of rows) {
+      if (r.category_slug === "gardsbutikk") ch.gardsbutikk++;
+      else if (r.category_slug === "reko-ring") ch.rekoRing++;
+      else if (r.category_slug === "selvplukk") ch.selvplukk++;
+      else if (r.category_slug === "hjemlevering") ch.hjemlevering++;
+    }
+  } catch (e) {
+    console.warn("[seo /mat] salgskanal read failed:", e);
+  }
+  return ch;
+}
+
+const MAT_LANDING_CSS = `
+  .mat-answer { font-size: 1.05rem; color: var(--charcoal); max-width: 760px; line-height: 1.6; margin-top: 8px; }
+  .mat-more { max-width: 1100px; margin: 0 auto; padding: 0 24px 24px; font-size: 0.95rem; }
+  .mat-more a { color: var(--green-700); }
+`;
+
+router.get("/mat/:kategori/:sted", (req: Request, res: Response, next: any) => {
+  if (!isRfbMatLandingEnabled()) return next();
+  // Norwegian only: the text is generated in Norwegian, so /en and /sv fall
+  // through to the 404 and the page announces no EN alternate.
+  const lang: Lang = req.lang || "no";
+  if (lang !== "no") return next();
+  const rawCat = String(req.params.kategori || "");
+  const rawPlace = String(req.params.sted || "");
+  const catSlug = rawCat.toLowerCase();
+  const placeSlug = rawPlace.toLowerCase();
+  const category = matCategoryBySlug(catSlug);
+  if (!category || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(placeSlug)) return next();
+
+  let combo: MatLandingCombo<any> | undefined;
+  try {
+    combo = matLandingGatedCombos({ only: { categorySlug: catSlug, placeSlug } })[0];
+  } catch (e) {
+    console.error(`[seo /mat] ${catSlug}/${placeSlug} gate failed:`, e);
+    return next();
+  }
+  if (!combo) return next(); // unknown or below the gate: 404, never listed
+  const path = matLandingPath(catSlug, placeSlug);
+  // Upper-case variants of a served page: one canonical URL.
+  if (rawCat !== catSlug || rawPlace !== placeSlug) return res.redirect(301, path);
+
+  try {
+    const producers = combo.producers;
+    const n = producers.length;
+    const first = producers[0];
+    const placeName = fylkeForPlaceSlug(placeSlug) ?? String(first.city || first.location?.city || placeSlug);
+    const producerNames = producers.map((a: any) => String(a.name || ""));
+    const verifiedCount = producers.filter((a: any) => a.isVerified).length;
+    const channels = matLandingChannels(producers.map((a: any) => a.id));
+    const url = BASE_URL + path;
+
+    const answerFirst = buildMatLandingAnswerFirst({ category, placeName, producerNames, channels })
+      || `${category.label} i ${placeName}.`;
+    const faqJsonLd = buildMatLandingFaqJsonLd({ category, placeName, url, producerNames, verifiedCount, channels });
+    const faqSectionHtml = rfbFaqSectionHtml(faqJsonLd, lang);
+
+    const collectionJsonLd = {
+      "@context": "https://schema.org",
+      "@type": "CollectionPage",
+      name: `${category.label} i ${placeName}`,
+      description: answerFirst,
+      url,
+      mainEntity: {
+        "@type": "ItemList",
+        numberOfItems: n,
+        itemListElement: producers.slice(0, 100).map((a: any, i: number) => ({
+          "@type": "ListItem",
+          position: i + 1,
+          url: BASE_URL + "/produsent/" + slugify(a.name),
+          name: a.name,
+        })),
+      },
+    };
+    const placeUrl = BASE_URL + "/" + placeSlug;
+    const breadcrumbJsonLd = buildBreadcrumbJsonLd([
+      { name: t(lang, "nav.home"), url: `${BASE_URL}/` },
+      { name: placeName, url: placeUrl },
+      { name: category.label, url },
+    ]);
+    const jsonLd: object[] = [collectionJsonLd, breadcrumbJsonLd];
+    if (faqJsonLd) jsonLd.push(faqJsonLd);
+
+    const placeHtml = `<span translate="no">${escapeHtml(placeName)}</span>`;
+    const cards = producers.map((a: any) => producerCard(a, undefined, lang)).join("");
+    const content = `
+    <section class="city-hero">
+      <div class="container">
+        <div class="bc" style="padding:0 0 12px;"><a href="/">${escapeHtml(t(lang, "nav.home"))}</a><span>/</span><a href="/${placeSlug}">${escapeHtml(placeName)}</a><span>/</span>${escapeHtml(category.label)}</div>
+        <h1>${escapeHtml(category.label)} fra lokale produsenter i ${placeHtml}</h1>
+        <p class="mat-answer">${escapeHtml(answerFirst)}</p>
+      </div>
+    </section>
+    <section class="sec">
+      <div class="city-grid">${cards}</div>
+    </section>
+    <div class="mat-more"><a href="/${placeSlug}">Alle lokale produsenter i ${placeHtml} →</a></div>${faqSectionHtml ? `\n    ${faqSectionHtml}` : ""}`;
+
+    const shownNames = producerNames.slice(0, 3);
+    const metaDesc = `${n} lokale produsenter av ${category.noun} i ${placeName}: ${shownNames.join(", ")}${n > shownNames.length ? " m.fl." : ""}. Kontakt produsentene direkte.`;
+    const title = `${category.label} i ${placeName} — ${n} lokale produsenter | ${getConfig().display_name}`;
+
+    recordAiPageDelivery(req, res, "ai_page_list", producers.map((a: any) => a.id));
+    res.send(shell(title, metaDesc, content, {
+      canonical: url,
+      jsonLd,
+      extraCss: CITY_CSS + MAT_LANDING_CSS + (faqSectionHtml ? FAQ_SECTION_CSS : ""),
+      lang,
+      pathForAlternate: path,
+      noEnglish: true,
+    }));
+  } catch (err) {
+    console.error(`SEO /mat/${catSlug}/${placeSlug} error:`, err);
+    res.status(500).send("Intern feil");
+  }
+});
+
 // GET /verifisert-av-eier — dev-request
 // 2026-07-30-rettfrabonden-verifisert-av-eier-badge-og-filter: browse-all page
 // for producers with agent.isVerified === true (the owner-claim/manual
@@ -5052,6 +5270,8 @@ export function buildProducerAnswerFirstOpening(params: {
   productsAreSourced?: boolean;
   /** Confirmed direct-sale-channel signal (agent_salgskanal membership, etc). */
   hasDirectSaleSignal?: boolean;
+  /** Økologi S3e: the producer has a valid Debio status (info.agent.debioVerified) — organic words may be translated. Default false. */
+  organicAllowed?: boolean;
 }): string | null {
   const lang: Lang = params.lang || "no";
   const productsAreSourced = params.productsAreSourced ?? false;
@@ -5059,7 +5279,7 @@ export function buildProducerAnswerFirstOpening(params: {
   const productNames = (params.productsList || [])
     .map((p: unknown) => productNameText(p))
     .filter(Boolean)
-    .map((n: string) => productLabel(n, lang))
+    .map((n: string) => productLabel(n, lang, { organicAllowed: params.organicAllowed === true }))
     .slice(0, 4);
   const catLabels = (params.categories || []).map((c: string) => catLabel(c, lang)).filter(Boolean).slice(0, 3);
   const usingRealProducts = productNames.length > 0 && productsAreSourced;
@@ -5293,6 +5513,49 @@ function passesRoleGate(
   return true;
 }
 
+// ─── E-mail on the producer profile (dev-request
+// 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting, slice 3: S-A1 and
+// S-A3 on rettfrabonden.com /produsent/:slug) ──────────────────────────────
+// With EMAIL_REVEAL_GUARD_RFB on, the profile page gives the producer's
+// e-mail (the mailto: line on the producer and the umbrella contact card, and
+// JSON-LD `email`) only within the per-IP limit of
+// services/email-reveal-guard.ts — one RFB counter per client, which the
+// later REST/A2A/MCP slice (S-A5) shares, and a profile seen again in the
+// window is free. Over the limit the contact card shows «Vis e-post», a plain
+// link to GET /produsent/:slug/epost (no script), and the address is nowhere
+// in the HTML; JSON-LD has no `email`. CCBot (S-A3) gets neither the address
+// nor «Vis e-post», also on its first request. With the switch on the page
+// depends on the client, so it is Cache-Control: private. Switch off:
+// revealEmailFor is not called and the page and its headers are
+// byte-identical to main. Platform addresses (kontakt@…) are not producer
+// e-mail and are left alone. The guard's log line carries profile ids and
+// counts only, never an address or an IP.
+const RFB_EMAIL_REVEAL_LABEL: Readonly<Record<Lang, string>> = { no: "Vis e-post", en: "Show e-mail", sv: "Visa e-post" };
+
+/** The path of the «Vis e-post» endpoint for a producer slug (localized like the profile). */
+export function rfbEmailRevealPath(slug: string, lang: Lang = "no"): string {
+  return localizedPath(`/produsent/${encodeURIComponent(slug)}/epost`, lang);
+}
+
+/**
+ * How the profile shows the producer's e-mail to this request: null = switch
+ * off (change nothing); "show" = as today; "reveal" = «Vis e-post» without the
+ * address; "none" = nothing (CCBot, or no e-mail shown).
+ */
+function rfbProfileEmailView(req: Request, res: Response, agentId: string, email: unknown): "show" | "reveal" | "none" | null {
+  if (!emailRevealGuardEnabled("rfb")) return null;
+  res.set("Cache-Control", "private");
+  if (!email || !agentId) return "none";
+  const allowed = revealEmailFor(req, "rfb", [agentId]);
+  if (allowed !== null && allowed.has(agentId)) return "show";
+  return isCcBotUserAgent(req.get("user-agent")) ? "none" : "reveal";
+}
+
+/** The contact-card line for «Vis e-post» (same markup as the e-mail line, the link instead of the address). */
+function rfbEmailRevealItem(slug: string, lang: Lang): string {
+  return `<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.email"))}</div><div class="ct-val"><a href="${escapeHtml(rfbEmailRevealPath(slug, lang))}" rel="nofollow">${escapeHtml(RFB_EMAIL_REVEAL_LABEL[lang] || RFB_EMAIL_REVEAL_LABEL.no)}</a></div></div></div>`;
+}
+
 router.get("/produsent/:slug", (req: Request, res: Response) => {
   const lang = req.lang;
   const slug = (req.params.slug as string).toLowerCase();
@@ -5517,6 +5780,9 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // all (getAgentInfo then filters as for a producer without status).
     const debioSwitchOff = debioSwitchOffAgentIds([agent.id]).has(agent.id);
     const info = knowledgeService.getAgentInfo(agent.id, { withGoogleRating: true, debioSwitchOff });
+    // Økologi S3e: product names on /en and /sv translate an organic word only
+    // for a producer with a valid Debio status (same signal as the badge).
+    const productOrganicOpts = { organicAllowed: info?.agent.debioVerified === true };
     // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2c-1: the owner's
     // contact / price / stats choices (null = not enforced, page as before).
     const ownerChoices = publicFieldChoices(agent.id);
@@ -5527,6 +5793,10 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     const publicCountsOn = publicCountsShown(getDb(), agent.id, `/produsent/${slugify(String(agent.name || ""))}`, ownerChoices ? ownerChoices.publicCounts : null);
     const k = withoutHiddenFields((info?.knowledge || {}) as any, ownerChoices);
     const meta = (info?.meta || {}) as any;
+    // Slice 3 (S-A1/S-A3): the e-mail this request may see. Switch off → null
+    // → k.email, exactly as before.
+    const emailView = rfbProfileEmailView(req, res, agent.id, k.email);
+    const shownEmail = emailView === null || emailView === "show" ? k.email : null;
 
     // Render-time guard: nav/boilerplate scraped text masquerading as a real
     // description must never render (dev-request 2026-07-04-rfb-datakvalitet
@@ -5758,7 +6028,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       const umbContactItems: string[] = [];
       if (k.address) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#128205;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.address"))}</div><div class="ct-val">${escapeHtml(formatAddressLine(k.address, k.postalCode, cityName))}</div></div></div>`);
       if (isDisplayablePhone(k.phone)) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#128222;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.phone"))}</div><div class="ct-val"><a href="tel:${k.phone.replace(/\s+/g, "")}">${escapeHtml(k.phone)}</a></div></div></div>`);
-      if (k.email) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.email"))}</div><div class="ct-val"><a href="mailto:${k.email}">${escapeHtml(k.email)}</a></div></div></div>`);
+      if (shownEmail) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.email"))}</div><div class="ct-val"><a href="mailto:${shownEmail}">${escapeHtml(shownEmail)}</a></div></div></div>`);
+      else if (emailView === "reveal") umbContactItems.push(rfbEmailRevealItem(slug, lang));
       if (k.website) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#127760;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.website"))}</div><div class="ct-val"><a href="${escapeHtml(addUtmParams(k.website))}" target="_blank" rel="noopener">${escapeHtml(k.website.replace(/^https?:\/\//, ""))}</a></div></div></div>`);
       // Google Maps search — search by name + (address|city), never raw coords.
       if (k.address || isDisplayablePhone(k.phone) || k.email || k.website) {
@@ -6038,7 +6309,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // is fire-and-forget and never blocks navigation, so these links keep
     // working identically with JS disabled or if the beacon call fails.
     if (isDisplayablePhone(k.phone)) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#128222;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.phone"))}</div><div class="ct-val"><a href="tel:${k.phone.replace(/\s+/g, "")}" data-track-kind="phone">${escapeHtml(k.phone)}</a></div></div></div>`);
-    if (k.email) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.email"))}</div><div class="ct-val"><a href="mailto:${k.email}" data-track-kind="email">${escapeHtml(k.email)}</a></div></div></div>`);
+    if (shownEmail) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.email"))}</div><div class="ct-val"><a href="mailto:${shownEmail}" data-track-kind="email">${escapeHtml(shownEmail)}</a></div></div></div>`);
+    else if (emailView === "reveal") contactItems.push(rfbEmailRevealItem(slug, lang));
     // Website now routes through the counting redirect (GET /ut/:agentId/website,
     // src/routes/contact-tracking.ts) instead of linking straight to
     // agent_knowledge.website. This works with JS fully disabled (it's a
@@ -6105,9 +6377,9 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           const soft = softStockOf(p, name);
           if (soft) {
             const note = `<div class="prod-stock" data-stock-confirmed-at="${escapeHtml(soft.stock_confirmed_at)}" data-needs-producer-confirmation="true" style="flex-basis:100%;font-size:0.72rem;color:var(--g500);margin-top:4px">${escapeHtml(stockSoftExpiryBuyerText(soft.stock_confirmed_at, softLang))}</div>`;
-            return `<div class="prod-item" style="flex-wrap:wrap"><span class="prod-name">${escapeHtml(productLabel(name, lang))}</span>${price}<div class="prod-meta">${seasonal}${org}</div>${note}</div>`;
+            return `<div class="prod-item" style="flex-wrap:wrap"><span class="prod-name">${escapeHtml(productLabel(name, lang, productOrganicOpts))}</span>${price}<div class="prod-meta">${seasonal}${org}</div>${note}</div>`;
           }
-          return `<div class="prod-item"><span class="prod-name">${escapeHtml(productLabel(name, lang))}</span>${price}<div class="prod-meta">${seasonal}${org}</div></div>`;
+          return `<div class="prod-item"><span class="prod-name">${escapeHtml(productLabel(name, lang, productOrganicOpts))}</span>${price}<div class="prod-meta">${seasonal}${org}</div></div>`;
         }).filter(Boolean).join("") : "";
 
     // Opening hours — guard against string data (some agents have free-text like "Man-Fre 10-17")
@@ -6172,7 +6444,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
             return `<span class="${cls}" title="${monthAbbr(m, lang)}">${monthAbbr(m, lang).charAt(0)}</span>`;
           }).join("");
           return `<div class="season-row">
-            <div class="season-name">${inSeason ? '<span class="season-live">&#9679;</span>' : ""}${escapeHtml(productLabel(product, lang))}</div>
+            <div class="season-name">${inSeason ? '<span class="season-live">&#9679;</span>' : ""}${escapeHtml(productLabel(product, lang, productOrganicOpts))}</div>
             <div class="season-bar">${monthDots}</div>
             ${note ? `<div class="season-note"${lang !== "no" ? ' lang="nb"' : ""}>${escapeHtml(note)}</div>` : ""}
           </div>`;
@@ -6277,7 +6549,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
     // Contact
     if (isDisplayablePhone(k.phone)) jsonLd.telephone = k.phone;
-    if (k.email) jsonLd.email = k.email;
+    if (shownEmail) jsonLd.email = shownEmail;
     if (k.website) jsonLd.url = k.website;
 
     // Geo coordinates
@@ -6381,7 +6653,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         if (!rawName) return null;
 
         // Parse price from name if not in price field (e.g. "Lammelår – kr 275/kg")
-        let productName = productLabel(rawName, lang);
+        let productName = productLabel(rawName, lang, productOrganicOpts);
         let priceValue = typeof p === "object" ? (p.price || "") : "";
 
         // Extract numeric price from various formats (strict parser, see parseNokPrice)
@@ -6389,7 +6661,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         if (priceNum === null) {
           // S6 del A: only a "kr" price the name shows, and the name is cut
           // only when it has one (splitNamePrice).
-          const fromName = splitNamePrice(rawName, lang);
+          const fromName = splitNamePrice(rawName, lang, productOrganicOpts);
           productName = fromName.name;
           priceNum = hidesPrices(ownerChoices) ? null : fromName.price;
         }
@@ -6578,6 +6850,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         productsAreSourced,
         hasDirectSaleSignal,
         lang,
+        organicAllowed: productOrganicOpts.organicAllowed,
       });
       if (!answerFirstOpening) {
         console.log(`[seo] /produsent/${slug}: answer-first opening skipped (insufficient real facts) — falling back to existing description block`);
@@ -7020,6 +7293,70 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
   }
 });
 
+// «Vis e-post» (slice 3, S-A1): read-only, no DB write. Only with
+// EMAIL_REVEAL_GUARD_RFB on; off → next(), so the path answers exactly as on
+// main (the app's fall-through 404) and nothing new is exposed. On: the same
+// guard and RFB counter as the profile page. Within the limit → 200 with the
+// address; over it → 429 «prøv igjen senere» without it; CCBot → 403 without
+// it; a slug with no public profile (unknown, role/vetting/listability gate,
+// owner-paused or hidden) or no e-mail → 404. Always Cache-Control: private
+// and noindex. Three path segments, so it cannot collide with
+// /produsent/:slug; /produsent/ordre/* is mounted earlier in index.ts and
+// keeps its own routes.
+router.get("/produsent/:slug/epost", (req: Request, res: Response, next) => {
+  if (!emailRevealGuardEnabled("rfb")) { next(); return; }
+  res.set("Cache-Control", "private");
+  res.set("X-Robots-Tag", "noindex, nofollow");
+  const lang: Lang = req.lang || "no";
+  const en = lang === "en";
+  const sv = lang === "sv";
+  const slug = String(req.params.slug).toLowerCase();
+  try {
+    let agent = marketplaceRegistry.getAgentBySlugIncludingUmbrellas(slug);
+    if (agent && !passesRoleGate(agent, slug)) agent = undefined;
+    if (agent && (ownerPauseEnabled() || ownerVisibilityEnforced()) && isProfileOwnerHidden(getDb(), agent.id)) agent = undefined;
+    let email: string | null = null;
+    if (agent) {
+      const info = knowledgeService.getAgentInfo(agent.id);
+      const k = withoutHiddenFields((info?.knowledge || {}) as any, publicFieldChoices(agent.id));
+      email = typeof k.email === "string" && k.email.trim() !== "" ? k.email : null;
+    }
+    const profilePath = localizedPath("/produsent/" + encodeURIComponent(slug), lang);
+    const page = (title: string, body: string) => shell(
+      title,
+      title,
+      `<div class="sec" style="padding:48px 24px 48px;max-width:720px;margin:0 auto;"><h1 style="font-size:1.6rem;margin-bottom:16px;">${escapeHtml(title)}</h1>${body}</div>`,
+      { lang, robots: "noindex, nofollow", canonical: BASE_URL + profilePath, pathForAlternate: `/produsent/${encodeURIComponent(slug)}/epost` },
+    );
+    if (!agent || !email) {
+      const title = en ? "Not found" : sv ? "Hittades inte" : "Ikke funnet";
+      res.status(404).send(page(title, `<p><a href="${localizedPath("/sok", lang)}">${en ? "Find producers →" : sv ? "Hitta producenter →" : "Finn produsenter →"}</a></p>`));
+      return;
+    }
+    const name = String(agent.name || "");
+    const title = en ? `E-mail for ${name}` : sv ? `E-post till ${name}` : `E-post til ${name}`;
+    const back = `<p style="margin-top:20px"><a href="${escapeHtml(profilePath)}">&larr; ${en ? "Back to" : sv ? "Tillbaka till" : "Tilbake til"} ${escapeHtml(name)}</a></p>`;
+    const allowed = revealEmailFor(req, "rfb", [agent.id]);
+    if (allowed !== null && allowed.has(agent.id)) {
+      res.status(200).send(page(title, `<p style="font-size:1.05rem"><a href="mailto:${escapeHtml(email)}">${escapeHtml(email)}</a></p>${back}`));
+      return;
+    }
+    if (isCcBotUserAgent(req.get("user-agent"))) {
+      res.status(403).send(page(title, `<p>${en ? "The e-mail address is not shown to this client." : sv ? "E-postadressen visas inte för den här klienten." : "E-postadressen vises ikke for denne klienten."}</p>${back}`));
+      return;
+    }
+    res.set("Retry-After", "3600");
+    res.status(429).send(page(title, `<p>${en
+      ? "The limit for how many e-mail addresses can be shown from here has been reached. Please try again later, or contact the producer by phone or through their website."
+      : sv
+        ? "Gränsen för hur många e-postadresser som kan visas härifrån är nådd. Försök igen senare, eller kontakta producenten per telefon eller via webbplatsen."
+        : "Grensen for hvor mange e-postadresser som kan vises herfra, er nådd. Prøv igjen senere, eller kontakt produsenten på telefon eller via nettsiden."}</p>${back}`));
+  } catch (err) {
+    console.error(`SEO /produsent/${slug}/epost error:`, err);
+    res.status(500).send(en ? "Internal error" : "Intern feil");
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════
 // GET /sitemap.xml
 // ═══════════════════════════════════════════════════════════════
@@ -7157,6 +7494,31 @@ export function buildSitemapXml(): string {
       }
     }
     for (const city of cities) addEntry(`/${city}`, "weekly", "0.8", cityLastmod.get(city) || today);
+
+    // dev-request 2026-09-24-ai-sok-bli-svaret-rfb, B6: the /mat/<kategori>/<sted>
+    // pages the route serves — the same matLandingGatedCombos() gate, with the
+    // knowledge rows read above. Norwegian URL only (the page has no EN
+    // version). lastmod = newest update among the listed producers. Nothing
+    // here with RFB_MAT_LANDING_ENABLED off.
+    if (isRfbMatLandingEnabled()) {
+      try {
+        const combos = matLandingGatedCombos({
+          knowledgeIds: (ids) => new Set(ids.filter((id) => knowledgeByAgent.has(id))),
+        });
+        for (const c of combos) {
+          let lm = "";
+          for (const a of c.producers) {
+            const updatedAt = parseIsoOrSqlite(knowledgeByAgent.get(a.id)?.updatedAt);
+            if (!updatedAt) continue;
+            const l = lastmodForDate(updatedAt);
+            if (l > lm) lm = l;
+          }
+          addEntry(matLandingPath(c.category.slug, c.placeSlug), "weekly", "0.6", lm || today, true);
+        }
+      } catch (e) {
+        console.error("[sitemap] /mat entries failed:", e);
+      }
+    }
 
     // PR-30: producer URLs get per-agent <lastmod> + status-driven priority/changefreq
     // WO-17: pre-flight gate filters agents that would 404 in the route handler

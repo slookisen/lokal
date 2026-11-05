@@ -1661,7 +1661,12 @@ router.get("/agents/:id/info", (req: Request, res: Response) => {
   // 404 exactly like an unknown id for a not-yet-vetted self-registered
   // agent — same "tell me about this seller" surface, same rule as
   // /produsent/:slug and /agents/:id/card.
-  if (marketplaceRegistry.isQuarantinedFromPublicView(agentId)) {
+  // dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post AC6 (Daniel's
+  // option A): the ONE exception for the armed claim-test fixture — this
+  // route (selger.html's /selger?agent=<id> lookup and the owner dashboard)
+  // serves it; card/vcard/trust and every list keep it hidden.
+  const INFO_VIEW = { claimTestFixtureInfo: true } as const;
+  if (marketplaceRegistry.isQuarantinedFromPublicView(agentId, INFO_VIEW)) {
     // S1b punkt 6 (OWNER_PAUSE_ENABLED): the owner of a paused profile still
     // loads their own /selger editor. A valid X-Claim-Token for exactly this
     // agent skips the pause check only (is_active / catalog_hidden / vetting
@@ -1670,7 +1675,7 @@ router.get("/agents/:id/info", (req: Request, res: Response) => {
     // S2c-2: the same holds for the owner's visibility.profile choice.
     const ownerRead = (ownerPauseEnabled() || ownerVisibilityEnforced()) && !!claimToken &&
       knowledgeService.getClaimByToken(claimToken)?.agentId === agentId &&
-      !marketplaceRegistry.isQuarantinedFromPublicView(agentId, { ignoreOwnerPause: true });
+      !marketplaceRegistry.isQuarantinedFromPublicView(agentId, { ignoreOwnerPause: true, ...INFO_VIEW });
     if (!ownerRead) {
       res.status(404).json({ success: false, error: "Agent ikke funnet" });
       return;
@@ -1989,13 +1994,16 @@ router.post("/agents/:id/claim", rfbClaimRequestLimiter, async (req: Request, re
   try {
     // The claim domain rule (CLAIM_DOMAIN_RULE_ENABLED, default off) may run
     // an HTTPS probe of the claimant's domain first; off = requestClaim as before.
+    // With CLAIM_AUTO_ASSESSMENT_ENABLED === "true" the new claim row also gets
+    // a record-only assessment in the background (the IP is used only for its
+    // in-memory velocity count, never stored).
     const result = await knowledgeService.requestClaimWithDomainRule(agentId, {
       claimantName: name,
       claimantEmail: email,
       claimantPhone: phone,
       source: source || 'organic',
       listedEmailWrong: listedEmailWrong === true,
-    });
+    }, { clientIp: req.ip });
 
     if (result.kind === "already_owner") {
       res.status(400).json({ success: false, error: "Du har allerede gjort krav på denne agenten. Bruk innlogging med e-post." });

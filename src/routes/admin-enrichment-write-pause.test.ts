@@ -711,6 +711,10 @@ export async function runAdminEnrichmentWritePauseTests(
         // the pause via the service to prove the writing steps stop.
         "services/rfb-enrichment-nightly.test.ts",
         "services/rfb-enrichment-nightly.ts",
+        // dev-request 2026-11-01-rfb-hold-profilen-oppdatert: the owner refresh
+        // (step 6 of the nightly run, which checks the pause) — its test file
+        // sets the pause via the service to prove the owner step stops.
+        "services/rfb-owner-refresh.test.ts",
         // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-
         // places-treffvakt (S3): the Places match guard's test file sets the
         // rfb pause via the service to prove both google-rating routes still
@@ -723,6 +727,17 @@ export async function runAdminEnrichmentWritePauseTests(
         // the pause via the service to prove the wiring.
         "routes/dental.ts",
         "routes/dental-enrichment-write-pause.test.ts",
+        // The shared dental helper (enrichmentWritePauseBlock(() => getDb("rfb"),
+        // "dental")) used by dental.ts, the admin-dental-* apply sweeps and the
+        // geocode worker, plus the sweeps' own direct pause-constant imports.
+        "services/dental-enrichment-write-pause.ts",
+        "routes/admin-dental-brreg-address-sweep.ts",
+        "routes/admin-dental-hjemmeside-cleanup.ts",
+        "routes/admin-dental-hjemmeside-discovery.ts",
+        "routes/admin-dental-offentlig-klinikk-hjemmeside-korrigering.ts",
+        "routes/admin-dental-schema-probe-sweep.ts",
+        "routes/admin-dental-wrong-entity-retro-sanitize.ts",
+        "routes/admin-dental-write-pause.test.ts",
       ].sort(),
       "ewp-125: the guard is imported by exactly the gated surfaces, the shared write primitives, its own admin route, and the test files",
     );

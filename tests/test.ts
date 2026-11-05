@@ -46,6 +46,16 @@ import conversationUiRouter, {
   renderTranscriptBody,
 } from "../src/routes/conversation-ui";
 import { swapOutModules, swappedOutModuleIds, withModulesSwappedOut } from "./module-cache";
+import { __setImportValuesHiddenForTesting } from "../src/services/dental-import-display";
+
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon
+// (F2-S10): with IMPORT_VALUES_HIDDEN on, a dental row without an org.nr.,
+// organisasjonsform and naeringskode is not public. Most dental fixtures in
+// this file and the suites it runs are such rows (they predate F2-S10), so
+// the run starts with the switch off, which gives the answers as before
+// F2-S10. src/services/dental-import-display.test.ts runs on the default
+// (on) and puts this back when it is done.
+__setImportValuesHiddenForTesting(false);
 
 // ─────────────────────────────────────────────────────────────────────────
 // SHARED GLOBAL STATE — read this before adding a new test block.
@@ -919,6 +929,25 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("bulk-load-provider-domain-dedup: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// bulk-load stamps experience_providers.name_collision at first harvest
+// (verdict.name_collision from classifyProvider) — own in-memory DBs,
+// runSerial() like the sibling bulk-load blocks.
+runSerial(async () => {
+  console.log("\n── bulk-load: name_collision stamp at first harvest ──");
+  try {
+    const { runOpplevelserBulkLoadNameCollisionTests } = require("../src/routes/opplevelser-bulk-load-name-collision.test") as
+      typeof import("../src/routes/opplevelser-bulk-load-name-collision.test");
+    const r = await runOpplevelserBulkLoadNameCollisionTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("bulk-load-name-collision: " + f);
+    console.log(`  bulk-load-name-collision: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bulk-load-name-collision: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -11209,8 +11238,10 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     /if \(isDisplayablePhone\(k\.phone\)\) umbContactItems\.push\(`<div class="ct-item">[\s\S]{0,200}tel:\$\{k\.phone/.test(seoSrc),
     "phase5.11-a5: umbrella phone uses tel: link (same pattern as producer), gated by isDisplayablePhone"
   );
+  // E-post-skjerming slice 3: the line reads shownEmail (k.email unless the
+  // EMAIL_REVEAL_GUARD_RFB limit withholds it; switch off → k.email).
   assertTrue(
-    /if \(k\.email\) umbContactItems\.push\(`<div class="ct-item">[\s\S]{0,200}mailto:\$\{k\.email/.test(seoSrc),
+    /if \(shownEmail\) umbContactItems\.push\(`<div class="ct-item">[\s\S]{0,200}mailto:\$\{shownEmail/.test(seoSrc),
     "phase5.11-a5: umbrella email uses mailto: link"
   );
   assertTrue(
@@ -23155,6 +23186,7 @@ let _pr103RestoreModules: (() => void) | null = null;
     const stats = await geocodeTick(50, {
       fetchImpl: fetchTick as unknown as typeof fetch,
       sleep: noSleep,
+      pauseBlock: () => null, // main DB (pause table) is not set up in this block
     });
 
     assertEq(stats.processed, 2,
@@ -23201,6 +23233,7 @@ let _pr103RestoreModules: (() => void) | null = null;
     const stats1 = await geocodeTick(50, {
       fetchImpl: fetchMiss as unknown as typeof fetch,
       sleep: noSleep,
+      pauseBlock: () => null, // main DB (pause table) is not set up in this block
     });
     assertEq(stats1.no_match, 1,
       "pr103-15a: first tick reports no_match=1");
@@ -23218,6 +23251,7 @@ let _pr103RestoreModules: (() => void) | null = null;
     const stats2 = await geocodeTick(50, {
       fetchImpl: fetchCount as unknown as typeof fetch,
       sleep: noSleep,
+      pauseBlock: () => null, // main DB (pause table) is not set up in this block
     });
     assertEq(stats2.processed, 0,
       "pr103-15d: second tick processed=0 (no_match row skipped)");
@@ -23240,6 +23274,7 @@ let _pr103RestoreModules: (() => void) | null = null;
     const stats = await geocodeTick(50, {
       fetchImpl: fetchUnused as unknown as typeof fetch,
       sleep: noSleep,
+      pauseBlock: () => null, // main DB (pause table) is not set up in this block
     });
     assertEq(stats.processed, 0,
       "pr103-16a: empty-address row never processed");
@@ -33567,6 +33602,18 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of g5h.failures) failures.push("opplevelser-gardssalg-5d-hardening: " + f);
     console.log(`  opplevelser-gardssalg-5d-hardening: ${g5h.passed} passed, ${g5h.failed} failed`);
 
+    // Read-only GET /admin/gardssalg-content-audit: which fields were changed
+    // by which source after time T for one producer (rollback triage). Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-content-audit-read: admin read of the content audit ──");
+    const { runOpplevelserGardssalgContentAuditReadTests } = require("../src/routes/opplevelser-gardssalg-content-audit-read.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-content-audit-read.test");
+    const gContentAuditRead = await runOpplevelserGardssalgContentAuditReadTests(false);
+    passed += gContentAuditRead.passed;
+    failed += gContentAuditRead.failed;
+    for (const f of gContentAuditRead.failures) failures.push("opplevelser-gardssalg-content-audit-read: " + f);
+    console.log(`  opplevelser-gardssalg-content-audit-read: ${gContentAuditRead.passed} passed, ${gContentAuditRead.failed} failed`);
+
     // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 3
     // (detail completeness weave): GET /admin/detail-completeness-coverage —
     // read-only, catalog-wide booking_url/phone/website coverage report over
@@ -37519,6 +37566,19 @@ const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
     failed++;
     failures.push("bestillinger-b2b2: unexpected error: " + String(err?.message || err));
   }
+  // B2b-3 (bestillinger: the owner-facing texts follow the soft-expiry rule) — own in-memory DB.
+  try {
+    const { runBestillingerB2b3Tests } = require("../src/routes/bestillinger-b2b3.test") as
+      typeof import("../src/routes/bestillinger-b2b3.test");
+    const b2b3 = await runBestillingerB2b3Tests({ log: false });
+    passed += b2b3.passed;
+    failed += b2b3.failed;
+    for (const f of b2b3.failures) failures.push("bestillinger-b2b3: " + f);
+    console.log(`  bestillinger-b2b3: ${b2b3.passed} passed, ${b2b3.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bestillinger-b2b3: unexpected error: " + String(err?.message || err));
+  }
   // Fase B1 (kjøperens handlinger via MCP + ordrekortet /ordre/:id) runs strictly after A2 (own in-memory DB).
   try {
     const { runBuyerOrderActionsFaseB1Tests } = require("../src/routes/buyer-order-actions-fase-b1.test") as
@@ -39874,6 +39934,29 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("dental-verified-claim: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S10,
+// Daniel's choice B on question 32): no public surface shows a value only the
+// May 2026 directory import gave (dental-import-display.ts): the rows without
+// an org.nr. are not public, and its addresses and websites on rows with one
+// are hidden until a real source confirms them. Swaps DENTAL_DB_PATH
+// (:memory:), ADMIN_KEY and the dental modules (restored in finally) —
+// runSerial.
+runSerial(async () => {
+  console.log("\n── dental-import-display: verdier fra katalogimporten vises ikke (F2-S10) ──");
+  try {
+    const { runDentalImportDisplayTests } = require("../src/services/dental-import-display.test") as
+      typeof import("../src/services/dental-import-display.test");
+    const did = await runDentalImportDisplayTests({ log: false });
+    passed += did.passed;
+    failed += did.failed;
+    for (const f of did.failures) failures.push("dental-import-display: " + f);
+    console.log(`  dental-import-display: ${did.passed} passed, ${did.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-import-display: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -43409,6 +43492,25 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("experiences-seo-produktby-gate: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-24-ai-sok-bli-svaret-rfb, B6: /mat/<kategori>/<sted>
+// produkt×sted landing pages on RFB — one gate (≥2 visible producers) for the
+// route and the sitemap, behind RFB_MAT_LANDING_ENABLED.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-24-ai-sok-bli-svaret-rfb B6: /mat/<kategori>/<sted> landing pages ──");
+  try {
+    const { runRfbMatLandingTests } = require("../src/routes/rfb-mat-landing.test") as
+      typeof import("../src/routes/rfb-mat-landing.test");
+    const rml = await runRfbMatLandingTests({ log: false });
+    passed += rml.passed;
+    failed += rml.failed;
+    for (const f of rml.failures) failures.push("rfb-mat-landing: " + f);
+    console.log(`  rfb-mat-landing: ${rml.passed} passed, ${rml.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-mat-landing: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -49853,6 +49955,24 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-30-fire-feil-detektor-og-varsel-ved-4xx (slice 2): P0 alert at the
+// first /fire 401/403 per agent per UTC day (in-memory DB, stubbed fetch + sender).
+runSerial(async () => {
+  console.log("\n── loop-dispatch: P0 alert at first /fire 401/403 per agent per UTC day ──");
+  try {
+    const { runAdminLoopDispatchFireAlertTests } = require("../src/routes/admin-loop-dispatch-fire-alert.test") as
+      typeof import("../src/routes/admin-loop-dispatch-fire-alert.test");
+    const fa = await runAdminLoopDispatchFireAlertTests({ log: false });
+    passed += fa.passed;
+    failed += fa.failed;
+    for (const f of fa.failures) failures.push("admin-loop-dispatch-fire-alert: " + f);
+    console.log(`  admin-loop-dispatch-fire-alert: ${fa.passed} passed, ${fa.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-loop-dispatch-fire-alert: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-19-rfb-marketing-utsending-inn-i-plattformjobben: the
 // platform-side daily RFB outreach send (services/rfb-marketing-daily.ts) —
 // guards G1–G4, dry run, reserve-before-send fail-closed, restart/second-tick
@@ -49987,6 +50107,40 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice A
+// (record-only): the owner-claim auto-assessment (claim-assessment.ts) behind
+// CLAIM_AUTO_ASSESSMENT_ENABLED. Unit block: all network/clock stubbed, pure.
+// Route block: pins getDb() to its own in-memory DB and stubs the e-mail
+// transporter, the HTTPS probe and the assessment deps (restored in
+// finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering: claim auto-assessment (slice A) ──");
+  try {
+    const { runClaimAssessmentTests } = require("../src/services/claim-assessment.test") as
+      typeof import("../src/services/claim-assessment.test");
+    const r = await runClaimAssessmentTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("claim-assessment: " + f);
+    console.log(`  claim-assessment: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("claim-assessment: unexpected error: " + String(err?.message || err));
+  }
+  try {
+    const { runRfbClaimVurderingTests } = require("../src/routes/rfb-claim-vurdering.test") as
+      typeof import("../src/routes/rfb-claim-vurdering.test");
+    const r = await runRfbClaimVurderingTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-claim-vurdering: " + f);
+    console.log(`  rfb-claim-vurdering: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-claim-vurdering: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // Claim rule slice 1b, shared address ("delt adresse"): no code on any path
 // (rule 1, P1, P2) to an address that is the known e-mail of more than one
 // RFB profile → pending_review shared_address. Pins getDb() to its own
@@ -50051,6 +50205,26 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("rfb-claim-k5-gratulerer: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice
+// C1: POST /admin/agents/claim-revoke puts the profile back from the pre-grant
+// snapshot. Pins getDb() to its own in-memory DB, runs an in-process server,
+// sets ADMIN_KEY (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-30-rfb-eierkrav C1: admin claim-revoke restores the profile ──");
+  try {
+    const { runRfbClaimRevokeTests } = require("../src/routes/rfb-claim-revoke.test") as
+      typeof import("../src/routes/rfb-claim-revoke.test");
+    const rv = await runRfbClaimRevokeTests({ log: false });
+    passed += rv.passed;
+    failed += rv.failed;
+    for (const f of rv.failures) failures.push("rfb-claim-revoke: " + f);
+    console.log(`  rfb-claim-revoke: ${rv.passed} passed, ${rv.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-claim-revoke: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -50535,6 +50709,30 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("rfb-enrichment-nightly: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-11-01-rfb-hold-profilen-oppdatert («Hold profilen
+// oppdatert»): the owner refresh as the nightly run's last step behind
+// OWNER_AUTO_UPDATES_ENABLED — AC1/AC2 (fill_empty / never / automatic, the
+// never list, owner-saved and CS-locked fields), AC3 (the unowned cohort and
+// writes identical flag off vs on), AC4 (the owner-portal card for every
+// verified owner, «Mine valg» shows the same value, flag off = no card, no
+// write), AC5 (change-log rows with source), guards, preview, the probe's
+// choice rows. Fresh in-memory DB per block (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-01-rfb-hold-profilen-oppdatert: rfb-owner-refresh ──");
+  try {
+    const { runRfbOwnerRefreshTests } = require("../src/services/rfb-owner-refresh.test") as
+      typeof import("../src/services/rfb-owner-refresh.test");
+    const ror = await runRfbOwnerRefreshTests({ log: false });
+    passed += ror.passed;
+    failed += ror.failed;
+    for (const f of ror.failures) failures.push("rfb-owner-refresh: " + f);
+    console.log(`  rfb-owner-refresh: ${ror.passed} passed, ${ror.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-owner-refresh: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -51055,6 +51253,27 @@ runSerial(async () => {
   }
 });
 
+// Eierportal testrunde 1, T6 («felles drakt, lys og mørk»): shared colour
+// tokens on «Mine valg», the portal and the owner's «Mine ordrer» list —
+// contrast ≥ 4.5:1 / 3:1 in both themes, no colour inline styles for an
+// allowlisted subject, byte-identical off the list, buyer card untouched.
+// Swaps getDb() + the cart DB + env (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── eierportal testrunde 1 T6: felles drakt, lys og mørk ──");
+  try {
+    const { runOwnerUiTokensT6Tests } = require("../src/routes/owner-ui-tokens-t6.test") as
+      typeof import("../src/routes/owner-ui-tokens-t6.test");
+    const r = await runOwnerUiTokensT6Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-ui-tokens-t6: " + f);
+    console.log(`  owner-ui-tokens-t6: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-ui-tokens-t6: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-21 live-go handlevogn-pilot og første handel, skive 2:
 // one-time order activation link (AC8). Swaps the getDb() singleton and env
 // (restored in finally) — runSerial, tail position.
@@ -51364,6 +51583,29 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post AC6 (option A):
+// POST /admin/test-claim-fixture — ONE hidden, unclaimed claim-test profile;
+// GET /agents/:id/info is its only public exception; the claim flow end to end
+// (selger.html in node:vm), reset, retire, the write pins, the pipeline
+// exclusions and POST /admin/test-producer unchanged. Swaps getDb(), env, the
+// mail transport, global fetch and the pipeline seams (restored in finally) —
+// runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post AC6: POST /admin/test-claim-fixture ──");
+  try {
+    const { runAdminTestClaimFixtureTests } = require("../src/routes/admin-test-claim-fixture.test") as
+      typeof import("../src/routes/admin-test-claim-fixture.test");
+    const r = await runAdminTestClaimFixtureTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-test-claim-fixture: " + f);
+    console.log(`  admin-test-claim-fixture: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-test-claim-fixture: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2d-2 (AC22): «Vis som
 // offentlig» — X-Admin-Key + ?as_public=1 evaluates the hidden test fixture as
 // public on the covered surfaces (no-store, noindex, no shared cache), owner
@@ -51452,6 +51694,13 @@ runSerial(async () => {
 // slice 1: the per-IP e-mail limit (services/email-reveal-guard.ts — switch
 // per host, default off; CCBot never; shared counter per host) and its wiring
 // into Finn-tannlege REST (/api/tannlege/agents[/:id]) and A2A message/send.
+// Slice 2 adds the clinic profile pages and the «Vis e-post» endpoint (same
+// counter; switch off = byte-identical pages).
+// Slice 3 adds the RFB producer profile page and its «Vis e-post» endpoint
+// (EMAIL_REVEAL_GUARD_RFB, the rfb counter; switch off = byte-identical).
+// Slice 4 adds the Opplevagent gårdssalg producer profile page and its «Vis
+// e-post» endpoint (EMAIL_REVEAL_GUARD_EXPERIENCES, the experiences counter;
+// switch off = byte-identical).
 // Switch off = byte-identical answers; MCP tannlege_info untouched. Sets env
 // flags and swaps the dental db-factory (restored in finally) — runSerial,
 // tail position.
@@ -51460,6 +51709,12 @@ runSerial(async () => {
   for (const [label, load] of [
     ["email reveal guard", () => (require("../src/services/email-reveal-guard.test") as typeof import("../src/services/email-reveal-guard.test")).runEmailRevealGuardTests({ log: false })],
     ["dental email reveal guard", () => (require("../src/routes/dental-email-reveal-guard.test") as typeof import("../src/routes/dental-email-reveal-guard.test")).runDentalEmailRevealGuardTests({ log: false })],
+    // slice 2: the clinic profile pages (/klinikk/:slug, /klinikk/id/:id) and «Vis e-post» (GET /klinikk/id/:id/epost).
+    ["dental profile email reveal", () => (require("../src/routes/dental-profile-email-reveal.test") as typeof import("../src/routes/dental-profile-email-reveal.test")).runDentalProfileEmailRevealTests({ log: false })],
+    // slice 3: the RFB producer profile page (/produsent/:slug, producer + umbrella card) and «Vis e-post» (GET /produsent/:slug/epost).
+    ["rfb profile email reveal", () => (require("../src/routes/rfb-profile-email-reveal.test") as typeof import("../src/routes/rfb-profile-email-reveal.test")).runRfbProfileEmailRevealTests({ log: false })],
+    // slice 4: the Opplevagent gårdssalg profile page (/kategori/gardssalg/produsent/:providerSlug) and «Vis e-post» (…/:providerSlug/epost).
+    ["experiences profile email reveal", () => (require("../src/routes/experiences-profile-email-reveal.test") as typeof import("../src/routes/experiences-profile-email-reveal.test")).runExperiencesProfileEmailRevealTests({ log: false })],
   ] as Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]>) {
     try {
       const r = await load();
@@ -51494,6 +51749,24 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("dental-enrichment-write-pause: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Same fence on the admin-dental-* apply sweeps + the geocode worker (own
+// in-memory dental/main DBs, restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dental skrivepause: admin-dental-* apply-sveip + geocode-worker ──");
+  try {
+    const { runAdminDentalWritePauseTests } = require("../src/routes/admin-dental-write-pause.test") as
+      typeof import("../src/routes/admin-dental-write-pause.test");
+    const r = await runAdminDentalWritePauseTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-dental-write-pause: " + f);
+    console.log(`  admin-dental-write-pause: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-dental-write-pause: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -51885,6 +52158,30 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-02-rfb-endringslogg-lettlest (E1–E3): the portal's
+// «Endringslogg» / GET my-audit in plain Norwegian — the field table (fail
+// closed), readable values, «Du» / «Rett fra Bonden» / «Automatisk fra
+// nettsiden din», no notes / e-mail addresses / hidden fields in the JSON;
+// real portal save, nightly owner refresh and claim-test fixture rows; the
+// portal script on the real answer; the empty state. Swaps the getDb()
+// singleton, env vars, console.log, fetch, the fixture route's DB override
+// and the registry caches (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── Endringslogg lett å lese (my-audit) ──");
+  try {
+    const { runOwnerAuditLogTests } = require("../src/routes/owner-audit-log.test") as
+      typeof import("../src/routes/owner-audit-log.test");
+    const r = await runOwnerAuditLogTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-audit-log: " + f);
+    console.log(`  owner-audit-log: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-audit-log: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // Opplevagent «For tilbydere» with sections and FAQ (dev-request O4 = G4,
 // slice O4a): flag off = old page unchanged; flag on = ten section ids + top
 // menu, FAQPage JSON-LD == visible accordion, price text from price-message.ts,
@@ -51903,6 +52200,50 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("experiences-for-tilbydere-faq: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse (RFB +
+// gårdssalg): the producer description from the «Om oss» page, behind
+// ENRICHMENT_ABOUT_PAGE_ENABLED (default OFF) with a dry-run-only
+// about_page_preview. Three suites: the pure switch/extractor/choice; the RFB
+// homepage-content-refresh wiring (swaps the getDb() singleton and, for the
+// route cases, globalThis.fetch); the gårdssalg content-refresh wiring (swaps
+// the experiences DB module cache, env vars and globalThis.fetch). Everything
+// is restored in finally — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── about-page-candidate: «Om oss» til produsentbeskrivelsen (RFB + gårdssalg) ──");
+  const suites: Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]> = [
+    [
+      "about-page-candidate",
+      async () =>
+        (require("../src/services/about-page-candidate.test") as typeof import("../src/services/about-page-candidate.test"))
+          .runAboutPageCandidateTests({ log: false }),
+    ],
+    [
+      "homepage-content-refresh-about-page",
+      () =>
+        (require("../src/routes/homepage-content-refresh-about-page.test") as typeof import("../src/routes/homepage-content-refresh-about-page.test"))
+          .runHomepageContentRefreshAboutPageTests({ log: false }),
+    ],
+    [
+      "opplevelser-gardssalg-about-page-candidate",
+      () =>
+        (require("../src/routes/opplevelser-gardssalg-about-page-candidate.test") as typeof import("../src/routes/opplevelser-gardssalg-about-page-candidate.test"))
+          .runOpplevelserGardssalgAboutPageCandidateTests({ log: false }),
+    ],
+  ];
+  for (const [label, runSuite] of suites) {
+    try {
+      const r = await runSuite();
+      passed += r.passed;
+      failed += r.failed;
+      for (const f of r.failures) failures.push(`${label}: ` + f);
+      console.log(`  ${label}: ${r.passed} passed, ${r.failed} failed`);
+    } catch (err: any) {
+      failed++;
+      failures.push(`${label}: unexpected error: ` + String(err?.message || err));
+    }
   }
 });
 

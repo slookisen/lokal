@@ -464,9 +464,14 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
         if (typeof v === "string") strings.push(v);
         else if (v && typeof v === "object") Object.values(v).forEach(walk);
       };
-      walk(importData);
+      // F2-S10 (b): the org.nr. map and its input hashes are checked by
+      // dental-import-display.test.ts (org.nr. and column names only).
+      const { fields_by_org_nr: _fields, meta: importMeta, ...counted } = importData ?? {};
+      const { fields_by_org_nr: _fieldsMeta, ...ownMeta } = importMeta ?? {};
+      walk({ meta: ownMeta, ...counted });
+      walk(_fieldsMeta?.description);
       const WEB = /https?:|www\.|\b[a-z0-9-]+\.(?:no|com|net|org)\b/i;
-      assertEq(Object.keys(importData ?? {}), ["meta", "enhetsregisteret_search", "directory_import"], "a24: the data file has counts, nothing else (no rows)");
+      assertEq(Object.keys(importData ?? {}), ["meta", "enhetsregisteret_search", "directory_import", "fields_by_org_nr"], "a24: the data file has counts and the F2-S10 org.nr. map, nothing else (no rows)");
       assertTrue(strings.length > 0 && !strings.some((t) => WEB.test(t)) && strings.every((t) => (t.match(/\d{4}/g) ?? []).every((d) => d === "2026")),
         "a24b: … and its text has no web address and no four-digit number but the year", strings.find((t) => WEB.test(t) || (t.match(/\d{4}/g) ?? []).some((d) => d !== "2026")));
       if (imp) {
@@ -492,11 +497,16 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
         assertTrue([imp.name_nb, imp.label_nb!, imp.method_nb, imp.date_nb, brreg.method_nb].every((t) => t.includes(month.nb)) &&
           [imp.name_en, imp.label_en!, imp.method_en, imp.date_en, brreg.method_en].every((t) => t.includes(month.en)),
           "a28b: the import's name, label, method and date, and Brreg's method, give the run date's month");
-        assertTrue(imp.method_nb.includes("for oppføringer uten organisasjonsnummer") && imp.method_nb.includes("tomme adresser, telefonnumre og nettsteder på en del klinikker med organisasjonsnummer") &&
-          imp.method_nb.endsWith("Verdiene er ikke hentet på nytt, og ingen kilde er lagret per felt.") &&
-          imp.method_en.includes("for listings without an organisation number") && imp.method_en.includes("empty addresses, phone numbers and websites on some clinics with an organisation number") &&
-          imp.method_en.endsWith("The values have not been fetched again, and no source is stored per field."),
-          "a29: the method: rows without an org.nr. from the import, empty fields filled on some with one, no source per field", `${imp.method_nb} / ${imp.method_en}`);
+        // F2-S10 (d): addresses and websites only (the phone numbers it filled
+        // were the Brreg mobile number), and the values are not shown.
+        assertTrue(imp.method_nb.includes("for oppføringer uten organisasjonsnummer") && imp.method_nb.includes("tomme adresser og nettsteder på en del klinikker med organisasjonsnummer") &&
+          imp.method_nb.includes("Verdiene er ikke hentet på nytt, og ingen kilde er lagret per felt.") &&
+          imp.method_nb.endsWith("Verdiene vises ikke på Finn-tannlege før de er hentet på nytt fra en offisiell kilde: fylkeskommunens tannhelseside, Enhetsregisteret eller klinikkens eget nettsted.") &&
+          imp.method_en.includes("for listings without an organisation number") && imp.method_en.includes("empty addresses and websites on some clinics with an organisation number") &&
+          imp.method_en.includes("The values have not been fetched again, and no source is stored per field.") &&
+          imp.method_en.endsWith("The values are not shown on Finn-tannlege until they have been fetched again from an official source: the county's dental health service page, the Central Coordinating Register for Legal Entities (Enhetsregisteret) or the clinic's own website.") &&
+          !/telefonnumre|phone numbers/.test(`${imp.method_nb} ${imp.method_en}`),
+          "a29: the method: rows without an org.nr. from the import, empty addresses and websites filled on some with one, no source per field, not shown until fetched again from an official source", `${imp.method_nb} / ${imp.method_en}`);
         assertEq([imp.date_nb, imp.date_en], ["Ingen dato per felt. Verdiene er fra mai 2026.", "No date per field. The values are from May 2026."], "a29b: the date: none per field");
       }
       // Brreg applies to clinics with an org.nr., and the clinic list was built
