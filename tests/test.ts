@@ -52027,6 +52027,25 @@ runSerial(async () => {
   }
 });
 
+// økologi S3f: read-only GET /admin/debio/organic-claims-summary (daily
+// organic-word counts per Debio status, unverified alert + sample). Pins the
+// getDb() singleton and sets ADMIN_KEY (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── økologi S3f: daglig opptelling av økologi-ord ──");
+  try {
+    const { runOrganicClaimsSummaryS3fTests } = require("../src/services/organic-claims-summary-s3f.test") as
+      typeof import("../src/services/organic-claims-summary-s3f.test");
+    const r = await runOrganicClaimsSummaryS3fTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("organic-claims-summary-s3f: " + f);
+    console.log(`  organic-claims-summary-s3f: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("organic-claims-summary-s3f: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // A2A dev-request 2026-10-21-rfb-produktimport-fra-egen-nettside, Skive 1:
 // product extractor (Shopify / WooCommerce / JSON-LD / grounded LLM tiers,
 // robots.txt, same-host + SSRF) and the flag-gated dry-run measurement
