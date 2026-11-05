@@ -238,10 +238,15 @@ export function parseAboutJudgeReply(text: string, pageCount: number): Omit<Abou
  * Does every factual claim in `about` have support in `pages`? Never throws.
  * Only the about text and the page texts are sent to the model.
  */
-export async function judgeAboutAgainstPages(params: {
-  about: string;
-  pages: AboutJudgePage[];
-}): Promise<AboutJudgeVerdict> {
+export async function judgeAboutAgainstPages(
+  params: {
+    about: string;
+    pages: AboutJudgePage[];
+  },
+  // Optional extra abort signal (refreshHomepageContent bounds the call by
+  // its own deadline); an abort reads as a timeout. Absent = unchanged.
+  io?: { signal?: AbortSignal },
+): Promise<AboutJudgeVerdict> {
   const about = (params.about || "").trim().slice(0, ABOUT_JUDGE_CANDIDATE_CHAR_CAP);
   // Not filtered: bestPage indexes into the caller's own page list.
   const pages = params.pages;
@@ -257,7 +262,9 @@ export async function judgeAboutAgainstPages(params: {
   if (hit && Date.now() - hit.at < CACHE_TTL_MS) return { ...hit.verdict, cached: true };
   if (hit) verdictCache.delete(cacheKey);
 
-  const signal = AbortSignal.timeout(judgeTimeoutMs);
+  const signal = io?.signal
+    ? AbortSignal.any([AbortSignal.timeout(judgeTimeoutMs), io.signal])
+    : AbortSignal.timeout(judgeTimeoutMs);
   let response: Awaited<ReturnType<typeof fetch>>;
   try {
     response = await raceAbort(

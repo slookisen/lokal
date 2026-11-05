@@ -17,6 +17,8 @@ import {
   type TopProducerRow,
   type CityStatsRow,
   type UmbrellaTrafficBucket,
+  computeAiAgentBreakdown,
+  AI_AGENT_RAW_MAX_HOURS,
 } from "../services/admin-stats-compute";
 import { computeTrafficReport, deviceForSession, type TrafficReport } from "../services/traffic-report";
 import { computeHistoryView, type HistoryView } from "../services/traffic-history-compute";
@@ -300,6 +302,28 @@ router.get("/utm", (req: Request, res: Response) => {
     timestamp: new Date().toISOString(),
     utm: analyticsService.getUtmBreakdown(hours, parseVertical(req)),
   });
+});
+
+/**
+ * GET /admin/analytics/ai-agents?hours=24&days=90&vertical=
+ * ai-sok B5: views per AI agent (OAI-SearchBot vs ChatGPT-User vs GPTBot, …)
+ * from raw rows (`raw`, last `hours`, max 168) and, separately, from the
+ * nightly rollup (`rollup`, rolled-up days within the last `days`, max 400).
+ */
+router.get("/ai-agents", (req: Request, res: Response) => {
+  try {
+    const hours = parseInt(req.query.hours as string) || 24;
+    const days = parseInt(req.query.days as string) || 90;
+    const out = computeAiAgentBreakdown(getDb(), hours, days, parseVertical(req), Date.now());
+    res.json({
+      timeframe: `last ${Math.max(1, Math.min(AI_AGENT_RAW_MAX_HOURS, hours))} hours (raw)`,
+      timestamp: new Date().toISOString(),
+      ...out,
+    });
+  } catch (err) {
+    console.error("[analytics] ai-agents error:", err);
+    res.status(500).json({ error: "ai-agents breakdown failed" });
+  }
 });
 
 /**

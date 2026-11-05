@@ -4,6 +4,7 @@ import path from "path";
 import { getDb, closeDb } from "./database/init";
 import { runTrafficHistoryJob, startTrafficHistoryScheduler } from "./services/traffic-history";
 import { flushAiDeliveries, startAiDeliveriesFlusher } from "./services/profile-ai-deliveries";
+import { flushAiClicks, startAiClicksFlusher } from "./services/profile-ai-clicks";
 import { runWalCheckpoints, getWalSizes } from "./services/wal-maintenance";
 import { isNameFtsEnabled, syncAgentsNameFts } from "./services/name-search-fts";
 import { createOffsiteBackupTick, getOffsiteBackupHealth, OFFSITE_TICK_MS } from "./services/offsite-backup";
@@ -48,6 +49,7 @@ import agentReadinessRoutes from "./routes/agent-readiness";
 import { linkHeaders, markdownNegotiation } from "./middleware/agent-discovery";
 import { trackSelgerHtmlOpen } from "./middleware/analytics";
 import { langMiddleware } from "./i18n/middleware";
+import { asPublicViewMiddleware } from "./middleware/as-public-view";
 import { analyticsService, shouldRunAutoPrune } from "./services/analytics-service";
 import { mcpUsageLogger } from "./services/mcp-usage-logger";
 import { startEventLoopMonitor, requestTrackerMiddleware, trackJob, getEventLoopSummary } from "./services/event-loop-monitor";
@@ -86,6 +88,12 @@ import {
 } from "./services/rfb-enrichment-nightly";
 import adminRunVerifierRoutes, { runVerifierTick, isVerifierWindowHour } from "./routes/admin-run-verifier";
 import adminRunDentalVerifierRoutes from "./routes/admin-run-dental-verifier";
+import { runDentalVerifierBatch } from "./services/dental-verifier";
+import {
+  shouldRunDentalVerifierScheduler,
+  resolveDentalVerifierSchedulerBatchSize,
+  DENTAL_VERIFIER_SCHEDULER_INTERVAL_MS,
+} from "./services/dental-verifier-scheduler";
 import adminSecondLineJudgePreviewRoutes from "./routes/admin-second-line-judge-preview";
 import adminLoopHeartbeatRoutes from "./routes/admin-loop-heartbeat";
 import adminLoopDispatchRoutes, { parseRoutines, runDispatchTick } from "./routes/admin-loop-dispatch";
@@ -93,10 +101,13 @@ import { resolveTickIntervalMin } from "./services/loop-dispatch";
 import adminRunPlatformVerifierRoutes from "./routes/admin-run-platform-verifier";
 import adminVerifierSweepStatusRouter from "./routes/admin-verifier-sweep-status";
 import ownerPortalRoutes from "./routes/owner-portal";
+import ownerProductImportRoutes from "./routes/owner-product-import";
+import ownerProductOutreachRoutes from "./routes/owner-product-outreach";
 import ownerFeaturesRoutes from "./routes/owner-features";
 import ownerOrdersRoutes from "./routes/owner-orders";
 import buyerOrderCardRoutes from "./routes/buyer-order-card";
 import avmeldRoutes from "./routes/avmeld";
+import stockCheckRoutes from "./routes/stock-check";
 import gardssalgClaimRoutes, { GARDSSALG_CLAIM_PATH_PREFIXES, gardssalgClaimHostGate } from "./routes/gardssalg-claim";
 import resendWebhookRoutes from "./routes/resend-webhook";
 import { createAgentplatformHostGate } from "./routes/agentplatform-site";
@@ -120,12 +131,17 @@ import adminAgentsContentCorrectionRoutes from "./routes/admin-agents-content-co
 import adminAgentsThemeSpamSweepRoutes from "./routes/admin-agents-theme-spam-sweep";
 import adminAgentsCategoryDescriptionProvenanceAuditRoutes from "./routes/admin-agents-category-description-provenance-audit";
 import adminAgentsFylkeContradictionAuditRoutes from "./routes/admin-agents-fylke-contradiction-audit";
+import adminAgentsFacebookTierShadowRoutes from "./routes/admin-agents-facebook-tier-shadow";
 import adminDrinkCoverageRoutes from "./routes/admin-drink-coverage";
 import adminEnrichmentWritePauseRoutes from "./routes/admin-enrichment-write-pause";
 import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-merge";
 import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
 import adminAgentsBusinessTypeRoutes from "./routes/admin-agents-business-type";
 import adminTestProducerRoutes from "./routes/admin-test-producer";
+import adminTestClaimFixtureRoutes from "./routes/admin-test-claim-fixture";
+import adminOwnerFeaturesInterestRoutes from "./routes/admin-owner-features-interest";
+import adminOwnerFeaturesSwitchProbeRoutes from "./routes/admin-owner-features-switch-probe";
+import adminGardssalgSwitchProbeRoutes from "./routes/admin-gardssalg-switch-probe";
 import adminAgentsClaimBackfillRoutes from "./routes/admin-agents-claim-backfill";
 import adminAgentsTerminalReparkRoutes from "./routes/admin-agents-terminal-repark";
 import adminAgentsDuplicateSlugsRoutes from "./routes/admin-agents-duplicate-slugs";
@@ -157,6 +173,8 @@ import adminHanenRoutes, { publicRouter as publicHanenRoutes } from "./routes/ad
 import adminDebioCrossCheckRoutes from "./routes/admin-debio-cross-check";
 import adminSalgskanalRoutes from "./routes/admin-salgskanal";
 import adminJobsRoutes from "./routes/admin-jobs";
+import adminProductImportRoutes from "./routes/admin-product-import";
+import { productImportDryRunEnabled, resumeProductImportDryRunOnBoot } from "./services/product-import/dry-run";
 import platformTriggersRoutes, { adminRouter as adminTriggersRoutes } from "./routes/platform-triggers";
 import crmRoutes from "./routes/crm";
 import { mountBillingRoutes } from "./routes/admin-billing";
@@ -176,6 +194,7 @@ import {
   EXPERIENCES_GEOCODE_BOOT_DELAY_MS,
 } from "./services/boot-job-gate";
 import { syncDebioVerifications } from "./services/debio-verification-service";
+import { syncDebioRegister, debioRegisterSyncEnabled, enforceDebioRegisterFreshness } from "./services/debio-register-sync";
 import { runSalgskanalSweep } from "./services/salgskanal-matcher";
 
 // Seed-knowledge loaded dynamically — only used if DB is empty
@@ -322,6 +341,12 @@ app.use(markdownNegotiation);
 
 // Detect /en prefix → req.lang. Must run before any HTML route.
 app.use(langMiddleware);
+
+// «Vis som offentlig» (dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2d-2):
+// X-Admin-Key + ?as_public=1 on a public RFB surface → the hidden test fixture
+// is evaluated as public (no-store, noindex). After langMiddleware so /en paths
+// are matched stripped; anything else passes through untouched.
+app.use(asPublicViewMiddleware);
 
 // ─── POST /webhooks/resend (owner decision 2026-09-29 «Blacklist bounces») ──
 // Svix-signed Resend events → email_bounces only (hard bounce / spam
@@ -532,9 +557,21 @@ app.use("/", ownerPortalRoutes);
 // (GET/PUT /api/owner/:id/features). Same owner session + isVerifiedOwner;
 // 404 for every subject not in OWNER_FEATURES_ALLOWED_SUBJECTS (default empty).
 app.use("/", ownerFeaturesRoutes);
+// dev-request 2026-10-21-rfb-produktimport-fra-egen-nettside, Skive 3-1: owner product import
+// from the profile's own website (/api/agents/:id/product-import[/fetch|/runs/:runId[/publish]]).
+// Flag PRODUCT_IMPORT_ENABLED (default off → 404); same owner session + isVerifiedOwner + is_verified=1.
+app.use("/", ownerProductImportRoutes);
+// Skive 3b-2: the signed outreach landing page /eier/:id/varer/forslag?t=… (GET list / POST «Bekreft og legg inn»).
+// Flag PRODUCT_IMPORT_OUTREACH_ENABLED (default off → 404); token + owner session + isVerifiedOwner + is_verified=1.
+app.use("/", ownerProductOutreachRoutes);
 // dev-request 2026-10-21-rfb-mine-ordrer (Fase A2): «Mine ordrer» for owners
 // (/eier/:id/ordrer, session) and the per-order e-mail view (/produsent/ordre/:token/kompakt).
 app.use("/", ownerOrdersRoutes);
+// B2 (rfb-bestillinger): /lagerstatus/:token — the stock-check reminder's
+// confirm link (GET shows, POST confirms). 404 while STOCK_CHECK_EMAIL_ENABLED
+// is off, and (B1a) for a producer off OWNER_FEATURES_ALLOWED_SUBJECTS. See
+// routes/stock-check.ts.
+app.use("/", stockCheckRoutes);
 // Fase B1: the buyer's order card (/ordre/:id?ref=<buyer_ref>), linked from the buyer receipts.
 app.use("/", buyerOrderCardRoutes);
 // dev-request 2026-10-21 live-go handlevogn-pilot, skive 2: one-time activation
@@ -895,6 +932,10 @@ app.use(
 // feil-adresse, Mål 1): read-only list of RFB producers whose name suffix and city point to
 // different fylker. Mount BEFORE /admin/agents like the siblings above.
 app.use("/admin/agents/fylke-contradiction-audit", adminLimiter, adminAgentsFylkeContradictionAuditRoutes);
+// GET /admin/agents/facebook-tier-shadow (enrichment-kadens S1a): read-only shadow count of
+// RFB profiles that would lose address/phone agreement if facebook_official_page stopped
+// corroborating those fields. After S1b that rule is live, so it always reports would_lose=0. Mount BEFORE /admin/agents like the siblings above.
+app.use("/admin/agents/facebook-tier-shadow", adminLimiter, adminAgentsFacebookTierShadowRoutes);
 app.use("/admin/agents/drink-coverage", adminLimiter, adminDrinkCoverageRoutes);
 // GET/POST /admin/enrichment-write-pause (dev-request 2026-08-20-enrichment-
 // write-pause-mekanisk-gjerde, P1) — the per-vertical enrichment write-pause
@@ -918,6 +959,18 @@ app.use("/admin/agents/business-type", adminLimiter, adminAgentsBusinessTypeRout
 // orders (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt):
 // dry-run default, arm/retire, refuses every non-fixture row.
 app.use("/admin/test-producer", adminLimiter, adminTestProducerRoutes);
+// POST /admin/test-claim-fixture — the ONE hidden, UNCLAIMED claim-test profile
+// (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post AC6): dry-run
+// default, arm (create/reset) / retire, refuses every other row.
+app.use("/admin/test-claim-fixture", adminLimiter, adminTestClaimFixtureRoutes);
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2e: «Gi meg beskjed» counts per planned key (read-only).
+app.use("/admin/owner-features/interest", adminLimiter, adminOwnerFeaturesInterestRoutes);
+// S2d-3: the switch probe («bryterprobe») on the hidden test producer — behind
+// OWNER_FEATURES_SWITCH_PROBE_ENABLED=1 (default off → 404), dry-run by default.
+app.use("/admin/owner-features/switch-probe", adminLimiter, adminOwnerFeaturesSwitchProbeRoutes);
+// dev-request 2026-10-22-opplevagent-mine-valg-gardssalg O2b: the Opplevagent «Mine valg» switch probe
+// on the hidden gårdssalg test producer — behind OA_OWNER_FEATURES_SWITCH_PROBE_ENABLED=1 (default off → 404).
+app.use("/admin/gardssalg/owner-features/switch-probe", adminLimiter, adminGardssalgSwitchProbeRoutes);
 // POST /admin/agents/claim-backfill — one-shot claimed_at backfill for verified
 // claims (dev-request 2026-10-01-rfb-eierkrav-utelates-fra-outreach). Mount BEFORE /admin/agents.
 app.use("/admin/agents/claim-backfill", adminLimiter, adminAgentsClaimBackfillRoutes);
@@ -1188,6 +1241,10 @@ app.use("/api/marketplace/hanen", publicHanenRoutes);
 app.use("/admin/debio", adminLimiter, adminDebioCrossCheckRoutes);
 // dev-request 2026-07-06-rfb-salgskanal-kategorier: salgskanal auto-matcher sweep — POST /admin/salgskanal/sync
 app.use("/admin/salgskanal", adminLimiter, adminSalgskanalRoutes);
+// dev-request 2026-10-21-rfb-produktimport-fra-egen-nettside, Skive 1: dry-run measurement of the
+// product extractor — POST/GET /admin/product-import/dry-run[/:id]. Flag PRODUCT_IMPORT_DRYRUN_ENABLED
+// (default off → 404); writes only product_import_runs/_results, never agent_knowledge/products.
+app.use("/admin/product-import", adminLimiter, adminProductImportRoutes);
 // PR-65 (2026-05-17): in-memory job tracker for ?async=1 admin endpoints — GET /admin/jobs[/:id]
 app.use("/admin", adminLimiter, adminJobsRoutes);
 // Phase 0: admin product backfill endpoint
@@ -1552,6 +1609,9 @@ app.listen(Number(PORT), HOST, async () => {
   // in-memory delivery counts are written as daily sums every minute and on
   // shutdown (below).
   startAiDeliveriesFlusher();
+  // «Klikk fra AI-svar» (dev-request 2026-10-14-klikk-fra-ai-svar-per-profil,
+  // slice 2): the same minute flush + shutdown flush for clicks from AI answers.
+  startAiClicksFlusher();
 
   // ─── PR-92 (2026-06-01): daily analytics auto-prune ───────────────
   // Keeps the DB from growing unbounded (analytics_page_views adds
@@ -1767,8 +1827,33 @@ let lastDebioSyncAt: Date | null = null;
 if (process.env.RFB_DISABLE_DEBIO_SYNC !== "1") {
   setInterval(trackJob("debio-sync", async () => {
     const now = new Date();
+    // Økologi S1 (AC1.6): every hour — > 7 days without a successful register
+    // sync clears register-checked statuses. No-op when the register sync
+    // never ran or RFB_DEBIO_REGISTER_SYNC is off (rollback to finnoko).
+    try {
+      const f = enforceDebioRegisterFreshness(getDb(), now);
+      if (f.warning) console.warn(`[debio-register] ${f.warning} (cleared=${f.cleared})`);
+    } catch (err) {
+      console.error("[debio-register] freshness check failed:", err);
+    }
     if (now.getUTCHours() !== 4) return; // fire only during 04:00 UTC window
     if (lastDebioSyncAt && (now.getTime() - lastDebioSyncAt.getTime()) < 23 * 3600_000) return;
+    // Økologi S1: with RFB_DEBIO_REGISTER_SYNC on, Debio's full register is the
+    // status source (finnoko only as a helper key inside it).
+    if (debioRegisterSyncEnabled()) {
+      try {
+        const r = await syncDebioRegister(getDb(), { dryRun: false });
+        console.log(
+          `[debio-register] accepted=${r.accepted} rows=${r.normalized} verified=${r.verified} ` +
+          `review=${r.review_candidates} reset=${r.would_reset} changes=${r.changes} errors=${r.errors.length}`,
+        );
+        for (const w of r.warnings) console.warn(`[debio-register] ${w}`);
+        lastDebioSyncAt = now;
+      } catch (err) {
+        console.error("[debio-register] failed:", err);
+      }
+      return;
+    }
     try {
       const result = await syncDebioVerifications();
       console.log(
@@ -1907,6 +1992,43 @@ if (process.env.VERIFIER_SCHEDULER_ENABLED === "1") {
       verifierTickRunning = false;
     }
   }), 60 * 60_000); // hourly check, self-gated on the 22-06 UTC window
+}
+
+// ─── dev-request 2026-09-02-dental-verifier-website-ownership: internal ──
+// hourly dental-verifier scheduler ─────────────────────────────────────
+//
+// Drives runDentalVerifierBatch (src/services/dental-verifier.ts) on an
+// hourly cadence — the SAME library call admin-run-dental-verifier.ts's
+// POST / handler makes, not an HTTP self-call and not a re-implementation.
+//
+// Gated OFF by default — only runs when DENTAL_VERIFIER_SCHEDULER_ENABLED=1
+// AND ENABLE_DENTAL=1 (the dental.db handle is only open when the dental
+// vertical is enabled). The flag is turned on only by Daniel; nothing in
+// this repo (fly.toml included) sets it. Batch size comes from
+// DENTAL_VERIFIER_BATCH_SIZE (default 30, capped at 200).
+let dentalVerifierTickRunning = false;
+if (shouldRunDentalVerifierScheduler()) {
+  const dentalVerifierBatchSize = resolveDentalVerifierSchedulerBatchSize();
+  setInterval(trackJob("dental-verifier-scheduler", async () => {
+    if (dentalVerifierTickRunning) {
+      console.warn("[dental-verifier-scheduler] tick skipped — a previous tick is still running");
+      return;
+    }
+    dentalVerifierTickRunning = true;
+    try {
+      const r = await runDentalVerifierBatch({ batchSize: dentalVerifierBatchSize });
+      const verified = r.results.filter((x) => x.new_verification_status === "verified").length;
+      const inactive = r.results.filter((x) => x.new_is_inactive === true).length;
+      console.log(
+        `[dental-verifier-scheduler] run_id=${r.run_id} processed=${r.results.length} ` +
+        `verified=${verified} newly_inactive=${inactive} batch_size=${dentalVerifierBatchSize}`
+      );
+    } catch (err) {
+      console.error("[dental-verifier-scheduler] tick failed:", err);
+    } finally {
+      dentalVerifierTickRunning = false;
+    }
+  }), DENTAL_VERIFIER_SCHEDULER_INTERVAL_MS); // hourly
 }
 
 // ─── dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent, Daniel
@@ -2112,6 +2234,42 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
 }
 
 // ─── A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
+// felles-serverjobbramme, «Innsnevring 2026-10-28», skive 3k med punkt b:
+// needs_review content judgements — same file-queue mechanics as the two
+// proposal jobs above (services/proposal-file-queue.ts), reading
+// `experiences-content-judgements/` in slookisen/A2A (verdicts a Cloud
+// Routine rendered on Daniel's subscription) and storing them through
+// applyExperienceContentJudgements(), which re-checks every item and writes
+// through the same shared code as POST /admin/experiences-content-judge-
+// sweep. Never calls an LLM. OFF by default:
+// EXPERIENCE_CONTENT_JUDGEMENT_JOB_ENABLED === "true" turns it on; flipping
+// it back is the rollback. First tick 9 minutes after boot, hourly after
+// that; an overlapping tick is skipped.
+if (process.env.ENABLE_EXPERIENCES === "1") {
+  let experienceContentJudgementsRunning = false;
+  const experienceContentJudgementsTick = trackJob("experience-content-judgements", async () => {
+    if (experienceContentJudgementsRunning) return;
+    experienceContentJudgementsRunning = true;
+    try {
+      const { tickExperienceContentJudgements } = await import("./services/experience-content-judgement-job");
+      const r = await tickExperienceContentJudgements();
+      if (r.skipped_reason === "disabled") return;
+      console.log(
+        `[experience-content-judgements] tick run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
+          `listed=${r.files_listed} processed=${r.processed.length} written=${r.written} ` +
+          `github_error=${r.github_error ? "yes" : "no"} envelope=${r.envelope_recorded}`,
+      );
+    } catch (err) {
+      console.error("[experience-content-judgements] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      experienceContentJudgementsRunning = false;
+    }
+  });
+  setTimeout(() => { void experienceContentJudgementsTick(); }, 9 * 60_000);
+  setInterval(() => { void experienceContentJudgementsTick(); }, 60 * 60_000);
+}
+
+// ─── A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
 // felles-serverjobbramme, tillegg 2026-10-15 «4b-det»: the gårdssalg content
 // queue (drink cohort first, then generic) drained by the platform once a
 // day, exactly like gardssalg-outreach-daily below ───────────────────────
@@ -2151,6 +2309,63 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
   });
   setTimeout(() => { void gardssalgCrDailyTick(); }, 7 * 60_000);
   setInterval(() => { void gardssalgCrDailyTick(); }, 10 * 60_000);
+}
+
+// ─── A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
+// felles-serverjobbramme, «Innsnevring 2026-10-28» step 3n: the two org.nr
+// paths (Trinn A website, Trinn B name+kommune) run by the platform once a
+// day, plus punkt a (admission_checked_at reset for needs_review rows of a
+// provider just resolved brreg_active=1) ─────────────────────────────────
+//
+// Same pattern as gardssalg-content-refresh-daily above: checks every 10
+// minutes, fires once inside EXPERIENCE_ORGNR_JOB_WINDOW_HOUR_UTC (default
+// 04), stamp persisted in boot_job_state. OFF by default:
+// EXPERIENCE_ORGNR_JOB_ENABLED=true turns it on; flipping it back is the
+// rollback. No LLM. Manual/dry runs: POST /api/opplevelser/admin/experience-orgnr-job-run.
+if (process.env.ENABLE_EXPERIENCES === "1") {
+  let lastExperienceOrgnrRunAt: Date | null = null;
+  let experienceOrgnrRunning = false;
+  const experienceOrgnrDailyTick = trackJob("experience-orgnr-daily", async () => {
+    if (experienceOrgnrRunning) return;
+    experienceOrgnrRunning = true;
+    const now = new Date();
+    try {
+      const { tickExperienceOrgnrDaily } = await import("./services/experience-orgnr-job");
+      const t = await tickExperienceOrgnrDaily({ now, lastRunAt: lastExperienceOrgnrRunAt });
+      lastExperienceOrgnrRunAt = t.lastRunAt;
+      const r = t.report;
+      if (!r) return;
+      console.log(
+        `[experience-orgnr-daily] run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
+          `processed=${r.totals.processed} active=${r.totals.resolved_active} inactive=${r.totals.resolved_inactive} ` +
+          `admission_reset=${r.totals.admission_reset_rows} errors=${r.totals.errors} envelope=${r.envelope_recorded}`,
+      );
+    } catch (err) {
+      console.error("[experience-orgnr-daily] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      experienceOrgnrRunning = false;
+    }
+  });
+  setTimeout(() => { void experienceOrgnrDailyTick(); }, 8 * 60_000);
+  setInterval(() => { void experienceOrgnrDailyTick(); }, 10 * 60_000);
+}
+
+// ─── dev-request 2026-10-21-rfb-produktimport-fra-egen-nettside, runde 2
+// (punkt 5): the product-import dry-run measurement survives a deploy. Once,
+// 45 s after boot and only with PRODUCT_IMPORT_DRYRUN_ENABLED=1, a run the
+// previous process left `running`/`interrupted` continues with the profiles
+// that have no result row yet (no duplicates: PRIMARY KEY + INSERT OR IGNORE).
+// Writes only product_import_runs/_results. Flag off at boot → no resume.
+if (productImportDryRunEnabled()) {
+  setTimeout(() => {
+    const r = resumeProductImportDryRunOnBoot();
+    if (r) {
+      console.log(
+        `[product-import] resumed dry run ${r.run_id}: ${r.profiles_done}/${r.profiles_total} done, ` +
+          `${r.profiles_remaining} remaining (resume #${r.resume_count})`,
+      );
+    }
+  }, 45_000);
 }
 
 // ─── dev-request 2026-09-03-opplevagent-sending-uten-llm-i-sendestien
@@ -2441,6 +2656,46 @@ if (process.env.RFB_DISABLE_ORDER_FOLLOWUPS !== "1") {
     void orderFollowupsTick();
   }, 5 * 60_000);
   setInterval(orderFollowupsTick, 60 * 60_000);
+
+  // B4 (dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier):
+  // the producer's daily-cap digest — one e-mail per producer per Oslo day
+  // for yesterday's over-cap submits, from 07:00 Oslo time. A no-op while
+  // ORDER_CAP_NOTICE_ENABLED is off (default). Idempotent: the
+  // order_cap_notices primary key is the sent marker
+  // (services/order-cap-notice.ts).
+  const orderCapNoticeTick = trackJob("order-cap-notice", async () => {
+    try {
+      const { processOrderCapNotices } = await import("./services/order-cap-notice");
+      const r = await processOrderCapNotices();
+      if (r.sent || r.skipped || r.failed) {
+        console.log(`[order-cap] tick day=${r.day} candidates=${r.candidates} sent=${r.sent} skipped=${r.skipped} failed=${r.failed}`);
+      }
+    } catch (err) {
+      console.error("[order-cap] tick failed:", err);
+    }
+  });
+  setTimeout(() => { void orderCapNoticeTick(); }, 6 * 60_000);
+  setInterval(orderCapNoticeTick, 60 * 60_000);
+
+  // B2 (dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier):
+  // the stock-check reminder (owner feature products.stock_check) — at most
+  // one e-mail per producer per 14 days when an orderable producer-stated
+  // item expires within 3 days, 07–21 Oslo time. A no-op while
+  // STOCK_CHECK_EMAIL_ENABLED is off (default). The send is reserved in
+  // stock_check_notices before it is made (services/stock-check-reminder.ts).
+  const stockCheckTick = trackJob("stock-check", async () => {
+    try {
+      const { processStockCheckReminders } = await import("./services/stock-check-reminder");
+      const r = await processStockCheckReminders();
+      if (r.sent || r.skipped || r.failed) {
+        console.log(`[stock-check] tick candidates=${r.candidates} sent=${r.sent} skipped=${r.skipped} failed=${r.failed} held=${r.held} off=${r.feature_off}`);
+      }
+    } catch (err) {
+      console.error("[stock-check] tick failed:", err);
+    }
+  });
+  setTimeout(() => { void stockCheckTick(); }, 7 * 60_000);
+  setInterval(stockCheckTick, 60 * 60_000);
 }
 
 // ─── dev-request 2026-07-09-loop-dispatch-self-tick: dispatcher self-tick ───
@@ -2508,7 +2763,7 @@ if (process.env.DISPATCH_TICK_DISABLED === "1" || !dispatchRoutinesConfigured) {
 }
 
 // ─── Graceful shutdown ───────────────────────────────────────
-process.on("SIGTERM", () => { discoveryService.shutdown(); flushAiDeliveries(); closeDb(); process.exit(0); });
-process.on("SIGINT", () => { discoveryService.shutdown(); flushAiDeliveries(); closeDb(); process.exit(0); });
+process.on("SIGTERM", () => { discoveryService.shutdown(); flushAiDeliveries(); flushAiClicks(); closeDb(); process.exit(0); });
+process.on("SIGINT", () => { discoveryService.shutdown(); flushAiDeliveries(); flushAiClicks(); closeDb(); process.exit(0); });
 
 export default app;

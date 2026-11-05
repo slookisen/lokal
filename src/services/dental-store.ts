@@ -44,6 +44,7 @@ import { findSearchSpecialty, specialtyTitleWords } from "../config/dental-searc
 // dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S2b): on public surfaces
 // the akutt filter is the claim the card shows, not the raw acute_vakt flag.
 import { DENTAL_ACUTE_CLAIM_SQL, DENTAL_ACUTE_VAKT_SQL } from "./dental-acute-claim";
+import { DENTAL_HELFO_CLAIM_SQL, HELFO_CLAIM_REQUIRES_SOURCE, dentalHelfoClaimSql } from "./dental-helfo-claim";
 // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
 // treffvakt (A4-D): the sitemap's thin-profile check reads the values the
 // clinic page shows. dental-places-display.ts imports only types from here.
@@ -52,6 +53,12 @@ import { shownDentalAgent } from "./dental-places-display";
 // on public surfaces «verified» (filter, order) is the read-time claim, and
 // hydrateAgent carries what the claim reads. The module imports no store.
 import { countRichFields, dentalVerifiedClaimSql } from "./dental-verified-claim";
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S10):
+// the rows the May 2026 directory import added on its own are not public.
+// Every public query below ANDs dentalPublicRowSql() next to its
+// verification_status != 'rejected' (dental-import-display.test.ts checks
+// each one). The module imports no store.
+import { dentalPublicRowSql, importValuesHidden } from "./dental-import-display";
 
 // ─── Schemas (input validation) ─────────────────────────────────────
 
@@ -684,13 +691,23 @@ function pushFreeTextClause(
 //   publicOnly        visitor-facing surfaces: no rejected or closed clinics,
 //                     no proven non-clinic (DENTAL_CLINIC_CLASS_SQL), a
 //                     verification_status filter of 'rejected' is ignored,
-//                     'verified' means the «Verifisert» claim (F2-S8, below)
-//                     and acute_vakt 1 means the akutt claim (S2b, below).
+//                     'verified' means the «Verifisert» claim (F2-S8, below),
+//                     acute_vakt 1 means the akutt claim (S2b, below) and
+//                     helfo_agreement 'true' the Helfo claim (F2-S6, below).
+//   sourcedClaims     GET /agents without the admin key (F2-S7): the
+//                     acute_vakt and helfo_agreement filters list only rows
+//                     whose answer has the value asked for
+//                     (dental-rest-claims.ts): acute_vakt 1 is «Akuttvakt»
+//                     (DENTAL_ACUTE_VAKT_SQL, publicAcuteVakt), helfo as for
+//                     publicOnly. Rows are otherwise as without it (no
+//                     rejected/closed/non-clinic exclusion).
 //   excludeParked     GET /agents?exclude_parked=1 (enrichment candidates).
 //   excludeNonClinic  GET /discover's opt-in catalog_class filter.
 // The synthetic probe row is skipped for every caller.
 export interface DentalWhereOptions {
   publicOnly?: boolean;
+  excludeImportOnly?: boolean;
+  sourcedClaims?: boolean;
   excludeParked?: boolean;
   excludeNonClinic?: boolean;
 }
@@ -709,6 +726,9 @@ export function buildDentalWhere(
     // hidden from every public-facing path, unconditionally -- same shape as
     // the verification_status='rejected' exclusion.
     where.push("verification_status != 'rejected'", "(is_inactive IS NULL OR is_inactive = 0)");
+    // F2-S10: not a row the directory import added on its own (switch
+    // IMPORT_VALUES_HIDDEN; off adds nothing).
+    if (importValuesHidden()) where.push(dentalPublicRowSql());
     // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5a): the
     // catalog_class exclusion is UNCONDITIONAL for public surfaces. Uses the
     // lenient DENTAL_CLINIC_CLASS_SQL (NULL/"ukjent" stay eligible, only
@@ -722,6 +742,11 @@ export function buildDentalWhere(
   }
   if (opts.excludeNonClinic && !opts.publicOnly) {
     where.push(DENTAL_CLINIC_CLASS_SQL);
+  }
+  // F2-S10: GET /api/tannlege/agents without the admin key leaves out the
+  // rows publicOnly leaves out for the import, and nothing else.
+  if (opts.excludeImportOnly && !opts.publicOnly && importValuesHidden()) {
+    where.push(dentalPublicRowSql());
   }
 
   pushFieldClauses(where, params, parsed, opts, "");
@@ -807,8 +832,22 @@ function pushFieldClauses(
     pushFreeTextClause(where, params, f.q, `${p}q`);
   }
   if (f.helfo_agreement !== undefined) {
-    where.push(`helfo_agreement = @${p}helfo_agreement`);
-    params[`${p}helfo_agreement`] = f.helfo_agreement;
+    // F2-S6: on a public surface the filter lists the clinics whose card
+    // gives the value asked for (shownHelfoAgreement): «true» is the Helfo
+    // claim (a stored 'true' with a source), and a 'true' without a source
+    // answers 'unknown'. GET /agents without the admin key gives the card's
+    // value too (F2-S7, sourcedClaims). GET /agents with the key (admin,
+    // enrichment) keeps the column, as does every surface with the switch off.
+    const sourced = (opts.publicOnly || opts.sourcedClaims) && HELFO_CLAIM_REQUIRES_SOURCE;
+    if (sourced && f.helfo_agreement === "true") {
+      where.push(DENTAL_HELFO_CLAIM_SQL);
+    } else if (sourced && f.helfo_agreement === "unknown") {
+      where.push(`(helfo_agreement = @${p}helfo_agreement OR (helfo_agreement = 'true' AND NOT ${DENTAL_HELFO_CLAIM_SQL}))`);
+      params[`${p}helfo_agreement`] = f.helfo_agreement;
+    } else {
+      where.push(`helfo_agreement = @${p}helfo_agreement`);
+      params[`${p}helfo_agreement`] = f.helfo_agreement;
+    }
   }
   if (f.acute_vakt === 1 && opts.publicOnly) {
     // S2b: a visitor-facing akutt filter lists the clinics whose card shows
@@ -818,6 +857,13 @@ function pushFieldClauses(
     // keyword reading and message.data) gets it. GET /agents (admin,
     // enrichment) keeps the raw column, as does acute_vakt 0.
     where.push(DENTAL_ACUTE_CLAIM_SQL);
+  } else if (f.acute_vakt === 1 && opts.sourcedClaims) {
+    // F2-S7: GET /agents without the admin key answers acute_vakt 1 only
+    // where the card says «Akuttvakt» (publicAcuteVakt), so its filter lists
+    // just those rows: the vakt twin, not the whole claim (a clinic with akutt
+    // only in patient_focus answers acute_vakt null). acute_vakt 0 is
+    // answered as stored, so it keeps the column below.
+    where.push(DENTAL_ACUTE_VAKT_SQL);
   } else if (f.acute_vakt !== undefined) {
     where.push(`acute_vakt = @${p}acute_vakt`);
     params[`${p}acute_vakt`] = f.acute_vakt;
@@ -1551,7 +1597,9 @@ export function listDentalAgents(
   // function so the OTHER caller of listDentalAgents (GET /api/tannlege/
   // agents, an admin/enrichment listing, not one of slice 1b's named public
   // surfaces) stays byte-identical.
-  opts: { excludeParked?: boolean; excludeNonClinic?: boolean } = {}
+  // F2-S7: sourcedClaims (GET /agents without the admin key) makes the
+  // acute_vakt and helfo_agreement filters follow the answer's values.
+  opts: { excludeParked?: boolean; excludeNonClinic?: boolean; sourcedClaims?: boolean } = {}
 ): DentalAgentRow[] {
   const parsed = ListFilterSchema.parse(filter);
   const db = getDb("dental");
@@ -1698,6 +1746,7 @@ export function getAvailableSpecialties(candidates: string[]): string[] {
     const m = specialtyMatch(name, "s");
     const sql = `SELECT 1 FROM dental_agents
        WHERE verification_status != 'rejected'
+         AND ${dentalPublicRowSql()}
          AND (is_inactive IS NULL OR is_inactive = 0)
          AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}
          AND ${m.sql}
@@ -1724,8 +1773,9 @@ export interface DentalStats {
  * the synthetic probe row. Used by getDentalStats() and by
  * countHonestDentalClinics() so every surface counts the SAME rows.
  */
-const DENTAL_HONEST_BASE_SQL =
-  "FROM dental_agents WHERE verification_status != 'rejected' AND (is_inactive IS NULL OR is_inactive = 0)" +
+// F2-S10: a function, so the import switch is read per call.
+const dentalHonestBaseSql = (): string =>
+  `FROM dental_agents WHERE verification_status != 'rejected' AND ${dentalPublicRowSql()} AND (is_inactive IS NULL OR is_inactive = 0)` +
   ` AND ${DENTAL_CLINIC_CLASS_SQL} AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}`;
 
 /**
@@ -1736,7 +1786,7 @@ const DENTAL_HONEST_BASE_SQL =
  */
 export function countHonestDentalClinics(): number {
   const db = getDb("dental");
-  return (db.prepare(`SELECT COUNT(*) AS n ${DENTAL_HONEST_BASE_SQL}`).get() as { n: number }).n;
+  return (db.prepare(`SELECT COUNT(*) AS n ${dentalHonestBaseSql()}`).get() as { n: number }).n;
 }
 
 export function getDentalStats(): DentalStats {
@@ -1748,7 +1798,7 @@ export function getDentalStats(): DentalStats {
   // unconditional honest-count catalog_class filter as listPublicDentalAgents()
   // above, so the frontpage/fylke counters never show a bigger number than
   // the filtered listing they sit next to.
-  const base = DENTAL_HONEST_BASE_SQL;
+  const base = dentalHonestBaseSql();
 
   const total = countHonestDentalClinics();
 
@@ -1757,8 +1807,11 @@ export function getDentalStats(): DentalStats {
   ).all() as Array<{ fylke: string; n: number }>;
   const per_fylke = perFylkeRows.map((r) => ({ fylke: r.fylke, count: r.n }));
 
+  // A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon
+  // (F2-S6): the Helfo claim (dentalHelfoClaimSql: 'true' with a source),
+  // the same rows /sok?helfo=1 and MCP `helfo` list.
   const helfo_count = (db.prepare(
-    `SELECT COUNT(*) AS n ${base} AND helfo_agreement = 'true'`
+    `SELECT COUNT(*) AS n ${base} AND ${dentalHelfoClaimSql()}`
   ).get() as { n: number }).n;
 
   const chain_count = (db.prepare(
@@ -1824,7 +1877,7 @@ export function getDentalMarketplaceStats(): DentalMarketplaceStats {
   // producer/umbrella distinction, so this is the closest honest analog to
   // marketplaceRegistry's activeProducers.
   const activeProducers = (db.prepare(
-    "SELECT COUNT(*) AS c FROM dental_agents WHERE verification_status != 'rejected' AND (is_inactive IS NULL OR is_inactive = 0)" +
+    `SELECT COUNT(*) AS c FROM dental_agents WHERE verification_status != 'rejected' AND ${dentalPublicRowSql()} AND (is_inactive IS NULL OR is_inactive = 0)` +
       ` AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}`
   ).get() as { c: number }).c;
 
@@ -1833,7 +1886,7 @@ export function getDentalMarketplaceStats(): DentalMarketplaceStats {
   // same active gate as activeProducers, same relationship as RFB's own
   // cities-exclude-umbrella filtering.
   const cityRows = db.prepare(
-    "SELECT DISTINCT poststed FROM dental_agents WHERE poststed IS NOT NULL AND verification_status != 'rejected' AND (is_inactive IS NULL OR is_inactive = 0)" +
+    `SELECT DISTINCT poststed FROM dental_agents WHERE poststed IS NOT NULL AND verification_status != 'rejected' AND ${dentalPublicRowSql()} AND (is_inactive IS NULL OR is_inactive = 0)` +
       ` AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}`
   ).all() as Array<{ poststed: string }>;
   const cities = cityRows.map((r) => r.poststed);
@@ -2017,7 +2070,7 @@ export interface DentalChain {
   num_locations_advertised: number | null;
   tier: string | null;
   confidence: string | null;
-  /** Public clinics (DENTAL_HONEST_BASE_SQL) whose chain_brand is this name, trimmed and case-folded. */
+  /** Public clinics (dentalHonestBaseSql) whose chain_brand is this name, trimmed and case-folded. */
   antall_lokasjoner_i_db: number;
 }
 
@@ -2041,7 +2094,7 @@ export function listChains(): DentalChain[] {
     .prepare("SELECT id, chain_brand, parent_orgnr, website, num_locations_advertised, tier, confidence FROM dental_chains")
     .all() as Array<Record<string, unknown>>;
   const spellings = db
-    .prepare(`SELECT chain_brand, COUNT(*) AS n ${DENTAL_HONEST_BASE_SQL} AND chain_brand IS NOT NULL GROUP BY chain_brand`)
+    .prepare(`SELECT chain_brand, COUNT(*) AS n ${dentalHonestBaseSql()} AND chain_brand IS NOT NULL GROUP BY chain_brand`)
     .all() as Array<{ chain_brand: string; n: number }>;
 
   // Folded name -> clinics per trimmed spelling.
@@ -2526,6 +2579,7 @@ export function listPoststeder(minCount = 1): PoststedRow[] {
     SELECT poststed, fylke, COUNT(*) AS n
     FROM dental_agents
     WHERE verification_status != 'rejected'
+      AND ${dentalPublicRowSql()}
       AND poststed IS NOT NULL AND poststed != ''
       AND fylke IS NOT NULL AND fylke != ''
       AND (is_inactive IS NULL OR is_inactive = 0)
@@ -2543,6 +2597,7 @@ export function listPoststeder(minCount = 1): PoststedRow[] {
     SELECT poststed, COUNT(*) AS n
     FROM dental_agents
     WHERE verification_status != 'rejected'
+      AND ${dentalPublicRowSql()}
       AND poststed IS NOT NULL AND poststed != ''
       AND ${DENTAL_CLINIC_CLASS_SQL}
       AND (is_inactive IS NULL OR is_inactive = 0)
@@ -2579,6 +2634,7 @@ export function listRelatedClinics(
     WHERE poststed = ?
       AND id != ?
       AND verification_status != 'rejected'
+      AND ${dentalPublicRowSql()}
       AND (is_inactive IS NULL OR is_inactive = 0)
       ${catalogClassClause}
       AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}
@@ -2625,6 +2681,7 @@ export function listDentalNamesakes(
     WHERE poststed IN (${places.map(() => "?").join(", ")})
       AND id != ?
       AND verification_status != 'rejected'
+      AND ${dentalPublicRowSql()}
       AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}
       AND nb_lower(trim(navn)) = nb_lower(trim(?))
     LIMIT 20
@@ -2664,9 +2721,10 @@ export function getDentalAgentsForSitemap(): Array<{ org_nr: string; navn: strin
   const rows = db.prepare(`
     SELECT org_nr, navn, updated_at,
            adresse, telefon, mobil, hjemmeside, opening_hours, field_provenance, stage_v_pending_correction,
-           organisasjonsform
+           organisasjonsform, website_ownership
     FROM dental_agents
     WHERE verification_status != 'rejected'
+      AND ${dentalPublicRowSql()}
       AND org_nr IS NOT NULL AND org_nr != ''
       AND (is_inactive IS NULL OR is_inactive = 0)
       ${catalogClassClause}
@@ -2676,7 +2734,7 @@ export function getDentalAgentsForSitemap(): Array<{ org_nr: string; navn: strin
   `).all() as Array<
     { org_nr: string; navn: string; updated_at: string | null } &
       Record<
-        "adresse" | "telefon" | "mobil" | "hjemmeside" | "opening_hours" | "field_provenance" | "stage_v_pending_correction" | "organisasjonsform",
+        "adresse" | "telefon" | "mobil" | "hjemmeside" | "opening_hours" | "field_provenance" | "stage_v_pending_correction" | "organisasjonsform" | "website_ownership",
         string | null
       >
   >;
@@ -2692,6 +2750,8 @@ export function getDentalAgentsForSitemap(): Array<{ org_nr: string; navn: strin
           field_provenance: parseJsonOrNull(r.field_provenance) as DentalAgent["field_provenance"],
           stage_v_pending_correction: r.stage_v_pending_correction,
           organisasjonsform: r.organisasjonsform,
+          org_nr: r.org_nr,
+          website_ownership: r.website_ownership,
         })
       )
     )

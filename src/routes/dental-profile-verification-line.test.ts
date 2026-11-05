@@ -441,7 +441,20 @@ export async function runDentalProfileVerificationLineTests(
         console.log("SNAPSHOT_REST=" + JSON.stringify(restBefore.text));
         console.log("SNAPSHOT_MCP=" + JSON.stringify(mcpText));
       }
-      assertTrue(restBefore.text === SNAPSHOT_REST, "H6: GET /api/tannlege/agents/:id is byte-identical to the snapshot from main", restBefore.text);
+      // F2-S7 (same dev-request) changes this answer on purpose: the row's
+      // acute_vakt 1 has a stamp but no quote, so the public answer gives
+      // null, as the card does. With its switch off the answer is main's.
+      const restClaims = require("../services/dental-rest-claims") as typeof import("../services/dental-rest-claims");
+      restClaims.__setRestClaimsRequireSourceForTesting(false);
+      let restOff: { text: string };
+      try {
+        restOff = await get(`${origin}/api/tannlege/agents/${FIXED_ID}`);
+      } finally {
+        restClaims.__setRestClaimsRequireSourceForTesting(null);
+      }
+      assertTrue(restOff.text === SNAPSHOT_REST, "H6: GET /api/tannlege/agents/:id is byte-identical to the snapshot from main (F2-S7 switch off)", restOff.text);
+      assertTrue(restBefore.text === SNAPSHOT_REST.replace('"acute_vakt":1,', '"acute_vakt":null,') && SNAPSHOT_REST.includes('"acute_vakt":1,'),
+        "H6b: ... and with F2-S7 on, it differs only in acute_vakt 1 -> null (no quote)", restBefore.text);
       assertTrue(mcpText === SNAPSHOT_MCP, "H7: MCP tannlege_info is byte-identical to the snapshot from main", mcpText);
       const newWords = /Kontroll og kilder|Ikke kontrollert ennå|Sist kontrollert|Brønnøysundregistrene kontrollert|Nettstedet bekreftet|tolket automatisk/;
       assertTrue(!newWords.test(restBefore.text) && !newWords.test(mcpText), "H8: no page text of this slice in the JSON answers");

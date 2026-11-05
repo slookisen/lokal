@@ -609,11 +609,19 @@ export async function runInternTrafikkTellesIkkeTests(opts: { log?: boolean } = 
     assertTrue(JSON.stringify(actual) === JSON.stringify(expected),
       `${label} (expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)})`);
   }
-  /** A "<status> <json>" dental REST list answer without each agent's field_provenance (A4-D). */
+  /**
+   * A "<status> <json>" dental REST list answer without each agent's
+   * field_provenance (A4-D), and with acute_vakt and helfo_agreement as the
+   * public answer gives them (F2-S7, read from the stored values it holds).
+   */
   function withoutFieldProvenance(answer: string): string {
+    const { withRestClaims, restClaimsRequireSource } = require("../services/dental-rest-claims") as typeof import("../services/dental-rest-claims");
     const at = answer.indexOf(" ");
     const body = JSON.parse(answer.slice(at + 1));
-    body.agents = (body.agents ?? []).map(({ field_provenance: _p, ...agent }: Record<string, unknown>) => agent);
+    body.agents = (body.agents ?? []).map((stored: Record<string, any>) => {
+      const { field_provenance: _p, ...agent } = stored;
+      return restClaimsRequireSource() ? withRestClaims(agent, stored) : agent;
+    });
     return `${answer.slice(0, at)} ${JSON.stringify(body)}`;
   }
   /** Two answers: the same, or where they first differ. */
@@ -745,7 +753,9 @@ export async function runInternTrafikkTellesIkkeTests(opts: { log?: boolean } = 
           // Dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-
           // places-treffvakt (A4-D): with a valid X-Admin-Key the dental REST
           // list keeps field_provenance (the enrichment reads it back), which
-          // the public answer leaves out. That is its one difference.
+          // the public answer leaves out, and (F2-S7) the stored acute_vakt
+          // and helfo_agreement, which the public answer gives only with a
+          // source. Those are its only differences.
           const compared = entry.name === "dental GET /api/tannlege/agents" && label === "valid X-Admin-Key"
             ? withoutFieldProvenance(internalAnswer)
             : internalAnswer;

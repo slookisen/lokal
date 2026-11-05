@@ -78,12 +78,11 @@ import { getDb } from "../database/init";
 import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenContact, type PublicFieldChoices } from "../owner-features/enforce";
 import { knowledgeService } from "./knowledge-service";
 import { geocodingService } from "./geocoding-service";
-import { isEligibleForRealOrder, isProducerStatedSource, isRowOrderableForRealOrder, foodInfoOf, type FoodInfo } from "./cart-service";
-import { computeEffectiveAvailability } from "./supply-graph";
+import { isEligibleForRealOrder, isProducerStatedSource, isRowOrderableForRealOrder, foodInfoOf, orderPathStockFreshness, softExpiryFields, type FoodInfo } from "./cart-service";
 import { haversineDistanceKm, KM_PER_DEG_LAT, kmPerDegLng } from "./geo-distance";
 import { isValidLatLng } from "../utils/geo-query";
 import { slugify } from "../utils/slug";
-import { publicListableSql } from "./agent-visibility";
+import { publicListableSql, notOwnerHiddenSql, type OwnerVisibilityAudience } from "./agent-visibility";
 import { isCategoryLabel } from "../utils/category-label";
 import { productNameMatch, COMPOUND_HEAD_MIN_LENGTH, type ProductNameMatch } from "../utils/product-name-match";
 import { formatRfbDistanceLabel, shouldSuppressDistance } from "./geo-precision";
@@ -116,6 +115,12 @@ export interface FindOffersParams {
   lng?: number | null;
   radiusKm?: unknown;
   limit?: unknown;
+  /**
+   * S2c-2 (dev-request 2026-10-22-rfb-mine-valg-eierbrytere): "ai" for the
+   * MCP tool — producers hidden from AI assistants are left out. Default
+   * "all" (the /handleliste page and its REST route).
+   */
+  audience?: OwnerVisibilityAudience;
 }
 
 export interface OfferProducer {
@@ -149,6 +154,13 @@ export interface Offer {
   producer_confirmed?: boolean;
   /** Skive 4: ingredients / allergens / net weight where stated, shown to the buyer before submit; left out when none is stated. */
   food_info?: FoodInfo;
+  /**
+   * B2b-1 (findOffers / findProducerOrderables, soft-expiry rule active, row in the soft window): when the
+   * producer last confirmed the row (ISO). Left out otherwise.
+   */
+  stock_confirmed_at?: string;
+  /** B2b-1: present (true) with stock_confirmed_at — the producer confirms the item is in stock before the order holds. */
+  needs_producer_confirmation?: true;
   producer: OfferProducer;
 }
 
@@ -257,6 +269,8 @@ interface OfferCandidate {
   dist: number;
   match: ProductNameMatch;
   availability: string;
+  /** B2b-1: the soft-window fields ({} unless the soft-expiry rule is active for the producer and the row is in the window). */
+  soft: { stock_confirmed_at?: string; needs_producer_confirmation?: true };
 }
 
 /** I-S2: a producer's label rows by name (nb), then id, so its category match does not hang on the rows' order. */
@@ -433,7 +447,7 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
       AND a.lat IS NOT NULL AND a.lng IS NOT NULL
       AND k.verification_status = 'verified'
       AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
-      AND ${publicListableSql("a")}
+      AND ${publicListableSql("a")}${params.audience === "ai" ? notOwnerHiddenSql("ai_assistants", "a") : ""}
       AND a.lat BETWEEN ? AND ? AND a.lng BETWEEN ? AND ?
       AND (LOWER(p.name) LIKE ? ESCAPE '\\' OR LOWER(p.name) LIKE ? ESCAPE '\\')
   `).all(
@@ -460,10 +474,10 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
     if (!match) continue;
     const dist = haversineDistanceKm(position.lat, position.lng, r.lat, r.lng);
     if (dist > radiusKm) continue;
-    const x: OfferCandidate = {
-      r, dist, match,
-      availability: computeEffectiveAvailability(r.availability, r.availability_updated_at, r.availability_source, now),
-    };
+    // B2b-1: the order path's stock state — the soft-expiry rule when it is active for the
+    // producer (stock-soft-expiry.ts), else exactly computeEffectiveAvailability().
+    const fresh = orderPathStockFreshness(r, now);
+    const x: OfferCandidate = { r, dist, match, availability: fresh.availability, soft: softExpiryFields(fresh) };
     if (isCategoryLabel({ name: r.product_name, hasPrice: r.price_nok != null, availabilitySource: r.availability_source })) {
       const prev = firstLabel.get(r.agent_id);
       if (!prev || compareLabelRows(r, prev.r) < 0) firstLabel.set(r.agent_id, x);
@@ -482,7 +496,7 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
   const ownerChoices = publicFieldChoicesForMany([...offerRows, ...matchRows].map((x) => x.r.agent_id), { db });
   const producerOf = (r: RawOfferRow, dist: number): OfferProducer => offerProducerOf(db, r, dist, ownerChoices.get(r.agent_id));
 
-  const offers: Offer[] = offerRows.map(({ r, dist, availability }) => {
+  const offers: Offer[] = offerRows.map(({ r, dist, availability, soft }) => {
     const food_info = foodInfoOf(r);
     const producer = producerOf(r, dist);
     return {
@@ -495,6 +509,7 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
       // row is a contact choice already in step 2), and for any offer that carries food information.
       ...(food_info || producer.can_order ? { producer_confirmed: isProducerStatedSource(r.availability_source) } : {}),
       ...(food_info ? { food_info } : {}),
+      ...soft,
       producer,
     };
   });
@@ -590,14 +605,17 @@ export function findProducerOrderables(
     const producer = offerProducerOf(db, orderable[0]!, null, publicFieldChoices(agentId, { db }));
     const offers: Offer[] = orderable.map((r) => {
       const food_info = foodInfoOf(r);
+      // B2b-1: the order path's stock state (the soft-expiry rule when active; else computeEffectiveAvailability).
+      const fresh = orderPathStockFreshness(r, now);
       return {
         product_id: r.product_id,
         product_name: r.product_name,
         price_nok: r.price_nok ?? null,
         unit: r.unit ?? null,
-        availability: computeEffectiveAvailability(r.availability, r.availability_updated_at, r.availability_source, now),
+        availability: fresh.availability,
         producer_confirmed: true,
         ...(food_info ? { food_info } : {}),
+        ...softExpiryFields(fresh),
         producer,
       };
     });

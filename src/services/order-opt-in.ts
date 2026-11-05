@@ -16,6 +16,20 @@ export function readOrderNotificationsOptIn(db: any, agentId: string): boolean |
   return row.v === 1;
 }
 
+/**
+ * dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2e: the confirmed order
+ * address (agents.order_notification_email) as the `orders.email` owner
+ * feature reads it. null = no override (orders go to the profile e-mail) or
+ * no such agent. Written only by the S1b punkt 7 confirmation flow.
+ */
+export function readOrderNotificationEmailOverride(db: any, agentId: string): string | null {
+  const row = db.prepare("SELECT order_notification_email AS v FROM agents WHERE id = ?").get(agentId) as
+    | { v: string | null }
+    | undefined;
+  const v = (row?.v ?? "").trim();
+  return v ? v : null;
+}
+
 /** Write the column. Returns false when no agent row was updated. */
 export function writeOrderNotificationsOptIn(db: any, agentId: string, optIn: boolean): boolean {
   const info = db

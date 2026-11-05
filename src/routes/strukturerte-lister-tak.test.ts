@@ -59,6 +59,9 @@
  *         npx tsx src/routes/strukturerte-lister-tak.test.ts --print
  *       Moved on purpose (2026-10-23, GHSA-46jr, lokal#1229): lokal_discover
  *       with 50 categories is now the MCP_MAX_FILTER_LIST refusal.
+ *       Moved on purpose (2026-10-30, økologi S3a, AC3.3): the RFB GET /a2a
+ *       card's discover skill no longer carries the «organic» tag or the
+ *       «Find organic farms near Oslo» example.
  *
  * Data: I-Y's fixtures (own in-memory DBs, restored in finally; geocoding
  * offline), the real handlers: MCP tools through a duck-typed server, the

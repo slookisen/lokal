@@ -426,12 +426,19 @@ export async function runBuyerOrderActionsFaseB1Tests(opts: { log?: boolean } = 
       assertEq([pw.status, row(w.id).status], [404, "pending"], "card-16: POST with a wrong ref → 404, no change");
       const px = await req("POST", `/ordre/${encodeURIComponent(w.id)}`, { headers: { Origin: "https://evil.example" }, form: { ref: w.ref, action: "cancel", expect: "withdraw" } });
       assertEq([px.status, row(w.id).status], [403, "pending"], "card-17: a cross-site form post (foreign Origin) → 403, no change");
+      assertTrue(px.text.includes("Kunne ikke lagre") && px.text.includes("Endringen ble ikke lagret") && px.text.includes(">Tilbake til ordren</a>"), "t0a-c1: refused card POST → «Kunne ikke lagre» page with «Tilbake til ordren»");
+      const pxMeta = await req("POST", `/ordre/${encodeURIComponent(w.id)}`, { headers: { "Sec-Fetch-Site": "same-site" }, form: { ref: w.ref, action: "cancel", expect: "withdraw" } });
+      assertEq([pxMeta.status, row(w.id).status], [403, "pending"], "t0a-c2: Sec-Fetch-Site: same-site without Origin → 403, no change");
       const pv = await req("POST", `/ordre/${encodeURIComponent(w.id)}`, { form: { ref: w.ref, action: "confirm" } });
       assertEq([pv.status, pv.headers["location"], row(w.id).status], [303, `${cardUrl(w)}&error=ugyldig`, "pending"], "card-18: a seller action from the card → refused (PRG with error)");
       const pp = await req("POST", `/ordre/${encodeURIComponent(w.id)}`, { form: { ref: w.ref, action: "picked_up" } });
       assertEq([pp.headers["location"], row(w.id).status], [`${cardUrl(w)}&error=ugyldig`, "pending"], "card-19: «Jeg har hentet» on a pending order → refused");
       const same = await req("POST", `/ordre/${encodeURIComponent(w.id)}`, { headers: { Origin: `http://127.0.0.1:${port}` }, form: { ref: w.ref, action: "cancel", expect: "withdraw" } });
       assertEq([same.status, row(w.id).status], [303, "cancelled"], "card-20: a same-origin form post is accepted");
+      // T0a: the card's plain form POST under Referrer-Policy: no-referrer sends «Origin: null» — accepted.
+      const wn = seedOrder({ status: "pending" });
+      const pn = await req("POST", `/ordre/${encodeURIComponent(wn.id)}`, { headers: { Origin: "null", "Sec-Fetch-Site": "same-origin" }, form: { ref: wn.ref, action: "cancel", expect: "withdraw" } });
+      assertEq([pn.status, row(wn.id).status], [303, "cancelled"], "t0a-c3: Origin: null + Sec-Fetch-Site: same-origin → accepted");
 
       // Review B1: the stale tab. The card was opened while pending (free
       // withdraw), the producer confirmed, then the buyer clicks «Avbestill».

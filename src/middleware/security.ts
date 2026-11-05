@@ -39,16 +39,35 @@ export const corsOptions = {
 
 // ─── Security headers (Helmet) ───────────────────────────────
 // Fix #9: Enable CSP with sensible defaults
+//
+// dev-request 2026-06-25-platform-contact-surface, slice CSP: the /kontakt
+// form on all three sites (rettfrabonden.com, opplevagent.no,
+// finn-tannlege.com — one policy, set here for every host) loads Cloudflare
+// Turnstile from https://challenges.cloudflare.com/turnstile/v0/api.js, and
+// the widget runs in an iframe from that same origin. With script-src
+// 'self' 'unsafe-inline' and frame-src 'none' the browser blocked both, no
+// token was ever produced, and /api/contact (fail-closed) answered 403
+// captcha_failed to every visitor. Cloudflare's CSP reference for Turnstile
+// lists exactly this origin in script-src and frame-src.
+//
+// connect-src carries the same origin too: when a challenge fails, the
+// Turnstile script reports the error with a fetch to
+// https://challenges.cloudflare.com/cdn-cgi/challenge-platform/…, and prod's
+// console showed connect-src 'self' https://rettfrabonden.com blocking it.
+// Same origin, same pages and hosts as script-src / frame-src (one policy for
+// every host); nothing else in connect-src changes.
+const TURNSTILE_ORIGIN = "https://challenges.cloudflare.com";
+
 export const securityHeaders = helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'unsafe-inline'"],  // needed for SEO inline scripts
+      scriptSrc: ["'self'", "'unsafe-inline'", TURNSTILE_ORIGIN],  // inline: SEO scripts; Turnstile: /kontakt
       styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
       fontSrc: ["'self'", "https://fonts.gstatic.com"],
       imgSrc: ["'self'", "data:", "https:"],
-      connectSrc: ["'self'", "https://rettfrabonden.com"],
-      frameSrc: ["'none'"],
+      connectSrc: ["'self'", "https://rettfrabonden.com", TURNSTILE_ORIGIN],  // Turnstile: its error report on a failed challenge
+      frameSrc: [TURNSTILE_ORIGIN],  // the Turnstile widget iframe; no other frame is allowed
       objectSrc: ["'none'"],
     },
   },
@@ -321,7 +340,8 @@ export const consumerKeyIssuanceLimiter = rateLimit({
 // RFB claim-request limiter — decision 11=A (dev-request
 // 2026-10-17-rfb-claim-verifisering-mot-kjent-kontakt): per IP on
 // POST /api/marketplace/agents/:id/claim, mounted on that route
-// (routes/marketplace.ts). Every request counts — a code send and an
+// (routes/marketplace.ts) and on …/claim/resend (K1, dev-request
+// 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post). Every request counts — a code send and an
 // admin-queue entry alike — so one IP can neither mail many producers nor
 // flood the queue. The limits that must hold also while this IP key can be
 // chosen by the client (see sharedValidate above) live in knowledge-service.ts

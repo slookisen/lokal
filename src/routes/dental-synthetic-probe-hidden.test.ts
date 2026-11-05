@@ -191,6 +191,13 @@ export async function runDentalSyntheticProbeHiddenTests(
     db.prepare("UPDATE dental_agents SET catalog_class = 'klinikk', specialists = ? WHERE id = ?").run(
       JSON.stringify([{ name: "Kari Nordmann", title: "Spesialist i periodonti" }]), clinicId
     );
+    // F2-S6: both Helfo rows carry the source the Helfo claim needs
+    // (resolveHelfoClaim), so only the probe rule keeps the probe out of
+    // helfo_count (A12).
+    db.prepare("UPDATE dental_agents SET field_provenance = ? WHERE id IN (?, ?)").run(
+      JSON.stringify({ helfo_agreement: [{ value: "true", source_type: "homepage", source_url: "https://example.test/helfo", fetched_at: "2026-05-01T10:00:00Z" }] }),
+      PROBE_ID, clinicId
+    );
 
     const probeSlug = dentalSeo.slugifyClinic("PR-100b Persistence Probe", PROBE_ORGNR);
     const clinicSlug = dentalSeo.slugifyClinic("Sentrum Tannklinikk AS", CLINIC_ORGNR);

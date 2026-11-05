@@ -50,9 +50,13 @@ import { shownDentalAgent, shownDentalFieldProvenance, isPrivateEnkAddress } fro
 // GET /discover gives verification_status as the badge says it.
 import { shownVerificationStatus } from "../services/dental-verified-claim";
 import { placesDisplayPolicyEnabled } from "../services/places-display-policy";
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S7):
+// the raw REST answers give acute_vakt and helfo_agreement as the card does.
+import { restClaimsRequireSource, withRestClaims } from "../services/dental-rest-claims";
 import { getDb } from "../database/db-factory";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isTestFingerprintPayload, DENTAL_SYNTHETIC_PROBE_IDS, isDentalSyntheticProbeId } from "../services/dental-contamination";
+import { importValuesHidden, isHiddenImportRow } from "../services/dental-import-display";
 import { mergeFieldProvenance } from "./admin-knowledge";
 import {
   placesPeriodsToOpeningHours,
@@ -63,7 +67,7 @@ import {
   type PlacesPlace,
 } from "../services/dental-places";
 import { nameSimilarity } from "../services/name-matcher";
-import { placesFieldMask, dentalPlacesContactFieldsFetchEnabled, PLACES_DENTAL_CONTACT_FIELDS } from "../services/places-match";
+import { placesFieldMask, dentalPlacesContactFieldsFetchEnabled, PLACES_DENTAL_CONTACT_FIELDS, placesAddressFetchEnabled, withoutPlacesAddressField } from "../services/places-match";
 import { classifyHjemmeside } from "../services/dental-hjemmeside-classifier";
 import { isPublicDentalServiceHost, DENTAL_CLINIC_CLASS_SQL, isDentalPublicCatalogClassFilterEnabled } from "../services/dental-catalog-class";
 import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage-tracker";
@@ -75,11 +79,8 @@ import { getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
 import { toDentalClinicCard } from "../services/dental-clinic-card";
 import { hasAcuteVaktQuote } from "../services/dental-acute-claim";
 import { emailRevealGuardEnabled, revealEmailFor } from "../services/email-reveal-guard";
-import {
-  enrichmentWritePauseBlock,
-  ENRICHMENT_WRITE_PAUSE_HTTP_STATUS,
-  type EnrichmentWritePausedBody,
-} from "../services/enrichment-write-pause";
+import { ENRICHMENT_WRITE_PAUSE_HTTP_STATUS } from "../services/enrichment-write-pause";
+import { dentalEnrichmentWritePauseBlock } from "../services/dental-enrichment-write-pause";
 
 const router = Router();
 
@@ -107,9 +108,6 @@ const router = Router();
 // assessment, no clinic content; same reasoning as the /admin/run-verifier
 // exemption in the service), and the non-enrichment admin writes (POST
 // /agents, /exclusions, /agents/bulk-import).
-function dentalEnrichmentWritePauseBlock(): EnrichmentWritePausedBody | null {
-  return enrichmentWritePauseBlock(() => getDb("rfb"), "dental");
-}
 
 // ─── Admin auth ─────────────────────────────────────────────────────
 // Same shape as marketplace.ts:getAdminKey() — accept either env var
@@ -168,9 +166,13 @@ function withoutGoogleRating<T extends { rating?: unknown; rating_count?: unknow
 // the side values the «Verifisert» claim reads are left out of both as well,
 // and verification_status stays the stored value here (the raw REST answer
 // is F2-S7's), so both answers are as before.
+// F2-S7 (same dev-request): without the admin key, acute_vakt and
+// helfo_agreement are the card's (withRestClaims: «Akuttvakt» and the Helfo
+// claim only with a source); switch REST_CLAIMS_REQUIRE_SOURCE.
 function restDentalAgent(agent: DentalAgentRow, adminView: boolean) {
-  const row = withoutDentalSideColumns(withoutGoogleRating(adminView ? agent : shownDentalAgent(agent)));
-  if (adminView) return row;
+  const base = withoutDentalSideColumns(withoutGoogleRating(adminView ? agent : shownDentalAgent(agent)));
+  if (adminView) return base;
+  const row = restClaimsRequireSource() ? withRestClaims(base, agent) : base;
   if (!placesDisplayPolicyEnabled()) return { ...row, field_provenance: shownDentalFieldProvenance(agent) };
   const { field_provenance: _provenance, ...shown } = row;
   return shown;
@@ -192,8 +194,12 @@ function restSummaryProvenance(agent: DentalAgentRow, adminView: boolean) {
 // layer). With the rule off every caller gets the same answer and the
 // headers are as before, unless the answer has a clinic whose private
 // address is hidden (dev-request 2026-10-18-dental-privat-adresse-skjules).
+// F2-S7: while REST_CLAIMS_REQUIRE_SOURCE is on, acute_vakt, helfo_agreement
+// and their filters depend on the key too, so the same two headers are set.
+// F2-S10 (same dev-request): while IMPORT_VALUES_HIDDEN is on, so do the rows
+// listed and the import's address and website.
 function restAdminView(req: Request, res: Response, agents: readonly DentalAgentRow[]): boolean {
-  if (placesDisplayPolicyEnabled() || agents.some((agent) => isPrivateEnkAddress(agent))) {
+  if (placesDisplayPolicyEnabled() || restClaimsRequireSource() || importValuesHidden() || agents.some((agent) => isPrivateEnkAddress(agent))) {
     res.vary("X-Admin-Key");
     res.set("Cache-Control", "private");
   }
@@ -307,7 +313,21 @@ router.get("/agents", (req: Request, res: Response) => {
     // consecutive homepage-fetch failures (30d backoff) — the enrichment
     // routine's candidate listing. Absent param = unchanged behavior.
     const excludeParked = req.query.exclude_parked === "1" || req.query.exclude_parked === "true";
-    const rows = listDentalAgents(filter, limit, offset, { excludeParked });
+    // F2-S7: the key is read before the query, because without it the
+    // acute_vakt and helfo_agreement filters list only rows whose answer has
+    // the value asked for (sourcedClaims). With the switch off, or with the
+    // key, the options are as before.
+    const sourcedClaims = restClaimsRequireSource() && !hasAdminKey(req);
+    // F2-S10 (same dev-request, Daniel's choice B on question 32): without
+    // the key, the rows the May 2026 directory import added on its own are
+    // not listed (and `count` follows); with it, or with IMPORT_VALUES_HIDDEN
+    // off, the options are as before.
+    const excludeImportOnly = importValuesHidden() && !hasAdminKey(req);
+    const rows = listDentalAgents(filter, limit, offset, {
+      excludeParked,
+      ...(sourcedClaims ? { sourcedClaims } : {}),
+      ...(excludeImportOnly ? { excludeImportOnly } : {}),
+    });
     const adminView = restAdminView(req, res, rows);
     const shownRows = rows.map((stored) => restDentalAgent(stored, adminView));
     const emailWithheld = restEmailWithheld(req, res, shownRows, adminView);
@@ -358,6 +378,13 @@ router.get("/agents/:id", (req: Request, res: Response) => {
     .prepare("SELECT last_verified_at FROM dental_agents WHERE id = ?")
     .get(agent.id) as { last_verified_at: string | null } | undefined;
   const adminView = restAdminView(req, res, [agent]);
+  // F2-S10: without the key a row the May 2026 directory import added on its
+  // own is not found; with it the answer is as stored (the enrichment and
+  // admin read-back). The headers restAdminView set stay on the 404.
+  if (!adminView && isHiddenImportRow(agent)) {
+    res.status(404).json({ error: "Not found" });
+    return;
+  }
   const stored = restDentalAgent(agent, adminView);
   const emailWithheld = restEmailWithheld(req, res, [stored], adminView)?.has(stored.id) === true;
   const summaryProvenance = restSummaryProvenance(agent, adminView);
@@ -1332,6 +1359,10 @@ const PLACES_PRO_FIELD_MASK = placesFieldMask(
 const withoutContactFields = (mask: string): string =>
   mask.split(",").filter((f) => !PLACES_DENTAL_CONTACT_FIELDS.includes(f)).join(",");
 const PLACES_PRO_FIELD_MASK_NO_CONTACT = withoutContactFields(PLACES_PRO_FIELD_MASK);
+// Same dev-request, A5: the request picks one of the masks above and drops
+// places.formattedAddress from it (withoutPlacesAddressField) while
+// PLACES_ADDRESS_FETCH_ENABLED (places-match.ts) is off. addressComponents
+// stays for the match guard, read in memory only.
 
 interface PlacesAgentRow {
   id: string;
@@ -1396,6 +1427,11 @@ router.post(
     }
     // A6: phone, website and opening hours from Places (see places-match.ts).
     const contactFetch = dentalPlacesContactFieldsFetchEnabled();
+    // A5: the address from Places (see places-match.ts). While it is off no
+    // row is selected for its empty address, no address is looked up or
+    // written here (Brreg's included: by_field.adresse is 0), and the masks
+    // carry no places.formattedAddress.
+    const addressFetch = placesAddressFetchEnabled();
     // dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
     // item 1: raise the homepage-backfill default/cap 20/50 -> 100/cycle (the
     // universe-growth lever — at 20/day a full sweep of the ~5,670 homepage-
@@ -1475,16 +1511,29 @@ router.post(
       // never rejected.
       // A6: with the contact fields off, only a missing address makes a row
       // worth a Places call (the fields below are the pre-A6 text verbatim).
-      const missingFieldsSql = contactFetch
-        ? `hjemmeside IS NULL OR hjemmeside = ''
+      // A5: with the address off too, no field is left and no row is
+      // selected (`0`); with only the address off, the contact fields alone.
+      const missingFieldsSql = addressFetch
+        ? contactFetch
+          ? `hjemmeside IS NULL OR hjemmeside = ''
                  OR adresse    IS NULL OR adresse    = ''
                  OR telefon    IS NULL OR telefon    = ''
                  OR opening_hours IS NULL OR opening_hours = ''`
-        : `adresse IS NULL OR adresse = ''`;
+          : `adresse IS NULL OR adresse = ''`
+        : contactFetch
+          ? `hjemmeside IS NULL OR hjemmeside = ''
+                 OR telefon    IS NULL OR telefon    = ''
+                 OR opening_hours IS NULL OR opening_hours = ''`
+          : `0`;
       const missingOrderSql = contactFetch
-        ? `CASE WHEN hjemmeside IS NULL OR hjemmeside = '' THEN 0 ELSE 1 END ASC,
+        ? addressFetch
+          ? `CASE WHEN hjemmeside IS NULL OR hjemmeside = '' THEN 0 ELSE 1 END ASC,
               CASE WHEN (adresse IS NULL OR adresse = '')
                      OR (telefon IS NULL OR telefon = '')
+                     OR (opening_hours IS NULL OR opening_hours = '') THEN 0 ELSE 1 END ASC,
+              `
+          : `CASE WHEN hjemmeside IS NULL OR hjemmeside = '' THEN 0 ELSE 1 END ASC,
+              CASE WHEN (telefon IS NULL OR telefon = '')
                      OR (opening_hours IS NULL OR opening_hours = '') THEN 0 ELSE 1 END ASC,
               `
         : "";
@@ -1566,7 +1615,8 @@ router.post(
       // filled has nothing left to fetch from Places. It is not sent to
       // Google (no fetch, no logPlacesCall) and gets no no-retry marker.
       // Only reachable through agentIds: auto-select picks missing addresses.
-      if (!contactFetch && !isEmptyCol(row.adresse)) {
+      // A5: with the address off too, no row has anything left to fetch.
+      if (!contactFetch && !(addressFetch && isEmptyCol(row.adresse))) {
         results.push({
           agentId: row.id,
           navn: row.navn,
@@ -1599,11 +1649,14 @@ router.post(
         ENTERPRISE_MONTHLY_HARD_STOP
       );
       if (wantsEnterprise && !needsEnterprise) enterpriseCapped = true;
-      const fieldMask = needsEnterprise
-        ? PLACES_ENTERPRISE_FIELD_MASK
-        : contactFetch
-          ? PLACES_PRO_FIELD_MASK
-          : PLACES_PRO_FIELD_MASK_NO_CONTACT;
+      const fieldMask = withoutPlacesAddressField(
+        needsEnterprise
+          ? PLACES_ENTERPRISE_FIELD_MASK
+          : contactFetch
+            ? PLACES_PRO_FIELD_MASK
+            : PLACES_PRO_FIELD_MASK_NO_CONTACT,
+        addressFetch
+      );
       if (needsEnterprise) enterpriseCalls++; else proCalls++;
 
       // ── measure 3 of dev-request 2026-07-03-places-api-cost-reduction ──
@@ -1615,8 +1668,9 @@ router.post(
       // source, unchanged from before. Phone is NOT looked up here: Brreg's
       // Enhetsregisteret API has no phone-number field, so telefon stays
       // Google-only exactly as before.
+      // A5: not while address fetch is off (Phase 2G writes no address then).
       let brregAddr: string | null = null;
-      if (isEmptyCol(row.adresse)) {
+      if (addressFetch && isEmptyCol(row.adresse)) {
         try {
           const brregHit = await findOrgnumberByName(row.navn, row.postnummer);
           if (brregHit?.address) brregAddr = brregHit.address;
@@ -1724,8 +1778,10 @@ router.post(
       // measure 3: prefer the BRREG address looked up above when we have
       // one — Google's formattedAddress is only used as the fallback when
       // BRREG had nothing usable for this clinic.
+      // A5: nothing of it is used while address fetch is off, also if
+      // Google sends one it was not asked for.
       const placesAddr =
-        typeof place.formattedAddress === "string"
+        addressFetch && typeof place.formattedAddress === "string"
           ? place.formattedAddress.trim()
           : "";
       const gAddr = brregAddr || placesAddr;

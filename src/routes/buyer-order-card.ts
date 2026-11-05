@@ -31,6 +31,9 @@ import type { PaymentsStripeClient } from "../services/payment-provider";
 import { formatPickupTimeOslo } from "../services/order-lifecycle";
 import { PRICE_BY_AGREEMENT } from "../services/order-pricing";
 import { ordersShell, esc, itemsSummary, messageThreadHtml, messageErrorCode, messageBannerHtml } from "./owner-orders-view";
+import {
+  isCrossSiteWrite, writeGuardRefusedBody, WRITE_GUARD_REFUSED_TITLE, WRITE_GUARD_CONTACT_RFB,
+} from "../middleware/same-origin-write";
 
 const router = Router();
 
@@ -58,12 +61,6 @@ function q(req: Request, name: string): string {
   return Array.isArray(v) ? String(v[0] ?? "") : typeof v === "string" ? v : "";
 }
 
-/** A browser form post from another site is refused (Origin present and not our host) — as owner-orders.ts. */
-function crossSite(req: Request): boolean {
-  const origin = req.headers.origin;
-  if (!origin || typeof origin !== "string") return false;
-  try { return new URL(origin).host !== String(req.headers.host || ""); } catch { return true; }
-}
 
 function cardHeaders(res: Response): void {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -244,7 +241,13 @@ router.post("/ordre/:id", buyerOrderCardLimiter, express.urlencoded({ extended: 
   const ref = typeof body["ref"] === "string" ? (body["ref"] as string) : "";
   try {
     if (!getBuyerOrderRow(orderId, ref)) return notFound(res);
-    if (crossSite(req)) { cardHeaders(res); return res.status(403).send(ordersShell("Ikke tillatt", `<h1>Ikke tillatt</h1>`)); }
+    // A browser form post from another site is refused — the shared check in src/middleware/same-origin-write.ts.
+    if (isCrossSiteWrite(req, "/ordre/:id")) {
+      cardHeaders(res);
+      return res.status(403).send(ordersShell(WRITE_GUARD_REFUSED_TITLE, writeGuardRefusedBody({
+        contact: WRITE_GUARD_CONTACT_RFB, backHref: cardPath(orderId, ref), backLabel: "Tilbake til ordren",
+      })));
+    }
     const back = cardPath(orderId, ref);
     res.setHeader("Referrer-Policy", "no-referrer");
     res.setHeader("Cache-Control", "no-store");

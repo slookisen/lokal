@@ -23,7 +23,8 @@ import { RFB_VERIFIER_SCOPE_SQL } from "../agents/lokal-agent-verifier";
 import {
   crossSourceAgreement,
   tierForSource,
-  isInferenceSource,
+  validEvidenceRecords,
+  type FieldName,
   type ProvenanceRecord,
   type SourceTier,
 } from "../services/cross-source-validator";
@@ -75,28 +76,14 @@ function parseFieldProvenance(
   }
 }
 
-// Mirrors the exact "valid" (evidence, non-inference) record extraction that
-// crossSourceAgreement() does internally (cross-source-validator.ts) — same
-// value-presence filter, same isInferenceSource() deny-list — so
-// blocker_breakdown's source_count distribution can never disagree with the
-// verdict the verifier itself computed for the same field.
+// Delegates to the validator's own evidence extraction (validEvidenceRecords:
+// value-presence, S1b existence-only drop, inference deny-list) so
+// blocker_breakdown's source_count can never disagree with the verifier's verdict.
 function getValidFieldRecords(
   fieldProvenance: Record<string, ProvenanceRecord[] | ProvenanceRecord | unknown>,
-  fieldName: string
+  fieldName: FieldName
 ): ProvenanceRecord[] {
-  const raw = fieldProvenance[fieldName];
-  let records: ProvenanceRecord[];
-  if (!raw) {
-    records = [];
-  } else if (Array.isArray(raw)) {
-    records = raw as ProvenanceRecord[];
-  } else if (typeof raw === "object" && raw !== null) {
-    records = [raw as ProvenanceRecord];
-  } else {
-    records = [];
-  }
-  const allValid = records.filter((r) => r && typeof r.value === "string" && r.value.trim() !== "");
-  return allValid.filter((r) => !isInferenceSource(r.source_type));
+  return validEvidenceRecords(fieldProvenance, fieldName);
 }
 
 // GET /admin/outreach-ready-pool/stats — pool size + breakdowns

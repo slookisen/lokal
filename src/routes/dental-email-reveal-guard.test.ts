@@ -74,6 +74,9 @@ export async function runDentalEmailRevealGuardTests(opts: { log?: boolean } = {
   ];
   const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
   const policy = require("../services/places-display-policy") as typeof import("../services/places-display-policy");
+  // F2-S7: the raw REST answers' Helfo/akutt rule sets Cache-Control too; H
+  // below turns it off with the Places rule, so only the guard sets it.
+  const restClaims = require("../services/dental-rest-claims") as typeof import("../services/dental-rest-claims");
   const guard = require("../services/email-reveal-guard") as typeof import("../services/email-reveal-guard");
   const logLines: string[] = [];
   const freshGuard = () => guard.__resetEmailRevealGuardForTesting({ log: (l) => logLines.push(l) });
@@ -280,6 +283,7 @@ export async function runDentalEmailRevealGuardTests(opts: { log?: boolean } = {
 
     // ── P: Places rule off — public field_provenance ──────────────────────
     policy.__setPlacesDisplayPolicyForTesting(false);
+    restClaims.__setRestClaimsRequireSourceForTesting(false);
     try {
       process.env.EMAIL_REVEAL_PER_IP_PER_HOUR = "0";
       freshGuard();
@@ -303,6 +307,7 @@ export async function runDentalEmailRevealGuardTests(opts: { log?: boolean } = {
         "H2: switch on -> Cache-Control: private on /agents/:id (also without e-mail), /agents, A2A list and info, and the admin view");
     } finally {
       policy.__setPlacesDisplayPolicyForTesting(null);
+      restClaims.__setRestClaimsRequireSourceForTesting(null);
     }
 
     // ── M: MCP tannlege_info is not part of this slice ────────────────────
@@ -333,6 +338,7 @@ export async function runDentalEmailRevealGuardTests(opts: { log?: boolean } = {
     failures.push("dental email reveal guard: unexpected error: " + String(err?.stack || err?.message || err));
   } finally {
     policy.__setPlacesDisplayPolicyForTesting(null);
+    restClaims.__setRestClaimsRequireSourceForTesting(null);
     if (closeMcp) await closeMcp().catch(() => {});
     if (closeHttp) await closeHttp().catch(() => {});
     try {

@@ -627,6 +627,20 @@ export async function runRfbHiddenTestProducerTests(opts: { log?: boolean } = {}
       assertEq(r.status, 200, "ac6-12: explicit agent_id of the fixture is accepted");
       clearRegistryCaches();
       assertTrue(!marketplaceRegistry.getActiveAgents().some((a) => a.id === LEGACY_ID), "ac6-13: still hidden after re-arm");
+      // T0b: re-arm repairs a NULL unit on the fixture product, keeps a set one.
+      const unitOf = () => (db.prepare(
+        `SELECT unit FROM products WHERE agent_id = ? AND name_norm = 'testpoteter (kun test)'`,
+      ).get(LEGACY_ID) as any)?.unit;
+      db.prepare(`UPDATE products SET unit = NULL WHERE agent_id = ? AND name_norm = 'testpoteter (kun test)'`).run(LEGACY_ID);
+      assertEq(unitOf(), null, "ac6-14: precondition — fixture product unit is NULL");
+      r = await postTp({ email: FIXTURE_EMAIL, apply: true });
+      assertEq(r.status, 200, "ac6-15: re-arm with NULL unit → 200");
+      assertEq(unitOf(), "kg", "ac6-16: re-arm repaired the NULL unit to 'kg'");
+      db.prepare(`UPDATE products SET unit = 'stk' WHERE agent_id = ? AND name_norm = 'testpoteter (kun test)'`).run(LEGACY_ID);
+      r = await postTp({ email: FIXTURE_EMAIL, apply: true });
+      assertEq(r.status, 200, "ac6-17: re-arm with unit 'stk' → 200");
+      assertEq(unitOf(), "stk", "ac6-18: re-arm keeps an existing non-NULL unit ('stk')");
+      db.prepare(`UPDATE products SET unit = 'kg' WHERE agent_id = ? AND name_norm = 'testpoteter (kun test)'`).run(LEGACY_ID);
     }
 
     // ══ Create path (no legacy row) + multiple-fixture refusal — own DB ════

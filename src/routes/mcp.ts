@@ -20,6 +20,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
 import { knowledgeService, parseProductPrice, productPriceText, isProductHeader, isProductNoise } from "../services/knowledge-service";
+import { isDebioVerifiedValue, isOrganicClaimUmbrella } from "../services/organic-claims";
 import { slugify } from "../utils/slug";
 import { textEntries } from "../utils/text-entries";
 import { areGenericCategoryNames, isGenericCategoryName, isCategoryLabel } from "../utils/category-label";
@@ -32,8 +33,9 @@ import { geocodingService } from "../services/geocoding-service";
 import { isValidLatLng, resolveSearchRadiusKm } from "../utils/geo-query";
 import { capFreeText, capName, capNameList } from "../utils/free-text";
 import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
-import { computeEffectiveAvailability } from "../services/supply-graph";
-import { findOffers, resolveOffersRadiusKm, resolveOffersLimit } from "../services/catalog-offers";
+import { evaluateStockFreshness } from "../services/supply-graph";
+import { stockSoftExpiryActiveFor, stockSoftExpiryBuyerTextNb } from "../services/stock-soft-expiry";
+import { findOffers, resolveOffersRadiusKm, resolveOffersLimit, type FindOffersResult } from "../services/catalog-offers";
 import { formatAddressLine } from "../utils/address-format";
 import { DRINK_SUBCATEGORIES } from "../services/drink-taxonomy";
 import {
@@ -55,7 +57,7 @@ import { foreignPlaceIn } from "../services/outside-norway";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 import { searchCountable } from "../services/search-tracking";
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
-import { publicListableSql, failsProducerRoleGate, isAgentIdPubliclyVisible } from "../services/agent-visibility";
+import { publicListableSql, failsProducerRoleGate, isAgentIdPubliclyVisible, notOwnerHiddenSql, ownerHidesAgent, withoutOwnerHidden } from "../services/agent-visibility";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { isPaymentsEnabled, isPaymentsLifecycleActive, submitCartWithPayments, resolvePaymentsStripeClient } from "../services/payment-service";
@@ -108,6 +110,10 @@ export interface CatalogAvailability {
   availabilityUpdatedAt: string | null;
   /** products.availability_source ('producer_dashboard' when the producer set it). */
   availabilitySource?: string | null;
+  /** B2b-2: soft window only (rule active for the producer) — when the producer last confirmed the row (ISO). */
+  stockConfirmedAt?: string;
+  /** B2b-2: present (true) with stockConfirmedAt — the producer confirms the order before it holds. */
+  needsProducerConfirmation?: true;
 }
 
 // dev-request 2026-07-13-supply-graph-v1 (Slice 1): per-agent name_norm →
@@ -137,13 +143,20 @@ export function getCatalogAvailabilityMap(
       availability_source: string;
     }>;
     const now = new Date();
+    // B2b-2: the order path's stock rule (stock-soft-expiry.ts). Rule off →
+    // evaluateStockFreshness() is exactly computeEffectiveAvailability().
+    const softExpiry = stockSoftExpiryActiveFor(agentId);
     for (const r of rows) {
       // First write wins; UNIQUE(agent_id, name_norm) means at most one row anyway.
       if (!map.has(r.name_norm)) {
+        const fresh = evaluateStockFreshness(r.availability, r.availability_updated_at, r.availability_source, now, softExpiry);
         map.set(r.name_norm, {
-          availability: computeEffectiveAvailability(r.availability, r.availability_updated_at, r.availability_source, now),
+          availability: fresh.availability,
           availabilityUpdatedAt: r.availability_updated_at ?? null,
           availabilitySource: r.availability_source,
+          ...(fresh.needs_producer_confirmation && fresh.stock_confirmed_at
+            ? { stockConfirmedAt: fresh.stock_confirmed_at, needsProducerConfirmation: true as const }
+            : {}),
         });
       }
     }
@@ -234,7 +247,13 @@ export function formatProductsForMcp(
     const avail = availabilityByNorm?.get(normalizeProductName(cleanName));
     const availStr = avail ? `  · availability: ${avail.availability}` : "";
     const availUpdatedStr = avail?.availabilityUpdatedAt ? `  · availability_updated_at: ${avail.availabilityUpdatedAt}` : "";
-    lines.push(`- ${cleanName}${cat}${priceStr}${seasonal}${idStr}${availStr}${availUpdatedStr}`);
+    // B2b-2: a row in the soft window (rule active) carries its confirmation
+    // date, the flag and the buyer text: the assistant states the date and
+    // that the producer confirms the order — never a plain «in stock».
+    const softStr = avail?.needsProducerConfirmation && avail.stockConfirmedAt
+      ? `  · stock_confirmed_at: ${avail.stockConfirmedAt}  · needs_producer_confirmation: true  · ${stockSoftExpiryBuyerTextNb(avail.stockConfirmedAt)}`
+      : "";
+    lines.push(`- ${cleanName}${cat}${priceStr}${seasonal}${idStr}${availStr}${availUpdatedStr}${softStr}`);
     productCount++;
   }
 
@@ -700,6 +719,24 @@ function areaListText(words: string): string {
     "search without a place to cover all of Norway.\n\n";
 }
 
+/**
+ * B2b-2 (lokal_find_offers): an offer findOffers marked as in the soft window
+ * (needs_producer_confirmation, stock_confirmed_at) also carries `stock_note`,
+ * the buyer text with the date («Sist bekreftet av produsenten …»), before
+ * `producer`. A result without such an offer is returned as it is.
+ */
+export function withStockNotes(result: FindOffersResult): FindOffersResult {
+  if (!result.offers.some((o) => o.needs_producer_confirmation && o.stock_confirmed_at)) return result;
+  return {
+    ...result,
+    offers: result.offers.map((o) => {
+      if (!(o.needs_producer_confirmation && o.stock_confirmed_at)) return o;
+      const { producer, ...rest } = o;
+      return { ...rest, stock_note: stockSoftExpiryBuyerTextNb(o.stock_confirmed_at), producer };
+    }),
+  };
+}
+
 export function registerTools(
   server: McpServer,
   getClientIdentity?: () => string | undefined,
@@ -826,7 +863,8 @@ export function registerTools(
       // directly), so it needs the same honest-drop signal as the REST/web
       // search surfaces — not just the underlying filter fix.
       const discoverMeta: DiscoverMeta = {};
-      const results = marketplaceRegistry.discover({ ...parsed, limit: limit || 10, offset: 0 }, discoverMeta, { trackDiscovery: countable(extra, q) });
+      // S2c-2: audience "ai" — a profile hidden from AI assistants is left out.
+      const results = marketplaceRegistry.discover({ ...parsed, limit: limit || 10, offset: 0 }, discoverMeta, { trackDiscovery: countable(extra, q), audience: "ai" });
 
       // Integration test 2026-10-17, slice I-W: the words the parser could not
       // read are looked up in the product names (discover() step 3c). When no
@@ -1086,7 +1124,7 @@ export function registerTools(
       // gets back non-budget producers with no indication the filter was
       // silently dropped.
       const discoverMeta: DiscoverMeta = {};
-      const results = marketplaceRegistry.discover(body, discoverMeta, { trackDiscovery: countable(extra, JSON.stringify(body), true) });
+      const results = marketplaceRegistry.discover(body, discoverMeta, { trackDiscovery: countable(extra, JSON.stringify(body), true), audience: "ai" });
 
       if (!results?.length) {
         return { content: [{ type: "text" as const, text: "Ingen produsenter funnet med disse filtrene." }] };
@@ -1139,7 +1177,8 @@ export function registerTools(
       // Shared by-id visibility predicate (agent-visibility.ts; flag-gated —
       // off = served as before). allowCatalogHidden: the hidden test fixture
       // stays orderable by id.
-      if (!info || !isAgentIdPubliclyVisible(getDb(), agentId, { surface: "ungated", allowCatalogHidden: true })) {
+      // S2c-2: audience "ai" — the owner's visibility.profile / ai_assistants.
+      if (!info || !isAgentIdPubliclyVisible(getDb(), agentId, { surface: "ungated", allowCatalogHidden: true, audience: "ai" })) {
         return { content: [{ type: "text" as const, text: `Fant ingen produsent med ID ${agentId}.` }] };
       }
 
@@ -1364,7 +1403,7 @@ export function registerTools(
         FROM agent_affiliations aff
         INNER JOIN agents p ON p.id = aff.producer_id
         WHERE aff.umbrella_id = ? AND aff.status = 'active' AND p.is_active = 1
-          AND ${publicListableSql("p")}
+          AND ${publicListableSql("p")}${notOwnerHiddenSql("ai_assistants", "p")}
         ORDER BY p.name ASC
         LIMIT ?
       `).all(umbrellaId, lim) as any[];
@@ -1411,19 +1450,23 @@ export function registerTools(
     guardToolHandler("lokal_get_producer_affiliations", async ({ producerId }) => {
       const db = getDb();
       const producer = db.prepare(
-        "SELECT id, name, umbrella_type FROM agents WHERE id = ? AND is_active = 1"
+        "SELECT id, name, umbrella_type, debio_verified FROM agents WHERE id = ? AND is_active = 1"
       ).get(producerId) as any;
-      if (!producer) {
+      // S2c-2: a profile hidden from AI assistants reads like an unknown id.
+      if (!producer || ownerHidesAgent(producerId, "ai_assistants")) {
         return { content: [{ type: "text" as const, text: `Fant ingen produsent med ID ${producerId}.` }] };
       }
 
-      const rows = db.prepare(`
+      const allRows = db.prepare(`
         SELECT u.id, u.name, u.umbrella_type, aff.labels
         FROM agent_affiliations aff
         INNER JOIN agents u ON u.id = aff.umbrella_id
         WHERE aff.producer_id = ? AND aff.status = 'active' AND u.is_active = 1
         ORDER BY u.name ASC
       `).all(producerId) as any[];
+      // Økologi S0 fix-up (review B2): no certification / organic umbrella
+      // without a valid Debio status (organic-claims.ts).
+      const rows = isDebioVerifiedValue(producer.debio_verified) ? allRows : allRows.filter((u) => !isOrganicClaimUmbrella(u));
 
       if (!rows.length) {
         return { content: [{ type: "text" as const, text: `${producer.name} har ingen registrerte paraplyer-tilknytninger.` }] };
@@ -1666,6 +1709,7 @@ export function registerTools(
           lng: hasCoords ? (lng as number) : undefined,
           radiusKm,
           limit: resolveOffersLimit(undefined),
+          audience: "ai",
         });
         results.push(result);
       }
@@ -1673,7 +1717,11 @@ export function registerTools(
       // I-S2: a category match hands its producer to the caller too.
       deliver("lokal_find_offers", { items: terms, near, lat, lng, radius_km }, extra,
         results.flatMap((r) => [...r.offers, ...(r.category_matches ?? [])].map((o) => o.producer.agent_id)));
-      const content = [{ type: "text" as const, text: JSON.stringify(results, null, 2) }];
+      // B2b-2: an offer in the soft window (it carries needs_producer_confirmation,
+      // findOffers) also gets the buyer text, so the assistant states the date and
+      // that the producer confirms the order. Every other offer is as before.
+      const shown = results.map((r) => withStockNotes(r));
+      const content = [{ type: "text" as const, text: JSON.stringify(shown, null, 2) }];
       // I-Y2: the JSON stays the list of results; the note is its own part.
       if (items.length > MAX_OFFER_ITEMS) content.push({ type: "text" as const, text: offersItemsOmittedText(items) });
       return { content };
@@ -2002,7 +2050,8 @@ export function registerTools(
     "lokal://producers/overview",
     { description: "Overview of all local food producers — count, cities, and categories", mimeType: "text/plain" },
     async () => {
-      const agents = marketplaceRegistry.getActiveAgents();
+      // S2c-2: counts without the profiles hidden from AI assistants.
+      const agents = withoutOwnerHidden(marketplaceRegistry.getActiveAgents(), "ai_assistants");
       const cities = new Map<string, number>();
       for (const a of agents) {
         const city = (a as any).city || a.location?.city || "Ukjent";
@@ -2027,7 +2076,7 @@ export function registerTools(
       const agentId = uri.pathname?.split("/").pop() || "";
       const info = knowledgeService.getAgentInfo(agentId);
       // Shared by-id visibility predicate (flag-gated, see lokal_info).
-      if (!info || !isAgentIdPubliclyVisible(getDb(), agentId, { surface: "ungated" })) {
+      if (!info || !isAgentIdPubliclyVisible(getDb(), agentId, { surface: "ungated", audience: "ai" })) {
         return { contents: [{ uri: uri.href, text: "Producer not found", mimeType: "text/plain" }] };
       }
       // S2c-1: without what the owner hid (not enforced = as before).

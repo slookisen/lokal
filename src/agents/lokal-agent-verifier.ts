@@ -3131,6 +3131,15 @@ export function buildRunEnvelope(input: {
   // RFB_TERMINAL_UNCONFIRMABLE_ENABLED is off. Lets the daily brief see how
   // many agents this run permanently removed from the hourly sweep.
   const terminalUnconfirmable = r.filter((x) => x.new_verification_status === "terminal_unconfirmable").length;
+  // dev-request 2026-09-15-review-required-koen-promoteres-ikke-aarsak-usynlig
+  // (spec punkt 3, AC2/AC3): the re-evaluation throughput of review_required
+  // rows. Same derivation as admin-run-verifier.ts, which until now returned
+  // these two counts only in the HTTP response, so the run-ledger never held
+  // them. Always emitted (value 0 when none), like the other counters.
+  const reviewRequiredReevaluated = r.filter((x) => x.prior_verification_status === "review_required").length;
+  const reviewRequiredPromoted = r.filter(
+    (x) => x.prior_verification_status === "review_required" && x.new_verification_status === "verified"
+  ).length;
 
   return {
     run_id: input.run_id,
@@ -3187,6 +3196,8 @@ export function buildRunEnvelope(input: {
         },
       },
       { type: "db_state_change", value: terminalUnconfirmable, meta: { kind: "agents_terminal_unconfirmable" } },
+      { type: "db_state_change", value: reviewRequiredReevaluated, meta: { kind: "review_required_reevaluated" } },
+      { type: "db_state_change", value: reviewRequiredPromoted, meta: { kind: "review_required_promoted" } },
       ...(input.reportPath
         ? [{ type: "file_deployed", value: input.reportPath, meta: { kind: "hourly_report" } }]
         : []),

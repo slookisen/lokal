@@ -16,7 +16,10 @@
  *      the Brreg-dissolved/bankrupt inactive path, the 7-day homepage
  *      cache/TTL, the offentlig_klinikk+directory_url verified path, the
  *      NACE-mismatch review path, specialists_verified, and that a
- *      'rejected' clinic is never re-picked/promoted.
+ *      'rejected' clinic is never re-picked/promoted, and that the picker
+ *      orders enrichment_state='enriched' rows first.
+ *   Plus pure tests for the scheduler gate / batch-size helpers in
+ *   dental-verifier-scheduler.ts.
  *
  * Same fixture/mocking discipline as dental-wrong-entity-streak.test.ts:
  * DENTAL_DB_PATH=":memory:", db-factory reset + require-cache clear
@@ -38,6 +41,12 @@ import {
   DENTAL_VERIFIER_HOMEPAGE_CACHE_MS,
   type DentalVerifierCandidateRow,
 } from "./dental-verifier";
+import {
+  shouldRunDentalVerifierScheduler,
+  resolveDentalVerifierSchedulerBatchSize,
+  DENTAL_VERIFIER_SCHEDULER_DEFAULT_BATCH_SIZE,
+  DENTAL_VERIFIER_SCHEDULER_MAX_BATCH_SIZE,
+} from "./dental-verifier-scheduler";
 import type { BrregVerifyResult } from "./brreg-client";
 import type { FetchPageResult } from "./fetch-page";
 
@@ -244,6 +253,33 @@ export async function runDentalVerifierTests(opts: { log?: boolean } = {}): Prom
     !computeDentalVerifiedRule({ brregStatus: "active", websiteOwnership: "unverified", catalogClass: "klinikk", directoryUrl: "https://x.no", richFieldCount: 3 }),
     "vr-07: a plain klinikk's directory_url does NOT count as the escape hatch -- only offentlig_klinikk gets it"
   );
+
+  // ── Scheduler gate + batch-size resolution (dental-verifier-scheduler.ts) ──
+  assertEq(shouldRunDentalVerifierScheduler({}), false, "sch-01: no flags -> scheduler off");
+  assertEq(shouldRunDentalVerifierScheduler({ DENTAL_VERIFIER_SCHEDULER_ENABLED: "1" }), false, "sch-02: scheduler flag alone (dental off) -> off");
+  assertEq(shouldRunDentalVerifierScheduler({ ENABLE_DENTAL: "1" }), false, "sch-03: dental on but scheduler flag unset -> off");
+  assertEq(shouldRunDentalVerifierScheduler({ DENTAL_VERIFIER_SCHEDULER_ENABLED: "true", ENABLE_DENTAL: "1" }), false, "sch-04: 'true' is not '1' -> off");
+  assertEq(shouldRunDentalVerifierScheduler({ DENTAL_VERIFIER_SCHEDULER_ENABLED: "1", ENABLE_DENTAL: "0" }), false, "sch-05: ENABLE_DENTAL=0 -> off");
+  assertEq(shouldRunDentalVerifierScheduler({ DENTAL_VERIFIER_SCHEDULER_ENABLED: " 1", ENABLE_DENTAL: "1" }), false, "sch-06: whitespace-padded flag is not exactly '1' -> off");
+  assertEq(shouldRunDentalVerifierScheduler({ DENTAL_VERIFIER_SCHEDULER_ENABLED: "1", ENABLE_DENTAL: "1" }), true, "sch-07: both flags exactly '1' -> on");
+
+  const D = DENTAL_VERIFIER_SCHEDULER_DEFAULT_BATCH_SIZE;
+  const M = DENTAL_VERIFIER_SCHEDULER_MAX_BATCH_SIZE;
+  assertEq(D, 30, "bs-00: conservative default is 30");
+  assertEq(M, 200, "bs-00b: cap is 200");
+  assertEq(resolveDentalVerifierSchedulerBatchSize({}), D, "bs-01: missing -> default");
+  assertEq(resolveDentalVerifierSchedulerBatchSize({ DENTAL_VERIFIER_BATCH_SIZE: "" }), D, "bs-02: empty -> default");
+  assertEq(resolveDentalVerifierSchedulerBatchSize({ DENTAL_VERIFIER_BATCH_SIZE: "abc" }), D, "bs-03: non-numeric -> default");
+  assertEq(resolveDentalVerifierSchedulerBatchSize({ DENTAL_VERIFIER_BATCH_SIZE: "0" }), D, "bs-04: zero -> default");
+  assertEq(resolveDentalVerifierSchedulerBatchSize({ DENTAL_VERIFIER_BATCH_SIZE: "-5" }), D, "bs-05: negative -> default");
+  assertEq(resolveDentalVerifierSchedulerBatchSize({ DENTAL_VERIFIER_BATCH_SIZE: "12abc" }), D, "bs-06: trailing garbage -> default");
+  assertEq(resolveDentalVerifierSchedulerBatchSize({ DENTAL_VERIFIER_BATCH_SIZE: "7.5" }), D, "bs-07: decimal -> default");
+  assertEq(resolveDentalVerifierSchedulerBatchSize({ DENTAL_VERIFIER_BATCH_SIZE: "50" }), 50, "bs-08: valid value used as-is");
+  assertEq(resolveDentalVerifierSchedulerBatchSize({ DENTAL_VERIFIER_BATCH_SIZE: " 75 " }), 75, "bs-09: surrounding whitespace tolerated");
+  assertEq(resolveDentalVerifierSchedulerBatchSize({ DENTAL_VERIFIER_BATCH_SIZE: "200" }), 200, "bs-10: exactly the cap -> cap");
+  assertEq(resolveDentalVerifierSchedulerBatchSize({ DENTAL_VERIFIER_BATCH_SIZE: "100000" }), M, "bs-11: huge value capped");
+  assertEq(resolveDentalVerifierSchedulerBatchSize({ DENTAL_VERIFIER_BATCH_SIZE: "99999999999999999999999" }), M, "bs-12: absurdly huge value capped");
+  assertEq(resolveDentalVerifierSchedulerBatchSize({ DENTAL_VERIFIER_BATCH_SIZE: "1" }), 1, "bs-13: minimum 1 accepted");
 
   // ═══════════════════════════════════════════════════════════════════
   // Block 2: integration tests via runDentalVerifierBatch, in-memory DB
@@ -590,6 +626,26 @@ export async function runDentalVerifierTests(opts: { log?: boolean } = {}): Prom
       updateRow(id, { catalog_class: "lab_leverandor" });
       const picked = verifierMod.pickDentalVerifierBatch(dentalDb, 500);
       assertTrue(!picked.some((c) => c.id === id), "int-K-01: lab_leverandor row excluded from the picker (DENTAL_CLINIC_CLASS_SQL)");
+    }
+
+    // ── L: enriched rows are picked before raw rows ──────────────────
+    {
+      // Park every row created by earlier blocks so only this block's
+      // fixtures are eligible (is_inactive=1 is a picker exclusion).
+      dentalDb.prepare("UPDATE dental_agents SET is_inactive = 1").run();
+      const rawNever = makeClinic("Raa Aldri Tannklinikk AS", "911113001", { enrichment_state: "raw", last_verified_at: null });
+      const rawOld = makeClinic("Raa Gammel Tannklinikk AS", "911113002", { enrichment_state: "raw", last_verified_at: "2020-01-01T00:00:00.000Z" });
+      const enrNewer = makeClinic("Beriket Nyere Tannklinikk AS", "911113003", { enrichment_state: "enriched", last_verified_at: "2025-06-01T00:00:00.000Z" });
+      const enrOlder = makeClinic("Beriket Eldre Tannklinikk AS", "911113004", { enrichment_state: "enriched", last_verified_at: "2024-06-01T00:00:00.000Z" });
+
+      const all = verifierMod.pickDentalVerifierBatch(dentalDb, 500).map((c) => c.id);
+      assertEq(all, [enrOlder, enrNewer, rawNever, rawOld], "int-L-01: enriched rows first (oldest-verified first among them), then raw rows (never-verified first)");
+
+      const top2 = verifierMod.pickDentalVerifierBatch(dentalDb, 2).map((c) => c.id);
+      assertEq(top2, [enrOlder, enrNewer], "int-L-02: with limit 2, only the enriched rows are picked even though raw rows are older/never-verified");
+
+      const top3 = verifierMod.pickDentalVerifierBatch(dentalDb, 3).map((c) => c.id);
+      assertEq(top3, [enrOlder, enrNewer, rawNever], "int-L-03: raw rows remain eligible after the enriched ones when the limit allows");
     }
 
     if (log) console.log(`  dental-verifier: OK (${passed} assertions)`);

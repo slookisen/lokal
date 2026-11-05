@@ -62,7 +62,14 @@ const VEDLEGG_A_KEYS = [
   "connect.own_ai",
 ];
 
-const S2A_LIVE = ["orders.enabled", "orders.reminder", "auto.guarantee", "notify.order_email", "comms.unsubscribe"];
+// S2e (side v2) adds visibility.profile (the /eier pause card), orders.email
+// (the confirmed order address) and comms.news (the first-login consent).
+const S2A_LIVE = ["orders.enabled", "orders.reminder", "auto.guarantee", "notify.order_email", "comms.unsubscribe",
+  "visibility.profile", "orders.email", "comms.news",
+  // B2 (rfb-bestillinger): the stock-check reminder.
+  "products.stock_check",
+  // dev-request 2026-11-01-rfb-hold-profilen-oppdatert (coming_soon at run time until OWNER_AUTO_UPDATES_ENABLED).
+  "auto.updates"];
 
 function seedProducer(db: Database.Database, id: string, o: { claimed: boolean; isVerified: boolean }): void {
   db.prepare(
@@ -199,7 +206,7 @@ export async function runOwnerFeaturesS2aTests(opts: { log?: boolean } = {}): Pr
       assertTrue(reg.OWNER_FEATURE_GROUPS.every((g) => !!g.label.no && !!g.label.en), "registry: every group has NO+EN label");
       const types = ["switch", "choice", "number", "date", "email", "action", "guarantee", "locked"];
       const surfaceOk = (s: string) =>
-        /^(profile_html|json_ld|listing_html|mcp_search|mcp_info|rest_card|vcard|acp_feed|sitemap|llms|a2a|leaderboard|order_gate)$/.test(s) || /^(email|job):[a-z_]+$/.test(s);
+        /^(profile_html|json_ld|listing_html|mcp_search|mcp_info|rest_card|vcard|acp_feed|sitemap|llms|a2a|leaderboard|order_gate|owner_portal)$/.test(s) || /^(email|job):[a-z_]+$/.test(s);
       for (const e of reg.OWNER_FEATURE_REGISTRY) {
         const ok =
           !!e.label?.no && !!e.label?.en && !!e.description?.no && !!e.description?.en &&
@@ -208,7 +215,9 @@ export async function runOwnerFeaturesS2aTests(opts: { log?: boolean } = {}): Pr
           e.default && "owner" in e.default && "unclaimed" in e.default &&
           e.default.owner !== undefined && e.default.unclaimed !== undefined &&
           ["live", "beta", "coming_soon"].includes(e.status) &&
-          Array.isArray(e.surfaces) && e.surfaces.length > 0 && e.surfaces.every(surfaceOk) &&
+          // S2e: a live consent record whose sending is not built (comms.news)
+          // declares no surface — nothing to observe; every other entry has one.
+          Array.isArray(e.surfaces) && (e.surfaces.length > 0 || (e.consent && e.status === "live")) && e.surfaces.every(surfaceOk) &&
           e.verticals.includes("rfb") && /^\d{4}-\d{2}-\d{2}$/.test(e.since) && /^\d{4}-\d{2}-\d{2}-/.test(e.devRequest) &&
           typeof e.consent === "boolean" && typeof e.outward === "boolean" && typeof e.advanced === "boolean";
         assertTrue(ok, `registry: ${e.key} has NO+EN texts, group, type, default per segment, status, surfaces`);
@@ -227,14 +236,15 @@ export async function runOwnerFeaturesS2aTests(opts: { log?: boolean } = {}): Pr
         if (e.consent) assertEq([e.default.owner, e.default.unclaimed].filter((d) => d === true).length, 0, `registry: consent entry ${e.key} defaults off`);
       }
       assertEq(reg.OWNER_FEATURE_REGISTRY.filter((e) => e.status === "live").map((e) => e.key).sort(), [...S2A_LIVE].sort(),
-        "registry: S2a live set is exactly orders.enabled, orders.reminder, notify.order_email, auto.guarantee, comms.unsubscribe");
+        "registry: live set is exactly the S2a five + S2e visibility.profile, orders.email, comms.news + B2 products.stock_check + auto.updates (behind its flag)");
       const g = (k: string) => reg.getOwnerFeature(k);
       assertEq(g("orders.enabled").storage?.column, "agents.order_notifications_opt_in", "registry: orders.enabled adapter column");
       assertEq([g("orders.enabled").type, g("orders.enabled").default], ["switch", { owner: false, unclaimed: false }], "registry: orders.enabled switch, off for both segments");
       assertEq([g("orders.reminder").type, g("orders.reminder").lockedWhen], ["locked", "orders.enabled"], "registry: orders.reminder locked on with orders.enabled");
       assertEq([g("notify.order_email").type, g("notify.order_email").lockedWhen], ["locked", "orders.enabled"], "registry: notify.order_email locked on with orders.enabled");
       assertEq([g("auto.guarantee").type, g("comms.unsubscribe").type], ["guarantee", "guarantee"], "registry: guarantees");
-      assertEq([g("orders.email").status, g("orders.email").type], ["coming_soon", "email"], "registry: orders.email registered coming_soon");
+      assertEq([g("orders.email").status, g("orders.email").type, g("orders.email").confirmByEmail, g("orders.email").storage?.column],
+        ["live", "email", true, "agents.order_notification_email"], "registry: orders.email live (S2e), changed only by e-mail confirmation, reads the order address column");
       assertEq(g("payments.pay_at_pickup").lockOnUnless, "payments.prepay", "registry: pay_at_pickup locked on unless prepay");
     }
 
@@ -256,6 +266,8 @@ export async function runOwnerFeaturesS2aTests(opts: { log?: boolean } = {}): Pr
     assertEq(rs.featureOn("rfb", OWNED_ID, "auto.guarantee"), true, "featureOn: guarantee on");
     assertEq(rs.rfbFeatureOn(OWNED_ID, "comms.unsubscribe"), true, "rfbFeatureOn wrapper");
     assertEq(rs.resolveOwnerFeature("rfb", EMAILMATCH_ID, "auto.updates").value, "automatic", "segment: unclaimed profile gets the unclaimed default");
+    // dev-request 2026-11-01-rfb-hold-profilen-oppdatert: with OWNER_AUTO_UPDATES_ENABLED off (here) the
+    // pre-live answer («Foreslå til meg»); with it on the owner default is «Fyll tomme felt selv».
     assertEq(rs.resolveOwnerFeature("rfb", OWNED_ID, "auto.updates").value, "suggest", "segment: verified owner gets the owner default");
 
     // ── Resolution order (fixture registry) ────────────────────────────────
@@ -392,11 +404,11 @@ export async function runOwnerFeaturesS2aTests(opts: { log?: boolean } = {}): Pr
     assertEq([fk["orders.reminder"].value, fk["orders.reminder"].source], [false, "locked"], "GET: orders.reminder off while orders off");
     assertEq([fk["auto.guarantee"].value, fk["auto.guarantee"].source, fk["auto.guarantee"].reason.no],
       [true, "locked", "Dette er et løfte fra Rett fra Bonden og kan ikke slås av."], "GET: guarantee on, locked, Norwegian reason");
-    assertEq([fk["visibility.profile"].status, fk["visibility.profile"].value, fk["visibility.profile"].changeable], ["coming_soon", true, false], "GET: coming_soon entry shows its default, not changeable");
+    assertEq([fk["visibility.leaderboard"].status, fk["visibility.leaderboard"].value, fk["visibility.leaderboard"].changeable], ["coming_soon", true, false], "GET: coming_soon entry shows its default, not changeable");
     assertEq(fk["orders.daily_cap"].advanced, true, "GET: advanced flag");
 
     // 409s with Norwegian reason; nothing written.
-    const c1 = await put(OWNED_ID, "visibility.profile", { value: false });
+    const c1 = await put(OWNED_ID, "visibility.leaderboard", { value: false });
     assertEq([c1.status, c1.body?.error, c1.body?.reason, c1.body?.reason_en], [409, "coming_soon", "Kommer snart.", "Coming soon."], "PUT: coming_soon → 409");
     const c2 = await put(OWNED_ID, "auto.guarantee", { value: false });
     assertEq([c2.status, c2.body?.error], [409, "guarantee"], "PUT: guarantee → 409");

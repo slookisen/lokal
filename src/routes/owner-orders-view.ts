@@ -15,7 +15,9 @@ import { cancelActionsEnabled } from "../services/order-actions";
 import { formatPickupTimeOslo, noShowEarliestMs, isOrderAutocompleteEnabled } from "../services/order-lifecycle";
 import { PRICE_BY_AGREEMENT } from "../services/order-pricing";
 import { randomUUID } from "crypto";
+import { soldOutChoices, stockSoftExpiryActiveFor } from "../services/stock-soft-expiry";
 import { isOrderMessagesEnabled, listOrderMessages, orderTakesMessages, ORDER_MESSAGE_MAX_CHARS, type OrderMessageRow } from "../services/order-messages";
+import { OWNER_ORDERS_THEME_CSS, ownerThemeHtml } from "../owner-ui/tokens";
 
 export type OwnerOrdersTab = "venter" | "kommende" | "avsluttet";
 export const OWNER_ORDERS_TABS: ReadonlyArray<{ key: OwnerOrdersTab; label: string }> = [
@@ -211,17 +213,39 @@ const ACTION_LABEL = {
   no_show: "Kunden kom ikke",
   buyer_cancelled: "Kunden avbestilte",
   cannot_deliver: "Kan ikke levere",
+  // B3 (dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier):
+  // the same «Hentet» as the producer's order page — the shared layer's
+  // `complete` (confirmed/ready → completed, completion_source 'seller').
+  complete: "Hentet",
 } as const;
 
 function actionForm(ctx: RowContext, action: keyof typeof ACTION_LABEL, cls: string, extra = ""): string {
   return `<form method="post" action="${esc(ctx.postTo)}" class="mo-form"><input type="hidden" name="action" value="${action}"><input type="hidden" name="idem" value="${randomUUID()}">${extra}<button type="submit" class="mo-btn ${cls}">${ACTION_LABEL[action]}</button></form>`;
 }
 
+/**
+ * B2b-1 «Utsolgt»: a second decline button that also sets the ticked items
+ * (all ticked by default) to out of stock. Only while the soft-expiry rule is
+ * active for the producer, and only when the order has products of it; ""
+ * otherwise, so the page is unchanged with the rule off.
+ */
+function soldOutDeclineForm(o: OwnerOrder, ctx: RowContext): string {
+  if (!stockSoftExpiryActiveFor(o.agent_id)) return "";
+  const choices = soldOutChoices(cartServiceDb(), o.id, o.agent_id);
+  if (!choices.length) return "";
+  const boxes = choices.map((c) =>
+    `<label style="display:block;padding:4px 0"><input type="checkbox" name="sold_out" value="${esc(c.product_id)}" checked> ${esc(c.name)}</label>`,
+  ).join("");
+  return `<form method="post" action="${esc(ctx.postTo)}" class="mo-form" data-sold-out-form="1"><input type="hidden" name="action" value="decline_sold_out"><input type="hidden" name="idem" value="${randomUUID()}">` +
+    `<fieldset style="border:1px solid #e4e2da;border-radius:8px;margin:0 0 6px;padding:6px 10px"><legend style="font-size:.9rem">Utsolgt (settes til «ikke på lager»):</legend>${boxes}</fieldset>` +
+    `<button type="submit" class="mo-btn mo-secondary">Avslå – utsolgt</button></form>`;
+}
+
 function actionsHtml(o: OwnerOrder, ctx: RowContext): string {
   const now = ctx.now ?? new Date();
   if (o.status === "pending") {
     const pickup = `<label class="mo-pick">Hentetid (valgfritt)<input type="datetime-local" name="pickup_time" min="${nowOsloLocalMin(now)}"></label>`;
-    return `<div class="mo-actions">${actionForm(ctx, "confirm", "mo-primary", pickup)}${actionForm(ctx, "decline", "mo-secondary")}</div>`;
+    return `<div class="mo-actions">${actionForm(ctx, "confirm", "mo-primary", pickup)}${actionForm(ctx, "decline", "mo-secondary")}${soldOutDeclineForm(o, ctx)}</div>`;
   }
   if (o.status === "confirmed" || o.status === "ready") {
     const confirmedAt = o.timeline.find((e) => e.to_status === "confirmed")?.created_at ?? null;
@@ -237,7 +261,10 @@ function actionsHtml(o: OwnerOrder, ctx: RowContext): string {
     }
     const hint = isOrderAutocompleteEnabled()
       ? `<p class="mo-hint">Du trenger ikke gjøre mer. Ordren avsluttes av seg selv etter henting.</p>` : "";
-    return `${hint}<details class="mo-menu"><summary>Flere valg</summary>${parts.join("")}</details>`;
+    // B3: «Hentet» is optional (the automatic close stays the main path) and
+    // offered only for confirmed/ready — the layer re-validates on POST.
+    const pickedUp = `<div class="mo-actions">${actionForm(ctx, "complete", "mo-primary")}</div>`;
+    return `${hint}${pickedUp}<details class="mo-menu"><summary>Flere valg</summary>${parts.join("")}</details>`;
   }
   return "";
 }
@@ -407,10 +434,11 @@ export function bannerHtml(done: string, error: string): string {
     if (m) return m;
   }
   if (error === "hentetid") return `<div class="mo-banner warn" role="alert">Hentetiden er ikke gyldig. Velg et tidspunkt fra i dag og fram i tid, eller la feltet stå tomt.</div>`;
+  if (error === "allerede-hentet") return `<div class="mo-banner ok" role="status">Ordren er allerede registrert som hentet. Ingenting ble endret.</div>`;
   if (error === "ugyldig") return `<div class="mo-banner warn" role="alert">Handlingen er ikke gyldig for ordrens status akkurat nå.</div>`;
   if (error) return `<div class="mo-banner warn" role="alert">Kunne ikke oppdatere ordren. Prøv igjen.</div>`;
   const labels: Record<string, string> = {
-    confirmed: "Ordren er bekreftet.", declined: "Ordren er avslått.", cancelled: "Ordren er kansellert.", completed: "Ordren er avsluttet.", ready: "Ordren er oppdatert.",
+    confirmed: "Ordren er bekreftet.", declined: "Ordren er avslått.", cancelled: "Ordren er kansellert.", completed: "Ordren er registrert som hentet.", ready: "Ordren er oppdatert.",
   };
   return labels[done] ? `<div class="mo-banner ok" role="status">${esc(labels[done])}</div>` : "";
 }
@@ -425,6 +453,8 @@ export function renderOrdersPage(opts: {
   done: string;
   error: string;
   now?: Date;
+  /** T6: the shared owner theme (dark mode, token classes); allowlisted subjects only. */
+  ownerTheme?: boolean;
 }): string {
   const base = `/eier/${encodeURIComponent(opts.agentId)}/ordrer`;
   const tabs = OWNER_ORDERS_TABS.map((t) =>
@@ -437,13 +467,15 @@ export function renderOrdersPage(opts: {
     }),
   ).join("\n");
   const empty = opts.orders.length ? "" : `<p class="mo-empty">${opts.tab === "venter" ? "Ingen ordrer venter på svar." : opts.tab === "kommende" ? "Ingen kommende henting." : "Ingen avsluttede ordrer ennå."}</p>`;
-  return ordersShell(`Mine ordrer · ${opts.producerName}`, `
+  const body = `
 <p class="mo-sub"><a href="/eier/${encodeURIComponent(opts.agentId)}/portal">← Eierportalen</a></p>
 <h1>Mine ordrer</h1>
 <p class="mo-sub">${esc(opts.producerName)}</p>
 ${bannerHtml(opts.done, opts.error)}
 <nav class="mo-tabs" aria-label="Ordrer">${tabs}</nav>
-${rows}${empty}`);
+${rows}${empty}`;
+  return ordersShell(`Mine ordrer · ${opts.producerName}`,
+    opts.ownerTheme ? `<style>${OWNER_ORDERS_THEME_CSS}</style>${ownerThemeHtml(body)}` : body);
 }
 
 /** The single-order view opened from the e-mail (token). Shows that order only. */

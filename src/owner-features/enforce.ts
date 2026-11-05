@@ -185,3 +185,32 @@ export function publicAgentInfo<T extends { agent: any; knowledge: any }>(info: 
   return { ...info, agent, knowledge: withoutHiddenFields(info.knowledge, c) };
 }
 
+
+/**
+ * Økologi S1 (A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-
+ * og-tekstrevisjon, S1.7): the agents among `agentIds` whose `auto.debio`
+ * switch is off — no organic display at all for them (the register sync
+ * leaves their `debio_verified` at 0, the profile page shows no approval).
+ * Same gate as the choices above: OWNER_FEATURES_ENFORCE and the allowlist,
+ * otherwise nobody is off. A failed lookup counts the allowlisted ids as off
+ * (fail closed) and logs.
+ */
+export function debioSwitchOffAgentIds(agentIds: Iterable<string>, opts: EnforceOptions = {}): Set<string> {
+  const env = opts.env ?? process.env;
+  const out = new Set<string>();
+  if (!ownerFeaturesEnforceOn(env)) return out;
+  const allowed = new Set(ownerFeaturesAllowedSubjects(env));
+  if (allowed.size === 0) return out;
+  const ids = [...new Set(agentIds)].filter((id) => typeof id === "string" && allowed.has(`rfb:${id}`));
+  if (ids.length === 0) return out;
+  try {
+    const resolved = resolveOwnerFeatureKeysForSubjects("rfb", ids, ["auto.debio"], {
+      db: opts.db, env, registry: registryOverride ?? undefined,
+    });
+    for (const [id, byKey] of resolved) if (byKey["auto.debio"]?.value === false) out.add(id);
+  } catch (err) {
+    console.error("[owner-features] auto.debio lookup failed, treating the switch as off:", err);
+    for (const id of ids) out.add(id);
+  }
+  return out;
+}

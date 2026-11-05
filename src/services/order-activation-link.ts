@@ -114,11 +114,9 @@ function parseToken(secret: string, token: unknown): TokenPayload | null {
   }
 }
 
-/** Short, non-reversible label for logs (never the token itself). */
-export function tokenLogLabel(token: unknown): string {
-  if (typeof token !== "string" || !token) return "none";
-  return crypto.createHash("sha256").update(token, "utf8").digest("hex").slice(0, 10);
-}
+/** Short, non-reversible label for logs (never the token itself). Lives in
+ *  src/utils/log-label.ts; re-exported here so existing imports keep working. */
+export { tokenLogLabel } from "../utils/log-label";
 
 // ─── Generation (admin) ─────────────────────────────────────────────────────
 
