@@ -2,6 +2,7 @@ import { getDb, LEGACY_AGENT_VIEW_SOURCE } from "../database/init";
 import { isAnalyticsRollupReadEnabled, rollupBoundaryDateOn, type RollupRawTable } from "./analytics-rollup-boundary";
 import { ensureTrafficHistoryForDaySync } from "./traffic-history";
 import { notBotSearchSql } from "./search-stats-compute";
+import { aiAgentTokenCaseSql } from "./traffic-classifier";
 import fs from "fs";
 
 export interface RetentionResult {
@@ -34,6 +35,15 @@ const BOT_TYPE_CASE = `
     ELSE 'human'
   END
 `;
+
+/** ai-sok B5: true iff page_view_ai_agent_daily exists (older/mirrored schemas lack it). */
+function hasAiAgentRollupSchema(db: ReturnType<typeof getDb>): boolean {
+  try {
+    return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='page_view_ai_agent_daily'").get();
+  } catch {
+    return false;
+  }
+}
 
 /** B4: true iff analytics_page_views has utm_source AND page_view_utm_daily exists. */
 function hasUtmRollupSchema(db: ReturnType<typeof getDb>): boolean {
@@ -333,6 +343,29 @@ const PAGE_VIEWS_SPEC: PruneSpec = {
            AND (utm_source IS NOT NULL OR utm_medium IS NOT NULL OR utm_campaign IS NOT NULL)
          GROUP BY day, utm_source, utm_medium, utm_campaign, bot_type, vertical_id
          ON CONFLICT(day, utm_source, utm_medium, utm_campaign, bot_type, vertical_id) DO UPDATE SET
+           view_count = view_count + excluded.view_count,
+           session_count = session_count + excluded.session_count`);
+    }
+    // 1d. ai-sok B5: per-AI-agent rollup (additive; page_view_daily is
+    //     unchanged). Token = first AI_AGENT_REGISTRY row found in the UA,
+    //     exactly like aiAgentEntryOf, so OAI-SearchBot, GPTBot and
+    //     ChatGPT-User stay separate after the raw rows are gone. Same window,
+    //     same is_owner exclusion, same transaction, runs before the DELETE.
+    if (hasAiAgentRollupSchema(db)) {
+      sql.push(`INSERT INTO page_view_ai_agent_daily (day, agent, vertical_id, view_count, session_count)
+         SELECT day, agent, vertical_id, COUNT(*) AS view_count, COUNT(DISTINCT session_id) AS session_count
+         FROM (
+           SELECT substr(created_at, 1, 10) AS day,
+                  ${aiAgentTokenCaseSql("session_id")} AS agent,
+                  COALESCE(vertical_id, 'rfb') AS vertical_id,
+                  session_id
+           FROM analytics_page_views
+           WHERE created_at >= ? AND created_at < ?
+             AND (is_owner IS NULL OR is_owner = 0)
+         )
+         WHERE agent IS NOT NULL
+         GROUP BY day, agent, vertical_id
+         ON CONFLICT(day, agent, vertical_id) DO UPDATE SET
            view_count = view_count + excluded.view_count,
            session_count = session_count + excluded.session_count`);
     }

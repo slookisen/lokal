@@ -267,7 +267,7 @@ router.post("/eier/:agentId/produktimport/hent", express.urlencoded({ extended: 
   }
 });
 
-type Preview = NonNullable<ReturnType<typeof getOwnerImportPreview>>;
+export type Preview = NonNullable<ReturnType<typeof getOwnerImportPreview>>;
 type PreviewCandidate = Preview["new"][number];
 type PreviewChanged = Preview["changed"][number];
 
@@ -319,10 +319,52 @@ function publishedPriceText(price: number | null, unit: string, isFrom: boolean,
   return `${isFrom ? "fra " : ""}kr ${formatNok(price)}${unit ? ` / ${unit}` : " (uten enhet)"}${exclVat ? " ekskl. mva." : ""}`;
 }
 
-interface FormState {
+export interface FormState {
   selected: Set<string>;
   remove: Set<string>;
   values: Record<string, { name?: string; price?: string; unit?: string }>;
+}
+
+/**
+ * The page variant the Skive 3b-2 outreach landing page renders the same
+ * preview with: its own title / form target / button, hidden fields (token,
+ * run), a notice (freshness), the «på lager» choice in place of the stock
+ * note, no «Ikke funnet» section (that page never removes products) and the
+ * fetch date on every row. Absent = the Skive 3-2 preview page, unchanged.
+ */
+export interface PreviewVariant {
+  title: string;
+  selfHref: string;
+  actionHref: string;
+  submitLabel: string;
+  hiddenFields: Record<string, string>;
+  noticeHtml?: string;
+  stockChoiceHtml: string;
+}
+
+/** «31.10.2026» from an ISO / SQL timestamp (Europe/Oslo); "" when unreadable. */
+function fetchedDateText(ts: string | null | undefined): string {
+  if (!ts) return "";
+  const d = new Date(/T/.test(ts) ? ts : `${ts.replace(" ", "T")}Z`);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleDateString("nb-NO", { timeZone: "Europe/Oslo", day: "2-digit", month: "2-digit", year: "numeric" });
+}
+
+/**
+ * The short reason on a row that is not ticked from the start (Skive 3c): the
+ * page preselects every suggestion except the ones publishOwnerImport would
+ * refuse (`publish_blocked`), so the reason is that block, in a few words.
+ */
+const NOT_PRESELECTED_REASON_NB: Record<string, string> = {
+  category_label: "ser ut som et kategorinavn",
+  alcohol: "alkohol",
+  service: "tjeneste eller opplevelse",
+  check_failed: "kunne ikke sjekkes",
+};
+
+/** Whether a suggestion's «velg» box is ticked: the submitted form if any, else the default preselection. */
+function isTicked(c: PreviewCandidate, form: FormState | null): boolean {
+  return form ? form.selected.has(c.id) : !c.publish_blocked;
 }
 
 function candidateRowHtml(
@@ -331,13 +373,14 @@ function candidateRowHtml(
   old: PreviewChanged["old"] | null,
   form: FormState | null,
   badFields: Map<string, Set<string>>,
+  showFetchedAt = false,
 ): string {
   const pre = candidatePrefill(c, old);
   const v = form?.values[c.id] ?? {};
   const name = v.name ?? pre.name;
   const price = v.price ?? pre.price;
   const unit = v.unit ?? pre.unit;
-  const checked = form ? form.selected.has(c.id) : !c.publish_blocked;
+  const checked = isTicked(c, form);
   const bad = badFields.get(c.id) ?? new Set<string>();
   const fid = escapeHtml(c.id);
   const field = (key: "navn" | "pris" | "enhet", label: string, value: string, extra: string, errKey: string) =>
@@ -358,11 +401,16 @@ function candidateRowHtml(
   if (c.price_is_from) notes.push(`<div class="ep-audit-meta" data-from-price="1">Nettsiden oppgir en «fra»-pris.</div>`);
   if (c.llm) notes.push(`<div class="ep-audit-meta" data-llm="1">Funnet ved å lese teksten på siden. Sjekk navn og pris ekstra nøye.</div>`);
   if (c.publish_blocked_text) notes.push(`<div class="ep-alert ep-alert-error" role="note" data-blocked="${escapeHtml(String(c.publish_blocked))}">${escapeHtml(c.publish_blocked_text)}</div>`);
+  if (showFetchedAt && fetchedDateText(c.fetched_at)) {
+    notes.push(`<div class="ep-audit-meta" data-fetched-at="${escapeHtml(c.fetched_at)}">Hentet ${escapeHtml(fetchedDateText(c.fetched_at))}</div>`);
+  }
   const source = c.source_url && /^https?:\/\//i.test(c.source_url)
     ? ` <a class="ep-audit-meta" href="${escapeHtml(c.source_url)}" rel="noopener nofollow" target="_blank">Se på nettsiden</a>`
     : "";
   return `<li class="ep-audit-item" data-candidate-id="${fid}" data-kind="${kind}">
-          <label><input type="checkbox" name="velg" value="${fid}"${checked ? " checked" : ""}> <strong>${escapeHtml(c.name)}</strong></label>${source}
+          <label><input type="checkbox" name="velg" value="${fid}"${checked ? " checked" : ""}> <strong>${escapeHtml(c.name)}</strong>${c.publish_blocked
+            ? ` <span class="ep-audit-meta" data-not-preselected="${escapeHtml(String(c.publish_blocked))}">(usikker: ${escapeHtml(NOT_PRESELECTED_REASON_NB[c.publish_blocked] ?? "sjekk varen")})</span>`
+            : ""}</label>${source}
           ${oldNew}
           ${kind === "changed"
             ? `<div class="ep-field" data-name-locked="1"><span>Navn</span> <strong>${escapeHtml(c.name)}</strong> <span class="ep-audit-meta">Navnet kan ikke endres her, fordi varen allerede finnes i profilen din.</span></div>`
@@ -377,16 +425,26 @@ function candidateRowHtml(
 export function renderImportPreviewPage(
   agentId: string,
   p: Preview,
-  opts: { claimant: boolean; errorText?: string | null; form?: FormState | null; fields?: Array<{ id: string; field: string }> } = { claimant: true },
+  opts: {
+    claimant: boolean;
+    errorText?: string | null;
+    form?: FormState | null;
+    fields?: Array<{ id: string; field: string }>;
+    variant?: PreviewVariant;
+    /** «Velg alle» / «Velg ingen» without JS (GET ?valg=): ticks every / no suggestion. Ignored when `form` is set. */
+    valg?: BulkChoice | null;
+  } = { claimant: true },
 ): string {
   const id = encodeURIComponent(agentId);
-  const self = `/eier/${id}/produktimport/${encodeURIComponent(p.run_id)}`;
-  const back = `/eier/${id}/portal#${PRODUCT_IMPORT_ANCHOR}`;
+  const v = opts.variant ?? null;
+  const self = v ? v.selfHref : `/eier/${id}/produktimport/${encodeURIComponent(p.run_id)}`;
+  const back = v ? `/eier/${id}/portal` : `/eier/${id}/portal#${PRODUCT_IMPORT_ANCHOR}`;
   const when = formatImportRunTime(p.created_at);
   const website = p.website ?? "";
   const head = `<div class="ep-card">
-        <h1>Produkter fra nettsiden din</h1>
+        <h1>${escapeHtml(v ? v.title : "Produkter fra nettsiden din")}</h1>
         <p>Hentet fra <strong>${escapeHtml(website)}</strong>${when ? ` ${escapeHtml(when)}` : ""}.</p>
+        ${v?.noticeHtml ?? ""}
         ${opts.errorText ? `<div class="ep-alert ep-alert-error" role="alert" data-publish-error="1">${escapeHtml(opts.errorText)}</div>` : ""}
       </div>`;
   if (p.status === "running") {
@@ -418,13 +476,17 @@ export function renderImportPreviewPage(
     if (!badFields.has(f.id)) badFields.set(f.id, new Set());
     badFields.get(f.id)!.add(f.field);
   }
-  const form = opts.form ?? null;
+  // «Velg alle» / «Velg ingen» (Skive 3c) only tick / untick the suggestions
+  // («velg»); the «fjern» boxes stay unticked as always.
+  const form: FormState | null = opts.form ?? (opts.valg && !v
+    ? { selected: new Set(opts.valg === "alle" ? [...p.new, ...p.changed].map((c) => c.id) : []), remove: new Set(), values: {} }
+    : null);
   const section = (title: string, attr: string, intro: string, rows: string[], empty: string) => `
         <h2 ${attr}>${escapeHtml(title)} (${rows.length})</h2>
         ${intro ? `<p class="ep-audit-meta">${escapeHtml(intro)}</p>` : ""}
         ${rows.length ? `<ul class="ep-audit-list">${rows.join("")}</ul>` : `<p class="ep-audit-meta">${escapeHtml(empty)}</p>`}`;
-  const newRows = p.new.map((c) => candidateRowHtml(c, "new", null, form, badFields));
-  const changedRows = p.changed.map((c) => candidateRowHtml(c, "changed", c.old, form, badFields));
+  const newRows = p.new.map((c) => candidateRowHtml(c, "new", null, form, badFields, !!v));
+  const changedRows = p.changed.map((c) => candidateRowHtml(c, "changed", c.old, form, badFields, !!v));
   const notFoundRows = p.not_found.map((c) => {
     const checked = form ? form.remove.has(c.name) : false; // never preselected
     return `<li class="ep-audit-item" data-not-found="${escapeHtml(c.name)}">
@@ -450,10 +512,48 @@ export function renderImportPreviewPage(
   const claimantNote = opts.claimant
     ? ""
     : `<div class="ep-alert ep-alert-error" role="note" data-claimant-login-required="1">For å publisere må du logge inn med e-postadressen til den som har bekreftet eierskapet til profilen. <a href="/selger?agent=${id}">Logg inn med eierens e-post</a></div>`;
+  if (v) {
+    const hidden = Object.entries(v.hiddenFields)
+      .map(([k, val]) => `<input type="hidden" name="${escapeHtml(k)}" value="${escapeHtml(val)}">`)
+      .join("");
+    return `${head}
+      <div class="ep-card" data-import-status="completed" data-outreach-list="1">
+        <p>Vi fant disse varene på nettsiden din. Alle er krysset av. Rett navn, pris eller enhet om noe er feil, og fjern krysset for varer du ikke vil ha med. Varene du har i profilen i dag, beholdes.</p>
+        <form method="post" action="${escapeHtml(v.actionHref)}">
+          ${hidden}
+          ${section("Nye produkter", 'data-section="new"', "", newRows, "Ingen nye produkter.")}
+          ${section("Endret pris eller enhet", 'data-section="changed"', "Gammel pris → ny pris fra nettsiden.", changedRows, "Ingen endringer i pris eller enhet.")}
+          ${unchanged}
+          ${done}
+          ${v.stockChoiceHtml}
+          ${claimantNote}
+          <div class="ep-form-actions">
+            <button type="submit" class="ep-btn ep-btn-primary">${escapeHtml(v.submitLabel)}</button>
+            <a href="${back}" class="ep-btn ep-btn-secondary">Avbryt</a>
+          </div>
+        </form>
+      </div>`;
+  }
+  const suggestions = [...p.new, ...p.changed];
+  const total = suggestions.length;
+  const selectedCount = suggestions.filter((c) => isTicked(c, form)).length;
+  // «Varer vi er usikre på, er ikke valgt» only while the ticks are exactly the default preselection.
+  const onlyUncertainLeftOut = suggestions.every((c) => isTicked(c, form) === !c.publish_blocked);
+  const lead = selectionLeadText(selectedCount, total, onlyUncertainLeftOut);
+  const counter = (where: string) =>
+    `<span class="ep-audit-meta" data-valg-count="${selectedCount}" data-valg-total="${total}" data-valg-count-at="${where}" aria-live="polite">${selectedCount} av ${total} valgt</span>`;
+  const bulkBar = total
+    ? `<div class="ep-form-actions" data-valg-bar="1">
+            ${counter("top")}
+            <a class="ep-btn ep-btn-secondary" href="${self}?valg=alle" data-valg="alle">Velg alle</a>
+            <a class="ep-btn ep-btn-secondary" href="${self}?valg=ingen" data-valg="ingen">Velg ingen</a>
+          </div>`
+    : "";
   return `${head}
-      <div class="ep-card" data-import-status="completed">
-        <p>Kryss av for varene du vil legge inn, og rett navn, pris eller enhet om noe er feil. Varene du har i dag, beholdes med mindre du krysser av for å fjerne dem.</p>
+      <div class="ep-card" data-import-status="completed" data-import-select-root="1">
+        <p><span data-valg-lead="1">${escapeHtml(lead)}</span> Varene du har i dag, beholdes med mindre du krysser av for å fjerne dem.</p>
         <form method="post" action="${self}/publiser">
+          ${bulkBar}
           ${section("Nye produkter", 'data-section="new"', "", newRows, "Ingen nye produkter.")}
           ${section("Endret pris eller enhet", 'data-section="changed"', "Gammel pris → ny pris fra nettsiden.", changedRows, "Ingen endringer i pris eller enhet.")}
           ${section("Ikke funnet på nettsiden", 'data-section="not_found"', "Disse varene har du i profilen i dag, men vi fant dem ikke på nettsiden. De blir ikke fjernet med mindre du krysser av.", notFoundRows, "Alle varene dine ble funnet.")}
@@ -463,11 +563,74 @@ export function renderImportPreviewPage(
           ${claimantNote}
           <div class="ep-form-actions">
             <button type="submit" class="ep-btn ep-btn-primary">Publiser valgte</button>
+            ${total ? counter("submit") : ""}
             <a href="${back}" class="ep-btn ep-btn-secondary">Avbryt</a>
           </div>
         </form>
+        ${total ? BULK_SELECT_SCRIPT : ""}
       </div>`;
 }
+
+/** The «Velg alle» / «Velg ingen» choice a GET of the preview page may carry. */
+export type BulkChoice = "alle" | "ingen";
+
+/** `?valg=` → "alle" / "ingen"; anything else (missing, other text, repeated) → null (ignored). PURE. */
+export function parseBulkChoice(raw: unknown): BulkChoice | null {
+  return raw === "alle" || raw === "ingen" ? raw : null;
+}
+
+const LEAD_ALL = "Alle varene vi fant er valgt. Fjern krysset for varer du ikke vil legge inn, og rett navn, pris eller enhet om noe er feil.";
+const LEAD_NONE = "Ingen varer er valgt. Sett kryss ved varene du vil legge inn, og rett navn, pris eller enhet om noe er feil.";
+const LEAD_EMPTY = "Vi fant ingen nye varer eller endringer å legge inn.";
+const leadSome = (n: number, total: number) =>
+  `${n} av ${total} varer er valgt. Fjern krysset for varer du ikke vil legge inn, eller sett kryss ved flere. Rett navn, pris eller enhet om noe er feil.`;
+
+/**
+ * The sentence above the list that fits the selection (Skive 3c): never «kryss
+ * av for …» when every suggestion is already ticked. PURE.
+ */
+export function selectionLeadText(selected: number, total: number, onlyUncertainLeftOut: boolean): string {
+  if (total === 0) return LEAD_EMPTY;
+  if (selected >= total) return LEAD_ALL;
+  if (selected === 0) return LEAD_NONE;
+  const some = leadSome(selected, total);
+  return onlyUncertainLeftOut ? some.replace(" valgt. ", " valgt. Varer vi er usikre på, er ikke valgt. ") : some;
+}
+
+/**
+ * With JS, «Velg alle» / «Velg ingen» tick / untick the «velg» boxes (never
+ * «fjern») and the counters and the lead sentence follow every change without
+ * a reload. Without JS the two links reload the page with ?valg=. Inline, like
+ * the other portal scripts (CSP script-src allows 'unsafe-inline'); fixed text
+ * only, nothing from the request.
+ */
+const BULK_SELECT_SCRIPT = `<script>
+        (function () {
+          var root = document.querySelector('[data-import-select-root="1"]');
+          if (!root) return;
+          var LEAD_ALL = ${JSON.stringify(LEAD_ALL)}, LEAD_NONE = ${JSON.stringify(LEAD_NONE)};
+          var SOME = ${JSON.stringify(leadSome(-1, -2))};
+          function boxes() { return root.querySelectorAll('input[type="checkbox"][name="velg"]'); }
+          function update() {
+            var all = boxes(), n = 0, i;
+            for (i = 0; i < all.length; i++) if (all[i].checked) n++;
+            var counts = root.querySelectorAll('[data-valg-count]');
+            for (i = 0; i < counts.length; i++) { counts[i].textContent = n + " av " + all.length + " valgt"; counts[i].setAttribute("data-valg-count", String(n)); }
+            var lead = root.querySelector('[data-valg-lead]');
+            if (lead) lead.textContent = n >= all.length ? LEAD_ALL : n === 0 ? LEAD_NONE : SOME.replace("-1", String(n)).replace("-2", String(all.length));
+          }
+          root.addEventListener("change", function (ev) { if (ev.target && ev.target.name === "velg") update(); });
+          var links = root.querySelectorAll('[data-valg]');
+          for (var j = 0; j < links.length; j++) {
+            links[j].addEventListener("click", function (ev) {
+              ev.preventDefault();
+              var on = this.getAttribute("data-valg") === "alle", all = boxes();
+              for (var k = 0; k < all.length; k++) all[k].checked = on;
+              update();
+            });
+          }
+        })();
+        </script>`;
 
 function pageTitle(): string {
   return "Produkter fra nettsiden din";
@@ -481,7 +644,9 @@ router.get("/eier/:agentId/produktimport/:runId", (req: Request, res: Response) 
     const preview = RUN_ID_RE.test(runId) ? getOwnerImportPreview(auth.agentId, runId) : null;
     if (!preview) return res.status(404).send(PAGE_404());
     const claimant = !!sessionClaimantOwnerEmail(auth.agentId, auth.session);
-    const html = renderImportPreviewPage(auth.agentId, preview, { claimant });
+    // ?valg=alle / ?valg=ingen (Skive 3c, «Velg alle» / «Velg ingen» without JS) only changes the ticks; still read-only.
+    const valg = parseBulkChoice((req.query as Record<string, unknown> | undefined)?.valg);
+    const html = renderImportPreviewPage(auth.agentId, preview, { claimant, valg });
     const headHtml = preview.status === "running" ? `<meta http-equiv="refresh" content="4">` : undefined;
     return res.send(portalShell(pageTitle(), html, { headHtml }));
   } catch (err) {
@@ -491,6 +656,36 @@ router.get("/eier/:agentId/produktimport/:runId", (req: Request, res: Response) 
 });
 
 const asList = (v: unknown): string[] => (Array.isArray(v) ? v : v === undefined ? [] : [v]).filter((x): x is string => typeof x === "string");
+
+/**
+ * The publish selection and the re-render state from a submitted preview
+ * form (`velg` ticks, `navn_/pris_/enhet_<id>` values, `fjern`). Shared by
+ * «Publiser valgte» and the outreach page's «Bekreft og legg inn». PURE.
+ */
+export function publishSelectionFromForm(preview: Preview, body: Record<string, unknown>): { selection: PublishSelection[]; remove: string[]; form: FormState } {
+  const rows = new Map<string, { c: PreviewCandidate; old: { unit: string | null } | null }>();
+  for (const c of preview.new) rows.set(c.id, { c, old: null });
+  for (const c of preview.changed) rows.set(c.id, { c, old: c.old });
+  const ticked = [...new Set(asList(body.velg).filter((x) => CANDIDATE_ID_RE.test(x)))].slice(0, 500);
+  const remove = [...new Set(asList(body.fjern).filter((x) => x.length > 0 && x.length <= 200))].slice(0, 500);
+  const selection: PublishSelection[] = [];
+  const form: FormState = { selected: new Set(ticked), remove: new Set(remove), values: {} };
+  for (const c of rows.values()) {
+    const v = { name: body[`navn_${c.c.id}`], price: body[`pris_${c.c.id}`], unit: body[`enhet_${c.c.id}`] };
+    form.values[c.c.id] = {
+      name: typeof v.name === "string" ? v.name : undefined,
+      price: typeof v.price === "string" ? v.price : undefined,
+      unit: typeof v.unit === "string" ? v.unit : undefined,
+    };
+  }
+  for (const tid of ticked) {
+    const row = rows.get(tid);
+    // A ticked id that is not an open new/changed row of this run goes
+    // through as-is: publishOwnerImport answers 404 / 409 for it.
+    selection.push(row ? selectionFromForm(row.c, row.old, form.values[tid]!) : { id: tid });
+  }
+  return { selection, remove, form };
+}
 
 router.post("/eier/:agentId/produktimport/:runId/publiser", express.urlencoded({ extended: false, parameterLimit: 5000 }), (req: Request, res: Response) => {
   const auth = ownerImportPageAuth(req, res, { write: true });
@@ -502,27 +697,7 @@ router.post("/eier/:agentId/produktimport/:runId/publiser", express.urlencoded({
     const preview = RUN_ID_RE.test(runId) ? getOwnerImportPreview(auth.agentId, runId) : null;
     if (!preview) return res.status(404).send(PAGE_404());
     const body = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
-    const rows = new Map<string, { c: PreviewCandidate; old: { unit: string | null } | null }>();
-    for (const c of preview.new) rows.set(c.id, { c, old: null });
-    for (const c of preview.changed) rows.set(c.id, { c, old: c.old });
-    const ticked = [...new Set(asList(body.velg).filter((x) => CANDIDATE_ID_RE.test(x)))].slice(0, 500);
-    const remove = [...new Set(asList(body.fjern).filter((x) => x.length > 0 && x.length <= 200))].slice(0, 500);
-    const selection: PublishSelection[] = [];
-    const form: FormState = { selected: new Set(ticked), remove: new Set(remove), values: {} };
-    for (const c of rows.values()) {
-      const v = { name: body[`navn_${c.c.id}`], price: body[`pris_${c.c.id}`], unit: body[`enhet_${c.c.id}`] };
-      form.values[c.c.id] = {
-        name: typeof v.name === "string" ? v.name : undefined,
-        price: typeof v.price === "string" ? v.price : undefined,
-        unit: typeof v.unit === "string" ? v.unit : undefined,
-      };
-    }
-    for (const tid of ticked) {
-      const row = rows.get(tid);
-      // A ticked id that is not a pending new/changed row of this run goes
-      // through as-is: publishOwnerImport answers 404 / 409 for it.
-      selection.push(row ? selectionFromForm(row.c, row.old, form.values[tid]!) : { id: tid });
-    }
+    const { selection, remove, form } = publishSelectionFromForm(preview, body);
     const r = publishOwnerImport(auth.agentId, runId, selection, remove, { actorEmail: claimantEmail });
     if (r.ok) {
       return res.redirect(303, importCardBack(

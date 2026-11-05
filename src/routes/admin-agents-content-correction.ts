@@ -92,11 +92,59 @@
 // An object entry merged into a string duplicate keeps the object behaviour
 // above (planned from the renamed object's old key to the new name).
 // Max 50 items per call — this is a targeted lever, not a sweep.
+//
+// ── Owner consent (S2e, dev-request 2026-10-28-rfb-okologisk-merking-…) ──
+// The owner lock used to be absolute: every owner-locked profile came back
+// skipped_claimed, whatever the owner had said. For the organic-labelling
+// text revision we e-mailed owner-locked producers asking them to reply «ja»
+// to a text fix, so a «ja» needs an honest, audited way through. Any item may
+// carry `owner_consent: { crm_message_id }` (null/absent = no consent; any
+// other shape, or an empty / over-long id -> invalid_item). It is checked —
+// in dry-run too, and re-read FRESH inside the apply's per-row transaction,
+// like the lock itself — only when the row IS owner-locked. Consent is valid
+// only if the crm_messages row exists, is direction='in', its thread's
+// contact has crm_contacts.agent_id = the item's agent_id, it was sent FROM
+// that contact (lower(trim(from_email)) = lower(trim(crm_contacts.email)) —
+// a CC'd third party replying on the thread is not the owner), and some
+// thread with the SAME contact_id (any thread — S2e-2: a reply to our notice
+// is often imported as a new thread) holds an earlier direction='out' message
+// that was actually sent (delivery_status='sent'; a queued/drafted/failed row
+// never reached the owner), at most 30 days before the reply. «Earlier»
+// compares julianday(COALESCE(sent_at, received_at)) on both sides, strictly
+// (julianday() normalises ISO «T…Z» and SQLite «YYYY-MM-DD HH:MM:SS» alike).
+// Outbound to other contacts of the same agent does not count. The spec
+// reads «received after the last outbound message with the owner notice»; we
+// cannot identify the notice message generically, and requiring the reply to
+// postdate the very LAST outbound would void the consent as soon as we reply
+// to confirm it — so the rule is «a reply after some outbound we sent to that
+// contact». The latest qualifying outbound is recorded as
+// basis_outbound_message_id in the crm_actions payload. Otherwise
+// invalid_consent and nothing is written. Valid consent bypasses the OWNER
+// LOCK ONLY: curated_fields, junk gates, unchanged, dry-run default and the
+// per-row transaction all still apply. Outcomes: would_write_with_owner_consent
+// / written_with_owner_consent (would_merge_… / merged_… for a product_name
+// merge). The audit notes get ` · owner_consent=<id>` after the reason, and
+// the same transaction inserts a crm_actions row (type owner_consent_applied,
+// actor system) on the reply message's thread/contact. On a row that is NOT
+// owner-locked, owner_consent is ignored (not checked) and the outcome is the
+// normal one — consent is never claimed where it was not what let it through.
+// Without owner_consent behaviour is unchanged (skipped_claimed).
+// Residual risk: the route is admin-key only and every consent write is
+// audited (audit notes + crm_actions), but the check proves «the contact
+// replied after we wrote», not WHAT they agreed to — the admin caller is
+// trusted to cite a reply that really is a «ja» to this fix. One consent
+// message can also be reused across fields/items/calls for the same agent;
+// the crm_actions trail makes such reuse visible, it does not prevent it.
 
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
-import { hasInternalNote, looksLikeCodeArtifact, looksLikeThemeSpam } from "../services/description-quality";
+import {
+  hasInternalNote, looksLikeCodeArtifact, looksLikeThemeSpam,
+  organicClaimGateEnabled, hasUnverifiedOrganicClaim, logOrganicClaimGate,
+  REFUSED_ORGANIC_CLAIM_UNVERIFIED, type OrganicGateAgent,
+} from "../services/description-quality";
+import { readDebioVerified } from "../services/debio-approval";
 import { isProductHeader, isProductNoise, parseProductPrice } from "../services/knowledge-service";
 import { normalizeName } from "../services/product-catalog-sync";
 import {
@@ -148,17 +196,24 @@ type Field = TextField | "product_name" | "products_organic_flag" | ListField;
 const LIST_FIELDS: readonly ListField[] = ["specialties", "certifications", "tags"];
 export const CONTENT_CORRECTION_MAX_PRODUCT_NAME = 200;
 export const CONTENT_CORRECTION_MAX_REMOVE = 100;
+export const CONTENT_CORRECTION_MAX_CONSENT_ID = 200;
 
 type ItemOutcome =
   | "would_write"
   | "written"
   | "would_merge"
   | "merged"
+  | "would_write_with_owner_consent"
+  | "written_with_owner_consent"
+  | "would_merge_with_owner_consent"
+  | "merged_with_owner_consent"
+  | "invalid_consent"
   | "skipped_claimed"
   | "skipped_curated"
   | "skipped_unchanged"
   | "skipped_malformed_json"
   | "refused_junk_text"
+  | "refused_organic_claim_unverified"
   | "invalid_item"
   | "not_found"
   | "error";
@@ -259,11 +314,82 @@ function storageColumn(field: Field): TextField | "products" | ListField {
   return field;
 }
 
-type ValidItem =
+interface OwnerConsent {
+  crm_message_id: string;
+}
+
+type ValidItem = (
   | { agent_id: string; field: TextField; text: string }
   | { agent_id: string; field: "product_name"; old_name: string; text: string }
   | { agent_id: string; field: "products_organic_flag" }
-  | { agent_id: string; field: ListField; remove: string[] };
+  | { agent_id: string; field: ListField; remove: string[] }
+) & { owner_consent?: OwnerConsent };
+
+/** S2e-2: how old (days before the reply) our outbound notice may be. */
+const CONSENT_OUTBOUND_MAX_AGE_DAYS = 30;
+
+/** Result of the (fresh) owner-consent check for one item. */
+type ConsentCheck =
+  | { ok: true; crm_message_id: string; thread_id: string; contact_id: string; basis_outbound_id: string }
+  | { ok: false; crm_message_id: string; detail: string };
+
+/**
+ * Is `crm_message_id` a valid owner consent for `agentId`? See the header
+ * (S2e) for the rule and why «earlier outbound», not «after the last one».
+ * Read-only; called inside the per-row transaction on apply.
+ */
+function checkOwnerConsent(db: ReturnType<typeof getDb>, agentId: string, crmMessageId: string): ConsentCheck {
+  const bad = (detail: string): ConsentCheck => ({ ok: false, crm_message_id: crmMessageId, detail });
+  const m = db.prepare(
+    `SELECT m.direction AS direction, m.thread_id AS thread_id, t.contact_id AS contact_id,
+            c.agent_id AS contact_agent_id,
+            (lower(trim(m.from_email)) = lower(trim(c.email))) AS from_contact,
+            julianday(COALESCE(m.sent_at, m.received_at)) AS ts
+       FROM crm_messages m
+       JOIN crm_threads t ON t.id = m.thread_id
+       LEFT JOIN crm_contacts c ON c.id = t.contact_id
+      WHERE m.id = ?`,
+  ).get(crmMessageId) as
+    | { direction: string; thread_id: string; contact_id: string; contact_agent_id: string | null; from_contact: number | null; ts: number | null }
+    | undefined;
+  if (!m) return bad("owner_consent: crm message not found");
+  if (m.direction !== "in") return bad("owner_consent: crm message is not inbound");
+  if (!m.contact_agent_id || m.contact_agent_id !== agentId) {
+    return bad("owner_consent: crm message's contact does not belong to this agent");
+  }
+  // The reply must come FROM the contact (not a CC'd third party on the thread).
+  if (!m.from_contact) return bad("owner_consent: sender is not the profile's contact");
+  if (m.ts == null) return bad("owner_consent: crm message has no usable timestamp");
+  // S2e-2: our notice may sit in ANY thread with the same contact (a reply is
+  // often imported as a new thread), but must be sent strictly before the
+  // reply and at most CONSENT_OUTBOUND_MAX_AGE_DAYS before it. The latest such
+  // outbound is recorded as the basis in crm_actions.
+  const basis = db.prepare(
+    `SELECT o.id AS id FROM crm_messages o
+       JOIN crm_threads ot ON ot.id = o.thread_id
+      WHERE ot.contact_id = ? AND o.direction = 'out' AND o.delivery_status = 'sent'
+        AND julianday(COALESCE(o.sent_at, o.received_at)) < ?
+        AND julianday(COALESCE(o.sent_at, o.received_at)) >= ? - ?
+      ORDER BY julianday(COALESCE(o.sent_at, o.received_at)) DESC, o.id DESC
+      LIMIT 1`,
+  ).get(m.contact_id, m.ts, m.ts, CONSENT_OUTBOUND_MAX_AGE_DAYS) as { id: string } | undefined;
+  if (!basis) {
+    return bad(
+      `owner_consent: no sent outbound message to this contact in the ${CONSENT_OUTBOUND_MAX_AGE_DAYS} days before the reply — not a reply to our notice`,
+    );
+  }
+  return { ok: true, crm_message_id: crmMessageId, thread_id: m.thread_id, contact_id: m.contact_id, basis_outbound_id: basis.id };
+}
+
+/** Outcome as reported: *_with_owner_consent when consent is what let it through. */
+function reportedOutcome(outcome: ItemOutcome, viaOwnerConsent: boolean | undefined): ItemOutcome {
+  if (!viaOwnerConsent) return outcome;
+  if (outcome === "would_write") return "would_write_with_owner_consent";
+  if (outcome === "would_merge") return "would_merge_with_owner_consent";
+  if (outcome === "written") return "written_with_owner_consent";
+  if (outcome === "merged") return "merged_with_owner_consent";
+  return outcome;
+}
 
 type Invalid = { ok: false; outcome: ItemOutcome; detail: string; agent_id: string };
 
@@ -276,8 +402,28 @@ function junkGate(text: string, agentId: string): Invalid | null {
   return null;
 }
 
-/** Shape + content validation of one caller-supplied item. */
+/**
+ * Shape + content validation of one caller-supplied item, including the
+ * optional owner_consent (S2e): absent or null = none; otherwise it must be
+ * { crm_message_id: non-empty string <= CONTENT_CORRECTION_MAX_CONSENT_ID }.
+ */
 function validateItem(raw: unknown): { ok: true; item: ValidItem } | Invalid {
+  const v = validateItemFields(raw);
+  if (!v.ok) return v;
+  const oc = ((raw ?? {}) as Record<string, unknown>).owner_consent;
+  if (oc === undefined || oc === null) return v;
+  const id = oc && typeof oc === "object" && !Array.isArray(oc) ? (oc as Record<string, unknown>).crm_message_id : undefined;
+  const trimmed = typeof id === "string" ? id.trim() : "";
+  if (!trimmed) {
+    return { ok: false, outcome: "invalid_item", detail: "owner_consent must be { crm_message_id: non-empty string }", agent_id: v.item.agent_id };
+  }
+  if (trimmed.length > CONTENT_CORRECTION_MAX_CONSENT_ID) {
+    return { ok: false, outcome: "invalid_item", detail: `owner_consent.crm_message_id exceeds ${CONTENT_CORRECTION_MAX_CONSENT_ID} chars`, agent_id: v.item.agent_id };
+  }
+  return { ok: true, item: { ...v.item, owner_consent: { crm_message_id: trimmed } } };
+}
+
+function validateItemFields(raw: unknown): { ok: true; item: ValidItem } | Invalid {
   const r = (raw ?? {}) as Record<string, unknown>;
   const agentId = typeof r.agent_id === "string" ? r.agent_id.trim() : "";
   if (!agentId) return { ok: false, outcome: "invalid_item", detail: "agent_id required", agent_id: "" };
@@ -384,9 +530,10 @@ function populatedFieldCount(p: Record<string, unknown>): number {
 }
 
 /**
- * The change one item would make, computed against a lock snapshot. Pure —
- * shared by the dry-run and by the apply's fresh in-transaction re-check, so
- * both always agree on the outcome. `newValue` is the full new column value.
+ * The change one item would make, computed against a lock snapshot. Pure
+ * apart from the (read-only) owner-consent lookup it is handed — shared by the
+ * dry-run and by the apply's fresh in-transaction re-check, so both always
+ * agree on the outcome. `newValue` is the full new column value.
  */
 interface Plan {
   outcome: ItemOutcome;
@@ -407,6 +554,29 @@ interface Plan {
   renamedEntry?: Record<string, unknown>;
   /** product_name: the renamed entry is a plain string (not in the catalog). */
   renamedStringEntry?: boolean;
+  /** S2e: the owner lock was passed on valid owner consent (thread/contact for crm_actions). */
+  viaOwnerConsent?: { crm_message_id: string; thread_id: string; contact_id: string; basis_outbound_id: string };
+}
+
+/**
+ * The owner-lock step of plan(): null = proceed (not locked); otherwise the
+ * outcome to stop at, or `consent` = proceed on valid owner consent (S2e).
+ */
+function ownerLockGate(
+  cur: LockSnapshot,
+  consent: ConsentCheck | undefined,
+): { stop: ItemOutcome; detail?: string } | { consent: Plan["viaOwnerConsent"] } | null {
+  if (!isOwnerLocked(cur)) return null;
+  if (!consent) return { stop: "skipped_claimed" };
+  if (!consent.ok) return { stop: "invalid_consent", detail: consent.detail };
+  return {
+    consent: {
+      crm_message_id: consent.crm_message_id,
+      thread_id: consent.thread_id,
+      contact_id: consent.contact_id,
+      basis_outbound_id: consent.basis_outbound_id,
+    },
+  };
 }
 
 /**
@@ -466,22 +636,57 @@ function applyCatalog(db: ReturnType<typeof getDb>, c: CatalogEffect): void {
   }
 }
 
-function plan(cur: LockSnapshot | undefined, item: ValidItem): Plan {
+/**
+ * `consentFor` is called (lazily) only when the row is owner-locked and the
+ * item carries owner_consent — an unlocked row never checks or claims consent.
+ */
+/**
+ * Økologi S3b (RFB_ORGANIC_CLAIM_GATE, dev-request 2026-10-28-rfb-okologisk-
+ * merking-…, S3 punkt 1): the agents row's debio_verified for an item that
+ * writes text (description / about / product_name) — null when the flag is
+ * off or the item writes no text (list removals and products_organic_flag
+ * only ever take organic claims away), so plan() is unchanged then.
+ */
+function organicGateAgentFor(db: ReturnType<typeof getDb>, item: ValidItem): OrganicGateAgent | null {
+  if (!("text" in item) || !organicClaimGateEnabled()) return null;
+  return readDebioVerified(db, item.agent_id);
+}
+
+function plan(
+  cur: LockSnapshot | undefined,
+  item: ValidItem,
+  consentFor?: () => ConsentCheck,
+  organicAgent?: OrganicGateAgent | null,
+): Plan {
   if (!cur) return { outcome: "not_found" };
+  // Økologi S3b: a correction never writes a new organic claim for a producer
+  // without a valid Debio status. Text is refused whole (a product name too:
+  // the caller named the exact new value, so it is not rewritten for them),
+  // checked first like the junk gate — before the locks. No audit row.
+  if (organicAgent && "text" in item && hasUnverifiedOrganicClaim(item.text, organicAgent)) {
+    return {
+      outcome: REFUSED_ORGANIC_CLAIM_UNVERIFIED,
+      column: storageColumn(item.field),
+      detail: "text contains an organic claim and the producer has no valid Debio status",
+    };
+  }
   const column = storageColumn(item.field);
+  const gate = ownerLockGate(cur, isOwnerLocked(cur) && item.owner_consent && consentFor ? consentFor() : undefined);
+  const viaOwnerConsent = gate && "consent" in gate ? gate.consent : undefined;
+  const stop = gate && "stop" in gate ? gate : undefined;
 
   if (item.field === "description" || item.field === "about") {
     const oldValue = item.field === "description" ? cur.description : cur.about;
-    const base = { column, oldValue, oldPreview: oldValue, newPreview: item.text };
-    if (isOwnerLocked(cur)) return { ...base, outcome: "skipped_claimed" };
+    const base: Plan = { outcome: "would_write", column, oldValue, oldPreview: oldValue, newPreview: item.text, viaOwnerConsent };
+    if (stop) return { ...base, outcome: stop.stop, detail: stop.detail, viaOwnerConsent: undefined };
     if (isFieldCurated(cur.curated_fields, item.field)) return { ...base, outcome: "skipped_curated" };
     if ((oldValue ?? "") === item.text) return { ...base, outcome: "skipped_unchanged" };
     return { ...base, outcome: "would_write", newValue: item.text };
   }
 
   const oldValue = (cur as unknown as Record<string, string | null>)[column] ?? null;
-  const base: Plan = { outcome: "would_write", column, oldValue };
-  if (isOwnerLocked(cur)) return { ...base, outcome: "skipped_claimed" };
+  const base: Plan = { outcome: "would_write", column, oldValue, viaOwnerConsent };
+  if (stop) return { ...base, outcome: stop.stop, detail: stop.detail, viaOwnerConsent: undefined };
   if (isFieldCurated(cur.curated_fields, column)) return { ...base, outcome: "skipped_curated" };
   const arr = parseJsonArray(oldValue);
   if (!arr) return { ...base, outcome: "skipped_malformed_json", detail: `stored ${column} is not a JSON array` };
@@ -580,13 +785,20 @@ function catalogFor(db: ReturnType<typeof getDb>, item: ValidItem, p: Plan): Cat
   return planCatalog(db, item.agent_id, p.renamedEntry, item.text);
 }
 
+/** Lazy owner-consent check for plan() — undefined when the item carries none. */
+function consentChecker(db: ReturnType<typeof getDb>, item: ValidItem): (() => ConsentCheck) | undefined {
+  const oc = item.owner_consent;
+  return oc ? () => checkOwnerConsent(db, item.agent_id, oc.crm_message_id) : undefined;
+}
+
 /** Write ONE correction — fresh lock re-read inside its own transaction. */
 function applyCorrection(item: ValidItem, reason: string, batchTag: string): ApplyResult {
   const db = db_();
   try {
     const tx = db.transaction((): ApplyResult => {
       const cur = db.prepare(LOCK_SNAPSHOT_SQL).get(item.agent_id) as LockSnapshot | undefined;
-      const p = plan(cur, item);
+      // Owner consent is re-checked here, fresh, inside this row's transaction.
+      const p = plan(cur, item, consentChecker(db, item), organicGateAgentFor(db, item));
       if (p.outcome !== "would_write" && p.outcome !== "would_merge") return { ...p, name: cur?.name };
 
       const nowIso = new Date().toISOString();
@@ -609,6 +821,8 @@ function applyCorrection(item: ValidItem, reason: string, batchTag: string): App
         catalog.applied = catalog.action !== "none";
       }
       let notes = `${batchTag}: ${reason}`;
+      const consent = p.viaOwnerConsent;
+      if (consent) notes += ` · owner_consent=${consent.crm_message_id}`;
       if (p.merge) {
         notes += ` [merge: kept ${p.merge.kept} ${JSON.stringify(p.merge.kept_product)}; dropped ${JSON.stringify(p.merge.dropped_product)}]`;
       }
@@ -618,7 +832,25 @@ function applyCorrection(item: ValidItem, reason: string, batchTag: string): App
            (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
          VALUES (?, ?, ?, ?, ?, 'admin', NULL, datetime('now'), ?)`,
       ).run(randomUUID(), item.agent_id, col, p.oldValue ?? null, newValue, notes);
-      return { ...p, outcome: p.outcome === "would_merge" ? "merged" : "written", name: cur!.name, catalog };
+      if (consent) {
+        db.prepare(
+          `INSERT INTO crm_actions (id, thread_id, contact_id, type, actor, payload)
+           VALUES (?, ?, ?, 'owner_consent_applied', 'system', ?)`,
+        ).run(
+          randomUUID(),
+          consent.thread_id,
+          consent.contact_id,
+          JSON.stringify({
+            agent_id: item.agent_id,
+            field: item.field,
+            crm_message_id: consent.crm_message_id,
+            basis_outbound_message_id: consent.basis_outbound_id,
+            batch_tag: batchTag,
+          }),
+        );
+      }
+      const written: ItemOutcome = p.outcome === "would_merge" ? "merged" : "written";
+      return { ...p, outcome: reportedOutcome(written, !!consent), name: cur!.name, catalog };
     });
     return tx();
   } catch (e: any) {
@@ -694,10 +926,17 @@ router.post("/", (req: Request, res: Response) => {
       // Dry-run reports the lock state too, so the caller sees what WOULD be
       // refused before spending an apply on it.
       const cur = db.prepare(LOCK_SNAPSHOT_SQL).get(item.agent_id) as LockSnapshot | undefined;
-      const p = plan(cur, item);
-      results.push(toResult(item, { ...p, name: cur?.name, catalog: catalogFor(db, item, p) }));
+      const p = plan(cur, item, consentChecker(db, item), organicGateAgentFor(db, item));
+      const catalog = catalogFor(db, item, p);
+      results.push(toResult(item, { ...p, outcome: reportedOutcome(p.outcome, !!p.viaOwnerConsent), name: cur?.name, catalog }));
     } else {
       results.push(toResult(item, applyCorrection(item, reason, batchTag)));
+    }
+  }
+
+  for (const r of results) {
+    if (r.outcome === REFUSED_ORGANIC_CLAIM_UNVERIFIED) {
+      logOrganicClaimGate("POST /admin/agents/content-correction", r.outcome, r.agent_id, String(r.field ?? ""));
     }
   }
 

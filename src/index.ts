@@ -4,6 +4,7 @@ import path from "path";
 import { getDb, closeDb } from "./database/init";
 import { runTrafficHistoryJob, startTrafficHistoryScheduler } from "./services/traffic-history";
 import { flushAiDeliveries, startAiDeliveriesFlusher } from "./services/profile-ai-deliveries";
+import { flushAiClicks, startAiClicksFlusher } from "./services/profile-ai-clicks";
 import { runWalCheckpoints, getWalSizes } from "./services/wal-maintenance";
 import { isNameFtsEnabled, syncAgentsNameFts } from "./services/name-search-fts";
 import { createOffsiteBackupTick, getOffsiteBackupHealth, OFFSITE_TICK_MS } from "./services/offsite-backup";
@@ -101,6 +102,7 @@ import adminRunPlatformVerifierRoutes from "./routes/admin-run-platform-verifier
 import adminVerifierSweepStatusRouter from "./routes/admin-verifier-sweep-status";
 import ownerPortalRoutes from "./routes/owner-portal";
 import ownerProductImportRoutes from "./routes/owner-product-import";
+import ownerProductOutreachRoutes from "./routes/owner-product-outreach";
 import ownerFeaturesRoutes from "./routes/owner-features";
 import ownerOrdersRoutes from "./routes/owner-orders";
 import buyerOrderCardRoutes from "./routes/buyer-order-card";
@@ -136,6 +138,7 @@ import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-mer
 import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
 import adminAgentsBusinessTypeRoutes from "./routes/admin-agents-business-type";
 import adminTestProducerRoutes from "./routes/admin-test-producer";
+import adminTestClaimFixtureRoutes from "./routes/admin-test-claim-fixture";
 import adminOwnerFeaturesInterestRoutes from "./routes/admin-owner-features-interest";
 import adminOwnerFeaturesSwitchProbeRoutes from "./routes/admin-owner-features-switch-probe";
 import adminGardssalgSwitchProbeRoutes from "./routes/admin-gardssalg-switch-probe";
@@ -558,6 +561,9 @@ app.use("/", ownerFeaturesRoutes);
 // from the profile's own website (/api/agents/:id/product-import[/fetch|/runs/:runId[/publish]]).
 // Flag PRODUCT_IMPORT_ENABLED (default off → 404); same owner session + isVerifiedOwner + is_verified=1.
 app.use("/", ownerProductImportRoutes);
+// Skive 3b-2: the signed outreach landing page /eier/:id/varer/forslag?t=… (GET list / POST «Bekreft og legg inn»).
+// Flag PRODUCT_IMPORT_OUTREACH_ENABLED (default off → 404); token + owner session + isVerifiedOwner + is_verified=1.
+app.use("/", ownerProductOutreachRoutes);
 // dev-request 2026-10-21-rfb-mine-ordrer (Fase A2): «Mine ordrer» for owners
 // (/eier/:id/ordrer, session) and the per-order e-mail view (/produsent/ordre/:token/kompakt).
 app.use("/", ownerOrdersRoutes);
@@ -953,6 +959,10 @@ app.use("/admin/agents/business-type", adminLimiter, adminAgentsBusinessTypeRout
 // orders (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt):
 // dry-run default, arm/retire, refuses every non-fixture row.
 app.use("/admin/test-producer", adminLimiter, adminTestProducerRoutes);
+// POST /admin/test-claim-fixture — the ONE hidden, UNCLAIMED claim-test profile
+// (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post AC6): dry-run
+// default, arm (create/reset) / retire, refuses every other row.
+app.use("/admin/test-claim-fixture", adminLimiter, adminTestClaimFixtureRoutes);
 // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2e: «Gi meg beskjed» counts per planned key (read-only).
 app.use("/admin/owner-features/interest", adminLimiter, adminOwnerFeaturesInterestRoutes);
 // S2d-3: the switch probe («bryterprobe») on the hidden test producer — behind
@@ -1599,6 +1609,9 @@ app.listen(Number(PORT), HOST, async () => {
   // in-memory delivery counts are written as daily sums every minute and on
   // shutdown (below).
   startAiDeliveriesFlusher();
+  // «Klikk fra AI-svar» (dev-request 2026-10-14-klikk-fra-ai-svar-per-profil,
+  // slice 2): the same minute flush + shutdown flush for clicks from AI answers.
+  startAiClicksFlusher();
 
   // ─── PR-92 (2026-06-01): daily analytics auto-prune ───────────────
   // Keeps the DB from growing unbounded (analytics_page_views adds
@@ -2221,6 +2234,42 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
 }
 
 // ─── A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
+// felles-serverjobbramme, «Innsnevring 2026-10-28», skive 3k med punkt b:
+// needs_review content judgements — same file-queue mechanics as the two
+// proposal jobs above (services/proposal-file-queue.ts), reading
+// `experiences-content-judgements/` in slookisen/A2A (verdicts a Cloud
+// Routine rendered on Daniel's subscription) and storing them through
+// applyExperienceContentJudgements(), which re-checks every item and writes
+// through the same shared code as POST /admin/experiences-content-judge-
+// sweep. Never calls an LLM. OFF by default:
+// EXPERIENCE_CONTENT_JUDGEMENT_JOB_ENABLED === "true" turns it on; flipping
+// it back is the rollback. First tick 9 minutes after boot, hourly after
+// that; an overlapping tick is skipped.
+if (process.env.ENABLE_EXPERIENCES === "1") {
+  let experienceContentJudgementsRunning = false;
+  const experienceContentJudgementsTick = trackJob("experience-content-judgements", async () => {
+    if (experienceContentJudgementsRunning) return;
+    experienceContentJudgementsRunning = true;
+    try {
+      const { tickExperienceContentJudgements } = await import("./services/experience-content-judgement-job");
+      const r = await tickExperienceContentJudgements();
+      if (r.skipped_reason === "disabled") return;
+      console.log(
+        `[experience-content-judgements] tick run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
+          `listed=${r.files_listed} processed=${r.processed.length} written=${r.written} ` +
+          `github_error=${r.github_error ? "yes" : "no"} envelope=${r.envelope_recorded}`,
+      );
+    } catch (err) {
+      console.error("[experience-content-judgements] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      experienceContentJudgementsRunning = false;
+    }
+  });
+  setTimeout(() => { void experienceContentJudgementsTick(); }, 9 * 60_000);
+  setInterval(() => { void experienceContentJudgementsTick(); }, 60 * 60_000);
+}
+
+// ─── A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
 // felles-serverjobbramme, tillegg 2026-10-15 «4b-det»: the gårdssalg content
 // queue (drink cohort first, then generic) drained by the platform once a
 // day, exactly like gardssalg-outreach-daily below ───────────────────────
@@ -2260,6 +2309,45 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
   });
   setTimeout(() => { void gardssalgCrDailyTick(); }, 7 * 60_000);
   setInterval(() => { void gardssalgCrDailyTick(); }, 10 * 60_000);
+}
+
+// ─── A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
+// felles-serverjobbramme, «Innsnevring 2026-10-28» step 3n: the two org.nr
+// paths (Trinn A website, Trinn B name+kommune) run by the platform once a
+// day, plus punkt a (admission_checked_at reset for needs_review rows of a
+// provider just resolved brreg_active=1) ─────────────────────────────────
+//
+// Same pattern as gardssalg-content-refresh-daily above: checks every 10
+// minutes, fires once inside EXPERIENCE_ORGNR_JOB_WINDOW_HOUR_UTC (default
+// 04), stamp persisted in boot_job_state. OFF by default:
+// EXPERIENCE_ORGNR_JOB_ENABLED=true turns it on; flipping it back is the
+// rollback. No LLM. Manual/dry runs: POST /api/opplevelser/admin/experience-orgnr-job-run.
+if (process.env.ENABLE_EXPERIENCES === "1") {
+  let lastExperienceOrgnrRunAt: Date | null = null;
+  let experienceOrgnrRunning = false;
+  const experienceOrgnrDailyTick = trackJob("experience-orgnr-daily", async () => {
+    if (experienceOrgnrRunning) return;
+    experienceOrgnrRunning = true;
+    const now = new Date();
+    try {
+      const { tickExperienceOrgnrDaily } = await import("./services/experience-orgnr-job");
+      const t = await tickExperienceOrgnrDaily({ now, lastRunAt: lastExperienceOrgnrRunAt });
+      lastExperienceOrgnrRunAt = t.lastRunAt;
+      const r = t.report;
+      if (!r) return;
+      console.log(
+        `[experience-orgnr-daily] run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
+          `processed=${r.totals.processed} active=${r.totals.resolved_active} inactive=${r.totals.resolved_inactive} ` +
+          `admission_reset=${r.totals.admission_reset_rows} errors=${r.totals.errors} envelope=${r.envelope_recorded}`,
+      );
+    } catch (err) {
+      console.error("[experience-orgnr-daily] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      experienceOrgnrRunning = false;
+    }
+  });
+  setTimeout(() => { void experienceOrgnrDailyTick(); }, 8 * 60_000);
+  setInterval(() => { void experienceOrgnrDailyTick(); }, 10 * 60_000);
 }
 
 // ─── dev-request 2026-10-21-rfb-produktimport-fra-egen-nettside, runde 2
@@ -2675,7 +2763,7 @@ if (process.env.DISPATCH_TICK_DISABLED === "1" || !dispatchRoutinesConfigured) {
 }
 
 // ─── Graceful shutdown ───────────────────────────────────────
-process.on("SIGTERM", () => { discoveryService.shutdown(); flushAiDeliveries(); closeDb(); process.exit(0); });
-process.on("SIGINT", () => { discoveryService.shutdown(); flushAiDeliveries(); closeDb(); process.exit(0); });
+process.on("SIGTERM", () => { discoveryService.shutdown(); flushAiDeliveries(); flushAiClicks(); closeDb(); process.exit(0); });
+process.on("SIGINT", () => { discoveryService.shutdown(); flushAiDeliveries(); flushAiClicks(); closeDb(); process.exit(0); });
 
 export default app;

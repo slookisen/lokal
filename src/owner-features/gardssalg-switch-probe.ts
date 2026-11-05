@@ -704,11 +704,16 @@ function a2aBody(f: GardssalgProbeFixture): any {
   return { jsonrpc: "2.0", id: "switch-probe", method: "message/send", params: { message: { role: "user", parts } } };
 }
 
+/** Where the operator sets the test row's place (O2c). */
+const A2A_LOCATION_ROUTE = "POST /api/opplevelser/admin/gardssalg/test-provider { email, lat, lon } (eventuelt { kommune })";
+
 function a2aHint(f: GardssalgProbeFixture): string | undefined {
   if (f.lat === null || f.lon === null) {
     return f.kommune
-      ? undefined
-      : "testprodusenten har verken koordinater eller kommune, så A2A-søket (maks 20 treff, uten fritekst) kan ikke nå den";
+      ? `testprodusenten har kommune (${f.kommune}), men ingen koordinater: A2A-søket (maks 20 treff, uten fritekst) når den bare ` +
+        `hvis kommunenavnet gjenkjennes og raden er blant de 20 første — sett koordinater med ${A2A_LOCATION_ROUTE}`
+      : "testprodusenten har verken koordinater eller kommune, så A2A-søket (maks 20 treff, uten fritekst) kan ikke nå den — " +
+        `sett et sted på testraden med ${A2A_LOCATION_ROUTE}`;
   }
   return undefined;
 }

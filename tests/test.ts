@@ -46,6 +46,16 @@ import conversationUiRouter, {
   renderTranscriptBody,
 } from "../src/routes/conversation-ui";
 import { swapOutModules, swappedOutModuleIds, withModulesSwappedOut } from "./module-cache";
+import { __setImportValuesHiddenForTesting } from "../src/services/dental-import-display";
+
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon
+// (F2-S10): with IMPORT_VALUES_HIDDEN on, a dental row without an org.nr.,
+// organisasjonsform and naeringskode is not public. Most dental fixtures in
+// this file and the suites it runs are such rows (they predate F2-S10), so
+// the run starts with the switch off, which gives the answers as before
+// F2-S10. src/services/dental-import-display.test.ts runs on the default
+// (on) and puts this back when it is done.
+__setImportValuesHiddenForTesting(false);
 
 // ─────────────────────────────────────────────────────────────────────────
 // SHARED GLOBAL STATE — read this before adding a new test block.
@@ -310,6 +320,17 @@ const failures: string[] = [];
 let _serialChain: Promise<void> = Promise.resolve();
 // Read by the env-hygiene check before the summary.
 const _suiteStartedAtMs = Date.now();
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S6):
+// the Helfo claim needs a stored source (resolveHelfoClaim). Gives every
+// dental row stored with helfo_agreement 'true' a homepage source for it,
+// merged into its field_provenance, for fixtures written before the rule.
+function giveDentalHelfoSources(db: { prepare(sql: string): { run(...args: unknown[]): unknown } }): void {
+  db.prepare(
+    "UPDATE dental_agents SET field_provenance = json_set(CASE WHEN json_valid(field_provenance) THEN field_provenance ELSE '{}' END," +
+    " '$.helfo_agreement', json(?)) WHERE helfo_agreement = 'true'"
+  ).run(JSON.stringify([{ value: "true", source_type: "homepage", source_url: "https://example.test/helfo", fetched_at: "2026-05-01T10:00:00Z" }]));
+}
+
 function runSerial(fn: () => Promise<void> | void): Promise<void> {
   const next = _serialChain.then(fn, fn);
   _serialChain = next.then(() => {}, () => {});
@@ -911,6 +932,25 @@ runSerial(async () => {
   }
 });
 
+// bulk-load stamps experience_providers.name_collision at first harvest
+// (verdict.name_collision from classifyProvider) — own in-memory DBs,
+// runSerial() like the sibling bulk-load blocks.
+runSerial(async () => {
+  console.log("\n── bulk-load: name_collision stamp at first harvest ──");
+  try {
+    const { runOpplevelserBulkLoadNameCollisionTests } = require("../src/routes/opplevelser-bulk-load-name-collision.test") as
+      typeof import("../src/routes/opplevelser-bulk-load-name-collision.test");
+    const r = await runOpplevelserBulkLoadNameCollisionTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("bulk-load-name-collision: " + f);
+    console.log(`  bulk-load-name-collision: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bulk-load-name-collision: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── dev-request rfb-kvalitetsgate-parity: RFB's LLM-judge quality-gate
 // cascade (judgeRfbAboutCandidate/meetsRfbAboutQualityBar/
 // isRfbJudgeInfraFailure, routes/admin-agents.ts) — sentinel/fail-closed
@@ -1128,6 +1168,21 @@ console.log("\n── rfb-producer-en-seo (buildProducerPageTitle / buildProduce
   console.log(`  rfb-producer-en-seo: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// dev-request 2026-10-27-produsentside-sted-dobbelt-i-navn-og-tekst («Malm i
+// Malm»): sentence/title builders must not append « i {sted}» to a name that
+// already ends with « — {sted}»; non-place suffixes and suffix-less names are
+// byte-identical to before.
+console.log("\n── rfb-producer-place-dedup (nameForPlaceSentence) ──");
+{
+  const { runRfbProducerPlaceDedupTests } = require("../src/routes/rfb-producer-place-dedup.test") as
+    typeof import("../src/routes/rfb-producer-place-dedup.test");
+  const r = runRfbProducerPlaceDedupTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("rfb-producer-place-dedup: " + f);
+  console.log(`  rfb-producer-place-dedup: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // dev-request 2026-09-09-rfb-profil-intro-setning-selger-bestill-direkte:
 // the producer-page opening sentence must not claim "selger ... bestill
 // direkte" unless there's a real sourced product list AND a confirmed
@@ -1169,6 +1224,20 @@ console.log("\n── rfb-address-normalization-c1 ──");
   failed += r.failed;
   for (const f of r.failures) failures.push("rfb-address-normalization-c1: " + f);
   console.log(`  rfb-address-normalization-c1: ${r.passed} passed, ${r.failed} failed`);
+}
+
+// ── extractAddress «Skive A» (2026-11-01): only the clean «street nr,
+// postnummer poststed» or null — block boundaries as line breaks, trailing
+// Norge/Norway dropped, in-memory postnummerregister check, name-prefix guard. ──
+console.log("\n── rfb-extract-address-skive-a ──");
+{
+  const { runRfbExtractAddressSkiveATests } = require("../src/routes/rfb-extract-address-skive-a.test") as
+    typeof import("../src/routes/rfb-extract-address-skive-a.test");
+  const r = runRfbExtractAddressSkiveATests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("rfb-extract-address-skive-a: " + f);
+  console.log(`  rfb-extract-address-skive-a: ${r.passed} passed, ${r.failed} failed`);
 }
 
 // ── dev-request 2026-07-28-rfb-kontaktekstraksjon-orgnr-som-telefon
@@ -1988,11 +2057,11 @@ function captureFromInvitation(): { subject: string; html: string; text: string 
     captured = { subject: opts.subject };
     return { success: true, messageId: "test" };
   };
-  void svc.sendClaimConfirmation("ola@example.com", "Test Gård", "https://rettfrabonden.com/admin");
+  void svc.sendClaimConfirmation("ola@example.com", "Test Gård", "https://rettfrabonden.com/magic-link-verify?token=abc", "agent-1");
   assertEq(
     captured ? captured.subject : "",
-    "Gratulerer! Test Gård er nå ditt på Rett fra Bonden",
-    "email: confirmation subject byte-identical",
+    "Profilen til Test Gård er nå din på Rett fra Bonden",
+    "email: confirmation subject byte-identical (K5 text)",
   );
 }
 
@@ -6177,6 +6246,20 @@ const _m2Promise = (async function runOwnerPortalTests() {
         created_at TEXT DEFAULT (datetime('now')),
         expires_at TEXT NOT NULL
       );
+      -- K5 (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post):
+      -- request-magic-link also accepts a verified claimant's address, so it
+      -- reads agent_claims for any address that is not agent_knowledge.email.
+      CREATE TABLE agent_claims (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        claimant_name TEXT NOT NULL,
+        claimant_email TEXT NOT NULL,
+        status TEXT DEFAULT 'pending',
+        claim_token TEXT,
+        claim_token_expires_at TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        verified_at TEXT
+      );
       CREATE TABLE agent_knowledge_audit (
         id TEXT PRIMARY KEY,
         agent_id TEXT NOT NULL,
@@ -6451,6 +6534,116 @@ const _m2Promise = (async function runOwnerPortalTests() {
       } finally {
         (emailSvcMod2.emailService as any).sendEmail = origSendEmail2;
       }
+    }
+
+    // ── T1 (dev-request "eierportal bølge 0"): magic-link tokens and owner
+    //    e-mail addresses must never reach the logs in clear text. The verify
+    //    token becomes the 7-day rfb_owner_session cookie and is accepted as
+    //    a Bearer token, so a logged token = a stolen owner session. ────────
+    {
+      const crypto = require("crypto") as typeof import("crypto");
+      const logLabelMod = require("../src/utils/log-label") as typeof import("../src/utils/log-label");
+      // Capture console output (still forwarded, so concurrent suites keep
+      // their own output) for the duration of fn().
+      async function captureLogs(fn: () => Promise<void>): Promise<string> {
+        const lines: string[] = [];
+        const orig = { log: console.log, warn: console.warn, error: console.error, info: console.info };
+        const wrap = (k: keyof typeof orig) => (...args: unknown[]) => {
+          lines.push(args.map((a) => (typeof a === "string" ? a : (() => { try { return JSON.stringify(a); } catch { return String(a); } })())).join(" "));
+          (orig[k] as (...a: unknown[]) => void).apply(console, args);
+        };
+        console.log = wrap("log"); console.warn = wrap("warn"); console.error = wrap("error"); console.info = wrap("info");
+        try { await fn(); } finally {
+          console.log = orig.log; console.warn = orig.warn; console.error = orig.error; console.info = orig.info;
+        }
+        return lines.join("\n");
+      }
+
+      const T1_AGENT_ID = "m2-t1-logredact-agent";
+      const T1_EMAIL = "Eier.T1@Logredact-Gard.example.no";
+      portalDb.prepare(
+        "INSERT OR REPLACE INTO agents (id, name, slug, description, provider, contact_email, url, role, api_key) VALUES (?, ?, ?, 'test', 'test', ?, 'https://example.no', 'producer', 'k-t1')"
+      ).run(T1_AGENT_ID, "M2 T1 Gård", "m2-t1-gaard", T1_EMAIL);
+      portalDb.prepare(
+        "INSERT OR REPLACE INTO agent_knowledge (agent_id, email, field_provenance, verification_status, enrichment_status) VALUES (?, ?, '{}', 'unverified', 'partial')"
+      ).run(T1_AGENT_ID, T1_EMAIL);
+
+      // t1-1/2: valid token → redirected to the portal, logs carry only the hash label.
+      const validToken = crypto.randomBytes(32).toString("hex");
+      portalDb.prepare(
+        `INSERT INTO magic_links (id, email, token, agent_id, used, created_at, expires_at)
+         VALUES (?, ?, ?, ?, 0, ?, datetime('now', '+1 day'))`
+      ).run("ml_t1_valid", T1_EMAIL, validToken, T1_AGENT_ID, new Date().toISOString());
+      let validResp: { status: number; headers: any; body: string } = { status: 0, headers: {}, body: "" };
+      const validLogs = await captureLogs(async () => {
+        validResp = await req("GET", `/magic-link-verify?token=${validToken}`);
+      });
+      assertEq(validResp.status, 302, "m2-t1-1: valid magic-link token still redirects (behaviour unchanged)");
+      assertTrue(
+        String(validResp.headers.location || "") === `/eier/${T1_AGENT_ID}/portal`,
+        "m2-t1-1: valid token redirects to the owner portal"
+      );
+      assertTrue(!validLogs.includes(validToken), "m2-t1-2: valid magic-link token never appears in logs");
+      assertTrue(
+        validLogs.includes(logLabelMod.tokenLogLabel(validToken)),
+        "m2-t1-2: logs carry the token's hash label instead"
+      );
+
+      // t1-3: invalid/unknown token → same, on the 'Invalid or expired' path.
+      const invalidToken = crypto.randomBytes(32).toString("hex");
+      let invalidResp: { status: number; headers: any; body: string } = { status: 0, headers: {}, body: "" };
+      const invalidLogs = await captureLogs(async () => {
+        invalidResp = await req("GET", `/magic-link-verify?token=${invalidToken}`);
+      });
+      assertEq(invalidResp.status, 302, "m2-t1-3: invalid token still redirects to /?error=invalid_token");
+      assertTrue(!invalidLogs.includes(invalidToken), "m2-t1-3: invalid magic-link token never appears in logs");
+      assertTrue(
+        invalidLogs.includes(`Invalid or expired token: ${logLabelMod.tokenLogLabel(invalidToken)}`),
+        "m2-t1-3: invalid-token log line carries the hash label"
+      );
+
+      // t1-4/5/6: request-magic-link (success, mismatch, failed send) never logs the address.
+      const emailSvcT1 = require("../src/services/email-service") as typeof import("../src/services/email-service");
+      const origSendT1 = emailSvcT1.emailService.sendEmail.bind(emailSvcT1.emailService);
+      let sendOk = true;
+      (emailSvcT1.emailService as any).sendEmail = async () => (sendOk ? { success: true, messageId: "mock-t1" } : { success: false, error: "mock-fail" });
+      const statuses: number[] = [];
+      const wrongEmail = "someone.else@other-t1.example.no";
+      let emailLogs = "";
+      try {
+        const hdrs = { "Content-Type": "application/json" };
+        emailLogs = await captureLogs(async () => {
+          statuses.push((await req("POST", `/api/agents/${T1_AGENT_ID}/request-magic-link`, { headers: hdrs, body: JSON.stringify({ email: T1_EMAIL }), expectOk: true })).status);
+          statuses.push((await req("POST", `/api/agents/${T1_AGENT_ID}/request-magic-link`, { headers: hdrs, body: JSON.stringify({ email: wrongEmail }) })).status);
+          sendOk = false;
+          statuses.push((await req("POST", `/api/agents/${T1_AGENT_ID}/request-magic-link`, { headers: hdrs, body: JSON.stringify({ email: T1_EMAIL }) })).status);
+        });
+      } finally {
+        (emailSvcT1.emailService as any).sendEmail = origSendT1;
+      }
+      assertEq(statuses.join(","), "200,404,500", "m2-t1-4: request-magic-link success/mismatch/send-fail statuses unchanged");
+      const lowerLogs = emailLogs.toLowerCase();
+      assertTrue(
+        !lowerLogs.includes(T1_EMAIL.toLowerCase()) && !lowerLogs.includes(wrongEmail.toLowerCase()),
+        "m2-t1-5: owner e-mail address (any casing) never appears in request-magic-link logs"
+      );
+      assertTrue(
+        emailLogs.includes(logLabelMod.emailLogLabel(T1_EMAIL)) && emailLogs.includes(logLabelMod.emailLogLabel(wrongEmail)),
+        "m2-t1-6: request-magic-link logs carry the e-mail hash label instead"
+      );
+      assertEq(
+        logLabelMod.emailLogLabel(T1_EMAIL), logLabelMod.emailLogLabel(T1_EMAIL.toLowerCase()),
+        "m2-t1-6: e-mail label is case-insensitive"
+      );
+
+      // t1-7: cheap source scan — owner-portal must not interpolate a raw
+      // token/e-mail straight into a console.* template literal again.
+      const opSrc = fs2.readFileSync("src/routes/owner-portal.ts", "utf8");
+      // Matches the template literal even when the call spans several lines.
+      const rawLogHits = opSrc.match(/console\.(log|warn|error|info|debug)\(\s*`[^`]*\$\{\s*(token|email)\s*\}[^`]*`/g) || [];
+      assertEq(rawLogHits.length, 0, "m2-t1-7: owner-portal.ts has no console.* line logging ${token} / ${email} directly");
+      const activationMod = require("../src/services/order-activation-link") as typeof import("../src/services/order-activation-link");
+      assertEq(activationMod.tokenLogLabel("abc"), logLabelMod.tokenLogLabel("abc"), "m2-t1-8: order-activation-link still re-exports the shared tokenLogLabel");
     }
 
     // E1.4 — Magic-link email body template contains agent name + 7-day expiry.
@@ -11045,8 +11238,10 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     /if \(isDisplayablePhone\(k\.phone\)\) umbContactItems\.push\(`<div class="ct-item">[\s\S]{0,200}tel:\$\{k\.phone/.test(seoSrc),
     "phase5.11-a5: umbrella phone uses tel: link (same pattern as producer), gated by isDisplayablePhone"
   );
+  // E-post-skjerming slice 3: the line reads shownEmail (k.email unless the
+  // EMAIL_REVEAL_GUARD_RFB limit withholds it; switch off → k.email).
   assertTrue(
-    /if \(k\.email\) umbContactItems\.push\(`<div class="ct-item">[\s\S]{0,200}mailto:\$\{k\.email/.test(seoSrc),
+    /if \(shownEmail\) umbContactItems\.push\(`<div class="ct-item">[\s\S]{0,200}mailto:\$\{shownEmail/.test(seoSrc),
     "phase5.11-a5: umbrella email uses mailto: link"
   );
   assertTrue(
@@ -17883,7 +18078,8 @@ withFreshModules(["../src/database/db-factory", "../src/services/dental-store"],
   assertTrue(countPublicDentalAgents({ fylke: "Oslo" }) === 22, "sok-fix: fylke filter applies");
   assertTrue(countPublicDentalAgents({ fylke: "Vestland" }) === 1, "sok-fix: fylke filter Vestland");
 
-  // 6. Helfo filter.
+  // 6. Helfo filter (F2-S6: the rows with a Helfo source).
+  giveDentalHelfoSources(dbFactory.getDb("dental"));
   assertTrue(countPublicDentalAgents({ helfo_agreement: "true" }) === 11, "sok-fix: helfo filter applies (10 even solos + Bergen)");
 
   // 7. CORE FIX — specialty filter matches BOTH available_specialties AND
@@ -22990,6 +23186,7 @@ let _pr103RestoreModules: (() => void) | null = null;
     const stats = await geocodeTick(50, {
       fetchImpl: fetchTick as unknown as typeof fetch,
       sleep: noSleep,
+      pauseBlock: () => null, // main DB (pause table) is not set up in this block
     });
 
     assertEq(stats.processed, 2,
@@ -23036,6 +23233,7 @@ let _pr103RestoreModules: (() => void) | null = null;
     const stats1 = await geocodeTick(50, {
       fetchImpl: fetchMiss as unknown as typeof fetch,
       sleep: noSleep,
+      pauseBlock: () => null, // main DB (pause table) is not set up in this block
     });
     assertEq(stats1.no_match, 1,
       "pr103-15a: first tick reports no_match=1");
@@ -23053,6 +23251,7 @@ let _pr103RestoreModules: (() => void) | null = null;
     const stats2 = await geocodeTick(50, {
       fetchImpl: fetchCount as unknown as typeof fetch,
       sleep: noSleep,
+      pauseBlock: () => null, // main DB (pause table) is not set up in this block
     });
     assertEq(stats2.processed, 0,
       "pr103-15d: second tick processed=0 (no_match row skipped)");
@@ -23075,6 +23274,7 @@ let _pr103RestoreModules: (() => void) | null = null;
     const stats = await geocodeTick(50, {
       fetchImpl: fetchUnused as unknown as typeof fetch,
       sleep: noSleep,
+      pauseBlock: () => null, // main DB (pause table) is not set up in this block
     });
     assertEq(stats.processed, 0,
       "pr103-16a: empty-address row never processed");
@@ -23464,6 +23664,7 @@ withFreshModules([
 
   // ── pr109-09: getDentalStats counts correctly (excludes rejected)
   {
+    giveDentalHelfoSources(dbFactory109.getDb("dental"));
     const stats = getDentalStats();
     assertEq(stats.total, 5, "pr109-09a: getDentalStats.total = 5 (excludes rejected)");
     assertTrue(stats.per_fylke.length >= 1, "pr109-09b: per_fylke has at least 1 entry");
@@ -23646,6 +23847,7 @@ withFreshModules(["../src/database/db-factory", "../src/services/dental-store"],
 
   // ── getDentalStats excludes the inactive fixture row from every count ──
   {
+    giveDentalHelfoSources(dbInactive);
     const stats = getDentalStatsInactive();
     assertEq(stats.total, 2, "inactive-09: getDentalStats.total excludes is_inactive=1 rows (2 active fixture rows, not counting the extra solo-closed one)");
     assertEq(stats.helfo_count, 1, "inactive-10: getDentalStats.helfo_count excludes the inactive fixture row (only activeId1 has helfo=true)");
@@ -27439,7 +27641,8 @@ withFreshModules(["../src/database/db-factory", "../src/services/dental-store"],
       "pr114-04f: profil_url inkluderer org_nr i slug"
     );
 
-    // buildSearchResults for klinikk med Helfo: badge settes
+    // buildSearchResults for klinikk med Helfo: badge settes (F2-S6: med kilde)
+    giveDentalHelfoSources(db);
     const helfoAgents = listPublicDentalAgents({ helfo_agreement: "true" } as any, 10);
     assertTrue(helfoAgents.length >= 1, "pr114-04g: minst 1 Helfo-klinikk funnet");
     const helfoResults = buildSearchResults(helfoAgents);
@@ -33399,6 +33602,18 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of g5h.failures) failures.push("opplevelser-gardssalg-5d-hardening: " + f);
     console.log(`  opplevelser-gardssalg-5d-hardening: ${g5h.passed} passed, ${g5h.failed} failed`);
 
+    // Read-only GET /admin/gardssalg-content-audit: which fields were changed
+    // by which source after time T for one producer (rollback triage). Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-content-audit-read: admin read of the content audit ──");
+    const { runOpplevelserGardssalgContentAuditReadTests } = require("../src/routes/opplevelser-gardssalg-content-audit-read.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-content-audit-read.test");
+    const gContentAuditRead = await runOpplevelserGardssalgContentAuditReadTests(false);
+    passed += gContentAuditRead.passed;
+    failed += gContentAuditRead.failed;
+    for (const f of gContentAuditRead.failures) failures.push("opplevelser-gardssalg-content-audit-read: " + f);
+    console.log(`  opplevelser-gardssalg-content-audit-read: ${gContentAuditRead.passed} passed, ${gContentAuditRead.failed} failed`);
+
     // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 3
     // (detail completeness weave): GET /admin/detail-completeness-coverage —
     // read-only, catalog-wide booking_url/phone/website coverage report over
@@ -35728,6 +35943,19 @@ const _utmCapturePromise: Promise<void> = new Promise<void>(r => {
   } catch (err: any) {
     failed++;
     failures.push("utm-capture: unexpected error: " + String(err?.message || err));
+  }
+  // ai-sok B5: per-AI-agent rollup. Same serial slot as B4 (swaps the DB singleton).
+  try {
+    const { runAiAgentRollupTests } = require("../src/services/ai-agent-rollup.test") as
+      typeof import("../src/services/ai-agent-rollup.test");
+    const ar = await runAiAgentRollupTests({ log: false });
+    passed += ar.passed;
+    failed += ar.failed;
+    for (const f of ar.failures) failures.push("ai-agent-rollup: " + f);
+    console.log(`  ai-agent-rollup: ${ar.passed} passed, ${ar.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("ai-agent-rollup: unexpected error: " + String(err?.message || err));
   } finally {
     _utmCaptureResolve();
   }
@@ -36741,6 +36969,34 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental acute claim: unexpected error: " + String(err?.message || err));
   }
 
+  console.log("\n── A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S6): Helfo-merket bare med kilde ──");
+  try {
+    const { runDentalHelfoClaimTests } = require("../src/routes/dental-helfo-claim.test") as
+      typeof import("../src/routes/dental-helfo-claim.test");
+    const dhc = await runDentalHelfoClaimTests({ log: false });
+    passed += dhc.passed;
+    failed += dhc.failed;
+    for (const f of dhc.failures) failures.push("dental helfo claim: " + f);
+    console.log(`  dental helfo claim: ${dhc.passed} passed, ${dhc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental helfo claim: unexpected error: " + String(err?.message || err));
+  }
+
+  console.log("\n── A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S7): Helfo og akutt bare med kilde i det rå REST-API-et ──");
+  try {
+    const { runDentalRestClaimsTests } = require("../src/routes/dental-rest-claims.test") as
+      typeof import("../src/routes/dental-rest-claims.test");
+    const drc = await runDentalRestClaimsTests({ log: false });
+    passed += drc.passed;
+    failed += drc.failed;
+    for (const f of drc.failures) failures.push("dental rest claims: " + f);
+    console.log(`  dental rest claims: ${drc.passed} passed, ${drc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental rest claims: unexpected error: " + String(err?.message || err));
+  }
+
   console.log("\n── A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S3): profilen viser hva som er kontrollert og når ──");
   try {
     const { runDentalProfileVerificationLineTests } = require("../src/routes/dental-profile-verification-line.test") as
@@ -37296,6 +37552,32 @@ const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
   } catch (err: any) {
     failed++;
     failures.push("bestillinger-b2b1: unexpected error: " + String(err?.message || err));
+  }
+  // B2b-2 (bestillinger: the soft-expiry date on every surface — producer page/JSON-LD, MCP, REST, A2A, feeds) — own in-memory DB.
+  try {
+    const { runBestillingerB2b2Tests } = require("../src/routes/bestillinger-b2b2.test") as
+      typeof import("../src/routes/bestillinger-b2b2.test");
+    const b2b2 = await runBestillingerB2b2Tests({ log: false });
+    passed += b2b2.passed;
+    failed += b2b2.failed;
+    for (const f of b2b2.failures) failures.push("bestillinger-b2b2: " + f);
+    console.log(`  bestillinger-b2b2: ${b2b2.passed} passed, ${b2b2.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bestillinger-b2b2: unexpected error: " + String(err?.message || err));
+  }
+  // B2b-3 (bestillinger: the owner-facing texts follow the soft-expiry rule) — own in-memory DB.
+  try {
+    const { runBestillingerB2b3Tests } = require("../src/routes/bestillinger-b2b3.test") as
+      typeof import("../src/routes/bestillinger-b2b3.test");
+    const b2b3 = await runBestillingerB2b3Tests({ log: false });
+    passed += b2b3.passed;
+    failed += b2b3.failed;
+    for (const f of b2b3.failures) failures.push("bestillinger-b2b3: " + f);
+    console.log(`  bestillinger-b2b3: ${b2b3.passed} passed, ${b2b3.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bestillinger-b2b3: unexpected error: " + String(err?.message || err));
   }
   // Fase B1 (kjøperens handlinger via MCP + ordrekortet /ordre/:id) runs strictly after A2 (own in-memory DB).
   try {
@@ -39652,6 +39934,29 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("dental-verified-claim: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S10,
+// Daniel's choice B on question 32): no public surface shows a value only the
+// May 2026 directory import gave (dental-import-display.ts): the rows without
+// an org.nr. are not public, and its addresses and websites on rows with one
+// are hidden until a real source confirms them. Swaps DENTAL_DB_PATH
+// (:memory:), ADMIN_KEY and the dental modules (restored in finally) —
+// runSerial.
+runSerial(async () => {
+  console.log("\n── dental-import-display: verdier fra katalogimporten vises ikke (F2-S10) ──");
+  try {
+    const { runDentalImportDisplayTests } = require("../src/services/dental-import-display.test") as
+      typeof import("../src/services/dental-import-display.test");
+    const did = await runDentalImportDisplayTests({ log: false });
+    passed += did.passed;
+    failed += did.failed;
+    for (const f of did.failures) failures.push("dental-import-display: " + f);
+    console.log(`  dental-import-display: ${did.passed} passed, ${did.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-import-display: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -43017,6 +43322,27 @@ runSerial(async () => {
   }
 });
 
+// ── OA-01 (dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas):
+// the claim page now sees Opplevagent's own outreach — tier outreach_delivered
+// reads experience_outreach_sent_log (real, delivered, same provider, no
+// bounce, not shared). Own in-memory experiences + RFB dbs and a real
+// http.Server, restored in its own finally — runSerial like the suites above.
+runSerial(async () => {
+  console.log("\n── OA-01: gardssalg-claim outreach_delivered (Opplevagent outreach log) ──");
+  try {
+    const { runGardssalgClaimOutreachDeliveredOa01Tests } = require("../src/routes/gardssalg-claim-outreach-delivered-oa01.test") as
+      typeof import("../src/routes/gardssalg-claim-outreach-delivered-oa01.test");
+    const oa01 = await runGardssalgClaimOutreachDeliveredOa01Tests({ log: false });
+    passed += oa01.passed;
+    failed += oa01.failed;
+    for (const f of oa01.failures) failures.push("gardssalg-claim-outreach-delivered-oa01: " + f);
+    console.log(`  gardssalg-claim-outreach-delivered-oa01: ${oa01.passed} passed, ${oa01.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-claim-outreach-delivered-oa01: unexpected error: " + String(err?.message || err));
+  }
+});
+
 runSerial(async () => {
   console.log("\n── dev-request 2026-08-06-eier-ser-reserver-knapp-paa-egen-profil: owner-CTA swap (decideOwnerCtaSwap + cache-safety regression) ──");
   try {
@@ -43166,6 +43492,25 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("experiences-seo-produktby-gate: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-24-ai-sok-bli-svaret-rfb, B6: /mat/<kategori>/<sted>
+// produkt×sted landing pages on RFB — one gate (≥2 visible producers) for the
+// route and the sitemap, behind RFB_MAT_LANDING_ENABLED.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-24-ai-sok-bli-svaret-rfb B6: /mat/<kategori>/<sted> landing pages ──");
+  try {
+    const { runRfbMatLandingTests } = require("../src/routes/rfb-mat-landing.test") as
+      typeof import("../src/routes/rfb-mat-landing.test");
+    const rml = await runRfbMatLandingTests({ log: false });
+    passed += rml.passed;
+    failed += rml.failed;
+    for (const f of rml.failures) failures.push("rfb-mat-landing: " + f);
+    console.log(`  rfb-mat-landing: ${rml.passed} passed, ${rml.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-mat-landing: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -44349,6 +44694,26 @@ runSerial(async () => {
   }
 });
 
+// Slice E1 (dev-request 2026-10-31-rfb-utgaende-eposter-design-og-lesbarhet):
+// the five owner-mail buttons are bulletproof (bgcolor cell, inline white
+// text, white <span>), href/label unchanged, white-on-green ≥ 4.5:1. Swaps
+// APP_URL (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── E1: lesbar knapp i eier-e-postene ──");
+  try {
+    const { runEmailCtaButtonE1Tests } = require("../src/services/email-cta-button-e1.test") as
+      typeof import("../src/services/email-cta-button-e1.test");
+    const e1 = await runEmailCtaButtonE1Tests({ log: false });
+    passed += e1.passed;
+    failed += e1.failed;
+    for (const f of e1.failures) failures.push("email-cta-button-e1: " + f);
+    console.log(`  email-cta-button-e1: ${e1.passed} passed, ${e1.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("email-cta-button-e1: unexpected error: " + String(err?.message || err));
+  }
+});
+
 runSerial(async () => {
   console.log("\n── dev-request 2026-09-16-crm-utgaaende-html-body-kollapser-linjeskift ──");
   try {
@@ -44448,6 +44813,28 @@ runSerial(async () => {
     failed++;
     failures.push("crm-triage: unexpected error: " + String(err?.message || err));
     console.log(`  ✗ crm-triage: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+// Daniel, 2026-11-01: e-mail copy of every POST /api/contact submission to
+// ADMIN_NOTIFICATION_EMAIL (text-only, Reply-To = visitor, fire-and-forget).
+// Next to crm-vertical/crm-triage, the other blocks that drive the real
+// contact router. It pins its own in-memory getDb() DB, so it sits here,
+// after _adHocFamilyBarrier, not beside the ad-hoc contact-tracking block.
+runSerial(async () => {
+  console.log("\n── contact-form-copy: e-post-kopi av kontaktskjemaet til admin ──");
+  try {
+    const { runContactFormCopyTests } = require("../src/routes/contact-form-copy.test") as
+      typeof import("../src/routes/contact-form-copy.test");
+    const r = await runContactFormCopyTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("contact-form-copy: " + f);
+    console.log(`  contact-form-copy: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("contact-form-copy: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ contact-form-copy: unexpected error: ${String(err?.message || err)}`);
   }
 });
 
@@ -44685,6 +45072,27 @@ runSerial(async () => {
     failed++;
     failures.push(`profile-ai-deliveries-s2: unexpected error: ${String(err?.message || err)}`);
     console.log(`  ✗ profile-ai-deliveries-s2: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
+  // dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 2: «Klikk fra
+  // AI-svar», people who come to a profile page from an AI answer, stored as
+  // daily sums per profile x AI. Swaps getDb() and the dental / experiences db
+  // handles (restored in finally), so serial.
+  console.log("\n── Klikk fra AI-svar S2: clicks from AI answers per profile ──");
+  try {
+    const { runProfileAiClicksTests } = require("../src/services/profile-ai-clicks.test") as
+      typeof import("../src/services/profile-ai-clicks.test");
+    const r = await runProfileAiClicksTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("profile-ai-clicks: " + f);
+    console.log(`  profile-ai-clicks: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push(`profile-ai-clicks: unexpected error: ${String(err?.message || err)}`);
+    console.log(`  ✗ profile-ai-clicks: unexpected error: ${String(err?.message || err)}`);
   }
 });
 
@@ -46132,6 +46540,48 @@ runSerial(async () => {
   }
 });
 
+// A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-felles-
+// serverjobbramme, «Innsnevring 2026-10-28» step 3n: the org.nr paths run by a
+// server-side daily job, plus punkt a (admission_checked_at reset for
+// needs_review rows of a provider resolved brreg_active=1). Serial: in-memory DBs.
+runSerial(async () => {
+  console.log("\n── 3n: experience-orgnr-job (server-side, punkt a) ──");
+  try {
+    const { runExperienceOrgnrJobTests } = require("../src/services/experience-orgnr-job.test") as
+      typeof import("../src/services/experience-orgnr-job.test");
+    const oj = await runExperienceOrgnrJobTests({ log: false });
+    passed += oj.passed;
+    failed += oj.failed;
+    for (const f of oj.failures) failures.push("experience-orgnr-job: " + f);
+    console.log(`  experience-orgnr-job: ${oj.passed} passed, ${oj.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experience-orgnr-job: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-felles-
+// serverjobbramme, «Innsnevring 2026-10-28», skive 3k med punkt b: the
+// needs_review content judge without an LLM — candidate GET (batches 1..4),
+// the shared apply function with its deterministic re-checks and the hourly
+// job on the shared proposal file queue. api.anthropic.com, global fetch and
+// the judge module are counted and asserted zero. Serial: in-memory DBs.
+runSerial(async () => {
+  console.log("\n── 3k: experience-content-judgement-job (candidates, apply, job) ──");
+  try {
+    const { runExperienceContentJudgementJobTests } = require("../src/services/experience-content-judgement-job.test") as
+      typeof import("../src/services/experience-content-judgement-job.test");
+    const cj = await runExperienceContentJudgementJobTests({ log: false });
+    passed += cj.passed;
+    failed += cj.failed;
+    for (const f of cj.failures) failures.push("experience-content-judgement-job: " + f);
+    console.log(`  experience-content-judgement-job: ${cj.passed} passed, ${cj.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experience-content-judgement-job: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // Tillegg 2026-10-15 «4b-forslag»: gårdssalg visit-text proposals — the
 // candidates GET, the shared apply function behind POST /admin/gardssalg-
 // visit-proposals-write (server re-fetch + verbatim evidence + overlap) and
@@ -46360,6 +46810,32 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("security-sanitize-fixpoint: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-06-25-platform-contact-surface, slice CSP: the one CSP in
+// security.ts (script-src 'self' 'unsafe-inline', frame-src 'none') blocked
+// Cloudflare Turnstile on /kontakt for all three sites, so /api/contact
+// answered 403 captcha_failed to every visitor. Proves script-src and
+// frame-src now carry https://challenges.cloudflare.com, every other
+// directive is byte-identical, and GET /kontakt + /en/kontakt on each host
+// (real routers behind securityHeaders) serve a page whose Turnstile script
+// and iframe the header allows. Swaps the getDb() singleton, module cache and
+// DB env vars (restored in finally) — runSerial, next to the other
+// security.ts suites.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-06-25-platform-contact-surface, CSP: Turnstile allowed on /kontakt ──");
+  try {
+    const { runSecurityCspTurnstileTests } = require("../src/middleware/security-csp-turnstile.test") as
+      typeof import("../src/middleware/security-csp-turnstile.test");
+    const csp = await runSecurityCspTurnstileTests({ log: false });
+    passed += csp.passed;
+    failed += csp.failed;
+    for (const f of csp.failures) failures.push("security-csp-turnstile: " + f);
+    console.log(`  security-csp-turnstile: ${csp.passed} passed, ${csp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("security-csp-turnstile: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -49374,6 +49850,30 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-forverring, skive B
+// (AC2): refreshHomepageContent's about judges (quality → facts → better than
+// stored, stubbed; the real judges against a stubbed Messages API for the
+// infra failures), the deadline rule, and the never-replace rule for a
+// non-empty stored category list — function, route with explicit agentIds,
+// and the morning send's refreshRfbCandidateHomepage. Pins its own in-memory
+// DB + global fetch stub (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-forverring (skive B): homepage-content-refresh about judges ──");
+  try {
+    const { runHomepageContentRefreshAboutJudgesTests } =
+      require("../src/routes/homepage-content-refresh-about-judges.test") as
+        typeof import("../src/routes/homepage-content-refresh-about-judges.test");
+    const haj = await runHomepageContentRefreshAboutJudgesTests({ log: false });
+    passed += haj.passed;
+    failed += haj.failed;
+    for (const f of haj.failures) failures.push("homepage-content-refresh-about-judges: " + f);
+    console.log(`  homepage-content-refresh-about-judges: ${haj.passed} passed, ${haj.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("homepage-content-refresh-about-judges: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-10-rfb-homepage-refresh-kategorinavn-som-produkter: the
 // refresh writes categories only, category-name products are known-bad, the
 // auto-select takes uncorroborated rows, the gate names the stopped rows.
@@ -49452,6 +49952,24 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("admin-loop-dispatch: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-30-fire-feil-detektor-og-varsel-ved-4xx (slice 2): P0 alert at the
+// first /fire 401/403 per agent per UTC day (in-memory DB, stubbed fetch + sender).
+runSerial(async () => {
+  console.log("\n── loop-dispatch: P0 alert at first /fire 401/403 per agent per UTC day ──");
+  try {
+    const { runAdminLoopDispatchFireAlertTests } = require("../src/routes/admin-loop-dispatch-fire-alert.test") as
+      typeof import("../src/routes/admin-loop-dispatch-fire-alert.test");
+    const fa = await runAdminLoopDispatchFireAlertTests({ log: false });
+    passed += fa.passed;
+    failed += fa.failed;
+    for (const f of fa.failures) failures.push("admin-loop-dispatch-fire-alert: " + f);
+    console.log(`  admin-loop-dispatch-fire-alert: ${fa.passed} passed, ${fa.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-loop-dispatch-fire-alert: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -49589,6 +50107,40 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice A
+// (record-only): the owner-claim auto-assessment (claim-assessment.ts) behind
+// CLAIM_AUTO_ASSESSMENT_ENABLED. Unit block: all network/clock stubbed, pure.
+// Route block: pins getDb() to its own in-memory DB and stubs the e-mail
+// transporter, the HTTPS probe and the assessment deps (restored in
+// finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering: claim auto-assessment (slice A) ──");
+  try {
+    const { runClaimAssessmentTests } = require("../src/services/claim-assessment.test") as
+      typeof import("../src/services/claim-assessment.test");
+    const r = await runClaimAssessmentTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("claim-assessment: " + f);
+    console.log(`  claim-assessment: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("claim-assessment: unexpected error: " + String(err?.message || err));
+  }
+  try {
+    const { runRfbClaimVurderingTests } = require("../src/routes/rfb-claim-vurdering.test") as
+      typeof import("../src/routes/rfb-claim-vurdering.test");
+    const r = await runRfbClaimVurderingTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-claim-vurdering: " + f);
+    console.log(`  rfb-claim-vurdering: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-claim-vurdering: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // Claim rule slice 1b, shared address ("delt adresse"): no code on any path
 // (rule 1, P1, P2) to an address that is the known e-mail of more than one
 // RFB profile → pending_review shared_address. Pins getDb() to its own
@@ -49610,6 +50162,72 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post, K1–K3: the same
+// claimant gets the same claim back (code_already_sent, no new code), «Send
+// koden på nytt» (same code, same farm address, once, ≥ 10 min, platform cap),
+// selger.html keeps the open claim in localStorage, the store card comes
+// before the registration hero (no «Siri»), Norwegian verify errors with the
+// tries left. Pins getDb() to its own in-memory DB, stubs the e-mail
+// transporter (restored in finally) and runs selger.html's script in node:vm.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-01-rfb-kravflyt: claim across tabs, resend, store first, Norwegian errors ──");
+  try {
+    const { runRfbClaimKravflytTests } = require("../src/routes/rfb-claim-kravflyt.test") as
+      typeof import("../src/routes/rfb-claim-kravflyt.test");
+    const kf = await runRfbClaimKravflytTests({ log: false });
+    passed += kf.passed;
+    failed += kf.failed;
+    for (const f of kf.failures) failures.push("rfb-claim-kravflyt: " + f);
+    console.log(`  rfb-claim-kravflyt: ${kf.passed} passed, ${kf.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-claim-kravflyt: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post, K5: Daniel's
+// approval mails «Profilen til X er nå din» with a one-time 15-minute login
+// straight into /eier (a fresh 7-day session, not the mailed token), and the
+// /eier login also accepts this agent's verified owner's confirmed address.
+// Pins getDb() to its own in-memory DB, stubs the e-mail transporter, runs an
+// in-process server, sets APP_URL/ADMIN_KEY (all restored in finally) —
+// runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-01-rfb-kravflyt K5: approval mail + owner-portal login for the confirmed address ──");
+  try {
+    const { runRfbClaimK5GratulererTests } = require("../src/routes/rfb-claim-k5-gratulerer.test") as
+      typeof import("../src/routes/rfb-claim-k5-gratulerer.test");
+    const k5 = await runRfbClaimK5GratulererTests({ log: false });
+    passed += k5.passed;
+    failed += k5.failed;
+    for (const f of k5.failures) failures.push("rfb-claim-k5-gratulerer: " + f);
+    console.log(`  rfb-claim-k5-gratulerer: ${k5.passed} passed, ${k5.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-claim-k5-gratulerer: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice
+// C1: POST /admin/agents/claim-revoke puts the profile back from the pre-grant
+// snapshot. Pins getDb() to its own in-memory DB, runs an in-process server,
+// sets ADMIN_KEY (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-30-rfb-eierkrav C1: admin claim-revoke restores the profile ──");
+  try {
+    const { runRfbClaimRevokeTests } = require("../src/routes/rfb-claim-revoke.test") as
+      typeof import("../src/routes/rfb-claim-revoke.test");
+    const rv = await runRfbClaimRevokeTests({ log: false });
+    passed += rv.passed;
+    failed += rv.failed;
+    for (const f of rv.failures) failures.push("rfb-claim-revoke: " + f);
+    console.log(`  rfb-claim-revoke: ${rv.passed} passed, ${rv.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-claim-revoke: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-rfb-utsending-v4, skive 1: /selger?agent=<id> viser
 // bare den ene butikken når produsenten ikke er tatt over.
 runSerial(async () => {
@@ -49625,6 +50243,27 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("rfb-selger-en-butikk: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Slice T0e (owner portal): /selger?magic= with an old stored session shows
+// the dashboard on the first try — init waits for the magic login instead of
+// restoring the old session alongside it, and a stale 401 never clears a
+// newer token. Runs selger.html's script in node:vm (fake DOM, Map-backed
+// localStorage); listens for unhandledRejection (removed in finally).
+runSerial(async () => {
+  console.log("\n── T0e: /selger?magic= med gammel lagret innlogging ──");
+  try {
+    const { runSelgerMagicLinkOldSessionT0eTests } = require("../src/routes/selger-magic-link-old-session-t0e.test") as
+      typeof import("../src/routes/selger-magic-link-old-session-t0e.test");
+    const r = await runSelgerMagicLinkOldSessionT0eTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("selger-magic-link-old-session-t0e: " + f);
+    console.log(`  selger-magic-link-old-session-t0e: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("selger-magic-link-old-session-t0e: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -50073,6 +50712,30 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-01-rfb-hold-profilen-oppdatert («Hold profilen
+// oppdatert»): the owner refresh as the nightly run's last step behind
+// OWNER_AUTO_UPDATES_ENABLED — AC1/AC2 (fill_empty / never / automatic, the
+// never list, owner-saved and CS-locked fields), AC3 (the unowned cohort and
+// writes identical flag off vs on), AC4 (the owner-portal card for every
+// verified owner, «Mine valg» shows the same value, flag off = no card, no
+// write), AC5 (change-log rows with source), guards, preview, the probe's
+// choice rows. Fresh in-memory DB per block (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-01-rfb-hold-profilen-oppdatert: rfb-owner-refresh ──");
+  try {
+    const { runRfbOwnerRefreshTests } = require("../src/services/rfb-owner-refresh.test") as
+      typeof import("../src/services/rfb-owner-refresh.test");
+    const ror = await runRfbOwnerRefreshTests({ log: false });
+    passed += ror.passed;
+    failed += ror.failed;
+    for (const f of ror.failures) failures.push("rfb-owner-refresh: " + f);
+    console.log(`  rfb-owner-refresh: ${ror.passed} passed, ${ror.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-owner-refresh: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-10-rfb-berikelse-nattjobb (prod incident 2026-10-11: a
 // manual apply run replaced 7 stored contact_email values and 2 phones):
 // GET /admin/bm-producer-harvest `fill_only` + `scope_agent_ids`; the default
@@ -50493,6 +51156,25 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, O3: «Mine besøk» as
+// a pure render function (upcoming/past split, per-state actions on the same
+// endpoints as the e-mail links, escaping, empty states). No DB, no env.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-opplevagent-mine-valg-gardssalg O3: «Mine besøk» (render) ──");
+  try {
+    const { runGardssalgMineBesokTests } = require("../src/owner-features/gardssalg-mine-besok.test") as
+      typeof import("../src/owner-features/gardssalg-mine-besok.test");
+    const r = await runGardssalgMineBesokTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-mine-besok: " + f);
+    console.log(`  gardssalg-mine-besok: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-mine-besok: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, O1b: the price
 // message on /slik-fungerer-det and the attendance page, and «Én bryter, ett
 // sted» in the gårdssalg owner portal. Swaps getDb() + env — runSerial.
@@ -50529,6 +51211,66 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("gardssalg-owner-features-o2a: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Eierportal bølge 0, T2: the «Mine valg» level preview (GET …/valg?niva=)
+// never writes — on gårdssalg (experiences.db booking_live, gardssalg_content_audit)
+// nor RFB; the preview equals the confirmed apply. Swaps getDb() + env — runSerial.
+runSerial(async () => {
+  console.log("\n── eierportal bølge 0 T2: nivå-forhåndsvisning skriver aldri ──");
+  try {
+    const { runOwnerLevelPreviewT2Tests } = require("../src/routes/owner-features-level-preview-t2.test") as
+      typeof import("../src/routes/owner-features-level-preview-t2.test");
+    const r = await runOwnerLevelPreviewT2Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-features-level-preview-t2: " + f);
+    console.log(`  owner-features-level-preview-t2: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-features-level-preview-t2: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Eierportal testrunde 1, T5 («lagres der du står», steg 1): every «Mine valg»
+// POST outcome (RFB and gårdssalg) answers 303 with the contracted anchor; the
+// level preview sits inside #niva, the confirm panel inside li#valg-<key>, the
+// message in its card or row. Swaps getDb() + env + module cache — runSerial.
+runSerial(async () => {
+  console.log("\n── eierportal testrunde 1 T5: ankerkontrakt for «Mine valg» ──");
+  try {
+    const { runOwnerFeaturesT5AnchorsTests } = require("../src/routes/owner-features-t5-anchors.test") as
+      typeof import("../src/routes/owner-features-t5-anchors.test");
+    const r = await runOwnerFeaturesT5AnchorsTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-features-t5-anchors: " + f);
+    console.log(`  owner-features-t5-anchors: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-features-t5-anchors: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Eierportal testrunde 1, T6 («felles drakt, lys og mørk»): shared colour
+// tokens on «Mine valg», the portal and the owner's «Mine ordrer» list —
+// contrast ≥ 4.5:1 / 3:1 in both themes, no colour inline styles for an
+// allowlisted subject, byte-identical off the list, buyer card untouched.
+// Swaps getDb() + the cart DB + env (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── eierportal testrunde 1 T6: felles drakt, lys og mørk ──");
+  try {
+    const { runOwnerUiTokensT6Tests } = require("../src/routes/owner-ui-tokens-t6.test") as
+      typeof import("../src/routes/owner-ui-tokens-t6.test");
+    const r = await runOwnerUiTokensT6Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-ui-tokens-t6: " + f);
+    console.log(`  owner-ui-tokens-t6: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-ui-tokens-t6: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -50719,6 +51461,46 @@ runSerial(async () => {
   }
 });
 
+// Slice T3 (owner-portal profile save): a save locks / audits / writes only
+// the fields that actually change; empty opening hours ('[]') are never shown
+// as "[]" and never locked. Swaps the getDb() singleton, console.log, fetch
+// and env vars (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── T3: profillagring låser bare endrede felt ──");
+  try {
+    const { runOwnerProfileLockChangedFieldsT3Tests } = require("../src/routes/owner-profile-lock-changed-fields-t3.test") as
+      typeof import("../src/routes/owner-profile-lock-changed-fields-t3.test");
+    const r = await runOwnerProfileLockChangedFieldsT3Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-profile-lock-changed-fields-t3: " + f);
+    console.log(`  owner-profile-lock-changed-fields-t3: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-profile-lock-changed-fields-t3: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Slice T0d (dev-request 2026-10-30-rfb-eierportal-bolge-0-ingen-tilgang):
+// the portal stores «Åpningstider» as JSON text; raw-text rows read as text in
+// both modes, so non-owner knowledge writes stop throwing. Swaps the getDb()
+// singleton, env vars and fetch (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── T0d: åpningstider lagres som JSON ──");
+  try {
+    const { runOwnerOpeningHoursJsonT0dTests } = require("../src/routes/owner-opening-hours-json-t0d.test") as
+      typeof import("../src/routes/owner-opening-hours-json-t0d.test");
+    const r = await runOwnerOpeningHoursJsonT0dTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-opening-hours-json-t0d: " + f);
+    console.log(`  owner-opening-hours-json-t0d: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-opening-hours-json-t0d: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2e (side v2, AC25–30):
 // «Planlagt» box + «Gi meg beskjed» (interest rows, admin counts), two levels
 // (stored «aktiv»/«full_fart» read as «Ta imot bestillinger»), no fake values,
@@ -50798,6 +51580,29 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("admin-test-producer-owner-login: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post AC6 (option A):
+// POST /admin/test-claim-fixture — ONE hidden, unclaimed claim-test profile;
+// GET /agents/:id/info is its only public exception; the claim flow end to end
+// (selger.html in node:vm), reset, retire, the write pins, the pipeline
+// exclusions and POST /admin/test-producer unchanged. Swaps getDb(), env, the
+// mail transport, global fetch and the pipeline seams (restored in finally) —
+// runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post AC6: POST /admin/test-claim-fixture ──");
+  try {
+    const { runAdminTestClaimFixtureTests } = require("../src/routes/admin-test-claim-fixture.test") as
+      typeof import("../src/routes/admin-test-claim-fixture.test");
+    const r = await runAdminTestClaimFixtureTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-test-claim-fixture: " + f);
+    console.log(`  admin-test-claim-fixture: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-test-claim-fixture: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -50889,6 +51694,13 @@ runSerial(async () => {
 // slice 1: the per-IP e-mail limit (services/email-reveal-guard.ts — switch
 // per host, default off; CCBot never; shared counter per host) and its wiring
 // into Finn-tannlege REST (/api/tannlege/agents[/:id]) and A2A message/send.
+// Slice 2 adds the clinic profile pages and the «Vis e-post» endpoint (same
+// counter; switch off = byte-identical pages).
+// Slice 3 adds the RFB producer profile page and its «Vis e-post» endpoint
+// (EMAIL_REVEAL_GUARD_RFB, the rfb counter; switch off = byte-identical).
+// Slice 4 adds the Opplevagent gårdssalg producer profile page and its «Vis
+// e-post» endpoint (EMAIL_REVEAL_GUARD_EXPERIENCES, the experiences counter;
+// switch off = byte-identical).
 // Switch off = byte-identical answers; MCP tannlege_info untouched. Sets env
 // flags and swaps the dental db-factory (restored in finally) — runSerial,
 // tail position.
@@ -50897,6 +51709,12 @@ runSerial(async () => {
   for (const [label, load] of [
     ["email reveal guard", () => (require("../src/services/email-reveal-guard.test") as typeof import("../src/services/email-reveal-guard.test")).runEmailRevealGuardTests({ log: false })],
     ["dental email reveal guard", () => (require("../src/routes/dental-email-reveal-guard.test") as typeof import("../src/routes/dental-email-reveal-guard.test")).runDentalEmailRevealGuardTests({ log: false })],
+    // slice 2: the clinic profile pages (/klinikk/:slug, /klinikk/id/:id) and «Vis e-post» (GET /klinikk/id/:id/epost).
+    ["dental profile email reveal", () => (require("../src/routes/dental-profile-email-reveal.test") as typeof import("../src/routes/dental-profile-email-reveal.test")).runDentalProfileEmailRevealTests({ log: false })],
+    // slice 3: the RFB producer profile page (/produsent/:slug, producer + umbrella card) and «Vis e-post» (GET /produsent/:slug/epost).
+    ["rfb profile email reveal", () => (require("../src/routes/rfb-profile-email-reveal.test") as typeof import("../src/routes/rfb-profile-email-reveal.test")).runRfbProfileEmailRevealTests({ log: false })],
+    // slice 4: the Opplevagent gårdssalg profile page (/kategori/gardssalg/produsent/:providerSlug) and «Vis e-post» (…/:providerSlug/epost).
+    ["experiences profile email reveal", () => (require("../src/routes/experiences-profile-email-reveal.test") as typeof import("../src/routes/experiences-profile-email-reveal.test")).runExperiencesProfileEmailRevealTests({ log: false })],
   ] as Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]>) {
     try {
       const r = await load();
@@ -50934,6 +51752,24 @@ runSerial(async () => {
   }
 });
 
+// Same fence on the admin-dental-* apply sweeps + the geocode worker (own
+// in-memory dental/main DBs, restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dental skrivepause: admin-dental-* apply-sveip + geocode-worker ──");
+  try {
+    const { runAdminDentalWritePauseTests } = require("../src/routes/admin-dental-write-pause.test") as
+      typeof import("../src/routes/admin-dental-write-pause.test");
+    const r = await runAdminDentalWritePauseTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-dental-write-pause: " + f);
+    console.log(`  admin-dental-write-pause: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-dental-write-pause: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
 // tekstrevisjon, S0 (P0, Debio complaint): no organic claim on any public read
 // surface without a valid Debio status (debio_verified = 1 until S1) — profile
@@ -50953,6 +51789,31 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("organic-claims-s0: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
+// tekstrevisjon, S3b (S3 punkt 1, automatic doors): RFB_ORGANIC_CLAIM_GATE —
+// the automated/admin content writes (PUT /admin/knowledge, homepage refresh,
+// content-correction, admin-agents register / Brreg fallback / tynne-profiler,
+// the marketplace admin lanes, bulk-enrich, /admin/register) strip organic
+// list entries and refuse organic free text for a producer without a valid
+// Debio status; flag off / verified / no organic words unchanged; owner lanes
+// untouched (S3c). Swaps the getDb() singleton, env vars, fetch and
+// console.log (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-28-rfb-okologisk-merking S3b: skrivevakt for økologi-påstander (automatiske dører) ──");
+  try {
+    const { runOrganicClaimGateS3bTests } = require("../src/routes/organic-claim-gate-s3b.test") as
+      typeof import("../src/routes/organic-claim-gate-s3b.test");
+    const r = await runOrganicClaimGateS3bTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("organic-claim-gate-s3b: " + f);
+    console.log(`  organic-claim-gate-s3b: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("organic-claim-gate-s3b: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -51165,6 +52026,51 @@ runSerial(async () => {
   }
 });
 
+// Produktimport skive 3b-1: outreach pre-extraction (admin only) — flag-gated
+// POST /admin/product-import/prepare + GET report (JSON / Norwegian md);
+// controls (category label, alcohol, duplicate/unchanged, unanchored price,
+// LLM tier only at measured accuracy ≥ 0.95); nothing public, no e-mail,
+// not counted in the owner's daily fetch limit.
+// Swaps the getDb() singleton and env (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── produktimport skive 3b-1: forhåndsuttrekk før utsendelse ──");
+  try {
+    const { runOutreachPrepareTests } = require("../src/services/product-import/outreach-prepare.test") as
+      typeof import("../src/services/product-import/outreach-prepare.test");
+    const r = await runOutreachPrepareTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("outreach-prepare: " + f);
+    console.log(`  outreach-prepare: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("outreach-prepare: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Produktimport skive 3b-2: owner side of the outreach pre-extraction — signed
+// link per recipient (admin links endpoint omits 0-candidate recipients),
+// landing page /eier/:id/varer/forslag (token + owner session + verified
+// owner; GET writes only the 'opened' log row), «Bekreft og legg inn» via
+// publishOwnerImport (+ «på lager» via B1), 7-day freshness re-extraction,
+// per-recipient log, magic-link return path.
+// Swaps the getDb() singleton and env (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── produktimport skive 3b-2: lenke, landingsside og bekreftelse ──");
+  try {
+    const { runOwnerProductOutreachTests } = require("../src/routes/owner-product-outreach.test") as
+      typeof import("../src/routes/owner-product-outreach.test");
+    const r = await runOwnerProductOutreachTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-product-outreach: " + f);
+    console.log(`  owner-product-outreach: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-product-outreach: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
 // tekstrevisjon, S3a (AC3.3): MCP descriptions, llms.txt, A2A card and SEO
 // pages promise no organic / Debio coverage beyond Debio's public register;
@@ -51184,6 +52090,160 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("organic-texts-s3a: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
+// tekstrevisjon, S2e: POST /admin/agents/content-correction owner-consent
+// path — an inbound CRM reply after our notice lets ONE item past the owner
+// lock (only), audited + crm_actions owner_consent_applied. Own ":memory:" DB
+// via the route's seam; sets ADMIN_KEY only if unset (restored) — runSerial.
+runSerial(async () => {
+  console.log("\n── økologi S2e: content-correction med eiersamtykke ──");
+  try {
+    const { runAdminAgentsContentCorrectionOwnerConsentTests } = require("../src/routes/admin-agents-content-correction-owner-consent.test") as
+      typeof import("../src/routes/admin-agents-content-correction-owner-consent.test");
+    const r = await runAdminAgentsContentCorrectionOwnerConsentTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("content-correction-owner-consent: " + f);
+    console.log(`  content-correction-owner-consent: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("content-correction-owner-consent: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// POST /admin/rfb-website-discovery + the review queue, approve and judge
+// routes (incl. dev-request 2026-10-31 S2: a real judge AVVIS closes the row
+// as 'rejected', an infrastructure failure keeps it 'pending', and a rejection
+// is sticky for the same candidate_url). Own in-memory DB, global fetch stub,
+// admin key and ANTHROPIC_API_KEY, all restored in finally — runSerial, tail
+// position.
+runSerial(async () => {
+  console.log("\n── RFB website discovery + review queue/judge ──");
+  try {
+    const { runAdminRfbWebsiteDiscoveryTests } = require("../src/routes/admin-rfb-website-discovery.test") as
+      typeof import("../src/routes/admin-rfb-website-discovery.test");
+    const r = await runAdminRfbWebsiteDiscoveryTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-rfb-website-discovery: " + f);
+    console.log(`  admin-rfb-website-discovery: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-rfb-website-discovery: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Slice T0c (owner portal): every inline <script> on the owner-facing pages
+// (RFB portal, login, Mine valg, Mine ordrer, order link + compact view,
+// gårdssalg login/portal/valg) is valid JavaScript as rendered, and the
+// portal's change log + fetch save work in a fake DOM. Swaps the getDb()
+// singleton, the cart DB, the experiences DB module cache, env vars and the
+// claim-harvest fetch (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── T0c: eiersidenes inline-skript er gyldig JavaScript ──");
+  try {
+    const { runOwnerPagesInlineScriptSyntaxT0cTests } = require("../src/routes/owner-pages-inline-script-syntax-t0c.test") as
+      typeof import("../src/routes/owner-pages-inline-script-syntax-t0c.test");
+    const r = await runOwnerPagesInlineScriptSyntaxT0cTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-pages-inline-script-syntax-t0c: " + f);
+    console.log(`  owner-pages-inline-script-syntax-t0c: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-pages-inline-script-syntax-t0c: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-11-02-rfb-endringslogg-lettlest (E1–E3): the portal's
+// «Endringslogg» / GET my-audit in plain Norwegian — the field table (fail
+// closed), readable values, «Du» / «Rett fra Bonden» / «Automatisk fra
+// nettsiden din», no notes / e-mail addresses / hidden fields in the JSON;
+// real portal save, nightly owner refresh and claim-test fixture rows; the
+// portal script on the real answer; the empty state. Swaps the getDb()
+// singleton, env vars, console.log, fetch, the fixture route's DB override
+// and the registry caches (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── Endringslogg lett å lese (my-audit) ──");
+  try {
+    const { runOwnerAuditLogTests } = require("../src/routes/owner-audit-log.test") as
+      typeof import("../src/routes/owner-audit-log.test");
+    const r = await runOwnerAuditLogTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-audit-log: " + f);
+    console.log(`  owner-audit-log: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-audit-log: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Opplevagent «For tilbydere» with sections and FAQ (dev-request O4 = G4,
+// slice O4a): flag off = old page unchanged; flag on = ten section ids + top
+// menu, FAQPage JSON-LD == visible accordion, price text from price-message.ts,
+// no Rett fra Bonden wording, escaping. Calls the GET handler directly, no DB;
+// restores FOR_TILBYDERE_FAQ_ENABLED in finally — tail position.
+runSerial(async () => {
+  console.log("\n── O4a: «For tilbydere» med deler og FAQ (opplevagent.no /for-tilbydere) ──");
+  try {
+    const { runExperiencesForTilbydereFaqTests } = require("../src/routes/experiences-for-tilbydere-faq.test") as
+      typeof import("../src/routes/experiences-for-tilbydere-faq.test");
+    const r = await runExperiencesForTilbydereFaqTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("experiences-for-tilbydere-faq: " + f);
+    console.log(`  experiences-for-tilbydere-faq: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-for-tilbydere-faq: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse (RFB +
+// gårdssalg): the producer description from the «Om oss» page, behind
+// ENRICHMENT_ABOUT_PAGE_ENABLED (default OFF) with a dry-run-only
+// about_page_preview. Three suites: the pure switch/extractor/choice; the RFB
+// homepage-content-refresh wiring (swaps the getDb() singleton and, for the
+// route cases, globalThis.fetch); the gårdssalg content-refresh wiring (swaps
+// the experiences DB module cache, env vars and globalThis.fetch). Everything
+// is restored in finally — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── about-page-candidate: «Om oss» til produsentbeskrivelsen (RFB + gårdssalg) ──");
+  const suites: Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]> = [
+    [
+      "about-page-candidate",
+      async () =>
+        (require("../src/services/about-page-candidate.test") as typeof import("../src/services/about-page-candidate.test"))
+          .runAboutPageCandidateTests({ log: false }),
+    ],
+    [
+      "homepage-content-refresh-about-page",
+      () =>
+        (require("../src/routes/homepage-content-refresh-about-page.test") as typeof import("../src/routes/homepage-content-refresh-about-page.test"))
+          .runHomepageContentRefreshAboutPageTests({ log: false }),
+    ],
+    [
+      "opplevelser-gardssalg-about-page-candidate",
+      () =>
+        (require("../src/routes/opplevelser-gardssalg-about-page-candidate.test") as typeof import("../src/routes/opplevelser-gardssalg-about-page-candidate.test"))
+          .runOpplevelserGardssalgAboutPageCandidateTests({ log: false }),
+    ],
+  ];
+  for (const [label, runSuite] of suites) {
+    try {
+      const r = await runSuite();
+      passed += r.passed;
+      failed += r.failed;
+      for (const f of r.failures) failures.push(`${label}: ` + f);
+      console.log(`  ${label}: ${r.passed} passed, ${r.failed} failed`);
+    } catch (err: any) {
+      failed++;
+      failures.push(`${label}: unexpected error: ` + String(err?.message || err));
+    }
   }
 });
 

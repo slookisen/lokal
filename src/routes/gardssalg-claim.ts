@@ -506,6 +506,9 @@ router.get("/kategori/gardssalg/eier/:providerSlug", generalLimiter, async (req:
 // nothing — no live derivation can produce it, so a client naming it still
 // lands on issueClaimMagicLink()'s "invalid_selection" (there is no such
 // candidate to match), which is what the j2 regression test pins.
+//
+// "outreach_delivered" (OA-01, 2026-10-31): the Opplevagent-outreach tier —
+// listed so a producer offered it next to another address can pick it.
 const CLAIM_EMAIL_SOURCES = [
   "brreg_contact",
   "verified_domain_address",
@@ -514,6 +517,7 @@ const CLAIM_EMAIL_SOURCES = [
   "found_contact_page",
   "found_site_other",
   "found_umbrella_member",
+  "outreach_delivered",
 ] as const;
 function parseSelectedSource(value: unknown): (typeof CLAIM_EMAIL_SOURCES)[number] | undefined {
   return typeof value === "string" && (CLAIM_EMAIL_SOURCES as readonly string[]).includes(value)

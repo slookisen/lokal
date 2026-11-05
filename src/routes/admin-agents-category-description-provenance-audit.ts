@@ -80,7 +80,7 @@ import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
 import { isJunkDescription } from "../services/description-quality";
 import { fieldLacksWebsiteCorroboration } from "../services/cross-source-validator";
-import { applyRfbRetroScanNull } from "./admin-agents";
+import { applyRfbRetroScanNull, isRfbFieldCurated } from "./admin-agents";
 
 const router = Router();
 
@@ -120,6 +120,8 @@ interface AuditRow {
   products: string | null;
   about: string | null;
   field_provenance: string | null;
+  claimed_at: string | null;
+  curated_fields: string | null;
 }
 
 interface NaceDefaultExample {
@@ -136,7 +138,13 @@ interface BoilerplateExample {
   org_nr: string | null;
   field: "description" | "about";
   excerpt: string;
+  /** Owner-claimed row: applyRfbRetroScanNull refuses it, so it is never a routing candidate. */
+  claimed: boolean;
+  /** Field locked in agent_knowledge.curated_fields: likewise never a routing candidate. */
+  curated_locked: boolean;
 }
+
+type BoilerplateField = "description" | "about";
 
 const EXAMPLE_LIMIT = 25;
 
@@ -149,17 +157,32 @@ function excerpt(text: string): string {
  * The scan + classify pass shared by GET / (report) and POST /route-
  * boilerplate-to-reenrichment (which needs the SAME boilerplate candidate
  * set the report just showed, not a second independent query).
+ *
+ * dev-request 2026-10-31 S3: a boilerplate hit on an owner-claimed row
+ * (agents.claimed_at set) or on a field locked in curated_fields is one
+ * applyRfbRetroScanNull refuses on purpose, so it goes to skippedClaimed /
+ * skippedCurated instead of boilerplateAgentIds — before, the same claimed
+ * rows came back as "candidates" every day and were never written. The
+ * report's count/examples still cover every hit, each example marked.
  */
 function runAudit(db: ReturnType<typeof getDb>): {
   scannedCount: number;
   naceDefaultOnly: { count: number; examples: NaceDefaultExample[] };
-  boilerplateDescription: { count: number; examples: BoilerplateExample[] };
-  boilerplateAgentIds: Array<{ id: string; field: "description" | "about" }>;
+  boilerplateDescription: {
+    count: number;
+    claimed_count: number;
+    curated_locked_count: number;
+    examples: BoilerplateExample[];
+  };
+  boilerplateAgentIds: Array<{ id: string; field: BoilerplateField }>;
+  skippedClaimed: Array<{ id: string; field: BoilerplateField }>;
+  skippedCurated: Array<{ id: string; field: BoilerplateField }>;
 } {
   const rows = db
     .prepare(
       `SELECT a.id, a.name, a.org_nr, a.description, a.categories,
-              k.products, k.about, k.field_provenance
+              k.products, k.about, k.field_provenance,
+              a.claimed_at, k.curated_fields
          FROM agents a
          LEFT JOIN agent_knowledge k ON k.agent_id = a.id
          ${RFB_PRODUCER_SCOPE_SQL}`
@@ -169,7 +192,9 @@ function runAudit(db: ReturnType<typeof getDb>): {
   const naceExamples: NaceDefaultExample[] = [];
   let naceCount = 0;
   const boilerplateExamples: BoilerplateExample[] = [];
-  const boilerplateAgentIds: Array<{ id: string; field: "description" | "about" }> = [];
+  const boilerplateAgentIds: Array<{ id: string; field: BoilerplateField }> = [];
+  const skippedClaimed: Array<{ id: string; field: BoilerplateField }> = [];
+  const skippedCurated: Array<{ id: string; field: BoilerplateField }> = [];
   let boilerplateCount = 0;
 
   for (const row of rows) {
@@ -220,29 +245,25 @@ function runAudit(db: ReturnType<typeof getDb>): {
     }
 
     // ── Boilerplate description/about (reuses isJunkDescription as-is) ─────
-    if (row.description && isJunkDescription(row.description)) {
+    const claimed = !!row.claimed_at;
+    const flagged: Array<{ field: BoilerplateField; text: string }> = [];
+    if (row.description && isJunkDescription(row.description)) flagged.push({ field: "description", text: row.description });
+    if (row.about && isJunkDescription(row.about)) flagged.push({ field: "about", text: row.about });
+    for (const { field, text } of flagged) {
       boilerplateCount++;
-      boilerplateAgentIds.push({ id: row.id, field: "description" });
+      const curatedLocked = isRfbFieldCurated(row.curated_fields, field);
+      if (claimed) skippedClaimed.push({ id: row.id, field });
+      else if (curatedLocked) skippedCurated.push({ id: row.id, field });
+      else boilerplateAgentIds.push({ id: row.id, field });
       if (boilerplateExamples.length < EXAMPLE_LIMIT) {
         boilerplateExamples.push({
           id: row.id,
           name: row.name,
           org_nr: row.org_nr,
-          field: "description",
-          excerpt: excerpt(row.description),
-        });
-      }
-    }
-    if (row.about && isJunkDescription(row.about)) {
-      boilerplateCount++;
-      boilerplateAgentIds.push({ id: row.id, field: "about" });
-      if (boilerplateExamples.length < EXAMPLE_LIMIT) {
-        boilerplateExamples.push({
-          id: row.id,
-          name: row.name,
-          org_nr: row.org_nr,
-          field: "about",
-          excerpt: excerpt(row.about),
+          field,
+          excerpt: excerpt(text),
+          claimed,
+          curated_locked: curatedLocked,
         });
       }
     }
@@ -251,8 +272,15 @@ function runAudit(db: ReturnType<typeof getDb>): {
   return {
     scannedCount: rows.length,
     naceDefaultOnly: { count: naceCount, examples: naceExamples },
-    boilerplateDescription: { count: boilerplateCount, examples: boilerplateExamples },
+    boilerplateDescription: {
+      count: boilerplateCount,
+      claimed_count: skippedClaimed.length,
+      curated_locked_count: skippedCurated.length,
+      examples: boilerplateExamples,
+    },
     boilerplateAgentIds,
+    skippedClaimed,
+    skippedCurated,
   };
 }
 
@@ -321,8 +349,12 @@ router.post("/route-boilerplate-to-reenrichment", (req: Request, res: Response) 
     res.json({
       success: true,
       dry_run: !apply,
+      // Only rows the write can actually touch (dev-request 2026-10-31 S3);
+      // claimed / curated-locked hits are listed separately, never written.
       candidate_count: targets.length,
       candidates: targets,
+      skipped_claimed: audit.skippedClaimed,
+      skipped_curated: audit.skippedCurated,
       routed_to_reenrichment: routed,
     });
   } catch (err) {

@@ -277,6 +277,14 @@ export function classifyContactCandidateDefect(
 export interface ContactCandidateJudgeVerdict {
   approved: boolean;
   reason?: string;
+  /**
+   * Set ONLY when no model verdict was obtained (missing API key, network
+   * error, timeout, non-2xx response, unparseable JSON, response without a
+   * text block). Still `approved: false` (fail-closed), but callers that
+   * persist a rejection can tell an infrastructure failure apart from a real
+   * AVVIS and keep the item open for a later retry. Absent on real verdicts.
+   */
+  infraFailure?: true;
 }
 
 const CONTACT_JUDGE_APPROVE_TOKEN = "GODKJENN";
@@ -316,6 +324,7 @@ function raceAbort<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
 const JUDGE_TIMEOUT_VERDICT: ContactCandidateJudgeVerdict = {
   approved: false,
   reason: "judge_timeout — dommer-kall tidsavbrutt — avvist fail-closed",
+  infraFailure: true,
 };
 
 /**
@@ -334,7 +343,7 @@ export async function judgeContactCandidate(params: {
   const { fieldType, candidate, sourceContext, businessName } = params;
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
-    return { approved: false, reason: "ANTHROPIC_API_KEY mangler — avvist fail-closed" };
+    return { approved: false, reason: "ANTHROPIC_API_KEY mangler — avvist fail-closed", infraFailure: true };
   }
 
   const fieldLabel = fieldLabelFor(fieldType);
@@ -388,7 +397,7 @@ Ved minste tvil, svar ${CONTACT_JUDGE_REJECT_TOKEN}.`;
     }), signal);
   } catch (err: any) {
     if (signal.aborted || err?.name === "TimeoutError") return JUDGE_TIMEOUT_VERDICT;
-    return { approved: false, reason: "nettverksfeil under dommer-kall — avvist fail-closed" }; // never fabricate
+    return { approved: false, reason: "nettverksfeil under dommer-kall — avvist fail-closed", infraFailure: true }; // never fabricate
   }
 
   if (!response.ok) {
@@ -403,6 +412,7 @@ Ved minste tvil, svar ${CONTACT_JUDGE_REJECT_TOKEN}.`;
     return {
       approved: false,
       reason: `dommer-API svarte status ${response.status} — avvist fail-closed — ${bodySnippet}`,
+      infraFailure: true,
     };
   }
 
@@ -411,13 +421,13 @@ Ved minste tvil, svar ${CONTACT_JUDGE_REJECT_TOKEN}.`;
     result = await raceAbort(response.json(), signal);
   } catch {
     if (signal.aborted) return JUDGE_TIMEOUT_VERDICT;
-    return { approved: false, reason: "ikke-parsbar JSON fra dommer-API — avvist fail-closed" };
+    return { approved: false, reason: "ikke-parsbar JSON fra dommer-API — avvist fail-closed", infraFailure: true };
   }
 
   const contentArr = Array.isArray(result?.content) ? result.content : [];
   const text = contentArr.find((c: any) => c?.type === "text")?.text;
   if (typeof text !== "string") {
-    return { approved: false, reason: "uventet svarformat fra dommer-API — avvist fail-closed" };
+    return { approved: false, reason: "uventet svarformat fra dommer-API — avvist fail-closed", infraFailure: true };
   }
 
   const lines = text.trim().split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);

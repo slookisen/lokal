@@ -206,6 +206,9 @@ export async function runBestillingerB1bTests(opts: { log?: boolean } = {}): Pro
         assertEq(r.status, 403, `other-1: verified owner, not the claimant's e-mail → POST ${name} → 403`);
         assertTrue(html.includes("Logg inn med eierens e-postadresse") && html.includes("e-postadressen til den som har bekreftet eierskapet")
           && html.includes(`href="/selger?agent=${P}"`) && html.includes("ep-card"), `other-2: POST ${name} → Norwegian page linking to /selger?agent=<id>`);
+        const title = (html.match(/<title>([^<]*)<\/title>/) ?? [])[1] ?? "";
+        assertTrue(title.includes("Logg inn med eierens e-post") && !title.includes("Ingen tilgang"),
+          `other-2b: POST ${name} → page <title> says «Logg inn med eierens e-post», not «Ingen tilgang» (got ${JSON.stringify(title)})`);
       }
       assertEq([productsOf(), auditCount()], [before, a0], "other-3: nothing written, no audit row");
       const g = await invoke(H.portal, makeReq({ method: "GET", params: { agentId: P }, token: "tok-other" }));

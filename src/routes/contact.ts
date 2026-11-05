@@ -17,6 +17,8 @@
  * On success: creates a CRM thread (category "innkommende", subject
  * prefixed with "[Kontaktskjema]") via direct DB write — minimum privilege,
  * no reads, no admin routes.
+ * Then e-mails a text-only copy to ADMIN_NOTIFICATION_EMAIL (Reply-To = the
+ * visitor), fire-and-forget: it never delays or changes the response.
  *
  * NEVER exposes internal errors to the caller.
  */
@@ -24,6 +26,7 @@
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
+import { emailService, maskEmails } from "../services/email-service";
 
 const router = Router();
 
@@ -129,7 +132,7 @@ function createContactThread(params: {
   subject: string;
   message: string;
   platform: Platform;
-}): void {
+}): string {
   const db = getDb();
   const now = new Date().toISOString();
   const lowerEmail = params.email.trim().toLowerCase();
@@ -212,6 +215,8 @@ function createContactThread(params: {
       name: params.name,
     }),
   );
+
+  return threadId;
 }
 
 // ─── POST /contact ───────────────────────────────────────────
@@ -291,7 +296,17 @@ router.post("/contact", async (req: Request, res: Response): Promise<void> => {
     }
 
     // 6. Create CRM thread
-    createContactThread({ name, email, subject, message, platform });
+    const threadId = createContactThread({ name, email, subject, message, platform });
+
+    // 6b. E-mail copy to the admin (Daniel, 2026-11-01). Not awaited: the
+    // thread above is already written, and a slow or failing send must never
+    // delay or change the response. The service never throws; the .catch is
+    // a belt, and logs no message content or visitor address.
+    emailService
+      .sendAdminContactFormCopy({ platform, name, email, subject, message, threadId })
+      .catch((err: unknown) => {
+        console.error("[contact] Admin copy failed:", maskEmails(err instanceof Error ? err.message : String(err)));
+      });
 
     // 7. Success
     res.status(200).json({

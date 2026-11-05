@@ -31,7 +31,8 @@ import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
 import { slugify } from "../utils/slug";
-import { computeEffectiveAvailability } from "../services/supply-graph";
+import { evaluateStockFreshness, type StockFreshness } from "../services/supply-graph";
+import { stockSoftExpiryActiveFor, stockSoftExpiryBuyerTextNb } from "../services/stock-soft-expiry";
 import { runProductCatalogSync, normalizeName } from "../services/product-catalog-sync";
 import { findOffers, resolveOffersRadiusKm, resolveOffersLimit } from "../services/catalog-offers";
 import { isValidLatLng } from "../utils/geo-query";
@@ -44,6 +45,30 @@ import { publiclyVisibleSql, notOwnerHiddenSql } from "../services/agent-visibil
 import { publicFieldChoicesForMany, hidesPrices } from "../owner-features/enforce";
 
 // ─── Public catalog router (mounted at /api/marketplace/catalog) ────────────
+// B2b-2 (dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier,
+// «B2b — myk utløp»): the feeds and the product list read a row's stock with
+// the order path's rule. Rule off for the producer (STOCK_SOFT_EXPIRY_ENABLED
+// and the owner-features allowlist, stock-soft-expiry.ts) → exactly
+// computeEffectiveAvailability() and no extra field, as before. In the soft
+// window → 'in_stock' plus stock_confirmed_at / needs_producer_confirmation.
+function rowStockFreshness(
+  agentId: string,
+  r: { availability: string; availability_updated_at: string | null; availability_source: string },
+  now: Date,
+  active: Map<string, boolean>,
+): StockFreshness {
+  let on = active.get(agentId);
+  if (on === undefined) { on = stockSoftExpiryActiveFor(agentId); active.set(agentId, on); }
+  return evaluateStockFreshness(r.availability, r.availability_updated_at, r.availability_source, now, on);
+}
+
+/** B2b-2: the two fields of a row in the soft window ({} otherwise). */
+function softStockJson(f: StockFreshness): { stock_confirmed_at?: string; needs_producer_confirmation?: true } {
+  return f.needs_producer_confirmation && f.stock_confirmed_at
+    ? { stock_confirmed_at: f.stock_confirmed_at, needs_producer_confirmation: true }
+    : {};
+}
+
 export const catalogRouter = Router();
 
 // ─── Admin catalog router (mounted at /admin/products) ──────────────────────
@@ -385,26 +410,32 @@ catalogRouter.get("/feed", (req: Request, res: Response) => {
   const now = new Date();
   // S2c-1 (products.show_prices): no amount for a producer who hid prices.
   const ownerChoices = publicFieldChoicesForMany(rows.map(r => r.agent_id));
-  const items = rows.map(r => ({
-    id: r.id,
-    title: r.name,
-    description: r.description ?? null,
-    price: {
-      amount: hidesPrices(ownerChoices.get(r.agent_id)) ? null : r.price_nok ?? null,
-      currency: r.currency,
-    },
-    availability: computeEffectiveAvailability(r.availability, r.availability_updated_at, r.availability_source, now),
-    availability_updated_at: r.availability_updated_at ?? null,
-    unit: r.unit ?? null,
-    category: r.category ?? null,
-    seller: {
-      agent_id: r.agent_id,
-      name: r.agent_name,
-      city: r.agent_city ?? null,
-      profile_url: `${BASE_URL}/produsent/${slugify(r.agent_name)}`,
-    },
-    image_url: r.image_url ?? null,
-  }));
+  const softActive = new Map<string, boolean>();
+  const items = rows.map(r => {
+    const fresh = rowStockFreshness(r.agent_id, r, now, softActive);
+    return {
+      id: r.id,
+      title: r.name,
+      description: r.description ?? null,
+      price: {
+        amount: hidesPrices(ownerChoices.get(r.agent_id)) ? null : r.price_nok ?? null,
+        currency: r.currency,
+      },
+      availability: fresh.availability,
+      availability_updated_at: r.availability_updated_at ?? null,
+      // B2b-2: only for a row in the soft window (extension fields of this JSON feed).
+      ...softStockJson(fresh),
+      unit: r.unit ?? null,
+      category: r.category ?? null,
+      seller: {
+        agent_id: r.agent_id,
+        name: r.agent_name,
+        city: r.agent_city ?? null,
+        profile_url: `${BASE_URL}/produsent/${slugify(r.agent_name)}`,
+      },
+      image_url: r.image_url ?? null,
+    };
+  });
 
   res.json({ success: true, count: items.length, total, items });
 });
@@ -481,6 +512,7 @@ catalogRouter.get("/acp-feed.csv", (_req: Request, res: Response) => {
   ];
 
   const now = new Date();
+  const softActive = new Map<string, boolean>();
   let skippedMissingRequired = 0;
   const lines: string[] = [header.join(",")];
 
@@ -494,11 +526,21 @@ catalogRouter.get("/acp-feed.csv", (_req: Request, res: Response) => {
     }
 
     const title = r.name.slice(0, 150);
-    const description = (r.description ?? "").slice(0, 5000);
+    // B2b-2: the ACP columns are fixed (no extension column), so a row in the
+    // soft window states its confirmation date in `description` — the buyer
+    // text, after the producer's own text, within the 5000-character limit.
+    // `availability` keeps the ACP enum ('in_stock'). Any other row as before.
+    const fresh = rowStockFreshness(r.agent_id, r, now, softActive);
+    const stockNote = fresh.needs_producer_confirmation && fresh.stock_confirmed_at
+      ? stockSoftExpiryBuyerTextNb(fresh.stock_confirmed_at)
+      : "";
+    const description = stockNote
+      ? [(r.description ?? "").slice(0, 5000 - stockNote.length - 1), stockNote].filter(Boolean).join(" ")
+      : (r.description ?? "").slice(0, 5000);
     const brand = r.agent_name.slice(0, 70);
     const url = `${BASE_URL}/produsent/${slugify(r.agent_name)}`;
     const price = `${r.price_nok.toFixed(2)} ${r.currency}`;
-    const availability = computeEffectiveAvailability(r.availability, r.availability_updated_at, r.availability_source, now);
+    const availability = fresh.availability;
     const productCategory = r.category ?? "";
 
     const fields = [
@@ -584,21 +626,27 @@ INNER JOIN agent_knowledge k ON k.agent_id = a.id
   // `availability_source` (internal provenance) stays un-projected here, same
   // as `source` above.
   const now = new Date();
-  const products = rows.map(r => ({
-    id: r.id,
-    name: r.name,
-    description: r.description,
-    unit: r.unit,
-    price_nok: r.price_nok,
-    currency: r.currency,
-    availability: computeEffectiveAvailability(r.availability, r.availability_updated_at, r.availability_source, now),
-    availability_updated_at: r.availability_updated_at ?? null,
-    stock_qty: r.stock_qty,
-    category: r.category,
-    image_url: r.image_url,
-    created_at: r.created_at,
-    updated_at: r.updated_at,
-  }));
+  const softActive = new Map<string, boolean>();
+  const products = rows.map(r => {
+    // B2b-2: the order path's stock rule; the two fields only in the soft window.
+    const fresh = rowStockFreshness(id as string, r, now, softActive);
+    return {
+      id: r.id,
+      name: r.name,
+      description: r.description,
+      unit: r.unit,
+      price_nok: r.price_nok,
+      currency: r.currency,
+      availability: fresh.availability,
+      availability_updated_at: r.availability_updated_at ?? null,
+      ...softStockJson(fresh),
+      stock_qty: r.stock_qty,
+      category: r.category,
+      image_url: r.image_url,
+      created_at: r.created_at,
+      updated_at: r.updated_at,
+    };
+  });
 
   res.json({
     success: true,

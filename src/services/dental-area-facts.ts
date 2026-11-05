@@ -18,6 +18,9 @@
 // counts the same way, with the SQL twin of resolveVerifiedClaim (A2A
 // dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon, F2-S8): the
 // clinics whose card shows «Verifisert».
+// helfo_true counts with the SQL twin of resolveHelfoClaim (F2-S6, same
+// dev-request): helfo_agreement = 'true' with a stored source, the clinics
+// /sok?helfo=1 lists and whose card shows the Helfo badge.
 //
 // specialist_clinics counts the clinics whose card shows a specialty: the
 // cards' own predicate, clinicSpecialties(row).length > 0, run in JS over the
@@ -52,6 +55,7 @@
 import { createSwrCache, type SwrCache } from "./offthread-stats";
 import { DENTAL_ACUTE_CLAIM_SQL } from "./dental-acute-claim";
 import { dentalVerifiedClaimSql } from "./dental-verified-claim";
+import { dentalHelfoClaimSql } from "./dental-helfo-claim";
 import { clinicSpecialties } from "../config/dental-search-vocabulary";
 import { DENTAL_STATS_TTL_MS } from "./dental-search-gazetteer";
 import { DENTAL_EMERGENCY_NOTICE, DENTAL_LANDING_CONFIG, DENTAL_LANDING_FACETS, type DentalLandingFacet } from "../config/dental-landing";
@@ -69,7 +73,7 @@ export interface DentalAreaCounts {
   total: number;
   /** Clinics that show «Verifisert» (the read-time claim, F2-S8). */
   verified: number;
-  /** helfo_agreement = 'true': what the clinics' own websites say. */
+  /** Clinics that show the Helfo claim (dentalHelfoClaimSql: 'true' with a source, F2-S6): what the clinics' own websites say. */
   helfo_true: number;
   /** Clinics that show an akutt claim (DENTAL_ACUTE_CLAIM_SQL). */
   acute_sourced: number;
@@ -169,7 +173,7 @@ export function computeDentalAreaFacts(db: DbHandle): DentalAreaFacts {
   const rows = db.prepare(
     "SELECT poststed, fylke," +
     ` CASE WHEN ${dentalVerifiedClaimSql()} THEN 1 ELSE 0 END,` +
-    " CASE WHEN helfo_agreement = 'true' THEN 1 ELSE 0 END," +
+    ` CASE WHEN ${dentalHelfoClaimSql()} THEN 1 ELSE 0 END,` +
     ` CASE WHEN ${DENTAL_ACUTE_CLAIM_SQL} THEN 1 ELSE 0 END,` +
     ` CASE WHEN ${DATED_UPDATED_AT_SQL} THEN updated_at END,` +
     ` CASE WHEN ${SPECIALTY_CANDIDATE_SQL} THEN 1 ELSE 0 END,` +

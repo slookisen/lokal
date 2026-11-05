@@ -2007,18 +2007,28 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       const q = testDb
         .prepare("SELECT status, reason FROM agents_website_review_queue WHERE agent_id = 'wd-jg-rej'")
         .get() as any;
-      assertEq(q.status, "pending", "jg-b5: status column untouched — still 'pending'");
+      // dev-request 2026-10-31 S2: the judge's AVVIS closes the row (was left 'pending').
+      assertEq(q.status, "rejected", "jg-b5: AVVIS closes the row — status 'rejected'");
       assertTrue(
         typeof q.reason === "string" && q.reason.includes("LLM judge AVVIS"),
         "jg-b6: reason column carries the judge's verdict",
       );
       const k = testDb.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'wd-jg-rej'").get() as any;
       assertTrue(!k.website, "jg-b7: website column still blank — no write");
+      assertEq(r.body.still_pending, 0, "jg-b8: a rejected row no longer counts in still_pending");
+      const again = await callJudge({});
+      assertEq(again.body.processed, 0, "jg-b9: a rejected row is not re-judged on the next run");
+      assertEq(
+        (testDb.prepare("SELECT COUNT(*) AS c FROM agents_website_review_queue WHERE agent_id = 'wd-jg-rej'").get() as any).c,
+        1,
+        "jg-b10: the rejected row is kept, not deleted",
+      );
     }
 
     // ── (jg-c) fail-closed path: a judge-side failure (simulated network
-    //     throw) resolves EXACTLY like a reject — no write, status
-    //     untouched, reason appended ──
+    //     throw) is NOT a verdict — no write, counted as rejected in this
+    //     run, but the row stays 'pending' (reason recorded) so a later run
+    //     judges it again ──
     {
       testDb.prepare("DELETE FROM agents_website_review_queue").run();
       insertAgent({ id: "wd-jg-fail", name: "Steinbru Gardsmat AS" });
@@ -2043,13 +2053,98 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       const q = testDb
         .prepare("SELECT status, reason FROM agents_website_review_queue WHERE agent_id = 'wd-jg-fail'")
         .get() as any;
-      assertEq(q.status, "pending", "jg-c4: status untouched on fail-closed, same as a plain reject");
-      assertTrue(typeof q.reason === "string" && q.reason.length > 0, "jg-c5: reason column carries the fail-closed note");
+      assertEq(q.status, "pending", "jg-c4: a network failure is not a verdict — the row stays 'pending'");
+      assertTrue(
+        typeof q.reason === "string" && q.reason.includes("nettverksfeil"),
+        "jg-c5: reason column carries the fail-closed note",
+      );
       const k = testDb.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'wd-jg-fail'").get() as any;
       assertTrue(!k.website, "jg-c6: website column still blank — no write");
+      assertEq(r.body.still_pending, 1, "jg-c7: the row still counts in still_pending");
 
       // Restore the URL-keyed stub for the remaining blocks.
       globalThis.fetch = stubFetch();
+    }
+
+    // ── (jg-c2) more infrastructure failures (missing API key, HTTP 429)
+    //     keep the row 'pending'; a real AVVIS answer afterwards closes it ──
+    {
+      testDb.prepare("DELETE FROM agents_website_review_queue").run();
+      insertAgent({ id: "wd-jg-infra", name: "Lyngmo Gardsbakeri AS" });
+      insertQueueRow({
+        id: "q-jg-infra",
+        agentId: "wd-jg-infra",
+        candidateUrl: "https://lyngmogardsbakeri.no",
+        confidence: 0.92,
+        updatedAt: "2026-08-01T00:00:02.500Z",
+      });
+      const readStatus = () =>
+        (testDb.prepare("SELECT status, reason FROM agents_website_review_queue WHERE agent_id = 'wd-jg-infra'").get() as any);
+
+      // Missing ANTHROPIC_API_KEY.
+      const savedKey = process.env.ANTHROPIC_API_KEY;
+      delete process.env.ANTHROPIC_API_KEY;
+      const noKey = await callJudge({});
+      process.env.ANTHROPIC_API_KEY = savedKey;
+      assertEq(noKey.body.rejected, 1, "jg-c2a: missing API key is counted as rejected in this run");
+      assertEq(readStatus().status, "pending", "jg-c2b: missing API key keeps the row 'pending'");
+      assertTrue(String(readStatus().reason).includes("ANTHROPIC_API_KEY"), "jg-c2c: reason records the missing key");
+
+      // HTTP 429 from the judge API.
+      fixtures.set("https://api.anthropic.com/v1/messages", {
+        ok: false,
+        status: 429,
+        text: async () => "rate limited",
+      } as unknown as Response);
+      const throttled = await callJudge({});
+      assertEq(throttled.body.processed, 1, "jg-c2d: the still-pending row is judged again on the next run");
+      assertEq(readStatus().status, "pending", "jg-c2e: a non-2xx (429) keeps the row 'pending'");
+
+      // A real AVVIS answer closes it.
+      fixtures.set("https://api.anthropic.com/v1/messages", judgeApiResponse("AVVIS\nIkke produsentens egen nettside."));
+      const real = await callJudge({});
+      assertEq(real.body.rejected, 1, "jg-c2f: the AVVIS run rejects the row");
+      assertEq(readStatus().status, "rejected", "jg-c2g: an explicit AVVIS token closes the row as 'rejected'");
+    }
+
+    // ── (jg-s) a judge rejection is sticky: re-discovering the SAME
+    //     candidate_url keeps the row 'rejected' (reason kept); a different
+    //     candidate_url reopens it as 'pending' ──
+    {
+      testDb.prepare("DELETE FROM agents_website_review_queue").run();
+      insertAgent({ id: "wd-jg-sticky", name: "Kvitfjell Sideri AS", orgNr: "955555551", city: "Ringebu" });
+      fixtures.set(
+        "https://kvitfjellsideri.no",
+        htmlResponse("<html><body>Kvitfjell Sideri — org.nr 955 555 551</body></html>", { finalUrl: "https://kvitfjellsideri.no" }),
+      );
+      insertQueueRow({
+        id: "q-jg-sticky",
+        agentId: "wd-jg-sticky",
+        candidateUrl: "https://kvitfjellsideri.no",
+        confidence: 0.92,
+        status: "rejected",
+      });
+      testDb
+        .prepare("UPDATE agents_website_review_queue SET reason = 'LLM judge AVVIS: sticky-test' WHERE agent_id = 'wd-jg-sticky'")
+        .run();
+
+      const same = await callDiscovery({ agentIds: ["wd-jg-sticky"] });
+      assertEq(same.body.proposed?.[0]?.candidate_url, "https://kvitfjellsideri.no", "jg-s1: discovery re-proposes the same URL");
+      const rowSame = readQueueRow("wd-jg-sticky");
+      assertEq(rowSame.status, "rejected", "jg-s2: same candidate_url — the row stays 'rejected'");
+      assertEq(rowSame.reason, "LLM judge AVVIS: sticky-test", "jg-s3: same candidate_url — the judge's reason is kept");
+
+      testDb
+        .prepare("UPDATE agents_website_review_queue SET candidate_url = 'https://gammel-kvitfjell.no' WHERE agent_id = 'wd-jg-sticky'")
+        .run();
+      await callDiscovery({ agentIds: ["wd-jg-sticky"] });
+      const rowNew = readQueueRow("wd-jg-sticky");
+      assertEq(
+        [rowNew.status, rowNew.candidate_url],
+        ["pending", "https://kvitfjellsideri.no"],
+        "jg-s4: a different candidate_url reopens the row as 'pending'",
+      );
+      testDb.prepare("DELETE FROM agents_website_review_queue").run();
     }
 
     // ── (jg-d) deterministic backstop short-circuit: a structurally
@@ -2076,9 +2171,10 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
         "jg-d3: reason attributes the rejection to the backstop classifier, not the LLM",
       );
       const q = testDb
-        .prepare("SELECT status FROM agents_website_review_queue WHERE agent_id = 'wd-jg-backstop'")
+        .prepare("SELECT status, reason FROM agents_website_review_queue WHERE agent_id = 'wd-jg-backstop'")
         .get() as any;
-      assertEq(q.status, "pending", "jg-d4: status untouched");
+      assertEq(q.status, "rejected", "jg-d4: backstop AVVIS closes the row — status 'rejected'");
+      assertTrue(typeof q.reason === "string" && q.reason.includes("judge backstop AVVIS"), "jg-d5: reason kept on the closed row");
 
       globalThis.fetch = stubFetch();
     }
@@ -2177,9 +2273,15 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
         `INSERT INTO agents_website_review_queue (id, agent_id, agent_name, candidate_url, status, created_at, updated_at)
          VALUES ('q-st-applied', 'wd-st-applied', 'Alt Behandlet Gard AS', 'https://altbehandletgard.no', 'applied', ?, ?)`,
       ).run(daysAgoSqlite(10), daysAgoSqlite(10));
+      // A judge-rejected row (dev-request 2026-10-31 S2) is closed: excluded too.
+      insertAgent({ id: "wd-st-rejected", name: "Avvist Gard AS" });
+      testDb.prepare(
+        `INSERT INTO agents_website_review_queue (id, agent_id, agent_name, candidate_url, status, created_at, updated_at)
+         VALUES ('q-st-rejected', 'wd-st-rejected', 'Avvist Gard AS', 'https://avvistgard.no', 'rejected', ?, ?)`,
+      ).run(daysAgoSqlite(12), daysAgoSqlite(12));
 
       const r = await callStaleness();
-      assertEq(r.body.count, 3, "st-b1: count 3 — the applied row is excluded");
+      assertEq(r.body.count, 3, "st-b1: count 3 — the applied and the rejected rows are excluded");
       // threshold is 2 days: the 1-day row is fresh, the 3- and 5-day rows
       // are stale.
       assertEq(r.body.stale_count, 2, "st-b2: stale_count 2 (3-day and 5-day rows)");

@@ -86,6 +86,9 @@
 import Database from "better-sqlite3";
 import fs from "fs";
 import path from "path";
+// skive B (dev-request 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-forverring): the about
+// LLM judges approve everything here — this suite tests other guards.
+import { useApproveAllAboutJudges } from "../../tests/helpers/hcr-about-judges";
 
 export interface TestSummary {
   passed: number;
@@ -155,6 +158,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
   let passed = 0;
   let failed = 0;
   const failures: string[] = [];
+  const restoreAboutJudges = useApproveAllAboutJudges();
 
   function assertEq(actual: unknown, expected: unknown, label: string): void {
     if (JSON.stringify(actual) === JSON.stringify(expected)) {
@@ -579,7 +583,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq(e2.inReplyToMessageId, undefined, "e28: AC4 …and no In-Reply-To/References");
       assertTrue(String(e2.textContent).startsWith("Hei igjen,\n\nJeg skrev til dere "), "e29: the second touch is text I, not the first text again");
       assertTrue(!String(e2.textContent).includes("katalog") && !String(e0.textContent).toLowerCase().includes("katalog"), "e30: no «katalog» in any sent text");
-      assertTrue(String(e0.textContent).includes("https://rettfrabonden.com/selger?agent=f-0000-000a"), "e31: H carries {eier_url} with the agent id");
+      assertTrue(!String(e0.textContent).includes("selger?agent=") && String(e0.textContent).includes("svarer dere bare på denne e-posten, så hjelper jeg dere med å ta den over."), "e31: H asks for a reply instead of carrying {eier_url} (Daniel 2026-11-01)");
       assertEq(
         r_e_rows().map((x) => [x.agent_id, x.template, x.subject_variant]),
         [["f-0000-000a", "rfb-outreach-v4", "A"], ["f-0000-000b", "rfb-outreach-v4", "B"], ["s-0000-0001", "rfb-outreach-v4-followup", "B"]],
@@ -2039,6 +2043,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
     failed++;
     failures.push(`rfb-marketing-daily: unexpected error: ${err instanceof Error ? err.stack || err.message : String(err)}`);
   } finally {
+    restoreAboutJudges();
     daily.__setRfbMarketingHealthProbeForTesting(null);
     daily.__setRfbMarketingRefreshFetchForTesting(null);
     emailSvc.isConfigured = origConfigured;

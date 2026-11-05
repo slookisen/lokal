@@ -13,12 +13,21 @@ import {
   type TranslationTargetLang,
 } from "../services/profile-translations";
 import crypto from "crypto";
+import { tokenLogLabel, emailLogLabel } from "../utils/log-label";
+import { productImportOutreachEnabled } from "../services/product-import/outreach-prepare";
+import { OUTREACH_RETURN_COOKIE, outreachReturnPathFor } from "../services/product-import/outreach-landing";
 import { getProducerPaymentStatus } from "../services/payment-service";
 import { isOverridableCsLock, csLockNote } from "../services/owner-cs-lock";
 import { customerRuleSql } from "../services/customer-rule";
-import { getSupplyGraphStaleDays } from "../services/supply-graph";
+import { getSupplyGraphHardStaleDays, getSupplyGraphStaleDays } from "../services/supply-graph";
+import { stockSoftExpiryActiveFor } from "../services/stock-soft-expiry";
 import { writeOrderNotificationsOptInWithAudit } from "../services/order-opt-in";
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
+import {
+  OWNER_FEATURE_GROUPS, getOwnerFeature, ownerAutoUpdatesEnabled, ownerFeatureEntryForEnv, visibleOwnerFeatureOptions, type OwnerFeatureValue,
+} from "../owner-features/registry";
+import { resolveOwnerFeature, setOwnerFeatureValue } from "../owner-features/resolve";
+import { OWNER_PORTAL_THEME_CSS, ownerThemeHtml } from "../owner-ui/tokens";
 import { ownerPauseEnabled, isOwnerPaused, readOwnerPauseRow } from "../services/agent-visibility";
 import { isBlocked, normalizeEmail } from "../services/blocklist-service";
 import { rateLimit } from "express-rate-limit";
@@ -26,6 +35,7 @@ import {
   isCrossSiteWrite, writeGuardRefusedBody, WRITE_GUARD_REFUSED_TITLE, WRITE_GUARD_CONTACT_RFB,
 } from "../middleware/same-origin-write";
 import { ownerOrdersEntryCardHtml } from "./owner-orders-view";
+import { OWNER_PORTAL_FORM_LABELS, readOwnerAuditFeed } from "./owner-audit-log";
 import { paymentPortalAlert, renderPaymentCard, shouldRenderPaymentCard } from "./owner-payment-card";
 import {
   ownerOrderabilityPortalEnabledFor, listOwnerProductOrderability, confirmOwnerProductInStock,
@@ -110,7 +120,8 @@ interface SessionData {
 // ─────────────────────────────────────────────────────────────────
 // POST /api/agents/:id/request-magic-link
 // ─────────────────────────────────────────────────────────────────
-// 1. Validate email matches agent's registered email (case-insensitive)
+// 1. Validate email matches agent's registered email (case-insensitive), or
+//    the confirmed address of this agent's verified owner (K5, below)
 // 2. Rate-limit: max 3 requests per hour
 // 3. Generate secure token
 // 4. Store in magic_links table
@@ -122,7 +133,7 @@ router.post("/api/agents/:id/request-magic-link", async (req: Request, res: Resp
     const { id } = req.params;
     const { email } = req.body;
 
-    console.log(`[owner-portal] POST request-magic-link for agent ${id}, email: ${email}`);
+    console.log(`[owner-portal] POST request-magic-link for agent ${id}, email: ${emailLogLabel(email)}`);
 
     // Validate input
     if (!email || typeof email !== "string" || !email.includes("@")) {
@@ -143,13 +154,22 @@ router.post("/api/agents/:id/request-magic-link", async (req: Request, res: Resp
       .prepare("SELECT name FROM agents WHERE id = ?")
       .get(id) as any;
 
-    if (
-      !agentKnowledge ||
-      !agentKnowledge.email ||
-      agentKnowledge.email.toLowerCase() !== email.toLowerCase()
-    ) {
+    // K5 (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post): an owner
+    // Daniel approved by hand is bound to the address he approved
+    // (agent_claims.claimant_email, status 'verified'), often because the one
+    // on the profile was wrong — and approval never touches
+    // agent_knowledge.email. That confirmed address logs in too, for THIS
+    // agent only. Any other address gets the same 404 as before. The link goes
+    // to the confirmed address (normalized), not to the typed variant of it.
+    const knowledgeMatch =
+      !!agentKnowledge &&
+      !!agentKnowledge.email &&
+      agentKnowledge.email.toLowerCase() === email.toLowerCase();
+    const claimantEmail = knowledgeMatch ? null : verifiedClaimantEmailFor(String(id), email);
+
+    if (!knowledgeMatch && !claimantEmail) {
       console.log(
-        `[owner-portal] Email mismatch for ${id}: provided=${email}, registered=${agentKnowledge?.email || "none"}`
+        `[owner-portal] Email mismatch for ${id}: provided=${emailLogLabel(email)}, registered=${emailLogLabel(agentKnowledge?.email)}`
       );
       return res.status(404).json({
         success: false,
@@ -194,30 +214,21 @@ router.post("/api/agents/:id/request-magic-link", async (req: Request, res: Resp
       });
     }
 
-    // 3. Generate secure token
-    const token = crypto.randomBytes(32).toString("hex");
-    const now = new Date();
-    const expiresAt = new Date(now.getTime() + MAGIC_LINK_VALID_HOURS * 60 * 60 * 1000);
-
-    // 4. Insert into magic_links
-    const linkId = `ml_${crypto.randomBytes(8).toString("hex")}`;
-    db.prepare(
-      `INSERT INTO magic_links (id, email, token, agent_id, used, created_at, expires_at)
-       VALUES (?, ?, ?, ?, 0, ?, ?)`
-    ).run(linkId, email, token, id, now.toISOString(), expiresAt.toISOString());
+    // 3 + 4. Generate secure token, insert into magic_links (shared helper)
+    const recipient = claimantEmail ?? email;
+    const { linkId, verifyUrl } = createOwnerLoginLink(String(id), recipient, "request");
 
     console.log(`[owner-portal] Created magic link ${linkId} for ${id}`);
 
     // 5. Send email — agent-name aware template per Phase 5.4a M2 spec B2
-    const verifyUrl = `https://rettfrabonden.com/magic-link-verify?token=${token}`;
     const emailResult = await emailService.sendOwnerMagicLink({
-      to: email,
+      to: recipient,
       agentName,
       verifyUrl,
     });
 
     if (!emailResult.success) {
-      console.error(`[owner-portal] Failed to send magic link email to ${email}`);
+      console.error(`[owner-portal] Failed to send magic link email to ${emailLogLabel(email)}`);
       return res.status(500).json({
         success: false,
         error: "email_send_failed",
@@ -226,7 +237,7 @@ router.post("/api/agents/:id/request-magic-link", async (req: Request, res: Resp
     }
 
     // 6. Success
-    console.log(`[owner-portal] Magic link sent to ${email}`);
+    console.log(`[owner-portal] Magic link sent to ${emailLogLabel(email)}`);
     return res.json({
       success: true,
       message: "Sjekk e-posten din for innloggings-link.",
@@ -248,12 +259,16 @@ router.post("/api/agents/:id/request-magic-link", async (req: Request, res: Resp
 // 2. Mark token as used
 // 3. Set HttpOnly session cookie
 // 4. Redirect to edit page
+// (A claim-approval link, "mlclaim_", is one-time and opens a fresh session
+// row instead — see createOwnerLoginLink.)
 
 router.get("/magic-link-verify", (req: Request, res: Response) => {
   try {
     const { token } = req.query;
 
-    console.log(`[owner-portal] GET magic-link-verify, token=${token}`);
+    // Never log the token itself: it becomes the 7-day rfb_owner_session
+    // cookie and is accepted as a Bearer token (T1, eierportal bølge 0).
+    console.log(`[owner-portal] GET magic-link-verify, token=${tokenLogLabel(token)}`);
 
     if (!token || typeof token !== "string") {
       // FIX 2026-05-10: /min-profil/feil does not exist. Send user to a usable page.
@@ -271,26 +286,53 @@ router.get("/magic-link-verify", (req: Request, res: Response) => {
       .get(token) as any;
 
     if (!magicLink) {
-      console.log(`[owner-portal] Invalid or expired token: ${token}`);
+      console.log(`[owner-portal] Invalid or expired token: ${tokenLogLabel(token)}`);
       // FIX 2026-05-10: /min-profil/feil does not exist; send user to a usable page.
       return res.redirect(302, "/?error=invalid_token");
     }
 
     const agentId = magicLink.agent_id;
 
-    // 2. Mark as used
-    db.prepare(
-      `UPDATE magic_links SET used = 1, used_at = datetime('now') WHERE token = ?`
-    ).run(token);
+    if (String(magicLink.id || "").startsWith(OWNER_CLAIM_LINK_ID_PREFIX)) {
+      // K5: the claim-approval link is one-time. Burn it (used = 1 AND
+      // expired, so the mailed token is no session either; `used = 0` in the
+      // WHERE makes a second click — or a race — lose) and open a fresh 7-day
+      // session row, so the 15-minute link life is not the session's life.
+      const burned = db.prepare(
+        `UPDATE magic_links SET used = 1, used_at = datetime('now'), expires_at = ? WHERE token = ? AND used = 0`
+      ).run(new Date(Date.now() - 1000).toISOString(), token);
+      if (burned.changes === 0) {
+        console.log(`[owner-portal] Claim login link already used: ${tokenLogLabel(token)}`);
+        return res.redirect(302, "/?error=invalid_token");
+      }
+      openOwnerSession(res, agentId, String(magicLink.email || ""));
+    } else {
+      // 2. Mark as used
+      db.prepare(
+        `UPDATE magic_links SET used = 1, used_at = datetime('now') WHERE token = ?`
+      ).run(token);
 
-    // 3. Set HttpOnly cookie
-    res.cookie("rfb_owner_session", token, {
-      path: "/",
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-      httpOnly: true,
-      secure: true,
-      sameSite: "lax",
-    });
+      // 3. Set HttpOnly cookie
+      res.cookie("rfb_owner_session", token, {
+        path: "/",
+        maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+        httpOnly: true,
+        secure: true,
+        sameSite: "lax",
+      });
+    }
+
+    // Skive 3b-2 (PRODUCT_IMPORT_OUTREACH_ENABLED): back to the outreach
+    // landing page the owner came from (rfb_owner_return cookie), only when it
+    // is exactly that page for THIS agent.
+    const outreachBack = productImportOutreachEnabled()
+      ? outreachReturnPathFor(req.headers.cookie as string | undefined, (req as any).cookies, String(agentId))
+      : null;
+    if (outreachBack) {
+      res.clearCookie(OUTREACH_RETURN_COOKIE, { path: "/" });
+      console.log(`[owner-portal] Magic link verified for ${agentId}, returning to the product suggestions page`);
+      return res.redirect(302, outreachBack);
+    }
 
     // 4. Redirect to authenticated portal page (per Phase 5.4a M2 spec B3)
     console.log(`[owner-portal] Magic link verified for ${agentId}, redirecting to /eier/${agentId}/portal`);
@@ -337,6 +379,18 @@ function readSessionCookie(req: Request): string | undefined {
   return parsed.rfb_owner_session;
 }
 
+/**
+ * A claim-approval link ("mlclaim_") is never a session, used or not. Only
+ * /magic-link-verify redeems it, and that burns it and opens a fresh
+ * "mlsess_" row. Without this check a claim link that something else had
+ * marked used (the /selger verifier, knowledge-service verifyMagicLink, did
+ * so before it learnt to ignore them) would act as a cookie / Bearer session
+ * for the rest of its 15 minutes.
+ */
+function isClaimApprovalLinkId(id: unknown): boolean {
+  return String(id || "").startsWith(OWNER_CLAIM_LINK_ID_PREFIX);
+}
+
 export function verifyOwnerSession(req: Request): { valid: boolean; agentId?: string; token?: string } {
   // Try cookie first
   const cookieToken = readSessionCookie(req);
@@ -344,11 +398,11 @@ export function verifyOwnerSession(req: Request): { valid: boolean; agentId?: st
     const db = getDb();
     const link = db
       .prepare(
-        `SELECT agent_id FROM magic_links
+        `SELECT id, agent_id FROM magic_links
          WHERE token = ? AND used = 1 AND ${OWNER_TOKEN_NOT_EXPIRED_SQL}`
       )
       .get(cookieToken) as any;
-    if (link) {
+    if (link && !isClaimApprovalLinkId(link.id)) {
       return { valid: true, agentId: link.agent_id, token: cookieToken };
     }
   }
@@ -360,11 +414,11 @@ export function verifyOwnerSession(req: Request): { valid: boolean; agentId?: st
     const db = getDb();
     const link = db
       .prepare(
-        `SELECT agent_id FROM magic_links
+        `SELECT id, agent_id FROM magic_links
          WHERE token = ? AND used = 1 AND ${OWNER_TOKEN_NOT_EXPIRED_SQL}`
       )
       .get(token) as any;
-    if (link) {
+    if (link && !isClaimApprovalLinkId(link.id)) {
       return { valid: true, agentId: link.agent_id, token };
     }
   }
@@ -422,6 +476,17 @@ export function isVerifiedOwner(
   const agentId = typeof agentIdParam === "string" ? agentIdParam : "";
   if (!session || !session.valid || !session.agentId || !agentId) return false;
   if (session.agentId !== agentId) return false;
+  return agentHasVerifiedOwner(agentId);
+}
+
+/**
+ * The ownership half of isVerifiedOwner, without a session: the agent has a
+ * verified owner by the shared customer rule (claimed_at set OR a verified
+ * agent_claims row). For pages that must choose between «log in» (an owner
+ * exists) and «take over the profile» (none yet) for a visitor with no session.
+ */
+export function agentHasVerifiedOwner(agentId: string): boolean {
+  if (!agentId) return false;
   const row = getDb()
     .prepare(`SELECT ${customerRuleSql("a")} AS owned FROM agents a WHERE a.id = ?`)
     .get(agentId) as { owned?: number } | undefined;
@@ -470,6 +535,19 @@ function setOwnerSessionCookie(res: Response, token: string): void {
   });
 }
 
+/** A fresh /eier session (magic_links row, used = 1, ISO timestamps, 7 days) + its cookie. */
+function openOwnerSession(res: Response, agentId: string, email: string): void {
+  const token = crypto.randomBytes(32).toString("hex");
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + OWNER_SESSION_VALID_MS);
+  getDb().prepare(
+    `INSERT INTO magic_links (id, email, token, agent_id, used, used_at, created_at, expires_at)
+     VALUES (?, ?, ?, ?, 1, ?, ?, ?)`
+  ).run(`${OWNER_SESSION_ID_PREFIX}${crypto.randomBytes(8).toString("hex")}`, email, token, agentId,
+    now.toISOString(), now.toISOString(), expiresAt.toISOString());
+  setOwnerSessionCookie(res, token);
+}
+
 /**
  * OWNER_UNIFIED_SESSION_ENABLED: called by the /selger login after a verified
  * claimant redeemed their magic link. Opens the /eier session (a fresh
@@ -487,17 +565,70 @@ export function issueOwnerSessionForSelgerLogin(
   if (!ownerUnifiedSessionEnabled() || !agentId || !email) return false;
   const existing = verifyOwnerSession(req);
   if (existing.valid && existing.agentId === agentId) return false;
-  const token = crypto.randomBytes(32).toString("hex");
-  const now = new Date();
-  const expiresAt = new Date(now.getTime() + OWNER_SESSION_VALID_MS);
-  getDb().prepare(
-    `INSERT INTO magic_links (id, email, token, agent_id, used, used_at, created_at, expires_at)
-     VALUES (?, ?, ?, ?, 1, ?, ?, ?)`
-  ).run(`${OWNER_SESSION_ID_PREFIX}${crypto.randomBytes(8).toString("hex")}`, email, token, agentId,
-    now.toISOString(), now.toISOString(), expiresAt.toISOString());
-  setOwnerSessionCookie(res, token);
+  openOwnerSession(res, agentId, email);
   console.log(`[owner-portal] unified session opened for ${agentId} from /selger login`);
   return true;
+}
+
+// ── E-mailed /eier login links (K5, dev-request
+//    2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post) ──────────────────
+// One insert for both mails that carry a /magic-link-verify link:
+//   "request"         POST /api/agents/:id/request-magic-link — "ml_" row,
+//                     7 days, the token itself becomes the session (as before);
+//   "claim_approval"  POST /admin/agents/claim-review-approve — "mlclaim_"
+//                     row, 15 minutes (the mail says so), one-time:
+//                     /magic-link-verify burns it and opens a fresh 7-day
+//                     session row, so the mailed token is never a session.
+//                     Only /magic-link-verify takes it: verifyOwnerSession
+//                     never accepts an "mlclaim_" row, and the /selger
+//                     verifier (knowledge-service verifyMagicLink) ignores it.
+// No rate limit in here. request-magic-link checks its visitor limit before
+// calling; Daniel's approval is not held by it. An "mlclaim_" row is an
+// e-mail, so it still counts toward that limit — a visitor gets fewer mails
+// in that hour, never more.
+// The link base is APP_URL (default https://rettfrabonden.com), as the other
+// RFB owner mails build theirs (the old request-magic-link URL was the same
+// host hard-coded).
+const OWNER_CLAIM_LINK_ID_PREFIX = "mlclaim_";
+const OWNER_CLAIM_LINK_VALID_MS = 15 * 60 * 1000;
+
+/** APP_URL (default https://rettfrabonden.com) without a trailing slash. */
+function ownerLinkBaseUrl(): string {
+  return (process.env.APP_URL || "https://rettfrabonden.com").replace(/\/+$/, "");
+}
+
+/** Writes one e-mailed /eier login link (magic_links, used = 0) and returns its verify URL. */
+export function createOwnerLoginLink(
+  agentId: string,
+  email: string,
+  kind: "request" | "claim_approval",
+): { linkId: string; token: string; verifyUrl: string } {
+  const token = crypto.randomBytes(32).toString("hex");
+  const now = new Date();
+  const validMs = kind === "claim_approval" ? OWNER_CLAIM_LINK_VALID_MS : MAGIC_LINK_VALID_HOURS * 60 * 60 * 1000;
+  const prefix = kind === "claim_approval" ? OWNER_CLAIM_LINK_ID_PREFIX : "ml_";
+  const linkId = `${prefix}${crypto.randomBytes(8).toString("hex")}`;
+  getDb().prepare(
+    `INSERT INTO magic_links (id, email, token, agent_id, used, created_at, expires_at)
+     VALUES (?, ?, ?, ?, 0, ?, ?)`
+  ).run(linkId, email, token, agentId, now.toISOString(), new Date(now.getTime() + validMs).toISOString());
+  return { linkId, token, verifyUrl: `${ownerLinkBaseUrl()}/magic-link-verify?token=${token}` };
+}
+
+/**
+ * `email` normalized (trim + lower case — normalizeEmail, as the claim flow
+ * stores claimant_email) when it is the confirmed address of THIS agent's
+ * verified owner (agent_claims.status = 'verified'); else null. Pending,
+ * rejected or superseded claims, and verified owners of other agents, never
+ * match.
+ */
+function verifiedClaimantEmailFor(agentId: string, email: string): string | null {
+  const wanted = normalizeEmail(email);
+  if (!agentId || !wanted) return null;
+  const rows = getDb()
+    .prepare(`SELECT claimant_email FROM agent_claims WHERE agent_id = ? AND status = 'verified'`)
+    .all(agentId) as Array<{ claimant_email: string | null }>;
+  return rows.some((r) => normalizeEmail(r.claimant_email) === wanted) ? wanted : null;
 }
 
 /**
@@ -522,6 +653,54 @@ function presentedOwnerTokens(req: Request): string[] {
   const auth = req.headers.authorization;
   if (auth && auth.startsWith("Bearer ")) out.push(auth.substring(7));
   return out;
+}
+
+// ── T3: lock / audit / write only the fields the owner actually changed ──
+// The portal form posts all seven fields on every save, so before this a
+// save that changed one field stamped curated_fields by:"owner" (and wrote an
+// agent_knowledge_audit row) for all seven — freezing untouched fields
+// against enrichment. Same notion of "changed" as the gårdssalg claim
+// (services/gardssalg-claim.ts, G1 pkt 2): compare after CRLF→LF + trim, and
+// null / "" / whitespace-only are the same "empty". opening_hours has the DB
+// default '[]' (database/init.ts), which is also "empty" — never shown to the
+// owner as "[]", never "changed" into "", never locked.
+function normalizeOwnerProfileValue(dbField: string, value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  const s = String(value).replace(/\r\n?/g, "\n").trim();
+  if (s === "") return null;
+  if (dbField === "opening_hours" && s === "[]") return null;
+  return s;
+}
+
+// T0d: agent_knowledge.opening_hours is a JSON column — knowledge-service
+// reads it with JSON.parse, and the strict read of its write path threw on
+// the raw «Åpningstider» text this portal used to store. The portal now
+// stores the owner's text as a JSON string (JSON.stringify(text)), the text
+// variant knowledge-service already reads. Older rows hold the raw text;
+// both read back as the same text here.
+function ownerProfileStoredText(dbField: string, stored: unknown): unknown {
+  if (dbField !== "opening_hours" || typeof stored !== "string") return stored;
+  try {
+    const parsed = JSON.parse(stored);
+    return typeof parsed === "string" ? parsed : stored;
+  } catch {
+    return stored; // a raw-text row from before T0d
+  }
+}
+
+/** The value the owner wrote, as the column stores it (opening hours as JSON text). */
+function ownerProfileStoredValue(dbField: string, value: unknown): unknown {
+  if (dbField !== "opening_hours") return value;
+  const text = normalizeOwnerProfileValue(dbField, value);
+  // Empty stays as it was posted (never locked, never shown as "[]").
+  return text === null ? value : JSON.stringify(text);
+}
+
+/** The stored value as the portal input shows it ('[]' opening hours → ""). */
+function ownerProfileDisplayValue(dbField: string, stored: unknown): string {
+  if (stored == null) return "";
+  if (dbField === "opening_hours" && normalizeOwnerProfileValue(dbField, stored) === null) return "";
+  return String(ownerProfileStoredText(dbField, stored));
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -609,6 +788,7 @@ router.post("/api/agents/:id/update-profile", (req: Request, res: Response) => {
     const updatedFields: Record<string, any> = {};
     const skippedFields: Array<{ field: string; reason: string }> = [];
     const auditInserts: Array<any> = [];
+    let curatedChanged = false;
 
     for (const field of EDITABLE_FIELDS) {
       if (!(field in bodyFields)) continue; // Skip if not in request
@@ -652,14 +832,26 @@ router.post("/api/agents/:id/update-profile", (req: Request, res: Response) => {
         continue;
       }
 
-      const oldValue = (knowledge as any)[dbField] || null;
-      updatedFields[dbField] = newValue;
+      // T3: an unchanged field is a no-op — no write, no audit row, no lock;
+      // its existing curated_fields entry (if any) stays exactly as it is.
+      // T0d: opening hours compare as text, whether stored as JSON or raw.
+      const storedText = ownerProfileStoredText(dbField, (knowledge as any)[dbField]);
+      if (normalizeOwnerProfileValue(dbField, newValue) === normalizeOwnerProfileValue(dbField, storedText)) {
+        continue;
+      }
 
-      // Update curated_fields
-      curatedFields[dbField] = {
-        locked_at: new Date().toISOString(),
-        by: "owner",
-      };
+      const oldValue = storedText || null;
+      updatedFields[dbField] = ownerProfileStoredValue(dbField, newValue);
+
+      // Update curated_fields — never for empty opening hours ('' / '[]'):
+      // the field goes back to "no hours" and an existing lock is left as is.
+      if (!(dbField === "opening_hours" && normalizeOwnerProfileValue(dbField, newValue) === null)) {
+        curatedFields[dbField] = {
+          locked_at: new Date().toISOString(),
+          by: "owner",
+        };
+        curatedChanged = true;
+      }
 
       // Queue audit record
       auditInserts.push({
@@ -688,10 +880,13 @@ router.post("/api/agents/:id/update-profile", (req: Request, res: Response) => {
         ).run(...updateValues, new Date().toISOString(), id);
       }
 
-      // Update curated_fields JSON
-      db.prepare(
-        `UPDATE agent_knowledge SET curated_fields = ?, updated_at = ? WHERE agent_id = ?`
-      ).run(JSON.stringify(curatedFields), new Date().toISOString(), id);
+      // Update curated_fields JSON — only when a lock was added (T3: a save
+      // with nothing changed does not touch the row at all).
+      if (curatedChanged) {
+        db.prepare(
+          `UPDATE agent_knowledge SET curated_fields = ?, updated_at = ? WHERE agent_id = ?`
+        ).run(JSON.stringify(curatedFields), new Date().toISOString(), id);
+      }
 
       // Insert audit records
       const auditIds: string[] = [];
@@ -804,7 +999,7 @@ router.get("/api/agents/:id/profile", (req: Request, res: Response) => {
 
     for (const field of EDITABLE_FIELDS) {
       const dbField = field === "description" ? "about" : field;
-      const value = (knowledge as any)[dbField] || null;
+      const value = ownerProfileStoredText(dbField, (knowledge as any)[dbField]) || null;
       const curatedInfo = curatedFields[dbField] || {};
 
       const csOverride = isOverridableCsLock(curatedInfo);
@@ -1608,6 +1803,54 @@ export function ownerFeaturesEntryCardHtml(agentId: string): string {
       </div>`;
 }
 
+// ── H2: «Hjelp med å holde profilen oppdatert» ──────────────────────────
+// dev-request 2026-11-01-rfb-hold-profilen-oppdatert: the auto.updates choice
+// for EVERY verified owner in this portal — not only the «Mine valg»
+// allowlist — behind OWNER_AUTO_UPDATES_ENABLED (off = no card, and the POST
+// answers 404 and writes nothing). Every text is the catalog's own: the
+// group label, the entry's label and description, the visible option labels
+// and the auto.guarantee line. The value is stored by setOwnerFeatureValue
+// in owner_feature_settings (keyed by vertical and profile id) — the storage
+// «Mine valg» reads, so both show the same value — and logged in its change
+// log; the save goes through the portal's write guard (session, verified
+// owner, same Origin).
+export const OWNER_AUTO_UPDATES_ANCHOR = "hold-oppdatert";
+export const OWNER_AUTO_UPDATES_KEY = "auto.updates";
+
+/**
+ * auto.updates is a Rett fra Bonden choice: the card and its POST follow the
+ * owner refresh's own vertical rule (services/rfb-owner-refresh.ts,
+ * COALESCE(vertical_id, 'rfb') = 'rfb').
+ */
+export function ownerAutoUpdatesAppliesTo(agentId: string): boolean {
+  try {
+    return !!getDb().prepare(`SELECT 1 AS x FROM agents WHERE id = ? AND COALESCE(vertical_id, 'rfb') = 'rfb'`).get(agentId);
+  } catch {
+    return false;
+  }
+}
+
+export function ownerAutoUpdatesCardHtml(agentId: string, value: OwnerFeatureValue): string {
+  const e = getOwnerFeature(OWNER_AUTO_UPDATES_KEY);
+  const group = OWNER_FEATURE_GROUPS.find((g) => g.key === e.group);
+  const guarantee = ownerFeatureEntryForEnv(getOwnerFeature("auto.guarantee"));
+  const options = visibleOwnerFeatureOptions(e).map((o) =>
+    `<label style="display:flex;align-items:center;gap:10px;min-height:44px;cursor:pointer;"><input type="radio" name="value" value="${escapeHtml(o.value)}"${o.value === value ? " checked" : ""}> ${escapeHtml(o.label.no)}</label>`,
+  ).join("\n            ");
+  return `<div class="ep-card" id="${OWNER_AUTO_UPDATES_ANCHOR}">
+        <h2>${escapeHtml(group ? group.label.no : e.label.no)}</h2>
+        <form method="post" action="/eier/${encodeURIComponent(agentId)}/hold-oppdatert" data-auto-updates="1">
+          <fieldset style="border:none;padding:0;margin:0 0 12px;">
+            <legend style="font-weight:600;margin-bottom:4px;">${escapeHtml(e.label.no)}</legend>
+            <p style="margin-bottom:12px;color:#737373;font-size:0.88rem;">${escapeHtml(e.description.no)}</p>
+            ${options}
+          </fieldset>
+          <p class="ep-audit-meta" data-guarantee="auto.guarantee" style="margin-bottom:12px;">${escapeHtml(guarantee.label.no)}<br>${escapeHtml(guarantee.description.no)}</p>
+          <button type="submit" class="ep-btn ep-btn-primary">Lagre</button>
+        </form>
+      </div>`;
+}
+
 export function ownerNotVerifiedPage(agentId: string): string {
   const id = encodeURIComponent(agentId);
   return portalShell(
@@ -1803,6 +2046,21 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
     }
 
     const ownerFeaturesCardHtml = hasOwnerFeatures ? ownerFeaturesEntryCardHtml(agentId) : "";
+
+    // H2 (dev-request 2026-11-01-rfb-hold-profilen-oppdatert): the auto.updates
+    // card for every verified owner, allowlist or not — only with
+    // OWNER_AUTO_UPDATES_ENABLED on (flag off = the portal is byte-identical to before).
+    let autoUpdatesCardHtml = "";
+    if (ownerAutoUpdatesEnabled() && ownerAutoUpdatesAppliesTo(agentId)) {
+      try {
+        if (isVerifiedOwner(agentId, session)) {
+          autoUpdatesCardHtml = ownerAutoUpdatesCardHtml(agentId, resolveOwnerFeature("rfb", agentId, OWNER_AUTO_UPDATES_KEY, { db }).value);
+        }
+      } catch (e) {
+        console.error("[owner-portal] auto-updates card failed:", e instanceof Error ? e.message : "error");
+        autoUpdatesCardHtml = "";
+      }
+    }
     // S2e: with «Mine valg», the «Bestillinger» card (and its order-address
     // section) is replaced by a link there; otherwise unchanged.
     const ordersOrMovedCardHtml = hasOwnerFeatures ? ownerFeaturesMovedCardHtml(agentId) : ordersCardHtml(agent, orderEmailHtml);
@@ -1814,19 +2072,21 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       pendingOrderCount = Number(pc?.n) || 0;
     } catch { pendingOrderCount = 0; }
 
-    // Editable fields with display labels (Norwegian Bokmål)
+    // Editable fields with display labels (Norwegian Bokmål). The labels live
+    // in owner-audit-log.ts, so «Endringslogg» names the fields the same way.
+    const FL = OWNER_PORTAL_FORM_LABELS;
     const fieldDefs: Array<{ key: string; dbField: string; label: string; type: "text" | "textarea" | "email" | "url" }> = [
-      { key: "email",        dbField: "email",         label: "E-post",            type: "email" },
-      { key: "phone",        dbField: "phone",         label: "Telefon",           type: "text" },
-      { key: "address",      dbField: "address",       label: "Adresse",           type: "text" },
-      { key: "postal_code",  dbField: "postal_code",   label: "Postnummer",        type: "text" },
-      { key: "website",      dbField: "website",       label: "Nettside",          type: "url" },
-      { key: "opening_hours",dbField: "opening_hours", label: "Åpningstider", type: "text" },
-      { key: "description",  dbField: "about",         label: "Om produsenten",    type: "textarea" },
+      { key: "email",        dbField: "email",         label: FL.email,         type: "email" },
+      { key: "phone",        dbField: "phone",         label: FL.phone,         type: "text" },
+      { key: "address",      dbField: "address",       label: FL.address,       type: "text" },
+      { key: "postal_code",  dbField: "postal_code",   label: FL.postal_code,   type: "text" },
+      { key: "website",      dbField: "website",       label: FL.website,       type: "url" },
+      { key: "opening_hours",dbField: "opening_hours", label: FL.opening_hours, type: "text" },
+      { key: "description",  dbField: "about",         label: FL.about,         type: "textarea" },
     ];
 
     const fieldHtml = fieldDefs.map((fd) => {
-      const value = (knowledge as any)[fd.dbField] != null ? String((knowledge as any)[fd.dbField]) : "";
+      const value = ownerProfileDisplayValue(fd.dbField, (knowledge as any)[fd.dbField]);
       const lockInfo = curatedFields[fd.dbField] || {};
       const csOverride = isOverridableCsLock(lockInfo);
       const lockedByOther = lockInfo.by && lockInfo.by !== "owner" && lockInfo.by !== null && !csOverride;
@@ -1896,7 +2156,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
         </form>
       </div>
 
-      ${ownerFeaturesCardHtml}${ownerSelgerCardHtml(agent.id)}${productImportCard}${orderabilityCardHtml}${ownerOrdersEntryCardHtml(agent.id, pendingOrderCount)}${ordersOrMovedCardHtml}${paymentCardHtml}${pauseCardHtml}
+      ${autoUpdatesCardHtml}${ownerFeaturesCardHtml}${ownerSelgerCardHtml(agent.id)}${productImportCard}${orderabilityCardHtml}${ownerOrdersEntryCardHtml(agent.id, pendingOrderCount)}${ordersOrMovedCardHtml}${paymentCardHtml}${pauseCardHtml}
 
       <div class="ep-card">
         <h2>Statistikk</h2>
@@ -1912,7 +2172,12 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
 
       <script>
       (function () {
+        // T0c: this script sits inside a TS template literal, which drops the
+        // backslash of an escaped double quote. JS strings that hold HTML
+        // attributes therefore use single quotes, so the emitted script stays
+        // valid (owner-pages-inline-script-syntax-t0c.test.ts compiles it).
         // Load my-audit feed
+        function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
         if (window.fetch) {
           fetch("/api/agents/${encodeURIComponent(agent.id)}/my-audit?limit=20", { credentials: "same-origin" })
             .then(function (r) { return r.json(); })
@@ -1920,25 +2185,27 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
               var ul = document.getElementById("ep-audit");
               if (!ul) return;
               if (!j || !j.success || !j.audits || j.audits.length === 0) {
-                ul.innerHTML = "<li class=\"ep-audit-item ep-audit-meta\">Ingen endringer ennå.</li>";
+                ul.innerHTML = '<li class="ep-audit-item ep-audit-meta">Ingen endringer ennå.</li>';
                 return;
               }
+              // The API sends finished text (owner-audit-log.ts): name, values,
+              // who and time. An e-mail field comes without values.
               ul.innerHTML = j.audits.map(function (a) {
-                var when = new Date(a.changed_at).toLocaleString("nb-NO");
-                var who = a.changed_by === "owner" ? "Du" : (a.changed_by === "admin" ? "Support" : "System");
-                var oldV = a.old_value == null ? "(tomt)" : a.old_value;
-                var newV = a.new_value == null ? "(tomt)" : a.new_value;
-                function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
-                return "<li class=\"ep-audit-item\"><strong>" + esc(a.field_name) + "</strong> endret av " + esc(who) + "<div class=\"ep-audit-meta\">" + esc(when) + " · \"" + esc(oldV).slice(0, 80) + "\" → \"" + esc(newV).slice(0, 80) + "\"</div></li>";
+                var change = a.values_hidden ? ' endret' : ': ' + esc(a.old_value) + ' → ' + esc(a.new_value);
+                return '<li class="ep-audit-item"><strong>' + esc(a.label) + '</strong>' + change +
+                  '<div class="ep-audit-meta">' + esc(a.when) + ' · ' + esc(a.who) + '</div></li>';
               }).join("");
             })
             .catch(function () {
               var ul = document.getElementById("ep-audit");
-              if (ul) ul.innerHTML = "<li class=\"ep-audit-item ep-audit-meta\">Kunne ikke laste endringslogg.</li>";
+              if (ul) ul.innerHTML = '<li class="ep-audit-item ep-audit-meta">Kunne ikke laste endringslogg.</li>';
             });
         }
 
-        // Progressive enhancement for save
+        // Progressive enhancement for save. Same server logic either way:
+        // POST /eier/:id/save (no JS) forwards to update-profile. If the fetch
+        // itself fails (offline, non-JSON answer), fall back to the plain form
+        // POST; form.submit() does not fire this handler again.
         var form = document.getElementById("ep-profile-form");
         if (form && window.fetch) {
           form.addEventListener("submit", function (ev) {
@@ -1965,7 +2232,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
                   window.location.href = base + "?status=error";
                 }
               }).catch(function () {
-                if (btn) { btn.disabled = false; btn.textContent = "Lagre alle endringer"; }
+                form.submit();
               });
           });
         }
@@ -1973,7 +2240,15 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       </script>
     `;
 
-    return res.send(portalShell(`Eierportal · ${agent.name}`, body));
+    // T6 (eierportal testrunde 1): the shared owner theme, light and dark —
+    // token CSS in the body and colour inline styles as token classes — only
+    // for a subject on OWNER_FEATURES_ALLOWED_SUBJECTS (off the list = the
+    // portal is byte-identical to before).
+    let ownerTheme = false;
+    try { ownerTheme = isSubjectAllowedForOwnerFeatures("rfb", agentId); } catch { ownerTheme = false; }
+    const pageBody = ownerTheme ? `<style>${OWNER_PORTAL_THEME_CSS}</style>${ownerThemeHtml(body)}` : body;
+
+    return res.send(portalShell(`Eierportal · ${agent.name}`, pageBody));
   } catch (err) {
     console.error("[owner-portal] GET /eier/:agentId/portal error:", err);
     return res.status(500).send(portalShell(
@@ -2094,6 +2369,38 @@ router.post("/eier/:agentId/pause", express.urlencoded({ extended: false }), (re
   } catch (e: any) {
     console.error("[owner-portal] POST /eier pause failed:", e);
     return res.redirect(303, `${base}?status=pause_error#pause`);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────
+// POST /eier/:agentId/hold-oppdatert   (form) — H2, see ownerAutoUpdatesCardHtml.
+// Flag off or not an RFB profile → 404, nothing written. Origin → session → verified owner, then
+// setOwnerFeatureValue (owner_feature_settings + its change-log row). A
+// hidden or unknown value is refused (invalid_value) and stores nothing.
+// ─────────────────────────────────────────────────────────────────
+router.post("/eier/:agentId/hold-oppdatert", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+  const agentId = String(req.params.agentId || "");
+  const base = `/eier/${encodeURIComponent(agentId)}/portal`;
+  if (!ownerAutoUpdatesEnabled() || !ownerAutoUpdatesAppliesTo(agentId)) return res.status(404).json({ success: false, error: "not_found" });
+  if (isCrossSiteWrite(req, "/eier/:agentId/hold-oppdatert")) {
+    return res.status(403).send(portalWriteRefusedPage(base));
+  }
+  try {
+    const session = verifyOwnerSession(req);
+    if (!session.valid) return res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
+    if (!isVerifiedOwner(agentId, session)) {
+      return session.agentId === agentId
+        ? res.status(403).send(ownerNotVerifiedPage(agentId))
+        : res.status(403).json(ownerForbiddenJson(agentId, session));
+    }
+    const value = typeof req.body?.value === "string" ? req.body.value : "";
+    const out = setOwnerFeatureValue("rfb", agentId, OWNER_AUTO_UPDATES_KEY, value, { actor: "owner", detail: ownerSessionEmail(session.token) });
+    if (out.kind !== "ok") return res.redirect(303, `${base}?status=error#${OWNER_AUTO_UPDATES_ANCHOR}`);
+    if (out.changed) console.log(`[owner-portal] owner set ${OWNER_AUTO_UPDATES_KEY} for agent ${agentId}`);
+    return res.redirect(303, `${base}?status=saved#${OWNER_AUTO_UPDATES_ANCHOR}`);
+  } catch (e: any) {
+    console.error("[owner-portal] POST /eier hold-oppdatert failed:", e);
+    return res.redirect(303, `${base}?status=error#${OWNER_AUTO_UPDATES_ANCHOR}`);
   }
 });
 
@@ -2456,15 +2763,28 @@ function formatOwnerPrice(price: number | null, unit: string | null): string {
 }
 
 /** The B1 card. Pure rendering of listOwnerProductOrderability(). */
-export function ownerOrderabilityCardHtml(agentId: string, o: OwnerOrderabilityOverview, bannerHtml = ""): string {
+export function ownerOrderabilityCardHtml(agentId: string, o: OwnerOrderabilityOverview, bannerHtml = "", env: NodeJS.ProcessEnv = process.env): string {
   const id = encodeURIComponent(agentId);
   const total = o.products.length;
+  // B2b-3: with the soft-expiry rule active the texts follow it; off → unchanged.
+  const soft = stockSoftExpiryActiveFor(agentId, env);
+  const stockMeta = (p: OwnerOrderabilityOverview["products"][number]): string => {
+    if (soft && p.needs_producer_confirmation && p.stock_confirmed_at) {
+      return ` <span class="ep-audit-meta" data-stock-soft="1">Lagerstatus sist bekreftet ${escapeHtml(formatOwnerDate(p.stock_confirmed_at))}. Kundene ser at den ikke er bekreftet nylig.</span>`;
+    }
+    if (!p.stock_expires_at) return "";
+    return ` <span class="ep-audit-meta">${soft ? "Lagerstatus bekreftet til" : "Lagerstatus gjelder til"} ${escapeHtml(formatOwnerDate(p.stock_expires_at))}</span>`;
+  };
+  const staleDays = getSupplyGraphStaleDays();
+  const validity = soft
+    ? `En bekreftelse på lager gjelder i ${staleDays} dager. Etter det kan kundene fortsatt bestille i opptil ${getSupplyGraphHardStaleDays()} dager, med datoen for siste bekreftelse synlig.`
+    : `En bekreftelse på lager gjelder i ${staleDays} dager.`;
   const profileHtml = o.profile_reasons.length
     ? `<div class="ep-alert ep-alert-error" role="note" data-orderability-profile="blocked">Ingen varer kan bestilles før dette er ordnet:<ul>${o.profile_reasons.map((r) => `<li>${escapeHtml(orderabilityReasonTextNb(r))}</li>`).join("")}</ul></div>`
     : "";
   const rows = o.products.map((p) => {
     const status = p.orderable
-      ? `<strong class="ep-orderable-yes">Kan bestilles</strong>${p.stock_expires_at ? ` <span class="ep-audit-meta">Lagerstatus gjelder til ${escapeHtml(formatOwnerDate(p.stock_expires_at))}</span>` : ""}`
+      ? `<strong class="ep-orderable-yes">Kan bestilles</strong>${stockMeta(p)}`
       : `<strong class="ep-orderable-no">Kan ikke bestilles</strong><ul class="ep-orderable-reasons">${p.reasons.map((r) => `<li data-reason="${escapeHtml(r.code)}">${escapeHtml(orderabilityReasonTextNb(r))}</li>`).join("")}</ul>`;
     const noPrice = p.missing_price
       ? `<div class="ep-audit-meta" data-missing-price="1">Mangler pris — legg inn pris før du bekrefter at varen er på lager.</div>`
@@ -2492,7 +2812,7 @@ export function ownerOrderabilityCardHtml(agentId: string, o: OwnerOrderabilityO
   return `<div class="ep-card" id="${ORDERABILITY_ANCHOR}">
         <h2>Varer som kan bestilles</h2>
         ${bannerHtml}
-        <p data-orderable-count="${o.orderable_count}">${o.orderable_count} av ${total} ${total === 1 ? "vare" : "varer"} kan bestilles nå. En bekreftelse på lager gjelder i ${getSupplyGraphStaleDays()} dager.</p>
+        <p data-orderable-count="${o.orderable_count}">${o.orderable_count} av ${total} ${total === 1 ? "vare" : "varer"} kan bestilles nå. ${validity}</p>
         ${profileHtml}
         ${list}
         <h3 style="margin-top:20px;">Legg til vare</h3>
@@ -2512,7 +2832,7 @@ export function ownerOrderabilityCardHtml(agentId: string, o: OwnerOrderabilityO
 export function ownerProductsNeedClaimantLoginPage(agentId: string): string {
   const id = encodeURIComponent(agentId);
   return portalShell(
-    "Ingen tilgang",
+    "Logg inn med eierens e-post",
     `<div class="ep-card" data-claimant-login-required="1">
           <h1>Logg inn med eierens e-postadresse</h1>
           <p>For å endre varene må du logge inn med e-postadressen til den som har bekreftet eierskapet til profilen. Du kan fortsatt se varene i portalen.</p>
@@ -2565,14 +2885,21 @@ function orderabilityBack(agentId: string, status: string, extra = ""): string {
 //   confirmable under the B1 rule. Same owner checks as the B1 POSTs.
 
 /** The B2 banner: the orderable items whose stock status expires within 3 days. "" when none. */
-export function stockCheckBannerHtml(agentId: string, items: StockCheckItem[]): string {
+export function stockCheckBannerHtml(agentId: string, items: StockCheckItem[], env: NodeJS.ProcessEnv = process.env): string {
   if (items.length === 0) return "";
   const id = encodeURIComponent(agentId);
-  const lis = items.map((i) => `<li data-product-id="${escapeHtml(i.id)}">${escapeHtml(i.name)} <span class="ep-audit-meta">gjelder til ${escapeHtml(formatStockCheckDate(i.expires_at))}</span></li>`).join("");
+  // B2b-3: soft-expiry texts when the rule is active for the producer; off → unchanged.
+  const soft = stockSoftExpiryActiveFor(agentId, env);
+  const one = items.length === 1;
+  const lis = items.map((i) => `<li data-product-id="${escapeHtml(i.id)}">${escapeHtml(i.name)} <span class="ep-audit-meta">${soft ? "bekreftet til" : "gjelder til"} ${escapeHtml(formatStockCheckDate(i.expires_at))}</span></li>`).join("");
   const hidden = items.map((i) => `<input type="hidden" name="id" value="${escapeHtml(i.id)}">`).join("");
+  const heading = soft ? "Lagerstatusen er snart ikke lenger bekreftet nylig" : "Lagerstatusen går snart ut";
+  const para = soft
+    ? `Kundene kan fortsatt bestille ${one ? "varen" : "varene"}, men de ser at lagerstatusen ikke er bekreftet nylig. Bekreft ${one ? "den" : "dem"} for å fornye datoen.`
+    : `Når den har gått ut, kan kundene ikke bestille ${one ? "varen" : "varene"} før du har bekreftet ${one ? "den" : "dem"} igjen.`;
   return `<div class="ep-alert ep-alert-error" role="note" data-stock-check-banner="1">
-          <strong>Lagerstatusen går snart ut</strong>
-          <p style="margin:6px 0;">Når den har gått ut, kan kundene ikke bestille ${items.length === 1 ? "varen" : "varene"} før du har bekreftet ${items.length === 1 ? "den" : "dem"} igjen.</p>
+          <strong>${heading}</strong>
+          <p style="margin:6px 0;">${para}</p>
           <ul>${lis}</ul>
           <form method="post" action="/eier/${id}/varer/bekreft-lagerpaminnelse" style="margin:8px 0 0;">
             ${hidden}
@@ -2782,9 +3109,12 @@ export function productImportCardHtml(agentId: string, o: ImportOverview, alertH
 // ─────────────────────────────────────────────────────────────────
 // GET /api/agents/:agentId/my-audit — owner-side audit feed (session-gated)
 // ─────────────────────────────────────────────────────────────────
-// Same shape as the Daniel-only /admin/agent-audit endpoint, but auth-gated
-// to the owner's session cookie (NOT admin-key). Returns last N audit
-// entries for *this* agent only.
+// Auth-gated to the owner's session cookie (NOT admin-key). Returns the last
+// N log rows for *this* agent only, as the owner reads them (dev-request
+// 2026-11-02-rfb-endringslogg-lettlest, owner-audit-log.ts): only fields in
+// OWNER_AUDIT_FIELDS, Norwegian names and values, «Du» / «Rett fra Bonden» /
+// «Automatisk fra nettsiden din» — no notes, no e-mail addresses, no
+// technical rows. Daniel's /admin/agent-audit keeps the raw rows.
 router.get("/api/agents/:agentId/my-audit", (req: Request, res: Response) => {
   try {
     const agentId = String((req.params as any).agentId || "");
@@ -2800,19 +3130,10 @@ router.get("/api/agents/:agentId/my-audit", (req: Request, res: Response) => {
       return res.status(403).json(ownerForbiddenJson(agentId, session));
     }
 
-    const limitNum = Math.min(parseInt(String(req.query.limit ?? "20"), 10) || 20, 200);
+    // 1..200 (a negative LIMIT would mean «no limit» in SQLite).
+    const limitNum = Math.max(1, Math.min(parseInt(String(req.query.limit ?? "20"), 10) || 20, 200));
 
-    const db = getDb();
-    const audits = db
-      .prepare(
-        `SELECT id, agent_id, field_name, old_value, new_value,
-                changed_by, changed_by_email, changed_at, notes
-           FROM agent_knowledge_audit
-          WHERE agent_id = ?
-          ORDER BY changed_at DESC
-          LIMIT ?`
-      )
-      .all(agentId, limitNum) as any[];
+    const audits = readOwnerAuditFeed(getDb(), agentId, limitNum);
 
     return res.json({
       success: true,

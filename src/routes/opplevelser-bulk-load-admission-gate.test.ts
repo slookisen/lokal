@@ -39,6 +39,11 @@
  *   (e) budget cap: a 51-new-row apply judges exactly
  *       ADMISSION_GATE_MAX_JUDGED (50) rows and fail-closes the rest to
  *       needs_review with the "admission-gate cap" reason.
+ *   (f) diagnostics (dev-request 2026-10-31-opplevagent-admisjonsgate-
+ *       script-json-stripping, slice 1): one admission_gate.diagnostics
+ *       entry per successfully fetched row (visible vs script-embedded text
+ *       counts), none in dry-run or for fetch failures, and the judge still
+ *       receives only the visible text.
  */
 
 export interface TestSummary {
@@ -202,12 +207,14 @@ export function runOpplevelserBulkLoadAdmissionGateTests(
       // case can assert ZERO budget spent.
       let pageFetches = 0;
       let judgeCalls = 0;
+      const judgePrompts: string[] = [];
       globalThis.fetch = (async (url: any, init: any) => {
         const urlStr = String(url);
         if (urlStr === "https://api.anthropic.com/v1/messages") {
           judgeCalls++;
           const body = JSON.parse(init?.body ?? "{}");
           const promptText: string = body?.messages?.[0]?.content ?? "";
+          judgePrompts.push(promptText);
           if (promptText.includes("Mismatch nordlystur")) {
             return mkAnthropicResponse("MISMATCH\nSiden handler om noe helt annet.");
           }
@@ -226,6 +233,18 @@ export function runOpplevelserBulkLoadAdmissionGateTests(
         }
         if (urlStr === "https://evidens.example/skitur") {
           return mkPageResponse("<html><body>Skitur i fjellet med guide.</body></html>", urlStr);
+        }
+        if (urlStr === "https://evidens.example/skriptside") {
+          // Simpleview-style CMS: editorial content only as JSON string
+          // literals inside <script>; the visible markup is navigation.
+          return mkPageResponse(
+            '<html><head><script>window.__PAGE__={"heading":"Kajakkpadling i Reinefjorden","body":"Guidet kajakktur hver dag hele sommeren, utstyr inkludert"}</script>' +
+              '<script src="/app.js"></script></head><body><nav>Hjem Kart Meny</nav></body></html>',
+            urlStr,
+          );
+        }
+        if (urlStr === "https://evidens.example/ren-html") {
+          return mkPageResponse("<html><body><h1>Elvepadling</h1><p>Rolig elvepadling for hele familien.</p></body></html>", urlStr);
         }
         if (urlStr.startsWith("https://evidens.example/cap/")) {
           return mkPageResponse("<html><body>Evidensside for kapasitetstesten.</body></html>", urlStr);
@@ -269,6 +288,7 @@ export function runOpplevelserBulkLoadAdmissionGateTests(
         assertEq(pageFetches, 0, "ag-1c: dry-run fetched ZERO evidence pages");
         assertEq(judgeCalls, 0, "ag-1d: dry-run spent ZERO judge calls");
         assertEq(r.body.admission_gate?.dry_run, true, "ag-1e: admission_gate reports it only runs in apply mode");
+        assertEq(r.body.admission_gate?.diagnostics, undefined, "ag-6a: dry-run carries NO diagnostics entries");
         const n = (expDb.prepare("SELECT COUNT(*) AS n FROM experiences").get() as { n: number }).n;
         assertEq(n, 0, "ag-1f: dry-run wrote nothing");
       }
@@ -284,6 +304,16 @@ export function runOpplevelserBulkLoadAdmissionGateTests(
           "ag-2c: admission_gate tallies — 4 evidence-backed rows judged (match+mismatch+unresolved partition), the no-evidence row never judged",
         );
         assertEq((r.body.admission_gate.results as any[]).length, 4, "ag-2d: per-row results for exactly the 4 gated rows");
+        const diags = r.body.admission_gate.diagnostics as any[];
+        assertEq(
+          diags.map((d) => [d.evidence_url, d.verdict]),
+          [
+            ["https://evidens.example/hvalsafari", "match"],
+            ["https://evidens.example/nordlys", "mismatch"],
+            ["https://evidens.example/skitur", "unresolved"],
+          ],
+          "ag-6b: one diagnostic per SUCCESSFUL fetch (judge failure included, SSRF-blocked fetch failure excluded)",
+        );
 
         const match = expRow("Hvalsafari fra kaia");
         assertEq(match?.verification_status, "verified", "ag-2e: MATCH row admitted as `verified` (today's verified_active rule)");
@@ -349,6 +379,48 @@ export function runOpplevelserBulkLoadAdmissionGateTests(
           .prepare("SELECT COUNT(*) AS n FROM experiences WHERE title LIKE 'Kapasitetstur %' AND verification_status = 'verified'")
           .get() as { n: number }).n;
         assertEq(verifiedCount, 50, "ag-5g: the 50 judged (MATCH) rows admitted verified as today");
+        assertEq((r.body.admission_gate.diagnostics as any[]).length, 50, "ag-5h: diagnostics bounded by the judge cap (capped row has none)");
+      }
+
+      // ── (f) diagnostics: visible vs script-embedded text ────────────────
+      {
+        pageFetches = 0;
+        judgeCalls = 0;
+        judgePrompts.length = 0;
+        const r = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          body: {
+            apply: true,
+            experiences: [
+              { title: "Kajakkpadling i Reinefjorden", provider_name: "Aktiv Opplevelser AS", category: "mat_drikke",
+                kommune: "Moskenes", fylke: "Nordland", confidence: "high",
+                evidence_url: "https://evidens.example/skriptside" },
+              { title: "Elvepadling for familien", provider_name: "Aktiv Opplevelser AS", category: "mat_drikke",
+                kommune: "Moskenes", fylke: "Nordland", confidence: "high",
+                evidence_url: "https://evidens.example/ren-html" },
+            ],
+          },
+        });
+        assertEq(r.status, 200, "ag-6c: diagnostics apply -> 200");
+        const diags = r.body.admission_gate.diagnostics as any[];
+        assertEq(diags.length, 2, "ag-6d: one diagnostics entry per judged row");
+        const script = diags.find((d) => d.evidence_url === "https://evidens.example/skriptside");
+        const plain = diags.find((d) => d.evidence_url === "https://evidens.example/ren-html");
+        assertEq(script?.script_blocks, 2, "ag-6e: script-only page counts its <script> blocks");
+        assertTrue(script?.visible_chars < script?.embedded_chars, "ag-6f: script-only page — embedded text larger than visible text");
+        assertEq(script?.visible_sample, "Hjem Kart Meny", "ag-6g: visible sample is the nav-only text the judge sees");
+        assertTrue(
+          typeof script?.embedded_sample === "string" && script.embedded_sample.includes("Guidet kajakktur hver dag"),
+          "ag-6h: embedded sample carries the script-JSON editorial text",
+        );
+        assertEq(script?.verdict, "match", "ag-6i: diagnostic records the outcome verdict");
+        assertEq(plain?.script_blocks, 0, "ag-6j: plain HTML page -> script_blocks 0");
+        assertEq(plain?.embedded_chars, 0, "ag-6k: plain HTML page -> embedded_chars 0");
+        assertTrue(plain?.visible_chars > 0 && plain?.visible_sample.includes("Rolig elvepadling"), "ag-6l: plain page visible text counted");
+        assertEq(judgePrompts.length, 2, "ag-6m: one judge call per row (diagnostics spend no extra LLM budget)");
+        const scriptPrompt = judgePrompts.find((p) => p.includes("Kajakkpadling i Reinefjorden")) ?? "";
+        assertTrue(scriptPrompt.includes("Hjem Kart Meny"), "ag-6n: judge still receives the visible text");
+        assertTrue(!scriptPrompt.includes("Guidet kajakktur hver dag"), "ag-6o: judge does NOT receive the script-only text — judge input unchanged");
       }
     } catch (err: any) {
       failed++;

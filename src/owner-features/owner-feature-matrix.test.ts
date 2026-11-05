@@ -54,6 +54,14 @@
  *                             mail captured at the order-notify seam) and the
  *                             /eier portal banner (B1 card flag on) follow the
  *                             switch; with orders.enabled off a PUT on → 409
+ *   dev-request 2026-11-01-rfb-hold-profilen-oppdatert:
+ *   auto.updates × job:rfb_enrichment_nightly  the owner refresh's own cohort
+ *                             (loadOwnerRefreshCohort, OWNER_AUTO_UPDATES_ENABLED
+ *                             on): default fill_empty (only the empty category
+ *                             list) → automatic (+ the enrichment about /
+ *                             description) → never (not taken) → fill_empty;
+ *                             the unclaimed control is never taken, and the
+ *                             nightly cohort still leaves the owner out
  * Kinds:
  *   switch     default → on → off → on again; the effect follows each step;
  *              plus an unmet requirement → 409, nothing written, no effect.
@@ -62,6 +70,9 @@
  *              default → on → off → on again.
  *   guarantee  every write (off and on) is refused (409 guarantee), nothing
  *              stored, the effect stays on at every step.
+ *   choice     default → on → off → on again are option values (auto.updates:
+ *              its default → automatic → never → fill_empty), each written
+ *              through PUT, the effect is that option's.
  *
  * Real router + services on the production schema in an in-memory DB.
  * Exported runOwnerFeatureMatrixTests({log}) -> TestSummary; wired into
@@ -76,7 +87,7 @@ export interface TestSummary {
   failures: string[];
 }
 
-export type MatrixKind = "switch" | "locked" | "guarantee";
+export type MatrixKind = "switch" | "locked" | "guarantee" | "choice";
 
 export interface OwnerFeatureMatrixCase {
   key: string;
@@ -139,6 +150,9 @@ export const OWNER_FEATURE_MATRIX_CASES: readonly OwnerFeatureMatrixCase[] = [
     observe: "processStockCheckReminders() result: sent + a stock_check_notices row vs feature_off and no row" },
   { key: "products.stock_check", surface: "owner_portal", kind: "switch",
     observe: "GET /eier/:id/portal: the stock-check banner in «Varer som kan bestilles» vs none" },
+  // dev-request 2026-11-01-rfb-hold-profilen-oppdatert: the owner refresh.
+  { key: "auto.updates", surface: "job:rfb_enrichment_nightly", kind: "choice",
+    observe: "loadOwnerRefreshCohort(): taken as fill_empty (empty fields only) / automatic (+ filled enrichment fields) / not taken (never)" },
 ];
 
 export const MATRIX_STEPS = ["default", "on", "off", "on_again"] as const;
@@ -161,6 +175,7 @@ const SAVED_ENV = [
   "OUTREACH_PAUSED", "ORDER_AUTOCOMPLETE_ENABLED", "RFB_DISABLE_ORDER_FOLLOWUPS",
   "OWNER_FEATURES_ENFORCE", "OWNER_PAUSE_ENABLED", "OWNER_ORDER_EMAIL_ENABLED", "LANG_COOKIE_REDIRECT_ENABLED",
   "STOCK_CHECK_EMAIL_ENABLED", "OWNER_ORDERABILITY_PORTAL_ENABLED", "SUPPLY_GRAPH_STALE_DAYS",
+  "OWNER_AUTO_UPDATES_ENABLED",
 ];
 
 /** S2e: the visibility.profile producer — the same rich profile shape as owner-features-s2c2.test.ts. */
@@ -325,6 +340,7 @@ export async function runOwnerFeatureMatrixTests(opts: { log?: boolean } = {}): 
       notifyLocked: "mx-notify", nightly: "mx-nightly", nightlyControl: "mx-nightly-ctl", knowledge: "mx-knowledge", outreach: "mx-outreach",
       orderEmail: "mx-order-email",
       stockMail: "mx-stock-mail", stockJob: "mx-stock-job", stockPortal: "mx-stock-portal",
+      autoUpdates: "mx-auto-updates",
     };
     const tokens: Record<string, string> = {};
     for (const id of Object.values(ids)) {
@@ -333,6 +349,15 @@ export async function runOwnerFeatureMatrixTests(opts: { log?: boolean } = {}): 
         isVerified: id !== ids.unbadged && id !== ids.nightlyControl,
       });
     }
+    // auto.updates: an empty category list (the field fill_empty may fill) —
+    // set here, so the producer is in no category list the other cases read —
+    // and an about / description an enrichment source recorded verbatim (the
+    // text automatic may replace: provably ours).
+    db.prepare(`UPDATE agents SET categories = '[]' WHERE id = ?`).run(ids.autoUpdates);
+    db.prepare(`UPDATE agent_knowledge SET field_provenance = ? WHERE agent_id = ?`).run(JSON.stringify({
+      about: [{ source_type: "google_places", value: "Liten familiegård med grønnsaker og poteter fra egen jord." }],
+      description: [{ source_type: "google_places", value: "Testprodusent for valgmatrisen." }],
+    }), ids.autoUpdates);
     // S2e: the pause producer (rich profile so every list surface shows it today;
     // its own city, so llms.txt's 1–2 samples per city include it).
     const VIS_ID = "mx-vis-pause";
@@ -756,6 +781,46 @@ export async function runOwnerFeatureMatrixTests(opts: { log?: boolean } = {}): 
         await refused(id, c.key, true, "guarantee", `${L} [on_again]`);
         await expect("on_again"); step(c, "on_again");
       },
+      // ── choice: auto.updates — the owner refresh's cohort follows the option ──
+      "auto.updates × job:rfb_enrichment_nightly": async (c) => {
+        const id = ids.autoUpdates;
+        const L = matrixCaseId(c);
+        const orf = require("../services/rfb-owner-refresh") as typeof import("../services/rfb-owner-refresh");
+        // Seeded with an enrichment about / description (not owner-saved) and an empty category list.
+        process.env.OWNER_AUTO_UPDATES_ENABLED = "1";
+        const expect = async (s: MatrixStep, mode: "fill_empty" | "automatic" | null) => {
+          const cohort = await orf.loadOwnerRefreshCohort(db as any, { nowMs: Date.now() });
+          const row = cohort.eligible.find((r) => r.id === id);
+          assertEq(
+            row ? [row.mode, row.fields] : null,
+            mode === "fill_empty" ? ["fill_empty", ["categories"]] : mode === "automatic" ? ["automatic", ["about", "description", "categories"]] : null,
+            `${L} [${s}]: owner refresh ${mode ? `takes the profile as ${mode} with the fields the choice allows` : "does not take the profile (never)"}`,
+          );
+          assertTrue(!cohort.eligible.some((r) => r.id === ids.nightlyControl), `${L} [${s}]: control — the unclaimed twin is never in the owner refresh`);
+          const nightlyCohort = await nightly.loadRfbEnrichmentCohort(db as any);
+          assertTrue(!nightlyCohort.rows.some((r) => r.id === id), `${L} [${s}]: the nightly (unowned) cohort still leaves the owner out`);
+          assertEq(resolved(id, c.key).value, mode ?? "never", `${L} [${s}]: auto.updates resolves ${mode ?? "never"}`);
+        };
+        const chooseTo = async (value: string, label: string) => {
+          featuresMod.__resetOwnerFeaturesRateLimitForTesting();
+          const r = await put(id, c.key, value);
+          assertEq([r.status, r.body?.feature?.value], [200, value], `${label}: PUT ${c.key}=${value} → 200`);
+        };
+        try {
+          await expect("default", "fill_empty"); step(c, "default");
+          await chooseTo("automatic", `${L} [on]`);
+          await expect("on", "automatic"); step(c, "on");
+          await chooseTo("never", `${L} [off]`);
+          await expect("off", null); step(c, "off");
+          await chooseTo("fill_empty", `${L} [on_again]`);
+          await expect("on_again", "fill_empty"); step(c, "on_again");
+          // The hidden «Foreslå til meg» cannot be stored.
+          const hidden = await put(id, c.key, "suggest");
+          assertEq(hidden.status, 400, `${L}: PUT ${c.key}=suggest (hidden option) → 400, nothing stored`);
+        } finally {
+          delete process.env.OWNER_AUTO_UPDATES_ENABLED;
+        }
+      },
       "auto.guarantee × job:knowledge_write": async (c) => {
         const id = ids.knowledge;
         const L = matrixCaseId(c);
@@ -999,7 +1064,7 @@ export async function runOwnerFeatureMatrixTests(opts: { log?: boolean } = {}): 
       const e = reg.findOwnerFeature(c.key);
       assertTrue(!!e && liveKeys.has(c.key), `${id}: key is a live registry entry`);
       if (e) {
-        assertEq(c.kind, e.type === "locked" ? "locked" : e.type === "guarantee" ? "guarantee" : "switch", `${id}: case kind matches the entry type (${e.type})`);
+        assertEq(c.kind, e.type === "locked" ? "locked" : e.type === "guarantee" ? "guarantee" : e.type === "choice" ? "choice" : "switch", `${id}: case kind matches the entry type (${e.type})`);
         assertTrue((e.surfaces as string[]).includes(c.surface), `${id}: surface is declared on the entry`);
       }
       const run = runners[id];

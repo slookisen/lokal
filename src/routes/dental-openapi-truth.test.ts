@@ -96,14 +96,16 @@ export async function runDentalOpenapiTruthTests(opts: { log?: boolean } = {}): 
     dbFactory.__resetDbFactoryForTesting();
     const db = dbFactory.getDb("dental");
     (require("../services/dental-search-gazetteer") as typeof import("../services/dental-search-gazetteer")).__resetDentalSearchGazetteerForTesting();
+    // F2-S6: the Helfo rows carry the source the Helfo claim needs (resolveHelfoClaim).
+    const helfoProv = JSON.stringify({ helfo_agreement: [{ value: "true", source_type: "homepage", source_url: "https://example.test/helfo", fetched_at: "2026-05-01T10:00:00Z" }] });
     const ins = db.prepare(
-      "INSERT INTO dental_agents (id, navn, fylke, poststed, verification_status, helfo_agreement, acute_vakt, is_inactive) VALUES (?,?,?,?,?,?,?,?)"
+      "INSERT INTO dental_agents (id, navn, fylke, poststed, verification_status, helfo_agreement, acute_vakt, is_inactive, field_provenance) VALUES (?,?,?,?,?,?,?,?,?)"
     );
-    ins.run("d-1", "Bergen Tannlegesenter", "Vestland", "Bergen", "unverified", "true", 0, 0);
-    ins.run("d-2", "Bergen Tannhelse", "Vestland", "Bergen", "unverified", "false", 0, 0);
-    ins.run("d-3", "Avvist Tannklinikk", "Vestland", "Bergen", "rejected", "true", 0, 0);
-    ins.run("d-4", "Nedlagt Tannklinikk", "Vestland", "Bergen", "unverified", "true", 0, 1);
-    ins.run("d-5", "Oslo Tannlege", "Oslo", "Oslo", "unverified", "true", 0, 0);
+    ins.run("d-1", "Bergen Tannlegesenter", "Vestland", "Bergen", "unverified", "true", 0, 0, helfoProv);
+    ins.run("d-2", "Bergen Tannhelse", "Vestland", "Bergen", "unverified", "false", 0, 0, null);
+    ins.run("d-3", "Avvist Tannklinikk", "Vestland", "Bergen", "rejected", "true", 0, 0, helfoProv);
+    ins.run("d-4", "Nedlagt Tannklinikk", "Vestland", "Bergen", "unverified", "true", 0, 1, helfoProv);
+    ins.run("d-5", "Oslo Tannlege", "Oslo", "Oslo", "unverified", "true", 0, 0, helfoProv);
 
     const dentalRouter = (require("./dental") as typeof import("./dental")).default;
     const idsOf = (r: { body: any }): string[] => (r.body?.results ?? []).map((x: any) => x.id).sort();

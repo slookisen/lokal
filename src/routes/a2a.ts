@@ -14,7 +14,8 @@ import {
 } from "../services/a2a-traffic-classifier";
 import { hashIP } from "../services/analytics-service";
 import { discoveryService } from "../services/discovery-service";
-import { knowledgeService, relabelCertifications, productEntries } from "../services/knowledge-service";
+import { knowledgeService, relabelCertifications, productEntries, parseProductPrice } from "../services/knowledge-service";
+import { catalogNameNorm, softStockByNameNorm, stockSoftExpiryBuyerTextNb } from "../services/stock-soft-expiry";
 import { stripOrganicEntries } from "../services/organic-claims";
 import { textEntries } from "../utils/text-entries";
 import { redactPII } from "../utils/pii-redact";
@@ -732,6 +733,30 @@ function handleExtendedCard(params: any, id: any, req: Request, res: Response) {
 // This is the core of the dummy-agent system: every seller has
 // an agent that can answer based on what we know about them.
 
+/**
+ * B2b-2 (bestillinger, «myk utløp»): agent/info's product list. A product
+ * whose catalog row is in the soft window (STOCK_SOFT_EXPIRY_ENABLED on and
+ * the producer on the owner-features allowlist, stock-soft-expiry.ts) gets
+ * stock_confirmed_at, needs_producer_confirmation: true and stock_note (the
+ * buyer text with the date: the producer confirms the order). Nothing in the
+ * window → the info object as it was, untouched.
+ */
+export function withSoftStockProducts<T extends { knowledge: any }>(info: T, agentId: string): T {
+  const products = info?.knowledge?.products;
+  if (!Array.isArray(products) || products.length === 0) return info;
+  const soft = softStockByNameNorm(getDb(), agentId);
+  if (soft.size === 0) return info;
+  let changed = false;
+  const out = products.map((p: any) => {
+    if (!p || typeof p !== "object" || typeof p.name !== "string") return p;
+    const f = soft.get(catalogNameNorm(parseProductPrice(p).cleanName));
+    if (!f) return p;
+    changed = true;
+    return { ...p, ...f, stock_note: stockSoftExpiryBuyerTextNb(f.stock_confirmed_at) };
+  });
+  return changed ? { ...info, knowledge: { ...info.knowledge, products: out } } : info;
+}
+
 function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
   const agentId = params?.agentId;
   if (!agentId) {
@@ -775,7 +800,8 @@ function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
           artifactId: `info-${agentId}`,
           name: "agent-info",
           // S2c-1: without what the owner hid (not enforced = as before).
-          data: publicAgentInfo(info, publicFieldChoices(agentId)),
+          // B2b-2: products in the stock rule's soft window carry the date.
+          data: withSoftStockProducts(publicAgentInfo(info, publicFieldChoices(agentId)), String(agentId)),
         }),
       ],
     },

@@ -33,8 +33,9 @@ import { geocodingService } from "../services/geocoding-service";
 import { isValidLatLng, resolveSearchRadiusKm } from "../utils/geo-query";
 import { capFreeText, capName, capNameList } from "../utils/free-text";
 import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
-import { computeEffectiveAvailability } from "../services/supply-graph";
-import { findOffers, resolveOffersRadiusKm, resolveOffersLimit } from "../services/catalog-offers";
+import { evaluateStockFreshness } from "../services/supply-graph";
+import { stockSoftExpiryActiveFor, stockSoftExpiryBuyerTextNb } from "../services/stock-soft-expiry";
+import { findOffers, resolveOffersRadiusKm, resolveOffersLimit, type FindOffersResult } from "../services/catalog-offers";
 import { formatAddressLine } from "../utils/address-format";
 import { DRINK_SUBCATEGORIES } from "../services/drink-taxonomy";
 import {
@@ -109,6 +110,10 @@ export interface CatalogAvailability {
   availabilityUpdatedAt: string | null;
   /** products.availability_source ('producer_dashboard' when the producer set it). */
   availabilitySource?: string | null;
+  /** B2b-2: soft window only (rule active for the producer) — when the producer last confirmed the row (ISO). */
+  stockConfirmedAt?: string;
+  /** B2b-2: present (true) with stockConfirmedAt — the producer confirms the order before it holds. */
+  needsProducerConfirmation?: true;
 }
 
 // dev-request 2026-07-13-supply-graph-v1 (Slice 1): per-agent name_norm →
@@ -138,13 +143,20 @@ export function getCatalogAvailabilityMap(
       availability_source: string;
     }>;
     const now = new Date();
+    // B2b-2: the order path's stock rule (stock-soft-expiry.ts). Rule off →
+    // evaluateStockFreshness() is exactly computeEffectiveAvailability().
+    const softExpiry = stockSoftExpiryActiveFor(agentId);
     for (const r of rows) {
       // First write wins; UNIQUE(agent_id, name_norm) means at most one row anyway.
       if (!map.has(r.name_norm)) {
+        const fresh = evaluateStockFreshness(r.availability, r.availability_updated_at, r.availability_source, now, softExpiry);
         map.set(r.name_norm, {
-          availability: computeEffectiveAvailability(r.availability, r.availability_updated_at, r.availability_source, now),
+          availability: fresh.availability,
           availabilityUpdatedAt: r.availability_updated_at ?? null,
           availabilitySource: r.availability_source,
+          ...(fresh.needs_producer_confirmation && fresh.stock_confirmed_at
+            ? { stockConfirmedAt: fresh.stock_confirmed_at, needsProducerConfirmation: true as const }
+            : {}),
         });
       }
     }
@@ -235,7 +247,13 @@ export function formatProductsForMcp(
     const avail = availabilityByNorm?.get(normalizeProductName(cleanName));
     const availStr = avail ? `  · availability: ${avail.availability}` : "";
     const availUpdatedStr = avail?.availabilityUpdatedAt ? `  · availability_updated_at: ${avail.availabilityUpdatedAt}` : "";
-    lines.push(`- ${cleanName}${cat}${priceStr}${seasonal}${idStr}${availStr}${availUpdatedStr}`);
+    // B2b-2: a row in the soft window (rule active) carries its confirmation
+    // date, the flag and the buyer text: the assistant states the date and
+    // that the producer confirms the order — never a plain «in stock».
+    const softStr = avail?.needsProducerConfirmation && avail.stockConfirmedAt
+      ? `  · stock_confirmed_at: ${avail.stockConfirmedAt}  · needs_producer_confirmation: true  · ${stockSoftExpiryBuyerTextNb(avail.stockConfirmedAt)}`
+      : "";
+    lines.push(`- ${cleanName}${cat}${priceStr}${seasonal}${idStr}${availStr}${availUpdatedStr}${softStr}`);
     productCount++;
   }
 
@@ -699,6 +717,24 @@ function areaListText(words: string): string {
     "søk uten sted for hele landet. / " +
     `No producer in the area lists ${words}. The list below is the producers in the area, not matches for ${words}; ` +
     "search without a place to cover all of Norway.\n\n";
+}
+
+/**
+ * B2b-2 (lokal_find_offers): an offer findOffers marked as in the soft window
+ * (needs_producer_confirmation, stock_confirmed_at) also carries `stock_note`,
+ * the buyer text with the date («Sist bekreftet av produsenten …»), before
+ * `producer`. A result without such an offer is returned as it is.
+ */
+export function withStockNotes(result: FindOffersResult): FindOffersResult {
+  if (!result.offers.some((o) => o.needs_producer_confirmation && o.stock_confirmed_at)) return result;
+  return {
+    ...result,
+    offers: result.offers.map((o) => {
+      if (!(o.needs_producer_confirmation && o.stock_confirmed_at)) return o;
+      const { producer, ...rest } = o;
+      return { ...rest, stock_note: stockSoftExpiryBuyerTextNb(o.stock_confirmed_at), producer };
+    }),
+  };
 }
 
 export function registerTools(
@@ -1681,7 +1717,11 @@ export function registerTools(
       // I-S2: a category match hands its producer to the caller too.
       deliver("lokal_find_offers", { items: terms, near, lat, lng, radius_km }, extra,
         results.flatMap((r) => [...r.offers, ...(r.category_matches ?? [])].map((o) => o.producer.agent_id)));
-      const content = [{ type: "text" as const, text: JSON.stringify(results, null, 2) }];
+      // B2b-2: an offer in the soft window (it carries needs_producer_confirmation,
+      // findOffers) also gets the buyer text, so the assistant states the date and
+      // that the producer confirms the order. Every other offer is as before.
+      const shown = results.map((r) => withStockNotes(r));
+      const content = [{ type: "text" as const, text: JSON.stringify(shown, null, 2) }];
       // I-Y2: the JSON stays the list of results; the note is its own part.
       if (items.length > MAX_OFFER_ITEMS) content.push({ type: "text" as const, text: offersItemsOmittedText(items) });
       return { content };

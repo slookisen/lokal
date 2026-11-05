@@ -52,6 +52,8 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/db-factory";
+import { dentalEnrichmentWritePauseBlock } from "../services/dental-enrichment-write-pause";
+import { ENRICHMENT_WRITE_PAUSE_HTTP_STATUS } from "../services/enrichment-write-pause";
 import { classifyHjemmeside, type HjemmesideBadReason } from "../services/dental-hjemmeside-classifier";
 
 function getAdminKey(): string {
@@ -288,6 +290,14 @@ router.post("/", (req: Request, res: Response) => {
         offset,
         next_offset: lastPage ? null : offset + batchRows.length,
       });
+      return;
+    }
+
+    // Enrichment write-pause fence: apply/write mode only, before the first write.
+    // Dry-run and read paths stay open.
+    const pauseBlock = dentalEnrichmentWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
       return;
     }
 

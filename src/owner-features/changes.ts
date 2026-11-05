@@ -14,6 +14,7 @@ import {
   findOwnerFeature,
   type LocalizedText,
   type OwnerFeatureEntry,
+  type OwnerFeatureStorageAdapter,
   type OwnerFeatureValue,
   type OwnerFeatureVertical,
 } from "./registry";
@@ -158,10 +159,58 @@ class PreviewRollback extends Error {
 }
 
 /**
+ * T2 (eierportal bølge 0): a storage adapter for the level preview. Reads see
+ * the overlay first (values "written" earlier in the same preview), then the
+ * real column; writes are recorded in the overlay and NEVER forwarded to the
+ * real adapter. The real writers are not covered by the preview's rolled-back
+ * lokal.db transaction: the gårdssalg ones write experiences.db
+ * (updateClaimedProviderProfile → booking_live, gardssalg_content_audit,
+ * the owner-lock stamp; pause/resume), and the RFB pause writer also clears
+ * the public list caches. A GET must change none of that.
+ */
+function previewOverlayAdapter(
+  key: string,
+  real: OwnerFeatureStorageAdapter,
+  overlay: Map<string, OwnerFeatureValue>,
+): OwnerFeatureStorageAdapter {
+  const slot = (subjectId: string) => `${key}\u0000${subjectId}`;
+  return {
+    column: real.column,
+    read: (db, subjectId) => {
+      const k = slot(subjectId);
+      return overlay.has(k) ? (overlay.get(k) as OwnerFeatureValue) : real.read(db, subjectId);
+    },
+    write: (db, subjectId, value) => {
+      // Same "no such row" answer as the real writers (they report false
+      // when no row was written); the column's own gate is already checked
+      // by the resolver (requires / enableRequires) before any write.
+      if (real.read(db, subjectId) === null) return false;
+      overlay.set(slot(subjectId), value);
+      return true;
+    },
+  };
+}
+
+/**
+ * A clone of `registry` whose storage adapters go to one fresh in-memory
+ * overlay (previewOverlayAdapter). Entries without an adapter are shared
+ * as they are (they write owner_feature_settings in lokal.db, which the
+ * preview transaction rolls back).
+ */
+export function previewOverlayRegistry(registry: readonly OwnerFeatureEntry[]): OwnerFeatureEntry[] {
+  const overlay = new Map<string, OwnerFeatureValue>();
+  return registry.map((e) => (e.storage ? { ...e, storage: previewOverlayAdapter(e.key, e.storage, overlay) } : e));
+}
+
+/**
  * What choosing a level would change (the confirm panel). Runs the real
- * applyOwnerLevel inside a transaction that is always rolled back, so the
- * preview equals what a confirmed apply does (requirements switched on
- * earlier in the same preset included). Nothing is kept.
+ * applyOwnerLevel inside a lokal.db transaction that is always rolled back,
+ * over a clone of the registry whose storage adapters write only to an
+ * in-memory overlay (previewOverlayRegistry), so the preview equals what a
+ * confirmed apply does (requirements switched on earlier in the same preset
+ * included) and nothing is kept on any database — no column, no
+ * owner_feature_audit / owner_feature_change_batch / gardssalg_content_audit
+ * row (T2: a GET never writes; e-mail scanners open links).
  */
 export function previewOwnerLevel(
   vertical: OwnerFeatureVertical,
@@ -175,10 +224,11 @@ export function previewOwnerLevel(
   const db = opts.db ?? getDb();
   const o = { ...opts, db, registry };
   const before = resolveOwnerFeatures(vertical, subjectId, o);
+  const dry = { ...o, registry: previewOverlayRegistry(registry) };
   let out: ApplyOwnerLevelResult | null = null;
   try {
     db.transaction(() => {
-      throw new PreviewRollback(applyOwnerLevel(vertical, subjectId, level.key, { actor: "system", detail: "preview" }, o));
+      throw new PreviewRollback(applyOwnerLevel(vertical, subjectId, level.key, { actor: "system", detail: "preview" }, dry));
     })();
   } catch (e) {
     if (!(e instanceof PreviewRollback)) throw e;

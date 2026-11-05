@@ -56,8 +56,8 @@
  *   (l) F2-S2, /proveniens is the method page: title and h1 «Metode og
  *       kilder»; Daniel named as responsible editor (Daniel 2026-10-18,
  *       question 14); the Helfo, akutt and specialty texts, each checked
- *       against the code that shows the badge (and no claim that Helfo needs
- *       a source before F2-S6 builds that rule); needs_review, «sist
+ *       against the code that shows the badge (Helfo needs a stored source
+ *       since F2-S6, and the text says so); needs_review, «sist
  *       kontrollert» and «sist oppdatert»; how to report an error; the live
  *       numbers from the caches only (no query per request, «minst» when a
  *       clinic has no fylke); the repeat-park rule only while
@@ -464,9 +464,14 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
         if (typeof v === "string") strings.push(v);
         else if (v && typeof v === "object") Object.values(v).forEach(walk);
       };
-      walk(importData);
+      // F2-S10 (b): the org.nr. map and its input hashes are checked by
+      // dental-import-display.test.ts (org.nr. and column names only).
+      const { fields_by_org_nr: _fields, meta: importMeta, ...counted } = importData ?? {};
+      const { fields_by_org_nr: _fieldsMeta, ...ownMeta } = importMeta ?? {};
+      walk({ meta: ownMeta, ...counted });
+      walk(_fieldsMeta?.description);
       const WEB = /https?:|www\.|\b[a-z0-9-]+\.(?:no|com|net|org)\b/i;
-      assertEq(Object.keys(importData ?? {}), ["meta", "enhetsregisteret_search", "directory_import"], "a24: the data file has counts, nothing else (no rows)");
+      assertEq(Object.keys(importData ?? {}), ["meta", "enhetsregisteret_search", "directory_import", "fields_by_org_nr"], "a24: the data file has counts and the F2-S10 org.nr. map, nothing else (no rows)");
       assertTrue(strings.length > 0 && !strings.some((t) => WEB.test(t)) && strings.every((t) => (t.match(/\d{4}/g) ?? []).every((d) => d === "2026")),
         "a24b: … and its text has no web address and no four-digit number but the year", strings.find((t) => WEB.test(t) || (t.match(/\d{4}/g) ?? []).some((d) => d !== "2026")));
       if (imp) {
@@ -492,11 +497,16 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
         assertTrue([imp.name_nb, imp.label_nb!, imp.method_nb, imp.date_nb, brreg.method_nb].every((t) => t.includes(month.nb)) &&
           [imp.name_en, imp.label_en!, imp.method_en, imp.date_en, brreg.method_en].every((t) => t.includes(month.en)),
           "a28b: the import's name, label, method and date, and Brreg's method, give the run date's month");
-        assertTrue(imp.method_nb.includes("for oppføringer uten organisasjonsnummer") && imp.method_nb.includes("tomme adresser, telefonnumre og nettsteder på en del klinikker med organisasjonsnummer") &&
-          imp.method_nb.endsWith("Verdiene er ikke hentet på nytt, og ingen kilde er lagret per felt.") &&
-          imp.method_en.includes("for listings without an organisation number") && imp.method_en.includes("empty addresses, phone numbers and websites on some clinics with an organisation number") &&
-          imp.method_en.endsWith("The values have not been fetched again, and no source is stored per field."),
-          "a29: the method: rows without an org.nr. from the import, empty fields filled on some with one, no source per field", `${imp.method_nb} / ${imp.method_en}`);
+        // F2-S10 (d): addresses and websites only (the phone numbers it filled
+        // were the Brreg mobile number), and the values are not shown.
+        assertTrue(imp.method_nb.includes("for oppføringer uten organisasjonsnummer") && imp.method_nb.includes("tomme adresser og nettsteder på en del klinikker med organisasjonsnummer") &&
+          imp.method_nb.includes("Verdiene er ikke hentet på nytt, og ingen kilde er lagret per felt.") &&
+          imp.method_nb.endsWith("Verdiene vises ikke på Finn-tannlege før de er hentet på nytt fra en offisiell kilde: fylkeskommunens tannhelseside, Enhetsregisteret eller klinikkens eget nettsted.") &&
+          imp.method_en.includes("for listings without an organisation number") && imp.method_en.includes("empty addresses and websites on some clinics with an organisation number") &&
+          imp.method_en.includes("The values have not been fetched again, and no source is stored per field.") &&
+          imp.method_en.endsWith("The values are not shown on Finn-tannlege until they have been fetched again from an official source: the county's dental health service page, the Central Coordinating Register for Legal Entities (Enhetsregisteret) or the clinic's own website.") &&
+          !/telefonnumre|phone numbers/.test(`${imp.method_nb} ${imp.method_en}`),
+          "a29: the method: rows without an org.nr. from the import, empty addresses and websites filled on some with one, no source per field, not shown until fetched again from an official source", `${imp.method_nb} / ${imp.method_en}`);
         assertEq([imp.date_nb, imp.date_en], ["Ingen dato per felt. Verdiene er fra mai 2026.", "No date per field. The values are from May 2026."], "a29b: the date: none per field");
       }
       // Brreg applies to clinics with an org.nr., and the clinic list was built
@@ -819,20 +829,22 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
         "l3: the page names Daniel as responsible editor, nb and en");
       assertEq((main.match(/Ansvarlig redaktør|Responsible editor/g) || []).length, 2, "l3b: … and names no other");
 
-      // Helfo: read from the clinic's website; the badge is shown from
-      // helfo_agreement alone until F2-S6 (resolveHelfoClaim) adds the source rule.
+      // Helfo: read from the clinic's website; since F2-S6 the badge needs a
+      // stored source (resolveHelfoClaim), and the text says so.
       const seoSrc = read("src/routes/dental-seo.ts");
       const helfoNb = paragraphStarting(nbPart, "Helfo-direkteoppgjør");
       const helfoEn = paragraphStarting(enPart, "Helfo direct billing");
       assertTrue(helfoNb.includes("er tolket automatisk fra klinikkens nettside") && helfoNb.includes("ikke en bekreftelse fra Helfo") &&
         helfoEn.includes("is read automatically from the clinic's website") && helfoEn.includes("not a confirmation from Helfo"),
         "l4: Helfo is read automatically from the clinic's website, and is no confirmation from Helfo");
-      assertTrue(seoSrc.includes('if (!inactive && agent.helfo_agreement === "true")'), "l4b control: the profile shows the Helfo badge from helfo_agreement alone");
-      assertTrue(!fs.existsSync(path.join(ROOT, "src/services/dental-helfo-claim.ts")) && !seoSrc.includes("resolveHelfoClaim("),
-        "l4c control: F2-S6's resolveHelfoClaim is not built yet (when it lands, the Helfo text and l4d change with it)");
-      assertTrue(!/\bbare\b|\bonly\b/.test(helfoNb + helfoEn) && helfoNb.includes("merket vises når uttrekket har registrert det") &&
-        helfoEn.includes("the badge is shown when the extraction has recorded that"),
-        "l4d: the Helfo text claims no source rule yet, only what shows the badge today", helfoNb);
+      const helfoClaim = require("../services/dental-helfo-claim") as typeof import("../services/dental-helfo-claim");
+      assertTrue(seoSrc.includes("if (!inactive && resolveHelfoClaim(agent))") && helfoClaim.HELFO_CLAIM_REQUIRES_SOURCE,
+        "l4b control: the profile shows the Helfo badge from resolveHelfoClaim, with the source rule on");
+      assertTrue(!/if \((!inactive && )?agent\.helfo_agreement === "true"\)/.test(seoSrc),
+        "l4c control: no Helfo badge or sentence is read from helfo_agreement alone");
+      assertTrue(helfoNb.includes("merket vises bare når uttrekket har lagret kilden sammen med opplysningen") && helfoNb.includes("Uten lagret kilde viser vi ingen Helfo-opplysning") &&
+        helfoEn.includes("the badge is shown only when the extraction has stored its source with the detail") && helfoEn.includes("Without a stored source we show no Helfo detail"),
+        "l4d: the Helfo text states the source rule the badge follows (F2-S6)", helfoNb);
 
       // Akutt: as resolveAcuteClaim decides.
       const acute = require("../services/dental-acute-claim") as typeof import("../services/dental-acute-claim");

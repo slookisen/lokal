@@ -206,6 +206,10 @@ export const DENTAL_DATA_SOURCES: readonly DentalDataSource[] = [
   // licence or credit line, until Daniel has decided what happens to its data
   // (A2A FUNN dental-katalogimport-valg-hos-daniel); the truth test locks
   // that. Not «åpen nettkatalog»: «åpen» could read as an open licence.
+  // F2-S10 (Daniel's choice B on question 32, 2026-10-19): the values are not
+  // shown (dental-import-display.ts), and the method says so. The phone
+  // numbers it filled on rows with an org.nr. were the Brreg mobile number,
+  // so the method names addresses and websites only.
   {
     id: "katalogimport_2026_05",
     name_nb: "en engangsimport fra en nettkatalog (mai 2026)",
@@ -218,8 +222,8 @@ export const DENTAL_DATA_SOURCES: readonly DentalDataSource[] = [
       { nb: "telefon", en: "phone" },
       { nb: "nettsted", en: "website" },
     ],
-    method_nb: "Navn, adresse, telefon og nettsted for oppføringer uten organisasjonsnummer ble hentet én gang fra en nettkatalog i mai 2026. Importen fylte samtidig tomme adresser, telefonnumre og nettsteder på en del klinikker med organisasjonsnummer. Verdiene er ikke hentet på nytt, og ingen kilde er lagret per felt.",
-    method_en: "Name, address, phone and website for listings without an organisation number were taken once from an online directory in May 2026. The import also filled empty addresses, phone numbers and websites on some clinics with an organisation number. The values have not been fetched again, and no source is stored per field.",
+    method_nb: "Navn, adresse, telefon og nettsted for oppføringer uten organisasjonsnummer ble hentet én gang fra en nettkatalog i mai 2026. Importen fylte samtidig tomme adresser og nettsteder på en del klinikker med organisasjonsnummer. Verdiene er ikke hentet på nytt, og ingen kilde er lagret per felt. Verdiene vises ikke på Finn-tannlege før de er hentet på nytt fra en offisiell kilde: fylkeskommunens tannhelseside, Enhetsregisteret eller klinikkens eget nettsted.",
+    method_en: "Name, address, phone and website for listings without an organisation number were taken once from an online directory in May 2026. The import also filled empty addresses and websites on some clinics with an organisation number. The values have not been fetched again, and no source is stored per field. The values are not shown on Finn-tannlege until they have been fetched again from an official source: the county's dental health service page, the Central Coordinating Register for Legal Entities (Enhetsregisteret) or the clinic's own website.",
     date_nb: "Ingen dato per felt. Verdiene er fra mai 2026.",
     date_en: "No date per field. The values are from May 2026.",
     url: null,

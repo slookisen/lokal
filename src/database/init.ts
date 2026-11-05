@@ -575,7 +575,7 @@ function initSchema(db: Database.Database): void {
       claimant_phone TEXT,
       verification_method TEXT DEFAULT 'email',  -- 'email' | 'phone' | 'manual'
       verification_code TEXT,                     -- 6-digit code sent to verify
-      status TEXT DEFAULT 'pending' CHECK(status IN ('pending','code_sent','verified','rejected','expired','pending_review','superseded')),
+      status TEXT DEFAULT 'pending' CHECK(status IN ('pending','code_sent','verified','rejected','expired','pending_review','superseded','revoked')),
       claim_token TEXT,                           -- Token for managing agent after claim
       claim_token_expires_at TEXT,                -- Token expires 30 days after issue
       notes TEXT,                                 -- Admin notes
@@ -587,7 +587,12 @@ function initSchema(db: Database.Database): void {
       failed_attempts INTEGER DEFAULT 0,          -- Wrong codes entered; the 5th expires the claim
       review_reason TEXT,                         -- Admin queue: 'no_known_email' | 'listed_email_wrong' | 'has_owner' | 'shared_address'
       claimant_email_typed TEXT,                  -- Audit: the address the claimant typed, kept when claimant_email becomes the owner's address
-      recommendation TEXT                         -- Claim domain rule (2026-10-27): 'domain_match_independent' | 'domain_code_sent' | 'free_mail_needs_extra' | 'has_owner' | 'needs_review' | 'shared_address' (2026-10-29: the code's address is the known e-mail of >1 RFB profile)
+      recommendation TEXT,                        -- Claim domain rule (2026-10-27): 'domain_match_independent' | 'domain_code_sent' | 'free_mail_needs_extra' | 'has_owner' | 'needs_review' | 'shared_address' (2026-10-29: the code's address is the known e-mail of >1 RFB profile)
+      claim_assessment TEXT,                      -- Owner-claim auto-assessment (2026-10-30, slice A, record-only): JSON from claim-assessment.ts; NULL = not assessed
+      claim_assessment_at TEXT,                   -- When claim_assessment was written (ISO-8601)
+      pre_grant_state TEXT,                       -- Owner-claim revoke (2026-10-30, slice C1): JSON snapshot of agents.is_verified/claimed_at/claimed_via + agent_knowledge.data_source taken just before grantClaimOwnership; NULL = granted before C1
+      revoked_at TEXT,                            -- When an admin revoked this verified claim (POST /admin/agents/claim-revoke), ISO-8601
+      revoke_note TEXT                            -- The admin's note on the revoke
     );
 
     -- ════════════════════════════════════════════════════════════
@@ -1535,6 +1540,29 @@ function initSchema(db: Database.Database): void {
   } catch {
     // Column already exists — expected after first migration
   }
+  // dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post (K1): «Send
+  // koden på nytt» — how often the same code was sent again, and when (the
+  // platform cap counts resends). Additive and idempotent; existing rows
+  // start at 0/NULL. A rollback leaves them in place.
+  for (const col of ["resend_count INTEGER DEFAULT 0", "resent_at TEXT"]) {
+    try {
+      db.exec(`ALTER TABLE agent_claims ADD COLUMN ${col}`);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
+  // dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk,
+  // slice A (record-only): the stored owner-claim auto-assessment (JSON,
+  // services/claim-assessment.ts) and when it was written. Written only with
+  // CLAIM_AUTO_ASSESSMENT_ENABLED === "true". Additive and idempotent;
+  // existing rows keep NULL. A rollback leaves them in place.
+  for (const col of ["claim_assessment TEXT", "claim_assessment_at TEXT"]) {
+    try {
+      db.exec(`ALTER TABLE agent_claims ADD COLUMN ${col}`);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
   // SQLite cannot ALTER a CHECK, so widening the status list rebuilds the
   // table (same pattern as crm_threads above). The new table is the stored
   // CREATE text with only the CHECK clause swapped, so every column — also
@@ -1578,6 +1606,57 @@ function initSchema(db: Database.Database): void {
     }
   } catch (e) {
     console.warn("[init][agent-claims-11a] status-CHECK widening skipped:", e instanceof Error ? e.message : String(e));
+  }
+
+  // dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk,
+  // slice C1 (admin claim-revoke): the pre-grant snapshot that a revoke
+  // restores the profile from, and the revoke stamp. Additive and idempotent;
+  // existing rows keep NULL (a revoke of such a claim restores only partly,
+  // knowledge-service.ts revokeClaimOwnership). A rollback leaves them in place.
+  for (const col of ["pre_grant_state TEXT", "revoked_at TEXT", "revoke_note TEXT"]) {
+    try {
+      db.exec(`ALTER TABLE agent_claims ADD COLUMN ${col}`);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
+  // Slice C1: the status 'revoked'. Same rebuild as the 11=A widening above
+  // (stored CREATE text with only the CHECK swapped, rows copied unchanged,
+  // indexes recreated). Runs after it, so it only ever sees the 11=A CHECK. If
+  // the stored text does not hold that exact CHECK, nothing is rebuilt and a
+  // revoke fails at write time (its transaction rolls back), never silently.
+  try {
+    const OLD_CLAIM_STATUS_CHECK = "CHECK(status IN ('pending','code_sent','verified','rejected','expired','pending_review','superseded'))";
+    const NEW_CLAIM_STATUS_CHECK = "CHECK(status IN ('pending','code_sent','verified','rejected','expired','pending_review','superseded','revoked'))";
+    const claimsRow = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_claims'"
+    ).get() as { sql: string } | undefined;
+    if (claimsRow && !/'revoked'/.test(claimsRow.sql)) {
+      const createNew = claimsRow.sql.replace(/^CREATE TABLE\s+"?agent_claims"?/, "CREATE TABLE agent_claims__revoke_new");
+      if (createNew === claimsRow.sql || !createNew.includes(OLD_CLAIM_STATUS_CHECK)) {
+        console.warn("[init][agent-claims-revoke] status CHECK not in the expected form — rebuild skipped");
+      } else {
+        const indexSql = (db.prepare(
+          "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='agent_claims' AND sql IS NOT NULL"
+        ).all() as Array<{ sql: string }>).map((r) => r.sql);
+        const fkWasOn = db.pragma("foreign_keys", { simple: true }) === 1;
+        db.pragma("foreign_keys = OFF");
+        try {
+          db.transaction(() => {
+            db.exec(createNew.replace(OLD_CLAIM_STATUS_CHECK, NEW_CLAIM_STATUS_CHECK));
+            db.exec(`INSERT INTO agent_claims__revoke_new SELECT * FROM agent_claims`);
+            db.exec(`DROP TABLE agent_claims`);
+            db.exec(`ALTER TABLE agent_claims__revoke_new RENAME TO agent_claims`);
+            for (const sql of indexSql) db.exec(sql);
+          })();
+          console.log("[init][agent-claims-revoke] agent_claims.status CHECK widened to include 'revoked'");
+        } finally {
+          if (fkWasOn) db.pragma("foreign_keys = ON");
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("[init][agent-claims-revoke] status-CHECK widening skipped:", e instanceof Error ? e.message : String(e));
   }
 
   // ─── Tier 2: Add seasonality, delivery_radius, min_order_value ──
@@ -4577,6 +4656,23 @@ function initSchema(db: Database.Database): void {
     )
   `);
 
+  // ai-sok B5: per-AI-agent rollup (search indexer vs user fetch vs training
+  // crawler survive the nightly prune). page_view_daily's coarse bot_type
+  // ('chatgpt' = GPTBot + ChatGPT-User + OAI-SearchBot) is left untouched, so
+  // every existing reader keeps its numbers. One row per day x registry token
+  // x vertical; vendor/purpose are looked up from AI_AGENT_REGISTRY when read.
+  // Written by retention-service.ts in the same transaction as page_view_daily.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS page_view_ai_agent_daily (
+      day           TEXT NOT NULL,
+      agent         TEXT NOT NULL,
+      vertical_id   TEXT NOT NULL DEFAULT 'rfb',
+      view_count    INTEGER NOT NULL DEFAULT 0,
+      session_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, agent, vertical_id)
+    )
+  `);
+
   // ─── Measure 2 of dev-request 2026-07-03-places-api-cost-reduction ──────
   // (SKU field-splitting, RFB google-rating-batch): Places API (New) Text
   // Search bills the whole call at Enterprise-tier pricing (1k free calls/mo)
@@ -5518,11 +5614,17 @@ function initSchema(db: Database.Database): void {
   // direct-id order-flow path (/catalog/agents/:id/products, cart add/submit,
   // /produsent/ordre/:token, admin inbox) keeps working. Same idea as
   // experience_providers.catalog_hidden. DEFAULT 0, so every existing row is a
-  // no-op. The ONE place that reads it is services/agent-visibility.ts. The
-  // only writer is POST /admin/test-producer (routes/admin-test-producer.ts),
-  // which only ever touches the single origin='test_fixture' row.
-  // Rollback: the column is additive and may stay; retire the fixture with the
-  // endpoint (or UPDATE agents SET is_active=0 WHERE origin='test_fixture').
+  // no-op. The ONE place that reads it is services/agent-visibility.ts. There
+  // are exactly two writers, each pinned to its own single fixture row:
+  //   * POST /admin/test-producer (routes/admin-test-producer.ts) — the order
+  //     fixture, origin='test_fixture';
+  //   * POST /admin/test-claim-fixture (routes/admin-test-claim-fixture.ts,
+  //     dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post AC6) — the
+  //     unclaimed claim-test fixture, origin='test_claim_fixture', which GET
+  //     /api/marketplace/agents/:id/info alone serves while it is armed.
+  // Rollback: the column is additive and may stay; retire a fixture with its
+  // endpoint (or UPDATE agents SET is_active=0 WHERE origin IN
+  // ('test_fixture','test_claim_fixture')).
   try {
     db.exec(`ALTER TABLE agents ADD COLUMN catalog_hidden INTEGER NOT NULL DEFAULT 0`);
   } catch { /* already exists — expected */ }
@@ -6200,6 +6302,27 @@ function initSchema(db: Database.Database): void {
     console.error("Migration profile_ai_deliveries failed:", err);
   }
 
+  // ─── profile_ai_clicks (dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 2) ───
+  // «Klikk fra AI-svar»: how many people came to each profile page from an AI
+  // assistant's answer, per UTC day x AI (chatgpt | claude | perplexity |
+  // gemini | copilot | other). Daily sums only, no IP, session, user agent or
+  // URL; written in batches by profile-ai-clicks.ts. Additive.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS profile_ai_clicks (
+        vertical_id TEXT NOT NULL,
+        profile_id TEXT NOT NULL,
+        day TEXT NOT NULL,
+        ai_vendor TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 0,
+        UNIQUE (vertical_id, profile_id, day, ai_vendor)
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_profile_ai_clicks_vertical_day ON profile_ai_clicks(vertical_id, day)`);
+  } catch (err) {
+    console.error("Migration profile_ai_clicks failed:", err);
+  }
+
   // ─── search_console_weekly (A2A dev-request 2026-10-16-gsc-bing-ai-rapporter, S6c) ───
   // Weekly numbers from Google Search Console and Bing Webmaster Tools per
   // domain (source gsc | bing; week = Monday YYYY-MM-DD; metric e.g. clicks,
@@ -6369,6 +6492,55 @@ function initSchema(db: Database.Database): void {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_product_import_candidates_agent ON product_import_candidates(agent_id)`);
   } catch (err) {
     console.error("Migration product_import_candidates failed:", err);
+  }
+
+  // ─── product_import outreach pre-extraction (Skive 3b-1) ────────────────
+  // POST /admin/product-import/prepare (flag PRODUCT_IMPORT_OUTREACH_ENABLED)
+  // logs one product_import_runs row per recipient with mode
+  // 'outreach_prepare', the campaign slug and the prepare batch id; its
+  // candidates carry the diff kind (new / changed / unchanged) and the old
+  // price. Status 'eligible' / 'unchanged' / 'rejected' — never 'pending',
+  // so the owner preview/publish (mode 'owner_fetch') never sees them.
+  // Additive, nullable, idempotent.
+  try {
+    const addCols = (table: string, cols: Array<[string, string]>) => {
+      const have = new Set((db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((c) => c.name));
+      for (const [col, type] of cols) if (!have.has(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);
+    };
+    addCols("product_import_runs", [["campaign", "TEXT"], ["prepare_id", "TEXT"]]);
+    addCols("product_import_candidates", [["diff_kind", "TEXT"], ["old_price_nok", "REAL"]]);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_product_import_runs_campaign ON product_import_runs(campaign, mode, created_at)`);
+  } catch (err) {
+    console.error("Migration product_import outreach columns failed:", err);
+  }
+
+  // ─── product_import_outreach_events (Skive 3b-2) ────────────────────────
+  // Append-only log per outreach recipient (flag PRODUCT_IMPORT_OUTREACH_ENABLED):
+  // 'opened' (the signed landing link was opened; detail = the session state),
+  // 'refetch_started' (the list was older than 7 days and an owner fetch was
+  // started; run_id = that owner_fetch run) and 'confirmed' (count = products
+  // published, in_stock = whether «på lager» was chosen). «Extracted» is the
+  // 3b-1 product_import_runs row itself. Never read by products / profiles.
+  // Additive, brand-new table, idempotent.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS product_import_outreach_events (
+        id TEXT PRIMARY KEY,
+        campaign TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        event TEXT NOT NULL,
+        run_id TEXT,
+        count INTEGER,
+        in_stock INTEGER,
+        detail TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_product_import_outreach_events_campaign ON product_import_outreach_events(campaign, agent_id, created_at)`,
+    );
+  } catch (err) {
+    console.error("Migration product_import_outreach_events failed:", err);
   }
 
   // ─── S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok ──────────────

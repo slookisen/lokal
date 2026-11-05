@@ -497,7 +497,7 @@ export function runGardssalgOwnerFeaturesO1aTests(opts: { log?: boolean } = {}):
       }
       assertTrue(limited.every((st) => st === 303), "r1: 30 writes in a minute are served");
       const over = await req("POST", page("utenepost", "/interesse"), { ...form, ...cookie("tok-ne") }, "key=contact.address");
-      assertEq(over.status, 429, "r2: the 31st write in a minute → 429");
+      assertEq([over.status, String(over.headers.location)], [303, page("utenepost", "?melding=for_mange&ved=planlagt-contact.address#planlagt-contact.address")], "r2: the 31st write in a minute → 303 «For mange endringer» at the row (T5)");
       assertEq((rfbDb.prepare(`SELECT COUNT(*) AS n FROM owner_feature_interest WHERE subject_id = 'o1-noemail'`).get() as any).n, 0, "r3: the refused write stored nothing");
       const overPut = await req("PUT", api("o1-noemail", "/booking.enabled"), { ...json, ...cookie("tok-ne") }, JSON.stringify({ value: false }));
       assertEq(overPut.status, 429, "r4: the API shares the per-session limit");

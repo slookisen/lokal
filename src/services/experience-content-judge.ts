@@ -424,17 +424,14 @@ Ved minste tvil, svar ${JUDGE_MISMATCH_TOKEN}.`;
  * verdict (the sweep's boilerplate-description check) does not have to
  * fetch the same URL twice.
  *
- * `currentSummary` is the same idea for a different unrelated need: it is
- * `summarizeAbout(fetchResult.html)` — the SAME extractive summary
- * (meta-description-first, capped ~300 chars) that the content-refresh
- * writer would store as `row.description` for this page today — computed
- * from the html already in scope, no re-fetch. It is present whenever a
- * real page was fetched and `null` for the dead/parked/empty-url branches,
- * exactly like `pageText`. A caller comparing `row.description` (which is
- * ALWAYS meta-derived-or-capped-paragraph, never the full page body) against
- * "would this page currently produce the same description" must compare
- * against `currentSummary`, not `pageText` — `pageText` is the full visible
- * body and is a different shape entirely.
+ * `currentSummary` is `summarizeAbout(fetchResult.html)` — the extractive
+ * summary (meta-description-first, capped ~300 chars) a content-refresh
+ * writer would store for this page — computed from the html already in
+ * scope, no re-fetch; `null` for the dead/parked/empty-url branches.
+ * Informational only: the content-judge sweep's boilerplate-description
+ * nulling does NOT compare against it (a description equal to the page's
+ * meta summary is the owner's own genuine text); it nulls only a full copy
+ * of `pageText`.
  */
 export type EvidencePageUnresolvedReason = "evidence_page_dead" | "evidence_page_parked" | "judge_failed";
 
