@@ -727,6 +727,17 @@ export async function runAdminEnrichmentWritePauseTests(
         // the pause via the service to prove the wiring.
         "routes/dental.ts",
         "routes/dental-enrichment-write-pause.test.ts",
+        // The shared dental helper (enrichmentWritePauseBlock(() => getDb("rfb"),
+        // "dental")) used by dental.ts, the admin-dental-* apply sweeps and the
+        // geocode worker, plus the sweeps' own direct pause-constant imports.
+        "services/dental-enrichment-write-pause.ts",
+        "routes/admin-dental-brreg-address-sweep.ts",
+        "routes/admin-dental-hjemmeside-cleanup.ts",
+        "routes/admin-dental-hjemmeside-discovery.ts",
+        "routes/admin-dental-offentlig-klinikk-hjemmeside-korrigering.ts",
+        "routes/admin-dental-schema-probe-sweep.ts",
+        "routes/admin-dental-wrong-entity-retro-sanitize.ts",
+        "routes/admin-dental-write-pause.test.ts",
       ].sort(),
       "ewp-125: the guard is imported by exactly the gated surfaces, the shared write primitives, its own admin route, and the test files",
     );

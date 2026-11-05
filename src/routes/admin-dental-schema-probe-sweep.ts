@@ -46,6 +46,8 @@ import { Router, Request, Response } from "express";
 import { getDb } from "../database/db-factory";
 import { findContaminatedFields, DENTAL_SYNTHETIC_PROBE_IDS } from "../services/dental-contamination";
 import { updateDentalAgent, type DentalAgent } from "../services/dental-store";
+import { dentalEnrichmentWritePauseBlock } from "../services/dental-enrichment-write-pause";
+import { ENRICHMENT_WRITE_PAUSE_HTTP_STATUS } from "../services/enrichment-write-pause";
 
 function getAdminKey(): string {
   return process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
@@ -132,6 +134,14 @@ router.post("/", (req: Request, res: Response) => {
         matched_count: matches.length,
         matches,
       });
+      return;
+    }
+
+    // Enrichment write-pause fence: apply mode only, before the first write.
+    // Dry-run/read paths stay open.
+    const pauseBlock = dentalEnrichmentWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
       return;
     }
 

@@ -21,7 +21,8 @@ import { OUTREACH_RETURN_COOKIE, outreachReturnPathFor } from "../services/produ
 import { getProducerPaymentStatus } from "../services/payment-service";
 import { isOverridableCsLock, csLockNote } from "../services/owner-cs-lock";
 import { customerRuleSql } from "../services/customer-rule";
-import { getSupplyGraphStaleDays } from "../services/supply-graph";
+import { getSupplyGraphHardStaleDays, getSupplyGraphStaleDays } from "../services/supply-graph";
+import { stockSoftExpiryActiveFor } from "../services/stock-soft-expiry";
 import { writeOrderNotificationsOptInWithAudit } from "../services/order-opt-in";
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
 import {
@@ -36,6 +37,7 @@ import {
   isCrossSiteWrite, writeGuardRefusedBody, WRITE_GUARD_REFUSED_TITLE, WRITE_GUARD_CONTACT_RFB,
 } from "../middleware/same-origin-write";
 import { ownerOrdersEntryCardHtml } from "./owner-orders-view";
+import { OWNER_PORTAL_FORM_LABELS, readOwnerAuditFeed } from "./owner-audit-log";
 import { paymentPortalAlert, renderPaymentCard, shouldRenderPaymentCard } from "./owner-payment-card";
 import {
   ownerOrderabilityPortalEnabledFor, listOwnerProductOrderability, confirmOwnerProductInStock,
@@ -379,6 +381,18 @@ function readSessionCookie(req: Request): string | undefined {
   return parsed.rfb_owner_session;
 }
 
+/**
+ * A claim-approval link ("mlclaim_") is never a session, used or not. Only
+ * /magic-link-verify redeems it, and that burns it and opens a fresh
+ * "mlsess_" row. Without this check a claim link that something else had
+ * marked used (the /selger verifier, knowledge-service verifyMagicLink, did
+ * so before it learnt to ignore them) would act as a cookie / Bearer session
+ * for the rest of its 15 minutes.
+ */
+function isClaimApprovalLinkId(id: unknown): boolean {
+  return String(id || "").startsWith(OWNER_CLAIM_LINK_ID_PREFIX);
+}
+
 export function verifyOwnerSession(req: Request): { valid: boolean; agentId?: string; token?: string } {
   // Try cookie first
   const cookieToken = readSessionCookie(req);
@@ -386,11 +400,11 @@ export function verifyOwnerSession(req: Request): { valid: boolean; agentId?: st
     const db = getDb();
     const link = db
       .prepare(
-        `SELECT agent_id FROM magic_links
+        `SELECT id, agent_id FROM magic_links
          WHERE token = ? AND used = 1 AND ${OWNER_TOKEN_NOT_EXPIRED_SQL}`
       )
       .get(cookieToken) as any;
-    if (link) {
+    if (link && !isClaimApprovalLinkId(link.id)) {
       return { valid: true, agentId: link.agent_id, token: cookieToken };
     }
   }
@@ -402,11 +416,11 @@ export function verifyOwnerSession(req: Request): { valid: boolean; agentId?: st
     const db = getDb();
     const link = db
       .prepare(
-        `SELECT agent_id FROM magic_links
+        `SELECT id, agent_id FROM magic_links
          WHERE token = ? AND used = 1 AND ${OWNER_TOKEN_NOT_EXPIRED_SQL}`
       )
       .get(token) as any;
-    if (link) {
+    if (link && !isClaimApprovalLinkId(link.id)) {
       return { valid: true, agentId: link.agent_id, token };
     }
   }
@@ -567,6 +581,9 @@ export function issueOwnerSessionForSelgerLogin(
 //                     row, 15 minutes (the mail says so), one-time:
 //                     /magic-link-verify burns it and opens a fresh 7-day
 //                     session row, so the mailed token is never a session.
+//                     Only /magic-link-verify takes it: verifyOwnerSession
+//                     never accepts an "mlclaim_" row, and the /selger
+//                     verifier (knowledge-service verifyMagicLink) ignores it.
 // No rate limit in here. request-magic-link checks its visitor limit before
 // calling; Daniel's approval is not held by it. An "mlclaim_" row is an
 // e-mail, so it still counts toward that limit — a visitor gets fewer mails
@@ -2137,15 +2154,17 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       pendingOrderCount = Number(pc?.n) || 0;
     } catch { pendingOrderCount = 0; }
 
-    // Editable fields with display labels (Norwegian Bokmål)
+    // Editable fields with display labels (Norwegian Bokmål). The labels live
+    // in owner-audit-log.ts, so «Endringslogg» names the fields the same way.
+    const FL = OWNER_PORTAL_FORM_LABELS;
     const fieldDefs: Array<{ key: string; dbField: string; label: string; type: "text" | "textarea" | "email" | "url" }> = [
-      { key: "email",        dbField: "email",         label: "E-post",            type: "email" },
-      { key: "phone",        dbField: "phone",         label: "Telefon",           type: "text" },
-      { key: "address",      dbField: "address",       label: "Adresse",           type: "text" },
-      { key: "postal_code",  dbField: "postal_code",   label: "Postnummer",        type: "text" },
-      { key: "website",      dbField: "website",       label: "Nettside",          type: "url" },
-      { key: "opening_hours",dbField: "opening_hours", label: "Åpningstider", type: "text" },
-      { key: "description",  dbField: "about",         label: "Om produsenten",    type: "textarea" },
+      { key: "email",        dbField: "email",         label: FL.email,         type: "email" },
+      { key: "phone",        dbField: "phone",         label: FL.phone,         type: "text" },
+      { key: "address",      dbField: "address",       label: FL.address,       type: "text" },
+      { key: "postal_code",  dbField: "postal_code",   label: FL.postal_code,   type: "text" },
+      { key: "website",      dbField: "website",       label: FL.website,       type: "url" },
+      { key: "opening_hours",dbField: "opening_hours", label: FL.opening_hours, type: "text" },
+      { key: "description",  dbField: "about",         label: FL.about,         type: "textarea" },
     ];
 
     // Økologi S3c: the «økologisk needs Debio» message at the description
@@ -2269,13 +2288,12 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
                 ul.innerHTML = '<li class="ep-audit-item ep-audit-meta">Ingen endringer ennå.</li>';
                 return;
               }
+              // The API sends finished text (owner-audit-log.ts): name, values,
+              // who and time. An e-mail field comes without values.
               ul.innerHTML = j.audits.map(function (a) {
-                var when = new Date(a.changed_at).toLocaleString("nb-NO");
-                var who = a.changed_by === "owner" ? "Du" : (a.changed_by === "admin" ? "Support" : "System");
-                var oldV = a.old_value == null ? "(tomt)" : String(a.old_value);
-                var newV = a.new_value == null ? "(tomt)" : String(a.new_value);
-                return '<li class="ep-audit-item"><strong>' + esc(a.field_name) + '</strong> endret av ' + esc(who) +
-                  '<div class="ep-audit-meta">' + esc(when) + ' · «' + esc(oldV.slice(0, 80)) + '» → «' + esc(newV.slice(0, 80)) + '»</div></li>';
+                var change = a.values_hidden ? ' endret' : ': ' + esc(a.old_value) + ' → ' + esc(a.new_value);
+                return '<li class="ep-audit-item"><strong>' + esc(a.label) + '</strong>' + change +
+                  '<div class="ep-audit-meta">' + esc(a.when) + ' · ' + esc(a.who) + '</div></li>';
               }).join("");
             })
             .catch(function () {
@@ -2902,15 +2920,28 @@ function formatOwnerPrice(price: number | null, unit: string | null): string {
 }
 
 /** The B1 card. Pure rendering of listOwnerProductOrderability(). */
-export function ownerOrderabilityCardHtml(agentId: string, o: OwnerOrderabilityOverview, bannerHtml = ""): string {
+export function ownerOrderabilityCardHtml(agentId: string, o: OwnerOrderabilityOverview, bannerHtml = "", env: NodeJS.ProcessEnv = process.env): string {
   const id = encodeURIComponent(agentId);
   const total = o.products.length;
+  // B2b-3: with the soft-expiry rule active the texts follow it; off → unchanged.
+  const soft = stockSoftExpiryActiveFor(agentId, env);
+  const stockMeta = (p: OwnerOrderabilityOverview["products"][number]): string => {
+    if (soft && p.needs_producer_confirmation && p.stock_confirmed_at) {
+      return ` <span class="ep-audit-meta" data-stock-soft="1">Lagerstatus sist bekreftet ${escapeHtml(formatOwnerDate(p.stock_confirmed_at))}. Kundene ser at den ikke er bekreftet nylig.</span>`;
+    }
+    if (!p.stock_expires_at) return "";
+    return ` <span class="ep-audit-meta">${soft ? "Lagerstatus bekreftet til" : "Lagerstatus gjelder til"} ${escapeHtml(formatOwnerDate(p.stock_expires_at))}</span>`;
+  };
+  const staleDays = getSupplyGraphStaleDays();
+  const validity = soft
+    ? `En bekreftelse på lager gjelder i ${staleDays} dager. Etter det kan kundene fortsatt bestille i opptil ${getSupplyGraphHardStaleDays()} dager, med datoen for siste bekreftelse synlig.`
+    : `En bekreftelse på lager gjelder i ${staleDays} dager.`;
   const profileHtml = o.profile_reasons.length
     ? `<div class="ep-alert ep-alert-error" role="note" data-orderability-profile="blocked">Ingen varer kan bestilles før dette er ordnet:<ul>${o.profile_reasons.map((r) => `<li>${escapeHtml(orderabilityReasonTextNb(r))}</li>`).join("")}</ul></div>`
     : "";
   const rows = o.products.map((p) => {
     const status = p.orderable
-      ? `<strong class="ep-orderable-yes">Kan bestilles</strong>${p.stock_expires_at ? ` <span class="ep-audit-meta">Lagerstatus gjelder til ${escapeHtml(formatOwnerDate(p.stock_expires_at))}</span>` : ""}`
+      ? `<strong class="ep-orderable-yes">Kan bestilles</strong>${stockMeta(p)}`
       : `<strong class="ep-orderable-no">Kan ikke bestilles</strong><ul class="ep-orderable-reasons">${p.reasons.map((r) => `<li data-reason="${escapeHtml(r.code)}">${escapeHtml(orderabilityReasonTextNb(r))}</li>`).join("")}</ul>`;
     const noPrice = p.missing_price
       ? `<div class="ep-audit-meta" data-missing-price="1">Mangler pris — legg inn pris før du bekrefter at varen er på lager.</div>`
@@ -2938,7 +2969,7 @@ export function ownerOrderabilityCardHtml(agentId: string, o: OwnerOrderabilityO
   return `<div class="ep-card" id="${ORDERABILITY_ANCHOR}">
         <h2>Varer som kan bestilles</h2>
         ${bannerHtml}
-        <p data-orderable-count="${o.orderable_count}">${o.orderable_count} av ${total} ${total === 1 ? "vare" : "varer"} kan bestilles nå. En bekreftelse på lager gjelder i ${getSupplyGraphStaleDays()} dager.</p>
+        <p data-orderable-count="${o.orderable_count}">${o.orderable_count} av ${total} ${total === 1 ? "vare" : "varer"} kan bestilles nå. ${validity}</p>
         ${profileHtml}
         ${list}
         <h3 style="margin-top:20px;">Legg til vare</h3>
@@ -3011,14 +3042,21 @@ function orderabilityBack(agentId: string, status: string, extra = ""): string {
 //   confirmable under the B1 rule. Same owner checks as the B1 POSTs.
 
 /** The B2 banner: the orderable items whose stock status expires within 3 days. "" when none. */
-export function stockCheckBannerHtml(agentId: string, items: StockCheckItem[]): string {
+export function stockCheckBannerHtml(agentId: string, items: StockCheckItem[], env: NodeJS.ProcessEnv = process.env): string {
   if (items.length === 0) return "";
   const id = encodeURIComponent(agentId);
-  const lis = items.map((i) => `<li data-product-id="${escapeHtml(i.id)}">${escapeHtml(i.name)} <span class="ep-audit-meta">gjelder til ${escapeHtml(formatStockCheckDate(i.expires_at))}</span></li>`).join("");
+  // B2b-3: soft-expiry texts when the rule is active for the producer; off → unchanged.
+  const soft = stockSoftExpiryActiveFor(agentId, env);
+  const one = items.length === 1;
+  const lis = items.map((i) => `<li data-product-id="${escapeHtml(i.id)}">${escapeHtml(i.name)} <span class="ep-audit-meta">${soft ? "bekreftet til" : "gjelder til"} ${escapeHtml(formatStockCheckDate(i.expires_at))}</span></li>`).join("");
   const hidden = items.map((i) => `<input type="hidden" name="id" value="${escapeHtml(i.id)}">`).join("");
+  const heading = soft ? "Lagerstatusen er snart ikke lenger bekreftet nylig" : "Lagerstatusen går snart ut";
+  const para = soft
+    ? `Kundene kan fortsatt bestille ${one ? "varen" : "varene"}, men de ser at lagerstatusen ikke er bekreftet nylig. Bekreft ${one ? "den" : "dem"} for å fornye datoen.`
+    : `Når den har gått ut, kan kundene ikke bestille ${one ? "varen" : "varene"} før du har bekreftet ${one ? "den" : "dem"} igjen.`;
   return `<div class="ep-alert ep-alert-error" role="note" data-stock-check-banner="1">
-          <strong>Lagerstatusen går snart ut</strong>
-          <p style="margin:6px 0;">Når den har gått ut, kan kundene ikke bestille ${items.length === 1 ? "varen" : "varene"} før du har bekreftet ${items.length === 1 ? "den" : "dem"} igjen.</p>
+          <strong>${heading}</strong>
+          <p style="margin:6px 0;">${para}</p>
           <ul>${lis}</ul>
           <form method="post" action="/eier/${id}/varer/bekreft-lagerpaminnelse" style="margin:8px 0 0;">
             ${hidden}
@@ -3228,9 +3266,12 @@ export function productImportCardHtml(agentId: string, o: ImportOverview, alertH
 // ─────────────────────────────────────────────────────────────────
 // GET /api/agents/:agentId/my-audit — owner-side audit feed (session-gated)
 // ─────────────────────────────────────────────────────────────────
-// Same shape as the Daniel-only /admin/agent-audit endpoint, but auth-gated
-// to the owner's session cookie (NOT admin-key). Returns last N audit
-// entries for *this* agent only.
+// Auth-gated to the owner's session cookie (NOT admin-key). Returns the last
+// N log rows for *this* agent only, as the owner reads them (dev-request
+// 2026-11-02-rfb-endringslogg-lettlest, owner-audit-log.ts): only fields in
+// OWNER_AUDIT_FIELDS, Norwegian names and values, «Du» / «Rett fra Bonden» /
+// «Automatisk fra nettsiden din» — no notes, no e-mail addresses, no
+// technical rows. Daniel's /admin/agent-audit keeps the raw rows.
 router.get("/api/agents/:agentId/my-audit", (req: Request, res: Response) => {
   try {
     const agentId = String((req.params as any).agentId || "");
@@ -3246,19 +3287,10 @@ router.get("/api/agents/:agentId/my-audit", (req: Request, res: Response) => {
       return res.status(403).json(ownerForbiddenJson(agentId, session));
     }
 
-    const limitNum = Math.min(parseInt(String(req.query.limit ?? "20"), 10) || 20, 200);
+    // 1..200 (a negative LIMIT would mean «no limit» in SQLite).
+    const limitNum = Math.max(1, Math.min(parseInt(String(req.query.limit ?? "20"), 10) || 20, 200));
 
-    const db = getDb();
-    const audits = db
-      .prepare(
-        `SELECT id, agent_id, field_name, old_value, new_value,
-                changed_by, changed_by_email, changed_at, notes
-           FROM agent_knowledge_audit
-          WHERE agent_id = ?
-          ORDER BY changed_at DESC
-          LIMIT ?`
-      )
-      .all(agentId, limitNum) as any[];
+    const audits = readOwnerAuditFeed(getDb(), agentId, limitNum);
 
     return res.json({
       success: true,

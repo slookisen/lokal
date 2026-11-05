@@ -24,7 +24,9 @@
  *   (ui)  selger.html (its inline script in node:vm, Map-backed localStorage)
  *         against the real handlers: the open claim is kept, the code field
  *         comes back for the same store and is cleared after verify / expiry /
- *         replacement (AC2); code_already_sent and resend on the page.
+ *         replacement (AC2); code_already_sent and resend on the page; the
+ *         persistent claim-form answer (rule 4, a missing field) is gone once
+ *         a code is sent or handed back, and «Gå tilbake» shows a clean form.
  *   (k2)  /selger?agent=<not taken over>: «Dette er min butikk» before the
  *         registration hero and «Allerede registrert?» in the HTML; «Siri» is
  *         not on the page (AC3).
@@ -619,6 +621,7 @@ export async function runRfbClaimKravflytTests(opts: { log?: boolean } = {}): Pr
       const UI2 = "c1a1c1a1-0000-4000-8000-000000000002";
       const UI3 = "c1a1c1a1-0000-4000-8000-000000000003";
       const UI4 = "c1a1c1a1-0000-4000-8000-000000000004";
+      const UI5 = "c1a1c1a1-0000-4000-8000-000000000005";
       // ── AC2: kept, restored in a new tab for the same store, cleared after verify ──
       agent(UI1, "post@ui1.example.test");
       infoFor[UI1] = { name: "Gård ui1" };
@@ -711,6 +714,44 @@ export async function runRfbClaimKravflytTests(opts: { log?: boolean } = {}): Pr
       const strangerAlert = stranger.page.el("claimAlert").innerHTML;
       ok(strangerAlert.startsWith('<div class="alert alert-error">Det er alt sendt en kode til gårdens e-post.') && strangerAlert.includes("feil eller utdatert"),
         "ui: the rule-4 answer in the claim form is still shown after the 5-second timers have run");
+
+      // ── … but not once a code is handed back, nor after «Gå tilbake» ──
+      // The owner first typed another e-mail (rule 4 above), then retypes the
+      // address the code was asked for: the code step opens. The rule-4 text
+      // was persistent and stayed in the hidden form, so «Gå tilbake» showed
+      // it again above the form.
+      const strangerCallsBefore = calls.length;
+      stranger.page.el("claimEmail").value = "ola@ui4.example.test";
+      stranger.page.el("btnRequestClaim").click();
+      await settle();
+      eq([stranger.codeStepShown(), stranger.page.context.claimId, calls.length - strangerCallsBefore], [true, id4, 1],
+        "ui-back: setup — the original e-mail on the same page → the code step for the same claim");
+      eq(stranger.page.el("claimAlert").innerHTML, "", "ui-back: the code handed back clears the rule-4 answer from the claim form");
+      stranger.page.el("btnClaimBack").click();
+      eq([stranger.formOnly(), stranger.page.el("claimAlert").innerHTML, stranger.page.el("verifyAlert").innerHTML], [true, "", ""],
+        "ui-back: «Gå tilbake» shows the form without the old rule-4 text (and without the code step's message)");
+      // The back handler clears the form's alert on its own too (whatever put it there).
+      stranger.page.el("btnRequestClaim").click();
+      await settle();
+      eq(stranger.codeStepShown(), true, "ui-back: setup — the code step again");
+      stranger.page.el("claimAlert").innerHTML = alertBox("error", "gammel melding");
+      stranger.page.el("btnClaimBack").click();
+      eq([stranger.formOnly(), stranger.page.el("claimAlert").innerHTML], [true, ""], "ui-back: «Gå tilbake» empties claimAlert itself");
+      // A fresh code (not only one handed back) clears it as well.
+      agent(UI5, "post@ui5.example.test");
+      infoFor[UI5] = { name: "Gård ui5" };
+      const fresh = open(`?agent=${UI5}`, storage());
+      await settle();
+      fresh.page.context.startClaimFlow(UI5, "Gård ui5");
+      fresh.page.el("claimName").value = "";
+      fresh.page.el("btnRequestClaim").click();
+      await settle();
+      ok(fresh.page.el("claimAlert").innerHTML.startsWith('<div class="alert alert-error">'), "ui-back: setup — a missing name leaves an error on the form");
+      await requestCode(fresh, UI5, "ola@ui5.example.test");
+      eq([fresh.codeStepShown(), claimsOf(UI5).filter((c) => c.status === "code_sent").length, fresh.page.el("claimAlert").innerHTML], [true, 1, ""],
+        "ui-back: a code sent clears the form's error");
+      fresh.page.el("btnClaimBack").click();
+      eq([fresh.formOnly(), fresh.page.el("claimAlert").innerHTML], [true, ""], "ui-back: … and «Gå tilbake» shows a clean form");
 
       // ── «Send koden på nytt» on the page: disabled until it opens (10 min after the send) ──
       eq(phone.page.el("btnResendClaimCode").disabled, true, "ui: «Send koden på nytt» is disabled until 10 minutes after the first send");

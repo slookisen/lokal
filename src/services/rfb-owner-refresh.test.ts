@@ -355,8 +355,8 @@ export async function runRfbOwnerRefreshTests(opts: { log?: boolean } = {}): Pro
       db.prepare("INSERT INTO magic_links (id, email, token, agent_id, used, created_at, expires_at) VALUES ('ml-w', 'post@w-fill.example.no', 'tok-w-fill', 'w-fill', 1, ?, ?)")
         .run(new Date().toISOString(), new Date(Date.now() + 86_400_000).toISOString());
       const feed = await invoke(findRouteHandler(portalMod.default, "/api/agents/:agentId/my-audit", "get"), makeReq({ params: { agentId: "w-fill" }, token: "tok-w-fill", query: { limit: "20" } }));
-      assertEq([feed.status, (feed.body?.audits ?? []).filter((a: any) => a.changed_by === "system").map((a: any) => a.field_name).sort()], [200, ["about", "categories", "description"]],
-        "w1 (AC5): GET /api/agents/:id/my-audit shows the owner the three rows");
+      assertEq([feed.status, (feed.body?.audits ?? []).filter((a: any) => a.who === "Automatisk fra nettsiden din").map((a: any) => a.field_name).sort()], [200, ["about", "categories", "description"]],
+        "w1 (AC5): GET /api/agents/:id/my-audit shows the owner the three rows, «Automatisk fra nettsiden din» (dev-request 2026-11-02-rfb-endringslogg-lettlest)");
 
       // w2 — owner-saved about: not touched, not even the empty description beside it.
       seed("w-own", { owned: true, description: "", categories: "[]", k: { about: "Dette skrev eieren selv.", curated_fields: JSON.stringify({ about: { by: "owner", locked_at: "2026-10-30T00:00:00.000Z" } }) } });

@@ -431,6 +431,9 @@ import {
   selectExperiencesForPriceFreshnessCheck,
   resolvePriceProvenanceUrl,
   type PriceFreshnessTarget,
+  // Stamp name_collision at first harvest in bulk-load (additive; the
+  // recheck-backfill sweep keeps stamping already-present rows).
+  flagNameCollision,
 } from "../services/experience-store";
 // dev-request 2026-08-17-forsyningskjede-samarbeid-og-kvalitetsoppdatering,
 // Skive 3 ("Kvalitetsstyrt oppdatering av ikke-tomme felt — erstatter
@@ -2109,13 +2112,32 @@ const ADMISSION_VERDICT_STAMP_MAX_CHARS = 500;
 
 type AdmissionOutcome = { status: "match" | "mismatch" | "unresolved"; reason: string };
 
+// dev-request 2026-10-31-opplevagent-admisjonsgate-script-json-stripping,
+// slice 1 (diagnostics only): for every row whose evidence page was fetched,
+// record how much text the judge saw (visibleTextOf) vs how much the page
+// ships as script-embedded string literals (gardssalgEmbeddedPageText).
+// Evidence only — the judge input is unchanged.
+const ADMISSION_DIAGNOSTIC_SAMPLE_CHARS = 300;
+type AdmissionDiagnostic = {
+  evidence_url: string;
+  visible_chars: number;
+  embedded_chars: number;
+  script_blocks: number;
+  visible_sample: string;
+  embedded_sample: string;
+  verdict: AdmissionOutcome["status"];
+};
+
 /**
  * Run one NOT-YET-INSERTED bulk-load row through the admission gate: fetch
  * its own evidence_url and ask the fail-closed judge whether the candidate's
  * composed content (title/category/price) is substantiated by that page.
  * Never throws — every failure path resolves to `unresolved` (fail-closed).
  */
-async function judgeBulkLoadCandidate(r: BulkRow, evidenceUrl: string): Promise<AdmissionOutcome> {
+async function judgeBulkLoadCandidate(
+  r: BulkRow,
+  evidenceUrl: string,
+): Promise<AdmissionOutcome & { diagnostic?: AdmissionDiagnostic }> {
   const judgeRow: HoldoutExperienceRow = {
     // Synthetic id — the row does not exist yet; the judge only echoes this
     // into nothing (its prompt uses title/description/category/price).
@@ -2135,11 +2157,28 @@ async function judgeBulkLoadCandidate(r: BulkRow, evidenceUrl: string): Promise<
       reason: `henting av evidensside feilet: ${fetchResult.reason} (${fetchResult.persistence})`,
     };
   }
-  const judged = await judgeExperienceContentMatch(judgeRow, visibleTextOf(fetchResult.html));
-  if (!judged.ok) return { status: "unresolved", reason: judged.reasoning };
-  return judged.verdict === "MATCH"
-    ? { status: "match", reason: judged.reasoning }
-    : { status: "mismatch", reason: judged.reasoning };
+  const visibleText = visibleTextOf(fetchResult.html);
+  const judged = await judgeExperienceContentMatch(judgeRow, visibleText);
+  const outcome: AdmissionOutcome = !judged.ok
+    ? { status: "unresolved", reason: judged.reasoning }
+    : judged.verdict === "MATCH"
+      ? { status: "match", reason: judged.reasoning }
+      : { status: "mismatch", reason: judged.reasoning };
+  const embeddedText = gardssalgEmbeddedPageText(fetchResult.html);
+  const diagnostic: AdmissionDiagnostic = {
+    evidence_url: evidenceUrl,
+    visible_chars: visibleText.length,
+    embedded_chars: embeddedText.length,
+    script_blocks: (fetchResult.html.match(/<script\b/gi) || []).length,
+    visible_sample: visibleText.slice(0, ADMISSION_DIAGNOSTIC_SAMPLE_CHARS),
+    embedded_sample: embeddedText.slice(0, ADMISSION_DIAGNOSTIC_SAMPLE_CHARS),
+    verdict: outcome.status,
+  };
+  console.log(
+    `[opplevelser] admission-gate diagnostic url=${evidenceUrl} verdict=${outcome.status} ` +
+      `visible_chars=${diagnostic.visible_chars} embedded_chars=${diagnostic.embedded_chars} script_blocks=${diagnostic.script_blocks}`,
+  );
+  return { ...outcome, diagnostic };
 }
 
 router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response) => {
@@ -2217,6 +2256,12 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
   // follows the same convention.
   let rejectedBlocklisted = 0;
   const rejectedBlocklistedProviders: Array<{ provider_name: string; matched_by?: string; matched_value?: string }> = [];
+  // Providers whose Brreg verdict carried name_collision:true (>=2 Brreg
+  // entities share the name, kommune didn't disambiguate) — stamped via
+  // flagNameCollision() at first harvest in apply mode, counted only in
+  // dry-run. Never cleared here.
+  let flaggedNameCollision = 0;
+  const flaggedNameCollisionProviders: string[] = [];
 
   // Admission-gate tallies (see the block comment above ADMISSION_GATE_MAX_
   // JUDGED). `judged` = rows the gate actually evaluated (fetch + judge
@@ -2231,6 +2276,8 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
     verdict: "match" | "mismatch" | "unresolved";
     reason: string;
   }> = [];
+  // Bounded by ADMISSION_GATE_MAX_JUDGED (one entry per successful fetch).
+  const admissionGateDiagnostics: AdmissionDiagnostic[] = [];
 
   // ── 2–3. Classify + (conditionally) insert, one provider at a time. ─
   for (let i = 0; i < providerNames.length; i++) {
@@ -2291,6 +2338,10 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
           }
         }
         providersInserted += 1;
+        if (verdict.name_collision === true) {
+          flaggedNameCollision++;
+          flaggedNameCollisionProviders.push(name);
+        }
         continue;
       }
 
@@ -2352,6 +2403,14 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
           setBrregVerification(providerId, (verdict.brreg_active ?? 0) as 0 | 1, verdict.org_nr ?? undefined);
         }
         providersInserted += 1;
+      }
+
+      // Stamp name_collision for both the existing and the freshly created
+      // provider (set-only; never cleared here).
+      if (verdict.name_collision === true) {
+        flagNameCollision(providerId);
+        flaggedNameCollision++;
+        flaggedNameCollisionProviders.push(name);
       }
 
       // ── insert this provider's experiences (idempotent by title). ───
@@ -2441,7 +2500,9 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
             admissionGate.capped++;
           } else {
             admissionGate.judged++;
-            admission = await judgeBulkLoadCandidate(r, evidenceUrl);
+            const { diagnostic, ...judgedOutcome } = await judgeBulkLoadCandidate(r, evidenceUrl);
+            admission = judgedOutcome;
+            if (diagnostic) admissionGateDiagnostics.push(diagnostic);
             admissionGate[admission.status]++;
           }
           admissionGateResults.push({
@@ -2528,6 +2589,8 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
     excluded_inactive: excludedInactive,
     rejected_blocklisted: rejectedBlocklisted,
     rejected_blocklisted_providers: rejectedBlocklistedProviders,
+    flagged_name_collision: flaggedNameCollision,
+    flagged_name_collision_providers: flaggedNameCollisionProviders,
     // Admission-gate report (faithfulness-inflow slice). Dry-run spends zero
     // fetch/judge budget by design, so it can only announce that the gate
     // WOULD run on apply — it cannot pre-compute verdicts without paying the
@@ -2537,7 +2600,7 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
           dry_run: true,
           note: "admission gate kjøres kun i apply-modus: hver NY rad med evidence_url dømmes mot sin egen evidensside før den slippes inn som verified",
         }
-      : { ...admissionGate, results: admissionGateResults },
+      : { ...admissionGate, results: admissionGateResults, diagnostics: admissionGateDiagnostics },
     ...(cappedProviders > 0 ? { capped_providers: cappedProviders } : {}),
   });
 });
@@ -10727,6 +10790,88 @@ router.post("/admin/gardssalg-claim-revoke", requireAdmin, (req: Request, res: R
   txn();
 
   res.json({ success: true, dry_run: false, provider_id: providerId, revoked, claimed_at_reset: claimedAtReset });
+});
+
+// ─── GET /api/opplevelser/admin/gardssalg-content-audit (admin, read-only) ──
+//
+// Lists gardssalg_content_audit rows for ONE producer, optionally after a
+// point in time, so an operator can see "which fields were changed by which
+// source after time T" before deciding on a manual rollback. No writes.
+//
+// Query: provider_id (required, ≤200 chars), since (optional ISO 8601 date or
+// datetime; a value without a zone designator is read as UTC), field
+// (optional exact field_name), limit (optional, default 200, clamped 1–1000).
+//
+// changed_at is stored both as SQLite `YYYY-MM-DD HH:MM:SS` (column default)
+// and as ISO `...T...Z` by some writers, so filtering and ordering go through
+// SQLite datetime() (second precision) instead of comparing raw strings.
+function normalizeAuditSince(raw: string): { iso: string; sql: string } | null {
+  let s = raw.trim();
+  if (!s) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    s = `${s}T00:00:00Z`;
+  } else {
+    s = s.replace(/^(\d{4}-\d{2}-\d{2}) (\d)/, "$1T$2");
+    if (/T\d/.test(s) && !/(Z|[+-]\d{2}:?\d{2})$/i.test(s)) s = `${s}Z`;
+  }
+  const ms = Date.parse(s);
+  if (Number.isNaN(ms)) return null;
+  const iso = new Date(ms).toISOString();
+  return { iso, sql: iso.slice(0, 19).replace("T", " ") };
+}
+
+router.get("/admin/gardssalg-content-audit", requireAdmin, (req: Request, res: Response) => {
+  const rawProvider = req.query.provider_id;
+  const providerId = typeof rawProvider === "string" ? rawProvider.trim() : "";
+  if (!providerId || providerId.length > 200) {
+    return res.status(400).json({ error: "provider_id_required" });
+  }
+
+  let since: { iso: string; sql: string } | null = null;
+  const rawSince = req.query.since;
+  if (rawSince !== undefined && rawSince !== "") {
+    since = typeof rawSince === "string" ? normalizeAuditSince(rawSince) : null;
+    if (!since) return res.status(400).json({ error: "invalid_since" });
+  }
+
+  const rawField = req.query.field;
+  const field = typeof rawField === "string" && rawField.trim() ? rawField.trim() : null;
+
+  const parsedLimit = typeof req.query.limit === "string" ? Number.parseInt(req.query.limit, 10) : NaN;
+  const limit = Number.isFinite(parsedLimit) ? Math.min(1000, Math.max(1, parsedLimit)) : 200;
+
+  try {
+    const expDb = getExpDb("experiences");
+    const where: string[] = ["provider_id = @provider_id"];
+    const params: Record<string, string | number> = { provider_id: providerId, fetch_limit: limit + 1 };
+    if (since) { where.push("datetime(changed_at) >= datetime(@since)"); params.since = since.sql; }
+    if (field) { where.push("field_name = @field"); params.field = field; }
+    const fetched = expDb.prepare(
+      `SELECT id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at, notes
+         FROM gardssalg_content_audit
+        WHERE ${where.join(" AND ")}
+        ORDER BY datetime(changed_at) ASC, changed_at ASC, rowid ASC
+        LIMIT @fetch_limit`,
+    ).all(params) as Array<{
+      id: string; field_name: string; old_value: string | null; new_value: string | null;
+      source_url: string | null; batch_id: string | null; changed_by: string; changed_at: string; notes: string | null;
+    }>;
+    const truncated = fetched.length > limit;
+    const rows = truncated ? fetched.slice(0, limit) : fetched;
+    const byChangedBy: Record<string, number> = {};
+    for (const r of rows) byChangedBy[r.changed_by] = (byChangedBy[r.changed_by] ?? 0) + 1;
+    return res.json({
+      provider_id: providerId,
+      since: since ? since.iso : null,
+      count: rows.length,
+      truncated,
+      by_changed_by: byChangedBy,
+      rows,
+    });
+  } catch (err) {
+    console.error("[opplevelser] admin/gardssalg-content-audit failed", err);
+    return res.status(500).json({ error: "internal_error" });
+  }
 });
 
 // ─── POST /api/opplevelser/admin/gardssalg-owner-email-confirm (admin) ─────
