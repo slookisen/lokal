@@ -23,8 +23,9 @@
 //           org_nr:NNNNNNNNN in agents.tags         (tag_org_nr)
 //        b. website / e-mail domain via finnoko     (finnoko_domain)
 //        c. name + postal code, token overlap ≥ 0.67 after dropping generic
-//           words and place names; our name is also tried without a
-//           « — tagline» (S1d)                       (name_postal)
+//           words and place names                   (name_postal)
+//           (S1d: with no such hit, our name without its « — tagline» is
+//           tried too — a review candidate only, never a status)
 //        d. street + house no. + postal code        (street_postal), or a
 //           differing postal code with the same city (street_city) — only
 //           when no other active producer of ours has that street + house
@@ -206,7 +207,8 @@ export function coreTokens(name: string, places: readonly (string | null)[]): st
  * Our profile name without a spaced-dash tagline: «Moe Gård — Bringebær fra
  * Moe» → «Moe Gård», «Lindheim Gård - Testvik» → «Lindheim Gård». The
  * register has the business name only, so the tagline's extra tokens pulled
- * the name overlap under NAME_TOKEN_OVERLAP_MIN. Only a dash with spaces on
+ * the name overlap under NAME_TOKEN_OVERLAP_MIN. A hit on it is a review
+ * candidate only (matchProducer). Only a dash with spaces on
  * both sides splits («Hansen-Gård» stays whole); null when there is no such
  * dash or nothing is left before it.
  */
@@ -487,22 +489,32 @@ export function matchProducer(
   if (p.city) for (const e of ix.byCity.get(p.city) ?? []) near.add(e);
 
   // c. name + postal code
-  const nameHits: Array<{ e: Entity; score: number; postal: boolean }> = [];
-  const ourNames = [p.name, nameWithoutTagline(p.name)].filter((n): n is string => !!n);
-  for (const e of near) {
-    const at = entityAt(e, p);
-    let best = 0;
-    for (const n of e.names) {
-      const places = [p.city, ...e.cities];
-      for (const ours of ourNames) best = Math.max(best, tokenOverlap(coreTokens(ours, places), coreTokens(n, places)));
+  const nameHitsFor = (ours: string): Array<{ e: Entity; score: number; postal: boolean }> => {
+    const hits: Array<{ e: Entity; score: number; postal: boolean }> = [];
+    for (const e of near) {
+      const at = entityAt(e, p);
+      let best = 0;
+      for (const n of e.names) {
+        const places = [p.city, ...e.cities];
+        best = Math.max(best, tokenOverlap(coreTokens(ours, places), coreTokens(n, places)));
+      }
+      if (best >= NAME_TOKEN_OVERLAP_MIN) hits.push({ e, score: best, postal: at.postal });
     }
-    if (best >= NAME_TOKEN_OVERLAP_MIN) nameHits.push({ e, score: best, postal: at.postal });
-  }
+    return hits;
+  };
+  const nameHits = nameHitsFor(p.name);
   const strongName = nameHits.filter((h) => h.postal);
   if (strongName.length === 1 && ok(strongName[0].e)) {
     return { sikker: { entity: strongName[0].e, method: "name_postal" }, review: [] };
   }
   for (const h of nameHits) addReview(h.e, "name", h.score, h.postal ? "name_postal_ambiguous" : "name_city");
+  // S1d: our name without its « — tagline», only when the full name has no
+  // name + postal hit — and only ever a review candidate, never a status
+  // (the stripped name is shorter, so a hit on it is weaker evidence).
+  const stripped = strongName.length === 0 ? nameWithoutTagline(p.name) : null;
+  if (stripped) {
+    for (const h of nameHitsFor(stripped)) addReview(h.e, "name", h.score, h.postal ? "name_tagline_postal" : "name_tagline_city");
+  }
 
   // d. street + house no. (+ postal code, or the same city)
   if (p.street) {

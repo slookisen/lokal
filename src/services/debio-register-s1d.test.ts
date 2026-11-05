@@ -17,8 +17,11 @@
  *   next sync the link is kept (org.nr. entity and sid-only entity), no new
  *             pending row for the agent.
  *   privacy   no Debio person name / street in any table or response.
- *   tagline   «Moe Gård — Bringebær fra Moe» matches the register's «Moe
- *             Gård» on name + postal code (root cause, item 3).
+ *   tagline   «Moe Gård — Bringebær fra Moe» vs the register's «Moe Gård»:
+ *             a pending review candidate, never a status (root cause, item
+ *             3); the full-name path is unchanged («Lie Gård — Lie Honning»
+ *             keeps its match), a stripped-only hit never badges («Berg -
+ *             Andersen bakeri og kafe» vs «Berg»).
  *
  * In-memory DB on the production schema, injected fake fetch (no network).
  * Exported runDebioRegisterS1dTests({log}) -> TestSummary; wired into
@@ -67,6 +70,11 @@ function registerRows(): Raw[] {
     { name: "Andrevalg Zqv", clientCode: "931000007", certSid: 6007, postalCode: "3107", city: "Byttby", statusCodes: [509], validTo: FUTURE, mainProductGroups: ["LBP"] },
     // root cause: register name «Moe Gård», same postal code as our profile
     { name: "Moe Gård", clientCode: "931000008", certSid: 6008, postalCode: "3108", city: "Bærby", statusCodes: [509], validTo: FUTURE, mainProductGroups: ["LBP"] },
+    // review B1 guards: «Lie Honning» (okologisk) + «Lie Gård» (karens) at 3108;
+    // a separate «Berg» (okologisk) at 3110
+    { name: "Lie Honning", clientCode: "931000009", certSid: 6009, postalCode: "3108", city: "Bærby", statusCodes: [509], validTo: FUTURE, mainProductGroups: ["LBP"] },
+    { name: "Lie Gård", clientCode: "931000010", certSid: 6010, postalCode: "3108", city: "Bærby", statusCodes: [503], validTo: FUTURE, mainProductGroups: ["LBP"] },
+    { name: "Berg", clientCode: "931000011", certSid: 6011, postalCode: "3110", city: "Bergby", statusCodes: [509], validTo: FUTURE, mainProductGroups: ["FIO"] },
   ];
 }
 
@@ -95,6 +103,8 @@ const AGENTS: Seed[] = [
   { id: "m-rejected", name: "Avvistun Grønt", city: "Annenby" },
   { id: "m-inactive", name: "Sovetun Grønt", city: "Annenby", active: 0 },
   { id: "m-moe", name: "Moe Gård — Bringebær fra Moe", city: "Bærby", postal: "3108" },
+  { id: "m-lie", name: "Lie Gård — Lie Honning", city: "Bærby", postal: "3108" },
+  { id: "m-berg", name: "Berg - Andersen bakeri og kafe", city: "Bergby", postal: "3110" },
 ];
 
 function seed(db: Database.Database, a: Seed): void {
@@ -288,8 +298,17 @@ export async function runDebioRegisterS1dTests(opts: { log?: boolean } = {}): Pr
     assertEq([r2.accepted, state("m-oko").debio_status, state("m-oko").debio_verified], [true, "ingen", 0], "sync-gone: entry gone from the register → reset like any approval");
 
     // ── root cause: tagline in our profile name ─────────────────────────────
-    assertEq([state("m-moe").debio_status, state("m-moe").debio_match_method, state("m-moe").debio_sid], ["okologisk", "name_postal", "6008"],
-      "rootcause-1: «Moe Gård — Bringebær fra Moe» matches register «Moe Gård» on name + postal code");
+    const pending = (id: string) => (db.prepare("SELECT entity_key, match_method, reasons FROM debio_match_review WHERE agent_id = ? AND state = 'pending' ORDER BY id").all(id) as any[])
+      .map((r) => [r.entity_key, r.match_method, JSON.parse(r.reasons)]);
+    assertEq([state("m-moe").debio_status, state("m-moe").debio_verified, state("m-moe").debio_match_method], ["ingen", 0, null],
+      "rootcause-1: «Moe Gård — Bringebær fra Moe» vs register «Moe Gård» — no status from a tagline-stripped hit");
+    assertEq(pending("m-moe"), [["931000008", "name", ["name_tagline_postal"]]], "rootcause-2: … but a pending review candidate (name_tagline_postal)");
+    assertEq([state("m-berg").debio_status, state("m-berg").debio_verified, state("m-berg").debio_match_method], ["ingen", 0, null],
+      "b1-berg-1: «Berg - Andersen bakeri og kafe» vs a separate register «Berg» at the same postal code → no badge");
+    assertEq(pending("m-berg"), [["931000011", "name", ["name_tagline_postal"]]], "b1-berg-2: stripped-only hit is a pending review candidate");
+    assertEq([state("m-lie").debio_status, state("m-lie").debio_verified, state("m-lie").debio_match_method, state("m-lie").debio_sid], ["okologisk", 1, "name_postal", "6009"],
+      "b1-lie-1: «Lie Gård — Lie Honning» keeps the full-name match to «Lie Honning» (as on main)");
+    assertEq(pending("m-lie"), [], "b1-lie-2: the stripped name «Lie Gård» does not add a hit when the full name has one");
 
     // ── privacy ─────────────────────────────────────────────────────────────
     const leaks: string[] = [];
