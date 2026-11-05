@@ -575,7 +575,7 @@ function initSchema(db: Database.Database): void {
       claimant_phone TEXT,
       verification_method TEXT DEFAULT 'email',  -- 'email' | 'phone' | 'manual'
       verification_code TEXT,                     -- 6-digit code sent to verify
-      status TEXT DEFAULT 'pending' CHECK(status IN ('pending','code_sent','verified','rejected','expired','pending_review','superseded')),
+      status TEXT DEFAULT 'pending' CHECK(status IN ('pending','code_sent','verified','rejected','expired','pending_review','superseded','revoked')),
       claim_token TEXT,                           -- Token for managing agent after claim
       claim_token_expires_at TEXT,                -- Token expires 30 days after issue
       notes TEXT,                                 -- Admin notes
@@ -589,7 +589,10 @@ function initSchema(db: Database.Database): void {
       claimant_email_typed TEXT,                  -- Audit: the address the claimant typed, kept when claimant_email becomes the owner's address
       recommendation TEXT,                        -- Claim domain rule (2026-10-27): 'domain_match_independent' | 'domain_code_sent' | 'free_mail_needs_extra' | 'has_owner' | 'needs_review' | 'shared_address' (2026-10-29: the code's address is the known e-mail of >1 RFB profile)
       claim_assessment TEXT,                      -- Owner-claim auto-assessment (2026-10-30, slice A, record-only): JSON from claim-assessment.ts; NULL = not assessed
-      claim_assessment_at TEXT                    -- When claim_assessment was written (ISO-8601)
+      claim_assessment_at TEXT,                   -- When claim_assessment was written (ISO-8601)
+      pre_grant_state TEXT,                       -- Owner-claim revoke (2026-10-30, slice C1): JSON snapshot of agents.is_verified/claimed_at/claimed_via + agent_knowledge.data_source taken just before grantClaimOwnership; NULL = granted before C1
+      revoked_at TEXT,                            -- When an admin revoked this verified claim (POST /admin/agents/claim-revoke), ISO-8601
+      revoke_note TEXT                            -- The admin's note on the revoke
     );
 
     -- ════════════════════════════════════════════════════════════
@@ -1603,6 +1606,57 @@ function initSchema(db: Database.Database): void {
     }
   } catch (e) {
     console.warn("[init][agent-claims-11a] status-CHECK widening skipped:", e instanceof Error ? e.message : String(e));
+  }
+
+  // dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk,
+  // slice C1 (admin claim-revoke): the pre-grant snapshot that a revoke
+  // restores the profile from, and the revoke stamp. Additive and idempotent;
+  // existing rows keep NULL (a revoke of such a claim restores only partly,
+  // knowledge-service.ts revokeClaimOwnership). A rollback leaves them in place.
+  for (const col of ["pre_grant_state TEXT", "revoked_at TEXT", "revoke_note TEXT"]) {
+    try {
+      db.exec(`ALTER TABLE agent_claims ADD COLUMN ${col}`);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
+  // Slice C1: the status 'revoked'. Same rebuild as the 11=A widening above
+  // (stored CREATE text with only the CHECK swapped, rows copied unchanged,
+  // indexes recreated). Runs after it, so it only ever sees the 11=A CHECK. If
+  // the stored text does not hold that exact CHECK, nothing is rebuilt and a
+  // revoke fails at write time (its transaction rolls back), never silently.
+  try {
+    const OLD_CLAIM_STATUS_CHECK = "CHECK(status IN ('pending','code_sent','verified','rejected','expired','pending_review','superseded'))";
+    const NEW_CLAIM_STATUS_CHECK = "CHECK(status IN ('pending','code_sent','verified','rejected','expired','pending_review','superseded','revoked'))";
+    const claimsRow = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_claims'"
+    ).get() as { sql: string } | undefined;
+    if (claimsRow && !/'revoked'/.test(claimsRow.sql)) {
+      const createNew = claimsRow.sql.replace(/^CREATE TABLE\s+"?agent_claims"?/, "CREATE TABLE agent_claims__revoke_new");
+      if (createNew === claimsRow.sql || !createNew.includes(OLD_CLAIM_STATUS_CHECK)) {
+        console.warn("[init][agent-claims-revoke] status CHECK not in the expected form — rebuild skipped");
+      } else {
+        const indexSql = (db.prepare(
+          "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='agent_claims' AND sql IS NOT NULL"
+        ).all() as Array<{ sql: string }>).map((r) => r.sql);
+        const fkWasOn = db.pragma("foreign_keys", { simple: true }) === 1;
+        db.pragma("foreign_keys = OFF");
+        try {
+          db.transaction(() => {
+            db.exec(createNew.replace(OLD_CLAIM_STATUS_CHECK, NEW_CLAIM_STATUS_CHECK));
+            db.exec(`INSERT INTO agent_claims__revoke_new SELECT * FROM agent_claims`);
+            db.exec(`DROP TABLE agent_claims`);
+            db.exec(`ALTER TABLE agent_claims__revoke_new RENAME TO agent_claims`);
+            for (const sql of indexSql) db.exec(sql);
+          })();
+          console.log("[init][agent-claims-revoke] agent_claims.status CHECK widened to include 'revoked'");
+        } finally {
+          if (fkWasOn) db.pragma("foreign_keys = ON");
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("[init][agent-claims-revoke] status-CHECK widening skipped:", e instanceof Error ? e.message : String(e));
   }
 
   // ─── Tier 2: Add seasonality, delivery_radius, min_order_value ──

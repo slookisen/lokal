@@ -50195,6 +50195,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice
+// C1: POST /admin/agents/claim-revoke puts the profile back from the pre-grant
+// snapshot. Pins getDb() to its own in-memory DB, runs an in-process server,
+// sets ADMIN_KEY (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-30-rfb-eierkrav C1: admin claim-revoke restores the profile ──");
+  try {
+    const { runRfbClaimRevokeTests } = require("../src/routes/rfb-claim-revoke.test") as
+      typeof import("../src/routes/rfb-claim-revoke.test");
+    const rv = await runRfbClaimRevokeTests({ log: false });
+    passed += rv.passed;
+    failed += rv.failed;
+    for (const f of rv.failures) failures.push("rfb-claim-revoke: " + f);
+    console.log(`  rfb-claim-revoke: ${rv.passed} passed, ${rv.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-claim-revoke: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-rfb-utsending-v4, skive 1: /selger?agent=<id> viser
 // bare den ene butikken når produsenten ikke er tatt over.
 runSerial(async () => {
