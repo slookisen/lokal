@@ -31,7 +31,8 @@
 // selector SQL in routes/marketplace.ts POST /admin/homepage-provenance-batch
 // 1:1): status IN ('data_insufficient','review_required','pending_verify')
 // → homepage present (COALESCE(k.website, a.url)) → about non-empty →
-// field_provenance lacks a "homepage" source → not parked
+// field_provenance has no homepage source on address/phone/email
+// (hasHomepageContactProvenance, services/homepage-contact-provenance.ts) → not parked
 // (homepage_unreachable_since < 30d ago) → not in no-yield/wrong-entity
 // backoff (streak >= 3 AND last attempt inside NO_YIELD_BACKOFF_DAYS).
 //
@@ -43,6 +44,7 @@
 import { Router, Request, Response } from "express";
 import { getDb, isContentQualified, retailShopPoolBlockers } from "../database/init";
 import { isBlocked } from "../services/blocklist-service";
+import { hasHomepageContactProvenance } from "../services/homepage-contact-provenance";
 import { buildCrossPlatformIdentity } from "../services/cross-platform-match";
 import { getRecentlyEmailedAddresses, getCrossPlatformSuppressors, getOpenExperiencesDb } from "../services/outreach-suppression-signals";
 
@@ -495,7 +497,11 @@ router.get("/", (req: Request, res: Response) => {
     const about = (row.about ?? "").trim();
     const email = (row.k_email ?? "").trim();
     const provCounts = provenanceSourceCounts(row.field_provenance);
-    const provHasHomepage = (row.field_provenance ?? "").includes('"homepage"');
+    // Skive C1 (dev-request 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-
+    // forverring): same rule as the batch selector — only a homepage source
+    // on address/phone/email blocks; a homepage source on website/about does
+    // not. Blocker/signal names are kept for report stability.
+    const provHasHomepage = hasHomepageContactProvenance(row.field_provenance);
     const noYield = row.no_yield_streak ?? 0;
     const wrongEntity = row.wrong_entity_streak ?? 0;
     const parkedNow = withinDays(row.homepage_unreachable_since, 30, nowMs);
