@@ -48,8 +48,14 @@ export const corsOptions = {
 // 'self' 'unsafe-inline' and frame-src 'none' the browser blocked both, no
 // token was ever produced, and /api/contact (fail-closed) answered 403
 // captcha_failed to every visitor. Cloudflare's CSP reference for Turnstile
-// lists exactly this origin in script-src and frame-src. connect-src is only
-// needed for pre-clearance, and then only 'self', so it stays as it was.
+// lists exactly this origin in script-src and frame-src.
+//
+// connect-src carries the same origin too: when a challenge fails, the
+// Turnstile script reports the error with a fetch to
+// https://challenges.cloudflare.com/cdn-cgi/challenge-platform/…, and prod's
+// console showed connect-src 'self' https://rettfrabonden.com blocking it.
+// Same origin, same pages and hosts as script-src / frame-src (one policy for
+// every host); nothing else in connect-src changes.
 const TURNSTILE_ORIGIN = "https://challenges.cloudflare.com";
 
 export const securityHeaders = helmet({
@@ -60,7 +66,7 @@ export const securityHeaders = helmet({
       styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
       fontSrc: ["'self'", "https://fonts.gstatic.com"],
       imgSrc: ["'self'", "data:", "https:"],
-      connectSrc: ["'self'", "https://rettfrabonden.com"],
+      connectSrc: ["'self'", "https://rettfrabonden.com", TURNSTILE_ORIGIN],  // Turnstile: its error report on a failed challenge
       frameSrc: [TURNSTILE_ORIGIN],  // the Turnstile widget iframe; no other frame is allowed
       objectSrc: ["'none'"],
     },

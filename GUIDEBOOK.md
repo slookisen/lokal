@@ -981,7 +981,7 @@ googleRating, google_rating, googleReviewCount, google_review_count,
 tripadvisorRating, tripadvisor_rating, views_count, ai_conversations_count
 ```
 
-Every write goes through `agent_knowledge_audit` with `(agent_id, field, old_value, new_value, changed_by, changed_at)`. Daniel's admin reader can replay the full edit history of any producer; the owner's `my-audit` returns only their own rows.
+Every write goes through `agent_knowledge_audit` with `(agent_id, field, old_value, new_value, changed_by, changed_at)`. Daniel's admin reader can replay the full edit history of any producer; the owner's `my-audit` returns only their own rows, as the portal's «Endringslogg» shows them (`src/routes/owner-audit-log.ts`, dev-request 2026-11-02-rfb-endringslogg-lettlest): only fields in `OWNER_AUDIT_FIELDS` (fail closed), Norwegian names and values, «Du» / «Rett fra Bonden» / «Automatisk fra nettsiden din», no notes, no technical rows; e-mail fields without values and addresses inside other values (the forms listed at `stripEmailAddresses`) replaced by «…».
 
 **Magic-link UX (PR-8, B2 spec):**
 The email body explicitly names the agent (so a producer who manages two farms knows which one this link unlocks) and states the 7-day expiry up front:

@@ -28,6 +28,7 @@ import { containsOrganicClaim, isOrganicClaimUmbrella } from "../services/organi
 import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenFields, hidesAddress, hidesPrices, debioSwitchOffAgentIds } from "../owner-features/enforce";
 import { debioApprovalText, debioProcessText, debioRegisterSyncEnabled, finnokoSearchUrl, readDebioStatusRow } from "../services/debio-approval";
 import { publicCountsShown } from "../services/public-stats-threshold";
+import { emailRevealGuardEnabled, isCcBotUserAgent, revealEmailFor } from "../services/email-reveal-guard";
 // dev-request 2026-10-17-integrasjonstest-oppfolging, I-G: knowledge list
 // fields read by type (see "knowledge fields read by type" below).
 import { textEntries } from "../utils/text-entries";
@@ -5512,6 +5513,49 @@ function passesRoleGate(
   return true;
 }
 
+// ─── E-mail on the producer profile (dev-request
+// 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting, slice 3: S-A1 and
+// S-A3 on rettfrabonden.com /produsent/:slug) ──────────────────────────────
+// With EMAIL_REVEAL_GUARD_RFB on, the profile page gives the producer's
+// e-mail (the mailto: line on the producer and the umbrella contact card, and
+// JSON-LD `email`) only within the per-IP limit of
+// services/email-reveal-guard.ts — one RFB counter per client, which the
+// later REST/A2A/MCP slice (S-A5) shares, and a profile seen again in the
+// window is free. Over the limit the contact card shows «Vis e-post», a plain
+// link to GET /produsent/:slug/epost (no script), and the address is nowhere
+// in the HTML; JSON-LD has no `email`. CCBot (S-A3) gets neither the address
+// nor «Vis e-post», also on its first request. With the switch on the page
+// depends on the client, so it is Cache-Control: private. Switch off:
+// revealEmailFor is not called and the page and its headers are
+// byte-identical to main. Platform addresses (kontakt@…) are not producer
+// e-mail and are left alone. The guard's log line carries profile ids and
+// counts only, never an address or an IP.
+const RFB_EMAIL_REVEAL_LABEL: Readonly<Record<Lang, string>> = { no: "Vis e-post", en: "Show e-mail", sv: "Visa e-post" };
+
+/** The path of the «Vis e-post» endpoint for a producer slug (localized like the profile). */
+export function rfbEmailRevealPath(slug: string, lang: Lang = "no"): string {
+  return localizedPath(`/produsent/${encodeURIComponent(slug)}/epost`, lang);
+}
+
+/**
+ * How the profile shows the producer's e-mail to this request: null = switch
+ * off (change nothing); "show" = as today; "reveal" = «Vis e-post» without the
+ * address; "none" = nothing (CCBot, or no e-mail shown).
+ */
+function rfbProfileEmailView(req: Request, res: Response, agentId: string, email: unknown): "show" | "reveal" | "none" | null {
+  if (!emailRevealGuardEnabled("rfb")) return null;
+  res.set("Cache-Control", "private");
+  if (!email || !agentId) return "none";
+  const allowed = revealEmailFor(req, "rfb", [agentId]);
+  if (allowed !== null && allowed.has(agentId)) return "show";
+  return isCcBotUserAgent(req.get("user-agent")) ? "none" : "reveal";
+}
+
+/** The contact-card line for «Vis e-post» (same markup as the e-mail line, the link instead of the address). */
+function rfbEmailRevealItem(slug: string, lang: Lang): string {
+  return `<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.email"))}</div><div class="ct-val"><a href="${escapeHtml(rfbEmailRevealPath(slug, lang))}" rel="nofollow">${escapeHtml(RFB_EMAIL_REVEAL_LABEL[lang] || RFB_EMAIL_REVEAL_LABEL.no)}</a></div></div></div>`;
+}
+
 router.get("/produsent/:slug", (req: Request, res: Response) => {
   const lang = req.lang;
   const slug = (req.params.slug as string).toLowerCase();
@@ -5749,6 +5793,10 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     const publicCountsOn = publicCountsShown(getDb(), agent.id, `/produsent/${slugify(String(agent.name || ""))}`, ownerChoices ? ownerChoices.publicCounts : null);
     const k = withoutHiddenFields((info?.knowledge || {}) as any, ownerChoices);
     const meta = (info?.meta || {}) as any;
+    // Slice 3 (S-A1/S-A3): the e-mail this request may see. Switch off → null
+    // → k.email, exactly as before.
+    const emailView = rfbProfileEmailView(req, res, agent.id, k.email);
+    const shownEmail = emailView === null || emailView === "show" ? k.email : null;
 
     // Render-time guard: nav/boilerplate scraped text masquerading as a real
     // description must never render (dev-request 2026-07-04-rfb-datakvalitet
@@ -5980,7 +6028,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       const umbContactItems: string[] = [];
       if (k.address) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#128205;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.address"))}</div><div class="ct-val">${escapeHtml(formatAddressLine(k.address, k.postalCode, cityName))}</div></div></div>`);
       if (isDisplayablePhone(k.phone)) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#128222;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.phone"))}</div><div class="ct-val"><a href="tel:${k.phone.replace(/\s+/g, "")}">${escapeHtml(k.phone)}</a></div></div></div>`);
-      if (k.email) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.email"))}</div><div class="ct-val"><a href="mailto:${k.email}">${escapeHtml(k.email)}</a></div></div></div>`);
+      if (shownEmail) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.email"))}</div><div class="ct-val"><a href="mailto:${shownEmail}">${escapeHtml(shownEmail)}</a></div></div></div>`);
+      else if (emailView === "reveal") umbContactItems.push(rfbEmailRevealItem(slug, lang));
       if (k.website) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#127760;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.website"))}</div><div class="ct-val"><a href="${escapeHtml(addUtmParams(k.website))}" target="_blank" rel="noopener">${escapeHtml(k.website.replace(/^https?:\/\//, ""))}</a></div></div></div>`);
       // Google Maps search — search by name + (address|city), never raw coords.
       if (k.address || isDisplayablePhone(k.phone) || k.email || k.website) {
@@ -6260,7 +6309,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // is fire-and-forget and never blocks navigation, so these links keep
     // working identically with JS disabled or if the beacon call fails.
     if (isDisplayablePhone(k.phone)) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#128222;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.phone"))}</div><div class="ct-val"><a href="tel:${k.phone.replace(/\s+/g, "")}" data-track-kind="phone">${escapeHtml(k.phone)}</a></div></div></div>`);
-    if (k.email) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.email"))}</div><div class="ct-val"><a href="mailto:${k.email}" data-track-kind="email">${escapeHtml(k.email)}</a></div></div></div>`);
+    if (shownEmail) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.email"))}</div><div class="ct-val"><a href="mailto:${shownEmail}" data-track-kind="email">${escapeHtml(shownEmail)}</a></div></div></div>`);
+    else if (emailView === "reveal") contactItems.push(rfbEmailRevealItem(slug, lang));
     // Website now routes through the counting redirect (GET /ut/:agentId/website,
     // src/routes/contact-tracking.ts) instead of linking straight to
     // agent_knowledge.website. This works with JS fully disabled (it's a
@@ -6499,7 +6549,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
     // Contact
     if (isDisplayablePhone(k.phone)) jsonLd.telephone = k.phone;
-    if (k.email) jsonLd.email = k.email;
+    if (shownEmail) jsonLd.email = shownEmail;
     if (k.website) jsonLd.url = k.website;
 
     // Geo coordinates
@@ -7240,6 +7290,70 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
   } catch (err) {
     console.error(`SEO /produsent/${slug} error:`, err);
     res.status(500).send(lang === "en" ? "Internal error" : "Intern feil");
+  }
+});
+
+// «Vis e-post» (slice 3, S-A1): read-only, no DB write. Only with
+// EMAIL_REVEAL_GUARD_RFB on; off → next(), so the path answers exactly as on
+// main (the app's fall-through 404) and nothing new is exposed. On: the same
+// guard and RFB counter as the profile page. Within the limit → 200 with the
+// address; over it → 429 «prøv igjen senere» without it; CCBot → 403 without
+// it; a slug with no public profile (unknown, role/vetting/listability gate,
+// owner-paused or hidden) or no e-mail → 404. Always Cache-Control: private
+// and noindex. Three path segments, so it cannot collide with
+// /produsent/:slug; /produsent/ordre/* is mounted earlier in index.ts and
+// keeps its own routes.
+router.get("/produsent/:slug/epost", (req: Request, res: Response, next) => {
+  if (!emailRevealGuardEnabled("rfb")) { next(); return; }
+  res.set("Cache-Control", "private");
+  res.set("X-Robots-Tag", "noindex, nofollow");
+  const lang: Lang = req.lang || "no";
+  const en = lang === "en";
+  const sv = lang === "sv";
+  const slug = String(req.params.slug).toLowerCase();
+  try {
+    let agent = marketplaceRegistry.getAgentBySlugIncludingUmbrellas(slug);
+    if (agent && !passesRoleGate(agent, slug)) agent = undefined;
+    if (agent && (ownerPauseEnabled() || ownerVisibilityEnforced()) && isProfileOwnerHidden(getDb(), agent.id)) agent = undefined;
+    let email: string | null = null;
+    if (agent) {
+      const info = knowledgeService.getAgentInfo(agent.id);
+      const k = withoutHiddenFields((info?.knowledge || {}) as any, publicFieldChoices(agent.id));
+      email = typeof k.email === "string" && k.email.trim() !== "" ? k.email : null;
+    }
+    const profilePath = localizedPath("/produsent/" + encodeURIComponent(slug), lang);
+    const page = (title: string, body: string) => shell(
+      title,
+      title,
+      `<div class="sec" style="padding:48px 24px 48px;max-width:720px;margin:0 auto;"><h1 style="font-size:1.6rem;margin-bottom:16px;">${escapeHtml(title)}</h1>${body}</div>`,
+      { lang, robots: "noindex, nofollow", canonical: BASE_URL + profilePath, pathForAlternate: `/produsent/${encodeURIComponent(slug)}/epost` },
+    );
+    if (!agent || !email) {
+      const title = en ? "Not found" : sv ? "Hittades inte" : "Ikke funnet";
+      res.status(404).send(page(title, `<p><a href="${localizedPath("/sok", lang)}">${en ? "Find producers →" : sv ? "Hitta producenter →" : "Finn produsenter →"}</a></p>`));
+      return;
+    }
+    const name = String(agent.name || "");
+    const title = en ? `E-mail for ${name}` : sv ? `E-post till ${name}` : `E-post til ${name}`;
+    const back = `<p style="margin-top:20px"><a href="${escapeHtml(profilePath)}">&larr; ${en ? "Back to" : sv ? "Tillbaka till" : "Tilbake til"} ${escapeHtml(name)}</a></p>`;
+    const allowed = revealEmailFor(req, "rfb", [agent.id]);
+    if (allowed !== null && allowed.has(agent.id)) {
+      res.status(200).send(page(title, `<p style="font-size:1.05rem"><a href="mailto:${escapeHtml(email)}">${escapeHtml(email)}</a></p>${back}`));
+      return;
+    }
+    if (isCcBotUserAgent(req.get("user-agent"))) {
+      res.status(403).send(page(title, `<p>${en ? "The e-mail address is not shown to this client." : sv ? "E-postadressen visas inte för den här klienten." : "E-postadressen vises ikke for denne klienten."}</p>${back}`));
+      return;
+    }
+    res.set("Retry-After", "3600");
+    res.status(429).send(page(title, `<p>${en
+      ? "The limit for how many e-mail addresses can be shown from here has been reached. Please try again later, or contact the producer by phone or through their website."
+      : sv
+        ? "Gränsen för hur många e-postadresser som kan visas härifrån är nådd. Försök igen senare, eller kontakta producenten per telefon eller via webbplatsen."
+        : "Grensen for hvor mange e-postadresser som kan vises herfra, er nådd. Prøv igjen senere, eller kontakt produsenten på telefon eller via nettsiden."}</p>${back}`));
+  } catch (err) {
+    console.error(`SEO /produsent/${slug}/epost error:`, err);
+    res.status(500).send(en ? "Internal error" : "Intern feil");
   }
 });
 

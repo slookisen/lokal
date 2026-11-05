@@ -69,6 +69,8 @@
 import { Router, Request, Response } from "express";
 import { v4 as uuid } from "uuid";
 import { getDb } from "../database/db-factory";
+import { dentalEnrichmentWritePauseBlock } from "../services/dental-enrichment-write-pause";
+import { ENRICHMENT_WRITE_PAUSE_HTTP_STATUS } from "../services/enrichment-write-pause";
 import { fetchBrregWebsite } from "../services/brreg-client";
 import { classifyHjemmeside } from "../services/dental-hjemmeside-classifier";
 // dev-request 2026-09-02-dental-hjemmeside-hygiene-og-brreg-gjenfinning (steg
@@ -907,6 +909,16 @@ router.post("/hjemmeside-discovery-approve", (req: Request, res: Response) => {
   if (body.approvals.length > DENTAL_WD_APPROVE_MAX) {
     res.status(400).json({ error: `Too many approvals (max ${DENTAL_WD_APPROVE_MAX} per call)` });
     return;
+  }
+
+  // Enrichment write-pause fence: apply/write mode only, before the first write.
+  // Dry-run and read paths stay open.
+  if (apply) {
+    const pauseBlock = dentalEnrichmentWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
   }
 
   const db = getDb("dental");

@@ -2270,6 +2270,42 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
 }
 
 // ─── A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
+// felles-serverjobbramme, «Innsnevring 2026-10-28», skive 3j: gårdssalg
+// website-discovery judgements — same file-queue mechanics as the content
+// judgements above, reading `gardssalg-website-judgements/` in
+// slookisen/A2A (verdicts a Cloud Routine rendered on Daniel's subscription)
+// and storing them through applyGardssalgWebsiteJudgements(), which re-checks
+// every item and writes via the same approve path as POST /admin/gardssalg-
+// website-review-judge. Never calls an LLM. OFF by default:
+// GARDSSALG_WEBSITE_JUDGEMENT_JOB_ENABLED === "true" turns it on; flipping it
+// back is the rollback. First tick 11 minutes after boot, hourly after that;
+// an overlapping tick is skipped.
+if (process.env.ENABLE_EXPERIENCES === "1") {
+  let gardssalgWebsiteJudgementsRunning = false;
+  const gardssalgWebsiteJudgementsTick = trackJob("gardssalg-website-judgements", async () => {
+    if (gardssalgWebsiteJudgementsRunning) return;
+    gardssalgWebsiteJudgementsRunning = true;
+    try {
+      const { tickGardssalgWebsiteJudgements } = await import("./services/gardssalg-website-judgement-job");
+      const r = await tickGardssalgWebsiteJudgements();
+      if (r.skipped_reason === "disabled") return;
+      console.log(
+        `[gardssalg-website-judgements] tick run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
+          `listed=${r.files_listed} processed=${r.processed.length} written=${r.written} ` +
+          `daily_cap_reached=${r.daily_cap_reached ? "yes" : "no"} ` +
+          `github_error=${r.github_error ? "yes" : "no"} envelope=${r.envelope_recorded}`,
+      );
+    } catch (err) {
+      console.error("[gardssalg-website-judgements] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      gardssalgWebsiteJudgementsRunning = false;
+    }
+  });
+  setTimeout(() => { void gardssalgWebsiteJudgementsTick(); }, 11 * 60_000);
+  setInterval(() => { void gardssalgWebsiteJudgementsTick(); }, 60 * 60_000);
+}
+
+// ─── A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
 // felles-serverjobbramme, tillegg 2026-10-15 «4b-det»: the gårdssalg content
 // queue (drink cohort first, then generic) drained by the platform once a
 // day, exactly like gardssalg-outreach-daily below ───────────────────────
@@ -2348,6 +2384,42 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
   });
   setTimeout(() => { void experienceOrgnrDailyTick(); }, 8 * 60_000);
   setInterval(() => { void experienceOrgnrDailyTick(); }, 10 * 60_000);
+}
+
+// ─── Gårdssalg website-verification sweep — server-side daily job (step 3f) ───
+//
+// Same pattern as experience-orgnr-daily above: checks every 10 minutes, fires
+// once inside GARDSSALG_WEBSITE_VERIFICATION_JOB_WINDOW_HOUR_UTC (default 05),
+// stamp persisted in boot_job_state. OFF by default:
+// GARDSSALG_WEBSITE_VERIFICATION_JOB_ENABLED=true turns it on; flipping it back
+// is the rollback. No LLM. Manual/dry runs:
+// POST /api/opplevelser/admin/gardssalg-website-verification-job-run.
+if (process.env.ENABLE_EXPERIENCES === "1") {
+  let lastGardssalgWvRunAt: Date | null = null;
+  let gardssalgWvRunning = false;
+  const gardssalgWvDailyTick = trackJob("gardssalg-website-verification-daily", async () => {
+    if (gardssalgWvRunning) return;
+    gardssalgWvRunning = true;
+    const now = new Date();
+    try {
+      const { tickGardssalgWebsiteVerificationDaily } = await import("./services/gardssalg-website-verification-job");
+      const t = await tickGardssalgWebsiteVerificationDaily({ now, lastRunAt: lastGardssalgWvRunAt });
+      lastGardssalgWvRunAt = t.lastRunAt;
+      const r = t.report;
+      if (!r) return;
+      console.log(
+        `[gardssalg-website-verification-daily] run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} stop=${r.stop_reason ?? "-"} ` +
+          `pages=${r.totals.pages} scanned=${r.totals.scanned} written=${r.totals.provenance_written} ` +
+          `enqueued=${r.totals.enqueued} errors=${r.totals.errors} envelope=${r.envelope_recorded}`,
+      );
+    } catch (err) {
+      console.error("[gardssalg-website-verification-daily] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      gardssalgWvRunning = false;
+    }
+  });
+  setTimeout(() => { void gardssalgWvDailyTick(); }, 9 * 60_000);
+  setInterval(() => { void gardssalgWvDailyTick(); }, 10 * 60_000);
 }
 
 // ─── Gårdssalg website-review-queue parking — server-side daily job (step 3m) ───

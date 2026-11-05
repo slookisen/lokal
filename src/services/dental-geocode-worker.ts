@@ -30,6 +30,7 @@
 
 import { getDb } from "../database/db-factory";
 import { updateDentalAgent } from "./dental-store";
+import { dentalEnrichmentWritePauseBlock } from "./dental-enrichment-write-pause";
 
 // Kartverket endpoint + standard params.
 const KARTVERKET_BASE = "https://ws.geonorge.no/adresser/v1/sok";
@@ -45,6 +46,8 @@ export type GeocodeResult = {
   no_match: number;
   errors: number;
   duration_ms: number;
+  /** true when the dental enrichment write-pause held the whole tick back. */
+  paused?: boolean;
 };
 
 // Injection seams for tests -- pass a mock fetch + zero-delay sleep.
@@ -52,6 +55,9 @@ export type GeocodeResult = {
 export type GeocodeDeps = {
   fetchImpl?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
+  // Test seam for the dental write-pause lookup (defaults to the real,
+  // fail-closed DB-backed check). Production callers omit it.
+  pauseBlock?: () => ReturnType<typeof dentalEnrichmentWritePauseBlock>;
 };
 
 // --- Helpers ------------------------------------------------------
@@ -198,6 +204,22 @@ export async function geocodeTick(
   deps: GeocodeDeps = {}
 ): Promise<GeocodeResult> {
   const start = Date.now();
+  // Dental enrichment write-pause: geocode fields (lat/lng/geocode_*) are
+  // derived from the stored address, which may itself be a field the paused
+  // enrichment wrote, so the worker holds back while the pause is on (or the
+  // lookup fails closed). Nothing is selected or written; the queue is left
+  // untouched and resumes on the first tick after the pause is lifted.
+  const pauseBlock = (deps.pauseBlock ?? dentalEnrichmentWritePauseBlock)();
+  if (pauseBlock) {
+    console.log(
+      `[dental-geocode] held back by dental enrichment write-pause (fail_closed=${pauseBlock.fail_closed}): ${pauseBlock.reason ?? "no reason"}`,
+    );
+    return {
+      processed: 0, high: 0, medium: 0, low: 0, no_match: 0, errors: 0,
+      duration_ms: Date.now() - start,
+      paused: true,
+    };
+  }
   const db = getDb("dental");
   const stats: GeocodeResult = {
     processed: 0,
