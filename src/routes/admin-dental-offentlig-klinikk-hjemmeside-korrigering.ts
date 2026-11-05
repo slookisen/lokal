@@ -55,6 +55,8 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/db-factory";
+import { dentalEnrichmentWritePauseBlock } from "../services/dental-enrichment-write-pause";
+import { ENRICHMENT_WRITE_PAUSE_HTTP_STATUS } from "../services/enrichment-write-pause";
 import { isPublicDentalServiceHost } from "../services/dental-catalog-class";
 import {
   discoverDentalClinicWebsite,
@@ -378,6 +380,15 @@ router.post("/", async (req: Request, res: Response) => {
       : OFFENTLIG_KLINIKK_KORRIGERING_BATCH_CAP;
 
   try {
+    // Enrichment write-pause fence: apply/write mode only, before the first write.
+    // Dry-run and read paths stay open.
+    if (!dryRun) {
+      const pauseBlock = dentalEnrichmentWritePauseBlock();
+      if (pauseBlock) {
+        res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+        return;
+      }
+    }
     const db = getDb("dental");
     const trueCandidates = findTrueCandidates(db);
     const batch = trueCandidates.slice(offset, offset + limit);

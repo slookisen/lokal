@@ -9,11 +9,11 @@
 // the pilot.
 
 import { getDb } from "../database/init";
-import { findOwnerFeature, ownerFeatureRegistryFor, type OwnerFeatureEntry, type OwnerFeatureVertical } from "./registry";
+import { findOwnerFeature, ownerFeatureRegistryFor, ownerFeatureStatus, type OwnerFeatureEntry, type OwnerFeatureVertical } from "./registry";
 
 export type RecordInterestResult =
   | { kind: "ok"; created: boolean }
-  /** Unknown key, or a key that is not `coming_soon` (a built entry has its own control). */
+  /** Unknown key, or a key that is not `coming_soon` at run time (a built entry has its own control). */
   | { kind: "not_planned" };
 
 /** Stores the owner's interest once (idempotent). Writes nothing else. */
@@ -25,7 +25,7 @@ export function recordOwnerFeatureInterest(
   opts: { db?: any; registry?: OwnerFeatureEntry[]; now?: Date } = {},
 ): RecordInterestResult {
   const e = findOwnerFeature(key, opts.registry ?? ownerFeatureRegistryFor(vertical));
-  if (!e || e.status !== "coming_soon") return { kind: "not_planned" };
+  if (!e || ownerFeatureStatus(e) !== "coming_soon") return { kind: "not_planned" };
   const db = opts.db ?? getDb();
   const info = db
     .prepare(
@@ -80,8 +80,9 @@ export function ownerFeatureInterestCounts(
   const out: OwnerFeatureInterestCount[] = [];
   for (const e of registry) {
     const r = byKey.get(e.key);
-    if (e.status !== "coming_soon" && !r) continue;
-    out.push({ key: e.key, status: e.status, label_no: e.label.no, count: Number(r?.n) || 0, first_at: r?.first_at ?? null, last_at: r?.last_at ?? null });
+    const status = ownerFeatureStatus(e);
+    if (status !== "coming_soon" && !r) continue;
+    out.push({ key: e.key, status, label_no: e.label.no, count: Number(r?.n) || 0, first_at: r?.first_at ?? null, last_at: r?.last_at ?? null });
     byKey.delete(e.key);
   }
   for (const r of byKey.values()) {

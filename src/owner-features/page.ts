@@ -33,7 +33,11 @@ import { escapeHtml } from "../routes/owner-portal";
 import {
   OWNER_FEATURE_GROUPS,
   OWNER_FEATURE_REGISTRY,
+  STOCK_CHECK_SOFT_EXPIRY_DESCRIPTION,
   findOwnerFeature,
+  ownerFeatureEntryForEnv,
+  ownerFeatureStatus,
+  visibleOwnerFeatureOptions,
   type LocalizedText,
   type OwnerFeatureEntry,
   type OwnerFeatureGroup,
@@ -61,6 +65,7 @@ import {
 import { OPPLEVAGENT_PRICE_MESSAGE } from "./price-message";
 import { OWNER_TOKEN_CSS } from "../owner-ui/tokens";
 import { OWNER_COMMS_GROUP_NOTE, OWNER_NEWS_CONSENT_TEXT, OWNER_NEWS_PLACEMENT_QUESTION, OWNER_NOTIFY_GROUP_NOTE } from "./news-consent";
+import { stockSoftExpiryActiveFor } from "../services/stock-soft-expiry";
 
 /** Entries that need this key on are shown only when it is on (spec «Grensesnitt»). */
 export const OWNER_PAGE_REVEAL_KEY = "orders.enabled";
@@ -307,9 +312,9 @@ export function ownerStatsAreLow(st: OwnerPageStats): boolean {
 
 const esc = (v: unknown): string => escapeHtml(String(v ?? ""));
 
-/** Is the entry built (shown in the main view with its value)? */
+/** Is the entry built (shown in the main view with its value)? A liveFlag entry with its flag off is not. */
 export function isOwnerFeatureBuilt(e: OwnerFeatureEntry): boolean {
-  return e.status !== "coming_soon";
+  return ownerFeatureStatus(e) !== "coming_soon";
 }
 
 /**
@@ -372,7 +377,7 @@ const ACTOR_LABELS: Record<string, string> = {
 };
 
 function isNew(e: OwnerFeatureEntry, now: Date): boolean {
-  if (e.status !== "live") return false;
+  if (ownerFeatureStatus(e) !== "live") return false;
   const since = new Date(`${e.since}T00:00:00Z`).getTime();
   if (Number.isNaN(since)) return false;
   const age = now.getTime() - since;
@@ -440,7 +445,7 @@ function controlHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeatu
       );
     }
     case "choice": {
-      const opts = (e.options || []).map((o) =>
+      const opts = visibleOwnerFeatureOptions(e).map((o) =>
         `<option value="${esc(o.value)}"${o.value === r.value ? " selected" : ""}>${esc(o.label.no)}</option>`).join("");
       return form(
         `<label class="mv-sr" for="${esc(fieldId)}">${esc(e.label.no)}</label>` +
@@ -618,6 +623,16 @@ function ordersExplainHtml(m: OwnerPageModel): string {
           </details>`;
 }
 
+/**
+ * A row's description for this owner. B2b-3: `products.stock_check` follows
+ * the soft-expiry rule when it is active for the producer; every other row
+ * (and the rule off) → the entry's description as before.
+ */
+export function ownerRowDescription(agentId: string, e: OwnerFeatureEntry, env: NodeJS.ProcessEnv = process.env): LocalizedText {
+  if (e.key === "products.stock_check" && stockSoftExpiryActiveFor(agentId, env)) return STOCK_CHECK_SOFT_EXPIRY_DESCRIPTION;
+  return ownerFeatureEntryForEnv(e, env).description;
+}
+
 function rowHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeature, swap: string): string {
   const badges =
     (isNew(e, ctx.now) ? ` <span class="mv-badge mv-badge-new">Nytt</span>` : "") +
@@ -640,7 +655,7 @@ function rowHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeature, 
   }
   // T7: the news row shows the versioned consent text — only here, on the
   // allowlisted RFB page (the registry description feeds public pages).
-  const desc = !ctx.m.variant && e.key === OWNER_PAGE_NEWS_KEY ? OWNER_NEWS_CONSENT_TEXT.row.no : e.description.no;
+  const desc = !ctx.m.variant && e.key === OWNER_PAGE_NEWS_KEY ? OWNER_NEWS_CONSENT_TEXT.row.no : ownerRowDescription(ctx.m.agent.id, e).no;
   return `<li class="mv-item" id="${esc(ownerRowAnchor(e.key))}" data-key="${esc(e.key)}">
           <div class="mv-item-text"><strong>${esc(e.label.no)}</strong>${badges}<p class="mv-desc">${esc(desc)}</p>${reason}${explain}${rowExtraHtml(ctx, e, r)}</div>
           <div class="mv-item-ctl">${controlHtml(ctx, e, r, swap)}</div>${noticeAtHtml(ctx, ownerRowAnchor(e.key))}${confirm}
@@ -701,7 +716,7 @@ function plannedHtml(ctx: RenderCtx, registry: OwnerFeatureEntry[]): string {
       : rowForm(m, "/interesse", "planlagt",
           `<input type="hidden" name="key" value="${esc(e.key)}"><button type="submit" class="ep-btn ep-btn-secondary">Gi meg beskjed</button>`);
     return `<li class="mv-item mv-item-planned" id="${esc(ownerPlannedAnchor(e.key))}" data-planned-key="${esc(e.key)}">
-          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong> <span class="mv-badge">${esc(groupLabel.get(e.group) ?? "")}</span><p class="mv-desc">${esc(e.description.no)}</p></div>
+          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong> <span class="mv-badge">${esc(groupLabel.get(e.group) ?? "")}</span><p class="mv-desc">${esc(ownerFeatureEntryForEnv(e).description.no)}</p></div>
           <div class="mv-item-ctl">${ctl}</div>${noticeAtHtml(ctx, ownerPlannedAnchor(e.key))}
         </li>`;
   }).join("");

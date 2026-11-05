@@ -932,10 +932,22 @@ function isHighLinkDensityBlock(blockHtml: string): boolean {
 // upstream. Bounding the slice BEFORE any tag-stripping/link-density scan
 // keeps worst-case scan cost flat regardless of how large/broken the input
 // HTML is.
-const MAX_PROSE_SCAN_LEN = 25_000;
+export const MAX_PROSE_SCAN_LEN = 25_000;
 
 export function extractProseText(html: string): string {
   if (!html) return "";
+  const text = flattenHtmlToText(proseHtmlOf(html));
+  return text.slice(0, 20_000);
+}
+
+/**
+ * extractProseText's HTML stage, before tags are flattened to text: the
+ * scan-length cap, the script/style/noscript/template drop, the
+ * nav/header/footer/aside drop and the disguised-nav-menu <ul>/<ol> drop.
+ * Shared by extractProseText and extractProseParagraphs so both read the
+ * page with the same chrome removed. PURE.
+ */
+function proseHtmlOf(html: string): string {
   let h = html.slice(0, MAX_PROSE_SCAN_LEN);
   h = h
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
@@ -944,10 +956,87 @@ export function extractProseText(html: string): string {
     .replace(/<template[\s\S]*?<\/template>/gi, " ");
   h = stripBlocksByTagNames(h, ["nav", "header", "footer", "aside"]);
   h = stripBlocksByTagNames(h, ["ul", "ol"], isHighLinkDensityBlock);
-  const text = decodeHtmlEntities(h.replace(/<[^>]+>/g, " "))
+  return h;
+}
+
+/** Tags → spaces, entities decoded, whitespace collapsed (extractProseText's last step). PURE. */
+function flattenHtmlToText(h: string): string {
+  return decodeHtmlEntities(h.replace(/<[^>]+>/g, " "))
     .replace(/\s+/g, " ")
     .trim();
-  return text.slice(0, 20_000);
+}
+
+// Block-level boundaries for extractProseParagraphs. Inline markup (<a>,
+// <strong>, <span>, <br>, …) is NOT a boundary: it is flattened to a space
+// inside its paragraph, exactly as extractProseText does.
+const PROSE_BLOCK_BOUNDARY_RE =
+  /<\/?(?:p|div|h[1-6]|li|dd|dt|section|article|main|blockquote|figure|figcaption|table|tr|td|th|hr)(?![\w-])[^>]*>/gi;
+
+/**
+ * extractProseText split into its block-level pieces (paragraphs, headings,
+ * list items, …), each flattened the same way, in page order, empty pieces
+ * dropped. Same chrome removal as extractProseText (proseHtmlOf). PURE.
+ *
+ * dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse, spec 2:
+ * extractProseText collapses the whole page into one line, so «the first 2–3
+ * substantial paragraphs of the about page» cannot be read from it.
+ */
+export function extractProseParagraphs(html: string): string[] {
+  if (!html) return [];
+  return proseHtmlOf(html)
+    .split(PROSE_BLOCK_BOUNDARY_RE)
+    .map(flattenHtmlToText)
+    .filter((s) => s.length > 0);
+}
+
+/** summarizeAboutPageProse's default cap (spec 2: «tak på for eksempel 500 tegn»). */
+export const ABOUT_PAGE_PROSE_MAX_CHARS = 500;
+/** A paragraph shorter than this is a heading/caption/CTA, not prose. */
+export const ABOUT_PAGE_PROSE_MIN_PARAGRAPH_CHARS = 60;
+/** At most this many paragraphs are joined. */
+export const ABOUT_PAGE_PROSE_MAX_PARAGRAPHS = 3;
+
+/**
+ * DETERMINISTIC, extractive about-text candidate from an «Om oss»/«Om gården»/
+ * «Historie»/«About» sub-page (dev-request 2026-10-27-rfb-berikelse-om-oss-
+ * sider-til-beskrivelse, spec 2). PURE, no generative text.
+ *
+ * Unlike summarizeAbout it ignores og:description/meta description — on most
+ * CMS sites those are the same site-wide text as the homepage, which is the
+ * thing this candidate is meant to improve on. Instead it takes the first
+ * ABOUT_PAGE_PROSE_MAX_PARAGRAPHS substantial prose paragraphs of the page
+ * (extractProseParagraphs — nav/header/footer/aside and nav-menu lists
+ * removed), in page order. A paragraph counts when it is at least
+ * ABOUT_PAGE_PROSE_MIN_PARAGRAPH_CHARS long, has a sentence ending and clears
+ * classifyAboutCheapBar at that length (not boilerplate/cookie text, not
+ * mangled, Norwegian); exact repeats are skipped. The joined text is cut to
+ * `maxChars`: at the last sentence end when that keeps at least 40% of it,
+ * else at the last word boundary. "" when no paragraph qualifies. The
+ * caller's quality/substantiation/code/spam guards still apply.
+ */
+export function summarizeAboutPageProse(html: string, maxChars: number = ABOUT_PAGE_PROSE_MAX_CHARS): string {
+  if (!html) return "";
+  const picked: string[] = [];
+  const seen = new Set<string>();
+  for (const p of extractProseParagraphs(html)) {
+    if (picked.length >= ABOUT_PAGE_PROSE_MAX_PARAGRAPHS) break;
+    if (p.length < ABOUT_PAGE_PROSE_MIN_PARAGRAPH_CHARS) continue;
+    if (!/[.!?…](?:["»”)]*)(?:\s|$)/.test(p)) continue;
+    if (classifyAboutCheapBar(p, ABOUT_PAGE_PROSE_MIN_PARAGRAPH_CHARS) !== "ok") continue;
+    const key = p.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    picked.push(p);
+  }
+  if (picked.length === 0) return "";
+  const joined = picked.join(" ");
+  if (joined.length <= maxChars) return joined;
+  const slice = joined.slice(0, maxChars);
+  let sentenceEnd = -1;
+  for (const m of slice.matchAll(/[.!?…](?:["»”)]*)(?=\s|$)/g)) sentenceEnd = m.index! + m[0].length;
+  if (sentenceEnd >= Math.floor(maxChars * 0.4)) return slice.slice(0, sentenceEnd).trim();
+  const lastSpace = slice.lastIndexOf(" ");
+  return (lastSpace > Math.floor(maxChars * 0.4) ? slice.slice(0, lastSpace) : slice).trim();
 }
 
 // Norwegian → category vocabulary, mirroring the platform's canonical map in

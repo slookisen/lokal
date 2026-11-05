@@ -51,6 +51,7 @@ const SAVED_ENV = [
   ALLOW_ENV, "OWNER_VERIFIED_OWNER_GATE_ENABLED", "OWNER_UNIFIED_SESSION_ENABLED", "OWNER_PAUSE_ENABLED",
   "OWNER_ORDER_EMAIL_ENABLED", "OWNER_FEATURES_ENFORCE", "ADMIN_KEY", "ANALYTICS_ADMIN_KEY",
   "ORDER_REMINDER_HOURS", "ORDER_AUTOCANCEL_HOURS", "ORDER_CAP_NEW_PER_PRODUCER_PER_DAY", "ORDER_CAP_NOTICE_ENABLED",
+  "OWNER_AUTO_UPDATES_ENABLED",
 ];
 const OWNED_ID = "s2e-owned";
 const EMPTY_ID = "s2e-empty";
@@ -272,8 +273,9 @@ export async function runOwnerFeaturesS2eTests(opts: { log?: boolean } = {}): Pr
       return i < 0 ? "" : b.slice(i, b.indexOf("</li>", i));
     };
     const mainView = (b: string) => b.slice(0, b.indexOf(`id="planlagt"`) > 0 ? b.indexOf(`id="planlagt"`) : b.length);
-    const SOON = reg.OWNER_FEATURE_REGISTRY.filter((e) => e.status === "coming_soon");
-    const LIVE = reg.OWNER_FEATURE_REGISTRY.filter((e) => e.status !== "coming_soon");
+    // Run-time status: a liveFlag entry with its flag off (auto.updates, OWNER_AUTO_UPDATES_ENABLED cleared above) is planned.
+    const SOON = reg.OWNER_FEATURE_REGISTRY.filter((e) => reg.ownerFeatureStatus(e) === "coming_soon");
+    const LIVE = reg.OWNER_FEATURE_REGISTRY.filter((e) => reg.ownerFeatureStatus(e) !== "coming_soon");
 
     // ═══ AC25 — «Planlagt» ═════════════════════════════════════════════════
     {
@@ -416,7 +418,7 @@ export async function runOwnerFeaturesS2eTests(opts: { log?: boolean } = {}): Pr
       assertEq(withState.map((e) => e.key), [], "AC27: no planned row shows a value");
       const status = b.slice(b.indexOf(`class="mv-status"`), b.indexOf("</div>", b.indexOf(`class="mv-status"`)));
       const statusKeys = [...status.matchAll(/data-status-key="([^"]+)"/g)].map((m) => m[1]);
-      assertEq(statusKeys, pg.OWNER_PAGE_STATUS_KEYS.filter((k) => reg.getOwnerFeature(k).status !== "coming_soon"), "AC27: «Slik er du nå» lists only built entries");
+      assertEq(statusKeys, pg.OWNER_PAGE_STATUS_KEYS.filter((k) => reg.ownerFeatureStatus(reg.getOwnerFeature(k)) !== "coming_soon"), "AC27: «Slik er du nå» lists only built entries");
       assertTrue(!statusKeys.includes("notify.report") && !mainView(b).includes("Månedlig"), "AC27: «Rapport: Månedlig» is gone");
       for (const text of ["Milepæler: På", "Si fra når noe endres på profilen min: På", "Minn meg på å bekrefte lagerstatus: På", "Rapport om profilen din:"]) {
         assertTrue(!b.includes(text) && !b.replace(/<[^>]+>/g, "").includes(text), `AC27: no «${text}» on the page`);

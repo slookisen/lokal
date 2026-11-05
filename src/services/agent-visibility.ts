@@ -67,6 +67,41 @@ function col(alias: string | undefined, name: string): string {
 /** The `agents.origin` the test fixture carries (routes/admin-test-producer.ts). */
 export const TEST_FIXTURE_ORIGIN = "test_fixture";
 
+// ─── The claim-test fixture (dev-request 2026-11-01-rfb-kravflyt-tal-eiere- ─
+// fra-e-post, AC6; Daniel's option A, 2026-11-01) ────────────────────────────
+// POST /admin/test-claim-fixture keeps ONE hidden, unclaimed RFB profile so
+// the owner-claim flow can be tested in production. Its marker is
+// origin = 'test_claim_fixture' AND catalog_hidden = 1 — a different origin
+// from the order fixture above, so POST /admin/test-producer, the switch probe
+// and the as-public view (all pinned to 'test_fixture') never see it, and
+// catalog_hidden = 1 keeps it off every list/search/feed/sitemap/llms/MCP/A2A
+// surface and every by-id surface that asks isAgentPubliclyVisible.
+//
+// The ONE exception: GET /api/marketplace/agents/:id/info — selger.html's
+// single-store lookup for /selger?agent=<id> and the owner dashboard after
+// the claim — passes `claimTestFixtureInfo`, and isAgentPubliclyVisible then
+// reads catalog_hidden as 0 for the ARMED fixture only
+// (isArmedClaimTestFixtureRow). Every other gate (delisted, owner pause and
+// choices, is_active under the by-id flag, vertical, vetting) still applies.
+// The claim routes need no exception: they never checked visibility. And
+// lokal_info's allowCatalogHidden (the ORDER fixture's exception, for its
+// order flow by id) never reaches the claim fixture.
+
+/** The `agents.origin` the claim-test fixture carries (routes/admin-test-claim-fixture.ts). */
+export const CLAIM_TEST_FIXTURE_ORIGIN = "test_claim_fixture";
+
+/** The claim-test fixture's marker: origin AND catalog_hidden, both. */
+export function isClaimTestFixtureRow(row: { origin?: string | null; catalog_hidden?: number | null } | null | undefined): boolean {
+  return !!row && row.origin === CLAIM_TEST_FIXTURE_ORIGIN && Number(row.catalog_hidden) === 1;
+}
+
+/** GET /agents/:id/info's exception: the claim-test fixture, armed (is_active = 1; retire turns it off). */
+export function isArmedClaimTestFixtureRow(
+  row: { origin?: string | null; catalog_hidden?: number | null; is_active?: number | null } | null | undefined,
+): boolean {
+  return isClaimTestFixtureRow(row) && Number(row!.is_active) === 1;
+}
+
 const asPublicViewStore = new AsyncLocalStorage<true>();
 
 /** Is the current request an admin's «Vis som offentlig» view? */
@@ -294,6 +329,12 @@ export function hasProducerPage(
 // (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt AC1/AC2 —
 // the order flow resolves product ids through lokal_info). It is still
 // subject to is_active / vertical / vetted.
+//
+// Second deliberate deviation (dev-request 2026-11-01-rfb-kravflyt-tal-
+// eiere-fra-e-post, AC6, option A): GET /agents/:id/info passes
+// `claimTestFixtureInfo`, so the ARMED claim-test fixture is served there and
+// on no other gated surface (see CLAIM_TEST_FIXTURE_ORIGIN above). With the
+// flag off the ungated surfaces still answer any existing id, as before.
 
 /** Env flag (read at call time, "1" or "true" = on). Default OFF. */
 export const BY_ID_VISIBILITY_FLAG = "OWNER_VISIBILITY_ENFORCE_BY_ID";
@@ -322,6 +363,12 @@ export interface AgentVisibilityOptions {
   surface: "gated" | "ungated";
   /** Keep the catalog_hidden test fixture reachable (lokal_info only). */
   allowCatalogHidden?: boolean;
+  /**
+   * The armed claim-test fixture reads as not hidden (isArmedClaimTestFixtureRow).
+   * Passed by GET /api/marketplace/agents/:id/info ONLY — see the block at the
+   * top of this file. No other row and no other surface is affected.
+   */
+  claimTestFixtureInfo?: boolean;
   /**
    * S2c-2: "ai" = an AI-facing surface (MCP, A2A): the owner's «Synlig for
    * AI-assistenter» (visibility.ai_assistants) applies on top of
@@ -353,11 +400,17 @@ export function isAgentPubliclyVisible(row: AgentVisibilityRow | null | undefine
   if (ownerPauseEnabled() && isOwnerPaused(row)) return false;
   // S2c-2: the owner's visibility choice (no query unless enforced + allowlisted).
   if (opts.agentId && ownerHidesAgent(opts.agentId, audienceChoice(opts.audience))) return false;
+  // The claim-test fixture's one exception (GET /agents/:id/info only): its
+  // catalog_hidden reads as 0, nothing else changes. false for every other row.
+  const claimFixture = opts.claimTestFixtureInfo === true && isArmedClaimTestFixtureRow(row);
   if (!byIdVisibilityEnforced()) {
-    return opts.surface === "gated" ? !quarantinedToday(row, false) : true;
+    return opts.surface === "gated" ? !quarantinedToday(row, claimFixture) : true;
   }
   if (row.is_active != null && !row.is_active) return false;
-  return !quarantinedToday(row, opts.allowCatalogHidden === true);
+  // lokal_info's allowCatalogHidden is the ORDER fixture's exception (its
+  // order flow by id); it never reaches the claim-test fixture.
+  const allowHidden = (opts.allowCatalogHidden === true && !isClaimTestFixtureRow(row)) || claimFixture;
+  return !quarantinedToday(row, allowHidden);
 }
 
 /** Row lookup + isAgentPubliclyVisible() for callers that only hold an id. */
