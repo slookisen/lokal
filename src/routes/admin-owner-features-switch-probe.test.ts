@@ -310,8 +310,8 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       const comingSoon = reg.OWNER_FEATURE_REGISTRY.filter((e) => e.status === "coming_soon").map((e) => `coming_soon:${e.key}`);
       assertEq(comingSoon.filter((n) => !checks.some((c) => c.check === n && c.result === "PASS" && /→ 409 coming_soon/.test(c.observed))), [], "run-12: every coming_soon key → 409 coming_soon, no effect");
       assertTrue(checks.some((c) => c.check === "requirement_unmet:orders.enabled" && c.result === "PASS" && /409 requirement_not_met/.test(c.observed)), "run-13: unmet requirement → 409, no effect");
-      assertTrue(checks.some((c) => c.check === "level:bare_synlig" && c.result === "PASS") && checks.some((c) => c.check === "level:ta_imot_bestillinger" && c.result === "PASS"), "run-14: both levels = the single switches");
-      assertTrue(checks.some((c) => c.check === "undo:level:bare_synlig" && c.result === "PASS"), "run-15: «Angre» on a level restores the effect");
+      assertTrue(checks.some((c) => c.check === "level:minst_mulig" && c.result === "PASS") && checks.some((c) => c.check === "level:utnytte_mulighetene" && c.result === "PASS"), "run-14: both levels = the single switches");
+      assertTrue(checks.some((c) => c.check === "undo:level:minst_mulig" && c.result === "PASS"), "run-15: «Angre» on a level restores the effect");
       assertTrue(["orders.enabled", "visibility.profile", "comms.news"].every((k) => checks.some((c) => c.check === `undo:single:${k}` && c.result === "PASS")), "run-16: «Angre» on each live switch restores the effect");
       assertTrue(checks.some((c) => c.check === "no_surface:comms.news" && c.result === "PASS"), "run-17: comms.news (no surface): write + change log");
       assertTrue(checks.some((c) => c.check === "restore" && c.result === "PASS"), "run-18: restore check PASS");

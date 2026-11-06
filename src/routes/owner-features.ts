@@ -24,6 +24,7 @@ import {
   batchKeys,
   currentOwnerLevel,
   findOwnerLevel,
+  readOwnerLevelChoiceFor,
   getOwnerChangeBatch,
   latestUndoableBatch,
   ownerFeatureChangeLog,
@@ -519,6 +520,8 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
       agent: { id: agent.id, name: String(agent.name || "") },
       resolved,
       level: currentOwnerLevel(VERTICAL, agentId, resolved),
+      // T8: who chose — read only (the status line's «Du valgte …»).
+      levelChoice: readOwnerLevelChoiceFor(VERTICAL, agentId, { db }),
       showIntro: news.showQuestion,
       newsAnswer: news.answer,
       notice,

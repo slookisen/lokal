@@ -51624,7 +51624,8 @@ runSerial(async () => {
 
 // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2e (side v2, AC25–30):
 // «Planlagt» box + «Gi meg beskjed» (interest rows, admin counts), two levels
-// (stored «aktiv»/«full_fart» read as «Ta imot bestillinger»), no fake values,
+// (T8, testrunde-1 AC4: «Minst mulig» / «Utnytte mulighetene», old keys read
+// as aliases, level from the switches, who-chose status line), no fake values,
 // the orders explanation + orderable-items check, the portal cards moved into
 // «Mine valg», the first-login answer in its row. Swaps the getDb() singleton,
 // env vars and the confirm-mail sender (restored in finally) — runSerial.

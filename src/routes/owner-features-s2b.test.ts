@@ -300,7 +300,9 @@ export async function runOwnerFeaturesS2bTests(opts: { log?: boolean } = {}): Pr
     assertTrue(b0.includes("valg til vises når du slår på «Ta imot bestillinger»"), "page: hidden-rows note");
     assertTrue(!b0.includes("Flere valg"), "page (S2e): no «Flere valg» while no advanced entry is built");
     assertTrue(b0.includes("Slik er du nå") && b0.includes("Hvor aktiv vil du være?"), "page: levels + status line");
-    assertTrue(!b0.includes(`aria-current="true" data-level=`), "page (S2e): no level marked before the owner chose one");
+    // T8: the level that applies is computed from the switches — a default owner stands on «Minst mulig».
+    assertTrue(b0.includes(`aria-current="true" data-level="minst_mulig"`) && b0.includes("Du står på standardvalgene. Du trenger ikke gjøre noe.") && !b0.includes("Du har ikke valgt nivå ennå"),
+      "page (T8): a default owner stands on «Minst mulig» («Gjelder nå»), no «Du har ikke valgt nivå ennå»");
     // T7: no first-login card; the unanswered question stands in #gruppe-comms.
     assertTrue(!b0.includes(`id="velkommen"`) && b0.includes(`data-news-question="1"`), "page (T7): no first-login card; the news question is shown");
     assertTrue(b0.includes("Ingen endringer ennå."), "page: empty change log");
@@ -355,7 +357,8 @@ export async function runOwnerFeaturesS2bTests(opts: { log?: boolean } = {}): Pr
     assertTrue(pAfter.includes("Lagret: «Ta imot bestillinger» er På.") && pAfter.includes(`name="batch" value="${b1[0].id}"`) && pAfter.includes(">Angre<"), "switch: message with «Angre»");
     assertTrue(row(pAfter, "orders.enabled").includes(`class="mv-toast mv-toast-inline`), "switch (T5): the message stands in the row that changed");
     assertTrue(pAfter.includes(`data-key="orders.email"`), "page: orders.* rows revealed once orders are on");
-    assertTrue(!pAfter.includes(`aria-current="true" data-level=`), "level (S2e): a single switch marks no level (only the owner's level choice does)");
+    assertTrue(pAfter.includes(`aria-current="true" data-level="utnytte_mulighetene"`) && pAfter.includes("Valgene dine passer med «Utnytte mulighetene».") && !pAfter.includes("Du valgte"),
+      "level (T8): a single switch gives «Valgene dine passer med …», never «Du valgte» (only the owner's level choice does)");
     const noop = await post(H.sett, OWNED_ID, { key: "orders.enabled", value: "true", confirmed: "1" });
     assertEq([loc(noop).includes("melding=ingen_endring"), audits(OWNED_ID).length, batches(OWNED_ID).length], [true, 1, 1], "switch: no-op writes nothing");
     const cs = await post(H.sett, OWNED_ID, { key: "visibility.leaderboard", value: "false", confirmed: "1" });
@@ -375,33 +378,35 @@ export async function runOwnerFeaturesS2bTests(opts: { log?: boolean } = {}): Pr
     assertEq([loc(u2).includes("melding=angre_umulig"), audits(OWNED_ID).length], [true, 2], "undo: second undo refused, nothing written");
     assertEq(loc(await post(H.angre, OWNED_ID, { batch: "abc" })).includes("melding=angre_umulig"), true, "undo: junk batch id refused");
 
-    // ── Levels (S2e: «Bare synlig» / «Ta imot bestillinger») ────────────────
-    const lv0 = await post(H.niva, OWNED_ID, { level: "ta_imot_bestillinger" });
-    assertEq(loc(lv0), `/eier/${OWNED_ID}/valg?niva=ta_imot_bestillinger#niva-forhandsvis`, "level: unconfirmed → preview panel (T5: inside the level card)");
-    const prev = html(await page(OWNED_ID, { niva: "ta_imot_bestillinger" }));
-    assertTrue(prev.includes("Bytte til «Ta imot bestillinger»?") && prev.includes("<strong>Ta imot bestillinger</strong>: Av → På") && prev.includes("Bekreft «Ta imot bestillinger»"), "level: preview lists the live change");
+    // ── Levels (T8: «Minst mulig» / «Utnytte mulighetene») ──────────────────
+    const lv0 = await post(H.niva, OWNED_ID, { level: "utnytte_mulighetene" });
+    assertEq(loc(lv0), `/eier/${OWNED_ID}/valg?niva=utnytte_mulighetene#niva-forhandsvis`, "level: unconfirmed → preview panel (T5: inside the level card)");
+    const prev = html(await page(OWNED_ID, { niva: "utnytte_mulighetene" }));
+    assertTrue(prev.includes("Bytte til «Utnytte mulighetene»?") && prev.includes("<strong>Ta imot bestillinger</strong>: Av → På") && prev.includes("Bekreft «Utnytte mulighetene»"), "level: preview lists the live change");
     const auditsBefore = audits(OWNED_ID).length;
-    const lv1 = await post(H.niva, OWNED_ID, { level: "ta_imot_bestillinger", confirmed: "1" });
+    const lv1 = await post(H.niva, OWNED_ID, { level: "utnytte_mulighetene", confirmed: "1" });
     const lb = batches(OWNED_ID).at(-1);
-    assertEq([lv1.status, optInCol(OWNED_ID), audits(OWNED_ID).length - auditsBefore, lb.kind, lb.level], [303, 1, 1, "level", "ta_imot_bestillinger"], "level: «Ta imot bestillinger» changes only orders.enabled (live) — one audit row, one level batch");
+    assertEq([lv1.status, optInCol(OWNED_ID), audits(OWNED_ID).length - auditsBefore, lb.kind, lb.level], [303, 1, 1, "level", "utnytte_mulighetene"], "level: «Utnytte mulighetene» changes only orders.enabled (stock check is on by default) — one audit row, one level batch");
     assertEq(settingsRows(OWNED_ID), 0, "level: no setting rows");
-    assertTrue(html(await page(OWNED_ID, { endret: String(lb.id) })).includes("Du har valgt «Ta imot bestillinger». Lagret: «Ta imot bestillinger» er På."), "level: message names the level and the change");
-    const lv2 = await post(H.niva, OWNED_ID, { level: "ta_imot_bestillinger", confirmed: "1" });
+    assertTrue(html(await page(OWNED_ID, { endret: String(lb.id) })).includes("Du har valgt «Utnytte mulighetene». Lagret: «Ta imot bestillinger» er På."), "level: message names the level and the change");
+    const lv2 = await post(H.niva, OWNED_ID, { level: "utnytte_mulighetene", confirmed: "1" });
     assertEq([loc(lv2).includes("melding=niva_valgt"), audits(OWNED_ID).length - auditsBefore], [true, 1], "level: choosing it again changes nothing more");
     const pl = html(await page(OWNED_ID));
-    assertTrue(pl.includes(`aria-current="true" data-level="ta_imot_bestillinger"`), "level: the owner's chosen level is marked");
+    assertTrue(pl.includes(`aria-current="true" data-level="utnytte_mulighetene"`) && pl.includes("Du valgte «Utnytte mulighetene»"), "level: the owner's chosen level is marked, «Du valgte …»");
+    // An old key in the form (alias) is stored as the new key.
     const lv3 = await post(H.niva, OWNED_ID, { level: "bare_synlig", confirmed: "1" });
     const lb3 = batches(OWNED_ID).at(-1);
-    assertEq([lv3.status, optInCol(OWNED_ID), lb3.level, audits(OWNED_ID).length - auditsBefore], [303, 0, "bare_synlig", 2], "level: «Bare synlig» turns orders off");
+    assertEq([lv3.status, optInCol(OWNED_ID), lb3.level, audits(OWNED_ID).length - auditsBefore], [303, 0, "minst_mulig", 2], "level: «Minst mulig» (old key «bare_synlig») turns orders off");
     // Undo a level as one unit.
     const ul = await post(H.angre, OWNED_ID, { batch: String(lb3.id) });
     assertEq([ul.status, optInCol(OWNED_ID), audits(OWNED_ID).length - auditsBefore], [303, 1, 3], "undo: level reverted as one unit");
     assertEq(loc(await post(H.niva, OWNED_ID, { level: "bogus", confirmed: "1" })).includes("melding=ugyldig"), true, "level: unknown level refused");
     // Unmet requirement: skipped with reason.
-    const lu = await post(H.niva, UNBADGED_ID, { level: "ta_imot_bestillinger", confirmed: "1" });
+    const lu = await post(H.niva, UNBADGED_ID, { level: "utnytte_mulighetene", confirmed: "1" });
     assertEq([loc(lu), optInCol(UNBADGED_ID), audits(UNBADGED_ID).length], [`/eier/${UNBADGED_ID}/valg?melding=hoppet&nokkel=orders.enabled&ved=niva#niva`, 0, 0], "level: unmet requirement → key skipped, nothing written");
     assertTrue(html(await page(UNBADGED_ID, { melding: "hoppet", nokkel: "orders.enabled" })).includes("«Ta imot bestillinger»: Krever at profilen er verifisert"), "level: skipped message carries the Norwegian reason");
-    assertTrue(!html(await page(UNBADGED_ID)).includes(`aria-current="true" data-level=`), "level (S2e): a level that could not apply is not marked as chosen");
+    const pU = html(await page(UNBADGED_ID));
+    assertTrue(!pU.includes(`data-level-status="chosen"`) && !pU.includes(`aria-current="true" data-level="utnytte_mulighetene"`), "level (S2e/T8): a level that could not apply is not marked as chosen");
     // The undo/preview machinery over multi-key presets (fixture levels: the S2b «Aktiv» / «Full fart» presets).
     const FIXTURE_LEVELS: any[] = [
       { key: "bare_synlig", label: { no: "Bare synlig", en: "Just visible" }, description: { no: "x", en: "x" }, recommended: false,

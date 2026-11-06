@@ -9,7 +9,10 @@
 //   2. Only real choices in the main view: a `coming_soon` entry is never a
 //      (grey) switch; all of them sit in one closed «Planlagt — si fra hvis du
 //      vil ha dette (N)» box at the bottom, each with «Gi meg beskjed».
-//   3. Two honest levels; a level is marked only after the owner chose it.
+//   3. Two honest levels. T8 (RFB): «Minst mulig» / «Utnytte mulighetene»;
+//      the level that applies is computed from the switches, the status line
+//      says who chose, deviations are «Unntak» (gårdssalg: unchanged, a level
+//      is marked only after the owner chose it).
 //   4. orders.enabled explains itself where it is taken (fold-out) and shows
 //      the prerequisite check (orderable items) above the switch.
 //   5. No fake values: an unbuilt entry shows no value and is not in «Slik er
@@ -48,10 +51,14 @@ import type { ResolvedOwnerFeature, ResolvedOwnerFeatures } from "./resolve";
 import {
   OWNER_LEVELS,
   OWNER_LEVEL_CUSTOM_LABEL,
+  OWNER_LEVEL_DEFAULT_KEY,
+  deriveOwnerLevel,
+  ownerLevelStatus,
   type OwnerLevel,
   type OwnerChangeLogRow,
   type OwnerLevelKey,
   type OwnerLevelPreview,
+  type OwnerLevelStatus,
 } from "./changes";
 import type { OwnerStats } from "../services/owner-stats-service";
 import {
@@ -173,8 +180,14 @@ export interface OwnerPageModel {
   agent: { id: string; name: string };
   resolved: ResolvedOwnerFeatures;
   registry?: OwnerFeatureEntry[];
-  /** The owner's own level choice; null = none made (no level marked). */
+  /** The owner's own level choice; null = none made (no level marked). Gårdssalg only since T8. */
   level: OwnerLevelKey | "custom" | null;
+  /**
+   * T8 (RFB page): the owner's own level choice (readOwnerLevelChoiceFor) and
+   * when it was made — only for the status line's «Du valgte …». The level
+   * that applies is computed from `resolved`. Unset/null = no owner choice.
+   */
+  levelChoice?: { level: OwnerLevel; at: string } | null;
   /** T7: the «Nyheter og tips» question stands at the top of #gruppe-comms. */
   showIntro: boolean;
   /** T7: the comms.news row's «Du sa ja/nei {dato}.» (null/unset = nothing to say). */
@@ -407,6 +420,8 @@ interface RenderCtx {
   noticePlaced: boolean;
   /** T5: the switch confirm panel has been placed in its row. */
   confirmPlaced: boolean;
+  /** T8 (RFB page only): the level status from the switches; null = none / gårdssalg. */
+  levelStatus: OwnerLevelStatus | null;
 }
 
 /** T5: the notice, when it belongs at element `id` and is not placed yet. */
@@ -634,9 +649,15 @@ export function ownerRowDescription(agentId: string, e: OwnerFeatureEntry, env: 
 }
 
 function rowHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeature, swap: string): string {
+  // T8: a row that deviates from the level that applies is an «Unntak».
+  const ls = ctx.levelStatus;
+  const exception = ls && ls.kind === "custom" ? ls.exceptions.find((x) => x.key === e.key) : undefined;
   const badges =
     (isNew(e, ctx.now) ? ` <span class="mv-badge mv-badge-new">Nytt</span>` : "") +
-    (e.consent ? ` <span class="mv-badge">Samtykke</span>` : "");
+    (e.consent ? ` <span class="mv-badge">Samtykke</span>` : "") +
+    (exception ? ` <span class="mv-badge" data-level-exception="${esc(e.key)}">Unntak</span>` : "");
+  const exceptionText = exception && ls
+    ? `<p class="mv-desc">Nivået «${esc(ls.level.label.no)}» har dette ${exception.levelValue === true ? "på" : "av"}.</p>` : "";
   const reason = r.reason && e.type !== "guarantee" && r.block !== "confirm_by_email"
     ? `<p class="mv-reason">${esc(r.reason.no)}</p>` : "";
   let explain = "";
@@ -657,7 +678,7 @@ function rowHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeature, 
   // allowlisted RFB page (the registry description feeds public pages).
   const desc = !ctx.m.variant && e.key === OWNER_PAGE_NEWS_KEY ? OWNER_NEWS_CONSENT_TEXT.row.no : ownerRowDescription(ctx.m.agent.id, e).no;
   return `<li class="mv-item" id="${esc(ownerRowAnchor(e.key))}" data-key="${esc(e.key)}">
-          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong>${badges}<p class="mv-desc">${esc(desc)}</p>${reason}${explain}${rowExtraHtml(ctx, e, r)}</div>
+          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong>${badges}<p class="mv-desc">${esc(desc)}</p>${exceptionText}${reason}${explain}${rowExtraHtml(ctx, e, r)}</div>
           <div class="mv-item-ctl">${controlHtml(ctx, e, r, swap)}</div>${noticeAtHtml(ctx, ownerRowAnchor(e.key))}${confirm}
         </li>`;
 }
@@ -732,7 +753,9 @@ function plannedHtml(ctx: RenderCtx, registry: OwnerFeatureEntry[]): string {
 
 function levelsHtml(ctx: RenderCtx): string {
   const m = ctx.m;
-  const cards = (m.variant ? m.variant.levels : OWNER_LEVELS).map((l) => {
+  if (!m.variant) return rfbLevelsHtml(ctx);
+  // Gårdssalg: unchanged until T20 (marked only after the owner's own choice).
+  const cards = m.variant.levels.map((l) => {
     const current = m.level === l.key;
     return `<li class="mv-level"${current ? ` aria-current="true"` : ""} data-level="${esc(l.key)}">
           <strong>${esc(l.label.no)}</strong>${l.recommended ? ` <span class="mv-badge mv-badge-new">Anbefalt</span>` : ""}${l.key === "bare_synlig" ? ` <span class="mv-badge">Standard</span>` : ""}
@@ -753,6 +776,56 @@ function levelsHtml(ctx: RenderCtx): string {
         ${note}
         ${noticeAtHtml(ctx, OWNER_ANCHOR_LEVEL)}
         <ul class="mv-levels">${cards}</ul>
+        ${levelPreviewHtml(m)}
+        ${statusLineHtml(m)}
+      </section>`;
+}
+
+/** T8: the level status line on the RFB page (who chose; «Tilpasset» with the reset link). */
+function levelStatusLineHtml(m: OwnerPageModel, st: OwnerLevelStatus | null): string {
+  if (!st) return "";
+  const name = esc(st.level.label.no);
+  switch (st.kind) {
+    case "default":
+      return `<p class="mv-note" data-level-status="default">Du står på standardvalgene. Du trenger ikke gjøre noe.</p>`;
+    case "chosen":
+      return `<p class="mv-note" data-level-status="chosen">Du valgte «${name}» ${esc(formatDate(st.at))}.</p>`;
+    case "matches":
+      return `<p class="mv-note" data-level-status="matches">Valgene dine passer med «${name}».</p>`;
+    case "custom": {
+      const href = actionPath(m, `?niva=${encodeURIComponent(st.level.key)}#${OWNER_ANCHOR_LEVEL_PREVIEW}`);
+      return `<p class="mv-note" data-level-status="custom">Tilpasset: valgene dine bygger på «${name}», med ${st.exceptions.length} unntak. <a href="${esc(href)}">Tilbakestill til «${name}»</a></p>`;
+    }
+  }
+}
+
+/**
+ * T8 (RFB page): «Minst mulig» («Standard») and «Utnytte mulighetene». The
+ * card of the level that applies now (from the switches, with no exceptions)
+ * is marked «Gjelder nå» (aria-current, Q1); the status line says who chose.
+ */
+function rfbLevelsHtml(ctx: RenderCtx): string {
+  const m = ctx.m;
+  const st = ctx.levelStatus;
+  const applies = st && st.kind !== "custom" ? st.level.key : null;
+  const cards = OWNER_LEVELS.map((l) => {
+    const current = applies === l.key;
+    return `<li class="mv-level"${current ? ` aria-current="true"` : ""} data-level="${esc(l.key)}">
+          <strong>${esc(l.label.no)}</strong>${l.key === OWNER_LEVEL_DEFAULT_KEY ? ` <span class="mv-badge">Standard</span>` : ""}
+          <p class="mv-desc">${esc(l.description.no)}</p>
+          ${current
+            ? `<span class="mv-state">Gjelder nå</span>`
+            : `<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m, `?niva=${encodeURIComponent(l.key)}#${OWNER_ANCHOR_LEVEL_PREVIEW}`))}">Velg «${esc(l.label.no)}»</a>`}
+        </li>`;
+  }).join("");
+  // T5: the preview and the level message stand inside the level card.
+  return `<section class="ep-card" id="${OWNER_ANCHOR_LEVEL}" aria-labelledby="mv-h-niva">
+        <h2 id="mv-h-niva">Hvor aktiv vil du være?</h2>
+        <p class="mv-desc">Velg nivå. Valgene lenger ned settes etter nivået, og du kan gjøre unntak.</p>
+        ${levelStatusLineHtml(m, st)}
+        ${noticeAtHtml(ctx, OWNER_ANCHOR_LEVEL)}
+        <ul class="mv-levels">${cards}</ul>
+        <p class="mv-desc">Nivået endrer aldri om profilen er synlig, og aldri «Nyheter og tips». Det bestemmer du selv.</p>
         ${levelPreviewHtml(m)}
         ${statusLineHtml(m)}
       </section>`;
@@ -1114,7 +1187,9 @@ ${OWNER_TOKEN_CSS}  .mv-page, .mv-page * { overflow-wrap: anywhere; }
 /** The page body (inside portalShell). */
 export function renderOwnerFeaturesPageBody(m: OwnerPageModel): string {
   const registry = m.registry ?? OWNER_FEATURE_REGISTRY;
-  const ctx: RenderCtx = { m, now: m.now ?? new Date(), explainedAlways: false, explainedLocked: false, noticePlaced: false, confirmPlaced: false };
+  // T8: the RFB level status, computed from the switches (gårdssalg: none, page unchanged).
+  const levelStatus = m.variant ? null : ownerLevelStatus(deriveOwnerLevel(m.resolved, OWNER_LEVELS, registry), m.levelChoice ?? null);
+  const ctx: RenderCtx = { m, now: m.now ?? new Date(), explainedAlways: false, explainedLocked: false, noticePlaced: false, confirmPlaced: false, levelStatus };
   const back = m.variant ? m.variant.backHref : `/eier/${encodeURIComponent(m.agent.id)}/portal`;
   return `<style>${OWNER_PAGE_CSS}</style>
     <div class="mv-page">
