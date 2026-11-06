@@ -46599,6 +46599,24 @@ runSerial(async () => {
   }
 });
 
+// Step 3m: the gårdssalg review-queue parking as a server-side daily job.
+// Serial: in-memory DBs.
+runSerial(async () => {
+  console.log("\n── 3m: gardssalg-website-review-queue-park-job (server-side) ──");
+  try {
+    const { runGardssalgWebsiteReviewQueueParkJobTests } = require("../src/services/gardssalg-website-review-queue-park-job.test") as
+      typeof import("../src/services/gardssalg-website-review-queue-park-job.test");
+    const pj = await runGardssalgWebsiteReviewQueueParkJobTests({ log: false });
+    passed += pj.passed;
+    failed += pj.failed;
+    for (const f of pj.failures) failures.push("gardssalg-website-review-queue-park-job: " + f);
+    console.log(`  gardssalg-website-review-queue-park-job: ${pj.passed} passed, ${pj.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-website-review-queue-park-job: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-felles-
 // serverjobbramme, «Innsnevring 2026-10-28», skive 3k med punkt b: the
 // needs_review content judge without an LLM — candidate GET (batches 1..4),

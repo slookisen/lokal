@@ -2429,6 +2429,41 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
   setInterval(() => { void gardssalgWvDailyTick(); }, 10 * 60_000);
 }
 
+// ─── Gårdssalg website-review-queue parking — server-side daily job (step 3m) ───
+//
+// Same pattern as the jobs above: checks every 10 minutes, fires once inside
+// GARDSSALG_WEBSITE_REVIEW_QUEUE_PARK_JOB_WINDOW_HOUR_UTC (default 06), stamp
+// persisted in boot_job_state. OFF by default:
+// GARDSSALG_WEBSITE_REVIEW_QUEUE_PARK_JOB_ENABLED=true turns it on; flipping it
+// back is the rollback. No LLM. Manual/dry runs:
+// POST /api/opplevelser/admin/gardssalg-website-review-queue-park-job-run.
+if (process.env.ENABLE_EXPERIENCES === "1") {
+  let lastGardssalgRqpRunAt: Date | null = null;
+  let gardssalgRqpRunning = false;
+  const gardssalgRqpDailyTick = trackJob("gardssalg-website-review-queue-park-daily", async () => {
+    if (gardssalgRqpRunning) return;
+    gardssalgRqpRunning = true;
+    const now = new Date();
+    try {
+      const { tickGardssalgWebsiteReviewQueueParkDaily } = await import("./services/gardssalg-website-review-queue-park-job");
+      const t = await tickGardssalgWebsiteReviewQueueParkDaily({ now, lastRunAt: lastGardssalgRqpRunAt });
+      lastGardssalgRqpRunAt = t.lastRunAt;
+      const r = t.report;
+      if (!r) return;
+      console.log(
+        `[gardssalg-website-review-queue-park-daily] run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
+          `would_park=${r.would_park} parked=${r.parked} envelope=${r.envelope_recorded}`,
+      );
+    } catch (err) {
+      console.error("[gardssalg-website-review-queue-park-daily] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      gardssalgRqpRunning = false;
+    }
+  });
+  setTimeout(() => { void gardssalgRqpDailyTick(); }, 10 * 60_000);
+  setInterval(() => { void gardssalgRqpDailyTick(); }, 10 * 60_000);
+}
+
 // ─── dev-request 2026-10-21-rfb-produktimport-fra-egen-nettside, runde 2
 // (punkt 5): the product-import dry-run measurement survives a deploy. Once,
 // 45 s after boot and only with PRODUCT_IMPORT_DRYRUN_ENABLED=1, a run the
