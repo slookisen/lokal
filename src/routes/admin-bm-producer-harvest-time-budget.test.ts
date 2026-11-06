@@ -1,13 +1,13 @@
 /**
  * admin-bm-producer-harvest-time-budget.test.ts — 502 fix for
- * GET /admin/bm-producer-harvest: a 30 s wall-clock budget
+ * GET /admin/bm-producer-harvest: a 20 s wall-clock budget
  * (BM_HARVEST_TIME_BUDGET_MS) in BOTH branches, plus `processed` and the
  * `next_offset` resume cursor.
  *
  * Against a stub bondensmarked.no (10-slug sitemap, unparseable pages, every
  * page request recorded) and an injected clock (__setBmHarvestNowForTesting)
  * that advances STEP_MS per producer-page fetch:
- *   t1 constants: budget 30 s, APPLY_TIME_BUDGET_MS is the same value (alias)
+ *   t1 constants: budget 20 s, APPLY_TIME_BUDGET_MS is the same value (alias)
  *   t2 AC7.1 dry-run budget exceeded after N slugs → time_budget_exceeded,
  *      processed N, skipped, next_offset = offset+N, only N pages fetched,
  *      existing fields unchanged
@@ -86,7 +86,7 @@ export async function runAdminBmProducerHarvestTimeBudgetTests(opts: { log?: boo
   }
 
   // t1 — constants
-  assertEq([BM_HARVEST_TIME_BUDGET_MS, APPLY_TIME_BUDGET_MS], [30_000, 30_000], "t1: budget is 30 s and APPLY_TIME_BUDGET_MS aliases it");
+  assertEq([BM_HARVEST_TIME_BUDGET_MS, APPLY_TIME_BUDGET_MS], [20_000, 20_000], "t1: budget is 20 s and APPLY_TIME_BUDGET_MS aliases it");
 
   const key = process.env.ADMIN_KEY || "bm-time-budget-test-key";
   const prevAdminKey = process.env.ADMIN_KEY;
@@ -102,8 +102,8 @@ export async function runAdminBmProducerHarvestTimeBudgetTests(opts: { log?: boo
     `<url><loc>https://bondensmarked.no/produsenter</loc></url></urlset>`;
 
   // Each producer-page fetch advances the injected clock by stepMs. With
-  // stepMs = 11 s the check before slug k sees (k-1)*11 s elapsed: slugs 1..3
-  // start (0, 11, 22 s), slug 4 sees 33 s > 30 s → break after N = 3.
+  // stepMs = 7 s the check before slug k sees (k-1)*7 s elapsed: slugs 1..3
+  // start (0, 7, 14 s), slug 4 sees 21 s > 20 s → break after N = 3.
   let mockNow = 1_000_000;
   let stepMs = 0;
   let pageFetches: string[] = [];
@@ -126,7 +126,7 @@ export async function runAdminBmProducerHarvestTimeBudgetTests(opts: { log?: boo
     stepMs = step;
     return callRoute(router, { url: "/", headers: auth, query });
   };
-  const SLOW = 11_000;
+  const SLOW = 7_000;
 
   try {
     // t2 — dry-run, budget exceeded after N = 3 slugs
@@ -139,7 +139,7 @@ export async function runAdminBmProducerHarvestTimeBudgetTests(opts: { log?: boo
     assertEq(pageFetches, ["gard-2", "gard-3", "gard-4"], "t2: dry-run stops starting slugs once the budget is exceeded");
     assertEq(
       [r.body?.total_slugs, r.body?.offset, r.body?.fetched, r.body?.parse_failed, r.body?.matched, r.body?.unmatched, r.body?.duration_ms],
-      [10, 2, 6, 3, 0, 0, 33_000],
+      [10, 2, 6, 3, 0, 0, 21_000],
       "t2: existing dry-run fields keep their meaning (fetched = window size), duration_ms uses the injected clock",
     );
 
