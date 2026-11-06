@@ -176,6 +176,7 @@ import adminSalgskanalRoutes from "./routes/admin-salgskanal";
 import adminJobsRoutes from "./routes/admin-jobs";
 import adminProductImportRoutes from "./routes/admin-product-import";
 import { productImportDryRunEnabled, resumeProductImportDryRunOnBoot } from "./services/product-import/dry-run";
+import { productAutoSyncEnabled } from "./services/product-import/auto-sync";
 import platformTriggersRoutes, { adminRouter as adminTriggersRoutes } from "./routes/platform-triggers";
 import crmRoutes from "./routes/crm";
 import { mountBillingRoutes } from "./routes/admin-billing";
@@ -2444,6 +2445,40 @@ if (productImportDryRunEnabled()) {
       );
     }
   }, 45_000);
+}
+
+// ─── Produktimport skive 4-1: weekly product auto-sync from the owner's own
+// website ──────────────────────────────────────────────────────────────────
+// OFF by default: PRODUCT_AUTO_SYNC_ENABLED=1/true at boot schedules it;
+// unset, nothing is scheduled and nothing is written. Checks every 10
+// minutes; one sweep a day inside the window (03 UTC), stamp persisted in
+// boot_job_state so a restart does not sweep twice. A sweep runs the verified
+// profiles with product_sync_mode 'weekly' whose own last run is ≥ 7 days old,
+// one after another, paced per host. Flipping the flag off is the rollback.
+if (productAutoSyncEnabled()) {
+  let lastProductAutoSyncAt: Date | null = null;
+  let productAutoSyncRunning = false;
+  const productAutoSyncTick = trackJob("product-auto-sync-weekly", async () => {
+    if (productAutoSyncRunning) return;
+    productAutoSyncRunning = true;
+    try {
+      const { tickProductAutoSync } = await import("./services/product-import/auto-sync");
+      const t = await tickProductAutoSync({ now: new Date(), lastRunAt: lastProductAutoSyncAt });
+      lastProductAutoSyncAt = t.lastRunAt;
+      const r = t.report;
+      if (!r) return;
+      console.log(
+        `[product-auto-sync] profiles=${r.profiles} applied=${r.applied} blocked=${r.blocked} ` +
+          `skipped=${r.skipped} errors=${r.errors}`,
+      );
+    } catch (err) {
+      console.error("[product-auto-sync] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      productAutoSyncRunning = false;
+    }
+  });
+  setTimeout(() => { void productAutoSyncTick(); }, 11 * 60_000);
+  setInterval(() => { void productAutoSyncTick(); }, 10 * 60_000);
 }
 
 // ─── dev-request 2026-09-03-opplevagent-sending-uten-llm-i-sendestien

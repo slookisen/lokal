@@ -52436,3 +52436,26 @@ runSerial(async () => {
     failures.push("homepage-provenance-contact-field-selector: unexpected error: " + String(err?.message || err));
   }
 });
+
+// Produktimport skive 4-1: weekly auto-sync of a verified owner's products from
+// their own website (flag PRODUCT_AUTO_SYNC_ENABLED, default off) — price/unit
+// changes applied as owner_auto_sync, new products staged only, not-found →
+// out of stock (never deleted), three deviation locks (fetch failure, > 50 %
+// missing, price ± 50 %) with zero product changes, 3 locks in a row → mode
+// off, flag-off tick writes nothing. Swaps the getDb() singleton and env
+// (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── produktimport skive 4-1: ukentlig synk fra egen nettside ──");
+  try {
+    const { runAutoSyncTests } = require("../src/services/product-import/auto-sync.test") as
+      typeof import("../src/services/product-import/auto-sync.test");
+    const r = await runAutoSyncTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("product-auto-sync: " + f);
+    console.log(`  product-auto-sync: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("product-auto-sync: unexpected error: " + String(err?.message || err));
+  }
+});
