@@ -51830,6 +51830,28 @@ runSerial(async () => {
   }
 });
 
+// Produktimport skive 4-2b: the «Mine valg» switch products.weekly_sync wired
+// to product_auto_sync_state.product_sync_mode (live behind
+// PRODUCT_AUTO_SYNC_ENABLED; flag off = byte-identical page/API, change
+// refused as before; on → 'weekly' + one agent_knowledge_audit row; off →
+// 'off', sync state kept; is_verified = 0 / non-owner refused). Swaps getDb()
+// and env — runSerial.
+runSerial(async () => {
+  console.log("\n── produktimport skive 4-2b: «Mine valg»-bryteren products.weekly_sync ──");
+  try {
+    const { runProductWeeklySyncSwitchTests } = require("../src/owner-features/product-weekly-sync.test") as
+      typeof import("../src/owner-features/product-weekly-sync.test");
+    const r = await runProductWeeklySyncSwitchTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("product-weekly-sync-switch: " + f);
+    console.log(`  product-weekly-sync-switch: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("product-weekly-sync-switch: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
 // slice 1: the per-IP e-mail limit (services/email-reveal-guard.ts — switch
 // per host, default off; CCBot never; shared counter per host) and its wiring

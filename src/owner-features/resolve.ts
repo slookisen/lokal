@@ -648,7 +648,7 @@ export function setOwnerFeatureValue(
       ).run(vertical, subjectId, key, JSON.stringify(current ?? null), JSON.stringify(v.value), actor.actor, actor.detail ?? null, now);
     }
     if (e.storage) {
-      const w = e.storage.write(db, subjectId, v.value);
+      const w = e.storage.write(db, subjectId, v.value, { actor: actor.actor, detail: actor.detail ?? null });
       if (w !== true) {
         throw new AdapterRefusal(
           w && typeof w === "object"

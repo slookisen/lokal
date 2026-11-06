@@ -11,6 +11,7 @@
 import { getDb } from "../database/init";
 import {
   ownerFeatureRegistryFor,
+  ownerFeatureStatus,
   findOwnerFeature,
   type LocalizedText,
   type OwnerFeatureEntry,
@@ -169,12 +170,16 @@ function sameValue(a: OwnerFeatureValue | undefined, b: OwnerFeatureValue | unde
   return JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 }
 
-/** The level's preset restricted to entries that exist and are `live`. */
-function liveLevelValues(level: OwnerLevel, registry: OwnerFeatureEntry[]): Array<[OwnerFeatureEntry, OwnerFeatureValue]> {
+/**
+ * The level's preset restricted to entries that exist and are `live` at run
+ * time (ownerFeatureStatus: a liveFlag entry with its flag off is coming_soon
+ * and skipped, as the resolver treats it).
+ */
+function liveLevelValues(level: OwnerLevel, registry: OwnerFeatureEntry[], env: NodeJS.ProcessEnv = process.env): Array<[OwnerFeatureEntry, OwnerFeatureValue]> {
   const out: Array<[OwnerFeatureEntry, OwnerFeatureValue]> = [];
   for (const [key, value] of level.values) {
     const e = findOwnerFeature(key, registry);
-    if (e && e.status === "live") out.push([e, value]);
+    if (e && ownerFeatureStatus(e, env) === "live") out.push([e, value]);
   }
   return out;
 }
@@ -343,7 +348,7 @@ export function currentOwnerLevel(
 ): OwnerLevelKey | "custom" | null {
   const registry = opts.registry ?? ownerFeatureRegistryFor(vertical);
   const matches = (l: OwnerLevel) => {
-    const live = liveLevelValues(l, registry);
+    const live = liveLevelValues(l, registry, opts.env);
     return live.length > 0 && live.every(([e, v]) => sameValue(resolved.byKey[e.key]?.value, v));
   };
   const chosen = readOwnerLevelChoiceFor(vertical, subjectId, { db: opts.db, levels: opts.levels ?? ownerLevelsFor(vertical) })?.level;
@@ -574,7 +579,7 @@ export function applyOwnerLevel(
     const prior = explicitRowKeys(db, vertical, subjectId);
     const changed: string[] = [];
     const skipped: Array<{ key: string; reason: LocalizedText }> = [];
-    for (const [e, value] of liveLevelValues(level, registry)) {
+    for (const [e, value] of liveLevelValues(level, registry, opts.env)) {
       // Locked at the level's value already: nothing to do, nothing to report.
       // (A key that is off only because a requirement is off still gets the
       // explicit off, so it stays off when the requirement comes back.)

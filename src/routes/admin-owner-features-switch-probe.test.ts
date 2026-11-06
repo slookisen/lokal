@@ -46,7 +46,7 @@ const SAVED_ENV = [
   "OWNER_FEATURES_SWITCH_PROBE_ENABLED", "ADMIN_KEY", "ANALYTICS_ADMIN_KEY", "OWNER_FEATURES_ALLOWED_SUBJECTS",
   "OWNER_FEATURES_ENFORCE", "OWNER_PAUSE_ENABLED", "OWNER_VISIBILITY_ENFORCE_BY_ID", "OWNER_LOCK_ENFORCE_WRITES",
   "OUTREACH_UNSUBSCRIBE_ENABLED", "STOCK_CHECK_EMAIL_ENABLED", "OWNER_ORDERABILITY_PORTAL_ENABLED", "OWNER_ORDER_EMAIL_ENABLED", "RFB_DISABLE_ORDER_FOLLOWUPS", "UNSUBSCRIBE_TOKEN_SECRET",
-  "OWNER_AUTO_UPDATES_ENABLED",
+  "OWNER_AUTO_UPDATES_ENABLED", "PRODUCT_AUTO_SYNC_ENABLED",
 ];
 const KEY = "switch-probe-admin-key-for-tests";
 const FIX = "sp-fixture";
@@ -164,6 +164,8 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       process.env.OWNER_ORDERABILITY_PORTAL_ENABLED = "1";
       // dev-request 2026-11-01-rfb-hold-profilen-oppdatert: auto.updates (liveFlag) and the owner refresh.
       process.env.OWNER_AUTO_UPDATES_ENABLED = "1";
+      // Produktimport skive 4-2b: products.weekly_sync (liveFlag) and the weekly job.
+      process.env.PRODUCT_AUTO_SYNC_ENABLED = "1";
     };
     setBaseEnv();
 
@@ -323,7 +325,8 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
         `run-18b: the probe covers the public-stats threshold as-public, both sides (${thr?.observed ?? "missing"})`);
       assertEq(rawState(FIX), before, "run-19: the fixture's stored choices byte-identical to the snapshot afterwards");
       realUntouched("run-19b");
-      assertEq(grown(t0, tableCounts()).filter((x) => !/^owner_feature_(audit|change_batch):/.test(x)), [], "run-19c: no table grows except the change log (the readers' own rows are removed)");
+      // Produktimport skive 4-2b: products.weekly_sync's write also logs in the product change log (agent_knowledge_audit).
+      assertEq(grown(t0, tableCounts()).filter((x) => !/^(owner_feature_(audit|change_batch)|agent_knowledge_audit):/.test(x)), [], "run-19c: no table grows except the change log (the readers' own rows are removed)");
       const se: any[] = b.side_effects ?? [];
       assertTrue(se.some((x) => x.table === "tasks" && x.created > 0) && se.every((x) => x.removed === x.created), "run-19d: side effects reported (A2A tasks created by the probe) and removed exactly");
       assertTrue(/## Sideeffekter av lesingene/.test(String(b.markdown)), "run-19e: side effects in the report");
