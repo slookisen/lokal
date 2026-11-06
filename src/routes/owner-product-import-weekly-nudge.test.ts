@@ -153,13 +153,16 @@ export async function runOwnerImportWeeklyNudgeTests(opts: { log?: boolean } = {
       db.prepare("INSERT INTO magic_links (id, email, token, agent_id, used, created_at, expires_at) VALUES (?, ?, ?, ?, 1, ?, ?)")
         .run(`mlsess_${id}`, `post@${id}.example.no`, tokens[id], id, new Date().toISOString(), new Date(Date.now() + DAY).toISOString());
     };
-    const IDS = ["nu-on", "nu-wk", "nu-unver", "nu-off", "nu-zero", "nu-esc"];
+    const ODD = "nu&x?y";
+    const IDS = ["nu-on", "nu-wk", "nu-unver", "nu-off", "nu-zero", "nu-esc", "nu-nolist", ODD];
     addAgent("nu-on", { verified: 1 });
     addAgent("nu-wk", { verified: 1, mode: "weekly" });
     addAgent("nu-unver", { verified: 0 });
     addAgent("nu-off", { verified: 1, mode: "off" });
     addAgent("nu-zero", { verified: 1 });
     addAgent("nu-esc", { verified: 1, mode: "weekly" });
+    addAgent("nu-nolist", { verified: 1 });
+    addAgent(ODD, { verified: 1 });
     for (const id of IDS) session(id);
     const routes: Record<string, FakeRoute> = {};
     for (const id of IDS) {
@@ -197,6 +200,7 @@ export async function runOwnerImportWeeklyNudgeTests(opts: { log?: boolean } = {
     const BASE = "Vil du at vi holder prisene oppdatert hver uke? Slå det på i";
 
     process.env.PRODUCT_IMPORT_ENABLED = "1";
+    process.env.OWNER_FEATURES_ALLOWED_SUBJECTS = ["nu-on", "nu-wk", "nu-unver", "nu-off", "nu-zero", "nu-esc", ODD].map((i) => `rfb:${i}`).join(",");
 
     // ─── Flag off: byte-identical receipt (pure + portal) ───────────────────
     {
@@ -232,6 +236,24 @@ export async function runOwnerImportWeeklyNudgeTests(opts: { log?: boolean } = {
       process.env.PRODUCT_AUTO_SYNC_ENABLED = "1";
     }
 
+    // ─── Allowlist: no link to a «Mine valg» page the owner cannot open ─────
+    {
+      assertTrue(!hasNudge(await portalAlert("nu-nolist", PUB(2))), "no nudge for a verified owner not on OWNER_FEATURES_ALLOWED_SUBJECTS");
+      assertEq(portalMod.weeklySyncNudgeHtml("nu-nolist"), "", "not on the allowlist: empty nudge html");
+      const saved = process.env.OWNER_FEATURES_ALLOWED_SUBJECTS;
+      process.env.OWNER_FEATURES_ALLOWED_SUBJECTS = "";
+      assertTrue(!hasNudge(await portalAlert("nu-on", PUB(2))), "empty allowlist: no nudge");
+      process.env.OWNER_FEATURES_ALLOWED_SUBJECTS = saved;
+      assertTrue(hasNudge(await portalAlert("nu-on", PUB(2))), "listed again: nudge back");
+    }
+
+    // ─── href is URL-encoded for an id that needs it ────────────────────────
+    {
+      const n = portalMod.weeklySyncNudgeHtml(ODD);
+      assertTrue(n.includes('<a href="/eier/nu%26x%3Fy/valg#valg-products.weekly_sync">'), "href: id is encodeURIComponent'ed");
+      assertTrue(hasNudge(await portalAlert(ODD, PUB(1))) && (await portalAlert(ODD, PUB(1))).includes("/eier/nu%26x%3Fy/valg#valg-products.weekly_sync"), "href: encoded on the portal receipt too");
+    }
+
     // ─── Decided from stored state at render time, not a query parameter ────
     {
       const p = await portalAlert("nu-on", { ...PUB(1), uke: "1", weekly: "1", nudge: "0" });
@@ -265,6 +287,13 @@ export async function runOwnerImportWeeklyNudgeTests(opts: { log?: boolean } = {
         (db.prepare("SELECT id, field_name, old_value, new_value, changed_by, changed_at, notes FROM agent_knowledge_audit WHERE agent_id = 'nu-on' AND field_name = 'products.weekly_sync'").all() as any[]));
       assertEq(feed.map((r) => [r.field_name, r.label, r.old_value, r.new_value, r.values_hidden]),
         [["products.weekly_sync", reg.getOwnerFeature("products.weekly_sync").label.no, "Nei", "Ja", false]], "audit: the 4-2a row is shown in the change log with the Mine valg label");
+      // 4-2b: a row written by the «Mine valg» path shows in the log too.
+      const sw0 = require("../owner-features/product-weekly-sync") as typeof import("../owner-features/product-weekly-sync");
+      sw0.writeProductWeeklySync(db, "nu-off", true, { actor: "owner", detail: "post@nu-off.example.no" } as any);
+      const feed2 = lgMod.ownerAuditFeedRows(
+        (db.prepare("SELECT id, field_name, old_value, new_value, changed_by, changed_at, notes FROM agent_knowledge_audit WHERE agent_id = 'nu-off' AND field_name = 'products.weekly_sync'").all() as any[]));
+      assertEq(feed2.map((r) => [r.field_name, r.label, r.old_value, r.new_value, r.who]),
+        [["products.weekly_sync", reg.getOwnerFeature("products.weekly_sync").label.no, "Nei", "Ja", lgMod.OWNER_AUDIT_WHO_OWNER]], "audit: the 4-2b Mine valg row is shown in the change log");
       // The 4-2b writer's row (Mine valg switch) uses the same field name.
       const sw = require("../owner-features/product-weekly-sync") as typeof import("../owner-features/product-weekly-sync");
       assertEq(sw.PRODUCT_WEEKLY_SYNC_KEY in lgMod.OWNER_AUDIT_FIELDS, true, "audit: 4-2b's field name is in the table");

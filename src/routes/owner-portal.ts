@@ -2145,7 +2145,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
     let productImportCard = "";
     try {
       if (productImportCardVisible(agentId, session, agent.is_verified)) {
-        const ia = productImportPortalAlert(status, req.query as any, productImportStockHintHtml(agentId), weeklySyncNudgeHtml(agentId));
+        const ia = productImportPortalAlert(status, req.query as any, productImportStockHintHtml(agentId), status === "produktimport_publisert" ? weeklySyncNudgeHtml(agentId) : "");
         const iaHtml = ia
           ? `<div class="ep-alert ${ia.ok ? "ep-alert-ok" : "ep-alert-error"}" role="${ia.ok ? "status" : "alert"}" data-import-alert="${escapeHtml(status)}">${ia.html}</div>`
           : "";
@@ -3241,12 +3241,17 @@ export function productImportPortalAlert(
 /**
  * Skive 4-2c: after a publish, the pointer to the «Mine valg» weekly-sync row.
  * Decided from stored state at render time with the import page's own rule
- * (importPageAutoSyncChoice: PRODUCT_AUTO_SYNC_ENABLED on and is_verified = 1;
+ * (importPageAutoSyncChoice: PRODUCT_AUTO_SYNC_ENABLED on and is_verified = 1)
+ * plus the «Mine valg» allowlist (isSubjectAllowedForOwnerFeatures, as its page gate;
  * mode 'weekly' = already on, so no nudge). "" otherwise. Never writes.
  */
 export function weeklySyncNudgeHtml(agentId: string): string {
   let choice: ReturnType<typeof importPageAutoSyncChoice> = null;
-  try { choice = importPageAutoSyncChoice(agentId); } catch { choice = null; }
+  try {
+    // «Mine valg» 404s for subjects off the allowlist (pageGate): no link to a page the owner cannot open.
+    if (!isSubjectAllowedForOwnerFeatures("rfb", agentId)) return "";
+    choice = importPageAutoSyncChoice(agentId);
+  } catch { choice = null; }
   if (!choice || choice.mode === "weekly") return "";
   const href = `/eier/${encodeURIComponent(agentId)}/valg#${ownerRowAnchor(PRODUCT_WEEKLY_SYNC_KEY)}`;
   return `<span data-weekly-sync-nudge="1">${escapeHtml("Vil du at vi holder prisene oppdatert hver uke? Slå det på i")} <a href="${escapeHtml(href)}">«Mine valg»</a>.</span>`;
