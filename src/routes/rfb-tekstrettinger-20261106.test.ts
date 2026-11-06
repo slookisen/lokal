@@ -37,6 +37,11 @@ export function runRfbTekstrettinger20261106Tests(): TestSummary {
   ok(!selger.includes("finner dere automatisk"), "/selger: no «finner dere automatisk» in any description");
   ok((selger.match(/Gratis selgerprofil for norske matprodusenter, gårder og REKO-ringer\."/g) || []).length === 3, "/selger: the three descriptions end after the first two sentences");
 
+  const app = read("public", "app.html");
+  ok(!app.includes("finner deg automatisk"), "/app: no «finner deg automatisk»");
+  ok(!app.includes("agenten din svarer for deg"), "/app: the platform does not answer in the producer's name");
+  ok(app.includes("om lokal mat kan finne deg."), "/app: the softened sentence");
+
   const no = read("i18n", "locales", "no.json");
   const en = read("i18n", "locales", "en.json");
   ok(!/kundene finner deg/.test(no) && (no.match(/kundene kan finne deg/g) || []).length === 2, "footer no: «kan finne»");

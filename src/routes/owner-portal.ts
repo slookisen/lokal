@@ -123,9 +123,9 @@ interface SessionData {
 // ─────────────────────────────────────────────────────────────────
 // POST /api/agents/:id/request-magic-link
 // ─────────────────────────────────────────────────────────────────
-// 1. Validate email matches agent's registered email (case-insensitive), or
+// 1. Rate-limit: max 3 requests per hour, before the address is looked at
+// 2. Validate email matches agent's registered email (case-insensitive), or
 //    the confirmed address of this agent's verified owner (K5, below)
-// 2. Rate-limit: max 3 requests per hour
 // 3. Generate secure token
 // 4. Store in magic_links table
 // 5. Send email with verify link
