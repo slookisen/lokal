@@ -4,8 +4,8 @@ import { getDb } from "../database/init";
 import {
   verifyOwnerSession, isVerifiedOwner, OWNER_NOT_VERIFIED_MESSAGE, portalWriteRefusedPage,
   portalShell, ownerNotVerifiedPage,
-  ownerOrderEmailEnabled, currentOrderRecipient, pendingOrderEmailChange, requestOwnerOrderEmailChange,
-  parseResumeDate, ownerUnifiedSessionEnabled,
+  ownerOrderEmailEnabledFor, currentOrderRecipient, pendingOrderEmailChange, requestOwnerOrderEmailChange,
+  parseResumeDate, ownerUnifiedSessionEnabledFor,
 } from "./owner-portal";
 import { isCrossSiteWrite } from "../middleware/same-origin-write";
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
@@ -379,7 +379,7 @@ function itemsHref(agentId: string): string {
   const id = encodeURIComponent(agentId);
   // B1: with the orderability card on, it is the place to make items orderable.
   if (ownerOrderabilityPortalEnabledFor(agentId)) return `/eier/${id}/portal#bestillbare-varer`;
-  return ownerUnifiedSessionEnabled() ? `/eier/${id}/portal#produkter` : `/selger?agent=${id}`;
+  return ownerUnifiedSessionEnabledFor(agentId) ? `/eier/${id}/portal#produkter` : `/selger?agent=${id}`;
 }
 
 /**
@@ -511,7 +511,7 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
     let orderEmail: { enabled: boolean; current: string | null; pending: string | null } | null = null;
     try {
       orderEmail = {
-        enabled: ownerOrderEmailEnabled(),
+        enabled: ownerOrderEmailEnabledFor(agentId),
         current: currentOrderRecipient(agentId),
         pending: pendingOrderEmailChange(agentId)?.new_email ?? null,
       };

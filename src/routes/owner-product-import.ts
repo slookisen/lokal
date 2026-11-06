@@ -56,7 +56,7 @@ import {
   getOwnerImportOverview,
   getOwnerImportPreview,
   OWNER_IMPORT_NO_WEBSITE_MESSAGE,
-  productImportEnabled,
+  productImportEnabledFor,
   profileWebsite,
   publishOwnerImport,
   startOwnerFetch,
@@ -77,7 +77,7 @@ type AccessCheck =
   | { ok: false; reason: "flag_off" | "not_logged_in" | "cross_site" | "foreign" | "not_verified"; agentId: string; session: Session | null };
 
 function checkOwnerImportAccess(req: Request, agentId: string, opts: { write: boolean }): AccessCheck {
-  if (!productImportEnabled()) return { ok: false, reason: "flag_off", agentId, session: null };
+  if (!productImportEnabledFor(agentId)) return { ok: false, reason: "flag_off", agentId, session: null };
   const session = verifyOwnerSession(req);
   if (!session.valid) return { ok: false, reason: "not_logged_in", agentId, session };
   if (opts.write && isCrossSiteWrite(req)) return { ok: false, reason: "cross_site", agentId, session };

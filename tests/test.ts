@@ -52519,3 +52519,26 @@ runSerial(async () => {
     failures.push("product-auto-sync: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-11-05-eierflagg-koblet-til-pilotlisten: PRODUCT_IMPORT_ENABLED,
+// OWNER_ORDER_EMAIL_ENABLED, OWNER_UNIFIED_SESSION_ENABLED and
+// PRODUCT_IMPORT_OUTREACH_ENABLED accept exactly "pilot" (on only for owners in
+// OWNER_FEATURES_ALLOWED_SUBJECTS); "1"/"true" unchanged; anything else off.
+// Per call site, the admin prepare route's per-id rejection and the switch
+// probe's mode report. Swaps the getDb() singleton and env (restored in
+// finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── eierflagg med pilotmodus (OWNER_FEATURES_ALLOWED_SUBJECTS) ──");
+  try {
+    const { runOwnerFlagPilotTests } = require("../src/owner-features/owner-flag-pilot.test") as
+      typeof import("../src/owner-features/owner-flag-pilot.test");
+    const r = await runOwnerFlagPilotTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-flag-pilot: " + f);
+    console.log(`  owner-flag-pilot: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-flag-pilot: unexpected error: " + String(err?.message || err));
+  }
+});
