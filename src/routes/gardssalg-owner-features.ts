@@ -45,8 +45,10 @@ import {
 import {
   formatOwnerFeatureValue,
   renderOwnerFeaturesPageBody,
+  renderOwnerFeaturesPageFragment,
   type OwnerPageBooking,
   type OwnerPageGardssalgStats,
+  type OwnerPageModel,
   type OwnerPageNotice,
   type OwnerPageVariant,
 } from "../owner-features/page";
@@ -54,7 +56,9 @@ import { readOwnerFeatureInterest, recordOwnerFeatureInterest } from "../owner-f
 import {
   OWNER_ANCHOR_FALLBACK, OWNER_ANCHOR_LEVEL, OWNER_ANCHOR_LEVEL_PREVIEW, OWNER_ANCHOR_PLANNED,
   isOwnerPageAnchor, ownerBatchAnchor, ownerPageTail, ownerPlannedAnchor, ownerRowAnchor, ownerUndoAnchor,
+  parseOwnerFragmentParam, withOwnerFragment,
 } from "../owner-features/anchors";
+import { OWNER_FRAGMENT_HEADER } from "../owner-ui/enhance";
 
 // ─────────────────────────────────────────────────────────────────
 // «Mine valg» for gårdssalg owners — dev-request 2026-10-22-opplevagent-
@@ -285,9 +289,9 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
     return { ok: true, provider, slug, token: session.token };
   }
 
-  /** T5: 303 back to the page — `query` with the message placed at `anchor`, and `#anchor`. */
+  /** T5: 303 back to the page — `query` with the message placed at `anchor`, and `#anchor` (T9: `?fragment=` passed on). */
   const backTo = (res: Response, slug: string, query: string, anchor: string, opts: { place?: boolean } = {}): Response => {
-    res.redirect(303, PAGE_PATH(slug, ownerPageTail(query, anchor, opts)));
+    res.redirect(303, PAGE_PATH(slug, ownerPageTail(withOwnerFragment(query, (res as any).req), anchor, opts)));
     return res;
   };
 
@@ -422,7 +426,7 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
         readMoreUrl: GARDSSALG_BOOKING_READ_MORE_URL,
       };
 
-      const body = renderOwnerFeaturesPageBody({
+      const model: OwnerPageModel = {
         agent: { id: provider.id, name: String(provider.navn || "") },
         resolved,
         registry,
@@ -438,8 +442,19 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
         booking,
         gardssalgStats: gardssalgOwnerPageStats(provider),
         statsHref: PORTAL_PATH(slug),
-      });
+      };
       res.setHeader("Cache-Control", "no-store");
+      // T9: `?fragment=` → only those regions (same render), after the same gate.
+      const fragment = qs("fragment");
+      if (fragment !== "") {
+        const ids = parseOwnerFragmentParam(fragment);
+        const html = ids ? renderOwnerFeaturesPageFragment(model, ids) : null;
+        if (html === null) return res.status(404).type("text/plain").send("Fant ikke delen av siden.");
+        res.setHeader(OWNER_FRAGMENT_HEADER, ids!.join(","));
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
+        return res.send(html);
+      }
+      const body = renderOwnerFeaturesPageBody(model);
       return res.send(shell(`Mine valg · ${provider.navn}`, `${body}<style>${GARDSSALG_PAGE_CSS}</style>`));
     } catch (e) {
       return fail("GET valg")(res, e);

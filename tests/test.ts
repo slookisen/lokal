@@ -51370,6 +51370,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-30-rfb-eierportal-testrunde-1, T9 («lagres der du står»,
+// steg 2): ?fragment= regions, the shared script (no re-send on an HTTP
+// answer), one #mv-status, no inline handlers. Swaps getDb() + env + module
+// cache — runSerial.
+runSerial(async () => {
+  console.log("\n── eierportal testrunde 1 T9: lagres der du står, steg 2 ──");
+  try {
+    const { runOwnerFeaturesT9EnhanceTests } = require("../src/routes/owner-features-t9-enhance.test") as
+      typeof import("../src/routes/owner-features-t9-enhance.test");
+    const r = await runOwnerFeaturesT9EnhanceTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-features-t9-enhance: " + f);
+    console.log(`  owner-features-t9-enhance: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-features-t9-enhance: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // Eierportal testrunde 1, T6 («felles drakt, lys og mørk»): shared colour
 // tokens on «Mine valg», the portal and the owner's «Mine ordrer» list —
 // contrast ≥ 4.5:1 / 3:1 in both themes, no colour inline styles for an

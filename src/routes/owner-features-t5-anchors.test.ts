@@ -407,7 +407,10 @@ export async function runOwnerFeaturesT5AnchorsTests(opts: { log?: boolean } = {
 
       // ── The script: no anchor-less navigation, no inline handlers ────────
       assertTrue(!pg.OWNER_PAGE_SCRIPT.includes("window.location") && !pg.OWNER_PAGE_SCRIPT.includes("getElementById(\"bekreft\")"), "r57: the script never navigates to Response.url");
-      assertTrue(pg.OWNER_PAGE_SCRIPT.includes("f.submit()"), "r58: errors fall back to the plain form POST (its 303 keeps the anchor)");
+      // T9 (FUNN t5-gjeninnsending-ordre-epost): an HTTP error answer is shown, never re-sent; only a
+      // failed fetch (no answer) falls back to the plain form POST, whose 303 keeps the anchor.
+      assertTrue(!pg.OWNER_PAGE_SCRIPT.includes("f.submit()") && pg.OWNER_PAGE_SCRIPT.includes("HTMLFormElement.prototype.submit"),
+        "r58: a failed fetch falls back to the plain form POST; an error answer is never re-sent (T9)");
       let compiles = true;
       try { new vm.Script(pg.OWNER_PAGE_SCRIPT); } catch { compiles = false; }
       assertTrue(compiles, "r59: the script compiles");

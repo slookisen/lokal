@@ -431,7 +431,7 @@ export async function runOwnerFeaturesS2eTests(opts: { log?: boolean } = {}): Pr
       // One exception: the owner turns the stock check off.
       await post(H.sett, FIX, { key: "products.stock_check", value: "false", confirmed: "1" });
       const fe = await pageHtml(FIX);
-      assertTrue(fe.includes("Tilpasset: valgene dine bygger på «Utnytte mulighetene», med 1 unntak.") && fe.includes(`href="/eier/${FIX}/valg?niva=utnytte_mulighetene#niva-forhandsvis">Tilbakestill til «Utnytte mulighetene»</a>`),
+      assertTrue(fe.includes("Tilpasset: valgene dine bygger på «Utnytte mulighetene», med 1 unntak.") && fe.includes(`href="/eier/${FIX}/valg?niva=utnytte_mulighetene#niva-forhandsvis" data-mv-row="niva">Tilbakestill til «Utnytte mulighetene»</a>`),
         "T8: one exception → «Tilpasset … 1 unntak» + «Tilbakestill til …» (anchor contract)");
       assertTrue(row(fe, "products.stock_check").includes(">Unntak</span>") && row(fe, "products.stock_check").includes("Nivået «Utnytte mulighetene» har dette på."), "T8: the deviating row has «Unntak» and «Nivået … har dette på.»");
       assertTrue(!row(fe, "orders.enabled").includes("Unntak") && !fe.includes(`aria-current="true" data-level=`) && !fe.includes("Du valgte"), "T8: only the deviating row is an exception; no card «Gjelder nå» while custom");
@@ -669,8 +669,10 @@ export async function runOwnerFeaturesS2eTests(opts: { log?: boolean } = {}): Pr
       assertTrue(groups.length >= 4 && groups.includes("gruppe-orders"), "principle 9: every group card can be folded (<details open>)");
       const rowForms = b.match(/<form method="post" action="\/eier\/[^"]+\/valg\/(sett|interesse|ordre-epost)" class="mv-ctl-form" data-mv-row="[^"]+">/g) || [];
       assertTrue(rowForms.length > 5 && rowForms.every((f) => /data-mv-row="(gruppe-[a-z]+|planlagt)"/.test(f)), "principle 9: row forms name the card the script swaps after a save");
-      assertTrue(b.includes(`<div id="mv-toast-slot">`) && !pg.OWNER_PAGE_SCRIPT.includes("window.location") && pg.OWNER_PAGE_SCRIPT.includes("f.submit()"),
-        "principle 9: the script swaps the card + message (T5: the confirm panel too, in its row); errors fall back to the plain form POST");
+      // T9: an HTTP answer is never re-sent (FUNN t5-gjeninnsending-ordre-epost); only a failed fetch falls back to the plain POST.
+      assertTrue(b.includes(`<div id="mv-toast-slot">`) && !pg.OWNER_PAGE_SCRIPT.includes("window.location") && !pg.OWNER_PAGE_SCRIPT.includes("f.submit()")
+        && pg.OWNER_PAGE_SCRIPT.includes("HTMLFormElement.prototype.submit"),
+        "principle 9: the script swaps the changed regions + message (T9); a failed fetch falls back to the plain form POST, an error answer never re-sends it");
       await post(H.sett, OTHER_ID, { key: "orders.enabled", value: "false", confirmed: "1" });
     }
 
