@@ -149,41 +149,9 @@ router.post("/api/agents/:id/request-magic-link", async (req: Request, res: Resp
 
     const db = getDb();
 
-    // 1. Check if email matches agent's registered email + load agent name
-    const agentKnowledge = db
-      .prepare("SELECT email FROM agent_knowledge WHERE agent_id = ?")
-      .get(id) as any;
-    const agentRow = db
-      .prepare("SELECT name FROM agents WHERE id = ?")
-      .get(id) as any;
-
-    // K5 (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post): an owner
-    // Daniel approved by hand is bound to the address he approved
-    // (agent_claims.claimant_email, status 'verified'), often because the one
-    // on the profile was wrong — and approval never touches
-    // agent_knowledge.email. That confirmed address logs in too, for THIS
-    // agent only. Any other address gets the same 404 as before. The link goes
-    // to the confirmed address (normalized), not to the typed variant of it.
-    const knowledgeMatch =
-      !!agentKnowledge &&
-      !!agentKnowledge.email &&
-      agentKnowledge.email.toLowerCase() === email.toLowerCase();
-    const claimantEmail = knowledgeMatch ? null : verifiedClaimantEmailFor(String(id), email);
-
-    if (!knowledgeMatch && !claimantEmail) {
-      console.log(
-        `[owner-portal] Email mismatch for ${id}: provided=${emailLogLabel(email)}, registered=${emailLogLabel(agentKnowledge?.email)}`
-      );
-      return res.status(404).json({
-        success: false,
-        error: "email_not_associated",
-        message: "Den e-posten er ikke registrert for denne produsenten.",
-      });
-    }
-
-    const agentName: string = (agentRow && agentRow.name) ? String(agentRow.name) : "din profil";
-
-    // 2. Rate-limit check
+    // 1. Rate-limit check, BEFORE the address is looked at: over the limit,
+    // every address gets the same 429, so the limit itself does not tell a
+    // visitor which address belongs to the profile.
     // created_at is stored as an ISO-8601 string (now.toISOString(), e.g.
     // "2026-08-06T13:20:00.000Z" — see the INSERT below), while
     // datetime('now', ...) produces SQLite's own native format (e.g.
@@ -216,6 +184,40 @@ router.post("/api/agents/:id/request-magic-link", async (req: Request, res: Resp
         message: "For mange innloggingsforsøk. Prøv igjen senere.",
       });
     }
+
+    // 2. Check if email matches agent's registered email + load agent name
+    const agentKnowledge = db
+      .prepare("SELECT email FROM agent_knowledge WHERE agent_id = ?")
+      .get(id) as any;
+    const agentRow = db
+      .prepare("SELECT name FROM agents WHERE id = ?")
+      .get(id) as any;
+
+    // K5 (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post): an owner
+    // Daniel approved by hand is bound to the address he approved
+    // (agent_claims.claimant_email, status 'verified'), often because the one
+    // on the profile was wrong — and approval never touches
+    // agent_knowledge.email. That confirmed address logs in too, for THIS
+    // agent only. Any other address gets the same 404 as before. The link goes
+    // to the confirmed address (normalized), not to the typed variant of it.
+    const knowledgeMatch =
+      !!agentKnowledge &&
+      !!agentKnowledge.email &&
+      agentKnowledge.email.toLowerCase() === email.toLowerCase();
+    const claimantEmail = knowledgeMatch ? null : verifiedClaimantEmailFor(String(id), email);
+
+    if (!knowledgeMatch && !claimantEmail) {
+      console.log(
+        `[owner-portal] Email mismatch for ${id}: provided=${emailLogLabel(email)}, registered=${emailLogLabel(agentKnowledge?.email)}`
+      );
+      return res.status(404).json({
+        success: false,
+        error: "email_not_associated",
+        message: "Den e-posten er ikke registrert for denne produsenten.",
+      });
+    }
+
+    const agentName: string = (agentRow && agentRow.name) ? String(agentRow.name) : "din profil";
 
     // 3 + 4. Generate secure token, insert into magic_links (shared helper)
     const recipient = claimantEmail ?? email;

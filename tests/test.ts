@@ -50223,6 +50223,17 @@ runSerial(async () => {
 // in-memory DB, stubs the e-mail transporter and the HTTPS probe (restored in
 // finally) — runSerial.
 runSerial(async () => {
+  console.log("\n── public text decisions 2026-11-06 ──");
+  const { runRfbTekstrettinger20261106Tests } = require("../src/routes/rfb-tekstrettinger-20261106.test") as
+    typeof import("../src/routes/rfb-tekstrettinger-20261106.test");
+  const tr = runRfbTekstrettinger20261106Tests();
+  passed += tr.passed;
+  failed += tr.failed;
+  for (const f of tr.failures) failures.push("rfb-tekstrettinger-20261106: " + f);
+  console.log(`  rfb-tekstrettinger-20261106: ${tr.passed} passed, ${tr.failed} failed`);
+});
+
+runSerial(async () => {
   console.log("\n── claim rule slice 1b: RFB claim shared address (delt adresse) ──");
   try {
     const { runRfbClaimDeltAdresseTests } = require("../src/routes/rfb-claim-delt-adresse.test") as
