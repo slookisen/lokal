@@ -191,6 +191,24 @@ export async function runRfbClaimCrmThreadC3Tests(opts: { log?: boolean } = {}):
     process.env.CLAIM_CRM_TRACKING_ENABLED = "true";
     const A = agent("c3-on");
     const FARM = `post@${A}.example.test`;
+    // Unrelated outreach_sent_log rows that must survive the per-message
+    // cleanup DELETE in claim-crm-tracking (scope pinned to message_id).
+    const OTHER = agent("c3-other");
+    const insSent = db.prepare(
+      `INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes, vertical_id)
+       VALUES (?, ?, datetime('now', '-3 days'), 'email', ?, ?, 'rfb')`,
+    );
+    const seeded = [
+      [OTHER, `post@${OTHER}.example.test`, "seed-other-cold-msg", "auto:cold_outreach_v2"],
+      [OTHER, null, "seed-backfill-msg", "backfill:pr38_marketing_sends_v1"],
+      [A, FARM, "seed-same-farm-cold-msg", "auto:cold_outreach_v2"],
+      [A, FARM, "seed-same-farm-confirm-msg", "auto:cold_outreach_confirm_v2"],
+    ] as const;
+    const seededIds = seeded.map((r) => Number(insSent.run(...r).lastInsertRowid));
+    const seededRows = (): unknown[] =>
+      db.prepare(`SELECT id, agent_id, recipient_email, message_id, notes FROM outreach_sent_log WHERE id IN (${seededIds.join(",")}) ORDER BY id`).all();
+    const seededBefore = seededRows();
+    eq(seededBefore.length, seeded.length, "C3.1: setup — unrelated outreach_sent_log rows seeded");
     const r1 = await claim(A);
     eq([r1.status, r1.body?.data?.status], [200, "code_sent"], "C3.1: the claim request sends the code (200, code_sent)");
     const claimId: string = r1.body?.data?.claimId;
@@ -208,6 +226,7 @@ export async function runRfbClaimCrmThreadC3Tests(opts: { log?: boolean } = {}):
     const contact = db.prepare("SELECT email, vertical_id FROM crm_contacts WHERE id = ?").get(thread.contact_id) as any;
     eq([contact?.email, contact?.vertical_id], [FARM, "rfb"], "C3.1: … contact resolved for that address on rfb");
     ok(!JSON.stringify([thread, msgs]).includes(code), "C3.1: the code is nowhere in the stored thread or message");
+    eq(tracking.CODE_MASK, "••••••", "C3.1: … the code mask is the literal non-empty mask");
     ok([msgs[0].body_text, msgs[0].body_html].every((b: string) => b.includes(tracking.CODE_MASK)), "C3.1: … the bodies carry the mask instead");
     eq(msgs[0].subject, mails[mails.length - 1].subject, "C3.1: … the stored subject is the sent subject");
 
@@ -229,11 +248,16 @@ export async function runRfbClaimCrmThreadC3Tests(opts: { log?: boolean } = {}):
     const appr = msgs[2];
     ok(!JSON.stringify(appr).includes(token) && !/magic-link-verify|token=/.test(JSON.stringify(appr)),
       "C3.1: … no token and no login link in the stored approval message");
+    eq(tracking.LOGIN_LINK_PLACEHOLDER, "[innloggingslenke]", "C3.1: … the login-link placeholder is the literal non-empty placeholder");
     ok(appr.body_text.includes(tracking.LOGIN_LINK_PLACEHOLDER) && appr.body_html.includes(tracking.LOGIN_LINK_PLACEHOLDER),
       "C3.1: … the link is replaced by [innloggingslenke]");
     ok(!JSON.stringify(msgs).includes(code), "C3.1: the code is still nowhere in the thread");
-    eq((db.prepare("SELECT COUNT(*) AS n FROM outreach_sent_log WHERE recipient_email = ? OR message_id IN (SELECT id FROM crm_messages WHERE thread_id = ?)")
+    eq(msgs.length, 3, "C3.1: … three claim message ids to check");
+    eq((db.prepare(`SELECT COUNT(*) AS n FROM outreach_sent_log WHERE (recipient_email = ? AND id NOT IN (${seededIds.join(",")}))
+        OR message_id IN (SELECT id FROM crm_messages WHERE thread_id = ?)`)
       .get(FARM, `claim-${claimId}`) as any).n, 0, "C3.1: no outreach_sent_log (max-touch-vern) row for the claim mails");
+    eq(seededRows(), seededBefore,
+      "C3.1: … the cleanup is scoped to the claim's own message_id — unrelated cold-outreach, backfill and same-farm rows all survive");
 
     // ══ C3.2 getThreadDetail (GET /admin/crm/threads/:id) ════════════════
     {
