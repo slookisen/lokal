@@ -37,10 +37,12 @@ import {
   OWNER_NEWS_ANSWER_TEXT, OWNER_NEWS_CONSENT_VERSION, OWNER_NEWS_PLACEMENTS, OWNER_NEWS_PLACEMENT_QUESTION, OWNER_NEWS_PLACEMENT_ROW,
   type OwnerNewsPlacement,
 } from "../owner-features/news-consent";
-import { formatOwnerFeatureValue, ownerPageStatsFrom, renderOwnerFeaturesPageBody, type OwnerPageNotice, type OwnerPageStats } from "../owner-features/page";
+import { formatOwnerFeatureValue, ownerPageStatsFrom, renderOwnerFeaturesPageBody, renderOwnerFeaturesPageFragment, type OwnerPageModel, type OwnerPageNotice, type OwnerPageStats } from "../owner-features/page";
+import { OWNER_FRAGMENT_HEADER } from "../owner-ui/enhance";
 import {
   OWNER_ANCHOR_FALLBACK, OWNER_ANCHOR_LEVEL, OWNER_ANCHOR_LEVEL_PREVIEW, OWNER_ANCHOR_NEWS_QUESTION, OWNER_ANCHOR_PLANNED,
   isOwnerPageAnchor, ownerBatchAnchor, ownerPageTail, ownerPlannedAnchor, ownerRowAnchor, ownerUndoAnchor,
+  parseOwnerFragmentParam, withOwnerFragment,
 } from "../owner-features/anchors";
 import { getOwnerStats } from "../services/owner-stats-service";
 import { publicStatsMinViews } from "../services/public-stats-threshold";
@@ -214,7 +216,9 @@ router.put("/api/owner/:id/features/:key", (req: Request, res: Response) => {
 //   GET  /eier/:agentId/valg            the page (?niva= level confirm panel,
 //                                       ?bekreft=&verdi= switch confirm panel,
 //                                       ?side= change-log page, ?endret= /
-//                                       ?melding= the message at the bottom)
+//                                       ?melding= the message at the bottom;
+//                                       T9: ?fragment=<region>[,…] only those
+//                                       regions, unknown id → 404)
 //   POST /eier/:agentId/valg/sett       { key, value[, confirmed] } one entry
 //   POST /eier/:agentId/valg/niva       { level, confirmed } apply a level
 //   POST /eier/:agentId/valg/angre      { batch } undo the newest change
@@ -258,9 +262,12 @@ function pageGate(req: Request): Gate {
   return { ok: true, agentId, token: session.token };
 }
 
-/** T5: 303 back to the page — `query` with the message placed at `anchor`, and `#anchor`. */
+/**
+ * T5: 303 back to the page — `query` with the message placed at `anchor`, and
+ * `#anchor`. T9: a POST sent by the script with `?fragment=` passes it on.
+ */
 function backTo(res: Response, agentId: string, query: string, anchor: string, opts: { place?: boolean } = {}): Response {
-  res.redirect(303, pagePath(agentId, ownerPageTail(query, anchor, opts)));
+  res.redirect(303, pagePath(agentId, ownerPageTail(withOwnerFragment(query, (res as any).req), anchor, opts)));
   return res;
 }
 
@@ -516,7 +523,7 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
         pending: pendingOrderEmailChange(agentId)?.new_email ?? null,
       };
     } catch { orderEmail = null; }
-    const body = renderOwnerFeaturesPageBody({
+    const model: OwnerPageModel = {
       agent: { id: agent.id, name: String(agent.name || "") },
       resolved,
       level: currentOwnerLevel(VERTICAL, agentId, resolved),
@@ -537,9 +544,19 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
       orderTimings: { reminderHours: orderReminderHours(), autocancelHours: orderAutocancelHours(), dailyCap: orderCapNewPerDay(), capNotice: isOrderCapNoticeEnabled() },
       stats: ownerPageStats(agent.id, String(agent.name || ""), db),
       statsHref: ownerStatsHref(agent.id),
-    });
+    };
     res.setHeader("Cache-Control", "no-store");
-    return res.send(portalShell(`Mine valg · ${agent.name}`, body));
+    // T9: `?fragment=` → only those regions (same render), after the same gate; a GET writes nothing.
+    const fragment = qs("fragment");
+    if (fragment !== "") {
+      const ids = parseOwnerFragmentParam(fragment);
+      const html = ids ? renderOwnerFeaturesPageFragment(model, ids) : null;
+      if (html === null) return res.status(404).type("text/plain").send("Fant ikke delen av siden.");
+      res.setHeader(OWNER_FRAGMENT_HEADER, ids!.join(","));
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      return res.send(html);
+    }
+    return res.send(portalShell(`Mine valg · ${agent.name}`, renderOwnerFeaturesPageBody(model)));
   } catch (e: any) {
     console.error("[owner-features] GET /eier/:agentId/valg failed:", e);
     return simplePage(500, "Feil", `<h1>Noe gikk galt</h1><p>Prøv igjen senere.</p>`)(res);

@@ -62,6 +62,7 @@ import {
 } from "./changes";
 import type { OwnerStats } from "../services/owner-stats-service";
 import {
+  OWNER_ANCHOR_FALLBACK,
   OWNER_ANCHOR_LEVEL,
   OWNER_ANCHOR_LEVEL_PREVIEW,
   OWNER_ANCHOR_LOG,
@@ -71,6 +72,7 @@ import {
 } from "./anchors";
 import { OPPLEVAGENT_PRICE_MESSAGE } from "./price-message";
 import { OWNER_TOKEN_CSS } from "../owner-ui/tokens";
+import { OWNER_ENHANCE_SCRIPT, OWNER_STATUS_CSS, OWNER_STATUS_HTML } from "../owner-ui/enhance";
 import { OWNER_COMMS_GROUP_NOTE, OWNER_NEWS_CONSENT_TEXT, OWNER_NEWS_PLACEMENT_QUESTION, OWNER_NOTIFY_GROUP_NOTE } from "./news-consent";
 import { stockSoftExpiryActiveFor } from "../services/stock-soft-expiry";
 
@@ -437,9 +439,13 @@ function isTarget(m: OwnerPageModel, key: string): boolean {
   return m.noticeAt === ownerRowAnchor(key) || (!!m.confirm && m.confirm.key === key);
 }
 
-/** `data-mv-row` names the element the enhancement script swaps after a save. */
-function rowForm(m: OwnerPageModel, tail: string, swap: string, inner: string): string {
-  return `<form method="post" action="${esc(actionPath(m, tail))}" class="mv-ctl-form" data-mv-row="${esc(swap)}">${inner}</form>`;
+/**
+ * `data-mv-row` names the card the form sits in (the T9 script saves it in
+ * place); `once` (T9) marks a form whose POST is never sent again by the
+ * script (it sends an e-mail).
+ */
+function rowForm(m: OwnerPageModel, tail: string, swap: string, inner: string, once = false): string {
+  return `<form method="post" action="${esc(actionPath(m, tail))}" class="mv-ctl-form" data-mv-row="${esc(swap)}"${once ? ` data-mv-once="1"` : ""}>${inner}</form>`;
 }
 
 /** The control for one row. */
@@ -499,6 +505,7 @@ function orderEmailControlHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: Resolved
     `<label class="mv-sr" for="${fieldId}">Ny adresse for bestillinger</label>` +
     `<input id="${fieldId}" name="email" type="email" required autocomplete="email" placeholder="Ny adresse">` +
     `<button type="submit" class="ep-btn ep-btn-secondary">Send bekreftelse</button>`,
+    true,
   );
 }
 
@@ -693,12 +700,13 @@ function groupEntries(m: OwnerPageModel, registry: OwnerFeatureEntry[], group: s
   return { reveal, shown, hidden };
 }
 
-function groupsHtml(ctx: RenderCtx, registry: OwnerFeatureEntry[]): string {
+/** One card per group (T9: each is a region `gruppe-<key>`; "" = the group has nothing to show). */
+function groupRegions(ctx: RenderCtx, registry: OwnerFeatureEntry[]): OwnerPageRegion[] {
   const m = ctx.m;
   return pageGroups(m).map((g) => {
-    const { reveal, shown, hidden } = groupEntries(m, registry, g.key);
-    if (shown.length === 0 && hidden.length === 0) return "";
     const swap = `gruppe-${g.key}`;
+    const { reveal, shown, hidden } = groupEntries(m, registry, g.key);
+    if (shown.length === 0 && hidden.length === 0) return { id: swap, html: "" };
     const basic = shown.filter((e) => !e.advanced).map((e) => rowHtml(ctx, e, m.resolved.byKey[e.key], swap)).join("");
     const advEntries = shown.filter((e) => e.advanced);
     const adv = advEntries.map((e) => rowHtml(ctx, e, m.resolved.byKey[e.key], swap)).join("");
@@ -709,7 +717,7 @@ function groupsHtml(ctx: RenderCtx, registry: OwnerFeatureEntry[]): string {
       : "";
     // T7: the group subtitles, and the news question at the top of «comms» (RFB page only).
     const note = m.variant ? "" : g.key === "comms" ? OWNER_COMMS_GROUP_NOTE : g.key === "notify" ? OWNER_NOTIFY_GROUP_NOTE : "";
-    return `<section class="ep-card mv-group" id="${esc(swap)}" data-group="${esc(g.key)}" aria-labelledby="mv-h-${esc(g.key)}">
+    return { id: swap, html: `<section class="ep-card mv-group" id="${esc(swap)}" data-group="${esc(g.key)}" aria-labelledby="mv-h-${esc(g.key)}">
         <details class="mv-fold" open>
           <summary class="mv-fold-summary"><h2 id="mv-h-${esc(g.key)}">${esc(g.label.no)}</h2></summary>
           ${note ? `<p class="mv-desc mv-group-note">${esc(note)}</p>` : ""}
@@ -719,8 +727,8 @@ function groupsHtml(ctx: RenderCtx, registry: OwnerFeatureEntry[]): string {
           ${adv ? `<details class="mv-more"${advOpen ? " open" : ""}><summary>Flere valg</summary><ul class="mv-list">${adv}</ul></details>` : ""}
           ${hiddenNote}
         </details>
-      </section>`;
-  }).join("\n");
+      </section>` };
+  });
 }
 
 /** v2 principle 2: every planned entry, closed by default, «Gi meg beskjed» per row, no value. */
@@ -762,7 +770,7 @@ function levelsHtml(ctx: RenderCtx): string {
           <p class="mv-desc">${esc(l.description.no)}</p>
           ${current
             ? `<span class="mv-state">Valgt</span>`
-            : `<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m, `?niva=${encodeURIComponent(l.key)}#${OWNER_ANCHOR_LEVEL_PREVIEW}`))}">Velg «${esc(l.label.no)}»</a>`}
+            : `<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m, `?niva=${encodeURIComponent(l.key)}#${OWNER_ANCHOR_LEVEL_PREVIEW}`))}" data-mv-row="${OWNER_ANCHOR_LEVEL}">Velg «${esc(l.label.no)}»</a>`}
         </li>`;
   }).join("");
   const note = m.level === "custom"
@@ -794,7 +802,7 @@ function levelStatusLineHtml(m: OwnerPageModel, st: OwnerLevelStatus | null): st
       return `<p class="mv-note" data-level-status="matches">Valgene dine passer med «${name}».</p>`;
     case "custom": {
       const href = actionPath(m, `?niva=${encodeURIComponent(st.level.key)}#${OWNER_ANCHOR_LEVEL_PREVIEW}`);
-      return `<p class="mv-note" data-level-status="custom">Tilpasset: valgene dine bygger på «${name}», med ${st.exceptions.length} unntak. <a href="${esc(href)}">Tilbakestill til «${name}»</a></p>`;
+      return `<p class="mv-note" data-level-status="custom">Tilpasset: valgene dine bygger på «${name}», med ${st.exceptions.length} unntak. <a href="${esc(href)}" data-mv-row="${OWNER_ANCHOR_LEVEL}">Tilbakestill til «${name}»</a></p>`;
     }
   }
 }
@@ -815,7 +823,7 @@ function rfbLevelsHtml(ctx: RenderCtx): string {
           <p class="mv-desc">${esc(l.description.no)}</p>
           ${current
             ? `<span class="mv-state">Gjelder nå</span>`
-            : `<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m, `?niva=${encodeURIComponent(l.key)}#${OWNER_ANCHOR_LEVEL_PREVIEW}`))}">Velg «${esc(l.label.no)}»</a>`}
+            : `<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m, `?niva=${encodeURIComponent(l.key)}#${OWNER_ANCHOR_LEVEL_PREVIEW}`))}" data-mv-row="${OWNER_ANCHOR_LEVEL}">Velg «${esc(l.label.no)}»</a>`}
         </li>`;
   }).join("");
   // T5: the preview and the level message stand inside the level card.
@@ -854,8 +862,8 @@ function levelPreviewHtml(m: OwnerPageModel): string {
     return `<li><strong>${esc(label(c.key))}</strong>: ${esc(formatOwnerFeatureValue(e, c.from))} → ${esc(formatOwnerFeatureValue(e, c.to))}${confirm ? `<p class="mv-desc">${esc(confirm.no)}</p>` : ""}</li>`;
   }).join("");
   const skipped = p.skipped.map((s) => `<li><strong>${esc(label(s.key))}</strong> endres ikke: ${esc(s.reason.no)}</li>`).join("");
-  const cancel = `<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m, `#${OWNER_ANCHOR_LEVEL}`))}">Avbryt</a>`;
-  const confirmForm = `<form method="post" action="${esc(actionPath(m, "/niva"))}" class="mv-ctl-form">
+  const cancel = `<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m, `#${OWNER_ANCHOR_LEVEL}`))}" data-mv-cancel="1">Avbryt</a>`;
+  const confirmForm = `<form method="post" action="${esc(actionPath(m, "/niva"))}" class="mv-ctl-form" data-mv-row="${OWNER_ANCHOR_LEVEL}">
             <input type="hidden" name="level" value="${esc(p.level.key)}">
             <input type="hidden" name="confirmed" value="1">
             <button type="submit" class="ep-btn ep-btn-primary">Bekreft «${esc(p.level.label.no)}»</button>
@@ -896,7 +904,7 @@ function confirmHtml(m: OwnerPageModel, swap: string): string {
           ${until}
           <div class="ep-form-actions">
             <button type="submit" class="ep-btn ep-btn-primary">Ja, ${esc(c.value ? "slå på" : "slå av")}</button>
-            <a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m, `#${ownerRowAnchor(e.key)}`))}">Avbryt</a>
+            <a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m, `#${ownerRowAnchor(e.key)}`))}" data-mv-cancel="1">Avbryt</a>
           </div>
         </form>
       </div>`;
@@ -937,8 +945,8 @@ function logHtml(ctx: RenderCtx): string {
           <div class="ep-audit-meta">${esc(formatWhen(r.at))} · ${esc(who)}</div></li>`;
   }).join("");
   const nav: string[] = [];
-  if (m.log.page > 1) nav.push(`<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m, `?side=${m.log.page - 1}#endringslogg`))}">Nyere</a>`);
-  if (m.log.page < m.log.pages) nav.push(`<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m, `?side=${m.log.page + 1}#endringslogg`))}">Eldre</a>`);
+  if (m.log.page > 1) nav.push(`<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m, `?side=${m.log.page - 1}#endringslogg`))}" data-mv-row="${OWNER_ANCHOR_LOG}">Nyere</a>`);
+  if (m.log.page < m.log.pages) nav.push(`<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m, `?side=${m.log.page + 1}#endringslogg`))}" data-mv-row="${OWNER_ANCHOR_LOG}">Eldre</a>`);
   return `<section class="ep-card" id="endringslogg" aria-labelledby="mv-h-logg">
         <details class="mv-fold" open>
           <summary class="mv-fold-summary"><h2 id="mv-h-logg">Endringslogg</h2></summary>
@@ -955,7 +963,7 @@ function noticeHtml(m: OwnerPageModel, inline = false): string {
   const n = m.notice;
   if (!n) return "";
   const undo = n.undoBatchId
-    ? `<form method="post" action="${esc(actionPath(m, "/angre"))}" class="mv-ctl-form"><input type="hidden" name="batch" value="${esc(n.undoBatchId)}"><button type="submit" class="ep-btn ep-btn-secondary">Angre</button></form>`
+    ? `<form method="post" action="${esc(actionPath(m, "/angre"))}" class="mv-ctl-form" data-mv="angre"><input type="hidden" name="batch" value="${esc(n.undoBatchId)}"><button type="submit" class="ep-btn ep-btn-secondary">Angre</button></form>`
     : "";
   return `<div class="mv-toast${inline ? " mv-toast-inline" : ""} ${n.ok ? "mv-toast-ok" : "mv-toast-error"}" role="${n.ok ? "status" : "alert"}"><span>${esc(n.text)}</span>${undo}</div>`;
 }
@@ -1040,61 +1048,11 @@ function jumpNavHtml(m: OwnerPageModel, registry: OwnerFeatureEntry[]): string {
 }
 
 /**
- * v2 principle 9: a save updates only its card. Progressive enhancement over
- * the plain forms (which keep working without JavaScript): a form marked
- * data-mv-row is POSTed with fetch, the 303 is followed, and the named card,
- * the levels card, the message slot and the change log are swapped in from
- * the returned page. T5: a confirm panel now stands inside its row, so it is
- * swapped in with the card (no navigation, focus moves to its heading); an
- * error or anything unexpected → the plain form POST (form.submit()), whose
- * 303 keeps its anchor. The script never navigates to the anchor-less
- * Response.url.
+ * v2 principle 9 / T9: a save updates only the regions it changed. The
+ * shared enhancement script (owner-ui/enhance.ts) over the plain forms,
+ * which keep working without JavaScript (303 + anchor, T5).
  */
-export const OWNER_PAGE_SCRIPT = `
-(function () {
-  if (!window.fetch || !window.DOMParser || !window.FormData || !window.URLSearchParams) return;
-  var page = document.querySelector(".mv-page");
-  if (!page) return;
-  function swap(doc, id) {
-    var cur = document.getElementById(id), next = doc.getElementById(id);
-    if (!cur || !next) return;
-    if (cur.tagName === "DETAILS" && cur.open) next.setAttribute("open", "");
-    var curFold = cur.querySelector("details.mv-fold"), nextFold = next.querySelector("details.mv-fold");
-    if (curFold && nextFold && !curFold.open) nextFold.removeAttribute("open");
-    cur.parentNode.replaceChild(document.importNode(next, true), cur);
-  }
-  function dropMessages() {
-    var old = page.querySelectorAll(".mv-toast, .mv-confirm[data-confirm-key]");
-    for (var i = 0; i < old.length; i++) old[i].parentNode.removeChild(old[i]);
-  }
-  page.addEventListener("submit", function (ev) {
-    var f = ev.target;
-    if (!f || f.tagName !== "FORM" || !f.getAttribute("data-mv-row") || String(f.method).toLowerCase() !== "post") return;
-    ev.preventDefault();
-    var btn = f.querySelector("button[type=submit]");
-    if (btn) btn.disabled = true;
-    fetch(f.action, {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams(new FormData(f)).toString()
-    }).then(function (r) {
-      return r.text().then(function (t) { return { ok: r.ok, url: r.url, html: t }; });
-    }).then(function (out) {
-      var doc = new DOMParser().parseFromString(out.html, "text/html");
-      if (!out.ok || !doc.querySelector(".mv-page")) {
-        f.submit();
-        return;
-      }
-      dropMessages();
-      [f.getAttribute("data-mv-row"), "niva", "mv-toast-slot", "endringslogg"].forEach(function (id) { swap(doc, id); });
-      var card = document.getElementById(f.getAttribute("data-mv-row"));
-      var head = card && card.querySelector(".mv-confirm h3");
-      if (head && head.focus) head.focus();
-    }).catch(function () { f.submit(); });
-  });
-})();
-`;
+export const OWNER_PAGE_SCRIPT = OWNER_ENHANCE_SCRIPT;
 
 /**
  * Page-only CSS on top of PORTAL_PALETTE_CSS: layout, ≥ 44 px targets, dark
@@ -1168,7 +1126,7 @@ ${OWNER_TOKEN_CSS}  .mv-page, .mv-page * { overflow-wrap: anywhere; }
   .mv-stat strong { font-size: 1.4rem; color: var(--ow-accent); }
   .mv-stat span { font-size: 0.88rem; font-weight: 600; }
   .mv-stat small { font-size: 0.78rem; color: var(--ow-muted); }
-  @media (prefers-color-scheme: dark) {
+${OWNER_STATUS_CSS}  @media (prefers-color-scheme: dark) {
     body { background: var(--ow-page-bg); color: var(--ow-text); }
     a, .ep-logo { color: var(--ow-accent); }
     .ep-logo span { color: var(--ow-logo-accent); }
@@ -1184,13 +1142,55 @@ ${OWNER_TOKEN_CSS}  .mv-page, .mv-page * { overflow-wrap: anywhere; }
   }
 `;
 
-/** The page body (inside portalShell). */
-export function renderOwnerFeaturesPageBody(m: OwnerPageModel): string {
+/** T9: one region of the page — what `?fragment=<id>` answers with. */
+export interface OwnerPageRegion {
+  id: string;
+  /** "" = the region has nothing to show in this state. */
+  html: string;
+}
+
+/**
+ * T9: the page's regions in page order, rendered by the same functions (and
+ * in the same order, so a message or panel lands in the same place) as the
+ * full page: statistics, level card, one card per group, planned, change
+ * log, message slot.
+ */
+export function renderOwnerFeaturesPageRegions(m: OwnerPageModel): OwnerPageRegion[] {
   const registry = m.registry ?? OWNER_FEATURE_REGISTRY;
   // T8: the RFB level status, computed from the switches (gårdssalg: none, page unchanged).
   const levelStatus = m.variant ? null : ownerLevelStatus(deriveOwnerLevel(m.resolved, OWNER_LEVELS, registry), m.levelChoice ?? null);
   const ctx: RenderCtx = { m, now: m.now ?? new Date(), explainedAlways: false, explainedLocked: false, noticePlaced: false, confirmPlaced: false, levelStatus };
+  const regions: OwnerPageRegion[] = [
+    { id: "statistikk", html: statsHtml(m) },
+    { id: OWNER_ANCHOR_LEVEL, html: levelsHtml(ctx) },
+    ...groupRegions(ctx, registry),
+    { id: OWNER_ANCHOR_PLANNED, html: plannedHtml(ctx, registry) },
+    { id: OWNER_ANCHOR_LOG, html: logHtml(ctx) },
+  ];
+  regions.push({ id: OWNER_ANCHOR_FALLBACK, html: `<div id="${OWNER_ANCHOR_FALLBACK}">${ctx.confirmPlaced ? "" : confirmHtml(m, OWNER_ANCHOR_FALLBACK)}${ctx.noticePlaced ? "" : noticeHtml(m)}</div>` });
+  return regions;
+}
+
+/**
+ * T9: `?fragment=<id>[,<id>…]` — only those regions, in page order, from the
+ * same render as the full page. null = an id that is not one of this page's
+ * regions (the route answers 404).
+ */
+export function renderOwnerFeaturesPageFragment(m: OwnerPageModel, ids: readonly string[]): string | null {
+  const regions = renderOwnerFeaturesPageRegions(m);
+  const known = new Set(regions.map((r) => r.id));
+  if (ids.length === 0 || !ids.every((id) => known.has(id))) return null;
+  const want = new Set(ids);
+  return regions.filter((r) => want.has(r.id)).map((r) => r.html).join("");
+}
+
+/** The page body (inside portalShell). */
+export function renderOwnerFeaturesPageBody(m: OwnerPageModel): string {
+  const registry = m.registry ?? OWNER_FEATURE_REGISTRY;
   const back = m.variant ? m.variant.backHref : `/eier/${encodeURIComponent(m.agent.id)}/portal`;
+  const regions = renderOwnerFeaturesPageRegions(m);
+  const html = (id: string) => regions.find((r) => r.id === id)?.html ?? "";
+  const groups = regions.filter((r) => r.id.startsWith("gruppe-")).map((r) => r.html).join("\n");
   return `<style>${OWNER_PAGE_CSS}</style>
     <div class="mv-page">
       <div class="ep-card">
@@ -1199,12 +1199,13 @@ export function renderOwnerFeaturesPageBody(m: OwnerPageModel): string {
         <div class="ep-form-actions"><a class="ep-btn ep-btn-secondary" href="${esc(back)}">Tilbake til eierportalen</a></div>
         ${jumpNavHtml(m, registry)}
       </div>
-      ${statsHtml(m)}
-      ${levelsHtml(ctx)}
-      ${groupsHtml(ctx, registry)}
-      ${plannedHtml(ctx, registry)}
-      ${logHtml(ctx)}
-      <div id="mv-toast-slot">${ctx.confirmPlaced ? "" : confirmHtml(m, "mv-toast-slot")}${ctx.noticePlaced ? "" : noticeHtml(m)}</div>
+      ${html("statistikk")}
+      ${html(OWNER_ANCHOR_LEVEL)}
+      ${groups}
+      ${html(OWNER_ANCHOR_PLANNED)}
+      ${html(OWNER_ANCHOR_LOG)}
+      ${html(OWNER_ANCHOR_FALLBACK)}
+      ${OWNER_STATUS_HTML}
     </div>
     <script>${OWNER_PAGE_SCRIPT}</script>`;
 }
