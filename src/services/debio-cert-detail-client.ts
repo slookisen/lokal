@@ -170,24 +170,28 @@ const LINE_ENVELOPE_KEYS = [
   "results", "data", "details", "detaillines", "certificatedetails", "rows",
 ];
 // Product / area text only. Deliberately NOT: clientName, companyName,
-// contactName, owner, street, address … (person data, S1.6).
+// contactName, owner, street, address … (person data, S1.6), and not the
+// generic name / title / text, which may hold a person's name while the real
+// shape is unknown.
 const LABEL_KEYS = [
   "productname", "product", "productgroupname", "productcaption", "areaname", "area",
-  "name", "caption", "description", "text", "label", "title",
+  "caption", "description", "label",
 ];
 const STATUS_KEYS = ["statussid", "status", "statuscode", "resultsid", "result", "resultcode", "certstatus", "certstatussid"];
 const STATUS_TEXT_KEYS = ["statustext", "statusname", "statuscaption", "statusdescription", "resulttext", "resultname", "resultcaption"];
 const STATUS_OBJ_CODE_KEYS = ["sid", "code", "id", "statussid", "statuscode"];
 const STATUS_OBJ_TEXT_KEYS = ["caption", "name", "text", "description", "label"];
 
-/** Number, numeric string or {sid|code|id} → a positive integer; else null. */
-function statusCodeOf(v: unknown): number | null {
+const STATUS_OBJ_MAX_DEPTH = 3;
+
+/** Number, numeric string or {sid|code|id} (at most 3 object levels) → a positive integer; else null. */
+function statusCodeOf(v: unknown, depth = 0): number | null {
   if (typeof v === "number") return Number.isInteger(v) && v > 0 ? v : null;
   if (typeof v === "string" && /^\s*\d+\s*$/.test(v)) {
     const n = Number(v.trim());
     return Number.isSafeInteger(n) && n > 0 ? n : null;
   }
-  if (isObj(v)) return statusCodeOf(pick(mapOf(v), STATUS_OBJ_CODE_KEYS));
+  if (isObj(v)) return depth >= STATUS_OBJ_MAX_DEPTH ? null : statusCodeOf(pick(mapOf(v), STATUS_OBJ_CODE_KEYS), depth + 1);
   return null;
 }
 
@@ -249,7 +253,11 @@ function normalizeLine(raw: unknown): CertDetailLine | null {
 
 const URL_KEY_HINTS = ["traces", "url", "link", "href", "certificate", "pdf", "document"];
 
-/** A top-level http(s) link, preferring keys that mention traces, then url/link-ish keys. */
+/**
+ * A top-level http(s) link whose value mentions traces or whose key carries a
+ * hint (traces/url/link/href/certificate/pdf/document); any other link (a
+ * homepage …) is ignored. Traces values first, then by hint order.
+ */
 function certificateUrlOf(raw: unknown): string | null {
   if (!isObj(raw)) return null;
   const candidates: Array<{ rank: number; url: string }> = [];
@@ -258,8 +266,9 @@ function certificateUrlOf(raw: unknown): string | null {
     if (!s || !/^https?:\/\/[^\s]+$/i.test(s)) continue;
     const kk = keyOf(k);
     const hint = URL_KEY_HINTS.findIndex((h) => kk.includes(h));
-    const rank = /traces/i.test(s) ? -1 : hint >= 0 ? hint : URL_KEY_HINTS.length;
-    candidates.push({ rank, url: s });
+    const traces = /traces/i.test(s);
+    if (!traces && hint < 0) continue;
+    candidates.push({ rank: traces ? -1 : hint, url: s });
   }
   if (!candidates.length) return null;
   candidates.sort((a, b) => a.rank - b.rank);

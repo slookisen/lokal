@@ -269,12 +269,13 @@ router.post("/match-review/:id", (req: Request, res: Response) => {
 // POST /admin/debio/cert-detail-probe   body { enquiryOrigSid: <positive integer> }
 //   Calls Debio's getcertificatedetail once and returns the response SHAPE
 //   (key paths + types, no values) plus what normalizeCertDetail() makes of
-//   it: { ok, reason?, shape, recognized, line_count, lines (≤ 50, label ≤ 120
-//   chars), status_counts, certificate_url }. Captures the real shape from
+//   it: { ok, reason?, shape, recognized, line_count, lines (≤ 50; per line
+//   statusCode, organic, label_present, label_length, status_text_present —
+//   no free-text values while the real shape is unknown), status_counts,
+//   certificate_url }. Captures the real shape from
 //   prod before S4b stores anything. No database access at all; no Debio
 //   person name / street in the response (S1.6).
 const CERT_PROBE_MAX_LINES = 50;
-const CERT_PROBE_MAX_LABEL = 120;
 let certDetailFetch: typeof fetch | undefined;
 /** Tests only: the fetch used by POST /cert-detail-probe (undefined = real transport). */
 export function __setCertDetailFetchForTesting(f: typeof fetch | undefined): void {
@@ -301,8 +302,11 @@ router.post("/cert-detail-probe", async (req: Request, res: Response) => {
       statusCounts[k] = (statusCounts[k] ?? 0) + 1;
     }
     const lines = norm.lines.slice(0, CERT_PROBE_MAX_LINES).map((l) => ({
-      ...l,
-      label: l.label === null ? null : (l.label.length > CERT_PROBE_MAX_LABEL ? l.label.slice(0, CERT_PROBE_MAX_LABEL - 1) + "…" : l.label),
+      statusCode: l.statusCode,
+      organic: l.organic,
+      label_present: l.label !== null,
+      label_length: l.label === null ? 0 : l.label.length,
+      status_text_present: l.statusText !== null,
     }));
     res.json({
       ok: true,

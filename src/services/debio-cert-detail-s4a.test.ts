@@ -112,6 +112,23 @@ export async function runDebioCertDetailS4aTests(opts: { log?: boolean } = {}): 
     assertEq([unknown2.recognized, unknown2.lines.length], [false, 0], "norm-13: lines without any status → recognized false");
     assertEq(client.normalizeCertDetail(null), { lines: [], recognized: false, certificateUrl: null }, "norm-14: null → recognized false");
     assertEq(client.normalizeCertDetail("tekst").recognized, false, "norm-15: string → recognized false");
+    const generic = client.normalizeCertDetail([{ name: "Ola Hansen", title: "Ola Hansen", text: "Ola Hansen", status: 509 }]);
+    assertEq(generic.lines, [{ label: null, statusCode: 509, statusText: null, organic: true }], "norm-16: generic name/title/text are never a label");
+
+    // certificate url: only a hinted key or a traces value
+    assertEq(client.normalizeCertDetail({ homepage: "https://ola-hansen.no", lines: [{ product: "Egg", status: 509 }] }).certificateUrl, null, "url-1: unhinted link (homepage) → null");
+    assertEq(client.normalizeCertDetail({ homepage: "https://ola-hansen.no", certificateLink: "https://portal.debio.no/c/1" }).certificateUrl, "https://portal.debio.no/c/1", "url-2: hinted key accepted, unhinted ignored");
+    assertEq(client.normalizeCertDetail({ website: "https://webgate.ec.europa.eu/tracesnt/x" }).certificateUrl, "https://webgate.ec.europa.eu/tracesnt/x", "url-3: traces value accepted under any key");
+
+    // status object depth limit
+    let deepSid: any = 509;
+    for (let i = 0; i < 20000; i++) deepSid = { sid: deepSid };
+    let deepOut: any = null;
+    let deepThrew = false;
+    try { deepOut = client.normalizeCertDetail([{ product: "Egg", status: deepSid }]); } catch { deepThrew = true; }
+    assertTrue(!deepThrew && deepOut?.recognized === false, "depth-1: 20000-level {sid:{sid:…}} → no throw, no status", deepOut);
+    assertEq(client.normalizeCertDetail([{ product: "Egg", status: { sid: { sid: { sid: 509 } } } }]).lines[0]?.statusCode, 509, "depth-2: 3 object levels still read");
+    assertEq(client.normalizeCertDetail([{ product: "Egg", status: { sid: { sid: { sid: { sid: 509 } } } } }]).lines[0]?.statusCode ?? null, null, "depth-3: 4 object levels → null");
 
     // ── shape ────────────────────────────────────────────────────────────
     const shape = client.describeShape(personDetail());
@@ -124,6 +141,11 @@ export async function runDebioCertDetailS4aTests(opts: { log?: boolean } = {}): 
     assertTrue(bareShape.includes("[].statusSid: number") && bareShape.includes("(root): array"), "shape-5: bare array root", bareShape);
     const keyed = client.describeShape({ byOwner: { [PERSON]: { x: 1 } } });
     assertTrue(!JSON.stringify(keyed).includes(PERSON) && keyed.includes("byOwner.<key>.x: number"), "shape-6: data-like keys masked", keyed);
+    const wide = client.describeShape(Array.from({ length: 30 }, (_, i) => ({ [`k${i}`]: 1 })));
+    assertTrue(wide.includes("[].k24: number") && !wide.some((p) => p.startsWith("[].k25")), "shape-8: only the first 25 array items are sampled", wide.length);
+    const manyKeys: Record<string, number> = {};
+    for (let i = 0; i < 500; i++) manyKeys[`key${i}`] = i;
+    assertEq(client.describeShape(manyKeys).length, 400, "shape-9: at most 400 paths");
     const deep = client.describeShape({ a: { b: { c: { d: { e: { f: 1 } } } } } }, 2);
     assertTrue(deep.includes("a.b: object") && !deep.some((p) => p.startsWith("a.b.c")), "shape-7: maxDepth respected", deep);
 
@@ -187,6 +209,12 @@ export async function runDebioCertDetailS4aTests(opts: { log?: boolean } = {}): 
     assertEq(noKey.status, 403, "route-2: no X-Admin-Key → 403");
     const wrongKey = await call({ enquiryOrigSid: 4242 }, { "x-admin-key": "nope" });
     assertEq(wrongKey.status, 403, "route-3: wrong X-Admin-Key → 403");
+    routeMod.__setCertDetailFetchForTesting(jsonFetch({ homepage: "https://ola-hansen.no", lines: [{ name: "Ola Hansen", status: 509 }, { clientName: "Ola Hansen", product: "Egg", status: 501, statusText: "Ola Hansen" }] }));
+    const person = await call({ enquiryOrigSid: 9 });
+    assertEq([person.body.ok, person.body.line_count, person.body.certificate_url], [true, 2, null], "route-19: person-data lines counted, homepage not a certificate url");
+    assertTrue(!JSON.stringify(person.body).includes("Ola Hansen") && !JSON.stringify(person.body).includes("ola-hansen"), "route-20: person string never in the response", person.body);
+    routeMod.__setCertDetailFetchForTesting(counting(jsonFetch(personDetail())));
+    fetchCount = 0;
     for (const [i, b] of ([undefined, {}, { enquiryOrigSid: "4242" }, { enquiryOrigSid: 0 }, { enquiryOrigSid: -1 }, { enquiryOrigSid: 1.5 }, { enquiryOrigSid: null }] as any[]).entries()) {
       const r = await call(b);
       assertEq(r.status, 400, `route-4.${i}: bad body ${JSON.stringify(b)} → 400`);
@@ -199,7 +227,9 @@ export async function runDebioCertDetailS4aTests(opts: { log?: boolean } = {}): 
     assertEq(ok.body.status_counts, { "501": 1, "502": 1, "509": 2, "510": 1 }, "route-8: status_counts");
     assertTrue(Array.isArray(ok.body.shape) && ok.body.shape.length > 0, "route-9: shape returned");
     assertTrue(typeof ok.body.certificate_url === "string" && ok.body.certificate_url.includes("tracesnt"), "route-10: certificate_url");
-    assertEq(ok.body.lines[4].label.length, 120, "route-11: label truncated to 120 chars");
+    assertEq(ok.body.lines[0], { statusCode: 509, organic: true, label_present: true, label_length: 4, status_text_present: true }, "route-11: line has presence/length flags only");
+    assertTrue((ok.body.lines as any[]).every((l) => !("label" in l) && !("statusText" in l)), "route-11b: no label / statusText values in the response");
+    assertEq(ok.body.lines[4].label_length, 300, "route-11c: label_length is the full length");
     assertEq(fetchCount, 1, "route-12: exactly one fetch");
     const okJson = JSON.stringify(ok.body);
     assertTrue(!okJson.includes(PERSON) && !okJson.includes(STREET), "route-13: no person name / street in the response");
