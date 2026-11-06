@@ -52459,3 +52459,26 @@ runSerial(async () => {
     failures.push("product-auto-sync: unexpected error: " + String(err?.message || err));
   }
 });
+
+// Produktimport skive 4-2a (= skive 4a + visibility): the «Hold prisene
+// oppdatert automatisk hver uke» box on the import page (ticked publish →
+// product_sync_mode 'weekly' + change-log row in the publish transaction;
+// unticked → unchanged; hidden with the flag off or is_verified = 0), the
+// owner's auto-sync status and the profile page's «Oppdatert automatisk fra
+// <domene> <dato>» (flag off = unchanged). Swaps the getDb() singleton and env
+// (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── produktimport skive 4-2a: ukentlig-boks på importsiden + synlighet ──");
+  try {
+    const { runOwnerImportAutoSyncTests } = require("../src/routes/owner-product-import-auto-sync.test") as
+      typeof import("../src/routes/owner-product-import-auto-sync.test");
+    const r = await runOwnerImportAutoSyncTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("product-import-weekly-box: " + f);
+    console.log(`  product-import-weekly-box: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("product-import-weekly-box: unexpected error: " + String(err?.message || err));
+  }
+});

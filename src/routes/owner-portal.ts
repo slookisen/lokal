@@ -51,6 +51,7 @@ import {
   getOwnerImportOverview, productImportEnabled, profileWebsite, OWNER_FETCH_BUSY_MESSAGE, OWNER_FETCH_DAILY_LIMIT_MESSAGE,
   OWNER_FETCH_RUNNING_MESSAGE, OWNER_IMPORT_NO_WEBSITE_MESSAGE,
 } from "../services/product-import/owner-import";
+import { autoSyncStatusView, type AutoSyncStatusView } from "../services/product-import/auto-sync";
 
 const router = Router();
 
@@ -2120,7 +2121,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
         const iaHtml = ia
           ? `<div class="ep-alert ${ia.ok ? "ep-alert-ok" : "ep-alert-error"}" role="${ia.ok ? "status" : "alert"}" data-import-alert="${escapeHtml(status)}">${ia.html}</div>`
           : "";
-        productImportCard = productImportCardHtml(agentId, getOwnerImportOverview(agentId), iaHtml);
+        productImportCard = productImportCardHtml(agentId, getOwnerImportOverview(agentId), iaHtml, autoSyncStatusHtml(autoSyncStatusView(agentId)));
       }
     } catch (e) {
       console.error("[owner-portal] product import card failed:", e instanceof Error ? e.message : "error");
@@ -3233,8 +3234,35 @@ function importRunStatusText(run: ImportOverview["runs"][number]): string {
   return `Siste henting${at} ble ikke fullført. ${productImportOutcomeTextNb(run.outcome) ?? ""}`.trim();
 }
 
-/** The card. Pure rendering of getOwnerImportOverview() (+ an optional alert). */
-export function productImportCardHtml(agentId: string, o: ImportOverview, alertHtml = ""): string {
+/**
+ * The weekly auto-sync status line (Skive 4-2a): the last successful update
+ * and what changed, the lock reason, or why it was turned off. "" for null
+ * (flag off, or never on and never run), so the card is unchanged then.
+ */
+export function autoSyncStatusHtml(v: AutoSyncStatusView | null): string {
+  if (!v) return "";
+  const when = (ts: string | null) => {
+    const w = formatImportRunTime(ts);
+    return w ? ` ${w}` : "";
+  };
+  let text: string;
+  if (v.kind === "waiting") {
+    text = "Prisene oppdateres automatisk hver uke. Den første oppdateringen kommer innen en uke.";
+  } else if (v.kind === "success") {
+    const parts = [`${v.changed} ${v.changed === 1 ? "vare" : "varer"} fikk ny pris eller enhet`];
+    if (v.not_found) parts.push(`${v.not_found} ble ikke funnet og kan ikke bestilles nå`);
+    if (v.new_pending) parts.push(`${v.new_pending} nye ${v.new_pending === 1 ? "vare venter" : "varer venter"} på godkjenning`);
+    text = `Sist oppdatert automatisk${when(v.at)}: ${parts.join(", ")}.`;
+  } else if (v.kind === "blocked") {
+    text = `Den automatiske oppdateringen${when(v.at)} ble stoppet, og ingenting ble endret. ${v.reason}`;
+  } else {
+    text = `Den ukentlige oppdateringen er slått av etter flere stopp på rad${when(v.at)}. ${v.reason}`;
+  }
+  return `<p class="ep-audit-meta" data-auto-sync-status="${v.kind}">${escapeHtml(text)}</p>`;
+}
+
+/** The card. Pure rendering of getOwnerImportOverview() (+ an optional alert and auto-sync status). */
+export function productImportCardHtml(agentId: string, o: ImportOverview, alertHtml = "", autoSyncHtml = ""): string {
   const id = encodeURIComponent(agentId);
   const website = o.website ?? "";
   const websiteHtml = /^https?:\/\//i.test(website)
@@ -3258,7 +3286,7 @@ export function productImportCardHtml(agentId: string, o: ImportOverview, alertH
         ${alertHtml}
         <p>Vi leser produktene og prisene på <strong>${websiteHtml}</strong> og viser deg forslagene før noe blir lagt inn. Ingenting publiseres før du har valgt varene og trykket «Publiser valgte».</p>
         <p class="ep-audit-meta" data-fetches-left="${o.fetches_left_today}">Du kan hente ${o.fetches_left_today} ${o.fetches_left_today === 1 ? "gang" : "ganger"} til i dag (høyst ${o.daily_limit} per døgn).</p>
-        ${latestHtml}
+        ${latestHtml}${autoSyncHtml ? `\n        ${autoSyncHtml}` : ""}
         ${action}
       </div>`;
 }
