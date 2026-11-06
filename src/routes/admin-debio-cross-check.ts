@@ -48,6 +48,7 @@ import { syncDebioVerifications } from "../services/debio-verification-service";
 import { startJob } from "../services/job-tracker";
 import { syncDebioRegister, listMatchReview, decideMatchReview, manualDebioLink } from "../services/debio-register-sync";
 import { getDb } from "../database/init";
+import { fetchDebioCertificateDetail, normalizeCertDetail, describeShape } from "../services/debio-cert-detail-client";
 
 const router = Router();
 
@@ -262,6 +263,63 @@ router.post("/match-review/:id", (req: Request, res: Response) => {
   const out = decideMatchReview(getDb(), id, action);
   if (!out) { res.status(404).json({ success: false, error: "review row not found" }); return; }
   res.json({ success: true, ...out });
+});
+
+// ─── Økologi S4a: Debio certificate-detail probe (read-only) ─────────
+// POST /admin/debio/cert-detail-probe   body { enquiryOrigSid: <positive integer> }
+//   Calls Debio's getcertificatedetail once and returns the response SHAPE
+//   (key paths + types, no values) plus what normalizeCertDetail() makes of
+//   it: { ok, reason?, shape, recognized, line_count, lines (≤ 50; per line
+//   statusCode, organic, label_present, label_length, status_text_present —
+//   no free-text values while the real shape is unknown), status_counts,
+//   certificate_url }. Captures the real shape from
+//   prod before S4b stores anything. No database access at all; no Debio
+//   person name / street in the response (S1.6).
+const CERT_PROBE_MAX_LINES = 50;
+let certDetailFetch: typeof fetch | undefined;
+/** Tests only: the fetch used by POST /cert-detail-probe (undefined = real transport). */
+export function __setCertDetailFetchForTesting(f: typeof fetch | undefined): void {
+  certDetailFetch = f;
+}
+
+router.post("/cert-detail-probe", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const sid = req.body?.enquiryOrigSid;
+  if (typeof sid !== "number" || !Number.isSafeInteger(sid) || sid <= 0) {
+    res.status(400).json({ success: false, error: "enquiryOrigSid must be a positive integer" });
+    return;
+  }
+  try {
+    const fetched = await fetchDebioCertificateDetail(sid, { fetchImpl: certDetailFetch });
+    if (!fetched.ok) {
+      res.json({ ok: false, reason: fetched.reason, shape: [], recognized: false, line_count: 0, lines: [], status_counts: {}, certificate_url: null });
+      return;
+    }
+    const norm = normalizeCertDetail(fetched.raw);
+    const statusCounts: Record<string, number> = {};
+    for (const l of norm.lines) {
+      const k = l.statusCode === null ? "none" : String(l.statusCode);
+      statusCounts[k] = (statusCounts[k] ?? 0) + 1;
+    }
+    const lines = norm.lines.slice(0, CERT_PROBE_MAX_LINES).map((l) => ({
+      statusCode: l.statusCode,
+      organic: l.organic,
+      label_present: l.label !== null,
+      label_length: l.label === null ? 0 : l.label.length,
+      status_text_present: l.statusText !== null,
+    }));
+    res.json({
+      ok: true,
+      shape: describeShape(fetched.raw),
+      recognized: norm.recognized,
+      line_count: norm.lines.length,
+      lines,
+      status_counts: statusCounts,
+      certificate_url: norm.certificateUrl,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: "cert-detail probe failed", detail: err?.message || String(err) });
+  }
 });
 
 export default router;
