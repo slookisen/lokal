@@ -159,6 +159,7 @@ import { isAsPublicView } from "../services/agent-visibility";
 import { capName } from "../utils/free-text";
 import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
 import { MCP_MAX_TOOL_INPUT_ELEMENTS } from "../services/mcp-input-limits";
+import { BRAND_ENTITIES, brandMcpIcons } from "../config/brand-entities";
 // dev-request 2026-10-16-opplevagent-mcp-fritekst-query: the category aliases
 // (S1, moved from this file) and the free-text `query` interpreter (S2).
 import {
@@ -1701,6 +1702,10 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
+/** serverInfo title and icons (G3-S5): the brand's name and 512 PNG logo, read from BRAND_ENTITIES.experiences. */
+export const OPPLEVAGENT_MCP_SERVER_TITLE = `${BRAND_ENTITIES.experiences.name} — norske opplevelser`;
+export const OPPLEVAGENT_MCP_SERVER_ICONS = brandMcpIcons(BRAND_ENTITIES.experiences);
+
 async function getOrCreateExperiencesSession(
   sessionId: string | undefined,
   isInitialize: boolean,
@@ -1737,7 +1742,9 @@ async function getOrCreateExperiencesSession(
   const server = new McpServer({
     name: "opplevagent",
     version: "0.1.0",
-    title: "Opplevagent — norske opplevelser",
+    title: OPPLEVAGENT_MCP_SERVER_TITLE,
+    websiteUrl: BRAND_ENTITIES.experiences.url,
+    icons: OPPLEVAGENT_MCP_SERVER_ICONS,
     description:
       "AI-discoverable marketplace of Norwegian experiences — curated, Brreg-verified activities " +
       "searchable by county, category, weather, season, and group size. / " +

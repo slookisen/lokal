@@ -95,6 +95,7 @@ import { INDEXNOW_KEY } from "../services/indexnow-service";
 import { htmlLangAttr, ogLocale, localizedPath, isSvLocaleEnabled, type Lang } from "../i18n/t";
 import { getPublishedProfileTranslations } from "../services/profile-translations";
 import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
+import { BRAND_ENTITIES, brandMcpIcons } from "../config/brand-entities";
 import {
   listCategories,
   getPublishedExperienceBySlug,
@@ -3323,7 +3324,7 @@ function experiencesMcpServerCard() {
       url: "https://github.com/slookisen/lokal",
     },
     documentation: `${url}/llms.txt`,
-    icon: `${url}/favicon.svg`,
+    icon: brandMcpIcons(BRAND_ENTITIES.experiences)?.[0]?.src, // the 512 PNG logo (was favicon.svg), as serverInfo icons[0]
     // T3: the organisation behind the server is the company (same as the agent
     // card's provider); `name`/`title` above keep the brand.
     vendor: {
