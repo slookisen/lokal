@@ -119,13 +119,13 @@ router.get("/a2a", (_req: Request, res: Response) => {
     const cities = [...new Set(agents.map((a: any) => a.city).filter(Boolean))];
     const card = {
       name: "Rett fra Bonden",
-      description: `A2A marketplace for local food in Norway. Connect AI agents with ${agents.length}+ verified local farms, shops, cooperatives, farm shops, REKO rings, and markets. Agent-markedsplass for lokal mat i Norge.`,
+      description: `A2A marketplace for local food in Norway. Connect AI agents with ${agents.length}+ local farms, shops, cooperatives, farm shops, REKO rings, and markets, cross-checked against the Brønnøysund register. Agent-markedsplass for lokal mat i Norge.`,
       url: process.env.BASE_URL || "https://rettfrabonden.com",
       // T3 (dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as):
       // same provider as the .well-known card (getRegistryCard) — the company.
       provider: {
         ...agentCardProvider(),
-        contactUrl: `${process.env.BASE_URL || "https://rettfrabonden.com"}/docs`,
+        contactUrl: `${process.env.BASE_URL || "https://rettfrabonden.com"}/kontakt`,
         description: "Open agent-to-agent food marketplace operator. Norges første A2A-markedsplass for lokal mat.",
       },
       version: "1.0.0",
@@ -138,7 +138,7 @@ router.get("/a2a", (_req: Request, res: Response) => {
       additionalInterfaces: [
         { url: `${process.env.BASE_URL || "https://rettfrabonden.com"}/api/marketplace`, transport: "HTTP+JSON" },
       ],
-      documentationUrl: `${process.env.BASE_URL || "https://rettfrabonden.com"}/docs`,
+      documentationUrl: `${process.env.BASE_URL || "https://rettfrabonden.com"}/teknologi`,
       // dev-request 2026-07-25-proveniens-transparens: additive link to the
       // public "how we verify our data" page (field_provenance / cross-source
       // agreement machinery, already live server-side — this is docs only,
@@ -179,7 +179,7 @@ router.get("/a2a", (_req: Request, res: Response) => {
         { type: "rest", url: `${process.env.BASE_URL || "https://rettfrabonden.com"}/api/marketplace`, description: "REST API for search, discovery, registration" },
       ],
       skills: [
-        { id: "discover-local-food-agents", name: "Discover Local Food Agents", description: `Search ${agents.length}+ verified local food producers in Norway`, tags: ["local food", "farm direct", "Norway"], examples: ["Find farms near Oslo", "finn grønnsaker i Bergen"] },
+        { id: "discover-local-food-agents", name: "Discover Local Food Agents", description: `Search ${agents.length}+ local food producers in Norway, cross-checked against the Brønnøysund register`, tags: ["local food", "farm direct", "Norway"], examples: ["Find farms near Oslo", "finn grønnsaker i Bergen"] },
         { id: "agent-conversation", name: "Start Agent Negotiation", description: "Initiate buyer-seller conversation between agents", tags: ["negotiate", "order", "transaction"], examples: ["negotiate delivery of tomatoes"] },
         { id: "build-shopping-cart", name: "Build a shopping cart", description: `Cart and order flow is available via the MCP server (POST /mcp): find offers with lokal_find_offers, then lokal_cart_create, lokal_cart_add_item, lokal_cart_view and lokal_cart_submit (${isPaymentsEnabled() ? "pickup order; producers that take prepayment return a Stripe payment link the buyer approves themselves, the others are paid at pickup" : "pickup order, no payment"}). Not available through message/send on /a2a.`, tags: ["cart", "order", "local food", "pickup", "mcp"], examples: ["MCP tools/call lokal_find_offers {items: [\"potet\"], near: \"Oslo\"}", "MCP tools/call lokal_cart_create"] },
         // Fase B3 (mine ordrer): only with ORDER_AGENT_ACTIONS_ENABLED on; off, the card is unchanged.
