@@ -50748,6 +50748,25 @@ runSerial(async () => {
   }
 });
 
+// GET /admin/bm-producer-harvest 502 fix: 30 s wall-clock budget in BOTH
+// branches + `processed` / `next_offset`. Pins its own in-memory DB, a stub
+// global fetch and the injected clock (all restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── bm-producer-harvest time budget + next_offset ──");
+  try {
+    const { runAdminBmProducerHarvestTimeBudgetTests } = require("../src/routes/admin-bm-producer-harvest-time-budget.test") as
+      typeof import("../src/routes/admin-bm-producer-harvest-time-budget.test");
+    const bt = await runAdminBmProducerHarvestTimeBudgetTests({ log: false });
+    passed += bt.passed;
+    failed += bt.failed;
+    for (const f of bt.failures) failures.push("bm-producer-harvest-time-budget: " + f);
+    console.log(`  bm-producer-harvest-time-budget: ${bt.passed} passed, ${bt.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bm-producer-harvest-time-budget: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-10-rfb-berikelse-nattjobb (R6): the nightly RFB
 // enrichment job (services/rfb-enrichment-nightly.ts) — AC1 (cohort
 // exclusions pinned against pool-blocker-explain, per-step caps, LLM cap,
