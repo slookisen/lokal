@@ -3150,6 +3150,8 @@ Tool description (verbatim — these strings shape LLM tool-selection, see C.29 
 
 > Resolve a Norwegian place name (city, town, region, fylke, or kommune) to lat/lng coordinates. Use this when you need explicit coordinates for `lokal_discover` (e.g., 'show me organic farms within 10 km of Florø'). Returns coordinates + suggested search radius. Covers all of Norway via Kartverket Stedsnavn API fallback. **Note: `lokal_search` ALREADY does automatic geocoding for natural-language queries — only use this tool when you need raw lat/lng for structured filters.**
 
+2026-11-06 (A2A dev-request 2026-10-16-mcp-beskrivelser-intensjonsord-og-lint, S6): the HTTP-MCP text in `src/routes/mcp.ts` now reads 'show me farms within 10 km of Florø' (no organic example, Debio text rules); the npm stdio server `mcp-server/` is unchanged.
+
 The "already does automatic geocoding" note is deliberate: without it, models call `lokal_geocode` then `lokal_discover(lat, lng)` for queries that `lokal_search` would have resolved in one hop.
 
 **Verify:**

@@ -52628,3 +52628,25 @@ runSerial(async () => {
     failures.push("owner-flag-pilot: unexpected error: " + String(err?.message || err));
   }
 });
+
+// A2A dev-request 2026-10-16-mcp-beskrivelser-intensjonsord-og-lint, S6: the
+// shared lint for MCP tool titles and descriptions on all three servers (no
+// directive wording, no other brand's names, the dental brand guards, no RFB
+// certification claims) and the S6 texts of lokal_search / lokal_find_offers.
+// Swaps PAYMENTS_ENABLED / ORDER_AGENT_ACTIONS_ENABLED / ORDER_MESSAGES_ENABLED
+// (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── MCP-beskrivelser: delt lint (S6) ──");
+  try {
+    const { runMcpDescriptionPolicyTests } = require("../src/routes/mcp-description-policy.test") as
+      typeof import("../src/routes/mcp-description-policy.test");
+    const r = await runMcpDescriptionPolicyTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("mcp-description-policy: " + f);
+    console.log(`  mcp-description-policy: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("mcp-description-policy: unexpected error: " + String(err?.message || err));
+  }
+});

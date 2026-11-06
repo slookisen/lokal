@@ -12,12 +12,12 @@ Submission pack for listing the remote MCP server `https://rettfrabonden.com/mcp
 
 ## Prerequisites before submission
 
-**Ready to submit: no** (1 waiting).
+**Ready to submit: yes.** Every prerequisite is done.
 
 | Prerequisite | Status | Detail | Owner | Source |
 |---|---|---|---|---|
 | Every tool has a title and readOnlyHint/destructiveHint | **DONE** | All 15 tools. | — | code |
-| Tool descriptions describe and never instruct Claude | **WAITING** | `lokal_search`: «ALWAYS use», «USE THIS FOR». The fix waits for OpenAI's decision on the RFB ChatGPT app: tool metadata stays frozen while OpenAI reviews it (Daniel reports the decision). | 2026-10-16-mcp-beskrivelser-intensjonsord-og-lint (S6) | code |
+| Tool descriptions describe and never instruct Claude | **DONE** | No directive wording in any tool description. | — | code |
 | Privacy policy page | **DONE** | https://rettfrabonden.com/personvern | — | code |
 | Terms page | **DONE** | https://rettfrabonden.com/vilkar | — | code |
 | Public documentation page | **DONE** | https://rettfrabonden.com/guide-mat-ai | — | code |
