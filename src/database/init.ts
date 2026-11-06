@@ -4684,6 +4684,16 @@ function initSchema(db: Database.Database): void {
     // Column already exists
   }
 
+  // «Klikk fra AI-svar» slice 4 (dev-request 2026-10-14-klikk-fra-ai-svar-per-
+  // profil): the AI the clicker's landing came from, classified server-side
+  // (classifyAiClickSource: chatgpt|claude|perplexity|gemini|copilot|other),
+  // NULL = no AI attribution. Nullable, additive; metadata-only ALTER, no backfill.
+  try {
+    db.exec(`ALTER TABLE contact_clicks ADD COLUMN ai_source TEXT`);
+  } catch {
+    // Column already exists
+  }
+
   // B4: UTM-preserving rollup destination. page_view_daily's PRIMARY KEY is
   // left untouched (changing it would alter existing aggregates' grain), so
   // utm lives in its own small additive table, written by

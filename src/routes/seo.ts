@@ -61,6 +61,7 @@ import { isJunkDescription, stripInternalNotes, normalizeProse, organicOwnerGate
 import { getProfileActivity } from "../services/profile-activity-service";
 import { recordAiPageDelivery } from "../services/profile-ai-deliveries";
 import { recordAiProfileClick } from "../services/profile-ai-clicks";
+import { aiAttributionClientJs } from "../services/contact-ai-attribution";
 import { searchTrafficClass } from "../services/search-tracking";
 import {
   AI_DELIVERIES_LABEL, AI_DELIVERIES_SUBTITLE, aiDeliveriesCountingSince,
@@ -7276,13 +7277,18 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           })
           .catch(function () { /* fail-quiet — no UI on error */ });
 
+        // «Klikk fra AI-svar» slice 4: remember this tab's landing (utm_* and
+        // the AI referrer host) and send it with the beacon and the /ut/ links,
+        // since Referrer-Policy: no-referrer hides it from both.
+        ${aiAttributionClientJs()}
+
         document.addEventListener("click", function (e) {
           var link = e.target && e.target.closest ? e.target.closest("a[data-track-kind]") : null;
           if (!link) return;
           var kind = link.getAttribute("data-track-kind");
           if (!kind) return;
           try {
-            var payload = JSON.stringify({ agentId: agentId, kind: kind });
+            var payload = JSON.stringify(aiAttrInto({ agentId: agentId, kind: kind }));
             if (navigator.sendBeacon) {
               navigator.sendBeacon("/api/track/contact-click", new Blob([payload], { type: "application/json" }));
             } else {

@@ -45120,6 +45120,28 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  // dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 4 («Kontakt-klikk»):
+  // the profile page sends its landing (utm_* + AI referrer host) with the
+  // contact beacon and /ut/ links; contact_clicks.ai_source is classified
+  // server-side; funnel read per profile x AI. Swaps getDb() and the dental /
+  // experiences db handles, so serial.
+  console.log("\n── Klikk fra AI-svar S4: contact clicks from an AI landing ──");
+  try {
+    const { runContactAiAttributionTests } = require("../src/services/contact-ai-attribution.test") as
+      typeof import("../src/services/contact-ai-attribution.test");
+    const r = await runContactAiAttributionTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("contact-ai-attribution: " + f);
+    console.log(`  contact-ai-attribution: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push(`contact-ai-attribution: unexpected error: ${String(err?.message || err)}`);
+    console.log(`  ✗ contact-ai-attribution: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   // dev-request 2026-10-13-statistikk-riktig-for-investorer, S2: searches
   // logged from /sok on all three sites, the public search API, and counted
   // per channel (AI assistants from analytics_mcp_calls). Swaps getDb() and
