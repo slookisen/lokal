@@ -50371,6 +50371,29 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice
+// B2a: the stored claim assessment in the admin notice for a queued claim —
+// with CLAIM_AUTO_ASSESSMENT_ENABLED the notice waits (bounded) for this
+// claim's running assessment and shows its result, signals and unavailable
+// sources (escaped); no assessment → today's notice byte for byte. Pins
+// getDb() to its own in-memory DB, stubs the mail transporter and the
+// assessment deps, sets env (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-30-rfb-eierkrav B2a: claim assessment in the admin claim notice ──");
+  try {
+    const { runRfbClaimNoticeAssessmentB2aTests } = require("../src/routes/rfb-claim-notice-assessment-b2a.test") as
+      typeof import("../src/routes/rfb-claim-notice-assessment-b2a.test");
+    const b2a = await runRfbClaimNoticeAssessmentB2aTests({ log: false });
+    passed += b2a.passed;
+    failed += b2a.failed;
+    for (const f of b2a.failures) failures.push("rfb-claim-notice-assessment-b2a: " + f);
+    console.log(`  rfb-claim-notice-assessment-b2a: ${b2a.passed} passed, ${b2a.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-claim-notice-assessment-b2a: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-rfb-utsending-v4, skive 1: /selger?agent=<id> viser
 // bare den ene butikken når produsenten ikke er tatt over.
 runSerial(async () => {
