@@ -32,6 +32,7 @@ import { randomUUID } from "crypto";
 import { getDb } from "../../database/init";
 import { normalizeName } from "../product-catalog-sync";
 import { extractProductsFromWebsite, HostPacer, type ProductImportDeps, type ProductImportResult } from "./extractor";
+import { ownerFlagEnabledFor, ownerFlagMode, type OwnerFlagMode } from "../../owner-features/owner-flag-mode";
 import { PRODUCT_IMPORT_DRYRUN_CONCURRENCY, PRODUCT_IMPORT_DRYRUN_HOST_INTERVAL_MS } from "./dry-run";
 import { currentProductsOf, diffAgainst, producerTypesOf, profileWebsite, publishBlockReason, readCurrentList } from "./owner-import";
 
@@ -44,10 +45,19 @@ const MODE = "outreach_prepare";
 /** Rules that dropped a price the source had (not verbatim / not at the name / not real). */
 const PRICE_DROP_RULES = new Set(["price_not_at_name", "price_blog_source_dropped", "price_placeholder_dropped", "price_zero_dropped"]);
 
-/** Flag: "1"/"true" turns the outreach routes on. Anything else = off (404). */
+/** Flag: "1"/"true" turns the outreach on for every owner ("all" mode). */
 export function productImportOutreachEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const v = env[PRODUCT_IMPORT_OUTREACH_FLAG];
-  return v === "1" || v === "true";
+  return ownerFlagMode(PRODUCT_IMPORT_OUTREACH_FLAG, env) === "all";
+}
+
+/** The flag's mode: "all" ("1"/"true"), "pilot" (allowlisted owners only) or "off". */
+export function productImportOutreachMode(env: NodeJS.ProcessEnv = process.env): OwnerFlagMode {
+  return ownerFlagMode(PRODUCT_IMPORT_OUTREACH_FLAG, env);
+}
+
+/** The outreach is on for this owner (pilot: `rfb:<id>` in OWNER_FEATURES_ALLOWED_SUBJECTS). */
+export function productImportOutreachEnabledFor(agentId: string | null | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
+  return ownerFlagEnabledFor(PRODUCT_IMPORT_OUTREACH_FLAG, agentId, env);
 }
 
 /** The configured measured LLM accuracy (0–1), or null when absent/invalid. PURE. */

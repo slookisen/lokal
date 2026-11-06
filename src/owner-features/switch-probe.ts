@@ -87,6 +87,7 @@ import {
   type OwnerActor,
 } from "./changes";
 import { isSubjectAllowedForOwnerFeatures } from "./allowlist";
+import { ownerPilotFlagModes, type OwnerFlagMode, type OwnerPilotFlag } from "./owner-flag-mode";
 
 const VERTICAL = "rfb" as const;
 export const SWITCH_PROBE_ACTOR: OwnerActor = { actor: "admin", detail: "switch-probe" };
@@ -123,6 +124,9 @@ export const SWITCH_PROBE_ENV_FLAGS = [
   "OWNER_LOCK_ENFORCE_WRITES",
   "OUTREACH_UNSUBSCRIBE_ENABLED",
   "OWNER_ORDER_EMAIL_ENABLED",
+  "PRODUCT_IMPORT_ENABLED",
+  "OWNER_UNIFIED_SESSION_ENABLED",
+  "PRODUCT_IMPORT_OUTREACH_ENABLED",
   "RFB_DISABLE_ORDER_FOLLOWUPS",
   "PUBLIC_STATS_MIN_VIEWS",
   "STOCK_CHECK_EMAIL_ENABLED",
@@ -206,6 +210,8 @@ export interface SwitchProbePlan {
   segment: string;
   allowlisted: boolean;
   env_flags: Record<string, string | null>;
+  /** The four pilot-capable owner flags: off / pilot / all (owner-flag-mode.ts). */
+  owner_flag_modes: Record<OwnerPilotFlag, OwnerFlagMode>;
   baseline: Array<{ key: string; status: string; type: string; value: OwnerFeatureValue | string; source: string; block: string | null }>;
   rows: SwitchProbePlanRow[];
   checks: string[];
@@ -218,6 +224,8 @@ export interface SwitchProbeResult {
   started_at: string;
   finished_at: string;
   env_flags: Record<string, string | null>;
+  /** The four pilot-capable owner flags: off / pilot / all (owner-flag-mode.ts). */
+  owner_flag_modes: Record<OwnerPilotFlag, OwnerFlagMode>;
   rows: SwitchProbeRow[];
   checks: SwitchProbeCheck[];
   pass: number;
@@ -1098,6 +1106,7 @@ export function planSwitchProbe(db: any, agentId: string, env: NodeJS.ProcessEnv
     segment: resolved.subject.segment,
     allowlisted: isSubjectAllowedForOwnerFeatures(VERTICAL, agentId, env),
     env_flags: envFlags(env),
+    owner_flag_modes: ownerPilotFlagModes(env),
     baseline: liveEntries(env).map((e) => {
       const r = resolved.byKey[e.key];
       return { key: e.key, status: e.status, type: e.type, value: displayValue(e, r.value), source: r.source, block: r.block };
@@ -1783,7 +1792,7 @@ export function dryRunSwitchProbe(agentId: string, opts: SwitchProbeOptions = {}
   const plan = planSwitchProbe(db, agentId, env, { ...defaultSwitchProbeReaders(), ...(opts.readers || {}) });
   const result: SwitchProbeResult & { plan: SwitchProbePlan } = {
     ok: true, dry_run: true, agent_id: agentId, started_at: started, finished_at: new Date().toISOString(),
-    env_flags: plan.env_flags, rows: [], checks: [], pass: 0, fail: 0, not_observable: 0, restored: true, restore_diff: [], side_effects: [],
+    env_flags: plan.env_flags, owner_flag_modes: plan.owner_flag_modes, rows: [], checks: [], pass: 0, fail: 0, not_observable: 0, restored: true, restore_diff: [], side_effects: [],
     ready_for_daniel_test: false, markdown: renderSwitchProbePlanMarkdown(plan, started), plan,
   };
   return result;
@@ -1879,6 +1888,7 @@ export async function runSwitchProbe(agentId: string, opts: SwitchProbeOptions =
     started_at: started,
     finished_at: new Date().toISOString(),
     env_flags: envFlags(env),
+    owner_flag_modes: ownerPilotFlagModes(env),
     rows: c.rows,
     checks: c.checks,
     pass,
@@ -1907,6 +1917,8 @@ export function renderSwitchProbePlanMarkdown(plan: SwitchProbePlan, at: string)
   lines.push(`- Planlagte rader: ${plan.rows.length} · uten effektleser: ${plan.rows.filter((r) => !r.reader).length}`, "");
   lines.push("| Nøkkel | Flate | Retning | Type | Effektleser |", "|---|---|---|---|---|");
   for (const r of plan.rows) lines.push(`| ${r.key} | ${r.surface} | ${r.direction} | ${r.kind} | ${r.reader ? "ja" : "NEI"} |`);
+  lines.push("", "## Eierflagg med pilotmodus", "", "| Flagg | Modus |", "|---|---|");
+  for (const [k, m] of Object.entries(plan.owner_flag_modes)) lines.push(`| ${k} | ${m} |`);
   lines.push("", "## Startverdier", "", "| Nøkkel | Verdi | Kilde | Sperre |", "|---|---|---|---|");
   for (const b of plan.baseline) lines.push(`| ${b.key} | ${cell(JSON.stringify(b.value))} | ${b.source} | ${b.block ?? ""} |`);
   lines.push("", "## Ekstra kontroller", "");
@@ -1927,6 +1939,8 @@ export function renderSwitchProbeMarkdown(r: SwitchProbeResult): string {
   if (r.error) lines.push(`- Kjøringen ble avbrutt: ${cell(r.error)}`);
   lines.push("", "## Miljøflagg", "", "| Flagg | Verdi |", "|---|---|");
   for (const [k, v] of Object.entries(r.env_flags)) lines.push(`| ${k} | ${v === null ? "(ikke satt)" : cell(v)} |`);
+  lines.push("", "## Eierflagg med pilotmodus", "", "«pilot» = bare produsenter i OWNER_FEATURES_ALLOWED_SUBJECTS; «all» = alle verifiserte eiere («1»/«true»); «off» = av.", "", "| Flagg | Modus |", "|---|---|");
+  for (const [k, m] of Object.entries(r.owner_flag_modes)) lines.push(`| ${k} | ${m} |`);
   lines.push("", "## Bryter × flate × retning", "");
   lines.push("«IKKE OBSERVERBAR»: flaten viser ikke testprodusenten selv i grunntilstanden der den skal være synlig, så ingen av retningene kan bevises (en «av»-rad ville bestått uten bevis). Raden er ikke PASS og stopper `ready_for_daniel_test` som en FAIL, men telles for seg: feilen ligger i hva proben kan se, ikke nødvendigvis i produktet.", "");
   lines.push("«Skiller» = nei: en avvist skriving (låst valg / løfte / bekreftelse på e-post) der flaten skal vise det samme før og etter. En leser som aldri endrer seg ville også bestått, så raden viser bare at skrivingen ble avvist, ikke at flaten reagerer på bryteren.", "");

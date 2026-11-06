@@ -16,7 +16,8 @@ import {
 } from "../services/profile-translations";
 import crypto from "crypto";
 import { tokenLogLabel, emailLogLabel } from "../utils/log-label";
-import { productImportOutreachEnabled } from "../services/product-import/outreach-prepare";
+import { productImportOutreachEnabledFor } from "../services/product-import/outreach-prepare";
+import { ownerFlagEnabledFor, ownerFlagMode } from "../owner-features/owner-flag-mode";
 import { OUTREACH_RETURN_COOKIE, outreachReturnPathFor } from "../services/product-import/outreach-landing";
 import { getProducerPaymentStatus } from "../services/payment-service";
 import { isOverridableCsLock, csLockNote } from "../services/owner-cs-lock";
@@ -48,7 +49,7 @@ import {
   stockCheckOn, soonExpiringItems, confirmStockCheckItems, formatStockCheckDate, type StockCheckItem,
 } from "../services/stock-check-reminder";
 import {
-  getOwnerImportOverview, productImportEnabled, profileWebsite, OWNER_FETCH_BUSY_MESSAGE, OWNER_FETCH_DAILY_LIMIT_MESSAGE,
+  getOwnerImportOverview, productImportEnabledFor, profileWebsite, OWNER_FETCH_BUSY_MESSAGE, OWNER_FETCH_DAILY_LIMIT_MESSAGE,
   OWNER_FETCH_RUNNING_MESSAGE, OWNER_IMPORT_NO_WEBSITE_MESSAGE,
 } from "../services/product-import/owner-import";
 
@@ -327,7 +328,7 @@ router.get("/magic-link-verify", (req: Request, res: Response) => {
     // Skive 3b-2 (PRODUCT_IMPORT_OUTREACH_ENABLED): back to the outreach
     // landing page the owner came from (rfb_owner_return cookie), only when it
     // is exactly that page for THIS agent.
-    const outreachBack = productImportOutreachEnabled()
+    const outreachBack = productImportOutreachEnabledFor(String(agentId))
       ? outreachReturnPathFor(req.headers.cookie as string | undefined, (req as any).cookies, String(agentId))
       : null;
     if (outreachBack) {
@@ -457,8 +458,14 @@ export function ownerVerifiedOwnerGateEnabled(): boolean {
   return envFlagOn(OWNER_VERIFIED_OWNER_GATE_FLAG);
 }
 
+/** "1"/"true": the unified session is on for every verified owner ("all" mode). */
 export function ownerUnifiedSessionEnabled(): boolean {
-  return envFlagOn(OWNER_UNIFIED_SESSION_FLAG);
+  return ownerFlagMode(OWNER_UNIFIED_SESSION_FLAG) === "all";
+}
+
+/** On for this owner: "1"/"true" → everyone; "pilot" → `rfb:<id>` in OWNER_FEATURES_ALLOWED_SUBJECTS. */
+export function ownerUnifiedSessionEnabledFor(agentId: string | null | undefined): boolean {
+  return ownerFlagEnabledFor(OWNER_UNIFIED_SESSION_FLAG, agentId);
 }
 
 /**
@@ -564,7 +571,7 @@ export function issueOwnerSessionForSelgerLogin(
   agentId: string,
   email: string,
 ): boolean {
-  if (!ownerUnifiedSessionEnabled() || !agentId || !email) return false;
+  if (!ownerUnifiedSessionEnabledFor(agentId) || !agentId || !email) return false;
   const existing = verifyOwnerSession(req);
   if (existing.valid && existing.agentId === agentId) return false;
   openOwnerSession(res, agentId, email);
@@ -1631,8 +1638,27 @@ const ORDER_EMAIL_MAX_REQUESTS_PER_HOUR = 3;
 const ORDER_EMAIL_AUDIT_FIELD = "order_notification_email";
 const ORDER_EMAIL_CONFIRM_PATH = "/eier/ordre-epost/bekreft";
 
+/** "1"/"true": the order e-mail change is on for every verified owner ("all" mode). */
 export function ownerOrderEmailEnabled(): boolean {
-  return envFlagOn(OWNER_ORDER_EMAIL_FLAG);
+  return ownerFlagMode(OWNER_ORDER_EMAIL_FLAG) === "all";
+}
+
+/** On for this owner: "1"/"true" → everyone; "pilot" → `rfb:<id>` in OWNER_FEATURES_ALLOWED_SUBJECTS. */
+export function ownerOrderEmailEnabledFor(agentId: string | null | undefined): boolean {
+  return ownerFlagEnabledFor(OWNER_ORDER_EMAIL_FLAG, agentId);
+}
+
+/**
+ * The agent a confirmation token was issued for (any state: used, expired …),
+ * or null for an unknown / malformed token. Read-only; lets the confirm routes
+ * apply the pilot list to the token's owner.
+ */
+export function orderEmailTokenAgentId(rawToken: string): string | null {
+  if (!/^[0-9a-f]{64}$/.test(rawToken)) return null;
+  const row = getDb()
+    .prepare("SELECT agent_id FROM owner_order_email_change WHERE token_hash = ?")
+    .get(hashOrderEmailToken(rawToken)) as { agent_id?: string } | undefined;
+  return row?.agent_id ? String(row.agent_id) : null;
 }
 
 function hashOrderEmailToken(token: string): string {
@@ -1692,7 +1718,7 @@ export async function requestOwnerOrderEmailChange(
   agentId: string,
   rawEmail: unknown,
 ): Promise<{ status: number; body: any }> {
-  if (!ownerOrderEmailEnabled()) return { status: 404, body: { success: false, error: "not_found" } };
+  if (!ownerOrderEmailEnabledFor(agentId)) return { status: 404, body: { success: false, error: "not_found" } };
   const session = verifyOwnerSession(req);
   if (!session.valid) {
     return { status: 401, body: { success: false, error: "session_invalid", message: "Din sesjon er utløpt. Logg inn på nytt." } };
@@ -2028,7 +2054,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       alert = `<div class="ep-alert ep-alert-ok" role="status">Profilen er synlig igjen.</div>`;
     } else if (status === "pause_error" && ownerPauseEnabled()) {
       alert = `<div class="ep-alert ep-alert-error" role="alert">Klarte ikke å endre pausen. Sjekk datoen og prøv igjen.</div>`;
-    } else if (status.startsWith("order_email_") && ownerOrderEmailEnabled() && ORDER_EMAIL_STATUS_ALERTS[status]) {
+    } else if (status.startsWith("order_email_") && ownerOrderEmailEnabledFor(agentId) && ORDER_EMAIL_STATUS_ALERTS[status]) {
       const oa = ORDER_EMAIL_STATUS_ALERTS[status];
       alert = oa.ok
         ? `<div class="ep-alert ep-alert-ok" role="status">${escapeHtml(oa.text)}</div>`
@@ -2077,7 +2103,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
     // card — only with OWNER_ORDER_EMAIL_ENABLED on and a verified owner
     // (flag off = the portal is byte-identical to before).
     let orderEmailHtml = "";
-    if (ownerOrderEmailEnabled() && !hasOwnerFeatures) {
+    if (ownerOrderEmailEnabledFor(agentId) && !hasOwnerFeatures) {
       try {
         if (isVerifiedOwner(agentId, session)) {
           orderEmailHtml = ownerOrderEmailSectionHtml(agentId, currentOrderRecipient(agentId), pendingOrderEmailChange(agentId)?.new_email ?? null);
@@ -2550,7 +2576,7 @@ router.post("/api/agents/:id/order-email", async (req: Request, res: Response) =
 router.post("/eier/:agentId/order-email", express.urlencoded({ extended: false }), async (req: Request, res: Response) => {
   const agentId = String(req.params.agentId || "");
   const base = `/eier/${encodeURIComponent(agentId)}/portal`;
-  if (!ownerOrderEmailEnabled()) {
+  if (!ownerOrderEmailEnabledFor(agentId)) {
     return res.status(404).send(portalShell("Fant ikke siden", `<div class="ep-card"><h1>Fant ikke siden</h1></div>`));
   }
   // Same Origin check as POST /eier/:id/pause and /selger: no cross-site trigger.
@@ -2573,6 +2599,18 @@ router.post("/eier/:agentId/order-email", express.urlencoded({ extended: false }
     return res.redirect(303, `${base}?status=order_email_error#bestillinger`);
   }
 });
+
+/**
+ * The confirm routes exist: "1"/"true" → for every token; "pilot" → only for
+ * a token issued to an agent on the pilot list (unknown token = no agent id =
+ * off, as with the flag off); off → never.
+ */
+function orderEmailConfirmOpen(rawToken: string): boolean {
+  const mode = ownerFlagMode(OWNER_ORDER_EMAIL_FLAG);
+  if (mode === "all") return true;
+  if (mode === "off") return false;
+  return ownerOrderEmailEnabledFor(orderEmailTokenAgentId(rawToken));
+}
 
 function orderEmailNoStore(res: Response): void {
   // The token is in the URL: never cache the page, never leak it as Referer.
@@ -2598,7 +2636,7 @@ function orderEmailTokenErrorPage(reason: string): string {
 }
 
 router.get(`${ORDER_EMAIL_CONFIRM_PATH}/:token`, orderEmailConfirmLimiter, (req: Request, res: Response) => {
-  if (!ownerOrderEmailEnabled()) {
+  if (!orderEmailConfirmOpen(String(req.params.token || ""))) {
     return res.status(404).send(portalShell("Fant ikke siden", `<div class="ep-card"><h1>Fant ikke siden</h1></div>`));
   }
   orderEmailNoStore(res);
@@ -2621,7 +2659,7 @@ router.get(`${ORDER_EMAIL_CONFIRM_PATH}/:token`, orderEmailConfirmLimiter, (req:
 });
 
 router.post(`${ORDER_EMAIL_CONFIRM_PATH}/:token`, orderEmailConfirmLimiter, express.urlencoded({ extended: false }), (req: Request, res: Response) => {
-  if (!ownerOrderEmailEnabled()) {
+  if (!orderEmailConfirmOpen(String(req.params.token || ""))) {
     return res.status(404).send(portalShell("Fant ikke siden", `<div class="ep-card"><h1>Fant ikke siden</h1></div>`));
   }
   orderEmailNoStore(res);
@@ -2815,7 +2853,7 @@ export function sessionClaimantOwnerEmail(
 
 router.post("/eier/:agentId/selger", (req: Request, res: Response) => {
   const agentId = String((req.params as any).agentId || "");
-  if (!ownerUnifiedSessionEnabled()) {
+  if (!ownerUnifiedSessionEnabledFor(agentId)) {
     return res.status(404).send(portalShell("Fant ikke siden", `<div class="ep-card"><h1>Fant ikke siden</h1></div>`));
   }
   try {
@@ -2854,7 +2892,7 @@ router.post("/eier/:agentId/selger", (req: Request, res: Response) => {
 
 /** Portal card (flag on only): products, opening hours, availability via /selger. */
 export function ownerSelgerCardHtml(agentId: string): string {
-  if (!ownerUnifiedSessionEnabled()) return "";
+  if (!ownerUnifiedSessionEnabledFor(agentId)) return "";
   const id = encodeURIComponent(agentId);
   return `<div class="ep-card" id="produkter">
         <h2>Produkter og åpningstider</h2>
@@ -3208,7 +3246,7 @@ export function productImportStockHintHtml(agentId: string): string {
 
 /** Card visibility: flag on, verified owner of this profile, agents.is_verified = 1, a stored website. */
 export function productImportCardVisible(agentId: string, session: { valid: boolean; agentId?: string }, agentIsVerified: number): boolean {
-  if (!productImportEnabled()) return false;
+  if (!productImportEnabledFor(agentId)) return false;
   if (agentIsVerified !== 1) return false;
   if (!isVerifiedOwner(agentId, session)) return false;
   return !!profileWebsite(agentId);
