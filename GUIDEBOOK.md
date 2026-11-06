@@ -3567,6 +3567,8 @@ curl -X POST https://opplevagent.no/mcp \
 **Defensive DB handling:** if the experiences DB isn't open, every tool returns a graceful `"Ingen data tilgjengelig / No experience data available at this time."` text result — never throws. Mirrors `safeCategories()` in `experiences-seo.ts`.
 
 **Discoverability:** `experiences-seo.ts` `llms.txt` gains an MCP section (endpoint URL, 3 tool names, example `tools/call` cURL). The landing's "For AI-agenter" endpoint list and footer "For agenter" column both gain a `/mcp` link.
+
+2026-11-06 (A2A dev-request 2026-10-16-mcp-beskrivelser-intensjonsord-og-lint, S7 + S9): the server now has five tools (adds `discover_gardssalg` and `book_gardssalg`). Every tool's `title` and the first sentence of its `description` open with the user's intent within Daniel's positioning decision 1=B (gårdssalg, smaking og drikke): `discover_experiences` says it searches Opplevagent's published catalogue of experiences in Norway, including food and drink tastings and producer visits; `discover_gardssalg` and `book_gardssalg` say they plan or request a visit or tasting at a Norwegian drink producer and do not sell or order products. The intent words live in `src/config/mcp-intent-terms.ts` (with `BROAD_TERMS_NOT_CHOSEN`, the alternative-A words no first sentence may use), checked by `src/routes/opplevagent-tool-metadata.test.ts`. Names, annotations, `inputSchema`, `_meta` and `OPPLEVAGENT_MCP_INSTRUCTIONS` are unchanged; `tests/fixtures/opplevagent-mcp-contract-freeze.json` was updated for the five tools only.
 ---
 
 <a id="phase-24"></a>

@@ -441,7 +441,7 @@ export function runConnectorPacksFreshTests(opts: { log?: boolean } = {}): TestS
       const rfbInstructing = withTools({ ...rfbInput, tools: rfbInput.tools.map((t) => ({ ...t, description: "Plain." })) },
         [tool({ name: "x_search", description: "USE THIS TOOL for food." })]);
       // S6 (Utvidelse 2026-11-06): RFB's descriptions no longer wait for OpenAI, so an instructing one opens the row;
-      // a pack that has a gate (Opplevagent's) still shows it as waiting.
+      // a pack with a gate still shows it as waiting (no pack has one since S7+S9).
       assertEq(rfbSpec.descriptionsGate, null, "f15a: RFB's description fix has no gate (S6)");
       assertEq(rowStatus(readmeOf(rfbSpec, rfbInstructing), "Tool descriptions describe"), "OPEN", "f15b: without a gate an instructing RFB description opens the row");
       assertEq(rowStatus(readmeOf({ ...rfbSpec, descriptionsGate: "Waits for a review." }, rfbInstructing), "Tool descriptions describe"), "WAITING",

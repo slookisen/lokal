@@ -52650,3 +52650,25 @@ runSerial(async () => {
     failures.push("mcp-description-policy: unexpected error: " + String(err?.message || err));
   }
 });
+
+// A2A dev-request 2026-10-16-mcp-beskrivelser-intensjonsord-og-lint, S7 + S9:
+// the five Opplevagent tools open with the user's intent (gårdssalg, smaking og
+// drikke, decision 1=B) — no broad word from alternative A in any first
+// sentence, intent words from src/config/mcp-intent-terms.ts in
+// discover_experiences and discover_gardssalg, and the gårdssalg tools say they
+// do not sell or order products. Read-only; runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── Opplevagent: verktøy-metadata (S7/S9) ──");
+  try {
+    const { runOpplevagentToolMetadataTests } = require("../src/routes/opplevagent-tool-metadata.test") as
+      typeof import("../src/routes/opplevagent-tool-metadata.test");
+    const r = runOpplevagentToolMetadataTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("opplevagent-tool-metadata: " + f);
+    console.log(`  opplevagent-tool-metadata: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevagent-tool-metadata: unexpected error: " + String(err?.message || err));
+  }
+});

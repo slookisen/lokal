@@ -12,7 +12,7 @@ Submission pack for listing the remote MCP server `https://opplevagent.no/mcp` i
 
 ## Prerequisites before submission
 
-**Ready to submit: no** (1 open, 1 waiting).
+**Ready to submit: no** (1 open).
 
 | Prerequisite | Status | Detail | Owner | Source |
 |---|---|---|---|---|
@@ -24,7 +24,7 @@ Submission pack for listing the remote MCP server `https://opplevagent.no/mcp` i
 | Square 512×512 PNG icon to upload | **DONE** | `opplevagent-connectors-prep/assets/opplevagent-brand-512.png` (512×512, md5 `ae5af016bbaa21767fa71b66bda51750`). | — | code |
 | MCP App carousel screenshots (3–5 PNG, at least 1000 px wide, showing the live cards) | **OPEN** | 4 PNG in `opplevagent-connectors-prep/assets/`, widths 1260, 1260, 1260, 1260 px; prompts in `opplevagent-connectors-prep/assets/prompts.txt`. Rendered 2026-09-24 (e8a68a45), but the card templates in `src/routes/opplevagent-widgets.ts` have changed since (md5 `dd5d60567b45ad773981299969680d8b` when rendered), so the screenshots do not show the live cards. After OpenAI's decision on the ChatGPT app (the cards can change in review), render them again with `node opplevagent-connectors-prep/assets/generate-screenshots.js`, check its mock data against the live tool output, then set `rendered` in `PACKS` to the new date, commit and md5 (`cardTemplatesMd5()`). | G3-S6 of this dev-request (follow-up) | code |
 | Free-text search in discover_experiences (`query`) | **DONE** | lokal#1089: the user's request goes in `query`, and a place search never returns an unfiltered all-Norway list. | 2026-10-16-opplevagent-mcp-fritekst-query | recorded 2026-10-17 |
-| OpenAI's decision on the Opplevagent ChatGPT app | **WAITING** | Submit after it. Tool titles and first sentences (lint S7) and serverInfo title, websiteUrl and icons (G3-S5) change once OpenAI has decided, and the directory should review the final metadata. Daniel reports the decision. | Daniel (OpenAI review) | recorded 2026-10-17 |
+| OpenAI's decision on the Opplevagent ChatGPT app | **DONE** | Daniel reported on 2026-11-06 that OpenAI approved and published the app (A2A daniel-responses/2026-11-06-live-opplevagent-chatgpt-app-godkjent.md). The tool titles and first sentences changed after it (lint S7 and S9); serverInfo title, websiteUrl and icons (G3-S5) are a separate change. | Daniel (OpenAI review) | recorded 2026-10-17 |
 
 The directory reviews against its connector checklist: https://claude.com/docs/connectors/building/review-criteria.
 
@@ -39,7 +39,7 @@ Rows with source "code" are computed when the pack is generated. Rows with sourc
 | `claude-directory/test-instructions.md` | The Test & launch step: reviewer instructions and prompts. |
 | `assets/opplevagent-brand-512.png` | The icon to upload: Opplevagent's own mark, square, no rounded corners. |
 | `assets/0?-*.png` | MCP App carousel screenshots; the prompt for each is in `assets/prompts.txt` (see `assets/README.md`). |
-| `chatgpt-app/` | The ChatGPT app submission. Frozen while OpenAI reviews it; not part of this pack. |
+| `chatgpt-app/` | The ChatGPT app submission (approved and listed by OpenAI); not part of this pack. |
 | `claude-desktop/` | Deprecated: the MCPB desktop-extension path, kept as history. |
 
 ## How this pack is made

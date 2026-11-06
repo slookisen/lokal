@@ -3,7 +3,7 @@
   "name_for_human": "Opplevagent",
   "name_for_model": "opplevagent",
   "description_for_human": "Finn norske opplevelser — aktiviteter, gårdssalg, mat og naturopplevelser i hele Norge.",
-  "description_for_model": "Opplevagent er en norsk opplevelses- og gårdssalgsmarkedsplass. Bruk discover_experiences for å søke etter opplevelser etter kategori, fylke og pris. Bruk get_experience for detaljer om én opplevelse. Bruk list_experience_categories for kategorier. Bruk discover_gardssalg for å finne gårdssalg og gårdsbutikker, og book_gardssalg for å sende en besøksforespørsel til en gård (oppretter kun en forespørsel — ingen betaling skjer i chatten).",
+  "description_for_model": "Opplevagent er en norsk opplevelses- og gårdssalgsmarkedsplass. Bruk discover_experiences for å søke i Opplevagents publiserte katalog over opplevelser i Norge, blant annet mat- og drikkesmaking og besøk hos produsenter, etter kategori, fylke og pris. Bruk get_experience for detaljer om én opplevelse. Bruk list_experience_categories for kategorier. Bruk discover_gardssalg for å planlegge besøk eller smaking hos en norsk drikkeprodusent (bryggeri, sideri, vingård, destilleri, mjøderi, gårdskafé), og book_gardssalg for å sende en besøksforespørsel til produsenten (oppretter kun en forespørsel — ingen betaling skjer i chatten). Verktøyene selger eller bestiller ikke produkter.",
   "auth": {
     "type": "none"
   },
