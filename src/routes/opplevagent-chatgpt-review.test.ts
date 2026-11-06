@@ -224,8 +224,14 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
       // ── (e) annotation table ──────────────────────────────────────────
       const list = await rpc("tools/list", {});
       const tools: any[] = list.result?.tools ?? [];
-      assertTrue(!instructions.includes("Rett fra Bonden") && !tools.find((t) => t.name === "discover_experiences")?.description?.includes("Rett fra Bonden") && instructions.includes("out_of_scope"),
-        "s3: scope guidance stays within this app without directing selection of another plugin");
+      // S9 (A2A 2026-10-16-mcp-beskrivelser-intensjonsord-og-lint, AC-S9-1): all five descriptions and the
+      // instructions name no other app or its tools and never steer the choice of tool.
+      const s3Forbidden = ["Rett fra Bonden", "lokal_", "Finn-tannlege", "tannlege_", "instead of", "prefer"];
+      const s3Texts: Array<[string, string]> = [["instructions", instructions],
+        ...Object.keys(OPPLEVAGENT_EXPECTED_ANNOTATIONS).map((name): [string, string] => [name, tools.find((t) => t.name === name)?.description ?? ""])];
+      const s3Hits = s3Texts.flatMap(([where, text]) => s3Forbidden.filter((w) => text.toLowerCase().includes(w.toLowerCase())).map((w) => `${where}: «${w}»`));
+      assertTrue(s3Texts.every(([, text]) => text.length > 0) && s3Hits.length === 0 && instructions.includes("out_of_scope"),
+        "s3: scope guidance stays within this app without directing selection of another plugin" + (s3Hits.length ? ` (${s3Hits.join(", ")})` : ""));
       for (const [name, expected] of Object.entries(OPPLEVAGENT_EXPECTED_ANNOTATIONS)) {
         const tool = tools.find((t) => t.name === name);
         assertTrue(!!tool, `e1: tools/list exposes ${name}`);
