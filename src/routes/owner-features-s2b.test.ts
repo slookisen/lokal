@@ -401,9 +401,9 @@ export async function runOwnerFeaturesS2bTests(opts: { log?: boolean } = {}): Pr
     const ul = await post(H.angre, OWNED_ID, { batch: String(lb3.id) });
     assertEq([ul.status, optInCol(OWNED_ID), audits(OWNED_ID).length - auditsBefore], [303, 1, 3], "undo: level reverted as one unit");
     assertEq(loc(await post(H.niva, OWNED_ID, { level: "bogus", confirmed: "1" })).includes("melding=ugyldig"), true, "level: unknown level refused");
-    // Unmet requirement: skipped with reason.
+    // Unmet hard requirement (T10: not verified): nothing written, back to the preview.
     const lu = await post(H.niva, UNBADGED_ID, { level: "utnytte_mulighetene", confirmed: "1" });
-    assertEq([loc(lu), optInCol(UNBADGED_ID), audits(UNBADGED_ID).length], [`/eier/${UNBADGED_ID}/valg?melding=hoppet&nokkel=orders.enabled&ved=niva#niva`, 0, 0], "level: unmet requirement → key skipped, nothing written");
+    assertEq([loc(lu), optInCol(UNBADGED_ID), audits(UNBADGED_ID).length, batches(UNBADGED_ID).length], [`/eier/${UNBADGED_ID}/valg?niva=utnytte_mulighetene#niva-forhandsvis`, 0, 0, 0], "level: unmet hard requirement → nothing written, back to the preview (T10)");
     assertTrue(html(await page(UNBADGED_ID, { melding: "hoppet", nokkel: "orders.enabled" })).includes("«Ta imot bestillinger»: Krever at profilen er verifisert"), "level: skipped message carries the Norwegian reason");
     const pU = html(await page(UNBADGED_ID));
     assertTrue(!pU.includes(`data-level-status="chosen"`) && !pU.includes(`aria-current="true" data-level="utnytte_mulighetene"`), "level (S2e/T8): a level that could not apply is not marked as chosen");

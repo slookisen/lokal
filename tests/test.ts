@@ -51390,6 +51390,27 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-30-rfb-eierportal-testrunde-1, T10 (forhåndsvisning med
+// konsekvenser): the level preview's sections, hard requirements (no confirm
+// button, POST writes nothing), soft warnings, orderGateReady, and hard
+// requirements ⇔ isEligibleForRealOrder() with orders on. Swaps getDb() +
+// env + module cache — runSerial.
+runSerial(async () => {
+  console.log("\n── eierportal testrunde 1 T10: forhåndsvisning med konsekvenser ──");
+  try {
+    const { runOwnerFeaturesT10PreviewTests } = require("../src/routes/owner-features-t10-preview.test") as
+      typeof import("../src/routes/owner-features-t10-preview.test");
+    const r = await runOwnerFeaturesT10PreviewTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-features-t10-preview: " + f);
+    console.log(`  owner-features-t10-preview: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-features-t10-preview: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // Eierportal testrunde 1, T6 («felles drakt, lys og mørk»): shared colour
 // tokens on «Mine valg», the portal and the owner's «Mine ordrer» list —
 // contrast ≥ 4.5:1 / 3:1 in both themes, no colour inline styles for an

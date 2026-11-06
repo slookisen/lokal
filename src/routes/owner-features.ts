@@ -631,6 +631,9 @@ router.post("/eier/:agentId/valg/niva", express.urlencoded({ extended: false }),
     // T5: the preview stands inside the level card.
     if (body.confirmed !== "1") return backTo(res, agentId, `niva=${encodeURIComponent(level.key)}`, OWNER_ANCHOR_LEVEL_PREVIEW, { place: false });
     const out = applyOwnerLevel(VERTICAL, agentId, level.key, { actor: "owner", detail: sessionEmail(g.token) });
+    // T10: a hard requirement is missing — nothing was written; back to the
+    // preview, which lists «Dette mangler» and has no confirm button.
+    if (out.kind === "not_ready") return backTo(res, agentId, `niva=${encodeURIComponent(level.key)}`, OWNER_ANCHOR_LEVEL_PREVIEW, { place: false });
     if (out.kind !== "ok") return backTo(res, agentId, "melding=feil", anchor);
     if (out.batchId) {
       console.log(`[owner-features] owner chose level ${level.key} for agent ${agentId}: ${out.changed.join(",")}`);

@@ -20,6 +20,8 @@ import {
   type OwnerFeatureVertical,
 } from "./registry";
 import {
+  orderRequirementText,
+  readOrderReadiness,
   resolveOwnerFeatures,
   setOwnerFeatureValue,
   type OwnerConsentStamp,
@@ -188,6 +190,74 @@ export interface OwnerLevelPreview {
   level: OwnerLevel;
   changes: Array<{ key: string; from: OwnerFeatureValue; to: OwnerFeatureValue }>;
   skipped: Array<{ key: string; reason: LocalizedText }>;
+  /** T10: `locked` keys that follow a changed key («Følger med»), from → to. */
+  follows?: Array<{ key: string; from: OwnerFeatureValue; to: OwnerFeatureValue }>;
+  /** T10: hard and soft requirements (ownerLevelRequirements). */
+  requirements?: OwnerLevelRequirements;
+}
+
+// ── Level requirements (T10) ───────────────────────────────────────────────
+// dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 3 «Velge». A level
+// that switches orders ON needs the real-order gate to be ready (orders.enabled
+// `enableRequires: orderGateReady`): verified (agents.is_verified = 1), an
+// order address that exists and is not blocked, the profile checked (the
+// internal cross-check). These are HARD: no confirm button, and a confirmed
+// POST writes nothing (applyOwnerLevel → not_ready). They are read from
+// cart-service orderReadiness() — isEligibleForRealOrder() with orders on,
+// explained by explainNotEligible() — so `hard` is empty if and only if the
+// gate would be true with orders on. No new rule. SOFT (a warning, the level
+// can still be confirmed): 0 orderable products, the profile on pause. An
+// owner who already has orders on is never stopped or changed by any of it.
+
+export interface OwnerLevelRequirement {
+  code: string;
+  text: LocalizedText;
+}
+
+export interface OwnerLevelRequirements {
+  hard: OwnerLevelRequirement[];
+  soft: OwnerLevelRequirement[];
+}
+
+export const OWNER_LEVEL_SOFT_TEXTS: Readonly<Record<"no_orderable_products" | "profile_paused", LocalizedText>> = {
+  no_orderable_products: {
+    no: "Du har 0 varer som kan bestilles. Kundene kan ikke bestille før du har lagt inn varer.",
+    en: "You have 0 items that can be ordered. Customers cannot order until you have added items.",
+  },
+  profile_paused: {
+    no: "Profilen din er på pause. Kundene finner den ikke før du slår den på igjen.",
+    en: "Your profile is on pause. Customers will not find it until you switch it back on.",
+  },
+};
+
+/** The level's live preset keys that need the real-order gate when set on. */
+function orderGatedValues(level: OwnerLevel, registry: OwnerFeatureEntry[], env?: NodeJS.ProcessEnv): Array<[OwnerFeatureEntry, OwnerFeatureValue]> {
+  return liveLevelValues(level, registry, env).filter(([e, v]) => v === true && (e.enableRequires ?? []).includes("orderGateReady"));
+}
+
+export function ownerLevelRequirements(
+  vertical: OwnerFeatureVertical,
+  subjectId: string,
+  levelKey: string,
+  opts: OwnerLevelOptions = {},
+): OwnerLevelRequirements {
+  const none: OwnerLevelRequirements = { hard: [], soft: [] };
+  const level = findOwnerLevel(levelKey, opts.levels ?? ownerLevelsFor(vertical));
+  if (!level || vertical !== "rfb") return none;
+  const registry = opts.registry ?? ownerFeatureRegistryFor(vertical);
+  const gated = orderGatedValues(level, registry, opts.env);
+  if (gated.length === 0) return none;
+  const db = opts.db ?? getDb();
+  const resolved = resolveOwnerFeatures(vertical, subjectId, { ...opts, db, registry });
+  const switchingOn = gated.some(([e]) => resolved.byKey[e.key]?.value !== true);
+  const r = readOrderReadiness(db, subjectId);
+  if (switchingOn && !r.ready) {
+    return { hard: r.missing.map((code) => ({ code, text: orderRequirementText(code) })), soft: [] };
+  }
+  const soft: OwnerLevelRequirement[] = [];
+  if (r.orderableIfOn === 0) soft.push({ code: "no_orderable_products", text: OWNER_LEVEL_SOFT_TEXTS.no_orderable_products });
+  if (resolved.byKey["visibility.profile"]?.value === false) soft.push({ code: "profile_paused", text: OWNER_LEVEL_SOFT_TEXTS.profile_paused });
+  return { hard: [], soft };
 }
 
 class PreviewRollback extends Error {
@@ -260,6 +330,7 @@ export function previewOwnerLevel(
   const db = opts.db ?? getDb();
   const o = { ...opts, db, registry };
   const before = resolveOwnerFeatures(vertical, subjectId, o);
+  const requirements = ownerLevelRequirements(vertical, subjectId, level.key, o);
   const dry = { ...o, registry: previewOverlayRegistry(registry) };
   let out: ApplyOwnerLevelResult | null = null;
   try {
@@ -270,12 +341,23 @@ export function previewOwnerLevel(
     if (!(e instanceof PreviewRollback)) throw e;
     out = e.out;
   }
-  if (!out || out.kind !== "ok") return { level, changes: [], skipped: [] };
+  if (!out || out.kind !== "ok") return { level, changes: [], skipped: [], follows: [], requirements };
   const target = new Map(level.values);
+  const changed = new Set(out.changed);
+  // T10 «Følger med»: a `locked` key follows the key it is locked on.
+  const follows: NonNullable<OwnerLevelPreview["follows"]> = [];
+  for (const e of registry) {
+    if (e.type !== "locked" || !e.lockedWhen || !changed.has(e.lockedWhen)) continue;
+    const from = before.byKey[e.key]?.value ?? null;
+    const to = target.get(e.lockedWhen) === true;
+    if (!sameValue(from, to)) follows.push({ key: e.key, from, to });
+  }
   return {
     level,
     changes: out.changed.map((key) => ({ key, from: before.byKey[key]?.value ?? null, to: target.get(key) ?? null })),
     skipped: out.skipped,
+    follows,
+    requirements,
   };
 }
 
@@ -548,6 +630,8 @@ export function applyOwnerSingleChange(
 export type ApplyOwnerLevelResult =
   | { kind: "unknown_level" }
   | { kind: "not_found" }
+  /** T10: a hard requirement is missing (ownerLevelRequirements) — nothing was written. */
+  | { kind: "not_ready"; level: OwnerLevel; missing: OwnerLevelRequirement[] }
   | {
       kind: "ok";
       level: OwnerLevel;
@@ -575,6 +659,10 @@ export function applyOwnerLevel(
   const db = opts.db ?? getDb();
   const o = { ...opts, db, registry };
   return db.transaction((): ApplyOwnerLevelResult => {
+    // T10: a hard requirement stops the whole level before any write
+    // (server side — not only the missing confirm button).
+    const req = ownerLevelRequirements(vertical, subjectId, level.key, o);
+    if (req.hard.length) return { kind: "not_ready", level, missing: req.hard };
     const before = maxAuditId(db);
     const prior = explicitRowKeys(db, vertical, subjectId);
     const changed: string[] = [];

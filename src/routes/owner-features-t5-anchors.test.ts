@@ -281,8 +281,12 @@ export async function runOwnerFeaturesT5AnchorsTests(opts: { log?: boolean } = {
       assertTrue(toastIn(await follow(OWNED_ID, loc(lv2)), "niva"), "r10: …and its message is in #niva");
       assertEq(loc(await post(H.niva, OWNED_ID, { level: "bogus", confirmed: "1" })), P(OWNED_ID, "?melding=ugyldig&ved=niva#niva"), "r11: unknown level → #niva");
       const lvU = await post(H.niva, UNVERIFIED_ID, { level: "utnytte_mulighetene", confirmed: "1" });
-      assertEq(loc(lvU), P(UNVERIFIED_ID, "?melding=hoppet&nokkel=orders.enabled&ved=niva#niva"), "r12: a skipped key (requirement) → #niva");
-      assertTrue(toastIn(await follow(UNVERIFIED_ID, loc(lvU)), "niva"), "r13: …message in #niva");
+      // T10: a hard requirement (is_verified = 0) → nothing written, back to the preview inside #niva.
+      assertEq(loc(lvU), P(UNVERIFIED_ID, "?niva=utnytte_mulighetene#niva-forhandsvis"), "r12: a hard requirement missing → the preview in #niva (T10)");
+      { const pU = await follow(UNVERIFIED_ID, loc(lvU));
+        const pv = elementById(pU, "niva-forhandsvis");
+        assertTrue(elementById(pU, "niva").includes(`id="niva-forhandsvis"`) && pv.includes("Du kan ikke velge «Utnytte mulighetene» før dette er på plass:") && !pv.includes("Bekreft «Utnytte mulighetene»"),
+          "r13: …the preview lists «Dette mangler» and has no confirm button (T10)"); }
 
       // ── Undo a level → back to #niva ─────────────────────────────────────
       const ul = await post(H.angre, OWNED_ID, { batch: String(endret(loc(lv1))) });

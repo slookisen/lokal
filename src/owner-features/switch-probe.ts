@@ -82,7 +82,9 @@ import {
   OWNER_LEVELS,
   applyOwnerLevel,
   applyOwnerSingleChange,
+  deriveOwnerLevel,
   ownerFeatureChangeLog,
+  previewOwnerLevel,
   undoOwnerChange,
   type OwnerActor,
 } from "./changes";
@@ -1104,6 +1106,9 @@ const PLANNED_CHECKS = [
   "requirement_unmet:<key> — uoppfylt krav → 409 requirement_not_met, ingen lagring, ingen effekt (rullet tilbake)",
   "level:<nivå> — nivået gir samme effekt som enkeltbryterne",
   "undo:level:<nivå> / undo:single:<key> — «Angre» gjenoppretter effekten",
+  "level_preview:<nivå> — forhåndsvisningen skriver ingenting, er lik det bekreftelsen gjør, og harde krav er tomme hvis og bare hvis isEligibleForRealOrder() er sann med bestillinger på (T10)",
+  "level_derived:<nivå> — etter nivået regnes nettopp dette nivået ut fra bryterne, uten unntak (T10)",
+  "level_invariants:<nivå> — nivået endrer aldri comms.news eller visibility.profile, og orderGateReady slår aldri av en eier som har bestillinger på (T10)",
   "no_surface:<key> — live-nøkkel uten flater: skriving + endringslogg",
   "choice:<key> — hvert valg som tilbys skrives (og tilbake); flaten viser effekten av akkurat det valget",
   "public_stats_threshold — «Vis som offentlig»: statistikkflisene på profilsiden vises bare med minst PUBLIC_STATS_MIN_VIEWS sidevisninger fra mennesker siste 12 mnd (eierens «Sett»), prøvd på begge sider av terskelen",
@@ -1698,6 +1703,105 @@ function checkLevels(c: Ctx, baseline: ResolvedOwnerFeatures): void {
   }
 }
 
+/** The fixture's real-order gate as it would answer with orders on (always rolled back). */
+function gateWithOrdersOn(c: Ctx): boolean {
+  const { isEligibleForRealOrder } = require("../services/cart-service") as typeof import("../services/cart-service");
+  let out = false;
+  try {
+    c.db.transaction(() => {
+      c.db.prepare(`UPDATE agents SET order_notifications_opt_in = 1 WHERE id = ? AND ${FIXTURE_PIN}`).run(c.agentId);
+      out = isEligibleForRealOrder(c.agentId, c.db);
+      throw new CheckRollback();
+    })();
+  } catch (err) {
+    if (!(err instanceof CheckRollback)) throw err;
+  }
+  return out;
+}
+
+const LEVEL_INVARIANT_KEYS = ["comms.news", "visibility.profile"] as const;
+
+/**
+ * T10 (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 3): per level
+ *   level_preview     the preview writes nothing (stored state, audit, effects),
+ *                     equals what the confirmed level then does (changed and
+ *                     skipped keys), and its hard requirements are empty iff
+ *                     isEligibleForRealOrder() is true with orders on (a level
+ *                     that switches orders on; else always empty);
+ *   level_derived     after the level, deriveOwnerLevel() gives exactly that
+ *                     level with no exceptions;
+ *   level_invariants  the level leaves comms.news and visibility.profile as
+ *                     they were; with orders on, the profile made not ready
+ *                     (cross-check cleared, rolled back) and the level applied
+ *                     again leaves orders on and writes nothing.
+ */
+function checkLevelsT10(c: Ctx, baseline: ResolvedOwnerFeatures): void {
+  const allKeys = liveEntries(c.env).map((e) => e.key);
+  for (const level of OWNER_LEVELS) {
+    restoreValues(c, baseline, allKeys);
+    const o = { db: c.db, env: c.env };
+    // level_preview
+    const stored0 = JSON.stringify(snapshotFixture(c.db, c.agentId));
+    const audit0 = maxAuditId(c.db, c.agentId);
+    const sig0 = effectSignature(c);
+    const before = resolvedNow(c);
+    const p = previewOwnerLevel(VERTICAL, c.agentId, level.key, o);
+    const noWrite = JSON.stringify(snapshotFixture(c.db, c.agentId)) === stored0 && maxAuditId(c.db, c.agentId) === audit0 && effectSignature(c) === sig0;
+    const hard = p?.requirements?.hard ?? [];
+    const switchesOn = level.values.some(([k, v]) => k === "orders.enabled" && v === true) && before.byKey["orders.enabled"]?.value !== true;
+    const gate = gateWithOrdersOn(c);
+    const hardOk = switchesOn ? (hard.length === 0) === gate : hard.length === 0;
+    const out = applyOwnerLevel(VERTICAL, c.agentId, level.key, SWITCH_PROBE_ACTOR, o);
+    const keys = (xs: string[]) => JSON.stringify([...xs].sort());
+    const same = !!p && (out.kind === "ok"
+      ? keys(out.changed) === keys(p.changes.map((x) => x.key)) && keys(out.skipped.map((x) => x.key)) === keys(p.skipped.map((x) => x.key))
+      : out.kind === "not_ready" && hard.length > 0 && maxAuditId(c.db, c.agentId) === audit0);
+    addCheck(c, {
+      check: `level_preview:${level.key}`, pass: noWrite && hardOk && same,
+      observed: `forhåndsvisning ${noWrite ? "skrev ingenting" : "SKREV"}; endres: ${p?.changes.map((x) => x.key).join(", ") || "—"}; harde krav: ${hard.map((h) => h.code).join(", ") || "ingen"}; porten med bestillinger på: ${gate ? "ja" : "nei"}; bekreftet → ${out.kind}${out.kind === "ok" ? ` (${out.changed.join(", ") || "ingen endring"})` : ""}`,
+      ...(!noWrite ? { reason: "forhåndsvisningen skrev noe" } : !hardOk ? { reason: "harde krav stemmer ikke med isEligibleForRealOrder() med bestillinger på" } : !same ? { reason: "forhåndsvisningen er ulik det bekreftelsen gjorde" } : {}),
+    });
+    // level_derived
+    const after = resolvedNow(c);
+    const d = deriveOwnerLevel(after, OWNER_LEVELS);
+    const derivedOk = out.kind === "ok" && !!d && d.level.key === level.key && d.exceptions.length === 0;
+    addCheck(c, {
+      check: `level_derived:${level.key}`, pass: derivedOk,
+      observed: d ? `utregnet nivå: ${d.level.key}, ${d.exceptions.length} unntak` : "ingen nivå regnet ut",
+      ...(derivedOk ? {} : { reason: out.kind !== "ok" ? `nivået ble ikke brukt (${out.kind})` : "bryterne gir ikke nettopp dette nivået" }),
+    });
+    // level_invariants
+    const unchanged = LEVEL_INVARIANT_KEYS.every((k) => sameValue(before.byKey[k]?.value, after.byKey[k]?.value));
+    const presetClean = level.values.every(([k]) => !(LEVEL_INVARIANT_KEYS as readonly string[]).includes(k));
+    let keepsOn = true;
+    let keepsOnNote = "bestillinger av — ikke relevant";
+    if (after.byKey["orders.enabled"]?.value === true) {
+      try {
+        c.db.transaction(() => {
+          c.db.prepare(
+            `UPDATE agent_knowledge SET verification_status = 'pending'
+              WHERE agent_id = ? AND agent_id IN (SELECT id FROM agents WHERE id = ? AND ${FIXTURE_PIN})`,
+          ).run(c.agentId, c.agentId);
+          const a1 = maxAuditId(c.db, c.agentId);
+          const again = applyOwnerLevel(VERTICAL, c.agentId, level.key, SWITCH_PROBE_ACTOR, o);
+          const still = resolvedNow(c).byKey["orders.enabled"]?.value === true;
+          keepsOn = again.kind === "ok" && still && maxAuditId(c.db, c.agentId) === a1;
+          keepsOnNote = `ikke klar (rullet tilbake): nivået på nytt → ${again.kind}; bestillinger ${still ? "fortsatt på" : "AV"}`;
+          throw new CheckRollback();
+        })();
+      } catch (err: any) {
+        if (!(err instanceof CheckRollback)) { keepsOn = false; keepsOnNote = `feil: ${String(err?.message || err)}`; }
+      }
+    }
+    addCheck(c, {
+      check: `level_invariants:${level.key}`, pass: unchanged && presetClean && keepsOn,
+      observed: `${LEVEL_INVARIANT_KEYS.map((k) => `${k}: ${JSON.stringify(before.byKey[k]?.value ?? null)} → ${JSON.stringify(after.byKey[k]?.value ?? null)}`).join("; ")}; ${keepsOnNote}`,
+      ...(!unchanged ? { reason: "nivået endret comms.news eller visibility.profile" } : !presetClean ? { reason: "nivået har en forbudt nøkkel" } : !keepsOn ? { reason: "orderGateReady endret en eier som har bestillinger på" } : {}),
+    });
+    restoreValues(c, baseline, allKeys);
+  }
+}
+
 /** «Angre» on one switch restores the effect (every plain live switch). */
 async function checkUndoSingle(c: Ctx, baseline: ResolvedOwnerFeatures): Promise<void> {
   for (const e of liveEntries(c.env)) {
@@ -1873,6 +1977,7 @@ export async function runSwitchProbe(agentId: string, opts: SwitchProbeOptions =
     checkComingSoon(c);
     checkRequirements(c);
     checkLevels(c, baseline);
+    checkLevelsT10(c, baseline);
     await checkUndoSingle(c, baseline);
     await checkPublicStatsThreshold(c);
   } catch (e: any) {

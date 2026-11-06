@@ -652,6 +652,29 @@ export async function runOwnerFeatureMatrixTests(opts: { log?: boolean } = {}): 
         await switchTo(id, c.key, true, `${L} [on_again]`);
         await expectGate(true, "on_again"); step(c, "on_again");
 
+        // T10 orderGateReady (enableRequires): stops only switching ON, never
+        // switches off or changes an owner who already has orders on.
+        {
+          const G = `${L} [orderGateReady]`;
+          const audits0 = auditRows(id, c.key);
+          db.prepare(`UPDATE agent_knowledge SET verification_status = 'pending' WHERE agent_id = ?`).run(id);
+          assertEq([optInCol(id), resolved(id, c.key).value], [1, true], `${G}: the profile is no longer checked — orders stay on (column 1, value on)`);
+          featuresMod.__resetOwnerFeaturesRateLimitForTesting();
+          const same = await put(id, c.key, true);
+          assertEq([same.status, same.body?.feature?.value, optInCol(id), auditRows(id, c.key) - audits0], [200, true, 1, 0], `${G}: PUT on while already on → 200 no-op, never refused, nothing written`);
+          assertEq(cartSvc!.orderReadiness(db, id).ready, false, `${G}: orderReadiness = not ready (= the gate with orders on)`);
+          await switchTo(id, c.key, false, `${G} [off]`);
+          featuresMod.__resetOwnerFeaturesRateLimitForTesting();
+          const on = await put(id, c.key, true);
+          assertEq([on.status, on.body?.error, optInCol(id), auditRows(id, c.key) - audits0], [409, "requirement_not_met", 0, 1], `${G}: PUT on while not ready → 409 requirement_not_met, column 0, no new audit row`);
+          assertTrue(/Rett fra Bonden har ikke kontrollert profilen/.test(String(on.body?.reason?.no ?? on.body?.reason ?? JSON.stringify(on.body))), `${G}: the 409 names what is missing`);
+          db.prepare(`UPDATE agent_knowledge SET verification_status = 'verified' WHERE agent_id = ?`).run(id);
+          assertEq(cartSvc!.orderReadiness(db, id).ready, true, `${G}: checked again → ready`);
+          assertEq(optInCol(id), 0, `${G}: orderReadiness never keeps a write (column still 0)`);
+          await switchTo(id, c.key, true, `${G} [on]`);
+          await expectGate(true, "on_again");
+        }
+
         // Unmet requirement (claimed owner, no is_verified badge): 409, nothing written, gate stays shut.
         const u = ids.unbadged;
         const before = await submitFor(u);

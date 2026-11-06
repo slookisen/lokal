@@ -173,10 +173,14 @@ export interface LocalizedText {
  * noBookingAdminBrake = Opplevagent has not stopped booking for the row;
  * visibilityOwnerControlled = the row is visible or on the owner's own pause
  * (not «fjern», not an admin quality hide).
+ * T10 (RFB): orderGateReady = isEligibleForRealOrder() would be true with
+ * orders on (cart-service orderReadiness) — an `enableRequires` of
+ * orders.enabled, so it only stops switching orders ON.
  */
 export type OwnerFeatureCondition =
   | "verifiedOwner" | "isVerifiedBadge" | "stripeActive" | "drinkProducer"
-  | "bookingRequestEmail" | "noBookingAdminBrake" | "visibilityOwnerControlled";
+  | "bookingRequestEmail" | "noBookingAdminBrake" | "visibilityOwnerControlled"
+  | "orderGateReady";
 export type OwnerFeatureRequirement = OwnerFeatureKey | OwnerFeatureCondition;
 
 /**
@@ -561,6 +565,11 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     ),
     default: { owner: false, unclaimed: false },
     requires: ["verifiedOwner", "isVerifiedBadge"],
+    // T10: switching ON needs the real-order gate to be ready (verified,
+    // an order address that is not blocked, the profile checked). Only
+    // checked when switching on: an owner who already has orders on is
+    // never switched off or changed by it.
+    enableRequires: ["orderGateReady"],
     confirmOn: t(
       "Du får bestillinger på e-post og må svare kunden. Du kan slå det av når som helst.",
       "You will receive orders by e-mail and must reply to the customer. You can switch it off at any time.",
