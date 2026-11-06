@@ -732,10 +732,46 @@ export function __resetClaimIpWindowForTesting(): void {
 // ─── fire-and-forget tracking (tests await it) ────────────────────────────
 
 const pending = new Set<Promise<void>>();
+/** The running assessment per claim id (eierkrav B2a: the admin notice waits for it). */
+const pendingByClaim = new Map<string, Promise<void>>();
 
-export function trackClaimAssessment(p: Promise<void>): void {
+export function trackClaimAssessment(p: Promise<void>, claimId?: string): void {
   pending.add(p);
-  p.finally(() => pending.delete(p)).catch(() => { /* already handled */ });
+  if (claimId) pendingByClaim.set(claimId, p);
+  p.finally(() => {
+    pending.delete(p);
+    if (claimId && pendingByClaim.get(claimId) === p) pendingByClaim.delete(claimId);
+  }).catch(() => { /* already handled */ });
+}
+
+/** Extra time past CLAIM_ASSESSMENT_TOTAL_TIMEOUT_MS for the run's DB reads and write. */
+export const CLAIM_ASSESSMENT_NOTICE_WAIT_MARGIN_MS = 2000;
+/** Longest the admin notice of a queued claim waits for that claim's assessment (B2a). */
+export const CLAIM_ASSESSMENT_NOTICE_MAX_WAIT_MS = CLAIM_ASSESSMENT_TOTAL_TIMEOUT_MS + CLAIM_ASSESSMENT_NOTICE_WAIT_MARGIN_MS;
+
+let noticeWaitOverrideMs: number | null = null;
+
+/**
+ * Eierkrav B2a: resolves when the already-started assessment of this claim
+ * settles (written, failed or timed out), or after the max wait — whichever
+ * comes first. Never starts a run and never rejects; with no run in flight
+ * it resolves at once.
+ */
+export function waitForClaimAssessment(claimId: string): Promise<void> {
+  const run = pendingByClaim.get(claimId);
+  if (!run) return Promise.resolve();
+  const maxWaitMs = Math.min(noticeWaitOverrideMs ?? CLAIM_ASSESSMENT_NOTICE_MAX_WAIT_MS, CLAIM_ASSESSMENT_NOTICE_MAX_WAIT_MS);
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, Math.max(0, maxWaitMs));
+    (timer as any).unref?.();
+    const done = () => { clearTimeout(timer); resolve(); };
+    run.then(done, done);
+  });
+}
+
+/** Tests only: a shorter max wait for the notice (null restores the default; never longer than the default). */
+export function __setClaimNoticeWaitMsForTesting(ms: number | null): void {
+  noticeWaitOverrideMs = ms;
 }
 
 /** Tests only: resolves when every assessment started so far has finished. */

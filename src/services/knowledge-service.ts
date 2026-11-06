@@ -1494,7 +1494,7 @@ class KnowledgeService {
           console.warn(`[claim-assessment] claim ${claimId} not assessed: ${claimAssessmentErrorKind(err)}`);
         }
       })();
-      trackClaimAssessment(run);
+      trackClaimAssessment(run, claimId);
     } catch (err) {
       console.warn(`[claim-assessment] not started: ${claimAssessmentErrorKind(err)}`);
     }

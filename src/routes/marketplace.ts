@@ -3,7 +3,7 @@ import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-
 import { getConfig } from "../config/vertical-config";
 import { AgentRegistrationSchema, AdminRegistrationSchema, DiscoveryQuerySchema } from "../models/marketplace";
 import { interactionLogger } from "../services/interaction-logger";
-import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise, productPriceText, productsWriteError, isSingleEmailAddress, CLAIM_CODE_VALID_HOURS, EMAIL_ADDRESS_MAX_LENGTH, formatClaimTime, type ClaimReviewReason, type SkippedKnowledgeField, type ClaimRateLimitScope, type ClaimCodeRoute, type ClaimResendRefusal } from "../services/knowledge-service";
+import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise, productPriceText, productsWriteError, isSingleEmailAddress, CLAIM_CODE_VALID_HOURS, EMAIL_ADDRESS_MAX_LENGTH, formatClaimTime, parseStoredClaimAssessment, type ClaimReviewReason, type SkippedKnowledgeField, type ClaimRateLimitScope, type ClaimCodeRoute, type ClaimResendRefusal } from "../services/knowledge-service";
 import { isDebioVerifiedValue, isOrganicClaimUmbrella, stripOrganicCategories } from "../services/organic-claims";
 import { textEntries } from "../utils/text-entries";
 import { geocodingService } from "../services/geocoding-service";
@@ -56,6 +56,7 @@ import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
 import { maskEmail } from "../services/gardssalg-claim";
 import { CLAIM_RECOMMENDATION_LABELS, type ClaimRecommendation } from "../services/claim-domain-rule";
 import { createClaimActionLinks, isClaimActionLinksEnabled } from "../services/claim-action-link";
+import { claimAssessmentEnabled, waitForClaimAssessment, type ClaimAssessment } from "../services/claim-assessment";
 import { rfbClaimRequestLimiter } from "../middleware/security";
 import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
 import { capFreeText, capName } from "../utils/free-text";
@@ -1971,8 +1972,44 @@ function claimQueuedActionLinks(claimId: string): { approve: string; reject: str
 
 /** Tells the admin (ADMIN_NOTIFICATION_EMAIL) that a claim entered the admin
  *  queue. Fire-and-forget, like the verified-claim notice below; the queue's
- *  own caps bound how often it fires. */
+ *  own caps bound how often it fires.
+ *
+ *  Eierkrav B2a: with CLAIM_AUTO_ASSESSMENT_ENABLED === "true" the notice
+ *  first waits (bounded, CLAIM_ASSESSMENT_NOTICE_MAX_WAIT_MS) for this
+ *  claim's already-started assessment, then shows what is stored in
+ *  claim_assessment. Flag off, no stored assessment, a timeout or an
+ *  unreadable value → the notice goes out exactly as before. The caller
+ *  never waits for any of it. */
 function notifyAdminClaimQueued(claimId: string): void {
+  let assessmentOn = false;
+  try {
+    assessmentOn = claimAssessmentEnabled();
+  } catch { /* off */ }
+  if (!assessmentOn) {
+    sendAdminClaimQueuedNotice(claimId, undefined);
+    return;
+  }
+  try {
+    waitForClaimAssessment(claimId)
+      .then(() => sendAdminClaimQueuedNotice(claimId, storedClaimAssessment(claimId)))
+      .catch((err: any) => console.error("[Admin notify] claim-review notice error:", err?.message));
+  } catch (err: any) {
+    console.error("[Admin notify] claim-review notice error:", err?.message);
+  }
+}
+
+/** The claim's stored assessment, or undefined (none, unreadable or a read error). */
+function storedClaimAssessment(claimId: string): ClaimAssessment | undefined {
+  try {
+    const row = getDb().prepare("SELECT claim_assessment FROM agent_claims WHERE id = ?").get(claimId) as { claim_assessment: string | null } | undefined;
+    return parseStoredClaimAssessment(row?.claim_assessment) ?? undefined;
+  } catch (err: any) {
+    console.warn("[Admin notify] claim assessment not read:", err?.code ?? "error");
+    return undefined;
+  }
+}
+
+function sendAdminClaimQueuedNotice(claimId: string, assessment: ClaimAssessment | undefined): void {
   try {
     const row = getDb().prepare(
       `SELECT c.agent_id, c.claimant_name, c.claimant_email, c.review_reason, c.recommendation, a.name AS agent_name
@@ -1985,7 +2022,7 @@ function notifyAdminClaimQueued(claimId: string): void {
     const recommendation = row.recommendation
       ? `${row.recommendation} — ${CLAIM_RECOMMENDATION_LABELS[row.recommendation] ?? ""}`.replace(/ — $/, "")
       : undefined;
-    emailService.sendAdminClaimReviewNotification(row.agent_name, row.agent_id, row.claimant_name, row.claimant_email, reason, recommendation, claimQueuedActionLinks(claimId))
+    emailService.sendAdminClaimReviewNotification(row.agent_name, row.agent_id, row.claimant_name, row.claimant_email, reason, recommendation, claimQueuedActionLinks(claimId), assessment)
       .catch((err: any) => console.error("[Admin notify] claim-review notice failed:", err?.message));
   } catch (err: any) {
     console.error("[Admin notify] claim-review notice error:", err?.message);
