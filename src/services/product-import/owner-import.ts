@@ -665,7 +665,13 @@ export function publishOwnerImport(
   runId: string,
   selection: PublishSelection[],
   remove: string[],
-  opts: { actorEmail: string | null; now?: () => number; mode?: ImportRunMode } = { actorEmail: null },
+  opts: {
+    actorEmail: string | null;
+    now?: () => number;
+    mode?: ImportRunMode;
+    /** Extra writes that must commit or roll back with the publish (Skive 4a: the weekly-sync box). */
+    inTransaction?: () => void;
+  } = { actorEmail: null },
 ): PublishResult {
   const db = getDb();
   const now = opts.now ?? testDeps?.now ?? Date.now;
@@ -875,6 +881,7 @@ export function publishOwnerImport(
         auditOwnerProductChange(db, agentId, "products.removed", removedNames.join(", ").slice(0, 2000), null, opts.actorEmail,
           `owner removed ${removedNames.length} product(s) in import run ${runId} (produktimport skive 3)`);
       }
+      opts.inTransaction?.();
     })();
   } catch (err) {
     console.error("[product-import] owner publish failed:", err instanceof Error ? err.message : err);

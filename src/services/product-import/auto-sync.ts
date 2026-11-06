@@ -114,7 +114,7 @@ export function readAutoSyncState(agentId: string): AutoSyncStateRow | null {
   return row ?? null;
 }
 
-/** Sets a profile's mode (no route calls this yet; a later slice adds the owner toggle). */
+/** Sets a profile's mode (the import page's box calls this via enableWeeklySyncFromImport; «Mine valg» comes later). */
 export function setProductSyncMode(agentId: string, mode: ProductSyncMode): void {
   getDb()
     .prepare(
@@ -125,6 +125,84 @@ export function setProductSyncMode(agentId: string, mode: ProductSyncMode): void
          disabled_at = CASE WHEN excluded.product_sync_mode = 'weekly' THEN NULL ELSE disabled_at END`,
     )
     .run(agentId, mode);
+}
+
+// ── Import-page choice + owner status (Skive 4a / 4-2a) ────────────────────
+
+/**
+ * The «Hold prisene oppdatert automatisk hver uke» box on the import page:
+ * null (no box) unless the flag is on and the profile has agents.is_verified
+ * = 1; else the profile's current mode (the box is ticked when 'weekly').
+ * Never writes.
+ */
+export function importPageAutoSyncChoice(agentId: string, env: NodeJS.ProcessEnv = process.env): { mode: ProductSyncMode } | null {
+  if (!productAutoSyncEnabled(env)) return null;
+  const row = getDb().prepare(`SELECT is_verified FROM agents WHERE id = ?`).get(agentId) as { is_verified?: number } | undefined;
+  if (!row || row.is_verified !== 1) return null;
+  return { mode: readAutoSyncState(agentId)?.product_sync_mode === "weekly" ? "weekly" : "off" };
+}
+
+/**
+ * «Publiser valgte» with the box ticked: sets product_sync_mode 'weekly' and
+ * writes one agent_knowledge_audit row (field products.weekly_sync, the
+ * «Mine valg» key of the same setting). Meant to run inside the publish
+ * transaction (publishOwnerImport's inTransaction). Does nothing when the
+ * flag is off, the profile is not is_verified = 1 or the mode already is
+ * 'weekly'. Returns whether the mode was changed.
+ */
+export function enableWeeklySyncFromImport(agentId: string, actorEmail: string | null, runId: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  const choice = importPageAutoSyncChoice(agentId, env);
+  if (!choice || choice.mode === "weekly") return false;
+  setProductSyncMode(agentId, "weekly");
+  auditOwnerProductChange(getDb(), agentId, "products.weekly_sync", "off", "weekly", actorEmail,
+    `owner turned on weekly price auto-sync when publishing import run ${runId} (produktimport skive 4a)`);
+  return true;
+}
+
+/** What the owner is shown about the weekly auto-sync (portal card / import page). */
+export type AutoSyncStatusView =
+  | { kind: "waiting" }
+  | { kind: "success"; at: string; changed: number; not_found: number; new_pending: number }
+  | { kind: "blocked"; at: string | null; reason: string }
+  | { kind: "disabled"; at: string | null; reason: string };
+
+/** The lock / failure reason codes of planAutoSync / runAutoSyncForProfile in plain Norwegian. */
+export function autoSyncReasonTextNb(reason: string | null): string {
+  const r = (reason ?? "").replace(/^\d+ låste kjøringer på rad; siste: /, "");
+  const code = r.split(":")[0]!.trim();
+  const detail = r.slice(code.length + 1).trim();
+  if (code === "fetch_failed") return "Vi fikk ikke hentet produktene fra nettsiden din.";
+  if (code === "too_many_missing") return `Vi fant ikke mange nok av varene dine på nettsiden${detail ? ` (${detail})` : ""}.`;
+  if (code === "price_deviation") return `En pris endret seg mer enn 50 %${detail ? ` (${detail})` : ""}.`;
+  return "Oppdateringen ble stoppet.";
+}
+
+/**
+ * The status view, or null when nothing is shown: flag off, or the mode is
+ * not 'weekly' and the profile never had a run. Never writes.
+ */
+export function autoSyncStatusView(agentId: string, env: NodeJS.ProcessEnv = process.env): AutoSyncStatusView | null {
+  if (!productAutoSyncEnabled(env)) return null;
+  const s = readAutoSyncState(agentId);
+  if (!s) return null;
+  const weekly = s.product_sync_mode === "weekly";
+  if (!weekly && !s.last_run_at) return null;
+  if (!weekly && s.disabled_reason) return { kind: "disabled", at: s.disabled_at, reason: autoSyncReasonTextNb(s.disabled_reason) };
+  if (weekly && s.consecutive_blocks > 0 && s.last_block_reason) {
+    return { kind: "blocked", at: s.last_run_at, reason: autoSyncReasonTextNb(s.last_block_reason) };
+  }
+  if (s.last_success_at) {
+    let sum: { changed?: unknown; not_found?: unknown; new_pending?: unknown } = {};
+    try { sum = JSON.parse(s.last_change_summary ?? "{}") ?? {}; } catch { sum = {}; }
+    return {
+      kind: "success",
+      at: s.last_success_at,
+      changed: Array.isArray(sum.changed) ? sum.changed.length : 0,
+      not_found: Array.isArray(sum.not_found) ? sum.not_found.length : 0,
+      new_pending: typeof sum.new_pending === "number" ? sum.new_pending : 0,
+    };
+  }
+  return weekly ? { kind: "waiting" } : null;
 }
 
 const sqlTs = (ms: number): string => new Date(ms).toISOString().slice(0, 19).replace("T", " ");

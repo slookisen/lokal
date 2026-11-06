@@ -22,6 +22,7 @@ import { Router, Request, Response } from "express";
 import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { resolveRouteIntent } from "../services/route-intent";
+import { productAutoSyncEnabled } from "../services/product-import/auto-sync";
 import { knowledgeService, productPriceText, parseProductPrice, OWNER_PRODUCT_SOURCES, ownerWroteAbout, publicOwnerAboutText } from "../services/knowledge-service";
 import { catalogNameNorm, softStockByNameNorm, stockSoftExpiryBuyerText, type SoftStockFields } from "../services/stock-soft-expiry";
 import { containsOrganicClaim, isOrganicClaimUmbrella, dropOrganicSentences } from "../services/organic-claims";
@@ -990,8 +991,8 @@ function productDateText(iso: unknown, lang: Lang): string {
 }
 
 /** The products card's date line + price caveat as HTML, or "" when no owner product has a date. */
-export function productDateLineHtml(products: unknown[], lang: Lang): string {
-  let newest: { at: number; iso: string; host: string; confirmed: boolean } | null = null;
+export function productDateLineHtml(products: unknown[], lang: Lang, env: NodeJS.ProcessEnv = process.env): string {
+  let newest: { at: number; iso: string; host: string; confirmed: boolean; auto: boolean } | null = null;
   for (const p of products) {
     if (!p || typeof p !== "object") continue;
     const { source, sourceUrl, fetchedAt, confirmedAt } = p as Record<string, unknown>;
@@ -1006,12 +1007,20 @@ export function productDateLineHtml(products: unknown[], lang: Lang): string {
     const iso = host && typeof fetchedAt === "string" ? fetchedAt : confirmedAt;
     const at = typeof iso === "string" ? Date.parse(iso) : NaN;
     if (!Number.isFinite(at) || (newest && at <= newest.at)) continue;
-    newest = { at, iso: iso as string, host: iso === fetchedAt ? host : "", confirmed: typeof confirmedAt === "string" && !!confirmedAt };
+    newest = {
+      at, iso: iso as string, host: iso === fetchedAt ? host : "", confirmed: typeof confirmedAt === "string" && !!confirmedAt,
+      auto: source === "owner_auto_sync",
+    };
   }
   if (!newest) return "";
   const date = productDateText(newest.iso, lang);
   if (!date) return "";
-  const line = newest.host
+  // Skive 4-2a: the newest price came from the weekly auto-sync → «Oppdatert
+  // automatisk fra <domene> <dato>» (only with PRODUCT_AUTO_SYNC_ENABLED on;
+  // off = exactly the line above).
+  const line = newest.host && newest.auto && productAutoSyncEnabled(env)
+    ? t(lang, "producer.products_auto_updated", { host: newest.host, date })
+    : newest.host
     ? t(lang, "producer.products_prices_fetched", { host: newest.host, date }) +
       (newest.confirmed ? ` \u00b7 ${t(lang, "producer.products_confirmed_by_owner")}` : "")
     : t(lang, "producer.products_updated_by_owner", { date });
