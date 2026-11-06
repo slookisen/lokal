@@ -52,7 +52,9 @@ import {
   getOwnerImportOverview, productImportEnabledFor, profileWebsite, OWNER_FETCH_BUSY_MESSAGE, OWNER_FETCH_DAILY_LIMIT_MESSAGE,
   OWNER_FETCH_RUNNING_MESSAGE, OWNER_IMPORT_NO_WEBSITE_MESSAGE,
 } from "../services/product-import/owner-import";
-import { autoSyncStatusView, type AutoSyncStatusView } from "../services/product-import/auto-sync";
+import { autoSyncStatusView, importPageAutoSyncChoice, type AutoSyncStatusView } from "../services/product-import/auto-sync";
+import { ownerRowAnchor } from "../owner-features/anchors";
+import { PRODUCT_WEEKLY_SYNC_KEY } from "../owner-features/product-weekly-sync";
 
 const router = Router();
 
@@ -2143,7 +2145,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
     let productImportCard = "";
     try {
       if (productImportCardVisible(agentId, session, agent.is_verified)) {
-        const ia = productImportPortalAlert(status, req.query as any, productImportStockHintHtml(agentId));
+        const ia = productImportPortalAlert(status, req.query as any, productImportStockHintHtml(agentId), weeklySyncNudgeHtml(agentId));
         const iaHtml = ia
           ? `<div class="ep-alert ${ia.ok ? "ep-alert-ok" : "ep-alert-error"}" role="${ia.ok ? "status" : "alert"}" data-import-alert="${escapeHtml(status)}">${ia.html}</div>`
           : "";
@@ -3208,6 +3210,7 @@ export function productImportPortalAlert(
   status: string,
   query: { publisert?: unknown; fjernet?: unknown; avvist?: unknown },
   stockHint: string,
+  weeklyNudgeHtml = "",
 ): { ok: boolean; html: string } | null {
   const num = (v: unknown) => (typeof v === "string" && /^\d{1,4}$/.test(v) ? Number(v) : 0);
   const varer = (n: number) => `${n} ${n === 1 ? "vare" : "varer"}`;
@@ -3223,7 +3226,7 @@ export function productImportPortalAlert(
       if (rej > 0) text += ` ${varer(rej)} kunne ikke legges inn (kategorinavn, alkohol eller tjeneste).`;
       return {
         ok: true,
-        html: `<span data-import-published="${pub}" data-import-removed="${rem}">${escapeHtml(text)}</span>${pub > 0 ? ` ${stockHint}` : ""}`,
+        html: `<span data-import-published="${pub}" data-import-removed="${rem}">${escapeHtml(text)}</span>${pub > 0 ? ` ${stockHint}` : ""}${pub > 0 && weeklyNudgeHtml ? ` ${weeklyNudgeHtml}` : ""}`,
       };
     }
     case "produktimport_grense": return { ok: false, html: escapeHtml(OWNER_FETCH_DAILY_LIMIT_MESSAGE) };
@@ -3233,6 +3236,20 @@ export function productImportPortalAlert(
     case "produktimport_feil": return { ok: false, html: "Noe gikk galt. Prøv igjen om litt." };
     default: return null;
   }
+}
+
+/**
+ * Skive 4-2c: after a publish, the pointer to the «Mine valg» weekly-sync row.
+ * Decided from stored state at render time with the import page's own rule
+ * (importPageAutoSyncChoice: PRODUCT_AUTO_SYNC_ENABLED on and is_verified = 1;
+ * mode 'weekly' = already on, so no nudge). "" otherwise. Never writes.
+ */
+export function weeklySyncNudgeHtml(agentId: string): string {
+  let choice: ReturnType<typeof importPageAutoSyncChoice> = null;
+  try { choice = importPageAutoSyncChoice(agentId); } catch { choice = null; }
+  if (!choice || choice.mode === "weekly") return "";
+  const href = `/eier/${encodeURIComponent(agentId)}/valg#${ownerRowAnchor(PRODUCT_WEEKLY_SYNC_KEY)}`;
+  return `<span data-weekly-sync-nudge="1">${escapeHtml("Vil du at vi holder prisene oppdatert hver uke? Slå det på i")} <a href="${escapeHtml(href)}">«Mine valg»</a>.</span>`;
 }
 
 /** Where imported products are made orderable: the B1 card when it is on for this profile, else a plain sentence. */
