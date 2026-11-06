@@ -639,7 +639,8 @@ function parsePriceInput(v: unknown): number | null | "invalid" {
   return Math.round(n * 100) / 100;
 }
 
-function formatPrice(price: number | null, unit: string | null, isFrom: boolean, exclVat: boolean): string | undefined {
+/** The stored price text for a product («fra kr 250/kg ekskl. mva.»); also used by the weekly auto-sync. */
+export function formatPrice(price: number | null, unit: string | null, isFrom: boolean, exclVat: boolean): string | undefined {
   if (price === null) return undefined;
   const p = Number.isInteger(price) ? String(price) : price.toFixed(2).replace(".", ",");
   return `${isFrom ? "fra " : ""}kr ${p}${unit ? `/${unit}` : ""}${exclVat ? " ekskl. mva." : ""}`;

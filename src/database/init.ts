@@ -6606,6 +6606,36 @@ function initSchema(db: Database.Database): void {
     console.error("Migration product_import_outreach_events failed:", err);
   }
 
+  // ─── product_auto_sync_state (Produktimport skive 4-1) ──────────────────
+  // Weekly auto-sync of a verified owner's products from their own website
+  // (flag PRODUCT_AUTO_SYNC_ENABLED, default off). One row per profile:
+  // product_sync_mode ('off' | 'weekly'; a profile without a row is 'off'),
+  // the consecutive lock/failure count, the last run / last success, the last
+  // change summary (JSON) and the last lock reason; after 3 locks in a row the
+  // job sets the mode back to 'off' with disabled_reason. Runs are logged in
+  // product_import_runs with mode 'auto_sync'; new products wait there as
+  // 'pending' candidates. Additive, brand-new table, idempotent.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS product_auto_sync_state (
+        agent_id TEXT PRIMARY KEY,
+        product_sync_mode TEXT NOT NULL DEFAULT 'off',
+        consecutive_blocks INTEGER NOT NULL DEFAULT 0,
+        last_run_at TEXT,
+        last_run_id TEXT,
+        last_success_at TEXT,
+        last_change_summary TEXT,
+        last_block_reason TEXT,
+        disabled_reason TEXT,
+        disabled_at TEXT,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_product_auto_sync_state_mode ON product_auto_sync_state(product_sync_mode, last_run_at)`);
+  } catch (err) {
+    console.error("Migration product_auto_sync_state failed:", err);
+  }
+
   // ─── S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok ──────────────
   // agents_name_fts (FTS5 trigram over agents.name) + its three sync triggers,
   // populated here only when empty or out of step with agents (one INSERT …
