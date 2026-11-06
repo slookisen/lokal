@@ -50326,6 +50326,27 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice
+// C4: signed one-click links (approve / reject / revoke) for owner claims —
+// GET writes nothing, POST runs once, expiry/tamper/flag/secret refusals. Pins
+// getDb() to its own in-memory DB, runs an in-process server, sets env
+// (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-30-rfb-eierkrav C4: signed one-click claim-action links ──");
+  try {
+    const { runClaimActionLinkTests } = require("../src/routes/claim-action-link.test") as
+      typeof import("../src/routes/claim-action-link.test");
+    const c4 = await runClaimActionLinkTests({ log: false });
+    passed += c4.passed;
+    failed += c4.failed;
+    for (const f of c4.failures) failures.push("claim-action-link: " + f);
+    console.log(`  claim-action-link: ${c4.passed} passed, ${c4.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("claim-action-link: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-rfb-utsending-v4, skive 1: /selger?agent=<id> viser
 // bare den ene butikken når produsenten ikke er tatt over.
 runSerial(async () => {

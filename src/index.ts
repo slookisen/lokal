@@ -38,6 +38,7 @@ import { runProductCatalogSync } from "./services/product-catalog-sync";
 import { cartRouter, adminOrderRouter, producerOrderRouter } from "./routes/marketplace-cart";
 import adminOrdersRoutes from "./routes/admin-orders";
 import orderActivationRoutes, { orderActivationAdminRouter } from "./routes/order-activation-link";
+import claimActionLinkRoutes, { claimActionAdminRouter } from "./routes/claim-action-link";
 import dentalRoutes from "./routes/dental";
 import opplevelserRoutes from "./routes/opplevelser";
 import mcpRoutes from "./routes/mcp";
@@ -579,6 +580,10 @@ app.use("/", buyerOrderCardRoutes);
 // dev-request 2026-10-21 live-go handlevogn-pilot, skive 2: one-time activation
 // link landing page (GET/POST /aktiver-bestillinger?t=…).
 app.use("/", orderActivationRoutes);
+// dev-request 2026-10-30-rfb-eierkrav (slice C4): signed one-click owner-claim
+// decision links (GET confirm / POST perform /eierkrav/handling?t=…). 404
+// while CLAIM_ACTION_LINKS_ENABLED is off. See routes/claim-action-link.ts.
+app.use("/", claimActionLinkRoutes);
 
 // (gardssalgClaimRoutes is mounted earlier — before the opplevagent.no
 // host-gate above — see the comment there for why.)
@@ -981,6 +986,10 @@ app.use("/admin/gardssalg/owner-features/switch-probe", adminLimiter, adminGards
 // POST /admin/agents/claim-backfill — one-shot claimed_at backfill for verified
 // claims (dev-request 2026-10-01-rfb-eierkrav-utelates-fra-outreach). Mount BEFORE /admin/agents.
 app.use("/admin/agents/claim-backfill", adminLimiter, adminAgentsClaimBackfillRoutes);
+// POST /admin/agents/claim-action-links — mint signed one-click links for an
+// owner claim (dev-request 2026-10-30-rfb-eierkrav, slice C4). 503 while
+// CLAIM_ACTION_LINKS_ENABLED is off. Mount BEFORE /admin/agents.
+app.use("/admin/agents/claim-action-links", adminLimiter, claimActionAdminRouter);
 // POST /admin/agents/terminal-repark — categorical correction lever that
 // flips wrongly terminal_unconfirmable rows (parked by the pre-#718
 // no-data-was-treated-as-dead bug) back to pending_verify, leaving

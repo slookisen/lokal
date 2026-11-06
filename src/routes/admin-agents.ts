@@ -120,11 +120,8 @@ import {
 import { readDebioVerified } from "../services/debio-approval";
 // The claim admin queue (decision 11=A) — see GET /claim-review-queue below.
 import { knowledgeService } from "../services/knowledge-service";
-import { emailService } from "../services/email-service";
-import { recordClaimMail } from "../services/claim-crm-tracking";
-import { trustScoreService } from "../services/trust-score-service";
 import { maskEmail } from "../services/gardssalg-claim";
-import { createOwnerLoginLink } from "./owner-portal";
+import { applyClaimApprove, applyClaimReject, applyClaimRevoke, sendClaimApprovedLoginMail } from "../services/claim-review-actions";
 
 import { deleteAgentProfileTranslations } from "../services/profile-translations";
 const router = Router();
@@ -2307,13 +2304,12 @@ router.post("/claim-review-approve", async (req: Request, res: Response) => {
     return;
   }
 
-  const approved = knowledgeService.approveClaimReview(claimId, body.email as string | undefined);
+  const approved = applyClaimApprove(claimId, body.email as string | undefined);
   if (!approved.ok) {
     const status = approved.error === "not_found" ? 404 : approved.error === "not_pending_review" ? 409 : 400;
     res.status(status).json({ error: approved.error });
     return;
   }
-  trustScoreService.update(approved.agentId);
 
   // K5 (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post): a one-time,
   // 15-minute login straight into the owner portal (/eier) for the approved
@@ -2322,17 +2318,8 @@ router.post("/claim-review-approve", async (req: Request, res: Response) => {
   // Not held by request-magic-link's visitor rate limit (createOwnerLoginLink
   // checks none). The approval is already stored, so a failure here only
   // means no mail (loginLinkSent false), never a 500 to retry into a 409.
-  let loginLinkSent = false;
-  try {
-    const nameRow = getDb().prepare("SELECT name FROM agents WHERE id = ?").get(approved.agentId) as { name?: string } | undefined;
-    const link = createOwnerLoginLink(approved.agentId, approved.email, "claim_approval");
-    const approvedAgentName = nameRow?.name || "din gård";
-    const sent = await emailService.sendClaimConfirmation(approved.email, approvedAgentName, link.verifyUrl, approved.agentId);
-    loginLinkSent = sent.success && sent.messageId !== "DRY_RUN";
-    recordClaimMail({ kind: "claim_approved", claimId, agentId: approved.agentId, email: approved.email, agentName: approvedAgentName, sendResult: sent });
-  } catch (err) {
-    console.error("[admin-agents] claim-review-approve: login link not sent:", err instanceof Error ? err.message : "error");
-  }
+  // Shared with the signed claim-action links (services/claim-review-actions.ts).
+  const loginLinkSent = await sendClaimApprovedLoginMail(claimId, approved, "[admin-agents] claim-review-approve");
 
   res.json({
     success: true,
@@ -2354,7 +2341,7 @@ router.post("/claim-review-reject", (req: Request, res: Response) => {
     res.status(400).json({ error: "Requires { claimId, note? }" });
     return;
   }
-  const rejected = knowledgeService.rejectClaimReview(claimId, body.note as string | undefined);
+  const rejected = applyClaimReject(claimId, body.note as string | undefined);
   if (!rejected.ok) {
     res.status(rejected.error === "not_found" ? 404 : 409).json({ error: rejected.error });
     return;
@@ -2385,15 +2372,11 @@ router.post("/claim-revoke", (req: Request, res: Response) => {
     return;
   }
   const note = typeof body.note === "string" && body.note.trim() ? body.note.trim() : undefined;
-  const revoked = knowledgeService.revokeClaimOwnership(claimId, note);
+  const revoked = applyClaimRevoke(claimId, note);
   if (!revoked.ok) {
     res.status(revoked.error === "not_found" ? 404 : 409).json({ error: revoked.error });
     return;
   }
-  trustScoreService.update(revoked.agentId);
-  console.log(
-    `[claim-revoke] claim ${claimId} on agent ${revoked.agentId} revoked: restored=${revoked.restored}, ownerRemains=${revoked.ownerRemains}, sessionsRevoked=${revoked.sessionsRevoked}`
-  );
   res.json({
     success: true,
     claimId,
