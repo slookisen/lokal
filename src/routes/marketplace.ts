@@ -11,6 +11,7 @@ import { getDb } from "../database/init";
 import { emailService } from "../services/email-service";
 import { deleteAgentProfileTranslations } from "../services/profile-translations";
 import { handleInboundEmailWebhook } from "../services/inbound-email-webhook";
+import { recordClaimMail } from "../services/claim-crm-tracking";
 import { trustScoreService } from "../services/trust-score-service";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { slugify } from "../utils/slug";
@@ -2056,6 +2057,7 @@ router.post("/agents/:id/claim", rfbClaimRequestLimiter, async (req: Request, re
     // `email` (unless that IS the farm's address). Domain rule P1/P2 (flag
     // on): to the claimant's own address, whose domain qualified.
     const emailResult = await emailService.sendVerificationCode(result.recipient, result.verificationCode, agentName);
+    recordClaimMail({ kind: "claim_code", claimId: result.claimId, agentId, email: result.recipient, agentName, sendResult: emailResult });
     const dryRun = emailResult.success && emailResult.messageId === "DRY_RUN";
     const returnDevCode = dryRun && mayReturnDevClaimCode();
     if (!emailResult.success || (dryRun && !returnDevCode)) {
@@ -2124,7 +2126,9 @@ router.post("/agents/:id/claim/resend", rfbClaimRequestLimiter, async (req: Requ
 
     // Same bookkeeping lookup as the claim request above.
     const agent = marketplaceRegistry.getActiveAgents({ includeUnvetted: true }).find((a: any) => a.id === agentId);
-    const emailResult = await emailService.sendVerificationCode(result.recipient, result.verificationCode, agent?.name || "Ukjent produsent");
+    const resendAgentName = agent?.name || "Ukjent produsent";
+    const emailResult = await emailService.sendVerificationCode(result.recipient, result.verificationCode, resendAgentName);
+    recordClaimMail({ kind: "claim_code", claimId, agentId, email: result.recipient, agentName: resendAgentName, sendResult: emailResult });
     const dryRun = emailResult.success && emailResult.messageId === "DRY_RUN";
     const returnDevCode = dryRun && mayReturnDevClaimCode();
     if (!emailResult.success || (dryRun && !returnDevCode)) {

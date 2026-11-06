@@ -50266,6 +50266,28 @@ runSerial(async () => {
   }
 });
 
+// Eierkrav slice C3: the claim-flow mails to the claimant (code, resend,
+// approval) are filed as outbound crm_messages in one CRM thread per claim
+// (claim-<claimId>) behind CLAIM_CRM_TRACKING_ENABLED (default off); no code
+// or login link is stored. Pins getDb() to its own in-memory DB, stubs the
+// e-mail transporter and a crmService method, sets env (all restored in
+// finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── eierkrav C3: claim-flow mails recorded as one CRM thread per claim ──");
+  try {
+    const { runRfbClaimCrmThreadC3Tests } = require("../src/routes/rfb-claim-crm-thread-c3.test") as
+      typeof import("../src/routes/rfb-claim-crm-thread-c3.test");
+    const c3 = await runRfbClaimCrmThreadC3Tests({ log: false });
+    passed += c3.passed;
+    failed += c3.failed;
+    for (const f of c3.failures) failures.push("rfb-claim-crm-thread-c3: " + f);
+    console.log(`  rfb-claim-crm-thread-c3: ${c3.passed} passed, ${c3.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-claim-crm-thread-c3: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice
 // C1: POST /admin/agents/claim-revoke puts the profile back from the pre-grant
 // snapshot. Pins getDb() to its own in-memory DB, runs an in-process server,
