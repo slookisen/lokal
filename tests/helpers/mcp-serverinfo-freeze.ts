@@ -75,3 +75,27 @@ export function reversedKeys(value: unknown): unknown {
   }
   return value;
 }
+
+/**
+ * G3-S5 for RFB and Opplevagent: what is wrong with a live serverInfo against
+ * its BRAND_ENTITIES entry; empty when nothing is. title leads with the brand
+ * name, websiteUrl is the brand URL, icons[0] is the brand's 512×512 logo as
+ * image/png (the entry has no 192 icon yet, so it is the only icon).
+ */
+export function brandServerInfoProblems(
+  serverInfo: unknown,
+  brand: { name: string; url: string; logoPng: string | null },
+): string[] {
+  const s = (serverInfo ?? {}) as Record<string, any>;
+  const problems: string[] = [];
+  if (typeof s.title !== "string" || !s.title.startsWith(`${brand.name} — `)) problems.push(`title does not lead with «${brand.name} — » (${JSON.stringify(s.title)})`);
+  if (s.websiteUrl !== brand.url) problems.push(`websiteUrl is not ${brand.url} (${JSON.stringify(s.websiteUrl)})`);
+  const icon = Array.isArray(s.icons) ? s.icons[0] : undefined;
+  if (!icon) problems.push("no icons[0]");
+  else {
+    if (icon.src !== brand.logoPng || !String(icon.src).endsWith(".png")) problems.push(`icons[0].src is not the brand PNG logo (${JSON.stringify(icon.src)})`);
+    if (icon.mimeType !== "image/png") problems.push(`icons[0].mimeType is not image/png (${JSON.stringify(icon.mimeType)})`);
+    if (JSON.stringify(icon.sizes) !== JSON.stringify(["512x512"])) problems.push(`icons[0].sizes is not ["512x512"] (${JSON.stringify(icon.sizes)})`);
+  }
+  return problems;
+}

@@ -58,6 +58,7 @@ import { foreignPlaceIn } from "../services/outside-norway";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 import { searchCountable } from "../services/search-tracking";
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
+import { BRAND_ENTITIES, brandMcpIcons } from "../config/brand-entities";
 import { publicListableSql, failsProducerRoleGate, isAgentIdPubliclyVisible, notOwnerHiddenSql, ownerHidesAgent, withoutOwnerHidden } from "../services/agent-visibility";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { safeHonestCatalogCount } from "../services/honest-count";
@@ -2240,6 +2241,14 @@ export function rfbMcpInstructions(): string {
   return isPaymentsEnabled() ? RFB_MCP_INSTRUCTIONS_PREPAY : RFB_MCP_INSTRUCTIONS;
 }
 
+/**
+ * serverInfo `title` and `icons` (G3-S5, A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker):
+ * the brand's name and 512 PNG logo from BRAND_ENTITIES.rfb, so the connector
+ * shows the brand instead of the bare `name`. websiteUrl is BRAND_ENTITIES.rfb.url.
+ */
+export const RFB_MCP_SERVER_TITLE = `${BRAND_ENTITIES.rfb.name} — Norwegian local food producers`;
+export const RFB_MCP_SERVER_ICONS = brandMcpIcons(BRAND_ENTITIES.rfb);
+
 async function getOrCreateSession(
   sessionId: string | undefined,
   isInitialize: boolean,
@@ -2284,7 +2293,13 @@ async function getOrCreateSession(
   const clientIdentity = req ? detectMcpClient(req) : undefined;
   const requestMeta = req ? buildRequestMeta(req) : undefined;
 
-  const server = new McpServer({ name: "rett-fra-bonden", version: "0.4.0" }, { instructions: rfbMcpInstructions(), maxToolInputElements: MCP_MAX_TOOL_INPUT_ELEMENTS });
+  const server = new McpServer({
+    name: "rett-fra-bonden",
+    version: "0.4.0",
+    title: RFB_MCP_SERVER_TITLE,
+    websiteUrl: BRAND_ENTITIES.rfb.url,
+    icons: RFB_MCP_SERVER_ICONS,
+  }, { instructions: rfbMcpInstructions(), maxToolInputElements: MCP_MAX_TOOL_INPUT_ELEMENTS });
   const sessionRef: { clientIdentity?: string; requestMeta?: import("../services/conversation-service").RequestMeta } = { clientIdentity, requestMeta };
   registerTools(server, () => sessionRef.clientIdentity, () => sessionRef.requestMeta);
 

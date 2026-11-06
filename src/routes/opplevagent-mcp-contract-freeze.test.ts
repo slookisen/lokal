@@ -46,7 +46,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
-  SERVER_INFO_PART, SERVER_INFO_CHANGES, serverInfoHash, serverInfoFreezeFailure, reversedKeys, type LiveContract,
+  SERVER_INFO_PART, SERVER_INFO_CHANGES, brandServerInfoProblems, serverInfoHash, serverInfoFreezeFailure, reversedKeys, type LiveContract,
 } from "../../tests/helpers/mcp-serverinfo-freeze";
 
 export interface TestSummary {
@@ -200,6 +200,14 @@ export function runOpplevagentMcpContractFreezeTests(opts: { log?: boolean } = {
           check(serverInfoFreezeFailure(live.serverInfo[part], hash), `cf-2: ${part} is the serverInfo frozen for the OpenAI review`);
         } else {
           assertEq(live.hashes[part], hash, `cf-1: ${part} is byte-identical to the contract frozen for the OpenAI review`);
+        }
+      }
+
+      // G3-S5: the serverInfo carries the brand's title, websiteUrl and PNG icon from BRAND_ENTITIES.experiences.
+      {
+        const { BRAND_ENTITIES } = require("../config/brand-entities") as typeof import("../config/brand-entities");
+        for (const [part, serverInfo] of Object.entries(live.serverInfo)) {
+          assertEq(brandServerInfoProblems(serverInfo, BRAND_ENTITIES.experiences), [], "cf-5: " + part + " has the brand title, websiteUrl and icons[0] (image/png, 512x512)");
         }
       }
 

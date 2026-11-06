@@ -427,6 +427,7 @@ export async function runDiscoveryTruthTests(opts: { log?: boolean } = {}): Prom
         const r = await callRouter(expRouter, p, "opplevagent.no");
         assertEq(r?.body?.["x-opplevagent"]?.totalExperiences, EXPECT_EXP, `exp-count-${p}: totalExperiences`);
         assertEq(digitsToNumber((String(r?.body?.description).match(/Discover ([\d\s  ]+) curated/) || [])[1]), EXPECT_EXP, `exp-count-${p}: description count`);
+        assertEq(r?.body?.icon, "https://opplevagent.no/favicon-512.png", `exp-card-icon-${p}: the server card shows the 512 PNG logo (G3-S5), not favicon.svg`);
       }
       const card = await callRouter(expRouter, "/.well-known/agent-card.json", "opplevagent.no");
       assertEq(card?.body?.["x-catalog"], { vertical: "experiences", honestCount: EXPECT_EXP }, "exp-count-card: agent card x-catalog");
