@@ -50349,6 +50349,28 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice
+// B1: signed «Godkjenn» / «Avvis» buttons (the C4 links) in the admin notice
+// for a queued claim — flag on mints two links for the admin only; flag off /
+// no secret / a mint throw sends today's notice; a repeat claim sends nothing.
+// Pins getDb() to its own in-memory DB, stubs the mail transporter, sets env
+// (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-30-rfb-eierkrav B1: signed buttons in the admin claim notice ──");
+  try {
+    const { runRfbClaimNoticeButtonsB1Tests } = require("../src/routes/rfb-claim-notice-buttons-b1.test") as
+      typeof import("../src/routes/rfb-claim-notice-buttons-b1.test");
+    const b1 = await runRfbClaimNoticeButtonsB1Tests({ log: false });
+    passed += b1.passed;
+    failed += b1.failed;
+    for (const f of b1.failures) failures.push("rfb-claim-notice-buttons-b1: " + f);
+    console.log(`  rfb-claim-notice-buttons-b1: ${b1.passed} passed, ${b1.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-claim-notice-buttons-b1: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-rfb-utsending-v4, skive 1: /selger?agent=<id> viser
 // bare den ene butikken når produsenten ikke er tatt over.
 runSerial(async () => {
