@@ -132,6 +132,7 @@ export const SWITCH_PROBE_ENV_FLAGS = [
   "STOCK_CHECK_EMAIL_ENABLED",
   "OWNER_ORDERABILITY_PORTAL_ENABLED",
   "OWNER_AUTO_UPDATES_ENABLED",
+  "PRODUCT_AUTO_SYNC_ENABLED",
 ] as const;
 
 /**
@@ -151,6 +152,8 @@ export const SWITCH_PROBE_FLAG_DEPENDENCIES: Readonly<Record<string, string>> = 
   // OWNER_AUTO_UPDATES_ENABLED is off, so the probe checks it as a planned
   // entry then (409 coming_soon, no effect) and probes every option only
   // with the flag on (liveEntries reads the run-time status).
+  // products.weekly_sync (produktimport skive 4-2b) likewise: its liveFlag is
+  // PRODUCT_AUTO_SYNC_ENABLED.
 };
 const FLAG_OFF_REASON = "flag off in this environment";
 
@@ -383,6 +386,8 @@ interface FixtureSnapshot {
   /** T7: the «Nyheter og tips» question state (owner_feature_prompt). */
   owner_feature_prompt: any[];
   agent_knowledge: any;
+  /** Produktimport skive 4-2b: products.weekly_sync's column (and the sync state its «on» write resets). */
+  product_auto_sync_state: any[];
 }
 
 function tableExists(db: any, name: string): boolean {
@@ -402,6 +407,7 @@ export function snapshotFixture(db: any, agentId: string): FixtureSnapshot {
     agent_knowledge: tableExists(db, "agent_knowledge")
       ? db.prepare(`SELECT about, curated_fields FROM agent_knowledge WHERE agent_id = ?`).get(agentId) ?? null
       : null,
+    product_auto_sync_state: rows("product_auto_sync_state", "agent_id = ?", agentId),
   };
 }
 
@@ -468,6 +474,10 @@ function restoreSnapshot(db: any, agentId: string, snap: FixtureSnapshot): void 
     if (snap.agent_knowledge) {
       db.prepare(`UPDATE agent_knowledge SET about = ?, curated_fields = ? WHERE agent_id IN (${pinned})`)
         .run(snap.agent_knowledge.about, snap.agent_knowledge.curated_fields, agentId);
+    }
+    if (tableExists(db, "product_auto_sync_state")) {
+      db.prepare(`DELETE FROM product_auto_sync_state WHERE agent_id IN (${pinned})`).run(agentId);
+      insertRows(db, "product_auto_sync_state", snap.product_auto_sync_state ?? []);
     }
     const after = resolveOwnerFeatures(VERTICAL, agentId, { db });
     const now = new Date().toISOString();
@@ -996,6 +1006,17 @@ const autoUpdatesJobSync = (ctx: ProbeReaderContext): SurfaceObservation => {
   };
 };
 
+// products.weekly_sync (produktimport skive 4-2b): the weekly job's own
+// selection rule for the fixture (dueAutoSyncProfiles: mode 'weekly' and
+// agents.is_verified = 1), on the probe's db. Decision only: nothing is
+// fetched or written.
+const productWeeklySyncJobSync = (ctx: ProbeReaderContext): SurfaceObservation => {
+  const { productWeeklySyncSelected } = require("./product-weekly-sync") as typeof import("./product-weekly-sync");
+  const taken = productWeeklySyncSelected(ctx.db, ctx.fixture.id);
+  const flag = flagOn(ctx.env, "PRODUCT_AUTO_SYNC_ENABLED") ? "" : " (PRODUCT_AUTO_SYNC_ENABLED er av: den ukentlige jobben kjører ikke i dette miljøet)";
+  return { endpoints: { weekly_sync_job: taken }, detail: `den ukentlige produktjobben ${taken ? "tar med profilen" : "hopper over profilen"}${flag}` };
+};
+
 const outreachSync = (ctx: ProbeReaderContext): SurfaceObservation => {
   const av = require("../services/avmeld-service") as typeof import("../services/avmeld-service");
   const to = ctx.fixture.outreachEmail;
@@ -1060,6 +1081,7 @@ export function defaultSwitchProbeReaders(): Record<string, SurfaceReaderDef> {
     "products.stock_check × email:stock_check": syncReader(stockCheckMailSync, "allowlist + stockCheckOn() + resolveOrderNotificationRecipient(): lagerpåminnelse sendes / sendes ikke"),
     "products.stock_check × job:stock_check": syncReader(stockCheckJobSync, "allowlist + stockCheckOn(): jobben tar med / hopper over produsenten"),
     "products.stock_check × owner_portal": syncReader(stockCheckPortalSync, "allowlist + stockCheckOn(): banneret i eierportalen kan vises / vises ikke"),
+    "products.weekly_sync × job:product_weekly_sync": syncReader(productWeeklySyncJobSync, "product_sync_mode + is_verified (dueAutoSyncProfiles' regel): den ukentlige produktjobben tar med / hopper over profilen"),
   };
   for (const s of VISIBILITY_SURFACES) {
     out[caseId("visibility.profile", s)] = {
