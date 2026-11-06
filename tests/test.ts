@@ -40062,8 +40062,10 @@ withMemoryVerticalDb("EXPERIENCES_DB_PATH", () => {
     layerA2aProv.route.stack[layerA2aProv.route.stack.length - 1].handle({} as any, a2aCardResProv);
     assertEq(a2aCardBodyProv.provenancePageUrl, "https://rettfrabonden.com/proveniens",
       "prov-rfb-card-01: /a2a card has additive provenancePageUrl");
-    assertEq(a2aCardBodyProv.documentationUrl, "https://rettfrabonden.com/docs",
-      "prov-rfb-card-02: /a2a card documentationUrl is unchanged (additive-only)");
+    // documentationUrl moved off the unrouted /docs (404) to /teknologi (A2A dev-request
+    // 2026-11-06-rfb-claude-katalog-innsending, slice 1).
+    assertEq(a2aCardBodyProv.documentationUrl, "https://rettfrabonden.com/teknologi",
+      "prov-rfb-card-02: /a2a card documentationUrl is the routed /teknologi page");
     assertEq(a2aCardBodyProv.securitySchemes.apiKey.name, "X-API-Key",
       "prov-rfb-card-03: /a2a card securitySchemes.apiKey is unchanged (additive-only)");
     // A2A skill honesty (dev-request 2026-09-16-handleliste slice 5): the cart skill must
@@ -40082,8 +40084,8 @@ withMemoryVerticalDb("EXPERIENCES_DB_PATH", () => {
     const registryCardProv: any = marketplaceRegistry.getRegistryCard("https://rettfrabonden.com");
     assertEq(registryCardProv.provenancePageUrl, "https://rettfrabonden.com/proveniens",
       "prov-rfb-card-04: getRegistryCard() has additive provenancePageUrl");
-    assertEq(registryCardProv.documentationUrl, "https://rettfrabonden.com/docs",
-      "prov-rfb-card-05: getRegistryCard() documentationUrl is unchanged (additive-only)");
+    assertEq(registryCardProv.documentationUrl, "https://rettfrabonden.com/teknologi",
+      "prov-rfb-card-05: getRegistryCard() documentationUrl is the routed /teknologi page");
     assertEq(registryCardProv.protocolVersion, "1.0.0",
       "prov-rfb-card-06: getRegistryCard() protocolVersion is unchanged (additive-only)");
 
