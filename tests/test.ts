@@ -50419,6 +50419,30 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice
+// B2b-2: after a B2b-1 auto-approval the farm's known address (as before the
+// approval) gets «Ny eier registrert for <profil>» when it exists, differs
+// from the claimant's and is not shared; the admin notice says «sendt» /
+// «ikke sendt (<grunn>)», a send failure never undoes the approval, and with
+// CLAIM_CRM_TRACKING_ENABLED it is a farm_notice row in claim-<claimId>. Own
+// in-memory DB, stubbed transporter and assessment deps, env restored in
+// finally — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-30-rfb-eierkrav B2b-2: farm notice after auto-approval ──");
+  try {
+    const { runRfbClaimFarmNoticeB2b2Tests } = require("../src/routes/rfb-claim-farm-notice-b2b2.test") as
+      typeof import("../src/routes/rfb-claim-farm-notice-b2b2.test");
+    const b2b2 = await runRfbClaimFarmNoticeB2b2Tests({ log: false });
+    passed += b2b2.passed;
+    failed += b2b2.failed;
+    for (const f of b2b2.failures) failures.push("rfb-claim-farm-notice-b2b2: " + f);
+    console.log(`  rfb-claim-farm-notice-b2b2: ${b2b2.passed} passed, ${b2b2.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-claim-farm-notice-b2b2: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-rfb-utsending-v4, skive 1: /selger?agent=<id> viser
 // bare den ene butikken når produsenten ikke er tatt over.
 runSerial(async () => {

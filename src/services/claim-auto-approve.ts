@@ -11,12 +11,24 @@
 // unknown/NULL/unreadable value, a failed or timed-out run, a claim already
 // decided, a profile that got an owner, a throw — approves nothing, and the
 // caller sends today's queue notice.
+//
+// B2b-2: after such an approval the farm's KNOWN address — resolveFarmContactEmail
+// as it was BEFORE the approval — gets «Ny eier registrert for <profil>»
+// (emailService.sendClaimFarmNotice), only when that address exists, differs
+// (trim + lower case) from the claimant's e-mail and is not shared
+// (isSharedKnownEmail). No new flag: this path already needs both flags above.
+// With CLAIM_CRM_TRACKING_ENABLED it is filed as a "farm_notice" in the
+// claim's CRM thread. The admin notice says «sendt» / «ikke sendt (<grunn>)».
+// A failure or throw here never undoes the approval and never stops the login
+// mail or the admin notice. The address is never logged.
 
 import { getDb } from "../database/init";
 import { claimAssessmentEnabled } from "./claim-assessment";
 import { applyClaimApprove, sendClaimApprovedLoginMail } from "./claim-review-actions";
 import { createClaimActionLinks, isClaimActionLinksEnabled } from "./claim-action-link";
-import { emailService } from "./email-service";
+import { emailService, type ClaimFarmNoticeOutcome } from "./email-service";
+import { knowledgeService } from "./knowledge-service";
+import { recordClaimMail } from "./claim-crm-tracking";
 
 export const CLAIM_AUTO_APPROVE_FLAG = "CLAIM_AUTO_APPROVE_ENABLED";
 
@@ -66,6 +78,53 @@ function revokeLink(claimId: string): string | undefined {
   }
 }
 
+const normalized = (v: string | null | undefined): string => (v ?? "").trim().toLowerCase();
+
+/** B2b-2: where the farm notice would go, read before the approval changes
+ *  anything — the known address, or why there is none to use. May throw. */
+type FarmNoticePlan = { address: string } | { address: null; outcome: ClaimFarmNoticeOutcome };
+function planFarmNotice(claimId: string): FarmNoticePlan {
+  const claim = getDb().prepare("SELECT agent_id, claimant_email FROM agent_claims WHERE id = ?").get(claimId) as
+    { agent_id: string; claimant_email: string | null } | undefined;
+  if (!claim) return { address: null, outcome: { sent: false, reason: "no_known_email" } };
+  const known = knowledgeService.resolveFarmContactEmail(claim.agent_id);
+  if (!known || !normalized(known)) return { address: null, outcome: { sent: false, reason: "no_known_email" } };
+  if (normalized(known) === normalized(claim.claimant_email)) return { address: null, outcome: { sent: false, reason: "same_as_claimant" } };
+  if (knowledgeService.isSharedKnownEmail(known, claim.agent_id)) return { address: null, outcome: { sent: false, reason: "shared_address" } };
+  return { address: normalized(known) };
+}
+
+/** B2b-2: sends the notice per `plan` after the approval. Never rejects. */
+async function sendFarmNotice(
+  claimId: string,
+  plan: FarmNoticePlan,
+  approved: { agentId: string; email: string },
+  agentName: string,
+): Promise<ClaimFarmNoticeOutcome> {
+  if (plan.address === null) {
+    console.log(`[claim-auto-approve] farm notice for claim ${claimId} not sent: ${plan.outcome.sent ? "sent" : plan.outcome.reason}`);
+    return plan.outcome;
+  }
+  // The approved owner address may differ from the queued one; never notify the claimant as "the farm".
+  if (plan.address === normalized(approved.email)) {
+    console.log(`[claim-auto-approve] farm notice for claim ${claimId} not sent: same_as_claimant`);
+    return { sent: false, reason: "same_as_claimant" };
+  }
+  try {
+    const at = new Date();
+    const sent = await emailService.sendClaimFarmNotice(plan.address, agentName, at);
+    recordClaimMail({ kind: "farm_notice", claimId, agentId: approved.agentId, email: plan.address, agentName, sendResult: sent, at });
+    if (sent.success && sent.messageId !== "DRY_RUN") {
+      console.log(`[claim-auto-approve] farm notice for claim ${claimId} sent`);
+      return { sent: true };
+    }
+    console.error(`[claim-auto-approve] farm notice for claim ${claimId} not sent: send_failed`);
+  } catch (err: any) {
+    console.error(`[claim-auto-approve] farm notice for claim ${claimId} not sent: send_failed (${err?.name ?? "error"})`);
+  }
+  return { sent: false, reason: "send_failed" };
+}
+
 /**
  * Approves `claimId` when `assessment` is green (the caller has checked the
  * flags and that the claim's own run settled). Resolves true when the claim
@@ -75,6 +134,14 @@ function revokeLink(claimId: string): string | undefined {
  */
 export async function autoApproveGreenClaim(claimId: string, assessment: unknown): Promise<boolean> {
   if (!isGreenClaimAssessment(assessment)) return false;
+  // B2b-2: the farm's known address as it is before the approval.
+  let farmPlan: FarmNoticePlan;
+  try {
+    farmPlan = planFarmNotice(claimId);
+  } catch (err: any) {
+    console.error(`[claim-auto-approve] farm notice plan for claim ${claimId} failed: ${err?.name ?? "error"}`);
+    farmPlan = { address: null, outcome: { sent: false, reason: "send_failed" } };
+  }
   let approved: ReturnType<typeof applyClaimApprove>;
   try {
     approved = applyClaimApprove(claimId, undefined, "auto_assessment");
@@ -90,9 +157,15 @@ export async function autoApproveGreenClaim(claimId: string, assessment: unknown
 
   try {
     const loginLinkSent = await sendClaimApprovedLoginMail(claimId, approved, "[claim-auto-approve]");
-    const row = getDb().prepare(
-      `SELECT c.claimant_name, a.name AS agent_name FROM agent_claims c JOIN agents a ON a.id = c.agent_id WHERE c.id = ?`
-    ).get(claimId) as { claimant_name: string | null; agent_name: string | null } | undefined;
+    let row: { claimant_name: string | null; agent_name: string | null } | undefined;
+    try {
+      row = getDb().prepare(
+        `SELECT c.claimant_name, a.name AS agent_name FROM agent_claims c JOIN agents a ON a.id = c.agent_id WHERE c.id = ?`
+      ).get(claimId) as { claimant_name: string | null; agent_name: string | null } | undefined;
+    } catch (err: any) {
+      console.error("[claim-auto-approve] claim row read failed:", err?.message);
+    }
+    const farmNotice = await sendFarmNotice(claimId, farmPlan, approved, row?.agent_name || "din gård");
     const sent = await emailService.sendAdminClaimAutoApprovedNotification({
       agentName: row?.agent_name || approved.agentId,
       agentId: approved.agentId,
@@ -102,6 +175,7 @@ export async function autoApproveGreenClaim(claimId: string, assessment: unknown
       loginLinkSent,
       assessment,
       revokeUrl: revokeLink(claimId),
+      farmNotice,
     });
     if (!sent.success) console.error("[claim-auto-approve] admin notice failed:", sent.error);
   } catch (err: any) {
