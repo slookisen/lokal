@@ -987,7 +987,8 @@ function initSchema(db: Database.Database): void {
     -- bounces») ───────────────────────────────────────────────────
     -- Idempotency ledger for POST /webhooks/resend (routes/resend-webhook.ts).
     -- One row per svix-id Resend delivered for an event we ACT on
-    -- (email.bounced / email.complained); unrelated event types write nothing.
+    -- (email.bounced / email.complained / email.delivered); unrelated event
+    -- types write nothing.
     -- Svix retries the same svix-id until it gets a 2xx, so a PRIMARY KEY on
     -- it turns a replay into a no-op. Holds the recipient address and the
     -- outcome only — never the payload (subject/body/from are not stored).
@@ -998,6 +999,28 @@ function initSchema(db: Database.Database): void {
       outcome TEXT NOT NULL,
       received_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    -- ─── email_delivery_events (eierkrav skive C2, 2026-11-06) ─────
+    -- One row per Resend email.delivered event (routes/resend-webhook.ts →
+    -- services/resend-webhook.ts), so a verifier can tell "delivered to the
+    -- receiving MTA" from "only handed to Resend". svix_id UNIQUE = the same
+    -- idempotency key as resend_webhook_events (a Svix retry is a no-op).
+    -- crm_message_id: the OUTBOUND crm_messages row this delivery was
+    -- attributed to by recipient + time (we send through Resend's SMTP relay
+    -- and never learn Resend's email_id at send time), NULL when none fits.
+    -- Plain TEXT, no FK: purely additive, never constrains crm_messages.
+    -- Recipient address only — never subject/body/headers.
+    CREATE TABLE IF NOT EXISTS email_delivery_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      svix_id TEXT NOT NULL UNIQUE,
+      resend_email_id TEXT,
+      email TEXT NOT NULL,
+      delivered_at TEXT NOT NULL,
+      crm_message_id TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_email_delivery_events_email ON email_delivery_events(email, delivered_at);
+    CREATE INDEX IF NOT EXISTS idx_email_delivery_events_crm_message ON email_delivery_events(crm_message_id);
 
 
     -- Analytics indexes (for fast aggregation)

@@ -37,6 +37,15 @@
 //        • email.bounced with any other bounce.type (Transient/Undetermined/
 //          missing) → soft: ledger row + console line, nothing recorded.
 //          Mailbox-full / greylisting is not a dead address.
+//        • email.delivered (eierkrav skive C2, 2026-11-06) → one
+//          email_delivery_events row (svix_id UNIQUE, resend_email_id,
+//          recipient, delivered_at, crm_message_id) so a verifier can tell
+//          "delivered to the receiving server" from "only sent". Exactly one
+//          plausible recipient is required, as for bounces; otherwise ledger
+//          row (ambiguous_recipient) + console line, no delivery row. Touches
+//          nothing else: no email_bounces / agent_blocklist / profiles /
+//          outreach-gate effect. crm_message_id comes from
+//          resolveDeliveryCrmMessage() (section 4) and may be NULL.
 //        • any other event type → 200, nothing written (so subscribing to
 //          more events in the Resend dashboard is harmless).
 //      A failure anywhere rolls the whole event back (ledger row included),
@@ -44,6 +53,9 @@
 //   3. resolveBounceSendAttribution(): which of OUR sends bounced, so the
 //      email_bounces row carries agent_id_at_send / batch_id / lane_at_send
 //      (always NULL from this webhook before 2026-10-04). See its comment.
+//   4. resolveDeliveryCrmMessage() / latestDeliveryFor(): which outbound
+//      crm_messages row a delivery belongs to (recipient + time, same reason
+//      as 3), and the read helper the verifier uses. See their comments.
 //
 // Deliberately OUT of scope: catching up on bounces/complaints that happened
 // BEFORE the webhook was configured (would need Resend API polling —
@@ -125,6 +137,7 @@ export type ResendWebhookOutcome =
   | "hard_bounce_recorded"
   | "complaint_recorded"
   | "soft_bounce_logged"
+  | "delivery_recorded"
   | "ambiguous_recipient"
   | "ignored_event_type"
   | "duplicate";
@@ -134,7 +147,7 @@ export interface ResendWebhookResult {
   body: { received: true; outcome: ResendWebhookOutcome; event_type?: string; duplicate?: boolean };
 }
 
-const ACTED_EVENT_TYPES = new Set(["email.bounced", "email.complained"]);
+const ACTED_EVENT_TYPES = new Set(["email.bounced", "email.complained", "email.delivered"]);
 // Mirrors the upper bound of a valid address (RFC 5321 path limit) plus a
 // minimal local@domain shape. Not a validator — just "is this plausibly the
 // one recipient address, and not junk we'd write into email_bounces".
@@ -176,9 +189,11 @@ export function processResendWebhookEvent(svixId: string, event: any): ResendWeb
   const bounceSubType: string = typeof data?.bounce?.subType === "string" ? data.bounce.subType : "";
   const isHard = type === "email.bounced" && bounceKind.toLowerCase() === "permanent";
   const isComplaint = type === "email.complained";
+  const isDelivered = type === "email.delivered";
 
   let outcome: ResendWebhookOutcome;
   if (!email) outcome = "ambiguous_recipient";
+  else if (isDelivered) outcome = "delivery_recorded";
   else if (isComplaint) outcome = "complaint_recorded";
   else if (isHard) outcome = "hard_bounce_recorded";
   else outcome = "soft_bounce_logged";
@@ -198,14 +213,32 @@ export function processResendWebhookEvent(svixId: string, event: any): ResendWeb
       console.warn(`[resend-webhook] send attribution failed (bounce recorded without it): ${err?.message ?? err}`);
     }
   }
+  // Same best-effort, read-only rule for a delivery's CRM message.
+  let deliveryCrmMessageId: string | null = null;
+  if (email && outcome === "delivery_recorded") {
+    try {
+      const acceptedAt = [data?.created_at, event?.created_at].map((v) => parseDbTime(v)).find((t) => Number.isFinite(t));
+      deliveryCrmMessageId = resolveDeliveryCrmMessage(email, new Date(acceptedAt ?? Date.now()));
+    } catch (err: any) {
+      console.warn(`[resend-webhook] delivery attribution failed (delivery recorded without it): ${err?.message ?? err}`);
+    }
+  }
   let duplicate = false;
   db.transaction(() => {
     if (ledger.run(svixId, type, email, outcome).changes === 0) {
       duplicate = true;
       return;
     }
-    if (outcome !== "hard_bounce_recorded" && outcome !== "complaint_recorded") return;
     const resendEmailId = typeof data?.email_id === "string" ? data.email_id.slice(0, 128) : undefined;
+    if (outcome === "delivery_recorded") {
+      // Address only — no subject/from/body/headers.
+      db.prepare(
+        `INSERT OR IGNORE INTO email_delivery_events (svix_id, resend_email_id, email, delivered_at, crm_message_id)
+         VALUES (?, ?, ?, ?, ?)`,
+      ).run(svixId, resendEmailId ?? null, email!, isoOrNow(event?.created_at ?? data?.created_at), deliveryCrmMessageId);
+      return;
+    }
+    if (outcome !== "hard_bounce_recorded" && outcome !== "complaint_recorded") return;
     const diag = typeof data?.bounce?.message === "string" ? data.bounce.message : "";
     const reason = isComplaint
       ? `${RESEND_WEBHOOK_SOURCE}: spam complaint`
@@ -236,6 +269,7 @@ export function processResendWebhookEvent(svixId: string, event: any): ResendWeb
     `[resend-webhook] ${type} ${outcome}` +
       (email ? ` ${email}` : "") +
       (type === "email.bounced" ? ` bounce_type=${bounceKind || "missing"}` : "") +
+      (isDelivered ? ` crm_message=${deliveryCrmMessageId ?? "-"}` : "") +
       (attribution ? ` lane=${attribution.lane} agent=${attribution.agentIdAtSend ?? "-"} batch=${attribution.batchId ?? "-"}` : ""),
   );
   return { httpStatus: 200, body: { received: true, outcome, event_type: type } };
@@ -360,4 +394,100 @@ export function resolveBounceSendAttribution(email: string, acceptedAt: Date): B
     .filter((c) => c.at >= latest - SAME_SEND_WINDOW_MS)
     .sort((a, b) => a.rank - b.rank || b.at - a.at)[0];
   return best.attribution;
+}
+
+// ─── 4. Delivery → CRM message ──────────────────────────────────────────
+// Resend's data.email_id is not what we stored at send time (SMTP relay —
+// see section 3), so a delivery is tied to OUR send by RECIPIENT + TIME: the
+// latest OUTBOUND crm_messages row (direction 'out', sent_at set — only
+// confirmed sends carry a sent_at) whose to_emails JSON array holds the
+// address, sent no later than when Resend accepted the mail (data.created_at,
+// else the event time) plus BOUNCE_ATTRIBUTION_CLOCK_SLACK_MS, and no earlier
+// than DELIVERY_ATTRIBUTION_LOOKBACK_DAYS before it. Short lookback: Resend
+// reports a delivery seconds to minutes after acceptance, so anything older
+// is not this mail. NULL when none fits.
+export const DELIVERY_ATTRIBUTION_LOOKBACK_DAYS = 7;
+const DELIVERY_CANDIDATE_LIMIT = 500;
+
+/** to_emails is a JSON array of addresses; malformed/legacy values → []. */
+function parseRecipientList(v: unknown): string[] {
+  if (typeof v !== "string" || v === "") return [];
+  try {
+    const arr = JSON.parse(v);
+    if (!Array.isArray(arr)) return [];
+    return arr
+      .filter((a): a is string => typeof a === "string")
+      .map((a) => {
+        const m = /<([^<>]+)>\s*$/.exec(a); // display-name form, as in singleRecipient
+        return normalizeEmail(m ? m[1] : a);
+      });
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The crm_messages.id of the outbound send behind a delivery to `email`
+ * (normalized), or null. Read-only; throws only on a DB error (the caller
+ * records the delivery with crm_message_id NULL).
+ */
+export function resolveDeliveryCrmMessage(email: string, acceptedAt: Date): string | null {
+  const hi = acceptedAt.getTime() + BOUNCE_ATTRIBUTION_CLOCK_SLACK_MS;
+  const lo = acceptedAt.getTime() - DELIVERY_ATTRIBUTION_LOOKBACK_DAYS * 86400_000;
+  const toSql = (ms: number) => new Date(ms).toISOString().slice(0, 19).replace("T", " ");
+  // LIKE is only a pre-filter (with %, _ and \ escaped); the exact match is
+  // the parsed JSON below. datetime() normalizes ISO and SQLite-format sent_at.
+  const like = "%" + email.toLowerCase().replace(/[\\%_]/g, (c) => "\\" + c) + "%";
+  const rows = getDb()
+    .prepare(
+      `SELECT id, to_emails, sent_at FROM crm_messages
+        WHERE direction = 'out' AND sent_at IS NOT NULL
+          AND datetime(sent_at) >= datetime(?) AND datetime(sent_at) <= datetime(?)
+          AND LOWER(to_emails) LIKE ? ESCAPE '\\'
+        ORDER BY datetime(sent_at) DESC, rowid DESC
+        LIMIT ${DELIVERY_CANDIDATE_LIMIT}`,
+    )
+    .all(toSql(lo), toSql(hi), like) as Array<{ id: string; to_emails: string | null; sent_at: string }>;
+  for (const r of rows) {
+    const at = parseDbTime(r.sent_at);
+    if (!Number.isFinite(at) || at < lo || at > hi) continue;
+    if (parseRecipientList(r.to_emails).includes(email)) return r.id;
+  }
+  return null;
+}
+
+export interface EmailDeliveryEvent {
+  id: number;
+  svix_id: string;
+  resend_email_id: string | null;
+  email: string;
+  delivered_at: string;
+  crm_message_id: string | null;
+  created_at: string;
+}
+
+/**
+ * Latest recorded delivery for a CRM message (preferred when both are given)
+ * or for a recipient address; null when none. Read-only, no HTTP route — for
+ * the verifier and other in-process callers.
+ */
+export function latestDeliveryFor(q: { crmMessageId?: string; email?: string }): EmailDeliveryEvent | null {
+  const db = getDb();
+  if (q.crmMessageId) {
+    return (
+      (db
+        .prepare(`SELECT * FROM email_delivery_events WHERE crm_message_id = ? ORDER BY delivered_at DESC, id DESC LIMIT 1`)
+        .get(q.crmMessageId) as EmailDeliveryEvent | undefined) ?? null
+    );
+  }
+  if (q.email) {
+    const addr = normalizeEmail(q.email);
+    if (!addr) return null;
+    return (
+      (db
+        .prepare(`SELECT * FROM email_delivery_events WHERE email = ? ORDER BY delivered_at DESC, id DESC LIMIT 1`)
+        .get(addr) as EmailDeliveryEvent | undefined) ?? null
+    );
+  }
+  return null;
 }
