@@ -50394,6 +50394,31 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice
+// B2b-1: with CLAIM_AUTO_APPROVE_ENABLED and CLAIM_AUTO_ASSESSMENT_ENABLED
+// both exactly "true", a queued claim whose own assessment settles green is
+// approved through the admin path (claimed_via = auto_assessment), the login
+// mail goes out (CRM trail) and the admin gets «Eierkrav godkjent
+// automatisk» with a revoke link / claim-revoke line; anything else is
+// today's queue notice. Pins getDb() to its own in-memory DB, stubs the mail
+// transporter and the assessment deps, sets env (restored in finally) —
+// runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-30-rfb-eierkrav B2b-1: green claim auto-approval ──");
+  try {
+    const { runRfbClaimAutoApproveB2b1Tests } = require("../src/routes/rfb-claim-auto-approve-b2b1.test") as
+      typeof import("../src/routes/rfb-claim-auto-approve-b2b1.test");
+    const b2b1 = await runRfbClaimAutoApproveB2b1Tests({ log: false });
+    passed += b2b1.passed;
+    failed += b2b1.failed;
+    for (const f of b2b1.failures) failures.push("rfb-claim-auto-approve-b2b1: " + f);
+    console.log(`  rfb-claim-auto-approve-b2b1: ${b2b1.passed} passed, ${b2b1.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-claim-auto-approve-b2b1: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-rfb-utsending-v4, skive 1: /selger?agent=<id> viser
 // bare den ene butikken når produsenten ikke er tatt over.
 runSerial(async () => {

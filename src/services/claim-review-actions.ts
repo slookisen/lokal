@@ -10,7 +10,7 @@
 // throws (a failure only means no mail).
 
 import { getDb } from "../database/init";
-import { knowledgeService } from "./knowledge-service";
+import { knowledgeService, type ClaimApprovalVia } from "./knowledge-service";
 import { trustScoreService } from "./trust-score-service";
 import { emailService } from "./email-service";
 import { recordClaimMail } from "./claim-crm-tracking";
@@ -21,9 +21,12 @@ export type ClaimRejectResult = ReturnType<typeof knowledgeService.rejectClaimRe
 export type ClaimRevokeResult = ReturnType<typeof knowledgeService.revokeClaimOwnership>;
 
 /** Approve a queued claim (approveClaimReview) and recalculate the trust
- *  score. The caller sends the login mail (sendClaimApprovedLoginMail). */
-export function applyClaimApprove(claimId: string, email?: string): ClaimApproveResult {
-  const approved = knowledgeService.approveClaimReview(claimId, email);
+ *  score. The caller sends the login mail (sendClaimApprovedLoginMail).
+ *  `via` 'auto_assessment' is the green auto-approval (eierkrav B2b-1): it is
+ *  stamped on the profile and the claim, and approveClaimReview re-checks in
+ *  its transaction that the claim is still queued and the profile unowned. */
+export function applyClaimApprove(claimId: string, email?: string, via: ClaimApprovalVia = "admin_approval"): ClaimApproveResult {
+  const approved = knowledgeService.approveClaimReview(claimId, email, via);
   if (approved.ok) trustScoreService.update(approved.agentId);
   return approved;
 }

@@ -49,6 +49,8 @@ const CLAIM_ASSESSMENT_SOURCE_LABELS: Record<string, string> = {
   website_email_domain: "nettstedet på e-postdomenet",
 };
 const CLAIM_ASSESSMENT_NOTE = "Vurderingen er bare registrert og avgjør ikke kravet.";
+/** The note under the block in the eierkrav B2b-1 «godkjent automatisk» notice. */
+const CLAIM_AUTO_APPROVED_NOTE = "Kravet ble godkjent automatisk fordi vurderingen er grønn.";
 
 /**
  * The assessment block's lines (plain text, unescaped), or null when the value
@@ -1301,6 +1303,75 @@ ${this.brand} | ${getConfig().domain}`;
     } catch (error) {
       logger.error('Error sending admin claim-review notification', {
         agentId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Eierkrav B2b-1: tells the admin (ADMIN_NOTIFICATION_EMAIL) that a queued
+   * claim was approved automatically on a green claim assessment — sent
+   * instead of the «claim queued» notice. Profile, claimant, whether the
+   * login mail went out, the B2a assessment block (with its own note) and an
+   * «Angre» button: the signed C4 revoke link when one was minted, else a line
+   * naming POST /admin/agents/claim-revoke. Every value is HTML-escaped.
+   */
+  async sendAdminClaimAutoApprovedNotification(opts: {
+    agentName: string;
+    agentId: string;
+    claimId: string;
+    claimantName: string;
+    claimantEmail: string;
+    loginLinkSent: boolean;
+    assessment: unknown;
+    /** A signed C4 `revoke` link; undefined → the admin-route text line. */
+    revokeUrl?: string;
+  }): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const adminEmail = process.env.ADMIN_NOTIFICATION_EMAIL;
+    if (!adminEmail) {
+      logger.info('ADMIN_NOTIFICATION_EMAIL not set — skipping claim auto-approved notification');
+      return { success: true, messageId: 'NO_ADMIN_EMAIL' };
+    }
+
+    try {
+      const { agentName, agentId, claimId, claimantName, claimantEmail, revokeUrl } = opts;
+      const subject = `Eierkrav godkjent automatisk: ${agentName}`;
+      const intro = 'Den automatiske vurderingen var grønn, så kravet er godkjent og innsenderen er nå eier av profilen.';
+      const login = opts.loginLinkSent ? 'sendt' : 'ikke sendt';
+      const blockLines = claimAssessmentNoticeLines(opts.assessment);
+      // B2a's block, with this notice's own note in place of «only recorded».
+      const assessmentLines = blockLines ? [...blockLines.slice(0, -1), CLAIM_AUTO_APPROVED_NOTE] : null;
+      const revokeCommand = `POST /admin/agents/claim-revoke {"claimId": "${claimId}", "note": "…"} (X-Admin-Key)`;
+      const row = (label: string, value: string) =>
+        `<tr><td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;">${label}:</td><td style="padding: 8px; border-bottom: 1px solid #eee;">${this.escapeHtml(value)}</td></tr>`;
+      const undoHtml = revokeUrl
+        ? `
+          <p><a href="${this.escapeHtml(revokeUrl)}" style="display: inline-block; padding: 10px 20px; margin: 0 8px 8px 0; background: #8b1e1e; color: #ffffff; text-decoration: none; border-radius: 6px; font-weight: bold;">Angre</a></p>
+          <p style="color: #555; font-size: 13px;">${this.escapeHtml(CLAIM_REVIEW_LINK_NOTE)}</p>`
+        : `
+          <p>Angre: ${this.escapeHtml(revokeCommand)}</p>`;
+      const htmlContent = `
+        <div style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+          <h2 style="color: #2d5016;">Eierkrav godkjent automatisk på ${this.brand}</h2>
+          <p>${this.escapeHtml(intro)}</p>
+          <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
+            ${row('Produsent', `${agentName} (${agentId})`)}
+            ${row('Navn', claimantName)}
+            ${row('E-post', claimantEmail)}
+            ${row('Innlogging', login)}
+            ${row('Krav-id', claimId)}
+            ${row('Tidspunkt', new Date().toLocaleString('nb-NO', { timeZone: 'Europe/Oslo' }))}
+          </table>${assessmentLines ? this.claimAssessmentHtml(assessmentLines) : ''}${undoHtml}
+          <p style="color: #888; font-size: 12px;">Automatisk varsling fra ${this.brand}</p>
+        </div>`;
+      const undoText = revokeUrl ? `Angre: ${revokeUrl}\n${CLAIM_REVIEW_LINK_NOTE}` : `Angre: ${revokeCommand}`;
+      const textContent = `Eierkrav godkjent automatisk på ${this.brand}\n\n${intro}\n\nProdusent: ${agentName} (${agentId})\nNavn: ${claimantName}\nE-post: ${claimantEmail}\nInnlogging: ${login}\nKrav-id: ${claimId}\nTidspunkt: ${new Date().toISOString()}\n\n${assessmentLines ? `${assessmentLines.join('\n')}\n\n` : ''}${undoText}`;
+
+      return await this.sendEmail({ to: adminEmail, subject, htmlContent, textContent });
+    } catch (error) {
+      logger.error('Error sending admin claim auto-approved notification', {
+        agentId: opts.agentId,
         error: error instanceof Error ? error.message : String(error),
       });
       return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
