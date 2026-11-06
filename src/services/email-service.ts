@@ -8,6 +8,9 @@ import { applyTestSendRedirect, TestSendNotConfiguredError } from "./send-guard"
 import { crmFromHeader } from "./crm-platform-identity";
 import { unsubscribeHeaderValues } from "./avmeld-service";
 
+/** One line under the eierkrav B1 buttons in the admin claim-review notice. */
+const CLAIM_REVIEW_LINK_NOTE = "Lenken åpner en bekreftelsesside og virker én gang innen 72 timer.";
+
 // Simple logger — replace with winston/pino in production
 const logger = {
   info: (msg: string, meta?: any) => console.log(`[Email] ${msg}`, meta ? JSON.stringify(meta) : ""),
@@ -1192,7 +1195,10 @@ ${this.brand} | ${getConfig().domain}`;
     claimantEmail: string,
     reason: string,
     /** The claim domain rule's advice: the rule and what Daniel can do. */
-    recommendation?: string
+    recommendation?: string,
+    /** Signed one-click links (eierkrav B1, behind CLAIM_ACTION_LINKS_ENABLED).
+     *  Undefined → the notice is rendered exactly as before. */
+    actionLinks?: { approve: string; reject: string }
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     const adminEmail = process.env.ADMIN_NOTIFICATION_EMAIL;
     if (!adminEmail) {
@@ -1216,11 +1222,11 @@ ${this.brand} | ${getConfig().domain}`;
             ${row('Grunn', reason)}
             ${recommendation ? row('Anbefaling', recommendation) : ''}
             ${row('Tidspunkt', new Date().toLocaleString('nb-NO', { timeZone: 'Europe/Oslo' }))}
-          </table>
+          </table>${actionLinks ? this.claimReviewButtonsHtml(actionLinks) : ''}
           <p>Køen: GET ${this.escapeHtml(queuePath)} (X-Admin-Key)</p>
           <p style="color: #888; font-size: 12px;">Automatisk varsling fra ${this.brand}</p>
         </div>`;
-      const textContent = `Eierkrav venter på godkjenning på ${this.brand}\n\nIngen kode er sendt. Kravet gir verken tilgang eller merke før det er godkjent.\n\nProdusent: ${agentName} (${agentId})\nNavn: ${claimantName}\nE-post: ${claimantEmail}\nGrunn: ${reason}\n${recommendation ? `Anbefaling: ${recommendation}\n` : ''}Tidspunkt: ${new Date().toISOString()}\n\nKøen: GET ${queuePath} (X-Admin-Key)`;
+      const textContent = `Eierkrav venter på godkjenning på ${this.brand}\n\nIngen kode er sendt. Kravet gir verken tilgang eller merke før det er godkjent.\n\nProdusent: ${agentName} (${agentId})\nNavn: ${claimantName}\nE-post: ${claimantEmail}\nGrunn: ${reason}\n${recommendation ? `Anbefaling: ${recommendation}\n` : ''}Tidspunkt: ${new Date().toISOString()}\n\n${actionLinks ? `Godkjenn: ${actionLinks.approve}\nAvvis: ${actionLinks.reject}\n${CLAIM_REVIEW_LINK_NOTE}\n\n` : ''}Køen: GET ${queuePath} (X-Admin-Key)`;
 
       return await this.sendEmail({
         to: adminEmail,
@@ -1299,6 +1305,15 @@ ${this.brand} | ${getConfig().domain}`;
       });
       return { success: false, error: maskEmails(error instanceof Error ? error.message : 'Unknown error') };
     }
+  }
+
+  /** «Godkjenn» / «Avvis» buttons for the admin claim-review notice (B1). */
+  private claimReviewButtonsHtml(links: { approve: string; reject: string }): string {
+    const btn = (href: string, label: string, color: string) =>
+      `<a href="${this.escapeHtml(href)}" style="display: inline-block; padding: 10px 20px; margin: 0 8px 8px 0; background: ${color}; color: #ffffff; text-decoration: none; border-radius: 6px; font-weight: bold;">${label}</a>`;
+    return `
+          <p>${btn(links.approve, 'Godkjenn', '#2d5016')}${btn(links.reject, 'Avvis', '#8b1e1e')}</p>
+          <p style="color: #555; font-size: 13px;">${this.escapeHtml(CLAIM_REVIEW_LINK_NOTE)}</p>`;
   }
 
   private escapeHtml(text: string): string {

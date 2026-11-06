@@ -55,6 +55,7 @@ import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
 // helper the Opplevagent claim page uses; per-IP limit on claim requests.
 import { maskEmail } from "../services/gardssalg-claim";
 import { CLAIM_RECOMMENDATION_LABELS, type ClaimRecommendation } from "../services/claim-domain-rule";
+import { createClaimActionLinks, isClaimActionLinksEnabled } from "../services/claim-action-link";
 import { rfbClaimRequestLimiter } from "../middleware/security";
 import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
 import { capFreeText, capName } from "../utils/free-text";
@@ -1945,6 +1946,29 @@ function claimRequestFieldError(b: { name: unknown; email: unknown; phone: unkno
   return null;
 }
 
+/** Eierkrav B1: signed «Godkjenn» / «Avvis» links (slice C4) for the admin
+ *  notice of a queued claim. Only when CLAIM_ACTION_LINKS_ENABLED is on and
+ *  there is a recipient; C4's own mint checks the secret. Anything else —
+ *  flag off, secret missing/short, a mint refusal or a throw — gives
+ *  undefined, and the notice goes out exactly as before (never an unsigned
+ *  link). Neither the links nor their tokens are logged. */
+function claimQueuedActionLinks(claimId: string): { approve: string; reject: string } | undefined {
+  if (!isClaimActionLinksEnabled() || !process.env.ADMIN_NOTIFICATION_EMAIL) return undefined;
+  try {
+    const minted = createClaimActionLinks(claimId, ["approve", "reject"]);
+    if (!minted.ok) {
+      console.warn("[Admin notify] claim-action links not minted:", minted.reason);
+      return undefined;
+    }
+    const approve = minted.links.find((l) => l.action === "approve")?.url;
+    const reject = minted.links.find((l) => l.action === "reject")?.url;
+    return approve && reject ? { approve, reject } : undefined;
+  } catch (err: any) {
+    console.error("[Admin notify] claim-action links failed:", err?.message);
+    return undefined;
+  }
+}
+
 /** Tells the admin (ADMIN_NOTIFICATION_EMAIL) that a claim entered the admin
  *  queue. Fire-and-forget, like the verified-claim notice below; the queue's
  *  own caps bound how often it fires. */
@@ -1961,7 +1985,7 @@ function notifyAdminClaimQueued(claimId: string): void {
     const recommendation = row.recommendation
       ? `${row.recommendation} — ${CLAIM_RECOMMENDATION_LABELS[row.recommendation] ?? ""}`.replace(/ — $/, "")
       : undefined;
-    emailService.sendAdminClaimReviewNotification(row.agent_name, row.agent_id, row.claimant_name, row.claimant_email, reason, recommendation)
+    emailService.sendAdminClaimReviewNotification(row.agent_name, row.agent_id, row.claimant_name, row.claimant_email, reason, recommendation, claimQueuedActionLinks(claimId))
       .catch((err: any) => console.error("[Admin notify] claim-review notice failed:", err?.message));
   } catch (err: any) {
     console.error("[Admin notify] claim-review notice error:", err?.message);
