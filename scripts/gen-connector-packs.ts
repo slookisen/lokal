@@ -68,7 +68,8 @@ export const ONLY_IF_ASKED = "**Use only if the portal asks.** It has no field f
 /**
  * Description wording the directory rejects as prompt injection ("describe what
  * the tool does, and don't tell Claude how to behave"). Same patterns as the
- * lint planned in A2A dev-request 2026-10-16-mcp-beskrivelser-intensjonsord-og-lint (S6).
+ * lint in src/routes/mcp-description-policy.test.ts (A2A dev-request
+ * 2026-10-16-mcp-beskrivelser-intensjonsord-og-lint, S6), which checks the two lists are equal.
  */
 export const DIRECTIVE_PATTERNS: readonly RegExp[] = [
   /\bALWAYS (use|call)\b/i,
@@ -214,7 +215,9 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
       lokal_cart_submit: "Sends a real pickup order by e-mail to each producer in the cart who has opted in to orders through the platform; for the others it returns contact details. No payment.",
     },
     owners: { descriptions: "2026-10-16-mcp-beskrivelser-intensjonsord-og-lint (S6)", terms: DASH, docs: DASH, icon: DASH, screenshots: DASH },
-    descriptionsGate: "The fix waits for OpenAI's decision on the RFB ChatGPT app: tool metadata stays frozen while OpenAI reviews it (Daniel reports the decision).",
+    // S6 (A2A 2026-10-16-mcp-beskrivelser-intensjonsord-og-lint, Utvidelse 2026-11-06): the RFB app is listed and
+    // OpenAI reviews each tool change on its own, so a description fix no longer waits for a decision.
+    descriptionsGate: null,
     recordedPrerequisites: [],
     caveats: [
       "Prices: most producers list products without a price, and the tools say so. Do not describe the connector as a price comparison.",
