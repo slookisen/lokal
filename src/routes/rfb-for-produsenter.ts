@@ -15,7 +15,7 @@
 //
 // The text must stay TRUE to what the code does today (rfb-for-produsenter.
 // test.ts pins these facts):
-//   - Two levels only, «Bare synlig» and «Ta imot bestillinger»
+//   - Two levels only, «Minst mulig» and «Utnytte mulighetene» (T8)
 //     (owner-features/changes.ts OWNER_LEVELS); the list of choices available
 //     today is read from the registry (status !== coming_soon); everything
 //     else is called «planlagt».

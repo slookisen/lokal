@@ -262,25 +262,25 @@ export async function runOwnerFeaturesT5AnchorsTests(opts: { log?: boolean } = {
       // ── Level: preview link, preview inside #niva, confirm → #niva ─────────
       const b0 = await pageHtml(OWNED_ID);
       assertTrue(!/<form method="get"/.test(b0), "r01: no GET form on the page (the level choice is a link)");
-      assertTrue(elementById(b0, "niva").includes(`href="/eier/${OWNED_ID}/valg?niva=ta_imot_bestillinger#niva-forhandsvis"`),
-        "r02: «Velg «Ta imot bestillinger»» links to …/valg?niva=<level>#niva-forhandsvis inside #niva");
+      assertTrue(elementById(b0, "niva").includes(`href="/eier/${OWNED_ID}/valg?niva=utnytte_mulighetene#niva-forhandsvis"`),
+        "r02: «Velg «Utnytte mulighetene»» links to …/valg?niva=<level>#niva-forhandsvis inside #niva");
       const w0 = writes(OWNED_ID);
-      const pv = await pageHtml(OWNED_ID, { niva: "ta_imot_bestillinger" });
+      const pv = await pageHtml(OWNED_ID, { niva: "utnytte_mulighetene" });
       assertEq(writes(OWNED_ID), w0, "r03: the preview GET writes nothing (T2 kept)");
-      assertTrue(elementById(pv, "niva").includes(`id="niva-forhandsvis"`) && elementById(pv, "niva-forhandsvis").includes("Bytte til «Ta imot bestillinger»?"),
+      assertTrue(elementById(pv, "niva").includes(`id="niva-forhandsvis"`) && elementById(pv, "niva-forhandsvis").includes("Bytte til «Utnytte mulighetene»?"),
         "r04: the level preview stands inside #niva");
       assertTrue(!pv.includes(`id="bekreft"`), "r05: no panel above the level card any more");
-      const lv0 = await post(H.niva, OWNED_ID, { level: "ta_imot_bestillinger" });
-      assertEq([lv0.status, loc(lv0)], [303, P(OWNED_ID, "?niva=ta_imot_bestillinger#niva-forhandsvis")], "r06: POST niva unconfirmed → 303 …?niva=<level>#niva-forhandsvis");
-      const lv1 = await post(H.niva, OWNED_ID, { level: "ta_imot_bestillinger", confirmed: "1" });
+      const lv0 = await post(H.niva, OWNED_ID, { level: "utnytte_mulighetene" });
+      assertEq([lv0.status, loc(lv0)], [303, P(OWNED_ID, "?niva=utnytte_mulighetene#niva-forhandsvis")], "r06: POST niva unconfirmed → 303 …?niva=<level>#niva-forhandsvis");
+      const lv1 = await post(H.niva, OWNED_ID, { level: "utnytte_mulighetene", confirmed: "1" });
       assertTrue(lv1.status === 303 && new RegExp(`^/eier/${OWNED_ID}/valg\\?endret=\\d+#niva$`).test(loc(lv1)), `r07: confirming a level → 303 …?endret=<n>#niva (${loc(lv1)})`);
       const pl1 = await follow(OWNED_ID, loc(lv1));
       assertTrue(toastIn(pl1, "niva") && !toastIn(pl1, "mv-toast-slot") && !topCard(pl1).includes("mv-toast"), "r08: the level message stands in #niva (not the slot, not the top card)");
-      const lv2 = await post(H.niva, OWNED_ID, { level: "ta_imot_bestillinger", confirmed: "1" });
+      const lv2 = await post(H.niva, OWNED_ID, { level: "utnytte_mulighetene", confirmed: "1" });
       assertEq(loc(lv2), P(OWNED_ID, "?melding=niva_valgt&ved=niva#niva"), "r09: the same level again (no change) → #niva");
       assertTrue(toastIn(await follow(OWNED_ID, loc(lv2)), "niva"), "r10: …and its message is in #niva");
       assertEq(loc(await post(H.niva, OWNED_ID, { level: "bogus", confirmed: "1" })), P(OWNED_ID, "?melding=ugyldig&ved=niva#niva"), "r11: unknown level → #niva");
-      const lvU = await post(H.niva, UNVERIFIED_ID, { level: "ta_imot_bestillinger", confirmed: "1" });
+      const lvU = await post(H.niva, UNVERIFIED_ID, { level: "utnytte_mulighetene", confirmed: "1" });
       assertEq(loc(lvU), P(UNVERIFIED_ID, "?melding=hoppet&nokkel=orders.enabled&ved=niva#niva"), "r12: a skipped key (requirement) → #niva");
       assertTrue(toastIn(await follow(UNVERIFIED_ID, loc(lvU)), "niva"), "r13: …message in #niva");
 
