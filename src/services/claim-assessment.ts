@@ -758,13 +758,27 @@ let noticeWaitOverrideMs: number | null = null;
  * it resolves at once.
  */
 export function waitForClaimAssessment(claimId: string): Promise<void> {
+  return waitForClaimAssessmentOutcome(claimId).then(() => undefined);
+}
+
+/** How waitForClaimAssessmentOutcome ended: the claim's run settled, the max
+ *  wait passed first, or no run was in flight for the claim. */
+export type ClaimAssessmentWaitOutcome = "settled" | "timeout" | "none";
+
+/**
+ * Eierkrav B2b-1: waitForClaimAssessment, telling how the wait ended. Only
+ * "settled" means the stored claim_assessment (if any) is this run's final
+ * word; the green auto-approval acts on nothing else. Never starts a run and
+ * never rejects.
+ */
+export function waitForClaimAssessmentOutcome(claimId: string): Promise<ClaimAssessmentWaitOutcome> {
   const run = pendingByClaim.get(claimId);
-  if (!run) return Promise.resolve();
+  if (!run) return Promise.resolve("none");
   const maxWaitMs = Math.min(noticeWaitOverrideMs ?? CLAIM_ASSESSMENT_NOTICE_MAX_WAIT_MS, CLAIM_ASSESSMENT_NOTICE_MAX_WAIT_MS);
-  return new Promise<void>((resolve) => {
-    const timer = setTimeout(resolve, Math.max(0, maxWaitMs));
+  return new Promise<ClaimAssessmentWaitOutcome>((resolve) => {
+    const timer = setTimeout(() => resolve("timeout"), Math.max(0, maxWaitMs));
     (timer as any).unref?.();
-    const done = () => { clearTimeout(timer); resolve(); };
+    const done = () => { clearTimeout(timer); resolve("settled"); };
     run.then(done, done);
   });
 }

@@ -56,7 +56,8 @@ import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
 import { maskEmail } from "../services/gardssalg-claim";
 import { CLAIM_RECOMMENDATION_LABELS, type ClaimRecommendation } from "../services/claim-domain-rule";
 import { createClaimActionLinks, isClaimActionLinksEnabled } from "../services/claim-action-link";
-import { claimAssessmentEnabled, waitForClaimAssessment, type ClaimAssessment } from "../services/claim-assessment";
+import { claimAssessmentEnabled, waitForClaimAssessmentOutcome, type ClaimAssessment } from "../services/claim-assessment";
+import { autoApproveGreenClaim, claimAutoApproveEnabled } from "../services/claim-auto-approve";
 import { rfbClaimRequestLimiter } from "../middleware/security";
 import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
 import { capFreeText, capName } from "../utils/free-text";
@@ -1979,7 +1980,15 @@ function claimQueuedActionLinks(claimId: string): { approve: string; reject: str
  *  claim's already-started assessment, then shows what is stored in
  *  claim_assessment. Flag off, no stored assessment, a timeout or an
  *  unreadable value → the notice goes out exactly as before. The caller
- *  never waits for any of it. */
+ *  never waits for any of it.
+ *
+ *  Eierkrav B2b-1: with CLAIM_AUTO_APPROVE_ENABLED === "true" as well, a
+ *  claim whose own run settled within the wait with a green stored result is
+ *  approved automatically (autoApproveGreenClaim), which sends the claimant's
+ *  login mail and the «godkjent automatisk» notice instead of this one. One
+ *  decision per claim, here: anything not approved (not green, no run, over
+ *  the wait, already decided, the profile got an owner) gets the notice
+ *  above. */
 function notifyAdminClaimQueued(claimId: string): void {
   let assessmentOn = false;
   try {
@@ -1990,8 +1999,16 @@ function notifyAdminClaimQueued(claimId: string): void {
     return;
   }
   try {
-    waitForClaimAssessment(claimId)
-      .then(() => sendAdminClaimQueuedNotice(claimId, storedClaimAssessment(claimId)))
+    waitForClaimAssessmentOutcome(claimId)
+      .then(async (outcome) => {
+        const assessment = storedClaimAssessment(claimId);
+        let autoOn = false;
+        try {
+          autoOn = claimAutoApproveEnabled();
+        } catch { /* off */ }
+        if (autoOn && outcome === "settled" && assessment && await autoApproveGreenClaim(claimId, assessment)) return;
+        sendAdminClaimQueuedNotice(claimId, assessment);
+      })
       .catch((err: any) => console.error("[Admin notify] claim-review notice error:", err?.message));
   } catch (err: any) {
     console.error("[Admin notify] claim-review notice error:", err?.message);
