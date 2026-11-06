@@ -297,10 +297,7 @@ export class EmailService {
     agentName: string
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     try {
-      const subject = `Din bekreftelseskode for ${agentName} på ${this.brand}`;
-
-      const htmlContent = this.generateVerificationCodeHtml(code, agentName);
-      const textContent = this.generateVerificationCodeText(code, agentName);
+      const { subject, htmlContent, textContent } = this.buildVerificationCodeEmail(code, agentName);
 
       return await this.sendEmail({
         to: email,
@@ -337,10 +334,7 @@ export class EmailService {
     agentId: string
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     try {
-      const subject = `Profilen til ${agentName} er nå din på ${this.brand}`;
-
-      const htmlContent = this.generateClaimConfirmationHtml(agentName, loginUrl, agentId);
-      const textContent = this.generateClaimConfirmationText(agentName, loginUrl, agentId);
+      const { subject, htmlContent, textContent } = this.buildClaimConfirmationEmail(agentName, loginUrl, agentId);
 
       return await this.sendEmail({
         to: email,
@@ -360,6 +354,32 @@ export class EmailService {
         error: error instanceof Error ? error.message : 'Unknown error',
       };
     }
+  }
+
+  /**
+   * Subject and bodies of the claim verification-code mail, exactly as
+   * sendVerificationCode sends them. Also used by claim-crm-tracking.ts to
+   * file a copy in the CRM with the code replaced by a mask.
+   */
+  buildVerificationCodeEmail(code: string, agentName: string): { subject: string; htmlContent: string; textContent: string } {
+    return {
+      subject: `Din bekreftelseskode for ${agentName} på ${this.brand}`,
+      htmlContent: this.generateVerificationCodeHtml(code, agentName),
+      textContent: this.generateVerificationCodeText(code, agentName),
+    };
+  }
+
+  /**
+   * Subject and bodies of «Profilen til X er nå din», exactly as
+   * sendClaimConfirmation sends them. Also used by claim-crm-tracking.ts to
+   * file a copy in the CRM with the login link replaced by a placeholder.
+   */
+  buildClaimConfirmationEmail(agentName: string, loginUrl: string, agentId: string): { subject: string; htmlContent: string; textContent: string } {
+    return {
+      subject: `Profilen til ${agentName} er nå din på ${this.brand}`,
+      htmlContent: this.generateClaimConfirmationHtml(agentName, loginUrl, agentId),
+      textContent: this.generateClaimConfirmationText(agentName, loginUrl, agentId),
+    };
   }
 
   async sendEmail(options: EmailOptions): Promise<{ success: boolean; messageId?: string; error?: string }> {
