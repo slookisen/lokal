@@ -47,6 +47,7 @@ import { runDebioCrossCheck, DEFAULT_SINCE_ISO, DebioSource } from "../services/
 import { syncDebioVerifications } from "../services/debio-verification-service";
 import { startJob } from "../services/job-tracker";
 import { syncDebioRegister, listMatchReview, decideMatchReview, manualDebioLink } from "../services/debio-register-sync";
+import { buildOrganicClaimsSummary } from "../services/organic-claims-summary";
 import { getDb } from "../database/init";
 
 const router = Router();
@@ -222,6 +223,20 @@ router.get("/match-review", (req: Request, res: Response) => {
   const state = (["pending", "approved", "rejected", "all"].includes(raw) ? raw : "pending") as "pending" | "approved" | "rejected" | "all";
   const items = listMatchReview(getDb(), state);
   res.json({ success: true, state, count: items.length, items });
+});
+
+// GET /admin/debio/organic-claims-summary   (økologi S3f)
+//   Read-only daily count of organic claim words on active RFB producer
+//   profiles, per Debio status (okologisk|karens|annet|ingen|ukjent), plus
+//   unverified profiles with hits (alert when > 0) and a sample (max 50).
+//   Writes nothing. See services/organic-claims-summary.ts.
+router.get("/organic-claims-summary", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    res.json({ success: true, ...buildOrganicClaimsSummary(getDb()) });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: "organic claims summary failed", detail: err?.message || String(err) });
+  }
 });
 
 // POST /admin/debio/match-review/manual
