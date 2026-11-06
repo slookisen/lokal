@@ -6463,6 +6463,33 @@ function initSchema(db: Database.Database): void {
     console.error("Migration order_activation_links failed:", err);
   }
 
+  // ─── claim_action_links (dev-request 2026-10-30-rfb-eierkrav-automatisk-
+  // vurdering-og-ettklikk, slice C4 — signerte ett-klikks-lenker) ──────────
+  // One row per admin-minted, HMAC-signed one-time link that approves,
+  // rejects or revokes one owner claim (services/claim-action-link.ts). The
+  // token itself is never stored: `nonce_hash` is sha256(nonce) hex. `used_at`
+  // is the single-use guard (a conditional UPDATE … WHERE used_at IS NULL in
+  // the same transaction as the claim decision); `used_result` records the
+  // outcome. Additive; brand-new table.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS claim_action_links (
+        id TEXT PRIMARY KEY,
+        nonce_hash TEXT NOT NULL UNIQUE,
+        claim_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        created_by TEXT NOT NULL DEFAULT 'admin',
+        used_at TEXT,
+        used_result TEXT
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_claim_action_links_claim ON claim_action_links(claim_id)`);
+  } catch (err) {
+    console.error("Migration claim_action_links failed:", err);
+  }
+
   // ─── product_import_runs / product_import_run_results (dev-request
   // 2026-10-21-rfb-produktimport-fra-egen-nettside, Skive 1) ──────────────
   // The dry-run measurement (POST /admin/product-import/dry-run, flag
