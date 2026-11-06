@@ -31,7 +31,7 @@
 // Limits: at most OWNER_FETCH_DAILY_LIMIT fetches per profile per UTC day,
 // counted from product_import_runs (survives restarts); at most
 // OWNER_FETCH_MAX_CONCURRENT fetches at a time in this process, and one per
-// profile. Flag PRODUCT_IMPORT_ENABLED ("1"/"true"; default off).
+// profile. Flag PRODUCT_IMPORT_ENABLED ("1"/"true"; "pilot" = allowlisted owners only; default off).
 
 import { randomUUID } from "crypto";
 import { getDb } from "../../database/init";
@@ -47,6 +47,7 @@ import {
 } from "../knowledge-service";
 import { normalizeName, parsePriceNok, runProductCatalogSync } from "../product-catalog-sync";
 import { auditOwnerProductChange } from "../owner-orderability";
+import { ownerFlagEnabledFor, ownerFlagMode } from "../../owner-features/owner-flag-mode";
 import { extractProductsFromWebsite, HostPacer, type ProductImportDeps, type ProductImportResult } from "./extractor";
 import { canonicalUnit, detectPriceUnit, normalizeProductName, PRODUCT_IMPORT_MAX_PRODUCTS, type ProductUnit } from "./normalize";
 
@@ -66,10 +67,18 @@ export const OWNER_FETCH_RUNNING_MESSAGE = "Vi henter allerede produkter fra net
 export const OWNER_IMPORT_NO_WEBSITE_MESSAGE =
   "Profilen har ingen nettside. Legg inn nettsiden i profilen først, eller legg inn produktene selv.";
 
-/** Flag: "1"/"true" turns the owner import on. Anything else = off (404). */
+/** Flag: "1"/"true" turns the owner import on for every verified owner ("all" mode). */
 export function productImportEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const v = env[PRODUCT_IMPORT_FLAG];
-  return v === "1" || v === "true";
+  return ownerFlagMode(PRODUCT_IMPORT_FLAG, env) === "all";
+}
+
+/**
+ * The owner import is on for this owner: "1"/"true" → everyone; "pilot" →
+ * only an owner in OWNER_FEATURES_ALLOWED_SUBJECTS (`rfb:<id>`); anything
+ * else → off (404).
+ */
+export function productImportEnabledFor(agentId: string | null | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
+  return ownerFlagEnabledFor(PRODUCT_IMPORT_FLAG, agentId, env);
 }
 
 // ── Test seams ──────────────────────────────────────────────────────────────

@@ -46599,6 +46599,24 @@ runSerial(async () => {
   }
 });
 
+// Step 3m: the gårdssalg review-queue parking as a server-side daily job.
+// Serial: in-memory DBs.
+runSerial(async () => {
+  console.log("\n── 3m: gardssalg-website-review-queue-park-job (server-side) ──");
+  try {
+    const { runGardssalgWebsiteReviewQueueParkJobTests } = require("../src/services/gardssalg-website-review-queue-park-job.test") as
+      typeof import("../src/services/gardssalg-website-review-queue-park-job.test");
+    const pj = await runGardssalgWebsiteReviewQueueParkJobTests({ log: false });
+    passed += pj.passed;
+    failed += pj.failed;
+    for (const f of pj.failures) failures.push("gardssalg-website-review-queue-park-job: " + f);
+    console.log(`  gardssalg-website-review-queue-park-job: ${pj.passed} passed, ${pj.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-website-review-queue-park-job: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-felles-
 // serverjobbramme, «Innsnevring 2026-10-28», skive 3k med punkt b: the
 // needs_review content judge without an LLM — candidate GET (batches 1..4),
@@ -50266,6 +50284,28 @@ runSerial(async () => {
   }
 });
 
+// Eierkrav slice C3: the claim-flow mails to the claimant (code, resend,
+// approval) are filed as outbound crm_messages in one CRM thread per claim
+// (claim-<claimId>) behind CLAIM_CRM_TRACKING_ENABLED (default off); no code
+// or login link is stored. Pins getDb() to its own in-memory DB, stubs the
+// e-mail transporter and a crmService method, sets env (all restored in
+// finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── eierkrav C3: claim-flow mails recorded as one CRM thread per claim ──");
+  try {
+    const { runRfbClaimCrmThreadC3Tests } = require("../src/routes/rfb-claim-crm-thread-c3.test") as
+      typeof import("../src/routes/rfb-claim-crm-thread-c3.test");
+    const c3 = await runRfbClaimCrmThreadC3Tests({ log: false });
+    passed += c3.passed;
+    failed += c3.failed;
+    for (const f of c3.failures) failures.push("rfb-claim-crm-thread-c3: " + f);
+    console.log(`  rfb-claim-crm-thread-c3: ${c3.passed} passed, ${c3.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-claim-crm-thread-c3: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice
 // C1: POST /admin/agents/claim-revoke puts the profile back from the pre-grant
 // snapshot. Pins getDb() to its own in-memory DB, runs an in-process server,
@@ -51602,7 +51642,8 @@ runSerial(async () => {
 
 // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2e (side v2, AC25–30):
 // «Planlagt» box + «Gi meg beskjed» (interest rows, admin counts), two levels
-// (stored «aktiv»/«full_fart» read as «Ta imot bestillinger»), no fake values,
+// (T8, testrunde-1 AC4: «Minst mulig» / «Utnytte mulighetene», old keys read
+// as aliases, level from the switches, who-chose status line), no fake values,
 // the orders explanation + orderable-items check, the portal cards moved into
 // «Mine valg», the first-login answer in its row. Swaps the getDb() singleton,
 // env vars and the confirm-mail sender (restored in finally) — runSerial.
@@ -51786,6 +51827,28 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("mine-valg-s2f: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Produktimport skive 4-2b: the «Mine valg» switch products.weekly_sync wired
+// to product_auto_sync_state.product_sync_mode (live behind
+// PRODUCT_AUTO_SYNC_ENABLED; flag off = byte-identical page/API, change
+// refused as before; on → 'weekly' + one agent_knowledge_audit row; off →
+// 'off', sync state kept; is_verified = 0 / non-owner refused). Swaps getDb()
+// and env — runSerial.
+runSerial(async () => {
+  console.log("\n── produktimport skive 4-2b: «Mine valg»-bryteren products.weekly_sync ──");
+  try {
+    const { runProductWeeklySyncSwitchTests } = require("../src/owner-features/product-weekly-sync.test") as
+      typeof import("../src/owner-features/product-weekly-sync.test");
+    const r = await runProductWeeklySyncSwitchTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("product-weekly-sync-switch: " + f);
+    console.log(`  product-weekly-sync-switch: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("product-weekly-sync-switch: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -52043,6 +52106,25 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("debio-register-s1d: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// økologi S3f: read-only GET /admin/debio/organic-claims-summary (daily
+// organic-word counts per Debio status, unverified alert + sample). Pins the
+// getDb() singleton and sets ADMIN_KEY (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── økologi S3f: daglig opptelling av økologi-ord ──");
+  try {
+    const { runOrganicClaimsSummaryS3fTests } = require("../src/services/organic-claims-summary-s3f.test") as
+      typeof import("../src/services/organic-claims-summary-s3f.test");
+    const r = await runOrganicClaimsSummaryS3fTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("organic-claims-summary-s3f: " + f);
+    console.log(`  organic-claims-summary-s3f: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("organic-claims-summary-s3f: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -52480,5 +52562,28 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("product-import-weekly-box: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-11-05-eierflagg-koblet-til-pilotlisten: PRODUCT_IMPORT_ENABLED,
+// OWNER_ORDER_EMAIL_ENABLED, OWNER_UNIFIED_SESSION_ENABLED and
+// PRODUCT_IMPORT_OUTREACH_ENABLED accept exactly "pilot" (on only for owners in
+// OWNER_FEATURES_ALLOWED_SUBJECTS); "1"/"true" unchanged; anything else off.
+// Per call site, the admin prepare route's per-id rejection and the switch
+// probe's mode report. Swaps the getDb() singleton and env (restored in
+// finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── eierflagg med pilotmodus (OWNER_FEATURES_ALLOWED_SUBJECTS) ──");
+  try {
+    const { runOwnerFlagPilotTests } = require("../src/owner-features/owner-flag-pilot.test") as
+      typeof import("../src/owner-features/owner-flag-pilot.test");
+    const r = await runOwnerFlagPilotTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-flag-pilot: " + f);
+    console.log(`  owner-flag-pilot: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-flag-pilot: unexpected error: " + String(err?.message || err));
   }
 });

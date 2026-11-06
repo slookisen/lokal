@@ -121,6 +121,7 @@ import { readDebioVerified } from "../services/debio-approval";
 // The claim admin queue (decision 11=A) — see GET /claim-review-queue below.
 import { knowledgeService } from "../services/knowledge-service";
 import { emailService } from "../services/email-service";
+import { recordClaimMail } from "../services/claim-crm-tracking";
 import { trustScoreService } from "../services/trust-score-service";
 import { maskEmail } from "../services/gardssalg-claim";
 import { createOwnerLoginLink } from "./owner-portal";
@@ -2325,8 +2326,10 @@ router.post("/claim-review-approve", async (req: Request, res: Response) => {
   try {
     const nameRow = getDb().prepare("SELECT name FROM agents WHERE id = ?").get(approved.agentId) as { name?: string } | undefined;
     const link = createOwnerLoginLink(approved.agentId, approved.email, "claim_approval");
-    const sent = await emailService.sendClaimConfirmation(approved.email, nameRow?.name || "din gård", link.verifyUrl, approved.agentId);
+    const approvedAgentName = nameRow?.name || "din gård";
+    const sent = await emailService.sendClaimConfirmation(approved.email, approvedAgentName, link.verifyUrl, approved.agentId);
     loginLinkSent = sent.success && sent.messageId !== "DRY_RUN";
+    recordClaimMail({ kind: "claim_approved", claimId, agentId: approved.agentId, email: approved.email, agentName: approvedAgentName, sendResult: sent });
   } catch (err) {
     console.error("[admin-agents] claim-review-approve: login link not sent:", err instanceof Error ? err.message : "error");
   }

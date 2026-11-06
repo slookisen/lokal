@@ -4,8 +4,8 @@ import { getDb } from "../database/init";
 import {
   verifyOwnerSession, isVerifiedOwner, OWNER_NOT_VERIFIED_MESSAGE, portalWriteRefusedPage,
   portalShell, ownerNotVerifiedPage,
-  ownerOrderEmailEnabled, currentOrderRecipient, pendingOrderEmailChange, requestOwnerOrderEmailChange,
-  parseResumeDate, ownerUnifiedSessionEnabled,
+  ownerOrderEmailEnabledFor, currentOrderRecipient, pendingOrderEmailChange, requestOwnerOrderEmailChange,
+  parseResumeDate, ownerUnifiedSessionEnabledFor,
 } from "./owner-portal";
 import { isCrossSiteWrite } from "../middleware/same-origin-write";
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
@@ -24,6 +24,7 @@ import {
   batchKeys,
   currentOwnerLevel,
   findOwnerLevel,
+  readOwnerLevelChoiceFor,
   getOwnerChangeBatch,
   latestUndoableBatch,
   ownerFeatureChangeLog,
@@ -378,7 +379,7 @@ function itemsHref(agentId: string): string {
   const id = encodeURIComponent(agentId);
   // B1: with the orderability card on, it is the place to make items orderable.
   if (ownerOrderabilityPortalEnabledFor(agentId)) return `/eier/${id}/portal#bestillbare-varer`;
-  return ownerUnifiedSessionEnabled() ? `/eier/${id}/portal#produkter` : `/selger?agent=${id}`;
+  return ownerUnifiedSessionEnabledFor(agentId) ? `/eier/${id}/portal#produkter` : `/selger?agent=${id}`;
 }
 
 /**
@@ -510,7 +511,7 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
     let orderEmail: { enabled: boolean; current: string | null; pending: string | null } | null = null;
     try {
       orderEmail = {
-        enabled: ownerOrderEmailEnabled(),
+        enabled: ownerOrderEmailEnabledFor(agentId),
         current: currentOrderRecipient(agentId),
         pending: pendingOrderEmailChange(agentId)?.new_email ?? null,
       };
@@ -519,6 +520,8 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
       agent: { id: agent.id, name: String(agent.name || "") },
       resolved,
       level: currentOwnerLevel(VERTICAL, agentId, resolved),
+      // T8: who chose — read only (the status line's «Du valgte …»).
+      levelChoice: readOwnerLevelChoiceFor(VERTICAL, agentId, { db }),
       showIntro: news.showQuestion,
       newsAnswer: news.answer,
       notice,

@@ -204,13 +204,14 @@ const APPLY_MAX_LIMIT = HARD_CAP_SLUGS; // was: 50 — see dev-request 2026-08-1
 // BM_HARVEST_TIME_BUDGET_MS bounds BOTH branches (dry-run and apply): the
 // dry-run branch used to have no valve at all and fetched the whole ~347-page
 // catalog sequentially (15 s timeout per page) before responding, so a prod
-// call outlived the HTTP proxy and came back as a 502. 30 s matches the
-// fleet's other heavy routes (RFB_WD_TIME_BUDGET_MS,
-// PHONE_RETRO_SCAN_TIME_BUDGET_MS) and — since the check only stops NEW
-// slugs from starting — leaves room for one in-flight slug to finish under
-// the proxy timeout. A cut-short call reports `next_offset` so the caller
-// can resume exactly where it stopped.
-export const BM_HARVEST_TIME_BUDGET_MS = 30_000;
+// call outlived the HTTP proxy and came back as a 502. The budget is 20 s
+// because a prod probe on 2026-11-06 showed the caller→route response window
+// is ~30 s (a limit=400 dry-run answered HTTP 502 "upstream request failed"
+// after 30.3 s, while the whole 359-slug catalog takes ~30 s). 20 s leaves
+// room for the sitemap fetch plus one in-flight slug (the check only stops
+// NEW slugs from starting) under that window. A cut-short call reports
+// `next_offset` so the caller can resume exactly where it stopped.
+export const BM_HARVEST_TIME_BUDGET_MS = 20_000;
 /** Alias kept for existing imports/tests — same value as BM_HARVEST_TIME_BUDGET_MS (was 60 s). */
 export const APPLY_TIME_BUDGET_MS = BM_HARVEST_TIME_BUDGET_MS;
 
