@@ -425,6 +425,7 @@ export type OrderabilityReasonCode =
   | "owner_not_verified"      // agents.is_verified != 1
   | "order_email_missing"     // no order / contact e-mail
   | "order_email_suppressed"  // the recipient e-mail is blocklisted
+  | "profile_not_checked"     // T10 (orderReadiness only): no verified internal cross-check (agent_knowledge), or second-line only
   | "producer_not_eligible";  // any other isEligibleForRealOrder() «no» (cross-check, umbrella, inactive, read error)
 
 export interface OrderabilityReason {
@@ -472,8 +473,13 @@ export interface ProducerOrderability {
   reasons: OrderabilityReason[];
 }
 
-/** Explains a «no» from isEligibleForRealOrder(); never decides it. Never throws. */
-function explainNotEligible(db: any, agentId: string): OrderabilityReason[] {
+/**
+ * Explains a «no» from isEligibleForRealOrder(); never decides it. Never throws.
+ * `assumeOrdersOn` (T10, orderReadiness): explains the gate as it would answer
+ * with orders switched on — no orders_off, and the cross-check named
+ * (profile_not_checked) instead of the generic reason. Default: as before.
+ */
+function explainNotEligible(db: any, agentId: string, assumeOrdersOn = false): OrderabilityReason[] {
   const out: OrderabilityReason[] = [];
   const profile = (code: OrderabilityReasonCode) => out.push({ code, level: "profile" });
   try {
@@ -483,11 +489,19 @@ function explainNotEligible(db: any, agentId: string): OrderabilityReason[] {
       FROM agents a WHERE a.id = ?
     `).get(agentId) as { is_verified: number | null; opt_in: number | null; override_email: string | null; contact_email: string | null } | undefined;
     if (row) {
-      if (row.opt_in !== 1) profile("orders_off");
+      if (row.opt_in !== 1 && !assumeOrdersOn) profile("orders_off");
       if (row.is_verified !== 1) profile("owner_not_verified");
       const email = (row.override_email || "").trim() || (row.contact_email || "").trim();
       if (!email) profile("order_email_missing");
       else if (isBlocked({ email }).blocked) profile("order_email_suppressed");
+      if (assumeOrdersOn) {
+        const checked = db.prepare(`
+          SELECT 1 FROM agent_knowledge k
+          WHERE k.agent_id = ? AND k.verification_status = 'verified'
+            AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
+        `).get(agentId);
+        if (!checked) profile("profile_not_checked");
+      }
     }
   } catch { /* fall through to the generic reason */ }
   if (out.length === 0) profile("producer_not_eligible");
@@ -507,6 +521,70 @@ export function producerOrderability(db: any, agentId: string, explain = true): 
     eligible = false;
   }
   return { eligible, reasons: eligible || !explain ? [] : explainNotEligible(db, agentId) };
+}
+
+/**
+ * T10 (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 3): what the
+ * level preview needs before a level may switch orders on. No new rule:
+ *   ready            isEligibleForRealOrder() itself, as it answers with
+ *                    agents.order_notifications_opt_in = 1 — when the column
+ *                    is off it is set to 1 inside a transaction that is
+ *                    always rolled back, so `ready` is true if and only if
+ *                    the real gate would be true with orders on. A gate that
+ *                    cannot be evaluated counts as «no».
+ *   missing          explainNotEligible() for that answer (never orders_off);
+ *                    [] when ready; never empty when not ready.
+ *   orderable_if_on  product rows that pass every product check of
+ *                    isRowOrderableForRealOrder() (the profile check taken as
+ *                    passed) — «Du har 0 varer som kan bestilles» is a soft
+ *                    warning, not a requirement.
+ */
+export interface OrderReadiness {
+  ready: boolean;
+  missing: OrderabilityReason[];
+  orderable_if_on: number;
+}
+
+class ReadinessRollback extends Error {
+  constructor(readonly ready: boolean) { super("order readiness rollback"); }
+}
+
+function eligibleWithOrdersOn(db: any, agentId: string): boolean {
+  const row = db.prepare(`SELECT order_notifications_opt_in AS opt_in FROM agents WHERE id = ?`).get(agentId) as { opt_in: number | null } | undefined;
+  if (!row) return false;
+  if (row.opt_in === 1) return isEligibleForRealOrder(agentId, db);
+  try {
+    db.transaction(() => {
+      db.prepare(`UPDATE agents SET order_notifications_opt_in = 1 WHERE id = ?`).run(agentId);
+      throw new ReadinessRollback(isEligibleForRealOrder(agentId, db));
+    })();
+  } catch (e) {
+    if (e instanceof ReadinessRollback) return e.ready;
+    throw e;
+  }
+  return false;
+}
+
+export function orderReadiness(db: any, agentId: string, now: Date = new Date()): OrderReadiness {
+  let ready = false;
+  try { ready = eligibleWithOrdersOn(db, agentId); } catch { ready = false; }
+  let missing: OrderabilityReason[] = [];
+  if (!ready) {
+    missing = explainNotEligible(db, agentId, true);
+    if (missing.length === 0) missing = [{ code: "producer_not_eligible", level: "profile" }];
+  }
+  let orderable = 0;
+  try {
+    const rows = db
+      .prepare(
+        `SELECT agent_id, name, description, category, price_nok, availability, availability_updated_at, availability_source
+           FROM products WHERE agent_id = ?`,
+      )
+      .all(agentId) as OrderabilityRow[];
+    const passed: ProducerOrderability = { eligible: true, reasons: [] };
+    orderable = rows.filter((r) => evaluateOrderability(db, r, now, true, passed).length === 0).length;
+  } catch { orderable = 0; }
+  return { ready, missing, orderable_if_on: orderable };
 }
 
 /**

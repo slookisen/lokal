@@ -431,6 +431,24 @@ export function checkLevelPresets(
   return problems;
 }
 
+/**
+ * T10 (orderGateReady): a level that switches a real-order key ON must meet
+ * the real-order gate first, and that check may only stop switching ON.
+ * Every live switch with the `order_gate` surface has `enableRequires`
+ * orderGateReady; orderGateReady never stands in `requires` (that would show
+ * an owner who already has orders on as off).
+ */
+export function checkOrderGateRequirement(registry: readonly OwnerFeatureEntry[]): string[] {
+  const problems: string[] = [];
+  for (const e of registry) {
+    if ((e.requires as readonly string[]).includes("orderGateReady")) problems.push(`${e.key}: orderGateReady must be an enableRequires, never requires`);
+    if (e.status === "live" && e.type === "switch" && e.surfaces.includes("order_gate") && e.storage && !(e.enableRequires ?? []).includes("orderGateReady")) {
+      problems.push(`${e.key}: a live order_gate switch without enableRequires orderGateReady`);
+    }
+  }
+  return problems;
+}
+
 export async function runRegistryGovernanceS4Tests(opts: { log?: boolean } = {}): Promise<TestSummary> {
   const log = opts.log ?? false;
   let passed = 0;
@@ -585,6 +603,13 @@ export async function runRegistryGovernanceS4Tests(opts: { log?: boolean } = {})
       "rule 5: OWNER_LEVELS is exactly «minst_mulig», «utnytte_mulighetene»", OWNER_LEVELS.map((l) => l.key));
     const levelProblems = checkLevelPresets(OWNER_LEVELS, OWNER_FEATURE_REGISTRY);
     assertTrue(levelProblems.length === 0, `rule 5: the ${OWNER_LEVELS.length} levels use only live, allowed keys; «Minst mulig» = owner default; the levels differ`, levelProblems);
+    // T10: orderGateReady on orders.enabled, only as enableRequires.
+    const gateProblems = checkOrderGateRequirement(OWNER_FEATURE_REGISTRY);
+    assertTrue(gateProblems.length === 0, "rule 5 (T10): orders.enabled needs orderGateReady to switch on, and orderGateReady is never a `requires`", gateProblems);
+    const gateMut = checkOrderGateRequirement(OWNER_FEATURE_REGISTRY.map((e) => (e.key === "orders.enabled" ? { ...e, enableRequires: [] } : e)));
+    assertTrue(gateMut.some((p) => p.startsWith("orders.enabled: a live order_gate switch without")), "self-check (T10): orders.enabled without orderGateReady is reported", gateMut);
+    const gateMut2 = checkOrderGateRequirement(OWNER_FEATURE_REGISTRY.map((e) => (e.key === "orders.enabled" ? { ...e, requires: [...e.requires, "orderGateReady" as const] } : e)));
+    assertTrue(gateMut2.some((p) => p === "orders.enabled: orderGateReady must be an enableRequires, never requires"), "self-check (T10): orderGateReady as `requires` is reported", gateMut2);
 
     // ── Gårdssalg (O1a): rules 1–3 over the gårdssalg registry. ─────────────
     const gsKeys = GARDSSALG_OWNER_FEATURE_KEYS as readonly string[];

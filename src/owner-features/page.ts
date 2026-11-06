@@ -834,7 +834,7 @@ function rfbLevelsHtml(ctx: RenderCtx): string {
         ${noticeAtHtml(ctx, OWNER_ANCHOR_LEVEL)}
         <ul class="mv-levels">${cards}</ul>
         <p class="mv-desc">Nivået endrer aldri om profilen er synlig, og aldri «Nyheter og tips». Det bestemmer du selv.</p>
-        ${levelPreviewHtml(m)}
+        ${rfbLevelPreviewHtml(m, st)}
         ${statusLineHtml(m)}
       </section>`;
 }
@@ -879,6 +879,81 @@ function levelPreviewHtml(m: OwnerPageModel): string {
   return `<section class="mv-confirm mv-confirm-inline" id="${OWNER_ANCHOR_LEVEL_PREVIEW}" role="region" aria-labelledby="mv-h-niva-forhandsvis">
         <h3 id="mv-h-niva-forhandsvis">Bytte til «${esc(p.level.label.no)}»?</h3>
         ${body}
+      </section>`;
+}
+
+/** T10: shown under the stock-check change in the RFB level preview. */
+const LEVEL_PREVIEW_STOCK_CHECK_NOTE = "Påminnelse om lagerstatus på e-post (høyst én hver 14. dag)";
+/** T10: «Dette må du gjøre» when a level switches orders off. */
+const LEVEL_PREVIEW_ORDERS_OFF_TODO = "Bestillinger du allerede har fått, må du fortsatt svare på. Nye kunder får kontaktinformasjonen din i stedet.";
+const LEVEL_PREVIEW_GOOD_TO_KNOW = "Du kan gjøre unntak etterpå. «Angre» angrer hele nivåbyttet.";
+
+/**
+ * T10 (RFB page, punkt 3 «Velge»): the level preview inside the level card —
+ * «Dette endres», «Følger med», «Endres ikke», «Dette må du gjøre», «Dette
+ * mangler» and «Godt å vite» (a section only when it has something). A hard
+ * requirement (OwnerLevelPreview.requirements.hard) gives «Du kan ikke velge
+ * «{nivå}» før dette er på plass:» and NO confirm button (the POST refuses it
+ * too, applyOwnerLevel → not_ready); a soft one is a warning and the level can
+ * still be confirmed. Plain links and forms — works without JavaScript; the
+ * T9 script swaps the #niva region rendered by this same function.
+ */
+function rfbLevelPreviewHtml(m: OwnerPageModel, st: OwnerLevelStatus | null): string {
+  const p = m.levelPreview;
+  if (!p) return "";
+  const registry = m.registry ?? OWNER_FEATURE_REGISTRY;
+  const label = (k: string) => findOwnerFeature(k, registry)?.label.no ?? k;
+  const name = esc(p.level.label.no);
+  const req = p.requirements ?? { hard: [], soft: [] };
+  const blocked = req.hard.length > 0;
+  const exceptions = new Set(st && st.kind === "custom" ? st.exceptions.map((x) => x.key) : []);
+  const section = (title: string, inner: string) =>
+    inner ? `<div class="mv-preview-part"><h4>${esc(title)}</h4>${inner}</div>` : "";
+  const list = (items: string[]) => (items.length ? `<ul>${items.join("")}</ul>` : "");
+
+  const changes = p.changes.map((c) => {
+    const e = findOwnerFeature(c.key, registry);
+    const note = c.key === "products.stock_check" && c.to === true ? `<p class="mv-desc">${esc(LEVEL_PREVIEW_STOCK_CHECK_NOTE)}</p>` : "";
+    return `<li><strong>${esc(label(c.key))}</strong>: ${esc(formatOwnerFeatureValue(e, c.from))} → ${esc(formatOwnerFeatureValue(e, c.to))}${exceptions.has(c.key) ? " (ditt unntak)" : ""}${note}</li>`;
+  });
+  const follows = (p.follows ?? []).map((f) => {
+    const e = findOwnerFeature(f.key, registry);
+    return `<li><strong>${esc(label(f.key))}</strong>: ${esc(formatOwnerFeatureValue(e, f.from))} → ${esc(formatOwnerFeatureValue(e, f.to))}</li>`;
+  });
+  const unchanged = p.skipped.map((s) => `<li><strong>${esc(label(s.key))}</strong> endres ikke: ${esc(s.reason.no)}</li>`);
+  const vis = m.resolved.byKey["visibility.profile"];
+  if (vis) unchanged.push(`<li>Profilen er synlig: ${vis.value === false ? "Av" : "På"}</li>`);
+  if (findOwnerFeature("comms.news", registry)) unchanged.push(`<li>Nyheter og tips: du bestemmer selv</li>`);
+  const ordersOnAfter = p.level.values.some(([k, v]) => k === "orders.enabled" && v === true);
+  if (ordersOnAfter && m.orderEmail?.current) unchanged.push(`<li>Bestillinger sendes til: ${esc(m.orderEmail.current)}</li>`);
+
+  const todo: string[] = [];
+  for (const c of p.changes) {
+    const e = findOwnerFeature(c.key, registry);
+    if (c.key === "orders.enabled" && c.to === false) { todo.push(`<li>${esc(LEVEL_PREVIEW_ORDERS_OFF_TODO)}</li>`); continue; }
+    const t = c.to === true ? e?.confirmOn : c.to === false ? e?.confirmOff : undefined;
+    if (t) todo.push(`<li>${esc(t.no)}</li>`);
+  }
+
+  const missing = blocked
+    ? `<p>Du kan ikke velge «${name}» før dette er på plass:</p>${list(req.hard.map((h) => `<li data-level-requirement="${esc(h.code)}">${esc(h.text.no)}</li>`))}`
+    : list(req.soft.map((w) => `<li data-level-warning="${esc(w.code)}">${esc(w.text.no)}</li>`));
+
+  const cancel = `<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m, `#${OWNER_ANCHOR_LEVEL}`))}" data-mv-cancel="1">Avbryt</a>`;
+  const confirmForm = `<form method="post" action="${esc(actionPath(m, "/niva"))}" class="mv-ctl-form" data-mv-row="${OWNER_ANCHOR_LEVEL}">
+            <input type="hidden" name="level" value="${esc(p.level.key)}">
+            <input type="hidden" name="confirmed" value="1">
+            <button type="submit" class="ep-btn ep-btn-primary">Bekreft «${name}»</button>
+          </form>`;
+  const showConfirm = !blocked && (p.changes.length > 0 || p.skipped.length === 0);
+  const same = !blocked && p.changes.length === 0 ? `<p>Valgene dine er allerede slik. Bekreft for å velge nivået.</p>` : "";
+  return `<section class="mv-confirm mv-confirm-inline" id="${OWNER_ANCHOR_LEVEL_PREVIEW}" role="region" aria-labelledby="mv-h-niva-forhandsvis"${blocked ? ` data-level-blocked="1"` : ""}>
+        <h3 id="mv-h-niva-forhandsvis">Bytte til «${name}»?</h3>
+        ${same}${section("Dette endres", list(changes))}${section("Følger med", list(follows))}${section("Endres ikke", list(unchanged))}${section("Dette må du gjøre", list(todo))}${section("Dette mangler", missing)}${section("Godt å vite", blocked ? "" : `<p>${esc(LEVEL_PREVIEW_GOOD_TO_KNOW)}</p>`)}
+        <div class="ep-form-actions">
+          ${showConfirm ? confirmForm : ""}
+          ${cancel}
+        </div>
       </section>`;
 }
 
@@ -1106,6 +1181,8 @@ ${OWNER_TOKEN_CSS}  .mv-page, .mv-page * { overflow-wrap: anywhere; }
   .mv-confirm { border-color: var(--ow-accent-line); }
   .mv-confirm-inline { flex: 1 1 100%; min-width: 0; margin-top: 12px; padding: 12px 14px; border: 1px solid var(--ow-accent-line); border-radius: 10px; }
   .mv-confirm-inline h3 { font-size: 1rem; margin: 0 0 6px; }
+  .mv-preview-part h4 { font-size: 0.95rem; margin: 10px 0 4px; }
+  .mv-preview-part ul { margin: 0; padding-left: 20px; }
   .mv-item > .mv-toast { flex: 1 1 100%; }
   .mv-toast { position: sticky; bottom: 0; z-index: 10; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; margin-top: 16px; padding: 10px 14px; border-radius: 10px; font-size: 0.95rem; box-shadow: 0 -2px 8px rgba(0,0,0,0.08); }
   .mv-toast-ok { background: var(--ow-ok-bg); color: var(--ow-ok-text); border: 1px solid var(--ow-ok-line); }

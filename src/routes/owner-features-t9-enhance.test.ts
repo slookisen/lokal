@@ -159,6 +159,8 @@ interface FakeRun {
   status: FakeEl;
   fire: () => void;
   settle: () => Promise<void>;
+  /** T10 (FUNN t9-klientskript-testhull): any event to the page's listeners. */
+  dispatch: (type: string, ev: any) => void;
 }
 
 /**
@@ -187,6 +189,7 @@ function runScript(script: string, answer: (() => any) | "reject" | "pending", o
     submits: 0, fetches: [], assigns: [], page, form, status,
     fire: () => { for (const fn of listeners.submit || []) fn({ target: form, preventDefault() { /* */ } }); },
     settle: async () => { for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r)); },
+    dispatch: (type: string, ev: any) => { for (const fn of listeners[type] || []) fn(ev); },
   };
   class FakeFormData { constructor(public f: FakeEl) {} }
   class FakeURLSearchParams extends URLSearchParams {
@@ -351,6 +354,40 @@ export async function runOwnerFeaturesT9EnhanceTests(opts: { log?: boolean } = {
       const f = r.fetches[0];
       assertTrue(f.init.method === "POST" && /\/valg\/ordre-epost\?fragment=gruppe-orders$/.test(f.url) && f.init.credentials === "same-origin",
         `j18: the POST asks for the page's regions with ?fragment= (${f.url})`);
+    }
+    // T10 (FUNN t9-klientskript-testhull, review lokal#1411 N1): mutants M5 and M14.
+    {
+      // M5: the busy lock is released after an answer — the next submit is sent.
+      const r = runScript(S, () => fakeResponse(500));
+      r.fire();
+      await r.settle();
+      r.fire();
+      await r.settle();
+      assertEq(r.fetches.length, 2, "j19: after an answer the busy lock is released — a later submit is sent again");
+      assertTrue(!r.form.querySelector("button")!.disabled && !r.form.hasAttribute("aria-busy"), "j20: … and the form is no longer busy");
+      const n = runScript(S, "reject", { online: false });
+      n.fire();
+      await n.settle();
+      n.fire();
+      await n.settle();
+      assertEq(n.fetches.length, 2, "j21: also after no answer at all (offline) the lock is released");
+    }
+    {
+      // M14: «Avbryt» closes its panel on the client — no request, no navigation.
+      const r = runScript(S, "pending");
+      const li = r.page.querySelector("li")!;
+      const panel = li.appendChild(new FakeEl("div", { class: "mv-confirm mv-confirm-inline", role: "region" }));
+      const cancel = panel.appendChild(new FakeEl("a", { class: "ep-btn ep-btn-secondary", href: "https://rettfrabonden.com/eier/x/valg#valg-orders.email", "data-mv-cancel": "1" }));
+      let prevented = false;
+      r.dispatch("click", { target: cancel, button: 0, defaultPrevented: false, preventDefault() { prevented = true; } });
+      assertTrue(prevented && !li.contains(panel) && panel.parentNode === null, "j22: «Avbryt» removes its .mv-confirm panel on the client (the link is not followed)");
+      assertEq([r.fetches.length, r.assigns.length, r.submits], [0, 0, 0], "j23: «Avbryt» sends no request and navigates nowhere");
+      // A modified click (new tab) is left to the browser.
+      const panel2 = li.appendChild(new FakeEl("div", { class: "mv-confirm" }));
+      const cancel2 = panel2.appendChild(new FakeEl("a", { href: "https://rettfrabonden.com/eier/x/valg#niva", "data-mv-cancel": "1" }));
+      let prevented2 = false;
+      r.dispatch("click", { target: cancel2, button: 0, ctrlKey: true, defaultPrevented: false, preventDefault() { prevented2 = true; } });
+      assertTrue(!prevented2 && li.contains(panel2), "j24: a ctrl-click on «Avbryt» is left to the browser (panel kept)");
     }
   }
 

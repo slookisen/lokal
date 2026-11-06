@@ -152,7 +152,57 @@ const CONDITION_REASONS: Record<OwnerFeatureCondition, LocalizedText> = {
     no: "Synligheten kan ikke endres herfra. Kontakt kontakt@opplevagent.no.",
     en: "Visibility cannot be changed from here. Contact kontakt@opplevagent.no.",
   },
+  // T10: the fallback; the resolver names what is missing (orderRequirementText).
+  orderGateReady: {
+    no: "Profilen er ikke klar for bestillinger ennå. Kontakt kontakt@rettfrabonden.com.",
+    en: "The profile is not ready for orders yet. Contact kontakt@rettfrabonden.com.",
+  },
 };
+
+/**
+ * T10: what is missing before orders can be switched on, one text per
+ * cart-service orderReadiness() reason (the level preview's «Dette mangler»
+ * and the orderGateReady block reason).
+ */
+export const ORDER_REQUIREMENT_TEXTS: Readonly<Record<string, LocalizedText>> = {
+  owner_not_verified: {
+    no: "Profilen er ikke verifisert. Bekreft eierskapet ditt først.",
+    en: "The profile is not verified. Verify your ownership first.",
+  },
+  order_email_missing: {
+    no: "Det finnes ingen e-postadresse som bestillingene kan sendes til.",
+    en: "There is no e-mail address the orders can be sent to.",
+  },
+  order_email_suppressed: {
+    no: "E-postadressen for bestillinger kan ikke motta e-post fra oss.",
+    en: "The order e-mail address cannot receive e-mail from us.",
+  },
+  profile_not_checked: {
+    no: "Rett fra Bonden har ikke kontrollert profilen ennå. Kontakt kontakt@rettfrabonden.com.",
+    en: "Rett fra Bonden has not checked the profile yet. Contact kontakt@rettfrabonden.com.",
+  },
+  producer_not_eligible: {
+    no: "Profilen kan ikke ta imot bestillinger ennå. Kontakt kontakt@rettfrabonden.com.",
+    en: "The profile cannot accept orders yet. Contact kontakt@rettfrabonden.com.",
+  },
+};
+
+export function orderRequirementText(code: string): LocalizedText {
+  return Object.prototype.hasOwnProperty.call(ORDER_REQUIREMENT_TEXTS, code)
+    ? ORDER_REQUIREMENT_TEXTS[code]
+    : ORDER_REQUIREMENT_TEXTS.producer_not_eligible;
+}
+
+/** T10: the real-order gate with orders on (cart-service orderReadiness), loaded lazily (no import cycle). */
+export function readOrderReadiness(db: any, agentId: string): { ready: boolean; missing: string[]; orderableIfOn: number } {
+  try {
+    const cart = require("../services/cart-service") as typeof import("../services/cart-service");
+    const r = cart.orderReadiness(db, agentId);
+    return { ready: r.ready, missing: r.missing.map((m) => m.code), orderableIfOn: r.orderable_if_on };
+  } catch {
+    return { ready: false, missing: ["producer_not_eligible"], orderableIfOn: 0 };
+  }
+}
 const CONDITIONS = new Set<string>(Object.keys(CONDITION_REASONS));
 
 function requiresKeyReason(label: LocalizedText): LocalizedText {
@@ -266,10 +316,29 @@ class Resolver {
     return this.subject.vertical === "gardssalg" ? REASON_GUARANTEE_GARDSSALG : REASON_GUARANTEE;
   }
 
+  private orderGate: { met: boolean; reason: LocalizedText } | null = null;
+
   /** Is a non-key condition met for this subject? (loader state first) */
   conditionState(c: OwnerFeatureCondition): { met: boolean; reason: LocalizedText } {
     const given = this.subject.conditions?.[c];
     if (given) return { met: given.met, reason: given.reason ?? CONDITION_REASONS[c] };
+    if (c === "orderGateReady" && this.subject.vertical === "rfb") {
+      // Read only when switching on (enableRequires), once per resolver.
+      if (!this.orderGate) {
+        const r = readOrderReadiness(this.db, this.subject.subjectId);
+        const texts = r.missing.map(orderRequirementText);
+        this.orderGate = r.ready
+          ? { met: true, reason: CONDITION_REASONS.orderGateReady }
+          : {
+              met: false,
+              reason: {
+                no: `Bestillinger kan ikke slås på før dette er på plass: ${texts.map((x) => x.no).join(" ")}`,
+                en: `Orders cannot be switched on until this is in place: ${texts.map((x) => x.en).join(" ")}`,
+              },
+            };
+      }
+      return this.orderGate;
+    }
     const met = c === "verifiedOwner" ? this.subject.verifiedOwner
       : c === "isVerifiedBadge" ? this.subject.isVerifiedBadge
       : false; // stripeActive / drinkProducer / gårdssalg conditions without loader state
@@ -615,14 +684,15 @@ export function setOwnerFeatureValue(
     const v = validateOwnerFeatureValue(e, rawValue);
     if (!v.ok) return { kind: "invalid_value", reason: v.reason };
     const d = r.segmentDefault(e);
-    if (!sameValue(v.value, offValue(e, d))) {
-      const unmet = r.unmetRequirement(e) ?? r.unmetEnableRequirement(e);
-      if (unmet) return { kind: "blocked", block: "requirement_not_met", reason: unmet };
-    }
-
     // No-op: compare with the explicit value (or the default when none).
     const x = r.explicitValue(e);
     const current = x ? x.value : d;
+    if (!sameValue(v.value, offValue(e, d))) {
+      // T10: an `enableRequires` condition only stops switching ON — a value
+      // that is already on is never refused (or changed) because of it.
+      const unmet = r.unmetRequirement(e) ?? (sameValue(current, v.value) ? null : r.unmetEnableRequirement(e));
+      if (unmet) return { kind: "blocked", block: "requirement_not_met", reason: unmet };
+    }
     if (sameValue(current, v.value)) return { kind: "ok", changed: false, feature: before };
 
     const now = new Date().toISOString();

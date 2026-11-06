@@ -314,6 +314,12 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       assertTrue(checks.some((c) => c.check === "requirement_unmet:orders.enabled" && c.result === "PASS" && /409 requirement_not_met/.test(c.observed)), "run-13: unmet requirement → 409, no effect");
       assertTrue(checks.some((c) => c.check === "level:minst_mulig" && c.result === "PASS") && checks.some((c) => c.check === "level:utnytte_mulighetene" && c.result === "PASS"), "run-14: both levels = the single switches");
       assertTrue(checks.some((c) => c.check === "undo:level:minst_mulig" && c.result === "PASS"), "run-15: «Angre» on a level restores the effect");
+      for (const lv of ["minst_mulig", "utnytte_mulighetene"]) {
+        for (const kind of ["level_preview", "level_derived", "level_invariants"]) {
+          const row = checks.find((c) => c.check === `${kind}:${lv}`);
+          assertTrue(!!row && row.result === "PASS", `run-15b (T10): ${kind}:${lv} PASS (${row?.observed ?? "missing"} ${row?.reason ?? ""})`);
+        }
+      }
       assertTrue(["orders.enabled", "visibility.profile", "comms.news"].every((k) => checks.some((c) => c.check === `undo:single:${k}` && c.result === "PASS")), "run-16: «Angre» on each live switch restores the effect");
       assertTrue(checks.some((c) => c.check === "no_surface:comms.news" && c.result === "PASS"), "run-17: comms.news (no surface): write + change log");
       assertTrue(checks.some((c) => c.check === "restore" && c.result === "PASS"), "run-18: restore check PASS");
@@ -625,7 +631,7 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       assertTrue(b2.checks.filter((x) => x.check.startsWith("coming_soon:") && x.check !== `coming_soon:${csKey}`).every((x) => x.result === "PASS"), "vac-5: … the other coming_soon checks still PASS");
       assertEq([b2.restored, rawState(FIX)], [true, before], "vac-6: restored");
       // (c) the requirement not enforced → the requirement check FAILs.
-      const regReq = reg.OWNER_FEATURE_REGISTRY.map((e) => (e.key === "orders.enabled" ? { ...e, requires: [] } : e));
+      const regReq = reg.OWNER_FEATURE_REGISTRY.map((e) => (e.key === "orders.enabled" ? { ...e, requires: [], enableRequires: [] } : e));
       const noReq: import("../owner-features/switch-probe").ProbeWriteFn = (v, id, key, val, actor, o) =>
         rs.setOwnerFeatureValue(v, id, key, val, actor, key === "orders.enabled" ? { ...o, registry: regReq } : o);
       const c3 = await probe.runSwitchProbe(FIX, { db, maxWaitMs: 0, write: noReq });
@@ -633,6 +639,21 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       assertTrue(!!rq && rq.result === "FAIL", "vac-7: requirement not enforced → requirement_unmet check FAILs");
       assertEq([c3.restored, rawState(FIX)], [true, before], "vac-8: restored");
       realUntouched("vac-9");
+      // (d) T10: the fixture not ready for orders (cross-check pending) →
+      // level_preview still PASSes (hard requirement shown = the gate says no),
+      // level_derived for «Utnytte mulighetene» FAILs (the level cannot apply).
+      const vsBefore = (db.prepare("SELECT verification_status AS v FROM agent_knowledge WHERE agent_id = ?").get(FIX) as any).v;
+      db.prepare("UPDATE agent_knowledge SET verification_status = 'pending' WHERE agent_id = ?").run(FIX);
+      try {
+        const d4 = await probe.runSwitchProbe(FIX, { db, maxWaitMs: 0 });
+        const pv = d4.checks.find((x) => x.check === "level_preview:utnytte_mulighetene");
+        const dv = d4.checks.find((x) => x.check === "level_derived:utnytte_mulighetene");
+        assertTrue(!!pv && pv.result === "PASS" && /profile_not_checked/.test(pv.observed), `vac-10 (T10): not ready → level_preview PASS with the hard requirement named (${pv?.observed})`);
+        assertTrue(!!dv && dv.result === "FAIL" && /not_ready/.test(dv.reason || ""), `vac-11 (T10): not ready → level_derived:utnytte_mulighetene FAILs (${dv?.reason})`);
+        assertEq(d4.restored, true, "vac-12: restored");
+      } finally {
+        db.prepare("UPDATE agent_knowledge SET verification_status = ? WHERE agent_id = ?").run(vsBefore, FIX);
+      }
     }
 
     // ═══ Run lock is released when the setup throws ═══════════════════════
