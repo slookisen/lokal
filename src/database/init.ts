@@ -2024,6 +2024,24 @@ function initSchema(db: Database.Database): void {
     // Index already exists
   }
 
+  // ─── crm_contacts.retention_last_{inbound,outbound}_at (slettefrist slice A) ───
+  // dev-request 2026-10-12-slettefrist-korrespondanse-og-oversettelser, slice A
+  // (services/privacy-retention.ts). The nightly 24-month retention job deletes
+  // a contact's old threads/messages but KEEPS the crm_contacts row (status,
+  // agent_id, provider_id are suppression memory). Before deleting the
+  // messages it records here the latest inbound time (COALESCE(sent_at,
+  // received_at)) and the latest outbound sent_at of the deleted messages, so
+  // every lifetime «has ever replied» / «was ever contacted» reader gives the
+  // same answer after the cleanup as before (AC1). NULL = nothing deleted.
+  // Additive, idempotent ALTERs; no index (only read joined via the contact).
+  for (const col of ["retention_last_inbound_at", "retention_last_outbound_at"]) {
+    try {
+      db.exec(`ALTER TABLE crm_contacts ADD COLUMN ${col} TEXT`);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
+
   // Healing sweep, BEFORE the triggers exist: classifyEmail() used to match every
   // vertical's contacts against the RFB `agents` table, so an experiences contact
   // whose email happened to match an RFB producer got agent_id pointing at the

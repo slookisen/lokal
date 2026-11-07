@@ -53,6 +53,7 @@ import { trackSelgerHtmlOpen } from "./middleware/analytics";
 import { langMiddleware } from "./i18n/middleware";
 import { asPublicViewMiddleware } from "./middleware/as-public-view";
 import { analyticsService, shouldRunAutoPrune } from "./services/analytics-service";
+import { runPrivacyRetentionTick } from "./services/privacy-retention";
 import { mcpUsageLogger } from "./services/mcp-usage-logger";
 import { startEventLoopMonitor, requestTrackerMiddleware, trackJob, getEventLoopSummary } from "./services/event-loop-monitor";
 import { startEventLoopPersistence, pruneEventLoopEvents } from "./services/event-loop-persist";
@@ -1775,6 +1776,14 @@ app.listen(Number(PORT), HOST, async () => {
       } catch (err) {
         console.error("[event-loop-persist] prune failed (non-fatal):", err);
       }
+
+      // dev-request 2026-10-12-slettefrist-korrespondanse-og-oversettelser,
+      // slice A: 24-month retention for e-mail correspondence and send logs
+      // (services/privacy-retention.ts). PRIVACY_RETENTION_MODE=off|dry_run|
+      // apply, default dry_run (counts only, writes nothing). Batched with a
+      // setImmediate between transactions, capped per night, own running
+      // flag, starts only in 03–06 UTC. Never throws.
+      await runPrivacyRetentionTick(getDb());
 
       // Slice 4 of 2026-10-08-serverheng…: big-table indexes are built here, in
       // the 03:00 window, not at boot (services/night-indexes.ts).
