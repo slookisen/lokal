@@ -29,9 +29,20 @@ import { producerContact, producerTraderStatus, TERMS_OF_PURCHASE_URL, type Prod
 import { companyOperatorSentence } from "./company-legal";
 import { PRICE_BY_AGREEMENT, PARTIAL_SUM_LABEL, summarizePricing } from "./order-pricing";
 import { formatPickupTimeOslo, isOrderAutocompleteEnabled } from "./order-lifecycle";
+import { buyerCancelDetailSentence } from "../owner-features/order-texts";
 
 export function isBuyerReceiptsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.ORDER_BUYER_RECEIPTS_ENABLED === "1";
+}
+
+/**
+ * T12 (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 6; pakke C):
+ * «1» lets the cancellation receipt use orders.cancel_detail for its reason
+ * sentence. Default OFF until Daniel has approved text package C: off, the
+ * receipt is byte-identical to before for every order.
+ */
+export function isCancelDetailReceiptEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.ORDER_CANCEL_DETAIL_RECEIPT_ENABLED === "1";
 }
 
 type SendFn = (opts: EmailOptions) => Promise<{ success: boolean; messageId?: string; error?: string }>;
@@ -90,6 +101,8 @@ export interface ReceiptData {
   autoCloseOn?: boolean;
   /** Fase B1: the buyer's order card (/ordre/:id?ref=…); null/absent = no link line. */
   cardUrl?: string | null;
+  /** T12: orders.cancel_detail — passed only with ORDER_CANCEL_DETAIL_RECEIPT_ENABLED=1; absent = today's text. */
+  cancelDetail?: string | null;
 }
 
 /**
@@ -236,7 +249,7 @@ export function renderBuyerReceipt(event: ReceiptEvent, d: ReceiptData): Rendere
       pay = notChargedLine(p);
       break;
     case "producer_cancelled":
-      why = `${d.producerName} har kansellert bestillingen fordi den ikke kan leveres.`;
+      why = buyerCancelDetailSentence(d.cancelDetail, d.producerName) ?? `${d.producerName} har kansellert bestillingen fordi den ikke kan leveres.`;
       // A captured payment is refunded automatically (and retried by the
       // maintenance job if Stripe failed), so «captured» also gets the line.
       pay = paid ? REFUND : notChargedLine(p);
@@ -281,12 +294,12 @@ export async function sendBuyerOrderReceipt(orderId: string, event: ReceiptEvent
   try {
     const db = _testDb ?? getDb();
     const o = db.prepare(`
-      SELECT o.id, o.agent_id, o.buyer_ref, o.total_nok, o.cancel_reason, o.pickup_time, o.buyer_email AS order_email, c.buyer_email AS cart_email,
+      SELECT o.id, o.agent_id, o.buyer_ref, o.total_nok, o.cancel_reason, o.cancel_detail, o.pickup_time, o.buyer_email AS order_email, c.buyer_email AS cart_email,
              a.name AS producer_name
       FROM orders o INNER JOIN agents a ON a.id = o.agent_id LEFT JOIN carts c ON c.id = o.cart_id
       WHERE o.id = ?
     `).get(orderId) as
-      | { id: string; agent_id: string; buyer_ref: string; total_nok: number | null; cancel_reason: string | null; pickup_time: string | null; order_email: string | null; cart_email: string | null; producer_name: string }
+      | { id: string; agent_id: string; buyer_ref: string; total_nok: number | null; cancel_reason: string | null; cancel_detail: string | null; pickup_time: string | null; order_email: string | null; cart_email: string | null; producer_name: string }
       | undefined;
     if (!o) return;
     const to = plausibleEmail(o.order_email) ?? plausibleEmail(o.cart_email);
@@ -318,6 +331,8 @@ export async function sendBuyerOrderReceipt(orderId: string, event: ReceiptEvent
       autoCloseOn: isOrderAutocompleteEnabled(),
       // Fase B1: the buyer's order card, from the receipts that leave the order open.
       cardUrl: event === "submitted" || event === "confirmed" ? buyerOrderCardUrl(o.id, o.buyer_ref) : null,
+      // T12 (pakke C): the cancel detail only with its own switch on.
+      ...(isCancelDetailReceiptEnabled() ? { cancelDetail: o.cancel_detail } : {}),
     });
     if (!rendered) return;
     const replyTo = plausibleEmail(contact.email) ?? "kontakt@rettfrabonden.com";

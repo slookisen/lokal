@@ -18,6 +18,12 @@ import { randomUUID } from "crypto";
 import { soldOutChoices, stockSoftExpiryActiveFor } from "../services/stock-soft-expiry";
 import { isOrderMessagesEnabled, listOrderMessages, orderTakesMessages, ORDER_MESSAGE_MAX_CHARS, type OrderMessageRow } from "../services/order-messages";
 import { OWNER_ORDERS_THEME_CSS, ownerThemeHtml } from "../owner-ui/tokens";
+import { isBuyerReceiptsEnabled } from "../services/order-receipt-service";
+import { osloDay, osloDayStartUtc } from "../services/order-cap-notice";
+import {
+  OWNER_CANCEL_SUMMARY, OWNER_ORDER_ACTION_LABELS, OWNER_ORDER_OVERVIEW_EMPTY, OWNER_ORDER_OVERVIEW_HEADING,
+  ownerCancelChooseLine, ownerCancelledBanner, ownerNoShowFromLine, ownerOverviewMonthLine, ownerOverviewTotalLine,
+} from "../owner-features/order-texts";
 
 export type OwnerOrdersTab = "venter" | "kommende" | "avsluttet";
 export const OWNER_ORDERS_TABS: ReadonlyArray<{ key: OwnerOrdersTab; label: string }> = [
@@ -205,6 +211,11 @@ export interface RowContext {
    * view). Ignored while ORDER_MESSAGES_ENABLED is off.
    */
   messagePostTo?: string;
+  /**
+   * T12: the cancellation component (orderActionsComponentHtml) instead of
+   * today's buttons — only for a producer on OWNER_FEATURES_ALLOWED_SUBJECTS.
+   */
+  t12?: boolean;
 }
 
 const ACTION_LABEL = {
@@ -243,6 +254,13 @@ function soldOutDeclineForm(o: OwnerOrder, ctx: RowContext): string {
 
 function actionsHtml(o: OwnerOrder, ctx: RowContext): string {
   const now = ctx.now ?? new Date();
+  if (ctx.t12) {
+    return orderActionsComponentHtml({
+      orderId: o.id, agentId: o.agent_id, status: o.status, pickupTime: o.pickup_time, paymentMode: o.payment_mode,
+      confirmedAt: o.timeline.find((e) => e.to_status === "confirmed")?.created_at ?? null,
+      postTo: ctx.postTo, now, cls: MO_COMPONENT_CLASSES,
+    });
+  }
   if (o.status === "pending") {
     const pickup = `<label class="mo-pick">Hentetid (valgfritt)<input type="datetime-local" name="pickup_time" min="${nowOsloLocalMin(now)}"></label>`;
     return `<div class="mo-actions">${actionForm(ctx, "confirm", "mo-primary", pickup)}${actionForm(ctx, "decline", "mo-secondary")}${soldOutDeclineForm(o, ctx)}</div>`;
@@ -267,6 +285,177 @@ function actionsHtml(o: OwnerOrder, ctx: RowContext): string {
     return `${hint}${pickedUp}<details class="mo-menu"><summary>Flere valg</summary>${parts.join("")}</details>`;
   }
   return "";
+}
+
+// ─── T12: one cancellation component for the three order pages ─────────────
+
+/** The CSS classes of the page the component is placed on. */
+export interface OrderComponentClasses {
+  /** Wrapper of a group of buttons. */
+  actions: string;
+  form: string;
+  btn: string;
+  primary: string;
+  secondary: string;
+  hint: string;
+  /** The `<details>` holding the cancellation reasons. */
+  menu: string;
+  /** The label around the optional pickup time. */
+  pickup: string;
+}
+
+export const MO_COMPONENT_CLASSES: OrderComponentClasses = {
+  actions: "mo-actions", form: "mo-form", btn: "mo-btn", primary: "mo-primary", secondary: "mo-secondary",
+  hint: "mo-hint", menu: "mo-menu", pickup: "mo-pick",
+};
+
+export interface OrderComponentInput {
+  orderId: string;
+  agentId: string;
+  status: string;
+  pickupTime: string | null;
+  paymentMode: string | null;
+  /** The first order_events row into 'confirmed' (for «Kunden kom ikke»). */
+  confirmedAt: string | null;
+  postTo: string;
+  now: Date;
+  cls: OrderComponentClasses;
+  /** Escaped HTML put under «Kanseller bestillingen …» (the old order page's payment line). */
+  cancelExtraHtml?: string;
+}
+
+/**
+ * T12 (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 6): the order
+ * buttons of «Mine ordrer», the compact page from the e-mail and the old
+ * order page — the caller shows it only for a producer on the allowlist.
+ *
+ *   pending   : «Bekreft» (optional pickup time), «Avslå», «Avslå – utsolgt»
+ *               and «Kunden har avbestilt» (buyer_cancelled, not a decline).
+ *               «Avslå – utsolgt» and the item boxes of «Varen er utsolgt»
+ *               keep B2b-1's gate (stockSoftExpiryActiveFor + items of the
+ *               producer on the order).
+ *   confirmed : «Hentet» as the main button and right under it «Kanseller
+ *               bestillingen …» with «Varen er utsolgt», «Jeg kan ikke levere
+ *               likevel», «Kunden har avbestilt» and «Kunden kom ikke» (the
+ *               latter disabled with «Kan registreres fra {tid}.» before
+ *               noShowEarliestMs, as today).
+ *
+ * No new transitions: the posted values are mapped by t12SellerActionFrom
+ * (order-actions.ts) and the layer re-validates everything. The cancellation
+ * choices that may touch a prepayment follow cancelActionsEnabled, as today.
+ */
+export function orderActionsComponentHtml(i: OrderComponentInput): string {
+  const c = i.cls;
+  const L = OWNER_ORDER_ACTION_LABELS;
+  const form = (action: string, label: string, btnCls: string, extra = "", attrs = "") =>
+    `<form method="post" action="${esc(i.postTo)}" class="${c.form}"${attrs}><input type="hidden" name="action" value="${action}"><input type="hidden" name="idem" value="${randomUUID()}">${extra}<button type="submit" class="${c.btn} ${btnCls}">${esc(label)}</button></form>`;
+  // B2b-1's gate for the sold-out write (STOCK_SOFT_EXPIRY_ENABLED + allowlist).
+  const soldOutRule = stockSoftExpiryActiveFor(i.agentId);
+  const choices = soldOutRule ? soldOutChoices(cartServiceDb(), i.orderId, i.agentId) : [];
+  const soldOutBoxes = (): string => {
+    if (!choices.length) return "";
+    const boxes = choices.map((ch) =>
+      `<label style="display:block;padding:4px 0"><input type="checkbox" name="sold_out" value="${esc(ch.product_id)}" checked> ${esc(ch.name)}</label>`,
+    ).join("");
+    return `<fieldset style="border:1px solid #e4e2da;border-radius:8px;margin:0 0 6px;padding:6px 10px"><legend style="font-size:.9rem">Utsolgt (settes til «ikke på lager»):</legend>${boxes}</fieldset>`;
+  };
+  const cancels = cancelActionsEnabled(i.paymentMode);
+
+  if (i.status === "pending") {
+    const pickup = `<label class="${c.pickup}">Hentetid (valgfritt)<input type="datetime-local" name="pickup_time" min="${nowOsloLocalMin(i.now)}"></label>`;
+    return `<div class="${c.actions}" data-t12-actions="pending">` +
+      form("confirm", L.confirm, c.primary, pickup) +
+      form("decline", L.decline, c.secondary) +
+      // «Avslå – utsolgt» as B2b-1: only with the rule active and items of this producer on the order.
+      (choices.length ? form("decline_sold_out", L.decline_sold_out, c.secondary, soldOutBoxes(), ' data-sold-out-form="1"') : "") +
+      (cancels ? form("buyer_cancelled", L.buyer_cancelled, c.secondary) : "") +
+      `</div>`;
+  }
+  if (i.status === "confirmed" || i.status === "ready") {
+    const from = noShowEarliestMs({ pickup_time: i.pickupTime, confirmed_at: i.confirmedAt });
+    const noShowLocked = from !== null && i.now.getTime() < from;
+    const reasons: string[] = [];
+    if (cancels) {
+      reasons.push(form("cancel_sold_out", L.cancel_sold_out, c.secondary, soldOutBoxes(), choices.length ? ' data-sold-out-form="1"' : ""));
+      reasons.push(form("cancel_cannot_deliver", L.cancel_cannot_deliver, c.secondary));
+      reasons.push(form("buyer_cancelled", L.buyer_cancelled, c.secondary));
+    }
+    reasons.push(noShowLocked
+      ? `<div class="${c.form}"><button type="button" class="${c.btn} ${c.secondary}" disabled>${esc(L.no_show)}</button><p class="${c.hint}">${esc(ownerNoShowFromLine(formatPickupTimeOslo(new Date(from!).toISOString())))}</p></div>`
+      : form("no_show", L.no_show, c.secondary));
+    const autoHint = isOrderAutocompleteEnabled()
+      ? `<p class="${c.hint}">Du trenger ikke gjøre mer. Ordren avsluttes av seg selv etter henting.</p>` : "";
+    return `${autoHint}<div class="${c.actions}" data-t12-actions="confirmed">${form("complete", L.complete, c.primary)}</div>` +
+      `<details class="${c.menu}"><summary>${esc(OWNER_CANCEL_SUMMARY)}</summary>` +
+      `<p class="${c.hint}">${esc(ownerCancelChooseLine(isBuyerReceiptsEnabled()))}</p>` +
+      (i.cancelExtraHtml ? `<p class="${c.hint}">${i.cancelExtraHtml}</p>` : "") +
+      reasons.join("") + `</details>`;
+  }
+  return "";
+}
+
+/** T12: the banner text after a successful action, "" = keep the page's own banner. */
+export function t12DoneBannerText(done: string): string {
+  return done === "cancelled" ? ownerCancelledBanner(isBuyerReceiptsEnabled()) : "";
+}
+
+// ─── T12: «Bestillinger gjennom Rett fra Bonden» (the overview) ────────────
+
+export interface OwnerOrderOverview {
+  /** «november» — the current Oslo month, lower case. */
+  monthName: string;
+  /** Orders received this Oslo month (any status) and how many of them are picked up (completed). */
+  month: { received: number; pickedUp: number };
+  /** The same since the producer's first order. */
+  total: { received: number; pickedUp: number };
+}
+
+/** The UTC bounds [start, end) of the Oslo calendar month of `now`, as «YYYY-MM-DD HH:MM:SS». */
+export function osloMonthBoundsUtc(now: Date): { start: string; end: string; ym: string } {
+  const ym = osloDay(now).slice(0, 7);
+  const [y, m] = ym.split("-").map(Number) as [number, number];
+  const next = m === 12 ? `${y + 1}-01` : `${y}-${String(m + 1).padStart(2, "0")}`;
+  return {
+    start: osloDayStartUtc(new Date(`${ym}-01T12:00:00Z`)),
+    end: osloDayStartUtc(new Date(`${next}-01T12:00:00Z`)),
+    ym,
+  };
+}
+
+/**
+ * T12: the producer's orders through Rett fra Bonden — received and picked up
+ * this Oslo month and since the start. One shared function, for «Mine ordrer»
+ * now and the dashboard's Oversikt and Statistikk later (T15). Real numbers
+ * from `orders` of THIS producer only. «Received» counts every order by
+ * created_at (any status); «picked up» counts those of them with status
+ * 'completed' (the seller's «Hentet», the buyer's report or the automatic
+ * close after pickup).
+ */
+export function getOwnerOrderOverview(agentId: string, now: Date = new Date(), db: any = cartServiceDb()): OwnerOrderOverview {
+  const b = osloMonthBoundsUtc(now);
+  const r = db.prepare(`
+    SELECT COUNT(*) AS total_received,
+           COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) AS total_picked,
+           COALESCE(SUM(CASE WHEN datetime(created_at) >= ? AND datetime(created_at) < ? THEN 1 ELSE 0 END), 0) AS month_received,
+           COALESCE(SUM(CASE WHEN datetime(created_at) >= ? AND datetime(created_at) < ? AND status = 'completed' THEN 1 ELSE 0 END), 0) AS month_picked
+    FROM orders WHERE agent_id = ?
+  `).get(b.start, b.end, b.start, b.end, agentId) as
+    { total_received: number; total_picked: number; month_received: number; month_picked: number };
+  const monthName = new Intl.DateTimeFormat("nb-NO", { timeZone: "UTC", month: "long" }).format(new Date(`${b.ym}-15T12:00:00Z`));
+  return {
+    monthName,
+    month: { received: r.month_received, pickedUp: r.month_picked },
+    total: { received: r.total_received, pickedUp: r.total_picked },
+  };
+}
+
+/** T12: the overview block at the top of «Mine ordrer». */
+export function ownerOrderOverviewHtml(ov: OwnerOrderOverview): string {
+  const lines = ov.total.received === 0
+    ? `<p class="mo-hint">${esc(OWNER_ORDER_OVERVIEW_EMPTY)}</p>`
+    : `<p>${esc(ownerOverviewMonthLine(ov.monthName, ov.month.received, ov.month.pickedUp))}</p>` +
+      `<p>${esc(ownerOverviewTotalLine(ov.total.received, ov.total.pickedUp))}</p>`;
+  return `<section class="mo-block" id="mo-oversikt" aria-labelledby="mo-oversikt-h"><h2 id="mo-oversikt-h" style="font-size:1rem;margin:0 0 4px">${esc(OWNER_ORDER_OVERVIEW_HEADING)}</h2>${lines}</section>`;
 }
 
 function detailHtml(o: OwnerOrder, ctx: RowContext): string {
@@ -427,7 +616,7 @@ ${body}
 </html>`;
 }
 
-export function bannerHtml(done: string, error: string): string {
+export function bannerHtml(done: string, error: string, t12 = false): string {
   // Fase B2: the message banners exist only while the thread is switched on.
   if (isOrderMessagesEnabled()) {
     const m = messageBannerHtml(done, error, "Meldingen er sendt til kunden.");
@@ -437,6 +626,8 @@ export function bannerHtml(done: string, error: string): string {
   if (error === "allerede-hentet") return `<div class="mo-banner ok" role="status">Ordren er allerede registrert som hentet. Ingenting ble endret.</div>`;
   if (error === "ugyldig") return `<div class="mo-banner warn" role="alert">Handlingen er ikke gyldig for ordrens status akkurat nå.</div>`;
   if (error) return `<div class="mo-banner warn" role="alert">Kunne ikke oppdatere ordren. Prøv igjen.</div>`;
+  const t12Text = t12 && !error ? t12DoneBannerText(done) : "";
+  if (t12Text) return `<div class="mo-banner ok" role="status">${esc(t12Text)}</div>`;
   const labels: Record<string, string> = {
     confirmed: "Ordren er bekreftet.", declined: "Ordren er avslått.", cancelled: "Ordren er kansellert.", completed: "Ordren er registrert som hentet.", ready: "Ordren er oppdatert.",
   };
@@ -455,6 +646,8 @@ export function renderOrdersPage(opts: {
   now?: Date;
   /** T6: the shared owner theme (dark mode, token classes); allowlisted subjects only. */
   ownerTheme?: boolean;
+  /** T12: the cancellation component and the overview (allowlisted subjects only; absent = page as before). */
+  t12?: { overview: OwnerOrderOverview } | null;
 }): string {
   const base = `/eier/${encodeURIComponent(opts.agentId)}/ordrer`;
   const tabs = OWNER_ORDERS_TABS.map((t) =>
@@ -464,6 +657,7 @@ export function renderOrdersPage(opts: {
     renderOrderRow(o, {
       postTo: `${base}/${encodeURIComponent(o.id)}`, open: o.id === opts.openId, now: opts.now,
       messagePostTo: `${base}/${encodeURIComponent(o.id)}/melding`,
+      ...(opts.t12 ? { t12: true } : {}),
     }),
   ).join("\n");
   const empty = opts.orders.length ? "" : `<p class="mo-empty">${opts.tab === "venter" ? "Ingen ordrer venter på svar." : opts.tab === "kommende" ? "Ingen kommende henting." : "Ingen avsluttede ordrer ennå."}</p>`;
@@ -471,7 +665,7 @@ export function renderOrdersPage(opts: {
 <p class="mo-sub"><a href="/eier/${encodeURIComponent(opts.agentId)}/portal">← Eierportalen</a></p>
 <h1>Mine ordrer</h1>
 <p class="mo-sub">${esc(opts.producerName)}</p>
-${bannerHtml(opts.done, opts.error)}
+${opts.t12 ? `${ownerOrderOverviewHtml(opts.t12.overview)}\n` : ""}${bannerHtml(opts.done, opts.error, !!opts.t12)}
 <nav class="mo-tabs" aria-label="Ordrer">${tabs}</nav>
 ${rows}${empty}`;
   return ordersShell(`Mine ordrer · ${opts.producerName}`,
@@ -479,12 +673,12 @@ ${rows}${empty}`;
 }
 
 /** The single-order view opened from the e-mail (token). Shows that order only. */
-export function renderTokenOrderPage(o: OwnerOrder, tokenBase: string, done: string, error: string, now?: Date): string {
+export function renderTokenOrderPage(o: OwnerOrder, tokenBase: string, done: string, error: string, now?: Date, t12 = false): string {
   return ordersShell(`Ordre ${o.id.slice(0, 8)}`, `
 <h1>Henteordre hos ${esc(o.producer_name)}</h1>
 <p class="mo-sub">Ordre ${esc(o.id.slice(0, 8))}</p>
-${bannerHtml(done, error)}
-${renderOrderRow(o, { postTo: tokenBase, open: true, now })}
+${bannerHtml(done, error, t12)}
+${renderOrderRow(o, { postTo: tokenBase, open: true, now, ...(t12 ? { t12: true } : {}) })}
 <a class="mo-link" href="/eier/${encodeURIComponent(o.agent_id)}/ordrer">Se alle ordrene dine</a>
 <p class="mo-hint">Lenken er personlig for denne ordren. Ikke del den videre. Ingen betaling skjer via plattformen, med mindre forhåndsbetaling er brukt.</p>`);
 }

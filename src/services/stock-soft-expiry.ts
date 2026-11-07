@@ -201,6 +201,8 @@ export function markOrderItemsSoldOut(
   agentId: string,
   productIds: readonly string[] | null | undefined,
   now: Date = new Date(),
+  /** T12: «cancelled» for «Varen er utsolgt» on a confirmed order; the audit note says which. */
+  on: "declined" | "cancelled" = "declined",
 ): string[] {
   const wanted = new Set(productIds ?? []);
   const written: string[] = [];
@@ -211,7 +213,9 @@ export function markOrderItemsSoldOut(
       if (!setProducerAvailabilityByProductId(agentId, r.product_id, "out_of_stock", db).success) continue;
       written.push(r.product_id);
       audit(db, agentId, "products.availability", r.availability, "out_of_stock",
-        `sold out on declined order ${orderId.slice(0, 8)} (B2b-1 «Utsolgt»): ${r.product_id}`, now);
+        on === "cancelled"
+          ? `sold out on cancelled order ${orderId.slice(0, 8)} (T12 «Varen er utsolgt»): ${r.product_id}`
+          : `sold out on declined order ${orderId.slice(0, 8)} (B2b-1 «Utsolgt»): ${r.product_id}`, now);
     }
   })();
   return written;

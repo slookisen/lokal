@@ -24,14 +24,14 @@ import { verifyOwnerSession, ownerSessionAllows } from "./owner-portal";
 import {
   isCrossSiteWrite, writeGuardRefusedBody, WRITE_GUARD_REFUSED_TITLE, WRITE_GUARD_CONTACT_RFB,
 } from "../middleware/same-origin-write";
-import { applyOrderAction, type OrderAction } from "../services/order-actions";
+import { applyOrderAction, t12OrderActionsActive, t12SellerActionFrom, type OrderAction, type OrderCancelDetail } from "../services/order-actions";
 import { isOrderMessagesEnabled, postOrderMessage } from "../services/order-messages";
 import { soldOutIdsFromBody, stockSoftExpiryActiveFor } from "../services/stock-soft-expiry";
 import { isPaymentsLifecycleActive, resolvePaymentsStripeClient } from "../services/payment-service";
 import type { PaymentsStripeClient } from "../services/payment-provider";
 import {
   countOwnerOrders, listOwnerOrders, getOwnerOrder, getOwnerOrderByToken, parseTab, tabForStatus,
-  renderOrdersPage, renderTokenOrderPage, ordersShell, esc, ROW_ANCHOR, messageErrorCode,
+  renderOrdersPage, renderTokenOrderPage, ordersShell, esc, ROW_ANCHOR, messageErrorCode, getOwnerOrderOverview,
 } from "./owner-orders-view";
 
 const router = Router();
@@ -63,7 +63,15 @@ const SELLER_ACTIONS: Record<string, OrderAction> = Object.assign(Object.create(
  * sold-out write — only while the soft-expiry rule is active for the producer;
  * otherwise it is an unknown action, as before.
  */
-function sellerActionFrom(body: Record<string, unknown>, agentId: string): { action: OrderAction; soldOut: { productIds: string[] } | null } | null {
+function sellerActionFrom(
+  body: Record<string, unknown>, agentId: string,
+): { action: OrderAction; soldOut: { productIds: string[] } | null; cancelDetail?: OrderCancelDetail | null } | null {
+  // T12: the cancellation component's actions, for a producer on the allowlist
+  // (anything else falls through to today's mapping, e.g. a page opened before).
+  if (t12OrderActionsActive(agentId)) {
+    const t12 = t12SellerActionFrom(body, agentId);
+    if (t12) return t12;
+  }
   const raw = String(body["action"] || "");
   if (raw === "decline_sold_out" && stockSoftExpiryActiveFor(agentId)) {
     return { action: "decline", soldOut: { productIds: soldOutIdsFromBody(body["sold_out"]) } };
@@ -169,6 +177,8 @@ router.get("/eier/:agentId/ordrer", ownerOrdersLimiter, (req: Request, res: Resp
       agentId, producerName: agent.name, tab, counts, orders,
       openId: q(req, "o") || null, done: q(req, "done"), error: q(req, "error"),
       ownerTheme: ownerThemeFor(agentId),
+      // T12: the cancellation component and the overview, allowlisted producers only.
+      ...(t12OrderActionsActive(agentId) ? { t12: { overview: getOwnerOrderOverview(agentId) } } : {}),
     }));
   } catch (err) {
     console.error("[owner-orders] GET list failed:", err instanceof Error ? err.message : "error");
@@ -201,7 +211,10 @@ router.post("/eier/:agentId/ordrer/:orderId", ownerOrdersLimiter, express.urlenc
     const result = await applyOrderAction(
       orderId, action,
       { role: "seller", channel: "owner_portal", ref: `owner:${agentId.slice(0, 8)}` },
-      { payments: paymentsClientFor(req), idempotencyKey: idemFrom(body), pickupTime: pickupFrom(body, action), soldOut: chosen.soldOut },
+      {
+        payments: paymentsClientFor(req), idempotencyKey: idemFrom(body), pickupTime: pickupFrom(body, action), soldOut: chosen.soldOut,
+        ...(chosen.cancelDetail ? { cancelDetail: chosen.cancelDetail } : {}),
+      },
     );
     if (!result.success) {
       const cur = getOwnerOrder(agentId, orderId);
@@ -256,7 +269,8 @@ router.get("/produsent/ordre/:token/kompakt", ownerOrdersLimiter, (req: Request,
     const order = getOwnerOrderByToken(token);
     if (!order) return notFoundPage(res);
     noStore(res);
-    return res.send(renderTokenOrderPage(order, `/produsent/ordre/${encodeURIComponent(token)}/kompakt`, q(req, "done"), q(req, "error")));
+    return res.send(renderTokenOrderPage(order, `/produsent/ordre/${encodeURIComponent(token)}/kompakt`, q(req, "done"), q(req, "error"),
+      undefined, t12OrderActionsActive(order.agent_id)));
   } catch (err) {
     console.error("[owner-orders] GET token view failed:", err instanceof Error ? err.message : "error");
     noStore(res);
@@ -280,7 +294,10 @@ router.post("/produsent/ordre/:token/kompakt", ownerOrdersLimiter, express.urlen
     const result = await applyOrderAction(
       order.id, action,
       { role: "seller", channel: "producer_page", ref: `token:${order.id.slice(0, 8)}` },
-      { payments: paymentsClientFor(req), idempotencyKey: idemFrom(body), pickupTime: pickupFrom(body, action), soldOut: chosen.soldOut },
+      {
+        payments: paymentsClientFor(req), idempotencyKey: idemFrom(body), pickupTime: pickupFrom(body, action), soldOut: chosen.soldOut,
+        ...(chosen.cancelDetail ? { cancelDetail: chosen.cancelDetail } : {}),
+      },
     );
     if (!result.success) {
       const cur = getOwnerOrderByToken(token);
