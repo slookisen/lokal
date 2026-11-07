@@ -5,7 +5,7 @@ import {
   verifyOwnerSession, isVerifiedOwner, OWNER_NOT_VERIFIED_MESSAGE, portalWriteRefusedPage,
   portalShell, ownerNotVerifiedPage,
   ownerOrderEmailEnabledFor, currentOrderRecipient, pendingOrderEmailChange, requestOwnerOrderEmailChange,
-  parseResumeDate, ownerUnifiedSessionEnabledFor,
+  parseResumeDate, ownerUnifiedSessionEnabledFor, ownerEmailNeedsClaimantLoginPage,
 } from "./owner-portal";
 import { isCrossSiteWrite } from "../middleware/same-origin-write";
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
@@ -766,6 +766,7 @@ router.post("/eier/:agentId/valg/ordre-epost", express.urlencoded({ extended: fa
       console.log(`[owner-features] owner requested a new order address for agent ${agentId} (page)`);
       return back("ordre_epost_sendt");
     }
+    if (out.status === 403 && out.body?.error === "claimant_login_required") return res.status(403).send(ownerEmailNeedsClaimantLoginPage(agentId, "order_email"));
     const mapped = ORDER_EMAIL_MESSAGES[String(out.body?.error || "")];
     if (mapped) return back(mapped);
     return back("ordre_epost_feil");
