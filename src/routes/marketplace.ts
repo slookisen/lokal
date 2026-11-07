@@ -69,6 +69,7 @@ import { setProducerAvailabilityByProductId } from "../services/supply-graph";
 import { renderPage, shouldEscalateToRender } from "../services/render-page";
 import { normalizeOpeningHours, entryDaysLabel } from "../utils/opening-hours";
 import { issueOwnerSessionForSelgerLogin } from "./owner-portal";
+import { revokeOwnerAccessExceptVerifiedOwners } from "../services/owner-access-revocation";
 import { HOMEPAGE_CONTACT_PROVENANCE_EXCLUSION_SQL } from "../services/homepage-contact-provenance";
 import {
   publicFieldChoices, publicFieldChoicesForMany, withoutHiddenContact, withoutHiddenFields, publicAgentInfo,
@@ -2423,19 +2424,29 @@ router.post("/agents/:id/unclaim", (req: Request, res: Response) => {
 
   try {
     const db = getDb();
-    // Remove this specific claim
-    db.prepare("DELETE FROM agent_claims WHERE agent_id = ? AND claim_token = ?").run(agentId, claimToken);
+    // One transaction: the claim goes and the login rows go with it, or
+    // neither does (dev-request 2026-11-06-rfb-krav-for-portal-og-okter-ved-
+    // eierskifte, spec point 2).
+    db.transaction(() => {
+      // Remove this specific claim
+      db.prepare("DELETE FROM agent_claims WHERE agent_id = ? AND claim_token = ?").run(agentId, claimToken);
 
-    // Check if any other verified claims remain for this agent
-    const remainingClaims = db.prepare(
-      "SELECT COUNT(*) as c FROM agent_claims WHERE agent_id = ? AND status = 'verified'"
-    ).get(agentId) as any;
+      // Check if any other verified claims remain for this agent
+      const remainingClaims = db.prepare(
+        "SELECT COUNT(*) as c FROM agent_claims WHERE agent_id = ? AND status = 'verified'"
+      ).get(agentId) as any;
 
-    if (remainingClaims.c === 0) {
-      // No owners left — reset verified status and data source
-      db.prepare("UPDATE agents SET is_verified = 0 WHERE id = ?").run(agentId);
-      db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ?").run(agentId);
-    }
+      if (remainingClaims.c === 0) {
+        // No owners left — reset verified status and data source
+        db.prepare("UPDATE agents SET is_verified = 0 WHERE id = ?").run(agentId);
+        db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ?").run(agentId);
+      }
+
+      // /eier sessions and open login links for the profile end here. A
+      // remaining verified co-owner keeps theirs (still an owner); with no
+      // owner left, every row for the profile is revoked.
+      revokeOwnerAccessExceptVerifiedOwners(db, agentId, "unclaim");
+    })();
 
     // Recalculate trust score
     trustScoreService.update(agentId);
@@ -2463,20 +2474,28 @@ router.post("/admin/agents/:id/reset-claim", (req: Request, res: Response) => {
 
   try {
     const db = getDb();
-    db.prepare("UPDATE agents SET is_verified = 0 WHERE id = ?").run(agentId);
-    // Ownership given by the order activation link (skive 2) is revoked here
-    // too; other claimed_via stamps are left as before.
-    db.prepare("UPDATE agents SET claimed_at = NULL, claimed_via = NULL WHERE id = ? AND claimed_via = 'activation_link'").run(agentId);
-    db.prepare("DELETE FROM agent_claims WHERE agent_id = ?").run(agentId);
-    db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ?").run(agentId);
-    // S1b punkt 7 (dev-request 2026-10-22-rfb-mine-valg-eierbrytere): a
-    // pending owner change of the order e-mail belongs to the old owner —
-    // kill it. Best-effort: a DB without the table never breaks reset-claim.
-    try {
-      db.prepare(
-        "UPDATE owner_order_email_change SET outcome = 'superseded', consumed_at = ? WHERE agent_id = ? AND outcome IS NULL AND consumed_at IS NULL"
-      ).run(new Date().toISOString(), agentId);
-    } catch { /* table missing — nothing pending */ }
+    // One transaction: ownership reset and login-row revocation succeed or
+    // fail together, so a reset never leaves the old owner's sessions live
+    // (dev-request 2026-11-06-rfb-krav-for-portal-og-okter-ved-eierskifte).
+    db.transaction(() => {
+      db.prepare("UPDATE agents SET is_verified = 0 WHERE id = ?").run(agentId);
+      // Ownership given by the order activation link (skive 2) is revoked here
+      // too; other claimed_via stamps are left as before.
+      db.prepare("UPDATE agents SET claimed_at = NULL, claimed_via = NULL WHERE id = ? AND claimed_via = 'activation_link'").run(agentId);
+      db.prepare("DELETE FROM agent_claims WHERE agent_id = ?").run(agentId);
+      db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ?").run(agentId);
+      // S1b punkt 7 (dev-request 2026-10-22-rfb-mine-valg-eierbrytere): a
+      // pending owner change of the order e-mail belongs to the old owner —
+      // kill it. Best-effort: a DB without the table never breaks reset-claim.
+      try {
+        db.prepare(
+          "UPDATE owner_order_email_change SET outcome = 'superseded', consumed_at = ? WHERE agent_id = ? AND outcome IS NULL AND consumed_at IS NULL"
+        ).run(new Date().toISOString(), agentId);
+      } catch { /* table missing — nothing pending */ }
+      // Every /eier session and open login link for the profile (no verified
+      // owner remains after the DELETE above).
+      revokeOwnerAccessExceptVerifiedOwners(db, agentId, "reset-claim");
+    })();
     trustScoreService.update(agentId);
     res.json({ success: true, message: "Claim and verification reset" });
   } catch (err: any) {

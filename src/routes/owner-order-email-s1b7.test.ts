@@ -396,6 +396,13 @@ export async function runOwnerOrderEmailS1b7Tests(opts: { log?: boolean } = {}):
           .run(crypto.createHash("sha256").update(th).digest("hex"));
         const late2 = await confirmPost(th);
         assertEq([late2.status, overrideCol()], [400, "eier-borte@s1b7.example.no"], "reset-5: ownership binding rejects it on its own too");
+        // dev-request 2026-11-06-rfb-krav-for-portal-og-okter-ved-eierskifte:
+        // reset-claim revoked owner A's session; owner B logs in afresh and
+        // the rest of this file runs on B's session.
+        assertEq((await request(OWNED_ID, "etter-reset@s1b7.example.no")).status, 401, "reset-6: A's old session is revoked by reset-claim");
+        tokens[OWNED_ID] = `tok-${OWNED_ID}-b`;
+        db.prepare("INSERT INTO magic_links (id, email, token, agent_id, used, created_at, expires_at) VALUES (?, ?, ?, ?, 1, ?, ?)")
+          .run(`mlsess_${OWNED_ID}_b`, "eier-b@s1b7.example.no", tokens[OWNED_ID], OWNED_ID, new Date().toISOString(), new Date(Date.now() + 86_400_000).toISOString());
       } finally {
         if (prevAdminKey === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = prevAdminKey;
       }
