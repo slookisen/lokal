@@ -53,6 +53,7 @@ import { isValidLatLng, resolveSearchRadiusKm, formatPlaceLabel } from "../utils
 import { capFreeText } from "../utils/free-text";
 import { getDb } from "../database/init";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
+import { withoutSellerEmailAlways } from "../services/conversation-email-guard";
 import { getTrafficStats, getTrafficStatsSnapshot } from "../services/traffic-stats";
 import { publicTrafficYearBlock, TRAFFIC_YEAR_KEYS, trafficYearCell, trafficYearLangOf, type TrafficYearKey } from "../services/traffic-year-compute";
 import { aiDeliveriesYearPeriodLabel } from "../services/profile-year-compute";
@@ -1232,7 +1233,11 @@ function producerCardMediumRich(a: any, knowledge: any, lang: Lang = "no"): stri
 
 function buildConversationShowcase(_lang: Lang = "no"): string {
   try {
-    const convs = conversationService.listConversations({ limit: 3 });
+    // S-A5 (dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting):
+    // the front page is the same for every visitor, so with
+    // EMAIL_REVEAL_GUARD_RFB on the reply preview never shows the seller's ✉️
+    // line (services/conversation-email-guard.ts; no budget spent). Off: as before.
+    const convs = withoutSellerEmailAlways(conversationService.listConversations({ limit: 3 }));
     if (convs.length === 0) return "";
 
     const sourceLabels: Record<string, string> = {
