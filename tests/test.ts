@@ -46105,6 +46105,25 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-12-slettefrist-korrespondanse-og-oversettelser, slice C:
+// POST /admin/privacy/erasure-by-email (src/routes/admin-privacy-erasure.ts) —
+// art. 17 erasure by e-mail, dry-run by default (AC3). Own in-memory DB seam.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-12-slettefrist (slice C): admin-privacy-erasure ──");
+  try {
+    const { runAdminPrivacyErasureTests } = require("../src/routes/admin-privacy-erasure.test") as
+      typeof import("../src/routes/admin-privacy-erasure.test");
+    const pe = await runAdminPrivacyErasureTests({ log: false });
+    passed += pe.passed;
+    failed += pe.failed;
+    for (const f of pe.failures) failures.push("admin-privacy-erasure: " + f);
+    console.log(`  admin-privacy-erasure: ${pe.passed} passed, ${pe.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-privacy-erasure: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-23-crm-house-bucket-kimaere-opprydding, slice 3:
 // GET /admin/crm-chimera-contacts-diagnose
 // (src/routes/admin-crm-chimera-contacts-diagnose.ts) — the remaining

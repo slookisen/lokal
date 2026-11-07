@@ -6375,6 +6375,30 @@ function initSchema(db: Database.Database): void {
     console.error("Migration rfb_marketing_lane_state/rfb_marketing_send_ledger failed:", err);
   }
 
+  // ─── privacy_erasure_audit (dev-request 2026-10-12-slettefrist-
+  // korrespondanse-og-oversettelser, slice C) ─────────────────────────
+  // One row per APPLIED art. 17 erasure by POST /admin/privacy/erasure-by-email
+  // (routes/admin-privacy-erasure.ts), written in the same transaction as the
+  // DELETEs. Holds a keyed hash of the normalized address, never the address.
+  // Insert-only; dry-runs write nothing. Purely additive.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS privacy_erasure_audit (
+        id TEXT PRIMARY KEY,
+        requested_at TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        requested_by TEXT,
+        email_hash TEXT NOT NULL,
+        include_suppression INTEGER NOT NULL DEFAULT 0,
+        counts_json TEXT NOT NULL,
+        total_rows INTEGER NOT NULL
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_privacy_erasure_audit_hash ON privacy_erasure_audit(email_hash)`);
+  } catch (err) {
+    console.error("Migration privacy_erasure_audit failed:", err);
+  }
+
   // ─── profile_ai_deliveries (dev-request 2026-10-14-med-i-ai-svar-per-profil, S1) ───
   // «Med i AI-svar»: how many times each profile was sent to an AI assistant,
   // per UTC day x channel (ai_page_list | ai_page_profile | mcp | a2a) x AI

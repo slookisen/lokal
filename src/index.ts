@@ -156,6 +156,7 @@ import adminDodBulkRoutes from "./routes/admin-dod-bulk";
 import adminRfbContactExtractionRoutes from "./routes/admin-rfb-contact-extraction";
 import adminAgentsPendingVerifyUnparkRoutes from "./routes/admin-agents-pending-verify-unpark";
 import adminCrmChimeraAgentClearRoutes from "./routes/admin-crm-chimera-agent-clear";
+import adminPrivacyErasureRoutes from "./routes/admin-privacy-erasure";
 import adminCrmChimeraContactsDiagnoseRoutes from "./routes/admin-crm-chimera-contacts-diagnose";
 import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside-cleanup";
 import adminDentalMarkInactiveRoutes from "./routes/admin-dental-mark-inactive";
@@ -1109,6 +1110,11 @@ app.use("/admin/field-spot-check", adminLimiter, adminFieldSpotCheckRoutes);
 // contaminated fields. Dry-run by default; apply=true writes.
 // POST /admin/crm-chimera-agent-clear
 app.use("/admin/crm-chimera-agent-clear", adminLimiter, adminCrmChimeraAgentClearRoutes);
+// dev-request 2026-10-12-slettefrist-korrespondanse-og-oversettelser, slice C:
+// GDPR art. 17 erasure of one e-mail address's correspondence. Dry-run by
+// default; {apply:true} deletes in one transaction + privacy_erasure_audit row.
+// POST /admin/privacy/erasure-by-email
+app.use("/admin/privacy", adminLimiter, adminPrivacyErasureRoutes);
 // dev-request 2026-07-23-crm-house-bucket-kimaere-opprydding, slice 3: the
 // remaining 13-contact diagnosis half. Read-only, dry-run-only — NO apply
 // mode at all, zero writes. Enumerates crm_contacts rows still on the
