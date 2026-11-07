@@ -368,7 +368,7 @@ export function runContactFormDetectorTests(opts: { log?: boolean } = {}): TestS
     assertEq(only(page(FORM), "https://www.sub.gard.no/k", "https://sub.gard.no")?.sameSiteAsProducer, true, "B2: www of own host");
     assertEq(only(page(FORM), "https://gard.no/k", "https://www.gard.no")?.sameSiteAsProducer, true, "B2: www. stripped from producer");
     assertEq(only(page(ABS("https://skjema.sub.gard.no/x")), "https://sub.gard.no/k", "https://sub.gard.no")?.sameSiteAsProducer, true, "B2: subdomain of own host");
-    assertEq(producerOwnHost("https://www.Sub.Gard.no/om"), "sub.gard.no", "B2: producerOwnHost keeps subdomains, strips www.");
+    assertEq(producerOwnHost("https://www.Sub.Gard.no/"), "sub.gard.no", "B2: producerOwnHost keeps subdomains, strips www.");
     assertEq(producerOwnHost("https://co.uk"), null, "B2: bare public suffix is nobody's host");
     assertEq(producerOwnHost("https://www.facebook.com/gard"), null, "B2: social platform is never the producer's host");
     assertEq(urlIsOnProducerHost("https://gard.priv.no/x", "other.priv.no"), false, "B2: other.priv.no");
@@ -491,10 +491,142 @@ export function runContactFormDetectorTests(opts: { log?: boolean } = {}): TestS
     assertEq(f?.fields.map((x) => x.name), ["e", "gjest's-melding"], "N8: unquoted value keeps its apostrophe");
   }
 
-  // 23b. Review B3: an unquoted "<" inside a tag ends that tag attempt; the next tag is read.
+  // 23b. Review r2 B1: an unquoted "<" inside a tag is a plain character, as
+  // in a browser — `<b <form action="/a">` is ONE <b> tag (attributes "<form"
+  // and "action"), so there is no form.
   {
     const s = detectContactForms(page(`<b <form action="/a"><input type="email" name="e"><textarea name="m"></textarea></form>`), PAGE, SITE);
-    assertEq([s.formsTotal, s.forms[0]?.action], [1, "https://www.gard.no/a"], "B3: '<b <form' → the form is still a tag");
+    assertEq([s.formsTotal, s.forms.length], [0, 0], "r2 B1: '<b <form' is one <b> tag, no form");
+  }
+
+  // 23c. Review r2 B1: "<" inside a tag must not hide formaction, <base>,
+  // the form's action or </form>. Each case posts to evil.com in a browser.
+  {
+    const FIELDS = `<input type="email" name="e"><textarea name="m"></textarea>`;
+    const cases: Array<[string, string]> = [
+      [
+        "formaction after data-x=a<b",
+        `<form action="/send" method="post">${FIELDS}<button formaction="https://evil.com" data-x=a<b>Send</button></form>`,
+      ],
+      [
+        "data-x=a<b before formaction",
+        `<form action="/send" method="post">${FIELDS}<button data-x=a<b formaction="https://evil.com/x">Send</button></form>`,
+      ],
+      [
+        "input type=submit formaction with a<b",
+        `<form action="/send" method="post">${FIELDS}<input type=submit data-x=a<b formaction=https://evil.com></form>`,
+      ],
+      ["base href with a<b", `<base data-x=a<b href="https://evil.com/"><form action="send" method="post">${FIELDS}</form>`],
+      ["form action with a<b", `<form data-x=a<b action="https://evil.com/send" method="post">${FIELDS}</form>`],
+      ["form action with bare < attribute", `<form < action="https://evil.com/send" method="post">${FIELDS}</form>`],
+      [
+        "</form> with a<b, button after it",
+        `<form id="k" action="/send" method="post">${FIELDS}<div data-x=a<b></div><button formaction="https://evil.com">Send</button></form>`,
+      ],
+      [
+        "fake </form> inside a tag with a<b",
+        `<form action="/send" method="post">${FIELDS}<p data-x=a<b title=</form>></p><button formaction="https://evil.com">Send</button></form>`,
+      ],
+      [
+        "</form_x> is not </form>",
+        `<form action="/send" method="post">${FIELDS}</form_x><button formaction="https://evil.com">Send</button></form>`,
+      ],
+      [
+        "bogus comment <! … > hides a </form>",
+        `<form action="/send" method="post">${FIELDS}<! </form> ><button formaction="https://evil.com">Send</button></form>`,
+      ],
+      [
+        "first <base href> wins",
+        `<base href="https://evil.com/"><base href="https://www.gard.no/"><form action="send" method="post">${FIELDS}</form>`,
+      ],
+    ];
+    for (const [name, body] of cases) {
+      const s = detectContactForms(page(body), PAGE, SITE);
+      assertEq(s.forms.length, 1, `r2 B1: ${name} — form found`);
+      assertEq(s.forms[0]?.sameSiteAsProducer, false, `r2 B1: ${name} — not same-site`);
+      assertEq(s.forms[0]?.skipReason, "annet_domene", `r2 B1: ${name} — skip annet_domene`);
+    }
+    // The resolved URLs, so the test pins WHY it is not same-site.
+    const f1 = only(page(cases[0]![1]));
+    assertEq(f1?.submitActions.map((a) => a.action), ["https://evil.com/"], "r2 B1: formaction read past a<b");
+    const fb = only(page(cases[3]![1]));
+    assertEq(fb?.action, "https://evil.com/send", "r2 B1: <base href> read past a<b");
+    const ff = only(page(cases[4]![1]));
+    assertEq(ff?.action, "https://evil.com/send", "r2 B1: form action read past a<b");
+    // A harmless "<" in a value keeps an own-site form same-site.
+    const ok = only(page(`<form action="/send" method="post">${FIELDS}<button data-x=a<b>Send</button></form>`));
+    assertEq([ok?.sameSiteAsProducer, ok?.skipReason], [true, null], "r2 B1: a<b alone keeps own-site form usable");
+    // Fail closed: the page ends inside a tag → no form on it is same-site.
+    const cut = detectContactForms(page(`<form action="/send" method="post">${FIELDS}</form>`) + `<button form=x formaction="https://evil.com"`, PAGE, SITE);
+    assertEq([cut.forms.length, cut.forms[0]?.sameSiteAsProducer], [1, false], "r2 B1: unterminated tag → fail closed");
+    const cutQ = detectContactForms(page(`<form action="/send" method="post">${FIELDS}</form><p title="never closed>`), PAGE, SITE);
+    assertEq(cutQ.forms[0]?.sameSiteAsProducer, false, "r2 B1: unclosed quoted value → fail closed");
+    // Truncated at the size limit → fail closed too.
+    const big = page(`<form action="/send" method="post">${FIELDS}</form>`) + " ".repeat(CONTACT_FORM_MAX_HTML_CHARS);
+    assertEq(detectContactForms(big, PAGE, SITE).forms[0]?.sameSiteAsProducer, false, "r2 B1: truncated page → fail closed");
+    // Attribute parsing follows the browser: quotes only after "=", first wins, "=" may start a name.
+    const q = only(page(`<form action="/send" method="post">${FIELDS}<button =" formaction="https://evil.com">S</button></form>`));
+    assertEq(q?.sameSiteAsProducer, false, "r2 B1: '=\"' as attribute name does not swallow formaction");
+    const dup = only(page(`<form action="https://evil.com/" action="/send" method="post">${FIELDS}</form>`));
+    assertEq(dup?.action, "https://evil.com/", "r2 B1: duplicate attribute — first wins");
+    const sc = only(page(`<form action="/send"/method="post">${FIELDS}</form>`));
+    assertEq([sc?.action, sc?.method], ["https://www.gard.no/send", "post"], "r2 B1: '/' between attributes");
+  }
+
+  // 23d. Review r2 B2: a website with a path on an unknown host is not the
+  // producer's own host; a root website is.
+  {
+    const PORTAL = "https://www.lokalmatportal.no/produsent/gard";
+    const FORM = `<form action="/send" method="post"><input type="email" name="e"><textarea name="m"></textarea></form>`;
+    assertEq(producerOwnHost(PORTAL), null, "r2 B2: deep page on an unknown host has no own host");
+    const deep = detectContactForms(page(FORM), "https://www.lokalmatportal.no/kontakt", PORTAL);
+    assertEq([deep.producerDomain, deep.forms[0]?.sameSiteAsProducer, deep.forms[0]?.skipReason], [null, false, "annet_domene"], "r2 B2: portal form is not the producer's");
+    const deepSame = detectContactForms(page(FORM), "https://www.lokalmatportal.no/produsent/gard", PORTAL);
+    assertEq(deepSame.forms[0]?.sameSiteAsProducer, false, "r2 B2: even on the producer's own portal page");
+    assertEq(producerOwnHost("https://www.gard.no/"), "gard.no", "r2 B2: root website with /");
+    assertEq(producerOwnHost("gard.no"), "gard.no", "r2 B2: bare root website");
+    assertEq(producerOwnHost("https://www.gard.no/no"), "gard.no", "r2 B2: language root /no counts as root");
+    assertEq(producerOwnHost("https://www.gard.no/?ref=x#top"), "gard.no", "r2 B2: query/fragment ignored");
+    const root = detectContactForms(page(FORM), "https://www.gard.no/kontakt", "https://www.gard.no/");
+    assertEq([root.producerDomain, root.forms[0]?.sameSiteAsProducer], ["gard.no", true], "r2 B2: root website → own-host match");
+  }
+
+  // 23e. Review r2 B3: `form=` buttons belong only to the FIRST form with that
+  // id; many forms sharing an id with many such buttons stay fast.
+  {
+    const FIELDS = `<input type="email" name="e"><textarea name="m"></textarea>`;
+    const s = detectContactForms(
+      page(`<form id="k" action="/a">${FIELDS}</form><form id="k" action="/b">${FIELDS}</form><button form="k" formaction="https://evil.com">S</button>`),
+      PAGE,
+      SITE,
+    );
+    assertEq(
+      s.forms.map((f) => [f.action, f.sameSiteAsProducer]),
+      [["https://www.gard.no/a", false], ["https://www.gard.no/b", true]],
+      "r2 B3: form= button only on the first form with the id",
+    );
+    const unit = `<form id="x">${FIELDS}</form>`;
+    const btn = `<button form="x" formaction="/ok">S</button>`;
+    const k = Math.floor(CONTACT_FORM_MAX_HTML_CHARS / 2 / unit.length);
+    const kb = Math.floor(CONTACT_FORM_MAX_HTML_CHARS / 2 / btn.length);
+    const html = unit.repeat(k) + btn.repeat(kb);
+    const t0 = Date.now();
+    const r = detectContactForms(html, PAGE, SITE);
+    const ms = Date.now() - t0;
+    if (log) console.log(`    timing r2 B3 shared id: ${k} forms + ${kb} buttons, ${html.length} chars in ${ms} ms`);
+    assertEq(ms < 2000, true, `r2 B3: ${k} forms sharing an id + ${kb} form= buttons (${html.length} chars) under 2 s`);
+    assertEq([r.formsTotal, r.forms[0]?.submitActions.length, r.forms[1]?.submitActions.length], [k, kb, 0], "r2 B3: buttons counted once, on the first form");
+  }
+
+  // 23f. Review N4: method=dialog (form or formmethod) sends nothing → skip.
+  {
+    const FIELDS = `<input type="email" name="e"><textarea name="m"></textarea>`;
+    const d = only(page(`<form method="dialog">${FIELDS}</form>`));
+    assertEq([d?.method, d?.skipReason], ["dialog", "metode_dialog"], "N4: method=dialog → metode_dialog");
+    const fm = only(page(`<form method="post" action="/send">${FIELDS}<button formmethod="dialog">Lukk</button></form>`));
+    assertEq(fm?.skipReason, "metode_dialog", "N4: formmethod=dialog → metode_dialog");
+    const cap = only(page(`<form method="dialog">${FIELDS}<div class="g-recaptcha"></div></form>`));
+    assertEq(cap?.skipReason, "captcha", "N4: captcha still wins over dialog");
   }
 
   // 24. Review B3: tokenizing is linear — 2 MB of adversarial input in well under 2 s each.

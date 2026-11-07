@@ -16,13 +16,15 @@
 // It is deliberately conservative: anything it is unsure about makes a form
 // MORE likely to be skipped (captcha anywhere on the page, a "*" in a label =
 // required, an unknown producer host = not same-site, a submit button posting
-// elsewhere = not same-site), never less.
+// elsewhere = not same-site, a page that ends inside a tag or is cut at the
+// size limit = not same-site), never less.
 //
 // "Same site" means the producer's OWN host (leading "www." stripped) or a
 // subdomain of it — never a sibling, a parent, or anything else that merely
-// shares a registrable domain or hosting suffix (review B2, 2026-11-05).
+// shares a registrable domain or hosting suffix (review B2, 2026-11-05) —
+// and only when the producer's website is a front page (review r2 B2).
 
-import { isHostedPlatformHost, normalizeHost, registrableDomain, stripWww, websiteHost } from "./claim-domain-rule";
+import { isHostedPlatformHost, isRootWebsite, normalizeHost, registrableDomain, stripWww, websiteHost } from "./claim-domain-rule";
 
 export type ContactFieldRole =
   | "name"
@@ -42,7 +44,8 @@ export type ContactFormSkipReason =
   | "telefon_paakrevd"
   | "melding_for_lang"
   | "mangler_meldingsfelt"
-  | "mangler_epostfelt";
+  | "mangler_epostfelt"
+  | "metode_dialog";
 
 export interface ContactFormField {
   /** The `name` attribute (what the form submits), or null when absent. */
@@ -138,21 +141,6 @@ export function decodeEntities(s: string): string {
   });
 }
 
-function parseAttrs(raw: string): Attrs {
-  const attrs: Attrs = new Map();
-  // Quotes only delimit a value right after "="; an unquoted value runs to
-  // whitespace, so `alt=Ola's` is one value (review N8), as in browsers.
-  const re = /([^\s"'>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(raw)) !== null) {
-    const key = m[1]!.toLowerCase();
-    if (attrs.has(key)) continue; // first wins, as in HTML
-    const val = m[2] ?? m[3] ?? m[4] ?? "";
-    attrs.set(key, decodeEntities(val));
-  }
-  return attrs;
-}
-
 /**
  * Elements whose content is not markup: raw text (script, style, xmp, iframe,
  * noembed, noframes, noscript — a scripting browser), escapable raw text
@@ -163,70 +151,144 @@ const RAW_TEXT_TAGS: ReadonlySet<string> = new Set([
   "script", "style", "textarea", "title", "xmp", "noscript", "template", "iframe", "noembed", "noframes",
 ]);
 
+/** HTML whitespace (CR included: the input is not newline-normalized). */
 function isWs(c: number): boolean {
   return c === 32 || c === 9 || c === 10 || c === 12 || c === 13;
 }
 
+function isAsciiAlpha(c: number): boolean {
+  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
+
+interface TagRest {
+  /** Index just past the ">" that ends the tag. */
+  end: number;
+  attrs: Attrs;
+}
+
 /**
- * Tokenize `html` into open/close tags and text. Comments are dropped;
- * raw-text element bodies are one text token.
+ * Read the rest of a tag — attributes up to the ">" that ends it — starting
+ * right after the tag name, with the HTML tokenizer's attribute states
+ * (review r2 B1). As in a browser, "<", quotes not right after "=", "=" at
+ * the start of a name and "`" are ordinary characters; only ">" outside a
+ * quoted value ends the tag. Returns null when the input ends inside the tag
+ * (a browser drops such a tag and everything after it).
  *
- * Linear time (review B3): the old single regex rescanned the rest of the
- * input for every "<" that had no ">", so `"<a".repeat(n)` was quadratic.
- * Here a tag ends at the first ">" outside a quoted attribute value; an
- * unquoted "<" inside a tag makes that "<" plain text (conservative — a
- * browser would keep going). Each scan position is marked in `seen` per
- * state; a scan only revisits a position after an earlier scan through it
- * FAILED (a successful scan moves the cursor past its ">"), and a scan that
- * reaches a failed position stops there, so every character is scanned
- * O(1) times. Quoted values are skipped with indexOf; consecutive quotes of
- * one kind bound disjoint intervals, so that is linear too.
+ * Linear in the characters consumed: one forward pass, quoted values are
+ * skipped with indexOf.
  */
-function tokenize(html: string): Token[] {
+function readTagRest(html: string, p: number): TagRest | null {
+  const n = html.length;
+  const attrs: Attrs = new Map();
+  let name = "";
+  let haveAttr = false;
+  const commit = (value: string): void => {
+    if (haveAttr && !attrs.has(name)) attrs.set(name, decodeEntities(value)); // first wins, as in HTML
+    haveAttr = false;
+    name = "";
+  };
+  // States: 0 before-attr-name, 1 attr-name, 2 after-attr-name, 3 before-attr-value,
+  // 4 after-quoted-value, 5 self-closing-start.
+  let state = 0;
+  while (p < n) {
+    const c = html.charCodeAt(p);
+    switch (state) {
+      case 0: // before attribute name
+        if (isWs(c)) p++;
+        else if (c === 47 /* / */) { state = 5; p++; }
+        else if (c === 62 /* > */) return { end: p + 1, attrs };
+        else { haveAttr = true; name = String.fromCharCode(c).toLowerCase(); state = 1; p++; } // "=" too
+        break;
+      case 1: // attribute name
+        if (isWs(c)) { state = 2; p++; }
+        else if (c === 47) { commit(""); state = 5; p++; }
+        else if (c === 62) { commit(""); return { end: p + 1, attrs }; }
+        else if (c === 61 /* = */) { state = 3; p++; }
+        else { name += String.fromCharCode(c).toLowerCase(); p++; }
+        break;
+      case 2: // after attribute name
+        if (isWs(c)) p++;
+        else if (c === 47) { commit(""); state = 5; p++; }
+        else if (c === 61) { state = 3; p++; }
+        else if (c === 62) { commit(""); return { end: p + 1, attrs }; }
+        else { commit(""); state = 0; }
+        break;
+      case 3: { // before attribute value
+        if (isWs(c)) { p++; break; }
+        if (c === 34 /* " */ || c === 39 /* ' */) {
+          const close = html.indexOf(c === 34 ? '"' : "'", p + 1);
+          if (close < 0) return null;
+          commit(html.slice(p + 1, close));
+          state = 4;
+          p = close + 1;
+          break;
+        }
+        if (c === 62) { commit(""); return { end: p + 1, attrs }; }
+        // Unquoted value: runs to whitespace or ">" ("<", quotes, "=" are plain).
+        let j = p;
+        while (j < n && !isWs(html.charCodeAt(j)) && html.charCodeAt(j) !== 62) j++;
+        if (j >= n) return null;
+        commit(html.slice(p, j));
+        if (html.charCodeAt(j) === 62) return { end: j + 1, attrs };
+        state = 0;
+        p = j + 1;
+        break;
+      }
+      case 4: // after a quoted value
+        if (isWs(c)) { state = 0; p++; }
+        else if (c === 47) { state = 5; p++; }
+        else if (c === 62) return { end: p + 1, attrs };
+        else state = 0;
+        break;
+      default: // self-closing start tag
+        if (c === 62) return { end: p + 1, attrs };
+        state = 0;
+    }
+  }
+  return null;
+}
+
+interface Tokenized {
+  tokens: Token[];
+  /** The input ended inside a tag: a browser drops it and everything after it, so nothing after can be trusted. */
+  unterminatedTag: boolean;
+}
+
+/**
+ * Tokenize `html` into open/close tags and text, following the HTML
+ * tokenizer where it matters for forms (review r2 B1):
+ *   - a tag name is a letter followed by anything but whitespace, "/" or ">"
+ *     (so `</form_x>` is not `</form>`);
+ *   - attributes are read by readTagRest(): an unquoted "<" inside a tag is
+ *     a plain character, the tag ends at the first ">" outside a quoted value;
+ *   - comments, `<!…>`, `<?…>` and `</` + non-letter are bogus comments up to
+ *     the next ">" and dropped; `<` + anything else is text;
+ *   - raw-text element bodies are one text token; `<plaintext>` makes the rest
+ *     of the document text.
+ * A tag the input ends inside stops tokenizing and sets `unterminatedTag`
+ * (the caller fails closed on it).
+ *
+ * Linear time: every successful tag read moves the cursor past its ">", and
+ * the first failed read ends tokenizing.
+ */
+function tokenize(html: string): Tokenized {
   const tokens: Token[] = [];
   const n = html.length;
-  const seen = new Uint8Array(n + 1); // bit 1: between attributes, bit 2: in an unquoted value
-  const nameRe = /[a-zA-Z][a-zA-Z0-9:-]*/y;
-
-  /** Index of the ">" that ends a tag whose name ends at `p`, or -1. */
-  function tagEnd(p: number): number {
-    let inValue = false;
-    while (p < n) {
-      const bit = inValue ? 2 : 1;
-      if (seen[p]! & bit) return -1; // an earlier scan from here failed
-      seen[p]! |= bit;
-      const c = html.charCodeAt(p);
-      if (c === 62 /* > */) return p;
-      if (c === 60 /* < */) return -1;
-      if (inValue) {
-        if (isWs(c)) inValue = false;
-        p++;
-        continue;
-      }
-      if (c !== 61 /* = */) {
-        p++;
-        continue;
-      }
-      let j = p + 1;
-      while (j < n && isWs(html.charCodeAt(j))) j++;
-      if (j >= n) return -1;
-      const q = html.charCodeAt(j);
-      if (q === 34 /* " */ || q === 39 /* ' */) {
-        const close = html.indexOf(q === 34 ? '"' : "'", j + 1);
-        if (close < 0) return -1;
-        p = close + 1;
-      } else {
-        inValue = true;
-        p = j;
-      }
-    }
-    return -1;
-  }
+  let unterminatedTag = false;
 
   let i = 0;
   let textStart = 0;
   const pushText = (end: number, tag = ""): void => {
     if (end > textStart) tokens.push({ kind: "text", tag, attrs: new Map(), text: html.slice(textStart, end) });
+  };
+  /** Scan a tag name starting at `p` (a letter); returns its end. */
+  const nameEndAt = (p: number): number => {
+    while (p < n) {
+      const c = html.charCodeAt(p);
+      if (isWs(c) || c === 47 || c === 62) break;
+      p++;
+    }
+    return p;
   };
 
   for (;;) {
@@ -244,45 +306,70 @@ function tokenize(html: string): Token[] {
       i = textStart = end;
       continue;
     }
-    const isClose = html.charCodeAt(lt + 1) === 47; /* / */
-    nameRe.lastIndex = lt + (isClose ? 2 : 1);
-    const nm = nameRe.exec(html);
-    if (!nm) {
-      i = lt + 1;
+    const c1 = html.charCodeAt(lt + 1);
+    const isClose = c1 === 47; /* / */
+    const c2 = isClose ? html.charCodeAt(lt + 2) : c1;
+    if (c1 === 33 /* ! */ || c1 === 63 /* ? */ || (isClose && lt + 2 < n && !isAsciiAlpha(c2) && c2 !== 62)) {
+      // Bogus comment (doctype included): dropped up to the next ">".
+      pushText(lt);
+      const gt = html.indexOf(">", lt + 2);
+      i = textStart = gt < 0 ? n : gt + 1;
       continue;
     }
-    const nameEnd = nameRe.lastIndex;
-    const gt = tagEnd(nameEnd);
-    if (gt < 0) {
-      i = lt + 1; // not a tag: the "<" is text
+    if (isClose && c2 === 62) {
+      pushText(lt); // "</>" is dropped
+      i = textStart = lt + 3;
       continue;
+    }
+    if (!isAsciiAlpha(c2)) {
+      i = lt + 1; // "<" + anything else is text
+      continue;
+    }
+    const nameStart = lt + (isClose ? 2 : 1);
+    const nameEnd = nameEndAt(nameStart);
+    const rest = nameEnd < n ? readTagRest(html, nameEnd) : null;
+    if (!rest) {
+      pushText(lt);
+      textStart = n;
+      unterminatedTag = true;
+      break;
     }
     pushText(lt);
-    const tag = nm[0].toLowerCase();
-    i = textStart = gt + 1;
+    const tag = html.slice(nameStart, nameEnd).toLowerCase();
+    i = textStart = rest.end;
     if (isClose) {
       tokens.push({ kind: "close", tag, attrs: new Map(), text: "" });
       continue;
     }
-    tokens.push({ kind: "open", tag, attrs: parseAttrs(html.slice(nameEnd, gt)), text: "" });
+    tokens.push({ kind: "open", tag, attrs: rest.attrs, text: "" });
+    if (tag === "plaintext") {
+      pushText(n, tag);
+      i = textStart = n;
+      break;
+    }
     if (RAW_TEXT_TAGS.has(tag)) {
-      // Content up to "</tag" followed by whitespace, "/" or ">", then the next ">".
-      const closeRe = new RegExp(`</${tag}(?=[\\s/>])`, "gi");
+      // Content up to "</tag" followed by whitespace, "/" or ">", then the end of that close tag.
+      const closeRe = new RegExp(`</${tag}(?=[\\t\\n\\f\\r />])`, "gi");
       closeRe.lastIndex = i;
       const c = closeRe.exec(html);
-      const closeGt = c ? html.indexOf(">", c.index + 2 + tag.length) : -1;
-      if (!c || closeGt < 0) {
+      if (!c) {
         pushText(n, tag); // unclosed: the rest of the document is its content
         i = textStart = n;
         break;
       }
+      const closeRest = readTagRest(html, c.index + 2 + tag.length);
       pushText(c.index, tag);
+      if (!closeRest) {
+        textStart = n;
+        unterminatedTag = true;
+        break;
+      }
       tokens.push({ kind: "close", tag, attrs: new Map(), text: "" });
-      i = textStart = closeGt + 1;
+      i = textStart = closeRest.end;
     }
   }
   pushText(n);
-  return tokens;
+  return { tokens, unterminatedTag };
 }
 
 // ── Classification ──────────────────────────────────────────────────────────
@@ -368,12 +455,19 @@ function cleanText(s: string): string {
 /**
  * The producer's own host with a leading "www." stripped, or null: website
  * missing or unparseable, a hosted/social platform (never the producer's own
- * site — isHostedPlatformHost, as in claim-domain-rule), or a bare public
- * suffix such as "co.uk".
+ * site — isHostedPlatformHost, as in claim-domain-rule), a bare public
+ * suffix such as "co.uk", or a website that is not a front page.
+ *
+ * Same precedence as P1 in claim-domain-rule (review r2 B2): only a ROOT
+ * website (isRootWebsite: empty path, "/", or /no, /en, /home …) makes its
+ * host the producer's own. A website with a path on an unknown host
+ * (lokalmatportal.no/produsent/gard) is a page ABOUT the farm on someone
+ * else's site, so the whole host must not count as the producer's.
  */
 export function producerOwnHost(producerWebsite: string): string | null {
   const host = websiteHost(producerWebsite);
   if (!host || isHostedPlatformHost(host)) return null;
+  if (!isRootWebsite(producerWebsite)) return null;
   const own = stripWww(host);
   if (registrableDomain(own) === null) return null;
   return own;
@@ -445,15 +539,26 @@ export function detectContactForms(
   messageLength = 0,
 ): ContactFormSurvey {
   checkMessageLength(messageLength);
-  const src = (html || "").length > CONTACT_FORM_MAX_HTML_CHARS ? html.slice(0, CONTACT_FORM_MAX_HTML_CHARS) : html || "";
-  const tokens = tokenize(src);
+  const truncated = (html || "").length > CONTACT_FORM_MAX_HTML_CHARS;
+  const src = truncated ? html.slice(0, CONTACT_FORM_MAX_HTML_CHARS) : html || "";
+  const { tokens, unterminatedTag } = tokenize(src);
+  // Fail closed (review r2 B1): when the page ends inside a tag, or was cut at
+  // CONTACT_FORM_MAX_HTML_CHARS, markup we did not read (a formaction, a
+  // `form=` button, a </form>) could change where a form posts, so no form
+  // on the page counts as same-site.
+  const untrustedTail = unterminatedTag || truncated;
 
   let baseUrl = pageUrl;
+  let baseSeen = false;
   let pageCaptcha = false;
   let pageCharset: string | null = null;
   const rawForms: RawForm[] = [];
   const labelFor = new Map<string, string>();
-  /** Submit controls that name a form with `form="id"` (they may sit outside it). */
+  /**
+   * Submit controls that name a form with `form="id"` (they may sit outside
+   * it). Attached after the scan to the FIRST form with that id only, as a
+   * browser does — so many forms sharing one id stay linear (review r2 B3).
+   */
   const submittersByFormId = new Map<string, Attrs[]>();
 
   let form: RawForm | null = null;
@@ -498,9 +603,11 @@ export function detectContactForms(
       CAPTCHA_TAG_RE.test(t.tag);
     switch (t.tag) {
       case "base":
-        if (a.get("href")) {
+        // Only the FIRST <base href> sets the document base, as in browsers (review r2 B1).
+        if (a.has("href") && !baseSeen) {
+          baseSeen = true;
           try {
-            baseUrl = new URL(a.get("href")!, pageUrl).toString();
+            baseUrl = new URL((a.get("href") || "").trim(), pageUrl).toString();
           } catch {
             /* keep page URL */
           }
@@ -582,7 +689,14 @@ export function detectContactForms(
     }
   })();
   const producerDomain = producerOwnHost(producerWebsite);
-  const pageSameSite = urlIsOnProducerHost(pageUrl, producerDomain);
+  const pageSameSite = !untrustedTail && urlIsOnProducerHost(pageUrl, producerDomain);
+
+  /** rawForms index of the first form with each id (review r2 B3). */
+  const firstFormById = new Map<string, number>();
+  rawForms.forEach((rf, idx) => {
+    const id = (rf.attrs.get("id") || "").trim();
+    if (id && !firstFormById.has(id)) firstFormById.set(id, idx);
+  });
 
   /** An action attribute resolved as a browser does: empty → the document URL, else against <base>. */
   const resolveAction = (raw: string): string | null => {
@@ -635,7 +749,8 @@ export function detectContactForms(
     const ac = (rf.attrs.get("accept-charset") || "").trim().split(/[\s,]+/)[0] || "";
 
     const formId = (rf.attrs.get("id") || "").trim();
-    const submitters = [...rf.submitters, ...(formId ? submittersByFormId.get(formId) ?? [] : [])];
+    const byId = formId && firstFormById.get(formId) === index ? submittersByFormId.get(formId) ?? [] : [];
+    const submitters = [...rf.submitters, ...byId];
     const submitActions: ContactFormSubmitAction[] = [];
     for (const s of new Set(submitters)) {
       const hasAction = s.has("formaction");
@@ -693,12 +808,15 @@ export function detectContactForms(
  */
 export function formSkipReason(
   form: Pick<DetectedContactForm, "captcha" | "sameSiteAsProducer" | "phoneRequired" | "messageMaxLength" | "fields"> &
-    Partial<Pick<DetectedContactForm, "hasMessageField" | "hasEmailField">>,
+    Partial<Pick<DetectedContactForm, "hasMessageField" | "hasEmailField" | "method" | "submitActions">>,
   messageLength: number,
 ): ContactFormSkipReason | null {
   checkMessageLength(messageLength);
   if (form.captcha) return "captcha";
   if (!form.sameSiteAsProducer) return "annet_domene";
+  // method=dialog (on the form or a submit control's formmethod) closes a
+  // <dialog> and sends nothing (review N4).
+  if (form.method === "dialog" || (form.submitActions ?? []).some((s) => s.method === "dialog")) return "metode_dialog";
   const hasMessage = form.hasMessageField ?? form.fields.some((f) => f.role === "message");
   if (!hasMessage) return "mangler_meldingsfelt";
   const hasEmail = form.hasEmailField ?? form.fields.some((f) => f.role === "email");
