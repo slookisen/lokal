@@ -67,6 +67,7 @@ import { createHmac, randomUUID } from "crypto";
 import type Database from "better-sqlite3";
 import { getDb } from "../database/init";
 import { normalizeEmail } from "../services/blocklist-service";
+import { SUPPRESSING_BOUNCE_TYPES_SQL } from "../services/privacy-suppression";
 
 const router = Router();
 
@@ -142,14 +143,15 @@ export const ERASURE_TABLES: readonly TableSpec[] = [
   },
 ];
 
-// What actually suppresses outreach (review B1): only these bounce types are
-// read as a block by the senders (crm.ts / admin-outreach-candidates /
-// opplevelser use IN ('hard','complaint','unsubscribe')); 'soft'/'unknown'/NULL
-// rows written by bounce-service do NOT stop a send, so they must not count as
-// «still suppressed» here. agent_blocklist email rows block via isBlocked().
+// What actually suppresses outreach (review B1): only the bounce types in
+// SUPPRESSING_BOUNCE_TYPES (services/privacy-suppression.ts, shared with the
+// nightly retention job) are read as a block by the senders; 'soft'/'unknown'/
+// NULL rows written by bounce-service do NOT stop a send, so they must not
+// count as «still suppressed» here. agent_blocklist email rows block via
+// isBlocked().
 const ACTIVE_SUPPRESSION_SQL = [
   `SELECT COUNT(*) AS c FROM email_bounces
-     WHERE LOWER(TRIM(email)) = ? AND bounce_type IN ('hard', 'complaint', 'unsubscribe')`,
+     WHERE LOWER(TRIM(email)) = ? AND bounce_type IN ${SUPPRESSING_BOUNCE_TYPES_SQL}`,
   `SELECT COUNT(*) AS c FROM agent_blocklist
      WHERE identifier_type = 'email' AND LOWER(TRIM(identifier_value)) = ?`,
 ];

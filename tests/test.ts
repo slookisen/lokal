@@ -46124,6 +46124,25 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-12-slettefrist-korrespondanse-og-oversettelser, slice A:
+// nightly 24-month retention job (src/services/privacy-retention.ts) — dry_run
+// default, batched apply, guard/cooldown decisions identical before/after (AC1).
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-12-slettefrist (slice A): privacy-retention ──");
+  try {
+    const { runPrivacyRetentionTests } = require("../src/services/privacy-retention.test") as
+      typeof import("../src/services/privacy-retention.test");
+    const pr = await runPrivacyRetentionTests({ log: false });
+    passed += pr.passed;
+    failed += pr.failed;
+    for (const f of pr.failures) failures.push("privacy-retention: " + f);
+    console.log(`  privacy-retention: ${pr.passed} passed, ${pr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("privacy-retention: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-23-crm-house-bucket-kimaere-opprydding, slice 3:
 // GET /admin/crm-chimera-contacts-diagnose
 // (src/routes/admin-crm-chimera-contacts-diagnose.ts) — the remaining
