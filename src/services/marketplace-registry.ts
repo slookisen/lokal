@@ -64,6 +64,7 @@ import {
 import { FILLER_WORDS, isFillerNoPlaceAt, NO_PRODUCT_WORDS, QUALIFIER_WORDS } from "./search-intent/rfb-filler-words";
 import { officialPoststedFylker } from "./norway-postnummer";
 import { productNameMatch, type ProductNameMatch } from "../utils/product-name-match";
+import { splitQueryQuantity } from "../utils/query-quantity";
 import { isCategoryLabel } from "../utils/category-label";
 import { safeHonestCatalogCount } from "./honest-count";
 import { registeredMcpTools } from "./mcp-tool-manifest";
@@ -861,6 +862,12 @@ class MarketplaceRegistry {
     /** Slice I-W: the words nothing else in the query explains (unknownProductWords), for discover() step 3c. */
     _unknownTerms?: string[];
   } {
+    // A2A dev-request 2026-11-06-rfb-sok-mengde-flerord-og-treffvisning,
+    // slice A: a quantity («1kg», «0,5 kg», «2 stk») is no product word. It
+    // is taken out before anything below splits the text into words, or
+    // unknownProductWords would look up «1kg» (or «0» and «5kg») in the
+    // product names (utils/query-quantity.ts).
+    query = splitQueryQuantity(query).product;
     const q = query.toLowerCase().replace(/[?!.,]/g, "");
 
     // ── English queries (dev-request 2026-09-05-rfb-mcp-engelsk-sok-kategorifeil) ──

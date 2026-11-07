@@ -88,6 +88,10 @@ import { productNameMatch, COMPOUND_HEAD_MIN_LENGTH, type ProductNameMatch } fro
 import { formatRfbDistanceLabel, shouldSuppressDistance } from "./geo-precision";
 import { PRODUCT_CATEGORY_KEYWORDS } from "./marketplace-registry";
 import { PLATFORM_CATEGORIES, PRODUCT_KEY_TO_PLATFORM } from "./search-enrich";
+import { splitQueryQuantity } from "../utils/query-quantity";
+import { FILLER_WORDS } from "./search-intent/rfb-filler-words";
+import { tokenize } from "./search-intent/norwegian-query";
+import { isOrganicWord } from "./organic-claims";
 
 const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 
@@ -176,6 +180,14 @@ export interface CategoryMatch {
 
 export interface FindOffersResult {
   term: string;
+  /**
+   * Slices A+B (2026-11-06-rfb-sok-mengde-flerord-og-treffvisning): the text the
+   * offers were found by, only when it is not `term` (a quantity taken out, or
+   * the filler words of a phrase that found nothing).
+   */
+  matched_term?: string;
+  /** Slice A: true when `term` is a quantity only («1kg»): there is no product to look for. */
+  needs_product?: true;
   offers: Offer[];
   /** I-S2: only when non-empty; offers.length + category_matches.length ≤ limit. */
   category_matches?: CategoryMatch[];
@@ -318,6 +330,47 @@ function likeContaining(s: string): string {
   return `%${s.replace(/[\\%_]/g, "\\$&")}%`;
 }
 
+// ─── Slice B (2026-11-06-rfb-sok-mengde-flerord-og-treffvisning) ─────────
+// A phrase that finds nothing («norsk lam», «biff tørrmodnet») is searched
+// again by its words, without the filler words of the RFB search
+// (search-intent/rfb-filler-words.ts FILLER_WORDS: «norsk», «kjøpe», «jeg» …)
+// and without bare numbers. Every word that is left must match the same
+// product name (productNameMatch), never just one of them, so «butchers cut
+// biff» finds no plain «Biff». An organic claim word is never left out, so
+// «økologisk honning» never offers plain honey (Debio complaint, A2A
+// dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-tekstrevisjon).
+
+/**
+ * Claim words a search keeps whatever the filler lists say. Explicit, and locked
+ * by catalog-offers-flerord.test.ts; organic-claims.ts isOrganicWord() catches
+ * their other forms («økomerket», «Debio-godkjent»).
+ */
+export const OFFER_CLAIM_WORDS: ReadonlySet<string> = new Set([
+  "økologisk", "økologiske", "økologiskt", "økologi", "øko", "ø-merket", "ømerket",
+  "organic", "organisk", "organiske", "debio", "biodynamisk", "biodynamiske", "biodynamic", "demeter",
+]);
+
+/** True for a claim word a search never leaves out (OFFER_CLAIM_WORDS, or an organic word by organic-claims.ts). */
+export function isOfferClaimWord(word: string): boolean {
+  const w = word.trim().toLowerCase();
+  return OFFER_CLAIM_WORDS.has(w) || isOrganicWord(w);
+}
+
+/**
+ * The words of `text` that must all match one product name when the whole
+ * phrase found nothing: lower case, in order, once each, without filler words
+ * (`isFiller`, default FILLER_WORDS) and bare numbers. A claim word is always kept.
+ */
+export function offerSearchWords(text: string, isFiller: (w: string) => boolean = (w) => FILLER_WORDS.has(w)): string[] {
+  const words: string[] = [];
+  for (const w of tokenize(text)) {
+    if (words.includes(w)) continue;
+    if (!isOfferClaimWord(w) && (/^\p{N}+$/u.test(w) || isFiller(w))) continue;
+    words.push(w);
+  }
+  return words;
+}
+
 async function defaultGeocode(place: string): Promise<{ lat: number; lng: number } | null> {
   const g = await geocodingService.geocode(place);
   return g ? { lat: g.lat, lng: g.lng } : null;
@@ -414,6 +467,10 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
 
   if (!term) return { term, offers: [] };
 
+  // Slice A: a quantity («1kg», «0,5 kg») is no product word; alone it names no product.
+  const product = splitQueryQuantity(term).product;
+  if (!product) return { term, offers: [], needs_product: true };
+
   const position = await resolvePosition(params, geocode);
   if (!position) return { term, offers: [] };
 
@@ -429,68 +486,98 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
   // the term is also tried with its first letter upper-cased, or «øl» would
   // miss «Øl fra Lindheim» (an all-caps name is a section header and never
   // reaches `products`).
-  const termLower = term.toLowerCase();
-  const rows = db.prepare(`
-    SELECT
-      p.id AS product_id, p.name AS product_name, p.price_nok, p.unit,
-      p.availability, p.availability_updated_at, p.availability_source,
-      a.id AS agent_id, a.name AS agent_name, a.city AS city,
-      a.lat AS lat, a.lng AS lng, a.geo_precision AS geo_precision,
-      a.is_verified AS is_verified,
-      p.category AS product_category, a.categories AS agent_categories,
-      p.ingredients AS ingredients, p.allergens AS allergens, p.net_weight AS net_weight
-    FROM products p
-    INNER JOIN agents a ON a.id = p.agent_id
-    INNER JOIN agent_knowledge k ON k.agent_id = a.id
-    WHERE a.umbrella_type IS NULL
-      AND a.is_active = 1
-      AND a.lat IS NOT NULL AND a.lng IS NOT NULL
-      AND k.verification_status = 'verified'
-      AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
-      AND ${publicListableSql("a")}${params.audience === "ai" ? notOwnerHiddenSql("ai_assistants", "a") : ""}
-      AND a.lat BETWEEN ? AND ? AND a.lng BETWEEN ? AND ?
-      AND (LOWER(p.name) LIKE ? ESCAPE '\\' OR LOWER(p.name) LIKE ? ESCAPE '\\')
-  `).all(
-    position.lat - latDeltaDeg, position.lat + latDeltaDeg,
-    position.lng - lngDeltaDeg, position.lng + lngDeltaDeg,
-    likeContaining(termLower), likeContaining(termLower.charAt(0).toUpperCase() + termLower.slice(1))
-  ) as RawOfferRow[];
+  // Slice B: `words` is the whole phrase as one word (as before), or the words
+  // of offerSearchWords(); the LIKE goes on the longest, and every word must
+  // match the name (the row's match is its weakest word's).
+  const search = (words: readonly string[]) => {
+    const likeTerm = words.reduce((a, b) => (b.length > a.length ? b : a));
+    const termLower = likeTerm.toLowerCase();
+    const rows = db.prepare(`
+      SELECT
+        p.id AS product_id, p.name AS product_name, p.price_nok, p.unit,
+        p.availability, p.availability_updated_at, p.availability_source,
+        a.id AS agent_id, a.name AS agent_name, a.city AS city,
+        a.lat AS lat, a.lng AS lng, a.geo_precision AS geo_precision,
+        a.is_verified AS is_verified,
+        p.category AS product_category, a.categories AS agent_categories,
+        p.ingredients AS ingredients, p.allergens AS allergens, p.net_weight AS net_weight
+      FROM products p
+      INNER JOIN agents a ON a.id = p.agent_id
+      INNER JOIN agent_knowledge k ON k.agent_id = a.id
+      WHERE a.umbrella_type IS NULL
+        AND a.is_active = 1
+        AND a.lat IS NOT NULL AND a.lng IS NOT NULL
+        AND k.verification_status = 'verified'
+        AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
+        AND ${publicListableSql("a")}${params.audience === "ai" ? notOwnerHiddenSql("ai_assistants", "a") : ""}
+        AND a.lat BETWEEN ? AND ? AND a.lng BETWEEN ? AND ?
+        AND (LOWER(p.name) LIKE ? ESCAPE '\\' OR LOWER(p.name) LIKE ? ESCAPE '\\')
+    `).all(
+      position.lat - latDeltaDeg, position.lat + latDeltaDeg,
+      position.lng - lngDeltaDeg, position.lng + lngDeltaDeg,
+      likeContaining(termLower), likeContaining(termLower.charAt(0).toUpperCase() + termLower.slice(1))
+    ) as RawOfferRow[];
 
-  // I-S: the labels are split off before the limit, so they do not shorten
-  // the page. I-V: one row per producer, its best (compareOfferRows).
-  // I-S2: the free places go to the nearest label producers, one entry each:
-  // per producer the label whose name sorts first (nb). A producer with a
-  // real offer for the term is never one of them: when there are free
-  // places, every such producer is on the page.
-  // Equal distances are common (all rows of one producer, producers placed at
-  // a city centroid) and the query has no ORDER BY, so no choice uses the
-  // rows' order: both lists go by distance, then agent id.
-  // A term shorter than COMPOUND_HEAD_MIN_LENGTH may end a word of a row in its own category.
-  const termCategories = term.length < COMPOUND_HEAD_MIN_LENGTH ? platformCategoriesOf(term) : [];
-  const bestOffer = new Map<string, OfferCandidate>();
-  const firstLabel = new Map<string, OfferCandidate>();
-  for (const r of rows) {
-    const match = productNameMatch(r.product_name, term, termCategories.length > 0 && rowInCategories(r, termCategories));
-    if (!match) continue;
-    const dist = haversineDistanceKm(position.lat, position.lng, r.lat, r.lng);
-    if (dist > radiusKm) continue;
-    // B2b-1: the order path's stock state — the soft-expiry rule when it is active for the
-    // producer (stock-soft-expiry.ts), else exactly computeEffectiveAvailability().
-    const fresh = orderPathStockFreshness(r, now);
-    const x: OfferCandidate = { r, dist, match, availability: fresh.availability, soft: softExpiryFields(fresh) };
-    if (isCategoryLabel({ name: r.product_name, hasPrice: r.price_nok != null, availabilitySource: r.availability_source })) {
-      const prev = firstLabel.get(r.agent_id);
-      if (!prev || compareLabelRows(r, prev.r) < 0) firstLabel.set(r.agent_id, x);
-    } else {
-      const prev = bestOffer.get(r.agent_id);
-      if (!prev || compareOffersForProducer(x, prev, db) < 0) bestOffer.set(r.agent_id, x);
+    // I-S: the labels are split off before the limit, so they do not shorten
+    // the page. I-V: one row per producer, its best (compareOfferRows).
+    // I-S2: the free places go to the nearest label producers, one entry each:
+    // per producer the label whose name sorts first (nb). A producer with a
+    // real offer for the term is never one of them: when there are free
+    // places, every such producer is on the page.
+    // Equal distances are common (all rows of one producer, producers placed at
+    // a city centroid) and the query has no ORDER BY, so no choice uses the
+    // rows' order: both lists go by distance, then agent id.
+    // A term shorter than COMPOUND_HEAD_MIN_LENGTH may end a word of a row in its own category.
+    const termCategories = words.map((w) => (w.length < COMPOUND_HEAD_MIN_LENGTH ? platformCategoriesOf(w) : []));
+    const bestOffer = new Map<string, OfferCandidate>();
+    const firstLabel = new Map<string, OfferCandidate>();
+    for (const r of rows) {
+      let match: ProductNameMatch = 3;
+      for (let i = 0; i < words.length && match > 0; i++) {
+        const m = productNameMatch(r.product_name, words[i], termCategories[i].length > 0 && rowInCategories(r, termCategories[i]));
+        if (m < match) match = m;
+      }
+      if (!match) continue;
+      const dist = haversineDistanceKm(position.lat, position.lng, r.lat, r.lng);
+      if (dist > radiusKm) continue;
+      // B2b-1: the order path's stock state — the soft-expiry rule when it is active for the
+      // producer (stock-soft-expiry.ts), else exactly computeEffectiveAvailability().
+      const fresh = orderPathStockFreshness(r, now);
+      const x: OfferCandidate = { r, dist, match, availability: fresh.availability, soft: softExpiryFields(fresh) };
+      if (isCategoryLabel({ name: r.product_name, hasPrice: r.price_nok != null, availabilitySource: r.availability_source })) {
+        const prev = firstLabel.get(r.agent_id);
+        if (!prev || compareLabelRows(r, prev.r) < 0) firstLabel.set(r.agent_id, x);
+      } else {
+        const prev = bestOffer.get(r.agent_id);
+        if (!prev || compareOffersForProducer(x, prev, db) < 0) bestOffer.set(r.agent_id, x);
+      }
+    }
+    const offerRows = [...bestOffer.values()].sort(byDistance).slice(0, limit);
+    const matchRows = [...firstLabel.values()]
+      .filter((x) => !bestOffer.has(x.r.agent_id))
+      .sort(byDistance)
+      .slice(0, limit - offerRows.length);
+    return { offerRows, matchRows };
+  };
+
+  // Slice B: the whole phrase first, as before; only when it finds nothing,
+  // its words (offerSearchWords), all of them in one product name.
+  let usedTerm = product;
+  let { offerRows, matchRows } = search([product]);
+  if (offerRows.length === 0 && matchRows.length === 0) {
+    const words = offerSearchWords(product);
+    const wordsTerm = words.join(" ");
+    // One word that is the phrase itself would only search it again.
+    if (words.length > 1 || (words.length === 1 && words[0] !== product.toLowerCase())) {
+      const byWords = search(words);
+      if (byWords.offerRows.length > 0 || byWords.matchRows.length > 0) {
+        ({ offerRows, matchRows } = byWords);
+        usedTerm = wordsTerm;
+      }
     }
   }
-  const offerRows = [...bestOffer.values()].sort(byDistance).slice(0, limit);
-  const matchRows = [...firstLabel.values()]
-    .filter((x) => !bestOffer.has(x.r.agent_id))
-    .sort(byDistance)
-    .slice(0, limit - offerRows.length);
+  // `term` is what was sent; matched_term only when the search read it otherwise.
+  const head = usedTerm === term ? { term } : { term, matched_term: usedTerm };
 
   // One producer shape for offers and category matches.
   const ownerChoices = publicFieldChoicesForMany([...offerRows, ...matchRows].map((x) => x.r.agent_id), { db });
@@ -514,8 +601,8 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
     };
   });
 
-  if (matchRows.length === 0) return { term, offers };
-  const note = categoryMatchNote(term);
+  if (matchRows.length === 0) return { ...head, offers };
+  const note = categoryMatchNote(usedTerm);
   const category_matches: CategoryMatch[] = matchRows.map(({ r, dist }) => ({
     match: "category",
     category: r.product_name.trim(),
@@ -523,7 +610,7 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
     note,
     producer: producerOf(r, dist),
   }));
-  return { term, offers, category_matches };
+  return { ...head, offers, category_matches };
 }
 
 // ─── Skive 3: one producer's orderable products (bestillingsknapp) ───────
