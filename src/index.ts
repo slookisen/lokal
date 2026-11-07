@@ -148,6 +148,7 @@ import adminGardssalgSwitchProbeRoutes from "./routes/admin-gardssalg-switch-pro
 import adminAgentsClaimBackfillRoutes from "./routes/admin-agents-claim-backfill";
 import adminAgentsTerminalReparkRoutes from "./routes/admin-agents-terminal-repark";
 import adminAgentsDuplicateSlugsRoutes from "./routes/admin-agents-duplicate-slugs";
+import adminOwnerGateImpactRoutes from "./routes/admin-owner-gate-impact";
 import adminRfbWebsiteDiscoveryRoutes from "./routes/admin-rfb-website-discovery";
 import adminRfbBrregSelfSufficiencyRoutes from "./routes/admin-rfb-brreg-selfsufficiency";
 import adminPoolBlockerExplainRoutes from "./routes/admin-pool-blocker-explain";
@@ -1003,6 +1004,9 @@ app.use("/admin/agents/terminal-repark", adminLimiter, adminAgentsTerminalRepark
 // feeds the duplicate-merge lever above (which never detects by itself).
 // Same ordering rule as the siblings above — mount BEFORE /admin/agents.
 app.use("/admin/agents/duplicate-slugs", adminLimiter, adminAgentsDuplicateSlugsRoutes);
+// GET /admin/owner-gate-impact — READ-ONLY count of who OWNER_VERIFIED_OWNER_GATE_ENABLED
+// would stop (dev-request 2026-11-06-rfb-krav-for-portal-og-okter-ved-eierskifte, point 1).
+app.use("/admin/owner-gate-impact", adminLimiter, adminOwnerGateImpactRoutes);
 app.use("/admin/agents", adminLimiter, adminAgentsRoutes);
 app.use("/admin/outreach-ready-pool", adminLimiter, adminOutreachPoolRoutes);
 // orch-pr-20260614-3: suppression-gate candidates endpoint + sent-log backfill import
