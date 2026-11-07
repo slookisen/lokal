@@ -52,6 +52,21 @@ const CLAIM_ASSESSMENT_NOTE = "Vurderingen er bare registrert og avgjør ikke kr
 /** The note under the block in the eierkrav B2b-1 «godkjent automatisk» notice. */
 const CLAIM_AUTO_APPROVED_NOTE = "Kravet ble godkjent automatisk fordi vurderingen er grønn.";
 
+/** Eierkrav B2b-2: the outcome of the notice to the farm's known address. */
+export type ClaimFarmNoticeSkipReason = "no_known_email" | "same_as_claimant" | "shared_address" | "send_failed";
+export type ClaimFarmNoticeOutcome = { sent: true } | { sent: false; reason: ClaimFarmNoticeSkipReason };
+export const CLAIM_FARM_NOTICE_LABEL = "Varsel til gårdens kjente adresse";
+export const CLAIM_FARM_NOTICE_REASON_LABELS: Record<ClaimFarmNoticeSkipReason, string> = {
+  no_known_email: "ingen kjent adresse",
+  same_as_claimant: "samme som innsender",
+  shared_address: "delt adresse",
+  send_failed: "sendefeil",
+};
+/** «sendt» / «ikke sendt (<grunn>)» for the admin notice. */
+export function claimFarmNoticeLabel(outcome: ClaimFarmNoticeOutcome): string {
+  return outcome.sent ? "sendt" : `ikke sendt (${CLAIM_FARM_NOTICE_REASON_LABELS[outcome.reason] ?? "sendefeil"})`;
+}
+
 /**
  * The assessment block's lines (plain text, unescaped), or null when the value
  * is not a stored assessment with a known result — then the notice has no block.
@@ -445,6 +460,67 @@ export class EmailService {
       htmlContent: this.generateClaimConfirmationHtml(agentName, loginUrl, agentId),
       textContent: this.generateClaimConfirmationText(agentName, loginUrl, agentId),
     };
+  }
+
+  /**
+   * Eierkrav B2b-2 (dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-
+   * og-ettklikk): after a claim was approved automatically, the farm's KNOWN
+   * address (as it was before the approval) is told that someone registered
+   * as the profile's owner, and to reply if it was not them. Nothing about the
+   * claimant (no name, no e-mail) and no login or action link; Reply-To is
+   * the platform's support address like the other claim mails. Never throws.
+   */
+  async sendClaimFarmNotice(
+    farmEmail: string,
+    agentName: string,
+    at: Date = new Date(),
+  ): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    try {
+      const { subject, htmlContent, textContent } = this.buildClaimFarmNoticeEmail(agentName, at);
+      return await this.sendEmail({
+        to: farmEmail,
+        subject,
+        htmlContent,
+        textContent,
+        replyTo: this.supportEmail,
+        // A transactional notice to the farm, not outreach.
+        omitAgentHeader: true,
+      });
+    } catch (error) {
+      logger.error('Error sending claim farm notice', {
+        agentName,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Subject and bodies of the B2b-2 farm notice, exactly as sendClaimFarmNotice
+   * sends them. Also used by claim-crm-tracking.ts to file the CRM copy.
+   */
+  buildClaimFarmNoticeEmail(agentName: string, at: Date = new Date()): { subject: string; htmlContent: string; textContent: string } {
+    const date = at.toLocaleDateString('nb-NO', { timeZone: 'Europe/Oslo', day: 'numeric', month: 'long', year: 'numeric' });
+    const lead = `Ny eier registrert for ${agentName} på ${this.brand}.`;
+    const what = `${date} registrerte noen seg som eier av profilen ${agentName} på ${this.brand}.`;
+    const ask = 'Var det ikke dere? Svar på denne e-posten.';
+    const htmlContent = `
+<!DOCTYPE html>
+<html lang="no">
+<head>
+  <meta charset="UTF-8">
+</head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', sans-serif; color: #333; max-width: 600px; margin: 0 auto;">
+  <div style="background: #ffffff; padding: 40px 20px;">
+    <div style="font-size: 20px; font-weight: bold; color: #2d5f2e; margin-bottom: 20px;">${this.escapeHtml(this.brand)}</div>
+    <p><strong>${this.escapeHtml(lead)}</strong></p>
+    <p>${this.escapeHtml(what)}</p>
+    <p>${this.escapeHtml(ask)}</p>
+  </div>
+</body>
+</html>`;
+    const textContent = `${lead}\n\n${what}\n\n${ask}\n`;
+    return { subject: `Ny eier registrert for ${agentName} på ${this.brand}`, htmlContent, textContent };
   }
 
   async sendEmail(options: EmailOptions): Promise<{ success: boolean; messageId?: string; error?: string }> {
@@ -1327,6 +1403,9 @@ ${this.brand} | ${getConfig().domain}`;
     assessment: unknown;
     /** A signed C4 `revoke` link; undefined → the admin-route text line. */
     revokeUrl?: string;
+    /** B2b-2: what happened to the notice to the farm's known address
+     *  (the address itself is never shown); undefined → no line. */
+    farmNotice?: ClaimFarmNoticeOutcome;
   }): Promise<{ success: boolean; messageId?: string; error?: string }> {
     const adminEmail = process.env.ADMIN_NOTIFICATION_EMAIL;
     if (!adminEmail) {
@@ -1339,6 +1418,7 @@ ${this.brand} | ${getConfig().domain}`;
       const subject = `Eierkrav godkjent automatisk: ${agentName}`;
       const intro = 'Den automatiske vurderingen var grønn, så kravet er godkjent og innsenderen er nå eier av profilen.';
       const login = opts.loginLinkSent ? 'sendt' : 'ikke sendt';
+      const farmNotice = opts.farmNotice ? claimFarmNoticeLabel(opts.farmNotice) : null;
       const blockLines = claimAssessmentNoticeLines(opts.assessment);
       // B2a's block, with this notice's own note in place of «only recorded».
       const assessmentLines = blockLines ? [...blockLines.slice(0, -1), CLAIM_AUTO_APPROVED_NOTE] : null;
@@ -1359,14 +1439,15 @@ ${this.brand} | ${getConfig().domain}`;
             ${row('Produsent', `${agentName} (${agentId})`)}
             ${row('Navn', claimantName)}
             ${row('E-post', claimantEmail)}
-            ${row('Innlogging', login)}
+            ${row('Innlogging', login)}${farmNotice !== null ? `
+            ${row(CLAIM_FARM_NOTICE_LABEL, farmNotice)}` : ''}
             ${row('Krav-id', claimId)}
             ${row('Tidspunkt', new Date().toLocaleString('nb-NO', { timeZone: 'Europe/Oslo' }))}
           </table>${assessmentLines ? this.claimAssessmentHtml(assessmentLines) : ''}${undoHtml}
           <p style="color: #888; font-size: 12px;">Automatisk varsling fra ${this.brand}</p>
         </div>`;
       const undoText = revokeUrl ? `Angre: ${revokeUrl}\n${CLAIM_REVIEW_LINK_NOTE}` : `Angre: ${revokeCommand}`;
-      const textContent = `Eierkrav godkjent automatisk på ${this.brand}\n\n${intro}\n\nProdusent: ${agentName} (${agentId})\nNavn: ${claimantName}\nE-post: ${claimantEmail}\nInnlogging: ${login}\nKrav-id: ${claimId}\nTidspunkt: ${new Date().toISOString()}\n\n${assessmentLines ? `${assessmentLines.join('\n')}\n\n` : ''}${undoText}`;
+      const textContent = `Eierkrav godkjent automatisk på ${this.brand}\n\n${intro}\n\nProdusent: ${agentName} (${agentId})\nNavn: ${claimantName}\nE-post: ${claimantEmail}\nInnlogging: ${login}\n${farmNotice !== null ? `${CLAIM_FARM_NOTICE_LABEL}: ${farmNotice}\n` : ''}Krav-id: ${claimId}\nTidspunkt: ${new Date().toISOString()}\n\n${assessmentLines ? `${assessmentLines.join('\n')}\n\n` : ''}${undoText}`;
 
       return await this.sendEmail({ to: adminEmail, subject, htmlContent, textContent });
     } catch (error) {

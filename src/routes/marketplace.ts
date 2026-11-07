@@ -72,6 +72,7 @@ import { issueOwnerSessionForSelgerLogin } from "./owner-portal";
 import { revokeOwnerAccessExceptVerifiedOwners } from "../services/owner-access-revocation";
 import { HOMEPAGE_CONTACT_PROVENANCE_EXCLUSION_SQL } from "../services/homepage-contact-provenance";
 import { emailWithheldIds, withKnowledgeEmailNull } from "../services/email-reveal-guard";
+import { hasContactRetentionMarkers } from "../services/privacy-retention";
 import {
   publicFieldChoices, publicFieldChoicesForMany, withoutHiddenContact, withoutHiddenFields, publicAgentInfo,
   withoutHiddenCoordinates, hidesPrices, hidesTrust, type PublicFieldChoices,
@@ -5853,6 +5854,22 @@ router.get("/admin/agents/dump", (req: Request, res: Response) => {
     `).all() as Array<{ email: string; contacted_at: string | null }>;
     for (const r of sentRows) {
       if (r.contacted_at != null) contactedByEmail.set(r.email, r.contacted_at);
+    }
+    // Slettefrist slice A: outbound messages the 24-month retention job
+    // deleted are kept as crm_contacts.retention_last_outbound_at — the newer
+    // of the two is the same MAX(sent_at) as before the cleanup.
+    if (hasContactRetentionMarkers(db)) {
+      const retainedRows = db.prepare(`
+        SELECT LOWER(email) AS email, MAX(retention_last_outbound_at) AS contacted_at
+        FROM crm_contacts
+        WHERE retention_last_outbound_at IS NOT NULL AND email IS NOT NULL
+        GROUP BY LOWER(email)
+      `).all() as Array<{ email: string; contacted_at: string | null }>;
+      for (const r of retainedRows) {
+        if (r.contacted_at == null) continue;
+        const live = contactedByEmail.get(r.email);
+        if (live === undefined || r.contacted_at > live) contactedByEmail.set(r.email, r.contacted_at);
+      }
     }
 
     let sql = `

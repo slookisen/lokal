@@ -44,6 +44,7 @@
 // back to the documented default (enabled:true, threshold:3) rather than
 // requiring a seed migration.
 import type Database from "better-sqlite3";
+import { hasContactRetentionMarkers } from "./privacy-retention";
 
 export const OUTREACH_MAX_TOUCH_VERN_DEFAULT_THRESHOLD = 3;
 export const OUTREACH_MAX_TOUCH_VERN_DEFAULT_ENABLED = true;
@@ -201,9 +202,22 @@ export function getMaxTouchStatusForEmail(
         LIMIT 1`,
     )
     .get(normalized) as { hit: number } | undefined;
+  // Slettefrist slice A: a reply whose messages the 24-month retention job
+  // deleted survives as crm_contacts.retention_last_inbound_at, so «replied
+  // ever» is the same before and after the cleanup.
+  const retainedInbound =
+    !inboundRow && hasContactRetentionMarkers(db)
+      ? (db
+          .prepare(
+            `SELECT 1 AS hit FROM crm_contacts c
+              WHERE c.retention_last_inbound_at IS NOT NULL AND LOWER(c.email) = ?
+              LIMIT 1`,
+          )
+          .get(normalized) as { hit: number } | undefined)
+      : undefined;
 
   const sendCount = sentRow?.cnt ?? 0;
-  const hasInboundEver = !!inboundRow;
+  const hasInboundEver = !!inboundRow || !!retainedInbound;
   return {
     send_count: sendCount,
     last_sent_at: sentRow?.last_sent_at ?? null,
@@ -252,6 +266,18 @@ export function createMaxTouchStatusLookup(
     )
     .all() as Array<{ e: string | null }>) {
     if (r.e !== null) inbound.add(r.e);
+  }
+  // Slettefrist slice A: replies kept as a contact marker after the
+  // retention job deleted the messages (same as the per-address form).
+  if (hasContactRetentionMarkers(db)) {
+    for (const r of db
+      .prepare(
+        `SELECT DISTINCT LOWER(c.email) AS e FROM crm_contacts c
+          WHERE c.retention_last_inbound_at IS NOT NULL AND c.email IS NOT NULL`,
+      )
+      .all() as Array<{ e: string | null }>) {
+      if (r.e !== null) inbound.add(r.e);
+    }
   }
   return (email: string): MaxTouchStatus => {
     const normalized = email.trim().toLowerCase();

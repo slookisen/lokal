@@ -41,6 +41,7 @@ import { resolveVerifiedClaim } from "../services/dental-verified-claim";
 import { recordAiPageDelivery } from "../services/profile-ai-deliveries";
 import { recordAiProfileClick } from "../services/profile-ai-clicks";
 import { aiDeliveriesTileFor } from "../services/profile-ai-deliveries-tile";
+import { aiClicksTileFor } from "../services/profile-ai-clicks-tile";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
 // dev-request 2026-10-17-jsonld-script-escaping-felles-serialiserer: the
 // shell's JSON-LD goes through the serializer that escapes < > & U+2028 U+2029.
@@ -2249,6 +2250,7 @@ function renderClinicProfile(
   </div>
   <div class="container" style="padding-top:32px;padding-bottom:48px">
     ${aiDeliveriesTileFor("dental", agent.id)}
+    ${aiClicksTileFor("dental", agent.id)}
     ${inactiveNotice}
     ${thinProfileCta}
     ${omOssSection}

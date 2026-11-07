@@ -4,6 +4,9 @@
 // its resend, and «Profilen til X er nå din» on approval) as outbound
 // crm_messages in ONE CRM thread per claim, `claim-<claimId>`, so the whole
 // claim correspondence is visible under GET /admin/crm/threads/:id.
+// B2b-2 adds one mail that does not go to the claimant: the «Ny eier
+// registrert» notice to the farm's known address after an auto-approval
+// (kind "farm_notice", no secret in it, same thread and same bookkeeping).
 //
 // Flag CLAIM_CRM_TRACKING_ENABLED, on only when exactly "true" (default off):
 // off = no CRM read or write at all.
@@ -38,7 +41,10 @@ export const CLAIM_CRM_THREAD_PREFIX = "claim-";
 export const CODE_MASK = "••••••";
 export const LOGIN_LINK_PLACEHOLDER = "[innloggingslenke]";
 
-export type ClaimMailKind = "claim_code" | "claim_approved";
+// B2b-2 (eierkrav auto-approval): "farm_notice" is the «Ny eier registrert»
+// notice to the farm's known address. It carries no secret, so its copy is
+// the sent mail as is; it goes in the same `claim-<claimId>` thread.
+export type ClaimMailKind = "claim_code" | "claim_approved" | "farm_notice";
 
 export function isClaimCrmTrackingEnabled(): boolean {
   return process.env.CLAIM_CRM_TRACKING_ENABLED === "true";
@@ -58,6 +64,8 @@ export interface ClaimMailRecordInput {
   agentName: string;
   /** What emailService.sendVerificationCode / sendClaimConfirmation returned. */
   sendResult: { success: boolean; messageId?: string } | null | undefined;
+  /** farm_notice only: the date the sent notice was rendered with. */
+  at?: Date;
 }
 
 /**
@@ -71,7 +79,9 @@ export function recordClaimMail(input: ClaimMailRecordInput): string | null {
     const rendered =
       input.kind === "claim_code"
         ? emailService.buildVerificationCodeEmail(CODE_MASK, input.agentName)
-        : emailService.buildClaimConfirmationEmail(input.agentName, LOGIN_LINK_PLACEHOLDER, input.agentId);
+        : input.kind === "farm_notice"
+          ? emailService.buildClaimFarmNoticeEmail(input.agentName, input.at)
+          : emailService.buildClaimConfirmationEmail(input.agentName, LOGIN_LINK_PLACEHOLDER, input.agentId);
     const smtpMessageId = input.sendResult?.messageId;
     // DRY_RUN reached nobody — the routes treat it as not sent too.
     const sent = input.sendResult?.success === true && !!smtpMessageId && smtpMessageId !== "DRY_RUN";

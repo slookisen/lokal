@@ -35,6 +35,7 @@ import { logInternalError, rpcInternalErrorReply } from "../utils/internal-error
 import { searchCountable } from "../services/search-tracking";
 import { publicAgentInfo, publicFieldChoices } from "../owner-features/enforce";
 import { emailWithheldIds, withKnowledgeEmailNull } from "../services/email-reveal-guard";
+import { guardConversationEmails, messageForListener, liveStreamCacheControl } from "../services/conversation-email-guard";
 import { readSearchText, geocodeSearchPlace, discoveryQueryOf, outsideNorwayText, noProductMatchText } from "../services/rfb-search-reading";
 import {
   isOrderAgentActionsEnabled,
@@ -1056,12 +1057,16 @@ router.get("/api/discovery", (_req: Request, res: Response) => {
 // Connect with EventSource("/api/live") in the dashboard
 // ═══════════════════════════════════════════════════════════════
 
-const sseClients = new Set<Response>();
+// S-A5 (dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting):
+// each listener keeps its own request, so a seller message's ✉️ line follows
+// that listener's rfb per-IP counter (services/conversation-email-guard.ts;
+// switch EMAIL_REVEAL_GUARD_RFB off = the same bytes to everyone, as before).
+const sseClients = new Map<Response, Request>();
 
 router.get("/api/live", (req: Request, res: Response) => {
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
+    "Cache-Control": liveStreamCacheControl(),
     "Connection": "keep-alive",
     "X-Accel-Buffering": "no",
   });
@@ -1069,14 +1074,14 @@ router.get("/api/live", (req: Request, res: Response) => {
   // Send initial connection event
   res.write(`data: ${JSON.stringify({ type: "connected", timestamp: new Date().toISOString() })}\n\n`);
 
-  sseClients.add(res);
+  sseClients.set(res, req);
   req.on("close", () => sseClients.delete(res));
 });
 
 // Forward interactions and messages to SSE clients
 interactionLogger.on("interaction", (event: InteractionEvent) => {
   const data = JSON.stringify({ eventType: "interaction", ...event });
-  for (const client of sseClients) {
+  for (const client of sseClients.keys()) {
     try { client.write(`data: ${data}\n\n`); } catch { sseClients.delete(client); }
   }
 });
@@ -1090,8 +1095,15 @@ interactionLogger.on("message", (msg: any) => {
     safe.content = redactPII(msg.content);
   }
   const data = JSON.stringify({ type: "conversation_message", ...safe });
-  for (const client of sseClients) {
-    try { client.write(`data: ${data}\n\n`); } catch { sseClients.delete(client); }
+  // S-A5: a seller message's ✉️ line per listener (see sseClients above).
+  const cache = new Map<string, string | null>();
+  for (const [client, clientReq] of sseClients) {
+    let line = data;
+    try {
+      const shown = messageForListener(clientReq, safe, cache);
+      if (shown !== safe) line = JSON.stringify({ type: "conversation_message", ...shown });
+    } catch { /* guard failure: the message is not sent to this listener */ continue; }
+    try { client.write(`data: ${line}\n\n`); } catch { sseClients.delete(client); }
   }
 });
 
@@ -1143,7 +1155,9 @@ router.post("/api/conversations", (req: Request, res: Response) => {
     requestMeta, // (item 3) internal-traffic classification
     trafficClass,
   });
-  res.json({ success: true, data: conversation });
+  // S-A5: the seller auto-reply's ✉️ line follows the rfb per-IP limit
+  // (services/conversation-email-guard.ts); the stored rows are unchanged.
+  res.json({ success: true, data: guardConversationEmails(req, res, [conversation])[0] });
 });
 
 // Redact PII from a conversation's public-facing fields without touching
@@ -1171,7 +1185,9 @@ router.get("/api/conversations", (req: Request, res: Response) => {
     status: (req.query.status as string) || undefined,
     agentId: (req.query.agentId as string) || undefined,
   });
-  const safe = conversations.map(redactConversationForPublic);
+  // S-A5: each seller whose reply carries an e-mail counts on the rfb per-IP
+  // limit once, in list order (services/conversation-email-guard.ts).
+  const safe = guardConversationEmails(req, res, conversations).map(redactConversationForPublic);
   res.json({ success: true, data: safe, count: safe.length });
 });
 
@@ -1182,7 +1198,8 @@ router.get("/api/conversations/:id", (req: Request, res: Response) => {
     res.status(404).json({ success: false, error: "Conversation not found" });
     return;
   }
-  res.json({ success: true, data: redactConversationForPublic(conversation) });
+  // S-A5: the seller's ✉️ line follows the rfb per-IP limit (see the list above).
+  res.json({ success: true, data: redactConversationForPublic(guardConversationEmails(req, res, [conversation])[0]) });
 });
 
 // POST /api/conversations/:id/messages — Add message to conversation

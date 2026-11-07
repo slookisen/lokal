@@ -13,6 +13,7 @@
 
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
 import { capFreeText } from "../utils/free-text";
+import { hasContactRetentionMarkers } from "../services/privacy-retention";
 // The gårdssalg product-name extractor (moved to its own service, behaviour
 // unchanged — see the re-export next to gardssalgProductSourceText below).
 import {
@@ -19762,7 +19763,20 @@ export function gardssalgProducerHasCrmReply(rfbDb: ReturnType<typeof getRfbDb>,
         LIMIT 1`,
     )
     .get(providerId);
-  return row !== undefined;
+  if (row !== undefined) return true;
+  // Slettefrist slice A: a reply whose messages the 24-month retention job
+  // deleted is kept on the contact (retention_last_inbound_at).
+  if (!hasContactRetentionMarkers(rfbDb)) return false;
+  const retained = rfbDb
+    .prepare(
+      `SELECT 1 FROM crm_contacts cc
+        WHERE cc.provider_id = ?
+          AND cc.vertical_id = 'experiences'
+          AND cc.retention_last_inbound_at IS NOT NULL
+        LIMIT 1`,
+    )
+    .get(providerId);
+  return retained !== undefined;
 }
 
 /** Max cold touches per producer in this lane: the first + one follow-up. */

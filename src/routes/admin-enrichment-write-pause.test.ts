@@ -749,6 +749,12 @@ export async function runAdminEnrichmentWritePauseTests(
         "routes/admin-dental-schema-probe-sweep.ts",
         "routes/admin-dental-wrong-entity-retro-sanitize.ts",
         "routes/admin-dental-write-pause.test.ts",
+        // dev-request 2026-09-02-dental-permanent-triage-needs-review-drain
+        // (3c-1): the dental-triage job and its /run route check the dental
+        // pause before writing; its test file sets/clears the pause.
+        "routes/admin-dental-triage.ts",
+        "services/dental-triage.ts",
+        "services/dental-triage.test.ts",
       ].sort(),
       "ewp-125: the guard is imported by exactly the gated surfaces, the shared write primitives, its own admin route, and the test files",
     );

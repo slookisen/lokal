@@ -178,6 +178,7 @@ import {
   isDirectoryOrAggregatorHost,
 } from "./cross-source-validator";
 import { outreachSentLogHasVerticalColumn } from "./outreach-suppression-signals";
+import { hasContactRetentionMarkers } from "./privacy-retention";
 import { createLlmCallMeter, runWithLlmCallMeter, type LlmCallMeter } from "./llm-call-meter";
 import { refreshRfbCandidateHomepage } from "./rfb-marketing-daily";
 import { generateGardssalgProductList, type GardssalgProductsExtractionDiagnostic } from "./gardssalg-product-list";
@@ -1038,6 +1039,20 @@ export function readRfbContactedSignals(db: Db): RfbContactedSignals {
     )
     .all() as Array<{ e: string | null; last_sent: string | null }>;
   for (const r of crmRows) if (r.e !== null && r.last_sent) crmOutEmails.add(r.e);
+  // Slettefrist slice A: outbound messages the 24-month retention job deleted
+  // are kept as crm_contacts.retention_last_outbound_at (their MAX(sent_at)).
+  if (hasContactRetentionMarkers(db)) {
+    for (const r of db
+      .prepare(
+        `SELECT LOWER(email) AS e, MAX(retention_last_outbound_at) AS last_sent
+           FROM crm_contacts
+          WHERE retention_last_outbound_at IS NOT NULL
+          GROUP BY LOWER(email)`,
+      )
+      .all() as Array<{ e: string | null; last_sent: string | null }>) {
+      if (r.e !== null && r.last_sent) crmOutEmails.add(r.e);
+    }
+  }
 
   const sentAgentIds = new Set<string>();
   const sentRecipients = new Set<string>();
