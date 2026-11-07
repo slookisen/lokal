@@ -9,8 +9,8 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
-    "build": "tsc && xcopy src\\public dist\\public /E /I /Y 2>nul || cp -r src/public dist/public",
-    "start:prod": "node dist/index.js",
+    "build": "tsc --noEmit && node scripts/build-dist.js",
+    "start:prod": "node --enable-source-maps dist/index.js",
     "test": "tsx tests/test.ts"
   },
   "keywords": [],
@@ -43,6 +43,7 @@
     "@types/better-sqlite3": "^7.6.13",
     "@types/js-yaml": "^4.0.9",
     "@types/qrcode": "^1.5.6",
+    "esbuild": "0.27.4",
     "nodemon": "^3.1.14",
     "ts-node": "^10.9.2",
     "tsx": "^4.21.0"
