@@ -45112,6 +45112,27 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  // dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 5a: the public
+  // «Klikk fra AI-svar · 60d: N» tile on the rfb producer, dental clinic,
+  // gårdssalg provider and experience pages. Swaps getDb() and the dental /
+  // experiences db handles (restored in finally), so serial.
+  console.log("\n── Klikk fra AI-svar S5a: public tile on the profile pages ──");
+  try {
+    const { runProfileAiClicksTileTests } = require("../src/services/profile-ai-clicks-tile.test") as
+      typeof import("../src/services/profile-ai-clicks-tile.test");
+    const r = await runProfileAiClicksTileTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("profile-ai-clicks-tile: " + f);
+    console.log(`  profile-ai-clicks-tile: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push(`profile-ai-clicks-tile: unexpected error: ${String(err?.message || err)}`);
+    console.log(`  ✗ profile-ai-clicks-tile: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   // dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 3 («Merking»):
   // profile links handed to AI clients over MCP, A2A and REST (ai_search) carry
   // utm_*=ai_search, at the transport boundary only; 301s keep the query.
