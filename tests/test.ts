@@ -50294,6 +50294,17 @@ runSerial(async () => {
   }
 });
 
+runSerial(async () => {
+  console.log("\n── public text decisions 2026-11-06 ──");
+  const { runRfbTekstrettinger20261106Tests } = require("../src/routes/rfb-tekstrettinger-20261106.test") as
+    typeof import("../src/routes/rfb-tekstrettinger-20261106.test");
+  const tr = runRfbTekstrettinger20261106Tests();
+  passed += tr.passed;
+  failed += tr.failed;
+  for (const f of tr.failures) failures.push("rfb-tekstrettinger-20261106: " + f);
+  console.log(`  rfb-tekstrettinger-20261106: ${tr.passed} passed, ${tr.failed} failed`);
+});
+
 // dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post, K1–K3: the same
 // claimant gets the same claim back (code_already_sent, no new code), «Send
 // koden på nytt» (same code, same farm address, once, ≥ 10 min, platform cap),
