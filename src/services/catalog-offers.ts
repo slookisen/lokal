@@ -383,6 +383,34 @@ export function hasOfferNegationWord(text: string): boolean {
 }
 
 /**
+ * Reduced-amount words. A phrase holding one of them («syltetøy med lite
+ * sukker», «brød med lite salt», «low sugar jam») is never searched by its
+ * words, just like a negation (OFFER_NEGATION_WORDS): «lite» is a qualifier and
+ * «litt» a filler word, so leaving them out turned «syltetøy med lite sukker»
+ * into «syltetøy sukker», which offered «Syltetøy med sukker» — a false
+ * reduced-sugar / reduced-salt claim (review B2 of PR #1433). A bare «0» or
+ * «0%» («0 sukker syltetøy») counts too, since bare numbers are left out of the
+ * words. Such a phrase gets the answer it had before the word search: what the
+ * whole phrase finds, else empty offers and no matched_term. Whole word and any
+ * case, so «lettmelk» and «lavendel» do not count. Explicit and lower case;
+ * Norwegian (bokmål and nynorsk) and English. Locked by
+ * src/routes/rfb-sok-mengde-flerord.test.ts.
+ */
+export const OFFER_REDUCED_AMOUNT_WORDS: ReadonlySet<string> = new Set([
+  // Norwegian
+  "lite", "litt", "lav", "lavt", "låg", "redusert", "redusere", "mindre", "minst", "null", "lett",
+  // English
+  "low", "less", "reduced", "lower", "zero", "light",
+  // A bare zero
+  "0", "0%",
+]);
+
+/** True when `text` holds a reduced-amount word or a bare «0» / «0%» (OFFER_REDUCED_AMOUNT_WORDS), by whole word and any case. */
+export function hasOfferReducedAmountWord(text: string): boolean {
+  return tokenize(text).some((w) => OFFER_REDUCED_AMOUNT_WORDS.has(w.toLowerCase()));
+}
+
+/**
  * The words of `text` that must all match one product name when the whole
  * phrase found nothing: lower case, in order, once each, without filler words
  * (`isFiller`, default FILLER_WORDS) and bare numbers. A claim word is always kept.
@@ -590,8 +618,9 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
   // its words (offerSearchWords), all of them in one product name.
   let usedTerm = product;
   let { offerRows, matchRows } = search([product]);
-  // A negation («uten», «without» …) is never read word by word (OFFER_NEGATION_WORDS).
-  if (offerRows.length === 0 && matchRows.length === 0 && !hasOfferNegationWord(product)) {
+  // A negation («uten», «without» …) or a reduced amount («lite», «low», a bare «0» …)
+  // is never read word by word (OFFER_NEGATION_WORDS, OFFER_REDUCED_AMOUNT_WORDS).
+  if (offerRows.length === 0 && matchRows.length === 0 && !hasOfferNegationWord(product) && !hasOfferReducedAmountWord(product)) {
     const words = offerSearchWords(product);
     const wordsTerm = words.join(" ");
     // One word that is the phrase itself would only search it again.

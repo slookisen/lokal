@@ -48,7 +48,9 @@ const VANLIG = "Vanlig Bigård Fixture";
 const NORSK = "Norskbigården Fixture";
 const BAKER = "Glutenbakeriet Fixture";
 const MEIERI = "Laktosemeieriet Fixture";
-const ALL = [HONEY_1KG, BIFF, TORRMODNET, LAM, OKO, VANLIG, NORSK, BAKER, MEIERI];
+const SYLTERI = "Sylteriet Fixture";
+const SALTBAKER = "Saltbakeriet Fixture";
+const ALL = [HONEY_1KG, BIFF, TORRMODNET, LAM, OKO, VANLIG, NORSK, BAKER, MEIERI, SYLTERI, SALTBAKER];
 
 const SEEDS: Seed[] = [
   { id: id(1), name: HONEY_1KG, ...near(0.002), city: "Oslo", categories: ["honey"],
@@ -72,6 +74,11 @@ const SEEDS: Seed[] = [
     catalog: [{ name: "Brød med gluten", priceNok: 60 }, { name: "Bread with gluten", priceNok: 60 }] },
   { id: id(9), name: MEIERI, ...near(0.018), city: "Oslo", categories: ["dairy"],
     products: [{ name: "Melk med laktose", category: "dairy", price: "25 kr" }], catalog: [{ name: "Melk med laktose", priceNok: 25 }] },
+  // Review B2: products that hold what a reduced-amount search asks for less of.
+  { id: id(10), name: SYLTERI, ...near(0.020), city: "Oslo", categories: ["bakery"],
+    products: [{ name: "Syltetøy med sukker", category: "bakery", price: "70 kr" }], catalog: [{ name: "Syltetøy med sukker", priceNok: 70 }] },
+  { id: id(11), name: SALTBAKER, ...near(0.022), city: "Oslo", categories: ["bakery"],
+    products: [{ name: "Brød med salt", category: "bakery", price: "55 kr" }], catalog: [{ name: "Brød med salt", priceNok: 55 }] },
 ];
 
 export async function runRfbSokMengdeFlerordTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
@@ -256,6 +263,24 @@ export async function runRfbSokMengdeFlerordTests(opts: { log?: boolean } = {}):
       assertEq(negLocked.filter((w) => !OFFER_NEGATION_WORDS.has(w)), [], "negation words: OFFER_NEGATION_WORDS holds every locked word");
       assertEq(["brød uten gluten", "Bread WITHOUT gluten", "melk, uten laktose", "ikke pasteurisert ost", "honning", "utenlandsk ost", "glutenfritt brød"].map(hasOfferNegationWord),
         [true, true, true, true, false, false, false], "negation words: by whole word and any case («utenlandsk», «glutenfritt» are one word)");
+
+      // Review B2: a reduced amount («lite», a bare «0» …) is never read word by word (false reduced-sugar/salt claim).
+      for (const q of ["syltetøy med lite sukker", "lite sukker syltetøy", "0 sukker syltetøy", "brød med lite salt", "syltetøy 0% sukker", "Syltetøy med LAV sukker"]) {
+        const r = await offers(q);
+        assertEq(r, { term: q, offers: [] }, `B2: findOffers «${q}» is empty with no matched_term (never the product with it)`);
+      }
+      const sylt = await offers("syltetøy sukker");
+      assertEq([offerNames(sylt), sylt.matched_term], [[`${SYLTERI}: Syltetøy med sukker`], undefined],
+        "B2 control: «syltetøy sukker» (no reduced amount) still finds «Syltetøy med sukker» by its words");
+      const { OFFER_REDUCED_AMOUNT_WORDS, hasOfferReducedAmountWord } =
+        require("../services/catalog-offers") as typeof import("../services/catalog-offers");
+      const redLocked = ["lite", "litt", "lav", "lavt", "låg", "redusert", "redusere", "mindre", "minst", "null",
+        "low", "less", "reduced", "lower", "zero", "light", "lett", "0", "0%"];
+      assertEq(redLocked.filter((w) => !OFFER_REDUCED_AMOUNT_WORDS.has(w)), [], "reduced-amount words: OFFER_REDUCED_AMOUNT_WORDS holds every locked word and a bare «0» / «0%»");
+      assertEq(["syltetøy med lite sukker", "LOW sugar jam", "0 sukker syltetøy", "syltetøy 0% sukker", "Light-yoghurt",
+        "lettmelk", "lavendel honning", "honning", "10 egg", "500 g honning", "nullstilt"].map(hasOfferReducedAmountWord),
+        [true, true, true, true, true, false, false, false, false, false, false],
+        "reduced-amount words: by whole word and any case («lettmelk», «lavendel», «10», «500» do not count)");
 
       const mcpOffers = tools.get("lokal_find_offers")!;
       const viaMcp = JSON.parse(textOf(await mcpOffers({ items: ["norsk lam", "1kg"], lat: O.lat, lng: O.lng, radius_km: 50 })));
