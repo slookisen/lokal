@@ -69,7 +69,9 @@ import { setProducerAvailabilityByProductId } from "../services/supply-graph";
 import { renderPage, shouldEscalateToRender } from "../services/render-page";
 import { normalizeOpeningHours, entryDaysLabel } from "../utils/opening-hours";
 import { issueOwnerSessionForSelgerLogin } from "./owner-portal";
+import { revokeOwnerAccessExceptVerifiedOwners } from "../services/owner-access-revocation";
 import { HOMEPAGE_CONTACT_PROVENANCE_EXCLUSION_SQL } from "../services/homepage-contact-provenance";
+import { emailWithheldIds, withKnowledgeEmailNull } from "../services/email-reveal-guard";
 import {
   publicFieldChoices, publicFieldChoicesForMany, withoutHiddenContact, withoutHiddenFields, publicAgentInfo,
   withoutHiddenCoordinates, hidesPrices, hidesTrust, type PublicFieldChoices,
@@ -241,17 +243,19 @@ function ensureAgentInDb(agentId: string): boolean {
 // Used by /search, /discover (via enrichment) and /vcard endpoint.
 // Keeping these inline to avoid a new util module just yet.
 
-function buildContactBlock(agentId: string, choices?: PublicFieldChoices | null): {
+type ContactBlock = {
   address?: string;
   postalCode?: string;
   phone?: string;
-  email?: string;
+  email?: string | null;
   website?: string;
   openingHours?: Array<{ day: string; open: string; close: string }>;
   paymentMethods?: string[];
   deliveryOptions?: string[];
   vcardUrl: string;
-} | null {
+};
+
+function buildContactBlock(agentId: string, choices?: PublicFieldChoices | null): ContactBlock | null {
   const info = knowledgeService.getAgentInfo(agentId);
   if (!info) return null;
   // S2c-1: without the phone / address the owner hid (choices null = as before).
@@ -273,6 +277,29 @@ function buildContactBlock(agentId: string, choices?: PublicFieldChoices | null)
     deliveryOptions: k.deliveryOptions,
     vcardUrl: `/api/marketplace/agents/${agentId}/vcard`,
   };
+}
+
+// dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
+// S-A5 (RFB REST): the producer e-mail in these answers follows the per-IP
+// limit of services/email-reveal-guard.ts — the rfb counter the profile page
+// /produsent/:slug uses (switch EMAIL_REVEAL_GUARD_RFB, default off). Over
+// the limit, or for CCBot, the e-mail is left out exactly as for a producer
+// without one (no new field). In a list each producer with an e-mail counts
+// on its own, in list order. Switch on: Cache-Control: private. Switch off:
+// nothing changes, headers included. The guard logs ids and counts only.
+
+/** A contact block as buildContactBlock gives it for the same producer without an e-mail. */
+function contactBlockWithoutEmail<T extends ContactBlock | null>(block: T): T {
+  if (!block || !block.email) return block;
+  if (!(block.address || block.phone || block.website)) return { vcardUrl: block.vcardUrl } as T;
+  return { ...block, email: null };
+}
+
+/** The list's contact blocks with the e-mail left out where this request is over the rfb limit (switch off: as given). */
+function guardContactBlocks<T extends { agentId: string; contact: ContactBlock | null }>(req: Request, res: Response, rows: T[]): T[] {
+  const withheld = emailWithheldIds(req, res, "rfb", rows.filter((r) => !!r.contact?.email).map((r) => r.agentId));
+  if (!withheld || withheld.size === 0) return rows;
+  return rows.map((r) => (withheld.has(r.agentId) ? { ...r, contact: contactBlockWithoutEmail(r.contact) } : r));
 }
 
 // dev-request 2026-07-04-rfb-datakvalitet item 1 (description sanitizer,
@@ -314,7 +341,7 @@ function escapeVCard(value: string): string {
 const VCARD_CHARSET = "CHARSET=UTF-8";
 const VCARD_NOTE_PREFIX = `NOTE;${VCARD_CHARSET}:`;
 
-function buildVCard(agentId: string): string | null {
+function buildVCard(agentId: string, emailAllowed: (agentId: string) => boolean = () => true): string | null {
   const info = knowledgeService.getAgentInfo(agentId);
   if (!info) return null;
   // S2c-1: the owner's contact / price / trust choices (null = as before).
@@ -329,7 +356,7 @@ function buildVCard(agentId: string): string | null {
   lines.push(`ORG;${VCARD_CHARSET}:${escapeVCard(agent.name)}`);
   if (k.about) lines.push(`${VCARD_NOTE_PREFIX}${escapeVCard(k.about)}`);
   if (isDisplayablePhone(k.phone)) lines.push(`TEL;TYPE=WORK,VOICE:${escapeVCard(k.phone)}`);
-  if (k.email) lines.push(`EMAIL;TYPE=WORK:${escapeVCard(k.email)}`);
+  if (k.email && emailAllowed(agentId)) lines.push(`EMAIL;TYPE=WORK:${escapeVCard(k.email)}`);
   if (k.website) lines.push(`URL:${escapeVCard(k.website)}`);
   if (k.address || agent.city) {
     // ADR;TYPE=WORK:;;<street>;<city>;<region>;<postal>;<country>
@@ -641,10 +668,14 @@ router.post("/discover", (req: Request, res: Response) => {
     }
 
     const ownerChoices = publicFieldChoicesForMany(results.map((r: any) => r.agent.id));
-    const enrichedResults = results.map((r: any) => ({
+    const contacts = guardContactBlocks(req, res, results.map((r: any) => ({
+      agentId: r.agent.id as string,
+      contact: buildContactBlock(r.agent.id, ownerChoices.get(r.agent.id)),
+    })));
+    const enrichedResults = results.map((r: any, i: number) => ({
       ...r,
       agent: withSanitizedDescription(r.agent),
-      contact: buildContactBlock(r.agent.id, ownerChoices.get(r.agent.id)),
+      contact: contacts[i]!.contact,
     }));
 
     // dev-request 2026-07-25 fix 0g(ii): structured discovery is a read-only
@@ -939,9 +970,13 @@ router.get("/search", async (req: Request, res: Response) => {
   const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 
   const ownerChoices = publicFieldChoicesForMany(results.map((r: any) => r.agent.id));
-  const enrichedResults = results.map((r: any) => {
+  const contacts = guardContactBlocks(req, res, results.map((r: any) => ({
+    agentId: r.agent.id as string,
+    contact: buildContactBlock(r.agent.id, ownerChoices.get(r.agent.id)),
+  })));
+  const enrichedResults = results.map((r: any, i: number) => {
     const choices = ownerChoices.get(r.agent.id);
-    const contact = buildContactBlock(r.agent.id, choices);
+    const contact = contacts[i]!.contact;
     // Skive A2: no profile link for roles whose /produsent/<slug> 404s.
     const profileUrl = failsProducerRoleGate(r.agent.role, false)
       ? undefined
@@ -1075,11 +1110,17 @@ router.get("/agents/:id/vcard", (req: Request, res: Response) => {
     res.status(404).json({ success: false, error: "Agent ikke funnet" });
     return;
   }
-  const vcard = buildVCard(agentId);
+  // S-A5: the EMAIL line follows the rfb per-IP limit (see guardContactBlocks).
+  let emailGuarded = false;
+  const vcard = buildVCard(agentId, (id) => {
+    emailGuarded = true;
+    return !emailWithheldIds(req, res, "rfb", [id])?.has(id);
+  });
   if (!vcard) {
     res.status(404).json({ success: false, error: "Agent ikke funnet" });
     return;
   }
+  if (!emailGuarded) emailWithheldIds(req, res, "rfb", []); // switch on: Cache-Control: private all the same
   const info = knowledgeService.getAgentInfo(agentId);
   const contentDisposition = vcardContentDisposition(info?.agent.name || "agent");
 
@@ -1136,7 +1177,9 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
     if (cityName) contact.city = cityName;
     contact.country = "Norway";
     if (isDisplayablePhone(k.phone)) contact.phone = k.phone;
-    if (k.email) contact.email = k.email;
+    // S-A5: the e-mail follows the rfb per-IP limit (see guardContactBlocks).
+    const emailWithheld = emailWithheldIds(req, res, "rfb", k.email ? [agentId] : []);
+    if (k.email && !emailWithheld?.has(agentId)) contact.email = k.email;
     if (k.website) contact.website = addUtmParams(k.website);
     if (Object.keys(contact).length > 1) card.contact = contact;
 
@@ -1720,6 +1763,11 @@ router.get("/agents/:id/info", (req: Request, res: Response) => {
   if (ownerChoices && !isOwnerRead) {
     info = publicAgentInfo(info, ownerChoices);
   }
+  // S-A5: knowledge.email follows the rfb per-IP limit (see
+  // guardContactBlocks); withheld it reads null, as a producer without one.
+  // The owner's own /selger read (X-Claim-Token) is not limited.
+  const infoEmailWithheld = emailWithheldIds(req, res, "rfb", info.knowledge.email && !isOwnerRead ? [agentId] : []);
+  if (infoEmailWithheld?.has(agentId)) info = withKnowledgeEmailNull(info);
   const data = {
     ...info,
     ...(provenance ? { provenance } : {}),
@@ -2423,19 +2471,29 @@ router.post("/agents/:id/unclaim", (req: Request, res: Response) => {
 
   try {
     const db = getDb();
-    // Remove this specific claim
-    db.prepare("DELETE FROM agent_claims WHERE agent_id = ? AND claim_token = ?").run(agentId, claimToken);
+    // One transaction: the claim goes and the login rows go with it, or
+    // neither does (dev-request 2026-11-06-rfb-krav-for-portal-og-okter-ved-
+    // eierskifte, spec point 2).
+    db.transaction(() => {
+      // Remove this specific claim
+      db.prepare("DELETE FROM agent_claims WHERE agent_id = ? AND claim_token = ?").run(agentId, claimToken);
 
-    // Check if any other verified claims remain for this agent
-    const remainingClaims = db.prepare(
-      "SELECT COUNT(*) as c FROM agent_claims WHERE agent_id = ? AND status = 'verified'"
-    ).get(agentId) as any;
+      // Check if any other verified claims remain for this agent
+      const remainingClaims = db.prepare(
+        "SELECT COUNT(*) as c FROM agent_claims WHERE agent_id = ? AND status = 'verified'"
+      ).get(agentId) as any;
 
-    if (remainingClaims.c === 0) {
-      // No owners left — reset verified status and data source
-      db.prepare("UPDATE agents SET is_verified = 0 WHERE id = ?").run(agentId);
-      db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ?").run(agentId);
-    }
+      if (remainingClaims.c === 0) {
+        // No owners left — reset verified status and data source
+        db.prepare("UPDATE agents SET is_verified = 0 WHERE id = ?").run(agentId);
+        db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ?").run(agentId);
+      }
+
+      // /eier sessions and open login links for the profile end here. A
+      // remaining verified co-owner keeps theirs (still an owner); with no
+      // owner left, every row for the profile is revoked.
+      revokeOwnerAccessExceptVerifiedOwners(db, agentId, "unclaim");
+    })();
 
     // Recalculate trust score
     trustScoreService.update(agentId);
@@ -2463,20 +2521,28 @@ router.post("/admin/agents/:id/reset-claim", (req: Request, res: Response) => {
 
   try {
     const db = getDb();
-    db.prepare("UPDATE agents SET is_verified = 0 WHERE id = ?").run(agentId);
-    // Ownership given by the order activation link (skive 2) is revoked here
-    // too; other claimed_via stamps are left as before.
-    db.prepare("UPDATE agents SET claimed_at = NULL, claimed_via = NULL WHERE id = ? AND claimed_via = 'activation_link'").run(agentId);
-    db.prepare("DELETE FROM agent_claims WHERE agent_id = ?").run(agentId);
-    db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ?").run(agentId);
-    // S1b punkt 7 (dev-request 2026-10-22-rfb-mine-valg-eierbrytere): a
-    // pending owner change of the order e-mail belongs to the old owner —
-    // kill it. Best-effort: a DB without the table never breaks reset-claim.
-    try {
-      db.prepare(
-        "UPDATE owner_order_email_change SET outcome = 'superseded', consumed_at = ? WHERE agent_id = ? AND outcome IS NULL AND consumed_at IS NULL"
-      ).run(new Date().toISOString(), agentId);
-    } catch { /* table missing — nothing pending */ }
+    // One transaction: ownership reset and login-row revocation succeed or
+    // fail together, so a reset never leaves the old owner's sessions live
+    // (dev-request 2026-11-06-rfb-krav-for-portal-og-okter-ved-eierskifte).
+    db.transaction(() => {
+      db.prepare("UPDATE agents SET is_verified = 0 WHERE id = ?").run(agentId);
+      // Ownership given by the order activation link (skive 2) is revoked here
+      // too; other claimed_via stamps are left as before.
+      db.prepare("UPDATE agents SET claimed_at = NULL, claimed_via = NULL WHERE id = ? AND claimed_via = 'activation_link'").run(agentId);
+      db.prepare("DELETE FROM agent_claims WHERE agent_id = ?").run(agentId);
+      db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ?").run(agentId);
+      // S1b punkt 7 (dev-request 2026-10-22-rfb-mine-valg-eierbrytere): a
+      // pending owner change of the order e-mail belongs to the old owner —
+      // kill it. Best-effort: a DB without the table never breaks reset-claim.
+      try {
+        db.prepare(
+          "UPDATE owner_order_email_change SET outcome = 'superseded', consumed_at = ? WHERE agent_id = ? AND outcome IS NULL AND consumed_at IS NULL"
+        ).run(new Date().toISOString(), agentId);
+      } catch { /* table missing — nothing pending */ }
+      // Every /eier session and open login link for the profile (no verified
+      // owner remains after the DELETE above).
+      revokeOwnerAccessExceptVerifiedOwners(db, agentId, "reset-claim");
+    })();
     trustScoreService.update(agentId);
     res.json({ success: true, message: "Claim and verification reset" });
   } catch (err: any) {

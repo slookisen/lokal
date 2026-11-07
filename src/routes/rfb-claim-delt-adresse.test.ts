@@ -262,6 +262,23 @@ export async function runRfbClaimDeltAdresseTests(opts: { log?: boolean } = {}):
       agent("nk-x1", { listed: "vert@nk.example.test", vertical: "experiences" });
       agent("nk-r1", { listed: "vert@nk.example.test" });
       eq(knowledgeService.isSharedKnownEmail("vert@nk.example.test"), false, "one: dental/experiences rows do not count (RFB only)");
+      // A deactivated or merged profile no longer shares the address.
+      agent("ia-surv", { listed: "lega@ia.example.test" });
+      agent("ia-dup", { listed: "lega@ia.example.test" });
+      eq(knowledgeService.isSharedKnownEmail("lega@ia.example.test"), true, "inactive: two active profiles share the address");
+      db.prepare("UPDATE agents SET is_active = 0 WHERE id = 'ia-dup'").run();
+      eq(knowledgeService.isSharedKnownEmail("lega@ia.example.test"), false, "inactive: the deactivated or merged duplicate no longer counts");
+      eq(knowledgeService.knownEmailHoldersOtherThan("lega@ia.example.test", "ia-surv"), [], "inactive: … nor as a holder");
+      const iaM0 = mails.length;
+      const iaR = await claim("ia-surv", { name: "Kari", email: "kari@annen.example.test" });
+      eq([iaR.status, iaR.body?.data?.status, mails.length], [200, "code_sent", iaM0 + 1], "inactive: the survivor's claim gets a code");
+      eq(knowledgeService.isSharedKnownEmail("lega@ia.example.test", "ia-dup"), true, "inactive: a claim on the inactive profile itself still sees the address as shared");
+      agent("ib-real", { listed: "kolonial@ia.example.test" });
+      agent("ib-stray", {});
+      outreach("ib-stray", "kolonial@ia.example.test");
+      eq(knowledgeService.isSharedKnownEmail("kolonial@ia.example.test"), true, "inactive: delivered outreach on another active profile shares the address");
+      db.prepare("UPDATE agents SET is_active = 0 WHERE id = 'ib-stray'").run();
+      eq(knowledgeService.isSharedKnownEmail("kolonial@ia.example.test"), false, "inactive: … and stops when that profile is deactivated");
       agent("nk-o1", {});
       outreach("nk-o1", "dentalout@nk.example.test", "dental");
       agent("nk-o2", { listed: "dentalout@nk.example.test" });

@@ -26,9 +26,9 @@
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
-import { isEligibleForRealOrder, orderCapNewPerDay, orderCapOpenPerBuyer } from "../services/cart-service";
+import { isEligibleForRealOrder, orderCapNewPerBuyerPerDay, orderCapNewPerDay, orderCapOpenPerBuyer, orderCapProducerCeilingPerDay } from "../services/cart-service";
 import { orderReminderHours, listAutoCompleteDue } from "../services/order-followups";
-import { isOrderCapNoticeEnabled, listOrderCapStats } from "../services/order-cap-notice";
+import { isOrderCapNoticeEnabled, isOrderCapV2Enabled, listOrderCapStats, ORDER_CAP_CEILING_PREWARN_AT } from "../services/order-cap-notice";
 import { isOrderAutocompleteEnabled, orderAutocompleteSinceMs } from "../services/order-lifecycle";
 
 const router = Router();
@@ -247,14 +247,29 @@ router.get("/cap-stats", (req: Request, res: Response) => {
   try {
     const db = _adminOrdersTestDb ?? getDb();
     const days = Number(req.query.days) || 30;
-    const rows = listOrderCapStats({ days, db });
+    // T11: with ORDER_CAP_V2_ENABLED on, the rows also carry the reason_detail
+    // counts and the internal admin alerts; off, the answer is unchanged.
+    const v2 = isOrderCapV2Enabled();
+    const rows = listOrderCapStats({ days, db, detail: v2 });
     res.json({
       success: true,
       notice_enabled: isOrderCapNoticeEnabled(),
-      caps: { new_per_producer_per_day: orderCapNewPerDay(), open_pending_per_buyer: orderCapOpenPerBuyer() },
+      caps: v2
+        ? {
+          new_per_producer_per_day: orderCapNewPerDay(), open_pending_per_buyer: orderCapOpenPerBuyer(),
+          v2_enabled: true, new_per_buyer_per_day: orderCapNewPerBuyerPerDay(),
+          producer_ceiling_per_day: orderCapProducerCeilingPerDay(), ceiling_prewarn_at: ORDER_CAP_CEILING_PREWARN_AT,
+        }
+        : { new_per_producer_per_day: orderCapNewPerDay(), open_pending_per_buyer: orderCapOpenPerBuyer() },
       window_days: Math.min(Math.max(Math.floor(days), 1), 365),
       total_producer_daily_cap: rows.reduce((n, r) => n + r.producer_daily_cap, 0),
       total_buyer_open_cap: rows.reduce((n, r) => n + r.buyer_open_cap, 0),
+      ...(v2
+        ? {
+          total_platform_ceiling: rows.reduce((n, r) => n + (r.platform_ceiling ?? 0), 0),
+          total_buyer_daily_cap: rows.reduce((n, r) => n + (r.buyer_daily_cap ?? 0), 0),
+        }
+        : {}),
       days: rows,
     });
   } catch (err) {
