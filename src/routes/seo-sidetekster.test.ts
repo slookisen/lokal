@@ -297,8 +297,9 @@ export function runSeoSideteksterTests(opts: { log?: boolean } = {}): Promise<Te
         // The producer answers by e-mail, as the server instructions say.
         assertTrue(/stays pending until the producer answers by e-mail/.test((require("./experiences-mcp") as typeof import("./experiences-mcp")).OPPLEVAGENT_MCP_INSTRUCTIONS),
           "ip-a21: the server instructions say the producer answers by e-mail, which ip-a11–a14 mirror");
-        // The producer types the discover_gardssalg description lists, seltzeri included.
-        const discoverDesc = manifest.registeredMcpTools("experiences").find((t) => t.name === "discover_gardssalg")?.description || "";
+        // The producer types the discover_gardssalg description lists, seltzeri included. Full description:
+        // since S7/S9 (A2A 2026-10-16-mcp-beskrivelser-intensjonsord-og-lint) the type list is in its second sentence.
+        const discoverDesc = manifest.registeredMcpToolDefinitions("experiences").find((t) => t.name === "discover_gardssalg")?.description || "";
         const gsCopy = (lang: "no" | "en") => seo.opplevagentMcpGuideTools(lang).find((t) => t.name === "discover_gardssalg");
         assertTrue(discoverDesc.includes("seltzeri") && ["seltzerier", "mjøderier", "gårdskafeer"].every((w) => gsCopy("no")?.cardHtml.includes(w))
           && ["seltzeri)", "mjøderi"].every((w) => gsCopy("no")?.faq.includes(w))

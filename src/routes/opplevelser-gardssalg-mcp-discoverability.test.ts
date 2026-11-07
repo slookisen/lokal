@@ -219,7 +219,7 @@ export function runOpplevelserGardssalgMcpDiscoverabilityTests(opts: { log?: boo
       assertTrue(!(liveResult.gardssalg_producers as any[]).some((p) => p.navn === "Skjult Gårdsmat AS"), "c5: hidden row still absent even with dispatch on globally (it is never returned by the query at all)");
 
       // ── (d, part 2) profile_url shape ────────────────────────────────────
-      assertEq(gmLiveLive?.profile_url, "https://opplevagent.no/kategori/gardssalg/produsent/gaardsmat-live", "d4: profile_url is built from the provider's slug");
+      assertEq(gmLiveLive?.profile_url, "https://opplevagent.no/kategori/gardssalg/produsent/gaardsmat-live?utm_source=node_sdk&utm_medium=mcp&utm_campaign=ai_search", "d4: profile_url is built from the provider's slug (AI-tagged over MCP, klikk-fra-ai-svar S3)");
 
       // ── zero-results shape ────────────────────────────────────────────────
       const zeroResult = await callTool("discover_gardssalg", { fylke: "Ingen-Fylke-Finnes" });

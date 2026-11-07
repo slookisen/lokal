@@ -351,6 +351,8 @@ interface GardssalgFixtureSnapshot {
   owner_feature_settings: any[];
   owner_feature_level_choice: any[];
   owner_feature_intro: any[];
+  /** T7: the «Nyheter og tips» question state (owner_feature_prompt). */
+  owner_feature_prompt: any[];
   experience_providers: Record<string, unknown> | null;
 }
 
@@ -363,6 +365,7 @@ export function snapshotGardssalgFixture(lokalDb: any, expDb: any, providerId: s
     owner_feature_settings: rows("owner_feature_settings"),
     owner_feature_level_choice: rows("owner_feature_level_choice"),
     owner_feature_intro: rows("owner_feature_intro"),
+    owner_feature_prompt: rows("owner_feature_prompt"),
     experience_providers: (expDb.prepare(`SELECT ${PROVIDER_COLUMNS.join(", ")} FROM experience_providers WHERE id = ?`).get(providerId) as Record<string, unknown> | undefined) ?? null,
   };
 }
@@ -401,7 +404,7 @@ function restoreSnapshot(lokalDb: any, expDb: any, providerId: string, snap: Gar
     if (r.changes !== 1) throw new Error("restore refused: experience_providers row not pinned");
   }
   lokalDb.transaction(() => {
-    for (const t of ["owner_feature_settings", "owner_feature_level_choice", "owner_feature_intro"] as const) {
+    for (const t of ["owner_feature_settings", "owner_feature_level_choice", "owner_feature_intro", "owner_feature_prompt"] as const) {
       if (!tableExists(lokalDb, t)) continue;
       lokalDb.prepare(`DELETE FROM ${t} WHERE vertical = ? AND subject_id = ?`).run(VERTICAL, providerId);
       insertRows(lokalDb, t, snap[t]);

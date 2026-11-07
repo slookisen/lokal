@@ -4,8 +4,8 @@ import { getDb } from "../database/init";
 import {
   verifyOwnerSession, isVerifiedOwner, OWNER_NOT_VERIFIED_MESSAGE, portalWriteRefusedPage,
   portalShell, ownerNotVerifiedPage,
-  ownerOrderEmailEnabled, currentOrderRecipient, pendingOrderEmailChange, requestOwnerOrderEmailChange,
-  parseResumeDate, ownerUnifiedSessionEnabled,
+  ownerOrderEmailEnabledFor, currentOrderRecipient, pendingOrderEmailChange, requestOwnerOrderEmailChange,
+  parseResumeDate, ownerUnifiedSessionEnabledFor,
 } from "./owner-portal";
 import { isCrossSiteWrite } from "../middleware/same-origin-write";
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
@@ -20,20 +20,29 @@ import { SlidingWindowCap } from "../services/a2a-traffic-classifier";
 import {
   applyOwnerLevel,
   applyOwnerSingleChange,
-  answerOwnerIntro,
+  answerOwnerNewsQuestion,
+  batchKeys,
   currentOwnerLevel,
   findOwnerLevel,
+  readOwnerLevelChoiceFor,
   getOwnerChangeBatch,
   latestUndoableBatch,
   ownerFeatureChangeLog,
   previewOwnerLevel,
-  readOwnerIntro,
+  readOwnerNewsState,
   undoOwnerChange,
+  type OwnerNewsAnswer,
 } from "../owner-features/changes";
-import { formatOwnerFeatureValue, ownerPageStatsFrom, renderOwnerFeaturesPageBody, type OwnerPageNotice, type OwnerPageStats } from "../owner-features/page";
+import {
+  OWNER_NEWS_ANSWER_TEXT, OWNER_NEWS_CONSENT_VERSION, OWNER_NEWS_PLACEMENTS, OWNER_NEWS_PLACEMENT_QUESTION, OWNER_NEWS_PLACEMENT_ROW,
+  type OwnerNewsPlacement,
+} from "../owner-features/news-consent";
+import { formatOwnerFeatureValue, ownerPageStatsFrom, renderOwnerFeaturesPageBody, renderOwnerFeaturesPageFragment, type OwnerPageModel, type OwnerPageNotice, type OwnerPageStats } from "../owner-features/page";
+import { OWNER_FRAGMENT_HEADER } from "../owner-ui/enhance";
 import {
   OWNER_ANCHOR_FALLBACK, OWNER_ANCHOR_LEVEL, OWNER_ANCHOR_LEVEL_PREVIEW, OWNER_ANCHOR_NEWS_QUESTION, OWNER_ANCHOR_PLANNED,
   isOwnerPageAnchor, ownerBatchAnchor, ownerPageTail, ownerPlannedAnchor, ownerRowAnchor, ownerUndoAnchor,
+  parseOwnerFragmentParam, withOwnerFragment,
 } from "../owner-features/anchors";
 import { getOwnerStats } from "../services/owner-stats-service";
 import { publicStatsMinViews } from "../services/public-stats-threshold";
@@ -207,11 +216,14 @@ router.put("/api/owner/:id/features/:key", (req: Request, res: Response) => {
 //   GET  /eier/:agentId/valg            the page (?niva= level confirm panel,
 //                                       ?bekreft=&verdi= switch confirm panel,
 //                                       ?side= change-log page, ?endret= /
-//                                       ?melding= the message at the bottom)
+//                                       ?melding= the message at the bottom;
+//                                       T9: ?fragment=<region>[,…] only those
+//                                       regions, unknown id → 404)
 //   POST /eier/:agentId/valg/sett       { key, value[, confirmed] } one entry
 //   POST /eier/:agentId/valg/niva       { level, confirmed } apply a level
 //   POST /eier/:agentId/valg/angre      { batch } undo the newest change
-//   POST /eier/:agentId/valg/intro      { answer: yes|no } first-login card
+//   POST /eier/:agentId/valg/intro      { answer: yes|later|never } the
+//                                       «Nyheter og tips» question (T7)
 // Same order of checks as the API: allowlist (404) → owner session (401) →
 // isVerifiedOwner (403) → [POST] Origin check (403) → per-session write limit
 // (shared with PUT: the PUT answers 429, a page POST 303 «For mange
@@ -250,9 +262,12 @@ function pageGate(req: Request): Gate {
   return { ok: true, agentId, token: session.token };
 }
 
-/** T5: 303 back to the page — `query` with the message placed at `anchor`, and `#anchor`. */
+/**
+ * T5: 303 back to the page — `query` with the message placed at `anchor`, and
+ * `#anchor`. T9: a POST sent by the script with `?fragment=` passes it on.
+ */
 function backTo(res: Response, agentId: string, query: string, anchor: string, opts: { place?: boolean } = {}): Response {
-  res.redirect(303, pagePath(agentId, ownerPageTail(query, anchor, opts)));
+  res.redirect(303, pagePath(agentId, ownerPageTail(withOwnerFragment(query, (res as any).req), anchor, opts)));
   return res;
 }
 
@@ -304,8 +319,10 @@ const PAGE_MESSAGES: Record<string, { ok: boolean; text: string }> = {
   angret: { ok: true, text: "Endringen er angret." },
   angre_umulig: { ok: false, text: "Denne endringen kan ikke angres lenger." },
   angre_endret: { ok: false, text: "Endringen kan ikke angres fordi valget er endret siden." },
-  intro_ja: { ok: true, text: "Takk! Svaret ditt er lagret: du vil ha nyheter og tips." },
-  intro_nei: { ok: true, text: "Takk! Svaret ditt er lagret: ingen nyheter og tips." },
+  // T7: the «Nyheter og tips» answers (shown in the group / the row).
+  intro_ja: { ok: true, text: OWNER_NEWS_ANSWER_TEXT.yes },
+  intro_ikke_na: { ok: true, text: OWNER_NEWS_ANSWER_TEXT.later },
+  intro_nei: { ok: true, text: OWNER_NEWS_ANSWER_TEXT.never },
   ugyldig: { ok: false, text: "Verdien er ikke gyldig." },
   feil: { ok: false, text: "Klarte ikke å lagre. Prøv igjen." },
   for_mange: { ok: false, text: "For mange endringer. Prøv igjen om litt." },
@@ -369,7 +386,7 @@ function itemsHref(agentId: string): string {
   const id = encodeURIComponent(agentId);
   // B1: with the orderability card on, it is the place to make items orderable.
   if (ownerOrderabilityPortalEnabledFor(agentId)) return `/eier/${id}/portal#bestillbare-varer`;
-  return ownerUnifiedSessionEnabled() ? `/eier/${id}/portal#produkter` : `/selger?agent=${id}`;
+  return ownerUnifiedSessionEnabledFor(agentId) ? `/eier/${id}/portal#produkter` : `/selger?agent=${id}`;
 }
 
 /**
@@ -436,6 +453,14 @@ function batchNotice(agentId: string, batchId: number): OwnerPageNotice | null {
   return { ok: true, text, undoBatchId: undoable && undoable.id === batch.id ? batch.id : null };
 }
 
+/** T7: is batch `batchId` a single comms.news change (not an undo, not a level)? */
+function isNewsBatch(agentId: string, batchId: number): boolean {
+  const batch = getOwnerChangeBatch(VERTICAL, agentId, batchId);
+  if (!batch || batch.kind !== "single") return false;
+  const keys = batchKeys(batch);
+  return keys.length === 1 && keys[0] === "comms.news";
+}
+
 router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
   try {
     const g = pageGate(req);
@@ -459,6 +484,9 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
     if (Number.isFinite(changedId) && changedId > 0) {
       notice = batchNotice(agentId, changedId);
       if (notice && !noticeAt) noticeAt = ownerBatchAnchor(VERTICAL, agentId, changedId, db);
+      // T7: «Ja takk» says so in its own words («Angre» stays on the message) —
+      // only when that batch is the comms.news change; else the normal message.
+      if (notice && qs("melding") === "intro_ja" && isNewsBatch(agentId, changedId)) notice = { ...notice, text: OWNER_NEWS_ANSWER_TEXT.yes };
     }
     const msg = own(PAGE_MESSAGES, qs("melding"));
     if (!notice && msg) notice = { ok: msg.ok, text: msg.text };
@@ -479,9 +507,9 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
 
     const page = Number.parseInt(qs("side"), 10);
     const log = ownerFeatureChangeLog(VERTICAL, agentId, Number.isFinite(page) ? page : 1);
-    // v2 principle 8: the first-login card asks only while «Nyheter og tips»
-    // has no answer — neither on the card nor set in its row.
-    const newsAnswered = resolvedKey("comms.news")?.source === "owner";
+    // T7: the «Nyheter og tips» question (top of #gruppe-comms) and the row's
+    // «Du sa ja/nei {dato}» — read only, a GET writes nothing.
+    const news = readOwnerNewsState(VERTICAL, agentId, resolved, { db });
     let orderable: { count: number; itemsHref: string } | null = null;
     try { orderable = { count: countOwnerOrderableItems(agentId, db), itemsHref: itemsHref(agentId) }; } catch (e) {
       console.error("[owner-features] orderable count failed:", e);
@@ -490,16 +518,19 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
     let orderEmail: { enabled: boolean; current: string | null; pending: string | null } | null = null;
     try {
       orderEmail = {
-        enabled: ownerOrderEmailEnabled(),
+        enabled: ownerOrderEmailEnabledFor(agentId),
         current: currentOrderRecipient(agentId),
         pending: pendingOrderEmailChange(agentId)?.new_email ?? null,
       };
     } catch { orderEmail = null; }
-    const body = renderOwnerFeaturesPageBody({
+    const model: OwnerPageModel = {
       agent: { id: agent.id, name: String(agent.name || "") },
       resolved,
       level: currentOwnerLevel(VERTICAL, agentId, resolved),
-      showIntro: !readOwnerIntro(VERTICAL, agentId) && !newsAnswered,
+      // T8: who chose — read only (the status line's «Du valgte …»).
+      levelChoice: readOwnerLevelChoiceFor(VERTICAL, agentId, { db }),
+      showIntro: news.showQuestion,
+      newsAnswer: news.answer,
       notice,
       noticeAt,
       confirm,
@@ -513,9 +544,19 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
       orderTimings: { reminderHours: orderReminderHours(), autocancelHours: orderAutocancelHours(), dailyCap: orderCapNewPerDay(), capNotice: isOrderCapNoticeEnabled() },
       stats: ownerPageStats(agent.id, String(agent.name || ""), db),
       statsHref: ownerStatsHref(agent.id),
-    });
+    };
     res.setHeader("Cache-Control", "no-store");
-    return res.send(portalShell(`Mine valg · ${agent.name}`, body));
+    // T9: `?fragment=` → only those regions (same render), after the same gate; a GET writes nothing.
+    const fragment = qs("fragment");
+    if (fragment !== "") {
+      const ids = parseOwnerFragmentParam(fragment);
+      const html = ids ? renderOwnerFeaturesPageFragment(model, ids) : null;
+      if (html === null) return res.status(404).type("text/plain").send("Fant ikke delen av siden.");
+      res.setHeader(OWNER_FRAGMENT_HEADER, ids!.join(","));
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      return res.send(html);
+    }
+    return res.send(portalShell(`Mine valg · ${agent.name}`, renderOwnerFeaturesPageBody(model)));
   } catch (e: any) {
     console.error("[owner-features] GET /eier/:agentId/valg failed:", e);
     return simplePage(500, "Feil", `<h1>Noe gikk galt</h1><p>Prøv igjen senere.</p>`)(res);
@@ -549,8 +590,13 @@ router.post("/eier/:agentId/valg/sett", express.urlencoded({ extended: false }),
       if (!until) return backTo(res, agentId, "melding=ugyldig_dato", anchor);
     }
     const db = getDb();
+    // T7: a consent key changed in its row records the place (and, for
+    // comms.news, the consent text version) on its audit row.
+    const consent = e.consent
+      ? { textVersion: e.key === "comms.news" ? OWNER_NEWS_CONSENT_VERSION : null, placement: OWNER_NEWS_PLACEMENT_ROW }
+      : null;
     const out = db.transaction(() => {
-      const o = applyOwnerSingleChange(VERTICAL, agentId, key, value, { actor: "owner", detail: sessionEmail(g.token) });
+      const o = applyOwnerSingleChange(VERTICAL, agentId, key, value, { actor: "owner", detail: sessionEmail(g.token), consent });
       if (until && o.result.kind === "ok" && o.result.changed) {
         db.prepare(`UPDATE ${OWNER_PAUSE_TABLE} SET pause_until = ? WHERE agent_id = ?`).run(until, agentId);
       }
@@ -585,6 +631,9 @@ router.post("/eier/:agentId/valg/niva", express.urlencoded({ extended: false }),
     // T5: the preview stands inside the level card.
     if (body.confirmed !== "1") return backTo(res, agentId, `niva=${encodeURIComponent(level.key)}`, OWNER_ANCHOR_LEVEL_PREVIEW, { place: false });
     const out = applyOwnerLevel(VERTICAL, agentId, level.key, { actor: "owner", detail: sessionEmail(g.token) });
+    // T10: a hard requirement is missing — nothing was written; back to the
+    // preview, which lists «Dette mangler» and has no confirm button.
+    if (out.kind === "not_ready") return backTo(res, agentId, `niva=${encodeURIComponent(level.key)}`, OWNER_ANCHOR_LEVEL_PREVIEW, { place: false });
     if (out.kind !== "ok") return backTo(res, agentId, "melding=feil", anchor);
     if (out.batchId) {
       console.log(`[owner-features] owner chose level ${level.key} for agent ${agentId}: ${out.changed.join(",")}`);
@@ -634,8 +683,15 @@ router.post("/eier/:agentId/valg/angre", express.urlencoded({ extended: false })
   }
 });
 
+/** The form's answer → yes | later | never ("no" from a page cached before T7 = an explicit no). */
+function newsAnswerOf(raw: unknown): OwnerNewsAnswer | null {
+  if (raw === "yes" || raw === "later" || raw === "never") return raw;
+  if (raw === "no") return "never";
+  return null;
+}
+
 router.post("/eier/:agentId/valg/intro", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
-  // T5: the news question's answer lands on its group (the row: #valg-comms.news).
+  // T5/T7: the question stands in #gruppe-comms; «Ja takk» lands on its row (#valg-comms.news).
   const anchor = OWNER_ANCHOR_NEWS_QUESTION;
   try {
     const g = pageGate(req);
@@ -644,11 +700,16 @@ router.post("/eier/:agentId/valg/intro", express.urlencoded({ extended: false })
     if (guard) return guard(res);
     const agentId = g.agentId;
     const body = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
-    const answer = body.answer === "yes" ? "yes" : body.answer === "no" ? "no" : null;
+    const answer = newsAnswerOf(body.answer);
     if (!answer) return backTo(res, agentId, "melding=ugyldig", anchor);
-    const out = answerOwnerIntro(VERTICAL, agentId, answer, { actor: "owner", detail: sessionEmail(g.token) });
-    if (out.batchId) return backTo(res, agentId, `endret=${out.batchId}`, anchor, { place: false });
-    return backTo(res, agentId, `melding=${answer === "yes" ? "intro_ja" : "intro_nei"}`, anchor);
+    const placement: OwnerNewsPlacement = (OWNER_NEWS_PLACEMENTS as readonly string[]).includes(String(body.placement))
+      ? (body.placement as OwnerNewsPlacement)
+      : OWNER_NEWS_PLACEMENT_QUESTION;
+    const out = answerOwnerNewsQuestion(VERTICAL, agentId, answer, { actor: "owner", detail: sessionEmail(g.token) }, { placement });
+    if (out.kind !== "ok") return backTo(res, agentId, "melding=ingen_endring", anchor);
+    console.log(`[owner-features] owner answered the news question (${answer}) for agent ${agentId}`);
+    if (out.batchId) return backTo(res, agentId, `endret=${out.batchId}&melding=intro_ja`, anchor, { place: false });
+    return backTo(res, agentId, `melding=${answer === "yes" ? "intro_ja" : answer === "later" ? "intro_ikke_na" : "intro_nei"}`, anchor);
   } catch (e: any) {
     console.error("[owner-features] POST valg/intro failed:", e);
     return backTo(res, String(req.params.agentId || ""), "melding=feil", anchor);

@@ -987,7 +987,8 @@ function initSchema(db: Database.Database): void {
     -- bounces») ───────────────────────────────────────────────────
     -- Idempotency ledger for POST /webhooks/resend (routes/resend-webhook.ts).
     -- One row per svix-id Resend delivered for an event we ACT on
-    -- (email.bounced / email.complained); unrelated event types write nothing.
+    -- (email.bounced / email.complained / email.delivered); unrelated event
+    -- types write nothing.
     -- Svix retries the same svix-id until it gets a 2xx, so a PRIMARY KEY on
     -- it turns a replay into a no-op. Holds the recipient address and the
     -- outcome only — never the payload (subject/body/from are not stored).
@@ -998,6 +999,28 @@ function initSchema(db: Database.Database): void {
       outcome TEXT NOT NULL,
       received_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    -- ─── email_delivery_events (eierkrav skive C2, 2026-11-06) ─────
+    -- One row per Resend email.delivered event (routes/resend-webhook.ts →
+    -- services/resend-webhook.ts), so a verifier can tell "delivered to the
+    -- receiving MTA" from "only handed to Resend". svix_id UNIQUE = the same
+    -- idempotency key as resend_webhook_events (a Svix retry is a no-op).
+    -- crm_message_id: the OUTBOUND crm_messages row this delivery was
+    -- attributed to by recipient + time (we send through Resend's SMTP relay
+    -- and never learn Resend's email_id at send time), NULL when none fits.
+    -- Plain TEXT, no FK: purely additive, never constrains crm_messages.
+    -- Recipient address only — never subject/body/headers.
+    CREATE TABLE IF NOT EXISTS email_delivery_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      svix_id TEXT NOT NULL UNIQUE,
+      resend_email_id TEXT,
+      email TEXT NOT NULL,
+      delivered_at TEXT NOT NULL,
+      crm_message_id TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_email_delivery_events_email ON email_delivery_events(email, delivered_at);
+    CREATE INDEX IF NOT EXISTS idx_email_delivery_events_crm_message ON email_delivery_events(crm_message_id);
 
 
     -- Analytics indexes (for fast aggregation)
@@ -4467,6 +4490,31 @@ function initSchema(db: Database.Database): void {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_agents_org_nr ON agents(org_nr) WHERE org_nr IS NOT NULL`);
   } catch { /* partial index unsupported or already created */ }
 
+  // ─── Økologi S3c (A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-
+  // register-og-tekstrevisjon): an org.nr. the OWNER typed in the portal ────
+  // (POST /eier/:agentId/org-nr). A CANDIDATE only: the Debio register sync
+  // turns it into a pending debio_match_review row (match_method
+  // 'owner_org_nr') that a person approves. Never copied into agents.org_nr,
+  // which the sync treats as a safe automatic match.
+  //
+  // A side table, NOT new columns on `agents`: a wider `agents` row flips
+  // SQLite's index choice for the unordered public scans (see the økologi S1
+  // note at agent_debio_status; dyre-oppslag-tak, strukturerte-lister-tak and
+  // name-search-fts fail with two extra TEXT columns on `agents`).
+  //   owner_org_nr    : 9 digits, MOD11-checked
+  //   owner_org_nr_at : ISO-8601 of the owner's save
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_owner_org_nr (
+        agent_id TEXT PRIMARY KEY,
+        owner_org_nr TEXT NOT NULL,
+        owner_org_nr_at TEXT NOT NULL
+      )
+    `);
+  } catch (err) {
+    console.error("Migration agent_owner_org_nr (økologi S3c) failed:", err);
+  }
+
   // ─── agents_org_nr_audit / agents_org_nr_review_queue (dev-request ─────
   // 2026-07-26-rfb-outreach-tilsig-blokkerdiagnose-og-orgnr, Steg 2) ────────
   //
@@ -5714,7 +5762,9 @@ function initSchema(db: Database.Database): void {
         new_json TEXT,
         actor TEXT NOT NULL,
         actor_detail TEXT,
-        at TEXT NOT NULL
+        at TEXT NOT NULL,
+        text_version TEXT,
+        placement TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_owner_feature_audit_subject
         ON owner_feature_audit(vertical, subject_id, at);
@@ -5810,6 +5860,42 @@ function initSchema(db: Database.Database): void {
     `);
   } catch (err) {
     console.error("Migration owner_feature_level_choice failed:", err);
+  }
+
+  // ─── eierportal testrunde 1, T7 — «Nyheter og tips» nederst ─────────────
+  // owner_feature_audit.text_version / placement: nullable, written only for
+  // consent keys (comms.news): which version of the consent text the owner
+  // saw (owner-features/news-consent.ts) and where it was answered
+  // ('mine_valg_question' / 'mine_valg_row'; T15 adds the Oversikt place).
+  // Added to the CREATE TABLE above for new databases; idempotent ALTER for
+  // existing ones. owner_feature_prompt: one row per (subject, question key)
+  // — state 'later' (rounds = how many times «Ikke nå», snoozed_until = when
+  // the question may come back), 'yes' or 'never' (answered_at = the time of
+  // the explicit answer). «Ikke nå» writes no owner_feature_settings and no
+  // audit row. A subject with an owner_feature_intro row (S2b first-login
+  // card) counts as answered. No CHECK on state, so a later slice can add a
+  // state without a table rebuild; the code validates it. Times are ISO-8601.
+  // Additive only.
+  try {
+    const have = new Set((db.prepare(`PRAGMA table_info(owner_feature_audit)`).all() as Array<{ name: string }>).map((c) => c.name));
+    for (const col of ["text_version", "placement"]) {
+      if (!have.has(col)) db.exec(`ALTER TABLE owner_feature_audit ADD COLUMN ${col} TEXT`);
+    }
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS owner_feature_prompt (
+        vertical TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        state TEXT NOT NULL,
+        rounds INTEGER NOT NULL DEFAULT 0,
+        snoozed_until TEXT,
+        answered_at TEXT,
+        actor_detail TEXT,
+        PRIMARY KEY (vertical, subject_id, key)
+      );
+    `);
+  } catch (err) {
+    console.error("Migration owner_feature_prompt / owner_feature_audit consent columns failed:", err);
   }
 
   // ─── dev-request 2026-07-31-rfb-poolgate-uten-telefon-og-batchkapasitet
@@ -6377,6 +6463,33 @@ function initSchema(db: Database.Database): void {
     console.error("Migration order_activation_links failed:", err);
   }
 
+  // ─── claim_action_links (dev-request 2026-10-30-rfb-eierkrav-automatisk-
+  // vurdering-og-ettklikk, slice C4 — signerte ett-klikks-lenker) ──────────
+  // One row per admin-minted, HMAC-signed one-time link that approves,
+  // rejects or revokes one owner claim (services/claim-action-link.ts). The
+  // token itself is never stored: `nonce_hash` is sha256(nonce) hex. `used_at`
+  // is the single-use guard (a conditional UPDATE … WHERE used_at IS NULL in
+  // the same transaction as the claim decision); `used_result` records the
+  // outcome. Additive; brand-new table.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS claim_action_links (
+        id TEXT PRIMARY KEY,
+        nonce_hash TEXT NOT NULL UNIQUE,
+        claim_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        created_by TEXT NOT NULL DEFAULT 'admin',
+        used_at TEXT,
+        used_result TEXT
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_claim_action_links_claim ON claim_action_links(claim_id)`);
+  } catch (err) {
+    console.error("Migration claim_action_links failed:", err);
+  }
+
   // ─── product_import_runs / product_import_run_results (dev-request
   // 2026-10-21-rfb-produktimport-fra-egen-nettside, Skive 1) ──────────────
   // The dry-run measurement (POST /admin/product-import/dry-run, flag
@@ -6541,6 +6654,36 @@ function initSchema(db: Database.Database): void {
     );
   } catch (err) {
     console.error("Migration product_import_outreach_events failed:", err);
+  }
+
+  // ─── product_auto_sync_state (Produktimport skive 4-1) ──────────────────
+  // Weekly auto-sync of a verified owner's products from their own website
+  // (flag PRODUCT_AUTO_SYNC_ENABLED, default off). One row per profile:
+  // product_sync_mode ('off' | 'weekly'; a profile without a row is 'off'),
+  // the consecutive lock/failure count, the last run / last success, the last
+  // change summary (JSON) and the last lock reason; after 3 locks in a row the
+  // job sets the mode back to 'off' with disabled_reason. Runs are logged in
+  // product_import_runs with mode 'auto_sync'; new products wait there as
+  // 'pending' candidates. Additive, brand-new table, idempotent.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS product_auto_sync_state (
+        agent_id TEXT PRIMARY KEY,
+        product_sync_mode TEXT NOT NULL DEFAULT 'off',
+        consecutive_blocks INTEGER NOT NULL DEFAULT 0,
+        last_run_at TEXT,
+        last_run_id TEXT,
+        last_success_at TEXT,
+        last_change_summary TEXT,
+        last_block_reason TEXT,
+        disabled_reason TEXT,
+        disabled_at TEXT,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_product_auto_sync_state_mode ON product_auto_sync_state(product_sync_mode, last_run_at)`);
+  } catch (err) {
+    console.error("Migration product_auto_sync_state failed:", err);
   }
 
   // ─── S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok ──────────────

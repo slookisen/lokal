@@ -49,7 +49,7 @@ import { isJunkDescription, looksTruncatedMidWord } from "../services/descriptio
 // dev-request 2026-10-16-utgaende-lenker-utm-eller-referrer-policy (S1): links
 // to the provider's own website carry UTM; booking_url, «Kilde:» and JSON-LD
 // url/sameAs stay as stored.
-import { addUtmParams, OUTBOUND_UTM } from "../utils/url-utm";
+import { addUtmParams, OUTBOUND_UTM, withRequestQuery } from "../utils/url-utm";
 const PROVIDER_SITE_UTM = OUTBOUND_UTM.opplevagent.provider_profile;
 const GARDSSALG_SITE_UTM = OUTBOUND_UTM.opplevagent.gardssalg_profile;
 // dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E1-S1:
@@ -95,6 +95,7 @@ import { INDEXNOW_KEY } from "../services/indexnow-service";
 import { htmlLangAttr, ogLocale, localizedPath, isSvLocaleEnabled, type Lang } from "../i18n/t";
 import { getPublishedProfileTranslations } from "../services/profile-translations";
 import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
+import { BRAND_ENTITIES, brandMcpIcons } from "../config/brand-entities";
 import {
   listCategories,
   getPublishedExperienceBySlug,
@@ -3323,7 +3324,7 @@ function experiencesMcpServerCard() {
       url: "https://github.com/slookisen/lokal",
     },
     documentation: `${url}/llms.txt`,
-    icon: `${url}/favicon.svg`,
+    icon: brandMcpIcons(BRAND_ENTITIES.experiences)?.[0]?.src, // the 512 PNG logo (was favicon.svg), as serverInfo icons[0]
     // T3: the organisation behind the server is the company (same as the agent
     // card's provider); `name`/`title` above keep the brand.
     vendor: {
@@ -8872,7 +8873,7 @@ router.get("/tilbyder/:providerSlugOrId", (req: Request, res: Response, next: Ne
     try { provider = getPublishedProviderById(param); } catch { provider = null; }
     if (!provider) return next();
     const slug = provider.slug as string | null;
-    if (slug) { res.redirect(301, `/tilbyder/${encodeURIComponent(slug)}`); return; }
+    if (slug) { res.redirect(301, withRequestQuery(`/tilbyder/${encodeURIComponent(slug)}`, req.originalUrl)); return; }
     // No slug yet (backfill race) — serve by ID temporarily
   } else {
     // Normal slug-based lookup
@@ -9591,7 +9592,7 @@ router.get("/opplevelse/:slug", (req: Request, res: Response, next: NextFunction
       canonicalSlug = null;
     }
     if (canonicalSlug && canonicalSlug !== slug) {
-      res.redirect(301, `/opplevelse/${encodeURIComponent(canonicalSlug)}`);
+      res.redirect(301, withRequestQuery(`/opplevelse/${encodeURIComponent(canonicalSlug)}`, req.originalUrl));
       return;
     }
     return next(); // → Norwegian 404 catch-all (no rfb/dental leak)
@@ -10804,12 +10805,12 @@ const OA_MCP_GUIDE_TOOL_COPY: Record<string, Record<GuideLang, GuideToolCopy>> =
   },
   discover_gardssalg: {
     no: {
-      card: "Finner gårdssalg: bryggerier, ciderier, vingårder, destillerier, gårdskafeer, mjøderier og seltzerier som selger rett fra gården. Filtrer på fylke, kommune og produsenttype, eller slå opp én produsent ved navn og sted i <code>query</code>, f.eks. «Fjordgard Bryggeri». Med <code>lat</code>/<code>lng</code> kommer de nærmeste først. Returnerer navn, sted, produsenttype, profilside og om produsenten tar imot besøksforespørsler nå.",
-      faq: "discover_gardssalg finner drikkeprodusenter med gårdssalg (bryggeri, cideri, vingård, destilleri, gårdskafé, mjøderi og seltzeri) etter fylke, kommune og type, eller én produsent ved navn i query",
+      card: "Finner norske drikkeprodusenter å besøke eller smake hos: bryggerier, siderier, vingårder, destillerier, mjøderier, gårdskafeer og seltzerier med gårdssalg. Verktøyet selger eller bestiller ikke produkter. Filtrer på fylke, kommune og produsenttype, eller slå opp én produsent ved navn og sted i <code>query</code>, f.eks. «Fjordgard Bryggeri». Med <code>lat</code>/<code>lng</code> kommer de nærmeste først. Returnerer navn, sted, produsenttype, profilside og om produsenten tar imot besøksforespørsler nå.",
+      faq: "discover_gardssalg finner drikkeprodusenter med gårdssalg å besøke eller smake hos (bryggeri, sideri, vingård, destilleri, gårdskafé, mjøderi og seltzeri) etter fylke, kommune og type, eller én produsent ved navn i query (verktøyet selger eller bestiller ikke produkter)",
     },
     en: {
-      card: "Finds farm sales (gårdssalg): breweries, cideries, wineries, distilleries, farm cafés, meaderies, and seltzer makers that sell straight from the farm. Filter by county (fylke), municipality (kommune), and producer type, or look up one producer by name and place in <code>query</code>, e.g. \"Fjordgard Bryggeri\". With <code>lat</code>/<code>lng</code> the nearest come first. Returns name, location, producer type, profile page, and whether the producer takes visit requests right now.",
-      faq: "discover_gardssalg finds drink producers with a farm sale (brewery, cidery, winery, distillery, farm café, meadery, and seltzer maker) by county, municipality, and type, or one producer by name in query",
+      card: "Finds Norwegian drink producers to visit or taste at: breweries, cideries, wineries, distilleries, meaderies, farm cafés, and seltzer makers with a farm sale (gårdssalg). The tool does not sell or order products. Filter by county (fylke), municipality (kommune), and producer type, or look up one producer by name and place in <code>query</code>, e.g. \"Fjordgard Bryggeri\". With <code>lat</code>/<code>lng</code> the nearest come first. Returns name, location, producer type, profile page, and whether the producer takes visit requests right now.",
+      faq: "discover_gardssalg finds drink producers with a farm sale to visit or taste at (brewery, cidery, winery, distillery, farm café, meadery, and seltzer maker) by county, municipality, and type, or one producer by name in query (the tool does not sell or order products)",
     },
   },
   book_gardssalg: {

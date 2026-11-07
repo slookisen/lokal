@@ -683,6 +683,13 @@ export async function runAdminEnrichmentWritePauseTests(
         // experiences pause before every apply tick (the services it drives do
         // not check it themselves).
         "services/experience-orgnr-job.ts",
+        // Step 3f: the gårdssalg website-verification daily job checks the
+        // experiences pause before every apply page (and treats a pause thrown
+        // by the apply as paused).
+        "services/gardssalg-website-verification-job.ts",
+        // Step 3m: the gårdssalg review-queue parking daily job checks the
+        // experiences pause before every apply run.
+        "services/gardssalg-website-review-queue-park-job.ts",
         // The description proposals job itself no longer imports the guard:
         // its mechanics moved VERBATIM into services/proposal-file-queue.ts
         // (tillegg 2026-10-15 «4b-forslag»), which checks the experiences
@@ -696,6 +703,10 @@ export async function runAdminEnrichmentWritePauseTests(
         // row through opplevelser.ts's shared helper. Its test file sets the
         // pause via the service to prove both.
         "services/experience-content-judgement-job.test.ts",
+        // gardssalg-website-judgement-job (skive 3j, same dev-request): same
+        // shape as the content-judgement job above; its test file sets the
+        // pause via the service to prove the whole-file gate.
+        "services/gardssalg-website-judgement-job.test.ts",
         // gardssalg-content-refresh-job («4b-det», A2A dev-request 2026-10-06-
         // experiences-enrichment-plattformjobb-og-felles-serverjobbramme,
         // tillegg 2026-10-15): the daily job drives the SAME shared core as

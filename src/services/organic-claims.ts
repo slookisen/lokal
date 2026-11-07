@@ -217,3 +217,58 @@ export function isOrganicClaimUmbrella(u: { umbrella_type?: unknown; name?: unkn
   if (u.umbrella_type === "certification") return true;
   return containsOrganicClaim(String(u.name ?? "")) || containsOrganicClaim(String(u.labels ?? ""));
 }
+
+/** Sentence-ending marks for dropOrganicSentences. */
+const SENTENCE_END = new Set([".", "!", "?", "…"]);
+
+/**
+ * `text` cut into sentences, each with the whitespace that followed it in the
+ * original. A sentence ends at a run of `.` `!` `?` `…` followed by
+ * whitespace or the end of the text, or at a newline — so «1.5», «kr 49.90»,
+ * «f.eks.» inside a sentence, «post@gard.no» and URLs never split a sentence.
+ * Joining every piece's `body + sep` gives back `text` exactly.
+ */
+function splitSentencesVerbatim(text: string): Array<{ body: string; sep: string }> {
+  const out: Array<{ body: string; sep: string }> = [];
+  const isWs = (c: string | undefined) => c !== undefined && /\s/.test(c);
+  let start = 0;
+  let i = 0;
+  const cut = (bodyEnd: number) => {
+    let k = bodyEnd;
+    while (k < text.length && isWs(text[k])) k++;
+    out.push({ body: text.slice(start, bodyEnd), sep: text.slice(bodyEnd, k) });
+    start = k;
+    i = k;
+  };
+  while (i < text.length) {
+    const c = text[i];
+    if (SENTENCE_END.has(c)) {
+      let j = i;
+      while (j < text.length && SENTENCE_END.has(text[j])) j++;
+      if (j === text.length || isWs(text[j])) { cut(j); continue; }
+      i = j;
+      continue;
+    }
+    if (c === "\n" || c === "\r") { cut(i); continue; }
+    i++;
+  }
+  if (start < text.length) out.push({ body: text.slice(start), sep: "" });
+  return out;
+}
+
+/**
+ * Økologi S3c (read step): `text` without the sentences that carry an organic
+ * claim (see splitSentencesVerbatim for where a sentence ends). A sentence
+ * where containsOrganicClaim() is true is dropped; every kept sentence comes
+ * back byte-for-byte, each followed by its own original separator (space,
+ * line break, blank line); the result is trimmed at both ends. Nothing left →
+ * "". Text without an organic claim comes back unchanged (same string). Used
+ * for owner-written prose on the public profile of a producer without a
+ * valid Debio status.
+ */
+export function dropOrganicSentences(text: unknown): string {
+  if (typeof text !== "string" || !text) return "";
+  if (!containsOrganicClaim(text)) return text;
+  const kept = splitSentencesVerbatim(text).filter((p) => p.body.trim() && !containsOrganicClaim(p.body));
+  return kept.map((p) => p.body + p.sep).join("").trim();
+}

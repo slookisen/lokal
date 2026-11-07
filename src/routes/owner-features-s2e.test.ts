@@ -8,9 +8,16 @@
  *         beskjed» stores ONE interest row per (subject, key) and changes no
  *         effect; admins read the counts (GET /admin/owner-features/interest);
  *         an API call that tries to change a coming_soon key → 409, no effect.
- *   AC26  exactly two levels; a stored «aktiv» / «full_fart» reads as «Ta imot
- *         bestillinger» and changes no switch; a level is marked only after
- *         the owner's own choice (armed test producer: none marked).
+ *   AC26  exactly two levels. T8 (dev-request 2026-10-30-rfb-eierportal-
+ *         testrunde-1, AC4): «minst_mulig» / «utnytte_mulighetene» with only
+ *         live keys; stored or linked old keys («bare_synlig»,
+ *         «ta_imot_bestillinger», «aktiv», «full_fart») give the right level
+ *         and change no switch; the level that applies is computed from the
+ *         switches, «Gjelder nå» on its card; the status line says who chose
+ *         (default owner «Du står på standardvalgene …», armed test producer
+ *         «Valgene dine passer med «Utnytte mulighetene».», never «Du
+ *         valgte»); one exception → «Tilpasset … 1 unntak» + «Unntak»; a
+ *         level never changes comms.news or visibility.profile.
  *   AC27  over the whole registry: an unbuilt entry has no value text, in its
  *         row or in «Slik er du nå».
  *   AC28  the orders.enabled row has the explanation and the prerequisite
@@ -21,8 +28,8 @@
  *         profile with «Mine valg»; both choices (and the order address) are
  *         in «Mine valg» with the same effect (the 12-surface pause matrix and
  *         the order-address case live in owner-feature-matrix.test.ts).
- *   AC30  «Ja takk» on the first-login card → the «Nyheter og tips» row shows
- *         «På» at once.
+ *   AC30  «Ja takk» on the «Nyheter og tips» question (T7: in #gruppe-comms,
+ *         no first-login card) → the row shows «På» at once.
  *   plus  principle 7 wording, principle 9 (foldable cards, jump links,
  *         row-swap forms), escaping of the new parts.
  *
@@ -58,6 +65,8 @@ const EMPTY_ID = "s2e-empty";
 const TWO_ID = "s2e-two";
 const LEGACY_AKTIV_ID = "s2e-legacy-aktiv";
 const LEGACY_FULL_ID = "s2e-legacy-full";
+const LEGACY_TAIB_ID = "s2e-legacy-taib";
+const LEGACY_BARE_ID = "s2e-legacy-bare";
 const NEWS_NO_ID = "s2e-news-no";
 const NEWS_ROW_ID = "s2e-news-row";
 const OTHER_ID = "s2e-other";
@@ -204,11 +213,13 @@ export async function runOwnerFeaturesS2eTests(opts: { log?: boolean } = {}): Pr
     seedProducer(db, TWO_ID, { products: [OK, OK, { availability: "out_of_stock", source: "admin_producer_confirmed" }, { availability: "in_stock", source: "enrichment" }] });
     seedProducer(db, LEGACY_AKTIV_ID);
     seedProducer(db, LEGACY_FULL_ID);
+    seedProducer(db, LEGACY_TAIB_ID);
+    seedProducer(db, LEGACY_BARE_ID);
     seedProducer(db, NEWS_NO_ID);
     seedProducer(db, NEWS_ROW_ID);
     seedProducer(db, OTHER_ID);
     seedProducer(db, XSS_ID, { name: XSS_NAME });
-    const SEEDED = [OWNED_ID, EMPTY_ID, TWO_ID, LEGACY_AKTIV_ID, LEGACY_FULL_ID, NEWS_NO_ID, NEWS_ROW_ID, OTHER_ID, XSS_ID];
+    const SEEDED = [OWNED_ID, EMPTY_ID, TWO_ID, LEGACY_AKTIV_ID, LEGACY_FULL_ID, LEGACY_TAIB_ID, LEGACY_BARE_ID, NEWS_NO_ID, NEWS_ROW_ID, OTHER_ID, XSS_ID];
 
     const tokens: Record<string, string> = {};
     const addSession = (id: string, email: string) => {
@@ -351,18 +362,30 @@ export async function runOwnerFeaturesS2eTests(opts: { log?: boolean } = {}): Pr
       assertEq([loc(ps), writes(OWNED_ID)], [`/eier/${OWNED_ID}/valg?melding=sperret&nokkel=orders.daily_cap&ved=valg-orders.daily_cap#valg-orders.daily_cap`, w1], "AC25: the page form for a coming_soon key is refused too, nothing written");
     }
 
-    // ═══ AC26 — two levels ═════════════════════════════════════════════════
+    // ═══ AC26 / T8 AC4 — «Minst mulig» / «Utnytte mulighetene» ═════════════
     {
-      assertEq(ch.OWNER_LEVELS.map((l) => [l.key, l.label.no]), [["bare_synlig", "Bare synlig"], ["ta_imot_bestillinger", "Ta imot bestillinger"]], "AC26: the registry level model has exactly the two levels");
+      assertEq(ch.OWNER_LEVELS.map((l) => [l.key, l.label.no]), [["minst_mulig", "Minst mulig"], ["utnytte_mulighetene", "Utnytte mulighetene"]], "T8: OWNER_LEVELS is exactly «minst_mulig» and «utnytte_mulighetene»");
+      const notLive = ch.OWNER_LEVELS.flatMap((l) => l.values.map(([k]) => k)).filter((k) => reg.findOwnerFeature(k)?.status !== "live");
+      assertEq(notLive, [], "T8: every preset key is a live registry key");
+      assertEq(ch.OWNER_LEVELS.map((l) => l.values), [[["orders.enabled", false]], [["orders.enabled", true], ["products.stock_check", true]]], "T8: «Minst mulig» = orders off; «Utnytte mulighetene» = orders + stock check on");
       const b = await pageHtml(OWNED_ID);
       const lv = b.slice(b.indexOf(`id="niva"`), b.indexOf("</section>", b.indexOf(`id="niva"`)));
       assertEq((lv.match(/data-level="/g) || []).length, 2, "AC26: the page shows exactly two levels");
-      assertTrue(lv.includes(`data-level="bare_synlig"`) && lv.includes(`data-level="ta_imot_bestillinger"`), "AC26: «Bare synlig» and «Ta imot bestillinger»");
-      assertTrue(!/Full fart|data-level="aktiv"|>Aktiv</.test(b), "AC26: no «Aktiv» / «Full fart» on the page");
-      assertTrue(!lv.includes(`aria-current="true"`) && lv.includes("Du har ikke valgt nivå ennå"), "AC26: no level marked before the owner chose one");
+      assertTrue(lv.includes(`data-level="minst_mulig"`) && lv.includes(`data-level="utnytte_mulighetene"`), "T8: «Minst mulig» and «Utnytte mulighetene»");
+      assertTrue(!/Full fart|data-level="aktiv"|>Aktiv<|Bare synlig/.test(b), "T8: no «Aktiv» / «Full fart» / «Bare synlig» on the page");
+      assertTrue(lv.includes("Hvor aktiv vil du være?") && lv.includes("Velg nivå. Valgene lenger ned settes etter nivået, og du kan gjøre unntak.")
+        && lv.includes("Nivået endrer aldri om profilen er synlig, og aldri «Nyheter og tips». Det bestemmer du selv."), "T8: heading, intro and «Nivået endrer aldri …»");
+      const card = (h: string, key: string) => { const i = h.indexOf(`data-level="${key}"`); return i < 0 ? "" : h.slice(i, h.indexOf("</li>", i)); };
+      assertTrue(card(lv, "minst_mulig").includes(`<span class="mv-badge">Standard</span>`) && !card(lv, "utnytte_mulighetene").includes("Standard"), "T8: «Standard» is on «Minst mulig»");
+      assertTrue(card(lv, "minst_mulig").includes("Folk og AI-assistenter finner profilen din og får kontaktinformasjonen din. Du trenger ikke logge inn.")
+        && card(lv, "utnytte_mulighetene").includes("Kunder og AI-assistenter kan bestille varer fra deg for henting. Du bekrefter eller avslår hver bestilling."), "T8: the card texts");
+      assertTrue(lv.includes(`aria-current="true" data-level="minst_mulig"`) && card(lv, "minst_mulig").includes("Gjelder nå") && !lv.includes(`aria-current="true" data-level="utnytte_mulighetene"`),
+        "T8: a default owner's «Minst mulig» card is «Gjelder nå» (aria-current)");
+      assertTrue(lv.includes("Du står på standardvalgene. Du trenger ikke gjøre noe.") && !lv.includes("Du valgte") && !lv.includes("Du har ikke valgt nivå ennå"), "T8: default owner sees «Du står på standardvalgene …»");
+      assertTrue(card(lv, "utnytte_mulighetene").includes(`href="/eier/${OWNED_ID}/valg?niva=utnytte_mulighetene#niva-forhandsvis"`), "T8: «Velg» keeps the anchor contract (…?niva=<nivå>#niva-forhandsvis)");
 
-      // Stored S2b choices «aktiv» / «full_fart» read as «Ta imot bestillinger», nothing changes.
-      for (const [id, legacy] of [[LEGACY_AKTIV_ID, "aktiv"], [LEGACY_FULL_ID, "full_fart"]] as const) {
+      // Stored old keys (batch level from S2b/S2e, or the owner_feature_level_choice row) read as the new levels; nothing changes.
+      for (const [id, legacy] of [[LEGACY_AKTIV_ID, "aktiv"], [LEGACY_FULL_ID, "full_fart"], [LEGACY_TAIB_ID, "ta_imot_bestillinger"]] as const) {
         db.prepare("UPDATE agents SET order_notifications_opt_in = 1 WHERE id = ?").run(id);
         const audit = db.prepare(
           `INSERT INTO owner_feature_audit (vertical, subject_id, key, old_json, new_json, actor, actor_detail, at)
@@ -375,35 +398,75 @@ export async function runOwnerFeaturesS2eTests(opts: { log?: boolean } = {}): Pr
         ).run(id, legacy, aid, aid);
         const w = writes(id);
         const p = await pageHtml(id);
-        assertTrue(p.includes(`aria-current="true" data-level="ta_imot_bestillinger"`), `AC26: a stored «${legacy}» shows as «Ta imot bestillinger»`);
+        assertTrue(p.includes(`aria-current="true" data-level="utnytte_mulighetene"`) && p.includes("Du valgte «Utnytte mulighetene» 27.10.2026."), `T8: a stored «${legacy}» shows as «Utnytte mulighetene», chosen by the owner`);
         assertEq([optInCol(id), writes(id), count("SELECT COUNT(*) AS n FROM owner_feature_level_choice WHERE subject_id = ?", id)], [1, w, 0],
-          `AC26: reading «${legacy}» changes no switch and writes nothing`);
+          `T8: reading «${legacy}» changes no switch and writes nothing`);
         const resolved = rs.resolveOwnerFeatures("rfb", id, { db });
-        assertEq(ch.currentOwnerLevel("rfb", id, resolved, { db }), "ta_imot_bestillinger", `AC26: currentOwnerLevel(«${legacy}») = ta_imot_bestillinger`);
+        assertEq(ch.currentOwnerLevel("rfb", id, resolved, { db }), "utnytte_mulighetene", `T8: currentOwnerLevel(«${legacy}») = utnytte_mulighetene`);
       }
-      const pv = await pageHtml(OWNED_ID, { niva: "full_fart" });
-      assertTrue(pv.includes("Bytte til «Ta imot bestillinger»?"), "AC26: an old ?niva=full_fart link previews «Ta imot bestillinger»");
+      db.prepare(`INSERT INTO owner_feature_level_choice (vertical, subject_id, level, chosen_at, actor_detail, batch_id) VALUES ('rfb', ?, 'bare_synlig', '2026-10-28T09:00:00.000Z', 'legacy', NULL)`).run(LEGACY_BARE_ID);
+      {
+        const w = writes(LEGACY_BARE_ID);
+        const p = await pageHtml(LEGACY_BARE_ID);
+        assertTrue(p.includes(`aria-current="true" data-level="minst_mulig"`) && p.includes("Du valgte «Minst mulig» 28.10.2026."), "T8: a stored «bare_synlig» choice shows as «Minst mulig», chosen by the owner");
+        assertEq([optInCol(LEGACY_BARE_ID), writes(LEGACY_BARE_ID), (db.prepare("SELECT level FROM owner_feature_level_choice WHERE subject_id = ?").get(LEGACY_BARE_ID) as any).level], [0, w, "bare_synlig"],
+          "T8: reading «bare_synlig» changes no switch and does not rewrite the stored key");
+      }
+      // Old ?niva= links preview the new level, and a GET changes nothing.
+      for (const [legacy, label] of [["full_fart", "Utnytte mulighetene"], ["aktiv", "Utnytte mulighetene"], ["ta_imot_bestillinger", "Utnytte mulighetene"], ["bare_synlig", "Minst mulig"]] as const) {
+        const id = legacy === "bare_synlig" ? LEGACY_AKTIV_ID : OWNED_ID;
+        const w = [writes(id), optInCol(id)];
+        const pv = await pageHtml(id, { niva: legacy });
+        assertTrue(pv.includes(`Bytte til «${label}»?`) && pv.includes(`name="level" value="${label === "Minst mulig" ? "minst_mulig" : "utnytte_mulighetene"}"`), `T8: an old ?niva=${legacy} link previews «${label}»`);
+        assertEq([writes(id), optInCol(id)], w, `T8: …and the ?niva=${legacy} GET changes no switch`);
+      }
 
-      // Armed test producer: orders on by the arming (admin), no level marked.
+      // Armed test producer: orders on by the arming (platform), never «Du valgte».
       const fx = await page(FIX);
       const fb = html(fx);
       assertEq([fx.status, optInCol(FIX)], [200, 1], "AC26: the armed test producer's page (orders switched on by the arming)");
-      assertTrue(!fb.includes(`aria-current="true" data-level=`), "AC26: armed test producer — no level marked (the arming is not the owner's choice)");
+      assertTrue(fb.includes("Valgene dine passer med «Utnytte mulighetene».") && !fb.includes("Du valgte") && fb.includes(`aria-current="true" data-level="utnytte_mulighetene"`),
+        "T8: armed test producer sees «Valgene dine passer med «Utnytte mulighetene».», never «Du valgte»");
       assertTrue(row(fb, "orders.enabled").includes(">På<"), "AC26: …while its orders row says «På»");
+      // One exception: the owner turns the stock check off.
+      await post(H.sett, FIX, { key: "products.stock_check", value: "false", confirmed: "1" });
+      const fe = await pageHtml(FIX);
+      assertTrue(fe.includes("Tilpasset: valgene dine bygger på «Utnytte mulighetene», med 1 unntak.") && fe.includes(`href="/eier/${FIX}/valg?niva=utnytte_mulighetene#niva-forhandsvis" data-mv-row="niva">Tilbakestill til «Utnytte mulighetene»</a>`),
+        "T8: one exception → «Tilpasset … 1 unntak» + «Tilbakestill til …» (anchor contract)");
+      assertTrue(row(fe, "products.stock_check").includes(">Unntak</span>") && row(fe, "products.stock_check").includes("Nivået «Utnytte mulighetene» har dette på."), "T8: the deviating row has «Unntak» and «Nivået … har dette på.»");
+      assertTrue(!row(fe, "orders.enabled").includes("Unntak") && !fe.includes(`aria-current="true" data-level=`) && !fe.includes("Du valgte"), "T8: only the deviating row is an exception; no card «Gjelder nå» while custom");
       const w = writes(FIX);
-      const choose = await post(H.niva, FIX, { level: "ta_imot_bestillinger", confirmed: "1" });
-      assertEq([loc(choose), writes(FIX)], [`/eier/${FIX}/valg?melding=niva_valgt&ved=niva#niva`, w], "AC26: the owner chooses «Ta imot bestillinger» — nothing to change, nothing in the audit");
-      assertTrue((await pageHtml(FIX)).includes(`aria-current="true" data-level="ta_imot_bestillinger"`), "AC26: …and only now is the level marked");
-      const choice = db.prepare("SELECT level, actor_detail, batch_id FROM owner_feature_level_choice WHERE subject_id = ?").get(FIX) as any;
-      assertEq(choice, { level: "ta_imot_bestillinger", actor_detail: OWNER_EMAIL, batch_id: null }, "AC26: the owner's choice is stored with who");
-      // An owner switch afterwards → «Egendefinert», no longer the level.
+      const choose = await post(H.niva, FIX, { level: "utnytte_mulighetene", confirmed: "1" });
+      assertTrue(loc(choose).startsWith(`/eier/${FIX}/valg?endret=`) && writes(FIX)[1] === w[1] + 1, "T8: «Tilbakestill» → choosing the level resets the exception (one audit row)");
+      const fc = await pageHtml(FIX);
+      assertTrue(fc.includes(`aria-current="true" data-level="utnytte_mulighetene"`) && /Du valgte «Utnytte mulighetene» \d{2}\.\d{2}\.\d{4}\./.test(fc) && !fc.includes("Unntak</span>"),
+        "T8: …and now «Du valgte «Utnytte mulighetene» {dato}.»");
+      const choice = db.prepare("SELECT level, actor_detail FROM owner_feature_level_choice WHERE subject_id = ?").get(FIX) as any;
+      assertEq(choice, { level: "utnytte_mulighetene", actor_detail: OWNER_EMAIL }, "AC26: the owner's choice is stored with who (new key)");
+      // An owner switch afterwards: the switches decide which level applies.
       await post(H.sett, FIX, { key: "orders.enabled", value: "false", confirmed: "1" });
-      assertTrue((await pageHtml(FIX)).includes("Egendefinert") && !(await pageHtml(FIX)).includes(`aria-current="true" data-level=`), "AC26: a switch changed since → «Egendefinert», no level marked");
-      // An admin write (not the owner) never marks a level.
-      ch.applyOwnerLevel("rfb", OTHER_ID, "ta_imot_bestillinger", { actor: "admin", detail: "admin" }, { db });
+      const fo = await pageHtml(FIX);
+      assertTrue(fo.includes(`aria-current="true" data-level="minst_mulig"`) && fo.includes("Du står på standardvalgene.") && !fo.includes("Du valgte"), "T8: orders turned off since → «Minst mulig» applies, not the old choice");
+      // An admin write (not the owner) never reads as the owner's choice.
+      ch.applyOwnerLevel("rfb", OTHER_ID, "utnytte_mulighetene", { actor: "admin", detail: "admin" }, { db });
+      const po = await pageHtml(OTHER_ID);
       assertEq([optInCol(OTHER_ID), ch.currentOwnerLevel("rfb", OTHER_ID, rs.resolveOwnerFeatures("rfb", OTHER_ID, { db }), { db })], [1, null],
-        "AC26: a level applied by an admin switches orders on but marks no level");
+        "AC26: a level applied by an admin switches orders on but is no owner choice");
+      assertTrue(po.includes("Valgene dine passer med «Utnytte mulighetene».") && !po.includes("Du valgte"), "T8: …the page says «passer med», never «Du valgte»");
       db.prepare("UPDATE agents SET order_notifications_opt_in = 0 WHERE id = ?").run(OTHER_ID);
+
+      // A level never changes comms.news or visibility.profile (both away from their default first).
+      await post(H.intro, LEGACY_BARE_ID, { answer: "yes" });
+      await post(H.sett, LEGACY_BARE_ID, { key: "visibility.profile", value: "false", confirmed: "1" });
+      const val = (k: string) => rs.resolveOwnerFeatures("rfb", LEGACY_BARE_ID, { db }).byKey[k].value;
+      const before2 = [val("comms.news"), val("visibility.profile")];
+      assertEq(before2, [true, false], "T8 setup: comms.news on, visibility.profile off");
+      for (const level of ["utnytte_mulighetene", "minst_mulig", "utnytte_mulighetene"]) {
+        ch.applyOwnerLevel("rfb", LEGACY_BARE_ID, level, { actor: "owner", detail: "t" }, { db });
+        assertEq([val("comms.news"), val("visibility.profile")], before2, `T8: applying «${level}» never changes comms.news or visibility.profile`);
+      }
+      assertEq(count(`SELECT COUNT(*) AS n FROM owner_feature_audit a JOIN owner_feature_change_batch b ON a.subject_id = b.subject_id AND a.id BETWEEN b.first_audit_id AND b.last_audit_id
+        WHERE b.kind = 'level' AND a.key IN ('comms.news', 'visibility.profile')`), 0, "T8: no level batch anywhere has a comms.news / visibility.profile audit row");
     }
 
     // ═══ AC27 — no fake values ═════════════════════════════════════════════
@@ -559,29 +622,31 @@ export async function runOwnerFeaturesS2eTests(opts: { log?: boolean } = {}): Pr
       setEnv("OWNER_PAUSE_ENABLED", null);
     }
 
-    // ═══ AC30 — the first-login answer is the row's value ══════════════════
+    // ═══ AC30 — the answer is the row's value (T7: the question in #gruppe-comms) ═══
     {
       const b0 = await pageHtml(OWNED_ID);
-      assertTrue(b0.includes(`id="velkommen"`) && row(b0, "comms.news").includes(">Av<"), "AC30: before the answer: the card, and the row says «Av»");
+      assertTrue(!b0.includes(`id="velkommen"`) && b0.includes(`data-news-question="1"`) && row(b0, "comms.news").includes(">Av<"),
+        "AC30 (T7): before the answer: the question (no top card), and the row says «Av»");
       const i = await post(H.intro, OWNED_ID, { answer: "yes" });
       const target = loc(i);
-      assertTrue(target.startsWith(`/eier/${OWNED_ID}/valg?endret=`), "AC30: «Ja takk» → 303 with the change");
-      const bid = String(new URLSearchParams(target.split("?")[1]).get("endret"));
-      const b1 = await pageHtml(OWNED_ID, { endret: bid });
-      assertTrue(row(b1, "comms.news").includes(">På<") && !b1.includes(`id="velkommen"`), "AC30: the «Nyheter og tips» row shows «På» at once, the card is gone");
-      assertTrue(b1.includes("Lagret: «Nyheter og tips» er På.") && b1.includes(">Angre<"), "AC30: the message names the row (and can be undone)");
+      assertTrue(target.startsWith(`/eier/${OWNED_ID}/valg?endret=`) && target.endsWith("#gruppe-comms"), "AC30: «Ja takk» → 303 with the change, to #gruppe-comms");
+      const bid = String(new URLSearchParams(target.split("?")[1].split("#")[0]).get("endret"));
+      const b1 = await pageHtml(OWNED_ID, { endret: bid, melding: "intro_ja" });
+      assertTrue(row(b1, "comms.news").includes(">På<") && !b1.includes(`data-news-question="1"`), "AC30: the «Nyheter og tips» row shows «På» at once, the question is gone");
+      assertTrue(b1.includes("Takk! Du får nyheter og tips på e-post. Du kan slå det av her når som helst.") && b1.includes(">Angre<"), "AC30 (T7): the confirmation (and it can be undone)");
       assertEq((db.prepare("SELECT value_json, set_by FROM owner_feature_settings WHERE subject_id = ? AND key = 'comms.news'").get(OWNED_ID) as any), { value_json: "true", set_by: "owner" },
         "AC30: stored as the owner's explicit choice");
-      assertEq((db.prepare("SELECT answer FROM owner_feature_intro WHERE subject_id = ?").get(OWNED_ID) as any)?.answer, "yes", "AC30: the consent record with its time");
-      const n = await post(H.intro, NEWS_NO_ID, { answer: "no" });
-      assertEq(loc(n), `/eier/${NEWS_NO_ID}/valg?melding=intro_nei&ved=gruppe-comms#gruppe-comms`, "AC30: «Nei takk» → message");
-      const bn = await pageHtml(NEWS_NO_ID);
-      assertTrue(row(bn, "comms.news").includes(">Av<") && !bn.includes(`id="velkommen"`), "AC30: «Nei takk» → the row says «Av», no card");
-      // Principle 8: set in the row first → the card does not ask again.
+      assertEq((db.prepare("SELECT state FROM owner_feature_prompt WHERE subject_id = ? AND key = 'comms.news'").get(OWNED_ID) as any)?.state, "yes", "AC30: the consent record with its time");
+      const n = await post(H.intro, NEWS_NO_ID, { answer: "never" });
+      assertEq(loc(n), `/eier/${NEWS_NO_ID}/valg?melding=intro_nei&ved=gruppe-comms#gruppe-comms`, "AC30 (T7): «Nei, ikke spør meg igjen» → message in #gruppe-comms");
+      const bn = await pageHtml(NEWS_NO_ID, { melding: "intro_nei", ved: "gruppe-comms" });
+      assertTrue(row(bn, "comms.news").includes(">Av<") && !bn.includes(`data-news-question="1"`), "AC30: «Nei» → the row says «Av», no question");
+      assertTrue(bn.includes("Greit. Vi spør ikke igjen. Du kan slå det på her hvis du ombestemmer deg."), "AC30 (T7): ?melding=intro_nei shows the «never» confirmation");
+      // Principle 8: set in the row first → the question does not ask again.
       await post(H.sett, NEWS_ROW_ID, { key: "comms.news", value: "true", confirmed: "1" });
       const br = await pageHtml(NEWS_ROW_ID);
-      assertTrue(!br.includes(`id="velkommen"`) && row(br, "comms.news").includes(">På<"), "principle 8: answered in the row → the card is not shown");
-      assertTrue(!br.includes("Kommer snart") && b0.includes("Svaret ditt blir valget «Nyheter og tips»"), "principle 8: the card promises only what the row does");
+      assertTrue(!br.includes(`data-news-question="1"`) && row(br, "comms.news").includes(">På<"), "principle 8: answered in the row → the question is not shown");
+      assertTrue(!br.includes("Kommer snart") && b0.includes("Vil du ha nyheter og tips på e-post?") && !b0.includes("nyhetsbrev hver"), "principle 8: the question promises only what the row does (no frequency)");
     }
 
     // ═══ Principles 7 + 9 ══════════════════════════════════════════════════
@@ -604,8 +669,10 @@ export async function runOwnerFeaturesS2eTests(opts: { log?: boolean } = {}): Pr
       assertTrue(groups.length >= 4 && groups.includes("gruppe-orders"), "principle 9: every group card can be folded (<details open>)");
       const rowForms = b.match(/<form method="post" action="\/eier\/[^"]+\/valg\/(sett|interesse|ordre-epost)" class="mv-ctl-form" data-mv-row="[^"]+">/g) || [];
       assertTrue(rowForms.length > 5 && rowForms.every((f) => /data-mv-row="(gruppe-[a-z]+|planlagt)"/.test(f)), "principle 9: row forms name the card the script swaps after a save");
-      assertTrue(b.includes(`<div id="mv-toast-slot">`) && !pg.OWNER_PAGE_SCRIPT.includes("window.location") && pg.OWNER_PAGE_SCRIPT.includes("f.submit()"),
-        "principle 9: the script swaps the card + message (T5: the confirm panel too, in its row); errors fall back to the plain form POST");
+      // T9: an HTTP answer is never re-sent (FUNN t5-gjeninnsending-ordre-epost); only a failed fetch falls back to the plain POST.
+      assertTrue(b.includes(`<div id="mv-toast-slot">`) && !pg.OWNER_PAGE_SCRIPT.includes("window.location") && !pg.OWNER_PAGE_SCRIPT.includes("f.submit()")
+        && pg.OWNER_PAGE_SCRIPT.includes("HTMLFormElement.prototype.submit"),
+        "principle 9: the script swaps the changed regions + message (T9); a failed fetch falls back to the plain form POST, an error answer never re-sends it");
       await post(H.sett, OTHER_ID, { key: "orders.enabled", value: "false", confirmed: "1" });
     }
 

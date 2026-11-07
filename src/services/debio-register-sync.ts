@@ -24,6 +24,8 @@
 //        b. website / e-mail domain via finnoko     (finnoko_domain)
 //        c. name + postal code, token overlap ≥ 0.67 after dropping generic
 //           words and place names                   (name_postal)
+//           (S1d: with no such hit, our name without its « — tagline» is
+//           tried too — a review candidate only, never a status)
 //        d. street + house no. + postal code        (street_postal), or a
 //           differing postal code with the same city (street_city) — only
 //           when no other active producer of ours has that street + house
@@ -56,6 +58,7 @@ import { emailDomain, isFreeMailDomain } from "./claim-domain-rule";
 import { nameSimilarity, normaliseForMatch } from "./name-matcher";
 import { certValidOn, debioRegisterStale, readDebioRegisterState, DEBIO_REGISTER_STALE_DAYS, DEBIO_REGISTER_SYNC_ENV, debioRegisterSyncEnabled } from "./debio-approval";
 import { debioSwitchOffAgentIds } from "../owner-features/enforce";
+import { organicOwnerGateActive } from "./description-quality";
 
 // The flag lives in debio-approval (read side, no import cycle); re-exported here.
 export { DEBIO_REGISTER_SYNC_ENV, debioRegisterSyncEnabled };
@@ -95,6 +98,12 @@ export interface SyncDebioRegisterResult {
   would_reset: number;
   changes: number;
   owner_switch_off: number;
+  /**
+   * Økologi S3c: review candidates added from an owner-supplied org.nr.
+   * (agent_owner_org_nr). Present only with RFB_ORGANIC_CLAIM_GATE and
+   * RFB_ORGANIC_OWNER_GATE on (absent = the result is as before S3c).
+   */
+  owner_org_nr_candidates?: number;
   finnoko_helper: "ok" | "failed";
   stale: boolean;
   warnings: string[];
@@ -110,6 +119,8 @@ interface Entity {
   status: Exclude<DebioStatus, "ingen"> | "ingen";
   validTo: string | null;
   productGroups: string[];
+  /** Every register sid in the entity (the manual link looks a sid up here). */
+  sids: string[];
   /** In memory only. */
   names: string[];
   postalCodes: string[];
@@ -154,6 +165,7 @@ export function buildEntities(rows: readonly DebioRegisterRow[], now: Date): Ent
       status,
       validTo,
       productGroups,
+      sids: [...new Set(list.map((r) => r.sid).filter((s): s is string => !!s))],
       names: [...new Set(list.map((r) => r.name))],
       postalCodes: [...new Set(list.map((r) => r.postalCode).filter((p): p is string => !!p))],
       cities: [...new Set(list.map((r) => normCity(r.city)).filter((c): c is string => !!c))],
@@ -189,6 +201,20 @@ export function coreTokens(name: string, places: readonly (string | null)[]): st
   const placeTokens = new Set<string>();
   for (const p of places) if (p) for (const t of p.split(" ")) placeTokens.add(t);
   return [...new Set(tokens(name).filter((t) => !GENERIC.has(t) && !placeTokens.has(t)))];
+}
+
+/**
+ * Our profile name without a spaced-dash tagline: «Moe Gård — Bringebær fra
+ * Moe» → «Moe Gård», «Lindheim Gård - Testvik» → «Lindheim Gård». The
+ * register has the business name only, so the tagline's extra tokens pulled
+ * the name overlap under NAME_TOKEN_OVERLAP_MIN. A hit on it is a review
+ * candidate only (matchProducer). Only a dash with spaces on
+ * both sides splits («Hansen-Gård» stays whole); null when there is no such
+ * dash or nothing is left before it.
+ */
+export function nameWithoutTagline(name: string): string | null {
+  const m = /^(.*?\S)\s+[—–-]\s+\S/.exec(name);
+  return m ? m[1].trim() || null : null;
 }
 
 /** |A ∩ B| / max(|A|, |B|) — 0 when either side is empty. */
@@ -271,6 +297,12 @@ interface Producer {
   name: string;
   orgNr: string | null;
   tagOrgNrs: string[];
+  /**
+   * Økologi S3c: the org.nr. the owner typed in the portal (agent_owner_org_nr)
+   * — a review candidate only, never a safe match. null when absent or equal
+   * to agents.org_nr.
+   */
+  ownerOrgNr: string | null;
   domains: string[];
   postal: string | null;
   city: string | null;
@@ -295,14 +327,25 @@ function tagOrgNrs(tags: unknown): string[] {
   return out;
 }
 
+/** Økologi S3c: does the agent_owner_org_nr side table exist (older schemas: no)? */
+function hasOwnerOrgNrTable(db: Database.Database): boolean {
+  try {
+    return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_owner_org_nr'").get();
+  } catch {
+    return false;
+  }
+}
+
 function loadProducers(db: Database.Database): Producer[] {
+  const ownerOrgNr = hasOwnerOrgNrTable(db);
   const rows = db.prepare(`
-    SELECT a.id, a.name, a.org_nr, a.tags, a.city, a.description, a.contact_email,
+    SELECT a.id, a.name, a.org_nr, a.tags, ${ownerOrgNr ? "o.owner_org_nr" : "NULL AS owner_org_nr"}, a.city, a.description, a.contact_email,
            a.debio_verified, s.debio_status, s.debio_sid, s.debio_match_method, s.debio_cert_valid_to,
            k.website, k.email AS k_email, k.address, k.postal_code, k.about
     FROM agents a
     LEFT JOIN agent_knowledge k ON k.agent_id = a.id
     LEFT JOIN agent_debio_status s ON s.agent_id = a.id
+    ${ownerOrgNr ? "LEFT JOIN agent_owner_org_nr o ON o.agent_id = a.id" : ""}
     WHERE a.is_active = 1
       AND (a.umbrella_type IS NULL OR a.umbrella_type = '')
       AND (a.role IS NULL OR a.role = 'producer')
@@ -317,11 +360,14 @@ function loadProducers(db: Database.Database): Producer[] {
     }
     const fromAddr = postalFromAddress(r.address);
     const mailLocals = [r.contact_email, r.k_email].filter((e) => typeof e === "string").map((e: string) => e.split("@")[0]);
+    const orgNr = normalizeOrgNr(r.org_nr);
+    const owner = normalizeOrgNr(r.owner_org_nr);
     return {
       id: r.id,
       name: String(r.name || ""),
-      orgNr: normalizeOrgNr(r.org_nr),
+      orgNr,
       tagOrgNrs: tagOrgNrs(r.tags),
+      ownerOrgNr: owner && owner !== orgNr ? owner : null,
       domains,
       postal: postalCodeOf(r.postal_code) ?? fromAddr.postal,
       city: normCity(r.city) ?? fromAddr.city,
@@ -443,21 +489,32 @@ export function matchProducer(
   if (p.city) for (const e of ix.byCity.get(p.city) ?? []) near.add(e);
 
   // c. name + postal code
-  const nameHits: Array<{ e: Entity; score: number; postal: boolean }> = [];
-  for (const e of near) {
-    const at = entityAt(e, p);
-    let best = 0;
-    for (const n of e.names) {
-      const places = [p.city, ...e.cities];
-      best = Math.max(best, tokenOverlap(coreTokens(p.name, places), coreTokens(n, places)));
+  const nameHitsFor = (ours: string): Array<{ e: Entity; score: number; postal: boolean }> => {
+    const hits: Array<{ e: Entity; score: number; postal: boolean }> = [];
+    for (const e of near) {
+      const at = entityAt(e, p);
+      let best = 0;
+      for (const n of e.names) {
+        const places = [p.city, ...e.cities];
+        best = Math.max(best, tokenOverlap(coreTokens(ours, places), coreTokens(n, places)));
+      }
+      if (best >= NAME_TOKEN_OVERLAP_MIN) hits.push({ e, score: best, postal: at.postal });
     }
-    if (best >= NAME_TOKEN_OVERLAP_MIN) nameHits.push({ e, score: best, postal: at.postal });
-  }
+    return hits;
+  };
+  const nameHits = nameHitsFor(p.name);
   const strongName = nameHits.filter((h) => h.postal);
   if (strongName.length === 1 && ok(strongName[0].e)) {
     return { sikker: { entity: strongName[0].e, method: "name_postal" }, review: [] };
   }
   for (const h of nameHits) addReview(h.e, "name", h.score, h.postal ? "name_postal_ambiguous" : "name_city");
+  // S1d: our name without its « — tagline», only when the full name has no
+  // name + postal hit — and only ever a review candidate, never a status
+  // (the stripped name is shorter, so a hit on it is weaker evidence).
+  const stripped = strongName.length === 0 ? nameWithoutTagline(p.name) : null;
+  if (stripped) {
+    for (const h of nameHitsFor(stripped)) addReview(h.e, "name", h.score, h.postal ? "name_tagline_postal" : "name_tagline_city");
+  }
 
   // d. street + house no. (+ postal code, or the same city)
   if (p.street) {
@@ -527,6 +584,11 @@ interface Decision {
   reason: string;
 }
 
+/** The one `verified` rule: okologisk with a valid certificate and auto.debio not off. */
+function verifiedFor(status: string, certValidTo: string | null, switchOff: boolean, now: Date): 0 | 1 {
+  return status === "okologisk" && certValidOn(certValidTo, now) && !switchOff ? 1 : 0;
+}
+
 function decide(entity: Entity | null, method: SikkerMethod | null, switchOff: boolean, now: Date): Decision {
   if (!entity) return { status: "ingen", validTo: null, groups: [], sid: null, method: null, verified: 0, reason: "not_in_register" };
   const valid = entity.status === "okologisk" && certValidOn(entity.validTo, now);
@@ -536,7 +598,7 @@ function decide(entity: Entity | null, method: SikkerMethod | null, switchOff: b
     groups: entity.productGroups,
     sid: entity.sid,
     method,
-    verified: valid && !switchOff ? 1 : 0,
+    verified: verifiedFor(entity.status, entity.validTo, switchOff, now),
     reason: switchOff ? "owner_switch_off" : entity.status === "ingen" ? "expired" : entity.status === "okologisk" && !valid ? "cert_not_valid" : "register_status",
   };
 }
@@ -551,6 +613,51 @@ const UPSERT_STATUS_SQL = `
     debio_product_groups = excluded.debio_product_groups, debio_sid = excluded.debio_sid,
     debio_checked_at = excluded.debio_checked_at, debio_match_method = excluded.debio_match_method
 `;
+/**
+ * One `debio_match_review` candidate row (new rows start 'pending'; a
+ * conflict refreshes the fields and keeps the state). Debio `name` / `street`
+ * are never part of it (S1.6).
+ */
+const UPSERT_REVIEW_SQL = `
+  INSERT INTO debio_match_review
+    (agent_id, entity_key, debio_sid, org_nr, status, cert_valid_to, product_groups, postal_code, city,
+     match_method, score, reasons, state, first_seen_at, last_seen_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+  ON CONFLICT(agent_id, entity_key) DO UPDATE SET
+    debio_sid = excluded.debio_sid, org_nr = excluded.org_nr, status = excluded.status,
+    cert_valid_to = excluded.cert_valid_to, product_groups = excluded.product_groups,
+    postal_code = excluded.postal_code, city = excluded.city, match_method = excluded.match_method,
+    score = excluded.score, reasons = excluded.reasons, last_seen_at = excluded.last_seen_at
+`;
+
+export interface ReviewRowFields {
+  entity_key: string;
+  debio_sid: string | null;
+  org_nr: string | null;
+  status: string;
+  cert_valid_to: string | null;
+  product_groups: string[];
+  postal_code: string | null;
+  city: string | null;
+  match_method: string;
+  score: number;
+  reasons: string[];
+}
+
+/** The review-row fields for a candidate — shared by the sync and the manual link. */
+function reviewRowFields(e: Entity, c: { method: string; score: number; reasons: string[] }): ReviewRowFields {
+  return {
+    entity_key: e.key, debio_sid: e.sid, org_nr: e.orgNr, status: e.status, cert_valid_to: e.validTo,
+    product_groups: e.productGroups, postal_code: e.postalCodes[0] ?? null, city: e.cities[0] ?? null,
+    match_method: c.method, score: Math.round(c.score * 100) / 100, reasons: c.reasons,
+  };
+}
+
+function reviewRowParams(agentId: string, f: ReviewRowFields, nowIso: string): unknown[] {
+  return [agentId, f.entity_key, f.debio_sid, f.org_nr, f.status, f.cert_valid_to, JSON.stringify(f.product_groups),
+    f.postal_code, f.city, f.match_method, f.score, JSON.stringify(f.reasons), nowIso, nowIso];
+}
+
 /** The derived flag every reader uses. */
 const UPDATE_VERIFIED_SQL = `
   UPDATE agents SET debio_verified = ?, debio_verified_at = CASE WHEN ? = 1 THEN ? ELSE debio_verified_at END WHERE id = ?
@@ -727,6 +834,23 @@ export async function syncDebioRegister(db: Database.Database = getDb(), opts: S
     m.method = null;
   }
 
+  // Økologi S3c: no safe match this run, and the owner typed an org.nr. that
+  // the register knows → a review candidate (match_method 'owner_org_nr'),
+  // never a status. A rejected agent|entity pair is not proposed again; an
+  // existing candidate for the same entity is merged into this one.
+  const ownerOrgNrOn = organicOwnerGateActive(env);
+  if (ownerOrgNrOn) result.owner_org_nr_candidates = 0;
+  for (const m of ownerOrgNrOn ? matchedList : []) {
+    if (m.entity || !m.p.ownerOrgNr) continue;
+    const e = ix.byOrgNr.get(m.p.ownerOrgNr);
+    if (!e || rejectedPairs.has(`${m.p.id}|${e.key}`)) continue;
+    const same = m.review.find((c) => c.entity.key === e.key);
+    const reasons = ["owner_supplied_org_nr", ...(same ? same.reasons.filter((r) => r !== "owner_supplied_org_nr") : [])];
+    m.review = [{ entity: e, method: "owner_org_nr", score: Math.max(0.9, same?.score ?? 0), reasons },
+      ...m.review.filter((c) => c.entity.key !== e.key)];
+    result.owner_org_nr_candidates = (result.owner_org_nr_candidates ?? 0) + 1;
+  }
+
   type Planned = { p: Producer; d: Decision; review: Candidate[] };
   const planned: Planned[] = [];
   for (const { p, entity, method, review } of matchedList) {
@@ -745,17 +869,7 @@ export async function syncDebioRegister(db: Database.Database = getDb(), opts: S
   db.transaction(() => {
     const upsertStatus = db.prepare(UPSERT_STATUS_SQL);
     const updVerified = db.prepare(UPDATE_VERIFIED_SQL);
-    const upsertReview = db.prepare(`
-      INSERT INTO debio_match_review
-        (agent_id, entity_key, debio_sid, org_nr, status, cert_valid_to, product_groups, postal_code, city,
-         match_method, score, reasons, state, first_seen_at, last_seen_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-      ON CONFLICT(agent_id, entity_key) DO UPDATE SET
-        debio_sid = excluded.debio_sid, org_nr = excluded.org_nr, status = excluded.status,
-        cert_valid_to = excluded.cert_valid_to, product_groups = excluded.product_groups,
-        postal_code = excluded.postal_code, city = excluded.city, match_method = excluded.match_method,
-        score = excluded.score, reasons = excluded.reasons, last_seen_at = excluded.last_seen_at
-    `);
+    const upsertReview = db.prepare(UPSERT_REVIEW_SQL);
     const clearPending = db.prepare("DELETE FROM debio_match_review WHERE agent_id = ? AND state = 'pending'");
     for (const { p, d, review } of planned) {
       upsertStatus.run(p.id, d.status, d.validTo, JSON.stringify(d.groups), d.sid, nowIso, d.method);
@@ -771,11 +885,7 @@ export async function syncDebioRegister(db: Database.Database = getDb(), opts: S
       if (d.method !== null) {
         clearPending.run(p.id);
       } else {
-        for (const c of review) {
-          const e = c.entity;
-          upsertReview.run(p.id, e.key, e.sid, e.orgNr, e.status, e.validTo, JSON.stringify(e.productGroups),
-            e.postalCodes[0] ?? null, e.cities[0] ?? null, c.method, Math.round(c.score * 100) / 100, JSON.stringify(c.reasons), nowIso, nowIso);
-        }
+        for (const c of review) upsertReview.run(...reviewRowParams(p.id, reviewRowFields(c.entity, c), nowIso));
       }
     }
     updateState(db, { last_attempt_at: nowIso, last_success_at: nowIso, last_success_rows: fetched.rows.length, last_reject_reason: null });
@@ -792,7 +902,8 @@ export async function syncDebioRegister(db: Database.Database = getDb(), opts: S
 
 export interface MatchReviewItem {
   id: number;
-  agent: { id: string; name: string | null; city: string | null; postal_code: string | null; org_nr: string | null };
+  /** owner_org_nr: økologi S3c — the org.nr. the owner typed in the portal (agent_owner_org_nr), null when none. */
+  agent: { id: string; name: string | null; city: string | null; postal_code: string | null; org_nr: string | null; owner_org_nr: string | null };
   debio: { sid: string | null; org_nr: string | null; status: string; cert_valid_to: string | null; product_groups: string[]; postal_code: string | null; city: string | null; source_url: string | null };
   match_method: string;
   score: number | null;
@@ -810,18 +921,21 @@ function jsonList(v: unknown): string[] {
 
 /** Review candidates (agent side + Debio sid / city / postal code + reason codes; no Debio names). */
 export function listMatchReview(db: Database.Database, state: "pending" | "approved" | "rejected" | "all" = "pending", limit = 200): MatchReviewItem[] {
+  const ownerOrgNr = hasOwnerOrgNrTable(db);
   const rows = db.prepare(`
-    SELECT r.*, a.name AS agent_name, a.city AS agent_city, a.org_nr AS agent_org_nr, k.postal_code AS agent_postal
+    SELECT r.*, a.name AS agent_name, a.city AS agent_city, a.org_nr AS agent_org_nr, k.postal_code AS agent_postal,
+           ${ownerOrgNr ? "o.owner_org_nr" : "NULL"} AS agent_owner_org_nr
     FROM debio_match_review r
     LEFT JOIN agents a ON a.id = r.agent_id
     LEFT JOIN agent_knowledge k ON k.agent_id = r.agent_id
+    ${ownerOrgNr ? "LEFT JOIN agent_owner_org_nr o ON o.agent_id = r.agent_id" : ""}
     WHERE (? = 'all' OR r.state = ?)
     ORDER BY r.score DESC, r.id ASC
     LIMIT ?
   `).all(state, state, limit) as any[];
   return rows.map((r) => ({
     id: r.id,
-    agent: { id: r.agent_id, name: r.agent_name ?? null, city: r.agent_city ?? null, postal_code: r.agent_postal ?? null, org_nr: r.agent_org_nr ?? null },
+    agent: { id: r.agent_id, name: r.agent_name ?? null, city: r.agent_city ?? null, postal_code: r.agent_postal ?? null, org_nr: r.agent_org_nr ?? null, owner_org_nr: r.agent_owner_org_nr ?? null },
     debio: {
       sid: r.debio_sid, org_nr: r.org_nr, status: r.status, cert_valid_to: r.cert_valid_to,
       product_groups: jsonList(r.product_groups), postal_code: r.postal_code, city: r.city,
@@ -861,7 +975,7 @@ export function decideMatchReview(
   if (!old) return null;
   const switchOff = debioSwitchOffAgentIds([r.agent_id], { db, env: opts.env }).has(r.agent_id);
   const status = (["okologisk", "karens", "annet", "ingen"].includes(r.status) ? r.status : "annet") as DebioStatus;
-  const verified: 0 | 1 = status === "okologisk" && certValidOn(r.cert_valid_to, now) && !switchOff ? 1 : 0;
+  const verified = verifiedFor(status, r.cert_valid_to, switchOff, now);
   db.transaction(() => {
     // One approved candidate per agent: an earlier approval for another entity is withdrawn.
     db.prepare("UPDATE debio_match_review SET state = 'pending', decided_at = NULL WHERE agent_id = ? AND state = 'approved' AND id <> ?").run(r.agent_id, id);
@@ -872,4 +986,124 @@ export function decideMatchReview(
       { status, verified, reason: switchOff ? "owner_switch_off" : "review_approved", sid: r.debio_sid }, "review", nowIso);
   })();
   return { id, state: "approved", agent_id: r.agent_id, debio_status: status, debio_verified: verified };
+}
+
+// ─── manual register link (admin, økologi S1d) ──────────────────────────────
+// A producer that is in the register but never got the right candidate from
+// the sync: an admin links it by Debio sid. The candidate is built exactly as
+// the sync builds one (reviewRowFields: same entity_key, status, validity,
+// product groups, org.nr.), with match_method 'manual' and the admin's reason,
+// then approved through decideMatchReview — so the same verified rule, the
+// same withdrawal of an earlier approval and the same change log apply, and
+// the next sync keeps it like any approval (it finds the entity again by
+// org.nr. / sid). Dry run by default.
+
+export const MANUAL_LINK_REASON_MAX = 500;
+
+export interface ManualLinkInput {
+  agent_id?: unknown;
+  debio_sid?: unknown;
+  reason?: unknown;
+  apply?: unknown;
+}
+
+export interface ManualLinkOptions {
+  fetchImpl?: typeof fetch;
+  env?: NodeJS.ProcessEnv;
+  now?: Date;
+  minRows?: number;
+}
+
+type ReviewRowState = { id: number; entity_key: string; debio_sid: string | null; org_nr: string | null; status: string; match_method: string; state: string };
+
+export type ManualLinkResult =
+  | { ok: false; http: 400 | 404 | 409 | 502; error: string; detail?: string }
+  | {
+      ok: true;
+      dry_run: boolean;
+      agent_id: string;
+      candidate: ReviewRowFields;
+      /** Whether the agent gets (dry run: would get) debio_verified = 1. */
+      verified: 0 | 1;
+      owner_switch_off: boolean;
+      /** The review row for the same agent + entity this replaces (null = a new row). */
+      replaces: ReviewRowState | null;
+      /** An approval for another entity that is withdrawn (back to pending). */
+      withdraws: ReviewRowState | null;
+      /** The agent's register status before the link. */
+      current: { debio_status: string | null; debio_sid: string | null; debio_match_method: string | null; debio_verified: number };
+      /** Apply only: the resulting review row and agent state. */
+      review_row?: ReviewRowState & { score: number | null; reasons: string[]; decided_at: string | null };
+      state?: { debio_status: string | null; debio_sid: string | null; debio_cert_valid_to: string | null; debio_match_method: string | null; debio_verified: number };
+    };
+
+function reviewRowState(r: any): ReviewRowState | null {
+  return r ? { id: r.id, entity_key: r.entity_key, debio_sid: r.debio_sid, org_nr: r.org_nr, status: r.status, match_method: r.match_method, state: r.state } : null;
+}
+
+/** Link agent ↔ register entry by sid (see the section comment). `apply` must be literally true to write. */
+export async function manualDebioLink(db: Database.Database, input: ManualLinkInput, opts: ManualLinkOptions = {}): Promise<ManualLinkResult> {
+  const now = opts.now ?? new Date();
+  const nowIso = now.toISOString();
+  const agentId = typeof input.agent_id === "string" ? input.agent_id.trim() : "";
+  const sid = typeof input.debio_sid === "string" || (typeof input.debio_sid === "number" && Number.isFinite(input.debio_sid)) ? String(input.debio_sid).trim() : "";
+  const reason = typeof input.reason === "string" ? input.reason.trim() : "";
+  if (!agentId) return { ok: false, http: 400, error: "agent_id is required" };
+  if (!sid) return { ok: false, http: 400, error: "debio_sid is required" };
+  if (!reason) return { ok: false, http: 400, error: "reason is required" };
+  if (reason.length > MANUAL_LINK_REASON_MAX) return { ok: false, http: 400, error: `reason longer than ${MANUAL_LINK_REASON_MAX} characters` };
+  const dryRun = input.apply !== true;
+
+  const agent = db.prepare("SELECT id, is_active, umbrella_type, role FROM agents WHERE id = ?").get(agentId) as any;
+  if (!agent) return { ok: false, http: 404, error: "agent not found" };
+  // The sync checks active producers only; a link on anything else would never be kept or reset.
+  if (agent.is_active !== 1 || (agent.umbrella_type != null && agent.umbrella_type !== "") || (agent.role != null && agent.role !== "producer")) {
+    return { ok: false, http: 409, error: "agent is not an active producer (the register sync does not check it)" };
+  }
+
+  // The register as the sync sees it: same fetch, same minimum-row rule, same
+  // entities. Nothing about the register is stored between runs (only the
+  // matched statuses, S1.6), so the latest snapshot is a fresh fetch.
+  const env = opts.env ?? process.env;
+  let fetched: DebioRegisterFetchResult;
+  try {
+    fetched = await fetchDebioRegister({ fetchImpl: opts.fetchImpl, env, now });
+  } catch (e) {
+    return { ok: false, http: 502, error: "debio register fetch failed", detail: e instanceof Error ? e.message : String(e) };
+  }
+  const minRows = opts.minRows ?? DEBIO_REGISTER_MIN_ROWS;
+  if (fetched.rows.length < minRows) {
+    return { ok: false, http: 502, error: "debio register snapshot rejected", detail: `too few rows: ${fetched.rows.length} normalized (${fetched.raw} raw), minimum ${minRows}` };
+  }
+  const entity = buildEntities(fetched.rows, now).find((e) => e.sids.includes(sid));
+  if (!entity) return { ok: false, http: 404, error: "debio_sid not in the register" };
+
+  const candidate = reviewRowFields(entity, { method: "manual", score: 1, reasons: [`manual: ${reason}`] });
+  const switchOff = debioSwitchOffAgentIds([agentId], { db, env: opts.env }).has(agentId);
+  const verified = verifiedFor(candidate.status, candidate.cert_valid_to, switchOff, now);
+  const replaces = reviewRowState(db.prepare("SELECT * FROM debio_match_review WHERE agent_id = ? AND entity_key = ?").get(agentId, entity.key));
+  const withdraws = reviewRowState(db.prepare("SELECT * FROM debio_match_review WHERE agent_id = ? AND state = 'approved' AND entity_key <> ? ORDER BY id LIMIT 1").get(agentId, entity.key));
+  const cur = db.prepare("SELECT s.debio_status, s.debio_sid, s.debio_match_method, a.debio_verified FROM agents a LEFT JOIN agent_debio_status s ON s.agent_id = a.id WHERE a.id = ?").get(agentId) as any;
+  const base = {
+    ok: true as const, dry_run: dryRun, agent_id: agentId, candidate, verified, owner_switch_off: switchOff, replaces, withdraws,
+    current: { debio_status: cur?.debio_status ?? null, debio_sid: cur?.debio_sid ?? null, debio_match_method: cur?.debio_match_method ?? null, debio_verified: cur?.debio_verified === 1 ? 1 : 0 },
+  };
+  if (dryRun) return base;
+
+  let decided: ReturnType<typeof decideMatchReview> = null;
+  db.transaction(() => {
+    db.prepare(UPSERT_REVIEW_SQL).run(...reviewRowParams(agentId, candidate, nowIso));
+    const id = (db.prepare("SELECT id FROM debio_match_review WHERE agent_id = ? AND entity_key = ?").get(agentId, entity.key) as { id: number }).id;
+    decided = decideMatchReview(db, id, "approve", { now, env: opts.env });
+  })();
+  const d = decided as ReturnType<typeof decideMatchReview>;
+  const row = db.prepare("SELECT * FROM debio_match_review WHERE id = ?").get(d?.id) as any;
+  const st = db.prepare(`SELECT s.debio_status, s.debio_sid, s.debio_cert_valid_to, s.debio_match_method, a.debio_verified
+    FROM agents a LEFT JOIN agent_debio_status s ON s.agent_id = a.id WHERE a.id = ?`).get(agentId) as any;
+  return {
+    ...base,
+    verified: (d?.debio_verified === 1 ? 1 : 0),
+    review_row: { ...(reviewRowState(row) as ReviewRowState), score: row?.score ?? null, reasons: jsonList(row?.reasons), decided_at: row?.decided_at ?? null },
+    state: { debio_status: st?.debio_status ?? null, debio_sid: st?.debio_sid ?? null, debio_cert_valid_to: st?.debio_cert_valid_to ?? null, debio_match_method: st?.debio_match_method ?? null, debio_verified: st?.debio_verified === 1 ? 1 : 0 },
+  };
 }

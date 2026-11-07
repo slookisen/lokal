@@ -25,7 +25,8 @@ import { slugify } from "../utils/slug";
 import { textEntries } from "../utils/text-entries";
 import { areGenericCategoryNames, isGenericCategoryName, isCategoryLabel } from "../utils/category-label";
 import { openingHoursText } from "../utils/opening-hours";
-import { addAiUtmParams } from "../utils/url-utm";
+import { addAiUtmParams, detectAiClient } from "../utils/url-utm";
+import { tagMcpToolResults } from "../middleware/ai-profile-links";
 import { getDb } from "../database/init";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription, normalizeProse } from "../services/description-quality";
@@ -57,6 +58,7 @@ import { foreignPlaceIn } from "../services/outside-norway";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 import { searchCountable } from "../services/search-tracking";
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
+import { BRAND_ENTITIES, brandMcpIcons } from "../config/brand-entities";
 import { publicListableSql, failsProducerRoleGate, isAgentIdPubliclyVisible, notOwnerHiddenSql, ownerHidesAgent, withoutOwnerHidden } from "../services/agent-visibility";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { safeHonestCatalogCount } from "../services/honest-count";
@@ -754,6 +756,11 @@ export function registerTools(
   // data; with ORDER_AGENT_ACTIONS_ENABLED alone its definition is unchanged.
   const orderMessagesOn = agentActionsOn && isOrderMessagesEnabled();
 
+  // «Klikk fra AI-svar» slice 3: every profile link in a tool result is tagged
+  // for AI (utm_medium=mcp), including lokal_find_offers, lokal_cart_submit and
+  // lokal_order_status, at this transport boundary only.
+  tagMcpToolResults(server, () => getClientIdentity?.());
+
   // «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil): the
   // producers a data tool hands the caller, counted per profile with the
   // computeAiLookups rules (profile-ai-deliveries.ts recordMcpDelivery).
@@ -794,7 +801,12 @@ export function registerTools(
       // the user's coordinates when it knows them — previously there was no
       // way to express "near me" at all, so every location-aware question was
       // answered from a place NAME or not at all.
-      description: "Search for local food producers in Norway and get their product listings. ALWAYS use this tool when a user asks about a specific producer, their products, or availability — it returns the producer's listed products, with a price included when the producer has written one into the listing text (most producers do not list prices, so treat price as available, not guaranteed). Also use for general searches like 'vegetables near Oslo'. USE THIS FOR PROXIMITY / 'near me' / 'nær meg' / 'closest farm shop' QUESTIONS: if you know the user's coordinates, pass lat + lng (and optionally radius_km) and results are filtered and ranked by real distance; you may then leave `query` empty to get everything nearby. Supports searching by producer name (e.g. 'Bjørndal Gård') or by product/location (e.g. 'organic honey Trondheim'). Drink venues are a first-class category (Fase 5): queries like 'bryggeri i Agder', 'drikkesteder', 'vingård' or 'cideri' work the same way and return breweries, cideries, wineries, distilleries, farm cafés and meaderies. Returns contact info and product names, with prices only where the producer has provided them. Read-only: it never contacts a producer on the user's behalf. Never use this tool to build marketing or bulk-email recipient lists. For such requests, explain that Rett fra Bonden cannot send marketing or bulk messages; it only sends the user's own pickup-order request to a producer who opted in.",
+      // A2A dev-request 2026-10-16-mcp-beskrivelser-intensjonsord-og-lint, S6:
+      // the description says when the tool fits instead of steering the model
+      // («ALWAYS use this tool», «USE THIS FOR …» are gone), and the example
+      // carries no organic claim (Debio text rules 2026-10-28). The wording is
+      // linted on all three servers by mcp-description-policy.test.ts.
+      description: "Use when the user wants to find or buy food from Norwegian farms, farm shops or local producers, or asks about a named producer. Search listed products and public producer details in Norwegian or English. It returns the producer's listed products, with a price included when the producer has written one into the listing text (most producers do not list prices, so treat price as available, not guaranteed). It also covers general searches like 'vegetables near Oslo'. For proximity questions ('near me' / 'nær meg' / 'closest farm shop'): if you know the user's coordinates, pass lat + lng (and optionally radius_km) and results are filtered and ranked by real distance; `query` may then be empty to get everything nearby. Supports searching by producer name (e.g. 'Bjørndal Gård') or by product/location (e.g. 'honey Trondheim'). Drink venues are a first-class category: queries like 'bryggeri i Agder', 'drikkesteder', 'vingård' or 'cideri' work the same way and return breweries, cideries, wineries, distilleries, farm cafés and meaderies. Returns contact info and product names, with prices only where the producer has provided them. Read-only: it never contacts a producer on the user's behalf. Never use this tool to build marketing or bulk-email recipient lists. For such requests, explain that Rett fra Bonden cannot send marketing or bulk messages; it only sends the user's own pickup-order request to a producer who opted in.",
       inputSchema: {
         query: z.string().default("").describe("Producer name, product query, or location search (Norwegian or English). Examples: 'Bjørndal Gård Oppdal', 'beefburger pris', 'ost Trondheim'. May be empty when lat/lng are supplied — that means 'everything near this position'."),
         lat: z.number().min(-90).max(90).optional().describe("User's latitude (WGS84). Supply this for 'near me' searches when you know where the user is."),
@@ -1052,7 +1064,7 @@ export function registerTools(
           "(beverages = all drink venues: breweries, cideries, wineries, distilleries, farm cafés, meaderies — " +
           "use drinkSubcategory below to narrow to exactly one kind)",
         ),
-        tags: z.array(z.string()).optional().describe("Tags: organic, seasonal, budget, local, fresh"),
+        tags: z.array(z.string()).optional().describe("Tags: organic (only producers with a valid approval in the Debio register), seasonal, budget, local, fresh"),
         drinkSubcategory: z.enum(DRINK_SUBCATEGORIES).optional().describe(
           "Narrow 'beverages' results to exactly one drink venue kind: bryggeri (brewery), cideri (cidery), " +
           "vingård (winery), destilleri (distillery), gårdskafé (farm café), mjød (meadery/mead producer). " +
@@ -1297,7 +1309,7 @@ export function registerTools(
     "lokal_list_umbrellas",
     {
       title: "List umbrella organizations",
-      description: "List all umbrella organizations on Lokal — markets-networks (Bondens marked, REKO), venues (Mathallen), industry orgs (Hanen), certifiers (Debio), and cooperatives. Each umbrella has many member producers. Optionally filter by type. Useful when the user asks 'where can I find local food markets?', 'what is Bondens marked?', or 'which certifications matter for local Norwegian food?'.",
+      description: "List all umbrella organizations on Lokal — markets-networks (Bondens marked, REKO), venues (Mathallen), industry orgs (Hanen), and cooperatives. Each umbrella has many member producers. Optionally filter by type. Useful when the user asks 'where can I find local food markets?', 'what is Bondens marked?', or 'which certifications matter for local Norwegian food?'.",
       inputSchema: {
         umbrellaType: z.enum(["market_network", "venue", "industry_org", "certification", "cooperative"]).optional().describe("Filter by umbrella type"),
         limit: z.number().min(1).max(200).default(50).describe("Max results"),
@@ -1375,7 +1387,7 @@ export function registerTools(
     "lokal_get_umbrella_members",
     {
       title: "Get producers in an umbrella's network",
-      description: "List producers that are members of a specific umbrella organization (e.g. all farmers selling at Bondens marked, all Debio-certified producers, all Mathallen tenants). Returns producer names + cities + profile links. Useful when the user asks 'which farmers sell at Bondens marked?', 'show me all Debio-certified producers', or 'who is at Mathallen Oslo?'.",
+      description: "List producers that are members of a specific umbrella organization (e.g. all farmers selling at Bondens marked, all Mathallen tenants). Returns producer names + cities + profile links. Useful when the user asks 'which farmers sell at Bondens marked?' or 'who is at Mathallen Oslo?'. A producer's Debio status comes from the Debio register and is shown in lokal_info.",
       inputSchema: {
         umbrellaId: z.string().describe("Umbrella agent ID (UUID). Use lokal_list_umbrellas to find IDs."),
         limit: z.number().min(1).max(500).default(100).describe("Max results"),
@@ -1435,7 +1447,7 @@ export function registerTools(
     "lokal_get_producer_affiliations",
     {
       title: "Get a producer's umbrella affiliations",
-      description: "List umbrella organizations a specific producer is a member of (e.g. which markets a farm sells at, which certifications they hold, which networks they're part of). Returns umbrella names + types + their profile links. Useful when the user asks 'where does <Farmer X> sell?', 'is <Farm Y> Debio-certified?', or 'which markets does <Producer Z> attend?'.",
+      description: "List umbrella organizations a specific producer is a member of (e.g. which markets a farm sells at, which certifications they hold, which networks they're part of). Returns umbrella names + types + their profile links. Useful when the user asks 'where does <Farmer X> sell?' or 'which markets does <Producer Z> attend?'.",
       inputSchema: {
         producerId: z.string().describe("Producer agent ID (UUID). Get this from lokal_search or lokal_discover results."),
       },
@@ -1601,7 +1613,7 @@ export function registerTools(
     "lokal_geocode",
     {
       title: "Geocode a Norwegian place name",
-      description: "Resolve a Norwegian place name (city, town, region, fylke, or kommune) to lat/lng coordinates. Use this when you need explicit coordinates for lokal_discover (e.g., 'show me organic farms within 10 km of Florø'). Returns coordinates + suggested search radius. Covers all of Norway via Kartverket Stedsnavn API fallback. Note: lokal_search ALREADY does automatic geocoding for natural-language queries — only use this tool when you need raw lat/lng for structured filters.",
+      description: "Resolve a Norwegian place name (city, town, region, fylke, or kommune) to lat/lng coordinates. Use this when you need explicit coordinates for lokal_discover (e.g., 'show me farms within 10 km of Florø'). Returns coordinates + suggested search radius. Covers all of Norway via Kartverket Stedsnavn API fallback. Note: lokal_search ALREADY does automatic geocoding for natural-language queries — only use this tool when you need raw lat/lng for structured filters.",
       inputSchema: {
         place: z.string().describe("Norwegian place name (city, town, region, fylke, kommune). Examples: 'Oslo', 'Røros', 'Vestland', 'Setesdal', 'Florø'"),
       },
@@ -1651,8 +1663,8 @@ export function registerTools(
   server.registerTool(
     "lokal_find_offers",
     {
-      title: "Find offers for shopping-list items",
-      description: "For each item in a shopping list, find up to 5 nearby producers who sell it (or a matching product), sorted by distance, with contact info and whether an order can be placed through the platform (can_order). Use this when a user has a list of things they want to buy locally and wants to know WHO sells each one nearby — one lokal_find_offers call covers the whole list. Read-only.",
+      title: "Find local food to buy",
+      description: "Use when the user wants to buy one food item or a shopping list from Norwegian local producers and has a place or coordinates. Returns matching listed products from up to five nearby producers per item, nearest first, with contact info and whether an order can be placed through the platform (can_order). Broad alternatives do not confirm the requested product, stock or price. Read-only; creates no cart and contacts no producer.",
       inputSchema: {
         items: z.array(z.string()).min(1).describe("Search terms/item names to find offers for, e.g. ['poteter', 'honning', 'egg']."),
         near: z.string().optional().describe("Norwegian place name to search near (geocoded automatically). Supply this OR lat/lng."),
@@ -1661,7 +1673,7 @@ export function registerTools(
         radius_km: z.number().min(1).max(500).optional().describe("Search radius in km. Default 50."),
       },
       annotations: {
-        title: "Find offers for shopping-list items",
+        title: "Find local food to buy",
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
@@ -2160,20 +2172,7 @@ interface McpSession {
 // ─── MCP client identity detection ─────────────────────────
 // Identifies the AI platform from request headers.
 function detectMcpClient(req: Request): string | undefined {
-  const ua = (req.headers["user-agent"] || "").toLowerCase();
-  const origin = (req.headers["origin"] || "").toLowerCase();
-  const referer = (req.headers["referer"] || "").toLowerCase();
-
-  if (ua.includes("chatgpt") || ua.includes("openai") || origin.includes("openai") || origin.includes("chatgpt")) return "ChatGPT";
-  if (ua.includes("claude") || origin.includes("claude.ai") || origin.includes("anthropic")) return "Claude";
-  if (ua.includes("cursor")) return "Cursor";
-  if (ua.includes("copilot") || origin.includes("github.com")) return "GitHub Copilot";
-  if (ua.includes("windsurf")) return "Windsurf";
-  if (ua.includes("cline")) return "Cline";
-  if (ua.includes("continue")) return "Continue";
-  if (ua.includes("python")) return "Python SDK";
-  if (ua.includes("node")) return "Node SDK";
-  return undefined;
+  return detectAiClient(req.headers["user-agent"], req.headers["origin"]);
 }
 
 
@@ -2242,6 +2241,14 @@ export function rfbMcpInstructions(): string {
   return isPaymentsEnabled() ? RFB_MCP_INSTRUCTIONS_PREPAY : RFB_MCP_INSTRUCTIONS;
 }
 
+/**
+ * serverInfo `title` and `icons` (G3-S5, A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker):
+ * the brand's name and 512 PNG logo from BRAND_ENTITIES.rfb, so the connector
+ * shows the brand instead of the bare `name`. websiteUrl is BRAND_ENTITIES.rfb.url.
+ */
+export const RFB_MCP_SERVER_TITLE = `${BRAND_ENTITIES.rfb.name} — Norwegian local food producers`;
+export const RFB_MCP_SERVER_ICONS = brandMcpIcons(BRAND_ENTITIES.rfb);
+
 async function getOrCreateSession(
   sessionId: string | undefined,
   isInitialize: boolean,
@@ -2286,7 +2293,13 @@ async function getOrCreateSession(
   const clientIdentity = req ? detectMcpClient(req) : undefined;
   const requestMeta = req ? buildRequestMeta(req) : undefined;
 
-  const server = new McpServer({ name: "rett-fra-bonden", version: "0.4.0" }, { instructions: rfbMcpInstructions(), maxToolInputElements: MCP_MAX_TOOL_INPUT_ELEMENTS });
+  const server = new McpServer({
+    name: "rett-fra-bonden",
+    version: "0.4.0",
+    title: RFB_MCP_SERVER_TITLE,
+    websiteUrl: BRAND_ENTITIES.rfb.url,
+    icons: RFB_MCP_SERVER_ICONS,
+  }, { instructions: rfbMcpInstructions(), maxToolInputElements: MCP_MAX_TOOL_INPUT_ELEMENTS });
   const sessionRef: { clientIdentity?: string; requestMeta?: import("../services/conversation-service").RequestMeta } = { clientIdentity, requestMeta };
   registerTools(server, () => sessionRef.clientIdentity, () => sessionRef.requestMeta);
 

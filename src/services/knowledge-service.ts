@@ -2,12 +2,13 @@ import { v4 as uuid } from "uuid";
 import crypto from "crypto";
 import { getDb } from "../database/init";
 import { isDisplayablePhone, validatePhoneForWrite, stripTrailingContactLabel, stripLeadingContactLabel } from "./contact-normalizer";
-import { isJunkDescription, normalizeProse } from "./description-quality";
+import { isJunkDescription, normalizeProse, organicOwnerGateActive } from "./description-quality";
 import { textEntries } from "../utils/text-entries";
-import { productsWithoutOrganicFlag, stripOrganicEntries } from "./organic-claims";
+import { productsWithoutOrganicFlag, stripOrganicEntries, dropOrganicSentences } from "./organic-claims";
 import { debioStatusShown } from "./debio-approval";
 import { normalizeEmail } from "./blocklist-service";
 import { customerRuleSql } from "./customer-rule";
+import { revokeOwnerAccessExceptVerifiedOwners } from "./owner-access-revocation";
 import {
   type ClaimRecommendation, type DomainHttpsCheck, claimDomainRuleEnabled, emailDomain, emailDomainMatchesWebsite,
   getDomainHttpsCheck, isFreeMailDomain, isHostedPlatformHost, isRootWebsite, registrableDomain, websiteHost,
@@ -210,6 +211,58 @@ export function ownerLockedFieldKeys(curatedFieldsJson: string | null | undefine
     // unreadable → no locks (same as parseCuratedFields)
   }
   return out;
+}
+
+// ─── Økologi S3c / S3c-2: the owner's own `about` on public reads ──────────
+// dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
+// tekstrevisjon. With RFB_ORGANIC_CLAIM_GATE + RFB_ORGANIC_OWNER_GATE both on
+// (organicOwnerGateActive, default off), an OWNER-written about
+// (curated_fields.about.by === "owner") of a producer without a valid Debio
+// status loses every sentence with an organic claim (dropOrganicSentences)
+// on every public read. Read-side only; the stored text is unchanged.
+
+/** Parsed curated_fields says `about` is owner-written (`about.by === "owner"`). */
+export function aboutIsOwnerWritten(curatedFields: unknown): boolean {
+  return !!curatedFields && typeof curatedFields === "object" &&
+    (curatedFields as { about?: { by?: unknown } | null }).about?.by === "owner";
+}
+
+/**
+ * Is agent_knowledge.about owner-written (curated_fields.about.by ===
+ * "owner")? Tolerant: unreadable JSON / no row = false.
+ */
+export function ownerWroteAbout(agentId: string): boolean {
+  try {
+    const row = getDb().prepare("SELECT curated_fields FROM agent_knowledge WHERE agent_id = ?").get(agentId) as { curated_fields?: string | null } | undefined;
+    if (!row?.curated_fields) return false;
+    return aboutIsOwnerWritten(JSON.parse(row.curated_fields));
+  } catch {
+    return false;
+  }
+}
+
+/** The producer has a valid Debio status (debioStatusShown). Tolerant: no row / error = false. */
+function debioStatusShownFor(agentId: string): boolean {
+  try {
+    const db = getDb();
+    const agent = db.prepare("SELECT id, debio_verified FROM agents WHERE id = ?").get(agentId) as { id?: unknown; debio_verified?: unknown } | undefined;
+    return debioStatusShown(agent, db);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Økologi S3c-2: `about` (agent_knowledge.about or a published translation
+ * of it) as a public surface that does not read getAgentInfo may show it.
+ * Gate off, empty text, non-owner text or a valid Debio status → `about`
+ * unchanged (same value, no DB read while the gate is off); otherwise
+ * dropOrganicSentences(about) ("" when nothing is left).
+ */
+export function publicOwnerAboutText<T extends string | null | undefined>(agentId: string, about: T): T | string {
+  if (!about || !organicOwnerGateActive()) return about;
+  if (!ownerWroteAbout(agentId)) return about;
+  return debioStatusShownFor(agentId) ? about : dropOrganicSentences(about);
 }
 
 export interface SeasonalProduct {
@@ -756,6 +809,10 @@ function claimAssessmentErrorKind(err: unknown): string {
   return err instanceof Error && /^[A-Za-z]{1,40}$/.test(err.name) ? err.name : "error";
 }
 
+/** How a queued claim was approved: by Daniel from the admin queue, or
+ *  automatically on a green claim assessment (eierkrav B2b-1). */
+export type ClaimApprovalVia = "admin_approval" | "auto_assessment";
+
 /** The stored claim_assessment JSON, parsed; null when absent or unreadable. */
 export function parseStoredClaimAssessment(raw: string | null | undefined): ClaimAssessment | null {
   if (!raw) return null;
@@ -844,6 +901,13 @@ class KnowledgeService {
     // (X-Claim-Token for this agent) reads the stored lists unchanged, so a
     // save from there never drops what the public view filters.
     const filterOrganic = !debioVerified && !opts.ownerView;
+    // Økologi S3c-2 (RFB_ORGANIC_CLAIM_GATE + RFB_ORGANIC_OWNER_GATE, both
+    // default off): the same read step as the profile page — an OWNER-written
+    // about of a producer without a valid Debio status loses every sentence
+    // with an organic claim on this public read (info API, MCP, A2A, cards).
+    // Not for the owner's own editor (ownerView). Stored text unchanged.
+    const ownerAboutOrganicFilter = organicOwnerGateActive() && debioVerified !== true && !opts.ownerView &&
+      aboutIsOwnerWritten(knowledge?.curatedFields);
     const storedProducts = productEntries(knowledge?.products);
 
     return {
@@ -878,7 +942,9 @@ class KnowledgeService {
         // this seller" endpoints (GET /agents/:id/info, MCP lokal_info),
         // so scraped nav/boilerplate junk (e.g. "Skip to content ... Meny")
         // must never be returned as if it were a real description/about text.
-        about: this.guardedDescriptionField(agentId, agent.name, "knowledge.about", knowledge?.about),
+        about: ownerAboutOrganicFilter
+          ? dropOrganicSentences(this.guardedDescriptionField(agentId, agent.name, "knowledge.about", knowledge?.about))
+          : this.guardedDescriptionField(agentId, agent.name, "knowledge.about", knowledge?.about),
         description: this.guardedDescriptionField(agentId, agent.name, "agent.description", agent.description),
         specialties: filterOrganic ? stripOrganicEntries(textEntries(knowledge?.specialties)) : textEntries(knowledge?.specialties),
         // PR-95: rewrite certifications to reflect debio_verified flag.
@@ -1433,7 +1499,7 @@ class KnowledgeService {
           console.warn(`[claim-assessment] claim ${claimId} not assessed: ${claimAssessmentErrorKind(err)}`);
         }
       })();
-      trackClaimAssessment(run);
+      trackClaimAssessment(run, claimId);
     } catch (err) {
       console.warn(`[claim-assessment] not started: ${claimAssessmentErrorKind(err)}`);
     }
@@ -1937,7 +2003,7 @@ class KnowledgeService {
    * claimant_email_typed. Shared by verifyClaim and approveClaimReview, so the
    * badge gate and the owner stamp below are the same on both paths.
    */
-  private grantClaimOwnership(claim: { id: string; agent_id: string }, ownerEmail: string, claimedVia: "claim" | "admin_approval"): string {
+  private grantClaimOwnership(claim: { id: string; agent_id: string }, ownerEmail: string, claimedVia: "claim" | ClaimApprovalVia): string {
     const db = getDb();
     const claimId = claim.id;
     // Success — generate claim token for future management (expires in 30 days)
@@ -2046,7 +2112,8 @@ class KnowledgeService {
     // ownership is real even though the public badge is withheld above.
     // agent_claims carries no user id, so claimed_by_user_id is left alone.
     // claimed_via is 'claim' for the code path, 'admin_approval' for a claim
-    // Daniel approved from the admin queue (decision 11=A).
+    // Daniel approved from the admin queue (decision 11=A), 'auto_assessment'
+    // for a green claim approved automatically (eierkrav B2b-1).
     db.prepare(`
       UPDATE agents
          SET claimed_at = ?, claimed_via = COALESCE(claimed_via, ?)
@@ -2059,6 +2126,15 @@ class KnowledgeService {
       db.prepare("UPDATE agent_knowledge SET data_source = 'hybrid' WHERE agent_id = ? AND data_source = 'auto'")
         .run(claim.agent_id);
     }
+
+    // Owner change (dev-request 2026-11-06-rfb-krav-for-portal-og-okter-ved-
+    // eierskifte, spec point 2): login rows follow ownership. Every live
+    // /eier session and open login link for this profile whose address is not
+    // a verified owner now (the new owner, or an owner that stays) is revoked
+    // — e.g. a previous owner by activation link or the old listed address.
+    // Both callers run this method inside a transaction, so a failure here
+    // rolls the whole grant back instead of leaving the old sessions live.
+    revokeOwnerAccessExceptVerifiedOwners(db, claim.agent_id, `claim grant (${claimedVia})`);
 
     return claimToken;
   }
@@ -2100,10 +2176,17 @@ class KnowledgeService {
    * because the profile got an owner meanwhile), else the address the
    * claimant gave. An existing owner keeps its own claim and token. The
    * caller sends the login link to `email`.
+   *
+   * Eierkrav B2b-1: `via` 'auto_assessment' is the green auto-approval. It
+   * stamps claimed_via and the claim's verification_method 'auto_assessment'
+   * (instead of 'admin_approval' / 'manual'), and only inside the
+   * transaction, re-checked there: the claim must still be pending_review and
+   * the profile must still have no owner ("has_owner" otherwise). The default
+   * ('admin_approval') is the admin path, unchanged.
    */
-  approveClaimReview(claimId: string, approvedEmail?: string):
+  approveClaimReview(claimId: string, approvedEmail?: string, via: ClaimApprovalVia = "admin_approval"):
     | { ok: true; agentId: string; email: string; isVerified: boolean }
-    | { ok: false; error: "not_found" | "not_pending_review" | "invalid_email" } {
+    | { ok: false; error: "not_found" | "not_pending_review" | "invalid_email" | "has_owner" } {
     const db = getDb();
     const claim = db.prepare("SELECT id, agent_id, status, claimant_email, code_sent_to FROM agent_claims WHERE id = ?").get(claimId) as
       { id: string; agent_id: string; status: string; claimant_email: string; code_sent_to: string | null } | undefined;
@@ -2111,10 +2194,18 @@ class KnowledgeService {
     if (claim.status !== "pending_review") return { ok: false, error: "not_pending_review" };
     const email = normalizeEmail(approvedEmail ?? claim.code_sent_to ?? claim.claimant_email);
     if (!isSingleEmailAddress(email)) return { ok: false, error: "invalid_email" };
-    db.transaction(() => {
-      db.prepare("UPDATE agent_claims SET verification_method = 'manual' WHERE id = ?").run(claimId);
-      this.grantClaimOwnership(claim, email, "admin_approval");
+    const auto = via === "auto_assessment";
+    const refused = db.transaction((): "not_pending_review" | "has_owner" | null => {
+      if (auto) {
+        const current = db.prepare("SELECT status FROM agent_claims WHERE id = ?").get(claimId) as { status: string } | undefined;
+        if (current?.status !== "pending_review") return "not_pending_review";
+        if (this.agentHasOwner(claim.agent_id)) return "has_owner";
+      }
+      db.prepare("UPDATE agent_claims SET verification_method = ? WHERE id = ?").run(auto ? "auto_assessment" : "manual", claimId);
+      this.grantClaimOwnership(claim, email, via);
+      return null;
     })();
+    if (refused) return { ok: false, error: refused };
     const agent = db.prepare("SELECT is_verified FROM agents WHERE id = ?").get(claim.agent_id) as { is_verified: number } | undefined;
     return { ok: true, agentId: claim.agent_id, email, isVerified: agent?.is_verified === 1 };
   }
@@ -2154,7 +2245,7 @@ class KnowledgeService {
    *     flipped it ('auto' → 'hybrid') and it is still 'hybrid' (an owner
    *     edit since then is kept). restored "snapshot".
    *   - no snapshot (granted before C1): claimed_at/claimed_via are cleared
-   *     only when claimed_via is 'claim' or 'admin_approval' (a grant's
+   *     only when claimed_via is 'claim', 'admin_approval' or 'auto_assessment' (a grant's
    *     stamp); is_verified and data_source are left as they are, since what
    *     they were before cannot be known. restored "partial_no_snapshot".
    */
@@ -2200,7 +2291,7 @@ class KnowledgeService {
       if (!snap) {
         db.prepare(`
           UPDATE agents SET claimed_at = NULL, claimed_via = NULL
-           WHERE id = ? AND claimed_via IN ('claim', 'admin_approval')
+           WHERE id = ? AND claimed_via IN ('claim', 'admin_approval', 'auto_assessment')
         `).run(claim.agent_id);
         return { ok: true as const, agentId: claim.agent_id, restored: "partial_no_snapshot" as const, ownerRemains, sessionsRevoked };
       }

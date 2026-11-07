@@ -29,6 +29,7 @@
 import { readOrderNotificationsOptIn, writeOrderNotificationsOptIn, readOrderNotificationEmailOverride } from "../services/order-opt-in";
 import { readOwnerProfileVisible, writeOwnerProfileVisible } from "../services/owner-pause-store";
 import { GARDSSALG_BOOKING_ENABLED_ADAPTER, GARDSSALG_PROFILE_VISIBLE_ADAPTER } from "./gardssalg-adapters";
+import { PRODUCT_WEEKLY_SYNC_ADAPTER, PRODUCT_WEEKLY_SYNC_FLAG } from "./product-weekly-sync";
 
 export const OWNER_FEATURE_KEYS = [
   // Hvem kan finne deg
@@ -172,10 +173,14 @@ export interface LocalizedText {
  * noBookingAdminBrake = Opplevagent has not stopped booking for the row;
  * visibilityOwnerControlled = the row is visible or on the owner's own pause
  * (not «fjern», not an admin quality hide).
+ * T10 (RFB): orderGateReady = isEligibleForRealOrder() would be true with
+ * orders on (cart-service orderReadiness) — an `enableRequires` of
+ * orders.enabled, so it only stops switching orders ON.
  */
 export type OwnerFeatureCondition =
   | "verifiedOwner" | "isVerifiedBadge" | "stripeActive" | "drinkProducer"
-  | "bookingRequestEmail" | "noBookingAdminBrake" | "visibilityOwnerControlled";
+  | "bookingRequestEmail" | "noBookingAdminBrake" | "visibilityOwnerControlled"
+  | "orderGateReady";
 export type OwnerFeatureRequirement = OwnerFeatureKey | OwnerFeatureCondition;
 
 /**
@@ -192,6 +197,12 @@ export type OwnerFeatureSurface =
   | "owner_portal"
   | `email:${string}` | `job:${string}`;
 
+/** Who an owner write is for (resolve.ts setOwnerFeatureValue's actor), passed on to an adapter's write. */
+export interface OwnerFeatureWriteActor {
+  actor: "owner" | "admin" | "cs" | "system";
+  detail?: string | null;
+}
+
 /**
  * Storage adapter: the entry lives in an existing column instead of
  * owner_feature_settings. The column stays the source of truth.
@@ -207,7 +218,7 @@ export interface OwnerFeatureStorageAdapter {
    * booking_live: an admin brake set after the resolver checked — answered
    * as a 409 like any other block).
    */
-  write(db: any, subjectId: string, value: OwnerFeatureValue): boolean | { blocked: LocalizedText };
+  write(db: any, subjectId: string, value: OwnerFeatureValue, actor?: OwnerFeatureWriteActor): boolean | { blocked: LocalizedText };
 }
 
 export interface OwnerFeatureEntry {
@@ -259,7 +270,7 @@ export interface OwnerFeatureEntry {
    * options, since), used while the flag is off so the resolver and the
    * owner API answer exactly as before (ownerFeatureEntryForEnv).
    */
-  whileFlagOff?: Partial<Pick<OwnerFeatureEntry, "default" | "options" | "since" | "description">>;
+  whileFlagOff?: Partial<Pick<OwnerFeatureEntry, "default" | "options" | "since" | "description" | "requires">>;
   /**
    * The flag whileFlagOff follows, for an entry that is live either way but
    * whose text depends on another entry's flag (auto.guarantee follows
@@ -296,11 +307,13 @@ export const OWNER_FEATURE_GROUPS: Array<{ key: OwnerFeatureGroup; label: Locali
   { key: "products", label: { no: "Produkter og priser", en: "Products and prices" } },
   { key: "orders", label: { no: "Bestillinger", en: "Orders" } },
   { key: "payments", label: { no: "Betaling", en: "Payment" } },
-  { key: "notify", label: { no: "Varsler til deg", en: "Notifications to you" } },
   { key: "auto", label: { no: "Hjelp med å holde profilen oppdatert", en: "Help keeping your profile up to date" } },
   { key: "stats", label: { no: "Statistikk og offentlige tall", en: "Statistics and public numbers" } },
-  { key: "comms", label: { no: "Kontakt fra Rett fra Bonden", en: "Contact from Rett fra Bonden" } },
   { key: "connect", label: { no: "Koblinger", en: "Connections" } },
+  // T7 (punkt 1): notifications, then «Kontakt fra Rett fra Bonden» as the
+  // last group — the «Nyheter og tips» question stands at its top.
+  { key: "notify", label: { no: "Varsler til deg", en: "Notifications to you" } },
+  { key: "comms", label: { no: "Kontakt fra Rett fra Bonden", en: "Contact from Rett fra Bonden" } },
 ];
 
 const DR = "2026-10-22-rfb-mine-valg-eierbrytere";
@@ -479,13 +492,35 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     devRequest: "2026-10-21-rfb-produktimport-fra-egen-nettside",
     surfaces: ["job:product_import"],
   }),
+  // Produktimport skive 4-2b (dev-request 2026-10-21-rfb-produktimport-fra-
+  // egen-nettside): live behind PRODUCT_AUTO_SYNC_ENABLED (liveFlag; off =
+  // coming_soon, the catalog row exactly as before — whileFlagOff). One truth
+  // with the import page's box (Skive 4a): product_auto_sync_state.
+  // product_sync_mode via the adapter (product-weekly-sync.ts), read by the
+  // weekly job (services/product-import/auto-sync.ts dueAutoSyncProfiles).
+  // Only for a verified owner of a profile with agents.is_verified = 1 — the
+  // job's own rule. Switching on runs nothing at once; the job picks it up.
   entry({
     key: "products.weekly_sync", group: "products", type: "switch",
     label: t("Hold produktene oppdatert fra nettsiden", "Keep products updated from my website"),
-    description: t("Produktene sjekkes mot nettsiden din hver uke.", "Your products are checked against your website every week."),
+    description: t(
+      "Vi sjekker nettsiden din hver uke. Varer du har bekreftet, får ny pris automatisk. Nye varer venter til du godkjenner dem, og store avvik stopper oppdateringen.",
+      "We check your website every week. Items you have confirmed get the new price automatically. New items wait for your approval, and large deviations stop the update.",
+    ),
     default: { owner: false, unclaimed: false },
+    requires: ["verifiedOwner", "isVerifiedBadge"],
+    status: "live",
+    liveFlag: PRODUCT_WEEKLY_SYNC_FLAG,
+    // Flag off: the pre-live catalog row (its text, no requirements, the S2a date).
+    whileFlagOff: {
+      description: t("Produktene sjekkes mot nettsiden din hver uke.", "Your products are checked against your website every week."),
+      requires: [],
+      since: SINCE,
+    },
+    since: "2026-11-06",
     devRequest: "2026-10-21-rfb-produktimport-fra-egen-nettside",
     surfaces: ["job:product_weekly_sync"],
+    storage: PRODUCT_WEEKLY_SYNC_ADAPTER,
   }),
   entry({
     key: "products.show_prices", group: "products", type: "switch",
@@ -530,6 +565,11 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     ),
     default: { owner: false, unclaimed: false },
     requires: ["verifiedOwner", "isVerifiedBadge"],
+    // T10: switching ON needs the real-order gate to be ready (verified,
+    // an order address that is not blocked, the profile checked). Only
+    // checked when switching on: an owner who already has orders on is
+    // never switched off or changed by it.
+    enableRequires: ["orderGateReady"],
     confirmOn: t(
       "Du får bestillinger på e-post og må svare kunden. Du kan slå det av når som helst.",
       "You will receive orders by e-mail and must reply to the customer. You can switch it off at any time.",
@@ -887,6 +927,9 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   entry({
     key: "comms.news", group: "comms", type: "switch",
     label: t("Nyheter og tips", "News and tips"),
+    // T7: the allowlisted «Mine valg» page shows the versioned consent text
+    // (news-consent.ts) in this row instead; this description stays as it is
+    // because the public «For produsenter» page reads it (not allowlisted).
     description: t(
       "Om du vil ha nyheter og tips fra Rett fra Bonden på e-post. Vi lagrer svaret ditt med tidspunkt. Vi sender ingen nyhetsbrev automatisk.",
       "Whether you want news and tips from Rett fra Bonden by e-mail. We store your answer with the time. We send no newsletter automatically.",

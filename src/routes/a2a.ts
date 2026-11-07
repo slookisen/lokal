@@ -14,7 +14,7 @@ import {
 } from "../services/a2a-traffic-classifier";
 import { hashIP } from "../services/analytics-service";
 import { discoveryService } from "../services/discovery-service";
-import { knowledgeService, relabelCertifications, productEntries, parseProductPrice } from "../services/knowledge-service";
+import { knowledgeService, relabelCertifications, productEntries, parseProductPrice, publicOwnerAboutText } from "../services/knowledge-service";
 import { catalogNameNorm, softStockByNameNorm, stockSoftExpiryBuyerTextNb } from "../services/stock-soft-expiry";
 import { stripOrganicEntries } from "../services/organic-claims";
 import { textEntries } from "../utils/text-entries";
@@ -26,6 +26,7 @@ import { isJunkDescription } from "../services/description-quality";
 import { signAgentCard, getJWKS } from "../services/agent-card-signing";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { recordA2aDelivery } from "../services/profile-ai-deliveries";
+import { aiProfileLinksJson } from "../middleware/ai-profile-links";
 import { agentCardProvider } from "../services/company-legal";
 import { isPaymentsEnabled } from "../services/payment-service";
 import { a2aMessageData, capA2aData } from "../utils/a2a-message";
@@ -33,6 +34,7 @@ import { capFreeText } from "../utils/free-text";
 import { logInternalError, rpcInternalErrorReply } from "../utils/internal-error";
 import { searchCountable } from "../services/search-tracking";
 import { publicAgentInfo, publicFieldChoices } from "../owner-features/enforce";
+import { emailWithheldIds, withKnowledgeEmailNull } from "../services/email-reveal-guard";
 import { readSearchText, geocodeSearchPlace, discoveryQueryOf, outsideNorwayText, noProductMatchText } from "../services/rfb-search-reading";
 import {
   isOrderAgentActionsEnabled,
@@ -118,13 +120,13 @@ router.get("/a2a", (_req: Request, res: Response) => {
     const cities = [...new Set(agents.map((a: any) => a.city).filter(Boolean))];
     const card = {
       name: "Rett fra Bonden",
-      description: `A2A marketplace for local food in Norway. Connect AI agents with ${agents.length}+ verified local farms, shops, cooperatives, farm shops, REKO rings, and markets. Agent-markedsplass for lokal mat i Norge.`,
+      description: `A2A marketplace for local food in Norway. Connect AI agents with ${agents.length}+ local farms, shops, cooperatives, farm shops, REKO rings, and markets, cross-checked against the Brønnøysund register. Agent-markedsplass for lokal mat i Norge.`,
       url: process.env.BASE_URL || "https://rettfrabonden.com",
       // T3 (dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as):
       // same provider as the .well-known card (getRegistryCard) — the company.
       provider: {
         ...agentCardProvider(),
-        contactUrl: `${process.env.BASE_URL || "https://rettfrabonden.com"}/docs`,
+        contactUrl: `${process.env.BASE_URL || "https://rettfrabonden.com"}/kontakt`,
         description: "Open agent-to-agent food marketplace operator. Norges første A2A-markedsplass for lokal mat.",
       },
       version: "1.0.0",
@@ -137,7 +139,7 @@ router.get("/a2a", (_req: Request, res: Response) => {
       additionalInterfaces: [
         { url: `${process.env.BASE_URL || "https://rettfrabonden.com"}/api/marketplace`, transport: "HTTP+JSON" },
       ],
-      documentationUrl: `${process.env.BASE_URL || "https://rettfrabonden.com"}/docs`,
+      documentationUrl: `${process.env.BASE_URL || "https://rettfrabonden.com"}/teknologi`,
       // dev-request 2026-07-25-proveniens-transparens: additive link to the
       // public "how we verify our data" page (field_provenance / cross-source
       // agreement machinery, already live server-side — this is docs only,
@@ -178,7 +180,7 @@ router.get("/a2a", (_req: Request, res: Response) => {
         { type: "rest", url: `${process.env.BASE_URL || "https://rettfrabonden.com"}/api/marketplace`, description: "REST API for search, discovery, registration" },
       ],
       skills: [
-        { id: "discover-local-food-agents", name: "Discover Local Food Agents", description: `Search ${agents.length}+ verified local food producers in Norway`, tags: ["local food", "farm direct", "Norway"], examples: ["Find farms near Oslo", "finn grønnsaker i Bergen"] },
+        { id: "discover-local-food-agents", name: "Discover Local Food Agents", description: `Search ${agents.length}+ local food producers in Norway, cross-checked against the Brønnøysund register`, tags: ["local food", "farm direct", "Norway"], examples: ["Find farms near Oslo", "finn grønnsaker i Bergen"] },
         { id: "agent-conversation", name: "Start Agent Negotiation", description: "Initiate buyer-seller conversation between agents", tags: ["negotiate", "order", "transaction"], examples: ["negotiate delivery of tomatoes"] },
         { id: "build-shopping-cart", name: "Build a shopping cart", description: `Cart and order flow is available via the MCP server (POST /mcp): find offers with lokal_find_offers, then lokal_cart_create, lokal_cart_add_item, lokal_cart_view and lokal_cart_submit (${isPaymentsEnabled() ? "pickup order; producers that take prepayment return a Stripe payment link the buyer approves themselves, the others are paid at pickup" : "pickup order, no payment"}). Not available through message/send on /a2a.`, tags: ["cart", "order", "local food", "pickup", "mcp"], examples: ["MCP tools/call lokal_find_offers {items: [\"potet\"], near: \"Oslo\"}", "MCP tools/call lokal_cart_create"] },
         // Fase B3 (mine ordrer): only with ORDER_AGENT_ACTIONS_ENABLED on; off, the card is unchanged.
@@ -199,7 +201,8 @@ router.get("/a2a", (_req: Request, res: Response) => {
   }
 });
 
-router.post("/a2a", (req: Request, res: Response) => {
+// «Klikk fra AI-svar» slice 3: profile links in the answer are tagged for AI (utm_medium=a2a).
+router.post("/a2a", aiProfileLinksJson("a2a"), (req: Request, res: Response) => {
   // Defensive: a request without Content-Type: application/json (or with a malformed
   // body) leaves req.body as undefined, and destructuring it throws — Express then
   // emits a default HTML 500 to a JSON-RPC client. Return a clean parse error instead.
@@ -791,6 +794,16 @@ function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
     });
   }
 
+  // dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
+  // S-A5 (RFB A2A): knowledge.email follows the rfb per-IP limit of
+  // services/email-reveal-guard.ts, the counter the profile page and the
+  // REST answers share (switch EMAIL_REVEAL_GUARD_RFB, default off). Over
+  // the limit, or for CCBot, it reads null as for a producer without one.
+  // Switch on: Cache-Control: private. Switch off: nothing changes.
+  let shown = publicAgentInfo(info, publicFieldChoices(agentId));
+  const emailWithheld = emailWithheldIds(req, res, "rfb", shown.knowledge.email ? [String(agentId)] : []);
+  if (emailWithheld?.has(String(agentId))) shown = withKnowledgeEmailNull(shown);
+
   res.json({
     jsonrpc: "2.0",
     result: {
@@ -801,7 +814,7 @@ function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
           name: "agent-info",
           // S2c-1: without what the owner hid (not enforced = as before).
           // B2b-2: products in the stock rule's soft window carry the date.
-          data: withSoftStockProducts(publicAgentInfo(info, publicFieldChoices(agentId)), String(agentId)),
+          data: withSoftStockProducts(shown, String(agentId)),
         }),
       ],
     },
@@ -908,12 +921,21 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
       console.log(`[description-guard] suppressed junk knowledge.about (agent.json x-knowledge) for ${req.params.id} (${card.name})`);
       safeAbout = undefined;
     }
+    // Økologi S3c-2: owner-written about of a producer without a valid Debio
+    // status → no organic sentence (gate off = unchanged).
+    safeAbout = publicOwnerAboutText(req.params.id as string, safeAbout);
+    // dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
+    // S-A5 (RFB A2A): x-knowledge.email follows the rfb per-IP limit (as
+    // agent/info above); withheld it is left out as for a producer without
+    // one. Switch on: Cache-Control: private instead of public. Off: as before.
+    const agentId = req.params.id as string;
+    const emailWithheld = emailWithheldIds(req, res, "rfb", knowledge.email ? [agentId] : []);
     const enriched: Record<string, any> = { ...card };
     enriched["x-knowledge"] = {
       address: knowledge.address,
       postalCode: knowledge.postalCode,
       phone: isDisplayablePhone(knowledge.phone) ? knowledge.phone : undefined,
-      email: knowledge.email,
+      email: emailWithheld?.has(agentId) ? undefined : knowledge.email,
       website: knowledge.website,
       openingHours: knowledge.openingHours,
       // Integration test 2026-10-17 (I-G): products is DB JSON. Stored as
@@ -945,7 +967,7 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
     for (const key of Object.keys(xk)) {
       if (xk[key] === undefined || xk[key] === null) delete xk[key];
     }
-    res.header("Cache-Control", "public, max-age=1800");
+    res.header("Cache-Control", emailWithheld === null ? "public, max-age=1800" : "private");
     res.json(enriched);
     return;
   }

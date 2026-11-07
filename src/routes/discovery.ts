@@ -13,7 +13,7 @@
 
 import { Router, Request, Response } from "express";
 import { marketplaceRegistry } from "../services/marketplace-registry";
-import { knowledgeService } from "../services/knowledge-service";
+import { knowledgeService, publicOwnerAboutText } from "../services/knowledge-service";
 import { slugify } from "../utils/slug";
 import { failsProducerRoleGate, withoutOwnerHidden } from "../services/agent-visibility";
 import { getConfig } from "../config/vertical-config";
@@ -27,6 +27,12 @@ import { debioProcessText } from "../services/debio-approval";
 /** ONE catalog number for every RFB discovery document (services/honest-count.ts); falls back to the list the handler already holds. */
 function rfbCatalogCount(fallback: number): number {
   return safeHonestCatalogCount("rfb") ?? fallback;
+}
+
+/** The skill ids the served RFB agent card actually lists (the card itself, never a hand-kept copy). */
+function rfbAgentCardSkillIds(): string[] {
+  const card = marketplaceRegistry.getRegistryCard(BASE_URL) as { skills?: Array<{ id?: string }> };
+  return (card.skills || []).map((s) => String(s.id || "")).filter(Boolean);
 }
 
 const router = Router();
@@ -228,9 +234,10 @@ Hver produsentprofil viser hvilke paraplyer de er medlem av. Se også:
 
 Rett fra Bonden er bygget på Agent-to-Agent-protokollen (A2A). En AI-agent kan:
 
-1. Lese **agent-kortet** på \`${BASE_URL}/.well-known/agent-card.json\` for å oppdage
-   tilgjengelige verktøy (${registeredMcpTools("rfb").map((t) => "`" + t.name + "`").join(", ")}).
-2. Bruke **MCP-endepunktet** på \`${BASE_URL}/mcp\` for direkte verktøyskall via JSON-RPC.
+1. Lese **agent-kortet** på \`${BASE_URL}/.well-known/agent-card.json\`. Det beskriver plattformen
+   og lister A2A-ferdighetene (skills) ${rfbAgentCardSkillIds().map((id) => "`" + id + "`").join(", ")}.
+2. Bruke **MCP-endepunktet** på \`${BASE_URL}/mcp\` for direkte verktøyskall via JSON-RPC. MCP-server-kortet
+   lister tilgjengelige verktøy (${registeredMcpTools("rfb").map((t) => "`" + t.name + "`").join(", ")}).
 3. Lese **OpenAPI-spec** på \`${BASE_URL}/openapi.json\` for tradisjonell REST-tilgang.
 
 Eksempel — finn produsenter i Oslo som selger honning (korrekt MCP JSON-RPC 2.0):
@@ -265,7 +272,7 @@ Content-Type: application/json
 - [Forsiden](${BASE_URL}/): Søk og utforsk lokale ${getConfig().domain_dictionary.entity_plural_long}
 - [Om oss](${BASE_URL}/om): Historien bak plattformen
 - [Teknologi](${BASE_URL}/teknologi): Hvordan A2A-teknologien fungerer
-- [Personvern](${BASE_URL}/personvern): Ingen cookies, ingen sporing
+- [Personvern](${BASE_URL}/personvern): Bare nødvendige informasjonskapsler (innlogging for selgere, språkvalg), ingen annonse- eller sporingscookies og ingen tredjeparts sporing. Sidebesøk og søk logges i vår egen database med saltet IP-hash.
 
 ## ChatGPT Custom GPT
 
@@ -402,10 +409,12 @@ router.get("/llms-full.txt", (_req: Request, res: Response) => {
           // Redact PII from about text before including in AI-readable dump.
           // Emails and Norwegian phone numbers must not appear in /llms-full.txt.
           // Take extra chars before redaction so truncation doesn't expose a partial address.
-          const aboutRedacted = k.about.substring(0, 300)
+          // Økologi S3c-2: owner-text read step (gate off = k.about unchanged).
+          const aboutRedacted = publicOwnerAboutText(a.id, k.about).substring(0, 300)
             .replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, "[e-post]")
             .replace(/(\+47|0047)?[\s\-.]?\d{3}[\s\-.]?\d{2}[\s\-.]?\d{3}/g, "[tlf]");
-          parts.push(aboutRedacted.substring(0, 120));
+          // (Only empty when the read step dropped every sentence.)
+          if (aboutRedacted) parts.push(aboutRedacted.substring(0, 120));
         }
         lines.push(parts.join(" | "));
       }
@@ -545,7 +554,7 @@ router.get("/.well-known/ai-plugin.json", (_req: Request, res: Response) => {
       "gårdsbutikker og REKO-ringer med kontaktinfo og åpningstider.",
     description_for_model:
       "Plugin for searching and discovering local food producers in Norway. " +
-      `Provides access to ${rfbCatalogCount(stats.totalAgents) || "1,290+"} verified producers ` +
+      `Provides access to ${rfbCatalogCount(stats.totalAgents) || "1,290+"} producers, cross-checked against the Brønnøysund register, ` +
       "including farms, farmers' markets, REKO rings, farm shops, and " +
       "cooperatives. Use the search endpoint for natural-language queries " +
       "(Norwegian or English) and the agents endpoint for structured lookups " +

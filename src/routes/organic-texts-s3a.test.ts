@@ -3,8 +3,9 @@
  * merking-debio-register-og-tekstrevisjon, slice S3a (AC3.3): platform texts
  * promise no organic / Debio coverage beyond Debio's public register.
  *
- *   (the live /mcp tool descriptions in routes/mcp.ts are frozen with the
- *   ChatGPT app review — rfb-mcp-contract-freeze — and are not covered here)
+ *   (the live /mcp tool descriptions in routes/mcp.ts are not covered here:
+ *   their Debio wording is linted by mcp-description-policy.test.ts, A2A
+ *   2026-10-16-mcp-beskrivelser-intensjonsord-og-lint S6)
  *   llms      /llms.txt drops the old finnoko cross-check sentence (NO + EN)
  *             and describes the register flow; with the flag off it states
  *             the finnoko fallback instead (rollback stays truthful).
@@ -66,9 +67,9 @@ export async function runOrganicTextsS3aTests(opts: { log?: boolean } = {}): Pro
 
   const prevFlag = process.env.RFB_DEBIO_REGISTER_SYNC;
   try {
-    // The live /mcp tool descriptions (src/routes/mcp.ts) are not changed in
-    // S3a: the RFB MCP contract is frozen while OpenAI reviews the ChatGPT app
-    // (rfb-mcp-contract-freeze.test.ts); they follow with a re-submission.
+    // The live /mcp tool descriptions (src/routes/mcp.ts) were not changed in
+    // S3a; they followed in S6 of A2A 2026-10-16-mcp-beskrivelser-intensjonsord-
+    // og-lint, and mcp-description-policy.test.ts keeps the Debio wording out.
 
     // ── static sources (stdio server, A2A card, agent-readiness) ───────────
     const fs = require("fs") as typeof import("fs");

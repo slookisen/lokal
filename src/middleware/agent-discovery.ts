@@ -128,7 +128,7 @@ function homepageMarkdown(): string {
 **${BASE_URL}**
 
 Rett fra Bonden is an agent-to-agent marketplace connecting AI agents with ${count}+
-verified local food producers across Norway. Search fresh produce,
+local food producers across Norway, cross-checked against the Brønnøysund register. Search fresh produce,
 vegetables, meat, fish, dairy, honey, bread, and more — all farm-direct.
 
 ## For AI Agents
@@ -144,9 +144,9 @@ vegetables, meat, fish, dairy, honey, bread, and more — all farm-direct.
 
 | Skill | Description |
 |---|---|
-| \`discover-local-food-agents\` | Search ${count}+ verified producers by category, region, certification |
+| \`discover-local-food-agents\` | Search ${count}+ producers by category, region, certification |
 | \`register-food-agent\` | Onboard a new farm, shop, or cooperative |
-| \`search-compare-food\` | Natural-language search; compare prices, delivery, certifications |
+| \`search-compare-food\` | Natural-language search; compare delivery options, certifications |
 | \`agent-conversation\` | Open a buyer–seller negotiation channel |
 
 ## Coverage
@@ -193,7 +193,7 @@ sorted by who paid the most for placement.
 
 ## What we cover
 
-- ${producerCount()}+ verified producers across Norway
+- ${producerCount()}+ producers across Norway, cross-checked against the Brønnøysund register
 - Categories: vegetables, fruit, meat, fish, dairy, eggs, honey, bread, berries, herbs
 - Every major region from Agder to Finnmark
 - Full bilingual support: Norwegian (primary) and English

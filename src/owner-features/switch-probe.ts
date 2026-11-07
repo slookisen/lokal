@@ -82,11 +82,14 @@ import {
   OWNER_LEVELS,
   applyOwnerLevel,
   applyOwnerSingleChange,
+  deriveOwnerLevel,
   ownerFeatureChangeLog,
+  previewOwnerLevel,
   undoOwnerChange,
   type OwnerActor,
 } from "./changes";
 import { isSubjectAllowedForOwnerFeatures } from "./allowlist";
+import { ownerPilotFlagModes, type OwnerFlagMode, type OwnerPilotFlag } from "./owner-flag-mode";
 
 const VERTICAL = "rfb" as const;
 export const SWITCH_PROBE_ACTOR: OwnerActor = { actor: "admin", detail: "switch-probe" };
@@ -123,11 +126,15 @@ export const SWITCH_PROBE_ENV_FLAGS = [
   "OWNER_LOCK_ENFORCE_WRITES",
   "OUTREACH_UNSUBSCRIBE_ENABLED",
   "OWNER_ORDER_EMAIL_ENABLED",
+  "PRODUCT_IMPORT_ENABLED",
+  "OWNER_UNIFIED_SESSION_ENABLED",
+  "PRODUCT_IMPORT_OUTREACH_ENABLED",
   "RFB_DISABLE_ORDER_FOLLOWUPS",
   "PUBLIC_STATS_MIN_VIEWS",
   "STOCK_CHECK_EMAIL_ENABLED",
   "OWNER_ORDERABILITY_PORTAL_ENABLED",
   "OWNER_AUTO_UPDATES_ENABLED",
+  "PRODUCT_AUTO_SYNC_ENABLED",
 ] as const;
 
 /**
@@ -147,6 +154,8 @@ export const SWITCH_PROBE_FLAG_DEPENDENCIES: Readonly<Record<string, string>> = 
   // OWNER_AUTO_UPDATES_ENABLED is off, so the probe checks it as a planned
   // entry then (409 coming_soon, no effect) and probes every option only
   // with the flag on (liveEntries reads the run-time status).
+  // products.weekly_sync (produktimport skive 4-2b) likewise: its liveFlag is
+  // PRODUCT_AUTO_SYNC_ENABLED.
 };
 const FLAG_OFF_REASON = "flag off in this environment";
 
@@ -206,6 +215,8 @@ export interface SwitchProbePlan {
   segment: string;
   allowlisted: boolean;
   env_flags: Record<string, string | null>;
+  /** The four pilot-capable owner flags: off / pilot / all (owner-flag-mode.ts). */
+  owner_flag_modes: Record<OwnerPilotFlag, OwnerFlagMode>;
   baseline: Array<{ key: string; status: string; type: string; value: OwnerFeatureValue | string; source: string; block: string | null }>;
   rows: SwitchProbePlanRow[];
   checks: string[];
@@ -218,6 +229,8 @@ export interface SwitchProbeResult {
   started_at: string;
   finished_at: string;
   env_flags: Record<string, string | null>;
+  /** The four pilot-capable owner flags: off / pilot / all (owner-flag-mode.ts). */
+  owner_flag_modes: Record<OwnerPilotFlag, OwnerFlagMode>;
   rows: SwitchProbeRow[];
   checks: SwitchProbeCheck[];
   pass: number;
@@ -372,7 +385,11 @@ interface FixtureSnapshot {
   owner_profile_pause: any[];
   owner_feature_level_choice: any[];
   owner_feature_intro: any[];
+  /** T7: the «Nyheter og tips» question state (owner_feature_prompt). */
+  owner_feature_prompt: any[];
   agent_knowledge: any;
+  /** Produktimport skive 4-2b: products.weekly_sync's column (and the sync state its «on» write resets). */
+  product_auto_sync_state: any[];
 }
 
 function tableExists(db: any, name: string): boolean {
@@ -388,9 +405,11 @@ export function snapshotFixture(db: any, agentId: string): FixtureSnapshot {
     owner_profile_pause: rows("owner_profile_pause", "agent_id = ?", agentId),
     owner_feature_level_choice: rows("owner_feature_level_choice", "vertical = ? AND subject_id = ?", VERTICAL, agentId),
     owner_feature_intro: rows("owner_feature_intro", "vertical = ? AND subject_id = ?", VERTICAL, agentId),
+    owner_feature_prompt: rows("owner_feature_prompt", "vertical = ? AND subject_id = ?", VERTICAL, agentId),
     agent_knowledge: tableExists(db, "agent_knowledge")
       ? db.prepare(`SELECT about, curated_fields FROM agent_knowledge WHERE agent_id = ?`).get(agentId) ?? null
       : null,
+    product_auto_sync_state: rows("product_auto_sync_state", "agent_id = ?", agentId),
   };
 }
 
@@ -450,9 +469,17 @@ function restoreSnapshot(db: any, agentId: string, snap: FixtureSnapshot): void 
       db.prepare(`DELETE FROM owner_feature_intro WHERE vertical = ? AND subject_id IN (${pinned})`).run(VERTICAL, agentId);
       insertRows(db, "owner_feature_intro", snap.owner_feature_intro);
     }
+    if (tableExists(db, "owner_feature_prompt")) {
+      db.prepare(`DELETE FROM owner_feature_prompt WHERE vertical = ? AND subject_id IN (${pinned})`).run(VERTICAL, agentId);
+      insertRows(db, "owner_feature_prompt", snap.owner_feature_prompt ?? []);
+    }
     if (snap.agent_knowledge) {
       db.prepare(`UPDATE agent_knowledge SET about = ?, curated_fields = ? WHERE agent_id IN (${pinned})`)
         .run(snap.agent_knowledge.about, snap.agent_knowledge.curated_fields, agentId);
+    }
+    if (tableExists(db, "product_auto_sync_state")) {
+      db.prepare(`DELETE FROM product_auto_sync_state WHERE agent_id IN (${pinned})`).run(agentId);
+      insertRows(db, "product_auto_sync_state", snap.product_auto_sync_state ?? []);
     }
     const after = resolveOwnerFeatures(VERTICAL, agentId, { db });
     const now = new Date().toISOString();
@@ -981,6 +1008,17 @@ const autoUpdatesJobSync = (ctx: ProbeReaderContext): SurfaceObservation => {
   };
 };
 
+// products.weekly_sync (produktimport skive 4-2b): the weekly job's own
+// selection rule for the fixture (dueAutoSyncProfiles: mode 'weekly' and
+// agents.is_verified = 1), on the probe's db. Decision only: nothing is
+// fetched or written.
+const productWeeklySyncJobSync = (ctx: ProbeReaderContext): SurfaceObservation => {
+  const { productWeeklySyncSelected } = require("./product-weekly-sync") as typeof import("./product-weekly-sync");
+  const taken = productWeeklySyncSelected(ctx.db, ctx.fixture.id);
+  const flag = flagOn(ctx.env, "PRODUCT_AUTO_SYNC_ENABLED") ? "" : " (PRODUCT_AUTO_SYNC_ENABLED er av: den ukentlige jobben kjører ikke i dette miljøet)";
+  return { endpoints: { weekly_sync_job: taken }, detail: `den ukentlige produktjobben ${taken ? "tar med profilen" : "hopper over profilen"}${flag}` };
+};
+
 const outreachSync = (ctx: ProbeReaderContext): SurfaceObservation => {
   const av = require("../services/avmeld-service") as typeof import("../services/avmeld-service");
   const to = ctx.fixture.outreachEmail;
@@ -1045,6 +1083,7 @@ export function defaultSwitchProbeReaders(): Record<string, SurfaceReaderDef> {
     "products.stock_check × email:stock_check": syncReader(stockCheckMailSync, "allowlist + stockCheckOn() + resolveOrderNotificationRecipient(): lagerpåminnelse sendes / sendes ikke"),
     "products.stock_check × job:stock_check": syncReader(stockCheckJobSync, "allowlist + stockCheckOn(): jobben tar med / hopper over produsenten"),
     "products.stock_check × owner_portal": syncReader(stockCheckPortalSync, "allowlist + stockCheckOn(): banneret i eierportalen kan vises / vises ikke"),
+    "products.weekly_sync × job:product_weekly_sync": syncReader(productWeeklySyncJobSync, "product_sync_mode + is_verified (dueAutoSyncProfiles' regel): den ukentlige produktjobben tar med / hopper over profilen"),
   };
   for (const s of VISIBILITY_SURFACES) {
     out[caseId("visibility.profile", s)] = {
@@ -1067,6 +1106,9 @@ const PLANNED_CHECKS = [
   "requirement_unmet:<key> — uoppfylt krav → 409 requirement_not_met, ingen lagring, ingen effekt (rullet tilbake)",
   "level:<nivå> — nivået gir samme effekt som enkeltbryterne",
   "undo:level:<nivå> / undo:single:<key> — «Angre» gjenoppretter effekten",
+  "level_preview:<nivå> — forhåndsvisningen skriver ingenting, er lik det bekreftelsen gjør, og harde krav er tomme hvis og bare hvis isEligibleForRealOrder() er sann med bestillinger på (T10)",
+  "level_derived:<nivå> — etter nivået regnes nettopp dette nivået ut fra bryterne, uten unntak (T10)",
+  "level_invariants:<nivå> — nivået endrer aldri comms.news eller visibility.profile, og orderGateReady slår aldri av en eier som har bestillinger på (T10)",
   "no_surface:<key> — live-nøkkel uten flater: skriving + endringslogg",
   "choice:<key> — hvert valg som tilbys skrives (og tilbake); flaten viser effekten av akkurat det valget",
   "public_stats_threshold — «Vis som offentlig»: statistikkflisene på profilsiden vises bare med minst PUBLIC_STATS_MIN_VIEWS sidevisninger fra mennesker siste 12 mnd (eierens «Sett»), prøvd på begge sider av terskelen",
@@ -1091,6 +1133,7 @@ export function planSwitchProbe(db: any, agentId: string, env: NodeJS.ProcessEnv
     segment: resolved.subject.segment,
     allowlisted: isSubjectAllowedForOwnerFeatures(VERTICAL, agentId, env),
     env_flags: envFlags(env),
+    owner_flag_modes: ownerPilotFlagModes(env),
     baseline: liveEntries(env).map((e) => {
       const r = resolved.byKey[e.key];
       return { key: e.key, status: e.status, type: e.type, value: displayValue(e, r.value), source: r.source, block: r.block };
@@ -1660,6 +1703,105 @@ function checkLevels(c: Ctx, baseline: ResolvedOwnerFeatures): void {
   }
 }
 
+/** The fixture's real-order gate as it would answer with orders on (always rolled back). */
+function gateWithOrdersOn(c: Ctx): boolean {
+  const { isEligibleForRealOrder } = require("../services/cart-service") as typeof import("../services/cart-service");
+  let out = false;
+  try {
+    c.db.transaction(() => {
+      c.db.prepare(`UPDATE agents SET order_notifications_opt_in = 1 WHERE id = ? AND ${FIXTURE_PIN}`).run(c.agentId);
+      out = isEligibleForRealOrder(c.agentId, c.db);
+      throw new CheckRollback();
+    })();
+  } catch (err) {
+    if (!(err instanceof CheckRollback)) throw err;
+  }
+  return out;
+}
+
+const LEVEL_INVARIANT_KEYS = ["comms.news", "visibility.profile"] as const;
+
+/**
+ * T10 (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 3): per level
+ *   level_preview     the preview writes nothing (stored state, audit, effects),
+ *                     equals what the confirmed level then does (changed and
+ *                     skipped keys), and its hard requirements are empty iff
+ *                     isEligibleForRealOrder() is true with orders on (a level
+ *                     that switches orders on; else always empty);
+ *   level_derived     after the level, deriveOwnerLevel() gives exactly that
+ *                     level with no exceptions;
+ *   level_invariants  the level leaves comms.news and visibility.profile as
+ *                     they were; with orders on, the profile made not ready
+ *                     (cross-check cleared, rolled back) and the level applied
+ *                     again leaves orders on and writes nothing.
+ */
+function checkLevelsT10(c: Ctx, baseline: ResolvedOwnerFeatures): void {
+  const allKeys = liveEntries(c.env).map((e) => e.key);
+  for (const level of OWNER_LEVELS) {
+    restoreValues(c, baseline, allKeys);
+    const o = { db: c.db, env: c.env };
+    // level_preview
+    const stored0 = JSON.stringify(snapshotFixture(c.db, c.agentId));
+    const audit0 = maxAuditId(c.db, c.agentId);
+    const sig0 = effectSignature(c);
+    const before = resolvedNow(c);
+    const p = previewOwnerLevel(VERTICAL, c.agentId, level.key, o);
+    const noWrite = JSON.stringify(snapshotFixture(c.db, c.agentId)) === stored0 && maxAuditId(c.db, c.agentId) === audit0 && effectSignature(c) === sig0;
+    const hard = p?.requirements?.hard ?? [];
+    const switchesOn = level.values.some(([k, v]) => k === "orders.enabled" && v === true) && before.byKey["orders.enabled"]?.value !== true;
+    const gate = gateWithOrdersOn(c);
+    const hardOk = switchesOn ? (hard.length === 0) === gate : hard.length === 0;
+    const out = applyOwnerLevel(VERTICAL, c.agentId, level.key, SWITCH_PROBE_ACTOR, o);
+    const keys = (xs: string[]) => JSON.stringify([...xs].sort());
+    const same = !!p && (out.kind === "ok"
+      ? keys(out.changed) === keys(p.changes.map((x) => x.key)) && keys(out.skipped.map((x) => x.key)) === keys(p.skipped.map((x) => x.key))
+      : out.kind === "not_ready" && hard.length > 0 && maxAuditId(c.db, c.agentId) === audit0);
+    addCheck(c, {
+      check: `level_preview:${level.key}`, pass: noWrite && hardOk && same,
+      observed: `forhåndsvisning ${noWrite ? "skrev ingenting" : "SKREV"}; endres: ${p?.changes.map((x) => x.key).join(", ") || "—"}; harde krav: ${hard.map((h) => h.code).join(", ") || "ingen"}; porten med bestillinger på: ${gate ? "ja" : "nei"}; bekreftet → ${out.kind}${out.kind === "ok" ? ` (${out.changed.join(", ") || "ingen endring"})` : ""}`,
+      ...(!noWrite ? { reason: "forhåndsvisningen skrev noe" } : !hardOk ? { reason: "harde krav stemmer ikke med isEligibleForRealOrder() med bestillinger på" } : !same ? { reason: "forhåndsvisningen er ulik det bekreftelsen gjorde" } : {}),
+    });
+    // level_derived
+    const after = resolvedNow(c);
+    const d = deriveOwnerLevel(after, OWNER_LEVELS);
+    const derivedOk = out.kind === "ok" && !!d && d.level.key === level.key && d.exceptions.length === 0;
+    addCheck(c, {
+      check: `level_derived:${level.key}`, pass: derivedOk,
+      observed: d ? `utregnet nivå: ${d.level.key}, ${d.exceptions.length} unntak` : "ingen nivå regnet ut",
+      ...(derivedOk ? {} : { reason: out.kind !== "ok" ? `nivået ble ikke brukt (${out.kind})` : "bryterne gir ikke nettopp dette nivået" }),
+    });
+    // level_invariants
+    const unchanged = LEVEL_INVARIANT_KEYS.every((k) => sameValue(before.byKey[k]?.value, after.byKey[k]?.value));
+    const presetClean = level.values.every(([k]) => !(LEVEL_INVARIANT_KEYS as readonly string[]).includes(k));
+    let keepsOn = true;
+    let keepsOnNote = "bestillinger av — ikke relevant";
+    if (after.byKey["orders.enabled"]?.value === true) {
+      try {
+        c.db.transaction(() => {
+          c.db.prepare(
+            `UPDATE agent_knowledge SET verification_status = 'pending'
+              WHERE agent_id = ? AND agent_id IN (SELECT id FROM agents WHERE id = ? AND ${FIXTURE_PIN})`,
+          ).run(c.agentId, c.agentId);
+          const a1 = maxAuditId(c.db, c.agentId);
+          const again = applyOwnerLevel(VERTICAL, c.agentId, level.key, SWITCH_PROBE_ACTOR, o);
+          const still = resolvedNow(c).byKey["orders.enabled"]?.value === true;
+          keepsOn = again.kind === "ok" && still && maxAuditId(c.db, c.agentId) === a1;
+          keepsOnNote = `ikke klar (rullet tilbake): nivået på nytt → ${again.kind}; bestillinger ${still ? "fortsatt på" : "AV"}`;
+          throw new CheckRollback();
+        })();
+      } catch (err: any) {
+        if (!(err instanceof CheckRollback)) { keepsOn = false; keepsOnNote = `feil: ${String(err?.message || err)}`; }
+      }
+    }
+    addCheck(c, {
+      check: `level_invariants:${level.key}`, pass: unchanged && presetClean && keepsOn,
+      observed: `${LEVEL_INVARIANT_KEYS.map((k) => `${k}: ${JSON.stringify(before.byKey[k]?.value ?? null)} → ${JSON.stringify(after.byKey[k]?.value ?? null)}`).join("; ")}; ${keepsOnNote}`,
+      ...(!unchanged ? { reason: "nivået endret comms.news eller visibility.profile" } : !presetClean ? { reason: "nivået har en forbudt nøkkel" } : !keepsOn ? { reason: "orderGateReady endret en eier som har bestillinger på" } : {}),
+    });
+    restoreValues(c, baseline, allKeys);
+  }
+}
+
 /** «Angre» on one switch restores the effect (every plain live switch). */
 async function checkUndoSingle(c: Ctx, baseline: ResolvedOwnerFeatures): Promise<void> {
   for (const e of liveEntries(c.env)) {
@@ -1776,7 +1918,7 @@ export function dryRunSwitchProbe(agentId: string, opts: SwitchProbeOptions = {}
   const plan = planSwitchProbe(db, agentId, env, { ...defaultSwitchProbeReaders(), ...(opts.readers || {}) });
   const result: SwitchProbeResult & { plan: SwitchProbePlan } = {
     ok: true, dry_run: true, agent_id: agentId, started_at: started, finished_at: new Date().toISOString(),
-    env_flags: plan.env_flags, rows: [], checks: [], pass: 0, fail: 0, not_observable: 0, restored: true, restore_diff: [], side_effects: [],
+    env_flags: plan.env_flags, owner_flag_modes: plan.owner_flag_modes, rows: [], checks: [], pass: 0, fail: 0, not_observable: 0, restored: true, restore_diff: [], side_effects: [],
     ready_for_daniel_test: false, markdown: renderSwitchProbePlanMarkdown(plan, started), plan,
   };
   return result;
@@ -1835,6 +1977,7 @@ export async function runSwitchProbe(agentId: string, opts: SwitchProbeOptions =
     checkComingSoon(c);
     checkRequirements(c);
     checkLevels(c, baseline);
+    checkLevelsT10(c, baseline);
     await checkUndoSingle(c, baseline);
     await checkPublicStatsThreshold(c);
   } catch (e: any) {
@@ -1872,6 +2015,7 @@ export async function runSwitchProbe(agentId: string, opts: SwitchProbeOptions =
     started_at: started,
     finished_at: new Date().toISOString(),
     env_flags: envFlags(env),
+    owner_flag_modes: ownerPilotFlagModes(env),
     rows: c.rows,
     checks: c.checks,
     pass,
@@ -1900,6 +2044,8 @@ export function renderSwitchProbePlanMarkdown(plan: SwitchProbePlan, at: string)
   lines.push(`- Planlagte rader: ${plan.rows.length} · uten effektleser: ${plan.rows.filter((r) => !r.reader).length}`, "");
   lines.push("| Nøkkel | Flate | Retning | Type | Effektleser |", "|---|---|---|---|---|");
   for (const r of plan.rows) lines.push(`| ${r.key} | ${r.surface} | ${r.direction} | ${r.kind} | ${r.reader ? "ja" : "NEI"} |`);
+  lines.push("", "## Eierflagg med pilotmodus", "", "| Flagg | Modus |", "|---|---|");
+  for (const [k, m] of Object.entries(plan.owner_flag_modes)) lines.push(`| ${k} | ${m} |`);
   lines.push("", "## Startverdier", "", "| Nøkkel | Verdi | Kilde | Sperre |", "|---|---|---|---|");
   for (const b of plan.baseline) lines.push(`| ${b.key} | ${cell(JSON.stringify(b.value))} | ${b.source} | ${b.block ?? ""} |`);
   lines.push("", "## Ekstra kontroller", "");
@@ -1920,6 +2066,8 @@ export function renderSwitchProbeMarkdown(r: SwitchProbeResult): string {
   if (r.error) lines.push(`- Kjøringen ble avbrutt: ${cell(r.error)}`);
   lines.push("", "## Miljøflagg", "", "| Flagg | Verdi |", "|---|---|");
   for (const [k, v] of Object.entries(r.env_flags)) lines.push(`| ${k} | ${v === null ? "(ikke satt)" : cell(v)} |`);
+  lines.push("", "## Eierflagg med pilotmodus", "", "«pilot» = bare produsenter i OWNER_FEATURES_ALLOWED_SUBJECTS; «all» = alle verifiserte eiere («1»/«true»); «off» = av.", "", "| Flagg | Modus |", "|---|---|");
+  for (const [k, m] of Object.entries(r.owner_flag_modes)) lines.push(`| ${k} | ${m} |`);
   lines.push("", "## Bryter × flate × retning", "");
   lines.push("«IKKE OBSERVERBAR»: flaten viser ikke testprodusenten selv i grunntilstanden der den skal være synlig, så ingen av retningene kan bevises (en «av»-rad ville bestått uten bevis). Raden er ikke PASS og stopper `ready_for_daniel_test` som en FAIL, men telles for seg: feilen ligger i hva proben kan se, ikke nødvendigvis i produktet.", "");
   lines.push("«Skiller» = nei: en avvist skriving (låst valg / løfte / bekreftelse på e-post) der flaten skal vise det samme før og etter. En leser som aldri endrer seg ville også bestått, så raden viser bare at skrivingen ble avvist, ikke at flaten reagerer på bryteren.", "");

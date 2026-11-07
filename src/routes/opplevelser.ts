@@ -559,8 +559,14 @@ import {
 // for a BLANK hjemmeside; this one only judges whether an EXISTING
 // hjemmeside is verifiably the producer's own).
 import {
+  getGardssalgWebsiteReviewQueueParkJobStatus,
+  runGardssalgWebsiteReviewQueuePark,
+  runGardssalgWebsiteReviewQueueParkJob,
+} from "../services/gardssalg-website-review-queue-park-job";
+import {
   loadGardssalgWebsiteVerificationCohort,
   scanGardssalgWebsiteVerificationRows,
+  scanGardssalgWebsiteVerificationPage,
   planGardssalgWebsiteVerificationRemediation,
   applyGardssalgWebsiteVerification,
   getGardssalgWebsiteVerificationSweepOffset,
@@ -4201,7 +4207,7 @@ async function crFetchGardssalgContent(
  * A shared adapter is not a style preference here: every field this contract
  * grows is, by construction, one a caller needed and could not see.
  */
-function gsWvFetchFnFromGardssalgCrawler(): GsWvFetchFn {
+export function gsWvFetchFnFromGardssalgCrawler(): GsWvFetchFn {
   return async (homepageUrl: string) => {
     const fetched = await crFetchGardssalgContent(homepageUrl);
     if (!fetched.ok) {
@@ -7925,6 +7931,24 @@ interface GardssalgWdJudgeQueueRow {
   evidence: string | null;
   confidence: number | null;
   reason: string;
+  updated_at: string;
+}
+
+/** The ONE predicate + ordering for the website-judge queue: used by the
+ *  LLM judge route, the file-queue candidate GET and (as the same band
+ *  constants) the file-queue apply step's re-checks. */
+function selectGardssalgWdJudgeQueue(db: Database.Database, limit: number): GardssalgWdJudgeQueueRow[] {
+  return db
+    .prepare(
+      `SELECT id, provider_id, provider_name, candidate_url, final_url, evidence, confidence, reason, updated_at
+         FROM gardssalg_website_review_queue
+        WHERE reason = 'website_discovery_candidate'
+          AND parked_since IS NULL
+          AND confidence >= ? AND confidence < ?
+        ORDER BY updated_at ASC
+        LIMIT ?`,
+    )
+    .all(GARDSSALG_WD_JUDGE_MIN_CONFIDENCE, GARDSSALG_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE, limit) as GardssalgWdJudgeQueueRow[];
 }
 
 /** Mirrors rfbWdJudgeSourceContext (admin-rfb-website-discovery.ts): the
@@ -8014,17 +8038,7 @@ router.post("/admin/gardssalg-website-review-judge", requireAdmin, async (req: R
   // follow-up): a parked row is out of attention by definition and is never
   // judged — same exclusion as the auto-approve selection above and
   // isOpenGardssalgWebsiteCandidate(). Mirrored in still_pending below.
-  const pending = db
-    .prepare(
-      `SELECT id, provider_id, provider_name, candidate_url, final_url, evidence, confidence, reason
-         FROM gardssalg_website_review_queue
-        WHERE reason = 'website_discovery_candidate'
-          AND parked_since IS NULL
-          AND confidence >= ? AND confidence < ?
-        ORDER BY updated_at ASC
-        LIMIT ?`,
-    )
-    .all(GARDSSALG_WD_JUDGE_MIN_CONFIDENCE, GARDSSALG_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE, limit) as GardssalgWdJudgeQueueRow[];
+  const pending = selectGardssalgWdJudgeQueue(db, limit);
 
   // Enrichment write-pause gate (same discipline as gardssalg-website-review-
   // approve's own `apply` check, immediately above) — gated over the WHOLE
@@ -8138,6 +8152,252 @@ router.post("/admin/gardssalg-website-review-judge", requireAdmin, async (req: R
   });
 });
 
+// ─── Slice 3j: gårdssalg website-judge as a file queue (no LLM here) ─────────
+//
+// A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-felles-
+// serverjobbramme, «Innsnevring 2026-10-28», skive 3j. The judge route above
+// calls an LLM from this server; Daniel's rule (Endring 2026-10-08) is that a
+// platform job never does. A Cloud Routine on his subscription judges instead
+// and commits verdicts to A2A; the job in services/gardssalg-website-
+// judgement-job.ts stores them through applyGardssalgWebsiteJudgements()
+// below, re-checking everything deterministically. Same shape as slice 3k:
+//
+//   GET /admin/gardssalg-website-judge-candidates   read-only: the SAME rows
+//       as the judge route (selectGardssalgWdJudgeQueue), public catalog
+//       fields + the judge's source_context + the structural backstop result.
+//   applyGardssalgWebsiteJudgements()               the no-LLM store step.
+//   GET /admin/gardssalg-website-judgements-status  read-only job status.
+import {
+  GARDSSALG_WEBSITE_JUDGEMENTS_MAX_ITEMS,
+  GARDSSALG_WEBSITE_JUDGEMENTS_MAX_REASON_CHARS,
+  GARDSSALG_WEBSITE_JUDGEMENTS_SCHEMA,
+  GARDSSALG_WEBSITE_JUDGEMENT_MAX_ID_CHARS,
+  GARDSSALG_WEBSITE_JUDGEMENT_MAX_URL_CHARS,
+  getGardssalgWebsiteJudgementsStatus,
+} from "../services/gardssalg-website-judgement-job";
+
+export const GARDSSALG_WD_JUDGE_CANDIDATES_DEFAULT_LIMIT = 25;
+export const GARDSSALG_WD_JUDGE_CANDIDATES_MAX_LIMIT = 50;
+
+export type GardssalgWdJudgeCandidate = {
+  id: string;
+  provider_id: string;
+  provider_name: string | null;
+  candidate_url: string;
+  final_url: string | null;
+  confidence: number | null;
+  updated_at: string;
+  source_context: string;
+  structural_defect: boolean;
+  structural_defect_reason: string | null;
+};
+
+/** Read-only core of the candidate GET. `limit` is the raw query value;
+ *  returns null for an invalid one (-> 400). */
+export function selectGardssalgWdJudgeCandidates(
+  db: Database.Database,
+  rawLimit: unknown,
+): { limit: number; rows: GardssalgWdJudgeCandidate[] } | null {
+  let limit = GARDSSALG_WD_JUDGE_CANDIDATES_DEFAULT_LIMIT;
+  if (rawLimit !== undefined) {
+    if (typeof rawLimit !== "string" || !/^\d{1,6}$/.test(rawLimit.trim())) return null;
+    const n = parseInt(rawLimit.trim(), 10);
+    if (n < 1) return null;
+    limit = Math.min(n, GARDSSALG_WD_JUDGE_CANDIDATES_MAX_LIMIT);
+  }
+  const rows = selectGardssalgWdJudgeQueue(db, limit).map((q) => {
+    const defect = classifyContactCandidateDefect("website", q.candidate_url);
+    return {
+      id: q.id,
+      provider_id: q.provider_id,
+      provider_name: q.provider_name,
+      candidate_url: q.candidate_url,
+      final_url: q.final_url,
+      confidence: q.confidence,
+      updated_at: q.updated_at,
+      source_context: gardssalgWdJudgeSourceContext(q),
+      structural_defect: !!defect.defective,
+      structural_defect_reason: defect.defective ? (defect.reason ?? "flagged defective") : null,
+    };
+  });
+  return { limit, rows };
+}
+
+router.get("/admin/gardssalg-website-judge-candidates", requireAdmin, (req: Request, res: Response) => {
+  try {
+    const out = selectGardssalgWdJudgeCandidates(getExpDb("experiences"), req.query?.limit);
+    if (!out) {
+      res.status(400).json({ error: `limit must be an integer 1..${GARDSSALG_WD_JUDGE_CANDIDATES_MAX_LIMIT}` });
+      return;
+    }
+    res.json({
+      success: true,
+      count: out.rows.length,
+      rows: out.rows,
+      judgement_schema: GARDSSALG_WEBSITE_JUDGEMENTS_SCHEMA,
+      max_items_per_file: GARDSSALG_WEBSITE_JUDGEMENTS_MAX_ITEMS,
+    });
+  } catch (err) {
+    console.error("[opplevelser] admin/gardssalg-website-judge-candidates failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+export type GardssalgWebsiteJudgementItemResult = {
+  provider_id: string;
+  result: "written" | "rejected";
+  reason?: string;
+  verdict?: "GODKJENN" | "AVVIS";
+  /** For written AVVIS: why it was an AVVIS. */
+  via?: "client" | "backstop" | "write_blocked";
+};
+
+export type GardssalgWebsiteJudgementsResult =
+  | { ok: false; error: string }
+  | {
+      ok: true;
+      totals: { written: number; rejected: number; godkjenn: number; avvis: number };
+      results: GardssalgWebsiteJudgementItemResult[];
+    };
+
+function gardssalgWebsiteJudgementLogSafe(v: unknown, max: number): string {
+  return String(v ?? "-").replace(/[^A-Za-z0-9._:\-]/g, "").slice(0, max);
+}
+
+/**
+ * Stores one judgement file's items (the website-judgement job's apply step).
+ * NEVER calls an LLM, never fetches. File-level problems (not 1..50 objects,
+ * duplicate provider_id) -> {ok:false}; a malformed item rejects only itself.
+ * A live write-pause THROWS (EnrichmentWritePausedError) before any write for
+ * the item, so the queue records a per-file failure and retries; items
+ * already stored are then `not_found`/`not_eligible` (idempotent).
+ * Per item, in order: pause; row exists with reason website_discovery_candidate;
+ * parked_since IS NULL; confidence inside the judge band; stored candidate_url
+ * equals the item's; structural backstop (defective -> AVVIS whatever the
+ * client said). GODKJENN goes through the approve route in-process, exactly
+ * like the judge route.
+ */
+export async function applyGardssalgWebsiteJudgements(
+  db: Database.Database,
+  rawItems: unknown,
+  opts: { createdAt?: unknown; runId?: unknown; now?: Date; logTag?: string } = {},
+): Promise<GardssalgWebsiteJudgementsResult> {
+  if (!Array.isArray(rawItems) || rawItems.length < 1 || rawItems.length > GARDSSALG_WEBSITE_JUDGEMENTS_MAX_ITEMS) {
+    return { ok: false, error: `items must be an array of 1..${GARDSSALG_WEBSITE_JUDGEMENTS_MAX_ITEMS} items` };
+  }
+  const seen = new Set<string>();
+  for (let i = 0; i < rawItems.length; i++) {
+    const r = rawItems[i];
+    if (!r || typeof r !== "object" || Array.isArray(r)) return { ok: false, error: `items[${i}] must be an object` };
+    const pid = (r as Record<string, unknown>).provider_id;
+    if (typeof pid !== "string" || pid.trim() === "") return { ok: false, error: `items[${i}].provider_id must be a non-empty string` };
+    if (pid.trim().length > GARDSSALG_WEBSITE_JUDGEMENT_MAX_ID_CHARS) continue; // item-level invalid_provider_id
+    if (seen.has(pid.trim())) {
+      return { ok: false, error: `duplicate provider_id in items: ${gardssalgWebsiteJudgementLogSafe(pid.trim(), GARDSSALG_WEBSITE_JUDGEMENT_MAX_ID_CHARS)}` };
+    }
+    seen.add(pid.trim());
+  }
+
+  const assertNotPaused = (): void => {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) throw new EnrichmentWritePausedError(pauseBlock);
+  };
+  // Whole-file gate: a paused vertical writes nothing at all.
+  assertNotPaused();
+
+  type QRow = { provider_id: string; candidate_url: string; confidence: number | null; reason: string; parked_since: string | null };
+  const rowStmt = db.prepare(
+    `SELECT provider_id, candidate_url, confidence, reason, parked_since FROM gardssalg_website_review_queue WHERE provider_id = ?`,
+  );
+  const results: GardssalgWebsiteJudgementItemResult[] = [];
+
+  for (const raw of rawItems as Array<Record<string, unknown>>) {
+    const providerId = String(raw.provider_id).trim();
+    if (providerId.length > GARDSSALG_WEBSITE_JUDGEMENT_MAX_ID_CHARS) {
+      results.push({ provider_id: gardssalgWebsiteJudgementLogSafe(providerId, GARDSSALG_WEBSITE_JUDGEMENT_MAX_ID_CHARS), result: "rejected", reason: "invalid_provider_id" });
+      continue;
+    }
+    const reject = (reason: string) => results.push({ provider_id: providerId, result: "rejected", reason });
+    if (raw.verdict !== "GODKJENN" && raw.verdict !== "AVVIS") { reject("invalid_verdict"); continue; }
+    if (typeof raw.candidate_url !== "string" || raw.candidate_url.trim() === "" || raw.candidate_url.length > GARDSSALG_WEBSITE_JUDGEMENT_MAX_URL_CHARS) {
+      reject("invalid_candidate_url");
+      continue;
+    }
+    const reasoning = typeof raw.reason === "string" ? raw.reason.replace(/\s+/g, " ").trim() : "";
+    if (reasoning === "" || reasoning.length > GARDSSALG_WEBSITE_JUDGEMENTS_MAX_REASON_CHARS) { reject("invalid_reason"); continue; }
+
+    assertNotPaused();
+    const row = rowStmt.get(providerId) as QRow | undefined;
+    if (!row) { reject("not_found"); continue; }
+    if (row.reason !== "website_discovery_candidate" || row.parked_since !== null) { reject("not_eligible"); continue; }
+    if (
+      typeof row.confidence !== "number" ||
+      row.confidence < GARDSSALG_WD_JUDGE_MIN_CONFIDENCE ||
+      row.confidence >= GARDSSALG_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE
+    ) { reject("out_of_scope"); continue; }
+    if (row.candidate_url.trim() !== raw.candidate_url.trim()) { reject("candidate_changed"); continue; }
+
+    const appendAvvis = (note: string, via: "client" | "backstop" | "write_blocked"): void => {
+      assertNotPaused();
+      const changes = gardssalgWdJudgeAppendReason(db, providerId, note);
+      if (changes > 0) results.push({ provider_id: providerId, result: "written", verdict: "AVVIS", via });
+      else reject("row_changed");
+    };
+
+    // Structural backstop: defective -> AVVIS regardless of the client verdict.
+    const defect = classifyContactCandidateDefect("website", row.candidate_url);
+    if (defect.defective) {
+      appendAvvis(`judge backstop AVVIS: ${defect.reason ?? "flagged defective"}`, "backstop");
+      continue;
+    }
+    if (raw.verdict === "AVVIS") {
+      appendAvvis(`routine judge AVVIS: ${reasoning}`, "client");
+      continue;
+    }
+
+    // GODKJENN — the approve route's full guarded write path, in-process.
+    try {
+      const approveResp = await callGardssalgAdminRouteInProcess("/admin/gardssalg-website-review-approve", {
+        approvals: [{ provider_id: providerId, url: row.candidate_url }],
+        apply: true,
+      });
+      const writtenList = Array.isArray(approveResp.body?.written) ? approveResp.body.written : [];
+      if (writtenList.some((w: any) => w?.provider_id === providerId)) {
+        results.push({ provider_id: providerId, result: "written", verdict: "GODKJENN" });
+      } else {
+        const rejectedList = Array.isArray(approveResp.body?.rejected) ? approveResp.body.rejected : [];
+        const innerReason = rejectedList.find((r: any) => r?.provider_id === providerId)?.reason;
+        appendAvvis(`judge GODKJENN but write blocked: ${innerReason ?? "unknown"}`, "write_blocked");
+      }
+    } catch (err: any) {
+      if (err instanceof EnrichmentWritePausedError) throw err;
+      // Fail THAT row closed, continue with the rest.
+      try {
+        appendAvvis(`uventet feil under dommer/skriving — avvist fail-closed: ${err?.message ?? String(err)}`, "write_blocked");
+      } catch (inner) {
+        if (inner instanceof EnrichmentWritePausedError) throw inner;
+        reject("write_error");
+      }
+    }
+  }
+
+  const totals = { written: 0, rejected: 0, godkjenn: 0, avvis: 0 };
+  for (const r of results) {
+    totals[r.result]++;
+    if (r.verdict === "GODKJENN") totals.godkjenn++;
+    if (r.verdict === "AVVIS") totals.avvis++;
+  }
+  console.log(
+    `[${opts.logTag ?? "gardssalg-website-judgements"}] run_id=${gardssalgWebsiteJudgementLogSafe(opts.runId, 80)} ` +
+      results.map((r) => `${gardssalgWebsiteJudgementLogSafe(r.provider_id, GARDSSALG_WEBSITE_JUDGEMENT_MAX_ID_CHARS)}=${r.result}${r.reason ? ":" + r.reason : ""}${r.verdict ? ":" + r.verdict : ""}${r.via ? ":" + r.via : ""}`).join(" "),
+  );
+  return { ok: true, totals, results };
+}
+
+router.get("/admin/gardssalg-website-judgements-status", requireAdmin, (_req: Request, res: Response) => {
+  res.json({ success: true, ...getGardssalgWebsiteJudgementsStatus(getExpDb("experiences") as any) });
+});
+
 // ─── POST /admin/gardssalg-website-review-queue-park ────────────────────────
 //
 // dev-request 2026-09-02-gardssalg-website-review-queue-terminal-parking.
@@ -8169,54 +8429,29 @@ router.post("/admin/gardssalg-website-review-judge", requireAdmin, async (req: R
 // is one column + one route on the existing table).
 router.post("/admin/gardssalg-website-review-queue-park", requireAdmin, (req: Request, res: Response) => {
   const body = (req.body ?? {}) as { apply?: unknown };
-  const apply = body.apply === true;
+  // Thin wrapper: the selection + guarded UPDATE live in
+  // runGardssalgWebsiteReviewQueuePark, shared with the daily job (step 3m).
+  res.json(runGardssalgWebsiteReviewQueuePark(getExpDb("experiences"), { apply: body.apply === true }));
+});
 
-  const db = getExpDb("experiences");
-  const candidates = db
-    .prepare(
-      `SELECT provider_id, reason FROM gardssalg_website_review_queue
-        WHERE reason IN ('verification_failed', 'candidate_evidence_failed')
-          AND parked_since IS NULL
-        ORDER BY updated_at ASC`,
-    )
-    .all() as Array<{ provider_id: string; reason: string }>;
+// ─── Server-side daily job for the parking above (step «3m») — read-only status
+// + manual run. Same pattern as admin/gardssalg-website-verification-job-run
+// (3f). Registered ahead of every `/:id` route. ─────────────────────────────
+router.get("/admin/gardssalg-website-review-queue-park-job-status", requireAdmin, (_req: Request, res: Response) => {
+  res.json({ success: true, ...getGardssalgWebsiteReviewQueueParkJobStatus() });
+});
 
-  // A true no-op on an empty selection — never throws, dry-run or apply.
-  if (candidates.length === 0) {
-    res.json({ would_park: 0, parked: 0, results: [] });
-    return;
+// Manual run, same code path as the daily tick. Dry-run unless `apply` is
+// exactly the JSON boolean true. Write-pause is checked inside the run (apply only).
+router.post("/admin/gardssalg-website-review-queue-park-job-run", requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const body = (req.body ?? {}) as { apply?: unknown };
+    const report = await runGardssalgWebsiteReviewQueueParkJob({ apply: body.apply === true, trigger: "manual" });
+    res.json({ success: true, ...report });
+  } catch (err) {
+    console.error("[opplevelser] admin/gardssalg-website-review-queue-park-job-run failed", err);
+    res.status(500).json({ success: false, error: "Internal error" });
   }
-
-  if (!apply) {
-    res.json({
-      would_park: candidates.length,
-      parked: 0,
-      results: candidates.map((c) => ({ provider_id: c.provider_id, reason: c.reason })),
-    });
-    return;
-  }
-
-  const stampPark = db.prepare(
-    `UPDATE gardssalg_website_review_queue
-        SET parked_since = datetime('now'), updated_at = datetime('now')
-      WHERE provider_id = ? AND parked_since IS NULL`,
-  );
-  let parked = 0;
-  for (const c of candidates) {
-    const result = stampPark.run(c.provider_id);
-    if (result.changes > 0) parked++;
-    // changes === 0 means a concurrent call already parked this row between
-    // our SELECT and this UPDATE — correctly excluded from `parked`, but the
-    // row still reports in `results` below since it WAS a would-park
-    // candidate at selection time; `results` mirrors the selected set
-    // identically across dry-run and apply, `parked` is what actually landed.
-  }
-
-  res.json({
-    would_park: candidates.length,
-    parked,
-    results: candidates.map((c) => ({ provider_id: c.provider_id, reason: c.reason })),
-  });
 });
 
 // ─── gardssalg_website_review_queue triage read (2026-10-11) ─────────────────
@@ -27011,15 +27246,14 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
     // See gsWvFetchFnFromGardssalgCrawler's doc comment.
     const fetchFn: GsWvFetchFn = gsWvFetchFnFromGardssalgCrawler();
 
-    let cohort = loadGardssalgWebsiteVerificationCohort(expDb, scope, cohortParam);
-    if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
-      const idSet = new Set(
-        (body.providerIds as unknown[])
-          .filter((v): v is string => typeof v === "string" && v.trim() !== "")
-          .map((v) => v.trim())
-      );
-      cohort = cohort.filter((p) => idSet.has(p.id));
-    }
+    const providerIds =
+      Array.isArray(body.providerIds) && body.providerIds.length > 0
+        ? (body.providerIds as unknown[])
+            .filter((v): v is string => typeof v === "string" && v.trim() !== "")
+            .map((v) => v.trim())
+        : undefined;
+    // A non-empty providerIds array whose entries are all invalid still
+    // narrows the cohort to nothing (empty id set), as before.
 
     // Paginate BEFORE scanning — mirrors the GET audit route's own
     // `cohortRows.slice(pageOffset, pageOffset + limit)` pattern, so only the
@@ -27047,20 +27281,14 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
     // out of this repo's scope) is what will actually let production
     // benefit from this mechanism; tracked as its own follow-up.
     const usePersistedOffset = limit !== undefined && offset === undefined;
-    const total = cohort.length;
-    let pageOffset: number | undefined;
-    if (limit !== undefined) {
-      pageOffset = usePersistedOffset ? getGardssalgWebsiteVerificationSweepOffset(expDb, cohortParam) : (offset as number);
-      cohort = cohort.slice(pageOffset, pageOffset + limit);
-    }
-
-    const { summary, rows } = await scanGardssalgWebsiteVerificationRows(cohort, fetchFn, CR_CONCURRENCY);
-    const nextOffset =
-      limit === undefined
-        ? undefined
-        : (pageOffset as number) + rows.length < total
-          ? (pageOffset as number) + rows.length
-          : null;
+    const { summary, rows, total, pageOffset, nextOffset } = await scanGardssalgWebsiteVerificationPage(expDb, {
+      scope,
+      cohort: cohortParam,
+      fetchFn,
+      concurrency: CR_CONCURRENCY,
+      providerIds,
+      page: limit !== undefined ? { limit, offset: usePersistedOffset ? "persisted" : (offset as number) } : undefined,
+    });
     const pagination =
       limit === undefined
         ? undefined
@@ -27141,6 +27369,32 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
     if (sendEnrichmentWritePausedIfPaused(err, res)) return;
     console.error("[gardssalg-website-verification-remediation] failed:", err);
     res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── Server-side daily job for the sweep above (step «3f») — read-only status
+// + manual run. Same pattern as admin/experience-orgnr-job-run (3n). Registered
+// ahead of every `/:id` route. ──────────────────────────────────────────────
+import {
+  getGardssalgWebsiteVerificationJobStatus,
+  runGardssalgWebsiteVerificationJob,
+} from "../services/gardssalg-website-verification-job";
+
+router.get("/admin/gardssalg-website-verification-job-status", requireAdmin, (_req: Request, res: Response) => {
+  res.json({ success: true, ...getGardssalgWebsiteVerificationJobStatus() });
+});
+
+// Manual run, same code path as the daily tick. Dry-run unless `apply` is
+// exactly the JSON boolean true. Write-pause is checked inside the run (apply
+// only); a dry-run reads the shared persisted offset but never advances it.
+router.post("/admin/gardssalg-website-verification-job-run", requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const body = (req.body ?? {}) as { apply?: unknown };
+    const report = await runGardssalgWebsiteVerificationJob({ apply: body.apply === true, trigger: "manual" });
+    res.json({ success: true, ...report });
+  } catch (err) {
+    console.error("[opplevelser] admin/gardssalg-website-verification-job-run failed", err);
+    res.status(500).json({ success: false, error: "Internal error" });
   }
 });
 

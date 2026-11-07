@@ -4,6 +4,7 @@ import path from "path";
 import { getDb, closeDb } from "./database/init";
 import { runTrafficHistoryJob, startTrafficHistoryScheduler } from "./services/traffic-history";
 import { flushAiDeliveries, startAiDeliveriesFlusher } from "./services/profile-ai-deliveries";
+import { aiProfileLinksForAiSearch } from "./middleware/ai-profile-links";
 import { flushAiClicks, startAiClicksFlusher } from "./services/profile-ai-clicks";
 import { runWalCheckpoints, getWalSizes } from "./services/wal-maintenance";
 import { isNameFtsEnabled, syncAgentsNameFts } from "./services/name-search-fts";
@@ -37,6 +38,7 @@ import { runProductCatalogSync } from "./services/product-catalog-sync";
 import { cartRouter, adminOrderRouter, producerOrderRouter } from "./routes/marketplace-cart";
 import adminOrdersRoutes from "./routes/admin-orders";
 import orderActivationRoutes, { orderActivationAdminRouter } from "./routes/order-activation-link";
+import claimActionLinkRoutes, { claimActionAdminRouter } from "./routes/claim-action-link";
 import dentalRoutes from "./routes/dental";
 import opplevelserRoutes from "./routes/opplevelser";
 import mcpRoutes from "./routes/mcp";
@@ -175,6 +177,7 @@ import adminSalgskanalRoutes from "./routes/admin-salgskanal";
 import adminJobsRoutes from "./routes/admin-jobs";
 import adminProductImportRoutes from "./routes/admin-product-import";
 import { productImportDryRunEnabled, resumeProductImportDryRunOnBoot } from "./services/product-import/dry-run";
+import { productAutoSyncEnabled } from "./services/product-import/auto-sync";
 import platformTriggersRoutes, { adminRouter as adminTriggersRoutes } from "./routes/platform-triggers";
 import crmRoutes from "./routes/crm";
 import { mountBillingRoutes } from "./routes/admin-billing";
@@ -577,6 +580,10 @@ app.use("/", buyerOrderCardRoutes);
 // dev-request 2026-10-21 live-go handlevogn-pilot, skive 2: one-time activation
 // link landing page (GET/POST /aktiver-bestillinger?t=…).
 app.use("/", orderActivationRoutes);
+// dev-request 2026-10-30-rfb-eierkrav (slice C4): signed one-click owner-claim
+// decision links (GET confirm / POST perform /eierkrav/handling?t=…). 404
+// while CLAIM_ACTION_LINKS_ENABLED is off. See routes/claim-action-link.ts.
+app.use("/", claimActionLinkRoutes);
 
 // (gardssalgClaimRoutes is mounted earlier — before the opplevagent.no
 // host-gate above — see the comment there for why.)
@@ -625,6 +632,11 @@ app.post("/admin/analytics/prune", adminLimiter);
 app.use("/api/tannlege", dentalLimiter);
 // Everything else gets the general limiter
 app.use("/api", generalLimiter);
+// dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 3: JSON answers
+// of the three public APIs to an ai_search client (ChatGPT-User / custom GPT
+// actions, Claude-User, Perplexity-User) get AI-tagged profile links
+// (utm_medium=api). Everyone else gets the answer unchanged.
+app.use(["/api/marketplace", "/api/tannlege", "/api/opplevelser"], aiProfileLinksForAiSearch);
 // dev-request 2026-07-03-agent-profile-conversations-stats slice 1:
 // /ut/:agentId/:kind lives outside /api (it's a bare redirect URL meant to
 // be pasted into profile pages), so it doesn't inherit the "/api" limiter
@@ -974,6 +986,10 @@ app.use("/admin/gardssalg/owner-features/switch-probe", adminLimiter, adminGards
 // POST /admin/agents/claim-backfill — one-shot claimed_at backfill for verified
 // claims (dev-request 2026-10-01-rfb-eierkrav-utelates-fra-outreach). Mount BEFORE /admin/agents.
 app.use("/admin/agents/claim-backfill", adminLimiter, adminAgentsClaimBackfillRoutes);
+// POST /admin/agents/claim-action-links — mint signed one-click links for an
+// owner claim (dev-request 2026-10-30-rfb-eierkrav, slice C4). 503 while
+// CLAIM_ACTION_LINKS_ENABLED is off. Mount BEFORE /admin/agents.
+app.use("/admin/agents/claim-action-links", adminLimiter, claimActionAdminRouter);
 // POST /admin/agents/terminal-repark — categorical correction lever that
 // flips wrongly terminal_unconfirmable rows (parked by the pre-#718
 // no-data-was-treated-as-dead bug) back to pending_verify, leaving
@@ -2270,6 +2286,42 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
 }
 
 // ─── A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
+// felles-serverjobbramme, «Innsnevring 2026-10-28», skive 3j: gårdssalg
+// website-discovery judgements — same file-queue mechanics as the content
+// judgements above, reading `gardssalg-website-judgements/` in
+// slookisen/A2A (verdicts a Cloud Routine rendered on Daniel's subscription)
+// and storing them through applyGardssalgWebsiteJudgements(), which re-checks
+// every item and writes via the same approve path as POST /admin/gardssalg-
+// website-review-judge. Never calls an LLM. OFF by default:
+// GARDSSALG_WEBSITE_JUDGEMENT_JOB_ENABLED === "true" turns it on; flipping it
+// back is the rollback. First tick 11 minutes after boot, hourly after that;
+// an overlapping tick is skipped.
+if (process.env.ENABLE_EXPERIENCES === "1") {
+  let gardssalgWebsiteJudgementsRunning = false;
+  const gardssalgWebsiteJudgementsTick = trackJob("gardssalg-website-judgements", async () => {
+    if (gardssalgWebsiteJudgementsRunning) return;
+    gardssalgWebsiteJudgementsRunning = true;
+    try {
+      const { tickGardssalgWebsiteJudgements } = await import("./services/gardssalg-website-judgement-job");
+      const r = await tickGardssalgWebsiteJudgements();
+      if (r.skipped_reason === "disabled") return;
+      console.log(
+        `[gardssalg-website-judgements] tick run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
+          `listed=${r.files_listed} processed=${r.processed.length} written=${r.written} ` +
+          `daily_cap_reached=${r.daily_cap_reached ? "yes" : "no"} ` +
+          `github_error=${r.github_error ? "yes" : "no"} envelope=${r.envelope_recorded}`,
+      );
+    } catch (err) {
+      console.error("[gardssalg-website-judgements] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      gardssalgWebsiteJudgementsRunning = false;
+    }
+  });
+  setTimeout(() => { void gardssalgWebsiteJudgementsTick(); }, 11 * 60_000);
+  setInterval(() => { void gardssalgWebsiteJudgementsTick(); }, 60 * 60_000);
+}
+
+// ─── A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
 // felles-serverjobbramme, tillegg 2026-10-15 «4b-det»: the gårdssalg content
 // queue (drink cohort first, then generic) drained by the platform once a
 // day, exactly like gardssalg-outreach-daily below ───────────────────────
@@ -2350,6 +2402,77 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
   setInterval(() => { void experienceOrgnrDailyTick(); }, 10 * 60_000);
 }
 
+// ─── Gårdssalg website-verification sweep — server-side daily job (step 3f) ───
+//
+// Same pattern as experience-orgnr-daily above: checks every 10 minutes, fires
+// once inside GARDSSALG_WEBSITE_VERIFICATION_JOB_WINDOW_HOUR_UTC (default 05),
+// stamp persisted in boot_job_state. OFF by default:
+// GARDSSALG_WEBSITE_VERIFICATION_JOB_ENABLED=true turns it on; flipping it back
+// is the rollback. No LLM. Manual/dry runs:
+// POST /api/opplevelser/admin/gardssalg-website-verification-job-run.
+if (process.env.ENABLE_EXPERIENCES === "1") {
+  let lastGardssalgWvRunAt: Date | null = null;
+  let gardssalgWvRunning = false;
+  const gardssalgWvDailyTick = trackJob("gardssalg-website-verification-daily", async () => {
+    if (gardssalgWvRunning) return;
+    gardssalgWvRunning = true;
+    const now = new Date();
+    try {
+      const { tickGardssalgWebsiteVerificationDaily } = await import("./services/gardssalg-website-verification-job");
+      const t = await tickGardssalgWebsiteVerificationDaily({ now, lastRunAt: lastGardssalgWvRunAt });
+      lastGardssalgWvRunAt = t.lastRunAt;
+      const r = t.report;
+      if (!r) return;
+      console.log(
+        `[gardssalg-website-verification-daily] run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} stop=${r.stop_reason ?? "-"} ` +
+          `pages=${r.totals.pages} scanned=${r.totals.scanned} written=${r.totals.provenance_written} ` +
+          `enqueued=${r.totals.enqueued} errors=${r.totals.errors} envelope=${r.envelope_recorded}`,
+      );
+    } catch (err) {
+      console.error("[gardssalg-website-verification-daily] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      gardssalgWvRunning = false;
+    }
+  });
+  setTimeout(() => { void gardssalgWvDailyTick(); }, 9 * 60_000);
+  setInterval(() => { void gardssalgWvDailyTick(); }, 10 * 60_000);
+}
+
+// ─── Gårdssalg website-review-queue parking — server-side daily job (step 3m) ───
+//
+// Same pattern as the jobs above: checks every 10 minutes, fires once inside
+// GARDSSALG_WEBSITE_REVIEW_QUEUE_PARK_JOB_WINDOW_HOUR_UTC (default 06), stamp
+// persisted in boot_job_state. OFF by default:
+// GARDSSALG_WEBSITE_REVIEW_QUEUE_PARK_JOB_ENABLED=true turns it on; flipping it
+// back is the rollback. No LLM. Manual/dry runs:
+// POST /api/opplevelser/admin/gardssalg-website-review-queue-park-job-run.
+if (process.env.ENABLE_EXPERIENCES === "1") {
+  let lastGardssalgRqpRunAt: Date | null = null;
+  let gardssalgRqpRunning = false;
+  const gardssalgRqpDailyTick = trackJob("gardssalg-website-review-queue-park-daily", async () => {
+    if (gardssalgRqpRunning) return;
+    gardssalgRqpRunning = true;
+    const now = new Date();
+    try {
+      const { tickGardssalgWebsiteReviewQueueParkDaily } = await import("./services/gardssalg-website-review-queue-park-job");
+      const t = await tickGardssalgWebsiteReviewQueueParkDaily({ now, lastRunAt: lastGardssalgRqpRunAt });
+      lastGardssalgRqpRunAt = t.lastRunAt;
+      const r = t.report;
+      if (!r) return;
+      console.log(
+        `[gardssalg-website-review-queue-park-daily] run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
+          `would_park=${r.would_park} parked=${r.parked} envelope=${r.envelope_recorded}`,
+      );
+    } catch (err) {
+      console.error("[gardssalg-website-review-queue-park-daily] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      gardssalgRqpRunning = false;
+    }
+  });
+  setTimeout(() => { void gardssalgRqpDailyTick(); }, 10 * 60_000);
+  setInterval(() => { void gardssalgRqpDailyTick(); }, 10 * 60_000);
+}
+
 // ─── dev-request 2026-10-21-rfb-produktimport-fra-egen-nettside, runde 2
 // (punkt 5): the product-import dry-run measurement survives a deploy. Once,
 // 45 s after boot and only with PRODUCT_IMPORT_DRYRUN_ENABLED=1, a run the
@@ -2366,6 +2489,40 @@ if (productImportDryRunEnabled()) {
       );
     }
   }, 45_000);
+}
+
+// ─── Produktimport skive 4-1: weekly product auto-sync from the owner's own
+// website ──────────────────────────────────────────────────────────────────
+// OFF by default: PRODUCT_AUTO_SYNC_ENABLED=1/true at boot schedules it;
+// unset, nothing is scheduled and nothing is written. Checks every 10
+// minutes; one sweep a day inside the window (03 UTC), stamp persisted in
+// boot_job_state so a restart does not sweep twice. A sweep runs the verified
+// profiles with product_sync_mode 'weekly' whose own last run is ≥ 7 days old,
+// one after another, paced per host. Flipping the flag off is the rollback.
+if (productAutoSyncEnabled()) {
+  let lastProductAutoSyncAt: Date | null = null;
+  let productAutoSyncRunning = false;
+  const productAutoSyncTick = trackJob("product-auto-sync-weekly", async () => {
+    if (productAutoSyncRunning) return;
+    productAutoSyncRunning = true;
+    try {
+      const { tickProductAutoSync } = await import("./services/product-import/auto-sync");
+      const t = await tickProductAutoSync({ now: new Date(), lastRunAt: lastProductAutoSyncAt });
+      lastProductAutoSyncAt = t.lastRunAt;
+      const r = t.report;
+      if (!r) return;
+      console.log(
+        `[product-auto-sync] profiles=${r.profiles} applied=${r.applied} blocked=${r.blocked} ` +
+          `skipped=${r.skipped} errors=${r.errors}`,
+      );
+    } catch (err) {
+      console.error("[product-auto-sync] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      productAutoSyncRunning = false;
+    }
+  });
+  setTimeout(() => { void productAutoSyncTick(); }, 11 * 60_000);
+  setInterval(() => { void productAutoSyncTick(); }, 10 * 60_000);
 }
 
 // ─── dev-request 2026-09-03-opplevagent-sending-uten-llm-i-sendestien

@@ -31,7 +31,7 @@
 // Limits: at most OWNER_FETCH_DAILY_LIMIT fetches per profile per UTC day,
 // counted from product_import_runs (survives restarts); at most
 // OWNER_FETCH_MAX_CONCURRENT fetches at a time in this process, and one per
-// profile. Flag PRODUCT_IMPORT_ENABLED ("1"/"true"; default off).
+// profile. Flag PRODUCT_IMPORT_ENABLED ("1"/"true"; "pilot" = allowlisted owners only; default off).
 
 import { randomUUID } from "crypto";
 import { getDb } from "../../database/init";
@@ -47,6 +47,7 @@ import {
 } from "../knowledge-service";
 import { normalizeName, parsePriceNok, runProductCatalogSync } from "../product-catalog-sync";
 import { auditOwnerProductChange } from "../owner-orderability";
+import { ownerFlagEnabledFor, ownerFlagMode } from "../../owner-features/owner-flag-mode";
 import { extractProductsFromWebsite, HostPacer, type ProductImportDeps, type ProductImportResult } from "./extractor";
 import { canonicalUnit, detectPriceUnit, normalizeProductName, PRODUCT_IMPORT_MAX_PRODUCTS, type ProductUnit } from "./normalize";
 
@@ -66,10 +67,18 @@ export const OWNER_FETCH_RUNNING_MESSAGE = "Vi henter allerede produkter fra net
 export const OWNER_IMPORT_NO_WEBSITE_MESSAGE =
   "Profilen har ingen nettside. Legg inn nettsiden i profilen først, eller legg inn produktene selv.";
 
-/** Flag: "1"/"true" turns the owner import on. Anything else = off (404). */
+/** Flag: "1"/"true" turns the owner import on for every verified owner ("all" mode). */
 export function productImportEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const v = env[PRODUCT_IMPORT_FLAG];
-  return v === "1" || v === "true";
+  return ownerFlagMode(PRODUCT_IMPORT_FLAG, env) === "all";
+}
+
+/**
+ * The owner import is on for this owner: "1"/"true" → everyone; "pilot" →
+ * only an owner in OWNER_FEATURES_ALLOWED_SUBJECTS (`rfb:<id>`); anything
+ * else → off (404).
+ */
+export function productImportEnabledFor(agentId: string | null | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
+  return ownerFlagEnabledFor(PRODUCT_IMPORT_FLAG, agentId, env);
 }
 
 // ── Test seams ──────────────────────────────────────────────────────────────
@@ -639,7 +648,8 @@ function parsePriceInput(v: unknown): number | null | "invalid" {
   return Math.round(n * 100) / 100;
 }
 
-function formatPrice(price: number | null, unit: string | null, isFrom: boolean, exclVat: boolean): string | undefined {
+/** The stored price text for a product («fra kr 250/kg ekskl. mva.»); also used by the weekly auto-sync. */
+export function formatPrice(price: number | null, unit: string | null, isFrom: boolean, exclVat: boolean): string | undefined {
   if (price === null) return undefined;
   const p = Number.isInteger(price) ? String(price) : price.toFixed(2).replace(".", ",");
   return `${isFrom ? "fra " : ""}kr ${p}${unit ? `/${unit}` : ""}${exclVat ? " ekskl. mva." : ""}`;
@@ -655,7 +665,13 @@ export function publishOwnerImport(
   runId: string,
   selection: PublishSelection[],
   remove: string[],
-  opts: { actorEmail: string | null; now?: () => number; mode?: ImportRunMode } = { actorEmail: null },
+  opts: {
+    actorEmail: string | null;
+    now?: () => number;
+    mode?: ImportRunMode;
+    /** Extra writes that must commit or roll back with the publish (Skive 4a: the weekly-sync box). */
+    inTransaction?: () => void;
+  } = { actorEmail: null },
 ): PublishResult {
   const db = getDb();
   const now = opts.now ?? testDeps?.now ?? Date.now;
@@ -704,15 +720,28 @@ export function publishOwnerImport(
   }> = [];
   const seenSel = new Set<string>();
   const seenNames = new Set<string>();
+  // Single read of the profile's current list: used for the name lock below
+  // and for the merge further down.
+  const types = producerTypesOf(agentId);
+  const list = readCurrentList(agentId).slice();
+  const current = currentProductsOf(list);
+  const byKey = new Map<string, CurrentProduct>();
+  for (const c of current) if (!byKey.has(c.key)) byKey.set(c.key, c);
   for (const s of selection) {
     if (seenSel.has(s.id)) continue;
     seenSel.add(s.id);
     const row = byId.get(s.id)!;
     let name = row.name;
+    // Name lock: a candidate matching an existing product keeps its name, so
+    // the merge updates that product instead of adding a duplicate. Only a
+    // submitted name that normalises to the same key is tolerated (ignored).
+    const matched = byKey.has(normalizeName(row.name));
     if (s.name !== undefined) {
-      const n = normalizeProductName(s.name);
+      const n = typeof s.name === "string" ? normalizeProductName(s.name) : null;
       if (!n) fieldErrors.push({ id: s.id, field: "name" });
-      else name = n;
+      else if (matched) {
+        if (normalizeName(n) !== normalizeName(row.name)) fieldErrors.push({ id: s.id, field: "name" });
+      } else name = n;
     }
     let price = row.price_nok;
     let priceEdited = false;
@@ -743,13 +772,8 @@ export function publishOwnerImport(
     return { ok: false, status: 400, error: "invalid", message: "Noen av feltene er ugyldige. Sjekk navn, pris og enhet.", fields: fieldErrors };
   }
 
-  const types = producerTypesOf(agentId);
   const nowIso = isoTs(now());
   const nowSql = sqlTs(now());
-  const list = readCurrentList(agentId).slice();
-  const current = currentProductsOf(list);
-  const byKey = new Map<string, CurrentProduct>();
-  for (const c of current) if (!byKey.has(c.key)) byKey.set(c.key, c);
 
   const published: Array<{ id: string; name: string; action: "added" | "updated" }> = [];
   const rejected: Array<{ id: string; name: string; reason: PublishBlockReason; message: string }> = [];
@@ -857,6 +881,7 @@ export function publishOwnerImport(
         auditOwnerProductChange(db, agentId, "products.removed", removedNames.join(", ").slice(0, 2000), null, opts.actorEmail,
           `owner removed ${removedNames.length} product(s) in import run ${runId} (produktimport skive 3)`);
       }
+      opts.inTransaction?.();
     })();
   } catch (err) {
     console.error("[product-import] owner publish failed:", err instanceof Error ? err.message : err);

@@ -187,7 +187,7 @@ export async function runAdminHomepageProvenanceCohortTests(opts: { log?: boolea
     insertAgent({ id: "excl-status", name: "Feil status", website: "https://x.no", verificationStatus: "verified" });
     insertAgent({ id: "excl-nohome", name: "Ingen nettsted", website: null, aUrl: null });
     insertAgent({ id: "excl-noabout", name: "Tomt about", website: "https://x.no", about: "" });
-    insertAgent({ id: "excl-hasprov", name: "Har homepage-provenance", website: "https://x.no", fieldProvenance: '{"about":[{"source_type":"homepage"}]}' });
+    insertAgent({ id: "excl-hasprov", name: "Har homepage-provenance", website: "https://x.no", fieldProvenance: '{"address":[{"source_type":"homepage","value":"Testveien 1"}]}' });
     insertAgent({ id: "excl-parked", name: "Parkert nylig", website: "https://x.no", homepageUnreachableSince: daysAgoIso(5) });
     insertAgent({ id: "excl-backoff", name: "No-yield backoff", website: "https://x.no", noYieldStreak: 3, lastEnrichmentAttemptAt: daysAgoIso(1) });
     {
@@ -195,7 +195,7 @@ export async function runAdminHomepageProvenanceCohortTests(opts: { log?: boolea
       assertTrue(!r.body.agentIds.includes("excl-status"), "c1: wrong verification_status excluded");
       assertTrue(!r.body.agentIds.includes("excl-nohome"), "c2: no homepage excluded");
       assertTrue(!r.body.agentIds.includes("excl-noabout"), "c3: empty about excluded");
-      assertTrue(!r.body.agentIds.includes("excl-hasprov"), "c4: existing homepage provenance excluded");
+      assertTrue(!r.body.agentIds.includes("excl-hasprov"), "c4: existing homepage provenance on a contact field (address) excluded");
       assertTrue(!r.body.agentIds.includes("excl-parked"), "c5: freshly parked excluded");
       assertTrue(!r.body.agentIds.includes("excl-backoff"), "c6: no-yield backoff excluded");
     }

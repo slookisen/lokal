@@ -22,9 +22,10 @@ import { Router, Request, Response } from "express";
 import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { resolveRouteIntent } from "../services/route-intent";
-import { knowledgeService, productPriceText, parseProductPrice, OWNER_PRODUCT_SOURCES } from "../services/knowledge-service";
+import { productAutoSyncEnabled } from "../services/product-import/auto-sync";
+import { knowledgeService, productPriceText, parseProductPrice, OWNER_PRODUCT_SOURCES, ownerWroteAbout, publicOwnerAboutText } from "../services/knowledge-service";
 import { catalogNameNorm, softStockByNameNorm, stockSoftExpiryBuyerText, type SoftStockFields } from "../services/stock-soft-expiry";
-import { containsOrganicClaim, isOrganicClaimUmbrella } from "../services/organic-claims";
+import { containsOrganicClaim, isOrganicClaimUmbrella, dropOrganicSentences } from "../services/organic-claims";
 import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenFields, hidesAddress, hidesPrices, debioSwitchOffAgentIds } from "../owner-features/enforce";
 import { debioApprovalText, debioProcessText, debioRegisterSyncEnabled, finnokoSearchUrl, readDebioStatusRow } from "../services/debio-approval";
 import { publicCountsShown } from "../services/public-stats-threshold";
@@ -56,7 +57,7 @@ import { getTrafficStats, getTrafficStatsSnapshot } from "../services/traffic-st
 import { publicTrafficYearBlock, TRAFFIC_YEAR_KEYS, trafficYearCell, trafficYearLangOf, type TrafficYearKey } from "../services/traffic-year-compute";
 import { aiDeliveriesYearPeriodLabel } from "../services/profile-year-compute";
 import { isDisplayablePhone } from "../services/contact-normalizer";
-import { isJunkDescription, stripInternalNotes, normalizeProse } from "../services/description-quality";
+import { isJunkDescription, stripInternalNotes, normalizeProse, organicOwnerGateActive } from "../services/description-quality";
 import { getProfileActivity } from "../services/profile-activity-service";
 import { recordAiPageDelivery } from "../services/profile-ai-deliveries";
 import { recordAiProfileClick } from "../services/profile-ai-clicks";
@@ -83,7 +84,7 @@ import {
   SALGSKANAL_CATEGORY_NAMES,
   type SalgskanalCategorySlug,
 } from "../services/salgskanal-matcher";
-import { addUtmParams } from "../utils/url-utm";
+import { addUtmParams, withRequestQuery } from "../utils/url-utm";
 // dev-request 2026-09-24-ai-sok-bli-svaret-rfb, slice B6: /mat/<kategori>/<sted>.
 import {
   isRfbMatLandingEnabled,
@@ -256,9 +257,12 @@ export function applyPublishedTranslations<T extends { id: string; description?:
     const t = map.get(r.id);
     if (!t) continue;
     if (t.description && r.description) r.description = t.description;
-    if (t.about && "about" in r && r.about) r.about = t.about;
+    // Økologi S3c-2: a published translation of an owner-written about loses
+    // its organic sentences as the Norwegian text does (gate off = t.about).
+    const tAbout = t.about ? publicOwnerAboutText(r.id, t.about) : t.about;
+    if (tAbout && "about" in r && r.about) r.about = tAbout;
     const k = knowledgeById?.get(r.id);
-    if (k && t.about && k.about) k.about = t.about;
+    if (k && tAbout && k.about) k.about = tAbout;
   }
   return rows;
 }
@@ -987,8 +991,8 @@ function productDateText(iso: unknown, lang: Lang): string {
 }
 
 /** The products card's date line + price caveat as HTML, or "" when no owner product has a date. */
-export function productDateLineHtml(products: unknown[], lang: Lang): string {
-  let newest: { at: number; iso: string; host: string; confirmed: boolean } | null = null;
+export function productDateLineHtml(products: unknown[], lang: Lang, env: NodeJS.ProcessEnv = process.env): string {
+  let newest: { at: number; iso: string; host: string; confirmed: boolean; auto: boolean } | null = null;
   for (const p of products) {
     if (!p || typeof p !== "object") continue;
     const { source, sourceUrl, fetchedAt, confirmedAt } = p as Record<string, unknown>;
@@ -1003,12 +1007,20 @@ export function productDateLineHtml(products: unknown[], lang: Lang): string {
     const iso = host && typeof fetchedAt === "string" ? fetchedAt : confirmedAt;
     const at = typeof iso === "string" ? Date.parse(iso) : NaN;
     if (!Number.isFinite(at) || (newest && at <= newest.at)) continue;
-    newest = { at, iso: iso as string, host: iso === fetchedAt ? host : "", confirmed: typeof confirmedAt === "string" && !!confirmedAt };
+    newest = {
+      at, iso: iso as string, host: iso === fetchedAt ? host : "", confirmed: typeof confirmedAt === "string" && !!confirmedAt,
+      auto: source === "owner_auto_sync",
+    };
   }
   if (!newest) return "";
   const date = productDateText(newest.iso, lang);
   if (!date) return "";
-  const line = newest.host
+  // Skive 4-2a: the newest price came from the weekly auto-sync → «Oppdatert
+  // automatisk fra <domene> <dato>» (only with PRODUCT_AUTO_SYNC_ENABLED on;
+  // off = exactly the line above).
+  const line = newest.host && newest.auto && productAutoSyncEnabled(env)
+    ? t(lang, "producer.products_auto_updated", { host: newest.host, date })
+    : newest.host
     ? t(lang, "producer.products_prices_fetched", { host: newest.host, date }) +
       (newest.confirmed ? ` \u00b7 ${t(lang, "producer.products_confirmed_by_owner")}` : "")
     : t(lang, "producer.products_updated_by_owner", { date });
@@ -5042,7 +5054,9 @@ export function renderRelatedSection(
   if (!rows.length) return "";
   const items = rows.map((r) => {
     const slug = slugify(r.name);
-    let previewSource = r.description || r.about || "";
+    // Økologi S3c-2: the about preview (only when there is no description)
+    // gets the owner-text read step (gate off = r.about unchanged).
+    let previewSource = r.description || publicOwnerAboutText(r.id, r.about) || "";
     if (previewSource && isJunkDescription(previewSource)) {
       console.log(`[description-guard] suppressed junk description (related-producer preview) for ${r.id} (${r.name})`);
       previewSource = "";
@@ -5664,7 +5678,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           // 301 tells crawlers to update their index — same rationale as
           // the fuzzy-match redirect below, but backed by an exact
           // historical record instead of a similarity guess.
-          return res.redirect(301, `${localizedPath("/produsent/" + canonical, lang)}`);
+          return res.redirect(301, withRequestQuery(localizedPath("/produsent/" + canonical, lang), req.originalUrl));
         }
       }
 
@@ -5679,7 +5693,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         if (canonical && canonical !== slug) {
           // 301 tells crawlers to update their index — preserves SEO juice
           // and teaches Perplexity/ChatGPT/Claude the canonical URL.
-          return res.redirect(301, `${localizedPath("/produsent/" + canonical, lang)}`);
+          return res.redirect(301, withRequestQuery(localizedPath("/produsent/" + canonical, lang), req.originalUrl));
         }
       }
 
@@ -5805,7 +5819,16 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // lede, umbrella "about", LocalBusiness JSON-LD, <meta name="description">)
     // so a junk value never reaches any public output for this page.
     const rawDescription = agent.description || "";
-    const rawAbout = k.about || "";
+    // Økologi S3c (RFB_ORGANIC_CLAIM_GATE + RFB_ORGANIC_OWNER_GATE, both
+    // default off): an OWNER-written about (curated_fields.about.by "owner")
+    // of a producer without a valid Debio status (the badge's signal) loses
+    // every sentence with an organic claim before any about-derived output
+    // (body, JSON-LD, umbrella text) — and so does a published EN/SV
+    // translation of it. Nothing left = empty, so the existing fallbacks
+    // apply. Read-side only; the stored text is unchanged.
+    const ownerOrganicFilter = organicOwnerGateActive() && info?.agent.debioVerified !== true &&
+      ownerWroteAbout(agent.id);
+    const rawAbout = ownerOrganicFilter ? dropOrganicSentences(k.about || "") : (k.about || "");
     // stripInternalNotes: an enrichment routine's own working note appended to
     // real producer prose ("… NB: nettside midlertidig utilgjengelig — kontakt
     // bør bekreftes av verifier.") must not reach a customer, but the prose in
@@ -5825,9 +5848,12 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       ? getPublishedProfileTranslations(getDb(), "rfb", "agent", agent.id, lang)
       : {};
     const displayDescription = (safeDescription && profileTranslations.description) || safeDescription;
-    const displayAbout = (safeAbout && profileTranslations.about) || safeAbout;
+    const aboutTranslation = ownerOrganicFilter && profileTranslations.about
+      ? dropOrganicSentences(profileTranslations.about)
+      : profileTranslations.about;
+    const displayAbout = (safeAbout && aboutTranslation) || safeAbout;
     const descriptionIsNb = lang !== "no" && !!safeDescription && !profileTranslations.description;
-    const aboutIsNb = lang !== "no" && !!safeAbout && !profileTranslations.about;
+    const aboutIsNb = lang !== "no" && !!safeAbout && !aboutTranslation;
     if (rawDescription && !safeDescription) {
       console.log(`[description-guard] suppressed junk agent.description for ${agent.id} (${agent.name}) on /produsent/${slug}`);
     }

@@ -262,27 +262,31 @@ export async function runOwnerFeaturesT5AnchorsTests(opts: { log?: boolean } = {
       // ── Level: preview link, preview inside #niva, confirm → #niva ─────────
       const b0 = await pageHtml(OWNED_ID);
       assertTrue(!/<form method="get"/.test(b0), "r01: no GET form on the page (the level choice is a link)");
-      assertTrue(elementById(b0, "niva").includes(`href="/eier/${OWNED_ID}/valg?niva=ta_imot_bestillinger#niva-forhandsvis"`),
-        "r02: «Velg «Ta imot bestillinger»» links to …/valg?niva=<level>#niva-forhandsvis inside #niva");
+      assertTrue(elementById(b0, "niva").includes(`href="/eier/${OWNED_ID}/valg?niva=utnytte_mulighetene#niva-forhandsvis"`),
+        "r02: «Velg «Utnytte mulighetene»» links to …/valg?niva=<level>#niva-forhandsvis inside #niva");
       const w0 = writes(OWNED_ID);
-      const pv = await pageHtml(OWNED_ID, { niva: "ta_imot_bestillinger" });
+      const pv = await pageHtml(OWNED_ID, { niva: "utnytte_mulighetene" });
       assertEq(writes(OWNED_ID), w0, "r03: the preview GET writes nothing (T2 kept)");
-      assertTrue(elementById(pv, "niva").includes(`id="niva-forhandsvis"`) && elementById(pv, "niva-forhandsvis").includes("Bytte til «Ta imot bestillinger»?"),
+      assertTrue(elementById(pv, "niva").includes(`id="niva-forhandsvis"`) && elementById(pv, "niva-forhandsvis").includes("Bytte til «Utnytte mulighetene»?"),
         "r04: the level preview stands inside #niva");
       assertTrue(!pv.includes(`id="bekreft"`), "r05: no panel above the level card any more");
-      const lv0 = await post(H.niva, OWNED_ID, { level: "ta_imot_bestillinger" });
-      assertEq([lv0.status, loc(lv0)], [303, P(OWNED_ID, "?niva=ta_imot_bestillinger#niva-forhandsvis")], "r06: POST niva unconfirmed → 303 …?niva=<level>#niva-forhandsvis");
-      const lv1 = await post(H.niva, OWNED_ID, { level: "ta_imot_bestillinger", confirmed: "1" });
+      const lv0 = await post(H.niva, OWNED_ID, { level: "utnytte_mulighetene" });
+      assertEq([lv0.status, loc(lv0)], [303, P(OWNED_ID, "?niva=utnytte_mulighetene#niva-forhandsvis")], "r06: POST niva unconfirmed → 303 …?niva=<level>#niva-forhandsvis");
+      const lv1 = await post(H.niva, OWNED_ID, { level: "utnytte_mulighetene", confirmed: "1" });
       assertTrue(lv1.status === 303 && new RegExp(`^/eier/${OWNED_ID}/valg\\?endret=\\d+#niva$`).test(loc(lv1)), `r07: confirming a level → 303 …?endret=<n>#niva (${loc(lv1)})`);
       const pl1 = await follow(OWNED_ID, loc(lv1));
       assertTrue(toastIn(pl1, "niva") && !toastIn(pl1, "mv-toast-slot") && !topCard(pl1).includes("mv-toast"), "r08: the level message stands in #niva (not the slot, not the top card)");
-      const lv2 = await post(H.niva, OWNED_ID, { level: "ta_imot_bestillinger", confirmed: "1" });
+      const lv2 = await post(H.niva, OWNED_ID, { level: "utnytte_mulighetene", confirmed: "1" });
       assertEq(loc(lv2), P(OWNED_ID, "?melding=niva_valgt&ved=niva#niva"), "r09: the same level again (no change) → #niva");
       assertTrue(toastIn(await follow(OWNED_ID, loc(lv2)), "niva"), "r10: …and its message is in #niva");
       assertEq(loc(await post(H.niva, OWNED_ID, { level: "bogus", confirmed: "1" })), P(OWNED_ID, "?melding=ugyldig&ved=niva#niva"), "r11: unknown level → #niva");
-      const lvU = await post(H.niva, UNVERIFIED_ID, { level: "ta_imot_bestillinger", confirmed: "1" });
-      assertEq(loc(lvU), P(UNVERIFIED_ID, "?melding=hoppet&nokkel=orders.enabled&ved=niva#niva"), "r12: a skipped key (requirement) → #niva");
-      assertTrue(toastIn(await follow(UNVERIFIED_ID, loc(lvU)), "niva"), "r13: …message in #niva");
+      const lvU = await post(H.niva, UNVERIFIED_ID, { level: "utnytte_mulighetene", confirmed: "1" });
+      // T10: a hard requirement (is_verified = 0) → nothing written, back to the preview inside #niva.
+      assertEq(loc(lvU), P(UNVERIFIED_ID, "?niva=utnytte_mulighetene#niva-forhandsvis"), "r12: a hard requirement missing → the preview in #niva (T10)");
+      { const pU = await follow(UNVERIFIED_ID, loc(lvU));
+        const pv = elementById(pU, "niva-forhandsvis");
+        assertTrue(elementById(pU, "niva").includes(`id="niva-forhandsvis"`) && pv.includes("Du kan ikke velge «Utnytte mulighetene» før dette er på plass:") && !pv.includes("Bekreft «Utnytte mulighetene»"),
+          "r13: …the preview lists «Dette mangler» and has no confirm button (T10)"); }
 
       // ── Undo a level → back to #niva ─────────────────────────────────────
       const ul = await post(H.angre, OWNED_ID, { batch: String(endret(loc(lv1))) });
@@ -348,7 +352,8 @@ export async function runOwnerFeaturesT5AnchorsTests(opts: { log?: boolean } = {
       const newsLive = reg.findOwnerFeature("comms.news")?.status === "live";
       const i1 = await post(H.intro, NEWS_ID, { answer: "yes" });
       if (newsLive) {
-        assertTrue(i1.status === 303 && /\?endret=\d+#gruppe-comms$/.test(loc(i1)), `r42: «Ja takk» → 303 …?endret=<n>#gruppe-comms (${loc(i1)})`);
+        // T7: the yes carries its own confirmation (melding=intro_ja) next to the batch.
+        assertTrue(i1.status === 303 && /\?endret=\d+&melding=intro_ja#gruppe-comms$/.test(loc(i1)), `r42: «Ja takk» → 303 …?endret=<n>&melding=intro_ja#gruppe-comms (${loc(i1)})`);
         const pi = await follow(NEWS_ID, loc(i1));
         assertTrue(elementById(pi, "gruppe-comms").includes(`id="valg-comms.news"`) && toastIn(pi, "valg-comms.news"), "r43: the answer's message stands in the row #valg-comms.news inside #gruppe-comms");
         const ui = await post(H.angre, NEWS_ID, { batch: String(endret(loc(i1))) });
@@ -356,8 +361,8 @@ export async function runOwnerFeaturesT5AnchorsTests(opts: { log?: boolean } = {
       } else {
         assertEq(loc(i1), P(NEWS_ID, "?melding=intro_ja&ved=gruppe-comms#gruppe-comms"), "r42: «Ja takk» → #gruppe-comms");
       }
-      const i2 = await post(H.intro, NEWS_NO_ID, { answer: "no" });
-      assertEq(loc(i2), P(NEWS_NO_ID, "?melding=intro_nei&ved=gruppe-comms#gruppe-comms"), "r45: «Nei takk» → #gruppe-comms");
+      const i2 = await post(H.intro, NEWS_NO_ID, { answer: "never" });
+      assertEq(loc(i2), P(NEWS_NO_ID, "?melding=intro_nei&ved=gruppe-comms#gruppe-comms"), "r45: «Nei, ikke spør meg igjen» → #gruppe-comms");
       assertTrue(toastIn(await follow(NEWS_NO_ID, loc(i2)), "gruppe-comms"), "r46: …message in the group card");
       assertEq(loc(await post(H.intro, NEWS_NO_ID, { answer: "kanskje" })), P(NEWS_NO_ID, "?melding=ugyldig&ved=gruppe-comms#gruppe-comms"), "r47: junk answer → #gruppe-comms");
 
@@ -406,7 +411,10 @@ export async function runOwnerFeaturesT5AnchorsTests(opts: { log?: boolean } = {
 
       // ── The script: no anchor-less navigation, no inline handlers ────────
       assertTrue(!pg.OWNER_PAGE_SCRIPT.includes("window.location") && !pg.OWNER_PAGE_SCRIPT.includes("getElementById(\"bekreft\")"), "r57: the script never navigates to Response.url");
-      assertTrue(pg.OWNER_PAGE_SCRIPT.includes("f.submit()"), "r58: errors fall back to the plain form POST (its 303 keeps the anchor)");
+      // T9 (FUNN t5-gjeninnsending-ordre-epost): an HTTP error answer is shown, never re-sent; only a
+      // failed fetch (no answer) falls back to the plain form POST, whose 303 keeps the anchor.
+      assertTrue(!pg.OWNER_PAGE_SCRIPT.includes("f.submit()") && pg.OWNER_PAGE_SCRIPT.includes("HTMLFormElement.prototype.submit"),
+        "r58: a failed fetch falls back to the plain form POST; an error answer is never re-sent (T9)");
       let compiles = true;
       try { new vm.Script(pg.OWNER_PAGE_SCRIPT); } catch { compiles = false; }
       assertTrue(compiles, "r59: the script compiles");

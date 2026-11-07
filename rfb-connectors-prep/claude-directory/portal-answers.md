@@ -4,7 +4,7 @@
 
 Every step of the developer portal at https://claude.ai/directory/manage (**Submit new** → **MCP connector**), answered. Copy the fenced blocks as they are. Steps as listed in https://claude.com/docs/connectors/building/submission (read 2026-10-17).
 
-Before you start: Ready to submit: no (1 waiting). See the prerequisites in ../README.md.
+Before you start: Ready to submit: yes. Every prerequisite is done. See the prerequisites in ../README.md.
 
 ## 1. Connection
 
@@ -25,16 +25,16 @@ The client must send `initialize` first. A request without a live session gets 4
 
 | Tool | `title` | `annotations.title` | readOnlyHint | destructiveHint | openWorldHint | What it does (first sentence) |
 |---|---|---|---|---|---|---|
-| `lokal_search` | Search local food producers | (same) | true | false | true | Search for local food producers in Norway and get their product listings. |
+| `lokal_search` | Search local food producers | (same) | true | false | true | Use when the user wants to find or buy food from Norwegian farms, farm shops or local producers, or asks about a named producer. |
 | `lokal_discover` | Discover producers by filter | (same) | true | false | false | Structured search in the Lokal food producer registry. |
 | `lokal_info` | Producer details | (same) | true | false | false | Get a specific producer's full listed product catalog, contact details, opening hours, and delivery options. |
 | `lokal_stats` | Platform statistics | (same) | true | false | false | Get Lokal platform statistics — total agents, cities covered, interactions. |
-| `lokal_list_umbrellas` | List umbrella organizations | (same) | true | false | false | List all umbrella organizations on Lokal — markets-networks (Bondens marked, REKO), venues (Mathallen), industry orgs (Hanen), certifiers (Debio), and cooperatives. |
-| `lokal_get_umbrella_members` | Get producers in an umbrella's network | (same) | true | false | false | List producers that are members of a specific umbrella organization (e.g. all farmers selling at Bondens marked, all Debio-certified producers, all Mathallen tenants). |
+| `lokal_list_umbrellas` | List umbrella organizations | (same) | true | false | false | List all umbrella organizations on Lokal — markets-networks (Bondens marked, REKO), venues (Mathallen), industry orgs (Hanen), and cooperatives. |
+| `lokal_get_umbrella_members` | Get producers in an umbrella's network | (same) | true | false | false | List producers that are members of a specific umbrella organization (e.g. all farmers selling at Bondens marked, all Mathallen tenants). |
 | `lokal_get_producer_affiliations` | Get a producer's umbrella affiliations | (same) | true | false | false | List umbrella organizations a specific producer is a member of (e.g. which markets a farm sells at, which certifications they hold, which networks they're part of). |
 | `lokal_bm_next_markets` | Get upcoming Bondens marked events | Upcoming Bondens marked events | true | false | false | Returns upcoming Bondens marked events (markedsdager) for a region or specific lokallag/venue. |
 | `lokal_geocode` | Geocode a Norwegian place name | Geocode Norwegian place | true | false | true | Resolve a Norwegian place name (city, town, region, fylke, or kommune) to lat/lng coordinates. |
-| `lokal_find_offers` | Find offers for shopping-list items | (same) | true | false | true | For each item in a shopping list, find up to 5 nearby producers who sell it (or a matching product), sorted by distance, with contact info and whether an order can be placed through the platform (can_order). |
+| `lokal_find_offers` | Find local food to buy | (same) | true | false | true | Use when the user wants to buy one food item or a shopping list from Norwegian local producers and has a place or coordinates. |
 | `lokal_cart_view` | View shopping cart | View cart | true | false | false | View the current contents of a cart, grouped by producer, with subtotals and a total. |
 | `lokal_order_status` | Get order status | Order status | true | false | false | Fetch the status, items and status timeline of a pickup order created by lokal_cart_submit. |
 
@@ -130,7 +130,7 @@ Seven acknowledgments, all required. Our basis for each:
 | First-party API usage | Our own: the server reads Rett fra Bonden's own producer catalogue on the same domain. Place-name lookups can fall back to Kartverket's public place-name service. |
 | Financial transactions | No money moves through the connector. A pickup order is a request to collect goods; the user pays the producer at pickup, outside Claude and outside this platform. No card or bank details are asked for. |
 | AI media generation | None: the connector generates no images, video or audio. |
-| Prompt injection | **Not yet.** `lokal_search`: «ALWAYS use», «USE THIS FOR». The fix waits for OpenAI's decision on the RFB ChatGPT app: tool metadata stays frozen while OpenAI reviews it (Daniel reports the decision). |
+| Prompt injection | Tool descriptions say what each tool does and do not instruct Claude (checked against the directive patterns in scripts/gen-connector-packs.ts). |
 | Conversation data collection | The tools take only the arguments they need. The server never asks for chat history, memory or files. |
 | Public documentation | https://rettfrabonden.com/guide-mat-ai |
 

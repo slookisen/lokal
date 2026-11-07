@@ -16,7 +16,9 @@
  *   undo       reverts the newest change (a level as one unit) with audit rows;
  *              refuses an older batch, a second undo, and a key changed since.
  *   log        newest first, who/when, «Angret», pagination.
- *   intro      first-login card shown until answered; answer stored once;
+ *   intro      (T7) the «Nyheter og tips» question shown until answered;
+ *              answer stored once (owner_feature_prompt); full T7 cases in
+ *              owner-features-t7.test.ts;
  *              coming_soon comms.news writes no setting; live fixture applies.
  *   N1         the old Bestillinger routes write the orders.enabled audit row.
  *   escaping   agent name, registry text and query parameters are escaped.
@@ -227,6 +229,7 @@ export async function runOwnerFeaturesS2bTests(opts: { log?: boolean } = {}): Pr
     assertEq([optInCol(OWNED_ID), audits(OWNED_ID).length, batches(OWNED_ID).length, settingsRows(OWNED_ID)], [0, 0, 0, 0],
       "allowlist off: nothing written");
     assertEq((db.prepare("SELECT COUNT(*) AS n FROM owner_feature_intro").get() as any).n, 0, "allowlist off: no intro row");
+    assertEq((db.prepare("SELECT COUNT(*) AS n FROM owner_feature_prompt").get() as any).n, 0, "allowlist off (T7): no prompt row");
 
     // ── Check order ──────────────────────────────────────────────────────────
     assertEq((await page(OWNED_ID, {}, "")).status, 404, "order: allowlist before session (no session, not listed → 404)");
@@ -271,9 +274,15 @@ export async function runOwnerFeaturesS2bTests(opts: { log?: boolean } = {}): Pr
     assertTrue(groupPos.every((p) => p > 0) && groupPos.every((p, i) => i === 0 || p > groupPos[i - 1]), "page: every group with a built entry rendered, in Vedlegg A order");
     assertTrue(reg.OWNER_FEATURE_GROUPS.filter((g) => !builtGroups.includes(g)).every((g) => !b0.includes(`data-group="${g.key}"`)),
       "page (S2e): a group with only planned entries has no card");
-    const shownKeys = reg.OWNER_FEATURE_REGISTRY.filter((e) => !e.advanced).map((e) => e.key).filter((k) => b0.includes(`data-key="${k}"`));
+    // T7: groups in OWNER_FEATURE_GROUPS order, rows in registry order within their group.
+    const groupIdx = (g: string) => reg.OWNER_FEATURE_GROUPS.findIndex((x) => x.key === g);
+    const shownKeys = reg.OWNER_FEATURE_REGISTRY.filter((e) => !e.advanced)
+      .map((e, i) => ({ k: e.key, g: groupIdx(e.group), i }))
+      .sort((a, b) => a.g - b.g || a.i - b.i)
+      .map((x) => x.k)
+      .filter((k) => b0.includes(`data-key="${k}"`));
     const keyPos = shownKeys.map((k) => b0.indexOf(`data-key="${k}"`));
-    assertTrue(keyPos.every((p, i) => i === 0 || p > keyPos[i - 1]), "page: rows in registry order (advanced ones under «Flere valg»)");
+    assertTrue(keyPos.every((p, i) => i === 0 || p > keyPos[i - 1]), "page: rows in registry order within their group (advanced ones under «Flere valg»)");
     // One row: from its <li> to the end of its control column (rows may hold nested lists).
     const row = (b: string, key: string) => {
       const i = b.indexOf(`data-key="${key}"`);
@@ -291,8 +300,11 @@ export async function runOwnerFeaturesS2bTests(opts: { log?: boolean } = {}): Pr
     assertTrue(b0.includes("valg til vises når du slår på «Ta imot bestillinger»"), "page: hidden-rows note");
     assertTrue(!b0.includes("Flere valg"), "page (S2e): no «Flere valg» while no advanced entry is built");
     assertTrue(b0.includes("Slik er du nå") && b0.includes("Hvor aktiv vil du være?"), "page: levels + status line");
-    assertTrue(!b0.includes(`aria-current="true" data-level=`), "page (S2e): no level marked before the owner chose one");
-    assertTrue(b0.includes(`id="velkommen"`), "page: first-login card shown");
+    // T8: the level that applies is computed from the switches — a default owner stands on «Minst mulig».
+    assertTrue(b0.includes(`aria-current="true" data-level="minst_mulig"`) && b0.includes("Du står på standardvalgene. Du trenger ikke gjøre noe.") && !b0.includes("Du har ikke valgt nivå ennå"),
+      "page (T8): a default owner stands on «Minst mulig» («Gjelder nå»), no «Du har ikke valgt nivå ennå»");
+    // T7: no first-login card; the unanswered question stands in #gruppe-comms.
+    assertTrue(!b0.includes(`id="velkommen"`) && b0.includes(`data-news-question="1"`), "page (T7): no first-login card; the news question is shown");
     assertTrue(b0.includes("Ingen endringer ennå."), "page: empty change log");
     const unb = html(await page(UNBADGED_ID));
     assertTrue(row(unb, "orders.enabled").includes("Krever at profilen er verifisert av Rett fra Bonden"), "page: requirement reason (is_verified) shown");
@@ -345,7 +357,8 @@ export async function runOwnerFeaturesS2bTests(opts: { log?: boolean } = {}): Pr
     assertTrue(pAfter.includes("Lagret: «Ta imot bestillinger» er På.") && pAfter.includes(`name="batch" value="${b1[0].id}"`) && pAfter.includes(">Angre<"), "switch: message with «Angre»");
     assertTrue(row(pAfter, "orders.enabled").includes(`class="mv-toast mv-toast-inline`), "switch (T5): the message stands in the row that changed");
     assertTrue(pAfter.includes(`data-key="orders.email"`), "page: orders.* rows revealed once orders are on");
-    assertTrue(!pAfter.includes(`aria-current="true" data-level=`), "level (S2e): a single switch marks no level (only the owner's level choice does)");
+    assertTrue(pAfter.includes(`aria-current="true" data-level="utnytte_mulighetene"`) && pAfter.includes("Valgene dine passer med «Utnytte mulighetene».") && !pAfter.includes("Du valgte"),
+      "level (T8): a single switch gives «Valgene dine passer med …», never «Du valgte» (only the owner's level choice does)");
     const noop = await post(H.sett, OWNED_ID, { key: "orders.enabled", value: "true", confirmed: "1" });
     assertEq([loc(noop).includes("melding=ingen_endring"), audits(OWNED_ID).length, batches(OWNED_ID).length], [true, 1, 1], "switch: no-op writes nothing");
     const cs = await post(H.sett, OWNED_ID, { key: "visibility.leaderboard", value: "false", confirmed: "1" });
@@ -365,33 +378,35 @@ export async function runOwnerFeaturesS2bTests(opts: { log?: boolean } = {}): Pr
     assertEq([loc(u2).includes("melding=angre_umulig"), audits(OWNED_ID).length], [true, 2], "undo: second undo refused, nothing written");
     assertEq(loc(await post(H.angre, OWNED_ID, { batch: "abc" })).includes("melding=angre_umulig"), true, "undo: junk batch id refused");
 
-    // ── Levels (S2e: «Bare synlig» / «Ta imot bestillinger») ────────────────
-    const lv0 = await post(H.niva, OWNED_ID, { level: "ta_imot_bestillinger" });
-    assertEq(loc(lv0), `/eier/${OWNED_ID}/valg?niva=ta_imot_bestillinger#niva-forhandsvis`, "level: unconfirmed → preview panel (T5: inside the level card)");
-    const prev = html(await page(OWNED_ID, { niva: "ta_imot_bestillinger" }));
-    assertTrue(prev.includes("Bytte til «Ta imot bestillinger»?") && prev.includes("<strong>Ta imot bestillinger</strong>: Av → På") && prev.includes("Bekreft «Ta imot bestillinger»"), "level: preview lists the live change");
+    // ── Levels (T8: «Minst mulig» / «Utnytte mulighetene») ──────────────────
+    const lv0 = await post(H.niva, OWNED_ID, { level: "utnytte_mulighetene" });
+    assertEq(loc(lv0), `/eier/${OWNED_ID}/valg?niva=utnytte_mulighetene#niva-forhandsvis`, "level: unconfirmed → preview panel (T5: inside the level card)");
+    const prev = html(await page(OWNED_ID, { niva: "utnytte_mulighetene" }));
+    assertTrue(prev.includes("Bytte til «Utnytte mulighetene»?") && prev.includes("<strong>Ta imot bestillinger</strong>: Av → På") && prev.includes("Bekreft «Utnytte mulighetene»"), "level: preview lists the live change");
     const auditsBefore = audits(OWNED_ID).length;
-    const lv1 = await post(H.niva, OWNED_ID, { level: "ta_imot_bestillinger", confirmed: "1" });
+    const lv1 = await post(H.niva, OWNED_ID, { level: "utnytte_mulighetene", confirmed: "1" });
     const lb = batches(OWNED_ID).at(-1);
-    assertEq([lv1.status, optInCol(OWNED_ID), audits(OWNED_ID).length - auditsBefore, lb.kind, lb.level], [303, 1, 1, "level", "ta_imot_bestillinger"], "level: «Ta imot bestillinger» changes only orders.enabled (live) — one audit row, one level batch");
+    assertEq([lv1.status, optInCol(OWNED_ID), audits(OWNED_ID).length - auditsBefore, lb.kind, lb.level], [303, 1, 1, "level", "utnytte_mulighetene"], "level: «Utnytte mulighetene» changes only orders.enabled (stock check is on by default) — one audit row, one level batch");
     assertEq(settingsRows(OWNED_ID), 0, "level: no setting rows");
-    assertTrue(html(await page(OWNED_ID, { endret: String(lb.id) })).includes("Du har valgt «Ta imot bestillinger». Lagret: «Ta imot bestillinger» er På."), "level: message names the level and the change");
-    const lv2 = await post(H.niva, OWNED_ID, { level: "ta_imot_bestillinger", confirmed: "1" });
+    assertTrue(html(await page(OWNED_ID, { endret: String(lb.id) })).includes("Du har valgt «Utnytte mulighetene». Lagret: «Ta imot bestillinger» er På."), "level: message names the level and the change");
+    const lv2 = await post(H.niva, OWNED_ID, { level: "utnytte_mulighetene", confirmed: "1" });
     assertEq([loc(lv2).includes("melding=niva_valgt"), audits(OWNED_ID).length - auditsBefore], [true, 1], "level: choosing it again changes nothing more");
     const pl = html(await page(OWNED_ID));
-    assertTrue(pl.includes(`aria-current="true" data-level="ta_imot_bestillinger"`), "level: the owner's chosen level is marked");
+    assertTrue(pl.includes(`aria-current="true" data-level="utnytte_mulighetene"`) && pl.includes("Du valgte «Utnytte mulighetene»"), "level: the owner's chosen level is marked, «Du valgte …»");
+    // An old key in the form (alias) is stored as the new key.
     const lv3 = await post(H.niva, OWNED_ID, { level: "bare_synlig", confirmed: "1" });
     const lb3 = batches(OWNED_ID).at(-1);
-    assertEq([lv3.status, optInCol(OWNED_ID), lb3.level, audits(OWNED_ID).length - auditsBefore], [303, 0, "bare_synlig", 2], "level: «Bare synlig» turns orders off");
+    assertEq([lv3.status, optInCol(OWNED_ID), lb3.level, audits(OWNED_ID).length - auditsBefore], [303, 0, "minst_mulig", 2], "level: «Minst mulig» (old key «bare_synlig») turns orders off");
     // Undo a level as one unit.
     const ul = await post(H.angre, OWNED_ID, { batch: String(lb3.id) });
     assertEq([ul.status, optInCol(OWNED_ID), audits(OWNED_ID).length - auditsBefore], [303, 1, 3], "undo: level reverted as one unit");
     assertEq(loc(await post(H.niva, OWNED_ID, { level: "bogus", confirmed: "1" })).includes("melding=ugyldig"), true, "level: unknown level refused");
-    // Unmet requirement: skipped with reason.
-    const lu = await post(H.niva, UNBADGED_ID, { level: "ta_imot_bestillinger", confirmed: "1" });
-    assertEq([loc(lu), optInCol(UNBADGED_ID), audits(UNBADGED_ID).length], [`/eier/${UNBADGED_ID}/valg?melding=hoppet&nokkel=orders.enabled&ved=niva#niva`, 0, 0], "level: unmet requirement → key skipped, nothing written");
+    // Unmet hard requirement (T10: not verified): nothing written, back to the preview.
+    const lu = await post(H.niva, UNBADGED_ID, { level: "utnytte_mulighetene", confirmed: "1" });
+    assertEq([loc(lu), optInCol(UNBADGED_ID), audits(UNBADGED_ID).length, batches(UNBADGED_ID).length], [`/eier/${UNBADGED_ID}/valg?niva=utnytte_mulighetene#niva-forhandsvis`, 0, 0, 0], "level: unmet hard requirement → nothing written, back to the preview (T10)");
     assertTrue(html(await page(UNBADGED_ID, { melding: "hoppet", nokkel: "orders.enabled" })).includes("«Ta imot bestillinger»: Krever at profilen er verifisert"), "level: skipped message carries the Norwegian reason");
-    assertTrue(!html(await page(UNBADGED_ID)).includes(`aria-current="true" data-level=`), "level (S2e): a level that could not apply is not marked as chosen");
+    const pU = html(await page(UNBADGED_ID));
+    assertTrue(!pU.includes(`data-level-status="chosen"`) && !pU.includes(`aria-current="true" data-level="utnytte_mulighetene"`), "level (S2e/T8): a level that could not apply is not marked as chosen");
     // The undo/preview machinery over multi-key presets (fixture levels: the S2b «Aktiv» / «Full fart» presets).
     const FIXTURE_LEVELS: any[] = [
       { key: "bare_synlig", label: { no: "Bare synlig", en: "Just visible" }, description: { no: "x", en: "x" }, recommended: false,
@@ -512,24 +527,28 @@ export async function runOwnerFeaturesS2bTests(opts: { log?: boolean } = {}): Pr
       assertEq((html(await page(LOG_ID, { side: "99" })).match(/Side 2 av 2/g) || []).length, 1, "log: page out of range clamps to the last");
     }
 
-    // ── First-login card ─────────────────────────────────────────────────────
+    // ── «Nyheter og tips» question (T7; the S2b first-login card is gone) ───
     {
       const i1 = await post(H.intro, OWNED_ID, { answer: "yes" });
-      const row1 = db.prepare("SELECT answer, answered_at, actor_detail FROM owner_feature_intro WHERE subject_id = ?").get(OWNED_ID) as any;
-      assertEq([loc(i1).startsWith(`/eier/${OWNED_ID}/valg?endret=`), row1?.answer, row1?.actor_detail], [true, "yes", `post@${OWNED_ID}.example.no`], "intro: «Ja» stored with the session e-mail (S2e: applied to comms.news, with a batch)");
-      assertTrue(/^\d{4}-\d{2}-\d{2}T/.test(String(row1?.answered_at)), "intro: answer time stored (ISO)");
-      assertEq((db.prepare("SELECT value_json, set_by FROM owner_feature_settings WHERE key = 'comms.news' AND subject_id = ?").get(OWNED_ID) as any), { value_json: "true", set_by: "owner" }, "intro (S2e): live comms.news gets the owner's explicit row");
+      const p1 = db.prepare("SELECT state, answered_at, actor_detail FROM owner_feature_prompt WHERE subject_id = ? AND key = 'comms.news'").get(OWNED_ID) as any;
+      assertEq([loc(i1).startsWith(`/eier/${OWNED_ID}/valg?endret=`), p1?.state, p1?.actor_detail], [true, "yes", `post@${OWNED_ID}.example.no`], "intro (T7): «Ja takk» stored with the session e-mail, applied to comms.news with a batch");
+      assertTrue(/^\d{4}-\d{2}-\d{2}T/.test(String(p1?.answered_at)), "intro: answer time stored (ISO)");
+      assertEq((db.prepare("SELECT COUNT(*) AS n FROM owner_feature_intro").get() as any).n, 0, "intro (T7): no owner_feature_intro row is written any more");
+      assertEq((db.prepare("SELECT value_json, set_by FROM owner_feature_settings WHERE key = 'comms.news' AND subject_id = ?").get(OWNED_ID) as any), { value_json: "true", set_by: "owner" }, "intro: live comms.news gets the owner's explicit row");
       const after = html(await page(OWNED_ID));
-      assertTrue(!after.includes(`id="velkommen"`), "intro: card not shown again");
-      await post(H.intro, OWNED_ID, { answer: "no" });
-      assertEq((db.prepare("SELECT answer FROM owner_feature_intro WHERE subject_id = ?").get(OWNED_ID) as any).answer, "yes", "intro: a second answer does not overwrite the first");
+      assertTrue(!after.includes(`data-news-question="1"`), "intro: question not shown again");
+      const second = await post(H.intro, OWNED_ID, { answer: "never" });
+      assertTrue(loc(second).includes("melding=ingen_endring"), "intro (T7): an answer while the question is closed changes nothing");
+      assertEq((db.prepare("SELECT state FROM owner_feature_prompt WHERE subject_id = ?").get(OWNED_ID) as any).state, "yes", "intro: a second answer does not overwrite the first");
       assertEq(loc(await post(H.intro, OTHER_ID, { answer: "kanskje" })).includes("melding=ugyldig"), true, "intro: junk answer refused");
-      assertEq((db.prepare("SELECT COUNT(*) AS n FROM owner_feature_intro WHERE subject_id = ?").get(OTHER_ID) as any).n, 0, "intro: junk answer stores nothing");
-      const R = reg.OWNER_FEATURE_REGISTRY.map((e) => (e.key === "comms.news" ? { ...e, status: "live" as const } : e));
-      const out = ch.answerOwnerIntro("rfb", OTHER_ID, "yes", { actor: "owner", detail: "t" }, { registry: R, db });
-      assertEq([out.stored, out.applied, !!out.batchId], [true, true, true], "intro (live comms.news): «Ja» applied as the explicit choice with a batch");
-      assertEq(rs.resolveOwnerFeature("rfb", OTHER_ID, "comms.news", { registry: R, db }).value, true, "intro (live comms.news): value on");
+      assertEq((db.prepare("SELECT COUNT(*) AS n FROM owner_feature_prompt WHERE subject_id = ?").get(OTHER_ID) as any).n, 0, "intro: junk answer stores nothing");
+      const out = ch.answerOwnerNewsQuestion("rfb", OTHER_ID, "yes", { actor: "owner", detail: "t" }, { db });
+      assertEq(out.kind === "ok" && [out.changed, !!out.batchId], [true, true], "intro (live comms.news): «Ja takk» applied as the explicit choice with a batch");
+      assertEq(rs.resolveOwnerFeature("rfb", OTHER_ID, "comms.news", { db }).value, true, "intro (live comms.news): value on");
       assertEq(audits(OTHER_ID).map((a) => a.key), ["comms.news"], "intro (live comms.news): one audit row");
+      const R = reg.OWNER_FEATURE_REGISTRY.map((e) => (e.key === "comms.news" ? { ...e, status: "coming_soon" as const } : e));
+      const cs = ch.answerOwnerNewsQuestion("rfb", LOG_ID, "yes", { actor: "owner", detail: "t" }, { registry: R, db });
+      assertEq(cs.kind, "not_open", "intro: coming_soon comms.news → no question, nothing written");
     }
 
     // ── Escaping ─────────────────────────────────────────────────────────────
@@ -581,7 +600,7 @@ export async function runOwnerFeaturesS2bTests(opts: { log?: boolean } = {}): Pr
       try {
         db.prepare("INSERT INTO owner_feature_intro (vertical, subject_id, answer, answered_at) VALUES ('rfb', 'z', 'maybe', 'x')").run();
       } catch { threw = true; }
-      assertTrue(threw, "schema: intro answer CHECK");
+      assertTrue(threw, "schema: intro answer CHECK (the S2b table is kept)");
       threw = false;
       try {
         db.prepare("INSERT INTO owner_feature_change_batch (vertical, subject_id, kind, first_audit_id, last_audit_id, created_at) VALUES ('rfb', 'z', 'bogus', 1, 1, 'x')").run();
