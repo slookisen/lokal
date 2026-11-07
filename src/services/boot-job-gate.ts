@@ -42,6 +42,10 @@ export const EXPERIENCES_GEOCODE_BOOT_DELAY_MS = 6 * 60 * 1000;
  *  a few small HTTPS calls in the free slot before the 3 min geocode. It waits for runExclusiveBootJob,
  *  then makes the calls outside the gate (network waits, almost no CPU). */
 export const SEARCH_CONSOLE_BOOT_DELAY_MS = 2 * 60 * 1000;
+/** First check of the weekly AI citation panel (services/ai-citation/panel-job.ts, A2A
+ *  2026-10-16-siteringspanel), well after every boot job above; behind AI_CITATION_PANEL_ENABLED.
+ *  Like the GSC/Bing check it waits for runExclusiveBootJob, then makes its calls outside the gate. */
+export const AI_CITATION_PANEL_BOOT_DELAY_MS = 15 * 60 * 1000;
 
 /** Resolve on the next macrotask so queued I/O and timers can run. */
 export function yieldToEventLoop(): Promise<void> {
