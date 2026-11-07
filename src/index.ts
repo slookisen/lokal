@@ -44,6 +44,7 @@ import opplevelserRoutes from "./routes/opplevelser";
 import mcpRoutes from "./routes/mcp";
 import { mcpIpEmergencyBrakeLimiter, mcpPrimaryLimiter, mcpCartToolLimiter } from "./middleware/mcp-rate-limit";
 import { installClientIp, resolveClientIpConfig } from "./middleware/client-ip";
+import { installClientHeaders, resolveClientHeadersConfig } from "./middleware/client-headers";
 import seoRoutes from "./routes/seo";
 import discoveryRoutes from "./routes/discovery";
 import conversationUiRoutes from "./routes/conversation-ui";
@@ -249,6 +250,12 @@ const PORT = process.env.PORT || 3000;
 // (Fly-Client-IP would be the CDN's address): revise middleware/client-ip.ts
 // BEFORE any such DNS switch.
 installClientIp(app, resolveClientIpConfig(process.env));
+// Trinn 3: drop the client-supplied X-Forwarded-Host (req.hostname then comes
+// from Host) and take X-Forwarded-Proto from fly-forwarded-proto (http|https
+// only). Directly after installClientIp, so it runs before the www redirect,
+// the host gates, the vertical resolution and analytics read req.hostname /
+// req.protocol. CLIENT_HEADERS_NORMALIZE=off is the rollback; off Fly = no-op.
+installClientHeaders(app, resolveClientHeadersConfig(process.env));
 
 // ─── Event-loop stall monitor (dev-request 2026-09-19-prod-event-loop-stall-
 // mcp-unhealthy) ────────────────────────────────────────────────
