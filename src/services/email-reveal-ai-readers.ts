@@ -103,8 +103,15 @@ export const POSITIVE_TTL_MS = 24 * 60 * 60_000;
 export const NEGATIVE_TTL_MS = 60 * 60_000;
 export const ERROR_TTL_MS = 10 * 60_000;
 export const MAX_CACHE = 10_000;
+/**
+ * Background verifications running at once. Each slot can issue up to ~4
+ * c-ares queries (1 PTR + up to MAX_PTR_NAMES = 3 forward A/AAAA), each with
+ * its own resolver timeout (VERIFY_TIMEOUT_MS), so real concurrent DNS work
+ * is bounded at about 4 × MAX_IN_FLIGHT queries; the overall per-slot
+ * timeout frees the slot after VERIFY_TIMEOUT_MS even if queries linger.
+ */
 export const MAX_IN_FLIGHT = 50;
-/** PTR hostnames forward-checked per IP. */
+/** PTR hostnames forward-checked per IP (counted among the names inside the operator's domains). */
 const MAX_PTR_NAMES = 3;
 
 /** The real resolver: c-ares (non-blocking, no libuv threadpool), one try per query. */

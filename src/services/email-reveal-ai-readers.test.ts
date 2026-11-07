@@ -7,6 +7,7 @@
  *   F   forward-confirmed reverse DNS with a fake resolver (PTR domain, forward match)
  *   V   the verifier: miss → false + background lookup, dedup, positive/negative/error
  *       cache with TTLs, timeout, bounds
+ *   D   emailRevealLimitFor directly: CCBot from a verified IP -> base
  *   G   through revealEmailFor: verified Googlebot gets the higher limit after the
  *       lookup; spoofed UA stays at base; CCBot never; switch off → no DNS at all;
  *       ip_list operators make no lookup; one log line without the IP
@@ -32,6 +33,7 @@ import {
   EMAIL_REVEAL_MAX_LIMIT,
   emailRevealAiReaderLimit,
   emailRevealBaseLimit,
+  emailRevealLimitFor,
   revealEmailFor,
   __emailRevealAiReadersSettledForTesting,
   __resetEmailRevealGuardForTesting,
@@ -76,8 +78,24 @@ const googleRecords: Records = {
     "203.0.113.66": ["crawl.googlebot.com.evil.example"], // PTR not in the domain
     "203.0.113.67": [GOOGLE_HOST], // PTR claims Google, forward lookup says otherwise
     "157.55.39.1": ["msnbot-157-55-39-1.search.msn.com"],
+    "203.0.113.80": ["crawl.evilgooglebot.com"], // ends in "googlebot.com" but not ".googlebot.com"
+    "203.0.113.81": ["googlebot.com"], // the bare domain itself, not a host under it
+    // four in-domain names; only the 4th forward-confirms (MAX_PTR_NAMES = 3)
+    "203.0.113.82": ["a.googlebot.com", "b.googlebot.com", "c.googlebot.com", "d.googlebot.com"],
+    // control: the same IP's confirming name within the first three
+    "203.0.113.83": ["a.googlebot.com", "e.googlebot.com"],
   },
-  a: { [GOOGLE_HOST]: [GOOGLE_IP], "msnbot-157-55-39-1.search.msn.com": ["157.55.39.1"] },
+  a: {
+    [GOOGLE_HOST]: [GOOGLE_IP],
+    "msnbot-157-55-39-1.search.msn.com": ["157.55.39.1"],
+    "crawl.evilgooglebot.com": ["203.0.113.80"],
+    "googlebot.com": ["203.0.113.81"],
+    "a.googlebot.com": ["192.0.2.250"],
+    "b.googlebot.com": ["192.0.2.251"],
+    "c.googlebot.com": ["192.0.2.252"],
+    "d.googlebot.com": ["203.0.113.82"],
+    "e.googlebot.com": ["203.0.113.83"],
+  },
   aaaa: { [GOOGLE_V6_HOST]: ["2001:4860:4801:10:0:0:0:1"] },
 };
 
@@ -144,6 +162,15 @@ export async function runEmailRevealAiReadersTests(opts: { log?: boolean } = {})
       const before = f.total();
       eq(await forwardConfirmedReverseDns(f.resolver, GOOGLE_IP, AI_READER_REGISTRY.find((e) => e.token === "GPTBot")!), false, "F9: ip_list entry -> false");
       eq(f.total(), before, "F10: ... with no DNS call");
+      eq(await forwardConfirmedReverseDns(f.resolver, "203.0.113.80", googlebot), false,
+        "F12: PTR crawl.evilgooglebot.com (forward-confirmed) -> not verified: the domain must follow a dot");
+      eq(await forwardConfirmedReverseDns(f.resolver, "203.0.113.81", googlebot), false,
+        "F13: PTR = the bare domain googlebot.com (forward-confirmed) -> not verified: a host under the domain is required");
+      const fc = f.calls.resolve4;
+      eq(await forwardConfirmedReverseDns(f.resolver, "203.0.113.82", googlebot), false,
+        "F14: four in-domain PTR names, only the 4th confirms -> not verified (MAX_PTR_NAMES = 3)");
+      eq(f.calls.resolve4 - fc, 3, "F15: ... and only three forward lookups were made");
+      eq(await forwardConfirmedReverseDns(f.resolver, "203.0.113.83", googlebot), true, "F16: control: a confirming name within the first three -> verified");
       const bad = fakeResolver(googleRecords, { fail: true });
       let threw = false;
       try { await forwardConfirmedReverseDns(bad.resolver, GOOGLE_IP, googlebot); } catch { threw = true; }
@@ -184,6 +211,19 @@ export async function runEmailRevealAiReadersTests(opts: { log?: boolean } = {})
       v.isVerified("203.0.113.67", googlebot);
       eq(v.inFlightSize(), 1, "V14: after 1 h it is tried again");
       await v.settled();
+    }
+    {
+      // N1: the cache key includes the operator.
+      const f = fakeResolver(googleRecords);
+      const v = new AiReaderVerifier({ resolver: f.resolver });
+      const bingEntry = AI_READER_REGISTRY.find((e) => e.token === "bingbot")!;
+      v.isVerified(GOOGLE_IP, googlebot);
+      await v.settled();
+      eq(v.isVerified(GOOGLE_IP, googlebot), true, "V7c: Google IP verified for Google");
+      eq(v.isVerified(GOOGLE_IP, bingEntry), false, "V7d: the same IP with a bingbot UA is not verified for bing (key = IP + operator)");
+      await v.settled();
+      eq([f.calls.reverse, v.isVerified(GOOGLE_IP, bingEntry), v.isVerified(GOOGLE_IP, googlebot)], [2, false, true],
+        "V7e: ... bing got its own lookup (PTR is googlebot.com -> not verified), Google stays verified");
     }
     {
       let t = 2_000_000;
@@ -275,6 +315,21 @@ export async function runEmailRevealAiReadersTests(opts: { log?: boolean } = {})
       t += 61 * 60_000;
       eq(revealEmailFor(req(GOOGLE_IP, GOOGLEBOT_UA), "dental", ids("n", 12))?.size, 10, "G19: an hour later the verified reader still gets 10 (cache, no new lookup)");
       eq(f.calls.reverse, 3, "G20: total PTR lookups: Google once + two spoofers");
+    }
+
+    // ── D: emailRevealLimitFor directly ──────────────────────────────────
+    {
+      const f = fakeResolver(googleRecords);
+      __resetEmailRevealGuardForTesting({ log: () => {}, aiReaders: { resolver: f.resolver } });
+      process.env.EMAIL_REVEAL_AI_READER_PER_HOUR = "300";
+      const req = (ip: string, ua: string) => ({ ip, headers: { "user-agent": ua } }) as any;
+      emailRevealLimitFor(req(GOOGLE_IP, GOOGLEBOT_UA), "dental", 30);
+      await __emailRevealAiReadersSettledForTesting();
+      eq(emailRevealLimitFor(req(GOOGLE_IP, GOOGLEBOT_UA), "dental", 30), 300, "D1: control: verified Googlebot IP -> the AI-reader limit");
+      const before = f.total();
+      eq(emailRevealLimitFor(req(GOOGLE_IP, "CCBot/2.0 " + GOOGLEBOT_UA), "dental", 30), 30, "D2: CCBot UA from the verified IP -> base limit");
+      eq(emailRevealLimitFor(req(GOOGLE_IP, "ccbot"), "dental", 30), 30, "D3: lower-case ccbot -> base limit");
+      eq(f.total(), before, "D4: ... with no DNS lookup");
     }
   } catch (err: any) {
     failed++;
