@@ -72,7 +72,7 @@
  * the same rfb counter via emailWithheldIds: GET /api/marketplace/agents/:id
  * /card, /info and /vcard, the contact blocks of POST /discover and GET
  * /search, contact_handoffs of POST /cart/:id/submit (routes/marketplace.ts,
- * routes/marketplace-cart.ts), and A2A GET /agents/:id/agent.json and
+ * routes/marketplace-cart.ts), and the A2A per-producer card (x-knowledge) and
  * agent/info (routes/a2a.ts). The RFB MCP answers are not wired yet.
  *
  * Not yet: S-A2 (verified AI readers via reverse DNS — hook:
