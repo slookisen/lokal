@@ -52825,3 +52825,23 @@ runSerial(async () => {
     failures.push("opplevagent-tool-metadata: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-02-dental-permanent-triage-needs-review-drain, slice 3c-1:
+// the deterministic dental-triage job + POST /admin/dental/triage/{dry-run,run}.
+// Own in-memory dental/main DBs, swaps ADMIN_KEY / DENTAL_TRIAGE_JOB_ENABLED
+// (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dental-triage: needs_review-drenering (skive 3c-1) ──");
+  try {
+    const { runDentalTriageTests } = require("../src/services/dental-triage.test") as
+      typeof import("../src/services/dental-triage.test");
+    const r = await runDentalTriageTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("dental-triage: " + f);
+    console.log(`  dental-triage: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-triage: unexpected error: " + String(err?.message || err));
+  }
+});
