@@ -415,15 +415,16 @@ export async function runRfbSeoFeiltypedeKnowledgeFeltTests(opts: { log?: boolea
       // The whole inline script as on main, held as its SHA-256 (it is ~4 KB):
       // a legitimate edit of the script's JavaScript changes these hashes too,
       // so take new ones from main then (S1 2026-10-25: «Med i AI-søk» strings;
-      // statistikk S2c 2026-10-26: the tiles read s.year and its labels).
+      // statistikk S2c 2026-10-26: the tiles read s.year and its labels;
+      // «Klikk fra AI-svar» S4 2026-11-06: landing capture + aiAttrInto beacon).
       // The server-written lines are spelled
       // out below so a failure shows which value moved.
       const scriptOf = (body: string): string => scriptElements(body).find((e) => e.content.includes("var agentId"))?.content ?? "";
       const sha256 = (s: string): string => createHash("sha256").update(s, "utf8").digest("hex");
       const no = scriptOf(producer("uuid-gard").body);
       const en = scriptOf(producer("uuid-gard", "en").body);
-      assertEq(sha256(no), "6cc804c49fe381a9d482c6719fd9ae49f44a796644ba35cac72cf6a19d3de685", "b inline script no: byte-identical to main for a UUID id (sha256)");
-      assertEq(sha256(en), "e8f5a0524a9ea2b6873eb9f023912ce7cd5a719d2b33fbf826afcaa83a16f829", "b inline script en: byte-identical to main, language strings included (sha256)");
+      assertEq(sha256(no), "c86703b25296d46217888fba535b594343910938295d1485e467363022f08d5f", "b inline script no: byte-identical to main for a UUID id (sha256)");
+      assertEq(sha256(en), "703d736ae942f5733b63914df5b39071af8f9ad464dfb8b5749fb01ee66158df", "b inline script en: byte-identical to main, language strings included (sha256)");
       assertTrue(no.includes(`var agentId = "${UUID}";`) && en.includes(`var agentId = "${UUID}";`), "b inline script: agentId is the plain JSON string for a UUID");
       assertTrue(no.includes('toLocaleString("nb-NO")') && no.includes('parts.push("Annet" + " " + b.other)') && no.includes('"ganger profilen var blant treffene en AI-assistent hentet · " + lb.aiDeliveries') && no.includes('y.labels["nb"]'),
         "b inline script no: Norwegian language strings as before");
