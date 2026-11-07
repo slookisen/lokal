@@ -42812,6 +42812,26 @@ runSerial(async () => {
   }
 });
 
+// ── dev-request 2026-10-10-rfb-verifier-kapasitet-til-fulle-profiler:
+// verified slots only for rows that need a re-check, full profiles first in
+// pending_verify/review_required, Brreg lookup in the sweep, slot claims.
+// Own in-memory DB (swaps getDb()) — runSerial like the suite above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-10: verifier capacity to full profiles ──");
+  try {
+    const { runLokalAgentVerifierCapacityTests } = require("../src/agents/lokal-agent-verifier-capacity.test") as
+      typeof import("../src/agents/lokal-agent-verifier-capacity.test");
+    const rs = await runLokalAgentVerifierCapacityTests({ log: false });
+    passed += rs.passed;
+    failed += rs.failed;
+    for (const f of rs.failures) failures.push("verifier-capacity: " + f);
+    console.log(`  verifier-capacity: ${rs.passed} passed, ${rs.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("verifier-capacity: unexpected error: " + String(err?.stack || err?.message || err));
+  }
+});
+
 // ── orch-pr-20260905-dental-verifier-canary: admin-key-gated canary trigger
 // route for the dental verifier (POST /admin/run-dental-verifier). Mutates
 // process.env.ADMIN_KEY/ANALYTICS_ADMIN_KEY and the route's own

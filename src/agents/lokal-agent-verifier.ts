@@ -17,7 +17,7 @@
 //
 // Reference: PHASE5-ENRICHMENT-REORG.md §8 + WO #8.
 
-import { getDb } from "../database/init";
+import { getDb, POOL_CONTENT_THRESHOLD_SQL } from "../database/init";
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: the batch
 // pickers below never select the catalog_hidden test fixture — its cross-check
 // status is owned by POST /admin/test-producer, and a verifier pass would
@@ -139,6 +139,10 @@ export interface VerifierResult {
   // real transition, which `passed` (basic-gate-pass, independent of the
   // stricter cross-source/domain-coherence/email-ownership guards) cannot.
   prior_verification_status: string;
+  // dev-request 2026-10-10-rfb-verifier-kapasitet-til-fulle-profiler (point
+  // 5): which slot pickBatchBiased gave this row. Only set when the row came
+  // from pickBatchBiased; absent for every other picker.
+  pick_slot?: VerifierPickSlot;
 }
 
 export interface BrregLookupResult {
@@ -729,6 +733,9 @@ export function countPendingVerify(db: any): number {
 //   - growthCount = Math.floor(limit * growthRatio)   (default 21 of 30)
 //   - verifiedCount = limit - growthCount             (default 9 of 30)
 //   - verified sub-query: WHERE verification_status = 'verified'
+//   (2026-10-10-rfb-verifier-kapasitet-til-fulle-profiler: verifiedCount is
+//   now a cap, filled only by verified rows that need a re-check; the rest
+//   goes to growth — see the block just above pickBatchBiased.)
 //
 // orch-pr-20260704-poolfix: 'unverified' (the agent_knowledge column
 // DEFAULT for brand-new rows, see database/init.ts) added to the growth
@@ -764,28 +771,226 @@ export function countPendingVerify(db: any): number {
 // Fall-back: if the growth or verified bucket (after its own internal
 // backfill, for growth) returns fewer rows than its target, the deficit
 // is filled from the OTHER bucket so the caller always gets up to
-// `limit` candidates when any exist. This cross-bucket fall-back is
-// UNCHANGED from before.
+// `limit` candidates when any exist.
 //
 // opt_out agents are always excluded (matches pickBatch).
+// ── dev-request 2026-10-10-rfb-verifier-kapasitet-til-fulle-profiler ──────
+//
+// Spec point 1 (verified slots): a verified slot only goes to a verified row
+// that needs a re-check (verifiedRecheckNeededSql below). The verified share
+// is now a CAP (limit - floor(limit * growthRatio), default 9 of 30), not a
+// fixed quota: slots that no verified row needs go to the growth rows.
+//
+// Spec point 2 (order inside pending_verify / review_required): rows with a
+// full profile (isFullProfileForVerifierRanking) come first. To keep the
+// 2026-08-10 round-robin rule, the ranking only reorders a LOOKAHEAD window at
+// the head of the existing round-robin ORDER (the next
+// FULL_PROFILE_RANKING_LOOKAHEAD rows in rotation): a full-profile row can be
+// picked earlier than its turn, but once processed its sweep_processed_at
+// sends it to the back of the rotation like any other row, so no row is
+// picked again and again and rows without a full profile still reach the
+// head of the queue. A full-profile row swept within the last
+// FULL_PROFILE_RANKING_MIN_AGE_HOURS is not boosted, so a cohort smaller than
+// the lookahead (review_required) cannot re-pick its full profiles each run.
+//
+// Spec point 5 (visibility): every row pickBatchBiased returns carries
+// `pick_slot` (VerifierPickSlot); runVerifierBatch copies it onto the result
+// and buildRunEnvelope counts it into the run-ledger claims.
+
+export type VerifierPickSlot =
+  | "verified_recheck"     // verified row that needs a re-check (point 1)
+  | "verified_fill"        // verified row picked only because growth ran out
+  | "growth_full_profile"  // growth row with a full profile (point 2)
+  | "growth_other";        // any other growth row
+
+// How many rows at the head of the round-robin queue the full-profile ranking
+// may reorder, per status (pending_verify, review_required).
+export const FULL_PROFILE_RANKING_LOOKAHEAD = 120;
+// A full-profile row processed less than this long ago gets no boost: it keeps
+// its round-robin place (at most one boosted pass per row per 3 days).
+export const FULL_PROFILE_RANKING_MIN_AGE_HOURS = 72;
+
+// A verified row whose URL probe will be older than the pool's 30-day limit
+// within this many days counts as "needs a re-check" (pool rule:
+// url_last_probed > now-30d in the outreach_ready_pool VIEW).
+export const VERIFIED_RECHECK_URL_MAX_AGE_DAYS = 30;
+export const VERIFIED_RECHECK_URL_LEAD_DAYS = 7;
+
+// A verified row whose second contact is due within this many days counts as
+// "needs a re-check".
+export const VERIFIED_RECHECK_SECOND_TOUCH_LEAD_DAYS = 14;
+
+// Same value as resolveRfbMarketingGateCooldownDays() in
+// services/rfb-marketing-daily.ts (the cooldown mode=second waits after the
+// last send before the next contact). Mirrored, not imported, because
+// rfb-marketing-daily.ts imports this file; a unit test asserts they agree.
+export function verifierSecondTouchCooldownDays(): number {
+  const sendPathCooldown = Math.max(1, parseInt(String(process.env.OUTREACH_COOLDOWN_DAYS ?? "60"), 10) || 60);
+  return Math.max(60, sendPathCooldown);
+}
+
+// Same value as OUTREACH_MAX_TOUCH_VERN_DEFAULT_THRESHOLD
+// (services/outreach-max-touch-vern.ts): a row with this many sends gets no
+// further contact, so no "second contact due" re-check either.
+const VERIFIED_RECHECK_MAX_SENDS = 3;
+
+function sqliteTableExists(db: any, name: string): boolean {
+  try {
+    return !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = ?`).get(name);
+  } catch {
+    return false;
+  }
+}
+
+function sqliteColumnExists(db: any, table: string, column: string): boolean {
+  try {
+    return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).some((c) => c.name === column);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * SQL predicate (aliases a = agents, k = agent_knowledge) for "this verified
+ * row needs a re-check" — spec point 1. True when ANY of:
+ *   (a) URL check about to go stale: url_last_probed is NULL or older than
+ *       30 - 7 = 23 days (the pool drops a row at 30 days);
+ *   (b) flagged: last HTTP check failed (>= 400), last URL probe not 2xx/3xx,
+ *       homepage parked as unreachable, or a Brreg flag that disqualifies
+ *       (dissolved / bankrupt / wrong_nace);
+ *   (c) in or entering the pool: email set, enrichment rich/partial, content
+ *       over POOL_CONTENT_THRESHOLD_SQL, and no RFB send yet — the
+ *       outreach_ready_pool VIEW's own conditions, minus the URL freshness
+ *       that this re-check is there to renew;
+ *   (d) second contact due within 14 days: 1-2 earlier sends (by agent id or
+ *       recipient e-mail, any vertical — the same keys mode=second uses) and
+ *       the latest one at least (cooldown - 14) days ago.
+ * Clauses whose table/column is missing (minimal test schemas) are left out.
+ */
+export function verifiedRecheckNeededSql(db: any): string {
+  const clauses: string[] = [];
+  const hasK = (c: string) => sqliteColumnExists(db, "agent_knowledge", c);
+
+  if (hasK("url_last_probed")) {
+    const days = VERIFIED_RECHECK_URL_MAX_AGE_DAYS - VERIFIED_RECHECK_URL_LEAD_DAYS;
+    clauses.push(`(k.url_last_probed IS NULL OR datetime(k.url_last_probed) <= datetime('now', '-${days} days'))`);
+  }
+
+  if (hasK("last_http_status")) clauses.push(`(k.last_http_status IS NOT NULL AND k.last_http_status >= 400)`);
+  if (hasK("url_last_status")) {
+    clauses.push(`(k.url_last_status IS NOT NULL AND (k.url_last_status < 200 OR k.url_last_status >= 400))`);
+  }
+  if (hasK("homepage_unreachable_since")) clauses.push(`k.homepage_unreachable_since IS NOT NULL`);
+  if (sqliteColumnExists(db, "agents", "brreg_flag")) {
+    clauses.push(`a.brreg_flag IN ('dissolved', 'bankrupt', 'wrong_nace')`);
+  }
+
+  const hasSentLog = sqliteTableExists(db, "outreach_sent_log");
+  const hasRecipient = hasSentLog && sqliteColumnExists(db, "outreach_sent_log", "recipient_email");
+  const hasVertical = hasSentLog && sqliteColumnExists(db, "outreach_sent_log", "vertical_id");
+  const sentMatch = (o: string) =>
+    hasRecipient
+      ? `(${o}.agent_id = a.id OR (${o}.recipient_email IS NOT NULL AND ${o}.recipient_email = LOWER(k.email)))`
+      : `${o}.agent_id = a.id`;
+
+  if (hasK("enrichment_status") && hasK("about") && hasK("products")) {
+    const notSent = hasSentLog
+      ? ` AND NOT EXISTS (SELECT 1 FROM outreach_sent_log o WHERE ${hasVertical ? "o.vertical_id = 'rfb' AND " : ""}${sentMatch("o")})`
+      : "";
+    clauses.push(
+      `(k.email IS NOT NULL AND k.email != '' AND k.enrichment_status IN ('rich', 'partial') AND ${POOL_CONTENT_THRESHOLD_SQL}${notSent})`
+    );
+  }
+
+  if (hasSentLog) {
+    const dueAfterDays = Math.max(0, verifierSecondTouchCooldownDays() - VERIFIED_RECHECK_SECOND_TOUCH_LEAD_DAYS);
+    clauses.push(
+      `((SELECT COUNT(*) FROM outreach_sent_log o2 WHERE ${sentMatch("o2")}) BETWEEN 1 AND ${VERIFIED_RECHECK_MAX_SENDS - 1}` +
+      ` AND (SELECT MAX(datetime(o3.sent_at)) FROM outreach_sent_log o3 WHERE ${sentMatch("o3")}) <= datetime('now', '-${dueAfterDays} days'))`
+    );
+  }
+
+  return clauses.length > 0 ? `(${clauses.join(" OR ")})` : "0";
+}
+
+// Lazy: routes/admin-outreach-candidates.ts pulls in route modules; loading it
+// only when the ranking runs keeps it out of this file's import graph.
+function productsAreOnlyCategoryNames(products: unknown): boolean {
+  const json = typeof products === "string" ? products : JSON.stringify(products ?? []);
+  const mod = require("../routes/admin-outreach-candidates") as typeof import("../routes/admin-outreach-candidates");
+  return mod.productsAreGenericCategoryNames(json);
+}
+
+/**
+ * "Full profile" for the verifier's growth-row ranking (spec point 2). Uses
+ * the gate's own helpers, not a copy:
+ *   - website set (k.website);
+ *   - e-mail on the site's domain or a free-mail address —
+ *     computeKvalitetsGate's reasons.email_own_domain (incl. its cross-TLD
+ *     homepage branch);
+ *   - content over the threshold — computeKvalitetsGate's
+ *     reasons.content_threshold — and products that are not only category
+ *     names (productsAreGenericCategoryNames, the outreach gate's
+ *     generic_products_only check);
+ *   - address backed by at least two agreeing non-inference Tier A/B sources
+ *     (or an owner source) — crossSourceAgreement(…, "address").verdict ===
+ *     "pool_eligible", the same check runVerifierBatch applies.
+ * The HTTP check is not known before the run, so the gate is called with a
+ * placeholder 200 and only the reasons above are read. Phone is NOT used.
+ */
+export function isFullProfileForVerifierRanking(row: {
+  name?: string | null;
+  email?: string | null;
+  website?: string | null;
+  about?: string | null;
+  products?: unknown;
+  field_provenance?: unknown;
+}): boolean {
+  try {
+    const website = (row.website ?? "").trim();
+    const email = (row.email ?? "").trim();
+    if (!website || !email) return false;
+
+    const gate = computeKvalitetsGate({
+      http_status: 200,
+      email,
+      website,
+      about: row.about ?? null,
+      products: parseProducts(row.products),
+      brreg: null,
+      field_provenance: row.field_provenance,
+    });
+    if (!gate.reasons.email_own_domain || !gate.reasons.content_threshold) return false;
+    if (productsAreOnlyCategoryNames(row.products)) return false;
+
+    let fieldProv: Record<string, unknown> = {};
+    const raw = row.field_provenance;
+    if (typeof raw === "string") fieldProv = JSON.parse(raw || "{}");
+    else if (raw && typeof raw === "object") fieldProv = raw as Record<string, unknown>;
+    return crossSourceAgreement(fieldProv, "address", { ownName: row.name ?? null }).verdict === "pool_eligible";
+  } catch {
+    return false;
+  }
+}
+
 export function pickBatchBiased(
   db: any,
   limit = 30,
   growthRatio = 0.7
 ): any[] {
-  const growthTarget = Math.floor(limit * growthRatio);
-  const verifiedTarget = limit - growthTarget;
+  const verifiedCap = limit - Math.floor(limit * growthRatio);
 
   const SELECT_COLS = `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city, a.is_verified,
               k.email, k.phone, k.address,
               k.website, k.about, k.products, k.field_provenance,
               k.verification_status, k.enrichment_status,
-              k.last_verified_at, k.last_http_check_at, k.last_http_status
+              k.last_verified_at, k.last_http_check_at, k.last_http_status,
+              k.sweep_processed_at
          FROM agents a
    INNER JOIN agent_knowledge k ON k.agent_id = a.id${catalogHiddenIdExclusionSql(db, "a")}`;
   // (The catalog_hidden exclusion — "" when there is no hidden row — sits in
   // the INNER JOIN's ON clause: for an inner join that is the same as a WHERE
-  // term, and it reaches all five queries below through this shared prefix.)
+  // term, and it reaches every query below through this shared prefix.)
 
   // ── Round-robin ordering (dev-request 2026-08-10-verifier-portkjede-og-
   // provenansrydding, skive F — Daniel: «Unngå å kjøre gjennom de samme
@@ -809,9 +1014,28 @@ export function pickBatchBiased(
   // guaranteed before any agent repeats. The dead-URL priority is preserved
   // as a TIE-BREAK among agents with equal sweep recency, so it still front-
   // loads broken sites within a round without being able to starve a round.
-  const ORDER = `ORDER BY COALESCE(k.sweep_processed_at, '1970-01-01') ASC,
+  const ORDER_KEYS = `COALESCE(k.sweep_processed_at, '1970-01-01') ASC,
               CASE WHEN k.last_http_status >= 400 THEN 0 ELSE 1 END,
               COALESCE(k.last_verified_at, '1970-01-01') ASC`;
+  const ORDER = `ORDER BY ${ORDER_KEYS}`;
+
+  const recheckSql = verifiedRecheckNeededSql(db);
+
+  // ── Verified slots first (spec point 1): only rows that need a re-check,
+  // up to the cap. Whatever the cap leaves unused goes to growth below.
+  const verifiedRows: any[] = verifiedCap > 0
+    ? db.prepare(
+        `${SELECT_COLS}
+          WHERE ${RFB_VERIFIER_SCOPE_SQL}
+          AND k.verification_status = 'verified'
+          AND ${recheckSql}
+          ${ORDER}
+          LIMIT ?`
+      ).all(verifiedCap)
+    : [];
+  for (const r of verifiedRows) r.pick_slot = "verified_recheck" as VerifierPickSlot;
+
+  const growthTarget = limit - verifiedRows.length;
 
   // Priority order matters: statuses earlier in this list get the
   // "remainder" slots when growthTarget doesn't divide evenly by 4.
@@ -819,93 +1043,108 @@ export function pickBatchBiased(
   // priority since they're the ones that were starved by the old
   // pooled-query behaviour.
   const GROWTH_STATUSES = ['pending_verify', 'review_required', 'unverified', 'data_insufficient'];
+  // Spec point 2: full-profile-first ranking applies to these two statuses.
+  const RANKED_STATUSES = new Set(['pending_verify', 'review_required']);
 
   const perStatusBase = Math.floor(growthTarget / GROWTH_STATUSES.length);
   const perStatusRemainder = growthTarget % GROWTH_STATUSES.length;
+
+  const tagGrowth = (r: any): any => {
+    if (r._full_profile === undefined) r._full_profile = isFullProfileForVerifierRanking(r);
+    r.pick_slot = (r._full_profile ? "growth_full_profile" : "growth_other") as VerifierPickSlot;
+    delete r._full_profile;
+    return r;
+  };
 
   const growthRows: any[] = [];
   const growthHaveIds = new Set<string>();
   GROWTH_STATUSES.forEach((status, idx) => {
     const quota = perStatusBase + (idx < perStatusRemainder ? 1 : 0);
     if (quota <= 0) return;
-    const rows = db.prepare(
+    const ranked = RANKED_STATUSES.has(status);
+    let rows: any[] = db.prepare(
       `${SELECT_COLS}
         WHERE ${RFB_VERIFIER_SCOPE_SQL}
           AND k.verification_status = ?
         ${ORDER}
         LIMIT ?`
-    ).all(status, quota);
+    ).all(status, ranked ? Math.max(quota, FULL_PROFILE_RANKING_LOOKAHEAD) : quota);
+    if (ranked) {
+      // Stable: boosted full profiles first, otherwise the round-robin ORDER
+      // as is. A full profile processed within the last
+      // FULL_PROFILE_RANKING_MIN_AGE_HOURS is not boosted (keeps its
+      // round-robin place), so a small cohort that fits inside the lookahead
+      // window cannot have its full profiles re-picked on every run.
+      const boostBefore = Date.now() - FULL_PROFILE_RANKING_MIN_AGE_HOURS * 3600_000;
+      rows = rows
+        .map((r, i) => {
+          r._full_profile = isFullProfileForVerifierRanking(r);
+          const swept = r.sweep_processed_at ? Date.parse(String(r.sweep_processed_at)) : NaN;
+          const boost = r._full_profile && (Number.isNaN(swept) || swept <= boostBefore);
+          return { r, i, boost };
+        })
+        .sort((x, y) => Number(y.boost) - Number(x.boost) || x.i - y.i)
+        .slice(0, quota)
+        .map((x) => x.r);
+    }
     for (const r of rows) {
-      growthRows.push(r);
+      growthRows.push(tagGrowth(r));
       growthHaveIds.add(r.id);
     }
   });
 
   // Per-status quotas can come up short (a cohort simply doesn't have
   // enough rows) — backfill the shortfall from the combined 4-status
-  // pool, excluding ids already selected. Same backfill idiom as the
-  // growth/verified cross-bucket fall-back further below: over-fetch to
+  // pool, excluding ids already selected: over-fetch to
   // (already-have + shortfall) = growthTarget, filter dupes, slice to
   // the shortfall.
   const growthQuotaShortfall = growthTarget - growthRows.length;
   if (growthQuotaShortfall > 0) {
-    let growthBackfill = db.prepare(
+    const growthBackfill = (db.prepare(
       `${SELECT_COLS}
         WHERE ${RFB_VERIFIER_SCOPE_SQL}
           AND k.verification_status IN ('pending_verify', 'review_required', 'unverified', 'data_insufficient')
         ${ORDER}
         LIMIT ?`
-    ).all(growthTarget);
-    growthBackfill = growthBackfill
+    ).all(growthTarget) as any[])
       .filter((r: any) => !growthHaveIds.has(r.id))
       .slice(0, growthQuotaShortfall);
     for (const r of growthBackfill) {
-      growthRows.push(r);
+      growthRows.push(tagGrowth(r));
       growthHaveIds.add(r.id);
     }
   }
 
-  const verifiedRows = verifiedTarget > 0
-    ? db.prepare(
-        `${SELECT_COLS}
-          WHERE ${RFB_VERIFIER_SCOPE_SQL}
-          AND k.verification_status = 'verified'
-          ${ORDER}
-          LIMIT ?`
-      ).all(verifiedTarget)
-    : [];
-
-  // Fall-back: backfill from the other bucket if one came up short.
+  // Fall-back: growth ran out → fill the rest with verified rows, the ones
+  // that need a re-check first (none of those are left if the cap was not
+  // reached, but the cap may have stopped them), then any verified row.
   const growthDeficit = growthTarget - growthRows.length;
-  const verifiedDeficit = verifiedTarget - verifiedRows.length;
-
   let extraVerified: any[] = [];
   if (growthDeficit > 0) {
-    extraVerified = db.prepare(
+    const haveIds = new Set(verifiedRows.map((r: any) => r.id));
+    extraVerified = (db.prepare(
       `${SELECT_COLS}
         WHERE ${RFB_VERIFIER_SCOPE_SQL}
           AND k.verification_status = 'verified'
-        ${ORDER}
+        ORDER BY CASE WHEN ${recheckSql} THEN 0 ELSE 1 END, ${ORDER_KEYS}
         LIMIT ?`
-    ).all(verifiedTarget + growthDeficit);
-    // Strip the rows we already have to avoid duplicates and cap total.
-    const haveIds = new Set(verifiedRows.map((r: any) => r.id));
-    extraVerified = extraVerified.filter((r: any) => !haveIds.has(r.id)).slice(0, growthDeficit);
+    ).all(verifiedRows.length + growthDeficit) as any[])
+      .filter((r: any) => !haveIds.has(r.id))
+      .slice(0, growthDeficit);
+    if (extraVerified.length > 0) {
+      const recheckIds = new Set(
+        (db.prepare(
+          `SELECT a.id FROM agents a INNER JOIN agent_knowledge k ON k.agent_id = a.id
+            WHERE a.id IN (${extraVerified.map(() => "?").join(", ")}) AND ${recheckSql}`
+        ).all(...extraVerified.map((r: any) => r.id)) as Array<{ id: string }>).map((x) => x.id)
+      );
+      for (const r of extraVerified) {
+        r.pick_slot = (recheckIds.has(r.id) ? "verified_recheck" : "verified_fill") as VerifierPickSlot;
+      }
+    }
   }
 
-  let extraGrowth: any[] = [];
-  if (verifiedDeficit > 0) {
-    extraGrowth = db.prepare(
-      `${SELECT_COLS}
-        WHERE ${RFB_VERIFIER_SCOPE_SQL}
-          AND k.verification_status IN ('unverified', 'pending_verify', 'review_required', 'data_insufficient')
-        ${ORDER}
-        LIMIT ?`
-    ).all(growthTarget + verifiedDeficit);
-    extraGrowth = extraGrowth.filter((r: any) => !growthHaveIds.has(r.id)).slice(0, verifiedDeficit);
-  }
-
-  return [...growthRows, ...extraGrowth, ...verifiedRows, ...extraVerified].slice(0, limit);
+  return [...growthRows, ...verifiedRows, ...extraVerified].slice(0, limit);
 }
 
 // orch-pr-87: sweep-round observability. Returns aggregate counters
@@ -3041,6 +3280,7 @@ export async function runVerifierBatch(opts: {
       verified_second_line: verifiedSecondLine,
       agent_name: agent.name ?? null,
       prior_verification_status: agent.verification_status,
+      ...(agent.pick_slot ? { pick_slot: agent.pick_slot as VerifierPickSlot } : {}),
     });
   }
 
@@ -3054,6 +3294,23 @@ export async function runVerifierBatch(opts: {
 
 // Build a run-envelope payload from verifier results, ready to POST
 // to /admin/runs.
+// dev-request 2026-10-10-rfb-verifier-kapasitet-til-fulle-profiler (point
+// 5): how pickBatchBiased spent this run's slots. Emitted only when at least
+// one result carries pick_slot (i.e. the run used pickBatchBiased), so other
+// pickers' envelopes are unchanged. `custom` claims: report-only counts, not
+// DB-state claims for the snapshot probe. Rows merged in by
+// includeStaleReviewRequired carry no pick_slot and are not counted here.
+export function pickSlotClaims(results: VerifierResult[]): Array<{ type: "custom"; value: number; meta: { kind: string } }> {
+  if (!results.some((x) => x.pick_slot)) return [];
+  const count = (slot: VerifierPickSlot) => results.filter((x) => x.pick_slot === slot).length;
+  return [
+    { type: "custom", value: count("verified_recheck"), meta: { kind: "verifier_slots_verified_recheck" } },
+    { type: "custom", value: count("verified_fill"), meta: { kind: "verifier_slots_verified_fill" } },
+    { type: "custom", value: count("growth_full_profile"), meta: { kind: "verifier_slots_growth_full_profile" } },
+    { type: "custom", value: count("growth_other"), meta: { kind: "verifier_slots_growth_other" } },
+  ];
+}
+
 export function buildRunEnvelope(input: {
   run_id: string;
   started_at: string;
@@ -3198,6 +3455,7 @@ export function buildRunEnvelope(input: {
       { type: "db_state_change", value: terminalUnconfirmable, meta: { kind: "agents_terminal_unconfirmable" } },
       { type: "db_state_change", value: reviewRequiredReevaluated, meta: { kind: "review_required_reevaluated" } },
       { type: "db_state_change", value: reviewRequiredPromoted, meta: { kind: "review_required_promoted" } },
+      ...pickSlotClaims(r),
       ...(input.reportPath
         ? [{ type: "file_deployed", value: input.reportPath, meta: { kind: "hourly_report" } }]
         : []),
