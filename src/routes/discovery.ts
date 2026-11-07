@@ -591,8 +591,8 @@ function serveApiIndex(_req: Request, res: Response): void {
     version: "v1",
     description:
       "REST API for Norwegian local food producers. " +
-      `${rfbCatalogCount(stats.totalAgents) || "1,290+"} verified agents across farms, markets, ` +
-      "REKO rings, and cooperatives.",
+      `${rfbCatalogCount(stats.totalAgents) || "1,290+"} producers across farms, markets, ` +
+      "REKO rings, and cooperatives, cross-checked against the Brønnøysund register.",
     documentation: `${BASE_URL}/openapi.json`,
     protocols: {
       rest: `${BASE_URL}/api/marketplace`,

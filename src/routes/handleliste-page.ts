@@ -37,7 +37,8 @@ import { KJOPSVILKAR_PATH } from "./rfb-kjopsvilkar";
 import { BETALING_PATH } from "./rfb-betaling";
 import { isPaymentsEnabled } from "../services/payment-service";
 import { serializeJsonForScript } from "../services/safe-script-json";
-import { isOrderCapNoticeEnabled, orderCapBuyerNotice } from "../services/order-cap-notice";
+import { isOrderCapNoticeEnabled, isOrderCapV2Enabled, orderCapBuyerNotice } from "../services/order-cap-notice";
+import { buyerOrderCapNotice } from "../owner-features/order-texts";
 import { stockSoftExpiryBuyerTemplate, stockSoftExpiryEnabled } from "../services/stock-soft-expiry";
 import type { Offer } from "../services/catalog-offers";
 
@@ -731,7 +732,17 @@ export function buildHandelistePage(lang: Lang, preselect?: HandelistePreselect 
     : {};
   // B4: the buyer's daily-cap text (the same function as the API's cap_notice),
   // only with ORDER_CAP_NOTICE_ENABLED on — off, the copy is unchanged.
-  const capCopy = isOrderCapNoticeEnabled()
+  const capV2 = isOrderCapNoticeEnabled() && isOrderCapV2Enabled();
+  const capLang = lang === "en" ? "en" : "no";
+  const capCopy = capV2
+    ? {
+      __cap_v2: {
+        platform_ceiling: buyerOrderCapNotice("platform_ceiling", "{cap}", capLang),
+        buyer_open_cap: buyerOrderCapNotice("buyer_open_cap", "{cap}", capLang),
+        buyer_daily_cap: buyerOrderCapNotice("buyer_daily_cap", "{cap}", capLang),
+      },
+    }
+    : isOrderCapNoticeEnabled()
     ? { __cap_daily: orderCapBuyerNotice("producer_daily_cap", "{cap}", lang === "en" ? "en" : "no"), __cap_open: orderCapBuyerNotice("buyer_open_cap", "{cap}", lang === "en" ? "en" : "no") }
     : {};
   // B2b-1: the soft-expiry buyer text, only with STOCK_SOFT_EXPIRY_ENABLED on — off, the copy is unchanged.
@@ -789,10 +800,17 @@ export function buildHandelistePage(lang: Lang, preselect?: HandelistePreselect 
       </section>
     </form>
     <script type="application/json" id="hl-copy">${serializeJsonForScript(copy)}</script>
-    <script>${CLIENT_SCRIPT}</script>
+    <script>${capV2 ? HANDELISTE_CLIENT_SCRIPT_CAP_V2 : CLIENT_SCRIPT}</script>
   </main>`;
   return { title: c.title, description: c.description, content, extraCss: HANDELISTE_CSS };
 }
 
 /** Exposed for tests (syntax check + endpoint-contract assertions). */
 export const HANDELISTE_CLIENT_SCRIPT = CLIENT_SCRIPT;
+
+// T11 (ORDER_CAP_V2_ENABLED + ORDER_CAP_NOTICE_ENABLED): the handoff card also
+// knows the v2 cap_reason values. Only this one line differs, and only the v2
+// page serves it — off, the page carries CLIENT_SCRIPT byte for byte.
+const CAP_LINE_V1 = "var capT = h.cap_reason === 'producer_daily_cap' ? C.__cap_daily : (h.cap_reason === 'buyer_open_cap' ? C.__cap_open : null);";
+const CAP_LINE_V2 = "var capT = (C.__cap_v2 && C.__cap_v2[h.cap_reason]) || null;";
+export const HANDELISTE_CLIENT_SCRIPT_CAP_V2 = CLIENT_SCRIPT.replace(CAP_LINE_V1, CAP_LINE_V2);

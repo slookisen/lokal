@@ -5524,6 +5524,35 @@ function initSchema(db: Database.Database): void {
       PRIMARY KEY (agent_id, oslo_day)
     )
   `);
+  // T11 (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 5; order
+  // caps v2 behind ORDER_CAP_V2_ENABLED). Additive only — the CHECK on
+  // order_cap_events.reason is NOT widened:
+  //   order_cap_events.reason_detail : nullable; the v2 rule that hit
+  //     ('platform_ceiling' | 'buyer_daily_cap' | 'buyer_open_cap';
+  //     'owner_daily_cap' is reserved for T17). NULL on every v1 row.
+  //   order_cap_admin_alerts : the internal admin alert marker. The primary
+  //     key (agent_id, oslo_day, kind) is what guarantees ONE alert per
+  //     producer per Oslo day per kind ('ceiling' | 'prewarn') across
+  //     overlapping submits and restarts. No buyer data. status 'claimed' |
+  //     'sent' | 'failed'.
+  try {
+    const capEvCols = new Set((db.prepare(`PRAGMA table_info(order_cap_events)`).all() as Array<{ name: string }>).map((c) => c.name));
+    if (!capEvCols.has("reason_detail")) db.exec(`ALTER TABLE order_cap_events ADD COLUMN reason_detail TEXT`);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS order_cap_admin_alerts (
+        agent_id     TEXT NOT NULL,
+        oslo_day     TEXT NOT NULL,
+        kind         TEXT NOT NULL,
+        order_count  INTEGER NOT NULL,
+        cap          INTEGER NOT NULL,
+        status       TEXT NOT NULL DEFAULT 'claimed',
+        created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (agent_id, oslo_day, kind)
+      )
+    `);
+  } catch (err) {
+    console.error("Migration order caps v2 (T11) failed:", err);
+  }
 
   // B2 (dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier):
   // the stock-check reminder (services/stock-check-reminder.ts). Additive.
@@ -6373,6 +6402,30 @@ function initSchema(db: Database.Database): void {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_rfb_marketing_send_ledger_day_status ON rfb_marketing_send_ledger(day, status)`);
   } catch (err) {
     console.error("Migration rfb_marketing_lane_state/rfb_marketing_send_ledger failed:", err);
+  }
+
+  // ─── privacy_erasure_audit (dev-request 2026-10-12-slettefrist-
+  // korrespondanse-og-oversettelser, slice C) ─────────────────────────
+  // One row per APPLIED art. 17 erasure by POST /admin/privacy/erasure-by-email
+  // (routes/admin-privacy-erasure.ts), written in the same transaction as the
+  // DELETEs. Holds a keyed hash of the normalized address, never the address.
+  // Insert-only; dry-runs write nothing. Purely additive.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS privacy_erasure_audit (
+        id TEXT PRIMARY KEY,
+        requested_at TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        requested_by TEXT,
+        email_hash TEXT NOT NULL,
+        include_suppression INTEGER NOT NULL DEFAULT 0,
+        counts_json TEXT NOT NULL,
+        total_rows INTEGER NOT NULL
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_privacy_erasure_audit_hash ON privacy_erasure_audit(email_hash)`);
+  } catch (err) {
+    console.error("Migration privacy_erasure_audit failed:", err);
   }
 
   // ─── profile_ai_deliveries (dev-request 2026-10-14-med-i-ai-svar-per-profil, S1) ───

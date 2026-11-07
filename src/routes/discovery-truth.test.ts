@@ -285,6 +285,14 @@ export async function runDiscoveryTruthTests(opts: { log?: boolean } = {}): Prom
       const skills = await callRouter(readinessRouter, "/.well-known/agent-skills/index.json", "rettfrabonden.com");
       assertEq(digitsToNumber((String(skills?.body?.skills?.[0]?.description).match(/Search (\d+) Norwegian/) || [])[1]), EXPECT_RFB, "rfb-count-agent-skills: description count");
 
+      // N1 (Claude directory prep): the public /api index must not claim "verified" producers.
+      for (const p of ["/api", "/api/v1"]) {
+        const idx = await callRouter(discoveryRouter, p, "rettfrabonden.com");
+        const desc = String(idx?.body?.description ?? "");
+        assertTrue(desc.length > 0 && !/verified/i.test(desc), `api-index ${p}: description does not claim "verified" (${desc})`);
+        assertTrue(desc.includes("Brønnøysund"), `api-index ${p}: description names the Brønnøysund cross-check`);
+      }
+
       const st = await callRouter(a2aRouter, "/api/stats", "rettfrabonden.com");
       assertEq(st?.body?.data?.honestCount, EXPECT_RFB, "rfb-count-api-stats: data.honestCount");
       assertEq(st?.body?.data?.honestCountVertical, "rfb", "rfb-count-api-stats: data.honestCountVertical");

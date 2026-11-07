@@ -53,6 +53,7 @@ import { isValidLatLng, resolveSearchRadiusKm, formatPlaceLabel } from "../utils
 import { capFreeText } from "../utils/free-text";
 import { getDb } from "../database/init";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
+import { withoutSellerEmailAlways } from "../services/conversation-email-guard";
 import { getTrafficStats, getTrafficStatsSnapshot } from "../services/traffic-stats";
 import { publicTrafficYearBlock, TRAFFIC_YEAR_KEYS, trafficYearCell, trafficYearLangOf, type TrafficYearKey } from "../services/traffic-year-compute";
 import { aiDeliveriesYearPeriodLabel } from "../services/profile-year-compute";
@@ -1233,7 +1234,11 @@ function producerCardMediumRich(a: any, knowledge: any, lang: Lang = "no"): stri
 
 function buildConversationShowcase(_lang: Lang = "no"): string {
   try {
-    const convs = conversationService.listConversations({ limit: 3 });
+    // S-A5 (dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting):
+    // the front page is the same for every visitor, so with
+    // EMAIL_REVEAL_GUARD_RFB on the reply preview never shows the seller's ✉️
+    // line (services/conversation-email-guard.ts; no budget spent). Off: as before.
+    const convs = withoutSellerEmailAlways(conversationService.listConversations({ limit: 3 }));
     if (convs.length === 0) return "";
 
     const sourceLabels: Record<string, string> = {
@@ -2352,13 +2357,13 @@ router.get("/om", (req: Request, res: Response) => {
       <div class="om-val">
         <span class="om-val-icon">&#127987;</span>
         <h3>Norway first</h3>
-        <p>Built for Norwegian farms, markets and food traditions. <span translate="no">Oslo</span> first, the rest of the country to follow.</p>
+        <p>Built for Norwegian farms, markets and food traditions.</p>
       </div>
     </div>
 
     <h2>Our vision</h2>
     <p>We believe the future of commerce is about visibility. Whoever gets found, gets the customer. We're building the infrastructure that lets local producers compete on equal terms with the big chains \u2014 in a world where more and more shopping happens through AI.</p>
-    <p>${brand} is a non-profit initiative. The code is open source.</p>
+    <p>Free to join today. Run by AGENTPLATFORM.NO AS. The code is open source.</p>
   </section>` : `
   <section class="om-hero">
     <h1>Maten fortjener \u00e5 bli <em>funnet</em></h1>
@@ -2398,13 +2403,13 @@ router.get("/om", (req: Request, res: Response) => {
       <div class="om-val">
         <span class="om-val-icon">&#127987;</span>
         <h3>Norsk f\u00f8rst</h3>
-        <p>Bygget for norske g\u00e5rder, markeder og mattradisjoner. <span translate="no">Oslo</span> f\u00f8rst, hele landet etter.</p>
+        <p>Bygget for norske g\u00e5rder, markeder og mattradisjoner.</p>
       </div>
     </div>
 
     <h2>Visjonen v\u00e5r</h2>
     <p>Vi tror at fremtidens handel handler om synlighet. Den som blir funnet, f\u00e5r kunden. Vi bygger infrastrukturen som gj\u00f8r at lokale produsenter konkurrerer p\u00e5 like vilk\u00e5r med de store kjedene \u2014 i en verden der stadig flere handler gjennom AI.</p>
-    <p>${brand} er et non-profit initiativ. Koden er \u00e5pen kildekode.</p>
+    <p>Gratis \u00e5 v\u00e6re med i dag. Drevet av AGENTPLATFORM.NO AS. Koden er \u00e5pen kildekode.</p>
   </section>`;
 
   res.send(shell(

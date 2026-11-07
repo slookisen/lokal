@@ -90,6 +90,7 @@ import {
 } from "./services/rfb-enrichment-nightly";
 import adminRunVerifierRoutes, { runVerifierTick, isVerifierWindowHour } from "./routes/admin-run-verifier";
 import adminRunDentalVerifierRoutes from "./routes/admin-run-dental-verifier";
+import adminDentalTriageRoutes from "./routes/admin-dental-triage";
 import { runDentalVerifierBatch } from "./services/dental-verifier";
 import {
   shouldRunDentalVerifierScheduler,
@@ -156,6 +157,7 @@ import adminDodBulkRoutes from "./routes/admin-dod-bulk";
 import adminRfbContactExtractionRoutes from "./routes/admin-rfb-contact-extraction";
 import adminAgentsPendingVerifyUnparkRoutes from "./routes/admin-agents-pending-verify-unpark";
 import adminCrmChimeraAgentClearRoutes from "./routes/admin-crm-chimera-agent-clear";
+import adminPrivacyErasureRoutes from "./routes/admin-privacy-erasure";
 import adminCrmChimeraContactsDiagnoseRoutes from "./routes/admin-crm-chimera-contacts-diagnose";
 import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside-cleanup";
 import adminDentalMarkInactiveRoutes from "./routes/admin-dental-mark-inactive";
@@ -1112,6 +1114,11 @@ app.use("/admin/field-spot-check", adminLimiter, adminFieldSpotCheckRoutes);
 // contaminated fields. Dry-run by default; apply=true writes.
 // POST /admin/crm-chimera-agent-clear
 app.use("/admin/crm-chimera-agent-clear", adminLimiter, adminCrmChimeraAgentClearRoutes);
+// dev-request 2026-10-12-slettefrist-korrespondanse-og-oversettelser, slice C:
+// GDPR art. 17 erasure of one e-mail address's correspondence. Dry-run by
+// default; {apply:true} deletes in one transaction + privacy_erasure_audit row.
+// POST /admin/privacy/erasure-by-email
+app.use("/admin/privacy", adminLimiter, adminPrivacyErasureRoutes);
 // dev-request 2026-07-23-crm-house-bucket-kimaere-opprydding, slice 3: the
 // remaining 13-contact diagnosis half. Read-only, dry-run-only — NO apply
 // mode at all, zero writes. Enumerates crm_contacts rows still on the
@@ -1131,6 +1138,10 @@ app.use("/admin/dental/hjemmeside-cleanup-sweep", adminLimiter, adminDentalHjemm
 // research). dry-run by default, dry_run:false writes.
 // POST /admin/dental/mark-inactive
 app.use("/admin/dental/mark-inactive", adminLimiter, adminDentalMarkInactiveRoutes);
+// dev-request 2026-09-02-dental-permanent-triage-needs-review-drain, slice 3c-1:
+// deterministic needs_review drain. POST /admin/dental/triage/dry-run (never
+// writes) and POST /admin/dental/triage/run (503 unless DENTAL_TRIAGE_JOB_ENABLED=true).
+app.use("/admin/dental/triage", adminLimiter, adminDentalTriageRoutes);
 // dev-request 2026-09-02-dental-hjemmeside-hygiene-og-brreg-gjenfinning,
 // slice 2d: one-time, safely re-runnable correction pass for
 // catalog_class='offentlig_klinikk' rows whose hjemmeside is actually a
@@ -2049,6 +2060,32 @@ if (shouldRunDentalVerifierScheduler()) {
       dentalVerifierTickRunning = false;
     }
   }), DENTAL_VERIFIER_SCHEDULER_INTERVAL_MS); // hourly
+}
+
+// ─── dev-request 2026-09-02-dental-permanent-triage-needs-review-drain, slice
+// 3c-1: weekly deterministic drain of dental needs_review rows (Brreg deleted ->
+// inactive, directory homepage -> directory_url/raw, the verifier's Verified
+// rule -> verified; everything else stays). OFF by default: scheduled only when
+// DENTAL_TRIAGE_JOB_ENABLED === "true" AND ENABLE_DENTAL=1, and runDentalTriage
+// itself re-checks the flag and the dental write-pause before writing. Wakes
+// every 6 h; runs when the persisted boot_job_state stamp is >= 7 days old, so
+// a restart does not run it twice in a week. Nothing in fly.toml sets the flag.
+if (process.env.ENABLE_DENTAL === "1" && process.env.DENTAL_TRIAGE_JOB_ENABLED === "true") {
+  const dentalTriageTick = trackJob("dental-triage", async () => {
+    try {
+      const triage = await import("./services/dental-triage");
+      if (triage.isDentalTriageRunning()) return;
+      const last = getJobLastCompletedAt(getDb(), triage.DENTAL_TRIAGE_JOB);
+      if (!triage.isDentalTriageDue(last, new Date())) return;
+      const summary = await triage.runDentalTriage();
+      console.log(triage.formatDentalTriageSummary(summary));
+      if (!summary.disabled && !summary.paused) markJobCompleted(getDb(), triage.DENTAL_TRIAGE_JOB);
+    } catch (err) {
+      console.error("[dental-triage] tick failed (non-fatal, retried next tick):", err);
+    }
+  });
+  setTimeout(() => { void dentalTriageTick(); }, 20 * 60_000);
+  setInterval(() => { void dentalTriageTick(); }, 6 * 3600_000);
 }
 
 // ─── dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent, Daniel
