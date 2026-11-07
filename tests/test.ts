@@ -52122,6 +52122,9 @@ runSerial(async () => {
 // switch off = byte-identical).
 // S-A5 adds the RFB REST and A2A answers (rfb counter shared with the profile
 // page; switch off = byte-identical; MCP untouched).
+// S-A5 (conversations) adds the public conversation answers: REST
+// /api/conversations*, /samtale/:id, the /api/live and AG-UI streams (rfb
+// counter; switch off = byte-identical), /samtaler and the front page preview.
 // Switch off = byte-identical answers; MCP tannlege_info untouched. Sets env
 // flags and swaps the dental db-factory (restored in finally) — runSerial,
 // tail position.
@@ -52138,6 +52141,8 @@ runSerial(async () => {
     ["experiences profile email reveal", () => (require("../src/routes/experiences-profile-email-reveal.test") as typeof import("../src/routes/experiences-profile-email-reveal.test")).runExperiencesProfileEmailRevealTests({ log: false })],
     // S-A5 (RFB REST + A2A): card/info/vcard, discover/search contact blocks, cart submit contact_handoffs, agent.json and A2A agent/info (rfb counter; switch off = byte-identical).
     ["rfb api email reveal", () => (require("../src/routes/rfb-api-email-reveal.test") as typeof import("../src/routes/rfb-api-email-reveal.test")).runRfbApiEmailRevealTests({ log: false })],
+    // S-A5 (conversations): the seller auto-reply's ✉️ line on /api/conversations*, /samtale/:id, /api/live, AG-UI, /samtaler and the front page (rfb counter; switch off = byte-identical).
+    ["rfb conversations email reveal", () => (require("../src/routes/rfb-conversations-email-reveal.test") as typeof import("../src/routes/rfb-conversations-email-reveal.test")).runRfbConversationsEmailRevealTests({ log: false })],
   ] as Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]>) {
     try {
       const r = await load();
