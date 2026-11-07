@@ -8,6 +8,7 @@ import { productsWithoutOrganicFlag, stripOrganicEntries, dropOrganicSentences }
 import { debioStatusShown } from "./debio-approval";
 import { normalizeEmail } from "./blocklist-service";
 import { customerRuleSql } from "./customer-rule";
+import { revokeOwnerAccessExceptVerifiedOwners } from "./owner-access-revocation";
 import {
   type ClaimRecommendation, type DomainHttpsCheck, claimDomainRuleEnabled, emailDomain, emailDomainMatchesWebsite,
   getDomainHttpsCheck, isFreeMailDomain, isHostedPlatformHost, isRootWebsite, registrableDomain, websiteHost,
@@ -2125,6 +2126,15 @@ class KnowledgeService {
       db.prepare("UPDATE agent_knowledge SET data_source = 'hybrid' WHERE agent_id = ? AND data_source = 'auto'")
         .run(claim.agent_id);
     }
+
+    // Owner change (dev-request 2026-11-06-rfb-krav-for-portal-og-okter-ved-
+    // eierskifte, spec point 2): login rows follow ownership. Every live
+    // /eier session and open login link for this profile whose address is not
+    // a verified owner now (the new owner, or an owner that stays) is revoked
+    // — e.g. a previous owner by activation link or the old listed address.
+    // Both callers run this method inside a transaction, so a failure here
+    // rolls the whole grant back instead of leaving the old sessions live.
+    revokeOwnerAccessExceptVerifiedOwners(db, claim.agent_id, `claim grant (${claimedVia})`);
 
     return claimToken;
   }

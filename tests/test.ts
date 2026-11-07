@@ -50328,6 +50328,27 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-06-rfb-krav-for-portal-og-okter-ved-eierskifte, spec
+// point 2 / AC 2: unclaim, reset-claim and an owner change revoke the old
+// owner's /eier sessions and open login links; the new owner logs in. Pins
+// getDb() to its own in-memory DB, runs an in-process server, sets env and an
+// e-mail stub (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-06 eierskifte: owner sessions and login links follow ownership ──");
+  try {
+    const { runRfbOwnerAccessRevocationTests } = require("../src/routes/rfb-owner-access-revocation.test") as
+      typeof import("../src/routes/rfb-owner-access-revocation.test");
+    const r = await runRfbOwnerAccessRevocationTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-owner-access-revocation: " + f);
+    console.log(`  rfb-owner-access-revocation: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-owner-access-revocation: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice
 // C4: signed one-click links (approve / reject / revoke) for owner claims —
 // GET writes nothing, POST runs once, expiry/tamper/flag/secret refusals. Pins
