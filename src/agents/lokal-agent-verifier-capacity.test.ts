@@ -183,6 +183,78 @@ export async function runLokalAgentVerifierCapacityTests(opts: { log?: boolean }
       db.close();
     }
 
+    // ── Second-contact window: due date within ±14 days only ─────────────
+    {
+      const db = freshDb();
+      const seed = seeder(db);
+      const cd = verifierSecondTouchCooldownDays();
+      const cases: Array<[string, number, boolean]> = [
+        ["due-in-10d", cd - 10, true],     // inside: due in 10 days
+        ["due-10d-ago", cd + 10, true],    // inside: became due 10 days ago
+        ["due-in-30d", cd - 30, false],    // before the window
+        ["overdue-30d", cd + 30, false],   // long overdue: outside
+        ["overdue-200d", cd + 200, false], // long overdue: outside
+      ];
+      for (const [id, daysAgo] of cases) {
+        seed(id, "verified", { enrichment: "rich", about: ABOUT });
+        sendLog(db, id, `post@${id}.no`, daysAgo * DAY);
+      }
+      for (let i = 0; i < 40; i++) seed(`pv-${i}`, "pending_verify");
+      const verIds = new Set(pickBatchBiased(db, 30).filter((r: any) => r.verification_status === "verified").map((r: any) => r.id));
+      for (const [id, , want] of cases) {
+        assertTrue(verIds.has(id) === want, `B2: ${id} is ${want ? "" : "not "}a second-contact re-check`);
+      }
+      db.close();
+    }
+
+    // ── B1: verified re-check reasons do not re-pick the same rows ───────
+    {
+      const db = freshDb();
+      const seed = seeder(db);
+      // 12 rows entering the pool (never contacted), 2 flagged, 2 second
+      // contact due, 50 quiet verified, 400 pending. Cap is 9 per run.
+      const sticky: string[] = [];
+      for (let i = 0; i < 12; i++) { seed(`pool-${i}`, "verified", { enrichment: "rich", about: ABOUT }); sticky.push(`pool-${i}`); }
+      for (let i = 0; i < 2; i++) {
+        seed(`flag-${i}`, "verified", { enrichment: "rich", about: ABOUT, last_http_status: 503 });
+        sendLog(db, `flag-${i}`, `post@flag-${i}.no`, 5 * DAY);
+        sticky.push(`flag-${i}`);
+      }
+      for (let i = 0; i < 2; i++) {
+        seed(`due-${i}`, "verified", { enrichment: "rich", about: ABOUT });
+        sendLog(db, `due-${i}`, `post@due-${i}.no`, (verifierSecondTouchCooldownDays() - 5) * DAY);
+        sticky.push(`due-${i}`);
+      }
+      for (let i = 0; i < 50; i++) {
+        seed(`quiet-${i}`, "verified", { enrichment: "rich", about: ABOUT });
+        sendLog(db, `quiet-${i}`, `post@quiet-${i}.no`, 5 * DAY);
+      }
+      for (let i = 0; i < 400; i++) seed(`pv-${i}`, "pending_verify");
+
+      const stamp = db.prepare(`UPDATE agent_knowledge SET sweep_processed_at = ? WHERE agent_id = ?`);
+      const perRun: string[][] = [];
+      for (let run = 0; run < 3; run++) {
+        const batch = pickBatchBiased(db, 30);
+        perRun.push(batch.filter((r: any) => r.verification_status === "verified").map((r: any) => r.id));
+        const now = new Date(Date.now() + run * 1000).toISOString();
+        for (const r of batch) stamp.run(now, r.id);
+      }
+      const [r0, r1, r2] = perRun as [string[], string[], string[]];
+      assertTrue(r0.length === 9, `B1: run 0 fills the 9-slot cap (got ${r0.length})`);
+      assertTrue(r1.every((id) => !r0.includes(id)), `B1: run 1 re-picks none of run 0's rows (got ${JSON.stringify(r1)})`);
+      assertTrue(r1.length === 7, `B1: run 1 takes the 7 remaining re-check rows (got ${r1.length})`);
+      assertTrue(new Set([...r0, ...r1]).size === sticky.length && [...r0, ...r1].every((id) => sticky.includes(id)),
+        "B1: runs 0-1 rotate through every re-check row once, no quiet rows");
+      assertTrue(r2.length === 0, `B1: run 2 picks no verified row — all were just processed (got ${JSON.stringify(r2)})`);
+
+      // Once the 72 h guard has passed, the pool rows count again.
+      db.prepare(`UPDATE agent_knowledge SET sweep_processed_at = ? WHERE agent_id LIKE 'pool-%'`).run(iso(4 * DAY));
+      const r3 = pickBatchBiased(db, 30).filter((r: any) => r.verification_status === "verified").map((r: any) => r.id);
+      assertTrue(r3.length === 9 && r3.every((id: string) => id.startsWith("pool-")),
+        `B1: after 72 h the pool rows are re-check rows again (got ${JSON.stringify(r3)})`);
+      db.close();
+    }
+
     // ── AC1a'': no growth rows → verified rows still fill the batch ──────
     {
       const db = freshDb();

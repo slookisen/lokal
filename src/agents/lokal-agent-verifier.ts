@@ -820,6 +820,16 @@ export const VERIFIED_RECHECK_URL_LEAD_DAYS = 7;
 // "needs a re-check".
 export const VERIFIED_RECHECK_SECOND_TOUCH_LEAD_DAYS = 14;
 
+// Round-robin guard for the re-check reasons that do not clear themselves
+// when the row is processed (flagged, in/entering the pool, second contact
+// due): such a row only counts as needing a re-check again once its last
+// verifier pass (sweep_processed_at, the picker's own recency key) is at least
+// this old. Same value as FULL_PROFILE_RANKING_MIN_AGE_HOURS for growth rows:
+// with 9 runs a night a pool row is re-checked at most once per 3 nights,
+// well inside the pool's 30-day URL limit (which clause (a) covers on its own
+// — a re-check renews url_last_probed, so (a) needs no guard).
+export const VERIFIED_RECHECK_MIN_AGE_HOURS = 72;
+
 // Same value as resolveRfbMarketingGateCooldownDays() in
 // services/rfb-marketing-daily.ts (the cooldown mode=second waits after the
 // last send before the next contact). Mirrored, not imported, because
@@ -862,18 +872,23 @@ function sqliteColumnExists(db: any, table: string, column: string): boolean {
  *       over POOL_CONTENT_THRESHOLD_SQL, and no RFB send yet — the
  *       outreach_ready_pool VIEW's own conditions, minus the URL freshness
  *       that this re-check is there to renew;
- *   (d) second contact due within 14 days: 1-2 earlier sends (by agent id or
- *       recipient e-mail, any vertical — the same keys mode=second uses) and
- *       the latest one at least (cooldown - 14) days ago.
+ *   (d) second contact due within 14 days either way: 1-2 earlier sends (by
+ *       agent id or recipient e-mail, any vertical — the same keys mode=second
+ *       uses) and the due date (latest send + cooldown) between now-14d and
+ *       now+14d. Long-overdue rows are not a re-check reason.
+ * (b), (c) and (d) only count when the row's sweep_processed_at is NULL or
+ * older than VERIFIED_RECHECK_MIN_AGE_HOURS (round-robin guard); (a) clears
+ * itself because a re-check renews url_last_probed.
  * Clauses whose table/column is missing (minimal test schemas) are left out.
  */
 export function verifiedRecheckNeededSql(db: any): string {
   const clauses: string[] = [];
+  const urlClauses: string[] = [];
   const hasK = (c: string) => sqliteColumnExists(db, "agent_knowledge", c);
 
   if (hasK("url_last_probed")) {
     const days = VERIFIED_RECHECK_URL_MAX_AGE_DAYS - VERIFIED_RECHECK_URL_LEAD_DAYS;
-    clauses.push(`(k.url_last_probed IS NULL OR datetime(k.url_last_probed) <= datetime('now', '-${days} days'))`);
+    urlClauses.push(`(k.url_last_probed IS NULL OR datetime(k.url_last_probed) <= datetime('now', '-${days} days'))`);
   }
 
   if (hasK("last_http_status")) clauses.push(`(k.last_http_status IS NOT NULL AND k.last_http_status >= 400)`);
@@ -903,14 +918,26 @@ export function verifiedRecheckNeededSql(db: any): string {
   }
 
   if (hasSentLog) {
-    const dueAfterDays = Math.max(0, verifierSecondTouchCooldownDays() - VERIFIED_RECHECK_SECOND_TOUCH_LEAD_DAYS);
+    // due = last send + cooldown, within [now-14d, now+14d]
+    // ⇔ last send within [now-(cooldown+14)d, now-(cooldown-14)d].
+    const cooldown = verifierSecondTouchCooldownDays();
+    const lead = VERIFIED_RECHECK_SECOND_TOUCH_LEAD_DAYS;
+    const newestDays = Math.max(0, cooldown - lead);
+    const oldestDays = cooldown + lead;
     clauses.push(
       `((SELECT COUNT(*) FROM outreach_sent_log o2 WHERE ${sentMatch("o2")}) BETWEEN 1 AND ${VERIFIED_RECHECK_MAX_SENDS - 1}` +
-      ` AND (SELECT MAX(datetime(o3.sent_at)) FROM outreach_sent_log o3 WHERE ${sentMatch("o3")}) <= datetime('now', '-${dueAfterDays} days'))`
+      ` AND (SELECT MAX(datetime(o3.sent_at)) FROM outreach_sent_log o3 WHERE ${sentMatch("o3")})` +
+      ` BETWEEN datetime('now', '-${oldestDays} days') AND datetime('now', '-${newestDays} days'))`
     );
   }
 
-  return clauses.length > 0 ? `(${clauses.join(" OR ")})` : "0";
+  const guarded = clauses.length === 0
+    ? []
+    : hasK("sweep_processed_at")
+      ? [`((k.sweep_processed_at IS NULL OR datetime(k.sweep_processed_at) <= datetime('now', '-${VERIFIED_RECHECK_MIN_AGE_HOURS} hours')) AND (${clauses.join(" OR ")}))`]
+      : [`(${clauses.join(" OR ")})`];
+  const all = [...urlClauses, ...guarded];
+  return all.length > 0 ? `(${all.join(" OR ")})` : "0";
 }
 
 // Lazy: routes/admin-outreach-candidates.ts pulls in route modules; loading it
