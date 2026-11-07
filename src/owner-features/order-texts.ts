@@ -79,3 +79,72 @@ export function buyerOrderCapNotice(detail: OrderCapDetail, n: number | string, 
       return `Du har sendt ${n} bestillinger til denne produsenten i dag, så denne ble ikke sendt. Ta kontakt med produsenten direkte med kontaktinformasjonen og meldingen under.`;
   }
 }
+
+// ─── T12: cancellation and the «Mine ordrer» overview (punkt 6) ──────────────
+//
+// Owner texts, shown only for a producer on OWNER_FEATURES_ALLOWED_SUBJECTS
+// (off the list the three order pages are byte-identical to before).
+
+/** The disclosure that holds the cancellation reasons of a confirmed order. */
+export const OWNER_CANCEL_SUMMARY = "Kanseller bestillingen …";
+
+/** The labels of the order buttons (pakke A word list: Avslå before, Kanseller after, «Kunden har avbestilt» both). */
+export const OWNER_ORDER_ACTION_LABELS = {
+  confirm: "Bekreft",
+  decline: "Avslå",
+  decline_sold_out: "Avslå – utsolgt",
+  complete: "Hentet",
+  cancel_sold_out: "Varen er utsolgt",
+  cancel_cannot_deliver: "Jeg kan ikke levere likevel",
+  buyer_cancelled: "Kunden har avbestilt",
+  no_show: "Kunden kom ikke",
+} as const;
+
+/** The line under «Kanseller bestillingen …»: whether the buyer is told by the platform. */
+export function ownerCancelChooseLine(buyerReceiptsOn: boolean): string {
+  return buyerReceiptsOn ? "Velg hvorfor. Kunden får beskjed med en gang." : "Velg hvorfor. Gi kunden beskjed selv.";
+}
+
+/** The banner after a cancellation. */
+export function ownerCancelledBanner(buyerReceiptsOn: boolean): string {
+  return buyerReceiptsOn
+    ? "Bestillingen er kansellert. Kunden har fått beskjed."
+    : "Bestillingen er kansellert. Husk å gi kunden beskjed.";
+}
+
+/** «Kunden kom ikke» before the earliest time (order-lifecycle noShowEarliestMs). */
+export function ownerNoShowFromLine(when: string): string {
+  return `Kan registreres fra ${when}.`;
+}
+
+export const OWNER_ORDER_OVERVIEW_HEADING = "Bestillinger gjennom Rett fra Bonden";
+export const OWNER_ORDER_OVERVIEW_EMPTY =
+  "Ingen bestillinger ennå. Når kunder bestiller gjennom Rett fra Bonden, ser du dem her.";
+
+function bestillinger(n: number): string {
+  return `${n} ${n === 1 ? "bestilling" : "bestillinger"}`;
+}
+
+/** «I november: 4 bestillinger, 3 hentet» (month name in lower case, Oslo month). */
+export function ownerOverviewMonthLine(monthName: string, received: number, pickedUp: number): string {
+  return `I ${monthName}: ${bestillinger(received)}, ${pickedUp} hentet`;
+}
+
+/** «Siden start: 12 bestillinger, 9 hentet» */
+export function ownerOverviewTotalLine(received: number, pickedUp: number): string {
+  return `Siden start: ${bestillinger(received)}, ${pickedUp} hentet`;
+}
+
+// ─── T12: the buyer's cancellation receipt (pakke C, draft) ──────────────────
+
+/**
+ * The reason sentence of the buyer's cancellation receipt for a producer
+ * cancellation with orders.cancel_detail. Pakke C: used only with
+ * ORDER_CANCEL_DETAIL_RECEIPT_ENABLED=1 (order-receipt-service.ts); off, or
+ * without a detail, the receipt keeps today's sentence byte for byte.
+ * null = no new sentence for this detail (today's sentence applies).
+ */
+export function buyerCancelDetailSentence(detail: string | null | undefined, producerName: string): string | null {
+  if (detail === "sold_out") return `${producerName} har kansellert bestillingen fordi varen er utsolgt.`;
+  return null;
+}
