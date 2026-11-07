@@ -629,6 +629,128 @@ export function runContactFormDetectorTests(opts: { log?: boolean } = {}): TestS
     assertEq(cap?.skipReason, "captcha", "N4: captcha still wins over dialog");
   }
 
+  // 23g. Review r3 B1–B5, N1, N3–N5: each "evil" page posts to evil.com in a
+  // browser, so none may be same-site; each "ok" control must stay same-site.
+  {
+    const F = `<textarea name="message"></textarea><input type="email" name="email">`;
+    const ss = (body: string, pageUrl = PAGE, site = SITE): boolean[] =>
+      detectContactForms(page(body), pageUrl, site).forms.map((f) => f.sameSiteAsProducer);
+    const evil = (body: string, label: string): void => {
+      const r = ss(body);
+      assertEq(r.length > 0 && r.every((x) => x === false), true, `${label} → not same-site`);
+    };
+    const ok = (body: string, label: string): void => assertEq(ss(body), [true], `${label} → same-site`);
+
+    // B1: a comment ends at "--!>" as well as "-->".
+    evil(`<form action="/send">${F}<!-- x --!><button formaction="https://evil.com/">S</button> --></form>`, "r3 B1: comment ended by --!>");
+    evil(`<form action="/send">${F}<!----!><button formaction="https://evil.com/">S</button> --></form>`, "r3 B1: <!----!> ends at once");
+    evil(`<form action="/send">${F}<!--><button formaction="https://evil.com/">S</button>--></form>`, "r3 B1: <!--> is an empty comment");
+    evil(`<form action="/send">${F}<!---><button formaction="https://evil.com/">S</button>--></form>`, "r3 B1: <!---> is an empty comment");
+    ok(`<form action="/send">${F}<!-- <button formaction="https://evil.com/">S</button> --!> --></form>`, "r3 B1: button inside a --!>-closed comment is dropped");
+    ok(`<form action="/send">${F}<!--!><button formaction="https://evil.com/">S</button> --></form>`, "r3 B1: <!--!> does not end the comment");
+    {
+      const many = `<form action="/send">${F}</form>` + "<!---->".repeat(Math.floor(CONTACT_FORM_MAX_HTML_CHARS / 8));
+      const t0 = Date.now();
+      detectContactForms(many, PAGE, SITE);
+      assertEq(Date.now() - t0 < 2000, true, "r3 B1: many comments without --!> stay linear (under 2 s)");
+    }
+
+    // B2: foreign content (<svg>/<math>) → nothing is same-site.
+    evil(`<form action="/send">${F}<svg><style><p><button formaction="https://evil.com/">S</button></style></svg></form>`, "r3 B2: <svg><style> is not raw text");
+    evil(`<svg><base href="https://www.gard.no/"></svg><base href="https://evil.com/"><form action="/send">${F}</form>`, "r3 B2: <base> inside <svg> is not the document base");
+    evil(`<form action="/send">${F}<math><title><button formaction="https://evil.com/">S</button></title></math></form>`, "r3 B2: <math><title> is not raw text");
+    evil(`<form action="/send">${F}</form><SVG viewBox="0 0 1 1"></SVG>`, "r3 B2: any <svg> start tag fails closed (case-insensitive)");
+
+    // B3: character references in URL attributes.
+    evil(`<form action="&#47&#47evil.com/x">${F}</form>`, "r3 B3: &#47 without ;");
+    evil(`<form action="&sol;&sol;evil.com/x">${F}</form>`, "r3 B3: &sol; (unknown named ref) → ambiguous");
+    evil(`<form action="https&colon;//evil.com/x">${F}</form>`, "r3 B3: &colon;");
+    evil(`<form action="&#00000000047;&#00000000047;evil.com/x">${F}</form>`, "r3 B3: leading zeros");
+    evil(`<form action="&#x2f&#X2F;evil.com/x">${F}</form>`, "r3 B3: hex without ; / upper X");
+    evil(`<form action="/send">${F}<button formaction="&#0000047&#47evil.com/">S</button></form>`, "r3 B3: formaction with references");
+    evil(`<base href="&sol;&sol;evil.com/"><form action="/send">${F}</form>`, "r3 B3: ambiguous <base href>");
+    evil(`<form action="/send&#x80;/x">${F}</form>`, "r3 B3: C1 reference (windows-1252 remap) → ambiguous");
+    ok(`<form action="/send?a=1&amp;b=2">${F}</form>`, "r3 B3: &amp; in a query string stays same-site");
+    ok(`<form action="/send?a=1&b=2&copy=3">${F}</form>`, "r3 B3: &name= is never a reference in an attribute");
+    ok(`<form action="&#47;send">${F}</form>`, "r3 B3: &#47;send → /send");
+    assertEq(only(page(`<form action="&#0000047send">${F}</form>`))?.action, "https://www.gard.no/send", "r3 B3: &#0000047 decodes to /");
+    assertEq(only(page(`<form action="&amp;#47;&amp;#47;evil.com">${F}</form>`))?.action, "https://www.gard.no/&#47;&#47;evil.com", "r3 B3: decoding is one pass");
+    assertEq(decodeEntities("&#0;&#x110000;&#xD800;&#99999999999999999999;"), "����", "r3 B3: invalid code points → U+FFFD");
+    {
+      const t0 = Date.now();
+      detectContactForms(`<form action="${"&#0".repeat(600_000)}">${F}</form>`, PAGE, SITE);
+      detectContactForms(`<form action="${"&a".repeat(900_000)}">${F}</form>`, PAGE, SITE);
+      assertEq(Date.now() - t0 < 2000, true, "r3 B3: 2 MB of references in one attribute under 2 s");
+    }
+
+    // B4: button/input type is not trimmed.
+    evil(`<form action="/send">${F}<button type="button " formaction="https://evil.com/">S</button></form>`, 'r3 B4: type="button " is submit');
+    evil(`<form action="/send">${F}<button type="&#9;button" formaction="https://evil.com/">S</button></form>`, 'r3 B4: type="&#9;button" is submit');
+    evil(`<form action="/send">${F}<button type=" reset" formaction="https://evil.com/">S</button></form>`, 'r3 B4: type=" reset" is submit');
+    evil(`<form action="/send">${F}<button type="" formaction="https://evil.com/">S</button></form>`, 'r3 B4: type="" is submit');
+    ok(`<form action="/send">${F}<button type="BUTTON" formaction="https://evil.com/">S</button><button type="Reset" formaction="https://evil.com/">R</button></form>`, "r3 B4: exact button/reset (any case) is not submit");
+    ok(`<form action="/send">${F}<input type="submit " formaction="https://evil.com/"></form>`, 'r3 B4: input type="submit " is a text field, not submit');
+    evil(`<form action="/send">${F}<input type="IMAGE" formaction="https://evil.com/"></form>`, "r3 B4: input type=IMAGE is submit");
+
+    // B5: ids and form= are exact.
+    {
+      const s = detectContactForms(
+        page(`<form id=" f" action="/a">${F}</form><form id="f" action="/send">${F}</form><button form="f" formaction="https://evil.com/">S</button>`),
+        PAGE,
+        SITE,
+      );
+      assertEq(s.forms.map((f) => f.sameSiteAsProducer), [true, false], 'r3 B5: form="f" belongs to id="f", not id=" f"');
+      const s2 = detectContactForms(
+        page(`<form id="f" action="/a">${F}</form><form id="f " action="/send">${F}</form><button form="f " formaction="https://evil.com/">S</button>`),
+        PAGE,
+        SITE,
+      );
+      assertEq(s2.forms.map((f) => f.sameSiteAsProducer), [true, false], 'r3 B5: form="f " belongs to id="f "');
+    }
+
+    // N1: form markup inside <noscript>.
+    evil(`<form action="/send">${F}<noscript><button formaction="https://evil.com/">S</button></noscript></form>`, "r3 N1: submit button in <noscript>");
+    evil(`<form action="/send">${F}<noscript></form><form action="https://evil.com/"></noscript></form>`, "r3 N1: form tags in <noscript>");
+    ok(`<noscript><iframe src="https://www.googletagmanager.com/ns.html"></iframe></noscript><form action="/send">${F}</form>`, "r3 N1: plain GTM noscript stays same-site");
+
+    // N3: non-default port.
+    assertEq(ss(`<form action="https://www.gard.no:8443/send">${F}</form>`), [false], "r3 N3: action on a non-default port");
+    assertEq(ss(`<form action="/send">${F}</form>`, "https://www.gard.no:8080/kontakt"), [false], "r3 N3: page on a non-default port");
+    assertEq(ss(`<form action="https://www.gard.no:443/send">${F}</form>`), [true], "r3 N3: explicit default port is same-site");
+    assertEq(urlIsOnProducerHost("http://gard.no:80/x", "gard.no"), true, "r3 N3: http :80 is the default port");
+
+    // N4: method/formmethod are not trimmed.
+    assertEq(only(page(`<form method=" post" action="/send">${F}</form>`))?.method, "get", 'r3 N4: method=" post" is GET');
+    assertEq(only(page(`<form method="POST" action="/send">${F}</form>`))?.method, "post", "r3 N4: method=POST");
+    assertEq(
+      only(page(`<form action="/send">${F}<button formmethod="dialog ">S</button></form>`))?.submitActions,
+      [{ action: "https://www.gard.no/send", method: "get" }],
+      'r3 N4: formmethod="dialog " is GET',
+    );
+
+    // N5: tokenizer edges.
+    {
+      const raw = only(page(`<form action="/send"><textarea name="message"></textareaX><button formaction="https://evil.com/">S</button></textarea><input type="email" name="email"></form>`));
+      assertEq([raw?.submitActions.length, raw?.sameSiteAsProducer], [0, true], "r3 N5: </textareaX> does not end the textarea");
+      const raw2 = only(page(`<form action="/send"><textarea name="message"></textarea_><button formaction="https://evil.com/">S</button></textarea><input type="email" name="email"></form>`));
+      assertEq(raw2?.submitActions.length, 0, "r3 N5: </textarea_> does not end the textarea");
+    }
+    evil(`<form action="/send">${F}<button a="x"formaction="https://evil.com/">S</button></form>`, 'r3 N5: a="x"formaction= reads formaction');
+    evil(`<form action="/send">${F}<button a='x'formaction=https://evil.com/>S</button></form>`, "r3 N5: a='x'formaction= (single quotes, unquoted value)");
+    evil(`<form action="/send">${F}<button/formaction="https://evil.com/">S</button></form>`, "r3 N5: <button/formaction=> reads formaction");
+    evil(`<form action="/send">${F}<button/ /formaction=https://evil.com/>S</button></form>`, "r3 N5: <button/ /formaction=> reads formaction");
+
+    // Fail-closed extras: whitespace action resolves against <base>; double-escaped
+    // script; nested <template>; </form> not in scope.
+    evil(`<base href="https://evil.com/"><form action=" ">${F}</form>`, 'r3: action=" " resolves against <base>, not the page');
+    evil(`<form action="/send">${F}<script><!--<script></script></form>--></script><button formaction="https://evil.com/">S</button>`, "r3: double-escaped script hides </form>");
+    evil(`<form action="/send">${F}<template><template></template></form></template><button formaction="https://evil.com/">S</button>`, "r3: nested <template> hides </form>");
+    evil(`<form action="/send">${F}<object></form><button formaction="https://evil.com/">S</button></object>`, "r3: </form> inside <object> is ignored");
+    evil(`<form action="/send">${F}<table><tr><td></form><button formaction="https://evil.com/">S</button></td></tr></table>`, "r3: </form> inside an open <td> is ignored");
+    ok(`<form action="/send">${F}<table><tr><td>x<td>y</table></form><button formaction="https://evil.com/">S</button>`, "r3: </form> after a closed table ends the form");
+    ok(`<script><!-- old-style hiding --></script><form action="/send">${F}</form>`, "r3: <!-- in a script without <script inside stays same-site");
+  }
+
   // 24. Review B3: tokenizing is linear — 2 MB of adversarial input in well under 2 s each.
   {
     const MB2 = CONTACT_FORM_MAX_HTML_CHARS;
@@ -650,6 +772,12 @@ export function runContactFormDetectorTests(opts: { log?: boolean } = {}): TestS
       ["<a'x=' (quoted value swallows next tag)", fill("<a'x='")],
       ['""="<a', fill('""="<a')],
       ['<a<a"="', fill('<a<a"="')],
+      // Review r3 shapes: per-element checks added for comments, noscript, script, template, scope boundaries.
+      ["<!--x--!> (bang-closed comments)", fill("<!--x--!>")],
+      ["<noscript><!-- (comment inside noscript)", fill("<noscript><!--</noscript>")],
+      ["<script><!-- (escaped scripts)", fill("<script><!--</script>")],
+      ["<template><a (templates)", fill("<template><a</template>")],
+      ["<form><table><td> (scope boundaries)", fill("<form><table><td></form>")],
     ];
     for (const [name, html] of shapes) {
       const t0 = Date.now();

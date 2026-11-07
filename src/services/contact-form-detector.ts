@@ -17,7 +17,8 @@
 // MORE likely to be skipped (captcha anywhere on the page, a "*" in a label =
 // required, an unknown producer host = not same-site, a submit button posting
 // elsewhere = not same-site, a page that ends inside a tag or is cut at the
-// size limit = not same-site), never less.
+// size limit = not same-site, <svg>/<math>, an undecodable character
+// reference in a URL, a non-default port = not same-site), never less.
 //
 // "Same site" means the producer's OWN host (leading "www." stripped) or a
 // subdomain of it — never a sibling, a parent, or anything else that merely
@@ -110,7 +111,10 @@ export const CONTACT_FORM_MAX_HTML_CHARS = 2_000_000;
 
 // ── Tokenizer ───────────────────────────────────────────────────────────────
 
-type Attrs = Map<string, string>;
+/** Decoded attribute values (first wins). `ambiguous` names attributes whose character references could not be decoded with certainty (review r3 B3). */
+interface Attrs extends Map<string, string> {
+  ambiguous?: Set<string>;
+}
 
 interface Token {
   kind: "open" | "close" | "text";
@@ -121,24 +125,87 @@ interface Token {
 }
 
 const ENTITY: Record<string, string> = {
-  amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
+  amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: "\u00a0",
+  AMP: "&", LT: "<", GT: ">", QUOT: '"',
   aelig: "æ", oslash: "ø", aring: "å", AElig: "Æ", Oslash: "Ø", Aring: "Å",
   laquo: "«", raquo: "»", mdash: "—", ndash: "–",
 };
 
-export function decodeEntities(s: string): string {
-  return s.replace(/&(#x[0-9a-f]{1,6}|#[0-9]{1,7}|[a-z]{2,8});/gi, (m, body: string) => {
-    if (body[0] === "#") {
-      const cp = body[1] === "x" || body[1] === "X" ? parseInt(body.slice(2), 16) : parseInt(body.slice(1), 10);
-      if (!Number.isFinite(cp) || cp <= 0 || cp > 0x10ffff) return m;
-      try {
+/** The names in ENTITY that HTML also decodes WITHOUT a trailing ";" (legacy Latin-1 references). */
+const LEGACY_NO_SEMI: ReadonlySet<string> = new Set([
+  "amp", "lt", "gt", "quot", "nbsp", "AMP", "LT", "GT", "QUOT",
+  "aelig", "oslash", "aring", "AElig", "Oslash", "Aring", "laquo", "raquo",
+]);
+
+/** Longest semicolon-less (legacy) name in the HTML entity table ("middot", "plusmn" …). */
+const LEGACY_MAX_LEN = 6;
+
+/**
+ * One alternative per character-reference shape; every quantified run is
+ * followed only by an optional ";", so a global scan is linear (no backtracking
+ * between runs).
+ */
+const CHAR_REF_RE = /&(?:#[xX]([0-9a-fA-F]+)(;?)|#([0-9]+)(;?)|([A-Za-z][A-Za-z0-9]*)(;?))/g;
+
+interface Decoded {
+  text: string;
+  /** A reference the browser may decode differently from us (unknown named reference, C1 remap). */
+  ambiguous: boolean;
+}
+
+/**
+ * Decode character references as the HTML tokenizer does (review r3 B3):
+ *   - numeric references (decimal or hex) with ANY number of leading zeros and
+ *     with or without ";" ("&#47", "&#00000000047;", "&#x2F");
+ *     0, surrogates and values above U+10FFFF become U+FFFD;
+ *   - named references from the small ENTITY table; without ";" only the
+ *     legacy ones, and in an attribute not when followed by "=" (HTML rule).
+ * A reference we cannot decode with certainty — a named reference not in
+ * ENTITY ("&sol;", "&colon;"), a short semicolon-less name that might be a
+ * legacy one, a C1 code point the browser remaps — sets `ambiguous`; callers
+ * treat an ambiguous URL as unknown (fail closed). Decoding is one pass, so
+ * "&amp;#47;" is "&#47;" (as in a browser), not "/".
+ */
+function decodeRefs(s: string, inAttribute: boolean): Decoded {
+  if (s.indexOf("&") < 0) return { text: s, ambiguous: false };
+  let ambiguous = false;
+  CHAR_REF_RE.lastIndex = 0;
+  const text = s.replace(
+    CHAR_REF_RE,
+    (m: string, hex: string | undefined, _hs: string, dec: string | undefined, _ds: string, name: string | undefined, nameSemi: string, offset: number) => {
+      if (hex !== undefined || dec !== undefined) {
+        const digits = (hex ?? dec)!.replace(/^0+/, "");
+        const cp = digits.length > 8 ? Infinity : digits ? parseInt(digits, hex !== undefined ? 16 : 10) : 0;
+        if (!Number.isFinite(cp) || cp === 0 || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return "\ufffd";
+        if (cp >= 0x80 && cp <= 0x9f) {
+          ambiguous = true; // windows-1252 remap in browsers; not modelled
+          return "\ufffd";
+        }
         return String.fromCodePoint(cp);
-      } catch {
+      }
+      const nm = name!;
+      if (nameSemi) {
+        if (Object.prototype.hasOwnProperty.call(ENTITY, nm)) return ENTITY[nm]!;
+        ambiguous = true; // a named reference we do not know ("&sol;", "&colon;" …)
         return m;
       }
-    }
-    return Object.prototype.hasOwnProperty.call(ENTITY, body) ? ENTITY[body]! : m;
-  });
+      // Semicolon-less: `nm` is the whole alphanumeric run, so the next character is not alphanumeric.
+      if (inAttribute && s.charCodeAt(offset + m.length) === 61 /* = */) return m; // never decoded in an attribute
+      if (LEGACY_NO_SEMI.has(nm)) return ENTITY[nm]!;
+      if (nm.length <= LEGACY_MAX_LEN) ambiguous = true; // could be a legacy name we do not list
+      return m; // longer runs: a legacy prefix would be followed by an alphanumeric → not decoded
+    },
+  );
+  return { text, ambiguous };
+}
+
+export function decodeEntities(s: string): string {
+  return decodeRefs(s, false).text;
+}
+
+/** ASCII-only lower case, as HTML keyword matching ("İ"/"K" are not folded to ASCII). */
+function asciiLower(s: string): string {
+  return s.replace(/[A-Z]+/g, (c) => c.toLowerCase());
 }
 
 /**
@@ -183,7 +250,12 @@ function readTagRest(html: string, p: number): TagRest | null {
   let name = "";
   let haveAttr = false;
   const commit = (value: string): void => {
-    if (haveAttr && !attrs.has(name)) attrs.set(name, decodeEntities(value)); // first wins, as in HTML
+    if (haveAttr && !attrs.has(name)) {
+      // first wins, as in HTML
+      const d = decodeRefs(value, true);
+      attrs.set(name, d.text);
+      if (d.ambiguous) (attrs.ambiguous ??= new Set()).add(name);
+    }
     haveAttr = false;
     name = "";
   };
@@ -261,8 +333,9 @@ interface Tokenized {
  *     (so `</form_x>` is not `</form>`);
  *   - attributes are read by readTagRest(): an unquoted "<" inside a tag is
  *     a plain character, the tag ends at the first ">" outside a quoted value;
- *   - comments, `<!…>`, `<?…>` and `</` + non-letter are bogus comments up to
- *     the next ">" and dropped; `<` + anything else is text;
+ *   - comments end at the first "-->" or "--!>" ("<!-->", "<!--->" are empty);
+ *     `<!…>`, `<?…>` and `</` + non-letter are bogus comments up to the next
+ *     ">"; both are dropped; `<` + anything else is text;
  *   - raw-text element bodies are one text token; `<plaintext>` makes the rest
  *     of the document text.
  * A tag the input ends inside stops tokenizing and sets `unterminatedTag`
@@ -278,6 +351,17 @@ function tokenize(html: string): Tokenized {
 
   let i = 0;
   let textStart = 0;
+  // Next "-->" / "--!>" at or after a position, memoised so many comments stay linear (review r3 B1).
+  let nextDashGt = -2;
+  let nextDashBangGt = -2;
+  const commentEnd = (from: number): number => {
+    if (nextDashGt !== -1 && nextDashGt < from) nextDashGt = html.indexOf("-->", from);
+    if (nextDashBangGt !== -1 && nextDashBangGt < from) nextDashBangGt = html.indexOf("--!>", from);
+    const a = nextDashGt < 0 ? Infinity : nextDashGt + 3;
+    const b = nextDashBangGt < 0 ? Infinity : nextDashBangGt + 4;
+    const e = Math.min(a, b);
+    return e === Infinity ? n : e; // an unclosed comment runs to the end
+  };
   const pushText = (end: number, tag = ""): void => {
     if (end > textStart) tokens.push({ kind: "text", tag, attrs: new Map(), text: html.slice(textStart, end) });
   };
@@ -296,13 +380,12 @@ function tokenize(html: string): Tokenized {
     if (lt < 0) break;
     if (html.startsWith("<!--", lt)) {
       pushText(lt);
+      // "<!-->" and "<!--->" are empty comments; otherwise the comment ends at
+      // the FIRST "-->" or "--!>" (the HTML comment-end-bang state, review r3 B1).
       let end: number;
       if (html.startsWith("<!-->", lt)) end = lt + 5;
       else if (html.startsWith("<!--->", lt)) end = lt + 6;
-      else {
-        const c = html.indexOf("-->", lt + 4);
-        end = c < 0 ? n : c + 3; // an unclosed comment runs to the end
-      }
+      else end = commentEnd(lt + 4);
       i = textStart = end;
       continue;
     }
@@ -489,6 +572,7 @@ export function urlIsOnProducerHost(url: string | null, ownHost: string | null):
   }
   if (u.protocol !== "http:" && u.protocol !== "https:") return false;
   if (u.username || u.password) return false;
+  if (u.port) return false; // a non-default port is another origin (review r3 N3); default ports read as ""
   const host = normalizeHost(u.hostname);
   if (!host) return false;
   if (host !== ownHost && isHostedPlatformHost(host)) return false;
@@ -517,6 +601,63 @@ function checkMessageLength(messageLength: number): void {
     throw new RangeError(`contact-form-detector: messageLength must be a finite number >= 0, got ${String(messageLength)}`);
   }
 }
+
+/** Input types HTML knows; any other value (" email", "tex t") is the Text state. */
+const INPUT_TYPES: ReadonlySet<string> = new Set([
+  "hidden", "text", "search", "tel", "url", "email", "password", "date", "month", "week", "time",
+  "datetime-local", "number", "range", "color", "checkbox", "radio", "file", "submit", "image", "reset", "button",
+]);
+
+/** An input's type state: ASCII case-insensitive, NOT trimmed (review r3 B4); unknown/missing = "text". */
+function inputTypeOf(a: Attrs): string {
+  const t = asciiLower(a.get("type") ?? "text");
+  return INPUT_TYPES.has(t) ? t : "text";
+}
+
+/**
+ * Is this start tag a submit button? `<button>` unless its type is EXACTLY
+ * (ASCII case-insensitively) "button" or "reset" — "button " or "&#9;button"
+ * is an invalid value, i.e. submit (review r3 B4); `<input>` only when its
+ * type is exactly "submit" or "image".
+ */
+function isSubmitControl(tag: string, a: Attrs): boolean {
+  if (tag === "button") {
+    const t = asciiLower(a.get("type") ?? "submit");
+    return t !== "button" && t !== "reset";
+  }
+  if (tag === "input") {
+    const t = inputTypeOf(a);
+    return t === "submit" || t === "image";
+  }
+  return false;
+}
+
+/**
+ * A URL attribute's raw value: undefined when absent, null when a character
+ * reference in it could not be decoded with certainty (review r3 B3) — the
+ * caller treats null as an unknown destination.
+ */
+function urlAttr(a: Attrs, name: string): string | undefined | null {
+  if (!a.has(name)) return undefined;
+  return a.ambiguous?.has(name) ? null : a.get(name)!;
+}
+
+/**
+ * <noscript> content is text to a scripting browser but markup without
+ * scripting. If it holds anything that could change where a form posts — a
+ * form tag, a submit button, a <base> — no form on the page is trusted
+ * (review r3 N1). Linear: the content is tokenized once.
+ */
+function noscriptHasFormMarkup(text: string): boolean {
+  const { tokens, unterminatedTag } = tokenize(text);
+  if (unterminatedTag) return true;
+  return tokens.some(
+    (t) => (t.kind !== "text" && t.tag === "form") || (t.kind === "open" && (t.tag === "base" || isSubmitControl(t.tag, t.attrs))),
+  );
+}
+
+/** Elements that bound the default "in scope" check: a `</form>` while one opened inside the form is still open does not end it. */
+const FORM_SCOPE_BOUNDARY: ReadonlySet<string> = new Set(["applet", "object", "marquee", "table", "td", "th", "caption"]);
 
 function captchaUrl(a: Attrs): boolean {
   return ["src", "data-src", "data-lazy-src", "href"].some((k) => CAPTCHA_SCRIPT_SRC_RE.test(a.get(k) || ""));
@@ -547,6 +688,14 @@ export function detectContactForms(
   // `form=` button, a </form>) could change where a form posts, so no form
   // on the page counts as same-site.
   const untrustedTail = unterminatedTag || truncated;
+  // Fail closed on markup this tokenizer does not model (review r3): foreign
+  // content (<svg>/<math>: style, title, textarea, script are not raw text
+  // there, and <base> may sit inside), a script that enters the
+  // double-escaped state, nested <template>, a </form> the tree builder would
+  // not honour, an ambiguous <base href>, form markup inside <noscript>.
+  let untrustedMarkup = false;
+  /** Open scope-boundary elements (table, object …) started inside the current form. */
+  const boundaryOpen = new Map<string, number>();
 
   let baseUrl = pageUrl;
   let baseSeen = false;
@@ -569,11 +718,18 @@ export function detectContactForms(
     if (t.kind === "text") {
       if (t.tag === "script") {
         if (CAPTCHA_INLINE_RE.test(t.text)) pageCaptcha = true;
+        // "<!--" then "<script" + space,/,> enters script-data-double-escaped:
+        // the browser does NOT end the script at the "</script>" we stopped at.
+        const esc = t.text.indexOf("<!--");
+        if (esc >= 0 && /<script[\t\n\f\r />]/i.test(t.text.slice(esc + 4))) untrustedMarkup = true;
         continue;
       }
       if (t.tag === "noscript" || t.tag === "template") {
         // Not parsed as forms here, but a captcha in a fallback still marks the page.
         if (CAPTCHA_INLINE_RE.test(t.text) || CAPTCHA_SCRIPT_SRC_RE.test(t.text)) pageCaptcha = true;
+        if (t.tag === "noscript" && noscriptHasFormMarkup(t.text)) untrustedMarkup = true;
+        // A nested <template> ends at ITS "</template>", not at the first one we stopped at.
+        if (t.tag === "template" && /<template[\t\n\f\r />]/i.test(t.text)) untrustedMarkup = true;
         continue;
       }
       if (t.tag) continue; // style, textarea, title, xmp, iframe … content
@@ -588,13 +744,23 @@ export function detectContactForms(
         for (const f of label.fields) f.labelText = `${f.labelText} ${text}`.trim();
         label = null;
       } else if (t.tag === "form" && form) {
+        // A boundary element opened inside the form and still open: the
+        // browser ignores this </form> (form not in scope) and later controls
+        // still belong to the form — fail closed.
+        for (const v of boundaryOpen.values()) if (v > 0) untrustedMarkup = true;
         rawForms.push(form);
         form = null;
+      } else if (form && FORM_SCOPE_BOUNDARY.has(t.tag)) {
+        const v = boundaryOpen.get(t.tag) ?? 0;
+        if (v > 0) boundaryOpen.set(t.tag, v - 1);
+        if (t.tag === "table") for (const k of ["td", "th", "caption"]) boundaryOpen.set(k, 0); // </table> closes its cells
       }
       continue;
     }
 
     // open tag
+    if (t.tag === "svg" || t.tag === "math") untrustedMarkup = true; // foreign content (review r3 B2)
+    if (form && FORM_SCOPE_BOUNDARY.has(t.tag)) boundaryOpen.set(t.tag, (boundaryOpen.get(t.tag) ?? 0) + 1);
     const cls = a.get("class") || "";
     const markerCaptcha =
       CAPTCHA_CLASS_RE.test(cls) ||
@@ -606,10 +772,14 @@ export function detectContactForms(
         // Only the FIRST <base href> sets the document base, as in browsers (review r2 B1).
         if (a.has("href") && !baseSeen) {
           baseSeen = true;
-          try {
-            baseUrl = new URL((a.get("href") || "").trim(), pageUrl).toString();
-          } catch {
-            /* keep page URL */
+          const href = urlAttr(a, "href");
+          if (href === null) untrustedMarkup = true; // unknown base: every relative action is unknown (review r3 B3)
+          else {
+            try {
+              baseUrl = new URL(href ?? "", pageUrl).toString(); // the URL parser strips what HTML strips
+            } catch {
+              /* keep page URL */
+            }
           }
         }
         continue;
@@ -631,6 +801,7 @@ export function detectContactForms(
         continue;
       case "form":
         if (form) continue; // nested <form> is ignored by HTML parsers
+        boundaryOpen.clear();
         form = {
           attrs: a,
           fields: [],
@@ -648,15 +819,12 @@ export function detectContactForms(
       else pageCaptcha = true;
     }
 
-    // Submit controls (review B1): <button> is a submit button unless
-    // type=button|reset; <input type=submit|image> too. Their formaction /
-    // formmethod override the form's.
-    const inputType = t.tag === "input" ? (a.get("type") || "text").trim().toLowerCase() : "";
-    const isSubmitter =
-      (t.tag === "button" && !["button", "reset"].includes((a.get("type") || "submit").trim().toLowerCase())) ||
-      (t.tag === "input" && (inputType === "submit" || inputType === "image"));
-    if (isSubmitter) {
-      const owner = (a.get("form") || "").trim();
+    // Submit controls (review B1, r3 B4): see isSubmitControl(). Their
+    // formaction / formmethod override the form's.
+    const inputType = t.tag === "input" ? inputTypeOf(a) : "";
+    if (isSubmitControl(t.tag, a)) {
+      // `form="…"` is matched EXACTLY against ids, no trimming (review r3 B5).
+      const owner = a.get("form");
       if (owner) {
         const list = submittersByFormId.get(owner) ?? [];
         list.push(a);
@@ -689,25 +857,31 @@ export function detectContactForms(
     }
   })();
   const producerDomain = producerOwnHost(producerWebsite);
-  const pageSameSite = !untrustedTail && urlIsOnProducerHost(pageUrl, producerDomain);
+  const pageSameSite = !untrustedTail && !untrustedMarkup && urlIsOnProducerHost(pageUrl, producerDomain);
 
   /** rawForms index of the first form with each id (review r2 B3). */
   const firstFormById = new Map<string, number>();
   rawForms.forEach((rf, idx) => {
-    const id = (rf.attrs.get("id") || "").trim();
+    const id = rf.attrs.get("id"); // exact, no trimming (review r3 B5)
     if (id && !firstFormById.has(id)) firstFormById.set(id, idx);
   });
 
-  /** An action attribute resolved as a browser does: empty → the document URL, else against <base>. */
-  const resolveAction = (raw: string): string | null => {
+  /**
+   * An action attribute resolved as a browser does: absent or EXACTLY empty →
+   * the document URL, else (whitespace included, not trimmed) against <base>.
+   * null (ambiguous character reference) stays null: unknown destination.
+   */
+  const resolveAction = (raw: string | undefined | null): string | null => {
+    if (raw === null) return null;
     try {
       return raw ? new URL(raw, baseUrl).toString() : new URL(pageUrl).toString();
     } catch {
       return null;
     }
   };
+  /** ASCII lower case, no trimming (review r3 N4); any other value is GET. */
   const parseMethod = (raw: string): "get" | "post" | "dialog" => {
-    const m = raw.trim().toLowerCase();
+    const m = asciiLower(raw);
     return m === "post" ? "post" : m === "dialog" ? "dialog" : "get";
   };
 
@@ -744,11 +918,11 @@ export function detectContactForms(
     const message = messages.find((f) => f.type === "textarea") ?? messages[0] ?? null;
     if (!message) return;
 
-    const action = resolveAction((rf.attrs.get("action") || "").trim());
+    const action = resolveAction(urlAttr(rf.attrs, "action"));
     const method = parseMethod(rf.attrs.get("method") || "get");
     const ac = (rf.attrs.get("accept-charset") || "").trim().split(/[\s,]+/)[0] || "";
 
-    const formId = (rf.attrs.get("id") || "").trim();
+    const formId = rf.attrs.get("id") || "";
     const byId = formId && firstFormById.get(formId) === index ? submittersByFormId.get(formId) ?? [] : [];
     const submitters = [...rf.submitters, ...byId];
     const submitActions: ContactFormSubmitAction[] = [];
@@ -757,7 +931,7 @@ export function detectContactForms(
       const hasMethod = s.has("formmethod");
       if (!hasAction && !hasMethod) continue;
       submitActions.push({
-        action: hasAction ? resolveAction((s.get("formaction") || "").trim()) : action,
+        action: hasAction ? resolveAction(urlAttr(s, "formaction")) : action,
         method: hasMethod ? parseMethod(s.get("formmethod") || "") : null,
       });
     }
