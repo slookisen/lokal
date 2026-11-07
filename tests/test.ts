@@ -52185,6 +52185,8 @@ runSerial(async () => {
 // S-A5 (conversations) adds the public conversation answers: REST
 // /api/conversations*, /samtale/:id, the /api/live and AG-UI streams (rfb
 // counter; switch off = byte-identical), /samtaler and the front page preview.
+// S-A2 adds the higher limit for verified AI readers (forward-confirmed
+// reverse DNS, injected fake resolver; switch off = no DNS lookup).
 // Switch off = byte-identical answers; MCP tannlege_info untouched. Sets env
 // flags and swaps the dental db-factory (restored in finally) — runSerial,
 // tail position.
@@ -52203,6 +52205,8 @@ runSerial(async () => {
     ["rfb api email reveal", () => (require("../src/routes/rfb-api-email-reveal.test") as typeof import("../src/routes/rfb-api-email-reveal.test")).runRfbApiEmailRevealTests({ log: false })],
     // S-A5 (conversations): the seller auto-reply's ✉️ line on /api/conversations*, /samtale/:id, /api/live, AG-UI, /samtaler and the front page (rfb counter; switch off = byte-identical).
     ["rfb conversations email reveal", () => (require("../src/routes/rfb-conversations-email-reveal.test") as typeof import("../src/routes/rfb-conversations-email-reveal.test")).runRfbConversationsEmailRevealTests({ log: false })],
+    // S-A2: a higher limit for AI readers verified by forward-confirmed reverse DNS (fake resolver, no network; switch off = no lookup).
+    ["email reveal ai readers", () => (require("../src/services/email-reveal-ai-readers.test") as typeof import("../src/services/email-reveal-ai-readers.test")).runEmailRevealAiReadersTests({ log: false })],
   ] as Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]>) {
     try {
       const r = await load();

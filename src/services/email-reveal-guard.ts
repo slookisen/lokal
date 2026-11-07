@@ -75,14 +75,32 @@
  * routes/marketplace-cart.ts), and the A2A per-producer card (x-knowledge) and
  * agent/info (routes/a2a.ts). The RFB MCP answers are not wired yet.
  *
- * Not yet: S-A2 (verified AI readers via reverse DNS — hook:
- * emailRevealLimitFor), S-A4 (trap address), S-D (contact form) and the RFB
- * MCP answers (S-A5).
+ * S-A2 (verified AI readers): emailRevealLimitFor gives a known AI reader /
+ * search fetcher whose origin is verified by forward-confirmed reverse DNS
+ * the higher EMAIL_REVEAL_AI_READER_PER_HOUR (default 300) instead of the
+ * base limit. The User-Agent only picks the operator to verify against; it
+ * never raises the limit by itself. Registry, accepted domains per operator
+ * and the cache: services/email-reveal-ai-readers.ts. Never blocks on DNS: a
+ * cache miss gets the base limit for that request and starts one background
+ * lookup; later requests from that IP use the result. OpenAI, Anthropic and
+ * Perplexity publish only IP lists, which this slice does not fetch, so they
+ * stay at the base limit. Counting is unchanged (same store, key and window);
+ * only the limit differs. CCBot (S-A3) is checked first and never gets
+ * e-mail. Switch off for the host → nothing of this runs (no DNS lookup).
+ * One log line `email_reveal_ai_reader_verified` (operator, host, hashed
+ * client — never the IP) per successful verification.
+ *
+ * Both limits are capped at EMAIL_REVEAL_MAX_LIMIT (1000): a larger whole
+ * number is cut to the cap (per-client memory grows with the limit).
+ *
+ * Not yet: S-A4 (trap address), S-D (contact form) and the RFB MCP answers
+ * (S-A5).
  */
 
 import crypto from "crypto";
 import type { Request, Response } from "express";
 import { createStatsKey } from "../middleware/client-ip";
+import { AiReaderVerifier, aiReaderEntryOf, type AiReaderVerifierOptions } from "./email-reveal-ai-readers";
 
 export type EmailRevealHost = "dental" | "rfb" | "experiences";
 
@@ -94,6 +112,10 @@ export const EMAIL_REVEAL_SWITCH_ENV: Readonly<Record<EmailRevealHost, string>> 
 
 export const EMAIL_REVEAL_LIMIT_ENV = "EMAIL_REVEAL_PER_IP_PER_HOUR";
 export const EMAIL_REVEAL_DEFAULT_LIMIT = 30;
+export const EMAIL_REVEAL_AI_READER_LIMIT_ENV = "EMAIL_REVEAL_AI_READER_PER_HOUR";
+export const EMAIL_REVEAL_AI_READER_DEFAULT_LIMIT = 300;
+/** Upper bound for both limits (a larger configured value is cut to this). */
+export const EMAIL_REVEAL_MAX_LIMIT = 1000;
 export const EMAIL_REVEAL_WINDOW_MS = 60 * 60_000;
 /** Clients kept per host before the least recently seen is evicted. */
 export const EMAIL_REVEAL_MAX_CLIENTS = 20_000;
@@ -108,11 +130,21 @@ export function emailRevealGuardEnabled(host: EmailRevealHost, env: Env = proces
   return raw === "on" || raw === "1" || raw === "true";
 }
 
-/** EMAIL_REVEAL_PER_IP_PER_HOUR as a whole number ≥ 0; anything else → the default (30). */
+/** A whole number ≥ 0 (at most six digits), cut to EMAIL_REVEAL_MAX_LIMIT; anything else → `fallback`. */
+function parseLimit(raw: string | undefined, fallback: number): number {
+  const v = (raw ?? "").trim();
+  if (!/^\d{1,6}$/.test(v)) return fallback;
+  return Math.min(Number(v), EMAIL_REVEAL_MAX_LIMIT);
+}
+
+/** EMAIL_REVEAL_PER_IP_PER_HOUR as a whole number ≥ 0, at most 1000; anything else → the default (30). */
 export function emailRevealBaseLimit(env: Env = process.env): number {
-  const raw = (env[EMAIL_REVEAL_LIMIT_ENV] ?? "").trim();
-  if (!/^\d{1,6}$/.test(raw)) return EMAIL_REVEAL_DEFAULT_LIMIT;
-  return Number(raw);
+  return parseLimit(env[EMAIL_REVEAL_LIMIT_ENV], EMAIL_REVEAL_DEFAULT_LIMIT);
+}
+
+/** EMAIL_REVEAL_AI_READER_PER_HOUR as a whole number ≥ 0, at most 1000; anything else → the default (300). */
+export function emailRevealAiReaderLimit(env: Env = process.env): number {
+  return parseLimit(env[EMAIL_REVEAL_AI_READER_LIMIT_ENV], EMAIL_REVEAL_AI_READER_DEFAULT_LIMIT);
 }
 
 /** Whether a User-Agent is Common Crawl's (S-A3): «CCBot» anywhere, any case. */
@@ -120,14 +152,43 @@ export function isCcBotUserAgent(ua: string | undefined | null): boolean {
   return typeof ua === "string" && /ccbot/i.test(ua);
 }
 
+let aiReaders: AiReaderVerifier | null = null;
+let aiReaderOpts: AiReaderVerifierOptions = {};
+let logLine: (line: string) => void = (line) => console.log(line);
+
+/** Created on first use, so nothing (not even a resolver) exists while every switch is off. */
+function aiReaderVerifier(): AiReaderVerifier {
+  if (!aiReaders) {
+    aiReaders = new AiReaderVerifier({
+      ...aiReaderOpts,
+      onVerified: (entry, context) => {
+        logLine(JSON.stringify({ evt: "email_reveal_ai_reader_verified", operator: entry.operator, token: entry.token, ...context }));
+      },
+    });
+  }
+  return aiReaders;
+}
+
 /**
- * The per-hour limit for this request. S-A2 plugs in here: a known AI reader
- * whose origin is verified (reverse DNS or the operator's published ranges)
- * gets a higher limit. Not built in slice 1, so every client gets the base
- * limit.
+ * The per-hour limit for this request (S-A2). A User-Agent from the AI-reader
+ * registry whose IP is verified (forward-confirmed reverse DNS, cached) gets
+ * max(baseLimit, EMAIL_REVEAL_AI_READER_PER_HOUR); everyone else — unknown
+ * UA, an operator not verifiable here, a cache miss (verification then starts
+ * in the background), a failed or timed-out lookup — gets baseLimit.
+ * Synchronous; never waits for DNS. CCBot is never raised (and revealEmailFor
+ * checks it before calling this). `client` is the hashed client id for the
+ * verification log line.
  */
-export function emailRevealLimitFor(_req: Request, _host: EmailRevealHost, baseLimit: number): number {
-  return baseLimit;
+export function emailRevealLimitFor(req: Request, host: EmailRevealHost, baseLimit: number, client?: string): number {
+  const ua = typeof req.headers?.["user-agent"] === "string" ? req.headers["user-agent"] : undefined;
+  if (isCcBotUserAgent(ua)) return baseLimit;
+  const entry = aiReaderEntryOf(ua);
+  if (!entry || entry.method !== "fcrdns") return baseLimit;
+  const aiLimit = emailRevealAiReaderLimit();
+  if (aiLimit <= baseLimit) return baseLimit; // nothing to gain: no lookup
+  if (typeof req.ip !== "string" || req.ip.trim() === "") return baseLimit;
+  const context: Record<string, string> = client ? { host, client } : { host };
+  return aiReaderVerifier().isVerified(req.ip, entry, context) ? aiLimit : baseLimit;
 }
 
 // ─── Store ──────────────────────────────────────────────────────────────
@@ -222,7 +283,6 @@ export class EmailRevealStore {
 }
 
 let store = new EmailRevealStore();
-let logLine: (line: string) => void = (line) => console.log(line);
 
 /**
  * The ids in `profileIds` (each a profile that HAS an e-mail in this answer)
@@ -246,7 +306,7 @@ export function revealEmailFor(req: Request, host: EmailRevealHost, profileIds: 
     reason = "limit";
     const key = store.clientKey(req.ip);
     client = Buffer.from(key, "base64url").toString("hex", 0, 6);
-    allowed = store.reveal(host, key, profileIds, emailRevealLimitFor(req, host, emailRevealBaseLimit()));
+    allowed = store.reveal(host, key, profileIds, emailRevealLimitFor(req, host, emailRevealBaseLimit(), client));
   }
   const withheld = profileIds.filter((id) => !allowed.has(id));
   if (withheld.length > 0) {
@@ -287,8 +347,22 @@ export function withKnowledgeEmailNull<T extends { knowledge: { email?: string |
   return { ...info, knowledge: { ...info.knowledge, email: null } };
 }
 
-/** Test-only: a fresh store (optionally with an injected clock) and log sink. */
-export function __resetEmailRevealGuardForTesting(opts: EmailRevealStoreOptions & { log?: (line: string) => void } = {}): void {
+/**
+ * Test-only: a fresh store (optionally with an injected clock) and log sink,
+ * and a fresh AI-reader verifier (S-A2) with `aiReaders` options (injected
+ * resolver, clock, timeout, bounds). Without `aiReaders.resolver` the real
+ * DNS resolver would be used, so tests that reach a verification pass one.
+ */
+export function __resetEmailRevealGuardForTesting(
+  opts: EmailRevealStoreOptions & { log?: (line: string) => void; aiReaders?: Omit<AiReaderVerifierOptions, "onVerified"> } = {}
+): void {
   store = new EmailRevealStore(opts);
   logLine = opts.log ?? ((line) => console.log(line));
+  aiReaders = null;
+  aiReaderOpts = opts.aiReaders ?? {};
+}
+
+/** Test-only: resolves when every background AI-reader verification has finished. */
+export async function __emailRevealAiReadersSettledForTesting(): Promise<void> {
+  if (aiReaders) await aiReaders.settled();
 }
