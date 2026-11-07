@@ -34,6 +34,7 @@ import { capFreeText } from "../utils/free-text";
 import { logInternalError, rpcInternalErrorReply } from "../utils/internal-error";
 import { searchCountable } from "../services/search-tracking";
 import { publicAgentInfo, publicFieldChoices } from "../owner-features/enforce";
+import { emailWithheldIds, withKnowledgeEmailNull } from "../services/email-reveal-guard";
 import { readSearchText, geocodeSearchPlace, discoveryQueryOf, outsideNorwayText, noProductMatchText } from "../services/rfb-search-reading";
 import {
   isOrderAgentActionsEnabled,
@@ -793,6 +794,16 @@ function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
     });
   }
 
+  // dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
+  // S-A5 (RFB A2A): knowledge.email follows the rfb per-IP limit of
+  // services/email-reveal-guard.ts, the counter the profile page and the
+  // REST answers share (switch EMAIL_REVEAL_GUARD_RFB, default off). Over
+  // the limit, or for CCBot, it reads null as for a producer without one.
+  // Switch on: Cache-Control: private. Switch off: nothing changes.
+  let shown = publicAgentInfo(info, publicFieldChoices(agentId));
+  const emailWithheld = emailWithheldIds(req, res, "rfb", shown.knowledge.email ? [String(agentId)] : []);
+  if (emailWithheld?.has(String(agentId))) shown = withKnowledgeEmailNull(shown);
+
   res.json({
     jsonrpc: "2.0",
     result: {
@@ -803,7 +814,7 @@ function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
           name: "agent-info",
           // S2c-1: without what the owner hid (not enforced = as before).
           // B2b-2: products in the stock rule's soft window carry the date.
-          data: withSoftStockProducts(publicAgentInfo(info, publicFieldChoices(agentId)), String(agentId)),
+          data: withSoftStockProducts(shown, String(agentId)),
         }),
       ],
     },
@@ -913,12 +924,18 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
     // Økologi S3c-2: owner-written about of a producer without a valid Debio
     // status → no organic sentence (gate off = unchanged).
     safeAbout = publicOwnerAboutText(req.params.id as string, safeAbout);
+    // dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
+    // S-A5 (RFB A2A): x-knowledge.email follows the rfb per-IP limit (as
+    // agent/info above); withheld it is left out as for a producer without
+    // one. Switch on: Cache-Control: private instead of public. Off: as before.
+    const agentId = req.params.id as string;
+    const emailWithheld = emailWithheldIds(req, res, "rfb", knowledge.email ? [agentId] : []);
     const enriched: Record<string, any> = { ...card };
     enriched["x-knowledge"] = {
       address: knowledge.address,
       postalCode: knowledge.postalCode,
       phone: isDisplayablePhone(knowledge.phone) ? knowledge.phone : undefined,
-      email: knowledge.email,
+      email: emailWithheld?.has(agentId) ? undefined : knowledge.email,
       website: knowledge.website,
       openingHours: knowledge.openingHours,
       // Integration test 2026-10-17 (I-G): products is DB JSON. Stored as
@@ -950,7 +967,7 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
     for (const key of Object.keys(xk)) {
       if (xk[key] === undefined || xk[key] === null) delete xk[key];
     }
-    res.header("Cache-Control", "public, max-age=1800");
+    res.header("Cache-Control", emailWithheld === null ? "public, max-age=1800" : "private");
     res.json(enriched);
     return;
   }

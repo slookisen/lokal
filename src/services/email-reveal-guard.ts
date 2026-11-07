@@ -68,13 +68,20 @@
  * (routes/experiences-seo.ts) to the experiences counter. The Opplevagent
  * MCP/REST/A2A answers give no producer e-mail (S-A0), so nothing else there.
  *
+ * Slice 6 (S-A5, RFB REST + A2A) wires the rettfrabonden.com API answers to
+ * the same rfb counter via emailWithheldIds: GET /api/marketplace/agents/:id
+ * /card, /info and /vcard, the contact blocks of POST /discover and GET
+ * /search, contact_handoffs of POST /cart/:id/submit (routes/marketplace.ts,
+ * routes/marketplace-cart.ts), and A2A GET /agents/:id/agent.json and
+ * agent/info (routes/a2a.ts). The RFB MCP answers are not wired yet.
+ *
  * Not yet: S-A2 (verified AI readers via reverse DNS — hook:
  * emailRevealLimitFor), S-A4 (trap address), S-D (contact form) and the RFB
- * REST/A2A/MCP answers (S-A5).
+ * MCP answers (S-A5).
  */
 
 import crypto from "crypto";
-import type { Request } from "express";
+import type { Request, Response } from "express";
 import { createStatsKey } from "../middleware/client-ip";
 
 export type EmailRevealHost = "dental" | "rfb" | "experiences";
@@ -254,6 +261,30 @@ export function revealEmailFor(req: Request, host: EmailRevealHost, profileIds: 
     }));
   }
   return allowed;
+}
+
+/**
+ * For an API answer: the ids among `idsWithEmail` (each a profile that HAS an
+ * e-mail in this answer) whose e-mail this request may NOT get. null when the
+ * switch for `host` is off: the caller then changes nothing (headers
+ * included). With the switch on the answer depends on the client, so it is
+ * Cache-Control: private — also when `idsWithEmail` is empty.
+ */
+export function emailWithheldIds(req: Request, res: Response, host: EmailRevealHost, idsWithEmail: readonly string[]): ReadonlySet<string> | null {
+  if (!emailRevealGuardEnabled(host)) return null;
+  res.set("Cache-Control", "private");
+  const allowed = revealEmailFor(req, host, idsWithEmail);
+  if (allowed === null) return null;
+  return new Set(idsWithEmail.filter((id) => !allowed.has(id)));
+}
+
+/**
+ * An RFB getAgentInfo()-shaped answer with knowledge.email null: what a
+ * producer with no stored e-mail reads (agent_knowledge.email NULL), so the
+ * shape is unchanged (S-A5, REST /info and A2A agent/info).
+ */
+export function withKnowledgeEmailNull<T extends { knowledge: { email?: string | null } }>(info: T): T {
+  return { ...info, knowledge: { ...info.knowledge, email: null } };
 }
 
 /** Test-only: a fresh store (optionally with an injected clock) and log sink. */
