@@ -13,6 +13,7 @@
 
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
@@ -53,6 +54,7 @@ import { companyFooterLineHtml } from "../services/company-legal";
 import { BRAND_ENTITIES, brandMcpIcons } from "../config/brand-entities";
 import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
 import { MCP_MAX_TOOL_INPUT_ELEMENTS } from "../services/mcp-input-limits";
+import { emailRevealGuardEnabled, revealEmailFor } from "../services/email-reveal-guard";
 
 const router = Router();
 
@@ -401,7 +403,8 @@ export function registerDentalTools(server: McpServer): void {
         // The detail card: the keys this tool has always returned, with the
         // phone, acute_vakt (only with «Akuttvakt», F1-S4c) and profile-link
         // rules of the search card.
-        const result = toDentalClinicCard(agent, "detail", { specialists: listSpecialistsForClinic(agent.id) });
+        const card = toDentalClinicCard(agent, "detail", { specialists: listSpecialistsForClinic(agent.id) });
+        const result = card.epost && !dentalMcpEmailAllowed(agent.id) ? { ...card, epost: null } : card;
 
         deliver("tannlege_info", { org_nr, id }, extra, [agent.id]);
         return {
@@ -555,6 +558,24 @@ export function registerDentalTools(server: McpServer): void {
   );
 }
 
+// ─── E-mail reveal guard (dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting, S-A5) ──
+// tannlege_info shares the dental counter of the REST, A2A and profile-page
+// answers (services/email-reveal-guard.ts). The tool handler runs inside the
+// POST handler's transport.handleRequest, so the Express request (req.ip, the
+// app's one trusted client IP, and the User-Agent) reaches it through this
+// store. Switch off → revealEmailFor is null and the card is unchanged. Switch
+// on with no request in reach (not over HTTP) → fail closed, as for no IP.
+const dentalMcpRequestStore = new AsyncLocalStorage<Request>();
+
+/** Whether this request may see clinic `id`'s e-mail (true when the switch is off). */
+function dentalMcpEmailAllowed(id: string): boolean {
+  if (!emailRevealGuardEnabled("dental")) return true;
+  const req = dentalMcpRequestStore.getStore();
+  if (!req) return false;
+  const allowed = revealEmailFor(req, "dental", [id]);
+  return allowed === null || allowed.has(id);
+}
+
 // ─── Session management ──────────────────────────────────────
 // Each MCP client gets its own transport+server pair.
 // Sessions are cleaned up after 30 min of inactivity (mirrors mcp.ts).
@@ -660,7 +681,7 @@ router.post(["/", "/mcp"], async (req: Request, res: Response) => {
       sendMcpSessionNotFound(res);
       return;
     }
-    await result.session.transport.handleRequest(req, res, req.body);
+    await dentalMcpRequestStore.run(req, () => result.session.transport.handleRequest(req, res, req.body));
   } catch (err: any) {
     console.error("[dental-mcp] POST error:", err.message);
     if (!res.headersSent) {

@@ -22,7 +22,9 @@
  *   P   Places rule off (public field_provenance): the e-mail's provenance
  *       entries go with the e-mail, the rest stays
  *   H   Cache-Control: private with the switch on; none with it off
- *   M   MCP tannlege_info: unchanged by the switch and the counter
+ *   M   MCP tannlege_info (in-memory, no HTTP request): switch off gives each
+ *       e-mail; switch on fails closed (S-A5 wired it — the HTTP cases are in
+ *       dental-mcp-email-reveal.test.ts)
  *   G   the log lines carry no e-mail address
  *
  * Standalone: npx tsx src/routes/dental-email-reveal-guard.test.ts
@@ -310,7 +312,7 @@ export async function runDentalEmailRevealGuardTests(opts: { log?: boolean } = {
       restClaims.__setRestClaimsRequireSourceForTesting(null);
     }
 
-    // ── M: MCP tannlege_info is not part of this slice ────────────────────
+    // ── M: MCP tannlege_info in-memory (S-A5: dental-mcp-email-reveal.test.ts) ──
     {
       const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js") as typeof import("@modelcontextprotocol/sdk/server/mcp.js");
       const { Client } = require("@modelcontextprotocol/sdk/client/index.js") as typeof import("@modelcontextprotocol/sdk/client/index.js");
@@ -328,7 +330,7 @@ export async function runDentalEmailRevealGuardTests(opts: { log?: boolean } = {
       process.env.EMAIL_REVEAL_GUARD_DENTAL = "on";
       process.env.EMAIL_REVEAL_PER_IP_PER_HOUR = "0";
       freshGuard();
-      eq(await info(), mcpOff, "M2: switch on, limit 0 -> tannlege_info byte-identical to switch off (MCP not wired in slice 1)");
+      eq((await info()).map((t) => JSON.parse(t).epost), clinics.map(() => null), "M2: switch on, no HTTP request in reach -> tannlege_info without e-mail (fail closed, S-A5)");
     }
 
     // ── G: logs ───────────────────────────────────────────────────────────
