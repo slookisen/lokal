@@ -37,7 +37,7 @@
 //
 // SUPPRESSION (sperreliste) IS KEPT BY DEFAULT. In this codebase the
 // suppression rows for an address are:
-//   email_bounces           (hard bounce / complaint / unsubscribe — every
+//   email_bounces           (bounce_type hard / complaint / unsubscribe — every
 //                            outreach sender reads it; avmeld-service writes
 //                            its unsubscribe rows here)
 //   agent_blocklist         identifier_type='email'
@@ -142,6 +142,18 @@ export const ERASURE_TABLES: readonly TableSpec[] = [
   },
 ];
 
+// What actually suppresses outreach (review B1): only these bounce types are
+// read as a block by the senders (crm.ts / admin-outreach-candidates /
+// opplevelser use IN ('hard','complaint','unsubscribe')); 'soft'/'unknown'/NULL
+// rows written by bounce-service do NOT stop a send, so they must not count as
+// «still suppressed» here. agent_blocklist email rows block via isBlocked().
+const ACTIVE_SUPPRESSION_SQL = [
+  `SELECT COUNT(*) AS c FROM email_bounces
+     WHERE LOWER(TRIM(email)) = ? AND bounce_type IN ('hard', 'complaint', 'unsubscribe')`,
+  `SELECT COUNT(*) AS c FROM agent_blocklist
+     WHERE identifier_type = 'email' AND LOWER(TRIM(identifier_value)) = ?`,
+];
+
 const SEND_HISTORY_TABLES = new Set(["outreach_sent_log", "rfb_marketing_send_ledger"]);
 
 function args(spec: TableSpec, email: string): string[] {
@@ -166,13 +178,15 @@ export function planErasure(db: Database.Database, email: string, includeSuppres
       c: number;
     }).c;
     if (spec.suppression) {
-      suppressionRows += n;
       if (!includeSuppression) {
         kept[spec.table] = n;
         continue;
       }
     }
     counts[spec.table] = n;
+  }
+  for (const sql of ACTIVE_SUPPRESSION_SQL) {
+    suppressionRows += (db.prepare(sql).get(email) as { c: number }).c;
   }
   const total = Object.values(counts).reduce((a, b) => a + b, 0);
   const suppressedNow = suppressionRows > 0;

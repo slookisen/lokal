@@ -310,6 +310,30 @@ export async function runAdminPrivacyErasureTests(opts: { log?: boolean } = {}):
     assertEq(r.status, 409, "apply on unsuppressed address with send history → 409");
     r = await callRoute(router, { headers: H, body: { email: "ny@example.no", apply: true, confirm_unsuppressed: true } });
     assertEq(r.body?.counts?.outreach_sent_log, 1, "confirmed apply deletes send history");
+
+    // ── review B1: only hard/complaint/unsubscribe (or blocklist) count as suppression ──
+    for (const [bt, addr, expectBlocked] of [
+      ["soft", "soft@example.no", true],
+      ["unknown", "unknown@example.no", true],
+      ["hard", "hard@example.no", false],
+    ] as const) {
+      db.prepare(`INSERT INTO email_bounces (email, bounced_at, bounce_type) VALUES (?, '2026-11-01', ?)`).run(addr, bt);
+      db.prepare(`INSERT INTO outreach_sent_log (agent_id, recipient_email) VALUES ('ag-1', ?)`).run(addr);
+      r = await callRoute(router, { headers: H, body: { email: addr } });
+      assertEq(r.body?.suppressed_now, !expectBlocked, `${bt}-bounce: suppressed_now`);
+      assertEq(r.body?.unsuppressed_after, expectBlocked, `${bt}-bounce: unsuppressed_after`);
+      const snap = db.serialize();
+      r = await callRoute(router, { headers: H, body: { email: addr, apply: true } });
+      if (expectBlocked) {
+        assertEq(r.status, 409, `${bt}-bounce + send history → 409`);
+        assertEq(r.body?.error, "not_suppressed", `${bt}-bounce → not_suppressed`);
+        assertTrue(Buffer.compare(snap, db.serialize()) === 0, `${bt}-bounce refused apply writes nothing`);
+      } else {
+        assertEq(r.status, 200, `${bt}-bounce + send history → apply goes through`);
+        assertEq(r.body?.counts?.outreach_sent_log, 1, `${bt}-bounce apply deletes send history`);
+        assertEq(r.body?.kept_suppression?.email_bounces, 1, `${bt}-bounce row kept`);
+      }
+    }
   } catch (err: any) {
     failed++;
     failures.push("unexpected error: " + String(err?.stack || err));
