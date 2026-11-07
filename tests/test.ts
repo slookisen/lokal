@@ -52956,3 +52956,23 @@ runSerial(async () => {
     failures.push("dental-triage: unexpected error: " + String(err?.message || err));
   }
 });
+
+// POST /admin/orders/close-stale: old RFB orders closed as cancelled /
+// legacy_cleanup with no e-mail, no trust event and no payment change; the
+// 30-day contact sweep then picks them up. Own in-memory DB, adopt-ambient
+// admin key, stubbed mail (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── admin-orders: close-stale (legacy_cleanup) ──");
+  try {
+    const { runAdminOrdersCloseStaleTests } = require("../src/routes/admin-orders-close-stale.test") as
+      typeof import("../src/routes/admin-orders-close-stale.test");
+    const r = await runAdminOrdersCloseStaleTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-orders-close-stale: " + f);
+    console.log(`  admin-orders-close-stale: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-orders-close-stale: unexpected error: " + String(err?.message || err));
+  }
+});
