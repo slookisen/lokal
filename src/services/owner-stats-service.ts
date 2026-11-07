@@ -89,7 +89,11 @@
 import type Database from "better-sqlite3";
 import { COUNTABLE_CONV_SQL } from "./a2a-traffic-classifier";
 import { aiVendorBucket, storedClientClass, uaFromSessionId } from "./traffic-classifier";
-import { computeAiDeliveries, type AiDeliveries } from "./profile-ai-deliveries-compute";
+import { aiDeliveriesPeriodLabel, computeAiDeliveries, type AiDeliveries } from "./profile-ai-deliveries-compute";
+import {
+  AI_CLICK_VENDORS, AI_CLICK_WINDOW_DAYS, getProfileAiClicksTile, type AiClickVendor,
+} from "./profile-ai-clicks-compute";
+import { getProfileAiContactClicks } from "./contact-ai-attribution";
 import { computeProfileYear, profileYearRawFrom, type ProfileYear } from "./profile-year-compute";
 import { getRetentionWindowDays } from "./retention-window";
 import { TRAFFIC_YEAR_DAYS } from "./traffic-year-compute";
@@ -241,6 +245,103 @@ export interface OwnerStats {
    * here). The 60-day fields above keep their meaning.
    */
   year: ProfileYear;
+  /**
+   * «Sendt til AI» → «Klikk fra AI-svar» → «Kontakt-klikk» over the last 60
+   * days (dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 5b).
+   * Additive; a step whose read fails is left out, and the field is left out
+   * when every step failed. See getOwnerAiFunnel.
+   */
+  aiFunnel?: OwnerStatsAiFunnel;
+}
+
+/** One step's count with the period it covers (60 d, or «siden <dato>» while the counting is younger). */
+export interface OwnerStatsAiFunnelCount {
+  total: number;
+  /** First counted day ('YYYY-MM-DD', UTC), or null when nothing is counted yet. */
+  countingSince: string | null;
+  /** «siste 60 d» / «siden 26. okt.» (nb). */
+  label: string;
+}
+
+export interface OwnerStatsAiFunnel {
+  windowDays: number;
+  /** «Sendt til AI»: times the profile was among the results an AI assistant fetched (profile_ai_deliveries). */
+  sentToAi?: OwnerStatsAiFunnelCount;
+  /** «Klikk fra AI-svar»: people who clicked through from an AI answer (profile_ai_clicks), per AI. */
+  aiClicks?: OwnerStatsAiFunnelCount & { byVendor: Record<AiClickVendor, number> };
+  /**
+   * «Kontakt-klikk»: people's contact clicks on the profile (is_bot = 0) in
+   * the same 60 days; `fromAi` = those after a landing from an AI answer
+   * (contact_clicks.ai_source, recorded since slice 4), per AI.
+   */
+  contactClicks?: {
+    total: number;
+    label: string;
+    fromAi: OwnerStatsAiFunnelCount & { byVendor: Record<AiClickVendor, number> };
+  };
+}
+
+/**
+ * The day contact_clicks.ai_source started being written (slice 4, lokal#1426,
+ * deployed 2026-11-07). Clicks before it have no AI source, so the «etter klikk
+ * fra AI-svar» subset says «siden <dato>» until a whole window has passed.
+ */
+export const AI_CONTACT_SOURCE_COUNTING_SINCE = "2026-11-07";
+
+function periodLabel(countingSince: string | null, windowDays: number, nowMs: number): string {
+  return aiDeliveriesPeriodLabel(countingSince, windowDays, nowMs, "nb");
+}
+
+/**
+ * The AI funnel for one rfb producer, last 60 days (AI_CLICK_WINDOW_DAYS, UTC
+ * days, today included — the same window for all three steps):
+ *  - sentToAi: computeAiDeliveries (the «Med i AI-søk» store) over 60 days;
+ *    counted from aiDeliveriesCountingSince() on, so «siden <dato>» before that.
+ *  - aiClicks: getProfileAiClicksTile (as the public tile, slice 5a). Rows are
+ *    people only (profile-ai-clicks.ts filters bots and AI fetchers at write).
+ *  - contactClicks: getProfileAiContactClicks (slice 4), is_bot = 0.
+ * Each step is read on its own; a read that throws leaves that step out (the
+ * rest of the owner stats is unaffected). Returns undefined if all three fail.
+ */
+export function getOwnerAiFunnel(db: Database.Database, agentId: string, nowMs: number = Date.now()): OwnerStatsAiFunnel | undefined {
+  const windowDays = AI_CLICK_WINDOW_DAYS;
+  const out: OwnerStatsAiFunnel = { windowDays };
+  try {
+    const d = computeAiDeliveries(db, "rfb", agentId, windowDays, nowMs);
+    out.sentToAi = { total: d.total, countingSince: d.countingSince, label: periodLabel(d.countingSince, windowDays, nowMs) };
+  } catch (err) {
+    console.warn("[owner-stats] aiFunnel sentToAi read failed:", (err as Error)?.message || err);
+  }
+  try {
+    const c = getProfileAiClicksTile(db, "rfb", agentId, nowMs);
+    out.aiClicks = {
+      total: c.total,
+      countingSince: c.countingSince,
+      label: periodLabel(c.countingSince, windowDays, nowMs),
+      byVendor: { ...c.byVendor },
+    };
+  } catch (err) {
+    console.warn("[owner-stats] aiFunnel aiClicks read failed:", (err as Error)?.message || err);
+  }
+  try {
+    const k = getProfileAiContactClicks(db, agentId, nowMs, windowDays);
+    const byVendor = {} as Record<AiClickVendor, number>;
+    for (const v of AI_CLICK_VENDORS) byVendor[v] = k.fromAi.byVendor[v] ?? 0;
+    out.contactClicks = {
+      total: k.contactClicks,
+      label: periodLabel(null, windowDays, nowMs),
+      fromAi: {
+        total: k.fromAi.total,
+        countingSince: AI_CONTACT_SOURCE_COUNTING_SINCE,
+        label: periodLabel(AI_CONTACT_SOURCE_COUNTING_SINCE, windowDays, nowMs),
+        byVendor,
+      },
+    };
+  } catch (err) {
+    console.warn("[owner-stats] aiFunnel contactClicks read failed:", (err as Error)?.message || err);
+  }
+  if (!out.sentToAi && !out.aiClicks && !out.contactClicks) return undefined;
+  return out;
 }
 
 /**
@@ -446,6 +547,7 @@ export function getOwnerStats(db: Database.Database, agentId: string, path: stri
   const contactClicksByKind = getContactClicksByKind(db, agentId, windowDays);
   const contactClickedTotal = contactClicksByKind.reduce((sum, r) => sum + r.count, 0);
   const funnel = getFunnel(db, agentId, humanViews, contactClickedTotal);
+  const aiFunnel = getOwnerAiFunnel(db, agentId, nowMs);
 
   return {
     windowDays,
@@ -460,6 +562,7 @@ export function getOwnerStats(db: Database.Database, agentId: string, path: stri
       allTime: computeAiDeliveries(db, "rfb", agentId, null, nowMs),
     },
     year: computeProfileYear(db, agentId, { rawFrom, humanViews: humanYearRaw, aiViews: aiYearRaw }, nowMs),
+    ...(aiFunnel ? { aiFunnel } : {}),
   };
 }
 
