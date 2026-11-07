@@ -63,6 +63,7 @@ import { isOrderAutocompleteEnabled, noShowEarliestMs, formatPickupTimeOslo } fr
 import { randomUUID } from "crypto";
 import { PRICE_BY_AGREEMENT, PARTIAL_SUM_LABEL, summarizePricing } from "../services/order-pricing";
 import type { PaymentsStripeClient } from "../services/payment-provider";
+import { emailWithheldIds } from "../services/email-reveal-guard";
 
 // ─── Public cart/order router ────────────────────────────────────────────────
 export const cartRouter = Router();
@@ -402,6 +403,22 @@ cartRouter.post("/cart/:id/submit", cartWishesLimiter, async (req: Request, res:
   });
   if (!result.success) {
     res.status(result.status).json(result);
+    return;
+  }
+
+  // dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
+  // S-A5 (RFB REST): the producer e-mail in contact_handoffs follows the rfb
+  // per-IP limit of services/email-reveal-guard.ts (switch
+  // EMAIL_REVEAL_GUARD_RFB, default off), each producer with an e-mail on its
+  // own. Withheld it is null, as for a producer without one. Only this
+  // answer changes: cart-service (and so MCP lokal_cart_submit) and the
+  // stored cart_handoffs rows are untouched, and orders[].producer_contact
+  // (the seller's contact for the buyer's own order) is not limited.
+  // Switch on: Cache-Control: private. Switch off: nothing changes.
+  const handoffs = Array.isArray(result.contact_handoffs) ? result.contact_handoffs : [];
+  const withheld = emailWithheldIds(req, res, "rfb", handoffs.filter((h) => !!h.email).map((h) => h.agent_id));
+  if (withheld && withheld.size > 0) {
+    res.status(201).json({ ...result, contact_handoffs: handoffs.map((h) => (withheld.has(h.agent_id) ? { ...h, email: null } : h)) });
     return;
   }
 
