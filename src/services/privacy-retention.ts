@@ -41,13 +41,22 @@
 // DELETED (apply) for an expired address — exactly the rows planned:
 //   crm_threads + their crm_messages, crm_actions, crm_outbox,
 //   crm_retro_tagging_audit; crm_untriaged; rfb_marketing_send_ledger;
-//   resend_webhook_events; email_delivery_events; and NON-suppressing
-//   email_bounces rows — but those only when the address has no
-//   outreach_sent_log row (see «Kept»).
+//   resend_webhook_events; email_delivery_events. No email_bounces row is
+//   ever deleted (see «Kept»).
 //
 // KEPT, always:
 //   agent_blocklist (never read for deletion here);
-//   suppressing email_bounces (SUPPRESSING_BOUNCE_TYPES, shared with slice C);
+//   email_bounces — EVERY row, of every bounce_type (suppressing, soft,
+//     unknown, NULL). Several readers treat any bounce as a send block:
+//     gardssalg-claim.hasClaimBlockingBounce and
+//     knowledge-service.resolveFarmContactEmail refuse to send a claim code to
+//     an address with any non-unsubscribe bounce. Opplevagent claim candidates
+//     come from experience_outreach_sent_log (experiences.db), which this job
+//     cannot see, so «no RFB outreach_sent_log row» does not prove a soft
+//     bounce is unused; deleting it could make the address eligible for a
+//     claim code again. Deleting non-blocking bounces is deferred to a later
+//     slice. Bounces still count as activity (a recent bounce keeps the whole
+//     address);
 //   everything for an address with any activity at/after the cutoff;
 //   crm_contacts rows — status (blocked/archived = opt-out), agent_id and
 //     provider_id are suppression memory read by the outreach gates. Before a
@@ -64,10 +73,6 @@
 //     an address-keyed summary without changing who is eligible, so collapsing
 //     it is deferred. Because its rows stay, the max-touch counter and the
 //     cooldowns read exactly what they read before;
-//   non-suppressing bounces for an address that still has outreach_sent_log
-//     rows: knowledge-service.resolveFarmContactEmail and
-//     gardssalg-claim.hasClaimBlockingBounce treat ANY non-unsubscribe bounce
-//     as «do not send the claim code to this outreach address».
 //
 // NO MAIN-THREAD FREEZE (AC4): the plan reads one table per macrotask
 // (setImmediate between them); apply deletes by rowid in transactions of about
@@ -79,12 +84,14 @@
 //
 // RACE: rows written between the plan and the delete get a larger rowid than
 // the plan's per-table snapshot; inside each address's transaction any such
-// row tied to the address makes the job skip that address tonight.
+// row tied to the address makes the job skip that address tonight. The check
+// only sees NEW rows (rowid > snapshot), not UPDATEs of existing rows; that is
+// acceptable because every real reply or send inserts a new row (a reply
+// always inserts a crm_messages row), so fresh activity is never an UPDATE only.
 //
 // No e-mail sending, no LLM calls, no new route.
 
 import type Database from "better-sqlite3";
-import { SUPPRESSING_BOUNCE_TYPES_SQL } from "./privacy-suppression";
 
 export type PrivacyRetentionMode = "off" | "dry_run" | "apply";
 
@@ -131,7 +138,13 @@ function sqliteTs(d: Date): string {
 /** Cutoff as 'YYYY-MM-DD HH:MM:SS' UTC: now − months, capped by the cooldown floor. */
 export function computePrivacyRetentionCutoff(now: Date, months: number, longestCooldownDays: number): string {
   const c = new Date(now.getTime());
+  // Subtract whole months, clamping the day to the target month's last day
+  // (setUTCMonth alone would roll 2028-02-29 − 24 → 2026-03-01).
+  const day = c.getUTCDate();
+  c.setUTCDate(1);
   c.setUTCMonth(c.getUTCMonth() - months);
+  const lastDay = new Date(Date.UTC(c.getUTCFullYear(), c.getUTCMonth() + 1, 0)).getUTCDate();
+  c.setUTCDate(Math.min(day, lastDay));
   const floor = new Date(now.getTime() - (longestCooldownDays + 1) * 86400_000);
   return sqliteTs(c.getTime() < floor.getTime() ? c : floor);
 }
@@ -161,6 +174,8 @@ export const RETENTION_DELETE_TABLES = [
   "crm_untriaged",
   "rfb_marketing_send_ledger",
   "resend_webhook_events",
+  // Never planned in this slice (rows.email_bounces stays empty), listed so
+  // the report keeps an explicit email_bounces: 0.
   "email_bounces",
 ] as const;
 export type RetentionTable = (typeof RETENTION_DELETE_TABLES)[number];
@@ -178,10 +193,7 @@ const ADDRESS_KEYED: ReadonlyArray<[string, string]> = [
 
 interface AddressPlan {
   last: string | null;
-  hasSentLog: boolean;
   rows: Record<RetentionTable, number[]>;
-  /** bounce rowids that are non-suppressing (deletable only without a sent-log row). */
-  softBounceRows: number[];
   contactIds: Set<string>;
   threadIds: Set<string>;
   /** contact id → newest inbound / outbound value of the messages planned for deletion. */
@@ -227,9 +239,7 @@ export async function planPrivacyRetention(db: Database.Database, cutoff: string
     if (!p) {
       p = {
         last: null,
-        hasSentLog: false,
         rows: emptyRows(),
-        softBounceRows: [],
         contactIds: new Set(),
         threadIds: new Set(),
         markers: new Map(),
@@ -366,21 +376,19 @@ export async function planPrivacyRetention(db: Database.Database, cutoff: string
     await yieldMacrotask();
   }
 
-  // email_bounces: every row is activity; only non-suppressing rows are candidates.
+  // email_bounces: every row is activity; no row is ever a delete candidate
+  // (rows.email_bounces stays empty — see «Kept» in the header).
   snapshot.email_bounces = 0;
   for (const r of db
     .prepare(
-      `SELECT rowid AS rid, LOWER(TRIM(email)) AS e, bounced_at, created_at,
-              CASE WHEN bounce_type IN ${SUPPRESSING_BOUNCE_TYPES_SQL} THEN 1 ELSE 0 END AS suppressing
-         FROM email_bounces`,
+      `SELECT rowid AS rid, LOWER(TRIM(email)) AS e, bounced_at, created_at FROM email_bounces`,
     )
-    .all() as Array<{ rid: number; e: string | null; bounced_at: unknown; created_at: unknown; suppressing: number }>) {
+    .all() as Array<{ rid: number; e: string | null; bounced_at: unknown; created_at: unknown }>) {
     snap("email_bounces", r.rid);
     const e = key(r.e);
     if (!e) continue;
     const p = plan(e);
     touch(p, r.bounced_at, r.created_at);
-    if (r.suppressing !== 1) p.softBounceRows.push(r.rid);
   }
   await yieldMacrotask();
 
@@ -393,7 +401,6 @@ export async function planPrivacyRetention(db: Database.Database, cutoff: string
     const e = key(r.e);
     if (!e) continue;
     const p = plan(e);
-    p.hasSentLog = true;
     touch(p, r.sent_at);
   }
   await yieldMacrotask();
@@ -406,7 +413,6 @@ export async function planPrivacyRetention(db: Database.Database, cutoff: string
       byAddress.delete(e);
       continue;
     }
-    p.rows.email_bounces = p.hasSentLog ? [] : p.softBounceRows;
     let n = 0;
     for (const t of RETENTION_DELETE_TABLES) n += p.rows[t].length;
     if (n === 0) {

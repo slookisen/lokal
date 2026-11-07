@@ -10,8 +10,8 @@
  *
  * Covers: env parsing (mode default dry_run; months < 12 → 24); rows older
  * than the cutoff deleted, younger kept; an address with mixed old+new
- * activity fully kept; suppressing bounces + agent_blocklist kept, a soft
- * bounce kept while the address still has outreach_sent_log rows; dry_run
+ * activity fully kept; every email_bounces row kept (hard, soft, NULL type,
+ * with or without outreach_sent_log rows) + agent_blocklist kept; dry_run
  * writes nothing (db.serialize() identical) and plans exactly what apply then
  * deletes; outreach_sent_log untouched; max-touch guard (per-address + batch
  * lookup), cooldown input (outreach_sent_log last send), gårdssalg reply
@@ -140,6 +140,8 @@ function seedMain(db: Database.Database): void {
     OLD_ISO,
     OLD,
   );
+  // Old soft bounce, no RFB outreach_sent_log row (e.g. an Opplevagent address):
+  // must stay, gardssalg-claim.hasClaimBlockingBounce reads it as a send block.
   addBounce(db, "old@example.no", "soft", OLD, "b-old-soft");
 
   // supp@ — old correspondence + suppression rows (hard bounce, blocklist) + a soft bounce.
@@ -234,6 +236,21 @@ export async function runPrivacyRetentionTests(opts: { log?: boolean } = {}): Pr
   assertEq(mod.resolvePrivacyRetentionMonths("36"), 36, "months: 36 allowed");
   assertEq(mod.computePrivacyRetentionCutoff(NOW, 24, 60), "2024-11-07 03:15:00", "cutoff: now − 24 months");
   assertEq(mod.computePrivacyRetentionCutoff(NOW, 12, 500), "2025-06-24 03:15:00", "cutoff: never closer than longest cooldown + 1 day");
+  assertEq(
+    mod.computePrivacyRetentionCutoff(new Date("2028-02-29T03:15:00Z"), 24, 60),
+    "2026-02-28 03:15:00",
+    "cutoff: 2028-02-29 − 24 months clamps to 2026-02-28",
+  );
+  assertEq(
+    mod.computePrivacyRetentionCutoff(new Date("2026-03-31T03:15:00Z"), 25, 60),
+    "2024-02-29 03:15:00",
+    "cutoff: 2026-03-31 − 25 months clamps to 2024-02-29",
+  );
+  assertEq(
+    mod.computePrivacyRetentionCutoff(new Date("2026-01-31T03:15:00Z"), 13, 60),
+    "2024-12-31 03:15:00",
+    "cutoff: 2026-01-31 − 13 months keeps day 31",
+  );
   assertEq(mod.normalizeRetentionTs("2023-06-02T11:00:00.000Z"), "2023-06-02 11:00:00", "ts: ISO normalized");
   assertEq(mod.normalizeRetentionTs("Mon, 01 Jan 2023"), "9999-12-31 23:59:59", "ts: unparsable → newest (keep)");
   assertEq(mod.normalizeRetentionTs(null), null, "ts: null → none");
@@ -302,7 +319,7 @@ export async function runPrivacyRetentionTests(opts: { log?: boolean } = {}): Pr
       crm_untriaged: 1, // old (weird kept)
       rfb_marketing_send_ledger: 1, // old (mixed kept)
       resend_webhook_events: 3, // old, supp, oslsoft
-      email_bounces: 2, // old soft, supp NULL-type (hard kept; oslsoft soft kept)
+      email_bounces: 0, // never deleted: any bounce is a claim-code send block
     };
     assertEq(dry.planned, expectedPlanned, "dry_run: per-table planned counts");
     assertEq(dry.addresses_expired, 6, "dry_run: 6 expired addresses with deletable rows");
@@ -326,8 +343,13 @@ export async function runPrivacyRetentionTests(opts: { log?: boolean } = {}): Pr
 
     assertEq(
       db.prepare(`SELECT resend_email_id AS id FROM email_bounces ORDER BY rowid`).all(),
-      [{ id: "b-supp-hard" }, { id: "b-osl-soft" }],
-      "apply: suppressing bounce kept; soft bounce kept while outreach_sent_log has the address; others deleted",
+      [{ id: "b-old-soft" }, { id: "b-supp-hard" }, { id: "b-supp-null" }, { id: "b-osl-soft" }],
+      "apply: every email_bounces row kept (hard, soft, NULL type; with or without outreach_sent_log)",
+    );
+    assertEq(
+      count(db, `SELECT COUNT(*) AS c FROM email_bounces WHERE LOWER(TRIM(email)) = 'old@example.no' AND bounce_type = 'soft' AND bounced_at < '${app.cutoff}'`),
+      1,
+      "apply: old soft bounce without outreach_sent_log row kept (claim-code block stays)",
     );
     assertEq(db.prepare(`SELECT * FROM agent_blocklist ORDER BY id`).all(), blockBefore, "apply: agent_blocklist untouched");
     assertEq(db.prepare(`SELECT * FROM outreach_sent_log ORDER BY id`).all(), osBefore, "apply: outreach_sent_log untouched");
