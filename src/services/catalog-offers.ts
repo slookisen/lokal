@@ -342,7 +342,7 @@ function likeContaining(s: string): string {
 
 /**
  * Claim words a search keeps whatever the filler lists say. Explicit, and locked
- * by catalog-offers-flerord.test.ts; organic-claims.ts isOrganicWord() catches
+ * by src/routes/rfb-sok-mengde-flerord.test.ts; organic-claims.ts isOrganicWord() catches
  * their other forms («økomerket», «Debio-godkjent»).
  */
 export const OFFER_CLAIM_WORDS: ReadonlySet<string> = new Set([
@@ -354,6 +354,32 @@ export const OFFER_CLAIM_WORDS: ReadonlySet<string> = new Set([
 export function isOfferClaimWord(word: string): boolean {
   const w = word.trim().toLowerCase();
   return OFFER_CLAIM_WORDS.has(w) || isOrganicWord(w);
+}
+
+/**
+ * Negation and absence words. A phrase holding one of them («brød uten gluten»,
+ * «melk uten laktose», «bread without gluten», «ikke pasteurisert») is never
+ * searched by its words: «uten» is a filler word (QUERY_STOPWORDS in
+ * search-intent/norwegian-query.ts, so FILLER_WORDS), and leaving it out turned
+ * «brød uten gluten» into «brød gluten», which offered «Brød med gluten» — a
+ * false allergen claim (review B1 of PR #1433). Such a phrase gets the answer it
+ * had before the word search: what the whole phrase finds, else empty offers
+ * and no matched_term. The filler lists themselves are unchanged (other
+ * searches read them). Explicit and lower case; Norwegian (bokmål and
+ * nynorsk), Swedish, Danish and English. Locked by
+ * src/routes/rfb-sok-mengde-flerord.test.ts.
+ */
+export const OFFER_NEGATION_WORDS: ReadonlySet<string> = new Set([
+  // Norwegian / Swedish / Danish
+  "uten", "utan", "uden", "ikke", "ikkje", "inte", "ingen", "inga", "intet",
+  "fri", "frie", "fritt", "unntatt",
+  // English
+  "without", "not", "no", "non", "free", "except", "excluding", "minus", "sans",
+]);
+
+/** True when `text` holds a negation or absence word (OFFER_NEGATION_WORDS), by whole word and any case. */
+export function hasOfferNegationWord(text: string): boolean {
+  return tokenize(text).some((w) => OFFER_NEGATION_WORDS.has(w.toLowerCase()));
 }
 
 /**
@@ -564,7 +590,8 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
   // its words (offerSearchWords), all of them in one product name.
   let usedTerm = product;
   let { offerRows, matchRows } = search([product]);
-  if (offerRows.length === 0 && matchRows.length === 0) {
+  // A negation («uten», «without» …) is never read word by word (OFFER_NEGATION_WORDS).
+  if (offerRows.length === 0 && matchRows.length === 0 && !hasOfferNegationWord(product)) {
     const words = offerSearchWords(product);
     const wordsTerm = words.join(" ");
     // One word that is the phrase itself would only search it again.
@@ -576,8 +603,9 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
       }
     }
   }
-  // `term` is what was sent; matched_term only when the search read it otherwise.
-  const head = usedTerm === term ? { term } : { term, matched_term: usedTerm };
+  // `term` is what was sent; matched_term only when the search read it otherwise
+  // (other words, not just other letter case: «Biff Tørrmodnet» read as «biff tørrmodnet»).
+  const head = usedTerm.toLowerCase() === term.toLowerCase() ? { term } : { term, matched_term: usedTerm };
 
   // One producer shape for offers and category matches.
   const ownerChoices = publicFieldChoicesForMany([...offerRows, ...matchRows].map((x) => x.r.agent_id), { db });

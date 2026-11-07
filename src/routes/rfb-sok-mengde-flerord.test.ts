@@ -45,7 +45,10 @@ const TORRMODNET = "Pølsemaker Fixture";
 const LAM = "Lammegården Fixture";
 const OKO = "Økobigården Fixture";
 const VANLIG = "Vanlig Bigård Fixture";
-const ALL = [HONEY_1KG, BIFF, TORRMODNET, LAM, OKO, VANLIG];
+const NORSK = "Norskbigården Fixture";
+const BAKER = "Glutenbakeriet Fixture";
+const MEIERI = "Laktosemeieriet Fixture";
+const ALL = [HONEY_1KG, BIFF, TORRMODNET, LAM, OKO, VANLIG, NORSK, BAKER, MEIERI];
 
 const SEEDS: Seed[] = [
   { id: id(1), name: HONEY_1KG, ...near(0.002), city: "Oslo", categories: ["honey"],
@@ -60,6 +63,15 @@ const SEEDS: Seed[] = [
     products: [{ name: "Økologisk honning", category: "honey", price: "200 kr" }], catalog: [{ name: "Økologisk honning", priceNok: 200 }] },
   { id: id(6), name: VANLIG, ...near(0.012), city: "Oslo", categories: ["honey"],
     products: [{ name: "Honning", category: "honey", price: "150 kr" }], catalog: [{ name: "Honning", priceNok: 150 }] },
+  // Review N3: a product whose name holds a filler word («norsk»).
+  { id: id(7), name: NORSK, ...near(0.014), city: "Oslo", categories: ["honey"],
+    products: [{ name: "Norsk honning", category: "honey", price: "180 kr" }], catalog: [{ name: "Norsk honning", priceNok: 180 }] },
+  // Review B1: products that hold what a negated search asks to be without.
+  { id: id(8), name: BAKER, ...near(0.016), city: "Oslo", categories: ["bakery"],
+    products: [{ name: "Brød med gluten", category: "bakery", price: "60 kr" }, { name: "Bread with gluten", category: "bakery", price: "60 kr" }],
+    catalog: [{ name: "Brød med gluten", priceNok: 60 }, { name: "Bread with gluten", priceNok: 60 }] },
+  { id: id(9), name: MEIERI, ...near(0.018), city: "Oslo", categories: ["dairy"],
+    products: [{ name: "Melk med laktose", category: "dairy", price: "25 kr" }], catalog: [{ name: "Melk med laktose", priceNok: 25 }] },
 ];
 
 export async function runRfbSokMengdeFlerordTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
@@ -218,6 +230,32 @@ export async function runRfbSokMengdeFlerordTests(opts: { log?: boolean } = {}):
       const both = await offers("biff tørrmodnet");
       assertEq(offerNames(both), [`${TORRMODNET}: Tørrmodnet biff`], "findOffers «biff tørrmodnet»: all words in one product name, never one of them");
       assertTrue(!("matched_term" in both), "findOffers «biff tørrmodnet»: the same words in another order carry no matched_term");
+
+      // Review N3: the whole phrase first, unchanged when it finds something.
+      const norsk = await offers("norsk honning");
+      assertEq(offerNames(norsk), [`${NORSK}: Norsk honning`],
+        "findOffers «norsk honning»: the whole phrase hits «Norsk honning», and the answer is not widened to all honey");
+      assertEq(Object.keys(norsk), ["term", "offers"], "findOffers «norsk honning»: a whole-phrase hit carries no matched_term");
+
+      // Review N2: a pure letter-case difference sets no matched_term; other words still do.
+      const caseOnly = await offers("Biff Tørrmodnet");
+      assertEq(offerNames(caseOnly), [`${TORRMODNET}: Tørrmodnet biff`], "findOffers «Biff Tørrmodnet» finds the dry-aged biff by its words");
+      assertTrue(!("matched_term" in caseOnly), "N2: findOffers «Biff Tørrmodnet»: only the letter case differs, so no matched_term");
+      const norskLam = await offers("Norsk Lam");
+      assertEq(norskLam.matched_term, "lam", "N2: findOffers «Norsk Lam»: a word left out still gives matched_term");
+
+      // Review B1: a negation is never read word by word (allergen-related false claim).
+      for (const q of ["brød uten gluten", "melk uten laktose", "bread without gluten", "Brød UTEN gluten"]) {
+        const r = await offers(q);
+        assertEq(r, { term: q, offers: [] }, `B1: findOffers «${q}» is empty with no matched_term (never the product with it)`);
+      }
+      assertEq(offerNames(await offers("brød gluten")), [`${BAKER}: Brød med gluten`], "B1 control: «brød gluten» (no negation) is read by its words");
+      const { OFFER_NEGATION_WORDS, hasOfferNegationWord } =
+        require("../services/catalog-offers") as typeof import("../services/catalog-offers");
+      const negLocked = ["uten", "utan", "uden", "ikke", "ingen", "fri", "without", "not", "no", "free"];
+      assertEq(negLocked.filter((w) => !OFFER_NEGATION_WORDS.has(w)), [], "negation words: OFFER_NEGATION_WORDS holds every locked word");
+      assertEq(["brød uten gluten", "Bread WITHOUT gluten", "melk, uten laktose", "ikke pasteurisert ost", "honning", "utenlandsk ost", "glutenfritt brød"].map(hasOfferNegationWord),
+        [true, true, true, true, false, false, false], "negation words: by whole word and any case («utenlandsk», «glutenfritt» are one word)");
 
       const mcpOffers = tools.get("lokal_find_offers")!;
       const viaMcp = JSON.parse(textOf(await mcpOffers({ items: ["norsk lam", "1kg"], lat: O.lat, lng: O.lng, radius_km: 50 })));
