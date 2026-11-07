@@ -227,6 +227,10 @@ export async function runOwnerFeaturesT5AnchorsTests(opts: { log?: boolean } = {
         db.prepare("INSERT INTO magic_links (id, email, token, agent_id, used, created_at, expires_at) VALUES (?, ?, ?, ?, 1, ?, ?)")
           .run(`mlsess_${id}`, `post@${id}.example.no`, tokens[id], id, new Date().toISOString(), new Date(Date.now() + 86_400_000).toISOString());
       }
+      // dev-request 2026-11-06-rfb-krav-for-portal-og-okter-ved-eierskifte (AC 3):
+      // the order-address form needs the verified claimant's own login.
+      db.prepare("INSERT INTO agent_claims (id, agent_id, claimant_email, claimant_name, status, verified_at) VALUES (?, ?, ?, 'Eier', 'verified', '2026-10-01T00:00:00.000Z')")
+        .run(`claim-${FORMS_ID}`, FORMS_ID, `post@${FORMS_ID}.example.no`);
       process.env.OWNER_FEATURES_ALLOWED_SUBJECTS = SEEDED.filter((id) => id !== OUTSIDE_ID).map((id) => `rfb:${id}`).join(",");
 
       const H: Record<string, Function> = {

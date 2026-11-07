@@ -37540,6 +37540,19 @@ const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
     failed++;
     failures.push("bestillinger-b1b: unexpected error: " + String(err?.message || err));
   }
+  // dev-request 2026-11-06 AC 3 (products, order e-mail, profile e-mail only from the verified claimant's own login) — own in-memory DB.
+  try {
+    const { runOwnerClaimantEmailRuleTests } = require("../src/routes/owner-claimant-email-rule.test") as
+      typeof import("../src/routes/owner-claimant-email-rule.test");
+    const cer = await runOwnerClaimantEmailRuleTests({ log: false });
+    passed += cer.passed;
+    failed += cer.failed;
+    for (const f of cer.failures) failures.push("owner-claimant-email-rule: " + f);
+    console.log(`  owner-claimant-email-rule: ${cer.passed} passed, ${cer.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-claimant-email-rule: unexpected error: " + String(err?.message || err));
+  }
   // B2b-1 (bestillinger: soft stock expiry 14–60 days, confirm refresh, «Utsolgt» on decline) — own in-memory DB.
   try {
     const { runBestillingerB2b1Tests } = require("../src/routes/bestillinger-b2b1.test") as

@@ -834,6 +834,12 @@ router.post("/api/agents/:id/update-profile", (req: Request, res: Response) => {
       }
     }
 
+    // dev-request 2026-11-06 (AC 3): a new profile e-mail only from the
+    // verified claimant's own login; refused as a whole, nothing written.
+    if ("email" in bodyFields && profileEmailChangeNeedsClaimant(id, sessionData, bodyFields.email)) {
+      return res.status(403).json({ success: false, error: "claimant_login_required", message: OWNER_CLAIMANT_EMAIL_MESSAGES.profile_email });
+    }
+
     // Strip any read-only fields
     for (const field of READ_ONLY_FIELDS) {
       delete (req.body as any)[field];
@@ -1729,6 +1735,11 @@ export async function requestOwnerOrderEmailChange(
       ? { status: 403, body: { success: false, error: "ownership_not_verified", message: OWNER_ORDER_EMAIL_LOCKED_MESSAGE } }
       : { status: 403, body: { success: false, error: "forbidden", message: "Du har ikke tilgang til denne agenten." } };
   }
+  // dev-request 2026-11-06 (AC 3): only the verified claimant's own login may
+  // ask for a new order address (no token row, no mail otherwise).
+  if (!sessionClaimantOwnerEmail(agentId, session)) {
+    return { status: 403, body: { success: false, error: "claimant_login_required", message: OWNER_CLAIMANT_EMAIL_MESSAGES.order_email } };
+  }
   const email = normalizeEmail(typeof rawEmail === "string" ? rawEmail : "");
   if (!email || !isPlausibleOrderEmail(email)) {
     return { status: 400, body: { success: false, error: "invalid_email", message: "Skriv inn en gyldig e-postadresse." } };
@@ -2588,6 +2599,7 @@ router.post("/eier/:agentId/order-email", express.urlencoded({ extended: false }
     const out = await requestOwnerOrderEmailChange(req, agentId, req.body?.email);
     if (out.status === 401) return res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
     if (out.status === 200) return res.redirect(303, `${base}?status=order_email_sent#bestillinger`);
+    if (out.status === 403 && out.body?.error === "claimant_login_required") return res.status(403).send(ownerEmailNeedsClaimantLoginPage(agentId, "order_email"));
     const mapped = ORDER_EMAIL_ERROR_STATUS[String(out.body?.error || "")];
     if (mapped) return res.redirect(303, `${base}?status=${mapped}#bestillinger`);
     if (out.status === 403 && out.body?.error === "ownership_not_verified") return res.status(403).send(ownerNotVerifiedPage(agentId));
@@ -2709,6 +2721,10 @@ router.post("/eier/:agentId/save", express.urlencoded({ extended: false }), asyn
     for (const key of EDITABLE_FIELDS) {
       const v = (req.body as any)[`field_${key}`];
       if (v !== undefined) payload[key] = String(v);
+    }
+    // dev-request 2026-11-06 (AC 3): same rule as update-profile, answered with the page.
+    if ("email" in payload && profileEmailChangeNeedsClaimant(agentId, session, payload.email)) {
+      return res.status(403).send(ownerEmailNeedsClaimantLoginPage(agentId, "profile_email"));
     }
     const url = `${req.protocol}://${req.get("host")}/api/agents/${encodeURIComponent(agentId)}/update-profile`;
     const resp = await fetch(url, {
@@ -3035,6 +3051,47 @@ export function ownerProductsNeedClaimantLoginPage(agentId: string): string {
           <a class="ep-btn ep-btn-primary" href="/selger?agent=${id}">Logg inn med eierens e-post</a>
         </div>`
   );
+}
+
+/**
+ * dev-request 2026-11-06-rfb-krav-for-portal-og-okter-ved-eierskifte (AC 3):
+ * the e-mail writes that need the verified claimant's own login, as products do.
+ */
+export type OwnerClaimantEmailField = "order_email" | "profile_email";
+
+export const OWNER_CLAIMANT_EMAIL_MESSAGES: Record<OwnerClaimantEmailField, string> = {
+  order_email: "For å endre adressen bestillingene sendes til, må du logge inn med e-postadressen til den som har bekreftet eierskapet til profilen.",
+  profile_email: "For å endre e-postadressen på profilen må du logge inn med e-postadressen til den som har bekreftet eierskapet til profilen.",
+};
+
+/** 403 page: verified owner, but this session may not change the order or profile e-mail (not the claimant's own login). */
+export function ownerEmailNeedsClaimantLoginPage(agentId: string, field: OwnerClaimantEmailField): string {
+  const id = encodeURIComponent(agentId);
+  return portalShell(
+    "Logg inn med eierens e-post",
+    `<div class="ep-card" data-claimant-login-required="1">
+          <h1>Logg inn med eierens e-postadresse</h1>
+          <p>${escapeHtml(OWNER_CLAIMANT_EMAIL_MESSAGES[field])} Ingenting er endret.</p>
+          <a class="ep-btn ep-btn-primary" href="/selger?agent=${id}">Logg inn med eierens e-post</a>
+        </div>`
+  );
+}
+
+/**
+ * True when this save would change the profile e-mail (agent_knowledge.email,
+ * compared as the save compares it) and the session is not the verified
+ * claimant's own login — the save must then be refused as a whole.
+ */
+export function profileEmailChangeNeedsClaimant(
+  agentId: string,
+  session: { token?: string } | null | undefined,
+  rawEmail: unknown,
+): boolean {
+  if (rawEmail === undefined) return false;
+  const row = getDb().prepare("SELECT email FROM agent_knowledge WHERE agent_id = ?").get(agentId) as { email?: string | null } | undefined;
+  if (!row) return false; // no profile: the save answers agent_not_found itself
+  if (normalizeOwnerProfileValue("email", rawEmail) === normalizeOwnerProfileValue("email", row.email)) return false;
+  return !sessionClaimantOwnerEmail(agentId, session);
 }
 
 type OwnerOrderabilityAuth = { ok: true; agentId: string; email: string | null } | { ok: false };

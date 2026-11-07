@@ -181,6 +181,13 @@ export async function runOwnerOrderEmailS1b7Tests(opts: { log?: boolean } = {}):
       db.prepare("INSERT INTO magic_links (id, email, token, agent_id, used, created_at, expires_at) VALUES (?, ?, ?, ?, 1, ?, ?)")
         .run(`mlsess_${id}`, `post@${id}.example.no`, tokens[id], id, new Date().toISOString(), new Date(Date.now() + 86_400_000).toISOString());
     }
+    // dev-request 2026-11-06-rfb-krav-for-portal-og-okter-ved-eierskifte (AC 3):
+    // only the verified claimant's own login may ask for a new order address,
+    // so the owner session here is the verified claimant's.
+    db.prepare("INSERT INTO agent_claims (id, agent_id, claimant_email, claimant_name, status, verified_at) VALUES (?, ?, ?, ?, 'verified', ?)")
+      .run("claim-s1b7-owner", OWNED_ID, `post@${OWNED_ID}.example.no`, "Eier", "2026-10-01T00:00:00.000Z");
+    db.prepare("INSERT INTO agent_claims (id, agent_id, claimant_email, claimant_name, status, verified_at) VALUES (?, ?, ?, ?, 'verified', ?)")
+      .run("claim-s1b7-other", OTHER_ID, `post@${OTHER_ID}.example.no`, "Eier", "2026-10-01T00:00:00.000Z");
 
     const request = (id: string, email: unknown, token: string | undefined = tokens[id]) =>
       invoke(H.api, makeReq({ params: { id }, body: { email }, token }));
@@ -344,11 +351,13 @@ export async function runOwnerOrderEmailS1b7Tests(opts: { log?: boolean } = {}):
       assertEq((await request(OWNED_ID, F)).status, 200, "chk-3: request another address");
       const tf = tokenOf(sentConfirms[1].confirmUrl);
       db.prepare("UPDATE agents SET claimed_at = NULL WHERE id = ?").run(OWNED_ID);
+      db.prepare("UPDATE agent_claims SET status = 'revoked' WHERE id = 'claim-s1b7-owner'").run();
       const n = await confirmPost(tf);
       assertEq([n.status, overrideCol()], [400, NEW_EMAIL], "chk-4: profile no longer verified-owned → rejected, nothing written");
       // Someone re-claims the profile (new ownership basis) → the link issued
       // under the old ownership must stay dead.
       db.prepare("UPDATE agents SET claimed_at = ? WHERE id = ?").run("2026-10-26T09:00:00.000Z", OWNED_ID);
+      db.prepare("UPDATE agent_claims SET status = 'verified' WHERE id = 'claim-s1b7-owner'").run();
       const re = await confirmPost(tf);
       assertEq([re.status, overrideCol(), auditRows().length], [400, NEW_EMAIL, 1], "chk-5: token issued before an ownership reset/re-claim → 400, nothing written");
       db.prepare("INSERT INTO agent_claims (id, agent_id, claimant_email, claimant_name, status, claim_token, claim_token_expires_at) VALUES (?, ?, ?, ?, 'verified', ?, ?)")

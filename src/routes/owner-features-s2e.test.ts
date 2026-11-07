@@ -228,6 +228,10 @@ export async function runOwnerFeaturesS2eTests(opts: { log?: boolean } = {}): Pr
         .run(`mlsess_${id}`, email, tokens[id], id, new Date().toISOString(), new Date(Date.now() + 86_400_000).toISOString());
     };
     for (const id of SEEDED) addSession(id, `post@${id}.example.no`);
+    // dev-request 2026-11-06-rfb-krav-for-portal-og-okter-ved-eierskifte (AC 3):
+    // a new order address only from the verified claimant's own login.
+    db.prepare("INSERT INTO agent_claims (id, agent_id, claimant_email, claimant_name, status, verified_at) VALUES (?, ?, ?, 'Eier', 'verified', '2026-10-01T00:00:00.000Z')")
+      .run(`claim-${OWNED_ID}`, OWNED_ID, `post@${OWNED_ID}.example.no`);
 
     // The armed hidden test producer (real POST /admin/test-producer, mode arm, with owner_email).
     const TP = findRouteHandler(tpMod.default, "/", "post");
