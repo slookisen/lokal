@@ -52786,3 +52786,26 @@ runSerial(async () => {
     failures.push("opplevagent-tool-metadata: unexpected error: " + String(err?.message || err));
   }
 });
+
+// A2A dev-request 2026-11-06-rfb-sok-mengde-flerord-og-treffvisning, slices A+B:
+// a quantity («1kg», «0,5 kg», «2 stk») is no product word in lokal_search or
+// findOffers, and a quantity alone asks for a product (needs_product:true in
+// findOffers); a findOffers phrase that finds nothing is searched by its words
+// without filler words, all of them in one product name, and an organic claim
+// word is never left out (OFFER_CLAIM_WORDS, locked). Own in-memory DB (restored
+// in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── RFB-søk: mengde er ikke produktord, find_offers med flere ord (skive A+B) ──");
+  try {
+    const { runRfbSokMengdeFlerordTests } = require("../src/routes/rfb-sok-mengde-flerord.test") as
+      typeof import("../src/routes/rfb-sok-mengde-flerord.test");
+    const r = await runRfbSokMengdeFlerordTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-sok-mengde-flerord: " + f);
+    console.log(`  rfb-sok-mengde-flerord: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-sok-mengde-flerord: unexpected error: " + String(err?.message || err));
+  }
+});

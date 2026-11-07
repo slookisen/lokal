@@ -37,6 +37,7 @@ import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/inter
 import { evaluateStockFreshness } from "../services/supply-graph";
 import { stockSoftExpiryActiveFor, stockSoftExpiryBuyerTextNb } from "../services/stock-soft-expiry";
 import { findOffers, resolveOffersRadiusKm, resolveOffersLimit, type FindOffersResult } from "../services/catalog-offers";
+import { splitQueryQuantity } from "../utils/query-quantity";
 import { formatAddressLine } from "../utils/address-format";
 import { DRINK_SUBCATEGORIES } from "../services/drink-taxonomy";
 import {
@@ -713,6 +714,16 @@ function noProductMatchText(words: string): string {
     "Try another word, a category (for example «bakery» or «honey») or a producer name.";
 }
 
+/**
+ * A2A dev-request 2026-11-06-rfb-sok-mengde-flerord-og-treffvisning, slice A:
+ * lokal_search's answer to a search of a quantity only («1kg», «500 g»): it
+ * names no product, so no producers are listed (utils/query-quantity.ts).
+ */
+function quantityOnlyText(quantity: string): string {
+  return `🔎 «${quantity}» er en mengde, ikke en vare. Si hvilken vare du ser etter, for eksempel «honning ${quantity}». / ` +
+    `«${quantity}» is a quantity, not a product. Say which product you are looking for, for example «honey ${quantity}».`;
+}
+
 /** Slice I-W: the line above a list of the producers near a place when no product there matches `words`. */
 function areaListText(words: string): string {
   return `🔎 Ingen produsent i området har ${words} i produktlista. Listen under er produsentene i området, ikke treff på ${words}; ` +
@@ -833,6 +844,12 @@ export function registerTools(
       const q = capFreeText(query || "");
       const foreign = foreignPlaceIn(q);
       if (foreign) return outsideNorwayAnswer(foreign);
+      // Slice A (2026-11-06-rfb-sok-mengde-flerord-og-treffvisning): a quantity
+      // alone names no product; without this «1kg» gave the standard list.
+      const qty = splitQueryQuantity(q);
+      if (qty.quantities.length > 0 && !qty.product) {
+        return { content: [{ type: "text" as const, text: quantityOnlyText(qty.quantities.join(" ")) }] };
+      }
       const parsed = marketplaceRegistry.parseNaturalQuery(q);
 
       // fix 0g(i): explicit coordinates beat any place name in the text —
