@@ -18,6 +18,7 @@
 import { formatAddressLine } from "../utils/address-format";
 import { randomUUID, randomBytes } from "crypto";
 import { getDb } from "../database/init";
+import { isContactHiddenAgentId } from "./agent-visibility";
 import { recordTrustEvent } from "./trust-event-service";
 import { sendOrderNotificationForOrder, OrderNotificationInput } from "./order-notify-service";
 import { evaluateStockFreshness, producerStockExpiresAt, producerStockHardExpiresAt, type StockFreshness } from "./supply-graph";
@@ -1307,7 +1308,10 @@ function buildContactHandoff(
   lines: Array<{ name: string; qty: number; unit?: string | null }>
 ): ContactHandoff {
   const info = knowledgeService.getAgentInfo(agentId);
-  const k = info?.knowledge;
+  // A catalog_hidden producer (the hidden test fixture, e.g. when its order
+  // cap is hit or it is retired) never shows its phone/e-mail here: they are
+  // a real person's (agent-visibility.ts). profile_url and message stay.
+  const k = isContactHiddenAgentId(cartServiceDb(), agentId) ? undefined : info?.knowledge;
   return {
     agent_id: agentId,
     name: agentName,

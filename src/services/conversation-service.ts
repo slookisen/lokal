@@ -8,7 +8,7 @@ import { formatAddressLine } from "../utils/address-format";
 import { openingHoursText } from "../utils/opening-hours";
 import { trustScoreService } from "./trust-score-service";
 import { isInternalTraffic, type RequestMeta } from "./internal-traffic";
-import { notOwnerHiddenSql } from "./agent-visibility";
+import { notOwnerHiddenSql, isContactHiddenAgentId, HIDDEN_CONTACT_NOTE_NB } from "./agent-visibility";
 import { isDebioVerifiedValue, stripOrganicCategories } from "./organic-claims";
 import { textEntries } from "../utils/text-entries";
 import {
@@ -350,14 +350,19 @@ class ConversationService {
       parts.push(`\n🕐 Åpningstider: ${hours}`);
     }
 
-    // Contact info
-    const contact: string[] = [];
-    if (k.address) contact.push(`📍 ${formatAddressLine(k.address, k.postalCode, agent.city)}`);
-    if (k.phone) contact.push(`📞 ${k.phone}`);
-    if (k.email) contact.push(`✉️ ${k.email}`);
-    if (k.website) contact.push(`🌐 ${k.website}`);
-    if (contact.length) {
-      parts.push(`\nKontakt oss:\n${contact.join("\n")}`);
+    // Contact info — never for a catalog_hidden row (the hidden test
+    // fixture): its contact details are a real person's (agent-visibility.ts).
+    if (isContactHiddenAgentId(getDb(), sellerAgentId)) {
+      parts.push(`\n${HIDDEN_CONTACT_NOTE_NB}`);
+    } else {
+      const contact: string[] = [];
+      if (k.address) contact.push(`📍 ${formatAddressLine(k.address, k.postalCode, agent.city)}`);
+      if (k.phone) contact.push(`📞 ${k.phone}`);
+      if (k.email) contact.push(`✉️ ${k.email}`);
+      if (k.website) contact.push(`🌐 ${k.website}`);
+      if (contact.length) {
+        parts.push(`\nKontakt oss:\n${contact.join("\n")}`);
+      }
     }
 
     // Delivery info

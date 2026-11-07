@@ -20,7 +20,7 @@ import { stripOrganicEntries } from "../services/organic-claims";
 import { textEntries } from "../utils/text-entries";
 import { redactPII } from "../utils/pii-redact";
 import { getDb } from "../database/init";
-import { isAgentIdPubliclyVisible, isDelistedAgentId, ownerHidesAgent } from "../services/agent-visibility";
+import { isAgentIdPubliclyVisible, isDelistedAgentId, ownerHidesAgent, isContactHiddenAgentId, withoutContactFields } from "../services/agent-visibility";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
 import { signAgentCard, getJWKS } from "../services/agent-card-signing";
@@ -759,6 +759,11 @@ export function withSoftStockProducts<T extends { knowledge: any }>(info: T, age
   return changed ? { ...info, knowledge: { ...info.knowledge, products: out } } : info;
 }
 
+/** The info without its contact fields when the row is catalog_hidden for this view; else the same object. */
+function withoutHiddenRowContact<T extends { knowledge: any }>(info: T, agentId: string): T {
+  return isContactHiddenAgentId(getDb(), agentId) ? { ...info, knowledge: withoutContactFields(info.knowledge) } : info;
+}
+
 function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
   const agentId = params?.agentId;
   if (!agentId) {
@@ -803,7 +808,9 @@ function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
           name: "agent-info",
           // S2c-1: without what the owner hid (not enforced = as before).
           // B2b-2: products in the stock rule's soft window carry the date.
-          data: withSoftStockProducts(publicAgentInfo(info, publicFieldChoices(agentId)), String(agentId)),
+          // A catalog_hidden row (the hidden test fixture) never shows its
+          // contact details (agent-visibility.ts, as lokal_info).
+          data: withSoftStockProducts(withoutHiddenRowContact(publicAgentInfo(info, publicFieldChoices(agentId)), String(agentId)), String(agentId)),
         }),
       ],
     },
