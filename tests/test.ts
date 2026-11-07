@@ -52851,6 +52851,25 @@ runSerial(async () => {
   }
 });
 
+// Produktimport skive 4-2c: receipt nudge to «Mine valg» weekly_sync after a
+// publish, products.weekly_sync in the owner change log, status-line escaping.
+// Swaps the getDb() singleton and env (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── produktimport skive 4-2c: kvittering → Mine valg + endringslogg ──");
+  try {
+    const { runOwnerImportWeeklyNudgeTests } = require("../src/routes/owner-product-import-weekly-nudge.test") as
+      typeof import("../src/routes/owner-product-import-weekly-nudge.test");
+    const r = await runOwnerImportWeeklyNudgeTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("product-import-weekly-nudge: " + f);
+    console.log(`  product-import-weekly-nudge: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("product-import-weekly-nudge: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-11-05-eierflagg-koblet-til-pilotlisten: PRODUCT_IMPORT_ENABLED,
 // OWNER_ORDER_EMAIL_ENABLED, OWNER_UNIFIED_SESSION_ENABLED and
 // PRODUCT_IMPORT_OUTREACH_ENABLED accept exactly "pilot" (on only for owners in
