@@ -51173,6 +51173,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-16-klient-ip-fra-fly-client-ip, trinn 3: the client
+// headers normalizer (middleware/client-headers.ts) — X-Forwarded-Host
+// stripped, X-Forwarded-Proto only from fly-forwarded-proto (http|https),
+// CLIENT_HEADERS_NORMALIZE_DEFAULT switch, and index.ts mounting order.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-16-klient-ip-fra-fly-client-ip, trinn 3: normalize forwarded host/proto ──");
+  try {
+    const { runClientHeadersTests } = require("../src/middleware/client-headers.test") as
+      typeof import("../src/middleware/client-headers.test");
+    const ch = await runClientHeadersTests({ log: false });
+    passed += ch.passed;
+    failed += ch.failed;
+    for (const f of ch.failures) failures.push("client-headers: " + f);
+    console.log(`  client-headers: ${ch.passed} passed, ${ch.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("client-headers: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-16-klient-ip-fra-fly-client-ip, trinn 1c: the closed
 // client-IP shadow windows are stored (client_ip_shadow_windows, written by
 // the store's timer, never by the request path), so clientIp.cumulative
