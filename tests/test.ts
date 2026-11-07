@@ -52825,3 +52825,24 @@ runSerial(async () => {
     failures.push("opplevagent-tool-metadata: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-11-06-rfb-krav-for-portal-og-okter-ved-eierskifte point 1:
+// GET /admin/owner-gate-impact — READ-ONLY count of profiles without a verified
+// owner and live sessions / login links OWNER_VERIFIED_OWNER_GATE_ENABLED would
+// stop. Own in-memory DB via its seam; toggles the gate env (restored in
+// finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── admin-owner-gate-impact: hvem eiergaten ville stoppe ──");
+  try {
+    const { runAdminOwnerGateImpactTests } = require("../src/routes/admin-owner-gate-impact.test") as
+      typeof import("../src/routes/admin-owner-gate-impact.test");
+    const r = await runAdminOwnerGateImpactTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-owner-gate-impact: " + f);
+    console.log(`  admin-owner-gate-impact: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-owner-gate-impact: unexpected error: " + String(err?.message || err));
+  }
+});
