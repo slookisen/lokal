@@ -52826,9 +52826,9 @@ runSerial(async () => {
 });
 
 // Daniel 2026-11-07 (Lega): POST /admin/agents/content-correction field
-// "address" — audited address correction that appends one admin_correction
-// provenance record and keeps the old ones (verdict unchanged, old value stays
-// refused by canCorrectFactualField). Own ":memory:" DB via the route's seam;
+// "address" — audited address correction; resets the geocode on a real
+// change and never touches field_provenance (verdict unchanged). Own
+// ":memory:" DB via the route's seam;
 // sets ADMIN_KEY only if unset (restored) — runSerial.
 runSerial(async () => {
   console.log("\n── content-correction: adresse ──");

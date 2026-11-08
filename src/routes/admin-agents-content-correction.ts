@@ -130,33 +130,38 @@
 // owner-locked, owner_consent is ignored (not checked) and the outcome is the
 // normal one — consent is never claimed where it was not what let it through.
 // Without owner_consent behaviour is unchanged (skipped_claimed).
-//
-// ── address (Daniel 2026-11-07, Lega: «Bygg admin-retting her») ─────────
-// { agent_id, field: "address", text, source_url? } writes
-// agent_knowledge.address (street line only — postal code and city are their
-// own columns). PUT /admin/knowledge cannot do this honestly: an address with
-// sources may only be overwritten by two Tier-A sources or the owner, AND only
-// when the old value is known-bad (canCorrectFactualField), so a correction a
-// person established from the producer's own site was refused there. Same
-// locks as every item here (owner lock / owner_consent, curated_fields
-// "address", unchanged, junk gate) plus: one line, at most
-// CONTENT_CORRECTION_MAX_ADDRESS chars; source_url, when given, must be an
-// http(s) URL. The apply also APPENDS one record to
-// field_provenance.address — { value, source_type: "admin_correction",
-// fetched_at, source_url?, reason } — in the same transaction. Existing
-// records are kept, never rewritten: the cross-source verdict (which only
-// counts Tier-A/B/S records — "admin_correction" is none of them) and with it
-// pool eligibility stay exactly as they were, and because the old value's
-// records stay, canCorrectFactualField keeps refusing an enrichment write that
-// would put the old address back. A field_provenance that is not a JSON object
-// -> skipped_malformed_json, nothing written. The audit row (field_name
-// address) notes the appended record.
 // Residual risk: the route is admin-key only and every consent write is
 // audited (audit notes + crm_actions), but the check proves «the contact
 // replied after we wrote», not WHAT they agreed to — the admin caller is
 // trusted to cite a reply that really is a «ja» to this fix. One consent
 // message can also be reused across fields/items/calls for the same agent;
 // the crm_actions trail makes such reuse visible, it does not prevent it.
+//
+// ── address (Daniel 2026-11-07, Lega: «Bygg admin-retting her») ─────────
+// { agent_id, field: "address", text, source_url? } writes
+// agent_knowledge.address (the street line; postal code and city are their
+// own columns). PUT /admin/knowledge cannot do this honestly: an address with
+// sources may only be overwritten by two Tier-A sources or the owner, and only
+// when the old value is known-bad (canCorrectFactualField), so a correction a
+// person established from the producer's own site was refused there. Same
+// locks as every item here (owner lock / owner_consent, curated_fields
+// "address", unchanged, junk gate), plus: one line, at most
+// CONTENT_CORRECTION_MAX_ADDRESS chars; source_url, when given, must be an
+// http(s) URL — it is evidence for the audit notes only.
+// On a real change the apply also resets the agent's geocode (the same columns
+// PUT /admin/knowledge resets: geo_precision/lat/lng/geocode_source/
+// geocode_outcome NULL, geocode_attempts 0, geocode_attempted_at NULL) in the
+// same transaction, so the geocode worker moves the map pin to the new address
+// instead of leaving it at the old one.
+// field_provenance is NOT touched. A record of our own would change the
+// cross-source verdict for empty or inference-only provenance (and so pool
+// eligibility and the inference-only outreach flag) without any new evidence,
+// and a homepage-typed record would be provenance we did not fetch. The audit
+// row (field_name address, changed_by admin, reason, source_url) is the record.
+// Residual risk: other writers can put the old value back — PUT
+// /admin/knowledge without allow_correct, PUT /api/marketplace/agents/:id/
+// knowledge, and the road-designation upgrade paths do not know about an admin
+// correction. Follow-up dev-request: those writers respect it.
 
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
@@ -219,8 +224,6 @@ const LIST_FIELDS: readonly ListField[] = ["specialties", "certifications", "tag
 export const CONTENT_CORRECTION_MAX_PRODUCT_NAME = 200;
 export const CONTENT_CORRECTION_MAX_ADDRESS = 200;
 export const CONTENT_CORRECTION_MAX_SOURCE_URL = 500;
-/** source_type of the provenance record an address correction appends. */
-export const ADMIN_CORRECTION_SOURCE_TYPE = "admin_correction";
 export const CONTENT_CORRECTION_MAX_REMOVE = 100;
 export const CONTENT_CORRECTION_MAX_CONSENT_ID = 200;
 
@@ -289,7 +292,6 @@ interface LockSnapshot {
   description: string;
   about: string | null;
   address: string | null;
-  field_provenance: string | null;
   products: string | null;
   specialties: string | null;
   certifications: string | null;
@@ -306,7 +308,6 @@ const LOCK_SNAPSHOT_SQL = `
          a.tags         AS tags,
          k.about        AS about,
          k.address      AS address,
-         k.field_provenance AS field_provenance,
          k.products     AS products,
          k.specialties  AS specialties,
          k.certifications AS certifications,
@@ -342,36 +343,6 @@ function isFieldCurated(curatedFieldsJson: string | null | undefined, fieldName:
 function storageColumn(field: Field): TextField | "address" | "products" | ListField {
   if (field === "product_name" || field === "products_organic_flag") return "products";
   return field;
-}
-
-/**
- * Parse a stored field_provenance column for an address correction:
- * null/'' -> {}; a JSON object -> it; anything else (bad JSON, array, scalar)
- * -> null (malformed, never overwritten).
- */
-function parseProvenanceObject(stored: string | null | undefined): Record<string, unknown> | null {
-  if (stored == null || stored === "") return {};
-  try {
-    const v = JSON.parse(stored);
-    return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * field_provenance with `record` appended to its `address` entry. Existing
- * records are kept as they are (a single-object entry becomes a one-element
- * array first, the shape usableFieldRecords already reads); other fields
- * untouched. null when the stored value is malformed.
- */
-function withAddressProvenanceRecord(stored: string | null | undefined, record: Record<string, unknown>): string | null {
-  const fp = parseProvenanceObject(stored);
-  if (!fp) return null;
-  const cur = fp.address;
-  const list = Array.isArray(cur) ? cur.slice() : cur && typeof cur === "object" ? [cur] : [];
-  list.push(record);
-  return JSON.stringify({ ...fp, address: list });
 }
 
 function isHttpUrl(s: string): boolean {
@@ -785,9 +756,6 @@ function plan(
     if (stop) return { ...base, outcome: stop.stop, detail: stop.detail, viaOwnerConsent: undefined };
     if (isFieldCurated(cur.curated_fields, "address")) return { ...base, outcome: "skipped_curated" };
     if ((oldValue ?? "") === item.text) return { ...base, outcome: "skipped_unchanged" };
-    if (!parseProvenanceObject(cur.field_provenance)) {
-      return { ...base, outcome: "skipped_malformed_json", detail: "stored field_provenance is not a JSON object" };
-    }
     return { ...base, outcome: "would_write", newValue: item.text };
   }
 
@@ -911,24 +879,19 @@ function applyCorrection(item: ValidItem, reason: string, batchTag: string): App
       const nowIso = new Date().toISOString();
       const col = p.column!;
       const newValue = p.newValue!;
-      let provenanceNote = "";
+      let addressNote = "";
       if (item.field === "address") {
-        const record: Record<string, unknown> = {
-          value: newValue,
-          source_type: ADMIN_CORRECTION_SOURCE_TYPE,
-          fetched_at: nowIso,
-          ...(item.source_url ? { source_url: item.source_url } : {}),
-          reason: `${batchTag}: ${reason}`.slice(0, 500),
-        };
-        const fp = withAddressProvenanceRecord(cur!.field_provenance, record);
-        // plan() already refused a malformed value; re-checked on the fresh row.
-        if (fp === null) return { ...p, outcome: "skipped_malformed_json", detail: "stored field_provenance is not a JSON object", name: cur?.name };
         if (cur!.has_knowledge_row) {
-          db.prepare(`UPDATE agent_knowledge SET address = ?, field_provenance = ?, updated_at = ? WHERE agent_id = ?`).run(newValue, fp, nowIso, item.agent_id);
+          db.prepare(`UPDATE agent_knowledge SET address = ?, updated_at = ? WHERE agent_id = ?`).run(newValue, nowIso, item.agent_id);
         } else {
-          db.prepare(`INSERT INTO agent_knowledge (agent_id, address, field_provenance, updated_at) VALUES (?, ?, ?, ?)`).run(item.agent_id, newValue, fp, nowIso);
+          db.prepare(`INSERT INTO agent_knowledge (agent_id, address, updated_at) VALUES (?, ?, ?)`).run(item.agent_id, newValue, nowIso);
         }
-        provenanceNote = ` [field_provenance.address += ${JSON.stringify(record)}]`;
+        // plan() only reaches here on a real change: move the map pin too.
+        db.prepare(
+          `UPDATE agents SET geo_precision = NULL, lat = NULL, lng = NULL, geocode_source = NULL,
+             geocode_outcome = NULL, geocode_attempts = 0, geocode_attempted_at = NULL WHERE id = ?`,
+        ).run(item.agent_id);
+        addressNote = ` [geocode reset]${item.source_url ? ` [source_url: ${item.source_url}]` : ""}`;
       } else if (col === "description") {
         db.prepare(`UPDATE agents SET description = ? WHERE id = ?`).run(newValue, item.agent_id);
       } else if (col === "tags") {
@@ -952,7 +915,7 @@ function applyCorrection(item: ValidItem, reason: string, batchTag: string): App
         notes += ` [merge: kept ${p.merge.kept} ${JSON.stringify(p.merge.kept_product)}; dropped ${JSON.stringify(p.merge.dropped_product)}]`;
       }
       if (catalog) notes += ` [catalog: ${JSON.stringify(catalog)}]`;
-      notes += provenanceNote;
+      notes += addressNote;
       db.prepare(
         `INSERT INTO agent_knowledge_audit
            (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
