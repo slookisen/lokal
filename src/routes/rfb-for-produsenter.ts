@@ -205,6 +205,54 @@ function orderLimitLinesEn(cfg: OrderLimitsConfig): string[] {
   ];
 }
 
+/**
+ * The #mine-valg Q/A in the function's state. for_alle = the approved 30.10
+ * wording; i_pilot = what the pilot producers have, marked «I pilot»;
+ * planlagt = described as planned (AC10: never «you can» for a pilot-only
+ * function).
+ */
+function mineValgQa(lang: "no" | "en", state: PilotState): FaqPair[] {
+  const parts = OWNER_LEVELS.map((l) => `«${l.label[lang]}»: ${l.description[lang]}`).join(" ");
+  if (lang === "en") {
+    if (state === "for_alle") return [
+      { q: "Which levels can I choose?", a: levelsAnswer("en") },
+      { q: "Can I change my mind?", a: "Yes. You can change level and switch choices on and off whenever you like. Orders you have already received must still be answered." },
+      { q: "What does «Planned» mean?", a: "These are choices we have not built yet. They have no effect until they are finished. Press «Gi meg beskjed» (Let me know) if you want to hear when a choice arrives." },
+      { q: "What do «Always» and «Locked on» mean?", a: "«Always» means a promise from Rett fra Bonden. It applies all the time and cannot be switched off. «Locked on» means the choice belongs to something you have switched on, for example order notifications by e-mail when you accept orders." },
+    ];
+    if (state === "i_pilot") return [
+      { q: "Which levels are there in «Mine valg» (in pilot)?", a: `In pilot: «Mine valg» (My choices) has two levels. ${parts}` },
+      { q: "Can I change my mind?", a: "Yes. You can switch orders on and off whenever you like. Orders you have already received must still be answered. In pilot: the producers in the pilot change level and switch choices on and off in «Mine valg» whenever they like." },
+      { q: "What does «Planned» mean?", a: "In pilot: the «Planlagt» (Planned) box in «Mine valg» lists choices we have not built yet. They have no effect until they are finished. The producers in the pilot can press «Gi meg beskjed» (Let me know) on a choice they want." },
+      { q: "What do «Always» and «Locked on» mean?", a: "In pilot: in «Mine valg», «Always» means a promise from Rett fra Bonden that applies all the time and cannot be switched off, and «Locked on» means the choice belongs to something the producer in the pilot has switched on, for example order notifications by e-mail." },
+    ];
+    return [
+      { q: "Which levels are planned in «Mine valg»?", a: `«Mine valg» (My choices) is planned, with two levels. ${parts}` },
+      { q: "Can I change my mind?", a: "Yes. You can switch orders on and off whenever you like. Orders you have already received must still be answered. Changing level and switching individual choices in «Mine valg» is planned." },
+      { q: "What does «Planned» mean?", a: "Planned means something we have not built yet. It has no effect until it is finished." },
+      { q: "What do «Always» and «Locked on» mean?", a: "They are labels planned for «Mine valg»: «Always» will mean a promise from Rett fra Bonden that cannot be switched off, and «Locked on» will mean the choice belongs to something you have switched on." },
+    ];
+  }
+  if (state === "for_alle") return [
+    { q: "Hvilke nivåer kan jeg velge?", a: levelsAnswer("no") },
+    { q: "Kan jeg ombestemme meg?", a: "Ja. Du kan bytte nivå og slå valg av og på når du vil. Bestillinger du allerede har fått, må du likevel svare på." },
+    { q: "Hva betyr «Planlagt»?", a: "Det er valg vi ikke har bygget ennå. De virker ikke før de er ferdige. Trykk «Gi meg beskjed» hvis du vil vite når et valg kommer." },
+    { q: "Hva betyr «Alltid» og «Låst på»?", a: "«Alltid» betyr et løfte fra Rett fra Bonden. Det gjelder hele tiden og kan ikke slås av. «Låst på» betyr at valget hører til noe du har slått på, for eksempel ordrevarsel på e-post når du tar imot bestillinger." },
+  ];
+  if (state === "i_pilot") return [
+    { q: "Hvilke nivåer finnes i «Mine valg» (i pilot)?", a: `I pilot: «Mine valg» har to nivåer. ${parts}` },
+    { q: "Kan jeg ombestemme meg?", a: "Ja. Du kan slå bestillinger av og på når du vil. Bestillinger du allerede har fått, må du likevel svare på. I pilot: produsentene i piloten bytter nivå og slår valg av og på i «Mine valg» når de vil." },
+    { q: "Hva betyr «Planlagt»?", a: "I pilot: boksen «Planlagt» i «Mine valg» viser valg vi ikke har bygget ennå. De virker ikke før de er ferdige. Produsentene i piloten kan trykke «Gi meg beskjed» på et valg de vil ha." },
+    { q: "Hva betyr «Alltid» og «Låst på»?", a: "I pilot: i «Mine valg» betyr «Alltid» et løfte fra Rett fra Bonden som gjelder hele tiden og ikke kan slås av, og «Låst på» betyr at valget hører til noe produsenten i piloten har slått på, for eksempel ordrevarsel på e-post." },
+  ];
+  return [
+    { q: "Hvilke nivåer er planlagt i «Mine valg»?", a: `«Mine valg» er planlagt, med to nivåer. ${parts}` },
+    { q: "Kan jeg ombestemme meg?", a: "Ja. Du kan slå bestillinger av og på når du vil. Bestillinger du allerede har fått, må du likevel svare på. Å bytte nivå og slå enkeltvalg av og på i «Mine valg» er planlagt." },
+    { q: "Hva betyr «Planlagt»?", a: "Planlagt betyr noe vi ikke har bygget ennå. Det virker ikke før det er ferdig." },
+    { q: "Hva betyr «Alltid» og «Låst på»?", a: "Det er merker som er planlagt i «Mine valg»: «Alltid» skal bety et løfte fra Rett fra Bonden som ikke kan slås av, og «Låst på» skal bety at valget hører til noe du har slått på." },
+  ];
+}
+
 function levelsAnswer(lang: "no" | "en"): string {
   const parts = OWNER_LEVELS.map((l) => `«${l.label[lang]}»: ${l.description[lang]}`);
   return lang === "en"
@@ -282,10 +330,7 @@ function sectionsNo(f: ForProdusenterFacts): Section[] {
         planlagt: "«Mine valg» er planlagt. Der skal du kunne velge hvor aktiv du vil være, og slå enkeltvalg av og på.",
       }, choicesHtml)}${pilotInvite("mine-valg", "no", f)}`,
       qa: [
-        { q: "Hvilke nivåer kan jeg velge?", a: levelsAnswer("no") },
-        { q: "Kan jeg ombestemme meg?", a: "Ja. Du kan bytte nivå og slå valg av og på når du vil. Bestillinger du allerede har fått, må du likevel svare på." },
-        { q: "Hva betyr «Planlagt»?", a: "Det er valg vi ikke har bygget ennå. De virker ikke før de er ferdige. Trykk «Gi meg beskjed» hvis du vil vite når et valg kommer." },
-        { q: "Hva betyr «Alltid» og «Låst på»?", a: "«Alltid» betyr et løfte fra Rett fra Bonden. Det gjelder hele tiden og kan ikke slås av. «Låst på» betyr at valget hører til noe du har slått på, for eksempel ordrevarsel på e-post når du tar imot bestillinger." },
+        ...mineValgQa("no", p.mine_valg),
       ],
     },
     {
@@ -472,10 +517,7 @@ function sectionsEn(f: ForProdusenterFacts): Section[] {
         planlagt: "«Mine valg» (My choices) is planned. There you will be able to choose how active you want to be, and switch individual choices on and off.",
       }, choicesHtml)}${pilotInvite("mine-valg", "en", f)}`,
       qa: [
-        { q: "Which levels can I choose?", a: levelsAnswer("en") },
-        { q: "Can I change my mind?", a: "Yes. You can change level and switch choices on and off whenever you like. Orders you have already received must still be answered." },
-        { q: "What does «Planned» mean?", a: "These are choices we have not built yet. They have no effect until they are finished. Press «Gi meg beskjed» (Let me know) if you want to hear when a choice arrives." },
-        { q: "What do «Always» and «Locked on» mean?", a: "«Always» means a promise from Rett fra Bonden. It applies all the time and cannot be switched off. «Locked on» means the choice belongs to something you have switched on, for example order notifications by e-mail when you accept orders." },
+        ...mineValgQa("en", p.mine_valg),
       ],
     },
     {

@@ -180,6 +180,54 @@ export async function runTodayFactsTests(opts: { log?: boolean } = {}): Promise<
     assertTrue(bad.length === 0, `AC10 ${lang}: no sentence outside a pilot block describes a pilot function as available to all${bad.length ? ` — ${bad.join(" | ")}` : ""}`);
     assertTrue(sentences.some((x) => /«Flere valg»/.test(x)) && !page.content.includes("«Ta imot bestillinger» i «Mine valg»"), `AC10 ${lang}: the cancellation everyone has today («Flere valg») is the main path`);
   }
+  // B1: the #mine-valg Q/A follow the «Mine valg» state (visible and JSON-LD).
+  {
+    const F1: Record<"no" | "en", string[]> = {
+      no: ["Hvilke nivåer kan jeg velge?", "Det er to nivåer.", "Du kan bytte nivå og slå valg av og på når du vil.", "Trykk «Gi meg beskjed» hvis du vil vite når et valg kommer.", "«Låst på» betyr at valget hører til noe du har slått på"],
+      en: ["Which levels can I choose?", "There are two levels.", "You can change level and switch choices on and off whenever you like.", "Press «Gi meg beskjed» (Let me know) if you want to hear when a choice arrives.", "«Locked on» means the choice belongs to something you have switched on"],
+    };
+    for (const [name, facts] of [["i_pilot", factsPilot], ["planlagt", factsOff], ["for_alle", factsAll]] as const) {
+      for (const lang of ["no", "en"] as const) {
+        const page = render(lang, facts);
+        const sec = (page.content.match(/<section class="fp-sec" id="mine-valg"[\s\S]*?<\/section>/) || [""])[0];
+        const vis = [...sec.matchAll(/<details class="fp-qa"><summary>([\s\S]*?)<\/summary><p>([\s\S]*?)<\/p><\/details>/g)].map((m) => ({ q: decode(m[1]), a: decode(m[2]) }));
+        const ld = ((page.jsonLd as any).mainEntity as any[]).map((e) => ({ q: e.name as string, a: e.acceptedAnswer.text as string }));
+        const ldMv = ld.filter((x) => vis.some((v) => v.q === x.q && v.a === x.a));
+        assertTrue(vis.length === 4 && ldMv.length === 4, `B1 ${name} ${lang}: the 4 #mine-valg Q/A are in the visible page and the JSON-LD`);
+        const everywhere = decode(page.content) + JSON.stringify(page.jsonLd);
+        if (name === "for_alle") {
+          assertTrue(F1[lang].every((x) => everywhere.includes(x)), `B1 ${name} ${lang}: the approved 30.10 #mine-valg wording`);
+          continue;
+        }
+        const mark = name === "i_pilot" ? /pilot/i : /planlagt|planned/i;
+        for (const x of vis) assertTrue(mark.test(x.a), `B1 ${name} ${lang}: «${x.q}» is marked ${name}`);
+        for (const x of vis) assertTrue(!/«Mine valg»/.test(x.q) || mark.test(x.q), `B1 ${name} ${lang}: question «${x.q}» naming «Mine valg» is marked`);
+        for (const f of F1[lang]) assertTrue(!everywhere.includes(f), `B1 ${name} ${lang}: no F1 sentence «${f}» (visible or JSON-LD)`);
+        // Sentence level: a sentence that offers a «Mine valg» action (level, choices, «Gi meg beskjed») carries the marker.
+        const offer = lang === "en" ? /level|switch choices|switching individual choices|Gi meg beskjed|«Always»|«Locked on»/ : /nivå|slå(r)? (enkelt)?valg|Gi meg beskjed|«Alltid»|«Låst på»/;
+        const sentences = vis.flatMap((x) => x.a.split(/(?<=[.?!])\s+/));
+        const unmarked = sentences.filter((x) => (offer.test(x) || /«Mine valg»/.test(x)) && !mark.test(x));
+        assertTrue(unmarked.length === 0, `B1 ${name} ${lang}: every sentence naming a «Mine valg» action is marked${unmarked.length ? ` — ${unmarked.join(" | ")}` : ""}`);
+      }
+    }
+  }
+  // N1: the stock-reminder and soft-expiry switches are not mixed up (nor «Varer»'s).
+  {
+    const only = (flag: string) => currentPilotStates({ [flag]: "1", ...al } as any);
+    const sc = only("STOCK_CHECK_EMAIL_ENABLED");
+    const se = only("STOCK_SOFT_EXPIRY_ENABLED");
+    const op = only("OWNER_ORDERABILITY_PORTAL_ENABLED");
+    assertTrue(sc.lagerpaminnelse === "i_pilot" && sc.myk_utlop === "planlagt" && sc.varer === "planlagt", "N1: STOCK_CHECK_EMAIL_ENABLED alone → only the stock reminder in pilot");
+    assertTrue(se.myk_utlop === "i_pilot" && se.lagerpaminnelse === "planlagt" && se.varer === "planlagt", "N1: STOCK_SOFT_EXPIRY_ENABLED alone → only soft expiry in pilot");
+    assertTrue(op.varer === "i_pilot" && op.lagerpaminnelse === "planlagt" && op.myk_utlop === "planlagt", "N1: OWNER_ORDERABILITY_PORTAL_ENABLED alone → only «Varer» in pilot");
+  }
+  // N2: the pause answer marks the «Mine valg» route «I pilot» (NO and EN).
+  {
+    const pauseOf = (lang: "no" | "en", facts: any) => ((render(lang, facts).jsonLd as any).mainEntity as any[])
+      .find((e) => e.name === (lang === "en" ? "Can I take a break?" : "Kan jeg ta en pause?"))?.acceptedAnswer.text as string;
+    assertTrue(pauseOf("en", factsPilot).endsWith("In pilot: the producers in the pilot switch off «Profilen er synlig» (profile is visible) in «Mine valg».") && !pauseOf("en", factsOff).includes("In pilot"), "N2: EN pause answer «In pilot: …» only while «Mine valg» is in pilot");
+    assertTrue(pauseOf("no", factsPilot).endsWith("I pilot: produsentene i piloten slår av «Profilen er synlig» i «Mine valg».") && !pauseOf("no", factsOff).includes("I pilot"), "N2: NO pause answer «I pilot: …» only while «Mine valg» is in pilot");
+  }
   // Every «I pilot» sentence in the Q/A really is marked.
   {
     const ans = ((render("no", factsPilot).jsonLd as any).mainEntity as any[]).map((e) => e.acceptedAnswer.text as string);
