@@ -39160,4 +39160,650 @@ router.post("/admin/experience-orgnr-job-run", requireAdmin, async (req: Request
   }
 });
 
+// ─── Catalogue facts write path (A2A dev-request 2026-10-16-opplevagent-
+// katalogfakta-alder-og-title-no, slice S3a) ───────────────────────────────
+//
+// A server-side, LLM-free, dry-run-by-default write path for six catalogue
+// fact fields on PUBLISHED, IN-SCOPE experiences (the 2026-09-18 scope rule,
+// experience-scope.ts). A routine (not part of this slice) proposes a value
+// per (experience, field) together with a VERBATIM excerpt from the
+// provider's own page; this server then:
+//
+//   GET  /admin/experience-facts-candidates  read-only: the published in-
+//                                            scope rows with ≥1 empty fact
+//                                            field, plus the page text the
+//                                            server will check against
+//   POST /admin/experience-facts-write       dry-run by default — thin
+//                                            wrapper over
+//                                            applyExperienceFactsProposals()
+//
+// applyExperienceFactsProposals() NEVER calls an LLM. Per item, in order:
+// field is in FACT_VALIDATORS; the row exists; the row is IN SCOPE
+// (isExperienceInScope) and PUBLISHED (PUBLISH_GATE_SQL) — both re-checked
+// per item, so a proposal file can never write a row outside scope or
+// unpublished; the row is not owner-locked (content_source manual/claim,
+// isExperienceOwnerLocked) and the provider holds no owner lock on the field
+// (isGardssalgFieldOwnerLocked); the field is still EMPTY (fill-only, never
+// overwrite); the value passes the field's validator against the excerpt;
+// the provider's hjemmeside is ownership-verified and not a shared domain;
+// source_url is on the hjemmeside host; then the server FETCHES source_url
+// itself through crFetchPage (the shared SSRF-guarded fetchPage — the same
+// guard the gårdssalg visit lane's crawl uses), refuses a redirect off the
+// host, and requires the excerpt to appear verbatim in the page's visible
+// text under the SAME folding as the visit lane (gardssalgVisitNormalise:
+// lower-case + whitespace collapse). Only then is the field written —
+// inside one transaction that re-checks every row gate and the empty-field
+// condition — with the fetched URL recorded as the field's provenance in
+// content_field_evidence (the same per-field map applyExperienceContent and
+// the description lane stamp).
+
+import { nameSimilarity } from "../services/name-matcher";
+
+export const EXPERIENCE_FACTS_CANDIDATES_DEFAULT_LIMIT = 10;
+export const EXPERIENCE_FACTS_CANDIDATES_MAX_LIMIT = 25;
+/** Rows the candidates GET scans (SQL window) before its JS-side filters. */
+export const EXPERIENCE_FACTS_CANDIDATES_SCAN_CAP = 500;
+// Same reasoning and numbers as GARDSSALG_VISIT_CANDIDATES_TIME_BUDGET_MS
+// (#1084): the candidates GET fetches pages synchronously inside one HTTP
+// request and the edge proxy gives up after about a minute, so no new batch
+// starts after TIME_BUDGET_MS and one row is abandoned after
+// PER_ROW_TIMEOUT_MS (reported fetch_ok:false / time_budget).
+export const EXPERIENCE_FACTS_CANDIDATES_TIME_BUDGET_MS = 35_000;
+export const EXPERIENCE_FACTS_CANDIDATES_PER_ROW_TIMEOUT_MS = 20_000;
+export const EXPERIENCE_FACTS_PAGE_TEXT_CAP = 6000;
+export const EXPERIENCE_FACTS_WRITE_MAX_ITEMS = 25;
+/** Distinct source URLs one write call may fetch (each is a real fetch). */
+export const EXPERIENCE_FACTS_WRITE_MAX_SOURCE_FETCHES = 10;
+export const EXPERIENCE_FACTS_EXCERPT_MIN_CHARS = 8;
+export const EXPERIENCE_FACTS_EXCERPT_MAX_CHARS = 500;
+/**
+ * Minimum nameSimilarity(title_no, title) (name-matcher.ts: normalised
+ * Sørensen–Dice over character bigrams, 1 = identical after normalisation).
+ * 0.6 is deliberately conservative: it admits a Norwegian rendering that
+ * keeps the title's words (spelling, definite form, a dropped or added
+ * short word) and refuses a rewrite into a different title. A rejected
+ * title_no simply stays NULL; every render path falls back to `title`.
+ */
+export const EXPERIENCE_FACTS_TITLE_NO_MIN_SIMILARITY = 0.6;
+export const EXPERIENCE_FACTS_TITLE_NO_MAX_CHARS = 120;
+export const EXPERIENCE_FACTS_MIN_AGE_MAX = 99;
+export const EXPERIENCE_FACTS_GROUP_MAX = 1000;
+export const EXPERIENCE_FACTS_AGE_SUITABILITY = ["all", "family", "adults", "kids"] as const;
+/**
+ * ISO-639-1 codes the `languages` field may carry (stored as a JSON array,
+ * as experience-store.ts's createExperience does; "no" is the code the
+ * catalogue and the /discover `language` filter already use), each with the
+ * names (Norwegian / English / native) one of which must appear in the
+ * excerpt — a language the provider's page never names cannot be written.
+ */
+export const EXPERIENCE_FACTS_LANGUAGE_NAMES: Readonly<Record<string, readonly string[]>> = {
+  no: ["norsk", "norwegian", "bokmål", "nynorsk"],
+  nb: ["bokmål", "norsk", "norwegian"],
+  nn: ["nynorsk"],
+  en: ["engelsk", "english"],
+  de: ["tysk", "german", "deutsch"],
+  fr: ["fransk", "french", "français", "francais"],
+  es: ["spansk", "spanish", "español", "espanol"],
+  it: ["italiensk", "italian", "italiano"],
+  nl: ["nederlandsk", "dutch", "nederlands"],
+  sv: ["svensk", "swedish", "svenska"],
+  da: ["dansk", "danish"],
+  fi: ["finsk", "finnish", "suomi"],
+  pl: ["polsk", "polish", "polski"],
+  se: ["samisk", "sámi", "sami", "nordsamisk"],
+  ru: ["russisk", "russian"],
+  zh: ["kinesisk", "chinese", "mandarin"],
+  ja: ["japansk", "japanese"],
+};
+/** English function/stock words that mark a title_no as not Norwegian. */
+const EXPERIENCE_FACTS_TITLE_NO_ENGLISH_WORDS = new Set([
+  "the", "and", "with", "of", "in", "on", "to", "from", "by", "your", "our",
+  "tasting", "experience", "guided", "brewery", "farm", "tour", "tours",
+]);
+
+export type ExperienceFactField = "min_age" | "group_min" | "group_max" | "age_suitability" | "languages" | "title_no";
+
+/** The stored row as the validators and gates see it. */
+type ExperienceFactsRow = {
+  id: string;
+  title: string;
+  title_no: string | null;
+  min_age: number | null;
+  group_min: number | null;
+  group_max: number | null;
+  age_suitability: string | null;
+  languages: string | null;
+  category: string | null;
+  content_source: string | null;
+  content_field_evidence: string | null;
+  source_page_url: string | null;
+  provider_id: string | null;
+  provider_hjemmeside: string | null;
+  provider_field_provenance: string | null;
+  provider_content_source: string | null;
+  provider_producer_type: string | null;
+  provider_rfb_seed_source: string | null;
+  facts_published: number | null;
+};
+
+const EXPERIENCE_FACTS_SELECT_COLUMNS =
+  `e.id AS id, e.title AS title, e.title_no AS title_no, e.min_age AS min_age,
+   e.group_min AS group_min, e.group_max AS group_max, e.age_suitability AS age_suitability,
+   e.languages AS languages, e.category AS category, e.content_source AS content_source,
+   e.content_field_evidence AS content_field_evidence, e.source_page_url AS source_page_url,
+   e.provider_id AS provider_id, p.hjemmeside AS provider_hjemmeside,
+   p.field_provenance AS provider_field_provenance, p.content_source AS provider_content_source,
+   p.producer_type AS provider_producer_type, p.rfb_seed_source AS provider_rfb_seed_source,
+   (${PUBLISH_GATE_SQL}) AS facts_published`;
+
+type FactValidationContext = {
+  row: ExperienceFactsRow;
+  /** Excerpt, whitespace-collapsed (original case). */
+  excerpt: string;
+  /** Proposed values of the OTHER items for the same row in this call. */
+  batch: Partial<Record<ExperienceFactField, unknown>>;
+};
+type FactValidator = {
+  /** The column this field writes (whitelisted — interpolated into SQL). */
+  column: ExperienceFactField;
+  /** The stored form of a valid value, or the reject reason. */
+  validate: (value: unknown, ctx: FactValidationContext) => { ok: true; stored: string | number } | { ok: false; reason: string };
+};
+
+/** A blank stored value: NULL or (TEXT columns) blank / 'null' / '[]' —
+ *  the same "blank" applyExperienceContent's isBlank uses. */
+function experienceFactIsEmpty(v: unknown): boolean {
+  if (v === null || v === undefined) return true;
+  const s = String(v).trim();
+  return s === "" || s === "null" || s === "[]";
+}
+
+/** True when `n` occurs as a whole digit run in `text` ("12" in "8–12 personer",
+ *  never "2" in "12"). */
+function experienceFactNumberInText(n: number, text: string): boolean {
+  return (text.match(/\d+/g) ?? []).some((run) => run.replace(/^0+(?=\d)/, "") === String(n));
+}
+
+function experienceFactParseInt(value: unknown): number | null {
+  if (typeof value === "number" && Number.isInteger(value)) return value;
+  if (typeof value === "string" && /^\s*\d{1,4}\s*$/.test(value)) return parseInt(value, 10);
+  return null;
+}
+
+function experienceFactGroupValidator(column: "group_min" | "group_max"): FactValidator {
+  return {
+    column,
+    validate: (value, ctx) => {
+      const n = experienceFactParseInt(value);
+      if (n === null || n < 1 || n > EXPERIENCE_FACTS_GROUP_MAX) return { ok: false, reason: "invalid_value" };
+      if (!experienceFactNumberInText(n, ctx.excerpt)) return { ok: false, reason: "number_not_in_excerpt" };
+      // Counterpart: the stored value, else the same call's proposal for it.
+      const other: "group_min" | "group_max" = column === "group_min" ? "group_max" : "group_min";
+      const stored = ctx.row[other];
+      const counterpart = stored !== null && stored !== undefined ? Number(stored) : experienceFactParseInt(ctx.batch[other]);
+      if (counterpart !== null && Number.isFinite(counterpart)) {
+        const min = column === "group_min" ? n : counterpart;
+        const max = column === "group_min" ? counterpart : n;
+        if (min > max) return { ok: false, reason: "group_min_gt_group_max" };
+      }
+      return { ok: true, stored: n };
+    },
+  };
+}
+
+/** Letter tokens of a title, original case. */
+function experienceFactTitleTokens(text: string): string[] {
+  return text.match(/[\p{L}][\p{L}\p{M}'’-]*/gu) ?? [];
+}
+
+/**
+ * One validator per allowed field. A field not in this registry is
+ * `rejected:field_not_allowed`. Every validator is pure and deterministic.
+ */
+export const FACT_VALIDATORS: Readonly<Record<ExperienceFactField, FactValidator>> = {
+  min_age: {
+    column: "min_age",
+    validate: (value, ctx) => {
+      const n = experienceFactParseInt(value);
+      if (n === null || n < 0 || n > EXPERIENCE_FACTS_MIN_AGE_MAX) return { ok: false, reason: "invalid_value" };
+      if (!experienceFactNumberInText(n, ctx.excerpt)) return { ok: false, reason: "number_not_in_excerpt" };
+      return { ok: true, stored: n };
+    },
+  },
+  group_min: experienceFactGroupValidator("group_min"),
+  group_max: experienceFactGroupValidator("group_max"),
+  age_suitability: {
+    column: "age_suitability",
+    validate: (value) => {
+      if (typeof value !== "string" || !(EXPERIENCE_FACTS_AGE_SUITABILITY as readonly string[]).includes(value)) {
+        return { ok: false, reason: "invalid_value" };
+      }
+      return { ok: true, stored: value };
+    },
+  },
+  languages: {
+    column: "languages",
+    validate: (value, ctx) => {
+      if (!Array.isArray(value) || value.length < 1 || value.length > 10 || !value.every((c) => typeof c === "string")) {
+        return { ok: false, reason: "invalid_value" };
+      }
+      const codes = Array.from(new Set((value as string[]).map((c) => c.trim().toLowerCase())));
+      if (codes.some((c) => !Object.prototype.hasOwnProperty.call(EXPERIENCE_FACTS_LANGUAGE_NAMES, c))) {
+        return { ok: false, reason: "language_not_allowed" };
+      }
+      const folded = gardssalgVisitNormalise(ctx.excerpt);
+      const named = (name: string) => new RegExp(`(^|[^\\p{L}])${name}`, "u").test(folded);
+      if (codes.some((c) => !EXPERIENCE_FACTS_LANGUAGE_NAMES[c].some(named))) {
+        return { ok: false, reason: "language_not_in_excerpt" };
+      }
+      return { ok: true, stored: JSON.stringify(codes) };
+    },
+  },
+  title_no: {
+    column: "title_no",
+    validate: (value, ctx) => {
+      if (typeof value !== "string") return { ok: false, reason: "invalid_value" };
+      const t = value.replace(/\s+/g, " ").trim();
+      if (t.length < 2 || t.length > EXPERIENCE_FACTS_TITLE_NO_MAX_CHARS) return { ok: false, reason: "invalid_value" };
+      if (GARDSSALG_VISIT_CONTACT_OR_LINK_RE.test(t) || /[<>`*#{}\[\]|\\]/.test(t)) return { ok: false, reason: "contact_or_link_or_markup" };
+      const title = ctx.row.title ?? "";
+      // Numbers: only ones the title already carries.
+      const titleDigits = new Set(title.match(/\d+/g) ?? []);
+      if ((t.match(/\d+/g) ?? []).some((d) => !titleDigits.has(d))) return { ok: false, reason: "new_number" };
+      const tokens = experienceFactTitleTokens(t);
+      if (tokens.some((w) => EXPERIENCE_FACTS_TITLE_NO_ENGLISH_WORDS.has(w.toLowerCase()))) return { ok: false, reason: "not_norwegian" };
+      // No new proper nouns: every capitalised token after the first (the
+      // first is capitalised by sentence case) and every all-caps token
+      // must already occur in the title.
+      const titleWords = new Set(experienceFactTitleTokens(title).map((w) => w.toLowerCase()));
+      const newProper = tokens.some((w, i) => {
+        const capital = /^\p{Lu}/u.test(w);
+        const allCaps = w.length > 1 && w === w.toUpperCase() && w !== w.toLowerCase();
+        return (allCaps || (capital && i > 0)) && !titleWords.has(w.toLowerCase());
+      });
+      if (newProper) return { ok: false, reason: "new_proper_noun" };
+      const sim = nameSimilarity(t, title);
+      if (!(sim >= EXPERIENCE_FACTS_TITLE_NO_MIN_SIMILARITY)) return { ok: false, reason: `title_not_similar:${sim.toFixed(2)}` };
+      return { ok: true, stored: t };
+    },
+  },
+};
+
+const EXPERIENCE_FACT_FIELDS = Object.keys(FACT_VALIDATORS) as ExperienceFactField[];
+
+function isExperienceFactField(f: string): f is ExperienceFactField {
+  return Object.prototype.hasOwnProperty.call(FACT_VALIDATORS, f);
+}
+
+type ExperienceFactsItem = { id: string; field: string; value: unknown; excerpt: unknown; source_url: unknown };
+
+export type ExperienceFactsWriteResult = {
+  id: string;
+  field: string;
+  result: "written" | "would_write" | "rejected";
+  reason?: string;
+};
+
+export type ExperienceFactsProposalsResult =
+  | { ok: false; error: string }
+  | { ok: true; totals: { written: number; would_write: number; rejected: number }; results: ExperienceFactsWriteResult[] };
+
+/** Structural parse only — a malformed item is a 400 for the whole call;
+ *  content problems (bad value, missing excerpt…) are per-item rejections. */
+function parseExperienceFactsItem(raw: unknown, index: number): ExperienceFactsItem | string {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return `items[${index}] must be an object`;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.id !== "string" || r.id.trim() === "" || r.id.length > 200) return `items[${index}].id must be a non-empty string`;
+  if (typeof r.field !== "string" || r.field.trim() === "" || r.field.length > 64) return `items[${index}].field must be a non-empty string`;
+  return { id: r.id.trim(), field: r.field.trim(), value: r.value, excerpt: r.excerpt, source_url: r.source_url };
+}
+
+/** Per-row gates shared by the pre-check and the in-transaction re-check.
+ *  Returns a reject reason or null. */
+function experienceFactsRowRejectReason(row: ExperienceFactsRow | undefined, field: ExperienceFactField): string | null {
+  if (!row) return "not_found";
+  const inScope = isExperienceInScope({
+    provider: { producer_type: row.provider_producer_type, rfb_seed_source: row.provider_rfb_seed_source },
+    category: row.category,
+  });
+  if (!inScope) return "out_of_scope";
+  if (Number(row.facts_published) !== 1) return "not_published";
+  if (isExperienceOwnerLocked(row)) return "owner_locked";
+  if (row.provider_id && isGardssalgFieldOwnerLocked({ content_source: row.provider_content_source, field_provenance: row.provider_field_provenance }, field)) {
+    return "field_owner_locked";
+  }
+  if (!experienceFactIsEmpty(row[field])) return "field_not_empty";
+  return null;
+}
+
+/** The provider hjemmeside's eligibility as a fact source, or a reject reason. */
+function experienceFactsSourceRejectReason(row: ExperienceFactsRow): string | null {
+  const hjemmeside = (row.provider_hjemmeside ?? "").trim();
+  if (!hjemmeside || !expDcUrlHost(hjemmeside)) return "no_website";
+  if (!isHjemmesideVerified(row.provider_field_provenance)) return "unverified_website";
+  const shared = expDescSharedDomainReason(hostFromUrlLike(hjemmeside));
+  if (shared) return `excluded_shared_domain:${shared}`;
+  return null;
+}
+
+/** The page the candidates GET shows for a row: the experience's own
+ *  same-host source_page_url when set, else the provider hjemmeside. */
+function experienceFactsDefaultSourceUrl(row: ExperienceFactsRow): string {
+  const hjemmeside = (row.provider_hjemmeside ?? "").trim();
+  const page = (row.source_page_url ?? "").trim();
+  if (page && expDcUrlHost(page) && expDcUrlHost(page) === expDcUrlHost(hjemmeside)) return page;
+  return hjemmeside;
+}
+
+function experienceFactsLookup(db: ReturnType<typeof getExpDb>, ids: string[]): Map<string, ExperienceFactsRow> {
+  if (ids.length === 0) return new Map();
+  const rows = db
+    .prepare(
+      `SELECT ${EXPERIENCE_FACTS_SELECT_COLUMNS}
+         FROM experiences e
+         LEFT JOIN experience_providers p ON p.id = e.provider_id
+        WHERE e.id IN (${ids.map(() => "?").join(",")})`
+    )
+    .all(...ids) as ExperienceFactsRow[];
+  return new Map(rows.map((r) => [r.id, r]));
+}
+
+/**
+ * The whole core of POST /admin/experience-facts-write. NEVER calls an LLM;
+ * the only network traffic is the SSRF-guarded fetch of each item's
+ * source_url (cached per URL within one call). The caller owns auth and the
+ * write-pause fence.
+ */
+export async function applyExperienceFactsProposals(
+  rawItems: unknown,
+  opts: { dryRun: boolean; fetchImpl?: typeof fetch; db?: ReturnType<typeof getExpDb>; logTag?: string }
+): Promise<ExperienceFactsProposalsResult> {
+  if (!Array.isArray(rawItems) || rawItems.length < 1 || rawItems.length > EXPERIENCE_FACTS_WRITE_MAX_ITEMS) {
+    return { ok: false, error: `items must be an array of 1..${EXPERIENCE_FACTS_WRITE_MAX_ITEMS} items` };
+  }
+  const items: ExperienceFactsItem[] = [];
+  for (let i = 0; i < rawItems.length; i++) {
+    const parsed = parseExperienceFactsItem(rawItems[i], i);
+    if (typeof parsed === "string") return { ok: false, error: parsed };
+    items.push(parsed);
+  }
+  const seen = new Set<string>();
+  for (const it of items) {
+    const key = `${it.id}\u0000${it.field}`;
+    if (seen.has(key)) return { ok: false, error: `duplicate (id, field) in items: ${it.id} ${it.field}` };
+    seen.add(key);
+  }
+  const distinctSources = new Set(items.map((it) => (typeof it.source_url === "string" ? it.source_url.trim() : "")).filter((u) => u !== ""));
+  if (distinctSources.size > EXPERIENCE_FACTS_WRITE_MAX_SOURCE_FETCHES) {
+    return { ok: false, error: `Too many distinct source_url values (${distinctSources.size}); max ${EXPERIENCE_FACTS_WRITE_MAX_SOURCE_FETCHES} per call — each one is fetched` };
+  }
+
+  const db = opts.db ?? getExpDb("experiences");
+  const { dryRun } = opts;
+  const rows = experienceFactsLookup(db, Array.from(new Set(items.map((it) => it.id))));
+  // Proposed values per row, for the group_min ≤ group_max cross-check.
+  const batchByRow = new Map<string, Partial<Record<ExperienceFactField, unknown>>>();
+  for (const it of items) {
+    if (!isExperienceFactField(it.field)) continue;
+    const b = batchByRow.get(it.id) ?? {};
+    b[it.field] = it.value;
+    batchByRow.set(it.id, b);
+  }
+
+  const results: ExperienceFactsWriteResult[] = [];
+  const reject = (it: ExperienceFactsItem, reason: string): void => {
+    results.push({ id: it.id, field: it.field, result: "rejected", reason });
+  };
+  const pageCache = new Map<string, Promise<{ ok: true; text: string; finalUrl: string } | { ok: false; reason: string }>>();
+  const fetchSourceText = (url: string, hjemmeside: string) => {
+    let p = pageCache.get(url);
+    if (!p) {
+      p = (async () => {
+        const r = await crFetchPage(url, opts.fetchImpl);
+        if (!r.ok) return { ok: false as const, reason: `fetch_failed:${r.reason}` };
+        if (expDcUrlHost(r.finalUrl || url) !== expDcUrlHost(hjemmeside)) return { ok: false as const, reason: "redirected_off_host" };
+        return { ok: true as const, text: gardssalgVisitNormalise(extractVisibleText(r.html)), finalUrl: r.finalUrl || url };
+      })().catch((e: any) => ({ ok: false as const, reason: `fetch_error:${String(e?.message ?? e).slice(0, 80)}` }));
+      pageCache.set(url, p);
+    }
+    return p;
+  };
+  const pending: Array<{ item: ExperienceFactsItem; field: ExperienceFactField; stored: string | number; provenanceUrl: string; result: ExperienceFactsWriteResult }> = [];
+
+  for (const item of items) {
+    if (!isExperienceFactField(item.field)) { reject(item, "field_not_allowed"); continue; }
+    const field = item.field;
+    const row = rows.get(item.id);
+    const rowReason = experienceFactsRowRejectReason(row, field);
+    if (rowReason || !row) { reject(item, rowReason ?? "not_found"); continue; }
+
+    if (typeof item.excerpt !== "string" || item.excerpt.trim() === "") { reject(item, "missing_excerpt"); continue; }
+    const excerpt = item.excerpt.replace(/\s+/g, " ").trim();
+    if (excerpt.length < EXPERIENCE_FACTS_EXCERPT_MIN_CHARS) { reject(item, "excerpt_too_short"); continue; }
+    if (excerpt.length > EXPERIENCE_FACTS_EXCERPT_MAX_CHARS) { reject(item, "excerpt_too_long"); continue; }
+
+    const batch = { ...(batchByRow.get(item.id) ?? {}) };
+    delete batch[field];
+    const v = FACT_VALIDATORS[field].validate(item.value, { row, excerpt, batch });
+    if (!v.ok) { reject(item, v.reason); continue; }
+
+    const sourceReason = experienceFactsSourceRejectReason(row);
+    if (sourceReason) { reject(item, sourceReason); continue; }
+    if (typeof item.source_url !== "string" || item.source_url.trim() === "") { reject(item, "missing_source_url"); continue; }
+    const sourceUrl = item.source_url.trim();
+    const hjemmeside = (row.provider_hjemmeside ?? "").trim();
+    if (expDcUrlHost(sourceUrl) === null || expDcUrlHost(sourceUrl) !== expDcUrlHost(hjemmeside)) { reject(item, "source_host_mismatch"); continue; }
+
+    // ── The server fetches the source ITSELF ─────────────────────────────
+    const page = await fetchSourceText(sourceUrl, hjemmeside);
+    if (!page.ok) { reject(item, page.reason); continue; }
+    if (!page.text.includes(gardssalgVisitNormalise(excerpt))) { reject(item, "evidence_not_found"); continue; }
+
+    const result: ExperienceFactsWriteResult = { id: item.id, field, result: dryRun ? "would_write" : "written" };
+    results.push(result);
+    pending.push({ item, field, stored: v.stored, provenanceUrl: page.finalUrl, result });
+  }
+
+  if (!dryRun && pending.length > 0) {
+    // ONE transaction. The source fetches above are async, so every write
+    // re-reads its row and re-runs the row gates (scope, publish gate,
+    // locks, still-empty) and the group ordering against what is stored
+    // NOW; a changed row is rejected, never overwritten. The UPDATE itself
+    // is additionally conditional on the column still being empty.
+    const tx = db.transaction(() => {
+      for (const w of pending) {
+        const fresh = experienceFactsLookup(db, [w.item.id]).get(w.item.id);
+        const reason = experienceFactsRowRejectReason(fresh, w.field);
+        let groupConflict = false;
+        if (!reason && fresh && (w.field === "group_min" || w.field === "group_max")) {
+          const other = w.field === "group_min" ? fresh.group_max : fresh.group_min;
+          if (other !== null && other !== undefined) {
+            const min = w.field === "group_min" ? Number(w.stored) : Number(other);
+            const max = w.field === "group_min" ? Number(other) : Number(w.stored);
+            groupConflict = min > max;
+          }
+        }
+        if (reason || !fresh || groupConflict) {
+          w.result.result = "rejected";
+          w.result.reason = groupConflict ? "group_min_gt_group_max" : `changed_during_call:${reason ?? "not_found"}`;
+          continue;
+        }
+        const evidence = parseContentFieldEvidence(fresh.content_field_evidence);
+        evidence[w.field] = w.provenanceUrl;
+        const col = FACT_VALIDATORS[w.field].column;
+        const info = db
+          .prepare(
+            `UPDATE experiences SET ${col} = ?, content_field_evidence = ?, updated_at = datetime('now')
+              WHERE id = ? AND (${col} IS NULL OR TRIM(CAST(${col} AS TEXT)) IN ('', 'null', '[]'))`
+          )
+          .run(w.stored, JSON.stringify(evidence), w.item.id);
+        if (info.changes !== 1) {
+          w.result.result = "rejected";
+          w.result.reason = "changed_during_call:field_not_empty";
+        }
+      }
+    });
+    tx();
+  }
+
+  const totals = { written: 0, would_write: 0, rejected: 0 };
+  for (const r of results) totals[r.result]++;
+  // One summary line per call: ids, fields and results — never values or excerpts.
+  console.log(
+    `[${opts.logTag ?? "experience-facts-write"}] dry_run=${dryRun} ` +
+      results.map((r) => `${r.id}.${r.field.replace(/[^A-Za-z0-9_]/g, "").slice(0, 32)}=${r.result}${r.reason ? ":" + r.reason : ""}`).join(" ")
+  );
+  return { ok: true, totals, results };
+}
+
+function resolveExperienceFactsCandidatesBudgets(env: Record<string, string | undefined> = process.env): { budgetMs: number; perRowMs: number } {
+  const pos = (raw: string | undefined, fallback: number): number => {
+    const n = parseInt(String(raw ?? ""), 10);
+    return Number.isInteger(n) && n > 0 ? n : fallback;
+  };
+  return {
+    budgetMs: pos(env.EXPERIENCE_FACTS_CANDIDATES_TIME_BUDGET_MS, EXPERIENCE_FACTS_CANDIDATES_TIME_BUDGET_MS),
+    perRowMs: pos(env.EXPERIENCE_FACTS_CANDIDATES_PER_ROW_TIMEOUT_MS, EXPERIENCE_FACTS_CANDIDATES_PER_ROW_TIMEOUT_MS),
+  };
+}
+
+// GET /admin/experience-facts-candidates?limit=N&after_id=X — read-only.
+// The published (PUBLISH_GATE_SQL) in-scope (experienceInScopeSql) rows —
+// the same set the detail page and /discover show — with at least one of
+// the six fact fields empty and not owner-locked, whose provider hjemmeside
+// is ownership-verified and not a shared domain (any other row could never
+// be written). Ordered by id; `after_id` pages through (`next_after_id`).
+// Each row carries the page text the server will check excerpts against.
+// Nothing is written or stamped here.
+router.get("/admin/experience-facts-candidates", requireAdmin, async (req: Request, res: Response) => {
+  const rawLimit = parseInt(String(req.query?.limit ?? ""), 10);
+  const limit = Number.isInteger(rawLimit) && rawLimit > 0 ? Math.min(EXPERIENCE_FACTS_CANDIDATES_MAX_LIMIT, rawLimit) : EXPERIENCE_FACTS_CANDIDATES_DEFAULT_LIMIT;
+  const afterId = typeof req.query?.after_id === "string" ? req.query.after_id.slice(0, 200) : "";
+  const db = getExpDb("experiences");
+  const fetchImpl = (req.app?.get?.("experienceFactsFetchImpl") as typeof fetch | undefined) ?? undefined;
+  const anyEmpty = EXPERIENCE_FACT_FIELDS.map((c) => `(e.${c} IS NULL OR TRIM(CAST(e.${c} AS TEXT)) IN ('', 'null', '[]'))`).join(" OR ");
+  const scanned = db
+    .prepare(
+      `SELECT ${EXPERIENCE_FACTS_SELECT_COLUMNS}
+         FROM experiences e
+         LEFT JOIN experience_providers p ON p.id = e.provider_id
+        WHERE ${PUBLISH_GATE_SQL}
+          AND ${experienceInScopeSql("e.category", "e.provider_id")}
+          AND (e.content_source IS NULL OR e.content_source NOT IN ('manual','claim'))
+          AND (${anyEmpty})
+          AND e.id > ?
+        ORDER BY e.id ASC
+        LIMIT ${EXPERIENCE_FACTS_CANDIDATES_SCAN_CAP}`
+    )
+    .all(afterId) as ExperienceFactsRow[];
+  const eligible: Array<{ row: ExperienceFactsRow; empty: ExperienceFactField[] }> = [];
+  for (const row of scanned) {
+    const empty = EXPERIENCE_FACT_FIELDS.filter((f) => experienceFactsRowRejectReason(row, f) === null);
+    if (empty.length === 0) continue;
+    if (experienceFactsSourceRejectReason(row)) continue;
+    eligible.push({ row, empty });
+  }
+  const targets = eligible.slice(0, limit);
+  type Item = {
+    id: string;
+    title: string;
+    title_no: string | null;
+    provider_id: string | null;
+    provider_hjemmeside: string | null;
+    source_url: string;
+    empty_fields: ExperienceFactField[];
+    current: Partial<Record<ExperienceFactField, unknown>>;
+    fetch_ok: boolean;
+    fetch_reason?: string;
+    final_url?: string;
+    page_text?: string;
+  };
+  const items: Item[] = [];
+  const startedAt = Date.now();
+  const { budgetMs, perRowMs } = resolveExperienceFactsCandidatesBudgets();
+  let truncated = false;
+  const ROW_TIMEOUT = Symbol("row_timeout");
+  const one = async ({ row, empty }: { row: ExperienceFactsRow; empty: ExperienceFactField[] }): Promise<void> => {
+    const current: Partial<Record<ExperienceFactField, unknown>> = {};
+    for (const f of EXPERIENCE_FACT_FIELDS) if (!empty.includes(f)) current[f] = row[f];
+    const sourceUrl = experienceFactsDefaultSourceUrl(row);
+    const base = {
+      id: row.id, title: row.title, title_no: row.title_no, provider_id: row.provider_id,
+      provider_hjemmeside: row.provider_hjemmeside, source_url: sourceUrl, empty_fields: empty, current,
+    };
+    try {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const raced = await Promise.race([
+        crFetchPage(sourceUrl, fetchImpl),
+        new Promise<typeof ROW_TIMEOUT>((resolve) => { timer = setTimeout(() => resolve(ROW_TIMEOUT), perRowMs); }),
+      ]);
+      if (timer) clearTimeout(timer);
+      if (raced === ROW_TIMEOUT) { items.push({ ...base, fetch_ok: false, fetch_reason: `time_budget:row>${perRowMs}ms` }); return; }
+      if (!raced.ok) { items.push({ ...base, fetch_ok: false, fetch_reason: `fetch_failed:${raced.reason}` }); return; }
+      items.push({ ...base, fetch_ok: true, final_url: raced.finalUrl, page_text: extractVisibleText(raced.html).slice(0, EXPERIENCE_FACTS_PAGE_TEXT_CAP) });
+    } catch (e: any) {
+      items.push({ ...base, fetch_ok: false, fetch_reason: `fetch_error:${String(e?.message ?? e).slice(0, 80)}` });
+    }
+  };
+  for (let i = 0; i < targets.length; i += CR_CONCURRENCY) {
+    if (Date.now() - startedAt > budgetMs) { truncated = true; break; }
+    await Promise.all(targets.slice(i, i + CR_CONCURRENCY).map(one));
+  }
+  const order = new Map(targets.map((t, i) => [t.row.id, i]));
+  items.sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
+  const last = items.length > 0 ? items[items.length - 1].id : null;
+  res.json({
+    success: true,
+    scanned: scanned.length,
+    eligible_in_scan: eligible.length,
+    returned: items.length,
+    requested: targets.length,
+    truncated,
+    next_after_id: last,
+    elapsed_ms: Date.now() - startedAt,
+    time_budget_ms: budgetMs,
+    per_row_timeout_ms: perRowMs,
+    rules: {
+      fields: EXPERIENCE_FACT_FIELDS,
+      max_items_per_write: EXPERIENCE_FACTS_WRITE_MAX_ITEMS,
+      max_source_fetches_per_write: EXPERIENCE_FACTS_WRITE_MAX_SOURCE_FETCHES,
+      excerpt_min_chars: EXPERIENCE_FACTS_EXCERPT_MIN_CHARS,
+      excerpt_max_chars: EXPERIENCE_FACTS_EXCERPT_MAX_CHARS,
+      excerpt: "verbatim from the source_url page's visible text (case and whitespace are folded); numbers written must appear in it",
+      source_url: "must be on the provider hjemmeside host; the server fetches it itself",
+      min_age_max: EXPERIENCE_FACTS_MIN_AGE_MAX,
+      group_max: EXPERIENCE_FACTS_GROUP_MAX,
+      age_suitability: EXPERIENCE_FACTS_AGE_SUITABILITY,
+      languages: Object.keys(EXPERIENCE_FACTS_LANGUAGE_NAMES),
+      title_no_min_similarity: EXPERIENCE_FACTS_TITLE_NO_MIN_SIMILARITY,
+      fill_only: "only empty fields are written; an existing value is never overwritten",
+      write_endpoint: "/api/opplevelser/admin/experience-facts-write",
+    },
+    items,
+  });
+});
+
+// POST /admin/experience-facts-write — dry-run by default; only the JSON
+// boolean false writes (same STRICT-FALSE idiom and the same write-pause
+// fence on apply as /admin/gardssalg-visit-proposals-write). No LLM seam:
+// nothing here calls one.
+router.post("/admin/experience-facts-write", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { dry_run?: unknown; items?: unknown };
+  const dryRun = body.dry_run !== false;
+  if (!dryRun) {
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+  const fetchImpl = (req.app?.get?.("experienceFactsFetchImpl") as typeof fetch | undefined) ?? undefined;
+  const out = await applyExperienceFactsProposals(body.items, { dryRun, fetchImpl, logTag: "experience-facts-write" });
+  if (!out.ok) {
+    res.status(400).json({ error: out.error });
+    return;
+  }
+  res.json({ success: true, dry_run: dryRun, ...out });
+});
+
 export default router;
