@@ -52831,8 +52831,7 @@ runSerial(async () => {
 // refused by canCorrectFactualField). Own ":memory:" DB via the route's seam;
 // sets ADMIN_KEY only if unset (restored) — runSerial.
 runSerial(async () => {
-  console.log("
-── content-correction: adresse ──");
+  console.log("\n── content-correction: adresse ──");
   try {
     const { runAdminAgentsContentCorrectionAddressTests } = require("../src/routes/admin-agents-content-correction-address.test") as
       typeof import("../src/routes/admin-agents-content-correction-address.test");
