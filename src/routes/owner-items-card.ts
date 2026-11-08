@@ -12,7 +12,14 @@
 //                           → 303 …?status=…&ved=vare-<id>#vare-<id>
 //   «Bekreft alle ({n})»    POST /eier/:id/varer/bekreft-alle with the ids
 //                           → 303 …?status=…#bestillbare-varer
-//   «Legg til vare»         POST /eier/:id/varer/ny (the form as before)
+//   «Merk som utsolgt» (V1b, under «Mer»)
+//                           POST /eier/:id/varer/:productId/utsolgt
+//                           → 303 …?status=vare_utsolgt&ved=vare-<id>#vare-<id>
+//   «Legg til vare» (V1b: a closed <details> with Navn, Pris, Enhet, Kategori,
+//   «Varen er på lager nå», «Er varen ferdigpakket?» and the food fields)
+//                           POST /eier/:id/varer/ny → 303 to the new row; on a
+//                           refusal the portal is rendered again with the form
+//                           open, the values kept and the message in the form.
 // Messages stand in the card, or in the row for a row's own POST (the T5
 // anchor contract). All output is HTML-escaped.
 
@@ -20,7 +27,7 @@ import type { OwnerItemsModel, OwnerItemView, OwnerItemAction, OwnerItemGroup } 
 import {
   OWNER_ITEM_GROUP_ORDER, OWNER_ITEMS_INVENTED_TEXT_NB, OWNER_ITEMS_TEXT_NB, ownerItemGroupLabel, ownerItemView,
 } from "../services/owner-items-view";
-import { orderabilityReasonTextNb } from "../services/owner-orderability";
+import { OWNER_PRODUCT_FIELD_TEXT_NB, orderabilityReasonTextNb, type OwnerProductField } from "../services/owner-orderability";
 
 /** The card's id (kept from B1: bulk, add and old links land here). */
 export const OWNER_ITEMS_ANCHOR = "bestillbare-varer";
@@ -74,6 +81,51 @@ export interface OwnerItemsMessage {
   productId?: string | null;
 }
 
+/** V1b: the «Legg til vare» form as it was posted (shown again, open, after a refusal). */
+export interface OwnerItemsAddFormValues {
+  name: string;
+  price: string;
+  unit: string;
+  category: string;
+  in_stock: boolean;
+  packaged: boolean;
+  ingredients: string;
+  allergens: string;
+  net_weight: string;
+}
+
+export interface OwnerItemsAddFormState {
+  values: OwnerItemsAddFormValues;
+  /** The refusal, shown in the form. */
+  message: string;
+  /** The fields to mark invalid (the first one gets autofocus, so the page scrolls to it without JavaScript). */
+  fields: OwnerProductField[];
+}
+
+/** The posted body → the values to show again (strings only, length-capped; never trusted for anything but display). */
+export function ownerItemsAddFormValues(body: Record<string, unknown>): OwnerItemsAddFormValues {
+  const t = (v: unknown, max: number) => (typeof v === "string" ? v.slice(0, max) : "");
+  return {
+    name: t(body.name, 200),
+    price: t(body.price, 40),
+    unit: t(body.unit, 60),
+    category: t(body.category, 80),
+    in_stock: body.paa_lager === "1",
+    packaged: body.ferdigpakket === "ja",
+    ingredients: t(body.ingredients, 3000),
+    allergens: t(body.allergens, 1500),
+    net_weight: t(body.net_weight, 40),
+  };
+}
+
+/** «Varen ble ikke lagt til. …» for the refused fields (B1 texts, V1b texts for the new cases). */
+export function ownerItemsAddErrorText(fields: readonly OwnerProductField[]): string {
+  const X = OWNER_ITEMS_INVENTED_TEXT_NB.fieldErrors as Record<string, string>;
+  const B1 = OWNER_PRODUCT_FIELD_TEXT_NB as Record<string, string>;
+  const detail = fields.map((f) => X[f] ?? B1[f] ?? "").filter(Boolean).join(" ");
+  return `Varen ble ikke lagt til. ${detail || "Sjekk feltene og prøv igjen."}`;
+}
+
 export interface OwnerItemsSectionInput {
   agentId: string;
   model: OwnerItemsModel;
@@ -83,6 +135,8 @@ export interface OwnerItemsSectionInput {
   /** The existing products.stock_check reminder box (stockCheckBannerHtml), "" when none. */
   bannerHtml?: string;
   message?: OwnerItemsMessage | null;
+  /** V1b: the posted «Legg til vare» form after a refusal (the form opens with these values). */
+  addForm?: OwnerItemsAddFormState | null;
 }
 
 function alertHtml(m: OwnerItemsMessage): string {
@@ -91,20 +145,62 @@ function alertHtml(m: OwnerItemsMessage): string {
     : `<div class="ep-alert ep-alert-error" role="alert" data-items-message="1">${esc(m.text)}</div>`;
 }
 
-/** The add-product form, as in the B1 card (V1b changes it, not V1a). */
-function addProductFormHtml(id: string): string {
-  const field = (name: string, label: string, type = "text", extra = "") =>
-    `<div class="ep-field"><label for="ny_${name}">${esc(label)}</label><input id="ny_${name}" name="${name}" type="${type}" ${extra}></div>`;
-  return `<h3 style="margin-top:20px;">Legg til vare</h3>
-        <form method="post" action="/eier/${id}/varer/ny">
-          ${field("name", "Navn", "text", 'required maxlength="120"')}
-          ${field("price", "Pris (kr)", "text", 'required inputmode="decimal"')}
-          ${field("unit", "Enhet (f.eks. kg, stk)", "text", 'maxlength="30"')}
-          <div class="ep-field"><label for="ny_ingredients">Ingredienser (valgfritt)</label><textarea id="ny_ingredients" name="ingredients" maxlength="1500"></textarea></div>
-          ${field("allergens", "Allergener (valgfritt, skill med komma)", "text")}
-          ${field("net_weight", "Nettovekt (valgfritt, f.eks. 250 g)", "text", 'maxlength="20"')}
-          <div class="ep-form-actions"><button type="submit" class="ep-btn ep-btn-primary">Legg til vare</button></div>
-        </form>`;
+/** Which form field a refused field marks. */
+const FIELD_INPUT: Record<OwnerProductField, string> = {
+  name: "name", price: "price", unit: "unit", category: "category",
+  ingredients: "ingredients", ingredients_required: "ingredients",
+  allergens: "allergens", allergens_required: "allergens",
+  net_weight: "net_weight", net_weight_required: "net_weight",
+};
+
+/**
+ * V1b «Legg til vare»: a closed <details> until opened (open again after a
+ * refusal). Works without JavaScript: the food fields are always there, and
+ * the server requires them when «Er varen ferdigpakket?» = Ja. The hidden
+ * `skjema=v1b` tells the route that an unticked «Varen er på lager nå» means
+ * «not in stock» (an unticked box sends nothing).
+ */
+function addProductFormHtml(id: string, model: Pick<OwnerItemsModel, "ordersOn" | "autoConfirm">, state: OwnerItemsAddFormState | null): string {
+  const T = OWNER_ITEMS_TEXT_NB;
+  const X = OWNER_ITEMS_INVENTED_TEXT_NB;
+  const v: OwnerItemsAddFormValues = state?.values ?? {
+    name: "", price: "", unit: "", category: "", in_stock: !model.autoConfirm, packaged: false, ingredients: "", allergens: "", net_weight: "",
+  };
+  const bad = new Set((state?.fields ?? []).map((f) => FIELD_INPUT[f]).filter(Boolean));
+  const first = ["name", "price", "unit", "category", "ingredients", "allergens", "net_weight"].find((f) => bad.has(f)) ?? null;
+  const attrs = (name: string) => `${bad.has(name) ? ' aria-invalid="true"' : ""}${first === name ? " autofocus" : ""}`;
+  const hint = (name: string, text: string) => `<div class="ep-hint" id="ny_${name}_hint">${esc(text)}</div>`;
+  const field = (name: string, label: string, value: string, extra: string, hintText?: string) =>
+    `<div class="ep-field"><label for="ny_${name}">${esc(label)}</label><input id="ny_${name}" name="${name}" type="text" value="${esc(value)}" ${extra}${hintText ? ` aria-describedby="ny_${name}_hint"` : ""}${attrs(name)}>${hintText ? hint(name, hintText) : ""}</div>`;
+  const choice = "display:flex;align-items:center;gap:10px;min-height:44px;cursor:pointer;";
+  const box = "width:24px;height:24px;margin:0;flex:none;";
+  const stockHints = [model.ordersOn ? T.inStockOrdersOnHint : "", model.autoConfirm ? X.inStockAutoConfirmHint : ""].filter(Boolean);
+  const errorHtml = state ? `<div class="ep-alert ep-alert-error" role="alert" data-items-message="1" data-items-add-error="1">${esc(state.message)}</div>` : "";
+  return `<details class="ep-items-add" data-items-add="1" style="margin-top:20px;"${state ? " open" : ""}>
+          <summary style="${choice}font-weight:600;">${esc(T.addTitle)}</summary>
+          ${errorHtml}
+          <form method="post" action="/eier/${id}/varer/ny" data-items-add-form="v1b">
+            <input type="hidden" name="skjema" value="v1b">
+            ${field("name", T.fieldName, v.name, 'required maxlength="120"')}
+            ${field("price", T.fieldPrice, v.price, 'required inputmode="decimal"')}
+            ${field("unit", T.fieldUnit, v.unit, 'maxlength="30"', X.unitHint)}
+            ${field("category", T.fieldCategory, v.category, 'maxlength="40"')}
+            <div class="ep-items-choice" style="margin-bottom:16px;">
+              <label style="${choice}"><input type="checkbox" name="paa_lager" value="1" style="${box}"${v.in_stock ? " checked" : ""} data-in-stock-default="${model.autoConfirm ? "0" : "1"}"> ${esc(T.fieldInStock)}</label>
+              ${stockHints.map((h) => `<div class="ep-audit-meta" data-in-stock-hint="1">${esc(h)}</div>`).join("")}
+            </div>
+            <fieldset style="border:none;padding:0;margin:0 0 16px;">
+              <legend style="font-weight:600;margin-bottom:4px;">${esc(T.packagedQuestion)}</legend>
+              <label style="${choice}"><input type="radio" name="ferdigpakket" value="ja" style="${box}"${v.packaged ? " checked" : ""}> ${esc(X.packagedYes)}</label>
+              <label style="${choice}"><input type="radio" name="ferdigpakket" value="nei" style="${box}"${v.packaged ? "" : " checked"}> ${esc(X.packagedNo)}</label>
+              <div class="ep-audit-meta">${esc(X.packagedFieldsHint)}</div>
+            </fieldset>
+            <div class="ep-field"><label for="ny_ingredients">${esc(X.fieldIngredients)}</label><textarea id="ny_ingredients" name="ingredients" maxlength="1500"${attrs("ingredients")}>${esc(v.ingredients)}</textarea></div>
+            ${field("allergens", X.fieldAllergens, v.allergens, "", X.allergensHint)}
+            ${field("net_weight", X.fieldNetWeight, v.net_weight, 'maxlength="20"', X.netWeightHint)}
+            <div class="ep-form-actions"><button type="submit" class="ep-btn ep-btn-primary">${esc(T.addTitle)}</button></div>
+          </form>
+        </details>`;
 }
 
 /** The «Varer» card. */
@@ -118,10 +214,11 @@ export function renderOwnerItemsSection(input: OwnerItemsSectionInput): string {
   const rowMessageId = msg && msg.productId && views.some((v) => v.row.id === msg.productId) ? msg.productId : null;
   const cardMessage = msg && !rowMessageId ? alertHtml(msg) : "";
 
-  const confirmForm = (productId: string, label: string, cls: string) =>
-    `<form method="post" action="/eier/${id}/varer/${esc(encodeURIComponent(productId))}/bekreft" style="margin:6px 0 0;">
+  const rowForm = (productId: string, path: "bekreft" | "utsolgt", label: string, cls: string) =>
+    `<form method="post" action="/eier/${id}/varer/${esc(encodeURIComponent(productId))}/${path}" style="margin:6px 0 0;">
             <button type="submit" class="ep-btn ${cls}">${esc(label)}</button>
           </form>`;
+  const confirmForm = (productId: string, label: string, cls: string) => rowForm(productId, "bekreft", label, cls);
 
   const rowHtml = ({ row, view }: { row: OwnerItemsModel["rows"][number]; view: OwnerItemView }): string => {
     const chip = view.chip
@@ -130,7 +227,9 @@ export function renderOwnerItemsSection(input: OwnerItemsSectionInput): string {
     const action = canEdit && view.action ? confirmForm(row.id, ACTION_LABEL[view.action], "ep-btn-secondary") : "";
     const more = canEdit && view.more.length
       ? `<details class="ep-item-more" style="margin:6px 0 0;"><summary>${esc(T.more)}</summary>
-            ${view.more.map(() => confirmForm(row.id, T.moreConfirmNow, "ep-btn-secondary")).join("")}
+            ${view.more.map((m) => m === "mark_sold_out"
+              ? rowForm(row.id, "utsolgt", T.moreMarkSoldOut, "ep-btn-secondary")
+              : confirmForm(row.id, T.moreConfirmNow, "ep-btn-secondary")).join("")}
           </details>`
       : "";
     const rowMsg = rowMessageId === row.id && msg ? alertHtml(msg) : "";
@@ -189,6 +288,6 @@ export function renderOwnerItemsSection(input: OwnerItemsSectionInput): string {
         ${profileHtml}${readOnly}
         ${bulk}
         ${groupsHtml}
-        ${canEdit ? addProductFormHtml(id) : ""}
+        ${canEdit ? addProductFormHtml(id, model, input.addForm ?? null) : ""}
       </div>`;
 }
