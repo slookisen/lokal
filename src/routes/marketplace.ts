@@ -73,6 +73,7 @@ import { revokeOwnerAccessExceptVerifiedOwners } from "../services/owner-access-
 import { HOMEPAGE_CONTACT_PROVENANCE_EXCLUSION_SQL } from "../services/homepage-contact-provenance";
 import { emailWithheldIds, withKnowledgeEmailNull } from "../services/email-reveal-guard";
 import { hasContactRetentionMarkers } from "../services/privacy-retention";
+import { invalidateAgentGeocode } from "../services/agent-geocode-reset";
 import {
   publicFieldChoices, publicFieldChoicesForMany, withoutHiddenContact, withoutHiddenFields, publicAgentInfo,
   withoutHiddenCoordinates, hidesPrices, hidesTrust, type PublicFieldChoices,
@@ -3446,14 +3447,9 @@ router.post("/admin/google-rating/:id", async (req: Request, res: Response) => {
 // below (google-rating-batch, homepage-provenance-batch) are fill-empty-only.
 // canCorrectRoadOnlyAddress (services/street-address-parse.ts) is the one
 // exception; a corrected address also resets the geocode, below.
-/** Same geocode reset PUT /admin/knowledge applies on a real address change
- *  (dev-request 2026-09-11-rettet-adresse-oppdaterer-ikke-kartpunktet). */
-function invalidateAgentGeocode(db: ReturnType<typeof getDb>, agentId: string): void {
-  db.prepare(
-    `UPDATE agents SET geo_precision = NULL, lat = NULL, lng = NULL, geocode_source = NULL,
-       geocode_outcome = NULL, geocode_attempts = 0, geocode_attempted_at = NULL WHERE id = ?`,
-  ).run(agentId);
-}
+// invalidateAgentGeocode (services/agent-geocode-reset.ts) is the same geocode
+// reset PUT /admin/knowledge applies on a real address change (dev-request
+// 2026-09-11-rettet-adresse-oppdaterer-ikke-kartpunktet).
 
 // ─── POST /admin/agents/:id/geocode-reset — re-geocode one producer ──
 // Clears one producer's coordinate and its geocode attempt counter, so the

@@ -50744,6 +50744,31 @@ runSerial(async () => {
 });
 
 // dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice
+// D1: «Slå sammen og godkjenn» — POST /admin/agents/claim-merge-approve
+// (behind CLAIM_MERGE_APPROVE_ENABLED): dry-run writes nothing, apply merges a
+// sibling into the claimed profile (duplicate-merge core + G8 opening hours /
+// delivery / map point) and approves the claim in one transaction; every
+// refusal writes nothing; a failed approval rolls the merge back; the
+// extracted sibling rule equals the claim assessment's. Pins getDb() to its
+// own in-memory DB, runs an in-process server, stubs the mail transporter,
+// sets env (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-30-rfb-eierkrav D1: «Slå sammen og godkjenn» ──");
+  try {
+    const { runAdminAgentsClaimMergeApproveTests } = require("../src/routes/admin-agents-claim-merge-approve.test") as
+      typeof import("../src/routes/admin-agents-claim-merge-approve.test");
+    const d1 = await runAdminAgentsClaimMergeApproveTests({ log: false });
+    passed += d1.passed;
+    failed += d1.failed;
+    for (const f of d1.failures) failures.push("claim-merge-approve-d1: " + f);
+    console.log(`  claim-merge-approve-d1: ${d1.passed} passed, ${d1.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("claim-merge-approve-d1: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice
 // B2b-2: after a B2b-1 auto-approval the farm's known address (as before the
 // approval) gets «Ny eier registrert for <profil>» when it exists, differs
 // from the claimant's and is not shared; the admin notice says «sendt» /

@@ -123,6 +123,8 @@ import { knowledgeService } from "../services/knowledge-service";
 import { maskEmail } from "../services/gardssalg-claim";
 import { applyClaimApprove, applyClaimReject, applyClaimRevoke, sendClaimApprovedLoginMail } from "../services/claim-review-actions";
 import { isClaimRequestMoreEnabled, requestMoreConfirmation, REQUEST_MORE_NOTE_MAX } from "../services/claim-request-more";
+import { isClaimMergeApproveEnabled, runClaimMergeApprove, CLAIM_MERGE_APPROVE_NOTE_MAX } from "../services/claim-merge-approve";
+import { isExplicitApply } from "./admin-agents-duplicate-merge";
 
 import { deleteAgentProfileTranslations } from "../services/profile-translations";
 const router = Router();
@@ -2408,6 +2410,82 @@ router.post("/claim-request-more", async (req: Request, res: Response) => {
     console.error("[admin-agents] claim-request-more failed:", err instanceof Error ? err.message : "error");
     res.status(500).json({ success: false, error: "server_error" });
   }
+});
+
+// ─── POST /admin/agents/claim-merge-approve ─────────────────────────────────
+//     (dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk,
+//     slice D1) ─────────────────────────────────────────────────────────────
+//
+// «Slå sammen og godkjenn»: a queued claim's profile (the survivor) absorbs a
+// sibling profile the admin names (`duplicateId`) with duplicate-merge's
+// fill-only rules plus G8 (opening hours, delivery, map point), then the claim
+// is approved exactly as claim-review-approve does, and the owner gets the
+// same login mail. Merge + approval are one transaction
+// (services/claim-merge-approve.ts); the mail goes out after commit.
+// Body: { claimId, duplicateId, note?, apply? } — dry-run unless `apply` is an
+// explicit truthy form (as duplicate-merge).
+//   503 claim_merge_approve_disabled  CLAIM_MERGE_APPROVE_ENABLED is not "true"
+//   400 bad body · 400 duplicate_is_claim_agent
+//   404 claim_not_found · 404 duplicate_not_found
+//   409 not_pending_review · has_owner · survivor_inactive · duplicate_inactive
+//       · not_a_sibling · duplicate_claimed
+//   409 approve_failed (+ reason, rolledBack: true) — nothing was written
+//   200 dry-run: { success, dryRun: true, filled, moved, geocodeReset, wouldApprove: true, … }
+//   200 apply:   { success, dryRun: false, filled, moved, geocodeReset, approved: true, loginLinkSent, sentTo (masked), … }
+router.post("/claim-merge-approve", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  if (!isClaimMergeApproveEnabled()) {
+    res.status(503).json({ success: false, error: "claim_merge_approve_disabled" });
+    return;
+  }
+  const body = (req.body ?? {}) as { claimId?: unknown; duplicateId?: unknown; note?: unknown; apply?: unknown };
+  const claimId = typeof body.claimId === "string" ? body.claimId.trim() : "";
+  const duplicateId = typeof body.duplicateId === "string" ? body.duplicateId.trim() : "";
+  const noteOk = body.note === undefined || (typeof body.note === "string" && body.note.length <= CLAIM_MERGE_APPROVE_NOTE_MAX);
+  if (!claimId || claimId.length > 200 || !duplicateId || duplicateId.length > 200 || !noteOk) {
+    res.status(400).json({
+      success: false,
+      error: `Requires { claimId, duplicateId, note?, apply? } (note at most ${CLAIM_MERGE_APPROVE_NOTE_MAX} characters)`,
+    });
+    return;
+  }
+  const apply = isExplicitApply(body.apply, req.query?.apply);
+  let r: ReturnType<typeof runClaimMergeApprove>;
+  try {
+    r = runClaimMergeApprove({ claimId, duplicateId, note: body.note as string | undefined, apply });
+  } catch (err) {
+    console.error("[admin-agents] claim-merge-approve failed (rolled back):", err instanceof Error ? err.message : "error");
+    res.status(500).json({ success: false, error: "server_error", rolledBack: true });
+    return;
+  }
+  if (!r.ok) {
+    const { ok: _ok, status, ...rest } = r;
+    res.status(status).json({ success: false, ...rest });
+    return;
+  }
+  const { ok: _ok, approved, ...summary } = r;
+  if (!approved) {
+    res.json({ success: true, ...summary, wouldApprove: true });
+    return;
+  }
+  console.log(
+    `[admin-agents] claim-merge-approve: claim ${claimId} approved on ${r.agentId} after merging ${duplicateId} (filled ${r.filled.length}, moved ${r.moved.length}, geocodeReset ${r.geocodeReset})`,
+  );
+  // Same login mail as claim-review-approve, after the commit. A failure only
+  // means no mail (loginLinkSent false), never an undo.
+  const loginLinkSent = await sendClaimApprovedLoginMail(
+    claimId,
+    { agentId: r.agentId, email: approved.email },
+    "[admin-agents] claim-merge-approve",
+  );
+  res.json({
+    success: true,
+    ...summary,
+    approved: true,
+    isVerified: approved.isVerified,
+    loginLinkSent,
+    sentTo: maskEmail(approved.email),
+  });
 });
 
 // ─── POST /admin/agents/claim-revoke ────────────────────────────────────────
