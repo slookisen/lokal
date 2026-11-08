@@ -39237,9 +39237,10 @@ export const EXPERIENCE_FACTS_AGE_SUITABILITY = ["all", "family", "adults", "kid
  * excerpt — a language the provider's page never names cannot be written.
  */
 export const EXPERIENCE_FACTS_LANGUAGE_NAMES: Readonly<Record<string, readonly string[]>> = {
+  // Only "no" for Norwegian: the /discover and MCP `language` filter match
+  // '"no"' (experience-store.ts), so storing "nb"/"nn" would drop the row out
+  // of Norwegian-language discovery. Bokmål/nynorsk evidence maps to "no".
   no: ["norsk", "norwegian", "bokmål", "nynorsk"],
-  nb: ["bokmål", "norsk", "norwegian"],
-  nn: ["nynorsk"],
   en: ["engelsk", "english"],
   de: ["tysk", "german", "deutsch"],
   fr: ["fransk", "french", "français", "francais"],
@@ -39392,7 +39393,10 @@ export const FACT_VALIDATORS: Readonly<Record<ExperienceFactField, FactValidator
         return { ok: false, reason: "language_not_allowed" };
       }
       const folded = gardssalgVisitNormalise(ctx.excerpt);
-      const named = (name: string) => new RegExp(`(^|[^\\p{L}])${name}`, "u").test(folded);
+      // Whole word, with at most the Norwegian adjective inflection "-e"
+      // ("norske", "engelske"): "Tyskland", "norskekysten" or "engelskmann"
+      // do not name a language.
+      const named = (name: string) => new RegExp(`(^|[^\\p{L}])${name}e?(?![\\p{L}])`, "u").test(folded);
       if (codes.some((c) => !EXPERIENCE_FACTS_LANGUAGE_NAMES[c].some(named))) {
         return { ok: false, reason: "language_not_in_excerpt" };
       }

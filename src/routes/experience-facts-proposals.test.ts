@@ -316,6 +316,20 @@ export function runExperienceFactsProposalsTests(opts: { log?: boolean } = {}): 
       // ═══════════════ C. registry shape ════════════════════════════════
       assertEq(Object.keys(route.FACT_VALIDATORS).sort(), ["age_suitability", "group_max", "group_min", "languages", "min_age", "title_no"], "c1: exactly the six allowed fields");
       assertEq(route.EXPERIENCE_FACTS_TITLE_NO_MIN_SIMILARITY, 0.6, "c2: title_no similarity threshold is a named constant");
+      // c3/c4: languages — only "no" for Norwegian, and whole-word language names.
+      {
+        const lang = route.FACT_VALIDATORS.languages;
+        const ctxOf = (excerpt: string) => ({ excerpt } as unknown as Parameters<typeof lang.validate>[1]);
+        assertTrue(!Object.prototype.hasOwnProperty.call(route.EXPERIENCE_FACTS_LANGUAGE_NAMES, "nb"), "c3-1: nb is not an allowed code (catalogue uses no)");
+        assertTrue(!Object.prototype.hasOwnProperty.call(route.EXPERIENCE_FACTS_LANGUAGE_NAMES, "nn"), "c3-2: nn is not an allowed code (catalogue uses no)");
+        assertEq(lang.validate(["nb"], ctxOf("Omvisningen foregår på norsk")), { ok: false, reason: "language_not_allowed" }, "c3-3: [nb] rejected");
+        assertEq(lang.validate(["no"], ctxOf("Omvisningen foregår på bokmål")), { ok: true, stored: JSON.stringify(["no"]) }, "c3-4: bokmål evidence stores no");
+        assertEq(lang.validate(["de"], ctxOf("Gjester fra Tyskland er velkomne")), { ok: false, reason: "language_not_in_excerpt" }, "c4-1: Tyskland does not name German");
+        assertEq(lang.validate(["no"], ctxOf("Gården ligger langs norskekysten")), { ok: false, reason: "language_not_in_excerpt" }, "c4-2: norskekysten does not name Norwegian");
+        assertEq(lang.validate(["en"], ctxOf("En engelskmann startet bryggeriet")), { ok: false, reason: "language_not_in_excerpt" }, "c4-3: engelskmann does not name English");
+        assertEq(lang.validate(["no", "en"], ctxOf("Guidede turer på norske og engelske.")), { ok: true, stored: JSON.stringify(["no", "en"]) }, "c4-4: inflected -e form still counts");
+        assertEq(lang.validate(["de"], ctxOf("Vi snakker tysk.")), { ok: true, stored: JSON.stringify(["de"]) }, "c4-5: word before punctuation counts");
+      }
     } finally {
       if (restoreMainDb) restoreMainDb();
       globalThis.fetch = prevFetch;
