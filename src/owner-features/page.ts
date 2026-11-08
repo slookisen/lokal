@@ -814,22 +814,45 @@ function levelsHtml(ctx: RenderCtx): string {
       </section>`;
 }
 
+/**
+ * T8: the RFB level status, computed from the switches (no owner choice
+ * needed to compute it; `choice` only says who chose). Shared by «Mine valg»
+ * and the T15b «Oversikt» block, so both always show the same level.
+ */
+export function ownerRfbLevelStatus(
+  resolved: ResolvedOwnerFeatures,
+  choice: { level: OwnerLevel; at: string } | null,
+  registry: OwnerFeatureEntry[] = OWNER_FEATURE_REGISTRY,
+): OwnerLevelStatus | null {
+  return ownerLevelStatus(deriveOwnerLevel(resolved, OWNER_LEVELS, registry), choice);
+}
+
+/**
+ * T8: the level status line's text (plain, not escaped). «Tilpasset» ends
+ * after the number of exceptions; the reset link is the page's own.
+ */
+export function ownerLevelStatusText(st: OwnerLevelStatus): string {
+  const name = st.level.label.no;
+  switch (st.kind) {
+    case "default":
+      return "Du står på standardvalgene. Du trenger ikke gjøre noe.";
+    case "chosen":
+      return `Du valgte «${name}» ${formatDate(st.at)}.`;
+    case "matches":
+      return `Valgene dine passer med «${name}».`;
+    case "custom":
+      return `Tilpasset: valgene dine bygger på «${name}», med ${st.exceptions.length} unntak.`;
+  }
+}
+
 /** T8: the level status line on the RFB page (who chose; «Tilpasset» with the reset link). */
 function levelStatusLineHtml(m: OwnerPageModel, st: OwnerLevelStatus | null): string {
   if (!st) return "";
+  const text = esc(ownerLevelStatusText(st));
+  if (st.kind !== "custom") return `<p class="mv-note" data-level-status="${st.kind}">${text}</p>`;
   const name = esc(st.level.label.no);
-  switch (st.kind) {
-    case "default":
-      return `<p class="mv-note" data-level-status="default">Du står på standardvalgene. Du trenger ikke gjøre noe.</p>`;
-    case "chosen":
-      return `<p class="mv-note" data-level-status="chosen">Du valgte «${name}» ${esc(formatDate(st.at))}.</p>`;
-    case "matches":
-      return `<p class="mv-note" data-level-status="matches">Valgene dine passer med «${name}».</p>`;
-    case "custom": {
-      const href = actionPath(m, `?niva=${encodeURIComponent(st.level.key)}#${OWNER_ANCHOR_LEVEL_PREVIEW}`);
-      return `<p class="mv-note" data-level-status="custom">Tilpasset: valgene dine bygger på «${name}», med ${st.exceptions.length} unntak. <a href="${esc(href)}" data-mv-row="${OWNER_ANCHOR_LEVEL}">Tilbakestill til «${name}»</a></p>`;
-    }
-  }
+  const href = actionPath(m, `?niva=${encodeURIComponent(st.level.key)}#${OWNER_ANCHOR_LEVEL_PREVIEW}`);
+  return `<p class="mv-note" data-level-status="custom">${text} <a href="${esc(href)}" data-mv-row="${OWNER_ANCHOR_LEVEL}">Tilbakestill til «${name}»</a></p>`;
 }
 
 /**
@@ -1260,7 +1283,7 @@ export interface OwnerPageRegion {
 export function renderOwnerFeaturesPageRegions(m: OwnerPageModel): OwnerPageRegion[] {
   const registry = m.registry ?? OWNER_FEATURE_REGISTRY;
   // T8: the RFB level status, computed from the switches (gårdssalg: none, page unchanged).
-  const levelStatus = m.variant ? null : ownerLevelStatus(deriveOwnerLevel(m.resolved, OWNER_LEVELS, registry), m.levelChoice ?? null);
+  const levelStatus = m.variant ? null : ownerRfbLevelStatus(m.resolved, m.levelChoice ?? null, registry);
   const ctx: RenderCtx = { m, now: m.now ?? new Date(), explainedAlways: false, explainedLocked: false, noticePlaced: false, confirmPlaced: false, levelStatus };
   const regions: OwnerPageRegion[] = [
     { id: "statistikk", html: statsHtml(m) },

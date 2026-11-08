@@ -71,11 +71,14 @@ export const OWNER_NEWS_MAX_ROUNDS = 3;
 
 /**
  * Where a consent answer was given (owner_feature_audit.placement).
- * T15 (dashboard «Oversikt») adds its own place here.
+ * T15b: «oversikt_question» is the same question in the «Oversikt» block of
+ * /eier/:id/portal (owner dashboard on; it is then not shown on «Mine valg»).
  */
-export const OWNER_NEWS_PLACEMENTS = ["mine_valg_question", "mine_valg_row"] as const;
+export const OWNER_NEWS_PLACEMENTS = ["mine_valg_question", "mine_valg_row", "oversikt_question"] as const;
 export type OwnerNewsPlacement = (typeof OWNER_NEWS_PLACEMENTS)[number];
 /** The question in «Kontakt fra Rett fra Bonden» on «Mine valg». */
 export const OWNER_NEWS_PLACEMENT_QUESTION: OwnerNewsPlacement = OWNER_NEWS_PLACEMENTS[0];
 /** The comms.news row (its switch) on «Mine valg». */
 export const OWNER_NEWS_PLACEMENT_ROW: OwnerNewsPlacement = OWNER_NEWS_PLACEMENTS[1];
+/** T15b: the question in the «Oversikt» block (/eier/:id/portal, owner dashboard on). */
+export const OWNER_NEWS_PLACEMENT_OVERVIEW: OwnerNewsPlacement = OWNER_NEWS_PLACEMENTS[2];
