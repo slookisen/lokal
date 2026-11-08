@@ -663,6 +663,8 @@ const CSS = `
   .nav-links a:hover { color: var(--green-700); text-decoration: none; }
   .nav-cta { padding: 7px 18px; background: var(--green-700); color: var(--white) !important; border-radius: 8px; font-weight: 600; font-size: 0.82rem; transition: all 0.2s; }
   .nav-cta:hover { background: var(--green-900); }
+  /* Mobile «Meny» (A2A 2026-10-22-rfb-for-produsenter-faq-side F2b): shown only <=768px */
+  .nav-menu-btn { display: none; }
 
   /* Breadcrumb */
   .bc { max-width: 1100px; margin: 0 auto; padding: 14px 24px 0; font-size: 0.8rem; color: var(--g500); }
@@ -725,10 +727,56 @@ const CSS = `
   @media (max-width: 768px) {
     .nav { padding: 0 16px; }
     .nav-links { display: none; }
+    .nav-menu-btn { display: inline-flex; align-items: center; gap: 8px; min-height: 40px; padding: 8px 14px; border: 1px solid var(--g300); border-radius: 8px; background: var(--white); color: var(--charcoal); font: inherit; font-size: 0.9rem; font-weight: 600; cursor: pointer; }
+    .nav-menu-btn:focus-visible { outline: 2px solid var(--green-700); outline-offset: 2px; }
+    .nav-menu-icon, .nav-menu-icon::before, .nav-menu-icon::after { display: block; width: 16px; height: 2px; border-radius: 1px; background: currentColor; transition: transform 0.2s, background 0.2s; }
+    .nav-menu-icon { position: relative; }
+    .nav-menu-icon::before, .nav-menu-icon::after { content: ""; position: absolute; left: 0; }
+    .nav-menu-icon::before { top: -5px; }
+    .nav-menu-icon::after { top: 5px; }
+    .nav-menu-btn[aria-expanded="true"] .nav-menu-icon { background: transparent; }
+    .nav-menu-btn[aria-expanded="true"] .nav-menu-icon::before { transform: translateY(5px) rotate(45deg); }
+    .nav-menu-btn[aria-expanded="true"] .nav-menu-icon::after { transform: translateY(-5px) rotate(-45deg); }
+    .nav-links.is-open { display: flex; position: absolute; top: 100%; left: 0; right: 0; flex-direction: column; align-items: stretch; gap: 0; background: var(--white); border-bottom: 1px solid var(--g200); box-shadow: var(--shadow-lg); padding: 8px 16px 16px; max-height: calc(100vh - 56px); overflow-y: auto; }
+    .nav-links.is-open > a { padding: 12px 4px; border-bottom: 1px solid var(--g100); font-size: 1rem; color: var(--g700); }
+    .nav-links.is-open > a.nav-cta { margin-top: 12px; padding: 12px 18px; border-bottom: 0; text-align: center; font-size: 1rem; }
+    .nav-links.is-open .lang-switch { margin: 12px 0 0; }
+    .nav-links.is-open .lang-switch .ls-menu { position: static; box-shadow: none; margin-top: 6px; }
     .container { padding: 0 16px; }
     .ft-inner { grid-template-columns: 1fr 1fr; gap: 20px; }
   }
 </style>`;
+
+// ─── Mobile «Meny» (<=768px) ────────────────────────────────
+// A2A dev-request 2026-10-22-rfb-for-produsenter-faq-side, slice F2b: below
+// 768px the header links used to vanish with no way to reach them. The
+// button toggles .is-open on #navLinks (the same links, language switch and
+// «For produsenter» as on desktop — one list, so the mobile menu can never
+// drift from the desktop one), keeps aria-expanded in sync, closes on Esc
+// (focus back to the button), on a click outside and when the window grows
+// past the breakpoint. Above 768px the button is display:none and nothing
+// changes. No JS: a <noscript> style shows the links wrapped in the header.
+export const NAV_MENU_JS = `<script>
+  (function(){
+    var btn = document.getElementById('navMenuBtn');
+    var panel = document.getElementById('navLinks');
+    if (!btn || !panel) return;
+    function isOpen(){ return btn.getAttribute('aria-expanded') === 'true'; }
+    function set(open, focusBtn){
+      panel.classList.toggle('is-open', open);
+      btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (!open && focusBtn) btn.focus();
+    }
+    btn.addEventListener('click', function(e){ e.stopPropagation(); set(!isOpen(), false); });
+    document.addEventListener('keydown', function(e){ if ((e.key === 'Escape' || e.key === 'Esc') && isOpen()) set(false, true); });
+    document.addEventListener('click', function(e){ if (isOpen() && !panel.contains(e.target)) set(false, false); });
+    if (window.matchMedia) {
+      var mq = window.matchMedia('(min-width: 769px)');
+      var onWide = function(){ if (mq.matches && isOpen()) set(false, false); };
+      if (mq.addEventListener) mq.addEventListener('change', onWide); else if (mq.addListener) mq.addListener(onWide);
+    }
+  })();
+  </script>`;
 
 // ─── Page shell ─────────────────────────────────────────────
 
@@ -864,12 +912,14 @@ export function shell(
   ${jsonLdScript}
   ${CSS}
   <style>${langSwitcherCss}</style>
+  <noscript><style>@media (max-width: 768px) { .nav-menu-btn { display: none !important; } .nav { height: auto; min-height: 56px; flex-wrap: wrap; padding: 8px 16px; } .nav-links { display: flex; flex-wrap: wrap; gap: 8px 16px; width: 100%; padding: 4px 0 8px; } }</style></noscript>
   ${extra?.extraCss ? `<style>${extra.extraCss}</style>` : ""}
 </head>
 <body>
   <nav class="nav">
     <a href="${localizedPath("/", lang)}" class="nav-logo"><div class="nav-icon">🌱</div> <span translate="no">${getConfig().display_name}</span></a>
-    <div class="nav-links">
+    <button type="button" class="nav-menu-btn" id="navMenuBtn" aria-expanded="false" aria-controls="navLinks"><span class="nav-menu-icon" aria-hidden="true"></span><span>${escapeHtml(t(lang, "nav.menu"))}</span></button>
+    <div class="nav-links" id="navLinks">
       <a href="/samtaler">${escapeHtml(t(lang, "nav.conversations"))}</a>
       <a href="${localizedPath("/sok", lang)}">${escapeHtml(t(lang, "nav.search"))}</a>
       <a href="${localizedPath("/teknologi", lang)}">${escapeHtml(t(lang, "nav.how_it_works"))}</a>
@@ -902,6 +952,7 @@ export function shell(
     <div class="ft-company">${companyFooterLineHtml(toSiteLang(lang), { contactHref: localizedPath("/kontakt", lang) })}</div>
   </footer>
   ${langSwitcherJs}
+  ${NAV_MENU_JS}
 </body>
 </html>`;
 }

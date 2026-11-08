@@ -662,14 +662,32 @@ export function renderForProdusenterQa(pairs: FaqPair[]): string {
     `<details class="fp-qa"><summary>${esc(p.q)}</summary><p>${esc(p.a)}</p></details>`).join("")}</div>`;
 }
 
+// F2b: the section menu follows the reader. The current section is the last
+// one whose top has passed a line just under the sticky menu (measured on
+// every scroll frame), so a long section stays lit for as long as it is being
+// read — the old IntersectionObserver band let an earlier section win while
+// «Bestillinger» filled the screen. A menu click / hash jump pins its link
+// until the reader scrolls on (the last sections cannot always reach the line
+// at the bottom of the page). It also keeps the current link in view inside
+// the horizontally scrolling menu and sets data-fade (l / r) for the edge fade
+// that shows the menu can scroll.
 const MENU_JS = `
 <script>
 (function(){
   var menu = document.getElementById('fpMenu');
-  if (!menu || !('IntersectionObserver' in window)) return;
-  var links = {};
-  menu.querySelectorAll('a[href^="#"]').forEach(function(a){ links[a.getAttribute('href').slice(1)] = a; });
-  var current = null;
+  if (!menu) return;
+  var list = menu.querySelector('ul');
+  var links = {}, ids = [];
+  menu.querySelectorAll('a[href^="#"]').forEach(function(a){ var id = a.getAttribute('href').slice(1); if (document.getElementById(id)) { links[id] = a; ids.push(id); } });
+  if (!ids.length) return;
+  var current = null, pinned = null, pinnedY = null, queued = false;
+  function fade(){
+    var max = list.scrollWidth - list.clientWidth;
+    var f = [];
+    if (max > 2 && list.scrollLeft > 2) f.push('l');
+    if (max > 2 && list.scrollLeft < max - 2) f.push('r');
+    menu.setAttribute('data-fade', f.join(' '));
+  }
   function mark(id){
     if (id === current || !links[id]) return;
     if (current && links[current]) { links[current].classList.remove('is-current'); links[current].removeAttribute('aria-current'); }
@@ -677,62 +695,110 @@ const MENU_JS = `
     var a = links[id];
     a.classList.add('is-current');
     a.setAttribute('aria-current', 'true');
-    var list = a.parentNode && a.parentNode.parentNode;
-    if (list && list.scrollWidth > list.clientWidth) {
+    if (list.scrollWidth > list.clientWidth) {
       var left = a.offsetLeft - (list.clientWidth - a.offsetWidth) / 2;
       list.scrollLeft = Math.max(0, left);
     }
+    fade();
   }
-  var visible = {};
-  var io = new IntersectionObserver(function(entries){
-    entries.forEach(function(e){ visible[e.target.id] = e.isIntersecting; });
-    var ids = Object.keys(links);
-    for (var i = 0; i < ids.length; i++) { if (visible[ids[i]]) { mark(ids[i]); return; } }
-  }, { rootMargin: '-120px 0px -55% 0px' });
-  Object.keys(links).forEach(function(id){ var el = document.getElementById(id); if (el) io.observe(el); });
+  function update(){
+    queued = false;
+    var y = window.pageYOffset || document.documentElement.scrollTop || 0;
+    if (pinned) {
+      if (pinnedY === null || Math.abs(y - pinnedY) < 48) { mark(pinned); return; }
+      pinned = null;
+    }
+    var line = menu.getBoundingClientRect().bottom + 24;
+    var cur = ids[0];
+    for (var i = 0; i < ids.length; i++) {
+      if (document.getElementById(ids[i]).getBoundingClientRect().top <= line) cur = ids[i]; else break;
+    }
+    mark(cur);
+  }
+  function queue(){ if (!queued) { queued = true; (window.requestAnimationFrame || setTimeout)(update); } }
+  function pin(id){
+    if (!links[id]) return;
+    pinned = id; pinnedY = null; mark(id);
+    setTimeout(function(){ pinnedY = window.pageYOffset || document.documentElement.scrollTop || 0; }, 150);
+  }
+  menu.addEventListener('click', function(e){
+    var a = e.target && e.target.closest ? e.target.closest('a[href^="#"]') : null;
+    if (a) pin(a.getAttribute('href').slice(1));
+  });
+  window.addEventListener('hashchange', function(){ pin(location.hash.slice(1)); });
+  window.addEventListener('scroll', queue, { passive: true });
+  window.addEventListener('resize', function(){ fade(); queue(); });
+  list.addEventListener('scroll', fade, { passive: true });
+  if (location.hash && links[location.hash.slice(1)]) pin(location.hash.slice(1)); else update();
+  fade();
 })();
 </script>`;
 
+// F2b: the site's own palette (seo.ts :root --green-*, --g*) and its system
+// font stack; light only (dark mode is out of scope for the whole site).
+// Reading width ~68ch; the sticky header (56px) + section menu (~50px) are
+// cleared by scroll-margin-top on every section and section heading.
 export const FOR_PRODUSENTER_CSS = `
-  .fp-hero { background: linear-gradient(135deg, var(--green-50) 0%, #f0f7f4 100%); padding: 56px 16px 40px; text-align: center; }
-  .fp-hero h1 { font-size: 2.2rem; font-weight: 800; color: var(--charcoal); letter-spacing: -1px; margin: 0 auto 12px; max-width: 760px; }
+  .fp-hero { background: linear-gradient(135deg, var(--green-50) 0%, #f0f7f4 100%); padding: 56px 16px 44px; text-align: center; border-bottom: 1px solid var(--green-100); }
+  .fp-hero h1 { font-size: 2.2rem; font-weight: 800; color: var(--charcoal); letter-spacing: -1px; line-height: 1.2; margin: 0 auto 12px; max-width: 760px; }
   .fp-hero p { font-size: 1.05rem; color: var(--g500); max-width: 620px; margin: 0 auto; line-height: 1.7; }
+  .fp-hero-ctas { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; margin-top: 24px; }
   .fp-menu { position: sticky; top: 56px; z-index: 90; background: rgba(255,255,255,0.97); border-bottom: 1px solid var(--g200); max-width: 100%; }
-  .fp-menu ul { list-style: none; display: flex; gap: 4px; margin: 0 auto; padding: 8px 16px; max-width: 960px; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: thin; white-space: nowrap; }
+  .fp-menu ul { list-style: none; display: flex; gap: 4px; margin: 0 auto; padding: 8px 16px; max-width: 1100px; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; -ms-overflow-style: none; white-space: nowrap; }
+  .fp-menu ul::-webkit-scrollbar { display: none; }
+  .fp-menu::before, .fp-menu::after { content: ""; position: absolute; top: 0; bottom: 0; width: 32px; pointer-events: none; opacity: 0; transition: opacity 0.2s; }
+  .fp-menu::before { left: 0; background: linear-gradient(to right, rgba(255,255,255,1), rgba(255,255,255,0)); }
+  .fp-menu::after { right: 0; background: linear-gradient(to left, rgba(255,255,255,1), rgba(255,255,255,0)); }
+  .fp-menu[data-fade~="l"]::before, .fp-menu[data-fade~="r"]::after { opacity: 1; }
   .fp-menu li { flex: 0 0 auto; }
   .fp-menu a { display: inline-block; padding: 6px 12px; border-radius: 999px; font-size: 0.85rem; font-weight: 600; color: var(--g700); text-decoration: none; }
   .fp-menu a:hover { background: var(--green-50); color: var(--green-700); text-decoration: none; }
   .fp-menu a:focus-visible { outline: 2px solid var(--green-700); outline-offset: 2px; }
   .fp-menu a.is-current { background: var(--green-700); color: var(--white); }
-  .fp-main { max-width: 760px; margin: 0 auto; padding: 8px 16px 48px; }
-  .fp-sec { scroll-margin-top: 120px; padding-top: 32px; }
-  .fp-sec h2 { font-size: 1.5rem; font-weight: 800; color: var(--charcoal); margin-bottom: 12px; }
+  .fp-main { max-width: calc(68ch + 32px); margin: 0 auto; padding: 8px 16px 56px; }
+  .fp-sec, .fp-sec h2 { scroll-margin-top: 112px; }
+  .fp-sec { padding-top: 40px; }
+  .fp-sec h2 { font-size: 1.5rem; font-weight: 800; color: var(--charcoal); letter-spacing: -0.3px; margin-bottom: 12px; }
   .fp-sec h3 { font-size: 1.05rem; font-weight: 700; color: var(--charcoal); margin: 20px 0 8px; }
   .fp-sec p, .fp-sec li { font-size: 0.97rem; color: var(--g700); line-height: 1.75; }
   .fp-sec p { margin-bottom: 12px; }
-  .fp-list, .fp-steps { margin: 8px 0 16px 22px; }
-  .fp-list li, .fp-steps li { margin-bottom: 6px; }
+  .fp-list { margin: 8px 0 16px 22px; }
+  .fp-list li { margin-bottom: 6px; }
+  .fp-steps { list-style: none; counter-reset: fp-step; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); gap: 12px; margin: 20px 0; }
+  .fp-steps li { counter-increment: fp-step; position: relative; margin: 0; padding: 52px 16px 16px; background: var(--white); border: 1px solid var(--g200); border-radius: var(--r-md); box-shadow: var(--shadow-sm); font-size: 0.93rem; line-height: 1.6; }
+  .fp-steps li::before { content: counter(fp-step); position: absolute; top: 14px; left: 16px; width: 28px; height: 28px; border-radius: 50%; background: var(--green-100); color: var(--green-700); font-weight: 800; font-size: 0.9rem; display: flex; align-items: center; justify-content: center; }
+  .fp-steps li strong { display: block; color: var(--charcoal); margin-bottom: 4px; }
   .fp-ctas { display: flex; flex-wrap: wrap; gap: 10px; margin: 20px 0 8px; }
-  .fp-btn { display: inline-block; padding: 10px 18px; border-radius: 8px; border: 1px solid var(--green-700); color: var(--green-700); font-weight: 600; font-size: 0.92rem; text-decoration: none; }
+  .fp-btn { display: inline-flex; align-items: center; justify-content: center; min-height: 44px; padding: 10px 18px; border-radius: var(--r-md); border: 1px solid var(--green-700); background: var(--white); color: var(--green-700); font-weight: 600; font-size: 0.92rem; text-decoration: none; transition: background 0.2s; }
   .fp-btn:hover { background: var(--green-50); text-decoration: none; }
-  .fp-btn-primary { background: var(--green-700); color: var(--white); }
+  .fp-btn:focus-visible { outline: 2px solid var(--green-700); outline-offset: 2px; }
+  .fp-btn-primary { background: var(--green-700); color: var(--white); font-weight: 700; }
   .fp-btn-primary:hover { background: var(--green-900); }
-  .fp-faq { margin-top: 12px; border-top: 1px solid var(--g200); }
+  .fp-faq { margin-top: 16px; border-top: 1px solid var(--g200); }
   .fp-qa { border-bottom: 1px solid var(--g200); }
-  .fp-qa summary { cursor: pointer; padding: 14px 4px; font-weight: 700; color: var(--charcoal); font-size: 0.98rem; }
+  .fp-qa summary { list-style: none; position: relative; cursor: pointer; padding: 14px 40px 14px 4px; font-weight: 700; color: var(--charcoal); font-size: 0.98rem; line-height: 1.5; }
+  .fp-qa summary::-webkit-details-marker { display: none; }
+  .fp-qa summary::after { content: "+"; position: absolute; right: 4px; top: 50%; transform: translateY(-50%); width: 26px; height: 26px; border-radius: 50%; background: var(--green-50); color: var(--green-700); font-size: 1.15rem; font-weight: 700; line-height: 26px; text-align: center; }
+  .fp-qa[open] summary::after { content: "\\2212"; }
+  .fp-qa summary:hover { color: var(--green-700); }
   .fp-qa summary:focus-visible { outline: 2px solid var(--green-700); outline-offset: 2px; }
-  .fp-qa p { padding: 0 4px 14px; margin: 0; }
-  .fp-pilot { margin: 16px 0; padding: 12px 16px; border: 1px solid var(--g200); border-left: 4px solid var(--green-700); border-radius: 8px; background: var(--green-50); }
+  .fp-qa p { padding: 0 40px 16px 4px; margin: 0; }
+  .fp-pilot { margin: 16px 0; padding: 14px 16px; border: 1px solid var(--g200); border-left: 4px solid var(--green-700); border-radius: var(--r-md); background: var(--green-50); }
   .fp-pilot p { margin-bottom: 8px; }
   .fp-pilot .fp-pilot-note { font-size: 0.9rem; color: var(--g500); margin-bottom: 0; }
-  .fp-badge { display: inline-block; padding: 2px 10px; margin-right: 6px; border-radius: 999px; background: var(--green-700); color: var(--white); font-size: 0.78rem; font-weight: 700; letter-spacing: 0.2px; vertical-align: 1px; }
-  .fp-invite { margin: 16px 0; padding: 12px 16px; border: 1px dashed var(--green-700); border-radius: 8px; }
+  .fp-badge { display: inline-block; padding: 1px 10px; margin-right: 6px; border-radius: 999px; border: 1px solid var(--green-600); background: var(--white); color: var(--green-700); font-size: 0.75rem; font-weight: 700; letter-spacing: 0.2px; line-height: 1.6; vertical-align: 1px; white-space: nowrap; }
+  .fp-invite { margin: 16px 0; padding: 14px 16px; border: 1px dashed var(--green-600); border-radius: var(--r-md); background: var(--white); }
   .fp-invite p { margin-bottom: 10px; }
-  .fp-closing { margin-top: 40px; padding: 24px 16px; border-top: 1px solid var(--g200); }
-  .fp-closing h2 { font-size: 1.3rem; font-weight: 800; color: var(--charcoal); margin-bottom: 8px; }
+  .fp-closing { margin-top: 48px; padding: 28px 24px; border: 1px solid var(--green-100); border-radius: var(--r-lg); background: var(--green-50); text-align: center; }
+  .fp-closing h2 { font-size: 1.4rem; font-weight: 800; color: var(--charcoal); margin-bottom: 4px; }
+  .fp-closing .fp-ctas { justify-content: center; }
+  .fp-closing .fp-invite { text-align: left; margin-bottom: 0; }
+  .fp-closing .fp-invite p { font-size: 0.95rem; color: var(--g700); line-height: 1.7; }
   @media (max-width: 768px) {
+    .fp-hero { padding: 40px 16px 32px; }
     .fp-hero h1 { font-size: 1.6rem; }
     .fp-sec h2 { font-size: 1.3rem; }
+    .fp-closing { padding: 24px 16px; }
   }
 `;
 
@@ -765,12 +831,14 @@ export function renderForProdusenterPage(lang: Lang, canonicalUrl: string, facts
     <ul>${sections.map((s) => `<li><a href="#${s.id}">${esc(s.menu)}</a></li>`).join("")}</ul>
   </nav>`;
   const title = en ? "How Rett fra Bonden works for producers" : "Slik fungerer Rett fra Bonden for produsenter";
-  // F2a: the closing box (take over the profile + the pilot invitation). F2b gives it its final look.
+  // The closing box (F2a: take over the profile + the pilot invitation; F2b:
+  // its look, plus «Logg inn» next to the take-over button as in the hero).
   const closing = `
     <aside class="fp-closing" aria-labelledby="fp-h-closing">
       <h2 id="fp-h-closing">${esc(en ? "Get started" : "Kom i gang")}</h2>
       <div class="fp-ctas">
         <a class="fp-btn fp-btn-primary" href="${SELGER_FIND}">${esc(en ? "Find your profile and take it over" : "Finn profilen din og ta den over")}</a>
+        <a class="fp-btn" href="${SELGER_LOGIN}">${esc(en ? "Log in" : "Logg inn")}</a>
       </div>${pilotInvite("avslutning", en ? "en" : "no", facts)}
     </aside>`;
   const content = `
@@ -779,6 +847,10 @@ export function renderForProdusenterPage(lang: Lang, canonicalUrl: string, facts
     <p>${en
       ? "Your profile, ownership, your choices, orders, payment, statistics and privacy, explained for producers."
       : "Profilen din, eierskap, valgene dine, bestillinger, betaling, statistikk og personvern, forklart for produsenter."}</p>
+    <div class="fp-hero-ctas">
+      <a class="fp-btn fp-btn-primary" href="${SELGER_FIND}">${esc(en ? "Find your profile and take it over" : "Finn profilen din og ta den over")}</a>
+      <a class="fp-btn" href="${SELGER_LOGIN}">${esc(en ? "Log in" : "Logg inn")}</a>
+    </div>
   </section>${menu}
   <main class="fp-main">${body}${closing}
   </main>
