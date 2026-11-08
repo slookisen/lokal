@@ -186,6 +186,20 @@ primary_region = 'arn'
   # Inert until RFB_MARKETING_PLATFORM_ENABLED='1' — this line does not turn
   # the job on. Rollback: remove the line (→ 10) or set a lower value.
   RFB_MARKETING_DAILY_CAP = '20'
+  # dev-request 2026-09-02-dental-permanent-triage-needs-review-drain, skive
+  # 3b-på (Daniel 2026-10-28 punkt 3.7 «Ja, GO etter 4.11», A2A
+  # daniel-responses/2026-10-28-live-svar-byggeko-sjekkliste-punkt-3.md).
+  # Turns on 3b (lokal#833): a dental row that reaches 3 strikes for the
+  # SECOND time (its 30-day park expired and it was re-stamped) gets
+  # verification_status='needs_review' with review_reason
+  # (wrong_entity_repeat / dead_homepage_repeat / insufficient_yield_repeat)
+  # and review_since. A first 3-strike park keeps the 30-day behaviour. Read in
+  # src/services/dental-store.ts and src/routes/dental-seo.ts (=== 'true').
+  # The dental write-pause fence is verified (2026-11-05), which was the gate.
+  # A Fly secret with the same name overrides this line: check
+  # `fly secrets list -a lokal` before merge. Rollback: remove the line or set
+  # it to 'false' (no migration; rows already in needs_review stay there).
+  DENTAL_REPEAT_PARK_TO_REVIEW = 'true'
 
 [[mounts]]
   source = 'lokal_data'

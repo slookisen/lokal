@@ -8,6 +8,7 @@ import { productsWithoutOrganicFlag, stripOrganicEntries, dropOrganicSentences }
 import { debioStatusShown } from "./debio-approval";
 import { normalizeEmail } from "./blocklist-service";
 import { customerRuleSql } from "./customer-rule";
+import { revokeOwnerAccessExceptVerifiedOwners } from "./owner-access-revocation";
 import {
   type ClaimRecommendation, type DomainHttpsCheck, claimDomainRuleEnabled, emailDomain, emailDomainMatchesWebsite,
   getDomainHttpsCheck, isFreeMailDomain, isHostedPlatformHost, isRootWebsite, registrableDomain, websiteHost,
@@ -1303,6 +1304,10 @@ class KnowledgeService {
    *  still to be confirmed with resolveFarmContactEmail). */
   private knownEmailCandidates(target: string, knownHolderId?: string): Set<string> {
     const db = getDb();
+    // A deactivated or merged profile (is_active = 0) no longer shares the
+    // address: it has no page and no owner to mix up, and a merged duplicate
+    // would otherwise block the code for the survivor forever. The claimed
+    // profile itself still counts, also when inactive.
     // The claimed profile itself, when its known e-mail is the address (rule 1):
     // a candidate regardless of the LIMIT below, so stale outreach rows cannot
     // crowd it out of the set.
@@ -1310,7 +1315,7 @@ class KnowledgeService {
     const listed = db.prepare(
       `SELECT k.agent_id AS id
          FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
-        WHERE LOWER(TRIM(k.email, ${EMAIL_TRIM_CHARS})) = ? AND COALESCE(a.vertical_id, 'rfb') = 'rfb'
+        WHERE LOWER(TRIM(k.email, ${EMAIL_TRIM_CHARS})) = ? AND COALESCE(a.vertical_id, 'rfb') = 'rfb' AND COALESCE(a.is_active, 1) = 1
         LIMIT ?`
     ).all(target, SHARED_EMAIL_CANDIDATES_MAX) as Array<{ id: string }>;
     for (const r of listed) candidates.add(r.id);
@@ -1318,7 +1323,7 @@ class KnowledgeService {
       const delivered = db.prepare(
         `SELECT DISTINCT o.agent_id AS id
            FROM outreach_sent_log o JOIN agents a ON a.id = o.agent_id
-          WHERE LOWER(TRIM(o.recipient_email, ${EMAIL_TRIM_CHARS})) = ? AND o.vertical_id = 'rfb' AND COALESCE(a.vertical_id, 'rfb') = 'rfb'
+          WHERE LOWER(TRIM(o.recipient_email, ${EMAIL_TRIM_CHARS})) = ? AND o.vertical_id = 'rfb' AND COALESCE(a.vertical_id, 'rfb') = 'rfb' AND COALESCE(a.is_active, 1) = 1
           LIMIT ?`
       ).all(target, SHARED_EMAIL_CANDIDATES_MAX) as Array<{ id: string }>;
       for (const r of delivered) candidates.add(r.id);
@@ -2125,6 +2130,15 @@ class KnowledgeService {
       db.prepare("UPDATE agent_knowledge SET data_source = 'hybrid' WHERE agent_id = ? AND data_source = 'auto'")
         .run(claim.agent_id);
     }
+
+    // Owner change (dev-request 2026-11-06-rfb-krav-for-portal-og-okter-ved-
+    // eierskifte, spec point 2): login rows follow ownership. Every live
+    // /eier session and open login link for this profile whose address is not
+    // a verified owner now (the new owner, or an owner that stays) is revoked
+    // — e.g. a previous owner by activation link or the old listed address.
+    // Both callers run this method inside a transaction, so a failure here
+    // rolls the whole grant back instead of leaving the old sessions live.
+    revokeOwnerAccessExceptVerifiedOwners(db, claim.agent_id, `claim grant (${claimedVia})`);
 
     return claimToken;
   }

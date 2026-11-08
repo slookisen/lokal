@@ -38,6 +38,7 @@ import { analyticsService } from "../services/analytics-service";
 import { recordAiPageDelivery } from "../services/profile-ai-deliveries";
 import { recordAiProfileClick } from "../services/profile-ai-clicks";
 import { aiDeliveriesTileFor } from "../services/profile-ai-deliveries-tile";
+import { aiClicksTileFor } from "../services/profile-ai-clicks-tile";
 import { TRAFFIC_YEAR_KEYS, trafficYearCell, trafficYearLangOf, type TrafficYear, type TrafficYearKey } from "../services/traffic-year-compute";
 import { filterQueryText } from "../services/search-tracking";
 import { getExperiencesAgentCard, OPPLEVAGENT_CUSTOM_GPT_URL } from "../services/experiences-agent-card";
@@ -4057,6 +4058,7 @@ ${oaSiteNav({ lang: uiLang, path: noPath, switcher: switcherOn })}
     <div class="badges">${badges.join("")}</div>
   </header>
   ${aiDeliveriesTileFor("experiences", exp.id)}
+  ${aiClicksTileFor("experiences", exp.id)}
   <div class="layout">
     <article>
       ${heroMedia}
@@ -6599,6 +6601,7 @@ ${switcherOn ? oaSiteNav({ active: "gardssalg", lang, path: noPath, switcher: tr
     <a href="${localizedPath("/", uiLang) || "/"}">${L.home}</a> · <a href="/kategori/gardssalg">${L.gsCrumb}</a> · ${escapeHtml(provider.navn)}
   </nav>
   ${aiDeliveriesTileFor("experiences", String(provider.id))}
+  ${aiClicksTileFor("experiences", String(provider.id))}
   <div class="produsent-layout">
     <article>
       <div class="info-card">
