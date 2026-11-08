@@ -122,6 +122,18 @@ export async function runDentalPrivacyTruthTests(opts: { log?: boolean } = {}): 
   assertTrue(!/ehandelsloven/i.test(html), "the privacy page is not presented as ehandelsloven § 8 compliance");
   assertTrue(!/Frankfurt|Daniel Fredriksen/.test(html), "no stale Frankfurt / personal controller name");
 
+  // 5. AI-answer marker (dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 6).
+  const t2 = text.replace(/&amp;/g, "&");
+  assertTrue(/utm_source/.test(t2) && /utm_medium/.test(t2) && /utm_campaign/.test(t2) && /utm_campaign=ai_search/.test(t2),
+    "the page names the utm_* marker on links given to AI assistants");
+  assertTrue(/det inneholder ingenting om deg/.test(t2) && /telle besøk som kom fra et AI-svar/.test(t2),
+    "the page says the marker holds nothing about the person and is used to count visits from AI answers");
+  assertTrue(!/kontaktknapp/i.test(t2), "no contact-click claim: dental profile pages do not count contact clicks");
+  const dentalSrc = fs.readFileSync(path.join(__dirname, "dental-seo.ts"), "utf8");
+  assertTrue(!/api\/track\/contact-click/.test(dentalSrc) && /recordAiProfileClick/.test(dentalSrc),
+    "code: dental counts AI-answer visits but has no contact-click beacon");
+  assertTrue(/Sist oppdatert: 2026-11-08/.test(text), "updated date is 2026-11-08");
+
   return { passed, failed, failures };
 }
 

@@ -3343,8 +3343,9 @@ router.get("/hvordan-det-fungerer", (_req: Request, res: Response) => {
 router.get("/personvern", (_req: Request, res: Response) => {
   // 2026-10-13: faktarettinger (dev-request 2026-10-06-personvernerklaeringer-del-a-na-del-b-pa-t, del A);
   // visit and search statistics described (2026-10-13-statistikk-riktig-for-investorer, S2:
-  // searches are now logged); operator → AGENTPLATFORM.NO AS (2026-10-08).
-  const updatedDate = "2026-10-13";
+  // searches are now logged); operator → AGENTPLATFORM.NO AS (2026-10-08). 2026-11-08: the
+  // AI-answer marker (dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 6).
+  const updatedDate = "2026-11-08";
   const html = `
 <main>
   <div class="content-page">
@@ -3367,6 +3368,8 @@ router.get("/personvern", (_req: Request, res: Response) => {
     <h2>Besøks- og søkestatistikk</h2>
     <p>For å forstå hvordan tjenesten brukes, registrerer serveren &mdash; uten cookies &mdash; for hvert sidebesøk hvilken side som ble vist, hvor du kom fra (referanse-URL), tidspunktet, en saltet og forkortet hash av IP-adressen (vi lagrer aldri hele IP-adressen) og en grov klassifisering av nettleseren (for eksempel mobil, PC eller søkemotor). Når du søker på nettsiden eller via API-et, lagrer vi i tillegg søketeksten og filtrene du valgte (for eksempel fylke, spesialitet eller akutt), antall treff og den samme IP-hashen. Når en AI-assistent bruker våre MCP- eller A2A-verktøy, logger vi verktøyet, AI-klientens nettleser-/klientstreng og en saltet IP-hash.</p>
     <p>Søk lagres uten navn eller konto, og vi forsøker ikke å knytte dem til deg. Disse enkeltregistreringene slettes automatisk etter 60 dager. Før sletting summeres de til tall uten kobling til den besøkende (for eksempel antall besøk per dag og antall søk per søketekst), og bare disse tallene beholdes. Statistikken lagres i databasen hos Fly.io (se under) og deles ikke med andre.</p>
+
+    <p>Har lenken du kom fra et merke (<code>utm_source</code>, <code>utm_medium</code>, <code>utm_campaign</code>), lagres også merket sammen med sidebesøket. Lenker til klinikksider som vi gir AI-assistenter som ChatGPT og Claude, har et slikt merke (for eksempel <code>utm_source=claude&amp;utm_campaign=ai_search</code>). Merket sier bare hvilken AI-tjeneste lenken ble gitt til &mdash; det inneholder ingenting om deg. Sammen med referanse-URL-en lar det oss telle besøk som kom fra et AI-svar. Disse besøkene summeres per dag, klinikkside og AI-tjeneste, uten IP-hash eller annen kobling til den besøkende, og summene vises på klinikksidene. Summene slettes ikke automatisk i dag.</p>
 
     <h2>Navngitte personer</h2>
     <p>Tannleger og annet helsepersonell kan fremgå av profilene med navn og tittel/spesialitet. Dette er offentlig tilgjengelig informasjon knyttet til yrkesutøvelse og autorisasjon &mdash; ikke privat informasjon. Grunnlaget er at offentligheten har rett og behov for å kjenne til autorisert helsepersonells spesialkompetanse.</p>
