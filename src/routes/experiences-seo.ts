@@ -359,6 +359,11 @@ function pwaHeadTags(opts: { includeThemeColor?: boolean } = {}): string {
 // item 3) so untrusted DB text (provider names, kommune names, …) gets the
 // exact same `& < > " '` escaping there as everywhere else in this file —
 // XML escaping doesn't differ from HTML escaping for that character set.
+/** Gårdssalg guest-contact sweep leaves '' in guest_name/guest_email: render «slettet». */
+export function escapeOrDeleted(text: unknown): string {
+  return typeof text === "string" && text.trim() ? escapeHtml(text) : "slettet";
+}
+
 export function escapeHtml(text: unknown): string {
   return String(text ?? "")
     .replace(/&/g, "&amp;")
@@ -7221,10 +7226,10 @@ ${BROWSE_CSS}
     <div class="recap">
       <div><strong>Dato/tid:</strong> ${escapeHtml(slotFormatted)}</div>
       <div><strong>Antall:</strong> ${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</div>
-      <div><strong>Navn:</strong> ${escapeHtml(booking.guest_name)}</div>
+      <div><strong>Navn:</strong> ${escapeOrDeleted(booking.guest_name)}</div>
       ${booking.notes ? `<div><strong>Kommentar:</strong> ${escapeHtml(booking.notes)}</div>` : ""}
     </div>
-    <p class="hint">En bekreftelse er sendt til ${escapeHtml(booking.guest_email)}.</p>
+    <p class="hint">En bekreftelse er sendt til ${escapeOrDeleted(booking.guest_email)}.</p>
     <a class="ics-link" href="${icsUrl}">Last ned kalenderfil (.ics)</a>
   </div>
 </main>
@@ -7361,8 +7366,8 @@ ${BROWSE_CSS}
     <div class="recap">
       <div><strong>Dato/tid:</strong> ${escapeHtml(slotFormatted)}</div>
       <div><strong>Antall:</strong> ${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</div>
-      <div><strong>Gjest:</strong> ${escapeHtml(booking.guest_name)}</div>
-      <div><strong>E-post:</strong> ${escapeHtml(booking.guest_email)}</div>
+      <div><strong>Gjest:</strong> ${escapeOrDeleted(booking.guest_name)}</div>
+      <div><strong>E-post:</strong> ${escapeOrDeleted(booking.guest_email)}</div>
       ${booking.guest_phone ? `<div><strong>Telefon:</strong> ${escapeHtml(booking.guest_phone)}</div>` : ""}
       ${booking.notes ? `<div><strong>Kommentar fra gjesten:</strong> ${escapeHtml(booking.notes)}</div>` : ""}
     </div>
@@ -7515,8 +7520,8 @@ function previsitRecapHtml(booking: GardssalgBooking, forProducer: boolean): str
       <div><strong>Dato/tid:</strong> ${escapeHtml(previsitSlotNb(booking.slot_at))}</div>
       ${booking.suggested_slot_at && booking.pre_status === "time_suggested" ? `<div><strong>Foreslått nytt tidspunkt:</strong> ${escapeHtml(previsitSlotNb(booking.suggested_slot_at))}</div>` : ""}
       <div><strong>Antall:</strong> ${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</div>
-      ${forProducer ? `<div><strong>Gjest:</strong> ${escapeHtml(booking.guest_name)}</div>
-      <div><strong>E-post:</strong> ${escapeHtml(booking.guest_email)}</div>
+      ${forProducer ? `<div><strong>Gjest:</strong> ${escapeOrDeleted(booking.guest_name)}</div>
+      <div><strong>E-post:</strong> ${escapeOrDeleted(booking.guest_email)}</div>
       ${booking.guest_phone ? `<div><strong>Telefon:</strong> ${escapeHtml(booking.guest_phone)}</div>` : ""}
       ${booking.notes ? `<div><strong>Kommentar fra gjesten:</strong> ${escapeHtml(booking.notes)}</div>` : ""}` : ""}
     </div>`;
@@ -9866,7 +9871,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=3600");
   res.send(legalPage("Personvern / Privacy", `<div class="lang"><a href="#en">English</a></div>
-<h1>Personvern</h1><p><strong>Sist oppdatert:</strong> 13. oktober 2026</p>
+<h1>Personvern</h1><p><strong>Sist oppdatert:</strong> 8. november 2026</p>
 <p>Opplevagent (opplevagent.no) er en agent-til-agent-markedsplass som hjelper AI-agenter og mennesker med å finne norske opplevelser og aktiviteter — turer, kurs, severdigheter og ting å gjøre. Vi respekterer personvernet til tilbydere, brukere og AI-agenter som samhandler med plattformen.</p>
 <h2>Hva vi samler inn</h2><ul>
 <li><strong>Opplevelsesdata:</strong> tittel, beskrivelse, tilbyder, kategori, fylke/kommune, varighet, pris, sesong og bookinglenke — offentlig tilgjengelig informasjon hentet fra tilbydernes egne nettsider og åpne kilder (Brønnøysundregistrene, Visit Norway / CBIS m.fl.).</li>
@@ -9903,7 +9908,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <tr><td>Sperreliste</td><td>Så lenge tjenesten finnes, slik at en fjernet profil ikke opprettes på nytt og vi ikke tar kontakt igjen. Lagrer nettstedsdomene, avsenderens e-postadresse og årsak.</td></tr>
 <tr><td>Besøks- og søkestatistikk og teknisk MCP/A2A-logg</td><td>Slettes automatisk etter 60 dager. Før sletting summeres de til tall uten kobling til den besøkende (for eksempel antall besøk per dag og antall søk per søketekst), og bare disse tallene beholdes.</td></tr>
 <tr><td>Agent-forespørsler</td><td>Loggen over, uten personopplysninger, slettes ikke automatisk i dag.</td></tr>
-<tr><td>Besøksforespørsler</td><td>Ingen automatisk sletting i dag. De lagres til du ber oss slette dem, og vi sletter dem da innen 30 dager. E-posten som er sendt til produsenten, ligger også i produsentens og din egen innboks; den kan vi ikke slette.</td></tr>
+<tr><td>Besøksforespørsler</td><td>Navn, e-post, telefon og kommentar slettes automatisk 30 dager etter at forespørselen er avgjort (gjennomført besøk, uteblitt eller kansellert), eller 30 dager etter ønsket besøksdato hvis den aldri ble avgjort. Dato, produsent, antall personer og status beholdes uten opplysninger om deg. Ber du om det, sletter vi tidligere. E-posten som er sendt til produsenten, ligger også i produsentens og din egen innboks; den kan vi ikke slette.</td></tr>
 <tr><td>Sikkerhetskopier av databasen</td><td>Daglige kopier hos Tigris beholdes i 7 dager, og én kopi per uke i 4 uker til. Før større endringer tar vi i tillegg av og til en manuell kopi på serveren; de ti nyeste beholdes, og ingen kopi lever lenger enn 30 dager. En slettet opplysning kan derfor ligge i en sikkerhetskopi en stund etter at den er slettet.</td></tr>
 </tbody></table>
 <h2>Rettighetene dine</h2><p>Etter personopplysningsloven og personvernforordningen (GDPR) har du rett til å:</p><ul>
@@ -9914,7 +9919,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <li><strong>Klage</strong> — du kan klage til Datatilsynet (datatilsynet.no).</li></ul>
 <h2>Kontakt</h2><p>${companyControllerSentenceHtml("nb", { siteName: "Opplevagent", siteEmail: "kontakt@opplevagent.no" })}</p>
 <hr>
-<h1 id="en">Privacy Policy</h1><p><strong>Last updated:</strong> 13 October 2026</p>
+<h1 id="en">Privacy Policy</h1><p><strong>Last updated:</strong> 8 November 2026</p>
 <p>Opplevagent (opplevagent.no) is an agent-to-agent marketplace that helps AI agents and humans find Norwegian experiences and activities — tours, courses, attractions, and things to do. We respect the privacy of providers, end-users, and AI agents that interact with the platform.</p>
 <h2>What we collect</h2><ul>
 <li><strong>Experience data:</strong> title, description, provider, category, county/municipality, duration, price, season, and booking link — public information gathered from providers' own websites and open sources (the Norwegian business registry, Visit Norway / CBIS, etc.).</li>
@@ -9951,7 +9956,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <tr><td>Do-not-contact list</td><td>For as long as the service exists, so that a removed profile is not re-created and we do not contact you again. Stores the website domain, the sender's email address and the reason.</td></tr>
 <tr><td>Visit and search statistics and the technical MCP/A2A log</td><td>Deleted automatically after 60 days. Before deletion they are summed into totals with no link to the visitor (for example visits per day and searches per search text), and only those totals are kept.</td></tr>
 <tr><td>Agent requests</td><td>The log above, without personal data, is not deleted automatically today.</td></tr>
-<tr><td>Visit requests</td><td>No automatic deletion today. They are kept until you ask us to delete them, and we then delete them within 30 days. The email already sent to the producer also sits in the producer's and your own inbox, which we cannot delete.</td></tr>
+<tr><td>Visit requests</td><td>Name, email, phone and comment are deleted automatically 30 days after the request is resolved (visit completed, no-show or cancelled), or 30 days after the requested visit date if it was never resolved. The date, producer, party size and status are kept without any information about you. If you ask, we delete sooner. The email already sent to the producer also sits in the producer's and your own inbox, which we cannot delete.</td></tr>
 <tr><td>Database backups</td><td>Daily copies with Tigris are kept for 7 days, and one copy per week for 4 more weeks. Before larger changes we occasionally also take a manual copy on the server; the ten newest are kept, and never longer than 30 days. A deleted detail can therefore remain in a backup for a while after it is deleted.</td></tr>
 </tbody></table>
 <h2>Your rights</h2><p>Under the Norwegian Personal Data Act and the GDPR you have the right to:</p><ul>

@@ -188,8 +188,8 @@ function cardHtml(booking: GardssalgBooking, now: Date): string {
 <div class="besok-status">Status: <strong>${escapeHtml(mineBesokStatusText(booking, now))}</strong></div>
 <div class="besok-detaljer">
 ${suggested}<div><strong>Antall:</strong> ${n} person${n > 1 ? "er" : ""}</div>
-<div><strong>Gjest:</strong> ${escapeHtml(String(booking.guest_name ?? ""))}</div>
-<div><strong>E-post:</strong> ${escapeHtml(String(booking.guest_email ?? ""))}</div>
+<div><strong>Gjest:</strong> ${booking.guest_name ? escapeHtml(String(booking.guest_name)) : "slettet"}</div>
+<div><strong>E-post:</strong> ${booking.guest_email ? escapeHtml(String(booking.guest_email)) : "slettet"}</div>
 ${booking.guest_phone ? `<div><strong>Telefon:</strong> ${escapeHtml(booking.guest_phone)}</div>\n` : ""}${booking.notes ? `<div><strong>Kommentar fra gjesten:</strong> ${escapeHtml(booking.notes)}</div>\n` : ""}<div><strong>Referanse:</strong> ${escapeHtml(booking.booking_ref)}</div>
 </div>
 ${actionsHtml(booking, now)}

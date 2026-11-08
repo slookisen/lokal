@@ -69,6 +69,7 @@ import { prewarmTrafficStats } from "./services/traffic-stats";
 import { AGENT_USAGE_PREWARM_INTERVAL_MS, prewarmAgentToolCalls } from "./services/agent-usage";
 import { prewarmAgentStats } from "./services/agent-stats-reader";
 import { sweepExpiredCartContactData } from "./services/cart-contact-sweep";
+import { sweepExpiredGardssalgGuestContact } from "./services/gardssalg-guest-contact-sweep";
 import analyticsRoutes from "./routes/analytics";
 import agentStatsRoutes from "./routes/agent-stats";
 import adminRunsRoutes from "./routes/admin-runs";
@@ -148,6 +149,7 @@ import adminTestClaimFixtureRoutes from "./routes/admin-test-claim-fixture";
 import adminOwnerFeaturesInterestRoutes from "./routes/admin-owner-features-interest";
 import adminOwnerFeaturesSwitchProbeRoutes from "./routes/admin-owner-features-switch-probe";
 import adminGardssalgSwitchProbeRoutes from "./routes/admin-gardssalg-switch-probe";
+import adminGardssalgGuestContactSweepRoutes from "./routes/admin-gardssalg-guest-contact-sweep";
 import adminAgentsClaimBackfillRoutes from "./routes/admin-agents-claim-backfill";
 import adminAgentsTerminalReparkRoutes from "./routes/admin-agents-terminal-repark";
 import adminAgentsDuplicateSlugsRoutes from "./routes/admin-agents-duplicate-slugs";
@@ -998,6 +1000,8 @@ app.use("/admin/owner-features/switch-probe", adminLimiter, adminOwnerFeaturesSw
 // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg O2b: the Opplevagent «Mine valg» switch probe
 // on the hidden gårdssalg test producer — behind OA_OWNER_FEATURES_SWITCH_PROBE_ENABLED=1 (default off → 404).
 app.use("/admin/gardssalg/owner-features/switch-probe", adminLimiter, adminGardssalgSwitchProbeRoutes);
+// dev-request 2026-10-23-opplevagent-besoksforesporsler-automatisk-sletting: read-only dry-run count.
+app.use("/admin/gardssalg/guest-contact-sweep", adminLimiter, adminGardssalgGuestContactSweepRoutes);
 // POST /admin/agents/claim-backfill — one-shot claimed_at backfill for verified
 // claims (dev-request 2026-10-01-rfb-eierkrav-utelates-fra-outreach). Mount BEFORE /admin/agents.
 app.use("/admin/agents/claim-backfill", adminLimiter, adminAgentsClaimBackfillRoutes);
@@ -1781,6 +1785,24 @@ app.listen(Number(PORT), HOST, async () => {
         );
       } catch (err) {
         console.error("[cart-contact-sweep] failed (non-fatal):", err);
+      }
+
+      // dev-request 2026-10-23-opplevagent-besoksforesporsler-automatisk-sletting:
+      // clears guest contact on gardssalg_bookings 30 days after a request is
+      // resolved (or 30 days after the wished visit date if never resolved).
+      // Same dry-run-first convention: count-only until
+      // GARDSSALG_GUEST_CONTACT_SWEEP_LIVE is exactly "true". Logs counts only.
+      try {
+        const gsLive = process.env.GARDSSALG_GUEST_CONTACT_SWEEP_LIVE === "true";
+        const gsResult = sweepExpiredGardssalgGuestContact(30, now, !gsLive);
+        console.log(
+          `[gardssalg-guest-contact-sweep] dryRun=${gsResult.dryRun} sweptCount=${gsResult.sweptCount}` +
+          (gsResult.dryRun
+            ? " (count-only, no rows modified — set GARDSSALG_GUEST_CONTACT_SWEEP_LIVE=true to enable real deletion)"
+            : "")
+        );
+      } catch (err) {
+        console.error("[gardssalg-guest-contact-sweep] failed (non-fatal):", err);
       }
 
       // Slice 1 of 2026-10-08-serverheng…: 14-day retention for event_loop_events
