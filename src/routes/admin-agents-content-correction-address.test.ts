@@ -275,6 +275,15 @@ export function runAdminAgentsContentCorrectionAddressTests(opts: { log?: boolea
       // A description item in the same call keeps its own behaviour.
       r = await post([item("ad-norow", { text: "Totakvegen 181" }), { agent_id: "ad-norow", field: "description", text: "Ost og bakst." }]);
       assertEq(r.body?.results?.map((x: any) => [x.field, x.outcome]), [["address", "would_write"], ["description", "would_write"]], "ad-40: mixed address + description items each plan on their own");
+
+      // A description apply never touches the geocode.
+      db.prepare(`UPDATE agents SET ${GEO_COLS.split(", ").map((c) => `${c} = ?`).join(", ")} WHERE id = 'ad-same'`).run(...GEO_SET);
+      r = await post([{ agent_id: "ad-same", field: "description", text: "Ost og bakst fra Rauland." }], true);
+      assertEq([first(r)?.outcome, geo("ad-same")], ["written", GEO_SET], "ad-41: description apply keeps the geocode");
+      // Whitespace-only difference in the stored value is a real change (exact compare, like PUT's valueChanged).
+      db.prepare(`UPDATE agent_knowledge SET address = ? WHERE agent_id = 'ad-same'`).run(NEW_ADDR + " ");
+      r = await post([item("ad-same")], true);
+      assertEq([first(r)?.outcome, know("ad-same")?.address, geo("ad-same")], ["written", NEW_ADDR, GEO_RESET], "ad-42: stored trailing space -> written, trimmed, geocode reset");
     } finally {
       try { require("./admin-agents-content-correction").__setContentCorrectionDbForTesting(null); } catch { /* ignore */ }
       try { db.close(); } catch { /* ignore */ }

@@ -159,9 +159,11 @@
 // and a homepage-typed record would be provenance we did not fetch. The audit
 // row (field_name address, changed_by admin, reason, source_url) is the record.
 // Residual risk: other writers can put the old value back — PUT
-// /admin/knowledge without allow_correct, PUT /api/marketplace/agents/:id/
-// knowledge, and the road-designation upgrade paths do not know about an admin
-// correction. Follow-up dev-request: those writers respect it.
+// /admin/knowledge without allow_correct, and with allow_correct when the
+// stored provenance is inference-only or website ownership is unverified;
+// PUT /api/marketplace/agents/:id/knowledge; and the road-designation upgrade
+// paths. None of them knows about an admin correction. Follow-up dev-request:
+// those writers respect it.
 
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
