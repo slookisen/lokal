@@ -53163,3 +53163,24 @@ runSerial(async () => {
     failures.push("experience-facts-proposals: unexpected error: " + String(err?.message || err));
   }
 });
+
+// Admin order statistics, slice S1: GET /admin/api/ordre/{oversikt,liste} —
+// read-only RFB order + Opplevagent gårdssalg counts, test data apart, no
+// buyer/guest data. Own in-memory lokal/experiences DBs pinned on the route
+// module, swaps ADMIN_KEY / ENABLE_EXPERIENCES (restored in finally) —
+// runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── admin-order-stats: GET /admin/api/ordre/{oversikt,liste} (S1) ──");
+  try {
+    const { runAdminOrderStatsTests } = require("../src/routes/admin-order-stats.test") as
+      typeof import("../src/routes/admin-order-stats.test");
+    const r = await runAdminOrderStatsTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-order-stats: " + f);
+    console.log(`  admin-order-stats: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-order-stats: unexpected error: " + String(err?.message || err));
+  }
+});
