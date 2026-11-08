@@ -59,7 +59,7 @@ import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 import { searchCountable } from "../services/search-tracking";
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
 import { BRAND_ENTITIES, brandMcpIcons } from "../config/brand-entities";
-import { publicListableSql, failsProducerRoleGate, isAgentIdPubliclyVisible, notOwnerHiddenSql, ownerHidesAgent, withoutOwnerHidden } from "../services/agent-visibility";
+import { publicListableSql, failsProducerRoleGate, isAgentIdPubliclyVisible, notOwnerHiddenSql, ownerHidesAgent, withoutOwnerHidden, isContactHiddenAgentId, withoutContactFields, HIDDEN_CONTACT_NOTE_NB } from "../services/agent-visibility";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { isPaymentsEnabled, isPaymentsLifecycleActive, submitCartWithPayments, resolvePaymentsStripeClient } from "../services/payment-service";
@@ -1218,16 +1218,23 @@ export function registerTools(
         }
       }
 
-      // Contact
-      const contact: string[] = [];
-      if (k.address) contact.push(`📍 ${formatAddressLine(k.address, k.postalCode, agent.city)}`);
-      if (isDisplayablePhone(k.phone)) contact.push(`📞 ${k.phone}`);
-      if (k.email) contact.push(`✉️ ${k.email}`);
-      if (k.website) contact.push(`🌐 ${k.website}`);
-      if (contact.length) sections.push(`\n## Kontakt\n${contact.join("\n")}`);
+      if (isContactHiddenAgentId(getDb(), agent.id)) {
+        // A catalog_hidden row (the hidden test fixture) is still described by
+        // id so it stays orderable, but its contact details and vCard link
+        // are a real person's and appear in no public answer (agent-visibility.ts).
+        sections.push(`\n${HIDDEN_CONTACT_NOTE_NB}`);
+      } else {
+        // Contact
+        const contact: string[] = [];
+        if (k.address) contact.push(`📍 ${formatAddressLine(k.address, k.postalCode, agent.city)}`);
+        if (isDisplayablePhone(k.phone)) contact.push(`📞 ${k.phone}`);
+        if (k.email) contact.push(`✉️ ${k.email}`);
+        if (k.website) contact.push(`🌐 ${k.website}`);
+        if (contact.length) sections.push(`\n## Kontakt\n${contact.join("\n")}`);
 
-      // vCard
-      sections.push(`\n🪪 [Last ned kontaktkort (vCard)](${addAiUtmParams(`${BASE_URL}/api/marketplace/agents/${agent.id}/vcard`, getClientIdentity?.())})`);
+        // vCard
+        sections.push(`\n🪪 [Last ned kontaktkort (vCard)](${addAiUtmParams(`${BASE_URL}/api/marketplace/agents/${agent.id}/vcard`, getClientIdentity?.())})`);
+      }
 
       // Opening hours (an array, or free text — see formatOpeningHoursForMcp)
       const hoursSection = formatOpeningHoursForMcp(k.openingHours);
@@ -2092,7 +2099,11 @@ export function registerTools(
         return { contents: [{ uri: uri.href, text: "Producer not found", mimeType: "text/plain" }] };
       }
       // S2c-1: without what the owner hid (not enforced = as before).
-      const shown = publicAgentInfo(info, publicFieldChoices(agentId));
+      const choiceShown = publicAgentInfo(info, publicFieldChoices(agentId));
+      // A catalog_hidden row never shows its contact details (see lokal_info).
+      const shown = isContactHiddenAgentId(getDb(), agentId)
+        ? { ...choiceShown, knowledge: withoutContactFields(choiceShown.knowledge) }
+        : choiceShown;
       return { contents: [{ uri: uri.href, text: JSON.stringify(shown, null, 2), mimeType: "application/json" }] };
     }
   );

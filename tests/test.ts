@@ -53427,3 +53427,26 @@ runSerial(async () => {
     failures.push("admin-order-stats: unexpected error: " + String(err?.message || err));
   }
 });
+
+// Claude directory checklist (2026-11-07): the hidden RFB test fixture
+// (catalog_hidden = 1) is still described by id on lokal_info (orderable by
+// product id), but its contact details and vCard link appear in no public
+// answer — lokal_info, the MCP producer resource, A2A agent/info, the seller
+// auto-reply and contact_handoffs. A visible producer's answer is unchanged;
+// the admin as-public view follows its existing rule. Swaps
+// OWNER_VISIBILITY_ENFORCE_BY_ID (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── RFB: skjult testprodusent uten kontaktinfo ──");
+  try {
+    const { runRfbHiddenContactOmissionTests } = require("../src/routes/rfb-hidden-contact-omission.test") as
+      typeof import("../src/routes/rfb-hidden-contact-omission.test");
+    const r = await runRfbHiddenContactOmissionTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-hidden-contact-omission: " + f);
+    console.log(`  rfb-hidden-contact-omission: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-hidden-contact-omission: unexpected error: " + String(err?.message || err));
+  }
+});

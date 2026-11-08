@@ -131,6 +131,54 @@ function catalogHiddenForView(row: { catalog_hidden?: number | null; origin?: st
   return !(isAsPublicView() && row.origin === TEST_FIXTURE_ORIGIN);
 }
 
+// ─── No contact details for a catalog_hidden row (Claude directory checklist,
+// 2026-11-07) ─────────────────────────────────────────────────────────────────
+// lokal_info passes `allowCatalogHidden` (and the ungated by-id surfaces answer
+// any id with OWNER_VISIBILITY_ENFORCE_BY_ID off), so the hidden test fixture
+// is still described by id — it must stay orderable by product id. Its contact
+// details (address, phone, e-mail, website, vCard) belong to a real person and
+// must appear in no public answer. Same "hidden for this view" rule as the
+// lists (catalogHiddenForView): inside the admin as-public view the ORDER
+// fixture reads as public, contact included; every other catalog_hidden row
+// (the claim-test fixture too) never shows contact details.
+
+/** The one line a hidden row shows where its contact block would be. */
+export const HIDDEN_CONTACT_NOTE_NB = "Kontaktinformasjon vises ikke for denne profilen.";
+
+/** Contact fields of a knowledge object that a hidden row never shows. */
+export const HIDDEN_ROW_CONTACT_FIELDS = ["address", "postalCode", "phone", "email", "website"] as const;
+
+/** Are this raw `agents` row's contact details withheld on a public answer? */
+export function contactHiddenForView(row: { catalog_hidden?: number | null; origin?: string | null } | null | undefined): boolean {
+  return !!row && catalogHiddenForView({ catalog_hidden: row.catalog_hidden == null ? 0 : Number(row.catalog_hidden), origin: row.origin });
+}
+
+/**
+ * contactHiddenForView() for a caller that only holds an id. An unknown id or
+ * a failed read (a schema without the column) is false: the answer is then
+ * exactly today's.
+ */
+export function isContactHiddenAgentId(
+  db: { prepare(sql: string): { get(...params: unknown[]): unknown } },
+  agentId: string,
+): boolean {
+  try {
+    const row = db.prepare("SELECT catalog_hidden, origin FROM agents WHERE id = ?").get(agentId) as
+      { catalog_hidden: number | null; origin: string | null } | undefined;
+    return contactHiddenForView(row);
+  } catch {
+    return false;
+  }
+}
+
+/** A copy of a knowledge object without HIDDEN_ROW_CONTACT_FIELDS (the same value when it is no object). */
+export function withoutContactFields<T>(k: T): T {
+  if (!k || typeof k !== "object") return k;
+  const out: any = { ...(k as any) };
+  for (const f of HIDDEN_ROW_CONTACT_FIELDS) delete out[f];
+  return out;
+}
+
 /**
  * For the non-public pipelines that must leave the fixture alone but have no
  * business filtering on vertical (the RFB verifier batch pickers — their
