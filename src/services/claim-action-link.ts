@@ -28,6 +28,14 @@
 // a double submit succeeds once. When the claim is no longer in the state the
 // action needs (approve after reject, …) nothing is written and the link is
 // not used up.
+//
+// Eierkrav B3a: a fourth action, request_more («Be om mer bekreftelse», claim
+// stays pending_review, one mail to the claimant), behind
+// CLAIM_REQUEST_MORE_ENABLED (off unless exactly "true"). Flag off → it is
+// never minted (not by default, not when asked for) and an existing link
+// executes nothing. It sends a mail, so it is not redeemed here but by
+// services/claim-request-more.ts (the link POST dispatches to it);
+// redeemClaimActionLink refuses it without using the link up.
 
 import crypto from "crypto";
 import { getDb } from "../database/init";
@@ -40,7 +48,7 @@ export const CLAIM_ACTION_VALID_HOURS = 72;
 export const CLAIM_ACTION_PATH = "/eierkrav/handling";
 export const CLAIM_ACTION_BASE_URL = "https://rettfrabonden.com";
 
-export const CLAIM_ACTIONS = ["approve", "reject", "revoke"] as const;
+export const CLAIM_ACTIONS = ["approve", "reject", "revoke", "request_more"] as const;
 export type ClaimAction = (typeof CLAIM_ACTIONS)[number];
 
 const TOKEN_VERSION = "v1";
@@ -53,6 +61,12 @@ type Db = ReturnType<typeof getDb>;
 /** CLAIM_ACTION_LINKS_ENABLED — off unless exactly "true". */
 export function isClaimActionLinksEnabled(): boolean {
   return process.env[CLAIM_ACTION_FLAG_ENV] === "true";
+}
+
+/** Eierkrav B3a: CLAIM_REQUEST_MORE_ENABLED — off unless exactly "true". */
+export const CLAIM_REQUEST_MORE_FLAG_ENV = "CLAIM_REQUEST_MORE_ENABLED";
+export function isClaimRequestMoreEnabled(): boolean {
+  return process.env[CLAIM_REQUEST_MORE_FLAG_ENV] === "true";
 }
 
 /** The signing secret, or null when unset/too short (callers fail closed). */
@@ -71,11 +85,20 @@ const REQUIRED_STATUS: Record<ClaimAction, string> = {
   approve: "pending_review",
   reject: "pending_review",
   revoke: "verified",
+  request_more: "pending_review",
 };
 
-/** The actions that fit a claim's current status (the mint default). */
+/** Whether an action may be minted / executed at all right now (B3a: only
+ *  request_more depends on a flag). */
+function isActionEnabled(a: ClaimAction): boolean {
+  return a !== "request_more" || isClaimRequestMoreEnabled();
+}
+
+/** The actions that fit a claim's current status (the mint default).
+ *  request_more only with CLAIM_REQUEST_MORE_ENABLED, so with the flag off
+ *  the default is exactly what it was before B3a. */
 export function actionsForStatus(status: string): ClaimAction[] {
-  return CLAIM_ACTIONS.filter((a) => REQUIRED_STATUS[a] === status);
+  return CLAIM_ACTIONS.filter((a) => REQUIRED_STATUS[a] === status && isActionEnabled(a));
 }
 
 function b64url(buf: Buffer): string {
@@ -127,7 +150,7 @@ export interface MintedClaimActionLink { action: ClaimAction; url: string; expir
 
 export type CreateClaimActionLinksResult =
   | { ok: true; claim_id: string; agent_id: string; name: string; status: string; links: MintedClaimActionLink[] }
-  | { ok: false; reason: "secret_missing" | "claim_not_found" | "action_not_valid_for_status" | "no_actions_for_status"; status?: string };
+  | { ok: false; reason: "secret_missing" | "action_disabled" | "claim_not_found" | "action_not_valid_for_status" | "no_actions_for_status"; status?: string };
 
 export function createClaimActionLinks(
   claimId: string,
@@ -136,6 +159,7 @@ export function createClaimActionLinks(
 ): CreateClaimActionLinksResult {
   const secret = claimActionSecret();
   if (!secret) return { ok: false, reason: "secret_missing" };
+  if (actions && actions.some((a) => !isActionEnabled(a))) return { ok: false, reason: "action_disabled" };
   const db = opts.db ?? getDb();
   const claim = db.prepare(
     `SELECT c.id, c.agent_id, c.status, a.name FROM agent_claims c JOIN agents a ON a.id = c.agent_id WHERE c.id = ?`
@@ -250,6 +274,9 @@ export function redeemClaimActionLink(token: unknown, opts: { now?: Date; db?: D
     const check = inspectClaimActionToken(token, { now, db });
     if (check.state !== "valid") return check;
     const { ctx } = check;
+    // B3a: request_more sends a mail and is redeemed by
+    // services/claim-request-more.ts; never here, and the link is not used up.
+    if (ctx.action === "request_more") return { state: "wrong_state", ctx };
 
     // Single-use guard: only the first conditional UPDATE wins.
     const claimed = db.prepare(

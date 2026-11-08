@@ -592,7 +592,10 @@ function initSchema(db: Database.Database): void {
       claim_assessment_at TEXT,                   -- When claim_assessment was written (ISO-8601)
       pre_grant_state TEXT,                       -- Owner-claim revoke (2026-10-30, slice C1): JSON snapshot of agents.is_verified/claimed_at/claimed_via + agent_knowledge.data_source taken just before grantClaimOwnership; NULL = granted before C1
       revoked_at TEXT,                            -- When an admin revoked this verified claim (POST /admin/agents/claim-revoke), ISO-8601
-      revoke_note TEXT                            -- The admin's note on the revoke
+      revoke_note TEXT,                           -- The admin's note on the revoke
+      request_more_at TEXT,                       -- Eierkrav B3a: when «Be om mer bekreftelse» was last sent to the claimant (ISO-8601; at most once per 24 h)
+      request_more_via TEXT,                      -- Eierkrav B3a: 'action_link' | 'admin'
+      request_more_note TEXT                      -- Eierkrav B3a: the admin's optional note (never mailed)
     );
 
     -- ════════════════════════════════════════════════════════════
@@ -1637,6 +1640,17 @@ function initSchema(db: Database.Database): void {
   // existing rows keep NULL (a revoke of such a claim restores only partly,
   // knowledge-service.ts revokeClaimOwnership). A rollback leaves them in place.
   for (const col of ["pre_grant_state TEXT", "revoked_at TEXT", "revoke_note TEXT"]) {
+    try {
+      db.exec(`ALTER TABLE agent_claims ADD COLUMN ${col}`);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
+  // Eierkrav B3a («Be om mer bekreftelse», services/claim-request-more.ts):
+  // when the request was last sent, by which path, and the admin's note.
+  // Additive and idempotent; existing rows keep NULL. A rollback leaves them
+  // in place.
+  for (const col of ["request_more_at TEXT", "request_more_via TEXT", "request_more_note TEXT"]) {
     try {
       db.exec(`ALTER TABLE agent_claims ADD COLUMN ${col}`);
     } catch {
