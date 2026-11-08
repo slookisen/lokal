@@ -36,7 +36,7 @@ import { countOrderableProducts } from "../services/cart-service";
 import { hasProducerPage, isProfileOwnerHidden } from "../services/agent-visibility";
 import { resolveOwnerFeatures, type ResolvedOwnerFeatures } from "../owner-features/resolve";
 import { readOwnerLevelChoiceFor, readOwnerNewsState } from "../owner-features/changes";
-import type { OwnerActionCounts } from "./shell";
+import { ownerDashboardActiveFor, type OwnerActionCounts } from "./shell";
 import type {
   OwnerOverviewModel, OwnerOverviewNewsResult, OwnerOverviewOrders, OwnerOverviewVisibility,
 } from "./overview";
@@ -67,6 +67,19 @@ export function countItemsToConfirm(db: any, agentId: string, now: Date = new Da
   } catch (e) {
     console.error("[owner-overview] items-to-confirm count failed:", e instanceof Error ? e.message : "error");
     return 0;
+  }
+}
+
+/**
+ * T15c: the «Varer» page /eier/:id/varer exists — the dashboard is active
+ * (OWNER_DASHBOARD_ENABLED + allowlist + verified owner) AND the T13 «Varer»
+ * card is shown (OWNER_ORDERABILITY_PORTAL_ENABLED + allowlist). Never throws.
+ */
+export function ownerItemsPageActiveFor(agentId: string, verifiedOwner: boolean, env: NodeJS.ProcessEnv = process.env): boolean {
+  try {
+    return ownerDashboardActiveFor(VERTICAL, agentId, verifiedOwner, env) && ownerOrderabilityPortalEnabledFor(agentId, env);
+  } catch {
+    return false;
   }
 }
 
@@ -106,6 +119,8 @@ export interface OwnerOverviewInput {
     labels: { nb: Record<string, string> };
   } | null;
   newsResult: OwnerOverviewNewsResult | null;
+  /** T15c: the Varer page exists (ownerItemsPageActiveFor). */
+  itemsPage?: boolean;
   db?: any;
 }
 
@@ -149,5 +164,6 @@ export function buildOwnerOverviewModel(input: OwnerOverviewInput): OwnerOvervie
       : null,
     showNewsQuestion,
     newsResult: input.newsResult,
+    ...(input.itemsPage ? { itemsPage: true } : {}),
   };
 }

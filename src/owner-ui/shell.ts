@@ -34,6 +34,12 @@
 // from ownerActionCounts() (owner-ui/overview-data.ts), the same read as the
 // «Dette bør du gjøre nå» block on Oversikt. The number is aria-hidden; a
 // visually hidden text says it in words («, 2 venter på svar»).
+//
+// T15c: «Varer» has its own page, /eier/:id/varer (the T13 card in the
+// shell), when the dashboard is active AND the «Varer» card is shown
+// (ownerItemsPageActiveFor, owner-ui/overview-data.ts). The caller passes
+// `itemsPage: true` then: the Varer link goes to /varer, and on that page
+// Varer carries aria-current="page". Without it the link is as in T15a.
 
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
 
@@ -80,6 +86,10 @@ export const OWNER_SHELL_TEXTS = {
   ordersBadge: ", {n} venter på svar",
   /** T15b: screen-reader text after the Varer badge ({n} ≥ 1). */
   itemsBadge: ", {n} bør bekreftes",
+  /** T15c: the line left on Oversikt where the «Varer» card was. */
+  itemsMoved: "Varene dine har nå en egen side.",
+  /** T15c: its link to the Varer page. */
+  itemsMovedLink: "Gå til Varer",
 } as const;
 
 /** The id of the page's <main>, the skip link's target. */
@@ -89,7 +99,7 @@ export const OWNER_SHELL_PROFILE_ANCHOR = "profil";
 /** The portal's orderable-items card (owner-portal ORDERABILITY_ANCHOR). */
 export const OWNER_SHELL_ITEMS_ANCHOR = "bestillbare-varer";
 
-export type OwnerShellSection = "oversikt" | "ordrer" | "valg";
+export type OwnerShellSection = "oversikt" | "ordrer" | "varer" | "valg";
 
 /**
  * T15b: what waits for the owner — read once per page by ownerActionCounts()
@@ -111,6 +121,8 @@ export interface OwnerShellOptions {
   profileSlug?: string;
   /** T15b: the badge numbers (absent or 0 = no badge). */
   counts?: OwnerActionCounts;
+  /** T15c: the Varer page exists (ownerItemsPageActiveFor) — the Varer link goes to /varer. */
+  itemsPage?: boolean;
 }
 
 /** «Statistikk»: the Statistikk tab in /selger (selger.html opens it on #statistikk). */
@@ -129,12 +141,17 @@ export interface OwnerShellLinks {
   logout: string;
 }
 
-export function ownerShellLinks(agentId: string, profileSlug = ""): OwnerShellLinks {
+/** T15c: the Varer page (only linked when ownerItemsPageActiveFor). */
+export function ownerItemsPagePath(agentId: string): string {
+  return `/eier/${encodeURIComponent(agentId)}/varer`;
+}
+
+export function ownerShellLinks(agentId: string, profileSlug = "", itemsPage = false): OwnerShellLinks {
   const base = `/eier/${encodeURIComponent(agentId)}`;
   return {
     oversikt: `${base}/portal`,
     ordrer: `${base}/ordrer`,
-    varer: `${base}/portal#${OWNER_SHELL_ITEMS_ANCHOR}`,
+    varer: itemsPage ? ownerItemsPagePath(agentId) : `${base}/portal#${OWNER_SHELL_ITEMS_ANCHOR}`,
     valg: `${base}/valg`,
     profil: `${base}/portal#${OWNER_SHELL_PROFILE_ANCHOR}`,
     statistikk: ownerShellStatsHref(agentId),
@@ -200,7 +217,7 @@ export const OWNER_SHELL_CSS = `
  */
 export function renderOwnerShellStart(opts: OwnerShellOptions): string {
   const T = OWNER_SHELL_TEXTS;
-  const L = ownerShellLinks(opts.agentId, opts.profileSlug ?? "");
+  const L = ownerShellLinks(opts.agentId, opts.profileSlug ?? "", opts.itemsPage === true);
   const cur = (s: OwnerShellSection) => (opts.current === s ? ` aria-current="page"` : "");
   const badge = (n: number | undefined, sr: string) => {
     const k = Number.isFinite(n) ? Math.floor(n as number) : 0;
@@ -223,7 +240,7 @@ export function renderOwnerShellStart(opts: OwnerShellOptions): string {
     <ul class="ow-nav-list">
       ${item(L.oversikt, esc(T.overview), "oversikt")}
       ${item(L.ordrer, `<span class="ow-nav-short">${esc(T.ordersShort)}</span><span class="ow-nav-long">${esc(T.orders)}</span>${badge(opts.counts?.pendingOrders, T.ordersBadge)}`, "ordrer")}
-      ${item(L.varer, `${esc(T.items)}${badge(opts.counts?.itemsToConfirm, T.itemsBadge)}`, null)}
+      ${item(L.varer, `${esc(T.items)}${badge(opts.counts?.itemsToConfirm, T.itemsBadge)}`, opts.itemsPage === true ? "varer" : null)}
       ${item(L.valg, esc(T.features), "valg")}
       <li><details class="ow-more"><summary>${esc(T.more)}</summary><ul class="ow-more-list">${more}</ul></details></li>
     </ul>

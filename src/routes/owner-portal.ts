@@ -1,4 +1,4 @@
-import express, { Router, Request, Response } from "express";
+import express, { Router, Request, Response, NextFunction } from "express";
 import { getDb } from "../database/init";
 import { emailService } from "../services/email-service";
 import { slugify } from "../utils/slug";
@@ -31,9 +31,11 @@ import {
 } from "../owner-features/registry";
 import { resolveOwnerFeature, setOwnerFeatureValue } from "../owner-features/resolve";
 import { OWNER_PORTAL_THEME_CSS, ownerThemeHtml } from "../owner-ui/tokens";
-import { OWNER_SHELL_MAIN_OPEN, OWNER_SHELL_PROFILE_ANCHOR, ownerDashboardActiveFor, renderOwnerShellStart } from "../owner-ui/shell";
+import {
+  OWNER_SHELL_MAIN_OPEN, OWNER_SHELL_PROFILE_ANCHOR, OWNER_SHELL_TEXTS, ownerDashboardActiveFor, ownerItemsPagePath, renderOwnerShellStart,
+} from "../owner-ui/shell";
 import { OWNER_OVERVIEW_NEWS_PARAM, parseOwnerOverviewNewsParam, renderOwnerOverview } from "../owner-ui/overview";
-import { buildOwnerOverviewModel, countPendingOrders, ownerActionCounts } from "../owner-ui/overview-data";
+import { buildOwnerOverviewModel, countPendingOrders, ownerActionCounts, ownerItemsPageActiveFor } from "../owner-ui/overview-data";
 import { ownerPauseEnabled, isOwnerPaused, readOwnerPauseRow } from "../services/agent-visibility";
 import { isBlocked, normalizeEmail } from "../services/blocklist-service";
 import { rateLimit } from "express-rate-limit";
@@ -59,8 +61,8 @@ import { autoSyncStatusView, importPageAutoSyncChoice, type AutoSyncStatusView }
 import { ownerRowAnchor } from "../owner-features/anchors";
 import { OWNER_ITEMS_INVENTED_TEXT_NB, OWNER_ITEMS_TEXT_NB, readOwnerItems } from "../services/owner-items-view";
 import {
-  ownerItemAnchor, ownerItemsAddErrorText, ownerItemsAddFormValues, ownerItemsMissingPriceText, renderOwnerItemsSection,
-  type OwnerItemsAddFormState, type OwnerItemsMessage,
+  OWNER_ITEMS_RETURN_FIELD, OWNER_ITEMS_RETURN_VARER, ownerItemAnchor, ownerItemsAddErrorText, ownerItemsAddFormValues,
+  ownerItemsMissingPriceText, ownerItemsReturnInput, renderOwnerItemsSection, type OwnerItemsAddFormState, type OwnerItemsMessage,
 } from "./owner-items-card";
 import { PRODUCT_WEEKLY_SYNC_KEY } from "../owner-features/product-weekly-sync";
 
@@ -2150,8 +2152,14 @@ function renderOwnerPortalPage(req: Request, res: Response, addForm: OwnerItemsA
     // card (routes/owner-items-card.ts); its POST messages stand in the card
     // or in the row (T5 anchor contract), not in the top alert. A verified
     // owner on another address than the claimant's sees the list without buttons.
+    // T15c: with the Varer page (dashboard active + the card shown), the
+    // portal keeps only the #bestillbare-varer anchor with one line and a
+    // link to /eier/:id/varer; off = unchanged.
+    const itemsPage = hasOwnerFeatures && ownerItemsPageActiveFor(agentId, true);
     let orderabilityCardHtml = "";
-    if (ownerOrderabilityPortalEnabledFor(agentId)) {
+    if (itemsPage) {
+      orderabilityCardHtml = ownerItemsMovedCardHtml(agentId);
+    } else if (ownerOrderabilityPortalEnabledFor(agentId)) {
       try {
         if (isVerifiedOwner(agentId, session)) {
           // B2: the stock-check banner (products.stock_check on, an orderable
@@ -2311,6 +2319,7 @@ function renderOwnerPortalPage(req: Request, res: Response, addForm: OwnerItemsA
         overviewHtml = renderOwnerOverview(buildOwnerOverviewModel({
           agentId, profileSlug: slug, counts: actionCounts, year: ownerYear, db,
           newsResult: parseOwnerOverviewNewsParam(req.query[OWNER_OVERVIEW_NEWS_PARAM]),
+          itemsPage,
         }));
       } catch (e) {
         console.error("[owner-portal] overview block failed:", e instanceof Error ? e.message : "error");
@@ -2434,9 +2443,95 @@ function renderOwnerPortalPage(req: Request, res: Response, addForm: OwnerItemsA
     const pageBody = ownerTheme ? `<style>${OWNER_PORTAL_THEME_CSS}</style>${ownerThemeHtml(body)}` : body;
 
     return res.send(portalShell(`Eierportal · ${agent.name}`, pageBody,
-      dashboard ? { ownerShellHtml: renderOwnerShellStart({ agentId, current: "oversikt", profileSlug: slug, counts: actionCounts ?? undefined }) } : {}));
+      dashboard ? { ownerShellHtml: renderOwnerShellStart({ agentId, current: "oversikt", profileSlug: slug, counts: actionCounts ?? undefined, ...(itemsPage ? { itemsPage } : {}) }) } : {}));
   } catch (err) {
     console.error("[owner-portal] GET /eier/:agentId/portal error:", err);
+    return res.status(500).send(portalShell(
+      "Feil",
+      `<div class="ep-card"><h1>Noe gikk galt</h1><p>Prøv igjen senere.</p></div>`
+    ));
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// T15c: GET /eier/:agentId/varer — the «Varer» page in the owner shell
+// ─────────────────────────────────────────────────────────────────
+// dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 9, slice T15c.
+// Only while ownerItemsPageActiveFor (OWNER_DASHBOARD_ENABLED + allowlist +
+// verified owner + the T13 card's own gate). Otherwise the request goes on
+// (next()) exactly as before this route existed. With the gate's env part on:
+// no session → 302 to the login page, another producer's session → 403, as
+// on /portal. The content is the T13 card (renderOwnerItemsSection) with the
+// same data and the same POST routes; its forms carry tilbake=varer, so the
+// answer lands back here.
+
+/** T15c: what is left on /portal where the «Varer» card was (the anchor, one line, the link). */
+export function ownerItemsMovedCardHtml(agentId: string): string {
+  const T = OWNER_SHELL_TEXTS;
+  return `<div class="ep-card" id="${ORDERABILITY_ANCHOR}" data-items-moved="t15c">
+        <h2>${escapeHtml(T.items)}</h2>
+        <p>${escapeHtml(T.itemsMoved)} <a href="${escapeHtml(ownerItemsPagePath(agentId))}">${escapeHtml(T.itemsMovedLink)}</a></p>
+      </div>`;
+}
+
+router.get("/eier/:agentId/varer", (req: Request, res: Response, next: NextFunction) => renderOwnerItemsPage(req, res, null, next));
+
+function renderOwnerItemsPage(req: Request, res: Response, addForm: OwnerItemsAddFormState | null, next?: NextFunction) {
+  const pass = () => (next ? next() : res.status(404).send(portalShell("Fant ikke siden", `<div class="ep-card"><h1>Fant ikke siden</h1></div>`)));
+  try {
+    const agentId = String((req.params as any).agentId || "");
+    // The env part of the gate first: off → exactly as before (no route).
+    if (!ownerItemsPageActiveFor(agentId, true)) return pass();
+    const session = verifyOwnerSession(req);
+    if (!session.valid) return res.redirect(302, `/eier/${encodeURIComponent(agentId)}`);
+    if (session.agentId !== agentId) {
+      return res.status(403).send(portalShell(
+        "Ingen tilgang",
+        `<div class="ep-card">
+          <h1>Ingen tilgang</h1>
+          <p>Sesjonen din er knyttet til en annen produsent. <a href="/eier/${encodeURIComponent(session.agentId || "")}/portal">Gå til din egen portal</a> eller <a href="/eier/${encodeURIComponent(agentId)}">logg inn på nytt</a>.</p>
+        </div>`
+      ));
+    }
+    if (!ownerItemsPageActiveFor(agentId, isVerifiedOwner(agentId, session))) return pass();
+
+    const db = getDb();
+    const agent = db.prepare("SELECT id, name FROM agents WHERE id = ?").get(agentId) as any;
+    if (!agent) return pass();
+
+    // The same card as on /portal before T15c: banner, data, message, form.
+    let banner = "";
+    try {
+      if (stockCheckOn(agentId, { db })) banner = stockCheckBannerHtml(agentId, soonExpiringItems(agentId, { db }), process.env, OWNER_ITEMS_RETURN_VARER);
+    } catch (e) {
+      console.error("[owner-portal] stock-check banner failed:", e instanceof Error ? e.message : "error");
+      banner = "";
+    }
+    const now = new Date();
+    const status = String(req.query.status || "");
+    const card = renderOwnerItemsSection({
+      agentId,
+      model: readOwnerItems(agentId, db, now),
+      now,
+      canEdit: !!sessionClaimantOwnerEmail(agentId, session),
+      bannerHtml: banner,
+      message: addForm ? null : ownerItemsMessageFromQuery(status, req.query as Record<string, unknown>),
+      addForm,
+      returnTo: OWNER_ITEMS_RETURN_VARER,
+    });
+    const body = `
+      <div class="ep-card">
+        <h1>${escapeHtml(OWNER_SHELL_TEXTS.items)}</h1>
+      </div>
+      ${card}
+    `;
+    const pageBody = `<style>${OWNER_PORTAL_THEME_CSS}</style>${ownerThemeHtml(body)}`;
+    const shell = renderOwnerShellStart({
+      agentId, current: "varer", profileSlug: slugify(String(agent.name || "")), counts: ownerActionCounts(db, agentId, now), itemsPage: true,
+    });
+    return res.send(portalShell(`${OWNER_SHELL_TEXTS.items} · ${agent.name}`, pageBody, { ownerShellHtml: shell }));
+  } catch (err) {
+    console.error("[owner-portal] GET /eier/:agentId/varer error:", err instanceof Error ? err.message : "error");
     return res.status(500).send(portalShell(
       "Feil",
       `<div class="ep-card"><h1>Noe gikk galt</h1><p>Prøv igjen senere.</p></div>`
@@ -3179,14 +3274,37 @@ function ownerOrderabilityAuth(req: Request, res: Response): OwnerOrderabilityAu
   return { ok: true, agentId, email: ownerSessionEmail(session.token) };
 }
 
-function orderabilityBack(agentId: string, status: string, extra = ""): string {
-  return `/eier/${encodeURIComponent(agentId)}/portal?status=${status}${extra}#${ORDERABILITY_ANCHOR}`;
+/** T15c: which owner page a products POST goes back to — one of two fixed paths. */
+type OwnerItemsBackPage = "portal" | "varer";
+
+/**
+ * T15c: «varer» when the form said tilbake=varer (it stood on the Varer page)
+ * and that page exists for this owner (the POST's auth already checked the
+ * session and ownership); else «portal», as before. Only picks between two
+ * fixed internal paths — nothing from the request ends up in the URL.
+ */
+function ownerItemsBackPage(req: Request, agentId: string): OwnerItemsBackPage {
+  try {
+    const raw = (req.body || {})[OWNER_ITEMS_RETURN_FIELD];
+    return raw === OWNER_ITEMS_RETURN_VARER && ownerItemsPageActiveFor(agentId, true) ? "varer" : "portal";
+  } catch {
+    return "portal";
+  }
+}
+
+function orderabilityBack(agentId: string, status: string, extra = "", page: OwnerItemsBackPage = "portal"): string {
+  return `/eier/${encodeURIComponent(agentId)}/${page === "varer" ? "varer" : "portal"}?status=${status}${extra}#${ORDERABILITY_ANCHOR}`;
 }
 
 /** T13 V1a: a row's own POST → back to that row, with the message placed there (`ved=vare-<id>#vare-<id>`). */
-function itemRowBack(agentId: string, status: string, productId: string): string {
+function itemRowBack(agentId: string, status: string, productId: string, page: OwnerItemsBackPage = "portal"): string {
   const anchor = encodeURIComponent(ownerItemAnchor(productId));
-  return `/eier/${encodeURIComponent(agentId)}/portal?status=${status}&ved=${anchor}#${anchor}`;
+  return `/eier/${encodeURIComponent(agentId)}/${page === "varer" ? "varer" : "portal"}?status=${status}&ved=${anchor}#${anchor}`;
+}
+
+/** T15c: «Fant ikke varen» — its link back to the page the form stood on. */
+function itemNotFoundPage(agentId: string, page: OwnerItemsBackPage): string {
+  return portalShell("Fant ikke varen", `<div class="ep-card"><h1>Fant ikke varen</h1><p><a href="/eier/${encodeURIComponent(agentId)}/${page === "varer" ? "varer" : "portal"}#${ORDERABILITY_ANCHOR}">Tilbake til varene</a></p></div>`);
 }
 
 /**
@@ -3215,7 +3333,7 @@ export function ownerItemsMessageFromQuery(status: string, query: Record<string,
 //   confirmable under the B1 rule. Same owner checks as the B1 POSTs.
 
 /** The B2 banner: the orderable items whose stock status expires within 3 days. "" when none. */
-export function stockCheckBannerHtml(agentId: string, items: StockCheckItem[], env: NodeJS.ProcessEnv = process.env): string {
+export function stockCheckBannerHtml(agentId: string, items: StockCheckItem[], env: NodeJS.ProcessEnv = process.env, returnTo: "varer" | null = null): string {
   if (items.length === 0) return "";
   const id = encodeURIComponent(agentId);
   // B2b-3: soft-expiry texts when the rule is active for the producer; off → unchanged.
@@ -3231,7 +3349,7 @@ export function stockCheckBannerHtml(agentId: string, items: StockCheckItem[], e
           <strong>${heading}</strong>
           <p style="margin:6px 0;">${para}</p>
           <ul>${lis}</ul>
-          <form method="post" action="/eier/${id}/varer/bekreft-lagerpaminnelse" style="margin:8px 0 0;">
+          <form method="post" action="/eier/${id}/varer/bekreft-lagerpaminnelse" style="margin:8px 0 0;">${ownerItemsReturnInput(returnTo)}
             ${hidden}
             <button type="submit" class="ep-btn ep-btn-primary">Bekreft at varene fortsatt er på lager</button>
           </form>
@@ -3241,20 +3359,22 @@ export function stockCheckBannerHtml(agentId: string, items: StockCheckItem[], e
 router.post("/eier/:agentId/varer/bekreft-lagerpaminnelse", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
   const auth = ownerOrderabilityAuth(req, res);
   if (!auth.ok) return;
+  const page = ownerItemsBackPage(req, auth.agentId);
   try {
     const raw = (req.body || {}).id;
     const ids = (Array.isArray(raw) ? raw : [raw]).filter((x): x is string => typeof x === "string" && x.length > 0 && x.length <= 200).slice(0, 200);
     const r = confirmStockCheckItems(auth.agentId, ids, { actorEmail: auth.email, via: "portal" });
-    return res.redirect(303, orderabilityBack(auth.agentId, r.confirmed.length > 0 ? "lager_bekreftet" : "ingen_varer_bekreftet"));
+    return res.redirect(303, orderabilityBack(auth.agentId, r.confirmed.length > 0 ? "lager_bekreftet" : "ingen_varer_bekreftet", "", page));
   } catch (err) {
     console.error("[owner-portal] POST varer/bekreft-lagerpaminnelse error:", err instanceof Error ? err.message : "error");
-    return res.redirect(303, orderabilityBack(auth.agentId, "vare_feil"));
+    return res.redirect(303, orderabilityBack(auth.agentId, "vare_feil", "", page));
   }
 });
 
 router.post("/eier/:agentId/varer/bekreft-alle", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
   const auth = ownerOrderabilityAuth(req, res);
   if (!auth.ok) return;
+  const page = ownerItemsBackPage(req, auth.agentId);
   try {
     // T13 V1a: «Bekreft alle ({n})» sends the ids it lists; without ids (an
     // older form) every confirmable row, as before.
@@ -3264,16 +3384,17 @@ router.post("/eier/:agentId/varer/bekreft-alle", express.urlencoded({ extended: 
       : (Array.isArray(raw) ? raw : [raw]).filter((x): x is string => typeof x === "string" && x.length > 0 && x.length <= 200).slice(0, 500);
     const r = confirmAllOwnerProductsInStock(auth.agentId, { actorEmail: auth.email, ids });
     const extra = r.skipped_missing_price > 0 ? `&uten_pris=${r.skipped_missing_price}` : "";
-    return res.redirect(303, orderabilityBack(auth.agentId, r.confirmed > 0 ? "varer_bekreftet" : "ingen_varer_bekreftet", extra));
+    return res.redirect(303, orderabilityBack(auth.agentId, r.confirmed > 0 ? "varer_bekreftet" : "ingen_varer_bekreftet", extra, page));
   } catch (err) {
     console.error("[owner-portal] POST varer/bekreft-alle error:", err instanceof Error ? err.message : "error");
-    return res.redirect(303, orderabilityBack(auth.agentId, "vare_feil"));
+    return res.redirect(303, orderabilityBack(auth.agentId, "vare_feil", "", page));
   }
 });
 
 router.post("/eier/:agentId/varer/ny", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
   const auth = ownerOrderabilityAuth(req, res);
   if (!auth.ok) return;
+  const page = ownerItemsBackPage(req, auth.agentId);
   try {
     const b = (req.body || {}) as Record<string, unknown>;
     // T13 V1b: the «Varer» card's form (skjema=v1b) adds Kategori, «Varen er
@@ -3287,17 +3408,19 @@ router.post("/eier/:agentId/varer/ny", express.urlencoded({ extended: false }), 
       ...(v1b ? { category: b.category, in_stock: b.paa_lager === "1", packaged: b.ferdigpakket === "ja" } : {}),
     }, { actorEmail: auth.email });
     if (v1b) {
-      if (r.ok) return res.redirect(303, itemRowBack(auth.agentId, r.in_stock ? "vare_lagt_til" : "vare_lagt_til_ikke_lager", r.product_id));
+      if (r.ok) return res.redirect(303, itemRowBack(auth.agentId, r.in_stock ? "vare_lagt_til" : "vare_lagt_til_ikke_lager", r.product_id, page));
       const message = r.error === "exists" ? ownerOrderabilityAlert("vare_finnes", undefined)!.text : ownerItemsAddErrorText(r.fields);
       res.status(422);
-      return renderOwnerPortalPage(req, res, { values: ownerItemsAddFormValues(b), message, fields: r.error === "exists" ? ["name"] : r.fields });
+      const state = { values: ownerItemsAddFormValues(b), message, fields: r.error === "exists" ? ["name" as const] : r.fields };
+      // T15c: from the Varer page the refusal is shown there, with the form open.
+      return page === "varer" ? renderOwnerItemsPage(req, res, state) : renderOwnerPortalPage(req, res, state);
     }
-    if (r.ok) return res.redirect(303, orderabilityBack(auth.agentId, "vare_lagt_til"));
-    if (r.error === "exists") return res.redirect(303, orderabilityBack(auth.agentId, "vare_finnes"));
-    return res.redirect(303, orderabilityBack(auth.agentId, "vare_ugyldig", `&felt=${encodeURIComponent(r.fields.join(","))}`));
+    if (r.ok) return res.redirect(303, orderabilityBack(auth.agentId, "vare_lagt_til", "", page));
+    if (r.error === "exists") return res.redirect(303, orderabilityBack(auth.agentId, "vare_finnes", "", page));
+    return res.redirect(303, orderabilityBack(auth.agentId, "vare_ugyldig", `&felt=${encodeURIComponent(r.fields.join(","))}`, page));
   } catch (err) {
     console.error("[owner-portal] POST varer/ny error:", err instanceof Error ? err.message : "error");
-    return res.redirect(303, orderabilityBack(auth.agentId, "vare_feil"));
+    return res.redirect(303, orderabilityBack(auth.agentId, "vare_feil", "", page));
   }
 });
 
@@ -3308,35 +3431,37 @@ router.post("/eier/:agentId/varer/ny", express.urlencoded({ extended: false }), 
 router.post("/eier/:agentId/varer/:productId/utsolgt", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
   const auth = ownerOrderabilityAuth(req, res);
   if (!auth.ok) return;
+  const page = ownerItemsBackPage(req, auth.agentId);
   try {
     const productId = String((req.params as any).productId || "");
     const r = markOwnerProductSoldOut(auth.agentId, productId, { actorEmail: auth.email });
-    if (r.ok) return res.redirect(303, itemRowBack(auth.agentId, "vare_utsolgt", productId));
+    if (r.ok) return res.redirect(303, itemRowBack(auth.agentId, "vare_utsolgt", productId, page));
     if (r.error === "not_found") {
-      return res.status(404).send(portalShell("Fant ikke varen", `<div class="ep-card"><h1>Fant ikke varen</h1><p><a href="/eier/${encodeURIComponent(auth.agentId)}/portal#${ORDERABILITY_ANCHOR}">Tilbake til varene</a></p></div>`));
+      return res.status(404).send(itemNotFoundPage(auth.agentId, page));
     }
-    return res.redirect(303, itemRowBack(auth.agentId, "vare_kan_ikke_merkes", productId));
+    return res.redirect(303, itemRowBack(auth.agentId, "vare_kan_ikke_merkes", productId, page));
   } catch (err) {
     console.error("[owner-portal] POST varer/:productId/utsolgt error:", err instanceof Error ? err.message : "error");
-    return res.redirect(303, orderabilityBack(auth.agentId, "vare_feil"));
+    return res.redirect(303, orderabilityBack(auth.agentId, "vare_feil", "", page));
   }
 });
 
 router.post("/eier/:agentId/varer/:productId/bekreft", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
   const auth = ownerOrderabilityAuth(req, res);
   if (!auth.ok) return;
+  const page = ownerItemsBackPage(req, auth.agentId);
   try {
     const productId = String((req.params as any).productId || "");
     const r = confirmOwnerProductInStock(auth.agentId, productId, { actorEmail: auth.email });
-    if (r.ok) return res.redirect(303, itemRowBack(auth.agentId, "vare_bekreftet", productId));
-    if (r.error === "missing_price") return res.redirect(303, itemRowBack(auth.agentId, "vare_mangler_pris", productId));
+    if (r.ok) return res.redirect(303, itemRowBack(auth.agentId, "vare_bekreftet", productId, page));
+    if (r.error === "missing_price") return res.redirect(303, itemRowBack(auth.agentId, "vare_mangler_pris", productId, page));
     if (r.error === "not_found") {
-      return res.status(404).send(portalShell("Fant ikke varen", `<div class="ep-card"><h1>Fant ikke varen</h1><p><a href="/eier/${encodeURIComponent(auth.agentId)}/portal#${ORDERABILITY_ANCHOR}">Tilbake til varene</a></p></div>`));
+      return res.status(404).send(itemNotFoundPage(auth.agentId, page));
     }
-    return res.redirect(303, itemRowBack(auth.agentId, "vare_kan_ikke_bekreftes", productId));
+    return res.redirect(303, itemRowBack(auth.agentId, "vare_kan_ikke_bekreftes", productId, page));
   } catch (err) {
     console.error("[owner-portal] POST varer/:productId/bekreft error:", err instanceof Error ? err.message : "error");
-    return res.redirect(303, orderabilityBack(auth.agentId, "vare_feil"));
+    return res.redirect(303, orderabilityBack(auth.agentId, "vare_feil", "", page));
   }
 });
 

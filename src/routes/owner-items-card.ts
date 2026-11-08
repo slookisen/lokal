@@ -22,6 +22,12 @@
 //                           open, the values kept and the message in the form.
 // Messages stand in the card, or in the row for a row's own POST (the T5
 // anchor contract). All output is HTML-escaped.
+//
+// T15c: on the owner shell's «Varer» page (/eier/:id/varer) the card is
+// rendered with `returnTo: "varer"` — every form then carries the hidden
+// field tilbake=varer, and the POST routes send the owner back to the Varer
+// page (a fixed internal path, never a URL from the request). Without it the
+// card's markup is exactly as before.
 
 import type { OwnerItemsModel, OwnerItemView, OwnerItemAction, OwnerItemGroup } from "../services/owner-items-view";
 import {
@@ -31,6 +37,16 @@ import { OWNER_PRODUCT_FIELD_TEXT_NB, orderabilityReasonTextNb, type OwnerProduc
 
 /** The card's id (kept from B1: bulk, add and old links land here). */
 export const OWNER_ITEMS_ANCHOR = "bestillbare-varer";
+
+/** T15c: the hidden form field that says «the form was on the Varer page». */
+export const OWNER_ITEMS_RETURN_FIELD = "tilbake";
+/** T15c: its one value. */
+export const OWNER_ITEMS_RETURN_VARER = "varer";
+
+/** T15c: the hidden field for a form on the Varer page ("" elsewhere, so the card is unchanged). */
+export function ownerItemsReturnInput(returnTo: "varer" | null | undefined): string {
+  return returnTo === OWNER_ITEMS_RETURN_VARER ? `<input type="hidden" name="${OWNER_ITEMS_RETURN_FIELD}" value="${OWNER_ITEMS_RETURN_VARER}">` : "";
+}
 
 /** One row's element id: li#vare-<id>. */
 export function ownerItemAnchor(productId: string): string {
@@ -137,6 +153,8 @@ export interface OwnerItemsSectionInput {
   message?: OwnerItemsMessage | null;
   /** V1b: the posted «Legg til vare» form after a refusal (the form opens with these values). */
   addForm?: OwnerItemsAddFormState | null;
+  /** T15c: the card stands on the Varer page — its forms say so (tilbake=varer). */
+  returnTo?: "varer" | null;
 }
 
 function alertHtml(m: OwnerItemsMessage): string {
@@ -160,7 +178,7 @@ const FIELD_INPUT: Record<OwnerProductField, string> = {
  * `skjema=v1b` tells the route that an unticked «Varen er på lager nå» means
  * «not in stock» (an unticked box sends nothing).
  */
-function addProductFormHtml(id: string, model: Pick<OwnerItemsModel, "ordersOn" | "autoConfirm">, state: OwnerItemsAddFormState | null): string {
+function addProductFormHtml(id: string, model: Pick<OwnerItemsModel, "ordersOn" | "autoConfirm">, state: OwnerItemsAddFormState | null, back = ""): string {
   const T = OWNER_ITEMS_TEXT_NB;
   const X = OWNER_ITEMS_INVENTED_TEXT_NB;
   const v: OwnerItemsAddFormValues = state?.values ?? {
@@ -180,7 +198,7 @@ function addProductFormHtml(id: string, model: Pick<OwnerItemsModel, "ordersOn" 
           <summary style="${choice}font-weight:600;">${esc(T.addTitle)}</summary>
           ${errorHtml}
           <form method="post" action="/eier/${id}/varer/ny" data-items-add-form="v1b">
-            <input type="hidden" name="skjema" value="v1b">
+            <input type="hidden" name="skjema" value="v1b">${back}
             ${field("name", T.fieldName, v.name, 'required maxlength="120"')}
             ${field("price", T.fieldPrice, v.price, 'required inputmode="decimal"')}
             ${field("unit", T.fieldUnit, v.unit, 'maxlength="30"', X.unitHint)}
@@ -213,9 +231,10 @@ export function renderOwnerItemsSection(input: OwnerItemsSectionInput): string {
   const msg = input.message ?? null;
   const rowMessageId = msg && msg.productId && views.some((v) => v.row.id === msg.productId) ? msg.productId : null;
   const cardMessage = msg && !rowMessageId ? alertHtml(msg) : "";
+  const back = ownerItemsReturnInput(input.returnTo);
 
   const rowForm = (productId: string, path: "bekreft" | "utsolgt", label: string, cls: string) =>
-    `<form method="post" action="/eier/${id}/varer/${esc(encodeURIComponent(productId))}/${path}" style="margin:6px 0 0;">
+    `<form method="post" action="/eier/${id}/varer/${esc(encodeURIComponent(productId))}/${path}" style="margin:6px 0 0;">${back}
             <button type="submit" class="ep-btn ${cls}">${esc(label)}</button>
           </form>`;
   const confirmForm = (productId: string, label: string, cls: string) => rowForm(productId, "bekreft", label, cls);
@@ -265,7 +284,7 @@ export function renderOwnerItemsSection(input: OwnerItemsSectionInput): string {
   const bulkN = views.filter((v) => v.view.group === "needs_action" && v.view.bulkConfirmable).length;
   const bulkIds = views.filter((v) => v.view.group === "needs_action" && v.view.bulkCandidate).map((v) => v.row.id);
   const bulk = canEdit && bulkN >= 2
-    ? `<form method="post" action="/eier/${id}/varer/bekreft-alle" style="margin:12px 0 0;" data-confirm-all="${bulkN}">
+    ? `<form method="post" action="/eier/${id}/varer/bekreft-alle" style="margin:12px 0 0;" data-confirm-all="${bulkN}">${back}
           ${bulkIds.map((pid) => `<input type="hidden" name="id" value="${esc(pid)}">`).join("")}
           <button type="submit" class="ep-btn ep-btn-primary">${esc(T.confirmAll.replace("{n}", String(bulkN)))}</button>
         </form>`
@@ -288,6 +307,6 @@ export function renderOwnerItemsSection(input: OwnerItemsSectionInput): string {
         ${profileHtml}${readOnly}
         ${bulk}
         ${groupsHtml}
-        ${canEdit ? addProductFormHtml(id, model, input.addForm ?? null) : ""}
+        ${canEdit ? addProductFormHtml(id, model, input.addForm ?? null, back) : ""}
       </div>`;
 }

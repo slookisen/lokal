@@ -382,7 +382,7 @@ export async function runOwnerOverviewT15bTests(opts: { log?: boolean } = {}): P
     const valgOn = on[`valg:${BUSY}`].html;
     assertTrue(!!st && valgOn.includes(`data-level-status="${st.kind}">${levelText}`), "on: Mine valg shows the same level line");
     assertTrue(valgOn.includes(`id="niva"`), "on: «Endre» lands on Mine valg's level card");
-    for (const [key, href] of [["ordrer", `/eier/${BUSY}/ordrer`], ["varer", "#bestillbare-varer"], ["valg", `/eier/${BUSY}/valg`], ["profil", "#profil"], ["statistikk", `/selger?agent=${BUSY}#statistikk`]]) {
+    for (const [key, href] of [["ordrer", `/eier/${BUSY}/ordrer`], ["varer", `/eier/${BUSY}/varer`], ["valg", `/eier/${BUSY}/valg`], ["profil", "#profil"], ["statistikk", `/selger?agent=${BUSY}#statistikk`]]) {
       assertTrue(new RegExp(`<li data-part="${key}"><a class="ow-ov-row" href="${href.replace(/[?#.]/g, "\\$&")}">`).test(block), `on: «Alt i eierportalen» links ${key} → ${href}`);
     }
     assertTrue(portal.includes(`id="bestillbare-varer"`) && portal.includes(`id="profil"`), "on: the in-page targets exist");
@@ -396,7 +396,9 @@ export async function runOwnerOverviewT15bTests(opts: { log?: boolean } = {}): P
     }).group === "needs_action").length;
     assertEq([pendingSql(BUSY), itemsNeeding], [2, 2], "counts: fixture — 2 pending orders, 2 items in «Trenger handling»");
     assertEq(ovd.ownerActionCounts(db, BUSY), { pendingOrders: 2, itemsToConfirm: 2 }, "counts: ownerActionCounts = the underlying counts");
-    const itemsCard = portal.slice(portal.indexOf(`id="bestillbare-varer"`));
+    // T15c: the «Varer» card is on /eier/:id/varer now.
+    const varerPage = await invoke(findRouteHandler(portalMod.default, "/eier/:agentId/varer", "get"), makeReq(BUSY, BUSY));
+    const itemsCard = String(varerPage.body).slice(String(varerPage.body).indexOf(`id="bestillbare-varer"`));
     assertEq(count(itemsCard.slice(0, itemsCard.indexOf(`data-items-group="orderable"`) > 0 ? itemsCard.indexOf(`data-items-group="orderable"`) : itemsCard.length), `data-group="needs_action"`), 2,
       "counts: the «Varer» card shows the same 2 rows under «Trenger handling»");
     const todo = (h: string, key: string) => {
@@ -404,11 +406,11 @@ export async function runOwnerOverviewT15bTests(opts: { log?: boolean } = {}): P
       return m ? { n: Number(m[1]), href: m[2], line: m[3], hint: m[4] } : null;
     };
     assertEq(todo(block, "orders"), { n: 2, href: `/eier/${BUSY}/ordrer`, line: "2 bestillinger venter på svar", hint: "Bekreft eller avslå i Mine ordrer." }, "counts: section 4 orders row");
-    assertEq(todo(block, "items"), { n: 2, href: "#bestillbare-varer", line: "2 varer bør bekreftes", hint: "Bekreft at de fortsatt er på lager." }, "counts: section 4 items row");
+    assertEq(todo(block, "items"), { n: 2, href: `/eier/${BUSY}/varer`, line: "2 varer bør bekreftes", hint: "Bekreft at de fortsatt er på lager." }, "counts: section 4 items row");
     assertTrue(!block.includes(T.todoNone), "counts: no «Alt er i orden» when something waits");
     for (const p of PAGES) {
       const n = shellNav(on[`${p}:${BUSY}`].html);
-      assertEq([navBadge(n, `/eier/${BUSY}/ordrer`), navBadge(n, `/eier/${BUSY}/portal#bestillbare-varer`)],
+      assertEq([navBadge(n, `/eier/${BUSY}/ordrer`), navBadge(n, `/eier/${BUSY}/varer`)],
         [{ n: 2, sr: ", 2 venter på svar" }, { n: 2, sr: ", 2 bør bekreftes" }], `counts: ${p} menu badges = section 4 = the counts`);
       assertEq(count(n, `aria-current="page"`), 1, `counts: ${p} still has exactly one aria-current`);
     }
