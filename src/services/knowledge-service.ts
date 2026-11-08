@@ -844,6 +844,64 @@ function claimCodeMatches(stored: unknown, entered: unknown): boolean {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+/** The profile facts the owner-claim sibling rule reads (agents + agent_knowledge). */
+export interface ClaimSiblingSourceRow {
+  org_nr: string | null;
+  tags: string | null;
+  phone: string | null;
+  address: string | null;
+  postal_code: string | null;
+}
+
+/**
+ * Owner-claim sibling rule (eierkrav; dev-request 2026-10-30-rfb-eierkrav-
+ * automatisk-vurdering-og-ettklikk): other RFB profiles with the same org.nr
+ * (column or `org_nr:` tag), the same normalized phone, or the same lowercased
+ * street address + postal code. ONE definition, shared by the claim
+ * assessment (gatherClaimAssessmentInput) and POST /admin/agents/claim-merge-
+ * approve (knowledgeService.findClaimSiblingIds), so the two cannot drift.
+ * Returns the profile's normalized org.nr (the assessment reports it) and the
+ * sibling ids in discovery order (org.nr, phone, address).
+ */
+export function claimSiblingsForRow(
+  db: ReturnType<typeof getDb>,
+  agentId: string,
+  row: ClaimSiblingSourceRow,
+): { orgNr: string | null; siblingIds: Set<string> } {
+  let orgNr = normalizeOrgNr(row.org_nr);
+  if (!orgNr && row.tags) {
+    const m = String(row.tags).match(/org_nr:(\d{9})(?!\d)/);
+    if (m) orgNr = m[1]!;
+  }
+  const phoneDigits = normalizePhoneDigits(row.phone);
+  const addr = typeof row.address === "string" && /\d/.test(row.address) && row.address.trim().length >= 6
+    ? row.address.trim().toLowerCase().replace(/\s+/g, " ") : null;
+
+  // Siblings: other RFB profiles with the same org.nr, phone or street address + postal code.
+  const siblingIds = new Set<string>();
+  const rfb = "COALESCE(a.vertical_id, 'rfb') = 'rfb'";
+  if (orgNr) {
+    for (const r of db.prepare(`SELECT a.id FROM agents a WHERE a.id <> ? AND ${rfb} AND (a.org_nr = ? OR a.tags LIKE ?) LIMIT 20`)
+      .all(agentId, orgNr, `%org_nr:${orgNr}%`) as Array<{ id: string }>) siblingIds.add(r.id);
+  }
+  if (phoneDigits) {
+    for (const r of db.prepare(
+      `SELECT k.agent_id AS id, k.phone FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
+        WHERE k.agent_id <> ? AND ${rfb}
+          AND REPLACE(REPLACE(REPLACE(REPLACE(k.phone, ' ', ''), '-', ''), '.', ''), char(160), '') LIKE ? LIMIT 50`
+    ).all(agentId, `%${phoneDigits}`) as Array<{ id: string; phone: string }>) {
+      if (normalizePhoneDigits(r.phone) === phoneDigits) siblingIds.add(r.id);
+    }
+  }
+  if (addr) {
+    for (const r of db.prepare(
+      `SELECT k.agent_id AS id FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
+        WHERE k.agent_id <> ? AND ${rfb} AND LOWER(TRIM(k.address)) = ? AND COALESCE(k.postal_code, '') = ? LIMIT 20`
+    ).all(agentId, addr, String(row.postal_code ?? "")) as Array<{ id: string }>) siblingIds.add(r.id);
+  }
+  return { orgNr, siblingIds };
+}
+
 class KnowledgeService {
 
   // ─── Get knowledge for an agent ──────────────────────────
@@ -1509,6 +1567,19 @@ class KnowledgeService {
     }
   }
 
+  /** The owner-claim sibling rule (claimSiblingsForRow) for one profile, read
+   *  fresh: the ids of the other RFB profiles it would report as siblings in
+   *  the claim assessment. Empty when the profile does not exist. */
+  findClaimSiblingIds(agentId: string): string[] {
+    const db = getDb();
+    const row = db.prepare(
+      `SELECT a.org_nr, a.tags, k.phone, k.address, k.postal_code
+         FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id WHERE a.id = ?`
+    ).get(agentId) as ClaimSiblingSourceRow | undefined;
+    if (!row) return [];
+    return [...claimSiblingsForRow(db, agentId, row).siblingIds];
+  }
+
   /** The DB facts assessClaim needs for a claim row, or null when the row is gone. */
   gatherClaimAssessmentInput(
     claimId: string,
@@ -1532,38 +1603,9 @@ class KnowledgeService {
     const domain = emailDomain(email);
     const reg = domain ? registrableDomain(domain.replace(/^www\./, "")) : null;
 
-    let orgNr = normalizeOrgNr(row.org_nr);
-    if (!orgNr && row.tags) {
-      const m = String(row.tags).match(/org_nr:(\d{9})(?!\d)/);
-      if (m) orgNr = m[1]!;
-    }
-    const phoneDigits = normalizePhoneDigits(row.phone);
-    const addr = typeof row.address === "string" && /\d/.test(row.address) && row.address.trim().length >= 6
-      ? row.address.trim().toLowerCase().replace(/\s+/g, " ") : null;
+    const { orgNr, siblingIds } = claimSiblingsForRow(db, agentId, row);
     const host = websiteHost(row.website);
-
-    // Siblings: other RFB profiles with the same org.nr, phone or street address + postal code.
-    const siblingIds = new Set<string>();
     const rfb = "COALESCE(a.vertical_id, 'rfb') = 'rfb'";
-    if (orgNr) {
-      for (const r of db.prepare(`SELECT a.id FROM agents a WHERE a.id <> ? AND ${rfb} AND (a.org_nr = ? OR a.tags LIKE ?) LIMIT 20`)
-        .all(agentId, orgNr, `%org_nr:${orgNr}%`) as Array<{ id: string }>) siblingIds.add(r.id);
-    }
-    if (phoneDigits) {
-      for (const r of db.prepare(
-        `SELECT k.agent_id AS id, k.phone FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
-          WHERE k.agent_id <> ? AND ${rfb}
-            AND REPLACE(REPLACE(REPLACE(REPLACE(k.phone, ' ', ''), '-', ''), '.', ''), char(160), '') LIKE ? LIMIT 50`
-      ).all(agentId, `%${phoneDigits}`) as Array<{ id: string; phone: string }>) {
-        if (normalizePhoneDigits(r.phone) === phoneDigits) siblingIds.add(r.id);
-      }
-    }
-    if (addr) {
-      for (const r of db.prepare(
-        `SELECT k.agent_id AS id FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
-          WHERE k.agent_id <> ? AND ${rfb} AND LOWER(TRIM(k.address)) = ? AND COALESCE(k.postal_code, '') = ? LIMIT 20`
-      ).all(agentId, addr, String(row.postal_code ?? "")) as Array<{ id: string }>) siblingIds.add(r.id);
-    }
     const siblings = [...siblingIds].map((id) => ({ independentWebsiteHost: this.independentWebsiteHost(id) }));
 
     // Another farm (not this one, not a sibling) with a website or e-mail on the claimant's domain.

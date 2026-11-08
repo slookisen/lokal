@@ -41,6 +41,17 @@
 // numeric/rating columns, and data_source/auto_sources/timestamps are
 // explicitly OUT OF SCOPE for this fill-only pass — see the dev-request.
 //
+// ── Shared core (claim-merge-approve) ────────────────────────────────────
+// The per-pair core (readAgentSnapshot → computeFillPlan → applyMergeWrites)
+// is exported so POST /admin/agents/claim-merge-approve (eierkrav D1,
+// services/claim-merge-approve.ts) runs the SAME fill-only / curated-lock /
+// append-only-provenance / audit / deactivation discipline instead of a copy.
+// That caller opts in to `{ g8: true }`, which ALSO fill-only moves opening
+// hours, the delivery fields the profile page shows (delivery_options,
+// delivery_radius, min_order_value) and the map point (agents.lat/lng with
+// its geo_precision/geocode_source/geocode_outcome). Without the option —
+// this route — the plan, the writes and the outcome are exactly as above.
+//
 // ── The trap this route avoids ───────────────────────────────────────────
 // A naive "just UPDATE the survivor with the duplicate's values" would
 // silently clobber curated/owner-set data and would leave the duplicate
@@ -53,6 +64,7 @@ import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
 import { coerceProvenanceToArrayShape } from "../services/cross-source-validator";
+import { invalidateAgentGeocode } from "../services/agent-geocode-reset";
 
 const router = Router();
 
@@ -100,6 +112,31 @@ export type KnowledgeMergeField = (typeof KNOWLEDGE_MERGE_FIELDS)[number];
 /** '' and NULL both count as "blank" for every field this route touches. */
 export function isBlank(v: string | null | undefined): boolean {
   return v === null || v === undefined || v === "";
+}
+
+/** G8 (claim-merge-approve only): agent_knowledge columns the profile page
+ *  shows for opening hours and delivery (routes/seo.ts producer page). */
+export const G8_KNOWLEDGE_FIELDS = ["opening_hours", "delivery_options", "delivery_radius", "min_order_value"] as const;
+export type G8KnowledgeField = (typeof G8_KNOWLEDGE_FIELDS)[number];
+
+/** G8: the map point — agents.lat/lng and the provenance of that position
+ *  (geo-precision.ts honesty rule), moved together as one unit. */
+export const MAP_POINT_FIELDS = ["lat", "lng", "geo_precision", "geocode_source", "geocode_outcome"] as const;
+export type MapPointField = (typeof MAP_POINT_FIELDS)[number];
+
+type ScalarValue = string | number | null;
+
+/** G8 blank: NULL, '' (after trim), or an empty JSON array/object — the
+ *  column defaults ('[]') count as "nothing set". */
+export function isBlankG8(v: ScalarValue | undefined): boolean {
+  if (v === null || v === undefined) return true;
+  if (typeof v === "number") return false;
+  const t = v.trim();
+  return t === "" || t === "[]" || t === "{}";
+}
+
+function normAddress(v: string | null): string {
+  return (v ?? "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
 /**
@@ -170,7 +207,7 @@ export function mergeFieldProvenance(
 }
 
 // ── Row snapshot ─────────────────────────────────────────────────────────
-interface AgentSnapshot {
+export interface AgentSnapshot {
   id: string;
   claimedAt: string | null;
   contactEmail: string | null;
@@ -178,6 +215,9 @@ interface AgentSnapshot {
   mergedInto: string | null;
   hasKnowledgeRow: boolean;
   knowledge: Record<KnowledgeMergeField, string | null>;
+  /** G8 columns — read always, used only with `{ g8: true }`. */
+  g8Knowledge: Record<G8KnowledgeField, ScalarValue>;
+  mapPoint: Record<MapPointField, ScalarValue>;
   curatedFields: string | null;
   fieldProvenance: string | null;
 }
@@ -188,13 +228,17 @@ interface AgentSnapshot {
  * note — an INNER JOIN here would silently make such rows un-mergeable).
  * `k_agent_id IS NULL` is the join-miss signal used to set hasKnowledgeRow.
  */
-function readAgentSnapshot(db: ReturnType<typeof getDb>, id: string): AgentSnapshot | null {
+export function readAgentSnapshot(db: ReturnType<typeof getDb>, id: string): AgentSnapshot | null {
   const row = db
     .prepare(
       `SELECT a.id AS a_id, a.claimed_at AS a_claimed_at, a.contact_email AS a_contact_email,
               a.is_active AS a_is_active, a.merged_into AS a_merged_into,
+              a.lat AS a_lat, a.lng AS a_lng, a.geo_precision AS a_geo_precision,
+              a.geocode_source AS a_geocode_source, a.geocode_outcome AS a_geocode_outcome,
               k.agent_id AS k_agent_id, k.address AS k_address, k.postal_code AS k_postal_code,
               k.website AS k_website, k.phone AS k_phone, k.email AS k_email, k.about AS k_about,
+              k.opening_hours AS k_opening_hours, k.delivery_options AS k_delivery_options,
+              k.delivery_radius AS k_delivery_radius, k.min_order_value AS k_min_order_value,
               k.curated_fields AS k_curated_fields, k.field_provenance AS k_field_provenance
          FROM agents a
          LEFT JOIN agent_knowledge k ON k.agent_id = a.id
@@ -221,21 +265,51 @@ function readAgentSnapshot(db: ReturnType<typeof getDb>, id: string): AgentSnaps
       email: row.k_email as string | null,
       about: row.k_about as string | null,
     },
+    g8Knowledge: {
+      opening_hours: row.k_opening_hours,
+      delivery_options: row.k_delivery_options,
+      delivery_radius: row.k_delivery_radius,
+      min_order_value: row.k_min_order_value,
+    },
+    mapPoint: {
+      lat: row.a_lat,
+      lng: row.a_lng,
+      geo_precision: row.a_geo_precision,
+      geocode_source: row.a_geocode_source,
+      geocode_outcome: row.a_geocode_outcome,
+    },
     curatedFields: row.k_curated_fields as string | null,
     fieldProvenance: row.k_field_provenance as string | null,
   };
 }
 
 // ── Fill plan ────────────────────────────────────────────────────────────
-interface FieldFillPlan {
-  field: string; // "contact_email" | KnowledgeMergeField
+export interface FieldFillPlan {
+  field: string; // "contact_email" | KnowledgeMergeField | G8KnowledgeField | MapPointField
   table: "agents" | "agent_knowledge";
-  newValue: string;
+  newValue: string | number | null;
 }
 
-interface MergePlan {
+export interface MergePlan {
   fillable: FieldFillPlan[];
   curatedSkipped: string[];
+  /** G8 only: the map point (MAP_POINT_FIELDS) is moved from the duplicate. */
+  mapPointMoved?: boolean;
+  /** G8 only: why a map point the survivor lacks was NOT moved. */
+  mapPointSkipped?: string;
+  /** G8 only: the survivor's address is filled from the duplicate while the
+   *  survivor keeps its own map point → re-geocode it (invalidateAgentGeocode). */
+  geocodeReset?: boolean;
+}
+
+export interface FillPlanOptions {
+  /** claim-merge-approve: also fill-only move G8 fields + the map point. */
+  g8?: boolean;
+}
+
+function knowledgeOldValue(survivor: AgentSnapshot, field: string): ScalarValue {
+  if ((G8_KNOWLEDGE_FIELDS as readonly string[]).includes(field)) return survivor.g8Knowledge[field as G8KnowledgeField];
+  return survivor.knowledge[field as KnowledgeMergeField];
 }
 
 /**
@@ -247,7 +321,7 @@ interface MergePlan {
  * curatedSkipped, not in fillable — it does not affect any other field or
  * the pair's overall outcome.
  */
-function computeFillPlan(survivor: AgentSnapshot, duplicate: AgentSnapshot): MergePlan {
+export function computeFillPlan(survivor: AgentSnapshot, duplicate: AgentSnapshot, opts: FillPlanOptions = {}): MergePlan {
   const fillable: FieldFillPlan[] = [];
   const curatedSkipped: string[] = [];
 
@@ -271,7 +345,60 @@ function computeFillPlan(survivor: AgentSnapshot, duplicate: AgentSnapshot): Mer
     }
   }
 
-  return { fillable, curatedSkipped };
+  if (!opts.g8) return { fillable, curatedSkipped };
+
+  // ── G8 (claim-merge-approve only) ──────────────────────────────────────
+  for (const field of G8_KNOWLEDGE_FIELDS) {
+    const survivorVal = survivor.g8Knowledge[field];
+    const dupVal = duplicate.g8Knowledge[field];
+    if (isBlankG8(survivorVal) && !isBlankG8(dupVal)) {
+      if (isFieldCurated(survivor.curatedFields, field)) {
+        curatedSkipped.push(field);
+      } else {
+        fillable.push({ field, table: "agent_knowledge", newValue: dupVal });
+      }
+    }
+  }
+
+  // The address the survivor will carry after the fills above.
+  const addressFilled = fillable.some((f) => f.field === "address");
+  const finalAddress = addressFilled ? duplicate.knowledge.address : survivor.knowledge.address;
+  const finalPostal = fillable.some((f) => f.field === "postal_code") ? duplicate.knowledge.postal_code : survivor.knowledge.postal_code;
+
+  // Any half of a point counts as "has one" — fill-only never overwrites it.
+  const survivorHasPoint = survivor.mapPoint.lat !== null || survivor.mapPoint.lng !== null;
+  const duplicateHasPoint = duplicate.mapPoint.lat !== null && duplicate.mapPoint.lng !== null;
+  let mapPointMoved = false;
+  let mapPointSkipped: string | undefined;
+  if (!survivorHasPoint && duplicateHasPoint) {
+    if (isFieldCurated(survivor.curatedFields, "lat") || isFieldCurated(survivor.curatedFields, "lng")) {
+      curatedSkipped.push("lat", "lng");
+      mapPointSkipped = "curated";
+    } else if (
+      // The duplicate's point belongs to the duplicate's address. Moved only
+      // when the survivor ends up at that same address (or has none) — a
+      // point for another address would put the farm in the wrong place; the
+      // geocode worker places the survivor's own address instead.
+      !isBlank(finalAddress) &&
+      (normAddress(finalAddress) !== normAddress(duplicate.knowledge.address) ||
+        (!isBlank(finalPostal) && !isBlank(duplicate.knowledge.postal_code) && String(finalPostal).trim() !== String(duplicate.knowledge.postal_code).trim()))
+    ) {
+      mapPointSkipped = "address_differs";
+    } else {
+      for (const field of MAP_POINT_FIELDS) {
+        if (survivor.mapPoint[field] !== duplicate.mapPoint[field]) {
+          fillable.push({ field, table: "agents", newValue: duplicate.mapPoint[field] });
+        }
+      }
+      mapPointMoved = true;
+    }
+  }
+
+  // Address filled from the duplicate while the survivor keeps a point that
+  // was placed without that address → re-geocode (same as geocode-reset).
+  const geocodeReset = addressFilled && survivorHasPoint;
+
+  return { fillable, curatedSkipped, mapPointMoved, ...(mapPointSkipped ? { mapPointSkipped } : {}), geocodeReset };
 }
 
 function curatedDetail(curatedSkipped: string[]): string | undefined {
@@ -293,7 +420,7 @@ function curatedDetail(curatedSkipped: string[]): string | undefined {
  * block on the survivor having some unrelated merged_into value — only the
  * two conditions above are the defect this guards against.
  */
-function isAlreadyMergedPair(survivor: AgentSnapshot, duplicate: AgentSnapshot): boolean {
+export function isAlreadyMergedPair(survivor: AgentSnapshot, duplicate: AgentSnapshot): boolean {
   return !survivor.isActive || duplicate.mergedInto !== null;
 }
 
@@ -306,7 +433,7 @@ function isAlreadyMergedPair(survivor: AgentSnapshot, duplicate: AgentSnapshot):
  * responsible for the surrounding transaction and the fresh claimed/curated
  * re-check.
  */
-function applyMergeWrites(
+export function applyMergeWrites(
   db: ReturnType<typeof getDb>,
   survivor: AgentSnapshot,
   duplicate: AgentSnapshot,
@@ -325,6 +452,19 @@ function applyMergeWrites(
        VALUES (?, ?, 'contact_email', ?, ?, 'system', NULL, datetime('now'), ?)`,
     ).run(randomUUID(), survivor.id, survivor.contactEmail, contactFill.newValue, `${batchTag}: ${reason}`);
     fieldsFilled.push("contact_email");
+  }
+
+  // G8 map point (only present with `{ g8: true }`): other `agents` columns.
+  for (const f of plan.fillable) {
+    if (f.table !== "agents" || f.field === "contact_email") continue;
+    if (!(MAP_POINT_FIELDS as readonly string[]).includes(f.field)) throw new Error(`unexpected agents fill: ${f.field}`);
+    db.prepare(`UPDATE agents SET ${f.field} = ? WHERE id = ?`).run(f.newValue, survivor.id);
+    db.prepare(
+      `INSERT INTO agent_knowledge_audit
+         (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
+       VALUES (?, ?, ?, ?, ?, 'system', NULL, datetime('now'), ?)`,
+    ).run(randomUUID(), survivor.id, f.field, survivor.mapPoint[f.field as MapPointField], f.newValue, `${batchTag}: ${reason}`);
+    fieldsFilled.push(f.field);
   }
 
   const knowledgeFills = plan.fillable.filter((f) => f.table === "agent_knowledge");
@@ -346,7 +486,7 @@ function applyMergeWrites(
     }
 
     for (const f of knowledgeFills) {
-      const oldValue = survivor.knowledge[f.field as KnowledgeMergeField];
+      const oldValue = knowledgeOldValue(survivor, f.field);
       db.prepare(
         `INSERT INTO agent_knowledge_audit
            (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
@@ -365,6 +505,23 @@ function applyMergeWrites(
          (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
        VALUES (?, ?, 'field_provenance', ?, ?, 'system', NULL, datetime('now'), ?)`,
     ).run(randomUUID(), survivor.id, survivor.fieldProvenance, mergedProvenance, `${batchTag}: ${reason}`);
+  }
+
+  // G8: the survivor's address came from the duplicate but its map point was
+  // placed without it → clear the point so the geocode worker re-places it
+  // (invalidateAgentGeocode, same as POST /admin/agents/:id/geocode-reset).
+  // One audit row per cleared value carries the old point.
+  if (plan.geocodeReset) {
+    for (const field of MAP_POINT_FIELDS) {
+      const old = survivor.mapPoint[field];
+      if (old === null) continue;
+      db.prepare(
+        `INSERT INTO agent_knowledge_audit
+           (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
+         VALUES (?, ?, ?, ?, NULL, 'system', NULL, datetime('now'), ?)`,
+      ).run(randomUUID(), survivor.id, field, old, `${batchTag}: geocode reset (address filled from ${duplicate.id}): ${reason}`);
+    }
+    invalidateAgentGeocode(db, survivor.id);
   }
 
   // Mandatory, independent of whether any field above was fillable: the
@@ -452,17 +609,24 @@ interface ResultItem {
   detail?: string;
 }
 
+/** Dry-run by default: only an explicit truthy form (true, 1, "1", "true" in
+ *  the body, or ?apply=1|true) applies. Shared with claim-merge-approve. */
+export function isExplicitApply(bodyApply: unknown, queryApply?: unknown): boolean {
+  return (
+    bodyApply === true ||
+    bodyApply === 1 ||
+    bodyApply === "1" ||
+    bodyApply === "true" ||
+    queryApply === "1" ||
+    queryApply === "true"
+  );
+}
+
 router.post("/", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
   const body = (req.body ?? {}) as { pairs?: unknown; apply?: unknown };
-  const apply =
-    body.apply === true ||
-    body.apply === 1 ||
-    body.apply === "1" ||
-    body.apply === "true" ||
-    req.query?.apply === "1" ||
-    req.query?.apply === "true";
+  const apply = isExplicitApply(body.apply, req.query?.apply);
   const dryRun = !apply;
 
   if (!Array.isArray(body.pairs) || body.pairs.length === 0) {
