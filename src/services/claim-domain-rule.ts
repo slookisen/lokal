@@ -199,7 +199,7 @@ export function websiteHost(website: unknown): string | null {
 }
 
 /** Strips one leading "www." (also "www2." etc. is NOT stripped: keep it simple). */
-function stripWww(host: string): string {
+export function stripWww(host: string): string {
   return host.startsWith("www.") && host.split(".").length > 2 ? host.slice(4) : host;
 }
 
