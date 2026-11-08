@@ -148,3 +148,13 @@ export function getProfileAiClicksTile(db: Db, vertical: string, profileId: stri
   const s = sums(db, vertical, profileId, windowStart(AI_CLICK_WINDOW_DAYS, nowMs));
   return { windowDays: AI_CLICK_WINDOW_DAYS, countingSince: firstStoredDay(db, vertical, undefined), total: s.total, byVendor: s.byVendor };
 }
+
+/**
+ * Sums for a whole vertical from `sinceDay` ('YYYY-MM-DD', UTC) through today
+ * (slice 5c): the click side of the admin click rate, read over exactly the
+ * same days as the «Sendt til AI» side. Same grouped sum as the other reads.
+ */
+export function getPlatformAiClicksSince(db: Db, vertical: string, sinceDay: string): AiClickSums {
+  if (!tableExists(db)) return emptyAiClickSums();
+  return sums(db, vertical, undefined, sinceDay);
+}
