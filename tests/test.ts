@@ -53095,3 +53095,25 @@ runSerial(async () => {
     failures.push("admin-orders-close-stale: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-16-opplevagent-katalogfakta-alder-og-title-no, slice
+// S3a: GET /admin/experience-facts-candidates + applyExperienceFactsProposals()
+// behind POST /admin/experience-facts-write (dry-run default, server-side
+// fetch + verbatim excerpt, fill-only, scope + publish gate per item).
+// api.anthropic.com is counted and asserted zero. Own in-memory DBs,
+// globalThis.fetch stubbed (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-16-opplevagent-katalogfakta S3a: experience-facts-proposals ──");
+  try {
+    const { runExperienceFactsProposalsTests } = require("../src/routes/experience-facts-proposals.test") as
+      typeof import("../src/routes/experience-facts-proposals.test");
+    const r = await runExperienceFactsProposalsTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("experience-facts-proposals: " + f);
+    console.log(`  experience-facts-proposals: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experience-facts-proposals: unexpected error: " + String(err?.message || err));
+  }
+});
