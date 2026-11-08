@@ -20,7 +20,9 @@ import express, { Router, Request, Response } from "express";
 import { rateLimit } from "express-rate-limit";
 import { getDb } from "../database/init";
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
-import { verifyOwnerSession, ownerSessionAllows } from "./owner-portal";
+import { verifyOwnerSession, ownerSessionAllows, isVerifiedOwner } from "./owner-portal";
+import { ownerDashboardActiveFor, renderOwnerShellStart } from "../owner-ui/shell";
+import { slugify } from "../utils/slug";
 import {
   isCrossSiteWrite, writeGuardRefusedBody, WRITE_GUARD_REFUSED_TITLE, WRITE_GUARD_CONTACT_RFB,
 } from "../middleware/same-origin-write";
@@ -179,6 +181,10 @@ router.get("/eier/:agentId/ordrer", ownerOrdersLimiter, (req: Request, res: Resp
       ownerTheme: ownerThemeFor(agentId),
       // T12: the cancellation component and the overview, allowlisted producers only.
       ...(t12OrderActionsActive(agentId) ? { t12: { overview: getOwnerOrderOverview(agentId) } } : {}),
+      // T15a: the shared owner shell — flag + allowlist + verified owner; absent = page as before.
+      ...(ownerDashboardActiveFor("rfb", agentId, isVerifiedOwner(agentId, session))
+        ? { ownerShellHtml: renderOwnerShellStart({ agentId, current: "ordrer", profileSlug: slugify(String(agent.name || "")) }) }
+        : {}),
     }));
   } catch (err) {
     console.error("[owner-orders] GET list failed:", err instanceof Error ? err.message : "error");

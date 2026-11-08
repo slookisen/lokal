@@ -18,6 +18,7 @@ import { randomUUID } from "crypto";
 import { soldOutChoices, stockSoftExpiryActiveFor } from "../services/stock-soft-expiry";
 import { isOrderMessagesEnabled, listOrderMessages, orderTakesMessages, ORDER_MESSAGE_MAX_CHARS, type OrderMessageRow } from "../services/order-messages";
 import { OWNER_ORDERS_THEME_CSS, ownerThemeHtml } from "../owner-ui/tokens";
+import { OWNER_SHELL_MAIN_ID } from "../owner-ui/shell";
 import { isBuyerReceiptsEnabled } from "../services/order-receipt-service";
 import { osloDay, osloDayStartUtc } from "../services/order-cap-notice";
 import {
@@ -596,6 +597,15 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#f5f3ee;color:#1e
 `;
 
 export function ordersShell(title: string, body: string): string {
+  return ordersShellWith(title, body, null);
+}
+
+/**
+ * ordersShell with the T15a owner shell (skip link + menu before <main>, and
+ * <main> as the skip link's target). `ownerShellHtml` null = exactly
+ * ordersShell, so the buyer's card and the token page are unchanged.
+ */
+function ordersShellWith(title: string, body: string, ownerShellHtml: string | null): string {
   return `<!doctype html>
 <html lang="nb">
 <head>
@@ -606,7 +616,7 @@ export function ordersShell(title: string, body: string): string {
 <style>${CSS}</style>
 </head>
 <body>
-<main class="mo-wrap">
+${ownerShellHtml ? `${ownerShellHtml}\n<main class="mo-wrap" id="${OWNER_SHELL_MAIN_ID}" tabindex="-1">` : `<main class="mo-wrap">`}
 ${body}
 </main>
 <script>
@@ -648,6 +658,8 @@ export function renderOrdersPage(opts: {
   ownerTheme?: boolean;
   /** T12: the cancellation component and the overview (allowlisted subjects only; absent = page as before). */
   t12?: { overview: OwnerOrderOverview } | null;
+  /** T15a: the owner shell's markup (renderOwnerShellStart); absent = page as before. */
+  ownerShellHtml?: string | null;
 }): string {
   const base = `/eier/${encodeURIComponent(opts.agentId)}/ordrer`;
   const tabs = OWNER_ORDERS_TABS.map((t) =>
@@ -668,8 +680,9 @@ export function renderOrdersPage(opts: {
 ${opts.t12 ? `${ownerOrderOverviewHtml(opts.t12.overview)}\n` : ""}${bannerHtml(opts.done, opts.error, !!opts.t12)}
 <nav class="mo-tabs" aria-label="Ordrer">${tabs}</nav>
 ${rows}${empty}`;
-  return ordersShell(`Mine ordrer · ${opts.producerName}`,
-    opts.ownerTheme ? `<style>${OWNER_ORDERS_THEME_CSS}</style>${ownerThemeHtml(body)}` : body);
+  return ordersShellWith(`Mine ordrer · ${opts.producerName}`,
+    opts.ownerTheme ? `<style>${OWNER_ORDERS_THEME_CSS}</style>${ownerThemeHtml(body)}` : body,
+    opts.ownerShellHtml || null);
 }
 
 /** The single-order view opened from the e-mail (token). Shows that order only. */

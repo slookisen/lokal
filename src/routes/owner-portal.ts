@@ -31,6 +31,7 @@ import {
 } from "../owner-features/registry";
 import { resolveOwnerFeature, setOwnerFeatureValue } from "../owner-features/resolve";
 import { OWNER_PORTAL_THEME_CSS, ownerThemeHtml } from "../owner-ui/tokens";
+import { OWNER_SHELL_MAIN_OPEN, OWNER_SHELL_PROFILE_ANCHOR, ownerDashboardActiveFor, renderOwnerShellStart } from "../owner-ui/shell";
 import { ownerPauseEnabled, isOwnerPaused, readOwnerPauseRow } from "../services/agent-visibility";
 import { isBlocked, normalizeEmail } from "../services/blocklist-service";
 import { rateLimit } from "express-rate-limit";
@@ -1239,7 +1240,11 @@ export function portalWriteRefusedPage(backHref: string, backLabel = "Tilbake ti
   return portalShell(WRITE_GUARD_REFUSED_TITLE, `<div class="ep-card">${writeGuardRefusedBody({ contact: WRITE_GUARD_CONTACT_RFB, backHref, backLabel })}</div>`);
 }
 
-export function portalShell(title: string, body: string, opts: { headHtml?: string } = {}): string {
+export function portalShell(title: string, body: string, opts: { headHtml?: string; ownerShellHtml?: string } = {}): string {
+  // T15a: with the owner shell (renderOwnerShellStart), the skip link and the
+  // menu come first in <body> and the page sits in <main id="innhold">.
+  // Without it the markup is exactly as before.
+  const shell = opts.ownerShellHtml;
   return `<!DOCTYPE html>
 <html lang="nb">
 <head>
@@ -1255,12 +1260,12 @@ export function portalShell(title: string, body: string, opts: { headHtml?: stri
   <title>${escapeHtml(title)} — Rett fra Bonden</title>
   <style>${PORTAL_PALETTE_CSS}</style>${opts.headHtml ? `\n  ${opts.headHtml}` : ""}
 </head>
-<body>
+<body>${shell ? `\n  ${shell}` : ""}
   <div class="ep-shell">
     <div class="ep-topbar">
       <a href="/" class="ep-logo">Rett fra <span>Bonden</span></a>
     </div>
-    ${body}
+    ${shell ? `${OWNER_SHELL_MAIN_OPEN}${body}</main>` : body}
   </div>
 </body>
 </html>`;
@@ -2294,6 +2299,9 @@ function renderOwnerPortalPage(req: Request, res: Response, addForm: OwnerItemsA
     `;
 
     const slug = agent.slug || "";
+    // T15a: the shared owner shell — OWNER_DASHBOARD_ENABLED + allowlist +
+    // verified owner (hasOwnerFeatures); off = the portal is byte-identical.
+    const dashboard = hasOwnerFeatures && ownerDashboardActiveFor("rfb", agentId, true);
     const backUrl = slug ? `/produsent/${encodeURIComponent(slug)}` : "/";
 
     const body = `
@@ -2308,7 +2316,7 @@ function renderOwnerPortalPage(req: Request, res: Response, addForm: OwnerItemsA
         ${alert}
       </div>
 
-      <div class="ep-card">
+      <div class="ep-card"${dashboard ? ` id="${OWNER_SHELL_PROFILE_ANCHOR}"` : ""}>
         <h2>Profilinformasjon</h2>
         <form id="ep-profile-form" method="post" action="/eier/${encodeURIComponent(agent.id)}/save" novalidate>
           ${fieldHtml}
@@ -2411,7 +2419,8 @@ function renderOwnerPortalPage(req: Request, res: Response, addForm: OwnerItemsA
     try { ownerTheme = isSubjectAllowedForOwnerFeatures("rfb", agentId); } catch { ownerTheme = false; }
     const pageBody = ownerTheme ? `<style>${OWNER_PORTAL_THEME_CSS}</style>${ownerThemeHtml(body)}` : body;
 
-    return res.send(portalShell(`Eierportal · ${agent.name}`, pageBody));
+    return res.send(portalShell(`Eierportal · ${agent.name}`, pageBody,
+      dashboard ? { ownerShellHtml: renderOwnerShellStart({ agentId, current: "oversikt", profileSlug: slug }) } : {}));
   } catch (err) {
     console.error("[owner-portal] GET /eier/:agentId/portal error:", err);
     return res.status(500).send(portalShell(
