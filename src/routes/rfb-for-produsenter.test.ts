@@ -198,7 +198,7 @@ export async function runRfbForProdusenterTests(opts: { log?: boolean } = {}): P
       assertTrue(no.body.includes(`<strong>${e.label.no}</strong>`), `#mine-valg lists live choice «${e.label.no}»`);
     }
     // No coming_soon label in the «Dette kan du velge i dag» list.
-    const todayList = (no.body.match(/Dette kan du velge i dag:<\/p>\s*<ul class="fp-list">([\s\S]*?)<\/ul>/) || ["", ""])[1];
+    const todayList = (no.body.match(/data-feature="mine_valg"[\s\S]*?<ul class="fp-list">([\s\S]*?)<\/ul>/) || ["", ""])[1];
     const todayLabels = [...todayList.matchAll(/<strong>([\s\S]*?)<\/strong>/g)].map((m) => decode(m[1]));
     assertTrue(todayLabels.length > 0, "#mine-valg: the «i dag» list is present");
     for (const e of OWNER_FEATURE_REGISTRY.filter((x) => x.verticals.includes("rfb") && ownerFeatureStatus(x) === "coming_soon")) {
@@ -224,29 +224,29 @@ export async function runRfbForProdusenterTests(opts: { log?: boolean } = {}): P
     assertTrue(no.body.includes(`minst ${facts.publicStatsMinViews} sidevisninger fra mennesker de siste 12 månedene`) && no.body.includes("Du ser alltid dine egne tall"), "#statistikk: public threshold from publicStatsMinViews(); owner always sees own numbers");
     assertTrue(no.body.includes("En rapport på e-post er planlagt") && !/månedsrapport/i.test(no.body), "#statistikk: no monthly report promised");
     // ── 6. Flag-dependent promises: both states ───────────────────────────
-    const base = { ...facts, autocompleteOn: false, buyerReceiptsOn: false, orderabilityPortalOn: false, stockCheckEmailOn: false };
+    // F2a: pilot functions carry a state (owner-features/today-facts.ts), not a raw flag.
+    const allState = (st: "for_alle" | "i_pilot" | "planlagt") => ({ mine_valg: st, varer: st, kanseller: st, lagerpaminnelse: st, myk_utlop: st });
+    const base = { ...facts, autocompleteOn: false, buyerReceiptsOn: false, pilot: allState("planlagt") };
     const offAll = mod.renderForProdusenterPage("no", "https://x/for-produsenter", base).content;
-    const onAll = mod.renderForProdusenterPage("no", "https://x/for-produsenter", { ...base, buyerReceiptsOn: true, orderabilityPortalOn: true, stockCheckEmailOn: true }).content;
+    const onAll = mod.renderForProdusenterPage("no", "https://x/for-produsenter", { ...base, buyerReceiptsOn: true, pilot: allState("for_alle") }).content;
     const offAllEn = mod.renderForProdusenterPage("en", "https://x/en/for-produsenter", base).content;
-    const onAllEn = mod.renderForProdusenterPage("en", "https://x/en/for-produsenter", { ...base, buyerReceiptsOn: true, orderabilityPortalOn: true, stockCheckEmailOn: true }).content;
+    const onAllEn = mod.renderForProdusenterPage("en", "https://x/en/for-produsenter", { ...base, buyerReceiptsOn: true, pilot: allState("for_alle") }).content;
     // a. buyer told on cancellation only with ORDER_BUYER_RECEIPTS_ENABLED
     assertTrue(!offAll.includes("kunden får beskjed") && onAll.includes("blir den kansellert, og kunden får beskjed"), "receipts flag: NO promises the buyer notice only when on");
     assertTrue(!offAllEn.includes("customer is told") && onAllEn.includes("and the customer is told"), "receipts flag: EN mirrors it");
     const { isBuyerReceiptsEnabled } = require("../services/order-receipt-service") as typeof import("../services/order-receipt-service");
     assertTrue(facts.buyerReceiptsOn === isBuyerReceiptsEnabled(), "facts.buyerReceiptsOn reads isBuyerReceiptsEnabled()");
-    // b. «eierportalen» for stock/products only with OWNER_ORDERABILITY_PORTAL_ENABLED
-    assertTrue(!offAll.includes("på lager i eierportalen") && !offAll.includes("legg inn varene i eierportalen") && offAll.includes("under «Tilgjengelighet» i fanen «Produkter»"), "portal flag off: stock/products not claimed for the owner portal (NO)");
-    assertTrue(onAll.includes("Merk varene som på lager i eierportalen") && onAll.includes("legg inn varene i eierportalen"), "portal flag on: owner-portal wording (NO)");
-    assertTrue(!offAllEn.includes("in the owner portal. The stock") && !offAllEn.includes("add your goods in the owner portal") && onAllEn.includes("add your goods in the owner portal"), "portal flag: EN mirrors it");
-    const { ownerOrderabilityPortalEnabled } = require("../services/owner-orderability") as typeof import("../services/owner-orderability");
-    assertTrue(facts.orderabilityPortalOn === ownerOrderabilityPortalEnabled(), "facts.orderabilityPortalOn reads ownerOrderabilityPortalEnabled()");
-    // c. stock-check reminder listed «i dag» only with STOCK_CHECK_EMAIL_ENABLED
+    // b. «Varer» in the owner portal for stock/products only while «Varer» is for everyone
+    assertTrue(!offAll.includes("på lager under «Varer» i eierportalen") && !offAll.includes("legg inn varene under «Varer»") && offAll.includes("under «Tilgjengelighet» i fanen «Produkter»"), "«Varer» planned: stock/products not claimed for the owner portal (NO)");
+    assertTrue(onAll.includes("Merk varene som på lager under «Varer» i eierportalen") && onAll.includes("legg inn varene under «Varer» i eierportalen"), "«Varer» for everyone: owner-portal wording (NO)");
+    assertTrue(!offAllEn.includes("add your goods under «Varer»") && onAllEn.includes("add your goods under «Varer» (goods) in the owner portal"), "«Varer»: EN mirrors it");
+    // c. stock-check reminder: the choice is listed only while the reminder is not «planlagt»
     const stockLabel = OWNER_FEATURE_REGISTRY.find((e) => e.key === "products.stock_check")!.label.no;
-    assertTrue(!offAll.includes(`<strong>${stockLabel}</strong>`) && offAll.includes("Påminnelse på e-post om å bekrefte lagerstatus er også planlagt"), "stock-check flag off: not in the «i dag» list, called planned");
-    assertTrue(onAll.includes(`<strong>${stockLabel}</strong>`) && !onAll.includes("lagerstatus er også planlagt"), "stock-check flag on: listed as available");
-    assertTrue(!mod.liveRfbOwnerChoices(base).some((e) => e.key === "products.stock_check") && mod.liveRfbOwnerChoices({ ...base, stockCheckEmailOn: true }).some((e) => e.key === "products.stock_check"), "liveRfbOwnerChoices honours the stock-check flag");
-    const { isStockCheckEmailEnabled } = require("../services/stock-check-reminder") as typeof import("../services/stock-check-reminder");
-    assertTrue(facts.stockCheckEmailOn === isStockCheckEmailEnabled(), "facts.stockCheckEmailOn reads isStockCheckEmailEnabled()");
+    assertTrue(!offAll.includes(`<strong>${stockLabel}</strong>`) && offAll.includes("Påminnelse på e-post om å bekrefte lagerstatus er planlagt."), "stock-check planned: not in the list, called planned");
+    assertTrue(onAll.includes(`<strong>${stockLabel}</strong>`) && !onAll.includes("lagerstatus er planlagt"), "stock-check for everyone: listed as available");
+    assertTrue(!mod.liveRfbOwnerChoices(base).some((e) => e.key === "products.stock_check") && mod.liveRfbOwnerChoices({ ...base, pilot: allState("i_pilot") }).some((e) => e.key === "products.stock_check"), "liveRfbOwnerChoices honours the stock-check state");
+    const { currentPilotStates } = require("../owner-features/today-facts") as typeof import("../owner-features/today-facts");
+    assertTrue(JSON.stringify(facts.pilot) === JSON.stringify(currentPilotStates()), "facts.pilot reads currentPilotStates() (today-facts.ts)");
     // Consent + contact is required for every real order (cart-service F2).
     assertTrue(/CONTACT_REQUIRED_ERROR/.test(cartSvc) && no.body.includes("Kunden må oppgi e-post eller telefon og godta at du får den"), "#bestillinger: buyer contact + consent is always required (CONTACT_REQUIRED_ERROR)");
     // Badge claim

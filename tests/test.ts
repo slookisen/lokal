@@ -49901,6 +49901,28 @@ runSerial(async () => {
   }
 });
 
+// «For produsenter» F2a (A2A dev-request 2026-10-22-rfb-for-produsenter-faq-side,
+// «Endringer fra Daniel 08.11»): the facts module owner-features/today-facts.ts,
+// the three states for_alle / i_pilot / planlagt checked against the code's own
+// per-owner gates, «I pilot» badge (AC9), nothing pilot-only called available to
+// all (AC10), the pilot invitation + mailto (AC11), ORDER_CAP_V2 text, JSON-LD
+// parity. Pure renders with explicit env objects, no DB, no process.env writes.
+runSerial(async () => {
+  console.log("\n── for produsenter F2a (today-facts, «I pilot») ──");
+  try {
+    const { runTodayFactsTests } = require("../src/owner-features/today-facts.test") as
+      typeof import("../src/owner-features/today-facts.test");
+    const tf = await runTodayFactsTests({ log: false });
+    passed += tf.passed;
+    failed += tf.failed;
+    for (const f of tf.failures) failures.push("today-facts: " + f);
+    console.log(`  today-facts: ${tf.passed} passed, ${tf.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("today-facts: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, track C3:
 // checkCartToken() enforces carts.expires_at (the "valid for 7 days" promise
 // is now literally true). Own in-memory DB — tail position, not load-bearing.

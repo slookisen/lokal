@@ -26,16 +26,24 @@
 //     pickup only and pay at pickup, daily cap ORDER_CAP_NEW_PER_PRODUCER_PER_DAY
 //     (10) → contact details instead, «Hentet» on the order page (B3),
 //     producer-stated stock expires after SUPPLY_GRAPH_STALE_DAYS (14).
-//   - Flag-dependent promises follow the flag (ForProdusenterFacts): the
-//     automatic close only while ORDER_AUTOCOMPLETE_ENABLED; «kunden får
-//     beskjed» on cancellation only while ORDER_BUYER_RECEIPTS_ENABLED; stock
-//     and products «i eierportalen» only while OWNER_ORDERABILITY_PORTAL_ENABLED
-//     (else the /selger «Produkter» tab, «Tilgjengelighet»); the stock-check
-//     reminder is listed as available only while STOCK_CHECK_EMAIL_ENABLED;
-//     with OWNER_AUTO_UPDATES_ENABLED (auto.updates live, dev-request
-//     2026-11-01-rfb-hold-profilen-oppdatert) the sentences that call the
-//     update choice planned, or new information «a suggestion», are left out
-//     (no replacement text without Daniel's approval).
+//   - Flag-dependent promises follow the flag (ForProdusenterFacts, now in
+//     owner-features/today-facts.ts): the automatic close only while
+//     ORDER_AUTOCOMPLETE_ENABLED; «kunden får beskjed» on cancellation only
+//     while ORDER_BUYER_RECEIPTS_ENABLED; the order limits follow
+//     ORDER_CAP_V2_ENABLED (T11 text from order-texts.ts when on, the old
+//     daily cap when off); with OWNER_AUTO_UPDATES_ENABLED (auto.updates live,
+//     dev-request 2026-11-01-rfb-hold-profilen-oppdatert) the sentences that
+//     call the update choice planned, or new information «a suggestion», are
+//     left out (no replacement text without Daniel's approval).
+//   - F2a (dev-request «Endringer fra Daniel 08.11»): «Mine valg», «Varer» in
+//     the owner portal, «Kanseller bestillingen» in «Mine ordrer» (T12), the
+//     stock-check e-mail and soft stock expiry each have a state
+//     (for_alle / i_pilot / planlagt, today-facts.ts — the flag AND the
+//     owner-features allowlist, as the code gates them). What everyone has
+//     today (/selger «Produkter», «Flere valg» on the order page, the
+//     «Bestillinger» card) is the main path; i_pilot is shown with the
+//     «I pilot» badge and note, plus the pilot invitation (mailto with only
+//     the subject) in #mine-valg and the closing box.
 //   - Every real order needs buyer contact + consent (CONTACT_REQUIRED_ERROR).
 //   - «Verifisert av eier» is the only badge that shows owner confirmation
 //     (profiles also carry Brreg / Debio badges).
@@ -50,16 +58,14 @@
 
 import { localizedPath, type Lang } from "../i18n/t";
 import { faqPairsFromJsonLd, type FaqPair } from "../services/faq-section";
-import { OWNER_FEATURE_REGISTRY, ownerAutoUpdatesEnabled, ownerFeatureEntryForEnv, ownerFeatureStatus, type OwnerFeatureEntry } from "../owner-features/registry";
+import { OWNER_FEATURE_REGISTRY, ownerFeatureEntryForEnv, ownerFeatureStatus, type OwnerFeatureEntry } from "../owner-features/registry";
 import { OWNER_LEVELS } from "../owner-features/changes";
-import { orderReminderHours, orderAutocancelHours } from "../services/order-followups";
-import { orderCapNewPerDay } from "../services/cart-service";
-import { isOrderAutocompleteEnabled } from "../services/order-lifecycle";
-import { publicStatsMinViews } from "../services/public-stats-threshold";
-import { getSupplyGraphStaleDays } from "../services/supply-graph";
-import { isBuyerReceiptsEnabled } from "../services/order-receipt-service";
-import { ownerOrderabilityPortalEnabled } from "../services/owner-orderability";
-import { isStockCheckEmailEnabled } from "../services/stock-check-reminder";
+import { ownerOrderLimitLines, type OrderLimitsConfig } from "../owner-features/order-texts";
+import { currentForProdusenterFacts, type ForProdusenterFacts, type PilotFeatureKey, type PilotState } from "../owner-features/today-facts";
+
+// F2a: the facts module lives in owner-features/today-facts.ts; re-exported
+// so existing callers (tests, rfb-owner-refresh) keep importing it from here.
+export { currentForProdusenterFacts, type ForProdusenterFacts } from "../owner-features/today-facts";
 
 export const FOR_PRODUSENTER_PATH = "/for-produsenter";
 
@@ -86,39 +92,6 @@ export const FOR_PRODUSENTER_ANCHORS = [
 ] as const;
 export type ForProdusenterAnchor = (typeof FOR_PRODUSENTER_ANCHORS)[number];
 
-/** Numbers the text quotes, read from the same configuration the code uses. */
-export interface ForProdusenterFacts {
-  reminderHours: number;
-  autocancelHours: number;
-  dailyCap: number;
-  autocompleteOn: boolean;
-  publicStatsMinViews: number;
-  stockValidDays: number;
-  /** ORDER_BUYER_RECEIPTS_ENABLED: the buyer is told when an order is cancelled. */
-  buyerReceiptsOn: boolean;
-  /** OWNER_ORDERABILITY_PORTAL_ENABLED: the /eier portal's «Varer som kan bestilles» card (B1). */
-  orderabilityPortalOn: boolean;
-  /** STOCK_CHECK_EMAIL_ENABLED: the stock-check reminder e-mail (B2). */
-  stockCheckEmailOn: boolean;
-  /** OWNER_AUTO_UPDATES_ENABLED: auto.updates is a live choice (dev-request 2026-11-01-rfb-hold-profilen-oppdatert). */
-  autoUpdatesOn?: boolean;
-}
-
-export function currentForProdusenterFacts(): ForProdusenterFacts {
-  return {
-    reminderHours: orderReminderHours(),
-    autocancelHours: orderAutocancelHours(),
-    dailyCap: orderCapNewPerDay(),
-    autocompleteOn: isOrderAutocompleteEnabled(),
-    publicStatsMinViews: publicStatsMinViews(),
-    stockValidDays: getSupplyGraphStaleDays(),
-    buyerReceiptsOn: isBuyerReceiptsEnabled(),
-    orderabilityPortalOn: ownerOrderabilityPortalEnabled(),
-    stockCheckEmailOn: isStockCheckEmailEnabled(),
-    autoUpdatesOn: ownerAutoUpdatesEnabled(),
-  };
-}
-
 const SELGER_FIND = "/selger#findSection";
 const SELGER_LOGIN = "/selger#loginBanner";
 const SELGER_REGISTER = "/selger";
@@ -142,21 +115,94 @@ function esc(text: string | number): string {
     .replace(/'/g, "&#39;");
 }
 
-/** Live entries whose effect also needs an env flag that is not on (listed as planned instead). */
+/** Live entries whose effect is still planned for everyone (listed as planned instead). */
 function flagGatedOff(e: OwnerFeatureEntry, f: ForProdusenterFacts): boolean {
-  return e.key === "products.stock_check" && !f.stockCheckEmailOn;
+  return e.key === "products.stock_check" && f.pilot.lagerpaminnelse === "planlagt";
 }
 
 /**
- * The «Mine valg» entries an RFB owner can use today (live/beta), in registry
- * order — minus a live entry whose effect is still behind an env flag that is
- * off (products.stock_check without STOCK_CHECK_EMAIL_ENABLED).
+ * The «Mine valg» entries an RFB owner can use (live/beta), in registry
+ * order — minus a live entry whose effect is still planned for everyone
+ * (products.stock_check while the stock-check reminder is «planlagt»).
  */
 export function liveRfbOwnerChoices(facts?: ForProdusenterFacts, registry: OwnerFeatureEntry[] = OWNER_FEATURE_REGISTRY): OwnerFeatureEntry[] {
   return registry
     .filter((e) => e.verticals.includes("rfb") && ownerFeatureStatus(e) !== "coming_soon" && !(facts && flagGatedOff(e, facts)))
     // The text as it applies now (auto.guarantee follows OWNER_AUTO_UPDATES_ENABLED).
     .map((e) => ownerFeatureEntryForEnv(e));
+}
+
+// ─── F2a: «I pilot» / «planlagt» (owner-features/today-facts.ts) ───────────
+
+const PILOT_COPY = {
+  no: {
+    badge: "I pilot",
+    note: "Dette tester vi nå med noen få utvalgte produsenter. Det blir tilgjengelig for alle senere.",
+    invite: "Vil du være med i piloten? Send oss en e-post, så tar vi kontakt. Vi tar inn noen få produsenter om gangen.",
+    inviteButton: "Send oss en e-post",
+  },
+  en: {
+    badge: "In pilot",
+    note: "We are testing this now with a few selected producers. It will become available to everyone later.",
+    invite: "Would you like to join the pilot? Send us an e-mail, and we will get in touch. We take in a few producers at a time.",
+    inviteButton: "Send us an e-mail",
+  },
+} as const;
+
+/** The pilot e-mail: only the subject «Pilot – Mine valg» in the link (no personal data). */
+export const PILOT_MAILTO = `mailto:kontakt@rettfrabonden.com?subject=${encodeURIComponent("Pilot – Mine valg")}`;
+
+interface FeatureCopy {
+  /** Plain text, shown without a badge while the function is «for_alle». */
+  forAlle: string;
+  /** Plain text, shown with the «I pilot» badge and note. */
+  pilot: string;
+  /** Plain text, describes the function as planned. */
+  planlagt: string;
+}
+
+/**
+ * One function's block in its state: «for_alle» plain, «i_pilot» with the
+ * badge and the note, «planlagt» as planned. `extra` (trusted HTML, our own
+ * escaped text) goes inside the block. Every text is escaped.
+ */
+function featureBlock(key: PilotFeatureKey, state: PilotState, lang: "no" | "en", copy: FeatureCopy, extra = ""): string {
+  if (state === "i_pilot") {
+    const c = PILOT_COPY[lang];
+    return `
+      <div class="fp-pilot" data-feature="${key}" data-state="i_pilot">
+        <p><span class="fp-badge">${esc(c.badge)}</span> ${esc(copy.pilot)}</p>${extra}
+        <p class="fp-pilot-note">${esc(c.note)}</p>
+      </div>`;
+  }
+  const text = state === "for_alle" ? copy.forAlle : copy.planlagt;
+  return `
+      <div class="fp-feature" data-feature="${key}" data-state="${state}"><p>${esc(text)}</p>${extra}</div>`;
+}
+
+function anyInPilot(f: ForProdusenterFacts): boolean {
+  return Object.values(f.pilot).some((s) => s === "i_pilot");
+}
+
+/** The pilot invitation (#mine-valg and the closing box); only while something is «i pilot». Promises no place. */
+function pilotInvite(where: "mine-valg" | "avslutning", lang: "no" | "en", f: ForProdusenterFacts): string {
+  if (!anyInPilot(f)) return "";
+  const c = PILOT_COPY[lang];
+  return `
+      <div class="fp-invite" data-pilot-invite="${where}">
+        <p>${esc(c.invite)}</p>
+        <a class="fp-btn" href="${esc(PILOT_MAILTO)}">${esc(c.inviteButton)}</a>
+      </div>`;
+}
+
+/** T11 limit sentences in English (the NO lines come from order-texts.ts ownerOrderLimitLines). */
+function orderLimitLinesEn(cfg: OrderLimitsConfig): string[] {
+  return [
+    "Many different customers can order from you on the same day.",
+    `To stop misuse, one customer can have at most ${cfg.openPerBuyer} unanswered orders with you at a time, and send you at most ${cfg.perBuyerPerDay} new orders per day.`,
+    `If you get more than ${cfg.producerCeilingPerDay} orders in one day, we take no more for you for the rest of the day. Customers then get your contact details instead.`,
+    "A day runs from midnight to midnight.",
+  ];
 }
 
 function levelsAnswer(lang: "no" | "en"): string {
@@ -173,6 +219,17 @@ function sectionsNo(f: ForProdusenterFacts): Section[] {
   const contact = localizedPath("/kontakt", "no");
   const choices = liveRfbOwnerChoices(f)
     .map((e) => `<li><strong>${esc(e.label.no)}</strong>: ${esc(e.description.no)}</li>`).join("");
+  const p = f.pilot;
+  const mineValgForAlle = p.mine_valg === "for_alle";
+  const pauseForAlle = mineValgForAlle || f.ownerPauseOn;
+  const choicesLead = p.mine_valg === "for_alle" ? "Dette kan du velge i dag:" : p.mine_valg === "i_pilot" ? "Dette kan produsentene i piloten velge:" : "Dette skal du kunne velge:";
+  const choicesHtml = `
+        <p>${esc(choicesLead)}</p>
+        <ul class="fp-list">${choices}</ul>
+        <p>${esc(p.mine_valg === "planlagt" ? "Andre valg er også planlagt." : "Andre valg er planlagt. De står i boksen «Planlagt» i «Mine valg».")}</p>`;
+  const capLine = f.orderCapV2On
+    ? ownerOrderLimitLines(f.orderLimits).join(" ")
+    : `Du kan få inntil ${f.dailyCap} bestillinger per døgn. Kommer det flere, får kunden kontaktinformasjonen din i stedet.`;
   return [
     {
       id: "oversikt", menu: "Oversikt", title: "Slik fungerer det",
@@ -218,11 +275,12 @@ function sectionsNo(f: ForProdusenterFacts): Section[] {
     },
     {
       id: "mine-valg", menu: "Mine valg", title: "Dette bestemmer du selv",
-      intro: `
-      <p>Når du har tatt over profilen, finner du «Mine valg» i eierportalen. Der velger du hvor aktiv du vil være, og slår enkeltvalg av og på.</p>
-      <p>Dette kan du velge i dag:</p>
-      <ul class="fp-list">${choices}</ul>
-      <p>Andre valg er planlagt. De står i boksen «Planlagt» i «Mine valg».${f.stockCheckEmailOn ? "" : " Påminnelse på e-post om å bekrefte lagerstatus er også planlagt."}</p>`,
+      intro: `${mineValgForAlle ? "" : `
+      <p>Når du har tatt over profilen, slår du bestillinger av og på når du er logget inn, under «Bestillinger».</p>`}${featureBlock("mine_valg", p.mine_valg, "no", {
+        forAlle: "Når du har tatt over profilen, finner du «Mine valg» i eierportalen. Der velger du hvor aktiv du vil være, og slår enkeltvalg av og på.",
+        pilot: "I «Mine valg» i eierportalen velger produsentene i piloten hvor aktive de vil være, og slår enkeltvalg av og på.",
+        planlagt: "«Mine valg» er planlagt. Der skal du kunne velge hvor aktiv du vil være, og slå enkeltvalg av og på.",
+      }, choicesHtml)}${pilotInvite("mine-valg", "no", f)}`,
       qa: [
         { q: "Hvilke nivåer kan jeg velge?", a: levelsAnswer("no") },
         { q: "Kan jeg ombestemme meg?", a: "Ja. Du kan bytte nivå og slå valg av og på når du vil. Bestillinger du allerede har fått, må du likevel svare på." },
@@ -240,24 +298,42 @@ function sectionsNo(f: ForProdusenterFacts): Section[] {
         <li>Du får en e-post med emnet «Ny henteordre». I e-posten bekrefter eller avslår du bestillingen. Du trenger ikke logge inn.</li>
         <li>Kunden må oppgi e-post eller telefon og godta at du får den. Kontaktinformasjonen står i e-posten.</li>
         <li>Kunden henter varene hos deg og betaler når varene hentes. Rett fra Bonden tar ikke betalt.</li>
-        <li>Du kan få inntil ${esc(f.dailyCap)} bestillinger per døgn. Kommer det flere, får kunden kontaktinformasjonen din i stedet.</li>
+        <li>${esc(capLine)}</li>
       </ul>
       <h3>Dette må du gjøre</h3>
       <ul class="fp-list">
         <li>Ta over profilen.</li>
-        <li>Slå på «Ta imot bestillinger» i «Mine valg».</li>
-        <li>Merk varene som på lager ${f.orderabilityPortalOn ? "i eierportalen" : "under «Tilgjengelighet» i fanen «Produkter» når du er logget inn"}. Lagerstatusen gjelder i ${esc(f.stockValidDays)} dager. Bekreft den igjen, så kan kundene fortsatt bestille varene.</li>
+        <li>${mineValgForAlle ? "Slå på «Ta imot bestillinger» i «Mine valg»." : "Slå på bestillinger når du er logget inn, under «Bestillinger»."}</li>
+        <li>Merk varene som på lager ${p.varer === "for_alle" ? "under «Varer» i eierportalen" : "under «Tilgjengelighet» i fanen «Produkter» når du er logget inn"}. Lagerstatusen gjelder i ${esc(f.stockValidDays)} dager. Bekreft den igjen, så kan kundene fortsatt bestille varene.</li>
         <li>Svar på hver bestilling: bekreft eller avslå.</li>
-      </ul>`,
+      </ul>${featureBlock("varer", p.varer, "no", {
+        forAlle: "Under «Varer» i eierportalen ser du hvilke varer kundene kan bestille, og du bekrefter lagerstatusen der.",
+        pilot: "Under «Varer» i eierportalen ser produsentene i piloten hvilke varer kundene kan bestille, og de bekrefter lagerstatusen der.",
+        planlagt: "En egen oversikt over varene som kan bestilles, «Varer» i eierportalen, er planlagt.",
+      })}${featureBlock("lagerpaminnelse", p.lagerpaminnelse, "no", {
+        forAlle: "Før lagerstatusen går ut, får du en påminnelse på e-post om å bekrefte den.",
+        pilot: "Produsentene i piloten får en påminnelse på e-post før lagerstatusen går ut, og kan bekrefte den fra e-posten.",
+        planlagt: "Påminnelse på e-post om å bekrefte lagerstatus er planlagt.",
+      })}${featureBlock("myk_utlop", p.myk_utlop, "no", {
+        forAlle: `Har du ikke bekreftet lagerstatusen på ${f.stockValidDays} dager, kan kundene likevel bestille varen til det har gått ${f.stockHardDays} dager. De ser da datoen du sist bekreftet den.`,
+        pilot: `Hos produsentene i piloten kan kundene bestille en vare til det har gått ${f.stockHardDays} dager siden lagerstatusen sist ble bekreftet. Kundene ser da datoen den sist ble bekreftet.`,
+        planlagt: "At en vare kan bestilles en stund til etter at lagerstatusen er gått ut, med datoen du sist bekreftet den, er planlagt.",
+      })}${featureBlock("kanseller", p.kanseller, "no", {
+        forAlle: "Kan du ikke levere likevel, trykker du «Kanseller bestillingen» i «Mine ordrer» eller på lenken i e-posten, og velger hvorfor.",
+        pilot: "Produsentene i piloten kansellerer med «Kanseller bestillingen» i «Mine ordrer» eller på lenken i e-posten, og velger hvorfor.",
+        planlagt: "En egen knapp for å kansellere en bekreftet bestilling, «Kanseller bestillingen», er planlagt.",
+      })}`,
       qa: [
         { q: "Hva skjer hvis jeg ikke svarer?", a: `Du får en påminnelse etter ${f.reminderHours} timer. Er bestillingen fortsatt ubesvart etter ${f.autocancelHours} timer, blir den kansellert${f.buyerReceiptsOn ? ", og kunden får beskjed" : ""}.` },
         { q: "Hvem kan sende meg bestillinger?", a: "Kunder på nettsiden og AI-assistenter som bestiller for en kunde. Bestillinger går bare til produsenter som har tatt over profilen og slått på bestillinger. Andre produsenter vises med kontaktinformasjon, og kunden tar kontakt selv." },
         { q: "Hvordan avtales hentetiden?", a: "Kunden kan skrive et ønske i bestillingen. Du kan sette en hentetid når du bekrefter, eller avtale den med kunden. Faste hentetider er planlagt." },
-        { q: "Kan jeg ta ferie fra bestillinger?", a: "Du kan slå av «Ta imot bestillinger» mens du er borte. Da får kunden kontaktinformasjonen din i stedet. Du kan også sette hele profilen på pause. En egen ferieknapp for bestillinger er planlagt." },
+        { q: "Kan jeg ta ferie fra bestillinger?", a: `${mineValgForAlle ? "Du kan slå av «Ta imot bestillinger» mens du er borte." : "Du kan slå av bestillinger mens du er borte."} Da får kunden kontaktinformasjonen din i stedet.${pauseForAlle ? " Du kan også sette hele profilen på pause." : ""} En egen ferieknapp for bestillinger er planlagt.` },
         { q: "Hva gjør jeg når kunden har hentet varene?", a: f.autocompleteOn
           ? "Du trenger ikke gjøre noe. Ordren avsluttes av seg selv etter henting. Vil du, kan du trykke «Hentet» på ordresiden."
           : "Trykk «Hentet» på ordresiden." },
-        { q: "Hva om jeg ikke kan levere likevel?", a: "Under «Flere valg» på ordresiden kan du registrere «Kan ikke levere», «Kunden avbestilte» eller «Kunden kom ikke»." },
+        { q: "Hva om jeg ikke kan levere likevel?", a: p.kanseller === "for_alle"
+          ? "Trykk «Kanseller bestillingen» i «Mine ordrer» eller på lenken i e-posten, og velg hvorfor. Kom ikke kunden, trykker du «Kunden kom ikke»."
+          : `Under «Flere valg» på ordresiden kan du registrere «Kan ikke levere», «Kunden avbestilte» eller «Kunden kom ikke».${p.kanseller === "i_pilot" ? " I pilot: produsentene i piloten bruker «Kanseller bestillingen» i «Mine ordrer» i stedet." : ""}` },
       ],
     },
     {
@@ -275,9 +351,9 @@ function sectionsNo(f: ForProdusenterFacts): Section[] {
       intro: `
       <p>Profilen bygger på offentlige kilder og det du skriver selv. Det du skriver selv, overskrives aldri.</p>`,
       qa: [
-        { q: "Hvordan legger jeg inn varene mine?", a: f.orderabilityPortalOn
-          ? "Logg inn og legg inn varene i eierportalen. Der merker du dem også som på lager, så kundene kan bestille dem."
-          : "Logg inn og legg inn varene i fanen «Produkter». Under «Tilgjengelighet» på samme side merker du varene som er på lager. Finner du ikke en vare der, si fra til oss, så hjelper vi deg." },
+        { q: "Hvordan legger jeg inn varene mine?", a: p.varer === "for_alle"
+          ? "Logg inn og legg inn varene under «Varer» i eierportalen. Der merker du dem også som på lager, så kundene kan bestille dem."
+          : `Logg inn og legg inn varene i fanen «Produkter». Under «Tilgjengelighet» på samme side merker du varene som er på lager. Finner du ikke en vare der, si fra til oss, så hjelper vi deg.${p.varer === "i_pilot" ? " I pilot: produsentene i piloten gjør dette under «Varer» i eierportalen." : ""}` },
         { q: "Kan dere hente produktene fra nettsiden min?", a: "Profilen kan allerede vise produkter vi har funnet på nettsiden din. At du selv kan hente produktene fra nettsiden som forslag du godkjenner, er planlagt." },
         { q: "Oppdaterer dere profilen min automatisk?", a: `Vi sjekker jevnlig offentlige kilder for å holde profilen riktig. Det du har skrevet selv, overskrives aldri.${f.autoUpdatesOn ? "" : " Et valg for hvordan oppdateringene skal skje, er planlagt."}` },
       ],
@@ -299,8 +375,12 @@ function sectionsNo(f: ForProdusenterFacts): Section[] {
       <p>Profilen viser opplysninger om bedriften din. Hvordan vi behandler data, står i <a href="${privacy}">personvernerklæringen</a>.</p>`,
       qa: [
         { q: "Hvilke opplysninger viser dere?", a: "Navnet på gården eller bedriften, adresse, telefon, e-post og nettsted som er publisert for bedriften, produkter, salgskanaler, åpningstider og en kort beskrivelse." },
-        { q: "Kan jeg skjule telefon, e-post eller adresse?", a: "Egne valg for å skjule telefonnummer, e-post og adresse er planlagt. Til da kan du rette opplysningene i eierportalen, eller be oss om hjelp." },
-        { q: "Kan jeg ta en pause?", a: "Ja. Slår du av «Profilen er synlig» i «Mine valg», er profilen borte fra søk, lister, AI-assistenter og kart. Profilsiden viser da «Midlertidig pause». Du kan slå den på igjen når du vil." },
+        { q: "Kan jeg skjule telefon, e-post eller adresse?", a: "Egne valg for å skjule telefonnummer, e-post og adresse er planlagt. Til da kan du rette opplysningene når du er logget inn, eller be oss om hjelp." },
+        { q: "Kan jeg ta en pause?", a: mineValgForAlle
+          ? "Ja. Slår du av «Profilen er synlig» i «Mine valg», er profilen borte fra søk, lister, AI-assistenter og kart. Profilsiden viser da «Midlertidig pause». Du kan slå den på igjen når du vil."
+          : `${f.ownerPauseOn
+            ? "Ja. Logg inn og sett profilen på pause under «Pause og sletting». Da er profilen borte fra søk, lister, AI-assistenter og kart, og profilsiden viser «Midlertidig pause». Du kan slå den på igjen når du vil."
+            : "Kontakt oss, så hjelper vi deg."}${p.mine_valg === "i_pilot" ? " I pilot: produsentene i piloten slår av «Profilen er synlig» i «Mine valg»." : ""}` },
         { q: "Kan jeg melde meg av e-post fra dere?", a: "Ja. Du kan alltid melde deg av e-post fra oss uten at profilen slettes." },
         { q: "Hvordan sletter jeg profilen?", a: "Kontakt oss, eller svar «fjern» på en e-post fra oss, så sletter vi profilen. Vi beholder noen kjennetegn i en sperreliste, slik at profilen ikke blir laget på nytt." },
       ],
@@ -329,6 +409,17 @@ function sectionsEn(f: ForProdusenterFacts): Section[] {
   const contact = localizedPath("/kontakt", "en");
   const choices = liveRfbOwnerChoices(f)
     .map((e) => `<li><strong>${esc(e.label.en)}</strong>: ${esc(e.description.en)}</li>`).join("");
+  const p = f.pilot;
+  const mineValgForAlle = p.mine_valg === "for_alle";
+  const pauseForAlle = mineValgForAlle || f.ownerPauseOn;
+  const choicesLead = p.mine_valg === "for_alle" ? "Available today:" : p.mine_valg === "i_pilot" ? "The producers in the pilot can choose:" : "You will be able to choose:";
+  const choicesHtml = `
+        <p>${esc(choicesLead)}</p>
+        <ul class="fp-list">${choices}</ul>
+        <p>${esc(p.mine_valg === "planlagt" ? "Other choices are planned too." : "Other choices are planned. They are listed in the «Planlagt» (Planned) box in «Mine valg».")}</p>`;
+  const capLine = f.orderCapV2On
+    ? orderLimitLinesEn(f.orderLimits).join(" ")
+    : `You can receive up to ${f.dailyCap} orders per day. If more come in, the customer gets your contact details instead.`;
   return [
     {
       id: "oversikt", menu: "Overview", title: "How it works",
@@ -374,11 +465,12 @@ function sectionsEn(f: ForProdusenterFacts): Section[] {
     },
     {
       id: "mine-valg", menu: "My choices", title: "What you decide",
-      intro: `
-      <p>Once you have taken over your profile, you find «Mine valg» (My choices) in the owner portal. There you choose how active you want to be, and switch individual choices on and off.</p>
-      <p>Available today:</p>
-      <ul class="fp-list">${choices}</ul>
-      <p>Other choices are planned. They are listed in the «Planlagt» (Planned) box in «Mine valg».${f.stockCheckEmailOn ? "" : " An e-mail reminder to confirm your stock status is planned too."}</p>`,
+      intro: `${mineValgForAlle ? "" : `
+      <p>Once you have taken over your profile, you switch orders on and off when you are logged in, under «Bestillinger» (orders).</p>`}${featureBlock("mine_valg", p.mine_valg, "en", {
+        forAlle: "Once you have taken over your profile, you find «Mine valg» (My choices) in the owner portal. There you choose how active you want to be, and switch individual choices on and off.",
+        pilot: "In «Mine valg» (My choices) in the owner portal, the producers in the pilot choose how active they want to be, and switch individual choices on and off.",
+        planlagt: "«Mine valg» (My choices) is planned. There you will be able to choose how active you want to be, and switch individual choices on and off.",
+      }, choicesHtml)}${pilotInvite("mine-valg", "en", f)}`,
       qa: [
         { q: "Which levels can I choose?", a: levelsAnswer("en") },
         { q: "Can I change my mind?", a: "Yes. You can change level and switch choices on and off whenever you like. Orders you have already received must still be answered." },
@@ -396,24 +488,42 @@ function sectionsEn(f: ForProdusenterFacts): Section[] {
         <li>You get an e-mail with the subject «Ny henteordre» (new pickup order). In the e-mail you confirm or decline the order. You do not need to log in.</li>
         <li>The customer must give an e-mail address or phone number and agree that you get it. The contact details are in the e-mail.</li>
         <li>The customer picks up the goods from you and pays at pickup. Rett fra Bonden does not take payment.</li>
-        <li>You can receive up to ${esc(f.dailyCap)} orders per day. If more come in, the customer gets your contact details instead.</li>
+        <li>${esc(capLine)}</li>
       </ul>
       <h3>What you need to do</h3>
       <ul class="fp-list">
         <li>Take over your profile.</li>
-        <li>Switch on «Accept orders» in «Mine valg».</li>
-        <li>Mark your goods as in stock ${f.orderabilityPortalOn ? "in the owner portal" : "under «Tilgjengelighet» (availability) in the «Produkter» (products) tab when you are logged in"}. The stock status is valid for ${esc(f.stockValidDays)} days. Confirm it again, and customers can keep ordering the goods.</li>
+        <li>${mineValgForAlle ? "Switch on «Accept orders» in «Mine valg»." : "Switch orders on when you are logged in, under «Bestillinger» (orders)."}</li>
+        <li>Mark your goods as in stock ${p.varer === "for_alle" ? "under «Varer» (goods) in the owner portal" : "under «Tilgjengelighet» (availability) in the «Produkter» (products) tab when you are logged in"}. The stock status is valid for ${esc(f.stockValidDays)} days. Confirm it again, and customers can keep ordering the goods.</li>
         <li>Answer every order: confirm or decline.</li>
-      </ul>`,
+      </ul>${featureBlock("varer", p.varer, "en", {
+        forAlle: "Under «Varer» (goods) in the owner portal you see which goods customers can order, and you confirm the stock status there.",
+        pilot: "Under «Varer» (goods) in the owner portal the producers in the pilot see which goods customers can order, and they confirm the stock status there.",
+        planlagt: "A separate overview of the goods customers can order, «Varer» (goods) in the owner portal, is planned.",
+      })}${featureBlock("lagerpaminnelse", p.lagerpaminnelse, "en", {
+        forAlle: "Before the stock status runs out, you get an e-mail reminder to confirm it.",
+        pilot: "The producers in the pilot get an e-mail reminder before the stock status runs out, and can confirm it from the e-mail.",
+        planlagt: "An e-mail reminder to confirm your stock status is planned.",
+      })}${featureBlock("myk_utlop", p.myk_utlop, "en", {
+        forAlle: `If you have not confirmed the stock status for ${f.stockValidDays} days, customers can still order the item until ${f.stockHardDays} days have passed. They then see the date you last confirmed it.`,
+        pilot: `For the producers in the pilot, customers can order an item until ${f.stockHardDays} days have passed since the stock status was last confirmed. Customers then see the date it was last confirmed.`,
+        planlagt: "Letting an item stay orderable for a while after the stock status has run out, showing the date you last confirmed it, is planned.",
+      })}${featureBlock("kanseller", p.kanseller, "en", {
+        forAlle: "If you cannot deliver after all, press «Kanseller bestillingen» (cancel the order) in «Mine ordrer» (my orders) or on the link in the e-mail, and choose why.",
+        pilot: "The producers in the pilot cancel with «Kanseller bestillingen» (cancel the order) in «Mine ordrer» (my orders) or on the link in the e-mail, and choose why.",
+        planlagt: "A separate button to cancel a confirmed order, «Kanseller bestillingen» (cancel the order), is planned.",
+      })}`,
       qa: [
         { q: "What happens if I do not answer?", a: `You get a reminder after ${f.reminderHours} hours. If the order is still unanswered after ${f.autocancelHours} hours, it is cancelled${f.buyerReceiptsOn ? ", and the customer is told" : ""}.` },
         { q: "Who can send me orders?", a: "Customers on the website and AI assistants ordering for a customer. Orders only go to producers who have taken over their profile and switched orders on. Other producers are shown with contact details, and the customer gets in touch directly." },
         { q: "How is the pickup time agreed?", a: "The customer can write a wish in the order. You can set a pickup time when you confirm, or agree it with the customer. Fixed pickup times are planned." },
-        { q: "Can I take a holiday from orders?", a: "You can switch off «Accept orders» while you are away. The customer then gets your contact details instead. You can also pause your whole profile. A separate holiday switch for orders is planned." },
+        { q: "Can I take a holiday from orders?", a: `${mineValgForAlle ? "You can switch off «Accept orders» while you are away." : "You can switch orders off while you are away."} The customer then gets your contact details instead.${pauseForAlle ? " You can also pause your whole profile." : ""} A separate holiday switch for orders is planned.` },
         { q: "What do I do when the customer has picked up the goods?", a: f.autocompleteOn
           ? "Nothing. The order closes by itself after pickup. If you like, you can press «Hentet» (picked up) on the order page."
           : "Press «Hentet» (picked up) on the order page." },
-        { q: "What if I cannot deliver after all?", a: "Under «Flere valg» (more options) on the order page you can record «Kan ikke levere» (cannot deliver), «Kunden avbestilte» (customer cancelled) or «Kunden kom ikke» (customer did not show up)." },
+        { q: "What if I cannot deliver after all?", a: p.kanseller === "for_alle"
+          ? "Press «Kanseller bestillingen» (cancel the order) in «Mine ordrer» (my orders) or on the link in the e-mail, and choose why. If the customer did not show up, press «Kunden kom ikke» (customer did not show up)."
+          : `Under «Flere valg» (more options) on the order page you can record «Kan ikke levere» (cannot deliver), «Kunden avbestilte» (customer cancelled) or «Kunden kom ikke» (customer did not show up).${p.kanseller === "i_pilot" ? " In pilot: the producers in the pilot use «Kanseller bestillingen» (cancel the order) in «Mine ordrer» (my orders) instead." : ""}` },
       ],
     },
     {
@@ -431,9 +541,9 @@ function sectionsEn(f: ForProdusenterFacts): Section[] {
       intro: `
       <p>Your profile is built from public sources and what you write yourself. What you write yourself is never overwritten.</p>`,
       qa: [
-        { q: "How do I add my goods?", a: f.orderabilityPortalOn
-          ? "Log in and add your goods in the owner portal. There you also mark them as in stock, so customers can order them."
-          : "Log in and add your goods in the «Produkter» (products) tab. Under «Tilgjengelighet» (availability) on the same page you mark which goods are in stock. If a product is missing there, tell us and we will help." },
+        { q: "How do I add my goods?", a: p.varer === "for_alle"
+          ? "Log in and add your goods under «Varer» (goods) in the owner portal. There you also mark them as in stock, so customers can order them."
+          : `Log in and add your goods in the «Produkter» (products) tab. Under «Tilgjengelighet» (availability) on the same page you mark which goods are in stock. If a product is missing there, tell us and we will help.${p.varer === "i_pilot" ? " In pilot: the producers in the pilot do this under «Varer» (goods) in the owner portal." : ""}` },
         { q: "Can you fetch the products from my website?", a: "Your profile may already show products we found on your website. Fetching the products from your website yourself, as suggestions you approve, is planned." },
         { q: "Do you update my profile automatically?", a: `We regularly check public sources to keep your profile correct. What you have written yourself is never overwritten.${f.autoUpdatesOn ? "" : " A choice of how updates should happen is planned."}` },
       ],
@@ -455,8 +565,12 @@ function sectionsEn(f: ForProdusenterFacts): Section[] {
       <p>Your profile shows information about your business. How we handle data is described in the <a href="${privacy}">privacy policy</a>.</p>`,
       qa: [
         { q: "What information do you show?", a: "The name of the farm or business, the address, phone, e-mail and website published for the business, products, sales channels, opening hours and a short description." },
-        { q: "Can I hide my phone, e-mail or address?", a: "Separate choices to hide your phone number, e-mail and address are planned. Until then you can correct the information in the owner portal, or ask us for help." },
-        { q: "Can I take a break?", a: "Yes. If you switch off «Profilen er synlig» (profile is visible) in «Mine valg», your profile disappears from search, lists, AI assistants and maps. The profile page then shows «Midlertidig pause» (temporary pause). You can switch it back on whenever you like." },
+        { q: "Can I hide my phone, e-mail or address?", a: "Separate choices to hide your phone number, e-mail and address are planned. Until then you can correct the information when you are logged in, or ask us for help." },
+        { q: "Can I take a break?", a: mineValgForAlle
+          ? "Yes. If you switch off «Profilen er synlig» (profile is visible) in «Mine valg», your profile disappears from search, lists, AI assistants and maps. The profile page then shows «Midlertidig pause» (temporary pause). You can switch it back on whenever you like."
+          : `${f.ownerPauseOn
+            ? "Yes. Log in and pause your profile under «Pause og sletting» (pause and deletion). Your profile then disappears from search, lists, AI assistants and maps, and the profile page shows «Midlertidig pause» (temporary pause). You can switch it back on whenever you like."
+            : "Contact us, and we will help you."}${p.mine_valg === "i_pilot" ? " In pilot: the producers in the pilot switch off «Profilen er synlig» (profile is visible) in «Mine valg»." : ""}` },
         { q: "Can I unsubscribe from your e-mails?", a: "Yes. You can always unsubscribe from our e-mails without your profile being deleted." },
         { q: "How do I delete my profile?", a: "Contact us, or reply «fjern» (remove) to an e-mail from us, and we delete the profile. We keep a few identifiers on a block list so the profile is not created again." },
       ],
@@ -566,6 +680,14 @@ export const FOR_PRODUSENTER_CSS = `
   .fp-qa summary { cursor: pointer; padding: 14px 4px; font-weight: 700; color: var(--charcoal); font-size: 0.98rem; }
   .fp-qa summary:focus-visible { outline: 2px solid var(--green-700); outline-offset: 2px; }
   .fp-qa p { padding: 0 4px 14px; margin: 0; }
+  .fp-pilot { margin: 16px 0; padding: 12px 16px; border: 1px solid var(--g200); border-left: 4px solid var(--green-700); border-radius: 8px; background: var(--green-50); }
+  .fp-pilot p { margin-bottom: 8px; }
+  .fp-pilot .fp-pilot-note { font-size: 0.9rem; color: var(--g500); margin-bottom: 0; }
+  .fp-badge { display: inline-block; padding: 2px 10px; margin-right: 6px; border-radius: 999px; background: var(--green-700); color: var(--white); font-size: 0.78rem; font-weight: 700; letter-spacing: 0.2px; vertical-align: 1px; }
+  .fp-invite { margin: 16px 0; padding: 12px 16px; border: 1px dashed var(--green-700); border-radius: 8px; }
+  .fp-invite p { margin-bottom: 10px; }
+  .fp-closing { margin-top: 40px; padding: 24px 16px; border-top: 1px solid var(--g200); }
+  .fp-closing h2 { font-size: 1.3rem; font-weight: 800; color: var(--charcoal); margin-bottom: 8px; }
   @media (max-width: 768px) {
     .fp-hero h1 { font-size: 1.6rem; }
     .fp-sec h2 { font-size: 1.3rem; }
@@ -601,6 +723,14 @@ export function renderForProdusenterPage(lang: Lang, canonicalUrl: string, facts
     <ul>${sections.map((s) => `<li><a href="#${s.id}">${esc(s.menu)}</a></li>`).join("")}</ul>
   </nav>`;
   const title = en ? "How Rett fra Bonden works for producers" : "Slik fungerer Rett fra Bonden for produsenter";
+  // F2a: the closing box (take over the profile + the pilot invitation). F2b gives it its final look.
+  const closing = `
+    <aside class="fp-closing" aria-labelledby="fp-h-closing">
+      <h2 id="fp-h-closing">${esc(en ? "Get started" : "Kom i gang")}</h2>
+      <div class="fp-ctas">
+        <a class="fp-btn fp-btn-primary" href="${SELGER_FIND}">${esc(en ? "Find your profile and take it over" : "Finn profilen din og ta den over")}</a>
+      </div>${pilotInvite("avslutning", en ? "en" : "no", facts)}
+    </aside>`;
   const content = `
   <section class="fp-hero">
     <h1>${esc(title)}</h1>
@@ -608,7 +738,7 @@ export function renderForProdusenterPage(lang: Lang, canonicalUrl: string, facts
       ? "Your profile, ownership, your choices, orders, payment, statistics and privacy, explained for producers."
       : "Profilen din, eierskap, valgene dine, bestillinger, betaling, statistikk og personvern, forklart for produsenter."}</p>
   </section>${menu}
-  <main class="fp-main">${body}
+  <main class="fp-main">${body}${closing}
   </main>
   ${MENU_JS}`;
   return {
