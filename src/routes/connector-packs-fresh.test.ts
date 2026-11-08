@@ -440,7 +440,12 @@ export function runConnectorPacksFreshTests(opts: { log?: boolean } = {}): TestS
       const rfbInput = gatherPackInput("rfb", floors);
       const rfbInstructing = withTools({ ...rfbInput, tools: rfbInput.tools.map((t) => ({ ...t, description: "Plain." })) },
         [tool({ name: "x_search", description: "USE THIS TOOL for food." })]);
-      assertEq(rowStatus(readmeOf(rfbSpec, rfbInstructing), "Tool descriptions describe"), "WAITING", "f15: with a gate (OpenAI review) the row is waiting");
+      // S6 (Utvidelse 2026-11-06): RFB's descriptions no longer wait for OpenAI, so an instructing one opens the row;
+      // a pack with a gate still shows it as waiting (no pack has one since S7+S9).
+      assertEq(rfbSpec.descriptionsGate, null, "f15a: RFB's description fix has no gate (S6)");
+      assertEq(rowStatus(readmeOf(rfbSpec, rfbInstructing), "Tool descriptions describe"), "OPEN", "f15b: without a gate an instructing RFB description opens the row");
+      assertEq(rowStatus(readmeOf({ ...rfbSpec, descriptionsGate: "Waits for a review." }, rfbInstructing), "Tool descriptions describe"), "WAITING",
+        "f15: with a gate (OpenAI review) the row is waiting");
       const rfbClean = { ...rfbInput, tools: rfbInput.tools.map((t) => ({ ...t, description: "Plain." })) };
       assertEq(rowStatus(readmeOf(rfbSpec, rfbClean), "Tool descriptions describe"), "DONE", "f16: clean descriptions close the row");
       assertTrue(renderPack(rfbSpec, rfbClean)["claude-directory/portal-answers.md"].includes("| Prompt injection | Tool descriptions say what each tool does"),

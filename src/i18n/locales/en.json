@@ -13,7 +13,7 @@
     "back_home": "Back to the front page"
   },
   "footer": {
-    "tagline": "Norway's first agent-to-agent (A2A) network for local food. We make food producers visible to AI assistants — so customers find you when they ask.",
+    "tagline": "Norway's first agent-to-agent (A2A) network for local food. We make food producers visible to AI assistants — so customers can find you when they ask.",
     "platform": "Platform",
     "search_producers": "Search producers",
     "how_it_works": "How it works",
@@ -92,7 +92,7 @@
     "title": "About Rett fra Bonden — Local food in Norway",
     "description": "Rett fra Bonden is Norway's first agent-to-agent network for local food. Read about our mission, how the platform works, and who we are.",
     "page_title": "About Rett fra Bonden",
-    "intro": "Rett fra Bonden is a platform that makes Norwegian food producers visible to AI assistants — so customers find you when they ask their AI for local food.",
+    "intro": "Rett fra Bonden is a platform that makes Norwegian food producers visible to AI assistants — so customers can find you when they ask their AI for local food.",
     "mission_title": "Our mission",
     "mission_body": "We want more people to buy food directly from Norwegian farms, markets and local producers. As AI assistants become the main entry point for information, local food must be visible there too.",
     "story_title": "The story",
@@ -170,6 +170,7 @@
     "rating_count_on_source": "{count} reviews on {source}",
     "rating_count_on_source_one": "{count} review on {source}",
     "products_prices_fetched": "Prices fetched from {host} on {date}",
+    "products_auto_updated": "Updated automatically from {host} on {date}",
     "products_confirmed_by_owner": "confirmed by owner",
     "products_updated_by_owner": "Updated by owner on {date}",
     "products_price_caveat": "Prices may have changed, check with the producer.",

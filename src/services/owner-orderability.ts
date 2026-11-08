@@ -279,6 +279,7 @@ export function orderabilityReasonTextNb(r: OrderabilityReason): string {
     case "owner_not_verified": return "Eierskapet er ikke bekreftet";
     case "order_email_missing": return "Mangler e-postadresse for bestillinger";
     case "order_email_suppressed": return "E-postadressen for bestillinger kan ikke motta e-post fra oss";
+    case "profile_not_checked": return "Rett fra Bonden har ikke kontrollert profilen ennå. Kontakt kontakt@rettfrabonden.com";
     case "producer_not_eligible": return "Profilen kan ikke ta imot bestillinger ennå. Kontakt kontakt@rettfrabonden.com";
   }
 }

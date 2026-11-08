@@ -198,8 +198,8 @@
     },
     "rfb GET /a2a": {
       "{}": {
-        "sha256": "2e68f4be373a54f7b86a137f2fb87cd175189ecfecc43e71692885f6ee1449e4",
-        "chars": 3870
+        "sha256": "b7582c77eb78c879ab8059c68d84e41bbc4b8b91d06c26bacf5b38c62cf40148",
+        "chars": 3956
       }
     },
     "oa GET /a2a": {

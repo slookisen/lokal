@@ -17,6 +17,11 @@
  *              suite that runs default → on → off → on again per case), and
  *              no case names a key that is not a live registry entry or a
  *              surface the entry does not declare (stale case), no duplicates.
+ *   levels     (rule 5, T8 of dev-request 2026-10-30-rfb-eierportal-testrunde-1)
+ *              OWNER_LEVELS names only live registry keys and never a key
+ *              a level must not set (OWNER_LEVEL_FORBIDDEN_KEYS /
+ *              _PREFIXES, and any consent entry); «Minst mulig» equals the
+ *              owner default; no two levels have the same preset.
  *   self-check the checkers run on a small synthetic registry + source fixture
  *              (missing EN label, live key without reader, unknown featureOn
  *              key, live surface without matrix case, stale matrix case) and
@@ -76,6 +81,7 @@ import {
   type OwnerFeatureEntry,
 } from "./registry";
 import { OWNER_FEATURE_MATRIX_CASES, matrixCaseId, type OwnerFeatureMatrixCase } from "./owner-feature-matrix.test";
+import { OWNER_LEVELS, OWNER_LEVEL_DEFAULT_KEY, type OwnerLevel } from "./changes";
 
 export interface TestSummary {
   passed: number;
@@ -375,6 +381,74 @@ export function checkMatrixCoverage(
   return problems;
 }
 
+/** Rule 5: keys a level never sets (the owner decides them alone, or they are not level material). */
+export const OWNER_LEVEL_FORBIDDEN_KEYS: readonly string[] = [
+  "orders.email",
+  "comms.news",
+  "comms.featured",
+  "comms.beta",
+  "stats.share_partner",
+  "auto.photos",
+  "orders.auto_confirm",
+  "orders.daily_cap",
+  "orders.pause",
+];
+export const OWNER_LEVEL_FORBIDDEN_PREFIXES: readonly string[] = ["visibility.", "contact.", "payments."];
+
+/**
+ * Rule 5 (T8): the level presets. Every preset key is a live registry entry
+ * and not forbidden (OWNER_LEVEL_FORBIDDEN_KEYS / _PREFIXES, or `consent`);
+ * the default level («Minst mulig») sets only owner-default values and
+ * exists; no two levels have the same preset.
+ */
+export function checkLevelPresets(
+  levels: readonly Pick<OwnerLevel, "key" | "values">[],
+  registry: readonly OwnerFeatureEntry[],
+  defaultKey: string = OWNER_LEVEL_DEFAULT_KEY,
+): string[] {
+  const problems: string[] = [];
+  const byKey = new Map(registry.map((e) => [e.key, e] as const));
+  for (const l of levels) {
+    for (const [key, value] of l.values) {
+      const e = byKey.get(key);
+      if (OWNER_LEVEL_FORBIDDEN_KEYS.includes(key) || OWNER_LEVEL_FORBIDDEN_PREFIXES.some((p) => key.startsWith(p)) || e?.consent) {
+        problems.push(`${l.key}: ${key} must never be in a level`);
+      }
+      if (!e) problems.push(`${l.key}: ${key} is not in the registry`);
+      else if (e.status !== "live") problems.push(`${l.key}: ${key} is ${e.status}, not live`);
+      if (l.key === defaultKey && e && JSON.stringify(value) !== JSON.stringify(e.default.owner)) {
+        problems.push(`${l.key}: ${key}=${JSON.stringify(value)} deviates from the owner default ${JSON.stringify(e.default.owner)}`);
+      }
+    }
+  }
+  if (!levels.some((l) => l.key === defaultKey)) problems.push(`${defaultKey}: the default level is missing`);
+  const sig = (l: Pick<OwnerLevel, "values">) => JSON.stringify([...l.values].map(([k, v]) => [k, v ?? null]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))));
+  for (let i = 0; i < levels.length; i++) {
+    for (let j = i + 1; j < levels.length; j++) {
+      if (sig(levels[i]) === sig(levels[j])) problems.push(`${levels[i].key} = ${levels[j].key}: the two levels do not differ`);
+    }
+  }
+  return problems;
+}
+
+/**
+ * T10 (orderGateReady): a level that switches a real-order key ON must meet
+ * the real-order gate first, and that check may only stop switching ON.
+ * Every live switch with the `order_gate` surface has `enableRequires`
+ * orderGateReady; orderGateReady never stands in `requires` (that would show
+ * an owner who already has orders on as off).
+ */
+export function checkOrderGateRequirement(registry: readonly OwnerFeatureEntry[]): string[] {
+  const problems: string[] = [];
+  for (const e of registry) {
+    if ((e.requires as readonly string[]).includes("orderGateReady")) problems.push(`${e.key}: orderGateReady must be an enableRequires, never requires`);
+    if (e.status === "live" && e.type === "switch" && e.surfaces.includes("order_gate") && e.storage && !(e.enableRequires ?? []).includes("orderGateReady")) {
+      problems.push(`${e.key}: a live order_gate switch without enableRequires orderGateReady`);
+    }
+  }
+  return problems;
+}
+
 export async function runRegistryGovernanceS4Tests(opts: { log?: boolean } = {}): Promise<TestSummary> {
   const log = opts.log ?? false;
   let passed = 0;
@@ -464,6 +538,40 @@ export async function runRegistryGovernanceS4Tests(opts: { log?: boolean } = {})
     assertTrue(!matrixFx.some((p) => p.startsWith("fx.mx_soon ×") && p.includes("no matrix case")), "self-check: a coming_soon entry needs no matrix case", matrixFx);
     assertTrue(matrixFx.length === 5, "self-check: exactly the five matrix problems are reported", matrixFx);
 
+    // Rule 5 self-check: each mutant of the real presets must be reported.
+    const lv = (key: string, values: Array<[string, unknown]>) => ({ key, values } as unknown as Pick<OwnerLevel, "key" | "values">);
+    const real = OWNER_LEVELS.map((l) => lv(l.key, [...l.values]));
+    const lv5 = (levels: Array<Pick<OwnerLevel, "key" | "values">>) => checkLevelPresets(levels, OWNER_FEATURE_REGISTRY);
+    assertTrue(lv5(real).length === 0, "self-check: the real presets pass rule 5 unmutated", lv5(real));
+    for (const forbidden of ["comms.news", "visibility.profile", "orders.email", "orders.auto_confirm", "orders.daily_cap", "orders.pause", "comms.featured", "stats.share_partner", "auto.photos", "comms.beta", "contact.phone"]) {
+      const mut = real.map((l, i) => (i === 1 ? lv(l.key, [...l.values, [forbidden, true]]) : l));
+      const out = lv5(mut);
+      assertTrue(out.some((p) => p.includes(`${forbidden} must never be in a level`)), `self-check: rule 5 reports forbidden key ${forbidden} in a level`, out);
+    }
+    const payFx = checkLevelPresets([lv("minst_mulig", [["orders.enabled", false]]), lv("x", [["payments.fx", true]])],
+      [...OWNER_FEATURE_REGISTRY, fx({ key: "payments.fx", status: "live" })]);
+    assertTrue(payFx.some((p) => p.includes("payments.fx must never be in a level")), "self-check: rule 5 reports a payments.* key", payFx);
+    const consentFx = checkLevelPresets([lv("minst_mulig", [["orders.enabled", false]]), lv("x", [["fx.consent", true]])],
+      [...OWNER_FEATURE_REGISTRY, fx({ key: "fx.consent", status: "live", consent: true })]);
+    assertTrue(consentFx.some((p) => p.includes("fx.consent must never be in a level")), "self-check: rule 5 reports any consent entry", consentFx);
+    const devMut = lv5([lv("minst_mulig", [["orders.enabled", true]]), real[1]]);
+    assertTrue(devMut.some((p) => p.startsWith("minst_mulig: orders.enabled=true deviates from the owner default")), "self-check: rule 5 reports a «Minst mulig» that deviates from the owner default", devMut);
+    const devMut2 = lv5([lv("minst_mulig", [["orders.enabled", false], ["products.stock_check", false]]), real[1]]);
+    assertTrue(devMut2.some((p) => p.startsWith("minst_mulig: products.stock_check=false deviates")), "self-check: rule 5 reports an extra non-default key in «Minst mulig»", devMut2);
+    const sameMut = lv5([real[0], lv("utnytte_mulighetene", [...real[0].values])]);
+    assertTrue(sameMut.some((p) => p.includes("the two levels do not differ")), "self-check: rule 5 reports two levels that do not differ", sameMut);
+    const sameOrder = lv5([lv("minst_mulig", [["orders.enabled", false]]), lv("a", [["orders.enabled", true], ["products.stock_check", true]]), lv("b", [["products.stock_check", true], ["orders.enabled", true]])]);
+    assertTrue(sameOrder.some((p) => p === "a = b: the two levels do not differ"), "self-check: rule 5 compares presets regardless of key order", sameOrder);
+    const notLive = lv5([real[0], lv("utnytte_mulighetene", [["orders.enabled", true], ["orders.auto_confirm_x", true]])]);
+    assertTrue(notLive.some((p) => p.includes("orders.auto_confirm_x is not in the registry")), "self-check: rule 5 reports a key outside the registry", notLive);
+    const soon = OWNER_FEATURE_REGISTRY.find((e) => e.status === "coming_soon" && !e.consent && !OWNER_LEVEL_FORBIDDEN_KEYS.includes(e.key) && !OWNER_LEVEL_FORBIDDEN_PREFIXES.some((p) => e.key.startsWith(p)));
+    if (soon) {
+      const soonMut = lv5([real[0], lv("utnytte_mulighetene", [...real[1].values, [soon.key, true]])]);
+      assertTrue(soonMut.some((p) => p === `utnytte_mulighetene: ${soon.key} is coming_soon, not live`), "self-check: rule 5 reports a coming_soon key in a level", soonMut);
+    }
+    const noDefault = lv5([real[1]]);
+    assertTrue(noDefault.some((p) => p.includes("the default level is missing")), "self-check: rule 5 reports a missing «Minst mulig»", noDefault);
+
     // ── Rule 1: registry shape.
     const shape = checkEntryShape(OWNER_FEATURE_REGISTRY, keys, groups);
     assertTrue(OWNER_FEATURE_REGISTRY.length > 0, "registry is not empty");
@@ -489,6 +597,19 @@ export async function runRegistryGovernanceS4Tests(opts: { log?: boolean } = {})
     const liveSurfaces = live.reduce((n, e) => n + e.surfaces.length, 0);
     const matrix = checkMatrixCoverage(OWNER_FEATURE_REGISTRY, OWNER_FEATURE_MATRIX_CASES);
     assertTrue(matrix.length === 0, `rule 4: every live surface (${liveSurfaces}) has a matrix case, no stale case (${OWNER_FEATURE_MATRIX_CASES.length} cases)`, matrix);
+
+    // ── Rule 5 (T8): the RFB level presets.
+    assertTrue(JSON.stringify(OWNER_LEVELS.map((l) => l.key)) === JSON.stringify(["minst_mulig", "utnytte_mulighetene"]),
+      "rule 5: OWNER_LEVELS is exactly «minst_mulig», «utnytte_mulighetene»", OWNER_LEVELS.map((l) => l.key));
+    const levelProblems = checkLevelPresets(OWNER_LEVELS, OWNER_FEATURE_REGISTRY);
+    assertTrue(levelProblems.length === 0, `rule 5: the ${OWNER_LEVELS.length} levels use only live, allowed keys; «Minst mulig» = owner default; the levels differ`, levelProblems);
+    // T10: orderGateReady on orders.enabled, only as enableRequires.
+    const gateProblems = checkOrderGateRequirement(OWNER_FEATURE_REGISTRY);
+    assertTrue(gateProblems.length === 0, "rule 5 (T10): orders.enabled needs orderGateReady to switch on, and orderGateReady is never a `requires`", gateProblems);
+    const gateMut = checkOrderGateRequirement(OWNER_FEATURE_REGISTRY.map((e) => (e.key === "orders.enabled" ? { ...e, enableRequires: [] } : e)));
+    assertTrue(gateMut.some((p) => p.startsWith("orders.enabled: a live order_gate switch without")), "self-check (T10): orders.enabled without orderGateReady is reported", gateMut);
+    const gateMut2 = checkOrderGateRequirement(OWNER_FEATURE_REGISTRY.map((e) => (e.key === "orders.enabled" ? { ...e, requires: [...e.requires, "orderGateReady" as const] } : e)));
+    assertTrue(gateMut2.some((p) => p === "orders.enabled: orderGateReady must be an enableRequires, never requires"), "self-check (T10): orderGateReady as `requires` is reported", gateMut2);
 
     // ── Gårdssalg (O1a): rules 1–3 over the gårdssalg registry. ─────────────
     const gsKeys = GARDSSALG_OWNER_FEATURE_KEYS as readonly string[];

@@ -47,6 +47,7 @@ export type OwnerAuditValueKind =
   | "email"       // an e-mail address: the row is shown without its values
   | "bool"        // 1/0, true/false → «Ja» / «Nei»
   | "visible"     // visibility.profile (the pause card): on → «Ja», off… → «Nei»
+  | "syncmode"    // product_sync_mode as logged ('weekly' / 'off') → «Ja» / «Nei»
   | "time"        // a timestamp → Norwegian date and time (Europe/Oslo)
   | "hours"       // opening hours: the owner's text, or structured hours as one line
   | "categories"  // a JSON list of category keys → the public category names
@@ -92,6 +93,8 @@ export const OWNER_AUDIT_FIELDS: Readonly<Record<string, OwnerAuditField>> = {
   "visibility.profile": { label: "Profilen er synlig", kind: "visible" },
   order_notifications_opt_in: { label: "Ta imot bestillinger", kind: "bool" },
   order_notification_email: { label: "Bestillinger sendes til", kind: "email" },
+  // Skive 4-2c: the «Mine valg» switch products.weekly_sync (field name = its registry key; label from the registry entry).
+  "products.weekly_sync": { label: "Hold produktene oppdatert fra nettsiden", kind: "syncmode" },
   // New short names.
   description: { label: "Kort beskrivelse", kind: "prose" },
   categories: { label: "Kategorier", kind: "categories" },
@@ -360,6 +363,12 @@ export function formatOwnerAuditValue(kind: OwnerAuditValueKind, raw: unknown): 
       const v = s.toLowerCase();
       if (v === "1" || v === "true") return OWNER_AUDIT_YES;
       if (v === "0" || v === "false") return OWNER_AUDIT_NO;
+      return shortText(s);
+    }
+    case "syncmode": {
+      const v = s.toLowerCase();
+      if (v === "weekly") return OWNER_AUDIT_YES;
+      if (v === "off") return OWNER_AUDIT_NO;
       return shortText(s);
     }
     case "visible": {

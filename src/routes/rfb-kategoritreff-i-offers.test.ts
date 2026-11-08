@@ -29,6 +29,7 @@
  */
 
 import Database from "better-sqlite3";
+import { stripAiUtm } from "../../tests/helpers/ai-utm";
 import * as vm from "node:vm";
 import { __setDbForTesting, __initSchemaForTesting, __peekDbForTesting } from "../database/init";
 import { __setGeocodingFetchForTesting, __clearGeocodeCacheForTesting } from "../services/geocoding-service";
@@ -326,7 +327,8 @@ export async function runRfbKategoritreffIOffersTests(opts: { log?: boolean } = 
       db.prepare("DELETE FROM profile_ai_deliveries").run();
       const r = await tools.get("lokal_find_offers")!({ items: ["honning", "egg"], near: "Trondheim" },
         { sessionId: "i-s2-find-offers", requestInfo: { headers: { "user-agent": "claude-ai/1.0" } } });
-      const parsed = JSON.parse(String(r?.content?.[0]?.text ?? "null"));
+      // klikk-fra-ai-svar S3: lokal_find_offers tags profile_url for AI; the rest is findOffers' JSON.
+      const parsed = stripAiUtm(JSON.parse(String(r?.content?.[0]?.text ?? "null")));
       assertEq(parsed, [searches.honningT, searches.eggT], "lokal_find_offers: one findOffers result per item, category matches included");
       deliveries.flushAiDeliveries(db as any);
       const counted = (db.prepare("SELECT profile_id FROM profile_ai_deliveries WHERE vertical_id = 'rfb' AND channel = 'mcp' ORDER BY profile_id").all() as any[])

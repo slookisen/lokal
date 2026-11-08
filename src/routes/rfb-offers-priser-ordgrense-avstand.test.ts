@@ -35,6 +35,7 @@
  */
 
 import Database from "better-sqlite3";
+import { stripAiUtm } from "../../tests/helpers/ai-utm";
 import * as vm from "node:vm";
 import { __setDbForTesting, __initSchemaForTesting, __peekDbForTesting } from "../database/init";
 import { __setGeocodingFetchForTesting, __clearGeocodeCacheForTesting } from "../services/geocoding-service";
@@ -437,10 +438,11 @@ export async function runRfbOffersPriserOrdgrenseAvstandTests(opts: { log?: bool
       const jord = await callRoute(catalogRouter, "GET", "/offers?q=jordskokk&near=Oslo&radius_km=50&limit=5");
       assertEq(jord.body, searches.jordskokkO, "GET /catalog/offers «jordskokk» near Oslo: distance_km null and distance_label for the centroid");
       const r = await tools.get("lokal_find_offers")!({ items: ["egg", "jordskokk"], near: "Bergen" });
-      const viaTool = JSON.parse(textOf(r));
+      // klikk-fra-ai-svar S3: lokal_find_offers tags profile_url for AI; the rest is findOffers' JSON.
+      const viaTool = stripAiUtm(JSON.parse(textOf(r)));
       assertEq(viaTool[0], searches.eggB, "lokal_find_offers «egg» near Bergen: the same offers, no «Pålegg»");
       const o = await tools.get("lokal_find_offers")!({ items: ["jordskokk", "poteter"], lat: O.lat, lng: O.lng });
-      const parsed = JSON.parse(textOf(o));
+      const parsed = stripAiUtm(JSON.parse(textOf(o)));
       assertEq(parsed[0], searches.jordskokkO, "lokal_find_offers «jordskokk»: the result JSON carries distance_label");
       assertTrue(/"distance_km": null,\n\s+"distance_label": "i Ski-området"/.test(textOf(o)),
         "lokal_find_offers: Reppe Søndre reads «distance_km: null, distance_label: i Ski-området» in the tool text");

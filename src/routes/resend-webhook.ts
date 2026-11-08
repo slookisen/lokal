@@ -1,7 +1,8 @@
 // ─── POST /webhooks/resend (owner decision 2026-09-29 «Blacklist bounces») ─
 // Resend → Svix → here. Automatic intake of hard bounces + spam complaints
 // into email_bounces (outreach suppression only — no agent_blocklist row,
-// owner decision «1B»); all logic lives in
+// owner decision «1B») and of email.delivered into email_delivery_events
+// (delivery evidence only, 2026-11-06); all logic lives in
 // services/resend-webhook.ts (see its header for the full contract).
 //
 // Auth is the Svix signature, NOT X-Admin-Key: Resend carries no admin key.

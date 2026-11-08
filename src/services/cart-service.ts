@@ -28,7 +28,11 @@ import { isBlocked } from "./blocklist-service";
 import { isCategoryLabel } from "../utils/category-label";
 import { classifyCartItemBan, banErrorText, BAN_CHECK_FAILED_ERROR, type BannedItemKind } from "./cart-item-ban";
 import { summarizePricing } from "./order-pricing";
-import { isOrderCapNoticeEnabled, orderCapHandoffFields, recordOrderCapEvent, type OrderCapReason } from "./order-cap-notice";
+import {
+  claimOrderCapAdminAlert, isOrderCapNoticeEnabled, isOrderCapV2Enabled, orderCapHandoffFields, orderCapHandoffFieldsV2,
+  orderCapReasonForDetail, osloDayStartUtc, recordOrderCapEvent, ORDER_CAP_CEILING_PREWARN_AT,
+  type OrderCapDetail, type OrderCapReason,
+} from "./order-cap-notice";
 
 // ─── Test-DB override (module-local, race-proof) ─────────────────────────────
 // In production _cartTestDb is always null → getDb() is used as normal.
@@ -425,6 +429,7 @@ export type OrderabilityReasonCode =
   | "owner_not_verified"      // agents.is_verified != 1
   | "order_email_missing"     // no order / contact e-mail
   | "order_email_suppressed"  // the recipient e-mail is blocklisted
+  | "profile_not_checked"     // T10 (orderReadiness only): no verified internal cross-check (agent_knowledge), or second-line only
   | "producer_not_eligible";  // any other isEligibleForRealOrder() «no» (cross-check, umbrella, inactive, read error)
 
 export interface OrderabilityReason {
@@ -472,8 +477,13 @@ export interface ProducerOrderability {
   reasons: OrderabilityReason[];
 }
 
-/** Explains a «no» from isEligibleForRealOrder(); never decides it. Never throws. */
-function explainNotEligible(db: any, agentId: string): OrderabilityReason[] {
+/**
+ * Explains a «no» from isEligibleForRealOrder(); never decides it. Never throws.
+ * `assumeOrdersOn` (T10, orderReadiness): explains the gate as it would answer
+ * with orders switched on — no orders_off, and the cross-check named
+ * (profile_not_checked) instead of the generic reason. Default: as before.
+ */
+function explainNotEligible(db: any, agentId: string, assumeOrdersOn = false): OrderabilityReason[] {
   const out: OrderabilityReason[] = [];
   const profile = (code: OrderabilityReasonCode) => out.push({ code, level: "profile" });
   try {
@@ -483,11 +493,19 @@ function explainNotEligible(db: any, agentId: string): OrderabilityReason[] {
       FROM agents a WHERE a.id = ?
     `).get(agentId) as { is_verified: number | null; opt_in: number | null; override_email: string | null; contact_email: string | null } | undefined;
     if (row) {
-      if (row.opt_in !== 1) profile("orders_off");
+      if (row.opt_in !== 1 && !assumeOrdersOn) profile("orders_off");
       if (row.is_verified !== 1) profile("owner_not_verified");
       const email = (row.override_email || "").trim() || (row.contact_email || "").trim();
       if (!email) profile("order_email_missing");
       else if (isBlocked({ email }).blocked) profile("order_email_suppressed");
+      if (assumeOrdersOn) {
+        const checked = db.prepare(`
+          SELECT 1 FROM agent_knowledge k
+          WHERE k.agent_id = ? AND k.verification_status = 'verified'
+            AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
+        `).get(agentId);
+        if (!checked) profile("profile_not_checked");
+      }
     }
   } catch { /* fall through to the generic reason */ }
   if (out.length === 0) profile("producer_not_eligible");
@@ -507,6 +525,70 @@ export function producerOrderability(db: any, agentId: string, explain = true): 
     eligible = false;
   }
   return { eligible, reasons: eligible || !explain ? [] : explainNotEligible(db, agentId) };
+}
+
+/**
+ * T10 (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 3): what the
+ * level preview needs before a level may switch orders on. No new rule:
+ *   ready            isEligibleForRealOrder() itself, as it answers with
+ *                    agents.order_notifications_opt_in = 1 — when the column
+ *                    is off it is set to 1 inside a transaction that is
+ *                    always rolled back, so `ready` is true if and only if
+ *                    the real gate would be true with orders on. A gate that
+ *                    cannot be evaluated counts as «no».
+ *   missing          explainNotEligible() for that answer (never orders_off);
+ *                    [] when ready; never empty when not ready.
+ *   orderable_if_on  product rows that pass every product check of
+ *                    isRowOrderableForRealOrder() (the profile check taken as
+ *                    passed) — «Du har 0 varer som kan bestilles» is a soft
+ *                    warning, not a requirement.
+ */
+export interface OrderReadiness {
+  ready: boolean;
+  missing: OrderabilityReason[];
+  orderable_if_on: number;
+}
+
+class ReadinessRollback extends Error {
+  constructor(readonly ready: boolean) { super("order readiness rollback"); }
+}
+
+function eligibleWithOrdersOn(db: any, agentId: string): boolean {
+  const row = db.prepare(`SELECT order_notifications_opt_in AS opt_in FROM agents WHERE id = ?`).get(agentId) as { opt_in: number | null } | undefined;
+  if (!row) return false;
+  if (row.opt_in === 1) return isEligibleForRealOrder(agentId, db);
+  try {
+    db.transaction(() => {
+      db.prepare(`UPDATE agents SET order_notifications_opt_in = 1 WHERE id = ?`).run(agentId);
+      throw new ReadinessRollback(isEligibleForRealOrder(agentId, db));
+    })();
+  } catch (e) {
+    if (e instanceof ReadinessRollback) return e.ready;
+    throw e;
+  }
+  return false;
+}
+
+export function orderReadiness(db: any, agentId: string, now: Date = new Date()): OrderReadiness {
+  let ready = false;
+  try { ready = eligibleWithOrdersOn(db, agentId); } catch { ready = false; }
+  let missing: OrderabilityReason[] = [];
+  if (!ready) {
+    missing = explainNotEligible(db, agentId, true);
+    if (missing.length === 0) missing = [{ code: "producer_not_eligible", level: "profile" }];
+  }
+  let orderable = 0;
+  try {
+    const rows = db
+      .prepare(
+        `SELECT agent_id, name, description, category, price_nok, availability, availability_updated_at, availability_source
+           FROM products WHERE agent_id = ?`,
+      )
+      .all(agentId) as OrderabilityRow[];
+    const passed: ProducerOrderability = { eligible: true, reasons: [] };
+    orderable = rows.filter((r) => evaluateOrderability(db, r, now, true, passed).length === 0).length;
+  } catch { orderable = 0; }
+  return { ready, missing, orderable_if_on: orderable };
 }
 
 /**
@@ -1173,7 +1255,8 @@ export interface ContactHandoff {
    * (order-cap-notice.ts orderCapBuyerNotice, Norwegian).
    */
   cap_reached?: true;
-  cap_reason?: OrderCapReason;
+  /** T11 (ORDER_CAP_V2_ENABLED): additive values 'platform_ceiling' | 'buyer_daily_cap'. */
+  cap_reason?: OrderCapReason | OrderCapDetail;
   cap?: number;
   cap_notice?: string;
 }
@@ -1293,6 +1376,93 @@ function orderCapReached(db: any, agentId: string, contact?: SubmitContactInput)
     return null;
   } catch {
     // A cap that cannot be read must not block a real buyer.
+    return null;
+  }
+}
+
+// ─── T11: order caps v2 (ORDER_CAP_V2_ENABLED) ───────────────────────────────
+// dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 5. The producer-wide
+// 10/day cap is gone (many different buyers may order the same day). Per buyer
+// per producer: ORDER_CAP_OPEN_PENDING_PER_BUYER (3) open unanswered and
+// ORDER_CAP_NEW_PER_BUYER_PER_DAY (10) new per Oslo day. Per producer: the
+// platform ceiling ORDER_CAP_PRODUCER_CEILING_PER_DAY (50) new per Oslo day,
+// all statuses. A day runs midnight to midnight Europe/Oslo. No limit per IP
+// or AI assistant (shared outgoing addresses).
+export function orderCapNewPerBuyerPerDay(): number { return envPositiveInt("ORDER_CAP_NEW_PER_BUYER_PER_DAY", 10); }
+/** Read only with ORDER_CAP_V2_ENABLED on. */
+export function orderCapProducerCeilingPerDay(): number { return envPositiveInt("ORDER_CAP_PRODUCER_CEILING_PER_DAY", 50); }
+
+/**
+ * The buyer's e-mail as the caps compare it: trimmed, lower case, without a
+ * «+tag» in the local part (« Ola+x@Example.no » → «ola@example.no»). "" = none.
+ */
+export function normalizeBuyerEmailForCap(raw: string | null | undefined): string {
+  const e = String(raw ?? "").trim().toLowerCase();
+  if (!e) return "";
+  const at = e.lastIndexOf("@");
+  if (at <= 0) return e;
+  const local = e.slice(0, at).split("+")[0]!;
+  return `${local || e.slice(0, at)}@${e.slice(at + 1)}`;
+}
+
+/**
+ * The buyer's phone as the caps compare it: digits only, without the
+ * Norwegian country code (+47 / 0047 / 47 before 8 digits):
+ * «+47 900 00 000» and «90000000» are the same buyer. "" = none.
+ */
+export function normalizeBuyerPhoneForCap(raw: string | null | undefined): string {
+  const s = String(raw ?? "").trim();
+  let d = s.replace(/\D+/g, "");
+  if (s.startsWith("+") && d.startsWith("47")) d = d.slice(2);
+  else if (d.startsWith("0047")) d = d.slice(4);
+  else if (d.length === 10 && d.startsWith("47")) d = d.slice(2);
+  return d;
+}
+
+export type OrderCapV2Hit = { reason: OrderCapReason; detail: OrderCapDetail; cap: number; todayCount: number };
+
+/**
+ * Which v2 cap (if any) turns this producer's order into a handoff. The
+ * buyer is recognised by e-mail OR phone (both normalised, both checked: a
+ * new e-mail with the same phone is the same buyer). Order: the platform
+ * ceiling (the day is full for everyone), then the buyer's open orders, then
+ * the buyer's new orders today. `now` is injectable for the tests. A read
+ * error never blocks the buyer (null).
+ */
+export function orderCapReachedV2(db: any, agentId: string, contact?: SubmitContactInput, now: Date = new Date()): OrderCapV2Hit | null {
+  try {
+    const dayStart = osloDayStartUtc(now);
+    const rows = db.prepare(
+      "SELECT buyer_email, buyer_phone, status, created_at FROM orders WHERE agent_id = ? AND (status = 'pending' OR created_at >= ?)"
+    ).all(agentId, dayStart) as Array<{ buyer_email: string | null; buyer_phone: string | null; status: string; created_at: string }>;
+    const today = rows.filter((r) => String(r.created_at) >= dayStart);
+    const ceiling = orderCapProducerCeilingPerDay();
+    if (today.length >= ceiling) return { reason: orderCapReasonForDetail("platform_ceiling"), detail: "platform_ceiling", cap: ceiling, todayCount: today.length };
+    const email = normalizeBuyerEmailForCap(contact?.buyer_email);
+    const phone = normalizeBuyerPhoneForCap(contact?.buyer_phone);
+    if (!email && !phone) return null;
+    const sameBuyer = (r: { buyer_email: string | null; buyer_phone: string | null }) =>
+      (!!email && normalizeBuyerEmailForCap(r.buyer_email) === email) || (!!phone && normalizeBuyerPhoneForCap(r.buyer_phone) === phone);
+    const openCap = orderCapOpenPerBuyer();
+    if (rows.filter((r) => r.status === "pending" && sameBuyer(r)).length >= openCap) {
+      return { reason: orderCapReasonForDetail("buyer_open_cap"), detail: "buyer_open_cap", cap: openCap, todayCount: today.length };
+    }
+    const perBuyer = orderCapNewPerBuyerPerDay();
+    if (today.filter(sameBuyer).length >= perBuyer) {
+      return { reason: orderCapReasonForDetail("buyer_daily_cap"), detail: "buyer_daily_cap", cap: perBuyer, todayCount: today.length };
+    }
+    return null;
+  } catch {
+    // A cap that cannot be read must not block a real buyer.
+    return null;
+  }
+}
+
+/** New orders for the producer since Oslo midnight (all statuses); null on a read error. */
+function ordersTodayForProducer(db: any, agentId: string, now: Date): number | null {
+  try {
+    return (db.prepare("SELECT COUNT(*) AS n FROM orders WHERE agent_id = ? AND created_at >= ?").get(agentId, osloDayStartUtc(now)) as { n: number }).n;
+  } catch {
     return null;
   }
 }
@@ -1497,9 +1667,13 @@ export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: 
   // B4: the cap and its reason are kept per producer — recorded for the
   // producer's daily digest and admin count, and (ORDER_CAP_NOTICE_ENABLED)
   // told to the buyer on the handoff.
-  const cappedAgents = new Map<string, { reason: OrderCapReason; cap: number }>();
+  // T11: ORDER_CAP_V2_ENABLED swaps the rule (per buyer + platform ceiling);
+  // off, orderCapReached() exactly as before.
+  const capV2On = isOrderCapV2Enabled();
+  const capNow = new Date();
+  const cappedAgents = new Map<string, { reason: OrderCapReason; cap: number; detail?: OrderCapDetail }>();
   for (const agent_id of Array.from(eligibleAgentIds)) {
-    const capHit = orderCapReached(db, agent_id, contact);
+    const capHit = capV2On ? orderCapReachedV2(db, agent_id, contact, capNow) : orderCapReached(db, agent_id, contact);
     if (capHit) {
       eligibleAgentIds.delete(agent_id);
       ineligibleAgentIds.add(agent_id);
@@ -1729,13 +1903,30 @@ export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: 
   // B4: every cap hit is counted (no buyer data); the buyer is told only
   // with ORDER_CAP_NOTICE_ENABLED on — off, the response is unchanged.
   for (const [agent_id, hit] of cappedAgents) {
-    recordOrderCapEvent({ agent_id, cart_id: cartId, reason: hit.reason, cap: hit.cap }, db);
+    if (hit.detail) recordOrderCapEvent({ agent_id, cart_id: cartId, reason: hit.reason, cap: hit.cap, reason_detail: hit.detail }, db);
+    else recordOrderCapEvent({ agent_id, cart_id: cartId, reason: hit.reason, cap: hit.cap }, db);
+  }
+  // T11: the admin's internal alerts (never a producer or buyer e-mail), at
+  // most one per producer per Oslo day per kind: at the ceiling, and the
+  // pre-warning once a producer reaches ORDER_CAP_CEILING_PREWARN_AT today.
+  if (capV2On) {
+    const ceiling = orderCapProducerCeilingPerDay();
+    for (const [agent_id, hit] of cappedAgents) {
+      if (hit.detail === "platform_ceiling") claimOrderCapAdminAlert({ agent_id, kind: "ceiling", count: ceiling, cap: ceiling, now: capNow }, db);
+    }
+    if (ORDER_CAP_CEILING_PREWARN_AT < ceiling) {
+      for (const agent_id of new Set(orderSummaries.map((o) => o.agent_id))) {
+        const n = ordersTodayForProducer(db, agent_id, capNow);
+        if (n !== null && n >= ORDER_CAP_CEILING_PREWARN_AT) claimOrderCapAdminAlert({ agent_id, kind: "prewarn", count: n, cap: ceiling, now: capNow }, db);
+      }
+    }
   }
   const capNoticeOn = isOrderCapNoticeEnabled();
   const contact_handoffs: ContactHandoff[] = Array.from(handoffByAgent.entries()).map(([agent_id, v]) => {
     const h = buildContactHandoff(agent_id, v.name, v.lines);
     const hit = cappedAgents.get(agent_id);
-    return capNoticeOn && hit ? { ...h, ...orderCapHandoffFields(hit.reason, hit.cap) } : h;
+    if (!capNoticeOn || !hit) return h;
+    return hit.detail ? { ...h, ...orderCapHandoffFieldsV2(hit.detail, hit.cap) } : { ...h, ...orderCapHandoffFields(hit.reason, hit.cap) };
   });
 
   const orders = orderSummaries.map((o) => ({ ...o, producer_contact: producerContact(o.agent_id, o.producer_name) }));
@@ -2009,6 +2200,8 @@ export function transitionOrder(
     completionSource?: OrderCompletionSource | null;
     /** Fase A1: set orders.pickup_time in the same write (confirm with a pickup time). */
     pickupTime?: string | null;
+    /** T12: orders.cancel_detail in the same write ('sold_out' | 'cannot_deliver'; cancelled only). */
+    cancelDetail?: string | null;
   }
 ): TransitionResult {
   const db = _cartTestDb ?? getDb();
@@ -2075,6 +2268,7 @@ export function transitionOrder(
     ? (opts?.completionSource ?? (actorRole === "admin" ? "admin" : actorRole === "seller" ? "seller" : actorRole === "buyer" ? "buyer" : null))
     : null;
   const pickupTime = toStatus === "confirmed" ? (opts?.pickupTime ?? null) : null;
+  const cancelDetail = toStatus === "cancelled" ? (opts?.cancelDetail ?? null) : null;
 
   // Concurrency guard: the UPDATE re-asserts the from-status we validated
   // against (id AND status), so two racing transitions (multi-instance, or
@@ -2094,6 +2288,9 @@ export function transitionOrder(
     }
     if (pickupTime) {
       db.prepare("UPDATE orders SET pickup_time = ? WHERE id = ?").run(pickupTime, orderId);
+    }
+    if (cancelDetail) {
+      db.prepare("UPDATE orders SET cancel_detail = ? WHERE id = ?").run(cancelDetail, orderId);
     }
     db.prepare(`
       INSERT INTO order_events (id, order_id, from_status, to_status, actor, actor_role, channel, idempotency_key, created_at)

@@ -50,18 +50,25 @@ import {
   productImportOutcomeTextNb,
   sessionClaimantOwnerEmail,
   verifyOwnerSession,
+  autoSyncStatusHtml,
 } from "./owner-portal";
 import { ownerOrderabilityPortalEnabledFor } from "../services/owner-orderability";
 import {
   getOwnerImportOverview,
   getOwnerImportPreview,
   OWNER_IMPORT_NO_WEBSITE_MESSAGE,
-  productImportEnabled,
+  productImportEnabledFor,
   profileWebsite,
   publishOwnerImport,
   startOwnerFetch,
   type PublishSelection,
 } from "../services/product-import/owner-import";
+import {
+  autoSyncStatusView,
+  enableWeeklySyncFromImport,
+  importPageAutoSyncChoice,
+  type ProductSyncMode,
+} from "../services/product-import/auto-sync";
 
 const router = Router();
 
@@ -77,7 +84,7 @@ type AccessCheck =
   | { ok: false; reason: "flag_off" | "not_logged_in" | "cross_site" | "foreign" | "not_verified"; agentId: string; session: Session | null };
 
 function checkOwnerImportAccess(req: Request, agentId: string, opts: { write: boolean }): AccessCheck {
-  if (!productImportEnabled()) return { ok: false, reason: "flag_off", agentId, session: null };
+  if (!productImportEnabledFor(agentId)) return { ok: false, reason: "flag_off", agentId, session: null };
   const session = verifyOwnerSession(req);
   if (!session.valid) return { ok: false, reason: "not_logged_in", agentId, session };
   if (opts.write && isCrossSiteWrite(req)) return { ok: false, reason: "cross_site", agentId, session };
@@ -433,6 +440,13 @@ export function renderImportPreviewPage(
     variant?: PreviewVariant;
     /** «Velg alle» / «Velg ingen» without JS (GET ?valg=): ticks every / no suggestion. Ignored when `form` is set. */
     valg?: BulkChoice | null;
+    /**
+     * Skive 4a: the «Hold prisene oppdatert automatisk hver uke» box (absent /
+     * null = no box: flag off or not is_verified = 1). `mode` is the stored
+     * value (the box is ticked when 'weekly'); `checked` the submitted tick on
+     * a re-render after a refused publish; `statusHtml` the auto-sync status.
+     */
+    autoSync?: { mode: ProductSyncMode; checked?: boolean; statusHtml?: string } | null;
   } = { claimant: true },
 ): string {
   const id = encodeURIComponent(agentId);
@@ -560,7 +574,7 @@ export function renderImportPreviewPage(
           ${unchanged}
           ${done}
           <p class="ep-audit-meta" data-stock-note="1">Varer du publiserer, vises på profilen din, men kan ikke bestilles før du har bekreftet at de er på lager.</p>
-          ${claimantNote}
+          ${claimantNote}${opts.autoSync ? `\n          ${weeklySyncBoxHtml(opts.autoSync)}` : ""}
           <div class="ep-form-actions">
             <button type="submit" class="ep-btn ep-btn-primary">Publiser valgte</button>
             ${total ? counter("submit") : ""}
@@ -569,6 +583,34 @@ export function renderImportPreviewPage(
         </form>
         ${total ? BULK_SELECT_SCRIPT : ""}
       </div>`;
+}
+
+/** The form field of the weekly-sync box (Skive 4a). */
+export const WEEKLY_SYNC_FIELD = "ukentlig_oppdatering";
+
+/**
+ * The «Hold prisene oppdatert automatisk hver uke» box above «Publiser
+ * valgte» with the short rules of the weekly sync (Skive 4a). Unticked
+ * unless the profile already is 'weekly' (or the owner ticked it before a
+ * refused publish). PURE.
+ */
+export function weeklySyncBoxHtml(a: { mode: ProductSyncMode; checked?: boolean; statusHtml?: string }): string {
+  const checked = a.checked ?? a.mode === "weekly";
+  return `<div class="ep-field" data-weekly-sync-box="${a.mode}">
+            <label><input type="checkbox" name="${WEEKLY_SYNC_FIELD}" value="1"${checked ? " checked" : ""}> <strong>Hold prisene oppdatert automatisk hver uke</strong></label>
+            <ul class="ep-audit-meta" data-weekly-sync-rules="1">
+              <li>Varer du har bekreftet, får ny pris automatisk når prisen endres på nettsiden.</li>
+              <li>Nye varer vi finner, legges ikke inn før du har godkjent dem.</li>
+              <li>Store avvik, for eksempel en pris som endres mye eller mange varer som mangler, stopper oppdateringen.</li>
+            </ul>${a.statusHtml ? `\n            ${a.statusHtml}` : ""}
+          </div>`;
+}
+
+/** The weekly-sync box state for the preview page, or null (no box). Never writes. */
+function autoSyncBoxFor(agentId: string, checked?: boolean): { mode: ProductSyncMode; checked?: boolean; statusHtml?: string } | null {
+  const choice = importPageAutoSyncChoice(agentId);
+  if (!choice) return null;
+  return { mode: choice.mode, checked, statusHtml: autoSyncStatusHtml(autoSyncStatusView(agentId)) };
 }
 
 /** The «Velg alle» / «Velg ingen» choice a GET of the preview page may carry. */
@@ -646,7 +688,7 @@ router.get("/eier/:agentId/produktimport/:runId", (req: Request, res: Response) 
     const claimant = !!sessionClaimantOwnerEmail(auth.agentId, auth.session);
     // ?valg=alle / ?valg=ingen (Skive 3c, «Velg alle» / «Velg ingen» without JS) only changes the ticks; still read-only.
     const valg = parseBulkChoice((req.query as Record<string, unknown> | undefined)?.valg);
-    const html = renderImportPreviewPage(auth.agentId, preview, { claimant, valg });
+    const html = renderImportPreviewPage(auth.agentId, preview, { claimant, valg, autoSync: autoSyncBoxFor(auth.agentId) });
     const headHtml = preview.status === "running" ? `<meta http-equiv="refresh" content="4">` : undefined;
     return res.send(portalShell(pageTitle(), html, { headHtml }));
   } catch (err) {
@@ -698,7 +740,13 @@ router.post("/eier/:agentId/produktimport/:runId/publiser", express.urlencoded({
     if (!preview) return res.status(404).send(PAGE_404());
     const body = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
     const { selection, remove, form } = publishSelectionFromForm(preview, body);
-    const r = publishOwnerImport(auth.agentId, runId, selection, remove, { actorEmail: claimantEmail });
+    // Skive 4a: the box only counts when it was offered (flag on, is_verified
+    // = 1; enableWeeklySyncFromImport checks both again). Unticked → mode unchanged.
+    const weekly = asList(body[WEEKLY_SYNC_FIELD]).includes("1");
+    const r = publishOwnerImport(auth.agentId, runId, selection, remove, {
+      actorEmail: claimantEmail,
+      inTransaction: weekly ? () => { enableWeeklySyncFromImport(auth.agentId, claimantEmail, runId); } : undefined,
+    });
     if (r.ok) {
       return res.redirect(303, importCardBack(
         auth.agentId,
@@ -706,7 +754,9 @@ router.post("/eier/:agentId/produktimport/:runId/publiser", express.urlencoded({
         `&publisert=${r.published.length}&fjernet=${r.removed.length}&avvist=${r.rejected.length}`,
       ));
     }
-    const html = renderImportPreviewPage(auth.agentId, preview, { claimant: true, errorText: r.message, form, fields: r.fields });
+    const html = renderImportPreviewPage(auth.agentId, preview, {
+      claimant: true, errorText: r.message, form, fields: r.fields, autoSync: autoSyncBoxFor(auth.agentId, weekly),
+    });
     return res.status(r.status).send(portalShell(pageTitle(), html));
   } catch (err) {
     console.error("[owner-product-import] POST publiser error:", err instanceof Error ? err.message : "error");

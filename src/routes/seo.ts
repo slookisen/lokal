@@ -22,9 +22,10 @@ import { Router, Request, Response } from "express";
 import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { resolveRouteIntent } from "../services/route-intent";
-import { knowledgeService, productPriceText, parseProductPrice, OWNER_PRODUCT_SOURCES } from "../services/knowledge-service";
+import { productAutoSyncEnabled } from "../services/product-import/auto-sync";
+import { knowledgeService, productPriceText, parseProductPrice, OWNER_PRODUCT_SOURCES, ownerWroteAbout, publicOwnerAboutText } from "../services/knowledge-service";
 import { catalogNameNorm, softStockByNameNorm, stockSoftExpiryBuyerText, type SoftStockFields } from "../services/stock-soft-expiry";
-import { containsOrganicClaim, isOrganicClaimUmbrella } from "../services/organic-claims";
+import { containsOrganicClaim, isOrganicClaimUmbrella, dropOrganicSentences } from "../services/organic-claims";
 import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenFields, hidesAddress, hidesPrices, debioSwitchOffAgentIds } from "../owner-features/enforce";
 import { debioApprovalText, debioProcessText, debioRegisterSyncEnabled, finnokoSearchUrl, readDebioStatusRow } from "../services/debio-approval";
 import { publicCountsShown } from "../services/public-stats-threshold";
@@ -52,14 +53,17 @@ import { isValidLatLng, resolveSearchRadiusKm, formatPlaceLabel } from "../utils
 import { capFreeText } from "../utils/free-text";
 import { getDb } from "../database/init";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
+import { withoutSellerEmailAlways } from "../services/conversation-email-guard";
 import { getTrafficStats, getTrafficStatsSnapshot } from "../services/traffic-stats";
 import { publicTrafficYearBlock, TRAFFIC_YEAR_KEYS, trafficYearCell, trafficYearLangOf, type TrafficYearKey } from "../services/traffic-year-compute";
 import { aiDeliveriesYearPeriodLabel } from "../services/profile-year-compute";
 import { isDisplayablePhone } from "../services/contact-normalizer";
-import { isJunkDescription, stripInternalNotes, normalizeProse } from "../services/description-quality";
+import { isJunkDescription, stripInternalNotes, normalizeProse, organicOwnerGateActive } from "../services/description-quality";
 import { getProfileActivity } from "../services/profile-activity-service";
 import { recordAiPageDelivery } from "../services/profile-ai-deliveries";
 import { recordAiProfileClick } from "../services/profile-ai-clicks";
+import { aiClicksPfStatFor } from "../services/profile-ai-clicks-tile";
+import { aiAttributionClientJs } from "../services/contact-ai-attribution";
 import { searchTrafficClass } from "../services/search-tracking";
 import {
   AI_DELIVERIES_LABEL, AI_DELIVERIES_SUBTITLE, aiDeliveriesCountingSince,
@@ -83,7 +87,7 @@ import {
   SALGSKANAL_CATEGORY_NAMES,
   type SalgskanalCategorySlug,
 } from "../services/salgskanal-matcher";
-import { addUtmParams } from "../utils/url-utm";
+import { addUtmParams, withRequestQuery } from "../utils/url-utm";
 // dev-request 2026-09-24-ai-sok-bli-svaret-rfb, slice B6: /mat/<kategori>/<sted>.
 import {
   isRfbMatLandingEnabled,
@@ -256,9 +260,12 @@ export function applyPublishedTranslations<T extends { id: string; description?:
     const t = map.get(r.id);
     if (!t) continue;
     if (t.description && r.description) r.description = t.description;
-    if (t.about && "about" in r && r.about) r.about = t.about;
+    // Økologi S3c-2: a published translation of an owner-written about loses
+    // its organic sentences as the Norwegian text does (gate off = t.about).
+    const tAbout = t.about ? publicOwnerAboutText(r.id, t.about) : t.about;
+    if (tAbout && "about" in r && r.about) r.about = tAbout;
     const k = knowledgeById?.get(r.id);
-    if (k && t.about && k.about) k.about = t.about;
+    if (k && tAbout && k.about) k.about = tAbout;
   }
   return rows;
 }
@@ -987,8 +994,8 @@ function productDateText(iso: unknown, lang: Lang): string {
 }
 
 /** The products card's date line + price caveat as HTML, or "" when no owner product has a date. */
-export function productDateLineHtml(products: unknown[], lang: Lang): string {
-  let newest: { at: number; iso: string; host: string; confirmed: boolean } | null = null;
+export function productDateLineHtml(products: unknown[], lang: Lang, env: NodeJS.ProcessEnv = process.env): string {
+  let newest: { at: number; iso: string; host: string; confirmed: boolean; auto: boolean } | null = null;
   for (const p of products) {
     if (!p || typeof p !== "object") continue;
     const { source, sourceUrl, fetchedAt, confirmedAt } = p as Record<string, unknown>;
@@ -1003,12 +1010,20 @@ export function productDateLineHtml(products: unknown[], lang: Lang): string {
     const iso = host && typeof fetchedAt === "string" ? fetchedAt : confirmedAt;
     const at = typeof iso === "string" ? Date.parse(iso) : NaN;
     if (!Number.isFinite(at) || (newest && at <= newest.at)) continue;
-    newest = { at, iso: iso as string, host: iso === fetchedAt ? host : "", confirmed: typeof confirmedAt === "string" && !!confirmedAt };
+    newest = {
+      at, iso: iso as string, host: iso === fetchedAt ? host : "", confirmed: typeof confirmedAt === "string" && !!confirmedAt,
+      auto: source === "owner_auto_sync",
+    };
   }
   if (!newest) return "";
   const date = productDateText(newest.iso, lang);
   if (!date) return "";
-  const line = newest.host
+  // Skive 4-2a: the newest price came from the weekly auto-sync → «Oppdatert
+  // automatisk fra <domene> <dato>» (only with PRODUCT_AUTO_SYNC_ENABLED on;
+  // off = exactly the line above).
+  const line = newest.host && newest.auto && productAutoSyncEnabled(env)
+    ? t(lang, "producer.products_auto_updated", { host: newest.host, date })
+    : newest.host
     ? t(lang, "producer.products_prices_fetched", { host: newest.host, date }) +
       (newest.confirmed ? ` \u00b7 ${t(lang, "producer.products_confirmed_by_owner")}` : "")
     : t(lang, "producer.products_updated_by_owner", { date });
@@ -1220,7 +1235,11 @@ function producerCardMediumRich(a: any, knowledge: any, lang: Lang = "no"): stri
 
 function buildConversationShowcase(_lang: Lang = "no"): string {
   try {
-    const convs = conversationService.listConversations({ limit: 3 });
+    // S-A5 (dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting):
+    // the front page is the same for every visitor, so with
+    // EMAIL_REVEAL_GUARD_RFB on the reply preview never shows the seller's ✉️
+    // line (services/conversation-email-guard.ts; no budget spent). Off: as before.
+    const convs = withoutSellerEmailAlways(conversationService.listConversations({ limit: 3 }));
     if (convs.length === 0) return "";
 
     const sourceLabels: Record<string, string> = {
@@ -2339,13 +2358,13 @@ router.get("/om", (req: Request, res: Response) => {
       <div class="om-val">
         <span class="om-val-icon">&#127987;</span>
         <h3>Norway first</h3>
-        <p>Built for Norwegian farms, markets and food traditions. <span translate="no">Oslo</span> first, the rest of the country to follow.</p>
+        <p>Built for Norwegian farms, markets and food traditions.</p>
       </div>
     </div>
 
     <h2>Our vision</h2>
     <p>We believe the future of commerce is about visibility. Whoever gets found, gets the customer. We're building the infrastructure that lets local producers compete on equal terms with the big chains \u2014 in a world where more and more shopping happens through AI.</p>
-    <p>${brand} is a non-profit initiative. The code is open source.</p>
+    <p>Free to join today. Run by AGENTPLATFORM.NO AS. The code is open source.</p>
   </section>` : `
   <section class="om-hero">
     <h1>Maten fortjener \u00e5 bli <em>funnet</em></h1>
@@ -2385,13 +2404,13 @@ router.get("/om", (req: Request, res: Response) => {
       <div class="om-val">
         <span class="om-val-icon">&#127987;</span>
         <h3>Norsk f\u00f8rst</h3>
-        <p>Bygget for norske g\u00e5rder, markeder og mattradisjoner. <span translate="no">Oslo</span> f\u00f8rst, hele landet etter.</p>
+        <p>Bygget for norske g\u00e5rder, markeder og mattradisjoner.</p>
       </div>
     </div>
 
     <h2>Visjonen v\u00e5r</h2>
     <p>Vi tror at fremtidens handel handler om synlighet. Den som blir funnet, f\u00e5r kunden. Vi bygger infrastrukturen som gj\u00f8r at lokale produsenter konkurrerer p\u00e5 like vilk\u00e5r med de store kjedene \u2014 i en verden der stadig flere handler gjennom AI.</p>
-    <p>${brand} er et non-profit initiativ. Koden er \u00e5pen kildekode.</p>
+    <p>Gratis \u00e5 v\u00e6re med i dag. Drevet av AGENTPLATFORM.NO AS. Koden er \u00e5pen kildekode.</p>
   </section>`;
 
   res.send(shell(
@@ -5042,7 +5061,9 @@ export function renderRelatedSection(
   if (!rows.length) return "";
   const items = rows.map((r) => {
     const slug = slugify(r.name);
-    let previewSource = r.description || r.about || "";
+    // Økologi S3c-2: the about preview (only when there is no description)
+    // gets the owner-text read step (gate off = r.about unchanged).
+    let previewSource = r.description || publicOwnerAboutText(r.id, r.about) || "";
     if (previewSource && isJunkDescription(previewSource)) {
       console.log(`[description-guard] suppressed junk description (related-producer preview) for ${r.id} (${r.name})`);
       previewSource = "";
@@ -5664,7 +5685,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           // 301 tells crawlers to update their index — same rationale as
           // the fuzzy-match redirect below, but backed by an exact
           // historical record instead of a similarity guess.
-          return res.redirect(301, `${localizedPath("/produsent/" + canonical, lang)}`);
+          return res.redirect(301, withRequestQuery(localizedPath("/produsent/" + canonical, lang), req.originalUrl));
         }
       }
 
@@ -5679,7 +5700,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         if (canonical && canonical !== slug) {
           // 301 tells crawlers to update their index — preserves SEO juice
           // and teaches Perplexity/ChatGPT/Claude the canonical URL.
-          return res.redirect(301, `${localizedPath("/produsent/" + canonical, lang)}`);
+          return res.redirect(301, withRequestQuery(localizedPath("/produsent/" + canonical, lang), req.originalUrl));
         }
       }
 
@@ -5805,7 +5826,16 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // lede, umbrella "about", LocalBusiness JSON-LD, <meta name="description">)
     // so a junk value never reaches any public output for this page.
     const rawDescription = agent.description || "";
-    const rawAbout = k.about || "";
+    // Økologi S3c (RFB_ORGANIC_CLAIM_GATE + RFB_ORGANIC_OWNER_GATE, both
+    // default off): an OWNER-written about (curated_fields.about.by "owner")
+    // of a producer without a valid Debio status (the badge's signal) loses
+    // every sentence with an organic claim before any about-derived output
+    // (body, JSON-LD, umbrella text) — and so does a published EN/SV
+    // translation of it. Nothing left = empty, so the existing fallbacks
+    // apply. Read-side only; the stored text is unchanged.
+    const ownerOrganicFilter = organicOwnerGateActive() && info?.agent.debioVerified !== true &&
+      ownerWroteAbout(agent.id);
+    const rawAbout = ownerOrganicFilter ? dropOrganicSentences(k.about || "") : (k.about || "");
     // stripInternalNotes: an enrichment routine's own working note appended to
     // real producer prose ("… NB: nettside midlertidig utilgjengelig — kontakt
     // bør bekreftes av verifier.") must not reach a customer, but the prose in
@@ -5825,9 +5855,12 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       ? getPublishedProfileTranslations(getDb(), "rfb", "agent", agent.id, lang)
       : {};
     const displayDescription = (safeDescription && profileTranslations.description) || safeDescription;
-    const displayAbout = (safeAbout && profileTranslations.about) || safeAbout;
+    const aboutTranslation = ownerOrganicFilter && profileTranslations.about
+      ? dropOrganicSentences(profileTranslations.about)
+      : profileTranslations.about;
+    const displayAbout = (safeAbout && aboutTranslation) || safeAbout;
     const descriptionIsNb = lang !== "no" && !!safeDescription && !profileTranslations.description;
-    const aboutIsNb = lang !== "no" && !!safeAbout && !profileTranslations.about;
+    const aboutIsNb = lang !== "no" && !!safeAbout && !aboutTranslation;
     if (rawDescription && !safeDescription) {
       console.log(`[description-guard] suppressed junk agent.description for ${agent.id} (${agent.name}) on /produsent/${slug}`);
     }
@@ -7035,7 +7068,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           ${profileRating ? `<div class="pf-stat"><div class="pf-stat-icon r">&#11088;</div><div><strong>${escapeHtml(profileRating.score)} / 5</strong><small>${escapeHtml(profileRating.attribution)}</small></div></div>` : ""}
           ${!publicCountsOn ? "" : `<div class="pf-stat" data-stat="human" title="${lang === "en" ? "Page views from humans" : "Sidevisninger fra mennesker"}"><div class="pf-stat-icon h">&#127760;</div><div><strong data-fill="human">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? "humans" : "mennesker"}</span></small></div></div>
           <div class="pf-stat" data-stat="ai" title="${lang === "en" ? `Every profile has this statistic. It shows that your information is being found by people searching via ChatGPT, Claude and similar AI services` : `Alle profiler har denne statistikken. Den viser at informasjonen din blir funnet av mennesker som søker via ChatGPT, Claude og lignende AI-tjenester`}"><div class="pf-stat-icon a">&#129302;</div><div><strong data-fill="ai">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? "AI agents" : "AI-agenter"}</span></small></div></div>
-          <div class="pf-stat" data-stat="aiDeliveries" title="${lang === "en" ? `Number of times this profile was among the results an AI assistant such as ChatGPT or Claude fetched for someone who asked (a search, a place, a category, the profile page, MCP or A2A), ${escapeHtml(aiDeliveriesYearPeriodLabel(aiDeliveriesCountingSince(), Date.now(), "en"))}. It does not show how many people saw it.` : `Antall ganger profilen var blant treffene en AI-assistent som ChatGPT eller Claude hentet for noen som spurte (søk, sted, kategori, profilsiden, MCP eller A2A), ${escapeHtml(aiDeliveriesYearPeriodLabel(aiDeliveriesCountingSince(), Date.now(), "nb"))}. Tallet viser ikke hvor mange som så den.`}"><div class="pf-stat-icon a">&#128228;</div><div><strong data-fill="aiDeliveries">0</strong><small>${lang === "en" ? AI_DELIVERIES_LABEL.en : AI_DELIVERIES_LABEL.nb}<br><span class="pf-stat-meta">${lang === "en" ? AI_DELIVERIES_SUBTITLE.en : AI_DELIVERIES_SUBTITLE.nb} &middot; ${escapeHtml(aiDeliveriesYearPeriodLabel(aiDeliveriesCountingSince(), Date.now(), lang === "en" ? "en" : "nb"))}</span></small></div></div>`}
+          <div class="pf-stat" data-stat="aiDeliveries" title="${lang === "en" ? `Number of times this profile was among the results an AI assistant such as ChatGPT or Claude fetched for someone who asked (a search, a place, a category, the profile page, MCP or A2A), ${escapeHtml(aiDeliveriesYearPeriodLabel(aiDeliveriesCountingSince(), Date.now(), "en"))}. It does not show how many people saw it.` : `Antall ganger profilen var blant treffene en AI-assistent som ChatGPT eller Claude hentet for noen som spurte (søk, sted, kategori, profilsiden, MCP eller A2A), ${escapeHtml(aiDeliveriesYearPeriodLabel(aiDeliveriesCountingSince(), Date.now(), "nb"))}. Tallet viser ikke hvor mange som så den.`}"><div class="pf-stat-icon a">&#128228;</div><div><strong data-fill="aiDeliveries">0</strong><small>${lang === "en" ? AI_DELIVERIES_LABEL.en : AI_DELIVERIES_LABEL.nb}<br><span class="pf-stat-meta">${lang === "en" ? AI_DELIVERIES_SUBTITLE.en : AI_DELIVERIES_SUBTITLE.nb} &middot; ${escapeHtml(aiDeliveriesYearPeriodLabel(aiDeliveriesCountingSince(), Date.now(), lang === "en" ? "en" : "nb"))}</span></small></div></div>
+          ${aiClicksPfStatFor(agent.id, lang === "en" ? "en" : "nb")}`}
         </div>
       </div>
 
@@ -7250,13 +7284,18 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           })
           .catch(function () { /* fail-quiet — no UI on error */ });
 
+        // «Klikk fra AI-svar» slice 4: remember this tab's landing (utm_* and
+        // the AI referrer host) and send it with the beacon and the /ut/ links,
+        // since Referrer-Policy: no-referrer hides it from both.
+        ${aiAttributionClientJs()}
+
         document.addEventListener("click", function (e) {
           var link = e.target && e.target.closest ? e.target.closest("a[data-track-kind]") : null;
           if (!link) return;
           var kind = link.getAttribute("data-track-kind");
           if (!kind) return;
           try {
-            var payload = JSON.stringify({ agentId: agentId, kind: kind });
+            var payload = JSON.stringify(aiAttrInto({ agentId: agentId, kind: kind }));
             if (navigator.sendBeacon) {
               navigator.sendBeacon("/api/track/contact-click", new Blob([payload], { type: "application/json" }));
             } else {

@@ -46,7 +46,7 @@ const SAVED_ENV = [
   "OWNER_FEATURES_SWITCH_PROBE_ENABLED", "ADMIN_KEY", "ANALYTICS_ADMIN_KEY", "OWNER_FEATURES_ALLOWED_SUBJECTS",
   "OWNER_FEATURES_ENFORCE", "OWNER_PAUSE_ENABLED", "OWNER_VISIBILITY_ENFORCE_BY_ID", "OWNER_LOCK_ENFORCE_WRITES",
   "OUTREACH_UNSUBSCRIBE_ENABLED", "STOCK_CHECK_EMAIL_ENABLED", "OWNER_ORDERABILITY_PORTAL_ENABLED", "OWNER_ORDER_EMAIL_ENABLED", "RFB_DISABLE_ORDER_FOLLOWUPS", "UNSUBSCRIBE_TOKEN_SECRET",
-  "OWNER_AUTO_UPDATES_ENABLED",
+  "OWNER_AUTO_UPDATES_ENABLED", "PRODUCT_AUTO_SYNC_ENABLED",
 ];
 const KEY = "switch-probe-admin-key-for-tests";
 const FIX = "sp-fixture";
@@ -140,6 +140,8 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
     // Starting state with explicit choices, so the restore has something to put back.
     db.prepare(`INSERT INTO owner_feature_settings (vertical, subject_id, key, value_json, set_by, admin_locked, set_at) VALUES ('rfb', ?, 'comms.news', 'true', 'owner', 0, '2026-10-20T10:00:00.000Z')`).run(FIX);
     db.prepare(`INSERT INTO owner_feature_intro (vertical, subject_id, answer, answered_at, actor_detail) VALUES ('rfb', ?, 'yes', '2026-10-20T10:00:00.000Z', ?)`).run(FIX, FIX_EMAIL);
+    // T7: the news question's state is part of the snapshot too.
+    db.prepare(`INSERT INTO owner_feature_prompt (vertical, subject_id, key, state, rounds, snoozed_until, answered_at, actor_detail) VALUES ('rfb', ?, 'comms.news', 'later', 1, '2027-01-18T10:00:00.000Z', NULL, ?)`).run(FIX, FIX_EMAIL);
     // A real owner's stored state next to the fixture: the probe must never touch it.
     for (const [k, v] of [["comms.news", "false"], ["visibility.english", "false"]]) {
       db.prepare(`INSERT INTO owner_feature_settings (vertical, subject_id, key, value_json, set_by, admin_locked, set_at) VALUES ('rfb', ?, ?, ?, 'owner', 0, '2026-10-19T09:00:00.000Z')`).run(REAL, k, v);
@@ -147,6 +149,7 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
     db.prepare(`INSERT INTO owner_profile_pause (agent_id, paused_at, pause_until, set_by) VALUES (?, '2026-10-19T09:00:00.000Z', '2099-01-01', 'owner')`).run(REAL);
     db.prepare(`INSERT INTO owner_feature_level_choice (vertical, subject_id, level, chosen_at, actor_detail, batch_id) VALUES ('rfb', ?, 'bare_synlig', '2026-10-19T09:00:00.000Z', 'post@sp-real.example.no', NULL)`).run(REAL);
     db.prepare(`INSERT INTO owner_feature_intro (vertical, subject_id, answer, answered_at, actor_detail) VALUES ('rfb', ?, 'no', '2026-10-19T09:00:00.000Z', 'post@sp-real.example.no')`).run(REAL);
+    db.prepare(`INSERT INTO owner_feature_prompt (vertical, subject_id, key, state, rounds, snoozed_until, answered_at, actor_detail) VALUES ('rfb', ?, 'comms.news', 'never', 2, NULL, '2026-10-19T09:00:00.000Z', 'post@sp-real.example.no')`).run(REAL);
     db.prepare(`UPDATE agent_knowledge SET curated_fields = ? WHERE agent_id = ?`).run(JSON.stringify({ about: { by: "owner", locked_at: "2026-10-19T09:00:00.000Z" } }), REAL);
 
     const setBaseEnv = () => {
@@ -161,6 +164,8 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       process.env.OWNER_ORDERABILITY_PORTAL_ENABLED = "1";
       // dev-request 2026-11-01-rfb-hold-profilen-oppdatert: auto.updates (liveFlag) and the owner refresh.
       process.env.OWNER_AUTO_UPDATES_ENABLED = "1";
+      // Produktimport skive 4-2b: products.weekly_sync (liveFlag) and the weekly job.
+      process.env.PRODUCT_AUTO_SYNC_ENABLED = "1";
     };
     setBaseEnv();
 
@@ -195,6 +200,7 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       pause: db.prepare("SELECT * FROM owner_profile_pause WHERE agent_id = ?").all(id),
       level: db.prepare("SELECT * FROM owner_feature_level_choice WHERE subject_id = ?").all(id),
       intro: db.prepare("SELECT * FROM owner_feature_intro WHERE subject_id = ?").all(id),
+      prompt: db.prepare("SELECT * FROM owner_feature_prompt WHERE subject_id = ?").all(id),
       knowledge: db.prepare("SELECT about, curated_fields, email FROM agent_knowledge WHERE agent_id = ?").get(id),
     });
 
@@ -306,8 +312,14 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       const comingSoon = reg.OWNER_FEATURE_REGISTRY.filter((e) => e.status === "coming_soon").map((e) => `coming_soon:${e.key}`);
       assertEq(comingSoon.filter((n) => !checks.some((c) => c.check === n && c.result === "PASS" && /→ 409 coming_soon/.test(c.observed))), [], "run-12: every coming_soon key → 409 coming_soon, no effect");
       assertTrue(checks.some((c) => c.check === "requirement_unmet:orders.enabled" && c.result === "PASS" && /409 requirement_not_met/.test(c.observed)), "run-13: unmet requirement → 409, no effect");
-      assertTrue(checks.some((c) => c.check === "level:bare_synlig" && c.result === "PASS") && checks.some((c) => c.check === "level:ta_imot_bestillinger" && c.result === "PASS"), "run-14: both levels = the single switches");
-      assertTrue(checks.some((c) => c.check === "undo:level:bare_synlig" && c.result === "PASS"), "run-15: «Angre» on a level restores the effect");
+      assertTrue(checks.some((c) => c.check === "level:minst_mulig" && c.result === "PASS") && checks.some((c) => c.check === "level:utnytte_mulighetene" && c.result === "PASS"), "run-14: both levels = the single switches");
+      assertTrue(checks.some((c) => c.check === "undo:level:minst_mulig" && c.result === "PASS"), "run-15: «Angre» on a level restores the effect");
+      for (const lv of ["minst_mulig", "utnytte_mulighetene"]) {
+        for (const kind of ["level_preview", "level_derived", "level_invariants"]) {
+          const row = checks.find((c) => c.check === `${kind}:${lv}`);
+          assertTrue(!!row && row.result === "PASS", `run-15b (T10): ${kind}:${lv} PASS (${row?.observed ?? "missing"} ${row?.reason ?? ""})`);
+        }
+      }
       assertTrue(["orders.enabled", "visibility.profile", "comms.news"].every((k) => checks.some((c) => c.check === `undo:single:${k}` && c.result === "PASS")), "run-16: «Angre» on each live switch restores the effect");
       assertTrue(checks.some((c) => c.check === "no_surface:comms.news" && c.result === "PASS"), "run-17: comms.news (no surface): write + change log");
       assertTrue(checks.some((c) => c.check === "restore" && c.result === "PASS"), "run-18: restore check PASS");
@@ -319,7 +331,8 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
         `run-18b: the probe covers the public-stats threshold as-public, both sides (${thr?.observed ?? "missing"})`);
       assertEq(rawState(FIX), before, "run-19: the fixture's stored choices byte-identical to the snapshot afterwards");
       realUntouched("run-19b");
-      assertEq(grown(t0, tableCounts()).filter((x) => !/^owner_feature_(audit|change_batch):/.test(x)), [], "run-19c: no table grows except the change log (the readers' own rows are removed)");
+      // Produktimport skive 4-2b: products.weekly_sync's write also logs in the product change log (agent_knowledge_audit).
+      assertEq(grown(t0, tableCounts()).filter((x) => !/^(owner_feature_(audit|change_batch)|agent_knowledge_audit):/.test(x)), [], "run-19c: no table grows except the change log (the readers' own rows are removed)");
       const se: any[] = b.side_effects ?? [];
       assertTrue(se.some((x) => x.table === "tasks" && x.created > 0) && se.every((x) => x.removed === x.created), "run-19d: side effects reported (A2A tasks created by the probe) and removed exactly");
       assertTrue(/## Sideeffekter av lesingene/.test(String(b.markdown)), "run-19e: side effects in the report");
@@ -618,7 +631,7 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       assertTrue(b2.checks.filter((x) => x.check.startsWith("coming_soon:") && x.check !== `coming_soon:${csKey}`).every((x) => x.result === "PASS"), "vac-5: … the other coming_soon checks still PASS");
       assertEq([b2.restored, rawState(FIX)], [true, before], "vac-6: restored");
       // (c) the requirement not enforced → the requirement check FAILs.
-      const regReq = reg.OWNER_FEATURE_REGISTRY.map((e) => (e.key === "orders.enabled" ? { ...e, requires: [] } : e));
+      const regReq = reg.OWNER_FEATURE_REGISTRY.map((e) => (e.key === "orders.enabled" ? { ...e, requires: [], enableRequires: [] } : e));
       const noReq: import("../owner-features/switch-probe").ProbeWriteFn = (v, id, key, val, actor, o) =>
         rs.setOwnerFeatureValue(v, id, key, val, actor, key === "orders.enabled" ? { ...o, registry: regReq } : o);
       const c3 = await probe.runSwitchProbe(FIX, { db, maxWaitMs: 0, write: noReq });
@@ -626,6 +639,21 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       assertTrue(!!rq && rq.result === "FAIL", "vac-7: requirement not enforced → requirement_unmet check FAILs");
       assertEq([c3.restored, rawState(FIX)], [true, before], "vac-8: restored");
       realUntouched("vac-9");
+      // (d) T10: the fixture not ready for orders (cross-check pending) →
+      // level_preview still PASSes (hard requirement shown = the gate says no),
+      // level_derived for «Utnytte mulighetene» FAILs (the level cannot apply).
+      const vsBefore = (db.prepare("SELECT verification_status AS v FROM agent_knowledge WHERE agent_id = ?").get(FIX) as any).v;
+      db.prepare("UPDATE agent_knowledge SET verification_status = 'pending' WHERE agent_id = ?").run(FIX);
+      try {
+        const d4 = await probe.runSwitchProbe(FIX, { db, maxWaitMs: 0 });
+        const pv = d4.checks.find((x) => x.check === "level_preview:utnytte_mulighetene");
+        const dv = d4.checks.find((x) => x.check === "level_derived:utnytte_mulighetene");
+        assertTrue(!!pv && pv.result === "PASS" && /profile_not_checked/.test(pv.observed), `vac-10 (T10): not ready → level_preview PASS with the hard requirement named (${pv?.observed})`);
+        assertTrue(!!dv && dv.result === "FAIL" && /not_ready/.test(dv.reason || ""), `vac-11 (T10): not ready → level_derived:utnytte_mulighetene FAILs (${dv?.reason})`);
+        assertEq(d4.restored, true, "vac-12: restored");
+      } finally {
+        db.prepare("UPDATE agent_knowledge SET verification_status = ? WHERE agent_id = ?").run(vsBefore, FIX);
+      }
     }
 
     // ═══ Run lock is released when the setup throws ═══════════════════════

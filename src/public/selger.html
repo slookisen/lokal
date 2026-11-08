@@ -11,10 +11,10 @@
   <script>if('serviceWorker' in navigator&&!/finn-tannlege\.com|opplevagent\.no/.test(location.hostname)){window.addEventListener('load',function(){navigator.serviceWorker.register('/sw.js').catch(function(){});});}</script>
   <script defer src="/install-prompt.js"></script>
   <title>Bli funnet av AI-søk — Rett fra Bonden</title>
-  <meta name="description" content="Bli synlig for AI-søk. Gratis selgerprofil for norske matprodusenter, gårder og REKO-ringer. ChatGPT, Claude og andre AI-assistenter finner dere automatisk.">
+  <meta name="description" content="Bli synlig for AI-søk. Gratis selgerprofil for norske matprodusenter, gårder og REKO-ringer.">
   <link rel="canonical" href="https://rettfrabonden.com/selger">
   <meta property="og:title" content="Bli funnet av AI-søk — Rett fra Bonden">
-  <meta property="og:description" content="Bli synlig for AI-søk. Gratis selgerprofil for norske matprodusenter, gårder og REKO-ringer. ChatGPT, Claude og andre AI-assistenter finner dere automatisk.">
+  <meta property="og:description" content="Bli synlig for AI-søk. Gratis selgerprofil for norske matprodusenter, gårder og REKO-ringer.">
   <meta property="og:url" content="https://rettfrabonden.com/selger">
   <meta property="og:type" content="website">
   <meta property="og:locale" content="nb_NO">
@@ -25,7 +25,7 @@
   <meta property="og:image:alt" content="Rett fra Bonden — lokal mat rett fra bonden i Norge">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Bli funnet av AI-søk — Rett fra Bonden">
-  <meta name="twitter:description" content="Bli synlig for AI-søk. Gratis selgerprofil for norske matprodusenter, gårder og REKO-ringer. ChatGPT, Claude og andre AI-assistenter finner dere automatisk.">
+  <meta name="twitter:description" content="Bli synlig for AI-søk. Gratis selgerprofil for norske matprodusenter, gårder og REKO-ringer.">
   <meta name="twitter:image" content="https://rettfrabonden.com/logo-512.png">
   <meta name="twitter:image:alt" content="Rett fra Bonden — lokal mat rett fra bonden i Norge">
   <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
@@ -702,6 +702,20 @@
               &laquo;Sett&raquo; (sidevisninger fra mennesker) gjelder perioden p&aring; kortet, som p&aring; profilsiden din. &laquo;Kontakt-klikk&raquo; er siste <span class="statsWindowDays">60</span> dager. &laquo;Oppdaget&raquo; er en gammel livstidsteller (vises i s&oslash;keresultater) som blander folk, roboter og AI; se &laquo;Med i AI-s&oslash;k&raquo; under for AI. Kontakt-klikk viser <strong>klikk-interesse</strong> &mdash; ikke bekreftet kontakt.
             </p>
             <div class="stats-grid" id="statsFunnel"></div>
+          </div>
+
+          <!-- dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 5b:
+               the AI funnel, from owner-stats' aiFunnel (60 days). A step whose
+               read failed is not in the payload and is not shown; no aiFunnel
+               at all hides the card. -->
+          <div class="card hidden" id="statsAiFunnelCard">
+            <h2>Trakt fra AI: sendt til AI &rarr; klikk fra AI-svar &rarr; kontakt-klikk</h2>
+            <p class="section-hint" style="margin-bottom:0.75rem;">
+              &laquo;Sendt til AI&raquo; er hvor mange ganger profilen din var blant treffene en AI-assistent hentet. &laquo;Klikk fra AI-svar&raquo; er bes&oslash;k fra folk som klikket seg inn p&aring; profilen fra et svar i en AI-assistent (ChatGPT, Claude, Perplexity &hellip;). Tallet er et <strong>minimum</strong>: ikke alle AI-er og nettlesere sier fra hvor bes&oslash;ket kom fra, s&aring; noen klikk blir ikke med. &laquo;Kontakt-klikk&raquo; er klikk p&aring; e-post, telefon og nettside p&aring; profilen din; &laquo;etter klikk fra AI-svar&raquo; er de som kom fra et AI-svar. Siste <span class="statsAiFunnelDays">60</span> dager, eller fra datoen p&aring; kortet.
+            </p>
+            <div class="stats-grid" id="statsAiFunnel"></div>
+            <h3>Klikk fra AI-svar per AI</h3>
+            <ul class="product-list" id="statsAiFunnelVendor"></ul>
           </div>
 
           <div class="card">
@@ -2179,6 +2193,41 @@
       funnelHtml += '<div class="stat-card"><div class="stat-number">' + seen.n + '</div><div class="stat-label">Sett (' + escHtml(seen.label) + ')</div></div>';
       funnelHtml += '<div class="stat-card"><div class="stat-number">' + (f.contactClicked || 0) + '</div><div class="stat-label">Kontakt-klikk (' + wd + 'd)</div></div>';
       document.getElementById('statsFunnel').innerHTML = funnelHtml;
+
+      // AI funnel (slice 5b): Sendt til AI -> Klikk fra AI-svar -> Kontakt-klikk,
+      // 60 days. Only the steps the payload carries are shown.
+      var af = data.aiFunnel || null;
+      var afCard = document.getElementById('statsAiFunnelCard');
+      var afHtml = '';
+      var afVendorHtml = '';
+      if (af) {
+        var afDays = af.windowDays || 60;
+        Array.prototype.forEach.call(document.querySelectorAll('.statsAiFunnelDays'), function(el) { el.textContent = afDays; });
+        var afNum = function(n) { n = Number(n); return isFinite(n) && n > 0 ? Math.floor(n) : 0; };
+        var afLabel = function(step) { return (step && step.label) || ('siste ' + afDays + ' d'); };
+        if (af.sentToAi) {
+          afHtml += '<div class="stat-card" data-ai-funnel="sentToAi"><div class="stat-number">' + afNum(af.sentToAi.total) + '</div><div class="stat-label">Sendt til AI (' + escHtml(afLabel(af.sentToAi)) + ')</div></div>';
+        }
+        if (af.aiClicks) {
+          afHtml += '<div class="stat-card" data-ai-funnel="aiClicks"><div class="stat-number">' + afNum(af.aiClicks.total) + '</div><div class="stat-label">Klikk fra AI-svar (' + escHtml(afLabel(af.aiClicks)) + ', minst)</div></div>';
+          var AF_VENDOR_LABELS = { chatgpt: 'ChatGPT', claude: 'Claude', perplexity: 'Perplexity', gemini: 'Gemini', copilot: 'Copilot', other: 'Andre AI' };
+          var afBv = af.aiClicks.byVendor || {};
+          Object.keys(AF_VENDOR_LABELS).forEach(function(k) {
+            var n = afNum(afBv[k]);
+            if (n > 0) afVendorHtml += '<li style="display:flex;justify-content:space-between;"><span>' + AF_VENDOR_LABELS[k] + '</span><span>' + n + '</span></li>';
+          });
+        }
+        if (af.contactClicks) {
+          var afFrom = af.contactClicks.fromAi || {};
+          afHtml += '<div class="stat-card" data-ai-funnel="contactClicks"><div class="stat-number">' + afNum(af.contactClicks.total) + '</div><div class="stat-label">Kontakt-klikk (' + escHtml(afLabel(af.contactClicks)) + ')';
+          afHtml += '<br>hvorav etter klikk fra AI-svar: <strong>' + afNum(afFrom.total) + '</strong> (' + escHtml(afLabel(afFrom)) + ')</div></div>';
+        }
+      }
+      document.getElementById('statsAiFunnel').innerHTML = afHtml;
+      document.getElementById('statsAiFunnelVendor').innerHTML = afVendorHtml || (af && af.aiClicks ? '<li style="color:var(--gray-500);">Ingen klikk fra AI-svar registrert enn&aring;.</li>' : '');
+      if (afCard) {
+        if (afHtml) afCard.classList.remove('hidden'); else afCard.classList.add('hidden');
+      }
 
       // Views by source
       var vbs = data.viewsBySource || { totals: {} };

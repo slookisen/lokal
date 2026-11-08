@@ -682,6 +682,52 @@ export function setGardssalgWebsiteVerificationSweepOffset(
   ).run({ cohort, next_offset: value });
 }
 
+/** One page of the sweep: load the cohort, optionally narrow to providerIds,
+ *  slice [pageOffset, pageOffset+limit) and classify it. Shared by
+ *  POST .../gardssalg-website-verification-remediation and the server-side
+ *  daily job so both run the identical load -> paginate -> scan code. Pure
+ *  read on the DB side; it never reads or writes the persisted sweep offset
+ *  (the caller decides, via `pageOffset`, and persists with
+ *  setGardssalgWebsiteVerificationSweepOffset). */
+export async function scanGardssalgWebsiteVerificationPage(
+  db: Database.Database,
+  opts: {
+    scope: GsWvScope;
+    cohort: GsWvCohort;
+    fetchFn: GsWvFetchFn;
+    concurrency: number;
+    /** Defined (even empty) = narrow the cohort to exactly these ids. */
+    providerIds?: readonly string[];
+    /** Absent = unpaginated (whole cohort). */
+    page?: { limit: number; offset: number | "persisted" };
+  }
+): Promise<{
+  summary: GsWvSummary;
+  rows: GsWvScanRow[];
+  total: number;
+  pageOffset: number | undefined;
+  nextOffset: number | null | undefined;
+}> {
+  let cohort = loadGardssalgWebsiteVerificationCohort(db, opts.scope, opts.cohort);
+  if (opts.providerIds) {
+    const idSet = new Set(opts.providerIds);
+    cohort = cohort.filter((p) => idSet.has(p.id));
+  }
+  const total = cohort.length;
+  let pageOffset: number | undefined;
+  if (opts.page) {
+    pageOffset =
+      opts.page.offset === "persisted"
+        ? getGardssalgWebsiteVerificationSweepOffset(db, opts.cohort)
+        : opts.page.offset;
+    cohort = cohort.slice(pageOffset, pageOffset + opts.page.limit);
+  }
+  const { summary, rows } = await scanGardssalgWebsiteVerificationRows(cohort, opts.fetchFn, opts.concurrency);
+  const nextOffset =
+    pageOffset === undefined ? undefined : pageOffset + rows.length < total ? pageOffset + rows.length : null;
+  return { summary, rows, total, pageOffset, nextOffset };
+}
+
 // ─── Plan (Part B — read-only) ──────────────────────────────────────────────
 
 /**

@@ -31,7 +31,8 @@
 // selector SQL in routes/marketplace.ts POST /admin/homepage-provenance-batch
 // 1:1): status IN ('data_insufficient','review_required','pending_verify')
 // → homepage present (COALESCE(k.website, a.url)) → about non-empty →
-// field_provenance lacks a "homepage" source → not parked
+// field_provenance has no homepage source on address/phone/email
+// (hasHomepageContactProvenance, services/homepage-contact-provenance.ts) → not parked
 // (homepage_unreachable_since < 30d ago) → not in no-yield/wrong-entity
 // backoff (streak >= 3 AND last attempt inside NO_YIELD_BACKOFF_DAYS).
 //
@@ -43,6 +44,8 @@
 import { Router, Request, Response } from "express";
 import { getDb, isContentQualified, retailShopPoolBlockers } from "../database/init";
 import { isBlocked } from "../services/blocklist-service";
+import { hasContactRetentionMarkers } from "../services/privacy-retention";
+import { hasHomepageContactProvenance } from "../services/homepage-contact-provenance";
 import { buildCrossPlatformIdentity } from "../services/cross-platform-match";
 import { getRecentlyEmailedAddresses, getCrossPlatformSuppressors, getOpenExperiencesDb } from "../services/outreach-suppression-signals";
 
@@ -444,6 +447,32 @@ router.get("/", (req: Request, res: Response) => {
   const recentlyEmailedAddresses = getRecentlyEmailedAddresses(db, cooldownDays);
   const crossPlatformSuppressors = getCrossPlatformSuppressors(db, cooldownDays, { expDb: getOpenExperiencesDb() });
 
+  // contacted_at = MAX(sent_at) of outbound CRM messages to a.contact_email.
+  // Slettefrist slice A: messages the 24-month retention job deleted are kept
+  // as crm_contacts.retention_last_outbound_at, so the newer of the two is
+  // used (same value as before the cleanup).
+  const liveContactedSql = `(
+             SELECT MAX(m.sent_at)
+             FROM crm_messages m
+             JOIN crm_threads t ON t.id = m.thread_id
+             JOIN crm_contacts c ON c.id = t.contact_id
+             WHERE m.direction = 'out'
+               AND a.contact_email IS NOT NULL AND a.contact_email != ''
+               AND LOWER(c.email) = LOWER(a.contact_email)
+           )`;
+  const retainedContactedSql = `(
+             SELECT MAX(cr.retention_last_outbound_at)
+             FROM crm_contacts cr
+             WHERE a.contact_email IS NOT NULL AND a.contact_email != ''
+               AND LOWER(cr.email) = LOWER(a.contact_email)
+           )`;
+  const contactedAtSql = hasContactRetentionMarkers(db)
+    ? `(CASE WHEN ${retainedContactedSql} IS NULL THEN ${liveContactedSql}
+             WHEN ${liveContactedSql} IS NULL THEN ${retainedContactedSql}
+             WHEN ${liveContactedSql} >= ${retainedContactedSql} THEN ${liveContactedSql}
+             ELSE ${retainedContactedSql} END)`
+    : liveContactedSql;
+
   const stmt = db.prepare(`
     SELECT a.id AS id, a.name AS name, a.umbrella_type AS umbrella_type,
            a.is_active AS is_active, a.url AS a_url, a.contact_email AS contact_email,
@@ -462,15 +491,7 @@ router.get("/", (req: Request, res: Response) => {
            k.pending_verify_parked_since AS pending_verify_parked_since,
            k.no_yield_streak AS no_yield_streak, k.wrong_entity_streak AS wrong_entity_streak,
            k.last_enrichment_attempt_at AS last_enrichment_attempt_at,
-           (
-             SELECT MAX(m.sent_at)
-             FROM crm_messages m
-             JOIN crm_threads t ON t.id = m.thread_id
-             JOIN crm_contacts c ON c.id = t.contact_id
-             WHERE m.direction = 'out'
-               AND a.contact_email IS NOT NULL AND a.contact_email != ''
-               AND LOWER(c.email) = LOWER(a.contact_email)
-           ) AS contacted_at,
+           ${contactedAtSql} AS contacted_at,
            EXISTS(
              SELECT 1 FROM outreach_sent_log o
              WHERE o.vertical_id = 'rfb'
@@ -495,7 +516,11 @@ router.get("/", (req: Request, res: Response) => {
     const about = (row.about ?? "").trim();
     const email = (row.k_email ?? "").trim();
     const provCounts = provenanceSourceCounts(row.field_provenance);
-    const provHasHomepage = (row.field_provenance ?? "").includes('"homepage"');
+    // Skive C1 (dev-request 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-
+    // forverring): same rule as the batch selector — only a homepage source
+    // on address/phone/email blocks; a homepage source on website/about does
+    // not. Blocker/signal names are kept for report stability.
+    const provHasHomepage = hasHomepageContactProvenance(row.field_provenance);
     const noYield = row.no_yield_streak ?? 0;
     const wrongEntity = row.wrong_entity_streak ?? 0;
     const parkedNow = withinDays(row.homepage_unreachable_since, 30, nowMs);

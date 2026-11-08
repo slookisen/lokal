@@ -62,6 +62,12 @@
  *                             description) → never (not taken) → fill_empty;
  *                             the unclaimed control is never taken, and the
  *                             nightly cohort still leaves the owner out
+ *   produktimport skive 4-2b:
+ *   products.weekly_sync × job:product_weekly_sync  the weekly job's own
+ *                             selection (dueAutoSyncProfiles + autoSyncSkipReason,
+ *                             PRODUCT_AUTO_SYNC_ENABLED on): skipped (mode_off)
+ *                             → taken (weekly) → skipped → taken; an
+ *                             is_verified = 0 owner → 409, nothing written
  * Kinds:
  *   switch     default → on → off → on again; the effect follows each step;
  *              plus an unmet requirement → 409, nothing written, no effect.
@@ -153,6 +159,9 @@ export const OWNER_FEATURE_MATRIX_CASES: readonly OwnerFeatureMatrixCase[] = [
   // dev-request 2026-11-01-rfb-hold-profilen-oppdatert: the owner refresh.
   { key: "auto.updates", surface: "job:rfb_enrichment_nightly", kind: "choice",
     observe: "loadOwnerRefreshCohort(): taken as fill_empty (empty fields only) / automatic (+ filled enrichment fields) / not taken (never)" },
+  // Produktimport skive 4-2b: the weekly product auto-sync (products.weekly_sync ↔ product_sync_mode).
+  { key: "products.weekly_sync", surface: "job:product_weekly_sync", kind: "switch",
+    observe: "dueAutoSyncProfiles() / autoSyncSkipReason(): the weekly job takes the profile (mode weekly) vs skips it (mode_off)" },
 ];
 
 export const MATRIX_STEPS = ["default", "on", "off", "on_again"] as const;
@@ -175,7 +184,7 @@ const SAVED_ENV = [
   "OUTREACH_PAUSED", "ORDER_AUTOCOMPLETE_ENABLED", "RFB_DISABLE_ORDER_FOLLOWUPS",
   "OWNER_FEATURES_ENFORCE", "OWNER_PAUSE_ENABLED", "OWNER_ORDER_EMAIL_ENABLED", "LANG_COOKIE_REDIRECT_ENABLED",
   "STOCK_CHECK_EMAIL_ENABLED", "OWNER_ORDERABILITY_PORTAL_ENABLED", "SUPPLY_GRAPH_STALE_DAYS",
-  "OWNER_AUTO_UPDATES_ENABLED",
+  "OWNER_AUTO_UPDATES_ENABLED", "PRODUCT_AUTO_SYNC_ENABLED",
 ];
 
 /** S2e: the visibility.profile producer — the same rich profile shape as owner-features-s2c2.test.ts. */
@@ -341,6 +350,7 @@ export async function runOwnerFeatureMatrixTests(opts: { log?: boolean } = {}): 
       orderEmail: "mx-order-email",
       stockMail: "mx-stock-mail", stockJob: "mx-stock-job", stockPortal: "mx-stock-portal",
       autoUpdates: "mx-auto-updates",
+      weeklySync: "mx-weekly-sync",
     };
     const tokens: Record<string, string> = {};
     for (const id of Object.values(ids)) {
@@ -349,6 +359,10 @@ export async function runOwnerFeatureMatrixTests(opts: { log?: boolean } = {}): 
         isVerified: id !== ids.unbadged && id !== ids.nightlyControl,
       });
     }
+    // dev-request 2026-11-06-rfb-krav-for-portal-og-okter-ved-eierskifte (AC 3):
+    // a new order address only from the verified claimant's own login.
+    db.prepare("INSERT INTO agent_claims (id, agent_id, claimant_email, claimant_name, status, verified_at) VALUES (?, ?, ?, 'Eier', 'verified', '2026-10-01T00:00:00.000Z')")
+      .run(`claim-${ids.orderEmail}`, ids.orderEmail, emailOf(ids.orderEmail));
     // auto.updates: an empty category list (the field fill_empty may fill) —
     // set here, so the producer is in no category list the other cases read —
     // and an about / description an enrichment source recorded verbatim (the
@@ -358,6 +372,10 @@ export async function runOwnerFeatureMatrixTests(opts: { log?: boolean } = {}): 
       about: [{ source_type: "google_places", value: "Liten familiegård med grønnsaker og poteter fra egen jord." }],
       description: [{ source_type: "google_places", value: "Testprodusent for valgmatrisen." }],
     }), ids.autoUpdates);
+    // Produktimport skive 4-2b: the weekly-sync producer is kept out of the
+    // public lists (catalog_hidden), so it never shifts what the list
+    // surfaces of the other cases show; the weekly job does not read it.
+    db.prepare(`UPDATE agents SET catalog_hidden = 1 WHERE id = ?`).run(ids.weeklySync);
     // S2e: the pause producer (rich profile so every list surface shows it today;
     // its own city, so llms.txt's 1–2 samples per city include it).
     const VIS_ID = "mx-vis-pause";
@@ -637,6 +655,29 @@ export async function runOwnerFeatureMatrixTests(opts: { log?: boolean } = {}): 
         await expectGate(false, "off"); step(c, "off");
         await switchTo(id, c.key, true, `${L} [on_again]`);
         await expectGate(true, "on_again"); step(c, "on_again");
+
+        // T10 orderGateReady (enableRequires): stops only switching ON, never
+        // switches off or changes an owner who already has orders on.
+        {
+          const G = `${L} [orderGateReady]`;
+          const audits0 = auditRows(id, c.key);
+          db.prepare(`UPDATE agent_knowledge SET verification_status = 'pending' WHERE agent_id = ?`).run(id);
+          assertEq([optInCol(id), resolved(id, c.key).value], [1, true], `${G}: the profile is no longer checked — orders stay on (column 1, value on)`);
+          featuresMod.__resetOwnerFeaturesRateLimitForTesting();
+          const same = await put(id, c.key, true);
+          assertEq([same.status, same.body?.feature?.value, optInCol(id), auditRows(id, c.key) - audits0], [200, true, 1, 0], `${G}: PUT on while already on → 200 no-op, never refused, nothing written`);
+          assertEq(cartSvc!.orderReadiness(db, id).ready, false, `${G}: orderReadiness = not ready (= the gate with orders on)`);
+          await switchTo(id, c.key, false, `${G} [off]`);
+          featuresMod.__resetOwnerFeaturesRateLimitForTesting();
+          const on = await put(id, c.key, true);
+          assertEq([on.status, on.body?.error, optInCol(id), auditRows(id, c.key) - audits0], [409, "requirement_not_met", 0, 1], `${G}: PUT on while not ready → 409 requirement_not_met, column 0, no new audit row`);
+          assertTrue(/Rett fra Bonden har ikke kontrollert profilen/.test(String(on.body?.reason?.no ?? on.body?.reason ?? JSON.stringify(on.body))), `${G}: the 409 names what is missing`);
+          db.prepare(`UPDATE agent_knowledge SET verification_status = 'verified' WHERE agent_id = ?`).run(id);
+          assertEq(cartSvc!.orderReadiness(db, id).ready, true, `${G}: checked again → ready`);
+          assertEq(optInCol(id), 0, `${G}: orderReadiness never keeps a write (column still 0)`);
+          await switchTo(id, c.key, true, `${G} [on]`);
+          await expectGate(true, "on_again");
+        }
 
         // Unmet requirement (claimed owner, no is_verified badge): 409, nothing written, gate stays shut.
         const u = ids.unbadged;
@@ -1056,6 +1097,41 @@ export async function runOwnerFeatureMatrixTests(opts: { log?: boolean } = {}): 
         }
       };
     }
+
+    // ── Produktimport skive 4-2b: products.weekly_sync × the weekly job ──
+    runners["products.weekly_sync × job:product_weekly_sync"] = async (c) => {
+      const id = ids.weeklySync;
+      const L = matrixCaseId(c);
+      const autoSync = require("../services/product-import/auto-sync") as typeof import("../services/product-import/auto-sync");
+      const syncRow = (agentId: string) => db.prepare("SELECT product_sync_mode FROM product_auto_sync_state WHERE agent_id = ?").get(agentId) as { product_sync_mode: string } | undefined;
+      process.env.PRODUCT_AUTO_SYNC_ENABLED = "1";
+      const expect = (s: MatrixStep, on: boolean) => {
+        const due = autoSync.dueAutoSyncProfiles(Date.now(), 100_000);
+        assertEq(due.includes(id), on, `${L} [${s}]: the weekly job ${on ? "takes" : "skips"} the profile (dueAutoSyncProfiles)`);
+        assertEq(autoSync.autoSyncSkipReason(id), on ? null : "mode_off", `${L} [${s}]: autoSyncSkipReason = ${on ? "null (runs)" : "mode_off"}`);
+        assertEq(resolved(id, c.key).value, on, `${L} [${s}]: products.weekly_sync resolves ${on}`);
+      };
+      try {
+        expect("default", false); step(c, "default");
+        await switchTo(id, c.key, true, `${L} [on]`);
+        assertEq(syncRow(id)?.product_sync_mode, "weekly", `${L} [on]: product_sync_mode = weekly`);
+        expect("on", true); step(c, "on");
+        await switchTo(id, c.key, false, `${L} [off]`);
+        assertEq(syncRow(id)?.product_sync_mode, "off", `${L} [off]: product_sync_mode = off`);
+        expect("off", false); step(c, "off");
+        await switchTo(id, c.key, true, `${L} [on_again]`);
+        expect("on_again", true); step(c, "on_again");
+        // Unmet requirement (agents.is_verified = 0): 409, nothing written, the job skips it.
+        featuresMod.__resetOwnerFeaturesRateLimitForTesting();
+        const a0 = auditRows(ids.unbadged, c.key);
+        const r = await put(ids.unbadged, c.key, true);
+        assertEq([r.status, r.body?.error], [409, "requirement_not_met"], `${L}: is_verified = 0 → PUT on → 409 requirement_not_met`);
+        assertEq([syncRow(ids.unbadged) ?? null, auditRows(ids.unbadged, c.key) - a0], [null, 0], `${L}: refused write stores nothing (no sync row, no audit)`);
+        assertTrue(!autoSync.dueAutoSyncProfiles(Date.now(), 100_000).includes(ids.unbadged), `${L}: the job never takes the is_verified = 0 profile`);
+      } finally {
+        delete process.env.PRODUCT_AUTO_SYNC_ENABLED;
+      }
+    };
 
     // ── Run the matrix ─────────────────────────────────────────────────────
     const liveKeys = new Set(reg.OWNER_FEATURE_REGISTRY.filter((e) => e.status === "live").map((e) => e.key));

@@ -96,3 +96,37 @@ export function ownerUndoAnchor(vertical: string, subjectId: string, batchId: nu
   if (!Number.isFinite(batchId) || batchId <= 0) return OWNER_ANCHOR_LOG;
   return ownerBatchAnchor(vertical, subjectId, batchId, db) ?? OWNER_ANCHOR_LOG;
 }
+
+// ─── T9: regions for `?fragment=` («lagres der du står», steg 2) ────────────
+// The enhancement script (owner-ui/enhance.ts) asks the «Mine valg» GET for
+// only the regions a save may change: `?fragment=<id>[,<id>…]`. A page POST
+// sent with `?fragment=` passes it on to its 303 (next to the T5 anchor), so
+// the followed GET answers with those regions only. Without JavaScript no
+// request carries it and every Location is the T5 one.
+
+/** The syntax of a region id; the page decides which exist (page.ts renderOwnerFeaturesPageFragment). */
+const OWNER_REGION_ID = /^(statistikk|niva|planlagt|endringslogg|mv-toast-slot|gruppe-[a-z_]+)$/;
+const OWNER_FRAGMENT_MAX_IDS = 32;
+
+/** `fragment=` → the region ids (deduplicated, as given), or null for anything else. */
+export function parseOwnerFragmentParam(raw: unknown): string[] | null {
+  if (typeof raw !== "string" || raw === "" || raw.length > 400) return null;
+  const ids = raw.split(",");
+  if (ids.length > OWNER_FRAGMENT_MAX_IDS || !ids.every((id) => OWNER_REGION_ID.test(id))) return null;
+  return Array.from(new Set(ids));
+}
+
+/** The `fragment=…` query part a page POST passes on to its 303 ("" = none, or junk). */
+export function ownerFragmentPassOn(req: { query?: unknown } | undefined): string {
+  const q = req && req.query && typeof req.query === "object" ? (req.query as Record<string, unknown>) : null;
+  const ids = q ? parseOwnerFragmentParam(q.fragment) : null;
+  return ids ? `fragment=${ids.join(",")}` : "";
+}
+
+/** `query` with the passed-on `fragment=` appended (T5 query first, so the anchor contract reads the same). */
+export function withOwnerFragment(query: string, req: { query?: unknown } | undefined): string {
+  const f = ownerFragmentPassOn(req);
+  if (!f) return query;
+  const q = query.replace(/^\?/, "");
+  return q ? `${q}&${f}` : f;
+}

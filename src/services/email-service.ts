@@ -7,6 +7,87 @@ import { getConfig } from "../config/vertical-config";
 import { applyTestSendRedirect, TestSendNotConfiguredError } from "./send-guard";
 import { crmFromHeader } from "./crm-platform-identity";
 import { unsubscribeHeaderValues } from "./avmeld-service";
+import { claimRequestMoreBody, claimRequestMoreSignOff, claimRequestMoreSubject } from "./claim-request-more-texts";
+
+/** One line under the eierkrav B1 buttons in the admin claim-review notice. */
+const CLAIM_REVIEW_LINK_NOTE = "Lenken åpner en bekreftelsesside og virker én gang innen 72 timer.";
+
+// ─── Eierkrav B2a: the stored claim assessment in the admin notice ─────────
+// Only what claim_assessment holds: the result, the anchors / supports that
+// hit, the red flags and the unavailable sources, with Norwegian labels. An
+// id without a label is shown as stored (escaped in the HTML part).
+
+const CLAIM_ASSESSMENT_RESULT_LABELS: Record<string, string> = { green: "grønn", yellow: "gul", red: "rød" };
+const CLAIM_ASSESSMENT_SIGNAL_LABELS: Record<string, string> = {
+  A1: "e-postdomenet er profilens nettsted (uavhengig kilde)",
+  A1_sibling: "e-postdomenet er nettstedet til en søskenprofil (mulig duplikat)",
+  A2_website: "adressen står på gårdens nettsted",
+  A2_enrichment: "adressen står i en kildeført berikelse",
+  A2_brreg: "adressen står i Brreg",
+  A2_bondensmarked: "adressen står hos Bondens marked",
+  A2_debio: "adressen står hos Debio",
+  S1: "navnet er innehaver, daglig leder eller styreleder i Brreg",
+  S2: "nettstedet på e-postdomenet viser profilens org.nr., telefon eller adresse",
+  S3: "domenet ble registrert for minst ett år siden",
+  S4: "telefonnummeret stemmer med en uavhengig kilde (teller ikke alene)",
+  has_owner: "profilen har allerede en eier",
+  shared_address: "adressen er kjent e-post for flere profiler",
+  free_mail: "gratis e-posttjeneste uten uavhengig treff på adressen",
+  domain_young: "domenet er yngre enn 90 dager",
+  no_mx: "domenet tar ikke imot e-post (ingen MX)",
+  disposable: "engangsadresse",
+  lookalike: "domenet ligner gårdens domene",
+  other_farm_domain: "domenet tilhører en annen gård",
+  velocity_email: "mange krav fra samme e-post siste døgn",
+  velocity_ip: "mange krav fra samme IP siste døgn",
+  velocity_domain: "mange krav fra samme domene siste døgn",
+};
+const CLAIM_ASSESSMENT_SOURCE_LABELS: Record<string, string> = {
+  brreg_roller: "Brreg (roller)",
+  rdap: "domeneregisteret (RDAP)",
+  dns_mx: "DNS (MX)",
+  website_farm: "gårdens nettsted",
+  website_email_domain: "nettstedet på e-postdomenet",
+};
+const CLAIM_ASSESSMENT_NOTE = "Vurderingen er bare registrert og avgjør ikke kravet.";
+/** The note under the block in the eierkrav B2b-1 «godkjent automatisk» notice. */
+const CLAIM_AUTO_APPROVED_NOTE = "Kravet ble godkjent automatisk fordi vurderingen er grønn.";
+
+/** Eierkrav B2b-2: the outcome of the notice to the farm's known address. */
+export type ClaimFarmNoticeSkipReason = "no_known_email" | "same_as_claimant" | "shared_address" | "send_failed";
+export type ClaimFarmNoticeOutcome = { sent: true } | { sent: false; reason: ClaimFarmNoticeSkipReason };
+export const CLAIM_FARM_NOTICE_LABEL = "Varsel til gårdens kjente adresse";
+export const CLAIM_FARM_NOTICE_REASON_LABELS: Record<ClaimFarmNoticeSkipReason, string> = {
+  no_known_email: "ingen kjent adresse",
+  same_as_claimant: "samme som innsender",
+  shared_address: "delt adresse",
+  send_failed: "sendefeil",
+};
+/** «sendt» / «ikke sendt (<grunn>)» for the admin notice. */
+export function claimFarmNoticeLabel(outcome: ClaimFarmNoticeOutcome): string {
+  return outcome.sent ? "sendt" : `ikke sendt (${CLAIM_FARM_NOTICE_REASON_LABELS[outcome.reason] ?? "sendefeil"})`;
+}
+
+/**
+ * The assessment block's lines (plain text, unescaped), or null when the value
+ * is not a stored assessment with a known result — then the notice has no block.
+ */
+export function claimAssessmentNoticeLines(assessment: unknown): string[] | null {
+  if (!assessment || typeof assessment !== "object" || Array.isArray(assessment)) return null;
+  const a = assessment as Record<string, unknown>;
+  const result = typeof a.result === "string" ? CLAIM_ASSESSMENT_RESULT_LABELS[a.result] : undefined;
+  if (!result) return null;
+  const ids = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string" && x.length > 0) : []);
+  const labelled = (id: string, labels: Record<string, string>) =>
+    Object.prototype.hasOwnProperty.call(labels, id) ? `${id} — ${labels[id]}` : id;
+  const lines = [`Automatisk vurdering: ${result}`];
+  for (const id of ids(a.anchors)) lines.push(`Anker: ${labelled(id, CLAIM_ASSESSMENT_SIGNAL_LABELS)}`);
+  for (const id of ids(a.supports)) lines.push(`Støtte: ${labelled(id, CLAIM_ASSESSMENT_SIGNAL_LABELS)}`);
+  for (const id of ids(a.red_flags)) lines.push(`Rødt flagg: ${labelled(id, CLAIM_ASSESSMENT_SIGNAL_LABELS)}`);
+  for (const id of ids(a.unavailable_sources)) lines.push(`Kilde utilgjengelig: ${labelled(id, CLAIM_ASSESSMENT_SOURCE_LABELS)}`);
+  lines.push(CLAIM_ASSESSMENT_NOTE);
+  return lines;
+}
 
 // Simple logger — replace with winston/pino in production
 const logger = {
@@ -297,10 +378,7 @@ export class EmailService {
     agentName: string
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     try {
-      const subject = `Din bekreftelseskode for ${agentName} på ${this.brand}`;
-
-      const htmlContent = this.generateVerificationCodeHtml(code, agentName);
-      const textContent = this.generateVerificationCodeText(code, agentName);
+      const { subject, htmlContent, textContent } = this.buildVerificationCodeEmail(code, agentName);
 
       return await this.sendEmail({
         to: email,
@@ -337,10 +415,7 @@ export class EmailService {
     agentId: string
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     try {
-      const subject = `Profilen til ${agentName} er nå din på ${this.brand}`;
-
-      const htmlContent = this.generateClaimConfirmationHtml(agentName, loginUrl, agentId);
-      const textContent = this.generateClaimConfirmationText(agentName, loginUrl, agentId);
+      const { subject, htmlContent, textContent } = this.buildClaimConfirmationEmail(agentName, loginUrl, agentId);
 
       return await this.sendEmail({
         to: email,
@@ -360,6 +435,149 @@ export class EmailService {
         error: error instanceof Error ? error.message : 'Unknown error',
       };
     }
+  }
+
+  /**
+   * Subject and bodies of the claim verification-code mail, exactly as
+   * sendVerificationCode sends them. Also used by claim-crm-tracking.ts to
+   * file a copy in the CRM with the code replaced by a mask.
+   */
+  buildVerificationCodeEmail(code: string, agentName: string): { subject: string; htmlContent: string; textContent: string } {
+    return {
+      subject: `Din bekreftelseskode for ${agentName} på ${this.brand}`,
+      htmlContent: this.generateVerificationCodeHtml(code, agentName),
+      textContent: this.generateVerificationCodeText(code, agentName),
+    };
+  }
+
+  /**
+   * Subject and bodies of «Profilen til X er nå din», exactly as
+   * sendClaimConfirmation sends them. Also used by claim-crm-tracking.ts to
+   * file a copy in the CRM with the login link replaced by a placeholder.
+   */
+  buildClaimConfirmationEmail(agentName: string, loginUrl: string, agentId: string): { subject: string; htmlContent: string; textContent: string } {
+    return {
+      subject: `Profilen til ${agentName} er nå din på ${this.brand}`,
+      htmlContent: this.generateClaimConfirmationHtml(agentName, loginUrl, agentId),
+      textContent: this.generateClaimConfirmationText(agentName, loginUrl, agentId),
+    };
+  }
+
+  /**
+   * Eierkrav B2b-2 (dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-
+   * og-ettklikk): after a claim was approved automatically, the farm's KNOWN
+   * address (as it was before the approval) is told that someone registered
+   * as the profile's owner, and to reply if it was not them. Nothing about the
+   * claimant (no name, no e-mail) and no login or action link; Reply-To is
+   * the platform's support address like the other claim mails. Never throws.
+   */
+  async sendClaimFarmNotice(
+    farmEmail: string,
+    agentName: string,
+    at: Date = new Date(),
+  ): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    try {
+      const { subject, htmlContent, textContent } = this.buildClaimFarmNoticeEmail(agentName, at);
+      return await this.sendEmail({
+        to: farmEmail,
+        subject,
+        htmlContent,
+        textContent,
+        replyTo: this.supportEmail,
+        // A transactional notice to the farm, not outreach.
+        omitAgentHeader: true,
+      });
+    } catch (error) {
+      logger.error('Error sending claim farm notice', {
+        agentName,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Subject and bodies of the B2b-2 farm notice, exactly as sendClaimFarmNotice
+   * sends them. Also used by claim-crm-tracking.ts to file the CRM copy.
+   */
+  buildClaimFarmNoticeEmail(agentName: string, at: Date = new Date()): { subject: string; htmlContent: string; textContent: string } {
+    const date = at.toLocaleDateString('nb-NO', { timeZone: 'Europe/Oslo', day: 'numeric', month: 'long', year: 'numeric' });
+    const lead = `Ny eier registrert for ${agentName} på ${this.brand}.`;
+    const what = `${date} registrerte noen seg som eier av profilen ${agentName} på ${this.brand}.`;
+    const ask = 'Var det ikke dere? Svar på denne e-posten.';
+    const htmlContent = `
+<!DOCTYPE html>
+<html lang="no">
+<head>
+  <meta charset="UTF-8">
+</head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', sans-serif; color: #333; max-width: 600px; margin: 0 auto;">
+  <div style="background: #ffffff; padding: 40px 20px;">
+    <div style="font-size: 20px; font-weight: bold; color: #2d5f2e; margin-bottom: 20px;">${this.escapeHtml(this.brand)}</div>
+    <p><strong>${this.escapeHtml(lead)}</strong></p>
+    <p>${this.escapeHtml(what)}</p>
+    <p>${this.escapeHtml(ask)}</p>
+  </div>
+</body>
+</html>`;
+    const textContent = `${lead}\n\n${what}\n\n${ask}\n`;
+    return { subject: `Ny eier registrert for ${agentName} på ${this.brand}`, htmlContent, textContent };
+  }
+
+  /**
+   * Eierkrav B3a: «Be om mer bekreftelse» — asks the person who submitted a
+   * queued owner claim for a bit more proof. One mail to the claim's own
+   * address; Reply-To the platform's support address like the other claim
+   * mails; no link, only the profile name (texts: claim-request-more-texts.ts).
+   * The recipient is never logged. Never throws.
+   */
+  async sendClaimRequestMore(
+    email: string,
+    agentName: string,
+  ): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    try {
+      const { subject, htmlContent, textContent } = this.buildClaimRequestMoreEmail(agentName);
+      return await this.sendEmail({
+        to: email,
+        subject,
+        htmlContent,
+        textContent,
+        replyTo: this.supportEmail,
+        omitAgentHeader: true,
+        redactRecipientInLogs: true,
+      });
+    } catch (error) {
+      logger.error('Error sending claim request-more mail', {
+        error: error instanceof Error ? maskEmails(error.message) : String(error),
+      });
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Subject and bodies of the B3a «Be om mer bekreftelse» mail, exactly as
+   * sendClaimRequestMore sends them. Also used by claim-crm-tracking.ts to
+   * file the CRM copy (kind "request_more"; nothing secret in it).
+   */
+  buildClaimRequestMoreEmail(agentName: string): { subject: string; htmlContent: string; textContent: string } {
+    const body = claimRequestMoreBody(agentName);
+    const signOff = claimRequestMoreSignOff(this.brand);
+    const htmlContent = `
+<!DOCTYPE html>
+<html lang="no">
+<head>
+  <meta charset="UTF-8">
+</head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', sans-serif; color: #333; max-width: 600px; margin: 0 auto;">
+  <div style="background: #ffffff; padding: 40px 20px;">
+    <div style="font-size: 20px; font-weight: bold; color: #2d5f2e; margin-bottom: 20px;">${this.escapeHtml(this.brand)}</div>
+    <p>${this.escapeHtml(body)}</p>
+    <p>${this.escapeHtml(signOff)}</p>
+  </div>
+</body>
+</html>`;
+    const textContent = `${body}\n\n${signOff}\n`;
+    return { subject: claimRequestMoreSubject(agentName), htmlContent, textContent };
   }
 
   async sendEmail(options: EmailOptions): Promise<{ success: boolean; messageId?: string; error?: string }> {
@@ -1172,7 +1390,13 @@ ${this.brand} | ${getConfig().domain}`;
     claimantEmail: string,
     reason: string,
     /** The claim domain rule's advice: the rule and what Daniel can do. */
-    recommendation?: string
+    recommendation?: string,
+    /** Signed one-click links (eierkrav B1, behind CLAIM_ACTION_LINKS_ENABLED).
+     *  Undefined → the notice is rendered exactly as before. */
+    actionLinks?: { approve: string; reject: string; request_more?: string },
+    /** The stored claim assessment (eierkrav B2a). Undefined, or not a
+     *  readable assessment → the notice is rendered exactly as before. */
+    assessment?: unknown
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     const adminEmail = process.env.ADMIN_NOTIFICATION_EMAIL;
     if (!adminEmail) {
@@ -1183,6 +1407,7 @@ ${this.brand} | ${getConfig().domain}`;
     try {
       const queuePath = '/admin/agents/claim-review-queue';
       const subject = `Eierkrav venter på godkjenning: ${agentName}`;
+      const assessmentLines = claimAssessmentNoticeLines(assessment);
       const row = (label: string, value: string) =>
         `<tr><td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;">${label}:</td><td style="padding: 8px; border-bottom: 1px solid #eee;">${this.escapeHtml(value)}</td></tr>`;
       const htmlContent = `
@@ -1196,11 +1421,11 @@ ${this.brand} | ${getConfig().domain}`;
             ${row('Grunn', reason)}
             ${recommendation ? row('Anbefaling', recommendation) : ''}
             ${row('Tidspunkt', new Date().toLocaleString('nb-NO', { timeZone: 'Europe/Oslo' }))}
-          </table>
+          </table>${assessmentLines ? this.claimAssessmentHtml(assessmentLines) : ''}${actionLinks ? this.claimReviewButtonsHtml(actionLinks) : ''}
           <p>Køen: GET ${this.escapeHtml(queuePath)} (X-Admin-Key)</p>
           <p style="color: #888; font-size: 12px;">Automatisk varsling fra ${this.brand}</p>
         </div>`;
-      const textContent = `Eierkrav venter på godkjenning på ${this.brand}\n\nIngen kode er sendt. Kravet gir verken tilgang eller merke før det er godkjent.\n\nProdusent: ${agentName} (${agentId})\nNavn: ${claimantName}\nE-post: ${claimantEmail}\nGrunn: ${reason}\n${recommendation ? `Anbefaling: ${recommendation}\n` : ''}Tidspunkt: ${new Date().toISOString()}\n\nKøen: GET ${queuePath} (X-Admin-Key)`;
+      const textContent = `Eierkrav venter på godkjenning på ${this.brand}\n\nIngen kode er sendt. Kravet gir verken tilgang eller merke før det er godkjent.\n\nProdusent: ${agentName} (${agentId})\nNavn: ${claimantName}\nE-post: ${claimantEmail}\nGrunn: ${reason}\n${recommendation ? `Anbefaling: ${recommendation}\n` : ''}Tidspunkt: ${new Date().toISOString()}\n\n${assessmentLines ? `${assessmentLines.join('\n')}\n\n` : ''}${actionLinks ? `Godkjenn: ${actionLinks.approve}\nAvvis: ${actionLinks.reject}\n${actionLinks.request_more ? `Be om mer bekreftelse: ${actionLinks.request_more}\n` : ''}${CLAIM_REVIEW_LINK_NOTE}\n\n` : ''}Køen: GET ${queuePath} (X-Admin-Key)`;
 
       return await this.sendEmail({
         to: adminEmail,
@@ -1211,6 +1436,80 @@ ${this.brand} | ${getConfig().domain}`;
     } catch (error) {
       logger.error('Error sending admin claim-review notification', {
         agentId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Eierkrav B2b-1: tells the admin (ADMIN_NOTIFICATION_EMAIL) that a queued
+   * claim was approved automatically on a green claim assessment — sent
+   * instead of the «claim queued» notice. Profile, claimant, whether the
+   * login mail went out, the B2a assessment block (with its own note) and an
+   * «Angre» button: the signed C4 revoke link when one was minted, else a line
+   * naming POST /admin/agents/claim-revoke. Every value is HTML-escaped.
+   */
+  async sendAdminClaimAutoApprovedNotification(opts: {
+    agentName: string;
+    agentId: string;
+    claimId: string;
+    claimantName: string;
+    claimantEmail: string;
+    loginLinkSent: boolean;
+    assessment: unknown;
+    /** A signed C4 `revoke` link; undefined → the admin-route text line. */
+    revokeUrl?: string;
+    /** B2b-2: what happened to the notice to the farm's known address
+     *  (the address itself is never shown); undefined → no line. */
+    farmNotice?: ClaimFarmNoticeOutcome;
+  }): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const adminEmail = process.env.ADMIN_NOTIFICATION_EMAIL;
+    if (!adminEmail) {
+      logger.info('ADMIN_NOTIFICATION_EMAIL not set — skipping claim auto-approved notification');
+      return { success: true, messageId: 'NO_ADMIN_EMAIL' };
+    }
+
+    try {
+      const { agentName, agentId, claimId, claimantName, claimantEmail, revokeUrl } = opts;
+      const subject = `Eierkrav godkjent automatisk: ${agentName}`;
+      const intro = 'Den automatiske vurderingen var grønn, så kravet er godkjent og innsenderen er nå eier av profilen.';
+      const login = opts.loginLinkSent ? 'sendt' : 'ikke sendt';
+      const farmNotice = opts.farmNotice ? claimFarmNoticeLabel(opts.farmNotice) : null;
+      const blockLines = claimAssessmentNoticeLines(opts.assessment);
+      // B2a's block, with this notice's own note in place of «only recorded».
+      const assessmentLines = blockLines ? [...blockLines.slice(0, -1), CLAIM_AUTO_APPROVED_NOTE] : null;
+      const revokeCommand = `POST /admin/agents/claim-revoke {"claimId": "${claimId}", "note": "…"} (X-Admin-Key)`;
+      const row = (label: string, value: string) =>
+        `<tr><td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;">${label}:</td><td style="padding: 8px; border-bottom: 1px solid #eee;">${this.escapeHtml(value)}</td></tr>`;
+      const undoHtml = revokeUrl
+        ? `
+          <p><a href="${this.escapeHtml(revokeUrl)}" style="display: inline-block; padding: 10px 20px; margin: 0 8px 8px 0; background: #8b1e1e; color: #ffffff; text-decoration: none; border-radius: 6px; font-weight: bold;">Angre</a></p>
+          <p style="color: #555; font-size: 13px;">${this.escapeHtml(CLAIM_REVIEW_LINK_NOTE)}</p>`
+        : `
+          <p>Angre: ${this.escapeHtml(revokeCommand)}</p>`;
+      const htmlContent = `
+        <div style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+          <h2 style="color: #2d5016;">Eierkrav godkjent automatisk på ${this.brand}</h2>
+          <p>${this.escapeHtml(intro)}</p>
+          <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
+            ${row('Produsent', `${agentName} (${agentId})`)}
+            ${row('Navn', claimantName)}
+            ${row('E-post', claimantEmail)}
+            ${row('Innlogging', login)}${farmNotice !== null ? `
+            ${row(CLAIM_FARM_NOTICE_LABEL, farmNotice)}` : ''}
+            ${row('Krav-id', claimId)}
+            ${row('Tidspunkt', new Date().toLocaleString('nb-NO', { timeZone: 'Europe/Oslo' }))}
+          </table>${assessmentLines ? this.claimAssessmentHtml(assessmentLines) : ''}${undoHtml}
+          <p style="color: #888; font-size: 12px;">Automatisk varsling fra ${this.brand}</p>
+        </div>`;
+      const undoText = revokeUrl ? `Angre: ${revokeUrl}\n${CLAIM_REVIEW_LINK_NOTE}` : `Angre: ${revokeCommand}`;
+      const textContent = `Eierkrav godkjent automatisk på ${this.brand}\n\n${intro}\n\nProdusent: ${agentName} (${agentId})\nNavn: ${claimantName}\nE-post: ${claimantEmail}\nInnlogging: ${login}\n${farmNotice !== null ? `${CLAIM_FARM_NOTICE_LABEL}: ${farmNotice}\n` : ''}Krav-id: ${claimId}\nTidspunkt: ${new Date().toISOString()}\n\n${assessmentLines ? `${assessmentLines.join('\n')}\n\n` : ''}${undoText}`;
+
+      return await this.sendEmail({ to: adminEmail, subject, htmlContent, textContent });
+    } catch (error) {
+      logger.error('Error sending admin claim auto-approved notification', {
+        agentId: opts.agentId,
         error: error instanceof Error ? error.message : String(error),
       });
       return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
@@ -1279,6 +1578,28 @@ ${this.brand} | ${getConfig().domain}`;
       });
       return { success: false, error: maskEmails(error instanceof Error ? error.message : 'Unknown error') };
     }
+  }
+
+  /** «Godkjenn» / «Avvis» buttons for the admin claim-review notice (B1). */
+  private claimReviewButtonsHtml(links: { approve: string; reject: string; request_more?: string }): string {
+    const btn = (href: string, label: string, color: string) =>
+      `<a href="${this.escapeHtml(href)}" style="display: inline-block; padding: 10px 20px; margin: 0 8px 8px 0; background: ${color}; color: #ffffff; text-decoration: none; border-radius: 6px; font-weight: bold;">${label}</a>`;
+    // Eierkrav B3a: the third button only when a request_more link was minted
+    // (CLAIM_REQUEST_MORE_ENABLED); without it the block is today's, byte for byte.
+    const more = links.request_more ? btn(links.request_more, 'Be om mer bekreftelse', '#8a6d1e') : '';
+    return `
+          <p>${btn(links.approve, 'Godkjenn', '#2d5016')}${btn(links.reject, 'Avvis', '#8b1e1e')}${more}</p>
+          <p style="color: #555; font-size: 13px;">${this.escapeHtml(CLAIM_REVIEW_LINK_NOTE)}</p>`;
+  }
+
+  private claimAssessmentHtml(lines: string[]): string {
+    const [head, ...rest] = lines;
+    const note = rest.pop() ?? '';
+    const items = rest.map((l) => `<li>${this.escapeHtml(l)}</li>`).join('');
+    return `
+          <p style="font-weight: bold; margin: 16px 0 4px;">${this.escapeHtml(head)}</p>${items ? `
+          <ul style="margin: 0 0 8px; padding-left: 20px;">${items}</ul>` : ''}
+          <p style="color: #555; font-size: 13px;">${this.escapeHtml(note)}</p>`;
   }
 
   private escapeHtml(text: string): string {

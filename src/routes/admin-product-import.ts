@@ -14,7 +14,7 @@
 // agent_knowledge or products. Nothing is published.
 //
 // Skive 3b-1 (outreach pre-extraction, flag PRODUCT_IMPORT_OUTREACH_ENABLED,
-// own 404 when off; same X-Admin-Key check):
+// own 404 when off; "pilot" = only allowlisted agentIds start; same X-Admin-Key check):
 //   POST /admin/product-import/prepare   body {agentIds[], campaign} → 202 {prepare_id, …}
 //   GET  /admin/product-import/prepare/:campaign[?format=md] → read-only report
 // Stages candidates in product_import_candidates only; never publishes, never sends e-mail.
@@ -38,7 +38,8 @@ import {
   activeOutreachPrepareId,
   getOutreachReport,
   OUTREACH_CAMPAIGN_RE,
-  productImportOutreachEnabled,
+  productImportOutreachEnabledFor,
+  productImportOutreachMode,
   renderOutreachReportMd,
   startOutreachPrepare,
   validatePrepareInput,
@@ -123,8 +124,12 @@ router.get("/dry-run/:id", (req: Request, res: Response) => {
   return res.json(run);
 });
 
+// Flag "pilot" (dev-request 2026-11-05-eierflagg-koblet-til-pilotlisten): the
+// routes exist; POST /prepare starts only the agentIds on the pilot list
+// (OWNER_FEATURES_ALLOWED_SUBJECTS `rfb:<id>`), the rest are listed under
+// `rejected` with a per-id error and nothing is started for them.
 function requireOutreachFlag(res: Response): boolean {
-  if (productImportOutreachEnabled()) return true;
+  if (productImportOutreachMode() !== "off") return true;
   res.status(404).json({ error: "Not found" });
   return false;
 }
@@ -133,14 +138,32 @@ router.post("/prepare", (req: Request, res: Response) => {
   if (!requireOutreachFlag(res) || !requireAdmin(req, res)) return;
   const input = validatePrepareInput(req.body);
   if (!input.ok) return res.status(400).json({ error: input.error, message: input.message });
+  const pilot = productImportOutreachMode() === "pilot";
+  const agentIds = pilot ? input.agentIds.filter((id) => productImportOutreachEnabledFor(id)) : input.agentIds;
+  const rejected = pilot
+    ? input.agentIds.filter((id) => !agentIds.includes(id)).map((agent_id) => ({
+      agent_id,
+      error: "not_in_pilot_list",
+      message: "Produsenten er ikke på pilotlisten (OWNER_FEATURES_ALLOWED_SUBJECTS). Ingenting er startet for den.",
+    }))
+    : [];
+  const pilotFields = pilot ? { flag_mode: "pilot" as const, rejected } : {};
+  if (agentIds.length === 0) {
+    return res.status(400).json({
+      error: "no_pilot_agent_ids",
+      message: "Ingen av produsentene er på pilotlisten. Ingenting er startet.",
+      ...pilotFields,
+    });
+  }
   const active = activeOutreachPrepareId();
-  if (active) return res.status(409).json({ error: "Et forhåndsuttrekk pågår allerede", prepare_id: active });
-  const started = startOutreachPrepare(input.agentIds, input.campaign);
+  if (active) return res.status(409).json({ error: "Et forhåndsuttrekk pågår allerede", prepare_id: active, ...pilotFields });
+  const started = startOutreachPrepare(agentIds, input.campaign);
   return res.status(202).json({
     ...started,
     mode: "outreach_prepare",
     status: "running",
     poll: `/admin/product-import/prepare/${started.campaign}`,
+    ...pilotFields,
   });
 });
 
