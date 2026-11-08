@@ -45157,6 +45157,27 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 5c: the admin
+// «Klikk fra AI-svar» view (GET /admin/analytics/ai-clicks + dashboard panel):
+// sums, click rate per 100 sent, top list, counting-since rule. Swaps getDb(),
+// the dental / experiences db handles and ADMIN_KEY (restored in finally), so serial.
+runSerial(async () => {
+  console.log("\n── Klikk fra AI-svar S5c: admin view ──");
+  try {
+    const { runAdminAiClicksTests } = require("../src/services/admin-ai-clicks.test") as
+      typeof import("../src/services/admin-ai-clicks.test");
+    const r = await runAdminAiClicksTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-ai-clicks: " + f);
+    console.log(`  admin-ai-clicks: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push(`admin-ai-clicks: unexpected error: ${String(err?.message || err)}`);
+    console.log(`  ✗ admin-ai-clicks: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
 runSerial(async () => {
   // dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 5a: the public
   // «Klikk fra AI-svar · 60d: N» tile on the rfb producer, dental clinic,
