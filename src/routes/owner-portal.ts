@@ -52,7 +52,9 @@ import {
   getOwnerImportOverview, productImportEnabledFor, profileWebsite, OWNER_FETCH_BUSY_MESSAGE, OWNER_FETCH_DAILY_LIMIT_MESSAGE,
   OWNER_FETCH_RUNNING_MESSAGE, OWNER_IMPORT_NO_WEBSITE_MESSAGE,
 } from "../services/product-import/owner-import";
-import { autoSyncStatusView, type AutoSyncStatusView } from "../services/product-import/auto-sync";
+import { autoSyncStatusView, importPageAutoSyncChoice, type AutoSyncStatusView } from "../services/product-import/auto-sync";
+import { ownerRowAnchor } from "../owner-features/anchors";
+import { PRODUCT_WEEKLY_SYNC_KEY } from "../owner-features/product-weekly-sync";
 
 const router = Router();
 
@@ -124,9 +126,9 @@ interface SessionData {
 // ─────────────────────────────────────────────────────────────────
 // POST /api/agents/:id/request-magic-link
 // ─────────────────────────────────────────────────────────────────
-// 1. Validate email matches agent's registered email (case-insensitive), or
+// 1. Rate-limit: max 3 requests per hour, before the address is looked at
+// 2. Validate email matches agent's registered email (case-insensitive), or
 //    the confirmed address of this agent's verified owner (K5, below)
-// 2. Rate-limit: max 3 requests per hour
 // 3. Generate secure token
 // 4. Store in magic_links table
 // 5. Send email with verify link
@@ -150,41 +152,9 @@ router.post("/api/agents/:id/request-magic-link", async (req: Request, res: Resp
 
     const db = getDb();
 
-    // 1. Check if email matches agent's registered email + load agent name
-    const agentKnowledge = db
-      .prepare("SELECT email FROM agent_knowledge WHERE agent_id = ?")
-      .get(id) as any;
-    const agentRow = db
-      .prepare("SELECT name FROM agents WHERE id = ?")
-      .get(id) as any;
-
-    // K5 (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post): an owner
-    // Daniel approved by hand is bound to the address he approved
-    // (agent_claims.claimant_email, status 'verified'), often because the one
-    // on the profile was wrong — and approval never touches
-    // agent_knowledge.email. That confirmed address logs in too, for THIS
-    // agent only. Any other address gets the same 404 as before. The link goes
-    // to the confirmed address (normalized), not to the typed variant of it.
-    const knowledgeMatch =
-      !!agentKnowledge &&
-      !!agentKnowledge.email &&
-      agentKnowledge.email.toLowerCase() === email.toLowerCase();
-    const claimantEmail = knowledgeMatch ? null : verifiedClaimantEmailFor(String(id), email);
-
-    if (!knowledgeMatch && !claimantEmail) {
-      console.log(
-        `[owner-portal] Email mismatch for ${id}: provided=${emailLogLabel(email)}, registered=${emailLogLabel(agentKnowledge?.email)}`
-      );
-      return res.status(404).json({
-        success: false,
-        error: "email_not_associated",
-        message: "Den e-posten er ikke registrert for denne produsenten.",
-      });
-    }
-
-    const agentName: string = (agentRow && agentRow.name) ? String(agentRow.name) : "din profil";
-
-    // 2. Rate-limit check
+    // 1. Rate-limit check, BEFORE the address is looked at: over the limit,
+    // every address gets the same 429, so the limit itself does not tell a
+    // visitor which address belongs to the profile.
     // created_at is stored as an ISO-8601 string (now.toISOString(), e.g.
     // "2026-08-06T13:20:00.000Z" — see the INSERT below), while
     // datetime('now', ...) produces SQLite's own native format (e.g.
@@ -217,6 +187,40 @@ router.post("/api/agents/:id/request-magic-link", async (req: Request, res: Resp
         message: "For mange innloggingsforsøk. Prøv igjen senere.",
       });
     }
+
+    // 2. Check if email matches agent's registered email + load agent name
+    const agentKnowledge = db
+      .prepare("SELECT email FROM agent_knowledge WHERE agent_id = ?")
+      .get(id) as any;
+    const agentRow = db
+      .prepare("SELECT name FROM agents WHERE id = ?")
+      .get(id) as any;
+
+    // K5 (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post): an owner
+    // Daniel approved by hand is bound to the address he approved
+    // (agent_claims.claimant_email, status 'verified'), often because the one
+    // on the profile was wrong — and approval never touches
+    // agent_knowledge.email. That confirmed address logs in too, for THIS
+    // agent only. Any other address gets the same 404 as before. The link goes
+    // to the confirmed address (normalized), not to the typed variant of it.
+    const knowledgeMatch =
+      !!agentKnowledge &&
+      !!agentKnowledge.email &&
+      agentKnowledge.email.toLowerCase() === email.toLowerCase();
+    const claimantEmail = knowledgeMatch ? null : verifiedClaimantEmailFor(String(id), email);
+
+    if (!knowledgeMatch && !claimantEmail) {
+      console.log(
+        `[owner-portal] Email mismatch for ${id}: provided=${emailLogLabel(email)}, registered=${emailLogLabel(agentKnowledge?.email)}`
+      );
+      return res.status(404).json({
+        success: false,
+        error: "email_not_associated",
+        message: "Den e-posten er ikke registrert for denne produsenten.",
+      });
+    }
+
+    const agentName: string = (agentRow && agentRow.name) ? String(agentRow.name) : "din profil";
 
     // 3 + 4. Generate secure token, insert into magic_links (shared helper)
     const recipient = claimantEmail ?? email;
@@ -832,6 +836,12 @@ router.post("/api/agents/:id/update-profile", (req: Request, res: Response) => {
       if (field in req.body) {
         bodyFields[field] = req.body[field];
       }
+    }
+
+    // dev-request 2026-11-06 (AC 3): a new profile e-mail only from the
+    // verified claimant's own login; refused as a whole, nothing written.
+    if ("email" in bodyFields && profileEmailChangeNeedsClaimant(id, sessionData, bodyFields.email)) {
+      return res.status(403).json({ success: false, error: "claimant_login_required", message: OWNER_CLAIMANT_EMAIL_MESSAGES.profile_email });
     }
 
     // Strip any read-only fields
@@ -1729,6 +1739,11 @@ export async function requestOwnerOrderEmailChange(
       ? { status: 403, body: { success: false, error: "ownership_not_verified", message: OWNER_ORDER_EMAIL_LOCKED_MESSAGE } }
       : { status: 403, body: { success: false, error: "forbidden", message: "Du har ikke tilgang til denne agenten." } };
   }
+  // dev-request 2026-11-06 (AC 3): only the verified claimant's own login may
+  // ask for a new order address (no token row, no mail otherwise).
+  if (!sessionClaimantOwnerEmail(agentId, session)) {
+    return { status: 403, body: { success: false, error: "claimant_login_required", message: OWNER_CLAIMANT_EMAIL_MESSAGES.order_email } };
+  }
   const email = normalizeEmail(typeof rawEmail === "string" ? rawEmail : "");
   if (!email || !isPlausibleOrderEmail(email)) {
     return { status: 400, body: { success: false, error: "invalid_email", message: "Skriv inn en gyldig e-postadresse." } };
@@ -2143,7 +2158,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
     let productImportCard = "";
     try {
       if (productImportCardVisible(agentId, session, agent.is_verified)) {
-        const ia = productImportPortalAlert(status, req.query as any, productImportStockHintHtml(agentId));
+        const ia = productImportPortalAlert(status, req.query as any, productImportStockHintHtml(agentId), status === "produktimport_publisert" ? weeklySyncNudgeHtml(agentId) : "");
         const iaHtml = ia
           ? `<div class="ep-alert ${ia.ok ? "ep-alert-ok" : "ep-alert-error"}" role="${ia.ok ? "status" : "alert"}" data-import-alert="${escapeHtml(status)}">${ia.html}</div>`
           : "";
@@ -2588,6 +2603,7 @@ router.post("/eier/:agentId/order-email", express.urlencoded({ extended: false }
     const out = await requestOwnerOrderEmailChange(req, agentId, req.body?.email);
     if (out.status === 401) return res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
     if (out.status === 200) return res.redirect(303, `${base}?status=order_email_sent#bestillinger`);
+    if (out.status === 403 && out.body?.error === "claimant_login_required") return res.status(403).send(ownerEmailNeedsClaimantLoginPage(agentId, "order_email"));
     const mapped = ORDER_EMAIL_ERROR_STATUS[String(out.body?.error || "")];
     if (mapped) return res.redirect(303, `${base}?status=${mapped}#bestillinger`);
     if (out.status === 403 && out.body?.error === "ownership_not_verified") return res.status(403).send(ownerNotVerifiedPage(agentId));
@@ -2709,6 +2725,10 @@ router.post("/eier/:agentId/save", express.urlencoded({ extended: false }), asyn
     for (const key of EDITABLE_FIELDS) {
       const v = (req.body as any)[`field_${key}`];
       if (v !== undefined) payload[key] = String(v);
+    }
+    // dev-request 2026-11-06 (AC 3): same rule as update-profile, answered with the page.
+    if ("email" in payload && profileEmailChangeNeedsClaimant(agentId, session, payload.email)) {
+      return res.status(403).send(ownerEmailNeedsClaimantLoginPage(agentId, "profile_email"));
     }
     const url = `${req.protocol}://${req.get("host")}/api/agents/${encodeURIComponent(agentId)}/update-profile`;
     const resp = await fetch(url, {
@@ -3037,6 +3057,47 @@ export function ownerProductsNeedClaimantLoginPage(agentId: string): string {
   );
 }
 
+/**
+ * dev-request 2026-11-06-rfb-krav-for-portal-og-okter-ved-eierskifte (AC 3):
+ * the e-mail writes that need the verified claimant's own login, as products do.
+ */
+export type OwnerClaimantEmailField = "order_email" | "profile_email";
+
+export const OWNER_CLAIMANT_EMAIL_MESSAGES: Record<OwnerClaimantEmailField, string> = {
+  order_email: "For å endre adressen bestillingene sendes til, må du logge inn med e-postadressen til den som har bekreftet eierskapet til profilen.",
+  profile_email: "For å endre e-postadressen på profilen må du logge inn med e-postadressen til den som har bekreftet eierskapet til profilen.",
+};
+
+/** 403 page: verified owner, but this session may not change the order or profile e-mail (not the claimant's own login). */
+export function ownerEmailNeedsClaimantLoginPage(agentId: string, field: OwnerClaimantEmailField): string {
+  const id = encodeURIComponent(agentId);
+  return portalShell(
+    "Logg inn med eierens e-post",
+    `<div class="ep-card" data-claimant-login-required="1">
+          <h1>Logg inn med eierens e-postadresse</h1>
+          <p>${escapeHtml(OWNER_CLAIMANT_EMAIL_MESSAGES[field])} Ingenting er endret.</p>
+          <a class="ep-btn ep-btn-primary" href="/selger?agent=${id}">Logg inn med eierens e-post</a>
+        </div>`
+  );
+}
+
+/**
+ * True when this save would change the profile e-mail (agent_knowledge.email,
+ * compared as the save compares it) and the session is not the verified
+ * claimant's own login — the save must then be refused as a whole.
+ */
+export function profileEmailChangeNeedsClaimant(
+  agentId: string,
+  session: { token?: string } | null | undefined,
+  rawEmail: unknown,
+): boolean {
+  if (rawEmail === undefined) return false;
+  const row = getDb().prepare("SELECT email FROM agent_knowledge WHERE agent_id = ?").get(agentId) as { email?: string | null } | undefined;
+  if (!row) return false; // no profile: the save answers agent_not_found itself
+  if (normalizeOwnerProfileValue("email", rawEmail) === normalizeOwnerProfileValue("email", row.email)) return false;
+  return !sessionClaimantOwnerEmail(agentId, session);
+}
+
 type OwnerOrderabilityAuth = { ok: true; agentId: string; email: string | null } | { ok: false };
 
 /** Flag + allowlist, session, Origin and strict ownership for the B1 POSTs; answers itself on failure. */
@@ -3208,6 +3269,7 @@ export function productImportPortalAlert(
   status: string,
   query: { publisert?: unknown; fjernet?: unknown; avvist?: unknown },
   stockHint: string,
+  weeklyNudgeHtml = "",
 ): { ok: boolean; html: string } | null {
   const num = (v: unknown) => (typeof v === "string" && /^\d{1,4}$/.test(v) ? Number(v) : 0);
   const varer = (n: number) => `${n} ${n === 1 ? "vare" : "varer"}`;
@@ -3223,7 +3285,7 @@ export function productImportPortalAlert(
       if (rej > 0) text += ` ${varer(rej)} kunne ikke legges inn (kategorinavn, alkohol eller tjeneste).`;
       return {
         ok: true,
-        html: `<span data-import-published="${pub}" data-import-removed="${rem}">${escapeHtml(text)}</span>${pub > 0 ? ` ${stockHint}` : ""}`,
+        html: `<span data-import-published="${pub}" data-import-removed="${rem}">${escapeHtml(text)}</span>${pub > 0 ? ` ${stockHint}` : ""}${pub > 0 && weeklyNudgeHtml ? ` ${weeklyNudgeHtml}` : ""}`,
       };
     }
     case "produktimport_grense": return { ok: false, html: escapeHtml(OWNER_FETCH_DAILY_LIMIT_MESSAGE) };
@@ -3233,6 +3295,25 @@ export function productImportPortalAlert(
     case "produktimport_feil": return { ok: false, html: "Noe gikk galt. Prøv igjen om litt." };
     default: return null;
   }
+}
+
+/**
+ * Skive 4-2c: after a publish, the pointer to the «Mine valg» weekly-sync row.
+ * Decided from stored state at render time with the import page's own rule
+ * (importPageAutoSyncChoice: PRODUCT_AUTO_SYNC_ENABLED on and is_verified = 1)
+ * plus the «Mine valg» allowlist (isSubjectAllowedForOwnerFeatures, as its page gate;
+ * mode 'weekly' = already on, so no nudge). "" otherwise. Never writes.
+ */
+export function weeklySyncNudgeHtml(agentId: string): string {
+  let choice: ReturnType<typeof importPageAutoSyncChoice> = null;
+  try {
+    // «Mine valg» 404s for subjects off the allowlist (pageGate): no link to a page the owner cannot open.
+    if (!isSubjectAllowedForOwnerFeatures("rfb", agentId)) return "";
+    choice = importPageAutoSyncChoice(agentId);
+  } catch { choice = null; }
+  if (!choice || choice.mode === "weekly") return "";
+  const href = `/eier/${encodeURIComponent(agentId)}/valg#${ownerRowAnchor(PRODUCT_WEEKLY_SYNC_KEY)}`;
+  return `<span data-weekly-sync-nudge="1">${escapeHtml("Vil du at vi holder prisene oppdatert hver uke? Slå det på i")} <a href="${escapeHtml(href)}">«Mine valg»</a>.</span>`;
 }
 
 /** Where imported products are made orderable: the B1 card when it is on for this profile, else a plain sentence. */

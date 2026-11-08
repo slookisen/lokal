@@ -58,11 +58,16 @@ import {
   type OrderPaymentEffect,
 } from "../services/payment-service";
 import { getDb } from "../database/init";
-import { applyOrderAction, cancelActionsEnabled as layerCancelActionsEnabled, type OrderAction } from "../services/order-actions";
+import {
+  applyOrderAction, cancelActionsEnabled as layerCancelActionsEnabled, t12OrderActionsActive, t12SellerActionFrom,
+  type OrderAction, type OrderCancelDetail,
+} from "../services/order-actions";
+import { orderActionsComponentHtml, t12DoneBannerText, type OrderComponentClasses } from "./owner-orders-view";
 import { isOrderAutocompleteEnabled, noShowEarliestMs, formatPickupTimeOslo } from "../services/order-lifecycle";
 import { randomUUID } from "crypto";
 import { PRICE_BY_AGREEMENT, PARTIAL_SUM_LABEL, summarizePricing } from "../services/order-pricing";
 import type { PaymentsStripeClient } from "../services/payment-provider";
+import { emailWithheldIds } from "../services/email-reveal-guard";
 
 // ─── Public cart/order router ────────────────────────────────────────────────
 export const cartRouter = Router();
@@ -405,6 +410,22 @@ cartRouter.post("/cart/:id/submit", cartWishesLimiter, async (req: Request, res:
     return;
   }
 
+  // dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
+  // S-A5 (RFB REST): the producer e-mail in contact_handoffs follows the rfb
+  // per-IP limit of services/email-reveal-guard.ts (switch
+  // EMAIL_REVEAL_GUARD_RFB, default off), each producer with an e-mail on its
+  // own. Withheld it is null, as for a producer without one. Only this
+  // answer changes: cart-service (and so MCP lokal_cart_submit) and the
+  // stored cart_handoffs rows are untouched, and orders[].producer_contact
+  // (the seller's contact for the buyer's own order) is not limited.
+  // Switch on: Cache-Control: private. Switch off: nothing changes.
+  const handoffs = Array.isArray(result.contact_handoffs) ? result.contact_handoffs : [];
+  const withheld = emailWithheldIds(req, res, "rfb", handoffs.filter((h) => !!h.email).map((h) => h.agent_id));
+  if (withheld && withheld.size > 0) {
+    res.status(201).json({ ...result, contact_handoffs: handoffs.map((h) => (withheld.has(h.agent_id) ? { ...h, email: null } : h)) });
+    return;
+  }
+
   res.status(201).json(result);
 });
 
@@ -592,6 +613,12 @@ const CANCEL_ACTIONS_FOR_STATUS: Record<string, Array<{ action: string; label: s
   ],
 };
 
+// T12: the shared cancellation component's classes on this page.
+const ORDER_PAGE_COMPONENT_CLASSES: OrderComponentClasses = {
+  actions: "t12-actions", form: "t12-form", btn: "act-btn", primary: "act-primary", secondary: "act-secondary",
+  hint: "hint", menu: "cancel-box", pickup: "pickup",
+};
+
 // The cancellation box shipped with prepayment: for a PREPAY order it is shown
 // (and accepted on POST) only while the payment lifecycle is on
 // (PAYMENTS_ENABLED=1 or "drain"), as a captured payment must be refunded.
@@ -700,8 +727,13 @@ producerOrderRouter.get("/:token", (req: Request, res: Response) => {
   const statusLabel = ORDER_STATUS_LABEL[order.status] || order.status;
   const done = String(req.query["done"] || "");
   const errorParam = String(req.query["error"] || "");
-  const banner =
-    done && ORDER_STATUS_LABEL[done]
+  // T12 (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 6): the
+  // shared cancellation component, only for a producer on the allowlist.
+  const t12 = t12OrderActionsActive(order.agent_id);
+  const t12Banner = t12 && !errorParam ? t12DoneBannerText(done) : "";
+  const banner = t12Banner
+    ? `<div class="ordre-banner ok" role="status">${escapePageHtml(t12Banner)}</div>`
+    : done && ORDER_STATUS_LABEL[done]
       ? `<div class="ordre-banner ok" role="status">Registrert: ${escapePageHtml(ORDER_STATUS_LABEL[done])}</div>`
       : errorParam === "ugyldig"
         ? `<div class="ordre-banner warn" role="alert">Handlingen er ikke gyldig for ordrens nåværende status.</div>`
@@ -741,7 +773,13 @@ producerOrderRouter.get("/:token", (req: Request, res: Response) => {
       soldOut.map((c) => `<label style="display:block;padding:4px 0"><input type="checkbox" name="sold_out" value="${escapePageHtml(c.product_id)}" checked> ${escapePageHtml(c.name)}</label>`).join("") +
       `</fieldset><button type="submit" class="act-btn act-secondary">Avslå – utsolgt</button></form>`
     : "";
-  const actionsHtml = (ACTIONS_FOR_STATUS[order.status] || [])
+  const actionsHtml = t12
+    ? orderActionsComponentHtml({
+        orderId: order.order_id, agentId: order.agent_id, status: order.status, pickupTime: order.pickup_time,
+        paymentMode: order.payment_mode, confirmedAt: confirmedAtForNoShow, postTo, now: new Date(),
+        cls: ORDER_PAGE_COMPONENT_CLASSES, cancelExtraHtml: escapePageHtml(cancelHint(paymentRow)),
+      })
+    : (ACTIONS_FOR_STATUS[order.status] || [])
     .filter((a) => !(a.action === "no_show" && noShowLocked))
     .map(
       (a) =>
@@ -752,7 +790,7 @@ producerOrderRouter.get("/:token", (req: Request, res: Response) => {
           .map((a) => `<form method="POST" action="${postTo}"><input type="hidden" name="action" value="${a.action}">${idemField()}<button type="submit" class="act-btn act-secondary">${a.label}</button></form>`)
           .join("\n      ")}\n    </details>`
       : "");
-  const autoCloseHint = (order.status === "confirmed" || order.status === "ready") && isOrderAutocompleteEnabled()
+  const autoCloseHint = !t12 && (order.status === "confirmed" || order.status === "ready") && isOrderAutocompleteEnabled()
     ? `<p class="hint">Du trenger ikke gjøre mer. Ordren avsluttes av seg selv etter henting. Kom kunden ikke, trykker du «Kunden kom ikke» før den lukkes.</p>`
     : "";
 
@@ -838,7 +876,7 @@ body{font-family:system-ui,sans-serif;background:#f5f3ee;color:#1e2b23;margin:0}
     ${buyerBlockHtml}${paymentRow ? `\n    ${paymentBanner}${paymentHtml}` : ""}
     ${timelineHtml}
     ${autoCloseHint}
-    ${noShowLocked && (order.status === "confirmed" || order.status === "ready") ? `<p class="hint">«Kunden kom ikke» kan registreres fra ${escapePageHtml(formatPickupTimeOslo(new Date(noShowFrom!).toISOString()))}.</p>` : ""}
+    ${!t12 && noShowLocked && (order.status === "confirmed" || order.status === "ready") ? `<p class="hint">«Kunden kom ikke» kan registreres fra ${escapePageHtml(formatPickupTimeOslo(new Date(noShowFrom!).toISOString()))}.</p>` : ""}
     ${actionsHtml}
     <p class="hint">Denne siden er for produsenten. Lenken er personlig for denne ordren — ikke del den videre. ${paymentRow ? "Betalingen går via Stripe direkte til din egen Stripe-konto." : "Ingen betaling skjer via plattformen."}</p>
   </div>
@@ -867,8 +905,12 @@ producerOrderRouter.post(
     const body = (req.body || {}) as Record<string, unknown>;
     const action = String(body["action"] || "");
     // B2b-1 «Utsolgt»: decline + sold-out write, only while the soft-expiry rule is active (else unknown, as before).
-    const soldOutPost = action === "decline_sold_out" && stockSoftExpiryActiveFor(order.agent_id);
-    const mapped: OrderAction | undefined = soldOutPost ? "decline" : PRODUCER_ACTIONS[action];
+    // T12: the cancellation component's actions first (allowlisted producer);
+    // anything else falls through to today's mapping.
+    const t12Chosen = t12OrderActionsActive(order.agent_id) ? t12SellerActionFrom(body, order.agent_id) : null;
+    const soldOutPost = !t12Chosen && action === "decline_sold_out" && stockSoftExpiryActiveFor(order.agent_id);
+    const mapped: OrderAction | undefined = t12Chosen ? t12Chosen.action : soldOutPost ? "decline" : PRODUCER_ACTIONS[action];
+    const t12Detail: OrderCancelDetail | null = t12Chosen?.cancelDetail ?? null;
     if (!mapped || (action.startsWith("cancel_") && !cancelActionsEnabled(order.payment_mode))) {
       res.redirect(303, `${backTo}?error=ugyldig`);
       return;
@@ -886,6 +928,8 @@ producerOrderRouter.post(
         idempotencyKey: idem,
         pickupTime: mapped === "confirm" && typeof body["pickup_time"] === "string" ? (body["pickup_time"] as string) : null,
         ...(soldOutPost ? { soldOut: { productIds: soldOutIdsFromBody(body["sold_out"]) } } : {}),
+        ...(t12Chosen?.soldOut ? { soldOut: t12Chosen.soldOut } : {}),
+        ...(t12Detail ? { cancelDetail: t12Detail } : {}),
       },
     );
     if (!result.success) {

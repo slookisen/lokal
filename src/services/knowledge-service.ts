@@ -1304,6 +1304,10 @@ class KnowledgeService {
    *  still to be confirmed with resolveFarmContactEmail). */
   private knownEmailCandidates(target: string, knownHolderId?: string): Set<string> {
     const db = getDb();
+    // A deactivated or merged profile (is_active = 0) no longer shares the
+    // address: it has no page and no owner to mix up, and a merged duplicate
+    // would otherwise block the code for the survivor forever. The claimed
+    // profile itself still counts, also when inactive.
     // The claimed profile itself, when its known e-mail is the address (rule 1):
     // a candidate regardless of the LIMIT below, so stale outreach rows cannot
     // crowd it out of the set.
@@ -1311,7 +1315,7 @@ class KnowledgeService {
     const listed = db.prepare(
       `SELECT k.agent_id AS id
          FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
-        WHERE LOWER(TRIM(k.email, ${EMAIL_TRIM_CHARS})) = ? AND COALESCE(a.vertical_id, 'rfb') = 'rfb'
+        WHERE LOWER(TRIM(k.email, ${EMAIL_TRIM_CHARS})) = ? AND COALESCE(a.vertical_id, 'rfb') = 'rfb' AND COALESCE(a.is_active, 1) = 1
         LIMIT ?`
     ).all(target, SHARED_EMAIL_CANDIDATES_MAX) as Array<{ id: string }>;
     for (const r of listed) candidates.add(r.id);
@@ -1319,7 +1323,7 @@ class KnowledgeService {
       const delivered = db.prepare(
         `SELECT DISTINCT o.agent_id AS id
            FROM outreach_sent_log o JOIN agents a ON a.id = o.agent_id
-          WHERE LOWER(TRIM(o.recipient_email, ${EMAIL_TRIM_CHARS})) = ? AND o.vertical_id = 'rfb' AND COALESCE(a.vertical_id, 'rfb') = 'rfb'
+          WHERE LOWER(TRIM(o.recipient_email, ${EMAIL_TRIM_CHARS})) = ? AND o.vertical_id = 'rfb' AND COALESCE(a.vertical_id, 'rfb') = 'rfb' AND COALESCE(a.is_active, 1) = 1
           LIMIT ?`
       ).all(target, SHARED_EMAIL_CANDIDATES_MAX) as Array<{ id: string }>;
       for (const r of delivered) candidates.add(r.id);

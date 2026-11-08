@@ -40,6 +40,7 @@
 import { Router, Request, Response } from "express";
 import { getDb, isContentQualified, humanAgentViewSql, LEGACY_AGENT_VIEW_SOURCE, POOL_RETAIL_SHOP_GATE_SQL, retailShopPoolBlockers } from "../database/init";
 import { isBlocked } from "../services/blocklist-service";
+import { hasContactRetentionMarkers } from "../services/privacy-retention";
 import { customerRuleSql } from "../services/customer-rule";
 import { publicListableSql } from "../services/agent-visibility";
 import {
@@ -413,7 +414,18 @@ export function computeOutreachCandidates(
         JOIN crm_messages cm ON cm.thread_id = ct.id
         WHERE cc.agent_id = a.id
           AND cm.direction = 'in'
-      ) THEN 1 ELSE 0 END AS has_replied,
+      )${
+        // Slettefrist slice A: a reply whose messages the 24-month retention
+        // job deleted is kept on the contact (retention_last_inbound_at).
+        hasContactRetentionMarkers(db)
+          ? `
+      OR EXISTS (
+        SELECT 1 FROM crm_contacts ccr
+        WHERE ccr.agent_id = a.id
+          AND ccr.retention_last_inbound_at IS NOT NULL
+      )`
+          : ""
+      } THEN 1 ELSE 0 END AS has_replied,
       CASE WHEN (
         EXISTS (
           SELECT 1 FROM crm_contacts cc2

@@ -3,7 +3,8 @@
 // many people came to a profile page from an AI assistant's answer (ChatGPT,
 // Claude …), per UTC day and AI. The rows are written in batches by
 // profile-ai-clicks.ts. Pure: no database/init import, so it can run in the
-// stats workers. No route or UI reads it yet (later display slices).
+// stats workers. Read by the public «Klikk fra AI-svar · 60d» tile (slice 5a,
+// profile-ai-clicks-tile.ts) through getProfileAiClicksTile.
 
 import type Database from "better-sqlite3";
 
@@ -113,4 +114,37 @@ export function getPlatformAiClicks(db: Db, vertical: string, nowMs: number, lim
     countingSince: firstStoredDay(db, vertical, undefined),
     topProfiles60d,
   };
+}
+
+/** What the public «Klikk fra AI-svar» tile needs (slice 5a): the 60-day sums and the vertical's first counted day. */
+export interface ProfileAiClicksTile {
+  windowDays: number;
+  /**
+   * First day the counting existed for the vertical ('YYYY-MM-DD', UTC):
+   * MIN(day) in profile_ai_clicks over the whole vertical, or null when the
+   * vertical has no rows yet. Deliberately the vertical's first day, not the
+   * profile's own: like the sister tile's countingSince (one start date for
+   * every profile, profile-ai-deliveries-compute.ts), so a profile whose first
+   * click came last week is not shown as «siden <last week>» when it has in
+   * fact been counted since the vertical's start. A data-derived day rather
+   * than a deploy constant because profile_ai_clicks has no restart to hide
+   * (every stored row counts); the first stored day can only be later than
+   * the deploy, never earlier, so «siden <dato>» never overstates the period.
+   */
+  countingSince: string | null;
+  total: number;
+  byVendor: Record<AiClickVendor, number>;
+}
+
+/**
+ * The tile's read: one grouped sum for the profile over the last 60 days (the
+ * table's unique key starts with vertical_id, profile_id) and one MIN(day) for
+ * the vertical (index on vertical_id, day). Only daily sums: never a single
+ * visit. Rows are written for people only (profile-ai-clicks.ts filters bots,
+ * AI fetchers and our own traffic before anything is stored).
+ */
+export function getProfileAiClicksTile(db: Db, vertical: string, profileId: string, nowMs: number): ProfileAiClicksTile {
+  if (!tableExists(db)) return { windowDays: AI_CLICK_WINDOW_DAYS, countingSince: null, ...emptyAiClickSums() };
+  const s = sums(db, vertical, profileId, windowStart(AI_CLICK_WINDOW_DAYS, nowMs));
+  return { windowDays: AI_CLICK_WINDOW_DAYS, countingSince: firstStoredDay(db, vertical, undefined), total: s.total, byVendor: s.byVendor };
 }

@@ -456,8 +456,8 @@ export async function runHomepageContentRefreshExtractionParityTests(opts: { log
           (mod as any).resolveHcrRouteTimeBudgetMs({ HCR_ROUTE_TIME_BUDGET_MS: "999999" }),
           (mod as any).resolveHcrRouteTimeBudgetMs({ HCR_ROUTE_TIME_BUDGET_MS: "99999999999999999999" }),
         ],
-        [25, 5, 3, 100, 25, 40000, 1500, 40000, 40000, 2000, 40000, 40000, 40000, 300000, 300000],
-        "R3: limit (body > query, default 25, cap 100) and budget (env all-digit positive integer, clamped to 300000, else 40000) resolution",
+        [25, 5, 3, 100, 25, 20000, 1500, 20000, 20000, 2000, 20000, 20000, 20000, 300000, 300000],
+        "R3: limit (body > query, default 25, cap 100) and budget (env all-digit positive integer, clamped to 300000, else 20000) resolution",
       );
     }
   } catch (err: any) {

@@ -349,6 +349,9 @@ export function initDentalSchema(db: Database.Database): void {
     "CREATE INDEX IF NOT EXISTS idx_excl_url ON dental_exclusions(hjemmeside_url)",
     "CREATE INDEX IF NOT EXISTS idx_excl_reason ON dental_exclusions(reason)",
     "CREATE INDEX IF NOT EXISTS idx_places_api_call_log_called_at ON places_api_call_log(called_at)",
+    // dev-request 2026-09-02-dental-permanent-triage-needs-review-drain (3c-1):
+    // the dental-triage picker looks up a row's recent triage findings.
+    "CREATE INDEX IF NOT EXISTS idx_dvf_agent_check ON dental_verifier_findings(agent_id, check_type)",
   ];
   for (const stmt of indexes) {
     try {

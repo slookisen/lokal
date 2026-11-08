@@ -39,7 +39,8 @@ import { getDb } from "../database/init";
 import { knowledgeService, type ExternalLink } from "../services/knowledge-service";
 import { analyticsService, parseUserAgent } from "../services/analytics-service";
 import { addUtmParams } from "../utils/url-utm";
-import { extractUtmFromQuery, extractUtmFromUrl } from "../utils/utm-capture";
+import { extractUtmFromUrl } from "../utils/utm-capture";
+import { classifyContactAiSource, readContactAttribution } from "../services/contact-ai-attribution";
 
 // ─── Shared validation ───────────────────────────────────────────
 // agentId is our own generated id (see routes/marketplace.ts registration) —
@@ -139,22 +140,31 @@ function isOwnReferer(referer: string | undefined, host: string | undefined): bo
   }
 }
 
-/** Record one contact_clicks row. Never throws — callers treat tracking as best-effort. */
-function recordClick(req: Request, res: Response, agentId: string, kind: string): void {
+/**
+ * Record one contact_clicks row. Never throws — callers treat tracking as best-effort.
+ * `client` is where the page put its remembered landing, first one wins per key (slice 4 of
+ * 2026-10-14-klikk-fra-ai-svar-per-profil): the beacon body for POST, the
+ * query string for GET /ut/. Only the whitelisted keys are read
+ * (readContactAttribution); the AI key is classified here, never taken
+ * from the client.
+ */
+function recordClick(req: Request, res: Response, agentId: string, kind: string, client: unknown[]): void {
   try {
     const db = getDb();
     const ua = analyticsService.getUserAgent(req);
     const sessionId = analyticsService.getOrCreateSessionId(req, res);
     const isBot = parseUserAgent(ua).isBot ? 1 : 0;
-    // B4: utm_source of the visit — own query string first (GET /ut/...),
-    // else the same-origin Referer (the profile page the beacon fired from).
-    const utmSource =
-      extractUtmFromQuery(req.query).utm_source ||
-      (isOwnReferer(req.get("referer"), req.hostname) ? extractUtmFromUrl(req.get("referer")).utm_source : null) ||
-      null;
+    // B4: utm_source of the visit — the page's remembered landing first
+    // (beacon body / /ut/ query), else the same-origin Referer (empty while
+    // Referrer-Policy is no-referrer, kept for the day it is not).
+    const sent = readContactAttribution(...client);
+    const ref = isOwnReferer(req.get("referer"), req.hostname) ? extractUtmFromUrl(req.get("referer")) : null;
+    const utmSource = sent.utm.utm_source || ref?.utm_source || null;
+    const utmCampaign = sent.utm.utm_campaign || ref?.utm_campaign || null;
+    const aiSource = classifyContactAiSource({ utm_source: utmSource, utm_campaign: utmCampaign, aiRef: sent.aiRef });
     db.prepare(
-      `INSERT INTO contact_clicks (agent_id, kind, session_id, is_bot, utm_source) VALUES (?, ?, ?, ?, ?)`,
-    ).run(agentId, kind, sessionId, isBot, utmSource);
+      `INSERT INTO contact_clicks (agent_id, kind, session_id, is_bot, utm_source, ai_source) VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(agentId, kind, sessionId, isBot, utmSource, aiSource);
   } catch (err) {
     console.error("[contact-tracking] failed to record click:", err);
   }
@@ -178,7 +188,7 @@ trackRouter.post("/contact-click", (req: Request, res: Response): void => {
       return;
     }
 
-    recordClick(req, res, agentId, kind);
+    recordClick(req, res, agentId, kind, [body, req.query]);
     res.status(204).end();
   } catch (err) {
     console.error("[contact-tracking] contact-click error:", err);
@@ -212,7 +222,7 @@ redirectRouter.get("/:agentId/:kind", (req: Request, res: Response): void => {
       return;
     }
 
-    recordClick(req, res, agentId, kind);
+    recordClick(req, res, agentId, kind, [req.query]);
     res.redirect(302, target);
   } catch (err) {
     console.error("[contact-tracking] /ut redirect error:", err);

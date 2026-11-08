@@ -5,7 +5,7 @@ import {
   verifyOwnerSession, isVerifiedOwner, OWNER_NOT_VERIFIED_MESSAGE, portalWriteRefusedPage,
   portalShell, ownerNotVerifiedPage,
   ownerOrderEmailEnabledFor, currentOrderRecipient, pendingOrderEmailChange, requestOwnerOrderEmailChange,
-  parseResumeDate, ownerUnifiedSessionEnabledFor,
+  parseResumeDate, ownerUnifiedSessionEnabledFor, ownerEmailNeedsClaimantLoginPage,
 } from "./owner-portal";
 import { isCrossSiteWrite } from "../middleware/same-origin-write";
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
@@ -49,12 +49,13 @@ import { publicStatsMinViews } from "../services/public-stats-threshold";
 import { slugify } from "../utils/slug";
 import { findOwnerFeature } from "../owner-features/registry";
 import { readOwnerFeatureInterest, recordOwnerFeatureInterest } from "../owner-features/interest";
-import { countOrderableProducts, orderCapNewPerDay } from "../services/cart-service";
+import { countOrderableProducts, orderCapNewPerBuyerPerDay, orderCapNewPerDay, orderCapOpenPerBuyer, orderCapProducerCeilingPerDay } from "../services/cart-service";
 import { ownerOrderabilityPortalEnabledFor } from "../services/owner-orderability";
 import { readOrderNotificationsOptIn, writeOrderNotificationsOptIn } from "../services/order-opt-in";
 import { OWNER_PAUSE_TABLE } from "../services/agent-visibility";
 import { orderReminderHours, orderAutocancelHours } from "../services/order-followups";
-import { isOrderCapNoticeEnabled } from "../services/order-cap-notice";
+import { isOrderCapNoticeEnabled, isOrderCapV2Enabled } from "../services/order-cap-notice";
+import { isBuyerReceiptsEnabled } from "../services/order-receipt-service";
 
 // ─────────────────────────────────────────────────────────────────
 // «Mine valg» owner API — dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2a
@@ -541,7 +542,16 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
       orderEmail,
       pauseUntil: resolvedKey("visibility.profile")?.value === false ? currentPauseUntil(agentId) : null,
       ordersReadMoreUrl: ORDERS_FAQ_URL,
-      orderTimings: { reminderHours: orderReminderHours(), autocancelHours: orderAutocancelHours(), dailyCap: orderCapNewPerDay(), capNotice: isOrderCapNoticeEnabled() },
+      orderTimings: {
+        reminderHours: orderReminderHours(), autocancelHours: orderAutocancelHours(), dailyCap: orderCapNewPerDay(), capNotice: isOrderCapNoticeEnabled(),
+        // T11: the v2 limits (and the receipts promise) only with ORDER_CAP_V2_ENABLED on; off, nothing new is passed.
+        ...(isOrderCapV2Enabled()
+          ? {
+            limits: { openPerBuyer: orderCapOpenPerBuyer(), perBuyerPerDay: orderCapNewPerBuyerPerDay(), producerCeilingPerDay: orderCapProducerCeilingPerDay() },
+            buyerReceipts: isBuyerReceiptsEnabled(),
+          }
+          : {}),
+      },
       stats: ownerPageStats(agent.id, String(agent.name || ""), db),
       statsHref: ownerStatsHref(agent.id),
     };
@@ -766,6 +776,7 @@ router.post("/eier/:agentId/valg/ordre-epost", express.urlencoded({ extended: fa
       console.log(`[owner-features] owner requested a new order address for agent ${agentId} (page)`);
       return back("ordre_epost_sendt");
     }
+    if (out.status === 403 && out.body?.error === "claimant_login_required") return res.status(403).send(ownerEmailNeedsClaimantLoginPage(agentId, "order_email"));
     const mapped = ORDER_EMAIL_MESSAGES[String(out.body?.error || "")];
     if (mapped) return back(mapped);
     return back("ordre_epost_feil");

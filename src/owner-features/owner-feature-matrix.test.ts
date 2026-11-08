@@ -359,6 +359,10 @@ export async function runOwnerFeatureMatrixTests(opts: { log?: boolean } = {}): 
         isVerified: id !== ids.unbadged && id !== ids.nightlyControl,
       });
     }
+    // dev-request 2026-11-06-rfb-krav-for-portal-og-okter-ved-eierskifte (AC 3):
+    // a new order address only from the verified claimant's own login.
+    db.prepare("INSERT INTO agent_claims (id, agent_id, claimant_email, claimant_name, status, verified_at) VALUES (?, ?, ?, 'Eier', 'verified', '2026-10-01T00:00:00.000Z')")
+      .run(`claim-${ids.orderEmail}`, ids.orderEmail, emailOf(ids.orderEmail));
     // auto.updates: an empty category list (the field fill_empty may fill) —
     // set here, so the producer is in no category list the other cases read —
     // and an about / description an enrichment source recorded verbatim (the

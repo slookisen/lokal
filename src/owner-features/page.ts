@@ -75,6 +75,7 @@ import { OWNER_TOKEN_CSS } from "../owner-ui/tokens";
 import { OWNER_ENHANCE_SCRIPT, OWNER_STATUS_CSS, OWNER_STATUS_HTML } from "../owner-ui/enhance";
 import { OWNER_COMMS_GROUP_NOTE, OWNER_NEWS_CONSENT_TEXT, OWNER_NEWS_PLACEMENT_QUESTION, OWNER_NOTIFY_GROUP_NOTE } from "./news-consent";
 import { stockSoftExpiryActiveFor } from "../services/stock-soft-expiry";
+import { OWNER_ORDER_LIMITS_HEADING, ownerAutocancelLine, ownerOrderLimitLines, type OrderLimitsConfig } from "./order-texts";
 
 /** Entries that need this key on are shown only when it is on (spec «Grensesnitt»). */
 export const OWNER_PAGE_REVEAL_KEY = "orders.enabled";
@@ -218,7 +219,17 @@ export interface OwnerPageModel {
   /** FAQ anchor for «Les mer» — only when that page is published (else null: inline text only). */
   ordersReadMoreUrl?: string | null;
   /** Real follow-up timings for the explanation (ORDER_REMINDER_HOURS / ORDER_AUTOCANCEL_HOURS). */
-  orderTimings?: { reminderHours: number; autocancelHours: number; dailyCap?: number; capNotice?: boolean };
+  orderTimings?: {
+    reminderHours: number; autocancelHours: number; dailyCap?: number; capNotice?: boolean;
+    /**
+     * T11: present only with ORDER_CAP_V2_ENABLED on — the per-buyer limits and
+     * the platform ceiling (order-texts.ts) replace the daily-cap line, and
+     * the auto-cancel line promises «kunden får beskjed» only with
+     * `buyerReceipts` (ORDER_BUYER_RECEIPTS_ENABLED). Absent = B4 text as before.
+     */
+    limits?: OrderLimitsConfig;
+    buyerReceipts?: boolean;
+  };
   /**
    * S2f statistics block at the top (v2 principle 1). undefined = no block;
    * null = the read failed (the block says so and keeps the link).
@@ -614,7 +625,21 @@ function ordersExplainHtml(m: OwnerPageModel): string {
   const t = m.orderTimings ?? { reminderHours: 24, autocancelHours: 72 };
   // B4: the daily cap, from the configuration the route passes in
   // (ORDER_CAP_NEW_PER_PRODUCER_PER_DAY); no line when it is not given.
-  const capLine = t.dailyCap && t.dailyCap > 0
+  // T11 (ORDER_CAP_V2_ENABLED, `t.limits` given): the per-buyer limits and the
+  // platform ceiling replace the daily-cap line (texts: order-texts.ts), and
+  // the auto-cancel line says «kunden får beskjed» only with buyer receipts on.
+  // Without `t.limits` the output is byte-identical to B4.
+  const limits = t.limits;
+  const limitsBlock = limits
+    ? `\n            <h3>${esc(OWNER_ORDER_LIMITS_HEADING)}</h3>` +
+      `\n            <ul data-order-limits="${esc(limits.openPerBuyer)}/${esc(limits.perBuyerPerDay)}/${esc(limits.producerCeilingPerDay)}">` +
+      ownerOrderLimitLines(limits).map((l) => `\n              <li>${esc(l)}</li>`).join("") +
+      `\n            </ul>`
+    : "";
+  const autocancelLine = limits
+    ? esc(ownerAutocancelLine(t.autocancelHours, t.buyerReceipts === true))
+    : `Er bestillingen fortsatt ubesvart etter ${esc(t.autocancelHours)} timer, blir den kansellert, og kunden får beskjed.`;
+  const capLine = !limits && t.dailyCap && t.dailyCap > 0
     ? `<li data-order-cap="${esc(t.dailyCap)}">Du kan få inntil ${esc(t.dailyCap)} bestillinger per døgn. Kommer det flere, blir de gjort om til en kontaktforespørsel: kunden får kontaktinformasjonen din i stedet${t.capNotice ? ", og du får én samlet e-post om det dagen etter" : ""}.</li>`
     : "";
   const readMore = m.ordersReadMoreUrl
@@ -628,12 +653,12 @@ function ordersExplainHtml(m: OwnerPageModel): string {
               <li>I e-posten bekrefter eller avslår du bestillingen med ett klikk. Du trenger ikke logge inn.</li>
               <li>Kunden henter varene hos deg og betaler når varene hentes. Rett fra Bonden tar ikke betalt.</li>
               ${capLine}
-            </ul>
+            </ul>${limitsBlock}
             <h3>Dette må du gjøre</h3>
             <ul>
               <li>Svar på hver bestilling: bekreft eller avslå.</li>
               <li>Svarer du ikke, får du en påminnelse etter ${esc(t.reminderHours)} timer.</li>
-              <li>Er bestillingen fortsatt ubesvart etter ${esc(t.autocancelHours)} timer, blir den kansellert, og kunden får beskjed.</li>
+              <li>${autocancelLine}</li>
               <li>Hold varene oppdatert, så kunden bare kan bestille det du har.</li>
             </ul>
             <h3>Slik slår du av</h3>

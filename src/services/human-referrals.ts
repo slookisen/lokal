@@ -116,6 +116,13 @@ const AI_REFERRAL_HOSTS: Array<[string, string, string]> = [
   ["you.com", "you", "You.com"],
 ];
 
+/**
+ * The AI answer hosts above, for the profile page's landing capture
+ * (contact-ai-attribution.ts, slice 4): the browser only flags the landing,
+ * the server classifies it again through classifyAiClickSource.
+ */
+export const AI_REFERRAL_HOST_DOMAINS: readonly string[] = AI_REFERRAL_HOSTS.map(([d]) => d);
+
 const AI_LABELS: Record<string, string> = {
   chatgpt: "ChatGPT", claude: "Claude", perplexity: "Perplexity", gemini: "Gemini", copilot: "Copilot",
   mistral: "Mistral", metaai: "Meta AI", grok: "Grok", deepseek: "DeepSeek", you: "You.com", kagi: "Kagi Assistant", annenai: "Annen AI",
