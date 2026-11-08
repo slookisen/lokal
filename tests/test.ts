@@ -37553,6 +37553,19 @@ const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
     failed++;
     failures.push("owner-items-t13-v1b: unexpected error: " + String(err?.message || err));
   }
+  // T15a (eierportal skall og meny, dev-request 2026-10-30-rfb-eierportal-testrunde-1 punkt 9) — own in-memory DB.
+  try {
+    const { runOwnerShellT15aTests } = require("../src/routes/owner-shell-t15a.test") as
+      typeof import("../src/routes/owner-shell-t15a.test");
+    const t15a = await runOwnerShellT15aTests({ log: false });
+    passed += t15a.passed;
+    failed += t15a.failed;
+    for (const f of t15a.failures) failures.push("owner-shell-t15a: " + f);
+    console.log(`  owner-shell-t15a: ${t15a.passed} passed, ${t15a.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-shell-t15a: unexpected error: " + String(err?.message || err));
+  }
   // B2 (lagerpåminnelse, products.stock_check, dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier) — own in-memory DB.
   try {
     const { runStockCheckReminderB2Tests } = require("../src/routes/stock-check-reminder-b2.test") as

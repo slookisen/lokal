@@ -39,6 +39,7 @@ import {
 } from "../owner-features/news-consent";
 import { formatOwnerFeatureValue, ownerPageStatsFrom, renderOwnerFeaturesPageBody, renderOwnerFeaturesPageFragment, type OwnerPageModel, type OwnerPageNotice, type OwnerPageStats } from "../owner-features/page";
 import { OWNER_FRAGMENT_HEADER } from "../owner-ui/enhance";
+import { ownerDashboardActiveFor, ownerShellStatsHref, renderOwnerShellStart } from "../owner-ui/shell";
 import {
   OWNER_ANCHOR_FALLBACK, OWNER_ANCHOR_LEVEL, OWNER_ANCHOR_LEVEL_PREVIEW, OWNER_ANCHOR_NEWS_QUESTION, OWNER_ANCHOR_PLANNED,
   isOwnerPageAnchor, ownerBatchAnchor, ownerPageTail, ownerPlannedAnchor, ownerRowAnchor, ownerUndoAnchor,
@@ -399,7 +400,7 @@ export const ORDERS_FAQ_URL: string | null = null;
 
 /** «Se all statistikk»: the Statistikk tab in /selger (selger.html opens it on #statistikk). */
 export function ownerStatsHref(agentId: string): string {
-  return `/selger?agent=${encodeURIComponent(agentId)}#statistikk`;
+  return ownerShellStatsHref(agentId);
 }
 
 /**
@@ -566,7 +567,11 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
       res.setHeader("Content-Type", "text/html; charset=utf-8");
       return res.send(html);
     }
-    return res.send(portalShell(`Mine valg · ${agent.name}`, renderOwnerFeaturesPageBody(model)));
+    // T15a: the shared owner shell — flag + allowlist (pageGate) + verified owner (pageGate); off = as before.
+    const shellHtml = ownerDashboardActiveFor(VERTICAL, agentId, true)
+      ? renderOwnerShellStart({ agentId, current: "valg", profileSlug: slugify(String(agent.name || "")) })
+      : null;
+    return res.send(portalShell(`Mine valg · ${agent.name}`, renderOwnerFeaturesPageBody(model), shellHtml ? { ownerShellHtml: shellHtml } : {}));
   } catch (e: any) {
     console.error("[owner-features] GET /eier/:agentId/valg failed:", e);
     return simplePage(500, "Feil", `<h1>Noe gikk galt</h1><p>Prøv igjen senere.</p>`)(res);
