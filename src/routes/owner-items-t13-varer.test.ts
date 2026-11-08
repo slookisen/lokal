@@ -223,20 +223,21 @@ export async function runOwnerItemsT13Tests(opts: { log?: boolean } = {}): Promi
     function expected(pid: string, soft: boolean, at: Date): Exp {
       const upd = UPD[pid] ?? null;
       const ageDays = upd ? (at.getTime() - new Date(upd.replace(" ", "T") + "Z").getTime()) / DAY : Infinity;
-      const fresh = (u: string): Exp => ({ group: "orderable", chip: "orderable", line: `Sist bekreftet ${fmt(u, at)}. Kan bestilles til ${fmt(plus(u, soft ? 60 : 14), at)}.`, action: null, more: ["confirm_now"] });
+      const fresh = (u: string): Exp => ({ group: "orderable", chip: "orderable", line: `Sist bekreftet ${fmt(u, at)}. Kan bestilles til ${fmt(plus(u, soft ? 60 : 14), at)}.`, action: null, more: ["confirm_now", "mark_sold_out"] });
       const expiredAt = (u: string) => fmt(plus(u, soft ? 60 : 14), at);
-      const must = (line: string): Exp => ({ group: "needs_action", chip: "must_confirm", line, action: "confirm", more: [] });
+      // V1b: «Merk som utsolgt» under «Mer» on every producer-stated row that is not sold out.
+      const must = (line: string): Exp => ({ group: "needs_action", chip: "must_confirm", line, action: "confirm", more: ["mark_sold_out"] });
       switch (pid) {
         case "t13-fresh": case "t13-soon": case "t13-soft": case "t13-hard": {
           if (ageDays <= 14) return fresh(upd!);
-          if (soft && ageDays <= 60) return { group: "needs_action", chip: "should_confirm", line: `Sist bekreftet ${fmt(upd!, at)}. Kundene ser denne datoen.`, action: "confirm", more: [] };
+          if (soft && ageDays <= 60) return { group: "needs_action", chip: "should_confirm", line: `Sist bekreftet ${fmt(upd!, at)}. Kundene ser denne datoen.`, action: "confirm", more: ["mark_sold_out"] };
           return must(`Lagerstatus gikk ut ${expiredAt(upd!)}. Kundene kan ikke bestille varen.`);
         }
-        case "t13-admin": return { group: "orderable", chip: "orderable", line: X.lineAdminConfirmed, action: null, more: [] };
+        case "t13-admin": return { group: "orderable", chip: "orderable", line: X.lineAdminConfirmed, action: null, more: ["mark_sold_out"] };
         case "t13-nodate": return must(X.lineExpiredNoDate);
         case "t13-out": return { group: "sold_out", chip: "sold_out", line: `Merket som utsolgt ${fmt(upd!, at)}.`, action: "back_in_stock", more: [] };
         case "t13-unknown": return must(X.lineNotInStock);
-        case "t13-exp-noprice": return { group: "needs_action", chip: "must_confirm", line: T.lineMissingPrice, action: null, more: [] };
+        case "t13-exp-noprice": return { group: "needs_action", chip: "must_confirm", line: T.lineMissingPrice, action: null, more: ["mark_sold_out"] };
         case "t13-scraped": return { group: "from_website", chip: "must_confirm", line: T.lineFromWebsite, action: "confirm_price_and_stock", more: [] };
         case "t13-scraped-noprice": return { group: "from_website", chip: "must_confirm", line: T.lineMissingPrice, action: null, more: [] };
         case "t13-label": return { group: "not_here", chip: "not_orderable", line: "Dette er et kategorinavn, ikke en vare.", action: null, more: [] };
@@ -309,8 +310,8 @@ export async function runOwnerItemsT13Tests(opts: { log?: boolean } = {}): Promi
       }
       assertTrue(html.includes(">Bekreft på lager</button>") && html.includes(">Bekreft pris og lager</button>") && html.includes(">På lager igjen</button>")
         && html.includes("<summary>Mer</summary>") && html.includes(">Bekreft på lager nå</button>"), "card-11: the actions and «Mer»");
-      assertTrue(!html.includes("Merk som utsolgt"), "card-12: no «Merk som utsolgt» in V1a");
-      assertTrue(html.includes(`action="/eier/${TP}/varer/ny"`) && html.includes('<label for="ny_name">Navn</label>'), "card-13: the add form, as before");
+      assertTrue(html.includes(">Merk som utsolgt</button>"), "card-12: «Merk som utsolgt» under «Mer» (V1b)");
+      assertTrue(html.includes(`action="/eier/${TP}/varer/ny"`) && html.includes('<label for="ny_name">Navn</label>'), "card-13: the add form");
       // Every row has li#vare-<id> and at most one primary action.
       for (const pid of TP_ROWS) {
         const m = html.match(new RegExp(`<li [^>]*id="vare-${pid}"[\\s\\S]*?</li>`));
@@ -352,7 +353,7 @@ export async function runOwnerItemsT13Tests(opts: { log?: boolean } = {}): Promi
       }
       const html = card.renderOwnerItemsSection({ agentId: TP, model, now, canEdit: true });
       const li = (pid: string) => (html.match(new RegExp(`<li [^>]*id="vare-${pid}"[\\s\\S]*?</li>`)) || [""])[0];
-      assertTrue(li("t13-admin").includes('data-action=""') && !li("t13-admin").includes("<form") && !li("t13-admin").includes("<button"), "none-2: an admin-confirmed row has no button at all");
+      assertTrue(li("t13-admin").includes('data-action=""') && !li("t13-admin").replace(/<details[\s\S]*?<\/details>/g, "").includes("<button"), "none-2: an admin-confirmed row has no primary button (V1b: only «Merk som utsolgt» under «Mer»)");
       assertTrue(li("t13-fresh").includes('data-action=""') && !li("t13-fresh").replace(/<details[\s\S]*?<\/details>/g, "").includes("<button"), "none-3: a fresh row has no button (only «Mer»)");
     }
 

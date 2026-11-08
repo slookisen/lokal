@@ -1,8 +1,10 @@
 // ─── T13 V1a — the owner portal's «Varer» card: one row's view ─────────────
 // dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 7 («Varer: en
 // arbeidsliste, ikke en regelforklaring»), slice T13, part V1a (view + safe
-// bulk). V1b («Merk som utsolgt», kategori, lagervalg, ferdigpakket) is not
-// here.
+// bulk). V1b adds «Merk som utsolgt» (a «Mer» action on in-stock rows) and
+// the texts of the new «Legg til vare» form (kategori, lagervalg,
+// ferdigpakket); readOwnerItems() also reads orders.auto_confirm for the
+// form's default.
 //
 //   ownerItemView(row, ctx)   pure: the row's group, status chip (brikke),
 //                             one reason line, at most one primary action and
@@ -31,6 +33,7 @@ import {
 import { getSupplyGraphHardStaleDays, getSupplyGraphStaleDays, producerStockExpiresAt, producerStockHardExpiresAt } from "./supply-graph";
 import { stockSoftExpiryActiveFor } from "./stock-soft-expiry";
 import { NOT_CONFIRMABLE, isConfirmable, orderabilityReasonTextNb, readOwnerProductRows } from "./owner-orderability";
+import { resolveOwnerFeature } from "../owner-features/resolve";
 
 // ─── Texts ──────────────────────────────────────────────────────────────────
 
@@ -61,6 +64,17 @@ export const OWNER_ITEMS_TEXT_NB = {
   readOnly: "Du kan se varene, men ikke endre dem med denne innloggingen.",
   today: "i dag",
   yesterday: "i går",
+  // V1b
+  moreMarkSoldOut: "Merk som utsolgt",
+  markedSoldOut: "Varen er merket som utsolgt. Kundene kan ikke bestille den.",
+  addTitle: "Legg til vare",
+  fieldName: "Navn",
+  fieldPrice: "Pris (kr)",
+  fieldUnit: "Enhet",
+  fieldCategory: "Kategori (valgfritt)",
+  fieldInStock: "Varen er på lager nå",
+  inStockOrdersOnHint: "Kunder kan bestille varen med en gang.",
+  packagedQuestion: "Er varen ferdigpakket?",
   groups: {
     needs_action: "Trenger handling",
     orderable: "Kan bestilles",
@@ -97,6 +111,32 @@ export const OWNER_ITEMS_INVENTED_TEXT_NB = {
   notConfirmedMissingPriceOne: "1 vare ble ikke bekreftet fordi den mangler pris.",
   /** The count line with m = 1 (singular). */
   countLineOne: "{n} av 1 vare kan bestilles nå.",
+  // ── V1b ──
+  /** «Er varen ferdigpakket?» answers. */
+  packagedYes: "Ja",
+  packagedNo: "Nei",
+  /** Labels of the three food fields (the spec names them, not their labels). */
+  fieldIngredients: "Ingredienser",
+  fieldAllergens: "Allergener",
+  fieldNetWeight: "Nettovekt",
+  /** Under the three food fields (they cannot be hidden without JavaScript). */
+  packagedFieldsHint: "Må fylles ut hvis varen er ferdigpakket. Kundene ser dette før de bestiller.",
+  allergensHint: "Skill med komma. Skriv «ingen» hvis varen ikke har allergener.",
+  netWeightHint: "For eksempel 250 g eller 1,5 kg.",
+  unitHint: "For eksempel kg eller stk.",
+  /** The «Varen er på lager nå» box is off by default because orders are confirmed automatically. */
+  inStockAutoConfirmHint: "Bestillinger bekreftes automatisk. Kryss av bare hvis du har varen nå.",
+  /** After «Legg til vare» with the box unticked. */
+  addedNotInStock: "Varen er lagt til. Den er ikke på lager, så kundene kan ikke bestille den ennå.",
+  /** «Merk som utsolgt» on a row that cannot be marked (category name, alcohol, service, scraped). */
+  cannotMarkSoldOut: "Denne varen kan ikke merkes som utsolgt her.",
+  /** Field errors the B1 texts (OWNER_PRODUCT_FIELD_TEXT_NB) do not cover. */
+  fieldErrors: {
+    category: "Kategori er for lang (maks 40 tegn).",
+    ingredients_required: "Ferdigpakket vare: skriv inn ingrediensene.",
+    allergens_required: "Ferdigpakket vare: skriv inn allergenene, eller «ingen».",
+    net_weight_required: "Ferdigpakket vare: skriv inn nettovekten, f.eks. 250 g.",
+  },
 } as const;
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -105,8 +145,8 @@ export type OwnerItemGroup = "needs_action" | "orderable" | "sold_out" | "from_w
 export type OwnerItemChip = "orderable" | "should_confirm" | "must_confirm" | "sold_out" | "not_orderable";
 /** The primary action: all three post to the existing confirm route. */
 export type OwnerItemAction = "confirm" | "confirm_price_and_stock" | "back_in_stock";
-/** «Mer» in V1a: only «Bekreft på lager nå». */
-export type OwnerItemMore = "confirm_now";
+/** «Mer»: «Bekreft på lager nå» (V1a) and «Merk som utsolgt» (V1b). */
+export type OwnerItemMore = "confirm_now" | "mark_sold_out";
 
 export const OWNER_ITEM_GROUP_ORDER: readonly OwnerItemGroup[] = ["needs_action", "orderable", "sold_out", "from_website", "not_here"];
 
@@ -222,9 +262,12 @@ export function ownerItemView(row: OwnerItemRow, ctx: OwnerItemViewCtx): OwnerIt
     };
   }
 
+  // V1b: «Merk som utsolgt» on every producer-stated row that is not sold out
+  // (needs a writing session; no price needed to say a row is sold out).
+  const soldOutMore: OwnerItemMore[] = ctx.canEdit ? ["mark_sold_out"] : [];
   const needs = (chip: OwnerItemChip, line: string): OwnerItemView => ({
     group: "needs_action", chip, line: missingPrice ? T.lineMissingPrice : line,
-    action: canAct ? "confirm" : null, more: [], bulkConfirmable: confirmable, bulkCandidate: true,
+    action: canAct ? "confirm" : null, more: soldOutMore, bulkConfirmable: confirmable, bulkCandidate: true,
   });
 
   // 4. Expired or not registered in stock: must be confirmed.
@@ -246,9 +289,9 @@ export function ownerItemView(row: OwnerItemRow, ctx: OwnerItemViewCtx): OwnerIt
   if (row.availability_source === "producer_dashboard") {
     const exp = ctx.softExpiry ? producerStockHardExpiresAt(row.availability_updated_at) : producerStockExpiresAt(row.availability_updated_at);
     const line = T.lineFresh.replace("{dato}", date(row.availability_updated_at)).replace("{dato2}", date(exp));
-    return { ...base, group: "orderable", chip, line, action: null, more: canAct ? ["confirm_now"] : [] };
+    return { ...base, group: "orderable", chip, line, action: null, more: [...(canAct ? ["confirm_now" as const] : []), ...soldOutMore] };
   }
-  return { ...base, group: "orderable", chip, line: X.lineAdminConfirmed, action: null };
+  return { ...base, group: "orderable", chip, line: X.lineAdminConfirmed, action: null, more: soldOutMore };
 }
 
 /** The label of a group (the «Kan bestilles» group follows orders on/off and the profile). */
@@ -273,6 +316,8 @@ export interface OwnerItemsModel {
   softExpiry: boolean;
   staleDays: number;
   hardStaleDays: number;
+  /** V1b: orders.auto_confirm (Mine valg) — «Varen er på lager nå» is then not ticked by default. */
+  autoConfirm: boolean;
 }
 
 /** The rows and counts for the card, through the order gate itself. */
@@ -300,6 +345,10 @@ export function readOwnerItems(agentId: string, db: any = getDb(), now: Date = n
     const o = db.prepare("SELECT order_notifications_opt_in AS v FROM agents WHERE id = ?").get(agentId) as { v?: number } | undefined;
     ordersOn = !!o && o.v === 1;
   } catch { ordersOn = false; }
+  let autoConfirm = false;
+  try {
+    autoConfirm = resolveOwnerFeature("rfb", agentId, "orders.auto_confirm", { db }).value === true;
+  } catch { autoConfirm = false; }
   return {
     rows,
     orderable_count: countOrderableProducts(agentId, db, now),
@@ -310,5 +359,6 @@ export function readOwnerItems(agentId: string, db: any = getDb(), now: Date = n
     softExpiry: stockSoftExpiryActiveFor(agentId, env),
     staleDays: getSupplyGraphStaleDays(),
     hardStaleDays: getSupplyGraphHardStaleDays(),
+    autoConfirm,
   };
 }
