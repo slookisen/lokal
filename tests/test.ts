@@ -47725,6 +47725,22 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── dev-request 2026-10-23-opplevagent-besoksforesporsler-automatisk-sletting: gardssalg guest-contact sweep ──");
+  try {
+    const { runGardssalgGuestContactSweepTests } = require("../src/services/gardssalg-guest-contact-sweep.test") as
+      typeof import("../src/services/gardssalg-guest-contact-sweep.test");
+    const ggs = await runGardssalgGuestContactSweepTests({ log: false });
+    passed += ggs.passed;
+    failed += ggs.failed;
+    for (const f of ggs.failures) failures.push("gardssalg-guest-contact-sweep: " + f);
+    console.log(`  gardssalg-guest-contact-sweep: ${ggs.passed} passed, ${ggs.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-guest-contact-sweep: unexpected error: " + String(err?.message || err));
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-08-23-rfb-andrelinje-verifisering-lav-terskel (fix-up): marketplace-catalog excludes verified_second_line ──");
   try {
     const { runMarketplaceCatalogSecondLineTests } = require("../src/routes/marketplace-catalog-second-line.test") as

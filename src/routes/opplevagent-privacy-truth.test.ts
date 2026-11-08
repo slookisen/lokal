@@ -189,7 +189,7 @@ export async function runOpplevagentPrivacyTruthTests(opts: { log?: boolean } = 
   assertTrue(/utsendingslogg/.test(noT) && /send log/.test(enT) && /korrespondansen/.test(noT) && /correspondence/.test(enT),
     "both parts say the send log and the correspondence are stored");
   assertTrue(/kontakt@opplevagent\.no/.test(noT) && /kontakt@opplevagent\.no/.test(enT), "deletion/objection contact address is on the page in both parts");
-  assertTrue(/13\. oktober 2026/.test(noT) && /13 October 2026/.test(enT), "both parts show today's updated date, 13 October 2026");
+  assertTrue(/8\. november 2026/.test(noT) && /8 November 2026/.test(enT), "both parts show today's updated date, 8 November 2026");
 
   // 2. «fjern» hides, does not delete.
   assertTrue(/<strong>skjules<\/strong>/.test(no) && /<strong>hidden<\/strong>/.test(en), "both parts say the profile is hidden after «fjern»");
@@ -218,7 +218,11 @@ export async function runOpplevagentPrivacyTruthTests(opts: { log?: boolean } = 
     "ground truth: the nightly prune deletes page views, searches and the MCP/A2A log after 60 days by default");
   const statsRow = /<tr><td>(Besøks- og søkestatistikk og teknisk MCP\/A2A-logg|Visit and search statistics and the technical MCP\/A2A log)<\/td><td>[^<]*<\/td><\/tr>/g;
   assertTrue((html.match(statsRow) ?? []).length === 4, "both parts have the statistics rows (legal basis and retention)");
-  const rest = html.replace(statsRow, "");
+  // The visit-request rows are the second sanctioned auto-deletion (dev-request
+  // 2026-10-23-opplevagent-besoksforesporsler-automatisk-sletting): backed by
+  // services/gardssalg-guest-contact-sweep.ts.
+  const visitRow = /<tr><td>(Besøksforespørsler|Visit requests)<\/td><td>[^<]*<\/td><\/tr>/g;
+  const rest = html.replace(statsRow, "").replace(visitRow, "");
   assertTrue(!/slettes automatisk/i.test(rest) && !/automatically deleted/i.test(rest) && !/slettes etter \d/i.test(rest) && !/deleted after \d/i.test(rest),
     "the page contains no 'slettes automatisk' / 'automatically deleted' promise outside the statistics rows");
   assertTrue(!/eierskap[^.]{0,80}(lagres|lagret)/i.test(html) && !/(lagres|lagret)[^.]{0,80}eierskap/i.test(html) &&

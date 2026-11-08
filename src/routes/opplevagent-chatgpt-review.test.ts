@@ -360,9 +360,9 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
       const legalSrc = require("fs").readFileSync(require.resolve("./experiences-seo"), "utf8") as string;
       assertTrue(!/opptil 180 dager/.test(legalSrc) && !/up to 180 days/.test(legalSrc),
         "i1: /personvern no longer promises a 180-day analytics window no job enforces");
-      assertTrue(/<tr><td>Besøksforespørsler<\/td><td>Ingen automatisk sletting i dag\. De lagres til du ber oss slette dem, og vi sletter dem da innen 30 dager/.test(legalSrc)
-        && /<tr><td>Visit requests<\/td><td>No automatic deletion today\. They are kept until you ask us to delete them, and we then delete them within 30 days/.test(legalSrc),
-        "i2: /personvern states plainly (NO + EN) that visit requests are not auto-deleted and how deletion works");
+      assertTrue(/<tr><td>Besøksforespørsler<\/td><td>Navn, e-post, telefon og kommentar slettes automatisk 30 dager etter at forespørselen er avgjort/.test(legalSrc)
+        && /<tr><td>Visit requests<\/td><td>Name, email, phone and comment are deleted automatically 30 days after the request is resolved/.test(legalSrc),
+        "i2: /personvern states plainly (NO + EN) that visit requests are auto-deleted 30 days after resolution (sweep 2026-10-23)");
       assertTrue(/1a\. Besøksforespørsler til gårdssalg/.test(legalSrc) && /1a\. Farm-sale visit requests/.test(legalSrc)
         && /ikke<\/strong> en bekreftet booking/.test(legalSrc) && /not<\/strong> a confirmed booking/.test(legalSrc),
         "i3: /vilkar describes visit requests (NO + EN): forwarded by email, never a confirmed booking");
