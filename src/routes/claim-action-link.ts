@@ -29,6 +29,16 @@
 // pending_review, at most once per claim per 24 h → 409, a failed send →
 // 502 and the link is not used up).
 //
+// Eierkrav D2: a fifth action, merge_approve («Slå sammen med <søsken> og
+// godkjenn»), behind CLAIM_MERGE_APPROVE_ENABLED (the D1 flag). Minted only
+// by the admin claim notice (marketplace.ts), bound to one sibling; asking
+// for it here → 400 (it needs a sibling id). GET shows the survivor, the
+// sibling, what the merge does and D1's dry-run summary (read-only). POST is
+// redeemed by services/claim-merge-approve.ts (redeemClaimMergeApproveLink):
+// merge + approval + link use in one transaction; a D1 refusal → 409 and the
+// link is not used up; the login mail goes out after commit. Flag off → an
+// existing link shows «not available» (503) and executes nothing.
+//
 // Flag off → both public routes 404. No dedicated rate limiter: the same as
 // the order activation link pages (routes/order-activation-link.ts); the
 // admin route sits behind adminLimiter in index.ts. The token travels in the
@@ -46,6 +56,7 @@ import {
   inspectClaimActionToken,
   isClaimAction,
   isClaimActionLinksEnabled,
+  isClaimMergeApproveEnabled,
   isClaimRequestMoreEnabled,
   redeemClaimActionLink,
   type ClaimAction,
@@ -53,6 +64,7 @@ import {
 } from "../services/claim-action-link";
 import { sendClaimApprovedLoginMail } from "../services/claim-review-actions";
 import { requestMoreConfirmation } from "../services/claim-request-more";
+import { redeemClaimMergeApproveLink, runClaimMergeApprove } from "../services/claim-merge-approve";
 import { maskEmail } from "../services/gardssalg-claim";
 import { tokenLogLabel } from "../utils/log-label";
 
@@ -91,11 +103,16 @@ claimActionAdminRouter.post("/", (req: Request, res: Response) => {
     if (!claimId || claimId.length > 200 || !actionsOk) {
       return res.status(400).json({ success: false, error: "Requires { claimId, actions? } (actions: approve | reject | revoke | request_more)" });
     }
+    // D2: merge_approve needs a sibling id and is minted by the claim notice only.
+    if (Array.isArray(body.actions) && body.actions.includes("merge_approve")) {
+      return res.status(400).json({ success: false, error: "merge_approve_needs_duplicate", message: "merge_approve is bound to a sibling profile and is only minted by the claim notice" });
+    }
     const r = createClaimActionLinks(claimId, body.actions as ClaimAction[] | undefined);
     if (!r.ok) {
       const map: Record<typeof r.reason, [number, string]> = {
         secret_missing: [503, `${CLAIM_ACTION_SECRET_ENV} is not configured`],
         action_disabled: [503, "CLAIM_REQUEST_MORE_ENABLED is not \"true\""],
+        duplicate_required: [400, "merge_approve needs a sibling id"],
         claim_not_found: [404, "No claim with that id"],
         action_not_valid_for_status: [409, "An asked-for action does not fit the claim's status"],
         no_actions_for_status: [409, "No action fits the claim's status"],
@@ -140,6 +157,7 @@ const ACTION_LABEL: Record<ClaimAction, { verb: string; done: string; button: st
   reject: { verb: "Avslå eierkravet", done: "Eierkravet er avslått", button: "Avslå eierkravet" },
   revoke: { verb: "Trekke tilbake eierskapet", done: "Eierskapet er trukket tilbake", button: "Trekk tilbake eierskapet" },
   request_more: { verb: "Be om mer bekreftelse", done: "Vi har bedt om mer bekreftelse", button: "Be om mer bekreftelse" },
+  merge_approve: { verb: "Slå sammen og godkjenne eierkravet", done: "Profilene er slått sammen og eierkravet er godkjent", button: "Slå sammen og godkjenn" },
 };
 
 const PAGE_CSS = `
@@ -197,12 +215,44 @@ function confirmFormHtml(ctx: ClaimActionContext, token: string): string {
       <p>Innsender: <strong>${escapeHtml(ctx.claimant_name)}</strong></p>
       <p>Handling: <strong>${escapeHtml(label.verb)}</strong></p>
       ${ctx.action === "request_more" ? `<p>Innsenderen får én e-post som ber om litt mer for å bekrefte at hen hører til gården. Eierkravet blir stående i køen.</p>
-      ` : ""}<p class="ep-muted">Ingenting er endret ennå. Handlingen utføres først når du trykker på knappen, og lenken kan bare brukes én gang.</p>
+      ` : ""}${ctx.action === "merge_approve" ? mergeApproveDetailsHtml(ctx) : ""}<p class="ep-muted">Ingenting er endret ennå. Handlingen utføres først når du trykker på knappen, og lenken kan bare brukes én gang.</p>
       <form method="post" action="${CLAIM_ACTION_PATH}">
         <input type="hidden" name="t" value="${escapeHtml(token)}">
         <button type="submit" class="ep-btn">${escapeHtml(label.button)}</button>
       </form>
     </div>`;
+}
+
+/** D2: survivor, sibling, what the merge does and D1's dry-run summary
+ *  (runClaimMergeApprove without apply writes nothing). */
+function mergeApproveDetailsHtml(ctx: ClaimActionContext): string {
+  let summary = "";
+  try {
+    const dry = runClaimMergeApprove({ claimId: ctx.claim_id, duplicateId: ctx.duplicate_id ?? "", apply: false, source: "action_link" });
+    if (dry.ok) {
+      const fields = [...dry.filled, ...dry.moved];
+      summary = fields.length > 0
+        ? `<p>Felt som blir fylt: ${escapeHtml(fields.join(", "))}</p>
+      `
+        : `<p>Ingen tomme felt blir fylt.</p>
+      `;
+    } else {
+      summary = `<p>Sjekk nå: kan ikke utføres (${escapeHtml(dry.error)}). Ingenting blir endret om du trykker.</p>
+      `;
+    }
+  } catch {
+    summary = "";
+  }
+  return `<p>Profilen som beholdes (har eierkravet): <strong>${escapeHtml(ctx.agent_name)}</strong></p>
+      <p>Søskenprofil som slås inn: <strong>${escapeHtml(ctx.duplicate_name)}</strong></p>
+      <p>Sammenslåingen fyller bare tomme felt på profilen som beholdes, deaktiverer søskenprofilen og godkjenner så eierkravet. Eieren får en innloggingslenke på e-post.</p>
+      ${summary}`;
+}
+
+/** D2: a merge_approve link while CLAIM_MERGE_APPROVE_ENABLED is off. */
+function mergeApproveNotAvailable(res: Response): void {
+  sendPage(res, 503, "Valget er ikke tilgjengelig",
+    `<div class="ep-card"><h1>Valget er ikke tilgjengelig</h1><p>«Slå sammen og godkjenn» er ikke slått på akkurat nå. Ingenting ble endret, og lenken er ikke brukt opp.</p></div>`);
 }
 
 type StatusState = "unavailable" | "invalid" | "used" | "expired" | "wrong_state";
@@ -243,6 +293,9 @@ router.get(CLAIM_ACTION_PATH, (req: Request, res: Response) => {
     if ((r.state === "valid" || r.state === "wrong_state") && r.ctx.action === "request_more" && !isClaimRequestMoreEnabled()) {
       return requestMoreNotAvailable(res);
     }
+    if ((r.state === "valid" || r.state === "wrong_state") && r.ctx.action === "merge_approve" && !isClaimMergeApproveEnabled()) {
+      return mergeApproveNotAvailable(res);
+    }
     if (r.state !== "valid") return statusPage(res, r.state, r.state === "wrong_state" ? r.ctx : undefined);
     return sendPage(res, 200, ACTION_LABEL[r.ctx.action].verb, confirmFormHtml(r.ctx, token));
   } catch (err) {
@@ -259,6 +312,10 @@ router.post(CLAIM_ACTION_PATH, express.urlencoded({ extended: false, limit: "4kb
     const peek = inspectClaimActionToken(token);
     if ((peek.state === "valid" || peek.state === "wrong_state") && peek.ctx.action === "request_more") {
       return await postRequestMore(res, token, peek.ctx);
+    }
+    // D2: merge_approve — merge + approve in one transaction, claim-merge-approve.ts.
+    if ((peek.state === "valid" || peek.state === "wrong_state") && peek.ctx.action === "merge_approve") {
+      return await postMergeApprove(res, token, peek.ctx);
     }
     const r = redeemClaimActionLink(token);
     if (r.state !== "done") return statusPage(res, r.state, r.state === "wrong_state" ? r.ctx : undefined);
@@ -307,6 +364,39 @@ async function postRequestMore(res: Response, token: string, ctx: ClaimActionCon
     default:
       return notFound(res);
   }
+}
+
+async function postMergeApprove(res: Response, token: string, ctx: ClaimActionContext): Promise<void> {
+  if (!isClaimMergeApproveEnabled()) return mergeApproveNotAvailable(res);
+  const r = redeemClaimMergeApproveLink(token);
+  if (!r.ok) {
+    switch (r.error) {
+      case "disabled": return mergeApproveNotAvailable(res);
+      case "link_unavailable": return statusPage(res, "unavailable");
+      case "link_used": return statusPage(res, "used");
+      case "link_expired": return statusPage(res, "expired");
+      case "not_pending_review": return statusPage(res, "wrong_state", ctx);
+      case "refused":
+        console.log(`[claim-action-link] merge_approve refused on claim ${ctx.claim_id} (${r.refusal.error}, token ${tokenLogLabel(token)})`);
+        return sendPage(res, 409, "Kan ikke utføres",
+          `<div class="ep-card"><h1>Handlingen kan ikke utføres nå</h1><p>Sammenslåingen av <strong>${escapeHtml(ctx.agent_name)}</strong> og <strong>${escapeHtml(ctx.duplicate_name)}</strong> kan ikke gjøres nå (${escapeHtml(r.refusal.error)}). Ingenting ble endret, og lenken er ikke brukt opp.</p></div>`);
+      case "link_invalid":
+      default:
+        return notFound(res);
+    }
+  }
+  console.log(
+    `[claim-action-link] merge_approve performed on claim ${r.claimId} (agent ${r.agentId}, merged ${r.duplicateId}, filled ${r.filled.length}, moved ${r.moved.length}, source action_link, token ${tokenLogLabel(token)})`,
+  );
+  // Same login mail as claim-review-approve / D1, after the commit; a failure
+  // only means no mail, never an error page.
+  const sent = await sendClaimApprovedLoginMail(r.claimId, { agentId: r.agentId, email: r.approved.email }, "[claim-action-link] merge_approve");
+  const extra = sent
+    ? `<p>Eieren har fått en innloggingslenke på e-post (${escapeHtml(maskEmail(r.approved.email))}).</p>`
+    : `<p>Innloggingslenken ble ikke sendt på e-post. Eieren kan logge inn med e-postadressen sin i eierportalen.</p>`;
+  const label = ACTION_LABEL.merge_approve;
+  return sendPage(res, 200, label.done,
+    `<div class="ep-card"><h1>${escapeHtml(label.done)}</h1><p>Gård: <strong>${escapeHtml(r.agentName)}</strong></p><p>Slått sammen med: <strong>${escapeHtml(r.duplicateName)}</strong></p>${extra}</div>`);
 }
 
 export default router;

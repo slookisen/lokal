@@ -6589,12 +6589,22 @@ function initSchema(db: Database.Database): void {
         expires_at TEXT NOT NULL,
         created_by TEXT NOT NULL DEFAULT 'admin',
         used_at TEXT,
-        used_result TEXT
+        used_result TEXT,
+        duplicate_id TEXT
       )
     `);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_claim_action_links_claim ON claim_action_links(claim_id)`);
   } catch (err) {
     console.error("Migration claim_action_links failed:", err);
+  }
+  // Eierkrav D2 («Slå sammen og godkjenn» as a signed link): the sibling
+  // profile a merge_approve link is bound to (NULL for every other action).
+  // Additive and idempotent; existing rows keep NULL. A rollback leaves it in
+  // place.
+  try {
+    db.exec(`ALTER TABLE claim_action_links ADD COLUMN duplicate_id TEXT`);
+  } catch {
+    // Column already exists — expected after first migration
   }
 
   // ─── product_import_runs / product_import_run_results (dev-request

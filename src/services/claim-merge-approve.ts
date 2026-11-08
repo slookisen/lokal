@@ -37,12 +37,22 @@
 // rolled back: no half merge without an approval. The login mail is sent by
 // the caller only after commit.
 //
+// ── D2: the signed link ──────────────────────────────────────────────────
+// The admin notice for a queued claim carries one merge_approve link
+// (services/claim-action-link.ts) per mergeable sibling
+// (mergeApproveCandidates). redeemClaimMergeApproveLink runs the D1
+// operation above for the link's claim + sibling, with source action_link,
+// and uses the link up in the SAME transaction (conditional UPDATE … WHERE
+// used_at IS NULL): a refusal or error rolls everything back and the link
+// stays unused. The caller sends the login mail after commit.
+//
 // The claimant's address is never logged.
 
 import { getDb } from "../database/init";
 import { customerRuleSql } from "./customer-rule";
 import { knowledgeService } from "./knowledge-service";
 import { applyClaimApprove } from "./claim-review-actions";
+import { inspectClaimActionToken, isClaimMergeApproveEnabled } from "./claim-action-link";
 import {
   readAgentSnapshot,
   computeFillPlan,
@@ -50,10 +60,11 @@ import {
   MAP_POINT_FIELDS,
 } from "../routes/admin-agents-duplicate-merge";
 
-export const CLAIM_MERGE_APPROVE_FLAG_ENV = "CLAIM_MERGE_APPROVE_ENABLED";
-export function isClaimMergeApproveEnabled(): boolean {
-  return process.env[CLAIM_MERGE_APPROVE_FLAG_ENV] === "true";
-}
+// The flag lives in claim-action-link.ts (it also gates the D2 link).
+export { isClaimMergeApproveEnabled, CLAIM_MERGE_APPROVE_FLAG_ENV } from "./claim-action-link";
+
+/** Who ran the operation: the D1 admin route or the D2 signed link. */
+export type ClaimMergeApproveSource = "admin" | "action_link";
 
 export const CLAIM_MERGE_APPROVE_NOTE_MAX = 1000;
 
@@ -106,11 +117,14 @@ export function runClaimMergeApprove(input: {
   duplicateId: string;
   note?: string;
   apply: boolean;
+  /** Default "admin" (the D1 route; its audit text is unchanged). */
+  source?: ClaimMergeApproveSource;
 }): ClaimMergeApproveResult {
   const db = getDb();
   const { claimId, duplicateId, apply } = input;
   const note = input.note?.trim() || "";
-  const reason = `claim-merge-approve claim ${claimId}${note ? `: ${note}` : ""}`;
+  const via = input.source === "action_link" ? " via action_link" : "";
+  const reason = `claim-merge-approve${via} claim ${claimId}${note ? `: ${note}` : ""}`;
   const batchTag = `claim-merge-approve-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
 
   try {
@@ -169,6 +183,101 @@ export function runClaimMergeApprove(input: {
     if (err instanceof ApproveRefused) {
       return { ok: false, status: 409, error: "approve_failed", reason: err.reason, rolledBack: true };
     }
+    throw err;
+  }
+}
+
+// ─── D2: notice candidates + signed-link redemption ─────────────────────────
+
+export const MERGE_APPROVE_NOTICE_MAX = 3;
+
+/**
+ * The siblings the admin notice offers «Slå sammen med <navn> og godkjenn»
+ * for: read fresh with findClaimSiblingIds (the rule D1 checks), without
+ * inactive / merged profiles and profiles with an owner, sorted by id, at
+ * most MERGE_APPROVE_NOTICE_MAX. Read-only.
+ */
+export function mergeApproveCandidates(agentId: string): Array<{ id: string; name: string }> {
+  const ids = knowledgeService.findClaimSiblingIds(agentId);
+  if (ids.length === 0) return [];
+  const db = getDb();
+  const rows = db.prepare(
+    `SELECT a.id, a.name FROM agents a
+      WHERE a.id IN (${ids.map(() => "?").join(", ")})
+        AND a.is_active = 1 AND a.merged_into IS NULL AND NOT (${customerRuleSql("a")})`,
+  ).all(...ids) as Array<{ id: string; name: string | null }>;
+  return rows
+    .map((r) => ({ id: r.id, name: String(r.name || "") }))
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+    .slice(0, MERGE_APPROVE_NOTICE_MAX);
+}
+
+export type RedeemMergeApproveLinkResult =
+  | {
+      ok: true;
+      claimId: string;
+      agentId: string;
+      agentName: string;
+      duplicateId: string;
+      duplicateName: string;
+      filled: string[];
+      moved: string[];
+      approved: { email: string; isVerified: boolean };
+    }
+  | { ok: false; error: "disabled" | "link_unavailable" | "link_invalid" | "link_used" | "link_expired" | "not_pending_review" }
+  // A D1 check refused (fresh read inside the transaction): nothing written, link not used up.
+  | { ok: false; error: "refused"; refusal: ClaimMergeApproveRefusal };
+
+class LinkMergeRefused extends Error {
+  constructor(readonly refusal: ClaimMergeApproveRefusal) {
+    super(`merge_approve refused: ${refusal.error}`);
+  }
+}
+
+/**
+ * POST of a merge_approve link: one transaction that checks the link, uses it
+ * up and runs runClaimMergeApprove (apply, source action_link) for the link's
+ * claim + sibling (nested as a SAVEPOINT). A refusal or a throw rolls back the
+ * whole transaction, so the link is only used up together with the merge and
+ * the approval. Never sends mail.
+ */
+export function redeemClaimMergeApproveLink(token: unknown, opts: { now?: Date } = {}): RedeemMergeApproveLinkResult {
+  if (!isClaimMergeApproveEnabled()) return { ok: false, error: "disabled" };
+  const db = getDb();
+  const now = opts.now ?? new Date();
+  try {
+    return db.transaction((): RedeemMergeApproveLinkResult => {
+      const check = inspectClaimActionToken(token, { now, db });
+      if (check.state === "unavailable") return { ok: false, error: "link_unavailable" };
+      if (check.state === "invalid") return { ok: false, error: "link_invalid" };
+      if (check.state === "used") return { ok: false, error: "link_used" };
+      if (check.state === "expired") return { ok: false, error: "link_expired" };
+      const { ctx } = check;
+      if (ctx.action !== "merge_approve" || !ctx.duplicate_id) return { ok: false, error: "link_invalid" };
+      if (check.state === "wrong_state") return { ok: false, error: "not_pending_review" };
+
+      const used = db.prepare("UPDATE claim_action_links SET used_at = ? WHERE id = ? AND used_at IS NULL").run(now.toISOString(), ctx.link_id);
+      if (used.changes !== 1) return { ok: false, error: "link_used" };
+
+      const r = runClaimMergeApprove({ claimId: ctx.claim_id, duplicateId: ctx.duplicate_id, apply: true, source: "action_link" });
+      if (!r.ok) throw new LinkMergeRefused(r);
+      if (!r.approved) throw new Error("merge_approve: apply returned no approval");
+      db.prepare("UPDATE claim_action_links SET used_result = ? WHERE id = ?").run("merged_approved", ctx.link_id);
+      return {
+        ok: true,
+        claimId: ctx.claim_id,
+        agentId: r.agentId,
+        agentName: ctx.agent_name,
+        duplicateId: ctx.duplicate_id,
+        duplicateName: ctx.duplicate_name,
+        filled: r.filled,
+        moved: r.moved,
+        approved: r.approved,
+      };
+    })();
+  } catch (err) {
+    // Rolled back: the link is not used up and nothing was written.
+    if (err instanceof LinkMergeRefused) return { ok: false, error: "refused", refusal: err.refusal };
     throw err;
   }
 }

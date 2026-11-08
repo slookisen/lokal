@@ -50769,6 +50769,30 @@ runSerial(async () => {
 });
 
 // dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice
+// D2: a signed «Slå sammen med <søsken> og godkjenn» button (C4 action
+// merge_approve, behind CLAIM_MERGE_APPROVE_ENABLED) in the admin notice for a
+// queued claim — bound to claim + sibling (payload + duplicate_id), GET writes
+// nothing, POST runs the D1 operation once with the link used up in the same
+// transaction, refusals write nothing and keep the link. Pins getDb() to its
+// own in-memory DB, runs an in-process server, stubs the mail transporter,
+// sets env (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-30-rfb-eierkrav D2: signed «Slå sammen og godkjenn» button ──");
+  try {
+    const { runRfbClaimMergeApproveLinkD2Tests } = require("../src/routes/rfb-claim-merge-approve-link-d2.test") as
+      typeof import("../src/routes/rfb-claim-merge-approve-link-d2.test");
+    const d2 = await runRfbClaimMergeApproveLinkD2Tests({ log: false });
+    passed += d2.passed;
+    failed += d2.failed;
+    for (const f of d2.failures) failures.push("claim-merge-approve-link-d2: " + f);
+    console.log(`  claim-merge-approve-link-d2: ${d2.passed} passed, ${d2.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("claim-merge-approve-link-d2: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice
 // B2b-2: after a B2b-1 auto-approval the farm's known address (as before the
 // approval) gets «Ny eier registrert for <profil>» when it exists, differs
 // from the claimant's and is not shared; the admin notice says «sendt» /
