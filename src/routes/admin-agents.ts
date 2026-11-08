@@ -122,6 +122,7 @@ import { readDebioVerified } from "../services/debio-approval";
 import { knowledgeService } from "../services/knowledge-service";
 import { maskEmail } from "../services/gardssalg-claim";
 import { applyClaimApprove, applyClaimReject, applyClaimRevoke, sendClaimApprovedLoginMail } from "../services/claim-review-actions";
+import { isClaimRequestMoreEnabled, requestMoreConfirmation, REQUEST_MORE_NOTE_MAX } from "../services/claim-request-more";
 
 import { deleteAgentProfileTranslations } from "../services/profile-translations";
 const router = Router();
@@ -2347,6 +2348,66 @@ router.post("/claim-review-reject", (req: Request, res: Response) => {
     return;
   }
   res.json({ success: true, claimId, agentId: rejected.agentId, status: "rejected" });
+});
+
+// ─── POST /admin/agents/claim-request-more ──────────────────────────────────
+//     (dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk,
+//     slice B3a) ────────────────────────────────────────────────────────────
+//
+// «Be om mer bekreftelse»: the person who submitted a queued claim gets ONE
+// mail asking for a bit more proof (services/claim-request-more.ts, shared
+// with the signed request_more link). The claim stays pending_review; the
+// request is stamped on the claim (request_more_at/_via/_note, via 'admin').
+// Body: { claimId, note? } (note is stored, never mailed).
+//   503 claim_request_more_disabled  CLAIM_REQUEST_MORE_ENABLED is not "true"
+//   400 bad body · 404 unknown claim · 409 not_pending_review
+//   409 already_requested            one request per claim per 24 h (link or admin)
+//   502 email_send_failed            the mail did not go out (send error, or
+//       DRY_RUN without SMTP — it reached nobody). Chosen over 200 with
+//       email_sent:false so a failure is never read as done: nothing is
+//       stamped, the 24 h window does not start, and the call can be retried.
+//   200 { success, claimId, email_sent: true }
+router.post("/claim-request-more", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  if (!isClaimRequestMoreEnabled()) {
+    res.status(503).json({ success: false, error: "claim_request_more_disabled" });
+    return;
+  }
+  const body = (req.body ?? {}) as { claimId?: unknown; note?: unknown };
+  const claimId = typeof body.claimId === "string" ? body.claimId.trim() : "";
+  const noteOk = body.note === undefined || (typeof body.note === "string" && body.note.length <= REQUEST_MORE_NOTE_MAX);
+  if (!claimId || claimId.length > 200 || !noteOk) {
+    res.status(400).json({ success: false, error: `Requires { claimId, note? } (note at most ${REQUEST_MORE_NOTE_MAX} characters)` });
+    return;
+  }
+  try {
+    const r = await requestMoreConfirmation({ claimId }, "admin", { note: body.note as string | undefined });
+    if (r.ok) {
+      res.json({ success: true, claimId: r.claimId, email_sent: true });
+      return;
+    }
+    switch (r.error) {
+      case "disabled":
+        res.status(503).json({ success: false, error: "claim_request_more_disabled" });
+        return;
+      case "not_found":
+        res.status(404).json({ success: false, error: "not_found" });
+        return;
+      case "not_pending_review":
+      case "already_requested":
+        res.status(409).json({ success: false, error: r.error });
+        return;
+      case "email_failed":
+        res.status(502).json({ success: false, error: "email_send_failed", claimId: r.claimId, email_sent: false });
+        return;
+      default:
+        res.status(500).json({ success: false, error: "server_error" });
+        return;
+    }
+  } catch (err) {
+    console.error("[admin-agents] claim-request-more failed:", err instanceof Error ? err.message : "error");
+    res.status(500).json({ success: false, error: "server_error" });
+  }
 });
 
 // ─── POST /admin/agents/claim-revoke ────────────────────────────────────────

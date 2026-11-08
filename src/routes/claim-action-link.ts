@@ -20,6 +20,15 @@
 //     unknown token → 404 (reveals nothing); claim no longer in the state the
 //     action needs → 409 and the link is not used up; secret unset → 503.
 //
+// Eierkrav B3a: a fourth action, request_more («Be om mer bekreftelse»),
+// behind CLAIM_REQUEST_MORE_ENABLED. Flag off → never minted (asking for it
+// → 503 claim_request_more_disabled; the default is approve + reject as
+// before), and an existing request_more link shows «not available» (503) on
+// GET and POST without being used up. Flag on → the POST is redeemed by
+// services/claim-request-more.ts (one mail to the claimant, claim stays
+// pending_review, at most once per claim per 24 h → 409, a failed send →
+// 502 and the link is not used up).
+//
 // Flag off → both public routes 404. No dedicated rate limiter: the same as
 // the order activation link pages (routes/order-activation-link.ts); the
 // admin route sits behind adminLimiter in index.ts. The token travels in the
@@ -37,11 +46,13 @@ import {
   inspectClaimActionToken,
   isClaimAction,
   isClaimActionLinksEnabled,
+  isClaimRequestMoreEnabled,
   redeemClaimActionLink,
   type ClaimAction,
   type ClaimActionContext,
 } from "../services/claim-action-link";
 import { sendClaimApprovedLoginMail } from "../services/claim-review-actions";
+import { requestMoreConfirmation } from "../services/claim-request-more";
 import { maskEmail } from "../services/gardssalg-claim";
 import { tokenLogLabel } from "../utils/log-label";
 
@@ -76,14 +87,15 @@ claimActionAdminRouter.post("/", (req: Request, res: Response) => {
     const body = (req.body ?? {}) as { claimId?: unknown; actions?: unknown };
     const claimId = typeof body.claimId === "string" ? body.claimId.trim() : "";
     const actionsOk = body.actions === undefined ||
-      (Array.isArray(body.actions) && body.actions.length <= 3 && body.actions.every((a) => isClaimAction(a)));
+      (Array.isArray(body.actions) && body.actions.length <= 4 && body.actions.every((a) => isClaimAction(a)));
     if (!claimId || claimId.length > 200 || !actionsOk) {
-      return res.status(400).json({ success: false, error: "Requires { claimId, actions? } (actions: approve | reject | revoke)" });
+      return res.status(400).json({ success: false, error: "Requires { claimId, actions? } (actions: approve | reject | revoke | request_more)" });
     }
     const r = createClaimActionLinks(claimId, body.actions as ClaimAction[] | undefined);
     if (!r.ok) {
       const map: Record<typeof r.reason, [number, string]> = {
         secret_missing: [503, `${CLAIM_ACTION_SECRET_ENV} is not configured`],
+        action_disabled: [503, "CLAIM_REQUEST_MORE_ENABLED is not \"true\""],
         claim_not_found: [404, "No claim with that id"],
         action_not_valid_for_status: [409, "An asked-for action does not fit the claim's status"],
         no_actions_for_status: [409, "No action fits the claim's status"],
@@ -91,7 +103,8 @@ claimActionAdminRouter.post("/", (req: Request, res: Response) => {
       const [status, message] = map[r.reason];
       return res.status(status).json({
         success: false,
-        error: r.reason === "secret_missing" ? "claim_action_secret_missing" : r.reason,
+        error: r.reason === "secret_missing" ? "claim_action_secret_missing"
+          : r.reason === "action_disabled" ? "claim_request_more_disabled" : r.reason,
         message,
         ...(r.status !== undefined ? { claimStatus: r.status } : {}),
       });
@@ -126,6 +139,7 @@ const ACTION_LABEL: Record<ClaimAction, { verb: string; done: string; button: st
   approve: { verb: "Godkjenne eierkravet", done: "Eierkravet er godkjent", button: "Godkjenn eierkravet" },
   reject: { verb: "Avslå eierkravet", done: "Eierkravet er avslått", button: "Avslå eierkravet" },
   revoke: { verb: "Trekke tilbake eierskapet", done: "Eierskapet er trukket tilbake", button: "Trekk tilbake eierskapet" },
+  request_more: { verb: "Be om mer bekreftelse", done: "Vi har bedt om mer bekreftelse", button: "Be om mer bekreftelse" },
 };
 
 const PAGE_CSS = `
@@ -182,7 +196,8 @@ function confirmFormHtml(ctx: ClaimActionContext, token: string): string {
       <p>Gård: <strong>${escapeHtml(ctx.agent_name)}</strong></p>
       <p>Innsender: <strong>${escapeHtml(ctx.claimant_name)}</strong></p>
       <p>Handling: <strong>${escapeHtml(label.verb)}</strong></p>
-      <p class="ep-muted">Ingenting er endret ennå. Handlingen utføres først når du trykker på knappen, og lenken kan bare brukes én gang.</p>
+      ${ctx.action === "request_more" ? `<p>Innsenderen får én e-post som ber om litt mer for å bekrefte at hen hører til gården. Eierkravet blir stående i køen.</p>
+      ` : ""}<p class="ep-muted">Ingenting er endret ennå. Handlingen utføres først når du trykker på knappen, og lenken kan bare brukes én gang.</p>
       <form method="post" action="${CLAIM_ACTION_PATH}">
         <input type="hidden" name="t" value="${escapeHtml(token)}">
         <button type="submit" class="ep-btn">${escapeHtml(label.button)}</button>
@@ -191,6 +206,12 @@ function confirmFormHtml(ctx: ClaimActionContext, token: string): string {
 }
 
 type StatusState = "unavailable" | "invalid" | "used" | "expired" | "wrong_state";
+
+/** B3a: a request_more link while CLAIM_REQUEST_MORE_ENABLED is off. */
+function requestMoreNotAvailable(res: Response): void {
+  sendPage(res, 503, "Valget er ikke tilgjengelig",
+    `<div class="ep-card"><h1>Valget er ikke tilgjengelig</h1><p>«Be om mer bekreftelse» er ikke slått på akkurat nå. Ingenting ble endret, og lenken er ikke brukt opp.</p></div>`);
+}
 
 function statusPage(res: Response, state: StatusState, ctx?: ClaimActionContext): void {
   switch (state) {
@@ -219,6 +240,9 @@ router.get(CLAIM_ACTION_PATH, (req: Request, res: Response) => {
   const token = typeof req.query.t === "string" ? req.query.t : "";
   try {
     const r = inspectClaimActionToken(token);
+    if ((r.state === "valid" || r.state === "wrong_state") && r.ctx.action === "request_more" && !isClaimRequestMoreEnabled()) {
+      return requestMoreNotAvailable(res);
+    }
     if (r.state !== "valid") return statusPage(res, r.state, r.state === "wrong_state" ? r.ctx : undefined);
     return sendPage(res, 200, ACTION_LABEL[r.ctx.action].verb, confirmFormHtml(r.ctx, token));
   } catch (err) {
@@ -231,6 +255,11 @@ router.post(CLAIM_ACTION_PATH, express.urlencoded({ extended: false, limit: "4kb
   if (!isClaimActionLinksEnabled()) return notFound(res);
   const token = typeof req.body?.t === "string" ? req.body.t : "";
   try {
+    // B3a: request_more sends a mail — redeemed by claim-request-more.ts.
+    const peek = inspectClaimActionToken(token);
+    if ((peek.state === "valid" || peek.state === "wrong_state") && peek.ctx.action === "request_more") {
+      return await postRequestMore(res, token, peek.ctx);
+    }
     const r = redeemClaimActionLink(token);
     if (r.state !== "done") return statusPage(res, r.state, r.state === "wrong_state" ? r.ctx : undefined);
     console.log(`[claim-action-link] ${r.action} performed on claim ${r.claim_id} (agent ${r.agent_id}, token ${tokenLogLabel(token)})`);
@@ -251,5 +280,33 @@ router.post(CLAIM_ACTION_PATH, express.urlencoded({ extended: false, limit: "4kb
     return statusPage(res, "unavailable");
   }
 });
+
+async function postRequestMore(res: Response, token: string, ctx: ClaimActionContext): Promise<void> {
+  if (!isClaimRequestMoreEnabled()) return requestMoreNotAvailable(res);
+  const r = await requestMoreConfirmation({ token }, "action_link");
+  if (r.ok) {
+    console.log(`[claim-action-link] request_more performed on claim ${r.claimId} (agent ${r.agentId}, token ${tokenLogLabel(token)})`);
+    const label = ACTION_LABEL.request_more;
+    return sendPage(res, 200, label.done,
+      `<div class="ep-card"><h1>${escapeHtml(label.done)}</h1><p>Gård: <strong>${escapeHtml(r.agentName)}</strong></p><p>Innsenderen har fått én e-post. Eierkravet står fortsatt i køen.</p></div>`);
+  }
+  switch (r.error) {
+    case "disabled": return requestMoreNotAvailable(res);
+    case "link_unavailable": return statusPage(res, "unavailable");
+    case "link_used": return statusPage(res, "used");
+    case "link_expired": return statusPage(res, "expired");
+    case "not_pending_review": return statusPage(res, "wrong_state", ctx);
+    case "already_requested":
+      return sendPage(res, 409, "Allerede bedt om mer bekreftelse",
+        `<div class="ep-card"><h1>Allerede bedt om mer bekreftelse</h1><p>Innsenderen av eierkravet for <strong>${escapeHtml(ctx.agent_name)}</strong> har fått en slik e-post det siste døgnet. Ingen ny e-post ble sendt, og lenken er ikke brukt opp.</p></div>`);
+    case "email_failed":
+      return sendPage(res, 502, "E-posten ble ikke sendt",
+        `<div class="ep-card"><h1>E-posten ble ikke sendt</h1><p>Vi fikk ikke sendt e-posten til innsenderen. Ingenting er registrert, og lenken er ikke brukt opp. Prøv igjen senere.</p></div>`);
+    case "link_invalid":
+    case "not_found":
+    default:
+      return notFound(res);
+  }
+}
 
 export default router;

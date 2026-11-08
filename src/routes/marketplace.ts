@@ -55,7 +55,7 @@ import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
 // helper the Opplevagent claim page uses; per-IP limit on claim requests.
 import { maskEmail } from "../services/gardssalg-claim";
 import { CLAIM_RECOMMENDATION_LABELS, type ClaimRecommendation } from "../services/claim-domain-rule";
-import { createClaimActionLinks, isClaimActionLinksEnabled } from "../services/claim-action-link";
+import { createClaimActionLinks, isClaimActionLinksEnabled, isClaimRequestMoreEnabled, type ClaimAction } from "../services/claim-action-link";
 import { claimAssessmentEnabled, waitForClaimAssessmentOutcome, type ClaimAssessment } from "../services/claim-assessment";
 import { autoApproveGreenClaim, claimAutoApproveEnabled } from "../services/claim-auto-approve";
 import { rfbClaimRequestLimiter } from "../middleware/security";
@@ -2002,18 +2002,25 @@ function claimRequestFieldError(b: { name: unknown; email: unknown; phone: unkno
  *  there is a recipient; C4's own mint checks the secret. Anything else —
  *  flag off, secret missing/short, a mint refusal or a throw — gives
  *  undefined, and the notice goes out exactly as before (never an unsigned
- *  link). Neither the links nor their tokens are logged. */
-function claimQueuedActionLinks(claimId: string): { approve: string; reject: string } | undefined {
+ *  link). Neither the links nor their tokens are logged.
+ *  Eierkrav B3a: with CLAIM_REQUEST_MORE_ENABLED === "true" as well, a third
+ *  link, request_more («Be om mer bekreftelse»), is minted with them; flag off
+ *  → exactly the two links (and the notice) as before. */
+function claimQueuedActionLinks(claimId: string): { approve: string; reject: string; request_more?: string } | undefined {
   if (!isClaimActionLinksEnabled() || !process.env.ADMIN_NOTIFICATION_EMAIL) return undefined;
   try {
-    const minted = createClaimActionLinks(claimId, ["approve", "reject"]);
+    const requestMore = isClaimRequestMoreEnabled();
+    const wanted: ClaimAction[] = requestMore ? ["approve", "reject", "request_more"] : ["approve", "reject"];
+    const minted = createClaimActionLinks(claimId, wanted);
     if (!minted.ok) {
       console.warn("[Admin notify] claim-action links not minted:", minted.reason);
       return undefined;
     }
     const approve = minted.links.find((l) => l.action === "approve")?.url;
     const reject = minted.links.find((l) => l.action === "reject")?.url;
-    return approve && reject ? { approve, reject } : undefined;
+    if (!approve || !reject) return undefined;
+    const more = requestMore ? minted.links.find((l) => l.action === "request_more")?.url : undefined;
+    return more ? { approve, reject, request_more: more } : { approve, reject };
   } catch (err: any) {
     console.error("[Admin notify] claim-action links failed:", err?.message);
     return undefined;

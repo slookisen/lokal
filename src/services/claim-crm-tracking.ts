@@ -44,7 +44,9 @@ export const LOGIN_LINK_PLACEHOLDER = "[innloggingslenke]";
 // B2b-2 (eierkrav auto-approval): "farm_notice" is the «Ny eier registrert»
 // notice to the farm's known address. It carries no secret, so its copy is
 // the sent mail as is; it goes in the same `claim-<claimId>` thread.
-export type ClaimMailKind = "claim_code" | "claim_approved" | "farm_notice";
+// B3a: "request_more" is «Be om mer bekreftelse» to the claimant of a queued
+// claim (no secret, no link), same thread and bookkeeping.
+export type ClaimMailKind = "claim_code" | "claim_approved" | "farm_notice" | "request_more";
 
 export function isClaimCrmTrackingEnabled(): boolean {
   return process.env.CLAIM_CRM_TRACKING_ENABLED === "true";
@@ -81,7 +83,9 @@ export function recordClaimMail(input: ClaimMailRecordInput): string | null {
         ? emailService.buildVerificationCodeEmail(CODE_MASK, input.agentName)
         : input.kind === "farm_notice"
           ? emailService.buildClaimFarmNoticeEmail(input.agentName, input.at)
-          : emailService.buildClaimConfirmationEmail(input.agentName, LOGIN_LINK_PLACEHOLDER, input.agentId);
+          : input.kind === "request_more"
+            ? emailService.buildClaimRequestMoreEmail(input.agentName)
+            : emailService.buildClaimConfirmationEmail(input.agentName, LOGIN_LINK_PLACEHOLDER, input.agentId);
     const smtpMessageId = input.sendResult?.messageId;
     // DRY_RUN reached nobody — the routes treat it as not sent too.
     const sent = input.sendResult?.success === true && !!smtpMessageId && smtpMessageId !== "DRY_RUN";

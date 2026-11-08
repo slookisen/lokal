@@ -50613,6 +50613,31 @@ runSerial(async () => {
 });
 
 // dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice
+// B3a: «Be om mer bekreftelse» as a third choice on a queued claim (behind
+// CLAIM_REQUEST_MORE_ENABLED) — third link/button in the admin notice (flag
+// off: today's notice), the request_more link (GET writes nothing, POST sends
+// one mail + CRM copy, claim stays queued, single use), the admin route
+// POST /admin/agents/claim-request-more, the shared 24 h rule and the
+// failed-send path. Pins getDb() to its own in-memory DB, runs an in-process
+// server, stubs the mail transporter, sets env (restored in finally) —
+// runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-30-rfb-eierkrav B3a: «Be om mer bekreftelse» on a queued claim ──");
+  try {
+    const { runRfbClaimRequestMoreB3aTests } = require("../src/routes/rfb-claim-request-more-b3a.test") as
+      typeof import("../src/routes/rfb-claim-request-more-b3a.test");
+    const b3a = await runRfbClaimRequestMoreB3aTests({ log: false });
+    passed += b3a.passed;
+    failed += b3a.failed;
+    for (const f of b3a.failures) failures.push("rfb-claim-request-more-b3a: " + f);
+    console.log(`  rfb-claim-request-more-b3a: ${b3a.passed} passed, ${b3a.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-claim-request-more-b3a: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice
 // B2b-2: after a B2b-1 auto-approval the farm's known address (as before the
 // approval) gets «Ny eier registrert for <profil>» when it exists, differs
 // from the claimant's and is not shared; the admin notice says «sendt» /
