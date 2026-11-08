@@ -45179,6 +45179,27 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  // dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 5b: the owner
+  // portal's AI funnel «Sendt til AI» → «Klikk fra AI-svar» → «Kontakt-klikk»
+  // (owner-stats aiFunnel, 60 days) and its render in selger.html. Swaps
+  // getDb() (restored in finally), so serial.
+  console.log("\n── Klikk fra AI-svar S5b: owner-portal AI funnel ──");
+  try {
+    const { runOwnerAiFunnelTests } = require("../src/services/owner-ai-funnel.test") as
+      typeof import("../src/services/owner-ai-funnel.test");
+    const r = await runOwnerAiFunnelTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-ai-funnel: " + f);
+    console.log(`  owner-ai-funnel: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push(`owner-ai-funnel: unexpected error: ${String(err?.message || err)}`);
+    console.log(`  ✗ owner-ai-funnel: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   // dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 3 («Merking»):
   // profile links handed to AI clients over MCP, A2A and REST (ai_search) carry
   // utm_*=ai_search, at the transport boundary only; 301s keep the query.
