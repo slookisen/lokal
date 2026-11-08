@@ -3043,6 +3043,47 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       assertEq(readQueueRow("wd-tb-g1"), undefined, "tb-g8: the late-resolving (verifying) evaluation wrote no queue row");
       assertEq(readQueueRow("wd-tb-g2"), undefined, "tb-g9: no queue row for the never-started candidate");
 
+      // (tb-h) N1: the abandoned attempt MUTATES its fallback counters and
+      // `tried` before it is abandoned (plain fetch returns a JS shell at
+      // once → tried.push + fallbackCounters.attempted++), then a slow
+      // headless render resolves later with verifying evidence. The private
+      // per-attempt state is never merged, so the response reports zero
+      // fallback attempts and nothing is queued.
+      process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED = "true";
+      let tbhRenderCalls = 0;
+      let tbhRenderResolved = false;
+      setRfbWdRenderPageImplForTesting!(async (url: string) => {
+        tbhRenderCalls++;
+        await sleep(SLOW_MS);
+        tbhRenderResolved = true;
+        return {
+          ok: true,
+          html: `<html><head><link rel="canonical" href="${url}"></head><body>Rendret Tidsgard — org.nr 977 200 036</body></html>`,
+          text: "Rendret Tidsgard — org.nr 977 200 036",
+          finalUrl: url,
+          elapsedMs: SLOW_MS,
+        };
+      });
+      insertAgent({ id: "wd-tb-h", name: "Rendret Tidsgard AS", orgNr: "977200036", city: "Elverum" });
+      const tbhHosts = gardssalgWebsiteCandidateHosts("Rendret Tidsgard AS");
+      const tbhShell = `<html><body><script>var pad = "${"x".repeat(2500)}";</script><div id="root">App</div></body></html>`;
+      fixtures.set(`https://${tbhHosts[0]}`, htmlResponse(tbhShell, { finalUrl: `https://${tbhHosts[0]}` }));
+      setRfbWdNowForTesting!(nearlySpentClock());
+      const rTbH = await callDiscovery({ agentIds: ["wd-tb-h"] });
+      assertEq(tbhRenderCalls, 1, "tb-h0: setup sanity -- the attempt reached the render fallback (counter + tried already mutated privately)");
+      assertTrue(!tbhRenderResolved, "tb-h1: route answered before the slow render resolved");
+      assertEq(rTbH.body.headless_fallback_attempted, 0, "tb-h2: the abandoned attempt's fallback counter is not merged into the response");
+      assertEq(rTbH.body.headless_fallback_verified, 0, "tb-h3: no verified fallback counted");
+      assertEq(rTbH.body.proposed.length, 0, "tb-h4: nothing proposed");
+      assertEq(rTbH.body.rejected.length, 0, "tb-h5: no rejected entry (the abandoned attempt's tried/excluded never surface)");
+      assertEq(rTbH.body.skipped_due_to_time_budget, ["wd-tb-h"], "tb-h6: target in skipped_due_to_time_budget");
+      await sleep(SLOW_MS + 150);
+      assertTrue(tbhRenderResolved, "tb-h7: setup sanity -- the render resolved later with verifying evidence");
+      assertEq(rTbH.body.headless_fallback_attempted, 0, "tb-h8: still 0 after the late resolution");
+      assertEq(readQueueRow("wd-tb-h"), undefined, "tb-h9: the late verifying render wrote no queue row");
+      setRfbWdRenderPageImplForTesting!(null);
+      delete process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED;
+
       setRfbWdNowForTesting!(null);
     }
   } catch (err: any) {

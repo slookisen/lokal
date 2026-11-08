@@ -309,6 +309,44 @@ export function runAdminRunVerifierAgentIdsTests(opts: { log?: boolean } = {}): 
           assertEq(tickH.truncated, false, "h3: tick is never truncated");
           assertEq(tickH.not_processed, 0, "h4: tick leaves nothing unprocessed");
         }
+
+        // (i) N2: deadline boundary is `>=` — a check that reads EXACTLY the
+        // deadline starts no new agent.
+        const { runVerifierBatch } = require("../agents/lokal-agent-verifier") as
+          typeof import("../agents/lokal-agent-verifier");
+        for (const id of ["aid-i1", "aid-i2"]) seed(id, "unverified");
+        const boundaryBatch = await runVerifierBatch({
+          agentIds: ["aid-i1", "aid-i2"],
+          deadlineAt: 20_000,
+          nowMs: () => 20_000,
+        });
+        assertEq(boundaryBatch.results.length, 0, "i1: clock exactly at the deadline → no agent starts");
+        assertEq(boundaryBatch.truncated, true, "i2: truncated=true at the boundary");
+        assertEq(boundaryBatch.not_processed, 2, "i3: both agents reported not_processed");
+        const justBefore = await runVerifierBatch({
+          agentIds: ["aid-i1"],
+          deadlineAt: 20_000,
+          nowMs: () => 19_999,
+        });
+        assertEq(justBefore.results.length, 1, "i4: 1 ms before the deadline the agent still starts");
+        assertEq(justBefore.truncated, false, "i5: not truncated when everything started");
+        assertEq(lastVerifiedOf("aid-i2"), null, "i6: the agent never started at the boundary is untouched");
+
+        // Route-level boundary: deadline read at 0 (→ 20 000), first check
+        // reads exactly 20 000 → nothing processed.
+        let boundaryReads = 0;
+        verifierRoute.__setVerifyRouteNowForTesting(() => (boundaryReads++ === 0 ? 0 : 20_000));
+        clearTickLock();
+        const roundI = await callRoute(router, {
+          method: "POST",
+          url: "/",
+          headers: { "x-admin-key": ADMIN_KEY },
+          query: { force: "1", bias_growth: "0" },
+          body: { agentIds: ["aid-i2"] },
+        });
+        assertEq(roundI.body.processed, 0, "i7: route — check exactly at the deadline starts no agent");
+        assertEq(roundI.body.truncated, true, "i8: route — truncated=true");
+        assertEq(roundI.body.not_processed, 1, "i9: route — not_processed=1");
       } finally {
         verifierRoute.__setVerifyRouteNowForTesting(null);
       }

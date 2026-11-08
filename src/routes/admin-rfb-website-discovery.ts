@@ -246,17 +246,19 @@ function rfbWdRemainingBudgetMs(startedAt: number): number {
 const RFB_WD_ABANDONED: unique symbol = Symbol("rfb_wd_abandoned");
 
 /**
- * Races `work` against `remainingMs` of real time (the remaining budget, read
+ * Starts `startWork` and races it against `remainingMs` of real time (the remaining budget, read
  * from the injectable clock, so a test can make it short). Returns
  * RFB_WD_ABANDONED when the timer wins; the timer is always cleared. The
  * abandoned promise keeps running but its result (or rejection) is dropped —
  * callers must never act on it.
  */
-async function raceRfbWdBudget<T>(work: Promise<T>, remainingMs: number): Promise<T | typeof RFB_WD_ABANDONED> {
+async function raceRfbWdBudget<T>(startWork: () => Promise<T>, remainingMs: number): Promise<T | typeof RFB_WD_ABANDONED> {
+  // No budget left: never start the work at all.
+  if (remainingMs <= 0) return RFB_WD_ABANDONED;
+  const work = startWork();
   // A late rejection after abandonment must not surface as an unhandled
   // rejection; a rejection that wins the race still reaches the caller.
   work.catch(() => undefined);
-  if (remainingMs <= 0) return RFB_WD_ABANDONED;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<typeof RFB_WD_ABANDONED>((resolve) => {
     timer = setTimeout(() => resolve(RFB_WD_ABANDONED), remainingMs);
@@ -921,15 +923,16 @@ async function tryRfbWebsiteCandidateHostWithinBudget(
   const attemptExcluded: Array<{ host: string; reason: string }> = [];
   const attemptCounters: RfbWdFallbackCounters = { attempted: 0, verified: 0 };
   const outcome = await raceRfbWdBudget(
-    tryRfbWebsiteCandidateHost(
-      host,
-      evidenceTarget,
-      existingHosts,
-      hostsProposedThisBatch,
-      attemptTried,
-      attemptExcluded,
-      attemptCounters,
-    ),
+    () =>
+      tryRfbWebsiteCandidateHost(
+        host,
+        evidenceTarget,
+        existingHosts,
+        hostsProposedThisBatch,
+        attemptTried,
+        attemptExcluded,
+        attemptCounters,
+      ),
     remainingMs,
   );
   if (outcome === RFB_WD_ABANDONED) return { abandoned: true };
@@ -1317,7 +1320,10 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
     let timeBudgetExceededExt = false;
 
     for (const c of candidates) {
-      if (rfbWdRemainingBudgetMs(extStartedAt) <= 0) {
+      // timeBudgetExceededExt latches the budget as spent: once an
+      // evaluation was abandoned (the race timer can fire while the clock
+      // still reads ~1 ms left), no further candidate may start.
+      if (timeBudgetExceededExt || rfbWdRemainingBudgetMs(extStartedAt) <= 0) {
         skippedDueToTimeBudgetExt.push(c.agentId);
         timeBudgetExceededExt = true;
         continue;
@@ -1342,7 +1348,7 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
         batchId,
         undefined,
         c.contactOverride,
-        { remainingMs: () => rfbWdRemainingBudgetMs(extStartedAt) },
+        { remainingMs: () => (timeBudgetExceededExt ? 0 : rfbWdRemainingBudgetMs(extStartedAt)) },
       );
 
       switch (outcome.outcome) {
@@ -1471,6 +1477,13 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
   const fallbackCounters: RfbWdFallbackCounters = { attempted: 0, verified: 0 };
   const skippedDueToTimeBudget: string[] = [];
   let timeBudgetExceeded = false;
+  // Latched once an in-flight attempt/search is abandoned: the race timer
+  // can fire while the clock still reads ~1 ms left, and no further target,
+  // host attempt or search may start after that.
+  let wdBudgetLatched = false;
+  const wdBudgetSpent = (): boolean =>
+    wdBudgetLatched || effectiveRfbWdNowMs() - wdStartedAt >= RFB_WD_TIME_BUDGET_MS;
+  const wdRemainingMs = (): number => (wdBudgetLatched ? 0 : rfbWdRemainingBudgetMs(wdStartedAt));
 
   const proposed: Array<{
     agent_id: string;
@@ -1492,7 +1505,7 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
   }> = [];
 
   for (const t of targets) {
-    if (effectiveRfbWdNowMs() - wdStartedAt >= RFB_WD_TIME_BUDGET_MS) {
+    if (wdBudgetSpent()) {
       skippedDueToTimeBudget.push(t.id);
       timeBudgetExceeded = true;
       continue;
@@ -1520,7 +1533,7 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
     // skipped_due_to_time_budget (a later call retries it), never proposed.
     let abandonedForThisTarget = false;
     for (const host of hosts) {
-      if (effectiveRfbWdNowMs() - wdStartedAt >= RFB_WD_TIME_BUDGET_MS) {
+      if (wdBudgetSpent()) {
         budgetHitForThisTarget = true;
         timeBudgetExceeded = true;
         break;
@@ -1533,10 +1546,11 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
         tried,
         excludedHere,
         fallbackCounters,
-        rfbWdRemainingBudgetMs(wdStartedAt),
+        wdRemainingMs(),
       );
       if (attempt.abandoned) {
         abandonedForThisTarget = true;
+        wdBudgetLatched = true;
         budgetHitForThisTarget = true;
         timeBudgetExceeded = true;
         break;
@@ -1568,22 +1582,23 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
     if (!hit && !budgetHitForThisTarget) {
       const searchImpl = effectiveRfbWdSearchImpl();
       if (searchImpl) {
-        if (effectiveRfbWdNowMs() - wdStartedAt >= RFB_WD_TIME_BUDGET_MS) {
+        if (wdBudgetSpent()) {
           budgetHitForThisTarget = true;
           timeBudgetExceeded = true;
         } else {
           searchAttempted = true;
           try {
             const query = gardssalgWebsiteSearchQuery({ navn: t.name, kommune: t.city });
-            const results = await raceRfbWdBudget(searchImpl(query), rfbWdRemainingBudgetMs(wdStartedAt));
+            const results = await raceRfbWdBudget(() => searchImpl(query), wdRemainingMs());
             if (results === RFB_WD_ABANDONED) {
               abandonedForThisTarget = true;
+              wdBudgetLatched = true;
               budgetHitForThisTarget = true;
               timeBudgetExceeded = true;
             } else {
               const searchHosts = gardssalgWebsiteSearchCandidateHosts(results, RFB_WD_SEARCH_MAX_CANDIDATES);
               for (const host of searchHosts) {
-                if (effectiveRfbWdNowMs() - wdStartedAt >= RFB_WD_TIME_BUDGET_MS) {
+                if (wdBudgetSpent()) {
                   budgetHitForThisTarget = true;
                   timeBudgetExceeded = true;
                   break;
@@ -1596,10 +1611,11 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
                   tried,
                   excludedHere,
                   fallbackCounters,
-                  rfbWdRemainingBudgetMs(wdStartedAt),
+                  wdRemainingMs(),
                 );
                 if (attempt.abandoned) {
                   abandonedForThisTarget = true;
+                  wdBudgetLatched = true;
                   budgetHitForThisTarget = true;
                   timeBudgetExceeded = true;
                   break;
