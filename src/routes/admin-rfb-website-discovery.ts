@@ -209,13 +209,20 @@ export const RFB_WD_RENDER_TIMEOUT_MS = 12_000;
 // retry + 12s headless render + 12s render retry). With 25-50 targets
 // processed sequentially and no overall budget, one stubborn "no_website"
 // target could alone burn multiple minutes, which is exactly what produced
-// the observed 0-bytes/60s timeout at both limit=50 and limit=25. 30s
-// leaves margin under that observed 60s cutoff even though a single
-// in-flight host attempt already started can still finish past the budget
-// (this stops NEW host attempts from starting, not one already running).
+// the observed 0-bytes/60s timeout at both limit=50 and limit=25.
 // Long-term fix is parallelizing host attempts — explicitly out of scope
 // for this mitigation (see the dev-request's own FUNN TIL OPPFØLGING).
-export const RFB_WD_TIME_BUDGET_MS = 30_000;
+//
+// 15 s (was 30 s): a prod probe on 2026-11-06 (see BM_HARVEST_TIME_BUDGET_MS,
+// admin-bm-producer-harvest.ts) showed the caller→route response window is
+// ~30 s, not ~60 s, and a 30 s budget plus one in-flight host attempt (up to
+// ~44 s) came back as HTTP 502 "upstream request failed". The budget now
+// bounds the in-flight work too: a host attempt or a Brave search that is
+// still running when the remaining budget is spent is abandoned (raced
+// against the remaining budget, see raceRfbWdBudget) — its late result is
+// ignored, it never writes or proposes anything, and the target lands in
+// skipped_due_to_time_budget. Worst-case response ≈ budget + a small margin.
+export const RFB_WD_TIME_BUDGET_MS = 15_000;
 
 // Test-only injection point for the wall-clock used by the time-budget
 // check above (mirrors __setRfbWdRenderPageImplForTesting /
@@ -229,6 +236,38 @@ export function __setRfbWdNowForTesting(fn: (() => number) | null): void {
 }
 function effectiveRfbWdNowMs(): number {
   return rfbWdNowForTesting ? rfbWdNowForTesting() : Date.now();
+}
+
+/** Budget left (ms) for a run that started at `startedAt` (effectiveRfbWdNowMs clock). */
+function rfbWdRemainingBudgetMs(startedAt: number): number {
+  return RFB_WD_TIME_BUDGET_MS - (effectiveRfbWdNowMs() - startedAt);
+}
+
+const RFB_WD_ABANDONED: unique symbol = Symbol("rfb_wd_abandoned");
+
+/**
+ * Starts `startWork` and races it against `remainingMs` of real time (the remaining budget, read
+ * from the injectable clock, so a test can make it short). Returns
+ * RFB_WD_ABANDONED when the timer wins; the timer is always cleared. The
+ * abandoned promise keeps running but its result (or rejection) is dropped —
+ * callers must never act on it.
+ */
+async function raceRfbWdBudget<T>(startWork: () => Promise<T>, remainingMs: number): Promise<T | typeof RFB_WD_ABANDONED> {
+  // No budget left: never start the work at all.
+  if (remainingMs <= 0) return RFB_WD_ABANDONED;
+  const work = startWork();
+  // A late rejection after abandonment must not surface as an unhandled
+  // rejection; a rejection that wins the race still reaches the caller.
+  work.catch(() => undefined);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<typeof RFB_WD_ABANDONED>((resolve) => {
+    timer = setTimeout(() => resolve(RFB_WD_ABANDONED), remainingMs);
+  });
+  try {
+    return await Promise.race([work, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 // Per-call fallback counters, threaded through tryRfbWebsiteCandidateHost by
@@ -862,6 +901,48 @@ async function tryRfbWebsiteCandidateHost(
   return null;
 }
 
+/**
+ * tryRfbWebsiteCandidateHost bounded by the remaining time budget. The
+ * attempt gets PRIVATE tried/excluded/fallback-counter state, merged into the
+ * caller's only when the attempt finished in time — so an abandoned attempt
+ * that resolves later cannot change anything the caller reports or writes.
+ * existingHosts/hostsProposedThisBatch are only read by the attempt (the
+ * caller adds a host to hostsProposedThisBatch only for a hit it accepted).
+ */
+async function tryRfbWebsiteCandidateHostWithinBudget(
+  host: string,
+  evidenceTarget: Parameters<typeof gardssalgWebsiteEvidenceMatch>[1],
+  existingHosts: Set<string>,
+  hostsProposedThisBatch: Set<string>,
+  tried: string[],
+  excludedHere: Array<{ host: string; reason: string }>,
+  fallbackCounters: RfbWdFallbackCounters,
+  remainingMs: number,
+): Promise<{ abandoned: true } | { abandoned: false; hit: RfbWdHit | null }> {
+  const attemptTried: string[] = [];
+  const attemptExcluded: Array<{ host: string; reason: string }> = [];
+  const attemptCounters: RfbWdFallbackCounters = { attempted: 0, verified: 0 };
+  const outcome = await raceRfbWdBudget(
+    () =>
+      tryRfbWebsiteCandidateHost(
+        host,
+        evidenceTarget,
+        existingHosts,
+        hostsProposedThisBatch,
+        attemptTried,
+        attemptExcluded,
+        attemptCounters,
+      ),
+    remainingMs,
+  );
+  if (outcome === RFB_WD_ABANDONED) return { abandoned: true };
+  tried.push(...attemptTried);
+  excludedHere.push(...attemptExcluded);
+  fallbackCounters.attempted += attemptCounters.attempted;
+  fallbackCounters.verified += attemptCounters.verified;
+  return { abandoned: false, hit: outcome };
+}
+
 function rfbWdConfidence(evidence: RfbWdEvidence): number {
   if (evidence.org_nr_found) return 1.0;
   if (evidence.phone_found) return 0.95;
@@ -1013,6 +1094,7 @@ export async function evaluateRfbWebsiteCandidate(
   batchId: string,
   reason: string = "website_discovery_candidate_external",
   contactOverride?: { telefon?: string | null; mobil?: string | null; kommune?: string | null },
+  budget?: { remainingMs: () => number },
 ): Promise<RfbWdCandidateOutcome> {
   let t = getRfbWebsiteDiscoveryTarget(db, candidate.agentId);
   if (!t && ensureKnowledgeRowForExternalCandidate(db, candidate.agentId)) {
@@ -1042,15 +1124,36 @@ export async function evaluateRfbWebsiteCandidate(
   };
   const tried: string[] = [];
   const excludedHere: Array<{ host: string; reason: string }> = [];
-  const hit = await tryRfbWebsiteCandidateHost(
-    host,
-    evidenceTarget,
-    existingHosts,
-    hostsProposedThisBatch,
-    tried,
-    excludedHere,
-    fallbackCounters,
-  );
+  let hit: RfbWdHit | null;
+  if (budget) {
+    // Only this route's external-candidates branch passes a budget: an
+    // attempt still running when it is spent is abandoned — nothing is
+    // queued from it, whenever it resolves.
+    const attempt = await tryRfbWebsiteCandidateHostWithinBudget(
+      host,
+      evidenceTarget,
+      existingHosts,
+      hostsProposedThisBatch,
+      tried,
+      excludedHere,
+      fallbackCounters,
+      budget.remainingMs(),
+    );
+    if (attempt.abandoned) {
+      return { outcome: "rejected", agent_id: t.id, agent_name: t.name, reason: "time_budget_exceeded", tried: [], excluded: [] };
+    }
+    hit = attempt.hit;
+  } else {
+    hit = await tryRfbWebsiteCandidateHost(
+      host,
+      evidenceTarget,
+      existingHosts,
+      hostsProposedThisBatch,
+      tried,
+      excludedHere,
+      fallbackCounters,
+    );
+  }
 
   if (hit) {
     hostsProposedThisBatch.add(hit.host);
@@ -1209,8 +1312,22 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
       excluded: Array<{ host: string; reason: string }>;
     }> = [];
     const seenAgentIds = new Set<string>();
+    // Same time budget as the auto-select/agentIds loop below: no new
+    // candidate starts once it is spent, and the one in flight is abandoned
+    // (no queue write) when it runs past it.
+    const extStartedAt = effectiveRfbWdNowMs();
+    const skippedDueToTimeBudgetExt: string[] = [];
+    let timeBudgetExceededExt = false;
 
     for (const c of candidates) {
+      // timeBudgetExceededExt latches the budget as spent: once an
+      // evaluation was abandoned (the race timer can fire while the clock
+      // still reads ~1 ms left), no further candidate may start.
+      if (timeBudgetExceededExt || rfbWdRemainingBudgetMs(extStartedAt) <= 0) {
+        skippedDueToTimeBudgetExt.push(c.agentId);
+        timeBudgetExceededExt = true;
+        continue;
+      }
       if (seenAgentIds.has(c.agentId)) {
         rejectedExt.push({ agent_id: c.agentId, agent_name: "", reason: "duplicate_agent_in_request", tried: [], excluded: [] });
         continue;
@@ -1231,6 +1348,7 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
         batchId,
         undefined,
         c.contactOverride,
+        { remainingMs: () => (timeBudgetExceededExt ? 0 : rfbWdRemainingBudgetMs(extStartedAt)) },
       );
 
       switch (outcome.outcome) {
@@ -1251,6 +1369,11 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
           });
           break;
         case "rejected":
+          if (outcome.reason === "time_budget_exceeded") {
+            skippedDueToTimeBudgetExt.push(outcome.agent_id);
+            timeBudgetExceededExt = true;
+            break;
+          }
           rejectedExt.push({
             agent_id: outcome.agent_id,
             agent_name: outcome.agent_name,
@@ -1274,6 +1397,8 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
       headless_fallback_attempted: fallbackCountersExt.attempted,
       headless_fallback_verified: fallbackCountersExt.verified,
       knowledge_rows_created: 0,
+      time_budget_exceeded: timeBudgetExceededExt,
+      skipped_due_to_time_budget: skippedDueToTimeBudgetExt,
     });
     return;
   }
@@ -1352,6 +1477,13 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
   const fallbackCounters: RfbWdFallbackCounters = { attempted: 0, verified: 0 };
   const skippedDueToTimeBudget: string[] = [];
   let timeBudgetExceeded = false;
+  // Latched once an in-flight attempt/search is abandoned: the race timer
+  // can fire while the clock still reads ~1 ms left, and no further target,
+  // host attempt or search may start after that.
+  let wdBudgetLatched = false;
+  const wdBudgetSpent = (): boolean =>
+    wdBudgetLatched || effectiveRfbWdNowMs() - wdStartedAt >= RFB_WD_TIME_BUDGET_MS;
+  const wdRemainingMs = (): number => (wdBudgetLatched ? 0 : rfbWdRemainingBudgetMs(wdStartedAt));
 
   const proposed: Array<{
     agent_id: string;
@@ -1373,7 +1505,7 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
   }> = [];
 
   for (const t of targets) {
-    if (effectiveRfbWdNowMs() - wdStartedAt >= RFB_WD_TIME_BUDGET_MS) {
+    if (wdBudgetSpent()) {
       skippedDueToTimeBudget.push(t.id);
       timeBudgetExceeded = true;
       continue;
@@ -1396,13 +1528,17 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
 
     let hit: RfbWdHit | null = null;
     let budgetHitForThisTarget = false;
+    // An in-flight host attempt or Brave search abandoned at the budget: the
+    // target was not evaluated to a conclusion, so it is reported in
+    // skipped_due_to_time_budget (a later call retries it), never proposed.
+    let abandonedForThisTarget = false;
     for (const host of hosts) {
-      if (effectiveRfbWdNowMs() - wdStartedAt >= RFB_WD_TIME_BUDGET_MS) {
+      if (wdBudgetSpent()) {
         budgetHitForThisTarget = true;
         timeBudgetExceeded = true;
         break;
       }
-      hit = await tryRfbWebsiteCandidateHost(
+      const attempt = await tryRfbWebsiteCandidateHostWithinBudget(
         host,
         evidenceTarget,
         existingHosts,
@@ -1410,7 +1546,16 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
         tried,
         excludedHere,
         fallbackCounters,
+        wdRemainingMs(),
       );
+      if (attempt.abandoned) {
+        abandonedForThisTarget = true;
+        wdBudgetLatched = true;
+        budgetHitForThisTarget = true;
+        timeBudgetExceeded = true;
+        break;
+      }
+      hit = attempt.hit;
       if (hit) break;
     }
 
@@ -1437,31 +1582,47 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
     if (!hit && !budgetHitForThisTarget) {
       const searchImpl = effectiveRfbWdSearchImpl();
       if (searchImpl) {
-        if (effectiveRfbWdNowMs() - wdStartedAt >= RFB_WD_TIME_BUDGET_MS) {
+        if (wdBudgetSpent()) {
           budgetHitForThisTarget = true;
           timeBudgetExceeded = true;
         } else {
           searchAttempted = true;
           try {
             const query = gardssalgWebsiteSearchQuery({ navn: t.name, kommune: t.city });
-            const results = await searchImpl(query);
-            const searchHosts = gardssalgWebsiteSearchCandidateHosts(results, RFB_WD_SEARCH_MAX_CANDIDATES);
-            for (const host of searchHosts) {
-              if (effectiveRfbWdNowMs() - wdStartedAt >= RFB_WD_TIME_BUDGET_MS) {
-                budgetHitForThisTarget = true;
-                timeBudgetExceeded = true;
-                break;
+            const results = await raceRfbWdBudget(() => searchImpl(query), wdRemainingMs());
+            if (results === RFB_WD_ABANDONED) {
+              abandonedForThisTarget = true;
+              wdBudgetLatched = true;
+              budgetHitForThisTarget = true;
+              timeBudgetExceeded = true;
+            } else {
+              const searchHosts = gardssalgWebsiteSearchCandidateHosts(results, RFB_WD_SEARCH_MAX_CANDIDATES);
+              for (const host of searchHosts) {
+                if (wdBudgetSpent()) {
+                  budgetHitForThisTarget = true;
+                  timeBudgetExceeded = true;
+                  break;
+                }
+                const attempt = await tryRfbWebsiteCandidateHostWithinBudget(
+                  host,
+                  evidenceTarget,
+                  existingHosts,
+                  hostsProposedThisBatch,
+                  tried,
+                  excludedHere,
+                  fallbackCounters,
+                  wdRemainingMs(),
+                );
+                if (attempt.abandoned) {
+                  abandonedForThisTarget = true;
+                  wdBudgetLatched = true;
+                  budgetHitForThisTarget = true;
+                  timeBudgetExceeded = true;
+                  break;
+                }
+                hit = attempt.hit;
+                if (hit) break;
               }
-              hit = await tryRfbWebsiteCandidateHost(
-                host,
-                evidenceTarget,
-                existingHosts,
-                hostsProposedThisBatch,
-                tried,
-                excludedHere,
-                fallbackCounters,
-              );
-              if (hit) break;
             }
           } catch {
             // A search failure (network/HTTP error) must not abort the row —
@@ -1473,7 +1634,9 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
       }
     }
 
-    if (hit) {
+    if (!hit && abandonedForThisTarget) {
+      skippedDueToTimeBudget.push(t.id);
+    } else if (hit) {
       hostsProposedThisBatch.add(hit.host);
       let candidateUrl: string;
       try {

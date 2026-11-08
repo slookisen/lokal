@@ -266,13 +266,13 @@ export async function runDiscoveryTruthTests(opts: { log?: boolean } = {}): Prom
       assertEq(digitsToNumber((llms?.text.match(/directly with (\d+)\+ local food/) || [])[1]), EXPECT_RFB, "rfb-count-llms-en: llms.txt English intro count");
 
       const card = regMod.marketplaceRegistry.getRegistryCard("https://rettfrabonden.com") as any;
-      assertEq(digitsToNumber((String(card.description).match(/with (\d+)\+ verified/) || [])[1]), EXPECT_RFB, "rfb-count-card-desc: agent card description count");
+      assertEq(digitsToNumber((String(card.description).match(/with (\d+)\+ local/) || [])[1]), EXPECT_RFB, "rfb-count-card-desc: agent card description count");
       assertEq(card["x-lokal"].stats.totalAgents, EXPECT_RFB, "rfb-count-card-stats: agent card x-lokal.stats.totalAgents");
 
       for (const p of ["/.well-known/mcp.json", "/.well-known/mcp/server-card.json", "/.well-known/mcp-server.json"]) {
         const r = await callRouter(readinessRouter, p, "rettfrabonden.com");
         assertEq(r?.body?.["x-lokal"]?.totalProducers, EXPECT_RFB, `rfb-count-${p}: totalProducers`);
-        assertEq(digitsToNumber((String(r?.body?.description).match(/Discover (\d+) verified/) || [])[1]), EXPECT_RFB, `rfb-count-${p}: description count`);
+        assertEq(digitsToNumber((String(r?.body?.description).match(/Discover (\d+) Norwegian/) || [])[1]), EXPECT_RFB, `rfb-count-${p}: description count`);
       }
       const sc2 = await callRouter(discoveryRouter, "/.well-known/mcp/server-card.json", "rettfrabonden.com");
       assertEq(digitsToNumber((String(sc2?.body?.serverInfo?.description).match(/discover (\d+)/) || [])[1]), EXPECT_RFB, "rfb-count-discovery-server-card: description count");
@@ -281,9 +281,17 @@ export async function runDiscoveryTruthTests(opts: { log?: boolean } = {}): Prom
       const at = await callRouter(discoveryRouter, "/agents.txt", "rettfrabonden.com");
       assertEq(digitsToNumber((String(at?.text).match(/with (\d+)\+ producers/) || [])[1]), EXPECT_RFB, "rfb-count-agents.txt: description count");
       const plug = await callRouter(discoveryRouter, "/.well-known/ai-plugin.json", "rettfrabonden.com");
-      assertEq(digitsToNumber((String(plug?.body?.description_for_model).match(/access to (\d+) verified/) || [])[1]), EXPECT_RFB, "rfb-count-ai-plugin: description count");
+      assertEq(digitsToNumber((String(plug?.body?.description_for_model).match(/access to (\d+) producers/) || [])[1]), EXPECT_RFB, "rfb-count-ai-plugin: description count");
       const skills = await callRouter(readinessRouter, "/.well-known/agent-skills/index.json", "rettfrabonden.com");
-      assertEq(digitsToNumber((String(skills?.body?.skills?.[0]?.description).match(/Search (\d+) verified/) || [])[1]), EXPECT_RFB, "rfb-count-agent-skills: description count");
+      assertEq(digitsToNumber((String(skills?.body?.skills?.[0]?.description).match(/Search (\d+) Norwegian/) || [])[1]), EXPECT_RFB, "rfb-count-agent-skills: description count");
+
+      // N1 (Claude directory prep): the public /api index must not claim "verified" producers.
+      for (const p of ["/api", "/api/v1"]) {
+        const idx = await callRouter(discoveryRouter, p, "rettfrabonden.com");
+        const desc = String(idx?.body?.description ?? "");
+        assertTrue(desc.length > 0 && !/verified/i.test(desc), `api-index ${p}: description does not claim "verified" (${desc})`);
+        assertTrue(desc.includes("Brønnøysund"), `api-index ${p}: description names the Brønnøysund cross-check`);
+      }
 
       const st = await callRouter(a2aRouter, "/api/stats", "rettfrabonden.com");
       assertEq(st?.body?.data?.honestCount, EXPECT_RFB, "rfb-count-api-stats: data.honestCount");
@@ -310,6 +318,62 @@ export async function runDiscoveryTruthTests(opts: { log?: boolean } = {}): Prom
         markdownNegotiation(req, fakeRes((c) => resolve(c)), () => resolve(null));
       });
       assertEq(digitsToNumber((String(md?.text).match(/connecting AI agents with (\d+)\+/) || [])[1]), EXPECT_RFB, "rfb-count-markdown: front page as markdown for agents");
+
+      // ── Claims on the RFB discovery surfaces (A2A dev-request
+      // 2026-11-06-rfb-claude-katalog-innsending, slice 1 / AC 1.1): no "N+ verified"
+      // count (profiles are cross-checked against Brønnøysund; the only badge is
+      // owner-verified), no price-comparison pitch, no link to the unrouted /docs, and
+      // no «Ingen cookies, ingen sporing» that /personvern contradicts.
+      {
+        const servedCard = (await callRouter(a2aRouter, "/.well-known/agent-card.json", "rettfrabonden.com"))?.body;
+        const legacyCard = (await callRouter(a2aRouter, "/.well-known/agent.json", "rettfrabonden.com"))?.body;
+        const inlineCard = (await callRouter(a2aRouter, "/a2a", "rettfrabonden.com"))?.body;
+        const serverCards = await Promise.all(["/.well-known/mcp/server-card.json", "/.well-known/mcp.json", "/.well-known/mcp-server.json"]
+          .map(async (p) => (await callRouter(readinessRouter, p, "rettfrabonden.com"))?.body));
+        const skillsIdx = (await callRouter(readinessRouter, "/.well-known/agent-skills/index.json", "rettfrabonden.com"))?.body;
+        const llmsFull = await callRouter(discoveryRouter, "/llms-full.txt", "rettfrabonden.com");
+        const plugin = (await callRouter(discoveryRouter, "/.well-known/ai-plugin.json", "rettfrabonden.com"))?.body;
+        const surfaces: Array<[string, string]> = [
+          ["agent-card", JSON.stringify(servedCard)],
+          ["agent.json", JSON.stringify(legacyCard)],
+          ["a2a-inline-card", JSON.stringify(inlineCard)],
+          ["registry-card", JSON.stringify(card)],
+          ...serverCards.map((b, i): [string, string] => [`server-card-${i}`, JSON.stringify(b)]),
+          ["agent-skills", JSON.stringify(skillsIdx)],
+          ["ai-plugin", JSON.stringify(plugin)],
+          ["llms.txt", String(llms?.text)],
+          ["llms-full.txt", String(llmsFull?.text)],
+          ["markdown-home", String(md?.text)],
+        ];
+        assertTrue(surfaces.every(([, t]) => t.length > 50), "claims-0: every surface was served (guards against a vacuous check)");
+        for (const [name, text] of surfaces) {
+          assertTrue(!/compare prices|sammenlign priser/i.test(text), `claims-price-${name}: no «Compare prices» / price-comparison pitch`);
+          assertTrue(!/\d[\d\s.,]*\+?\s*(verified|verifiserte)\b/i.test(text), `claims-verified-${name}: no producer count presented as «verified»`);
+          assertTrue(!/(rettfrabonden\.com|localhost:\d+|BASE_URL\})\/docs\b/.test(text), `claims-docs-${name}: no link to the unrouted /docs`);
+          assertTrue(!/Ingen cookies, ingen sporing/i.test(text), `claims-cookies-${name}: no «Ingen cookies, ingen sporing»`);
+        }
+        assertTrue(/Brønnøysund/.test(String(card.description)), "claims-bronnoysund-card: agent card says cross-checked against Brønnøysund");
+
+        // documentationUrl / contactUrl point at pages the RFB site router actually serves.
+        const linked = [servedCard?.documentationUrl, servedCard?.provider?.contactUrl, inlineCard?.documentationUrl, inlineCard?.provider?.contactUrl, serverCards[0]?.documentation, serverCards[0]?.contact?.url];
+        assertTrue(linked.every((u) => typeof u === "string" && /^https?:\/\/[^/]+\/[a-z]/.test(u)), `claims-links-0: card links are absolute page URLs (got ${JSON.stringify(linked)})`);
+        for (const p of [...new Set(linked.map((u) => new URL(String(u)).pathname))]) {
+          const page = await callSeo(p, "no");
+          assertTrue(page !== null && page.status === 200 && page.text.length > 500, `claims-links-${p}: ${p} is a routed page (200)`);
+        }
+
+        // llms.txt's privacy line agrees with what /personvern says.
+        const pv = String((await callSeo("/personvern", "no"))?.text);
+        assertTrue(/nødvendige \(essensielle\) informasjonskapsler/.test(pv) && /ingen tredjeparts analyse-, annonse- eller sporingscookies/.test(pv),
+          "claims-personvern-0: /personvern still says essential cookies only, no third-party tracking cookies");
+        assertTrue(/\[Personvern\]\([^)]*\/personvern\): Bare nødvendige informasjonskapsler/.test(String(llms?.text)), "claims-personvern-llms: llms.txt describes essential cookies, as /personvern does");
+
+        // llms.txt describes the agent card's skills as the card lists them.
+        const cardSkillIds = ((servedCard?.skills || []) as any[]).map((s) => s.id);
+        const sm = String(llms?.text).match(/lister A2A-ferdighetene \(skills\) ([^\n]*)\./);
+        assertEq(sm ? sm[1].split(",").map((x) => x.trim().replace(/`/g, "")) : [], cardSkillIds, "claims-skills-llms: llms.txt names the agent card's skills, not the MCP tools");
+        assertTrue(cardSkillIds.length > 0 && cardSkillIds.every((id: string) => !id.startsWith("lokal_")), "claims-skills-card: the card's skills are A2A skills, not lokal_* tools");
+      }
 
       // Host isolation: linkHeaders and markdownNegotiation are mounted app-wide, ahead of
       // the Opplevagent and Finn-tannlege routers. Live 11.10 both hosts answered
@@ -371,6 +435,7 @@ export async function runDiscoveryTruthTests(opts: { log?: boolean } = {}): Prom
         const r = await callRouter(expRouter, p, "opplevagent.no");
         assertEq(r?.body?.["x-opplevagent"]?.totalExperiences, EXPECT_EXP, `exp-count-${p}: totalExperiences`);
         assertEq(digitsToNumber((String(r?.body?.description).match(/Discover ([\d\s  ]+) curated/) || [])[1]), EXPECT_EXP, `exp-count-${p}: description count`);
+        assertEq(r?.body?.icon, "https://opplevagent.no/favicon-512.png", `exp-card-icon-${p}: the server card shows the 512 PNG logo (G3-S5), not favicon.svg`);
       }
       const card = await callRouter(expRouter, "/.well-known/agent-card.json", "opplevagent.no");
       assertEq(card?.body?.["x-catalog"], { vertical: "experiences", honestCount: EXPECT_EXP }, "exp-count-card: agent card x-catalog");
@@ -451,7 +516,7 @@ export async function runDiscoveryTruthTests(opts: { log?: boolean } = {}): Prom
       const card = regMod.marketplaceRegistry.getRegistryCard("https://rettfrabonden.com") as any;
       assertEq([...card["x-lokal"].mcpTools].sort(), live.rfb, "tools-rfb-agent-card: x-lokal.mcpTools == live tools/list");
       const llms = await callRouter(discoveryRouter, "/llms.txt", "rettfrabonden.com");
-      const m = String(llms?.text).match(/tilgjengelige verktøy \(([^)]*)\)/);
+      const m = String(llms?.text).match(/lister tilgjengelige verktøy \(([^)]*)\)/);
       assertEq((m ? m[1].split(",").map((s) => s.trim().replace(/`/g, "")) : []).sort(), live.rfb, "tools-rfb-llms: llms.txt tool list == live tools/list");
 
       // skills index never points at a tool that does not exist; negotiation skill gone

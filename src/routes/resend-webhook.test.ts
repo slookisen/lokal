@@ -35,6 +35,11 @@
  *       sent log (+ covering daily-run id), or outreach_sent_log (compose);
  *       the latest send at/before Resend's acceptance; NULLs outside the
  *       lookback; a failing lookup still records the bounce
+ *   w13 email.delivered (eierkrav C2, 2026-11-06) → one email_delivery_events
+ *       row (no bounce/blocklist effect); replayed svix-id → duplicate, still
+ *       one row; multi-recipient → ledger only; crm_message_id = the latest
+ *       OUTBOUND crm_messages row to that exact address at/before Resend's
+ *       acceptance (+ slack), NULL outside the lookback; latestDeliveryFor()
  *
  * Two ways to run:
  *   1. Standalone:  npx tsx src/routes/resend-webhook.test.ts
@@ -147,6 +152,7 @@ export async function runResendWebhookTests(opts: { log?: boolean } = {}): Promi
     bounces: (db().prepare("SELECT COUNT(*) c FROM email_bounces").get() as any).c,
     blocklist: (db().prepare("SELECT COUNT(*) c FROM agent_blocklist").get() as any).c,
     ledger: (db().prepare("SELECT COUNT(*) c FROM resend_webhook_events").get() as any).c,
+    deliveries: (db().prepare("SELECT COUNT(*) c FROM email_delivery_events").get() as any).c,
   });
   function seedAgent(id: string, name: string, email: string): void {
     db().prepare(
@@ -338,7 +344,7 @@ export async function runResendWebhookTests(opts: { log?: boolean } = {}): Promi
     // ── w8 unrelated event ─────────────────────────────────────────────
     {
       const before = counts();
-      for (const type of ["email.delivered", "email.sent", "email.opened", "contact.created"]) {
+      for (const type of ["email.sent", "email.opened", "email.delivery_delayed", "contact.created"]) {
         const body = JSON.stringify({ type, created_at: "2026-09-29T10:00:00Z", data: { email_id: "em_x", to: ["post@ok.rw-farm.no"] } });
         const r = await post(body, signed(body, "msg_w8_" + type));
         assertEq([r.status, r.body.outcome], [200, "ignored_event_type"], `w8: ${type} → 200 ignored`);
@@ -464,6 +470,76 @@ export async function runResendWebhookTests(opts: { log?: boolean } = {}): Promi
       body = bounceAt("post@ok2.rw-farm.no", "2026-09-29T08:00:01.000Z", "em_w12e");
       r = await post(body, signed(body, "msg_w12e"));
       assertEq([r.status, r.body.outcome, attributed("post@ok2.rw-farm.no")], [200, "hard_bounce_recorded", { agent_id_at_send: null, batch_id: null, lane_at_send: null }], "w12e: attribution lookup error → 200, bounce recorded without attribution");
+    }
+
+    // ── w13 email.delivered (eierkrav C2, 2026-11-06) ──────────────────
+    {
+      const contactId = "ct-w13";
+      db().prepare(`INSERT INTO crm_contacts (id, type, email) VALUES (?, 'producer', 'post@dlv.rw-farm.no')`).run(contactId);
+      db().prepare(`INSERT INTO crm_threads (id, contact_id, subject) VALUES ('th-w13', ?, 'x')`).run(contactId);
+      const msg = (id: string, direction: "in" | "out", to: string[] | string, sentAt: string | null) =>
+        db().prepare(
+          `INSERT INTO crm_messages (id, thread_id, direction, from_email, to_emails, subject, body_text, sent_at)
+           VALUES (?, 'th-w13', ?, 'kontakt@example.test', ?, 'x', 'x', ?)`,
+        ).run(id, direction, typeof to === "string" ? to : JSON.stringify(to), sentAt);
+      msg("msg-dlv-old", "out", ["post@dlv.rw-farm.no"], "2026-10-20T09:00:00.000Z");
+      msg("msg-dlv-a", "out", ["Post@DLV.rw-farm.no"], "2026-10-20 10:00:00"); // SQLite format, mixed case
+      msg("msg-dlv-in", "in", ["post@dlv.rw-farm.no"], "2026-10-20T10:00:30.000Z"); // inbound: never it
+      msg("msg-dlv-x", "out", ["xpost@dlv.rw-farm.no"], "2026-10-20T10:00:40.000Z"); // substring, other address
+      msg("msg-dlv-bad", "out", "not json post@dlv.rw-farm.no", "2026-10-20T10:00:45.000Z"); // malformed list
+      msg("msg-dlv-later", "out", ["post@dlv.rw-farm.no"], "2026-10-20T11:00:00.000Z"); // after acceptance + slack
+      msg("msg-dlv-far", "out", ["post@far.rw-farm.no"], "2026-10-12T10:00:00.000Z"); // 8 days before
+
+      const delivered = (to: unknown, emailId: string, acceptedAt?: string, eventAt = "2026-10-20T10:01:05.000Z") =>
+        JSON.stringify({
+          type: "email.delivered",
+          created_at: eventAt,
+          data: { email_id: emailId, from: "RFB <kontakt@example.test>", to, subject: "Hei", ...(acceptedAt ? { created_at: acceptedAt } : {}) },
+        });
+      const rowFor = (svixId: string) =>
+        db().prepare("SELECT svix_id, resend_email_id, email, delivered_at, crm_message_id FROM email_delivery_events WHERE svix_id = ?").get(svixId);
+
+      const before = counts();
+      let body = delivered(["Navn <POST@dlv.rw-farm.no>"], "em_dlv1", "2026-10-20T10:01:00.000Z");
+      let r = await post(body, signed(body, "msg_w13a"));
+      assertEq([r.status, r.body.outcome, r.body.event_type], [200, "delivery_recorded", "email.delivered"], "w13a: delivered → 200 delivery_recorded");
+      assertEq(rowFor("msg_w13a"), { svix_id: "msg_w13a", resend_email_id: "em_dlv1", email: "post@dlv.rw-farm.no", delivered_at: "2026-10-20T10:01:05.000Z", crm_message_id: "msg-dlv-a" }, "w13a: one row, normalized address, latest outbound CRM message at/before acceptance");
+      let after = counts();
+      assertEq([after.deliveries - before.deliveries, after.ledger - before.ledger, after.bounces - before.bounces, after.blocklist - before.blocklist], [1, 1, 0, 0], "w13a: one delivery + one ledger row; no bounce, no blocklist row");
+
+      r = await post(body, signed(body, "msg_w13a")); // Svix retry
+      assertEq([r.status, r.body.outcome, r.body.duplicate], [200, "duplicate", true], "w13b: replayed svix-id → duplicate");
+      assertEq(counts(), after, "w13b: replay wrote nothing (still one row)");
+
+      const mb = counts();
+      body = delivered(["post@dlv.rw-farm.no", "post@ok.rw-farm.no"], "em_dlv2", "2026-10-20T10:01:00.000Z");
+      r = await post(body, signed(body, "msg_w13c"));
+      assertEq(r.body.outcome, "ambiguous_recipient", "w13c: multi-recipient → ambiguous_recipient");
+      after = counts();
+      assertEq([after.deliveries - mb.deliveries, after.ledger - mb.ledger], [0, 1], "w13c: ledger only, no delivery row");
+
+      body = delivered(["post@far.rw-farm.no"], "em_dlv3", "2026-10-20T10:01:00.000Z");
+      r = await post(body, signed(body, "msg_w13d"));
+      assertEq([r.body.outcome, (rowFor("msg_w13d") as any)?.crm_message_id], ["delivery_recorded", null], "w13d: only send is outside the 7-day lookback → crm_message_id NULL");
+
+      // No data.created_at → the event time is the anchor: 10:45 + 10 min
+      // slack is still before msg-dlv-later (11:00); acceptance at 10:55
+      // (+ slack = 11:05) reaches it.
+      body = delivered(["post@dlv.rw-farm.no"], "em_dlv4", undefined, "2026-10-20T10:45:00.000Z");
+      r = await post(body, signed(body, "msg_w13e"));
+      assertEq((rowFor("msg_w13e") as any)?.crm_message_id, "msg-dlv-a", "w13e: no data.created_at → event time anchor, later send (beyond slack) not chosen");
+      body = delivered(["post@dlv.rw-farm.no"], "em_dlv5", "2026-10-20T10:55:00.000Z", "2026-10-20T11:00:30.000Z");
+      r = await post(body, signed(body, "msg_w13f"));
+      assertEq((rowFor("msg_w13f") as any)?.crm_message_id, "msg-dlv-later", "w13f: send within the clock slack after acceptance is attributed");
+
+      body = delivered(["post@none.rw-farm.no"], "em_dlv6", "2026-10-20T10:01:00.000Z");
+      r = await post(body, signed(body, "msg_w13g"));
+      assertEq([r.body.outcome, (rowFor("msg_w13g") as any)?.crm_message_id], ["delivery_recorded", null], "w13g: no CRM message for the address → NULL");
+
+      assertEq((svc.latestDeliveryFor({ crmMessageId: "msg-dlv-a" }) as any)?.svix_id, "msg_w13e", "w13h: latestDeliveryFor(crmMessageId) → the latest delivery of that message");
+      assertEq((svc.latestDeliveryFor({ email: " POST@dlv.rw-farm.no " }) as any)?.svix_id, "msg_w13f", "w13h: latestDeliveryFor(email) normalizes and returns the latest");
+      assertEq([svc.latestDeliveryFor({ crmMessageId: "msg-dlv-old" }), svc.latestDeliveryFor({ email: "nobody@x.no" }), svc.latestDeliveryFor({})], [null, null, null], "w13h: nothing recorded → null");
+      assertEq(db().prepare("SELECT COUNT(*) c FROM email_bounces WHERE email LIKE '%dlv.rw-farm.no' OR email LIKE '%far.rw-farm.no' OR email LIKE '%none.rw-farm.no'").get(), { c: 0 }, "w13: deliveries never touch email_bounces");
     }
   } catch (err: any) {
     failed++;

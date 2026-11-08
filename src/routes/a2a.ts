@@ -34,6 +34,8 @@ import { capFreeText } from "../utils/free-text";
 import { logInternalError, rpcInternalErrorReply } from "../utils/internal-error";
 import { searchCountable } from "../services/search-tracking";
 import { publicAgentInfo, publicFieldChoices } from "../owner-features/enforce";
+import { emailWithheldIds, withKnowledgeEmailNull } from "../services/email-reveal-guard";
+import { guardConversationEmails, messageForListener, liveStreamCacheControl } from "../services/conversation-email-guard";
 import { readSearchText, geocodeSearchPlace, discoveryQueryOf, outsideNorwayText, noProductMatchText } from "../services/rfb-search-reading";
 import {
   isOrderAgentActionsEnabled,
@@ -119,13 +121,13 @@ router.get("/a2a", (_req: Request, res: Response) => {
     const cities = [...new Set(agents.map((a: any) => a.city).filter(Boolean))];
     const card = {
       name: "Rett fra Bonden",
-      description: `A2A marketplace for local food in Norway. Connect AI agents with ${agents.length}+ verified local farms, shops, cooperatives, farm shops, REKO rings, and markets. Agent-markedsplass for lokal mat i Norge.`,
+      description: `A2A marketplace for local food in Norway. Connect AI agents with ${agents.length}+ local farms, shops, cooperatives, farm shops, REKO rings, and markets, cross-checked against the Brønnøysund register. Agent-markedsplass for lokal mat i Norge.`,
       url: process.env.BASE_URL || "https://rettfrabonden.com",
       // T3 (dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as):
       // same provider as the .well-known card (getRegistryCard) — the company.
       provider: {
         ...agentCardProvider(),
-        contactUrl: `${process.env.BASE_URL || "https://rettfrabonden.com"}/docs`,
+        contactUrl: `${process.env.BASE_URL || "https://rettfrabonden.com"}/kontakt`,
         description: "Open agent-to-agent food marketplace operator. Norges første A2A-markedsplass for lokal mat.",
       },
       version: "1.0.0",
@@ -138,7 +140,7 @@ router.get("/a2a", (_req: Request, res: Response) => {
       additionalInterfaces: [
         { url: `${process.env.BASE_URL || "https://rettfrabonden.com"}/api/marketplace`, transport: "HTTP+JSON" },
       ],
-      documentationUrl: `${process.env.BASE_URL || "https://rettfrabonden.com"}/docs`,
+      documentationUrl: `${process.env.BASE_URL || "https://rettfrabonden.com"}/teknologi`,
       // dev-request 2026-07-25-proveniens-transparens: additive link to the
       // public "how we verify our data" page (field_provenance / cross-source
       // agreement machinery, already live server-side — this is docs only,
@@ -179,7 +181,7 @@ router.get("/a2a", (_req: Request, res: Response) => {
         { type: "rest", url: `${process.env.BASE_URL || "https://rettfrabonden.com"}/api/marketplace`, description: "REST API for search, discovery, registration" },
       ],
       skills: [
-        { id: "discover-local-food-agents", name: "Discover Local Food Agents", description: `Search ${agents.length}+ verified local food producers in Norway`, tags: ["local food", "farm direct", "Norway"], examples: ["Find farms near Oslo", "finn grønnsaker i Bergen"] },
+        { id: "discover-local-food-agents", name: "Discover Local Food Agents", description: `Search ${agents.length}+ local food producers in Norway, cross-checked against the Brønnøysund register`, tags: ["local food", "farm direct", "Norway"], examples: ["Find farms near Oslo", "finn grønnsaker i Bergen"] },
         { id: "agent-conversation", name: "Start Agent Negotiation", description: "Initiate buyer-seller conversation between agents", tags: ["negotiate", "order", "transaction"], examples: ["negotiate delivery of tomatoes"] },
         { id: "build-shopping-cart", name: "Build a shopping cart", description: `Cart and order flow is available via the MCP server (POST /mcp): find offers with lokal_find_offers, then lokal_cart_create, lokal_cart_add_item, lokal_cart_view and lokal_cart_submit (${isPaymentsEnabled() ? "pickup order; producers that take prepayment return a Stripe payment link the buyer approves themselves, the others are paid at pickup" : "pickup order, no payment"}). Not available through message/send on /a2a.`, tags: ["cart", "order", "local food", "pickup", "mcp"], examples: ["MCP tools/call lokal_find_offers {items: [\"potet\"], near: \"Oslo\"}", "MCP tools/call lokal_cart_create"] },
         // Fase B3 (mine ordrer): only with ORDER_AGENT_ACTIONS_ENABLED on; off, the card is unchanged.
@@ -793,6 +795,16 @@ function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
     });
   }
 
+  // dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
+  // S-A5 (RFB A2A): knowledge.email follows the rfb per-IP limit of
+  // services/email-reveal-guard.ts, the counter the profile page and the
+  // REST answers share (switch EMAIL_REVEAL_GUARD_RFB, default off). Over
+  // the limit, or for CCBot, it reads null as for a producer without one.
+  // Switch on: Cache-Control: private. Switch off: nothing changes.
+  let shown = publicAgentInfo(info, publicFieldChoices(agentId));
+  const emailWithheld = emailWithheldIds(req, res, "rfb", shown.knowledge.email ? [String(agentId)] : []);
+  if (emailWithheld?.has(String(agentId))) shown = withKnowledgeEmailNull(shown);
+
   res.json({
     jsonrpc: "2.0",
     result: {
@@ -803,7 +815,7 @@ function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
           name: "agent-info",
           // S2c-1: without what the owner hid (not enforced = as before).
           // B2b-2: products in the stock rule's soft window carry the date.
-          data: withSoftStockProducts(publicAgentInfo(info, publicFieldChoices(agentId)), String(agentId)),
+          data: withSoftStockProducts(shown, String(agentId)),
         }),
       ],
     },
@@ -913,12 +925,18 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
     // Økologi S3c-2: owner-written about of a producer without a valid Debio
     // status → no organic sentence (gate off = unchanged).
     safeAbout = publicOwnerAboutText(req.params.id as string, safeAbout);
+    // dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
+    // S-A5 (RFB A2A): x-knowledge.email follows the rfb per-IP limit (as
+    // agent/info above); withheld it is left out as for a producer without
+    // one. Switch on: Cache-Control: private instead of public. Off: as before.
+    const agentId = req.params.id as string;
+    const emailWithheld = emailWithheldIds(req, res, "rfb", knowledge.email ? [agentId] : []);
     const enriched: Record<string, any> = { ...card };
     enriched["x-knowledge"] = {
       address: knowledge.address,
       postalCode: knowledge.postalCode,
       phone: isDisplayablePhone(knowledge.phone) ? knowledge.phone : undefined,
-      email: knowledge.email,
+      email: emailWithheld?.has(agentId) ? undefined : knowledge.email,
       website: knowledge.website,
       openingHours: knowledge.openingHours,
       // Integration test 2026-10-17 (I-G): products is DB JSON. Stored as
@@ -950,7 +968,7 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
     for (const key of Object.keys(xk)) {
       if (xk[key] === undefined || xk[key] === null) delete xk[key];
     }
-    res.header("Cache-Control", "public, max-age=1800");
+    res.header("Cache-Control", emailWithheld === null ? "public, max-age=1800" : "private");
     res.json(enriched);
     return;
   }
@@ -1039,12 +1057,16 @@ router.get("/api/discovery", (_req: Request, res: Response) => {
 // Connect with EventSource("/api/live") in the dashboard
 // ═══════════════════════════════════════════════════════════════
 
-const sseClients = new Set<Response>();
+// S-A5 (dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting):
+// each listener keeps its own request, so a seller message's ✉️ line follows
+// that listener's rfb per-IP counter (services/conversation-email-guard.ts;
+// switch EMAIL_REVEAL_GUARD_RFB off = the same bytes to everyone, as before).
+const sseClients = new Map<Response, Request>();
 
 router.get("/api/live", (req: Request, res: Response) => {
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
+    "Cache-Control": liveStreamCacheControl(),
     "Connection": "keep-alive",
     "X-Accel-Buffering": "no",
   });
@@ -1052,14 +1074,14 @@ router.get("/api/live", (req: Request, res: Response) => {
   // Send initial connection event
   res.write(`data: ${JSON.stringify({ type: "connected", timestamp: new Date().toISOString() })}\n\n`);
 
-  sseClients.add(res);
+  sseClients.set(res, req);
   req.on("close", () => sseClients.delete(res));
 });
 
 // Forward interactions and messages to SSE clients
 interactionLogger.on("interaction", (event: InteractionEvent) => {
   const data = JSON.stringify({ eventType: "interaction", ...event });
-  for (const client of sseClients) {
+  for (const client of sseClients.keys()) {
     try { client.write(`data: ${data}\n\n`); } catch { sseClients.delete(client); }
   }
 });
@@ -1073,8 +1095,15 @@ interactionLogger.on("message", (msg: any) => {
     safe.content = redactPII(msg.content);
   }
   const data = JSON.stringify({ type: "conversation_message", ...safe });
-  for (const client of sseClients) {
-    try { client.write(`data: ${data}\n\n`); } catch { sseClients.delete(client); }
+  // S-A5: a seller message's ✉️ line per listener (see sseClients above).
+  const cache = new Map<string, string | null>();
+  for (const [client, clientReq] of sseClients) {
+    let line = data;
+    try {
+      const shown = messageForListener(clientReq, safe, cache);
+      if (shown !== safe) line = JSON.stringify({ type: "conversation_message", ...shown });
+    } catch { /* guard failure: the message is not sent to this listener */ continue; }
+    try { client.write(`data: ${line}\n\n`); } catch { sseClients.delete(client); }
   }
 });
 
@@ -1126,7 +1155,9 @@ router.post("/api/conversations", (req: Request, res: Response) => {
     requestMeta, // (item 3) internal-traffic classification
     trafficClass,
   });
-  res.json({ success: true, data: conversation });
+  // S-A5: the seller auto-reply's ✉️ line follows the rfb per-IP limit
+  // (services/conversation-email-guard.ts); the stored rows are unchanged.
+  res.json({ success: true, data: guardConversationEmails(req, res, [conversation])[0] });
 });
 
 // Redact PII from a conversation's public-facing fields without touching
@@ -1154,7 +1185,9 @@ router.get("/api/conversations", (req: Request, res: Response) => {
     status: (req.query.status as string) || undefined,
     agentId: (req.query.agentId as string) || undefined,
   });
-  const safe = conversations.map(redactConversationForPublic);
+  // S-A5: each seller whose reply carries an e-mail counts on the rfb per-IP
+  // limit once, in list order (services/conversation-email-guard.ts).
+  const safe = guardConversationEmails(req, res, conversations).map(redactConversationForPublic);
   res.json({ success: true, data: safe, count: safe.length });
 });
 
@@ -1165,7 +1198,8 @@ router.get("/api/conversations/:id", (req: Request, res: Response) => {
     res.status(404).json({ success: false, error: "Conversation not found" });
     return;
   }
-  res.json({ success: true, data: redactConversationForPublic(conversation) });
+  // S-A5: the seller's ✉️ line follows the rfb per-IP limit (see the list above).
+  res.json({ success: true, data: redactConversationForPublic(guardConversationEmails(req, res, [conversation])[0]) });
 });
 
 // POST /api/conversations/:id/messages — Add message to conversation

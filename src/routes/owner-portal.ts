@@ -16,7 +16,8 @@ import {
 } from "../services/profile-translations";
 import crypto from "crypto";
 import { tokenLogLabel, emailLogLabel } from "../utils/log-label";
-import { productImportOutreachEnabled } from "../services/product-import/outreach-prepare";
+import { productImportOutreachEnabledFor } from "../services/product-import/outreach-prepare";
+import { ownerFlagEnabledFor, ownerFlagMode } from "../owner-features/owner-flag-mode";
 import { OUTREACH_RETURN_COOKIE, outreachReturnPathFor } from "../services/product-import/outreach-landing";
 import { getProducerPaymentStatus } from "../services/payment-service";
 import { isOverridableCsLock, csLockNote } from "../services/owner-cs-lock";
@@ -48,9 +49,12 @@ import {
   stockCheckOn, soonExpiringItems, confirmStockCheckItems, formatStockCheckDate, type StockCheckItem,
 } from "../services/stock-check-reminder";
 import {
-  getOwnerImportOverview, productImportEnabled, profileWebsite, OWNER_FETCH_BUSY_MESSAGE, OWNER_FETCH_DAILY_LIMIT_MESSAGE,
+  getOwnerImportOverview, productImportEnabledFor, profileWebsite, OWNER_FETCH_BUSY_MESSAGE, OWNER_FETCH_DAILY_LIMIT_MESSAGE,
   OWNER_FETCH_RUNNING_MESSAGE, OWNER_IMPORT_NO_WEBSITE_MESSAGE,
 } from "../services/product-import/owner-import";
+import { autoSyncStatusView, importPageAutoSyncChoice, type AutoSyncStatusView } from "../services/product-import/auto-sync";
+import { ownerRowAnchor } from "../owner-features/anchors";
+import { PRODUCT_WEEKLY_SYNC_KEY } from "../owner-features/product-weekly-sync";
 
 const router = Router();
 
@@ -122,9 +126,9 @@ interface SessionData {
 // ─────────────────────────────────────────────────────────────────
 // POST /api/agents/:id/request-magic-link
 // ─────────────────────────────────────────────────────────────────
-// 1. Validate email matches agent's registered email (case-insensitive), or
+// 1. Rate-limit: max 3 requests per hour, before the address is looked at
+// 2. Validate email matches agent's registered email (case-insensitive), or
 //    the confirmed address of this agent's verified owner (K5, below)
-// 2. Rate-limit: max 3 requests per hour
 // 3. Generate secure token
 // 4. Store in magic_links table
 // 5. Send email with verify link
@@ -148,41 +152,9 @@ router.post("/api/agents/:id/request-magic-link", async (req: Request, res: Resp
 
     const db = getDb();
 
-    // 1. Check if email matches agent's registered email + load agent name
-    const agentKnowledge = db
-      .prepare("SELECT email FROM agent_knowledge WHERE agent_id = ?")
-      .get(id) as any;
-    const agentRow = db
-      .prepare("SELECT name FROM agents WHERE id = ?")
-      .get(id) as any;
-
-    // K5 (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post): an owner
-    // Daniel approved by hand is bound to the address he approved
-    // (agent_claims.claimant_email, status 'verified'), often because the one
-    // on the profile was wrong — and approval never touches
-    // agent_knowledge.email. That confirmed address logs in too, for THIS
-    // agent only. Any other address gets the same 404 as before. The link goes
-    // to the confirmed address (normalized), not to the typed variant of it.
-    const knowledgeMatch =
-      !!agentKnowledge &&
-      !!agentKnowledge.email &&
-      agentKnowledge.email.toLowerCase() === email.toLowerCase();
-    const claimantEmail = knowledgeMatch ? null : verifiedClaimantEmailFor(String(id), email);
-
-    if (!knowledgeMatch && !claimantEmail) {
-      console.log(
-        `[owner-portal] Email mismatch for ${id}: provided=${emailLogLabel(email)}, registered=${emailLogLabel(agentKnowledge?.email)}`
-      );
-      return res.status(404).json({
-        success: false,
-        error: "email_not_associated",
-        message: "Den e-posten er ikke registrert for denne produsenten.",
-      });
-    }
-
-    const agentName: string = (agentRow && agentRow.name) ? String(agentRow.name) : "din profil";
-
-    // 2. Rate-limit check
+    // 1. Rate-limit check, BEFORE the address is looked at: over the limit,
+    // every address gets the same 429, so the limit itself does not tell a
+    // visitor which address belongs to the profile.
     // created_at is stored as an ISO-8601 string (now.toISOString(), e.g.
     // "2026-08-06T13:20:00.000Z" — see the INSERT below), while
     // datetime('now', ...) produces SQLite's own native format (e.g.
@@ -215,6 +187,40 @@ router.post("/api/agents/:id/request-magic-link", async (req: Request, res: Resp
         message: "For mange innloggingsforsøk. Prøv igjen senere.",
       });
     }
+
+    // 2. Check if email matches agent's registered email + load agent name
+    const agentKnowledge = db
+      .prepare("SELECT email FROM agent_knowledge WHERE agent_id = ?")
+      .get(id) as any;
+    const agentRow = db
+      .prepare("SELECT name FROM agents WHERE id = ?")
+      .get(id) as any;
+
+    // K5 (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post): an owner
+    // Daniel approved by hand is bound to the address he approved
+    // (agent_claims.claimant_email, status 'verified'), often because the one
+    // on the profile was wrong — and approval never touches
+    // agent_knowledge.email. That confirmed address logs in too, for THIS
+    // agent only. Any other address gets the same 404 as before. The link goes
+    // to the confirmed address (normalized), not to the typed variant of it.
+    const knowledgeMatch =
+      !!agentKnowledge &&
+      !!agentKnowledge.email &&
+      agentKnowledge.email.toLowerCase() === email.toLowerCase();
+    const claimantEmail = knowledgeMatch ? null : verifiedClaimantEmailFor(String(id), email);
+
+    if (!knowledgeMatch && !claimantEmail) {
+      console.log(
+        `[owner-portal] Email mismatch for ${id}: provided=${emailLogLabel(email)}, registered=${emailLogLabel(agentKnowledge?.email)}`
+      );
+      return res.status(404).json({
+        success: false,
+        error: "email_not_associated",
+        message: "Den e-posten er ikke registrert for denne produsenten.",
+      });
+    }
+
+    const agentName: string = (agentRow && agentRow.name) ? String(agentRow.name) : "din profil";
 
     // 3 + 4. Generate secure token, insert into magic_links (shared helper)
     const recipient = claimantEmail ?? email;
@@ -327,7 +333,7 @@ router.get("/magic-link-verify", (req: Request, res: Response) => {
     // Skive 3b-2 (PRODUCT_IMPORT_OUTREACH_ENABLED): back to the outreach
     // landing page the owner came from (rfb_owner_return cookie), only when it
     // is exactly that page for THIS agent.
-    const outreachBack = productImportOutreachEnabled()
+    const outreachBack = productImportOutreachEnabledFor(String(agentId))
       ? outreachReturnPathFor(req.headers.cookie as string | undefined, (req as any).cookies, String(agentId))
       : null;
     if (outreachBack) {
@@ -457,8 +463,14 @@ export function ownerVerifiedOwnerGateEnabled(): boolean {
   return envFlagOn(OWNER_VERIFIED_OWNER_GATE_FLAG);
 }
 
+/** "1"/"true": the unified session is on for every verified owner ("all" mode). */
 export function ownerUnifiedSessionEnabled(): boolean {
-  return envFlagOn(OWNER_UNIFIED_SESSION_FLAG);
+  return ownerFlagMode(OWNER_UNIFIED_SESSION_FLAG) === "all";
+}
+
+/** On for this owner: "1"/"true" → everyone; "pilot" → `rfb:<id>` in OWNER_FEATURES_ALLOWED_SUBJECTS. */
+export function ownerUnifiedSessionEnabledFor(agentId: string | null | undefined): boolean {
+  return ownerFlagEnabledFor(OWNER_UNIFIED_SESSION_FLAG, agentId);
 }
 
 /**
@@ -564,7 +576,7 @@ export function issueOwnerSessionForSelgerLogin(
   agentId: string,
   email: string,
 ): boolean {
-  if (!ownerUnifiedSessionEnabled() || !agentId || !email) return false;
+  if (!ownerUnifiedSessionEnabledFor(agentId) || !agentId || !email) return false;
   const existing = verifyOwnerSession(req);
   if (existing.valid && existing.agentId === agentId) return false;
   openOwnerSession(res, agentId, email);
@@ -824,6 +836,12 @@ router.post("/api/agents/:id/update-profile", (req: Request, res: Response) => {
       if (field in req.body) {
         bodyFields[field] = req.body[field];
       }
+    }
+
+    // dev-request 2026-11-06 (AC 3): a new profile e-mail only from the
+    // verified claimant's own login; refused as a whole, nothing written.
+    if ("email" in bodyFields && profileEmailChangeNeedsClaimant(id, sessionData, bodyFields.email)) {
+      return res.status(403).json({ success: false, error: "claimant_login_required", message: OWNER_CLAIMANT_EMAIL_MESSAGES.profile_email });
     }
 
     // Strip any read-only fields
@@ -1631,8 +1649,27 @@ const ORDER_EMAIL_MAX_REQUESTS_PER_HOUR = 3;
 const ORDER_EMAIL_AUDIT_FIELD = "order_notification_email";
 const ORDER_EMAIL_CONFIRM_PATH = "/eier/ordre-epost/bekreft";
 
+/** "1"/"true": the order e-mail change is on for every verified owner ("all" mode). */
 export function ownerOrderEmailEnabled(): boolean {
-  return envFlagOn(OWNER_ORDER_EMAIL_FLAG);
+  return ownerFlagMode(OWNER_ORDER_EMAIL_FLAG) === "all";
+}
+
+/** On for this owner: "1"/"true" → everyone; "pilot" → `rfb:<id>` in OWNER_FEATURES_ALLOWED_SUBJECTS. */
+export function ownerOrderEmailEnabledFor(agentId: string | null | undefined): boolean {
+  return ownerFlagEnabledFor(OWNER_ORDER_EMAIL_FLAG, agentId);
+}
+
+/**
+ * The agent a confirmation token was issued for (any state: used, expired …),
+ * or null for an unknown / malformed token. Read-only; lets the confirm routes
+ * apply the pilot list to the token's owner.
+ */
+export function orderEmailTokenAgentId(rawToken: string): string | null {
+  if (!/^[0-9a-f]{64}$/.test(rawToken)) return null;
+  const row = getDb()
+    .prepare("SELECT agent_id FROM owner_order_email_change WHERE token_hash = ?")
+    .get(hashOrderEmailToken(rawToken)) as { agent_id?: string } | undefined;
+  return row?.agent_id ? String(row.agent_id) : null;
 }
 
 function hashOrderEmailToken(token: string): string {
@@ -1692,7 +1729,7 @@ export async function requestOwnerOrderEmailChange(
   agentId: string,
   rawEmail: unknown,
 ): Promise<{ status: number; body: any }> {
-  if (!ownerOrderEmailEnabled()) return { status: 404, body: { success: false, error: "not_found" } };
+  if (!ownerOrderEmailEnabledFor(agentId)) return { status: 404, body: { success: false, error: "not_found" } };
   const session = verifyOwnerSession(req);
   if (!session.valid) {
     return { status: 401, body: { success: false, error: "session_invalid", message: "Din sesjon er utløpt. Logg inn på nytt." } };
@@ -1701,6 +1738,11 @@ export async function requestOwnerOrderEmailChange(
     return session.agentId === agentId
       ? { status: 403, body: { success: false, error: "ownership_not_verified", message: OWNER_ORDER_EMAIL_LOCKED_MESSAGE } }
       : { status: 403, body: { success: false, error: "forbidden", message: "Du har ikke tilgang til denne agenten." } };
+  }
+  // dev-request 2026-11-06 (AC 3): only the verified claimant's own login may
+  // ask for a new order address (no token row, no mail otherwise).
+  if (!sessionClaimantOwnerEmail(agentId, session)) {
+    return { status: 403, body: { success: false, error: "claimant_login_required", message: OWNER_CLAIMANT_EMAIL_MESSAGES.order_email } };
   }
   const email = normalizeEmail(typeof rawEmail === "string" ? rawEmail : "");
   if (!email || !isPlausibleOrderEmail(email)) {
@@ -2028,7 +2070,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       alert = `<div class="ep-alert ep-alert-ok" role="status">Profilen er synlig igjen.</div>`;
     } else if (status === "pause_error" && ownerPauseEnabled()) {
       alert = `<div class="ep-alert ep-alert-error" role="alert">Klarte ikke å endre pausen. Sjekk datoen og prøv igjen.</div>`;
-    } else if (status.startsWith("order_email_") && ownerOrderEmailEnabled() && ORDER_EMAIL_STATUS_ALERTS[status]) {
+    } else if (status.startsWith("order_email_") && ownerOrderEmailEnabledFor(agentId) && ORDER_EMAIL_STATUS_ALERTS[status]) {
       const oa = ORDER_EMAIL_STATUS_ALERTS[status];
       alert = oa.ok
         ? `<div class="ep-alert ep-alert-ok" role="status">${escapeHtml(oa.text)}</div>`
@@ -2077,7 +2119,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
     // card — only with OWNER_ORDER_EMAIL_ENABLED on and a verified owner
     // (flag off = the portal is byte-identical to before).
     let orderEmailHtml = "";
-    if (ownerOrderEmailEnabled() && !hasOwnerFeatures) {
+    if (ownerOrderEmailEnabledFor(agentId) && !hasOwnerFeatures) {
       try {
         if (isVerifiedOwner(agentId, session)) {
           orderEmailHtml = ownerOrderEmailSectionHtml(agentId, currentOrderRecipient(agentId), pendingOrderEmailChange(agentId)?.new_email ?? null);
@@ -2116,11 +2158,11 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
     let productImportCard = "";
     try {
       if (productImportCardVisible(agentId, session, agent.is_verified)) {
-        const ia = productImportPortalAlert(status, req.query as any, productImportStockHintHtml(agentId));
+        const ia = productImportPortalAlert(status, req.query as any, productImportStockHintHtml(agentId), status === "produktimport_publisert" ? weeklySyncNudgeHtml(agentId) : "");
         const iaHtml = ia
           ? `<div class="ep-alert ${ia.ok ? "ep-alert-ok" : "ep-alert-error"}" role="${ia.ok ? "status" : "alert"}" data-import-alert="${escapeHtml(status)}">${ia.html}</div>`
           : "";
-        productImportCard = productImportCardHtml(agentId, getOwnerImportOverview(agentId), iaHtml);
+        productImportCard = productImportCardHtml(agentId, getOwnerImportOverview(agentId), iaHtml, autoSyncStatusHtml(autoSyncStatusView(agentId)));
       }
     } catch (e) {
       console.error("[owner-portal] product import card failed:", e instanceof Error ? e.message : "error");
@@ -2550,7 +2592,7 @@ router.post("/api/agents/:id/order-email", async (req: Request, res: Response) =
 router.post("/eier/:agentId/order-email", express.urlencoded({ extended: false }), async (req: Request, res: Response) => {
   const agentId = String(req.params.agentId || "");
   const base = `/eier/${encodeURIComponent(agentId)}/portal`;
-  if (!ownerOrderEmailEnabled()) {
+  if (!ownerOrderEmailEnabledFor(agentId)) {
     return res.status(404).send(portalShell("Fant ikke siden", `<div class="ep-card"><h1>Fant ikke siden</h1></div>`));
   }
   // Same Origin check as POST /eier/:id/pause and /selger: no cross-site trigger.
@@ -2561,6 +2603,7 @@ router.post("/eier/:agentId/order-email", express.urlencoded({ extended: false }
     const out = await requestOwnerOrderEmailChange(req, agentId, req.body?.email);
     if (out.status === 401) return res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
     if (out.status === 200) return res.redirect(303, `${base}?status=order_email_sent#bestillinger`);
+    if (out.status === 403 && out.body?.error === "claimant_login_required") return res.status(403).send(ownerEmailNeedsClaimantLoginPage(agentId, "order_email"));
     const mapped = ORDER_EMAIL_ERROR_STATUS[String(out.body?.error || "")];
     if (mapped) return res.redirect(303, `${base}?status=${mapped}#bestillinger`);
     if (out.status === 403 && out.body?.error === "ownership_not_verified") return res.status(403).send(ownerNotVerifiedPage(agentId));
@@ -2573,6 +2616,18 @@ router.post("/eier/:agentId/order-email", express.urlencoded({ extended: false }
     return res.redirect(303, `${base}?status=order_email_error#bestillinger`);
   }
 });
+
+/**
+ * The confirm routes exist: "1"/"true" → for every token; "pilot" → only for
+ * a token issued to an agent on the pilot list (unknown token = no agent id =
+ * off, as with the flag off); off → never.
+ */
+function orderEmailConfirmOpen(rawToken: string): boolean {
+  const mode = ownerFlagMode(OWNER_ORDER_EMAIL_FLAG);
+  if (mode === "all") return true;
+  if (mode === "off") return false;
+  return ownerOrderEmailEnabledFor(orderEmailTokenAgentId(rawToken));
+}
 
 function orderEmailNoStore(res: Response): void {
   // The token is in the URL: never cache the page, never leak it as Referer.
@@ -2598,7 +2653,7 @@ function orderEmailTokenErrorPage(reason: string): string {
 }
 
 router.get(`${ORDER_EMAIL_CONFIRM_PATH}/:token`, orderEmailConfirmLimiter, (req: Request, res: Response) => {
-  if (!ownerOrderEmailEnabled()) {
+  if (!orderEmailConfirmOpen(String(req.params.token || ""))) {
     return res.status(404).send(portalShell("Fant ikke siden", `<div class="ep-card"><h1>Fant ikke siden</h1></div>`));
   }
   orderEmailNoStore(res);
@@ -2621,7 +2676,7 @@ router.get(`${ORDER_EMAIL_CONFIRM_PATH}/:token`, orderEmailConfirmLimiter, (req:
 });
 
 router.post(`${ORDER_EMAIL_CONFIRM_PATH}/:token`, orderEmailConfirmLimiter, express.urlencoded({ extended: false }), (req: Request, res: Response) => {
-  if (!ownerOrderEmailEnabled()) {
+  if (!orderEmailConfirmOpen(String(req.params.token || ""))) {
     return res.status(404).send(portalShell("Fant ikke siden", `<div class="ep-card"><h1>Fant ikke siden</h1></div>`));
   }
   orderEmailNoStore(res);
@@ -2670,6 +2725,10 @@ router.post("/eier/:agentId/save", express.urlencoded({ extended: false }), asyn
     for (const key of EDITABLE_FIELDS) {
       const v = (req.body as any)[`field_${key}`];
       if (v !== undefined) payload[key] = String(v);
+    }
+    // dev-request 2026-11-06 (AC 3): same rule as update-profile, answered with the page.
+    if ("email" in payload && profileEmailChangeNeedsClaimant(agentId, session, payload.email)) {
+      return res.status(403).send(ownerEmailNeedsClaimantLoginPage(agentId, "profile_email"));
     }
     const url = `${req.protocol}://${req.get("host")}/api/agents/${encodeURIComponent(agentId)}/update-profile`;
     const resp = await fetch(url, {
@@ -2815,7 +2874,7 @@ export function sessionClaimantOwnerEmail(
 
 router.post("/eier/:agentId/selger", (req: Request, res: Response) => {
   const agentId = String((req.params as any).agentId || "");
-  if (!ownerUnifiedSessionEnabled()) {
+  if (!ownerUnifiedSessionEnabledFor(agentId)) {
     return res.status(404).send(portalShell("Fant ikke siden", `<div class="ep-card"><h1>Fant ikke siden</h1></div>`));
   }
   try {
@@ -2854,7 +2913,7 @@ router.post("/eier/:agentId/selger", (req: Request, res: Response) => {
 
 /** Portal card (flag on only): products, opening hours, availability via /selger. */
 export function ownerSelgerCardHtml(agentId: string): string {
-  if (!ownerUnifiedSessionEnabled()) return "";
+  if (!ownerUnifiedSessionEnabledFor(agentId)) return "";
   const id = encodeURIComponent(agentId);
   return `<div class="ep-card" id="produkter">
         <h2>Produkter og åpningstider</h2>
@@ -2996,6 +3055,47 @@ export function ownerProductsNeedClaimantLoginPage(agentId: string): string {
           <a class="ep-btn ep-btn-primary" href="/selger?agent=${id}">Logg inn med eierens e-post</a>
         </div>`
   );
+}
+
+/**
+ * dev-request 2026-11-06-rfb-krav-for-portal-og-okter-ved-eierskifte (AC 3):
+ * the e-mail writes that need the verified claimant's own login, as products do.
+ */
+export type OwnerClaimantEmailField = "order_email" | "profile_email";
+
+export const OWNER_CLAIMANT_EMAIL_MESSAGES: Record<OwnerClaimantEmailField, string> = {
+  order_email: "For å endre adressen bestillingene sendes til, må du logge inn med e-postadressen til den som har bekreftet eierskapet til profilen.",
+  profile_email: "For å endre e-postadressen på profilen må du logge inn med e-postadressen til den som har bekreftet eierskapet til profilen.",
+};
+
+/** 403 page: verified owner, but this session may not change the order or profile e-mail (not the claimant's own login). */
+export function ownerEmailNeedsClaimantLoginPage(agentId: string, field: OwnerClaimantEmailField): string {
+  const id = encodeURIComponent(agentId);
+  return portalShell(
+    "Logg inn med eierens e-post",
+    `<div class="ep-card" data-claimant-login-required="1">
+          <h1>Logg inn med eierens e-postadresse</h1>
+          <p>${escapeHtml(OWNER_CLAIMANT_EMAIL_MESSAGES[field])} Ingenting er endret.</p>
+          <a class="ep-btn ep-btn-primary" href="/selger?agent=${id}">Logg inn med eierens e-post</a>
+        </div>`
+  );
+}
+
+/**
+ * True when this save would change the profile e-mail (agent_knowledge.email,
+ * compared as the save compares it) and the session is not the verified
+ * claimant's own login — the save must then be refused as a whole.
+ */
+export function profileEmailChangeNeedsClaimant(
+  agentId: string,
+  session: { token?: string } | null | undefined,
+  rawEmail: unknown,
+): boolean {
+  if (rawEmail === undefined) return false;
+  const row = getDb().prepare("SELECT email FROM agent_knowledge WHERE agent_id = ?").get(agentId) as { email?: string | null } | undefined;
+  if (!row) return false; // no profile: the save answers agent_not_found itself
+  if (normalizeOwnerProfileValue("email", rawEmail) === normalizeOwnerProfileValue("email", row.email)) return false;
+  return !sessionClaimantOwnerEmail(agentId, session);
 }
 
 type OwnerOrderabilityAuth = { ok: true; agentId: string; email: string | null } | { ok: false };
@@ -3169,6 +3269,7 @@ export function productImportPortalAlert(
   status: string,
   query: { publisert?: unknown; fjernet?: unknown; avvist?: unknown },
   stockHint: string,
+  weeklyNudgeHtml = "",
 ): { ok: boolean; html: string } | null {
   const num = (v: unknown) => (typeof v === "string" && /^\d{1,4}$/.test(v) ? Number(v) : 0);
   const varer = (n: number) => `${n} ${n === 1 ? "vare" : "varer"}`;
@@ -3184,7 +3285,7 @@ export function productImportPortalAlert(
       if (rej > 0) text += ` ${varer(rej)} kunne ikke legges inn (kategorinavn, alkohol eller tjeneste).`;
       return {
         ok: true,
-        html: `<span data-import-published="${pub}" data-import-removed="${rem}">${escapeHtml(text)}</span>${pub > 0 ? ` ${stockHint}` : ""}`,
+        html: `<span data-import-published="${pub}" data-import-removed="${rem}">${escapeHtml(text)}</span>${pub > 0 ? ` ${stockHint}` : ""}${pub > 0 && weeklyNudgeHtml ? ` ${weeklyNudgeHtml}` : ""}`,
       };
     }
     case "produktimport_grense": return { ok: false, html: escapeHtml(OWNER_FETCH_DAILY_LIMIT_MESSAGE) };
@@ -3194,6 +3295,25 @@ export function productImportPortalAlert(
     case "produktimport_feil": return { ok: false, html: "Noe gikk galt. Prøv igjen om litt." };
     default: return null;
   }
+}
+
+/**
+ * Skive 4-2c: after a publish, the pointer to the «Mine valg» weekly-sync row.
+ * Decided from stored state at render time with the import page's own rule
+ * (importPageAutoSyncChoice: PRODUCT_AUTO_SYNC_ENABLED on and is_verified = 1)
+ * plus the «Mine valg» allowlist (isSubjectAllowedForOwnerFeatures, as its page gate;
+ * mode 'weekly' = already on, so no nudge). "" otherwise. Never writes.
+ */
+export function weeklySyncNudgeHtml(agentId: string): string {
+  let choice: ReturnType<typeof importPageAutoSyncChoice> = null;
+  try {
+    // «Mine valg» 404s for subjects off the allowlist (pageGate): no link to a page the owner cannot open.
+    if (!isSubjectAllowedForOwnerFeatures("rfb", agentId)) return "";
+    choice = importPageAutoSyncChoice(agentId);
+  } catch { choice = null; }
+  if (!choice || choice.mode === "weekly") return "";
+  const href = `/eier/${encodeURIComponent(agentId)}/valg#${ownerRowAnchor(PRODUCT_WEEKLY_SYNC_KEY)}`;
+  return `<span data-weekly-sync-nudge="1">${escapeHtml("Vil du at vi holder prisene oppdatert hver uke? Slå det på i")} <a href="${escapeHtml(href)}">«Mine valg»</a>.</span>`;
 }
 
 /** Where imported products are made orderable: the B1 card when it is on for this profile, else a plain sentence. */
@@ -3208,7 +3328,7 @@ export function productImportStockHintHtml(agentId: string): string {
 
 /** Card visibility: flag on, verified owner of this profile, agents.is_verified = 1, a stored website. */
 export function productImportCardVisible(agentId: string, session: { valid: boolean; agentId?: string }, agentIsVerified: number): boolean {
-  if (!productImportEnabled()) return false;
+  if (!productImportEnabledFor(agentId)) return false;
   if (agentIsVerified !== 1) return false;
   if (!isVerifiedOwner(agentId, session)) return false;
   return !!profileWebsite(agentId);
@@ -3233,8 +3353,35 @@ function importRunStatusText(run: ImportOverview["runs"][number]): string {
   return `Siste henting${at} ble ikke fullført. ${productImportOutcomeTextNb(run.outcome) ?? ""}`.trim();
 }
 
-/** The card. Pure rendering of getOwnerImportOverview() (+ an optional alert). */
-export function productImportCardHtml(agentId: string, o: ImportOverview, alertHtml = ""): string {
+/**
+ * The weekly auto-sync status line (Skive 4-2a): the last successful update
+ * and what changed, the lock reason, or why it was turned off. "" for null
+ * (flag off, or never on and never run), so the card is unchanged then.
+ */
+export function autoSyncStatusHtml(v: AutoSyncStatusView | null): string {
+  if (!v) return "";
+  const when = (ts: string | null) => {
+    const w = formatImportRunTime(ts);
+    return w ? ` ${w}` : "";
+  };
+  let text: string;
+  if (v.kind === "waiting") {
+    text = "Prisene oppdateres automatisk hver uke. Den første oppdateringen kommer innen en uke.";
+  } else if (v.kind === "success") {
+    const parts = [`${v.changed} ${v.changed === 1 ? "vare" : "varer"} fikk ny pris eller enhet`];
+    if (v.not_found) parts.push(`${v.not_found} ble ikke funnet og kan ikke bestilles nå`);
+    if (v.new_pending) parts.push(`${v.new_pending} nye ${v.new_pending === 1 ? "vare venter" : "varer venter"} på godkjenning`);
+    text = `Sist oppdatert automatisk${when(v.at)}: ${parts.join(", ")}.`;
+  } else if (v.kind === "blocked") {
+    text = `Den automatiske oppdateringen${when(v.at)} ble stoppet, og ingenting ble endret. ${v.reason}`;
+  } else {
+    text = `Den ukentlige oppdateringen er slått av etter flere stopp på rad${when(v.at)}. ${v.reason}`;
+  }
+  return `<p class="ep-audit-meta" data-auto-sync-status="${v.kind}">${escapeHtml(text)}</p>`;
+}
+
+/** The card. Pure rendering of getOwnerImportOverview() (+ an optional alert and auto-sync status). */
+export function productImportCardHtml(agentId: string, o: ImportOverview, alertHtml = "", autoSyncHtml = ""): string {
   const id = encodeURIComponent(agentId);
   const website = o.website ?? "";
   const websiteHtml = /^https?:\/\//i.test(website)
@@ -3258,7 +3405,7 @@ export function productImportCardHtml(agentId: string, o: ImportOverview, alertH
         ${alertHtml}
         <p>Vi leser produktene og prisene på <strong>${websiteHtml}</strong> og viser deg forslagene før noe blir lagt inn. Ingenting publiseres før du har valgt varene og trykket «Publiser valgte».</p>
         <p class="ep-audit-meta" data-fetches-left="${o.fetches_left_today}">Du kan hente ${o.fetches_left_today} ${o.fetches_left_today === 1 ? "gang" : "ganger"} til i dag (høyst ${o.daily_limit} per døgn).</p>
-        ${latestHtml}
+        ${latestHtml}${autoSyncHtml ? `\n        ${autoSyncHtml}` : ""}
         ${action}
       </div>`;
 }

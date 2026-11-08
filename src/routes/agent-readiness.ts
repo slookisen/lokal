@@ -55,7 +55,7 @@ function mcpServerCard() {
     title: "Lokal — A2A marketplace for local food in Norway",
     version: "1.0.0",
     description:
-      `Discover ${stats.totalAgents || "1,290+"} verified Norwegian food producers. ` +
+      `Discover ${stats.totalAgents || "1,290+"} Norwegian food producers, cross-checked against the Brønnøysund register. ` +
       "Search by category, region, certification, and trust score. Supports " +
       "natural-language queries in Norwegian and English.",
     homepage: BASE_URL,
@@ -167,7 +167,7 @@ function agentSkillsIndex() {
         id: "discover-local-food-agents",
         name: "Discover Local Food Agents",
         description:
-          `Search ${count} verified Norwegian producers. Filter by category, region, certification, and trust score.`,
+          `Search ${count} Norwegian producers, cross-checked against the Brønnøysund register. Filter by category, region, certification, and trust score.`,
         url: `${BASE_URL}/.well-known/agent-skills/discover-local-food-agents`,
         tags: ["search", "discovery", "local-food", "norway"],
         inputModes: ["text/plain", "application/json"],
@@ -196,9 +196,9 @@ function agentSkillsIndex() {
         id: "search-compare-food",
         name: "Search & Compare Local Food",
         description:
-          "Natural-language search across producers. Compare prices, delivery options, availability.",
+          "Natural-language search across producers. Compare delivery options, certifications, availability.",
         url: `${BASE_URL}/.well-known/agent-skills/search-compare-food`,
-        tags: ["search", "compare", "price", "delivery"],
+        tags: ["search", "compare", "delivery"],
         inputModes: ["text/plain", "application/json"],
         outputModes: ["application/json"],
         invocation: {

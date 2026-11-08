@@ -29,8 +29,8 @@
 //   pickPendingVerifyBatch always selects the oldest un-processed pending_verify
 //   agents first. The sweep is therefore restartable without double-processing.
 
-import { runVerifierBatch, pickPendingVerifyBatch, countPendingVerify } from "../agents/lokal-agent-verifier";
-import type { VerifierResult } from "../agents/lokal-agent-verifier";
+import { runVerifierBatch, pickPendingVerifyBatch, countPendingVerify, resolveBrregLookup } from "../agents/lokal-agent-verifier";
+import type { VerifierResult, BrregFn } from "../agents/lokal-agent-verifier";
 import { getDb } from "../database/init";
 import { recordRun } from "./run-ledger";
 
@@ -134,6 +134,7 @@ export interface StartSweepOpts {
     pickFn: (db: any, limit?: number) => any[];
     db?: any;
     agentIds?: string[];
+    brregLookup?: BrregFn | null;
   }) => Promise<{ run_id: string; started_at: string; finished_at: string; results: VerifierResult[] }>;
   /**
    * Injectable sleep — defaults to defaultSleep. Pass `() => Promise.resolve()`
@@ -142,6 +143,15 @@ export interface StartSweepOpts {
   sleep?: (ms: number) => Promise<void>;
   /** Injectable DB — defaults to getDb(). */
   db?: any;
+  /**
+   * dev-request 2026-10-10-rfb-verifier-kapasitet-til-fulle-profiler (point
+   * 4): the Brreg lookup passed to every runVerifierBatch chunk. Defaults to
+   * resolveBrregLookup — the same lookup the scheduled path
+   * (routes/admin-run-verifier.ts) passes — so Brreg name-match as an
+   * identity source and the NACE/Brreg flags work in the sweep too. Tests
+   * inject a mock (no network).
+   */
+  brregLookup?: BrregFn | null;
   /**
    * dev-request 2026-09-16-run-verifier-agentids-og-pool-blocker-explain-
    * gate-felt: optional explicit id filter. When set (non-empty), REPLACES
@@ -187,6 +197,7 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
   const sleepFn = opts.sleep ?? defaultSleep;
   const db = opts.db ?? getDb();
   const agentIds = opts.agentIds && opts.agentIds.length > 0 ? [...opts.agentIds] : undefined;
+  const brregLookup = opts.brregLookup === undefined ? resolveBrregLookup : opts.brregLookup;
 
   const jobId = makeJobId();
   const startedAt = new Date().toISOString();
@@ -251,11 +262,13 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
                 pickFn: pickPendingVerifyBatch,
                 agentIds: chunkAgentIds,
                 db,
+                brregLookup,
               })
             : await runBatchFn({
                 batchSize: chunkSize,
                 pickFn: pickPendingVerifyBatch,
                 db,
+                brregLookup,
               });
           // Advance the cursor only after a successful chunk, so a failed
           // chunk (caught below) is retried on the same slice of ids rather

@@ -159,6 +159,7 @@ import { isAsPublicView } from "../services/agent-visibility";
 import { capName } from "../utils/free-text";
 import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
 import { MCP_MAX_TOOL_INPUT_ELEMENTS } from "../services/mcp-input-limits";
+import { BRAND_ENTITIES, brandMcpIcons } from "../config/brand-entities";
 // dev-request 2026-10-16-opplevagent-mcp-fritekst-query: the category aliases
 // (S1, moved from this file) and the free-text `query` interpreter (S2).
 import {
@@ -686,9 +687,10 @@ export function registerExperienceTools(
   server.registerTool(
     "discover_experiences",
     {
-      title: "Discover Norwegian experiences",
+      title: "Find experiences, tastings and producer visits in Norway",
       description:
-        "Search the opplevagent.no curated marketplace of Norwegian experiences and activities. " +
+        "Search Opplevagent's published catalogue of experiences in Norway, including food and drink tastings " +
+        "and producer visits (smaking, besøk hos drikkeprodusenter). " +
         "Filtrer på fylke (county), kategori, vær, sesong, innendørs/utendørs, gruppestørrelse, " +
         "pris og varighet. / Filter by county, category, weather, season, indoor/outdoor, group size, " +
         "price, and duration. " +
@@ -996,10 +998,10 @@ export function registerExperienceTools(
   server.registerTool(
     "list_experience_categories",
     {
-      title: "List Norwegian experience categories",
+      title: "List experience categories in Norway",
       description:
-        "List all experience categories available on opplevagent.no, " +
-        "along with the number of verified experiences in each category. " +
+        "List the experience categories in Opplevagent's catalogue for Norway, such as food and drink (mat og drikke), " +
+        "with the number of verified experiences in each category. " +
         "Henter alle kategorier med antall verifiserte opplevelser. " +
         "Use this to understand what kinds of experiences are available before " +
         "calling discover_experiences with a specific category filter. " +
@@ -1082,9 +1084,9 @@ export function registerExperienceTools(
   server.registerTool(
     "get_experience",
     {
-      title: "Get full details for a Norwegian experience",
+      title: "Get details for an experience, tasting or visit",
       description:
-        "Fetch complete details for a single experience from opplevagent.no by its UUID. " +
+        "Fetch the full details of one experience in Opplevagent's catalogue, such as a tasting or a producer visit, by its UUID. " +
         "Henter fullstendig informasjon om en opplevelse via UUID. " +
         "Returns title, full description, category, location (fylke/kommune/meeting point), " +
         "indoor/outdoor, season, weather suitability, group size limits, age suitability, " +
@@ -1195,10 +1197,12 @@ export function registerExperienceTools(
   server.registerTool(
     "discover_gardssalg",
     {
-      title: "Discover Norwegian farm-sale drink producers (gårdssalg)",
+      title: "Find drink producers to visit for a tasting (gårdssalg)",
       description:
-        "Search opplevagent.no's gårdssalg (farm-sale) vertical — Brreg-registered Norwegian drink " +
-        "producers (bryggeri/cideri/vingård/destilleri/gårdskafé/mjød/seltzeri) selling directly from the farm. " +
+        "Use this to plan a visit or tasting at a Norwegian drink producer (brewery, cidery, winery, distillery, " +
+        "meadery, farm café) and find ones that accept visit requests; it does not sell or order products. " +
+        "It searches opplevagent.no's gårdssalg (farm-sale) vertical of Brreg-registered drink producers to visit (besøk, smaking) " +
+        "(bryggeri/sideri/vingård/destilleri/mjøderi/gårdskafé/seltzeri). " +
         "Finn norske gårdssalg-produsenter (drikkeprodusenter som selger direkte fra gården) etter fylke, " +
         "kommune og produsenttype. / Filter by county (fylke), municipality (kommune), and producer type. " +
         "Also supports near-me search via lat/lng (+ optional radius_km): when given, results include a " +
@@ -1338,10 +1342,11 @@ export function registerExperienceTools(
   server.registerTool(
     "book_gardssalg",
     {
-      title: "Request a gårdssalg booking (pending — email confirmation required)",
+      title: "Request a visit or tasting at a drink producer (pending until the producer replies)",
       description:
-        "Submit a booking REQUEST for a Norwegian gårdssalg (farm-sale) producer discovered via " +
-        "discover_gardssalg. Send inn en reservasjonsforespørsel for et gårdssalg-besøk. " +
+        "Use this to request a visit or tasting (besøk, smaking) at a Norwegian gårdssalg drink producer found with " +
+        "discover_gardssalg or named by the guest; it sends a visit request and does not sell or order products. " +
+        "Send inn en reservasjonsforespørsel for et gårdssalg-besøk. " +
         "IMPORTANT: this NEVER creates a confirmed booking — it creates a PENDING request, exactly " +
         "like the producer's own website form. The PRODUCER reviews the request and responds " +
         "(confirms, proposes another time, or declines); guest_email only receives a read-only " +
@@ -1363,7 +1368,7 @@ export function registerExperienceTools(
         "confirm_outside_hours. " +
         "The requested slot_at is ALWAYS hard-rejected if it's in the past or too far ahead. If the " +
         "producer has stated opening hours and slot_at falls outside them, this returns " +
-        "outside_hours:true (not an error) instead of creating the booking — retry once with " +
+        "outside_hours:true (not an error) and creates no booking — retry once with " +
         "confirm_outside_hours:true if the exact requested time should be kept anyway. " +
         "On success the response carries the resolved producer (provider.navn) and slot_at_local " +
         "(e.g. 'fredag 23. oktober 2026 kl. 10:00') — read both back to the guest. " +
@@ -1697,6 +1702,10 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
+/** serverInfo title and icons (G3-S5): the brand's name and 512 PNG logo, read from BRAND_ENTITIES.experiences. */
+export const OPPLEVAGENT_MCP_SERVER_TITLE = `${BRAND_ENTITIES.experiences.name} — norske opplevelser`;
+export const OPPLEVAGENT_MCP_SERVER_ICONS = brandMcpIcons(BRAND_ENTITIES.experiences);
+
 async function getOrCreateExperiencesSession(
   sessionId: string | undefined,
   isInitialize: boolean,
@@ -1733,7 +1742,9 @@ async function getOrCreateExperiencesSession(
   const server = new McpServer({
     name: "opplevagent",
     version: "0.1.0",
-    title: "Opplevagent — norske opplevelser",
+    title: OPPLEVAGENT_MCP_SERVER_TITLE,
+    websiteUrl: BRAND_ENTITIES.experiences.url,
+    icons: OPPLEVAGENT_MCP_SERVER_ICONS,
     description:
       "AI-discoverable marketplace of Norwegian experiences — curated, Brreg-verified activities " +
       "searchable by county, category, weather, season, and group size. / " +

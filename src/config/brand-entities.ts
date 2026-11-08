@@ -7,7 +7,7 @@
 // and example queries. The sites' front-page Organization JSON-LD is built
 // from it (organizationJsonLd() in services/company-legal.ts); the Claude
 // directory packs (G3-S6) and the MCP serverInfo (G3-S5, brandMcpIcons():
-// Finn-tannlege now, RFB and Opplevagent once OpenAI has decided) read the
+// Finn-tannlege, RFB and Opplevagent) read the
 // same entries instead of keeping their own copies.
 //
 // Rules for editing:
@@ -53,8 +53,9 @@ export interface BrandEntity {
   logoPng: string | null;
   /**
    * Absolute URL of the logo's square 192×192 PNG, the small icon in the MCP
-   * serverInfo (G3-S5). Null where no serverInfo reads it yet: RFB and
-   * Opplevagent wait for OpenAI's decision, and the company has no MCP server.
+   * serverInfo (G3-S5). Null where the brand serves no 192×192 PNG
+   * (RFB, Opplevagent: their serverInfo carries the 512 logo alone) and for
+   * the company, which has no MCP server.
    */
   iconPng192: string | null;
   /** https URLs of profiles of this entity that exist today. Wikidata comes from `wikidataId`, not from here. */

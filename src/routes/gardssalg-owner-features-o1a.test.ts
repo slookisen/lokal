@@ -455,6 +455,11 @@ export function runGardssalgOwnerFeaturesO1aTests(opts: { log?: boolean } = {}):
       assertTrue(formOn.status === 303 && !String(formOn.headers.location).includes("error="), "s18: pause off → the form accepts again");
       assertEq(bookingRows(), rowsPauseOff + 1, "s19: … and writes the booking row");
 
+      // T8 is RFB only: before the owner's choice the gårdssalg level card keeps its own words and marks nothing.
+      const pPre = (await req("GET", page("testgard"), cookie("tok-test"))).body;
+      assertTrue(pPre.includes("Du har ikke valgt nivå ennå") && pPre.includes(`data-level="bare_synlig"`) && !pPre.includes(`aria-current="true" data-level=`)
+        && !/Minst mulig|Utnytte mulighetene|Gjelder nå|Du står på standardvalgene|Valgene dine passer med|Tilpasset:|data-level-status|>Unntak</.test(pPre),
+        "l0 (T8): the gårdssalg page keeps «Bare synlig» / «Ta imot besøk» and its own level note — no RFB level status");
       // Level: «Bare synlig» switches visits off; marked only after the owner's choice.
       const lvl = await req("POST", page("testgard", "/niva"), { ...form, ...cookie("tok-test") }, "level=bare_synlig&confirmed=1");
       assertTrue(lvl.status === 303 && /endret=\d+/.test(String(lvl.headers.location)), "l1: choosing «Bare synlig» saves");

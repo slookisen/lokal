@@ -29,6 +29,12 @@ function rfbCatalogCount(fallback: number): number {
   return safeHonestCatalogCount("rfb") ?? fallback;
 }
 
+/** The skill ids the served RFB agent card actually lists (the card itself, never a hand-kept copy). */
+function rfbAgentCardSkillIds(): string[] {
+  const card = marketplaceRegistry.getRegistryCard(BASE_URL) as { skills?: Array<{ id?: string }> };
+  return (card.skills || []).map((s) => String(s.id || "")).filter(Boolean);
+}
+
 const router = Router();
 const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 
@@ -228,9 +234,10 @@ Hver produsentprofil viser hvilke paraplyer de er medlem av. Se også:
 
 Rett fra Bonden er bygget på Agent-to-Agent-protokollen (A2A). En AI-agent kan:
 
-1. Lese **agent-kortet** på \`${BASE_URL}/.well-known/agent-card.json\` for å oppdage
-   tilgjengelige verktøy (${registeredMcpTools("rfb").map((t) => "`" + t.name + "`").join(", ")}).
-2. Bruke **MCP-endepunktet** på \`${BASE_URL}/mcp\` for direkte verktøyskall via JSON-RPC.
+1. Lese **agent-kortet** på \`${BASE_URL}/.well-known/agent-card.json\`. Det beskriver plattformen
+   og lister A2A-ferdighetene (skills) ${rfbAgentCardSkillIds().map((id) => "`" + id + "`").join(", ")}.
+2. Bruke **MCP-endepunktet** på \`${BASE_URL}/mcp\` for direkte verktøyskall via JSON-RPC. MCP-server-kortet
+   lister tilgjengelige verktøy (${registeredMcpTools("rfb").map((t) => "`" + t.name + "`").join(", ")}).
 3. Lese **OpenAPI-spec** på \`${BASE_URL}/openapi.json\` for tradisjonell REST-tilgang.
 
 Eksempel — finn produsenter i Oslo som selger honning (korrekt MCP JSON-RPC 2.0):
@@ -265,7 +272,7 @@ Content-Type: application/json
 - [Forsiden](${BASE_URL}/): Søk og utforsk lokale ${getConfig().domain_dictionary.entity_plural_long}
 - [Om oss](${BASE_URL}/om): Historien bak plattformen
 - [Teknologi](${BASE_URL}/teknologi): Hvordan A2A-teknologien fungerer
-- [Personvern](${BASE_URL}/personvern): Ingen cookies, ingen sporing
+- [Personvern](${BASE_URL}/personvern): Bare nødvendige informasjonskapsler (innlogging for selgere, språkvalg), ingen annonse- eller sporingscookies og ingen tredjeparts sporing. Sidebesøk og søk logges i vår egen database med saltet IP-hash.
 
 ## ChatGPT Custom GPT
 
@@ -547,7 +554,7 @@ router.get("/.well-known/ai-plugin.json", (_req: Request, res: Response) => {
       "gårdsbutikker og REKO-ringer med kontaktinfo og åpningstider.",
     description_for_model:
       "Plugin for searching and discovering local food producers in Norway. " +
-      `Provides access to ${rfbCatalogCount(stats.totalAgents) || "1,290+"} verified producers ` +
+      `Provides access to ${rfbCatalogCount(stats.totalAgents) || "1,290+"} producers, cross-checked against the Brønnøysund register, ` +
       "including farms, farmers' markets, REKO rings, farm shops, and " +
       "cooperatives. Use the search endpoint for natural-language queries " +
       "(Norwegian or English) and the agents endpoint for structured lookups " +
@@ -584,8 +591,8 @@ function serveApiIndex(_req: Request, res: Response): void {
     version: "v1",
     description:
       "REST API for Norwegian local food producers. " +
-      `${rfbCatalogCount(stats.totalAgents) || "1,290+"} verified agents across farms, markets, ` +
-      "REKO rings, and cooperatives.",
+      `${rfbCatalogCount(stats.totalAgents) || "1,290+"} producers across farms, markets, ` +
+      "REKO rings, and cooperatives, cross-checked against the Brønnøysund register.",
     documentation: `${BASE_URL}/openapi.json`,
     protocols: {
       rest: `${BASE_URL}/api/marketplace`,

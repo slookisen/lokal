@@ -4,8 +4,8 @@ import { getDb } from "../database/init";
 import {
   verifyOwnerSession, isVerifiedOwner, OWNER_NOT_VERIFIED_MESSAGE, portalWriteRefusedPage,
   portalShell, ownerNotVerifiedPage,
-  ownerOrderEmailEnabled, currentOrderRecipient, pendingOrderEmailChange, requestOwnerOrderEmailChange,
-  parseResumeDate, ownerUnifiedSessionEnabled,
+  ownerOrderEmailEnabledFor, currentOrderRecipient, pendingOrderEmailChange, requestOwnerOrderEmailChange,
+  parseResumeDate, ownerUnifiedSessionEnabledFor, ownerEmailNeedsClaimantLoginPage,
 } from "./owner-portal";
 import { isCrossSiteWrite } from "../middleware/same-origin-write";
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
@@ -24,6 +24,7 @@ import {
   batchKeys,
   currentOwnerLevel,
   findOwnerLevel,
+  readOwnerLevelChoiceFor,
   getOwnerChangeBatch,
   latestUndoableBatch,
   ownerFeatureChangeLog,
@@ -36,22 +37,25 @@ import {
   OWNER_NEWS_ANSWER_TEXT, OWNER_NEWS_CONSENT_VERSION, OWNER_NEWS_PLACEMENTS, OWNER_NEWS_PLACEMENT_QUESTION, OWNER_NEWS_PLACEMENT_ROW,
   type OwnerNewsPlacement,
 } from "../owner-features/news-consent";
-import { formatOwnerFeatureValue, ownerPageStatsFrom, renderOwnerFeaturesPageBody, type OwnerPageNotice, type OwnerPageStats } from "../owner-features/page";
+import { formatOwnerFeatureValue, ownerPageStatsFrom, renderOwnerFeaturesPageBody, renderOwnerFeaturesPageFragment, type OwnerPageModel, type OwnerPageNotice, type OwnerPageStats } from "../owner-features/page";
+import { OWNER_FRAGMENT_HEADER } from "../owner-ui/enhance";
 import {
   OWNER_ANCHOR_FALLBACK, OWNER_ANCHOR_LEVEL, OWNER_ANCHOR_LEVEL_PREVIEW, OWNER_ANCHOR_NEWS_QUESTION, OWNER_ANCHOR_PLANNED,
   isOwnerPageAnchor, ownerBatchAnchor, ownerPageTail, ownerPlannedAnchor, ownerRowAnchor, ownerUndoAnchor,
+  parseOwnerFragmentParam, withOwnerFragment,
 } from "../owner-features/anchors";
 import { getOwnerStats } from "../services/owner-stats-service";
 import { publicStatsMinViews } from "../services/public-stats-threshold";
 import { slugify } from "../utils/slug";
 import { findOwnerFeature } from "../owner-features/registry";
 import { readOwnerFeatureInterest, recordOwnerFeatureInterest } from "../owner-features/interest";
-import { countOrderableProducts, orderCapNewPerDay } from "../services/cart-service";
+import { countOrderableProducts, orderCapNewPerBuyerPerDay, orderCapNewPerDay, orderCapOpenPerBuyer, orderCapProducerCeilingPerDay } from "../services/cart-service";
 import { ownerOrderabilityPortalEnabledFor } from "../services/owner-orderability";
 import { readOrderNotificationsOptIn, writeOrderNotificationsOptIn } from "../services/order-opt-in";
 import { OWNER_PAUSE_TABLE } from "../services/agent-visibility";
 import { orderReminderHours, orderAutocancelHours } from "../services/order-followups";
-import { isOrderCapNoticeEnabled } from "../services/order-cap-notice";
+import { isOrderCapNoticeEnabled, isOrderCapV2Enabled } from "../services/order-cap-notice";
+import { isBuyerReceiptsEnabled } from "../services/order-receipt-service";
 
 // ─────────────────────────────────────────────────────────────────
 // «Mine valg» owner API — dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2a
@@ -213,7 +217,9 @@ router.put("/api/owner/:id/features/:key", (req: Request, res: Response) => {
 //   GET  /eier/:agentId/valg            the page (?niva= level confirm panel,
 //                                       ?bekreft=&verdi= switch confirm panel,
 //                                       ?side= change-log page, ?endret= /
-//                                       ?melding= the message at the bottom)
+//                                       ?melding= the message at the bottom;
+//                                       T9: ?fragment=<region>[,…] only those
+//                                       regions, unknown id → 404)
 //   POST /eier/:agentId/valg/sett       { key, value[, confirmed] } one entry
 //   POST /eier/:agentId/valg/niva       { level, confirmed } apply a level
 //   POST /eier/:agentId/valg/angre      { batch } undo the newest change
@@ -257,9 +263,12 @@ function pageGate(req: Request): Gate {
   return { ok: true, agentId, token: session.token };
 }
 
-/** T5: 303 back to the page — `query` with the message placed at `anchor`, and `#anchor`. */
+/**
+ * T5: 303 back to the page — `query` with the message placed at `anchor`, and
+ * `#anchor`. T9: a POST sent by the script with `?fragment=` passes it on.
+ */
 function backTo(res: Response, agentId: string, query: string, anchor: string, opts: { place?: boolean } = {}): Response {
-  res.redirect(303, pagePath(agentId, ownerPageTail(query, anchor, opts)));
+  res.redirect(303, pagePath(agentId, ownerPageTail(withOwnerFragment(query, (res as any).req), anchor, opts)));
   return res;
 }
 
@@ -378,7 +387,7 @@ function itemsHref(agentId: string): string {
   const id = encodeURIComponent(agentId);
   // B1: with the orderability card on, it is the place to make items orderable.
   if (ownerOrderabilityPortalEnabledFor(agentId)) return `/eier/${id}/portal#bestillbare-varer`;
-  return ownerUnifiedSessionEnabled() ? `/eier/${id}/portal#produkter` : `/selger?agent=${id}`;
+  return ownerUnifiedSessionEnabledFor(agentId) ? `/eier/${id}/portal#produkter` : `/selger?agent=${id}`;
 }
 
 /**
@@ -510,15 +519,17 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
     let orderEmail: { enabled: boolean; current: string | null; pending: string | null } | null = null;
     try {
       orderEmail = {
-        enabled: ownerOrderEmailEnabled(),
+        enabled: ownerOrderEmailEnabledFor(agentId),
         current: currentOrderRecipient(agentId),
         pending: pendingOrderEmailChange(agentId)?.new_email ?? null,
       };
     } catch { orderEmail = null; }
-    const body = renderOwnerFeaturesPageBody({
+    const model: OwnerPageModel = {
       agent: { id: agent.id, name: String(agent.name || "") },
       resolved,
       level: currentOwnerLevel(VERTICAL, agentId, resolved),
+      // T8: who chose — read only (the status line's «Du valgte …»).
+      levelChoice: readOwnerLevelChoiceFor(VERTICAL, agentId, { db }),
       showIntro: news.showQuestion,
       newsAnswer: news.answer,
       notice,
@@ -531,12 +542,31 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
       orderEmail,
       pauseUntil: resolvedKey("visibility.profile")?.value === false ? currentPauseUntil(agentId) : null,
       ordersReadMoreUrl: ORDERS_FAQ_URL,
-      orderTimings: { reminderHours: orderReminderHours(), autocancelHours: orderAutocancelHours(), dailyCap: orderCapNewPerDay(), capNotice: isOrderCapNoticeEnabled() },
+      orderTimings: {
+        reminderHours: orderReminderHours(), autocancelHours: orderAutocancelHours(), dailyCap: orderCapNewPerDay(), capNotice: isOrderCapNoticeEnabled(),
+        // T11: the v2 limits (and the receipts promise) only with ORDER_CAP_V2_ENABLED on; off, nothing new is passed.
+        ...(isOrderCapV2Enabled()
+          ? {
+            limits: { openPerBuyer: orderCapOpenPerBuyer(), perBuyerPerDay: orderCapNewPerBuyerPerDay(), producerCeilingPerDay: orderCapProducerCeilingPerDay() },
+            buyerReceipts: isBuyerReceiptsEnabled(),
+          }
+          : {}),
+      },
       stats: ownerPageStats(agent.id, String(agent.name || ""), db),
       statsHref: ownerStatsHref(agent.id),
-    });
+    };
     res.setHeader("Cache-Control", "no-store");
-    return res.send(portalShell(`Mine valg · ${agent.name}`, body));
+    // T9: `?fragment=` → only those regions (same render), after the same gate; a GET writes nothing.
+    const fragment = qs("fragment");
+    if (fragment !== "") {
+      const ids = parseOwnerFragmentParam(fragment);
+      const html = ids ? renderOwnerFeaturesPageFragment(model, ids) : null;
+      if (html === null) return res.status(404).type("text/plain").send("Fant ikke delen av siden.");
+      res.setHeader(OWNER_FRAGMENT_HEADER, ids!.join(","));
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      return res.send(html);
+    }
+    return res.send(portalShell(`Mine valg · ${agent.name}`, renderOwnerFeaturesPageBody(model)));
   } catch (e: any) {
     console.error("[owner-features] GET /eier/:agentId/valg failed:", e);
     return simplePage(500, "Feil", `<h1>Noe gikk galt</h1><p>Prøv igjen senere.</p>`)(res);
@@ -611,6 +641,9 @@ router.post("/eier/:agentId/valg/niva", express.urlencoded({ extended: false }),
     // T5: the preview stands inside the level card.
     if (body.confirmed !== "1") return backTo(res, agentId, `niva=${encodeURIComponent(level.key)}`, OWNER_ANCHOR_LEVEL_PREVIEW, { place: false });
     const out = applyOwnerLevel(VERTICAL, agentId, level.key, { actor: "owner", detail: sessionEmail(g.token) });
+    // T10: a hard requirement is missing — nothing was written; back to the
+    // preview, which lists «Dette mangler» and has no confirm button.
+    if (out.kind === "not_ready") return backTo(res, agentId, `niva=${encodeURIComponent(level.key)}`, OWNER_ANCHOR_LEVEL_PREVIEW, { place: false });
     if (out.kind !== "ok") return backTo(res, agentId, "melding=feil", anchor);
     if (out.batchId) {
       console.log(`[owner-features] owner chose level ${level.key} for agent ${agentId}: ${out.changed.join(",")}`);
@@ -743,6 +776,7 @@ router.post("/eier/:agentId/valg/ordre-epost", express.urlencoded({ extended: fa
       console.log(`[owner-features] owner requested a new order address for agent ${agentId} (page)`);
       return back("ordre_epost_sendt");
     }
+    if (out.status === 403 && out.body?.error === "claimant_login_required") return res.status(403).send(ownerEmailNeedsClaimantLoginPage(agentId, "order_email"));
     const mapped = ORDER_EMAIL_MESSAGES[String(out.body?.error || "")];
     if (mapped) return back(mapped);
     return back("ordre_epost_feil");

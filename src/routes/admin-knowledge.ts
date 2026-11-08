@@ -2286,7 +2286,7 @@ export interface HcrAboutJudges {
 /**
  * Per-call timeout (ms) of each about judge inside refreshHomepageContent. A
  * judge call is not STARTED with less than this left before deadlineAt (the
- * route's budget is 40 s, the morning send's 20 s per candidate).
+ * route's budget is 20 s, the morning send's 20 s per candidate).
  */
 export const HCR_ABOUT_JUDGE_TIMEOUT_MS = 8_000;
 
@@ -4015,8 +4015,15 @@ export async function refreshHomepageContent(
   };
 }
 
-/** Default time budget (ms) for one POST /admin/homepage-content-refresh call. */
-export const HCR_ROUTE_TIME_BUDGET_MS = 40_000;
+/**
+ * Default time budget (ms) for one POST /admin/homepage-content-refresh call.
+ * 20 s (was 40 s): a prod probe on 2026-11-06 (see BM_HARVEST_TIME_BUDGET_MS,
+ * admin-bm-producer-harvest.ts) showed the caller→route response window is
+ * ~30 s, not ~60 s, so a 40 s run came back as HTTP 502 "upstream request
+ * failed". 20 s leaves room for the in-flight fetch (aborted at the
+ * deadline) and the response under that window.
+ */
+export const HCR_ROUTE_TIME_BUDGET_MS = 20_000;
 
 /** Upper bound (ms) for the HCR_ROUTE_TIME_BUDGET_MS env override. */
 export const HCR_ROUTE_TIME_BUDGET_MAX_MS = 300_000;

@@ -62,6 +62,9 @@
  *       Moved on purpose (2026-10-30, økologi S3a, AC3.3): the RFB GET /a2a
  *       card's discover skill no longer carries the «organic» tag or the
  *       «Find organic farms near Oslo» example.
+ *       Moved on purpose (2026-11-06, rfb-claude-katalog-innsending slice 1):
+ *       the RFB GET /a2a card drops «verified» from its counts and points
+ *       documentationUrl/contactUrl at /teknologi and /kontakt instead of /docs.
  *
  * Data: I-Y's fixtures (own in-memory DBs, restored in finally; geocoding
  * offline), the real handlers: MCP tools through a duck-typed server, the

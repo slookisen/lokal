@@ -1418,7 +1418,8 @@ class MarketplaceRegistry {
       // Both need to find us. Bilingual descriptions = 2x discovery surface.
       name: "Rett fra Bonden",
       description: "A2A marketplace for local food in Norway. " +
-        `Connect AI agents with ${stats.totalAgents || 1169}+ verified local farms, shops, cooperatives, farm shops, REKO rings, and markets. ` +
+        `Connect AI agents with ${stats.totalAgents || 1169}+ local farms, shops, cooperatives, farm shops, REKO rings, and markets, ` +
+        "cross-checked against the Brønnøysund register (the only badge is \"Verified by owner\", set by the owner). " +
         "Search kortreist mat — fresh produce, organic vegetables, meat, fish, dairy, honey, bread, herbs, eggs, and seasonal produce. " +
         "Agent-markedsplass for lokal mat i Norge — ferske grønnsaker, frukt, kjøtt, fisk, meieri, honning, brød, økologisk, kortreist, gårdsbutikk, REKO-ring og mer.",
       // A2A spec: this MUST be the JSON-RPC endpoint, not the website root.
@@ -1438,7 +1439,7 @@ class MarketplaceRegistry {
       // the card's own `name` keeps the brand.
       provider: {
         ...agentCardProvider(),
-        contactUrl: `${baseUrl}/docs`,
+        contactUrl: `${baseUrl}/kontakt`,
         description: "Open agent-to-agent food marketplace operator. " +
           "Norges første A2A-markedsplass for lokal mat.",
       },
@@ -1453,7 +1454,7 @@ class MarketplaceRegistry {
       additionalInterfaces: [
         { url: `${baseUrl}/api/marketplace`, transport: "HTTP+JSON" },
       ],
-      documentationUrl: `${baseUrl}/docs`,
+      documentationUrl: `${baseUrl}/teknologi`,
       // dev-request 2026-07-25-proveniens-transparens: additive link to the
       // public "how we verify our data" page (field_provenance / cross-source
       // agreement machinery, already live server-side — docs only, no new
@@ -1500,12 +1501,12 @@ class MarketplaceRegistry {
         {
           id: "discover-local-food-agents",
           name: "Discover Local Food Agents / Finn lokale matagenter",
-          description: `Search a registry of ${stats.totalAgents || 1396}+ verified local food producers in Norway. ` +
+          description: `Search a registry of ${stats.totalAgents || 1396}+ local food producers in Norway, cross-checked against the Brønnøysund register. ` +
             "Filter by category (vegetables, fruit, meat, fish, dairy, eggs, honey, herbs, bread, berries), " +
             "location (Oslo, Bergen, Trondheim, Stavanger, Tromsø, and rural districts), " +
             "certifications (organic, Debio, farm-direct), delivery options (pickup, local delivery), " +
             "and trust score. Returns ranked results with contact info and A2A endpoints. " +
-            `Søk blant ${stats.totalAgents || 1396}+ verifiserte lokale ${getConfig().domain_dictionary.entity_plural_long} i Norge.`,
+            `Søk blant ${stats.totalAgents || 1396}+ lokale ${getConfig().domain_dictionary.entity_plural_long} i Norge, kryssjekket mot Brønnøysundregistrene.`,
           tags: [
             // English discovery keywords (what agents actually search for)
             "local food", "fresh produce", "organic", "farm direct", "vegetables", "fruit",
@@ -1549,18 +1550,20 @@ class MarketplaceRegistry {
         {
           id: "search-compare-food",
           name: "Search & Compare Local Food / Søk og sammenlign",
-          description: "Natural language search across all producers. Compare prices, delivery options, " +
+          // Not a price-comparison service: prices are shown only where a producer
+          // has listed them (A2A dev-request 2026-11-06-rfb-claude-katalog-innsending).
+          description: "Natural language search across all producers. Compare delivery options, " +
             "organic certifications, and availability. Supports both English and Norwegian queries. " +
-            "Søk, sammenlign priser, leveringsalternativer og tilgjengelighet.",
+            "Søk og sammenlign leveringsalternativer, økologisk sertifisering og tilgjengelighet.",
           tags: [
-            "search", "compare", "price", "delivery", "availability",
-            "søk", "sammenlign", "pris", "levering", "tilgjengelighet",
+            "search", "compare", "delivery", "availability",
+            "søk", "sammenlign", "levering", "tilgjengelighet",
           ],
           inputModes: ["text/plain", "application/json"],
           outputModes: ["application/json"],
           examples: [
-            "compare cheese prices in Oslo",
-            "finn billig honning nær Trondheim",
+            "cheese producers with pickup in Oslo",
+            "finn honning med levering nær Trondheim",
           ],
         },
         // Fase B3 (mine ordrer): only with ORDER_AGENT_ACTIONS_ENABLED on; off, the card is unchanged.

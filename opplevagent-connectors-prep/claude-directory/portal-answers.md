@@ -4,7 +4,7 @@
 
 Every step of the developer portal at https://claude.ai/directory/manage (**Submit new** → **MCP connector**), answered. Copy the fenced blocks as they are. Steps as listed in https://claude.com/docs/connectors/building/submission (read 2026-10-17).
 
-Before you start: Ready to submit: no (1 open, 1 waiting). See the prerequisites in ../README.md.
+Before you start: Ready to submit: no (1 open). See the prerequisites in ../README.md.
 
 ## 1. Connection
 
@@ -25,22 +25,22 @@ The client must send `initialize` first. A request without a live session gets 4
 
 | Tool | `title` | `annotations.title` | readOnlyHint | destructiveHint | openWorldHint | What it does (first sentence) |
 |---|---|---|---|---|---|---|
-| `discover_experiences` | Discover Norwegian experiences | (same) | true | false | false | Search the opplevagent.no curated marketplace of Norwegian experiences and activities. |
-| `list_experience_categories` | List Norwegian experience categories | List experience categories | true | false | false | List all experience categories available on opplevagent.no, along with the number of verified experiences in each category. |
-| `get_experience` | Get full details for a Norwegian experience | Get experience details | true | false | false | Fetch complete details for a single experience from opplevagent.no by its UUID. |
-| `discover_gardssalg` | Discover Norwegian farm-sale drink producers (gårdssalg) | Discover gårdssalg producers | true | false | false | Search opplevagent.no's gårdssalg (farm-sale) vertical — Brreg-registered Norwegian drink producers (bryggeri/cideri/vingård/destilleri/gårdskafé/mjød/seltzeri) selling directly from the farm. |
+| `discover_experiences` | Find experiences, tastings and producer visits in Norway | Discover Norwegian experiences | true | false | false | Search Opplevagent's published catalogue of experiences in Norway, including food and drink tastings and producer visits (smaking, besøk hos drikkeprodusenter). |
+| `list_experience_categories` | List experience categories in Norway | List experience categories | true | false | false | List the experience categories in Opplevagent's catalogue for Norway, such as food and drink (mat og drikke), with the number of verified experiences in each category. |
+| `get_experience` | Get details for an experience, tasting or visit | Get experience details | true | false | false | Fetch the full details of one experience in Opplevagent's catalogue, such as a tasting or a producer visit, by its UUID. |
+| `discover_gardssalg` | Find drink producers to visit for a tasting (gårdssalg) | Discover gårdssalg producers | true | false | false | Use this to plan a visit or tasting at a Norwegian drink producer (brewery, cidery, winery, distillery, meadery, farm café) and find ones that accept visit requests; it does not sell or order products. |
 
 ### Write (1)
 
 | Tool | `title` | `annotations.title` | readOnlyHint | destructiveHint | openWorldHint | What it does (first sentence) |
 |---|---|---|---|---|---|---|
-| `book_gardssalg` | Request a gårdssalg booking (pending — email confirmation required) | Request a gårdssalg booking | false | true | true | Submit a booking REQUEST for a Norwegian gårdssalg (farm-sale) producer discovered via discover_gardssalg. |
+| `book_gardssalg` | Request a visit or tasting at a drink producer (pending until the producer replies) | Request a gårdssalg booking | false | true | true | Use this to request a visit or tasting (besøk, smaking) at a Norwegian gårdssalg drink producer found with discover_gardssalg or named by the guest; it sends a visit request and does not sell or order products. |
 
 What each write tool really does:
 
 - `book_gardssalg`: Sends a real visit request by e-mail to the producer, and a status link to the guest. It never confirms a booking: the producer answers. Only producers with live booking can be booked. No payment.
 
-**Two title fields.** 4 of 5 tools have an `annotations.title` that differs from the top-level `title` (`list_experience_categories`, `get_experience`, `discover_gardssalg`, `book_gardssalg`). Both are shown above; which one a client displays depends on the client.
+**Two title fields.** 5 of 5 tools have an `annotations.title` that differs from the top-level `title` (`discover_experiences`, `list_experience_categories`, `get_experience`, `discover_gardssalg`, `book_gardssalg`). Both are shown above; which one a client displays depends on the client.
 
 ## 3. Listing
 

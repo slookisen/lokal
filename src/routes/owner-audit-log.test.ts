@@ -192,6 +192,10 @@ export async function runOwnerAuditLogTests(opts: { log?: boolean } = {}): Promi
       insAgent.run(id, `Gård ${id}`, `post@${id}.example.no`, `https://${id}.example.no`, `key-${id}`, cats, id === B ? 0 : 1, "2026-10-01T00:00:00.000Z");
       insKnowledge.run(id, `post@${id}.example.no`, `https://${id}.example.no`, about);
     }
+    // dev-request 2026-11-06-rfb-krav-for-portal-og-okter-ved-eierskifte (AC 3):
+    // the owner's save changes the profile e-mail, so A's session is the verified claimant's.
+    db.prepare("INSERT INTO agent_claims (id, agent_id, claimant_email, claimant_name, status, verified_at) VALUES (?, ?, ?, 'Eier', 'verified', '2026-10-01T00:00:00.000Z')")
+      .run(`claim-al-${A}`, A, OWNER_EMAIL);
     const tokA = session(A, OWNER_EMAIL);
     const tokB = session(B, `post@${B}.example.no`);
     const tokD = session(D, `post@${D}.example.no`);

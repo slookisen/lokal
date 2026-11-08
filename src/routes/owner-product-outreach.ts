@@ -52,7 +52,7 @@ import {
   verifyOwnerSession,
 } from "./owner-portal";
 import { publishSelectionFromForm, renderImportPreviewPage, type FormState, type Preview, type PreviewVariant } from "./owner-product-import";
-import { outreachLlmAllowed, productImportOutreachEnabled } from "../services/product-import/outreach-prepare";
+import { outreachLlmAllowed, productImportOutreachEnabledFor } from "../services/product-import/outreach-prepare";
 import {
   getOwnerImportPreview,
   isOwnerFetchJobRunning,
@@ -215,10 +215,10 @@ function noStore(res: Response): void {
 }
 
 router.get(PATH, (req: Request, res: Response) => {
-  if (!productImportOutreachEnabled()) return res.status(404).send(PAGE_404());
+  const agentId = String((req.params as any).agentId || "");
+  if (!productImportOutreachEnabledFor(agentId)) return res.status(404).send(PAGE_404());
   noStore(res);
   try {
-    const agentId = String((req.params as any).agentId || "");
     const token = typeof req.query?.t === "string" ? req.query.t : "";
     const tok = verifyOutreachToken(token, agentId);
     if (tok.state !== "valid") return res.status(tok.state === "expired" ? 410 : 404).send(linkUnusablePage());
@@ -274,10 +274,10 @@ function receiptPage(agentId: string, published: number, rejected: number, inSto
 }
 
 router.post(PATH, express.urlencoded({ extended: false, parameterLimit: 5000 }), (req: Request, res: Response) => {
-  if (!productImportOutreachEnabled()) return res.status(404).send(PAGE_404());
+  const agentId = String((req.params as any).agentId || "");
+  if (!productImportOutreachEnabledFor(agentId)) return res.status(404).send(PAGE_404());
   noStore(res);
   try {
-    const agentId = String((req.params as any).agentId || "");
     const body = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
     const token = typeof body.t === "string" ? body.t : "";
     const tok = verifyOutreachToken(token, agentId);

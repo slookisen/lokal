@@ -11,6 +11,7 @@
 import { getDb } from "../database/init";
 import {
   ownerFeatureRegistryFor,
+  ownerFeatureStatus,
   findOwnerFeature,
   type LocalizedText,
   type OwnerFeatureEntry,
@@ -19,6 +20,8 @@ import {
   type OwnerFeatureVertical,
 } from "./registry";
 import {
+  orderRequirementText,
+  readOrderReadiness,
   resolveOwnerFeatures,
   setOwnerFeatureValue,
   type OwnerConsentStamp,
@@ -41,17 +44,22 @@ export type OwnerActor = {
 };
 
 // ── Levels («Hvor aktiv vil du være?») ─────────────────────────────────────
-// S2e (v2 principle 3, «Ærlige nivåer»): exactly two levels — «Bare synlig»
-// and «Ta imot bestillinger». «Aktiv» and «Full fart» are gone from the page
-// (they did the same, and «Full fart» could not be chosen); a third level
-// comes only when there is something real to put in it (separate decision).
-// A level is a preset over live keys: applying it only touches entries that
-// are `live`; coming_soon (or unknown) keys are skipped silently.
-// Stored level choices from S2b («aktiv» / «full_fart» in
-// owner_feature_change_batch.level) read as «Ta imot bestillinger»; nothing
-// is rewritten and no switch changes because of the new model.
+// T8 (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 3): two levels
+// from least to most — «Minst mulig» (= the owner default, so an owner who
+// never logs in stands there) and «Utnytte mulighetene». A third level comes
+// only when there is something real to put in it. A level is a preset over
+// live keys: applying it only touches entries that are `live`; coming_soon
+// (or unknown) keys are skipped silently. Never in a level (S4 rule 5,
+// registry-governance-s4.test.ts): visibility.*, contact.*, orders.email,
+// the consents, comms.beta, orders.auto_confirm, orders.daily_cap,
+// orders.pause, payments.*. orders.reminder and notify.order_email are
+// `locked` on orders.enabled, so they follow it without being in a preset.
+// Stored level keys from earlier slices («bare_synlig»,
+// «ta_imot_bestillinger», S2b «aktiv» / «full_fart») are read as aliases —
+// in owner_feature_level_choice / owner_feature_change_batch.level and in
+// ?niva= links; nothing is rewritten and no switch changes because of it.
 
-export type OwnerLevelKey = "bare_synlig" | "ta_imot_bestillinger" | "ta_imot_besok";
+export type OwnerLevelKey = "minst_mulig" | "utnytte_mulighetene" | "bare_synlig" | "ta_imot_besok";
 
 export interface OwnerLevel {
   key: OwnerLevelKey;
@@ -62,13 +70,16 @@ export interface OwnerLevel {
   values: Array<[string, OwnerFeatureValue]>;
 }
 
+/** The RFB level that equals the owner default («Standard»). */
+export const OWNER_LEVEL_DEFAULT_KEY: OwnerLevelKey = "minst_mulig";
+
 export const OWNER_LEVELS: OwnerLevel[] = [
   {
-    key: "bare_synlig",
-    label: { no: "Bare synlig", en: "Just visible" },
+    key: "minst_mulig",
+    label: { no: "Minst mulig", en: "As little as possible" },
     description: {
-      no: "Folk og AI-assistenter finner deg og får kontaktinformasjonen din. Ingen bestillinger å svare på.",
-      en: "People and AI assistants find you and get your contact details. No orders to answer.",
+      no: "Folk og AI-assistenter finner profilen din og får kontaktinformasjonen din. Du trenger ikke logge inn.",
+      en: "People and AI assistants find your profile and get your contact details. You do not need to log in.",
     },
     recommended: false,
     values: [
@@ -76,15 +87,16 @@ export const OWNER_LEVELS: OwnerLevel[] = [
     ],
   },
   {
-    key: "ta_imot_bestillinger",
-    label: { no: "Ta imot bestillinger", en: "Accept orders" },
+    key: "utnytte_mulighetene",
+    label: { no: "Utnytte mulighetene", en: "Make the most of it" },
     description: {
-      no: "Kunder og AI-assistenter kan sende deg bestillinger på henting. Kunden betaler når varene hentes.",
-      en: "Customers and AI assistants can send you pickup orders. The customer pays when the goods are picked up.",
+      no: "Kunder og AI-assistenter kan bestille varer fra deg for henting. Du bekrefter eller avslår hver bestilling.",
+      en: "Customers and AI assistants can order goods from you for pickup. You confirm or decline each order.",
     },
     recommended: false,
     values: [
       ["orders.enabled", true],
+      ["products.stock_check", true],
     ],
   },
 ];
@@ -127,10 +139,19 @@ export function ownerLevelsFor(vertical: OwnerFeatureVertical): OwnerLevel[] {
   return vertical === "gardssalg" ? GARDSSALG_OWNER_LEVELS : OWNER_LEVELS;
 }
 
-/** S2b level keys that are stored in owner_feature_change_batch.level → the v2 level they mean. */
+/**
+ * Earlier RFB level keys (stored in owner_feature_level_choice.level /
+ * owner_feature_change_batch.level, or in an old ?niva= link) → the level
+ * they mean now (T8). «Bare synlig» was the lowest level (orders off) →
+ * «Minst mulig»; «Ta imot bestillinger» and S2b «Aktiv» / «Full fart» turned
+ * orders on → «Utnytte mulighetene». A level list that has the key itself
+ * (gårdssalg's «bare_synlig») finds it directly, before any alias.
+ */
 export const LEGACY_OWNER_LEVEL_ALIASES: Readonly<Record<string, OwnerLevelKey>> = {
-  aktiv: "ta_imot_bestillinger",
-  full_fart: "ta_imot_bestillinger",
+  bare_synlig: "minst_mulig",
+  ta_imot_bestillinger: "utnytte_mulighetene",
+  aktiv: "utnytte_mulighetene",
+  full_fart: "utnytte_mulighetene",
 };
 
 export const OWNER_LEVEL_CUSTOM_LABEL: LocalizedText = { no: "Egendefinert", en: "Custom" };
@@ -138,7 +159,7 @@ export const OWNER_LEVEL_CUSTOM_LABEL: LocalizedText = { no: "Egendefinert", en:
 /** Level options: `levels` is injectable for tests (fixture presets); defaults to OWNER_LEVELS. */
 export type OwnerLevelOptions = OwnerFeatureOptions & { levels?: readonly OwnerLevel[] };
 
-/** A v2 level key, or a stored S2b key («aktiv» / «full_fart») read as its v2 level. */
+/** A level key, or an earlier key (LEGACY_OWNER_LEVEL_ALIASES) read as the level it means now. */
 export function findOwnerLevel(key: unknown, levels: readonly OwnerLevel[] = OWNER_LEVELS): OwnerLevel | undefined {
   if (typeof key !== "string") return undefined;
   const direct = levels.find((l) => l.key === key);
@@ -151,12 +172,16 @@ function sameValue(a: OwnerFeatureValue | undefined, b: OwnerFeatureValue | unde
   return JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 }
 
-/** The level's preset restricted to entries that exist and are `live`. */
-function liveLevelValues(level: OwnerLevel, registry: OwnerFeatureEntry[]): Array<[OwnerFeatureEntry, OwnerFeatureValue]> {
+/**
+ * The level's preset restricted to entries that exist and are `live` at run
+ * time (ownerFeatureStatus: a liveFlag entry with its flag off is coming_soon
+ * and skipped, as the resolver treats it).
+ */
+function liveLevelValues(level: OwnerLevel, registry: OwnerFeatureEntry[], env: NodeJS.ProcessEnv = process.env): Array<[OwnerFeatureEntry, OwnerFeatureValue]> {
   const out: Array<[OwnerFeatureEntry, OwnerFeatureValue]> = [];
   for (const [key, value] of level.values) {
     const e = findOwnerFeature(key, registry);
-    if (e && e.status === "live") out.push([e, value]);
+    if (e && ownerFeatureStatus(e, env) === "live") out.push([e, value]);
   }
   return out;
 }
@@ -165,6 +190,74 @@ export interface OwnerLevelPreview {
   level: OwnerLevel;
   changes: Array<{ key: string; from: OwnerFeatureValue; to: OwnerFeatureValue }>;
   skipped: Array<{ key: string; reason: LocalizedText }>;
+  /** T10: `locked` keys that follow a changed key («Følger med»), from → to. */
+  follows?: Array<{ key: string; from: OwnerFeatureValue; to: OwnerFeatureValue }>;
+  /** T10: hard and soft requirements (ownerLevelRequirements). */
+  requirements?: OwnerLevelRequirements;
+}
+
+// ── Level requirements (T10) ───────────────────────────────────────────────
+// dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 3 «Velge». A level
+// that switches orders ON needs the real-order gate to be ready (orders.enabled
+// `enableRequires: orderGateReady`): verified (agents.is_verified = 1), an
+// order address that exists and is not blocked, the profile checked (the
+// internal cross-check). These are HARD: no confirm button, and a confirmed
+// POST writes nothing (applyOwnerLevel → not_ready). They are read from
+// cart-service orderReadiness() — isEligibleForRealOrder() with orders on,
+// explained by explainNotEligible() — so `hard` is empty if and only if the
+// gate would be true with orders on. No new rule. SOFT (a warning, the level
+// can still be confirmed): 0 orderable products, the profile on pause. An
+// owner who already has orders on is never stopped or changed by any of it.
+
+export interface OwnerLevelRequirement {
+  code: string;
+  text: LocalizedText;
+}
+
+export interface OwnerLevelRequirements {
+  hard: OwnerLevelRequirement[];
+  soft: OwnerLevelRequirement[];
+}
+
+export const OWNER_LEVEL_SOFT_TEXTS: Readonly<Record<"no_orderable_products" | "profile_paused", LocalizedText>> = {
+  no_orderable_products: {
+    no: "Du har 0 varer som kan bestilles. Kundene kan ikke bestille før du har lagt inn varer.",
+    en: "You have 0 items that can be ordered. Customers cannot order until you have added items.",
+  },
+  profile_paused: {
+    no: "Profilen din er på pause. Kundene finner den ikke før du slår den på igjen.",
+    en: "Your profile is on pause. Customers will not find it until you switch it back on.",
+  },
+};
+
+/** The level's live preset keys that need the real-order gate when set on. */
+function orderGatedValues(level: OwnerLevel, registry: OwnerFeatureEntry[], env?: NodeJS.ProcessEnv): Array<[OwnerFeatureEntry, OwnerFeatureValue]> {
+  return liveLevelValues(level, registry, env).filter(([e, v]) => v === true && (e.enableRequires ?? []).includes("orderGateReady"));
+}
+
+export function ownerLevelRequirements(
+  vertical: OwnerFeatureVertical,
+  subjectId: string,
+  levelKey: string,
+  opts: OwnerLevelOptions = {},
+): OwnerLevelRequirements {
+  const none: OwnerLevelRequirements = { hard: [], soft: [] };
+  const level = findOwnerLevel(levelKey, opts.levels ?? ownerLevelsFor(vertical));
+  if (!level || vertical !== "rfb") return none;
+  const registry = opts.registry ?? ownerFeatureRegistryFor(vertical);
+  const gated = orderGatedValues(level, registry, opts.env);
+  if (gated.length === 0) return none;
+  const db = opts.db ?? getDb();
+  const resolved = resolveOwnerFeatures(vertical, subjectId, { ...opts, db, registry });
+  const switchingOn = gated.some(([e]) => resolved.byKey[e.key]?.value !== true);
+  const r = readOrderReadiness(db, subjectId);
+  if (switchingOn && !r.ready) {
+    return { hard: r.missing.map((code) => ({ code, text: orderRequirementText(code) })), soft: [] };
+  }
+  const soft: OwnerLevelRequirement[] = [];
+  if (r.orderableIfOn === 0) soft.push({ code: "no_orderable_products", text: OWNER_LEVEL_SOFT_TEXTS.no_orderable_products });
+  if (resolved.byKey["visibility.profile"]?.value === false) soft.push({ code: "profile_paused", text: OWNER_LEVEL_SOFT_TEXTS.profile_paused });
+  return { hard: [], soft };
 }
 
 class PreviewRollback extends Error {
@@ -237,6 +330,7 @@ export function previewOwnerLevel(
   const db = opts.db ?? getDb();
   const o = { ...opts, db, registry };
   const before = resolveOwnerFeatures(vertical, subjectId, o);
+  const requirements = ownerLevelRequirements(vertical, subjectId, level.key, o);
   const dry = { ...o, registry: previewOverlayRegistry(registry) };
   let out: ApplyOwnerLevelResult | null = null;
   try {
@@ -247,12 +341,23 @@ export function previewOwnerLevel(
     if (!(e instanceof PreviewRollback)) throw e;
     out = e.out;
   }
-  if (!out || out.kind !== "ok") return { level, changes: [], skipped: [] };
+  if (!out || out.kind !== "ok") return { level, changes: [], skipped: [], follows: [], requirements };
   const target = new Map(level.values);
+  const changed = new Set(out.changed);
+  // T10 «Følger med»: a `locked` key follows the key it is locked on.
+  const follows: NonNullable<OwnerLevelPreview["follows"]> = [];
+  for (const e of registry) {
+    if (e.type !== "locked" || !e.lockedWhen || !changed.has(e.lockedWhen)) continue;
+    const from = before.byKey[e.key]?.value ?? null;
+    const to = target.get(e.lockedWhen) === true;
+    if (!sameValue(from, to)) follows.push({ key: e.key, from, to });
+  }
   return {
     level,
     changes: out.changed.map((key) => ({ key, from: before.byKey[key]?.value ?? null, to: target.get(key) ?? null })),
     skipped: out.skipped,
+    follows,
+    requirements,
   };
 }
 
@@ -273,15 +378,49 @@ export function readOwnerLevelChoice(
 }
 
 /**
+ * The owner's own level choice, read alias-aware (T8): the
+ * owner_feature_level_choice row (written by applyOwnerLevel for actor
+ * "owner" only), or, for choices made before S2e, the newest not-undone level
+ * batch whose audit rows the owner wrote. Never an admin, the test-producer
+ * arming or a single switch. `at` = when the owner chose it. null = no owner
+ * choice known, or a stored key this level list does not know.
+ */
+export function readOwnerLevelChoiceFor(
+  vertical: OwnerFeatureVertical,
+  subjectId: string,
+  opts: { db?: any; levels?: readonly OwnerLevel[] } = {},
+): { level: OwnerLevel; at: string } | null {
+  const db = opts.db ?? getDb();
+  let stored: { level?: string; at?: string } | undefined;
+  const row = readOwnerLevelChoice(vertical, subjectId, db);
+  if (row) stored = { level: row.level, at: row.chosen_at };
+  if (!stored) {
+    try {
+      stored = db
+        .prepare(
+          `SELECT b.level AS level, b.created_at AS at FROM owner_feature_change_batch b
+            WHERE b.vertical = ? AND b.subject_id = ? AND b.kind = 'level' AND b.undone_at IS NULL
+              AND EXISTS (SELECT 1 FROM owner_feature_audit a
+                           WHERE a.vertical = b.vertical AND a.subject_id = b.subject_id
+                             AND a.id BETWEEN b.first_audit_id AND b.last_audit_id AND a.actor = 'owner')
+            ORDER BY b.id DESC LIMIT 1`,
+        )
+        .get(vertical, subjectId) as { level?: string; at?: string } | undefined;
+    } catch {
+      stored = undefined; /* table missing → no owner choice known */
+    }
+  }
+  const level = stored?.level ? findOwnerLevel(stored.level, opts.levels ?? ownerLevelsFor(vertical)) : undefined;
+  return level ? { level, at: String(stored?.at ?? "") } : null;
+}
+
+/**
  * The level the owner is on now (v2 principle 3): a level is shown as chosen
- * ONLY when the owner chose it themselves — the owner_feature_level_choice
- * row (written by applyOwnerLevel for actor "owner" only), or, for choices
- * made before S2e, the newest not-undone level batch whose audit rows the
- * owner wrote. Never because an admin, the test-producer arming or a single
- * switch set the keys. While the chosen level's live keys still match it is
- * the current level; once the owner changed a switch since, "custom"
- * («Egendefinert»). No owner choice → null (no level marked). A stored
- * «aktiv» / «full_fart» reads as «Ta imot bestillinger».
+ * ONLY when the owner chose it themselves (readOwnerLevelChoiceFor). While
+ * the chosen level's live keys still match it is the current level; once the
+ * owner changed a switch since, "custom" («Egendefinert»). No owner choice →
+ * null (no level marked). Gårdssalg's page uses this; the RFB page uses
+ * deriveOwnerLevel + ownerLevelStatus (T8).
  */
 export function currentOwnerLevel(
   vertical: OwnerFeatureVertical,
@@ -291,31 +430,82 @@ export function currentOwnerLevel(
 ): OwnerLevelKey | "custom" | null {
   const registry = opts.registry ?? ownerFeatureRegistryFor(vertical);
   const matches = (l: OwnerLevel) => {
-    const live = liveLevelValues(l, registry);
+    const live = liveLevelValues(l, registry, opts.env);
     return live.length > 0 && live.every(([e, v]) => sameValue(resolved.byKey[e.key]?.value, v));
   };
-  const db = opts.db ?? getDb();
-  let levelKey: string | undefined = readOwnerLevelChoice(vertical, subjectId, db)?.level;
-  if (!levelKey) {
-    try {
-      const last = db
-        .prepare(
-          `SELECT b.level AS level FROM owner_feature_change_batch b
-            WHERE b.vertical = ? AND b.subject_id = ? AND b.kind = 'level' AND b.undone_at IS NULL
-              AND EXISTS (SELECT 1 FROM owner_feature_audit a
-                           WHERE a.vertical = b.vertical AND a.subject_id = b.subject_id
-                             AND a.id BETWEEN b.first_audit_id AND b.last_audit_id AND a.actor = 'owner')
-            ORDER BY b.id DESC LIMIT 1`,
-        )
-        .get(vertical, subjectId) as { level?: string } | undefined;
-      levelKey = last?.level;
-    } catch {
-      levelKey = undefined; /* table missing → no owner choice known */
-    }
-  }
-  const chosen = levelKey ? findOwnerLevel(levelKey, opts.levels ?? ownerLevelsFor(vertical)) : undefined;
+  const chosen = readOwnerLevelChoiceFor(vertical, subjectId, { db: opts.db, levels: opts.levels ?? ownerLevelsFor(vertical) })?.level;
   if (!chosen) return null;
   return matches(chosen) ? chosen.key : "custom";
+}
+
+/**
+ * Blocks whose key does not count when the applicable level is worked out
+ * (T8): an admin lock, the emergency brake (kill switch), a key that does not
+ * apply to this owner, and an unbuilt key — the owner cannot set those.
+ */
+export const OWNER_LEVEL_UNCOUNTED_BLOCKS: ReadonlySet<string> = new Set(["admin_locked", "killswitch", "not_applicable", "coming_soon"]);
+
+export interface OwnerLevelDerived {
+  level: OwnerLevel;
+  /** Counted keys whose value differs from the level's preset («Unntak»), in preset order. */
+  exceptions: Array<{ key: string; levelValue: OwnerFeatureValue }>;
+}
+
+/**
+ * T8: which level applies, computed from the switches only (pure; reads no
+ * owner choice). Per level, the counted keys of its live preset (blocks in
+ * OWNER_LEVEL_UNCOUNTED_BLOCKS left out) are compared with the resolved
+ * values. The level with the most matching keys wins, then the fewest
+ * deviations, then the lower level. A level with no matching counted key
+ * never applies; none → null.
+ */
+export function deriveOwnerLevel(
+  resolved: ResolvedOwnerFeatures,
+  levels: readonly OwnerLevel[] = OWNER_LEVELS,
+  registry: readonly OwnerFeatureEntry[] = ownerFeatureRegistryFor("rfb"),
+): OwnerLevelDerived | null {
+  let best: (OwnerLevelDerived & { matched: number }) | null = null;
+  for (const level of levels) {
+    let matched = 0;
+    const exceptions: OwnerLevelDerived["exceptions"] = [];
+    for (const [e, v] of liveLevelValues(level, registry as OwnerFeatureEntry[])) {
+      const r = resolved.byKey[e.key];
+      if (!r || (r.block && OWNER_LEVEL_UNCOUNTED_BLOCKS.has(r.block))) continue;
+      if (sameValue(r.value, v)) matched++;
+      else exceptions.push({ key: e.key, levelValue: v });
+    }
+    if (matched === 0) continue;
+    if (!best || matched > best.matched || (matched === best.matched && exceptions.length < best.exceptions.length)) {
+      best = { level, exceptions, matched };
+    }
+  }
+  return best ? { level: best.level, exceptions: best.exceptions } : null;
+}
+
+/**
+ * T8: the level status line on the RFB page — who chose:
+ *   default  the switches match the owner default level and the owner did not choose it
+ *   chosen   the owner chose this level and the switches still match it
+ *   matches  the switches match a level the owner did not choose (e.g. the
+ *            platform turned orders on) — never «Du valgte»
+ *   custom   the switches build on a level with exceptions
+ */
+export type OwnerLevelStatus =
+  | { kind: "default"; level: OwnerLevel }
+  | { kind: "chosen"; level: OwnerLevel; at: string }
+  | { kind: "matches"; level: OwnerLevel }
+  | { kind: "custom"; level: OwnerLevel; exceptions: OwnerLevelDerived["exceptions"] };
+
+export function ownerLevelStatus(
+  derived: OwnerLevelDerived | null,
+  choice: { level: OwnerLevel; at: string } | null,
+  defaultKey: OwnerLevelKey = OWNER_LEVEL_DEFAULT_KEY,
+): OwnerLevelStatus | null {
+  if (!derived) return null;
+  if (derived.exceptions.length > 0) return { kind: "custom", level: derived.level, exceptions: derived.exceptions };
+  if (choice && choice.level.key === derived.level.key) return { kind: "chosen", level: derived.level, at: choice.at };
+  if (derived.level.key === defaultKey) return { kind: "default", level: derived.level };
+  return { kind: "matches", level: derived.level };
 }
 
 // ── Batches ────────────────────────────────────────────────────────────────
@@ -440,6 +630,8 @@ export function applyOwnerSingleChange(
 export type ApplyOwnerLevelResult =
   | { kind: "unknown_level" }
   | { kind: "not_found" }
+  /** T10: a hard requirement is missing (ownerLevelRequirements) — nothing was written. */
+  | { kind: "not_ready"; level: OwnerLevel; missing: OwnerLevelRequirement[] }
   | {
       kind: "ok";
       level: OwnerLevel;
@@ -467,16 +659,23 @@ export function applyOwnerLevel(
   const db = opts.db ?? getDb();
   const o = { ...opts, db, registry };
   return db.transaction((): ApplyOwnerLevelResult => {
+    // T10: a hard requirement stops the whole level before any write
+    // (server side — not only the missing confirm button).
+    const req = ownerLevelRequirements(vertical, subjectId, level.key, o);
+    if (req.hard.length) return { kind: "not_ready", level, missing: req.hard };
     const before = maxAuditId(db);
     const prior = explicitRowKeys(db, vertical, subjectId);
     const changed: string[] = [];
     const skipped: Array<{ key: string; reason: LocalizedText }> = [];
-    for (const [e, value] of liveLevelValues(level, registry)) {
+    for (const [e, value] of liveLevelValues(level, registry, opts.env)) {
       // Locked at the level's value already: nothing to do, nothing to report.
       // (A key that is off only because a requirement is off still gets the
       // explicit off, so it stays off when the requirement comes back.)
       const now = resolveOwnerFeatures(vertical, subjectId, o).byKey[e.key];
       if (now && sameValue(now.value, value) && !now.changeable && now.block !== "requirement_not_met") continue;
+      // T8: a key that needs another key of this preset which was skipped
+      // above is a consequence of that skip, not a reason of its own.
+      if (now && now.block === "requirement_not_met" && skipped.some((s) => (e.requires as readonly string[]).includes(s.key))) continue;
       const out = setOwnerFeatureValue(vertical, subjectId, e.key, value, actor, o);
       if (out.kind === "not_found") return { kind: "not_found" };
       if (out.kind === "ok") {

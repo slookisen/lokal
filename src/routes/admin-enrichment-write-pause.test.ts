@@ -645,6 +645,11 @@ export async function runAdminEnrichmentWritePauseTests(
         // SAME shared opplevelser.ts helper, plus its own test file, which
         // sets/clears the pause via the service to prove the wiring.
         "routes/opplevelser-experience-description-write.test.ts",
+        // experience-facts-write (dev-request 2026-10-16-opplevagent-
+        // katalogfakta-alder-og-title-no, S3a): gated by the SAME shared
+        // opplevelser.ts helper; its test file sets/clears the pause via the
+        // service to prove the 423.
+        "routes/experience-facts-proposals.test.ts",
         // experiences-data-corrections (+ /revert): two more routes gated by
         // the SAME shared opplevelser.ts helper, plus their own test file,
         // which sets/clears the pause via the service to prove the wiring.
@@ -687,6 +692,9 @@ export async function runAdminEnrichmentWritePauseTests(
         // experiences pause before every apply page (and treats a pause thrown
         // by the apply as paused).
         "services/gardssalg-website-verification-job.ts",
+        // Step 3m: the gårdssalg review-queue parking daily job checks the
+        // experiences pause before every apply run.
+        "services/gardssalg-website-review-queue-park-job.ts",
         // The description proposals job itself no longer imports the guard:
         // its mechanics moved VERBATIM into services/proposal-file-queue.ts
         // (tillegg 2026-10-15 «4b-forslag»), which checks the experiences
@@ -695,6 +703,11 @@ export async function runAdminEnrichmentWritePauseTests(
         // pause via the service to prove it, same convention as the others.
         "services/proposal-file-queue.ts",
         "services/gardssalg-visit-proposals-job.test.ts",
+        // experience-facts-proposals-job (S3b, dev-request 2026-10-16-
+        // opplevagent-katalogfakta-alder-og-title-no): the third lane on the
+        // same queue; its test file sets the pause via the service to prove
+        // the tick is skipped before any GitHub fetch.
+        "services/experience-facts-proposals-job.test.ts",
         // experience-content-judgement-job (skive 3k, same dev-request): the
         // job runs on the same queue; its apply step re-checks the pause per
         // row through opplevelser.ts's shared helper. Its test file sets the
@@ -746,6 +759,12 @@ export async function runAdminEnrichmentWritePauseTests(
         "routes/admin-dental-schema-probe-sweep.ts",
         "routes/admin-dental-wrong-entity-retro-sanitize.ts",
         "routes/admin-dental-write-pause.test.ts",
+        // dev-request 2026-09-02-dental-permanent-triage-needs-review-drain
+        // (3c-1): the dental-triage job and its /run route check the dental
+        // pause before writing; its test file sets/clears the pause.
+        "routes/admin-dental-triage.ts",
+        "services/dental-triage.ts",
+        "services/dental-triage.test.ts",
       ].sort(),
       "ewp-125: the guard is imported by exactly the gated surfaces, the shared write primitives, its own admin route, and the test files",
     );

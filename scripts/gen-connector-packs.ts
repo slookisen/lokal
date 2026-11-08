@@ -68,7 +68,8 @@ export const ONLY_IF_ASKED = "**Use only if the portal asks.** It has no field f
 /**
  * Description wording the directory rejects as prompt injection ("describe what
  * the tool does, and don't tell Claude how to behave"). Same patterns as the
- * lint planned in A2A dev-request 2026-10-16-mcp-beskrivelser-intensjonsord-og-lint (S6).
+ * lint in src/routes/mcp-description-policy.test.ts (A2A dev-request
+ * 2026-10-16-mcp-beskrivelser-intensjonsord-og-lint, S6), which checks the two lists are equal.
  */
 export const DIRECTIVE_PATTERNS: readonly RegExp[] = [
   /\bALWAYS (use|call)\b/i,
@@ -214,7 +215,9 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
       lokal_cart_submit: "Sends a real pickup order by e-mail to each producer in the cart who has opted in to orders through the platform; for the others it returns contact details. No payment.",
     },
     owners: { descriptions: "2026-10-16-mcp-beskrivelser-intensjonsord-og-lint (S6)", terms: DASH, docs: DASH, icon: DASH, screenshots: DASH },
-    descriptionsGate: "The fix waits for OpenAI's decision on the RFB ChatGPT app: tool metadata stays frozen while OpenAI reviews it (Daniel reports the decision).",
+    // S6 (A2A 2026-10-16-mcp-beskrivelser-intensjonsord-og-lint, Utvidelse 2026-11-06): the RFB app is listed and
+    // OpenAI reviews each tool change on its own, so a description fix no longer waits for a decision.
+    descriptionsGate: null,
     recordedPrerequisites: [],
     caveats: [
       "Prices: most producers list products without a price, and the tools say so. Do not describe the connector as a price comparison.",
@@ -274,18 +277,20 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
     extraPrompts: [{ prompt: "Hvilke kategorier med opplevelser finnes?", tool: "list_experience_categories" }],
     writeToolNotes: { book_gardssalg: "Sends a real visit request by e-mail to the producer, and a status link to the guest. It never confirms a booking: the producer answers. Only producers with live booking can be booked. No payment." },
     owners: { descriptions: "2026-10-16-mcp-beskrivelser-intensjonsord-og-lint (S7)", terms: DASH, docs: DASH, icon: DASH, screenshots: "G3-S6 of this dev-request (follow-up)" },
-    descriptionsGate: "A fix waits for OpenAI's decision on the Opplevagent ChatGPT app: tool metadata stays frozen while OpenAI reviews it.",
+    // S7+S9 (A2A 2026-10-16-mcp-beskrivelser-intensjonsord-og-lint, «Løsning av S7 og S9 2026-11-06»): OpenAI approved
+    // and published the Opplevagent app, and it reviews each tool change on its own, so a description fix no longer waits.
+    descriptionsGate: null,
     recordedPrerequisites: [
       { item: "Free-text search in discover_experiences (`query`)", status: "done", owner: "2026-10-16-opplevagent-mcp-fritekst-query",
         detail: "lokal#1089: the user's request goes in `query`, and a place search never returns an unfiltered all-Norway list." },
-      { item: "OpenAI's decision on the Opplevagent ChatGPT app", status: "waiting", owner: "Daniel (OpenAI review)",
-        detail: "Submit after it. Tool titles and first sentences (lint S7) and serverInfo title, websiteUrl and icons (G3-S5) change once OpenAI has decided, and the directory should review the final metadata. Daniel reports the decision." },
+      { item: "OpenAI's decision on the Opplevagent ChatGPT app", status: "done", owner: "Daniel (OpenAI review)",
+        detail: "Daniel reported on 2026-11-06 that OpenAI approved and published the app (A2A daniel-responses/2026-11-06-live-opplevagent-chatgpt-app-godkjent.md). The tool titles and first sentences changed after it (lint S7 and S9); serverInfo title, websiteUrl and icons (G3-S5) are a separate change." },
     ],
     caveats: ["book_gardssalg is a real write: a request e-mails the producer. Keep it out of demos with real producers."],
     otherContents: [
       ["assets/opplevagent-brand-512.png", "The icon to upload: Opplevagent's own mark, square, no rounded corners."],
       ["assets/0?-*.png", "MCP App carousel screenshots; the prompt for each is in `assets/prompts.txt` (see `assets/README.md`)."],
-      ["chatgpt-app/", "The ChatGPT app submission. Frozen while OpenAI reviews it; not part of this pack."],
+      ["chatgpt-app/", "The ChatGPT app submission (approved and listed by OpenAI); not part of this pack."],
       ["claude-desktop/", "Deprecated: the MCPB desktop-extension path, kept as history."],
     ],
     notADirectoryPath: [

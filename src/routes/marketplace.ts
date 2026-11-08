@@ -3,7 +3,7 @@ import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-
 import { getConfig } from "../config/vertical-config";
 import { AgentRegistrationSchema, AdminRegistrationSchema, DiscoveryQuerySchema } from "../models/marketplace";
 import { interactionLogger } from "../services/interaction-logger";
-import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise, productPriceText, productsWriteError, isSingleEmailAddress, CLAIM_CODE_VALID_HOURS, EMAIL_ADDRESS_MAX_LENGTH, formatClaimTime, type ClaimReviewReason, type SkippedKnowledgeField, type ClaimRateLimitScope, type ClaimCodeRoute, type ClaimResendRefusal } from "../services/knowledge-service";
+import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise, productPriceText, productsWriteError, isSingleEmailAddress, CLAIM_CODE_VALID_HOURS, EMAIL_ADDRESS_MAX_LENGTH, formatClaimTime, parseStoredClaimAssessment, type ClaimReviewReason, type SkippedKnowledgeField, type ClaimRateLimitScope, type ClaimCodeRoute, type ClaimResendRefusal } from "../services/knowledge-service";
 import { isDebioVerifiedValue, isOrganicClaimUmbrella, stripOrganicCategories } from "../services/organic-claims";
 import { textEntries } from "../utils/text-entries";
 import { geocodingService } from "../services/geocoding-service";
@@ -11,6 +11,7 @@ import { getDb } from "../database/init";
 import { emailService } from "../services/email-service";
 import { deleteAgentProfileTranslations } from "../services/profile-translations";
 import { handleInboundEmailWebhook } from "../services/inbound-email-webhook";
+import { recordClaimMail } from "../services/claim-crm-tracking";
 import { trustScoreService } from "../services/trust-score-service";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { slugify } from "../utils/slug";
@@ -54,6 +55,9 @@ import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
 // helper the Opplevagent claim page uses; per-IP limit on claim requests.
 import { maskEmail } from "../services/gardssalg-claim";
 import { CLAIM_RECOMMENDATION_LABELS, type ClaimRecommendation } from "../services/claim-domain-rule";
+import { createClaimActionLinks, isClaimActionLinksEnabled, isClaimRequestMoreEnabled, type ClaimAction } from "../services/claim-action-link";
+import { claimAssessmentEnabled, waitForClaimAssessmentOutcome, type ClaimAssessment } from "../services/claim-assessment";
+import { autoApproveGreenClaim, claimAutoApproveEnabled } from "../services/claim-auto-approve";
 import { rfbClaimRequestLimiter } from "../middleware/security";
 import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
 import { capFreeText, capName } from "../utils/free-text";
@@ -65,7 +69,10 @@ import { setProducerAvailabilityByProductId } from "../services/supply-graph";
 import { renderPage, shouldEscalateToRender } from "../services/render-page";
 import { normalizeOpeningHours, entryDaysLabel } from "../utils/opening-hours";
 import { issueOwnerSessionForSelgerLogin } from "./owner-portal";
+import { revokeOwnerAccessExceptVerifiedOwners } from "../services/owner-access-revocation";
 import { HOMEPAGE_CONTACT_PROVENANCE_EXCLUSION_SQL } from "../services/homepage-contact-provenance";
+import { emailWithheldIds, withKnowledgeEmailNull } from "../services/email-reveal-guard";
+import { hasContactRetentionMarkers } from "../services/privacy-retention";
 import {
   publicFieldChoices, publicFieldChoicesForMany, withoutHiddenContact, withoutHiddenFields, publicAgentInfo,
   withoutHiddenCoordinates, hidesPrices, hidesTrust, type PublicFieldChoices,
@@ -237,17 +244,19 @@ function ensureAgentInDb(agentId: string): boolean {
 // Used by /search, /discover (via enrichment) and /vcard endpoint.
 // Keeping these inline to avoid a new util module just yet.
 
-function buildContactBlock(agentId: string, choices?: PublicFieldChoices | null): {
+type ContactBlock = {
   address?: string;
   postalCode?: string;
   phone?: string;
-  email?: string;
+  email?: string | null;
   website?: string;
   openingHours?: Array<{ day: string; open: string; close: string }>;
   paymentMethods?: string[];
   deliveryOptions?: string[];
   vcardUrl: string;
-} | null {
+};
+
+function buildContactBlock(agentId: string, choices?: PublicFieldChoices | null): ContactBlock | null {
   const info = knowledgeService.getAgentInfo(agentId);
   if (!info) return null;
   // S2c-1: without the phone / address the owner hid (choices null = as before).
@@ -269,6 +278,29 @@ function buildContactBlock(agentId: string, choices?: PublicFieldChoices | null)
     deliveryOptions: k.deliveryOptions,
     vcardUrl: `/api/marketplace/agents/${agentId}/vcard`,
   };
+}
+
+// dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
+// S-A5 (RFB REST): the producer e-mail in these answers follows the per-IP
+// limit of services/email-reveal-guard.ts — the rfb counter the profile page
+// /produsent/:slug uses (switch EMAIL_REVEAL_GUARD_RFB, default off). Over
+// the limit, or for CCBot, the e-mail is left out exactly as for a producer
+// without one (no new field). In a list each producer with an e-mail counts
+// on its own, in list order. Switch on: Cache-Control: private. Switch off:
+// nothing changes, headers included. The guard logs ids and counts only.
+
+/** A contact block as buildContactBlock gives it for the same producer without an e-mail. */
+function contactBlockWithoutEmail<T extends ContactBlock | null>(block: T): T {
+  if (!block || !block.email) return block;
+  if (!(block.address || block.phone || block.website)) return { vcardUrl: block.vcardUrl } as T;
+  return { ...block, email: null };
+}
+
+/** The list's contact blocks with the e-mail left out where this request is over the rfb limit (switch off: as given). */
+function guardContactBlocks<T extends { agentId: string; contact: ContactBlock | null }>(req: Request, res: Response, rows: T[]): T[] {
+  const withheld = emailWithheldIds(req, res, "rfb", rows.filter((r) => !!r.contact?.email).map((r) => r.agentId));
+  if (!withheld || withheld.size === 0) return rows;
+  return rows.map((r) => (withheld.has(r.agentId) ? { ...r, contact: contactBlockWithoutEmail(r.contact) } : r));
 }
 
 // dev-request 2026-07-04-rfb-datakvalitet item 1 (description sanitizer,
@@ -310,7 +342,7 @@ function escapeVCard(value: string): string {
 const VCARD_CHARSET = "CHARSET=UTF-8";
 const VCARD_NOTE_PREFIX = `NOTE;${VCARD_CHARSET}:`;
 
-function buildVCard(agentId: string): string | null {
+function buildVCard(agentId: string, emailAllowed: (agentId: string) => boolean = () => true): string | null {
   const info = knowledgeService.getAgentInfo(agentId);
   if (!info) return null;
   // S2c-1: the owner's contact / price / trust choices (null = as before).
@@ -325,7 +357,7 @@ function buildVCard(agentId: string): string | null {
   lines.push(`ORG;${VCARD_CHARSET}:${escapeVCard(agent.name)}`);
   if (k.about) lines.push(`${VCARD_NOTE_PREFIX}${escapeVCard(k.about)}`);
   if (isDisplayablePhone(k.phone)) lines.push(`TEL;TYPE=WORK,VOICE:${escapeVCard(k.phone)}`);
-  if (k.email) lines.push(`EMAIL;TYPE=WORK:${escapeVCard(k.email)}`);
+  if (k.email && emailAllowed(agentId)) lines.push(`EMAIL;TYPE=WORK:${escapeVCard(k.email)}`);
   if (k.website) lines.push(`URL:${escapeVCard(k.website)}`);
   if (k.address || agent.city) {
     // ADR;TYPE=WORK:;;<street>;<city>;<region>;<postal>;<country>
@@ -637,10 +669,14 @@ router.post("/discover", (req: Request, res: Response) => {
     }
 
     const ownerChoices = publicFieldChoicesForMany(results.map((r: any) => r.agent.id));
-    const enrichedResults = results.map((r: any) => ({
+    const contacts = guardContactBlocks(req, res, results.map((r: any) => ({
+      agentId: r.agent.id as string,
+      contact: buildContactBlock(r.agent.id, ownerChoices.get(r.agent.id)),
+    })));
+    const enrichedResults = results.map((r: any, i: number) => ({
       ...r,
       agent: withSanitizedDescription(r.agent),
-      contact: buildContactBlock(r.agent.id, ownerChoices.get(r.agent.id)),
+      contact: contacts[i]!.contact,
     }));
 
     // dev-request 2026-07-25 fix 0g(ii): structured discovery is a read-only
@@ -935,9 +971,13 @@ router.get("/search", async (req: Request, res: Response) => {
   const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 
   const ownerChoices = publicFieldChoicesForMany(results.map((r: any) => r.agent.id));
-  const enrichedResults = results.map((r: any) => {
+  const contacts = guardContactBlocks(req, res, results.map((r: any) => ({
+    agentId: r.agent.id as string,
+    contact: buildContactBlock(r.agent.id, ownerChoices.get(r.agent.id)),
+  })));
+  const enrichedResults = results.map((r: any, i: number) => {
     const choices = ownerChoices.get(r.agent.id);
-    const contact = buildContactBlock(r.agent.id, choices);
+    const contact = contacts[i]!.contact;
     // Skive A2: no profile link for roles whose /produsent/<slug> 404s.
     const profileUrl = failsProducerRoleGate(r.agent.role, false)
       ? undefined
@@ -1071,11 +1111,17 @@ router.get("/agents/:id/vcard", (req: Request, res: Response) => {
     res.status(404).json({ success: false, error: "Agent ikke funnet" });
     return;
   }
-  const vcard = buildVCard(agentId);
+  // S-A5: the EMAIL line follows the rfb per-IP limit (see guardContactBlocks).
+  let emailGuarded = false;
+  const vcard = buildVCard(agentId, (id) => {
+    emailGuarded = true;
+    return !emailWithheldIds(req, res, "rfb", [id])?.has(id);
+  });
   if (!vcard) {
     res.status(404).json({ success: false, error: "Agent ikke funnet" });
     return;
   }
+  if (!emailGuarded) emailWithheldIds(req, res, "rfb", []); // switch on: Cache-Control: private all the same
   const info = knowledgeService.getAgentInfo(agentId);
   const contentDisposition = vcardContentDisposition(info?.agent.name || "agent");
 
@@ -1132,7 +1178,9 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
     if (cityName) contact.city = cityName;
     contact.country = "Norway";
     if (isDisplayablePhone(k.phone)) contact.phone = k.phone;
-    if (k.email) contact.email = k.email;
+    // S-A5: the e-mail follows the rfb per-IP limit (see guardContactBlocks).
+    const emailWithheld = emailWithheldIds(req, res, "rfb", k.email ? [agentId] : []);
+    if (k.email && !emailWithheld?.has(agentId)) contact.email = k.email;
     if (k.website) contact.website = addUtmParams(k.website);
     if (Object.keys(contact).length > 1) card.contact = contact;
 
@@ -1716,6 +1764,11 @@ router.get("/agents/:id/info", (req: Request, res: Response) => {
   if (ownerChoices && !isOwnerRead) {
     info = publicAgentInfo(info, ownerChoices);
   }
+  // S-A5: knowledge.email follows the rfb per-IP limit (see
+  // guardContactBlocks); withheld it reads null, as a producer without one.
+  // The owner's own /selger read (X-Claim-Token) is not limited.
+  const infoEmailWithheld = emailWithheldIds(req, res, "rfb", info.knowledge.email && !isOwnerRead ? [agentId] : []);
+  if (infoEmailWithheld?.has(agentId)) info = withKnowledgeEmailNull(info);
   const data = {
     ...info,
     ...(provenance ? { provenance } : {}),
@@ -1944,10 +1997,92 @@ function claimRequestFieldError(b: { name: unknown; email: unknown; phone: unkno
   return null;
 }
 
+/** Eierkrav B1: signed «Godkjenn» / «Avvis» links (slice C4) for the admin
+ *  notice of a queued claim. Only when CLAIM_ACTION_LINKS_ENABLED is on and
+ *  there is a recipient; C4's own mint checks the secret. Anything else —
+ *  flag off, secret missing/short, a mint refusal or a throw — gives
+ *  undefined, and the notice goes out exactly as before (never an unsigned
+ *  link). Neither the links nor their tokens are logged.
+ *  Eierkrav B3a: with CLAIM_REQUEST_MORE_ENABLED === "true" as well, a third
+ *  link, request_more («Be om mer bekreftelse»), is minted with them; flag off
+ *  → exactly the two links (and the notice) as before. */
+function claimQueuedActionLinks(claimId: string): { approve: string; reject: string; request_more?: string } | undefined {
+  if (!isClaimActionLinksEnabled() || !process.env.ADMIN_NOTIFICATION_EMAIL) return undefined;
+  try {
+    const requestMore = isClaimRequestMoreEnabled();
+    const wanted: ClaimAction[] = requestMore ? ["approve", "reject", "request_more"] : ["approve", "reject"];
+    const minted = createClaimActionLinks(claimId, wanted);
+    if (!minted.ok) {
+      console.warn("[Admin notify] claim-action links not minted:", minted.reason);
+      return undefined;
+    }
+    const approve = minted.links.find((l) => l.action === "approve")?.url;
+    const reject = minted.links.find((l) => l.action === "reject")?.url;
+    if (!approve || !reject) return undefined;
+    const more = requestMore ? minted.links.find((l) => l.action === "request_more")?.url : undefined;
+    return more ? { approve, reject, request_more: more } : { approve, reject };
+  } catch (err: any) {
+    console.error("[Admin notify] claim-action links failed:", err?.message);
+    return undefined;
+  }
+}
+
 /** Tells the admin (ADMIN_NOTIFICATION_EMAIL) that a claim entered the admin
  *  queue. Fire-and-forget, like the verified-claim notice below; the queue's
- *  own caps bound how often it fires. */
+ *  own caps bound how often it fires.
+ *
+ *  Eierkrav B2a: with CLAIM_AUTO_ASSESSMENT_ENABLED === "true" the notice
+ *  first waits (bounded, CLAIM_ASSESSMENT_NOTICE_MAX_WAIT_MS) for this
+ *  claim's already-started assessment, then shows what is stored in
+ *  claim_assessment. Flag off, no stored assessment, a timeout or an
+ *  unreadable value → the notice goes out exactly as before. The caller
+ *  never waits for any of it.
+ *
+ *  Eierkrav B2b-1: with CLAIM_AUTO_APPROVE_ENABLED === "true" as well, a
+ *  claim whose own run settled within the wait with a green stored result is
+ *  approved automatically (autoApproveGreenClaim), which sends the claimant's
+ *  login mail and the «godkjent automatisk» notice instead of this one. One
+ *  decision per claim, here: anything not approved (not green, no run, over
+ *  the wait, already decided, the profile got an owner) gets the notice
+ *  above. */
 function notifyAdminClaimQueued(claimId: string): void {
+  let assessmentOn = false;
+  try {
+    assessmentOn = claimAssessmentEnabled();
+  } catch { /* off */ }
+  if (!assessmentOn) {
+    sendAdminClaimQueuedNotice(claimId, undefined);
+    return;
+  }
+  try {
+    waitForClaimAssessmentOutcome(claimId)
+      .then(async (outcome) => {
+        const assessment = storedClaimAssessment(claimId);
+        let autoOn = false;
+        try {
+          autoOn = claimAutoApproveEnabled();
+        } catch { /* off */ }
+        if (autoOn && outcome === "settled" && assessment && await autoApproveGreenClaim(claimId, assessment)) return;
+        sendAdminClaimQueuedNotice(claimId, assessment);
+      })
+      .catch((err: any) => console.error("[Admin notify] claim-review notice error:", err?.message));
+  } catch (err: any) {
+    console.error("[Admin notify] claim-review notice error:", err?.message);
+  }
+}
+
+/** The claim's stored assessment, or undefined (none, unreadable or a read error). */
+function storedClaimAssessment(claimId: string): ClaimAssessment | undefined {
+  try {
+    const row = getDb().prepare("SELECT claim_assessment FROM agent_claims WHERE id = ?").get(claimId) as { claim_assessment: string | null } | undefined;
+    return parseStoredClaimAssessment(row?.claim_assessment) ?? undefined;
+  } catch (err: any) {
+    console.warn("[Admin notify] claim assessment not read:", err?.code ?? "error");
+    return undefined;
+  }
+}
+
+function sendAdminClaimQueuedNotice(claimId: string, assessment: ClaimAssessment | undefined): void {
   try {
     const row = getDb().prepare(
       `SELECT c.agent_id, c.claimant_name, c.claimant_email, c.review_reason, c.recommendation, a.name AS agent_name
@@ -1960,7 +2095,7 @@ function notifyAdminClaimQueued(claimId: string): void {
     const recommendation = row.recommendation
       ? `${row.recommendation} — ${CLAIM_RECOMMENDATION_LABELS[row.recommendation] ?? ""}`.replace(/ — $/, "")
       : undefined;
-    emailService.sendAdminClaimReviewNotification(row.agent_name, row.agent_id, row.claimant_name, row.claimant_email, reason, recommendation)
+    emailService.sendAdminClaimReviewNotification(row.agent_name, row.agent_id, row.claimant_name, row.claimant_email, reason, recommendation, claimQueuedActionLinks(claimId), assessment)
       .catch((err: any) => console.error("[Admin notify] claim-review notice failed:", err?.message));
   } catch (err: any) {
     console.error("[Admin notify] claim-review notice error:", err?.message);
@@ -2056,6 +2191,7 @@ router.post("/agents/:id/claim", rfbClaimRequestLimiter, async (req: Request, re
     // `email` (unless that IS the farm's address). Domain rule P1/P2 (flag
     // on): to the claimant's own address, whose domain qualified.
     const emailResult = await emailService.sendVerificationCode(result.recipient, result.verificationCode, agentName);
+    recordClaimMail({ kind: "claim_code", claimId: result.claimId, agentId, email: result.recipient, agentName, sendResult: emailResult });
     const dryRun = emailResult.success && emailResult.messageId === "DRY_RUN";
     const returnDevCode = dryRun && mayReturnDevClaimCode();
     if (!emailResult.success || (dryRun && !returnDevCode)) {
@@ -2124,7 +2260,9 @@ router.post("/agents/:id/claim/resend", rfbClaimRequestLimiter, async (req: Requ
 
     // Same bookkeeping lookup as the claim request above.
     const agent = marketplaceRegistry.getActiveAgents({ includeUnvetted: true }).find((a: any) => a.id === agentId);
-    const emailResult = await emailService.sendVerificationCode(result.recipient, result.verificationCode, agent?.name || "Ukjent produsent");
+    const resendAgentName = agent?.name || "Ukjent produsent";
+    const emailResult = await emailService.sendVerificationCode(result.recipient, result.verificationCode, resendAgentName);
+    recordClaimMail({ kind: "claim_code", claimId, agentId, email: result.recipient, agentName: resendAgentName, sendResult: emailResult });
     const dryRun = emailResult.success && emailResult.messageId === "DRY_RUN";
     const returnDevCode = dryRun && mayReturnDevClaimCode();
     if (!emailResult.success || (dryRun && !returnDevCode)) {
@@ -2341,19 +2479,29 @@ router.post("/agents/:id/unclaim", (req: Request, res: Response) => {
 
   try {
     const db = getDb();
-    // Remove this specific claim
-    db.prepare("DELETE FROM agent_claims WHERE agent_id = ? AND claim_token = ?").run(agentId, claimToken);
+    // One transaction: the claim goes and the login rows go with it, or
+    // neither does (dev-request 2026-11-06-rfb-krav-for-portal-og-okter-ved-
+    // eierskifte, spec point 2).
+    db.transaction(() => {
+      // Remove this specific claim
+      db.prepare("DELETE FROM agent_claims WHERE agent_id = ? AND claim_token = ?").run(agentId, claimToken);
 
-    // Check if any other verified claims remain for this agent
-    const remainingClaims = db.prepare(
-      "SELECT COUNT(*) as c FROM agent_claims WHERE agent_id = ? AND status = 'verified'"
-    ).get(agentId) as any;
+      // Check if any other verified claims remain for this agent
+      const remainingClaims = db.prepare(
+        "SELECT COUNT(*) as c FROM agent_claims WHERE agent_id = ? AND status = 'verified'"
+      ).get(agentId) as any;
 
-    if (remainingClaims.c === 0) {
-      // No owners left — reset verified status and data source
-      db.prepare("UPDATE agents SET is_verified = 0 WHERE id = ?").run(agentId);
-      db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ?").run(agentId);
-    }
+      if (remainingClaims.c === 0) {
+        // No owners left — reset verified status and data source
+        db.prepare("UPDATE agents SET is_verified = 0 WHERE id = ?").run(agentId);
+        db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ?").run(agentId);
+      }
+
+      // /eier sessions and open login links for the profile end here. A
+      // remaining verified co-owner keeps theirs (still an owner); with no
+      // owner left, every row for the profile is revoked.
+      revokeOwnerAccessExceptVerifiedOwners(db, agentId, "unclaim");
+    })();
 
     // Recalculate trust score
     trustScoreService.update(agentId);
@@ -2381,20 +2529,28 @@ router.post("/admin/agents/:id/reset-claim", (req: Request, res: Response) => {
 
   try {
     const db = getDb();
-    db.prepare("UPDATE agents SET is_verified = 0 WHERE id = ?").run(agentId);
-    // Ownership given by the order activation link (skive 2) is revoked here
-    // too; other claimed_via stamps are left as before.
-    db.prepare("UPDATE agents SET claimed_at = NULL, claimed_via = NULL WHERE id = ? AND claimed_via = 'activation_link'").run(agentId);
-    db.prepare("DELETE FROM agent_claims WHERE agent_id = ?").run(agentId);
-    db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ?").run(agentId);
-    // S1b punkt 7 (dev-request 2026-10-22-rfb-mine-valg-eierbrytere): a
-    // pending owner change of the order e-mail belongs to the old owner —
-    // kill it. Best-effort: a DB without the table never breaks reset-claim.
-    try {
-      db.prepare(
-        "UPDATE owner_order_email_change SET outcome = 'superseded', consumed_at = ? WHERE agent_id = ? AND outcome IS NULL AND consumed_at IS NULL"
-      ).run(new Date().toISOString(), agentId);
-    } catch { /* table missing — nothing pending */ }
+    // One transaction: ownership reset and login-row revocation succeed or
+    // fail together, so a reset never leaves the old owner's sessions live
+    // (dev-request 2026-11-06-rfb-krav-for-portal-og-okter-ved-eierskifte).
+    db.transaction(() => {
+      db.prepare("UPDATE agents SET is_verified = 0 WHERE id = ?").run(agentId);
+      // Ownership given by the order activation link (skive 2) is revoked here
+      // too; other claimed_via stamps are left as before.
+      db.prepare("UPDATE agents SET claimed_at = NULL, claimed_via = NULL WHERE id = ? AND claimed_via = 'activation_link'").run(agentId);
+      db.prepare("DELETE FROM agent_claims WHERE agent_id = ?").run(agentId);
+      db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ?").run(agentId);
+      // S1b punkt 7 (dev-request 2026-10-22-rfb-mine-valg-eierbrytere): a
+      // pending owner change of the order e-mail belongs to the old owner —
+      // kill it. Best-effort: a DB without the table never breaks reset-claim.
+      try {
+        db.prepare(
+          "UPDATE owner_order_email_change SET outcome = 'superseded', consumed_at = ? WHERE agent_id = ? AND outcome IS NULL AND consumed_at IS NULL"
+        ).run(new Date().toISOString(), agentId);
+      } catch { /* table missing — nothing pending */ }
+      // Every /eier session and open login link for the profile (no verified
+      // owner remains after the DELETE above).
+      revokeOwnerAccessExceptVerifiedOwners(db, agentId, "reset-claim");
+    })();
     trustScoreService.update(agentId);
     res.json({ success: true, message: "Claim and verification reset" });
   } catch (err: any) {
@@ -5705,6 +5861,22 @@ router.get("/admin/agents/dump", (req: Request, res: Response) => {
     `).all() as Array<{ email: string; contacted_at: string | null }>;
     for (const r of sentRows) {
       if (r.contacted_at != null) contactedByEmail.set(r.email, r.contacted_at);
+    }
+    // Slettefrist slice A: outbound messages the 24-month retention job
+    // deleted are kept as crm_contacts.retention_last_outbound_at — the newer
+    // of the two is the same MAX(sent_at) as before the cleanup.
+    if (hasContactRetentionMarkers(db)) {
+      const retainedRows = db.prepare(`
+        SELECT LOWER(email) AS email, MAX(retention_last_outbound_at) AS contacted_at
+        FROM crm_contacts
+        WHERE retention_last_outbound_at IS NOT NULL AND email IS NOT NULL
+        GROUP BY LOWER(email)
+      `).all() as Array<{ email: string; contacted_at: string | null }>;
+      for (const r of retainedRows) {
+        if (r.contacted_at == null) continue;
+        const live = contactedByEmail.get(r.email);
+        if (live === undefined || r.contacted_at > live) contactedByEmail.set(r.email, r.contacted_at);
+      }
     }
 
     let sql = `

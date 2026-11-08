@@ -199,10 +199,30 @@ const APPLY_MAX_LIMIT = HARD_CAP_SLUGS; // was: 50 — see dev-request 2026-08-1
 // time_budget_exceeded / skipped_due_to_time_budget convention
 // admin-rfb-website-discovery.ts already established for this exact same
 // class of problem — same field names, same "stop starting new work, don't
-// abort work already in flight" semantics. 60s is generous for this route's
-// DB-only per-row cost (dry-run's own ~400-slug/no-fetch runs are far
-// faster) but well short of typical HTTP gateway/proxy timeouts.
-export const APPLY_TIME_BUDGET_MS = 60_000;
+// abort work already in flight" semantics.
+//
+// BM_HARVEST_TIME_BUDGET_MS bounds BOTH branches (dry-run and apply): the
+// dry-run branch used to have no valve at all and fetched the whole ~347-page
+// catalog sequentially (15 s timeout per page) before responding, so a prod
+// call outlived the HTTP proxy and came back as a 502. The budget is 20 s
+// because a prod probe on 2026-11-06 showed the caller→route response window
+// is ~30 s (a limit=400 dry-run answered HTTP 502 "upstream request failed"
+// after 30.3 s, while the whole 359-slug catalog takes ~30 s). 20 s leaves
+// room for the sitemap fetch plus one in-flight slug (the check only stops
+// NEW slugs from starting) under that window. A cut-short call reports
+// `next_offset` so the caller can resume exactly where it stopped.
+export const BM_HARVEST_TIME_BUDGET_MS = 20_000;
+/** Alias kept for existing imports/tests — same value as BM_HARVEST_TIME_BUDGET_MS (was 60 s). */
+export const APPLY_TIME_BUDGET_MS = BM_HARVEST_TIME_BUDGET_MS;
+
+/**
+ * Resume cursor for both branches: `offset + processed` while that is still
+ * inside the catalog, else null (the window reached the catalog end).
+ */
+function bmHarvestNextOffset(offset: number, processed: number, totalSlugs: number): number | null {
+  const next = offset + processed;
+  return next < totalSlugs ? next : null;
+}
 
 // Test-only injection point for the wall-clock used by the time-budget check
 // below (mirrors __setRfbWdNowForTesting, admin-rfb-website-discovery.ts):
@@ -530,7 +550,7 @@ router.get("/", async (req: Request, res: Response) => {
       // uniformly skipped and there is nothing per-slug to record for them.
       let timeBudgetExceeded = false;
       for (const slug of slugsToProcess) {
-        if (effectiveBmHarvestNowMs() - tApply0 > APPLY_TIME_BUDGET_MS) {
+        if (effectiveBmHarvestNowMs() - tApply0 > BM_HARVEST_TIME_BUDGET_MS) {
           timeBudgetExceeded = true;
           break;
         }
@@ -798,6 +818,8 @@ router.get("/", async (req: Request, res: Response) => {
         results,
         time_budget_exceeded: timeBudgetExceeded,
         skipped_due_to_time_budget: slugsToProcess.length - results.length,
+        processed: results.length,
+        next_offset: bmHarvestNextOffset(offset, results.length, total_slugs),
         duration_ms: effectiveBmHarvestNowMs() - tApply0,
       });
     } catch (err: any) {
@@ -809,7 +831,7 @@ router.get("/", async (req: Request, res: Response) => {
     return;
   }
 
-  const t0 = Date.now();
+  const t0 = effectiveBmHarvestNowMs();
   try {
     let limit = HARD_CAP_SLUGS;
     if (typeof req.query.limit === "string") {
@@ -849,7 +871,16 @@ router.get("/", async (req: Request, res: Response) => {
       nameScore: number;
     }> = [];
 
+    // Same wall-clock valve as the apply branch (BM_HARVEST_TIME_BUDGET_MS):
+    // checked before each slug starts; once tripped no further slug starts.
+    let timeBudgetExceeded = false;
+    let processed = 0;
     for (const slug of slugsToProcess) {
+      if (effectiveBmHarvestNowMs() - t0 > BM_HARVEST_TIME_BUDGET_MS) {
+        timeBudgetExceeded = true;
+        break;
+      }
+      processed++;
       const record = await fetchBmProducerRecord(slug);
       if (!record) {
         parse_failed++;
@@ -932,7 +963,11 @@ router.get("/", async (req: Request, res: Response) => {
       would_write_estimate,
       bm_domain_email_excluded_count,
       sample,
-      duration_ms: Date.now() - t0,
+      time_budget_exceeded: timeBudgetExceeded,
+      skipped_due_to_time_budget: slugsToProcess.length - processed,
+      processed,
+      next_offset: bmHarvestNextOffset(offset, processed, total_slugs),
+      duration_ms: effectiveBmHarvestNowMs() - t0,
     });
   } catch (err: any) {
     res.status(500).json({

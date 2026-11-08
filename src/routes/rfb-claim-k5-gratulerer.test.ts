@@ -459,6 +459,9 @@ export async function runRfbClaimK5GratulererTests(opts: { log?: boolean } = {})
       agent("k5-b", "Gård B", "post@k5-b.example.test");
       for (let i = 0; i < 3; i++) insLink.run(`ml_k5b_${i}`, "post@k5-b.example.test", `tok-k5b-${i}`, "k5-b", iso, new Date(Date.now() + 86_400_000).toISOString());
       eq((await requestLink("k5-b", "post@k5-b.example.test")).status, 429, "rate: 3 links this hour → the visitor gets 429");
+      const rWrong = await requestLink("k5-b", "fremmed@example.test");
+      const rRight = await requestLink("k5-b", "post@k5-b.example.test");
+      eq([rWrong.status, rWrong.json], [rRight.status, rRight.json], "rate: over the limit, a wrong address gets the same answer as the right one");
       const cb = claim("k5-b", "b@k5-b.example.test", "pending_review", { reason: "listed_email_wrong" });
       const before = mails.length;
       const a = await approve(cb, "b-bekreftet@k5-b.example.test");

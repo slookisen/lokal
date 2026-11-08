@@ -8,6 +8,7 @@ import { productsWithoutOrganicFlag, stripOrganicEntries, dropOrganicSentences }
 import { debioStatusShown } from "./debio-approval";
 import { normalizeEmail } from "./blocklist-service";
 import { customerRuleSql } from "./customer-rule";
+import { revokeOwnerAccessExceptVerifiedOwners } from "./owner-access-revocation";
 import {
   type ClaimRecommendation, type DomainHttpsCheck, claimDomainRuleEnabled, emailDomain, emailDomainMatchesWebsite,
   getDomainHttpsCheck, isFreeMailDomain, isHostedPlatformHost, isRootWebsite, registrableDomain, websiteHost,
@@ -808,6 +809,10 @@ function claimAssessmentErrorKind(err: unknown): string {
   return err instanceof Error && /^[A-Za-z]{1,40}$/.test(err.name) ? err.name : "error";
 }
 
+/** How a queued claim was approved: by Daniel from the admin queue, or
+ *  automatically on a green claim assessment (eierkrav B2b-1). */
+export type ClaimApprovalVia = "admin_approval" | "auto_assessment";
+
 /** The stored claim_assessment JSON, parsed; null when absent or unreadable. */
 export function parseStoredClaimAssessment(raw: string | null | undefined): ClaimAssessment | null {
   if (!raw) return null;
@@ -1299,6 +1304,10 @@ class KnowledgeService {
    *  still to be confirmed with resolveFarmContactEmail). */
   private knownEmailCandidates(target: string, knownHolderId?: string): Set<string> {
     const db = getDb();
+    // A deactivated or merged profile (is_active = 0) no longer shares the
+    // address: it has no page and no owner to mix up, and a merged duplicate
+    // would otherwise block the code for the survivor forever. The claimed
+    // profile itself still counts, also when inactive.
     // The claimed profile itself, when its known e-mail is the address (rule 1):
     // a candidate regardless of the LIMIT below, so stale outreach rows cannot
     // crowd it out of the set.
@@ -1306,7 +1315,7 @@ class KnowledgeService {
     const listed = db.prepare(
       `SELECT k.agent_id AS id
          FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
-        WHERE LOWER(TRIM(k.email, ${EMAIL_TRIM_CHARS})) = ? AND COALESCE(a.vertical_id, 'rfb') = 'rfb'
+        WHERE LOWER(TRIM(k.email, ${EMAIL_TRIM_CHARS})) = ? AND COALESCE(a.vertical_id, 'rfb') = 'rfb' AND COALESCE(a.is_active, 1) = 1
         LIMIT ?`
     ).all(target, SHARED_EMAIL_CANDIDATES_MAX) as Array<{ id: string }>;
     for (const r of listed) candidates.add(r.id);
@@ -1314,7 +1323,7 @@ class KnowledgeService {
       const delivered = db.prepare(
         `SELECT DISTINCT o.agent_id AS id
            FROM outreach_sent_log o JOIN agents a ON a.id = o.agent_id
-          WHERE LOWER(TRIM(o.recipient_email, ${EMAIL_TRIM_CHARS})) = ? AND o.vertical_id = 'rfb' AND COALESCE(a.vertical_id, 'rfb') = 'rfb'
+          WHERE LOWER(TRIM(o.recipient_email, ${EMAIL_TRIM_CHARS})) = ? AND o.vertical_id = 'rfb' AND COALESCE(a.vertical_id, 'rfb') = 'rfb' AND COALESCE(a.is_active, 1) = 1
           LIMIT ?`
       ).all(target, SHARED_EMAIL_CANDIDATES_MAX) as Array<{ id: string }>;
       for (const r of delivered) candidates.add(r.id);
@@ -1494,7 +1503,7 @@ class KnowledgeService {
           console.warn(`[claim-assessment] claim ${claimId} not assessed: ${claimAssessmentErrorKind(err)}`);
         }
       })();
-      trackClaimAssessment(run);
+      trackClaimAssessment(run, claimId);
     } catch (err) {
       console.warn(`[claim-assessment] not started: ${claimAssessmentErrorKind(err)}`);
     }
@@ -1998,7 +2007,7 @@ class KnowledgeService {
    * claimant_email_typed. Shared by verifyClaim and approveClaimReview, so the
    * badge gate and the owner stamp below are the same on both paths.
    */
-  private grantClaimOwnership(claim: { id: string; agent_id: string }, ownerEmail: string, claimedVia: "claim" | "admin_approval"): string {
+  private grantClaimOwnership(claim: { id: string; agent_id: string }, ownerEmail: string, claimedVia: "claim" | ClaimApprovalVia): string {
     const db = getDb();
     const claimId = claim.id;
     // Success — generate claim token for future management (expires in 30 days)
@@ -2107,7 +2116,8 @@ class KnowledgeService {
     // ownership is real even though the public badge is withheld above.
     // agent_claims carries no user id, so claimed_by_user_id is left alone.
     // claimed_via is 'claim' for the code path, 'admin_approval' for a claim
-    // Daniel approved from the admin queue (decision 11=A).
+    // Daniel approved from the admin queue (decision 11=A), 'auto_assessment'
+    // for a green claim approved automatically (eierkrav B2b-1).
     db.prepare(`
       UPDATE agents
          SET claimed_at = ?, claimed_via = COALESCE(claimed_via, ?)
@@ -2120,6 +2130,15 @@ class KnowledgeService {
       db.prepare("UPDATE agent_knowledge SET data_source = 'hybrid' WHERE agent_id = ? AND data_source = 'auto'")
         .run(claim.agent_id);
     }
+
+    // Owner change (dev-request 2026-11-06-rfb-krav-for-portal-og-okter-ved-
+    // eierskifte, spec point 2): login rows follow ownership. Every live
+    // /eier session and open login link for this profile whose address is not
+    // a verified owner now (the new owner, or an owner that stays) is revoked
+    // — e.g. a previous owner by activation link or the old listed address.
+    // Both callers run this method inside a transaction, so a failure here
+    // rolls the whole grant back instead of leaving the old sessions live.
+    revokeOwnerAccessExceptVerifiedOwners(db, claim.agent_id, `claim grant (${claimedVia})`);
 
     return claimToken;
   }
@@ -2161,10 +2180,17 @@ class KnowledgeService {
    * because the profile got an owner meanwhile), else the address the
    * claimant gave. An existing owner keeps its own claim and token. The
    * caller sends the login link to `email`.
+   *
+   * Eierkrav B2b-1: `via` 'auto_assessment' is the green auto-approval. It
+   * stamps claimed_via and the claim's verification_method 'auto_assessment'
+   * (instead of 'admin_approval' / 'manual'), and only inside the
+   * transaction, re-checked there: the claim must still be pending_review and
+   * the profile must still have no owner ("has_owner" otherwise). The default
+   * ('admin_approval') is the admin path, unchanged.
    */
-  approveClaimReview(claimId: string, approvedEmail?: string):
+  approveClaimReview(claimId: string, approvedEmail?: string, via: ClaimApprovalVia = "admin_approval"):
     | { ok: true; agentId: string; email: string; isVerified: boolean }
-    | { ok: false; error: "not_found" | "not_pending_review" | "invalid_email" } {
+    | { ok: false; error: "not_found" | "not_pending_review" | "invalid_email" | "has_owner" } {
     const db = getDb();
     const claim = db.prepare("SELECT id, agent_id, status, claimant_email, code_sent_to FROM agent_claims WHERE id = ?").get(claimId) as
       { id: string; agent_id: string; status: string; claimant_email: string; code_sent_to: string | null } | undefined;
@@ -2172,10 +2198,18 @@ class KnowledgeService {
     if (claim.status !== "pending_review") return { ok: false, error: "not_pending_review" };
     const email = normalizeEmail(approvedEmail ?? claim.code_sent_to ?? claim.claimant_email);
     if (!isSingleEmailAddress(email)) return { ok: false, error: "invalid_email" };
-    db.transaction(() => {
-      db.prepare("UPDATE agent_claims SET verification_method = 'manual' WHERE id = ?").run(claimId);
-      this.grantClaimOwnership(claim, email, "admin_approval");
+    const auto = via === "auto_assessment";
+    const refused = db.transaction((): "not_pending_review" | "has_owner" | null => {
+      if (auto) {
+        const current = db.prepare("SELECT status FROM agent_claims WHERE id = ?").get(claimId) as { status: string } | undefined;
+        if (current?.status !== "pending_review") return "not_pending_review";
+        if (this.agentHasOwner(claim.agent_id)) return "has_owner";
+      }
+      db.prepare("UPDATE agent_claims SET verification_method = ? WHERE id = ?").run(auto ? "auto_assessment" : "manual", claimId);
+      this.grantClaimOwnership(claim, email, via);
+      return null;
     })();
+    if (refused) return { ok: false, error: refused };
     const agent = db.prepare("SELECT is_verified FROM agents WHERE id = ?").get(claim.agent_id) as { is_verified: number } | undefined;
     return { ok: true, agentId: claim.agent_id, email, isVerified: agent?.is_verified === 1 };
   }
@@ -2215,7 +2249,7 @@ class KnowledgeService {
    *     flipped it ('auto' → 'hybrid') and it is still 'hybrid' (an owner
    *     edit since then is kept). restored "snapshot".
    *   - no snapshot (granted before C1): claimed_at/claimed_via are cleared
-   *     only when claimed_via is 'claim' or 'admin_approval' (a grant's
+   *     only when claimed_via is 'claim', 'admin_approval' or 'auto_assessment' (a grant's
    *     stamp); is_verified and data_source are left as they are, since what
    *     they were before cannot be known. restored "partial_no_snapshot".
    */
@@ -2261,7 +2295,7 @@ class KnowledgeService {
       if (!snap) {
         db.prepare(`
           UPDATE agents SET claimed_at = NULL, claimed_via = NULL
-           WHERE id = ? AND claimed_via IN ('claim', 'admin_approval')
+           WHERE id = ? AND claimed_via IN ('claim', 'admin_approval', 'auto_assessment')
         `).run(claim.agent_id);
         return { ok: true as const, agentId: claim.agent_id, restored: "partial_no_snapshot" as const, ownerRemains, sessionsRevoked };
       }
