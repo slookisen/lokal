@@ -52337,7 +52337,8 @@ runSerial(async () => {
 // counter; switch off = byte-identical), /samtaler and the front page preview.
 // S-A2 adds the higher limit for verified AI readers (forward-confirmed
 // reverse DNS, injected fake resolver; switch off = no DNS lookup).
-// Switch off = byte-identical answers; MCP tannlege_info untouched. Sets env
+// S-A5 adds the dental MCP tannlege_info (same dental counter).
+// Switch off = byte-identical answers. Sets env
 // flags and swaps the dental db-factory (restored in finally) — runSerial,
 // tail position.
 runSerial(async () => {
@@ -52357,6 +52358,8 @@ runSerial(async () => {
     ["rfb conversations email reveal", () => (require("../src/routes/rfb-conversations-email-reveal.test") as typeof import("../src/routes/rfb-conversations-email-reveal.test")).runRfbConversationsEmailRevealTests({ log: false })],
     // S-A2: a higher limit for AI readers verified by forward-confirmed reverse DNS (fake resolver, no network; switch off = no lookup).
     ["email reveal ai readers", () => (require("../src/services/email-reveal-ai-readers.test") as typeof import("../src/services/email-reveal-ai-readers.test")).runEmailRevealAiReadersTests({ log: false })],
+    // S-A5: the dental MCP tannlege_info on the same dental counter (switch off = byte-identical).
+    ["dental mcp email reveal", () => (require("../src/routes/dental-mcp-email-reveal.test") as typeof import("../src/routes/dental-mcp-email-reveal.test")).runDentalMcpEmailRevealTests({ log: false })],
   ] as Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]>) {
     try {
       const r = await load();
