@@ -2200,6 +2200,8 @@ export function transitionOrder(
     completionSource?: OrderCompletionSource | null;
     /** Fase A1: set orders.pickup_time in the same write (confirm with a pickup time). */
     pickupTime?: string | null;
+    /** T12: orders.cancel_detail in the same write ('sold_out' | 'cannot_deliver'; cancelled only). */
+    cancelDetail?: string | null;
   }
 ): TransitionResult {
   const db = _cartTestDb ?? getDb();
@@ -2266,6 +2268,7 @@ export function transitionOrder(
     ? (opts?.completionSource ?? (actorRole === "admin" ? "admin" : actorRole === "seller" ? "seller" : actorRole === "buyer" ? "buyer" : null))
     : null;
   const pickupTime = toStatus === "confirmed" ? (opts?.pickupTime ?? null) : null;
+  const cancelDetail = toStatus === "cancelled" ? (opts?.cancelDetail ?? null) : null;
 
   // Concurrency guard: the UPDATE re-asserts the from-status we validated
   // against (id AND status), so two racing transitions (multi-instance, or
@@ -2285,6 +2288,9 @@ export function transitionOrder(
     }
     if (pickupTime) {
       db.prepare("UPDATE orders SET pickup_time = ? WHERE id = ?").run(pickupTime, orderId);
+    }
+    if (cancelDetail) {
+      db.prepare("UPDATE orders SET cancel_detail = ? WHERE id = ?").run(cancelDetail, orderId);
     }
     db.prepare(`
       INSERT INTO order_events (id, order_id, from_status, to_status, actor, actor_role, channel, idempotency_key, created_at)

@@ -5572,6 +5572,18 @@ function initSchema(db: Database.Database): void {
     console.error("Migration order caps v2 (T11) failed:", err);
   }
 
+  // T12 (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 6;
+  // cancellation from «Mine ordrer»). Additive only, no CHECK:
+  //   orders.cancel_detail : nullable; why the producer cancelled a confirmed
+  //     order ('sold_out' | 'cannot_deliver', with cancel_reason
+  //     'producer_cancelled'). NULL on every older row and every other reason.
+  try {
+    const orderCols = new Set((db.prepare(`PRAGMA table_info(orders)`).all() as Array<{ name: string }>).map((c) => c.name));
+    if (!orderCols.has("cancel_detail")) db.exec(`ALTER TABLE orders ADD COLUMN cancel_detail TEXT`);
+  } catch (err) {
+    console.error("Migration orders.cancel_detail (T12) failed:", err);
+  }
+
   // B2 (dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier):
   // the stock-check reminder (services/stock-check-reminder.ts). Additive.
   //   stock_check_notices : one row per reserved reminder e-mail. The job

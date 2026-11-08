@@ -37514,6 +37514,19 @@ const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
     failed++;
     failures.push("order-cap-v2: unexpected error: " + String(err?.message || err));
   }
+  // T12 (kansellering og oversikt, dev-request 2026-10-30-rfb-eierportal-testrunde-1 punkt 6) — own in-memory DB.
+  try {
+    const { runOwnerOrdersT12Tests } = require("../src/routes/owner-orders-t12-kansellering.test") as
+      typeof import("../src/routes/owner-orders-t12-kansellering.test");
+    const t12 = await runOwnerOrdersT12Tests({ log: false });
+    passed += t12.passed;
+    failed += t12.failed;
+    for (const f of t12.failures) failures.push("owner-orders-t12-kansellering: " + f);
+    console.log(`  owner-orders-t12-kansellering: ${t12.passed} passed, ${t12.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-orders-t12-kansellering: unexpected error: " + String(err?.message || err));
+  }
   // B2 (lagerpåminnelse, products.stock_check, dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier) — own in-memory DB.
   try {
     const { runStockCheckReminderB2Tests } = require("../src/routes/stock-check-reminder-b2.test") as
