@@ -94,6 +94,14 @@ export interface DebioRegisterRow {
   productGroups: string[];
   /** Human product-group labels (`caption`, e.g. «Foredling, import og omsetning»), in order. */
   productGroupLabels: string[];
+  /**
+   * Økologi S4a-2: the `enquiryOrigSid`s of the row's `certificates[]` — the
+   * id Debio's getcertificatedetail takes. Certificates valid now first, then
+   * the rest; each group latest `to` first; positive integers, no duplicates.
+   * In memory only (read by POST /admin/debio/cert-detail-probe); the sync
+   * never persists it.
+   */
+  enquiryOrigSids: number[];
 }
 
 export interface DebioRegisterFetchResult {
@@ -288,6 +296,46 @@ export function certificateValidity(certs: unknown, now: Date): { validFrom: str
   return { validFrom: iso(starts.length ? Math.min(...starts) : null), validTo: null };
 }
 
+/** A positive safe integer from a number or a digit-only string; else null. */
+function positiveSafeInt(v: unknown): number | null {
+  let n: number;
+  if (typeof v === "number") n = v;
+  else if (typeof v === "string" && /^\d+$/.test(v.trim())) n = Number(v.trim());
+  else return null;
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
+/**
+ * Økologi S4a-2: the `enquiryOrigSid` of every certificate in the real
+ * `certificates: [{sid, from, to, enquiryOrigSid}]` array (keys looked up
+ * case-/separator-insensitively). Order: certificates valid now (from ≤ now ≤
+ * to; a missing `from` counts as started, as in certificateValidity) first,
+ * then the rest; within each group latest `to` first (no usable `to` last,
+ * ties keep array order). Only positive safe integers; duplicates dropped
+ * (first occurrence wins). Not an array → [].
+ */
+export function certificateEnquiryOrigSids(certs: unknown, now: Date): number[] {
+  if (!Array.isArray(certs)) return [];
+  const t = now.getTime();
+  const list: Array<{ id: number; to: number | null; current: boolean; i: number }> = [];
+  certs.forEach((c, i) => {
+    if (!c || typeof c !== "object" || Array.isArray(c)) return;
+    const m = lookupMap(c as Record<string, unknown>);
+    const id = positiveSafeInt(m.get("enquiryorigsid"));
+    if (id === null) return;
+    const to = instantOf(pick(m, ["to", "validto", "todate", "dateto"]));
+    const from = instantOf(pick(m, ["from", "validfrom", "fromdate", "datefrom"]));
+    list.push({ id, to, current: to !== null && (from === null || from <= t) && t <= to, i });
+  });
+  list.sort((a, b) =>
+    (a.current === b.current ? 0 : a.current ? -1 : 1)
+    || ((b.to ?? -Infinity) - (a.to ?? -Infinity) || 0)
+    || a.i - b.i);
+  const out: number[] = [];
+  for (const c of list) if (!out.includes(c.id)) out.push(c.id);
+  return out;
+}
+
 /** street + houseNr, appending the house number only when the street has no trailing number. */
 function streetWithHouseNr(street: unknown, houseNr: unknown): string | null {
   const s = text(street);
@@ -348,6 +396,7 @@ export function normalizeRegisterRow(raw: unknown, now: Date = new Date()): Debi
     validTo: fromCerts ? fromCerts.validTo : registerDate(pick(m, ["validto", "certvalidto", "todate", "dateto", "validtodate", "expirydate", "enddate", "validuntil"])),
     productGroups,
     productGroupLabels,
+    enquiryOrigSids: certificateEnquiryOrigSids(m.get("certificates"), now),
   };
 }
 

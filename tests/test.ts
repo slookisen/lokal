@@ -52758,6 +52758,27 @@ runSerial(async () => {
   }
 });
 
+// økologi S4a-2: the cert-detail probe takes registerSid and uses the
+// register row's certificates[].enquiryOrigSid (normalizer + route; the field
+// is never persisted). Pins the getDb() singleton and sets ADMIN_KEY /
+// RFB_DEBIO_REGISTER_SYNC / clears DEBIO_REGISTER_EXTRA_CA_PEM (restored in
+// finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── økologi S4a-2: sertifikatdetalj-probe med registerSid ──");
+  try {
+    const { runDebioCertDetailS4a2Tests } = require("../src/services/debio-cert-detail-s4a2.test") as
+      typeof import("../src/services/debio-cert-detail-s4a2.test");
+    const r = await runDebioCertDetailS4a2Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("debio-cert-detail-s4a2: " + f);
+    console.log(`  debio-cert-detail-s4a2: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("debio-cert-detail-s4a2: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // A2A dev-request 2026-10-21-rfb-produktimport-fra-egen-nettside, Skive 1:
 // product extractor (Shopify / WooCommerce / JSON-LD / grounded LLM tiers,
 // robots.txt, same-host + SSRF) and the flag-gated dry-run measurement
