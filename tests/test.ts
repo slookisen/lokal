@@ -52825,6 +52825,28 @@ runSerial(async () => {
   }
 });
 
+// Daniel 2026-11-07 (Lega): POST /admin/agents/content-correction field
+// "address" — audited address correction that appends one admin_correction
+// provenance record and keeps the old ones (verdict unchanged, old value stays
+// refused by canCorrectFactualField). Own ":memory:" DB via the route's seam;
+// sets ADMIN_KEY only if unset (restored) — runSerial.
+runSerial(async () => {
+  console.log("
+── content-correction: adresse ──");
+  try {
+    const { runAdminAgentsContentCorrectionAddressTests } = require("../src/routes/admin-agents-content-correction-address.test") as
+      typeof import("../src/routes/admin-agents-content-correction-address.test");
+    const r = await runAdminAgentsContentCorrectionAddressTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("content-correction-address: " + f);
+    console.log(`  content-correction-address: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("content-correction-address: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // POST /admin/rfb-website-discovery + the review queue, approve and judge
 // routes (incl. dev-request 2026-10-31 S2: a real judge AVVIS closes the row
 // as 'rejected', an infrastructure failure keeps it 'pending', and a rejection

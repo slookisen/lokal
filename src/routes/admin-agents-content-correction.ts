@@ -38,6 +38,7 @@
 //
 // Body: { apply?: boolean, reason: string, items: [ItemSpec] }, ItemSpec one of
 //   { agent_id, field: "description"|"about", text }
+//   { agent_id, field: "address", text, source_url? }  — see «address» below.
 //   { agent_id, field: "product_name", old_name, text }  — renames the ONE
 //       agent_knowledge.products entry whose name === old_name (0 or >1
 //       matches -> invalid_item); every other product field kept. Entries
@@ -129,6 +130,27 @@
 // owner-locked, owner_consent is ignored (not checked) and the outcome is the
 // normal one — consent is never claimed where it was not what let it through.
 // Without owner_consent behaviour is unchanged (skipped_claimed).
+//
+// ── address (Daniel 2026-11-07, Lega: «Bygg admin-retting her») ─────────
+// { agent_id, field: "address", text, source_url? } writes
+// agent_knowledge.address (street line only — postal code and city are their
+// own columns). PUT /admin/knowledge cannot do this honestly: an address with
+// sources may only be overwritten by two Tier-A sources or the owner, AND only
+// when the old value is known-bad (canCorrectFactualField), so a correction a
+// person established from the producer's own site was refused there. Same
+// locks as every item here (owner lock / owner_consent, curated_fields
+// "address", unchanged, junk gate) plus: one line, at most
+// CONTENT_CORRECTION_MAX_ADDRESS chars; source_url, when given, must be an
+// http(s) URL. The apply also APPENDS one record to
+// field_provenance.address — { value, source_type: "admin_correction",
+// fetched_at, source_url?, reason } — in the same transaction. Existing
+// records are kept, never rewritten: the cross-source verdict (which only
+// counts Tier-A/B/S records — "admin_correction" is none of them) and with it
+// pool eligibility stay exactly as they were, and because the old value's
+// records stay, canCorrectFactualField keeps refusing an enrichment write that
+// would put the old address back. A field_provenance that is not a JSON object
+// -> skipped_malformed_json, nothing written. The audit row (field_name
+// address) notes the appended record.
 // Residual risk: the route is admin-key only and every consent write is
 // audited (audit notes + crm_actions), but the check proves «the contact
 // replied after we wrote», not WHAT they agreed to — the admin caller is
@@ -191,10 +213,14 @@ function previewValue(s: string | null | undefined, maxLen = 80): string {
 
 type TextField = "description" | "about";
 type ListField = "specialties" | "certifications" | "tags";
-type Field = TextField | "product_name" | "products_organic_flag" | ListField;
+type Field = TextField | "address" | "product_name" | "products_organic_flag" | ListField;
 
 const LIST_FIELDS: readonly ListField[] = ["specialties", "certifications", "tags"];
 export const CONTENT_CORRECTION_MAX_PRODUCT_NAME = 200;
+export const CONTENT_CORRECTION_MAX_ADDRESS = 200;
+export const CONTENT_CORRECTION_MAX_SOURCE_URL = 500;
+/** source_type of the provenance record an address correction appends. */
+export const ADMIN_CORRECTION_SOURCE_TYPE = "admin_correction";
 export const CONTENT_CORRECTION_MAX_REMOVE = 100;
 export const CONTENT_CORRECTION_MAX_CONSENT_ID = 200;
 
@@ -262,6 +288,8 @@ interface LockSnapshot {
   claimed_at: string | null;
   description: string;
   about: string | null;
+  address: string | null;
+  field_provenance: string | null;
   products: string | null;
   specialties: string | null;
   certifications: string | null;
@@ -277,6 +305,8 @@ const LOCK_SNAPSHOT_SQL = `
          a.description  AS description,
          a.tags         AS tags,
          k.about        AS about,
+         k.address      AS address,
+         k.field_provenance AS field_provenance,
          k.products     AS products,
          k.specialties  AS specialties,
          k.certifications AS certifications,
@@ -309,9 +339,48 @@ function isFieldCurated(curatedFieldsJson: string | null | undefined, fieldName:
  * column name). Lists: specialties/certifications are agent_knowledge JSON
  * columns, tags is the agents.tags JSON column.
  */
-function storageColumn(field: Field): TextField | "products" | ListField {
+function storageColumn(field: Field): TextField | "address" | "products" | ListField {
   if (field === "product_name" || field === "products_organic_flag") return "products";
   return field;
+}
+
+/**
+ * Parse a stored field_provenance column for an address correction:
+ * null/'' -> {}; a JSON object -> it; anything else (bad JSON, array, scalar)
+ * -> null (malformed, never overwritten).
+ */
+function parseProvenanceObject(stored: string | null | undefined): Record<string, unknown> | null {
+  if (stored == null || stored === "") return {};
+  try {
+    const v = JSON.parse(stored);
+    return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * field_provenance with `record` appended to its `address` entry. Existing
+ * records are kept as they are (a single-object entry becomes a one-element
+ * array first, the shape usableFieldRecords already reads); other fields
+ * untouched. null when the stored value is malformed.
+ */
+function withAddressProvenanceRecord(stored: string | null | undefined, record: Record<string, unknown>): string | null {
+  const fp = parseProvenanceObject(stored);
+  if (!fp) return null;
+  const cur = fp.address;
+  const list = Array.isArray(cur) ? cur.slice() : cur && typeof cur === "object" ? [cur] : [];
+  list.push(record);
+  return JSON.stringify({ ...fp, address: list });
+}
+
+function isHttpUrl(s: string): boolean {
+  try {
+    const u = new URL(s);
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 interface OwnerConsent {
@@ -320,6 +389,7 @@ interface OwnerConsent {
 
 type ValidItem = (
   | { agent_id: string; field: TextField; text: string }
+  | { agent_id: string; field: "address"; text: string; source_url?: string }
   | { agent_id: string; field: "product_name"; old_name: string; text: string }
   | { agent_id: string; field: "products_organic_flag" }
   | { agent_id: string; field: ListField; remove: string[] }
@@ -441,6 +511,31 @@ function validateItemFields(raw: unknown): { ok: true; item: ValidItem } | Inval
     return { ok: true, item: { agent_id: agentId, field: f, text } };
   }
 
+  if (f === "address") {
+    const text = typeof r.text === "string" ? r.text.trim() : "";
+    if (!text) return { ok: false, outcome: "invalid_item", detail: "text required (non-empty)", agent_id: agentId };
+    if (text.length > CONTENT_CORRECTION_MAX_ADDRESS) {
+      return { ok: false, outcome: "invalid_item", detail: `text exceeds ${CONTENT_CORRECTION_MAX_ADDRESS} chars`, agent_id: agentId };
+    }
+    if (/[\r\n]/.test(text)) return { ok: false, outcome: "invalid_item", detail: "address must be one line", agent_id: agentId };
+    let sourceUrl: string | undefined;
+    if (r.source_url !== undefined && r.source_url !== null) {
+      const s = typeof r.source_url === "string" ? r.source_url.trim() : "";
+      if (!s || s.length > CONTENT_CORRECTION_MAX_SOURCE_URL || !isHttpUrl(s)) {
+        return {
+          ok: false,
+          outcome: "invalid_item",
+          detail: `source_url must be an http(s) URL of at most ${CONTENT_CORRECTION_MAX_SOURCE_URL} chars`,
+          agent_id: agentId,
+        };
+      }
+      sourceUrl = s;
+    }
+    const junk = junkGate(text, agentId);
+    if (junk) return junk;
+    return { ok: true, item: { agent_id: agentId, field: "address", text, ...(sourceUrl ? { source_url: sourceUrl } : {}) } };
+  }
+
   if (f === "product_name") {
     // old_name is matched EXACTLY against the stored name — not trimmed.
     const oldName = typeof r.old_name === "string" ? r.old_name : "";
@@ -476,7 +571,7 @@ function validateItemFields(raw: unknown): { ok: true; item: ValidItem } | Inval
   return {
     ok: false,
     outcome: "invalid_item",
-    detail: "field must be description|about|product_name|products_organic_flag|specialties|certifications|tags",
+    detail: "field must be description|about|address|product_name|products_organic_flag|specialties|certifications|tags",
     agent_id: agentId,
   };
 }
@@ -537,7 +632,7 @@ function populatedFieldCount(p: Record<string, unknown>): number {
  */
 interface Plan {
   outcome: ItemOutcome;
-  column?: TextField | "products" | ListField;
+  column?: TextField | "address" | "products" | ListField;
   oldValue?: string | null;
   newValue?: string;
   oldPreview?: string | null;
@@ -684,6 +779,18 @@ function plan(
     return { ...base, outcome: "would_write", newValue: item.text };
   }
 
+  if (item.field === "address") {
+    const oldValue = cur.address;
+    const base: Plan = { outcome: "would_write", column, oldValue, oldPreview: oldValue, newPreview: item.text, viaOwnerConsent };
+    if (stop) return { ...base, outcome: stop.stop, detail: stop.detail, viaOwnerConsent: undefined };
+    if (isFieldCurated(cur.curated_fields, "address")) return { ...base, outcome: "skipped_curated" };
+    if ((oldValue ?? "") === item.text) return { ...base, outcome: "skipped_unchanged" };
+    if (!parseProvenanceObject(cur.field_provenance)) {
+      return { ...base, outcome: "skipped_malformed_json", detail: "stored field_provenance is not a JSON object" };
+    }
+    return { ...base, outcome: "would_write", newValue: item.text };
+  }
+
   const oldValue = (cur as unknown as Record<string, string | null>)[column] ?? null;
   const base: Plan = { outcome: "would_write", column, oldValue, viaOwnerConsent };
   if (stop) return { ...base, outcome: stop.stop, detail: stop.detail, viaOwnerConsent: undefined };
@@ -804,7 +911,25 @@ function applyCorrection(item: ValidItem, reason: string, batchTag: string): App
       const nowIso = new Date().toISOString();
       const col = p.column!;
       const newValue = p.newValue!;
-      if (col === "description") {
+      let provenanceNote = "";
+      if (item.field === "address") {
+        const record: Record<string, unknown> = {
+          value: newValue,
+          source_type: ADMIN_CORRECTION_SOURCE_TYPE,
+          fetched_at: nowIso,
+          ...(item.source_url ? { source_url: item.source_url } : {}),
+          reason: `${batchTag}: ${reason}`.slice(0, 500),
+        };
+        const fp = withAddressProvenanceRecord(cur!.field_provenance, record);
+        // plan() already refused a malformed value; re-checked on the fresh row.
+        if (fp === null) return { ...p, outcome: "skipped_malformed_json", detail: "stored field_provenance is not a JSON object", name: cur?.name };
+        if (cur!.has_knowledge_row) {
+          db.prepare(`UPDATE agent_knowledge SET address = ?, field_provenance = ?, updated_at = ? WHERE agent_id = ?`).run(newValue, fp, nowIso, item.agent_id);
+        } else {
+          db.prepare(`INSERT INTO agent_knowledge (agent_id, address, field_provenance, updated_at) VALUES (?, ?, ?, ?)`).run(item.agent_id, newValue, fp, nowIso);
+        }
+        provenanceNote = ` [field_provenance.address += ${JSON.stringify(record)}]`;
+      } else if (col === "description") {
         db.prepare(`UPDATE agents SET description = ? WHERE id = ?`).run(newValue, item.agent_id);
       } else if (col === "tags") {
         db.prepare(`UPDATE agents SET tags = ? WHERE id = ?`).run(newValue, item.agent_id);
@@ -827,6 +952,7 @@ function applyCorrection(item: ValidItem, reason: string, batchTag: string): App
         notes += ` [merge: kept ${p.merge.kept} ${JSON.stringify(p.merge.kept_product)}; dropped ${JSON.stringify(p.merge.dropped_product)}]`;
       }
       if (catalog) notes += ` [catalog: ${JSON.stringify(catalog)}]`;
+      notes += provenanceNote;
       db.prepare(
         `INSERT INTO agent_knowledge_audit
            (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
