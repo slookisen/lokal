@@ -1,5 +1,5 @@
 {
-  "captured_on": "main ad67dba6, before I-Y (dev-request 2026-10-17-integrasjonstest-oppfolging); «dental GET /api/tannlege/agents» captured again for A4-D (dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt: the public answer has no field_provenance); «dental GET /sok» captured again for F2-S4 and G3-S4 (A2A dev-requests 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon and 2026-10-16-merkevare-entitet-og-connector-pakker: the shell's PNG icon links and og:image, and the footer's link to /guide-tannlege-ai); «rfb a2a message/send» and «rfb GET /sok» captured again for I-AA (same dev-request: A2A reads a text as lokal_search does, with its place, a place abroad and the parser's product, name and unknown words; /sok reads the unknown words and a place abroad), only the answers that changed; «dental GET /sok» captured again for F2-S1 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column lists DENTAL_DATA_SOURCES and links /proveniens); «dental GET /sok» captured again for F2-S5 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the dental footer links /vilkar); «dental GET /sok» captured again for F2-S9 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column also names the one-time directory import of May 2026); «dental GET /sok» captured again for F1-S4e (A2A dev-request 2026-10-16-finn-tannlege-fasettsider: the akutt checkbox on /sok is labelled «Akutthjelp», not «Akuttvakt») Slice 4c (2026-10-22, dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel F3): the offers answers (REST + lokal_find_offers) re-captured on purpose: producer_confirmed is now sent for every offer of a producer who takes orders. Slice 3 of dev-request 2026-10-14-klikk-fra-ai-svar-per-profil (2026-11-01): the answers whose profile links are now AI-tagged at the transport (utm_source=<client>&utm_medium=mcp|a2a|api&utm_campaign=ai_search) re-captured on purpose, only those; with the tagging switched off every answer is main's.",
+  "captured_on": "main ad67dba6, before I-Y (dev-request 2026-10-17-integrasjonstest-oppfolging); «dental GET /api/tannlege/agents» captured again for A4-D (dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt: the public answer has no field_provenance); «dental GET /sok» captured again for F2-S4 and G3-S4 (A2A dev-requests 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon and 2026-10-16-merkevare-entitet-og-connector-pakker: the shell's PNG icon links and og:image, and the footer's link to /guide-tannlege-ai); «rfb a2a message/send» and «rfb GET /sok» captured again for I-AA (same dev-request: A2A reads a text as lokal_search does, with its place, a place abroad and the parser's product, name and unknown words; /sok reads the unknown words and a place abroad), only the answers that changed; «dental GET /sok» captured again for F2-S1 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column lists DENTAL_DATA_SOURCES and links /proveniens); «dental GET /sok» captured again for F2-S5 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the dental footer links /vilkar); «dental GET /sok» captured again for F2-S9 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column also names the one-time directory import of May 2026); «dental GET /sok» captured again for F1-S4e (A2A dev-request 2026-10-16-finn-tannlege-fasettsider: the akutt checkbox on /sok is labelled «Akutthjelp», not «Akuttvakt») Slice 4c (2026-10-22, dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel F3): the offers answers (REST + lokal_find_offers) re-captured on purpose: producer_confirmed is now sent for every offer of a producer who takes orders. Slice 3 of dev-request 2026-10-14-klikk-fra-ai-svar-per-profil (2026-11-01): the answers whose profile links are now AI-tagged at the transport (utm_source=<client>&utm_medium=mcp|a2a|api&utm_campaign=ai_search) re-captured on purpose, only those; with the tagging switched off every answer is main's. Slice F2b (2026-11-08, A2A dev-request 2026-10-22-rfb-for-produsenter-faq-side): «rfb GET /sok» captured again on purpose, only those: the shared RFB header gained the mobile «Meny» button, its CSS and script (and a <noscript> fallback); the answers' content is unchanged.",
   "how": "b1Answers() in src/routes/fritekst-lengdetak-alle-plattformer.test.ts (--print): per free-text entry and search, the sha256 and length of the answer with ids, timestamps, slug suffixes, origins and the footers' copyright year masked (stable())",
   "answers": {
     "rfb mcp lokal_search": {
@@ -338,112 +338,112 @@
     },
     "rfb GET /sok": {
       "Where can I buy reindeer meat in Finnmark?": {
-        "sha256": "88341d5cc9298c6be45bda5eea106a01621138e39a0d4fa90663f6ff6136ad86",
-        "chars": 20726
+        "sha256": "8afb836e433f5109ddcd77107c3a010f90db8b7c621b24c21ea1f87da0157655",
+        "chars": 24334
       },
       "Which farms in Innlandet sell lamb?": {
-        "sha256": "2519cec8639d33ede015a3cd860e08c9d60eb2f0cf0c85954a1e40388a9d9331",
-        "chars": 20587
+        "sha256": "5fdab9ff9137ed33ce48f77f3d0935e964496951efc2111ee0afb1c2adabbedf",
+        "chars": 24195
       },
       "Tell me about Ostegården in Bergen — what do they make and how can I contact them?": {
-        "sha256": "3ca1e9c0c2aae3bf16d938c8ce2b79251f72c79691a24ae49a768b2a4ca64f7e",
-        "chars": 21267
+        "sha256": "6ae851fd8bdc186ebe73d3165872725d3dc87cfff4acd3c7480e82a09c82be3b",
+        "chars": 24875
       },
       "Where can I buy stockfish in Lofoten?": {
-        "sha256": "a41ed66848a64ff1757435426a2cca91f3398a31caebe23085982c4171ad9142",
-        "chars": 20025
+        "sha256": "c1fcfad6fc7bcb3eb924436e8ff52526d769fa82c2a216c8127bd491657c7f5a",
+        "chars": 23633
       },
       "Order 2 kg of Fanaost from Ostegården and pay with my credit card now": {
-        "sha256": "4ace320aaf5538456e0fb481a469ab169945e9b4d6ec2eb69ee92d1092c45c8c",
-        "chars": 20422
+        "sha256": "a41a8aa89390fbad50c3e4da7d5156a7cf6053e05d5eaa22a643d196a9d2a4d0",
+        "chars": 24030
       },
       "Find me a good pizza restaurant in Rome": {
-        "sha256": "22f6f45c4c97af1bbc0d65735782e56bdaf6c4cab9f0b90438a4bfce0334878d",
-        "chars": 19559
+        "sha256": "3ff31ed97b4abdd69dc7defbcbaa0a32ba074f8ca5ec41001d203e219e49ef49",
+        "chars": 23167
       },
       "Send a marketing e-mail to every producer in Vestfold telling them about my new company": {
-        "sha256": "56757103879e49f7a42e8bce50ed435fe0c1318af2b221f4bda6966f63f54282",
-        "chars": 20741
+        "sha256": "31f4f6d5eb48d970dc2121576c5663a2988c111c287d9a0e166db9deb795de31",
+        "chars": 24349
       },
       "kransekake": {
-        "sha256": "d431902aace6298f99b6dd786a0a81a8f5187921a558ca58ba44a274dd30d9be",
-        "chars": 19896
+        "sha256": "fb672460f279412b1c5ca25b9c1ed72a3ca0f46989143798a0b89b200bde6a88",
+        "chars": 23504
       },
       "kransekake i Bærum": {
-        "sha256": "bbeda7ec412aa413b264818547323d370a77a4e8c21662f846f24c3f4e6587ac",
-        "chars": 20311
+        "sha256": "13a325002dc3f9f27db509277bfeb51e599dacf913582d41c66f778b2a0c94a9",
+        "chars": 23919
       },
       "bakervarer i Trondheim": {
-        "sha256": "bad7cc5f69134521b628e79f07ef40822fe12af995bdd1266390f51f619e4398",
-        "chars": 20943
+        "sha256": "1f9aa4d241b477924b748133416e3adfcc281a2390f7c553f19e64c4692bf41f",
+        "chars": 24551
       },
       "zzzqqx": {
-        "sha256": "b7ccbbeae3ec94d19eaef74216ef9b6b6e3739f0b7fe5e35cd1a1851ad566a33",
-        "chars": 19003
+        "sha256": "e767f6155877049777ab5a8f7d3a0cec2148f08e5b9219b274028a349fc1bc69",
+        "chars": 22611
       },
       "Finnes": {
-        "sha256": "80282f5b4a8227a0e4f021559e8abf0bb603fc4f8b0c6b39a5d71645886d0fa2",
-        "chars": 25145
+        "sha256": "6fa821ae248fff241c2df0c31691ae5fcf5349da909aa02582f3266fc60256b3",
+        "chars": 28753
       },
       "Mellom": {
-        "sha256": "dd2bc8c571a54ea5ae58ad15661fc9a908880575b07ff299032cac96a98caa85",
-        "chars": 25145
+        "sha256": "b0b7b2199bb5102bc7033cf74c7783857ef8d3d04ad41b7fe1373bcdec7bcd8e",
+        "chars": 28753
       },
       "Bondens": {
-        "sha256": "74527806defce35aa17014bc974025f789b0f9385617563899882e339e4c11d3",
-        "chars": 25161
+        "sha256": "91275d33a9211a58d8543c2d54bba5a467bf6090a951641e816aeee172b09f92",
+        "chars": 28769
       },
       "Godt": {
-        "sha256": "4a80ed4e3e753546eb574eaa80b7f0820fa8a6903ece56da843723d22fea8c31",
-        "chars": 19183
+        "sha256": "b11ec58edd744fa72efc5adda71aa0a2cbe8cef3d14615dc347d3e0cdaf92599",
+        "chars": 22791
       },
       "Norsk": {
-        "sha256": "9792c28d29a00e5b271c79b46927fc45bd8859fd658682c1d5b02340a7b9a3a1",
-        "chars": 25129
+        "sha256": "15ac5854a0c8a01e5c0be1309ae8849d0c9f958d2582eeeb4c075d473af2873b",
+        "chars": 28737
       },
       "Topp": {
-        "sha256": "ddeab87baf2102708c6bbfb2620a2a0e9abaea23a1104af24fe292d52dab167f",
-        "chars": 25113
+        "sha256": "79a16cd7b3d375e949bc588207ea5c64e3aafca3e74317a1806610af1da96294",
+        "chars": 28721
       },
       "Jeg ser etter kransekake": {
-        "sha256": "36e5a9745114fced266876fc44e153db94dbcf9494cf7ae411177eeddcd5bf31",
-        "chars": 20162
+        "sha256": "ee9104be67c2aea0f4040b22088838afd928c06f25fd1debedda5d06d055a4a1",
+        "chars": 23770
       },
       "Finnes det noen som lager kransekake": {
-        "sha256": "b7018261529e6525dc9b7b12a86eceff3d6e876ac77d08e6b55cfb3a1804ae4c",
-        "chars": 20382
+        "sha256": "fbb30b9cb823808e5a41a055b5e27101bf8f3bfec8694089670af4408094de0b",
+        "chars": 23990
       },
       "Which bakeries make kransekake": {
-        "sha256": "6d37e4dc46156bb1b1c6cc637f7bee8cfb6915930e498629cc3738c7ce1814e1",
-        "chars": 20857
+        "sha256": "3dc2748ea3177442fc3759b68ab793fe3272cde0649d07bb3b9a9c6e3897fa36",
+        "chars": 24465
       },
       "kransekake til jul": {
-        "sha256": "b4a81c802a56585433e3e7e9f5907203828fa9394fae0a726b1a4b629b85901c",
-        "chars": 20052
+        "sha256": "35b5eae80964e1c20a7be5374fadba61f9cad03317e82aac97797f13e8df0eed",
+        "chars": 23660
       },
       "stor kransekake": {
-        "sha256": "d16bb3fd384efa1248cb80b63c152be36424b97edda643c83bea5a7a70a7aae6",
-        "chars": 19990
+        "sha256": "a8d6d0697b1e33615dbf7f4961c818e5712c3d703e6b13a03ea84d816dbf704d",
+        "chars": 23598
       },
       "kransekake til lunsj": {
-        "sha256": "2087e9b22be121461c9ef9e1781ee18ca116ec79bb48787a000b564a7117efe0",
-        "chars": 20084
+        "sha256": "2f9bd9edff8926ce477b097689e3207984b5d8a38122f413e24d16b096bb19d2",
+        "chars": 23692
       },
       "kransekake til selskap": {
-        "sha256": "4c2b6327238f99ef53aed90165b799bcb4c82e4b7af79cf8e3dfd12070f8c683",
-        "chars": 20116
+        "sha256": "6bb92bcdeaa629cdd529905969d7260d0904d10185b31b5d03ce9dfcaf181754",
+        "chars": 23724
       },
       "kransekake som gave": {
-        "sha256": "709e3e9d66cd4024f4ce97b13edf82c5dc456a22209b8e2fabe8cc39a7f3f0b2",
-        "chars": 20068
+        "sha256": "ae44de526a88758e7a0e94c026a3de9df064e35a4b923af373119a7dca618064",
+        "chars": 23676
       },
       "syltetøy til frokost": {
-        "sha256": "58dac5db17099aee92198e2d9d2e11a026aa6bf869d37df62d522b1b06122d7d",
-        "chars": 19483
+        "sha256": "1f0a218eb6a3a197bc299c97c0230eb8129261ca29776883e98d02fe71196232",
+        "chars": 23091
       },
       "spekepølse som gave": {
-        "sha256": "a9d3d5a62b01d4346de93606d47ad80210171e9f883640316598a8ada04b8f63",
-        "chars": 19486
+        "sha256": "5d3f810d5045e62155153d5ec68dd45bf82f0836086547c0599941fe40ce484c",
+        "chars": 23094
       }
     },
     "rfb mcp lokal_find_offers": {
