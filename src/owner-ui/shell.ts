@@ -28,6 +28,12 @@
 // #bestillbare-varer card, Mer → Profil (#profil on the portal), Statistikk
 // (the /selger Statistikk tab), the public profile and «Logg ut». The own
 // pages (/varer, /statistikk, /mer …) come in T15c, T15d and T16.
+//
+// T15b: Ordrer and Varer carry a count badge when something waits (orders
+// waiting for an answer, items that should be confirmed) — the numbers come
+// from ownerActionCounts() (owner-ui/overview-data.ts), the same read as the
+// «Dette bør du gjøre nå» block on Oversikt. The number is aria-hidden; a
+// visually hidden text says it in words («, 2 venter på svar»).
 
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
 
@@ -70,6 +76,10 @@ export const OWNER_SHELL_TEXTS = {
   stats: "Statistikk",
   publicProfile: "Se profilen din",
   logout: "Logg ut",
+  /** T15b: screen-reader text after the Ordrer badge ({n} ≥ 1). */
+  ordersBadge: ", {n} venter på svar",
+  /** T15b: screen-reader text after the Varer badge ({n} ≥ 1). */
+  itemsBadge: ", {n} bør bekreftes",
 } as const;
 
 /** The id of the page's <main>, the skip link's target. */
@@ -81,12 +91,26 @@ export const OWNER_SHELL_ITEMS_ANCHOR = "bestillbare-varer";
 
 export type OwnerShellSection = "oversikt" | "ordrer" | "valg";
 
+/**
+ * T15b: what waits for the owner — read once per page by ownerActionCounts()
+ * (owner-ui/overview-data.ts) and shown both as the menu badges and in
+ * «Dette bør du gjøre nå», so the two can never differ.
+ */
+export interface OwnerActionCounts {
+  /** Orders waiting for an answer (orders.status = 'pending'). */
+  pendingOrders: number;
+  /** «Varer» rows in «Trenger handling» (the T13 card's confirm-needed rows). */
+  itemsToConfirm: number;
+}
+
 export interface OwnerShellOptions {
   agentId: string;
   /** The page the shell is around (its menu item gets aria-current="page"). */
   current: OwnerShellSection;
   /** The public profile's slug (/produsent/<slug>); empty = no link. */
   profileSlug?: string;
+  /** T15b: the badge numbers (absent or 0 = no badge). */
+  counts?: OwnerActionCounts;
 }
 
 /** «Statistikk»: the Statistikk tab in /selger (selger.html opens it on #statistikk). */
@@ -147,6 +171,8 @@ export const OWNER_SHELL_CSS = `
   .ow-more-item { box-sizing: border-box; display: flex; align-items: center; width: 100%; min-height: 44px; padding: 10px 12px; border: 0; border-radius: 8px; background: none; color: var(--ow-accent); font: inherit; font-weight: 600; text-align: left; text-decoration: none; cursor: pointer; }
   .ow-more-item:hover { background: var(--ow-btn-secondary-hover); }
   .ow-more-form { margin: 0; }
+  .ow-sr { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+  .ow-nav-badge { display: inline-flex; align-items: center; justify-content: center; box-sizing: border-box; min-width: 1.5em; height: 1.5em; padding: 0 5px; border-radius: 999px; background: var(--ow-btn-primary-bg); color: var(--ow-btn-primary-text); font-size: 0.75rem; font-weight: 700; line-height: 1; }
   @media (max-width: 899.98px) {
     body { padding-bottom: calc(60px + env(safe-area-inset-bottom, 0px)); }
     .ow-nav { left: 0; right: 0; bottom: 0; border-top-width: 1px; padding: 0 4px env(safe-area-inset-bottom, 0px); }
@@ -176,6 +202,12 @@ export function renderOwnerShellStart(opts: OwnerShellOptions): string {
   const T = OWNER_SHELL_TEXTS;
   const L = ownerShellLinks(opts.agentId, opts.profileSlug ?? "");
   const cur = (s: OwnerShellSection) => (opts.current === s ? ` aria-current="page"` : "");
+  const badge = (n: number | undefined, sr: string) => {
+    const k = Number.isFinite(n) ? Math.floor(n as number) : 0;
+    return k >= 1
+      ? `<span class="ow-nav-badge" aria-hidden="true">${k}</span><span class="ow-sr">${esc(sr.replace("{n}", String(k)))}</span>`
+      : "";
+  };
   const item = (href: string, inner: string, section: OwnerShellSection | null) =>
     `<li><a class="ow-nav-item" href="${esc(href)}"${section ? cur(section) : ""}>${inner}</a></li>`;
   const more = [
@@ -190,8 +222,8 @@ export function renderOwnerShellStart(opts: OwnerShellOptions): string {
     <p class="ow-nav-title">${esc(T.nav)}</p>
     <ul class="ow-nav-list">
       ${item(L.oversikt, esc(T.overview), "oversikt")}
-      ${item(L.ordrer, `<span class="ow-nav-short">${esc(T.ordersShort)}</span><span class="ow-nav-long">${esc(T.orders)}</span>`, "ordrer")}
-      ${item(L.varer, esc(T.items), null)}
+      ${item(L.ordrer, `<span class="ow-nav-short">${esc(T.ordersShort)}</span><span class="ow-nav-long">${esc(T.orders)}</span>${badge(opts.counts?.pendingOrders, T.ordersBadge)}`, "ordrer")}
+      ${item(L.varer, `${esc(T.items)}${badge(opts.counts?.itemsToConfirm, T.itemsBadge)}`, null)}
       ${item(L.valg, esc(T.features), "valg")}
       <li><details class="ow-more"><summary>${esc(T.more)}</summary><ul class="ow-more-list">${more}</ul></details></li>
     </ul>

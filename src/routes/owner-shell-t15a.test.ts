@@ -24,6 +24,11 @@
  *               it above the bottom menu below 900 px.
  *   buyer       the buyer's order card (ordersShell) is unchanged.
  *
+ * T15b adds the menu badges, the «Oversikt» block on the portal and moves the
+ * «Nyheter og tips» question from Mine valg to Oversikt (flag on); the
+ * «nothing else changed» checks below take those T15b parts out as well (they
+ * are tested in owner-overview-t15b.test.ts).
+ *
  * Real routers on the production schema in an in-memory DB; handlers pulled
  * off the router stack (same harness as owner-ui-tokens-t6). Exported
  * runOwnerShellT15aTests({log}) -> TestSummary; wired into tests/test.ts.
@@ -320,6 +325,12 @@ export async function runOwnerShellT15aTests(opts: { log?: boolean } = {}): Prom
     assertTrue(PAGES.every((p) => !on[`${p}:other`].html.includes("ow-nav")), "gate: no shell on the 403 pages");
 
     // Flag on, allowlisted verified owner: the shell.
+    const ov = require("../owner-ui/overview-data") as typeof import("../owner-ui/overview-data");
+    const counts = ov.ownerActionCounts(db, ON_ID);
+    /** T15b parts taken out: the menu badges' markup is in shellStart; the «Oversikt» block; the news question (moved off Mine valg). */
+    const noBadges = (h: string) => h.replace(/<span class="ow-nav-badge"[^>]*>[^<]*<\/span><span class="ow-sr">[^<]*<\/span>/g, "");
+    const noOverview = (h: string) => h.replace(/\n      <style>\n  \.ow-ov-badges[\s\S]*?data-ov="help">[\s\S]*?<\/p>/, "");
+    const noNewsQuestion = (h: string) => h.replace(/<div class="mv-question" data-news-question="1"[\s\S]*?<\/form>\n        <\/div>/, "");
     for (const p of PAGES) {
       const r = on[`${p}:${ON_ID}`];
       const h = r.html;
@@ -329,7 +340,7 @@ export async function runOwnerShellT15aTests(opts: { log?: boolean } = {}): Prom
       assertEq(count(h, `aria-label="Eierportal"`), 1, `on: ${p} has no second «Eierportal» landmark`);
       const nav = shellNav(h);
       assertEq(count(nav, `aria-current="page"`), 1, `on: ${p} nav has exactly one aria-current="page"`);
-      const curTag = /<a class="ow-nav-item" href="([^"]*)" aria-current="page">([\s\S]*?)<\/a>/.exec(nav);
+      const curTag = /<a class="ow-nav-item" href="([^"]*)" aria-current="page">([\s\S]*?)<\/a>/.exec(noBadges(nav));
       assertEq(curTag ? [curTag[1], curTag[2].replace(/<[^>]+>/g, " ")] : null,
         [c.href, p === "orders" ? " Ordrer  Mine ordrer " : c.label], `on: ${p} aria-current points to «${c.label}»`);
       assertEq(firstFocusable(h), `<a class="ow-skip" href="#innhold">`, `on: ${p} «Hopp til innholdet» is the first focusable element`);
@@ -344,14 +355,15 @@ export async function runOwnerShellT15aTests(opts: { log?: boolean } = {}): Prom
       assertTrue(h.includes("--ow-page-bg") && h.includes("@media (prefers-color-scheme: dark)"), `on: ${p} carries the T6 tokens (light + dark)`);
       assertTrue(h.includes(`<style>${sh.OWNER_SHELL_CSS}</style>`), `on: ${p} carries the shell CSS`);
       // Nothing else changed: with the shell taken out the page is the flag-off page.
-      const shellStart = sh.renderOwnerShellStart({ agentId: ON_ID, current: c.section as any, profileSlug: `skallgard-${ON_ID}` });
+      const shellStart = sh.renderOwnerShellStart({ agentId: ON_ID, current: c.section as any, profileSlug: `skallgard-${ON_ID}`, counts });
       assertTrue(h.includes(shellStart), `on: ${p} shell markup is renderOwnerShellStart (with the public profile link)`);
       let stripped = h.replace(p === "orders" ? `${shellStart}\n` : `\n  ${shellStart}`, "");
       stripped = p === "orders"
         ? stripped.replace(`<main class="mo-wrap" id="innhold" tabindex="-1">`, `<main class="mo-wrap">`)
         : stripped.replace(sh.OWNER_SHELL_MAIN_OPEN, "").replace(/<\/main>(\s*<\/div>\s*<\/body>)/, "$1");
-      if (p === "portal") stripped = stripped.replace(`<div class="ep-card" id="profil">`, `<div class="ep-card">`);
-      assertEq(stripped, before[`${p}:${ON_ID}`].html, `on: ${p} without the shell markup is byte-identical to the flag-off page`);
+      if (p === "portal") stripped = noOverview(stripped).replace(`<div class="ep-card" id="profil">`, `<div class="ep-card">`);
+      const want = p === "valg" ? noNewsQuestion(before[`${p}:${ON_ID}`].html) : before[`${p}:${ON_ID}`].html;
+      assertEq(stripped, want, `on: ${p} without the shell markup (and the T15b parts) is byte-identical to the flag-off page`);
     }
 
     // Old anchors and the Stripe return: still on the same page.
@@ -359,7 +371,8 @@ export async function runOwnerShellT15aTests(opts: { log?: boolean } = {}): Prom
     const portalOnAll = portalOn + on[`orders:${ON_ID}`].html + on[`valg:${ON_ID}`].html;
     const idsOf = (h: string) => new Set([...h.matchAll(/\sid="([^"]+)"/g)].map((m) => m[1]));
     for (const p of PAGES) {
-      const lost = [...idsOf(before[`${p}:${ON_ID}`].html)].filter((id) => !idsOf(on[`${p}:${ON_ID}`].html).has(id));
+      // T15b: the news question (its heading id mv-h-intro) moves from Mine valg to Oversikt.
+      const lost = [...idsOf(before[`${p}:${ON_ID}`].html)].filter((id) => !idsOf(on[`${p}:${ON_ID}`].html).has(id) && !(p === "valg" && id === "mv-h-intro"));
       assertEq(lost, [], `anchors: every id on ${p} without the shell is still there with it`);
     }
     for (const a of OLD_ANCHORS) {
@@ -373,8 +386,8 @@ export async function runOwnerShellT15aTests(opts: { log?: boolean } = {}): Prom
     const stripe = on["portal:stripe"];
     assertTrue(stripe.status === 200 && stripe.html.includes(`id="forhandsbetaling"`) && stripe.html.includes("Vi venter på bekreftelse fra Stripe") && stripe.html.includes("ow-nav"),
       "anchors: the Stripe return /portal?status=payments_return#forhandsbetaling lands on the portal's card, in the shell");
-    const stripeStripped = stripe.html.replace(`\n  ${sh.renderOwnerShellStart({ agentId: ON_ID, current: "oversikt", profileSlug: `skallgard-${ON_ID}` })}`, "")
-      .replace(sh.OWNER_SHELL_MAIN_OPEN, "").replace(/<\/main>(\s*<\/div>\s*<\/body>)/, "$1").replace(`<div class="ep-card" id="profil">`, `<div class="ep-card">`);
+    const stripeStripped = noOverview(stripe.html.replace(`\n  ${sh.renderOwnerShellStart({ agentId: ON_ID, current: "oversikt", profileSlug: `skallgard-${ON_ID}`, counts })}`, "")
+      .replace(sh.OWNER_SHELL_MAIN_OPEN, "")).replace(/<\/main>(\s*<\/div>\s*<\/body>)/, "$1").replace(`<div class="ep-card" id="profil">`, `<div class="ep-card">`);
     assertEq(stripeStripped, before["portal:stripe"].html, "anchors: the Stripe return page is the flag-off page plus the shell");
 
     // Mine valg: the T9 status line and script are still there, inside the page.

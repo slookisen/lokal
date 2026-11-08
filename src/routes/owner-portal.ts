@@ -32,6 +32,8 @@ import {
 import { resolveOwnerFeature, setOwnerFeatureValue } from "../owner-features/resolve";
 import { OWNER_PORTAL_THEME_CSS, ownerThemeHtml } from "../owner-ui/tokens";
 import { OWNER_SHELL_MAIN_OPEN, OWNER_SHELL_PROFILE_ANCHOR, ownerDashboardActiveFor, renderOwnerShellStart } from "../owner-ui/shell";
+import { OWNER_OVERVIEW_NEWS_PARAM, parseOwnerOverviewNewsParam, renderOwnerOverview } from "../owner-ui/overview";
+import { buildOwnerOverviewModel, countPendingOrders, ownerActionCounts } from "../owner-ui/overview-data";
 import { ownerPauseEnabled, isOwnerPaused, readOwnerPauseRow } from "../services/agent-visibility";
 import { isBlocked, normalizeEmail } from "../services/blocklist-service";
 import { rateLimit } from "express-rate-limit";
@@ -2216,11 +2218,8 @@ function renderOwnerPortalPage(req: Request, res: Response, addForm: OwnerItemsA
     const ordersOrMovedCardHtml = hasOwnerFeatures ? ownerFeaturesMovedCardHtml(agentId) : ordersCardHtml(agent, orderEmailHtml);
 
     // Fase A2: number of orders waiting for an answer (tolerant: a DB without orders shows 0).
-    let pendingOrderCount = 0;
-    try {
-      const pc = db.prepare("SELECT COUNT(*) AS n FROM orders WHERE agent_id = ? AND status = 'pending'").get(agentId) as any;
-      pendingOrderCount = Number(pc?.n) || 0;
-    } catch { pendingOrderCount = 0; }
+    // T15b: the same read as the menu badge and «Dette bør du gjøre nå» (owner-ui/overview-data.ts).
+    const pendingOrderCount = countPendingOrders(db, agentId);
 
     // Editable fields with display labels (Norwegian Bokmål). The labels live
     // in owner-audit-log.ts, so «Endringslogg» names the fields the same way.
@@ -2303,6 +2302,21 @@ function renderOwnerPortalPage(req: Request, res: Response, addForm: OwnerItemsA
     // verified owner (hasOwnerFeatures); off = the portal is byte-identical.
     const dashboard = hasOwnerFeatures && ownerDashboardActiveFor("rfb", agentId, true);
     const backUrl = slug ? `/produsent/${encodeURIComponent(slug)}` : "/";
+    // T15b: the «Oversikt» block under the <h1> card and the menu badges —
+    // one ownerActionCounts() read for both; off = "" (byte-identical).
+    const actionCounts = dashboard ? ownerActionCounts(db, agentId) : null;
+    let overviewHtml = "";
+    if (dashboard && actionCounts) {
+      try {
+        overviewHtml = renderOwnerOverview(buildOwnerOverviewModel({
+          agentId, profileSlug: slug, counts: actionCounts, year: ownerYear, db,
+          newsResult: parseOwnerOverviewNewsParam(req.query[OWNER_OVERVIEW_NEWS_PARAM]),
+        }));
+      } catch (e) {
+        console.error("[owner-portal] overview block failed:", e instanceof Error ? e.message : "error");
+        overviewHtml = "";
+      }
+    }
 
     const body = `
       <div class="ep-card">
@@ -2314,7 +2328,7 @@ function renderOwnerPortalPage(req: Request, res: Response, addForm: OwnerItemsA
         </div>
         <p>Rediger profilinformasjonen din. Endringer logges og er synlige for support.</p>
         ${alert}
-      </div>
+      </div>${overviewHtml}
 
       <div class="ep-card"${dashboard ? ` id="${OWNER_SHELL_PROFILE_ANCHOR}"` : ""}>
         <h2>Profilinformasjon</h2>
@@ -2420,7 +2434,7 @@ function renderOwnerPortalPage(req: Request, res: Response, addForm: OwnerItemsA
     const pageBody = ownerTheme ? `<style>${OWNER_PORTAL_THEME_CSS}</style>${ownerThemeHtml(body)}` : body;
 
     return res.send(portalShell(`Eierportal · ${agent.name}`, pageBody,
-      dashboard ? { ownerShellHtml: renderOwnerShellStart({ agentId, current: "oversikt", profileSlug: slug }) } : {}));
+      dashboard ? { ownerShellHtml: renderOwnerShellStart({ agentId, current: "oversikt", profileSlug: slug, counts: actionCounts ?? undefined }) } : {}));
   } catch (err) {
     console.error("[owner-portal] GET /eier/:agentId/portal error:", err);
     return res.status(500).send(portalShell(

@@ -521,7 +521,8 @@ export async function runOwnerFeaturesT7Tests(opts: { log?: boolean } = {}): Pro
         const t = read(f);
         return /nyheter og tips/i.test(t) || t.includes("/valg/intro") || t.includes("OWNER_NEWS_CONSENT") || t.includes(nc.OWNER_NEWS_CONSENT_TEXT.question);
       }).map(rel).sort();
-      const allowed = ["owner-features/changes.ts", "owner-features/news-consent.ts", "owner-features/page.ts", "owner-features/registry.ts", "routes/owner-features.ts"];
+      // T15b: the same question on «Oversikt» (owner-ui/overview.ts, posting to the same route).
+      const allowed = ["owner-features/changes.ts", "owner-features/news-consent.ts", "owner-features/page.ts", "owner-features/registry.ts", "owner-ui/overview.ts", "routes/owner-features.ts"];
       assertTrue(mentions.every((f) => allowed.includes(f)), `e-mail: the news question lives only in the page/route/registry (${mentions.join(", ")})`);
       const mailers = files.filter((f) => /email-service|sendRaw\(|sendMail\(|nodemailer|resend/i.test(read(f)));
       const asking = mailers.filter((f) => {

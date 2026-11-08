@@ -34,12 +34,14 @@ import {
   type OwnerNewsAnswer,
 } from "../owner-features/changes";
 import {
-  OWNER_NEWS_ANSWER_TEXT, OWNER_NEWS_CONSENT_VERSION, OWNER_NEWS_PLACEMENTS, OWNER_NEWS_PLACEMENT_QUESTION, OWNER_NEWS_PLACEMENT_ROW,
+  OWNER_NEWS_ANSWER_TEXT, OWNER_NEWS_CONSENT_VERSION, OWNER_NEWS_PLACEMENTS, OWNER_NEWS_PLACEMENT_OVERVIEW, OWNER_NEWS_PLACEMENT_QUESTION, OWNER_NEWS_PLACEMENT_ROW,
   type OwnerNewsPlacement,
 } from "../owner-features/news-consent";
 import { formatOwnerFeatureValue, ownerPageStatsFrom, renderOwnerFeaturesPageBody, renderOwnerFeaturesPageFragment, type OwnerPageModel, type OwnerPageNotice, type OwnerPageStats } from "../owner-features/page";
 import { OWNER_FRAGMENT_HEADER } from "../owner-ui/enhance";
 import { ownerDashboardActiveFor, ownerShellStatsHref, renderOwnerShellStart } from "../owner-ui/shell";
+import { ownerOverviewNewsBack, type OwnerOverviewNewsResult } from "../owner-ui/overview";
+import { ownerActionCounts } from "../owner-ui/overview-data";
 import {
   OWNER_ANCHOR_FALLBACK, OWNER_ANCHOR_LEVEL, OWNER_ANCHOR_LEVEL_PREVIEW, OWNER_ANCHOR_NEWS_QUESTION, OWNER_ANCHOR_PLANNED,
   isOwnerPageAnchor, ownerBatchAnchor, ownerPageTail, ownerPlannedAnchor, ownerRowAnchor, ownerUndoAnchor,
@@ -512,6 +514,9 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
     // T7: the «Nyheter og tips» question (top of #gruppe-comms) and the row's
     // «Du sa ja/nei {dato}» — read only, a GET writes nothing.
     const news = readOwnerNewsState(VERTICAL, agentId, resolved, { db });
+    // T15a/T15b: the shared owner shell — flag + allowlist (pageGate) + verified owner (pageGate).
+    // With it on, the news question stands on «Oversikt» (the portal), not here.
+    const dashboard = ownerDashboardActiveFor(VERTICAL, agentId, true);
     let orderable: { count: number; itemsHref: string } | null = null;
     try { orderable = { count: countOwnerOrderableItems(agentId, db), itemsHref: itemsHref(agentId) }; } catch (e) {
       console.error("[owner-features] orderable count failed:", e);
@@ -531,7 +536,7 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
       level: currentOwnerLevel(VERTICAL, agentId, resolved),
       // T8: who chose — read only (the status line's «Du valgte …»).
       levelChoice: readOwnerLevelChoiceFor(VERTICAL, agentId, { db }),
-      showIntro: news.showQuestion,
+      showIntro: news.showQuestion && !dashboard,
       newsAnswer: news.answer,
       notice,
       noticeAt,
@@ -567,9 +572,9 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
       res.setHeader("Content-Type", "text/html; charset=utf-8");
       return res.send(html);
     }
-    // T15a: the shared owner shell — flag + allowlist (pageGate) + verified owner (pageGate); off = as before.
-    const shellHtml = ownerDashboardActiveFor(VERTICAL, agentId, true)
-      ? renderOwnerShellStart({ agentId, current: "valg", profileSlug: slugify(String(agent.name || "")) })
+    // T15a: the shared owner shell; off = as before. T15b: with the menu badges.
+    const shellHtml = dashboard
+      ? renderOwnerShellStart({ agentId, current: "valg", profileSlug: slugify(String(agent.name || "")), counts: ownerActionCounts(db, agentId) })
       : null;
     return res.send(portalShell(`Mine valg · ${agent.name}`, renderOwnerFeaturesPageBody(model), shellHtml ? { ownerShellHtml: shellHtml } : {}));
   } catch (e: any) {
@@ -708,25 +713,38 @@ function newsAnswerOf(raw: unknown): OwnerNewsAnswer | null {
 router.post("/eier/:agentId/valg/intro", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
   // T5/T7: the question stands in #gruppe-comms; «Ja takk» lands on its row (#valg-comms.news).
   const anchor = OWNER_ANCHOR_NEWS_QUESTION;
+  const rawBody = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
+  // T15b: an answer from «Oversikt» (placement oversikt_question) goes back
+  // to the portal's news block; every other answer as before.
+  const fromOverview = rawBody.placement === OWNER_NEWS_PLACEMENT_OVERVIEW;
+  const overviewBack = (r: OwnerOverviewNewsResult) => {
+    res.redirect(303, ownerOverviewNewsBack(String(req.params.agentId || ""), r));
+    return res;
+  };
   try {
     const g = pageGate(req);
     if (!g.ok) return g.send(res);
+    if (fromOverview && isCrossSiteWrite(req)) {
+      return res.status(403).send(portalWriteRefusedPage(`/eier/${encodeURIComponent(g.agentId)}/portal`));
+    }
     const guard = pageWriteGuard(req, g.token, anchor);
-    if (guard) return guard(res);
+    if (guard) return fromOverview ? overviewBack("error") : guard(res);
     const agentId = g.agentId;
-    const body = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
+    const body = rawBody;
     const answer = newsAnswerOf(body.answer);
-    if (!answer) return backTo(res, agentId, "melding=ugyldig", anchor);
+    if (!answer) return fromOverview ? overviewBack("error") : backTo(res, agentId, "melding=ugyldig", anchor);
     const placement: OwnerNewsPlacement = (OWNER_NEWS_PLACEMENTS as readonly string[]).includes(String(body.placement))
       ? (body.placement as OwnerNewsPlacement)
       : OWNER_NEWS_PLACEMENT_QUESTION;
     const out = answerOwnerNewsQuestion(VERTICAL, agentId, answer, { actor: "owner", detail: sessionEmail(g.token) }, { placement });
-    if (out.kind !== "ok") return backTo(res, agentId, "melding=ingen_endring", anchor);
+    if (out.kind !== "ok") return fromOverview ? overviewBack("error") : backTo(res, agentId, "melding=ingen_endring", anchor);
     console.log(`[owner-features] owner answered the news question (${answer}) for agent ${agentId}`);
+    if (fromOverview) return overviewBack(answer);
     if (out.batchId) return backTo(res, agentId, `endret=${out.batchId}&melding=intro_ja`, anchor, { place: false });
     return backTo(res, agentId, `melding=${answer === "yes" ? "intro_ja" : answer === "later" ? "intro_ikke_na" : "intro_nei"}`, anchor);
   } catch (e: any) {
     console.error("[owner-features] POST valg/intro failed:", e);
+    if (fromOverview) return overviewBack("error");
     return backTo(res, String(req.params.agentId || ""), "melding=feil", anchor);
   }
 });
