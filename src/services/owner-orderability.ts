@@ -35,6 +35,7 @@
 import crypto from "crypto";
 import { getDb } from "../database/init";
 import {
+  isProducerStatedSource,
   orderabilityReasons,
   producerOrderability,
   type OrderabilityReason,
@@ -160,14 +161,21 @@ export function confirmOwnerProductInStock(
   return out;
 }
 
-/** «Bekreft alle på lager»: every confirmable row of this producer, in one transaction. */
+/**
+ * «Bekreft alle på lager»: every confirmable row of this producer, in one transaction.
+ * T13 V1a: with `ids` («Bekreft alle ({n})» in the «Varer» card) only those
+ * ids, and of them only this producer's producer-stated rows — an id of
+ * another producer, or a scraped row sent along, is left untouched (a scraped
+ * row keeps its source); the B1 confirmable rule still applies.
+ */
 export function confirmAllOwnerProductsInStock(
   agentId: string,
-  opts: { db?: any; actorEmail?: string | null; now?: Date } = {},
+  opts: { db?: any; actorEmail?: string | null; now?: Date; ids?: readonly string[] } = {},
 ): { ok: true; confirmed: number; skipped_missing_price: number } {
   const db = opts.db ?? getDb();
   const now = opts.now ?? new Date();
-  const all = readRows(db, agentId);
+  const wanted = opts.ids ? new Set(opts.ids) : null;
+  const all = readRows(db, agentId).filter((r) => !wanted || (wanted.has(r.id) && isProducerStatedSource(r.availability_source)));
   // Unpriced rows a confirmation could otherwise fix: counted for the owner's message.
   const skipped_missing_price = all.filter((r) => r.price_nok == null
     && !orderabilityReasons(db, r, now, { eligible: true, reasons: [] }).reasons.some((x) => NOT_CONFIRMABLE.has(x.code))).length;
@@ -178,7 +186,8 @@ export function confirmAllOwnerProductsInStock(
       if (setProducerAvailabilityByProductId(agentId, r.id, "in_stock", db).success) confirmed++;
     }
     if (confirmed > 0) {
-      auditOwnerProductChange(db, agentId, "products.availability", null, "in_stock", opts.actorEmail ?? null, `owner confirmed all in stock: ${confirmed} item(s) (B1)`);
+      auditOwnerProductChange(db, agentId, "products.availability", null, "in_stock", opts.actorEmail ?? null,
+        wanted ? `owner confirmed ${confirmed} listed item(s) in stock (T13)` : `owner confirmed all in stock: ${confirmed} item(s) (B1)`);
     }
   })();
   return { ok: true, confirmed, skipped_missing_price };
