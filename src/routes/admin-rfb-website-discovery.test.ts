@@ -2936,6 +2936,154 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
         "tb-d6: response-level flag stays false -- nothing was actually cut short by the budget anywhere in this batch",
       );
 
+      // ── (tb-e..tb-g) S5b (2026-11-08): an attempt already IN FLIGHT when
+      // the budget runs out is abandoned (raced against the remaining
+      // budget) — the route answers at the budget, the target lands in
+      // skipped_due_to_time_budget, and the late-resolving attempt writes
+      // and proposes nothing. The clock reads "100 ms of budget left" right
+      // after the run starts and then follows real time, so the race timer
+      // is ~100 ms real; each slow stub resolves (with VERIFYING evidence)
+      // only after 400 ms.
+      const SLOW_MS = 400;
+      const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+      function nearlySpentClock(): () => number {
+        const base = 9_000_000;
+        const realStart = Date.now();
+        let first = true;
+        return () => {
+          if (first) {
+            first = false;
+            return base;
+          }
+          return base + RFB_WD_TIME_BUDGET_MS - 100 + (Date.now() - realStart);
+        };
+      }
+      function slowVerifyingResponse(host: string, body: string): Response {
+        return {
+          ok: true,
+          status: 200,
+          url: `https://${host}`,
+          headers: { get: (name: string) => (name.toLowerCase() === "content-type" ? "text/html; charset=utf-8" : null) },
+          arrayBuffer: async () => {
+            await sleep(SLOW_MS);
+            return new TextEncoder().encode(`<html><body>${body}<!-- selfref:${host} --></body></html>`).buffer;
+          },
+        } as unknown as Response;
+      }
+
+      // (tb-e) tier-1 host attempt in flight at the budget.
+      insertAgent({ id: "wd-tb-e1", name: "Treig Tidsgard AS", orgNr: "977200031", city: "Hamar" });
+      insertAgent({ id: "wd-tb-e2", name: "Neste Tidsgard AS", orgNr: "977200032", city: "Hamar" });
+      const tbeHosts = gardssalgWebsiteCandidateHosts("Treig Tidsgard AS");
+      const tbe2Hosts = gardssalgWebsiteCandidateHosts("Neste Tidsgard AS");
+      fixtures.set(`https://${tbeHosts[0]}`, slowVerifyingResponse(tbeHosts[0], "Treig Tidsgard — org.nr 977 200 031"));
+      setRfbWdNowForTesting!(nearlySpentClock());
+      const tbeStart = Date.now();
+      const rTbE = await callDiscovery({ agentIds: ["wd-tb-e1", "wd-tb-e2"] });
+      const tbeElapsed = Date.now() - tbeStart;
+      assertTrue(tbeElapsed < SLOW_MS, `tb-e1: route answered at the budget (${tbeElapsed} ms), before the slow attempt resolved`);
+      assertEq(rTbE.body.proposed.length, 0, "tb-e2: nothing proposed from the abandoned attempt");
+      assertTrue(!rTbE.body.rejected.some((r: any) => r.agent_id === "wd-tb-e1"), "tb-e3: abandoned target is not rejected");
+      assertEq(rTbE.body.skipped_due_to_time_budget, ["wd-tb-e1", "wd-tb-e2"], "tb-e4: abandoned target and the one after it are in skipped_due_to_time_budget");
+      assertEq(rTbE.body.time_budget_exceeded, true, "tb-e5: time_budget_exceeded is true");
+      assertTrue(!tbe2Hosts.some((h) => fetchCalls.includes(`https://${h}`)), "tb-e6: the next target never started");
+      await sleep(SLOW_MS + 150);
+      assertEq(readQueueRow("wd-tb-e1"), undefined, "tb-e7: the late-resolving (verifying) attempt wrote no queue row");
+
+      // (tb-f) tier-2 Brave search in flight at the budget.
+      insertAgent({ id: "wd-tb-f", name: "Sokesen Tidsgard AS", orgNr: "977200033", city: "Gjøvik" });
+      fixtures.set("https://sokesen-ekte.no", htmlResponse("<html><body>Sokesen Tidsgard — org.nr 977 200 033</body></html>", {
+        finalUrl: "https://sokesen-ekte.no",
+      }));
+      let tbfSearchResolved = false;
+      setRfbWdSearchForTesting!(async () => {
+        await sleep(SLOW_MS);
+        tbfSearchResolved = true;
+        return [{ title: "Sokesen Tidsgard", url: "https://sokesen-ekte.no", description: "Gjøvik" }];
+      });
+      setRfbWdNowForTesting!(nearlySpentClock());
+      const tbfStart = Date.now();
+      const rTbF = await callDiscovery({ agentIds: ["wd-tb-f"] });
+      const tbfElapsed = Date.now() - tbfStart;
+      assertTrue(tbfElapsed < SLOW_MS && !tbfSearchResolved, `tb-f1: route answered (${tbfElapsed} ms) before the slow search resolved`);
+      assertEq(rTbF.body.proposed.length, 0, "tb-f2: nothing proposed");
+      assertEq(rTbF.body.skipped_due_to_time_budget, ["wd-tb-f"], "tb-f3: target in skipped_due_to_time_budget");
+      assertEq(rTbF.body.time_budget_exceeded, true, "tb-f4: time_budget_exceeded is true");
+      await sleep(SLOW_MS + 150);
+      assertTrue(tbfSearchResolved, "tb-f5: setup sanity -- the abandoned search did resolve later");
+      assertTrue(!fetchCalls.includes("https://sokesen-ekte.no"), "tb-f6: the late search result's host was never fetched");
+      assertEq(readQueueRow("wd-tb-f"), undefined, "tb-f7: no queue row from the late search result");
+      setRfbWdSearchForTesting!(null);
+
+      // (tb-g) external-candidates branch: the evaluation in flight at the
+      // budget is abandoned, nothing is queued, the next candidate never starts.
+      insertAgent({ id: "wd-tb-g1", name: "Ekstern Tidsgard AS", orgNr: "977200034", city: "Lillehammer" });
+      insertAgent({ id: "wd-tb-g2", name: "Ekstern To Tidsgard AS", orgNr: "977200035", city: "Lillehammer" });
+      fixtures.set("https://ekstern-tidsgard.no", slowVerifyingResponse("ekstern-tidsgard.no", "Ekstern Tidsgard — org.nr 977 200 034"));
+      fixtures.set("https://ekstern-to.no", htmlResponse("<html><body>Ekstern To Tidsgard — org.nr 977 200 035</body></html>", {
+        finalUrl: "https://ekstern-to.no",
+      }));
+      setRfbWdNowForTesting!(nearlySpentClock());
+      const tbgStart = Date.now();
+      const rTbG = await callDiscovery({
+        candidates: [
+          { agentId: "wd-tb-g1", url: "https://ekstern-tidsgard.no" },
+          { agentId: "wd-tb-g2", url: "https://ekstern-to.no" },
+        ],
+      });
+      const tbgElapsed = Date.now() - tbgStart;
+      assertTrue(tbgElapsed < SLOW_MS, `tb-g1: external-candidates call answered at the budget (${tbgElapsed} ms)`);
+      assertEq(rTbG.body.mode, "external_candidates", "tb-g2: external-candidates branch");
+      assertEq(rTbG.body.proposed.length, 0, "tb-g3: nothing proposed");
+      assertEq(rTbG.body.rejected.length, 0, "tb-g4: abandoned candidate is not rejected");
+      assertEq(rTbG.body.skipped_due_to_time_budget, ["wd-tb-g1", "wd-tb-g2"], "tb-g5: both candidates in skipped_due_to_time_budget");
+      assertEq(rTbG.body.time_budget_exceeded, true, "tb-g6: time_budget_exceeded is true");
+      assertTrue(!fetchCalls.includes("https://ekstern-to.no"), "tb-g7: the second candidate never started");
+      await sleep(SLOW_MS + 150);
+      assertEq(readQueueRow("wd-tb-g1"), undefined, "tb-g8: the late-resolving (verifying) evaluation wrote no queue row");
+      assertEq(readQueueRow("wd-tb-g2"), undefined, "tb-g9: no queue row for the never-started candidate");
+
+      // (tb-h) N1: the abandoned attempt MUTATES its fallback counters and
+      // `tried` before it is abandoned (plain fetch returns a JS shell at
+      // once → tried.push + fallbackCounters.attempted++), then a slow
+      // headless render resolves later with verifying evidence. The private
+      // per-attempt state is never merged, so the response reports zero
+      // fallback attempts and nothing is queued.
+      process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED = "true";
+      let tbhRenderCalls = 0;
+      let tbhRenderResolved = false;
+      setRfbWdRenderPageImplForTesting!(async (url: string) => {
+        tbhRenderCalls++;
+        await sleep(SLOW_MS);
+        tbhRenderResolved = true;
+        return {
+          ok: true,
+          html: `<html><head><link rel="canonical" href="${url}"></head><body>Rendret Tidsgard — org.nr 977 200 036</body></html>`,
+          text: "Rendret Tidsgard — org.nr 977 200 036",
+          finalUrl: url,
+          elapsedMs: SLOW_MS,
+        };
+      });
+      insertAgent({ id: "wd-tb-h", name: "Rendret Tidsgard AS", orgNr: "977200036", city: "Elverum" });
+      const tbhHosts = gardssalgWebsiteCandidateHosts("Rendret Tidsgard AS");
+      const tbhShell = `<html><body><script>var pad = "${"x".repeat(2500)}";</script><div id="root">App</div></body></html>`;
+      fixtures.set(`https://${tbhHosts[0]}`, htmlResponse(tbhShell, { finalUrl: `https://${tbhHosts[0]}` }));
+      setRfbWdNowForTesting!(nearlySpentClock());
+      const rTbH = await callDiscovery({ agentIds: ["wd-tb-h"] });
+      assertEq(tbhRenderCalls, 1, "tb-h0: setup sanity -- the attempt reached the render fallback (counter + tried already mutated privately)");
+      assertTrue(!tbhRenderResolved, "tb-h1: route answered before the slow render resolved");
+      assertEq(rTbH.body.headless_fallback_attempted, 0, "tb-h2: the abandoned attempt's fallback counter is not merged into the response");
+      assertEq(rTbH.body.headless_fallback_verified, 0, "tb-h3: no verified fallback counted");
+      assertEq(rTbH.body.proposed.length, 0, "tb-h4: nothing proposed");
+      assertEq(rTbH.body.rejected.length, 0, "tb-h5: no rejected entry (the abandoned attempt's tried/excluded never surface)");
+      assertEq(rTbH.body.skipped_due_to_time_budget, ["wd-tb-h"], "tb-h6: target in skipped_due_to_time_budget");
+      await sleep(SLOW_MS + 150);
+      assertTrue(tbhRenderResolved, "tb-h7: setup sanity -- the render resolved later with verifying evidence");
+      assertEq(rTbH.body.headless_fallback_attempted, 0, "tb-h8: still 0 after the late resolution");
+      assertEq(readQueueRow("wd-tb-h"), undefined, "tb-h9: the late verifying render wrote no queue row");
+      setRfbWdRenderPageImplForTesting!(null);
+      delete process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED;
+
       setRfbWdNowForTesting!(null);
     }
   } catch (err: any) {

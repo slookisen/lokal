@@ -256,6 +256,100 @@ export function runAdminRunVerifierAgentIdsTests(opts: { log?: boolean } = {}): 
         roundD.body.processed >= 5,
         `d2: no agentIds -> default selection processes every remaining seeded agent (got ${roundD.body.processed})`,
       );
+      assertEq(roundD.body.truncated, false, "d3: S5c — a batch well inside the route budget is not truncated");
+      assertEq(roundD.body.not_processed, 0, "d4: S5c — nothing left unprocessed");
+
+      // ── (g) S5c (2026-11-08): POST / has a time budget
+      // (VERIFY_ROUTE_TIME_BUDGET_MS, default 20 s) that stops NEW agents from
+      // starting once spent. The test clock jumps 12 s per read: the deadline
+      // is read at 0 (→ 20 000), agent 1 starts at 12 000, the check before
+      // agent 2 reads 24 000 ≥ deadline → stop. No real waiting.
+      const verifierRoute = require("./admin-run-verifier") as typeof import("./admin-run-verifier");
+      assertEq(
+        [
+          verifierRoute.resolveVerifyRouteTimeBudgetMs({}),
+          verifierRoute.resolveVerifyRouteTimeBudgetMs({ VERIFY_ROUTE_TIME_BUDGET_MS: "5000" }),
+          verifierRoute.resolveVerifyRouteTimeBudgetMs({ VERIFY_ROUTE_TIME_BUDGET_MS: "0" }),
+          verifierRoute.resolveVerifyRouteTimeBudgetMs({ VERIFY_ROUTE_TIME_BUDGET_MS: "-3" }),
+          verifierRoute.resolveVerifyRouteTimeBudgetMs({ VERIFY_ROUTE_TIME_BUDGET_MS: "abc" }),
+        ],
+        [20000, 5000, 20000, 20000, 20000],
+        "g0: VERIFY_ROUTE_TIME_BUDGET_MS — positive integer, else the 20000 default",
+      );
+      for (const id of ["aid-g1", "aid-g2", "aid-g3", "aid-g4"]) seed(id, "unverified");
+      let fakeNow = 0;
+      verifierRoute.__setVerifyRouteNowForTesting(() => {
+        const v = fakeNow;
+        fakeNow += 12_000;
+        return v;
+      });
+      try {
+        clearTickLock();
+        const roundG = await callRoute(router, {
+          method: "POST",
+          url: "/",
+          headers: { "x-admin-key": ADMIN_KEY },
+          query: { force: "1", bias_growth: "0" },
+          body: { agentIds: ["aid-g1", "aid-g2", "aid-g3", "aid-g4"] },
+        });
+        assertEq(roundG.status, 200, "g1: 200 response");
+        assertEq(roundG.body.processed, 1, "g2: only the agent started before the budget ran out was processed");
+        assertEq(roundG.body.truncated, true, "g3: truncated=true");
+        assertEq(roundG.body.not_processed, 3, "g4: not_processed counts the 3 agents never started");
+        const touchedG = ["aid-g1", "aid-g2", "aid-g3", "aid-g4"].filter((id) => lastVerifiedOf(id) !== null);
+        assertEq(touchedG, ["aid-g1"], "g5: the 3 unstarted agents were not touched");
+
+        // (h) the tick path (cron scheduler / runVerifierTick without
+        // deadlineAt) keeps NO deadline even with the route clock installed.
+        clearTickLock();
+        const tickH = await verifierRoute.runVerifierTick({ agentIds: ["aid-g2", "aid-g3", "aid-g4"], biasGrowth: false });
+        assertTrue(!tickH.skipped, "h1: tick ran (not lock-skipped)");
+        if (!tickH.skipped) {
+          assertEq(tickH.processed, 3, "h2: tick without deadline processes every candidate");
+          assertEq(tickH.truncated, false, "h3: tick is never truncated");
+          assertEq(tickH.not_processed, 0, "h4: tick leaves nothing unprocessed");
+        }
+
+        // (i) N2: deadline boundary is `>=` — a check that reads EXACTLY the
+        // deadline starts no new agent.
+        const { runVerifierBatch } = require("../agents/lokal-agent-verifier") as
+          typeof import("../agents/lokal-agent-verifier");
+        for (const id of ["aid-i1", "aid-i2"]) seed(id, "unverified");
+        const boundaryBatch = await runVerifierBatch({
+          agentIds: ["aid-i1", "aid-i2"],
+          deadlineAt: 20_000,
+          nowMs: () => 20_000,
+        });
+        assertEq(boundaryBatch.results.length, 0, "i1: clock exactly at the deadline → no agent starts");
+        assertEq(boundaryBatch.truncated, true, "i2: truncated=true at the boundary");
+        assertEq(boundaryBatch.not_processed, 2, "i3: both agents reported not_processed");
+        const justBefore = await runVerifierBatch({
+          agentIds: ["aid-i1"],
+          deadlineAt: 20_000,
+          nowMs: () => 19_999,
+        });
+        assertEq(justBefore.results.length, 1, "i4: 1 ms before the deadline the agent still starts");
+        assertEq(justBefore.truncated, false, "i5: not truncated when everything started");
+        assertEq(lastVerifiedOf("aid-i2"), null, "i6: the agent never started at the boundary is untouched");
+
+        // Route-level boundary: deadline read at 0 (→ 20 000), first check
+        // reads exactly 20 000 → nothing processed.
+        let boundaryReads = 0;
+        verifierRoute.__setVerifyRouteNowForTesting(() => (boundaryReads++ === 0 ? 0 : 20_000));
+        clearTickLock();
+        const roundI = await callRoute(router, {
+          method: "POST",
+          url: "/",
+          headers: { "x-admin-key": ADMIN_KEY },
+          query: { force: "1", bias_growth: "0" },
+          body: { agentIds: ["aid-i2"] },
+        });
+        assertEq(roundI.body.processed, 0, "i7: route — check exactly at the deadline starts no agent");
+        assertEq(roundI.body.truncated, true, "i8: route — truncated=true");
+        assertEq(roundI.body.not_processed, 1, "i9: route — not_processed=1");
+      } finally {
+        verifierRoute.__setVerifyRouteNowForTesting(null);
+      }
     } finally {
       initMod.__setDbForTesting(prevDb);
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;

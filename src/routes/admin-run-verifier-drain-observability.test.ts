@@ -272,11 +272,14 @@ export function runAdminRunVerifierDrainObservabilityTests(
         "persisted", "envelope_recorded",
         "hour_utc", "forced", "tick_lock_skipped", "reprocess_review_queue",
         "bias_growth",
+        // dev-request S5c (2026-11-08): the route's time budget adds two
+        // fields on purpose — this pin is updated deliberately.
+        "truncated", "not_processed",
       ].sort();
       assertEq(
         Object.keys(round1.body).sort(),
         expectedNonSkippedKeys,
-        "lock-1: round 1 (non-skipped) response has EXACTLY the pre-existing field set plus the two new review_required_* fields — nothing else dropped or added",
+        "lock-1: round 1 (non-skipped) response has EXACTLY the pre-existing field set plus the review_required_* and S5c truncated/not_processed fields — nothing else dropped or added",
       );
       assertEq(round1.body.skipped, undefined, "lock-2: non-skipped response has no `skipped` key at all (matches pre-lock shape exactly)");
 
