@@ -191,6 +191,21 @@ export async function runOpplevagentPrivacyTruthTests(opts: { log?: boolean } = 
   assertTrue(/kontakt@opplevagent\.no/.test(noT) && /kontakt@opplevagent\.no/.test(enT), "deletion/objection contact address is on the page in both parts");
   assertTrue(/8\. november 2026/.test(noT) && /8 November 2026/.test(enT), "both parts show today's updated date, 8 November 2026");
 
+  // 1b. AI-answer marker (dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 6).
+  {
+    const noA = noT.replace(/&amp;/g, "&"), enA = enT.replace(/&amp;/g, "&");
+    assertTrue(/utm_campaign=ai_search/.test(noA) && /utm_campaign=ai_search/.test(enA) && /utm_medium/.test(noA) && /utm_medium/.test(enA),
+      "both parts name the utm_* marker on links given to AI assistants");
+    assertTrue(/det inneholder ingenting om deg/.test(noA) && /it contains nothing about you/.test(enA),
+      "both parts say the marker holds nothing about the person");
+    assertTrue(/telle besøk som kom fra et AI-svar/.test(noA) && /count visits that came from an AI answer/.test(enA),
+      "both parts say the marker is used to count visits from AI answers");
+    assertTrue(/summeres per dag, side og AI-tjeneste, uten IP-hash eller annen kobling til den besøkende, og summene vises på opplevelsessidene\. Summene slettes ikke automatisk i dag/.test(noA) &&
+      /summed per day, page and AI service, with no IP hash or other link to the visitor, and the totals are shown on the experience pages\. The totals are not deleted automatically today/.test(enA),
+      "both parts: totals without the IP hash, shown on experience pages, no automatic deletion");
+    assertTrue(!/kontaktknapp/i.test(noA) && !/contact button/i.test(enA), "no contact-click claim: Opplevagent pages do not count contact clicks");
+  }
+
   // 2. «fjern» hides, does not delete.
   assertTrue(/<strong>skjules<\/strong>/.test(no) && /<strong>hidden<\/strong>/.test(en), "both parts say the profile is hidden after «fjern»");
   assertTrue(/<strong>slettes ikke<\/strong>/.test(no) && /<strong>not deleted<\/strong>/.test(en),
