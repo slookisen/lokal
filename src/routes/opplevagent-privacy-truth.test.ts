@@ -200,6 +200,9 @@ export async function runOpplevagentPrivacyTruthTests(opts: { log?: boolean } = 
       "both parts say the marker holds nothing about the person");
     assertTrue(/telle besøk som kom fra et AI-svar/.test(noA) && /count visits that came from an AI answer/.test(enA),
       "both parts say the marker is used to count visits from AI answers");
+    assertTrue(/summeres per dag, side og AI-tjeneste, uten IP-hash eller annen kobling til den besøkende, og summene vises på opplevelsessidene\. Summene slettes ikke automatisk i dag/.test(noA) &&
+      /summed per day, page and AI service, with no IP hash or other link to the visitor, and the totals are shown on the experience pages\. The totals are not deleted automatically today/.test(enA),
+      "both parts: totals without the IP hash, shown on experience pages, no automatic deletion");
     assertTrue(!/kontaktknapp/i.test(noA) && !/contact button/i.test(enA), "no contact-click claim: Opplevagent pages do not count contact clicks");
   }
 

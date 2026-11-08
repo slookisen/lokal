@@ -3248,7 +3248,7 @@ router.get("/personvern", (req: Request, res: Response) => {
     </ul>
     <h3>Visits from AI answers and contact clicks</h3>
     <p>Links to producer pages that we give AI assistants such as ChatGPT and Claude carry a marker (for example <code>utm_source=claude&amp;utm_campaign=ai_search</code>). The marker only says which AI service the link was given to — it contains nothing about you. Together with the referrer it lets us count visits that came from an AI answer. These visits are summed per day, page and AI service, without the IP hash or any other link to the visitor, and the totals are shown on the producer pages.</p>
-    <p>When you click a contact button on a producer page (email, phone, website or social media), we count the click: which producer, which button, the time, the visit ID and which source the visit came from (for example an AI answer). The IP address is not stored with the click. Producers see the number of clicks in their dashboard.</p>
+    <p>When you click a contact button on a producer page (email, phone, website or social media), we count the click: which producer, which button, the time, which source the visit came from (for example an AI answer) and the visit ID. The visit ID contains the same salted, truncated hash of your IP address as the page visits (never the full IP address). Unlike the page visits, contact clicks are not deleted automatically today. Producers see the number of clicks in their dashboard.</p>
     <p>We use only a small number of essential cookies: a sign-in session cookie for sellers who verify a magic link or a farm-shop ownership claim (httpOnly, expires after 7 days), and one or two cookies that remember your language choice — a cookie set when you use the language switcher (expires after 1 year), and a session-only cookie the server may set when you follow a language-specific link (cleared when you close your browser). We set no third-party analytics, advertising or tracking cookies such as Google Analytics — all analysis happens in our own database.</p>
 
     <h3>Search and AI queries</h3>
@@ -3358,7 +3358,7 @@ ${pp ? `        ${pp.legalBasisRow}\n` : ""}      </tbody>
         <tr><td>Page-visit analytics</td><td>Individual page visits (with the pseudonymised IP hash) are deleted automatically after 60 days. Before deletion they are summed into daily counts per page, which contain no IP hash or other link to a visitor and are kept.</td></tr>
         <tr><td>Search logs</td><td>Individual searches (with the pseudonymised IP hash) are deleted automatically after 60 days. Before deletion they are summed into daily counts per search text, without any link to who searched, and those counts are kept.</td></tr>
         <tr><td>Visits from AI answers</td><td>Kept only as daily totals per page and AI service, with no IP hash or other link to the visitor. Not deleted automatically today.</td></tr>
-        <tr><td>Contact clicks</td><td>Stored without IP address. Not deleted automatically today.</td></tr>
+        <tr><td>Contact clicks</td><td>Stored with the visit ID (which contains the salted IP hash). Not deleted automatically today.</td></tr>
         <tr><td>Verification codes</td><td>Unverified claims expire after 7 days.</td></tr>
         <tr><td>Magic links</td><td>Expire after 15 minutes. Used links older than 1 hour are auto-deleted.</td></tr>
         <tr><td>Claim token (sign-in)</td><td>Expires after 30 days. Renewed at next sign-in.</td></tr>
@@ -3426,7 +3426,7 @@ ${pp ? `        ${pp.legalBasisRow}\n` : ""}      </tbody>
     </ul>
     <h3>Besøk fra AI-svar og kontakt-klikk</h3>
     <p>Lenker til produsentsider som vi gir AI-assistenter som ChatGPT og Claude, har et merke (for eksempel <code>utm_source=claude&amp;utm_campaign=ai_search</code>). Merket sier bare hvilken AI-tjeneste lenken ble gitt til — det inneholder ingenting om deg. Sammen med referanse-URL-en lar det oss telle besøk som kom fra et AI-svar. Disse besøkene summeres per dag, side og AI-tjeneste, uten IP-hash eller annen kobling til den besøkende, og summene vises på produsentsidene.</p>
-    <p>Når du klikker på en kontaktknapp på en produsentside (e-post, telefon, nettside eller sosiale medier), teller vi klikket: hvilken produsent, hvilken knapp, tidspunktet, besøks-ID-en og hvilken kilde besøket kom fra (for eksempel et AI-svar). IP-adressen lagres ikke sammen med klikket. Produsentene ser antallet klikk i oversikten sin.</p>
+    <p>Når du klikker på en kontaktknapp på en produsentside (e-post, telefon, nettside eller sosiale medier), teller vi klikket: hvilken produsent, hvilken knapp, tidspunktet, hvilken kilde besøket kom fra (for eksempel et AI-svar) og besøks-ID-en. Besøks-ID-en inneholder den samme saltede, forkortede hashen av IP-adressen din som sidebesøkene (aldri hele IP-adressen). Til forskjell fra sidebesøkene slettes kontakt-klikk ikke automatisk i dag. Produsentene ser antallet klikk i oversikten sin.</p>
     <p>Vi bruker kun et fåtall nødvendige (essensielle) informasjonskapsler: en innloggings-cookie for selgere som verifiserer en magisk lenke eller et gårdssalg-eierskapskrav (httpOnly, utløper etter 7 dager), og én eller to cookies som husker språkvalget ditt — en cookie som settes når du bruker språkvelgeren (utløper etter 1 år), og en økt-cookie (session-cookie) som serveren kan sette når du følger en språkspesifikk lenke (slettes når du lukker nettleseren). Vi bruker ingen tredjeparts analyse-, annonse- eller sporingscookies som Google Analytics — all analyse skjer i vår egen database.</p>
 
     <h3>Søk og AI-spørringer</h3>
@@ -3536,7 +3536,7 @@ ${pp ? `        ${pp.legalBasisRow}\n` : ""}      </tbody>
         <tr><td>Sidebesøk-analytikk</td><td>Enkeltbesøk (med pseudonymisert IP-hash) slettes automatisk etter 60 dager. Før sletting summeres de til tall per dag, uke og måned (antall sidevisninger, besøk og unike besøkende, per side, kilde og type klient), uten IP-hash eller annen kobling til den besøkende, og disse tallene beholdes.</td></tr>
         <tr><td>Søkelogger</td><td>Enkeltsøk (med pseudonymisert IP-hash) slettes automatisk etter 60 dager. Før sletting summeres de til tall per dag, uke og måned per søketekst og per kanal, uten kobling til hvem som søkte, og disse tallene beholdes.</td></tr>
         <tr><td>Besøk fra AI-svar</td><td>Lagres bare som summer per dag, side og AI-tjeneste, uten IP-hash eller annen kobling til den besøkende. Slettes ikke automatisk i dag.</td></tr>
-        <tr><td>Kontakt-klikk</td><td>Lagres uten IP-adresse. Slettes ikke automatisk i dag.</td></tr>
+        <tr><td>Kontakt-klikk</td><td>Lagres med besøks-ID-en (som inneholder den saltede IP-hashen). Slettes ikke automatisk i dag.</td></tr>
         <tr><td>Verifiseringskoder</td><td>Uverifiserte claims utløper etter 7 dager.</td></tr>
         <tr><td>Magiske lenker</td><td>Utløper etter 15 minutter. Brukte lenker eldre enn 1 time slettes automatisk.</td></tr>
         <tr><td>Claim-token (innlogging)</td><td>Utløper etter 30 dager. Fornyes ved ny innlogging.</td></tr>
