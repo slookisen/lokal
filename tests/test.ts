@@ -46842,6 +46842,27 @@ runSerial(async () => {
   }
 });
 
+// A2A dev-request 2026-10-16-opplevagent-katalogfakta-alder-og-title-no,
+// slice S3b: the catalogue facts proposals job on the shared proposal file
+// queue (flag OFF by default) storing through S3a's
+// applyExperienceFactsProposals(). api.anthropic.com is counted and asserted
+// zero. Serial: in-memory DB + globalThis.fetch.
+runSerial(async () => {
+  console.log("\n── S3b: experience-facts-proposals-job (proposal file queue) ──");
+  try {
+    const { runExperienceFactsProposalsJobTests } = require("../src/services/experience-facts-proposals-job.test") as
+      typeof import("../src/services/experience-facts-proposals-job.test");
+    const fj = await runExperienceFactsProposalsJobTests({ log: false });
+    passed += fj.passed;
+    failed += fj.failed;
+    for (const f of fj.failures) failures.push("experience-facts-proposals-job: " + f);
+    console.log(`  experience-facts-proposals-job: ${fj.passed} passed, ${fj.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experience-facts-proposals-job: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-08-06-aldri-gjett-epostadresse (slookisen/A2A), criterion
 // 6: GET /admin/gardssalg-epost-synthesis-audit (read-only) + POST
 // /admin/gardssalg-epost-synthesis-remediation (dry-run-by-default write) —

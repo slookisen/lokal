@@ -39198,6 +39198,7 @@ router.post("/admin/experience-orgnr-job-run", requireAdmin, async (req: Request
 // the description lane stamp).
 
 import { nameSimilarity } from "../services/name-matcher";
+import { getExperienceFactsProposalsStatus } from "../services/experience-facts-proposals-job";
 
 export const EXPERIENCE_FACTS_CANDIDATES_DEFAULT_LIMIT = 10;
 export const EXPERIENCE_FACTS_CANDIDATES_MAX_LIMIT = 25;
@@ -39808,6 +39809,13 @@ router.post("/admin/experience-facts-write", requireAdmin, async (req: Request, 
     return;
   }
   res.json({ success: true, dry_run: dryRun, ...out });
+});
+
+// GET /admin/experience-facts-proposals-status — read-only status of the
+// S3b proposals job (services/experience-facts-proposals-job.ts), same
+// shape and auth as /admin/gardssalg-visit-proposals-status.
+router.get("/admin/experience-facts-proposals-status", requireAdmin, (_req: Request, res: Response) => {
+  res.json({ success: true, ...getExperienceFactsProposalsStatus(getExpDb("experiences") as any) });
 });
 
 export default router;

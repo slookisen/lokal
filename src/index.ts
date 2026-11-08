@@ -2306,6 +2306,39 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
   setInterval(() => { void gardssalgVisitProposalsTick(); }, 60 * 60_000);
 }
 
+// ─── A2A dev-request 2026-10-16-opplevagent-katalogfakta-alder-og-title-no,
+// slice S3b: catalogue facts proposals — same file-queue mechanics as the
+// two proposal jobs above (services/proposal-file-queue.ts), reading
+// `experiences-facts-proposals/` in slookisen/A2A and storing through
+// applyExperienceFactsProposals() (S3a: scope + publish gate, locks,
+// fill-only, verbatim excerpt on a page the server fetches itself). Never
+// calls an LLM. OFF by default: EXPERIENCE_FACTS_PROPOSALS_JOB_ENABLED ===
+// "true" turns it on; flipping it back is the rollback. First tick 12
+// minutes after boot, hourly after that; an overlapping tick is skipped.
+if (process.env.ENABLE_EXPERIENCES === "1") {
+  let experienceFactsProposalsRunning = false;
+  const experienceFactsProposalsTick = trackJob("experience-facts-proposals", async () => {
+    if (experienceFactsProposalsRunning) return;
+    experienceFactsProposalsRunning = true;
+    try {
+      const { tickExperienceFactsProposals } = await import("./services/experience-facts-proposals-job");
+      const r = await tickExperienceFactsProposals();
+      if (r.skipped_reason === "disabled") return;
+      console.log(
+        `[experience-facts-proposals] tick run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
+          `listed=${r.files_listed} processed=${r.processed.length} written=${r.written} ` +
+          `github_error=${r.github_error ? "yes" : "no"} envelope=${r.envelope_recorded}`,
+      );
+    } catch (err) {
+      console.error("[experience-facts-proposals] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      experienceFactsProposalsRunning = false;
+    }
+  });
+  setTimeout(() => { void experienceFactsProposalsTick(); }, 12 * 60_000);
+  setInterval(() => { void experienceFactsProposalsTick(); }, 60 * 60_000);
+}
+
 // ─── A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
 // felles-serverjobbramme, «Innsnevring 2026-10-28», skive 3k med punkt b:
 // needs_review content judgements — same file-queue mechanics as the two
