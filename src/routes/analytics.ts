@@ -29,6 +29,7 @@ import { getTrafficStatsSnapshot } from "../services/traffic-stats";
 import { adminTrafficYearBody } from "../services/traffic-year-compute";
 import { computeAiLookupBreakdown, type AiLookupBreakdown } from "../services/search-stats-compute";
 import { AI_DELIVERY_WINDOW_DAYS, computeAiDeliveries, computeAiDeliveryTopProfiles } from "../services/profile-ai-deliveries-compute";
+import { ADMIN_AI_CLICK_VERTICALS, computeAdminAiClicks } from "../services/admin-ai-clicks";
 import { computePartnerReport, partnerReportToCsv, PartnerReportInputError } from "../services/partner-report-service";
 import { adminStatsReaderFor } from "../services/admin-stats";
 import { getEventLoopReport } from "../services/event-loop-monitor";
@@ -425,6 +426,37 @@ router.get("/ai-deliveries", (req: Request, res: Response) => {
     });
   } catch (err) {
     console.error("[analytics] ai-deliveries error:", err);
+    res.status(500).json({ error: "internal error" });
+  }
+});
+
+/**
+ * GET /admin/analytics/ai-clicks
+ * «Klikk fra AI-svar» (dev-request 2026-10-14-klikk-fra-ai-svar-per-profil,
+ * slice 5c): visits from people who clicked through to a profile from an AI
+ * assistant's answer, per vertical: platform sum for the last 60 days and
+ * since counting started (per AI), the click rate (clicks per 100 «Sendt til
+ * AI» deliveries over the same days; null when there were none) and the top
+ * profiles of the 60 days with name and public link. Reads the daily sums in
+ * profile_ai_clicks and profile_ai_deliveries; read-only, small enough for the
+ * request. Each count carries `display` with the counting-since words
+ * (services/admin-ai-clicks.ts).
+ * Query params:
+ *   vertical=rfb|dental|experiences (default: all three, or host-locked)
+ *   limit=10 (default; max 50): size of each top list
+ */
+router.get("/ai-clicks", (req: Request, res: Response) => {
+  try {
+    const limit = Math.max(1, Math.min(50, parseInt(req.query.limit as string) || 10));
+    const vertical = parseVertical(req);
+    const verticals = vertical ? [vertical] : [...ADMIN_AI_CLICK_VERTICALS];
+    res.json({
+      vertical: vertical || "all",
+      timestamp: new Date().toISOString(),
+      ...computeAdminAiClicks(getDb(), verticals, Date.now(), limit),
+    });
+  } catch (err) {
+    console.error("[analytics] ai-clicks error:", err);
     res.status(500).json({ error: "internal error" });
   }
 });

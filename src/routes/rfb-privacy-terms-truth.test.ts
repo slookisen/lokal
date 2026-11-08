@@ -264,8 +264,50 @@ export async function runRfbPrivacyTermsTruthTests(opts: { log?: boolean } = {})
     assertTrue(
       // 2026-10-09: controller changed to AGENTPLATFORM.NO AS (dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as).
       // 2026-10-11: legal basis, sources, recipients, AI, backups and the right to object (Daniel live «fiks personvernsiden»).
-      lang === "no" ? /Sist oppdatert: 11\. oktober 2026/.test(body) : /Last updated: 11 October 2026/.test(body),
+      // 2026-11-08: AI-answer marker and contact clicks (dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 6).
+      lang === "no" ? /Sist oppdatert: 8\. november 2026/.test(body) : /Last updated: 8 November 2026/.test(body),
       `/personvern (${lang}): "last updated" date reflects this change`
+    );
+
+    // ── 9. AI-answer marker and contact clicks (klikk-fra-ai-svar slice 6) ──
+    const text = body.replace(/<[^>]+>/g, " ").replace(/&amp;/g, "&").replace(/\s+/g, " ");
+    assertTrue(
+      /utm_source/.test(text) && /utm_medium/.test(text) && /utm_campaign/.test(text) && /utm_campaign=ai_search/.test(text),
+      `/personvern (${lang}): names the utm_* marker on links given to AI assistants`
+    );
+    assertTrue(
+      lang === "no"
+        ? /det inneholder ingenting om deg/.test(text) && /telle besøk som kom fra et AI-svar/.test(text)
+        : /it contains nothing about you/.test(text) && /count visits that came from an AI answer/.test(text),
+      `/personvern (${lang}): says the marker holds nothing about the person and is used to count visits from AI answers`
+    );
+    assertTrue(
+      lang === "no"
+        ? /teller vi klikket/.test(text) && /Besøks-ID-en inneholder den samme saltede, forkortede hashen av IP-adressen din/.test(text) && /slettes kontakt-klikk ikke automatisk i dag/.test(text)
+        : /we count the click/.test(text) && /The visit ID contains the same salted, truncated hash of your IP address/.test(text) && /contact clicks are not deleted automatically today/.test(text),
+      `/personvern (${lang}): discloses contact-click counting, that the visit ID carries the IP hash, and no automatic deletion`
+    );
+    assertTrue(!/lagres ikke sammen med klikket|not stored with the click|Lagres uten IP-adresse|Stored without IP address/.test(text),
+      `/personvern (${lang}): no claim that contact clicks are stored without the IP hash`);
+    assertTrue(
+      lang === "no"
+        ? /<td>Kontakt-klikk<\/td><td>Lagres med besøks-ID-en \(som inneholder den saltede IP-hashen\)\. Slettes ikke automatisk i dag\.<\/td>/.test(body)
+          && /<td>Besøk fra AI-svar<\/td><td>Lagres bare som summer per dag, side og AI-tjeneste, uten IP-hash eller annen kobling til den besøkende\. Slettes ikke automatisk i dag\.<\/td>/.test(body)
+        : /<td>Contact clicks<\/td><td>Stored with the visit ID \(which contains the salted IP hash\)\. Not deleted automatically today\.<\/td>/.test(body)
+          && /<td>Visits from AI answers<\/td><td>Kept only as daily totals per page and AI service, with no IP hash or other link to the visitor\. Not deleted automatically today\.<\/td>/.test(body),
+      `/personvern (${lang}): retention rows for contact clicks and AI-answer visits`
+    );
+    assertTrue(
+      lang === "no"
+        ? /summeres per dag, side og AI-tjeneste, uten IP-hash eller annen kobling til den besøkende, og summene vises på produsentsidene/.test(text)
+        : /summed per day, page and AI service, without the IP hash or any other link to the visitor, and the totals are shown on the producer pages/.test(text),
+      `/personvern (${lang}): AI-answer visits summed without the IP hash and shown on producer pages`
+    );
+    assertTrue(
+      lang === "no"
+        ? /En klassifisering av klienten \(menneske, AI-assistent, søkemotor eller annen robot\)/.test(text)
+        : /A classification of the client \(human, AI assistant, search engine or other bot\)/.test(text),
+      `/personvern (${lang}): NO and EN both list the client classification`
     );
 
     // ── 8. Producer profiles: real legal basis, sources, recipients, AI, backups, objection ──
@@ -388,6 +430,34 @@ export async function runRfbPrivacyTermsTruthTests(opts: { log?: boolean } = {})
         "/vilkar: \"last updated\" date reflects this change (both languages)"
       );
     }
+  }
+
+  // ── 9b. The slice-6 text matches the code ──
+  {
+    const root = path.join(__dirname, "..");
+    const utmSrc = fs.readFileSync(path.join(root, "utils", "url-utm.ts"), "utf8");
+    assertTrue(/addUtmParams\(url, aiSourceFromClient\(clientIdentity\), medium, "ai_search"\)/.test(utmSrc),
+      "code: links given to AI assistants carry utm_campaign=ai_search (addAiUtmParams)");
+    const initSrc = fs.readFileSync(path.join(root, "database", "init.ts"), "utf8");
+    const cc = initSrc.match(/CREATE TABLE IF NOT EXISTS contact_clicks \(([\s\S]*?)\)\s*`/);
+    assertTrue(!!cc && !/\bip\b|ip_hash/i.test(cc[1]), "code: contact_clicks has no IP column");
+    assertTrue(!/ALTER TABLE contact_clicks ADD COLUMN ip/i.test(initSrc), "code: no IP column is added to contact_clicks later");
+    const pac = initSrc.match(/CREATE TABLE IF NOT EXISTS profile_ai_clicks \(([\s\S]*?)\)\s*`/);
+    assertTrue(!!pac && /\bday\b/.test(pac[1]) && /\bai_vendor\b/.test(pac[1]) && !/session|ip/i.test(pac[1]),
+      "code: profile_ai_clicks holds daily totals per AI service, no session or IP");
+    const analyticsSrc = fs.readFileSync(path.join(root, "services", "analytics-service.ts"), "utf8");
+    assertTrue(/return `\$\{ipHash\}:\$\{humanDeviceBucket\(ua\)\}:\$\{uniqueSuffix\}`/.test(analyticsSrc) && /return sessionManager\.getOrCreate\(ipHash, userAgent\)|sessionIdFor\(/.test(analyticsSrc),
+      "code: the visit ID starts with the salted IP hash (as the page says)");
+    const walk = (d: string): string[] => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) =>
+      e.isDirectory() ? walk(path.join(d, e.name)) : (e.name.endsWith(".ts") && !e.name.endsWith(".test.ts") ? [path.join(d, e.name)] : []));
+    const prodSrc = walk(root).map((f) => fs.readFileSync(f, "utf8")).join("\n");
+    assertTrue(!/DELETE\s+FROM\s+contact_clicks/i.test(prodSrc) && !/DELETE\s+FROM\s+profile_ai_clicks/i.test(prodSrc),
+      "code: no automatic deletion of contact_clicks or profile_ai_clicks (as the page says) — update /personvern if one is added");
+    const pfSrc = fs.readFileSync(path.join(root, "routes", "seo.ts"), "utf8");
+    assertTrue(/aiClicksPfStatFor\(/.test(pfSrc), "code: producer pages render the AI-click totals");
+    const trackSrc = fs.readFileSync(path.join(root, "routes", "contact-tracking.ts"), "utf8");
+    assertTrue(/INSERT INTO contact_clicks \(agent_id, kind, session_id, is_bot, utm_source, ai_source\)/.test(trackSrc),
+      "code: a contact click stores producer, button, visit ID and source (as the page says)");
   }
 
   return { passed, failed, failures };

@@ -150,7 +150,72 @@ export async function runRfbForProdusenterTests(opts: { log?: boolean } = {}): P
     assertTrue(/\.fp-menu \{[^}]*position: sticky/.test(FOR_PRODUSENTER_CSS), "menu CSS: sticky");
     assertTrue(/\.fp-menu ul \{[^}]*overflow-x: auto/.test(FOR_PRODUSENTER_CSS), "menu CSS: overflow-x:auto (scrolls inside the menu, not the page)");
     assertTrue(!/(?:^|[^-])width:\s*\d{3,}px/.test(FOR_PRODUSENTER_CSS), "CSS: no fixed pixel widths ≥100px (no horizontal page scroll at 375px)");
-    assertTrue(/IntersectionObserver/.test(no.body) && /aria-current/.test(no.body), "menu marks the current section (IntersectionObserver, aria-current)");
+    // F2b: scroll-aware highlight — the last section whose top passed the line under the sticky menu.
+    assertTrue(/getBoundingClientRect\(\)\.bottom \+ 24/.test(no.body) && /addEventListener\('scroll', queue/.test(no.body) && /aria-current/.test(no.body) && !/IntersectionObserver/.test(no.body), "F2b: menu highlight follows scrolling (line under the sticky menu, aria-current), not the old IntersectionObserver band");
+    assertTrue(/menu\.addEventListener\('click'[\s\S]*?pin\(/.test(no.body) && /hashchange/.test(no.body), "F2b: a menu click / hash jump pins its link (sections near the page end)");
+    assertTrue(/\.fp-sec, \.fp-sec h2 \{ scroll-margin-top: (\d+)px; \}/.test(FOR_PRODUSENTER_CSS) && Number((FOR_PRODUSENTER_CSS.match(/scroll-margin-top: (\d+)px/) || ["", "0"])[1]) >= 56 + 48, "F2b: sections and their headings have scroll-margin-top clearing header + menu");
+    assertTrue(/\.fp-menu ul \{[^}]*scrollbar-width: none/.test(FOR_PRODUSENTER_CSS) && /\.fp-menu ul::-webkit-scrollbar \{ display: none; \}/.test(FOR_PRODUSENTER_CSS), "F2b: section menu hides the system scrollbar (Firefox + WebKit)");
+    assertTrue(/\.fp-menu::after \{[^}]*linear-gradient/.test(FOR_PRODUSENTER_CSS) && /\.fp-menu\[data-fade~="r"\]::after/.test(FOR_PRODUSENTER_CSS) && /\.fp-menu\[data-fade~="l"\]::before/.test(FOR_PRODUSENTER_CSS) && /setAttribute\('data-fade'/.test(no.body), "F2b: soft edge fade shows the menu can scroll (set from the scroll position)");
+    assertTrue(/\.fp-main \{[^}]*max-width: calc\(6[5-9]ch|\.fp-main \{[^}]*max-width: calc\(7[0-5]ch/.test(FOR_PRODUSENTER_CSS), "F2b: reading width 65–75ch");
+    assertTrue(/\.fp-qa summary::after \{[^}]*content: "\+"/.test(FOR_PRODUSENTER_CSS) && /\.fp-qa\[open\] summary::after \{ content: "\\2212"; \}/.test(FOR_PRODUSENTER_CSS) && /summary::-webkit-details-marker \{ display: none; \}/.test(FOR_PRODUSENTER_CSS), "F2b: accordions show +/− instead of the default marker");
+    assertTrue(/\.fp-steps \{[^}]*display: grid/.test(FOR_PRODUSENTER_CSS) && /\.fp-steps li::before \{ content: counter\(fp-step\)/.test(FOR_PRODUSENTER_CSS), "F2b: the three steps are numbered cards");
+    assertTrue(/\.fp-badge \{[^}]*border-radius: 999px/.test(FOR_PRODUSENTER_CSS), "F2b: «I pilot» is a chip");
+    for (const [l, b, find, login] of [["NO", no.body, "Finn profilen din og ta den over", "Logg inn"], ["EN", en.body, "Find your profile and take it over", "Log in"]] as const) {
+      const hero = (b.match(/<section class="fp-hero">[\s\S]*?<\/section>/) || [""])[0];
+      assertTrue(hero.includes(`<a class="fp-btn fp-btn-primary" href="/selger#findSection">${find}</a>`) && hero.includes(`<a class="fp-btn" href="/selger#loginBanner">${login}</a>`), `${l} F2b: hero has «${find}» (primary, /selger#findSection) and «${login}» (/selger#loginBanner)`);
+      assertTrue((hero.match(/<a /g) || []).length === 2 && /<p>[^<]{20,}<\/p>/.test(hero), `${l} F2b: hero = heading + short subtitle + exactly two buttons`);
+      const closing = (b.match(/<aside class="fp-closing"[\s\S]*?<\/aside>/) || [""])[0];
+      assertTrue(closing.includes(`href="/selger#findSection">${find}</a>`) && closing.includes(`href="/selger#loginBanner">${login}</a>`), `${l} F2b: closing action box has take-over + log-in`);
+      assertTrue(b.indexOf('<aside class="fp-closing"') > b.indexOf('id="kontakt"') && b.indexOf('<aside class="fp-closing"') < b.indexOf("<footer"), `${l} F2b: closing box sits after the last section, before the footer`);
+    }
+    {
+      // closing box with something in pilot: the F2a invitation, mailto with the subject only
+      const pilotFacts = { ...mod.currentForProdusenterFacts(), pilot: { mine_valg: "i_pilot", varer: "i_pilot", kanseller: "i_pilot", lagerpaminnelse: "i_pilot", myk_utlop: "i_pilot" } as any };
+      const html = mod.renderForProdusenterPage("no", "https://x/for-produsenter", pilotFacts).content;
+      const closing = (html.match(/<aside class="fp-closing"[\s\S]*?<\/aside>/) || [""])[0];
+      const hrefs = [...closing.matchAll(/href="(mailto:[^"]*)"/g)].map((m) => decode(m[1]));
+      assertTrue(hrefs.length === 1 && hrefs[0] === mod.PILOT_MAILTO && hrefs[0] === "mailto:kontakt@rettfrabonden.com?subject=Pilot%20%E2%80%93%20Mine%20valg", "F2b: closing box carries the F2a pilot mailto (subject only)");
+      const ldPairs = ((mod.renderForProdusenterPage("no", "https://x/for-produsenter", pilotFacts).jsonLd as any).mainEntity as any[]).map((e) => ({ q: e.name, a: e.acceptedAnswer.text }));
+      const visible = [...html.matchAll(/<details class="fp-qa"><summary>([\s\S]*?)<\/summary><p>([\s\S]*?)<\/p><\/details>/g)].map((m) => ({ q: decode(m[1]), a: decode(m[2]) }));
+      assertTrue(ldPairs.length >= 30 && JSON.stringify(ldPairs) === JSON.stringify(visible), "F2b: JSON-LD parity holds with pilot states too");
+    }
+
+    // ── 3b. F2b: «Meny» — the mobile menu in the shared RFB header ───────
+    {
+      const seoMod = require("./seo") as any;
+      const pages: Array<[string, string, "no" | "en"]> = [["/for-produsenter", "/for-produsenter", "no"], ["/personvern", "/for-produsenter", "no"], ["/om", "/for-produsenter", "no"], ["/om", "/en/for-produsenter", "en"]];
+      for (const [route, fpHref, lang] of pages) {
+        const b = invokeGet(seoRouter, route, lang).body;
+        const nav = navOf(b);
+        const btn = (nav.match(/<button[^>]*class="nav-menu-btn"[^>]*>[\s\S]*?<\/button>/) || [""])[0];
+        const label = lang === "en" ? "Menu" : "Meny";
+        assertTrue(/type="button"/.test(btn) && /aria-expanded="false"/.test(btn) && /aria-controls="navLinks"/.test(btn) && btn.includes(`<span>${label}</span>`), `F2b ${route} (${lang}): «${label}» button with type=button, aria-expanded=false, aria-controls`);
+        const panelM = nav.match(/<div class="nav-links" id="navLinks">([\s\S]*)<\/div>\s*<\/nav>/);
+        assertTrue(!!panelM && (b.match(/id="navLinks"/g) || []).length === 1, `F2b ${route}: aria-controls points to the one existing #navLinks`);
+        const panel = panelM ? panelM[1] : "";
+        for (const h of [`href="/samtaler"`, `href="${lang === "en" ? "/en/sok" : "/sok"}"`, `href="${lang === "en" ? "/en/teknologi" : "/teknologi"}"`, `href="${lang === "en" ? "/en/om" : "/om"}"`, 'id="langSwitch"', `<a href="${fpHref}" class="nav-cta">`]) {
+          assertTrue(panel.includes(h), `F2b ${route} (${lang}): the menu contains ${h}`);
+        }
+        assertTrue(nav.indexOf("navMenuBtn") < nav.indexOf('id="navLinks"'), `F2b ${route}: button comes before the links (tab order)`);
+        assertTrue(b.includes("<script>\n  (function(){\n    var btn = document.getElementById('navMenuBtn');"), `F2b ${route}: menu script is on the page`);
+      }
+      const js: string = seoMod.NAV_MENU_JS;
+      assertTrue(/'Escape'/.test(js) && /set\(false, true\)/.test(js) && /btn\.focus\(\)/.test(js), "F2b menu JS: Esc closes and returns focus to the button");
+      assertTrue(/setAttribute\('aria-expanded', open \? 'true' : 'false'\)/.test(js) && /classList\.toggle\('is-open', open\)/.test(js), "F2b menu JS: aria-expanded follows the open state");
+      assertTrue(/!panel\.contains\(e\.target\)/.test(js) && /min-width: 769px/.test(js), "F2b menu JS: closes on outside click and when growing past the breakpoint");
+      assertTrue(!/\son[a-z]+=/.test(navOf(invokeGet(seoRouter, "/om", "no").body)), "F2b: no inline event handlers in the header (CSP script-src-attr)");
+      // ≥769px: the button is hidden; only the <=768px media query shows it.
+      const base = (seoSrc.match(/\.nav-menu-btn \{ display: none; \}/g) || []).length;
+      const mq = (seoSrc.match(/@media \(max-width: 768px\) \{\n    \.nav \{ padding: 0 16px; \}\n    \.nav-links \{ display: none; \}\n    \.nav-menu-btn \{ display: inline-flex;/g) || []).length;
+      assertTrue(base === 1 && mq === 1, "F2b CSS: «Meny» hidden by default, shown only inside @media (max-width: 768px)");
+      assertTrue(/<noscript><style>@media \(max-width: 768px\) \{ \.nav-menu-btn \{ display: none !important; \}[^<]*\.nav-links \{ display: flex;/.test(invokeGet(seoRouter, "/om", "no").body), "F2b no-JS: links shown in the header, button hidden");
+      // flag rule unchanged: off ⇒ the menu's «For produsenter» is /selger
+      delete process.env[FLAG];
+      const offPanel = navOf(invokeGet(seoRouter, "/om", "no").body);
+      assertTrue(offPanel.includes('<a href="/selger" class="nav-cta">') && !offPanel.includes("/for-produsenter") && offPanel.includes('aria-controls="navLinks"'), "F2b flag off: the menu's «For produsenter» still → /selger (same rule as desktop)");
+      assertTrue(invokeGet(seoRouter, FOR_PRODUSENTER_PATH, "no").nextCalled, "F2b flag off: /for-produsenter still 404");
+      process.env[FLAG] = "1";
+    }
 
     // ── 4. AC4: FAQPage JSON-LD == visible Q/A ────────────────────────────
     for (const [l, b] of [["NO", no.body], ["EN", en.body]] as const) {
@@ -198,7 +263,7 @@ export async function runRfbForProdusenterTests(opts: { log?: boolean } = {}): P
       assertTrue(no.body.includes(`<strong>${e.label.no}</strong>`), `#mine-valg lists live choice «${e.label.no}»`);
     }
     // No coming_soon label in the «Dette kan du velge i dag» list.
-    const todayList = (no.body.match(/Dette kan du velge i dag:<\/p>\s*<ul class="fp-list">([\s\S]*?)<\/ul>/) || ["", ""])[1];
+    const todayList = (no.body.match(/data-feature="mine_valg"[\s\S]*?<ul class="fp-list">([\s\S]*?)<\/ul>/) || ["", ""])[1];
     const todayLabels = [...todayList.matchAll(/<strong>([\s\S]*?)<\/strong>/g)].map((m) => decode(m[1]));
     assertTrue(todayLabels.length > 0, "#mine-valg: the «i dag» list is present");
     for (const e of OWNER_FEATURE_REGISTRY.filter((x) => x.verticals.includes("rfb") && ownerFeatureStatus(x) === "coming_soon")) {
@@ -224,29 +289,29 @@ export async function runRfbForProdusenterTests(opts: { log?: boolean } = {}): P
     assertTrue(no.body.includes(`minst ${facts.publicStatsMinViews} sidevisninger fra mennesker de siste 12 månedene`) && no.body.includes("Du ser alltid dine egne tall"), "#statistikk: public threshold from publicStatsMinViews(); owner always sees own numbers");
     assertTrue(no.body.includes("En rapport på e-post er planlagt") && !/månedsrapport/i.test(no.body), "#statistikk: no monthly report promised");
     // ── 6. Flag-dependent promises: both states ───────────────────────────
-    const base = { ...facts, autocompleteOn: false, buyerReceiptsOn: false, orderabilityPortalOn: false, stockCheckEmailOn: false };
+    // F2a: pilot functions carry a state (owner-features/today-facts.ts), not a raw flag.
+    const allState = (st: "for_alle" | "i_pilot" | "planlagt") => ({ mine_valg: st, varer: st, kanseller: st, lagerpaminnelse: st, myk_utlop: st });
+    const base = { ...facts, autocompleteOn: false, buyerReceiptsOn: false, pilot: allState("planlagt") };
     const offAll = mod.renderForProdusenterPage("no", "https://x/for-produsenter", base).content;
-    const onAll = mod.renderForProdusenterPage("no", "https://x/for-produsenter", { ...base, buyerReceiptsOn: true, orderabilityPortalOn: true, stockCheckEmailOn: true }).content;
+    const onAll = mod.renderForProdusenterPage("no", "https://x/for-produsenter", { ...base, buyerReceiptsOn: true, pilot: allState("for_alle") }).content;
     const offAllEn = mod.renderForProdusenterPage("en", "https://x/en/for-produsenter", base).content;
-    const onAllEn = mod.renderForProdusenterPage("en", "https://x/en/for-produsenter", { ...base, buyerReceiptsOn: true, orderabilityPortalOn: true, stockCheckEmailOn: true }).content;
+    const onAllEn = mod.renderForProdusenterPage("en", "https://x/en/for-produsenter", { ...base, buyerReceiptsOn: true, pilot: allState("for_alle") }).content;
     // a. buyer told on cancellation only with ORDER_BUYER_RECEIPTS_ENABLED
     assertTrue(!offAll.includes("kunden får beskjed") && onAll.includes("blir den kansellert, og kunden får beskjed"), "receipts flag: NO promises the buyer notice only when on");
     assertTrue(!offAllEn.includes("customer is told") && onAllEn.includes("and the customer is told"), "receipts flag: EN mirrors it");
     const { isBuyerReceiptsEnabled } = require("../services/order-receipt-service") as typeof import("../services/order-receipt-service");
     assertTrue(facts.buyerReceiptsOn === isBuyerReceiptsEnabled(), "facts.buyerReceiptsOn reads isBuyerReceiptsEnabled()");
-    // b. «eierportalen» for stock/products only with OWNER_ORDERABILITY_PORTAL_ENABLED
-    assertTrue(!offAll.includes("på lager i eierportalen") && !offAll.includes("legg inn varene i eierportalen") && offAll.includes("under «Tilgjengelighet» i fanen «Produkter»"), "portal flag off: stock/products not claimed for the owner portal (NO)");
-    assertTrue(onAll.includes("Merk varene som på lager i eierportalen") && onAll.includes("legg inn varene i eierportalen"), "portal flag on: owner-portal wording (NO)");
-    assertTrue(!offAllEn.includes("in the owner portal. The stock") && !offAllEn.includes("add your goods in the owner portal") && onAllEn.includes("add your goods in the owner portal"), "portal flag: EN mirrors it");
-    const { ownerOrderabilityPortalEnabled } = require("../services/owner-orderability") as typeof import("../services/owner-orderability");
-    assertTrue(facts.orderabilityPortalOn === ownerOrderabilityPortalEnabled(), "facts.orderabilityPortalOn reads ownerOrderabilityPortalEnabled()");
-    // c. stock-check reminder listed «i dag» only with STOCK_CHECK_EMAIL_ENABLED
+    // b. «Varer» in the owner portal for stock/products only while «Varer» is for everyone
+    assertTrue(!offAll.includes("på lager under «Varer» i eierportalen") && !offAll.includes("legg inn varene under «Varer»") && offAll.includes("under «Tilgjengelighet» i fanen «Produkter»"), "«Varer» planned: stock/products not claimed for the owner portal (NO)");
+    assertTrue(onAll.includes("Merk varene som på lager under «Varer» i eierportalen") && onAll.includes("legg inn varene under «Varer» i eierportalen"), "«Varer» for everyone: owner-portal wording (NO)");
+    assertTrue(!offAllEn.includes("add your goods under «Varer»") && onAllEn.includes("add your goods under «Varer» (goods) in the owner portal"), "«Varer»: EN mirrors it");
+    // c. stock-check reminder: the choice is listed only while the reminder is not «planlagt»
     const stockLabel = OWNER_FEATURE_REGISTRY.find((e) => e.key === "products.stock_check")!.label.no;
-    assertTrue(!offAll.includes(`<strong>${stockLabel}</strong>`) && offAll.includes("Påminnelse på e-post om å bekrefte lagerstatus er også planlagt"), "stock-check flag off: not in the «i dag» list, called planned");
-    assertTrue(onAll.includes(`<strong>${stockLabel}</strong>`) && !onAll.includes("lagerstatus er også planlagt"), "stock-check flag on: listed as available");
-    assertTrue(!mod.liveRfbOwnerChoices(base).some((e) => e.key === "products.stock_check") && mod.liveRfbOwnerChoices({ ...base, stockCheckEmailOn: true }).some((e) => e.key === "products.stock_check"), "liveRfbOwnerChoices honours the stock-check flag");
-    const { isStockCheckEmailEnabled } = require("../services/stock-check-reminder") as typeof import("../services/stock-check-reminder");
-    assertTrue(facts.stockCheckEmailOn === isStockCheckEmailEnabled(), "facts.stockCheckEmailOn reads isStockCheckEmailEnabled()");
+    assertTrue(!offAll.includes(`<strong>${stockLabel}</strong>`) && offAll.includes("Påminnelse på e-post om å bekrefte lagerstatus er planlagt."), "stock-check planned: not in the list, called planned");
+    assertTrue(onAll.includes(`<strong>${stockLabel}</strong>`) && !onAll.includes("lagerstatus er planlagt"), "stock-check for everyone: listed as available");
+    assertTrue(!mod.liveRfbOwnerChoices(base).some((e) => e.key === "products.stock_check") && mod.liveRfbOwnerChoices({ ...base, pilot: allState("i_pilot") }).some((e) => e.key === "products.stock_check"), "liveRfbOwnerChoices honours the stock-check state");
+    const { currentPilotStates } = require("../owner-features/today-facts") as typeof import("../owner-features/today-facts");
+    assertTrue(JSON.stringify(facts.pilot) === JSON.stringify(currentPilotStates()), "facts.pilot reads currentPilotStates() (today-facts.ts)");
     // Consent + contact is required for every real order (cart-service F2).
     assertTrue(/CONTACT_REQUIRED_ERROR/.test(cartSvc) && no.body.includes("Kunden må oppgi e-post eller telefon og godta at du får den"), "#bestillinger: buyer contact + consent is always required (CONTACT_REQUIRED_ERROR)");
     // Badge claim

@@ -307,17 +307,27 @@ export async function runClaimAssessmentTests(opts: { log?: boolean } = {}): Pro
       const N = 512 * 1024;
       for (const [name, unit] of [["<", "<"], ["<script", "<script"], ["<style", "<style "], ["<a", "<a"], ["digit-dots", "1. "]] as const) {
         const html = unit.repeat(Math.ceil(N / unit.length));
-        const t = Date.now();
-        const pg = preparePage(html, Infinity);
-        pageHasEmail(pg, "post@gard.no"); pageHasOrgNr(pg, ORG); pageHasPhone(pg, "91234567"); pageHasAddress(pg, "Gardsvegen 12");
-        pageHasEmail(html, "post@gard.no"); pageHasOrgNr(html, ORG); pageHasPhone(html, "91234567"); pageHasAddress(html, "Gardsvegen 12");
-        const ms = Date.now() - t;
+        // Fastest of 3: a real ReDoS is slow on every run, a GC pause or a busy runner only on some
+        // (the determinism gate saw one 447 ms run). The 200 ms bound is unchanged.
+        let ms = Infinity;
+        for (let run = 0; run < 3; run++) {
+          const t = Date.now();
+          const pg = preparePage(html, Infinity);
+          pageHasEmail(pg, "post@gard.no"); pageHasOrgNr(pg, ORG); pageHasPhone(pg, "91234567"); pageHasAddress(pg, "Gardsvegen 12");
+          pageHasEmail(html, "post@gard.no"); pageHasOrgNr(html, ORG); pageHasPhone(html, "91234567"); pageHasAddress(html, "Gardsvegen 12");
+          ms = Math.min(ms, Date.now() - t);
+        }
         ok(ms < 200, `redos: 512 KB of «${name}» prepared and checked in < 200 ms (took ${ms} ms)`);
       }
       const closedBlocks = "<style>x</style>".repeat(40_000) + "<p>Org.nr 912 345 678</p>";
-      const tb = Date.now();
-      ok(pageHasOrgNr(preparePage(closedBlocks, Infinity), ORG), "page: text after many closed style blocks is kept");
-      ok(Date.now() - tb < 200, "redos: many closed style blocks without a script stay linear");
+      let closedMs = Infinity, closedKept = true;
+      for (let run = 0; run < 3; run++) {
+        const tb = Date.now();
+        closedKept = pageHasOrgNr(preparePage(closedBlocks, Infinity), ORG) && closedKept;
+        closedMs = Math.min(closedMs, Date.now() - tb);
+      }
+      ok(closedKept, "page: text after many closed style blocks is kept");
+      ok(closedMs < 200, `redos: many closed style blocks without a script stay linear (fastest of 3: ${closedMs} ms)`);
       ok(!pageHasOrgNr("<script>var x = '912345678';</script>", ORG), "page: script content is not page text");
       ok(!pageHasOrgNr("<p>hei</p><script>912345678", ORG), "page: an unclosed script drops the rest of the page");
       ok(pageHasEmail("<p>Skriv til post&#64;gard.no</p>", "post@gard.no"), "page: &#64; entity decoded");

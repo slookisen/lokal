@@ -35,6 +35,7 @@
 import crypto from "crypto";
 import { getDb } from "../database/init";
 import {
+  isProducerStatedSource,
   orderabilityReasons,
   producerOrderability,
   type OrderabilityReason,
@@ -160,14 +161,21 @@ export function confirmOwnerProductInStock(
   return out;
 }
 
-/** «Bekreft alle på lager»: every confirmable row of this producer, in one transaction. */
+/**
+ * «Bekreft alle på lager»: every confirmable row of this producer, in one transaction.
+ * T13 V1a: with `ids` («Bekreft alle ({n})» in the «Varer» card) only those
+ * ids, and of them only this producer's producer-stated rows — an id of
+ * another producer, or a scraped row sent along, is left untouched (a scraped
+ * row keeps its source); the B1 confirmable rule still applies.
+ */
 export function confirmAllOwnerProductsInStock(
   agentId: string,
-  opts: { db?: any; actorEmail?: string | null; now?: Date } = {},
+  opts: { db?: any; actorEmail?: string | null; now?: Date; ids?: readonly string[] } = {},
 ): { ok: true; confirmed: number; skipped_missing_price: number } {
   const db = opts.db ?? getDb();
   const now = opts.now ?? new Date();
-  const all = readRows(db, agentId);
+  const wanted = opts.ids ? new Set(opts.ids) : null;
+  const all = readRows(db, agentId).filter((r) => !wanted || (wanted.has(r.id) && isProducerStatedSource(r.availability_source)));
   // Unpriced rows a confirmation could otherwise fix: counted for the owner's message.
   const skipped_missing_price = all.filter((r) => r.price_nok == null
     && !orderabilityReasons(db, r, now, { eligible: true, reasons: [] }).reasons.some((x) => NOT_CONFIRMABLE.has(x.code))).length;
@@ -178,7 +186,8 @@ export function confirmAllOwnerProductsInStock(
       if (setProducerAvailabilityByProductId(agentId, r.id, "in_stock", db).success) confirmed++;
     }
     if (confirmed > 0) {
-      auditOwnerProductChange(db, agentId, "products.availability", null, "in_stock", opts.actorEmail ?? null, `owner confirmed all in stock: ${confirmed} item(s) (B1)`);
+      auditOwnerProductChange(db, agentId, "products.availability", null, "in_stock", opts.actorEmail ?? null,
+        wanted ? `owner confirmed ${confirmed} listed item(s) in stock (T13)` : `owner confirmed all in stock: ${confirmed} item(s) (B1)`);
     }
   })();
   return { ok: true, confirmed, skipped_missing_price };
@@ -191,23 +200,45 @@ export interface OwnerNewProductInput {
   ingredients?: unknown;
   allergens?: unknown;
   net_weight?: unknown;
+  /** T13 V1b: «Kategori (valgfritt)» (products.category, max 40). */
+  category?: unknown;
+  /**
+   * T13 V1b: «Varen er på lager nå». true/undefined → in stock (as before);
+   * false → the row is written as the producer's statement 'out_of_stock'.
+   */
+  in_stock?: boolean;
+  /** T13 V1b: «Er varen ferdigpakket?» = ja → ingredients, allergens and net weight are required. */
+  packaged?: boolean;
 }
 
 export type AddProductResult =
-  | { ok: true; product_id: string }
+  | { ok: true; product_id: string; in_stock: boolean }
   | { ok: false; error: "invalid"; fields: OwnerProductField[] }
   | { ok: false; error: "exists" };
 
-export type OwnerProductField = "name" | "price" | "unit" | "ingredients" | "allergens" | "net_weight";
+/** The B1 form fields (their texts are OWNER_PRODUCT_FIELD_TEXT_NB). */
+export type OwnerProductB1Field = "name" | "price" | "unit" | "ingredients" | "allergens" | "net_weight";
+/**
+ * T13 V1b adds the category and the three «required for ferdigpakket» cases;
+ * their texts are in owner-items-view OWNER_ITEMS_INVENTED_TEXT_NB.fieldErrors.
+ */
+export type OwnerProductField = OwnerProductB1Field | "category" | "ingredients_required" | "allergens_required" | "net_weight_required";
 
 /** validateProducerList's messages start with the field name; map them to the form's fields. */
 function invalidFields(errors: string[]): OwnerProductField[] {
   const out = new Set<OwnerProductField>();
   for (const e of errors) {
-    const f = e.replace(/^products\[0\]: /, "").split(" ")[0];
+    const msg = e.replace(/^products\[0\]: /, "");
+    const f = msg.split(" ")[0];
+    const required = /påkrevd for ferdigpakket/.test(msg);
     if (f === "price_nok") out.add("price");
-    else if (f === "name" || f === "unit" || f === "ingredients" || f === "allergens" || f === "net_weight") out.add(f);
+    else if (required && (f === "ingredients" || f === "allergens" || f === "net_weight")) out.add(`${f}_required` as OwnerProductField);
+    else if (f === "name" || f === "unit" || f === "ingredients" || f === "allergens" || f === "net_weight" || f === "category") out.add(f);
     else out.add("name");
+  }
+  // A too-long value is also «missing» to the packaged rule: name only the length.
+  for (const f of ["ingredients", "allergens", "net_weight"] as const) {
+    if (out.has(f)) out.delete(`${f}_required` as OwnerProductField);
   }
   return Array.from(out);
 }
@@ -216,7 +247,10 @@ function text(v: unknown): string {
   return typeof v === "string" ? v.trim() : "";
 }
 
-/** «Ny vare»: the form's text fields → one validated row, written as producer-stated and in stock. */
+/** T13 V1b: «ingen» in the allergen field = the producer states none ('[]'). */
+const NO_ALLERGENS_RE = /^(ingen|ingen allergener)\.?$/i;
+
+/** «Ny vare»: the form's text fields → one validated row, written as producer-stated (in stock unless `in_stock: false`). */
 export function addOwnerProduct(
   agentId: string,
   input: OwnerNewProductInput,
@@ -226,11 +260,17 @@ export function addOwnerProduct(
   const priceText = text(input.price).replace(/\s/g, "").replace(",", ".");
   const price = priceText && /^\d+(\.\d{1,2})?$/.test(priceText) ? Number(priceText) : NaN;
   const allergensText = text(input.allergens);
-  const allergens = allergensText ? allergensText.split(",").map((a) => a.trim()).filter(Boolean) : undefined;
+  const allergens = !allergensText
+    ? undefined
+    : NO_ALLERGENS_RE.test(allergensText) ? [] : allergensText.split(",").map((a) => a.trim()).filter(Boolean);
+  const inStock = input.in_stock !== false;
   const v = validateProducerList([{
     name: text(input.name) || undefined,
     price_nok: price,
     unit: text(input.unit) || undefined,
+    category: text(input.category) || undefined,
+    availability: inStock ? "in_stock" : "out_of_stock",
+    packaged: input.packaged === true,
     ingredients: text(input.ingredients) || undefined,
     allergens,
     net_weight: text(input.net_weight) || undefined,
@@ -246,13 +286,49 @@ export function addOwnerProduct(
   db.transaction(() => {
     db.prepare(
       `INSERT INTO products
-         (id, agent_id, name, name_norm, unit, price_nok, currency, availability, source,
+         (id, agent_id, name, name_norm, unit, price_nok, currency, availability, category, source,
           availability_updated_at, availability_source, ingredients, allergens, net_weight, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'NOK', 'in_stock', 'owner', datetime('now'), 'producer_dashboard', ?, ?, ?, datetime('now'), datetime('now'))`,
-    ).run(id, agentId, p.name, nameNorm, p.unit, p.price_nok, p.ingredients, allergensJson, p.net_weight);
-    auditOwnerProductChange(db, agentId, "products.added", null, p.name, opts.actorEmail ?? null, "owner added a product (B1)");
+       VALUES (?, ?, ?, ?, ?, ?, 'NOK', ?, ?, 'owner', datetime('now'), 'producer_dashboard', ?, ?, ?, datetime('now'), datetime('now'))`,
+    ).run(id, agentId, p.name, nameNorm, p.unit, p.price_nok, p.availability, p.category, p.ingredients, allergensJson, p.net_weight);
+    auditOwnerProductChange(db, agentId, "products.added", null, p.name, opts.actorEmail ?? null,
+      inStock ? "owner added a product (B1)" : "owner added a product, not in stock (T13)");
   })();
-  return { ok: true, product_id: id };
+  return { ok: true, product_id: id, in_stock: inStock };
+}
+
+export type MarkSoldOutResult =
+  | { ok: true; changed: boolean }
+  | { ok: false; error: "not_found" | "not_markable" };
+
+/**
+ * T13 V1b «Merk som utsolgt» for one row of this producer, through the same
+ * write path as «Bekreft på lager» (supply-graph
+ * setProducerAvailabilityByProductId, availability 'out_of_stock', fresh
+ * timestamp; an 'admin_producer_confirmed' row keeps its source). Only a
+ * producer-stated row that a stock statement can describe (not a category
+ * label, alcohol or a service; not a scraped row). An already sold-out row is
+ * left as it is (its date stays). «På lager igjen» is confirmOwnerProductInStock.
+ */
+export function markOwnerProductSoldOut(
+  agentId: string,
+  productId: string,
+  opts: { db?: any; actorEmail?: string | null; now?: Date } = {},
+): MarkSoldOutResult {
+  const db = opts.db ?? getDb();
+  const row = readRows(db, agentId).find((r) => r.id === productId);
+  if (!row) return { ok: false, error: "not_found" };
+  if (!isProducerStatedSource(row.availability_source)) return { ok: false, error: "not_markable" };
+  const reasons = orderabilityReasons(db, row, opts.now ?? new Date(), { eligible: true, reasons: [] }).reasons;
+  if (reasons.some((x) => NOT_CONFIRMABLE.has(x.code))) return { ok: false, error: "not_markable" };
+  if (row.availability === "out_of_stock") return { ok: true, changed: false };
+  let out: MarkSoldOutResult = { ok: false, error: "not_found" };
+  db.transaction(() => {
+    const w = setProducerAvailabilityByProductId(agentId, productId, "out_of_stock", db);
+    if (!w.success) return;
+    auditOwnerProductChange(db, agentId, "products.availability", row.availability, "out_of_stock", opts.actorEmail ?? null, `owner marked sold out: ${row.name} (T13)`);
+    out = { ok: true, changed: true };
+  })();
+  return out;
 }
 
 // ─── Owner-facing words (bokmål) ────────────────────────────────────────────
@@ -285,7 +361,7 @@ export function orderabilityReasonTextNb(r: OrderabilityReason): string {
 }
 
 /** Form field → what is wrong with it. */
-export const OWNER_PRODUCT_FIELD_TEXT_NB: Record<OwnerProductField, string> = {
+export const OWNER_PRODUCT_FIELD_TEXT_NB: Record<OwnerProductB1Field, string> = {
   name: "Navn mangler eller er for langt (maks 120 tegn).",
   price: "Pris må være et tall over 0, f.eks. 89 eller 89,50.",
   unit: "Enhet er for lang (maks 30 tegn).",

@@ -427,6 +427,10 @@
                 <div id="aiDeliveriesPanel"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
             <div class="panel panel-full">
+                <div class="panel-title" title="Besøk fra folk som klikket seg inn på en profil fra et svar i en AI-assistent (ChatGPT, Claude, Perplexity …). Tallet er et minimum: ikke alle AI-er sier fra hvor besøket kom fra. Klikkrate = klikk per 100 ganger profilene var sendt til AI (Med i AI-søk) de samme dagene. Faste perioder, uavhengig av tidsvalget over.">🔗 Klikk fra AI-svar (besøk fra folk som klikket seg inn fra et AI-svar)</div>
+                <div id="aiClicksPanel"><div class="loading"><div class="spinner"></div>Laster...</div></div>
+            </div>
+            <div class="panel panel-full">
                 <div class="panel-title">👥 Siste aktivitet (alle klienter) <span class="panel-note" data-raw-note></span></div>
                 <div id="visitorTable"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
@@ -717,6 +721,13 @@
                 document.getElementById("aiDeliveriesPanel").innerHTML = '<div class="empty-state">Kunne ikke hente tallene</div>';
             });
         }
+
+        // «Klikk fra AI-svar» per site: fixed 60 days + whole period, loaded on
+        // its own so a failure here never blanks the rest of the dashboard.
+        api("/ai-clicks?limit=10").then(renderAiClicks).catch(function(err) {
+            console.error("ai-clicks load failed:", err);
+            document.getElementById("aiClicksPanel").innerHTML = '<div class="empty-state">Kunne ikke hente tallene</div>';
+        });
 
         // «Begge»-visning: hent eksplisitte per-vertikal-tall til
         // sammenligningsstripen (uavhengig av hovedlastingen over).
@@ -1344,6 +1355,59 @@
                 + top.map(function(p) { return '<tr><td><strong>' + escHtml(p.name || p.profileId) + '</strong></td><td>' + fmtNum(p.total) + '</td></tr>'; }).join("")
                 + '</tbody></table>'
             : '<div class="empty-state">Ingen profiler med i AI-søk enda</div>';
+        el.innerHTML = html;
+    }
+
+    // ─── Klikk fra AI-svar (people who came to a profile from an AI answer) ──
+    // Never «60 d» or 0 for a counting younger than the window: the server's
+    // `display` says «Fra <dato>» (no number) or «siden <dato>» until a whole
+    // window has passed. Rate «–» when nothing was sent to AI those days.
+    var AI_CLICK_SITES = { rfb: "Rett fra Bonden", dental: "Finn-tannlege", experiences: "Opplevagent" };
+    var AI_CLICK_VENDORS = { chatgpt: "ChatGPT", claude: "Claude", perplexity: "Perplexity", gemini: "Gemini", copilot: "Copilot", other: "Andre AI" };
+    function aiClickCount(s) {
+        if (!s || !s.display) return "–";
+        return s.display.showNumber
+            ? '<strong>' + fmtNum(s.total) + '</strong> <span style="color:var(--text-dim)">' + escHtml(s.display.period) + '</span>'
+            : '<span style="color:var(--text-dim)">' + escHtml(s.display.period) + '</span>';
+    }
+    function aiClickRate(r) {
+        if (!r || r.per100 === null || r.per100 === undefined) return "–";
+        return escHtml(fmtDec(r.per100, r.per100 < 10 ? 1 : 0));
+    }
+    function renderAiClicks(d) {
+        var el = document.getElementById("aiClicksPanel");
+        var list = (d && d.verticals) || [];
+        if (!list.length) { el.innerHTML = '<div class="empty-state">Ingen tall enda</div>'; return; }
+        var html = '<table class="data-table"><thead><tr><th>Side</th><th>' + fmtNum(d.windowDays) + ' d</th><th>Hele perioden</th><th title="Klikk fra AI-svar per 100 ganger profilene var sendt til AI de samme dagene">Klikkrate (per 100 sendt)</th></tr></thead><tbody>';
+        html += list.map(function(v) {
+            var r = v.rate || {};
+            var rateTitle = r.sinceDay ? fmtNum(r.clicks) + ' klikk / ' + fmtNum(r.deliveries) + ' sendt til AI siden ' + r.sinceDay : fmtNum(r.deliveries) + ' sendt til AI, ingen klikk registrert enda';
+            return '<tr><td><strong>' + escHtml(AI_CLICK_SITES[v.vertical] || v.vertical) + '</strong></td><td>' + aiClickCount(v.last60d) + '</td><td>' + aiClickCount(v.allTime) + '</td><td title="' + escHtml(rateTitle) + '">' + aiClickRate(r) + '</td></tr>';
+        }).join("") + '</tbody></table>';
+        list.forEach(function(v) {
+            var site = escHtml(AI_CLICK_SITES[v.vertical] || v.vertical);
+            if (!v.countingSince) { html += '<div class="empty-state">' + site + ': ingen klikk fra AI-svar registrert enda</div>'; return; }
+            var w = v.last60d || {}, a = v.allTime || {};
+            var vendors = Object.keys(AI_CLICK_VENDORS).filter(function(k) { return ((w.byVendor || {})[k] || 0) > 0 || ((a.byVendor || {})[k] || 0) > 0; });
+            var p60 = w.display ? escHtml(w.display.period) : fmtNum(d.windowDays) + " d";
+            var pAll = a.display ? escHtml(a.display.period) : "Hele perioden";
+            if (vendors.length) {
+                html += '<table class="data-table" style="margin-top:8px"><thead><tr><th>' + site + ' per AI</th><th>' + p60 + '</th><th>' + pAll + '</th></tr></thead><tbody>'
+                    + vendors.map(function(k) { return '<tr><td>' + escHtml(AI_CLICK_VENDORS[k]) + '</td><td>' + fmtNum((w.byVendor || {})[k]) + '</td><td>' + fmtNum((a.byVendor || {})[k]) + '</td></tr>'; }).join("")
+                    + '</tbody></table>';
+            }
+            var top = v.top || [];
+            if (top.length) {
+                html += '<table class="data-table" style="margin-top:8px"><thead><tr><th>' + site + ': topp profiler (' + p60 + ')</th><th>Klikk fra AI-svar</th></tr></thead><tbody>'
+                    + top.map(function(t) {
+                        var label = '<strong>' + escHtml(t.name || t.profileId) + '</strong>';
+                        var cell = (typeof t.url === "string" && /^https?:\/\//.test(t.url)) ? '<a href="' + escHtml(t.url) + '" target="_blank" rel="noopener noreferrer">' + label + '</a>' : label;
+                        return '<tr><td>' + cell + '</td><td>' + fmtNum(t.total) + '</td></tr>';
+                    }).join("")
+                    + '</tbody></table>';
+            }
+        });
+        html += '<div style="font-size:11px;color:var(--text-dim);margin-top:6px">Mennesker som kom fra et AI-svar (henvisning fra en AI eller AI-merket lenke), én gang per besøkende og profil per 30 min. Et minimum. «–»: ingenting sendt til AI de samme dagene.</div>';
         el.innerHTML = html;
     }
 

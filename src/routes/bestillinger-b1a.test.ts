@@ -223,7 +223,7 @@ export async function runBestillingerB1aTests(opts: { log?: boolean } = {}): Pro
           `portal-2.${i}: off the list → no card, no banner, no B1 form`);
       }
       const tp = await portal(TP);
-      assertTrue(tp.includes(`id="bestillbare-varer"`) && tp.includes("Varer som kan bestilles"), "portal-3: the test producer on the list sees the card");
+      assertTrue(tp.includes(`id="bestillbare-varer"`) && tp.includes("<h2>Varer</h2>"), "portal-3: the test producer on the list sees the card");
       assertTrue(tp.includes('data-stock-check-banner="1"') && tp.includes(`name="id" value="${TP}-soon"`), "portal-4: … and the stock-check banner with its soon-expiring item");
       assertTrue((await portal(TP, { status: "vare_bekreftet" })).includes("Varen er bekreftet på lager."), "portal-5: … and the B1 alert");
       assertEq([oo.ownerOrderabilityPortalEnabledFor(TP), oo.ownerOrderabilityPortalEnabledFor(REAL), oo.ownerOrderabilityPortalEnabledFor("")], [true, false, false],
@@ -243,7 +243,7 @@ export async function runBestillingerB1aTests(opts: { log?: boolean } = {}): Pro
       }
       assertEq([productsOf(REAL), auditCount()], [before, a0], "route-2: off the list → nothing written, no audit row");
       const r = await invoke(H.one, makeReq({ params: { agentId: TP, productId: `${TP}-out` }, token: tokens[TP], headers: ORIGIN }));
-      assertEq([r.status, r.body?.__redirect], [303, `/eier/${TP}/portal?status=vare_bekreftet#bestillbare-varer`], "route-3: on the list → POST bekreft works (303 back to the card)");
+      assertEq([r.status, r.body?.__redirect], [303, `/eier/${TP}/portal?status=vare_bekreftet&ved=vare-${TP}-out#vare-${TP}-out`], "route-3: on the list → POST bekreft works (303 back to the row, T13)");
       assertEq((db.prepare("SELECT availability FROM products WHERE id = ?").get(`${TP}-out`) as any).availability, "in_stock", "route-4: … and writes");
       delete process.env.OWNER_ORDERABILITY_PORTAL_ENABLED;
       const off = await invoke(H.one, makeReq({ params: { agentId: TP, productId: `${TP}-out` }, token: tokens[TP], headers: ORIGIN }));

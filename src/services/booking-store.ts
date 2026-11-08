@@ -1355,7 +1355,10 @@ export async function processBookingFollowups(
           UPDATE gardssalg_bookings SET expired_guest_notified_at = ?
           WHERE booking_id = ? AND expired_guest_notified_at IS NULL
         `).run(now.toISOString(), booking.booking_id);
-        if (claim.changes === 1) {
+        if (claim.changes === 1 && !booking.guest_email?.trim()) {
+          // Guest contact already cleared by the gardssalg-guest-contact-sweep:
+          // nothing to e-mail. The claim stays set so the row is not re-examined.
+        } else if (claim.changes === 1) {
           try {
             await sendPrevisitExpiredToGuest(booking);
             result.expired_guests_notified++;

@@ -355,8 +355,10 @@ export async function runOwnerAuditLogTests(opts: { log?: boolean } = {}): Promi
       ];
       for (const [what, v] of shapes) {
         f("text", v); // warm
-        const viaFormat = Math.max(ms(() => f("text", v)), ms(() => f("text", v)));
-        const viaStrip = Math.max(ms(() => lg.stripEmailAddresses(v)), ms(() => lg.stripEmailAddresses(v)));
+        // Fastest of 3: a real ReDoS is slow on every run, a GC pause or a busy runner only on some
+        // (main d006a44 went red on one 65.7 ms run). The 50 ms bound is unchanged.
+        const viaFormat = Math.min(ms(() => f("text", v)), ms(() => f("text", v)), ms(() => f("text", v)));
+        const viaStrip = Math.min(ms(() => lg.stripEmailAddresses(v)), ms(() => lg.stripEmailAddresses(v)), ms(() => lg.stripEmailAddresses(v)));
         assertTrue(viaFormat < 50 && viaStrip < 50, `v14 (ReDoS): 200k ${what} — the shown value and stripEmailAddresses alone each under 50 ms`, `format ${viaFormat.toFixed(1)} ms, strip ${viaStrip.toFixed(1)} ms`);
       }
       // The cap keeps what the owner sees: an early address is still stripped, the cut word is dropped, the value ends with «…».

@@ -359,6 +359,11 @@ function pwaHeadTags(opts: { includeThemeColor?: boolean } = {}): string {
 // item 3) so untrusted DB text (provider names, kommune names, …) gets the
 // exact same `& < > " '` escaping there as everywhere else in this file —
 // XML escaping doesn't differ from HTML escaping for that character set.
+/** Gårdssalg guest-contact sweep leaves '' in guest_name/guest_email: render «slettet». */
+export function escapeOrDeleted(text: unknown): string {
+  return typeof text === "string" && text.trim() ? escapeHtml(text) : "slettet";
+}
+
 export function escapeHtml(text: unknown): string {
   return String(text ?? "")
     .replace(/&/g, "&amp;")
@@ -7221,10 +7226,10 @@ ${BROWSE_CSS}
     <div class="recap">
       <div><strong>Dato/tid:</strong> ${escapeHtml(slotFormatted)}</div>
       <div><strong>Antall:</strong> ${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</div>
-      <div><strong>Navn:</strong> ${escapeHtml(booking.guest_name)}</div>
+      <div><strong>Navn:</strong> ${escapeOrDeleted(booking.guest_name)}</div>
       ${booking.notes ? `<div><strong>Kommentar:</strong> ${escapeHtml(booking.notes)}</div>` : ""}
     </div>
-    <p class="hint">En bekreftelse er sendt til ${escapeHtml(booking.guest_email)}.</p>
+    <p class="hint">En bekreftelse er sendt til ${escapeOrDeleted(booking.guest_email)}.</p>
     <a class="ics-link" href="${icsUrl}">Last ned kalenderfil (.ics)</a>
   </div>
 </main>
@@ -7361,8 +7366,8 @@ ${BROWSE_CSS}
     <div class="recap">
       <div><strong>Dato/tid:</strong> ${escapeHtml(slotFormatted)}</div>
       <div><strong>Antall:</strong> ${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</div>
-      <div><strong>Gjest:</strong> ${escapeHtml(booking.guest_name)}</div>
-      <div><strong>E-post:</strong> ${escapeHtml(booking.guest_email)}</div>
+      <div><strong>Gjest:</strong> ${escapeOrDeleted(booking.guest_name)}</div>
+      <div><strong>E-post:</strong> ${escapeOrDeleted(booking.guest_email)}</div>
       ${booking.guest_phone ? `<div><strong>Telefon:</strong> ${escapeHtml(booking.guest_phone)}</div>` : ""}
       ${booking.notes ? `<div><strong>Kommentar fra gjesten:</strong> ${escapeHtml(booking.notes)}</div>` : ""}
     </div>
@@ -7515,8 +7520,8 @@ function previsitRecapHtml(booking: GardssalgBooking, forProducer: boolean): str
       <div><strong>Dato/tid:</strong> ${escapeHtml(previsitSlotNb(booking.slot_at))}</div>
       ${booking.suggested_slot_at && booking.pre_status === "time_suggested" ? `<div><strong>Foreslått nytt tidspunkt:</strong> ${escapeHtml(previsitSlotNb(booking.suggested_slot_at))}</div>` : ""}
       <div><strong>Antall:</strong> ${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</div>
-      ${forProducer ? `<div><strong>Gjest:</strong> ${escapeHtml(booking.guest_name)}</div>
-      <div><strong>E-post:</strong> ${escapeHtml(booking.guest_email)}</div>
+      ${forProducer ? `<div><strong>Gjest:</strong> ${escapeOrDeleted(booking.guest_name)}</div>
+      <div><strong>E-post:</strong> ${escapeOrDeleted(booking.guest_email)}</div>
       ${booking.guest_phone ? `<div><strong>Telefon:</strong> ${escapeHtml(booking.guest_phone)}</div>` : ""}
       ${booking.notes ? `<div><strong>Kommentar fra gjesten:</strong> ${escapeHtml(booking.notes)}</div>` : ""}` : ""}
     </div>`;
@@ -9866,7 +9871,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=3600");
   res.send(legalPage("Personvern / Privacy", `<div class="lang"><a href="#en">English</a></div>
-<h1>Personvern</h1><p><strong>Sist oppdatert:</strong> 13. oktober 2026</p>
+<h1>Personvern</h1><p><strong>Sist oppdatert:</strong> 8. november 2026</p>
 <p>Opplevagent (opplevagent.no) er en agent-til-agent-markedsplass som hjelper AI-agenter og mennesker med å finne norske opplevelser og aktiviteter — turer, kurs, severdigheter og ting å gjøre. Vi respekterer personvernet til tilbydere, brukere og AI-agenter som samhandler med plattformen.</p>
 <h2>Hva vi samler inn</h2><ul>
 <li><strong>Opplevelsesdata:</strong> tittel, beskrivelse, tilbyder, kategori, fylke/kommune, varighet, pris, sesong og bookinglenke — offentlig tilgjengelig informasjon hentet fra tilbydernes egne nettsider og åpne kilder (Brønnøysundregistrene, Visit Norway / CBIS m.fl.).</li>
@@ -9875,6 +9880,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <li><strong>Agent-forespørsler:</strong> for hvert søk logger vi hvilket verktøy som ble brukt, hvilke filtre/søkeord som ble sendt, og navnet på AI-klienten (f.eks. ChatGPT eller Claude, utledet av nettleser-/klientstrengen). Vi lagrer ikke IP-adresse, navn, konto eller andre personlige identifikatorer i denne loggen.</li>
 <li><strong>Teknisk logg over MCP/A2A-kall:</strong> separat fra loggen over logger vi for hvert kall verktøy, protokoll, svartid, AI-klientens nettleser-/klientstreng og en saltet, forkortet hash av IP-adressen, for å se hvilke AI-klienter som bruker tjenesten.</li>
 <li><strong>Besøks- og søkestatistikk:</strong> for hvert sidebesøk registrerer serveren, uten cookies, hvilken side som ble vist, hvor du kom fra (referanse-URL), tidspunktet, en saltet og forkortet hash av IP-adressen (aldri hele IP-adressen) og en grov klassifisering av nettleseren (f.eks. mobil, PC eller søkemotor). Søk på nettsiden og via API-et lagres med søketekst, valgte filtre (f.eks. sted eller tema), antall treff og den samme IP-hashen.</li>
+<li><strong>Besøk fra AI-svar:</strong> har lenken du kom fra et merke (<code>utm_source</code>, <code>utm_medium</code>, <code>utm_campaign</code>), lagres også merket sammen med sidebesøket. Lenker til opplevelsessider som vi gir AI-assistenter som ChatGPT og Claude, har et slikt merke (for eksempel <code>utm_source=claude&amp;utm_campaign=ai_search</code>). Merket sier bare hvilken AI-tjeneste lenken ble gitt til — det inneholder ingenting om deg. Sammen med referanse-URL-en lar det oss telle besøk som kom fra et AI-svar. Disse besøkene summeres per dag, side og AI-tjeneste, uten IP-hash eller annen kobling til den besøkende, og summene vises på opplevelsessidene. Summene slettes ikke automatisk i dag.</li>
 <li><strong>Besøksforespørsler til gårdssalg:</strong> når du ber om et besøk hos en gårdssalg-produsent — på nettsiden eller via en AI-assistent som ChatGPT eller Claude — lagrer vi navn, e-postadresse, eventuelt telefonnummer, ønsket dato/tid, antall personer og en eventuell kommentar. Opplysningene sendes på e-post til produsenten du ba om å besøke, slik at produsenten kan svare deg, og du får selv en kvittering med en statuslenke. Formålet er kun å formidle og følge opp forespørselen; opplysningene brukes ikke til markedsføring.</li></ul>
 <h2>Tilbyderprofiler og e-post vi sender uten at du har bedt om det</h2>
 <p>De fleste profilene i katalogen har vi laget uten at tilbyderen har meldt seg på. De bygger på opplysninger som allerede er offentlige: Brønnøysundregistrene, tilbyderens egen nettside, Visit Norway / CBIS, Rett fra Bondens produsentregister, nettsøk (Brave Search) og kataloger og oppføringssider. Vi kan sende tilbyderen en e-post om at profilen finnes, slik at den kan se over, rette eller overta profilen. Grunnlaget er berettiget interesse (personvernforordningen art. 6 nr. 1 bokstav f): å gi tilbydere synlighet i en gratis katalog som AI-assistenter kan hente fra.</p>
@@ -9903,7 +9909,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <tr><td>Sperreliste</td><td>Så lenge tjenesten finnes, slik at en fjernet profil ikke opprettes på nytt og vi ikke tar kontakt igjen. Lagrer nettstedsdomene, avsenderens e-postadresse og årsak.</td></tr>
 <tr><td>Besøks- og søkestatistikk og teknisk MCP/A2A-logg</td><td>Slettes automatisk etter 60 dager. Før sletting summeres de til tall uten kobling til den besøkende (for eksempel antall besøk per dag og antall søk per søketekst), og bare disse tallene beholdes.</td></tr>
 <tr><td>Agent-forespørsler</td><td>Loggen over, uten personopplysninger, slettes ikke automatisk i dag.</td></tr>
-<tr><td>Besøksforespørsler</td><td>Ingen automatisk sletting i dag. De lagres til du ber oss slette dem, og vi sletter dem da innen 30 dager. E-posten som er sendt til produsenten, ligger også i produsentens og din egen innboks; den kan vi ikke slette.</td></tr>
+<tr><td>Besøksforespørsler</td><td>Navn, e-post, telefon og kommentar slettes automatisk 30 dager etter at forespørselen er avgjort (gjennomført besøk, uteblitt eller kansellert), eller 30 dager etter ønsket besøksdato hvis den aldri ble avgjort. Dato, produsent, antall personer og status beholdes uten opplysninger om deg. Ber du om det, sletter vi tidligere. E-posten som er sendt til produsenten, ligger også i produsentens og din egen innboks; den kan vi ikke slette.</td></tr>
 <tr><td>Sikkerhetskopier av databasen</td><td>Daglige kopier hos Tigris beholdes i 7 dager, og én kopi per uke i 4 uker til. Før større endringer tar vi i tillegg av og til en manuell kopi på serveren; de ti nyeste beholdes, og ingen kopi lever lenger enn 30 dager. En slettet opplysning kan derfor ligge i en sikkerhetskopi en stund etter at den er slettet.</td></tr>
 </tbody></table>
 <h2>Rettighetene dine</h2><p>Etter personopplysningsloven og personvernforordningen (GDPR) har du rett til å:</p><ul>
@@ -9914,7 +9920,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <li><strong>Klage</strong> — du kan klage til Datatilsynet (datatilsynet.no).</li></ul>
 <h2>Kontakt</h2><p>${companyControllerSentenceHtml("nb", { siteName: "Opplevagent", siteEmail: "kontakt@opplevagent.no" })}</p>
 <hr>
-<h1 id="en">Privacy Policy</h1><p><strong>Last updated:</strong> 13 October 2026</p>
+<h1 id="en">Privacy Policy</h1><p><strong>Last updated:</strong> 8 November 2026</p>
 <p>Opplevagent (opplevagent.no) is an agent-to-agent marketplace that helps AI agents and humans find Norwegian experiences and activities — tours, courses, attractions, and things to do. We respect the privacy of providers, end-users, and AI agents that interact with the platform.</p>
 <h2>What we collect</h2><ul>
 <li><strong>Experience data:</strong> title, description, provider, category, county/municipality, duration, price, season, and booking link — public information gathered from providers' own websites and open sources (the Norwegian business registry, Visit Norway / CBIS, etc.).</li>
@@ -9923,6 +9929,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <li><strong>Agent requests:</strong> for each search we log which tool was used, which filters/search terms were sent, and the name of the AI client (e.g. ChatGPT or Claude, derived from the browser/client string). This log holds no IP address, name, account or other personal identifier.</li>
 <li><strong>Technical log of MCP/A2A calls:</strong> separately from the log above, for each call we log the tool, protocol, response time, the AI client's browser/client string and a salted, truncated hash of the IP address, to see which AI clients use the service.</li>
 <li><strong>Visit and search statistics:</strong> for each page visit the server records, without cookies, which page was shown, where you came from (referrer URL), the time, a salted and truncated hash of the IP address (never the full IP address) and a rough classification of the browser (e.g. mobile, desktop or search engine). Searches on the website and through the API are stored with the search text, the filters chosen (e.g. place or theme), the number of results and the same IP hash.</li>
+<li><strong>Visits from AI answers:</strong> if the link you arrived from has a marker (<code>utm_source</code>, <code>utm_medium</code>, <code>utm_campaign</code>), the marker is stored with the page visit. Links to experience pages that we give AI assistants such as ChatGPT and Claude carry such a marker (for example <code>utm_source=claude&amp;utm_campaign=ai_search</code>). The marker only says which AI service the link was given to — it contains nothing about you. Together with the referrer it lets us count visits that came from an AI answer. These visits are summed per day, page and AI service, with no IP hash or other link to the visitor, and the totals are shown on the experience pages. The totals are not deleted automatically today.</li>
 <li><strong>Farm-sale visit requests:</strong> when you request a visit to a farm-sale (gårdssalg) producer — on the website or through an AI assistant such as ChatGPT or Claude — we store your name, email address, optional phone number, requested date/time, party size and any note. These details are emailed to the producer you asked to visit so they can reply to you, and you receive a receipt with a status link. They are used only to pass on and follow up the request, never for marketing.</li></ul>
 <h2>Provider profiles and emails we send without being asked</h2>
 <p>Most profiles in the catalogue were created without the provider signing up. They are built on information that is already public: the Norwegian business registry, the provider's own website, Visit Norway / CBIS, the Rett fra Bonden producer register, web search (Brave Search) and directory and listing pages. We may email the provider to say the profile exists, so they can review, correct or take over the profile. The basis is legitimate interest (GDPR art. 6(1)(f)): giving providers visibility in a free catalogue that AI assistants can fetch from.</p>
@@ -9951,7 +9958,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <tr><td>Do-not-contact list</td><td>For as long as the service exists, so that a removed profile is not re-created and we do not contact you again. Stores the website domain, the sender's email address and the reason.</td></tr>
 <tr><td>Visit and search statistics and the technical MCP/A2A log</td><td>Deleted automatically after 60 days. Before deletion they are summed into totals with no link to the visitor (for example visits per day and searches per search text), and only those totals are kept.</td></tr>
 <tr><td>Agent requests</td><td>The log above, without personal data, is not deleted automatically today.</td></tr>
-<tr><td>Visit requests</td><td>No automatic deletion today. They are kept until you ask us to delete them, and we then delete them within 30 days. The email already sent to the producer also sits in the producer's and your own inbox, which we cannot delete.</td></tr>
+<tr><td>Visit requests</td><td>Name, email, phone and comment are deleted automatically 30 days after the request is resolved (visit completed, no-show or cancelled), or 30 days after the requested visit date if it was never resolved. The date, producer, party size and status are kept without any information about you. If you ask, we delete sooner. The email already sent to the producer also sits in the producer's and your own inbox, which we cannot delete.</td></tr>
 <tr><td>Database backups</td><td>Daily copies with Tigris are kept for 7 days, and one copy per week for 4 more weeks. Before larger changes we occasionally also take a manual copy on the server; the ten newest are kept, and never longer than 30 days. A deleted detail can therefore remain in a backup for a while after it is deleted.</td></tr>
 </tbody></table>
 <h2>Your rights</h2><p>Under the Norwegian Personal Data Act and the GDPR you have the right to:</p><ul>

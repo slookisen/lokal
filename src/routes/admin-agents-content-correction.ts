@@ -38,6 +38,7 @@
 //
 // Body: { apply?: boolean, reason: string, items: [ItemSpec] }, ItemSpec one of
 //   { agent_id, field: "description"|"about", text }
+//   { agent_id, field: "address", text, source_url? }  — see «address» below.
 //   { agent_id, field: "product_name", old_name, text }  — renames the ONE
 //       agent_knowledge.products entry whose name === old_name (0 or >1
 //       matches -> invalid_item); every other product field kept. Entries
@@ -135,6 +136,34 @@
 // trusted to cite a reply that really is a «ja» to this fix. One consent
 // message can also be reused across fields/items/calls for the same agent;
 // the crm_actions trail makes such reuse visible, it does not prevent it.
+//
+// ── address (Daniel 2026-11-07, Lega: «Bygg admin-retting her») ─────────
+// { agent_id, field: "address", text, source_url? } writes
+// agent_knowledge.address (the street line; postal code and city are their
+// own columns). PUT /admin/knowledge cannot do this honestly: an address with
+// sources may only be overwritten by two Tier-A sources or the owner, and only
+// when the old value is known-bad (canCorrectFactualField), so a correction a
+// person established from the producer's own site was refused there. Same
+// locks as every item here (owner lock / owner_consent, curated_fields
+// "address", unchanged, junk gate), plus: one line, at most
+// CONTENT_CORRECTION_MAX_ADDRESS chars; source_url, when given, must be an
+// http(s) URL — it is evidence for the audit notes only.
+// On a real change the apply also resets the agent's geocode (the same columns
+// PUT /admin/knowledge resets: geo_precision/lat/lng/geocode_source/
+// geocode_outcome NULL, geocode_attempts 0, geocode_attempted_at NULL) in the
+// same transaction, so the geocode worker moves the map pin to the new address
+// instead of leaving it at the old one.
+// field_provenance is NOT touched. A record of our own would change the
+// cross-source verdict for empty or inference-only provenance (and so pool
+// eligibility and the inference-only outreach flag) without any new evidence,
+// and a homepage-typed record would be provenance we did not fetch. The audit
+// row (field_name address, changed_by admin, reason, source_url) is the record.
+// Residual risk: other writers can put the old value back — PUT
+// /admin/knowledge without allow_correct, and with allow_correct when the
+// stored provenance is inference-only or website ownership is unverified;
+// PUT /api/marketplace/agents/:id/knowledge; and the road-designation upgrade
+// paths. None of them knows about an admin correction. Follow-up dev-request:
+// those writers respect it.
 
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
@@ -191,10 +220,12 @@ function previewValue(s: string | null | undefined, maxLen = 80): string {
 
 type TextField = "description" | "about";
 type ListField = "specialties" | "certifications" | "tags";
-type Field = TextField | "product_name" | "products_organic_flag" | ListField;
+type Field = TextField | "address" | "product_name" | "products_organic_flag" | ListField;
 
 const LIST_FIELDS: readonly ListField[] = ["specialties", "certifications", "tags"];
 export const CONTENT_CORRECTION_MAX_PRODUCT_NAME = 200;
+export const CONTENT_CORRECTION_MAX_ADDRESS = 200;
+export const CONTENT_CORRECTION_MAX_SOURCE_URL = 500;
 export const CONTENT_CORRECTION_MAX_REMOVE = 100;
 export const CONTENT_CORRECTION_MAX_CONSENT_ID = 200;
 
@@ -262,6 +293,7 @@ interface LockSnapshot {
   claimed_at: string | null;
   description: string;
   about: string | null;
+  address: string | null;
   products: string | null;
   specialties: string | null;
   certifications: string | null;
@@ -277,6 +309,7 @@ const LOCK_SNAPSHOT_SQL = `
          a.description  AS description,
          a.tags         AS tags,
          k.about        AS about,
+         k.address      AS address,
          k.products     AS products,
          k.specialties  AS specialties,
          k.certifications AS certifications,
@@ -309,9 +342,18 @@ function isFieldCurated(curatedFieldsJson: string | null | undefined, fieldName:
  * column name). Lists: specialties/certifications are agent_knowledge JSON
  * columns, tags is the agents.tags JSON column.
  */
-function storageColumn(field: Field): TextField | "products" | ListField {
+function storageColumn(field: Field): TextField | "address" | "products" | ListField {
   if (field === "product_name" || field === "products_organic_flag") return "products";
   return field;
+}
+
+function isHttpUrl(s: string): boolean {
+  try {
+    const u = new URL(s);
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 interface OwnerConsent {
@@ -320,6 +362,7 @@ interface OwnerConsent {
 
 type ValidItem = (
   | { agent_id: string; field: TextField; text: string }
+  | { agent_id: string; field: "address"; text: string; source_url?: string }
   | { agent_id: string; field: "product_name"; old_name: string; text: string }
   | { agent_id: string; field: "products_organic_flag" }
   | { agent_id: string; field: ListField; remove: string[] }
@@ -441,6 +484,31 @@ function validateItemFields(raw: unknown): { ok: true; item: ValidItem } | Inval
     return { ok: true, item: { agent_id: agentId, field: f, text } };
   }
 
+  if (f === "address") {
+    const text = typeof r.text === "string" ? r.text.trim() : "";
+    if (!text) return { ok: false, outcome: "invalid_item", detail: "text required (non-empty)", agent_id: agentId };
+    if (text.length > CONTENT_CORRECTION_MAX_ADDRESS) {
+      return { ok: false, outcome: "invalid_item", detail: `text exceeds ${CONTENT_CORRECTION_MAX_ADDRESS} chars`, agent_id: agentId };
+    }
+    if (/[\r\n]/.test(text)) return { ok: false, outcome: "invalid_item", detail: "address must be one line", agent_id: agentId };
+    let sourceUrl: string | undefined;
+    if (r.source_url !== undefined && r.source_url !== null) {
+      const s = typeof r.source_url === "string" ? r.source_url.trim() : "";
+      if (!s || s.length > CONTENT_CORRECTION_MAX_SOURCE_URL || !isHttpUrl(s)) {
+        return {
+          ok: false,
+          outcome: "invalid_item",
+          detail: `source_url must be an http(s) URL of at most ${CONTENT_CORRECTION_MAX_SOURCE_URL} chars`,
+          agent_id: agentId,
+        };
+      }
+      sourceUrl = s;
+    }
+    const junk = junkGate(text, agentId);
+    if (junk) return junk;
+    return { ok: true, item: { agent_id: agentId, field: "address", text, ...(sourceUrl ? { source_url: sourceUrl } : {}) } };
+  }
+
   if (f === "product_name") {
     // old_name is matched EXACTLY against the stored name — not trimmed.
     const oldName = typeof r.old_name === "string" ? r.old_name : "";
@@ -476,7 +544,7 @@ function validateItemFields(raw: unknown): { ok: true; item: ValidItem } | Inval
   return {
     ok: false,
     outcome: "invalid_item",
-    detail: "field must be description|about|product_name|products_organic_flag|specialties|certifications|tags",
+    detail: "field must be description|about|address|product_name|products_organic_flag|specialties|certifications|tags",
     agent_id: agentId,
   };
 }
@@ -537,7 +605,7 @@ function populatedFieldCount(p: Record<string, unknown>): number {
  */
 interface Plan {
   outcome: ItemOutcome;
-  column?: TextField | "products" | ListField;
+  column?: TextField | "address" | "products" | ListField;
   oldValue?: string | null;
   newValue?: string;
   oldPreview?: string | null;
@@ -684,6 +752,15 @@ function plan(
     return { ...base, outcome: "would_write", newValue: item.text };
   }
 
+  if (item.field === "address") {
+    const oldValue = cur.address;
+    const base: Plan = { outcome: "would_write", column, oldValue, oldPreview: oldValue, newPreview: item.text, viaOwnerConsent };
+    if (stop) return { ...base, outcome: stop.stop, detail: stop.detail, viaOwnerConsent: undefined };
+    if (isFieldCurated(cur.curated_fields, "address")) return { ...base, outcome: "skipped_curated" };
+    if ((oldValue ?? "") === item.text) return { ...base, outcome: "skipped_unchanged" };
+    return { ...base, outcome: "would_write", newValue: item.text };
+  }
+
   const oldValue = (cur as unknown as Record<string, string | null>)[column] ?? null;
   const base: Plan = { outcome: "would_write", column, oldValue, viaOwnerConsent };
   if (stop) return { ...base, outcome: stop.stop, detail: stop.detail, viaOwnerConsent: undefined };
@@ -804,7 +881,20 @@ function applyCorrection(item: ValidItem, reason: string, batchTag: string): App
       const nowIso = new Date().toISOString();
       const col = p.column!;
       const newValue = p.newValue!;
-      if (col === "description") {
+      let addressNote = "";
+      if (item.field === "address") {
+        if (cur!.has_knowledge_row) {
+          db.prepare(`UPDATE agent_knowledge SET address = ?, updated_at = ? WHERE agent_id = ?`).run(newValue, nowIso, item.agent_id);
+        } else {
+          db.prepare(`INSERT INTO agent_knowledge (agent_id, address, updated_at) VALUES (?, ?, ?)`).run(item.agent_id, newValue, nowIso);
+        }
+        // plan() only reaches here on a real change: move the map pin too.
+        db.prepare(
+          `UPDATE agents SET geo_precision = NULL, lat = NULL, lng = NULL, geocode_source = NULL,
+             geocode_outcome = NULL, geocode_attempts = 0, geocode_attempted_at = NULL WHERE id = ?`,
+        ).run(item.agent_id);
+        addressNote = ` [geocode reset]${item.source_url ? ` [source_url: ${item.source_url}]` : ""}`;
+      } else if (col === "description") {
         db.prepare(`UPDATE agents SET description = ? WHERE id = ?`).run(newValue, item.agent_id);
       } else if (col === "tags") {
         db.prepare(`UPDATE agents SET tags = ? WHERE id = ?`).run(newValue, item.agent_id);
@@ -827,6 +917,7 @@ function applyCorrection(item: ValidItem, reason: string, batchTag: string): App
         notes += ` [merge: kept ${p.merge.kept} ${JSON.stringify(p.merge.kept_product)}; dropped ${JSON.stringify(p.merge.dropped_product)}]`;
       }
       if (catalog) notes += ` [catalog: ${JSON.stringify(catalog)}]`;
+      notes += addressNote;
       db.prepare(
         `INSERT INTO agent_knowledge_audit
            (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)

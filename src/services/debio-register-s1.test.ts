@@ -40,9 +40,21 @@ export interface TestSummary {
   failures: string[];
 }
 
-const NOW = new Date("2026-10-29T12:00:00.000Z");
-const FUTURE = "2027-06-30";
-const PAST = "2026-09-30";
+// NOW follows the real clock: 12:00Z four days before today, so the last sync
+// (NOW + 3 d, SYNC_DAY below) is yesterday 12:00Z. Read paths that take no `now`
+// (knowledgeService.getAgentInfo → debioStatusShown) use the real clock, and a fixed
+// NOW made «stale-0» fail once the real clock passed SYNC_DAY + 7 d (2026-11-08T12:00Z).
+// The certificate validity dates below are derived from NOW for the same reason.
+// A2A dev-request 2026-11-08-lokal-debio-test-tidsbombe-stale-0.
+const DAY_MS = 86_400_000;
+const NOW = new Date(Math.floor(Date.now() / DAY_MS) * DAY_MS - 4 * DAY_MS + 12 * 3_600_000);
+// Certificate validity dates follow NOW too: fixed dates would expire as the real
+// clock moves on and turn the match/owner/derived assertions red (review lokal#1461 B1).
+const isoDay = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
+const FUTURE = isoDay(NOW.getTime() + 240 * DAY_MS);
+const PAST = isoDay(NOW.getTime() - 30 * DAY_MS);
+const TAG_VALID_TO = isoDay(NOW.getTime() + 150 * DAY_MS);
+const FUTURE_DMY = FUTURE.split("-").reverse().join(".");
 // Synthetic, distinctive "person" names and streets — must never be stored.
 const PERSON_A = "Zyxwolf Quarnstrom";
 const PERSON_B = "Per Kvitlund";
@@ -64,9 +76,9 @@ function fixtureRows(over: { expire?: boolean; dropOrg?: boolean; karensOrg?: bo
     // a. org.nr. (camelCase, «911 111 111»)
     ...(over.dropOrg ? [] : [{ name: "Orgtun Gard AS", clientCode: "911 111 111", certSid: 5001, postalCode: "1111", city: "Orgby", street: "Orgveien 1", statusCodes: over.karensOrg ? [502] : [509], validFrom: "2026-01-01", validTo: FUTURE, mainProductGroups: [{ code: "LBP" }, { code: "FIO" }] }]),
     // a. tags org_nr: (PascalCase, nested address, status as objects, /Date()/)
-    { Name: "Tagtun Gard", ClientCode: "922222222", CertificateSid: "5002", Address: { Street: "Tagveien 2", PostalCode: "2222", City: "Tagby" }, Statuses: [{ Code: 509 }], ValidTo: `/Date(${Date.parse("2027-03-31T00:00:00Z")})/`, ProductGroups: "LBP" },
+    { Name: "Tagtun Gard", ClientCode: "922222222", CertificateSid: "5002", Address: { Street: "Tagveien 2", PostalCode: "2222", City: "Tagby" }, Statuses: [{ Code: 509 }], ValidTo: `/Date(${Date.parse(`${TAG_VALID_TO}T00:00:00Z`)})/`, ProductGroups: "LBP" },
     // b. finnoko domain (snake_case)
-    { name: "Solbakken Frukt", client_code: "933333333", cert_sid: 5003, postal_code: "3333", city: "Fruktby", status_code: "509", valid_to: "30.06.2027", product_groups: ["FIO"] },
+    { name: "Solbakken Frukt", client_code: "933333333", cert_sid: 5003, postal_code: "3333", city: "Fruktby", status_code: "509", valid_to: FUTURE_DMY, product_groups: ["FIO"] },
     // c. name + postal code
     { name: "Lindheim Gard", clientCode: "944444444", certSid: 5004, postalCode: "7777", city: "Testvik", street: "Lindvegen 4", statusCodes: [509], validTo: FUTURE, mainProductGroups: ["LBP"] },
     // d. street + house no. + postal code — registered on a person's name
@@ -311,7 +323,7 @@ export async function runDebioRegisterS1Tests(opts: { log?: boolean } = {}): Pro
     }
     assertEq(JSON.parse(row("s1-org").debio_product_groups), ["LBP", "FIO"], "match-groups: product groups stored as JSON");
     assertEq([row("s1-org").debio_sid, row("s1-org").debio_cert_valid_to, row("s1-org").debio_checked_at], ["5001", FUTURE, NOW.toISOString()], "match-cols: sid, valid-to, checked_at");
-    assertEq(row("s1-tag").debio_cert_valid_to, "2027-03-31", "match-tag: /Date()/ validity parsed");
+    assertEq(row("s1-tag").debio_cert_valid_to, TAG_VALID_TO, "match-tag: /Date()/ validity parsed");
     for (const id of ["s1-farm-company", "s1-surname", "s1-chain"]) {
       const r = row(id);
       assertEq([r.debio_status, r.debio_verified, r.debio_match_method], ["ingen", 0, null], `support-${id}: support signal only → not verified`);

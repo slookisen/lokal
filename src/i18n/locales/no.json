@@ -10,7 +10,8 @@
     "lang_en": "English",
     "lang_sv": "Svenska",
     "home": "Hjem",
-    "back_home": "Tilbake til forsiden"
+    "back_home": "Tilbake til forsiden",
+    "menu": "Meny"
   },
   "footer": {
     "tagline": "Norges første agent-til-agent (A2A) nettverk for lokal mat. Vi gjør matprodusenter synlige for AI-assistenter — så kundene kan finne deg når de spør.",
