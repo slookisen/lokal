@@ -330,6 +330,18 @@ export async function runOwnerShellT15aTests(opts: { log?: boolean } = {}): Prom
     /** T15b parts taken out: the menu badges' markup is in shellStart; the «Oversikt» block; the news question (moved off Mine valg). */
     const noBadges = (h: string) => h.replace(/<span class="ow-nav-badge"[^>]*>[^<]*<\/span><span class="ow-sr">[^<]*<\/span>/g, "");
     const noOverview = (h: string) => h.replace(/\n      <style>\n  \.ow-ov-badges[\s\S]*?data-ov="help">[\s\S]*?<\/p>/, "");
+    /** T15c: the «Varer» card moved to /eier/:id/varer — drop the card (flag off) and the line left in its place (flag on). */
+    const dropDiv = (h: string, marker: string) => {
+      const at = h.indexOf(marker);
+      if (at < 0) return h;
+      const re = /<\/?div[\s>]/g;
+      re.lastIndex = at + 4;
+      let depth = 1;
+      let m: RegExpExecArray | null;
+      while (depth > 0 && (m = re.exec(h))) depth += m[0].startsWith("</") ? -1 : 1;
+      return h.slice(0, at) + h.slice(h.indexOf(">", re.lastIndex - 1) + 1);
+    };
+    const noItemsCard = (h: string) => dropDiv(dropDiv(h, `<div class="ep-card" id="bestillbare-varer" data-items-card="t13">`), `<div class="ep-card" id="bestillbare-varer" data-items-moved="t15c">`);
     const noNewsQuestion = (h: string) => h.replace(/<div class="mv-question" data-news-question="1"[\s\S]*?<\/form>\n        <\/div>/, "");
     for (const p of PAGES) {
       const r = on[`${p}:${ON_ID}`];
@@ -355,14 +367,14 @@ export async function runOwnerShellT15aTests(opts: { log?: boolean } = {}): Prom
       assertTrue(h.includes("--ow-page-bg") && h.includes("@media (prefers-color-scheme: dark)"), `on: ${p} carries the T6 tokens (light + dark)`);
       assertTrue(h.includes(`<style>${sh.OWNER_SHELL_CSS}</style>`), `on: ${p} carries the shell CSS`);
       // Nothing else changed: with the shell taken out the page is the flag-off page.
-      const shellStart = sh.renderOwnerShellStart({ agentId: ON_ID, current: c.section as any, profileSlug: `skallgard-${ON_ID}`, counts });
+      const shellStart = sh.renderOwnerShellStart({ agentId: ON_ID, current: c.section as any, profileSlug: `skallgard-${ON_ID}`, counts, itemsPage: true });
       assertTrue(h.includes(shellStart), `on: ${p} shell markup is renderOwnerShellStart (with the public profile link)`);
       let stripped = h.replace(p === "orders" ? `${shellStart}\n` : `\n  ${shellStart}`, "");
       stripped = p === "orders"
         ? stripped.replace(`<main class="mo-wrap" id="innhold" tabindex="-1">`, `<main class="mo-wrap">`)
         : stripped.replace(sh.OWNER_SHELL_MAIN_OPEN, "").replace(/<\/main>(\s*<\/div>\s*<\/body>)/, "$1");
-      if (p === "portal") stripped = noOverview(stripped).replace(`<div class="ep-card" id="profil">`, `<div class="ep-card">`);
-      const want = p === "valg" ? noNewsQuestion(before[`${p}:${ON_ID}`].html) : before[`${p}:${ON_ID}`].html;
+      if (p === "portal") stripped = noItemsCard(noOverview(stripped).replace(`<div class="ep-card" id="profil">`, `<div class="ep-card">`));
+      const want = p === "valg" ? noNewsQuestion(before[`${p}:${ON_ID}`].html) : p === "portal" ? noItemsCard(before[`${p}:${ON_ID}`].html) : before[`${p}:${ON_ID}`].html;
       assertEq(stripped, want, `on: ${p} without the shell markup (and the T15b parts) is byte-identical to the flag-off page`);
     }
 
@@ -382,13 +394,14 @@ export async function runOwnerShellT15aTests(opts: { log?: boolean } = {}): Prom
     assertTrue(["bestillbare-varer", "produkter", "forhandsbetaling", "mine-valg", "mine-ordrer", "bestillinger"].every((a) => portalOnAll.includes(`id="${a}"`)),
       `anchors: the old anchors are present with the shell on (${OLD_ANCHORS.filter((a) => !portalOnAll.includes(`id="${a}"`)).join(",") || "all"})`);
     assertTrue(portalOn.includes(`id="profil"`) && portalOn.includes(`href="/eier/${ON_ID}/portal#profil"`), "anchors: Mer → Profil lands on the portal's #profil card");
-    assertTrue(portalOn.includes(`id="bestillbare-varer"`) && portalOn.includes(`href="/eier/${ON_ID}/portal#bestillbare-varer"`), "anchors: Varer lands on the portal's #bestillbare-varer card");
+    // T15c: Varer has its own page; the portal keeps the #bestillbare-varer anchor with a link there.
+    assertTrue(portalOn.includes(`id="bestillbare-varer"`) && portalOn.includes(`href="/eier/${ON_ID}/varer"`), "anchors: Varer → /varer; the portal keeps #bestillbare-varer with a link there");
     const stripe = on["portal:stripe"];
     assertTrue(stripe.status === 200 && stripe.html.includes(`id="forhandsbetaling"`) && stripe.html.includes("Vi venter på bekreftelse fra Stripe") && stripe.html.includes("ow-nav"),
       "anchors: the Stripe return /portal?status=payments_return#forhandsbetaling lands on the portal's card, in the shell");
-    const stripeStripped = noOverview(stripe.html.replace(`\n  ${sh.renderOwnerShellStart({ agentId: ON_ID, current: "oversikt", profileSlug: `skallgard-${ON_ID}`, counts })}`, "")
-      .replace(sh.OWNER_SHELL_MAIN_OPEN, "")).replace(/<\/main>(\s*<\/div>\s*<\/body>)/, "$1").replace(`<div class="ep-card" id="profil">`, `<div class="ep-card">`);
-    assertEq(stripeStripped, before["portal:stripe"].html, "anchors: the Stripe return page is the flag-off page plus the shell");
+    const stripeStripped = noItemsCard(noOverview(stripe.html.replace(`\n  ${sh.renderOwnerShellStart({ agentId: ON_ID, current: "oversikt", profileSlug: `skallgard-${ON_ID}`, counts, itemsPage: true })}`, "")
+      .replace(sh.OWNER_SHELL_MAIN_OPEN, "")).replace(/<\/main>(\s*<\/div>\s*<\/body>)/, "$1").replace(`<div class="ep-card" id="profil">`, `<div class="ep-card">`));
+    assertEq(stripeStripped, noItemsCard(before["portal:stripe"].html), "anchors: the Stripe return page is the flag-off page plus the shell");
 
     // Mine valg: the T9 status line and script are still there, inside the page.
     const valgOn = on[`valg:${ON_ID}`].html;

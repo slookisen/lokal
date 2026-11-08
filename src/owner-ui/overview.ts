@@ -128,6 +128,8 @@ export interface OwnerOverviewModel {
   showNewsQuestion: boolean;
   /** The answer just given from here (`?nyheter=`), shown in the news block. */
   newsResult: OwnerOverviewNewsResult | null;
+  /** T15c: the Varer page exists — the Varer links go to /eier/:id/varer (else to #bestillbare-varer). */
+  itemsPage?: boolean;
 }
 
 function esc(v: unknown): string {
@@ -186,7 +188,8 @@ export const OWNER_OVERVIEW_CSS = `
 export function renderOwnerOverview(m: OwnerOverviewModel): string {
   const T = OWNER_OVERVIEW_TEXTS;
   const id = encodeURIComponent(m.agentId);
-  const L = ownerShellLinks(m.agentId, m.profileSlug);
+  const L = ownerShellLinks(m.agentId, m.profileSlug, m.itemsPage === true);
+  const itemsHref = m.itemsPage === true ? L.varer : "#bestillbare-varer";
   const counts = { pendingOrders: n(m.counts.pendingOrders), itemsToConfirm: n(m.counts.itemsToConfirm) };
 
   // 1. Status badges.
@@ -213,7 +216,7 @@ export function renderOwnerOverview(m: OwnerOverviewModel): string {
     todoRows.push(`<li data-todo="orders" data-count="${counts.pendingOrders}"><a class="ow-ov-row" href="${esc(L.ordrer)}"><strong>${esc(ownerOverviewOrdersLine(counts.pendingOrders))}</strong><span>${esc(T.todoOrdersHint)}</span></a></li>`);
   }
   if (counts.itemsToConfirm >= 1) {
-    todoRows.push(`<li data-todo="items" data-count="${counts.itemsToConfirm}"><a class="ow-ov-row" href="#bestillbare-varer"><strong>${esc(ownerOverviewItemsLine(counts.itemsToConfirm))}</strong><span>${esc(T.todoItemsHint)}</span></a></li>`);
+    todoRows.push(`<li data-todo="items" data-count="${counts.itemsToConfirm}"><a class="ow-ov-row" href="${esc(itemsHref)}"><strong>${esc(ownerOverviewItemsLine(counts.itemsToConfirm))}</strong><span>${esc(T.todoItemsHint)}</span></a></li>`);
   }
   const todo = `<section class="ep-card" id="${OWNER_OVERVIEW_TODO_ANCHOR}" aria-labelledby="ow-ov-todo-h" data-ov="todo">
         <h2 id="ow-ov-todo-h">${esc(T.todoTitle)}</h2>
@@ -234,7 +237,7 @@ export function renderOwnerOverview(m: OwnerOverviewModel): string {
     `<li data-part="${key}"><a class="ow-ov-row" href="${esc(href)}"><strong>${esc(label)}</strong></a></li>`;
   const parts = `<section class="ep-card" aria-labelledby="ow-ov-parts-h" data-ov="parts">
         <h2 id="ow-ov-parts-h">${esc(T.partsTitle)}</h2>
-        <ul class="ow-ov-list">${part(L.ordrer, T.partOrders, "ordrer")}${part("#bestillbare-varer", T.partItems, "varer")}${part(L.valg, T.partFeatures, "valg")}${part("#profil", T.partProfile, "profil")}${part(L.statistikk, T.partStats, "statistikk")}</ul>
+        <ul class="ow-ov-list">${part(L.ordrer, T.partOrders, "ordrer")}${part(itemsHref, T.partItems, "varer")}${part(L.valg, T.partFeatures, "valg")}${part("#profil", T.partProfile, "profil")}${part(L.statistikk, T.partStats, "statistikk")}</ul>
       </section>`;
 
   // 7. «Nyheter og tips» — the T7 question, posting to the same route.
