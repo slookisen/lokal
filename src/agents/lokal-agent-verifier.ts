@@ -2689,11 +2689,23 @@ export async function runVerifierBatch(opts: {
   // buildSecondLineEvidence when RFB_SECOND_LINE_EVIDENCE_ENABLED is on.
   // Production leaves it undefined → global fetch. Never called flag-off.
   secondLineEvidenceFetch?: typeof fetch;
+  // dev-request S5c (2026-11-08): optional absolute deadline (ms, on the
+  // `nowMs` clock). Set ONLY by the synchronous POST /admin/run-verifier
+  // route; once reached, no NEW agent is started (the one in flight
+  // finishes and persists normally) and the rest is reported as
+  // `not_processed`. Unset (cron tick, /sweep, scripts) = no deadline.
+  deadlineAt?: number;
+  // Clock for the deadline check (test seam). Defaults to Date.now.
+  nowMs?: () => number;
 }): Promise<{
   run_id: string;
   started_at: string;
   finished_at: string;
   results: VerifierResult[];
+  // S5c: true when deadlineAt stopped the loop before every candidate ran.
+  truncated?: boolean;
+  // S5c: candidates never started because of deadlineAt.
+  not_processed?: number;
 }> {
   const db = opts.db ?? getDb();
   const limit = opts.batchSize ?? 30;
@@ -2734,8 +2746,16 @@ export async function runVerifierBatch(opts: {
   }
 
   const results: VerifierResult[] = [];
+  const nowMs = opts.nowMs ?? Date.now;
+  let startedCount = 0;
+  let truncated = false;
 
   for (const agent of candidates) {
+    if (opts.deadlineAt !== undefined && nowMs() >= opts.deadlineAt) {
+      truncated = true;
+      break;
+    }
+    startedCount++;
     const probe = opts.headProbe ?? headProbe;
     const httpStatus = agent.website ? await probe(agent.website) : null;
     const brreg = opts.brregLookup
@@ -3316,6 +3336,8 @@ export async function runVerifierBatch(opts: {
     started_at: startedAt,
     finished_at: new Date().toISOString(),
     results,
+    truncated,
+    not_processed: candidates.length - startedCount,
   };
 }
 

@@ -107,7 +107,41 @@ export type VerifierTickResult =
       envelope_recorded: boolean;
       reprocess_review_queue: boolean;
       bias_growth: boolean;
+      // S5c: only a caller that passes deadlineAt (the POST / route) can see
+      // truncated=true; without a deadline these are always false / 0.
+      truncated: boolean;
+      not_processed: number;
     };
+
+/** Default time budget (ms) for one synchronous POST /admin/run-verifier call. */
+export const VERIFY_ROUTE_TIME_BUDGET_MS = 20_000;
+
+/**
+ * VERIFY_ROUTE_TIME_BUDGET_MS, overridable by the env var of the same name
+ * (a positive integer, else the default). dev-request S5c (2026-11-08): a
+ * prod probe on 2026-11-06 (see BM_HARVEST_TIME_BUDGET_MS,
+ * admin-bm-producer-harvest.ts) showed the caller→route response window is
+ * ~30 s, so a routine's synchronous call of this route came back as HTTP 502
+ * "upstream request failed" when the batch ran longer. 20 s leaves room for
+ * the agent in flight (the budget only stops NEW agents from starting) and
+ * the envelope/response under that window. The cron tick and /sweep keep no
+ * deadline.
+ */
+export function resolveVerifyRouteTimeBudgetMs(env: Record<string, string | undefined> = process.env): number {
+  const n = parseInt(String(env.VERIFY_ROUTE_TIME_BUDGET_MS ?? ""), 10);
+  return Number.isInteger(n) && n > 0 ? n : VERIFY_ROUTE_TIME_BUDGET_MS;
+}
+
+// Test-only clock for the POST / route's time budget (production leaves it
+// null and gets Date.now()). Used for both the deadline and the per-agent
+// check, so a test can cross the budget without real waiting.
+let verifyRouteNowForTesting: (() => number) | null = null;
+export function __setVerifyRouteNowForTesting(fn: (() => number) | null): void {
+  verifyRouteNowForTesting = fn;
+}
+function effectiveVerifyRouteNowMs(): number {
+  return verifyRouteNowForTesting ? verifyRouteNowForTesting() : Date.now();
+}
 
 // runVerifierTick — the actual verifier-batch-run + stat-computation +
 // envelope-record logic, extracted out of the POST / handler below so it
@@ -150,6 +184,11 @@ export async function runVerifierTick(opts: {
   // full semantics). Default undefined — every existing caller (cron tick,
   // 2B-PENDING, PR-97 drain) omits this and is byte-for-byte unchanged.
   agentIds?: string[];
+  // S5c: absolute deadline (ms on `nowMs`) after which no NEW agent starts.
+  // Passed ONLY by the synchronous POST / route — the index.ts cron tick
+  // never sets it, so the tick has no deadline.
+  deadlineAt?: number;
+  nowMs?: () => number;
 } = {}): Promise<VerifierTickResult> {
   const tickStartedAt = new Date().toISOString();
   const tickRunId = `run-${tickStartedAt.replace(/[:.]/g, "").slice(0, 15)}-lokal-agent-verifier-tick`;
@@ -199,12 +238,13 @@ export async function runVerifierTick(opts: {
   // pickStaleReviewRequiredBatch's own doc comment in lokal-agent-
   // verifier.ts. Additive only: candidates pickFn already returned are
   // never duplicated (runVerifierBatch dedupes by agent id).
+  const deadlineOpts = opts.deadlineAt !== undefined ? { deadlineAt: opts.deadlineAt, nowMs: opts.nowMs } : {};
   const batchResult = await runVerifierBatch(
     reprocessReviewQueue
-      ? { batchSize, pickFn: pickReviewQueueBatch, brregLookup: resolveBrregLookup, agentIds: opts.agentIds }
+      ? { batchSize, pickFn: pickReviewQueueBatch, brregLookup: resolveBrregLookup, agentIds: opts.agentIds, ...deadlineOpts }
       : biasGrowth
-        ? { batchSize, pickFn: pickBatchBiased, brregLookup: resolveBrregLookup, includeStaleReviewRequired: true, agentIds: opts.agentIds }
-        : { batchSize, brregLookup: resolveBrregLookup, includeStaleReviewRequired: true, agentIds: opts.agentIds }
+        ? { batchSize, pickFn: pickBatchBiased, brregLookup: resolveBrregLookup, includeStaleReviewRequired: true, agentIds: opts.agentIds, ...deadlineOpts }
+        : { batchSize, brregLookup: resolveBrregLookup, includeStaleReviewRequired: true, agentIds: opts.agentIds, ...deadlineOpts }
   );
   const results = batchResult.results;
 
@@ -350,6 +390,8 @@ export async function runVerifierTick(opts: {
     envelope_recorded: envelopeRecorded,
     reprocess_review_queue: reprocessReviewQueue,
     bias_growth: biasGrowth,
+    truncated: batchResult.truncated ?? false,
+    not_processed: batchResult.not_processed ?? 0,
   };
 }
 
@@ -427,7 +469,19 @@ router.post("/", async (req: Request, res: Response) => {
   const agentIds = parseAgentIds(req);
 
   try {
-    const tick = await runVerifierTick({ batchSize, reprocessReviewQueue, biasGrowth, skipTickLock, agentIds });
+    // S5c: this synchronous route (unlike the cron tick and /sweep) has a
+    // time budget — no new agent starts once it is spent; the response says
+    // `truncated` and how many were `not_processed`.
+    const deadlineAt = effectiveVerifyRouteNowMs() + resolveVerifyRouteTimeBudgetMs();
+    const tick = await runVerifierTick({
+      batchSize,
+      reprocessReviewQueue,
+      biasGrowth,
+      skipTickLock,
+      agentIds,
+      deadlineAt,
+      nowMs: effectiveVerifyRouteNowMs,
+    });
 
     if (tick.skipped) {
       // dev-request 2026-08-17-verifier-tick-lock: same response shape as
@@ -471,6 +525,8 @@ router.post("/", async (req: Request, res: Response) => {
       tick_lock_skipped: !!skipTickLock,
       reprocess_review_queue: tick.reprocess_review_queue,
       bias_growth: tick.bias_growth,
+      truncated: tick.truncated,
+      not_processed: tick.not_processed,
     });
   } catch (err: any) {
     res.status(500).json({
