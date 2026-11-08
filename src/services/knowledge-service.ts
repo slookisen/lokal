@@ -844,6 +844,9 @@ function claimCodeMatches(stored: unknown, entered: unknown): boolean {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+/** Which part of the owner-claim sibling rule found a sibling. */
+export type ClaimSiblingMatchKind = "org_nr" | "phone" | "address";
+
 /** The profile facts the owner-claim sibling rule reads (agents + agent_knowledge). */
 export interface ClaimSiblingSourceRow {
   org_nr: string | null;
@@ -861,13 +864,15 @@ export interface ClaimSiblingSourceRow {
  * assessment (gatherClaimAssessmentInput) and POST /admin/agents/claim-merge-
  * approve (knowledgeService.findClaimSiblingIds), so the two cannot drift.
  * Returns the profile's normalized org.nr (the assessment reports it) and the
- * sibling ids in discovery order (org.nr, phone, address).
+ * sibling ids in discovery order (org.nr, phone, address). `matchKinds` holds,
+ * per sibling id, the FIRST kind that found it (same order); additive, the
+ * existing callers read only orgNr + siblingIds.
  */
 export function claimSiblingsForRow(
   db: ReturnType<typeof getDb>,
   agentId: string,
   row: ClaimSiblingSourceRow,
-): { orgNr: string | null; siblingIds: Set<string> } {
+): { orgNr: string | null; siblingIds: Set<string>; matchKinds: Map<string, ClaimSiblingMatchKind> } {
   let orgNr = normalizeOrgNr(row.org_nr);
   if (!orgNr && row.tags) {
     const m = String(row.tags).match(/org_nr:(\d{9})(?!\d)/);
@@ -879,10 +884,15 @@ export function claimSiblingsForRow(
 
   // Siblings: other RFB profiles with the same org.nr, phone or street address + postal code.
   const siblingIds = new Set<string>();
+  const matchKinds = new Map<string, ClaimSiblingMatchKind>();
+  const found = (id: string, kind: ClaimSiblingMatchKind): void => {
+    siblingIds.add(id);
+    if (!matchKinds.has(id)) matchKinds.set(id, kind);
+  };
   const rfb = "COALESCE(a.vertical_id, 'rfb') = 'rfb'";
   if (orgNr) {
     for (const r of db.prepare(`SELECT a.id FROM agents a WHERE a.id <> ? AND ${rfb} AND (a.org_nr = ? OR a.tags LIKE ?) LIMIT 20`)
-      .all(agentId, orgNr, `%org_nr:${orgNr}%`) as Array<{ id: string }>) siblingIds.add(r.id);
+      .all(agentId, orgNr, `%org_nr:${orgNr}%`) as Array<{ id: string }>) found(r.id, "org_nr");
   }
   if (phoneDigits) {
     for (const r of db.prepare(
@@ -890,16 +900,43 @@ export function claimSiblingsForRow(
         WHERE k.agent_id <> ? AND ${rfb}
           AND REPLACE(REPLACE(REPLACE(REPLACE(k.phone, ' ', ''), '-', ''), '.', ''), char(160), '') LIKE ? LIMIT 50`
     ).all(agentId, `%${phoneDigits}`) as Array<{ id: string; phone: string }>) {
-      if (normalizePhoneDigits(r.phone) === phoneDigits) siblingIds.add(r.id);
+      if (normalizePhoneDigits(r.phone) === phoneDigits) found(r.id, "phone");
     }
   }
   if (addr) {
     for (const r of db.prepare(
       `SELECT k.agent_id AS id FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
         WHERE k.agent_id <> ? AND ${rfb} AND LOWER(TRIM(k.address)) = ? AND COALESCE(k.postal_code, '') = ? LIMIT 20`
-    ).all(agentId, addr, String(row.postal_code ?? "")) as Array<{ id: string }>) siblingIds.add(r.id);
+    ).all(agentId, addr, String(row.postal_code ?? "")) as Array<{ id: string }>) found(r.id, "address");
   }
-  return { orgNr, siblingIds };
+  return { orgNr, siblingIds, matchKinds };
+}
+
+/**
+ * G7 discovery-dedup D3 (POST /admin/agents/register, behind
+ * REGISTER_SIBLING_DEDUP_ENABLED): the sibling rule above applied to a
+ * candidate that has no row yet (agentId "" — no agent has an empty id, so
+ * nothing is excluded). First hit wins in kind order org_nr → phone →
+ * address; within that kind the lexicographically smallest agent id is
+ * returned, so the answer does not depend on SQLite row order. Reads only.
+ */
+export function findRegisterSiblingMatch(
+  db: ReturnType<typeof getDb>,
+  candidate: { org_nr?: unknown; phone?: unknown; address?: unknown; postal_code?: unknown },
+): { existingId: string; match: ClaimSiblingMatchKind } | null {
+  const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
+  const { matchKinds } = claimSiblingsForRow(db, "", {
+    org_nr: str(candidate.org_nr),
+    tags: null,
+    phone: str(candidate.phone),
+    address: str(candidate.address),
+    postal_code: str(candidate.postal_code),
+  });
+  for (const kind of ["org_nr", "phone", "address"] as const) {
+    const ids = [...matchKinds].filter(([, k]) => k === kind).map(([id]) => id).sort();
+    if (ids.length) return { existingId: ids[0]!, match: kind };
+  }
+  return null;
 }
 
 class KnowledgeService {

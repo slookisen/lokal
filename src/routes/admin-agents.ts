@@ -119,7 +119,7 @@ import {
 } from "../services/description-quality";
 import { readDebioVerified } from "../services/debio-approval";
 // The claim admin queue (decision 11=A) — see GET /claim-review-queue below.
-import { knowledgeService } from "../services/knowledge-service";
+import { knowledgeService, findRegisterSiblingMatch } from "../services/knowledge-service";
 import { maskEmail } from "../services/gardssalg-claim";
 import { applyClaimApprove, applyClaimReject, applyClaimRevoke, sendClaimApprovedLoginMail } from "../services/claim-review-actions";
 import { isClaimRequestMoreEnabled, requestMoreConfirmation, REQUEST_MORE_NOTE_MAX } from "../services/claim-request-more";
@@ -471,6 +471,8 @@ router.post("/register", async (req: Request, res: Response) => {
     description,
     lat,
     lng,
+    address: dedupAddress,
+    postal_code: dedupPostalCode,
   } = req.body as {
     name?: string;
     url?: string;
@@ -486,6 +488,9 @@ router.post("/register", async (req: Request, res: Response) => {
     description?: string;
     lat?: number;
     lng?: number;
+    // G7 D3: read only for the sibling dedup below — never persisted.
+    address?: unknown;
+    postal_code?: unknown;
   };
 
   if (!name || !url || !city || !vertical_id) {
@@ -602,6 +607,33 @@ router.post("/register", async (req: Request, res: Response) => {
         message: "Agent with this name+city already exists",
       });
       return;
+    }
+
+    // ── Dedup 3: owner-claim sibling rule (G7 discovery-dedup D3) ──
+    // REGISTER_SIBLING_DEDUP_ENABLED (read per request, default off), rfb
+    // only: refuse a new profile that matches an existing RFB profile on
+    // org.nr (column or tag), normalized phone, or street address + postal
+    // code — the same rule as the owner-claim assessment
+    // (knowledge-service.ts claimSiblingsForRow). `address`/`postal_code`
+    // are read for this check only and never stored. Runs before the Brreg
+    // lookup and the INSERT, so a hit writes nothing. Flag off: no query.
+    if (process.env.REGISTER_SIBLING_DEDUP_ENABLED === "true" && vertical_id === "rfb") {
+      const sibling = findRegisterSiblingMatch(db, {
+        org_nr,
+        phone: trimmedPhone,
+        address: dedupAddress,
+        postal_code: dedupPostalCode,
+      });
+      if (sibling) {
+        res.json({
+          success: false,
+          duplicate: true,
+          existing_id: sibling.existingId,
+          match: sibling.match,
+          message: `Agent matching an existing RFB profile on ${sibling.match} already exists`,
+        });
+        return;
+      }
     }
 
     // ── Build tags array ─────────────────────────────────────

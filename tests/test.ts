@@ -50818,6 +50818,27 @@ runSerial(async () => {
   }
 });
 
+// G7 discovery-dedup, slice D3: POST /admin/agents/register refuses a new RFB
+// profile that matches an existing RFB profile on org.nr, phone or street
+// address + postal code (the owner-claim sibling rule, claimSiblingsForRow),
+// behind REGISTER_SIBLING_DEDUP_ENABLED (default off). Pins getDb() to its
+// own in-memory DB, sets env (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── G7 discovery-dedup D3: register sibling dedup ──");
+  try {
+    const { runAdminAgentsRegisterSiblingDedupTests } = require("../src/routes/admin-agents-register-sibling-dedup.test") as
+      typeof import("../src/routes/admin-agents-register-sibling-dedup.test");
+    const d3 = await runAdminAgentsRegisterSiblingDedupTests({ log: false });
+    passed += d3.passed;
+    failed += d3.failed;
+    for (const f of d3.failures) failures.push("register-sibling-dedup-d3: " + f);
+    console.log(`  register-sibling-dedup-d3: ${d3.passed} passed, ${d3.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("register-sibling-dedup-d3: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice
 // B2b-2: after a B2b-1 auto-approval the farm's known address (as before the
 // approval) gets «Ny eier registrert for <profil>» when it exists, differs
