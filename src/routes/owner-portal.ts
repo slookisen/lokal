@@ -41,7 +41,7 @@ import { ownerOrdersEntryCardHtml } from "./owner-orders-view";
 import { OWNER_PORTAL_FORM_LABELS, readOwnerAuditFeed } from "./owner-audit-log";
 import { paymentPortalAlert, renderPaymentCard, shouldRenderPaymentCard } from "./owner-payment-card";
 import {
-  ownerOrderabilityPortalEnabledFor, listOwnerProductOrderability, confirmOwnerProductInStock,
+  ownerOrderabilityPortalEnabledFor, confirmOwnerProductInStock,
   confirmAllOwnerProductsInStock, addOwnerProduct, orderabilityReasonTextNb, formatOwnerDate,
   OWNER_PRODUCT_FIELD_TEXT_NB, type OwnerOrderabilityOverview, type OwnerProductField,
 } from "../services/owner-orderability";
@@ -54,6 +54,8 @@ import {
 } from "../services/product-import/owner-import";
 import { autoSyncStatusView, importPageAutoSyncChoice, type AutoSyncStatusView } from "../services/product-import/auto-sync";
 import { ownerRowAnchor } from "../owner-features/anchors";
+import { readOwnerItems } from "../services/owner-items-view";
+import { ownerItemAnchor, ownerItemsMissingPriceText, renderOwnerItemsSection, type OwnerItemsMessage } from "./owner-items-card";
 import { PRODUCT_WEEKLY_SYNC_KEY } from "../owner-features/product-weekly-sync";
 
 const router = Router();
@@ -2075,11 +2077,6 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       alert = oa.ok
         ? `<div class="ep-alert ep-alert-ok" role="status">${escapeHtml(oa.text)}</div>`
         : `<div class="ep-alert ep-alert-error" role="alert">${escapeHtml(oa.text)}</div>`;
-    } else if (ownerOrderabilityPortalEnabledFor(agentId) && ownerOrderabilityAlert(status, req.query.felt, req.query.uten_pris)) {
-      const va = ownerOrderabilityAlert(status, req.query.felt, req.query.uten_pris)!;
-      alert = va.ok
-        ? `<div class="ep-alert ep-alert-ok" role="status">${escapeHtml(va.text)}</div>`
-        : `<div class="ep-alert ep-alert-error" role="alert">${escapeHtml(va.text)}</div>`;
     } else if (paymentPortalAlert(status)) {
       const pa = paymentPortalAlert(status)!;
       alert = pa.ok
@@ -2127,10 +2124,14 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       } catch { orderEmailHtml = ""; }
     }
 
-    // B1: «Varer som kan bestilles» — only with OWNER_ORDERABILITY_PORTAL_ENABLED
+    // B1: the products card — only with OWNER_ORDERABILITY_PORTAL_ENABLED
     // on and a verified owner (flag off = the portal is byte-identical to before).
     // B1a: and only for a subject in OWNER_FEATURES_ALLOWED_SUBJECTS (off the
     // list = byte-identical to flag off; the banner lives inside the card).
+    // T13 V1a: under that same gate (no new flag) the card is the «Varer»
+    // card (routes/owner-items-card.ts); its POST messages stand in the card
+    // or in the row (T5 anchor contract), not in the top alert. A verified
+    // owner on another address than the claimant's sees the list without buttons.
     let orderabilityCardHtml = "";
     if (ownerOrderabilityPortalEnabledFor(agentId)) {
       try {
@@ -2144,7 +2145,15 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
             console.error("[owner-portal] stock-check banner failed:", e instanceof Error ? e.message : "error");
             banner = "";
           }
-          orderabilityCardHtml = ownerOrderabilityCardHtml(agentId, listOwnerProductOrderability(agentId, db), banner);
+          const now = new Date();
+          orderabilityCardHtml = renderOwnerItemsSection({
+            agentId,
+            model: readOwnerItems(agentId, db, now),
+            now,
+            canEdit: !!sessionClaimantOwnerEmail(agentId, session),
+            bannerHtml: banner,
+            message: ownerItemsMessageFromQuery(status, req.query as Record<string, unknown>),
+          });
         }
       } catch (e) {
         console.error("[owner-portal] orderability card failed:", e instanceof Error ? e.message : "error");
@@ -3135,6 +3144,31 @@ function orderabilityBack(agentId: string, status: string, extra = ""): string {
   return `/eier/${encodeURIComponent(agentId)}/portal?status=${status}${extra}#${ORDERABILITY_ANCHOR}`;
 }
 
+/** T13 V1a: a row's own POST → back to that row, with the message placed there (`ved=vare-<id>#vare-<id>`). */
+function itemRowBack(agentId: string, status: string, productId: string): string {
+  const anchor = encodeURIComponent(ownerItemAnchor(productId));
+  return `/eier/${encodeURIComponent(agentId)}/portal?status=${status}&ved=${anchor}#${anchor}`;
+}
+
+/**
+ * T13 V1a: status=… (and ved=, uten_pris=, felt=) after a products POST → the
+ * «Varer» card's message; null = not ours. The texts are the B1 alerts; the
+ * missing-price count after «Bekreft alle» is the spec's sentence.
+ */
+export function ownerItemsMessageFromQuery(status: string, query: Record<string, unknown>): OwnerItemsMessage | null {
+  const base = ownerOrderabilityAlert(status, query.felt);
+  if (!base) return null;
+  let text = base.text;
+  const rawK = query.uten_pris;
+  if ((status === "varer_bekreftet" || status === "ingen_varer_bekreftet") && typeof rawK === "string" && /^\d{1,5}$/.test(rawK)) {
+    const extra = ownerItemsMissingPriceText(Number(rawK));
+    if (extra) text = `${text} ${extra}`;
+  }
+  const ved = typeof query.ved === "string" ? query.ved : "";
+  const productId = ved.startsWith("vare-") && ved.length <= 205 ? ved.slice(5) : null;
+  return { ok: base.ok, text, productId };
+}
+
 // B2 (products.stock_check): the banner above the list and its one POST.
 //   POST /eier/:agentId/varer/bekreft-lagerpaminnelse — «Bekreft at varene
 //   fortsatt er på lager» for the listed ids (hidden fields); the service
@@ -3183,7 +3217,13 @@ router.post("/eier/:agentId/varer/bekreft-alle", express.urlencoded({ extended: 
   const auth = ownerOrderabilityAuth(req, res);
   if (!auth.ok) return;
   try {
-    const r = confirmAllOwnerProductsInStock(auth.agentId, { actorEmail: auth.email });
+    // T13 V1a: «Bekreft alle ({n})» sends the ids it lists; without ids (an
+    // older form) every confirmable row, as before.
+    const raw = (req.body || {}).id;
+    const ids = raw === undefined
+      ? undefined
+      : (Array.isArray(raw) ? raw : [raw]).filter((x): x is string => typeof x === "string" && x.length > 0 && x.length <= 200).slice(0, 500);
+    const r = confirmAllOwnerProductsInStock(auth.agentId, { actorEmail: auth.email, ids });
     const extra = r.skipped_missing_price > 0 ? `&uten_pris=${r.skipped_missing_price}` : "";
     return res.redirect(303, orderabilityBack(auth.agentId, r.confirmed > 0 ? "varer_bekreftet" : "ingen_varer_bekreftet", extra));
   } catch (err) {
@@ -3213,13 +3253,14 @@ router.post("/eier/:agentId/varer/:productId/bekreft", express.urlencoded({ exte
   const auth = ownerOrderabilityAuth(req, res);
   if (!auth.ok) return;
   try {
-    const r = confirmOwnerProductInStock(auth.agentId, String((req.params as any).productId || ""), { actorEmail: auth.email });
-    if (r.ok) return res.redirect(303, orderabilityBack(auth.agentId, "vare_bekreftet"));
-    if (r.error === "missing_price") return res.redirect(303, orderabilityBack(auth.agentId, "vare_mangler_pris"));
+    const productId = String((req.params as any).productId || "");
+    const r = confirmOwnerProductInStock(auth.agentId, productId, { actorEmail: auth.email });
+    if (r.ok) return res.redirect(303, itemRowBack(auth.agentId, "vare_bekreftet", productId));
+    if (r.error === "missing_price") return res.redirect(303, itemRowBack(auth.agentId, "vare_mangler_pris", productId));
     if (r.error === "not_found") {
       return res.status(404).send(portalShell("Fant ikke varen", `<div class="ep-card"><h1>Fant ikke varen</h1><p><a href="/eier/${encodeURIComponent(auth.agentId)}/portal#${ORDERABILITY_ANCHOR}">Tilbake til varene</a></p></div>`));
     }
-    return res.redirect(303, orderabilityBack(auth.agentId, "vare_kan_ikke_bekreftes"));
+    return res.redirect(303, itemRowBack(auth.agentId, "vare_kan_ikke_bekreftes", productId));
   } catch (err) {
     console.error("[owner-portal] POST varer/:productId/bekreft error:", err instanceof Error ? err.message : "error");
     return res.redirect(303, orderabilityBack(auth.agentId, "vare_feil"));

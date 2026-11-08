@@ -214,7 +214,7 @@ export async function runBestillingerB1bTests(opts: { log?: boolean } = {}): Pro
       const g = await invoke(H.portal, makeReq({ method: "GET", params: { agentId: P }, token: "tok-other" }));
       const html = String(g.body ?? "");
       assertEq(g.status, 200, "other-4: GET portal still 200 for the verified owner on another address");
-      assertTrue(html.includes(`id="bestillbare-varer"`) && html.includes("Varer som kan bestilles") && html.includes("Purre"), "other-5: … and the card is shown");
+      assertTrue(html.includes(`id="bestillbare-varer"`) && html.includes("<h2>Varer</h2>") && html.includes("Purre"), "other-5: … and the card is shown");
       // Existing checks keep their order/answers: cross-site, no session.
       const xs = await invoke(H.all, makeReq({ params: { agentId: P }, token: "tok-other", headers: { origin: "https://evil.example" } }));
       assertTrue(xs.status === 403 && !String(xs.body).includes("eierens e-post"), "other-6: cross-site still answered by the Origin check first");
@@ -229,7 +229,7 @@ export async function runBestillingerB1bTests(opts: { log?: boolean } = {}): Pro
       const r4 = await invoke(H.banner, makeReq({ params: { agentId: P }, body: { id: [`${P}-soon`] }, token: "tok-claimant", headers: ORIGIN }));
       assertEq([r4.status, r4.body?.__redirect], [303, back("lager_bekreftet")], "match-0: claimant → POST bekreft-lagerpaminnelse (before bekreft-alle refreshes the row) → 303 lager_bekreftet");
       const r1 = await invoke(H.one, makeReq({ params: { agentId: P, productId: `${P}-out` }, token: "tok-claimant", headers: ORIGIN }));
-      assertEq([r1.status, r1.body?.__redirect], [303, back("vare_bekreftet")], "match-1: claimant → POST bekreft → 303 vare_bekreftet");
+      assertEq([r1.status, r1.body?.__redirect], [303, `/eier/${P}/portal?status=vare_bekreftet&ved=vare-${P}-out#vare-${P}-out`], "match-1: claimant → POST bekreft → 303 vare_bekreftet");
       assertEq((db.prepare("SELECT availability FROM products WHERE id = ?").get(`${P}-out`) as any).availability, "in_stock", "match-2: … and writes");
       const r2 = await invoke(H.all, makeReq({ params: { agentId: P }, token: "tok-case", headers: ORIGIN }));
       assertEq([r2.status, r2.body?.__redirect], [303, back("varer_bekreftet")], "match-3: claimant, other case/whitespace → POST bekreft-alle → 303 varer_bekreftet");

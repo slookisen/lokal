@@ -376,16 +376,17 @@ export async function runOwnerOrderabilityB1Tests(opts: { log?: boolean } = {}):
     // ═══ the card ═════════════════════════════════════════════════════════
     {
       const html = await portal(A);
-      assertTrue(html.includes(`id="bestillbare-varer"`) && html.includes("Varer som kan bestilles"), "card: shown with the flag on");
+      assertTrue(html.includes(`id="bestillbare-varer"`) && html.includes("<h2>Varer</h2>"), "card: shown with the flag on (T13: the «Varer» card)");
       const n = cart.countOrderableProducts(A, db);
       assertTrue(html.includes(`data-orderable-count="${n}"`) && html.includes(`${n} av ${FIX.filter((f) => f.agent === A).length} varer kan bestilles nå.`), "card: the count equals countOrderableProducts");
       assertTrue(html.includes("Kan bestilles") && html.includes("Kan ikke bestilles"), "card: «Kan bestilles» / «Kan ikke bestilles»");
-      for (const t of ["Dette er et kategorinavn, ikke en vare", "Alkohol kan ikke bestilles her", "Tjenester og opplevelser kan ikke bestilles her", "Lagerstatus utgått", "Ikke registrert på lager", "Ikke bekreftet av deg ennå"]) {
+      // T13 V1a: one reason line per row (the «Varer» card's texts).
+      for (const t of ["Dette er et kategorinavn, ikke en vare", "Alkohol kan ikke bestilles her", "Tjenester og opplevelser kan ikke bestilles her", "Lagerstatus gikk ut", "Merket som utsolgt", "Fra nettsiden din – sjekk at prisen stemmer."]) {
         assertTrue(html.includes(t), `card: reason text «${t}»`);
       }
       assertTrue(html.includes(`action="/eier/${A}/varer/b1-out/bekreft"`) && !html.includes(`action="/eier/${A}/varer/b1-label/bekreft"`), "card: confirm button per confirmable row only");
-      assertTrue(!html.includes(`action="/eier/${A}/varer/b1-noprice/bekreft"`) && html.includes(`data-missing-price="1"`) && html.includes("Mangler pris"), "card: an unpriced row gets «Mangler pris» and no confirm button");
-      assertTrue(html.includes("Bekreft at varen er på lager") && html.includes("Bekreft alle på lager") && html.includes(`action="/eier/${A}/varer/ny"`), "card: the buttons and the add form");
+      assertTrue(!html.includes(`action="/eier/${A}/varer/b1-noprice/bekreft"`) && html.includes("Mangler pris – legg inn pris først."), "card: an unpriced row gets «Mangler pris» and no confirm button");
+      assertTrue(html.includes("Bekreft på lager") && html.includes("Bekreft alle (") && html.includes(`action="/eier/${A}/varer/ny"`), "card: the buttons and the add form");
       const offHtml = await portal(OFF);
       assertTrue(offHtml.includes(`data-orderability-profile="blocked"`) && offHtml.includes("Bestillinger er slått av"), "card: profile-level reason shown");
       assertTrue((await portal(EMATCH)).indexOf("bestillbare-varer") === -1, "card: not for a session without verified ownership");
@@ -427,24 +428,24 @@ export async function runOwnerOrderabilityB1Tests(opts: { log?: boolean } = {}):
     {
       const audits0 = (db.prepare("SELECT COUNT(*) AS n FROM agent_knowledge_audit WHERE agent_id = ?").get(A) as any).n;
       const r = await post(H.one, { agentId: A, productId: "b1-out" }, tokens[A], {}, { origin: "https://rettfrabonden.com" });
-      assertEq([r.status, loc(r)], [303, `/eier/${A}/portal?status=vare_bekreftet#bestillbare-varer`], "confirm one: 303 back to the card");
+      assertEq([r.status, loc(r)], [303, `/eier/${A}/portal?status=vare_bekreftet&ved=vare-b1-out#vare-b1-out`], "confirm one: 303 back to the row (T13 anchor #vare-<id>)");
       const row = rowOf("b1-out");
       assertEq([row.availability, row.availability_source], ["in_stock", "producer_dashboard"], "confirm one: in_stock, source producer_dashboard");
       assertTrue(cart.isRowOrderableForRealOrder(db, row), "confirm one: now orderable");
       assertEq((db.prepare("SELECT COUNT(*) AS n FROM agent_knowledge_audit WHERE agent_id = ?").get(A) as any).n, audits0 + 1, "confirm one: an audit row");
       const npr = await post(H.one, { agentId: A, productId: "b1-noprice" }, tokens[A]);
-      assertEq([loc(npr), src("b1-noprice")], [`/eier/${A}/portal?status=vare_mangler_pris#bestillbare-varer`, "enrichment"], "confirm one: an unpriced row is refused, nothing written");
+      assertEq([loc(npr), src("b1-noprice")], [`/eier/${A}/portal?status=vare_mangler_pris&ved=vare-b1-noprice#vare-b1-noprice`, "enrichment"], "confirm one: an unpriced row is refused, nothing written");
       assertTrue((await portal(A, { status: "vare_mangler_pris" })).includes("Varen mangler pris, så den kan ikke bekreftes her. Legg inn pris først."), "confirm one: the refusal message");
       const lab = await post(H.one, { agentId: A, productId: "b1-label" }, tokens[A]);
-      assertEq([loc(lab), src("b1-label")], [`/eier/${A}/portal?status=vare_kan_ikke_bekreftes#bestillbare-varer`, "enrichment"], "confirm one: a category label is not confirmed");
+      assertEq([loc(lab), src("b1-label")], [`/eier/${A}/portal?status=vare_kan_ikke_bekreftes&ved=vare-b1-label#vare-b1-label`, "enrichment"], "confirm one: a category label is not confirmed");
 
       const all = await post(H.all, { agentId: A }, tokens[A]);
       assertEq(loc(all), `/eier/${A}/portal?status=varer_bekreftet&uten_pris=1#bestillbare-varer`, "confirm all: 303 back, with the number of unpriced rows skipped");
       assertEq(src("b1-noprice"), "enrichment", "confirm all: an unpriced row is not confirmed");
       const msg = await portal(A, { status: "varer_bekreftet", uten_pris: "1" });
-      assertTrue(msg.includes("Varene er bekreftet på lager. 1 vare uten pris ble ikke bekreftet — legg inn pris først."), "confirm all: the owner is told the unpriced rows were skipped");
+      assertTrue(msg.includes("Varene er bekreftet på lager. 1 vare ble ikke bekreftet fordi den mangler pris."), "confirm all: the owner is told the unpriced rows were skipped");
       const msgBad = await portal(A, { status: "varer_bekreftet", uten_pris: "<b>" });
-      assertTrue(msgBad.includes("Varene er bekreftet på lager.") && !msgBad.includes("uten pris ble ikke"), "confirm all: a non-numeric uten_pris is ignored");
+      assertTrue(msgBad.includes("Varene er bekreftet på lager.") && !msgBad.includes("ble ikke bekreftet fordi"), "confirm all: a non-numeric uten_pris is ignored");
       const after = db.prepare("SELECT id, availability, availability_source FROM products WHERE agent_id = ? ORDER BY id").all(A) as any[];
       const by = Object.fromEntries(after.map((x) => [x.id, [x.availability, x.availability_source]]));
       for (const pid of ["b1-ok-dash", "b1-expired", "b1-expired-null", "b1-out", "b1-unconfirmed", "b1-out-unconfirmed"]) {

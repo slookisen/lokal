@@ -363,6 +363,11 @@ export async function runOwnerFeatureMatrixTests(opts: { log?: boolean } = {}): 
     // a new order address only from the verified claimant's own login.
     db.prepare("INSERT INTO agent_claims (id, agent_id, claimant_email, claimant_name, status, verified_at) VALUES (?, ?, ?, 'Eier', 'verified', '2026-10-01T00:00:00.000Z')")
       .run(`claim-${ids.orderEmail}`, ids.orderEmail, emailOf(ids.orderEmail));
+    // T13 V1a (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 7): the
+    // «Varer» card shows the stock-check box (it carries a confirm button) only
+    // to the verified claimant's own login; other sessions see the list only.
+    db.prepare("INSERT INTO agent_claims (id, agent_id, claimant_email, claimant_name, status, verified_at) VALUES (?, ?, ?, 'Eier', 'verified', '2026-10-01T00:00:00.000Z')")
+      .run(`claim-${ids.stockPortal}`, ids.stockPortal, emailOf(ids.stockPortal));
     // auto.updates: an empty category list (the field fill_empty may fill) —
     // set here, so the producer is in no category list the other cases read —
     // and an about / description an enrichment source recorded verbatim (the
@@ -1089,7 +1094,7 @@ export async function runOwnerFeatureMatrixTests(opts: { log?: boolean } = {}): 
         try {
           await stockSteps(c, id, async () => {
             const html = String((await invoke(portalH, makeReq({ params: { agentId: id }, token: tokens[id] }))).body ?? "");
-            if (!html.includes("Varer som kan bestilles")) assertTrue(false, `${matrixCaseId(c)}: the B1 card renders`);
+            if (!html.includes(`id="bestillbare-varer"`)) assertTrue(false, `${matrixCaseId(c)}: the B1 card (T13: «Varer») renders`);
             return html.includes('data-stock-check-banner="1"') && html.includes("Bekreft at varene fortsatt er på lager");
           });
         } finally {
