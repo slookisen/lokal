@@ -1393,7 +1393,7 @@ ${this.brand} | ${getConfig().domain}`;
     recommendation?: string,
     /** Signed one-click links (eierkrav B1, behind CLAIM_ACTION_LINKS_ENABLED).
      *  Undefined → the notice is rendered exactly as before. */
-    actionLinks?: { approve: string; reject: string; request_more?: string },
+    actionLinks?: { approve: string; reject: string; request_more?: string; merge_approve?: Array<{ name: string; url: string }> },
     /** The stored claim assessment (eierkrav B2a). Undefined, or not a
      *  readable assessment → the notice is rendered exactly as before. */
     assessment?: unknown
@@ -1425,7 +1425,7 @@ ${this.brand} | ${getConfig().domain}`;
           <p>Køen: GET ${this.escapeHtml(queuePath)} (X-Admin-Key)</p>
           <p style="color: #888; font-size: 12px;">Automatisk varsling fra ${this.brand}</p>
         </div>`;
-      const textContent = `Eierkrav venter på godkjenning på ${this.brand}\n\nIngen kode er sendt. Kravet gir verken tilgang eller merke før det er godkjent.\n\nProdusent: ${agentName} (${agentId})\nNavn: ${claimantName}\nE-post: ${claimantEmail}\nGrunn: ${reason}\n${recommendation ? `Anbefaling: ${recommendation}\n` : ''}Tidspunkt: ${new Date().toISOString()}\n\n${assessmentLines ? `${assessmentLines.join('\n')}\n\n` : ''}${actionLinks ? `Godkjenn: ${actionLinks.approve}\nAvvis: ${actionLinks.reject}\n${actionLinks.request_more ? `Be om mer bekreftelse: ${actionLinks.request_more}\n` : ''}${CLAIM_REVIEW_LINK_NOTE}\n\n` : ''}Køen: GET ${queuePath} (X-Admin-Key)`;
+      const textContent = `Eierkrav venter på godkjenning på ${this.brand}\n\nIngen kode er sendt. Kravet gir verken tilgang eller merke før det er godkjent.\n\nProdusent: ${agentName} (${agentId})\nNavn: ${claimantName}\nE-post: ${claimantEmail}\nGrunn: ${reason}\n${recommendation ? `Anbefaling: ${recommendation}\n` : ''}Tidspunkt: ${new Date().toISOString()}\n\n${assessmentLines ? `${assessmentLines.join('\n')}\n\n` : ''}${actionLinks ? `Godkjenn: ${actionLinks.approve}\nAvvis: ${actionLinks.reject}\n${actionLinks.request_more ? `Be om mer bekreftelse: ${actionLinks.request_more}\n` : ''}${(actionLinks.merge_approve ?? []).map((m) => `Slå sammen med ${m.name.replace(/\s+/g, ' ')} og godkjenn: ${m.url}\n`).join('')}${CLAIM_REVIEW_LINK_NOTE}\n\n` : ''}Køen: GET ${queuePath} (X-Admin-Key)`;
 
       return await this.sendEmail({
         to: adminEmail,
@@ -1581,14 +1581,19 @@ ${this.brand} | ${getConfig().domain}`;
   }
 
   /** «Godkjenn» / «Avvis» buttons for the admin claim-review notice (B1). */
-  private claimReviewButtonsHtml(links: { approve: string; reject: string; request_more?: string }): string {
+  private claimReviewButtonsHtml(links: { approve: string; reject: string; request_more?: string; merge_approve?: Array<{ name: string; url: string }> }): string {
     const btn = (href: string, label: string, color: string) =>
       `<a href="${this.escapeHtml(href)}" style="display: inline-block; padding: 10px 20px; margin: 0 8px 8px 0; background: ${color}; color: #ffffff; text-decoration: none; border-radius: 6px; font-weight: bold;">${label}</a>`;
     // Eierkrav B3a: the third button only when a request_more link was minted
     // (CLAIM_REQUEST_MORE_ENABLED); without it the block is today's, byte for byte.
     const more = links.request_more ? btn(links.request_more, 'Be om mer bekreftelse', '#8a6d1e') : '';
+    // Eierkrav D2: one «Slå sammen med <søsken> og godkjenn» per minted
+    // merge_approve link (sibling name escaped); none → today's block.
+    const merges = (links.merge_approve ?? [])
+      .map((m) => btn(m.url, `Slå sammen med ${this.escapeHtml(m.name)} og godkjenn`, '#3b5b7a'))
+      .join('');
     return `
-          <p>${btn(links.approve, 'Godkjenn', '#2d5016')}${btn(links.reject, 'Avvis', '#8b1e1e')}${more}</p>
+          <p>${btn(links.approve, 'Godkjenn', '#2d5016')}${btn(links.reject, 'Avvis', '#8b1e1e')}${more}${merges}</p>
           <p style="color: #555; font-size: 13px;">${this.escapeHtml(CLAIM_REVIEW_LINK_NOTE)}</p>`;
   }
 

@@ -55,7 +55,8 @@ import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
 // helper the Opplevagent claim page uses; per-IP limit on claim requests.
 import { maskEmail } from "../services/gardssalg-claim";
 import { CLAIM_RECOMMENDATION_LABELS, type ClaimRecommendation } from "../services/claim-domain-rule";
-import { createClaimActionLinks, isClaimActionLinksEnabled, isClaimRequestMoreEnabled, type ClaimAction } from "../services/claim-action-link";
+import { createClaimActionLinks, isClaimActionLinksEnabled, isClaimRequestMoreEnabled, isClaimMergeApproveEnabled, type ClaimAction } from "../services/claim-action-link";
+import { mergeApproveCandidates } from "../services/claim-merge-approve";
 import { claimAssessmentEnabled, waitForClaimAssessmentOutcome, type ClaimAssessment } from "../services/claim-assessment";
 import { autoApproveGreenClaim, claimAutoApproveEnabled } from "../services/claim-auto-approve";
 import { rfbClaimRequestLimiter } from "../middleware/security";
@@ -2006,8 +2007,12 @@ function claimRequestFieldError(b: { name: unknown; email: unknown; phone: unkno
  *  link). Neither the links nor their tokens are logged.
  *  Eierkrav B3a: with CLAIM_REQUEST_MORE_ENABLED === "true" as well, a third
  *  link, request_more («Be om mer bekreftelse»), is minted with them; flag off
- *  → exactly the two links (and the notice) as before. */
-function claimQueuedActionLinks(claimId: string): { approve: string; reject: string; request_more?: string } | undefined {
+ *  → exactly the two links (and the notice) as before.
+ *  Eierkrav D2: with CLAIM_MERGE_APPROVE_ENABLED === "true" as well, one
+ *  merge_approve link per mergeable sibling (claimMergeApproveLinks); none,
+ *  the flag off or any failure there → no merge_approve key, so the notice is
+ *  exactly as without D2. */
+function claimQueuedActionLinks(claimId: string): { approve: string; reject: string; request_more?: string; merge_approve?: Array<{ name: string; url: string }> } | undefined {
   if (!isClaimActionLinksEnabled() || !process.env.ADMIN_NOTIFICATION_EMAIL) return undefined;
   try {
     const requestMore = isClaimRequestMoreEnabled();
@@ -2021,10 +2026,38 @@ function claimQueuedActionLinks(claimId: string): { approve: string; reject: str
     const reject = minted.links.find((l) => l.action === "reject")?.url;
     if (!approve || !reject) return undefined;
     const more = requestMore ? minted.links.find((l) => l.action === "request_more")?.url : undefined;
-    return more ? { approve, reject, request_more: more } : { approve, reject };
+    const links: { approve: string; reject: string; request_more?: string; merge_approve?: Array<{ name: string; url: string }> } =
+      more ? { approve, reject, request_more: more } : { approve, reject };
+    const merges = claimMergeApproveLinks(claimId, minted.agent_id);
+    if (merges.length > 0) links.merge_approve = merges;
+    return links;
   } catch (err: any) {
     console.error("[Admin notify] claim-action links failed:", err?.message);
     return undefined;
+  }
+}
+
+/** Eierkrav D2: «Slå sammen med <søsken> og godkjenn» links for the notice —
+ *  siblings read fresh (mergeApproveCandidates: the D1 rule, no inactive or
+ *  owned profile, at most 3). Flag off, no sibling, a refusal or a throw →
+ *  [] (and nothing minted: one transaction). Never logs a link. */
+function claimMergeApproveLinks(claimId: string, agentId: string): Array<{ name: string; url: string }> {
+  if (!isClaimMergeApproveEnabled()) return [];
+  try {
+    const db = getDb();
+    return db.transaction(() => {
+      const out: Array<{ name: string; url: string }> = [];
+      for (const sib of mergeApproveCandidates(agentId)) {
+        const m = createClaimActionLinks(claimId, ["merge_approve"], { duplicateId: sib.id, db });
+        const url = m.ok ? m.links[0]?.url : undefined;
+        if (!url) throw new Error(`merge_approve not minted: ${m.ok ? "no link" : m.reason}`);
+        out.push({ name: sib.name, url });
+      }
+      return out;
+    })();
+  } catch (err: any) {
+    console.warn("[Admin notify] merge_approve links not minted:", err?.message);
+    return [];
   }
 }
 

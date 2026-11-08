@@ -36,6 +36,15 @@
 // executes nothing. It sends a mail, so it is not redeemed here but by
 // services/claim-request-more.ts (the link POST dispatches to it);
 // redeemClaimActionLink refuses it without using the link up.
+//
+// Eierkrav D2: a fifth action, merge_approve («Slå sammen med <søsken> og
+// godkjenn»), behind CLAIM_MERGE_APPROVE_ENABLED (the D1 flag). It is bound
+// to the claim AND one sibling profile: the sibling id is in the signed
+// payload (`d`) and in claim_action_links.duplicate_id, and both must agree
+// (every other action has neither). It is never part of a default set and is
+// only minted with a duplicate id. Like request_more it is not redeemed here
+// but by services/claim-merge-approve.ts (redeemClaimMergeApproveLink), in one
+// transaction with the merge + approval.
 
 import crypto from "crypto";
 import { getDb } from "../database/init";
@@ -48,13 +57,14 @@ export const CLAIM_ACTION_VALID_HOURS = 72;
 export const CLAIM_ACTION_PATH = "/eierkrav/handling";
 export const CLAIM_ACTION_BASE_URL = "https://rettfrabonden.com";
 
-export const CLAIM_ACTIONS = ["approve", "reject", "revoke", "request_more"] as const;
+export const CLAIM_ACTIONS = ["approve", "reject", "revoke", "request_more", "merge_approve"] as const;
 export type ClaimAction = (typeof CLAIM_ACTIONS)[number];
 
 const TOKEN_VERSION = "v1";
 const SIG_CONTEXT = "rfb-claim-action:v1:";
 const MAX_TOKEN_LENGTH = 1024;
 const MAX_CLAIM_ID_LENGTH = 200;
+const MAX_DUPLICATE_ID_LENGTH = 200;
 
 type Db = ReturnType<typeof getDb>;
 
@@ -67,6 +77,13 @@ export function isClaimActionLinksEnabled(): boolean {
 export const CLAIM_REQUEST_MORE_FLAG_ENV = "CLAIM_REQUEST_MORE_ENABLED";
 export function isClaimRequestMoreEnabled(): boolean {
   return process.env[CLAIM_REQUEST_MORE_FLAG_ENV] === "true";
+}
+
+/** Eierkrav D1/D2: CLAIM_MERGE_APPROVE_ENABLED — off unless exactly "true".
+ *  Gates the D1 admin route and the D2 merge_approve link. */
+export const CLAIM_MERGE_APPROVE_FLAG_ENV = "CLAIM_MERGE_APPROVE_ENABLED";
+export function isClaimMergeApproveEnabled(): boolean {
+  return process.env[CLAIM_MERGE_APPROVE_FLAG_ENV] === "true";
 }
 
 /** The signing secret, or null when unset/too short (callers fail closed). */
@@ -86,19 +103,23 @@ const REQUIRED_STATUS: Record<ClaimAction, string> = {
   reject: "pending_review",
   revoke: "verified",
   request_more: "pending_review",
+  merge_approve: "pending_review",
 };
 
-/** Whether an action may be minted / executed at all right now (B3a: only
- *  request_more depends on a flag). */
+/** Whether an action may be minted / executed at all right now (B3a:
+ *  request_more depends on its flag; D2: merge_approve on the D1 flag). */
 function isActionEnabled(a: ClaimAction): boolean {
-  return a !== "request_more" || isClaimRequestMoreEnabled();
+  if (a === "request_more") return isClaimRequestMoreEnabled();
+  if (a === "merge_approve") return isClaimMergeApproveEnabled();
+  return true;
 }
 
 /** The actions that fit a claim's current status (the mint default).
  *  request_more only with CLAIM_REQUEST_MORE_ENABLED, so with the flag off
- *  the default is exactly what it was before B3a. */
+ *  the default is exactly what it was before B3a. merge_approve is never a
+ *  default (D2: it needs a sibling id). */
 export function actionsForStatus(status: string): ClaimAction[] {
-  return CLAIM_ACTIONS.filter((a) => REQUIRED_STATUS[a] === status && isActionEnabled(a));
+  return CLAIM_ACTIONS.filter((a) => a !== "merge_approve" && REQUIRED_STATUS[a] === status && isActionEnabled(a));
 }
 
 function b64url(buf: Buffer): string {
@@ -120,7 +141,7 @@ function safeEqual(a: string, b: string): boolean {
   return crypto.timingSafeEqual(ab, bb);
 }
 
-interface TokenPayload { c: string; a: ClaimAction; x: number; n: string }
+interface TokenPayload { c: string; a: ClaimAction; x: number; n: string; d?: string }
 
 /** Verify the signature and shape; null on anything wrong. Never throws. */
 function parseToken(secret: string, token: unknown): TokenPayload | null {
@@ -138,6 +159,12 @@ function parseToken(secret: string, token: unknown): TokenPayload | null {
     if (!isClaimAction(p.a)) return null;
     if (typeof p.x !== "number" || !Number.isFinite(p.x)) return null;
     if (typeof p.n !== "string" || p.n.length < 16) return null;
+    // D2: a duplicate id exactly on merge_approve, never on another action.
+    if (p.a === "merge_approve") {
+      if (typeof p.d !== "string" || !p.d || p.d.length > MAX_DUPLICATE_ID_LENGTH) return null;
+      return { c: p.c, a: p.a, x: p.x, n: p.n, d: p.d };
+    }
+    if (p.d !== undefined) return null;
     return { c: p.c, a: p.a, x: p.x, n: p.n };
   } catch {
     return null;
@@ -150,16 +177,24 @@ export interface MintedClaimActionLink { action: ClaimAction; url: string; expir
 
 export type CreateClaimActionLinksResult =
   | { ok: true; claim_id: string; agent_id: string; name: string; status: string; links: MintedClaimActionLink[] }
-  | { ok: false; reason: "secret_missing" | "action_disabled" | "claim_not_found" | "action_not_valid_for_status" | "no_actions_for_status"; status?: string };
+  | { ok: false; reason: "secret_missing" | "action_disabled" | "duplicate_required" | "claim_not_found" | "action_not_valid_for_status" | "no_actions_for_status"; status?: string };
 
+/** D2: `duplicateId` is required for (and only used by) merge_approve, which
+ *  is then the only action minted in that call. */
 export function createClaimActionLinks(
   claimId: string,
   actions: ClaimAction[] | undefined,
-  opts: { now?: Date; db?: Db } = {},
+  opts: { now?: Date; db?: Db; duplicateId?: string } = {},
 ): CreateClaimActionLinksResult {
   const secret = claimActionSecret();
   if (!secret) return { ok: false, reason: "secret_missing" };
   if (actions && actions.some((a) => !isActionEnabled(a))) return { ok: false, reason: "action_disabled" };
+  const merge = !!actions && actions.includes("merge_approve");
+  const duplicateId = opts.duplicateId;
+  if (merge !== (duplicateId !== undefined)) return { ok: false, reason: "duplicate_required" };
+  if (merge && (actions!.length !== 1 || !duplicateId || duplicateId.length > MAX_DUPLICATE_ID_LENGTH)) {
+    return { ok: false, reason: "duplicate_required" };
+  }
   const db = opts.db ?? getDb();
   const claim = db.prepare(
     `SELECT c.id, c.agent_id, c.status, a.name FROM agent_claims c JOIN agents a ON a.id = c.agent_id WHERE c.id = ?`
@@ -170,7 +205,9 @@ export function createClaimActionLinks(
   let wanted: ClaimAction[];
   if (actions && actions.length > 0) {
     wanted = CLAIM_ACTIONS.filter((a) => actions.includes(a));
-    if (wanted.some((a) => !fitting.includes(a))) return { ok: false, reason: "action_not_valid_for_status", status };
+    // Every asked-for action is enabled (checked above), so this is the
+    // status fit actionsForStatus applies (merge_approve included).
+    if (wanted.some((a) => REQUIRED_STATUS[a] !== status)) return { ok: false, reason: "action_not_valid_for_status", status };
   } else {
     wanted = fitting;
     if (wanted.length === 0) return { ok: false, reason: "no_actions_for_status", status };
@@ -180,16 +217,18 @@ export function createClaimActionLinks(
   const expiresS = Math.floor((now.getTime() + CLAIM_ACTION_VALID_HOURS * 60 * 60 * 1000) / 1000);
   const expiresAt = new Date(expiresS * 1000).toISOString();
   const insert = db.prepare(
-    `INSERT INTO claim_action_links (id, nonce_hash, claim_id, action, created_at, expires_at, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, 'admin')`
+    `INSERT INTO claim_action_links (id, nonce_hash, claim_id, action, created_at, expires_at, created_by, duplicate_id)
+     VALUES (?, ?, ?, ?, ?, ?, 'admin', ?)`
   );
   const links: MintedClaimActionLink[] = [];
   db.transaction(() => {
     for (const action of wanted) {
       const nonce = b64url(crypto.randomBytes(16));
-      const payloadB64 = b64url(Buffer.from(JSON.stringify({ c: claim.id, a: action, x: expiresS, n: nonce }), "utf8"));
+      const d = action === "merge_approve" ? duplicateId! : null;
+      const payload = d === null ? { c: claim.id, a: action, x: expiresS, n: nonce } : { c: claim.id, a: action, x: expiresS, n: nonce, d };
+      const payloadB64 = b64url(Buffer.from(JSON.stringify(payload), "utf8"));
       const token = `${TOKEN_VERSION}.${payloadB64}.${b64url(hmac(secret, SIG_CONTEXT + payloadB64))}`;
-      insert.run(`cal_${crypto.randomBytes(12).toString("hex")}`, nonceHash(nonce), claim.id, action, now.toISOString(), expiresAt);
+      insert.run(`cal_${crypto.randomBytes(12).toString("hex")}`, nonceHash(nonce), claim.id, action, now.toISOString(), expiresAt, d);
       links.push({ action, url: `${CLAIM_ACTION_BASE_URL}${CLAIM_ACTION_PATH}?t=${encodeURIComponent(token)}`, expires_at: expiresAt });
     }
   })();
@@ -207,6 +246,10 @@ export interface ClaimActionContext {
   claimant_name: string;
   claim_status: string;
   expires_at: string;
+  /** D2: the sibling profile a merge_approve link is bound to (else null). */
+  duplicate_id: string | null;
+  /** D2: that sibling's name ("" when none / unknown). */
+  duplicate_name: string;
 }
 
 export type InspectClaimActionResult =
@@ -226,9 +269,13 @@ export function inspectClaimActionToken(token: unknown, opts: { now?: Date; db?:
   const db = opts.db ?? getDb();
   const linkHash = nonceHash(p.n);
   const row = db.prepare(
-    "SELECT id, claim_id, action, expires_at, used_at FROM claim_action_links WHERE nonce_hash = ?"
-  ).get(linkHash) as { id: string; claim_id: string; action: string; expires_at: string; used_at: string | null } | undefined;
+    "SELECT id, claim_id, action, expires_at, used_at, duplicate_id FROM claim_action_links WHERE nonce_hash = ?"
+  ).get(linkHash) as { id: string; claim_id: string; action: string; expires_at: string; used_at: string | null; duplicate_id: string | null } | undefined;
   if (!row || row.claim_id !== p.c || row.action !== p.a) return { state: "invalid" };
+  // D2: the signed sibling id and the stored one must agree (both absent
+  // for every action but merge_approve).
+  const duplicateId = p.d ?? null;
+  if ((row.duplicate_id ?? null) !== duplicateId) return { state: "invalid" };
   if (row.used_at) return { state: "used", action: p.a };
   const now = opts.now ?? new Date();
   if (now.getTime() >= p.x * 1000) return { state: "expired" };
@@ -236,6 +283,9 @@ export function inspectClaimActionToken(token: unknown, opts: { now?: Date; db?:
     `SELECT c.id, c.agent_id, c.status, c.claimant_name, a.name FROM agent_claims c JOIN agents a ON a.id = c.agent_id WHERE c.id = ?`
   ).get(p.c) as { id: string; agent_id: string; status: string; claimant_name: string | null; name: string | null } | undefined;
   if (!claim) return { state: "invalid" };
+  const duplicateName = duplicateId === null ? "" : String(
+    (db.prepare("SELECT name FROM agents WHERE id = ?").get(duplicateId) as { name: string | null } | undefined)?.name || "",
+  );
   const ctx: ClaimActionContext = {
     link_id: row.id,
     claim_id: claim.id,
@@ -245,6 +295,8 @@ export function inspectClaimActionToken(token: unknown, opts: { now?: Date; db?:
     claimant_name: String(claim.claimant_name || ""),
     claim_status: String(claim.status || ""),
     expires_at: row.expires_at,
+    duplicate_id: duplicateId,
+    duplicate_name: duplicateName,
   };
   if (claim.status !== REQUIRED_STATUS[p.a]) return { state: "wrong_state", ctx };
   return { state: "valid", ctx };
@@ -276,7 +328,8 @@ export function redeemClaimActionLink(token: unknown, opts: { now?: Date; db?: D
     const { ctx } = check;
     // B3a: request_more sends a mail and is redeemed by
     // services/claim-request-more.ts; never here, and the link is not used up.
-    if (ctx.action === "request_more") return { state: "wrong_state", ctx };
+    // D2: merge_approve likewise (services/claim-merge-approve.ts).
+    if (ctx.action === "request_more" || ctx.action === "merge_approve") return { state: "wrong_state", ctx };
 
     // Single-use guard: only the first conditional UPDATE wins.
     const claimed = db.prepare(
