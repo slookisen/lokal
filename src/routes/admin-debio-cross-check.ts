@@ -50,6 +50,7 @@ import { syncDebioRegister, listMatchReview, decideMatchReview, manualDebioLink 
 import { buildOrganicClaimsSummary } from "../services/organic-claims-summary";
 import { getDb } from "../database/init";
 import { fetchDebioCertificateDetail, normalizeCertDetail, describeShape } from "../services/debio-cert-detail-client";
+import { fetchDebioRegister, type DebioRegisterRow } from "../services/debio-register-client";
 
 const router = Router();
 
@@ -281,7 +282,10 @@ router.post("/match-review/:id", (req: Request, res: Response) => {
 });
 
 // ─── Økologi S4a: Debio certificate-detail probe (read-only) ─────────
-// POST /admin/debio/cert-detail-probe   body { enquiryOrigSid: <positive integer> }
+// POST /admin/debio/cert-detail-probe
+//   body { enquiryOrigSid: <positive integer> }   (S4a)
+//     | { registerSid: "<1–12 digits>" }          (S4a-2)
+//   Exactly one of the two; both, neither or an invalid value → 400.
 //   Calls Debio's getcertificatedetail once and returns the response SHAPE
 //   (key paths + types, no values) plus what normalizeCertDetail() makes of
 //   it: { ok, reason?, shape, recognized, line_count, lines (≤ 50; per line
@@ -290,48 +294,112 @@ router.post("/match-review/:id", (req: Request, res: Response) => {
 //   certificate_url }. Captures the real shape from
 //   prod before S4b stores anything. No database access at all; no Debio
 //   person name / street in the response (S1.6).
+//
+//   S4a-2: the register entity sid is NOT what getcertificatedetail takes
+//   (it returned an empty shell). With `registerSid` the route fetches the
+//   register once (fetchDebioRegister), takes the normalized row whose `sid`
+//   equals it and probes with its first `enquiryOrigSids` entry (a
+//   certificate valid now, latest `to` first). Register fetch failed →
+//   ok:false, reason "register_http_<n>" | "register_invalid_json" |
+//   "register_fetch_failed: <cause>" (never a response body); no such row →
+//   "register_sid_not_found"; the row has no enquiryOrigSid →
+//   "no_enquiry_orig_sid" (all with the same empty fields as a detail
+//   failure). Otherwise the S4a response plus enquiry_orig_sid_used and
+//   enquiry_orig_sid_count (also on a detail failure). The enquiryOrigSid
+//   path is unchanged.
 const CERT_PROBE_MAX_LINES = 50;
+const CERT_PROBE_REASON_MAX_CHARS = 300;
 let certDetailFetch: typeof fetch | undefined;
 /** Tests only: the fetch used by POST /cert-detail-probe (undefined = real transport). */
 export function __setCertDetailFetchForTesting(f: typeof fetch | undefined): void {
   certDetailFetch = f;
 }
+let certProbeRegisterFetch: typeof fetch | undefined;
+/** Tests only: the register fetch used by POST /cert-detail-probe with registerSid (undefined = real transport). */
+export function __setCertProbeRegisterFetchForTesting(f: typeof fetch | undefined): void {
+  certProbeRegisterFetch = f;
+}
+
+const certProbeFailure = (reason: string) =>
+  ({ ok: false, reason, shape: [] as string[], recognized: false, line_count: 0, lines: [] as unknown[], status_counts: {}, certificate_url: null });
+
+/** A register fetch error → a reason without any response body (it could carry personal data). */
+function registerFailureReason(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  const http = /^debio register HTTP (\d+)/.exec(msg);
+  if (http) return `register_http_${http[1]}`;
+  if (/^debio register JSON parse failed/.test(msg)) return "register_invalid_json";
+  return `register_fetch_failed: ${msg}`.slice(0, CERT_PROBE_REASON_MAX_CHARS);
+}
+
+async function certDetailProbe(sid: number): Promise<Record<string, unknown>> {
+  const fetched = await fetchDebioCertificateDetail(sid, { fetchImpl: certDetailFetch });
+  if (!fetched.ok) return certProbeFailure(fetched.reason);
+  const norm = normalizeCertDetail(fetched.raw);
+  const statusCounts: Record<string, number> = {};
+  for (const l of norm.lines) {
+    const k = l.statusCode === null ? "none" : String(l.statusCode);
+    statusCounts[k] = (statusCounts[k] ?? 0) + 1;
+  }
+  const lines = norm.lines.slice(0, CERT_PROBE_MAX_LINES).map((l) => ({
+    statusCode: l.statusCode,
+    organic: l.organic,
+    label_present: l.label !== null,
+    label_length: l.label === null ? 0 : l.label.length,
+    status_text_present: l.statusText !== null,
+  }));
+  return {
+    ok: true,
+    shape: describeShape(fetched.raw),
+    recognized: norm.recognized,
+    line_count: norm.lines.length,
+    lines,
+    status_counts: statusCounts,
+    certificate_url: norm.certificateUrl,
+  };
+}
 
 router.post("/cert-detail-probe", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const hasSid = Object.prototype.hasOwnProperty.call(body, "enquiryOrigSid");
+  const hasRegisterSid = Object.prototype.hasOwnProperty.call(body, "registerSid");
+  if (hasSid && hasRegisterSid) {
+    res.status(400).json({ success: false, error: "give exactly one of enquiryOrigSid or registerSid" });
+    return;
+  }
+  if (hasRegisterSid) {
+    const registerSid = body.registerSid;
+    if (typeof registerSid !== "string" || !/^\d{1,12}$/.test(registerSid)) {
+      res.status(400).json({ success: false, error: "registerSid must be a string of 1–12 digits" });
+      return;
+    }
+    try {
+      let rows: DebioRegisterRow[];
+      try {
+        rows = (await fetchDebioRegister({ fetchImpl: certProbeRegisterFetch })).rows;
+      } catch (e) {
+        res.json(certProbeFailure(registerFailureReason(e)));
+        return;
+      }
+      const row = rows.find((r) => r.sid === registerSid);
+      if (!row) { res.json(certProbeFailure("register_sid_not_found")); return; }
+      if (row.enquiryOrigSids.length === 0) { res.json(certProbeFailure("no_enquiry_orig_sid")); return; }
+      const used = row.enquiryOrigSids[0];
+      const out = await certDetailProbe(used);
+      res.json({ ...out, enquiry_orig_sid_used: used, enquiry_orig_sid_count: row.enquiryOrigSids.length });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: "cert-detail probe failed", detail: err?.message || String(err) });
+    }
+    return;
+  }
   const sid = req.body?.enquiryOrigSid;
   if (typeof sid !== "number" || !Number.isSafeInteger(sid) || sid <= 0) {
     res.status(400).json({ success: false, error: "enquiryOrigSid must be a positive integer" });
     return;
   }
   try {
-    const fetched = await fetchDebioCertificateDetail(sid, { fetchImpl: certDetailFetch });
-    if (!fetched.ok) {
-      res.json({ ok: false, reason: fetched.reason, shape: [], recognized: false, line_count: 0, lines: [], status_counts: {}, certificate_url: null });
-      return;
-    }
-    const norm = normalizeCertDetail(fetched.raw);
-    const statusCounts: Record<string, number> = {};
-    for (const l of norm.lines) {
-      const k = l.statusCode === null ? "none" : String(l.statusCode);
-      statusCounts[k] = (statusCounts[k] ?? 0) + 1;
-    }
-    const lines = norm.lines.slice(0, CERT_PROBE_MAX_LINES).map((l) => ({
-      statusCode: l.statusCode,
-      organic: l.organic,
-      label_present: l.label !== null,
-      label_length: l.label === null ? 0 : l.label.length,
-      status_text_present: l.statusText !== null,
-    }));
-    res.json({
-      ok: true,
-      shape: describeShape(fetched.raw),
-      recognized: norm.recognized,
-      line_count: norm.lines.length,
-      lines,
-      status_counts: statusCounts,
-      certificate_url: norm.certificateUrl,
-    });
+    res.json(await certDetailProbe(sid));
   } catch (err: any) {
     res.status(500).json({ success: false, error: "cert-detail probe failed", detail: err?.message || String(err) });
   }
