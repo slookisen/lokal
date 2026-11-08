@@ -40,7 +40,13 @@ export interface TestSummary {
   failures: string[];
 }
 
-const NOW = new Date("2026-10-29T12:00:00.000Z");
+// NOW follows the real clock: 12:00Z four days before today, so the last sync
+// (NOW + 3 d, SYNC_DAY below) is yesterday 12:00Z. Read paths that take no `now`
+// (knowledgeService.getAgentInfo → debioStatusShown) use the real clock, and a fixed
+// NOW made «stale-0» fail once the real clock passed SYNC_DAY + 7 d (2026-11-08T12:00Z).
+// A2A dev-request 2026-11-08-lokal-debio-test-tidsbombe-stale-0.
+const DAY_MS = 86_400_000;
+const NOW = new Date(Math.floor(Date.now() / DAY_MS) * DAY_MS - 4 * DAY_MS + 12 * 3_600_000);
 const FUTURE = "2027-06-30";
 const PAST = "2026-09-30";
 // Synthetic, distinctive "person" names and streets — must never be stored.
