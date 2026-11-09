@@ -11,7 +11,8 @@ import { getDb } from "../database/init";
 import { emailService } from "../services/email-service";
 import { deleteAgentProfileTranslations } from "../services/profile-translations";
 import { handleInboundEmailWebhook } from "../services/inbound-email-webhook";
-import { recordClaimMail } from "../services/claim-crm-tracking";
+import { recordClaimMail, isClaimCrmTrackingEnabled } from "../services/claim-crm-tracking";
+import { buildClaimAutoApprovalAudit, parseAuditSinceHours } from "../services/claim-auto-approval-audit";
 import { trustScoreService } from "../services/trust-score-service";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { slugify } from "../utils/slug";
@@ -5067,6 +5068,40 @@ router.get("/admin/claims", (req: Request, res: Response) => {
       verified: (claims as any[]).filter((c: any) => c.status === 'verified').length,
     }
   });
+});
+
+// ─── GET /admin/claims/auto-approval-audit — eierkrav E1 (read only) ──
+// Automatic owner-claim approvals (verification_method 'auto_assessment')
+// with verified_at in the last since_hours (integer 1–720, default 48; else
+// 400): assessment present, CRM thread, «claim_approved» message, delivery
+// within 1 h, and a verdict per claim. Same admin-key guard as /admin/claims
+// (403 / 503). No writes, no personal data (ids, statuses, timestamps only).
+router.get("/admin/claims/auto-approval-audit", (req: Request, res: Response) => {
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
+  const adminKey = (req.headers["x-admin-key"] as string) || (req.query.key as string);
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ error: "Krever admin-nøkkel" });
+    return;
+  }
+  const sinceHours = parseAuditSinceHours(req.query.since_hours);
+  if (sinceHours === null) {
+    res.status(400).json({ error: "since_hours må være et heltall 1–720" });
+    return;
+  }
+  try {
+    let autoApproveOn = false;
+    try { autoApproveOn = claimAutoApproveEnabled(); } catch { /* off */ }
+    const audit = buildClaimAutoApprovalAudit(getDb(), {
+      sinceHours,
+      now: new Date(),
+      flags: { auto_approve_enabled: autoApproveOn, crm_tracking_enabled: isClaimCrmTrackingEnabled() },
+    });
+    res.json({ success: true, ...audit });
+  } catch (err: any) {
+    console.error("[claims-auto-approval-audit] failed:", err?.code ?? "error");
+    res.status(500).json({ error: "Audit failed" });
+  }
 });
 
 // ─── GET /admin/claim-funnel: read-only invited → opened → started → verified funnel ──
