@@ -29912,6 +29912,12 @@ export const CONTENT_JUDGE_NAV_REASON_TERMS: readonly string[] = [
   "nav menu",
   "nav-meny",
   "menylinje",
+  // PR #1488 review N3: common nav-chrome phrasings the first list missed.
+  "hovedmeny",
+  "toppmeny",
+  "navbar",
+  "nav bar",
+  "main menu",
 ];
 
 /** True if the judge's reason text mentions navigation/menu chrome (see

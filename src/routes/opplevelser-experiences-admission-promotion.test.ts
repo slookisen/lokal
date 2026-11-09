@@ -363,6 +363,11 @@ export function runOpplevelserExperiencesAdmissionPromotionTests(
             }
             return mkAnthropicResponse("MATCH\nStemmer godt med kilden.");
           }
+          if (promptText.includes("Seiltur i skjærgården")) {
+            // Review N1: a MATCH whose own reason names the nav menu — the
+            // sweep must pass outcome.reason into the promotion guard.
+            return mkAnthropicResponse("MATCH\nBeskrivelsen gjengir navigasjonsmenyen på nettsiden.");
+          }
           if (promptText.includes("Klatretur i fjellet")) {
             return mkAnthropicResponse("MISMATCH\nSiden handler om noe helt annet.");
           }
@@ -394,6 +399,12 @@ export function runOpplevelserExperiencesAdmissionPromotionTests(
         }
         if (urlStr === "https://good.no/elvepadling") {
           return mkPageResponse("<html><body>Elvepadling for hele familien, rolig vann.</body></html>", urlStr);
+        }
+        if (urlStr === "https://good.no/navreason") {
+          return mkPageResponse("<html><body>Seiltur i skjærgården med skipper, tre timer.</body></html>", urlStr);
+        }
+        if (urlStr === "https://good.no/topptur") {
+          return mkPageResponse("<html><body>Guidet fjelltur til toppen av fjellet med lokal fjellfører.</body></html>", urlStr);
         }
         if (urlStr === "https://good.no/navdump") {
           return mkPageResponse("<html><body>Kajakktur på fjorden med guide, avgang hver dag fra brygga.</body></html>", urlStr);
@@ -774,6 +785,36 @@ export function runOpplevelserExperiencesAdmissionPromotionTests(
           assertEq(d.missing, ["judge_reason_nav"], `adm-g4d.${i}: reason "${reason}" -> missing=['judge_reason_nav']`);
         }
 
+        // Review N3: more nav-chrome phrasings in the judge's reason.
+        for (const [i, reason] of [
+          "Teksten er hentet fra hovedmenyen på siden.",
+          "Gjengir toppmenyen og overskrifter.",
+          "Matches the navbar of the page.",
+          "The stored text is the site's nav bar.",
+          "Copied from the main menu.",
+        ].entries()) {
+          const d = mod.evaluateContentJudgePromotion({ ...base, description: noProse }, "MATCH", reason);
+          assertEq(d.missing, ["judge_reason_nav"], `adm-g4e.${i}: reason "${reason}" -> missing=['judge_reason_nav']`);
+        }
+
+        // Review B1: "til toppen" is ordinary summit-hike prose in the
+        // experience catalogue — it must NOT count as a nav marker here;
+        // only the full anchor phrase "tilbake til toppen" does.
+        for (const [i, summit] of [
+          "Vi tar deg med til toppen av fjellet.",
+          "Guidet tur til toppen med lokal fjellfører.",
+        ].entries()) {
+          const d = mod.evaluateContentJudgePromotion({ ...base, description: summit }, "MATCH", okReason);
+          assertEq(d.contentQualityOk, true, `adm-g9a.${i}: summit prose "${summit}" -> contentQualityOk=true`);
+          assertEq(d.eligible, true, `adm-g9b.${i}: summit prose "${summit}" -> eligible`);
+        }
+        const dTop = mod.evaluateContentJudgePromotion(
+          { ...base, description: "Kajakktur på fjorden med guide. Tilbake til toppen" },
+          "MATCH",
+          okReason,
+        );
+        assertEq(dTop.missing, ["content_quality"], "adm-g9c: 'Tilbake til toppen' anchor still flags content_quality");
+
         const d5 = mod.evaluateContentJudgePromotion(
           { ...base, description: noProse },
           "MATCH",
@@ -811,8 +852,32 @@ export function runOpplevelserExperiencesAdmissionPromotionTests(
           evidence_url: "https://good.no/navdump",
           evidence_url_verification: null, verification_status: "needs_review", confidence: "high", canonical_id: null,
         });
+        insertExperience.run({
+          id: "adm-guard-navreason", provider_id: "prov-active-hjemmeside-verified",
+          title: "Seiltur i skjærgården", slug: "adm-guard-navreason",
+          description: "Seiltur i skjærgården med erfaren skipper. Turen varer i tre timer og passer for alle.",
+          category: "aktivitet", price_band: "standard", price_from: 700,
+          evidence_url: "https://good.no/navreason",
+          evidence_url_verification: null, verification_status: "needs_review", confidence: "high", canonical_id: null,
+        });
+        insertExperience.run({
+          id: "adm-guard-summit", provider_id: "prov-active-hjemmeside-verified",
+          title: "Guidet fjelltur", slug: "adm-guard-summit",
+          description: "Vi tar deg med til toppen av fjellet. Guidet tur til toppen med lokal fjellfører.",
+          category: "aktivitet", price_band: "standard", price_from: 900,
+          evidence_url: "https://good.no/topptur",
+          evidence_url_verification: null, verification_status: "needs_review", confidence: "high", canonical_id: null,
+        });
         const rGuard = await callRoute(opplevelserRouter, { headers: adminHeaders, body: {} });
         const g = (rGuard.body.results as any[]).find((x) => x.id === "adm-guard-navdump");
+        const gReason = (rGuard.body.results as any[]).find((x) => x.id === "adm-guard-navreason");
+        assertEq(gReason?.verdict, "MATCH", "adm-g8f: nav-reason row judged MATCH");
+        assertEq(gReason?.promotion?.judge_reason_nav, false, "adm-g8g: sweep passes the judge's reason -> promotion.judge_reason_nav=false");
+        assertEq(gReason?.promotion?.status, "held", "adm-g8h: nav-reason row held");
+        assertEq(gReason?.promotion?.missing, ["judge_reason_nav"], "adm-g8i: nav-reason row missing=['judge_reason_nav']");
+        const gSummit = (rGuard.body.results as any[]).find((x) => x.id === "adm-guard-summit");
+        assertEq(gSummit?.promotion?.content_quality, true, "adm-g8j: summit-hike description -> promotion.content_quality=true");
+        assertEq(gSummit?.promotion?.status, "would_promote", "adm-g8k: summit-hike row would_promote in dry-run (B1)");
         assertEq(g?.verdict, "MATCH", "adm-g8a: guard row judged MATCH");
         assertEq(g?.promotion?.content_quality, false, "adm-g8b: dry-run promotion.content_quality=false for the nav-dump row");
         assertEq(g?.promotion?.judge_reason_nav, true, "adm-g8c: dry-run promotion.judge_reason_nav=true (judge reason clean)");

@@ -2095,6 +2095,44 @@ export function meetsAboutCheapBar(text: string | null | undefined, minLen = 80)
 }
 
 /**
+ * Literal nav-chrome markers for looksLikeNavBoilerplate below — a SEPARATE
+ * list from NAV_BOILERPLATE_MARKERS (which meetsAboutQualityBar keeps using,
+ * unchanged). That list's bare "til toppen" is fine for producer about-text
+ * (where it is a "back to top" anchor), but in the experience catalogue
+ * "til toppen" is ordinary summit-hike prose ("Vi tar deg med til toppen av
+ * fjellet."), so here only the full anchor phrase "tilbake til toppen" counts
+ * (PR #1488 review B1). Lowercase, æøå-folded.
+ */
+const EXPERIENCE_NAV_BOILERPLATE_MARKERS: readonly string[] = [
+  "top of page", "hopp til innhold", "tilbake til toppen",
+];
+
+/**
+ * True if `text` looks like leaked NAVIGATION-MENU chrome rather than prose:
+ * an English skip/jump link ("skip to content"), a literal nav marker
+ * (EXPERIENCE_NAV_BOILERPLATE_MARKERS, e.g. "hopp til innhold", "tilbake til
+ * toppen"), or a menu-shaped string (isLikelyNavMenuLeakage: numbered/
+ * pipe-separated/flat-Title-Case menu list or a verbatim repeated
+ * breadcrumb). The nav layer of meetsAboutQualityBar below, WITHOUT its
+ * length (≥80) and Norwegian-language requirements and WITHOUT the bare
+ * "til toppen" marker — for callers whose text can legitimately be short,
+ * English or about summit hikes (stored experience descriptions, see
+ * evaluateContentJudgePromotion in routes/opplevelser.ts). Empty/blank text
+ * returns false (nothing to judge). PURE, no network/IO.
+ */
+export function looksLikeNavBoilerplate(text: string | null | undefined): boolean {
+  if (!text) return false;
+  const trimmed = String(text).replace(/\s+/g, " ").trim();
+  if (trimmed === "") return false;
+  const lowerAscii = stripNorwegianAccents(trimmed.toLowerCase());
+  if (NAV_SKIP_OR_JUMP_LINK_RE.test(lowerAscii)) return true;
+  for (const marker of EXPERIENCE_NAV_BOILERPLATE_MARKERS) {
+    if (lowerAscii.includes(marker)) return true;
+  }
+  return isLikelyNavMenuLeakage(trimmed);
+}
+
+/**
  * Quality bar a candidate `about`/`description` summary must clear before the
  * writer is allowed to overwrite an existing value with it. PURE.
  *
@@ -2126,30 +2164,6 @@ export function meetsAboutCheapBar(text: string | null | undefined, minLen = 80)
  * routes/opplevelser.ts) that reuses meetsAboutCheapBar above instead of
  * this function.
  */
-/**
- * True if `text` looks like leaked NAVIGATION-MENU chrome rather than prose:
- * an English skip/jump link ("skip to content"), a literal nav marker
- * (NAV_BOILERPLATE_MARKERS, e.g. "hopp til innhold"), or a menu-shaped string
- * (isLikelyNavMenuLeakage: numbered/pipe-separated/flat-Title-Case menu list
- * or a verbatim repeated breadcrumb). Exactly the nav layer of
- * meetsAboutQualityBar below, WITHOUT its length (≥80) and
- * Norwegian-language requirements — for callers whose text can legitimately
- * be short or English (stored experience descriptions, see
- * evaluateContentJudgePromotion in routes/opplevelser.ts). Empty/blank text
- * returns false (nothing to judge). PURE, no network/IO.
- */
-export function looksLikeNavBoilerplate(text: string | null | undefined): boolean {
-  if (!text) return false;
-  const trimmed = String(text).replace(/\s+/g, " ").trim();
-  if (trimmed === "") return false;
-  const lowerAscii = stripNorwegianAccents(trimmed.toLowerCase());
-  if (NAV_SKIP_OR_JUMP_LINK_RE.test(lowerAscii)) return true;
-  for (const marker of NAV_BOILERPLATE_MARKERS) {
-    if (lowerAscii.includes(marker)) return true;
-  }
-  return isLikelyNavMenuLeakage(trimmed);
-}
-
 export function meetsAboutQualityBar(text: string | null | undefined, minLen = 80): boolean {
   if (!meetsAboutCheapBar(text, minLen)) return false;
   const trimmed = String(text).replace(/\s+/g, " ").trim();
