@@ -147,6 +147,8 @@ const MON_0859_OSLO = "2026-10-19T06:59:00Z";
 const MON_0900_OSLO = "2026-10-19T07:00:00Z";
 const MON_2300_OSLO = "2026-10-19T21:00:00Z";
 const MON_0030_OSLO = "2026-10-18T22:30:00Z"; // still Sunday in UTC
+const TUE_0100_OSLO = "2026-10-19T23:00:00Z"; // Tuesday 01:00 in Oslo, still Monday in UTC
+const TUE_0300_OSLO = "2026-10-20T01:00:00Z"; // Tuesday 03:00 in Oslo
 // 2026-11-02 is a Monday in winter time (UTC+1).
 const WINTER_MON_1559_OSLO = "2026-11-02T14:59:00Z";
 const WINTER_MON_1600_OSLO = "2026-11-02T15:00:00Z";
@@ -206,7 +208,7 @@ export async function runDentalAapentNaaOsloTests(opts: { log?: boolean } = {}):
     const dentalSeo = require("./dental-seo") as typeof import("./dental-seo");
     const { __resetDentalSearchGazetteerForTesting } = require("../services/dental-search-gazetteer") as typeof import("../services/dental-search-gazetteer");
     const router = dentalSeo.default as any;
-    const { isOpenNow } = dentalSeo;
+    const { isOpenNow, dentalOpenStatus } = dentalSeo;
     __resetDentalSearchGazetteerForTesting();
     areaFacts.__resetDentalAreaFactsForTesting();
     dentalSeo.__resetDentalSitemapCacheForTesting();
@@ -227,6 +229,9 @@ export async function runDentalAapentNaaOsloTests(opts: { log?: boolean } = {}):
       ["U7b: an empty list: closed", [], MON_0930_OSLO, false],
       ["U8: no entry for Monday: closed", [{ day: "tue", open: "00:00", close: "23:59" }], MON_0930_OSLO, false],
       ["U9: an overnight entry, Monday 22:00–02:00, at 23:00 in Oslo (21:00 UTC): open", [{ day: "mon", open: "22:00", close: "02:00" }], MON_2300_OSLO, true],
+      ["U11a: an overnight entry, Monday 22:00–02:00, at Tuesday 01:00 in Oslo (Monday 23:00 UTC): open (the span from the day before)", [{ day: "mon", open: "22:00", close: "02:00" }], TUE_0100_OSLO, true],
+      ["U11b: the same entry at Tuesday 03:00 in Oslo: closed", [{ day: "mon", open: "22:00", close: "02:00" }], TUE_0300_OSLO, false],
+      ["U12: equal times 00:00–00:00 claim nothing, so not open", weekdays("00:00", "00:00"), MON_0930_OSLO, false],
     ];
     // T0: the zone really changes (offset of 2026-10-19 in minutes, as getTimezoneOffset gives it).
     const zones: Array<[string, number]> = [["UTC", 0], ["America/New_York", 240], ["Pacific/Auckland", -780], ["Europe/Oslo", -120]];
@@ -246,6 +251,17 @@ export async function runDentalAapentNaaOsloTests(opts: { log?: boolean } = {}):
       [false, true],
       "U10: without `at` it reads the clock: closed at 20:03 and open at 09:30 in Oslo, the process in UTC"
     );
+
+    // ── S: dentalOpenStatus: the three answers (open / closed / claims nothing) and the open row ──
+    const OVERNIGHT: Hours = [{ day: "mon", open: "22:00", close: "02:00" }];
+    const EQUAL: Hours = weekdays("00:00", "00:00");
+    assertEq(dentalOpenStatus(OVERNIGHT, new Date(TUE_0100_OSLO)), { isOpen: true, row: 0 }, "S1: Monday 22:00–02:00 at Tuesday 01:00 in Oslo: open, on Monday's row");
+    assertEq(dentalOpenStatus(OVERNIGHT, new Date(TUE_0300_OSLO)), { isOpen: false, row: -1 }, "S2: the same at Tuesday 03:00 in Oslo: closed");
+    assertEq(dentalOpenStatus(EQUAL, new Date(MON_0930_OSLO)), null, "S3: equal times 00:00–00:00: claims nothing (null)");
+    assertEq(dentalOpenStatus([...EQUAL, { day: "sat", open: "10:00", close: "14:00" }], new Date(MON_0930_OSLO)), { isOpen: false, row: -1 }, "S4: equal times beside a usable row: the usable row decides, closed on Monday");
+    assertEq(dentalOpenStatus(null, new Date(MON_0930_OSLO)), null, "S5: no hours: claims nothing");
+    assertEq(dentalOpenStatus([{ day: "tue", open: "08:00", close: "16:00" }], new Date(MON_0930_OSLO)), { isOpen: false, row: -1 }, "S6: no entry for the day: closed");
+    assertEq(dentalOpenStatus(FROM_09, new Date(MON_0930_OSLO)), { isOpen: true, row: 0 }, "S7: a normal day at 09:30 in Oslo: open on Monday's row");
 
     // ── fixture: four kjeveortopedi clinics in Oslo (one Helfo, so the
     //    kjeveortopedi facet passes the gate: 4 clinics, 2 facts). The
@@ -271,6 +287,10 @@ export async function runDentalAapentNaaOsloTests(opts: { log?: boolean } = {}):
     const idMorgen = mk(MORGEN, FROM_09);
     mk(LANG, LONG_DAY);
     mk(UTEN, null);
+    const NATT = "Oslo Natt Tann AS";
+    const LIKE = "Oslo Lik Tid Tann AS";
+    const idNatt = mk(NATT, [{ day: "mon", open: "22:00", close: "02:00" }, { day: "tue", open: "09:00", close: "16:00" }]);
+    mk(LIKE, EQUAL);
 
     // ── C: the clinic cards, the process in UTC as the server ──
     const badges = (iso: string, url: string): Record<string, string> | null => {
@@ -291,6 +311,16 @@ export async function runDentalAapentNaaOsloTests(opts: { log?: boolean } = {}):
     assertEq([stedWinter?.[KVELD], stedWinter?.[LANG]], ["Åpent nå", "Åpent nå"], "C6: /sted/oslo in winter time at 16:30 in Oslo: the two open until 20:00 and 21:00 say «Åpent nå»");
     assertEq([facetEve?.[UTEN], facetMorning?.[UTEN], stedWinter?.[UTEN]], ["", "", ""], "C7: the clinic without hours has no open-now badge");
 
+    // overnight span from the day before and equal times, on the card
+    const nightCards = (iso: string): Record<string, string> | null => {
+      const r = renderAt(router, iso, "/sted/oslo");
+      if (!r || r.status !== 200) return null;
+      return Object.fromEntries([NATT, LIKE].map((n) => [n, badgeOf(cardOf(r.text, n))]));
+    };
+    assertEq(nightCards(TUE_0100_OSLO)?.[NATT], "Åpent nå", "C8: Tuesday 01:00 in Oslo: «Åpent nå» for Monday 22:00–02:00 (span from the day before)");
+    assertEq(nightCards(TUE_0300_OSLO)?.[NATT], "Stengt nå", "C9: Tuesday 03:00 in Oslo: «Stengt nå»");
+    assertEq([nightCards(TUE_0100_OSLO)?.[LIKE], nightCards(MON_0930_OSLO)?.[LIKE]], ["", ""], "C10: equal times 00:00–00:00: no badge at all");
+
     // ── P: the clinic page's opening-hours table ──
     const rowsAt = (iso: string, id: string): string[] | null => {
       const r = renderAt(router, iso, `/klinikk/id/${id}`);
@@ -300,6 +330,8 @@ export async function runDentalAapentNaaOsloTests(opts: { log?: boolean } = {}):
     assertEq(rowsAt(MON_1959_OSLO, idKveld), ["Mandag"], "P2: the same clinic at 19:59 in Oslo: the Monday row says «Åpent nå»");
     assertEq(rowsAt(MON_0930_OSLO, idMorgen), ["Mandag"], "P3: the clinic that opens at 09:00, at 09:30 in Oslo (07:30 UTC): the Monday row says «Åpent nå» (main: none)");
     assertEq(rowsAt(WINTER_MON_1559_OSLO, idMorgen), ["Mandag"], "P4: the same clinic in winter time at 15:59 in Oslo: the Monday row says «Åpent nå»");
+    assertEq(rowsAt(TUE_0100_OSLO, idNatt), ["Mandag"], "P5: Tuesday 01:00 in Oslo: the «Åpent nå» mark is on Monday's row (the overnight span), not Tuesday's");
+    assertEq(rowsAt(TUE_0300_OSLO, idNatt), [], "P6: Tuesday 03:00 in Oslo: no row says «Åpent nå»");
   } catch (err: any) {
     failed++;
     failures.push("dental «Åpent nå» in Oslo time: unexpected error: " + String(err?.stack || err?.message || err));

@@ -69,7 +69,7 @@ import { emailRevealGuardEnabled, isCcBotUserAgent, revealEmailFor } from "../se
 import { placesDisplayPolicyEnabled } from "../services/places-display-policy";
 import { planDentalSearch, MAX_POSTSTED_IN, MAX_TERM_CHARS, type DentalSearchPlan, type DentalSearchTolkning } from "../services/dental-query-parser";
 import { capFreeText } from "../utils/free-text";
-import { osloWeekdayAndMinutes } from "../utils/opening-hours";
+import { normalizeOpeningHours, openingStatusAt, type OpeningHoursEntry } from "../utils/opening-hours";
 import { DENTAL_STATS_TTL_MS, getCachedDentalPoststeder, getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
 // dev-request 2026-10-17-dental-d3-rettelser (D3d punkt 2, trinn 3): the
 // clinic page names its place in the official spelling, by the same lookup as
@@ -635,40 +635,49 @@ function getCachedPoststeder(): PoststedRow[] {
 
 // ─── "Åpent nå" helper ───────────────────────────────────────
 
-// Monday first: the index is osloWeekdayAndMinutes().day (Monday = 0).
-const DAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] as const;
 const DAY_NAMES_NO: Record<string, string> = {
   mon: "Mandag", tue: "Tirsdag", wed: "Onsdag", thu: "Torsdag",
   fri: "Fredag", sat: "Lørdag", sun: "Søndag",
 };
 
 /**
- * Whether the clinic is open at `at` by its hours, on the clock in Norway
- * (Europe/Oslo). The weekday and the time used to come from the server's
- * clock, which runs in UTC, one or two hours behind Norway: at 20:03 in Oslo
- * (18:03 UTC) a clinic that closes at 20:00 still said «Åpent nå» (dev-request
- * 2026-10-16-finn-tannlege-fasettsider, live check after F1-S4a, 2026-10-19).
- * Exported for the tests.
+ * The clinic's hours as shared OpeningHoursEntry rows, one per stored row and
+ * in the same order (null where a row has no usable time), so a row can be
+ * matched with the entry openingStatusAt() names.
+ */
+function dentalEntries(opening_hours: NonNullable<DentalAgent["opening_hours"]>): Array<OpeningHoursEntry | null> {
+  return opening_hours.map((h) => normalizeOpeningHours([h])[0] ?? null);
+}
+
+/**
+ * Open-now status of the clinic at `at` on the clock in Norway (Europe/Oslo),
+ * by the shared openingStatusAt(): an overnight span from the day before
+ * (mon 22:00–02:00 on Tuesday 01:00) counts, and equal times ("00:00–00:00")
+ * or other entries that cannot say anything claim nothing. `row` is the index
+ * of the stored row that is open now, when open. null when no row counts
+ * (the card then has no badge).
+ */
+export function dentalOpenStatus(
+  opening_hours: DentalAgent["opening_hours"],
+  at: Date = new Date()
+): { isOpen: boolean; row: number } | null {
+  if (!opening_hours || opening_hours.length === 0) return null;
+  const entries = dentalEntries(opening_hours);
+  const status = openingStatusAt(entries.filter((e): e is OpeningHoursEntry => e !== null), at);
+  if (!status) return null;
+  return { isOpen: status.isOpen, row: status.isOpen ? entries.findIndex((e) => e !== null && e === status.today) : -1 };
+}
+
+/**
+ * Whether the clinic is open at `at` by its hours, on the clock in Norway.
+ * False when closed or when the hours claim nothing (dentalOpenStatus() tells
+ * those apart). Exported for the tests.
  */
 export function isOpenNow(
   opening_hours: DentalAgent["opening_hours"],
   at: Date = new Date()
 ): boolean {
-  if (!opening_hours || opening_hours.length === 0) return false;
-  const now = osloWeekdayAndMinutes(at);
-  const dayKey = DAY_KEYS[now.day];
-  const entry = opening_hours.find((h) => h.day === dayKey);
-  if (!entry) return false;
-  const [oh, om] = entry.open.split(":").map(Number);
-  const [ch, cm] = entry.close.split(":").map(Number);
-  const nowMin = now.minutes;
-  const openMin = (oh ?? 0) * 60 + (om ?? 0);
-  const closeMin = (ch ?? 0) * 60 + (cm ?? 0);
-  // Handle overnight spans (e.g. 22:00–02:00)
-  if (closeMin <= openMin) {
-    return nowMin >= openMin || nowMin < closeMin;
-  }
-  return nowMin >= openMin && nowMin < closeMin;
+  return dentalOpenStatus(opening_hours, at)?.isOpen === true;
 }
 
 // ─── SVG icons (inline, no emoji) ───────────────────────────
@@ -1088,11 +1097,12 @@ function clinicCard(
   if (agent.chain_brand)
     badges.push(`<span class="badge badge-chain">${escapeHtml(agent.chain_brand)}</span>`);
 
-  const openStatus = agent.opening_hours && agent.opening_hours.length > 0
-    ? (isOpenNow(agent.opening_hours)
-        ? `<span class="badge badge-open">${ICON_CLOCK} Åpent nå</span>`
-        : `<span class="badge badge-closed">${ICON_CLOCK} Stengt nå</span>`)
-    : "";
+  const openNowStatus = dentalOpenStatus(agent.opening_hours);
+  const openStatus = openNowStatus === null
+    ? ""
+    : openNowStatus.isOpen
+      ? `<span class="badge badge-open">${ICON_CLOCK} Åpent nå</span>`
+      : `<span class="badge badge-closed">${ICON_CLOCK} Stengt nå</span>`;
 
   const specialties = (() => {
     const names = clinicSpecialties(agent);
@@ -1984,9 +1994,10 @@ function renderClinicProfile(
   // ── Opening hours
   let hoursSection = "";
   if (agent.opening_hours && agent.opening_hours.length > 0) {
-    const rows = agent.opening_hours.map((h) => {
+    const openRow = dentalOpenStatus(agent.opening_hours)?.row ?? -1;
+    const rows = agent.opening_hours.map((h, i) => {
       const dayName = DAY_NAMES_NO[h.day] || h.day;
-      const open = isOpenNow([h]);
+      const open = i === openRow;
       return `<tr><td>${escapeHtml(dayName)}</td><td>${escapeHtml(h.open)}–${escapeHtml(h.close)}</td><td>${open ? '<span class="badge badge-open" style="font-size:.7rem">Åpent nå</span>' : ""}</td></tr>`;
     }).join("");
     hoursSection = `<div class="section-box"><h2>Åpningstider</h2><table class="hours-table" aria-label="Åpningstider"><tbody>${rows}</tbody></table></div>`;
