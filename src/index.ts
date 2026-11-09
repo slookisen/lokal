@@ -206,6 +206,7 @@ import {
 } from "./services/boot-job-gate";
 import { syncDebioVerifications } from "./services/debio-verification-service";
 import { syncDebioRegister, debioRegisterSyncEnabled, enforceDebioRegisterFreshness } from "./services/debio-register-sync";
+import { syncDebioCertDetails, debioCertDetailSyncEnabled } from "./services/debio-cert-detail-sync";
 import { runSalgskanalSweep } from "./services/salgskanal-matcher";
 
 // Seed-knowledge loaded dynamically — only used if DB is empty
@@ -1942,6 +1943,27 @@ if (process.env.RFB_DISABLE_DEBIO_SYNC !== "1") {
       console.error("[debio-sync] failed:", err);
     }
   }), 60 * 60_000); // hourly check
+}
+
+// ─── Økologi S4b-2: weekly Debio certificate-detail lines ──────────────
+// Every 6 h: at most 25 register-checked organic producers whose stored
+// certificate detail is missing or older than 7 days get one detail call
+// each (2 s apart), after one register call. Off unless
+// RFB_DEBIO_CERT_DETAIL_SYNC=1; RFB_DISABLE_DEBIO_SYNC=1 skips registering it.
+if (process.env.RFB_DISABLE_DEBIO_SYNC !== "1") {
+  setInterval(trackJob("debio-cert-detail-sync", async () => {
+    if (!debioCertDetailSyncEnabled()) return;
+    try {
+      const r = await syncDebioCertDetails(getDb(), { dryRun: false });
+      console.log(
+        `[debio-cert-detail] ok=${r.ok}${r.reason ? ` reason=${r.reason}` : ""} candidates=${r.candidates} ` +
+        `with_id=${r.with_id} fetched=${r.fetched} stored=${r.stored} recognized=${r.recognized} ` +
+        `errors=${r.errors} no_id=${r.skipped_no_id} organic_lines=${r.organic_lines}`,
+      );
+    } catch (err) {
+      console.error("[debio-cert-detail] failed:", err);
+    }
+  }), 6 * 3600_000);
 }
 
 // ─── dev-request 2026-07-06-rfb-salgskanal-kategorier: daily salgskanal ──
