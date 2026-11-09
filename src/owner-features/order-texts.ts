@@ -37,7 +37,7 @@ export const OWNER_ORDER_LIMITS_HEADING = "Hvor mange bestillinger kan du få?";
 export function ownerOrderLimitLines(cfg: OrderLimitsConfig): string[] {
   return [
     "Mange ulike kunder kan bestille fra deg samme dag.",
-    `For å stoppe misbruk kan én kunde ha høyst ${cfg.openPerBuyer} ubesvarte bestillinger hos deg om gangen, og sende deg høyst ${cfg.perBuyerPerDay} nye bestillinger per dag.`,
+    `For å hindre misbruk kan én kunde ha høyst ${cfg.openPerBuyer} ubesvarte bestillinger hos deg om gangen, og sende deg høyst ${cfg.perBuyerPerDay} nye bestillinger per dag.`,
     `Får du flere enn ${cfg.producerCeilingPerDay} bestillinger på én dag, tar vi ikke imot flere til deg resten av dagen. Kundene får da kontaktinformasjonen din i stedet.`,
     "En dag regnes fra midnatt til midnatt.",
   ];

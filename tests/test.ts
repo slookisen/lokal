@@ -37553,6 +37553,19 @@ const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
     failed++;
     failures.push("owner-items-t13-v1b: unexpected error: " + String(err?.message || err));
   }
+  // Tekstpakke A (approved owner texts 2026-11-09: Mine valg, Varer, Mine ordrer; F-b) — pure renders, no DB.
+  try {
+    const { runOwnerTekstpakkeATests } = require("../src/routes/owner-tekstpakke-a.test") as
+      typeof import("../src/routes/owner-tekstpakke-a.test");
+    const tpa = await runOwnerTekstpakkeATests({ log: false });
+    passed += tpa.passed;
+    failed += tpa.failed;
+    for (const f of tpa.failures) failures.push("owner-tekstpakke-a: " + f);
+    console.log(`  owner-tekstpakke-a: ${tpa.passed} passed, ${tpa.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-tekstpakke-a: unexpected error: " + String(err?.message || err));
+  }
   // T15a (eierportal skall og meny, dev-request 2026-10-30-rfb-eierportal-testrunde-1 punkt 9) — own in-memory DB.
   try {
     const { runOwnerShellT15aTests } = require("../src/routes/owner-shell-t15a.test") as

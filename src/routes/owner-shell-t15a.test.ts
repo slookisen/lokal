@@ -376,7 +376,9 @@ export async function runOwnerShellT15aTests(opts: { log?: boolean } = {}): Prom
       // T15d: with the shell, «Se all statistikk» goes to the Statistikk page (else the /selger tab).
       if (p === "valg") stripped = stripped.split(`href="${sh.ownerStatsPagePath(ON_ID)}">Se all statistikk`).join(`href="${sh.ownerShellStatsHref(ON_ID)}">Se all statistikk`);
       if (p === "portal") stripped = noItemsCard(noOverview(stripped).replace(`<div class="ep-card" id="profil">`, `<div class="ep-card">`));
-      const want = p === "valg" ? noNewsQuestion(before[`${p}:${ON_ID}`].html) : p === "portal" ? noItemsCard(before[`${p}:${ON_ID}`].html) : before[`${p}:${ON_ID}`].html;
+      // Tekstpakke A F-b: under the shell, «Mine ordrer» drops its «← Eierportalen» link (the menu has it).
+      const noBackLink = (x: string) => x.replace(`<p class="mo-sub"><a href="/eier/${ON_ID}/portal">← Eierportalen</a></p>\n`, "");
+      const want = p === "valg" ? noNewsQuestion(before[`${p}:${ON_ID}`].html) : p === "portal" ? noItemsCard(before[`${p}:${ON_ID}`].html) : noBackLink(before[`${p}:${ON_ID}`].html);
       assertEq(stripped, want, `on: ${p} without the shell markup (and the T15b parts) is byte-identical to the flag-off page`);
     }
 

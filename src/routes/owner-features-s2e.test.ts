@@ -21,7 +21,7 @@
  *   AC27  over the whole registry: an unbuilt entry has no value text, in its
  *         row or in «Slik er du nå».
  *   AC28  the orders.enabled row has the explanation and the prerequisite
- *         check: 0 orderable items → «Du har 0 varer som kan bestilles» + the
+ *         check: 0 orderable items → «Du har ingen varer som kan bestilles ennå» + the
  *         link to the items; N → N, the same count as
  *         isRowOrderableForRealOrder.
  *   AC29  the portal has no «Bestillinger» card and no pause card for a
@@ -533,10 +533,10 @@ export async function runOwnerFeaturesS2eTests(opts: { log?: boolean } = {}): Pr
 
       // 0 orderable items.
       const e0 = row(await pageHtml(EMPTY_ID), "orders.enabled");
-      assertTrue(e0.includes("Du har 0 varer som kan bestilles. Legg inn varer eller hent dem fra nettsiden din.") && e0.includes(`href="/selger?agent=${EMPTY_ID}"`),
-        "AC28: 0 items → «Du har 0 varer som kan bestilles …» + the link to the items");
+      assertTrue(e0.includes("Du har ingen varer som kan bestilles ennå. Legg inn varer eller hent dem fra nettsiden din.") && e0.includes(`href="/selger?agent=${EMPTY_ID}"`),
+        "AC28: 0 items → «Du har ingen varer som kan bestilles ennå …» + the link to the items");
       assertTrue(e0.includes(`name="value" value="true"`) && e0.includes("Slå på"), "AC28: the switch can still be switched on with 0 items");
-      assertTrue(e0.indexOf("Du har 0 varer") < e0.indexOf(`<div class="mv-item-ctl">`), "AC28: the check stands above the switch");
+      assertTrue(e0.indexOf("Du har ingen varer") < e0.indexOf(`<div class="mv-item-ctl">`), "AC28: the check stands above the switch");
       setEnv("OWNER_UNIFIED_SESSION_ENABLED", "1");
       assertTrue(row(await pageHtml(EMPTY_ID), "orders.enabled").includes(`href="/eier/${EMPTY_ID}/portal#produkter"`), "AC28: with the unified session the link goes to the portal's products card");
       setEnv("OWNER_UNIFIED_SESSION_ENABLED", null);

@@ -249,7 +249,7 @@ function soldOutDeclineForm(o: OwnerOrder, ctx: RowContext): string {
     `<label style="display:block;padding:4px 0"><input type="checkbox" name="sold_out" value="${esc(c.product_id)}" checked> ${esc(c.name)}</label>`,
   ).join("");
   return `<form method="post" action="${esc(ctx.postTo)}" class="mo-form" data-sold-out-form="1"><input type="hidden" name="action" value="decline_sold_out"><input type="hidden" name="idem" value="${randomUUID()}">` +
-    `<fieldset style="border:1px solid #e4e2da;border-radius:8px;margin:0 0 6px;padding:6px 10px"><legend style="font-size:.9rem">Utsolgt (settes til «ikke på lager»):</legend>${boxes}</fieldset>` +
+    `<fieldset style="border:1px solid #e4e2da;border-radius:8px;margin:0 0 6px;padding:6px 10px"><legend style="font-size:.9rem">Kryss av varene som er utsolgt. De blir merket som utsolgt.</legend>${boxes}</fieldset>` +
     `<button type="submit" class="mo-btn mo-secondary">Avslå – utsolgt</button></form>`;
 }
 
@@ -279,7 +279,7 @@ function actionsHtml(o: OwnerOrder, ctx: RowContext): string {
       parts.push(actionForm(ctx, "cannot_deliver", "mo-secondary"));
     }
     const hint = isOrderAutocompleteEnabled()
-      ? `<p class="mo-hint">Du trenger ikke gjøre mer. Ordren avsluttes av seg selv etter henting.</p>` : "";
+      ? `<p class="mo-hint">Du trenger ikke gjøre mer. Bestillingen avsluttes av seg selv etter henting.</p>` : "";
     // B3: «Hentet» is optional (the automatic close stays the main path) and
     // offered only for confirmed/ready — the layer re-validates on POST.
     const pickedUp = `<div class="mo-actions">${actionForm(ctx, "complete", "mo-primary")}</div>`;
@@ -358,7 +358,7 @@ export function orderActionsComponentHtml(i: OrderComponentInput): string {
     const boxes = choices.map((ch) =>
       `<label style="display:block;padding:4px 0"><input type="checkbox" name="sold_out" value="${esc(ch.product_id)}" checked> ${esc(ch.name)}</label>`,
     ).join("");
-    return `<fieldset style="border:1px solid #e4e2da;border-radius:8px;margin:0 0 6px;padding:6px 10px"><legend style="font-size:.9rem">Utsolgt (settes til «ikke på lager»):</legend>${boxes}</fieldset>`;
+    return `<fieldset style="border:1px solid #e4e2da;border-radius:8px;margin:0 0 6px;padding:6px 10px"><legend style="font-size:.9rem">Kryss av varene som er utsolgt. De blir merket som utsolgt.</legend>${boxes}</fieldset>`;
   };
   const cancels = cancelActionsEnabled(i.paymentMode);
 
@@ -385,7 +385,7 @@ export function orderActionsComponentHtml(i: OrderComponentInput): string {
       ? `<div class="${c.form}"><button type="button" class="${c.btn} ${c.secondary}" disabled>${esc(L.no_show)}</button><p class="${c.hint}">${esc(ownerNoShowFromLine(formatPickupTimeOslo(new Date(from!).toISOString())))}</p></div>`
       : form("no_show", L.no_show, c.secondary));
     const autoHint = isOrderAutocompleteEnabled()
-      ? `<p class="${c.hint}">Du trenger ikke gjøre mer. Ordren avsluttes av seg selv etter henting.</p>` : "";
+      ? `<p class="${c.hint}">Du trenger ikke gjøre mer. Bestillingen avsluttes av seg selv etter henting.</p>` : "";
     return `${autoHint}<div class="${c.actions}" data-t12-actions="confirmed">${form("complete", L.complete, c.primary)}</div>` +
       `<details class="${c.menu}"><summary>${esc(OWNER_CANCEL_SUMMARY)}</summary>` +
       `<p class="${c.hint}">${esc(ownerCancelChooseLine(isBuyerReceiptsEnabled()))}</p>` +
@@ -639,7 +639,7 @@ export function bannerHtml(done: string, error: string, t12 = false): string {
   const t12Text = t12 && !error ? t12DoneBannerText(done) : "";
   if (t12Text) return `<div class="mo-banner ok" role="status">${esc(t12Text)}</div>`;
   const labels: Record<string, string> = {
-    confirmed: "Ordren er bekreftet.", declined: "Ordren er avslått.", cancelled: "Ordren er kansellert.", completed: "Ordren er registrert som hentet.", ready: "Ordren er oppdatert.",
+    confirmed: "Bestillingen er bekreftet.", declined: "Bestillingen er avslått.", cancelled: "Ordren er kansellert.", completed: "Bestillingen er registrert som hentet.", ready: "Bestillingen er oppdatert.",
   };
   return labels[done] ? `<div class="mo-banner ok" role="status">${esc(labels[done])}</div>` : "";
 }
@@ -672,10 +672,11 @@ export function renderOrdersPage(opts: {
       ...(opts.t12 ? { t12: true } : {}),
     }),
   ).join("\n");
-  const empty = opts.orders.length ? "" : `<p class="mo-empty">${opts.tab === "venter" ? "Ingen ordrer venter på svar." : opts.tab === "kommende" ? "Ingen kommende henting." : "Ingen avsluttede ordrer ennå."}</p>`;
+  const empty = opts.orders.length ? "" : `<p class="mo-empty">${opts.tab === "venter" ? "Ingen bestillinger venter på svar." : opts.tab === "kommende" ? "Ingen kommende henting." : "Ingen avsluttede bestillinger ennå."}</p>`;
+  // F-b (tekstpakke A): with the owner shell its menu already links to the portal, so no «← Eierportalen» back link.
+  const backLink = opts.ownerShellHtml ? "" : `<p class="mo-sub"><a href="/eier/${encodeURIComponent(opts.agentId)}/portal">← Eierportalen</a></p>\n`;
   const body = `
-<p class="mo-sub"><a href="/eier/${encodeURIComponent(opts.agentId)}/portal">← Eierportalen</a></p>
-<h1>Mine ordrer</h1>
+${backLink}<h1>Mine ordrer</h1>
 <p class="mo-sub">${esc(opts.producerName)}</p>
 ${opts.t12 ? `${ownerOrderOverviewHtml(opts.t12.overview)}\n` : ""}${bannerHtml(opts.done, opts.error, !!opts.t12)}
 <nav class="mo-tabs" aria-label="Ordrer">${tabs}</nav>
@@ -692,8 +693,8 @@ export function renderTokenOrderPage(o: OwnerOrder, tokenBase: string, done: str
 <p class="mo-sub">Ordre ${esc(o.id.slice(0, 8))}</p>
 ${bannerHtml(done, error, t12)}
 ${renderOrderRow(o, { postTo: tokenBase, open: true, now, ...(t12 ? { t12: true } : {}) })}
-<a class="mo-link" href="/eier/${encodeURIComponent(o.agent_id)}/ordrer">Se alle ordrene dine</a>
-<p class="mo-hint">Lenken er personlig for denne ordren. Ikke del den videre. Ingen betaling skjer via plattformen, med mindre forhåndsbetaling er brukt.</p>`);
+<a class="mo-link" href="/eier/${encodeURIComponent(o.agent_id)}/ordrer">Se alle bestillingene dine</a>
+<p class="mo-hint">Lenken er personlig for denne bestillingen. Ikke del den videre. Kunden betaler deg når varene hentes. Rett fra Bonden tar ikke betalt.</p>`);
 }
 
 /** The «Mine ordrer» card on the owner portal front page. */
