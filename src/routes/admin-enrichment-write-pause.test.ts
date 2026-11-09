@@ -765,6 +765,11 @@ export async function runAdminEnrichmentWritePauseTests(
         "routes/admin-dental-triage.ts",
         "services/dental-triage.ts",
         "services/dental-triage.test.ts",
+        // Slice 3c-2: the dental-triage judgement job (shared file queue with
+        // pauseVertical "dental") re-checks the dental pause before the file
+        // and before each row's write; its test file sets/clears the pause.
+        "services/dental-triage-judgement-job.ts",
+        "services/dental-triage-judgement-job.test.ts",
       ].sort(),
       "ewp-125: the guard is imported by exactly the gated surfaces, the shared write primitives, its own admin route, and the test files",
     );

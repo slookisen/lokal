@@ -2491,9 +2491,12 @@ export interface RecordExclusionInput {
   isPermanent?: boolean;
 }
 
-export function recordExclusion(args: RecordExclusionInput): string {
+/** `db` (optional, additive): the dental handle to write through — lets a
+ *  caller keep the exclusion inside its own transaction on that handle.
+ *  Defaults to getDb("dental"), so existing callers are unchanged. */
+export function recordExclusion(args: RecordExclusionInput, db: any = getDb("dental")): string {
   const id = "excl-" + uuid();
-  getDb("dental")
+  db
     .prepare(
       `INSERT INTO dental_exclusions
        (id, org_nr, hjemmeside_url, navn_pattern, reason, evidence, notes, excluded_by, reactivate_after, is_permanent)

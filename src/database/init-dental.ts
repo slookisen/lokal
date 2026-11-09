@@ -794,5 +794,36 @@ export function initDentalSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // dev-request 2026-09-02-dental-permanent-triage-needs-review-drain, slice
+  // 3c-2: once-per-file ledger + per-path failure counter for the dental-
+  // triage judgement file queue (services/dental-triage-judgement-job.ts on
+  // the shared proposal file queue). Same shape as the experiences queue
+  // tables in init-experiences.ts; here because the job's rows and these
+  // ledgers share the dental DB. Additive, idempotent.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS dental_triage_judgement_files (
+        path TEXT PRIMARY KEY,
+        sha TEXT NOT NULL,
+        processed_at TEXT NOT NULL,
+        result_json TEXT
+      )
+    `);
+  } catch (e) {
+    console.log(`[dental] dental_triage_judgement_files init skipped: ${(e as Error).message}`);
+  }
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS dental_triage_judgement_failures (
+        path TEXT PRIMARY KEY,
+        fail_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        last_failed_at TEXT
+      )
+    `);
+  } catch (e) {
+    console.log(`[dental] dental_triage_judgement_failures init skipped: ${(e as Error).message}`);
+  }
+
   console.log("[dental] schema initialized");
 }

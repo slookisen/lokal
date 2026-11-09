@@ -31,7 +31,8 @@
 //
 // Everything else stays needs_review, row untouched (decision 'undecided',
 // with a reason). The judgement outcomes (rejected + dental_exclusions,
-// catalog_class correction) are NOT here — next slice.
+// catalog_class correction) are NOT here — slice 3c-2, see
+// dental-triage-judgement-job.ts (file queue, no LLM on the server).
 //
 // Audit: every applied decision (and every undecided result of a REAL run)
 // writes one dental_verifier_findings row (check_type 'dental_triage'); the
@@ -174,6 +175,11 @@ const CANDIDATE_STATE_SQL = `verification_status = 'needs_review'
           AND review_reason IN (${REASONS_SQL})
           AND (is_inactive IS NULL OR is_inactive = 0)
           AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}`;
+
+/** The triage-state predicate (bind DENTAL_TRIAGE_REVIEW_REASONS to its
+ *  placeholders, in order). Shared with the slice 3c-2 judgement job
+ *  (dental-triage-judgement-job.ts), which re-checks the same state. */
+export const DENTAL_TRIAGE_CANDIDATE_STATE_SQL = CANDIDATE_STATE_SQL;
 
 export function clampDentalTriageLimit(raw: unknown, fallback: number = DENTAL_TRIAGE_MAX_BATCH): number {
   const n = typeof raw === "number" ? raw : typeof raw === "string" && raw.trim() !== "" ? Number(raw) : NaN;

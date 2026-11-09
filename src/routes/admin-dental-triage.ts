@@ -12,6 +12,15 @@
 //     (standard body) while the dental enrichment write-pause is on, 409 while
 //     a pass is already running.
 //
+// Slice 3c-2 (judgement file queue, services/dental-triage-judgement-job.ts):
+//   GET /admin/dental/triage/judge-candidates?limit=1–50   (default 25)
+//     Read-only: rows in the triage state (3c-1 'undecided' first, then oldest
+//     review_since) with public catalog fields + the latest 3c-1 outcome, for
+//     the Cloud Routine that judges them and commits a
+//     dental-triage-judgements/v1 file to the A2A repo.
+//   GET /admin/dental/triage/judgement-status
+//     Read-only queue status (flag, token present, counts, timestamps).
+//
 // Requires X-Admin-Key (same requireAdmin idiom as the sibling dental admin
 // route files).
 
@@ -26,6 +35,14 @@ import {
   DENTAL_TRIAGE_MAX_BATCH,
 } from "../services/dental-triage";
 import { dentalEnrichmentWritePauseBlock } from "../services/dental-enrichment-write-pause";
+import {
+  DENTAL_TRIAGE_JUDGEMENTS_MAX_ITEMS,
+  DENTAL_TRIAGE_JUDGEMENTS_SCHEMA,
+  getDentalTriageJudgementsStatus,
+  selectDentalTriageJudgeCandidates,
+} from "../services/dental-triage-judgement-job";
+import { DENTAL_CATALOG_CLASSES } from "../services/dental-catalog-class";
+import { getDb } from "../database/db-factory";
 import { ENRICHMENT_WRITE_PAUSE_HTTP_STATUS } from "../services/enrichment-write-pause";
 
 function getAdminKey(): string {
@@ -104,6 +121,36 @@ router.post("/run", async (req: Request, res: Response) => {
     res.json({ success: true, ...summary });
   } catch (err: any) {
     res.status(500).json({ error: "Dental triage run failed", detail: err?.message ?? String(err) });
+  }
+});
+
+router.get("/judge-candidates", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const out = selectDentalTriageJudgeCandidates(getDb("dental") as any, req.query?.limit);
+    res.json({
+      success: true,
+      count: out.rows.length,
+      limit: out.limit,
+      rows: out.rows,
+      judgement_schema: DENTAL_TRIAGE_JUDGEMENTS_SCHEMA,
+      max_items_per_file: DENTAL_TRIAGE_JUDGEMENTS_MAX_ITEMS,
+      decisions: ["AVVIS", "KATALOGKLASSE"],
+      catalog_classes: DENTAL_CATALOG_CLASSES,
+    });
+  } catch (err: any) {
+    console.error("[admin-dental-triage] judge-candidates failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+router.get("/judgement-status", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    res.json({ success: true, ...getDentalTriageJudgementsStatus(getDb("dental") as any) });
+  } catch (err: any) {
+    console.error("[admin-dental-triage] judgement-status failed", err);
+    res.status(500).json({ error: "Internal error" });
   }
 });
 
