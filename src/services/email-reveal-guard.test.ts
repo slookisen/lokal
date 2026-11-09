@@ -11,6 +11,10 @@
  *   M   the memory bound (client cap, least recently seen evicted, sweep)
  *   R   revealEmailFor: switch off = null (no-op, also for CCBot); CCBot and
  *       a missing IP get nothing; the log line has counts and ids only
+ *   T   S-A4 trap block: a hit withholds every id for that client on that
+ *       host for 24 h (injected clock), other clients and hosts unaffected,
+ *       switch off records nothing, no IP records nothing, a renewed hit
+ *       extends the block, memory bound, log lines without IP or e-mail
  *
  * No DB, no HTTP. Standalone: npx tsx src/services/email-reveal-guard.test.ts
  * Wired into tests/test.ts via runEmailRevealGuardTests().
@@ -18,7 +22,10 @@
 
 import {
   EMAIL_REVEAL_DEFAULT_LIMIT,
+  EMAIL_REVEAL_TRAP_BLOCK_MS,
   EmailRevealStore,
+  EmailRevealTrapStore,
+  recordEmailRevealTrapHit,
   emailRevealBaseLimit,
   emailRevealGuardEnabled,
   isCcBotUserAgent,
@@ -184,6 +191,57 @@ export async function runEmailRevealGuardTests(opts: { log?: boolean } = {}): Pr
       lines.length = 0;
       revealEmailFor(req("203.0.113.50"), "dental", Array.from({ length: 12 }, (_, i) => `id${i}`));
       eq(JSON.parse(lines[0]!).profile_ids.length, 5, "R12: at most five ids per log line");
+    }
+
+    // ── T: trap block (S-A4) ─────────────────────────────────────────────
+    {
+      const lines: string[] = [];
+      t = 30_000_000;
+      __resetEmailRevealGuardForTesting({ now: clock, log: (l) => lines.push(l) });
+      const req = (ip: string | undefined, ua?: string) => ({ ip, headers: ua === undefined ? {} : { "user-agent": ua } }) as any;
+      delete process.env.EMAIL_REVEAL_PER_IP_PER_HOUR;
+      delete process.env.EMAIL_REVEAL_GUARD_DENTAL;
+      delete process.env.EMAIL_REVEAL_GUARD_RFB;
+      eq(recordEmailRevealTrapHit(req("198.51.100.1"), "dental"), "off", "T1: switch off -> the hit is not recorded");
+      eq(lines.length, 0, "T2: switch off -> nothing logged");
+      process.env.EMAIL_REVEAL_GUARD_DENTAL = "on";
+      process.env.EMAIL_REVEAL_GUARD_RFB = "on";
+      eq(sorted(revealEmailFor(req("198.51.100.1"), "dental", ["a"])), ["a"], "T3: a hit while the switch was off left no block");
+      eq(recordEmailRevealTrapHit(req(""), "dental"), "no_ip", "T4: no usable IP -> nothing recorded");
+      eq(recordEmailRevealTrapHit(req(undefined), "dental"), "no_ip", "T4b: ... also when req.ip is undefined");
+      lines.length = 0;
+      eq(recordEmailRevealTrapHit(req("198.51.100.2", "GPTBot/1.2"), "dental"), "blocked", "T5: switch on -> blocked (no exemption for a known AI reader UA)");
+      eq(sorted(revealEmailFor(req("198.51.100.2"), "dental", ["a", "b"])), [], "T6: the blocked client gets no e-mail on any profile");
+      eq(sorted(revealEmailFor(req("198.51.100.2"), "dental", ["a"])), [], "T6b: ... also on a profile it was not refused before");
+      eq(sorted(revealEmailFor(req("198.51.100.3"), "dental", ["a", "b"])), ["a", "b"], "T7: another IP is unaffected");
+      eq(sorted(revealEmailFor(req("198.51.100.2"), "rfb", ["a"])), ["a"], "T8: another host is unaffected (one block per host)");
+      t += EMAIL_REVEAL_TRAP_BLOCK_MS - 1;
+      eq(sorted(revealEmailFor(req("198.51.100.2"), "dental", ["c"])), [], "T9: still blocked just before 24 h");
+      t += 1;
+      eq(sorted(revealEmailFor(req("198.51.100.2"), "dental", ["c"])), ["c"], "T10: after 24 h the block has expired");
+      eq(recordEmailRevealTrapHit(req("198.51.100.2"), "dental"), "blocked", "T11: a hit after expiry is a new block");
+      t += 1000;
+      eq(recordEmailRevealTrapHit(req("198.51.100.2"), "dental"), "renewed", "T12: a hit within a block renews it");
+      t += EMAIL_REVEAL_TRAP_BLOCK_MS - 500;
+      eq(sorted(revealEmailFor(req("198.51.100.2"), "dental", ["d"])), [], "T13: the renewed block runs 24 h from the latest hit");
+      process.env.EMAIL_REVEAL_GUARD_DENTAL = "off";
+      eq(revealEmailFor(req("198.51.100.2"), "dental", ["d"]), null, "T14: switch off while blocked -> null (no change, as on main)");
+      process.env.EMAIL_REVEAL_GUARD_DENTAL = "on";
+      const parsed = lines.map((l) => JSON.parse(l));
+      const hits = parsed.filter((p) => p.evt === "email_reveal_trap_hit");
+      eq(hits.map((p) => [p.host, p.reason, p.renewed]), [["dental", "trap_hit", false], ["dental", "trap_hit", false], ["dental", "trap_hit", true]], "T15: one trap_hit log line per recorded hit");
+      ok(hits.every((p) => typeof p.client === "string" && p.client.length === 12), "T16: ... with the hashed client id");
+      ok(parsed.filter((p) => p.evt === "email_reveal_withheld").every((p) => p.reason === "trap_blocked" && p.revealed === 0), "T17: withheld lines for the blocked client have reason trap_blocked");
+      ok(lines.every((l) => !l.includes("@") && !l.includes("198.51.100") && !l.includes("GPTBot")), "T18: no e-mail address, no IP and no User-Agent in any log line");
+      // memory bound
+      let tt = 0;
+      const ts = new EmailRevealTrapStore({ now: () => tt, maxBlocked: 3, blockMs: 100 });
+      for (const k of ["k1", "k2", "k3", "k4"]) ts.block("rfb", k);
+      eq([ts.size("rfb"), ts.isBlocked("rfb", "k1"), ts.isBlocked("rfb", "k4")], [3, false, true], "T19: at the cap the oldest block is dropped");
+      tt = 100;
+      ts.block("rfb", "k5");
+      eq([ts.size("rfb"), ts.isBlocked("rfb", "k2"), ts.isBlocked("rfb", "k5")], [1, false, true], "T20: expired blocks are pruned first");
+      eq(ts.size("dental"), 0, "T21: hosts are separate");
     }
   } catch (err: any) {
     failed++;

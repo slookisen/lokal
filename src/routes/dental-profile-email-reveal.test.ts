@@ -25,6 +25,11 @@
  *       address, Retry-After), CCBot (403), unknown / no e-mail / rejected
  *       (404); Cache-Control: private and X-Robots-Tag noindex
  *   G   the guard's log lines carry no e-mail address and no IP
+ *   T   S-A4 trap path /kontakt-arkiv: disallowed in every robots.txt group
+ *       (same text switch on or off); the hidden link only with the switch
+ *       on, never in JSON-LD or the sitemap; switch off → fall-through, nothing
+ *       recorded; a GET/HEAD blocks that IP for 24 h (injected clock) on the
+ *       page, «Vis e-post» and REST; another IP unaffected; logs without IP
  *
  * The byte-identity of switch-off against main itself was checked when the
  * slice was built: 208 responses (7 fixture clinics, id and slug routes, the
@@ -75,6 +80,10 @@ export async function runDentalProfileEmailRevealTests(opts: { log?: boolean } =
   };
   const eq = (actual: unknown, expected: unknown, label: string) =>
     ok(JSON.stringify(actual) === JSON.stringify(expected), `${label} (expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)})`);
+  // S-A4: with the switch on, a profile page carries the hidden trap link once;
+  // apart from it the page is the switch-off page byte for byte.
+  const { EMAIL_TRAP_LINK_HTML } = require("../services/email-reveal-trap") as typeof import("../services/email-reveal-trap");
+  const noTrap = (html: string) => (html.split(EMAIL_TRAP_LINK_HTML).length === 2 ? html.replace(EMAIL_TRAP_LINK_HTML, "") : `[trap link count ${html.split(EMAIL_TRAP_LINK_HTML).length - 1}]`);
 
   const envKeys = ["DENTAL_DB_PATH", "EMAIL_REVEAL_GUARD_DENTAL", "EMAIL_REVEAL_PER_IP_PER_HOUR"];
   const prevEnv = Object.fromEntries(envKeys.map((k) => [k, process.env[k]]));
@@ -207,7 +216,7 @@ export async function runDentalProfileEmailRevealTests(opts: { log?: boolean } =
     freshGuard();
     for (const [i, id] of ids.entries()) {
       const r = await page(id, "203.0.113.20");
-      ok(r.text === offPages[i]!.text, `U1: switch on, under the limit -> clinic ${i + 1} byte-identical to switch off`);
+      ok(noTrap(r.text) === offPages[i]!.text, `U1: switch on, under the limit -> clinic ${i + 1} byte-identical to switch off but for the hidden trap link`);
       eq(r.headers["cache-control"], "private", `U2: switch on -> Cache-Control: private on clinic ${i + 1}`);
     }
     {
@@ -230,7 +239,7 @@ export async function runDentalProfileEmailRevealTests(opts: { log?: boolean } =
       const p3 = await page(ids[3]!, ip);
       ok(isRevealOnly(p3, 3), "L6: an address with &' is not leaked raw, escaped or encoded");
       const again = await page(ids[0]!, ip);
-      ok(again.text === offPages[0]!.text, "L7: a repeat view of a counted profile is free (still byte-identical to switch off)");
+      ok(noTrap(again.text) === offPages[0]!.text, "L7: a repeat view of a counted profile is free (still byte-identical to switch off but for the hidden trap link)");
       const slug = await slugPage(2, ip);
       ok(isRevealOnly(slug, 2), "L8: the /klinikk/:slug route over the limit: «Vis e-post», no address");
       ok(shows(await page(ids[2]!, "203.0.113.31"), 2), "L9: another IP has its own budget");
@@ -309,6 +318,88 @@ export async function runDentalProfileEmailRevealTests(opts: { log?: boolean } =
       ok(![...emails, "avvist@visprove-klinikk.example", "visprove-klinikk"].some((e) => joined.includes(e)), "G2: no log line carries an e-mail address");
       ok(!/203\.0\.113\./.test(joined), "G3: no log line carries an IP");
       ok(logLines.every((l) => { try { const o = JSON.parse(l); return o.evt === "email_reveal_withheld" && o.host === "dental"; } catch { return false; } }), "G4: every line is the guard's JSON line for dental");
+    }
+
+    // ── T: the trap path (S-A4) ─────────────────────────────────────────
+    {
+      const trap = require("../services/email-reveal-trap") as typeof import("../services/email-reveal-trap");
+      const robotsParser = require("../services/product-import/robots") as typeof import("../services/product-import/robots");
+      const jsonLdText = (html: string) => Array.from(html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)).map((m) => m[1]).join("\n");
+      const trapLinks = (html: string) => html.split(trap.EMAIL_TRAP_LINK_HTML).length - 1;
+      const http2 = require("http") as typeof import("http");
+      const head = (path: string, ip: string): Promise<number> => new Promise((resolve, reject) => {
+        const r = http2.request({ host: "127.0.0.1", port, path, method: "HEAD", headers: { "x-forwarded-for": ip, "user-agent": BROWSER } }, (res) => { res.resume(); res.on("end", () => resolve(res.statusCode ?? 0)); });
+        r.on("error", reject);
+        r.end();
+      });
+      let now = 50_000_000;
+      const trapLines: string[] = [];
+      guard.__resetEmailRevealGuardForTesting({ now: () => now, log: (l) => trapLines.push(l) });
+      delete process.env.EMAIL_REVEAL_PER_IP_PER_HOUR;
+      const SW = "EMAIL_REVEAL_GUARD_DENTAL";
+
+      // robots.txt: every group disallows the trap path; same text switch on or off
+      delete process.env[SW];
+      const robotsOff = await get("/robots.txt", "203.0.113.200");
+      process.env[SW] = "on";
+      const robotsOn = await get("/robots.txt", "203.0.113.200");
+      ok(robotsOff.status === 200 && robotsOff.text === robotsOn.text, "T1: robots.txt is the same with the switch on and off");
+      const agents = Array.from(robotsOn.text.matchAll(/^User-agent: (.+)$/gm)).map((m) => m[1]!.trim());
+      ok(agents.length > 15 && agents.includes("*") && agents.includes("Googlebot") && agents.includes("GPTBot"), "T2: robots.txt has the * group and the named groups");
+      const allowedFor = agents.filter((ua) => {
+        const policy = robotsParser.parseRobotsTxt(robotsOn.text, ua === "*" ? "some-unlisted-bot" : ua);
+        return robotsParser.isPathAllowed(policy, "/kontakt-arkiv/") || robotsParser.isPathAllowed(policy, "/kontakt-arkiv");
+      });
+      eq(allowedFor, [], "T3: no robots.txt group (incl. *) may fetch the trap path");
+      const groups = robotsOn.text.split(/\n\n/).filter((g) => /^User-agent: /m.test(g));
+      ok(groups.length === agents.length && groups.every((g) => g.includes(trap.EMAIL_TRAP_ROBOTS_DISALLOW)), "T4: the Disallow line is repeated inside every User-agent group");
+      ok(robotsParser.isPathAllowed(robotsParser.parseRobotsTxt(robotsOn.text, "Googlebot"), `/klinikk/id/${ids[0]}`), "T5: profile pages stay crawlable");
+
+      // switch off: no link, the path falls through, nothing recorded
+      delete process.env[SW];
+      const offPage = await ((ip: string) => page(ids[0]!, ip))("203.0.113.201");
+      eq(trapLinks(offPage.text), 0, "T6: switch off -> no trap link on the profile page");
+      ok(!offPage.text.includes("kontakt-arkiv"), "T6b: ... the path is nowhere in the page");
+      const offTrap = await get("/kontakt-arkiv/", "203.0.113.201");
+      const fallThrough = await get("/kontakt-arkiv-finnes-ikke/", "203.0.113.201");
+      ok(offTrap.status === fallThrough.status && offTrap.text === fallThrough.text.replace(/kontakt-arkiv-finnes-ikke/g, "kontakt-arkiv") && offTrap.headers["cache-control"] === fallThrough.headers["cache-control"],
+        "T7: switch off -> the trap path is the router's ordinary fall-through answer");
+      eq(trapLines.length, 0, "T8: switch off -> nothing logged");
+      process.env[SW] = "on";
+      ok(((r: HttpResult) => shows(r, 0))(await ((ip: string) => page(ids[0]!, ip))("203.0.113.201")), "T9: a hit while the switch was off left no block");
+
+      // switch on: link on the page, not in JSON-LD, not in the sitemap
+      const onPage = await ((ip: string) => page(ids[0]!, ip))("203.0.113.202");
+      eq(trapLinks(onPage.text), 1, "T10: switch on -> the hidden trap link once on the profile page");
+      ok(!jsonLdText(onPage.text).includes("kontakt-arkiv"), "T11: ... and not in JSON-LD");
+      const sitemap = await get("/sitemap.xml", "203.0.113.202");
+      ok(sitemap.status === 200 && !sitemap.text.includes("kontakt-arkiv"), "T12: the trap path is not in the sitemap");
+
+      // a hit blocks this IP on every surface of the host
+      const ip = "203.0.113.210";
+      ok(((r: HttpResult) => shows(r, 1))(await ((ip: string) => slugPage(1, ip))(ip)), "T13: before the hit the page shows the e-mail");
+      const hit = await get("/kontakt-arkiv/", ip);
+      ok(hit.status === 200 && hit.text.includes("Ingen oppføringer"), "T14: the trap answers a small 200 page");
+      eq([hit.headers["x-robots-tag"], hit.headers["cache-control"]], ["noindex, nofollow", "no-store"], "T15: ... noindex, nofollow and no-store");
+      const blockedPage = await ((ip: string) => slugPage(1, ip))(ip);
+      ok(blockedPage.status === 200 && !leaks(blockedPage.text, emails[1]!) && !jsonLdText(blockedPage.text).includes('"email"') && blockedPage.text.includes("Vis e-post"),
+        "T16: blocked -> the page renders, «Vis e-post», no address, no JSON-LD email (a profile it saw before too)");
+      eq((await ((ip: string) => reveal(ids[2]!, ip))(ip)).status, 429, "T17: blocked -> the reveal endpoint answers as over the limit (429)");
+      ok(((r: HttpResult) => shows(r, 2))(await ((ip: string) => page(ids[2]!, ip))("203.0.113.211")), "T18: another IP is unaffected");
+      const blockedRest = await rest(ids[2]!, ip);
+      const freeRest = await rest(ids[2]!, "203.0.113.211");
+      ok(blockedRest.status === 200 && !blockedRest.text.includes(emails[2]!) && freeRest.text.includes(emails[2]!), "T19: blocked -> REST /api/tannlege/agents/:id without e-mail (same counter); another IP gets it");
+      eq(await head("/kontakt-arkiv/noe", "203.0.113.212"), 200, "T20: HEAD on a path below the trap is the trap too");
+      ok(!((r: HttpResult) => shows(r, 0))(await ((ip: string) => page(ids[0]!, ip))("203.0.113.212")), "T21: ... and blocks that IP");
+      now += 24 * 60 * 60_000 - 1;
+      ok(!((r: HttpResult) => shows(r, 0))(await ((ip: string) => page(ids[0]!, ip))(ip)), "T22: still blocked just before 24 h");
+      now += 1;
+      ok(((r: HttpResult) => shows(r, 0))(await ((ip: string) => page(ids[0]!, ip))(ip)), "T23: after 24 h the e-mail is back");
+      const joined = trapLines.join("\n");
+      ok(trapLines.some((l) => JSON.parse(l).evt === "email_reveal_trap_hit" && JSON.parse(l).host === "dental"), "T24: the hit is logged (email_reveal_trap_hit, host dental)");
+      ok(trapLines.some((l) => JSON.parse(l).reason === "trap_blocked"), "T25: withheld answers are logged with reason trap_blocked");
+      ok(!((text: string) => [...emails, "visprove-klinikk"].some((e) => text.includes(e)))(joined) && !/203\.0\.113\./.test(joined), "T26: no log line carries an e-mail address or an IP");
+      delete process.env[SW];
     }
   } catch (err: any) {
     failed++;

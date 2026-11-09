@@ -173,6 +173,7 @@ import { EXPERIENCE_TAGS, type ExperienceTag } from "../services/experience-tags
 // reader.
 import { isGardssalgContactEmailFlaggedForReview } from "./opplevelser";
 import { emailRevealGuardEnabled, isCcBotUserAgent, revealEmailFor } from "../services/email-reveal-guard";
+import { EMAIL_TRAP_ROBOTS_DISALLOW, EMAIL_TRAP_ROUTE_PATHS, emailTrapHandler, emailTrapLinkFor } from "../services/email-reveal-trap";
 // dev-request 2026-08-07-orch-fylke-2024-migrasjon: the /fylke/:fylke 301
 // fallback below reuses norway-fylke.ts's own historical-alias map
 // (ALIAS_TO_CANONICAL), merged-legacy equivalence classes
@@ -292,6 +293,11 @@ import {
 import { faqPairsFromJsonLd, type FaqPair } from "../services/faq-section";
 
 const router = Router();
+
+// S-A4 (dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting):
+// the e-mail trap path. Switch EMAIL_REVEAL_GUARD_EXPERIENCES off → next()
+// (the ordinary 404, as on main).
+router.get(EMAIL_TRAP_ROUTE_PATHS, emailTrapHandler("experiences"));
 
 // Lazy, one-shot backfill of experience_providers.slug (additive migration).
 let _providerSlugBackfillDone = false;
@@ -2734,7 +2740,7 @@ router.get("/robots.txt", (_req: Request, res: Response) => {
 # Oversikt:      ${url}/llms.txt
 # Discovery:     ${url}/api/opplevelser/discover
 
-${buildRobotsGroups(GARDSSALG_ROBOTS_DISALLOWS)}
+${buildRobotsGroups(GARDSSALG_ROBOTS_DISALLOWS + "\n" + EMAIL_TRAP_ROBOTS_DISALLOW)}
 
 Sitemap: ${url}/sitemap.xml
 `);
@@ -6654,7 +6660,7 @@ ${switcherOn ? oaSiteNav({ active: "gardssalg", lang, path: noPath, switcher: tr
     </aside>
   </div>
   <p class="legal-note" style="font-size:.78rem;color:#7a7163;margin-top:24px;padding-top:16px;border-top:1px solid #e4ded0">Vi formidler besøket og smakingen hos produsenten. Selve salget skjer hos produsenten, som har egen kommunal bevilling.</p>
-</main>
+${emailView === null ? "" : emailTrapLinkFor("experiences")}</main>
 ${switcherOn ? oaSiteFooter({ lang }) : oaSiteFooter({})}
 <script>
 (function () {

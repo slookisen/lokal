@@ -52570,6 +52570,10 @@ runSerial(async () => {
 // S-A2 adds the higher limit for verified AI readers (forward-confirmed
 // reverse DNS, injected fake resolver; switch off = no DNS lookup).
 // S-A5 adds the dental MCP tannlege_info (same dental counter).
+// S-A4 adds the trap path /kontakt-arkiv on all three hosts (robots.txt
+// Disallow in every group, hidden link on the profile pages, a hit blocks
+// e-mail for that IP for 24 h; tested in the guard, rfb api, dental and
+// experiences profile suites).
 // Switch off = byte-identical answers. Sets env
 // flags and swaps the dental db-factory (restored in finally) — runSerial,
 // tail position.

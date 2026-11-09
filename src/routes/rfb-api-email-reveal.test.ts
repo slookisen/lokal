@@ -38,6 +38,13 @@
  *      200 producers read through each surface give ≤ N e-mails (N = limit)
  *   K  the owner's own /info read (X-Claim-Token) is not limited
  *   G  the guard's log lines carry no e-mail address and no IP
+ *   T  S-A4 trap path /kontakt-arkiv on rettfrabonden.com: disallowed in every
+ *     robots.txt group (switch on or off, same robots.txt); the hidden link
+ *     is on the profile page only with the switch on, never in JSON-LD or the
+ *     sitemap; switch off → the path falls through and nothing is recorded;
+ *     switch on → a GET or HEAD blocks that IP for 24 h (injected clock): no
+ *     e-mail on the profile page («Vis e-post»), the reveal endpoint (429),
+ *     card and info; another IP is unaffected; log lines carry no IP/e-mail
  *
  * Byte-identity of switch-off against main itself was checked when the slice
  * was built (same requests answered from a clean main checkout and from this
@@ -103,6 +110,7 @@ function storeProducer(id: string, name: string): any {
 export interface RfbApiHarness {
   get(path: string, ip: string, ua?: string, headers?: Record<string, string>): Promise<HttpResult>;
   post(path: string, body: unknown, ip: string, ua?: string, headers?: Record<string, string>): Promise<HttpResult>;
+  head(path: string, ip: string, ua?: string): Promise<HttpResult>;
   close(): Promise<void>;
 }
 
@@ -152,6 +160,7 @@ export async function startRfbApiApp(root = __dirname + "/.."): Promise<RfbApiHa
   return {
     get: (path, ip, ua, headers) => call("GET", path, undefined, ip, ua, headers),
     post: (path, body, ip, ua, headers) => call("POST", path, body, ip, ua, headers),
+    head: (path, ip, ua) => call("HEAD", path, undefined, ip, ua),
     close: () => new Promise<void>((resolve) => { server.closeAllConnections?.(); server.close(() => resolve()); }),
   };
 }
@@ -503,6 +512,92 @@ export async function runRfbApiEmailRevealTests(opts: { log?: boolean } = {}): P
       ok(!anyLeak(joined), "G2: no log line carries an e-mail address");
       ok(!/203\.0\.113\./.test(joined), "G3: no log line carries an IP");
       ok(logLines.every((l) => { try { const o = JSON.parse(l); return o.evt === "email_reveal_withheld" && o.host === "rfb"; } catch { return false; } }), "G4: every line is the guard's JSON line for rfb");
+    }
+
+    // ── T: the trap path (S-A4) ─────────────────────────────────────────
+    {
+      const trap = require("../services/email-reveal-trap") as typeof import("../services/email-reveal-trap");
+      const robotsParser = require("../services/product-import/robots") as typeof import("../services/product-import/robots");
+      const { slugify } = require("../utils/slug") as typeof import("../utils/slug");
+      const pageOf = (i: number, ip: string) => a.get(`/produsent/${slugify(P[i]!.name)}`, ip, "Mozilla/5.0 (test)");
+      const jsonLdText = (html: string) => Array.from(html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)).map((m) => m[1]).join("\n");
+      const trapLinks = (html: string) => html.split(trap.EMAIL_TRAP_LINK_HTML).length - 1;
+      let now = 50_000_000;
+      const trapLines: string[] = [];
+      guard.__resetEmailRevealGuardForTesting({ now: () => now, log: (l) => trapLines.push(l) });
+      delete process.env.EMAIL_REVEAL_PER_IP_PER_HOUR;
+
+      // robots.txt: every group disallows the trap path; same text switch on or off
+      switchOff();
+      const robotsOff = await a.get("/robots.txt", "203.0.113.200");
+      switchOn();
+      const robotsOn = await a.get("/robots.txt", "203.0.113.200");
+      ok(robotsOff.status === 200 && robotsOff.text === robotsOn.text, "T1: robots.txt is the same with the switch on and off");
+      const agents = Array.from(robotsOn.text.matchAll(/^User-agent: (.+)$/gm)).map((m) => m[1]!.trim());
+      ok(agents.length > 20 && agents.includes("*") && agents.includes("Googlebot") && agents.includes("GPTBot"), "T2: robots.txt has the * group and the named groups");
+      const allowedFor = agents.filter((ua) => {
+        const policy = robotsParser.parseRobotsTxt(robotsOn.text, ua === "*" ? "some-unlisted-bot" : ua);
+        return robotsParser.isPathAllowed(policy, "/kontakt-arkiv/") || robotsParser.isPathAllowed(policy, "/kontakt-arkiv");
+      });
+      eq(allowedFor, [], "T3: no robots.txt group (incl. *) may fetch the trap path");
+      const groups = robotsOn.text.split(/\n\n/).filter((g) => /^User-agent: /m.test(g));
+      ok(groups.every((g) => g.includes(trap.EMAIL_TRAP_ROBOTS_DISALLOW)), "T4: the Disallow line is repeated inside every User-agent group");
+      ok(robotsParser.isPathAllowed(robotsParser.parseRobotsTxt(robotsOn.text, "Googlebot"), `/produsent/${slugify(P[0]!.name)}`), "T5: profile pages stay crawlable");
+
+      // switch off: no link, the path falls through, nothing recorded
+      switchOff();
+      const offPage = await pageOf(0, "203.0.113.201");
+      eq(trapLinks(offPage.text), 0, "T6: switch off -> no trap link on the profile page");
+      ok(!offPage.text.includes("kontakt-arkiv"), "T6b: ... the path is nowhere in the page");
+      const offTrap = await a.get("/kontakt-arkiv/", "203.0.113.201");
+      ok(!offTrap.text.includes("Ingen oppføringer") && offTrap.headers["cache-control"] !== "no-store", "T7: switch off -> the trap path is not answered by the trap");
+      eq(trapLines.length, 0, "T8: switch off -> nothing logged");
+      switchOn();
+      eq((await card(P[0]!.id, "203.0.113.201")).email, P[0]!.email, "T9: a hit while the switch was off left no block");
+
+      // switch on: link on the page, not in JSON-LD, not in the sitemap
+      const onPage = await pageOf(0, "203.0.113.202");
+      eq(trapLinks(onPage.text), 1, "T10: switch on -> the hidden trap link once on the producer page");
+      ok(!jsonLdText(onPage.text).includes("kontakt-arkiv"), "T11: ... and not in JSON-LD");
+      ok(/<a href="\/kontakt-arkiv\/" rel="nofollow" tabindex="-1" aria-hidden="true" hidden style="display:none">/.test(onPage.text), "T12: the link is hidden from humans (hidden, display:none, aria-hidden, tabindex -1, nofollow)");
+      const umbOn = await a.get(`/produsent/${slugify(RFB_EMAIL_FIXTURE.umbrella.name)}`, "203.0.113.202", "Mozilla/5.0 (test)");
+      eq(trapLinks(umbOn.text), 1, "T13: ... and on the umbrella page");
+      const sitemap = await a.get("/sitemap.xml", "203.0.113.202");
+      ok(sitemap.status === 200 && sitemap.text.includes("/produsent/") && !sitemap.text.includes("kontakt-arkiv"), "T14: the trap path is not in the sitemap");
+
+      // a hit blocks this IP on every surface of the host
+      const ip = "203.0.113.210";
+      ok((await pageOf(1, ip)).text.includes(`href="mailto:${P[1]!.email}"`), "T15: before the hit the page shows the e-mail");
+      const hit = await a.get("/kontakt-arkiv/", ip);
+      ok(hit.status === 200 && hit.text.includes("Ingen oppføringer"), "T16: the trap answers a small 200 page");
+      eq([hit.headers["x-robots-tag"], hit.headers["cache-control"]], ["noindex, nofollow", "no-store"], "T17: ... noindex, nofollow and no-store");
+      ok(!anyLeak(hit.text), "T18: ... with no e-mail");
+      const blockedPage = await pageOf(1, ip);
+      ok(blockedPage.status === 200 && !leaks(blockedPage.text, P[1]!.email) && !jsonLdText(blockedPage.text).includes('"email"') && blockedPage.text.includes("Vis e-post"),
+        "T19: blocked -> the page renders, «Vis e-post», no address, no JSON-LD email (a profile it saw before too)");
+      eq((await a.get(`/produsent/${slugify(P[2]!.name)}/epost`, ip, "Mozilla/5.0 (test)")).status, 429, "T20: blocked -> the reveal endpoint answers as over the limit (429)");
+      const blockedCard = await card(P[2]!.id, ip);
+      const freeCard = await card(P[2]!.id, "203.0.113.211");
+      eq([blockedCard.email, freeCard.email], [undefined, P[2]!.email], "T21: blocked -> card without e-mail; another IP gets it");
+      eq((await card(NOEMAIL.id, ip)).shape, (await card(NOEMAIL.id, "203.0.113.211")).shape, "T21b: ... the blocked card has the shape of a producer without e-mail");
+      eq((await info(P[0]!.id, ip)).email, null, "T22: blocked -> info knowledge.email null");
+      const headHit = await a.head("/kontakt-arkiv/noe", "203.0.113.212");
+      eq(headHit.status, 200, "T23: HEAD on a path below the trap is the trap too");
+      eq((await card(P[0]!.id, "203.0.113.212")).email, undefined, "T24: ... and blocks that IP");
+      await a.get("/kontakt-arkiv", "203.0.113.213");
+      eq((await card(P[0]!.id, "203.0.113.213")).email, undefined, "T25: /kontakt-arkiv without the slash is the trap too");
+      const enTrap = await a.get("/en/kontakt-arkiv/", "203.0.113.214");
+      ok(!enTrap.text.includes("Ingen oppføringer"), "T25b: /en/kontakt-arkiv/ (not in robots.txt) is not the trap");
+      eq((await card(P[0]!.id, "203.0.113.214")).email, P[0]!.email, "T25c: ... and blocks nobody");
+      now += 24 * 60 * 60_000 - 1;
+      eq((await card(P[0]!.id, ip)).email, undefined, "T26: still blocked just before 24 h");
+      now += 1;
+      eq((await card(P[0]!.id, ip)).email, P[0]!.email, "T27: after 24 h the e-mail is back");
+      const joined = trapLines.join("\n");
+      ok(trapLines.some((l) => JSON.parse(l).evt === "email_reveal_trap_hit" && JSON.parse(l).host === "rfb"), "T28: the hit is logged (email_reveal_trap_hit, host rfb)");
+      ok(trapLines.some((l) => JSON.parse(l).reason === "trap_blocked"), "T29: withheld answers are logged with reason trap_blocked");
+      ok(!anyLeak(joined) && !/203\.0\.113\./.test(joined), "T30: no log line carries an e-mail address or an IP");
+      switchOff();
     }
   } catch (err: any) {
     failed++;
