@@ -23,9 +23,10 @@
 //     shape can be captured from prod without leaking personal data.
 // No DB writes, no scheduler, no table, no flag.
 //
-// S4b (comes after the shape is captured via the probe): store the lines
-// weekly, behind a flag; S4c: show the product «Øko» mark only on products
-// tied to 509 lines. normalizeCertDetail() is then tightened to the real shape.
+// S4b-1: the real shape was captured via the probe; normalizeCertDetail()
+// now reads its top-level certificateDetailPos[] (see below). Later S4b
+// slices store the lines weekly, behind a flag; S4c: show the product «Øko»
+// mark only on products tied to 509 lines.
 //
 // Privacy (S1.6): Debio person names / streets are never persisted, logged or
 // returned. normalizeCertDetail() reads only product/area label keys, status
@@ -275,11 +276,66 @@ function certificateUrlOf(raw: unknown): string | null {
   return candidates[0].url;
 }
 
-/** Defensive normalizer over guessed certificate-detail shapes (S4a). */
+// ─── real Debio format (S4b-1) ──────────────────────────────────────────────
+// Captured from prod via the probe (key paths + types only):
+//   { sid, enquiryOrigSid, from, to, additionalDWReports: [],
+//     certificateDetailPos: [{ name, category, unit, amount, partnerFullName,
+//                              result: { sid, name, caption, subResult } }] }
+// Only lines inside certificateDetailPos are read this way: label = name
+// (+ " (category)"), statusCode = result.sid when it is an integer in Debio's
+// code range 500–5099 (as debio-register-client), statusText = result.name ||
+// result.caption. partnerFullName (person data, S1.6) is never read.
+
+const DEBIO_POS_KEY = "certificatedetailpos";
+const DEBIO_CODE_MIN = 500;
+const DEBIO_CODE_MAX = 5099;
+
+function debioCodeOf(v: unknown): number | null {
+  return typeof v === "number" && Number.isInteger(v) && v >= DEBIO_CODE_MIN && v <= DEBIO_CODE_MAX ? v : null;
+}
+
+function normalizeDebioPosLine(raw: unknown): CertDetailLine | null {
+  if (!isObj(raw)) return null;
+  const m = mapOf(raw);
+  const name = str(m.get("name"));
+  const category = str(m.get("category"));
+  const label = name && category ? `${name} (${category})` : name ?? category;
+  const result = m.get("result");
+  let statusCode: number | null = null;
+  let statusText: string | null = null;
+  if (isObj(result)) {
+    const rm = mapOf(result);
+    statusCode = debioCodeOf(rm.get("sid"));
+    statusText = str(rm.get("name")) ?? str(rm.get("caption"));
+  }
+  if (statusCode === null && label === null && statusText === null) return null;
+  return { label, statusCode, statusText, organic: statusCode === DEBIO_CERT_DETAIL_ORGANIC_CODE };
+}
+
+/** The top-level certificateDetailPos array (any key casing), or null when absent. */
+function debioPosArray(raw: unknown): unknown[] | null {
+  if (!isObj(raw)) return null;
+  const v = mapOf(raw).get(DEBIO_POS_KEY);
+  return Array.isArray(v) ? v : null;
+}
+
+/**
+ * Normalizer over certificate-detail responses: the real Debio format
+ * (top-level certificateDetailPos, S4b-1) and, when that container is absent,
+ * the guessed S4a shapes exactly as before.
+ */
 export function normalizeCertDetail(raw: unknown): CertDetailNormalized {
   const certificateUrl = certificateUrlOf(raw);
   const lines: CertDetailLine[] = [];
-  for (const arr of findLineArrays(raw)) {
+  const pos = debioPosArray(raw);
+  const arrays = pos ? [] : findLineArrays(raw);
+  if (pos) {
+    for (const r of pos) {
+      const l = normalizeDebioPosLine(r);
+      if (l) lines.push(l);
+    }
+  }
+  for (const arr of arrays) {
     for (const r of arr) {
       const l = normalizeLine(r);
       if (l) lines.push(l);
