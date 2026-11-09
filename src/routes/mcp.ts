@@ -59,7 +59,7 @@ import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 import { searchCountable } from "../services/search-tracking";
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
 import { BRAND_ENTITIES, brandMcpIcons } from "../config/brand-entities";
-import { publicListableSql, failsProducerRoleGate, isAgentIdPubliclyVisible, notOwnerHiddenSql, ownerHidesAgent, withoutOwnerHidden, isContactHiddenAgentId, withoutContactFields, HIDDEN_CONTACT_NOTE_NB } from "../services/agent-visibility";
+import { publicListableSql, failsProducerRoleGate, isAgentIdPubliclyVisible, notOwnerHiddenSql, ownerHidesAgent, withoutOwnerHidden, isContactHiddenAgentId, withoutContactFields, redactContactText, HIDDEN_CONTACT_NOTE_NB } from "../services/agent-visibility";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { isPaymentsEnabled, isPaymentsLifecycleActive, submitCartWithPayments, resolvePaymentsStripeClient } from "../services/payment-service";
@@ -1213,7 +1213,9 @@ export function registerTools(
           // an AI agent must not relay the fleet's own working notes either.
           // I-N (AI2-08): scraped HTML tags («<br />») are no text either.
           // I-S (F1): an about of only tags gives no section.
-          const about = mcpProse(k.about);
+          const aboutRaw = mcpProse(k.about);
+          // A hidden row's free text may carry a website, e-mail or phone number.
+          const about = aboutRaw && isContactHiddenAgentId(getDb(), agent.id) ? redactContactText(aboutRaw) : aboutRaw;
           if (about) sections.push(`\n${about}`);
         }
       }
