@@ -174,13 +174,21 @@ export function isContactHiddenAgentId(
 /** Marker that replaces e-mail, link and phone text in a hidden row's free text. */
 export const CONTACT_TEXT_REDACTION_NB = "[kontaktinfo fjernet]";
 
-const REDACT_EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/g;
+// E-mail, any case. The lookbehind lets a match start only where a local
+// part starts, so text without "@" is scanned once (no quadratic retries).
+const REDACT_EMAIL_RE = /(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/gi;
 const REDACT_URL_RE = /(?:https?:\/\/|www\.)[^\s<>"')\]]*[^\s<>"')\].,;:!?]/gi;
-// Bare domain: a label, then a known lowercase TLD, not followed by more word characters.
-// "egg.Neste" or "2.5 kg" never match; a path after the domain goes with it.
-const REDACT_DOMAIN_RE = /(?<![A-Za-z0-9@.-])[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.(?:no|com|org|net|dk|se|fi|eu|io|info|nu)(?![A-Za-z0-9-])(?:\/[^\s<>"')\]]*[^\s<>"')\].,;:!?])?/g;
-// Norwegian phone: 8 digits (12345678 / 123 45 678 / 12 34 56 78), optional +47 / 0047 / 47 prefix.
-const REDACT_PHONE_RE = /(?<![\d.,])(?:(?:\+47|0047)[ -]?|47 )?(?:\d{8}|\d{3} \d{2} \d{3}|\d{2} \d{2} \d{2} \d{2})(?![\d])/g;
+// Bare domain: a label, then a known TLD (any case: "gard.no", "GARD.NO"), not
+// followed by more word characters. "egg.Neste" or "2.5 kg" never match; a path
+// after the domain goes with it.
+const REDACT_DOMAIN_RE = /(?<![A-Za-z0-9@.-])[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.(?:no|com|org|net|dk|se|fi|eu|io|info|nu)(?![A-Za-z0-9-])(?:\/[^\s<>"')\]]*[^\s<>"')\].,;:!?])?/gi;
+// Norwegian phone: exactly 8 digits — 12345678, 123 45 678 or 12 34 56 78, with
+// the same space, hyphen or dot between all groups (912-34-567, 91.23.45.67) —
+// and an optional +47 / 0047 / 47 prefix. Not preceded by a digit, "." or ","
+// (or digit + "-"), not followed by a digit or by ".", "," or "-" and a digit:
+// so dates (01.05.2026), decimals (12.5), times (10.00-14.00) and postal codes
+// never match.
+const REDACT_PHONE_RE = /(?<![\d.,]|\d-)(?:(?:\+47|0047)[ .-]?|47 )?(?:\d{8}|\d{3}([ .-])\d{2}\1\d{3}|\d{2}([ .-])\d{2}\2\d{2}\2\d{2})(?!\d|[.,-]\d)/g;
 
 /**
  * Replaces e-mail addresses, links and Norwegian phone numbers in free text
@@ -198,8 +206,8 @@ export function redactContactText(text: string): string {
 
 /**
  * A copy of a knowledge object without HIDDEN_ROW_CONTACT_FIELDS, with
- * externalLinks and images emptied and contact text in `about` redacted
- * (the same value when it is no object).
+ * externalLinks and images emptied and contact text in `about` and the
+ * HIDDEN_ROW_FREE_TEXT_FIELDS redacted (the same value when it is no object).
  */
 export function withoutContactFields<T>(k: T): T {
   if (!k || typeof k !== "object") return k;
@@ -208,6 +216,62 @@ export function withoutContactFields<T>(k: T): T {
   out.externalLinks = [];
   out.images = [];
   if (typeof out.about === "string") out.about = redactContactText(out.about);
+  return redactKnowledgeFreeText(out);
+}
+
+/** Free-text knowledge fields a hidden row shows only with contact text redacted. */
+export const HIDDEN_ROW_FREE_TEXT_FIELDS = ["description", "specialties", "paymentMethods", "deliveryOptions", "openingHours"] as const;
+
+// Opening-hours entry keys left as stored: schema.org dayOfWeek may be a URI
+// ("https://schema.org/Saturday") the URL pattern would otherwise eat, and the
+// validity dates are dates. Every other string in an entry (note, description,
+// hours, period, day/days labels, and open/close/opens/closes/from/to — a clock
+// time there never matches, free text there is redacted) can be rendered as
+// free text by utils/opening-hours.ts.
+const OPENING_HOURS_KEPT_KEYS = new Set(["dayOfWeek", "validFrom", "validThrough"]);
+
+function redactStringsDeep(v: unknown): unknown {
+  if (typeof v === "string") return redactContactText(v);
+  if (Array.isArray(v)) return v.map(redactStringsDeep);
+  return v;
+}
+
+function redactOpeningHoursEntry(e: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(e)) {
+    out[key] = OPENING_HOURS_KEPT_KEYS.has(key) ? value : redactStringsDeep(value);
+  }
+  return out;
+}
+
+function redactFreeTextValue(v: unknown): unknown {
+  if (typeof v === "string") return redactContactText(v);
+  if (Array.isArray(v)) {
+    return v.map((e) => {
+      if (typeof e === "string") return redactContactText(e);
+      if (Array.isArray(e)) return redactStringsDeep(e);
+      // An opening-hours entry object, in any stored form.
+      if (e && typeof e === "object") return redactOpeningHoursEntry(e as Record<string, unknown>);
+      return e;
+    });
+  }
+  return v;
+}
+
+/**
+ * A copy of a knowledge object with redactContactText run over
+ * HIDDEN_ROW_FREE_TEXT_FIELDS: strings, string entries of arrays (also
+ * nested), and every string value of an opening-hours entry object except
+ * dayOfWeek / validFrom / validThrough (see OPENING_HOURS_KEPT_KEYS).
+ * Numbers, booleans and null are untouched. Only for a contact-hidden row.
+ * The same value when it is no object.
+ */
+export function redactKnowledgeFreeText<T>(k: T): T {
+  if (!k || typeof k !== "object") return k;
+  const out: any = { ...(k as any) };
+  for (const f of HIDDEN_ROW_FREE_TEXT_FIELDS) {
+    if (f in out) out[f] = redactFreeTextValue(out[f]);
+  }
   return out;
 }
 

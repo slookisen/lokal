@@ -59,7 +59,7 @@ import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 import { searchCountable } from "../services/search-tracking";
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
 import { BRAND_ENTITIES, brandMcpIcons } from "../config/brand-entities";
-import { publicListableSql, failsProducerRoleGate, isAgentIdPubliclyVisible, notOwnerHiddenSql, ownerHidesAgent, withoutOwnerHidden, isContactHiddenAgentId, withoutContactFields, redactContactText, HIDDEN_CONTACT_NOTE_NB } from "../services/agent-visibility";
+import { publicListableSql, failsProducerRoleGate, isAgentIdPubliclyVisible, notOwnerHiddenSql, ownerHidesAgent, withoutOwnerHidden, isContactHiddenAgentId, withoutContactFields, redactContactText, redactKnowledgeFreeText, HIDDEN_CONTACT_NOTE_NB } from "../services/agent-visibility";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { isPaymentsEnabled, isPaymentsLifecycleActive, submitCartWithPayments, resolvePaymentsStripeClient } from "../services/payment-service";
@@ -1197,7 +1197,12 @@ export function registerTools(
       const { agent, knowledge: rawKnowledge = {} as any, meta = {} as any } = info;
       // S2c-1: the owner's contact / price choices (null = not enforced).
       const ownerChoices = publicFieldChoices(agent.id);
-      const k = withoutHiddenContact(rawKnowledge, ownerChoices);
+      // A catalog_hidden row (the hidden test fixture): contact text in its
+      // free-text fields (description, specialties, payment, delivery,
+      // opening hours) is redacted as in `about` below.
+      const contactHidden = isContactHiddenAgentId(getDb(), agent.id);
+      const choiceKnowledge = withoutHiddenContact(rawKnowledge, ownerChoices);
+      const k = contactHidden ? redactKnowledgeFreeText(choiceKnowledge) : choiceKnowledge;
       const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
       const sections: string[] = [`# ${agent.name}`];
 
@@ -1215,12 +1220,12 @@ export function registerTools(
           // I-S (F1): an about of only tags gives no section.
           const aboutRaw = mcpProse(k.about);
           // A hidden row's free text may carry a website, e-mail or phone number.
-          const about = aboutRaw && isContactHiddenAgentId(getDb(), agent.id) ? redactContactText(aboutRaw) : aboutRaw;
+          const about = aboutRaw && contactHidden ? redactContactText(aboutRaw) : aboutRaw;
           if (about) sections.push(`\n${about}`);
         }
       }
 
-      if (isContactHiddenAgentId(getDb(), agent.id)) {
+      if (contactHidden) {
         // A catalog_hidden row (the hidden test fixture) is still described by
         // id so it stays orderable, but its contact details and vCard link
         // are a real person's and appear in no public answer (agent-visibility.ts).
