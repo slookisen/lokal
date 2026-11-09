@@ -367,12 +367,14 @@ export async function runOwnerShellT15aTests(opts: { log?: boolean } = {}): Prom
       assertTrue(h.includes("--ow-page-bg") && h.includes("@media (prefers-color-scheme: dark)"), `on: ${p} carries the T6 tokens (light + dark)`);
       assertTrue(h.includes(`<style>${sh.OWNER_SHELL_CSS}</style>`), `on: ${p} carries the shell CSS`);
       // Nothing else changed: with the shell taken out the page is the flag-off page.
-      const shellStart = sh.renderOwnerShellStart({ agentId: ON_ID, current: c.section as any, profileSlug: `skallgard-${ON_ID}`, counts, itemsPage: true });
+      const shellStart = sh.renderOwnerShellStart({ agentId: ON_ID, current: c.section as any, profileSlug: `skallgard-${ON_ID}`, counts, itemsPage: true, statsPage: true });
       assertTrue(h.includes(shellStart), `on: ${p} shell markup is renderOwnerShellStart (with the public profile link)`);
       let stripped = h.replace(p === "orders" ? `${shellStart}\n` : `\n  ${shellStart}`, "");
       stripped = p === "orders"
         ? stripped.replace(`<main class="mo-wrap" id="innhold" tabindex="-1">`, `<main class="mo-wrap">`)
         : stripped.replace(sh.OWNER_SHELL_MAIN_OPEN, "").replace(/<\/main>(\s*<\/div>\s*<\/body>)/, "$1");
+      // T15d: with the shell, «Se all statistikk» goes to the Statistikk page (else the /selger tab).
+      if (p === "valg") stripped = stripped.split(`href="${sh.ownerStatsPagePath(ON_ID)}">Se all statistikk`).join(`href="${sh.ownerShellStatsHref(ON_ID)}">Se all statistikk`);
       if (p === "portal") stripped = noItemsCard(noOverview(stripped).replace(`<div class="ep-card" id="profil">`, `<div class="ep-card">`));
       const want = p === "valg" ? noNewsQuestion(before[`${p}:${ON_ID}`].html) : p === "portal" ? noItemsCard(before[`${p}:${ON_ID}`].html) : before[`${p}:${ON_ID}`].html;
       assertEq(stripped, want, `on: ${p} without the shell markup (and the T15b parts) is byte-identical to the flag-off page`);
@@ -399,14 +401,14 @@ export async function runOwnerShellT15aTests(opts: { log?: boolean } = {}): Prom
     const stripe = on["portal:stripe"];
     assertTrue(stripe.status === 200 && stripe.html.includes(`id="forhandsbetaling"`) && stripe.html.includes("Vi venter på bekreftelse fra Stripe") && stripe.html.includes("ow-nav"),
       "anchors: the Stripe return /portal?status=payments_return#forhandsbetaling lands on the portal's card, in the shell");
-    const stripeStripped = noItemsCard(noOverview(stripe.html.replace(`\n  ${sh.renderOwnerShellStart({ agentId: ON_ID, current: "oversikt", profileSlug: `skallgard-${ON_ID}`, counts, itemsPage: true })}`, "")
+    const stripeStripped = noItemsCard(noOverview(stripe.html.replace(`\n  ${sh.renderOwnerShellStart({ agentId: ON_ID, current: "oversikt", profileSlug: `skallgard-${ON_ID}`, counts, itemsPage: true, statsPage: true })}`, "")
       .replace(sh.OWNER_SHELL_MAIN_OPEN, "")).replace(/<\/main>(\s*<\/div>\s*<\/body>)/, "$1").replace(`<div class="ep-card" id="profil">`, `<div class="ep-card">`));
     assertEq(stripeStripped, noItemsCard(before["portal:stripe"].html), "anchors: the Stripe return page is the flag-off page plus the shell");
 
     // Mine valg: the T9 status line and script are still there, inside the page.
     const valgOn = on[`valg:${ON_ID}`].html;
     assertEq(count(valgOn, `id="mv-status"`), 1, "status: Mine valg keeps one #mv-status");
-    assertTrue(valgOn.indexOf(`id="mv-status"`) > valgOn.indexOf(`id="innhold"`) && valgOn.includes(featuresMod.ownerStatsHref(ON_ID)), "status: #mv-status inside <main>; the T9 script is kept");
+    assertTrue(valgOn.indexOf(`id="mv-status"`) > valgOn.indexOf(`id="innhold"`) && valgOn.includes(sh.ownerStatsPagePath(ON_ID)), "status: #mv-status inside <main>; the T9 script is kept (T15d: «Se all statistikk» → the Statistikk page)");
     const pg = require("../owner-features/page") as typeof import("../owner-features/page");
     assertTrue(valgOn.includes(`<script>${pg.OWNER_PAGE_SCRIPT}</script>`), "status: the T9 script is the page's only script addition (unchanged)");
     assertTrue(valgOn.indexOf(`<style>${sh.OWNER_SHELL_CSS}</style>`) < valgOn.indexOf(pg.OWNER_PAGE_CSS), "status: shell CSS (status line above the menu, body-specific) precedes the page CSS and wins by specificity");

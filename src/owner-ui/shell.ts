@@ -40,6 +40,12 @@
 // (ownerItemsPageActiveFor, owner-ui/overview-data.ts). The caller passes
 // `itemsPage: true` then: the Varer link goes to /varer, and on that page
 // Varer carries aria-current="page". Without it the link is as in T15a.
+//
+// T15d: «Statistikk» has its own page, /eier/:id/statistikk (the /selger
+// Statistikk tab's sections, rendered on the server), whenever the dashboard
+// is active (ownerStatsPageActiveFor, owner-ui/overview-data.ts). The caller
+// passes `statsPage: true` then: Mer → Statistikk goes to /statistikk, and on
+// that page it carries aria-current="page". Without it the link is as in T15a.
 
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
 
@@ -99,7 +105,7 @@ export const OWNER_SHELL_PROFILE_ANCHOR = "profil";
 /** The portal's orderable-items card (owner-portal ORDERABILITY_ANCHOR). */
 export const OWNER_SHELL_ITEMS_ANCHOR = "bestillbare-varer";
 
-export type OwnerShellSection = "oversikt" | "ordrer" | "varer" | "valg";
+export type OwnerShellSection = "oversikt" | "ordrer" | "varer" | "valg" | "statistikk";
 
 /**
  * T15b: what waits for the owner — read once per page by ownerActionCounts()
@@ -123,6 +129,8 @@ export interface OwnerShellOptions {
   counts?: OwnerActionCounts;
   /** T15c: the Varer page exists (ownerItemsPageActiveFor) — the Varer link goes to /varer. */
   itemsPage?: boolean;
+  /** T15d: the Statistikk page exists (ownerStatsPageActiveFor) — Mer → Statistikk goes to /statistikk. */
+  statsPage?: boolean;
 }
 
 /** «Statistikk»: the Statistikk tab in /selger (selger.html opens it on #statistikk). */
@@ -146,7 +154,12 @@ export function ownerItemsPagePath(agentId: string): string {
   return `/eier/${encodeURIComponent(agentId)}/varer`;
 }
 
-export function ownerShellLinks(agentId: string, profileSlug = "", itemsPage = false): OwnerShellLinks {
+/** T15d: the Statistikk page (only linked when ownerStatsPageActiveFor). */
+export function ownerStatsPagePath(agentId: string): string {
+  return `/eier/${encodeURIComponent(agentId)}/statistikk`;
+}
+
+export function ownerShellLinks(agentId: string, profileSlug = "", itemsPage = false, statsPage = false): OwnerShellLinks {
   const base = `/eier/${encodeURIComponent(agentId)}`;
   return {
     oversikt: `${base}/portal`,
@@ -154,7 +167,7 @@ export function ownerShellLinks(agentId: string, profileSlug = "", itemsPage = f
     varer: itemsPage ? ownerItemsPagePath(agentId) : `${base}/portal#${OWNER_SHELL_ITEMS_ANCHOR}`,
     valg: `${base}/valg`,
     profil: `${base}/portal#${OWNER_SHELL_PROFILE_ANCHOR}`,
-    statistikk: ownerShellStatsHref(agentId),
+    statistikk: statsPage ? ownerStatsPagePath(agentId) : ownerShellStatsHref(agentId),
     publicProfile: profileSlug ? `/produsent/${encodeURIComponent(profileSlug)}` : null,
     logout: `${base}/logout`,
   };
@@ -187,6 +200,7 @@ export const OWNER_SHELL_CSS = `
   .ow-more-list { box-sizing: border-box; background: var(--ow-surface); border: 1px solid var(--ow-border); border-radius: 10px; padding: 6px; }
   .ow-more-item { box-sizing: border-box; display: flex; align-items: center; width: 100%; min-height: 44px; padding: 10px 12px; border: 0; border-radius: 8px; background: none; color: var(--ow-accent); font: inherit; font-weight: 600; text-align: left; text-decoration: none; cursor: pointer; }
   .ow-more-item:hover { background: var(--ow-btn-secondary-hover); }
+  .ow-more-item[aria-current="page"] { background: var(--ow-badge-new-bg); color: var(--ow-badge-new-text); }
   .ow-more-form { margin: 0; }
   .ow-sr { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
   .ow-nav-badge { display: inline-flex; align-items: center; justify-content: center; box-sizing: border-box; min-width: 1.5em; height: 1.5em; padding: 0 5px; border-radius: 999px; background: var(--ow-btn-primary-bg); color: var(--ow-btn-primary-text); font-size: 0.75rem; font-weight: 700; line-height: 1; }
@@ -217,7 +231,7 @@ export const OWNER_SHELL_CSS = `
  */
 export function renderOwnerShellStart(opts: OwnerShellOptions): string {
   const T = OWNER_SHELL_TEXTS;
-  const L = ownerShellLinks(opts.agentId, opts.profileSlug ?? "", opts.itemsPage === true);
+  const L = ownerShellLinks(opts.agentId, opts.profileSlug ?? "", opts.itemsPage === true, opts.statsPage === true);
   const cur = (s: OwnerShellSection) => (opts.current === s ? ` aria-current="page"` : "");
   const badge = (n: number | undefined, sr: string) => {
     const k = Number.isFinite(n) ? Math.floor(n as number) : 0;
@@ -229,7 +243,7 @@ export function renderOwnerShellStart(opts: OwnerShellOptions): string {
     `<li><a class="ow-nav-item" href="${esc(href)}"${section ? cur(section) : ""}>${inner}</a></li>`;
   const more = [
     `<li><a class="ow-more-item" href="${esc(L.profil)}">${esc(T.profile)}</a></li>`,
-    `<li><a class="ow-more-item" href="${esc(L.statistikk)}">${esc(T.stats)}</a></li>`,
+    `<li><a class="ow-more-item" href="${esc(L.statistikk)}"${opts.statsPage === true ? cur("statistikk") : ""}>${esc(T.stats)}</a></li>`,
     L.publicProfile ? `<li><a class="ow-more-item" href="${esc(L.publicProfile)}">${esc(T.publicProfile)}</a></li>` : "",
     `<li><form class="ow-more-form" method="post" action="${esc(L.logout)}"><button type="submit" class="ow-more-item">${esc(T.logout)}</button></form></li>`,
   ].join("");

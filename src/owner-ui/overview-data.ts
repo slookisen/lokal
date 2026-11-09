@@ -83,6 +83,18 @@ export function ownerItemsPageActiveFor(agentId: string, verifiedOwner: boolean,
   }
 }
 
+/**
+ * T15d: the «Statistikk» page /eier/:id/statistikk exists — the dashboard is
+ * active (OWNER_DASHBOARD_ENABLED + allowlist + verified owner). Never throws.
+ */
+export function ownerStatsPageActiveFor(agentId: string, verifiedOwner: boolean, env: NodeJS.ProcessEnv = process.env): boolean {
+  try {
+    return ownerDashboardActiveFor(VERTICAL, agentId, verifiedOwner, env);
+  } catch {
+    return false;
+  }
+}
+
 /** The ONE read behind the menu badges and «Dette bør du gjøre nå». */
 export function ownerActionCounts(db: any, agentId: string, now: Date = new Date()): OwnerActionCounts {
   return { pendingOrders: countPendingOrders(db, agentId), itemsToConfirm: countItemsToConfirm(db, agentId, now) };
@@ -121,6 +133,8 @@ export interface OwnerOverviewInput {
   newsResult: OwnerOverviewNewsResult | null;
   /** T15c: the Varer page exists (ownerItemsPageActiveFor). */
   itemsPage?: boolean;
+  /** T15d: the Statistikk page exists (ownerStatsPageActiveFor). */
+  statsPage?: boolean;
   db?: any;
 }
 
@@ -165,5 +179,6 @@ export function buildOwnerOverviewModel(input: OwnerOverviewInput): OwnerOvervie
     showNewsQuestion,
     newsResult: input.newsResult,
     ...(input.itemsPage ? { itemsPage: true } : {}),
+    ...(input.statsPage ? { statsPage: true } : {}),
   };
 }

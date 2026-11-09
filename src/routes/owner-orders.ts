@@ -188,6 +188,8 @@ router.get("/eier/:agentId/ordrer", ownerOrdersLimiter, (req: Request, res: Resp
         ? { ownerShellHtml: renderOwnerShellStart({
           agentId, current: "ordrer", profileSlug: slugify(String(agent.name || "")), counts: ownerActionCounts(getDb(), agentId),
           ...(ownerItemsPageActiveFor(agentId, true) ? { itemsPage: true } : {}),
+          // T15d: the dashboard is active here, so Mer → Statistikk goes to its page.
+          statsPage: true,
         }) }
         : {}),
     }));
