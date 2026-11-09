@@ -395,6 +395,9 @@ export function runOpplevelserExperiencesAdmissionPromotionTests(
         if (urlStr === "https://good.no/elvepadling") {
           return mkPageResponse("<html><body>Elvepadling for hele familien, rolig vann.</body></html>", urlStr);
         }
+        if (urlStr === "https://good.no/navdump") {
+          return mkPageResponse("<html><body>Kajakktur på fjorden med guide, avgang hver dag fra brygga.</body></html>", urlStr);
+        }
         throw new Error("admission-promotion test: unexpected fetch URL: " + urlStr);
       }) as unknown as typeof fetch;
 
@@ -424,6 +427,8 @@ export function runOpplevelserExperiencesAdmissionPromotionTests(
         assertEq(p1?.confidence_ok, true, "adm-2e: adm-promote-hjemmeside promotion.confidence_ok=true");
         assertEq(p1?.status, "would_promote", "adm-2f: adm-promote-hjemmeside promotion.status='would_promote' in dry-run");
         assertEq(p1?.missing, undefined, "adm-2g: no 'missing' field when eligible");
+        assertEq(p1?.content_quality, true, "adm-2h: promotion.content_quality=true reported per row (short Norwegian description is not nav chrome)");
+        assertEq(p1?.judge_reason_nav, true, "adm-2i: promotion.judge_reason_nav=true reported per row (judge reason has no nav/menu terms)");
 
         const p2 = byId.get("adm-promote-evidenceurl")?.promotion;
         assertEq(p2?.source_verified, true, "adm-3a: adm-promote-evidenceurl promotion.source_verified=true (via evidence_url, hjemmeside NOT verified)");
@@ -705,6 +710,114 @@ export function runOpplevelserExperiencesAdmissionPromotionTests(
         );
         const sAfterLatestRollback = snapshot("adm-regression-latest-batch")!;
         assertEq(sAfterLatestRollback.verification_status, "needs_review", "adm-34b: adm-regression-latest-batch reverted to 'needs_review' by its OWN (latest) batch's rollback");
+      }
+
+      // ── Promotion guard 2026-11-09: content_quality + judge_reason_nav ──
+      // Pure tests of the shared evaluateContentJudgePromotion() (sweep AND
+      // content-judgement job). Every old requirement is met in `base`, so
+      // the only possible `missing` entries are the two new ones.
+      {
+        const mod = require("./opplevelser") as typeof import("./opplevelser");
+        const base = {
+          verification_status: "needs_review",
+          confidence: "high",
+          evidence_url_verification: null,
+          p_brreg_active: 1,
+          p_field_provenance: hjemmesideVerifiedProvenance,
+        };
+        const okReason = "Stemmer godt med kilden.";
+        const navDump =
+          "Hjem | Om oss | Opplevelser | Overnatting | Kontakt | Velkommen til Fjordgarden " +
+          "Hjem | Om oss | Opplevelser | Overnatting | Kontakt";
+        const navDumpFlat = "Hjem Om Oss Gårdsbutikk Opplevelser Overnatting Galleri Nyheter Kontakt Bestill";
+        const skipLink = "Skip to content Fjordgarden Velkommen til oss på gården";
+
+        const d1 = mod.evaluateContentJudgePromotion({ ...base, description: navDump }, "MATCH", okReason);
+        assertEq(d1.eligible, false, "adm-g1a: nav-menu-dump description + MATCH + all old requirements -> NOT eligible");
+        assertEq(d1.missing, ["content_quality"], "adm-g1b: missing=['content_quality'] only");
+        assertEq(d1.contentQualityOk, false, "adm-g1c: contentQualityOk=false for the nav dump");
+        const d1b = mod.evaluateContentJudgePromotion({ ...base, description: navDumpFlat }, "MATCH", okReason);
+        assertEq(d1b.missing, ["content_quality"], "adm-g1d: flat Title-Case nav bar description -> missing=['content_quality']");
+        const d1c = mod.evaluateContentJudgePromotion({ ...base, description: skipLink }, "MATCH", okReason);
+        assertEq(d1c.missing, ["content_quality"], "adm-g1e: skip-link chrome description -> missing=['content_quality']");
+
+        const noProse =
+          "Bli med på en guidet kajakktur langs fjorden. Vi serverer lokal mat underveis, og turen passer for hele familien.";
+        const d2 = mod.evaluateContentJudgePromotion({ ...base, description: noProse }, "MATCH", okReason);
+        assertEq(d2.eligible, true, "adm-g2a: real Norwegian prose description -> eligible as before");
+        assertEq(d2.missing, [], "adm-g2b: Norwegian prose -> missing=[]");
+        const enProse =
+          "Craft Beer Tasting & Brewery Experience: join our brewer for a guided tour of the brewhouse and taste five local beers.";
+        const d3 = mod.evaluateContentJudgePromotion({ ...base, description: enProse }, "MATCH", okReason);
+        assertEq(d3.eligible, true, "adm-g3a: real English prose description -> eligible (English is NOT blocked by content_quality)");
+        assertEq(d3.contentQualityOk, true, "adm-g3b: English prose contentQualityOk=true");
+        const dShort = mod.evaluateContentJudgePromotion({ ...base, description: "Kort om fjordturen." }, "MATCH", okReason);
+        assertEq(dShort.eligible, true, "adm-g3c: short Norwegian description (<80 chars) is NOT blocked by content_quality");
+
+        const d4 = mod.evaluateContentJudgePromotion(
+          { ...base, description: noProse },
+          "MATCH",
+          "Beskrivelsen inneholder samme navigasjonsmeny og strukturinformasjon som nettsiden.",
+        );
+        assertEq(d4.eligible, false, "adm-g4a: MATCH with reason mentioning 'navigasjonsmeny' -> NOT eligible");
+        assertEq(d4.missing, ["judge_reason_nav"], "adm-g4b: missing=['judge_reason_nav'] only");
+        assertEq(d4.judgeReasonNavOk, false, "adm-g4c: judgeReasonNavOk=false");
+        for (const [i, reason] of [
+          "The stored description is a direct excerpt from the site's NAVIGATION menu and welcome text.",
+          "Gjenspeiler meny-struktur og velkomsttekst.",
+          "Teksten er hentet fra menystrukturen på siden.",
+          "Matches the nav menu of the page.",
+          "Inneholder nav-menyen og overskrifter.",
+          "Tekst fra menylinjen.",
+        ].entries()) {
+          const d = mod.evaluateContentJudgePromotion({ ...base, description: noProse }, "MATCH", reason);
+          assertEq(d.missing, ["judge_reason_nav"], `adm-g4d.${i}: reason "${reason}" -> missing=['judge_reason_nav']`);
+        }
+
+        const d5 = mod.evaluateContentJudgePromotion(
+          { ...base, description: noProse },
+          "MATCH",
+          "Kilden beskriver menyen med lokale retter fra samme gård; stemmer med lagret beskrivelse.",
+        );
+        assertEq(d5.eligible, true, "adm-g5a: reason about a restaurant 'meny' (food menu) -> still eligible");
+        assertEq(d5.judgeReasonNavOk, true, "adm-g5b: plain 'meny'/'menyen' does NOT trigger judge_reason_nav");
+
+        const d6 = mod.evaluateContentJudgePromotion({ ...base, description: null }, "MATCH", okReason);
+        assertEq(d6.eligible, true, "adm-g6a: null description -> not blocked by content_quality");
+        assertEq(d6.contentQualityOk, true, "adm-g6b: null description contentQualityOk=true");
+        const d6b = mod.evaluateContentJudgePromotion({ ...base, description: "   " }, "MATCH", okReason);
+        assertEq(d6b.contentQualityOk, true, "adm-g6c: blank description contentQualityOk=true");
+        const d6c = mod.evaluateContentJudgePromotion({ ...base, description: noProse }, "MATCH", null);
+        assertEq(d6c.judgeReasonNavOk, true, "adm-g6d: null judge reason -> judgeReasonNavOk=true");
+
+        // Both new reasons stack with an old one, in a stable order.
+        const d7 = mod.evaluateContentJudgePromotion(
+          { ...base, confidence: "low", description: navDump },
+          "MATCH",
+          "Gjenspeiler nøyaktig navigasjonsmeny og overskrifter.",
+        );
+        assertEq(d7.missing, ["confidence", "content_quality", "judge_reason_nav"], "adm-g7: missing lists old + both new requirements in order");
+      }
+
+      // ── Promotion guard through the sweep route (dry-run): a needs_review
+      // row with a nav-dump description that would otherwise promote is
+      // held, and its per-row `promotion` reports content_quality:false.
+      {
+        insertExperience.run({
+          id: "adm-guard-navdump", provider_id: "prov-active-hjemmeside-verified",
+          title: "Kajakktur på fjorden", slug: "adm-guard-navdump",
+          description: "Hjem | Om oss | Opplevelser | Overnatting | Kontakt | Bestill",
+          category: "aktivitet", price_band: "standard", price_from: 600,
+          evidence_url: "https://good.no/navdump",
+          evidence_url_verification: null, verification_status: "needs_review", confidence: "high", canonical_id: null,
+        });
+        const rGuard = await callRoute(opplevelserRouter, { headers: adminHeaders, body: {} });
+        const g = (rGuard.body.results as any[]).find((x) => x.id === "adm-guard-navdump");
+        assertEq(g?.verdict, "MATCH", "adm-g8a: guard row judged MATCH");
+        assertEq(g?.promotion?.content_quality, false, "adm-g8b: dry-run promotion.content_quality=false for the nav-dump row");
+        assertEq(g?.promotion?.judge_reason_nav, true, "adm-g8c: dry-run promotion.judge_reason_nav=true (judge reason clean)");
+        assertEq(g?.promotion?.status, "held", "adm-g8d: nav-dump row held (not would_promote)");
+        assertEq(g?.promotion?.missing, ["content_quality"], "adm-g8e: dry-run promotion.missing=['content_quality']");
       }
     } catch (err: any) {
       failed++;
