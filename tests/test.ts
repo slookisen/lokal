@@ -932,6 +932,26 @@ runSerial(async () => {
   }
 });
 
+// ── katalogfakta S3c-i-a: bulk-load keeps min_age, age_suitability,
+// languages, group_min/group_max (sanitized) on NEW experiences only, and
+// reports facts_dropped in dry-run and apply. Own in-memory experiences DB +
+// pinned RFB db, no evidence_url (no fetch stub needed) — runSerial().
+runSerial(async () => {
+  console.log("\n── bulk-load: catalog facts (S3c-i-a) ──");
+  try {
+    const { runOpplevelserBulkLoadCatalogFactsTests } = require("../src/routes/opplevelser-bulk-load-catalog-facts.test") as
+      typeof import("../src/routes/opplevelser-bulk-load-catalog-facts.test");
+    const r = await runOpplevelserBulkLoadCatalogFactsTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("bulk-load-catalog-facts: " + f);
+    console.log(`  bulk-load-catalog-facts: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bulk-load-catalog-facts: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // bulk-load stamps experience_providers.name_collision at first harvest
 // (verdict.name_collision from classifyProvider) — own in-memory DBs,
 // runSerial() like the sibling bulk-load blocks.
