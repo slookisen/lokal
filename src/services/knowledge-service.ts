@@ -924,7 +924,11 @@ export function findRegisterSiblingMatch(
   db: ReturnType<typeof getDb>,
   candidate: { org_nr?: unknown; phone?: unknown; address?: unknown; postal_code?: unknown },
 ): { existingId: string; match: ClaimSiblingMatchKind } | null {
-  const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
+  // D3-N1/N4: org_nr / postal_code / phone may arrive as JSON numbers
+  // (123456789, 3570); a finite number is read as its decimal string, a
+  // string as-is, anything else as absent.
+  const str = (v: unknown): string | null =>
+    typeof v === "string" ? v : typeof v === "number" && Number.isFinite(v) ? String(v) : null;
   const { matchKinds } = claimSiblingsForRow(db, "", {
     org_nr: str(candidate.org_nr),
     tags: null,

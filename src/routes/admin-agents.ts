@@ -120,6 +120,9 @@ import {
 import { readDebioVerified } from "../services/debio-approval";
 // The claim admin queue (decision 11=A) — see GET /claim-review-queue below.
 import { knowledgeService, findRegisterSiblingMatch } from "../services/knowledge-service";
+// D3b (POST /register duplicate fill): the shared "is customer / owner-locked"
+// rule (agents.claimed_at set OR a verified agent_claims row) — one definition.
+import { customerRuleSql } from "../services/customer-rule";
 import { maskEmail } from "../services/gardssalg-claim";
 import { applyClaimApprove, applyClaimReject, applyClaimRevoke, sendClaimApprovedLoginMail } from "../services/claim-review-actions";
 import { isClaimRequestMoreEnabled, requestMoreConfirmation, REQUEST_MORE_NOTE_MAX } from "../services/claim-request-more";
@@ -404,6 +407,10 @@ router.get("/", (req: Request, res: Response) => {
 //      (skipped when org_nr is absent — nothing to match on)
 //   2. name+city match   → { success: false, duplicate: true, existing_id }
 //   3. Insert new agent with trust_score 0.3 (lower than owner-claimed 0.5)
+//   (D3: a third sibling check behind REGISTER_SIBLING_DEDUP_ENABLED; D3b:
+//   with REGISTER_DUPLICATE_FILL_ENABLED, rfb, any duplicate hit also fills
+//   empty email/website on the existing profile and adds `filled: string[]`
+//   to the response — see fillRegisterDuplicateContact above this route.)
 //
 // Columns: only those confirmed present in agents table are written.
 //   vertical_id  → confirmed via ALTER TABLE (Phase 4.6a)
@@ -423,6 +430,165 @@ router.get("/", (req: Request, res: Response) => {
 // backed contact — distinct from the A2A-protocol-required placeholder)
 // ALSO becomes agents.contact_email when given, replacing the
 // "kontakt@rettfrabonden.com" placeholder that column otherwise gets.
+// ─── D3b: fill empty email/website on the existing profile on a duplicate ──
+// dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice
+// D3b. Behind REGISTER_DUPLICATE_FILL_ENABLED (read per request, only "true"),
+// rfb only. When POST /register hits one of its three duplicate checks, the
+// email/website discovery found would otherwise be lost: this fills them into
+// the EXISTING profile, fill-only (a field is written only while it is NULL or
+// whitespace-only — never an overwrite), with provenance via
+// mergeFieldProvenance (the same merge the new-agent path below uses).
+//
+// Guards (all checked on a fresh snapshot inside ONE better-sqlite3
+// transaction, so a claim landing between read and write cannot slip in):
+//   - existing agent row missing or not rfb → nothing.
+//   - owner-claimed profile (customerRuleSql: claimed_at set OR a verified
+//     agent_claims row — the same rule knowledgeService.isAgentClaimed's
+//     agent_claims query is part of) → nothing.
+//   - agent_knowledge.owner_updated_at set → nothing: an owner has edited the
+//     profile, so an empty field may be a deliberate owner choice.
+//   - per field: curated_fields[field] truthy → that field is skipped. This is
+//     canCorrectFactualField's hard refusal #1 (curated_locked), the rule every
+//     automated write applies first. canCorrectFactualField itself is not
+//     called: email/website are not in CORRECTABLE_FACTUAL_FIELDS (it would
+//     answer field_not_correctable), and its remaining Tier-A/Tier-S logic only
+//     protects a POPULATED value — this path is a pure ADD by construction
+//     (the isPureAdd shortcut), so the curated lock is the only rule left.
+//   - no valid http(s) source_url (body source_url, else body url) → nothing.
+export const REGISTER_PLACEHOLDER_CONTACT_EMAIL = "kontakt@rettfrabonden.com";
+
+export function registerDuplicateFillEnabled(): boolean {
+  return process.env.REGISTER_DUPLICATE_FILL_ENABLED === "true";
+}
+
+/** Trimmed http(s) URL string, or null for anything else. */
+function registerHttpUrlOrNull(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const t = value.trim();
+  if (!t) return null;
+  try {
+    const u = new URL(t);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    if (!u.hostname) return null;
+    return t;
+  } catch {
+    return null;
+  }
+}
+
+/** A website candidate: http(s), and the host is not / does not end with rettfrabonden.com. */
+function registerWebsiteOrNull(value: unknown): string | null {
+  const t = registerHttpUrlOrNull(value);
+  if (!t) return null;
+  const host = new URL(t).hostname.toLowerCase().replace(/\.$/, "");
+  if (host.endsWith("rettfrabonden.com")) return null;
+  return t;
+}
+
+export interface RegisterDuplicateFillInput {
+  email: string | null;
+  website: string | null;
+  sourceType: string;
+  sourceUrl: string | null;
+}
+
+/** Builds the fill input from the request body (pure, no DB). */
+export function buildRegisterDuplicateFillInput(body: {
+  email?: unknown; url?: unknown; source?: unknown; source_url?: unknown;
+}): RegisterDuplicateFillInput {
+  const email = typeof body.email === "string" && body.email.trim() && isValidEmailFormat(body.email.trim())
+    ? body.email.trim() : null;
+  const sourceType = typeof body.source === "string" && body.source.trim() ? body.source.trim() : "agent_registration";
+  return {
+    email,
+    website: registerWebsiteOrNull(body.url),
+    sourceType,
+    sourceUrl: registerHttpUrlOrNull(body.source_url) ?? registerHttpUrlOrNull(body.url),
+  };
+}
+
+function isCuratedFieldLocked(curatedFieldsJson: string | null | undefined, field: string): boolean {
+  if (!curatedFieldsJson) return false;
+  try {
+    const parsed = JSON.parse(curatedFieldsJson);
+    return !!(parsed && typeof parsed === "object" && (parsed as Record<string, unknown>)[field]);
+  } catch {
+    return false; // malformed curated_fields → not locked (same convention as isRfbFieldCurated)
+  }
+}
+
+/**
+ * Fill-only write of email/website into an existing profile (see the block
+ * comment above). Returns the fields actually written, e.g. ["email","website"].
+ */
+export function fillRegisterDuplicateContact(
+  db: ReturnType<typeof getDb>,
+  existingId: string,
+  input: RegisterDuplicateFillInput,
+): string[] {
+  if (!input.sourceUrl || (!input.email && !input.website)) return [];
+  const run = db.transaction((): string[] => {
+    const agent = db.prepare(
+      `SELECT a.contact_email AS contact_email, COALESCE(a.vertical_id, 'rfb') AS vertical_id,
+              ${customerRuleSql("a")} AS owned
+         FROM agents a WHERE a.id = ?`,
+    ).get(existingId) as { contact_email: string | null; vertical_id: string; owned: number } | undefined;
+    if (!agent || agent.vertical_id !== "rfb" || agent.owned) return [];
+
+    const k = db.prepare(
+      `SELECT email, website, field_provenance, curated_fields, owner_updated_at FROM agent_knowledge WHERE agent_id = ?`,
+    ).get(existingId) as {
+      email: string | null; website: string | null; field_provenance: string | null;
+      curated_fields: string | null; owner_updated_at: string | null;
+    } | undefined;
+    if (k?.owner_updated_at) return [];
+
+    const blank = (v: string | null | undefined): boolean => v == null || String(v).trim() === "";
+    const fills: Array<{ field: "email" | "website"; value: string }> = [];
+    if (input.email && blank(k?.email) && !isCuratedFieldLocked(k?.curated_fields, "email")) {
+      fills.push({ field: "email", value: input.email });
+    }
+    if (input.website && blank(k?.website) && !isCuratedFieldLocked(k?.curated_fields, "website")) {
+      fills.push({ field: "website", value: input.website });
+    }
+    if (fills.length === 0) return [];
+
+    const nowIso = new Date().toISOString();
+    if (!k) {
+      db.prepare(
+        `INSERT OR IGNORE INTO agent_knowledge (agent_id, field_provenance, updated_at) VALUES (?, '{}', ?)`,
+      ).run(existingId, nowIso);
+    }
+    let existingProv: Record<string, unknown> = {};
+    if (k?.field_provenance) {
+      try {
+        const parsed = JSON.parse(k.field_provenance);
+        if (parsed && typeof parsed === "object") existingProv = parsed as Record<string, unknown>;
+      } catch {
+        /* tolerate junk, mirrors other call sites */
+      }
+    }
+    const incoming: Record<string, Array<{ value: string; source_type: string; fetched_at: string; source_url: string }>> = {};
+    for (const f of fills) {
+      incoming[f.field] = [{ value: f.value, source_type: input.sourceType, fetched_at: nowIso, source_url: input.sourceUrl! }];
+    }
+    const mergedProv = mergeFieldProvenance(existingProv, incoming);
+
+    // Column names come from the fixed "email" | "website" union above, never from input.
+    const sets = fills.map((f) => `${f.field} = ?`);
+    db.prepare(
+      `UPDATE agent_knowledge SET ${sets.join(", ")}, field_provenance = ?, updated_at = ? WHERE agent_id = ?`,
+    ).run(...fills.map((f) => f.value), JSON.stringify(mergedProv), nowIso, existingId);
+
+    const filledEmail = fills.find((f) => f.field === "email");
+    if (filledEmail && (agent.contact_email ?? "").trim().toLowerCase() === REGISTER_PLACEHOLDER_CONTACT_EMAIL) {
+      db.prepare(`UPDATE agents SET contact_email = ? WHERE id = ?`).run(filledEmail.value, existingId);
+    }
+    return fills.map((f) => f.field);
+  });
+  return run();
+}
+
 /** Økologi S3b: a net-new agent's Debio status (debio_verified defaults to 0). */
 const REGISTER_NEW_AGENT_DEBIO = { debio_verified: 0 } as const;
 
@@ -483,7 +649,7 @@ router.post("/register", async (req: Request, res: Response) => {
     nace_code?: string;
     categories?: string[];
     tags?: string[];
-    phone?: string;
+    phone?: string | number; // a number is read only by the sibling dedup (D3-N1/N4)
     email?: string;
     description?: string;
     lat?: number;
@@ -565,6 +731,22 @@ router.post("/register", async (req: Request, res: Response) => {
     return;
   }
 
+  // D3b: on a duplicate hit, fill empty email/website on the existing profile
+  // (REGISTER_DUPLICATE_FILL_ENABLED, rfb only). Flag off / non-rfb: returns
+  // {} with no query, so the duplicate body is byte-identical to before.
+  const duplicateFillOn = registerDuplicateFillEnabled() && vertical_id === "rfb";
+  const duplicateFillExtra = (db: ReturnType<typeof getDb>, existingId: string): { filled?: string[] } => {
+    if (!duplicateFillOn) return {};
+    try {
+      return { filled: fillRegisterDuplicateContact(db, existingId, buildRegisterDuplicateFillInput(req.body ?? {})) };
+    } catch (err: any) {
+      // The transaction rolled back, so nothing was written; the duplicate
+      // answer itself still stands.
+      console.error(`[register] duplicate fill failed for ${existingId}:`, err?.message || err);
+      return { filled: [] };
+    }
+  };
+
   try {
     const db = getDb();
 
@@ -587,6 +769,7 @@ router.post("/register", async (req: Request, res: Response) => {
           duplicate: true,
           existing_id: byOrgNr.id,
           message: "Agent with this org_nr already exists",
+          ...duplicateFillExtra(db, byOrgNr.id),
         });
         return;
       }
@@ -605,6 +788,7 @@ router.post("/register", async (req: Request, res: Response) => {
         duplicate: true,
         existing_id: byNameCity.id,
         message: "Agent with this name+city already exists",
+        ...duplicateFillExtra(db, byNameCity.id),
       });
       return;
     }
@@ -620,7 +804,8 @@ router.post("/register", async (req: Request, res: Response) => {
     if (process.env.REGISTER_SIBLING_DEDUP_ENABLED === "true" && vertical_id === "rfb") {
       const sibling = findRegisterSiblingMatch(db, {
         org_nr,
-        phone: trimmedPhone,
+        // D3-N1/N4: a phone sent as a JSON number reaches the rule too.
+        phone: typeof phone === "number" ? phone : trimmedPhone,
         address: dedupAddress,
         postal_code: dedupPostalCode,
       });
@@ -631,6 +816,7 @@ router.post("/register", async (req: Request, res: Response) => {
           existing_id: sibling.existingId,
           match: sibling.match,
           message: `Agent matching an existing RFB profile on ${sibling.match} already exists`,
+          ...duplicateFillExtra(db, sibling.existingId),
         });
         return;
       }
@@ -690,7 +876,7 @@ router.post("/register", async (req: Request, res: Response) => {
     // supplies a real, evidence-gated email (see header comment), use it
     // directly instead of the placeholder; agent_knowledge.email +
     // field_provenance carry the same value below, with provenance.
-    const contactEmailValue = trimmedEmail || "kontakt@rettfrabonden.com";
+    const contactEmailValue = trimmedEmail || REGISTER_PLACEHOLDER_CONTACT_EMAIL;
 
     db.prepare(
       `INSERT INTO agents (

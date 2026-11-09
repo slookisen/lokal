@@ -50852,6 +50852,29 @@ runSerial(async () => {
   }
 });
 
+// G7 discovery-dedup, slice D3b (dev-request 2026-10-30-rfb-eierkrav-
+// automatisk-vurdering-og-ettklikk): a POST /admin/agents/register duplicate
+// hit fills an empty email/website on the existing RFB profile (fill-only,
+// provenance, owner/curated guards), behind REGISTER_DUPLICATE_FILL_ENABLED
+// (default off); plus numeric org_nr/postal_code/phone in the sibling rule.
+// Pins getDb() to its own in-memory DB, sets env (restored in finally) —
+// runSerial.
+runSerial(async () => {
+  console.log("\n── G7 discovery-dedup D3b: register duplicate fill ──");
+  try {
+    const { runAdminAgentsRegisterDuplicateFillTests } = require("../src/routes/admin-agents-register-duplicate-fill.test") as
+      typeof import("../src/routes/admin-agents-register-duplicate-fill.test");
+    const d3b = await runAdminAgentsRegisterDuplicateFillTests({ log: false });
+    passed += d3b.passed;
+    failed += d3b.failed;
+    for (const f of d3b.failures) failures.push("register-duplicate-fill-d3b: " + f);
+    console.log(`  register-duplicate-fill-d3b: ${d3b.passed} passed, ${d3b.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("register-duplicate-fill-d3b: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice
 // B2b-2: after a B2b-1 auto-approval the farm's known address (as before the
 // approval) gets «Ny eier registrert for <profil>» when it exists, differs
