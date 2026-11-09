@@ -222,15 +222,36 @@ export function withoutContactFields<T>(k: T): T {
 /** Free-text knowledge fields a hidden row shows only with contact text redacted. */
 export const HIDDEN_ROW_FREE_TEXT_FIELDS = ["description", "specialties", "paymentMethods", "deliveryOptions", "openingHours"] as const;
 
+// Opening-hours entry keys left as stored: schema.org dayOfWeek may be a URI
+// ("https://schema.org/Saturday") the URL pattern would otherwise eat, and the
+// validity dates are dates. Every other string in an entry (note, description,
+// hours, period, day/days labels, and open/close/opens/closes/from/to — a clock
+// time there never matches, free text there is redacted) can be rendered as
+// free text by utils/opening-hours.ts.
+const OPENING_HOURS_KEPT_KEYS = new Set(["dayOfWeek", "validFrom", "validThrough"]);
+
+function redactStringsDeep(v: unknown): unknown {
+  if (typeof v === "string") return redactContactText(v);
+  if (Array.isArray(v)) return v.map(redactStringsDeep);
+  return v;
+}
+
+function redactOpeningHoursEntry(e: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(e)) {
+    out[key] = OPENING_HOURS_KEPT_KEYS.has(key) ? value : redactStringsDeep(value);
+  }
+  return out;
+}
+
 function redactFreeTextValue(v: unknown): unknown {
   if (typeof v === "string") return redactContactText(v);
   if (Array.isArray(v)) {
     return v.map((e) => {
       if (typeof e === "string") return redactContactText(e);
-      // An opening-hours entry's free-text note ({ day, open, close, note }).
-      if (e && typeof e === "object" && !Array.isArray(e) && typeof (e as any).note === "string") {
-        return { ...(e as any), note: redactContactText((e as any).note) };
-      }
+      if (Array.isArray(e)) return redactStringsDeep(e);
+      // An opening-hours entry object, in any stored form.
+      if (e && typeof e === "object") return redactOpeningHoursEntry(e as Record<string, unknown>);
       return e;
     });
   }
@@ -239,9 +260,11 @@ function redactFreeTextValue(v: unknown): unknown {
 
 /**
  * A copy of a knowledge object with redactContactText run over
- * HIDDEN_ROW_FREE_TEXT_FIELDS (strings, string entries of arrays and the
- * `note` of an opening-hours entry; other values untouched). Only for a
- * contact-hidden row. The same value when it is no object.
+ * HIDDEN_ROW_FREE_TEXT_FIELDS: strings, string entries of arrays (also
+ * nested), and every string value of an opening-hours entry object except
+ * dayOfWeek / validFrom / validThrough (see OPENING_HOURS_KEPT_KEYS).
+ * Numbers, booleans and null are untouched. Only for a contact-hidden row.
+ * The same value when it is no object.
  */
 export function redactKnowledgeFreeText<T>(k: T): T {
   if (!k || typeof k !== "object") return k;

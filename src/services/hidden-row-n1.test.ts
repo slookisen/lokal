@@ -151,13 +151,14 @@ export async function runHiddenRowN1Tests(opts: { log?: boolean } = {}): Promise
     ["phone +47 hyphens", "Tlf +47 912-34-567", `Tlf ${M}`],
     ["phone +47- dots", "Tlf +47-91.23.45.67", `Tlf ${M}`],
     ["phone 0047 dots", "Tlf 0047 912.34.567", `Tlf ${M}`],
+    ["phone +47. prefix", "Tlf +47.912 34 567", `Tlf ${M}`],
   ];
   for (const [label, input, expected] of posN3) assertEq(redactContactText(input), expected, `redact-n3-pos: ${label}`);
   const negN3 = [
     "Dato 01.05.2026", "Fra 01.05.2026 til 30.09.2026", "Åpent 10.00-14.00", "Åpent 10.00–14.00", "Postnummer 0150 Oslo",
     "Vekt 12.5 kg", "Pris 12.50 kr", "Pris kr 1.250,-", "Pris 1.250.000 kr", "Siden 2019-2026", "Kl. 10.00.", "Uke 12-34",
     "Dato 2026-05-01", "Tlf 12.34.567", "Ost 30 kr/kg, 2.5 kg", "Hei.Takk for sist.", "Egg.Neste uke",
-    "Nummer 912-34.567", "Nummer 91.23-45.67", "Nummer 912.34.5678", "Nummer 1.912.34.567",
+    "Art 5-12345678", "Verdi 12345678.5", "Nummer 912 34 567-8", "Nummer 912-34.567", "Nummer 91.23-45.67", "Nummer 912.34.5678", "Nummer 1.912.34.567",
   ];
   for (const t of negN3) assertEq(redactContactText(t), t, `redact-n3-neg: ${JSON.stringify(t)} unchanged`);
 
@@ -187,6 +188,44 @@ export async function runHiddenRowN1Tests(opts: { log?: boolean } = {}): Promise
     assertEq([r.paymentMethods, r.deliveryOptions], [[`Vipps ${M}`], [M]], "rkf-3: payment and delivery redacted");
     assertEq(r.openingHours, [{ day: "sat", open: "10:00", close: "14:00", note: `ring ${M}` }, `Søn: ${M}`], "rkf-4: opening-hours note and text entries redacted, times kept");
     assertEq([r.about, r.products, r.certifications, r.deliveryRadius], ["Ring 98765432", [{ name: "Ost 98765432" }], ["Debio"], 12], "rkf-5: fields outside the list untouched");
+    // Review B1: every stored opening-hours entry form (utils/opening-hours.ts).
+    {
+      const { openingHoursText } = require("../utils/opening-hours") as typeof import("../utils/opening-hours");
+      const OH_SECRETS = ["post@gard.no", "912 34 567", "www.gard.no", "91234567", "gard.no", "98765432", "913 45 678"];
+      const forms: Array<[string, any]> = [
+        ["byAppointment description", { description: "Etter avtale: post@gard.no", byAppointment: true }],
+        ["hours free text", { day: "sat", hours: "ring 912 34 567" }],
+        ["open free text", { day: "sun", open: "se www.gard.no" }],
+        ["close free text", { day: "mon", close: "ring 98765432" }],
+        ["day label free text", { day: "ring 91234567", open: "10:00", close: "12:00" }],
+        ["days array label", { days: ["sat", "ring 91234567"], open: "10:00", close: "12:00" }],
+        ["period", { day: "tue", open: "10:00", close: "12:00", period: "Sesong, info på gard.no" }],
+        ["dayOfWeek description", { dayOfWeek: "https://schema.org/Saturday", opens: "10:00", closes: "14:00", description: "Ring 913 45 678" }],
+        ["from/to free text", { day: "wed", from: "ring 98765432" }],
+      ];
+      for (const [label, entry] of forms) {
+        const r: any = redactKnowledgeFreeText({ openingHours: [entry] });
+        const text = openingHoursText(r.openingHours);
+        const json = JSON.stringify(r.openingHours);
+        assertEq([OH_SECRETS.filter((x) => text.includes(x)), OH_SECRETS.filter((x) => json.includes(x))], [[], []],
+          `oh-b1: ${label} leaks nothing via openingHoursText or JSON (text ${JSON.stringify(text)})`);
+      }
+      const probe: any = redactKnowledgeFreeText({ openingHours: forms.slice(0, 4).map((f) => f[1]) });
+      assertEq(OH_SECRETS.filter((x) => openingHoursText(probe.openingHours).includes(x)), [], "oh-b1: reviewer probe leaks nothing via openingHoursText");
+      const kept: any = redactKnowledgeFreeText({ openingHours: [
+        { dayOfWeek: ["https://schema.org/Saturday", "http://schema.org/Sunday"], opens: "10:00", closes: "14:00", validFrom: "2026-05-01", validThrough: "2026-09-30" },
+        { day: "sat", open: "10.00", close: "14.00" }, { day: "sun", hours: "09:00-18:00" }, { day: "mon", from: "08:00", to: "16:00", closed: false },
+      ] });
+      assertEq(kept.openingHours, [
+        { dayOfWeek: ["https://schema.org/Saturday", "http://schema.org/Sunday"], opens: "10:00", closes: "14:00", validFrom: "2026-05-01", validThrough: "2026-09-30" },
+        { day: "sat", open: "10.00", close: "14.00" }, { day: "sun", hours: "09:00-18:00" }, { day: "mon", from: "08:00", to: "16:00", closed: false },
+      ], "oh-b1: clock times, schema.org dayOfWeek URIs, validity dates and non-strings survive unchanged");
+      assertEq(openingHoursText(kept.openingHours), openingHoursText([
+        { dayOfWeek: ["https://schema.org/Saturday", "http://schema.org/Sunday"], opens: "10:00", closes: "14:00", validFrom: "2026-05-01", validThrough: "2026-09-30" },
+        { day: "sat", open: "10.00", close: "14.00" }, { day: "sun", hours: "09:00-18:00" }, { day: "mon", from: "08:00", to: "16:00", closed: false },
+      ]), "oh-b1: rendered opening hours of a harmless entry list unchanged");
+      assertEq(redactKnowledgeFreeText({ openingHours: [["ring 98765432", "sat"]] }), { openingHours: [[`ring ${M}`, "sat"]] }, "oh-b1: nested string arrays redacted");
+    }
     assertEq(redactKnowledgeFreeText({ openingHours: "Lør 10–14, tlf 912 34 567" }), { openingHours: `Lør 10–14, tlf ${M}` }, "rkf-6: free-text opening hours redacted");
     assertEq(redactKnowledgeFreeText({ x: 1 }), { x: 1 }, "rkf-7: absent fields are not added");
     assertEq(redactKnowledgeFreeText(null), null, "rkf-8: non-object returned as is");
