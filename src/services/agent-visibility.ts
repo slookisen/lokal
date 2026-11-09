@@ -171,11 +171,43 @@ export function isContactHiddenAgentId(
   }
 }
 
-/** A copy of a knowledge object without HIDDEN_ROW_CONTACT_FIELDS (the same value when it is no object). */
+/** Marker that replaces e-mail, link and phone text in a hidden row's free text. */
+export const CONTACT_TEXT_REDACTION_NB = "[kontaktinfo fjernet]";
+
+const REDACT_EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/g;
+const REDACT_URL_RE = /(?:https?:\/\/|www\.)[^\s<>"')\]]*[^\s<>"')\].,;:!?]/gi;
+// Bare domain: a label, then a known lowercase TLD, not followed by more word characters.
+// "egg.Neste" or "2.5 kg" never match; a path after the domain goes with it.
+const REDACT_DOMAIN_RE = /(?<![A-Za-z0-9@.-])[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.(?:no|com|org|net|dk|se|fi|eu|io|info|nu)(?![A-Za-z0-9-])(?:\/[^\s<>"')\]]*[^\s<>"')\].,;:!?])?/g;
+// Norwegian phone: 8 digits (12345678 / 123 45 678 / 12 34 56 78), optional +47 / 0047 / 47 prefix.
+const REDACT_PHONE_RE = /(?<![\d.,])(?:(?:\+47|0047)[ -]?|47 )?(?:\d{8}|\d{3} \d{2} \d{3}|\d{2} \d{2} \d{2} \d{2})(?![\d])/g;
+
+/**
+ * Replaces e-mail addresses, links and Norwegian phone numbers in free text
+ * with CONTACT_TEXT_REDACTION_NB. Conservative: prices, kg amounts, years and
+ * 4-digit postal codes are left alone. Pure.
+ */
+export function redactContactText(text: string): string {
+  if (typeof text !== "string" || !text) return text;
+  return text
+    .replace(REDACT_EMAIL_RE, CONTACT_TEXT_REDACTION_NB)
+    .replace(REDACT_URL_RE, CONTACT_TEXT_REDACTION_NB)
+    .replace(REDACT_DOMAIN_RE, CONTACT_TEXT_REDACTION_NB)
+    .replace(REDACT_PHONE_RE, CONTACT_TEXT_REDACTION_NB);
+}
+
+/**
+ * A copy of a knowledge object without HIDDEN_ROW_CONTACT_FIELDS, with
+ * externalLinks and images emptied and contact text in `about` redacted
+ * (the same value when it is no object).
+ */
 export function withoutContactFields<T>(k: T): T {
   if (!k || typeof k !== "object") return k;
   const out: any = { ...(k as any) };
   for (const f of HIDDEN_ROW_CONTACT_FIELDS) delete out[f];
+  out.externalLinks = [];
+  out.images = [];
+  if (typeof out.about === "string") out.about = redactContactText(out.about);
   return out;
 }
 

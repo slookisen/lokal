@@ -53505,3 +53505,21 @@ runSerial(async () => {
     failures.push("rfb-hidden-contact-omission: unexpected error: " + String(err?.message || err));
   }
 });
+
+// Katalog skive 6 (N1 from #1427): a hidden row shows no links, images or contact
+// text in about on lokal_info, the MCP resource and A2A agent/info.
+runSerial(async () => {
+  console.log("\n── Skjult rad: ingen lenker, bilder eller kontakttekst (N1) ──");
+  try {
+    const { runHiddenRowN1Tests } = require("../src/services/hidden-row-n1.test") as
+      typeof import("../src/services/hidden-row-n1.test");
+    const r = await runHiddenRowN1Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("hidden-row-n1: " + f);
+    console.log(`  hidden-row-n1: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("hidden-row-n1: unexpected error: " + String(err?.message || err));
+  }
+});

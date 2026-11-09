@@ -138,7 +138,7 @@ export async function runRfbHiddenContactOmissionTests(opts: { log?: boolean } =
     assertEq(visibility.isContactHiddenAgentId({ prepare() { throw new Error("no such column: catalog_hidden"); } }, HIDDEN), false,
       "helper-4: a failed read is false (today's answer)");
     assertEq(visibility.withoutContactFields({ address: "a", postalCode: "p", phone: "1", email: "e", website: "w", about: "x", products: [] }),
-      { about: "x", products: [] }, "helper-5: withoutContactFields drops address, postalCode, phone, email and website only");
+      { about: "x", products: [], externalLinks: [], images: [] }, "helper-5: withoutContactFields drops address, postalCode, phone, email and website and empties links and images");
 
     const mcp = require("./mcp") as typeof import("./mcp");
     const tools = new Map<string, (args: any, extra?: any) => Promise<any>>();
