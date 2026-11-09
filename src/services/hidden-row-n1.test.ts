@@ -3,6 +3,12 @@
  * row shows no contact information in any public answer, also not through
  * externalLinks, images or contact text inside `about`.
  *
+ * Katalog skive 7 (N1–N3 from #1472): the same redaction also covers
+ * description, specialties, paymentMethods, deliveryOptions and free-text
+ * opening hours; e-mail and bare domains in any case; phone numbers with
+ * hyphens or dots between groups; and the e-mail pattern stays linear on
+ * long text without "@".
+ *
  * Exported runHiddenRowN1Tests({log}) -> TestSummary; wired into tests/test.ts.
  * Standalone: npx tsx src/services/hidden-row-n1.test.ts
  */
@@ -24,6 +30,17 @@ const IMAGE = "https://bilder.example.no/skjult-n1.jpg";
 const ABOUT_RAW =
   "Vi dyrker poteter. Ring 98 76 54 32 eller +47 912 34 567, skriv til skjult@privat-n1.example.no, se www.skjult-n1.no og https://skjult-n1.example.com/butikk. Potet 30 kr/kg, 2.5 kg pose.";
 const SECRETS = ["98 76 54 32", "912 34 567", "skjult@privat-n1.example.no", "skjult-n1.no", "skjult-n1.example.com", LINK, IMAGE, "facebook.com", "skjult-gard-n1", "bilder.example.no"];
+
+// Slice 7: contact text in the other free-text fields.
+const HIDDEN_FT = "4d000000-0000-4000-8000-000000000003";
+const VISIBLE_FT = "4d000000-0000-4000-8000-000000000004";
+const FT_DESCRIPTION = "Gard ved 0150 Oslo. Skriv beskr@fri-n3.example.no eller ring 912-34-567.";
+const FT_SPECIALTIES = ["Ost — se OST-N3.NO", "Bestill på 91.23.45.67", "Eple 30 kr/kg"];
+const FT_PAYMENT = ["Vipps 412.34.567", "Faktura: Post@Faktura-N3.No"];
+const FT_DELIVERY = ["Henting, avtal på https://levering-n3.example.com/avtale", "Ring +47 934 56 789"];
+const FT_HOURS = "Lør 10–14 fra 01.05.2026, ellers ring 0047 95-67-89-01";
+const FT_SECRETS = ["beskr@fri-n3.example.no", "912-34-567", "OST-N3.NO", "91.23.45.67", "412.34.567", "Post@Faktura-N3.No",
+  "Faktura-N3", "levering-n3.example.com", "934 56 789", "95-67-89-01"];
 
 function seed(db: Database.Database): void {
   const agentStmt = db.prepare(`
@@ -51,6 +68,22 @@ function seed(db: Database.Database): void {
       JSON.stringify([{ type: "facebook", url: LINK }]),
       JSON.stringify([IMAGE]));
   }
+  const ftRows: Array<[string, string, string, number]> = [
+    [HIDDEN_FT, "Skjult N3 Gard", "test_fixture", 1],
+    [VISIBLE_FT, "Synlig N3 Gard", "discovery", 0],
+  ];
+  for (const [id, name, origin, hidden] of ftRows) {
+    agentStmt.run(id, name, FT_DESCRIPTION, `key-${id}`, origin, hidden);
+    db.prepare(`
+      INSERT INTO agent_knowledge (agent_id, about, products, opening_hours, specialties, payment_methods, delivery_options, verification_status)
+      VALUES (?, 'Vi selger ost og eple.', ?, ?, ?, ?, ?, 'verified')
+    `).run(id,
+      JSON.stringify([{ name: "Gardsost", category: "dairy" }]),
+      JSON.stringify(FT_HOURS),
+      JSON.stringify(FT_SPECIALTIES),
+      JSON.stringify(FT_PAYMENT),
+      JSON.stringify(FT_DELIVERY));
+  }
 }
 
 export async function runHiddenRowN1Tests(opts: { log?: boolean } = {}): Promise<TestSummary> {
@@ -70,7 +103,8 @@ export async function runHiddenRowN1Tests(opts: { log?: boolean } = {}): Promise
   const leaks = (text: string): string[] => SECRETS.filter((s) => text.includes(s));
 
   const visibility = require("./agent-visibility") as typeof import("./agent-visibility");
-  const { redactContactText, withoutContactFields } = visibility;
+  const { redactContactText, withoutContactFields, redactKnowledgeFreeText } = visibility;
+  const ftLeaks = (text: string): string[] => FT_SECRETS.filter((x) => text.includes(x));
   const M = "[kontaktinfo fjernet]";
 
   // ── redactContactText: positive cases ──
@@ -102,6 +136,63 @@ export async function runHiddenRowN1Tests(opts: { log?: boolean } = {}): Promise
   ];
   for (const t of neg) assertEq(redactContactText(t), t, `redact-neg: ${JSON.stringify(t)} unchanged`);
   assertEq(redactContactText(undefined as any), undefined, "redact-neg: non-string passes through");
+
+  // ── Slice 7 (N3): case-insensitive e-mail / domains, dotted and hyphenated phones ──
+  const posN3: Array<[string, string, string]> = [
+    ["upper-case domain", "Se GARD.NO i dag", `Se ${M} i dag`],
+    ["mixed-case domain", "Se Gard.Com.", `Se ${M}.`],
+    ["mixed-case e-mail", "Skriv Post@Gard.No nå", `Skriv ${M} nå`],
+    ["upper-case e-mail", "POST@GARD.NO", M],
+    ["upper-case www", "WWW.GARD.NO", M],
+    ["phone 3-2-3 hyphens", "Ring 912-34-567", `Ring ${M}`],
+    ["phone 2-2-2-2 dots", "Ring 91.23.45.67.", `Ring ${M}.`],
+    ["phone 3-2-3 dots", "Ring 912.34.567 i dag", `Ring ${M} i dag`],
+    ["phone 2-2-2-2 hyphens", "Ring 91-23-45-67", `Ring ${M}`],
+    ["phone +47 hyphens", "Tlf +47 912-34-567", `Tlf ${M}`],
+    ["phone +47- dots", "Tlf +47-91.23.45.67", `Tlf ${M}`],
+    ["phone 0047 dots", "Tlf 0047 912.34.567", `Tlf ${M}`],
+  ];
+  for (const [label, input, expected] of posN3) assertEq(redactContactText(input), expected, `redact-n3-pos: ${label}`);
+  const negN3 = [
+    "Dato 01.05.2026", "Fra 01.05.2026 til 30.09.2026", "Åpent 10.00-14.00", "Åpent 10.00–14.00", "Postnummer 0150 Oslo",
+    "Vekt 12.5 kg", "Pris 12.50 kr", "Pris kr 1.250,-", "Pris 1.250.000 kr", "Siden 2019-2026", "Kl. 10.00.", "Uke 12-34",
+    "Dato 2026-05-01", "Tlf 12.34.567", "Ost 30 kr/kg, 2.5 kg", "Hei.Takk for sist.", "Egg.Neste uke",
+    "Nummer 912-34.567", "Nummer 91.23-45.67", "Nummer 912.34.5678", "Nummer 1.912.34.567",
+  ];
+  for (const t of negN3) assertEq(redactContactText(t), t, `redact-n3-neg: ${JSON.stringify(t)} unchanged`);
+
+  // ── Slice 7 (N2): the e-mail pattern is linear on long text without "@" ──
+  {
+    const long = "abcdefghij.".repeat(10_000).slice(0, 100_000).replace(/\./g, "x");
+    const t0 = Date.now();
+    const out = redactContactText(long);
+    const ms = Date.now() - t0;
+    assertTrue(out === long && ms < 200, `perf-1: 100k chars without "@" redacted in ${ms} ms (< 200 ms)`);
+    const words = "ost og eple fra gard ".repeat(5_000);
+    const t1 = Date.now();
+    redactContactText(words);
+    const ms1 = Date.now() - t1;
+    assertTrue(ms1 < 200, `perf-2: ${words.length} chars of prose redacted in ${ms1} ms (< 200 ms)`);
+  }
+
+  // ── Slice 7 (N1): redactKnowledgeFreeText ──
+  {
+    const r: any = redactKnowledgeFreeText({
+      description: "Ring 912-34-567", specialties: ["se GARD.NO", 7], paymentMethods: ["Vipps 91.23.45.67"],
+      deliveryOptions: ["post@gard.no"], openingHours: [{ day: "sat", open: "10:00", close: "14:00", note: "ring 98765432" }, "Søn: www.gard.no"],
+      about: "Ring 98765432", products: [{ name: "Ost 98765432" }], certifications: ["Debio"], deliveryRadius: 12,
+    });
+    assertEq(r.description, `Ring ${M}`, "rkf-1: description redacted");
+    assertEq(r.specialties, [`se ${M}`, 7], "rkf-2: string entries redacted, other entries untouched");
+    assertEq([r.paymentMethods, r.deliveryOptions], [[`Vipps ${M}`], [M]], "rkf-3: payment and delivery redacted");
+    assertEq(r.openingHours, [{ day: "sat", open: "10:00", close: "14:00", note: `ring ${M}` }, `Søn: ${M}`], "rkf-4: opening-hours note and text entries redacted, times kept");
+    assertEq([r.about, r.products, r.certifications, r.deliveryRadius], ["Ring 98765432", [{ name: "Ost 98765432" }], ["Debio"], 12], "rkf-5: fields outside the list untouched");
+    assertEq(redactKnowledgeFreeText({ openingHours: "Lør 10–14, tlf 912 34 567" }), { openingHours: `Lør 10–14, tlf ${M}` }, "rkf-6: free-text opening hours redacted");
+    assertEq(redactKnowledgeFreeText({ x: 1 }), { x: 1 }, "rkf-7: absent fields are not added");
+    assertEq(redactKnowledgeFreeText(null), null, "rkf-8: non-object returned as is");
+    const w: any = withoutContactFields({ description: "post@gard.no", specialties: ["912-34-567"] });
+    assertEq([w.description, w.specialties], [M, [M]], "rkf-9: withoutContactFields redacts the free-text fields too");
+  }
 
   // ── withoutContactFields ──
   {
@@ -180,6 +271,48 @@ export async function runHiddenRowN1Tests(opts: { log?: boolean } = {}): Promise
       assertTrue(hText.includes("Testpoteter") && hText.includes(M), "a2a-2: profile and products kept, marker in about");
       const vText = JSON.stringify(await call(VISIBLE));
       assertTrue(vText.includes(IMAGE) && vText.includes("98 76 54 32"), "a2a-3: visible row's image and about unchanged");
+    }
+
+    // ── Slice 7 (N1): contact text in the other free-text fields, three surfaces ──
+    {
+      const h = await infoText(HIDDEN_FT);
+      assertEq(ftLeaks(h), [], "ft-info-1: lokal_info of the hidden row carries no contact text from specialties, payment, delivery or opening hours");
+      assertTrue(h.includes("## Spesialiteter") && h.includes("Eple 30 kr/kg") && h.includes("01.05.2026") && h.includes(M),
+        "ft-info-2: sections kept, price and date kept, marker in place");
+      const v = await infoText(VISIBLE_FT);
+      assertTrue(v.includes("OST-N3.NO") && v.includes("91.23.45.67") && v.includes("412.34.567") && v.includes("Post@Faktura-N3.No")
+        && v.includes("levering-n3.example.com") && v.includes("934 56 789") && v.includes("95-67-89-01") && !v.includes(M),
+        "ft-info-3: visible row's free-text fields unchanged");
+    }
+    {
+      const h = await readRes(HIDDEN_FT);
+      assertEq(ftLeaks(h), [], "ft-res-1: resource of the hidden row carries no contact text in any free-text field");
+      const hk = JSON.parse(h).knowledge;
+      assertTrue(typeof hk?.description === "string" && hk.description.includes("0150 Oslo") && hk.description.includes(M), "ft-res-2: description redacted, postal code kept");
+      assertEq(hk?.specialties?.[2], "Eple 30 kr/kg", "ft-res-3: harmless specialty unchanged");
+      assertTrue(typeof hk?.openingHours === "string" && hk.openingHours.includes("01.05.2026") && hk.openingHours.includes(M), "ft-res-4: free-text opening hours redacted, date kept");
+      assertEq(hk?.products?.[0]?.name, "Gardsost", "ft-res-5: products unchanged");
+      const vk = JSON.parse(await readRes(VISIBLE_FT)).knowledge;
+      assertEq([vk?.description, vk?.specialties, vk?.paymentMethods, vk?.deliveryOptions, vk?.openingHours],
+        [FT_DESCRIPTION, FT_SPECIALTIES, FT_PAYMENT, FT_DELIVERY, FT_HOURS], "ft-res-6: visible row's free-text fields byte-identical");
+    }
+    {
+      const a2aRouter = require("../routes/a2a").default as any;
+      const layer = (a2aRouter.stack as any[]).find((l: any) => l.route && l.route.path === "/a2a" && l.route.methods?.post);
+      const handle = layer.route.stack[layer.route.stack.length - 1].handle;
+      const call = (agentId: string) => new Promise<any>((resolve) => {
+        const req: any = { method: "POST", url: "/a2a", path: "/a2a", originalUrl: "/a2a", headers: { "user-agent": "test-agent/1.0" },
+          body: { jsonrpc: "2.0", method: "agent/info", params: { agentId }, id: 1 }, ip: "127.0.0.1", socket: { remoteAddress: "127.0.0.1" }, get: () => undefined };
+        const res: any = { statusCode: 200, headersSent: false, status(c: number) { this.statusCode = c; return this; }, setHeader() { return this; },
+          header() { return this; }, set() { return this; }, json(b: any) { this.headersSent = true; resolve(b); return this; } };
+        handle(req, res);
+      });
+      const hText = JSON.stringify(await call(HIDDEN_FT));
+      assertEq(ftLeaks(hText), [], "ft-a2a-1: A2A agent/info of the hidden row carries no contact text in any free-text field");
+      assertTrue(hText.includes("Gardsost") && hText.includes("Eple 30 kr/kg") && hText.includes(M), "ft-a2a-2: products and harmless text kept, marker in place");
+      const vText = JSON.stringify(await call(VISIBLE_FT));
+      assertEq(ftLeaks(vText), FT_SECRETS, "ft-a2a-3: visible row's free-text fields unchanged");
+      assertTrue(!vText.includes(M), "ft-a2a-4: no marker on the visible row");
     }
   } finally {
     console.log = prevLog;
