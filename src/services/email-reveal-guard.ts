@@ -93,8 +93,22 @@
  * Both limits are capped at EMAIL_REVEAL_MAX_LIMIT (1000): a larger whole
  * number is cut to the cap (per-client memory grows with the limit).
  *
- * Not yet: S-A4 (trap address), S-D (contact form) and the RFB MCP answers
- * (S-A5).
+ * S-A4 (trap address): a client that fetches the trap path (served by
+ * services/email-reveal-trap.ts on all three hosts, disallowed for every
+ * robot in robots.txt) is recorded here with recordEmailRevealTrapHit and
+ * gets NO e-mail for EMAIL_REVEAL_TRAP_BLOCK_MS (24 h) on that host:
+ * revealEmailFor withholds every id exactly as over the limit (reason
+ * "trap_blocked" in the log line), so every surface already wired to
+ * revealEmailFor / emailWithheldIds honours the block with no change of its
+ * own. Pages render as normal otherwise (shared IPs are not locked out). The
+ * block is keyed like the counter (same salted hash, IPv6 per /56), per host,
+ * per process (with N machines a client is blocked only on the machine that
+ * served its trap hit), at most EMAIL_REVEAL_TRAP_MAX_BLOCKED keys per host
+ * (expired ones pruned first, else the oldest block is dropped). Nobody is
+ * exempt — verified AI readers included: a hit means robots.txt was ignored.
+ * Switch off for the host → nothing is recorded and nothing changes.
+ *
+ * Not yet: S-D (contact form) and the RFB MCP answers (S-A5).
  */
 
 import crypto from "crypto";
@@ -119,6 +133,10 @@ export const EMAIL_REVEAL_MAX_LIMIT = 1000;
 export const EMAIL_REVEAL_WINDOW_MS = 60 * 60_000;
 /** Clients kept per host before the least recently seen is evicted. */
 export const EMAIL_REVEAL_MAX_CLIENTS = 20_000;
+/** S-A4: how long a trap hit withholds e-mail from that client (24 h). */
+export const EMAIL_REVEAL_TRAP_BLOCK_MS = 24 * 60 * 60_000;
+/** S-A4: blocked clients kept per host before the oldest block is dropped. */
+export const EMAIL_REVEAL_TRAP_MAX_BLOCKED = 20_000;
 const MAX_PROFILE_ID_LEN = 64;
 const LOGGED_IDS = 5;
 
@@ -282,7 +300,101 @@ export class EmailRevealStore {
   }
 }
 
+// ─── Trap blocks (S-A4) ─────────────────────────────────────────────────
+
+export interface EmailRevealTrapStoreOptions {
+  now?: () => number;
+  blockMs?: number;
+  maxBlocked?: number;
+}
+
+/**
+ * Clients blocked by a trap hit, per host: hashed client key → when the
+ * block ends. In memory, per process, bounded by maxBlocked per host.
+ */
+export class EmailRevealTrapStore {
+  private readonly now: () => number;
+  private readonly blockMs: number;
+  private readonly maxBlocked: number;
+  private readonly hosts = new Map<EmailRevealHost, Map<string, number>>();
+  private lastSweep = 0;
+
+  constructor(opts: EmailRevealTrapStoreOptions = {}) {
+    this.now = opts.now ?? Date.now;
+    this.blockMs = opts.blockMs ?? EMAIL_REVEAL_TRAP_BLOCK_MS;
+    this.maxBlocked = Math.max(1, opts.maxBlocked ?? EMAIL_REVEAL_TRAP_MAX_BLOCKED);
+  }
+
+  /** Blocks `clientKey` on `host` from now for blockMs (a new hit renews it). Returns whether it was already blocked. */
+  block(host: EmailRevealHost, clientKey: string): boolean {
+    const now = this.now();
+    const blocked = this.blockedOf(host);
+    this.sweep(now);
+    const until = blocked.get(clientKey);
+    const wasBlocked = until !== undefined && until > now;
+    blocked.delete(clientKey); // re-insert below: Map order = oldest block first
+    if (blocked.size >= this.maxBlocked) {
+      for (const [key, end] of blocked) if (end <= now) blocked.delete(key);
+      while (blocked.size >= this.maxBlocked) blocked.delete(blocked.keys().next().value as string);
+    }
+    blocked.set(clientKey, now + this.blockMs);
+    return wasBlocked;
+  }
+
+  /** Whether `clientKey` is blocked on `host` right now. */
+  isBlocked(host: EmailRevealHost, clientKey: string): boolean {
+    const blocked = this.hosts.get(host);
+    const until = blocked?.get(clientKey);
+    if (until === undefined) return false;
+    if (until > this.now()) return true;
+    blocked!.delete(clientKey);
+    return false;
+  }
+
+  /** Blocked clients held for a host (tests: the memory bound). */
+  size(host: EmailRevealHost): number {
+    return this.hosts.get(host)?.size ?? 0;
+  }
+
+  private blockedOf(host: EmailRevealHost): Map<string, number> {
+    let blocked = this.hosts.get(host);
+    if (!blocked) { blocked = new Map(); this.hosts.set(host, blocked); }
+    return blocked;
+  }
+
+  /** Drops every expired block; at most once a minute. */
+  private sweep(now: number): void {
+    if (now - this.lastSweep < 60_000) return;
+    this.lastSweep = now;
+    for (const blocked of this.hosts.values()) {
+      for (const [key, end] of blocked) if (end <= now) blocked.delete(key);
+    }
+  }
+}
+
 let store = new EmailRevealStore();
+let trapStore = new EmailRevealTrapStore();
+
+/** The short hashed client id used in log lines (never the IP). */
+function logClientId(key: string): string {
+  return Buffer.from(key, "base64url").toString("hex", 0, 6);
+}
+
+/**
+ * S-A4: records a hit on the trap path for this request's client on `host`.
+ * "off" = the switch for `host` is off (nothing recorded, no log); "no_ip" =
+ * no usable req.ip (nothing recorded); "blocked" = blocked for 24 h from now
+ * ("renewed" when it already was). One JSON log line per recorded hit, with
+ * the host and the hashed client id — never the IP.
+ */
+export function recordEmailRevealTrapHit(req: Request, host: EmailRevealHost): "off" | "no_ip" | "blocked" | "renewed" {
+  if (!emailRevealGuardEnabled(host)) return "off";
+  if (typeof req.ip !== "string" || req.ip.trim() === "") return "no_ip";
+  const key = store.clientKey(req.ip);
+  const renewed = trapStore.block(host, key);
+  logLine(JSON.stringify({ evt: "email_reveal_trap_hit", host, reason: "trap_hit", client: logClientId(key), renewed }));
+  return renewed ? "renewed" : "blocked";
+}
 
 /**
  * The ids in `profileIds` (each a profile that HAS an e-mail in this answer)
@@ -293,7 +405,7 @@ export function revealEmailFor(req: Request, host: EmailRevealHost, profileIds: 
   if (!emailRevealGuardEnabled(host)) return null;
   if (profileIds.length === 0) return new Set();
   const ua = typeof req.headers?.["user-agent"] === "string" ? req.headers["user-agent"] : undefined;
-  let reason: "ccbot" | "no_ip" | "limit";
+  let reason: "ccbot" | "no_ip" | "trap_blocked" | "limit";
   let allowed: Set<string>;
   let client: string | undefined;
   if (isCcBotUserAgent(ua)) {
@@ -303,10 +415,16 @@ export function revealEmailFor(req: Request, host: EmailRevealHost, profileIds: 
     reason = "no_ip";
     allowed = new Set();
   } else {
-    reason = "limit";
     const key = store.clientKey(req.ip);
-    client = Buffer.from(key, "base64url").toString("hex", 0, 6);
-    allowed = store.reveal(host, key, profileIds, emailRevealLimitFor(req, host, emailRevealBaseLimit(), client));
+    client = logClientId(key);
+    if (trapStore.isBlocked(host, key)) {
+      // S-A4: a trap hit within the last 24 h → no e-mail, as over the limit.
+      reason = "trap_blocked";
+      allowed = new Set();
+    } else {
+      reason = "limit";
+      allowed = store.reveal(host, key, profileIds, emailRevealLimitFor(req, host, emailRevealBaseLimit(), client));
+    }
   }
   const withheld = profileIds.filter((id) => !allowed.has(id));
   if (withheld.length > 0) {
@@ -348,15 +466,17 @@ export function withKnowledgeEmailNull<T extends { knowledge: { email?: string |
 }
 
 /**
- * Test-only: a fresh store (optionally with an injected clock) and log sink,
+ * Test-only: a fresh store and trap store (optionally with an injected clock;
+ * `trap` sets the trap store's bounds) and log sink,
  * and a fresh AI-reader verifier (S-A2) with `aiReaders` options (injected
  * resolver, clock, timeout, bounds). Without `aiReaders.resolver` the real
  * DNS resolver would be used, so tests that reach a verification pass one.
  */
 export function __resetEmailRevealGuardForTesting(
-  opts: EmailRevealStoreOptions & { log?: (line: string) => void; aiReaders?: Omit<AiReaderVerifierOptions, "onVerified"> } = {}
+  opts: EmailRevealStoreOptions & { log?: (line: string) => void; aiReaders?: Omit<AiReaderVerifierOptions, "onVerified">; trap?: Omit<EmailRevealTrapStoreOptions, "now"> } = {}
 ): void {
   store = new EmailRevealStore(opts);
+  trapStore = new EmailRevealTrapStore({ ...(opts.trap ?? {}), ...(opts.now ? { now: opts.now } : {}) });
   logLine = opts.log ?? ((line) => console.log(line));
   aiReaders = null;
   aiReaderOpts = opts.aiReaders ?? {};

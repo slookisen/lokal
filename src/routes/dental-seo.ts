@@ -66,6 +66,7 @@ import { isDentalSyntheticProbeId } from "../services/dental-contamination";
 import { isHiddenImportRow } from "../services/dental-import-display";
 import { shownDentalAgent } from "../services/dental-places-display";
 import { emailRevealGuardEnabled, isCcBotUserAgent, revealEmailFor } from "../services/email-reveal-guard";
+import { EMAIL_TRAP_ROBOTS_DISALLOW, EMAIL_TRAP_ROUTE_PATHS, emailTrapHandler, emailTrapLinkFor } from "../services/email-reveal-trap";
 import { placesDisplayPolicyEnabled } from "../services/places-display-policy";
 import { planDentalSearch, MAX_POSTSTED_IN, MAX_TERM_CHARS, type DentalSearchPlan, type DentalSearchTolkning } from "../services/dental-query-parser";
 import { capFreeText } from "../utils/free-text";
@@ -137,6 +138,11 @@ import {
 import { COMPANY_INFO } from "../config/company-info";
 
 const router = Router();
+
+// S-A4 (dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting):
+// the e-mail trap path. Switch EMAIL_REVEAL_GUARD_DENTAL off → next() (the
+// ordinary 404, as on main).
+router.get(EMAIL_TRAP_ROUTE_PATHS, emailTrapHandler("dental"));
 
 // The homepage strip's AI explanation (dev-request 2026-10-13-statistikk-riktig-for-investorer, S7).
 const DENTAL_DELIVERIES_EXPLAIN = "Med i AI-søk: ganger en klinikk var blant treffene en AI-assistent (ChatGPT, Claude …) hentet for noen som spurte (søk, sted, profilsiden, MCP eller A2A), summert over alle klinikker. Tallet viser ikke hvor mange som så det.";
@@ -2265,7 +2271,7 @@ function renderClinicProfile(
     ${verificationSection}
     ${disclaimer}
   </div>
-</main>`;
+${emailView === null ? "" : emailTrapLinkFor("dental")}</main>`;
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   recordAiPageDelivery(req, res, "ai_page_profile", [agent.id], "dental");
@@ -2693,7 +2699,7 @@ router.get("/robots.txt", (_req: Request, res: Response) => {
 # Oversikt:      ${DENTAL_BASE_URL}/llms.txt
 # API:           ${DENTAL_BASE_URL}/api/tannlege/agents
 
-${buildRobotsGroups("")}
+${buildRobotsGroups(EMAIL_TRAP_ROBOTS_DISALLOW)}
 
 Sitemap: ${DENTAL_BASE_URL}/sitemap.xml
 `);

@@ -141,6 +141,10 @@ export async function runRfbProfileEmailRevealTests(opts: { log?: boolean } = {}
   };
   const eq = (actual: unknown, expected: unknown, label: string) =>
     ok(JSON.stringify(actual) === JSON.stringify(expected), `${label} (expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)})`);
+  // S-A4: with the switch on, a profile page carries the hidden trap link once;
+  // apart from it the page is the switch-off page byte for byte.
+  const { EMAIL_TRAP_LINK_HTML } = require("../services/email-reveal-trap") as typeof import("../services/email-reveal-trap");
+  const noTrap = (html: string) => (html.split(EMAIL_TRAP_LINK_HTML).length === 2 ? html.replace(EMAIL_TRAP_LINK_HTML, "") : `[trap link count ${html.split(EMAIL_TRAP_LINK_HTML).length - 1}]`);
 
   const envKeys = ["EMAIL_REVEAL_GUARD_RFB", "EMAIL_REVEAL_PER_IP_PER_HOUR", "OWNER_PAUSE_ENABLED", "OWNER_FEATURES_ENFORCE", "OWNER_FEATURES_ALLOWED_SUBJECTS"];
   const prevEnv = Object.fromEntries(envKeys.map((k) => [k, process.env[k]]));
@@ -280,14 +284,14 @@ export async function runRfbProfileEmailRevealTests(opts: { log?: boolean } = {}
     freshGuard();
     for (const [i, slug] of slugs.entries()) {
       const r = await page(slug, "203.0.113.20");
-      ok(r.text === offPages[i]!.text, `U1: switch on, under the limit -> producer ${i + 1} byte-identical to switch off`);
+      ok(noTrap(r.text) === offPages[i]!.text, `U1: switch on, under the limit -> producer ${i + 1} byte-identical to switch off but for the hidden trap link`);
       eq(r.headers["cache-control"], "private", `U2: switch on -> Cache-Control: private on producer ${i + 1}`);
     }
     {
       const r = await page(umbSlug, "203.0.113.20");
-      ok(r.text === offUmb.text && r.headers["cache-control"] === "private", "U3: the umbrella page under the limit: byte-identical body, private");
+      ok(noTrap(r.text) === offUmb.text && r.headers["cache-control"] === "private", "U3: the umbrella page under the limit: byte-identical body but for the trap link, private");
       const en = await get(`/en/produsent/${slugs[0]}`, "203.0.113.20");
-      ok(en.text === offEn.text && en.headers["cache-control"] === "private", "U4: /en under the limit (profile already counted): byte-identical body, private");
+      ok(noTrap(en.text) === offEn.text && en.headers["cache-control"] === "private", "U4: /en under the limit (profile already counted): byte-identical body but for the trap link, private");
     }
 
     // ── L: over the limit ─────────────────────────────────────────────────
@@ -308,7 +312,7 @@ export async function runRfbProfileEmailRevealTests(opts: { log?: boolean } = {}
       ok(en.status === 200 && en.text.includes(revealLink(slugs[2]!, "/en")) && en.text.includes(">Show e-mail</a>") && !leaks(en.text, emails[2]!) && !jsonLdHasEmail(en.text),
         "L7: /en over the limit -> «Show e-mail» to /en/produsent/:slug/epost, no address");
       const again = await page(slugs[0]!, ip);
-      ok(again.text === offPages[0]!.text, "L8: a repeat view of a counted profile is free (still byte-identical to switch off)");
+      ok(noTrap(again.text) === offPages[0]!.text, "L8: a repeat view of a counted profile is free (still byte-identical to switch off but for the hidden trap link)");
       ok(shows(await page(slugs[2]!, "203.0.113.31"), 2), "L9: another IP has its own budget");
     }
     freshGuard(); // default limit 30

@@ -30,6 +30,7 @@ import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenFields, hid
 import { debioApprovalText, debioProcessText, debioRegisterSyncEnabled, finnokoSearchUrl, readDebioStatusRow } from "../services/debio-approval";
 import { publicCountsShown } from "../services/public-stats-threshold";
 import { emailRevealGuardEnabled, isCcBotUserAgent, revealEmailFor } from "../services/email-reveal-guard";
+import { EMAIL_TRAP_ROBOTS_DISALLOW, EMAIL_TRAP_ROUTE_PATHS, emailTrapHandler, emailTrapLinkFor } from "../services/email-reveal-trap";
 // dev-request 2026-10-17-integrasjonstest-oppfolging, I-G: knowledge list
 // fields read by type (see "knowledge fields read by type" below).
 import { textEntries } from "../utils/text-entries";
@@ -138,6 +139,11 @@ import {
 } from "../utils/freshness";
 
 const router = Router();
+
+// S-A4 (dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting):
+// the e-mail trap path, first so no catch-all (/:citySlug) takes it. Switch
+// EMAIL_REVEAL_GUARD_RFB off → next() (the app's ordinary 404, as on main).
+router.get(EMAIL_TRAP_ROUTE_PATHS, emailTrapHandler("rfb"));
 // Daniel 2026-09-03: the language a person chose follows them across pages
 // (session cookie; URL still wins; off unless LANG_COOKIE_REDIRECT_ENABLED).
 // Mounted on THIS router so it is scoped to the RFB host by construction.
@@ -6358,7 +6364,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       return res.send(shell(
         `${agent.name} — ${getConfig().display_name}`,
         aboutText || `${umbTypeBadge} på rettfrabonden.com med ${umbrellaChildren.length} medlemsprodusenter`,
-        umbContent,
+        // S-A4: the hidden trap link, only while the switch is on.
+        umbContent + (emailView === null ? "" : emailTrapLinkFor("rfb")),
         {
           extraCss: PROFILE_CSS,
           lang,
@@ -7395,7 +7402,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     res.send(shell(
       pageTitle,
       pageMetaDescription,
-      content,
+      // S-A4: the hidden trap link, only while the switch is on.
+      content + (emailView === null ? "" : emailTrapLinkFor("rfb")),
       { canonical: `${BASE_URL}${localizedPath("/produsent/" + slug, lang)}`, jsonLd: faqJsonLd ? [jsonLd, faqJsonLd, breadcrumbJsonLd] : [jsonLd, breadcrumbJsonLd], extraCss: PROFILE_CSS + RELATED_PRODUCERS_CSS + (faqSectionHtml ? FAQ_SECTION_CSS : ""), lang, pathForAlternate: "/produsent/" + slug,
         // S2c-2: only set when the owner chose so (byte-identical otherwise).
         ...(ownerNoIndex ? { robots: "noindex" } : {}),
@@ -7746,11 +7754,16 @@ router.get(`/${INDEXNOW_KEY}.txt`, (_req: Request, res: Response) => {
 // ignores the rules under "User-agent: *" entirely.
 // /sok is deliberately NOT listed — its pages carry a noindex meta tag,
 // which the crawler can only see if it is allowed to fetch the page.
+// S-A4 (dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting):
+// the e-mail trap path (services/email-reveal-trap.ts) is disallowed in every
+// group, also the two blocked outright, so a rule-following robot never
+// fetches it.
 const ROBOTS_DISALLOWS = `Disallow: /samtale/
 Disallow: /eier/
 Disallow: /magic-link-verify
 Disallow: /admin/
-Disallow: /ut/`;
+Disallow: /ut/
+${EMAIL_TRAP_ROBOTS_DISALLOW}`;
 
 router.get("/robots.txt", (_req: Request, res: Response) => {
   res.header("Content-Type", "text/plain; charset=utf-8");
@@ -7846,6 +7859,7 @@ Content-Signal: search=yes, ai-input=yes, ai-train=no
 
 User-agent: CCBot
 Disallow: /
+${EMAIL_TRAP_ROBOTS_DISALLOW}
 
 User-agent: FacebookBot
 Allow: /
@@ -7876,6 +7890,7 @@ ${ROBOTS_DISALLOWS}
 
 User-agent: Omgilibot
 Disallow: /
+${EMAIL_TRAP_ROBOTS_DISALLOW}
 
 Sitemap: ${BASE_URL}/sitemap.xml
 
