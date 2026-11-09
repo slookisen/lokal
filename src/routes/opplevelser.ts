@@ -1647,12 +1647,110 @@ export const BulkRowSchema = z.object({
   // not take effect reliably. A server-side alias works for old and new
   // callers alike.
   hjemmeside: z.string().optional().nullable(),
+  // Katalogfakta S3c-i-a: five catalog-fact fields a harvest row may carry.
+  // Deliberately LENIENT (z.unknown()) — an invalid value must never reject
+  // the whole row/request; sanitizeBulkRowFacts() below validates each one
+  // and drops (and counts) what it cannot accept. Only ever written on the
+  // NEW-experience insert path, never onto an existing experience.
+  min_age: z.unknown().optional(),
+  age_suitability: z.unknown().optional(),
+  languages: z.unknown().optional(),
+  group_min: z.unknown().optional(),
+  group_max: z.unknown().optional(),
 });
 const BulkLoadSchema = z.object({
   experiences: z.array(BulkRowSchema).min(1).max(5000),
   apply: z.boolean().optional().default(false),
 });
 export type BulkRow = z.infer<typeof BulkRowSchema>;
+
+export interface BulkRowFacts {
+  min_age?: number;
+  age_suitability?: (typeof EXPERIENCE_FACTS_AGE_SUITABILITY)[number];
+  languages?: string[];
+  group_min?: number;
+  group_max?: number;
+}
+
+/** Integer from a number or a digit-only string; null otherwise. */
+function bulkFactInt(value: unknown): number | null {
+  if (typeof value === "number") return Number.isInteger(value) ? value : null;
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) return Number(value.trim());
+  return null;
+}
+
+/**
+ * Katalogfakta S3c-i-a: validate the five catalog-fact fields of one
+ * bulk-load row against the same bounds the facts-proposals lane uses
+ * (EXPERIENCE_FACTS_* below). Pure. Absent/null fields are simply absent;
+ * an invalid value is left out of `facts` and named in `dropped`
+ * (field name, or `languages:<code>` for a filtered language code).
+ */
+export function sanitizeBulkRowFacts(row: {
+  min_age?: unknown;
+  age_suitability?: unknown;
+  languages?: unknown;
+  group_min?: unknown;
+  group_max?: unknown;
+}): { facts: BulkRowFacts; dropped: string[] } {
+  const facts: BulkRowFacts = {};
+  const dropped: string[] = [];
+  const present = (v: unknown) => v !== undefined && v !== null;
+
+  if (present(row.min_age)) {
+    const n = bulkFactInt(row.min_age);
+    if (n !== null && n >= 0 && n <= EXPERIENCE_FACTS_MIN_AGE_MAX) facts.min_age = n;
+    else dropped.push("min_age");
+  }
+
+  let gMin: number | null = null;
+  let gMax: number | null = null;
+  if (present(row.group_min)) {
+    const n = bulkFactInt(row.group_min);
+    if (n !== null && n >= 1 && n <= EXPERIENCE_FACTS_GROUP_MAX) gMin = n;
+    else dropped.push("group_min");
+  }
+  if (present(row.group_max)) {
+    const n = bulkFactInt(row.group_max);
+    if (n !== null && n >= 1 && n <= EXPERIENCE_FACTS_GROUP_MAX) gMax = n;
+    else dropped.push("group_max");
+  }
+  if (gMin !== null && gMax !== null && gMin > gMax) {
+    dropped.push("group_min", "group_max");
+  } else {
+    if (gMin !== null) facts.group_min = gMin;
+    if (gMax !== null) facts.group_max = gMax;
+  }
+
+  if (present(row.age_suitability)) {
+    const v = typeof row.age_suitability === "string" ? row.age_suitability.trim().toLowerCase() : null;
+    if (v !== null && (EXPERIENCE_FACTS_AGE_SUITABILITY as readonly string[]).includes(v)) {
+      facts.age_suitability = v as BulkRowFacts["age_suitability"];
+    } else {
+      dropped.push("age_suitability");
+    }
+  }
+
+  if (present(row.languages)) {
+    if (!Array.isArray(row.languages)) {
+      dropped.push("languages");
+    } else {
+      const kept: string[] = [];
+      for (const raw of row.languages) {
+        let code = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+        if (code === "nb" || code === "nn") code = "no";
+        if (code && Object.prototype.hasOwnProperty.call(EXPERIENCE_FACTS_LANGUAGE_NAMES, code)) {
+          if (!kept.includes(code)) kept.push(code);
+        } else {
+          dropped.push(`languages:${typeof raw === "string" ? raw : String(raw)}`);
+        }
+      }
+      if (kept.length > 0) facts.languages = kept;
+    }
+  }
+
+  return { facts, dropped };
+}
 
 // dev-request 2026-07-19-agg-website-leak: a 2026-07-12 harvest run wrote a
 // regional tourism-aggregator/DMO page (a KNOWN_DIRECTORY_HOSTS entry) into
@@ -2222,6 +2320,17 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
     }
   }
 
+  // ── 0. Katalogfakta S3c-i-a: sanitize the five catalog-fact fields per
+  // row up front, so dry-run reports `facts_dropped` too. Only the
+  // NEW-experience insert below ever uses `rowFacts`.
+  const rowFacts = new Map<BulkRow, BulkRowFacts>();
+  let factsDropped = 0;
+  for (const row of body.experiences) {
+    const { facts, dropped } = sanitizeBulkRowFacts(row);
+    rowFacts.set(row, facts);
+    factsDropped += dropped.length;
+  }
+
   // ── 1. Group rows by provider_name (trimmed). ─────────────────────
   const byProvider = new Map<string, BulkRow[]>();
   for (const row of body.experiences) {
@@ -2546,6 +2655,8 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
             booking_url: r.booking_url ?? null,
             evidence_url: r.evidence_url ?? null,
             confidence: r.confidence ?? null,
+            // Katalogfakta S3c-i-a: validated catalog facts, NEW rows only.
+            ...(rowFacts.get(r) ?? {}),
             discovery_source: "bulk-load",
             // A non-MATCH gate outcome forces needs_review no matter what the
             // Brreg classification would have granted — a row whose content
@@ -2594,6 +2705,10 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
     // — additive, reported in BOTH dry-run and apply so the freed-up
     // judge/Brreg budget is visible from the very first run after deploy.
     skipped_out_of_scope: skippedOutOfScope,
+    // Katalogfakta S3c-i-a: number of catalog-fact values (min_age,
+    // age_suitability, languages codes, group_min/group_max) dropped as
+    // invalid across all rows — counted in BOTH dry-run and apply.
+    facts_dropped: factsDropped,
     // dev-request 2026-09-14-svarteliste-navnematch-bommer-pa-listenavn-
     // varianter: providers resolved to an existing row via the domain
     // fallback (see the `existing`/`byDomain` lookup above) — 0/empty when
