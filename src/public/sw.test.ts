@@ -16,6 +16,7 @@
 
 import { readFileSync, existsSync, statSync } from "fs";
 import { join } from "path";
+import { createSwSim } from "./sw-test-harness";
 
 export interface TestSummary {
   passed: number;
@@ -113,6 +114,106 @@ export function runServiceWorkerTests(opts: { log?: boolean } = {}): TestSummary
       assertTrue(!mod.shouldBypass(mk(`${origin}/logo-200.png`), origin), "shouldBypass: GET /logo-200.png is NOT bypassed");
       assertTrue(!mod.shouldBypass(mk(`${origin}/`), origin), "shouldBypass: GET / (navigation) is NOT bypassed");
     }
+
+    // ── F-g: owner pages, query URLs and no-store/private responses are never cached ──
+    assertTrue(mod.CACHE_VERSION !== "rfb-pwa-v1", `CACHE_VERSION is bumped past "rfb-pwa-v1" so activate deletes old entries (got "${mod.CACHE_VERSION}")`);
+    assertTrue(/^rfb-pwa-v\d+$/.test(mod.CACHE_VERSION), `CACHE_VERSION keeps the rfb-pwa-v<N> shape (got "${mod.CACHE_VERSION}")`);
+    assertTrue(typeof mod.isCacheableStatic === "function", "sw.js exports isCacheableStatic(url)");
+    assertTrue(typeof mod.isCacheableResponse === "function", "sw.js exports isCacheableResponse(response)");
+    assertTrue(typeof mod.isPrivatePath === "function", "sw.js exports isPrivatePath(pathname)");
+
+    if (typeof mod.shouldBypass === "function") {
+      const origin = "https://rettfrabonden.com";
+      const mk = (url: string, method = "GET") => ({ url, method } as any);
+      const bypassed = [
+        "/eier/abc/valg?fragment=1",
+        "/eier/abc/valg",
+        "/eier/abc",
+        "/eier/abc/portal",
+        "/Eier/abc/varer",
+        "/selger.html",
+        "/selger",
+        "/produsent/ordre/x",
+        "/produsent/ordre/x/kompakt",
+        "/kategori/frukt/eier",
+        "/kategori/gardssalg/eier/slug/portal",
+        "/magic-link-verify",
+        "/auth/m/tok",
+        "/lagerstatus/tok",
+        "/avmeld/tok",
+        "/sok?q=eple",
+        "/?utm_source=x",
+        "/logo-200.png?v=2",
+      ];
+      for (const p of bypassed) {
+        assertTrue(mod.shouldBypass(mk(`${origin}${p}`), origin), `shouldBypass: GET ${p} is bypassed (owner path or query URL)`);
+      }
+      assertTrue(!mod.shouldBypass(mk(`${origin}/kategori/frukt`), origin), "shouldBypass: public /kategori/frukt is NOT bypassed (only /kategori/*/eier is)");
+      assertTrue(!mod.shouldBypass(mk(`${origin}/kategori/eier-test`), origin), "shouldBypass: /kategori/eier-test (no owner segment) is NOT bypassed");
+    }
+
+    if (typeof mod.isCacheableStatic === "function") {
+      const origin = "https://rettfrabonden.com";
+      const notCacheable = [
+        "/eier/abc/valg?fragment=1",
+        "/eier/abc/valg",
+        "/eier/abc/app.js",
+        "/selger.html",
+        "/selger/x",
+        "/produsent/ordre/x",
+        "/produsent/ordre/x/logo.png",
+        "/kategori/frukt/eier",
+        "/kategori/frukt/eier/logo.png",
+        "/logo-200.png?v=2",
+        "/manifest.json?x=1",
+        "/leaflet/leaflet.css?x",
+        "/",
+        "/sok",
+        "/produsenter",
+        "/openapi.json",
+        "/agent-card.json",
+        "/llms.txt",
+        "/sitemap.xml",
+        "/kategori/frukt",
+      ];
+      for (const p of notCacheable) {
+        assertTrue(!mod.isCacheableStatic(`${origin}${p}`), `isCacheableStatic: ${p} is NOT cacheable`);
+      }
+      const cacheable = [
+        "/logo-200.png",
+        "/favicon.svg",
+        "/favicon.ico",
+        "/manifest.json",
+        "/offline.html",
+        "/leaflet/leaflet.css",
+        "/leaflet/leaflet.js",
+        "/install-prompt.js",
+        "/agentplatform-geist-latin-wght.woff2",
+        "/site.webmanifest",
+      ];
+      for (const p of cacheable) {
+        assertTrue(mod.isCacheableStatic(`${origin}${p}`), `isCacheableStatic: ${p} is cacheable`);
+      }
+      for (const p of mod.APP_SHELL as string[]) {
+        assertTrue(mod.isCacheableStatic(`${origin}${p}`), `isCacheableStatic: APP_SHELL entry ${p} is cacheable`);
+      }
+      assertTrue(!mod.isCacheableStatic("not a url"), "isCacheableStatic: unparsable URL is NOT cacheable");
+    }
+
+    if (typeof mod.isCacheableResponse === "function") {
+      const res = (cc: string | null, status = 200) =>
+        new Response("x", { status, headers: cc === null ? {} : { "Cache-Control": cc } });
+      assertTrue(mod.isCacheableResponse(res(null)), "isCacheableResponse: 200 without Cache-Control is stored");
+      assertTrue(mod.isCacheableResponse(res("public, max-age=86400")), "isCacheableResponse: 200 public,max-age is stored");
+      assertTrue(mod.isCacheableResponse(res("no-cache")), "isCacheableResponse: no-cache (revalidate, not forbid-store) is stored");
+      assertTrue(!mod.isCacheableResponse(res("no-store")), "isCacheableResponse: Cache-Control: no-store is NOT stored");
+      assertTrue(!mod.isCacheableResponse(res("private")), "isCacheableResponse: Cache-Control: private is NOT stored");
+      assertTrue(!mod.isCacheableResponse(res("private, max-age=0")), "isCacheableResponse: private, max-age=0 is NOT stored");
+      assertTrue(!mod.isCacheableResponse(res("max-age=0, No-Store")), "isCacheableResponse: max-age=0, No-Store (mixed case) is NOT stored");
+      assertTrue(!mod.isCacheableResponse(res(null, 404)), "isCacheableResponse: 404 is NOT stored");
+      assertTrue(!mod.isCacheableResponse(res(null, 500)), "isCacheableResponse: 500 is NOT stored");
+      assertTrue(!mod.isCacheableResponse(null), "isCacheableResponse: missing response is NOT stored");
+    }
   }
 
   const fetchHandlerIdx = swSrc.indexOf('addEventListener("fetch"');
@@ -180,6 +281,41 @@ export async function runServiceWorkerHttpTests(opts: { log?: boolean } = {}): P
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+
+  // ── F-g: drive the real fetch handler in a sandbox ─────────────────────
+  const swSrc = readFileSync(join(__dirname, "sw.js"), "utf8");
+  const origin = "https://rettfrabonden.com";
+  const sim = createSwSim(swSrc, origin, (url) => {
+    if (url.endsWith("/nostore.png")) return new Response("x", { status: 200, headers: { "Cache-Control": "no-store" } });
+    if (url.endsWith("/private.css")) return new Response("x", { status: 200, headers: { "Cache-Control": "private, max-age=60" } });
+    return new Response("fresh", { status: 200 });
+  });
+
+  for (const p of ["/eier/abc/valg?fragment=1", "/eier/abc/valg", "/selger.html", "/produsent/ordre/x", "/kategori/frukt/eier", "/sok?q=1", "/some/page", "/openapi.json"]) {
+    const r = await sim.dispatch({ url: `${origin}${p}` });
+    assertTrue(!r.intercepted, `fetch handler: non-navigation GET ${p} is NOT intercepted (no respondWith)`);
+  }
+  const navOwner = await sim.dispatch({ url: `${origin}/eier/abc/valg`, mode: "navigate" });
+  assertTrue(!navOwner.intercepted, "fetch handler: navigation to /eier/abc/valg is NOT intercepted");
+  const nav = await sim.dispatch({ url: `${origin}/`, mode: "navigate" });
+  assertTrue(nav.intercepted, "fetch handler: navigation to / is still intercepted (network-first with offline fallback)");
+
+  const logo = await sim.dispatch({ url: `${origin}/logo-200.png` });
+  assertTrue(logo.intercepted, "fetch handler: GET /logo-200.png is intercepted (cache-first)");
+  assertTrue(sim.puts.includes(`${origin}/logo-200.png`), "fetch handler: normal static 200 response for /logo-200.png is stored");
+  const css = await sim.dispatch({ url: `${origin}/leaflet/leaflet.css` });
+  assertTrue(css.intercepted && sim.puts.includes(`${origin}/leaflet/leaflet.css`), "fetch handler: GET /leaflet/leaflet.css is intercepted and stored");
+  const fetchesBefore = sim.networkFetches.length;
+  const logoAgain = await sim.dispatch({ url: `${origin}/logo-200.png` });
+  assertTrue(logoAgain.intercepted && sim.networkFetches.length === fetchesBefore, "fetch handler: repeat GET /logo-200.png is served from cache (no network fetch)");
+
+  const ns = await sim.dispatch({ url: `${origin}/nostore.png` });
+  assertTrue(ns.intercepted && !sim.puts.includes(`${origin}/nostore.png`), "fetch handler: static response with Cache-Control: no-store is NOT stored");
+  const pv = await sim.dispatch({ url: `${origin}/private.css` });
+  assertTrue(pv.intercepted && !sim.puts.includes(`${origin}/private.css`), "fetch handler: static response with Cache-Control: private is NOT stored");
+
+  const allowedPuts = sim.puts.filter((u) => !u.endsWith("/logo-200.png") && !u.endsWith("/leaflet/leaflet.css"));
+  assertEq(allowedPuts, [], "fetch handler: nothing but the two static files was ever written to the cache");
 
   return { passed: passed.n, failed: failed.n, failures };
 }
