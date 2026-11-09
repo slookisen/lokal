@@ -677,6 +677,9 @@ import {
   // faithful meta-derived description was written from (it lives in an HTML
   // attribute, invisible to visibleTextOf).
   extractMetaDescriptions,
+  // Promotion guard «content_quality» in evaluateContentJudgePromotion.
+  looksLikeNavBoilerplate,
+  stripNorwegianAccents as stripNorwegianAccentsForJudgeReason,
 } from "../services/search-enrich";
 // Same slice — significant-title-token check for the homepage-boilerplate
 // description guard (descriptionMentionsExperienceTitle below): reuses the
@@ -29892,7 +29895,40 @@ const PROMOTION_ELIGIBLE_CONFIDENCE = new Set(["high", "medium"]);
 
 export type ContentJudgeSweepVerdict = "MATCH" | "MISMATCH" | "unresolved";
 
-/** The four promotion requirements (see the block comment above), each
+/** Navigation/menu-chrome terms that, when they appear in the judge's OWN
+ *  reason text, mean the judge matched the stored text against the page's
+ *  nav menu / site chrome (it only checks "same provider", not quality) —
+ *  so a MATCH with such a reason must never promote (promotion guard
+ *  `judge_reason_nav`, 2026-11-09: prod rows 36014679/20ef57b2/40e1caa5/
+ *  a6f08b66). Lowercase and æøå-folded, matched as substrings of the
+ *  lowercased+folded reason ("navigasjon" also covers "navigasjonsmeny").
+ *  Deliberately NOT plain "meny": a restaurant/food menu ("beskriver menyen
+ *  med lokale retter") is legitimate experience content. */
+export const CONTENT_JUDGE_NAV_REASON_TERMS: readonly string[] = [
+  "navigasjon",
+  "meny-struktur",
+  "menystruktur",
+  "navigation",
+  "nav menu",
+  "nav-meny",
+  "menylinje",
+  // PR #1488 review N3: common nav-chrome phrasings the first list missed.
+  "hovedmeny",
+  "toppmeny",
+  "navbar",
+  "nav bar",
+  "main menu",
+];
+
+/** True if the judge's reason text mentions navigation/menu chrome (see
+ *  CONTENT_JUDGE_NAV_REASON_TERMS). Null/empty reason -> false. PURE. */
+export function contentJudgeReasonMentionsNav(reason: string | null | undefined): boolean {
+  if (!reason) return false;
+  const folded = stripNorwegianAccentsForJudgeReason(reason.toLowerCase()).replace(/\s+/g, " ");
+  return CONTENT_JUDGE_NAV_REASON_TERMS.some((t) => folded.includes(stripNorwegianAccentsForJudgeReason(t)));
+}
+
+/** The six promotion requirements (see the block comment above), each
  *  evaluated separately. `row` is the state going INTO this write. */
 export type ContentJudgePromotionDecision = {
   wasNeedsReview: boolean;
@@ -29900,13 +29936,34 @@ export type ContentJudgePromotionDecision = {
   brregActiveOk: boolean;
   sourceVerified: boolean;
   confidenceOk: boolean;
+  /** `content_quality`: the stored description is not nav-menu/chrome text. */
+  contentQualityOk: boolean;
+  /** `judge_reason_nav`: the judge's reason does not mention nav/menu chrome. */
+  judgeReasonNavOk: boolean;
   missing: string[];
   eligible: boolean;
 };
 
+/**
+ * Promotion guard (2026-11-09) — two deterministic requirements on top of
+ * judge/brreg_active/source_verified/confidence; both can only make
+ * promotion STRICTER, never looser:
+ *  - `content_quality`: a non-empty (trimmed) `description` must not look
+ *    like nav-menu/chrome text (looksLikeNavBoilerplate, search-enrich.ts).
+ *    Design choice: NOT the full meetsAboutQualityBar — that gate also
+ *    requires ≥80 chars and Norwegian-language markers, but stored
+ *    experience descriptions are legitimately short ("Kort om fjordturen.")
+ *    and sometimes English (the catalogue has English-titled experiences),
+ *    so it would hold back rows for reasons unrelated to nav leakage. Only
+ *    its nav layer (skip/jump links, NAV_BOILERPLATE_MARKERS,
+ *    isLikelyNavMenuLeakage) is applied. A null/blank description passes.
+ *  - `judge_reason_nav`: the judge's own reason must not mention nav/menu
+ *    chrome (contentJudgeReasonMentionsNav).
+ */
 export function evaluateContentJudgePromotion(
-  row: Pick<ContentJudgeSweepRow, "verification_status" | "confidence" | "evidence_url_verification" | "p_brreg_active" | "p_field_provenance">,
+  row: Pick<ContentJudgeSweepRow, "verification_status" | "confidence" | "evidence_url_verification" | "p_brreg_active" | "p_field_provenance" | "description">,
   verdict: ContentJudgeSweepVerdict,
+  judgeReason: string | null,
 ): ContentJudgePromotionDecision {
   const wasNeedsReview = row.verification_status === "needs_review";
   const judgeOk = verdict === "MATCH";
@@ -29914,12 +29971,27 @@ export function evaluateContentJudgePromotion(
   const sourceVerified =
     isHjemmesideVerified(row.p_field_provenance) || isEvidenceUrlVerified(row.evidence_url_verification);
   const confidenceOk = row.confidence !== null && PROMOTION_ELIGIBLE_CONFIDENCE.has(row.confidence);
+  const description = typeof row.description === "string" ? row.description.trim() : "";
+  const contentQualityOk = description === "" || !looksLikeNavBoilerplate(description);
+  const judgeReasonNavOk = !contentJudgeReasonMentionsNav(judgeReason);
   const missing: string[] = [];
   if (!judgeOk) missing.push("judge");
   if (!brregActiveOk) missing.push("brreg_active");
   if (!sourceVerified) missing.push("source_verified");
   if (!confidenceOk) missing.push("confidence");
-  return { wasNeedsReview, judgeOk, brregActiveOk, sourceVerified, confidenceOk, missing, eligible: wasNeedsReview && missing.length === 0 };
+  if (!contentQualityOk) missing.push("content_quality");
+  if (!judgeReasonNavOk) missing.push("judge_reason_nav");
+  return {
+    wasNeedsReview,
+    judgeOk,
+    brregActiveOk,
+    sourceVerified,
+    confidenceOk,
+    contentQualityOk,
+    judgeReasonNavOk,
+    missing,
+    eligible: wasNeedsReview && missing.length === 0,
+  };
 }
 
 const CONTENT_JUDGE_PROMOTION_AUDIT_INSERT_SQL = `INSERT INTO experience_admission_promotion_audit
@@ -30102,6 +30174,8 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
         brreg_active: boolean;
         source_verified: boolean;
         confidence_ok: boolean;
+        content_quality: boolean;
+        judge_reason_nav: boolean;
         status: "not_applicable" | "held" | "would_promote" | "promoted";
         missing?: string[];
       };
@@ -30202,7 +30276,7 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
       // verification_status`, which was read by the SELECT BEFORE this loop
       // ran and is never mutated in place — the authoritative "status going
       // INTO this iteration" value.
-      // The four requirements + the write live in the shared
+      // The promotion requirements + the write live in the shared
       // evaluateContentJudgePromotion()/writeContentJudgeVerdict() above
       // (skive 3k) — the content-judgement job uses the same two.
       const {
@@ -30210,9 +30284,11 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
         brregActiveOk,
         sourceVerified,
         confidenceOk,
+        contentQualityOk,
+        judgeReasonNavOk,
         missing: missingPromotionReqs,
         eligible: eligibleForPromotion,
-      } = evaluateContentJudgePromotion(row, outcome.verdict);
+      } = evaluateContentJudgePromotion(row, outcome.verdict, outcome.reason);
 
       let promoted = false;
       if (applyMode) {
@@ -30270,6 +30346,8 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
           brreg_active: brregActiveOk,
           source_verified: sourceVerified,
           confidence_ok: confidenceOk,
+          content_quality: contentQualityOk,
+          judge_reason_nav: judgeReasonNavOk,
           status: promotionStatus,
           ...(promotionStatus === "held" ? { missing: missingPromotionReqs } : {}),
         },
@@ -30539,7 +30617,7 @@ export async function applyExperienceContentJudgements(
   const inScopeStmt = db.prepare(`SELECT 1 FROM experiences WHERE id = ? AND ${SWEEP_IN_SCOPE_WHERE}`);
   const rowStmt = db.prepare(
     `SELECT e.id, e.evidence_url, e.admission_checked_at, e.updated_at, e.verification_status,
-            e.confidence, e.evidence_url_verification,
+            e.confidence, e.evidence_url_verification, e.description,
             p.brreg_active AS p_brreg_active, p.field_provenance AS p_field_provenance
        FROM experiences e
        LEFT JOIN experience_providers p ON p.id = e.provider_id
@@ -30547,7 +30625,7 @@ export async function applyExperienceContentJudgements(
   );
   type Row = Pick<
     ContentJudgeSweepRow,
-    "id" | "evidence_url" | "admission_checked_at" | "verification_status" | "confidence" | "evidence_url_verification" | "p_brreg_active" | "p_field_provenance"
+    "id" | "evidence_url" | "admission_checked_at" | "verification_status" | "confidence" | "evidence_url_verification" | "p_brreg_active" | "p_field_provenance" | "description"
   > & { updated_at: string | null };
   /** A non-null timestamp newer than the file (or unparseable: fail closed). */
   const newerThanFile = (ts: string | null): boolean => {
@@ -30575,7 +30653,7 @@ export async function applyExperienceContentJudgements(
     if (demotes && demotions >= CONTENT_JUDGEMENT_MAX_DEMOTIONS_PER_FILE) return { id: it.id, result: "rejected", reason: "demotion_cap" };
     // The client verdict is the "judge" requirement only; the other three
     // are read from the row as it stands now, inside this transaction.
-    const decision = evaluateContentJudgePromotion(row, verdict);
+    const decision = evaluateContentJudgePromotion(row, verdict, reasoning);
     const { promoted } = writeContentJudgeVerdict(db, row.id, verdict, reasoning, decision.eligible, batchId);
     if (demotes) demotions++;
     return {

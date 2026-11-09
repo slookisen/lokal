@@ -396,6 +396,36 @@ export function runExperienceContentJudgementJobTests(opts: { log?: boolean } = 
         assertEq(out.totals.promoted, 0, "cj-5g: zero promotions");
       }
 
+      // ── cj-5n: promotion guard through the job (PR #1488 review N1). ──
+      // The job must SELECT e.description (else content_quality silently
+      // passes everything) and pass the item's reasoning to the guard.
+      {
+        seed("n-navdump", {
+          verification_status: "needs_review",
+          description: "Hjem | Om oss | Opplevelser | Overnatting | Kontakt | Bestill",
+        });
+        seed("n-navreason", { verification_status: "needs_review" });
+        seed("n-summit", { verification_status: "needs_review", description: "Vi tar deg med til toppen av fjellet." });
+        const out: any = await apply([
+          item("n-navdump"),
+          item("n-navreason", { reasoning: "Beskrivelsen gjengir navigasjonsmenyen på nettsiden." }),
+          item("n-summit"),
+        ]);
+        const r = new Map(out.results.map((x: any) => [x.id, x]));
+        assertEq(
+          [(r.get("n-navdump") as any).promotion.status, (r.get("n-navdump") as any).promotion.missing, row("n-navdump").verification_status],
+          ["held", ["content_quality"], "needs_review"],
+          "cj-5n-a: nav-dump description (read from the job's SELECT) -> held, missing=['content_quality']",
+        );
+        assertEq(
+          [(r.get("n-navreason") as any).promotion.status, (r.get("n-navreason") as any).promotion.missing, row("n-navreason").verification_status],
+          ["held", ["judge_reason_nav"], "needs_review"],
+          "cj-5n-b: reasoning naming the nav menu -> held, missing=['judge_reason_nav']",
+        );
+        assertEq(row("n-summit").verification_status, "verified", "cj-5n-c: summit-hike description ('til toppen') still promotes");
+        assertEq(out.totals.promoted, 1, "cj-5n-d: only the summit row promoted");
+      }
+
       // ── cj-6: match WITH promotion when all four hold + rollback. ────
       let promotedBatch = "";
       {
