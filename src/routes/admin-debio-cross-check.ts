@@ -51,6 +51,7 @@ import { buildOrganicClaimsSummary } from "../services/organic-claims-summary";
 import { getDb } from "../database/init";
 import { fetchDebioCertificateDetail, normalizeCertDetail, describeShape } from "../services/debio-cert-detail-client";
 import { fetchDebioRegister, type DebioRegisterRow } from "../services/debio-register-client";
+import { syncDebioCertDetails, debioCertDetailSyncEnabled, certDetailStatus } from "../services/debio-cert-detail-sync";
 
 const router = Router();
 
@@ -402,6 +403,69 @@ router.post("/cert-detail-probe", async (req: Request, res: Response) => {
     res.json(await certDetailProbe(sid));
   } catch (err: any) {
     res.status(500).json({ success: false, error: "cert-detail probe failed", detail: err?.message || String(err) });
+  }
+});
+
+// ─── Økologi S4b-2: weekly certificate-detail storage ────────────────
+// POST /admin/debio/cert-detail-sync   body { dry_run?: boolean, max?: 1–50 }
+//   Runs syncDebioCertDetails() once (services/debio-cert-detail-sync.ts).
+//   dry_run defaults to TRUE: one register call, candidates / ids reported,
+//   no detail calls, no writes. dry_run:false stores into
+//   agent_debio_cert_detail only (2 s between detail calls). Runs regardless
+//   of RFB_DEBIO_CERT_DETAIL_SYNC (manual ops); the 6-hourly scheduler runs
+//   only with the flag on. Invalid dry_run / max → 400.
+// GET /admin/debio/cert-detail-status
+//   Counts and fetched_at range only — no labels, names or ids.
+let certDetailSyncFetch: typeof fetch | undefined;
+let certDetailSyncRegisterFetch: typeof fetch | undefined;
+let certDetailSyncDelayMs: number | undefined;
+let certDetailSyncNow: Date | undefined;
+/** Tests only: the detail fetch, register fetch, delay and clock used by POST /cert-detail-sync (undefined = real). */
+export function __setCertDetailSyncForTesting(o: { fetchImpl?: typeof fetch; registerFetchImpl?: typeof fetch; delayMs?: number; now?: Date } | undefined): void {
+  certDetailSyncFetch = o?.fetchImpl;
+  certDetailSyncRegisterFetch = o?.registerFetchImpl;
+  certDetailSyncDelayMs = o?.delayMs;
+  certDetailSyncNow = o?.now;
+}
+
+router.post("/cert-detail-sync", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const raw = req.body;
+  if (raw !== undefined && raw !== null && (typeof raw !== "object" || Array.isArray(raw))) {
+    res.status(400).json({ success: false, error: "body must be a JSON object" });
+    return;
+  }
+  const body = (raw ?? {}) as Record<string, unknown>;
+  if (body.dry_run !== undefined && typeof body.dry_run !== "boolean") {
+    res.status(400).json({ success: false, error: "dry_run must be a boolean" });
+    return;
+  }
+  if (body.max !== undefined && (typeof body.max !== "number" || !Number.isInteger(body.max) || body.max < 1 || body.max > 50)) {
+    res.status(400).json({ success: false, error: "max must be an integer 1–50" });
+    return;
+  }
+  const dryRun = body.dry_run !== false;
+  try {
+    const result = await syncDebioCertDetails(getDb(), {
+      dryRun,
+      maxPerRun: body.max as number | undefined,
+      fetchImpl: certDetailSyncFetch,
+      registerFetchImpl: certDetailSyncRegisterFetch,
+      delayMs: certDetailSyncDelayMs,
+      now: certDetailSyncNow,
+    });
+    res.json({ success: result.ok, ...result });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: "cert-detail sync failed", detail: err?.message || String(err) });
+  }
+});
+
+router.get("/cert-detail-status", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    res.json({ ok: true, flag_enabled: debioCertDetailSyncEnabled(), ...certDetailStatus(getDb()) });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: "cert-detail status failed", detail: err?.message || String(err) });
   }
 });
 

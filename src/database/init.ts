@@ -4147,6 +4147,32 @@ function initSchema(db: Database.Database): void {
     console.error("Migration debio register (økologi S1) failed:", err);
   }
 
+  // ─── Økologi S4b-2: Debio certificate-detail lines, stored weekly ────────
+  // Written only by syncDebioCertDetails() (services/debio-cert-detail-sync.ts),
+  // behind RFB_DEBIO_CERT_DETAIL_SYNC (off by default) or via
+  // POST /admin/debio/cert-detail-sync. One row per agent; nothing reads the
+  // lines yet (S4c). lines_json holds only {label, statusCode, statusText,
+  // organic} per line — never partnerFullName or any other Debio name /
+  // street (S1.6). ok=0 rows carry a body-free last_error and wait 7 days.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_debio_cert_detail (
+        agent_id TEXT PRIMARY KEY,
+        enquiry_orig_sid INTEGER,
+        fetched_at TEXT NOT NULL,
+        ok INTEGER NOT NULL,
+        recognized INTEGER NOT NULL DEFAULT 0,
+        lines_json TEXT,
+        status_counts_json TEXT,
+        organic_line_count INTEGER NOT NULL DEFAULT 0,
+        line_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT
+      )
+    `);
+  } catch (err) {
+    console.error("Migration agent_debio_cert_detail (økologi S4b-2) failed:", err);
+  }
+
 
   // ─── Phase 0 (orch-pr-20260614-5): products catalog table ────────────────
   // Queryable product catalog seeded from agent_knowledge.products via
