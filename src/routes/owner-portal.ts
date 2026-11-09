@@ -1173,6 +1173,7 @@ const PORTAL_PALETTE_CSS = `
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     line-height: 1.6;
   }
+  button, input, select, textarea { font-family: inherit; }
   a { color: #2D5016; }
   .ep-shell { max-width: 720px; margin: 0 auto; padding: 24px 16px 80px; }
   .ep-topbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 24px; }
@@ -1231,6 +1232,7 @@ const PORTAL_PALETTE_CSS = `
   .ep-stat-label { font-size: 0.78rem; color: #737373; }
   .ep-audit-list { list-style: none; padding: 0; margin: 0; }
   .ep-audit-item { padding: 10px 0; border-bottom: 1px solid #f0f0e8; font-size: 0.88rem; }
+  .ep-audit-item { overflow-wrap: anywhere; word-break: break-word; }
   .ep-audit-item:last-child { border-bottom: none; }
   .ep-audit-meta { color: #737373; font-size: 0.78rem; }
   .ep-form-actions { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; }
