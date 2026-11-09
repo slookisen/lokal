@@ -53657,3 +53657,24 @@ runSerial(async () => {
     failures.push("hidden-row-n1: unexpected error: " + String(err?.message || err));
   }
 });
+
+// Eierkrav E1: GET /admin/claims/auto-approval-audit — read-only audit of
+// automatic owner-claim approvals (assessment, CRM thread, claim_approved
+// message, delivery within 1 h → verdict). Own in-memory DB pinned on getDb(),
+// swaps ADMIN_KEY / ANALYTICS_ADMIN_KEY and the claim flags (restored in
+// finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── eierkrav E1: auto-approval-audit ──");
+  try {
+    const { runClaimAutoApprovalAuditE1Tests } = require("../src/routes/claim-auto-approval-audit-e1.test") as
+      typeof import("../src/routes/claim-auto-approval-audit-e1.test");
+    const r = await runClaimAutoApprovalAuditE1Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("claim-auto-approval-audit-e1: " + f);
+    console.log(`  claim-auto-approval-audit-e1: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("claim-auto-approval-audit-e1: unexpected error: " + String(err?.message || err));
+  }
+});
