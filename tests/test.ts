@@ -52813,6 +52813,26 @@ runSerial(async () => {
   }
 });
 
+// økologi S4b-1: normalizeCertDetail() reads Debio's real getcertificatedetail
+// format (top-level certificateDetailPos[]; partnerFullName never read). Pins
+// the getDb() singleton and sets ADMIN_KEY / clears DEBIO_REGISTER_EXTRA_CA_PEM
+// (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── økologi S4b-1: sertifikatdetalj, ekte Debio-format ──");
+  try {
+    const { runDebioCertDetailS4b1Tests } = require("../src/services/debio-cert-detail-s4b1.test") as
+      typeof import("../src/services/debio-cert-detail-s4b1.test");
+    const r = await runDebioCertDetailS4b1Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("debio-cert-detail-s4b1: " + f);
+    console.log(`  debio-cert-detail-s4b1: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("debio-cert-detail-s4b1: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // A2A dev-request 2026-10-21-rfb-produktimport-fra-egen-nettside, Skive 1:
 // product extractor (Shopify / WooCommerce / JSON-LD / grounded LLM tiers,
 // robots.txt, same-host + SSRF) and the flag-gated dry-run measurement
