@@ -3,7 +3,8 @@
  * dev-request 2026-10-30-rfb-eierportal-testrunde-1, D3).
  *
  *   p1-*   «Slik fungerer bestillinger» (ORDER_CAP_V2_ENABLED): the heading and
- *          the four limit lines, «hindre misbruk», «per dag», never «døgn».
+ *          the four limit lines, «per dag», never «døgn» (the «hindre misbruk»
+ *          opening was dropped in tekstpakke B punkt 1).
  *   p2-*   level preview «Godt å vite» (the constant in page.ts).
  *   p3-*   «Du har ingen varer som kan bestilles ennå.» (both variants).
  *   p4-6   Varer texts (owner-items-view).
@@ -53,13 +54,13 @@ export async function runOwnerTekstpakkeATests(opts: { log?: boolean } = {}): Pr
     const expected = [
       "Hvor mange bestillinger kan du få?",
       "Mange ulike kunder kan bestille fra deg samme dag.",
-      "For å hindre misbruk kan én kunde ha høyst 3 ubesvarte bestillinger hos deg om gangen, og sende deg høyst 10 nye bestillinger per dag.",
+      "Én kunde kan ha høyst 3 ubesvarte bestillinger hos deg om gangen, og sende deg høyst 10 nye bestillinger per dag.",
       "Får du flere enn 50 bestillinger på én dag, tar vi ikke imot flere til deg resten av dagen. Kundene får da kontaktinformasjonen din i stedet.",
       "En dag regnes fra midnatt til midnatt.",
     ];
     ok(JSON.stringify(lines) === JSON.stringify(expected), "p1-01: the heading and the four limit lines are the approved text (defaults 3/10/50)");
     const joined = lines.join(" ");
-    ok(!joined.includes("stoppe misbruk") && !joined.includes("døgn") && joined.includes("per dag"), "p1-02: «hindre misbruk», «per dag», no «døgn»");
+    ok(!joined.includes("misbruk") && !joined.includes("døgn") && joined.includes("per dag"), "p1-02: no «misbruk» (tekstpakke B), «per dag», no «døgn»");
 
     // ── 2. Level preview «Godt å vite» ───────────────────────────────────────
     const pageSrc = src("owner-features/page.ts");

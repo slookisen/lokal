@@ -93,7 +93,7 @@ export const OWNER_SHELL_TEXTS = {
   /** T15b: screen-reader text after the Varer badge ({n} ≥ 1). */
   itemsBadge: ", {n} bør bekreftes",
   /** T15c: the line left on Oversikt where the «Varer» card was. */
-  itemsMoved: "Varene dine har nå en egen side.",
+  itemsMoved: "Varene dine finner du under «Varer».",
   /** T15c: its link to the Varer page. */
   itemsMovedLink: "Gå til Varer",
 } as const;

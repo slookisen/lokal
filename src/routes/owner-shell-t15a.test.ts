@@ -343,6 +343,26 @@ export async function runOwnerShellT15aTests(opts: { log?: boolean } = {}): Prom
     };
     const noItemsCard = (h: string) => dropDiv(dropDiv(h, `<div class="ep-card" id="bestillbare-varer" data-items-card="t13">`), `<div class="ep-card" id="bestillbare-varer" data-items-moved="t15c">`);
     const noNewsQuestion = (h: string) => h.replace(/<div class="mv-question" data-news-question="1"[\s\S]*?<\/form>\n        <\/div>/, "");
+    /**
+     * Tekstpakke B (2026-11-09), shell on only: the top card has no «Logg ut» (the menu has it) and no
+     * intro; the intro stands in «Profilinformasjon» with the new wording; «Gå til varene dine» goes to
+     * the Varer page. Put back the flag-off form so the rest of the page can be compared byte for byte.
+     */
+    const noTekstpakkeB = (h: string) => {
+      const pr = require("./owner-portal") as typeof import("./owner-portal");
+      return h
+        .replace(/<div class="ep-card">\n        <h1 style="margin:0;">([^<]*)<\/h1>\n/, (_m, name) => `<div class="ep-card">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+          <h1 style="margin:0;">${name}</h1>
+          <form method="post" action="/eier/${encodeURIComponent(ON_ID)}/logout" style="margin:0;">
+            <button type="submit" class="ep-btn ep-btn-ghost" aria-label="Logg ut">Logg ut</button>
+          </form>
+        </div>
+        <p>Rediger profilinformasjonen din. Endringer logges og er synlige for support.</p>
+`)
+        .replace(`<h2>Profilinformasjon</h2>\n        <p>${pr.OWNER_PORTAL_PROFILE_INTRO}</p>`, `<h2>Profilinformasjon</h2>`)
+        .split(`href="/eier/${encodeURIComponent(ON_ID)}/varer">Gå til varene dine`).join(`href="/eier/${encodeURIComponent(ON_ID)}/portal#bestillbare-varer">Gå til varene dine`);
+    };
     for (const p of PAGES) {
       const r = on[`${p}:${ON_ID}`];
       const h = r.html;
@@ -375,6 +395,7 @@ export async function runOwnerShellT15aTests(opts: { log?: boolean } = {}): Prom
         : stripped.replace(sh.OWNER_SHELL_MAIN_OPEN, "").replace(/<\/main>(\s*<\/div>\s*<\/body>)/, "$1");
       // T15d: with the shell, «Se all statistikk» goes to the Statistikk page (else the /selger tab).
       if (p === "valg") stripped = stripped.split(`href="${sh.ownerStatsPagePath(ON_ID)}">Se all statistikk`).join(`href="${sh.ownerShellStatsHref(ON_ID)}">Se all statistikk`);
+      stripped = noTekstpakkeB(stripped);
       if (p === "portal") stripped = noItemsCard(noOverview(stripped).replace(`<div class="ep-card" id="profil">`, `<div class="ep-card">`));
       // Tekstpakke A F-b: under the shell, «Mine ordrer» drops its «← Eierportalen» link (the menu has it).
       const noBackLink = (x: string) => x.replace(`<p class="mo-sub"><a href="/eier/${ON_ID}/portal">← Eierportalen</a></p>\n`, "");
@@ -405,7 +426,7 @@ export async function runOwnerShellT15aTests(opts: { log?: boolean } = {}): Prom
       "anchors: the Stripe return /portal?status=payments_return#forhandsbetaling lands on the portal's card, in the shell");
     const stripeStripped = noItemsCard(noOverview(stripe.html.replace(`\n  ${sh.renderOwnerShellStart({ agentId: ON_ID, current: "oversikt", profileSlug: `skallgard-${ON_ID}`, counts, itemsPage: true, statsPage: true })}`, "")
       .replace(sh.OWNER_SHELL_MAIN_OPEN, "")).replace(/<\/main>(\s*<\/div>\s*<\/body>)/, "$1").replace(`<div class="ep-card" id="profil">`, `<div class="ep-card">`));
-    assertEq(stripeStripped, noItemsCard(before["portal:stripe"].html), "anchors: the Stripe return page is the flag-off page plus the shell");
+    assertEq(noTekstpakkeB(stripeStripped), noItemsCard(before["portal:stripe"].html), "anchors: the Stripe return page is the flag-off page plus the shell");
 
     // Mine valg: the T9 status line and script are still there, inside the page.
     const valgOn = on[`valg:${ON_ID}`].html;

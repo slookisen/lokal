@@ -13,7 +13,7 @@
 //                      "needs_action" — only while that card is shown
 //                      (ownerOrderabilityPortalEnabledFor), since the badge
 //                      and the row link to it.
-//   visibility         «Skjult for kunder» when /produsent/<slug> is not
+//   visibility         «Ikke synlig for kunder ennå» when /produsent/<slug> is not
 //                      served (hasProducerPage + is_active); «På pause» when
 //                      «Profilen er synlig» (visibility.profile, the owner
 //                      pause row) is off or the public page shows the pause

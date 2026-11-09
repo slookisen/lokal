@@ -188,7 +188,7 @@ export async function runOwnerItemsPageT15cTests(opts: { log?: boolean } = {}): 
   const sh = require("../owner-ui/shell") as typeof import("../owner-ui/shell");
   const card = require("./owner-items-card") as typeof import("./owner-items-card");
   const T = sh.OWNER_SHELL_TEXTS;
-  assertEq([T.items, T.itemsMoved, T.itemsMovedLink], ["Varer", "Varene dine har nå en egen side.", "Gå til Varer"], "unit: the page title and the moved line are in OWNER_SHELL_TEXTS");
+  assertEq([T.items, T.itemsMoved, T.itemsMovedLink], ["Varer", "Varene dine finner du under «Varer».", "Gå til Varer"], "unit: the page title and the moved line are in OWNER_SHELL_TEXTS");
   assertEq(sh.ownerShellLinks("u 1", "").varer, "/eier/u%201/portal#bestillbare-varer", "unit: without the Varer page the link is as in T15a");
   assertEq(sh.ownerShellLinks("u 1", "", true).varer, "/eier/u%201/varer", "unit: with the Varer page the link is /eier/:id/varer");
   assertEq(sh.ownerItemsPagePath(`x"><i>`), "/eier/x%22%3E%3Ci%3E/varer", "unit: the Varer path encodes the agent id");
@@ -387,7 +387,9 @@ export async function runOwnerItemsPageT15cTests(opts: { log?: boolean } = {}): 
     // Same rows as the portal card had (flag off), apart from the hidden field.
     const oldCard = divAt(before[`portal:${BUSY}`].html, CARD);
     assertTrue(oldCard.length > 0, "rows: the old portal card is there with the flag off");
-    assertEq(vCard.split(BACK_INPUT).join(""), oldCard, "rows: the Varer page's card = the portal card before (byte-identical without tilbake=varer)");
+    // Tekstpakke B: on the Varer page the card has no second «Varer» heading (the page's <h1> is «Varer»).
+    assertEq(vCard.split(BACK_INPUT).join(""), oldCard.replace(`${CARD}\n        <h2>Varer</h2>`, CARD),
+      "rows: the Varer page's card = the portal card before (byte-identical without tilbake=varer and the card's own «Varer» heading)");
     const rowIds = (h: string) => [...h.matchAll(/<li class="ep-audit-item" id="vare-([^"]+)"/g)].map((m) => m[1]);
     assertEq(rowIds(vCard), rowIds(oldCard), "rows: same rows in the same order");
     assertEq(rowIds(vCard).length, 5, "rows: all five fixture rows");
@@ -413,7 +415,7 @@ export async function runOwnerItemsPageT15cTests(opts: { log?: boolean } = {}): 
     const moved = divAt(portalOn, MOVED);
     assertEq(moved, `${MOVED}
         <h2>Varer</h2>
-        <p>Varene dine har nå en egen side. <a href="/eier/${BUSY}/varer">Gå til Varer</a></p>
+        <p>Varene dine finner du under «Varer». <a href="/eier/${BUSY}/varer">Gå til Varer</a></p>
       </div>`, "portal: #bestillbare-varer keeps one line and a link to the Varer page");
     assertEq(count(portalOn, `id="bestillbare-varer"`), 1, "portal: one #bestillbare-varer anchor");
     assertTrue(!portalOn.includes(CARD) && !portalOn.includes(`/varer/c-old1/bekreft`) && !portalOn.includes(`/varer/bekreft-alle`) && !portalOn.includes(`/varer/ny"`),

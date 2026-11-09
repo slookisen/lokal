@@ -349,9 +349,9 @@ export async function runOwnerStatsPageT15dTests(opts: { log?: boolean } = {}): 
     assertEq(J.funnel, { discovered: 42, viewed: 6, contactClicked: 6 }, "parity: fixture sanity (funnel)");
     assertEq(tile(sh2, "data-stat", "discovered"), String(J.funnel.discovered), "parity: Oppdaget = funnel.discovered");
     assertEq(tile(sh2, "data-stat", "seen"), String(J.year.humanViews.value), "parity: Sett = year.humanViews.value");
-    assertTrue(sh2.includes(`Sett (${J.year.labels.nb.humanViews})`), "parity: Sett carries year.labels.nb.humanViews");
+    assertTrue(sh2.includes(`Besøk på profilsiden (${J.year.labels.nb.humanViews})`), "parity: Besøk på profilsiden carries year.labels.nb.humanViews");
     assertEq(tile(sh2, "data-stat", "contactClicked"), String(J.funnel.contactClicked), "parity: Kontakt-klikk = funnel.contactClicked");
-    assertTrue(sh2.includes(`Kontakt-klikk (${J.windowDays}d)`), "parity: the window is windowDays");
+    assertTrue(sh2.includes(`Trykk på e-post, telefon eller nettside (siste ${J.windowDays} dager)`), "parity: the window is windowDays");
     assertEq(tile(sh2, "data-stat", "aiAll"), String(J.year.aiViews.value), "parity: Alle AI-assistenter = year.aiViews.value");
     assertEq([tile(sh2, "data-stat", "chatgpt"), tile(sh2, "data-stat", "claude"), tile(sh2, "data-stat", "aiOther")],
       [String(J.aiPlatforms.chatgpt), String(J.aiPlatforms.claude), String(J.aiPlatforms.other)], "parity: ChatGPT / Claude / Andre AI = aiPlatforms");
@@ -359,7 +359,13 @@ export async function runOwnerStatsPageT15dTests(opts: { log?: boolean } = {}): 
     assertEq([tile(sh2, "data-stat", "dlWindow"), tile(sh2, "data-stat", "dlAllTime")], [String(J.aiDeliveries.window.total), String(J.aiDeliveries.allTime.total)],
       "parity: Med i AI-søk = aiDeliveries.window/allTime.total");
     const sources = Object.fromEntries([...sh2.matchAll(/<div class="ow-st-src" data-source="([^"]+)" data-count="(\d+)">/g)].map((m) => [unesc(m[1]), Number(m[2])]));
-    assertEq(sources, J.viewsBySource.totals, "parity: views by source = viewsBySource.totals");
+    // Tekstpakke B punkt 11: «organic» has no name of its own; its count is shown under «direct».
+    const wantSources: Record<string, number> = {};
+    for (const [k, v] of Object.entries(J.viewsBySource.totals as Record<string, number>)) {
+      const into = k === "organic" ? "direct" : k;
+      wantSources[into] = (wantSources[into] || 0) + v;
+    }
+    assertEq(sources, wantSources, "parity: views by source = viewsBySource.totals (organic counted under direct)");
     const terms = [...sh2.matchAll(/<li class="ow-st-row" data-term-count="(\d+)"><span>([^<]*)<\/span>/g)].map((m) => ({ term: unesc(m[2]), count: Number(m[1]) }));
     assertEq(terms, J.matchingSearchQueries, "parity: search terms (text and count, in order) = matchingSearchQueries");
     const channels = [...sh2.matchAll(/<li class="ow-st-row" data-channel="([^"]+)"><span>[^<]*<\/span><span class="ow-st-meta">(\d+)<\/span>/g)].map((m) => ({ source: unesc(m[1]), count: Number(m[2]) }));
@@ -381,7 +387,7 @@ export async function runOwnerStatsPageT15dTests(opts: { log?: boolean } = {}): 
     // ── Escaping ────────────────────────────────────────────────────────────
     assertTrue(!sh2.includes(`<script>alert`) && !sh2.includes(EVIL_TERM), "escape: the raw search term is not in the page");
     assertTrue(sh2.includes(`<span>&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt; &amp; &quot;egg&quot;</span>`), "escape: the search term with <script> and \" is shown as text");
-    assertTrue(sh2.includes(`Ekstern lenke (&lt;b&gt;x&lt;/b&gt;)`) && !sh2.includes("<b>x</b>"), "escape: a contact-click kind is shown as text");
+    assertTrue(sh2.includes(`Lenke til (&lt;b&gt;x&lt;/b&gt;)`) && !sh2.includes("<b>x</b>"), "escape: a contact-click kind is shown as text");
 
     // ── Failure: the stats read throws → 200, «—», one line ────────────────
     db.exec("ALTER TABLE agent_metrics RENAME TO agent_metrics_t15d_off");

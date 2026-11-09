@@ -14,73 +14,89 @@
 //     bars are <meter> elements and the 30-day trend is an SVG;
 //   - a failed read (stats === null) shows «—» and one short line.
 //
-// Every text is in OWNER_STATS_PAGE_TEXTS. Apart from `readFailed`, they are
-// the tab's own texts.
+// Every text is in OWNER_STATS_PAGE_TEXTS (tekstpakke B wording; the /selger
+// tab keeps its own, older texts in selger.html).
 
 import type { OwnerStats } from "../services/owner-stats-service";
 
-/** Every text the page shows. `readFailed` is new in T15d; the rest is the /selger tab's. */
+/**
+ * Every text the page shows. `readFailed` is new in T15d; the rest started as
+ * the /selger tab's texts and was reworded in tekstpakke B (approved
+ * 2026-11-09). The /selger tab (src/public/selger.html) has its own copies
+ * and keeps its old wording. Day counts come from the payload (`{wd}`,
+ * `{days}`), never a literal «Nd».
+ */
 export const OWNER_STATS_PAGE_TEXTS = {
   title: "Statistikk",
   readFailed: "Statistikken kunne ikke hentes akkurat nå. Prøv igjen senere.",
   emptyTitle: "Ingen aktivitet registrert ennå",
-  emptyIntro: "Profilen din er ny, så det er helt normalt at tallene under står på null. Her er noen konkrete grep for å komme i gang:",
+  emptyIntro: "Profilen din er ny, så det er helt normalt at tallene under står på null. Her er noen grep for å komme i gang:",
   emptyTips: [
-    "Fyll ut profilen fullstendig (om gården/bedriften, kontaktinfo og åpningstider) — jo mer komplett profilen er, jo lettere er det for AI-assistenter og søk å finne og anbefale deg.",
-    "Legg til produkter under «Produkter»-fanen, så har besøkende og AI-assistenter noe konkret å vise fram.",
-    "Del lenken til produsentprofilen din (/produsent/<din-url>) i egne kanaler, for eksempel sosiale medier eller nyhetsbrev.",
-    "Sørg for at kontaktinformasjonen (e-post, telefon, nettside) er komplett, så kontakt-klikk kan telles og tilskrives riktig.",
+    "Fyll ut profilen: om gården, kontaktinformasjon og åpningstider. Jo mer som står der, jo lettere er det for søk og AI-assistenter å finne og anbefale deg.",
+    "Legg inn varer under «Varer», så har kunder og AI-assistenter noe å vise fram.",
+    "Del lenken til profilen din (under «Se profilen din») i egne kanaler, for eksempel sosiale medier eller nyhetsbrev.",
+    "Sjekk at e-post, telefon og nettside stemmer, så kundene når deg.",
   ],
-  funnelTitle: "Trakt: oppdaget → sett → kontakt-klikk",
-  funnelHint: "«Sett» (sidevisninger fra mennesker) gjelder perioden på kortet, som på profilsiden din. «Kontakt-klikk» er siste {wd} dager. «Oppdaget» er en gammel livstidsteller (vises i søkeresultater) som blander folk, roboter og AI; se «Med i AI-søk» under for AI. Kontakt-klikk viser klikk-interesse — ikke bekreftet kontakt.",
-  funnelDiscovered: "Oppdaget (gammel livstidsteller)",
-  funnelSeen: "Sett ({label})",
-  funnelSeenBare: "Sett",
-  funnelContact: "Kontakt-klikk ({wd}d)",
-  funnelContactBare: "Kontakt-klikk",
-  aiFunnelTitle: "Trakt fra AI: sendt til AI → klikk fra AI-svar → kontakt-klikk",
-  aiFunnelHint: "«Sendt til AI» er hvor mange ganger profilen din var blant treffene en AI-assistent hentet. «Klikk fra AI-svar» er besøk fra folk som klikket seg inn på profilen fra et svar i en AI-assistent (ChatGPT, Claude, Perplexity …). Tallet er et minimum: ikke alle AI-er og nettlesere sier fra hvor besøket kom fra, så noen klikk blir ikke med. «Kontakt-klikk» er klikk på e-post, telefon og nettside på profilen din; «etter klikk fra AI-svar» er de som kom fra et AI-svar. Siste {days} dager, eller fra datoen på kortet.",
-  aiFunnelSent: "Sendt til AI ({label})",
-  aiFunnelClicks: "Klikk fra AI-svar ({label}, minst)",
-  aiFunnelContact: "Kontakt-klikk ({label})",
-  aiFunnelFromAi: "hvorav etter klikk fra AI-svar:",
-  aiFunnelDefaultLabel: "siste {days} d",
-  aiFunnelVendorTitle: "Klikk fra AI-svar per AI",
-  aiFunnelNoClicks: "Ingen klikk fra AI-svar registrert ennå.",
-  viewsTitle: "Visninger fra mennesker etter kilde (siste {wd} dager)",
+  /** «siste N dager» — the window label wherever the payload has no label of its own. */
+  windowLabel: "siste {days} dager",
+  funnelTitle: "Fra visning til kontakt",
+  funnelHint: "Besøk gjelder perioden på kortet, som på profilsiden din. Trykk på e-post, telefon og nettside gjelder de siste {wd} dagene. Et trykk viser at noen var interessert, ikke at de fikk tak i deg. «Vist i søkeresultater» teller alt siden start, også roboter og AI. For AI, se «Med i treffene til AI-assistenter».",
+  funnelDiscovered: "Vist i søkeresultater (siden start, også roboter)",
+  funnelSeen: "Besøk på profilsiden ({label})",
+  funnelSeenBare: "Besøk på profilsiden",
+  funnelContact: "Trykk på e-post, telefon eller nettside (siste {wd} dager)",
+  funnelContactBare: "Trykk på e-post, telefon eller nettside",
+  aiFunnelTitle: "Fra AI-assistenter",
+  aiFunnelHint: "«Med i treffene» er hvor mange ganger profilen din var blant treffene en AI-assistent hentet. «Besøk fra et AI-svar» er folk som trykket seg inn på profilen fra et svar i ChatGPT, Claude, Perplexity eller lignende. Tallet er et minimum, fordi ikke alle sier fra hvor besøket kom fra. Trykk på e-post, telefon og nettside viser hvor mange av dem som tok kontakt. Siste {days} dager, eller fra datoen på kortet.",
+  aiFunnelSent: "Med i treffene til AI ({label})",
+  aiFunnelClicks: "Besøk fra et AI-svar ({label}, minst)",
+  aiFunnelContact: "Trykk på e-post, telefon eller nettside ({label})",
+  aiFunnelFromAi: "Av disse kom fra et AI-svar:",
+  aiFunnelDefaultLabel: "siste {days} dager",
+  aiFunnelVendorTitle: "Besøk fra AI-svar, per assistent",
+  aiFunnelNoClicks: "Ingen besøk fra AI-svar ennå.",
+  viewsTitle: "Hvor besøkene kom fra (siste {wd} dager)",
   viewsNone: "Ingen visninger registrert ennå.",
   trendTitle: "Siste 30 dager",
   trendNone: "Ingen data ennå.",
-  aiTitle: "AI-søk",
-  aiHint: "Hvor mange ganger ChatGPT, Claude og andre AI-assistenter har hentet profilen din for noen som spurte. AI-roboter som bare leser og indekserer sider, telles ikke her. Fordelingen per AI er siste {wd} dager.",
+  aiTitle: "Hentet av AI-assistenter",
+  aiHint: "Hvor mange ganger ChatGPT, Claude og andre AI-assistenter har hentet profilen din for noen som spurte. Roboter som bare leser sider for å lage register, telles ikke. Fordelingen per assistent gjelder de siste {wd} dagene.",
   aiAll: "Alle AI-assistenter ({label})",
-  aiChatgpt: "ChatGPT ({wd}d)",
-  aiClaude: "Claude ({wd}d)",
-  aiOther: "Andre AI ({wd}d)",
-  dlTitle: "Med i AI-søk",
-  dlHint: "Antall ganger profilen din var blant treffene en AI-assistent som ChatGPT eller Claude hentet for noen som spurte: et søk, et sted, en kategori eller et markedsnettverk AI-en hentet, profilsiden din, eller svar via MCP og A2A. Forsiden telles ikke. Tallet viser ikke hvor mange som så profilen. Svar AI-en gir fra sin egen hukommelse ser vi ikke, så tallet er et minimum.",
+  aiChatgpt: "ChatGPT (siste {wd} dager)",
+  aiClaude: "Claude (siste {wd} dager)",
+  aiOther: "Andre AI (siste {wd} dager)",
+  dlTitle: "Med i treffene til AI-assistenter",
+  dlHint: "Hvor mange ganger profilen din var blant treffene når en AI-assistent som ChatGPT eller Claude lette etter noe for noen: et søk, et sted, en kategori eller profilsiden din. Forsiden telles ikke. Tallet sier ikke hvor mange som så profilen. Svar AI-en gir fra egen hukommelse ser vi ikke, så tallet er et minimum.",
   dlStat: "Ganger profilen var blant treffene en AI-assistent hentet ({label})",
   dlSince: "siden {date}",
   dlAllPeriod: "hele perioden",
-  dlVendorTitle: "Per AI",
-  dlChannelTitle: "Per kanal",
+  dlVendorTitle: "Per assistent",
+  dlChannelTitle: "Hvor treffet skjedde",
   dlRowTotal: "totalt",
   termsTitle: "Søk som traff profilen din",
   termsNone: "Ingen søk registrert ennå.",
   channelsTitle: "Samtaler per kanal",
   channelsNone: "Ingen samtaler registrert ennå.",
-  clicksTitle: "Kontakt-klikk etter type",
-  clicksHint: "Klikk på e-post-, telefon- og nettside-lenker på profilen din. Dette er klikk-interesse, ikke en bekreftelse på at kunden faktisk fikk tak i deg.",
-  clicksNone: "Ingen kontakt-klikk registrert ennå.",
-  clickExternal: "Ekstern lenke ({host})",
+  clicksTitle: "Trykk på kontaktinformasjonen",
+  clicksHint: "Trykk på e-post, telefon og nettside på profilen din. Det viser interesse, ikke at kunden fikk tak i deg.",
+  clicksNone: "Ingen trykk registrert ennå.",
+  clickExternal: "Lenke til ({host})",
   unknown: "Ukjent",
-  sourceLabels: { direct: "Direkte", organic: "Organisk", search: "Søk", social: "Sosiale medier", referral: "Henvisning", unknown: "Ukjent" } as Record<string, string>,
-  channelLabels: { web: "Nettside", a2a: "A2A", mcp: "MCP", api: "API/annet" } as Record<string, string>,
+  /**
+   * Tekstpakke B punkt 11: `organic` (a visit from another page on Rett fra
+   * Bonden) has no name of its own; its count is shown under `direct`
+   * («Direkte eller fra Rett fra Bonden») — see OWNER_STATS_SOURCE_MERGE.
+   */
+  sourceLabels: { direct: "Direkte eller fra Rett fra Bonden", search: "Søkemotorer (for eksempel Google)", social: "Sosiale medier", referral: "Lenker fra andre nettsider", unknown: "Ukjent" } as Record<string, string>,
+  channelLabels: { web: "Nettside", a2a: "Andre AI-agenter (A2A)", mcp: "Direkte kobling for AI (MCP)", api: "Andre tjenester" } as Record<string, string>,
   clickKindLabels: { email: "E-post", phone: "Telefon", website: "Nettside" } as Record<string, string>,
   aiFunnelVendorLabels: { chatgpt: "ChatGPT", claude: "Claude", perplexity: "Perplexity", gemini: "Gemini", copilot: "Copilot", other: "Andre AI" } as Record<string, string>,
   dlVendorLabels: { chatgpt: "ChatGPT", claude: "Claude", perplexity: "Perplexity", other: "Andre AI", unknown: "Ukjent AI" } as Record<string, string>,
-  dlChannelLabels: { ai_page_list: "Liste- og søkesider", ai_page_profile: "Profilsiden", mcp: "MCP", a2a: "A2A" } as Record<string, string>,
+  dlChannelLabels: { ai_page_list: "Liste- og søkesider", ai_page_profile: "Profilsiden", mcp: "Direkte kobling for AI (MCP)", a2a: "Andre AI-agenter (A2A)" } as Record<string, string>,
 } as const;
+
+/** Tekstpakke B punkt 11: a source shown under another source's name (its count is added there). */
+export const OWNER_STATS_SOURCE_MERGE: Record<string, string> = { organic: "direct" };
 
 export interface OwnerStatsPageModel {
   /** The getOwnerStats() payload; null when the read failed. */
@@ -200,11 +216,11 @@ export function renderOwnerStatsSections(m: OwnerStatsPageModel): string {
   }
   const wd = n0(s.windowDays) || 60;
 
-  // Funnel. «Sett»: the 12-month tile (year.humanViews) with its label, else the window's.
+  // Funnel. «Besøk på profilsiden»: the 12-month tile (year.humanViews) with its label, else the window's.
   const f = (s.funnel || { discovered: 0, viewed: 0, contactClicked: 0 }) as OwnerStats["funnel"];
   const yr = s.year || null;
   const yrLabel = (key: string): string => (yr && yr.labels && yr.labels.nb && (yr.labels.nb as Record<string, string>)[key]) || "";
-  const seen = yr && yr.humanViews ? { n: n0(yr.humanViews.value), label: yrLabel("humanViews") } : { n: n0(f.viewed), label: `${wd}d` };
+  const seen = yr && yr.humanViews ? { n: n0(yr.humanViews.value), label: yrLabel("humanViews") } : { n: n0(f.viewed), label: fill(T.windowLabel, { days: wd }) };
   const funnel = `<div class="ep-card ow-st-card" data-stats="funnel">
         <h2>${esc(T.funnelTitle)}</h2>
         <p class="ow-st-hint">${esc(fill(T.funnelHint, { wd }))}</p>
@@ -248,7 +264,12 @@ export function renderOwnerStatsSections(m: OwnerStatsPageModel): string {
 
   // Views by source (people, the window) and the 30-day trend.
   const vbs = s.viewsBySource || { totals: {}, daily: [] };
-  const totals = vbs.totals || {};
+  const rawTotals = vbs.totals || {};
+  const totals: Record<string, number> = {};
+  for (const src of Object.keys(rawTotals)) {
+    const into = Object.prototype.hasOwnProperty.call(OWNER_STATS_SOURCE_MERGE, src) ? OWNER_STATS_SOURCE_MERGE[src] : src;
+    totals[into] = n0(totals[into]) + n0(rawTotals[src]);
+  }
   const maxTotal = Math.max(1, Object.keys(totals).reduce((mx, k) => Math.max(mx, n0(totals[k])), 0));
   const srcRows = Object.keys(totals).map((src) => {
     const c = n0(totals[src]);
@@ -274,7 +295,7 @@ export function renderOwnerStatsSections(m: OwnerStatsPageModel): string {
         <div class="ep-stats">${aiTiles}</div>
       </div>`;
 
-  // Med i AI-søk: 12 months (or «siden <dato>») and since counting started.
+  // «Med i treffene til AI-assistenter»: 12 months (or «siden <dato>») and since counting started.
   const dl = (s.aiDeliveries || {}) as Partial<OwnerStats["aiDeliveries"]>;
   const dw = (dl.window || {}) as Partial<OwnerStats["aiDeliveries"]["window"]>;
   const da = (dl.allTime || {}) as Partial<OwnerStats["aiDeliveries"]["allTime"]>;
@@ -282,7 +303,7 @@ export function renderOwnerStatsSections(m: OwnerStatsPageModel): string {
   const sinceMs = dw.countingSince ? Date.parse(dw.countingSince + "T00:00:00Z") : NaN;
   const since = Number.isNaN(sinceMs) ? "" : new Date(sinceMs).toLocaleDateString("nb-NO", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
   const partial = !!since && (m.nowMs - sinceMs) < (dwDays - 1) * DAY_MS;
-  const dlWinLabel = yrLabel("aiDeliveries") || (partial ? fill(T.dlSince, { date: since }) : `${dwDays}d`);
+  const dlWinLabel = yrLabel("aiDeliveries") || (partial ? fill(T.dlSince, { date: since }) : fill(T.windowLabel, { days: dwDays }));
   const dlRows = (labels: Record<string, string>, w: Record<string, number> | undefined, a: Record<string, number> | undefined, attr: string) =>
     Object.keys(labels).map((k) => row(esc(labels[k]), `${n0((w || {})[k])} (${esc(dlWinLabel)}) · ${n0((a || {})[k])} ${esc(T.dlRowTotal)}`, ` data-${attr}="${esc(k)}"`)).join("");
   const dlCard = `<div class="ep-card ow-st-card" data-stats="ai-deliveries">

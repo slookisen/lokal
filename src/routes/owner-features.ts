@@ -39,7 +39,7 @@ import {
 } from "../owner-features/news-consent";
 import { formatOwnerFeatureValue, ownerPageStatsFrom, renderOwnerFeaturesPageBody, renderOwnerFeaturesPageFragment, type OwnerPageModel, type OwnerPageNotice, type OwnerPageStats } from "../owner-features/page";
 import { OWNER_FRAGMENT_HEADER } from "../owner-ui/enhance";
-import { ownerDashboardActiveFor, ownerShellStatsHref, ownerStatsPagePath, renderOwnerShellStart } from "../owner-ui/shell";
+import { ownerDashboardActiveFor, ownerItemsPagePath, ownerShellStatsHref, ownerStatsPagePath, renderOwnerShellStart } from "../owner-ui/shell";
 import { ownerOverviewNewsBack, type OwnerOverviewNewsResult } from "../owner-ui/overview";
 import { ownerActionCounts, ownerItemsPageActiveFor, ownerStatsPageActiveFor } from "../owner-ui/overview-data";
 import {
@@ -385,9 +385,11 @@ export function countOwnerOrderableItems(agentId: string, db: any = getDb(), now
   return n;
 }
 
-/** Where the owner edits the items (the unified session's portal card, else /selger). */
+/** Where the owner edits the items (the Varer page, the unified session's portal card, else /selger). */
 function itemsHref(agentId: string): string {
   const id = encodeURIComponent(agentId);
+  // Tekstpakke B (N2): with the Varer page (T15c), «Gå til varene dine» goes there.
+  if (ownerItemsPageActiveFor(agentId, true)) return ownerItemsPagePath(agentId);
   // B1: with the orderability card on, it is the place to make items orderable.
   if (ownerOrderabilityPortalEnabledFor(agentId)) return `/eier/${id}/portal#bestillbare-varer`;
   return ownerUnifiedSessionEnabledFor(agentId) ? `/eier/${id}/portal#produkter` : `/selger?agent=${id}`;

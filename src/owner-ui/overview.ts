@@ -10,7 +10,8 @@
 // On /eier/:id/portal, under the page's single <h1> (the producer's name), in
 // this order:
 //   1. status badges — visibility and orders;
-//   2. «Se profilen din» (or «Skjult for kunder» without a link);
+//   2. «Se profilen din» (or, without a link, the line that the profile page
+//      is not published yet — tekstpakke B punkt 2);
 //   3. the level line from «Mine valg» (T8) with «Endre»;
 //   4. «Dette bør du gjøre nå» — the same numbers as the menu badges;
 //   5. «Dette har profilen gjort for deg» — three numbers of the S2f card;
@@ -35,7 +36,7 @@ export const OWNER_OVERVIEW_TEXTS = {
   visibility: {
     visible: "Synlig for kunder",
     paused: "På pause",
-    hidden: "Skjult for kunder",
+    hidden: "Ikke synlig for kunder ennå",
   },
   orders: {
     on: "Tar imot bestillinger",
@@ -43,7 +44,7 @@ export const OWNER_OVERVIEW_TEXTS = {
     onNoItems: "Bestillinger er på, men ingen varer kan bestilles",
   },
   publicProfile: "Se profilen din",
-  profileHidden: "Skjult for kunder",
+  profileHidden: "Profilsiden din er ikke publisert ennå, så kunder og AI-assistenter finner den ikke. Det er ikke noe du har gjort feil. Skriv til oss, så hjelper vi deg.",
   levelChange: "Endre",
   levelNone: "Se hvor aktiv du er i Mine valg.",
   todoTitle: "Dette bør du gjøre nå",
@@ -55,9 +56,9 @@ export const OWNER_OVERVIEW_TEXTS = {
   todoItemsHint: "Bekreft at de fortsatt er på lager.",
   todoNone: "Alt er i orden. Du har ingenting som venter.",
   statsTitle: "Dette har profilen gjort for deg",
-  statsHumanViews: "Sidevisninger fra mennesker",
-  statsAiViews: "AI-søk",
-  statsAiDeliveries: "Med i AI-søk",
+  statsHumanViews: "Besøk på profilsiden",
+  statsAiViews: "Hentet av AI-assistenter",
+  statsAiDeliveries: "Med i treffene til AI-assistenter",
   statsMissing: "—",
   partsTitle: "Alt i eierportalen",
   partOrders: OWNER_SHELL_TEXTS.orders,
