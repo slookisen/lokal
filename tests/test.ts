@@ -53533,6 +53533,27 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-09-02-dental-permanent-triage-needs-review-drain, slice 3c-2:
+// the dental-triage judgement file queue (AVVIS / KATALOGKLASSE), its no-LLM
+// apply step and GET /admin/dental/triage/{judge-candidates,judgement-status}.
+// Own in-memory dental/main DBs, stubbed GitHub, global fetch asserted unused —
+// runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dental-triage-judgement-job: skjønnskø (skive 3c-2) ──");
+  try {
+    const { runDentalTriageJudgementJobTests } = require("../src/services/dental-triage-judgement-job.test") as
+      typeof import("../src/services/dental-triage-judgement-job.test");
+    const r = await runDentalTriageJudgementJobTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("dental-triage-judgement-job: " + f);
+    console.log(`  dental-triage-judgement-job: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-triage-judgement-job: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // POST /admin/orders/close-stale: old RFB orders closed as cancelled /
 // legacy_cleanup with no e-mail, no trust event and no payment change; the
 // 30-day contact sweep then picks them up. Own in-memory DB, adopt-ambient

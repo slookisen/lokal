@@ -1158,6 +1158,7 @@ app.use("/admin/dental/mark-inactive", adminLimiter, adminDentalMarkInactiveRout
 // dev-request 2026-09-02-dental-permanent-triage-needs-review-drain, slice 3c-1:
 // deterministic needs_review drain. POST /admin/dental/triage/dry-run (never
 // writes) and POST /admin/dental/triage/run (503 unless DENTAL_TRIAGE_JOB_ENABLED=true).
+// Slice 3c-2: GET /admin/dental/triage/{judge-candidates,judgement-status} (read-only).
 app.use("/admin/dental/triage", adminLimiter, adminDentalTriageRoutes);
 // dev-request 2026-09-02-dental-hjemmeside-hygiene-og-brreg-gjenfinning,
 // slice 2d: one-time, safely re-runnable correction pass for
@@ -2150,6 +2151,41 @@ if (process.env.ENABLE_DENTAL === "1" && process.env.DENTAL_TRIAGE_JOB_ENABLED =
   });
   setTimeout(() => { void dentalTriageTick(); }, 20 * 60_000);
   setInterval(() => { void dentalTriageTick(); }, 6 * 3600_000);
+}
+
+// ─── dev-request 2026-09-02-dental-permanent-triage-needs-review-drain, slice
+// 3c-2: dental-triage judgements — same file-queue mechanics as the gårdssalg
+// website judgements, reading `dental-triage-judgements/` in slookisen/A2A
+// (AVVIS / KATALOGKLASSE decisions a Cloud Routine rendered) and storing them
+// through applyDentalTriageJudgements(), which re-checks every row (dental
+// write-pause, still needs_review in the 3c state) in one transaction per row.
+// Never calls an LLM, sends nothing. OFF by default:
+// DENTAL_TRIAGE_JUDGEMENT_JOB_ENABLED === "true" turns it on; flipping it back
+// is the rollback. First tick 13 minutes after boot, hourly after that; an
+// overlapping tick is skipped.
+if (process.env.ENABLE_DENTAL === "1") {
+  let dentalTriageJudgementsRunning = false;
+  const dentalTriageJudgementsTick = trackJob("dental-triage-judgements", async () => {
+    if (dentalTriageJudgementsRunning) return;
+    dentalTriageJudgementsRunning = true;
+    try {
+      const { tickDentalTriageJudgements } = await import("./services/dental-triage-judgement-job");
+      const r = await tickDentalTriageJudgements();
+      if (r.skipped_reason === "disabled") return;
+      console.log(
+        `[dental-triage-judgements] tick run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
+          `listed=${r.files_listed} processed=${r.processed.length} written=${r.written} ` +
+          `daily_cap_reached=${r.daily_cap_reached ? "yes" : "no"} ` +
+          `github_error=${r.github_error ? "yes" : "no"} envelope=${r.envelope_recorded}`,
+      );
+    } catch (err) {
+      console.error("[dental-triage-judgements] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      dentalTriageJudgementsRunning = false;
+    }
+  });
+  setTimeout(() => { void dentalTriageJudgementsTick(); }, 13 * 60_000);
+  setInterval(() => { void dentalTriageJudgementsTick(); }, 60 * 60_000);
 }
 
 // ─── dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent, Daniel

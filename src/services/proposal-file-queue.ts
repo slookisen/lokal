@@ -31,7 +31,7 @@ import { randomUUID } from "crypto";
 import type Database from "better-sqlite3";
 import { getDb as getExpDbDefault } from "../database/db-factory";
 import { getDb as getMainDbDefault } from "../database/init";
-import { enrichmentWritePauseBlock } from "./enrichment-write-pause";
+import { enrichmentWritePauseBlock, type EnrichmentVertical } from "./enrichment-write-pause";
 import { listRecentRuns, recordRun } from "./run-ledger";
 
 export const PROPOSAL_QUEUE_REPO = "slookisen/A2A";
@@ -104,6 +104,13 @@ export interface ProposalQueueConfig {
   maxFileBytes?: number;
   maxFailures?: number;
   userAgent?: string;
+  /** Additive (dental-triage judgement lane, slice 3c-2): which vertical's
+   *  enrichment write-pause gates the tick, and the run-ledger vertical.
+   *  Both default to "experiences" — every earlier caller is unchanged. A
+   *  non-experiences caller also passes its own `deps.expDb` (the ledger
+   *  tables then live in that vertical's DB). */
+  pauseVertical?: EnrichmentVertical;
+  ledgerVertical?: string;
 }
 
 export interface ProposalQueueDeps {
@@ -280,12 +287,14 @@ export async function runProposalFileQueueTick(
   const maxFileBytes = config.maxFileBytes ?? PROPOSAL_QUEUE_MAX_FILE_BYTES;
   const maxFailures = config.maxFailures ?? PROPOSAL_QUEUE_MAX_FAILURES;
   const tag = config.logTag;
+  const pauseVertical: EnrichmentVertical = config.pauseVertical ?? "experiences";
+  const ledgerVertical = config.ledgerVertical ?? "experiences";
   // run-YYYY-MM-DD-<agent>-<seq>-<vertical>; seq = HHMMSSmmm + a short random
   // suffix, because recordRun() is ON CONFLICT(run_id) DO NOTHING and two
   // ticks must never share an id.
   const runId =
     `run-${today}-${config.agent}-` +
-    `${startedAt.replace(/[^0-9]/g, "").slice(8, 17)}${randomUUID().slice(0, 6)}-experiences`;
+    `${startedAt.replace(/[^0-9]/g, "").slice(8, 17)}${randomUUID().slice(0, 6)}-${ledgerVertical}`;
   const report: ProposalQueueTickReport = {
     run_id: runId,
     skipped_reason: null,
@@ -303,8 +312,8 @@ export async function runProposalFileQueueTick(
     return report;
   }
   const mainDb = deps.mainDb ?? getMainDbDefault;
-  if (enrichmentWritePauseBlock(mainDb, "experiences")) {
-    console.log(`[${tag}] experiences write-pause is active — tick skipped, nothing fetched`);
+  if (enrichmentWritePauseBlock(mainDb, pauseVertical)) {
+    console.log(`[${tag}] ${pauseVertical} write-pause is active — tick skipped, nothing fetched`);
     report.skipped_reason = "paused";
     return report;
   }
@@ -462,7 +471,7 @@ export async function runProposalFileQueueTick(
         console.log(`[${tag}] daily cap of ${maxFilesPerDay} file(s) reached for ${today} — remaining files left for the next UTC day`);
         break;
       }
-      if (enrichmentWritePauseBlock(mainDb, "experiences")) {
+      if (enrichmentWritePauseBlock(mainDb, pauseVertical)) {
         console.log(`[${tag}] write-pause became active mid-tick — remaining files left for a later tick`);
         break;
       }
@@ -543,8 +552,8 @@ export async function runProposalFileQueueTick(
       // and recordRun() ignores a repeat.
       recordRun(
         {
-          run_id: `run-${today}-${config.agent}-github-failed-experiences`,
-          vertical: "experiences",
+          run_id: `run-${today}-${config.agent}-github-failed-${ledgerVertical}`,
+          vertical: ledgerVertical,
           agent: config.agent,
           trigger_source: "cron",
           started_at: startedAt,
@@ -562,7 +571,7 @@ export async function runProposalFileQueueTick(
       recordRun(
         {
           run_id: runId,
-          vertical: "experiences",
+          vertical: ledgerVertical,
           agent: config.agent,
           trigger_source: "cron",
           started_at: startedAt,
