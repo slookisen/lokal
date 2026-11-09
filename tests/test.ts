@@ -51420,6 +51420,27 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice
+// D4: open owner claims on thin RFB profiles go first in the nightly
+// enrichment (behind RFB_ENRICHMENT_CLAIM_PRIORITY_ENABLED, default OFF) —
+// AC D4.1–D4.4. Pins a fresh in-memory DB per block (restored in finally) —
+// runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-30-rfb-eierkrav (D4): rfb-enrichment-claim-priority ──");
+  try {
+    const { runRfbEnrichmentClaimPriorityTests } = require("../src/services/rfb-enrichment-claim-priority.test") as
+      typeof import("../src/services/rfb-enrichment-claim-priority.test");
+    const rcp = await runRfbEnrichmentClaimPriorityTests({ log: false });
+    passed += rcp.passed;
+    failed += rcp.failed;
+    for (const f of rcp.failures) failures.push("rfb-enrichment-claim-priority: " + f);
+    console.log(`  rfb-enrichment-claim-priority: ${rcp.passed} passed, ${rcp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-enrichment-claim-priority: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-11-01-rfb-hold-profilen-oppdatert («Hold profilen
 // oppdatert»): the owner refresh as the nightly run's last step behind
 // OWNER_AUTO_UPDATES_ENABLED — AC1/AC2 (fill_empty / never / automatic, the
