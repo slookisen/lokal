@@ -8,6 +8,7 @@ import { applyTestSendRedirect, TestSendNotConfiguredError } from "./send-guard"
 import { crmFromHeader } from "./crm-platform-identity";
 import { unsubscribeHeaderValues } from "./avmeld-service";
 import { claimRequestMoreBody, claimRequestMoreSignOff, claimRequestMoreSubject } from "./claim-request-more-texts";
+import { isOwnerSessionSlidingEnabled, ownerSessionMaxDays } from "./owner-session-sliding";
 
 /** One line under the eierkrav B1 buttons in the admin claim-review notice. */
 const CLAIM_REVIEW_LINK_NOTE = "Lenken åpner en bekreftelsesside og virker én gang innen 72 timer.";
@@ -737,7 +738,7 @@ export class EmailService {
   <div style="font-size:22px;font-weight:700;color:#2D5016;border-bottom:3px solid #2D5016;padding-bottom:16px;margin-bottom:24px;">Rett fra <span style="color:#D4A373;">Bonden</span></div>
   <h1 style="font-size:20px;color:#1a1a1a;">Bekreft ny adresse for bestillinger</h1>
   <p>Eieren av <strong>${safeName}</strong> har bedt om at bestillinger fra kunder på Rett fra Bonden skal sendes til denne e-postadressen.</p>
-  <p>Klikk knappen under for å bekrefte. Til du har bekreftet, går bestillingene til den gamle adressen.</p>
+  <p>Trykk på knappen under for å bekrefte. Til du har bekreftet, går bestillingene til den gamle adressen.</p>
   <p style="text-align:center;"><a href="${safeUrl}" style="display:inline-block;background:#2D5016;color:#ffffff;padding:14px 32px;text-decoration:none;border-radius:8px;font-weight:700;">Bekreft adressen</a></p>
   <p style="font-size:14px;color:#666;">Eller kopier og lim inn denne lenken i nettleseren:<br><code style="word-break:break-all;">${safeUrl}</code></p>
   <p>Lenken er gyldig i ${validHours} timer.</p>
@@ -1203,7 +1204,7 @@ Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
     <p>Profilen til <strong>${this.escapeHtml(agentName)}</strong> er nå koblet til deg, og du kan endre den selv når du vil.</p>
     <p>I eierportalen kan du:</p>
     <ul>
-      <li>rette varer, åpningstider og kontaktinfo</li>
+      <li>rette varer, åpningstider og kontaktinformasjon</li>
       <li>se hvor ofte profilen blir vist og besøkt</li>
       <li>velge om du vil få bestillinger fra kunder på e-post</li>
     </ul>
@@ -1225,7 +1226,7 @@ Hei!
 Profilen til ${agentName} er nå koblet til deg, og du kan endre den selv når du vil.
 
 I eierportalen kan du:
-- rette varer, åpningstider og kontaktinfo
+- rette varer, åpningstider og kontaktinformasjon
 - se hvor ofte profilen blir vist og besøkt
 - velge om du vil få bestillinger fra kunder på e-post
 
@@ -1665,7 +1666,19 @@ function ctaButtonHtml(opts: {
     </table>`;
 }
 
-function buildOwnerMagicLinkHtml(agentName: string, verifyUrl: string): string {
+/**
+ * Tekstpakke C punkt 5 (approved 2026-11-09): the extra sentence of the
+ * owner login e-mail, only while OWNER_SESSION_SLIDING_ENABLED is on (the
+ * session is then renewed by use); null = off, no sentence.
+ */
+export function ownerLoginSlidingSentence(env: NodeJS.ProcessEnv = process.env): string | null {
+  if (!isOwnerSessionSlidingEnabled(env)) return null;
+  return "Når du har logget inn, holder du deg innlogget på denne enheten så lenge du bruker eierportalen minst én gang i måneden, " +
+    `men høyst i ${ownerSessionMaxDays(env)} dager.`;
+}
+
+export function buildOwnerMagicLinkHtml(agentName: string, verifyUrl: string): string {
+  const sliding = ownerLoginSlidingSentence();
   const safeName = epEscape(agentName);
   const safeUrl = epEscape(verifyUrl);
   return `<!DOCTYPE html>
@@ -1693,7 +1706,7 @@ function buildOwnerMagicLinkHtml(agentName: string, verifyUrl: string): string {
 
     <h1>Hei ${safeName}!</h1>
 
-    <p>Klikk lenken under for å logge inn på eierportalen for <strong>${safeName}</strong>.</p>
+    <p>Trykk på lenken under for å logge inn på eierportalen for <strong>${safeName}</strong>.</p>
 
     ${ctaButtonHtml({ href: safeUrl, label: "Logg inn på eierportalen", color: "#2D5016", radius: "8px", margin: "18px auto", center: true })}
 
@@ -1703,9 +1716,11 @@ function buildOwnerMagicLinkHtml(agentName: string, verifyUrl: string): string {
       <code>${safeUrl}</code>
     </p>
 
-    <p>Lenken er gyldig i 7 dager.</p>
+    <p>Lenken virker én gang og er gyldig i 7 dager.</p>
 
-    <p>Hvis du ikke ba om denne innloggingen, kan du trygt ignorere e-posten.</p>
+    ${sliding ? `<p>${epEscape(sliding)}</p>
+
+    ` : ""}<p>Hvis du ikke ba om denne innloggingen, kan du trygt ignorere e-posten.</p>
 
     <div class="footer">
       <p>Mvh,<br>Rett fra Bonden — kontakt@rettfrabonden.com<br>https://rettfrabonden.com</p>
@@ -1715,15 +1730,16 @@ function buildOwnerMagicLinkHtml(agentName: string, verifyUrl: string): string {
 </html>`;
 }
 
-function buildOwnerMagicLinkText(agentName: string, verifyUrl: string): string {
+export function buildOwnerMagicLinkText(agentName: string, verifyUrl: string): string {
+  const sliding = ownerLoginSlidingSentence();
   return `Hei ${agentName}!
 
-Klikk lenken under for å logge inn på eierportalen for ${agentName}:
+Trykk på lenken under for å logge inn på eierportalen for ${agentName}:
 
 ${verifyUrl}
 
-Lenken er gyldig i 7 dager.
-
+Lenken virker én gang og er gyldig i 7 dager.
+${sliding ? `\n${sliding}\n` : ""}
 Hvis du ikke ba om denne innloggingen, kan du trygt ignorere e-posten.
 
 Mvh,

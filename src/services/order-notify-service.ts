@@ -48,7 +48,7 @@ import { isBlocked } from "./blocklist-service";
 import { emailService, EmailOptions } from "./email-service";
 import { isOrderAutocompleteEnabled } from "./order-lifecycle";
 import { PRICE_BY_AGREEMENT, PARTIAL_SUM_LABEL } from "./order-pricing";
-import { formatOsloDayLabel } from "./order-cap-notice";
+import { formatOsloDayLabel, formatOsloDayMonthLabel } from "./order-cap-notice";
 import type { StockCheckEmailInput } from "./stock-check-reminder";
 import { stockSoftExpiryActiveFor } from "./stock-soft-expiry";
 import { getSupplyGraphHardStaleDays } from "./supply-graph";
@@ -215,6 +215,12 @@ function sumLabelOf(order: OrderNotificationInput): string {
 
 const NO_PAYMENT_HTML = "<p>Ingen betaling skjer via plattformen; oppgjør ved henting som vanlig.</p>";
 const NO_PAYMENT_TEXT = "Ingen betaling skjer via plattformen; oppgjør ved henting som vanlig.";
+/**
+ * Tekstpakke C punkt 1 (approved 2026-11-09): the v2 payment line for an
+ * order without prepayment — the same sentence as the short order page
+ * (tekstpakke A). v1 (the pinned rollback template) keeps NO_PAYMENT_*.
+ */
+export const OWNER_PAY_AT_PICKUP_TEXT = "Kunden betaler deg når varene hentes. Rett fra Bonden tar ikke betalt.";
 
 function formatNok(n: number): string {
   return Number.isInteger(n) ? String(n) : n.toFixed(2).replace(".", ",");
@@ -230,8 +236,9 @@ function paymentCopy(order: OrderNotificationInput, orderRef: string): Required<
   if (order.reminder) {
     return {
       ...merged,
-      subject: `Påminnelse: henteordre venter på svar — ${orderRef}`,
-      intro: "Påminnelse: du har en henteordre via Rett fra Bonden som ikke er besvart ennå. Kunden venter på bekreftelse eller avslag",
+      // Tekstpakke C punkt 2 (approved 2026-11-09): «bestilling» in sentences.
+      subject: `Påminnelse: bestilling venter på svar — ${orderRef}`,
+      intro: "Påminnelse: du har en bestilling via Rett fra Bonden som ikke er besvart ennå. Kunden venter på svar",
     };
   }
   return merged;
@@ -313,16 +320,20 @@ ${pay.html}
 export function renderOrderNotificationEmailV2(order: OrderNotificationInput): RenderedOrderNotificationEmail {
   const orderRef = order.order_id.slice(0, 8);
   // Fase A2: the main button opens THIS order in the compact «Mine ordrer» view
-  // (per-order token, no login); «Se alle ordrene dine» needs a login.
+  // (per-order token, no login); «Se alle bestillingene dine» needs a login.
   const confirmUrl = `${APP_URL}/produsent/ordre/${encodeURIComponent(order.confirm_token)}/kompakt`;
   const allOrdersUrl = `${APP_URL}/eier/${encodeURIComponent(order.agent_id)}/ordrer`;
   const itemRows = renderItemRowsHtml(order.items);
   const itemLines = renderItemLinesText(order.items);
-  const pay = paymentCopy(order, orderRef);
+  const pay0 = paymentCopy(order, orderRef);
+  // Tekstpakke C punkt 1: no prepayment → the approved payment line (v1 unchanged).
+  const pay = pay0.text === NO_PAYMENT_TEXT
+    ? { ...pay0, html: `<p>${escHtml(OWNER_PAY_AT_PICKUP_TEXT)}</p>`, text: OWNER_PAY_AT_PICKUP_TEXT }
+    : pay0;
   const linkLabel = pay.link === DEFAULT_LINK ? "Se og bekreft bestillingen" : pay.link;
   // Only the new-order mail promises the automatic close, and only while it is switched on (never a promise the platform does not keep).
   const autoCloseLine = !order.reminder && !order.payment?.status?.startsWith("payment_") && isOrderAutocompleteEnabled()
-    ? "Du trenger bare å bekrefte eller avslå. Ordren avsluttes av seg selv etter henting." : "";
+    ? "Du trenger bare å bekrefte eller avslå. Bestillingen avsluttes av seg selv etter henting." : "";
 
   const buyerName = (order.buyer_name || "").trim() || null;
   const buyerEmail = (order.buyer_email || "").trim() || null;
@@ -353,8 +364,7 @@ export function renderOrderNotificationEmailV2(order: OrderNotificationInput): R
 <p>Hei,</p>
 <p>${escHtml(pay.intro)}:</p>
 <table style="border-collapse:collapse;font-family:sans-serif">
-  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Ordre-ref:</td><td>${escHtml(orderRef)}</td></tr>
-  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Kjøper-ref:</td><td>${escHtml(maskBuyerRef(order.buyer_ref))}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Bestilling:</td><td>${escHtml(orderRef)}</td></tr>
   ${order.pickup_time ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">Hentetid:</td><td>${escHtml(order.pickup_time)}</td></tr>` : ""}
   ${order.total_nok != null ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">${sumLabelOf(order)}:</td><td>${order.total_nok} kr</td></tr>` : ""}
 </table>
@@ -363,13 +373,13 @@ ${buyerBlockHtml}<p style="font-weight:bold;margin-bottom:4px">Varer:</p>
   ${itemRows}
 </table>
 <p><a href="${confirmUrl}" style="display:inline-block;background:#2c5b3f;color:#ffffff;padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:bold">${escHtml(linkLabel)}</a><br>
-Lenken er personlig for denne ordren — ikke del den videre.</p>
-${autoCloseLine ? `<p>${escHtml(autoCloseLine)}</p>\n` : ""}<p><a href="${allOrdersUrl}">Se alle ordrene dine</a> (krever innlogging)</p>
+Lenken er personlig for denne bestillingen. Ikke del den videre.</p>
+${autoCloseLine ? `<p>${escHtml(autoCloseLine)}</p>\n` : ""}<p><a href="${allOrdersUrl}">Se alle bestillingene dine</a> (krever innlogging)</p>
 ${pay.html}
 <p>Hilsen<br>Rett fra Bonden</p>
     `.trim();
 
-  const textContent = `Hei,\n\n${pay.intro}.\nOrdre-ref: ${orderRef}\nKjøper-ref: ${maskBuyerRef(order.buyer_ref)}${order.pickup_time ? `\nHentetid: ${order.pickup_time}` : ""}${order.total_nok != null ? `\n${sumLabelOf(order)}: ${order.total_nok} kr` : ""}\n${buyerBlockText}\nVarer:\n${itemLines}\n\n${linkLabel} (personlig lenke, ikke del videre):\n${confirmUrl}\n\n${autoCloseLine ? autoCloseLine + "\n\n" : ""}Se alle ordrene dine (krever innlogging): ${allOrdersUrl}\n\n${pay.text}\n\nHilsen\nRett fra Bonden`;
+  const textContent = `Hei,\n\n${pay.intro}.\nBestilling: ${orderRef}${order.pickup_time ? `\nHentetid: ${order.pickup_time}` : ""}${order.total_nok != null ? `\n${sumLabelOf(order)}: ${order.total_nok} kr` : ""}\n${buyerBlockText}\nVarer:\n${itemLines}\n\n${linkLabel} (personlig lenke, ikke del videre):\n${confirmUrl}\n\n${autoCloseLine ? autoCloseLine + "\n\n" : ""}Se alle bestillingene dine (krever innlogging): ${allOrdersUrl}\n\n${pay.text}\n\nHilsen\nRett fra Bonden`;
 
   return {
     subject: pay.subject,
@@ -554,16 +564,16 @@ export async function sendProducerBuyerCancelNotice(orderId: string, kind: "with
     const orderRef = o.id.slice(0, 8);
     const allOrdersUrl = `${APP_URL}/eier/${encodeURIComponent(o.agent_id)}/ordrer`;
     const what = kind === "withdraw"
-      ? `Kunden har trukket bestillingen ${orderRef} før du bekreftet den. Ordren er kansellert, og den teller ikke mot deg. Du trenger ikke gjøre noe.`
-      : `Kunden har avbestilt bestillingen ${orderRef} etter at du bekreftet den. Ordren er kansellert, så du trenger ikke holde av varene.`;
+      ? `Kunden har trukket bestillingen ${orderRef} før du bekreftet den. Bestillingen er kansellert. Du trenger ikke gjøre noe.`
+      : `Kunden har avbestilt bestillingen ${orderRef} etter at du bekreftet den. Bestillingen er kansellert, så du trenger ikke holde av varene.`;
     const itemLines = items.map((i) => `- ${i.qty ?? "?"} × ${i.name_snapshot || "Vare"}`).join("\n");
-    const textContent = `Hei,\n\n${what}\n\nVarer:\n${itemLines}\n\nSe alle ordrene dine (krever innlogging): ${allOrdersUrl}\n\nHilsen\nRett fra Bonden`;
+    const textContent = `Hei,\n\n${what}\n\nVarer:\n${itemLines}\n\nSe alle bestillingene dine (krever innlogging): ${allOrdersUrl}\n\nHilsen\nRett fra Bonden`;
     const subject = kind === "withdraw" ? `Kunden har trukket bestillingen (${orderRef})` : `Kunden har avbestilt (${orderRef})`;
     const send: SendFn = _sendOverride ?? ((opts) => emailService.sendEmail(opts));
     const res = await send({
       to: recipient.email,
       subject,
-      htmlContent: `<p>Hei,</p>\n<p>${escHtml(what)}</p>\n<p><a href="${allOrdersUrl}">Se alle ordrene dine</a> (krever innlogging)</p>\n<p>Hilsen<br>Rett fra Bonden</p>`,
+      htmlContent: `<p>Hei,</p>\n<p>${escHtml(what)}</p>\n<p><a href="${allOrdersUrl}">Se alle bestillingene dine</a> (krever innlogging)</p>\n<p>Hilsen<br>Rett fra Bonden</p>`,
       textContent,
       replyTo: DEFAULT_ORDER_NOTIFY_REPLY_TO,
       // F8: transactional, not outreach.
@@ -655,14 +665,40 @@ export async function sendProducerOrderMessageNotice(orderId: string, messageTex
  * requests. FIRST VERSION — Daniel approves this text (recorded in
  * daniel-responses/) before ORDER_CAP_NOTICE_ENABLED is turned on (AC8).
  * No buyer data in it.
+ *
+ * Tekstpakke C punkt 4: with `v2` (set by processOrderCapNotices when
+ * ORDER_CAP_V2_ENABLED is on) the digest is the platform-ceiling text;
+ * without it, byte-identical to before.
  */
-export function renderOrderCapNoticeEmail(input: { agent_id: string; count: number; cap: number; oslo_day: string }): {
+export type OrderCapNoticeInput = { agent_id: string; count: number; cap: number; oslo_day: string; v2?: boolean };
+export function renderOrderCapNoticeEmail(input: OrderCapNoticeInput): {
   subject: string; textContent: string; htmlContent: string;
 } {
-  const day = formatOsloDayLabel(input.oslo_day);
   const n = Math.max(0, Math.floor(input.count));
-  const what = n === 1 ? "1 bestilling kom" : `${n} bestillinger kom`;
   const mineUrl = `${APP_URL}/eier/${encodeURIComponent(input.agent_id)}/ordrer`;
+  if (input.v2) {
+    // Tekstpakke C punkt 4 (approved 2026-11-09), ORDER_CAP_V2_ENABLED only:
+    // the digest covers the platform ceiling alone; `cap` is the ceiling
+    // in force when the hits were recorded. No «døgn», no old cap.
+    const dayV2 = formatOsloDayMonthLabel(input.oslo_day);
+    const leadV2 = `I går (${dayV2}) fikk du mer enn ${input.cap} bestillinger gjennom Rett fra Bonden. ` +
+      (n === 1 ? "Den neste kunden fikk" : `De neste ${n} kundene fikk`) +
+      " kontaktinformasjonen din i stedet, så de kan ta kontakt med deg direkte.";
+    const subjectV2 = `${n === 1 ? "1 kunde" : `${n} kunder`} fikk kontaktinformasjonen din i går`;
+    return {
+      subject: subjectV2,
+      textContent:
+        `Hei,\n\n${leadV2}\n\n` +
+        `Se bestillingene du har fått i Mine ordrer (krever innlogging): ${mineUrl}\n\n` +
+        `Du får høyst én slik e-post per dag.\n\nHilsen\nRett fra Bonden`,
+      htmlContent:
+        `<p>Hei,</p>\n<p>${escHtml(leadV2)}</p>\n` +
+        `<p><a href="${escHtml(mineUrl)}">Se bestillingene i Mine ordrer</a> (krever innlogging)</p>\n` +
+        `<p>Du får høyst én slik e-post per dag.</p>\n<p>Hilsen<br>Rett fra Bonden</p>`,
+    };
+  }
+  const day = formatOsloDayLabel(input.oslo_day);
+  const what = n === 1 ? "1 bestilling kom" : `${n} bestillinger kom`;
   const lead = `${what} etter grensen din på ${input.cap} bestillinger per døgn i går (${day}) og ble sendt som kontaktforespørsel.`;
   const explain = "Kundene fikk kontaktinformasjonen din i stedet for å sende bestillingen, så de kan ta kontakt med deg direkte.";
   const subject = `${what} etter grensen din i går`;
@@ -678,7 +714,7 @@ export function renderOrderCapNoticeEmail(input: { agent_id: string; count: numb
 }
 
 /** B4: sends the daily digest (same gated recipient as the order e-mail). Never throws. */
-export async function sendProducerOrderCapNotice(input: { agent_id: string; count: number; cap: number; oslo_day: string }): Promise<OrderNotifyOutcome> {
+export async function sendProducerOrderCapNotice(input: OrderCapNoticeInput): Promise<OrderNotifyOutcome> {
   try {
     const recipient = resolveOrderNotificationRecipient(input.agent_id);
     if (!recipient.eligible) {

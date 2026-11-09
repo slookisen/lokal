@@ -330,7 +330,10 @@ export async function applyOrderAction(
     idempotencyKey: idemKey,
     completionSource,
     pickupTime,
-    cancelDetail,
+    // Tekstpakke C punkt 10: «Avslå – utsolgt» (a seller's decline with the
+    // sold-out choice) stores 'sold_out' on the declined order, so the
+    // decline receipt can say why. A plain decline stores nothing.
+    cancelDetail: action === "decline" && actor.role === "seller" && opts.soldOut ? "sold_out" : cancelDetail,
   });
   if (!t.success) {
     if (idemKey !== null && t.error === IDEMPOTENCY_KEY_TAKEN) {

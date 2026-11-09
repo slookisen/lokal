@@ -5617,6 +5617,8 @@ function initSchema(db: Database.Database): void {
   //   orders.cancel_detail : nullable; why the producer cancelled a confirmed
   //     order ('sold_out' | 'cannot_deliver', with cancel_reason
   //     'producer_cancelled'). NULL on every older row and every other reason.
+  //     Tekstpakke C punkt 10: also 'sold_out' on a declined order
+  //     («Avslå – utsolgt»); same column, no new migration.
   try {
     const orderCols = new Set((db.prepare(`PRAGMA table_info(orders)`).all() as Array<{ name: string }>).map((c) => c.name));
     if (!orderCols.has("cancel_detail")) db.exec(`ALTER TABLE orders ADD COLUMN cancel_detail TEXT`);

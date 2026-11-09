@@ -35,6 +35,7 @@
 import { getConfig } from "../config/vertical-config";
 import { localizedPath, Lang } from "../i18n/t";
 import { companyOperatorSentence } from "../services/company-legal";
+import { orderAutocancelHours } from "../services/order-followups";
 
 export const KJOPSVILKAR_PATH = "/kjopsvilkar";
 export const KJOPSVILKAR_LAST_UPDATED = { no: "10. oktober 2026", en: "10 October 2026" } as const;
@@ -181,8 +182,8 @@ ${angreskjemaHtml("en", mail)}
     <p><strong>Slik sorteres tilbudene.</strong> I handlelisten og tilbudssøket sorteres tilbudene etter avstand fra stedet du oppgir. Ingen produsent betaler for plassering.</p>
 
     <h2 id="bestilling">2. Slik bestiller du</h2>
-    <p>Du velger varer i handlekurven eller handlelisten og sender bestillingen. Noen produsenter tar ikke imot bestillinger gjennom oss. Da får du i stedet produsentens kontaktinformasjon og en ferdig melding, og eventuell avtale gjør du direkte med produsenten, utenfor plattformen. Forbrukerlovgivningen gjelder også da, men punktene under om bestilling, betaling og refusjon gjennom plattformen gjør det ikke.</p>
-    <p>Bestillingen er en forespørsel til produsenten til produsenten har bekreftet den. Produsenten bekrefter eller avslår. Avtalen er bindende når produsentens bekreftelse har nådd deg. Avslår produsenten, er det ingen avtale, og du betaler ingenting.</p>
+    <p>Du velger varer i handlekurven eller handlelisten og sender bestillingen. Noen produsenter tar ikke imot bestillinger gjennom oss, eller har fått mange bestillinger samme dag. Da får du i stedet produsentens kontaktinformasjon og en ferdig melding, og eventuell avtale gjør du direkte med produsenten, utenfor plattformen. Forbrukerlovgivningen gjelder også da, men punktene under om bestilling, betaling og refusjon gjennom plattformen gjør det ikke.</p>
+    <p>Bestillingen er en forespørsel til produsenten har bekreftet den. Svarer ikke produsenten innen ${orderAutocancelHours()} timer, blir bestillingen kansellert. Produsenten bekrefter eller avslår. Avtalen er bindende når produsentens bekreftelse har nådd deg. Avslår produsenten, er det ingen avtale, og du betaler ingenting.</p>
 
     <h2 id="priser">3. Priser</h2>
     <p>Prisene settes av produsenten og vises i norske kroner. Prisen som står i bestillingen, gjelder når produsenten bekrefter den. Står det ingen pris, avtaler du prisen med produsenten før henting. Er produsenten registrert i Merverdiavgiftsregisteret, er MVA inkludert.</p>
@@ -199,7 +200,7 @@ ${angreskjemaHtml("en", mail)}
 
     <h2 id="avbestilling">6. Avbestilling og endring</h2>
     <p>Vil du avbestille eller endre en bestilling, kontakter du produsenten direkte så tidlig som mulig.</p>
-    <p>Før produsenten har bekreftet bestillingen, kan du trekke den tilbake uten kostnad ved å gi produsenten beskjed. Har du forhåndsbetalt, oppheves reservasjonen når produsenten avslår, eller når fristen går ut uten bekreftelse.</p>
+    <p>Før produsenten har bekreftet bestillingen, kan du trekke den tilbake uten kostnad på bestillingssiden (lenken i e-posten fra oss) eller ved å gi produsenten beskjed. Har du forhåndsbetalt, oppheves reservasjonen når produsenten avslår, eller når fristen går ut uten bekreftelse.</p>
     <p>Etter bekreftelse er bestillingen bindende, men du kan avbestille fram til du har hentet varene (forbrukerkjøpsloven § 41). Produsenten kan da ikke kreve betaling for varene, men kan kreve erstatning for tap avbestillingen påfører produsenten, for eksempel for ferskvarer som er klargjort til deg og ikke kan selges på nytt. Har du forhåndsbetalt, får du tilbake det som overstiger et slikt tap. For varer som ikke raskt forringes, har du i tillegg angrerett, se punkt 8.</p>
     <p>Kan produsenten ikke levere etter å ha bekreftet, får du hele beløpet tilbake.</p>
 

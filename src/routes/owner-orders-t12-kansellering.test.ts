@@ -320,7 +320,8 @@ export async function runOwnerOrdersT12Tests(opts: { log?: boolean } = {}): Prom
       const b = seedOrder({ status: "pending", product: true });
       await p.post(b, { action: "decline" });
       await settle();
-      assertEq([row(a), availability(a)], [{ status: "declined", cancel_reason: null, cancel_detail: null }, "out_of_stock"], `act-06: «Avslå – utsolgt» → declined + items out of stock (${p.name})`);
+      // Tekstpakke C punkt 10: «Avslå – utsolgt» also stores the reason (cancel_detail 'sold_out') for the decline receipt.
+      assertEq([row(a), availability(a)], [{ status: "declined", cancel_reason: null, cancel_detail: "sold_out" }, "out_of_stock"], `act-06: «Avslå – utsolgt» → declined (reason sold_out) + items out of stock (${p.name})`);
       assertEq([row(b), availability(b)], [{ status: "declined", cancel_reason: null, cancel_detail: null }, "in_stock"], `act-07: «Avslå» → declined, no stock write (${p.name})`);
     }
 

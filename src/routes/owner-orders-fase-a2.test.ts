@@ -373,11 +373,11 @@ export async function runOwnerOrdersFaseA2Tests(opts: { log?: boolean } = {}): P
       };
       const off = notifySvc.renderOrderNotificationEmailV2(input);
       assertTrue(off.htmlContent.includes(">Se og bekreft bestillingen</a>") && off.htmlContent.includes("/produsent/ordre/tok123/kompakt"), "mail-01: main button «Se og bekreft bestillingen» → compact per-order view");
-      assertTrue(off.htmlContent.includes("/eier/ag-a2/ordrer") && off.textContent.includes("Se alle ordrene dine (krever innlogging)"), "mail-02: «Se alle ordrene dine» → login-protected list");
+      assertTrue(off.htmlContent.includes("/eier/ag-a2/ordrer") && off.textContent.includes("Se alle bestillingene dine (krever innlogging)"), "mail-02: «Se alle bestillingene dine» → login-protected list");
       assertTrue(!off.textContent.includes("avsluttes av seg selv"), "mail-03: switch off → no promise of an automatic close");
       process.env.ORDER_AUTOCOMPLETE_ENABLED = "1";
       const on = notifySvc.renderOrderNotificationEmailV2(input);
-      assertTrue(on.textContent.includes("Du trenger bare å bekrefte eller avslå. Ordren avsluttes av seg selv etter henting.") && on.htmlContent.includes("Ordren avsluttes av seg selv etter henting."), "mail-04: switch on → the sentence is in text and html");
+      assertTrue(on.textContent.includes("Du trenger bare å bekrefte eller avslå. Bestillingen avsluttes av seg selv etter henting.") && on.htmlContent.includes("Bestillingen avsluttes av seg selv etter henting."), "mail-04: switch on → the sentence is in text and html");
       const rem = notifySvc.renderOrderNotificationEmailV2({ ...input, reminder: true });
       assertTrue(rem.htmlContent.includes("Se og bekreft bestillingen") && rem.htmlContent.includes("/kompakt") && !rem.textContent.includes("avsluttes av seg selv"), "mail-05: the reminder links to the same place, without the sentence");
       const v1 = notifySvc.renderOrderNotificationEmailV1(input);

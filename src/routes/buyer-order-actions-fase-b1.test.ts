@@ -213,7 +213,7 @@ export async function runBuyerOrderActionsFaseB1Tests(opts: { log?: boolean } = 
       assertEq(buyerEvents(p.id).map((e) => [e.from_status, e.to_status, e.actor_role, e.channel]), [["pending", "cancelled", "buyer", "mcp"]],
         "ac6-04: one order_events row, actor_role buyer, channel mcp");
       const pm = mailsFor(p.id);
-      assertTrue(pm.length === 1 && pm[0]!.to === PRODUCER_MAIL && /trukket bestillingen/.test(pm[0]!.subject) && /teller ikke mot deg/.test(pm[0]!.textContent),
+      assertTrue(pm.length === 1 && pm[0]!.to === PRODUCER_MAIL && /trukket bestillingen/.test(pm[0]!.subject) && /Bestillingen er kansellert\. Du trenger ikke gjøre noe\./.test(pm[0]!.textContent),
         `ac6-05: the producer gets one e-mail that the buyer withdrew (got ${JSON.stringify(pm).slice(0, 200)})`);
       assertTrue(!("consumer_law_note" in r.body) && !pm[0]!.textContent.includes("kari.b1@example.com"),
         "ac6-06: a free withdraw carries no § 41 note, and the producer mail carries no buyer address");
@@ -470,9 +470,9 @@ export async function runBuyerOrderActionsFaseB1Tests(opts: { log?: boolean } = 
         items: [{ name: "Egg", qty: 1, line_total: 60 }], totalNok: 60, cancelReason: null, payment: null } as const;
       const without = receiptSvc.renderBuyerReceipt("confirmed", { ...base });
       const withCard = receiptSvc.renderBuyerReceipt("confirmed", { ...base, cardUrl: "https://rfb.test/ordre/x?ref=y" });
-      assertTrue(!!without && !without.text.includes("Ordrekort") && without.text.includes(receiptSvc.CONSUMER_CANCEL_LOSS_SENTENCE),
+      assertTrue(!!without && !without.text.includes("Bestillingen din: se den") && without.text.includes(receiptSvc.CONSUMER_CANCEL_LOSS_SENTENCE),
         "rcpt-01: without a card URL the confirmation is as before (with the § 41 sentence)");
-      assertEq(withCard?.text.replace("Ordrekort: Se bestillingen, avbestill eller si fra at du har hentet: https://rfb.test/ordre/x?ref=y\n\n", ""), without?.text,
+      assertEq(withCard?.text.replace("Bestillingen din: se den, avbestill eller si fra at du har hentet: https://rfb.test/ordre/x?ref=y\n\n", ""), without?.text,
         "rcpt-02: the card link is one added line in the confirmation");
       process.env.ORDER_BUYER_RECEIPTS_ENABLED = "1";
       const o = seedOrder({ status: "pending" });

@@ -37599,6 +37599,19 @@ const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
     failed++;
     failures.push("owner-tekstpakke-b: unexpected error: " + String(err?.message || err));
   }
+  // Tekstpakke C (approved e-mail, buyer receipt and /kjopsvilkar texts 2026-11-09; digest V2, «Avslå – utsolgt» reason) — own in-memory DB.
+  try {
+    const { runOwnerTekstpakkeCTests } = require("../src/routes/owner-tekstpakke-c.test") as
+      typeof import("../src/routes/owner-tekstpakke-c.test");
+    const tpc = await runOwnerTekstpakkeCTests({ log: false });
+    passed += tpc.passed;
+    failed += tpc.failed;
+    for (const f of tpc.failures) failures.push("owner-tekstpakke-c: " + f);
+    console.log(`  owner-tekstpakke-c: ${tpc.passed} passed, ${tpc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-tekstpakke-c: unexpected error: " + String(err?.message || err));
+  }
   // Owner pages style fixes F-a, F-c, F-d, F-e, F-f (375 px browser test, CSS only) — pure renders.
   try {
     const { runOwnerStyleFixesFTests } = require("../src/routes/owner-style-fixes-f.test") as
