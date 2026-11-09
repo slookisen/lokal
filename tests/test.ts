@@ -37566,6 +37566,19 @@ const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
     failed++;
     failures.push("owner-tekstpakke-a: unexpected error: " + String(err?.message || err));
   }
+  // Tekstpakke B (approved owner dashboard texts 2026-11-09: Oversikt, Statistikk; top «Logg ut», Varer heading, N2 link) — own in-memory DB.
+  try {
+    const { runOwnerTekstpakkeBTests } = require("../src/routes/owner-tekstpakke-b.test") as
+      typeof import("../src/routes/owner-tekstpakke-b.test");
+    const tpb = await runOwnerTekstpakkeBTests({ log: false });
+    passed += tpb.passed;
+    failed += tpb.failed;
+    for (const f of tpb.failures) failures.push("owner-tekstpakke-b: " + f);
+    console.log(`  owner-tekstpakke-b: ${tpb.passed} passed, ${tpb.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-tekstpakke-b: unexpected error: " + String(err?.message || err));
+  }
   // T15a (eierportal skall og meny, dev-request 2026-10-30-rfb-eierportal-testrunde-1 punkt 9) — own in-memory DB.
   try {
     const { runOwnerShellT15aTests } = require("../src/routes/owner-shell-t15a.test") as

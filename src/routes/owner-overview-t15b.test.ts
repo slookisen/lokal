@@ -171,7 +171,7 @@ export async function runOwnerOverviewT15bTests(opts: { log?: boolean } = {}): P
 
   // ── Unit ─────────────────────────────────────────────────────────────────
   assertEq([T.visibility.visible, T.visibility.paused, T.visibility.hidden, T.orders.on, T.orders.off, T.orders.onNoItems],
-    ["Synlig for kunder", "På pause", "Skjult for kunder", "Tar imot bestillinger", "Tar ikke imot bestillinger", "Bestillinger er på, men ingen varer kan bestilles"],
+    ["Synlig for kunder", "På pause", "Ikke synlig for kunder ennå", "Tar imot bestillinger", "Tar ikke imot bestillinger", "Bestillinger er på, men ingen varer kan bestilles"],
     "unit: the status texts are in OWNER_OVERVIEW_TEXTS");
   assertEq([ovr.ownerOverviewOrdersLine(1), ovr.ownerOverviewOrdersLine(3), ovr.ownerOverviewItemsLine(1), ovr.ownerOverviewItemsLine(2)],
     ["1 bestilling venter på svar", "3 bestillinger venter på svar", "1 vare bør bekreftes", "2 varer bør bekreftes"], "unit: singular and plural lines");
@@ -190,11 +190,11 @@ export async function runOwnerOverviewT15bTests(opts: { log?: boolean } = {}): P
   assertEq(count(pure, `<div class="ep-stat-num">—</div>`), 3, "unit: a failed stats read shows «—» three times");
   assertTrue(pure.includes(T.todoNone) && !pure.includes(`data-todo="orders"`), "unit: zero counts → «Alt er i orden…»");
   const hidden = ovr.renderOwnerOverview({ ...baseModel, visibility: "hidden" });
-  assertTrue(!hidden.includes(`href="/produsent/`) && hidden.includes(`<p class="ow-ov-line" data-ov="profile">Skjult for kunder</p>`), "unit: hidden profile → «Skjult for kunder» without a link");
+  assertTrue(!hidden.includes(`href="/produsent/`) && hidden.includes(`<p class="ow-ov-line" data-ov="profile">Profilsiden din er ikke publisert ennå, så kunder og AI-assistenter finner den ikke. Det er ikke noe du har gjort feil. Skriv til oss, så hjelper vi deg.</p>`), "unit: hidden profile → the «not published yet» line without a link");
   const paused = ovr.renderOwnerOverview({ ...baseModel, visibility: "paused", orders: "on_no_items" });
   assertTrue(paused.includes(">På pause<") && paused.includes(`href="/produsent/u-gard"`) && paused.includes(">Bestillinger er på, men ingen varer kan bestilles<"), "unit: paused keeps the profile link; on with no items");
   const withStats = ovr.renderOwnerOverview({ ...baseModel, stats: { humanViews: { value: 12, label: "siste 12 måneder" }, aiViews: { value: 3, label: "siste 12 måneder" }, aiDeliveries: { value: 7, label: "siden 1. okt. 2026" } } });
-  assertTrue(withStats.includes(`<div class="ep-stat-num">12</div><div class="ep-stat-label">Sidevisninger fra mennesker (siste 12 måneder)</div>`) && withStats.includes(`>7</div><div class="ep-stat-label">Med i AI-søk (siden 1. okt. 2026)</div>`),
+  assertTrue(withStats.includes(`<div class="ep-stat-num">12</div><div class="ep-stat-label">Besøk på profilsiden (siste 12 måneder)</div>`) && withStats.includes(`>7</div><div class="ep-stat-label">Med i treffene til AI-assistenter (siden 1. okt. 2026)</div>`),
     "unit: stats show the source's numbers and period labels");
   const tk = require("../owner-ui/tokens") as typeof import("../owner-ui/tokens");
   const tokenNames = new Set(tk.OWNER_TOKENS.map((t) => t.name));
@@ -436,8 +436,8 @@ export async function runOwnerOverviewT15bTests(opts: { log?: boolean } = {}): P
     rs.setOwnerFeatureValue("rfb", ZERO, "visibility.profile", true, { actor: "owner", detail: "test" }, { db });
     db.prepare("UPDATE agents SET catalog_hidden = 1 WHERE id = ?").run(ZERO);
     const hiddenBlock = overviewBlock((await get("portal", ZERO)).html);
-    assertTrue(hiddenBlock.includes(`data-visibility="hidden">Skjult for kunder<`) && !hiddenBlock.includes(`href="/produsent/`) && hiddenBlock.includes(`data-ov="profile">Skjult for kunder</p>`),
-      "status: profile not served → «Skjult for kunder», no link");
+    assertTrue(hiddenBlock.includes(`data-visibility="hidden">Ikke synlig for kunder ennå<`) && !hiddenBlock.includes(`href="/produsent/`) && hiddenBlock.includes(`data-ov="profile">Profilsiden din er ikke publisert ennå, så kunder og AI-assistenter finner den ikke. Det er ikke noe du har gjort feil. Skriv til oss, så hjelper vi deg.</p>`),
+      "status: profile not served → «Ikke synlig for kunder ennå» and the «not published yet» line, no link");
     db.prepare("UPDATE agents SET catalog_hidden = 0 WHERE id = ?").run(ZERO);
 
     // ── Stats = ownerPortalYearStats ────────────────────────────────────────
@@ -449,11 +449,11 @@ export async function runOwnerOverviewT15bTests(opts: { log?: boolean } = {}): P
     assertTrue(!!year, "stats: the year read works in the fixture");
     if (year) {
       assertEq([statOf(block, "humanViews"), statOf(block, "aiViews"), statOf(block, "aiDeliveries")], [
-        [String(year.humanViews.value), `Sidevisninger fra mennesker (${year.labels.nb.humanViews})`],
-        [String(year.aiViews.value), `AI-søk (${year.labels.nb.aiViews})`],
-        [String(year.aiDeliveries.value), `Med i AI-søk (${year.labels.nb.aiDeliveries})`],
+        [String(year.humanViews.value), `Besøk på profilsiden (${year.labels.nb.humanViews})`],
+        [String(year.aiViews.value), `Hentet av AI-assistenter (${year.labels.nb.aiViews})`],
+        [String(year.aiDeliveries.value), `Med i treffene til AI-assistenter (${year.labels.nb.aiDeliveries})`],
       ], "stats: the three numbers are getOwnerStats().year (ownerPortalYearStats)");
-      assertTrue(portal.includes(`<div class="ep-stat-num">${year.humanViews.value}</div><div class="ep-stat-label">Sidevisninger fra mennesker (${year.labels.nb.humanViews})</div>`),
+      assertTrue(portal.includes(`<div class="ep-stat-num">${year.humanViews.value}</div><div class="ep-stat-label">Besøk på profilsiden (${year.labels.nb.humanViews})</div>`),
         "stats: the portal's own Statistikk card shows the same human page views");
     }
 

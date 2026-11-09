@@ -34,7 +34,7 @@ import { OWNER_PORTAL_THEME_CSS, ownerThemeHtml } from "../owner-ui/tokens";
 import {
   OWNER_SHELL_MAIN_OPEN, OWNER_SHELL_PROFILE_ANCHOR, OWNER_SHELL_TEXTS, ownerDashboardActiveFor, ownerItemsPagePath, renderOwnerShellStart,
 } from "../owner-ui/shell";
-import { OWNER_OVERVIEW_NEWS_PARAM, parseOwnerOverviewNewsParam, renderOwnerOverview } from "../owner-ui/overview";
+import { OWNER_OVERVIEW_NEWS_PARAM, OWNER_OVERVIEW_TEXTS, parseOwnerOverviewNewsParam, renderOwnerOverview } from "../owner-ui/overview";
 import { buildOwnerOverviewModel, countPendingOrders, ownerActionCounts, ownerItemsPageActiveFor, ownerStatsPageActiveFor } from "../owner-ui/overview-data";
 import { OWNER_STATS_PAGE_TEXTS, renderOwnerStatsPageBody } from "../owner-ui/stats-page";
 import { ownerPauseEnabled, isOwnerPaused, readOwnerPauseRow } from "../services/agent-visibility";
@@ -1925,7 +1925,7 @@ export function ownerFeaturesMovedCardHtml(agentId: string): string {
   const id = encodeURIComponent(agentId);
   return `<div class="ep-card" id="bestillinger">
         <h2>Bestillinger og pause</h2>
-        <p style="margin-bottom:12px;color:#737373;font-size:0.88rem;">Om du tar imot bestillinger, hvilken adresse de sendes til, og pause av profilen, velger du nå i «Mine valg».</p>
+        <p style="margin-bottom:12px;color:#737373;font-size:0.88rem;">Bestillinger, adressen de sendes til og pause velger du i «Mine valg».</p>
         <a class="ep-btn ep-btn-secondary" href="/eier/${id}/valg#gruppe-orders">Gå til bestillinger i Mine valg</a>
         <a class="ep-btn ep-btn-secondary" href="/eier/${id}/valg#gruppe-visibility">Gå til pause i Mine valg</a>
       </div>`;
@@ -2302,8 +2302,8 @@ function renderOwnerPortalPage(req: Request, res: Response, addForm: OwnerItemsA
       ${stat("Google-vurdering", knowledge.google_rating)}
       ${stat("Google-anmeldelser", knowledge.google_review_count)}
       ${stat("TripAdvisor", knowledge.tripadvisor_rating)}
-      ${stat(ownerYear ? `Sidevisninger fra mennesker (${ownerYear.labels.nb.humanViews})` : "Sidevisninger fra mennesker", ownerYear ? ownerYear.humanViews.value : null)}
-      ${stat(ownerYear ? `AI-søk (${ownerYear.labels.nb.aiViews})` : "AI-søk", ownerYear ? ownerYear.aiViews.value : null)}
+      ${stat(ownerYear ? `${OWNER_OVERVIEW_TEXTS.statsHumanViews} (${ownerYear.labels.nb.humanViews})` : OWNER_OVERVIEW_TEXTS.statsHumanViews, ownerYear ? ownerYear.humanViews.value : null)}
+      ${stat(ownerYear ? `${OWNER_OVERVIEW_TEXTS.statsAiViews} (${ownerYear.labels.nb.aiViews})` : OWNER_OVERVIEW_TEXTS.statsAiViews, ownerYear ? ownerYear.aiViews.value : null)}
     `;
 
     const slug = agent.slug || "";
@@ -2330,7 +2330,17 @@ function renderOwnerPortalPage(req: Request, res: Response, addForm: OwnerItemsA
       }
     }
 
-    const body = `
+    // Tekstpakke B (2026-11-09): with the owner shell, the menu has «Logg ut»,
+    // so the top card has only the <h1> (and any alert), and the intro line
+    // stands in «Profilinformasjon» with the approved wording. Without the
+    // shell the top card is unchanged.
+    const topCardHtml = dashboard
+      ? `
+      <div class="ep-card">
+        <h1 style="margin:0;">${escapeHtml(agent.name)}</h1>
+        ${alert}
+      </div>`
+      : `
       <div class="ep-card">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
           <h1 style="margin:0;">${escapeHtml(agent.name)}</h1>
@@ -2340,10 +2350,12 @@ function renderOwnerPortalPage(req: Request, res: Response, addForm: OwnerItemsA
         </div>
         <p>Rediger profilinformasjonen din. Endringer logges og er synlige for support.</p>
         ${alert}
-      </div>${overviewHtml}
+      </div>`;
+    const body = `${topCardHtml}${overviewHtml}
 
       <div class="ep-card"${dashboard ? ` id="${OWNER_SHELL_PROFILE_ANCHOR}"` : ""}>
-        <h2>Profilinformasjon</h2>
+        <h2>Profilinformasjon</h2>${dashboard ? `
+        <p>${escapeHtml(OWNER_PORTAL_PROFILE_INTRO)}</p>` : ""}
         <form id="ep-profile-form" method="post" action="/eier/${encodeURIComponent(agent.id)}/save" novalidate>
           ${fieldHtml}
           <div class="ep-form-actions">
@@ -2357,14 +2369,14 @@ function renderOwnerPortalPage(req: Request, res: Response, addForm: OwnerItemsA
 
       <div class="ep-card">
         <h2>Statistikk</h2>
-        <p style="margin-bottom:12px;color:#737373;font-size:0.88rem;">Disse tallene oppdateres automatisk og kan ikke redigeres.</p>
+        <p style="margin-bottom:12px;color:#737373;font-size:0.88rem;">Tallene oppdateres av seg selv.</p>
         <div class="ep-stats">${statsHtml}</div>
       </div>
 
       <div class="ep-card">
         <h2>Endringslogg</h2>
         <p style="margin-bottom:12px;color:#737373;font-size:0.88rem;">Siste 20 endringer på profilen.</p>
-        <ul id="ep-audit" class="ep-audit-list" aria-live="polite"><li class="ep-audit-item ep-audit-meta">Laster ...</li></ul>
+        <ul id="ep-audit" class="ep-audit-list" aria-live="polite"><li class="ep-audit-item ep-audit-meta">Laster …</li></ul>
       </div>
 
       <script>
@@ -2467,6 +2479,9 @@ function renderOwnerPortalPage(req: Request, res: Response, addForm: OwnerItemsA
 // on /portal. The content is the T13 card (renderOwnerItemsSection) with the
 // same data and the same POST routes; its forms carry tilbake=varer, so the
 // answer lands back here.
+
+/** Tekstpakke B punkt 5: the intro line in «Profilinformasjon» (only with the owner shell). */
+export const OWNER_PORTAL_PROFILE_INTRO = "Rediger profilinformasjonen din. Endringene vises i endringsloggen, og kundeservice kan se dem.";
 
 /** T15c: what is left on /portal where the «Varer» card was (the anchor, one line, the link). */
 export function ownerItemsMovedCardHtml(agentId: string): string {

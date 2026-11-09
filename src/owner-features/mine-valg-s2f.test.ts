@@ -319,8 +319,8 @@ export async function runMineValgS2fTests(opts: { log?: boolean } = {}): Promise
       const i = h.indexOf("<h2>Statistikk</h2>");
       const card = i < 0 ? "" : h.slice(i, h.indexOf("</div>\n      </div>", i));
       assertTrue(card.length > 0, "AC31 card: the portal has the «Statistikk» card");
-      const views = num(card, /<div class="ep-stat-num">(\d+)<\/div><div class="ep-stat-label">Sidevisninger fra mennesker \(/);
-      const ai = num(card, /<div class="ep-stat-num">(\d+)<\/div><div class="ep-stat-label">AI-søk \(/);
+      const views = num(card, /<div class="ep-stat-num">(\d+)<\/div><div class="ep-stat-label">Besøk på profilsiden \(/);
+      const ai = num(card, /<div class="ep-stat-num">(\d+)<\/div><div class="ep-stat-label">Hentet av AI-assistenter \(/);
       assertEq([views, ai], [19, 7], "AC31 card: page views and AI search show the tab's numbers, not «—»");
       const portalSrc = fs.readFileSync(path.join(__dirname, "../routes/owner-portal.ts"), "utf8");
       assertTrue(!/knowledge\.views_count|knowledge\.ai_conversations_count/.test(portalSrc), "AC31 card: the card no longer reads the fields that do not exist");

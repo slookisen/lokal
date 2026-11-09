@@ -299,8 +299,10 @@ export function renderOwnerItemsSection(input: OwnerItemsSectionInput): string {
     : `<p data-items-empty="1">${esc(T.empty)}</p>`;
   const readOnly = canEdit ? "" : `<p class="ep-audit-meta" data-items-read-only="1">${esc(T.readOnly)}</p>`;
 
-  return `<div class="ep-card" id="${OWNER_ITEMS_ANCHOR}" data-items-card="t13">
-        <h2>${esc(T.title)}</h2>
+  // Tekstpakke B: on the Varer page (returnTo "varer") the page's own <h1>
+  // «Varer» stands right above, so the card has no second «Varer» heading.
+  const titleHtml = input.returnTo === OWNER_ITEMS_RETURN_VARER ? "" : `\n        <h2>${esc(T.title)}</h2>`;
+  return `<div class="ep-card" id="${OWNER_ITEMS_ANCHOR}" data-items-card="t13">${titleHtml}
         ${cardMessage}${canEdit ? input.bannerHtml ?? "" : ""}
         ${head}
         <p class="ep-audit-meta" data-items-validity="${model.softExpiry ? "soft" : "hard"}">${esc(ownerItemsValidityLine(model))}</p>
