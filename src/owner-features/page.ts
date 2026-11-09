@@ -614,7 +614,7 @@ function ordersCheckHtml(m: OwnerPageModel): string {
   if (!o) return "";
   const link = `<a href="${esc(o.itemsHref)}">Gå til varene dine</a>`;
   if (o.count <= 0) {
-    return `<p class="mv-check mv-check-missing" data-orderable="0">Du har 0 varer som kan bestilles. Legg inn varer eller hent dem fra nettsiden din. ${link}</p>`;
+    return `<p class="mv-check mv-check-missing" data-orderable="0">Du har ingen varer som kan bestilles ennå. Legg inn varer eller hent dem fra nettsiden din. ${link}</p>`;
   }
   const n = Math.floor(o.count);
   return `<p class="mv-check" data-orderable="${n}">Du har ${n} ${n === 1 ? "vare" : "varer"} som kan bestilles. ${link}</p>`;
@@ -934,7 +934,7 @@ function levelPreviewHtml(m: OwnerPageModel): string {
 const LEVEL_PREVIEW_STOCK_CHECK_NOTE = "Påminnelse om lagerstatus på e-post (høyst én hver 14. dag)";
 /** T10: «Dette må du gjøre» when a level switches orders off. */
 const LEVEL_PREVIEW_ORDERS_OFF_TODO = "Bestillinger du allerede har fått, må du fortsatt svare på. Nye kunder får kontaktinformasjonen din i stedet.";
-const LEVEL_PREVIEW_GOOD_TO_KNOW = "Du kan gjøre unntak etterpå. «Angre» angrer hele nivåbyttet.";
+const LEVEL_PREVIEW_GOOD_TO_KNOW = "Du kan gjøre unntak etterpå. Trykker du «Angre», går hele nivåbyttet tilbake.";
 
 /**
  * T10 (RFB page, punkt 3 «Velge»): the level preview inside the level card —

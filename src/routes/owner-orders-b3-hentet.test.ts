@@ -189,7 +189,7 @@ export async function runOwnerOrdersB3HentetTests(opts: { log?: boolean } = {}):
       assertEq(newEvents(viaPortal), [{ from_status: "confirmed", to_status: "completed", actor: "producer", actor_role: "seller", channel: "owner_portal" }],
         "hentet-06: ONE order_events row, seller via owner_portal");
       const after = await req("GET", r.location!.replace(/#.*/, ""), { headers: { Cookie: COOKIE_A } });
-      assertTrue(after.text.includes("Ordren er registrert som hentet.") && rowHtml(after.text, viaPortal).includes(">Hentet</span>"),
+      assertTrue(after.text.includes("Bestillingen er registrert som hentet.") && rowHtml(after.text, viaPortal).includes(">Hentet</span>"),
         "hentet-07: the page after the redirect confirms it and the row's badge reads «Hentet»");
 
       // The producer's order page on an equal fixture.
@@ -309,7 +309,7 @@ export async function runOwnerOrdersB3HentetTests(opts: { log?: boolean } = {}):
         const page = await req("GET", A("?tab=kommende"), { headers: { Cookie: COOKIE_A } });
         const rh = rowHtml(page.text, id);
         assertTrue(HENTET_BTN.test(rh), `flag-01: «Hentet» is offered (${c.label})`);
-        assertEq(rh.includes("Ordren avsluttes av seg selv etter henting."), c.env.ORDER_AUTOCOMPLETE_ENABLED === "1", `flag-02: the automatic-close hint follows ORDER_AUTOCOMPLETE_ENABLED only (${c.label})`);
+        assertEq(rh.includes("Bestillingen avsluttes av seg selv etter henting."), c.env.ORDER_AUTOCOMPLETE_ENABLED === "1", `flag-02: the automatic-close hint follows ORDER_AUTOCOMPLETE_ENABLED only (${c.label})`);
         const r = await req("POST", A(`/${id}`), { headers: { Cookie: COOKIE_A }, form: { action: "complete" } });
         await settle();
         assertTrue(/done=completed/.test(r.location || "") && row(id).completion_source === "seller", `flag-03: «Hentet» completes the order (${c.label})`);

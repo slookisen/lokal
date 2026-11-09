@@ -221,7 +221,7 @@ export interface OwnerLevelRequirements {
 
 export const OWNER_LEVEL_SOFT_TEXTS: Readonly<Record<"no_orderable_products" | "profile_paused", LocalizedText>> = {
   no_orderable_products: {
-    no: "Du har 0 varer som kan bestilles. Kundene kan ikke bestille før du har lagt inn varer.",
+    no: "Du har ingen varer som kan bestilles ennå. Kundene kan ikke bestille før du har lagt inn varer.",
     en: "You have 0 items that can be ordered. Customers cannot order until you have added items.",
   },
   profile_paused: {

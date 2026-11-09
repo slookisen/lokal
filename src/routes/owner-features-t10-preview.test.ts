@@ -229,7 +229,7 @@ export async function runOwnerFeaturesT10PreviewTests(opts: { log?: boolean } = 
     // ── Soft requirements: warning, can confirm ───────────────────────────────
     {
       const g = previewOf(html(await page(IDS.noProd, { niva: U })));
-      ok(g.includes(`data-level-warning="no_orderable_products"`) && g.includes("Du har 0 varer som kan bestilles. Kundene kan ikke bestille før du har lagt inn varer.") && !g.includes(CANNOT),
+      ok(g.includes(`data-level-warning="no_orderable_products"`) && g.includes("Du har ingen varer som kan bestilles ennå. Kundene kan ikke bestille før du har lagt inn varer.") && !g.includes(CANNOT),
         "soft: 0 orderable items → the warning, not a hard requirement");
       ok(g.includes(CONFIRM), "soft: 0 orderable items → the confirm button is there");
       const p = await post(IDS.noProd, { level: U, confirmed: "1" });
@@ -253,6 +253,8 @@ export async function runOwnerFeaturesT10PreviewTests(opts: { log?: boolean } = 
       const g = previewOf(html(await page(IDS.ready, { niva: U })));
       for (const h of ["Dette endres", "Følger med", "Endres ikke", "Dette må du gjøre", "Godt å vite"]) ok(g.includes(`<h4>${h}</h4>`), `sections: «${h}»`);
       ok(!g.includes("<h4>Dette mangler</h4>"), "sections: nothing missing → no «Dette mangler»");
+      ok(g.includes("Du kan gjøre unntak etterpå. Trykker du «Angre», går hele nivåbyttet tilbake.") && !g.includes("«Angre» angrer hele nivåbyttet"),
+        "Godt å vite: tekstpakke A punkt 2 — the new sentence, not the old");
       ok(g.includes("<strong>Ta imot bestillinger</strong>: Av → På"), "Dette endres: «{valg}: {fra} → {til}»");
       ok(g.includes("<strong>Påminnelse om ubesvarte bestillinger</strong>: Av → Låst på") && g.includes("<strong>Ordrevarsel på e-post</strong>: Av → Låst på"), "Følger med: the locked keys that follow orders.enabled");
       ok(g.includes("Profilen er synlig: På") && g.includes("Nyheter og tips: du bestemmer selv") && g.includes(`Bestillinger sendes til: post@${IDS.ready}.example.no`), "Endres ikke: visibility, «Nyheter og tips», the order address");

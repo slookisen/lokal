@@ -312,7 +312,7 @@ ${"            "}
     const cfgA = { openPerBuyer: 3, perBuyerPerDay: 10, producerCeilingPerDay: 50 };
     assertEq(texts.ownerOrderLimitLines(cfgA), [
       "Mange ulike kunder kan bestille fra deg samme dag.",
-      "For å stoppe misbruk kan én kunde ha høyst 3 ubesvarte bestillinger hos deg om gangen, og sende deg høyst 10 nye bestillinger per dag.",
+      "For å hindre misbruk kan én kunde ha høyst 3 ubesvarte bestillinger hos deg om gangen, og sende deg høyst 10 nye bestillinger per dag.",
       "Får du flere enn 50 bestillinger på én dag, tar vi ikke imot flere til deg resten av dagen. Kundene får da kontaktinformasjonen din i stedet.",
       "En dag regnes fra midnatt til midnatt.",
     ], "text-01: the limit sentences with the default numbers");

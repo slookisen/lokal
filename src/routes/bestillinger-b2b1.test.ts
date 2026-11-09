@@ -484,6 +484,8 @@ export async function runBestillingerB2b1Tests(opts: { log?: boolean } = {}): Pr
       assertTrue(pageHtml.text.includes(SOLD_OUT_FORM) && boxes(pageHtml.text) === 2 && pageHtml.text.includes(">Avslå</button>"), "soldout-2: producer order page: the option too, beside «Avslå»");
       const list = await req("GET", `/eier/${TP}/ordrer?tab=venter`, { headers: { Cookie: cookies[TP]! } });
       assertTrue(list.text.includes(SOLD_OUT_FORM), "soldout-3: «Mine ordrer»: the option too");
+      assertTrue([compact.text, pageHtml.text, list.text].every((h) => h.includes("Kryss av varene som er utsolgt. De blir merket som utsolgt.") && !h.includes("Utsolgt (settes til «ikke på lager»):")),
+        "soldout-3b: tekstpakke A punkt 9 — the new legend on all three surfaces, not the old one");
 
       // Chosen items only (compact page).
       const a0 = auditRows(TP).length;

@@ -769,7 +769,7 @@ producerOrderRouter.get("/:token", (req: Request, res: Response) => {
   const soldOut = order.status === "pending" && stockSoftExpiryActiveFor(order.agent_id) ? soldOutChoices(cartServiceDb(), order.order_id, order.agent_id) : [];
   const soldOutHtml = soldOut.length
     ? `\n    <form method="POST" action="${postTo}" data-sold-out-form="1"><input type="hidden" name="action" value="decline_sold_out">${idemField()}` +
-      `<fieldset style="border:1px solid #e4e2da;border-radius:8px;margin:12px 0 0;padding:6px 10px"><legend style="font-size:.9rem">Utsolgt (settes til «ikke på lager»):</legend>` +
+      `<fieldset style="border:1px solid #e4e2da;border-radius:8px;margin:12px 0 0;padding:6px 10px"><legend style="font-size:.9rem">Kryss av varene som er utsolgt. De blir merket som utsolgt.</legend>` +
       soldOut.map((c) => `<label style="display:block;padding:4px 0"><input type="checkbox" name="sold_out" value="${escapePageHtml(c.product_id)}" checked> ${escapePageHtml(c.name)}</label>`).join("") +
       `</fieldset><button type="submit" class="act-btn act-secondary">Avslå – utsolgt</button></form>`
     : "";

@@ -46,7 +46,7 @@ export const OWNER_ITEMS_TEXT_NB = {
   profileBlocked: "Kundene kan ikke bestille noe ennå",
   goToChoices: "Gå til Mine valg",
   fromWebsiteIntro: "Kundene ser disse varene, men kan ikke bestille dem før du har bekreftet pris og lager.",
-  notHereIntro: "Alkohol, tjenester og kategorinavn kan ikke bestilles her. Du trenger ikke gjøre noe med dem.",
+  notHereIntro: "Alkohol, tjenester og overskrifter fra nettsiden din kan ikke bestilles her. Du trenger ikke gjøre noe med dem.",
   lineFresh: "Sist bekreftet {dato}. Kan bestilles til {dato2}.",
   lineSoft: "Sist bekreftet {dato}. Kundene ser denne datoen.",
   lineExpired: "Lagerstatus gikk ut {dato}. Kundene kan ikke bestille varen.",
@@ -100,7 +100,7 @@ export const OWNER_ITEMS_INVENTED_TEXT_NB = {
   /** «Kan bestilles» group while orders are on but the profile cannot take orders (not «orders off»). */
   groupOrderableProfileBlocked: "Klar når profilen kan ta imot bestillinger",
   /** An admin-confirmed row (no expiry, no date to show). */
-  lineAdminConfirmed: "Bekreftet sammen med Rett fra Bonden.",
+  lineAdminConfirmed: "Bekreftet av Rett fra Bonden.",
   /** A producer-stated row whose stock status was never dated. */
   lineExpiredNoDate: "Lagerstatus har gått ut. Kundene kan ikke bestille varen.",
   /** A producer-stated row whose stock is neither in stock nor sold out (e.g. unknown). */
@@ -135,7 +135,7 @@ export const OWNER_ITEMS_INVENTED_TEXT_NB = {
     category: "Kategori er for lang (maks 40 tegn).",
     ingredients_required: "Ferdigpakket vare: skriv inn ingrediensene.",
     allergens_required: "Ferdigpakket vare: skriv inn allergenene, eller «ingen».",
-    net_weight_required: "Ferdigpakket vare: skriv inn nettovekten, f.eks. 250 g.",
+    net_weight_required: "Ferdigpakket vare: skriv inn nettovekten, for eksempel 250 g.",
   },
 } as const;
 
