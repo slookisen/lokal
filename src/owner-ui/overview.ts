@@ -130,6 +130,8 @@ export interface OwnerOverviewModel {
   newsResult: OwnerOverviewNewsResult | null;
   /** T15c: the Varer page exists — the Varer links go to /eier/:id/varer (else to #bestillbare-varer). */
   itemsPage?: boolean;
+  /** T15d: the Statistikk page exists — «Statistikk» goes to /eier/:id/statistikk (else to the /selger tab). */
+  statsPage?: boolean;
 }
 
 function esc(v: unknown): string {
@@ -188,7 +190,7 @@ export const OWNER_OVERVIEW_CSS = `
 export function renderOwnerOverview(m: OwnerOverviewModel): string {
   const T = OWNER_OVERVIEW_TEXTS;
   const id = encodeURIComponent(m.agentId);
-  const L = ownerShellLinks(m.agentId, m.profileSlug, m.itemsPage === true);
+  const L = ownerShellLinks(m.agentId, m.profileSlug, m.itemsPage === true, m.statsPage === true);
   const itemsHref = m.itemsPage === true ? L.varer : "#bestillbare-varer";
   const counts = { pendingOrders: n(m.counts.pendingOrders), itemsToConfirm: n(m.counts.itemsToConfirm) };
 

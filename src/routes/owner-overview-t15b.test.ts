@@ -382,7 +382,7 @@ export async function runOwnerOverviewT15bTests(opts: { log?: boolean } = {}): P
     const valgOn = on[`valg:${BUSY}`].html;
     assertTrue(!!st && valgOn.includes(`data-level-status="${st.kind}">${levelText}`), "on: Mine valg shows the same level line");
     assertTrue(valgOn.includes(`id="niva"`), "on: «Endre» lands on Mine valg's level card");
-    for (const [key, href] of [["ordrer", `/eier/${BUSY}/ordrer`], ["varer", `/eier/${BUSY}/varer`], ["valg", `/eier/${BUSY}/valg`], ["profil", "#profil"], ["statistikk", `/selger?agent=${BUSY}#statistikk`]]) {
+    for (const [key, href] of [["ordrer", `/eier/${BUSY}/ordrer`], ["varer", `/eier/${BUSY}/varer`], ["valg", `/eier/${BUSY}/valg`], ["profil", "#profil"], ["statistikk", `/eier/${BUSY}/statistikk`]]) {
       assertTrue(new RegExp(`<li data-part="${key}"><a class="ow-ov-row" href="${href.replace(/[?#.]/g, "\\$&")}">`).test(block), `on: «Alt i eierportalen» links ${key} → ${href}`);
     }
     assertTrue(portal.includes(`id="bestillbare-varer"`) && portal.includes(`id="profil"`), "on: the in-page targets exist");

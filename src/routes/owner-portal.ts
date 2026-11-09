@@ -35,7 +35,8 @@ import {
   OWNER_SHELL_MAIN_OPEN, OWNER_SHELL_PROFILE_ANCHOR, OWNER_SHELL_TEXTS, ownerDashboardActiveFor, ownerItemsPagePath, renderOwnerShellStart,
 } from "../owner-ui/shell";
 import { OWNER_OVERVIEW_NEWS_PARAM, parseOwnerOverviewNewsParam, renderOwnerOverview } from "../owner-ui/overview";
-import { buildOwnerOverviewModel, countPendingOrders, ownerActionCounts, ownerItemsPageActiveFor } from "../owner-ui/overview-data";
+import { buildOwnerOverviewModel, countPendingOrders, ownerActionCounts, ownerItemsPageActiveFor, ownerStatsPageActiveFor } from "../owner-ui/overview-data";
+import { OWNER_STATS_PAGE_TEXTS, renderOwnerStatsPageBody } from "../owner-ui/stats-page";
 import { ownerPauseEnabled, isOwnerPaused, readOwnerPauseRow } from "../services/agent-visibility";
 import { isBlocked, normalizeEmail } from "../services/blocklist-service";
 import { rateLimit } from "express-rate-limit";
@@ -2320,6 +2321,8 @@ function renderOwnerPortalPage(req: Request, res: Response, addForm: OwnerItemsA
           agentId, profileSlug: slug, counts: actionCounts, year: ownerYear, db,
           newsResult: parseOwnerOverviewNewsParam(req.query[OWNER_OVERVIEW_NEWS_PARAM]),
           itemsPage,
+          // T15d: the dashboard is active here, so the Statistikk page exists (ownerStatsPageActiveFor).
+          statsPage: true,
         }));
       } catch (e) {
         console.error("[owner-portal] overview block failed:", e instanceof Error ? e.message : "error");
@@ -2443,7 +2446,7 @@ function renderOwnerPortalPage(req: Request, res: Response, addForm: OwnerItemsA
     const pageBody = ownerTheme ? `<style>${OWNER_PORTAL_THEME_CSS}</style>${ownerThemeHtml(body)}` : body;
 
     return res.send(portalShell(`Eierportal · ${agent.name}`, pageBody,
-      dashboard ? { ownerShellHtml: renderOwnerShellStart({ agentId, current: "oversikt", profileSlug: slug, counts: actionCounts ?? undefined, ...(itemsPage ? { itemsPage } : {}) }) } : {}));
+      dashboard ? { ownerShellHtml: renderOwnerShellStart({ agentId, current: "oversikt", profileSlug: slug, counts: actionCounts ?? undefined, ...(itemsPage ? { itemsPage } : {}), statsPage: true }) } : {}));
   } catch (err) {
     console.error("[owner-portal] GET /eier/:agentId/portal error:", err);
     return res.status(500).send(portalShell(
@@ -2527,7 +2530,7 @@ function renderOwnerItemsPage(req: Request, res: Response, addForm: OwnerItemsAd
     `;
     const pageBody = `<style>${OWNER_PORTAL_THEME_CSS}</style>${ownerThemeHtml(body)}`;
     const shell = renderOwnerShellStart({
-      agentId, current: "varer", profileSlug: slugify(String(agent.name || "")), counts: ownerActionCounts(db, agentId, now), itemsPage: true,
+      agentId, current: "varer", profileSlug: slugify(String(agent.name || "")), counts: ownerActionCounts(db, agentId, now), itemsPage: true, statsPage: true,
     });
     return res.send(portalShell(`${OWNER_SHELL_TEXTS.items} · ${agent.name}`, pageBody, { ownerShellHtml: shell }));
   } catch (err) {
@@ -2538,6 +2541,67 @@ function renderOwnerItemsPage(req: Request, res: Response, addForm: OwnerItemsAd
     ));
   }
 }
+
+// ─────────────────────────────────────────────────────────────────
+// T15d: GET /eier/:agentId/statistikk — the «Statistikk» page in the owner shell
+// ─────────────────────────────────────────────────────────────────
+// dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 9, slice T15d.
+// Only while ownerStatsPageActiveFor (OWNER_DASHBOARD_ENABLED + allowlist +
+// verified owner). Otherwise the request goes on (next()) exactly as before
+// this route existed. With the gate's env part on: no session → 302 to the
+// login page, another producer's session → 403, as on /varer. The content is
+// the /selger Statistikk tab's sections (owner-ui/stats-page.ts) from the same
+// getOwnerStats() read as GET /api/agents/:id/owner-stats; a failed read →
+// «—» and one line (200). Read only.
+
+router.get("/eier/:agentId/statistikk", (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const agentId = String((req.params as any).agentId || "");
+    // The env part of the gate first: off → exactly as before (no route).
+    if (!ownerStatsPageActiveFor(agentId, true)) return next();
+    const session = verifyOwnerSession(req);
+    if (!session.valid) return res.redirect(302, `/eier/${encodeURIComponent(agentId)}`);
+    if (session.agentId !== agentId) {
+      return res.status(403).send(portalShell(
+        "Ingen tilgang",
+        `<div class="ep-card">
+          <h1>Ingen tilgang</h1>
+          <p>Sesjonen din er knyttet til en annen produsent. <a href="/eier/${encodeURIComponent(session.agentId || "")}/portal">Gå til din egen portal</a> eller <a href="/eier/${encodeURIComponent(agentId)}">logg inn på nytt</a>.</p>
+        </div>`
+      ));
+    }
+    if (!ownerStatsPageActiveFor(agentId, isVerifiedOwner(agentId, session))) return next();
+
+    const db = getDb();
+    const agent = db.prepare("SELECT id, name FROM agents WHERE id = ?").get(agentId) as any;
+    if (!agent) return next();
+
+    const now = new Date();
+    // Same read and path derivation as GET /api/agents/:id/owner-stats.
+    let stats: ReturnType<typeof getOwnerStats> | null = null;
+    try {
+      stats = getOwnerStats(db, agentId, `/produsent/${slugify(String(agent.name || ""))}`, now.getTime());
+    } catch (e) {
+      console.error("[owner-portal] statistikk page read failed:", e instanceof Error ? e.message : "error");
+      stats = null;
+    }
+    const body = renderOwnerStatsPageBody({ stats, nowMs: now.getTime() });
+    const pageBody = `<style>${OWNER_PORTAL_THEME_CSS}</style>${ownerThemeHtml(body)}`;
+    const shell = renderOwnerShellStart({
+      agentId, current: "statistikk", profileSlug: slugify(String(agent.name || "")), counts: ownerActionCounts(db, agentId, now),
+      ...(ownerItemsPageActiveFor(agentId, true) ? { itemsPage: true } : {}),
+      statsPage: true,
+    });
+    res.setHeader("Cache-Control", "no-store");
+    return res.send(portalShell(`${OWNER_STATS_PAGE_TEXTS.title} · ${agent.name}`, pageBody, { ownerShellHtml: shell }));
+  } catch (err) {
+    console.error("[owner-portal] GET /eier/:agentId/statistikk error:", err instanceof Error ? err.message : "error");
+    return res.status(500).send(portalShell(
+      "Feil",
+      `<div class="ep-card"><h1>Noe gikk galt</h1><p>Prøv igjen senere.</p></div>`
+    ));
+  }
+});
 
 // ─────────────────────────────────────────────────────────────────
 // POST /api/agents/:id/order-notifications  { opt_in: boolean }

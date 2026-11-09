@@ -39,9 +39,9 @@ import {
 } from "../owner-features/news-consent";
 import { formatOwnerFeatureValue, ownerPageStatsFrom, renderOwnerFeaturesPageBody, renderOwnerFeaturesPageFragment, type OwnerPageModel, type OwnerPageNotice, type OwnerPageStats } from "../owner-features/page";
 import { OWNER_FRAGMENT_HEADER } from "../owner-ui/enhance";
-import { ownerDashboardActiveFor, ownerShellStatsHref, renderOwnerShellStart } from "../owner-ui/shell";
+import { ownerDashboardActiveFor, ownerShellStatsHref, ownerStatsPagePath, renderOwnerShellStart } from "../owner-ui/shell";
 import { ownerOverviewNewsBack, type OwnerOverviewNewsResult } from "../owner-ui/overview";
-import { ownerActionCounts, ownerItemsPageActiveFor } from "../owner-ui/overview-data";
+import { ownerActionCounts, ownerItemsPageActiveFor, ownerStatsPageActiveFor } from "../owner-ui/overview-data";
 import {
   OWNER_ANCHOR_FALLBACK, OWNER_ANCHOR_LEVEL, OWNER_ANCHOR_LEVEL_PREVIEW, OWNER_ANCHOR_NEWS_QUESTION, OWNER_ANCHOR_PLANNED,
   isOwnerPageAnchor, ownerBatchAnchor, ownerPageTail, ownerPlannedAnchor, ownerRowAnchor, ownerUndoAnchor,
@@ -559,7 +559,8 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
           : {}),
       },
       stats: ownerPageStats(agent.id, String(agent.name || ""), db),
-      statsHref: ownerStatsHref(agent.id),
+      // T15d: with the Statistikk page (dashboard active), «Se all statistikk» goes there.
+      statsHref: dashboard && ownerStatsPageActiveFor(agentId, true) ? ownerStatsPagePath(agent.id) : ownerStatsHref(agent.id),
     };
     res.setHeader("Cache-Control", "no-store");
     // T9: `?fragment=` → only those regions (same render), after the same gate; a GET writes nothing.
@@ -578,6 +579,8 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
         agentId, current: "valg", profileSlug: slugify(String(agent.name || "")), counts: ownerActionCounts(db, agentId),
         // T15c: with the Varer page, the menu's Varer goes there.
         ...(ownerItemsPageActiveFor(agentId, true) ? { itemsPage: true } : {}),
+        // T15d: the dashboard is active here, so Mer → Statistikk goes to its page.
+        statsPage: true,
       })
       : null;
     return res.send(portalShell(`Mine valg · ${agent.name}`, renderOwnerFeaturesPageBody(model), shellHtml ? { ownerShellHtml: shellHtml } : {}));
