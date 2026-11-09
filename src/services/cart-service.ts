@@ -2204,7 +2204,10 @@ export function transitionOrder(
     completionSource?: OrderCompletionSource | null;
     /** Fase A1: set orders.pickup_time in the same write (confirm with a pickup time). */
     pickupTime?: string | null;
-    /** T12: orders.cancel_detail in the same write ('sold_out' | 'cannot_deliver'; cancelled only). */
+    /**
+     * T12: orders.cancel_detail in the same write ('sold_out' | 'cannot_deliver'; cancelled only).
+     * Tekstpakke C punkt 10: also 'sold_out' on a decline («Avslå – utsolgt»).
+     */
     cancelDetail?: string | null;
   }
 ): TransitionResult {
@@ -2272,7 +2275,7 @@ export function transitionOrder(
     ? (opts?.completionSource ?? (actorRole === "admin" ? "admin" : actorRole === "seller" ? "seller" : actorRole === "buyer" ? "buyer" : null))
     : null;
   const pickupTime = toStatus === "confirmed" ? (opts?.pickupTime ?? null) : null;
-  const cancelDetail = toStatus === "cancelled" ? (opts?.cancelDetail ?? null) : null;
+  const cancelDetail = toStatus === "cancelled" || toStatus === "declined" ? (opts?.cancelDetail ?? null) : null;
 
   // Concurrency guard: the UPDATE re-asserts the from-status we validated
   // against (id AND status), so two racing transitions (multi-instance, or

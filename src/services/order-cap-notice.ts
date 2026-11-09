@@ -117,6 +117,12 @@ export function formatOsloDayLabel(day: string): string {
     .format(new Date(`${day}T12:00:00Z`));
 }
 
+/** «8. november» for «YYYY-MM-DD» (tekstpakke C punkt 4: no weekday). */
+export function formatOsloDayMonthLabel(day: string): string {
+  return new Intl.DateTimeFormat("nb-NO", { timeZone: "UTC", day: "numeric", month: "long" })
+    .format(new Date(`${day}T12:00:00Z`));
+}
+
 /** The digest is sent from this Oslo hour on (not in the night). */
 export const ORDER_CAP_NOTICE_SEND_FROM_HOUR = 7;
 
@@ -301,7 +307,7 @@ export interface OrderCapNoticeResult {
   failed: number;
 }
 
-export type OrderCapNoticeSender = (input: { agent_id: string; count: number; cap: number; oslo_day: string }) =>
+export type OrderCapNoticeSender = (input: { agent_id: string; count: number; cap: number; oslo_day: string; v2?: boolean }) =>
   Promise<"sent" | "skipped" | "failed">;
 
 /**
@@ -325,10 +331,14 @@ export async function processOrderCapNotices(
     return sendProducerOrderCapNotice(input);
   });
 
+  // Tekstpakke C punkt 4: with ORDER_CAP_V2_ENABLED on, only platform-ceiling
+  // hits (reason_detail 'platform_ceiling') count; a buyer's own limits never
+  // give the producer an e-mail. Off: the query is exactly as before.
+  const v2 = isOrderCapV2Enabled(env);
   const rows = db.prepare(`
     SELECT e.agent_id AS agent_id, COUNT(*) AS n, MAX(e.cap) AS cap
       FROM order_cap_events e
-     WHERE e.oslo_day = ? AND e.reason = 'producer_daily_cap'
+     WHERE e.oslo_day = ? AND e.reason = 'producer_daily_cap'${v2 ? " AND e.reason_detail = 'platform_ceiling'" : ""}
        AND NOT EXISTS (SELECT 1 FROM order_cap_notices x WHERE x.agent_id = e.agent_id AND x.oslo_day = e.oslo_day)
      GROUP BY e.agent_id
      ORDER BY e.agent_id
@@ -343,7 +353,7 @@ export async function processOrderCapNotices(
         VALUES (?, ?, ?, ?, 'claimed', datetime('now'))
       `).run(r.agent_id, day, r.n, r.cap);
       if (claimed.changes !== 1) continue;
-      const outcome = await send({ agent_id: r.agent_id, count: r.n, cap: r.cap, oslo_day: day });
+      const outcome = await send(v2 ? { agent_id: r.agent_id, count: r.n, cap: r.cap, oslo_day: day, v2: true } : { agent_id: r.agent_id, count: r.n, cap: r.cap, oslo_day: day });
       db.prepare(`UPDATE order_cap_notices SET status = ?, sent_at = CASE WHEN ? = 'sent' THEN datetime('now') ELSE sent_at END WHERE agent_id = ? AND oslo_day = ?`)
         .run(outcome, outcome, r.agent_id, day);
       out[outcome]++;

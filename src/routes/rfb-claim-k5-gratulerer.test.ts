@@ -200,7 +200,7 @@ export async function runRfbClaimK5GratulererTests(opts: { log?: boolean } = {})
         `Profilen til ${NAME} er nå koblet til deg, og du kan endre den selv når du vil.`,
         "",
         "I eierportalen kan du:",
-        "- rette varer, åpningstider og kontaktinfo",
+        "- rette varer, åpningstider og kontaktinformasjon", // tekstpakke C punkt 6
         "- se hvor ofte profilen blir vist og besøkt",
         "- velge om du vil få bestillinger fra kunder på e-post",
         "",
@@ -218,7 +218,7 @@ export async function runRfbClaimK5GratulererTests(opts: { log?: boolean } = {})
       const visible = body.replace(/<[^>]*>/g, " ").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#039;/g, "'").replace(/&amp;/g, "&")
         .replace(/\s+/g, " ").trim();
       eq(visible, `🌾 Rett fra Bonden Hei! Profilen til ${NAME} er nå koblet til deg, og du kan endre den selv når du vil. I eierportalen kan du: ` +
-        "rette varer, åpningstider og kontaktinfo se hvor ofte profilen blir vist og besøkt velge om du vil få bestillinger fra kunder på e-post " +
+        "rette varer, åpningstider og kontaktinformasjon se hvor ofte profilen blir vist og besøkt velge om du vil få bestillinger fra kunder på e-post " +
         "Logg inn i eierportalen Lenken virker i 15 minutter. Senere logger du inn på rettfrabonden.com/eier/k5-a med denne e-postadressen. " +
         "Har du spørsmål, svarer du bare på denne e-posten. Hilsen Daniel, Rett fra Bonden", "mail: the HTML reads exactly the approved text");
       ok(m.html.includes("<strong>Gård &lt;K5&gt; &amp; &quot;Søn&quot;</strong>") && !m.html.includes("<K5>") && !m.html.includes(`"Søn"`),
