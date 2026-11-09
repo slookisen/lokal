@@ -371,9 +371,14 @@ export async function runRfbPrivacyTermsTruthTests(opts: { log?: boolean } = {})
     );
     assertTrue(
       lang === "no"
-        ? /Oversatte utgaver av profilteksten \(engelsk og svensk\) avpubliseres, men blir liggende/.test(body)
-        : /Translated versions of the profile text \(English and Swedish\) are unpublished but stay in the database/.test(body),
-      `/personvern (${lang}): says translated profile text stays after the profile is deleted`
+        ? /Oversatte utgaver av profilteksten \(engelsk og svensk\) slettes sammen med profilen\./.test(body) &&
+            /oversatte utgaver av profilteksten slettes sammen med den\./.test(body) &&
+            !/blir liggende til vi sletter dem/.test(body)
+        : /Translated versions of the profile text \(English and Swedish\) are deleted together with the profile\./.test(body) &&
+            /translated versions of the profile text are deleted with it\./.test(body) &&
+            !/stay in the database until we delete them/.test(body) &&
+            !/stay until we delete them on request/.test(body),
+      `/personvern (${lang}): says translated profile text is deleted together with the profile (matches deleteAgentProfileTranslations ground truth)`
     );
     assertTrue(
       lang === "no"
