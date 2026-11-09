@@ -178,6 +178,16 @@ const FIELD_INPUT: Record<OwnerProductField, string> = {
  * `skjema=v1b` tells the route that an unticked «Varen er på lager nå» means
  * «not in stock» (an unticked box sends nothing).
  */
+/**
+ * F-e: the «Legg til vare» summary is display:flex (inline style), which drops
+ * the disclosure marker; a ▸ that turns when open shows it can be expanded.
+ * The marker has empty alt text, so screen readers keep the summary's own
+ * expanded/collapsed state. Rendered with the form only.
+ */
+export const ITEMS_ADD_SUMMARY_CSS = `.ep-items-add > summary::before { content: "\\25B8"; content: "\\25B8" / ""; display: inline-block; flex: none; width: 1em; text-align: center; transition: transform 0.15s ease; }
+  .ep-items-add[open] > summary::before { transform: rotate(90deg); }
+  @media (prefers-reduced-motion: reduce) { .ep-items-add > summary::before { transition: none; } }`;
+
 function addProductFormHtml(id: string, model: Pick<OwnerItemsModel, "ordersOn" | "autoConfirm">, state: OwnerItemsAddFormState | null, back = ""): string {
   const T = OWNER_ITEMS_TEXT_NB;
   const X = OWNER_ITEMS_INVENTED_TEXT_NB;
@@ -194,7 +204,8 @@ function addProductFormHtml(id: string, model: Pick<OwnerItemsModel, "ordersOn" 
   const box = "width:24px;height:24px;margin:0;flex:none;";
   const stockHints = [model.ordersOn ? T.inStockOrdersOnHint : "", model.autoConfirm ? X.inStockAutoConfirmHint : ""].filter(Boolean);
   const errorHtml = state ? `<div class="ep-alert ep-alert-error" role="alert" data-items-message="1" data-items-add-error="1">${esc(state.message)}</div>` : "";
-  return `<details class="ep-items-add" data-items-add="1" style="margin-top:20px;"${state ? " open" : ""}>
+  return `<style>${ITEMS_ADD_SUMMARY_CSS}</style>
+        <details class="ep-items-add" data-items-add="1" style="margin-top:20px;"${state ? " open" : ""}>
           <summary style="${choice}font-weight:600;">${esc(T.addTitle)}</summary>
           ${errorHtml}
           <form method="post" action="/eier/${id}/varer/ny" data-items-add-form="v1b">

@@ -596,6 +596,20 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#f5f3ee;color:#1e
 .mo-link{display:block;text-align:center;margin:16px 0;color:#2c5b3f;font-weight:700;padding:12px}
 `;
 
+/**
+ * The owner's «Mine ordrer» list only (renderOrdersPage), on top of CSS:
+ * the owner pages' font stack and light page background (as the portal,
+ * PORTAL_PALETTE_CSS), form controls that inherit the font, and tabs that
+ * all fit at 375 px. Placed before OWNER_ORDERS_THEME_CSS so the dark theme
+ * still wins. The buyer's card and the token page keep CSS unchanged.
+ */
+export const OWNER_ORDERS_PAGE_CSS = `
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:#FEFAE0}
+button,input,select,textarea{font-family:inherit}
+.mo-tabs{flex-wrap:wrap;overflow-x:visible}
+@media (max-width:480px){.mo-tabs{gap:4px}.mo-tab{flex:1 1 auto;padding:10px 6px;font-size:.85rem}.mo-count{margin-left:2px;padding:0 4px}}
+`;
+
 export function ordersShell(title: string, body: string): string {
   return ordersShellWith(title, body, null);
 }
@@ -682,7 +696,7 @@ ${opts.t12 ? `${ownerOrderOverviewHtml(opts.t12.overview)}\n` : ""}${bannerHtml(
 <nav class="mo-tabs" aria-label="Ordrer">${tabs}</nav>
 ${rows}${empty}`;
   return ordersShellWith(`Mine ordrer · ${opts.producerName}`,
-    opts.ownerTheme ? `<style>${OWNER_ORDERS_THEME_CSS}</style>${ownerThemeHtml(body)}` : body,
+    `<style>${OWNER_ORDERS_PAGE_CSS}</style>${opts.ownerTheme ? `<style>${OWNER_ORDERS_THEME_CSS}</style>${ownerThemeHtml(body)}` : body}`,
     opts.ownerShellHtml || null);
 }
 

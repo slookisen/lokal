@@ -37599,6 +37599,19 @@ const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
     failed++;
     failures.push("owner-tekstpakke-b: unexpected error: " + String(err?.message || err));
   }
+  // Owner pages style fixes F-a, F-c, F-d, F-e, F-f (375 px browser test, CSS only) — pure renders.
+  try {
+    const { runOwnerStyleFixesFTests } = require("../src/routes/owner-style-fixes-f.test") as
+      typeof import("../src/routes/owner-style-fixes-f.test");
+    const sff = await runOwnerStyleFixesFTests({ log: false });
+    passed += sff.passed;
+    failed += sff.failed;
+    for (const f of sff.failures) failures.push("owner-style-fixes-f: " + f);
+    console.log(`  owner-style-fixes-f: ${sff.passed} passed, ${sff.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-style-fixes-f: unexpected error: " + String(err?.message || err));
+  }
   // T15a (eierportal skall og meny, dev-request 2026-10-30-rfb-eierportal-testrunde-1 punkt 9) — own in-memory DB.
   try {
     const { runOwnerShellT15aTests } = require("../src/routes/owner-shell-t15a.test") as
