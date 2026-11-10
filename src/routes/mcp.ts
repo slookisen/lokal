@@ -58,7 +58,7 @@ import { foreignPlaceIn } from "../services/outside-norway";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 import { searchCountable } from "../services/search-tracking";
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
-import { BRAND_ENTITIES, brandMcpIcons } from "../config/brand-entities";
+import { BRAND_ENTITIES, brandMcpIcons, RFB_MCP_SERVER_TITLE } from "../config/brand-entities";
 import { publicListableSql, failsProducerRoleGate, isAgentIdPubliclyVisible, notOwnerHiddenSql, ownerHidesAgent, withoutOwnerHidden, isContactHiddenAgentId, withoutContactFields, redactContactText, redactKnowledgeFreeText, HIDDEN_CONTACT_NOTE_NB } from "../services/agent-visibility";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { safeHonestCatalogCount } from "../services/honest-count";
@@ -2264,7 +2264,7 @@ export function rfbMcpInstructions(): string {
  * the brand's name and 512 PNG logo from BRAND_ENTITIES.rfb, so the connector
  * shows the brand instead of the bare `name`. websiteUrl is BRAND_ENTITIES.rfb.url.
  */
-export const RFB_MCP_SERVER_TITLE = `${BRAND_ENTITIES.rfb.name} — Norwegian local food producers`;
+export { RFB_MCP_SERVER_TITLE };
 export const RFB_MCP_SERVER_ICONS = brandMcpIcons(BRAND_ENTITIES.rfb);
 
 async function getOrCreateSession(
