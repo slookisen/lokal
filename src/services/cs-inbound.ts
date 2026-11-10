@@ -418,13 +418,28 @@ export function recordThreadAlias(aliasId: string, threadId: string, source: str
   return r.changes > 0;
 }
 
-/** Does the inbound log still hold this row? (Rows are purged after 90 days.) */
+/** Does the inbound log still hold this row? (Rows are purged after 90 days.) A DB error throws — never read as «gone». */
 export function inboundLogExists(logId: string): boolean {
-  try {
-    return !!getDb().prepare("SELECT 1 FROM inbound_email_log WHERE id = ?").get(logId);
-  } catch {
-    return false;
-  }
+  return !!getDb().prepare("SELECT 1 FROM inbound_email_log WHERE id = ?").get(logId);
+}
+
+/** The automated classification the server stored for this e-mail (auto_reply / bounce), or null. */
+export function inboundLogAutomatedKind(logId: string): string | null {
+  const r = getDb().prepare("SELECT automated_kind FROM inbound_email_log WHERE id = ?").get(logId) as { automated_kind: string | null } | undefined;
+  return r?.automated_kind ?? null;
+}
+
+/** Is this one of our own platform addresses (any subdomain)? */
+export function isOurPlatformAddress(email: string | null | undefined): boolean {
+  const d = (email ?? "").trim().toLowerCase().split("@")[1] ?? "";
+  if (!d) return false;
+  return Object.keys(INBOUND_DOMAIN_VERTICALS).some((o) => d === o || d.endsWith("." + o));
+}
+
+/** «[Innkommende] X (fra …)» → «X»: the forward's own decoration off a subject before classifying it. */
+export function stripForwardSubject(subject: string | null): string | null {
+  if (!subject) return subject;
+  return subject.replace(/^\s*\[Innkommende\]\s*/i, "").replace(/\s*\(fra [^()]*\)\s*$/i, "");
 }
 
 export type MarkerTarget =

@@ -23,9 +23,20 @@ import { getDb } from "../database/init";
 import { isOutreachPaused } from "./admin-outreach-candidates";
 import { unsubscribeHeaderValues } from "../services/avmeld-service";
 import { getOutreachMaxTouchVernConfig, getMaxTouchStatusForEmail } from "../services/outreach-max-touch-vern";
-import { classifyAutomated, forwardCopyMarker, inboundLogExists, readInboundHeaders, recordThreadAlias, resolveThreadAlias, serverThreadForMarker } from "../services/cs-inbound";
+import {
+  classifyAutomated,
+  forwardCopyMarker,
+  inboundLogAutomatedKind,
+  inboundLogExists,
+  isOurPlatformAddress,
+  readInboundHeaders,
+  recordThreadAlias,
+  resolveThreadAlias,
+  serverThreadForMarker,
+  stripForwardSubject,
+} from "../services/cs-inbound";
 import { computeNeedsReply, markNoReplyNeeded } from "../services/crm-needs-reply";
-import { buildDailyDigest } from "../services/cs-watchdog";
+import { buildDailyDigest, INBOUND_LOG_RETENTION_DAYS } from "../services/cs-watchdog";
 
 // ─── Admin auth (matches the fleet-wide admin-route pattern, e.g.
 // admin-affiliations.ts / admin-hanen.ts: ADMIN_KEY primary,
@@ -1234,12 +1245,14 @@ router.post("/ingest", (req, res) => {
     const msgs = parsed.data.messages;
     const times = msgs.map((m) => (m.sentAt ? Date.parse(m.sentAt) : NaN));
     const first = times.every((t) => Number.isFinite(t)) ? msgs[times.indexOf(Math.min(...times))] : msgs[0];
-    // The fallback is only for deciding a NEW alias (an already-aliased Gmail
-    // thread sends later messages incrementally, and "first in this payload"
-    // is then just the oldest new message), and only for a message sent from
-    // one of our own platform addresses — never for a customer's reply.
-    const fromOurDomain = /@(rettfrabonden\.com|opplevagent\.no|finn-tannlege\.com)$/i.test((first.fromEmail ?? "").trim());
-    const firstCopyId = forwardCopyMarker(first, canonical === null && fromOurDomain ? parsed.data.subject : undefined);
+    // The Gmail thread subject may stand in for a missing per-message subject
+    // only for a message SENT FROM one of our own platform addresses (the
+    // forward is) — never for a customer's reply, which may carry an old
+    // marker unquoted in its history. Decided per message, so a re-sent
+    // aliased thread recognises its subject-less copy too.
+    const copyIdOf = (m: (typeof parsed.data.messages)[number]): string | null =>
+      forwardCopyMarker(m, isOurPlatformAddress(m.fromEmail) ? parsed.data.subject : undefined);
+    const firstCopyId = copyIdOf(first);
     if (!canonical) {
       const logId = firstCopyId;
       if (logId) {
@@ -1255,10 +1268,18 @@ router.post("/ingest", (req, res) => {
     // filing it now would be a duplicate). No subject fallback here: a message
     // without its own subject is never taken for a copy (a customer's
     // plain-text reply may carry the marker unquoted).
-    const filedById = (id: string): boolean => !inboundLogExists(id) || serverThreadForMarker(id) !== null;
+    // A missing log row means "purged after the retention window" ONLY when
+    // the copy itself is that old. A recent copy with no row (restored backup,
+    // a log insert that failed) is filed — a duplicate beats a lost e-mail.
+    const purgedLongAgo = (m: (typeof parsed.data.messages)[number]): boolean => {
+      const t = m.sentAt ? Date.parse(m.sentAt) : NaN;
+      return Number.isFinite(t) && Date.now() - t > (INBOUND_LOG_RETENTION_DAYS - 7) * 86400_000;
+    };
     const serverFiled = (m: (typeof parsed.data.messages)[number]): boolean => {
-      const id = m === first ? firstCopyId : forwardCopyMarker(m);
-      return id !== null && filedById(id);
+      const id = copyIdOf(m);
+      if (id === null) return false;
+      if (!inboundLogExists(id)) return purgedLongAgo(m);
+      return serverThreadForMarker(id) !== null;
     };
     if (canonical) {
       recordThreadAlias(parsed.data.threadId, canonical.threadId, "cs_gmail_copy");
@@ -1287,13 +1308,13 @@ router.post("/ingest", (req, res) => {
         // Daniel's Gmail reply directly) reopens a done/archived thread, as on
         // the server path. Never Daniel's own reply, never an already-filed
         // message, never an auto-reply or bounce.
-        const newHumanIn = rest.some(
-          (m) =>
-            !existed.has(m.messageId) &&
-            m.direction === "in" &&
-            m.rawMetadata?.automated !== true &&
-            classifyAutomated({ subject: m.subject ?? null, fromEmail: m.fromEmail, headers: readInboundHeaders(m.rawMetadata ?? {}) }).kind === null,
-        );
+        const newHumanIn = rest.some((m) => {
+          if (existed.has(m.messageId) || m.direction !== "in" || m.rawMetadata?.automated === true) return false;
+          // A kept copy of an e-mail the server logged: its own classification counts.
+          const cid = copyIdOf(m);
+          if (cid && inboundLogAutomatedKind(cid)) return false;
+          return classifyAutomated({ subject: stripForwardSubject(m.subject ?? null), fromEmail: m.fromEmail, headers: readInboundHeaders(m.rawMetadata ?? {}) }).kind === null;
+        });
         if (newMessages > 0 && newHumanIn) {
           const st = getDb().prepare("SELECT status FROM crm_threads WHERE id = ?").get(canonical.threadId) as { status: string } | undefined;
           if (st && (st.status === "done" || st.status === "archived")) {
