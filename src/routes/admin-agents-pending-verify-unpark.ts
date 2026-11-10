@@ -208,6 +208,18 @@ function selectCohortCandidates(db: ReturnType<typeof getDb>, limit: number): Un
 function unparkRows(db: ReturnType<typeof getDb>, ids: string[]): void {
   if (ids.length === 0) return;
   const placeholders = ids.map(() => "?").join(",");
+  // Observability only: one 'released' event per id that is parked right now
+  // (checked in SQL, before the UPDATE below). Own try/catch so a missing
+  // events table never blocks the unpark itself.
+  try {
+    db.prepare(
+      `INSERT INTO pending_verify_parking_events (agent_id, kind)
+       SELECT agent_id, 'released' FROM agent_knowledge
+        WHERE agent_id IN (${placeholders}) AND pending_verify_parked_since IS NOT NULL`
+    ).run(...ids);
+  } catch {
+    // events table absent (minimal test schema) — skip.
+  }
   db.prepare(
     `UPDATE agent_knowledge
         SET pending_verify_parked_since = NULL,
