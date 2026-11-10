@@ -36886,6 +36886,21 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental area landing (F1-S3): unexpected error: " + String(err?.message || err));
   }
 
+  // ── A2A dev-request 2026-10-16-finn-tannlege-fasettsider (F1-S5): kommune
+  //    pages /kommune/<slug>, 301 to /sted on the same clinic set, gate/sitemap parity ──
+  try {
+    const { runDentalKommunePagesTests } = require("../src/routes/dental-kommune-pages.test") as
+      typeof import("../src/routes/dental-kommune-pages.test");
+    const dkp = await runDentalKommunePagesTests({ log: false });
+    passed += dkp.passed;
+    failed += dkp.failed;
+    for (const f of dkp.failures) failures.push("dental kommune pages (F1-S5): " + f);
+    console.log(`  dental kommune pages (F1-S5): ${dkp.passed} passed, ${dkp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental kommune pages (F1-S5): unexpected error: " + String(err?.message || err));
+  }
+
   // ── A2A dev-request 2026-10-16-finn-tannlege-fasettsider (F1-S4a): facet
   //    pages /sted/<sted>/<fasett> and /fylke/<fylke>/<fasett> behind one gate,
   //    the same predicate for route, sitemap and links, and the facet config ──

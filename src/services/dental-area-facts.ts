@@ -57,6 +57,7 @@ import { DENTAL_ACUTE_CLAIM_SQL } from "./dental-acute-claim";
 import { dentalVerifiedClaimSql } from "./dental-verified-claim";
 import { dentalHelfoClaimSql } from "./dental-helfo-claim";
 import { clinicSpecialties } from "../config/dental-search-vocabulary";
+import { resolveKommuneFromPostnummer } from "./norway-postnummer";
 import { DENTAL_STATS_TTL_MS } from "./dental-search-gazetteer";
 import { DENTAL_EMERGENCY_NOTICE, DENTAL_LANDING_CONFIG, DENTAL_LANDING_FACETS, type DentalLandingFacet } from "../config/dental-landing";
 import {
@@ -97,12 +98,36 @@ export interface DentalAreaCounts {
   poststeder?: Map<string, number>;
 }
 
+/**
+ * One kommune's clinics, by stored postnummer (A2A dev-request
+ * 2026-10-16-finn-tannlege-fasettsider, F1-S5): the public clinics whose
+ * stored postnummer is a four-digit postnummer that Kartverket's postnummer
+ * table (services/norway-postnummer.ts) puts in the kommune. dental_agents
+ * has no kommune column; this is read at aggregate time, nothing is stored.
+ */
+export interface DentalKommuneFacts {
+  counts: DentalAreaCounts;
+  /** The clinics' ids: what /kommune/<slug> lists, compared with a /sted page's (routes/dental-seo.ts). */
+  ids: Set<string>;
+  /** The stored postnumre among them, sorted: the page's store filter (postnummer_in). */
+  postnumre: string[];
+  /** The stored poststed of the clinics and how many have each (a clinic without one is not here). */
+  poststeder: Map<string, number>;
+}
+
 export interface DentalAreaFacts {
   /** By the stored poststed spelling ("BERGEN", "Bergen" are separate keys). */
   byPoststed: Map<string, DentalAreaCounts>;
   /** By the stored fylke value. */
   byFylke: Map<string, DentalAreaCounts>;
+  /** By kommunenummer, from the stored postnummer (F1-S5). Only kommuner with a clinic. */
+  byKommune: Map<string, DentalKommuneFacts>;
+  /** The clinic ids per stored poststed spelling (F1-S5), the same rows byPoststed counts. */
+  idsByPoststed: Map<string, Set<string>>;
 }
+
+/** Empty facts, while the DB is not ready. */
+const emptyFacts = (): DentalAreaFacts => ({ byPoststed: new Map(), byFylke: new Map(), byKommune: new Map(), idsByPoststed: new Map() });
 
 const CACHE_KEY = "area-facts";
 
@@ -171,7 +196,7 @@ export function computeDentalAreaFacts(db: DbHandle): DentalAreaFacts {
   });
   // Raw rows (arrays, in this column order): one scan, no object per row.
   const rows = db.prepare(
-    "SELECT poststed, fylke," +
+    "SELECT poststed, fylke, id, postnummer," +
     ` CASE WHEN ${dentalVerifiedClaimSql()} THEN 1 ELSE 0 END,` +
     ` CASE WHEN ${dentalHelfoClaimSql()} THEN 1 ELSE 0 END,` +
     ` CASE WHEN ${DENTAL_ACUTE_CLAIM_SQL} THEN 1 ELSE 0 END,` +
@@ -182,12 +207,12 @@ export function computeDentalAreaFacts(db: DbHandle): DentalAreaFacts {
     facetColumns.join("") +
     ` FROM dental_agents WHERE ${where.join(" AND ")}`
   ).raw(true).all(params) as Array<[
-    poststed: string | null, fylke: string | null,
+    poststed: string | null, fylke: string | null, id: string, postnummer: string | null,
     verified: number, helfo_true: number, acute_sourced: number, updated_at: string | null,
     specialty_candidate: number, available_specialties: unknown, specialists: unknown,
     ...in_facet: number[],
   ]>;
-  const FIRST_FACET_COLUMN = 9;
+  const FIRST_FACET_COLUMN = 11;
 
   const byPoststed = new Map<string, DentalAreaCounts>();
   const byFylke = new Map<string, DentalAreaCounts>();
@@ -219,15 +244,50 @@ export function computeDentalAreaFacts(db: DbHandle): DentalAreaFacts {
       }
     }
   };
+  // F1-S5: the kommune of each stored postnummer, looked up once per value.
+  const byKommuneCounts = new Map<string, DentalAreaCounts>();
+  const byKommune = new Map<string, DentalKommuneFacts>();
+  const idsByPoststed = new Map<string, Set<string>>();
+  const kommuneOf = new Map<string, string | null>();
+  const postnumreOf = new Map<string, Set<string>>();
+  const kommuneFor = (postnummer: string | null): string | null => {
+    // Only a stored value that is itself a postnummer: the page's
+    // postnummer_in filter matches the bare column, so the two agree.
+    if (!postnummer || !/^\d{4}$/.test(postnummer)) return null;
+    let k = kommuneOf.get(postnummer);
+    if (k === undefined) {
+      const r = resolveKommuneFromPostnummer(postnummer);
+      k = "kommunenummer" in r ? r.kommunenummer : null;
+      kommuneOf.set(postnummer, k);
+    }
+    return k;
+  };
   for (const row of rows) {
-    const [poststed, fylke, verified, helfo, acute, updatedAt, candidate, availableSpecialties, specialists] = row;
+    const [poststed, fylke, id, postnummer, verified, helfo, acute, updatedAt, candidate, availableSpecialties, specialists] = row;
     // The cards' specialty predicate, on the columns parsed as the cards' rows are.
     const specialist = candidate === 1 &&
       clinicSpecialties(store.hydrateSpecialtySource({ available_specialties: availableSpecialties, specialists })).length > 0 ? 1 : 0;
     if (poststed) bump(byPoststed, poststed, row, verified, helfo, acute, specialist, updatedAt, null);
     if (fylke) bump(byFylke, fylke, row, verified, helfo, acute, specialist, updatedAt, poststed);
+    if (poststed) {
+      let ids = idsByPoststed.get(poststed);
+      if (!ids) idsByPoststed.set(poststed, (ids = new Set()));
+      ids.add(id);
+    }
+    const kommunenummer = kommuneFor(postnummer);
+    if (kommunenummer) {
+      bump(byKommuneCounts, kommunenummer, row, verified, helfo, acute, specialist, updatedAt, null);
+      let k = byKommune.get(kommunenummer);
+      if (!k) byKommune.set(kommunenummer, (k = { counts: byKommuneCounts.get(kommunenummer)!, ids: new Set(), postnumre: [], poststeder: new Map() }));
+      k.ids.add(id);
+      let pn = postnumreOf.get(kommunenummer);
+      if (!pn) postnumreOf.set(kommunenummer, (pn = new Set()));
+      pn.add(postnummer!);
+      if (poststed) k.poststeder.set(poststed, (k.poststeder.get(poststed) ?? 0) + 1);
+    }
   }
-  return { byPoststed, byFylke };
+  for (const [kommunenummer, k] of byKommune) k.postnumre = [...postnumreOf.get(kommunenummer)!].sort();
+  return { byPoststed, byFylke, byKommune, idsByPoststed };
 }
 
 // One cache per DB handle: production has one handle; a test with a fresh
@@ -245,7 +305,7 @@ export function getDentalAreaFacts(): DentalAreaFacts {
   try {
     db = (require("../database/db-factory") as typeof import("../database/db-factory")).getDb("dental") as unknown as DbHandle;
   } catch {
-    return { byPoststed: new Map(), byFylke: new Map() };
+    return emptyFacts();
   }
   let cache = caches.get(db as object);
   if (!cache) {
@@ -266,7 +326,7 @@ export function getDentalAreaFacts(): DentalAreaFacts {
     try {
       cache.set(CACHE_KEY, computeDentalAreaFacts(db));
     } catch {
-      return { byPoststed: new Map(), byFylke: new Map() }; // db not ready
+      return emptyFacts(); // db not ready
     }
   }
   return cache.get(CACHE_KEY)!.value;
@@ -320,9 +380,12 @@ export interface DentalAreaLanding {
  * What a page's numbers count. "poststed": the clinics with that poststed
  * (a /sted page and the spellings it lists), worded «med poststed X», since
  * /sok?q=X also reads the rest of the kommune. "fylke": the clinics in the
- * fylke (a /fylke page), worded «i X».
+ * fylke (a /fylke page), worded «i X». "kommune": the clinics whose
+ * postnummer lies in the kommune (a /kommune page, F1-S5), worded «i X
+ * kommune etter postnummer», since a postnummer area can cross a kommune
+ * border.
  */
-export type DentalAreaScope = "poststed" | "fylke";
+export type DentalAreaScope = "poststed" | "fylke" | "kommune";
 
 /** What a facet page says on top of the area text (F1-S4). */
 export interface DentalFacetLanding extends DentalAreaLanding {
@@ -433,7 +496,9 @@ function buildLanding(
   /** «med poststed Bergen» / «i Vestland», after a noun; «med kjeveortopedi og poststed Bergen» / «med kjeveortopedi i Vestland» for a facet. */
   const where = scope === "poststed"
     ? `med ${words ? `${words.feature} og ` : ""}poststed ${name}`
-    : `${words ? `med ${words.feature} ` : ""}i ${name}`;
+    : scope === "kommune"
+      ? `${words ? `med ${words.feature} ` : ""}i ${name} kommune etter postnummer`
+      : `${words ? `med ${words.feature} ` : ""}i ${name}`;
   const updated = formatNorwegianDate(counts.max_updated_at);
   const websites = (k: number): string => plural(k, "klinikkens nettside", "klinikkenes nettsider");
   /** «at de tar imot» / «at den tar imot». */
@@ -445,7 +510,9 @@ function buildLanding(
   const sentences: string[] = [
     scope === "poststed"
       ? `Vi har ${clinics} ${where} i oversikten.`
-      : `I ${name} har vi ${clinics}${withFeature} i oversikten.`,
+      : scope === "kommune"
+        ? `I ${name} kommune har vi ${clinics}${withFeature} etter postnummer i oversikten.`
+        : `I ${name} har vi ${clinics}${withFeature} i oversikten.`,
   ];
   if (words) sentences.push(words.definition(n === 1));
   const summary = sentences.join(" ");
@@ -495,7 +562,9 @@ function buildLanding(
   const qas: LandingQa[] = [
     scope === "poststed"
       ? { q: `Hvor mange tannlegeklinikker${withFeature} har poststed ${name}?`, a: `Vi har ${clinics} ${where} registrert.${countTail}` }
-      : { q: `Hvor mange tannlegeklinikker${withFeature} finnes det i ${name}?`, a: `Vi har ${clinics}${withFeature} registrert i ${name}.${countTail}` },
+      : scope === "kommune"
+        ? { q: `Hvor mange tannlegeklinikker${withFeature} finnes det i ${name} kommune?`, a: `Vi har ${clinics}${withFeature} registrert i ${name} kommune, etter postnummer.${countTail}` }
+        : { q: `Hvor mange tannlegeklinikker${withFeature} finnes det i ${name}?`, a: `Vi har ${clinics}${withFeature} registrert i ${name}.${countTail}` },
   ];
   if (states("helfo_true")) {
     qas.push({
