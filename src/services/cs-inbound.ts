@@ -101,6 +101,12 @@ function lastMarkerLine(text: string): string | null {
 /** The log id when the marker stands on an unquoted line of the text (or of the HTML with its quotes removed). */
 export function findUnquotedInboundMarker(bodyText: string | null | undefined, bodyHtml?: string | null): string | null {
   if (typeof bodyText === "string" && bodyText) {
+    // The forward's own header block (before the first blank line) carries the
+    // marker first; it wins over anything further down (a truncated body may
+    // end inside unquoted older history).
+    const header = bodyText.split(/\r?\n[ \t]*\r?\n/, 1)[0];
+    const h = lastMarkerLine(header);
+    if (h) return h;
     const m = lastMarkerLine(bodyText);
     if (m) return m;
   }
@@ -410,6 +416,15 @@ export function recordThreadAlias(aliasId: string, threadId: string, source: str
     .prepare("INSERT OR IGNORE INTO crm_thread_aliases (alias_id, thread_id, source) VALUES (?, ?, ?)")
     .run(aliasId, threadId, source);
   return r.changes > 0;
+}
+
+/** Does the inbound log still hold this row? (Rows are purged after 90 days.) */
+export function inboundLogExists(logId: string): boolean {
+  try {
+    return !!getDb().prepare("SELECT 1 FROM inbound_email_log WHERE id = ?").get(logId);
+  } catch {
+    return false;
+  }
 }
 
 export type MarkerTarget =

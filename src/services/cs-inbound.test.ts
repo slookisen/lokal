@@ -28,6 +28,11 @@
  *   ci82-ci87  second review: a copy the server did NOT file is kept; the last
  *              marker wins; subject fallback; linear-time HTML stripping;
  *              reopen via the Gmail path; unparseable sent_at still listed.
+ *   ci88-ci95  third review: only a NEW human inbound reopens via the Gmail
+ *              path; a subject-less customer reply is never taken for a copy;
+ *              copies whose log row was purged are not filed again; the
+ *              header marker wins; the parked fall-through does not file the
+ *              copy; parked 202 parity; RFC 2822 dates on outreach replies.
  *
  * Every assertion reads the DATABASE where a write is claimed.
  *
@@ -318,7 +323,7 @@ export function runCsInboundTests(opts: { log?: boolean } = {}): Promise<TestSum
         const offCopy = { messageId: "gm-off-1", direction: "in", fromEmail: "kontakt@rettfrabonden.com", subject: "[Innkommende] Flag off (fra z@z.no)", bodyText: `Videresent fra: z\n\nhei\n\n--\nInbound-ID: ${off.id}`, sentAt: new Date(Date.now() + 3000).toISOString() };
         const rOff = await call("POST", "/ingest", { threadId: "gm-thread-1", primaryFromEmail: "kari@testgard.no", vertical: "rfb", messages: [offCopy] });
         eq([rOff.body?.newMessages, (db.prepare("SELECT COUNT(*) n FROM crm_messages WHERE id = 'gm-off-1'").get() as any).n], [1, 1], "ci82: in an aliased Gmail thread, a copy of an e-mail the server did NOT file is kept (its only record)");
-        eq(ci.findUnquotedInboundMarker(`Inbound-ID: inb-older-0001\n\nnyere tekst\n\nInbound-ID: inb-newer-0002`), "inb-newer-0002", "ci83: the LAST unquoted marker wins (older forward history above it)");
+        eq(ci.findUnquotedInboundMarker(`kundens tekst\n\nFra: oss\nInbound-ID: inb-older-0001\n\nnyere tekst\n\nInbound-ID: inb-newer-0002`), "inb-newer-0002", "ci83: without a header marker, the LAST unquoted marker wins (older forward history above it)");
         eq(ci.forwardCopyMarker({ direction: "in", bodyText: `hei\n--\nInbound-ID: ${row1.id}` }, "[Innkommende] Spørsmål (fra x)"), row1.id, "ci84: a copy without its own subject is recognised from the Gmail thread subject");
         const t0 = Date.now();
         ci.htmlToPlainText("<".repeat(80_000));
@@ -328,6 +333,26 @@ export function runCsInboundTests(opts: { log?: boolean } = {}): Promise<TestSum
         const follow2 = { messageId: "gm-msg-4", direction: "in", fromEmail: "kari@testgard.no", subject: "Re: Spørsmål", bodyText: "En ting til!", sentAt: new Date(Date.now() + 5000).toISOString() };
         await call("POST", "/ingest", { threadId: "gm-thread-1", primaryFromEmail: "kari@testgard.no", vertical: "rfb", messages: [follow2] });
         eq((db.prepare("SELECT status FROM crm_threads WHERE id = ?").get(serverThread1) as any)?.status, "new", "ci86: a new customer message via the Gmail copy path reopens a done thread");
+
+        // ci88-ci94 (third review)
+        const gmCopy1 = { messageId: "gm-msg-1", direction: "in", fromEmail: "kontakt@rettfrabonden.com", subject: "[Innkommende] Spørsmål om profilen (fra Kari Hansen <kari@testgard.no>)", bodyText: `Videresent fra: kari\n\nhei\n\n--\nInbound-ID: ${row1.id}` };
+        crm.crmService.setThreadStatus(serverThread1, "done", "claude");
+        const daniel2 = { messageId: "gm-msg-5", direction: "out", fromEmail: "da.daniel@example.no", toEmails: ["kari@testgard.no"], subject: "Re: Spørsmål", bodyText: "Svar nr. 2", sentAt: new Date(Date.now() + 6000).toISOString() };
+        await call("POST", "/ingest", { threadId: "gm-thread-1", primaryFromEmail: "kari@testgard.no", vertical: "rfb", messages: [gmCopy1, follow2, daniel2] });
+        eq((db.prepare("SELECT status FROM crm_threads WHERE id = ?").get(serverThread1) as any)?.status, "done", "ci88: Daniel's own new reply (with an already-filed customer message in the payload) does not reopen the thread");
+        const ooo = { messageId: "gm-msg-6", direction: "in", fromEmail: "kari@testgard.no", subject: "Automatisk svar: Re: Spørsmål", bodyText: "Jeg er på ferie", sentAt: new Date(Date.now() + 7000).toISOString(), rawMetadata: { automated: true } };
+        await call("POST", "/ingest", { threadId: "gm-thread-1", primaryFromEmail: "kari@testgard.no", vertical: "rfb", messages: [ooo] });
+        eq((db.prepare("SELECT status FROM crm_threads WHERE id = ?").get(serverThread1) as any)?.status, "done", "ci89: an auto-reply does not reopen the thread");
+        const outlook = { messageId: "gm-msg-7", direction: "in", fromEmail: "kari@testgard.no", bodyText: `Takk, da er alt i orden.\n\nFra: Rett fra Bonden\nVideresent fra: kari\nInbound-ID: ${row1.id}`, sentAt: new Date(Date.now() + 8000).toISOString() };
+        await call("POST", "/ingest", { threadId: "gm-thread-1", primaryFromEmail: "kari@testgard.no", subject: "[Innkommende] Spørsmål om profilen (fra Kari Hansen <kari@testgard.no>)", vertical: "rfb", messages: [outlook] });
+        eq((db.prepare("SELECT thread_id FROM crm_messages WHERE id = 'gm-msg-7'").get() as any)?.thread_id, serverThread1, "ci90: a subject-less customer reply carrying the marker unquoted (Outlook) is filed, never taken for a copy");
+        crm.crmService.setThreadStatus(serverThread1, "done", "claude"); // ci90's real customer reply reopened it, as it should
+        db.prepare("DELETE FROM inbound_email_log WHERE id = ?").run(row1.id);
+        db.prepare("DELETE FROM crm_messages WHERE id = 'gm-msg-1'").run();
+        const daniel3 = { messageId: "gm-msg-8", direction: "out", fromEmail: "da.daniel@example.no", toEmails: ["kari@testgard.no"], subject: "Re: Spørsmål", bodyText: "Svar nr. 3", sentAt: new Date(Date.now() + 9000).toISOString() };
+        const rp3 = await call("POST", "/ingest", { threadId: "gm-thread-1", primaryFromEmail: "kari@testgard.no", vertical: "rfb", messages: [gmCopy1, daniel3] });
+        eq([rp3.body?.newMessages, (db.prepare("SELECT COUNT(*) n FROM crm_messages WHERE id = 'gm-msg-1'").get() as any).n, (db.prepare("SELECT status FROM crm_threads WHERE id = ?").get(serverThread1) as any)?.status], [1, 0, "done"], "ci91: after the 90-day log purge an old copy is not filed again (and nothing reopens)");
+        eq(ci.findUnquotedInboundMarker(`Videresent fra: x\nInbound-ID: inb-header-0001\n\nkundens tekst\nInbound-ID: inb-older-0002`), "inb-header-0001", "ci92: the marker in the forward's header block wins");
       }
 
       // ci77-ci78 (review #8): a copy of an e-mail the server parked as untriaged opens no second item
@@ -340,6 +365,8 @@ export function runCsInboundTests(opts: { log?: boolean } = {}): Promise<TestSum
           [202, true, untriagedBefore, 0], "ci77: the Gmail copy of a parked e-mail is answered as parked (202 + untriaged) — no new thread, no second untriaged item");
         const ru2 = await call("POST", "/ingest", { threadId: "gm-thread-u", primaryFromEmail: "x@y.no", vertical: "rfb", messages: [uCopy, { messageId: "gm-u-2", direction: "out", fromEmail: "da.daniel@example.no", toEmails: ["x@y.no"], subject: "Re: Hei", bodyText: "Hei!", sentAt: new Date().toISOString() }] });
         ok(ru2.status === 200 && (db.prepare("SELECT COUNT(*) n FROM crm_messages WHERE id='gm-u-2'").get() as any).n === 1, "ci78: …but a Daniel reply in that Gmail thread is still filed (nothing lost)");
+        eq((db.prepare("SELECT COUNT(*) n FROM crm_messages WHERE id='gm-u-1'").get() as any).n, 0, "ci93: …without filing the parked e-mail's copy a second time");
+        ok(typeof ru.body?.untriagedId === "string" && typeof ru.body?.openUntriaged === "number", "ci94: the parked 202 carries untriagedId and openUntriaged like a regular park");
       }
 
       // ── «trenger svar» ─────────────────────────────────────────────
@@ -415,6 +442,14 @@ export function runCsInboundTests(opts: { log?: boolean } = {}): Promise<TestSum
           messages: [{ messageId: "nr-odd-date-1", direction: "in", fromEmail: "a14@x.no", sentAt: "10 Nov 2026 08:00" }] },
         "a14@x.no", "rfb");
       ok(nr.computeNeedsReply({}).threads.some((t) => t.thread_id === "nr-odd-date"), "ci87: an inbound with a sent_at julianday cannot parse is still listed (falls back to received_at)");
+      crm.crmService.ingestThread(
+        { threadId: "nr-odd-outreach", subject: "Utsending", category: "marketing",
+          messages: [
+            { messageId: "nr-odd-outreach-1", direction: "out", fromEmail: "kontakt@rettfrabonden.com", toEmails: ["a15@x.no"], sentAt: hoursAgo(50) },
+            { messageId: "nr-odd-outreach-2", direction: "in", fromEmail: "a15@x.no", sentAt: "Tue, 10 Nov 2026 08:00:00 +0100" },
+          ] },
+        "a15@x.no", "rfb");
+      ok(nr.computeNeedsReply({}).threads.some((t) => t.thread_id === "nr-odd-outreach"), "ci95: a reply to our outreach with an RFC 2822 date is still a reply (not taken for an inbound pitch)");
     } catch (err: any) {
       failed++;
       failures.push("unexpected error: " + String(err?.stack || err));

@@ -295,9 +295,10 @@ export async function runCsWatchdog(
   }
   for (const f of db
     .prepare(
-      `SELECT id, subject, from_email, received_at FROM inbound_email_log
-        WHERE forward_status = 'pending' AND julianday(received_at) < julianday(?) - 30.0 / 1440
-        ORDER BY received_at ASC LIMIT 100`,
+      `SELECT l.id, l.subject, l.from_email, l.received_at FROM inbound_email_log l
+        WHERE l.forward_status = 'pending' AND julianday(l.received_at) < julianday(?) - 30.0 / 1440
+          AND NOT EXISTS (SELECT 1 FROM cs_alert_log a WHERE a.alert_key = 'forward-pending:' || l.id)
+        ORDER BY l.received_at ASC LIMIT 100`,
     )
     .all(now.toISOString()) as Array<{ id: string; subject: string | null; from_email: string | null; received_at: string }>) {
     items.push({

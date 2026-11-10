@@ -263,6 +263,11 @@ export function runCsWatchdogTests(opts: { log?: boolean } = {}): Promise<TestSu
           const n2: any[] = [];
           await cw.runCsWatchdog({ send: async (o: any) => { n2.push(o); return { success: true }; }, now: new Date(big.getTime() + 60_000), adminEmail: "admin@example.no", trigger: "manual" });
           ok(String(n2[0]?.textContent ?? "").includes("Videresending uavklart"), "cw55: a forward stuck in pending is alerted");
+          for (let i = 0; i < 101; i++) db.prepare(`INSERT INTO inbound_email_log (id, email_id, from_email, subject, forward_status, received_at) VALUES (?, ?, 'f@x.no', ?, 'pending', ?)`).run(`inb-pq-${String(i).padStart(3, "0")}`, `pq-${i}`, `Pending ${i}`, new Date(big.getTime() - (3 + i / 100) * 3600_000).toISOString());
+          cw.recordAlerts(Array.from({ length: 100 }, (_, i) => `forward-pending:inb-pq-${String(100 - i).padStart(3, "0")}`), big);
+          const n3: any[] = [];
+          await cw.runCsWatchdog({ send: async (o: any) => { n3.push(o); return { success: true }; }, now: new Date(big.getTime() + 120_000), adminEmail: "admin@example.no", trigger: "manual" });
+          ok(String(n3[0]?.textContent ?? "").includes("Pending 0"), "cw57: already-alerted pending forwards do not take the slots of a new one");
           const dA = await cw.runCsDailyDigest({ send: async () => ({ success: false }), now: new Date("2026-11-21T06:30:00Z"), adminEmail: "admin@example.no", trigger: "manual" });
           const dB = await cw.runCsDailyDigest({ send: async () => ({ success: true }), now: new Date("2026-11-21T07:30:00Z"), adminEmail: "admin@example.no", trigger: "manual" });
           eq([dA.run_id !== dB.run_id, (db.prepare("SELECT status FROM runs WHERE run_id = ?").get(dB.run_id) as any)?.status], [true, "completed"], "cw56: a successful digest retry gets its own ledger row");

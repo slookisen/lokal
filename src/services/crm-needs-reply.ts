@@ -129,7 +129,7 @@ export function computeNeedsReply(opts: { vertical?: string | null; limit?: numb
             COALESCE(t.category, 'unknown') = 'marketing'
             AND (SELECT m0.direction FROM crm_messages m0
                   WHERE m0.thread_id = t.id
-                  ORDER BY julianday(COALESCE(m0.sent_at, m0.received_at)) ASC
+                  ORDER BY COALESCE(julianday(m0.sent_at), julianday(m0.received_at)) ASC
                   LIMIT 1) = 'in'
           )
           AND h.jd IS NOT NULL
