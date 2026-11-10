@@ -280,7 +280,7 @@ export async function runAdminPrivacyErasureTests(opts: { log?: boolean } = {}):
     assertEq(audit[0]?.email_hash, mod.erasureAddressHash(TARGET_NORM), "audit stores keyed hash");
     assertTrue(!JSON.stringify(audit[0]).includes("example.no"), "audit never stores the address");
     assertEq(JSON.parse(audit[0]?.counts_json || "{}"), EXPECTED_TARGET_COUNTS, "audit per-table counts");
-    assertEq(audit[0]?.total_rows, 20, "audit total");
+    assertEq(audit[0]?.total_rows, 21, "audit total (20 + the inbound_email_log row, S1)");
     assertEq(audit[0]?.include_suppression, 0, "audit include_suppression=0");
     assertTrue(typeof audit[0]?.requested_at === "string" && audit[0].requested_at.length > 0, "audit when");
 

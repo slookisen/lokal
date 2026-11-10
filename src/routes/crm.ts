@@ -52,8 +52,15 @@ router.use(requireAdminAuth);
 // (crm_thread_aliases). Every /threads/:id route resolves it, so the agent can
 // keep using the id it knows. Ids without an alias pass through unchanged.
 router.param("id", (req, _res, next, id) => {
-  if (req.path.startsWith("/threads/") && typeof id === "string" && id) {
-    req.params.id = resolveThreadAlias(id);
+  // Never throw here: a throw would skip the route entirely. req.path is a
+  // getter on real Express requests but may be absent on hand-built ones.
+  try {
+    const p = typeof (req as any).path === "string" ? (req as any).path : String((req as any).url ?? "");
+    if (p.startsWith("/threads/") && typeof id === "string" && id) {
+      req.params.id = resolveThreadAlias(id);
+    }
+  } catch {
+    // leave the id as given
   }
   next();
 });
