@@ -114,9 +114,15 @@ export async function retryFailedForwards(deps: { send?: SendFn; now?: Date } = 
       exhaust(r, "unparseable forward_payload");
       continue;
     }
-    // Claim the try before the await: a second, overlapping run sees the
-    // fresh updated_at and treats the row as not due.
-    db.prepare("UPDATE inbound_email_log SET updated_at = datetime('now') WHERE id = ?").run(r.id);
+    // Claim the try before the await, conditionally on the row being exactly
+    // as this run read it: a second, overlapping run loses the claim.
+    const claimed = db
+      .prepare(
+        `UPDATE inbound_email_log SET updated_at = datetime('now')
+          WHERE id = ? AND forward_status = 'failed' AND forward_attempts = ? AND COALESCE(updated_at, '') = COALESCE(?, '')`,
+      )
+      .run(r.id, r.forward_attempts, r.updated_at);
+    if (claimed.changes !== 1) continue;
     retried++;
     let res: unknown;
     let err: string | null = null;
@@ -228,6 +234,9 @@ function runStamp(now: Date): string {
   return now.toISOString().slice(0, 19).replace(/[:]/g, "");
 }
 
+/** Most items one alert e-mail itemizes (and records). */
+export const ALERT_MAX_LINES = 40;
+
 export interface AlertItem {
   key: string;
   /** Alerted a single time (true) or again every 24 h while it lasts (false). */
@@ -268,21 +277,6 @@ export async function runCsWatchdog(
   // AFTER the alert e-mail was accepted — a relay outage or a missing admin
   // address leaves the items due, so the next run tries again.
   const items: AlertItem[] = [];
-  for (const t of report.threads.filter((x) => x.level === "p0")) {
-    items.push({
-      key: `thread:${t.thread_id}`,
-      // A thread already two weeks old is a backlog item: alerted once, then only in the digest.
-      once: t.age_hours > 14 * 24,
-      line: `• [${platformName(t.vertical)}] ${t.subject ?? "(uten emne)"} — fra ${t.contact_email}, ${Math.floor(t.age_hours)} t uten svar (tråd ${t.thread_id})`,
-    });
-  }
-  for (const u of report.untriaged.filter((x) => x.level === "p0")) {
-    items.push({
-      key: `untriaged:${u.id}`,
-      once: u.age_hours > 14 * 24,
-      line: `• [Ikke fordelt] ${u.subject ?? "(uten emne)"} — fra ${u.from_email}, ${Math.floor(u.age_hours)} t (plattform ukjent)`,
-    });
-  }
   const db = getDb();
   const exhaustedRows = db
     .prepare(
@@ -299,6 +293,19 @@ export async function runCsWatchdog(
       line: `• [Videresending feilet ${FORWARD_MAX_ATTEMPTS} ganger] ${f.subject ?? "(uten emne)"} — fra ${f.from_email ?? "?"}, mottatt ${f.received_at}: ${f.forward_error ?? "ukjent feil"}`,
     });
   }
+  for (const f of db
+    .prepare(
+      `SELECT id, subject, from_email, received_at FROM inbound_email_log
+        WHERE forward_status = 'pending' AND julianday(received_at) < julianday(?) - 30.0 / 1440
+        ORDER BY received_at ASC LIMIT 100`,
+    )
+    .all(now.toISOString()) as Array<{ id: string; subject: string | null; from_email: string | null; received_at: string }>) {
+    items.push({
+      key: `forward-pending:${f.id}`,
+      once: true,
+      line: `• [Videresending uavklart] ${f.subject ?? "(uten emne)"} — fra ${f.from_email ?? "?"}, mottatt ${f.received_at}: serveren stoppet før videresendingen var ferdig`,
+    });
+  }
   const regErrors = db
     .prepare(
       `SELECT id, subject, from_email, crm_error FROM inbound_email_log
@@ -309,9 +316,29 @@ export async function runCsWatchdog(
     items.push({ key: `register:${r.id}`, once: true, line: `• [Ikke registrert i CRM] ${r.subject ?? "(uten emne)"} — fra ${r.from_email ?? "?"}: ${r.crm_error ?? "ukjent feil"}` });
   }
   for (const extra of deps.extraItems?.(now) ?? []) items.push(extra);
+  // Threads last: a backlog of old threads must never push a one-time problem
+  // (an exhausted forward, a failed registration) out of the e-mail.
+  for (const u of report.untriaged.filter((x) => x.level === "p0")) {
+    items.push({
+      key: `untriaged:${u.id}`,
+      once: u.age_hours > 14 * 24,
+      line: `• [Ikke fordelt] ${u.subject ?? "(uten emne)"} — fra ${u.from_email}, ${Math.floor(u.age_hours)} t (plattform ukjent)`,
+    });
+  }
+  for (const t of report.threads.filter((x) => x.level === "p0")) {
+    items.push({
+      key: `thread:${t.thread_id}`,
+      // A thread already two weeks old is a backlog item: alerted once, then only in the digest.
+      once: t.age_hours > 14 * 24,
+      line: `• [${platformName(t.vertical)}] ${t.subject ?? "(uten emne)"} — fra ${t.contact_email}, ${Math.floor(t.age_hours)} t uten svar (tråd ${t.thread_id})`,
+    });
+  }
 
   const due = items.filter((i) => alertDue(i.key, now, i.once));
-  const lines = due.map((i) => i.line);
+  // Only what the e-mail itemizes is recorded as alerted; the rest stays due
+  // and is itemized by the next run.
+  const shown = due.slice(0, ALERT_MAX_LINES);
+  const lines = shown.map((i) => i.line);
 
   let alertSent: boolean | null = null;
   const adminEmail = (deps.adminEmail !== undefined ? deps.adminEmail : process.env.ADMIN_NOTIFICATION_EMAIL || "")?.trim() || "";
@@ -323,21 +350,21 @@ export async function runCsWatchdog(
     } else {
       const text =
         `Disse sakene har ingen svar eller håndtering etter 24 timer, eller har feilet:\n\n` +
-        lines.slice(0, 40).join("\n") +
-        (lines.length > 40 ? `\n… og ${lines.length - 40} til.` : "") +
+        lines.join("\n") +
+        (due.length > shown.length ? `\n… og ${due.length - shown.length} til (kommer i neste varsel).` : "") +
         `\n\nAlt som venter: ${adminCrmUrl()} (Trenger svar)\n` +
         `Totalt nå: ${report.counts.threads} tråder trenger svar (${report.counts.p0} over 24 t, ${report.counts.p1} over 12 t), ` +
         `${report.counts.untriaged_open} ikke fordelt, ${report.counts.forward_failed} videresendinger feilet.\n\n` +
         `Hver sak varsles høyst én gang per døgn. — CS-vakten på serveren`;
       try {
-        alertSent = succeeded(await send({ to: adminEmail, subject: `CS-vakt: ${lines.length} sak(er) trenger handling`, textContent: text, omitAgentHeader: true }));
+        alertSent = succeeded(await send({ to: adminEmail, subject: `CS-vakt: ${due.length} sak(er) trenger handling`, textContent: text, omitAgentHeader: true }));
       } catch (e: any) {
         alertSent = false;
         env.error(`alert send failed: ${String(e?.message ?? e)}`);
       }
       if (alertSent) {
         try {
-          recordAlerts(due.map((i) => i.key), now);
+          recordAlerts(shown.map((i) => i.key), now);
         } catch (e: any) {
           env.error(`recordAlerts failed: ${String(e?.message ?? e)}`);
         }
@@ -484,7 +511,9 @@ export async function runCsDailyDigest(deps: { send?: SendFn; now?: Date; adminE
 }> {
   const now = deps.now ?? new Date();
   const send = deps.send ?? defaultSend();
-  const runId = `run-${osloClock(now).date}-cs-daily-digest`;
+  // Per run, not per day: runs is ON CONFLICT DO NOTHING, so a successful
+  // retry after a failed attempt must get its own row.
+  const runId = `run-${runStamp(now)}-cs-daily-digest`;
   const env = new EnvelopeBuilder({ run_id: runId, vertical: "rfb", agent: "cs-daily-digest", trigger_source: deps.trigger ?? "cron" });
   const digest = buildDailyDigest(now);
   const adminEmail = (deps.adminEmail !== undefined ? deps.adminEmail : process.env.ADMIN_NOTIFICATION_EMAIL || "")?.trim() || "";
@@ -527,6 +556,10 @@ export interface CsTickState {
 }
 
 let tickInFlight = false;
+let tickStartedAt = 0;
+let tickStuckReported = false;
+/** A tick running longer than this is reported (the relay is hanging). */
+export const TICK_STUCK_MS = 30 * 60_000;
 
 /** For tests: whether a tick is running right now. */
 export function csTickInFlight(): boolean {
@@ -557,9 +590,23 @@ export async function tickCsWatchdog(
   // A slow relay can make one run outlast the 10-min interval; a second run
   // over the same rows would forward the same customer e-mail twice.
   if (tickInFlight) {
+    if (!tickStuckReported && Date.now() - tickStartedAt > TICK_STUCK_MS) {
+      tickStuckReported = true;
+      const mins = Math.round((Date.now() - tickStartedAt) / 60_000);
+      console.error(`[cs-watchdog] a tick has been running for ${mins} min — watchdog, digest and purge are blocked (mail relay hanging?)`);
+      try {
+        const b = new EnvelopeBuilder({ run_id: `run-${runStamp(now)}-cs-watchdog`, vertical: "rfb", agent: "cs-watchdog", trigger_source: "cron" });
+        b.error(`tick stuck for ${mins} min — watchdog, digest and purge blocked`);
+        recordRun(b.finish("failed"));
+      } catch {
+        // ledger down — the console line above is what is left
+      }
+    }
     return { lastWatchdogAt, lastDigestAt, lastDigestAttemptAt, lastPurgeAt, ranWatchdog, ranDigest, ranPurge, skippedOverlap: true };
   }
   tickInFlight = true;
+  tickStartedAt = Date.now();
+  tickStuckReported = false;
   try {
     const db = getDb();
     const watchOn = csWatchdogEnabled(env);

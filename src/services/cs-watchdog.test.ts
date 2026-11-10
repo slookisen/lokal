@@ -13,6 +13,9 @@
  *              e-mail was accepted; exhausted forwards alerted once; overlapping
  *              ticks skipped; a failed digest retried hourly; a throwing
  *              watchdog does not block the digest; daily purge with flags off.
+ *   cw53-cw56  second review: one-time problems are itemized before a thread
+ *              backlog and only itemized keys are recorded; a forward stuck in
+ *              pending is alerted; a digest retry gets its own ledger row.
  *
  * Standalone:
  *   node node_modules/tsx/dist/cli.mjs src/services/cs-watchdog.test.ts
@@ -175,6 +178,10 @@ export function runCsWatchdogTests(opts: { log?: boolean } = {}): Promise<TestSu
       // ── review B3: an item is only recorded as alerted once the alert went out ──
       {
         const t1 = new Date(now.getTime() + 3 * 3600_000);
+        // Isolate from the 100 legacy rows above (already handled in their own test):
+        // one fresh exhausted forward is the forward this block follows.
+        cw.recordAlerts((db.prepare("SELECT id FROM inbound_email_log WHERE forward_status = 'exhausted'").all() as Array<{ id: string }>).map((r) => `forward:${r.id}`), t1);
+        db.prepare(`INSERT INTO inbound_email_log (id, email_id, from_email, subject, forward_status, forward_attempts, received_at) VALUES ('inb-b3-ex', 'b3-ex', 'f@x.no', 'B3 videresending', 'exhausted', 4, ?)`).run(hoursBefore(t1, 1));
         crm.crmService.ingestThread(
           { threadId: "wd-b3", subject: "Varsel må fram", category: "innkommende",
             messages: [{ messageId: "wd-b3-m", direction: "in", fromEmail: "kunde4@x.no", sentAt: hoursBefore(t1, 28) }] },
@@ -185,7 +192,7 @@ export function runCsWatchdogTests(opts: { log?: boolean } = {}): Promise<TestSu
         const got: any[] = [];
         const t2 = new Date(t1.getTime() + 3600_000);
         await cw.runCsWatchdog({ send: async (o: any) => { got.push(o); return { success: true }; }, now: t2, adminEmail: "admin@example.no", trigger: "manual" });
-        ok(got.length === 1 && String(got[0].textContent).includes("Varsel må fram"), "cw42: the next run alerts it");
+        ok(got.length === 1 && String(got[0].textContent).includes("Varsel må fram") && String(got[0].textContent).includes("B3 videresending"), "cw42: the next run alerts it");
         ok(cw.alertDue("thread:wd-b3", new Date(t2.getTime() + 3600_000)) === false, "cw43: …and records it after the accepted send");
         // exhausted forwards: alerted once, never again
         const fw = await cw.runCsWatchdog({ send: async (o: any) => { got.push(o); return { success: true }; }, now: new Date(t2.getTime() + 26 * 3600_000), adminEmail: "admin@example.no", trigger: "manual" });
@@ -233,6 +240,32 @@ export function runCsWatchdogTests(opts: { log?: boolean } = {}): Promise<TestSu
           const p1 = await cw.tickCsWatchdog({ lastWatchdogAt: null, lastDigestAt: null, lastPurgeAt: null }, { now: T0, env: {} as any });
           const p2 = await cw.tickCsWatchdog(p1, { now: new Date(T0.getTime() + 3600_000), env: {} as any });
           eq([p1.ranPurge, p2.ranPurge], [true, false], "cw52: with both flags off the log is still purged, once a day");
+
+          // cw53-cw56 (second review)
+          // Ages come from SQL 'now' (real time): the threads are 30 h old for real;
+          // the run clock is days ahead so no earlier alert is still inside its 24 h.
+          const big = new Date(Date.now() + 5 * 86400_000);
+          for (let i = 0; i < 45; i++) {
+            crm.crmService.ingestThread(
+              { threadId: `wd-bk-${i}`, subject: `Backlog ${i}`, category: "innkommende",
+                messages: [{ messageId: `wd-bk-${i}-m`, direction: "in", fromEmail: `bk${i}@x.no`, sentAt: new Date(Date.now() - 30 * 3600_000).toISOString() }] },
+              `bk${i}@x.no`, "rfb");
+          }
+          db.prepare(`INSERT INTO inbound_email_log (id, email_id, from_email, subject, forward_status, forward_attempts, received_at) VALUES ('inb-n1-ex', 'n1-ex', 'f@x.no', 'Tapt videresending', 'exhausted', 4, ?)`).run(new Date(big.getTime() - 3600_000).toISOString());
+          db.prepare(`INSERT INTO inbound_email_log (id, email_id, from_email, subject, crm_status, crm_error, received_at) VALUES ('inb-n1-reg', 'n1-reg', 'f@x.no', 'Ikke registrert', 'error', 'boom', ?)`).run(new Date(big.getTime() - 3600_000).toISOString());
+          const n1: any[] = [];
+          await cw.runCsWatchdog({ send: async (o: any) => { n1.push(o); return { success: true }; }, now: big, adminEmail: "admin@example.no", trigger: "manual" });
+          const n1text = String(n1[0]?.textContent ?? "");
+          ok(n1text.includes("Tapt videresending") && n1text.includes("Ikke registrert"), "cw53: with 45 overdue threads, the exhausted forward and the registration error are still itemized");
+          const notShown = Array.from({ length: 45 }, (_, i) => `thread:wd-bk-${i}`).filter((k) => cw.alertDue(k, big));
+          ok(notShown.length > 0 && n1text.includes("kommer i neste varsel"), "cw54: items beyond the 40 shown stay due for the next alert");
+          db.prepare(`INSERT INTO inbound_email_log (id, email_id, from_email, subject, forward_status, received_at) VALUES ('inb-pend', 'pend', 'f@x.no', 'Henger i pending', 'pending', ?)`).run(new Date(big.getTime() - 2 * 3600_000).toISOString());
+          const n2: any[] = [];
+          await cw.runCsWatchdog({ send: async (o: any) => { n2.push(o); return { success: true }; }, now: new Date(big.getTime() + 60_000), adminEmail: "admin@example.no", trigger: "manual" });
+          ok(String(n2[0]?.textContent ?? "").includes("Videresending uavklart"), "cw55: a forward stuck in pending is alerted");
+          const dA = await cw.runCsDailyDigest({ send: async () => ({ success: false }), now: new Date("2026-11-21T06:30:00Z"), adminEmail: "admin@example.no", trigger: "manual" });
+          const dB = await cw.runCsDailyDigest({ send: async () => ({ success: true }), now: new Date("2026-11-21T07:30:00Z"), adminEmail: "admin@example.no", trigger: "manual" });
+          eq([dA.run_id !== dB.run_id, (db.prepare("SELECT status FROM runs WHERE run_id = ?").get(dB.run_id) as any)?.status], [true, "completed"], "cw56: a successful digest retry gets its own ledger row");
         } finally {
           if (prevAdmin === undefined) delete process.env.ADMIN_NOTIFICATION_EMAIL;
           else process.env.ADMIN_NOTIFICATION_EMAIL = prevAdmin;

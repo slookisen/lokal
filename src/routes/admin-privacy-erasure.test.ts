@@ -152,6 +152,8 @@ function seed(db: Database.Database): void {
   db.prepare(`INSERT INTO inbound_email_log (id, email_id, from_email, to_emails, cc_emails, subject) VALUES ('inb-cc', 'em-cc', 'third@example.no', '["kontakt@rettfrabonden.com"]', ?, 's')`).run(
     JSON.stringify([TARGET_NORM]),
   );
+  // Linked ONLY by the thread: a colleague writing on the target's thread.
+  db.prepare(`INSERT INTO inbound_email_log (id, email_id, from_email, to_emails, cc_emails, subject, crm_thread_id, forward_payload) VALUES ('inb-thread', 'em-th', 'colleague@example.no', '["kontakt@rettfrabonden.com"]', '[]', 's', 'th-t', '{"textContent":"x"}')`).run();
   db.prepare(`INSERT INTO inbound_email_log (id, email_id, from_email, to_emails, cc_emails, subject) VALUES ('inb-lookalike', 'em-la', 'third@example.no', ?, '[]', 's')`).run(
     JSON.stringify(["x" + TARGET_NORM]),
   );
@@ -170,10 +172,10 @@ const EXPECTED_TARGET_COUNTS: Record<string, number> = {
   crm_messages: 4,
   crm_thread_flags: 1,
   crm_thread_aliases: 1,
+  inbound_email_log: 3,
   crm_threads: 2,
   crm_contacts: 2,
   crm_untriaged: 1,
-  inbound_email_log: 2,
   outreach_sent_log: 1,
   rfb_marketing_send_ledger: 1,
   resend_webhook_events: 1,
@@ -295,7 +297,7 @@ export async function runAdminPrivacyErasureTests(opts: { log?: boolean } = {}):
     assertEq(audit[0]?.email_hash, mod.erasureAddressHash(TARGET_NORM), "audit stores keyed hash");
     assertTrue(!JSON.stringify(audit[0]).includes("example.no"), "audit never stores the address");
     assertEq(JSON.parse(audit[0]?.counts_json || "{}"), EXPECTED_TARGET_COUNTS, "audit per-table counts");
-    assertEq(audit[0]?.total_rows, 24, "audit total (20 + 2 inbound_email_log rows + crm_thread_flags + crm_thread_aliases, S1)");
+    assertEq(audit[0]?.total_rows, 25, "audit total (20 + 3 inbound_email_log rows + crm_thread_flags + crm_thread_aliases, S1)");
     assertEq(audit[0]?.include_suppression, 0, "audit include_suppression=0");
     assertTrue(typeof audit[0]?.requested_at === "string" && audit[0].requested_at.length > 0, "audit when");
 

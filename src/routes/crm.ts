@@ -1235,16 +1235,23 @@ router.post("/ingest", (req, res) => {
       const first = times.every((t) => Number.isFinite(t))
         ? msgs[times.indexOf(Math.min(...times))]
         : msgs[0];
-      const logId = forwardCopyMarker(first);
+      const logId = forwardCopyMarker(first, parsed.data.subject);
       if (logId) {
         const hit = serverThreadForMarker(logId);
         if (hit?.kind === "thread") canonical = { threadId: hit.threadId, vertical: hit.vertical, contactId: hit.contactId };
         else if (hit?.kind === "untriaged") parkedLogId = logId;
       }
     }
+    // A copy is left out only when the server itself filed THAT e-mail (as a
+    // thread or parked). A copy of an e-mail the server did not file (flag
+    // off, registration error) is the only record of it and is filed here.
+    const serverFiled = (m: (typeof parsed.data.messages)[number]): boolean => {
+      const id = forwardCopyMarker(m, parsed.data.subject);
+      return id !== null && serverThreadForMarker(id) !== null;
+    };
     if (canonical) {
       recordThreadAlias(parsed.data.threadId, canonical.threadId, "cs_gmail_copy");
-      const rest = parsed.data.messages.filter((m) => forwardCopyMarker(m) === null);
+      const rest = parsed.data.messages.filter((m) => !serverFiled(m));
       let newMessages = 0;
       if (rest.length > 0) {
         // The contact is the server thread's own — never whatever primaryFromEmail
@@ -1260,6 +1267,22 @@ router.post("/ingest", (req, res) => {
         } catch (err: any) {
           return res.status(500).json({ error: String(err?.message ?? "ingest failed") });
         }
+        // A new message from a person (e.g. the customer answering Daniel's
+        // Gmail reply directly) reopens a done/archived thread, as on the
+        // server path.
+        if (newMessages > 0 && rest.some((m) => m.direction === "in")) {
+          const st = getDb().prepare("SELECT status FROM crm_threads WHERE id = ?").get(canonical.threadId) as { status: string } | undefined;
+          if (st && (st.status === "done" || st.status === "archived")) {
+            crmService.setThreadStatus(canonical.threadId, "new", "system");
+            crmService.logAction({
+              threadId: canonical.threadId,
+              contactId: canonical.contactId,
+              type: "reopened_by_inbound",
+              actor: "system",
+              payload: { previousStatus: st.status, via: "cs_gmail_ingest" },
+            });
+          }
+        }
       }
       return res.json({
         threadId: canonical.threadId,
@@ -1272,8 +1295,11 @@ router.post("/ingest", (req, res) => {
     // The server parked the original as untriaged. The copy alone adds nothing
     // (filing it would open a second item for the same e-mail); if the Gmail
     // thread holds more than the copy, fall through so nothing is lost.
-    if (parkedLogId && parsed.data.messages.every((m) => forwardCopyMarker(m) !== null)) {
-      return res.json({
+    if (parkedLogId && parsed.data.messages.every((m) => serverFiled(m))) {
+      // Same contract as a parked ingest (202 + untriaged: true): the caller
+      // must not compose against this thread.
+      return res.status(202).json({
+        untriaged: true,
         threadId: null,
         newMessages: 0,
         serverRegistered: true,

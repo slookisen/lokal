@@ -69,34 +69,52 @@ export function findInboundMarker(...texts: Array<string | null | undefined>): s
 // Gmail reply quotes the forward («> Inbound-ID: …» in text, a blockquote /
 // gmail_quote in HTML) — that is a different message which must still be
 // filed, so a quoted marker never counts.
-const MARKER_LINE_RE = /^[ \t]*Inbound-ID:[ \t]*(inb-[A-Za-z0-9-]{8,64})[ \t]*$/m;
+const MARKER_LINE_RE = /^[ \t]*Inbound-ID:[ \t]*(inb-[A-Za-z0-9-]{8,64})[ \t]*$/gm;
+
+/** Longest HTML we strip — longer bodies are cut first (bounded regex work). */
+const HTML_SCAN_MAX = 200_000;
 
 function htmlWithoutQuotes(html: string): string {
-  let s = html;
-  // Gmail puts the quoted history in a gmail_quote container that runs to the end.
-  s = s.replace(/<div[^>]*class="[^"]*gmail_quote[\s\S]*$/i, " ");
-  for (let i = 0; i < 5 && /<blockquote/i.test(s); i++) s = s.replace(/<blockquote[^>]*>(?:(?!<blockquote)[\s\S])*?<\/blockquote>/gi, " ");
+  let s = html.length > HTML_SCAN_MAX ? html.slice(0, HTML_SCAN_MAX) : html;
+  // Gmail puts the quoted history in a gmail_quote container that runs to the
+  // end. Tag patterns use [^<>] so an unterminated "<" cannot make them
+  // backtrack over the whole body (quadratic on hostile input).
+  s = s.replace(/<div[^<>]*class="[^"<>]*gmail_quote[\s\S]*$/i, " ");
+  for (let i = 0; i < 5 && /<blockquote/i.test(s); i++) s = s.replace(/<blockquote[^<>]*>(?:(?!<blockquote)[\s\S])*?<\/blockquote>/gi, " ");
   s = s.replace(/<blockquote[\s\S]*$/i, " ");
   s = s
-    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<br[^<>]*>/gi, "\n")
     .replace(/<\/(p|div|li|tr|h[1-6]|pre)>/gi, "\n")
-    .replace(/<[^>]+>/g, " ")
+    .replace(/<[^<>]*>/g, " ")
     .replace(/&nbsp;/gi, " ")
     .replace(/&amp;/gi, "&");
   return s;
 }
 
+/** The LAST unquoted marker line (an older forward's history may sit above it unquoted, Outlook-style). */
+function lastMarkerLine(text: string): string | null {
+  let last: string | null = null;
+  for (const m of text.matchAll(MARKER_LINE_RE)) last = m[1];
+  return last;
+}
+
 /** The log id when the marker stands on an unquoted line of the text (or of the HTML with its quotes removed). */
 export function findUnquotedInboundMarker(bodyText: string | null | undefined, bodyHtml?: string | null): string | null {
   if (typeof bodyText === "string" && bodyText) {
-    const m = MARKER_LINE_RE.exec(bodyText);
-    if (m) return m[1];
+    const m = lastMarkerLine(bodyText);
+    if (m) return m;
   }
   if (typeof bodyHtml === "string" && bodyHtml) {
-    const m = MARKER_LINE_RE.exec(htmlWithoutQuotes(bodyHtml));
-    if (m) return m[1];
+    const m = lastMarkerLine(htmlWithoutQuotes(bodyHtml));
+    if (m) return m;
   }
   return null;
+}
+
+/** Plain text from untrusted HTML without quadratic regex work. */
+export function htmlToPlainText(html: string): string {
+  const s = html.length > HTML_SCAN_MAX ? html.slice(0, HTML_SCAN_MAX) : html;
+  return s.replace(/<[^<>]*>/g, " ").replace(/\s+/g, " ").trim();
 }
 
 const FORWARD_SUBJECT_RE = /^\s*\[Innkommende\]/i;
@@ -106,14 +124,19 @@ const FORWARD_SUBJECT_RE = /^\s*\[Innkommende\]/i;
  * subject starts with «[Innkommende]» (a «Fwd:»/«Re:» of it does not) and
  * whose own, unquoted text carries the marker. Anything else returns null.
  */
-export function forwardCopyMarker(m: {
-  direction?: string | null;
-  subject?: string | null;
-  bodyText?: string | null;
-  bodyHtml?: string | null;
-}): string | null {
+export function forwardCopyMarker(
+  m: {
+    direction?: string | null;
+    subject?: string | null;
+    bodyText?: string | null;
+    bodyHtml?: string | null;
+  },
+  /** The Gmail thread's subject, used when the message itself carries none. */
+  fallbackSubject?: string | null,
+): string | null {
   if (m.direction !== "in") return null;
-  if (!FORWARD_SUBJECT_RE.test(m.subject ?? "")) return null;
+  const subject = m.subject ?? fallbackSubject ?? "";
+  if (!FORWARD_SUBJECT_RE.test(subject)) return null;
   return findUnquotedInboundMarker(m.bodyText, m.bodyHtml);
 }
 

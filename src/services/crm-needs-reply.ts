@@ -97,7 +97,8 @@ export function computeNeedsReply(opts: { vertical?: string | null; limit?: numb
   const rows = db
     .prepare(
       `WITH h AS (
-         SELECT m.thread_id, MAX(julianday(COALESCE(m.sent_at, m.received_at))) AS jd
+         -- A sent_at julianday cannot parse falls back to received_at.
+         SELECT m.thread_id, MAX(COALESCE(julianday(m.sent_at), julianday(m.received_at))) AS jd
            FROM crm_messages m
           WHERE m.direction = 'in'
             -- COALESCE: a message without the flag ('{}' / NULL metadata) is human.

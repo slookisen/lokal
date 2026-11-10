@@ -33,6 +33,7 @@ import {
   classifyAutomated,
   csInboundServerIngestEnabled,
   deriveInboundVertical,
+  htmlToPlainText,
   inboundMarkerLine,
   insertInboundLog,
   newInboundLogId,
@@ -205,7 +206,7 @@ export async function handleInboundEmailWebhook(req: Request, res: Response, dep
             toEmails,
             ccEmails,
             subject: typeof subject === "string" ? subject : null,
-            bodyText: text || (html ? html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim() : null),
+            bodyText: text || (html ? htmlToPlainText(html) : null),
             bodyHtml: html || null,
             sentAt: createdAt,
             headers,
@@ -239,6 +240,11 @@ export async function handleInboundEmailWebhook(req: Request, res: Response, dep
       ? `<p style="color:#999;font-size:11px;margin-top:24px;">${escapeHtml(inboundMarkerLine(logId))}</p>`
       : "";
 
+    // The marker also goes in the header block at the TOP, so a copy whose
+    // text the reader truncates, or whose HTML ends inside the customer's own
+    // quoted history, still carries it on an unquoted line.
+    const markerTopHtml = logId ? `<br><span style="color:#999">${escapeHtml(inboundMarkerLine(logId))}</span>` : "";
+    const markerTopText = logId ? `\n${inboundMarkerLine(logId)}` : "";
     const forwardOptions = {
       to: forwardTo,
       subject: `[Innkommende] ${subject} (fra ${from})`,
@@ -246,12 +252,12 @@ export async function handleInboundEmailWebhook(req: Request, res: Response, dep
         <div style="border-bottom:1px solid #ccc;padding-bottom:8px;margin-bottom:16px;color:#666;font-size:13px;">
           <strong>Fra:</strong> ${from}<br>
           <strong>Til:</strong> ${Array.isArray(to) ? to.join(", ") : to}<br>
-          <strong>Emne:</strong> ${subject}
+          <strong>Emne:</strong> ${subject}${markerTopHtml}
         </div>
         ${bodyHtml}
         ${markerHtml}
       `,
-      textContent: `Videresent fra: ${from}\nTil: ${Array.isArray(to) ? to.join(", ") : to}\nEmne: ${subject}\n\n${bodyText}${markerText}`,
+      textContent: `Videresent fra: ${from}\nTil: ${Array.isArray(to) ? to.join(", ") : to}\nEmne: ${subject}${markerTopText}\n\n${bodyText}${markerText}`,
       replyTo: senderEmail,
     };
 

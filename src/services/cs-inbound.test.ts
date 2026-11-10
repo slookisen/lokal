@@ -25,6 +25,9 @@
  *              second item; «Re: [Innkommende] X (fra …)» normalises; an
  *              auto-reply never hides an earlier human message; thread stats
  *              pick the latest by time across mixed timestamp formats.
+ *   ci82-ci87  second review: a copy the server did NOT file is kept; the last
+ *              marker wins; subject fallback; linear-time HTML stripping;
+ *              reopen via the Gmail path; unparseable sent_at still listed.
  *
  * Every assertion reads the DATABASE where a write is claimed.
  *
@@ -147,6 +150,7 @@ export function runCsInboundTests(opts: { log?: boolean } = {}): Promise<TestSum
         eq([m?.direction, m?.from_email, m?.thread_id === row?.crm_thread_id], ["in", "kari@testgard.no", true], "ci24: the message is filed in that thread");
         const last = sent[sent.length - 1];
         ok(String(last?.textContent).includes(`Inbound-ID: ${row?.id}`), "ci25: the Gmail forward carries the Inbound-ID marker");
+        ok(String(last?.textContent).indexOf(`Inbound-ID: ${row?.id}`) < String(last?.textContent).indexOf("\n\n"), "ci25b: …also in the header at the top (survives a truncated body)");
       }
 
       // ci26-ci28: BUG FIX — a failed forward is recorded as failed and kept
@@ -306,14 +310,34 @@ export function runCsInboundTests(opts: { log?: boolean } = {}): Promise<TestSum
         eq([ci.recordThreadAlias("compose-bbb", serverThread, "test"), ci.resolveThreadAlias("compose-bbb")], [false, "compose-bbb"], "ci76: an id that is a real thread is never made an alias (no hijack of its routes)");
       }
 
+      // ci82-ci87 (second review): copies the server did NOT file are kept; marker robustness; reopen via Gmail
+      {
+        const row1 = logRow("em1");
+        const serverThread1 = row1.crm_thread_id;
+        const off = logRow("em12"); // filed with the flag off → crm_status 'disabled'
+        const offCopy = { messageId: "gm-off-1", direction: "in", fromEmail: "kontakt@rettfrabonden.com", subject: "[Innkommende] Flag off (fra z@z.no)", bodyText: `Videresent fra: z\n\nhei\n\n--\nInbound-ID: ${off.id}`, sentAt: new Date(Date.now() + 3000).toISOString() };
+        const rOff = await call("POST", "/ingest", { threadId: "gm-thread-1", primaryFromEmail: "kari@testgard.no", vertical: "rfb", messages: [offCopy] });
+        eq([rOff.body?.newMessages, (db.prepare("SELECT COUNT(*) n FROM crm_messages WHERE id = 'gm-off-1'").get() as any).n], [1, 1], "ci82: in an aliased Gmail thread, a copy of an e-mail the server did NOT file is kept (its only record)");
+        eq(ci.findUnquotedInboundMarker(`Inbound-ID: inb-older-0001\n\nnyere tekst\n\nInbound-ID: inb-newer-0002`), "inb-newer-0002", "ci83: the LAST unquoted marker wins (older forward history above it)");
+        eq(ci.forwardCopyMarker({ direction: "in", bodyText: `hei\n--\nInbound-ID: ${row1.id}` }, "[Innkommende] Spørsmål (fra x)"), row1.id, "ci84: a copy without its own subject is recognised from the Gmail thread subject");
+        const t0 = Date.now();
+        ci.htmlToPlainText("<".repeat(80_000));
+        ci.findUnquotedInboundMarker(null, "<div class=" + "<".repeat(80_000));
+        ok(Date.now() - t0 < 1000, "ci85: hostile unterminated-tag HTML is handled in linear time (no event-loop stall)");
+        crm.crmService.setThreadStatus(serverThread1, "done", "claude");
+        const follow2 = { messageId: "gm-msg-4", direction: "in", fromEmail: "kari@testgard.no", subject: "Re: Spørsmål", bodyText: "En ting til!", sentAt: new Date(Date.now() + 5000).toISOString() };
+        await call("POST", "/ingest", { threadId: "gm-thread-1", primaryFromEmail: "kari@testgard.no", vertical: "rfb", messages: [follow2] });
+        eq((db.prepare("SELECT status FROM crm_threads WHERE id = ?").get(serverThread1) as any)?.status, "new", "ci86: a new customer message via the Gmail copy path reopens a done thread");
+      }
+
       // ci77-ci78 (review #8): a copy of an e-mail the server parked as untriaged opens no second item
       {
         const u = logRow("em11");
         const untriagedBefore = (db.prepare("SELECT COUNT(*) n FROM crm_untriaged").get() as any).n;
         const uCopy = { messageId: "gm-u-1", direction: "in", fromEmail: "kontakt@rettfrabonden.com", subject: "[Innkommende] Hei (fra x@y.no)", bodyText: `hei\n\n--\nInbound-ID: ${u.id}` };
         const ru = await call("POST", "/ingest", { threadId: "gm-thread-u", primaryFromEmail: "x@y.no", vertical: "rfb", messages: [uCopy] });
-        eq([ru.status, ru.body?.parkedUntriaged, (db.prepare("SELECT COUNT(*) n FROM crm_untriaged").get() as any).n, (db.prepare("SELECT COUNT(*) n FROM crm_threads WHERE id='gm-thread-u'").get() as any).n],
-          [200, true, untriagedBefore, 0], "ci77: the Gmail copy of a parked e-mail is answered as parked — no new thread, no second untriaged item");
+        eq([ru.status, ru.body?.parkedUntriaged && ru.body?.untriaged, (db.prepare("SELECT COUNT(*) n FROM crm_untriaged").get() as any).n, (db.prepare("SELECT COUNT(*) n FROM crm_threads WHERE id='gm-thread-u'").get() as any).n],
+          [202, true, untriagedBefore, 0], "ci77: the Gmail copy of a parked e-mail is answered as parked (202 + untriaged) — no new thread, no second untriaged item");
         const ru2 = await call("POST", "/ingest", { threadId: "gm-thread-u", primaryFromEmail: "x@y.no", vertical: "rfb", messages: [uCopy, { messageId: "gm-u-2", direction: "out", fromEmail: "da.daniel@example.no", toEmails: ["x@y.no"], subject: "Re: Hei", bodyText: "Hei!", sentAt: new Date().toISOString() }] });
         ok(ru2.status === 200 && (db.prepare("SELECT COUNT(*) n FROM crm_messages WHERE id='gm-u-2'").get() as any).n === 1, "ci78: …but a Daniel reply in that Gmail thread is still filed (nothing lost)");
       }
@@ -386,6 +410,11 @@ export function runCsInboundTests(opts: { log?: boolean } = {}): Promise<TestSum
           ] },
         "a13@x.no", "rfb");
       eq((db.prepare("SELECT last_inbound_at FROM crm_threads WHERE id = 'ts-mix'").get() as any)?.last_inbound_at, "2026-11-09 09:30:00", "ci81: thread stats pick the latest by time, not by string, across mixed formats");
+      crm.crmService.ingestThread(
+        { threadId: "nr-odd-date", subject: "Rar dato", category: "innkommende",
+          messages: [{ messageId: "nr-odd-date-1", direction: "in", fromEmail: "a14@x.no", sentAt: "10 Nov 2026 08:00" }] },
+        "a14@x.no", "rfb");
+      ok(nr.computeNeedsReply({}).threads.some((t) => t.thread_id === "nr-odd-date"), "ci87: an inbound with a sent_at julianday cannot parse is still listed (falls back to received_at)");
     } catch (err: any) {
       failed++;
       failures.push("unexpected error: " + String(err?.stack || err));
