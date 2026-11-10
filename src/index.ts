@@ -85,6 +85,7 @@ import adminOutreachMaxTouchVernRoutes from "./routes/admin-outreach-max-touch-v
 import { rfbMarketingLaneRouter, rfbMarketingDailyRunRouter } from "./routes/admin-rfb-marketing";
 import { tickRfbMarketingDaily } from "./services/rfb-marketing-daily";
 import { tickCsWatchdog, type CsTickState } from "./services/cs-watchdog";
+import { csAutosendEnabled, runCsAutosend } from "./services/cs-reply-proposals";
 import { rfbEnrichmentNightlyRouter } from "./routes/admin-rfb-enrichment-nightly";
 import {
   isRfbEnrichmentNightlyEnabled,
@@ -2816,6 +2817,28 @@ if (process.env.RFB_MARKETING_PLATFORM_ENABLED === "1") {
   });
   setTimeout(() => { void csWatchdogTick(); }, 180_000);
   setInterval(() => { void csWatchdogTick(); }, 10 * 60_000);
+}
+
+// ─── CS på serveren, S2: the reply-proposal send worker (CS_AUTOSEND_ENABLED) ──
+// Every minute: recover expired leases, then evaluate + send due proposals
+// (or park them in the approval queue with the reason). With the flag off the
+// worker is not registered and the watchdog moves new proposals to the queue.
+if (csAutosendEnabled()) {
+  let csAutosendBusy = false;
+  const csAutosendTick = trackJob("cs-autosend", async () => {
+    if (csAutosendBusy) return;
+    csAutosendBusy = true;
+    try {
+      const r = await runCsAutosend();
+      if (r.run_id) console.log(`[cs-autosend] ${r.processed.map((p) => p.outcome).join(",")} recovered=${r.recovered_leases.length}`);
+    } catch (err) {
+      console.error("[cs-autosend] tick failed (non-fatal, retried next minute):", err);
+    } finally {
+      csAutosendBusy = false;
+    }
+  });
+  setTimeout(() => { void csAutosendTick(); }, 200_000);
+  setInterval(() => { void csAutosendTick(); }, 60_000);
 }
 
 // ─── dev-request 2026-10-10-rfb-berikelse-nattjobb (R6; Daniel GO 2026-10-10,

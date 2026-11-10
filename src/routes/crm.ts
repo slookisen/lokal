@@ -37,6 +37,16 @@ import {
 } from "../services/cs-inbound";
 import { computeNeedsReply, markNoReplyNeeded } from "../services/crm-needs-reply";
 import { buildDailyDigest, INBOUND_LOG_RETENTION_DAYS } from "../services/cs-watchdog";
+import {
+  REPLY_KINDS,
+  approveProposal,
+  createReplyProposal,
+  editProposal,
+  getProposal,
+  listProposals,
+  rejectProposal,
+  type ProposalStatus,
+} from "../services/cs-reply-proposals";
 
 // ─── Admin auth (matches the fleet-wide admin-route pattern, e.g.
 // admin-affiliations.ts / admin-hanen.ts: ADMIN_KEY primary,
@@ -1578,6 +1588,95 @@ router.post("/threads/:id/no-reply-needed", (req, res) => {
 // Daniel's queue of mail the server refused to route. Open items only unless
 // ?includeResolved=1. This is the whole point of steg 4: the undecidable case
 // is a countable list somebody looks at, not a message that quietly vanished.
+// ─── CS på serveren, S2: reply proposals + approval queue ────────────
+// dev-request 2026-11-10-cs-paa-serveren, skive S2. The CS routine proposes;
+// the server sends (cs-autosend) or parks the proposal here with the reason.
+// The recipient is never a parameter: it is the sender of the thread's latest
+// human inbound message.
+const proposalSchema = z.object({
+  kind: z.enum(REPLY_KINDS),
+  subject: z.string().max(500).nullable().optional(),
+  bodyText: z.string().min(1).max(50000),
+  bodyHtml: z.string().max(100000).nullable().optional(),
+  changeRequestIds: z.array(z.string().min(1).max(120)).max(20).optional(),
+  evidence: z.unknown().optional(),
+  createdBy: z.enum(["claude", "daniel"]).default("claude"),
+});
+
+router.post("/threads/:id/reply-proposals", (req, res) => {
+  const parsed = proposalSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
+  const r = createReplyProposal({ threadId: req.params.id, ...parsed.data, evidence: parsed.data.evidence });
+  if (!r.ok) return res.status(r.status).json({ error: r.error, detail: r.detail });
+  res.status(201).json({ proposal: r.proposal, superseded: r.superseded });
+});
+
+router.get("/threads/:id/reply-proposals", (req, res) => {
+  res.json({ items: listProposals({ threadId: req.params.id, limit: 100 }) });
+});
+
+const PROPOSAL_STATUSES: ReadonlyArray<ProposalStatus | "open"> = [
+  "open", "pending", "approval_needed", "approved", "sending", "sent", "failed", "rejected", "superseded",
+];
+
+router.get("/reply-proposals", (req, res) => {
+  const status = (req.query.status as string | undefined) ?? "approval_needed";
+  if (!PROPOSAL_STATUSES.includes(status as any)) return res.status(400).json({ error: "invalid status" });
+  const limit = Math.min(parseInt(String(req.query.limit ?? "100"), 10) || 100, 500);
+  res.json({ items: listProposals({ status: status as any, limit }) });
+});
+
+router.get("/reply-proposals/:pid", (req, res) => {
+  const p = getProposal(req.params.pid);
+  if (!p) return res.status(404).json({ error: "proposal not found" });
+  res.json({ proposal: p });
+});
+
+const proposalEditSchema = z.object({
+  subject: z.string().min(1).max(500).optional(),
+  bodyText: z.string().min(1).max(50000).optional(),
+  bodyHtml: z.string().max(100000).nullable().optional(),
+  kind: z.enum(REPLY_KINDS).optional(),
+  changeRequestIds: z.array(z.string().min(1).max(120)).max(20).optional(),
+  note: z.string().max(300).optional(),
+});
+
+/** Where an approval came from — the admin page marks its own calls. Audit only (the admin key is shared). */
+function approvalSource(req: Request): "admin-crm" | "api" {
+  return req.get("X-Admin-Client") === "admin-crm" ? "admin-crm" : "api";
+}
+
+router.post("/reply-proposals/:pid/approve", async (req, res) => {
+  const parsed = proposalEditSchema.safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
+  const { note, ...edits } = parsed.data;
+  try {
+    const r = await approveProposal(req.params.pid, { edits, note: note ?? null, actor: "daniel", source: approvalSource(req) });
+    if (!r.ok) return res.status(r.status).json({ error: r.error });
+    const sent = r.result.outcome === "sent";
+    res.status(sent ? 200 : 409).json({ sent, result: r.result, proposal: r.proposal });
+  } catch (err: any) {
+    res.status(500).json({ error: String(err?.message ?? err) });
+  }
+});
+
+router.post("/reply-proposals/:pid/edit", (req, res) => {
+  const parsed = proposalEditSchema.safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
+  const { note: _note, ...edits } = parsed.data;
+  const r = editProposal(req.params.pid, edits, "daniel");
+  if (!r.ok) return res.status(r.status).json({ error: r.error });
+  res.json({ proposal: r.proposal });
+});
+
+router.post("/reply-proposals/:pid/reject", (req, res) => {
+  const parsed = z.object({ reason: z.string().trim().min(1).max(300), actor: z.enum(["daniel", "claude"]).default("daniel") }).safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
+  const r = rejectProposal(req.params.pid, parsed.data.reason, parsed.data.actor);
+  if (!r.ok) return res.status(r.status).json({ error: r.error });
+  res.json({ success: true, proposal: getProposal(req.params.pid) });
+});
+
 router.get("/untriaged", (req, res) => {
   const includeResolved = String(req.query.includeResolved ?? "") === "1";
   const limit = parseInt(String(req.query.limit ?? "100"), 10) || 100;
@@ -1822,6 +1921,17 @@ router.post("/outbox/:id/result", (req, res) => {
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "invalid body" });
+
+  // CS på serveren, S2.5: a result is only accepted for a row that is still
+  // waiting (pending / processing). An unknown id is 404; a repeat of the SAME
+  // outcome is an idempotent 200; anything else (e.g. "completed" on a row the
+  // server already marked failed) is 409 — it used to overwrite silently.
+  const current = getDb().prepare("SELECT status FROM crm_outbox WHERE id = ?").get(req.params.id) as { status: string } | undefined;
+  if (!current) return res.status(404).json({ error: "outbox item not found" });
+  if (current.status === parsed.data.status) return res.json({ success: true, unchanged: true });
+  if (current.status !== "pending" && current.status !== "processing") {
+    return res.status(409).json({ error: "outbox_not_pending", status: current.status });
+  }
 
   crmService.markOutboxResult(req.params.id, parsed.data.status, parsed.data.resultId, parsed.data.error);
 

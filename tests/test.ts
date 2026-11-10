@@ -45073,6 +45073,23 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── dev-request 2026-11-10-cs-paa-serveren: S2 (svarforslag, sendejobb, godkjenningskø, utboks) ──");
+  try {
+    const { runCsReplyProposalsTests } = require("../src/services/cs-reply-proposals.test") as
+      typeof import("../src/services/cs-reply-proposals.test");
+    const crp = await runCsReplyProposalsTests({ log: false });
+    passed += crp.passed;
+    failed += crp.failed;
+    for (const f of crp.failures) failures.push("cs-reply-proposals: " + f);
+    console.log(`  cs-reply-proposals: ${crp.passed} passed, ${crp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("cs-reply-proposals: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ cs-reply-proposals: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-07-27-crm-plattformadskillelse: steg 4 (innkommende triage + utriaged-bøtte) ──");
   try {
     const { runCrmTriageTests } = require("../src/services/crm-triage.test") as

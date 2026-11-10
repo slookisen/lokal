@@ -132,6 +132,8 @@ export const ERASURE_TABLES: readonly TableSpec[] = [
   // Gmail-thread aliases belong to the thread and go with it.
   { table: "crm_thread_flags", where: `thread_id IN (${THREADS})`, params: 1 },
   { table: "crm_thread_aliases", where: `thread_id IN (${THREADS})`, params: 1 },
+  // S2: reply proposals carry the recipient and the reply text.
+  { table: "cs_reply_proposals", where: `thread_id IN (${THREADS}) OR LOWER(TRIM(to_email)) = ?`, params: 2 },
   // CS på serveren, S1a — placed BEFORE crm_threads: its crm_thread_id clause
   // only matches while the threads still exist. One row per inbound e-mail
   // (sender + subject, and the forward copy with the body while a forward is

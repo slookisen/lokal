@@ -49,6 +49,19 @@ export interface NeedsReplyThread {
   last_outbound_at: string | null;
   age_hours: number;
   level: NeedsReplyLevel;
+  /** S2: the thread's latest open reply proposal, if any (status + why it stopped). */
+  proposal?: { id: string; status: string; block_reason: string | null; created_at: string } | null;
+}
+
+/** S2: an outbound reply that did not get out (failed, or outcome unknown). */
+export interface NeedsReplyOutboundFailed {
+  proposal_id: string | null;
+  outbox_id: string | null;
+  thread_id: string | null;
+  vertical: string | null;
+  to_email: string | null;
+  reason: string | null;
+  at: string;
 }
 
 export interface NeedsReplyUntriaged {
@@ -71,9 +84,14 @@ export interface NeedsReplyReport {
     untriaged_open: number;
     forward_failed: number;
     crm_register_errors_7d: number;
+    /** S2: proposals waiting for Daniel in the approval queue. */
+    approval_needed: number;
+    /** S2: replies that did not get out in the last 7 days (proposals + resend_send outbox rows). */
+    outbound_failed_7d: number;
   };
   threads: NeedsReplyThread[];
   untriaged: NeedsReplyUntriaged[];
+  outbound_failed: NeedsReplyOutboundFailed[];
 }
 
 function round1(n: number): number {
@@ -189,6 +207,46 @@ export function computeNeedsReply(opts: { vertical?: string | null; limit?: numb
     // inbound_email_log missing (pre-migration DB) — report zero, not a 500.
   }
 
+  // S2: open proposals per listed thread, the approval queue, and replies that did not get out.
+  let approvalNeeded = 0;
+  const outboundFailed: NeedsReplyOutboundFailed[] = [];
+  try {
+    const open = db.prepare(
+      `SELECT id, status, block_reason, created_at FROM cs_reply_proposals
+        WHERE thread_id = ? AND status IN ('pending', 'approval_needed', 'approved', 'sending', 'failed')
+        ORDER BY created_at DESC LIMIT 1`,
+    );
+    for (const t of threads) t.proposal = (open.get(t.thread_id) as NeedsReplyThread["proposal"]) ?? null;
+    approvalNeeded = (db.prepare("SELECT COUNT(*) AS n FROM cs_reply_proposals WHERE status = 'approval_needed'").get() as { n: number }).n;
+    const failedProposals = db
+      .prepare(
+        `SELECT id AS proposal_id, outbox_id, thread_id, vertical, to_email, COALESCE(block_reason, last_error) AS reason, updated_at AS at
+           FROM cs_reply_proposals
+          WHERE status = 'failed' AND julianday(updated_at) >= julianday('now') - 7
+          ORDER BY updated_at DESC LIMIT 100`,
+      )
+      .all() as NeedsReplyOutboundFailed[];
+    outboundFailed.push(...failedProposals);
+  } catch {
+    // cs_reply_proposals missing (pre-migration DB)
+  }
+  try {
+    const seen = new Set(outboundFailed.map((o) => o.outbox_id).filter(Boolean));
+    const failedOutbox = db
+      .prepare(
+        `SELECT NULL AS proposal_id, id AS outbox_id, thread_id, vertical_id AS vertical, to_emails AS to_email, error AS reason,
+                COALESCE(processed_at, created_at) AS at
+           FROM crm_outbox
+          WHERE intent = 'resend_send' AND status = 'failed'
+            AND julianday(COALESCE(processed_at, created_at)) >= julianday('now') - 7
+          ORDER BY COALESCE(processed_at, created_at) DESC LIMIT 100`,
+      )
+      .all() as NeedsReplyOutboundFailed[];
+    for (const o of failedOutbox) if (!seen.has(o.outbox_id)) outboundFailed.push(o);
+  } catch {
+    // ignore
+  }
+
   return {
     generated_at: new Date().toISOString(),
     counts: {
@@ -199,9 +257,12 @@ export function computeNeedsReply(opts: { vertical?: string | null; limit?: numb
       untriaged_open: untriaged.length,
       forward_failed: forwardFailed,
       crm_register_errors_7d: registerErrors,
+      approval_needed: approvalNeeded,
+      outbound_failed_7d: outboundFailed.length,
     },
     threads,
     untriaged,
+    outbound_failed: outboundFailed,
   };
 }
 

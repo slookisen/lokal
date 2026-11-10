@@ -3313,6 +3313,53 @@ function initSchema(db: Database.Database): void {
     console.error("Migration idx_crm_outbox_result_id_norm failed:", err);
   }
 
+  // ─── CS på serveren, S2: reply proposals (dev-request 2026-11-10-cs-paa-serveren) ──
+  // The CS routine writes proposals; the server sends them (or parks them in
+  // the approval queue with the reason). No CHECK constraints on purpose: the
+  // status/kind vocabulary is validated in code (cs-reply-proposals.ts), so a
+  // new value never needs a table rebuild.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS cs_reply_proposals (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        vertical TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        to_email TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        body_text TEXT NOT NULL,
+        body_html TEXT,
+        in_reply_to TEXT,
+        answers_message_id TEXT,
+        change_request_ids TEXT NOT NULL DEFAULT '[]',
+        evidence TEXT,
+        created_by TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        block_reason TEXT,
+        block_detail TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        lease_until TEXT,
+        next_attempt_at TEXT,
+        outbox_id TEXT,
+        crm_message_id TEXT,
+        smtp_message_id TEXT,
+        last_error TEXT,
+        decided_by TEXT,
+        decided_at TEXT,
+        decision_note TEXT,
+        sent_at TEXT,
+        sent_mode TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_cs_reply_proposals_status ON cs_reply_proposals(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_cs_reply_proposals_thread ON cs_reply_proposals(thread_id);
+      CREATE INDEX IF NOT EXISTS idx_cs_reply_proposals_to_sent ON cs_reply_proposals(to_email, sent_at);
+    `);
+  } catch (err) {
+    console.error("Migration cs_reply_proposals failed:", err);
+  }
+
   // ─── M1 (Phase 5.4a): agent_knowledge_audit ─────────────────
   // Owner profile change history. Immutable changelog (insert-only).
   // Daniel uses GET /admin/agent-audit to inspect ownership changes.
