@@ -96,6 +96,29 @@ let _sweepJob: SweepJobState = {
   website_ownership_unverified: 0,
 };
 
+/**
+ * Claims for the bulk sweep's summary run-envelope.
+ *
+ * dev-request 2026-10-26-lokal-agent-verifier-snapshot-drift-toleranse, slice 2:
+ * the values here are this sweep's own per-run tallies. platform-verifier probes
+ * the global kinds `agents_review_required` / `agents_data_insufficient` as
+ * SNAPSHOTS (DB-wide count via claim-counts?mode=snapshot), so posting a per-sweep
+ * tally under those names failed verification on every sweep. Only the full
+ * lokal-agent-verifier run posts the global names (with snapshot values). The
+ * sweep therefore uses its own `bulk_sweep_*` kinds; `agents_verified` stays,
+ * as it is a genuine per-run delta.
+ */
+export function buildSweepRunEnvelopeClaims(
+  job: Pick<SweepJobState, "verified" | "review_required" | "data_insufficient" | "processed">,
+): Array<{ type: "db_state_change"; value: number; meta: { kind: string } }> {
+  return [
+    { type: "db_state_change", value: job.verified, meta: { kind: "agents_verified" } },
+    { type: "db_state_change", value: job.review_required, meta: { kind: "bulk_sweep_review_required" } },
+    { type: "db_state_change", value: job.data_insufficient, meta: { kind: "bulk_sweep_data_insufficient" } },
+    { type: "db_state_change", value: job.processed, meta: { kind: "bulk_sweep_processed" } },
+  ];
+}
+
 export function getSweepJob(): Readonly<SweepJobState> {
   return { ..._sweepJob };
 }
@@ -355,12 +378,7 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
           started_at: startedAt,
           finished_at: _sweepJob.finishedAt,
           status: "completed" as const,
-          claims: [
-            { type: "db_state_change" as const, value: _sweepJob.verified, meta: { kind: "agents_verified" } },
-            { type: "db_state_change" as const, value: _sweepJob.review_required, meta: { kind: "agents_review_required" } },
-            { type: "db_state_change" as const, value: _sweepJob.data_insufficient, meta: { kind: "agents_data_insufficient" } },
-            { type: "db_state_change" as const, value: _sweepJob.processed, meta: { kind: "bulk_sweep_processed" } },
-          ],
+          claims: buildSweepRunEnvelopeClaims(_sweepJob),
           evidence: [],
           notes: `Bulk pending_verify sweep: processed ${_sweepJob.processed} agents, ${_sweepJob.verified} verified, ${_sweepJob.still_pending} still_pending`,
         };
