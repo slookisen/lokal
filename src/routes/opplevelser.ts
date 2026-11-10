@@ -29903,7 +29903,10 @@ export type ContentJudgeSweepVerdict = "MATCH" | "MISMATCH" | "unresolved";
  *  a6f08b66). Lowercase and æøå-folded, matched as substrings of the
  *  lowercased+folded reason ("navigasjon" also covers "navigasjonsmeny").
  *  Deliberately NOT plain "meny": a restaurant/food menu ("beskriver menyen
- *  med lokale retter") is legitimate experience content. */
+ *  med lokale retter") is legitimate experience content. 2026-11-10: list
+ *  extended (menytekst, menyelement, menypunkt, sidemeny, bunntekst, footer,
+ *  nav-element, nav-lenke) after an independent dry-run control found the
+ *  guard missed these phrasings. */
 export const CONTENT_JUDGE_NAV_REASON_TERMS: readonly string[] = [
   "navigasjon",
   "meny-struktur",
@@ -29918,6 +29921,19 @@ export const CONTENT_JUDGE_NAV_REASON_TERMS: readonly string[] = [
   "navbar",
   "nav bar",
   "main menu",
+  // 2026-11-10: an independent dry-run control found the guard missed these
+  // nav/footer-chrome phrasings. Substrings cover inflections
+  // ("menyelement" -> "menyelementer", "nav-lenke" -> "nav-lenker"). None of
+  // them is a substring of ordinary food-menu prose ("menyen", "dagens meny",
+  // "menyer med lokale retter").
+  "menytekst",
+  "menyelement",
+  "menypunkt",
+  "sidemeny",
+  "bunntekst",
+  "footer",
+  "nav-element",
+  "nav-lenke",
 ];
 
 /** True if the judge's reason text mentions navigation/menu chrome (see
@@ -30181,6 +30197,10 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
       };
       would_be_action?: string;
       action_taken?: string;
+      // Dry-run only (2026-11-10): lets a reviewer eyeball the stored text
+      // behind each verdict without a separate DB read.
+      title?: string;
+      description_preview?: string | null;
     }> = [];
 
     // batch_id must be genuinely unique PER CALL, not just per-second: this
@@ -30354,6 +30374,12 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
         ...(dryRun
           ? { would_be_action: `[dry-run] ${actionText}${descText}` }
           : { action_taken: `${actionText}${descText}` }),
+        ...(dryRun
+          ? {
+              title: row.title,
+              description_preview: normDescription !== "" ? normDescription.slice(0, 200) : null,
+            }
+          : {}),
       });
     }
 

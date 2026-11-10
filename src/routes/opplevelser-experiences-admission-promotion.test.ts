@@ -406,6 +406,9 @@ export function runOpplevelserExperiencesAdmissionPromotionTests(
         if (urlStr === "https://good.no/topptur") {
           return mkPageResponse("<html><body>Guidet fjelltur til toppen av fjellet med lokal fjellfører.</body></html>", urlStr);
         }
+        if (urlStr.startsWith("https://good.no/preview-")) {
+          return mkPageResponse("<html><body>Gårdsbesøk med omvisning og smaksprøver fra gården.</body></html>", urlStr);
+        }
         if (urlStr === "https://good.no/navdump") {
           return mkPageResponse("<html><body>Kajakktur på fjorden med guide, avgang hver dag fra brygga.</body></html>", urlStr);
         }
@@ -823,6 +826,35 @@ export function runOpplevelserExperiencesAdmissionPromotionTests(
         assertEq(d5.eligible, true, "adm-g5a: reason about a restaurant 'meny' (food menu) -> still eligible");
         assertEq(d5.judgeReasonNavOk, true, "adm-g5b: plain 'meny'/'menyen' does NOT trigger judge_reason_nav");
 
+        // 2026-11-10 (vaktutvidelse): more nav/footer-chrome phrasings an
+        // independent dry-run control found the guard missed — incl.
+        // plural/inflected forms and capitalisation.
+        for (const [i, reason] of [
+          "Beskrivelsen er menytekst fra nettsiden.",
+          "Teksten består av menyelementer og overskrifter.",
+          "Gjengir menypunkter fra siden.",
+          "Hentet fra sidemenyen.",
+          "Inneholder bunnteksten med kontaktinfo.",
+          "Matches the Footer of the page.",
+          "Teksten er nav-elementer fra toppen av siden.",
+          "Lagret tekst er nav-lenker og velkomsttekst.",
+        ].entries()) {
+          const d = mod.evaluateContentJudgePromotion({ ...base, description: noProse }, "MATCH", reason);
+          assertEq(d.eligible, false, `adm-g4f.${i}: reason "${reason}" -> NOT eligible (held)`);
+          assertEq(d.missing, ["judge_reason_nav"], `adm-g4g.${i}: reason "${reason}" -> missing=['judge_reason_nav']`);
+        }
+        // ...while ordinary food-menu prose still does NOT trigger.
+        for (const [i, reason] of [
+          "Kilden nevner en meny med lokale retter.",
+          "Siden beskriver menyen for sommeren.",
+          "Stemmer: dagens meny serveres i gårdskafeen.",
+          "Gården tilbyr menyer med lokale retter; stemmer med lagret beskrivelse.",
+        ].entries()) {
+          const d = mod.evaluateContentJudgePromotion({ ...base, description: noProse }, "MATCH", reason);
+          assertEq(d.judgeReasonNavOk, true, `adm-g5c.${i}: food-menu reason "${reason}" -> judgeReasonNavOk=true`);
+          assertEq(d.eligible, true, `adm-g5d.${i}: food-menu reason "${reason}" -> still eligible`);
+        }
+
         const d6 = mod.evaluateContentJudgePromotion({ ...base, description: null }, "MATCH", okReason);
         assertEq(d6.eligible, true, "adm-g6a: null description -> not blocked by content_quality");
         assertEq(d6.contentQualityOk, true, "adm-g6b: null description contentQualityOk=true");
@@ -883,6 +915,50 @@ export function runOpplevelserExperiencesAdmissionPromotionTests(
         assertEq(g?.promotion?.judge_reason_nav, true, "adm-g8c: dry-run promotion.judge_reason_nav=true (judge reason clean)");
         assertEq(g?.promotion?.status, "held", "adm-g8d: nav-dump row held (not would_promote)");
         assertEq(g?.promotion?.missing, ["content_quality"], "adm-g8e: dry-run promotion.missing=['content_quality']");
+      }
+
+      // ── 2026-11-10 (vaktutvidelse): dry-run rows carry `title` +
+      // `description_preview` (first 200 chars, whitespace-collapsed; null
+      // for a null description); apply-mode rows do not.
+      {
+        const longDesc = ("Gårdsbesøk   med omvisning i fjøset,\n\nsmaksprøver og   historier fra gården. ").repeat(6);
+        insertExperience.run({
+          id: "adm-preview-long", provider_id: "prov-active-hjemmeside-verified",
+          title: "Gårdsbesøk med omvisning", slug: "adm-preview-long",
+          description: longDesc,
+          category: "aktivitet", price_band: "standard", price_from: 250,
+          evidence_url: "https://good.no/preview-long",
+          evidence_url_verification: null, verification_status: "verified", confidence: "high", canonical_id: null,
+        });
+        insertExperience.run({
+          id: "adm-preview-null", provider_id: "prov-active-hjemmeside-verified",
+          title: "Smaksprøver på gården", slug: "adm-preview-null",
+          description: null,
+          category: "aktivitet", price_band: "standard", price_from: 150,
+          evidence_url: "https://good.no/preview-null",
+          evidence_url_verification: null, verification_status: "verified", confidence: "high", canonical_id: null,
+        });
+        const rPrev = await callRoute(opplevelserRouter, { headers: adminHeaders, body: {} });
+        assertEq(rPrev.body.dry_run, true, "adm-p1: preview sweep is a dry-run");
+        const pLong = (rPrev.body.results as any[]).find((x) => x.id === "adm-preview-long");
+        const pNull = (rPrev.body.results as any[]).find((x) => x.id === "adm-preview-null");
+        const pShort = (rPrev.body.results as any[]).find((x) => x.id === "adm-promote-hjemmeside");
+        const expectedLong = longDesc.replace(/\s+/g, " ").trim().slice(0, 200);
+        assertEq(pLong?.title, "Gårdsbesøk med omvisning", "adm-p2: dry-run row carries title");
+        assertEq(pLong?.description_preview, expectedLong, "adm-p3: long description -> whitespace-collapsed first 200 chars");
+        assertEq(pLong?.description_preview?.length, 200, "adm-p4: long description preview truncated to exactly 200 chars");
+        assertTrue(longDesc.length > 200, "adm-p4b: fixture description is genuinely longer than 200 chars");
+        assertEq(pNull?.title, "Smaksprøver på gården", "adm-p5: null-description row still carries title");
+        assertEq(pNull?.description_preview, null, "adm-p6: null description -> description_preview=null");
+        assertEq(pShort?.description_preview, "Kort om fjordturen.", "adm-p7: short description -> preview is the full (≤200 chars) text");
+        assertTrue((rPrev.body.results as any[]).every((x) => "title" in x && "description_preview" in x), "adm-p8: every dry-run row has title + description_preview");
+
+        const rApply = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { apply: true } });
+        assertEq(rApply.body.dry_run, false, "adm-p9: apply sweep is not a dry-run");
+        const aLong = (rApply.body.results as any[]).find((x) => x.id === "adm-preview-long");
+        assertTrue(aLong !== undefined, "adm-p10: apply-mode results include the preview row");
+        assertTrue(!("title" in aLong) && !("description_preview" in aLong), "adm-p11: apply-mode row carries neither title nor description_preview");
+        assertTrue((rApply.body.results as any[]).every((x) => !("title" in x) && !("description_preview" in x)), "adm-p12: no apply-mode row carries title/description_preview");
       }
     } catch (err: any) {
       failed++;
