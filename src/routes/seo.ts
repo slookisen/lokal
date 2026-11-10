@@ -19,6 +19,7 @@
 
 import { resolveSitemapCacheTtlMs, logSlowSitemap } from "./sitemap-cache-util";
 import { Router, Request, Response } from "express";
+import { RFB_CHATGPT_APP_URL } from "../config/distribution-channels";
 import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { resolveRouteIntent } from "../services/route-intent";
@@ -1792,7 +1793,7 @@ router.get("/", (req: Request, res: Response) => {
         <div class="ai-assist">
           <p class="ai-assist-label">${escapeHtml(t(lang, "home.ai_assist_label"))}</p>
           <div class="ai-assist-btns">
-            <a href="https://chatgpt.com/g/g-69dbf8593c1c81919050f8da98cd327d-finn-lokal-mat-i-norge" target="_blank" rel="noopener" class="ai-btn ai-chatgpt">ChatGPT</a>
+            <a href="${RFB_CHATGPT_APP_URL}" target="_blank" rel="noopener" class="ai-btn ai-chatgpt">ChatGPT</a>
             <a href="${localizedPath("/teknologi", lang)}#claude-mcp" class="ai-btn ai-claude">Claude</a>
           </div>
           <p class="ai-assist-hint">${escapeHtml(t(lang, "home.ai_assist_hint"))} <a href="${localizedPath("/teknologi", lang)}#mcp-oppsett">${escapeHtml(t(lang, "home.ai_assist_setup_link"))}</a></p>
@@ -1870,7 +1871,7 @@ ${umbrellaSectionHtml}
           <h3>${escapeHtml(t(lang, "home.ai_sec_title"))}</h3>
           <p>${escapeHtml(t(lang, "home.ai_sec_body"))}</p>
           <div class="ai-logos">
-            <a href="https://chatgpt.com/g/g-69dbf8593c1c81919050f8da98cd327d-finn-lokal-mat-i-norge" target="_blank" rel="noopener" class="ai-logo">\u{1F4AC} ChatGPT</a>
+            <a href="${RFB_CHATGPT_APP_URL}" target="_blank" rel="noopener" class="ai-logo">\u{1F4AC} ChatGPT</a>
             <a href="${localizedPath("/teknologi", lang)}#claude-mcp" class="ai-logo">\u{1F50C} Claude MCP</a>
             <a href="https://github.com/slookisen/lokal" target="_blank" rel="noopener" class="ai-logo">\u{2B50} GitHub</a>
           </div>

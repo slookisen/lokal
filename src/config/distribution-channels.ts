@@ -35,7 +35,12 @@ const VERIFIED = "2026-10-16";
 const STDIO_DESC = "Stdio-transport package for local Claude Desktop / Cursor / Cline installs.";
 const A2A_DESC = "A2A protocol registry listing — direct JSON-RPC at /a2a.";
 
-const RFB_GPT = "https://chatgpt.com/g/g-69dbf8593c1c81919050f8da98cd327d-rett-fra-bonden";
+// Rett fra Bonden's ChatGPT app (MCP on rettfrabonden.com/mcp). Replaces the RFB Custom
+// GPT, which OpenAI retires on 2026-12-11. Single source for every "ChatGPT" link on the
+// RFB site (seo.ts homepage buttons, discovery.ts llms.txt); src/public/app.html is static
+// and carries the same literal.
+export const RFB_CHATGPT_APP_URL =
+  "https://chatgpt.com/plugins/plugin_asdk_app_6acbf3965a9881918afbcacd99a8e157";
 const DENTAL_GPT = "https://chatgpt.com/g/g-6a21e79241cc8191a04642bda508e42b-finn-tannlege-i-norge";
 
 const CHANNELS: Record<DistributionVertical, Entry[]> = {
@@ -78,9 +83,9 @@ const CHANNELS: Record<DistributionVertical, Entry[]> = {
     },
     {
       channel: "custom-gpt",
-      url: RFB_GPT,
-      install: RFB_GPT,
-      description: "ChatGPT Custom GPT — Rett fra Bonden local-food discovery; Actions on rettfrabonden.com/openapi.yaml.",
+      url: RFB_CHATGPT_APP_URL,
+      install: RFB_CHATGPT_APP_URL,
+      description: "ChatGPT app — Rett fra Bonden local-food discovery (MCP on rettfrabonden.com).",
     },
     {
       channel: "agenstry",
