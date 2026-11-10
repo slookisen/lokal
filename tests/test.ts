@@ -47059,6 +47059,28 @@ runSerial(async () => {
   }
 });
 
+// A2A dev-request 2026-10-25-besokstekst-oversettelse-ikke-norske-kilder:
+// «4b-forslag» over a NON-Norwegian homepage — gardssalgVisitSourceLooksNorwegian()
+// and the translated-source gates (≥ 2 snippets, digit tokens, weekdays/
+// months) that replace word overlap there; nynorsk stays on the overlap gate;
+// kill switch GARDSSALG_VISIT_TRANSLATED_SOURCES_DISABLED. api.anthropic.com
+// is counted and asserted zero. Serial: in-memory DB + globalThis.fetch.
+runSerial(async () => {
+  console.log("\n── 2026-10-25 «4b-forslag»: gardssalg-visit translated sources ──");
+  try {
+    const { runGardssalgVisitTranslatedSourcesTests } = require("../src/services/gardssalg-visit-translated-sources.test") as
+      typeof import("../src/services/gardssalg-visit-translated-sources.test");
+    const vt = await runGardssalgVisitTranslatedSourcesTests({ log: false });
+    passed += vt.passed;
+    failed += vt.failed;
+    for (const f of vt.failures) failures.push("gardssalg-visit-translated-sources: " + f);
+    console.log(`  gardssalg-visit-translated-sources: ${vt.passed} passed, ${vt.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-visit-translated-sources: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // A2A dev-request 2026-10-16-opplevagent-katalogfakta-alder-og-title-no,
 // slice S3b: the catalogue facts proposals job on the shared proposal file
 // queue (flag OFF by default) storing through S3a's
