@@ -276,6 +276,7 @@ router.post("/contact", async (req: Request, res: Response): Promise<void> => {
     const rawPlatform = String(body.platform ?? "").trim().toLowerCase();
     const VALID_PLATFORMS: Platform[] = ["rfb", "experiences", "dental"];
     if (rawPlatform !== "" && !VALID_PLATFORMS.includes(rawPlatform as Platform)) {
+      countContactRejection(inferPlatform(req), "invalid_input");
       res.status(422).json({
         success: false,
         error: "invalid_platform",

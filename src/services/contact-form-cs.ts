@@ -83,7 +83,12 @@ export function receiptTemplate(platform: ContactPlatform): { subject: string; t
   };
 }
 
-export type ReceiptOutcome = "sent" | "disabled" | "already_sent_24h" | "dry_run" | "failed";
+export type ReceiptOutcome = "sent" | "disabled" | "already_sent_24h" | "dry_run" | "failed" | "suppressed" | "daily_cap";
+
+export function contactReceiptMaxPerDay(env: NodeJS.ProcessEnv = process.env): number {
+  const n = parseInt(String(env.CS_CONTACT_RECEIPT_MAX_PER_DAY ?? ""), 10);
+  return Number.isFinite(n) && n > 0 ? n : 200;
+}
 
 /**
  * Send the receipt for one form submission. Never throws. Records the
@@ -102,18 +107,32 @@ export async function sendContactReceipt(
   const db = getDb();
   let outcome: ReceiptOutcome;
   let detail: string | null = null;
+  let reservedId: number | null = null;
   try {
+    // Check and reserve in one synchronous step: two submissions at once
+    // cannot both pass (no await in between).
     const recent = db
       .prepare(
         `SELECT 1 FROM contact_form_receipts
-          WHERE email = ? AND outcome = 'sent' AND julianday(sent_at) >= julianday(?) - 1 LIMIT 1`,
+          WHERE email = ? AND outcome IN ('sent', 'sending') AND julianday(sent_at) >= julianday(?) - 1 LIMIT 1`,
       )
       .get(email, now.toISOString());
+    const today = (db.prepare(`SELECT COUNT(*) AS n FROM contact_form_receipts WHERE outcome IN ('sent', 'sending') AND julianday(sent_at) >= julianday(?) - 1`).get(now.toISOString()) as { n: number }).n;
+    const suppressed =
+      !!db.prepare(`SELECT 1 FROM email_bounces WHERE LOWER(TRIM(email)) = ? AND bounce_type IN ('hard', 'complaint', 'unsubscribe') LIMIT 1`).get(email) ||
+      !!db.prepare(`SELECT 1 FROM agent_blocklist WHERE identifier_type = 'email' AND identifier_value = ? LIMIT 1`).get(email);
     if (recent) {
       outcome = "already_sent_24h";
+    } else if (suppressed) {
+      outcome = "suppressed";
+    } else if (today >= contactReceiptMaxPerDay(env)) {
+      outcome = "daily_cap";
     } else if (!(deps.liveTransport ?? emailService.isLiveTransport())) {
       outcome = "dry_run";
     } else {
+      reservedId = Number(
+        db.prepare(`INSERT INTO contact_form_receipts (email, platform, thread_id, outcome, sent_at) VALUES (?, ?, ?, 'sending', ?)`).run(email, input.platform, input.threadId, now.toISOString()).lastInsertRowid,
+      );
       const t = receiptTemplate(input.platform);
       const identity = resolveCrmIdentity(input.platform);
       const send = deps.sendRaw ?? ((o) => emailService.sendRaw(o));
@@ -133,13 +152,15 @@ export async function sendContactReceipt(
     detail = String(e?.message ?? e);
   }
   try {
-    db.prepare(`INSERT INTO contact_form_receipts (email, platform, thread_id, outcome, sent_at) VALUES (?, ?, ?, ?, ?)`).run(
-      email,
-      input.platform,
-      input.threadId,
-      outcome,
-      now.toISOString(),
-    );
+    if (reservedId !== null) db.prepare(`UPDATE contact_form_receipts SET outcome = ? WHERE id = ?`).run(outcome, reservedId);
+    else
+      db.prepare(`INSERT INTO contact_form_receipts (email, platform, thread_id, outcome, sent_at) VALUES (?, ?, ?, ?, ?)`).run(
+        email,
+        input.platform,
+        input.threadId,
+        outcome,
+        now.toISOString(),
+      );
     db.prepare(`INSERT INTO crm_actions (id, thread_id, contact_id, type, actor, payload) VALUES (?, ?, ?, ?, 'system', ?)`).run(
       randomUUID(),
       input.threadId,

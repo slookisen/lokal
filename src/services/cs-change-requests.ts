@@ -29,7 +29,7 @@ import http from "http";
 import { getDb } from "../database/init";
 import { getDb as getVerticalDb } from "../database/db-factory";
 import * as blocklist from "./blocklist-service";
-import { isFreeMailDomain, isHostedPlatformHost } from "./claim-domain-rule";
+import { isFreeMailDomain, isHostedPlatformHost, isRootWebsite } from "./claim-domain-rule";
 import { findCrossVerticalEntriesByEmail } from "./cross-vertical-contact-lookup";
 import { slugify } from "../utils/slug";
 import { marketplaceRegistry } from "./marketplace-registry";
@@ -48,8 +48,10 @@ export type ChangeVertical = "rfb" | "experiences";
 export type ChangeStatus =
   | "approval_needed"
   | "queued"
+  | "executing" // claimed by the worker (profile_update / hide in progress)
   | "executed"
   | "hidden"
+  | "deleting" // RFB delete claimed by the worker
   | "verified"
   | "verify_failed"
   | "failed"
@@ -73,7 +75,6 @@ const RFB_FIELDS: Record<string, { route: RfbRoute; key: string; lock: string; c
   address: { route: "knowledge", key: "address", lock: "address", column: { table: "agent_knowledge", name: "address" }, max: 300 },
   postalCode: { route: "knowledge", key: "postalCode", lock: "postal_code", column: { table: "agent_knowledge", name: "postal_code" }, max: 10 },
   website: { route: "knowledge", key: "website", lock: "website", column: { table: "agent_knowledge", name: "website" }, max: 500 },
-  openingHours: { route: "knowledge", key: "openingHours", lock: "opening_hours", column: { table: "agent_knowledge", name: "opening_hours" }, max: 1000 },
   about: { route: "knowledge", key: "about", lock: "about", column: { table: "agent_knowledge", name: "about" }, max: 4000 },
 };
 
@@ -86,6 +87,13 @@ const EXP_FIELDS: Record<string, { path: string; body: (v: string) => Record<str
   visit_text: { path: "gardssalg-set-content-field", body: (v) => ({ field: "visit_text", value: v }), lock: "visit_text", column: "visit_text", max: 4000 },
   opening_hours_text: { path: "gardssalg-set-content-field", body: (v) => ({ field: "opening_hours_text", value: v }), lock: "opening_hours_text", column: "opening_hours_text", max: 1000 },
 };
+
+/**
+ * Fields the public surfaces may legitimately not render (an e-mail behind
+ * «Vis e-post»). Only these may be verified from the database alone — every
+ * other field must show on the public page / API.
+ */
+const NOT_RENDERED: Record<ChangeVertical, readonly string[]> = { rfb: ["email"], experiences: ["email"] };
 
 export function supportedFields(vertical: ChangeVertical): string[] {
   return Object.keys(vertical === "rfb" ? RFB_FIELDS : EXP_FIELDS);
@@ -105,7 +113,7 @@ export type PublicFetch = (path: string, host: string) => Promise<HttpResult>;
 function localRequest(method: string, path: string, headers: Record<string, string>, body?: string): Promise<HttpResult> {
   const port = Number(process.env.PORT || 3000);
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: "127.0.0.1", port, method, path, headers, timeout: 30_000 }, (res) => {
+    const req = http.request({ host: "127.0.0.1", port, method, path, headers: { "User-Agent": "lokal-cs-change-requests/1 (internal)", ...headers }, timeout: 30_000 }, (res) => {
       const chunks: Buffer[] = [];
       res.on("data", (c: Buffer) => {
         if (chunks.reduce((n, b) => n + b.length, 0) < 2_000_000) chunks.push(c);
@@ -180,7 +188,7 @@ export function getChangeRequest(id: string): ChangeRequestRow | null {
 export function listChangeRequests(opts: { status?: string; threadId?: string; limit?: number } = {}): Array<ChangeRequestRow & { age_hours: number }> {
   const where: string[] = [];
   const params: unknown[] = [];
-  if (opts.status === "open") where.push("status IN ('approval_needed', 'queued', 'executed', 'hidden')");
+  if (opts.status === "open") where.push("status IN ('approval_needed', 'queued', 'executing', 'executed', 'hidden', 'deleting')");
   else if (opts.status) {
     where.push("status = ?");
     params.push(opts.status);
@@ -213,11 +221,23 @@ function addStep(id: string, step: string, ok: boolean, detail?: unknown, now: D
   db.prepare("UPDATE cs_change_requests SET steps = ?, updated_at = ? WHERE id = ?").run(JSON.stringify(steps).slice(0, 200_000), now.toISOString(), id);
 }
 
-function setStatus(id: string, status: ChangeStatus, reason: string | null, extra: Record<string, string | number | null> = {}, now: Date = new Date()): void {
+/** Set the status; with `from`, only if the row is still in that status (compare-and-set). Returns whether it changed. */
+function setStatus(
+  id: string,
+  status: ChangeStatus,
+  reason: string | null,
+  extra: Record<string, string | number | null> = {},
+  now: Date = new Date(),
+  from?: ChangeStatus,
+): boolean {
   const cols = Object.keys(extra);
-  getDb()
-    .prepare(`UPDATE cs_change_requests SET status = ?, status_reason = ?, updated_at = ?${cols.map((c) => `, ${c} = ?`).join("")} WHERE id = ?`)
-    .run(status, reason, now.toISOString(), ...cols.map((c) => extra[c]), id);
+  const r = getDb()
+    .prepare(
+      `UPDATE cs_change_requests SET status = ?, status_reason = ?, updated_at = ?${cols.map((c) => `, ${c} = ?`).join("")}
+        WHERE id = ?${from ? " AND status = ?" : ""}`,
+    )
+    .run(status, reason, now.toISOString(), ...cols.map((c) => extra[c]), id, ...(from ? [from] : []));
+  return r.changes === 1;
 }
 
 // ─── Targets ─────────────────────────────────────────────────────────
@@ -256,8 +276,11 @@ export function loadTarget(vertical: ChangeVertical, targetId: string): Target |
       .get(targetId) as { id: string; name: string; contact_email: string | null; url: string | null; org_nr: string | null; k_email: string | null; k_website: string | null } | undefined;
     if (!a) return null;
     const emails = [a.contact_email, a.k_email].map((e) => blocklist.normalizeEmail(e)).filter((e): e is string => !!e);
-    const websites = [a.url, a.k_website].filter((w): w is string => !!w && w.trim() !== "");
-    const domains = [...websites.map(domainOf), ...emails.map(domainOf)].filter(isOwnBusinessDomain);
+    // Only a ROOT website on the business's own domain identifies it (claim
+    // rule P1): never an e-mail's mail host, never a deep page on an umbrella
+    // or shop domain.
+    const websites = [a.url, a.k_website].filter((w): w is string => !!w && w.trim() !== "" && isRootWebsite(w));
+    const domains = websites.map(domainOf).filter(isOwnBusinessDomain);
     return { id: a.id, name: a.name, emails: [...new Set(emails)], domains: [...new Set(domains)], websites, slug: slugify(a.name), orgNr: a.org_nr ?? null };
   }
   const p = getVerticalDb("experiences")
@@ -265,8 +288,8 @@ export function loadTarget(vertical: ChangeVertical, targetId: string): Target |
     .get(targetId) as { id: string; navn: string; epost: string | null; hjemmeside: string | null; slug: string | null; org_nr: string | null } | undefined;
   if (!p) return null;
   const emails = [blocklist.normalizeEmail(p.epost)].filter((e): e is string => !!e);
-  const websites = [p.hjemmeside].filter((w): w is string => !!w && w.trim() !== "");
-  const domains = [...websites.map(domainOf), ...emails.map(domainOf)].filter(isOwnBusinessDomain);
+  const websites = [p.hjemmeside].filter((w): w is string => !!w && w.trim() !== "" && isRootWebsite(w));
+  const domains = websites.map(domainOf).filter(isOwnBusinessDomain);
   return { id: p.id, name: p.navn, emails, domains: [...new Set(domains)], websites, slug: p.slug, orgNr: p.org_nr ?? null };
 }
 
@@ -289,6 +312,7 @@ export function checkAuthority(input: {
   requesterEmail: string;
   threadId: string | null;
   evidenceMessageId: string | null;
+  kind?: ChangeKind;
 }): AuthorityResult {
   const requester = blocklist.normalizeEmail(input.requesterEmail);
   const none = (reason: string): AuthorityResult => ({ ok: false, authority: "none", reason });
@@ -299,13 +323,19 @@ export function checkAuthority(input: {
   const thread = db.prepare("SELECT id, vertical_id FROM crm_threads WHERE id = ?").get(input.threadId) as { id: string; vertical_id: string } | undefined;
   if (!thread) return none("ingen_traad");
   if (thread.vertical_id !== input.vertical) return none("feil_plattform");
+  // A removal cannot be undone after 24 h: its evidence must be an e-mail the
+  // SERVER received (Resend inbound), not a message any API caller could have
+  // filed through /admin/crm/ingest.
+  const serverOnly = input.kind === "removal";
   const msg = db
     .prepare(
       `SELECT id FROM crm_messages WHERE thread_id = ? AND direction = 'in' AND LOWER(TRIM(from_email)) = ?
-         ${input.evidenceMessageId ? "AND id = ?" : ""} LIMIT 1`,
+         ${input.evidenceMessageId ? "AND id = ?" : ""}
+         ${serverOnly ? "AND COALESCE(json_valid(raw_metadata), 0) = 1 AND json_extract(raw_metadata, '$.source') = 'resend_inbound'" : ""}
+        LIMIT 1`,
     )
     .get(...([input.threadId, requester, ...(input.evidenceMessageId ? [input.evidenceMessageId] : [])] as unknown[])) as { id: string } | undefined;
-  if (!msg) return none("ingen_melding_fra_avsender_i_traaden");
+  if (!msg) return none(serverOnly ? "fjerning_krever_serverregistrert_e-post" : "ingen_melding_fra_avsender_i_traaden");
   if (input.target.emails.includes(requester)) return { ok: true, authority: "registered_email", reason: null };
   const d = domainOf(requester);
   if (isOwnBusinessDomain(d) && input.target.domains.includes(d!)) return { ok: true, authority: "own_domain", reason: null };
@@ -354,7 +384,19 @@ export function createChangeRequest(input: CreateChangeRequestInput, deps: { env
     requesterEmail: input.requesterEmail,
     threadId: input.threadId,
     evidenceMessageId: input.evidence?.messageId ?? null,
+    kind: input.kind,
   });
+  // One open request per profile and kind: a retried apply must not create a
+  // second one (two removals of one profile would defeat «cancel»).
+  const open = getDb()
+    .prepare(
+      `SELECT id, status FROM cs_change_requests
+        WHERE vertical = ? AND target_id = ? AND kind = ? AND status IN ('approval_needed', 'queued', 'executing', 'executed', 'hidden', 'deleting')
+        LIMIT 1`,
+    )
+    .get(input.vertical, target.id, input.kind) as { id: string; status: string } | undefined;
+  // (removals only: several open profile updates for one profile are fine)
+  if (open && input.apply && input.kind === "removal") return { ok: false, status: 409, error: "open_request_exists", detail: open };
   const jobOn = csChangeRequestsEnabled(env);
   const status: ChangeStatus = auth.ok && jobOn ? "queued" : "approval_needed";
   const reason = !auth.ok ? auth.reason : jobOn ? null : "endringsjobben_er_av";
@@ -410,10 +452,47 @@ export function createChangeRequest(input: CreateChangeRequestInput, deps: { env
 
 // ─── Blocklist for a removal ─────────────────────────────────────────
 
+/**
+ * Is this identifier used by ANOTHER active profile (either vertical)? Then it
+ * is not blocklisted: an e-mail block stops that producer's order mails, a
+ * domain or name block stops its listing.
+ */
+export function identifierUsedElsewhere(type: string, value: string, vertical: ChangeVertical, targetId: string): boolean {
+  try {
+    const db = getDb();
+    const agents = db
+      .prepare(`SELECT a.id, a.name, a.contact_email, a.url, k.email AS k_email, k.website AS k_website FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id WHERE a.is_active = 1`)
+      .all() as Array<{ id: string; name: string; contact_email: string | null; url: string | null; k_email: string | null; k_website: string | null }>;
+    const exp = getVerticalDb("experiences")
+      .prepare(`SELECT id, navn, epost, hjemmeside FROM experience_providers WHERE COALESCE(catalog_hidden, 0) = 0`)
+      .all() as Array<{ id: string; navn: string; epost: string | null; hjemmeside: string | null }>;
+    const otherAgents = agents.filter((a) => !(vertical === "rfb" && a.id === targetId));
+    const otherProviders = exp.filter((p) => !(vertical === "experiences" && p.id === targetId));
+    if (type === "email") {
+      return (
+        otherAgents.some((a) => [a.contact_email, a.k_email].some((e) => blocklist.normalizeEmail(e) === value)) ||
+        otherProviders.some((p) => blocklist.normalizeEmail(p.epost) === value)
+      );
+    }
+    if (type === "website_domain") {
+      return otherAgents.some((a) => [a.url, a.k_website].some((w) => domainOf(w) === value)) || otherProviders.some((p) => domainOf(p.hjemmeside) === value);
+    }
+    if (type === "name_normalized") {
+      return otherAgents.some((a) => blocklist.normalizeName(a.name) === value) || otherProviders.some((p) => blocklist.normalizeName(p.navn) === value);
+    }
+    return false;
+  } catch {
+    // Cannot tell → do not block (a missing block is fixable; a wrong one silently hurts someone else).
+    return true;
+  }
+}
+
 export function removalBlocklistPlan(vertical: ChangeVertical, target: Target, requesterEmail: string): Array<{ type: string; value: string }> {
   const out: Array<{ type: string; value: string }> = [];
   const push = (type: string, value: string | null | undefined) => {
-    if (value && !out.some((o) => o.type === type && o.value === value)) out.push({ type, value });
+    if (!value || out.some((o) => o.type === type && o.value === value)) return;
+    if (type !== "agent_id" && identifierUsedElsewhere(type, value, vertical, target.id)) return;
+    out.push({ type, value });
   };
   push("email", blocklist.normalizeEmail(requesterEmail));
   for (const e of target.emails) push("email", e);
@@ -434,14 +513,6 @@ function blocklistIdsFor(pairs: Array<{ type: string; value: string }>): Map<str
     if (r) m.set(`${p.type}|${p.value}`, r.id);
   }
   return m;
-}
-
-/** Name rows only when no OTHER active producer carries the same normalized name (same rule as DELETE). */
-function nameIsShared(vertical: ChangeVertical, target: Target): boolean {
-  if (vertical !== "rfb") return false;
-  const norm = blocklist.normalizeName(target.name);
-  const rows = getDb().prepare("SELECT id, name FROM agents WHERE is_active = 1 AND id != ?").all(target.id) as Array<{ id: string; name: string }>;
-  return rows.some((r) => blocklist.normalizeName(r.name) === norm);
 }
 
 // ─── Execute ─────────────────────────────────────────────────────────
@@ -485,15 +556,25 @@ export function valueShows(field: string, value: string, surface: string): boole
   return normText(surface).includes(normText(value));
 }
 
-async function surfaces(vertical: ChangeVertical, target: Target, deps: ExecDeps): Promise<{ text: string; page: number; api: number }> {
+interface Surfaces {
+  text: string;
+  /** Every surface answered 2xx — only then can a value's absence mean anything. */
+  ok: boolean;
+  statuses: Record<string, number>;
+}
+
+async function surfaces(vertical: ChangeVertical, target: Target, deps: ExecDeps): Promise<Surfaces> {
   const fetchPublic = deps.publicFetch ?? defaultPublicFetch;
   if (vertical === "rfb") {
     const card = await fetchPublic(`/api/marketplace/agents/${encodeURIComponent(target.id)}/card`, "rettfrabonden.com").catch(() => null);
     const page = await fetchPublic(`/produsent/${encodeURIComponent(slugify(target.name))}`, "rettfrabonden.com").catch(() => null);
-    return { text: `${card?.body ?? ""}\n${page?.body ?? ""}`, page: page?.status ?? 0, api: card?.status ?? 0 };
+    const cs = card?.status ?? 0;
+    const ps = page?.status ?? 0;
+    return { text: `${card?.body ?? ""}\n${page?.body ?? ""}`, ok: okStatus(cs) && okStatus(ps), statuses: { card: cs, page: ps } };
   }
   const page = target.slug ? await fetchPublic(`/kategori/gardssalg/produsent/${encodeURIComponent(target.slug)}`, "opplevagent.no").catch(() => null) : null;
-  return { text: page?.body ?? "", page: page?.status ?? 0, api: 0 };
+  const ps = page?.status ?? 0;
+  return { text: page?.body ?? "", ok: okStatus(ps), statuses: { page: ps } };
 }
 
 function dbValue(vertical: ChangeVertical, targetId: string, field: string): string | null {
@@ -516,23 +597,22 @@ function okStatus(s: number): boolean {
   return s >= 200 && s < 300;
 }
 
+const FAILED_CALL = (e: any): HttpResult => ({ status: 0, body: String(e?.message ?? e), json: null, location: null });
+
 async function executeProfileUpdate(r: ChangeRequestRow, deps: ExecDeps): Promise<void> {
   const now = deps.now ?? new Date();
   const call = deps.adminCall ?? defaultAdminCall;
+  // Claim it: a cancel/reject that lands from here on finds it «executing».
+  if (!setStatus(r.id, "executing", null, {}, now, "queued")) return;
   const changes = JSON.parse(r.changes || "{}") as Record<string, string>;
   const target = loadTarget(r.vertical, r.target_id);
   if (!target) {
     addStep(r.id, "load_target", false, "profilen finnes ikke lenger", now);
-    setStatus(r.id, "failed", "profil_mangler", {}, now);
+    setStatus(r.id, "failed", "profil_mangler", {}, now, "executing");
     return;
   }
-  // Before-snapshot: old values, and whether each one showed publicly at all.
-  const before = await surfaces(r.vertical, target, deps);
-  const snapshot: Record<string, { old: string | null; oldShowed: boolean }> = {};
-  for (const f of Object.keys(changes)) {
-    const old = dbValue(r.vertical, r.target_id, f);
-    snapshot[f] = { old, oldShowed: !!old && valueShows(f, old, before.text) };
-  }
+  const snapshot: Record<string, { old: string | null }> = {};
+  for (const f of Object.keys(changes)) snapshot[f] = { old: dbValue(r.vertical, r.target_id, f) };
   getDb().prepare("UPDATE cs_change_requests SET snapshot = ? WHERE id = ?").run(JSON.stringify(snapshot), r.id);
   const evidence = (() => {
     try {
@@ -561,22 +641,32 @@ async function executeProfileUpdate(r: ChangeRequestRow, deps: ExecDeps): Promis
     const base = `/api/marketplace/agents/${encodeURIComponent(r.target_id)}`;
     for (const [route, body] of [["description", desc], ["patch", patch], ["knowledge", know]] as const) {
       if (Object.keys(body).filter((k) => k !== "owner_relay_evidence").length === 0) continue;
-      const res = await call(route === "description" ? "PUT" : route === "patch" ? "PATCH" : "PUT", route === "description" ? `${base}/description` : route === "patch" ? base : `${base}/knowledge`, route === "knowledge" ? { ...body, dataSource: "manual" } : body).catch((e) => ({ status: 0, body: String(e?.message ?? e), json: null, location: null }));
+      const res = await call(
+        route === "patch" ? "PATCH" : "PUT",
+        route === "description" ? `${base}/description` : route === "patch" ? base : `${base}/knowledge`,
+        route === "knowledge" ? { ...body, dataSource: "owner" } : body,
+      ).catch(FAILED_CALL);
       const skipped = res.json?.skipped;
-      const ok = okStatus(res.status) && !(Array.isArray(skipped) && skipped.length > 0);
-      addStep(r.id, `write_${route}`, ok, { status: res.status, fields: Object.keys(body), response: (res.json ?? res.body)?.toString?.().slice?.(0, 300) ?? res.json }, now);
-      if (!ok) failures.push(`${route}: HTTP ${res.status}${skipped ? ` skipped=${JSON.stringify(skipped)}` : ""}`);
+      const phoneRefused = route === "knowledge" && changes.phone !== undefined && res.json?.phone_write && res.json.phone_write.allowed === false;
+      const ok = okStatus(res.status) && !(Array.isArray(skipped) && skipped.length > 0) && !phoneRefused;
+      addStep(r.id, `write_${route}`, ok, { status: res.status, fields: Object.keys(body), skipped: skipped ?? null, phone_write: res.json?.phone_write ?? null }, now);
+      if (!ok) failures.push(`${route}: HTTP ${res.status}${skipped ? ` skipped=${JSON.stringify(skipped)}` : ""}${phoneRefused ? " telefon avvist" : ""}`);
     }
     if (failures.length === 0) {
       for (const f of Object.keys(changes)) {
-        const res = await call("POST", `/api/marketplace/admin/agents/${encodeURIComponent(r.target_id)}/curated-fields`, { field: RFB_FIELDS[f].lock, meta }).catch((e) => ({ status: 0, body: String(e), json: null, location: null }));
+        const res = await call("POST", `/api/marketplace/admin/agents/${encodeURIComponent(r.target_id)}/curated-fields`, { field: RFB_FIELDS[f].lock, meta }).catch(FAILED_CALL);
         addStep(r.id, `lock_${RFB_FIELDS[f].lock}`, okStatus(res.status), { status: res.status }, now);
       }
+    }
+    try {
+      (marketplaceRegistry as any).invalidateCache?.();
+    } catch {
+      /* cache refreshes on its own within 60 s */
     }
   } else {
     for (const [f, v] of Object.entries(changes)) {
       const m = EXP_FIELDS[f];
-      const res = await call("POST", `/api/opplevelser/admin/${m.path}`, { provider_id: r.target_id, source, ...m.body(v) }).catch((e) => ({ status: 0, body: String(e), json: null, location: null }));
+      const res = await call("POST", `/api/opplevelser/admin/${m.path}`, { provider_id: r.target_id, source, ...m.body(v) }).catch(FAILED_CALL);
       const ok = okStatus(res.status) && res.json?.success !== false && !res.json?.error;
       addStep(r.id, `write_${f}`, ok, { status: res.status, response: res.json ?? res.body.slice(0, 300) }, now);
       if (!ok) {
@@ -584,51 +674,57 @@ async function executeProfileUpdate(r: ChangeRequestRow, deps: ExecDeps): Promis
         continue;
       }
       if (m.lock) {
-        const l = await call("POST", "/api/opplevelser/admin/gardssalg-set-field-lock", { provider_id: r.target_id, field: m.lock, lock: true, source }).catch((e) => ({ status: 0, body: String(e), json: null, location: null }));
+        const l = await call("POST", "/api/opplevelser/admin/gardssalg-set-field-lock", { provider_id: r.target_id, field: m.lock, lock: true, source }).catch(FAILED_CALL);
         addStep(r.id, `lock_${m.lock}`, okStatus(l.status), { status: l.status }, now);
       }
     }
   }
-  if (r.vertical === "rfb") {
-    try {
-      (marketplaceRegistry as any).invalidateCache?.();
-    } catch {
-      /* cache refreshes on its own within 60 s */
-    }
-  }
   if (failures.length > 0) {
-    setStatus(r.id, "failed", `skriving_feilet: ${failures.join("; ")}`.slice(0, 500), {}, now);
+    setStatus(r.id, "failed", `skriving_feilet: ${failures.join("; ")}`.slice(0, 500), {}, now, "executing");
     return;
   }
-  setStatus(r.id, "executed", null, { executed_at: now.toISOString() }, now);
+  if (!setStatus(r.id, "executed", null, { executed_at: now.toISOString() }, now, "executing")) return;
   await verifyProfileUpdate(getChangeRequest(r.id)!, deps);
 }
 
 export async function verifyProfileUpdate(r: ChangeRequestRow, deps: ExecDeps): Promise<boolean> {
   const now = deps.now ?? new Date();
   const changes = JSON.parse(r.changes || "{}") as Record<string, string>;
-  const snapshot = JSON.parse(r.snapshot || "{}") as Record<string, { old: string | null; oldShowed: boolean }>;
+  const snapshot = JSON.parse(r.snapshot || "{}") as Record<string, { old: string | null }>;
   const target = loadTarget(r.vertical, r.target_id);
   if (!target) {
-    setStatus(r.id, "verify_failed", "profil_mangler", {}, now);
+    setStatus(r.id, "verify_failed", "profil_mangler", {}, now, "executed");
     return false;
   }
   const s = await surfaces(r.vertical, target, deps);
+  const windowOver = now.getTime() - Date.parse(r.executed_at ?? r.updated_at) > VERIFY_WINDOW_HOURS * 3600_000;
+  if (!s.ok) {
+    // A page or API that did not answer proves nothing either way.
+    addStep(r.id, "verify", false, { surfaces: s.statuses, note: "offentlig side/API svarte ikke 2xx — prøver igjen" }, now);
+    if (windowOver) setStatus(r.id, "verify_failed", `offentlige flater svarte ikke: ${JSON.stringify(s.statuses)}`, {}, now, "executed");
+    return false;
+  }
   const results: Record<string, string> = {};
   let all = true;
   for (const [f, v] of Object.entries(changes)) {
-    const inDb = (dbValue(r.vertical, r.target_id, f) ?? "") === v || (f === "phone" && digits(dbValue(r.vertical, r.target_id, f) ?? "").endsWith(digits(v).slice(-8)) && digits(v).length >= 8);
+    const stored = dbValue(r.vertical, r.target_id, f) ?? "";
+    const inDb = stored === v || (f === "phone" && digits(v).length >= 8 && digits(stored).endsWith(digits(v).slice(-8)));
+    if (!inDb) {
+      results[f] = "ikke_lagret";
+      all = false;
+      continue;
+    }
     if (v.trim() === "") {
       const old = snapshot[f]?.old;
       const gone = !old || !valueShows(f, old, s.text);
-      results[f] = gone && inDb ? "fjernet_fra_siden" : "vises_fortsatt";
-      all = all && gone && inDb;
+      results[f] = gone ? "fjernet_fra_siden" : "vises_fortsatt";
+      all = all && gone;
       continue;
     }
     if (valueShows(f, v, s.text)) {
       results[f] = "vises_offentlig";
-    } else if (!snapshot[f]?.oldShowed && inDb) {
-      // The surface never showed this field (e.g. an e-mail behind «Vis e-post»):
+    } else if (NOT_RENDERED[r.vertical].includes(f)) {
+      // This field is not rendered publicly (e.g. an e-mail behind «Vis e-post»):
       // read back from the database instead, and say so.
       results[f] = "lagret (feltet vises ikke offentlig)";
     } else {
@@ -636,29 +732,49 @@ export async function verifyProfileUpdate(r: ChangeRequestRow, deps: ExecDeps): 
       all = false;
     }
   }
-  addStep(r.id, "verify", all, { page: s.page, api: s.api, fields: results }, now);
+  addStep(r.id, "verify", all, { surfaces: s.statuses, fields: results }, now);
   if (all) {
-    setStatus(r.id, "verified", null, { verified_at: now.toISOString() }, now);
+    setStatus(r.id, "verified", null, { verified_at: now.toISOString() }, now, "executed");
     return true;
   }
-  const executedAt = Date.parse(r.executed_at ?? r.updated_at);
-  if (now.getTime() - executedAt > VERIFY_WINDOW_HOURS * 3600_000) {
-    setStatus(r.id, "verify_failed", `ikke synlig etter ${VERIFY_WINDOW_HOURS} t: ${JSON.stringify(results)}`.slice(0, 500), {}, now);
-  }
+  if (windowOver) setStatus(r.id, "verify_failed", `ikke synlig etter ${VERIFY_WINDOW_HOURS} t: ${JSON.stringify(results)}`.slice(0, 500), {}, now, "executed");
   return false;
 }
+
+/** Every blocklist row a removal of this target could add — ours AND the Opplevagent visibility route's own (org_nr, e-post, nettside). */
+function trackedBlocklistPairs(vertical: ChangeVertical, target: Target, plan: Array<{ type: string; value: string }>): Array<{ type: string; value: string }> {
+  const pairs = [...plan];
+  const add = (type: string, value: string | null | undefined) => {
+    if (value && !pairs.some((p) => p.type === type && p.value === value)) pairs.push({ type, value });
+  };
+  if (vertical === "experiences") {
+    const p = getVerticalDb("experiences").prepare("SELECT org_nr, epost, hjemmeside FROM experience_providers WHERE id = ?").get(target.id) as
+      | { org_nr: string | null; epost: string | null; hjemmeside: string | null }
+      | undefined;
+    if (p) {
+      add("org_nr", blocklist.normalizeOrgNr(p.org_nr));
+      add("email", blocklist.normalizeEmail(p.epost));
+      add("website_domain", domainOf(p.hjemmeside));
+    }
+  }
+  return pairs;
+}
+
+const REMOVAL_REASON = (id: string) => `kunden ba om fjerning — CS-forespørsel ${id}`;
 
 async function executeRemovalHide(r: ChangeRequestRow, deps: ExecDeps): Promise<void> {
   const now = deps.now ?? new Date();
   const call = deps.adminCall ?? defaultAdminCall;
+  if (!setStatus(r.id, "executing", null, {}, now, "queued")) return;
   const target = loadTarget(r.vertical, r.target_id);
   if (!target) {
     addStep(r.id, "load_target", false, "profilen finnes ikke lenger", now);
-    setStatus(r.id, "failed", "profil_mangler", {}, now);
+    setStatus(r.id, "failed", "profil_mangler", {}, now, "executing");
     return;
   }
-  const plan = removalBlocklistPlan(r.vertical, target, r.requester_email).filter((p) => !(p.type === "name_normalized" && nameIsShared(r.vertical, target)));
-  const before = blocklistIdsFor(plan);
+  const plan = removalBlocklistPlan(r.vertical, target, r.requester_email);
+  const tracked = trackedBlocklistPairs(r.vertical, target, plan);
+  const before = blocklistIdsFor(tracked);
   let snapshot: Record<string, unknown> = {};
   if (r.vertical === "rfb") {
     const db = getDb();
@@ -669,7 +785,7 @@ async function executeRemovalHide(r: ChangeRequestRow, deps: ExecDeps): Promise<
       db.prepare(
         `INSERT INTO agent_knowledge_audit (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
          VALUES (?, ?, 'is_active', ?, '0', 'system', ?, ?, ?)`,
-      ).run(randomUUID(), r.target_id, String(prev.is_active), r.requester_email, now.toISOString(), `fjern oss: skjult (cs-change-request ${r.id}), slettes etter ${REMOVAL_GRACE_HOURS} t`);
+      ).run(randomUUID(), r.target_id, String(prev.is_active), r.requester_email, now.toISOString(), `${REMOVAL_REASON(r.id)}: skjult, slettes etter ${REMOVAL_GRACE_HOURS} t`);
     })();
     try {
       (marketplaceRegistry as any).invalidateCache?.();
@@ -678,23 +794,35 @@ async function executeRemovalHide(r: ChangeRequestRow, deps: ExecDeps): Promise<
     }
     addStep(r.id, "hide", true, { is_active: 0, catalog_hidden: 1, previous: snapshot }, now);
   } else {
+    const xdb = getVerticalDb("experiences");
+    const prev = xdb.prepare("SELECT catalog_hidden, catalog_hidden_reason FROM experience_providers WHERE id = ?").get(r.target_id) as
+      | { catalog_hidden: number | null; catalog_hidden_reason: string | null }
+      | undefined;
+    snapshot = { catalog_hidden: prev?.catalog_hidden ?? 0, catalog_hidden_reason: prev?.catalog_hidden_reason ?? null };
     const res = await call("POST", "/api/opplevelser/admin/gardssalg-provider-visibility", {
       providerIds: [r.target_id],
       hidden: true,
       apply: true,
       mode: "remove_request",
       confirm_owned: true,
-    }).catch((e) => ({ status: 0, body: String(e), json: null, location: null }));
-    const ok = okStatus(res.status);
-    addStep(r.id, "hide", ok, { status: res.status, response: res.json ?? res.body.slice(0, 300) }, now);
+    }).catch(FAILED_CALL);
+    // 200 alone is not proof: the route answers 200 with the row in
+    // skipped_locked / not_found too. Accept only «changed» (or «unchanged»
+    // when it already was hidden as a removal) AND the row reads hidden now.
+    const inBucket = (k: string) => Array.isArray(res.json?.[k]) && res.json[k].some((x: any) => x?.id === r.target_id);
+    const now2 = xdb.prepare("SELECT catalog_hidden, catalog_hidden_reason FROM experience_providers WHERE id = ?").get(r.target_id) as
+      | { catalog_hidden: number | null; catalog_hidden_reason: string | null }
+      | undefined;
+    const hiddenNow = now2?.catalog_hidden === 1;
+    const ok = okStatus(res.status) && (inBucket("changed") || (inBucket("unchanged") && now2?.catalog_hidden_reason === "remove_request")) && hiddenNow;
+    const bucket = ["changed", "unchanged", "skipped_locked", "skipped_owned", "skipped_owner_removed", "not_found"].find(inBucket) ?? "ingen";
+    addStep(r.id, "hide", ok, { status: res.status, bucket, hidden_now: hiddenNow, previous: snapshot }, now);
     if (!ok) {
-      setStatus(r.id, "failed", `skjuling_feilet: HTTP ${res.status}`, {}, now);
+      setStatus(r.id, "failed", `skjuling_feilet: HTTP ${res.status}, ${bucket}`, {}, now, "executing");
       return;
     }
-    snapshot = { visibility: "remove_request" };
   }
-  // Blocklist: requester, profile e-mails, own domains, agent id, name. Free-mail / ISP / platform domains never.
-  const reason = `fjern oss — CS-forespørsel ${r.id}`;
+  const reason = REMOVAL_REASON(r.id);
   for (const p of plan) {
     try {
       if (p.type === "email") blocklist.add({ email: p.value, reason, sourceEmail: r.requester_email, agentNameForAudit: target.name });
@@ -705,7 +833,7 @@ async function executeRemovalHide(r: ChangeRequestRow, deps: ExecDeps): Promise<
       addStep(r.id, `blocklist_${p.type}`, false, String(e?.message ?? e), now);
     }
   }
-  const after = blocklistIdsFor(plan);
+  const after = blocklistIdsFor(tracked);
   const added = [...after.entries()].filter(([k]) => !before.has(k)).map(([k, v]) => ({ key: k, id: v }));
   addStep(r.id, "blocklist", plan.every((p) => after.has(`${p.type}|${p.value}`)), { planned: plan, added: added.map((a) => a.key), already: [...before.keys()] }, now);
   const cross = [...new Set([r.requester_email, ...target.emails])].flatMap((e) => {
@@ -715,12 +843,12 @@ async function executeRemovalHide(r: ChangeRequestRow, deps: ExecDeps): Promise<
       return [];
     }
   });
-  addStep(r.id, "cross_vertical", true, cross.length ? { hits: cross, note: "Ikke slettet på andre plattformer — vurderes av Daniel." } : { hits: [] }, now);
+  addStep(r.id, "cross_vertical", true, cross.length ? { hits: cross, note: "Ikke endret på andre plattformer — vurderes av Daniel." } : { hits: [] }, now);
   const deleteAfter = new Date(now.getTime() + REMOVAL_GRACE_HOURS * 3600_000).toISOString();
   getDb()
     .prepare("UPDATE cs_change_requests SET snapshot = ?, blocklist_ids = ?, cross_vertical = ? WHERE id = ?")
     .run(JSON.stringify(snapshot), JSON.stringify(added.map((a) => a.id)), JSON.stringify(cross), r.id);
-  setStatus(r.id, "hidden", null, { hidden_at: now.toISOString(), delete_after: deleteAfter, executed_at: now.toISOString() }, now);
+  setStatus(r.id, "hidden", null, { hidden_at: now.toISOString(), delete_after: deleteAfter, executed_at: now.toISOString() }, now, "executing");
 }
 
 async function removalChecks(r: ChangeRequestRow, deps: ExecDeps): Promise<{ ok: boolean; checks: Record<string, unknown> }> {
@@ -759,39 +887,53 @@ async function executeRemovalFinish(r: ChangeRequestRow, deps: ExecDeps): Promis
   const now = deps.now ?? new Date();
   const call = deps.adminCall ?? defaultAdminCall;
   if (r.vertical === "rfb" && !r.deleted_at) {
+    // Claim the delete: a cancel from here on is refused (it only acts on «hidden»).
+    if (!setStatus(r.id, "deleting", null, {}, now, "hidden")) return;
     const res = await call("DELETE", `/api/marketplace/agents/${encodeURIComponent(r.target_id)}?force=1`, {
-      reason: `fjern oss — CS-forespørsel ${r.id}`,
+      reason: REMOVAL_REASON(r.id),
       sourceEmail: r.requester_email,
-    }).catch((e) => ({ status: 0, body: String(e), json: null, location: null }));
+      // The blocklist was written at hide time with the own-domain and
+      // shared-identifier rules; the route's own fallback must not add more.
+      skipBlocklist: true,
+    }).catch(FAILED_CALL);
     const ok = okStatus(res.status) || res.status === 404;
     addStep(r.id, "delete", ok, { status: res.status, response: res.json ?? res.body.slice(0, 300) }, now);
     if (!ok) {
-      // 423 = enrichment write pause, 0 = server busy: try again next tick (still hidden).
+      // 423 = enrichment write pause, 0 = busy: still hidden, retried next tick.
       getDb().prepare("UPDATE cs_change_requests SET attempts = attempts + 1 WHERE id = ?").run(r.id);
-      if (r.attempts + 1 >= 12) setStatus(r.id, "failed", `sletting_feilet: HTTP ${res.status} (${r.attempts + 1} forsøk)`, {}, now);
+      if (r.attempts + 1 >= 48) setStatus(r.id, "failed", `sletting_feilet: HTTP ${res.status} (${r.attempts + 1} forsøk)`, {}, now, "deleting");
+      else setStatus(r.id, "hidden", `sletting utsatt: HTTP ${res.status}`, {}, now, "deleting");
       return;
     }
     getDb().prepare("UPDATE cs_change_requests SET deleted_at = ? WHERE id = ?").run(now.toISOString(), r.id);
   }
-  const { ok, checks } = await removalChecks(getChangeRequest(r.id)!, deps);
+  const cur = getChangeRequest(r.id)!;
+  const { ok, checks } = await removalChecks(cur, deps);
   addStep(r.id, "checks", ok, checks, now);
+  const from: ChangeStatus = cur.status === "deleting" ? "deleting" : "hidden";
   if (ok) {
-    setStatus(r.id, "verified", null, { verified_at: now.toISOString() }, now);
+    setStatus(r.id, "verified", null, { verified_at: now.toISOString() }, now, from);
     return;
   }
   const base = Date.parse(r.delete_after ?? r.updated_at);
-  if (now.getTime() - base > VERIFY_WINDOW_HOURS * 3600_000) setStatus(r.id, "verify_failed", `kontroller feilet: ${JSON.stringify(checks)}`.slice(0, 500), {}, now);
+  if (now.getTime() - base > VERIFY_WINDOW_HOURS * 3600_000) setStatus(r.id, "verify_failed", `kontroller feilet: ${JSON.stringify(checks)}`.slice(0, 500), {}, now, from);
 }
 
 // ─── Daniel's actions ────────────────────────────────────────────────
 
-export function approveChangeRequest(id: string, actor: "daniel" = "daniel", now: Date = new Date(), env: NodeJS.ProcessEnv = process.env): { ok: true; request: ChangeRequestRow; note?: string } | { ok: false; status: number; error: string } {
+export function approveChangeRequest(
+  id: string,
+  actor: "daniel" = "daniel",
+  now: Date = new Date(),
+  env: NodeJS.ProcessEnv = process.env,
+  source: "admin-crm" | "api" = "api",
+): { ok: true; request: ChangeRequestRow; note?: string } | { ok: false; status: number; error: string } {
   const r = getChangeRequest(id);
   if (!r) return { ok: false, status: 404, error: "not_found" };
   if (r.status !== "approval_needed") return { ok: false, status: 409, error: `status_${r.status}` };
+  if (!setStatus(id, "queued", null, {}, now, "approval_needed")) return { ok: false, status: 409, error: "status_changed" };
   getDb().prepare("UPDATE cs_change_requests SET authority = 'approved' WHERE id = ?").run(id);
-  setStatus(id, "queued", null, {}, now);
-  addStep(id, "approved", true, { by: actor }, now);
+  addStep(id, "approved", true, { by: actor, source }, now);
   return { ok: true, request: getChangeRequest(id)!, ...(csChangeRequestsEnabled(env) ? {} : { note: `${CS_CHANGE_REQUESTS_FLAG} er av — utføres når jobben slås på` }) };
 }
 
@@ -799,7 +941,7 @@ export function rejectChangeRequest(id: string, reason: string, actor: "daniel" 
   const r = getChangeRequest(id);
   if (!r) return { ok: false, status: 404, error: "not_found" };
   if (r.status !== "approval_needed" && r.status !== "queued") return { ok: false, status: 409, error: `status_${r.status}` };
-  setStatus(id, "rejected", reason, {}, now);
+  if (!setStatus(id, "rejected", reason, {}, now, r.status)) return { ok: false, status: 409, error: "status_changed" };
   addStep(id, "rejected", true, { by: actor, reason }, now);
   return { ok: true };
 }
@@ -810,12 +952,14 @@ export async function cancelChangeRequest(id: string, reason: string, deps: Exec
   const r = getChangeRequest(id);
   if (!r) return { ok: false, status: 404, error: "not_found" };
   if (r.status === "approval_needed" || r.status === "queued") {
-    setStatus(id, "cancelled", reason, {}, now);
+    if (!setStatus(id, "cancelled", reason, {}, now, r.status)) return { ok: false, status: 409, error: "status_changed" };
     addStep(id, "cancelled", true, { reason }, now);
     return { ok: true, request: getChangeRequest(id)! };
   }
   if (r.kind !== "removal" || r.status !== "hidden" || r.deleted_at) return { ok: false, status: 409, error: `cannot_cancel_${r.status}${r.deleted_at ? "_deleted" : ""}` };
-  const snap = JSON.parse(r.snapshot || "{}") as { is_active?: number; catalog_hidden?: number };
+  // Claim it first: the worker's delete only starts from «hidden».
+  if (!setStatus(id, "executing", "angrer", {}, now, "hidden")) return { ok: false, status: 409, error: "status_changed" };
+  const snap = JSON.parse(r.snapshot || "{}") as { is_active?: number; catalog_hidden?: number; catalog_hidden_reason?: string | null };
   if (r.vertical === "rfb") {
     const db = getDb();
     db.prepare("UPDATE agents SET is_active = ?, catalog_hidden = ? WHERE id = ?").run(snap.is_active ?? 1, snap.catalog_hidden ?? 0, r.target_id);
@@ -837,15 +981,29 @@ export async function cancelChangeRequest(id: string, reason: string, deps: Exec
       mode: "remove_request",
       confirm_owned: true,
       override_owner_removed: true,
-    }).catch((e) => ({ status: 0, body: String(e), json: null, location: null }));
+    }).catch(FAILED_CALL);
     addStep(id, "unhide", okStatus(res.status), { status: res.status }, now);
-    if (!okStatus(res.status)) return { ok: false, status: 502, error: `unhide_failed_${res.status}` };
+    if (!okStatus(res.status)) {
+      setStatus(id, "hidden", null, {}, now, "executing");
+      return { ok: false, status: 502, error: `unhide_failed_${res.status}` };
+    }
+    // It was already hidden before the removal (e.g. for quality): put that back exactly.
+    if (snap.catalog_hidden === 1 && snap.catalog_hidden_reason && snap.catalog_hidden_reason !== "remove_request") {
+      const back = await call("POST", "/api/opplevelser/admin/gardssalg-provider-visibility", {
+        providerIds: [r.target_id],
+        hidden: true,
+        apply: true,
+        mode: snap.catalog_hidden_reason,
+        confirm_owned: true,
+      }).catch(FAILED_CALL);
+      addStep(id, "restore_previous_hide", okStatus(back.status), { status: back.status, mode: snap.catalog_hidden_reason }, now);
+    }
   }
   const ids = JSON.parse(r.blocklist_ids || "[]") as number[];
   let removed = 0;
   for (const bid of ids) removed += blocklist.remove({ id: bid });
   addStep(id, "cancelled", true, { reason, restored: snap, blocklist_rows_removed: removed }, now);
-  setStatus(id, "cancelled", reason, {}, now);
+  setStatus(id, "cancelled", reason, {}, now, "executing");
   return { ok: true, request: getChangeRequest(id)! };
 }
 
@@ -867,6 +1025,7 @@ export async function runCsChangeRequests(deps: ExecDeps & { trigger?: "cron" | 
         WHERE status = 'queued'
            OR (status = 'executed' AND kind = 'profile_update')
            OR (status = 'hidden' AND kind = 'removal' AND julianday(delete_after) <= julianday(?))
+           OR (status = 'deleting' AND kind = 'removal' AND deleted_at IS NOT NULL)
         ORDER BY created_at ASC LIMIT ?`,
     )
     .all(now.toISOString(), limit) as Array<{ id: string }>;
@@ -881,12 +1040,12 @@ export async function runCsChangeRequests(deps: ExecDeps & { trigger?: "cron" | 
         else await executeRemovalHide(r, deps);
       } else if (r.status === "executed") {
         await verifyProfileUpdate(r, deps);
-      } else if (r.status === "hidden") {
+      } else if (r.status === "hidden" || r.status === "deleting") {
         await executeRemovalFinish(r, deps);
       }
     } catch (e: any) {
       addStep(r.id, "exception", false, String(e?.message ?? e), now);
-      setStatus(r.id, "failed", `unntak: ${String(e?.message ?? e)}`.slice(0, 500), {}, now);
+      setStatus(r.id, "failed", `unntak: ${String(e?.message ?? e)}`.slice(0, 500), {}, now, getChangeRequest(r.id)?.status as ChangeStatus);
     }
     const after = getChangeRequest(d.id)!;
     if (after.status !== from || from === "queued") processed.push({ id: d.id, from, to: after.status });

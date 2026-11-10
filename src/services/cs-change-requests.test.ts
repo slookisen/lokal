@@ -86,11 +86,12 @@ export function runCsChangeRequestsTests(opts: { log?: boolean } = {}): Promise<
       try { exp.exec("ALTER TABLE experience_providers ADD COLUMN about_text TEXT"); } catch { /* present */ }
 
       let tn = 0;
-      const mkThread = (vertical: "rfb" | "experiences", from: string, prefix = "cq") => {
+      const mkThread = (vertical: "rfb" | "experiences", from: string, prefix = "cq", serverRegistered = true) => {
         const id = `${prefix}-t${++tn}`;
         crm.crmService.ingestThread(
           { threadId: id, subject: `Henvendelse ${tn}`, category: "innkommende",
-            messages: [{ messageId: `${id}-in`, direction: "in", fromEmail: from, bodyText: "Vennligst endre", sentAt: ago(2) }] },
+            messages: [{ messageId: `${id}-in`, direction: "in", fromEmail: from, bodyText: "Vennligst endre", sentAt: ago(2),
+              rawMetadata: serverRegistered ? { source: "resend_inbound" } : {} }] },
           from, vertical);
         return id;
       };
@@ -98,6 +99,8 @@ export function runCsChangeRequestsTests(opts: { log?: boolean } = {}): Promise<
       // Stub of the server's own admin routes (what the real routes would store).
       const calls: Array<{ method: string; path: string; body: any }> = [];
       let refuseKnowledge = false;
+      const lockedProviders = new Set<string>();
+      let cardDown = false;
       let deleteStatus = 200;
       const adminCall: import("./cs-change-requests").AdminCall = async (method, path, body: any) => {
         calls.push({ method, path, body });
@@ -129,8 +132,10 @@ export function runCsChangeRequestsTests(opts: { log?: boolean } = {}): Promise<
         }
         if (path === "/api/opplevelser/admin/gardssalg-set-field-lock") return res(200, { success: true });
         if (path === "/api/opplevelser/admin/gardssalg-provider-visibility") {
-          exp.prepare("UPDATE experience_providers SET catalog_hidden = ? WHERE id = ?").run(body.hidden ? 1 : 0, body.providerIds[0]);
-          return res(200, { changed: 1 });
+          const pid = body.providerIds[0];
+          if (lockedProviders.has(pid)) return res(200, { changed: [], unchanged: [], skipped_locked: [{ id: pid }] });
+          exp.prepare("UPDATE experience_providers SET catalog_hidden = ?, catalog_hidden_reason = ? WHERE id = ?").run(body.hidden ? 1 : 0, body.hidden ? body.mode : null, pid);
+          return res(200, { changed: [{ id: pid }], unchanged: [] });
         }
         return res(404, { error: "no stub" });
       };
@@ -139,6 +144,7 @@ export function runCsChangeRequestsTests(opts: { log?: boolean } = {}): Promise<
       const publicFetch: import("./cs-change-requests").PublicFetch = async (path, host) => {
         const r = (status: number, body: string) => ({ status, body, json: null, location: null });
         let m = /^\/api\/marketplace\/agents\/([^/]+)\/card$/.exec(path);
+        if (m && cardDown) return r(503, "");
         if (m) {
           const a = db.prepare(`SELECT a.id, a.name, k.phone, k.about, k.address FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id WHERE a.id = ?`).get(decodeURIComponent(m[1])) as any;
           if (!a) return r(404, "{}");
@@ -271,6 +277,56 @@ export function runCsChangeRequestsTests(opts: { log?: boolean } = {}): Promise<
       const nDel = calls.filter((c) => c.method === "DELETE").length;
       await cq.runCsChangeRequests(deps({ now: new Date(Date.now() + 25 * 3600_000) }));
       eq([R(idXr).status, calls.filter((c) => c.method === "DELETE").length], ["verified", nDel], "cq22: …after 24 h verified without a delete call (no single-provider delete exists)");
+
+      // ── S4 review fixes ──────────────────────────────────────────────
+      {
+        // 7: a removal needs an e-mail the SERVER received, not one any API caller could file.
+        insAgent.run("ag-5", "Bevisgården", "post@bevis.no", "https://bevis.no", "key-ag-5");
+        db.prepare(`INSERT INTO agent_knowledge (agent_id, email, phone, about, website) VALUES ('ag-5', NULL, '33 33 33 33', 'Om', 'https://bevis.no')`).run();
+        const tNoServer = mkThread("rfb", "post@bevis.no", "cq", false);
+        const r7 = create({ targetId: "ag-5", threadId: tNoServer, requesterEmail: "post@bevis.no", kind: "removal" });
+        eq(r7.ok && !r7.dryRun && [r7.request.status, r7.request.status_reason], ["approval_needed", "fjerning_krever_serverregistrert_e-post"], "cqr1: a removal whose evidence was not received by the server goes to Daniel");
+        // 6: a second open removal of the same profile is refused (cancel stays meaningful)
+        const tSrv = mkThread("rfb", "post@bevis.no");
+        const r6 = create({ targetId: "ag-5", threadId: tSrv, requesterEmail: "post@bevis.no", kind: "removal" });
+        eq([(r6 as any).status, (r6 as any).error], [409, "open_request_exists"], "cqr2: a duplicate open removal of one profile → 409 with the existing id");
+      }
+      {
+        // 5c: an identifier another active profile uses is never blocklisted
+        insAgent.run("ag-6", "Delt Gård A", "felles@delt.no", "https://delt.no", "key-ag-6");
+        db.prepare(`INSERT INTO agent_knowledge (agent_id, email, website) VALUES ('ag-6', NULL, 'https://delt.no')`).run();
+        insAgent.run("ag-7", "Delt Gård B", "felles@delt.no", "https://annen.no", "key-ag-7");
+        db.prepare(`INSERT INTO agent_knowledge (agent_id, email, website) VALUES ('ag-7', NULL, 'https://annen.no')`).run();
+        const plan = cq.removalBlocklistPlan("rfb", cq.loadTarget("rfb", "ag-6")!, "felles@delt.no");
+        ok(!plan.some((p) => p.type === "email" && p.value === "felles@delt.no") && plan.some((p) => p.type === "agent_id"), "cqr3: an e-mail another active producer uses is not blocklisted (its order mails would stop)");
+        // 5a/b: authority from the ROOT website domain only
+        insAgent.run("ag-8", "Sidegården", "post@sidegarden.no", "https://www.facebook.com/sidegarden", "key-ag-8");
+        db.prepare(`INSERT INTO agent_knowledge (agent_id, email, website) VALUES ('ag-8', NULL, 'https://www.facebook.com/sidegarden')`).run();
+        const t5 = cq.loadTarget("rfb", "ag-8")!;
+        eq(t5.domains, [], "cqr4: a deep page on a platform host gives no own-domain authority");
+      }
+      {
+        // 2: Opplevagent hide that the route skipped is a failure, not «hidden»
+        exp.prepare(`INSERT INTO experience_providers (id, navn, epost, hjemmeside, slug) VALUES ('ep-2', 'Låst Gård', 'post@laast.no', 'https://laast.no', 'laast-gard--ep2')`).run();
+        lockedProviders.add("ep-2");
+        const tL = mkThread("experiences", "post@laast.no");
+        const cL = create({ vertical: "experiences", targetId: "ep-2", threadId: tL, requesterEmail: "post@laast.no", kind: "removal" });
+        await cq.runCsChangeRequests(deps());
+        const rl = R(cL.ok && !cL.dryRun ? cL.request.id : "");
+        ok(rl.status === "failed" && /skipped_locked/.test(rl.status_reason ?? ""), "cqr5: the visibility route answering 200 with skipped_locked → failed (the customer is never told it is hidden)");
+      }
+      {
+        // 3: an unavailable public surface proves nothing — stays executed
+        const tU = mkThread("rfb", "post@testgard-ost.no");
+        const cU = create({ threadId: tU, changes: { about: "Tekst mens kortet er nede" } });
+        cardDown = true;
+        await cq.runCsChangeRequests(deps());
+        const ru = R(cU.ok && !cU.dryRun ? cU.request.id : "");
+        cardDown = false;
+        eq(ru.status, "executed", "cqr6: card API down (503) → not verified, re-read later");
+        await cq.runCsChangeRequests(deps());
+        eq(R(ru.id).status, "verified", "cqr7: …verified once the surfaces answer and show the value");
+      }
 
       // ── routes, watchdog, digest ─────────────────────────────────────
       const router = (require("../routes/admin-cs-change-requests") as any).default;

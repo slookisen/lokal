@@ -69,7 +69,7 @@ router.get("/change-requests/:id", (req: Request, res: Response) => {
 
 router.post("/change-requests/:id/approve", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
-  const r = approveChangeRequest(String(req.params.id), "daniel");
+  const r = approveChangeRequest(String(req.params.id), "daniel", new Date(), process.env, req.get("X-Admin-Client") === "admin-crm" ? "admin-crm" : "api");
   if (!r.ok) return res.status(r.status).json({ error: r.error });
   res.json({ request: r.request, note: r.note });
 });

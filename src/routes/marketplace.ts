@@ -55,7 +55,7 @@ import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
 // Decision 11=A: the claim response shows the farm address masked, the same
 // helper the Opplevagent claim page uses; per-IP limit on claim requests.
 import { maskEmail } from "../services/gardssalg-claim";
-import { CLAIM_RECOMMENDATION_LABELS, type ClaimRecommendation } from "../services/claim-domain-rule";
+import { CLAIM_RECOMMENDATION_LABELS, isHostedPlatformHost, type ClaimRecommendation } from "../services/claim-domain-rule";
 import { createClaimActionLinks, isClaimActionLinksEnabled, isClaimRequestMoreEnabled, isClaimMergeApproveEnabled, type ClaimAction } from "../services/claim-action-link";
 import { mergeApproveCandidates } from "../services/claim-merge-approve";
 import { claimAssessmentEnabled, waitForClaimAssessmentOutcome, type ClaimAssessment } from "../services/claim-assessment";
@@ -4547,10 +4547,16 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
         // agent_knowledge.website. A knowledge-sourced domain that is a shared
         // free-mail/ISP/vipps host (PROTECTED_DOMAINS) is never blocklisted.
         // OWN_DOMAINS is still enforced inside blocklistAdd().
+        // A shared platform host (facebook.com, a shop or booking platform)
+        // is never blocklisted either, from either source: one producer's
+        // removal must not block every other page on that host.
+        const usableDomain = (d: string | null | undefined): boolean =>
+          !!d && !BLOCKLIST_PROTECTED_DOMAINS.has(d) && !isHostedPlatformHost(d);
         const registryUrl: string | undefined = fromRegistry?.url || undefined;
         const knowledgeDomain = blocklistNormalizeDomain(knowledgeWebsite);
-        const knowledgeUsable = !!knowledgeDomain && !BLOCKLIST_PROTECTED_DOMAINS.has(knowledgeDomain);
-        const primaryWebsite: string | undefined = registryUrl || (knowledgeUsable ? knowledgeWebsite : undefined);
+        const knowledgeUsable = usableDomain(knowledgeDomain);
+        const primaryWebsite: string | undefined =
+          registryUrl && usableDomain(blocklistNormalizeDomain(registryUrl)) ? registryUrl : knowledgeUsable ? knowledgeWebsite : undefined;
         blocklistResult = blocklistAdd({
           agentId,
           name: nameHasActiveSurvivor ? undefined : agent.name,

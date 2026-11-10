@@ -106,6 +106,11 @@ export function runContactFormCsTests(opts: { log?: boolean } = {}): Promise<Tes
       eq([r2, sent.length], ["already_sent_24h", 1], "cf9: at most one receipt per address per 24 h");
       const r3 = await cf.sendContactReceipt({ email: "ny@example.no", platform: "experiences", threadId: thread.id }, { env: ON, sendRaw: stubSend, liveTransport: false });
       eq([r3, sent.length], ["dry_run", 1], "cf10: a dry-run transport is never «sent»");
+      db.prepare(`INSERT INTO email_bounces (email, bounced_at, bounce_type) VALUES ('klaget@example.no', '2026-11-01', 'complaint')`).run();
+      const r4 = await cf.sendContactReceipt({ email: "klaget@example.no", platform: "rfb", threadId: thread.id }, { env: ON, sendRaw: stubSend, liveTransport: true });
+      eq([r4, sent.length], ["suppressed", 1], "cf10b: no receipt to an address with a complaint / hard bounce / on the blocklist");
+      const r5 = await cf.sendContactReceipt({ email: "mange@example.no", platform: "rfb", threadId: thread.id }, { env: { ...ON, CS_CONTACT_RECEIPT_MAX_PER_DAY: "1" } as any, sendRaw: stubSend, liveTransport: true });
+      eq([r5, sent.length], ["daily_cap", 1], "cf10c: a global daily cap on receipts");
       ok(!!db.prepare("SELECT 1 FROM crm_actions WHERE thread_id = ? AND type = 'receipt_sent'").get(thread.id) && (db.prepare("SELECT COUNT(*) n FROM crm_messages WHERE thread_id = ? AND direction = 'out'").get(thread.id) as any).n === 0, "cf11: the receipt is an action on the thread, not a message");
 
       // ── needs-reply + digest ────────────────────────────────────────

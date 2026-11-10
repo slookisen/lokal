@@ -403,13 +403,15 @@ export async function runCsWatchdog(
     for (const c of db
       .prepare(
         `SELECT id, vertical, target_name, kind FROM cs_change_requests
-          WHERE status = 'queued' AND julianday(updated_at) < julianday(?) - 30.0 / 1440 LIMIT 50`,
+          WHERE (status IN ('queued', 'executing') AND julianday(updated_at) < julianday(?) - 30.0 / 1440)
+             OR (status IN ('hidden', 'deleting') AND delete_after IS NOT NULL AND julianday(delete_after) < julianday(?) - 2.0 / 24)
+          LIMIT 50`,
       )
-      .all(now.toISOString()) as Array<{ id: string; vertical: string; target_name: string | null; kind: string }>) {
+      .all(now.toISOString(), now.toISOString()) as Array<{ id: string; vertical: string; target_name: string | null; kind: string }>) {
       items.push({
         key: `change-stuck:${c.id}`,
         once: true,
-        line: `• [${c.kind === "removal" ? "Fjerning" : "Endring"} venter på jobben] [${platformName(c.vertical)}] ${c.target_name ?? "?"} — i kø over 30 min (er CS_CHANGE_REQUESTS_ENABLED på?) (${c.id})`,
+        line: `• [${c.kind === "removal" ? "Fjerning" : "Endring"} henger] [${platformName(c.vertical)}] ${c.target_name ?? "?"} — ikke ferdig til forventet tid (er CS_CHANGE_REQUESTS_ENABLED på? sletting utsatt?) (${c.id})`,
       });
     }
   } catch (e: any) {

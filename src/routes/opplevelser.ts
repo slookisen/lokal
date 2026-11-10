@@ -863,7 +863,8 @@ import { CRM_SENDER_ADDRESS } from "../services/crm-platform-identity";
 // was removed; a merge with main's independently-built AC6 slice (#508)
 // silently dropped the import since neither side's diff hunk touched the
 // same line the other needed, tsc caught it as the two branches combined.
-import { normalizeDomain, normalizeEmail, isBlocked, add as blocklistAdd, loadOwnerRemovedMatcher } from "../services/blocklist-service";
+import { normalizeDomain, normalizeEmail, isBlocked, add as blocklistAdd, loadOwnerRemovedMatcher, PROTECTED_DOMAINS as BLOCKLIST_PROTECTED_DOMAINS_V } from "../services/blocklist-service";
+import { isHostedPlatformHost as isHostedPlatformHostV } from "../services/claim-domain-rule";
 import type { GardssalgTerminalStatus } from "../services/experience-store";
 import {
   countRecipientAddressTypes,
@@ -33283,9 +33284,12 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
             console.error("[opplevelser] gardssalg-provider-visibility confirmation clear failed (non-critical):", clearErr);
           }
           try {
+            // Never a shared platform host or free-mail domain as a website block.
+            const hjemDomain = normalizeDomain(row.hjemmeside ?? "");
+            const hjemUsable = !!hjemDomain && !BLOCKLIST_PROTECTED_DOMAINS_V.has(hjemDomain) && !isHostedPlatformHostV(hjemDomain);
             const bl = blocklistAdd({
               orgNr: row.org_nr ?? undefined,
-              website: row.hjemmeside ?? undefined,
+              website: hjemUsable ? (row.hjemmeside ?? undefined) : undefined,
               email: row.epost ?? undefined,
               reason: "gardssalg-provider-visibility hide (fjern oss)",
             });
