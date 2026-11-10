@@ -2108,12 +2108,96 @@ const EXPERIENCE_NAV_BOILERPLATE_MARKERS: readonly string[] = [
 ];
 
 /**
+ * Site-navigation / social-link vocabulary for hasNavWordRun below (lowercase,
+ * æøå-folded via stripNorwegianAccents; multi-word entries are matched as one
+ * unit, so "Kontakt oss" counts once, not as "kontakt" + something). Only used
+ * by the experience-description path (looksLikeNavBoilerplate) — never by
+ * meetsAboutQualityBar / isLikelyNavMenuLeakage.
+ */
+const SITE_NAV_RUN_TERMS: readonly string[] = [
+  // Norwegian
+  "hjem", "heim", "forside", "hovedside", "meny", "kontakt", "kontakt oss", "om oss",
+  "booking", "bestill", "takeaway", "aktiviteter", "historie", "bilder", "galleri",
+  "linker", "lenker", "nyheter", "arrangementer", "priser", "nettbutikk", "blogg",
+  "velg en side",
+  // English
+  "home", "menu", "contact", "contact us", "about", "about us", "gallery", "news",
+  "shop", "blog", "events",
+  // social links
+  "facebook", "instagram", "x", "twitter", "youtube", "tiktok", "linkedin", "rss",
+];
+
+/** SITE_NAV_RUN_TERMS split into token arrays, longest phrase first. */
+const SITE_NAV_RUN_PHRASES: readonly string[][] = SITE_NAV_RUN_TERMS
+  .map((t) => t.split(" "))
+  .sort((a, b) => b.length - a.length);
+
+/** Window (in units: a nav phrase or any other word) and distinct-term floor. */
+const NAV_RUN_WINDOW = 6;
+const NAV_RUN_MIN_DISTINCT = 3;
+
+/**
+ * True if `text` contains a RUN of site-navigation words — leaked menu/social
+ * chrome such as "Hjem Meny Booking Kontakt Bestill Takeaway" or "Facebook X
+ * Instagram RSS". HTML entities are decoded first (`&#8211;`, `&amp;`,
+ * `&nbsp;`). The text is cut into segments at sentence punctuation
+ * (. , ! ? : ;) — punctuation between tokens always breaks a run, so prose
+ * listings like "historie, aktiviteter for barn, bilder" never match. Within a
+ * segment, a nav term only counts when it is written Capitalized (menu labels
+ * are; mid-sentence prose words are not). Flags when any window of
+ * NAV_RUN_WINDOW consecutive units holds ≥ NAV_RUN_MIN_DISTINCT DISTINCT nav
+ * terms. PURE, no network/IO.
+ */
+export function hasNavWordRun(text: string | null | undefined): boolean {
+  if (!text) return false;
+  const decoded = decodeHtmlEntities(String(text));
+  for (const segment of decoded.split(/[.,!?:;]+/)) {
+    const raw = segment
+      .split(/[\s|]+/)
+      .map((t) => t.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ""))
+      .filter((t) => t !== "");
+    if (raw.length < NAV_RUN_MIN_DISTINCT) continue;
+    const folded = raw.map((t) => stripNorwegianAccents(t.toLowerCase()));
+    // Collapse the segment into units: a matched nav phrase (term) or null.
+    const units: (string | null)[] = [];
+    let i = 0;
+    while (i < raw.length) {
+      let matched: string[] | null = null;
+      if (/^\p{Lu}/u.test(raw[i])) {
+        for (const phrase of SITE_NAV_RUN_PHRASES) {
+          if (i + phrase.length > folded.length) continue;
+          if (phrase.every((w, k) => folded[i + k] === w)) { matched = phrase; break; }
+        }
+      }
+      if (matched) {
+        units.push(matched.join(" "));
+        i += matched.length;
+      } else {
+        units.push(null);
+        i += 1;
+      }
+    }
+    for (let start = 0; start < units.length; start++) {
+      const distinct = new Set<string>();
+      for (let k = start; k < Math.min(units.length, start + NAV_RUN_WINDOW); k++) {
+        const u = units[k];
+        if (u !== null) distinct.add(u);
+      }
+      if (distinct.size >= NAV_RUN_MIN_DISTINCT) return true;
+    }
+  }
+  return false;
+}
+
+/**
  * True if `text` looks like leaked NAVIGATION-MENU chrome rather than prose:
  * an English skip/jump link ("skip to content"), a literal nav marker
  * (EXPERIENCE_NAV_BOILERPLATE_MARKERS, e.g. "hopp til innhold", "tilbake til
  * toppen"), or a menu-shaped string (isLikelyNavMenuLeakage: numbered/
  * pipe-separated/flat-Title-Case menu list or a verbatim repeated
- * breadcrumb). The nav layer of meetsAboutQualityBar below, WITHOUT its
+ * breadcrumb), or an embedded run of site-nav/social-link words
+ * (hasNavWordRun — experience-only, not part of meetsAboutQualityBar). The
+ * nav layer of meetsAboutQualityBar below, WITHOUT its
  * length (≥80) and Norwegian-language requirements and WITHOUT the bare
  * "til toppen" marker — for callers whose text can legitimately be short,
  * English or about summit hikes (stored experience descriptions, see
@@ -2129,7 +2213,11 @@ export function looksLikeNavBoilerplate(text: string | null | undefined): boolea
   for (const marker of EXPERIENCE_NAV_BOILERPLATE_MARKERS) {
     if (lowerAscii.includes(marker)) return true;
   }
-  return isLikelyNavMenuLeakage(trimmed);
+  if (isLikelyNavMenuLeakage(trimmed)) return true;
+  // 2026-11-10: a run of site-nav / social-link words embedded in otherwise
+  // prose-like text (e.g. "Anno &#8211; Spise og Drikke Hjem Meny ... Booking
+  // Kontakt Bestill Takeaway Velkommen til Anno ..."), see hasNavWordRun.
+  return hasNavWordRun(trimmed);
 }
 
 /**

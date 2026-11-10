@@ -818,6 +818,65 @@ export function runOpplevelserExperiencesAdmissionPromotionTests(
         );
         assertEq(dTop.missing, ["content_quality"], "adm-g9c: 'Tilbake til toppen' anchor still flags content_quality");
 
+        // 2026-11-10 (navtekst i beskrivelse): a RUN of site-nav / social-link
+        // words embedded in otherwise prose-like text (hasNavWordRun). Both
+        // strings are real prod descriptions that used to pass content_quality.
+        {
+          const se = require("../services/search-enrich") as typeof import("../services/search-enrich");
+          const annoProd =
+            "Anno &#8211; Spise og Drikke Hjem Meny Meny Pizzameny Gruppemeny Booking Kontakt Bestill Takeaway " +
+            "Velkommen til Anno vi ønsker deg velkommen til oss og gleder oss til å varte deg opp!";
+          const frithjofProd =
+            "Losskøyta Frithjof II | Facebook X Instagram RSS Stiftelsen Venneforeningen Medlemsblad Linker " +
+            "Seilingsplan Hovedside Aktiviteter Historie Bilder Frithjof-vise Bøker/rekvisitter Velg en side Velkommen";
+          for (const [name, desc] of [["anno-36014679", annoProd], ["frithjof-a6f08b66", frithjofProd]] as const) {
+            assertEq(se.hasNavWordRun(desc), true, `adm-g10a.${name}: hasNavWordRun=true`);
+            assertEq(se.looksLikeNavBoilerplate(desc), true, `adm-g10b.${name}: looksLikeNavBoilerplate=true`);
+            const d = mod.evaluateContentJudgePromotion({ ...base, description: desc }, "MATCH", okReason);
+            assertEq(d.wasNeedsReview && !d.eligible, true, `adm-g10c.${name}: otherwise-eligible row -> held (not eligible)`);
+            assertEq(d.missing, ["content_quality"], `adm-g10d.${name}: missing=['content_quality']`);
+          }
+          // Frithjof with more prose after the nav run is still flagged.
+          assertEq(
+            se.looksLikeNavBoilerplate(frithjofProd + " til Losskøyta Frithjof II. Båten ble bygget i 1919 og seiler fortsatt hver sommer."),
+            true,
+            "adm-g10e: nav run followed by real prose is still flagged",
+          );
+
+          // Must NOT flag: prose mentioning menu/contact/booking, short, English,
+          // summit prose, comma-separated activity listing.
+          for (const [i, prose] of [
+            "Vi serverer en egen meny med lokale råvarer. Kontakt oss for booking av grupper.",
+            "Se menyen og bestill bord på nettsiden vår.",
+            "Kort om fjordturen.",
+            "A guided tour of the farm with tastings of local cheese and cider. Book via our website or contact us.",
+            "Vi tar deg med til toppen av fjellet.",
+            "Her kan du oppleve historie, aktiviteter for barn, bilder fra gamle dager og en hyggelig kafé.",
+          ].entries()) {
+            assertEq(se.hasNavWordRun(prose), false, `adm-g10f.${i}: hasNavWordRun=false for prose "${prose}"`);
+            assertEq(se.looksLikeNavBoilerplate(prose), false, `adm-g10g.${i}: looksLikeNavBoilerplate=false for "${prose}"`);
+            const d = mod.evaluateContentJudgePromotion({ ...base, description: prose }, "MATCH", okReason);
+            assertEq(d.contentQualityOk, true, `adm-g10h.${i}: contentQualityOk=true for "${prose}"`);
+            assertEq(d.eligible, true, `adm-g10i.${i}: eligible for "${prose}"`);
+          }
+
+          // Entity decoding: &nbsp; between nav words keeps the run; &amp; and
+          // &#8211; are neutralized (not words, not punctuation).
+          assertEq(se.hasNavWordRun("Gården&nbsp;Hjem&nbsp;Meny&nbsp;Kontakt"), true, "adm-g10j: &nbsp;-joined nav words form a run");
+          assertEq(se.hasNavWordRun("Mat &amp; Drikke &#8211; Hjem Booking Kontakt oss"), true, "adm-g10k: &amp;/&#8211; decoded, run still detected");
+          // Punctuation between tokens breaks a run.
+          assertEq(se.hasNavWordRun("Hjem Meny Kontakt"), true, "adm-g10l: bare nav run -> true");
+          assertEq(se.hasNavWordRun("Hjem. Meny. Kontakt."), false, "adm-g10m: periods break the run");
+          assertEq(se.hasNavWordRun("Hjem, Meny, Kontakt"), false, "adm-g10n: commas break the run");
+          assertEq(se.hasNavWordRun("Hjem Meny: Kontakt; Booking"), false, "adm-g10o: colon/semicolon break the run");
+          // Multi-word term counts once ("Kontakt oss" = one term), and two
+          // distinct terms are below the threshold.
+          assertEq(se.hasNavWordRun("Kontakt oss Booking"), false, "adm-g10p: only 2 distinct terms -> false");
+          // Lower-case mid-sentence words are prose, not menu labels.
+          assertEq(se.hasNavWordRun("vi har meny booking og kontakt her"), false, "adm-g10q: lower-case words never count");
+          assertEq(se.hasNavWordRun(null), false, "adm-g10r: null -> false");
+        }
+
         const d5 = mod.evaluateContentJudgePromotion(
           { ...base, description: noProse },
           "MATCH",
