@@ -26,6 +26,7 @@ import {
   NEGATIVE_TTL_MS,
   POSITIVE_TTL_MS,
   ERROR_TTL_MS,
+  type AiReaderIpListFetcher,
   type AiReaderResolver,
 } from "./email-reveal-ai-readers";
 import {
@@ -65,6 +66,9 @@ function fakeResolver(rec: Records, mode: { fail?: boolean; hang?: boolean; dela
   };
   return { resolver, calls, total: () => calls.reverse + calls.resolve4 + calls.resolve6 };
 }
+
+/** An IP-list fetcher that never reaches the network (every list: HTTP 404, so no list loads). */
+const noLists: AiReaderIpListFetcher = async () => ({ ok: false, status: 404, headers: { get: () => null }, body: null });
 
 const GOOGLE_IP = "66.249.66.1";
 const GOOGLE_HOST = "crawl-66-249-66-1.googlebot.com";
@@ -142,7 +146,7 @@ export async function runEmailRevealAiReadersTests(opts: { log?: boolean } = {})
       ["Claude-User", "Perplexity-User", "ip_list"], "U7: *-User tokens match first; OpenAI is ip_list");
     ok(AI_READER_REGISTRY.every((e) => (e.method === "fcrdns") === (e.domains.length > 0)), "U8: fcrdns entries have domains, ip_list entries none");
     ok(AI_READER_REGISTRY.filter((e) => ["openai", "anthropic", "perplexity"].includes(e.operator)).every((e) => e.method === "ip_list"),
-      "U9: OpenAI / Anthropic / Perplexity are ip_list (not verifiable in this slice)");
+      "U9: OpenAI / Anthropic / Perplexity are ip_list (verified against IP lists, see email-reveal-ai-reader-ip-lists.test.ts)");
     eq([aiReaderEntryOf("Mozilla/5.0"), aiReaderEntryOf(""), aiReaderEntryOf(undefined)], [null, null, null], "U10: other UAs -> null");
 
     // ── F: FCrDNS ────────────────────────────────────────────────────────
@@ -249,7 +253,7 @@ export async function runEmailRevealAiReadersTests(opts: { log?: boolean } = {})
     }
     {
       const f = fakeResolver({}, { hang: true });
-      const v = new AiReaderVerifier({ resolver: f.resolver, timeoutMs: 20, maxInFlight: 3, maxCache: 4 });
+      const v = new AiReaderVerifier({ resolver: f.resolver, timeoutMs: 20, maxInFlight: 3, maxCache: 4, ipListFetcher: noLists });
       for (let i = 0; i < 10; i++) v.isVerified(`192.0.2.${i}`, googlebot);
       eq(v.inFlightSize(), 3, "V20: at most maxInFlight lookups at once (the rest just get base)");
       await v.settled();
@@ -265,7 +269,7 @@ export async function runEmailRevealAiReadersTests(opts: { log?: boolean } = {})
       const lines: string[] = [];
       let t = 50_000_000;
       const f = fakeResolver(googleRecords);
-      __resetEmailRevealGuardForTesting({ now: () => t, log: (l) => lines.push(l), aiReaders: { resolver: f.resolver, now: () => t } });
+      __resetEmailRevealGuardForTesting({ now: () => t, log: (l) => lines.push(l), aiReaders: { resolver: f.resolver, now: () => t, ipListFetcher: noLists } });
       const req = (ip: string, ua?: string) => ({ ip, headers: ua === undefined ? {} : { "user-agent": ua } }) as any;
       const ids = (prefix: string, n: number) => Array.from({ length: n }, (_, i) => `${prefix}${i}`);
       process.env.EMAIL_REVEAL_PER_IP_PER_HOUR = "3";
@@ -320,7 +324,7 @@ export async function runEmailRevealAiReadersTests(opts: { log?: boolean } = {})
     // ── D: emailRevealLimitFor directly ──────────────────────────────────
     {
       const f = fakeResolver(googleRecords);
-      __resetEmailRevealGuardForTesting({ log: () => {}, aiReaders: { resolver: f.resolver } });
+      __resetEmailRevealGuardForTesting({ log: () => {}, aiReaders: { resolver: f.resolver, ipListFetcher: noLists } });
       process.env.EMAIL_REVEAL_AI_READER_PER_HOUR = "300";
       const req = (ip: string, ua: string) => ({ ip, headers: { "user-agent": ua } }) as any;
       emailRevealLimitFor(req(GOOGLE_IP, GOOGLEBOT_UA), "dental", 30);

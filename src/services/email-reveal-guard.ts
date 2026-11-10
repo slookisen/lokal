@@ -76,19 +76,21 @@
  * agent/info (routes/a2a.ts). The RFB MCP answers are not wired yet.
  *
  * S-A2 (verified AI readers): emailRevealLimitFor gives a known AI reader /
- * search fetcher whose origin is verified by forward-confirmed reverse DNS
- * the higher EMAIL_REVEAL_AI_READER_PER_HOUR (default 300) instead of the
- * base limit. The User-Agent only picks the operator to verify against; it
+ * search fetcher whose origin is verified (forward-confirmed reverse DNS for
+ * Google / Bing / Apple, the operator's published IP list for OpenAI,
+ * Anthropic and Perplexity) the higher EMAIL_REVEAL_AI_READER_PER_HOUR
+ * (default 300) instead of the base limit. The User-Agent only picks the operator to verify against; it
  * never raises the limit by itself. Registry, accepted domains per operator
- * and the cache: services/email-reveal-ai-readers.ts. Never blocks on DNS: a
- * cache miss gets the base limit for that request and starts one background
- * lookup; later requests from that IP use the result. OpenAI, Anthropic and
- * Perplexity publish only IP lists, which this slice does not fetch, so they
- * stay at the base limit. Counting is unchanged (same store, key and window);
+ * the IP-list sources and the cache: services/email-reveal-ai-readers.ts.
+ * Never blocks on DNS or on a list fetch: a cache miss (or a list not loaded
+ * yet) gets the base limit for that request and starts one background
+ * lookup / fetch; later requests use the result. Counting is unchanged (same store, key and window);
  * only the limit differs. CCBot (S-A3) is checked first and never gets
- * e-mail. Switch off for the host → nothing of this runs (no DNS lookup).
- * One log line `email_reveal_ai_reader_verified` (operator, host, hashed
- * client — never the IP) per successful verification.
+ * e-mail. Switch off for the host → nothing of this runs (no DNS lookup, no
+ * list fetch). One log line `email_reveal_ai_reader_verified` (operator,
+ * host, hashed client — never the IP) per successful verification, and one
+ * `email_reveal_ai_reader_ip_list` (list id, outcome, prefix count or failure
+ * reason — never an IP) per list fetch.
  *
  * Both limits are capped at EMAIL_REVEAL_MAX_LIMIT (1000): a larger whole
  * number is cut to the cap (per-client memory grows with the limit).
@@ -182,6 +184,9 @@ function aiReaderVerifier(): AiReaderVerifier {
       onVerified: (entry, context) => {
         logLine(JSON.stringify({ evt: "email_reveal_ai_reader_verified", operator: entry.operator, token: entry.token, ...context }));
       },
+      onIpListEvent: (event) => {
+        logLine(JSON.stringify({ evt: "email_reveal_ai_reader_ip_list", ...event }));
+      },
     });
   }
   return aiReaders;
@@ -189,11 +194,12 @@ function aiReaderVerifier(): AiReaderVerifier {
 
 /**
  * The per-hour limit for this request (S-A2). A User-Agent from the AI-reader
- * registry whose IP is verified (forward-confirmed reverse DNS, cached) gets
+ * registry whose IP is verified (forward-confirmed reverse DNS, cached; or in
+ * the operator's published IP list for that fetcher) gets
  * max(baseLimit, EMAIL_REVEAL_AI_READER_PER_HOUR); everyone else — unknown
- * UA, an operator not verifiable here, a cache miss (verification then starts
- * in the background), a failed or timed-out lookup — gets baseLimit.
- * Synchronous; never waits for DNS. CCBot is never raised (and revealEmailFor
+ * UA, a cache miss (verification then starts in the background), a list not
+ * loaded yet, an IP outside the list, a failed or timed-out lookup — gets
+ * baseLimit. Synchronous; never waits for DNS or a list fetch. CCBot is never raised (and revealEmailFor
  * checks it before calling this). `client` is the hashed client id for the
  * verification log line.
  */
@@ -201,7 +207,7 @@ export function emailRevealLimitFor(req: Request, host: EmailRevealHost, baseLim
   const ua = typeof req.headers?.["user-agent"] === "string" ? req.headers["user-agent"] : undefined;
   if (isCcBotUserAgent(ua)) return baseLimit;
   const entry = aiReaderEntryOf(ua);
-  if (!entry || entry.method !== "fcrdns") return baseLimit;
+  if (!entry || (entry.method === "ip_list" && !entry.ipList)) return baseLimit;
   const aiLimit = emailRevealAiReaderLimit();
   if (aiLimit <= baseLimit) return baseLimit; // nothing to gain: no lookup
   if (typeof req.ip !== "string" || req.ip.trim() === "") return baseLimit;
@@ -469,11 +475,12 @@ export function withKnowledgeEmailNull<T extends { knowledge: { email?: string |
  * Test-only: a fresh store and trap store (optionally with an injected clock;
  * `trap` sets the trap store's bounds) and log sink,
  * and a fresh AI-reader verifier (S-A2) with `aiReaders` options (injected
- * resolver, clock, timeout, bounds). Without `aiReaders.resolver` the real
- * DNS resolver would be used, so tests that reach a verification pass one.
+ * resolver, IP-list fetcher, clock, timeout, bounds). Without
+ * `aiReaders.resolver` / `aiReaders.ipListFetcher` the real DNS resolver /
+ * global fetch would be used, so tests that reach a verification pass them.
  */
 export function __resetEmailRevealGuardForTesting(
-  opts: EmailRevealStoreOptions & { log?: (line: string) => void; aiReaders?: Omit<AiReaderVerifierOptions, "onVerified">; trap?: Omit<EmailRevealTrapStoreOptions, "now"> } = {}
+  opts: EmailRevealStoreOptions & { log?: (line: string) => void; aiReaders?: Omit<AiReaderVerifierOptions, "onVerified" | "onIpListEvent">; trap?: Omit<EmailRevealTrapStoreOptions, "now"> } = {}
 ): void {
   store = new EmailRevealStore(opts);
   trapStore = new EmailRevealTrapStore({ ...(opts.trap ?? {}), ...(opts.now ? { now: opts.now } : {}) });
