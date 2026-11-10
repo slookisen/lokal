@@ -42,6 +42,7 @@ import { catalogHiddenIdExclusionSql } from "../services/agent-visibility";
 // updateAgent()'s rename hook writes through internally — no duplicated SQL
 // between the automatic path and this one-shot manual-backfill route.
 import { insertAgentSlugAlias } from "../services/marketplace-registry";
+import { setContactFormOnly } from "../services/contact-form-only";
 import {
   verifyOrgNumber,
   fetchBrregActivityDescription,
@@ -5250,6 +5251,35 @@ router.post("/:id/slug-alias", (req: Request, res: Response) => {
     res.json({ success: true, old_slug: oldSlug, agent_id: id });
   } catch (err: any) {
     res.status(500).json({ error: "slug-alias write failed", detail: err.message });
+  }
+});
+
+// ─── POST /admin/agents/:id/contact-form-only (dev-request
+// 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting, S-D1) ─────────
+// Sets agents.contact_form_only when the producer asks that their e-mail is
+// not shown (services/contact-form-only.ts). Body: { enabled: true|false }.
+// Record only: no mail is sent, the e-mail address is not touched, nothing is
+// echoed but the id and the flag. Works whatever CONTACT_FORM_RFB is (the
+// flag is only read while the switch is on), so a flag can be set before the
+// switch is turned on. 400 for a non-boolean `enabled`, 404 for an unknown id.
+router.post("/:id/contact-form-only", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const id = req.params.id as string;
+  const enabled = req.body?.enabled;
+  if (typeof enabled !== "boolean") {
+    res.status(400).json({ error: "enabled (boolean) is required" });
+    return;
+  }
+  try {
+    const result = setContactFormOnly(getDb(), id, enabled);
+    if (!result) {
+      res.status(404).json({ error: "Agent not found", agent_id: id });
+      return;
+    }
+    console.log(JSON.stringify({ evt: "contact_form_only_set", host: "rfb", profile_id: result.id, contact_form_only: result.contact_form_only }));
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: "contact-form-only write failed" });
   }
 });
 

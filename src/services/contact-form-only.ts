@@ -1,0 +1,276 @@
+/**
+ * contact-form-only.ts — dev-request
+ * 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting, S-D1
+ * («Kontaktskjema som valg per profil», Daniel's choice), rettfrabonden.com.
+ *
+ * A producer who does not want their e-mail address shown can ask us; an
+ * admin then sets agents.contact_form_only = 1 (POST
+ * /admin/agents/:id/contact-form-only, record only, no mail). With the switch
+ * CONTACT_FORM_RFB on, that profile's page /produsent/:slug shows a contact
+ * form instead of the e-mail (and instead of «Vis e-post»), JSON-LD has no
+ * `email`, and POST /produsent/:slug/kontakt (routes/seo.ts — named like the
+ * «Vis e-post» endpoint GET /produsent/:slug/epost) forwards the visitor's
+ * message to the stored address through the existing mail path
+ * (emailService.sendEmail), with Reply-To = the visitor's address. The
+ * producer's address is never in an HTTP answer or a log line.
+ *
+ * Switch: CONTACT_FORM_RFB, default OFF; on for "on", "1" or "true" (trimmed,
+ * any case — the same convention as EMAIL_REVEAL_GUARD_RFB). Read per call.
+ * Off → the flag is not even read: every page is byte-identical to main and
+ * the POST path falls through to the app's ordinary 404.
+ *
+ * Abuse limits on the POST: a hidden honeypot field (filled → answered like a
+ * success, nothing sent, nothing counted) and at most
+ * CONTACT_FORM_PER_IP_PER_HOUR (5) forwarded messages per client IP per
+ * sliding hour, keyed like the e-mail reveal guard (req.ip, salted hash via
+ * createStatsKey, IPv6 per /56; in memory, per process — with N machines a
+ * client can send up to 5 × N). Over the limit → 429 with Retry-After.
+ *
+ * Logs: one JSON line per outcome with the host, the profile id and a short
+ * hashed client id — never an e-mail address, never an IP, never the text.
+ *
+ * Not in S-D1 (later slices): hiding the e-mail of a flagged profile in the
+ * RFB REST / A2A / MCP answers (S-D2), and the dental + experiences hosts
+ * (S-D3). Operational step before the first flag is set: check that the
+ * privacy policy text covers forwarding of contact-form messages.
+ */
+
+import crypto from "crypto";
+import type Database from "better-sqlite3";
+import type { Request } from "express";
+import { createStatsKey } from "../middleware/client-ip";
+import { emailService, type EmailOptions } from "./email-service";
+
+export type ContactFormHost = "rfb";
+
+export const CONTACT_FORM_SWITCH_ENV: Readonly<Record<ContactFormHost, string>> = {
+  rfb: "CONTACT_FORM_RFB",
+};
+
+/** Forwarded messages per client IP per sliding hour. */
+export const CONTACT_FORM_PER_IP_PER_HOUR = 5;
+export const CONTACT_FORM_WINDOW_MS = 60 * 60_000;
+/** Clients kept before the least recently seen is evicted. */
+export const CONTACT_FORM_MAX_CLIENTS = 20_000;
+
+export const CONTACT_FORM_NAME_MAX = 100;
+export const CONTACT_FORM_EMAIL_MAX = 254;
+export const CONTACT_FORM_MESSAGE_MAX = 2000;
+export const CONTACT_FORM_MESSAGE_MIN = 2;
+/** The honeypot field's name (the same name as the /kontakt form's). */
+export const CONTACT_FORM_HONEYPOT_FIELD = "_honey";
+
+type Env = Record<string, string | undefined>;
+
+/** Whether the contact-form option is on for `host` (default off). */
+export function contactFormEnabled(host: ContactFormHost = "rfb", env: Env = process.env): boolean {
+  const raw = (env[CONTACT_FORM_SWITCH_ENV[host]] ?? "").trim().toLowerCase();
+  return raw === "on" || raw === "1" || raw === "true";
+}
+
+/** Whether an RFB agent has the contact-form-only flag. Missing row / column → false. */
+export function isContactFormOnly(db: Database.Database, agentId: string): boolean {
+  try {
+    const row = db.prepare("SELECT contact_form_only FROM agents WHERE id = ?").get(agentId) as { contact_form_only?: number } | undefined;
+    return Number(row?.contact_form_only ?? 0) === 1;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Sets the flag (admin). Returns the stored value, or null for an unknown id.
+ * The only DB write of S-D; never touches the e-mail address.
+ */
+export function setContactFormOnly(db: Database.Database, agentId: string, enabled: boolean): { id: string; contact_form_only: boolean } | null {
+  const row = db.prepare("SELECT id FROM agents WHERE id = ?").get(agentId) as { id: string } | undefined;
+  if (!row) return null;
+  db.prepare("UPDATE agents SET contact_form_only = ? WHERE id = ?").run(enabled ? 1 : 0, agentId);
+  return { id: row.id, contact_form_only: isContactFormOnly(db, agentId) };
+}
+
+// ─── Input ───────────────────────────────────────────────────────────────
+
+// C0 + DEL + C1 controls and the Unicode line/paragraph separators.
+const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g;
+// Bidi embedding/override/isolate marks.
+const BIDI_CHARS_RE = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+// Controls a multi-line message may not carry (tab, LF, CR are allowed).
+const MESSAGE_BAD_CHARS_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g;
+const EMAIL_RE = /^[^\s@<>()",;:\\[\]]+@[^\s@<>()",;:\\[\]]+\.[^\s@<>()",;:\\[\]]{2,}$/;
+
+function oneLine(s: string): string {
+  return s.replace(CONTROL_CHARS_RE, " ").replace(BIDI_CHARS_RE, "").replace(/\s+/g, " ").trim();
+}
+
+export interface ContactFormInput {
+  name: string;
+  replyEmail: string;
+  message: string;
+}
+
+export type ContactFormField = "name" | "reply_email" | "message";
+
+/** Whether the honeypot field carries anything (a bot filled it). */
+export function contactFormHoneypotFilled(body: unknown): boolean {
+  const v = (body as Record<string, unknown> | null | undefined)?.[CONTACT_FORM_HONEYPOT_FIELD];
+  return typeof v === "string" ? v.trim() !== "" : v !== undefined && v !== null && v !== "";
+}
+
+/** Validates the posted fields (name, reply_email, message). */
+export function validateContactFormInput(body: unknown): { ok: true; value: ContactFormInput } | { ok: false; errors: ContactFormField[] } {
+  const b = (body && typeof body === "object" ? body : {}) as Record<string, unknown>;
+  const str = (v: unknown) => (typeof v === "string" ? v : "");
+  const name = oneLine(str(b.name));
+  const replyEmail = str(b.reply_email).trim();
+  const message = str(b.message).replace(/\r\n?/g, "\n").replace(MESSAGE_BAD_CHARS_RE, "").replace(BIDI_CHARS_RE, "").trim();
+  const errors: ContactFormField[] = [];
+  if (name.length < 1 || Array.from(name).length > CONTACT_FORM_NAME_MAX) errors.push("name");
+  if (replyEmail.length > CONTACT_FORM_EMAIL_MAX || !EMAIL_RE.test(replyEmail)) errors.push("reply_email");
+  const msgLen = Array.from(message).length;
+  if (msgLen < CONTACT_FORM_MESSAGE_MIN || msgLen > CONTACT_FORM_MESSAGE_MAX) errors.push("message");
+  if (errors.length) return { ok: false, errors };
+  return { ok: true, value: { name, replyEmail, message } };
+}
+
+// ─── The forwarded mail ─────────────────────────────────────────────────
+
+const SUBJECT_MAX = 150;
+
+/** The forwarded mail (text only). The producer's address is only `to`. */
+export function buildContactFormMail(opts: { producerName: string; profileUrl: string; input: ContactFormInput; to: string }): EmailOptions {
+  const subjectRaw = `Melding via Rett fra Bonden: ${opts.input.name}`;
+  const chars = Array.from(subjectRaw);
+  const subject = chars.length <= SUBJECT_MAX ? subjectRaw : chars.slice(0, SUBJECT_MAX - 1).join("").trimEnd() + "…";
+  const textContent = [
+    `Hei ${oneLine(opts.producerName)}!`,
+    "",
+    `Du har fått en melding gjennom kontaktskjemaet på profilen din på Rett fra Bonden (${opts.profileUrl}).`,
+    "",
+    `Fra: ${opts.input.name}`,
+    `Svar-adresse: ${opts.input.replyEmail}`,
+    "",
+    opts.input.message,
+    "",
+    "—",
+    "Denne meldingen ble videresendt av Rett fra Bonden-plattformen. Avsenderen har ikke sett e-postadressen din.",
+    "Svarer du på denne e-posten, går svaret direkte til avsenderen, som da ser adressen du svarer fra.",
+    "Vi har ikke kontrollert innholdet i meldingen. Ser den ut som svindel eller reklame, kan du se bort fra den.",
+  ].join("\n");
+  return {
+    to: opts.to,
+    subject,
+    textContent,
+    replyTo: opts.input.replyEmail,
+    // Not outreach, and the mail carries a visitor's address and free text:
+    // keep the recipient and the subject out of the send log.
+    omitAgentHeader: true,
+    redactRecipientInLogs: true,
+    logSubjectAs: "[Kontaktskjema · produsent]",
+  };
+}
+
+export type ContactFormSender = (opts: EmailOptions) => Promise<{ success: boolean; messageId?: string; error?: string }>;
+
+let sender: ContactFormSender = (opts) => emailService.sendEmail(opts);
+
+/** Sends one forwarded message through the platform's mail path. */
+export function sendContactFormMail(opts: EmailOptions): ReturnType<ContactFormSender> {
+  return sender(opts);
+}
+
+// ─── Per-IP limit ───────────────────────────────────────────────────────
+
+export interface ContactFormRateStoreOptions {
+  now?: () => number;
+  windowMs?: number;
+  limit?: number;
+  maxClients?: number;
+  salt?: Buffer;
+}
+
+export class ContactFormRateStore {
+  private readonly now: () => number;
+  private readonly windowMs: number;
+  private readonly limit: number;
+  private readonly maxClients: number;
+  private readonly keyOf: (ip: string) => string;
+  /** hashed client key → send times in the window (Map order = least recently seen first). */
+  private readonly clients = new Map<string, number[]>();
+
+  constructor(opts: ContactFormRateStoreOptions = {}) {
+    this.now = opts.now ?? Date.now;
+    this.windowMs = opts.windowMs ?? CONTACT_FORM_WINDOW_MS;
+    this.limit = opts.limit ?? CONTACT_FORM_PER_IP_PER_HOUR;
+    this.maxClients = Math.max(1, opts.maxClients ?? CONTACT_FORM_MAX_CLIENTS);
+    this.keyOf = createStatsKey(opts.salt ?? crypto.randomBytes(16));
+  }
+
+  clientKey(ip: string): string {
+    return this.keyOf(ip);
+  }
+
+  /** Seconds until this client may send again; 0 = it may send now. */
+  retryAfterSeconds(key: string): number {
+    const times = this.live(key);
+    if (times.length < this.limit) return 0;
+    return Math.max(1, Math.ceil((times[0]! + this.windowMs - this.now()) / 1000));
+  }
+
+  /** Counts one send for this client. */
+  record(key: string): void {
+    const times = this.live(key);
+    this.clients.delete(key);
+    while (this.clients.size >= this.maxClients) this.clients.delete(this.clients.keys().next().value as string);
+    times.push(this.now());
+    this.clients.set(key, times);
+  }
+
+  size(): number {
+    return this.clients.size;
+  }
+
+  private live(key: string): number[] {
+    const now = this.now();
+    const times = (this.clients.get(key) ?? []).filter((t) => now - t < this.windowMs);
+    if (times.length === 0) this.clients.delete(key);
+    return times;
+  }
+}
+
+let rateStore = new ContactFormRateStore();
+let logLine: (line: string) => void = (line) => console.log(line);
+
+/** The short hashed client id used in log lines (never the IP). */
+function logClientId(key: string): string {
+  return Buffer.from(key, "base64url").toString("hex", 0, 6);
+}
+
+/**
+ * The limit check for one request. "no_ip" (no usable req.ip) fails closed
+ * like the e-mail reveal guard. `ok` carries the key to record after a send.
+ */
+export function contactFormRateCheck(req: Request): { ok: true; key: string; client: string } | { ok: false; reason: "limit" | "no_ip"; retryAfter: number; client?: string } {
+  if (typeof req.ip !== "string" || req.ip.trim() === "") return { ok: false, reason: "no_ip", retryAfter: 3600 };
+  const key = rateStore.clientKey(req.ip);
+  const client = logClientId(key);
+  const wait = rateStore.retryAfterSeconds(key);
+  if (wait > 0) return { ok: false, reason: "limit", retryAfter: wait, client };
+  return { ok: true, key, client };
+}
+
+export function contactFormRecordSend(key: string): void {
+  rateStore.record(key);
+}
+
+/** One JSON log line: profile id, outcome, hashed client — never an address, an IP or the text. */
+export function logContactFormEvent(fields: { outcome: string; profile_id?: string; client?: string; host?: ContactFormHost; [k: string]: unknown }): void {
+  logLine(JSON.stringify({ evt: "contact_form", host: fields.host ?? "rfb", ...fields }));
+}
+
+/** Test-only: a fresh limit store (optionally with a clock), log sink and sender. */
+export function __resetContactFormForTesting(opts: ContactFormRateStoreOptions & { log?: (line: string) => void; sender?: ContactFormSender } = {}): void {
+  rateStore = new ContactFormRateStore(opts);
+  logLine = opts.log ?? ((line) => console.log(line));
+  sender = opts.sender ?? ((o) => emailService.sendEmail(o));
+}
