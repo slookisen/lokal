@@ -52714,6 +52714,9 @@ runSerial(async () => {
 // Disallow in every group, hidden link on the profile pages, a hit blocks
 // e-mail for that IP for 24 h; tested in the guard, rfb api, dental and
 // experiences profile suites).
+// S-D1 adds the contact-form option per RFB profile (CONTACT_FORM_RFB, default
+// off; flagged profile → form instead of e-mail, POST /produsent/:slug/kontakt
+// forwards via a stubbed sender).
 // Switch off = byte-identical answers. Sets env
 // flags and swaps the dental db-factory (restored in finally) — runSerial,
 // tail position.
@@ -52738,6 +52741,8 @@ runSerial(async () => {
     ["email reveal ai reader ip lists", () => (require("../src/services/email-reveal-ai-reader-ip-lists.test") as typeof import("../src/services/email-reveal-ai-reader-ip-lists.test")).runEmailRevealAiReaderIpListsTests({ log: false })],
     // S-A5: the dental MCP tannlege_info on the same dental counter (switch off = byte-identical).
     ["dental mcp email reveal", () => (require("../src/routes/dental-mcp-email-reveal.test") as typeof import("../src/routes/dental-mcp-email-reveal.test")).runDentalMcpEmailRevealTests({ log: false })],
+    // S-D1: «Kontaktskjema som valg per profil» on rettfrabonden.com — agents.contact_form_only (admin POST /admin/agents/:id/contact-form-only), the form on /produsent/:slug and POST /produsent/:slug/kontakt (CONTACT_FORM_RFB; switch off = byte-identical; stubbed sender, no network).
+    ["rfb contact form only", () => (require("../src/routes/rfb-contact-form-only.test") as typeof import("../src/routes/rfb-contact-form-only.test")).runRfbContactFormOnlyTests({ log: false })],
   ] as Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]>) {
     try {
       const r = await load();
