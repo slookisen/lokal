@@ -51251,6 +51251,22 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── rfb-chatgpt-app-link: RFB ChatGPT links point to the ChatGPT app, not the retiring Custom GPT ──");
+  try {
+    const { runRfbChatgptAppLinkTests } = require("../src/config/rfb-chatgpt-app-link.test") as
+      typeof import("../src/config/rfb-chatgpt-app-link.test");
+    const r = await runRfbChatgptAppLinkTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-chatgpt-app-link: " + f);
+    console.log(`  rfb-chatgpt-app-link: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-chatgpt-app-link: unexpected error: " + String(err?.message || err));
+  }
+});
+
+runSerial(async () => {
   console.log("\n── mcp-stdio-bridge: stdio bridges (finn-tannlege-mcp, lokal-mcp, opplevagent-mcp) vs the real /mcp routers ──");
   try {
     const { runMcpStdioBridgeTests } = require("../src/routes/mcp-stdio-bridge.test") as

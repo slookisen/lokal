@@ -12,6 +12,7 @@
  */
 
 import { Router, Request, Response } from "express";
+import { RFB_CHATGPT_APP_URL } from "../config/distribution-channels";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { knowledgeService, publicOwnerAboutText } from "../services/knowledge-service";
 import { slugify } from "../utils/slug";
@@ -274,9 +275,9 @@ Content-Type: application/json
 - [Teknologi](${BASE_URL}/teknologi): Hvordan A2A-teknologien fungerer
 - [Personvern](${BASE_URL}/personvern): Bare nødvendige informasjonskapsler (innlogging for selgere, språkvalg), ingen annonse- eller sporingscookies og ingen tredjeparts sporing. Sidebesøk og søk logges i vår egen database med saltet IP-hash.
 
-## ChatGPT Custom GPT
+## ChatGPT-app
 
-ChatGPT Custom GPT — Rett fra Bonden: https://chatgpt.com/g/g-69dbf8593c1c81919050f8da98cd327d-rett-fra-bonden
+ChatGPT app — Rett fra Bonden: ${RFB_CHATGPT_APP_URL}
 
 ## Kontakt
 
