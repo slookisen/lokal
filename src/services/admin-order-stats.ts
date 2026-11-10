@@ -9,7 +9,8 @@
 //     experience_providers (provider display name + test identity).
 //
 // Consumed by routes/admin-order-stats.ts (GET /admin/api/ordre/oversikt and
-// GET /admin/api/ordre/liste). Nothing here writes, and nothing here ever
+// GET /admin/api/ordre/liste, S2: GET /admin/api/ordre/eksport.csv) and by
+// routes/admin-orders.ts (pilot-status order counts). Nothing here writes, and nothing here ever
 // selects a buyer/guest column: every SELECT names its columns explicitly
 // (never `SELECT *`), so buyer_name / buyer_email / buyer_phone /
 // delivery_note (orders, carts) and guest_name / guest_email / guest_phone /
@@ -640,4 +641,167 @@ function sortKey(s: string): number {
 export function mergeOrderLists(lists: OrderListRow[][], cap: number = LIST_CAP): { rows: OrderListRow[]; truncated: boolean } {
   const all = lists.flat().sort((a, b) => sortKey(b.date) - sortKey(a.date) || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
   return { rows: all.slice(0, cap), truncated: all.length > cap };
+}
+
+// ─── Order counts by status (shared with GET /admin/orders/pilot-status) ────
+//
+// Slice S2: pilot-status's orders_30d block reads its counts from here so it
+// and the oversikt numbers come from the same SQL and the same test rule.
+// `real` / `test` are split with the same RFB_IS_TEST_SQL predicate as
+// computeRfbOverview(); pilot-status keeps its own semantics (every order,
+// test included) by adding the two with combineRfbStatusCounts().
+
+export interface RfbStatusCounts {
+  by_status: Record<string, number>;
+  total: number;
+  /** completed orders closed by the follow-ups job (orders.completion_source = 'auto'). */
+  completed_auto: number;
+}
+
+/**
+ * Orders with `from <= created_at` (and `created_at < toExclusive` when
+ * given), per status, split into real and test. `from` / `toExclusive` are
+ * compared as text against orders.created_at, like every other query here.
+ */
+export function countRfbOrdersByStatus(db: Db, from: string, toExclusive: string | null = null): { real: RfbStatusCounts; test: RfbStatusCounts } {
+  const args: string[] = [from];
+  let upper = "";
+  if (toExclusive !== null) { upper = " AND o.created_at < ?"; args.push(toExclusive); }
+  const rows = db.prepare(
+    `SELECT o.status AS status, ${RFB_IS_TEST_SQL} AS is_test, COUNT(*) AS n,
+            SUM(CASE WHEN o.status = 'completed' AND o.completion_source = 'auto' THEN 1 ELSE 0 END) AS auto
+       FROM orders o LEFT JOIN agents a ON a.id = o.agent_id
+      WHERE o.created_at >= ?${upper}
+      GROUP BY o.status, is_test`
+  ).all(...args) as Array<{ status: string; is_test: number; n: number; auto: number | null }>;
+  const real: RfbStatusCounts = { by_status: zeroCounts(RFB_ORDER_STATUSES), total: 0, completed_auto: 0 };
+  const test: RfbStatusCounts = { by_status: zeroCounts(RFB_ORDER_STATUSES), total: 0, completed_auto: 0 };
+  for (const r of rows) {
+    const c = Number(r.is_test) === 1 ? test : real;
+    c.by_status[r.status] = (c.by_status[r.status] ?? 0) + r.n;
+    c.total += r.n;
+    c.completed_auto += Number(r.auto ?? 0);
+  }
+  return { real, test };
+}
+
+/** Real + test together (pilot-status counts every order). */
+export function combineRfbStatusCounts(a: RfbStatusCounts, b: RfbStatusCounts): RfbStatusCounts {
+  const by: Record<string, number> = zeroCounts(RFB_ORDER_STATUSES);
+  for (const src of [a.by_status, b.by_status]) for (const [k, v] of Object.entries(src)) by[k] = (by[k] ?? 0) + v;
+  return { by_status: by, total: a.total + b.total, completed_auto: a.completed_auto + b.completed_auto };
+}
+
+/** SQLite datetime('now', '-N days') computed from `now` (same text format). */
+export function sqliteDaysAgo(now: Date, days: number): string {
+  return sqliteDateTime(new Date(now.getTime() - days * 86_400_000));
+}
+
+// ─── CSV export (aggregates only) ───────────────────────────────────────────
+//
+// Slice S2: GET /admin/api/ordre/eksport.csv turns the oversikt body into
+// one long-format table. Every row is ONE aggregate (a count, sum, hours
+// figure or 0/1 availability flag) — never an order or a booking: no order
+// id, booking id/ref, buyer or guest field, note or free text. The only text
+// that comes from the database is the producer / provider display name.
+
+export const CSV_COLUMNS = ["plattform", "omfang", "kategori", "noekkel", "navn", "maal", "verdi", "periode_fra", "periode_til", "oppl"] as const;
+export type CsvRow = Record<typeof CSV_COLUMNS[number], string | number | null>;
+
+const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+
+/**
+ * One CSV cell. Numbers are written as numbers. Text: any e-mail-like
+ * substring is masked; a leading = + - @ (or tab / CR) gets a ' prefix so a
+ * spreadsheet never evaluates it as a formula; quotes, commas and line
+ * breaks are quoted per RFC 4180.
+ */
+export function csvCell(v: string | number | null | undefined): string {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "number") return Number.isFinite(v) ? String(v) : "";
+  let s = String(v).replace(EMAIL_RE, "[e-post skjult]");
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+  if (/[",\r\n]/.test(s) || /^\s|\s$/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+
+export function toCsv(rows: CsvRow[]): string {
+  const lines = [CSV_COLUMNS.join(",")];
+  for (const r of rows) lines.push(CSV_COLUMNS.map((c) => csvCell(r[c])).join(","));
+  return lines.join("\r\n") + "\r\n";
+}
+
+export interface OversiktForCsv {
+  plattform: Plattform;
+  periode: Periode;
+  oppl: Opplosning;
+  rfb?: RfbOverview;
+  gardssalg?: GardssalgOverview | GardssalgUnavailable;
+}
+
+/** The oversikt body as aggregate rows (see CSV_COLUMNS). */
+export function oversiktCsvRows(o: OversiktForCsv): CsvRow[] {
+  const rows: CsvRow[] = [];
+  const add = (plattform: string, omfang: "ekte" | "test", kategori: string, noekkel: string | null, navn: string | null, maal: string, verdi: number | null) =>
+    rows.push({ plattform, omfang, kategori, noekkel, navn, maal, verdi, periode_fra: o.periode.fra, periode_til: o.periode.til, oppl: o.oppl });
+
+  if (o.rfb) {
+    const r = o.rfb;
+    const P = "rfb";
+    add(P, "ekte", "tilgjengelig", null, null, "tilgjengelig", 1);
+    add(P, "ekte", "total", null, null, "antall", r.total);
+    for (const [s, n] of Object.entries(r.by_status)) add(P, "ekte", "status", s, null, "antall", n);
+    add(P, "ekte", "omsetning", null, null, "sum_nok", r.sum_nok.amount);
+    for (const p of r.producers) {
+      add(P, "ekte", "produsent", p.agent_id, p.name, "antall", p.total);
+      add(P, "ekte", "produsent", p.agent_id, p.name, "sum_nok", p.sum_nok);
+    }
+    for (const s of r.series) {
+      add(P, "ekte", "bolk", s.bucket, null, "antall", s.total);
+      add(P, "ekte", "bolk", s.bucket, null, "sum_nok", s.sum_nok);
+    }
+    add(P, "ekte", "svartid", null, null, "maalt", r.response_time.measured);
+    add(P, "ekte", "svartid", null, null, "uten_svar", r.response_time.unanswered);
+    add(P, "ekte", "svartid", null, null, "median_timer", r.response_time.median_hours);
+    add(P, "ekte", "svartid", null, null, "snitt_timer", r.response_time.avg_hours);
+    add(P, "ekte", "ubesvart_over_24t", null, null, "antall_naa", r.unanswered_over_24h.count);
+    add(P, "ekte", "overleveringer", null, null, "antall", r.cart_handoffs.count);
+    add(P, "test", "total", null, null, "antall", r.test.total);
+    for (const [s, n] of Object.entries(r.test.by_status)) add(P, "test", "status", s, null, "antall", n);
+    add(P, "test", "omsetning", null, null, "sum_nok", r.test.sum_nok);
+    add(P, "test", "ubesvart_over_24t", null, null, "antall_naa", r.test.unanswered_over_24h);
+    add(P, "test", "overleveringer", null, null, "antall", r.test.cart_handoffs);
+    for (const p of r.test.producers) add(P, "test", "produsent", p.agent_id, p.name, "antall", p.total);
+  }
+
+  if (o.gardssalg) {
+    const g = o.gardssalg;
+    const P = "gardssalg";
+    if (!g.available) {
+      add(P, "ekte", "tilgjengelig", null, null, "tilgjengelig", 0);
+    } else {
+      add(P, "ekte", "tilgjengelig", null, null, "tilgjengelig", 1);
+      add(P, "ekte", "total", null, null, "antall", g.total);
+      for (const [s, n] of Object.entries(g.by_status)) add(P, "ekte", "status", s, null, "antall", n);
+      for (const [s, n] of Object.entries(g.by_pre_status)) add(P, "ekte", "forhaandsstatus", s, null, "antall", n);
+      add(P, "ekte", "personer", null, null, "sum_personer", g.party_size_sum);
+      add(P, "ekte", "fakturerbar_info", null, null, "antall", g.billable.count);
+      for (const p of g.providers) {
+        add(P, "ekte", "tilbyder", p.provider_id, p.name, "antall", p.total);
+        add(P, "ekte", "tilbyder", p.provider_id, p.name, "sum_personer", p.party_size_sum);
+      }
+      for (const s of g.series) {
+        add(P, "ekte", "bolk", s.bucket, null, "antall", s.total);
+        add(P, "ekte", "bolk", s.bucket, null, "sum_personer", s.party_size_sum);
+      }
+      add(P, "ekte", "svartid", null, null, "maalt", g.response_time.measured);
+      add(P, "ekte", "svartid", null, null, "median_timer", g.response_time.median_hours);
+      add(P, "ekte", "svartid", null, null, "snitt_timer", g.response_time.avg_hours);
+      add(P, "test", "total", null, null, "antall", g.test.total);
+      for (const [s, n] of Object.entries(g.test.by_status)) add(P, "test", "status", s, null, "antall", n);
+      add(P, "test", "personer", null, null, "sum_personer", g.test.party_size_sum);
+      for (const p of g.test.providers) add(P, "test", "tilbyder", p.provider_id, p.name, "antall", p.total);
+    }
+  }
+  return rows;
 }

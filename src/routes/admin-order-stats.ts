@@ -2,14 +2,18 @@
 //
 // Slice S1 of the admin order-statistics dev-request (orch-pr-20261108-admin-
 // ordre). Mounted at /admin/api/ordre. GET only — no write, no table, no
-// migration; the order / booking flows and GET /admin/orders/pilot-status are
-// untouched.
+// migration; the order / booking flows are untouched. Since S2,
+// GET /admin/orders/pilot-status reads its 30-day counts from the same
+// service module (countRfbOrdersByStatus), response shape unchanged.
 //
 //   GET /admin/api/ordre/oversikt?plattform=rfb|gardssalg|alle
 //                                &fra=YYYY-MM-DD&til=YYYY-MM-DD&oppl=dag|uke|maaned
 //     Sums + zero-filled time series per platform (default: last 30 days,
 //     oppl=dag, plattform=alle). Test producer / test provider rows are in a
 //     separate `test` block, never in the main totals.
+//
+//   GET /admin/api/ordre/eksport.csv?plattform=&fra=&til=&oppl=   (slice S2)
+//     The oversikt numbers as a CSV of aggregates only (no order rows).
 //
 //   GET /admin/api/ordre/liste?plattform=rfb|gardssalg|alle&status=&fra=&til=
 //     Order / visit-request rows, newest first, capped at 500. Each row holds
@@ -24,6 +28,7 @@
 // instead of opening a database file).
 
 import { Router, Request, Response } from "express";
+import * as path from "path";
 import type Database from "better-sqlite3";
 import { getDb } from "../database/init";
 import {
@@ -36,7 +41,13 @@ import {
   listGardssalgBookings,
   mergeOrderLists,
   LIST_CAP,
+  oversiktCsvRows,
+  toCsv,
   type OrderListRow,
+  type OversiktForCsv,
+  type Periode,
+  type Plattform,
+  type Opplosning,
 } from "../services/admin-order-stats";
 
 type Db = Database.Database;
@@ -90,6 +101,23 @@ function now(): Date {
   return _nowForTesting ?? new Date();
 }
 
+/** The per-platform oversikt blocks (shared by /oversikt and /eksport.csv). */
+function computeBlocks(plattform: Plattform, periode: Periode, oppl: Opplosning): Pick<OversiktForCsv, "rfb" | "gardssalg"> {
+  const out: Pick<OversiktForCsv, "rfb" | "gardssalg"> = {};
+  if (plattform === "rfb" || plattform === "alle") {
+    out.rfb = computeRfbOverview(rfbDb(), periode, oppl, now());
+  }
+  if (plattform === "gardssalg" || plattform === "alle") {
+    const e = expDb();
+    if ("error" in e) out.gardssalg = gardssalgUnavailable(e.error);
+    else {
+      try { out.gardssalg = computeGardssalgOverview(e.db, periode, oppl); }
+      catch (err) { out.gardssalg = gardssalgUnavailable(`Lesing feilet: ${err instanceof Error ? err.message : String(err)}`); }
+    }
+  }
+  return out;
+}
+
 router.get("/oversikt", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
   const parsed = parseOversiktParams(req.query as Record<string, unknown>, now());
@@ -107,19 +135,36 @@ router.get("/oversikt", (req: Request, res: Response) => {
       forklaring:
         "Lesetall for bestillinger (Rett fra Bonden) og besøksforespørsler på gårdssalg (Opplevagent). " +
         "Ingen kjøper- eller gjesteopplysninger. Testdata er talt for seg i hver plattforms test-blokk.",
+      ...computeBlocks(plattform, periode, oppl),
     };
-    if (plattform === "rfb" || plattform === "alle") {
-      body.rfb = computeRfbOverview(rfbDb(), periode, oppl, now());
-    }
-    if (plattform === "gardssalg" || plattform === "alle") {
-      const e = expDb();
-      if ("error" in e) body.gardssalg = gardssalgUnavailable(e.error);
-      else {
-        try { body.gardssalg = computeGardssalgOverview(e.db, periode, oppl); }
-        catch (err) { body.gardssalg = gardssalgUnavailable(`Lesing feilet: ${err instanceof Error ? err.message : String(err)}`); }
-      }
-    }
     res.json(body);
+  } catch (err) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// GET /eksport.csv — slice S2. Same parameters, auth and numbers as
+// /oversikt, as one long-format CSV of AGGREGATES only (see
+// services/admin-order-stats.ts oversiktCsvRows): no order or booking row,
+// no id/ref of an order, no buyer/guest field, note or free text.
+router.get("/eksport.csv", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const parsed = parseOversiktParams(req.query as Record<string, unknown>, now());
+  if (!parsed.ok) {
+    res.status(400).json({ success: false, error: parsed.error, detail: parsed.detail });
+    return;
+  }
+  const { plattform, periode, oppl } = parsed.params;
+  try {
+    const csv = toCsv(oversiktCsvRows({ plattform, periode, oppl, ...computeBlocks(plattform, periode, oppl) }));
+    // plattform/fra/til are validated (enum + YYYY-MM-DD), so the file name is safe.
+    const filename = `ordre-oversikt-${plattform}-${periode.fra}-${periode.til}-${oppl}.csv`;
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Robots-Tag", "noindex, nofollow");
+    // UTF-8 BOM so spreadsheet programs read æ/ø/å correctly.
+    res.status(200).send("\uFEFF" + csv);
   } catch (err) {
     res.status(500).json({ success: false, error: err instanceof Error ? err.message : String(err) });
   }
@@ -167,6 +212,23 @@ router.get("/liste", (req: Request, res: Response) => {
   } catch (err) {
     res.status(500).json({ success: false, error: err instanceof Error ? err.message : String(err) });
   }
+});
+
+// ─── GET /admin/ordre — the read-only HTML page (slice S2) ───────────────────
+//
+// Mounted separately at /admin/ordre (adminOrderPageRouter). Follows the
+// admin-crm.html pattern exactly: the HTML itself is served WITHOUT a
+// server-side key check (a browser navigation cannot send X-Admin-Key) and
+// holds no data; the page asks for the admin key, keeps it in sessionStorage
+// ('rfb_admin_key', shared with the CRM page) and every data call it makes
+// (/admin/api/ordre/oversikt, /admin/api/ordre/eksport.csv) sends
+// X-Admin-Key and gets 401 without it. noindex via meta + X-Robots-Tag.
+export const ADMIN_ORDRE_HTML = path.join(__dirname, "..", "public", "admin-ordre.html");
+export const adminOrderPageRouter = Router();
+adminOrderPageRouter.get("/", (_req: Request, res: Response) => {
+  res.setHeader("X-Robots-Tag", "noindex, nofollow");
+  res.setHeader("Cache-Control", "no-store");
+  res.sendFile(ADMIN_ORDRE_HTML);
 });
 
 export default router;

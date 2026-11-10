@@ -30,6 +30,7 @@ import { isEligibleForRealOrder, orderCapNewPerBuyerPerDay, orderCapNewPerDay, o
 import { orderReminderHours, listAutoCompleteDue } from "../services/order-followups";
 import { isOrderCapNoticeEnabled, isOrderCapV2Enabled, listOrderCapStats, ORDER_CAP_CEILING_PREWARN_AT } from "../services/order-cap-notice";
 import { isOrderAutocompleteEnabled, orderAutocompleteSinceMs } from "../services/order-lifecycle";
+import { countRfbOrdersByStatus, combineRfbStatusCounts, sqliteDaysAgo } from "../services/admin-order-stats";
 
 const router = Router();
 
@@ -188,17 +189,18 @@ router.get("/pilot-status", (req: Request, res: Response) => {
     const passes = optIn.filter((a) => isEligibleForRealOrder(a.id, db));
     const verified = db.prepare("SELECT COUNT(*) AS n FROM agents WHERE is_verified = 1").get() as { n: number };
 
-    const byStatus: Record<string, number> = { pending: 0, confirmed: 0, declined: 0, ready: 0, completed: 0, cancelled: 0 };
-    const rows = db.prepare(
-      "SELECT status, COUNT(*) AS n FROM orders WHERE created_at >= datetime('now', '-30 days') GROUP BY status"
-    ).all() as Array<{ status: string; n: number }>;
-    for (const r of rows) byStatus[r.status] = r.n;
+    // S2 of the admin order-statistics dev-request: the 30-day counts come
+    // from services/admin-order-stats.ts (the module behind
+    // GET /admin/api/ordre/oversikt), so both read the same SQL. Semantics
+    // unchanged: every order (test producers included, real + test added),
+    // created_at >= datetime('now', '-30 days').
     // Fase A1 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-kjoperagent):
     // completed orders split by who closed them; 'auto' = closed by the
     // follow-ups job (henting ikke bekreftet), shown apart from confirmed ones.
-    const completedAuto = (db.prepare(
-      "SELECT COUNT(*) AS n FROM orders WHERE status = 'completed' AND completion_source = 'auto' AND created_at >= datetime('now', '-30 days')"
-    ).get() as { n: number }).n;
+    const split = countRfbOrdersByStatus(db, sqliteDaysAgo(new Date(), 30));
+    const counts30d = combineRfbStatusCounts(split.real, split.test);
+    const byStatus = counts30d.by_status;
+    const completedAuto = counts30d.completed_auto;
 
     // B2: dry run of the automatic close — how many confirmed/ready orders the
     // job WOULD close right now (whether or not the switch is on). Ids only.

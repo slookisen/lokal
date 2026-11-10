@@ -144,7 +144,7 @@ import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-mer
 import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
 import adminAgentsBusinessTypeRoutes from "./routes/admin-agents-business-type";
 import adminTestProducerRoutes from "./routes/admin-test-producer";
-import adminOrderStatsRoutes from "./routes/admin-order-stats";
+import adminOrderStatsRoutes, { adminOrderPageRouter } from "./routes/admin-order-stats";
 import adminTestClaimFixtureRoutes from "./routes/admin-test-claim-fixture";
 import adminOwnerFeaturesInterestRoutes from "./routes/admin-owner-features-interest";
 import adminOwnerFeaturesSwitchProbeRoutes from "./routes/admin-owner-features-switch-probe";
@@ -989,6 +989,10 @@ app.use("/admin/test-producer", adminLimiter, adminTestProducerRoutes);
 // GET /admin/api/ordre/{oversikt,liste} — read-only order statistics for RFB
 // orders + Opplevagent gårdssalg visit requests; no buyer/guest data (S1).
 app.use("/admin/api/ordre", adminLimiter, adminOrderStatsRoutes);
+// GET /admin/ordre — read-only HTML page over the routes above (S2). The HTML
+// carries no data and, like /admin/crm-dashboard, is served without a key;
+// every data call it makes sends X-Admin-Key. noindex.
+app.use("/admin/ordre", adminLimiter, adminOrderPageRouter);
 // POST /admin/test-claim-fixture — the ONE hidden, UNCLAIMED claim-test profile
 // (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post AC6): dry-run
 // default, arm (create/reset) / retire, refuses every other row.
