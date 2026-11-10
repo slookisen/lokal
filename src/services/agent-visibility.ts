@@ -523,11 +523,20 @@ export interface AgentVisibilityOptions {
   agentId?: string;
 }
 
+/**
+ * A self-registered profile still waiting for a human review
+ * (self-registered-review-approve sets is_vetted = 1). Only the vetting half
+ * of the quarantine rule — listability is checked separately.
+ */
+export function isAwaitingSelfRegisteredReview(row: { origin?: string | null; is_vetted?: number | null }): boolean {
+  return row.origin === "self_registered" && row.is_vetted !== 1;
+}
+
 /** Today's quarantine rule (what isQuarantinedFromPublicView() has always answered). */
 function quarantinedToday(row: AgentVisibilityRow, allowCatalogHidden: boolean): boolean {
   const listable = isPubliclyListable(allowCatalogHidden ? { ...row, catalog_hidden: 0 } : row);
   if (!listable) return true;
-  return row.origin === "self_registered" && row.is_vetted !== 1;
+  return isAwaitingSelfRegisteredReview(row);
 }
 
 /**

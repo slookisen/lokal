@@ -53825,3 +53825,25 @@ runSerial(async () => {
     failures.push("claim-auto-approval-audit-e1: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-11-10-rfb-registreringer-og-eierkrav-folges-opp S4a: a
+// verified owner sees «Under godkjenning» (200, noindex, private) instead of
+// the 404 on their own unvetted self-registered profile
+// (OWNER_PENDING_PROFILE_VIEW_ENABLED, default off); everyone else keeps the
+// 404. Own in-memory DB pinned on getDb(), swaps the flag (restored in
+// finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── S4a: eier ser «Under godkjenning» på egen profil ──");
+  try {
+    const { runOwnerPendingProfileViewS4aTests } = require("../src/routes/owner-pending-profile-view-s4a.test") as
+      typeof import("../src/routes/owner-pending-profile-view-s4a.test");
+    const r = await runOwnerPendingProfileViewS4aTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-pending-profile-view-s4a: " + f);
+    console.log(`  owner-pending-profile-view-s4a: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-pending-profile-view-s4a: unexpected error: " + String(err?.message || err));
+  }
+});
