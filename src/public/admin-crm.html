@@ -707,7 +707,9 @@ async function loadSummary() {
   } catch (e) { /* older server without /needs-reply — keep the KPI at 0 */ }
   try {
     const q = await api('/reply-proposals?status=approval_needed&limit=500');
-    document.getElementById('kpiApproval').textContent = q.items.length;
+    let ch = 0;
+    try { ch = (await apiCs('/change-requests?status=approval_needed&limit=500')).items.length; } catch (e) { ch = 0; }
+    document.getElementById('kpiApproval').textContent = q.items.length + ch;
   } catch (e) { /* older server without S2 — keep the KPI at 0 */ }
 }
 
@@ -1099,6 +1101,68 @@ const BLOCK_REASON_LABEL = {
 };
 const UI_HEADERS = { 'X-Admin-Client': 'admin-crm' };
 
+async function apiCs(path, opts = {}) {
+  const res = await fetch('/admin/cs' + path, {
+    ...opts,
+    headers: { ...(opts.headers || {}), 'X-Admin-Key': adminKey, ...(opts.body ? { 'Content-Type': 'application/json' } : {}) }
+  });
+  if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
+const CHANGE_STATUS_LABEL = {
+  approval_needed: 'venter på deg', queued: 'i kø', executed: 'utført, kontrolleres', hidden: 'skjult — slettes etter 24 t',
+  verified: 'utført og bekreftet', verify_failed: 'ikke bekreftet på siden', failed: 'feilet', cancelled: 'angret', rejected: 'avvist',
+};
+
+function renderChangeRequest(c) {
+  const id = escapeHtml(c.id);
+  let changes = '';
+  try { const ch = JSON.parse(c.changes || '{}'); changes = Object.entries(ch).map(([k, v]) => `${escapeHtml(k)}: «${escapeHtml(v)}»`).join('<br>'); } catch (e) { changes = ''; }
+  const buttons = c.status === 'approval_needed'
+    ? `<button class="btn-secondary" data-action="rejectChange" data-id="${id}">Avvis</button>
+       <button class="btn-primary" data-action="approveChange" data-id="${id}">Godkjenn og utfør</button>`
+    : c.status === 'hidden'
+    ? `<button class="btn-secondary" data-action="cancelChange" data-id="${id}">Angre fjerning</button>`
+    : '';
+  return `
+    <div class="await-row">
+      <div class="row-top">
+        <div class="subject">${c.kind === 'removal' ? 'Fjerning' : 'Endring'}: ${escapeHtml(c.target_name || c.target_id)}</div>
+        <div class="when">${Math.floor(c.age_hours)} t</div>
+      </div>
+      <div class="from"><span class="name">Fra: ${escapeHtml(c.requester_email)}</span></div>
+      <div class="meta">
+        <span class="pill">${escapeHtml(PLATFORM_LABEL[c.vertical] || c.vertical)}</span>
+        <span class="pill">${escapeHtml(CHANGE_STATUS_LABEL[c.status] || c.status)}</span>
+        ${c.status_reason ? `<span style="color:var(--danger)">${escapeHtml(c.status_reason)}</span>` : ''}
+      </div>
+      ${changes ? `<div class="from" style="margin-top:6px">${changes}</div>` : ''}
+      <div class="actions">${buttons}</div>
+    </div>`;
+}
+
+async function approveChange(id) {
+  if (!confirm('Utføre denne endringen nå? (fjerning: profilen skjules straks og slettes etter 24 t)')) return;
+  try { const r = await apiCs('/change-requests/' + encodeURIComponent(id) + '/approve', { method: 'POST', body: '{}' }); toast(r.note || 'Godkjent — utføres av serveren'); }
+  catch (e) { toast(e.message, true); }
+  await openApprovalQueue();
+}
+async function rejectChange(id) {
+  const reason = prompt('Hvorfor avvises forespørselen?');
+  if (!reason || !reason.trim()) return;
+  try { await apiCs('/change-requests/' + encodeURIComponent(id) + '/reject', { method: 'POST', body: JSON.stringify({ reason: reason.trim() }) }); toast('Avvist'); }
+  catch (e) { toast(e.message, true); }
+  await openApprovalQueue();
+}
+async function cancelChange(id) {
+  const reason = prompt('Hvorfor angres fjerningen? (profilen blir synlig igjen, sperrene fjernes)');
+  if (!reason || !reason.trim()) return;
+  try { await apiCs('/change-requests/' + encodeURIComponent(id) + '/cancel', { method: 'POST', body: JSON.stringify({ reason: reason.trim() }) }); toast('Fjerningen er angret'); }
+  catch (e) { toast(e.message, true); }
+  await openApprovalQueue();
+}
+
 async function openApprovalQueue() {
   document.getElementById('awaitOverlay').style.display = 'flex';
   document.getElementById('awaitTitle').textContent = 'Godkjenningskø';
@@ -1134,7 +1198,14 @@ async function openApprovalQueue() {
           </div>
         </div>`;
     });
-    list.innerHTML = rows.length ? rows.join('') : '<div class="await-empty">Ingen svarforslag venter \u2728</div>';
+    try {
+      const waiting = await apiCs('/change-requests?status=approval_needed&limit=200');
+      const hidden = await apiCs('/change-requests?status=hidden&limit=200');
+      const failedCh = await apiCs('/change-requests?status=verify_failed&limit=50');
+      const chRows = [...waiting.items, ...hidden.items, ...failedCh.items].map(renderChangeRequest);
+      if (chRows.length) rows.push('<div class="await-empty" style="text-align:left;font-weight:600">Endringer og fjerninger</div>', ...chRows);
+    } catch (e) { /* older server without S4 */ }
+    list.innerHTML = rows.length ? rows.join('') : '<div class="await-empty">Ingen svarforslag eller endringer venter \u2728</div>';
   } catch (e) {
     list.innerHTML = `<div class="await-empty" style="color:var(--danger)">Feil: ${escapeHtml(e.message)}</div>`;
   }
@@ -1309,6 +1380,9 @@ const ACTIONS = {
   approveProposal: id => approveProposal(id),
   saveProposal: id => saveProposal(id),
   rejectProposal: id => rejectProposal(id),
+  approveChange: id => approveChange(id),
+  rejectChange: id => rejectChange(id),
+  cancelChange: id => cancelChange(id),
   closeAwait,
   openThreadFromAwait: (id, _val, el) => {
     const contact = el?.dataset?.contact;

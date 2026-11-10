@@ -3406,6 +3406,44 @@ function initSchema(db: Database.Database): void {
     console.error("Migration contact_form tables failed:", err);
   }
 
+  // ─── CS på serveren, S4: change requests (profile_update / removal),
+  // executed and verified by the server (services/cs-change-requests.ts).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS cs_change_requests (
+        id TEXT PRIMARY KEY,
+        vertical TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        target_name TEXT,
+        thread_id TEXT,
+        requester_email TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        changes TEXT NOT NULL DEFAULT '{}',
+        evidence TEXT,
+        authority TEXT NOT NULL,
+        status TEXT NOT NULL,
+        status_reason TEXT,
+        steps TEXT NOT NULL DEFAULT '[]',
+        snapshot TEXT,
+        blocklist_ids TEXT NOT NULL DEFAULT '[]',
+        cross_vertical TEXT,
+        created_by TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        executed_at TEXT,
+        hidden_at TEXT,
+        delete_after TEXT,
+        deleted_at TEXT,
+        verified_at TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_cs_change_requests_status ON cs_change_requests(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_cs_change_requests_thread ON cs_change_requests(thread_id);
+    `);
+  } catch (err) {
+    console.error("Migration cs_change_requests failed:", err);
+  }
+
   // ─── M1 (Phase 5.4a): agent_knowledge_audit ─────────────────
   // Owner profile change history. Immutable changelog (insert-only).
   // Daniel uses GET /admin/agent-audit to inspect ownership changes.

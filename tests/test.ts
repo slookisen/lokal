@@ -45124,6 +45124,23 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── dev-request 2026-11-10-cs-paa-serveren: S4 (endringer og fjerning, utført og verifisert av serveren) ──");
+  try {
+    const { runCsChangeRequestsTests } = require("../src/services/cs-change-requests.test") as
+      typeof import("../src/services/cs-change-requests.test");
+    const cct = await runCsChangeRequestsTests({ log: false });
+    passed += cct.passed;
+    failed += cct.failed;
+    for (const f of cct.failures) failures.push("cs-change-requests: " + f);
+    console.log(`  cs-change-requests: ${cct.passed} passed, ${cct.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("cs-change-requests: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ cs-change-requests: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-07-27-crm-plattformadskillelse: steg 4 (innkommende triage + utriaged-bøtte) ──");
   try {
     const { runCrmTriageTests } = require("../src/services/crm-triage.test") as

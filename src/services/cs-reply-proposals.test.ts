@@ -143,9 +143,19 @@ export function runCsReplyProposalsTests(opts: { log?: boolean } = {}): Promise<
       eq(await gate({}, { kind: "fjernet", bodyText: "Profilen din er fjernet." }).then((r) => r.reason), "endring_mangler", "cr14: «fjernet» without a linked change request → stopped");
       eq(await gate({}, { kind: "takk", bodyText: "Takk! Vi har nå oppdatert åpningstidene på siden." }).then((r) => r.reason), "endring_ikke_verifisert", "cr15: text that says a change was made, without a verified change → stopped");
       eq(await gate({}, { kind: "rettelse_bekreftet", changeRequestIds: ["chg-1"], bodyText: "Vi har rettet telefonnummeret." }).then((r) => r.reason), "endring_ikke_verifisert", "cr16: a linked change that is not verified (S4 table absent) → stopped");
-      db.exec(`CREATE TABLE IF NOT EXISTS cs_change_requests (id TEXT PRIMARY KEY, status TEXT NOT NULL)`);
-      db.prepare(`INSERT INTO cs_change_requests (id, status) VALUES ('chg-ok', 'verified'), ('chg-pending', 'executed')`).run();
-      eq(await gate({}, { kind: "rettelse_bekreftet", changeRequestIds: ["chg-pending"], bodyText: "Vi har rettet telefonnummeret." }).then((r) => r.reason), "endring_ikke_verifisert", "cr16b: executed but not yet verified → stopped");
+      const insCr = db.prepare(
+        `INSERT INTO cs_change_requests (id, vertical, target_id, requester_email, kind, authority, status, created_by, created_at, updated_at)
+         VALUES (?, 'rfb', 'ag-x', 'k@x.no', ?, 'registered_email', ?, 'claude', ?, ?)`,
+      );
+      const tsNow = new Date().toISOString();
+      insCr.run("chg-ok", "profile_update", "verified", tsNow, tsNow);
+      insCr.run("chg-pending", "profile_update", "executed", tsNow, tsNow);
+      insCr.run("chg-failed", "profile_update", "verify_failed", tsNow, tsNow);
+      insCr.run("chg-hidden", "removal", "hidden", tsNow, tsNow);
+      eq(await gate({}, { kind: "rettelse_bekreftet", changeRequestIds: ["chg-pending"], bodyText: "Vi har rettet telefonnummeret." }).then((r) => [r.outcome, r.reason]), ["waiting", "venter_paa_endring"], "cr16b: executed but not yet verified → the reply WAITS (re-checked), not sent");
+      eq(await gate({}, { kind: "rettelse_bekreftet", changeRequestIds: ["chg-failed"], bodyText: "Vi har rettet telefonnummeret." }).then((r) => [r.outcome, r.reason]), ["approval_needed", "endring_ikke_verifisert"], "cr16c: a change that failed verification → approval queue");
+      eq(await gate({}, { kind: "fjern_steg1", changeRequestIds: ["chg-hidden"], bodyText: "Profilen din er nå skjult, og den slettes om 24 timer." }).then((r) => r.outcome), "sent", "cr16d: «fjern_steg1» may go once the removal is hidden");
+      eq(await gate({}, { kind: "fjernet", changeRequestIds: ["chg-hidden"], bodyText: "Profilen din er fjernet." }).then((r) => r.outcome), "waiting", "cr16e: «fjernet» waits until the removal is VERIFIED");
       eq(await gate({}, { kind: "rettelse_bekreftet", changeRequestIds: ["chg-ok"], bodyText: "Vi har rettet telefonnummeret." }).then((r) => r.outcome), "sent", "cr17: the same reply with a VERIFIED change is sent");
       eq(await gate({}, { kind: "takk", bodyText: "Se rettfrabonden.com for mer." }, {}, "experiences").then((r) => r.reason), "feil_merkevare", "cr18: another platform's brand/domain in an Opplevagent reply → stopped");
       eq(await gate({}, { kind: "takk", bodyText: "Takk, vi ser paa saken." }).then((r) => r.reason), "tegnsett", "cr19: æøå written as «paa» → stopped");
@@ -286,7 +296,7 @@ export function runCsReplyProposalsTests(opts: { log?: boolean } = {}): Promise<
         eq([idle.run_id, idle.processed.length], [null, 0], "cr41b: an idle minute writes no ledger row");
         const t3 = mkThread();
         const c3 = create(t3.id);
-        eq([rp.parkPendingWhenAutosendOff(OFF), c3.ok && P(c3.proposal.id).status], [1, "approval_needed"], "cr41c: autosend switched off → pending proposals move to the queue");
+        eq([rp.parkPendingWhenAutosendOff(OFF) >= 1, c3.ok && P(c3.proposal.id).status], [true, "approval_needed"], "cr41c: autosend switched off → pending proposals move to the queue");
       }
 
       // ── routes ───────────────────────────────────────────────────────

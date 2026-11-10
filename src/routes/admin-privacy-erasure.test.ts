@@ -150,6 +150,10 @@ function seed(db: Database.Database): void {
     db.prepare(`INSERT INTO crm_thread_flags (thread_id, no_reply_reason, no_reply_at, no_reply_by) VALUES (?, 'fri tekst', '2026-11-01T00:00:00Z', 'daniel')`).run(`th-${who}`);
     db.prepare(`INSERT INTO crm_thread_aliases (alias_id, thread_id, source) VALUES (?, ?, 'cs_gmail_copy')`).run(`gm-alias-${who}`, `th-${who}`);
     db.prepare(
+      `INSERT INTO cs_change_requests (id, vertical, target_id, thread_id, requester_email, kind, authority, status, created_by, created_at, updated_at)
+       VALUES (?, 'rfb', 'ag-1', ?, ?, 'removal', 'registered_email', 'verified', 'claude', '2026-11-01T00:00:00Z', '2026-11-01T00:00:00Z')`,
+    ).run(`chg-${who}`, `th-${who}`, who === "t" ? TARGET_NORM : OTHER);
+    db.prepare(
       `INSERT INTO cs_reply_proposals (id, thread_id, vertical, kind, to_email, subject, body_text, created_by, created_at, updated_at)
        VALUES (?, ?, 'rfb', 'takk', ?, 's', 'b', 'claude', '2026-11-01T00:00:00Z', '2026-11-01T00:00:00Z')`,
     ).run(`rp-${who}`, `th-${who}`, who === "t" ? TARGET_NORM : OTHER);
@@ -177,6 +181,7 @@ const EXPECTED_TARGET_COUNTS: Record<string, number> = {
   crm_messages: 4,
   crm_thread_flags: 1,
   crm_thread_aliases: 1,
+  cs_change_requests: 1,
   cs_reply_proposals: 1,
   inbound_email_log: 3,
   crm_threads: 2,
@@ -304,7 +309,7 @@ export async function runAdminPrivacyErasureTests(opts: { log?: boolean } = {}):
     assertEq(audit[0]?.email_hash, mod.erasureAddressHash(TARGET_NORM), "audit stores keyed hash");
     assertTrue(!JSON.stringify(audit[0]).includes("example.no"), "audit never stores the address");
     assertEq(JSON.parse(audit[0]?.counts_json || "{}"), EXPECTED_TARGET_COUNTS, "audit per-table counts");
-    assertEq(audit[0]?.total_rows, 27, "audit total (20 + 3 inbound_email_log rows + crm_thread_flags + crm_thread_aliases, S1; + cs_reply_proposals, S2; + contact_form_receipts, S5)");
+    assertEq(audit[0]?.total_rows, 28, "audit total (20 + 3 inbound_email_log rows + crm_thread_flags + crm_thread_aliases, S1; + cs_reply_proposals, S2; + cs_change_requests, S4; + contact_form_receipts, S5)");
     assertEq(audit[0]?.include_suppression, 0, "audit include_suppression=0");
     assertTrue(typeof audit[0]?.requested_at === "string" && audit[0].requested_at.length > 0, "audit when");
 

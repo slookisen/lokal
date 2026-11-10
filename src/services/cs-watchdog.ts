@@ -374,6 +374,36 @@ export async function runCsWatchdog(
       line: `• [Svar ${d.status === "complained" ? "merket som spam" : "kom ikke fram (bounce)"}] [${platformName(d.vertical)}] ${d.subject ?? "(uten emne)"} — til ${d.to_emails ?? "?"}${d.detail ? `: ${d.detail}` : ""}`,
     });
   }
+  // S4: change requests that failed, and requests nobody is executing.
+  try {
+    for (const c of db
+      .prepare(
+        `SELECT id, vertical, target_name, kind, status, status_reason FROM cs_change_requests
+          WHERE status IN ('failed', 'verify_failed') AND julianday(updated_at) >= julianday(?) - 7
+          ORDER BY updated_at ASC LIMIT 100`,
+      )
+      .all(now.toISOString()) as Array<{ id: string; vertical: string; target_name: string | null; kind: string; status: string; status_reason: string | null }>) {
+      items.push({
+        key: `change:${c.id}`,
+        once: true,
+        line: `• [${c.kind === "removal" ? "Fjerning" : "Endring"} ${c.status === "verify_failed" ? "ikke bekreftet på siden" : "feilet"}] [${platformName(c.vertical)}] ${c.target_name ?? "?"}: ${c.status_reason ?? "ukjent"} (${c.id})`,
+      });
+    }
+    for (const c of db
+      .prepare(
+        `SELECT id, vertical, target_name, kind FROM cs_change_requests
+          WHERE status = 'queued' AND julianday(updated_at) < julianday(?) - 30.0 / 1440 LIMIT 50`,
+      )
+      .all(now.toISOString()) as Array<{ id: string; vertical: string; target_name: string | null; kind: string }>) {
+      items.push({
+        key: `change-stuck:${c.id}`,
+        once: true,
+        line: `• [${c.kind === "removal" ? "Fjerning" : "Endring"} venter på jobben] [${platformName(c.vertical)}] ${c.target_name ?? "?"} — i kø over 30 min (er CS_CHANGE_REQUESTS_ENABLED på?) (${c.id})`,
+      });
+    }
+  } catch (e: any) {
+    env.error(`change-request checks: ${String(e?.message ?? e)}`);
+  }
   for (const extra of deps.extraItems?.(now) ?? []) items.push(extra);
   // Threads last: a backlog of old threads must never push a one-time problem
   // (an exhausted forward, a failed registration) out of the e-mail.
@@ -599,7 +629,28 @@ export function buildDailyDigest(now: Date = new Date()): { subject: string; tex
       for (const b of bounced.slice(0, 20)) lines.push(`• [${platformName(b.vertical)}] ${b.subject ?? "(uten emne)"} — ${b.status}${b.detail ? ` (${b.detail})` : ""}`);
     }
     if (viaApi > 0) lines.push(`Merk: ${viaApi} forslag ble godkjent via API-et, ikke fra admin-siden.`);
-    proposalCounts = { sent: sentRows, approval_queue: queue.length, approval_over_48h: queue.filter((q) => q.age_h > 48).length, failed_24h: failed.length, approved_via_api: viaApi };
+    // S4: changes and removals.
+    const ch = db
+      .prepare(
+        `SELECT vertical, kind, status, COUNT(*) AS n FROM cs_change_requests
+          WHERE julianday(updated_at) >= julianday(?) OR status IN ('approval_needed', 'queued', 'hidden')
+          GROUP BY 1, 2, 3`,
+      )
+      .all(since) as Array<{ vertical: string; kind: string; status: string; n: number }>;
+    if (ch.length > 0) {
+      lines.push("");
+      lines.push("ENDRINGER OG SLETTINGER (utført og kontrollert av serveren)");
+      const label: Record<string, string> = {
+        verified: "utført og bekreftet", hidden: "skjult, slettes etter 24 t", approval_needed: "venter på deg", queued: "i kø",
+        executed: "utført, venter på bekreftelse", failed: "feilet", verify_failed: "ikke bekreftet på siden", cancelled: "angret", rejected: "avvist",
+      };
+      for (const v of [...new Set(ch.map((r) => r.vertical))].sort()) {
+        const parts = ch.filter((r) => r.vertical === v).map((r) => `${r.kind === "removal" ? "fjerning" : "endring"} ${label[r.status] ?? r.status} ${r.n}`);
+        lines.push(`• ${platformName(v)}: ${parts.join(", ")}`);
+      }
+    }
+    proposalCounts = { ...proposalCounts, change_requests: ch };
+    proposalCounts = { ...proposalCounts, sent: sentRows, approval_queue: queue.length, approval_over_48h: queue.filter((q) => q.age_h > 48).length, failed_24h: failed.length, approved_via_api: viaApi };
   } catch {
     // cs_reply_proposals missing (pre-migration DB)
   }

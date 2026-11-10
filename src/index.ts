@@ -78,6 +78,7 @@ import adminDbBackupRoutes, { diskUsage, createBackupAgeSweepTick, BACKUP_AGE_SW
 import adminSearchConsolesRoutes from "./routes/admin-search-consoles";
 import adminConversationsTrafficClassRoutes from "./routes/admin-conversations-traffic-class";
 import adminCrossVerticalContactLookupRoutes from "./routes/admin-cross-vertical-contact-lookup";
+import adminCsChangeRequestsRoutes from "./routes/admin-cs-change-requests";
 import adminAgentsRoutes from "./routes/admin-agents";
 import adminOutreachPoolRoutes from "./routes/admin-outreach-pool";
 import adminOutreachCandidatesRoutes from "./routes/admin-outreach-candidates";
@@ -86,6 +87,7 @@ import { rfbMarketingLaneRouter, rfbMarketingDailyRunRouter } from "./routes/adm
 import { tickRfbMarketingDaily } from "./services/rfb-marketing-daily";
 import { tickCsWatchdog, type CsTickState } from "./services/cs-watchdog";
 import { csAutosendEnabled, runCsAutosend } from "./services/cs-reply-proposals";
+import { csChangeRequestsEnabled, runCsChangeRequests } from "./services/cs-change-requests";
 import { rfbEnrichmentNightlyRouter } from "./routes/admin-rfb-enrichment-nightly";
 import {
   isRfbEnrichmentNightlyEnabled,
@@ -1342,6 +1344,7 @@ if (process.env.CRM_ENABLED !== "0") {
 // customer-service "fjern" flow; exact-email-match only, never fuzzy name
 // matching. GET /admin/cross-vertical-contact-lookup.
 app.use("/admin", adminLimiter, adminCrossVerticalContactLookupRoutes);
+app.use("/admin/cs", adminLimiter, adminCsChangeRequestsRoutes);
 
 // Billing skeleton (Produsent-Premium, test-mode Stripe) — dev-request
 // 2026-07-13-billing-skjelett-moerkt. Feature-flagged via BILLING_ENABLED
@@ -2839,6 +2842,27 @@ if (csAutosendEnabled()) {
   });
   setTimeout(() => { void csAutosendTick(); }, 200_000);
   setInterval(() => { void csAutosendTick(); }, 60_000);
+}
+
+// ─── CS på serveren, S4: change requests executed + verified by the server
+// (CS_CHANGE_REQUESTS_ENABLED). Every 5 min: execute queued requests, re-read
+// public surfaces for executed ones, delete hidden removals after 24 h.
+if (csChangeRequestsEnabled()) {
+  let csChangeBusy = false;
+  const csChangeTick = trackJob("cs-change-requests", async () => {
+    if (csChangeBusy) return;
+    csChangeBusy = true;
+    try {
+      const r = await runCsChangeRequests();
+      if (r.run_id) console.log(`[cs-change-requests] ${r.processed.map((p) => `${p.id}:${p.from}->${p.to}`).join(" ")}`);
+    } catch (err) {
+      console.error("[cs-change-requests] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      csChangeBusy = false;
+    }
+  });
+  setTimeout(() => { void csChangeTick(); }, 240_000);
+  setInterval(() => { void csChangeTick(); }, 5 * 60_000);
 }
 
 // ─── dev-request 2026-10-10-rfb-berikelse-nattjobb (R6; Daniel GO 2026-10-10,

@@ -233,21 +233,27 @@ export function latestHumanInbound(threadId: string): LatestInbound | null {
   return { message_id: row.id, from_email: row.from_email.trim().toLowerCase(), subject: row.subject, at: row.at, rfc_message_id: rfc };
 }
 
-function changeRequestStatuses(ids: string[]): Map<string, string> {
-  const out = new Map<string, string>();
+function changeRequestStatuses(ids: string[]): Map<string, { status: string; kind: string }> {
+  const out = new Map<string, { status: string; kind: string }>();
   if (ids.length === 0) return out;
   try {
     const db = getDb();
-    const stmt = db.prepare("SELECT status FROM cs_change_requests WHERE id = ?");
+    const stmt = db.prepare("SELECT status, kind FROM cs_change_requests WHERE id = ?");
     for (const id of ids) {
-      const r = stmt.get(id) as { status: string } | undefined;
-      if (r) out.set(id, r.status);
+      const r = stmt.get(id) as { status: string; kind: string } | undefined;
+      if (r) out.set(id, r);
     }
   } catch {
     // cs_change_requests not there yet (S4 not deployed) — every id counts as unverified
   }
   return out;
 }
+
+/** Change-request states that are still on their way (the reply waits for them). */
+const CHANGE_IN_PROGRESS = new Set(["approval_needed", "queued", "executed", "hidden"]);
+/** How long a reply waits for its linked change before it goes to Daniel. */
+export const CHANGE_WAIT_HOURS = 72;
+export const CHANGE_WAIT_RECHECK_MS = 5 * 60_000;
 
 // ─── Create ───────────────────────────────────────────────────────────
 
@@ -350,7 +356,7 @@ export type SendMode = "auto" | "approved";
 
 export type Evaluation =
   | { ok: true; to: string; inReplyTo: string | null }
-  | { ok: false; outcome: "approval_needed" | "superseded"; reason: string; detail: string };
+  | { ok: false; outcome: "approval_needed" | "superseded" | "waiting"; reason: string; detail: string };
 
 /**
  * Every gate, read-only. `auto` is the worker; `approved` is Daniel pressing
@@ -397,9 +403,27 @@ export function evaluateProposal(p: ProposalRow, mode: SendMode, deps: { now?: D
   }
   if (crIds.length > 0) {
     const st = changeRequestStatuses(crIds);
-    const notVerified = crIds.filter((id) => st.get(id) !== "verified");
+    // «fjern_steg1» tells the customer the profile is hidden and will be
+    // deleted: a removal that has reached «hidden» is enough for that text.
+    const satisfied = (id: string) => {
+      const c = st.get(id);
+      if (!c) return false;
+      if (c.status === "verified") return true;
+      return p.kind === "fjern_steg1" && c.kind === "removal" && c.status === "hidden";
+    };
+    const notVerified = crIds.filter((id) => !satisfied(id));
     if (notVerified.length > 0) {
-      return stop("endring_ikke_verifisert", `endring(er) ikke verifisert som utført: ${notVerified.join(", ")}`);
+      const inProgress = notVerified.every((id) => CHANGE_IN_PROGRESS.has(st.get(id)?.status ?? ""));
+      const ageH = (now.getTime() - Date.parse(normTs(p.created_at))) / 3600_000;
+      if (inProgress && ageH < CHANGE_WAIT_HOURS) {
+        return {
+          ok: false,
+          outcome: "waiting",
+          reason: "venter_paa_endring",
+          detail: `venter på at endringen blir verifisert: ${notVerified.map((id) => `${id} (${st.get(id)?.status})`).join(", ")}`,
+        };
+      }
+      return stop("endring_ikke_verifisert", `endring(er) ikke verifisert som utført: ${notVerified.map((id) => `${id} (${st.get(id)?.status ?? "finnes ikke"})`).join(", ")}`);
     }
   } else if (mode === "auto" && claimsChange(p.body_text)) {
     return stop("endring_ikke_verifisert", "teksten sier at noe er endret, men ingen verifisert endring er koblet til");
@@ -468,7 +492,7 @@ export type SendRawFn = (options: Parameters<typeof emailService.sendRaw>[0]) =>
 
 export interface ProcessResult {
   id: string;
-  outcome: "sent" | "approval_needed" | "superseded" | "retry" | "failed" | "skipped";
+  outcome: "sent" | "approval_needed" | "superseded" | "retry" | "failed" | "skipped" | "waiting";
   reason?: string;
   detail?: string;
   smtpMessageId?: string;
@@ -493,6 +517,18 @@ export async function processProposal(
   const mode: SendMode = p.status === "approved" ? "approved" : "auto";
 
   const ev = evaluateProposal(p, mode, { now, env: deps.env, liveTransport: deps.liveTransport });
+  if (!ev.ok && ev.outcome === "waiting") {
+    // Stays in its state; re-checked after CHANGE_WAIT_RECHECK_MS. Visible on the proposal.
+    db.prepare(`UPDATE cs_reply_proposals SET block_reason = ?, block_detail = ?, next_attempt_at = ?, updated_at = ? WHERE id = ? AND status = ?`).run(
+      ev.reason,
+      ev.detail,
+      new Date(now.getTime() + CHANGE_WAIT_RECHECK_MS).toISOString(),
+      ts,
+      id,
+      p.status,
+    );
+    return { id, outcome: "waiting", reason: ev.reason, detail: ev.detail };
+  }
   if (!ev.ok) {
     db.prepare(`UPDATE cs_reply_proposals SET status = ?, block_reason = ?, block_detail = ?, updated_at = ? WHERE id = ? AND status = ?`).run(
       ev.outcome,
@@ -816,7 +852,7 @@ export async function runCsAutosend(
       processed.push({ id: d.id, outcome: "failed", reason: "exception", detail: String(e?.message ?? e) });
     }
   }
-  const acted = processed.filter((r) => r.outcome !== "skipped");
+  const acted = processed.filter((r) => r.outcome !== "skipped" && r.outcome !== "waiting");
   if (acted.length === 0 && recovered.length === 0) return { run_id: null, recovered_leases: [], processed, envelope_recorded: false };
 
   // One run-ledger row per minute that actually did something.
