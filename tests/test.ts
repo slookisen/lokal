@@ -52793,6 +52793,27 @@ runSerial(async () => {
   }
 });
 
+// A2A dev-request 2026-10-26-marketplace-agents-endepunkt-ignorerer-limit
+// (re-specified 2026-10-28): GET /api/marketplace/agents keeps the 50 cap,
+// pages with limit/offset without overlap or gaps (rowid tie-break), reads a
+// negative/non-numeric offset as 0, and every row carries umbrella_type.
+// Swaps the getDb() singleton (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-26-marketplace-agents: limit/offset-paginering og umbrella_type ──");
+  try {
+    const { runMarketplaceAgentsPagingTests } = require("../src/routes/marketplace-agents-paging.test") as
+      typeof import("../src/routes/marketplace-agents-paging.test");
+    const r = await runMarketplaceAgentsPagingTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("marketplace-agents-paging: " + f);
+    console.log(`  marketplace-agents-paging: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-agents-paging: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
 // tekstrevisjon, S0 (P0, Debio complaint): no organic claim on any public read
 // surface without a valid Debio status (debio_verified = 1 until S1) — profile
