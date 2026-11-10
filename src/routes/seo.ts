@@ -74,7 +74,9 @@ import { slugify } from "../utils/slug";
 import { normalizeBmEventTime } from "../utils/bm-event-time";
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: ONE shared
 // public-listability predicate (catalog_hidden fixture + RFB vertical).
-import { publicListableSql, isPubliclyListable, isAsPublicView, failsProducerRoleGate, isAgentIdPubliclyVisible, ownerPauseEnabled, ownerVisibilityEnforced, isProfileOwnerHidden, ownerHiddenChoices, ownerHiddenAgentIds } from "../services/agent-visibility";
+import { publicListableSql, isPubliclyListable, isAsPublicView, failsProducerRoleGate, isAgentIdPubliclyVisible, ownerPauseEnabled, ownerVisibilityEnforced, isProfileOwnerHidden, ownerHiddenChoices, ownerHiddenAgentIds, isAwaitingSelfRegisteredReview } from "../services/agent-visibility";
+import { verifyOwnerSession, isVerifiedOwner } from "./owner-portal";
+import { ownerShellLinks } from "../owner-ui/shell";
 import { umbrellaHasContent, indexableUmbrellas } from "../services/umbrella-indexability";
 // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt:
 // rating markup, Offer return/shipping terms, the visible rating text and
@@ -5572,14 +5574,29 @@ function passesRoleGate(
   agent: { id: string; name: string; role?: string },
   requestedSlug: string,
 ): boolean {
+  return roleGateVerdict(agent, requestedSlug) === "pass";
+}
+
+/**
+ * passesRoleGate with the reason: "pending_review" = the row fails ONLY
+ * because it is a self-registered profile not yet vetted (role gate and
+ * listability both pass); every other failure is "fail". Same query, same
+ * log lines as before.
+ */
+function roleGateVerdict(
+  agent: { id: string; name: string; role?: string },
+  requestedSlug: string,
+): "pass" | "pending_review" | "fail" {
   let roleGateUmbrellaType: string | null = null;
   let roleGateIsVetted = 1;
   let roleGateListable = true;
+  let roleGateAwaitingReview = false;
   try {
     const row = getDb()
       .prepare("SELECT umbrella_type, is_vetted, catalog_hidden, vertical_id, origin FROM agents WHERE id = ?")
       .get(agent.id) as { umbrella_type: string | null; is_vetted: number | null; catalog_hidden: number | null; vertical_id: string | null; origin: string | null } | undefined;
     roleGateUmbrellaType = row ? row.umbrella_type : null;
+    roleGateAwaitingReview = row ? isAwaitingSelfRegisteredReview(row) : false;
     // is_vetted defaults to 1 in the schema (see database/init.ts) — a
     // NULL/undefined read (shouldn't happen post-migration, but this
     // route never fabricates trust either way) is treated as vetted.
@@ -5601,9 +5618,44 @@ function passesRoleGate(
     } else {
       console.log(`[seo:role-gate] suppressed non-producer, non-umbrella agent ${agent.id} (${agent.name}, role=${agent.role}) on /produsent/${requestedSlug}`);
     }
-    return false;
+    return !failsRoleGate && roleGateListable && !roleGateIsVetted && roleGateAwaitingReview ? "pending_review" : "fail";
   }
-  return true;
+  return "pass";
+}
+
+// ─── Owner view of an unvetted self-registered profile (dev-request
+// 2026-11-10-rfb-registreringer-og-eierkrav-folges-opp, S4a) ──────────────
+// OWNER_PENDING_PROFILE_VIEW_ENABLED ("1"/"true", read at call time, default
+// OFF): a verified owner (isVerifiedOwner, session for exactly this agent)
+// who opens their own self-registered profile while it waits for
+// self-registered-review-approve gets a private 200 «Under godkjenning» page
+// instead of the 404. Everyone else — and everything with the flag off —
+// keeps today's 404. Only the name is shown; nothing is written, nothing
+// becomes public, no sitemap entry. Flag off = no session lookup, no query.
+export const OWNER_PENDING_PROFILE_VIEW_FLAG = "OWNER_PENDING_PROFILE_VIEW_ENABLED";
+
+export function ownerPendingProfileViewEnabled(): boolean {
+  const v = process.env[OWNER_PENDING_PROFILE_VIEW_FLAG];
+  return v === "1" || v === "true";
+}
+
+function renderOwnerPendingProfilePage(agent: { id: string; name: string }, slug: string, lang: Lang): string {
+  const en = lang === "en";
+  const name = String(agent.name || "");
+  const portalHref = ownerShellLinks(agent.id).oversikt;
+  return shell(
+    en ? `Under review — ${name}` : `Under godkjenning — ${name}`,
+    en ? "Your profile is under review" : "Profilen din er under godkjenning",
+    `<div class="sec" style="text-align:center;padding:64px 24px 32px;">
+            <h1 style="font-size:2rem;margin-bottom:12px;">${escapeHtml(name)}</h1>
+            <p style="font-size:1.2rem;margin-bottom:12px;"><strong>${escapeHtml(en ? "Your profile is under review" : "Profilen din er under godkjenning")}</strong></p>
+            <p style="color:var(--g500);max-width:640px;margin:0 auto 28px;">${escapeHtml(en
+              ? "We review the profile within two working days. Until it is approved, only you can see this page. Questions? Reply to our e-mail or contact customer service."
+              : "Vi ser over profilen innen to virkedager. Til den er godkjent, er det bare du som ser denne siden. Har du spørsmål, svar på e-posten fra oss eller skriv til kundeservice.")}</p>
+            <a href="${escapeHtml(portalHref)}" class="city-pill">${escapeHtml(en ? "Go to your owner page →" : "Gå til eiersiden din →")}</a>
+          </div>`,
+    { lang, robots: "noindex", canonical: `${BASE_URL}${localizedPath("/produsent/" + slug, lang)}`, pathForAlternate: `/produsent/${encodeURIComponent(slug)}` },
+  );
 }
 
 // ─── E-mail on the producer profile (dev-request
@@ -5696,8 +5748,19 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // 404 exactly like an unknown slug — never leak "this exists but is
     // hidden". Unconditional (applies to producers AND umbrella rows
     // alike, though umbrellas are never self-registered in practice).
-    if (agent && !passesRoleGate(agent, slug)) {
-      agent = undefined;
+    if (agent) {
+      const gate = roleGateVerdict(agent, slug);
+      if (gate !== "pass") {
+        // S4a: the verified owner's own pending profile → «Under godkjenning»
+        // (private, noindex). Flag off: short-circuits before any session lookup.
+        if (gate === "pending_review" && ownerPendingProfileViewEnabled() && isVerifiedOwner(agent.id, verifyOwnerSession(req))) {
+          console.log(`[seo:quarantine-gate] owner pending view for agent ${agent.id}`);
+          res.setHeader("X-Robots-Tag", "noindex");
+          res.setHeader("Cache-Control", "private, no-store");
+          return res.status(200).send(renderOwnerPendingProfilePage(agent, slug, lang));
+        }
+        agent = undefined;
+      }
     }
 
     // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S1b punkt 6: an
