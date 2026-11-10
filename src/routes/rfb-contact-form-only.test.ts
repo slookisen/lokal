@@ -155,6 +155,11 @@ export async function runRfbContactFormOnlyTests(opts: { log?: boolean } = {}): 
     const app = express();
     app.set("trust proxy", true);
     app.use("/admin/agents", express.json(), adminMod.default as any);
+    // N3: a request with the header x-test-no-ip has no usable req.ip.
+    app.use((req: any, _res: any, next: any) => {
+      if (req.headers["x-test-no-ip"]) Object.defineProperty(req, "ip", { value: "", configurable: true });
+      next();
+    });
     app.use(langMiddleware);
     app.use("/", seoMod.default as any);
     const httpServer = http.createServer(app);
@@ -287,6 +292,31 @@ export async function runRfbContactFormOnlyTests(opts: { log?: boolean } = {}): 
       ok(ne.status === 200 && !ne.text.includes("kontaktskjema") && onlyPlatformMailto(ne.text), "F15: flagged without a stored e-mail -> no form");
     }
 
+    // ── E: «Vis e-post» (GET /produsent/:slug/epost) for a flagged profile ──
+    {
+      const reveal = (prefix: string, ip: string) => request("GET", `${prefix}/produsent/${flaggedSlug}/epost`, ip);
+      process.env.EMAIL_REVEAL_GUARD_RFB = "on";
+      guard.__resetEmailRevealGuardForTesting({ log: (l) => guardLog.push(l) });
+      try {
+        process.env.CONTACT_FORM_RFB = "on";
+        for (const prefix of ["", "/en"]) {
+          const r = await reveal(prefix, "198.51.100.5");
+          ok(r.status === 404 && !leaks(r.text, flagged.email) && onlyPlatformMailto(r.text), `E1: both switches on + flagged -> ${prefix || "/"} reveal is 404 with no address (got ${r.status})`);
+          eq(r.headers["x-robots-tag"], "noindex, nofollow", `E2: ${prefix || "/"} the 404 is noindex`);
+        }
+        const unR = await request("GET", `/produsent/${unflaggedSlug}/epost`, "198.51.100.5");
+        ok(unR.status === 200 && unR.text.includes(`mailto:${unflagged.email}`), "E3: both switches on, unflagged -> reveal unchanged (200 with the address)");
+        delete process.env.CONTACT_FORM_RFB;
+        guard.__resetEmailRevealGuardForTesting({ log: (l) => guardLog.push(l) });
+        const off = await reveal("", "198.51.100.6");
+        ok(off.status === 200 && off.text.includes(`mailto:${flagged.email}`), "E4: CONTACT_FORM_RFB off + flagged -> reveal unchanged (200 with the address)");
+      } finally {
+        process.env.CONTACT_FORM_RFB = "on";
+        delete process.env.EMAIL_REVEAL_GUARD_RFB;
+        guard.__resetEmailRevealGuardForTesting({ log: (l) => guardLog.push(l) });
+      }
+    }
+
     // ── P: POST /produsent/:slug/kontakt ──────────────────────────────────
     freshContactForm();
     {
@@ -324,6 +354,18 @@ export async function runRfbContactFormOnlyTests(opts: { log?: boolean } = {}): 
       ok(badJson.status === 400 && JSON.parse(badJson.text).fields?.includes("reply_email"), "P14: JSON invalid -> 400 with the field");
       eq(sent.length, 2, "P15: invalid input -> nothing sent");
 
+      // N2: control characters / line breaks in the name never reach the subject as line breaks.
+      freshContactForm();
+      const crlf = await postForm(flaggedSlug, "198.51.100.14", { ...goodFields, name: "Kari\r\nBcc: x@y.example\u0000\u2028Kunde" });
+      ok(crlf.status === 200 && sent.length === 1, "P15b: a name with CR/LF/control chars is accepted (sanitized)");
+      ok(!!sent[0] && !/[\r\n\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(sent[0].subject) && sent[0].subject.startsWith("Melding via Rett fra Bonden: Kari "), `P15c: the subject has no line break or control char (got ${JSON.stringify(sent[0]?.subject)})`);
+
+      // N3: no usable req.ip -> fail closed (429, nothing sent).
+      freshContactForm();
+      const noIp = await request("POST", `/produsent/${flaggedSlug}/kontakt`, "198.51.100.15", form(goodFields), { "content-type": "application/x-www-form-urlencoded", accept: "text/html", "x-test-no-ip": "1" });
+      ok(noIp.status === 429 && Number(noIp.headers["retry-after"]) > 0, `P15d: no req.ip -> 429 with Retry-After (got ${noIp.status})`);
+      eq(sent.length, 0, "P15e: no req.ip -> nothing sent");
+
       // Per-IP limit: 5 per hour.
       freshContactForm();
       const ip = "198.51.100.20";
@@ -342,6 +384,8 @@ export async function runRfbContactFormOnlyTests(opts: { log?: boolean } = {}): 
 
       // 404s
       freshContactForm();
+      // N1: the non-producer is flagged and has an e-mail, so only the role gate yields its 404.
+      setFlag(RFB_EMAIL_FIXTURE.logistics.id, true);
       for (const [label, slug] of [
         ["unknown slug", "finnes-ikke-gard"],
         ["unflagged profile", unflaggedSlug],

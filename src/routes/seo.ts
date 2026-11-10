@@ -7540,7 +7540,9 @@ router.get("/produsent/:slug/epost", (req: Request, res: Response, next) => {
     if (agent && !passesRoleGate(agent, slug)) agent = undefined;
     if (agent && (ownerPauseEnabled() || ownerVisibilityEnforced()) && isProfileOwnerHidden(getDb(), agent.id)) agent = undefined;
     let email: string | null = null;
-    if (agent) {
+    // S-D1: a contact-form-only profile (CONTACT_FORM_RFB on) answers exactly
+    // like a profile without e-mail (404, no address). Switch off → not read.
+    if (agent && !(contactFormEnabled("rfb") && isContactFormOnly(getDb(), agent.id))) {
       const info = knowledgeService.getAgentInfo(agent.id);
       const k = withoutHiddenFields((info?.knowledge || {}) as any, publicFieldChoices(agent.id));
       email = typeof k.email === "string" && k.email.trim() !== "" ? k.email : null;
@@ -7677,7 +7679,7 @@ router.post("/produsent/:slug/kontakt", (_req: Request, _res: Response, next) =>
     thanks();
   } catch (err) {
     // The error text could carry an address (mail layer) — log the kind only.
-    console.error(`SEO /produsent/${slug}/kontakt error:`, err instanceof Error ? err.name : "unknown");
+    console.error(`SEO /produsent/${slug.replace(/[^a-z0-9-]/g, "?").slice(0, 100)}/kontakt error:`, err instanceof Error ? err.name : "unknown");
     if (!res.headersSent) res.status(500).send(lang === "en" ? "Internal error" : "Intern feil");
   }
 });
