@@ -63,7 +63,7 @@ export function runGardssalgVisitTranslatedSourcesTests(opts: { log?: boolean } 
       const looksNo = route.gardssalgVisitSourceLooksNorwegian;
 
       // ═══════════════ U. language heuristic (pure) ═════════════════════
-      const EN_PAGE = "Welcome to our cidery on the farm. We are open for visitors every Saturday from 12:00 to 16:00 from May to September, and you can taste our ciders in the old barn. The farm shop sells bottles and gift cards. Guided tours are available for groups of 10 or more.";
+      const EN_PAGE = "Welcome to our cidery on the farm. We are open for visitors every Saturday from 12:00 to 16:00 from May 1 to September 30, and you can taste our ciders in the old barn. The farm shop sells bottles and gift cards. Guided tours are available for groups of 10 or more. The farm shop is open Saturday–Sunday in the summer season. Cider tastings Sat–Sun at the old barn. You may enjoy your cider in the sun on the terrace.";
       const NB_PAGE = "Velkommen til gården vår. Vi har åpent i gårdsbutikken hver lørdag, og det er mulig å smake på eplemosten. Besøk oss gjerne med hele familien, men ring på forhånd om dere er en større gruppe.";
       const NN_PAGE = "Gardsbutikken vår er ope kvar laurdag frå mai til august. Me tek imot besøk av grupper, men dei må ringje på førehand. Eg viser gjerne rundt i sideriet, men det er ikkje servering på garden. Kva me har på lager står på tavla.";
       assertEq(looksNo(EN_PAGE), false, "u1: English farm page -> not Norwegian");
@@ -76,6 +76,17 @@ export function runGardssalgVisitTranslatedSourcesTests(opts: { log?: boolean } 
         "u7: mixed page where English is not ≥ 2× the Norwegian hits -> Norwegian");
       assertEq(looksNo(NN_PAGE + " " + EN_PAGE + " " + EN_PAGE + " " + EN_PAGE), false,
         "u8: page dominated by English (≥ 2× Norwegian hits) -> not Norwegian");
+      // PR #1498 review B1: Norwegian content under an English cookie banner
+      // and a Wix footer is still Norwegian.
+      const NB_WIX_PAGE = "Hjem Om oss Butikk Kontakt. Gårdsbutikken holder åpent hver lørdag fra kl. 11 til 15 fra mai til desember. " +
+        "Vi har også kafé med hjemmebakte kaker og kaffe, og du kan kjøpe egg, honning og eplemost. Grupper kan bestille omvisning på gården. " +
+        "Cookies: We use cookies to improve your experience on our website. By continuing to browse the site you agree to our use of cookies. Accept. " +
+        "This site was designed with the Wix website builder. Create your website today.";
+      assertEq(looksNo(NB_WIX_PAGE), true, "u9: Norwegian page + English cookie banner + Wix footer -> Norwegian");
+      const NB_TERSE_PAGE = "Gårdsutsalget ligger like ved riksveien. Åpningstider: torsdag–fredag 12–18, lørdag 10–15. " +
+        "Velkommen innom for ferske grønnsaker, poteter, jordbær i sesong og hjemmelaget syltetøy. Betaling med Vipps eller kort. " +
+        "Parkering rett ved låven. Cookies help us deliver our services. Privacy policy.";
+      assertEq(looksNo(NB_TERSE_PAGE), true, "u10: terse bokmål page not built around the stop-word list -> Norwegian");
 
       // ═══════════════ T. write endpoint ════════════════════════════════
       const call = (method: "GET" | "POST", url: string, body?: any): Promise<{ status: number; body: any }> =>
@@ -118,7 +129,7 @@ export function runGardssalgVisitTranslatedSourcesTests(opts: { log?: boolean } 
 
       const TR_TEXT = "Sideriet tar imot besøkende hver lørdag fra 12:00 til 16:00 fra mai til september, med smaking av sider i den gamle låven. Omvisning for grupper på 10 eller flere.";
       const TR_SNIPPETS = [
-        "We are open for visitors every Saturday from 12:00 to 16:00 from May to September",
+        "We are open for visitors every Saturday from 12:00 to 16:00 from May 1 to September 30",
         "Guided tours are available for groups of 10 or more",
       ];
       const item = (id: string, over: Record<string, unknown> = {}) => ({
@@ -161,7 +172,7 @@ export function runGardssalgVisitTranslatedSourcesTests(opts: { log?: boolean } 
         const cases: Array<[string, Record<string, unknown>, string]> = [
           ["translated_evidence_too_few", { evidence_snippets: [TR_SNIPPETS[0]] }, "only 1 snippet"],
           ["translated_numbers_not_in_evidence", { visit_text: TR_TEXT.replace("16:00", "18:00") }, "closing time not in the snippets"],
-          ["translated_numbers_not_in_evidence", { visit_text: TR_TEXT.replace("grupper på 10", "grupper på 1") }, "«1» is not satisfied by «10»"],
+          ["translated_numbers_not_in_evidence", { visit_text: "Sideriet tar imot grupper på 1 eller flere for omvisning i den gamle låven.", evidence_snippets: [TR_SNIPPETS[1], "The farm shop is open Saturday–Sunday in the summer season"] }, "«1» is not satisfied by «10»"],
           ["translated_days_not_in_evidence", { visit_text: TR_TEXT.replace("hver lørdag", "hver lørdag og søndag") }, "Sunday not in the snippets"],
           ["translated_days_not_in_evidence", { visit_text: TR_TEXT.replace("fra mai", "fra juni") }, "June not in the snippets"],
         ];
@@ -179,6 +190,43 @@ export function runGardssalgVisitTranslatedSourcesTests(opts: { log?: boolean } 
         // The usual gates before the language decision are unchanged (no source_language there).
         const nf = await post([item("vt-en-4", { evidence_snippets: ["Dette står ikke på siden i det hele tatt.", TR_SNIPPETS[1]] })], false);
         assertEq(nf.body.results[0], { provider_id: "vt-en-4", result: "rejected", reason: "evidence_not_found" }, "t2-ev: evidence_not_found still first, row shape unchanged");
+      }
+
+      // t3: idiomatic day forms (PR #1498 review B2) and English words that
+      // collide with day/month abbreviations (review N4).
+      {
+        const S_GROUPS = TR_SNIPPETS[1];
+        const S_SATSUN = "The farm shop is open Saturday–Sunday in the summer season";
+        const S_SATSUN_ABBR = "Cider tastings Sat–Sun at the old barn";
+        const S_SUN_MAY = "You may enjoy your cider in the sun on the terrace";
+        const rejects: Array<[string, string[], string]> = [
+          ["Gårdsbutikken er åpent lør–søn, og grupper på 10 eller flere kan bestille omvisning.", [S_GROUPS, S_SUN_MAY], "«lør–søn» without Sat/Sun evidence"],
+          ["Sideriet tar imot besøkende i helgene, og grupper på 10 eller flere kan bestille omvisning.", [S_GROUPS, S_SUN_MAY], "«i helgene» without weekend/Sat+Sun evidence"],
+          ["Sideriet tar imot besøkende på søndagar, og grupper på 10 eller flere kan få omvisning.", [S_GROUPS, TR_SNIPPETS[0]], "«søndagar» (-ar) without Sunday evidence"],
+          ["Sideriet har søndagsåpent i låven, og grupper på 10 eller flere kan få omvisning.", [S_GROUPS, TR_SNIPPETS[0]], "compound «søndagsåpent» without Sunday evidence"],
+          ["Sideriet har åpent på søndager, og grupper på 10 eller flere kan få omvisning.", [S_GROUPS, S_SUN_MAY], "«in the sun» is not Sunday evidence"],
+          ["Sideriet tar imot grupper på 10 eller flere fra mai, og sideren kan nytes på terrassen.", [S_GROUPS, S_SUN_MAY], "«you may» is not May evidence"],
+        ];
+        let i = 0;
+        for (const [text, snips, label] of rejects) {
+          i++;
+          const r = await post([item("vt-en-2", { visit_text: text, evidence_snippets: snips })], false);
+          assertEq([r.body.results[0].result, r.body.results[0].reason], ["rejected", "translated_days_not_in_evidence"], `t3-r${i}: ${label} -> translated_days_not_in_evidence`);
+        }
+        const passes: Array<[string, string[], string]> = [
+          ["Gårdsbutikken er åpent lør–søn i sommersesongen, og grupper på 10 eller flere kan bestille omvisning.", [S_SATSUN, S_GROUPS], "«lør–søn» with «Saturday–Sunday»"],
+          ["Smaking lør–søn i den gamle låven, og grupper på 10 eller flere kan bestille omvisning.", [S_SATSUN_ABBR, S_GROUPS], "«lør–søn» with «Sat–Sun»"],
+          ["Sideriet tar imot besøkende i helgene, og grupper på 10 eller flere kan bestille omvisning.", [S_SATSUN, S_GROUPS], "«i helgene» with Saturday + Sunday"],
+          ["Sideriet har lørdagskveld med smaking, og grupper på 10 eller flere kan få omvisning.", [TR_SNIPPETS[0], S_GROUPS], "compound «lørdagskveld» with Saturday"],
+          ["Sideriet tar imot grupper på 10 eller flere, og man kan smake sider i den gamle låven.", [S_GROUPS, S_SUN_MAY], "«man kan smake» is not a weekday"],
+        ];
+        i = 0;
+        for (const [text, snips, label] of passes) {
+          i++;
+          const r = await post([item("vt-en-3", { visit_text: text, evidence_snippets: snips })], true);
+          assertEq([r.body.results[0].result, r.body.results[0].reason, r.body.results[0].source_language], ["would_write", undefined, "other"], `t3-p${i}: ${label} -> would_write`);
+        }
+        assertEq(row("vt-en-2").visit_text, null, "t3-z: nothing written by the t3 rejections");
       }
 
       // t5: nynorsk source -> the word-overlap gate as before.

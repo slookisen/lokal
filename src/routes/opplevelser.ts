@@ -39353,9 +39353,13 @@ function gardssalgVisitContentWords(text: string): string[] {
 
 // ── Translated sources: language heuristic + deterministic anchoring ──
 // Norwegian (bokmål + nynorsk) stop words; nynorsk must never be mistaken
-// for a foreign language (that would drop the stricter overlap gate).
+// for a foreign language (that would drop the stricter overlap gate). Broad
+// on purpose: a Norwegian page with an English cookie banner / Wix footer
+// must still count as Norwegian (PR #1498 review B1).
 const GARDSSALG_VISIT_NO_STOPWORDS: ReadonlySet<string> = new Set(
-  "og vi på til med er som av det oss ikke ikkje eg me dei kva våre vår åpent ope besøk".split(" "),
+  ("og vi på til med er som av det oss ikke ikkje eg me dei kva våre vår åpent ope besøk " +
+    "i en et ei har fra frå kan du om også eller men hver kvar her hos kl så ein eit deg din ditt sin sitt seg " +
+    "nå no blir vert dere òg").split(" "),
 );
 // Common English stop words. Words that are ALSO everyday Norwegian (for,
 // at, to, by, all, is, be, not, den, man, du …) are deliberately left out.
@@ -39409,47 +39413,116 @@ function gardssalgVisitContainsNumberToken(haystack: string, token: string): boo
   }
 }
 
-// Bokmål weekday/month names → the English forms accepted as their evidence.
-const GARDSSALG_VISIT_DAY_MONTH_MAP: ReadonlyArray<readonly [string, readonly string[]]> = [
-  ["mandag", ["monday", "mondays", "mon"]],
-  ["tirsdag", ["tuesday", "tuesdays", "tue", "tues"]],
-  ["onsdag", ["wednesday", "wednesdays", "wed"]],
-  ["torsdag", ["thursday", "thursdays", "thu", "thur", "thurs"]],
-  ["fredag", ["friday", "fridays", "fri"]],
-  ["lørdag", ["saturday", "saturdays", "sat"]],
-  ["søndag", ["sunday", "sundays", "sun"]],
-  ["januar", ["january", "jan"]],
-  ["februar", ["february", "feb"]],
-  ["mars", ["march", "mar"]],
-  ["april", ["april", "apr"]],
-  ["mai", ["may"]],
-  ["juni", ["june", "jun"]],
-  ["juli", ["july", "jul"]],
-  ["august", ["august", "aug"]],
-  ["september", ["september", "sep", "sept"]],
-  ["oktober", ["october", "oct"]],
-  ["november", ["november", "nov"]],
-  ["desember", ["december", "dec"]],
+// ── Weekday / month / weekend anchoring for translated texts ──────────
+// Each concept: the bokmål forms that put it IN the visit_text, and the
+// English forms accepted as its evidence in the snippets. The snippets are
+// also searched with the bokmål detector (a mixed-language page).
+type GardssalgVisitDayConcept = {
+  key: string;
+  /** Full bokmål name: matches the word itself, any inflection (-s, -en,
+   *  -er, -ene, -ar) and compounds (lørdagskveld, søndagsåpent). */
+  nb: string;
+  /** Bokmål abbreviations that count as standalone words. */
+  nbAbbr?: readonly string[];
+  /** Ambiguous bokmål abbreviations («man kan smake»): only next to a
+   *  hyphen/dash or directly followed by «.». */
+  nbAbbrCtx?: readonly string[];
+  /** English evidence words that are unambiguous on their own. */
+  en: readonly string[];
+  /** English evidence words that collide with common English words
+   *  («in the sun», «you may visit»): only next to a hyphen/dash or
+   *  directly followed by «.» (Sat–Sun, Sat.). */
+  enCtx?: readonly string[];
+  /** As enCtx, but ALSO accepted next to a digit («1 May», «May 17»). */
+  enCtxDigit?: readonly string[];
+};
+const GARDSSALG_VISIT_DAY_CONCEPTS: readonly GardssalgVisitDayConcept[] = [
+  { key: "monday", nb: "mandag", nbAbbrCtx: ["man"], en: ["monday", "mondays", "mon"] },
+  { key: "tuesday", nb: "tirsdag", nbAbbr: ["tirs"], nbAbbrCtx: ["tir"], en: ["tuesday", "tuesdays", "tue", "tues"] },
+  { key: "wednesday", nb: "onsdag", nbAbbr: ["ons"], en: ["wednesday", "wednesdays"], enCtx: ["wed"] },
+  { key: "thursday", nb: "torsdag", nbAbbr: ["tors"], nbAbbrCtx: ["tor"], en: ["thursday", "thursdays", "thu", "thur", "thurs"] },
+  { key: "friday", nb: "fredag", nbAbbr: ["fre"], en: ["friday", "fridays"], enCtx: ["fri"] },
+  { key: "saturday", nb: "lørdag", nbAbbr: ["lør"], en: ["saturday", "saturdays"], enCtx: ["sat"] },
+  { key: "sunday", nb: "søndag", nbAbbr: ["søn"], en: ["sunday", "sundays"], enCtx: ["sun"] },
+  { key: "january", nb: "januar", en: ["january", "jan"] },
+  { key: "february", nb: "februar", en: ["february", "feb"] },
+  { key: "march", nb: "mars", en: ["march"], enCtx: ["mar"] },
+  { key: "april", nb: "april", en: ["april", "apr"] },
+  { key: "may", nb: "mai", en: [], enCtxDigit: ["may"] },
+  { key: "june", nb: "juni", en: ["june", "jun"] },
+  { key: "july", nb: "juli", en: ["july", "jul"] },
+  { key: "august", nb: "august", en: ["august", "aug"] },
+  { key: "september", nb: "september", en: ["september", "sep", "sept"] },
+  { key: "october", nb: "oktober", en: ["october", "oct"] },
+  { key: "november", nb: "november", en: ["november", "nov"] },
+  { key: "december", nb: "desember", en: ["december", "dec"] },
 ];
-/** Inflections accepted on a weekday stem: lørdags, lørdagen, lørdager, lørdagene. */
-const GARDSSALG_VISIT_WEEKDAY_SUFFIX_RE = /^(?:|s|en|er|ene)$/;
+const GARDSSALG_VISIT_DASH_RE = /[-\u2010-\u2014]/;
 
-/** The bokmål weekday/month names in `text` with NO counterpart among the
- *  snippet words (its English form, or the same bokmål word for a mixed-
- *  language page). Weekdays also match their inflected forms. */
-function gardssalgVisitMissingDaysMonths(text: string, snippetsJoined: string): string[] {
-  const textWords = String(text ?? "").toLowerCase().match(/\p{L}+/gu) ?? [];
-  const snippetWords = String(snippetsJoined ?? "").toLowerCase().match(/\p{L}+/gu) ?? [];
-  const snippetSet = new Set(snippetWords);
-  const isForm = (w: string, nb: string): boolean =>
-    w === nb || (nb.endsWith("dag") && w.startsWith(nb) && GARDSSALG_VISIT_WEEKDAY_SUFFIX_RE.test(w.slice(nb.length)));
-  const missing: string[] = [];
-  for (const [nb, en] of GARDSSALG_VISIT_DAY_MONTH_MAP) {
-    if (!textWords.some((w) => isForm(w, nb))) continue;
-    const covered = en.some((e) => snippetSet.has(e)) || snippetWords.some((w) => isForm(w, nb));
-    if (!covered) missing.push(nb);
+type GardssalgVisitWordCtx = { w: string; dashAdj: boolean; dotAfter: boolean; digitAdj: boolean };
+/** Lower-cased letter words of `text` with the context the ambiguous forms
+ *  need: a hyphen/dash as nearest non-space neighbour, a «.» directly after,
+ *  a digit as nearest non-space neighbour. */
+function gardssalgVisitWordsWithContext(text: string): GardssalgVisitWordCtx[] {
+  const s = String(text ?? "").toLowerCase();
+  const out: GardssalgVisitWordCtx[] = [];
+  for (const m of s.matchAll(/\p{L}+/gu)) {
+    const i = m.index ?? 0;
+    const end = i + m[0].length;
+    let p = i - 1;
+    while (p >= 0 && /\s/.test(s[p])) p--;
+    let n = end;
+    while (n < s.length && /\s/.test(s[n])) n++;
+    const prev = p >= 0 ? s[p] : "";
+    const next = n < s.length ? s[n] : "";
+    out.push({
+      w: m[0],
+      dashAdj: GARDSSALG_VISIT_DASH_RE.test(prev) || GARDSSALG_VISIT_DASH_RE.test(next),
+      dotAfter: s[end] === ".",
+      digitAdj: /\p{N}/u.test(prev) || /\p{N}/u.test(next),
+    });
   }
-  return missing;
+  return out;
+}
+
+/** The weekday/month/weekend concepts a text mentions in bokmål. */
+function gardssalgVisitNbDayConcepts(words: readonly GardssalgVisitWordCtx[]): Set<string> {
+  const found = new Set<string>();
+  for (const x of words) {
+    if (x.w.startsWith("helg")) found.add("weekend");
+    for (const c of GARDSSALG_VISIT_DAY_CONCEPTS) {
+      const isWeekday = c.nb.endsWith("dag");
+      if (isWeekday ? x.w.startsWith(c.nb) : x.w === c.nb) found.add(c.key);
+      else if (c.nbAbbr?.includes(x.w)) found.add(c.key);
+      else if (c.nbAbbrCtx?.includes(x.w) && (x.dashAdj || x.dotAfter)) found.add(c.key);
+    }
+  }
+  return found;
+}
+
+/** The concepts the snippets give evidence for (English or bokmål forms). */
+function gardssalgVisitEvidenceDayConcepts(words: readonly GardssalgVisitWordCtx[]): Set<string> {
+  const found = gardssalgVisitNbDayConcepts(words);
+  for (const x of words) {
+    if (x.w === "weekend" || x.w === "weekends") found.add("weekend");
+    for (const c of GARDSSALG_VISIT_DAY_CONCEPTS) {
+      if (c.en.includes(x.w)) found.add(c.key);
+      else if (c.enCtx?.includes(x.w) && (x.dashAdj || x.dotAfter)) found.add(c.key);
+      else if (c.enCtxDigit?.includes(x.w) && (x.dashAdj || x.dotAfter || x.digitAdj)) found.add(c.key);
+    }
+  }
+  if (found.has("saturday") && found.has("sunday")) found.add("weekend");
+  return found;
+}
+
+/** The weekday/month/weekend concepts of the bokmål `text` with NO evidence
+ *  in the snippets. «helg…» needs «weekend(s)» or both a Saturday and a
+ *  Sunday form in the snippets. */
+function gardssalgVisitMissingDaysMonths(text: string, snippetsJoined: string): string[] {
+  const inText = gardssalgVisitNbDayConcepts(gardssalgVisitWordsWithContext(text));
+  if (inText.size === 0) return [];
+  const evidence = gardssalgVisitEvidenceDayConcepts(gardssalgVisitWordsWithContext(snippetsJoined));
+  return Array.from(inText).filter((k) => !evidence.has(k));
 }
 
 /** Same host, ignoring a leading "www." — the proposal's source must be the
@@ -39588,7 +39661,7 @@ export async function applyGardssalgVisitProposals(
     try {
       written = applyGardssalgProviderContent(item.provider_id, { visit_text: text }, fetched.fetchUrl);
     } catch (e: any) {
-      reject(item.provider_id, `write_failed:${String(e?.message ?? e).slice(0, 80)}`); continue;
+      reject(item.provider_id, `write_failed:${String(e?.message ?? e).slice(0, 80)}`, lang); continue;
     }
     if (!written.includes("visit_text")) { reject(item.provider_id, "write_refused_locked_or_conflict", lang); continue; }
     try { markProviderContentAttempted(item.provider_id); } catch { /* best-effort */ }
