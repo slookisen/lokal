@@ -47059,6 +47059,28 @@ runSerial(async () => {
   }
 });
 
+// A2A dev-request 2026-10-25-besokstekst-oversettelse-ikke-norske-kilder:
+// «4b-forslag» over a NON-Norwegian homepage — gardssalgVisitSourceLooksNorwegian()
+// and the translated-source gates (≥ 2 snippets, digit tokens, weekdays/
+// months) that replace word overlap there; nynorsk stays on the overlap gate;
+// kill switch GARDSSALG_VISIT_TRANSLATED_SOURCES_DISABLED. api.anthropic.com
+// is counted and asserted zero. Serial: in-memory DB + globalThis.fetch.
+runSerial(async () => {
+  console.log("\n── 2026-10-25 «4b-forslag»: gardssalg-visit translated sources ──");
+  try {
+    const { runGardssalgVisitTranslatedSourcesTests } = require("../src/services/gardssalg-visit-translated-sources.test") as
+      typeof import("../src/services/gardssalg-visit-translated-sources.test");
+    const vt = await runGardssalgVisitTranslatedSourcesTests({ log: false });
+    passed += vt.passed;
+    failed += vt.failed;
+    for (const f of vt.failures) failures.push("gardssalg-visit-translated-sources: " + f);
+    console.log(`  gardssalg-visit-translated-sources: ${vt.passed} passed, ${vt.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-visit-translated-sources: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // A2A dev-request 2026-10-16-opplevagent-katalogfakta-alder-og-title-no,
 // slice S3b: the catalogue facts proposals job on the shared proposal file
 // queue (flag OFF by default) storing through S3a's
@@ -52714,6 +52736,9 @@ runSerial(async () => {
 // Disallow in every group, hidden link on the profile pages, a hit blocks
 // e-mail for that IP for 24 h; tested in the guard, rfb api, dental and
 // experiences profile suites).
+// S-D1 adds the contact-form option per RFB profile (CONTACT_FORM_RFB, default
+// off; flagged profile → form instead of e-mail, POST /produsent/:slug/kontakt
+// forwards via a stubbed sender).
 // Switch off = byte-identical answers. Sets env
 // flags and swaps the dental db-factory (restored in finally) — runSerial,
 // tail position.
@@ -52738,6 +52763,8 @@ runSerial(async () => {
     ["email reveal ai reader ip lists", () => (require("../src/services/email-reveal-ai-reader-ip-lists.test") as typeof import("../src/services/email-reveal-ai-reader-ip-lists.test")).runEmailRevealAiReaderIpListsTests({ log: false })],
     // S-A5: the dental MCP tannlege_info on the same dental counter (switch off = byte-identical).
     ["dental mcp email reveal", () => (require("../src/routes/dental-mcp-email-reveal.test") as typeof import("../src/routes/dental-mcp-email-reveal.test")).runDentalMcpEmailRevealTests({ log: false })],
+    // S-D1: «Kontaktskjema som valg per profil» on rettfrabonden.com — agents.contact_form_only (admin POST /admin/agents/:id/contact-form-only), the form on /produsent/:slug and POST /produsent/:slug/kontakt (CONTACT_FORM_RFB; switch off = byte-identical; stubbed sender, no network).
+    ["rfb contact form only", () => (require("../src/routes/rfb-contact-form-only.test") as typeof import("../src/routes/rfb-contact-form-only.test")).runRfbContactFormOnlyTests({ log: false })],
   ] as Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]>) {
     try {
       const r = await load();
@@ -52790,6 +52817,27 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("admin-dental-write-pause: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// A2A dev-request 2026-10-26-marketplace-agents-endepunkt-ignorerer-limit
+// (re-specified 2026-10-28): GET /api/marketplace/agents keeps the 50 cap,
+// pages with limit/offset without overlap or gaps (rowid tie-break), reads a
+// negative/non-numeric offset as 0, and every row carries umbrella_type.
+// Swaps the getDb() singleton (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-26-marketplace-agents: limit/offset-paginering og umbrella_type ──");
+  try {
+    const { runMarketplaceAgentsPagingTests } = require("../src/routes/marketplace-agents-paging.test") as
+      typeof import("../src/routes/marketplace-agents-paging.test");
+    const r = await runMarketplaceAgentsPagingTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("marketplace-agents-paging: " + f);
+    console.log(`  marketplace-agents-paging: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-agents-paging: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -53742,14 +53790,15 @@ runSerial(async () => {
   }
 });
 
-// Admin order statistics, slices S1+S2: GET /admin/api/ordre/{oversikt,liste,eksport.csv},
-// GET /admin/ordre, pilot-status agreement —
+// Admin order statistics, slices S1+S2+S3: GET /admin/api/ordre/{oversikt,liste,eksport.csv},
+// GET /admin/ordre, pilot-status agreement, S3 referrals (contact_clicks, bot
+// and test clicks apart) + «levert til AI-assistent» —
 // read-only RFB order + Opplevagent gårdssalg counts, test data apart, no
 // buyer/guest data. Own in-memory lokal/experiences DBs pinned on the route
 // module, swaps ADMIN_KEY / ENABLE_EXPERIENCES (restored in finally) —
 // runSerial, tail position.
 runSerial(async () => {
-  console.log("\n── admin-order-stats: GET /admin/api/ordre/{oversikt,liste,eksport.csv} + /admin/ordre (S1+S2) ──");
+  console.log("\n── admin-order-stats: GET /admin/api/ordre/{oversikt,liste,eksport.csv} + /admin/ordre (S1+S2+S3) ──");
   try {
     const { runAdminOrderStatsTests } = require("../src/routes/admin-order-stats.test") as
       typeof import("../src/routes/admin-order-stats.test");
@@ -53823,6 +53872,28 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("claim-auto-approval-audit-e1: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-11-10-rfb-registreringer-og-eierkrav-folges-opp S4a: a
+// verified owner sees «Under godkjenning» (200, noindex, private) instead of
+// the 404 on their own unvetted self-registered profile
+// (OWNER_PENDING_PROFILE_VIEW_ENABLED, default off); everyone else keeps the
+// 404. Own in-memory DB pinned on getDb(), swaps the flag (restored in
+// finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── S4a: eier ser «Under godkjenning» på egen profil ──");
+  try {
+    const { runOwnerPendingProfileViewS4aTests } = require("../src/routes/owner-pending-profile-view-s4a.test") as
+      typeof import("../src/routes/owner-pending-profile-view-s4a.test");
+    const r = await runOwnerPendingProfileViewS4aTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-pending-profile-view-s4a: " + f);
+    console.log(`  owner-pending-profile-view-s4a: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-pending-profile-view-s4a: unexpected error: " + String(err?.message || err));
   }
 });
 

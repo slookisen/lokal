@@ -23,6 +23,16 @@
  *   S2-PS   GET /admin/orders/pilot-status keeps its shape and its 30-day
  *           counts match oversikt (real + test) on a DB seeded relative to now
  *
+ * Slice S3 (same harness): RFB referrals (contact_clicks, /ut/) + «levert
+ * til AI-assistent» (profile_ai_deliveries) in oversikt, CSV and page
+ *   S3-AC6  a click with a known bot UA (parseUserAgent, the classifier that
+ *           stamps contact_clicks.is_bot) is not in the main click count but
+ *           is in the separate bot count
+ *   S3-SQL  clicks per type and per period equal a direct SQL count
+ *   S3-AI   AI deliveries are a separate block, never added to clicks
+ *   S3-TEST test-producer clicks / deliveries are in their own row
+ *   S3-AC2  no IP hash, session id, UA, utm or e-mail in any response / CSV
+ *
  * Standalone: npx tsx src/routes/admin-order-stats.test.ts
  * Wired into `npm test` by tests/test.ts.
  */
@@ -63,7 +73,8 @@ export async function runAdminOrderStatsTests(opts: { log?: boolean } = {}): Pro
   const svc = require("../services/admin-order-stats") as typeof import("../services/admin-order-stats");
   const adminOrdersMod = require("./admin-orders") as typeof import("./admin-orders");
 
-  const ENV_KEYS = ["ADMIN_KEY", "ANALYTICS_ADMIN_KEY", "ENABLE_EXPERIENCES"];
+  const analytics = require("../services/analytics-service") as typeof import("../services/analytics-service");
+  const ENV_KEYS = ["ADMIN_KEY", "ANALYTICS_ADMIN_KEY", "ENABLE_EXPERIENCES", "PROFILE_AI_DELIVERIES_COUNTING_SINCE"];
   const prevEnv: Record<string, string | undefined> = {};
   for (const k of ENV_KEYS) prevEnv[k] = process.env[k];
   const ADMIN_KEY = "order-stats-test-admin-key";
@@ -135,6 +146,40 @@ export async function runAdminOrderStatsTests(opts: { log?: boolean } = {}): Pro
     insHandoff.run("h2", "ag-b", "2026-10-11 10:00:00");
     insHandoff.run("h3", "ag-a", "2026-09-01 10:00:00"); // outside
     insHandoff.run("h4", "ag-test", "2026-11-01 10:00:00");
+
+    // ── Seed RFB clicks (S3) ───────────────────────────────────────────────
+    // is_bot is stamped exactly as routes/contact-tracking.ts recordClick()
+    // does: parseUserAgent(ua).isBot. session_id has the production shape
+    // "<ipHash>:<userAgent>" and must never reach a response.
+    const UA_HUMAN = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1";
+    const UA_GPTBOT = "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; GPTBot/1.2; +https://openai.com/gptbot)";
+    const UA_CURL = "curl/8.4.0";
+    const insClick = db.prepare(`INSERT INTO contact_clicks (agent_id, kind, session_id, is_bot, utm_source, ai_source, created_at)
+                                 VALUES (?, ?, ?, ?, ?, ?, ?)`);
+    const click = (agent: string, kind: string, ua: string, created: string, utm: string | null = null, ai: string | null = null) =>
+      insClick.run(agent, kind, "iphashHEMMELIGSESJON:" + ua, analytics.parseUserAgent(ua).isBot ? 1 : 0, utm, ai, created);
+    click("ag-a", "website", UA_HUMAN, "2026-11-01 10:00:00", "chatgpt.com-utmkilde", "chatgpt");
+    click("ag-a", "website", UA_HUMAN, "2026-11-01 11:00:00");
+    click("ag-a", "external:facebook", UA_HUMAN, "2026-11-02 09:00:00");
+    click("ag-b", "external:instagram", UA_HUMAN, "2026-11-03 09:00:00");
+    click("ag-b", "phone", UA_HUMAN, "2026-11-03 12:00:00");
+    click("ag-a", "email", UA_HUMAN, "2026-10-20 08:00:00");
+    click("ag-a", "website", UA_GPTBOT, "2026-11-01 12:00:00");          // AC6: known bot UA
+    click("ag-b", "phone", UA_CURL, "2026-11-04 12:00:00");              // script → bot
+    click("ag-test", "website", UA_HUMAN, "2026-11-02 10:00:00");       // test producer
+    click(svc.RFB_LEGACY_TEST_AGENT_ID, "email", UA_HUMAN, "2026-11-05 10:00:00"); // legacy test producer
+    click("ag-test", "website", UA_GPTBOT, "2026-11-02 11:00:00");      // bot at the test producer → bot row
+    click("ag-a", "website", UA_HUMAN, "2026-09-15 10:00:00");          // outside the period
+
+    // ── Seed AI deliveries (S3) ────────────────────────────────────────────
+    const insDel = db.prepare(`INSERT INTO profile_ai_deliveries (vertical_id, profile_id, day, channel, ai_vendor, count) VALUES (?, ?, ?, ?, ?, ?)`);
+    insDel.run("rfb", "ag-a", "2026-11-01", "ai_page_list", "chatgpt", 5);
+    insDel.run("rfb", "ag-a", "2026-11-02", "mcp", "claude", 3);
+    insDel.run("rfb", "ag-b", "2026-11-02", "ai_page_profile", "perplexity", 2);
+    insDel.run("rfb", "ag-test", "2026-11-02", "mcp", "claude", 4);          // test producer
+    insDel.run("rfb", "ag-a", "2026-10-20", "a2a", "other", 7);             // before the counting start (2026-10-26)
+    insDel.run("dental", "clinic-x", "2026-11-02", "ai_page_list", "chatgpt", 9); // other vertical
+    insDel.run("rfb", "ag-a", "2026-11-09", "mcp", "chatgpt", 1);           // after til
 
     // ── Seed Opplevagent gårdssalg ─────────────────────────────────────────
     const insProv = exp.prepare(`INSERT INTO experience_providers (id, navn, vertical, enrichment_state, verification_status, source, confidence)
@@ -449,10 +494,14 @@ export async function runAdminOrderStatsTests(opts: { log?: boolean } = {}): Pro
       const header = rows[0];
       assertEq(header, [...svc.CSV_COLUMNS], "s2-ac8: header = the aggregate columns");
       for (const c of header) assertTrue(!/(^id$|_id$|ref|order|booking|bestilling)/i.test(c), `s2-ac8: no order id/ref column (${c})`);
-      const data = rows.slice(1);
+      const dataAll = rows.slice(1);
       const ovA = (await req("GET", `/admin/api/ordre/oversikt?plattform=alle&${P}&oppl=dag`, K)).body;
-      const expected = svc.oversiktCsvRows({ plattform: "alle", periode: { fra: ovA.periode.fra, til: ovA.periode.til, til_eksklusiv: "" }, oppl: "dag", rfb: ovA.rfb, gardssalg: ovA.gardssalg });
-      assertEq(data.length, expected.length, "s2-ac8: CSV row count = aggregate rows of the oversikt body");
+      const expected = svc.oversiktCsvRows({ plattform: "alle", periode: { fra: ovA.periode.fra, til: ovA.periode.til, til_eksklusiv: "" }, oppl: "dag",
+        rfb: ovA.rfb, gardssalg: ovA.gardssalg, henvisninger: ovA.henvisninger, ai_leveranser: ovA.ai_leveranser });
+      assertEq(dataAll.length, expected.length, "s2-ac8: CSV row count = aggregate rows of the oversikt body");
+      // The S2 order rows (S3's henvisninger_* / ai_leveranser_* rows are checked in the S3 block).
+      const isS3 = (d: string[]) => /^(henvisninger_|ai_leveranser_)/.test(d[2]);
+      const data = dataAll.filter((d) => !isS3(d));
       // Independent count of the aggregate rows from the oversikt numbers.
       const rf = ovA.rfb, gs = ovA.gardssalg;
       const rfbRows = 1 + 1 + Object.keys(rf.by_status).length + 1 + 2 * rf.producers.length + 2 * rf.series.length + 4 + 1 + 1
@@ -462,15 +511,15 @@ export async function runAdminOrderStatsTests(opts: { log?: boolean } = {}): Pro
       assertEq(data.length, rfbRows + gsRows, "s2-ac8: row count = independent aggregate count");
       assertEq(data.length, 215, "s2-ac8: 215 aggregate rows for the seeded period (39 days, dag)");
       assertTrue(data.length < 2 * 39 + 200, "s2-ac8: rows are aggregates, not one per order");
-      assertTrue(data.every((d) => d.length === header.length), "s2-ac8: every row has every column");
+      assertTrue(dataAll.every((d) => d.length === header.length), "s2-ac8: every row has every column");
       const orderIds = ["o1", "o2", "o3", "o4", "o5", "o6", "o7", "o8", "t1", "t2", "t3", "g1", "g2", "g3", "g4", "g5", "g6", "gt1", "gt2",
         "GS-G1", "GS-G2", "GS-GT1", "e1", "i1", "h1"];
-      assertTrue(data.every((d) => d.every((c) => !orderIds.includes(c))), "s2-ac8: no order / booking / item / event / handoff id as a cell");
+      assertTrue(dataAll.every((d) => d.every((c) => !orderIds.includes(c))), "s2-ac8: no order / booking / item / event / handoff id as a cell");
       const vi = header.indexOf("verdi");
-      assertTrue(data.every((d) => d[vi] === "" || /^-?\d+(\.\d+)?$/.test(d[vi])), "s2-ac8: every verdi is a number (or empty)");
+      assertTrue(dataAll.every((d) => d[vi] === "" || /^-?\d+(\.\d+)?$/.test(d[vi])), "s2-ac8: every verdi is a number (or empty)");
       const mi = header.indexOf("maal");
-      const allowedMaal = ["tilgjengelig", "antall", "antall_naa", "sum_nok", "sum_personer", "maalt", "uten_svar", "median_timer", "snitt_timer"];
-      assertTrue(data.every((d) => allowedMaal.includes(d[mi])), "s2-ac8: every maal is an aggregate measure");
+      const allowedMaal = ["tilgjengelig", "antall", "antall_naa", "sum_nok", "sum_personer", "maalt", "uten_svar", "median_timer", "snitt_timer", "antall_klikk", "levert_til_ai"];
+      assertTrue(dataAll.every((d) => allowedMaal.includes(d[mi])), "s2-ac8: every maal is an aggregate measure");
       const find = (pl: string, om: string, kat: string, key: string, maal: string) =>
         data.find((d) => d[0] === pl && d[1] === om && d[2] === kat && d[3] === key && d[5] === maal)?.[vi];
       assertEq(find("rfb", "ekte", "total", "", "antall"), "7", "s2-ac8: rfb total matches oversikt");
@@ -568,8 +617,184 @@ export async function runAdminOrderStatsTests(opts: { log?: boolean } = {}): Pro
       routeMod.__setAdminOrderStatsNowForTesting(NOW);
     }
 
+    // ══ Slice S3 ════════════════════════════════════════════════════════════
+    const ov3 = (await req("GET", `/admin/api/ordre/oversikt?plattform=alle&${P}&oppl=dag`, K)).body;
+    const henv = ov3.henvisninger?.rfb;
+    const aiDel = ov3.ai_leveranser?.rfb;
+
+    // ── S3-AC6: bot clicks out of the main count, in the bot count ─────────
+    {
+      assertTrue(analytics.parseUserAgent(UA_GPTBOT).isBot && !analytics.parseUserAgent(UA_HUMAN).isBot, "s3-ac6: fixture UAs classified by the existing parseUserAgent (bot / human)");
+      assertTrue(henv && henv.available === true, "s3-ac6: henvisninger.rfb present for plattform=alle");
+      assertEq(henv.by_type.nettside, 2, "s3-ac6: the GPTBot website click is NOT in the main nettside count (2 human clicks)");
+      assertEq(henv.bot.total, 3, "s3-ac6: bot count holds GPTBot + curl + GPTBot at the test producer");
+      assertEq(henv.bot.by_type.nettside, 2, "s3-ac6: the GPTBot website clicks ARE in the bot nettside count");
+      assertEq(henv.bot.by_type.telefon, 1, "s3-ac6: the curl phone click is in the bot telefon count");
+      assertEq(henv.series.find((s: any) => s.bucket === "2026-11-01")?.by_type.nettside, 2, "s3-ac6: bot click not in the day series either");
+      const allRows = (db.prepare("SELECT COUNT(*) AS n FROM contact_clicks WHERE created_at >= ? AND created_at < ?").get("2026-10-01", "2026-11-09") as any).n;
+      assertEq(henv.total + henv.bot.total + henv.test.total, allRows, "s3-ac6: main + bot + test = every click in the period (no double count)");
+    }
+
+    // ── S3-SQL: per type and per period = direct SQL ───────────────────────
+    {
+      const range = ["2026-10-01", "2026-11-09"];
+      const notTest = `NOT (COALESCE(a.origin,'') IN ('test_fixture','test_claim_fixture') OR c.agent_id = '${svc.RFB_LEGACY_TEST_AGENT_ID}')`;
+      const typeCase = `CASE WHEN c.kind = 'website' THEN 'nettside' WHEN c.kind = 'phone' THEN 'telefon' WHEN c.kind = 'email' THEN 'e_post'
+                             WHEN c.kind LIKE 'external:%' THEN 'sosiale_medier' ELSE 'annet' END`;
+      const sqlType = db.prepare(`SELECT ${typeCase} AS t, COUNT(*) AS n FROM contact_clicks c LEFT JOIN agents a ON a.id = c.agent_id
+        WHERE c.created_at >= ? AND c.created_at < ? AND c.is_bot = 0 AND ${notTest} GROUP BY t`).all(...range) as Array<{ t: string; n: number }>;
+      for (const r of sqlType) assertEq(henv.by_type[r.t], r.n, `s3-sql: by_type.${r.t} = SQL`);
+      assertEq(henv.total, sqlType.reduce((a, r) => a + r.n, 0), "s3-sql: total = SQL");
+      assertEq(henv.by_type, { nettside: 2, sosiale_medier: 2, telefon: 1, e_post: 1, annet: 0 }, "s3-sql: by_type zero-filled (6 human clicks c1–c6)");
+      assertEq(henv.sosiale_medier_per_kanal, { facebook: 1, instagram: 1 }, "s3-sql: social clicks per external channel");
+      const sqlDay = db.prepare(`SELECT date(c.created_at) AS d, COUNT(*) AS n FROM contact_clicks c LEFT JOIN agents a ON a.id = c.agent_id
+        WHERE c.created_at >= ? AND c.created_at < ? AND c.is_bot = 0 AND ${notTest} GROUP BY d`).all(...range) as Array<{ d: string; n: number }>;
+      for (const r of sqlDay) assertEq(henv.series.find((s: any) => s.bucket === r.d)?.total, r.n, `s3-sql: day ${r.d} = SQL`);
+      assertEq(henv.series.length, 39, "s3-sql: zero-filled day series (same buckets as the orders)");
+      assertEq(henv.series.reduce((a: number, s: any) => a + s.total, 0), henv.total, "s3-sql: series sums to total");
+      const wk = (await req("GET", `/admin/api/ordre/oversikt?plattform=rfb&${P}&oppl=uke`, K)).body.henvisninger.rfb;
+      const sqlWeek = db.prepare(`SELECT date(c.created_at, 'weekday 0', '-6 days') AS w, COUNT(*) AS n FROM contact_clicks c LEFT JOIN agents a ON a.id = c.agent_id
+        WHERE c.created_at >= ? AND c.created_at < ? AND c.is_bot = 0 AND ${notTest} GROUP BY w`).all(...range) as Array<{ w: string; n: number }>;
+      for (const r of sqlWeek) assertEq(wk.series.find((s: any) => s.bucket === r.w)?.total, r.n, `s3-sql: week ${r.w} = SQL`);
+      assertEq(wk.series[0].bucket, "2026-09-28", "s3-sql: week buckets start on the Monday of fra's week");
+      const mo = (await req("GET", `/admin/api/ordre/oversikt?plattform=rfb&${P}&oppl=maaned`, K)).body.henvisninger.rfb;
+      assertEq(mo.series.map((s: any) => [s.bucket, s.total]), [["2026-10", 1], ["2026-11", 5]], "s3-sql: month buckets");
+      const narrow = (await req("GET", `/admin/api/ordre/oversikt?plattform=rfb&fra=2026-11-01&til=2026-11-01`, K)).body.henvisninger.rfb;
+      assertEq([narrow.total, narrow.by_type.nettside, narrow.bot.total], [2, 2, 1], "s3-sql: one-day period (fra = til) counts that day only");
+      // Per-type explanations exist for the page / API reader.
+      assertTrue(Object.keys(henv.by_type).every((t) => typeof henv.type_forklaring[t] === "string" && henv.type_forklaring[t].length > 0), "s3-sql: every type carries a Norwegian explanation");
+      assertTrue(typeof henv.forklaring === "string" && typeof henv.bot.forklaring === "string" && typeof henv.test.forklaring === "string", "s3-sql: every block carries a forklaring");
+    }
+
+    // ── S3-TEST: test-producer clicks in their own row ─────────────────────
+    {
+      assertEq([henv.test.total, henv.test.by_type.nettside, henv.test.by_type.e_post], [2, 1, 1], "s3-test: test row holds ag-test website + legacy email");
+      assertEq(henv.test.producers.map((p: any) => p.agent_id).sort(), ["ag-test", svc.RFB_LEGACY_TEST_AGENT_ID].sort(), "s3-test: test producers listed in the test row");
+      const testSql = (db.prepare(`SELECT COUNT(*) AS n FROM contact_clicks c LEFT JOIN agents a ON a.id = c.agent_id
+        WHERE c.created_at >= ? AND c.created_at < ? AND c.is_bot = 0 AND (COALESCE(a.origin,'') IN ('test_fixture','test_claim_fixture') OR c.agent_id = ?)`)
+        .get("2026-10-01", "2026-11-09", svc.RFB_LEGACY_TEST_AGENT_ID) as any).n;
+      assertEq(henv.test.total, testSql, "s3-test: test row = SQL");
+      assertEq(henv.series.find((s: any) => s.bucket === "2026-11-02")?.total, 1, "s3-test: test click not in the day series (only c3 on 2026-11-02)");
+      assertEq([aiDel.test.total, aiDel.test.by_channel.mcp], [4, 4], "s3-test: test-producer AI deliveries in their own row");
+    }
+
+    // ── S3-AI: AI deliveries separate, never added to clicks ───────────────
+    {
+      assertTrue(aiDel && aiDel.available === true, "s3-ai: ai_leveranser.rfb present");
+      assertEq(aiDel.etikett, "levert til AI-assistent", "s3-ai: labelled «levert til AI-assistent»");
+      assertEq(aiDel.total, 10, "s3-ai: 5 + 3 + 2 (test, before counting start, other vertical and after til excluded)");
+      const aiSql = (db.prepare(`SELECT SUM(d.count) AS n FROM profile_ai_deliveries d LEFT JOIN agents a ON a.id = d.profile_id
+        WHERE d.vertical_id = 'rfb' AND d.day >= ? AND d.day <= ?
+          AND NOT (COALESCE(a.origin,'') IN ('test_fixture','test_claim_fixture') OR d.profile_id = ?)`)
+        .get("2026-10-26", "2026-11-08", svc.RFB_LEGACY_TEST_AGENT_ID) as any).n;
+      assertEq(aiDel.total, aiSql, "s3-ai: total = SQL (from the counting start)");
+      assertEq(aiDel.counting_since, "2026-10-26", "s3-ai: counting_since reported");
+      assertEq(aiDel.by_channel, { ai_page_list: 5, ai_page_profile: 2, mcp: 3, a2a: 0 }, "s3-ai: per channel");
+      assertEq(aiDel.by_vendor, { chatgpt: 5, claude: 3, perplexity: 2, other: 0, unknown: 0 }, "s3-ai: per AI");
+      assertEq(aiDel.series.find((s: any) => s.bucket === "2026-11-02")?.total, 5, "s3-ai: day series (3 + 2, test excluded)");
+      assertEq(aiDel.series.reduce((a: number, s: any) => a + s.total, 0), aiDel.total, "s3-ai: series sums to total");
+      assertEq(henv.total, 6, "s3-ai: click total unchanged by the 10 deliveries (not summed)");
+      assertTrue(!("ai_leveranser" in henv) && !("henvisninger" in aiDel) && !("total" in ov3.henvisninger) , "s3-ai: two separate blocks, no combined click+delivery number");
+      assertTrue(ov3.rfb.total === 7 && Object.keys(ov3.rfb).every((k: string) => !/henvis|ai_lev/.test(k)), "s3-ai: the S1 rfb order block is unchanged");
+      const gsOnly = (await req("GET", `/admin/api/ordre/oversikt?plattform=gardssalg&${P}`, K)).body;
+      assertTrue(gsOnly.henvisninger === undefined && gsOnly.ai_leveranser === undefined, "s3-ai: plattform=gardssalg has no RFB click / AI blocks");
+      const rfbOnly = (await req("GET", `/admin/api/ordre/oversikt?plattform=rfb&${P}`, K)).body;
+      assertTrue(rfbOnly.henvisninger.rfb.total === 6 && rfbOnly.ai_leveranser.rfb.total === 10, "s3-ai: plattform=rfb has both blocks");
+    }
+
+    // ── S3 CSV: aggregate rows, clicks and deliveries in separate measures ─
+    {
+      const r = await reqH("GET", `${CSV}?plattform=alle&${P}&oppl=dag`, K);
+      const rows = parseCsv(r.text.replace(/^﻿/, ""));
+      const header = rows[0];
+      const data = rows.slice(1).filter((d) => /^(henvisninger_|ai_leveranser_)/.test(d[2]));
+      const vi = header.indexOf("verdi");
+      const find = (om: string, kat: string, key: string, maal: string) =>
+        data.find((d) => d[0] === "rfb" && d[1] === om && d[2] === kat && d[3] === key && d[5] === maal)?.[vi];
+      assertEq(find("ekte", "henvisninger_total", "", "antall_klikk"), "6", "s3-csv: main click total");
+      assertEq(find("bot", "henvisninger_total", "", "antall_klikk"), "3", "s3-csv: bot clicks in their own row");
+      assertEq(find("test", "henvisninger_total", "", "antall_klikk"), "2", "s3-csv: test clicks in their own row");
+      assertEq(find("ekte", "henvisninger_type", "nettside", "antall_klikk"), "2", "s3-csv: per type");
+      assertEq(find("ekte", "henvisninger_sosiale_medier", "facebook", "antall_klikk"), "1", "s3-csv: social per channel");
+      assertEq(find("ekte", "ai_leveranser_total", "", "levert_til_ai"), "10", "s3-csv: AI deliveries total");
+      assertEq(find("ekte", "ai_leveranser_ai", "claude", "levert_til_ai"), "3", "s3-csv: AI deliveries per AI");
+      assertEq(find("test", "ai_leveranser_total", "", "levert_til_ai"), "4", "s3-csv: test AI deliveries apart");
+      assertTrue(data.filter((d) => d[2].startsWith("henvisninger_")).every((d) => d[5] === "antall_klikk" || d[5] === "tilgjengelig")
+        && data.filter((d) => d[2].startsWith("ai_leveranser_")).every((d) => d[5] === "levert_til_ai" || d[5] === "tilgjengelig"),
+        "s3-csv: clicks and AI deliveries use different measures (never one sum)");
+      const expectedS3 = 2 + 5 + 2 + 39 + 1 + 5 + 1 + 5 + 2   // henvisninger: flag, total, 5 types, 2 social, 39 days, bot total+5, test total+5, 2 test producers
+        + 2 + 4 + 5 + 39 + 1 + 4;                              // ai_leveranser: flag, total, 4 channels, 5 AIs, 39 days, test total+4 channels
+      assertEq(data.length, expectedS3, "s3-csv: S3 aggregate row count");
+      const gsCsv = parseCsv((await reqH("GET", `${CSV}?plattform=gardssalg&${P}`, K)).text.replace(/^﻿/, "")).slice(1);
+      assertTrue(gsCsv.every((d) => !/^(henvisninger_|ai_leveranser_)/.test(d[2])), "s3-csv: plattform=gardssalg exports no S3 rows");
+    }
+
+    // ── S3-AC2 / AC1: no personal data, auth unchanged ─────────────────────
+    {
+      const jsonTexts: string[] = [];
+      const csvTexts3: string[] = [];
+      for (const pl of ["alle", "rfb"]) {
+        for (const o of ["dag", "uke", "maaned"]) {
+          jsonTexts.push((await req("GET", `/admin/api/ordre/oversikt?plattform=${pl}&${P}&oppl=${o}`, K)).text);
+          csvTexts3.push((await reqH("GET", `${CSV}?plattform=${pl}&${P}&oppl=${o}`, K)).text);
+        }
+      }
+      const all = [...jsonTexts, ...csvTexts3].join("\n");
+      const jsonAll = jsonTexts.join("\n");
+      const csvAll = csvTexts3.join("\n");
+      for (const v of ["iphash", "HEMMELIG", "Mozilla", "iPhone", "GPTBot", "curl/", "chatgpt.com-utmkilde", BUYER.name, BUYER.email, GUEST.name]) {
+        assertTrue(!all.includes(v), `s3-ac2: no «${v}» (IP hash / session id / UA / utm / buyer) in any response or CSV`);
+      }
+      for (const f of ["session_id", "utm_source", "ai_source", "is_bot", "user_agent", "buyer_", "guest_", "delivery_note", "notes"]) {
+        assertTrue(!jsonAll.includes(`"${f}"`) && !csvAll.includes(f), `s3-ac2: no field named ${f}`);
+      }
+      assertTrue(!/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/.test(all), "s3-ac2: no e-mail address pattern anywhere");
+      assertTrue(!/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/.test(all), "s3-ac2: no IP address pattern anywhere");
+      assertEq((await req("GET", `/admin/api/ordre/oversikt?plattform=rfb&${P}`)).status, 401, "s3-ac1: oversikt without key -> 401");
+      assertEq((await reqH("GET", `${CSV}?plattform=rfb&${P}`)).status, 401, "s3-ac1: eksport.csv without key -> 401");
+      const noKey = await req("GET", `/admin/api/ordre/oversikt?plattform=rfb&${P}`);
+      assertTrue(!noKey.text.includes("henvisninger") && !noKey.text.includes("ai_leveranser"), "s3-ac1: 401 body carries no S3 data");
+      for (const m of ["POST", "PUT", "DELETE", "PATCH"]) {
+        const r = await req(m, `/admin/api/ordre/oversikt?plattform=rfb&${P}`, K);
+        assertTrue(r.status === 404 || r.status === 405, `s3-ac1: ${m} oversikt not handled (${r.status})`);
+      }
+    }
+
+    // ── S3 page ────────────────────────────────────────────────────────────
+    {
+      const page = (await reqH("GET", "/admin/ordre")).text;
+      assertTrue(page.includes("henvisninger") && page.includes("Levert til AI-assistent") && page.includes("Bot-klikk"), "s3-page: section for clicks, bot clicks and «levert til AI-assistent»");
+      assertTrue(page.includes("ikke lagt sammen med klikkene"), "s3-page: explains AI deliveries are not added to clicks");
+      assertTrue(!/\.innerHTML\s*=|insertAdjacentHTML|document\.write/.test(page), "s3-page: still no HTML strings written into the DOM");
+      assertTrue(!/method:\s*'(POST|PUT|PATCH|DELETE)'/i.test(page), "s3-page: still no write calls");
+    }
+
+    // ── S3 counting-start override + unavailable tables ────────────────────
+    {
+      process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE = "2026-10-01";
+      const early = (await req("GET", `/admin/api/ordre/oversikt?plattform=rfb&${P}`, K)).body.ai_leveranser.rfb;
+      assertEq([early.total, early.by_channel.a2a, early.counting_since], [17, 7, "2026-10-01"], "s3-ai: the configured counting start is honoured");
+      delete process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE;
+      const bare = new Database(":memory:");
+      try {
+        bare.exec("CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, origin TEXT)");
+        const per = svc.parseOversiktParams({ fra: "2026-11-01", til: "2026-11-02" }, NOW);
+        if (per.ok) {
+          const h = svc.computeRfbReferrals(bare, per.params.periode, "dag");
+          const a = svc.computeRfbAiDeliveries(bare, per.params.periode, "dag");
+          assertTrue(h.available === false && a.available === false, "s3: missing tables → available=false, no throw");
+          const csvRows = svc.oversiktCsvRows({ plattform: "rfb", periode: per.params.periode, oppl: "dag", henvisninger: { rfb: h }, ai_leveranser: { rfb: a } });
+          assertEq(csvRows.map((x) => [x.kategori, x.verdi]), [["henvisninger_tilgjengelig", 0], ["ai_leveranser_tilgjengelig", 0]], "s3: unavailable → one 0 flag row each");
+        } else assertTrue(false, "s3: period parses");
+      } finally { bare.close(); }
+      assertEq(svc.henvisningType("external:tiktok"), "sosiale_medier", "s3: external:<type> → sosiale_medier");
+      assertEq(svc.henvisningType("weird"), "annet", "s3: unknown kind → annet");
+    }
+
     // Read-only: nothing changed in either DB.
     {
+      assertEq((db.prepare("SELECT COUNT(*) AS n FROM contact_clicks").get() as any).n, 12, "ro: contact_clicks unchanged");
+      assertEq((db.prepare("SELECT COUNT(*) AS n FROM profile_ai_deliveries").get() as any).n, 7, "ro: profile_ai_deliveries unchanged");
       assertEq((db.prepare("SELECT COUNT(*) AS n FROM orders").get() as any).n, 11, "ro: orders unchanged");
       assertEq((exp.prepare("SELECT COUNT(*) AS n FROM gardssalg_bookings").get() as any).n, 8, "ro: bookings unchanged");
     }

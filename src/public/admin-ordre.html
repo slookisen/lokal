@@ -51,7 +51,7 @@ tr.test td{color:var(--warn);font-style:italic}
 <div class="login-screen" id="loginScreen">
   <div class="login-card">
     <h1>Ordreoversikt</h1>
-    <div class="subtitle">Bestillinger og besøksforespørsler — kun lesing</div>
+    <div class="subtitle">Bestillinger, besøksforespørsler og henvisninger — kun lesing</div>
     <input type="password" id="adminKey" placeholder="Admin-nøkkel" autofocus>
     <button data-action="login">Logg inn</button>
     <div class="login-error" id="loginError"></div>
@@ -95,6 +95,18 @@ tr.test td{color:var(--warn);font-style:italic}
     <div id="rfbBody"></div>
   </section>
 
+  <section id="secRfbHenv">
+    <h2>Rett fra Bonden — henvisninger (klikk videre til produsenten)</h2>
+    <div class="lead" id="henvLead"></div>
+    <div id="henvBody"></div>
+  </section>
+
+  <section id="secRfbAi">
+    <h2>Rett fra Bonden — levert til AI-assistent</h2>
+    <div class="lead" id="aiLead"></div>
+    <div id="aiBody"></div>
+  </section>
+
   <section id="secGs">
     <h2>Opplevagent — gårdssalg</h2>
     <div class="lead" id="gsLead"></div>
@@ -127,6 +139,12 @@ const STATUS_NO = {
   awaiting_provider: 'Venter på produsent', provider_confirmed: 'Produsent bekreftet', provider_declined: 'Produsent avslo',
   time_suggested: 'Nytt tidspunkt foreslått', expired: 'Utløpt'
 };
+const HENV_NO = { nettside: 'Nettside', sosiale_medier: 'Sosiale medier', telefon: 'Telefon', e_post: 'E-post', annet: 'Annet' };
+const AI_KANAL_NO = {
+  ai_page_list: 'Listeside hentet av AI-assistent', ai_page_profile: 'Profilside hentet av AI-assistent',
+  mcp: 'MCP-verktøysvar', a2a: 'A2A-svar', annet: 'Annet'
+};
+const AI_NO = { chatgpt: 'ChatGPT', claude: 'Claude', perplexity: 'Perplexity', other: 'Annen AI', unknown: 'Ukjent AI' };
 const OPPL_NO = { dag: 'dag', uke: 'uke (mandag–søndag)', maaned: 'måned' };
 
 function el(tag, opts, children) {
@@ -279,6 +297,59 @@ function renderRfb(r, target) {
   target.appendChild(el('div', { cls: 'note', text: 'Bestillinger per tidsbolk etter innsendingsdato (UTC), uten testdata.' }));
 }
 
+// Slice S3: clicks (contact_clicks, /ut/). Bot and test clicks are shown
+// in their own rows, never in the main number.
+function renderHenv(h, target) {
+  target.replaceChildren();
+  document.getElementById('henvLead').textContent = h.forklaring;
+  if (!h.available) {
+    (h.merknader || []).forEach(m => target.appendChild(el('div', { cls: 'note', text: m })));
+    return;
+  }
+  target.appendChild(el('div', { cls: 'cards' }, [
+    card(fmtNum(h.total), 'Klikk fra folk', 'Klikk på nettside, sosiale medier, telefon eller e-post på produsentsidene i perioden, uten bot-klikk og uten testprodusenten.'),
+    card(fmtNum(h.bot.total), 'Bot-klikk (ikke med)', h.bot.forklaring),
+    card(fmtNum(h.test.total), 'Testklikk (ikke med)', h.test.forklaring)
+  ]));
+  target.appendChild(el('h3', { text: 'Per type' }));
+  const typeRows = Object.keys(h.by_type).map(t => ({ cells: [HENV_NO[t] || t, (h.type_forklaring && h.type_forklaring[t]) || '', fmtNum(h.by_type[t]), fmtNum(h.bot.by_type[t]), fmtNum(h.test.by_type[t])] }));
+  target.appendChild(table(['Type', 'Hva det teller', 'Klikk fra folk', 'Bot-klikk', 'Testklikk'], typeRows, 2));
+  target.appendChild(el('div', { cls: 'note', text: 'Bot-klikk og testklikk er tatt med her bare for å vise hva som er holdt utenfor; de er ikke med i «Klikk fra folk».' }));
+  const social = Object.keys(h.sosiale_medier_per_kanal || {});
+  if (social.length) {
+    target.appendChild(el('h3', { text: 'Sosiale medier per kanal' }));
+    target.appendChild(table(['Kanal', 'Klikk fra folk'], social.map(k => ({ cells: [k, fmtNum(h.sosiale_medier_per_kanal[k])] })), 1));
+  }
+  target.appendChild(el('h3', { text: 'Per tidsbolk' }));
+  target.appendChild(table(['Bolk', 'Klikk fra folk', 'Nettside', 'Sosiale medier', 'Telefon', 'E-post'],
+    h.series.map(s => ({ cells: [s.bucket, fmtNum(s.total), fmtNum(s.by_type.nettside), fmtNum(s.by_type.sosiale_medier), fmtNum(s.by_type.telefon), fmtNum(s.by_type.e_post)] })), 1));
+  (h.merknader || []).forEach(m => target.appendChild(el('div', { cls: 'note', text: m })));
+}
+
+// Slice S3: «levert til AI-assistent» (profile_ai_deliveries). A separate
+// number — never added to the clicks above.
+function renderAi(a, target) {
+  target.replaceChildren();
+  document.getElementById('aiLead').textContent = a.forklaring;
+  if (!a.available) {
+    (a.merknader || []).forEach(m => target.appendChild(el('div', { cls: 'note', text: m })));
+    return;
+  }
+  target.appendChild(el('div', { cls: 'cards' }, [
+    card(fmtNum(a.total), 'Levert til AI-assistent', 'Ganger en produsentprofil var med i det vi leverte til en AI-assistent. Ikke klikk, og ikke lagt sammen med klikkene.'),
+    card(fmtNum(a.test.total), 'Testprodusent (ikke med)', a.test.forklaring)
+  ]));
+  target.appendChild(el('h3', { text: 'Per kanal' }));
+  target.appendChild(table(['Kanal', 'Kode', 'Levert til AI-assistent'],
+    Object.keys(a.by_channel).map(c => ({ cells: [AI_KANAL_NO[c] || c, c, fmtNum(a.by_channel[c])] })), 2));
+  target.appendChild(el('h3', { text: 'Per AI-assistent' }));
+  target.appendChild(table(['AI', 'Levert til AI-assistent'],
+    Object.keys(a.by_vendor).map(v => ({ cells: [AI_NO[v] || v, fmtNum(a.by_vendor[v])] })), 1));
+  target.appendChild(el('h3', { text: 'Per tidsbolk' }));
+  target.appendChild(table(['Bolk', 'Levert til AI-assistent'], a.series.map(s => ({ cells: [s.bucket, fmtNum(s.total)] })), 1));
+  (a.merknader || []).forEach(m => target.appendChild(el('div', { cls: 'note', text: m })));
+}
+
 function renderGs(g, target) {
   target.replaceChildren();
   document.getElementById('gsLead').textContent = g.forklaring;
@@ -337,6 +408,8 @@ function render(body) {
     '. Hentet ' + new Date(body.generated_at).toLocaleString('nb-NO') + '. ' + body.forklaring;
   renderAlle(body, document.getElementById('alleBody'));
   if (body.rfb) renderRfb(body.rfb, document.getElementById('rfbBody'));
+  if (body.henvisninger && body.henvisninger.rfb) renderHenv(body.henvisninger.rfb, document.getElementById('henvBody'));
+  if (body.ai_leveranser && body.ai_leveranser.rfb) renderAi(body.ai_leveranser.rfb, document.getElementById('aiBody'));
   if (body.gardssalg) renderGs(body.gardssalg, document.getElementById('gsBody'));
 }
 

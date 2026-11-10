@@ -1618,13 +1618,25 @@ router.get("/geocode", async (req: Request, res: Response) => {
 
 // ─── GET /agents — List all active agents ────────────────────
 
+// dev-request 2026-10-26-marketplace-agents-endepunkt-ignorerer-limit
+// (re-specified 2026-10-28, Daniel 3.9): the 50-row cap per call stays — a
+// whole catalogue in one call invites bulk harvesting — and clients page with
+// `limit=50&offset=n` until a page has fewer than 50 rows. So `offset` must be
+// safe: a negative or non-numeric value reads as 0 (a negative offset used to
+// reach Array.slice as a from-the-end index and return the LAST rows), and a
+// limit ≤ 0 or non-numeric reads as the cap. The order is stable across pages
+// (rowid tie-break in getActiveAgents). Every row carries `umbrella_type`:
+// always null here, since this list excludes umbrella agents
+// (getActiveAgents' `umbrella_type IS NULL`), so the enrichment SKILLs'
+// client-side umbrella filter reads an explicit value instead of a missing key.
 router.get("/agents", (req: Request, res: Response) => {
   const HARD_CAP = 50;
   const allAgents = marketplaceRegistry.getActiveAgents();
   const total = allAgents.length;
-  let limit = parseInt(req.query.limit as string) || HARD_CAP;
-  if (limit > HARD_CAP) limit = HARD_CAP;
-  const offset = parseInt(req.query.offset as string) || 0;
+  const rawLimit = parseInt(req.query.limit as string, 10);
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, HARD_CAP) : HARD_CAP;
+  const rawOffset = parseInt(req.query.offset as string, 10);
+  const offset = Number.isFinite(rawOffset) && rawOffset > 0 ? rawOffset : 0;
   const agents = allAgents.slice(offset, offset + limit);
   res.json({
     success: true,
@@ -1651,6 +1663,7 @@ router.get("/agents", (req: Request, res: Response) => {
         isVerified: a.isVerified,
         isClaimed: knowledgeService.isAgentClaimed(a.id),
         skills: a.skills.map(s => ({ id: s.id, name: s.name, tags: s.tags })),
+        umbrella_type: null,
       };
     }),
   });
