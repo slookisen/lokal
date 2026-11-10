@@ -233,3 +233,10 @@ export const BRAND_ENTITIES: Readonly<Record<BrandKey, Readonly<BrandEntity>>> =
     exampleQueries: [],
   }),
 });
+
+/**
+ * serverInfo `title` of the RFB MCP server (G3-S5). Lives here, not in routes/mcp.ts,
+ * so the /mcp serverInfo and the server card (routes/agent-readiness.ts) read one
+ * value without the card importing the whole MCP route.
+ */
+export const RFB_MCP_SERVER_TITLE = `${BRAND_ENTITIES.rfb.name} — Norwegian local food producers`;
