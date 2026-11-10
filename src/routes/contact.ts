@@ -27,6 +27,7 @@ import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
 import { emailService, maskEmails } from "../services/email-service";
+import { countContactRejection, sendContactReceipt } from "../services/contact-form-cs";
 
 const router = Router();
 
@@ -228,6 +229,7 @@ router.post("/contact", async (req: Request, res: Response): Promise<void> => {
     // 1. Honeypot check
     const honey = String(body._honey ?? "");
     if (honey.length > 0) {
+      countContactRejection(inferPlatform(req), "honeypot");
       res.status(400).json({ success: false, error: "invalid" });
       return;
     }
@@ -239,14 +241,17 @@ router.post("/contact", async (req: Request, res: Response): Promise<void> => {
     const subject = String(body.subject ?? "").trim();
 
     if (name.length > 100 || email.length > 254 || message.length > 2000 || subject.length > 200) {
+      countContactRejection(inferPlatform(req), "invalid_input");
       res.status(422).json({ success: false, error: "field_too_long" });
       return;
     }
     if (!name || !email || !message) {
+      countContactRejection(inferPlatform(req), "invalid_input");
       res.status(422).json({ success: false, error: "missing_required_fields" });
       return;
     }
     if (!EMAIL_RE.test(email)) {
+      countContactRejection(inferPlatform(req), "invalid_input");
       res.status(422).json({ success: false, error: "invalid_email" });
       return;
     }
@@ -284,6 +289,7 @@ router.post("/contact", async (req: Request, res: Response): Promise<void> => {
     const cfToken = String(body.cfTurnstileResponse ?? "");
     const turnstileOk = await verifyTurnstile(cfToken);
     if (!turnstileOk) {
+      countContactRejection(platform, "captcha_failed");
       res.status(403).json({ success: false, error: "captcha_failed" });
       return;
     }
@@ -291,6 +297,7 @@ router.post("/contact", async (req: Request, res: Response): Promise<void> => {
     // 5. Rate limit
     const ip = clientIp(req);
     if (!checkRateLimit(ip)) {
+      countContactRejection(platform, "rate_limit");
       res.status(429).json({ success: false, error: "rate_limit_exceeded" });
       return;
     }
@@ -307,6 +314,17 @@ router.post("/contact", async (req: Request, res: Response): Promise<void> => {
       .catch((err: unknown) => {
         console.error("[contact] Admin copy failed:", maskEmails(err instanceof Error ? err.message : String(err)));
       });
+
+    // 6c. CS på serveren, S5: a missing admin address is an error, not a
+    // silent skip — the copy above then goes nowhere.
+    if (!process.env.ADMIN_NOTIFICATION_EMAIL) {
+      console.error(`[contact] ADMIN_NOTIFICATION_EMAIL is not set — no admin copy of form thread ${threadId}`);
+    }
+
+    // 6d. Automatic receipt to the visitor (CS_CONTACT_RECEIPT_ENABLED): fixed
+    // template, at most one per address per 24 h, never echoes the form text.
+    // Not awaited, never throws.
+    void sendContactReceipt({ email, platform, threadId }).catch(() => undefined);
 
     // 7. Success
     res.status(200).json({

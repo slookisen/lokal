@@ -50,6 +50,8 @@ export interface NeedsReplyThread {
   last_outbound_at: string | null;
   age_hours: number;
   level: NeedsReplyLevel;
+  /** S5: where the conversation came from — the public contact form, or e-mail. */
+  source?: "kontaktskjema" | "e-post";
   /** S2: the thread's latest open reply proposal, if any (status + why it stopped). */
   proposal?: { id: string; status: string; block_reason: string | null; created_at: string } | null;
 }
@@ -174,7 +176,7 @@ export function computeNeedsReply(opts: { vertical?: string | null; limit?: numb
 
   const threads: NeedsReplyThread[] = rows.map((r) => {
     const age = Math.max(0, round1(Number(r.age_hours) || 0));
-    return { ...r, age_hours: age, level: needsReplyLevel(age) };
+    return { ...r, age_hours: age, level: needsReplyLevel(age), source: r.thread_id.startsWith("kontakt-") ? "kontaktskjema" : "e-post" };
   });
 
   const untriagedRows = db

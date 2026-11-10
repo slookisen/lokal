@@ -151,6 +151,8 @@ export const ERASURE_TABLES: readonly TableSpec[] = [
   { table: "crm_threads", where: `contact_id IN (${CONTACTS})`, params: 1 },
   { table: "crm_contacts", where: `LOWER(TRIM(email)) = ?`, params: 1 },
   { table: "crm_untriaged", where: `LOWER(TRIM(from_email)) = ?`, params: 1 },
+  // CS på serveren, S5: the receipt log of the public contact form.
+  { table: "contact_form_receipts", where: `LOWER(TRIM(email)) = ?`, params: 1 },
   { table: "outreach_sent_log", where: `LOWER(TRIM(recipient_email)) = ?`, params: 1 },
   { table: "rfb_marketing_send_ledger", where: `LOWER(TRIM(recipient_email)) = ?`, params: 1 },
   { table: "resend_webhook_events", where: `LOWER(TRIM(email)) = ?`, params: 1 },

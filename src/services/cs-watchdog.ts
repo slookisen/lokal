@@ -25,6 +25,7 @@ import { EnvelopeBuilder } from "../types/run-envelope";
 import { getJobLastCompletedAt, markJobCompleted } from "./boot-job-gate";
 import { parkPendingWhenAutosendOff, recoverExpiredLeases } from "./cs-reply-proposals";
 import { failedReplyDeliveries } from "./crm-delivery-status";
+import { contactRejectionsSince } from "./contact-form-cs";
 
 export const CS_WATCHDOG_FLAG = "CS_WATCHDOG_ENABLED";
 export const CS_DAILY_DIGEST_FLAG = "CS_DAILY_DIGEST_ENABLED";
@@ -532,6 +533,13 @@ export function buildDailyDigest(now: Date = new Date()): { subject: string; tex
     const f = forms.find((r) => r.vertical === v)?.n ?? 0;
     lines.push(`• ${v === "-" ? "Ukjent plattform" : platformName(v)}: ${total} e-post${by ? ` (${by})` : ""}, ${f} kontaktskjema`);
   }
+  // S5: rejected contact-form submissions (spam protection at work, or a broken form).
+  const rejected = contactRejectionsSince(since);
+  if (rejected.length > 0) {
+    const byP = new Map<string, string[]>();
+    for (const r of rejected) byP.set(r.platform, [...(byP.get(r.platform) ?? []), `${r.reason} ${r.n}`]);
+    for (const [p, parts] of byP) lines.push(`• ${platformName(p)}: kontaktskjema avvist — ${parts.join(", ")}`);
+  }
   lines.push("");
   lines.push("UT");
   if (outbound.length === 0) lines.push("• Ingen svar eller utsendinger registrert i CRM.");
@@ -616,7 +624,7 @@ export function buildDailyDigest(now: Date = new Date()): { subject: string; tex
   return {
     subject,
     text: lines.join("\n"),
-    counts: { inbound, forms, outbound, needs_reply: report.counts, proposals: proposalCounts },
+    counts: { inbound, forms, contact_form_rejected: rejected, outbound, needs_reply: report.counts, proposals: proposalCounts },
   };
 }
 

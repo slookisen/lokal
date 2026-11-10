@@ -45107,6 +45107,23 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── dev-request 2026-11-10-cs-paa-serveren: S5 (kontaktskjema: kvittering, avviste innsendinger) ──");
+  try {
+    const { runContactFormCsTests } = require("../src/services/contact-form-cs.test") as
+      typeof import("../src/services/contact-form-cs.test");
+    const cft = await runContactFormCsTests({ log: false });
+    passed += cft.passed;
+    failed += cft.failed;
+    for (const f of cft.failures) failures.push("contact-form-cs: " + f);
+    console.log(`  contact-form-cs: ${cft.passed} passed, ${cft.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("contact-form-cs: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ contact-form-cs: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-07-27-crm-plattformadskillelse: steg 4 (innkommende triage + utriaged-bøtte) ──");
   try {
     const { runCrmTriageTests } = require("../src/services/crm-triage.test") as

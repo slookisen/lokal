@@ -3380,6 +3380,32 @@ function initSchema(db: Database.Database): void {
     console.error("Migration crm_message_delivery failed:", err);
   }
 
+  // ─── CS på serveren, S5: contact form — rejected submissions per day
+  // (no personal data: day, platform, reason, count) and the receipt log
+  // (one automatic receipt per address per 24 h).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS contact_form_rejections (
+        day TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (day, platform, reason)
+      );
+      CREATE TABLE IF NOT EXISTS contact_form_receipts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        thread_id TEXT,
+        outcome TEXT NOT NULL,
+        sent_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_contact_form_receipts_email ON contact_form_receipts(email, sent_at);
+    `);
+  } catch (err) {
+    console.error("Migration contact_form tables failed:", err);
+  }
+
   // ─── M1 (Phase 5.4a): agent_knowledge_audit ─────────────────
   // Owner profile change history. Immutable changelog (insert-only).
   // Daniel uses GET /admin/agent-audit to inspect ownership changes.
