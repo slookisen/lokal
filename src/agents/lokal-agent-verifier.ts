@@ -1362,6 +1362,24 @@ export function applyVerifierOutcome(
       // SQL-already-expired row as "not yet expired" and silently skip the
       // re-stamp. Keeping the whole comparison SQL-native (matching
       // stampParking() in admin-domain-coherence.ts) avoids the mismatch.
+      // Observability only (dev-request 2026-10-27-parkering-released-reparked-
+      // tellere): log a 'reparked' event BEFORE the re-stamp, using the exact
+      // same SQL-native predicate as the UPDATE below but restricted to rows
+      // that were ALREADY parked (first-time park, parked_since NULL, is not
+      // a repark). Own try/catch so a missing events table can never block
+      // the re-stamp itself.
+      try {
+        db.prepare(
+          `INSERT INTO pending_verify_parking_events (agent_id, kind)
+           SELECT agent_id, 'reparked' FROM agent_knowledge
+            WHERE agent_id = ?
+              AND pending_verify_no_progress_count >= 3
+              AND pending_verify_parked_since IS NOT NULL
+              AND pending_verify_parked_since <= datetime('now','-30 days')`
+        ).run(agentId);
+      } catch {
+        // events table absent (minimal test schema) — skip.
+      }
       db.prepare(
         `UPDATE agent_knowledge
             SET pending_verify_parked_since = datetime('now')
@@ -1370,6 +1388,17 @@ export function applyVerifierOutcome(
             AND (pending_verify_parked_since IS NULL OR pending_verify_parked_since <= datetime('now','-30 days'))`
       ).run(agentId);
     } else {
+      // Observability only: 'released' event, only when the row was actually
+      // parked before (never-parked rows must not count). Own try/catch.
+      try {
+        db.prepare(
+          `INSERT INTO pending_verify_parking_events (agent_id, kind)
+           SELECT agent_id, 'released' FROM agent_knowledge
+            WHERE agent_id = ? AND pending_verify_parked_since IS NOT NULL`
+        ).run(agentId);
+      } catch {
+        // events table absent (minimal test schema) — skip.
+      }
       db.prepare(
         `UPDATE agent_knowledge SET pending_verify_no_progress_count = 0, pending_verify_parked_since = NULL WHERE agent_id = ?`
       ).run(agentId);

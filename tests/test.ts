@@ -45832,6 +45832,24 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-27-parkering-released-reparked-tellere: released/reparked
+// 24h + prev-24h counters on pending_verify_parking (events table).
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-27-parkering-released-reparked-tellere: pending_verify parking event counters ──");
+  try {
+    const { runAdminOutreachPoolParkingEventCountersTests } = require("../src/routes/admin-outreach-pool-parking-event-counters.test") as
+      typeof import("../src/routes/admin-outreach-pool-parking-event-counters.test");
+    const pec = await runAdminOutreachPoolParkingEventCountersTests({ log: false });
+    passed += pec.passed;
+    failed += pec.failed;
+    for (const f of pec.failures) failures.push("parking-event-counters: " + f);
+    console.log(`  parking-event-counters: ${pec.passed} passed, ${pec.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("parking-event-counters: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-11-controller-to-admin-endepunkter-uenige-om-verified-beholdningen:
 // GET /admin/outreach-ready-pool/stats by_verification_status uses the same
 // population/classification as GET /admin/dod-bulk (parity test).

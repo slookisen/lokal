@@ -2525,6 +2525,26 @@ function initSchema(db: Database.Database): void {
     }
   }
 
+  // ─── dev-request 2026-10-27-parkering-released-reparked-tellere — append-only
+  // event log for pending_verify parking releases/re-parks, read by
+  // GET /admin/outreach-ready-pool/stats (24h / prev-24h counters). Written
+  // only by applyVerifierOutcome and the pending-verify-unpark lever; purely
+  // observational, no gate reads it.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS pending_verify_parking_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('released','reparked')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_pv_parking_events_kind_created
+        ON pending_verify_parking_events(kind, created_at);
+    `);
+  } catch {
+    // best-effort
+  }
+
   // ─── dev-request 2026-09-01-rfb-pending-verify-unpark-lever (Daniel Alternativ B,
   // 2026-09-02) — dedikert ferskhetskolonne for unpark-leverens filter, FRIKOBLET fra
   // agent_knowledge.updated_at (som 3 reviewrunder viste IKKE er et pålitelig
