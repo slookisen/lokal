@@ -287,12 +287,12 @@ export async function runMineValgS2fTests(opts: { log?: boolean } = {}): Promise
       assertTrue(b.length > 0, "AC31: «Mine valg» has the statistics block");
       assertTrue(h.indexOf(`id="statistikk"`) > 0 && h.indexOf(`id="statistikk"`) < h.indexOf(`id="niva"`), "AC31: the block is at the top, before the levels (proof first)");
       assertEq(
-        [blockNum(b, "Sidevisninger fra mennesker"), blockNum(b, "AI-søk"), blockNum(b, "Med i AI-søk"), blockNum(b, "Klikk til telefon"), blockNum(b, "Klikk til nettside")],
+        [blockNum(b, "Besøk på profilen"), blockNum(b, "Hentet av AI-assistenter"), blockNum(b, "Med i treffene til AI-assistenter"), blockNum(b, "Trykk på telefon"), blockNum(b, "Trykk på nettside")],
         [tabSeen, tabAi, 5, tabPhone, tabWeb],
         "AC31: the rendered tiles show the tab's numbers",
       );
       assertTrue(b.includes(`ChatGPT ${tabGpt} · Claude ${tabClaude} · Andre ${tabOther} (siste ${o.windowDays} dager)`), "AC31: the AI split as in the tab, with its window");
-      assertTrue(b.includes("Klikk til kart telles ikke ennå."), "AC31: map clicks are not counted anywhere: said, no fake number");
+      assertTrue(b.includes("Trykk på kart telles ikke ennå."), "AC31: map clicks are not counted anywhere: said, no fake number");
       assertTrue(b.includes(`href="/selger?agent=${P_ID}#statistikk"`) && b.includes("Se all statistikk"), "AC31: «Se all statistikk» links to the Statistikk tab");
       const selgerSrc = fs.readFileSync(path.join(__dirname, "../public/selger.html"), "utf8");
       assertTrue(/window\.location\.hash === '#statistikk'[\s\S]{0,200}data-tab="stats"/.test(selgerSrc), "AC31: /selger opens the Statistikk tab on #statistikk");
@@ -309,7 +309,7 @@ export async function runMineValgS2fTests(opts: { log?: boolean } = {}): Promise
 
       // A profile with no data: zeros, the tip, still the link.
       const e = block(await valgHtml(E_ID));
-      assertTrue(blockNum(e, "Sidevisninger fra mennesker") === 0 && (e.match(/Tips:/g) || []).length === 1 && !e.includes("Legg til åpningstider"),
+      assertTrue(blockNum(e, "Besøk på profilen") === 0 && (e.match(/Tips:/g) || []).length === 1 && !e.includes("Legg til åpningstider"),
         "AC31: an empty profile with opening hours: 0, one tip, not the opening-hours one");
     }
 
@@ -358,7 +358,7 @@ export async function runMineValgS2fTests(opts: { log?: boolean } = {}): Promise
       assertTrue(ld.length > 0 && ldParsed.every((x) => x !== null), "AC32 19: the page's JSON-LD blocks parse");
       assertTrue(!/interactionStatistic|InteractionCounter|userInteractionCount|"(humanViews|aiViews|aiDeliveries)"/.test(JSON.stringify(ldParsed)), "AC32 19: no view or AI count in the JSON-LD");
       const own19 = block(await valgHtml(P_ID));
-      assertEq(blockNum(own19, "Sidevisninger fra mennesker"), 19, "AC32 19: the owner sees the own numbers");
+      assertEq(blockNum(own19, "Besøk på profilen"), 19, "AC32 19: the owner sees the own numbers");
 
       // 20 views
       addHumanViews(1);
@@ -368,7 +368,7 @@ export async function runMineValgS2fTests(opts: { log?: boolean } = {}): Promise
       const s20 = await statsJson(P_ID);
       assertTrue(s20.publicCounts === undefined && s20.year && typeof s20.year.humanViews?.value === "number" && "humanViews" in s20, "AC32 20: GET /api/agents/:id/stats carries the counts as before");
       const own20 = block(await valgHtml(P_ID));
-      assertTrue(blockNum(own20, "Sidevisninger fra mennesker") === 20 && !own20.includes("Tips:"), "AC32 20: the owner sees 20, no low-number tip");
+      assertTrue(blockNum(own20, "Besøk på profilen") === 20 && !own20.includes("Tips:"), "AC32 20: the owner sees 20, no low-number tip");
 
       // The environment value is used.
       setEnv("PUBLIC_STATS_MIN_VIEWS", "21");
@@ -390,7 +390,7 @@ export async function runMineValgS2fTests(opts: { log?: boolean } = {}): Promise
       assertEq(tiles(await profileHtml(P_NAME)), [false, false, false], "AC32 off: 20 views but stats.public_counts off → no tiles");
       const sOff = await statsJson(P_ID);
       assertTrue(sOff.publicCounts === false && !("year" in sOff), "AC32 off: … and no counts in /api/agents/:id/stats");
-      assertEq(blockNum(block(await valgHtml(P_ID)), "Sidevisninger fra mennesker"), 20, "AC32 off: the owner still sees the own numbers");
+      assertEq(blockNum(block(await valgHtml(P_ID)), "Besøk på profilen"), 20, "AC32 off: the owner still sees the own numbers");
       db.prepare("DELETE FROM owner_feature_settings WHERE subject_id = ?").run(P_ID);
       enforce.__setEnforceRegistryForTesting(null);
       setEnv("OWNER_FEATURES_ENFORCE", null);

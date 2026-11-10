@@ -37627,6 +37627,19 @@ const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
     failed++;
     failures.push("owner-tekstpakke-c: unexpected error: " + String(err?.message || err));
   }
+  // Tekstpakke B2 (approved owner stat names in «Mine valg», «(siste N dager)» on the owner Statistikk AI card) — pure renders.
+  try {
+    const { runOwnerTekstpakkeB2Tests } = require("../src/owner-features/owner-tekstpakke-b2.test") as
+      typeof import("../src/owner-features/owner-tekstpakke-b2.test");
+    const tpb2 = await runOwnerTekstpakkeB2Tests({ log: false });
+    passed += tpb2.passed;
+    failed += tpb2.failed;
+    for (const f of tpb2.failures) failures.push("owner-tekstpakke-b2: " + f);
+    console.log(`  owner-tekstpakke-b2: ${tpb2.passed} passed, ${tpb2.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-tekstpakke-b2: unexpected error: " + String(err?.message || err));
+  }
   // Owner pages style fixes F-a, F-c, F-d, F-e, F-f (375 px browser test, CSS only) — pure renders.
   try {
     const { runOwnerStyleFixesFTests } = require("../src/routes/owner-style-fixes-f.test") as

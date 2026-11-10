@@ -1115,7 +1115,7 @@ function gardssalgStatsHtml(m: OwnerPageModel): string {
       <ul class="mv-stats">
         ${tile(st.humanViews, "Personer som så profilen", `siste ${st.windowDays} dager`)}
         ${tile(st.aiSearchViews, "Funnet via AI-assistenter", `siste ${st.windowDays} dager`)}
-        ${st.aiDeliveries ? tile(st.aiDeliveries.value, "Med i AI-søk", st.aiDeliveries.label) : ""}
+        ${st.aiDeliveries ? tile(st.aiDeliveries.value, "Med i treffene til AI-assistenter", st.aiDeliveries.label) : ""}
       </ul>
       ${low ? `<p class="mv-note">Tallene er lave ennå, og det er vanlig for en profil som er ny eller lite kjent.</p>
       <p class="mv-check">Tips: ${esc(st.tip)}</p>` : ""}
@@ -1145,13 +1145,13 @@ function statsHtml(m: OwnerPageModel): string {
   return `<section class="ep-card" id="statistikk" aria-labelledby="statistikk-h">
       <h2 id="statistikk-h">Dette har profilen gjort for deg</h2>
       <ul class="mv-stats">
-        ${tile(st.humanViews.value, "Sidevisninger fra mennesker", st.humanViews.label)}
-        ${tile(st.aiViews.value, "AI-søk", st.aiViews.label, split)}
-        ${tile(st.aiDeliveries.value, "Med i AI-søk", st.aiDeliveries.label)}
-        ${tile(st.clicks.phone, "Klikk til telefon", `siste ${st.clicks.days} dager`)}
-        ${tile(st.clicks.website, "Klikk til nettside", `siste ${st.clicks.days} dager`)}
+        ${tile(st.humanViews.value, "Besøk på profilen", st.humanViews.label)}
+        ${tile(st.aiViews.value, "Hentet av AI-assistenter", st.aiViews.label, split)}
+        ${tile(st.aiDeliveries.value, "Med i treffene til AI-assistenter", st.aiDeliveries.label)}
+        ${tile(st.clicks.phone, "Trykk på telefon", `siste ${st.clicks.days} dager`)}
+        ${tile(st.clicks.website, "Trykk på nettside", `siste ${st.clicks.days} dager`)}
       </ul>
-      <p class="mv-note">Klikk til kart telles ikke ennå.</p>
+      <p class="mv-note">Trykk på kart telles ikke ennå.</p>
       ${lowHtml}
       ${link}
     </section>`;
