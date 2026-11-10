@@ -1824,13 +1824,13 @@ class MarketplaceRegistry {
     const includeUnvetted = opts?.includeUnvetted === true;
     const db = getDb();
     if (includeUnvetted) {
-      const rows = db.prepare("SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL ORDER BY trust_score DESC, created_at DESC").all() as any[];
+      const rows = db.prepare("SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL ORDER BY trust_score DESC, created_at DESC, rowid ASC").all() as any[];
       return rows.map(r => this.rowToAgent(r)!);
     }
     // S2d-2 «Vis som offentlig»: an as-public view (admin key + ?as_public=1)
     // sees the test fixture, so it neither reads nor fills the shared cache.
     if (isAsPublicView()) {
-      return (db.prepare(`SELECT * FROM agents WHERE umbrella_type IS NULL AND ${activeVettedListableSql()} ORDER BY trust_score DESC, created_at DESC`).all() as any[])
+      return (db.prepare(`SELECT * FROM agents WHERE umbrella_type IS NULL AND ${activeVettedListableSql()} ORDER BY trust_score DESC, created_at DESC, rowid ASC`).all() as any[])
         .filter(r => !isDelistedAgentId(r.id))
         .map(r => this.rowToAgent(r)!);
     }
@@ -1849,7 +1849,12 @@ class MarketplaceRegistry {
     // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: + the shared
     // public-listability predicate (no catalog_hidden fixture, RFB vertical only)
     // — this one line covers every public list surface built on this method.
-    const rows = db.prepare(`SELECT * FROM agents WHERE umbrella_type IS NULL AND ${activeVettedListableSql()} ORDER BY trust_score DESC, created_at DESC`).all() as any[];
+    // dev-request 2026-10-26-marketplace-agents-endepunkt-ignorerer-limit: the
+    // `rowid ASC` tie-break (all three queries here) gives equal trust_score +
+    // created_at rows one fixed order, so GET /api/marketplace/agents pages
+    // with limit/offset neither repeat nor skip a row between calls. rowid is
+    // the order SQLite already returned ties in, so no surface reorders.
+    const rows = db.prepare(`SELECT * FROM agents WHERE umbrella_type IS NULL AND ${activeVettedListableSql()} ORDER BY trust_score DESC, created_at DESC, rowid ASC`).all() as any[];
     // Økologi S0: a delisted id (agent-visibility.ts) is on no public list.
     this._agentsCache = rows.filter(r => !isDelistedAgentId(r.id)).map(r => this.rowToAgent(r)!);
     this._agentsCacheTime = now;

@@ -509,6 +509,17 @@ export async function runDiscoveryTruthTests(opts: { log?: boolean } = {}): Prom
       assertEq(names(r?.body?.tools), live.rfb, `tools-rfb-${p}: tools == live tools/list`);
     }
     {
+      // G3-S5 rest: the RFB server card carries the same brand title and 512 PNG as /mcp serverInfo.
+      const mcpMod = require("./mcp") as typeof import("./mcp");
+      const sc = await callRouter(readinessRouter, "/.well-known/mcp/server-card.json", "rettfrabonden.com");
+      const icon0 = mcpMod.RFB_MCP_SERVER_ICONS?.[0]?.src;
+      assertTrue(typeof icon0 === "string" && icon0.endsWith(".png"), "rfb-server-card-icon: serverInfo icons[0] is a .png");
+      assertEq(sc?.body?.icon, icon0, "rfb-server-card-icon: card icon == serverInfo icons[0].src");
+      assertTrue(String(sc?.body?.icon).endsWith(".png"), "rfb-server-card-icon: card icon is a .png (not favicon.ico)");
+      assertEq(sc?.body?.title, mcpMod.RFB_MCP_SERVER_TITLE, "rfb-server-card-title: card title == serverInfo title");
+      assertEq(sc?.body?.name, "lokal", "rfb-server-card-title: name unchanged");
+    }
+    {
       const arr = await callRouter(readinessRouter, "/.well-known/mcp/server-cards.json", "rettfrabonden.com");
       assertEq(names(arr?.body?.[0]?.tools), live.rfb, "tools-rfb-server-cards.json: tools == live tools/list");
       const sc2 = await callRouter(discoveryRouter, "/.well-known/mcp/server-card.json", "rettfrabonden.com");

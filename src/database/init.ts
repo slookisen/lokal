@@ -5823,6 +5823,19 @@ function initSchema(db: Database.Database): void {
     db.exec(`ALTER TABLE agents ADD COLUMN catalog_hidden INTEGER NOT NULL DEFAULT 0`);
   } catch { /* already exists — expected */ }
 
+  // ─── dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
+  // S-D1 («Kontaktskjema som valg per profil», rettfrabonden.com) ─────────────
+  // contact_form_only: 1 = the producer asked that their e-mail is not shown;
+  // with CONTACT_FORM_RFB on, /produsent/:slug shows a contact form instead
+  // and POST /produsent/:slug/kontakt forwards the message to the stored
+  // address (services/contact-form-only.ts). DEFAULT 0, so every existing row
+  // is a no-op. Only writer: POST /admin/agents/:id/contact-form-only (admin,
+  // on the producer's request). Read only while the switch is on.
+  // Rollback: switch off (the column is additive and may stay).
+  try {
+    db.exec(`ALTER TABLE agents ADD COLUMN contact_form_only INTEGER NOT NULL DEFAULT 0`);
+  } catch { /* already exists — expected */ }
+
   // ─── dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S1b punkt 6 ───────
   // Owner pause (visibility.profile = false). One row = paused; pause_until
   // 'YYYY-MM-DD' (optional) = the pause ends that UTC day. Its own table, not

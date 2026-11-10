@@ -22,6 +22,7 @@ import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { registeredMcpTools } from "../services/mcp-tool-manifest";
 import { agentCardProvider } from "../services/company-legal";
+import { BRAND_ENTITIES, brandMcpIcons, RFB_MCP_SERVER_TITLE } from "../config/brand-entities";
 
 const router = Router();
 
@@ -52,7 +53,7 @@ function mcpServerCard() {
     // never written down. See services/mcp-protocol-version.ts.
     ...mcpProtocolDeclaration(),
     name: "lokal",
-    title: "Lokal — A2A marketplace for local food in Norway",
+    title: RFB_MCP_SERVER_TITLE,
     version: "1.0.0",
     description:
       `Discover ${stats.totalAgents || "1,290+"} Norwegian food producers, cross-checked against the Brønnøysund register. ` +
@@ -64,7 +65,7 @@ function mcpServerCard() {
       url: "https://github.com/slookisen/lokal",
     },
     documentation: `${BASE_URL}/teknologi`,
-    icon: `${BASE_URL}/favicon.ico`,
+    icon: brandMcpIcons(BRAND_ENTITIES.rfb)?.[0]?.src ?? `${BASE_URL}/favicon.ico`,
     // T3 (dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as): the
     // organisation behind the server is the company, same as the agent card's
     // provider; `name`/`title` above keep the brand.

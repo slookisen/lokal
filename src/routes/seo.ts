@@ -18,7 +18,7 @@
  */
 
 import { resolveSitemapCacheTtlMs, logSlowSitemap } from "./sitemap-cache-util";
-import { Router, Request, Response } from "express";
+import express, { Router, Request, Response } from "express";
 import { RFB_CHATGPT_APP_URL } from "../config/distribution-channels";
 import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
 import { safeHonestCatalogCount } from "../services/honest-count";
@@ -32,6 +32,11 @@ import { debioApprovalText, debioProcessText, debioRegisterSyncEnabled, finnokoS
 import { publicCountsShown } from "../services/public-stats-threshold";
 import { emailRevealGuardEnabled, isCcBotUserAgent, revealEmailFor } from "../services/email-reveal-guard";
 import { EMAIL_TRAP_ROBOTS_DISALLOW, EMAIL_TRAP_ROUTE_PATHS, emailTrapHandler, emailTrapLinkFor } from "../services/email-reveal-trap";
+import {
+  CONTACT_FORM_EMAIL_MAX, CONTACT_FORM_HONEYPOT_FIELD, CONTACT_FORM_MESSAGE_MAX, CONTACT_FORM_NAME_MAX,
+  buildContactFormMail, contactFormEnabled, contactFormHoneypotFilled, contactFormRateCheck, contactFormRecordSend,
+  isContactFormOnly, logContactFormEvent, sendContactFormMail, validateContactFormInput, type ContactFormField,
+} from "../services/contact-form-only";
 // dev-request 2026-10-17-integrasjonstest-oppfolging, I-G: knowledge list
 // fields read by type (see "knowledge fields read by type" below).
 import { textEntries } from "../utils/text-entries";
@@ -74,7 +79,9 @@ import { slugify } from "../utils/slug";
 import { normalizeBmEventTime } from "../utils/bm-event-time";
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: ONE shared
 // public-listability predicate (catalog_hidden fixture + RFB vertical).
-import { publicListableSql, isPubliclyListable, isAsPublicView, failsProducerRoleGate, isAgentIdPubliclyVisible, ownerPauseEnabled, ownerVisibilityEnforced, isProfileOwnerHidden, ownerHiddenChoices, ownerHiddenAgentIds } from "../services/agent-visibility";
+import { publicListableSql, isPubliclyListable, isAsPublicView, failsProducerRoleGate, isAgentIdPubliclyVisible, ownerPauseEnabled, ownerVisibilityEnforced, isProfileOwnerHidden, ownerHiddenChoices, ownerHiddenAgentIds, isAwaitingSelfRegisteredReview } from "../services/agent-visibility";
+import { verifyOwnerSession, isVerifiedOwner } from "./owner-portal";
+import { ownerShellLinks } from "../owner-ui/shell";
 import { umbrellaHasContent, indexableUmbrellas } from "../services/umbrella-indexability";
 // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt:
 // rating markup, Offer return/shipping terms, the visible rating text and
@@ -5572,14 +5579,29 @@ function passesRoleGate(
   agent: { id: string; name: string; role?: string },
   requestedSlug: string,
 ): boolean {
+  return roleGateVerdict(agent, requestedSlug) === "pass";
+}
+
+/**
+ * passesRoleGate with the reason: "pending_review" = the row fails ONLY
+ * because it is a self-registered profile not yet vetted (role gate and
+ * listability both pass); every other failure is "fail". Same query, same
+ * log lines as before.
+ */
+function roleGateVerdict(
+  agent: { id: string; name: string; role?: string },
+  requestedSlug: string,
+): "pass" | "pending_review" | "fail" {
   let roleGateUmbrellaType: string | null = null;
   let roleGateIsVetted = 1;
   let roleGateListable = true;
+  let roleGateAwaitingReview = false;
   try {
     const row = getDb()
       .prepare("SELECT umbrella_type, is_vetted, catalog_hidden, vertical_id, origin FROM agents WHERE id = ?")
       .get(agent.id) as { umbrella_type: string | null; is_vetted: number | null; catalog_hidden: number | null; vertical_id: string | null; origin: string | null } | undefined;
     roleGateUmbrellaType = row ? row.umbrella_type : null;
+    roleGateAwaitingReview = row ? isAwaitingSelfRegisteredReview(row) : false;
     // is_vetted defaults to 1 in the schema (see database/init.ts) — a
     // NULL/undefined read (shouldn't happen post-migration, but this
     // route never fabricates trust either way) is treated as vetted.
@@ -5601,9 +5623,44 @@ function passesRoleGate(
     } else {
       console.log(`[seo:role-gate] suppressed non-producer, non-umbrella agent ${agent.id} (${agent.name}, role=${agent.role}) on /produsent/${requestedSlug}`);
     }
-    return false;
+    return !failsRoleGate && roleGateListable && !roleGateIsVetted && roleGateAwaitingReview ? "pending_review" : "fail";
   }
-  return true;
+  return "pass";
+}
+
+// ─── Owner view of an unvetted self-registered profile (dev-request
+// 2026-11-10-rfb-registreringer-og-eierkrav-folges-opp, S4a) ──────────────
+// OWNER_PENDING_PROFILE_VIEW_ENABLED ("1"/"true", read at call time, default
+// OFF): a verified owner (isVerifiedOwner, session for exactly this agent)
+// who opens their own self-registered profile while it waits for
+// self-registered-review-approve gets a private 200 «Under godkjenning» page
+// instead of the 404. Everyone else — and everything with the flag off —
+// keeps today's 404. Only the name is shown; nothing is written, nothing
+// becomes public, no sitemap entry. Flag off = no session lookup, no query.
+export const OWNER_PENDING_PROFILE_VIEW_FLAG = "OWNER_PENDING_PROFILE_VIEW_ENABLED";
+
+export function ownerPendingProfileViewEnabled(): boolean {
+  const v = process.env[OWNER_PENDING_PROFILE_VIEW_FLAG];
+  return v === "1" || v === "true";
+}
+
+function renderOwnerPendingProfilePage(agent: { id: string; name: string }, slug: string, lang: Lang): string {
+  const en = lang === "en";
+  const name = String(agent.name || "");
+  const portalHref = ownerShellLinks(agent.id).oversikt;
+  return shell(
+    en ? `Under review — ${name}` : `Under godkjenning — ${name}`,
+    en ? "Your profile is under review" : "Profilen din er under godkjenning",
+    `<div class="sec" style="text-align:center;padding:64px 24px 32px;">
+            <h1 style="font-size:2rem;margin-bottom:12px;">${escapeHtml(name)}</h1>
+            <p style="font-size:1.2rem;margin-bottom:12px;"><strong>${escapeHtml(en ? "Your profile is under review" : "Profilen din er under godkjenning")}</strong></p>
+            <p style="color:var(--g500);max-width:640px;margin:0 auto 28px;">${escapeHtml(en
+              ? "We review the profile within two working days. Until it is approved, only you can see this page. Questions? Reply to our e-mail or contact customer service."
+              : "Vi ser over profilen innen to virkedager. Til den er godkjent, er det bare du som ser denne siden. Har du spørsmål, svar på e-posten fra oss eller skriv til kundeservice.")}</p>
+            <a href="${escapeHtml(portalHref)}" class="city-pill">${escapeHtml(en ? "Go to your owner page →" : "Gå til eiersiden din →")}</a>
+          </div>`,
+    { lang, robots: "noindex", canonical: `${BASE_URL}${localizedPath("/produsent/" + slug, lang)}`, pathForAlternate: `/produsent/${encodeURIComponent(slug)}` },
+  );
 }
 
 // ─── E-mail on the producer profile (dev-request
@@ -5647,6 +5704,94 @@ function rfbProfileEmailView(req: Request, res: Response, agentId: string, email
 /** The contact-card line for «Vis e-post» (same markup as the e-mail line, the link instead of the address). */
 function rfbEmailRevealItem(slug: string, lang: Lang): string {
   return `<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.email"))}</div><div class="ct-val"><a href="${escapeHtml(rfbEmailRevealPath(slug, lang))}" rel="nofollow">${escapeHtml(RFB_EMAIL_REVEAL_LABEL[lang] || RFB_EMAIL_REVEAL_LABEL.no)}</a></div></div></div>`;
+}
+
+// ─── S-D1: contact form instead of e-mail (dev-request
+// 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting, «Kontaktskjema
+// som valg per profil») ────────────────────────────────────────────────────
+// Only with CONTACT_FORM_RFB on and agents.contact_form_only = 1 (set by an
+// admin when the producer asks). The page then carries this form in place of
+// the e-mail line (and of «Vis e-post»), JSON-LD has no `email`, and POST
+// /produsent/:slug/kontakt forwards the message (services/contact-form-only.ts).
+// A plain HTML form post, no script. S-D2 (REST/A2A/MCP) and S-D3 (dental,
+// experiences) are later slices.
+type ContactFormCopy = {
+  label: string; name: string; email: string; message: string; note: string; send: string; honey: string;
+  thanksTitle: string; thanks: string; back: string; invalidTitle: string; invalid: Record<ContactFormField, string>;
+  limitedTitle: string; limited: string; failedTitle: string; failed: string; notFound: string; findProducers: string;
+};
+const RFB_CONTACT_FORM_COPY: Readonly<Record<"no" | "en", ContactFormCopy>> = {
+  no: {
+    label: "Send melding til produsenten",
+    name: "Navn",
+    email: "Din e-post (for svar)",
+    message: "Melding",
+    note: "Rett fra Bonden sender meldingen videre til produsenten. Produsenten svarer direkte til e-postadressen du oppgir.",
+    send: "Send melding",
+    honey: "Ikke fyll ut dette feltet",
+    thanksTitle: "Takk for meldingen",
+    thanks: "Meldingen er sendt videre til produsenten. Svaret kommer direkte fra produsenten til e-postadressen du oppga.",
+    back: "Tilbake til",
+    invalidTitle: "Meldingen ble ikke sendt",
+    invalid: {
+      name: `Skriv inn navnet ditt (høyst ${CONTACT_FORM_NAME_MAX} tegn).`,
+      reply_email: "Skriv inn en gyldig e-postadresse, så produsenten kan svare deg.",
+      message: `Skriv en melding (høyst ${CONTACT_FORM_MESSAGE_MAX} tegn).`,
+    },
+    limitedTitle: "For mange meldinger",
+    limited: "Det er sendt for mange meldinger herfra den siste timen. Prøv igjen senere.",
+    failedTitle: "Meldingen ble ikke sendt",
+    failed: "Noe gikk galt da meldingen skulle sendes. Prøv igjen senere.",
+    notFound: "Ikke funnet",
+    findProducers: "Finn produsenter →",
+  },
+  en: {
+    label: "Send a message to the producer",
+    name: "Name",
+    email: "Your e-mail (for the reply)",
+    message: "Message",
+    note: "Rett fra Bonden forwards your message to the producer. The producer replies directly to the e-mail address you give.",
+    send: "Send message",
+    honey: "Leave this field empty",
+    thanksTitle: "Thank you for your message",
+    thanks: "Your message has been forwarded to the producer. The reply comes directly from the producer to the e-mail address you gave.",
+    back: "Back to",
+    invalidTitle: "The message was not sent",
+    invalid: {
+      name: `Enter your name (at most ${CONTACT_FORM_NAME_MAX} characters).`,
+      reply_email: "Enter a valid e-mail address so the producer can reply.",
+      message: `Write a message (at most ${CONTACT_FORM_MESSAGE_MAX} characters).`,
+    },
+    limitedTitle: "Too many messages",
+    limited: "Too many messages have been sent from here in the last hour. Please try again later.",
+    failedTitle: "The message was not sent",
+    failed: "Something went wrong while sending the message. Please try again later.",
+    notFound: "Not found",
+    findProducers: "Find producers →",
+  },
+};
+function rfbContactFormCopy(lang: Lang): ContactFormCopy {
+  return lang === "en" ? RFB_CONTACT_FORM_COPY.en : RFB_CONTACT_FORM_COPY.no;
+}
+
+/** The path of the contact-form POST for a producer slug (localized like the profile). */
+export function rfbContactFormPath(slug: string, lang: Lang = "no"): string {
+  return localizedPath(`/produsent/${encodeURIComponent(slug)}/kontakt`, lang);
+}
+
+/** The contact-card item with the form (replaces the e-mail line). */
+function rfbContactFormItem(slug: string, lang: Lang): string {
+  const c = rfbContactFormCopy(lang);
+  const field = "display:block;width:100%;box-sizing:border-box;padding:8px 10px;margin:4px 0 10px;border:1px solid #d1d5db;border-radius:6px;font:inherit";
+  return `<div class="ct-item" id="kontaktskjema"><div class="ct-icon">&#9993;</div><div style="flex:1;min-width:0"><div class="ct-label">${escapeHtml(c.label)}</div><div class="ct-val">`
+    + `<form method="post" action="${escapeHtml(rfbContactFormPath(slug, lang))}" class="pf-contact-form">`
+    + `<div hidden aria-hidden="true" style="display:none"><label>${escapeHtml(c.honey)} <input type="text" name="${CONTACT_FORM_HONEYPOT_FIELD}" value="" tabindex="-1" autocomplete="off"></label></div>`
+    + `<label style="display:block">${escapeHtml(c.name)}<input type="text" name="name" required maxlength="${CONTACT_FORM_NAME_MAX}" autocomplete="name" style="${field}"></label>`
+    + `<label style="display:block">${escapeHtml(c.email)}<input type="email" name="reply_email" required maxlength="${CONTACT_FORM_EMAIL_MAX}" autocomplete="email" style="${field}"></label>`
+    + `<label style="display:block">${escapeHtml(c.message)}<textarea name="message" required maxlength="${CONTACT_FORM_MESSAGE_MAX}" rows="5" style="${field};resize:vertical"></textarea></label>`
+    + `<p style="font-size:.82rem;color:var(--g500);margin:0 0 10px">${escapeHtml(c.note)}</p>`
+    + `<button type="submit" style="background:var(--green-700,#15803d);color:#fff;padding:9px 20px;border:none;border-radius:6px;font-weight:600;cursor:pointer">${escapeHtml(c.send)}</button>`
+    + `</form></div></div></div>`;
 }
 
 router.get("/produsent/:slug", (req: Request, res: Response) => {
@@ -5696,8 +5841,19 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // 404 exactly like an unknown slug — never leak "this exists but is
     // hidden". Unconditional (applies to producers AND umbrella rows
     // alike, though umbrellas are never self-registered in practice).
-    if (agent && !passesRoleGate(agent, slug)) {
-      agent = undefined;
+    if (agent) {
+      const gate = roleGateVerdict(agent, slug);
+      if (gate !== "pass") {
+        // S4a: the verified owner's own pending profile → «Under godkjenning»
+        // (private, noindex). Flag off: short-circuits before any session lookup.
+        if (gate === "pending_review" && ownerPendingProfileViewEnabled() && isVerifiedOwner(agent.id, verifyOwnerSession(req))) {
+          console.log(`[seo:quarantine-gate] owner pending view for agent ${agent.id}`);
+          res.setHeader("X-Robots-Tag", "noindex");
+          res.setHeader("Cache-Control", "private, no-store");
+          return res.status(200).send(renderOwnerPendingProfilePage(agent, slug, lang));
+        }
+        agent = undefined;
+      }
     }
 
     // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S1b punkt 6: an
@@ -5888,8 +6044,14 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     const meta = (info?.meta || {}) as any;
     // Slice 3 (S-A1/S-A3): the e-mail this request may see. Switch off → null
     // → k.email, exactly as before.
-    const emailView = rfbProfileEmailView(req, res, agent.id, k.email);
-    const shownEmail = emailView === null || emailView === "show" ? k.email : null;
+    // S-D1: a profile with the contact-form-only flag (CONTACT_FORM_RFB on)
+    // shows a contact form instead of the e-mail, «Vis e-post» and JSON-LD
+    // `email`; the guard is then asked about no e-mail (nothing counted).
+    // Switch off → the flag is not read, exactly as before.
+    const contactFormOnly = contactFormEnabled("rfb") && isContactFormOnly(getDb(), agent.id);
+    const contactFormShown = contactFormOnly && typeof k.email === "string" && k.email.trim() !== "";
+    const emailView = rfbProfileEmailView(req, res, agent.id, contactFormOnly ? null : k.email);
+    const shownEmail = contactFormOnly ? null : emailView === null || emailView === "show" ? k.email : null;
 
     // Render-time guard: nav/boilerplate scraped text masquerading as a real
     // description must never render (dev-request 2026-07-04-rfb-datakvalitet
@@ -6135,6 +6297,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       if (isDisplayablePhone(k.phone)) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#128222;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.phone"))}</div><div class="ct-val"><a href="tel:${k.phone.replace(/\s+/g, "")}">${escapeHtml(k.phone)}</a></div></div></div>`);
       if (shownEmail) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.email"))}</div><div class="ct-val"><a href="mailto:${shownEmail}">${escapeHtml(shownEmail)}</a></div></div></div>`);
       else if (emailView === "reveal") umbContactItems.push(rfbEmailRevealItem(slug, lang));
+      else if (contactFormShown) umbContactItems.push(rfbContactFormItem(slug, lang));
       if (k.website) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#127760;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.website"))}</div><div class="ct-val"><a href="${escapeHtml(addUtmParams(k.website))}" target="_blank" rel="noopener">${escapeHtml(k.website.replace(/^https?:\/\//, ""))}</a></div></div></div>`);
       // Google Maps search — search by name + (address|city), never raw coords.
       if (k.address || isDisplayablePhone(k.phone) || k.email || k.website) {
@@ -6427,6 +6590,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     if (isDisplayablePhone(k.phone)) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#128222;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.phone"))}</div><div class="ct-val"><a href="tel:${k.phone.replace(/\s+/g, "")}" data-track-kind="phone">${escapeHtml(k.phone)}</a></div></div></div>`);
     if (shownEmail) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">${escapeHtml(t(lang, "producer.email"))}</div><div class="ct-val"><a href="mailto:${shownEmail}" data-track-kind="email">${escapeHtml(shownEmail)}</a></div></div></div>`);
     else if (emailView === "reveal") contactItems.push(rfbEmailRevealItem(slug, lang));
+    else if (contactFormShown) contactItems.push(rfbContactFormItem(slug, lang));
     // Website now routes through the counting redirect (GET /ut/:agentId/website,
     // src/routes/contact-tracking.ts) instead of linking straight to
     // agent_knowledge.website. This works with JS fully disabled (it's a
@@ -7439,7 +7603,9 @@ router.get("/produsent/:slug/epost", (req: Request, res: Response, next) => {
     if (agent && !passesRoleGate(agent, slug)) agent = undefined;
     if (agent && (ownerPauseEnabled() || ownerVisibilityEnforced()) && isProfileOwnerHidden(getDb(), agent.id)) agent = undefined;
     let email: string | null = null;
-    if (agent) {
+    // S-D1: a contact-form-only profile (CONTACT_FORM_RFB on) answers exactly
+    // like a profile without e-mail (404, no address). Switch off → not read.
+    if (agent && !(contactFormEnabled("rfb") && isContactFormOnly(getDb(), agent.id))) {
       const info = knowledgeService.getAgentInfo(agent.id);
       const k = withoutHiddenFields((info?.knowledge || {}) as any, publicFieldChoices(agent.id));
       email = typeof k.email === "string" && k.email.trim() !== "" ? k.email : null;
@@ -7477,6 +7643,107 @@ router.get("/produsent/:slug/epost", (req: Request, res: Response, next) => {
   } catch (err) {
     console.error(`SEO /produsent/${slug}/epost error:`, err);
     res.status(500).send(en ? "Internal error" : "Intern feil");
+  }
+});
+
+// S-D1: POST /produsent/:slug/kontakt — forwards a contact-form message to a
+// flagged producer's stored address (named like GET /produsent/:slug/epost;
+// /en/… via langMiddleware). Only with CONTACT_FORM_RFB on; off → next(), so
+// the path answers exactly as on main (the app's fall-through 404). On: the
+// profile must have a public page (same gates as the page and «Vis e-post»),
+// the contact_form_only flag and a stored e-mail, else 404. Honeypot filled →
+// answered like a success, nothing sent. Per-IP limit (5 per hour) → 429 with
+// Retry-After. Invalid input → 400. One mail via emailService, Reply-To = the
+// sender's address. HTML thank-you page (plain form post), JSON when the
+// client asks for JSON. The producer's address is never in the answer or a
+// log line. Cache-Control: private, no-store; noindex.
+const contactFormBodyParsers = [
+  express.urlencoded({ extended: false, limit: "16kb" }),
+  express.json({ limit: "16kb" }),
+];
+router.post("/produsent/:slug/kontakt", (_req: Request, _res: Response, next) => {
+  // Switch off → skip this route (and its body parsers) entirely.
+  if (!contactFormEnabled("rfb")) { next("route"); return; }
+  next();
+}, ...contactFormBodyParsers, async (req: Request, res: Response) => {
+  res.set("Cache-Control", "private, no-store");
+  res.set("X-Robots-Tag", "noindex, nofollow");
+  const lang: Lang = req.lang || "no";
+  const c = rfbContactFormCopy(lang);
+  const slug = String(req.params.slug).toLowerCase();
+  const wantsJson = req.accepts(["html", "json"]) === "json";
+  const profilePath = localizedPath("/produsent/" + encodeURIComponent(slug), lang);
+  const page = (title: string, body: string) => shell(
+    title,
+    title,
+    `<div class="sec" style="padding:48px 24px 48px;max-width:720px;margin:0 auto;"><h1 style="font-size:1.6rem;margin-bottom:16px;">${escapeHtml(title)}</h1>${body}</div>`,
+    { lang, robots: "noindex, nofollow", canonical: BASE_URL + profilePath, pathForAlternate: `/produsent/${encodeURIComponent(slug)}/kontakt` },
+  );
+  try {
+    let agent = marketplaceRegistry.getAgentBySlugIncludingUmbrellas(slug);
+    if (agent && !passesRoleGate(agent, slug)) agent = undefined;
+    if (agent && (ownerPauseEnabled() || ownerVisibilityEnforced()) && isProfileOwnerHidden(getDb(), agent.id)) agent = undefined;
+    let email: string | null = null;
+    if (agent && isContactFormOnly(getDb(), agent.id)) {
+      const info = knowledgeService.getAgentInfo(agent.id);
+      const k = withoutHiddenFields((info?.knowledge || {}) as any, publicFieldChoices(agent.id));
+      email = typeof k.email === "string" && k.email.trim() !== "" ? k.email.trim() : null;
+    }
+    if (!agent || !email) {
+      res.status(404);
+      if (wantsJson) { res.json({ ok: false, error: "not_found" }); return; }
+      res.send(page(c.notFound, `<p><a href="${localizedPath("/sok", lang)}">${escapeHtml(c.findProducers)}</a></p>`));
+      return;
+    }
+    const name = String(agent.name || "");
+    const back = `<p style="margin-top:20px"><a href="${escapeHtml(profilePath)}">&larr; ${escapeHtml(c.back)} ${escapeHtml(name)}</a></p>`;
+    const thanks = () => {
+      if (wantsJson) { res.status(200).json({ ok: true }); return; }
+      res.status(200).send(page(c.thanksTitle, `<p>${escapeHtml(c.thanks)}</p>${back}`));
+    };
+    if (contactFormHoneypotFilled(req.body)) {
+      logContactFormEvent({ outcome: "honeypot", profile_id: agent.id });
+      thanks();
+      return;
+    }
+    const rate = contactFormRateCheck(req);
+    if (!rate.ok) {
+      logContactFormEvent({ outcome: rate.reason === "limit" ? "rate_limited" : "no_ip", profile_id: agent.id, ...(rate.client ? { client: rate.client } : {}) });
+      res.set("Retry-After", String(rate.retryAfter));
+      res.status(429);
+      if (wantsJson) { res.json({ ok: false, error: "rate_limited", retry_after: rate.retryAfter }); return; }
+      res.send(page(c.limitedTitle, `<p>${escapeHtml(c.limited)}</p>${back}`));
+      return;
+    }
+    const parsed = validateContactFormInput(req.body);
+    if (!parsed.ok) {
+      logContactFormEvent({ outcome: "invalid", profile_id: agent.id, client: rate.client, fields: parsed.errors });
+      res.status(400);
+      if (wantsJson) { res.json({ ok: false, error: "invalid", fields: parsed.errors }); return; }
+      const backToForm = `<p style="margin-top:20px"><a href="${escapeHtml(profilePath)}#kontaktskjema">&larr; ${escapeHtml(c.back)} ${escapeHtml(name)}</a></p>`;
+      res.send(page(c.invalidTitle, `<ul>${parsed.errors.map((f) => `<li>${escapeHtml(c.invalid[f])}</li>`).join("")}</ul>${backToForm}`));
+      return;
+    }
+    contactFormRecordSend(rate.key);
+    const mail = buildContactFormMail({ producerName: name, profileUrl: BASE_URL + "/produsent/" + encodeURIComponent(slug), input: parsed.value, to: email });
+    let sent = false;
+    try {
+      sent = (await sendContactFormMail(mail)).success === true;
+    } catch {
+      sent = false;
+    }
+    logContactFormEvent({ outcome: sent ? "forwarded" : "send_failed", profile_id: agent.id, client: rate.client });
+    if (!sent) {
+      res.status(502);
+      if (wantsJson) { res.json({ ok: false, error: "send_failed" }); return; }
+      res.send(page(c.failedTitle, `<p>${escapeHtml(c.failed)}</p>${back}`));
+      return;
+    }
+    thanks();
+  } catch (err) {
+    // The error text could carry an address (mail layer) — log the kind only.
+    console.error(`SEO /produsent/${slug.replace(/[^a-z0-9-]/g, "?").slice(0, 100)}/kontakt error:`, err instanceof Error ? err.name : "unknown");
+    if (!res.headersSent) res.status(500).send(lang === "en" ? "Internal error" : "Intern feil");
   }
 });
 
