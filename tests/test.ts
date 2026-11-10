@@ -49576,6 +49576,25 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-26-lokal-agent-verifier-snapshot-drift-toleranse, slice 2:
+// the bulk sweep envelope posts its own bulk_sweep_* kinds, not the global snapshot kinds.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-26 slice 2: bulk sweep claim kinds ──");
+  try {
+    const { runVerifierSweepClaimsTests } =
+      require("../src/services/verifier-sweep-claims.test") as
+        typeof import("../src/services/verifier-sweep-claims.test");
+    const r = await runVerifierSweepClaimsTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("verifier-sweep-claims: " + f);
+    console.log(`  verifier-sweep-claims: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("verifier-sweep-claims: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt,
 // Slice 0: daily automatic catalog sync (runProductCatalogSync, extracted
 // from POST /admin/products/backfill) — proves the availability-preservation
