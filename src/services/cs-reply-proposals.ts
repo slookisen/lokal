@@ -36,7 +36,7 @@ import { crmFromHeader, resolveCrmIdentity, lintOutboundBodyForForeignBranding }
 import { emailService } from "./email-service";
 import { plainTextToEmailHtml } from "../utils/plain-text-to-html";
 import { containsMojibake } from "./search-enrich";
-import { classifyForwardCopy, forwardCopyMarker, forwardOriginalSender, isOurPlatformAddress, readInboundHeaders } from "./cs-inbound";
+import { classifyForwardCopy, forwardCopyMarker, forwardOriginalSender, forwardSuffix, inboundLogAutomatedKind, isOurPlatformAddress, readInboundHeaders } from "./cs-inbound";
 import { recordRun } from "./run-ledger";
 import { EnvelopeBuilder } from "../types/run-envelope";
 
@@ -170,7 +170,8 @@ export function replySubject(s: string | null | undefined): string {
   let t = (s ?? "").replace(/\s+/g, " ").trim();
   const PREFIX = /^(((re|sv|aw|vs|fw|fwd|vb|wg|tr)\s*(\[\d+\])?\s*:)|\[innkommende\])\s*/i;
   for (let i = 0; i < 10 && PREFIX.test(t); i++) t = t.replace(PREFIX, "").trim();
-  t = t.replace(/\s*\(fra [^()]*\)\s*$/i, "").trim();
+  const f = forwardSuffix(t);
+  if (f) t = t.slice(0, f.start).trim();
   return t ? `Re: ${t}` : "Re: din henvendelse";
 }
 
@@ -223,7 +224,14 @@ export function latestHumanInbound(threadId: string): LatestInbound | null {
       fromEmail = r.from_email;
       break;
     }
-    if (!forwardCopyMarker({ direction: "in", subject: r.subject, bodyText: r.body_text, bodyHtml: r.body_html })) continue;
+    const marker = forwardCopyMarker({ direction: "in", subject: r.subject, bodyText: r.body_text, bodyHtml: r.body_html });
+    if (!marker) continue;
+    // The server's own classification of that e-mail counts, as on /ingest.
+    try {
+      if (inboundLogAutomatedKind(marker)) continue;
+    } catch {
+      continue; // cannot tell → never pick a possibly automated sender
+    }
     const orig = forwardOriginalSender(r.subject);
     if (!orig?.email || isOurPlatformAddress(orig.email)) continue;
     let meta: Record<string, unknown> = {};

@@ -23,6 +23,8 @@
  *   crx9-crx12 second re-review: a live proposal's failed outbox row is not
  *              «ikke kom fram»; a kept forward copy stands for the sender it
  *              names (never a bounce, never our own address).
+ *   crx13-crx14 a kept copy the server logged as an auto-reply is no person;
+ *              the reply subject drops «(fra …)» with parentheses in it.
  *   cr42-cr52  routes, /outbox/:id/result validation, needs-reply + watchdog +
  *              digest integration.
  *
@@ -351,6 +353,11 @@ export function runCsReplyProposalsTests(opts: { log?: boolean } = {}): Promise<
         crm.crmService.ingestThread({ threadId: "rp-copy-bounce", subject: "[Innkommende] Undeliverable (fra Mail Delivery System (Gmail) <mailer-daemon@googlemail.com>)", category: "innkommende",
           messages: [{ messageId: "rp-copy-bounce-1", direction: "in", fromEmail: "kontakt@rettfrabonden.com", subject: "[Innkommende] Melding (fra Mail Delivery System (Gmail) <mailer-daemon@googlemail.com>)", bodyText: "Videresendt\nInbound-ID: inb-copybounce-01\n\nAddress not found", sentAt: ago(1) }] }, "ola@gard.no", "rfb");
         eq(rp.latestHumanInbound("rp-copy-bounce"), null, "crx12: …but never a bounce copy (sender name with parentheses parsed whole), so no reply goes to a mailer-daemon");
+        db.prepare(`INSERT INTO inbound_email_log (id, email_id, from_email, subject, crm_status, automated_kind, received_at) VALUES ('inb-copyauto-0001', 'copyauto-1', 'ola@gard.no', 'Om helgen', 'disabled', 'auto_reply', ?)`).run(ago(1));
+        crm.crmService.ingestThread({ threadId: "rp-copy-auto", subject: "[Innkommende] Om helgen (fra Ola Nord <ola@gard.no>)", category: "innkommende",
+          messages: [{ messageId: "rp-copy-auto-1", direction: "in", fromEmail: "kontakt@rettfrabonden.com", subject: "[Innkommende] Om helgen (fra Ola Nord <ola@gard.no>)", bodyText: "Videresendt\nInbound-ID: inb-copyauto-0001\n\nJeg er borte til mandag", sentAt: ago(1) }] }, "ola@gard.no", "rfb");
+        eq(rp.latestHumanInbound("rp-copy-auto"), null, "crx13: a kept copy whose inbound log says auto_reply is no person, even with a neutral subject");
+        eq(rp.replySubject("[Innkommende] Spørsmål om egg (fra Kari (Gård) <kari@gard.no>)"), "Re: Spørsmål om egg", "crx14: the reply subject drops a «(fra …)» with parentheses in the sender name");
         const t2 = mkThread();
         crm.crmService.ingestThread({ threadId: t2.id, messages: [{ messageId: `${t2.id}-cc`, direction: "in", fromEmail: "kollega@annen.no", bodyText: "Jeg svarer for Kari", sentAt: new Date(Date.now() + 1000).toISOString() }] }, t2.email, "rfb");
         const c2 = create(t2.id);

@@ -3444,6 +3444,12 @@ function initSchema(db: Database.Database): void {
   } catch (err) {
     console.error("Migration cs_change_requests failed:", err);
   }
+  // A database built from an earlier S4 commit has no blocklist_plan yet.
+  try {
+    db.exec("ALTER TABLE cs_change_requests ADD COLUMN blocklist_plan TEXT");
+  } catch {
+    /* already exists — expected */
+  }
 
   // ─── M1 (Phase 5.4a): agent_knowledge_audit ─────────────────
   // Owner profile change history. Immutable changelog (insert-only).

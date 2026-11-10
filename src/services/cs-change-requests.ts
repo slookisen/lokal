@@ -797,6 +797,12 @@ function trackedBlocklistPairs(vertical: ChangeVertical, target: Target, plan: A
 }
 
 const REMOVAL_REASON = (id: string) => `kunden ba om fjerning — CS-forespørsel ${id}`;
+/** The reason the Opplevagent visibility route writes on its own blocklist rows. */
+const VISIBILITY_ROUTE_REASON = "gardssalg-provider-visibility hide (fjern oss)";
+
+function blocklistReason(id: number): string | null {
+  return (getDb().prepare("SELECT reason FROM agent_blocklist WHERE id = ?").get(id) as { reason: string | null } | undefined)?.reason ?? null;
+}
 
 async function executeRemovalHide(r: ChangeRequestRow, deps: ExecDeps): Promise<void> {
   const now = deps.now ?? new Date();
@@ -885,16 +891,22 @@ async function executeRemovalHide(r: ChangeRequestRow, deps: ExecDeps): Promise<
     }
   }
   let after = blocklistIdsFor(tracked);
-  // Anything this removal added that is NOT in the plan (a route that still
-  // wrote its own rows) comes out again: the plan alone decides, and it
-  // leaves out identifiers another active profile uses.
-  const unplanned = [...after.entries()].filter(([k]) => !before.has(k) && !plan.some((p) => `${p.type}|${p.value}` === k));
+  // A row the route still wrote outside the plan comes out again: the plan
+  // alone decides, and it leaves out identifiers another active profile
+  // uses. Only the route's own rows — never one someone else added meanwhile.
+  const unplanned = [...after.entries()].filter(
+    ([k, id]) => !before.has(k) && !plan.some((p) => `${p.type}|${p.value}` === k) && blocklistReason(id) === VISIBILITY_ROUTE_REASON,
+  );
   if (unplanned.length > 0) {
     for (const [, id] of unplanned) blocklist.remove({ id });
     addStep(r.id, "blocklist_unplanned_removed", true, { removed: unplanned.map(([k]) => k) }, now);
     after = blocklistIdsFor(tracked);
   }
-  const added = [...after.entries()].filter(([k]) => !before.has(k)).map(([k, v]) => ({ key: k, id: v }));
+  // What a cancel removes: only rows written for THIS removal (our reason,
+  // or the route's), never a row someone else added between two attempts.
+  const added = [...after.entries()]
+    .filter(([k, id]) => !before.has(k) && [REMOVAL_REASON(r.id), VISIBILITY_ROUTE_REASON].includes(blocklistReason(id) ?? ""))
+    .map(([k, v]) => ({ key: k, id: v }));
   // The name row records which org.nr it was about, so a different business
   // with the same name is not blocked (blocklist isBlocked, Mål 3). Only on a
   // row this removal itself added.
@@ -1065,7 +1077,7 @@ export async function cancelChangeRequest(id: string, reason: string, deps: Exec
     } catch {
       /* ignore */
     }
-  } else {
+  } else if (snap.catalog_hidden !== 1) {
     const call = deps.adminCall ?? defaultAdminCall;
     const res = await call("POST", "/api/opplevelser/admin/gardssalg-provider-visibility", {
       providerIds: [r.target_id],
@@ -1080,10 +1092,12 @@ export async function cancelChangeRequest(id: string, reason: string, deps: Exec
       setStatus(id, "hidden", null, {}, now, "executing");
       return { ok: false, status: 502, error: `unhide_failed_${res.status}` };
     }
-    // It was already hidden before the removal (quality, the owner's own
-    // pause, …): put that back exactly. Written directly — the route only
-    // knows the modes «quality» and «remove_request».
-    if (snap.catalog_hidden === 1 && snap.catalog_hidden_reason !== "remove_request") {
+  } else {
+    // It was already hidden before this removal (quality, the owner's own
+    // pause, an earlier removal): it stays hidden, with exactly its earlier
+    // reason. Written directly — the route only knows two modes, and an
+    // unhide would expose it even for a moment.
+    {
       const xdb = getVerticalDb("experiences");
       xdb.prepare("UPDATE experience_providers SET catalog_hidden = 1, catalog_hidden_reason = ?, updated_at = datetime('now') WHERE id = ?").run(snap.catalog_hidden_reason ?? null, r.target_id);
       const back = xdb.prepare("SELECT catalog_hidden, catalog_hidden_reason FROM experience_providers WHERE id = ?").get(r.target_id) as

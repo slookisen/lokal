@@ -29,6 +29,9 @@
  *              Daniel, capped); a linked reply waits meanwhile; cancel puts an
  *              earlier hide back exactly; forged «resend_inbound» metadata is
  *              no evidence for a removal.
+ *   cqr19-cqr21 cancel never exposes an earlier removal; a row someone else
+ *              adds meanwhile is neither cleaned up nor removed by cancel;
+ *              an old cs_change_requests table gets blocklist_plan.
  *
  * Standalone:
  *   node node_modules/tsx/dist/cli.mjs src/services/cs-change-requests.test.ts
@@ -118,6 +121,7 @@ export function runCsChangeRequestsTests(opts: { log?: boolean } = {}): Promise<
       let cardDown = false;
       let deleteStatus = 200;
       let routeIgnoresSkip = false;
+      let routeAddsManualRow: string | null = null;
       const blocklistSvc = require("./blocklist-service") as typeof import("./blocklist-service");
       const adminCall: import("./cs-change-requests").AdminCall = async (method, path, body: any) => {
         calls.push({ method, path, body });
@@ -152,6 +156,8 @@ export function runCsChangeRequestsTests(opts: { log?: boolean } = {}): Promise<
           const pid = body.providerIds[0];
           if (lockedProviders.has(pid)) return res(200, { changed: [], unchanged: [], skipped_locked: [{ id: pid }] });
           exp.prepare("UPDATE experience_providers SET catalog_hidden = ?, catalog_hidden_reason = ? WHERE id = ?").run(body.hidden ? 1 : 0, body.hidden ? body.mode : null, pid);
+          // Someone else (Daniel, by hand) blocklists an address while the hide runs.
+          if (routeAddsManualRow) blocklistSvc.add({ email: routeAddsManualRow, reason: "manuell sperre (Daniel)" });
           // As the real route: «fjern oss» blocklists org.nr, e-post and site — unless asked not to.
           if (body.hidden && body.mode === "remove_request" && (body.skip_blocklist !== true || routeIgnoresSkip)) {
             const p = exp.prepare("SELECT org_nr, epost, hjemmeside FROM experience_providers WHERE id = ?").get(pid) as any;
@@ -459,6 +465,39 @@ export function runCsChangeRequestsTests(opts: { log?: boolean } = {}): Promise<
         const can = await cq.cancelChangeRequest(cP.request.id, "kunden angret", deps());
         const pr = exp.prepare("SELECT catalog_hidden, catalog_hidden_reason FROM experience_providers WHERE id = 'ep-p'").get() as any;
         eq([can.ok, pr.catalog_hidden, pr.catalog_hidden_reason], [true, 1, "owner_pause"], "cqr18: cancel restores the owner's own pause exactly (hidden, reason owner_pause)");
+      }
+
+      {
+        // NB1 (third round): a provider already removed earlier stays hidden on cancel.
+        exp.prepare(`INSERT INTO experience_providers (id, navn, epost, hjemmeside, slug, catalog_hidden, catalog_hidden_reason) VALUES ('ep-old', 'Gammel Fjerning', 'post@gammelfjern.no', 'https://gammelfjern.no', 'gammel-fjerning--ep', 1, 'remove_request')`).run();
+        const tO = mkThread("experiences", "post@gammelfjern.no");
+        const cO = create({ vertical: "experiences", targetId: "ep-old", threadId: tO, requesterEmail: "post@gammelfjern.no", kind: "removal" }) as any;
+        await cq.runCsChangeRequests(deps());
+        const nUnhide = calls.filter((c) => c.path.endsWith("gardssalg-provider-visibility") && c.body.hidden === false).length;
+        const canO = await cq.cancelChangeRequest(cO.request.id, "kunden angret", deps());
+        const po = exp.prepare("SELECT catalog_hidden, catalog_hidden_reason FROM experience_providers WHERE id = 'ep-old'").get() as any;
+        eq([canO.ok, po.catalog_hidden, po.catalog_hidden_reason, calls.filter((c) => c.path.endsWith("gardssalg-provider-visibility") && c.body.hidden === false).length - nUnhide],
+          [true, 1, "remove_request", 0], "cqr19: cancel of a removal on a provider that was already removed keeps it hidden (no unhide call at all)");
+        // NB5 (third round): a row someone else adds while the hide runs is kept, and cancel leaves it.
+        exp.prepare(`INSERT INTO experience_providers (id, navn, epost, hjemmeside, slug) VALUES ('ep-m', 'Manuellgården', 'post@manuell.no', 'https://manuell.no', 'manuellgarden--ep')`).run();
+        insAgent.run("ag-m", "Manuell RFB", "post@manuell.no", "https://manuell-rfb.no", "key-ag-m"); // shares the e-mail → not in the plan
+        db.prepare(`INSERT INTO agent_knowledge (agent_id, website) VALUES ('ag-m', 'https://manuell-rfb.no')`).run();
+        const tM = mkThread("experiences", "post@manuell.no");
+        const cM = create({ vertical: "experiences", targetId: "ep-m", threadId: tM, requesterEmail: "post@manuell.no", kind: "removal" }) as any;
+        routeAddsManualRow = "post@manuell.no";
+        await cq.runCsChangeRequests(deps());
+        routeAddsManualRow = null;
+        const manualKept = () => !!db.prepare("SELECT 1 FROM agent_blocklist WHERE identifier_type = 'email' AND identifier_value = 'post@manuell.no' AND reason = 'manuell sperre (Daniel)'").get();
+        eq([R(cM.request.id).status, manualKept()], ["hidden", true], "cqr20: a row someone else added meanwhile is not cleaned up as «unplanned»");
+        await cq.cancelChangeRequest(cM.request.id, "kunden angret", deps());
+        eq(manualKept(), true, "cqr20b: …and cancel does not remove it either");
+        // NB4 (third round): a cs_change_requests table from an earlier build gets the column.
+        const old = new Database(":memory:");
+        old.exec("CREATE TABLE cs_change_requests (id TEXT PRIMARY KEY, vertical TEXT NOT NULL, target_id TEXT NOT NULL, thread_id TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL)");
+        initMod.__initSchemaForTesting(old as any);
+        ok((old.prepare("PRAGMA table_info(cs_change_requests)").all() as any[]).some((c) => c.name === "blocklist_plan"), "cqr21: an older cs_change_requests table gets blocklist_plan at boot");
+        old.close();
+        initMod.__setDbForTesting(db as any);
       }
 
       // ── routes, watchdog, digest ─────────────────────────────────────
