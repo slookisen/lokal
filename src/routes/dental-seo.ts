@@ -80,11 +80,12 @@ import { officialPlaceSpelling } from "../services/search-intent/norwegian-query
 // the specialties the filter finds a clinic by, and the placeholder postnummer
 // "0000" is never shown, as on the MCP/A2A cards.
 import { clinicSpecialties } from "../config/dental-search-vocabulary";
-import { shownPostnummer } from "../services/norway-postnummer";
+import { shownPostnummer, kommuner2024 } from "../services/norway-postnummer";
+import { resolveFylke2024 } from "../services/fylke-2024-migration";
 // dev-request 2026-10-16-finn-tannlege-landingssider (F1-S1/F1-S2): page size,
 // page-nav window and the static pages' text dates.
 import { DENTAL_EMERGENCY_NOTICE, DENTAL_LANDING_CONFIG, DENTAL_LANDING_FACETS, DENTAL_STATIC_PAGE_DATES, type DentalLandingFacet } from "../config/dental-landing";
-import { getDentalAreaFacts, sumAreaCounts, buildDentalAreaLanding, type DentalAreaLanding, type DentalAreaCounts, type DentalAreaScope } from "../services/dental-area-facts";
+import { getDentalAreaFacts, sumAreaCounts, buildDentalAreaLanding, type DentalAreaLanding, type DentalAreaCounts, type DentalAreaScope, type DentalKommuneFacts } from "../services/dental-area-facts";
 // A2A dev-request 2026-10-16-finn-tannlege-fasettsider (F1-S4a): the facet
 // pages /sted/<sted>/<fasett> and /fylke/<fylke>/<fasett>, their sitemap URLs
 // and the links to them from /sted and /fylke; F1-S4e: the emergency notice
@@ -2603,6 +2604,15 @@ function buildDentalSitemapXml(): string {
       xml += `\n  ${urlTag(`${DENTAL_BASE_URL}/sted/${slug}`, "weekly", "0.75", lastmods?.forPoststed(stedSpellings(group)))}`;
     }
 
+    // Kommune pages (A2A dev-request 2026-10-16-finn-tannlege-fasettsider,
+    // F1-S5): only those with a page of their own. A kommune with exactly the
+    // clinics of one /sted page answers 301 there and is left out, so no
+    // place is listed twice. The same decision as the route
+    // (resolveDentalKommunePage); lastmod from the cached aggregate.
+    for (const { kommune, facts } of dentalKommunePages()) {
+      xml += `\n  ${urlTag(`${DENTAL_BASE_URL}/kommune/${kommune.slug}`, "weekly", "0.75", facts.counts.max_updated_at?.slice(0, 10))}`;
+    }
+
     // Facet pages (A2A dev-request 2026-10-16-finn-tannlege-fasettsider,
     // F1-S4a): the ones over the facet gate, of the places the facet routes
     // look up (findStedLandingPlace, findFylkeLandingPlace), so each URL here
@@ -4019,6 +4029,208 @@ router.get("/sted/:stedSlug", (req: Request, res: Response) => {
     // skive A: a /sted page with 0 active clinics must never be indexable.
     ...(isDentalStedIndexable(total) ? {} : { robots: "noindex,follow" }),
     jsonLd: [itemList, stedBreadcrumb, ...(landing.faqJsonLd ? [landing.faqJsonLd] : [])],
+  }));
+});
+
+// ═══════════════════════════════════════════════════════════
+// GET /kommune/:kommuneSlug (A2A dev-request
+// 2026-10-16-finn-tannlege-fasettsider, F1-S5, alternative A)
+// ═══════════════════════════════════════════════════════════
+
+// dental_agents has no kommune column, so a kommune that is not itself one
+// poststed (Bærum: Sandvika, Bekkestua …) had no page. A /kommune page lists
+// the public clinics whose stored postnummer Kartverket's postnummer table
+// (services/norway-postnummer.ts, CC BY 4.0) puts in the kommune, read from
+// the cached area aggregate (getDentalAreaFacts().byKommune). Nothing is
+// stored and no column is added.
+//
+// Canonical rule (Daniel, q23): a kommune whose clinics are exactly the
+// clinics one /sted page lists (the same set of clinic ids in the same
+// aggregate, not the same count) answers 301 to that /sted page and is not
+// in the sitemap. Only a kommune whose clinics differ from every /sted page
+// (several poststeder, or a poststed shared with a neighbour) has a page of
+// its own. A kommune without a clinic is a 404, as a place without one has
+// no /sted page. The route and the sitemap both ask resolveDentalKommunePage,
+// so a /kommune URL in the sitemap always answers 200.
+
+export interface DentalKommuneEntry {
+  kommunenummer: string;
+  /** Display name ("Bærum", "Våler"). */
+  kommune: string;
+  /** The URL segment: slugifyText of the name, or of name and fylke when two kommuner share a name. */
+  slug: string;
+  fylke: string | null;
+}
+
+let _kommunerBySlug: Map<string, DentalKommuneEntry> | null = null;
+
+/** Every kommune in the 2024 table with a postnummer, by slug. Static data, built once. */
+function dentalKommunerBySlug(): Map<string, DentalKommuneEntry> {
+  if (_kommunerBySlug) return _kommunerBySlug;
+  const all = kommuner2024().map(({ kommunenummer, kommune }) => {
+    const f = resolveFylke2024({ kommunenummer });
+    return { kommunenummer, kommune, fylke: "fylke" in f ? f.fylke : null };
+  });
+  const nameCount = new Map<string, number>();
+  for (const k of all) nameCount.set(slugifyText(k.kommune), (nameCount.get(slugifyText(k.kommune)) ?? 0) + 1);
+  const bySlug = new Map<string, DentalKommuneEntry>();
+  for (const k of all.sort((a, b) => a.kommunenummer.localeCompare(b.kommunenummer))) {
+    const plain = slugifyText(k.kommune);
+    // Two kommuner named alike (Herøy, Våler) are told apart by their fylke.
+    const slug = (nameCount.get(plain) ?? 0) > 1 && k.fylke ? slugifyText(`${k.kommune} ${k.fylke}`) : plain;
+    if (slug && !bySlug.has(slug)) bySlug.set(slug, { ...k, slug });
+  }
+  _kommunerBySlug = bySlug;
+  return bySlug;
+}
+
+/** The /sted slug whose page lists exactly the kommune's clinics (same ids), else undefined. */
+function stedWithSameClinicsAsKommune(kommune: DentalKommuneFacts, idsByPoststed: ReadonlyMap<string, ReadonlySet<string>>): string | undefined {
+  // The same clinic set means every clinic has a poststed of one /sted
+  // group, so the first poststed names the only candidate.
+  const first = kommune.poststeder.keys().next().value;
+  if (first === undefined) return undefined;
+  const slug = slugifyText(first);
+  const group = findStedGroup(slug);
+  if (!group || !isDentalStedIndexable(group.count)) return undefined;
+  const stedIds = new Set<string>();
+  for (const spelling of stedSpellings(group)) for (const id of idsByPoststed.get(spelling) ?? []) stedIds.add(id);
+  if (stedIds.size !== kommune.ids.size) return undefined;
+  for (const id of kommune.ids) if (!stedIds.has(id)) return undefined;
+  return slug;
+}
+
+export type DentalKommunePage =
+  | { kind: "not_found" }
+  | { kind: "redirect"; stedSlug: string }
+  | { kind: "page"; kommune: DentalKommuneEntry; facts: DentalKommuneFacts };
+
+/**
+ * What /kommune/<slug> answers: 404, 301 to the /sted page with the same
+ * clinics, or a page of its own. The route and the sitemap both ask this.
+ * Memory only: the kommune table and the cached area aggregate.
+ */
+export function resolveDentalKommunePage(slug: string): DentalKommunePage {
+  const kommune = dentalKommunerBySlug().get(slug);
+  if (!kommune) return { kind: "not_found" };
+  const area = getDentalAreaFacts();
+  const facts = area.byKommune.get(kommune.kommunenummer);
+  if (!facts || !isDentalStedIndexable(facts.counts.total)) return { kind: "not_found" };
+  const stedSlug = stedWithSameClinicsAsKommune(facts, area.idsByPoststed);
+  return stedSlug ? { kind: "redirect", stedSlug } : { kind: "page", kommune, facts };
+}
+
+/** Every kommune with a page of its own (200), for the sitemap: resolveDentalKommunePage per kommune. */
+export function dentalKommunePages(): Array<Extract<DentalKommunePage, { kind: "page" }>> {
+  const out: Array<Extract<DentalKommunePage, { kind: "page" }>> = [];
+  for (const slug of dentalKommunerBySlug().keys()) {
+    const d = resolveDentalKommunePage(slug);
+    if (d.kind === "page") out.push(d);
+  }
+  return out;
+}
+
+router.get("/kommune/:kommuneSlug", (req: Request, res: Response) => {
+  const slugParam = String(req.params.kommuneSlug).toLowerCase().trim();
+  const decision = resolveDentalKommunePage(slugParam);
+  if (decision.kind === "redirect") {
+    res.redirect(301, `/sted/${decision.stedSlug}`);
+    return;
+  }
+  if (decision.kind === "not_found") {
+    sendDentalNotFound(res,
+      `<main><div class="container"><div class="empty-state" style="padding:80px 0"><h3>Kommune ikke funnet</h3><p>Vi fant ikke tannleger for «${escapeHtml(slugParam)}».</p><a href="/" class="btn-secondary" style="margin-top:16px">Til forsiden</a></div></div></main>`,
+      { title: "Kommune ikke funnet — Finn-tannlege.com" }
+    );
+    return;
+  }
+
+  const { kommune, facts } = decision;
+  const name = kommune.kommune;
+  // The clinics with one of the kommune's stored postnumre, the rows the
+  // aggregate counted. Count first, so a ?side= past the last page falls
+  // back to page 1 (F1-S1).
+  const filter: ListFilter = { postnummer_in: facts.postnumre };
+  let total = 0;
+  try { total = countPublicDentalAgents(filter); } catch { /* db not ready */ }
+  const { page, offset, totalPages } = resolveListPage(req.query.side, total);
+  let agents: DentalAgentRow[] = [];
+  try {
+    agents = listPublicDentalAgents(filter, DENTAL_LANDING_CONFIG.listPageSize, offset);
+  } catch { /* db not ready */ }
+
+  const baseUrl = `/kommune/${kommune.slug}`;
+  const canonicalUrl = `${DENTAL_BASE_URL}${baseUrl}`;
+  // Page 1 keeps the bare canonical; page N ≥ 2 is its own (F1-S1).
+  const pageUrl = `${DENTAL_BASE_URL}${listPageHref(baseUrl, page)}`;
+  const pageMeta = listPageMeta(page, totalPages);
+
+  const itemList = dentalItemListJsonLd(`Tannlege i ${name} kommune`, pageUrl, agents, offset);
+  // F1-S3 text from the cached aggregate, worded «etter postnummer», page 1 only.
+  const landing = areaLandingFor(page === 1 ? facts.counts : undefined, total, name, pageUrl, "kommune");
+
+  const breadcrumbItems: BreadcrumbItem[] = [{ name: "Hjem", url: DENTAL_BASE_URL }];
+  if (kommune.fylke) breadcrumbItems.push({ name: kommune.fylke, url: `${DENTAL_BASE_URL}/fylke/${encodeURIComponent(kommune.fylke)}` });
+  breadcrumbItems.push({ name: `${name} kommune`, url: canonicalUrl });
+  const kommuneBreadcrumb = breadcrumbJsonLd(breadcrumbItems);
+
+  // The /sted pages of the kommune's poststeder, one chip per slug, most clinics first.
+  const chips = new Map<string, { label: string; count: number }>();
+  for (const [poststed, n] of [...facts.poststeder].sort((a, b) => b[1] - a[1])) {
+    const slug = slugifyText(poststed);
+    const group = findStedGroup(slug);
+    if (!group || !isDentalStedIndexable(group.count)) continue;
+    const chip = chips.get(slug);
+    if (chip) chip.count += n;
+    else chips.set(slug, { label: titleCasePoststed(group.row.poststed), count: n });
+  }
+  const poststedChips = chips.size > 0
+    ? `<div style="margin-top:40px">
+  <div class="section-title" style="font-size:1rem;margin-bottom:10px">Poststeder i ${escapeHtml(name)}</div>
+  <div style="display:flex;flex-wrap:wrap;gap:8px">
+    ${[...chips].map(([slug, c]) => `<a href="/sted/${escapeHtml(slug)}" class="spec-chip">${escapeHtml(c.label)} <span style="font-size:.75em;opacity:.7">(${c.count})</span></a>`).join("")}
+  </div>
+</div>` : "";
+
+  const fylkeLink = kommune.fylke
+    ? `<p style="margin-top:16px;font-size:.9rem"><a href="/fylke/${encodeURIComponent(kommune.fylke)}">&larr; Alle tannleger i ${escapeHtml(kommune.fylke)}</a></p>`
+    : `<p style="margin-top:16px;font-size:.9rem"><a href="/#fylker">&larr; Velg fylke</a></p>`;
+
+  const resultCards = agents.length > 0
+    ? agents.map(clinicCard).join("")
+    : `<div class="empty-state"><h3>Ingen klinikker funnet</h3><p>Vi har ingen registrerte klinikker i ${escapeHtml(name)} kommune for øyeblikket.</p></div>`;
+
+  const html = `
+<main>
+  <div class="profile-header">
+    <div class="container">
+      ${kommune.fylke ? `<p style="font-size:.85rem;opacity:.7;margin-bottom:8px"><a href="/fylke/${encodeURIComponent(kommune.fylke)}" style="color:rgba(255,255,255,.7)">&larr; ${escapeHtml(kommune.fylke)}</a></p>` : ""}
+      <h1 class="profile-name">Tannlege i ${escapeHtml(name)} kommune</h1>
+      <p style="opacity:.8;font-size:.95rem">${total.toLocaleString("nb")} klinikker registrert etter postnummer</p>
+    </div>
+  </div>
+  <div class="container" style="padding-top:28px;padding-bottom:48px">
+    ${landing.introHtml}${landing.tableHtml}
+    <p class="result-meta">Klinikkene er valgt etter postnummer. Et postnummerområde kan krysse kommunegrensen.</p>
+    <p class="result-meta">Side ${page} av ${totalPages}</p>
+    <div class="clinic-list" role="list" aria-label="Tannleger i ${escapeHtml(name)} kommune">
+      ${resultCards}
+    </div>
+    ${paginationHtml(page, totalPages, baseUrl)}
+    ${landing.faqHtml}
+    ${poststedChips}
+    ${fylkeLink}
+  </div>
+</main>`;
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  recordAiPageDelivery(req, res, "ai_page_list", agents.map((a) => a.id), "dental");
+  res.send(dentalShell(html, {
+    title: `Tannlege i ${name} kommune${pageMeta.title} — Finn-tannlege.com`,
+    description: `Oversikt over ${total} tannlegeklinikker i ${name} kommune${kommune.fylke ? `, ${kommune.fylke}` : ""}, etter postnummer. Finn klinikk med Helfo-avtale, spesialitet eller tannlegevakt.${pageMeta.description}`,
+    canonical: pageUrl,
+    ...(isDentalStedIndexable(total) ? {} : { robots: "noindex,follow" }),
+    jsonLd: [itemList, kommuneBreadcrumb, ...(landing.faqJsonLd ? [landing.faqJsonLd] : [])],
   }));
 });
 
