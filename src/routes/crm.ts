@@ -1599,11 +1599,6 @@ router.post("/threads/:id/no-reply-needed", (req, res) => {
   res.json({ success: true });
 });
 
-// ─── GET /admin/crm/untriaged ────────────────────────────────
-//
-// Daniel's queue of mail the server refused to route. Open items only unless
-// ?includeResolved=1. This is the whole point of steg 4: the undecidable case
-// is a countable list somebody looks at, not a message that quietly vanished.
 // ─── CS på serveren, S2: reply proposals + approval queue ────────────
 // dev-request 2026-11-10-cs-paa-serveren, skive S2. The CS routine proposes;
 // the server sends (cs-autosend) or parks the proposal here with the reason.
@@ -1655,6 +1650,8 @@ const proposalEditSchema = z.object({
   kind: z.enum(REPLY_KINDS).optional(),
   changeRequestIds: z.array(z.string().min(1).max(120)).max(20).optional(),
   note: z.string().max(300).optional(),
+  /** Daniel saw the customer's newer message and still sends this reply. */
+  acknowledgeNewerInbound: z.boolean().optional(),
 });
 
 /** Where an approval came from — the admin page marks its own calls. Audit only (the admin key is shared). */
@@ -1665,9 +1662,9 @@ function approvalSource(req: Request): "admin-crm" | "api" {
 router.post("/reply-proposals/:pid/approve", async (req, res) => {
   const parsed = proposalEditSchema.safeParse(req.body ?? {});
   if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
-  const { note, ...edits } = parsed.data;
+  const { note, acknowledgeNewerInbound, ...edits } = parsed.data;
   try {
-    const r = await approveProposal(req.params.pid, { edits, note: note ?? null, actor: "daniel", source: approvalSource(req) });
+    const r = await approveProposal(req.params.pid, { edits, note: note ?? null, actor: "daniel", source: approvalSource(req), acknowledgeNewerInbound: acknowledgeNewerInbound === true });
     if (!r.ok) return res.status(r.status).json({ error: r.error });
     const sent = r.result.outcome === "sent";
     res.status(sent ? 200 : 409).json({ sent, result: r.result, proposal: r.proposal });
@@ -1679,7 +1676,7 @@ router.post("/reply-proposals/:pid/approve", async (req, res) => {
 router.post("/reply-proposals/:pid/edit", (req, res) => {
   const parsed = proposalEditSchema.safeParse(req.body ?? {});
   if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
-  const { note: _note, ...edits } = parsed.data;
+  const { note: _note, acknowledgeNewerInbound: _ack, ...edits } = parsed.data;
   const r = editProposal(req.params.pid, edits, "daniel");
   if (!r.ok) return res.status(r.status).json({ error: r.error });
   res.json({ proposal: r.proposal });
@@ -1693,6 +1690,11 @@ router.post("/reply-proposals/:pid/reject", (req, res) => {
   res.json({ success: true, proposal: getProposal(req.params.pid) });
 });
 
+// ─── GET /admin/crm/untriaged ────────────────────────────────
+//
+// Daniel's queue of mail the server refused to route. Open items only unless
+// ?includeResolved=1. This is the whole point of steg 4: the undecidable case
+// is a countable list somebody looks at, not a message that quietly vanished.
 router.get("/untriaged", (req, res) => {
   const includeResolved = String(req.query.includeResolved ?? "") === "1";
   const limit = parseInt(String(req.query.limit ?? "100"), 10) || 100;
@@ -1944,7 +1946,14 @@ router.post("/outbox/:id/result", (req, res) => {
   // server already marked failed) is 409 — it used to overwrite silently.
   const current = getDb().prepare("SELECT status FROM crm_outbox WHERE id = ?").get(req.params.id) as { status: string } | undefined;
   if (!current) return res.status(404).json({ error: "outbox item not found" });
-  if (current.status === parsed.data.status) return res.json({ success: true, unchanged: true });
+  if (current.status === parsed.data.status) {
+    // Same outcome again. A new resultId (e.g. a re-created Gmail draft) is
+    // recorded rather than silently dropped.
+    if (parsed.data.resultId) {
+      getDb().prepare("UPDATE crm_outbox SET result_id = ? WHERE id = ? AND COALESCE(result_id, '') != ?").run(parsed.data.resultId, req.params.id, parsed.data.resultId);
+    }
+    return res.json({ success: true, unchanged: true });
+  }
   if (current.status !== "pending" && current.status !== "processing") {
     return res.status(409).json({ error: "outbox_not_pending", status: current.status });
   }

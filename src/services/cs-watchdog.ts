@@ -339,6 +339,17 @@ export async function runCsWatchdog(
         line: `• [Svar ikke sendt] [${platformName(f.vertical)}] ${f.subject} — til ${f.to_email}: ${f.block_detail ?? f.last_error ?? f.block_reason ?? "ukjent feil"}`,
       });
     }
+    // Daniel pressed Send but the row is still «approved» without a live lease — stuck.
+    for (const a of db
+      .prepare(
+        `SELECT id, vertical, subject FROM cs_reply_proposals
+          WHERE status = 'approved' AND julianday(updated_at) < julianday(?) - 15.0 / 1440
+            AND (lease_until IS NULL OR julianday(lease_until) < julianday(?))
+          LIMIT 50`,
+      )
+      .all(now.toISOString(), now.toISOString()) as Array<{ id: string; vertical: string; subject: string }>) {
+      items.push({ key: `proposal-stuck:${a.id}`, once: true, line: `• [Godkjent svar henger] [${platformName(a.vertical)}] ${a.subject} — godkjent, men ikke sendt (${a.id})` });
+    }
   } catch (e: any) {
     env.error(`proposal checks: ${String(e?.message ?? e)}`);
   }

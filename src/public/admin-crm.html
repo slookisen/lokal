@@ -1098,13 +1098,19 @@ const BLOCK_REASON_LABEL = {
   feil_plattform: 'Feil plattform',
   endret: 'Endret av deg',
   sending_feilet: 'Sendingen feilet',
+  venter_paa_endring: 'Venter på at endringen blir bekreftet',
+  mottaker_ikke_kontakt: 'Siste melding er fra en annen enn trådens kontakt',
+  mottaker_er_egen_adresse: 'Mottakeren er en av våre egne adresser',
+  endring_feil_traad: 'Koblet endring gjelder en annen tråd',
+  ukjent_utfall: 'Sendingen ble avbrutt — kan ha blitt levert',
+  lagring_feilet: 'Kunne ikke lagre sendingen',
 };
 const UI_HEADERS = { 'X-Admin-Client': 'admin-crm' };
 
 async function apiCs(path, opts = {}) {
   const res = await fetch('/admin/cs' + path, {
     ...opts,
-    headers: { ...(opts.headers || {}), 'X-Admin-Key': adminKey, ...(opts.body ? { 'Content-Type': 'application/json' } : {}) }
+    headers: { ...(opts.headers || {}), ...UI_HEADERS, 'X-Admin-Key': adminKey, ...(opts.body ? { 'Content-Type': 'application/json' } : {}) }
   });
   if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
   return res.json();
@@ -1171,7 +1177,10 @@ async function openApprovalQueue() {
   list.innerHTML = '<div class="await-empty">Laster…</div>';
   try {
     const q = await api('/reply-proposals?status=approval_needed&limit=200');
-    const rows = q.items.map(p => {
+    const failedQ = await api('/reply-proposals?status=failed&limit=100');
+    const approvedQ = await api('/reply-proposals?status=approved&limit=100');
+    const items = [...q.items, ...failedQ.items, ...approvedQ.items.filter(p => p.age_hours > 0.25)];
+    const rows = items.map(p => {
       const old = p.age_hours > 48 ? '<span class="pill p0">&gt;48 t</span>' : '';
       const reason = BLOCK_REASON_LABEL[p.block_reason] || p.block_reason || '';
       const id = escapeHtml(p.id);
@@ -1194,7 +1203,9 @@ async function openApprovalQueue() {
             <button class="btn-secondary" data-action="rejectProposal" data-id="${id}">Avvis</button>
             <button class="btn-secondary" data-action="saveProposal" data-id="${id}">Lagre endring</button>
             <button class="btn-secondary" data-action="openThreadFromAwait" data-id="${escapeHtml(p.thread_id)}" data-contact="${escapeHtml(p.contact_id || '')}" data-type="${escapeHtml(p.contact_type || 'unknown')}">Åpne tråd →</button>
-            <button class="btn-primary" data-action="approveProposal" data-id="${id}">Send</button>
+            ${p.status === 'approval_needed' || (p.status === 'failed' && p.block_reason !== 'ukjent_utfall')
+              ? `<button class="btn-primary" data-action="approveProposal" data-id="${id}" data-reason="${escapeHtml(p.block_reason || '')}">Send</button>`
+              : `<span style="color:var(--text-dim)">${p.status === 'failed' ? 'Kan ha blitt sendt — sjekk tråden før noe sendes på nytt' : 'Godkjent, men ikke sendt'}</span>`}
           </div>
         </div>`;
     });
@@ -1220,11 +1231,23 @@ function proposalEdits(pid) {
   return edits;
 }
 
-async function approveProposal(pid) {
-  if (!confirm('Sende dette svaret til kunden nå?')) return;
+async function approveProposal(pid, _val, el) {
+  const reason = el?.dataset?.reason || '';
+  const body = proposalEdits(pid);
+  if (reason === 'ny_melding_etter_forslag') {
+    if (!confirm('Kunden har skrevet igjen etter at forslaget ble laget. Har du lest den nye meldingen (Åpne tråd), og skal dette svaret likevel sendes?')) return;
+    body.acknowledgeNewerInbound = true;
+  } else if (!confirm('Sende dette svaret til kunden nå?')) return;
   try {
-    const r = await api('/reply-proposals/' + encodeURIComponent(pid) + '/approve', { method: 'POST', headers: UI_HEADERS, body: JSON.stringify(proposalEdits(pid)) });
-    toast(r.sent ? 'Sendt' : 'Ikke sendt: ' + (r.result?.detail || r.result?.reason || ''), !r.sent);
+    // Read the body also on 409 (not sent): it carries the reason.
+    const res = await fetch(API + '/reply-proposals/' + encodeURIComponent(pid) + '/approve', {
+      method: 'POST',
+      headers: { ...UI_HEADERS, 'X-Admin-Key': adminKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const r = await res.json().catch(() => ({}));
+    if (r.sent) toast('Sendt');
+    else toast('Ikke sendt: ' + (BLOCK_REASON_LABEL[r.result?.reason] || r.result?.detail || r.error || res.status), true);
   } catch (e) { toast(e.message, true); }
   await refresh();
   await openApprovalQueue();
@@ -1377,7 +1400,7 @@ const ACTIONS = {
   openNeedsReply,
   markNoReplyNeeded: id => markNoReplyNeeded(id),
   openApprovalQueue,
-  approveProposal: id => approveProposal(id),
+  approveProposal: (id, val, el) => approveProposal(id, val, el),
   saveProposal: id => saveProposal(id),
   rejectProposal: id => rejectProposal(id),
   approveChange: id => approveChange(id),

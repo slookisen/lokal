@@ -127,6 +127,8 @@ export const ERASURE_TABLES: readonly TableSpec[] = [
   { table: "crm_outbox", where: `thread_id IN (${THREADS}) OR contact_id IN (${CONTACTS})`, params: 2 },
   { table: "crm_actions", where: `thread_id IN (${THREADS}) OR contact_id IN (${CONTACTS})`, params: 2 },
   { table: "crm_retro_tagging_audit", where: `thread_id IN (${THREADS})`, params: 1 },
+  // S3: Resend's verdict per message goes with the message.
+  { table: "crm_message_delivery", where: `crm_message_id IN (${MESSAGES})`, params: 1 },
   { table: "crm_messages", where: `thread_id IN (${THREADS})`, params: 1 },
   // CS på serveren, S1: the free-text «trenger ikke svar» reason and the
   // Gmail-thread aliases belong to the thread and go with it.

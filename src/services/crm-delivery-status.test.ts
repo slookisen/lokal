@@ -97,6 +97,18 @@ export function runCrmDeliveryStatusTests(opts: { log?: boolean } = {}): Promise
       wh.processResendWebhookEvent("svix-cold", ev("email.bounced", "kald@x.no", { bounce: { type: "Permanent" } }));
       eq(status("ds-cold-out"), "bounced", "ds8b: a cold-outreach bounce is recorded on its message too");
 
+      // ── S2/S3 review B5: two replies to one address minutes apart ───
+      {
+        crm.crmService.ingestThread({ threadId: "ds-two-a", subject: "Sak A", category: "innkommende", messages: [{ messageId: "ds-two-a-in", direction: "in", fromEmail: "to@x.no", sentAt: ago(3) }] }, "to@x.no", "rfb");
+        crm.crmService.ingestThread({ threadId: "ds-two-b", subject: "Sak B", category: "innkommende", messages: [{ messageId: "ds-two-b-in", direction: "in", fromEmail: "to@x.no", sentAt: ago(3) }] }, "to@x.no", "rfb");
+        const ra = crm.crmService.recordOutboundReply({ threadId: "ds-two-a", vertical: "rfb", toEmails: ["to@x.no"], subject: "Re: Sak A", bodyText: "A", deliveryStatus: "sent", sentAt: new Date(Date.now() - 5 * 60_000).toISOString() }).messageId;
+        const rb = crm.crmService.recordOutboundReply({ threadId: "ds-two-b", vertical: "rfb", toEmails: ["to@x.no"], subject: "Re: Sak B", bodyText: "B", deliveryStatus: "sent", sentAt: new Date(Date.now() - 4 * 60_000).toISOString() }).messageId;
+        wh.processResendWebhookEvent("svix-two-1", ev("email.bounced", "to@x.no", { subject: "Re: Sak A", bounce: { type: "Permanent" } }));
+        eq([status(ra), status(rb)], ["bounced", undefined], "ds14: the subject picks the right reply when two went to the same address minutes apart");
+        wh.processResendWebhookEvent("svix-two-2", ev("email.delivered", "to@x.no"));
+        eq(status(rb), undefined, "ds15: without a subject, two candidates minutes apart are ambiguous — no verdict rather than a wrong one");
+      }
+
       // ── consequences ─────────────────────────────────────────────────
       const ids = nr.computeNeedsReply({}).threads.map((t) => t.thread_id);
       ok(ids.includes("ds-t2") && ids.includes("ds-t3") && !ids.includes("ds-t1"), "ds9: a bounced / spam-flagged reply puts its thread back in «trenger svar»; a delivered one does not");

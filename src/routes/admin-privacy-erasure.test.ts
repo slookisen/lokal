@@ -96,6 +96,7 @@ function seed(db: Database.Database): void {
         `INSERT INTO crm_messages (id, thread_id, direction, from_email, body_text) VALUES (?, ?, 'in', ?, 'hei')`,
       ).run(`m-${who}-${n}`, `th-${who}`, addr);
     }
+    db.prepare(`INSERT INTO crm_message_delivery (crm_message_id, status, updated_at) VALUES (?, 'delivered', '2026-11-01T00:00:00Z')`).run(`m-${who}-1`);
     db.prepare(`INSERT INTO crm_actions (id, thread_id, contact_id, type, actor) VALUES (?, ?, ?, 'note', 'system')`).run(
       `a-${who}`,
       `th-${who}`,
@@ -178,6 +179,7 @@ const EXPECTED_TARGET_COUNTS: Record<string, number> = {
   crm_outbox: 2,
   crm_actions: 2,
   crm_retro_tagging_audit: 2,
+  crm_message_delivery: 2,
   crm_messages: 4,
   crm_thread_flags: 1,
   crm_thread_aliases: 1,
@@ -309,7 +311,7 @@ export async function runAdminPrivacyErasureTests(opts: { log?: boolean } = {}):
     assertEq(audit[0]?.email_hash, mod.erasureAddressHash(TARGET_NORM), "audit stores keyed hash");
     assertTrue(!JSON.stringify(audit[0]).includes("example.no"), "audit never stores the address");
     assertEq(JSON.parse(audit[0]?.counts_json || "{}"), EXPECTED_TARGET_COUNTS, "audit per-table counts");
-    assertEq(audit[0]?.total_rows, 28, "audit total (20 + 3 inbound_email_log rows + crm_thread_flags + crm_thread_aliases, S1; + cs_reply_proposals, S2; + cs_change_requests, S4; + contact_form_receipts, S5)");
+    assertEq(audit[0]?.total_rows, 30, "audit total (20 + 3 inbound_email_log rows + crm_thread_flags + crm_thread_aliases, S1; + cs_reply_proposals, S2; + cs_change_requests, S4; + contact_form_receipts, S5; + 2 crm_message_delivery, S3)");
     assertEq(audit[0]?.include_suppression, 0, "audit include_suppression=0");
     assertTrue(typeof audit[0]?.requested_at === "string" && audit[0].requested_at.length > 0, "audit when");
 

@@ -36,6 +36,7 @@ import { crmFromHeader, resolveCrmIdentity, lintOutboundBodyForForeignBranding }
 import { emailService } from "./email-service";
 import { plainTextToEmailHtml } from "../utils/plain-text-to-html";
 import { containsMojibake } from "./search-enrich";
+import { isOurPlatformAddress } from "./cs-inbound";
 import { recordRun } from "./run-ledger";
 import { EnvelopeBuilder } from "../types/run-envelope";
 
@@ -76,7 +77,8 @@ export function autosendKinds(env: NodeJS.ProcessEnv = process.env): ReplyKind[]
 export const CHANGE_CONFIRMING_KINDS: readonly ReplyKind[] = ["rettelse_bekreftet", "fjernet"];
 
 export const PROPOSAL_MAX_ATTEMPTS = 3;
-export const PROPOSAL_LEASE_MS = 5 * 60_000;
+/** Longer than the SMTP socket timeout (nodemailer default 10 min), so a slow send cannot outlive its lease. */
+export const PROPOSAL_LEASE_MS = 15 * 60_000;
 export const PROPOSAL_RETRY_BASE_MS = 2 * 60_000;
 export const DUPLICATE_WINDOW_HOURS = 24;
 
@@ -198,17 +200,19 @@ export interface LatestInbound {
 /** The thread's latest inbound message from a person (auto-replies and bounces skipped). */
 export function latestHumanInbound(threadId: string): LatestInbound | null {
   const db = getDb();
-  const row = db
+  const rows = db
     .prepare(
       `SELECT id, from_email, subject, COALESCE(sent_at, received_at) AS at, raw_metadata
          FROM crm_messages
         WHERE thread_id = ? AND direction = 'in'
           AND NOT (COALESCE(json_valid(raw_metadata), 0) = 1 AND COALESCE(json_extract(raw_metadata, '$.automated'), 0) = 1)
-        ORDER BY julianday(COALESCE(sent_at, received_at)) DESC, rowid DESC
-        LIMIT 1`,
+        ORDER BY COALESCE(julianday(sent_at), julianday(received_at)) DESC, rowid DESC
+        LIMIT 20`,
     )
-    .get(threadId) as { id: string; from_email: string; subject: string | null; at: string; raw_metadata: string | null } | undefined;
-  if (!row || !row.from_email) return null;
+    .all(threadId) as Array<{ id: string; from_email: string; subject: string | null; at: string; raw_metadata: string | null }>;
+  // Our own platform addresses (a forwarded Gmail copy, an internal note) are never «the person who wrote».
+  const row = rows.find((r) => r.from_email && !isOurPlatformAddress(r.from_email));
+  if (!row) return null;
   let rfc: string | null = null;
   try {
     const meta = JSON.parse(row.raw_metadata ?? "{}");
@@ -233,20 +237,32 @@ export function latestHumanInbound(threadId: string): LatestInbound | null {
   return { message_id: row.id, from_email: row.from_email.trim().toLowerCase(), subject: row.subject, at: row.at, rfc_message_id: rfc };
 }
 
-function changeRequestStatuses(ids: string[]): Map<string, { status: string; kind: string }> {
-  const out = new Map<string, { status: string; kind: string }>();
+interface LinkedChange {
+  status: string;
+  kind: string;
+  thread_id: string | null;
+  requester_email: string | null;
+}
+function changeRequestStatuses(ids: string[]): Map<string, LinkedChange> {
+  const out = new Map<string, LinkedChange>();
   if (ids.length === 0) return out;
   try {
     const db = getDb();
-    const stmt = db.prepare("SELECT status, kind FROM cs_change_requests WHERE id = ?");
+    const stmt = db.prepare("SELECT status, kind, thread_id, requester_email FROM cs_change_requests WHERE id = ?");
     for (const id of ids) {
-      const r = stmt.get(id) as { status: string; kind: string } | undefined;
+      const r = stmt.get(id) as LinkedChange | undefined;
       if (r) out.set(id, r);
     }
   } catch {
     // cs_change_requests not there yet (S4 not deployed) — every id counts as unverified
   }
   return out;
+}
+
+/** A linked change must belong to THIS conversation: same thread, or (no thread) the same person. */
+function changeBelongsTo(c: LinkedChange, threadId: string, toEmail: string): boolean {
+  if (c.thread_id) return c.thread_id === threadId;
+  return (c.requester_email ?? "").trim().toLowerCase() === toEmail.trim().toLowerCase();
 }
 
 /** Change-request states that are still on their way (the reply waits for them). */
@@ -292,6 +308,12 @@ export function createReplyProposal(input: CreateProposalInput, deps: { now?: Da
       detail: "a reply proposal answers a message from a person on this thread; this thread has none — use /compose for a new e-mail",
     };
   }
+  // A linked change must belong to this conversation (or not exist yet).
+  if (input.changeRequestIds?.length) {
+    const st = changeRequestStatuses(input.changeRequestIds);
+    const foreign = input.changeRequestIds.filter((cid) => st.has(cid) && !changeBelongsTo(st.get(cid)!, thread.id, inbound.from_email));
+    if (foreign.length) return { ok: false, status: 409, error: "change_request_other_thread", detail: foreign.join(", ") };
+  }
   const subject = (input.subject ?? "").trim() || replySubject(thread.subject ?? inbound.subject);
   const id = `rp-${randomUUID()}`;
   const ts = nowIso(now);
@@ -301,9 +323,10 @@ export function createReplyProposal(input: CreateProposalInput, deps: { now?: Da
   const superseded: string[] = [];
   const tx = db.transaction(() => {
     const older = db
-      .prepare(`SELECT id FROM cs_reply_proposals WHERE thread_id = ? AND status IN ('pending', 'approval_needed')`)
-      .all(thread.id) as Array<{ id: string }>;
+      .prepare(`SELECT id, outbox_id FROM cs_reply_proposals WHERE thread_id = ? AND status IN ('pending', 'approval_needed')`)
+      .all(thread.id) as Array<{ id: string; outbox_id: string | null }>;
     for (const o of older) {
+      if (o.outbox_id) db.prepare(`UPDATE crm_outbox SET status = 'superseded' WHERE id = ? AND status IN ('pending', 'processing', 'failed')`).run(o.outbox_id);
       db.prepare(
         `UPDATE cs_reply_proposals SET status = 'superseded', block_reason = 'nyere_forslag', block_detail = ?, updated_at = ? WHERE id = ?`,
       ).run(id, ts, o.id);
@@ -361,11 +384,16 @@ export type Evaluation =
 /**
  * Every gate, read-only. `auto` is the worker; `approved` is Daniel pressing
  * Send — that skips the gates that exist only to make Daniel look (kind,
- * change wording in the text, quotas, a newer message on the thread) but
- * keeps the hard ones (thread, recipient, linked changes verified, branding,
- * encoding, duplicate, bounce/complaint, live transport).
+ * change wording in the text, quotas, recipient ≠ thread contact) but keeps
+ * the hard ones (thread, recipient never our own address, a newer customer
+ * message unless explicitly acknowledged, linked changes verified and on this
+ * thread, branding, encoding, duplicate, bounce/complaint, live transport).
  */
-export function evaluateProposal(p: ProposalRow, mode: SendMode, deps: { now?: Date; env?: NodeJS.ProcessEnv; liveTransport?: boolean } = {}): Evaluation {
+export function evaluateProposal(
+  p: ProposalRow,
+  mode: SendMode,
+  deps: { now?: Date; env?: NodeJS.ProcessEnv; liveTransport?: boolean; acknowledgeNewerInbound?: boolean } = {},
+): Evaluation {
   const now = deps.now ?? new Date();
   const env = deps.env ?? process.env;
   const db = getDb();
@@ -386,10 +414,19 @@ export function evaluateProposal(p: ProposalRow, mode: SendMode, deps: { now?: D
 
   const inbound = latestHumanInbound(p.thread_id);
   if (!inbound) return stop("ingen_innkommende", "tråden har ingen innkommende melding fra en person");
+  if (isOurPlatformAddress(p.to_email)) return stop("mottaker_er_egen_adresse", "mottakeren er en av våre egne adresser");
   if (inbound.from_email !== p.to_email.trim().toLowerCase()) {
     return stop("mottaker_endret", `siste innkommende er nå fra en annen adresse enn forslaget svarer`);
   }
-  if (mode === "auto" && p.answers_message_id && inbound.message_id !== p.answers_message_id) {
+  if (mode === "auto") {
+    const contact = db.prepare("SELECT c.email FROM crm_threads t JOIN crm_contacts c ON c.id = t.contact_id WHERE t.id = ?").get(p.thread_id) as { email: string } | undefined;
+    if ((contact?.email ?? "").trim().toLowerCase() !== p.to_email.trim().toLowerCase()) {
+      return stop("mottaker_ikke_kontakt", "siste melding er fra en annen enn trådens kontakt — Daniel avgjør hvem som skal ha svaret");
+    }
+  }
+  // Both modes: a newer customer message means the proposal may not answer
+  // it. Daniel may still send it, but only explicitly (acknowledgeNewerInbound).
+  if (p.answers_message_id && inbound.message_id !== p.answers_message_id && !deps.acknowledgeNewerInbound) {
     return stop("ny_melding_etter_forslag", "kunden har skrevet igjen etter at forslaget ble laget");
   }
 
@@ -405,6 +442,8 @@ export function evaluateProposal(p: ProposalRow, mode: SendMode, deps: { now?: D
     const st = changeRequestStatuses(crIds);
     // «fjern_steg1» tells the customer the profile is hidden and will be
     // deleted: a removal that has reached «hidden» is enough for that text.
+    const foreign = crIds.filter((id) => st.has(id) && !changeBelongsTo(st.get(id)!, p.thread_id, p.to_email));
+    if (foreign.length > 0) return stop("endring_feil_traad", `koblet endring gjelder en annen tråd eller person: ${foreign.join(", ")}`);
     const satisfied = (id: string) => {
       const c = st.get(id);
       if (!c) return false;
@@ -441,7 +480,8 @@ export function evaluateProposal(p: ProposalRow, mode: SendMode, deps: { now?: D
         ORDER BY id DESC LIMIT 1`,
     )
     .get(p.to_email) as { bounce_type: string } | undefined;
-  if (bounced && mode === "auto") {
+  // Both modes: a hard bounce cannot be delivered and a spam complaint must not be mailed again.
+  if (bounced) {
     return stop("mottaker_avvist", bounced.bounce_type === "complaint" ? "mottakeren har klaget (spam)" : "adressen har hard bounce");
   }
 
@@ -505,7 +545,7 @@ export interface ProcessResult {
  */
 export async function processProposal(
   id: string,
-  deps: { now?: Date; env?: NodeJS.ProcessEnv; sendRaw?: SendRawFn; liveTransport?: boolean } = {},
+  deps: { now?: Date; env?: NodeJS.ProcessEnv; sendRaw?: SendRawFn; liveTransport?: boolean; acknowledgeNewerInbound?: boolean } = {},
 ): Promise<ProcessResult> {
   const now = deps.now ?? new Date();
   const ts = nowIso(now);
@@ -516,7 +556,12 @@ export async function processProposal(
   if (p.next_attempt_at && Date.parse(p.next_attempt_at) > now.getTime()) return { id, outcome: "skipped", reason: "retry_not_due" };
   const mode: SendMode = p.status === "approved" ? "approved" : "auto";
 
-  const ev = evaluateProposal(p, mode, { now, env: deps.env, liveTransport: deps.liveTransport });
+  let ev = evaluateProposal(p, mode, { now, env: deps.env, liveTransport: deps.liveTransport, acknowledgeNewerInbound: deps.acknowledgeNewerInbound });
+  // Daniel pressed Send but the linked change is not verified yet: back to
+  // the queue with the reason (an «approved» row must never linger unseen).
+  if (!ev.ok && ev.outcome === "waiting" && mode === "approved") {
+    ev = { ok: false, outcome: "approval_needed", reason: ev.reason, detail: `${ev.detail} — trykk Send igjen når endringen er bekreftet` };
+  }
   if (!ev.ok && ev.outcome === "waiting") {
     // Stays in its state; re-checked after CHANGE_WAIT_RECHECK_MS. Visible on the proposal.
     db.prepare(`UPDATE cs_reply_proposals SET block_reason = ?, block_detail = ?, next_attempt_at = ?, updated_at = ? WHERE id = ? AND status = ?`).run(
@@ -550,12 +595,13 @@ export async function processProposal(
   }
 
   // Lease — synchronous, right after the synchronous evaluation.
+  const leaseUntil = new Date(now.getTime() + PROPOSAL_LEASE_MS).toISOString();
   const leased = db
     .prepare(
       `UPDATE cs_reply_proposals SET status = 'sending', lease_until = ?, attempts = attempts + 1, updated_at = ?
         WHERE id = ? AND status = ?`,
     )
-    .run(new Date(now.getTime() + PROPOSAL_LEASE_MS).toISOString(), ts, id, p.status);
+    .run(leaseUntil, ts, id, p.status);
   if (leased.changes !== 1) return { id, outcome: "skipped", reason: "lease_lost" };
   const attempt = p.attempts + 1;
 
@@ -594,15 +640,33 @@ export async function processProposal(
         rawMetadata: { source: "cs_reply_proposal", cs_reply: true, proposal_id: id, kind: p.kind, sent_mode: mode },
       }).messageId;
     } else {
+      // Reused after a failed attempt: the text may have been edited since —
+      // the CRM must show what is sent now, not what failed before.
+      db.prepare(`UPDATE crm_messages SET subject = ?, body_text = ?, body_html = ?, snippet = ?, to_emails = ? WHERE id = ?`).run(
+        p.subject,
+        p.body_text,
+        p.body_html ?? null,
+        p.body_text.slice(0, 200),
+        JSON.stringify([p.to_email]),
+        messageId,
+      );
       crmService.updateMessageDeliveryStatus(messageId, "queued");
     }
-    db.prepare(`UPDATE crm_outbox SET status = 'processing', error = NULL WHERE id = ?`).run(outboxId);
+    db.prepare(`UPDATE crm_outbox SET status = 'processing', error = NULL, subject = ?, body_text = ?, body_html = ?, to_emails = ?, created_by = ? WHERE id = ?`).run(
+      p.subject,
+      p.body_text,
+      p.body_html ?? null,
+      JSON.stringify([p.to_email]),
+      createdBy,
+      outboxId,
+    );
     db.prepare(`UPDATE cs_reply_proposals SET outbox_id = ?, crm_message_id = ? WHERE id = ?`).run(outboxId, messageId, id);
   } catch (e: any) {
     const msg = String(e?.message ?? e);
     db.prepare(
       `UPDATE cs_reply_proposals SET status = 'failed', block_reason = 'lagring_feilet', block_detail = ?, last_error = ?, lease_until = NULL, updated_at = ? WHERE id = ?`,
     ).run(msg, msg, ts, id);
+    if (outboxId) db.prepare(`UPDATE crm_outbox SET status = 'failed', error = ? WHERE id = ? AND status IN ('pending', 'processing')`).run(`lagring feilet: ${msg}`.slice(0, 500), outboxId);
     return { id, outcome: "failed", reason: "lagring_feilet", detail: msg };
   }
 
@@ -638,6 +702,8 @@ export async function processProposal(
     } catch (e) {
       console.error("[cs-autosend] bookkeeping after an accepted send failed:", e);
     }
+    // The mail went out: recorded as sent even if the lease ran out meanwhile
+    // (the truth beats the bookkeeping state it would otherwise overwrite).
     db.prepare(
       `UPDATE cs_reply_proposals
           SET status = 'sent', sent_at = ?, sent_mode = ?, smtp_message_id = ?, lease_until = NULL,
@@ -648,25 +714,36 @@ export async function processProposal(
   }
 
   const err = result.error || "send failed";
+  // Only while OUR lease still holds: if it ran out and the row moved on
+  // (ukjent utfall, rejected), a late failure must not put it back in line.
+  const stillOurs = !!db.prepare(`SELECT 1 FROM cs_reply_proposals WHERE id = ? AND status = 'sending' AND lease_until = ?`).get(id, leaseUntil);
   try {
     crmService.markOutboxResult(outboxId!, "failed", undefined, err);
     crmService.updateMessageDeliveryStatus(messageId!, "failed");
   } catch (e) {
     console.error("[cs-autosend] could not record a failed send:", e);
   }
+  if (!stillOurs) return { id, outcome: "failed", reason: "lease_lost", detail: err };
+  if (mode === "approved") {
+    // Daniel pressed Send: he sees the failure in the queue and decides.
+    db.prepare(
+      `UPDATE cs_reply_proposals SET status = 'approval_needed', block_reason = 'sending_feilet', block_detail = ?, last_error = ?, lease_until = NULL, next_attempt_at = NULL, updated_at = ? WHERE id = ? AND status = 'sending'`,
+    ).run(`sendingen feilet: ${err} — trykk Send for å prøve igjen`, err, doneTs, id);
+    return { id, outcome: "approval_needed", reason: "sending_feilet", detail: err };
+  }
   if (attempt < PROPOSAL_MAX_ATTEMPTS) {
     const next = new Date(now.getTime() + PROPOSAL_RETRY_BASE_MS * 2 ** (attempt - 1)).toISOString();
-    // Back to the state it came from; the outbox row goes back to pending for the next try.
-    db.prepare(`UPDATE crm_outbox SET status = 'pending' WHERE id = ?`).run(outboxId);
+    // Back to pending for the next try; the outbox row stays «failed» until
+    // then (never «pending», which the CS routine's outbox reader would see).
     db.prepare(
-      `UPDATE cs_reply_proposals SET status = ?, lease_until = NULL, next_attempt_at = ?, last_error = ?, updated_at = ? WHERE id = ?`,
-    ).run(p.status, next, err, doneTs, id);
+      `UPDATE cs_reply_proposals SET status = 'pending', lease_until = NULL, next_attempt_at = ?, last_error = ?, updated_at = ? WHERE id = ? AND status = 'sending'`,
+    ).run(next, err, doneTs, id);
     return { id, outcome: "retry", reason: "transport", detail: err };
   }
   db.prepare(
     `UPDATE cs_reply_proposals
         SET status = 'failed', block_reason = 'sending_feilet', block_detail = ?, last_error = ?, lease_until = NULL, updated_at = ?
-      WHERE id = ?`,
+      WHERE id = ? AND status = 'sending'`,
   ).run(`transporten feilet ${attempt} ganger: ${err}`, err, doneTs, id);
   crmService.logAction({
     threadId: p.thread_id,
@@ -748,7 +825,7 @@ export function editProposal(id: string, edits: ProposalEdits, actor: "daniel" |
 /** Daniel pressed Send (optionally with edits): approve and send now. */
 export async function approveProposal(
   id: string,
-  opts: { edits?: ProposalEdits; note?: string | null; actor?: "daniel"; source?: "admin-crm" | "api" } = {},
+  opts: { edits?: ProposalEdits; note?: string | null; actor?: "daniel"; source?: "admin-crm" | "api"; acknowledgeNewerInbound?: boolean } = {},
   deps: { now?: Date; env?: NodeJS.ProcessEnv; sendRaw?: SendRawFn; liveTransport?: boolean } = {},
 ): Promise<{ ok: true; result: ProcessResult; proposal: ProposalRow } | { ok: false; status: number; error: string }> {
   const now = deps.now ?? new Date();
@@ -767,15 +844,24 @@ export async function approveProposal(
     )
     .run(opts.actor ?? "daniel", ts, opts.note ?? null, ts, id);
   crmService.logAction({ threadId: p.thread_id, type: "proposal_approved", actor: opts.actor ?? "daniel", payload: { proposalId: id, source: opts.source ?? "api" } });
-  const result = await processProposal(id, deps);
+  if (opts.acknowledgeNewerInbound) {
+    // Daniel saw the newer customer message and still wants this reply sent:
+    // it now answers the latest message.
+    const latest = latestHumanInbound(p.thread_id);
+    if (latest) getDb().prepare(`UPDATE cs_reply_proposals SET answers_message_id = ?, in_reply_to = COALESCE(?, in_reply_to) WHERE id = ?`).run(latest.message_id, latest.rfc_message_id, id);
+  }
+  const result = await processProposal(id, { ...deps, acknowledgeNewerInbound: opts.acknowledgeNewerInbound });
   return { ok: true, result, proposal: getProposal(id)! };
 }
 
 export function rejectProposal(id: string, reason: string, actor: "daniel" | "claude", now: Date = new Date()): { ok: true } | { ok: false; status: number; error: string } {
   const p = getProposal(id);
   if (!p) return { ok: false, status: 404, error: "proposal not found" };
-  if (!EDITABLE.includes(p.status) && p.status !== "failed") return { ok: false, status: 409, error: `proposal is ${p.status}` };
+  // An «approved» row without a live lease (stuck) may be rejected too.
+  const stuckApproved = p.status === "approved" && (!p.lease_until || Date.parse(p.lease_until) < now.getTime());
+  if (!EDITABLE.includes(p.status) && p.status !== "failed" && !stuckApproved) return { ok: false, status: 409, error: `proposal is ${p.status}` };
   const ts = nowIso(now);
+  if (p.outbox_id) getDb().prepare(`UPDATE crm_outbox SET status = 'superseded' WHERE id = ? AND status IN ('pending', 'processing', 'failed')`).run(p.outbox_id);
   getDb()
     .prepare(`UPDATE cs_reply_proposals SET status = 'rejected', decided_by = ?, decided_at = ?, decision_note = ?, updated_at = ? WHERE id = ?`)
     .run(actor, ts, reason, ts, id);

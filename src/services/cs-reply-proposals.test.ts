@@ -15,6 +15,11 @@
  *              concurrent processing sends once.
  *   cr34-cr41  approval queue: approve (with edits) sends as daniel, reject,
  *              edit, refusal of unknown-outcome rows; worker run-ledger row.
+ *   crx1-crx8  review fixes: Send from the queue never leaves a stuck row;
+ *              edits after a failure are what the CRM shows; a newer customer
+ *              message needs an explicit acknowledgement; never our own
+ *              address, never a non-contact automatically; a change request
+ *              must belong to the thread; a lost lease is not re-queued.
  *   cr42-cr52  routes, /outbox/:id/result validation, needs-reply + watchdog +
  *              digest integration.
  *
@@ -135,6 +140,8 @@ export function runCsReplyProposalsTests(opts: { log?: boolean } = {}): Promise<
       // ── gates ────────────────────────────────────────────────────────
       const gate = async (threadOpts: Parameters<typeof mkThread>[1], extra: Partial<Parameters<typeof rp.createReplyProposal>[0]>, d: Record<string, unknown> = {}, vertical: "rfb" | "experiences" = "rfb") => {
         const t = mkThread(vertical, threadOpts);
+        // A linked change belongs to the conversation it confirms.
+        for (const cid of extra.changeRequestIds ?? []) db.prepare("UPDATE cs_change_requests SET thread_id = ? WHERE id = ?").run(t.id, cid);
         const c = create(t.id, extra);
         if (!c.ok) return { outcome: "create_failed", reason: (c as any).error };
         return rp.processProposal(c.proposal.id, deps(d));
@@ -219,7 +226,7 @@ export function runCsReplyProposalsTests(opts: { log?: boolean } = {}): Promise<
         sendResult = { success: false, error: "421 try again" };
         const f1 = await rp.processProposal(id, deps());
         eq([f1.outcome, P(id).status, P(id).attempts], ["retry", "pending", 1], "cr27: a transport failure → retry later (back to pending)");
-        eq((db.prepare(`SELECT status FROM crm_outbox WHERE id = ?`).get(P(id).outbox_id) as any).status, "pending", "cr28: the outbox row waits for the retry");
+        eq((db.prepare(`SELECT status FROM crm_outbox WHERE id = ?`).get(P(id).outbox_id) as any).status, "failed", "cr28: during the back-off the outbox row is «failed», never «pending» (the routine's outbox reader must not pick it up)");
         eq((await rp.processProposal(id, deps())).reason, "retry_not_due", "cr29: not retried before the back-off");
         const later = (min: number) => new Date(Date.now() + min * 60_000);
         await rp.processProposal(id, deps({ now: later(3) }));
@@ -297,6 +304,69 @@ export function runCsReplyProposalsTests(opts: { log?: boolean } = {}): Promise<
         const t3 = mkThread();
         const c3 = create(t3.id);
         eq([rp.parkPendingWhenAutosendOff(OFF) >= 1, c3.ok && P(c3.proposal.id).status], [true, "approval_needed"], "cr41c: autosend switched off → pending proposals move to the queue");
+      }
+
+      // ── review fixes (S2 review B1–B6, N1) ──────────────────────────
+      {
+        // B1: Daniel presses Send with autosend off and the transport fails → back in the queue, never a stuck «approved».
+        const t = mkThread();
+        const c = create(t.id, { kind: "annet", bodyText: "Svar som feiler første gang." }, OFF);
+        const id = c.ok ? c.proposal.id : "";
+        sendResult = { success: false, error: "421 busy" };
+        const a1 = await rp.approveProposal(id, {}, { env: OFF, sendRaw, liveTransport: true });
+        eq([a1.ok && a1.result.outcome, P(id).status, P(id).block_reason], ["approval_needed", "approval_needed", "sending_feilet"], "crx1: a failed send from the queue goes back to the queue with the reason");
+        sendResult = { success: true, messageId: "<smtp-x1@rfb>" };
+        // B6: edit after the failure → the CRM shows the text actually sent
+        const a2 = await rp.approveProposal(id, { edits: { bodyText: "Ny tekst fra Daniel." } }, { env: OFF, sendRaw, liveTransport: true });
+        const m = db.prepare(`SELECT body_text, delivery_status FROM crm_messages WHERE id = ?`).get(P(id).crm_message_id) as any;
+        const o = db.prepare(`SELECT body_text, status FROM crm_outbox WHERE id = ?`).get(P(id).outbox_id) as any;
+        eq([a2.ok && a2.result.outcome, m.body_text, m.delivery_status, o.body_text, o.status], ["sent", "Ny tekst fra Daniel.", "sent", "Ny tekst fra Daniel.", "completed"], "crx2: after an edit, the reused message and outbox rows carry the text that was sent");
+      }
+      {
+        // B2: a newer customer message stops Send too — unless Daniel explicitly acknowledges it.
+        const t = mkThread();
+        const c = create(t.id, { kind: "annet", bodyText: "Svar på det første spørsmålet." }, OFF);
+        const id = c.ok ? c.proposal.id : "";
+        addInbound(t.id, t.email, 2000);
+        const b1 = await rp.approveProposal(id, {}, { env: OFF, sendRaw, liveTransport: true });
+        eq([b1.ok && b1.result.reason, P(id).status], ["ny_melding_etter_forslag", "approval_needed"], "crx3: Send from the queue is stopped by a newer customer message");
+        const b2 = await rp.approveProposal(id, { acknowledgeNewerInbound: true }, { env: OFF, sendRaw, liveTransport: true });
+        eq(b2.ok && b2.result.outcome, "sent", "crx4: …and sent when Daniel says he has read it");
+      }
+      {
+        // B3: our own address is never the recipient; a CC person is not the contact on the automatic path.
+        const t = mkThread();
+        crm.crmService.ingestThread({ threadId: t.id, messages: [{ messageId: `${t.id}-copy`, direction: "in", fromEmail: "kontakt@rettfrabonden.com", bodyText: "Videresendt kopi", sentAt: new Date(Date.now() + 1000).toISOString() }] }, t.email, "rfb");
+        const c = create(t.id);
+        eq(c.ok && c.proposal.to_email, t.email, "crx5: a newer message from our own address is skipped — the customer stays the recipient");
+        const t2 = mkThread();
+        crm.crmService.ingestThread({ threadId: t2.id, messages: [{ messageId: `${t2.id}-cc`, direction: "in", fromEmail: "kollega@annen.no", bodyText: "Jeg svarer for Kari", sentAt: new Date(Date.now() + 1000).toISOString() }] }, t2.email, "rfb");
+        const c2 = create(t2.id);
+        eq(c2.ok && (await rp.processProposal(c2.proposal.id, deps())).reason, "mottaker_ikke_kontakt", "crx6: a reply to someone other than the thread's contact waits for Daniel");
+      }
+      {
+        // B4: a change request from another thread can neither be linked nor release a reply.
+        const tA = mkThread();
+        const tB = mkThread();
+        const ts2 = new Date().toISOString();
+        db.prepare(
+          `INSERT INTO cs_change_requests (id, vertical, target_id, thread_id, requester_email, kind, authority, status, created_by, created_at, updated_at)
+           VALUES ('chg-a', 'rfb', 'ag-a', ?, ?, 'profile_update', 'registered_email', 'verified', 'claude', ?, ?)`,
+        ).run(tA.id, tA.email, ts2, ts2);
+        const c = create(tB.id, { kind: "rettelse_bekreftet", changeRequestIds: ["chg-a"], bodyText: "Vi har nå oppdatert åpningstidene dine." });
+        eq([(c as any).status, (c as any).error], [409, "change_request_other_thread"], "crx7: linking another thread's change request is refused");
+      }
+      {
+        // N1: a lease that ran out during a slow send, then a late failure → the row is not put back in line.
+        const t = mkThread();
+        const c = create(t.id, { bodyText: "Treg sending." });
+        const id = c.ok ? c.proposal.id : "";
+        const slowFail = async () => {
+          db.prepare(`UPDATE cs_reply_proposals SET status = 'failed', block_reason = 'ukjent_utfall' WHERE id = ?`).run(id);
+          return { success: false, error: "timeout" };
+        };
+        const r = await rp.processProposal(id, { env: ON, sendRaw: slowFail, liveTransport: true });
+        eq([r.reason, P(id).status], ["lease_lost", "failed"], "crx8: a late transport failure after the lease was lost does not re-queue the proposal");
       }
 
       // ── routes ───────────────────────────────────────────────────────

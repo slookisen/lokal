@@ -226,11 +226,11 @@ export function processResendWebhookEvent(svixId: string, event: any): ResendWeb
   }
   // S3 (CS på serveren): which CRM message a bounce / complaint / soft bounce
   // belongs to — same recipient + time rule as a delivery. Read-only, best effort.
-  let verdictCrmMessageId: string | null = deliveryCrmMessageId;
-  if (email && outcome !== "delivery_recorded" && outcome !== "ambiguous_recipient") {
+  let verdictCrmMessageId: string | null = null;
+  if (email && outcome !== "ambiguous_recipient") {
     try {
       const acceptedAt = [data?.created_at, event?.created_at].map((v) => parseDbTime(v)).find((t) => Number.isFinite(t));
-      verdictCrmMessageId = resolveDeliveryCrmMessage(email, new Date(acceptedAt ?? Date.now()));
+      verdictCrmMessageId = resolveVerdictCrmMessage(email, new Date(acceptedAt ?? Date.now()), data?.subject);
     } catch (err: any) {
       console.warn(`[resend-webhook] message attribution failed (event recorded without it): ${err?.message ?? err}`);
     }
@@ -480,6 +480,45 @@ export function resolveDeliveryCrmMessage(email: string, acceptedAt: Date): stri
     if (parseRecipientList(r.to_emails).includes(email)) return r.id;
   }
   return null;
+}
+
+/**
+ * S3 (CS på serveren): the CRM message a delivery VERDICT (delivered / bounced /
+ * complained) belongs to. Stricter than resolveDeliveryCrmMessage, because a
+ * verdict changes what the CRM shows (a bounced reply puts its thread back
+ * in «trenger svar»): the subject must match when Resend gives one, and two
+ * candidate sends within VERDICT_AMBIGUITY_MS of each other make it
+ * ambiguous → null (no verdict recorded rather than a wrong one).
+ */
+export const VERDICT_AMBIGUITY_MS = 10 * 60_000;
+function normSubject(s: unknown): string {
+  return typeof s === "string" ? s.replace(/\s+/g, " ").trim().toLowerCase() : "";
+}
+export function resolveVerdictCrmMessage(email: string, acceptedAt: Date, subject: unknown): string | null {
+  const hi = acceptedAt.getTime() + BOUNCE_ATTRIBUTION_CLOCK_SLACK_MS;
+  const lo = acceptedAt.getTime() - DELIVERY_ATTRIBUTION_LOOKBACK_DAYS * 86400_000;
+  const toSql = (ms: number) => new Date(ms).toISOString().slice(0, 19).replace("T", " ");
+  const like = "%" + email.toLowerCase().replace(/[\\%_]/g, (c) => "\\" + c) + "%";
+  const rows = getDb()
+    .prepare(
+      `SELECT id, to_emails, sent_at, subject FROM crm_messages
+        WHERE direction = 'out' AND sent_at IS NOT NULL
+          AND datetime(sent_at) >= datetime(?) AND datetime(sent_at) <= datetime(?)
+          AND LOWER(to_emails) LIKE ? ESCAPE '\\'
+        ORDER BY datetime(sent_at) DESC, rowid DESC
+        LIMIT ${DELIVERY_CANDIDATE_LIMIT}`,
+    )
+    .all(toSql(lo), toSql(hi), like) as Array<{ id: string; to_emails: string | null; sent_at: string; subject: string | null }>;
+  const want = normSubject(subject);
+  const cands = rows.filter((r) => {
+    const at = parseDbTime(r.sent_at);
+    if (!Number.isFinite(at) || at < lo || at > hi) return false;
+    if (!parseRecipientList(r.to_emails).includes(email)) return false;
+    return !want || normSubject(r.subject) === want;
+  });
+  if (cands.length === 0) return null;
+  if (cands.length > 1 && Math.abs(parseDbTime(cands[0].sent_at) - parseDbTime(cands[1].sent_at)) < VERDICT_AMBIGUITY_MS) return null;
+  return cands[0].id;
 }
 
 export interface EmailDeliveryEvent {
