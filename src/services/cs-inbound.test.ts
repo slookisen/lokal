@@ -36,6 +36,10 @@
  *   ci96-ci98  fourth review: a subject-less copy is recognised per message
  *              (sender on our domain) also in an aliased thread; a recent copy
  *              with no log row is filed; a kept auto-reply copy never reopens.
+ *   ci99-ci104 fifth review: the log's automated_kind alone stops a reopen
+ *              (neutral subject); a bounce copy with no log row is read from
+ *              «(fra … <mailer-daemon@…>)»; a failed alias lookup answers 500
+ *              with nothing filed and the retry reopens the thread.
  *
  * Every assertion reads the DATABASE where a write is claimed.
  *
@@ -258,7 +262,8 @@ export function runCsInboundTests(opts: { log?: boolean } = {}): Promise<TestSum
           json(b: any) { this._body = b; settle(); return this; },
           send(b: any) { this._body = b; settle(); return this; },
         };
-        crmRouter.handle(req, res, () => settle());
+        // As Express's final handler: an error passed on is a 500.
+        crmRouter.handle(req, res, (err?: unknown) => { if (err) { res.statusCode = 500; res._body = { error: String((err as any)?.message ?? err) }; } settle(); });
         await done;
         return { status: res.statusCode, body: res._body };
       };
@@ -374,6 +379,37 @@ export function runCsInboundTests(opts: { log?: boolean } = {}): Promise<TestSum
         const oooCopy = { messageId: "gm-ooo-copy", direction: "in", fromEmail: "kontakt@rettfrabonden.com", subject: "[Innkommende] Automatisk svar: Re: Spørsmål (fra Kari)", bodyText: `Videresent fra: kari\nInbound-ID: inb-ooo-000000001\n\nPå ferie`, sentAt: new Date().toISOString() };
         await call("POST", "/ingest", { threadId: "gm-thread-1", primaryFromEmail: "kari@testgard.no", vertical: "rfb", messages: [oooCopy] });
         eq([(db.prepare("SELECT COUNT(*) n FROM crm_messages WHERE id = 'gm-ooo-copy'").get() as any).n, (db.prepare("SELECT status FROM crm_threads WHERE id = ?").get(serverThread1) as any)?.status], [1, "done"], "ci98: a kept copy of an auto-reply is filed but does not reopen the thread");
+
+        // ci99-ci104 (fifth review)
+        const threadStatus = () => (db.prepare("SELECT status FROM crm_threads WHERE id = ?").get(serverThread1) as any)?.status;
+        const filed = (id: string) => (db.prepare("SELECT COUNT(*) n FROM crm_messages WHERE id = ?").get(id) as any).n;
+        crm.crmService.setThreadStatus(serverThread1, "done", "claude");
+        db.prepare(`INSERT INTO inbound_email_log (id, email_id, from_email, subject, crm_status, automated_kind, received_at) VALUES ('inb-neutral-00001', 'neutral-1', 'kari@testgard.no', 'Om bestillingen', 'disabled', 'auto_reply', ?)`).run(new Date().toISOString());
+        const neutralAuto = { messageId: "gm-neutral-auto", direction: "in", fromEmail: "kontakt@rettfrabonden.com", subject: "[Innkommende] Om bestillingen (fra Kari <kari@testgard.no>)", bodyText: `Videresent fra: kari\nInbound-ID: inb-neutral-00001\n\nTakk`, sentAt: new Date().toISOString() };
+        await call("POST", "/ingest", { threadId: "gm-thread-1", primaryFromEmail: "kari@testgard.no", vertical: "rfb", messages: [neutralAuto] });
+        eq([filed("gm-neutral-auto"), threadStatus()], [1, "done"], "ci99: a kept copy with a NEUTRAL subject whose log row says auto_reply is filed but does not reopen");
+        db.prepare(`INSERT INTO inbound_email_log (id, email_id, from_email, subject, crm_status, received_at) VALUES ('inb-neutral-00002', 'neutral-2', 'kari@testgard.no', 'Om bestillingen', 'disabled', ?)`).run(new Date().toISOString());
+        const neutralHuman = { ...neutralAuto, messageId: "gm-neutral-human", bodyText: `Videresent fra: kari\nInbound-ID: inb-neutral-00002\n\nNår kan jeg hente?` };
+        await call("POST", "/ingest", { threadId: "gm-thread-1", primaryFromEmail: "kari@testgard.no", vertical: "rfb", messages: [neutralHuman] });
+        eq([filed("gm-neutral-human"), threadStatus()], [1, "new"], "ci100: the same copy without automated_kind reopens (control for ci99)");
+        crm.crmService.setThreadStatus(serverThread1, "done", "claude");
+        const bounceCopy = { messageId: "gm-bounce-copy", direction: "in", fromEmail: "kontakt@rettfrabonden.com", subject: "[Innkommende] Re: Om bestillingen (fra Mail Delivery Subsystem <mailer-daemon@googlemail.com>)", bodyText: `Videresent fra: mailer-daemon\nInbound-ID: inb-bounce-nolog-01\n\nAddress not found`, sentAt: new Date().toISOString() };
+        await call("POST", "/ingest", { threadId: "gm-thread-1", primaryFromEmail: "kari@testgard.no", vertical: "rfb", messages: [bounceCopy] });
+        eq([filed("gm-bounce-copy"), threadStatus()], [1, "done"], "ci101: a bounce copy with no log row is filed (recent) but does not reopen: the sender is read from «(fra … <mailer-daemon@…>)»");
+        eq([ci.classifyForwardCopy({ subject: "[Innkommende] Hei (fra Mail Delivery Subsystem)", fromEmail: "kontakt@rettfrabonden.com", headers: {} }).kind, ci.classifyForwardCopy({ subject: "[Innkommende] Leveringstid? (fra Ola <ola@gard.no>)", fromEmail: "kontakt@rettfrabonden.com", headers: {} }).kind, ci.forwardOriginalSender("[Innkommende] X (fra ola@gard.no)")?.email],
+          ["bounce", null, "ola@gard.no"], "ci102: classifyForwardCopy reads a bounce from the sender name, leaves a customer subject alone, parses a bare address");
+        db.exec("ALTER TABLE crm_thread_aliases RENAME TO crm_thread_aliases_off");
+        let threw = false;
+        try { ci.resolveThreadAlias("gm-thread-1", { strict: true }); } catch { threw = true; }
+        const lenient = ci.resolveThreadAlias("gm-thread-1");
+        const customerAnswer = { messageId: "gm-after-alias-err", direction: "in", fromEmail: "kari@testgard.no", subject: "Re: Om bestillingen", bodyText: "Fredag passer", sentAt: new Date().toISOString() };
+        const rErr = await call("POST", "/ingest", { threadId: "gm-thread-1", primaryFromEmail: "kari@testgard.no", vertical: "rfb", messages: [customerAnswer] });
+        const afterErr = [rErr.status, filed("gm-after-alias-err"), (db.prepare("SELECT COUNT(*) n FROM crm_threads WHERE id = 'gm-thread-1'").get() as any).n];
+        db.exec("ALTER TABLE crm_thread_aliases_off RENAME TO crm_thread_aliases");
+        eq([threw, lenient], [true, "gm-thread-1"], "ci103: resolveThreadAlias({strict}) lets a DB error through; the lenient form still returns the id");
+        eq(afterErr, [500, 0, 0], "ci104: a failed alias lookup on /ingest answers 500 and files nothing (no thread on the Gmail id)");
+        const rRetry = await call("POST", "/ingest", { threadId: "gm-thread-1", primaryFromEmail: "kari@testgard.no", vertical: "rfb", messages: [customerAnswer] });
+        eq([rRetry.body?.threadId === serverThread1, filed("gm-after-alias-err"), threadStatus()], [true, 1, "new"], "ci104b: the retry files the answer on the server thread and reopens it");
       }
 
       // ci77-ci78 (review #8): a copy of an e-mail the server parked as untriaged opens no second item

@@ -393,13 +393,19 @@ export function findThreadForInbound(input: {
 
 // ─── Aliases (Gmail thread id → server thread id) ─────────────────────
 
-export function resolveThreadAlias(id: string): string {
+/**
+ * The server thread a Gmail thread id is an alias of, or the id itself.
+ * `strict` lets a DB error through: /ingest must answer 500 (the caller
+ * retries) rather than file the messages on the Gmail thread id.
+ */
+export function resolveThreadAlias(id: string, opts: { strict?: boolean } = {}): string {
   try {
     const r = getDb().prepare("SELECT thread_id FROM crm_thread_aliases WHERE alias_id = ?").get(id) as
       | { thread_id: string }
       | undefined;
     return r?.thread_id ?? id;
-  } catch {
+  } catch (e) {
+    if (opts.strict) throw e;
     return id;
   }
 }
@@ -440,6 +446,42 @@ export function isOurPlatformAddress(email: string | null | undefined): boolean 
 export function stripForwardSubject(subject: string | null): string | null {
   if (!subject) return subject;
   return subject.replace(/^\s*\[Innkommende\]\s*/i, "").replace(/\s*\(fra [^()]*\)\s*$/i, "");
+}
+
+/**
+ * The original sender a forward names at the end of its subject:
+ * «… (fra Name <addr>)» or «… (fra addr)». Null without that suffix.
+ */
+export function forwardOriginalSender(subject: string | null | undefined): { email: string | null; name: string } | null {
+  const m = /\(fra ([^()]*)\)\s*$/i.exec(subject ?? "");
+  if (!m) return null;
+  const inner = m[1].trim();
+  const angle = /<([^<>\s]+@[^<>\s]+)>/.exec(inner);
+  const bare = /^([^\s<>@]+@[^\s<>@]+)$/.exec(inner);
+  const email = (angle?.[1] ?? bare?.[1] ?? null)?.toLowerCase() ?? null;
+  const name = inner.replace(/<[^<>]*>/g, "").replace(/^"+|"+$/g, "").trim();
+  return { email, name };
+}
+
+/**
+ * classifyAutomated for the Gmail copy of a forward. The copy is sent from
+ * our own address, so the original sender is read from «(fra …)» in its
+ * subject: a bounce from «Mail Delivery Subsystem <mailer-daemon@…>» stays a
+ * bounce when its log row is gone.
+ */
+export function classifyForwardCopy(input: { subject: string | null | undefined; fromEmail: string; headers: InboundHeaders }): {
+  kind: AutomatedKind;
+  reason: string | null;
+} {
+  const orig = forwardOriginalSender(input.subject);
+  const r = classifyAutomated({
+    subject: stripForwardSubject(input.subject ?? null),
+    fromEmail: orig?.email ?? input.fromEmail,
+    headers: input.headers,
+  });
+  if (r.kind !== null || !orig?.name) return r;
+  if (BOUNCE_SUBJECT_RE.test(orig.name)) return { kind: "bounce", reason: "bounce sender name" };
+  return r;
 }
 
 export type MarkerTarget =

@@ -25,6 +25,7 @@ import { unsubscribeHeaderValues } from "../services/avmeld-service";
 import { getOutreachMaxTouchVernConfig, getMaxTouchStatusForEmail } from "../services/outreach-max-touch-vern";
 import {
   classifyAutomated,
+  classifyForwardCopy,
   csInboundServerIngestEnabled,
   forwardCopyMarker,
   inboundLogAutomatedKind,
@@ -1245,7 +1246,14 @@ router.post("/ingest", (req, res) => {
   {
     let canonical: { threadId: string; vertical: string; contactId: string } | null = null;
     let parkedLogId: string | null = null;
-    const aliasTarget = resolveThreadAlias(parsed.data.threadId);
+    // Strict: a failed lookup answers 500 (the caller retries) instead of
+    // filing the messages on the Gmail thread id.
+    let aliasTarget: string;
+    try {
+      aliasTarget = resolveThreadAlias(parsed.data.threadId, { strict: true });
+    } catch (err: any) {
+      return res.status(500).json({ error: `alias lookup failed: ${String(err?.message ?? err)}` });
+    }
     if (aliasTarget !== parsed.data.threadId) {
       const t = getDb().prepare("SELECT id, vertical_id, contact_id FROM crm_threads WHERE id = ?").get(aliasTarget) as
         | { id: string; vertical_id: string; contact_id: string }
@@ -1253,9 +1261,8 @@ router.post("/ingest", (req, res) => {
       if (t) canonical = { threadId: t.id, vertical: t.vertical_id, contactId: t.contact_id };
     }
     // The thread's first message: the earliest by sentAt when every message
-    // carries one, otherwise the first in the payload (Gmail's own order). Only
-    // for THIS message may the Gmail thread subject stand in for a missing
-    // per-message subject.
+    // carries one, otherwise the first in the payload (Gmail's own order).
+    // Only this message can make the Gmail thread id a new alias.
     const msgs = parsed.data.messages;
     const times = msgs.map((m) => (m.sentAt ? Date.parse(m.sentAt) : NaN));
     const first = times.every((t) => Number.isFinite(t)) ? msgs[times.indexOf(Math.min(...times))] : msgs[0];
@@ -1279,9 +1286,9 @@ router.post("/ingest", (req, res) => {
     // NOT file that e-mail (flag off, registration error) — then it is the
     // only record. A copy the server filed (thread or parked) is left out, and
     // so is one whose log row was purged after 90 days (it was handled then;
-    // filing it now would be a duplicate). No subject fallback here: a message
-    // without its own subject is never taken for a copy (a customer's
-    // plain-text reply may carry the marker unquoted).
+    // filing it now would be a duplicate). The subject fallback in copyIdOf
+    // applies only to a message sent from one of our own addresses, so a
+    // customer's plain-text reply carrying the marker unquoted is still filed.
     // A missing log row means "purged after the retention window" ONLY when
     // the copy itself is that old. A recent copy with no row (restored backup,
     // a log insert that failed) is filed — a duplicate beats a lost e-mail.
@@ -1308,7 +1315,23 @@ router.post("/ingest", (req, res) => {
         // The contact is the server thread's own — never whatever primaryFromEmail
         // the caller sent (on a forwarded copy that is often our own address).
         const contact = getDb().prepare("SELECT email FROM crm_contacts WHERE id = ?").get(canonical.contactId) as { email: string } | undefined;
+        // A NEW inbound message from a person (e.g. the customer answering
+        // Daniel's Gmail reply directly) reopens a done/archived thread, as on
+        // the server path. Never Daniel's own reply, never an already-filed
+        // message, never an auto-reply or bounce. Decided BEFORE the messages
+        // are written: a DB error here answers 500 with nothing filed, so the
+        // retry still sees the messages as new and reopens the thread.
+        let newHumanIn = false;
         try {
+          newHumanIn = rest.some((m) => {
+            if (existed.has(m.messageId) || m.direction !== "in" || m.rawMetadata?.automated === true) return false;
+            const headers = readInboundHeaders(m.rawMetadata ?? {});
+            const cid = copyIdOf(m);
+            if (!cid) return classifyAutomated({ subject: stripForwardSubject(m.subject ?? null), fromEmail: m.fromEmail, headers }).kind === null;
+            // A kept copy of an e-mail the server logged: its own classification counts.
+            if (inboundLogAutomatedKind(cid)) return false;
+            return classifyForwardCopy({ subject: m.subject ?? parsed.data.subject ?? null, fromEmail: m.fromEmail, headers }).kind === null;
+          });
           const r = crmService.ingestThread(
             { threadId: canonical.threadId, messages: rest },
             contact?.email || parsed.data.primaryFromEmail,
@@ -1318,17 +1341,6 @@ router.post("/ingest", (req, res) => {
         } catch (err: any) {
           return res.status(500).json({ error: String(err?.message ?? "ingest failed") });
         }
-        // A NEW inbound message from a person (e.g. the customer answering
-        // Daniel's Gmail reply directly) reopens a done/archived thread, as on
-        // the server path. Never Daniel's own reply, never an already-filed
-        // message, never an auto-reply or bounce.
-        const newHumanIn = rest.some((m) => {
-          if (existed.has(m.messageId) || m.direction !== "in" || m.rawMetadata?.automated === true) return false;
-          // A kept copy of an e-mail the server logged: its own classification counts.
-          const cid = copyIdOf(m);
-          if (cid && inboundLogAutomatedKind(cid)) return false;
-          return classifyAutomated({ subject: stripForwardSubject(m.subject ?? null), fromEmail: m.fromEmail, headers: readInboundHeaders(m.rawMetadata ?? {}) }).kind === null;
-        });
         if (newMessages > 0 && newHumanIn) {
           const st = getDb().prepare("SELECT status FROM crm_threads WHERE id = ?").get(canonical.threadId) as { status: string } | undefined;
           if (st && (st.status === "done" || st.status === "archived")) {
