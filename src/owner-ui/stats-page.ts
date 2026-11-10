@@ -232,7 +232,10 @@ export function renderOwnerStatsSections(m: OwnerStatsPageModel): string {
   const af = s.aiFunnel || null;
   if (af) {
     const afDays = n0(af.windowDays) || 60;
-    const afLabel = (step: { label?: string } | undefined) => (step && step.label) || fill(T.aiFunnelDefaultLabel, { days: afDays });
+    // Owner-only: the shared aiDeliveriesPeriodLabel() says «siste 60 d» (public pages keep it);
+    // the owner page spells the unit out: «siste 60 dager».
+    const afLabel = (step: { label?: string } | undefined) =>
+      ((step && step.label) || fill(T.aiFunnelDefaultLabel, { days: afDays })).replace(/\b(siste \d+) d$/, "$1 dager");
     let tiles = "";
     let vendors = "";
     if (af.sentToAi) tiles += stat(afNum(af.sentToAi.total), esc(fill(T.aiFunnelSent, { label: afLabel(af.sentToAi) })), ` data-ai-funnel="sentToAi"`);
