@@ -334,6 +334,8 @@ export function runCsReplyProposalsTests(opts: { log?: boolean } = {}): Promise<
         eq([c.status, c.body?.proposal?.status, c.body?.proposal?.to_email], [201, "approval_needed", t.email], "cr42: POST /threads/:id/reply-proposals → 201, recipient from the thread");
         eq((await call("POST", `/threads/${t.id}/reply-proposals`, { kind: "ukjent", bodyText: "x" })).status, 400, "cr43: unknown kind → 400");
         eq((await call("POST", `/threads/${t.id}/reply-proposals`, { kind: "takk", bodyText: "x", toEmail: "annen@x.no" })).body?.proposal?.to_email, t.email, "cr44: a caller-supplied recipient is ignored");
+        const nrr = await call("GET", "/needs-reply?limit=5");
+        ok(nrr.status === 200 && typeof nrr.body?.server_mode?.autosend === "boolean" && nrr.body.server_mode.autosend === false && typeof nrr.body.server_mode.change_requests === "boolean", "cr44b: needs-reply reports server_mode (which parts the server does), for the CS routine");
         const q = await call("GET", "/reply-proposals?status=approval_needed");
         ok(q.status === 200 && q.body.items.some((x: any) => x.thread_id === t.id && typeof x.age_hours === "number"), "cr45: GET /reply-proposals lists the queue");
         eq((await call("GET", "/reply-proposals?status=bogus")).status, 400, "cr45b: invalid status filter → 400");

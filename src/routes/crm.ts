@@ -25,6 +25,7 @@ import { unsubscribeHeaderValues } from "../services/avmeld-service";
 import { getOutreachMaxTouchVernConfig, getMaxTouchStatusForEmail } from "../services/outreach-max-touch-vern";
 import {
   classifyAutomated,
+  csInboundServerIngestEnabled,
   forwardCopyMarker,
   inboundLogAutomatedKind,
   inboundLogExists,
@@ -36,9 +37,12 @@ import {
   stripForwardSubject,
 } from "../services/cs-inbound";
 import { computeNeedsReply, markNoReplyNeeded } from "../services/crm-needs-reply";
-import { buildDailyDigest, INBOUND_LOG_RETENTION_DAYS } from "../services/cs-watchdog";
+import { buildDailyDigest, csDailyDigestEnabled, csWatchdogEnabled, INBOUND_LOG_RETENTION_DAYS } from "../services/cs-watchdog";
+import { csChangeRequestsEnabled } from "../services/cs-change-requests";
+import { contactReceiptEnabled } from "../services/contact-form-cs";
 import {
   REPLY_KINDS,
+  csAutosendEnabled,
   approveProposal,
   createReplyProposal,
   editProposal,
@@ -1550,7 +1554,19 @@ router.post("/ingest", (req, res) => {
 router.get("/needs-reply", (req, res) => {
   try {
     const limitRaw = parseInt(String(req.query.limit ?? ""), 10);
-    res.json(computeNeedsReply({ vertical: parseVertical(req) ?? null, limit: Number.isFinite(limitRaw) ? limitRaw : undefined }));
+    // server_mode (S6): which server parts are switched on, so the CS routine
+    // moves each duty to the server only when the server actually does it.
+    res.json({
+      ...computeNeedsReply({ vertical: parseVertical(req) ?? null, limit: Number.isFinite(limitRaw) ? limitRaw : undefined }),
+      server_mode: {
+        inbound_ingest: csInboundServerIngestEnabled(),
+        autosend: csAutosendEnabled(),
+        change_requests: csChangeRequestsEnabled(),
+        watchdog: csWatchdogEnabled(),
+        daily_digest: csDailyDigestEnabled(),
+        contact_receipt: contactReceiptEnabled(),
+      },
+    });
   } catch (err: any) {
     res.status(500).json({ error: String(err?.message ?? "needs-reply failed") });
   }
