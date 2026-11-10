@@ -927,14 +927,35 @@ jobs:
             // The evaluate job is a matrix named `evaluate (<pr>)`, so match that shape too.
             const OWN_JOB_NAMES = ['resolve-pr', 'evaluate'];
             const isOwnJob = (name) => OWN_JOB_NAMES.includes(name) || /^evaluate \(.*\)$/.test(name || '');
+            // Retry a GitHub API call on transient 5xx only (Octokit errors carry a
+            // numeric `.status`). 4xx and non-HTTP errors are rethrown at once; after
+            // the last attempt the last error is rethrown. Pure — extracted and tested
+            // by scripts/test-fleet-auto-approve-5xx-retry.js
+            // (dev-request 2026-10-24-fleet-auto-approve-ingen-retry-ved-github-500:
+            // a single HttpError 500 on check-runs killed the gate run, lokal#1243).
+            async function withRetry5xx(fn, { attempts = 3, delaysMs = [2000, 4000, 8000], sleep, log, label = 'GitHub API call' } = {}) {
+              const doSleep = sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
+              for (let attempt = 1; ; attempt++) {
+                try {
+                  return await fn();
+                } catch (err) {
+                  const status = err && typeof err.status === 'number' ? err.status : null;
+                  if (status === null || status < 500 || attempt >= attempts) throw err;
+                  const delay = delaysMs[Math.min(attempt - 1, delaysMs.length - 1)];
+                  if (log) log(`${label} failed with HTTP ${status} (attempt ${attempt}/${attempts}) — retrying in ${delay}ms`);
+                  await doSleep(delay);
+                }
+              }
+            }
+            const retryOpts = (label) => ({ label, log: (m) => core.warning(m) });
             let combined, checkRuns, statusesOk, externalCheckRuns, checksIncomplete;
             for (let poll = 0; poll <= MAX_POLLS; poll++) {
-              ({ data: combined } = await github.rest.repos.getCombinedStatusForRef({
+              ({ data: combined } = await withRetry5xx(() => github.rest.repos.getCombinedStatusForRef({
                 owner, repo, ref: pr.head.sha,
-              }));
-              ({ data: checkRuns } = await github.rest.checks.listForRef({
+              }), retryOpts('getCombinedStatusForRef')));
+              ({ data: checkRuns } = await withRetry5xx(() => github.rest.checks.listForRef({
                 owner, repo, ref: pr.head.sha, per_page: 100,
-              }));
+              }), retryOpts('checks.listForRef')));
               statusesOk = combined.state === 'success' || (combined.state === 'pending' && combined.statuses.length === 0);
               externalCheckRuns = checkRuns.check_runs.filter(r => !isOwnJob(r.name));
               checksIncomplete = externalCheckRuns.some(r => r.status !== 'completed');
