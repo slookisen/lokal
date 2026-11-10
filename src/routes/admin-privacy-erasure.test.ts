@@ -119,6 +119,11 @@ function seed(db: Database.Database): void {
       `gm-${who}`,
       addr,
     );
+    db.prepare(`INSERT INTO inbound_email_log (id, email_id, from_email, subject) VALUES (?, ?, ?, 's')`).run(
+      `inb-${who}`,
+      `em-${who}`,
+      addr,
+    );
     db.prepare(`INSERT INTO outreach_sent_log (agent_id, recipient_email) VALUES ('ag-1', ?)`).run(addr);
     db.prepare(
       `INSERT INTO rfb_marketing_send_ledger (day, run_id, agent_id, recipient_email, touch, reserved_at)
@@ -137,6 +142,21 @@ function seed(db: Database.Database): void {
       addr.toLowerCase(),
     );
   }
+  // CS på serveren, S1: thread flags and Gmail aliases on the target's and the
+  // other person's thread; an inbound e-mail FROM someone else with the target
+  // in Cc (erased) and one with a look-alike address in To (kept).
+  for (const who of ["t", "o"]) {
+    db.prepare(`INSERT INTO crm_thread_flags (thread_id, no_reply_reason, no_reply_at, no_reply_by) VALUES (?, 'fri tekst', '2026-11-01T00:00:00Z', 'daniel')`).run(`th-${who}`);
+    db.prepare(`INSERT INTO crm_thread_aliases (alias_id, thread_id, source) VALUES (?, ?, 'cs_gmail_copy')`).run(`gm-alias-${who}`, `th-${who}`);
+  }
+  db.prepare(`INSERT INTO inbound_email_log (id, email_id, from_email, to_emails, cc_emails, subject) VALUES ('inb-cc', 'em-cc', 'third@example.no', '["kontakt@rettfrabonden.com"]', ?, 's')`).run(
+    JSON.stringify([TARGET_NORM]),
+  );
+  // Linked ONLY by the thread: a colleague writing on the target's thread.
+  db.prepare(`INSERT INTO inbound_email_log (id, email_id, from_email, to_emails, cc_emails, subject, crm_thread_id, forward_payload) VALUES ('inb-thread', 'em-th', 'colleague@example.no', '["kontakt@rettfrabonden.com"]', '[]', 's', 'th-t', '{"textContent":"x"}')`).run();
+  db.prepare(`INSERT INTO inbound_email_log (id, email_id, from_email, to_emails, cc_emails, subject) VALUES ('inb-lookalike', 'em-la', 'third@example.no', ?, '[]', 's')`).run(
+    JSON.stringify(["x" + TARGET_NORM]),
+  );
   // A delivery event attributed to one of the target's messages but recorded
   // under a different spelling → caught via crm_message_id.
   db.prepare(
@@ -150,6 +170,9 @@ const EXPECTED_TARGET_COUNTS: Record<string, number> = {
   crm_actions: 2,
   crm_retro_tagging_audit: 2,
   crm_messages: 4,
+  crm_thread_flags: 1,
+  crm_thread_aliases: 1,
+  inbound_email_log: 3,
   crm_threads: 2,
   crm_contacts: 2,
   crm_untriaged: 1,
@@ -274,7 +297,7 @@ export async function runAdminPrivacyErasureTests(opts: { log?: boolean } = {}):
     assertEq(audit[0]?.email_hash, mod.erasureAddressHash(TARGET_NORM), "audit stores keyed hash");
     assertTrue(!JSON.stringify(audit[0]).includes("example.no"), "audit never stores the address");
     assertEq(JSON.parse(audit[0]?.counts_json || "{}"), EXPECTED_TARGET_COUNTS, "audit per-table counts");
-    assertEq(audit[0]?.total_rows, 20, "audit total");
+    assertEq(audit[0]?.total_rows, 25, "audit total (20 + 3 inbound_email_log rows + crm_thread_flags + crm_thread_aliases, S1)");
     assertEq(audit[0]?.include_suppression, 0, "audit include_suppression=0");
     assertTrue(typeof audit[0]?.requested_at === "string" && audit[0].requested_at.length > 0, "audit when");
 

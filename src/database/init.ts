@@ -3228,6 +3228,91 @@ function initSchema(db: Database.Database): void {
     console.error("Migration inbound_email_seen failed:", err);
   }
 
+  // ─── CS på serveren, S1a (dev-request 2026-11-10-cs-paa-serveren) ──────
+  // inbound_email_log: one row per inbound e-mail the Resend webhook accepted
+  // (keyed by our own id; email_id UNIQUE when Resend gave one). Records the
+  // forward-to-Gmail outcome (so a failed forward is visible and retryable,
+  // not logged as success) and the server-side CRM registration outcome.
+  // forward_payload holds the forward mail only while it is NOT yet delivered
+  // (cleared on success) so a retry job can resend it.
+  //
+  // crm_thread_aliases: a Gmail thread id the CS agent ingests whose message
+  // carries our "Inbound-ID:" marker is an alias of the thread the server
+  // already registered; /threads/:id routes and /ingest resolve aliases.
+  //
+  // crm_thread_flags: «trenger ikke svar» per thread. Kept OUT of crm_threads
+  // on purpose: older migrations rebuild crm_threads with an explicit column
+  // list, which would silently drop a column added here.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS inbound_email_log (
+        id TEXT PRIMARY KEY,
+        email_id TEXT UNIQUE,
+        received_at TEXT NOT NULL DEFAULT (datetime('now')),
+        from_email TEXT,
+        to_emails TEXT,
+        cc_emails TEXT,
+        subject TEXT,
+        rfc_message_id TEXT,
+        in_reply_to TEXT,
+        vertical TEXT,
+        automated_kind TEXT,
+        body_fetch TEXT,
+        crm_status TEXT NOT NULL DEFAULT 'pending',
+        crm_thread_id TEXT,
+        crm_linked_by TEXT,
+        crm_error TEXT,
+        forward_status TEXT NOT NULL DEFAULT 'pending',
+        forward_attempts INTEGER NOT NULL DEFAULT 0,
+        forward_error TEXT,
+        forwarded_at TEXT,
+        forward_payload TEXT,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_inbound_email_log_received ON inbound_email_log(received_at);
+      CREATE INDEX IF NOT EXISTS idx_inbound_email_log_forward ON inbound_email_log(forward_status);
+      CREATE INDEX IF NOT EXISTS idx_inbound_email_log_rfc ON inbound_email_log(rfc_message_id);
+
+      CREATE TABLE IF NOT EXISTS crm_thread_aliases (
+        alias_id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        source TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS crm_thread_flags (
+        thread_id TEXT PRIMARY KEY,
+        no_reply_reason TEXT,
+        no_reply_at TEXT,
+        no_reply_by TEXT,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      -- S1b: one row per alerted item (thread:<id>, untriaged:<id>,
+      -- forward:<logId>, register:<logId>) so the CS watchdog alerts each
+      -- problem at most once per 24 h.
+      CREATE TABLE IF NOT EXISTS cs_alert_log (
+        alert_key TEXT PRIMARY KEY,
+        first_alerted_at TEXT NOT NULL,
+        last_alerted_at TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 1
+      );
+    `);
+  } catch (err) {
+    console.error("Migration cs-inbound (S1a) failed:", err);
+  }
+  // Expression index for In-Reply-To lookups against the SMTP Message-ID we
+  // stored on every send (crm_outbox.result_id, "<id@host>"). Separate try: a
+  // missing crm_outbox (fresh test DBs that skip the CRM block) must not undo
+  // the tables above.
+  try {
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_crm_outbox_result_id_norm ON crm_outbox(LOWER(REPLACE(REPLACE(result_id,'<',''),'>','')))",
+    );
+  } catch (err) {
+    console.error("Migration idx_crm_outbox_result_id_norm failed:", err);
+  }
+
   // ─── M1 (Phase 5.4a): agent_knowledge_audit ─────────────────
   // Owner profile change history. Immutable changelog (insert-only).
   // Daniel uses GET /admin/agent-audit to inspect ownership changes.
