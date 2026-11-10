@@ -23,6 +23,9 @@ import { getDb } from "../database/init";
 import { isOutreachPaused } from "./admin-outreach-candidates";
 import { unsubscribeHeaderValues } from "../services/avmeld-service";
 import { getOutreachMaxTouchVernConfig, getMaxTouchStatusForEmail } from "../services/outreach-max-touch-vern";
+import { findInboundMarker, recordThreadAlias, resolveThreadAlias, serverThreadForMarker } from "../services/cs-inbound";
+import { computeNeedsReply, markNoReplyNeeded } from "../services/crm-needs-reply";
+import { buildDailyDigest } from "../services/cs-watchdog";
 
 // ─── Admin auth (matches the fleet-wide admin-route pattern, e.g.
 // admin-affiliations.ts / admin-hanen.ts: ADMIN_KEY primary,
@@ -43,6 +46,17 @@ function requireAdminAuth(req: Request, res: Response, next: Function): void {
 
 const router = Router();
 router.use(requireAdminAuth);
+
+// CS på serveren, S1a: a Gmail thread id the CS agent ingested as a copy of a
+// server-registered e-mail is an ALIAS of the server thread
+// (crm_thread_aliases). Every /threads/:id route resolves it, so the agent can
+// keep using the id it knows. Ids without an alias pass through unchanged.
+router.param("id", (req, _res, next, id) => {
+  if (req.path.startsWith("/threads/") && typeof id === "string" && id) {
+    req.params.id = resolveThreadAlias(id);
+  }
+  next();
+});
 
 // ?vertical=rfb|dental|experiences — anything else (or omitted) = all verticals.
 function parseVertical(req: Request): CrmVertical | undefined {
@@ -1184,6 +1198,62 @@ router.post("/ingest", (req, res) => {
   const parsed = ingestSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
 
+  // ─── CS på serveren, S1a: the Gmail copy of a server-registered e-mail ──
+  // The server already registered the original (cs-inbound). Its forwarded
+  // Gmail copy carries "Inbound-ID: inb-…". That copy is NOT filed again: the
+  // Gmail thread id becomes an alias of the server thread, and only the other
+  // messages in the Gmail thread (e.g. Daniel's own Gmail reply) are filed
+  // there. A Gmail thread id that is already an alias goes straight to its
+  // server thread. Routing (signals/vertical) is skipped in both cases — the
+  // server decided the platform when it registered the original.
+  {
+    let canonical: { threadId: string; vertical: string; contactId: string } | null = null;
+    const aliasTarget = resolveThreadAlias(parsed.data.threadId);
+    if (aliasTarget !== parsed.data.threadId) {
+      const t = getDb().prepare("SELECT id, vertical_id, contact_id FROM crm_threads WHERE id = ?").get(aliasTarget) as
+        | { id: string; vertical_id: string; contact_id: string }
+        | undefined;
+      if (t) canonical = { threadId: t.id, vertical: t.vertical_id, contactId: t.contact_id };
+    }
+    const markerOf = (m: { bodyText?: string | null; snippet?: string | null; bodyHtml?: string | null }) =>
+      findInboundMarker(m.bodyText, m.snippet, m.bodyHtml);
+    if (!canonical) {
+      for (const m of parsed.data.messages) {
+        const logId = markerOf(m);
+        if (!logId) continue;
+        const hit = serverThreadForMarker(logId);
+        if (hit) {
+          canonical = hit;
+          break;
+        }
+      }
+    }
+    if (canonical) {
+      recordThreadAlias(parsed.data.threadId, canonical.threadId, "cs_gmail_copy");
+      const rest = parsed.data.messages.filter((m) => markerOf(m) === null);
+      let newMessages = 0;
+      if (rest.length > 0) {
+        try {
+          const r = crmService.ingestThread(
+            { threadId: canonical.threadId, messages: rest },
+            parsed.data.primaryFromEmail,
+            canonical.vertical as CrmVertical,
+          );
+          newMessages = r.newMessages;
+        } catch (err: any) {
+          return res.status(500).json({ error: String(err?.message ?? "ingest failed") });
+        }
+      }
+      return res.json({
+        threadId: canonical.threadId,
+        contactId: canonical.contactId,
+        newMessages,
+        serverRegistered: true,
+        aliasOf: parsed.data.threadId,
+      });
+    }
+  }
+
   // ─── steg 4: resolve the platform, or park ───────────────────
   //
   // Three cases, and none of them is a guess:
@@ -1342,6 +1412,47 @@ router.post("/ingest", (req, res) => {
   }
 
   res.json(result);
+});
+
+// ─── GET /admin/crm/needs-reply ──────────────────────────────
+// CS på serveren, S1a: every customer thread whose latest (human) inbound is
+// newer than its latest real outbound, with age and level (P1 ≥ 12 h, P0 ≥
+// 24 h), plus open untriaged rows and inbound mail whose forward failed.
+// ?vertical=rfb|dental|experiences filters threads.
+router.get("/needs-reply", (req, res) => {
+  try {
+    const limitRaw = parseInt(String(req.query.limit ?? ""), 10);
+    res.json(computeNeedsReply({ vertical: parseVertical(req) ?? null, limit: Number.isFinite(limitRaw) ? limitRaw : undefined }));
+  } catch (err: any) {
+    res.status(500).json({ error: String(err?.message ?? "needs-reply failed") });
+  }
+});
+
+// ─── GET /admin/crm/daily-digest/preview ─────────────────────
+// CS på serveren, S1b: the exact digest the 07:00 job would e-mail now —
+// read-only, sends nothing (for checking and for the morning report).
+router.get("/daily-digest/preview", (_req, res) => {
+  try {
+    const d = buildDailyDigest(new Date());
+    res.json({ subject: d.subject, text: d.text, counts: d.counts });
+  } catch (err: any) {
+    res.status(500).json({ error: String(err?.message ?? "digest failed") });
+  }
+});
+
+// ─── POST /admin/crm/threads/:id/no-reply-needed ─────────────
+// Mark «trenger ikke svar» (reason required). A later inbound makes the
+// thread need a reply again.
+router.post("/threads/:id/no-reply-needed", (req, res) => {
+  const schema = z.object({
+    reason: z.string().min(1).max(300),
+    actor: z.enum(["claude", "daniel", "system"]).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
+  const r = markNoReplyNeeded(req.params.id, parsed.data.reason, parsed.data.actor ?? "daniel");
+  if (!r.ok) return res.status(r.error === "thread_not_found" ? 404 : 400).json({ error: r.error });
+  res.json({ success: true });
 });
 
 // ─── GET /admin/crm/untriaged ────────────────────────────────

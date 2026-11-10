@@ -119,6 +119,11 @@ function seed(db: Database.Database): void {
       `gm-${who}`,
       addr,
     );
+    db.prepare(`INSERT INTO inbound_email_log (id, email_id, from_email, subject) VALUES (?, ?, ?, 's')`).run(
+      `inb-${who}`,
+      `em-${who}`,
+      addr,
+    );
     db.prepare(`INSERT INTO outreach_sent_log (agent_id, recipient_email) VALUES ('ag-1', ?)`).run(addr);
     db.prepare(
       `INSERT INTO rfb_marketing_send_ledger (day, run_id, agent_id, recipient_email, touch, reserved_at)
@@ -153,6 +158,7 @@ const EXPECTED_TARGET_COUNTS: Record<string, number> = {
   crm_threads: 2,
   crm_contacts: 2,
   crm_untriaged: 1,
+  inbound_email_log: 1,
   outreach_sent_log: 1,
   rfb_marketing_send_ledger: 1,
   resend_webhook_events: 1,

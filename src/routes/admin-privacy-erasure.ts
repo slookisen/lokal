@@ -131,6 +131,9 @@ export const ERASURE_TABLES: readonly TableSpec[] = [
   { table: "crm_threads", where: `contact_id IN (${CONTACTS})`, params: 1 },
   { table: "crm_contacts", where: `LOWER(TRIM(email)) = ?`, params: 1 },
   { table: "crm_untriaged", where: `LOWER(TRIM(from_email)) = ?`, params: 1 },
+  // CS på serveren, S1a: one row per inbound e-mail (sender + subject, and the
+  // forward copy with the body while a forward is undelivered).
+  { table: "inbound_email_log", where: `LOWER(TRIM(from_email)) = ?`, params: 1 },
   { table: "outreach_sent_log", where: `LOWER(TRIM(recipient_email)) = ?`, params: 1 },
   { table: "rfb_marketing_send_ledger", where: `LOWER(TRIM(recipient_email)) = ?`, params: 1 },
   { table: "resend_webhook_events", where: `LOWER(TRIM(email)) = ?`, params: 1 },

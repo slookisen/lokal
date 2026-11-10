@@ -45039,6 +45039,40 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── dev-request 2026-11-10-cs-paa-serveren: S1a (innkommende sikkerhetsnett, registrering på serveren, trenger svar) ──");
+  try {
+    const { runCsInboundTests } = require("../src/services/cs-inbound.test") as
+      typeof import("../src/services/cs-inbound.test");
+    const cit = await runCsInboundTests({ log: false });
+    passed += cit.passed;
+    failed += cit.failed;
+    for (const f of cit.failures) failures.push("cs-inbound: " + f);
+    console.log(`  cs-inbound: ${cit.passed} passed, ${cit.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("cs-inbound: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ cs-inbound: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-10-cs-paa-serveren: S1b (CS-vakt, ny videresending, daglig oppsummering) ──");
+  try {
+    const { runCsWatchdogTests } = require("../src/services/cs-watchdog.test") as
+      typeof import("../src/services/cs-watchdog.test");
+    const cwt = await runCsWatchdogTests({ log: false });
+    passed += cwt.passed;
+    failed += cwt.failed;
+    for (const f of cwt.failures) failures.push("cs-watchdog: " + f);
+    console.log(`  cs-watchdog: ${cwt.passed} passed, ${cwt.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("cs-watchdog: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ cs-watchdog: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-07-27-crm-plattformadskillelse: steg 4 (innkommende triage + utriaged-bøtte) ──");
   try {
     const { runCrmTriageTests } = require("../src/services/crm-triage.test") as
