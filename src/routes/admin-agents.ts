@@ -99,6 +99,9 @@ import { findLocalOrgnrCandidate, type LocalOrgnrHit } from "../services/local-o
 // self-registered-review-approve route below is the ONLY caller in this
 // file — see that route for why the ping moved here from routes/marketplace.ts.
 import { pingIndexNow } from "../services/indexnow-service";
+// dev-request 2026-11-10-rfb-registreringer-og-eierkrav-folges-opp (S2): the
+// record-only pre-check behind POST /self-registered-precheck below.
+import { REGISTRATION_PRECHECK_BATCH_CAP, runRegistrationPrecheck } from "../services/registration-precheck";
 // dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep 5b —
 // shared LLM-judge + deterministic-backstop contact gate for
 // POST /brreg-contact-backfill below (mirrors lokal#655's marketplace.ts
@@ -2431,16 +2434,103 @@ router.post("/org-nr-review-approve", (req: Request, res: Response) => {
 // GET lists the queue, oldest first — the incident this closes (Mikhailo T,
 // 2026-07-30) was a same-day drive-by; there's no reason a newer spam
 // signup should ever be reviewed ahead of an older, possibly-legitimate one.
+//
+// dev-request 2026-11-10-rfb-registreringer-og-eierkrav-folges-opp (S2): each
+// entry also carries the stored, record-only pre-check recommendation
+// (`precheck`, parsed JSON or null; services/registration-precheck.ts),
+// `precheck_at`, `age_days` (whole days since created_at), `org_nr` and
+// `city`. The original five fields and the order are unchanged.
 router.get("/self-registered-review-queue", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
   const db = getDb();
-  const entries = db.prepare(
-    `SELECT id, name, contact_email, url, created_at
-       FROM agents
-      WHERE origin = 'self_registered' AND is_vetted = 0
-      ORDER BY created_at ASC`
-  ).all();
+  const rows = db.prepare(
+    `SELECT a.id, a.name, a.contact_email, a.url, a.created_at, a.org_nr, a.city,
+            p.registration_precheck, p.registration_precheck_at
+       FROM agents a
+       LEFT JOIN agent_registration_precheck p ON p.agent_id = a.id
+      WHERE a.origin = 'self_registered' AND a.is_vetted = 0
+      ORDER BY a.created_at ASC`
+  ).all() as Array<{
+    id: string; name: string; contact_email: string; url: string; created_at: string | null;
+    org_nr: string | null; city: string | null; registration_precheck: string | null; registration_precheck_at: string | null;
+  }>;
+  const nowMs = Date.now();
+  const entries = rows.map((r) => {
+    let precheck: unknown = null;
+    if (r.registration_precheck) {
+      try { precheck = JSON.parse(r.registration_precheck); } catch { precheck = null; }
+    }
+    return {
+      id: r.id, name: r.name, contact_email: r.contact_email, url: r.url, created_at: r.created_at,
+      org_nr: r.org_nr, city: r.city,
+      precheck, precheck_at: r.registration_precheck_at, age_days: ageDaysSince(r.created_at, nowMs),
+    };
+  });
   res.json({ count: entries.length, entries });
+});
+
+/** Whole days since an SQLite/ISO timestamp (SQLite's "YYYY-MM-DD HH:MM:SS" is UTC), or null. */
+export function ageDaysSince(createdAt: string | null | undefined, nowMs: number): number | null {
+  if (typeof createdAt !== "string" || !createdAt.trim()) return null;
+  let s = createdAt.trim();
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(s)) s = s.replace(" ", "T") + "Z";
+  const t = Date.parse(s);
+  if (!Number.isFinite(t)) return null;
+  return Math.max(0, Math.floor((nowMs - t) / 86_400_000));
+}
+
+// POST /admin/agents/self-registered-precheck (S2): runs the record-only
+// pre-check on demand, regardless of REGISTRATION_PRECHECK_ENABLED. Body
+// { agentId } → that one agent (must be in the queue: origin self_registered
+// and is_vetted 0, else 409 like the approve route), or { all: true } → every
+// queued agent, oldest first, sequentially, at most 50 per call. Only stores
+// its row in agent_registration_precheck; never touches is_vetted or anything else.
+router.post("/self-registered-precheck", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const body = (req.body ?? {}) as { agentId?: unknown; all?: unknown };
+  const agentId = typeof body.agentId === "string" ? body.agentId.trim() : "";
+  const db = getDb();
+  if (agentId) {
+    const agent = db.prepare(`SELECT id, origin, is_vetted FROM agents WHERE id = ?`).get(agentId) as
+      { id: string; origin: string; is_vetted: number } | undefined;
+    if (!agent) {
+      res.status(404).json({ error: "Agent not found" });
+      return;
+    }
+    if (agent.origin !== "self_registered" || agent.is_vetted !== 0) {
+      res.status(409).json({ error: "not_in_self_registered_queue", detail: "Only unvetted self_registered agents are pre-checked" });
+      return;
+    }
+    try {
+      const precheck = await runRegistrationPrecheck(agentId);
+      res.json({ success: true, agentId, precheck });
+    } catch (err: any) {
+      res.status(502).json({ success: false, agentId, error: "precheck_failed", detail: err?.message === "precheck timeout" ? "timeout" : "error" });
+    }
+    return;
+  }
+  if (body.all !== true) {
+    res.status(400).json({ error: "Requires { agentId } or { all: true }" });
+    return;
+  }
+  const ids = (db.prepare(
+    `SELECT id FROM agents WHERE origin = 'self_registered' AND is_vetted = 0 ORDER BY created_at ASC LIMIT ?`
+  ).all(REGISTRATION_PRECHECK_BATCH_CAP + 1) as Array<{ id: string }>).map((r) => r.id);
+  const batch = ids.slice(0, REGISTRATION_PRECHECK_BATCH_CAP);
+  const results: Array<{ agentId: string; recommendation: string | null; error?: string }> = [];
+  const summary: Record<string, number> = { godkjenn: 0, spor_forst: 0, avvis: 0, failed: 0 };
+  for (const id of batch) {
+    try {
+      const p = await runRegistrationPrecheck(id);
+      if (!p) { results.push({ agentId: id, recommendation: null, error: "gone" }); summary.failed!++; continue; }
+      results.push({ agentId: id, recommendation: p.recommendation });
+      summary[p.recommendation] = (summary[p.recommendation] ?? 0) + 1;
+    } catch (err: any) {
+      results.push({ agentId: id, recommendation: null, error: err?.message === "precheck timeout" ? "timeout" : "error" });
+      summary.failed!++;
+    }
+  }
+  res.json({ success: true, assessed: results.length, more_remaining: ids.length > batch.length, summary, results });
 });
 
 // POST flips is_vetted to 1 for exactly one agent, then — and ONLY then —

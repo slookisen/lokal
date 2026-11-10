@@ -76,6 +76,8 @@ import { HOMEPAGE_CONTACT_PROVENANCE_EXCLUSION_SQL } from "../services/homepage-
 import { emailWithheldIds, withKnowledgeEmailNull } from "../services/email-reveal-guard";
 import { hasContactRetentionMarkers } from "../services/privacy-retention";
 import { invalidateAgentGeocode } from "../services/agent-geocode-reset";
+// dev-request 2026-11-10-rfb-registreringer-og-eierkrav-folges-opp (S2).
+import { scheduleRegistrationPrecheck } from "../services/registration-precheck";
 import {
   publicFieldChoices, publicFieldChoicesForMany, withoutHiddenContact, withoutHiddenFields, publicAgentInfo,
   withoutHiddenCoordinates, hidesPrices, hidesTrust, type PublicFieldChoices,
@@ -605,6 +607,13 @@ router.post("/register", (req: Request, res: Response) => {
         registeredAt: agent.registeredAt,
       },
     });
+
+    // dev-request 2026-11-10-rfb-registreringer-og-eierkrav-folges-opp (S2):
+    // record-only pre-check recommendation, started AFTER the response above
+    // (fire-and-forget, never throws; REGISTRATION_PRECHECK_ENABLED="false"
+    // is the kill switch). It never changes is_vetted, the response or any
+    // e-mail — see services/registration-precheck.ts.
+    scheduleRegistrationPrecheck(agent.id);
   } catch (error: any) {
     // A pause that went live between the gate above and the INSERT still ends
     // as a 423, never a 500 — the primitive's own gate is what caught it. The

@@ -53825,3 +53825,25 @@ runSerial(async () => {
     failures.push("claim-auto-approval-audit-e1: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-11-10-rfb-registreringer-og-eierkrav-folges-opp, slice S2:
+// record-only pre-check recommendation for self-registered profiles
+// (registration-precheck.ts), the review-queue fields, the admin precheck
+// route and the /register trigger. Own in-memory DB pinned on getDb(), stubbed
+// network deps, swaps ADMIN_KEY / REGISTRATION_PRECHECK_ENABLED and the
+// indexnow-service cache entry (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── S2: registrerings-forhåndssjekk (record-only) ──");
+  try {
+    const { runRegistrationPrecheckTests } = require("../src/services/registration-precheck.test") as
+      typeof import("../src/services/registration-precheck.test");
+    const r = await runRegistrationPrecheckTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("registration-precheck: " + f);
+    console.log(`  registration-precheck: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("registration-precheck: unexpected error: " + String(err?.message || err));
+  }
+});
