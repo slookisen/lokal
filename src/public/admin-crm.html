@@ -853,7 +853,7 @@ async function selectThread(id) {
             </select>
           </span>
         </div>
-        ${messages.map(m => renderMessage(m)).join('')}
+        ${messages.map(m => renderMessage(m, (data.deliveries || {})[m.id])).join('')}
       </div>
 
       <div class="compose">
@@ -879,8 +879,12 @@ async function selectThread(id) {
   } catch (e) { toast(e.message, true); }
 }
 
-function renderMessage(m) {
+const DELIVERY_LABEL = { delivered: 'levert', bounced: 'kom ikke fram (bounce)', complained: 'merket som spam', soft_bounced: 'midlertidig avvist' };
+function renderMessage(m, delivery) {
   const initial = (m.from_email || '?').charAt(0).toUpperCase();
+  const dTag = delivery
+    ? `<span class="pill${delivery.status === 'bounced' || delivery.status === 'complained' ? ' p0' : ''}" title="${escapeHtml(delivery.detail || '')}">${escapeHtml(DELIVERY_LABEL[delivery.status] || delivery.status)}</span>`
+    : '';
   const body = m.body_text || m.snippet || '(ingen tekst)';
   const long = body.length > 400;
   return `
@@ -889,7 +893,7 @@ function renderMessage(m) {
       <div class="content">
         <div class="meta-row">
           <span><strong>${escapeHtml(m.from_email)}</strong></span>
-          <span>${fmtFull(m.sent_at || m.received_at)}</span>
+          <span>${dTag} ${fmtFull(m.sent_at || m.received_at)}</span>
         </div>
         <div class="body${long ? ' collapsed' : ''}" id="msg-${m.id}">${escapeHtml(body)}</div>
         ${long ? `<span class="show-more" data-action="toggleMsg" data-id="${m.id}">Vis mer ▾</span>` : ''}

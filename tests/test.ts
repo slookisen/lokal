@@ -45090,6 +45090,23 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── dev-request 2026-11-10-cs-paa-serveren: S3 (leveringsstatus per CRM-melding) ──");
+  try {
+    const { runCrmDeliveryStatusTests } = require("../src/services/crm-delivery-status.test") as
+      typeof import("../src/services/crm-delivery-status.test");
+    const cds = await runCrmDeliveryStatusTests({ log: false });
+    passed += cds.passed;
+    failed += cds.failed;
+    for (const f of cds.failures) failures.push("crm-delivery-status: " + f);
+    console.log(`  crm-delivery-status: ${cds.passed} passed, ${cds.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-delivery-status: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ crm-delivery-status: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-07-27-crm-plattformadskillelse: steg 4 (innkommende triage + utriaged-bøtte) ──");
   try {
     const { runCrmTriageTests } = require("../src/services/crm-triage.test") as

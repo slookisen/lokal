@@ -24,6 +24,7 @@ import { recordRun } from "./run-ledger";
 import { EnvelopeBuilder } from "../types/run-envelope";
 import { getJobLastCompletedAt, markJobCompleted } from "./boot-job-gate";
 import { parkPendingWhenAutosendOff, recoverExpiredLeases } from "./cs-reply-proposals";
+import { failedReplyDeliveries } from "./crm-delivery-status";
 
 export const CS_WATCHDOG_FLAG = "CS_WATCHDOG_ENABLED";
 export const CS_DAILY_DIGEST_FLAG = "CS_DAILY_DIGEST_ENABLED";
@@ -364,6 +365,14 @@ export async function runCsWatchdog(
       line: `• [Utboks henger] [${platformName(o.vertical_id)}] ${o.subject} — ${o.intent === "gmail_draft" ? "Gmail-utkast" : "sending"} ${o.status} siden ${o.created_at}`,
     });
   }
+  // S3: a reply that bounced or drew a complaint — the thread is back in «Trenger svar».
+  for (const d of failedReplyDeliveries(new Date(now.getTime() - 7 * 86400_000).toISOString())) {
+    items.push({
+      key: `delivery:${d.crm_message_id}`,
+      once: true,
+      line: `• [Svar ${d.status === "complained" ? "merket som spam" : "kom ikke fram (bounce)"}] [${platformName(d.vertical)}] ${d.subject ?? "(uten emne)"} — til ${d.to_emails ?? "?"}${d.detail ? `: ${d.detail}` : ""}`,
+    });
+  }
   for (const extra of deps.extraItems?.(now) ?? []) items.push(extra);
   // Threads last: a backlog of old threads must never push a one-time problem
   // (an exhausted forward, a failed registration) out of the e-mail.
@@ -574,6 +583,12 @@ export function buildDailyDigest(now: Date = new Date()): { subject: string; tex
       lines.push("");
       lines.push(`SVAR SOM IKKE KOM UT siste døgn: ${failed.length}`);
       for (const f of failed.slice(0, 20)) lines.push(`• [${platformName(f.vertical)}] ${f.subject} — til ${f.to_email}: ${f.why ?? "ukjent feil"}`);
+    }
+    const bounced = failedReplyDeliveries(since);
+    if (bounced.length > 0) {
+      lines.push("");
+      lines.push(`SVAR SOM BOUNCET ELLER BLE MERKET SOM SPAM siste døgn: ${bounced.length} (trådene ligger igjen i «Trenger svar»)`);
+      for (const b of bounced.slice(0, 20)) lines.push(`• [${platformName(b.vertical)}] ${b.subject ?? "(uten emne)"} — ${b.status}${b.detail ? ` (${b.detail})` : ""}`);
     }
     if (viaApi > 0) lines.push(`Merk: ${viaApi} forslag ble godkjent via API-et, ikke fra admin-siden.`);
     proposalCounts = { sent: sentRows, approval_queue: queue.length, approval_over_48h: queue.filter((q) => q.age_h > 48).length, failed_24h: failed.length, approved_via_api: viaApi };

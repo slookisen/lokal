@@ -20,6 +20,7 @@
 // Open crm_untriaged rows and failed inbound forwards are reported alongside,
 // because they are inbound mail nobody has handled either.
 
+import { failedReplyDeliveries } from "./crm-delivery-status";
 import { getDb } from "../database/init";
 import { crmService } from "./crm-service";
 import type { Actor } from "./crm-service";
@@ -122,11 +123,19 @@ export function computeNeedsReply(opts: { vertical?: string | null; limit?: numb
             -- COALESCE: a message without the flag ('{}' / NULL metadata) is human.
             AND NOT (COALESCE(json_valid(m.raw_metadata), 0) = 1 AND COALESCE(json_extract(m.raw_metadata, '$.automated'), 0) = 1)
           GROUP BY m.thread_id
-       ), o AS (
+       ), oa AS (
          SELECT thread_id, MAX(julianday(sent_at)) AS jd
            FROM crm_messages
           WHERE direction = 'out' AND sent_at IS NOT NULL AND delivery_status = 'sent'
           GROUP BY thread_id
+       ), o AS (
+         -- S3: a reply Resend reported as bounced / complained did not reach
+         -- the customer — it does not count as answered.
+         SELECT m.thread_id, MAX(julianday(m.sent_at)) AS jd
+           FROM crm_messages m
+          WHERE m.direction = 'out' AND m.sent_at IS NOT NULL AND m.delivery_status = 'sent'
+            AND NOT EXISTS (SELECT 1 FROM crm_message_delivery d WHERE d.crm_message_id = m.id AND d.status IN ('bounced', 'complained'))
+          GROUP BY m.thread_id
        )
        SELECT t.id AS thread_id, t.vertical_id AS vertical, t.subject, t.status, t.category,
               c.email AS contact_email, c.name AS contact_name, c.id AS contact_id, c.type AS contact_type,
@@ -136,6 +145,7 @@ export function computeNeedsReply(opts: { vertical?: string | null; limit?: numb
          JOIN crm_contacts c ON c.id = t.contact_id
          JOIN h ON h.thread_id = t.id
          LEFT JOIN o ON o.thread_id = t.id
+         LEFT JOIN oa ON oa.thread_id = t.id
          LEFT JOIN crm_thread_flags f ON f.thread_id = t.id
         WHERE COALESCE(t.status, 'new') NOT IN ('done', 'archived')
           AND COALESCE(t.category, 'unknown') NOT IN ('system', 'leverandor')
@@ -152,7 +162,9 @@ export function computeNeedsReply(opts: { vertical?: string | null; limit?: numb
           )
           AND h.jd IS NOT NULL
           AND (o.jd IS NULL OR h.jd > o.jd)
-          AND (t.last_outbound_at IS NULL OR julianday(t.last_outbound_at) IS NULL OR h.jd > julianday(t.last_outbound_at))
+          -- last_outbound_at only decides for threads with no outbound message
+          -- rows (legacy backfill); otherwise the messages above decide.
+          AND (oa.jd IS NOT NULL OR t.last_outbound_at IS NULL OR julianday(t.last_outbound_at) IS NULL OR h.jd > julianday(t.last_outbound_at))
           AND (f.no_reply_at IS NULL OR julianday(f.no_reply_at) < h.jd)
           ${verticalClause}
         ORDER BY h.jd ASC
@@ -245,6 +257,18 @@ export function computeNeedsReply(opts: { vertical?: string | null; limit?: numb
     for (const o of failedOutbox) if (!seen.has(o.outbox_id)) outboundFailed.push(o);
   } catch {
     // ignore
+  }
+  // S3: replies Resend reported as bounced / complained.
+  for (const d of failedReplyDeliveries(new Date(Date.now() - 7 * 86400_000).toISOString())) {
+    outboundFailed.push({
+      proposal_id: null,
+      outbox_id: null,
+      thread_id: d.thread_id,
+      vertical: d.vertical,
+      to_email: d.to_emails,
+      reason: `${d.status}${d.detail ? ` (${d.detail})` : ""}`,
+      at: d.updated_at,
+    });
   }
 
   return {

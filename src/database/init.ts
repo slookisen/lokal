@@ -3360,6 +3360,26 @@ function initSchema(db: Database.Database): void {
     console.error("Migration cs_reply_proposals failed:", err);
   }
 
+  // ─── CS på serveren, S3: Resend's delivery verdict per CRM message ──
+  // Side table instead of new crm_messages.delivery_status values: widening
+  // that CHECK would mean rebuilding crm_messages and its triggers.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS crm_message_delivery (
+        crm_message_id TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        event_type TEXT,
+        detail TEXT,
+        svix_id TEXT,
+        event_at TEXT,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_crm_message_delivery_status ON crm_message_delivery(status, updated_at);
+    `);
+  } catch (err) {
+    console.error("Migration crm_message_delivery failed:", err);
+  }
+
   // ─── M1 (Phase 5.4a): agent_knowledge_audit ─────────────────
   // Owner profile change history. Immutable changelog (insert-only).
   // Daniel uses GET /admin/agent-audit to inspect ownership changes.
