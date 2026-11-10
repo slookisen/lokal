@@ -53930,3 +53930,23 @@ runSerial(async () => {
     failures.push("owner-pending-profile-view-s4a: unexpected error: " + String(err?.message || err));
   }
 });
+
+// S1 2026-11-10: flagged confirmation mail after a successful public
+// POST /register (REGISTRATION_CONFIRMATION_EMAIL_ENABLED, 24 h per address).
+// Own in-memory DB pinned on getDb(), stubs the emailService transporter and
+// sets the flag (both restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── registrering: bekreftelses-e-post (S1) ──");
+  try {
+    const { runRegistrationConfirmationTests } = require("../src/services/registration-confirmation.test") as
+      typeof import("../src/services/registration-confirmation.test");
+    const r = await runRegistrationConfirmationTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("registration-confirmation: " + f);
+    console.log(`  registration-confirmation: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("registration-confirmation: unexpected error: " + String(err?.message || err));
+  }
+});

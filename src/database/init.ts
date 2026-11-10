@@ -6949,6 +6949,26 @@ function initSchema(db: Database.Database): void {
     console.error("Migration product_auto_sync_state failed:", err);
   }
 
+  // ─── registration_confirmation_email_log (S1, 2026-11-10) ───────────────
+  // One row per normalized (trim + lowercase) address that got the
+  // self-registration confirmation mail; last_sent_at (ISO-8601 UTC) drives
+  // the «at most one per address per 24 h» limit across restarts. Written only
+  // after a successful send, and only while REGISTRATION_CONFIRMATION_EMAIL_
+  // ENABLED is "true" (services/registration-confirmation.ts). Additive,
+  // brand-new table, idempotent.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS registration_confirmation_email_log (
+        email_normalized TEXT PRIMARY KEY,
+        last_sent_at TEXT NOT NULL,
+        last_agent_id TEXT,
+        send_count INTEGER NOT NULL DEFAULT 1
+      )
+    `);
+  } catch (err) {
+    console.error("Migration registration_confirmation_email_log failed:", err);
+  }
+
   // ─── S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok ──────────────
   // agents_name_fts (FTS5 trigram over agents.name) + its three sync triggers,
   // populated here only when empty or out of step with agents (one INSERT …

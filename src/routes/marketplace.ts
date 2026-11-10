@@ -76,6 +76,7 @@ import { HOMEPAGE_CONTACT_PROVENANCE_EXCLUSION_SQL } from "../services/homepage-
 import { emailWithheldIds, withKnowledgeEmailNull } from "../services/email-reveal-guard";
 import { hasContactRetentionMarkers } from "../services/privacy-retention";
 import { invalidateAgentGeocode } from "../services/agent-geocode-reset";
+import { scheduleRegistrationConfirmation } from "../services/registration-confirmation";
 import {
   publicFieldChoices, publicFieldChoicesForMany, withoutHiddenContact, withoutHiddenFields, publicAgentInfo,
   withoutHiddenCoordinates, hidesPrices, hidesTrust, type PublicFieldChoices,
@@ -605,6 +606,8 @@ router.post("/register", (req: Request, res: Response) => {
         registeredAt: agent.registeredAt,
       },
     });
+    // S1 2026-11-10: flagged (REGISTRATION_CONFIRMATION_EMAIL_ENABLED), fire-and-forget, never throws.
+    scheduleRegistrationConfirmation({ email: registration.contactEmail, name: registration.name, agentId: agent.id });
   } catch (error: any) {
     // A pause that went live between the gate above and the INSERT still ends
     // as a 423, never a 500 — the primitive's own gate is what caught it. The
