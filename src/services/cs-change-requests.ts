@@ -179,6 +179,27 @@ export interface ChangeRequestRow {
   deleted_at: string | null;
   verified_at: string | null;
   attempts: number;
+  /** A removal's blocklist plan (JSON array of {type, value}), saved before anything changes. */
+  blocklist_plan: string | null;
+}
+
+/** The visibility before a removal, its blocklist plan and the rows that already existed. */
+interface RemovalSnapshot {
+  is_active?: number;
+  catalog_hidden?: number;
+  catalog_hidden_reason?: string | null;
+  plan?: Array<{ type: string; value: string }>;
+  blocklist_before?: string[];
+}
+
+function parseJson<T>(raw: string | null | undefined): T | null {
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw);
+    return v && typeof v === "object" && Object.keys(v).length > 0 ? (v as T) : null;
+  } catch {
+    return null;
+  }
 }
 
 export function getChangeRequest(id: string): ChangeRequestRow | null {
@@ -324,14 +345,22 @@ export function checkAuthority(input: {
   if (!thread) return none("ingen_traad");
   if (thread.vertical_id !== input.vertical) return none("feil_plattform");
   // A removal cannot be undone after 24 h: its evidence must be an e-mail the
-  // SERVER received (Resend inbound), not a message any API caller could have
-  // filed through /admin/crm/ingest.
+  // SERVER received (Resend inbound). That is proven by the server's own
+  // inbound_email_log row (written only by the webhook) whose message id the
+  // CRM message carries — never by raw_metadata, which /admin/crm/ingest
+  // stores as the caller sent it.
   const serverOnly = input.kind === "removal";
   const msg = db
     .prepare(
-      `SELECT id FROM crm_messages WHERE thread_id = ? AND direction = 'in' AND LOWER(TRIM(from_email)) = ?
-         ${input.evidenceMessageId ? "AND id = ?" : ""}
-         ${serverOnly ? "AND COALESCE(json_valid(raw_metadata), 0) = 1 AND json_extract(raw_metadata, '$.source') = 'resend_inbound'" : ""}
+      `SELECT m.id FROM crm_messages m WHERE m.thread_id = ? AND m.direction = 'in' AND LOWER(TRIM(m.from_email)) = ?
+         ${input.evidenceMessageId ? "AND m.id = ?" : ""}
+         ${
+           serverOnly
+             ? `AND EXISTS (SELECT 1 FROM inbound_email_log l
+                             WHERE ('rsnd-' || COALESCE(l.email_id, l.id)) = m.id
+                               AND LOWER(TRIM(l.from_email)) = LOWER(TRIM(m.from_email)))`
+             : ""
+         }
         LIMIT 1`,
     )
     .get(...([input.threadId, requester, ...(input.evidenceMessageId ? [input.evidenceMessageId] : [])] as unknown[])) as { id: string } | undefined;
@@ -461,11 +490,11 @@ export function identifierUsedElsewhere(type: string, value: string, vertical: C
   try {
     const db = getDb();
     const agents = db
-      .prepare(`SELECT a.id, a.name, a.contact_email, a.url, k.email AS k_email, k.website AS k_website FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id WHERE a.is_active = 1`)
-      .all() as Array<{ id: string; name: string; contact_email: string | null; url: string | null; k_email: string | null; k_website: string | null }>;
+      .prepare(`SELECT a.id, a.name, a.contact_email, a.url, a.org_nr, k.email AS k_email, k.website AS k_website FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id WHERE a.is_active = 1`)
+      .all() as Array<{ id: string; name: string; contact_email: string | null; url: string | null; org_nr: string | null; k_email: string | null; k_website: string | null }>;
     const exp = getVerticalDb("experiences")
-      .prepare(`SELECT id, navn, epost, hjemmeside FROM experience_providers WHERE COALESCE(catalog_hidden, 0) = 0`)
-      .all() as Array<{ id: string; navn: string; epost: string | null; hjemmeside: string | null }>;
+      .prepare(`SELECT id, navn, epost, hjemmeside, org_nr FROM experience_providers WHERE COALESCE(catalog_hidden, 0) = 0`)
+      .all() as Array<{ id: string; navn: string; epost: string | null; hjemmeside: string | null; org_nr: string | null }>;
     const otherAgents = agents.filter((a) => !(vertical === "rfb" && a.id === targetId));
     const otherProviders = exp.filter((p) => !(vertical === "experiences" && p.id === targetId));
     if (type === "email") {
@@ -479,6 +508,9 @@ export function identifierUsedElsewhere(type: string, value: string, vertical: C
     }
     if (type === "name_normalized") {
       return otherAgents.some((a) => blocklist.normalizeName(a.name) === value) || otherProviders.some((p) => blocklist.normalizeName(p.navn) === value);
+    }
+    if (type === "org_nr") {
+      return otherAgents.some((a) => blocklist.normalizeOrgNr(a.org_nr) === value) || otherProviders.some((p) => blocklist.normalizeOrgNr(p.org_nr) === value);
     }
     return false;
   } catch {
@@ -501,6 +533,7 @@ export function removalBlocklistPlan(vertical: ChangeVertical, target: Target, r
     if (isOwnBusinessDomain(d)) push("website_domain", d);
   }
   if (vertical === "rfb") push("agent_id", target.id.toLowerCase());
+  push("org_nr", blocklist.normalizeOrgNr(target.orgNr));
   push("name_normalized", blocklist.normalizeName(target.name));
   return out;
 }
@@ -611,8 +644,11 @@ async function executeProfileUpdate(r: ChangeRequestRow, deps: ExecDeps): Promis
     setStatus(r.id, "failed", "profil_mangler", {}, now, "executing");
     return;
   }
+  // A re-run after an interrupted attempt keeps the FIRST attempt's old
+  // values: by now the database may already hold the new ones.
+  const prior = parseJson<Record<string, { old: string | null }>>(r.snapshot);
   const snapshot: Record<string, { old: string | null }> = {};
-  for (const f of Object.keys(changes)) snapshot[f] = { old: dbValue(r.vertical, r.target_id, f) };
+  for (const f of Object.keys(changes)) snapshot[f] = prior && f in prior ? prior[f] : { old: dbValue(r.vertical, r.target_id, f) };
   getDb().prepare("UPDATE cs_change_requests SET snapshot = ? WHERE id = ?").run(JSON.stringify(snapshot), r.id);
   const evidence = (() => {
     try {
@@ -772,39 +808,53 @@ async function executeRemovalHide(r: ChangeRequestRow, deps: ExecDeps): Promise<
     setStatus(r.id, "failed", "profil_mangler", {}, now, "executing");
     return;
   }
-  const plan = removalBlocklistPlan(r.vertical, target, r.requester_email);
+  // A re-run after an interrupted attempt reuses the first attempt's
+  // snapshot: the visibility before the removal, the plan, and which
+  // blocklist rows were already there — so a cancel still restores exactly
+  // the state before the removal.
+  const prior = parseJson<RemovalSnapshot>(r.snapshot);
+  const plan = prior?.plan ?? removalBlocklistPlan(r.vertical, target, r.requester_email);
   const tracked = trackedBlocklistPairs(r.vertical, target, plan);
-  const before = blocklistIdsFor(tracked);
-  let snapshot: Record<string, unknown> = {};
+  const before = new Set(prior?.blocklist_before ?? [...blocklistIdsFor(tracked).keys()]);
+  let snapshot: RemovalSnapshot;
+  if (r.vertical === "rfb") {
+    const prev = getDb().prepare("SELECT is_active, catalog_hidden FROM agents WHERE id = ?").get(r.target_id) as { is_active: number; catalog_hidden: number | null };
+    snapshot = prior ?? { is_active: prev.is_active, catalog_hidden: prev.catalog_hidden ?? 0, plan, blocklist_before: [...before] };
+  } else {
+    const prev = getVerticalDb("experiences").prepare("SELECT catalog_hidden, catalog_hidden_reason FROM experience_providers WHERE id = ?").get(r.target_id) as
+      | { catalog_hidden: number | null; catalog_hidden_reason: string | null }
+      | undefined;
+    snapshot = prior ?? { catalog_hidden: prev?.catalog_hidden ?? 0, catalog_hidden_reason: prev?.catalog_hidden_reason ?? null, plan, blocklist_before: [...before] };
+  }
+  const visibility = { ...snapshot, plan: undefined, blocklist_before: undefined };
+  // Saved BEFORE anything changes.
+  getDb().prepare("UPDATE cs_change_requests SET snapshot = ?, blocklist_plan = ? WHERE id = ?").run(JSON.stringify(snapshot), JSON.stringify(plan), r.id);
   if (r.vertical === "rfb") {
     const db = getDb();
-    const prev = db.prepare("SELECT is_active, catalog_hidden FROM agents WHERE id = ?").get(r.target_id) as { is_active: number; catalog_hidden: number | null };
-    snapshot = { is_active: prev.is_active, catalog_hidden: prev.catalog_hidden ?? 0 };
     db.transaction(() => {
       db.prepare("UPDATE agents SET is_active = 0, catalog_hidden = 1 WHERE id = ?").run(r.target_id);
       db.prepare(
         `INSERT INTO agent_knowledge_audit (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
          VALUES (?, ?, 'is_active', ?, '0', 'system', ?, ?, ?)`,
-      ).run(randomUUID(), r.target_id, String(prev.is_active), r.requester_email, now.toISOString(), `${REMOVAL_REASON(r.id)}: skjult, slettes etter ${REMOVAL_GRACE_HOURS} t`);
+      ).run(randomUUID(), r.target_id, String(snapshot.is_active ?? 1), r.requester_email, now.toISOString(), `${REMOVAL_REASON(r.id)}: skjult, slettes etter ${REMOVAL_GRACE_HOURS} t`);
     })();
     try {
       (marketplaceRegistry as any).invalidateCache?.();
     } catch {
       /* ignore */
     }
-    addStep(r.id, "hide", true, { is_active: 0, catalog_hidden: 1, previous: snapshot }, now);
+    addStep(r.id, "hide", true, { is_active: 0, catalog_hidden: 1, previous: visibility }, now);
   } else {
     const xdb = getVerticalDb("experiences");
-    const prev = xdb.prepare("SELECT catalog_hidden, catalog_hidden_reason FROM experience_providers WHERE id = ?").get(r.target_id) as
-      | { catalog_hidden: number | null; catalog_hidden_reason: string | null }
-      | undefined;
-    snapshot = { catalog_hidden: prev?.catalog_hidden ?? 0, catalog_hidden_reason: prev?.catalog_hidden_reason ?? null };
     const res = await call("POST", "/api/opplevelser/admin/gardssalg-provider-visibility", {
       providerIds: [r.target_id],
       hidden: true,
       apply: true,
       mode: "remove_request",
       confirm_owned: true,
+      // The blocklist is written below from the plan (shared identifiers
+      // left out); the route must not add its own rows.
+      skip_blocklist: true,
     }).catch(FAILED_CALL);
     // 200 alone is not proof: the route answers 200 with the row in
     // skipped_locked / not_found too. Accept only «changed» (or «unchanged»
@@ -816,7 +866,7 @@ async function executeRemovalHide(r: ChangeRequestRow, deps: ExecDeps): Promise<
     const hiddenNow = now2?.catalog_hidden === 1;
     const ok = okStatus(res.status) && (inBucket("changed") || (inBucket("unchanged") && now2?.catalog_hidden_reason === "remove_request")) && hiddenNow;
     const bucket = ["changed", "unchanged", "skipped_locked", "skipped_owned", "skipped_owner_removed", "not_found"].find(inBucket) ?? "ingen";
-    addStep(r.id, "hide", ok, { status: res.status, bucket, hidden_now: hiddenNow, previous: snapshot }, now);
+    addStep(r.id, "hide", ok, { status: res.status, bucket, hidden_now: hiddenNow, previous: visibility }, now);
     if (!ok) {
       setStatus(r.id, "failed", `skjuling_feilet: HTTP ${res.status}, ${bucket}`, {}, now, "executing");
       return;
@@ -828,14 +878,30 @@ async function executeRemovalHide(r: ChangeRequestRow, deps: ExecDeps): Promise<
       if (p.type === "email") blocklist.add({ email: p.value, reason, sourceEmail: r.requester_email, agentNameForAudit: target.name });
       else if (p.type === "website_domain") blocklist.add({ website: p.value, reason, sourceEmail: r.requester_email, agentNameForAudit: target.name });
       else if (p.type === "agent_id") blocklist.add({ agentId: p.value, reason, sourceEmail: r.requester_email, agentNameForAudit: target.name });
+      else if (p.type === "org_nr") blocklist.add({ orgNr: p.value, reason, sourceEmail: r.requester_email, agentNameForAudit: target.name });
       else if (p.type === "name_normalized") blocklist.add({ name: target.name, reason, sourceEmail: r.requester_email });
     } catch (e: any) {
       addStep(r.id, `blocklist_${p.type}`, false, String(e?.message ?? e), now);
     }
   }
-  const after = blocklistIdsFor(tracked);
+  let after = blocklistIdsFor(tracked);
+  // Anything this removal added that is NOT in the plan (a route that still
+  // wrote its own rows) comes out again: the plan alone decides, and it
+  // leaves out identifiers another active profile uses.
+  const unplanned = [...after.entries()].filter(([k]) => !before.has(k) && !plan.some((p) => `${p.type}|${p.value}` === k));
+  if (unplanned.length > 0) {
+    for (const [, id] of unplanned) blocklist.remove({ id });
+    addStep(r.id, "blocklist_unplanned_removed", true, { removed: unplanned.map(([k]) => k) }, now);
+    after = blocklistIdsFor(tracked);
+  }
   const added = [...after.entries()].filter(([k]) => !before.has(k)).map(([k, v]) => ({ key: k, id: v }));
-  addStep(r.id, "blocklist", plan.every((p) => after.has(`${p.type}|${p.value}`)), { planned: plan, added: added.map((a) => a.key), already: [...before.keys()] }, now);
+  // The name row records which org.nr it was about, so a different business
+  // with the same name is not blocked (blocklist isBlocked, Mål 3). Only on a
+  // row this removal itself added.
+  const orgNr = blocklist.normalizeOrgNr(target.orgNr);
+  const nameRow = added.find((a) => a.key.startsWith("name_normalized|"));
+  if (orgNr && nameRow) getDb().prepare("UPDATE agent_blocklist SET linked_org_nr = ? WHERE id = ? AND linked_org_nr IS NULL").run(orgNr, nameRow.id);
+  addStep(r.id, "blocklist", plan.every((p) => after.has(`${p.type}|${p.value}`)), { planned: plan, added: added.map((a) => a.key), already: [...before] }, now);
   const cross = [...new Set([r.requester_email, ...target.emails])].flatMap((e) => {
     try {
       return findCrossVerticalEntriesByEmail(e, r.vertical as CrmVertical);
@@ -849,6 +915,27 @@ async function executeRemovalHide(r: ChangeRequestRow, deps: ExecDeps): Promise<
     .prepare("UPDATE cs_change_requests SET snapshot = ?, blocklist_ids = ?, cross_vertical = ? WHERE id = ?")
     .run(JSON.stringify(snapshot), JSON.stringify(added.map((a) => a.id)), JSON.stringify(cross), r.id);
   setStatus(r.id, "hidden", null, { hidden_at: now.toISOString(), delete_after: deleteAfter, executed_at: now.toISOString() }, now, "executing");
+}
+
+/**
+ * Every blocklist row the removal planned is there (plus `always`). The plan
+ * leaves out identifiers another active profile uses, so a shared address
+ * does not keep a removal from verifying.
+ */
+function plannedRowsPresent(r: ChangeRequestRow, always: Array<{ type: string; value: string }>): boolean {
+  const plan = parseJsonArray<{ type: string; value: string }>(r.blocklist_plan);
+  const pairs = [...plan, ...always];
+  const have = blocklistIdsFor(pairs);
+  return pairs.every((p) => have.has(`${p.type}|${p.value}`));
+}
+
+function parseJsonArray<T>(raw: string | null | undefined): T[] {
+  try {
+    const v = JSON.parse(raw ?? "[]");
+    return Array.isArray(v) ? (v as T[]) : [];
+  } catch {
+    return [];
+  }
 }
 
 async function removalChecks(r: ChangeRequestRow, deps: ExecDeps): Promise<{ ok: boolean; checks: Record<string, unknown> }> {
@@ -865,9 +952,9 @@ async function removalChecks(r: ChangeRequestRow, deps: ExecDeps): Promise<{ ok:
     checks.by_id = card?.status ?? "feil";
     checks.profile_page = page ? `${page.status}${page.location ? ` → ${page.location}` : ""}` : "feil";
     checks.not_in_search = !!search && okStatus(search.status) && !search.body.includes(r.target_id);
-    const bl = getDb().prepare("SELECT 1 FROM agent_blocklist WHERE identifier_type = 'agent_id' AND identifier_value = ?").get(r.target_id.toLowerCase());
-    checks.blocklisted = !!bl;
-    ok = card?.status === 404 && pageGone && checks.not_in_search === true && !!bl;
+    const bl = plannedRowsPresent(r, [{ type: "agent_id", value: r.target_id.toLowerCase() }]);
+    checks.blocklisted = bl;
+    ok = card?.status === 404 && pageGone && checks.not_in_search === true && bl;
   } else {
     const t = loadTarget("experiences", r.target_id);
     const page = t?.slug ? await fetchPublic(`/kategori/gardssalg/produsent/${encodeURIComponent(t.slug)}`, "opplevagent.no").catch(() => null) : null;
@@ -876,9 +963,9 @@ async function removalChecks(r: ChangeRequestRow, deps: ExecDeps): Promise<{ ok:
     checks.hidden_in_db = hidden;
     checks.profile_page = page?.status ?? (t?.slug ? "feil" : "ingen_slug");
     checks.not_in_discover = !!disc && okStatus(disc.status) && !disc.body.includes(r.target_id) && !(t?.slug && disc.body.includes(t.slug));
-    const bl = getDb().prepare("SELECT 1 FROM agent_blocklist WHERE identifier_type = 'email' AND identifier_value = ?").get(r.requester_email);
-    checks.blocklisted = !!bl;
-    ok = hidden && (page === null ? !t?.slug : page.status === 404) && checks.not_in_discover === true && !!bl;
+    const bl = plannedRowsPresent(r, []);
+    checks.blocklisted = bl;
+    ok = hidden && (page === null ? !t?.slug : page.status === 404) && checks.not_in_discover === true && bl;
   }
   return { ok, checks };
 }
@@ -887,8 +974,14 @@ async function executeRemovalFinish(r: ChangeRequestRow, deps: ExecDeps): Promis
   const now = deps.now ?? new Date();
   const call = deps.adminCall ?? defaultAdminCall;
   if (r.vertical === "rfb" && !r.deleted_at) {
-    // Claim the delete: a cancel from here on is refused (it only acts on «hidden»).
-    if (!setStatus(r.id, "deleting", null, {}, now, "hidden")) return;
+    // Claim the delete: a cancel from here on is refused (it only acts on
+    // «hidden»). A «deleting» row here was reclaimed by the worker after an
+    // interrupted delete (reclaimStale); DELETE is idempotent (404 accepted).
+    if (r.status === "hidden") {
+      if (!setStatus(r.id, "deleting", null, {}, now, "hidden")) return;
+    } else if (r.status !== "deleting") {
+      return;
+    }
     const res = await call("DELETE", `/api/marketplace/agents/${encodeURIComponent(r.target_id)}?force=1`, {
       reason: REMOVAL_REASON(r.id),
       sourceEmail: r.requester_email,
@@ -987,16 +1080,17 @@ export async function cancelChangeRequest(id: string, reason: string, deps: Exec
       setStatus(id, "hidden", null, {}, now, "executing");
       return { ok: false, status: 502, error: `unhide_failed_${res.status}` };
     }
-    // It was already hidden before the removal (e.g. for quality): put that back exactly.
-    if (snap.catalog_hidden === 1 && snap.catalog_hidden_reason && snap.catalog_hidden_reason !== "remove_request") {
-      const back = await call("POST", "/api/opplevelser/admin/gardssalg-provider-visibility", {
-        providerIds: [r.target_id],
-        hidden: true,
-        apply: true,
-        mode: snap.catalog_hidden_reason,
-        confirm_owned: true,
-      }).catch(FAILED_CALL);
-      addStep(id, "restore_previous_hide", okStatus(back.status), { status: back.status, mode: snap.catalog_hidden_reason }, now);
+    // It was already hidden before the removal (quality, the owner's own
+    // pause, …): put that back exactly. Written directly — the route only
+    // knows the modes «quality» and «remove_request».
+    if (snap.catalog_hidden === 1 && snap.catalog_hidden_reason !== "remove_request") {
+      const xdb = getVerticalDb("experiences");
+      xdb.prepare("UPDATE experience_providers SET catalog_hidden = 1, catalog_hidden_reason = ?, updated_at = datetime('now') WHERE id = ?").run(snap.catalog_hidden_reason ?? null, r.target_id);
+      const back = xdb.prepare("SELECT catalog_hidden, catalog_hidden_reason FROM experience_providers WHERE id = ?").get(r.target_id) as
+        | { catalog_hidden: number | null; catalog_hidden_reason: string | null }
+        | undefined;
+      const restored = back?.catalog_hidden === 1 && (back?.catalog_hidden_reason ?? null) === (snap.catalog_hidden_reason ?? null);
+      addStep(id, "restore_previous_hide", restored, { reason: snap.catalog_hidden_reason ?? null }, now);
     }
   }
   const ids = JSON.parse(r.blocklist_ids || "[]") as number[];
@@ -1008,6 +1102,46 @@ export async function cancelChangeRequest(id: string, reason: string, deps: Exec
 }
 
 // ─── Worker ──────────────────────────────────────────────────────────
+
+/** A claim («executing», «deleting») older than this was interrupted (restart, deploy). Each step's HTTP calls time out after 30 s. */
+export const STALE_CLAIM_MINUTES = 20;
+const MAX_RECLAIMS = 3;
+
+function reclaim(r: ChangeRequestRow, to: ChangeStatus, reason: string | null, now: Date): boolean {
+  const res = getDb()
+    .prepare("UPDATE cs_change_requests SET status = ?, status_reason = ?, updated_at = ?, attempts = attempts + 1 WHERE id = ? AND status = ? AND updated_at = ?")
+    .run(to, reason, now.toISOString(), r.id, r.status, r.updated_at);
+  return res.changes === 1;
+}
+
+/**
+ * Pick up a claim a restart left behind. A write or hide is re-run from
+ * «queued» (both are idempotent, and the first attempt's snapshot is kept);
+ * an interrupted cancel goes to «failed» for Daniel (half restored); a
+ * delete is retried. After MAX_RECLAIMS it stops at «failed».
+ */
+async function reclaimStale(r: ChangeRequestRow, deps: ExecDeps): Promise<void> {
+  const now = deps.now ?? new Date();
+  if (r.status === "deleting") {
+    if (!reclaim(r, "deleting", "sletting avbrutt underveis — prøver igjen", now)) return;
+    addStep(r.id, "reclaimed", true, { from: "deleting", attempt: r.attempts + 1 }, now);
+    await executeRemovalFinish(getChangeRequest(r.id)!, deps);
+    return;
+  }
+  if (r.status_reason === "angrer") {
+    if (reclaim(r, "failed", "angring avbrutt underveis — sjekk synlighet og sperreliste", now)) addStep(r.id, "reclaimed", false, { from: "executing", note: "angring avbrutt" }, now);
+    return;
+  }
+  if (r.attempts >= MAX_RECLAIMS) {
+    if (reclaim(r, "failed", `avbrutt underveis ${r.attempts} ganger`, now)) addStep(r.id, "reclaimed", false, { from: "executing", attempts: r.attempts }, now);
+    return;
+  }
+  if (!reclaim(r, "queued", "avbrutt underveis — kjøres på nytt", now)) return;
+  addStep(r.id, "reclaimed", true, { from: "executing", attempt: r.attempts + 1 }, now);
+  const again = getChangeRequest(r.id)!;
+  if (again.kind === "profile_update") await executeProfileUpdate(again, deps);
+  else await executeRemovalHide(again, deps);
+}
 
 export interface ChangeRunResult {
   run_id: string | null;
@@ -1026,9 +1160,10 @@ export async function runCsChangeRequests(deps: ExecDeps & { trigger?: "cron" | 
            OR (status = 'executed' AND kind = 'profile_update')
            OR (status = 'hidden' AND kind = 'removal' AND julianday(delete_after) <= julianday(?))
            OR (status = 'deleting' AND kind = 'removal' AND deleted_at IS NOT NULL)
+           OR (status IN ('executing', 'deleting') AND deleted_at IS NULL AND julianday(updated_at) <= julianday(?) - ? / 1440.0)
         ORDER BY created_at ASC LIMIT ?`,
     )
-    .all(now.toISOString(), limit) as Array<{ id: string }>;
+    .all(now.toISOString(), now.toISOString(), STALE_CLAIM_MINUTES, limit) as Array<{ id: string }>;
   const processed: ChangeRunResult["processed"] = [];
   for (const d of due) {
     const r = getChangeRequest(d.id);
@@ -1040,6 +1175,8 @@ export async function runCsChangeRequests(deps: ExecDeps & { trigger?: "cron" | 
         else await executeRemovalHide(r, deps);
       } else if (r.status === "executed") {
         await verifyProfileUpdate(r, deps);
+      } else if (r.status === "executing" || (r.status === "deleting" && !r.deleted_at)) {
+        await reclaimStale(r, deps);
       } else if (r.status === "hidden" || r.status === "deleting") {
         await executeRemovalFinish(r, deps);
       }
@@ -1048,7 +1185,7 @@ export async function runCsChangeRequests(deps: ExecDeps & { trigger?: "cron" | 
       setStatus(r.id, "failed", `unntak: ${String(e?.message ?? e)}`.slice(0, 500), {}, now, getChangeRequest(r.id)?.status as ChangeStatus);
     }
     const after = getChangeRequest(d.id)!;
-    if (after.status !== from || from === "queued") processed.push({ id: d.id, from, to: after.status });
+    if (after.status !== from || from === "queued" || after.attempts !== r.attempts) processed.push({ id: d.id, from, to: after.status });
   }
   if (processed.length === 0) return { run_id: null, processed, envelope_recorded: false };
   const runId = `run-${now.toISOString().slice(0, 19).replace(/[:]/g, "")}-cs-change-requests`;

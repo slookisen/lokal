@@ -36,7 +36,7 @@ import { crmFromHeader, resolveCrmIdentity, lintOutboundBodyForForeignBranding }
 import { emailService } from "./email-service";
 import { plainTextToEmailHtml } from "../utils/plain-text-to-html";
 import { containsMojibake } from "./search-enrich";
-import { isOurPlatformAddress } from "./cs-inbound";
+import { classifyForwardCopy, forwardCopyMarker, forwardOriginalSender, isOurPlatformAddress, readInboundHeaders } from "./cs-inbound";
 import { recordRun } from "./run-ledger";
 import { EnvelopeBuilder } from "../types/run-envelope";
 
@@ -202,16 +202,41 @@ export function latestHumanInbound(threadId: string): LatestInbound | null {
   const db = getDb();
   const rows = db
     .prepare(
-      `SELECT id, from_email, subject, COALESCE(sent_at, received_at) AS at, raw_metadata
+      `SELECT id, from_email, subject, COALESCE(sent_at, received_at) AS at, raw_metadata, body_text, body_html
          FROM crm_messages
         WHERE thread_id = ? AND direction = 'in'
           AND NOT (COALESCE(json_valid(raw_metadata), 0) = 1 AND COALESCE(json_extract(raw_metadata, '$.automated'), 0) = 1)
         ORDER BY COALESCE(julianday(sent_at), julianday(received_at)) DESC, rowid DESC
         LIMIT 20`,
     )
-    .all(threadId) as Array<{ id: string; from_email: string; subject: string | null; at: string; raw_metadata: string | null }>;
-  // Our own platform addresses (a forwarded Gmail copy, an internal note) are never «the person who wrote».
-  const row = rows.find((r) => r.from_email && !isOurPlatformAddress(r.from_email));
+    .all(threadId) as Array<{ id: string; from_email: string; subject: string | null; at: string; raw_metadata: string | null; body_text: string | null; body_html: string | null }>;
+  // Our own platform addresses (an internal note) are never «the person who
+  // wrote». A kept Gmail copy of a forward (sent from our address) stands for
+  // the original sender it names in «(fra … <addr>)» — unless that sender is
+  // automated (a bounce, an auto-reply) or one of our own addresses.
+  let row: (typeof rows)[number] | undefined;
+  let fromEmail = "";
+  for (const r of rows) {
+    if (!r.from_email) continue;
+    if (!isOurPlatformAddress(r.from_email)) {
+      row = r;
+      fromEmail = r.from_email;
+      break;
+    }
+    if (!forwardCopyMarker({ direction: "in", subject: r.subject, bodyText: r.body_text, bodyHtml: r.body_html })) continue;
+    const orig = forwardOriginalSender(r.subject);
+    if (!orig?.email || isOurPlatformAddress(orig.email)) continue;
+    let meta: Record<string, unknown> = {};
+    try {
+      meta = JSON.parse(r.raw_metadata ?? "{}") ?? {};
+    } catch {
+      meta = {};
+    }
+    if (classifyForwardCopy({ subject: r.subject, fromEmail: r.from_email, headers: readInboundHeaders(meta) }).kind !== null) continue;
+    row = r;
+    fromEmail = orig.email;
+    break;
+  }
   if (!row) return null;
   let rfc: string | null = null;
   try {
@@ -228,13 +253,13 @@ export function latestHumanInbound(threadId: string): LatestInbound | null {
             WHERE crm_thread_id = ? AND LOWER(from_email) = LOWER(?) AND rfc_message_id IS NOT NULL
             ORDER BY received_at DESC LIMIT 1`,
         )
-        .get(threadId, row.from_email) as { rfc_message_id: string } | undefined;
+        .get(threadId, fromEmail) as { rfc_message_id: string } | undefined;
       if (log?.rfc_message_id) rfc = log.rfc_message_id;
     } catch {
       // inbound_email_log missing — reply still threads by subject
     }
   }
-  return { message_id: row.id, from_email: row.from_email.trim().toLowerCase(), subject: row.subject, at: row.at, rfc_message_id: rfc };
+  return { message_id: row.id, from_email: fromEmail.trim().toLowerCase(), subject: row.subject, at: row.at, rfc_message_id: rfc };
 }
 
 interface LinkedChange {
@@ -266,7 +291,7 @@ function changeBelongsTo(c: LinkedChange, threadId: string, toEmail: string): bo
 }
 
 /** Change-request states that are still on their way (the reply waits for them). */
-const CHANGE_IN_PROGRESS = new Set(["approval_needed", "queued", "executed", "hidden"]);
+const CHANGE_IN_PROGRESS = new Set(["approval_needed", "queued", "executing", "executed", "hidden", "deleting"]);
 /** How long a reply waits for its linked change before it goes to Daniel. */
 export const CHANGE_WAIT_HOURS = 72;
 export const CHANGE_WAIT_RECHECK_MS = 5 * 60_000;

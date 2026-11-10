@@ -33108,6 +33108,7 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
     override_owner_removed?: unknown;
     mode?: unknown;
     confirm_owned?: unknown;
+    skip_blocklist?: unknown;
   };
 
   if (typeof body.hidden !== "boolean") {
@@ -33129,6 +33130,14 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
     return;
   }
   const confirmOwned = body.confirm_owned === true;
+  // CS på serveren (S4): the change-request worker writes the blocklist
+  // itself from its plan, which leaves out identifiers another active
+  // profile uses. It asks the route not to add its own rows.
+  if (body.skip_blocklist !== undefined && typeof body.skip_blocklist !== "boolean") {
+    res.status(400).json({ error: "Body field 'skip_blocklist' must be a boolean" });
+    return;
+  }
+  const skipBlocklist = body.skip_blocklist === true;
   const apply =
     body.apply === true ||
     body.apply === 1 ||
@@ -33283,7 +33292,7 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
           } catch (clearErr) {
             console.error("[opplevelser] gardssalg-provider-visibility confirmation clear failed (non-critical):", clearErr);
           }
-          try {
+          if (!skipBlocklist) try {
             // Never a shared platform host or free-mail domain as a website block.
             const hjemDomain = normalizeDomain(row.hjemmeside ?? "");
             const hjemUsable = !!hjemDomain && !BLOCKLIST_PROTECTED_DOMAINS_V.has(hjemDomain) && !isHostedPlatformHostV(hjemDomain);

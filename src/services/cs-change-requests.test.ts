@@ -20,6 +20,15 @@
  *              a 423 on delete is retried.
  *   cq20-cq22  Opplevagent: content field + lock; removal = hide (no delete).
  *   cq23-cq27  routes, run ledger, watchdog + digest.
+ *   cqr8-cqr18 second re-review: an Opplevagent removal through the REAL
+ *              visibility route blocklists only the plan (never an e-mail,
+ *              org.nr or site another active profile uses) and verifies on
+ *              the plan; rows a route adds anyway come out again; the name
+ *              row records the org.nr; a claim left behind by a restart is
+ *              picked up (write re-run, delete retried, interrupted cancel to
+ *              Daniel, capped); a linked reply waits meanwhile; cancel puts an
+ *              earlier hide back exactly; forged «resend_inbound» metadata is
+ *              no evidence for a removal.
  *
  * Standalone:
  *   node node_modules/tsx/dist/cli.mjs src/services/cs-change-requests.test.ts
@@ -86,12 +95,18 @@ export function runCsChangeRequestsTests(opts: { log?: boolean } = {}): Promise<
       try { exp.exec("ALTER TABLE experience_providers ADD COLUMN about_text TEXT"); } catch { /* present */ }
 
       let tn = 0;
-      const mkThread = (vertical: "rfb" | "experiences", from: string, prefix = "cq", serverRegistered = true) => {
+      // serverRegistered: the e-mail came through the Resend webhook — an
+      // inbound_email_log row, and the CRM message id «rsnd-<email_id>».
+      const mkThread = (vertical: "rfb" | "experiences", from: string, prefix = "cq", serverRegistered = true, forgedMeta = false) => {
         const id = `${prefix}-t${++tn}`;
+        if (serverRegistered) {
+          db.prepare(`INSERT INTO inbound_email_log (id, email_id, from_email, subject, crm_status, crm_thread_id, received_at) VALUES (?, ?, ?, ?, 'registered', ?, ?)`)
+            .run(`inb-${id}`, `${id}-em`, from, `Henvendelse ${tn}`, id, ago(2));
+        }
         crm.crmService.ingestThread(
           { threadId: id, subject: `Henvendelse ${tn}`, category: "innkommende",
-            messages: [{ messageId: `${id}-in`, direction: "in", fromEmail: from, bodyText: "Vennligst endre", sentAt: ago(2),
-              rawMetadata: serverRegistered ? { source: "resend_inbound" } : {} }] },
+            messages: [{ messageId: serverRegistered ? `rsnd-${id}-em` : `${id}-in`, direction: "in", fromEmail: from, bodyText: "Vennligst endre", sentAt: ago(2),
+              rawMetadata: serverRegistered || forgedMeta ? { source: "resend_inbound" } : {} }] },
           from, vertical);
         return id;
       };
@@ -102,6 +117,8 @@ export function runCsChangeRequestsTests(opts: { log?: boolean } = {}): Promise<
       const lockedProviders = new Set<string>();
       let cardDown = false;
       let deleteStatus = 200;
+      let routeIgnoresSkip = false;
+      const blocklistSvc = require("./blocklist-service") as typeof import("./blocklist-service");
       const adminCall: import("./cs-change-requests").AdminCall = async (method, path, body: any) => {
         calls.push({ method, path, body });
         const res = (status: number, json: any) => ({ status, body: JSON.stringify(json), json, location: null });
@@ -135,6 +152,11 @@ export function runCsChangeRequestsTests(opts: { log?: boolean } = {}): Promise<
           const pid = body.providerIds[0];
           if (lockedProviders.has(pid)) return res(200, { changed: [], unchanged: [], skipped_locked: [{ id: pid }] });
           exp.prepare("UPDATE experience_providers SET catalog_hidden = ?, catalog_hidden_reason = ? WHERE id = ?").run(body.hidden ? 1 : 0, body.hidden ? body.mode : null, pid);
+          // As the real route: «fjern oss» blocklists org.nr, e-post and site — unless asked not to.
+          if (body.hidden && body.mode === "remove_request" && (body.skip_blocklist !== true || routeIgnoresSkip)) {
+            const p = exp.prepare("SELECT org_nr, epost, hjemmeside FROM experience_providers WHERE id = ?").get(pid) as any;
+            blocklistSvc.add({ orgNr: p?.org_nr ?? undefined, email: p?.epost ?? undefined, website: p?.hjemmeside ?? undefined, reason: "gardssalg-provider-visibility hide (fjern oss)" });
+          }
           return res(200, { changed: [{ id: pid }], unchanged: [] });
         }
         return res(404, { error: "no stub" });
@@ -286,6 +308,10 @@ export function runCsChangeRequestsTests(opts: { log?: boolean } = {}): Promise<
         const tNoServer = mkThread("rfb", "post@bevis.no", "cq", false);
         const r7 = create({ targetId: "ag-5", threadId: tNoServer, requesterEmail: "post@bevis.no", kind: "removal" });
         eq(r7.ok && !r7.dryRun && [r7.request.status, r7.request.status_reason], ["approval_needed", "fjerning_krever_serverregistrert_e-post"], "cqr1: a removal whose evidence was not received by the server goes to Daniel");
+        if (r7.ok && !r7.dryRun) cq.rejectChangeRequest(r7.request.id, "test");
+        const tForged = mkThread("rfb", "post@bevis.no", "cq", false, true);
+        const r7b = create({ targetId: "ag-5", threadId: tForged, requesterEmail: "post@bevis.no", kind: "removal" });
+        eq(r7b.ok && !r7b.dryRun && [r7b.request.status, r7b.request.status_reason], ["approval_needed", "fjerning_krever_serverregistrert_e-post"], "cqr1b: raw_metadata.source = resend_inbound sent through /ingest is no evidence — only the server's own inbound log is");
         // 6: a second open removal of the same profile is refused (cancel stays meaningful)
         const tSrv = mkThread("rfb", "post@bevis.no");
         const r6 = create({ targetId: "ag-5", threadId: tSrv, requesterEmail: "post@bevis.no", kind: "removal" });
@@ -326,6 +352,113 @@ export function runCsChangeRequestsTests(opts: { log?: boolean } = {}): Promise<
         eq(ru.status, "executed", "cqr6: card API down (503) → not verified, re-read later");
         await cq.runCsChangeRequests(deps());
         eq(R(ru.id).status, "verified", "cqr7: …verified once the surfaces answer and show the value");
+      }
+
+      // ── second re-review ─────────────────────────────────────────────
+      {
+        // B1, through the REAL Opplevagent visibility route: a provider that
+        // shares its e-mail, org.nr and site with an active RFB producer.
+        const prevKey = process.env.ADMIN_KEY;
+        process.env.ADMIN_KEY = "test-admin-key";
+        const opl = (require("../routes/opplevelser") as any).default;
+        const realCall = (method: string, path: string, body?: any): Promise<any> =>
+          new Promise((resolve) => {
+            const headers: Record<string, string> = { "x-admin-key": "test-admin-key", host: "opplevagent.no", "content-type": "application/json" };
+            const sub = path.slice("/api/opplevelser".length);
+            const req: any = { method, url: sub, originalUrl: path, path: sub, query: {}, body: body ?? {}, headers, params: {}, ip: "127.0.0.1", get: (n: string) => headers[n.toLowerCase()], header: (n: string) => headers[n.toLowerCase()] };
+            const res: any = { statusCode: 200, setHeader() {}, getHeader() {}, set() { return this; }, header() { return this; },
+              status(c: number) { this.statusCode = c; return this; },
+              json(b: any) { resolve({ status: this.statusCode, body: JSON.stringify(b), json: b, location: null }); return this; },
+              send(b: any) { resolve({ status: this.statusCode, body: String(b), json: null, location: null }); return this; } };
+            opl.handle(req, res, (e: any) => resolve({ status: e ? 500 : 404, body: String(e ?? "fell through"), json: null, location: null }));
+          });
+        const mixedCall: import("./cs-change-requests").AdminCall = (method, path, body) =>
+          path === "/api/opplevelser/admin/gardssalg-provider-visibility" ? realCall(method, path, body) : adminCall(method, path, body);
+        try {
+          insAgent.run("ag-delt", "Delt Gård", "post@deltgard.no", "https://deltgard.no", "key-ag-delt");
+          db.prepare(`INSERT INTO agent_knowledge (agent_id, website) VALUES ('ag-delt', 'https://deltgard.no')`).run();
+          db.prepare("UPDATE agents SET org_nr = '912345678' WHERE id = 'ag-delt'").run();
+          exp.prepare(`INSERT INTO experience_providers (id, navn, epost, hjemmeside, slug, org_nr, producer_type) VALUES ('ep-delt', 'Delt Gård Sideri', 'post@deltgard.no', 'https://deltgard.no', 'delt-gard-sideri--ep', '912345678', 'sideri')`).run();
+          const tD = mkThread("experiences", "post@deltgard.no");
+          const dryD = cq.createChangeRequest({ vertical: "experiences", targetId: "ep-delt", threadId: tD, requesterEmail: "post@deltgard.no", kind: "removal", createdBy: "claude", apply: false }, { env: ON }) as any;
+          const planTypes = JSON.stringify(dryD.plan).match(/"type":"[a-z_]+"/g) ?? [];
+          eq(planTypes, ['"type":"name_normalized"'], "cqr8: the dry run plans only the name (e-mail, org.nr and site are shared with an active RFB producer)");
+          const cD = cq.createChangeRequest({ vertical: "experiences", targetId: "ep-delt", threadId: tD, requesterEmail: "post@deltgard.no", kind: "removal", createdBy: "claude", apply: true }, { env: ON }) as any;
+          const idD = cD.request.id;
+          await cq.runCsChangeRequests({ adminCall: mixedCall, publicFetch });
+          eq([R(idD).status, blocklistSvc.isBlocked({ email: "post@deltgard.no" }).blocked, blocklistSvc.isBlocked({ orgNr: "912345678" }).blocked, blocklistSvc.isBlocked({ website: "https://deltgard.no" }).blocked],
+            ["hidden", false, false, false], "cqr9: hidden through the real route, and the RFB producer's e-mail, org.nr and site stay open (its order mails keep coming)");
+          const nameRow = db.prepare("SELECT linked_org_nr FROM agent_blocklist WHERE identifier_type = 'name_normalized' AND identifier_value = ?").get(blocklistSvc.normalizeName("Delt Gård Sideri")) as any;
+          eq(nameRow?.linked_org_nr, "912345678", "cqr10: the name row records the org.nr (a different business with the same name is not blocked)");
+          await cq.runCsChangeRequests({ adminCall: mixedCall, publicFetch, now: new Date(Date.now() + 25 * 3600_000) });
+          eq(R(idD).status, "verified", "cqr11: verified on the PLANNED rows — a shared requester address no longer keeps a removal from verifying");
+        } finally {
+          if (prevKey === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = prevKey;
+        }
+      }
+      {
+        // B1 defence: a route that still writes its own rows — the unplanned ones come out again.
+        insAgent.run("ag-delt2", "Annen Delt", "post@delt2.no", "https://delt2.no", "key-ag-delt2");
+        db.prepare(`INSERT INTO agent_knowledge (agent_id, website) VALUES ('ag-delt2', 'https://delt2.no')`).run();
+        exp.prepare(`INSERT INTO experience_providers (id, navn, epost, hjemmeside, slug) VALUES ('ep-delt2', 'Bryggeri Delt', 'post@delt2.no', 'https://delt2.no', 'bryggeri-delt--ep2')`).run();
+        const tD2 = mkThread("experiences", "post@delt2.no");
+        const cD2 = create({ vertical: "experiences", targetId: "ep-delt2", threadId: tD2, requesterEmail: "post@delt2.no", kind: "removal" }) as any;
+        routeIgnoresSkip = true;
+        await cq.runCsChangeRequests(deps());
+        routeIgnoresSkip = false;
+        const steps = JSON.parse(R(cD2.request.id).steps);
+        eq([R(cD2.request.id).status, blocklistSvc.isBlocked({ email: "post@delt2.no" }).blocked, steps.some((x: any) => x.step === "blocklist_unplanned_removed")],
+          ["hidden", false, true], "cqr12: rows the route added outside the plan (a shared e-mail) are removed again, and the log says so");
+      }
+      {
+        // B2: a claim left behind by a restart.
+        insAgent.run("ag-b", "Bgård", "post@bgard.no", "https://bgard.no", "key-ag-b");
+        db.prepare(`INSERT INTO agent_knowledge (agent_id, email, phone, about, website) VALUES ('ag-b', NULL, '44 44 44 44', 'Gammel Bgård-tekst', 'https://bgard.no')`).run();
+        const tB = mkThread("rfb", "post@bgard.no");
+        const cB = create({ targetId: "ag-b", threadId: tB, requesterEmail: "post@bgard.no", changes: { about: "Ny Bgård-tekst" } }) as any;
+        const idB = cB.request.id;
+        void cq.runCsChangeRequests({ adminCall: () => new Promise(() => {}), publicFetch }); // never returns: the process «died» mid-write
+        await new Promise((r) => setTimeout(r, 30));
+        eq(R(idB).status, "executing", "cqr13: (setup) the request is left «executing»");
+        const pB = rp.createReplyProposal({ threadId: tB, kind: "rettelse_bekreftet", bodyText: "Vi har oppdatert teksten om gården.", changeRequestIds: [idB], createdBy: "claude" }, { env: { CS_AUTOSEND_ENABLED: "1" } as any }) as any;
+        eq((await rp.processProposal(pB.proposal.id, { env: { CS_AUTOSEND_ENABLED: "1" } as any, liveTransport: true, sendRaw: async () => ({ success: true, messageId: "<b@y>" }) })).outcome, "waiting", "cqr14: a reply linked to an «executing» change waits (it is not sent to Daniel as unverified)");
+        await cq.runCsChangeRequests(deps({ now: new Date(Date.now() + 5 * 60_000) }));
+        eq(R(idB).status, "executing", "cqr14b: a fresh claim is left alone");
+        await cq.runCsChangeRequests(deps({ now: new Date(Date.now() + (cq.STALE_CLAIM_MINUTES + 1) * 60_000) }));
+        const stepsB = JSON.parse(R(idB).steps);
+        eq([R(idB).status, stepsB.some((x: any) => x.step === "reclaimed" && x.ok), R(idB).attempts], ["verified", true, 1], "cqr15: after the stale window the worker picks it up, re-runs the write and verifies it");
+        // interrupted delete
+        insAgent.run("ag-9d", "Dgård", "post@dgard.no", "https://dgard.no", "key-ag-9d");
+        db.prepare(`INSERT INTO agent_knowledge (agent_id, website) VALUES ('ag-9d', 'https://dgard.no')`).run();
+        const tDd = mkThread("rfb", "post@dgard.no");
+        const cDd = create({ targetId: "ag-9d", threadId: tDd, requesterEmail: "post@dgard.no", kind: "removal" }) as any;
+        await cq.runCsChangeRequests(deps());
+        const at = new Date(Date.now() + 25 * 3600_000);
+        void cq.runCsChangeRequests({ publicFetch, now: at, adminCall: (m, p, b) => (m === "DELETE" ? new Promise(() => {}) : adminCall(m, p, b)) });
+        await new Promise((r) => setTimeout(r, 30));
+        eq(R(cDd.request.id).status, "deleting", "cqr16: (setup) the delete is left «deleting»");
+        await cq.runCsChangeRequests(deps({ now: new Date(at.getTime() + (cq.STALE_CLAIM_MINUTES + 1) * 60_000) }));
+        eq([R(cDd.request.id).status, !!db.prepare("SELECT 1 FROM agents WHERE id = 'ag-9d'").get()], ["verified", false], "cqr16b: the interrupted delete is retried and verified");
+        // interrupted cancel → Daniel; capped re-runs → failed
+        const stale = new Date(Date.now() - 2 * 3600_000).toISOString();
+        const cAng = create({ threadId: t1, changes: { about: "Angres" } }) as any;
+        const idAng = cAng.request.id;
+        db.prepare("UPDATE cs_change_requests SET status = 'executing', status_reason = 'angrer', updated_at = ? WHERE id = ?").run(stale, idAng);
+        const cCap = create({ threadId: t1, changes: { about: "Kappet" } }) as any;
+        db.prepare("UPDATE cs_change_requests SET status = 'executing', attempts = 3, updated_at = ? WHERE id = ?").run(stale, cCap.request.id);
+        await cq.runCsChangeRequests(deps());
+        eq([R(idAng).status, /angring avbrutt/.test(R(idAng).status_reason ?? ""), R(cCap.request.id).status, /avbrutt underveis 3 ganger/.test(R(cCap.request.id).status_reason ?? "")],
+          ["failed", true, "failed", true], "cqr17: an interrupted cancel goes to Daniel (failed, half restored); a claim interrupted 3 times stops at failed");
+      }
+      {
+        // NB1: cancel puts an earlier hide back exactly, whatever its reason (the route only knows two modes).
+        exp.prepare(`INSERT INTO experience_providers (id, navn, epost, hjemmeside, slug, catalog_hidden, catalog_hidden_reason) VALUES ('ep-p', 'Pausegården', 'post@pause.no', 'https://pause.no', 'pausegarden--ep', 1, 'owner_pause')`).run();
+        const tP = mkThread("experiences", "post@pause.no");
+        const cP = create({ vertical: "experiences", targetId: "ep-p", threadId: tP, requesterEmail: "post@pause.no", kind: "removal" }) as any;
+        await cq.runCsChangeRequests(deps());
+        const can = await cq.cancelChangeRequest(cP.request.id, "kunden angret", deps());
+        const pr = exp.prepare("SELECT catalog_hidden, catalog_hidden_reason FROM experience_providers WHERE id = 'ep-p'").get() as any;
+        eq([can.ok, pr.catalog_hidden, pr.catalog_hidden_reason], [true, 1, "owner_pause"], "cqr18: cancel restores the owner's own pause exactly (hidden, reason owner_pause)");
       }
 
       // ── routes, watchdog, digest ─────────────────────────────────────

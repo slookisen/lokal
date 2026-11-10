@@ -256,7 +256,24 @@ export function computeNeedsReply(opts: { vertical?: string | null; limit?: numb
           ORDER BY COALESCE(processed_at, created_at) DESC LIMIT 100`,
       )
       .all() as NeedsReplyOutboundFailed[];
-    for (const o of failedOutbox) if (!seen.has(o.outbox_id)) outboundFailed.push(o);
+    // A failed outbox row whose reply proposal is still alive (back-off
+    // before a retry, or back in Daniel's queue) has not finally failed: the
+    // proposal decides. Only a proposal in «failed» (listed above) or no
+    // proposal at all counts.
+    const ownerStatus = (() => {
+      try {
+        const st = db.prepare(`SELECT status FROM cs_reply_proposals WHERE outbox_id = ?`);
+        return (id: string | null) => (id ? ((st.get(id) as { status: string } | undefined)?.status ?? null) : null);
+      } catch {
+        return (_id: string | null) => null; // cs_reply_proposals missing (pre-migration DB)
+      }
+    })();
+    for (const o of failedOutbox) {
+      if (seen.has(o.outbox_id)) continue;
+      const owner = ownerStatus(o.outbox_id);
+      if (owner !== null && owner !== "failed") continue;
+      outboundFailed.push(o);
+    }
   } catch {
     // ignore
   }

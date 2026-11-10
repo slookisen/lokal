@@ -3435,7 +3435,8 @@ function initSchema(db: Database.Database): void {
         delete_after TEXT,
         deleted_at TEXT,
         verified_at TEXT,
-        attempts INTEGER NOT NULL DEFAULT 0
+        attempts INTEGER NOT NULL DEFAULT 0,
+        blocklist_plan TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_cs_change_requests_status ON cs_change_requests(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_cs_change_requests_thread ON cs_change_requests(thread_id);

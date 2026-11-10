@@ -1303,27 +1303,29 @@ router.post("/ingest", (req, res) => {
       return serverThreadForMarker(id) !== null;
     };
     if (canonical) {
-      recordThreadAlias(parsed.data.threadId, canonical.threadId, "cs_gmail_copy");
+      const target = canonical;
+      // Reads first (a DB error here throws before anything is written).
       const rest = parsed.data.messages.filter((m) => !serverFiled(m));
       let newMessages = 0;
-      if (rest.length > 0) {
-        const existed = new Set(
-          (getDb()
-            .prepare(`SELECT id FROM crm_messages WHERE id IN (${rest.map(() => "?").join(",")})`)
-            .all(...rest.map((m) => m.messageId)) as Array<{ id: string }>).map((r) => r.id),
-        );
-        // The contact is the server thread's own — never whatever primaryFromEmail
-        // the caller sent (on a forwarded copy that is often our own address).
-        const contact = getDb().prepare("SELECT email FROM crm_contacts WHERE id = ?").get(canonical.contactId) as { email: string } | undefined;
-        // A NEW inbound message from a person (e.g. the customer answering
-        // Daniel's Gmail reply directly) reopens a done/archived thread, as on
-        // the server path. Never Daniel's own reply, never an already-filed
-        // message, never an auto-reply or bounce. Decided BEFORE the messages
-        // are written: a DB error here answers 500 with nothing filed, so the
-        // retry still sees the messages as new and reopens the thread.
-        let newHumanIn = false;
-        try {
-          newHumanIn = rest.some((m) => {
+      // The alias, the messages and the reopen are one transaction: a DB error
+      // anywhere answers 500 with nothing written, and the retry does it all.
+      try {
+        getDb().transaction(() => {
+          recordThreadAlias(parsed.data.threadId, target.threadId, "cs_gmail_copy");
+          if (rest.length === 0) return;
+          const existed = new Set(
+            (getDb()
+              .prepare(`SELECT id FROM crm_messages WHERE id IN (${rest.map(() => "?").join(",")})`)
+              .all(...rest.map((m) => m.messageId)) as Array<{ id: string }>).map((r) => r.id),
+          );
+          // The contact is the server thread's own — never whatever primaryFromEmail
+          // the caller sent (on a forwarded copy that is often our own address).
+          const contact = getDb().prepare("SELECT email FROM crm_contacts WHERE id = ?").get(target.contactId) as { email: string } | undefined;
+          // A NEW inbound message from a person (e.g. the customer answering
+          // Daniel's Gmail reply directly) reopens a done/archived thread, as on
+          // the server path. Never Daniel's own reply, never an already-filed
+          // message, never an auto-reply or bounce.
+          const newHumanIn = rest.some((m) => {
             if (existed.has(m.messageId) || m.direction !== "in" || m.rawMetadata?.automated === true) return false;
             const headers = readInboundHeaders(m.rawMetadata ?? {});
             const cid = copyIdOf(m);
@@ -1332,28 +1334,27 @@ router.post("/ingest", (req, res) => {
             if (inboundLogAutomatedKind(cid)) return false;
             return classifyForwardCopy({ subject: m.subject ?? parsed.data.subject ?? null, fromEmail: m.fromEmail, headers }).kind === null;
           });
-          const r = crmService.ingestThread(
-            { threadId: canonical.threadId, messages: rest },
+          newMessages = crmService.ingestThread(
+            { threadId: target.threadId, messages: rest },
             contact?.email || parsed.data.primaryFromEmail,
-            canonical.vertical as CrmVertical,
-          );
-          newMessages = r.newMessages;
-        } catch (err: any) {
-          return res.status(500).json({ error: String(err?.message ?? "ingest failed") });
-        }
-        if (newMessages > 0 && newHumanIn) {
-          const st = getDb().prepare("SELECT status FROM crm_threads WHERE id = ?").get(canonical.threadId) as { status: string } | undefined;
-          if (st && (st.status === "done" || st.status === "archived")) {
-            crmService.setThreadStatus(canonical.threadId, "new", "system");
-            crmService.logAction({
-              threadId: canonical.threadId,
-              contactId: canonical.contactId,
-              type: "reopened_by_inbound",
-              actor: "system",
-              payload: { previousStatus: st.status, via: "cs_gmail_ingest" },
-            });
+            target.vertical as CrmVertical,
+          ).newMessages;
+          if (newMessages > 0 && newHumanIn) {
+            const st = getDb().prepare("SELECT status FROM crm_threads WHERE id = ?").get(target.threadId) as { status: string } | undefined;
+            if (st && (st.status === "done" || st.status === "archived")) {
+              crmService.setThreadStatus(target.threadId, "new", "system");
+              crmService.logAction({
+                threadId: target.threadId,
+                contactId: target.contactId,
+                type: "reopened_by_inbound",
+                actor: "system",
+                payload: { previousStatus: st.status, via: "cs_gmail_ingest" },
+              });
+            }
           }
-        }
+        })();
+      } catch (err: any) {
+        return res.status(500).json({ error: String(err?.message ?? "ingest failed") });
       }
       return res.json({
         threadId: canonical.threadId,

@@ -40,6 +40,9 @@
  *              (neutral subject); a bounce copy with no log row is read from
  *              «(fra … <mailer-daemon@…>)»; a failed alias lookup answers 500
  *              with nothing filed and the retry reopens the thread.
+ *   ci105-ci106 second re-review: «(fra …)» with parentheses in the sender
+ *              name is parsed whole; the alias branch is one transaction (a
+ *              DB error during the reopen rolls the messages back).
  *
  * Every assertion reads the DATABASE where a write is claimed.
  *
@@ -410,6 +413,18 @@ export function runCsInboundTests(opts: { log?: boolean } = {}): Promise<TestSum
         eq(afterErr, [500, 0, 0], "ci104: a failed alias lookup on /ingest answers 500 and files nothing (no thread on the Gmail id)");
         const rRetry = await call("POST", "/ingest", { threadId: "gm-thread-1", primaryFromEmail: "kari@testgard.no", vertical: "rfb", messages: [customerAnswer] });
         eq([rRetry.body?.threadId === serverThread1, filed("gm-after-alias-err"), threadStatus()], [true, 1, "new"], "ci104b: the retry files the answer on the server thread and reopens it");
+        const nested = "[Innkommende] Re: Bestilling (fra Mail Delivery System (Gmail) <mailer-daemon@googlemail.com>)";
+        eq([ci.forwardOriginalSender(nested)?.email, ci.stripForwardSubject(nested), ci.normalizeSubject(nested), ci.classifyForwardCopy({ subject: "[Innkommende] Melding (fra Mail Delivery System (Gmail) <mailer-daemon@googlemail.com>)", fromEmail: "kontakt@rettfrabonden.com", headers: {} as any }).kind],
+          ["mailer-daemon@googlemail.com", "Re: Bestilling", "bestilling", "bounce"], "ci105: a sender name with parentheses is parsed whole (address, stripped subject, thread subject, bounce)");
+        crm.crmService.setThreadStatus(serverThread1, "done", "claude");
+        db.exec("ALTER TABLE crm_actions RENAME TO crm_actions_off");
+        const lateAnswer = { messageId: "gm-tx-1", direction: "in", fromEmail: "kari@testgard.no", subject: "Re: Om bestillingen", bodyText: "Lørdag passer bedre", sentAt: new Date().toISOString() };
+        const rTx = await call("POST", "/ingest", { threadId: "gm-thread-1", primaryFromEmail: "kari@testgard.no", vertical: "rfb", messages: [lateAnswer] });
+        const txState = [rTx.status, filed("gm-tx-1"), threadStatus()];
+        db.exec("ALTER TABLE crm_actions_off RENAME TO crm_actions");
+        eq(txState, [500, 0, "done"], "ci106: a DB error during the reopen rolls the whole alias branch back (500, nothing filed, still done)");
+        await call("POST", "/ingest", { threadId: "gm-thread-1", primaryFromEmail: "kari@testgard.no", vertical: "rfb", messages: [lateAnswer] });
+        eq([filed("gm-tx-1"), threadStatus()], [1, "new"], "ci106b: …and the retry files the message and reopens the thread");
       }
 
       // ci77-ci78 (review #8): a copy of an e-mail the server parked as untriaged opens no second item

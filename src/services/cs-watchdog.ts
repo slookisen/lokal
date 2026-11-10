@@ -404,10 +404,11 @@ export async function runCsWatchdog(
       .prepare(
         `SELECT id, vertical, target_name, kind FROM cs_change_requests
           WHERE (status IN ('queued', 'executing') AND julianday(updated_at) < julianday(?) - 30.0 / 1440)
+             OR (status = 'deleting' AND deleted_at IS NULL AND julianday(updated_at) < julianday(?) - 30.0 / 1440)
              OR (status IN ('hidden', 'deleting') AND delete_after IS NOT NULL AND julianday(delete_after) < julianday(?) - 2.0 / 24)
           LIMIT 50`,
       )
-      .all(now.toISOString(), now.toISOString()) as Array<{ id: string; vertical: string; target_name: string | null; kind: string }>) {
+      .all(now.toISOString(), now.toISOString(), now.toISOString()) as Array<{ id: string; vertical: string; target_name: string | null; kind: string }>) {
       items.push({
         key: `change-stuck:${c.id}`,
         once: true,
@@ -646,7 +647,7 @@ export function buildDailyDigest(now: Date = new Date()): { subject: string; tex
     const ch = db
       .prepare(
         `SELECT vertical, kind, status, COUNT(*) AS n FROM cs_change_requests
-          WHERE julianday(updated_at) >= julianday(?) OR status IN ('approval_needed', 'queued', 'hidden')
+          WHERE julianday(updated_at) >= julianday(?) OR status IN ('approval_needed', 'queued', 'executing', 'hidden', 'deleting')
           GROUP BY 1, 2, 3`,
       )
       .all(since) as Array<{ vertical: string; kind: string; status: string; n: number }>;
@@ -655,6 +656,7 @@ export function buildDailyDigest(now: Date = new Date()): { subject: string; tex
       lines.push("ENDRINGER OG SLETTINGER (utført og kontrollert av serveren)");
       const label: Record<string, string> = {
         verified: "utført og bekreftet", hidden: "skjult, slettes etter 24 t", approval_needed: "venter på deg", queued: "i kø",
+        executing: "utføres nå", deleting: "slettes nå",
         executed: "utført, venter på bekreftelse", failed: "feilet", verify_failed: "ikke bekreftet på siden", cancelled: "angret", rejected: "avvist",
       };
       for (const v of [...new Set(ch.map((r) => r.vertical))].sort()) {

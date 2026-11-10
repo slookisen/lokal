@@ -20,6 +20,9 @@
  *              message needs an explicit acknowledgement; never our own
  *              address, never a non-contact automatically; a change request
  *              must belong to the thread; a lost lease is not re-queued.
+ *   crx9-crx12 second re-review: a live proposal's failed outbox row is not
+ *              «ikke kom fram»; a kept forward copy stands for the sender it
+ *              names (never a bounce, never our own address).
  *   cr42-cr52  routes, /outbox/:id/result validation, needs-reply + watchdog +
  *              digest integration.
  *
@@ -227,6 +230,7 @@ export function runCsReplyProposalsTests(opts: { log?: boolean } = {}): Promise<
         const f1 = await rp.processProposal(id, deps());
         eq([f1.outcome, P(id).status, P(id).attempts], ["retry", "pending", 1], "cr27: a transport failure → retry later (back to pending)");
         eq((db.prepare(`SELECT status FROM crm_outbox WHERE id = ?`).get(P(id).outbox_id) as any).status, "failed", "cr28: during the back-off the outbox row is «failed», never «pending» (the routine's outbox reader must not pick it up)");
+        ok(!nr.computeNeedsReply({}).outbound_failed.some((o) => o.outbox_id === P(id).outbox_id), "crx9: during the back-off the failed outbox row is NOT listed as «ikke kom fram» (the proposal is still alive)");
         eq((await rp.processProposal(id, deps())).reason, "retry_not_due", "cr29: not retried before the back-off");
         const later = (min: number) => new Date(Date.now() + min * 60_000);
         await rp.processProposal(id, deps({ now: later(3) }));
@@ -237,6 +241,7 @@ export function runCsReplyProposalsTests(opts: { log?: boolean } = {}): Promise<
           (db.prepare(`SELECT COUNT(*) n FROM crm_messages WHERE thread_id = ? AND direction = 'out'`).get(t.id) as any).n,
           (db.prepare(`SELECT status FROM crm_outbox WHERE id = ?`).get(P(id).outbox_id) as any).status,
         ], [1, 1, "failed"], "cr31: one outbox row and one message across all attempts, both failed at the end");
+        ok(nr.computeNeedsReply({}).outbound_failed.some((o) => o.proposal_id === id), "crx10: once the proposal itself has failed it is listed as «ikke kom fram»");
         sendResult = { success: true, messageId: "<smtp-2@rfb>" };
       }
       {
@@ -339,6 +344,13 @@ export function runCsReplyProposalsTests(opts: { log?: boolean } = {}): Promise<
         crm.crmService.ingestThread({ threadId: t.id, messages: [{ messageId: `${t.id}-copy`, direction: "in", fromEmail: "kontakt@rettfrabonden.com", bodyText: "Videresendt kopi", sentAt: new Date(Date.now() + 1000).toISOString() }] }, t.email, "rfb");
         const c = create(t.id);
         eq(c.ok && c.proposal.to_email, t.email, "crx5: a newer message from our own address is skipped — the customer stays the recipient");
+        // A thread that holds only a kept Gmail copy of a forward (the server did not file the original).
+        crm.crmService.ingestThread({ threadId: "rp-copy-only", subject: "[Innkommende] Egg til helgen? (fra Ola Nord <ola@gard.no>)", category: "innkommende",
+          messages: [{ messageId: "rp-copy-only-1", direction: "in", fromEmail: "kontakt@rettfrabonden.com", subject: "[Innkommende] Egg til helgen? (fra Ola Nord <ola@gard.no>)", bodyText: "Videresendt\nInbound-ID: inb-copyonly-0001\n\nHar dere egg?", sentAt: ago(1) }] }, "ola@gard.no", "rfb");
+        eq(rp.latestHumanInbound("rp-copy-only")?.from_email, "ola@gard.no", "crx11: a kept forward copy stands for the sender it names in «(fra … <addr>)»");
+        crm.crmService.ingestThread({ threadId: "rp-copy-bounce", subject: "[Innkommende] Undeliverable (fra Mail Delivery System (Gmail) <mailer-daemon@googlemail.com>)", category: "innkommende",
+          messages: [{ messageId: "rp-copy-bounce-1", direction: "in", fromEmail: "kontakt@rettfrabonden.com", subject: "[Innkommende] Melding (fra Mail Delivery System (Gmail) <mailer-daemon@googlemail.com>)", bodyText: "Videresendt\nInbound-ID: inb-copybounce-01\n\nAddress not found", sentAt: ago(1) }] }, "ola@gard.no", "rfb");
+        eq(rp.latestHumanInbound("rp-copy-bounce"), null, "crx12: …but never a bounce copy (sender name with parentheses parsed whole), so no reply goes to a mailer-daemon");
         const t2 = mkThread();
         crm.crmService.ingestThread({ threadId: t2.id, messages: [{ messageId: `${t2.id}-cc`, direction: "in", fromEmail: "kollega@annen.no", bodyText: "Jeg svarer for Kari", sentAt: new Date(Date.now() + 1000).toISOString() }] }, t2.email, "rfb");
         const c2 = create(t2.id);
