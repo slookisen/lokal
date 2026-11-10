@@ -26,8 +26,21 @@
 //
 // Periods are UTC calendar dates on created_at (the moment the order /
 // visit request was submitted); `til` is inclusive.
+//
+// Slice S3 adds two READ blocks over lokal.db for Rett fra Bonden:
+//   * henvisninger: contact_clicks (the /ut/ redirect for website / social
+//     links and the click beacon for e-mail / phone), per type and period.
+//     Bot clicks (contact_clicks.is_bot = 1, stamped at write time by
+//     parseUserAgent — the same classifier and the same is_bot = 0 rule
+//     owner-stats / partner-report use) are counted apart; test-producer
+//     clicks likewise (same test rule as the orders). Only agent_id, kind,
+//     is_bot and created_at are read — never session_id, utm or ai_source.
+//   * ai_leveranser: profile_ai_deliveries (vertical 'rfb'), «levert til
+//     AI-assistent», per channel / AI / period. A separate number: never
+//     added to clicks.
 
 import type Database from "better-sqlite3";
+import { aiDeliveriesCountingSince, AI_DELIVERY_CHANNELS, AI_DELIVERY_VENDORS } from "./profile-ai-deliveries-compute";
 
 type Db = Database.Database;
 
@@ -56,10 +69,14 @@ export const MAX_PERIOD_DAYS = 1096;
 export const UNANSWERED_HOURS = 24;
 
 // SQL fragments built only from the literal constants above (no user input).
-const RFB_IS_TEST_SQL =
-  `(COALESCE(a.origin, '') IN (${RFB_TEST_ORIGINS.map((o) => `'${o}'`).join(", ")}) OR o.agent_id = '${RFB_LEGACY_TEST_AGENT_ID}')`;
-const RFB_HANDOFF_IS_TEST_SQL =
-  `(COALESCE(a.origin, '') IN (${RFB_TEST_ORIGINS.map((o) => `'${o}'`).join(", ")}) OR h.agent_id = '${RFB_LEGACY_TEST_AGENT_ID}')`;
+/** RFB test predicate over `agents a` joined on `agentIdCol` (a literal column name, never input). */
+function rfbIsTestSql(agentIdCol: string): string {
+  return `(COALESCE(a.origin, '') IN (${RFB_TEST_ORIGINS.map((o) => `'${o}'`).join(", ")}) OR ${agentIdCol} = '${RFB_LEGACY_TEST_AGENT_ID}')`;
+}
+const RFB_IS_TEST_SQL = rfbIsTestSql("o.agent_id");
+const RFB_HANDOFF_IS_TEST_SQL = rfbIsTestSql("h.agent_id");
+const RFB_CLICK_IS_TEST_SQL = rfbIsTestSql("c.agent_id");
+const RFB_DELIVERY_IS_TEST_SQL = rfbIsTestSql("d.profile_id");
 const GS_IS_TEST_SQL = `(COALESCE(p.is_test_provider, 0) = 1 OR COALESCE(b.is_test, 0) = 1)`;
 const RFB_REVENUE_SQL = `(${RFB_REVENUE_STATUSES.map((s) => `'${s}'`).join(", ")})`;
 
@@ -552,6 +569,243 @@ export function computeGardssalgOverview(db: Db, periode: Periode, oppl: Opplosn
   };
 }
 
+// ─── RFB referrals (contact_clicks) — slice S3 ──────────────────────────────
+//
+// One contact_clicks row = one click on a producer's contact link:
+//   kind 'website' / 'external:<type>'  → GET /ut/:agentId/:kind (counting
+//                                          302 redirect, routes/contact-tracking.ts)
+//   kind 'email' / 'phone'              → POST /api/track/contact-click beacon
+// Every click lands in exactly one of three groups, so main + bot + test =
+// every row in the period:
+//   * bot  : is_bot = 1 (any producer)
+//   * test : is_bot = 0 at the RFB test producer (same rule as the orders)
+//   * main : is_bot = 0 at every other producer
+
+export const HENVISNING_TYPER = ["nettside", "sosiale_medier", "telefon", "e_post", "annet"] as const;
+export type HenvisningType = typeof HENVISNING_TYPER[number];
+
+/** contact_clicks.kind → the admin type (closed mapping; unknown kinds → 'annet'). */
+export function henvisningType(kind: string): HenvisningType {
+  if (kind === "website") return "nettside";
+  if (kind === "phone") return "telefon";
+  if (kind === "email") return "e_post";
+  if (kind.startsWith("external:")) return "sosiale_medier";
+  return "annet";
+}
+
+/** The <type> of an 'external:<type>' kind (the social channel), or null. */
+function externalChannel(kind: string): string | null {
+  if (!kind.startsWith("external:")) return null;
+  const t = kind.slice("external:".length).toLowerCase();
+  return /^[a-z0-9_-]{1,40}$/.test(t) ? t : "annet";
+}
+
+function zeroTypes(): Record<HenvisningType, number> {
+  return zeroCounts(HENVISNING_TYPER) as Record<HenvisningType, number>;
+}
+
+function tableExists(db: Db, name: string): boolean {
+  return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
+}
+
+export interface Unavailable {
+  available: false;
+  forklaring: string;
+  merknader: string[];
+}
+
+export interface RfbReferrals {
+  available: true;
+  forklaring: string;
+  total: number;
+  by_type: Record<HenvisningType, number>;
+  type_forklaring: Record<HenvisningType, string>;
+  /** sosiale_medier split per external link type (facebook, instagram …). */
+  sosiale_medier_per_kanal: Record<string, number>;
+  series: Array<{ bucket: string; total: number; by_type: Record<HenvisningType, number> }>;
+  bot: { forklaring: string; total: number; by_type: Record<HenvisningType, number> };
+  test: {
+    forklaring: string;
+    total: number;
+    by_type: Record<HenvisningType, number>;
+    producers: Array<{ agent_id: string; name: string | null; total: number }>;
+  };
+  merknader: string[];
+}
+
+export function computeRfbReferrals(db: Db, periode: Periode, oppl: Opplosning): RfbReferrals | Unavailable {
+  if (!tableExists(db, "contact_clicks")) {
+    return { available: false, forklaring: "Henvisninger (contact_clicks) kunne ikke leses.", merknader: ["Tabellen contact_clicks finnes ikke i denne databasen."] };
+  }
+  const bucket = bucketSql("c.created_at", oppl);
+  const rows = db.prepare(
+    `SELECT c.agent_id AS agent_id, a.name AS name, c.kind AS kind, ${bucket} AS bucket,
+            CASE WHEN c.is_bot = 1 THEN 1 ELSE 0 END AS is_bot,
+            ${RFB_CLICK_IS_TEST_SQL} AS is_test,
+            COUNT(*) AS n
+       FROM contact_clicks c LEFT JOIN agents a ON a.id = c.agent_id
+      WHERE c.created_at >= ? AND c.created_at < ?
+      GROUP BY c.agent_id, c.kind, bucket, is_bot, is_test`
+  ).all(periode.fra, periode.til_eksklusiv) as Array<{ agent_id: string; name: string | null; kind: string; bucket: string; is_bot: number; is_test: number; n: number }>;
+
+  const byType = zeroTypes();
+  const botByType = zeroTypes();
+  const testByType = zeroTypes();
+  const social: Record<string, number> = {};
+  let total = 0, botTotal = 0, testTotal = 0;
+  const testProducers = new Map<string, { agent_id: string; name: string | null; total: number }>();
+  const series = new Map<string, RfbReferrals["series"][number]>();
+  for (const k of bucketKeys(periode, oppl)) series.set(k, { bucket: k, total: 0, by_type: zeroTypes() });
+
+  for (const r of rows) {
+    const t = henvisningType(r.kind);
+    if (Number(r.is_bot) === 1) {
+      botTotal += r.n;
+      botByType[t] += r.n;
+      continue;
+    }
+    if (Number(r.is_test) === 1) {
+      testTotal += r.n;
+      testByType[t] += r.n;
+      const tp = testProducers.get(r.agent_id) ?? { agent_id: r.agent_id, name: r.name, total: 0 };
+      tp.total += r.n;
+      testProducers.set(r.agent_id, tp);
+      continue;
+    }
+    total += r.n;
+    byType[t] += r.n;
+    const ch = externalChannel(r.kind);
+    if (ch !== null) social[ch] = (social[ch] ?? 0) + r.n;
+    const s = series.get(r.bucket);
+    if (s) { s.total += r.n; s.by_type[t] += r.n; }
+  }
+
+  const socialSorted: Record<string, number> = {};
+  for (const [k, v] of Object.entries(social).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))) socialSorted[k] = v;
+
+  return {
+    available: true,
+    forklaring:
+      "Klikk fra en Rett fra Bonden-produsentside videre til produsenten (tabellen contact_clicks), per type og per tidsbolk " +
+      "(UTC-dato for klikket). Bare klikk fra folk: bot-klikk og klikk hos testprodusenten er holdt utenfor og vist for seg.",
+    total,
+    by_type: byType,
+    type_forklaring: {
+      nettside: "Klikk på produsentens nettside-lenke (videresending via /ut/).",
+      sosiale_medier: "Klikk på produsentens lenker til sosiale medier og andre eksterne lenker (videresending via /ut/).",
+      telefon: "Klikk på produsentens telefonnummer (tel:-lenke, registrert med klikk-beacon).",
+      e_post: "Klikk på produsentens e-postadresse (mailto:-lenke, registrert med klikk-beacon).",
+      annet: "Klikk med en type som ikke passer i de andre gruppene.",
+    },
+    sosiale_medier_per_kanal: socialSorted,
+    series: [...series.values()],
+    bot: {
+      forklaring:
+        "Klikk der nettleseren identifiserte seg som en bot (contact_clicks.is_bot = 1, satt ved klikket med den samme " +
+        "klienttolkningen som sidevisningene bruker). Ikke med i tallene over.",
+      total: botTotal,
+      by_type: botByType,
+    },
+    test: {
+      forklaring:
+        "Klikk fra folk hos testprodusenten (agents.origin test_fixture/test_claim_fixture eller «Test Gard Brreg»). Ikke med i tallene over.",
+      total: testTotal,
+      by_type: testByType,
+      producers: [...testProducers.values()],
+    },
+    merknader: [
+      "Telefon- og e-postklikk registreres bare når siden kjører JavaScript; selve oppringingen eller e-posten ser vi ikke.",
+      "Et klikk betyr at noen åpnet lenken, ikke at de tok kontakt eller handlet.",
+    ],
+  };
+}
+
+// ─── RFB AI deliveries (profile_ai_deliveries) — slice S3 ───────────────────
+//
+// «Levert til AI-assistent»: how many times an RFB producer profile was in
+// what we handed an AI assistant (profile-ai-deliveries.ts), from the daily
+// sums in profile_ai_deliveries (vertical_id = 'rfb'). Not a click and never
+// added to the click numbers. Days before aiDeliveriesCountingSince() are
+// not counted (the same rule as the «Med i AI-søk» tile).
+
+export const AI_LEVERANSE_ETIKETT = "levert til AI-assistent";
+
+export interface RfbAiDeliveries {
+  available: true;
+  etikett: string;
+  forklaring: string;
+  counting_since: string;
+  total: number;
+  by_channel: Record<string, number>;
+  by_vendor: Record<string, number>;
+  series: Array<{ bucket: string; total: number }>;
+  test: { forklaring: string; total: number; by_channel: Record<string, number> };
+  merknader: string[];
+}
+
+export function computeRfbAiDeliveries(db: Db, periode: Periode, oppl: Opplosning): RfbAiDeliveries | Unavailable {
+  if (!tableExists(db, "profile_ai_deliveries")) {
+    return { available: false, forklaring: "AI-leveranser (profile_ai_deliveries) kunne ikke leses.", merknader: ["Tabellen profile_ai_deliveries finnes ikke i denne databasen."] };
+  }
+  const since = aiDeliveriesCountingSince();
+  const from = periode.fra > since ? periode.fra : since;
+  const bucket = bucketSql("d.day", oppl);
+  const rows = db.prepare(
+    `SELECT d.channel AS channel, d.ai_vendor AS ai_vendor, ${bucket} AS bucket,
+            ${RFB_DELIVERY_IS_TEST_SQL} AS is_test,
+            SUM(d.count) AS n
+       FROM profile_ai_deliveries d LEFT JOIN agents a ON a.id = d.profile_id
+      WHERE d.vertical_id = ? AND d.day >= ? AND d.day <= ?
+      GROUP BY d.channel, d.ai_vendor, bucket, is_test`
+  ).all("rfb", from, periode.til) as Array<{ channel: string; ai_vendor: string; bucket: string; is_test: number; n: number | null }>;
+
+  const byChannel = zeroCounts(AI_DELIVERY_CHANNELS);
+  const byVendor = zeroCounts(AI_DELIVERY_VENDORS);
+  const testByChannel = zeroCounts(AI_DELIVERY_CHANNELS);
+  let total = 0, testTotal = 0;
+  const series = new Map<string, { bucket: string; total: number }>();
+  for (const k of bucketKeys(periode, oppl)) series.set(k, { bucket: k, total: 0 });
+
+  for (const r of rows) {
+    const n = Number(r.n ?? 0);
+    const channel = (AI_DELIVERY_CHANNELS as readonly string[]).includes(r.channel) ? r.channel : "annet";
+    const vendor = (AI_DELIVERY_VENDORS as readonly string[]).includes(r.ai_vendor) ? r.ai_vendor : "unknown";
+    if (Number(r.is_test) === 1) {
+      testTotal += n;
+      testByChannel[channel] = (testByChannel[channel] ?? 0) + n;
+      continue;
+    }
+    total += n;
+    byChannel[channel] = (byChannel[channel] ?? 0) + n;
+    byVendor[vendor] = (byVendor[vendor] ?? 0) + n;
+    const s = series.get(r.bucket);
+    if (s) s.total += n;
+  }
+
+  return {
+    available: true,
+    etikett: AI_LEVERANSE_ETIKETT,
+    forklaring:
+      "Antall ganger en Rett fra Bonden-produsentprofil var med i det vi leverte til en AI-assistent (ChatGPT, Claude, Perplexity …): " +
+      "en liste- eller profilside assistenten hentet, et MCP-verktøysvar eller et A2A-svar. Per kanal, per AI og per tidsbolk (UTC-dag). " +
+      "Dette er ikke klikk og er aldri lagt sammen med klikktallene. Testprodusenten er holdt utenfor.",
+    counting_since: since,
+    total,
+    by_channel: byChannel,
+    by_vendor: byVendor,
+    series: [...series.values()],
+    test: {
+      forklaring: "Leveranser av testprodusentens profil. Ikke med i tallene over.",
+      total: testTotal,
+      by_channel: testByChannel,
+    },
+    merknader: [
+      `Tellingen startet ${since}; dager før det telles ikke.`,
+      "En leveranse betyr at profilen nådde AI-assistenten, ikke at noen så den.",
+    ],
+  };
+}
+
 // ─── Order list ─────────────────────────────────────────────────────────────
 
 export interface OrderListRow {
@@ -737,12 +991,16 @@ export interface OversiktForCsv {
   oppl: Opplosning;
   rfb?: RfbOverview;
   gardssalg?: GardssalgOverview | GardssalgUnavailable;
+  /** Slice S3: clicks per platform (RFB only so far). */
+  henvisninger?: { rfb?: RfbReferrals | Unavailable };
+  /** Slice S3: «levert til AI-assistent» per platform (RFB only so far). Never added to clicks. */
+  ai_leveranser?: { rfb?: RfbAiDeliveries | Unavailable };
 }
 
 /** The oversikt body as aggregate rows (see CSV_COLUMNS). */
 export function oversiktCsvRows(o: OversiktForCsv): CsvRow[] {
   const rows: CsvRow[] = [];
-  const add = (plattform: string, omfang: "ekte" | "test", kategori: string, noekkel: string | null, navn: string | null, maal: string, verdi: number | null) =>
+  const add = (plattform: string, omfang: "ekte" | "test" | "bot", kategori: string, noekkel: string | null, navn: string | null, maal: string, verdi: number | null) =>
     rows.push({ plattform, omfang, kategori, noekkel, navn, maal, verdi, periode_fra: o.periode.fra, periode_til: o.periode.til, oppl: o.oppl });
 
   if (o.rfb) {
@@ -801,6 +1059,42 @@ export function oversiktCsvRows(o: OversiktForCsv): CsvRow[] {
       for (const [s, n] of Object.entries(g.test.by_status)) add(P, "test", "status", s, null, "antall", n);
       add(P, "test", "personer", null, null, "sum_personer", g.test.party_size_sum);
       for (const p of g.test.providers) add(P, "test", "tilbyder", p.provider_id, p.name, "antall", p.total);
+    }
+  }
+
+  // Slice S3. Clicks use maal 'antall_klikk', AI deliveries 'levert_til_ai',
+  // so the two can never be summed by accident in a spreadsheet.
+  const h = o.henvisninger?.rfb;
+  if (h) {
+    const P = "rfb";
+    if (!h.available) {
+      add(P, "ekte", "henvisninger_tilgjengelig", null, null, "tilgjengelig", 0);
+    } else {
+      add(P, "ekte", "henvisninger_tilgjengelig", null, null, "tilgjengelig", 1);
+      add(P, "ekte", "henvisninger_total", null, null, "antall_klikk", h.total);
+      for (const [t, n] of Object.entries(h.by_type)) add(P, "ekte", "henvisninger_type", t, null, "antall_klikk", n);
+      for (const [k, n] of Object.entries(h.sosiale_medier_per_kanal)) add(P, "ekte", "henvisninger_sosiale_medier", k, null, "antall_klikk", n);
+      for (const s of h.series) add(P, "ekte", "henvisninger_bolk", s.bucket, null, "antall_klikk", s.total);
+      add(P, "bot", "henvisninger_total", null, null, "antall_klikk", h.bot.total);
+      for (const [t, n] of Object.entries(h.bot.by_type)) add(P, "bot", "henvisninger_type", t, null, "antall_klikk", n);
+      add(P, "test", "henvisninger_total", null, null, "antall_klikk", h.test.total);
+      for (const [t, n] of Object.entries(h.test.by_type)) add(P, "test", "henvisninger_type", t, null, "antall_klikk", n);
+      for (const p of h.test.producers) add(P, "test", "henvisninger_produsent", p.agent_id, p.name, "antall_klikk", p.total);
+    }
+  }
+  const ai = o.ai_leveranser?.rfb;
+  if (ai) {
+    const P = "rfb";
+    if (!ai.available) {
+      add(P, "ekte", "ai_leveranser_tilgjengelig", null, null, "tilgjengelig", 0);
+    } else {
+      add(P, "ekte", "ai_leveranser_tilgjengelig", null, null, "tilgjengelig", 1);
+      add(P, "ekte", "ai_leveranser_total", null, null, "levert_til_ai", ai.total);
+      for (const [c, n] of Object.entries(ai.by_channel)) add(P, "ekte", "ai_leveranser_kanal", c, null, "levert_til_ai", n);
+      for (const [v, n] of Object.entries(ai.by_vendor)) add(P, "ekte", "ai_leveranser_ai", v, null, "levert_til_ai", n);
+      for (const s of ai.series) add(P, "ekte", "ai_leveranser_bolk", s.bucket, null, "levert_til_ai", s.total);
+      add(P, "test", "ai_leveranser_total", null, null, "levert_til_ai", ai.test.total);
+      for (const [c, n] of Object.entries(ai.test.by_channel)) add(P, "test", "ai_leveranser_kanal", c, null, "levert_til_ai", n);
     }
   }
   return rows;

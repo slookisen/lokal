@@ -53742,14 +53742,15 @@ runSerial(async () => {
   }
 });
 
-// Admin order statistics, slices S1+S2: GET /admin/api/ordre/{oversikt,liste,eksport.csv},
-// GET /admin/ordre, pilot-status agreement —
+// Admin order statistics, slices S1+S2+S3: GET /admin/api/ordre/{oversikt,liste,eksport.csv},
+// GET /admin/ordre, pilot-status agreement, S3 referrals (contact_clicks, bot
+// and test clicks apart) + «levert til AI-assistent» —
 // read-only RFB order + Opplevagent gårdssalg counts, test data apart, no
 // buyer/guest data. Own in-memory lokal/experiences DBs pinned on the route
 // module, swaps ADMIN_KEY / ENABLE_EXPERIENCES (restored in finally) —
 // runSerial, tail position.
 runSerial(async () => {
-  console.log("\n── admin-order-stats: GET /admin/api/ordre/{oversikt,liste,eksport.csv} + /admin/ordre (S1+S2) ──");
+  console.log("\n── admin-order-stats: GET /admin/api/ordre/{oversikt,liste,eksport.csv} + /admin/ordre (S1+S2+S3) ──");
   try {
     const { runAdminOrderStatsTests } = require("../src/routes/admin-order-stats.test") as
       typeof import("../src/routes/admin-order-stats.test");

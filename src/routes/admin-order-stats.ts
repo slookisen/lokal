@@ -12,6 +12,10 @@
 //     oppl=dag, plattform=alle). Test producer / test provider rows are in a
 //     separate `test` block, never in the main totals.
 //
+//     Slice S3 adds `henvisninger.rfb` (contact clicks per type and period,
+//     bot and test clicks apart) and `ai_leveranser.rfb` («levert til
+//     AI-assistent», never added to clicks) for plattform=rfb|alle.
+//
 //   GET /admin/api/ordre/eksport.csv?plattform=&fra=&til=&oppl=   (slice S2)
 //     The oversikt numbers as a CSV of aggregates only (no order rows).
 //
@@ -36,6 +40,8 @@ import {
   parseListeParams,
   computeRfbOverview,
   computeGardssalgOverview,
+  computeRfbReferrals,
+  computeRfbAiDeliveries,
   gardssalgUnavailable,
   listRfbOrders,
   listGardssalgBookings,
@@ -102,8 +108,9 @@ function now(): Date {
 }
 
 /** The per-platform oversikt blocks (shared by /oversikt and /eksport.csv). */
-function computeBlocks(plattform: Plattform, periode: Periode, oppl: Opplosning): Pick<OversiktForCsv, "rfb" | "gardssalg"> {
-  const out: Pick<OversiktForCsv, "rfb" | "gardssalg"> = {};
+type Blocks = Pick<OversiktForCsv, "rfb" | "gardssalg" | "henvisninger" | "ai_leveranser">;
+function computeBlocks(plattform: Plattform, periode: Periode, oppl: Opplosning): Blocks {
+  const out: Blocks = {};
   if (plattform === "rfb" || plattform === "alle") {
     out.rfb = computeRfbOverview(rfbDb(), periode, oppl, now());
   }
@@ -114,6 +121,12 @@ function computeBlocks(plattform: Plattform, periode: Periode, oppl: Opplosning)
       try { out.gardssalg = computeGardssalgOverview(e.db, periode, oppl); }
       catch (err) { out.gardssalg = gardssalgUnavailable(`Lesing feilet: ${err instanceof Error ? err.message : String(err)}`); }
     }
+  }
+  // Slice S3: RFB clicks (contact_clicks, /ut/) and «levert til
+  // AI-assistent» (profile_ai_deliveries), kept as separate blocks.
+  if (plattform === "rfb" || plattform === "alle") {
+    out.henvisninger = { rfb: computeRfbReferrals(rfbDb(), periode, oppl) };
+    out.ai_leveranser = { rfb: computeRfbAiDeliveries(rfbDb(), periode, oppl) };
   }
   return out;
 }
@@ -134,7 +147,8 @@ router.get("/oversikt", (req: Request, res: Response) => {
       generated_at: now().toISOString(),
       forklaring:
         "Lesetall for bestillinger (Rett fra Bonden) og besøksforespørsler på gårdssalg (Opplevagent). " +
-        "Ingen kjøper- eller gjesteopplysninger. Testdata er talt for seg i hver plattforms test-blokk.",
+        "Ingen kjøper- eller gjesteopplysninger. Testdata er talt for seg i hver plattforms test-blokk. " +
+        "Henvisninger (klikk videre til produsenten) og leveranser til AI-assistenter er egne tall og er ikke lagt sammen.",
       ...computeBlocks(plattform, periode, oppl),
     };
     res.json(body);
