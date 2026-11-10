@@ -1028,7 +1028,7 @@ async function openNeedsReply() {
         <div class="await-row">
           <div class="row-top">
             <div class="subject">${escapeHtml(t.subject || '(uten emne)')}</div>
-            <div class="when" title="${fmtFull(t.last_inbound_at)}">${Math.floor(t.age_hours)} t</div>
+            <div class="when" title="${escapeHtml(fmtFull(t.last_inbound_at))}">${Math.floor(t.age_hours)} t</div>
           </div>
           <div class="from"><span class="name">${escapeHtml(t.contact_name || t.contact_email)}</span> · ${escapeHtml(t.contact_email)}</div>
           <div class="meta">
@@ -1037,8 +1037,8 @@ async function openNeedsReply() {
             <span style="color:var(--text-dim)">Status: ${escapeHtml(t.status)}</span>
           </div>
           <div class="actions">
-            <button class="btn-secondary" data-action="markNoReplyNeeded" data-id="${t.thread_id}" title="Marker at tråden ikke trenger svar (begrunnelse kreves)">Trenger ikke svar</button>
-            <button class="btn-primary" data-action="openThreadFromAwait" data-id="${t.thread_id}" data-contact="${t.contact_id}" data-type="${escapeHtml(t.contact_type || 'unknown')}">Åpne tråd →</button>
+            <button class="btn-secondary" data-action="markNoReplyNeeded" data-id="${escapeHtml(t.thread_id)}" title="Marker at tråden ikke trenger svar (begrunnelse kreves)">Trenger ikke svar</button>
+            <button class="btn-primary" data-action="openThreadFromAwait" data-id="${escapeHtml(t.thread_id)}" data-contact="${escapeHtml(t.contact_id)}" data-type="${escapeHtml(t.contact_type || 'unknown')}">Åpne tråd →</button>
           </div>
         </div>`);
     }
@@ -1047,14 +1047,14 @@ async function openNeedsReply() {
         <div class="await-row">
           <div class="row-top">
             <div class="subject">${escapeHtml(u.subject || '(uten emne)')}</div>
-            <div class="when" title="${fmtFull(u.created_at)}">${Math.floor(u.age_hours)} t</div>
+            <div class="when" title="${escapeHtml(fmtFull(u.created_at))}">${Math.floor(u.age_hours)} t</div>
           </div>
           <div class="from"><span class="name">${escapeHtml(u.from_email)}</span></div>
           <div class="meta"><span class="pill">Ikke fordelt til plattform</span>${u.level === 'p0' ? '<span class="pill p0">&gt;24 t</span>' : ''}</div>
         </div>`);
     }
     if (nr.counts.forward_failed > 0) {
-      rows.unshift(`<div class="await-empty" style="color:var(--danger)">${nr.counts.forward_failed} innkommende e-post kunne ikke videresendes til Gmail (prøves på nytt av CS-vakten).</div>`);
+      rows.unshift(`<div class="await-empty" style="color:var(--danger)">${nr.counts.forward_failed} innkommende e-post kunne ikke videresendes til Gmail (prøves på nytt av CS-vakten, eller ga opp de siste 7 døgn).</div>`);
     }
     list.innerHTML = rows.length ? rows.join('') : '<div class="await-empty">Alt er besvart \u2728</div>';
   } catch (e) {
@@ -1066,7 +1066,7 @@ async function markNoReplyNeeded(threadId) {
   const reason = prompt('Hvorfor trenger tråden ikke svar? (f.eks. «bare takk», «spam»)');
   if (!reason || !reason.trim()) return;
   try {
-    await api('/threads/' + threadId + '/no-reply-needed', { method: 'POST', body: JSON.stringify({ reason: reason.trim(), actor: 'daniel' }) });
+    await api('/threads/' + encodeURIComponent(threadId) + '/no-reply-needed', { method: 'POST', body: JSON.stringify({ reason: reason.trim(), actor: 'daniel' }) });
     toast('Markert: trenger ikke svar');
     await refresh();
     await openNeedsReply();

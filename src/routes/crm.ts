@@ -23,7 +23,7 @@ import { getDb } from "../database/init";
 import { isOutreachPaused } from "./admin-outreach-candidates";
 import { unsubscribeHeaderValues } from "../services/avmeld-service";
 import { getOutreachMaxTouchVernConfig, getMaxTouchStatusForEmail } from "../services/outreach-max-touch-vern";
-import { findInboundMarker, recordThreadAlias, resolveThreadAlias, serverThreadForMarker } from "../services/cs-inbound";
+import { forwardCopyMarker, recordThreadAlias, resolveThreadAlias, serverThreadForMarker } from "../services/cs-inbound";
 import { computeNeedsReply, markNoReplyNeeded } from "../services/crm-needs-reply";
 import { buildDailyDigest } from "../services/cs-watchdog";
 
@@ -1207,14 +1207,19 @@ router.post("/ingest", (req, res) => {
 
   // ─── CS på serveren, S1a: the Gmail copy of a server-registered e-mail ──
   // The server already registered the original (cs-inbound). Its forwarded
-  // Gmail copy carries "Inbound-ID: inb-…". That copy is NOT filed again: the
-  // Gmail thread id becomes an alias of the server thread, and only the other
-  // messages in the Gmail thread (e.g. Daniel's own Gmail reply) are filed
+  // Gmail copy is an inbound message with subject «[Innkommende] …» whose own,
+  // UNQUOTED text carries "Inbound-ID: inb-…" (forwardCopyMarker). That copy is
+  // NOT filed again: when it is the FIRST message of the Gmail thread, the
+  // Gmail thread id becomes an alias of the server thread and the other
+  // messages (Daniel's Gmail reply, the customer's answer to it) are filed
   // there. A Gmail thread id that is already an alias goes straight to its
-  // server thread. Routing (signals/vertical) is skipped in both cases — the
-  // server decided the platform when it registered the original.
+  // server thread. A quoted marker (a reply), a «Fwd:» of the copy, or a copy
+  // that is not the thread's first message never creates an alias. Routing is
+  // skipped only on this path — the server decided the platform when it
+  // registered the original.
   {
     let canonical: { threadId: string; vertical: string; contactId: string } | null = null;
+    let parkedLogId: string | null = null;
     const aliasTarget = resolveThreadAlias(parsed.data.threadId);
     if (aliasTarget !== parsed.data.threadId) {
       const t = getDb().prepare("SELECT id, vertical_id, contact_id FROM crm_threads WHERE id = ?").get(aliasTarget) as
@@ -1222,28 +1227,33 @@ router.post("/ingest", (req, res) => {
         | undefined;
       if (t) canonical = { threadId: t.id, vertical: t.vertical_id, contactId: t.contact_id };
     }
-    const markerOf = (m: { bodyText?: string | null; snippet?: string | null; bodyHtml?: string | null }) =>
-      findInboundMarker(m.bodyText, m.snippet, m.bodyHtml);
     if (!canonical) {
-      for (const m of parsed.data.messages) {
-        const logId = markerOf(m);
-        if (!logId) continue;
+      // The thread's first message: the earliest by sentAt when every message
+      // carries one, otherwise the first in the payload (Gmail's own order).
+      const msgs = parsed.data.messages;
+      const times = msgs.map((m) => (m.sentAt ? Date.parse(m.sentAt) : NaN));
+      const first = times.every((t) => Number.isFinite(t))
+        ? msgs[times.indexOf(Math.min(...times))]
+        : msgs[0];
+      const logId = forwardCopyMarker(first);
+      if (logId) {
         const hit = serverThreadForMarker(logId);
-        if (hit) {
-          canonical = hit;
-          break;
-        }
+        if (hit?.kind === "thread") canonical = { threadId: hit.threadId, vertical: hit.vertical, contactId: hit.contactId };
+        else if (hit?.kind === "untriaged") parkedLogId = logId;
       }
     }
     if (canonical) {
       recordThreadAlias(parsed.data.threadId, canonical.threadId, "cs_gmail_copy");
-      const rest = parsed.data.messages.filter((m) => markerOf(m) === null);
+      const rest = parsed.data.messages.filter((m) => forwardCopyMarker(m) === null);
       let newMessages = 0;
       if (rest.length > 0) {
+        // The contact is the server thread's own — never whatever primaryFromEmail
+        // the caller sent (on a forwarded copy that is often our own address).
+        const contact = getDb().prepare("SELECT email FROM crm_contacts WHERE id = ?").get(canonical.contactId) as { email: string } | undefined;
         try {
           const r = crmService.ingestThread(
             { threadId: canonical.threadId, messages: rest },
-            parsed.data.primaryFromEmail,
+            contact?.email || parsed.data.primaryFromEmail,
             canonical.vertical as CrmVertical,
           );
           newMessages = r.newMessages;
@@ -1256,7 +1266,20 @@ router.post("/ingest", (req, res) => {
         contactId: canonical.contactId,
         newMessages,
         serverRegistered: true,
-        aliasOf: parsed.data.threadId,
+        gmailThreadId: parsed.data.threadId,
+      });
+    }
+    // The server parked the original as untriaged. The copy alone adds nothing
+    // (filing it would open a second item for the same e-mail); if the Gmail
+    // thread holds more than the copy, fall through so nothing is lost.
+    if (parkedLogId && parsed.data.messages.every((m) => forwardCopyMarker(m) !== null)) {
+      return res.json({
+        threadId: null,
+        newMessages: 0,
+        serverRegistered: true,
+        parkedUntriaged: true,
+        untriagedThreadId: `inbound-${parkedLogId}`,
+        gmailThreadId: parsed.data.threadId,
       });
     }
   }

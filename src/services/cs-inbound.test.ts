@@ -18,6 +18,13 @@
  *              leverandor/inbound-pitch excluded, reply to OUR outreach kept,
  *              automated latest inbound excluded, no-reply mark until a new
  *              inbound, untriaged listed, routes.
+ *   ci70-ci81  review fixes: a QUOTED marker (Gmail reply, nested quote, HTML
+ *              blockquote / gmail_quote) or a «Fwd:» never counts as the copy;
+ *              only the Gmail thread's first message can create an alias; a
+ *              real thread id is never aliased; a parked e-mail's copy opens no
+ *              second item; «Re: [Innkommende] X (fra …)» normalises; an
+ *              auto-reply never hides an earlier human message; thread stats
+ *              pick the latest by time across mixed timestamp formats.
  *
  * Every assertion reads the DATABASE where a write is claimed.
  *
@@ -264,6 +271,51 @@ export function runCsInboundTests(opts: { log?: boolean } = {}): Promise<TestSum
         eq([r2.body?.threadId, r2.body?.newMessages], [serverThread, 0], "ci45: re-ingesting the same Gmail thread is idempotent");
         const r3 = await call("POST", "/threads/gm-thread-1/status", { status: "in_progress", actor: "claude" });
         eq([r3.status, (db.prepare("SELECT status FROM crm_threads WHERE id = ?").get(serverThread) as any)?.status], [200, "in_progress"], "ci46: /threads/<gmail-id>/status resolves the alias to the server thread");
+
+        // ci70-ci76 (review B1): only the copy itself counts — never a quoted marker, a Fwd, or a copy that is not first.
+        const quoted = `Hei Kari, takk for meldingen.\n\nPå tirsdag skrev Rett fra Bonden:\n> Videresent fra: kari\n> hei\n> --\n> Inbound-ID: ${row.id}`;
+        const rq = await call("POST", "/ingest", {
+          threadId: "gm-thread-q", primaryFromEmail: "kari@testgard.no", vertical: "rfb",
+          messages: [{ messageId: "gm-q-1", direction: "out", fromEmail: "da.daniel@example.no", toEmails: ["kari@testgard.no"], subject: "Re: [Innkommende] Spørsmål om profilen (fra Kari Hansen <kari@testgard.no>)", bodyText: quoted, sentAt: new Date().toISOString() }],
+        });
+        ok(rq.status === 200 && rq.body?.serverRegistered !== true && (db.prepare("SELECT COUNT(*) n FROM crm_messages WHERE id = 'gm-q-1'").get() as any).n === 1, "ci70: a Gmail reply QUOTING the marker is filed, not dropped, and creates no alias");
+        eq((db.prepare("SELECT COUNT(*) n FROM crm_thread_aliases WHERE alias_id = 'gm-thread-q'").get() as any).n, 0, "ci70b: …no alias for that Gmail thread");
+        const follow = { messageId: "gm-msg-3", direction: "in", fromEmail: "kari@testgard.no", subject: "Re: Spørsmål", bodyText: `Supert!\n\n> Takk!\n> > Inbound-ID: ${row.id}`, sentAt: new Date(Date.now() + 1000).toISOString() };
+        const rf = await call("POST", "/ingest", { threadId: "gm-thread-1", primaryFromEmail: "kari@testgard.no", vertical: "rfb", messages: [gmailCopy, danielReply, follow] });
+        eq([rf.body?.newMessages, (db.prepare("SELECT thread_id FROM crm_messages WHERE id = 'gm-msg-3'").get() as any)?.thread_id], [1, serverThread], "ci71: the customer's follow-up with a nested quoted marker is filed on the server thread");
+        eq(ci.forwardCopyMarker({ direction: "in", subject: "[Innkommende] X", bodyText: null, bodyHtml: `<p>Svar</p><blockquote>Inbound-ID: ${row.id}</blockquote>` }), null, "ci72: a marker inside an HTML blockquote does not count");
+        eq(ci.forwardCopyMarker({ direction: "in", subject: "[Innkommende] X", bodyText: null, bodyHtml: `<p>Svar</p><div class="gmail_quote"><p>Inbound-ID: ${row.id}</p></div>` }), null, "ci72b: …nor inside a gmail_quote container");
+        eq(ci.forwardCopyMarker({ direction: "in", subject: "[Innkommende] X", bodyText: null, bodyHtml: `<pre>hei</pre><p style="color:#999">Inbound-ID: ${row.id}</p>` }), row.id, "ci72c: the copy's own HTML marker line counts");
+        eq(ci.forwardCopyMarker({ direction: "in", subject: "Fwd: [Innkommende] X", bodyText: `hei\n\nInbound-ID: ${row.id}` }), null, "ci73: a «Fwd:» of the copy is not the copy");
+        const rfw = await call("POST", "/ingest", {
+          threadId: "gm-thread-fwd", primaryFromEmail: "produsent@example.no", vertical: "rfb",
+          messages: [
+            { messageId: "gm-fwd-1", direction: "out", fromEmail: "da.daniel@example.no", toEmails: ["produsent@example.no"], subject: "Fwd: [Innkommende] Spørsmål om profilen", bodyText: `Se under\n\nVideresent fra: kari\nhei\n--\nInbound-ID: ${row.id}`, sentAt: new Date().toISOString() },
+            { messageId: "gm-fwd-2", direction: "in", fromEmail: "produsent@example.no", subject: "Re: Fwd: [Innkommende] Spørsmål om profilen", bodyText: "Skal se på det", sentAt: new Date(Date.now() + 1000).toISOString() },
+          ],
+        });
+        ok(rfw.body?.serverRegistered !== true && (db.prepare("SELECT thread_id FROM crm_messages WHERE id = 'gm-fwd-2'").get() as any)?.thread_id !== serverThread, "ci74: a Gmail thread where Daniel forwarded the copy is NOT merged into the customer's thread");
+        const rlate = await call("POST", "/ingest", {
+          threadId: "gm-thread-late", primaryFromEmail: "kari@testgard.no", vertical: "rfb",
+          messages: [
+            { messageId: "gm-late-1", direction: "in", fromEmail: "kari@testgard.no", subject: "Noe annet", bodyText: "Første melding", sentAt: hoursAgo(5) },
+            { ...gmailCopy, messageId: "gm-late-2", sentAt: hoursAgo(1) },
+          ],
+        });
+        ok(rlate.body?.serverRegistered !== true && (db.prepare("SELECT COUNT(*) n FROM crm_thread_aliases WHERE alias_id = 'gm-thread-late'").get() as any).n === 0, "ci75: a copy that is not the Gmail thread's first message creates no alias");
+        eq([ci.recordThreadAlias("compose-bbb", serverThread, "test"), ci.resolveThreadAlias("compose-bbb")], [false, "compose-bbb"], "ci76: an id that is a real thread is never made an alias (no hijack of its routes)");
+      }
+
+      // ci77-ci78 (review #8): a copy of an e-mail the server parked as untriaged opens no second item
+      {
+        const u = logRow("em11");
+        const untriagedBefore = (db.prepare("SELECT COUNT(*) n FROM crm_untriaged").get() as any).n;
+        const uCopy = { messageId: "gm-u-1", direction: "in", fromEmail: "kontakt@rettfrabonden.com", subject: "[Innkommende] Hei (fra x@y.no)", bodyText: `hei\n\n--\nInbound-ID: ${u.id}` };
+        const ru = await call("POST", "/ingest", { threadId: "gm-thread-u", primaryFromEmail: "x@y.no", vertical: "rfb", messages: [uCopy] });
+        eq([ru.status, ru.body?.parkedUntriaged, (db.prepare("SELECT COUNT(*) n FROM crm_untriaged").get() as any).n, (db.prepare("SELECT COUNT(*) n FROM crm_threads WHERE id='gm-thread-u'").get() as any).n],
+          [200, true, untriagedBefore, 0], "ci77: the Gmail copy of a parked e-mail is answered as parked — no new thread, no second untriaged item");
+        const ru2 = await call("POST", "/ingest", { threadId: "gm-thread-u", primaryFromEmail: "x@y.no", vertical: "rfb", messages: [uCopy, { messageId: "gm-u-2", direction: "out", fromEmail: "da.daniel@example.no", toEmails: ["x@y.no"], subject: "Re: Hei", bodyText: "Hei!", sentAt: new Date().toISOString() }] });
+        ok(ru2.status === 200 && (db.prepare("SELECT COUNT(*) n FROM crm_messages WHERE id='gm-u-2'").get() as any).n === 1, "ci78: …but a Daniel reply in that Gmail thread is still filed (nothing lost)");
       }
 
       // ── «trenger svar» ─────────────────────────────────────────────
@@ -320,6 +372,20 @@ export function runCsInboundTests(opts: { log?: boolean } = {}): Promise<TestSum
       eq([p1.status, (db.prepare("SELECT no_reply_by FROM crm_thread_flags WHERE thread_id='nr-p1'").get() as any)?.no_reply_by], [200, "daniel"], "ci66: POST no-reply-needed stores the mark");
       eq((await call("POST", "/threads/nr-p1/no-reply-needed", {})).status, 400, "ci67: POST without reason → 400");
       eq((await call("POST", "/threads/nope/no-reply-needed", { reason: "x" })).status, 404, "ci68: unknown thread → 404");
+
+      // ci79-ci81 (review #5-#7)
+      eq(ci.normalizeSubject("Re: [Innkommende] Hei der (fra Kari <k@x.no>)"), "hei der", "ci79: «Re: [Innkommende] X (fra …)» normalises to X");
+      mkThread("nr-auto-hides", "a12@x.no", "innkommende", [{ dir: "in", h: 30 }, { dir: "in", h: 2, auto: true }]);
+      const ah = nr.computeNeedsReply({ vertical: "rfb" }).threads.find((t) => t.thread_id === "nr-auto-hides");
+      ok(!!ah && ah.level === "p0" && ah.age_hours >= 29, "ci80: a later auto-reply does not hide an earlier unanswered human message (clock from the human one)");
+      crm.crmService.ingestThread(
+        { threadId: "ts-mix", subject: "Tid", category: "innkommende",
+          messages: [
+            { messageId: "ts-mix-1", direction: "in", fromEmail: "a13@x.no", sentAt: "2026-11-09T08:00:00Z" },
+            { messageId: "ts-mix-2", direction: "in", fromEmail: "a13@x.no", sentAt: "2026-11-09 09:30:00" },
+          ] },
+        "a13@x.no", "rfb");
+      eq((db.prepare("SELECT last_inbound_at FROM crm_threads WHERE id = 'ts-mix'").get() as any)?.last_inbound_at, "2026-11-09 09:30:00", "ci81: thread stats pick the latest by time, not by string, across mixed formats");
     } catch (err: any) {
       failed++;
       failures.push("unexpected error: " + String(err?.stack || err));

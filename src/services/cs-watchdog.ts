@@ -73,33 +73,50 @@ export async function retryFailedForwards(deps: { send?: SendFn; now?: Date } = 
   const db = getDb();
   const now = deps.now ?? new Date();
   const send = deps.send ?? defaultSend();
+  const exhausted: ForwardRetryResult["exhausted"] = [];
+  const exhaust = (r: { id: string; subject: string | null; from_email: string | null; received_at: string }, error: string | null) => {
+    db.prepare(
+      `UPDATE inbound_email_log SET forward_status = 'exhausted', forward_error = COALESCE(?, forward_error), updated_at = datetime('now') WHERE id = ?`,
+    ).run(error, r.id);
+    exhausted.push({ id: r.id, subject: r.subject, from_email: r.from_email, received_at: r.received_at, error });
+  };
+  // Rows that reached the limit under an older build: make them terminal too.
+  const stale = db
+    .prepare(
+      `SELECT id, subject, from_email, received_at, forward_error FROM inbound_email_log
+        WHERE forward_status = 'failed' AND (forward_attempts >= ? OR forward_payload IS NULL)`,
+    )
+    .all(FORWARD_MAX_ATTEMPTS) as Array<{ id: string; subject: string | null; from_email: string | null; received_at: string; forward_error: string | null }>;
+  for (const r of stale) exhaust(r, r.forward_error ?? "no forward_payload");
+
+  // Only rows that may still be retried: an exhausted row never takes a slot
+  // from a newer failure.
   const rows = db
     .prepare(
       `SELECT id, forward_attempts, updated_at, forward_payload, subject, from_email, received_at, forward_error
-         FROM inbound_email_log WHERE forward_status = 'failed' ORDER BY received_at ASC LIMIT 100`,
+         FROM inbound_email_log
+        WHERE forward_status = 'failed' AND forward_attempts < ? AND forward_payload IS NOT NULL
+        ORDER BY received_at ASC LIMIT 100`,
     )
-    .all() as Array<{
-      id: string; forward_attempts: number; updated_at: string | null; forward_payload: string | null;
+    .all(FORWARD_MAX_ATTEMPTS) as Array<{
+      id: string; forward_attempts: number; updated_at: string | null; forward_payload: string;
       subject: string | null; from_email: string | null; received_at: string; forward_error: string | null;
     }>;
   let retried = 0;
   let recovered = 0;
-  const exhausted: ForwardRetryResult["exhausted"] = [];
   for (const r of rows) {
-    if (!r.forward_payload || r.forward_attempts >= FORWARD_MAX_ATTEMPTS) {
-      exhausted.push({ id: r.id, subject: r.subject, from_email: r.from_email, received_at: r.received_at, error: r.forward_error });
-      continue;
-    }
     if (!forwardRetryDue(r.forward_attempts, r.updated_at, now)) continue;
     let payload: any;
     try {
       payload = JSON.parse(r.forward_payload);
     } catch {
-      db.prepare("UPDATE inbound_email_log SET forward_attempts = ?, forward_error = 'unparseable forward_payload', updated_at = datetime('now') WHERE id = ?")
-        .run(FORWARD_MAX_ATTEMPTS, r.id);
-      exhausted.push({ id: r.id, subject: r.subject, from_email: r.from_email, received_at: r.received_at, error: "unparseable forward_payload" });
+      db.prepare("UPDATE inbound_email_log SET forward_attempts = ? WHERE id = ?").run(FORWARD_MAX_ATTEMPTS, r.id);
+      exhaust(r, "unparseable forward_payload");
       continue;
     }
+    // Claim the try before the await: a second, overlapping run sees the
+    // fresh updated_at and treats the row as not due.
+    db.prepare("UPDATE inbound_email_log SET updated_at = datetime('now') WHERE id = ?").run(r.id);
     retried++;
     let res: unknown;
     let err: string | null = null;
@@ -119,9 +136,7 @@ export async function retryFailedForwards(deps: { send?: SendFn; now?: Date } = 
       const msg = (err ?? (res && typeof res === "object" ? String((res as any).error ?? "send failed") : "send failed")).slice(0, 500);
       db.prepare("UPDATE inbound_email_log SET forward_attempts = ?, forward_error = ?, updated_at = datetime('now') WHERE id = ?")
         .run(attempts, msg, r.id);
-      if (attempts >= FORWARD_MAX_ATTEMPTS) {
-        exhausted.push({ id: r.id, subject: r.subject, from_email: r.from_email, received_at: r.received_at, error: msg });
-      }
+      if (attempts >= FORWARD_MAX_ATTEMPTS) exhaust(r, msg);
     }
   }
   return { retried, recovered, exhausted };
@@ -131,34 +146,58 @@ export async function retryFailedForwards(deps: { send?: SendFn; now?: Date } = 
 
 export const INBOUND_LOG_RETENTION_DAYS = 90;
 
-/** Delete log rows older than the retention window. Undelivered forwards are kept until resolved. */
+export const EXHAUSTED_PAYLOAD_DAYS = 30;
+
+/**
+ * Delete log rows older than the retention window, and drop the stored mail
+ * body of a forward that was given up on more than EXHAUSTED_PAYLOAD_DAYS ago
+ * (it was alerted; the e-mail itself is in the CRM when server ingest is on).
+ */
 export function purgeInboundLog(now: Date = new Date()): number {
-  const r = getDb()
-    .prepare(
-      `DELETE FROM inbound_email_log
-        WHERE julianday(received_at) < julianday(?) - ?
-          AND forward_status != 'failed'`,
-    )
+  const db = getDb();
+  db.prepare(
+    `UPDATE inbound_email_log SET forward_payload = NULL
+      WHERE forward_status = 'exhausted' AND forward_payload IS NOT NULL AND julianday(received_at) < julianday(?) - ?`,
+  ).run(now.toISOString(), EXHAUSTED_PAYLOAD_DAYS);
+  const r = db
+    .prepare(`DELETE FROM inbound_email_log WHERE julianday(received_at) < julianday(?) - ?`)
     .run(now.toISOString(), INBOUND_LOG_RETENTION_DAYS);
   return r.changes;
 }
 
 // ─── Alert de-duplication ────────────────────────────────────────────
 
-/** True (and recorded) when `key` has not been alerted in the last 24 h. */
-export function claimAlert(key: string, now: Date = new Date()): boolean {
-  const db = getDb();
-  const row = db.prepare("SELECT last_alerted_at FROM cs_alert_log WHERE alert_key = ?").get(key) as
+/**
+ * Is `key` due for an alert? Never alerted → yes. `once` keys are alerted a
+ * single time; others again after 24 h. Read-only: the key is recorded by
+ * recordAlerts() only once the alert e-mail was actually accepted.
+ */
+export function alertDue(key: string, now: Date = new Date(), once = false): boolean {
+  const row = getDb().prepare("SELECT last_alerted_at FROM cs_alert_log WHERE alert_key = ?").get(key) as
     | { last_alerted_at: string }
     | undefined;
-  if (row) {
-    const last = Date.parse(row.last_alerted_at);
-    if (Number.isFinite(last) && now.getTime() - last < 24 * 3600_000) return false;
-    db.prepare("UPDATE cs_alert_log SET last_alerted_at = ?, count = count + 1 WHERE alert_key = ?").run(now.toISOString(), key);
-    return true;
-  }
-  db.prepare("INSERT INTO cs_alert_log (alert_key, first_alerted_at, last_alerted_at, count) VALUES (?, ?, ?, 1)")
-    .run(key, now.toISOString(), now.toISOString());
+  if (!row) return true;
+  if (once) return false;
+  const last = Date.parse(row.last_alerted_at);
+  return !Number.isFinite(last) || now.getTime() - last >= 24 * 3600_000;
+}
+
+export function recordAlerts(keys: string[], now: Date = new Date()): void {
+  const db = getDb();
+  const ts = now.toISOString();
+  const up = db.prepare(
+    `INSERT INTO cs_alert_log (alert_key, first_alerted_at, last_alerted_at, count) VALUES (?, ?, ?, 1)
+     ON CONFLICT(alert_key) DO UPDATE SET last_alerted_at = excluded.last_alerted_at, count = count + 1`,
+  );
+  db.transaction(() => {
+    for (const k of keys) up.run(k, ts, ts);
+  })();
+}
+
+/** Due-check and record in one step (kept for callers that alert without e-mail). */
+export function claimAlert(key: string, now: Date = new Date()): boolean {
+  if (!alertDue(key, now)) return false;
+  recordAlerts([key], now);
   return true;
 }
 
@@ -189,7 +228,23 @@ function runStamp(now: Date): string {
   return now.toISOString().slice(0, 19).replace(/[:]/g, "");
 }
 
-export async function runCsWatchdog(deps: { send?: SendFn; now?: Date; adminEmail?: string | null; trigger?: "cron" | "manual" } = {}): Promise<WatchdogResult> {
+export interface AlertItem {
+  key: string;
+  /** Alerted a single time (true) or again every 24 h while it lasts (false). */
+  once: boolean;
+  line: string;
+}
+
+export async function runCsWatchdog(
+  deps: {
+    send?: SendFn;
+    now?: Date;
+    adminEmail?: string | null;
+    trigger?: "cron" | "manual";
+    /** More alert items from later slices (S2 outbound problems). */
+    extraItems?: (now: Date) => AlertItem[];
+  } = {},
+): Promise<WatchdogResult> {
   const now = deps.now ?? new Date();
   const send = deps.send ?? defaultSend();
   const runId = `run-${runStamp(now)}-cs-watchdog`;
@@ -209,30 +264,54 @@ export async function runCsWatchdog(deps: { send?: SendFn; now?: Date; adminEmai
   }
   const report = computeNeedsReply({});
 
-  // New problems since the last alert for each item.
-  const lines: string[] = [];
+  // Every item that may need an alert. A key is recorded in cs_alert_log only
+  // AFTER the alert e-mail was accepted — a relay outage or a missing admin
+  // address leaves the items due, so the next run tries again.
+  const items: AlertItem[] = [];
   for (const t of report.threads.filter((x) => x.level === "p0")) {
-    if (!claimAlert(`thread:${t.thread_id}`, now)) continue;
-    lines.push(`• [${platformName(t.vertical)}] ${t.subject ?? "(uten emne)"} — fra ${t.contact_email}, ${Math.floor(t.age_hours)} t uten svar (tråd ${t.thread_id})`);
+    items.push({
+      key: `thread:${t.thread_id}`,
+      // A thread already two weeks old is a backlog item: alerted once, then only in the digest.
+      once: t.age_hours > 14 * 24,
+      line: `• [${platformName(t.vertical)}] ${t.subject ?? "(uten emne)"} — fra ${t.contact_email}, ${Math.floor(t.age_hours)} t uten svar (tråd ${t.thread_id})`,
+    });
   }
   for (const u of report.untriaged.filter((x) => x.level === "p0")) {
-    if (!claimAlert(`untriaged:${u.id}`, now)) continue;
-    lines.push(`• [Ikke fordelt] ${u.subject ?? "(uten emne)"} — fra ${u.from_email}, ${Math.floor(u.age_hours)} t (plattform ukjent)`);
+    items.push({
+      key: `untriaged:${u.id}`,
+      once: u.age_hours > 14 * 24,
+      line: `• [Ikke fordelt] ${u.subject ?? "(uten emne)"} — fra ${u.from_email}, ${Math.floor(u.age_hours)} t (plattform ukjent)`,
+    });
   }
-  for (const f of forward.exhausted) {
-    if (!claimAlert(`forward:${f.id}`, now)) continue;
-    lines.push(`• [Videresending feilet ${FORWARD_MAX_ATTEMPTS} ganger] ${f.subject ?? "(uten emne)"} — fra ${f.from_email ?? "?"}, mottatt ${f.received_at}: ${f.error ?? "ukjent feil"}`);
+  const db = getDb();
+  const exhaustedRows = db
+    .prepare(
+      `SELECT l.id, l.subject, l.from_email, l.received_at, l.forward_error FROM inbound_email_log l
+        WHERE l.forward_status = 'exhausted'
+          AND NOT EXISTS (SELECT 1 FROM cs_alert_log a WHERE a.alert_key = 'forward:' || l.id)
+        ORDER BY l.received_at ASC LIMIT 200`,
+    )
+    .all() as Array<{ id: string; subject: string | null; from_email: string | null; received_at: string; forward_error: string | null }>;
+  for (const f of exhaustedRows) {
+    items.push({
+      key: `forward:${f.id}`,
+      once: true,
+      line: `• [Videresending feilet ${FORWARD_MAX_ATTEMPTS} ganger] ${f.subject ?? "(uten emne)"} — fra ${f.from_email ?? "?"}, mottatt ${f.received_at}: ${f.forward_error ?? "ukjent feil"}`,
+    });
   }
-  const regErrors = getDb()
+  const regErrors = db
     .prepare(
       `SELECT id, subject, from_email, crm_error FROM inbound_email_log
         WHERE crm_status = 'error' AND julianday(received_at) >= julianday(?) - 7`,
     )
     .all(now.toISOString()) as Array<{ id: string; subject: string | null; from_email: string | null; crm_error: string | null }>;
   for (const r of regErrors) {
-    if (!claimAlert(`register:${r.id}`, now)) continue;
-    lines.push(`• [Ikke registrert i CRM] ${r.subject ?? "(uten emne)"} — fra ${r.from_email ?? "?"}: ${r.crm_error ?? "ukjent feil"}`);
+    items.push({ key: `register:${r.id}`, once: true, line: `• [Ikke registrert i CRM] ${r.subject ?? "(uten emne)"} — fra ${r.from_email ?? "?"}: ${r.crm_error ?? "ukjent feil"}` });
   }
+  for (const extra of deps.extraItems?.(now) ?? []) items.push(extra);
+
+  const due = items.filter((i) => alertDue(i.key, now, i.once));
+  const lines = due.map((i) => i.line);
 
   let alertSent: boolean | null = null;
   const adminEmail = (deps.adminEmail !== undefined ? deps.adminEmail : process.env.ADMIN_NOTIFICATION_EMAIL || "")?.trim() || "";
@@ -256,7 +335,15 @@ export async function runCsWatchdog(deps: { send?: SendFn; now?: Date; adminEmai
         alertSent = false;
         env.error(`alert send failed: ${String(e?.message ?? e)}`);
       }
-      if (!alertSent) env.error("CS alert e-mail was not accepted by the mail relay", { items: lines.length });
+      if (alertSent) {
+        try {
+          recordAlerts(due.map((i) => i.key), now);
+        } catch (e: any) {
+          env.error(`recordAlerts failed: ${String(e?.message ?? e)}`);
+        }
+      } else {
+        env.error("CS alert e-mail was not accepted by the mail relay", { items: lines.length });
+      }
     }
   }
 
@@ -430,34 +517,106 @@ export async function runCsDailyDigest(deps: { send?: SendFn; now?: Date; adminE
 
 // ─── Tick (called every 10 min from index.ts) ────────────────────────
 
-export async function tickCsWatchdog(state: { lastWatchdogAt: Date | null; lastDigestAt: Date | null }, deps: { now?: Date; send?: SendFn; env?: NodeJS.ProcessEnv } = {}): Promise<{
-  lastWatchdogAt: Date | null; lastDigestAt: Date | null; ranWatchdog: boolean; ranDigest: boolean;
+export interface CsTickState {
+  lastWatchdogAt: Date | null;
+  lastDigestAt: Date | null;
+  /** Last digest attempt that did NOT get through — retried after ≥ 55 min, not every tick. */
+  lastDigestAttemptAt?: Date | null;
+  /** Last log purge (runs daily even with both flags off — the log is always written). */
+  lastPurgeAt?: Date | null;
+}
+
+let tickInFlight = false;
+
+/** For tests: whether a tick is running right now. */
+export function csTickInFlight(): boolean {
+  return tickInFlight;
+}
+
+export async function tickCsWatchdog(
+  state: CsTickState,
+  deps: { now?: Date; send?: SendFn; env?: NodeJS.ProcessEnv; extraItems?: (now: Date) => AlertItem[] } = {},
+): Promise<{
+  lastWatchdogAt: Date | null;
+  lastDigestAt: Date | null;
+  lastDigestAttemptAt: Date | null;
+  lastPurgeAt: Date | null;
+  ranWatchdog: boolean;
+  ranDigest: boolean;
+  ranPurge: boolean;
+  skippedOverlap: boolean;
 }> {
   const now = deps.now ?? new Date();
   const env = deps.env ?? process.env;
-  const db = getDb();
   let { lastWatchdogAt, lastDigestAt } = state;
+  let lastDigestAttemptAt = state.lastDigestAttemptAt ?? null;
+  let lastPurgeAt = state.lastPurgeAt ?? null;
   let ranWatchdog = false;
   let ranDigest = false;
-  if (csWatchdogEnabled(env)) {
-    const persisted = getJobLastCompletedAt(db, CS_WATCHDOG_JOB);
-    const last = [lastWatchdogAt, persisted].filter((d): d is Date => !!d && d.getTime() <= now.getTime()).sort((a, b) => b.getTime() - a.getTime())[0] ?? null;
-    if (watchdogDue(now, last)) {
-      await runCsWatchdog({ now, send: deps.send });
-      markJobCompleted(db, CS_WATCHDOG_JOB, now);
-      lastWatchdogAt = now;
-      ranWatchdog = true;
-    }
+  let ranPurge = false;
+  // A slow relay can make one run outlast the 10-min interval; a second run
+  // over the same rows would forward the same customer e-mail twice.
+  if (tickInFlight) {
+    return { lastWatchdogAt, lastDigestAt, lastDigestAttemptAt, lastPurgeAt, ranWatchdog, ranDigest, ranPurge, skippedOverlap: true };
   }
-  if (csDailyDigestEnabled(env)) {
-    const persisted = getJobLastCompletedAt(db, CS_DIGEST_JOB);
-    const last = [lastDigestAt, persisted].filter((d): d is Date => !!d && d.getTime() <= now.getTime()).sort((a, b) => b.getTime() - a.getTime())[0] ?? null;
-    if (digestDue(now, last)) {
-      await runCsDailyDigest({ now, send: deps.send });
-      markJobCompleted(db, CS_DIGEST_JOB, now);
-      lastDigestAt = now;
-      ranDigest = true;
+  tickInFlight = true;
+  try {
+    const db = getDb();
+    const watchOn = csWatchdogEnabled(env);
+    if (watchOn) {
+      const persisted = getJobLastCompletedAt(db, CS_WATCHDOG_JOB);
+      const last = [lastWatchdogAt, persisted].filter((d): d is Date => !!d && d.getTime() <= now.getTime()).sort((a, b) => b.getTime() - a.getTime())[0] ?? null;
+      if (watchdogDue(now, last)) {
+        lastWatchdogAt = now;
+        ranWatchdog = true;
+        try {
+          await runCsWatchdog({ now, send: deps.send, extraItems: deps.extraItems });
+          markJobCompleted(db, CS_WATCHDOG_JOB, now);
+        } catch (e: any) {
+          // Not completed: retried at the next hourly slot. Recorded so the failure is visible.
+          console.error("[cs-watchdog] run failed:", e);
+          try {
+            const b = new EnvelopeBuilder({ run_id: `run-${runStamp(now)}-cs-watchdog`, vertical: "rfb", agent: "cs-watchdog", trigger_source: "cron" });
+            b.error(`watchdog run threw: ${String(e?.message ?? e)}`);
+            recordRun(b.finish("failed"));
+          } catch {
+            // the ledger itself is down — the console line above is all that is left
+          }
+        }
+      }
+    } else if (!lastPurgeAt || now.getTime() - lastPurgeAt.getTime() >= 24 * 3600_000) {
+      // The watchdog purges on every run; with it off, purge once a day here.
+      try {
+        purgeInboundLog(now);
+        ranPurge = true;
+      } catch (e) {
+        console.error("[cs-watchdog] purge failed:", e);
+      }
+      lastPurgeAt = now;
     }
+    if (csDailyDigestEnabled(env)) {
+      const persisted = getJobLastCompletedAt(db, CS_DIGEST_JOB);
+      const last = [lastDigestAt, persisted].filter((d): d is Date => !!d && d.getTime() <= now.getTime()).sort((a, b) => b.getTime() - a.getTime())[0] ?? null;
+      const backoffOk = !lastDigestAttemptAt || now.getTime() - lastDigestAttemptAt.getTime() >= 55 * 60_000;
+      if (digestDue(now, last) && backoffOk) {
+        ranDigest = true;
+        try {
+          const r = await runCsDailyDigest({ now, send: deps.send });
+          if (r.sent) {
+            markJobCompleted(db, CS_DIGEST_JOB, now);
+            lastDigestAt = now;
+            lastDigestAttemptAt = null;
+          } else {
+            lastDigestAttemptAt = now;
+          }
+        } catch (e) {
+          console.error("[cs-daily-digest] run failed:", e);
+          lastDigestAttemptAt = now;
+        }
+      }
+    }
+  } finally {
+    tickInFlight = false;
   }
-  return { lastWatchdogAt, lastDigestAt, ranWatchdog, ranDigest };
+  return { lastWatchdogAt, lastDigestAt, lastDigestAttemptAt, lastPurgeAt, ranWatchdog, ranDigest, ranPurge, skippedOverlap: false };
 }

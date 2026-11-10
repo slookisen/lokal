@@ -55,7 +55,7 @@ export function inboundMarkerLine(logId: string): string {
   return `${INBOUND_MARKER_LABEL}: ${logId}`;
 }
 
-/** The inbound log id carried by a forwarded copy, or null. */
+/** The inbound log id anywhere in the texts (quoted or not), or null. Diagnostics only — see forwardCopyMarker. */
 export function findInboundMarker(...texts: Array<string | null | undefined>): string | null {
   for (const t of texts) {
     if (typeof t !== "string" || !t) continue;
@@ -63,6 +63,58 @@ export function findInboundMarker(...texts: Array<string | null | undefined>): s
     if (m) return m[1];
   }
   return null;
+}
+
+// The marker as the forward writes it: alone on its own, UNQUOTED line. A
+// Gmail reply quotes the forward («> Inbound-ID: …» in text, a blockquote /
+// gmail_quote in HTML) — that is a different message which must still be
+// filed, so a quoted marker never counts.
+const MARKER_LINE_RE = /^[ \t]*Inbound-ID:[ \t]*(inb-[A-Za-z0-9-]{8,64})[ \t]*$/m;
+
+function htmlWithoutQuotes(html: string): string {
+  let s = html;
+  // Gmail puts the quoted history in a gmail_quote container that runs to the end.
+  s = s.replace(/<div[^>]*class="[^"]*gmail_quote[\s\S]*$/i, " ");
+  for (let i = 0; i < 5 && /<blockquote/i.test(s); i++) s = s.replace(/<blockquote[^>]*>(?:(?!<blockquote)[\s\S])*?<\/blockquote>/gi, " ");
+  s = s.replace(/<blockquote[\s\S]*$/i, " ");
+  s = s
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|li|tr|h[1-6]|pre)>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&");
+  return s;
+}
+
+/** The log id when the marker stands on an unquoted line of the text (or of the HTML with its quotes removed). */
+export function findUnquotedInboundMarker(bodyText: string | null | undefined, bodyHtml?: string | null): string | null {
+  if (typeof bodyText === "string" && bodyText) {
+    const m = MARKER_LINE_RE.exec(bodyText);
+    if (m) return m[1];
+  }
+  if (typeof bodyHtml === "string" && bodyHtml) {
+    const m = MARKER_LINE_RE.exec(htmlWithoutQuotes(bodyHtml));
+    if (m) return m[1];
+  }
+  return null;
+}
+
+const FORWARD_SUBJECT_RE = /^\s*\[Innkommende\]/i;
+
+/**
+ * The log id if `m` IS the server's forwarded copy: an inbound message whose
+ * subject starts with «[Innkommende]» (a «Fwd:»/«Re:» of it does not) and
+ * whose own, unquoted text carries the marker. Anything else returns null.
+ */
+export function forwardCopyMarker(m: {
+  direction?: string | null;
+  subject?: string | null;
+  bodyText?: string | null;
+  bodyHtml?: string | null;
+}): string | null {
+  if (m.direction !== "in") return null;
+  if (!FORWARD_SUBJECT_RE.test(m.subject ?? "")) return null;
+  return findUnquotedInboundMarker(m.bodyText, m.bodyHtml);
 }
 
 // ─── Platform from recipient domain ──────────────────────────────────
@@ -244,9 +296,12 @@ export function classifyAutomated(input: { subject: string | null | undefined; f
 /** Lowercased subject without Re:/SV:/Fwd: prefixes, [Innkommende] and extra spaces. */
 export function normalizeSubject(s: string | null | undefined): string {
   let t = (s ?? "").replace(/\s+/g, " ").trim();
-  t = t.replace(/^\[innkommende\]\s*/i, "");
-  const PREFIX = /^((re|sv|aw|vs|fw|fwd|vb|videresend|videresendt|wg|tr)\s*(\[\d+\])?\s*:\s*)/i;
+  // Reply/forward prefixes and the forward's own «[Innkommende]» tag, in any
+  // order («Re: [Innkommende] X (fra …)» is Daniel's Gmail reply to a forward).
+  const PREFIX = /^(((re|sv|aw|vs|fw|fwd|vb|videresend|videresendt|wg|tr)\s*(\[\d+\])?\s*:)|\[innkommende\])\s*/i;
   for (let i = 0; i < 10 && PREFIX.test(t); i++) t = t.replace(PREFIX, "").trim();
+  // The forward appends « (fra <sender>)»; a reply to the forward keeps it.
+  t = t.replace(/\s*\(fra [^()]*\)\s*$/i, "").trim();
   return t.toLowerCase();
 }
 
@@ -320,24 +375,45 @@ export function resolveThreadAlias(id: string): string {
   }
 }
 
-export function recordThreadAlias(aliasId: string, threadId: string, source: string): void {
-  if (!aliasId || aliasId === threadId) return;
-  getDb()
+/**
+ * Record `aliasId` → `threadId`. Never for an id that is itself a real thread:
+ * the alias would silently redirect every /threads/<id> route of that thread.
+ */
+export function recordThreadAlias(aliasId: string, threadId: string, source: string): boolean {
+  if (!aliasId || aliasId === threadId) return false;
+  const db = getDb();
+  if (db.prepare("SELECT 1 FROM crm_threads WHERE id = ?").get(aliasId)) return false;
+  const r = db
     .prepare("INSERT OR IGNORE INTO crm_thread_aliases (alias_id, thread_id, source) VALUES (?, ?, ?)")
     .run(aliasId, threadId, source);
+  return r.changes > 0;
 }
 
-/** The server thread a marked (forwarded) message belongs to, or null. */
-export function serverThreadForMarker(logId: string): { threadId: string; vertical: string; contactId: string } | null {
+export type MarkerTarget =
+  | { kind: "thread"; threadId: string; vertical: string; contactId: string }
+  | { kind: "untriaged"; logId: string };
+
+/**
+ * Where the server filed the e-mail a forwarded copy belongs to: its CRM
+ * thread (also after an untriaged item was assigned — the assign replays it
+ * as thread `inbound-<logId>`), or still parked as untriaged. Null when the
+ * server did not file it (flag off, error, unknown id).
+ */
+export function serverThreadForMarker(logId: string): MarkerTarget | null {
   const db = getDb();
-  const row = db.prepare("SELECT crm_thread_id FROM inbound_email_log WHERE id = ?").get(logId) as
-    | { crm_thread_id: string | null }
+  const row = db.prepare("SELECT crm_thread_id, crm_status FROM inbound_email_log WHERE id = ?").get(logId) as
+    | { crm_thread_id: string | null; crm_status: string | null }
     | undefined;
-  if (!row?.crm_thread_id) return null;
-  const t = db.prepare("SELECT id, vertical_id, contact_id FROM crm_threads WHERE id = ?").get(row.crm_thread_id) as
-    | { id: string; vertical_id: string; contact_id: string }
-    | undefined;
-  return t ? { threadId: t.id, vertical: t.vertical_id, contactId: t.contact_id } : null;
+  if (!row) return null;
+  const threadId = row.crm_thread_id ?? (row.crm_status === "untriaged" ? `inbound-${logId}` : null);
+  if (threadId) {
+    const t = db.prepare("SELECT id, vertical_id, contact_id FROM crm_threads WHERE id = ?").get(threadId) as
+      | { id: string; vertical_id: string; contact_id: string }
+      | undefined;
+    if (t) return { kind: "thread", threadId: t.id, vertical: t.vertical_id, contactId: t.contact_id };
+  }
+  if (row.crm_status === "untriaged") return { kind: "untriaged", logId };
+  return null;
 }
 
 // ─── Inbound log ──────────────────────────────────────────────────────

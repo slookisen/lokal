@@ -84,7 +84,7 @@ import adminOutreachCandidatesRoutes from "./routes/admin-outreach-candidates";
 import adminOutreachMaxTouchVernRoutes from "./routes/admin-outreach-max-touch-vern";
 import { rfbMarketingLaneRouter, rfbMarketingDailyRunRouter } from "./routes/admin-rfb-marketing";
 import { tickRfbMarketingDaily } from "./services/rfb-marketing-daily";
-import { csDailyDigestEnabled, csWatchdogEnabled, tickCsWatchdog } from "./services/cs-watchdog";
+import { tickCsWatchdog, type CsTickState } from "./services/cs-watchdog";
 import { rfbEnrichmentNightlyRouter } from "./routes/admin-rfb-enrichment-nightly";
 import {
   isRfbEnrichmentNightlyEnabled,
@@ -2801,12 +2801,14 @@ if (process.env.RFB_MARKETING_PLATFORM_ENABLED === "1") {
 // CS LLM routine — this is what notices when that routine has stopped.
 // Flags CS_WATCHDOG_ENABLED / CS_DAILY_DIGEST_ENABLED (default off). Both
 // stamps persist in boot_job_state, so a restart does not double-run.
-if (csWatchdogEnabled() || csDailyDigestEnabled()) {
-  let csWatchState: { lastWatchdogAt: Date | null; lastDigestAt: Date | null } = { lastWatchdogAt: null, lastDigestAt: null };
+// Registered always: with both flags off the tick only purges inbound_email_log
+// once a day (the log is written for every inbound e-mail regardless of flags).
+{
+  let csWatchState: CsTickState = { lastWatchdogAt: null, lastDigestAt: null, lastDigestAttemptAt: null, lastPurgeAt: null };
   const csWatchdogTick = trackJob("cs-watchdog", async () => {
     try {
       const r = await tickCsWatchdog(csWatchState);
-      csWatchState = { lastWatchdogAt: r.lastWatchdogAt, lastDigestAt: r.lastDigestAt };
+      csWatchState = { lastWatchdogAt: r.lastWatchdogAt, lastDigestAt: r.lastDigestAt, lastDigestAttemptAt: r.lastDigestAttemptAt, lastPurgeAt: r.lastPurgeAt };
       if (r.ranWatchdog || r.ranDigest) console.log(`[cs-watchdog] tick watchdog=${r.ranWatchdog} digest=${r.ranDigest}`);
     } catch (err) {
       console.error("[cs-watchdog] tick failed (non-fatal, retried next tick):", err);

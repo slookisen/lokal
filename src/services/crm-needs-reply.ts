@@ -90,14 +90,33 @@ export function computeNeedsReply(opts: { vertical?: string | null; limit?: numb
     verticalClause = "AND t.vertical_id = ?";
     params.push(opts.vertical);
   }
+  // The clock starts at the latest inbound message from a PERSON. An
+  // auto-reply or bounce never starts it, and never hides an earlier human
+  // message that is still unanswered. Times compared with julianday (rows
+  // mix SQLite and ISO formats).
   const rows = db
     .prepare(
-      `SELECT t.id AS thread_id, t.vertical_id AS vertical, t.subject, t.status, t.category,
+      `WITH h AS (
+         SELECT m.thread_id, MAX(julianday(COALESCE(m.sent_at, m.received_at))) AS jd
+           FROM crm_messages m
+          WHERE m.direction = 'in'
+            -- COALESCE: a message without the flag ('{}' / NULL metadata) is human.
+            AND NOT (COALESCE(json_valid(m.raw_metadata), 0) = 1 AND COALESCE(json_extract(m.raw_metadata, '$.automated'), 0) = 1)
+          GROUP BY m.thread_id
+       ), o AS (
+         SELECT thread_id, MAX(julianday(sent_at)) AS jd
+           FROM crm_messages
+          WHERE direction = 'out' AND sent_at IS NOT NULL AND delivery_status = 'sent'
+          GROUP BY thread_id
+       )
+       SELECT t.id AS thread_id, t.vertical_id AS vertical, t.subject, t.status, t.category,
               c.email AS contact_email, c.name AS contact_name, c.id AS contact_id, c.type AS contact_type,
-              t.last_inbound_at, t.last_outbound_at,
-              (julianday('now') - julianday(t.last_inbound_at)) * 24.0 AS age_hours
+              strftime('%Y-%m-%dT%H:%M:%SZ', h.jd) AS last_inbound_at, t.last_outbound_at,
+              (julianday('now') - h.jd) * 24.0 AS age_hours
          FROM crm_threads t
          JOIN crm_contacts c ON c.id = t.contact_id
+         JOIN h ON h.thread_id = t.id
+         LEFT JOIN o ON o.thread_id = t.id
          LEFT JOIN crm_thread_flags f ON f.thread_id = t.id
         WHERE COALESCE(t.status, 'new') NOT IN ('done', 'archived')
           AND COALESCE(t.category, 'unknown') NOT IN ('system', 'leverandor')
@@ -112,19 +131,12 @@ export function computeNeedsReply(opts: { vertical?: string | null; limit?: numb
                   ORDER BY julianday(COALESCE(m0.sent_at, m0.received_at)) ASC
                   LIMIT 1) = 'in'
           )
-          AND t.last_inbound_at IS NOT NULL
-          AND julianday(t.last_inbound_at) IS NOT NULL
-          AND (t.last_outbound_at IS NULL OR julianday(t.last_inbound_at) > julianday(t.last_outbound_at))
-          AND (f.no_reply_at IS NULL OR julianday(f.no_reply_at) < julianday(t.last_inbound_at))
-          AND NOT EXISTS (
-            SELECT 1 FROM crm_messages m
-             WHERE m.thread_id = t.id AND m.direction = 'in'
-               AND json_valid(m.raw_metadata)
-               AND json_extract(m.raw_metadata, '$.automated') = 1
-               AND julianday(COALESCE(m.sent_at, m.received_at)) >= julianday(t.last_inbound_at)
-          )
+          AND h.jd IS NOT NULL
+          AND (o.jd IS NULL OR h.jd > o.jd)
+          AND (t.last_outbound_at IS NULL OR julianday(t.last_outbound_at) IS NULL OR h.jd > julianday(t.last_outbound_at))
+          AND (f.no_reply_at IS NULL OR julianday(f.no_reply_at) < h.jd)
           ${verticalClause}
-        ORDER BY julianday(t.last_inbound_at) ASC
+        ORDER BY h.jd ASC
         LIMIT ${limit}`,
     )
     .all(...params) as Array<Omit<NeedsReplyThread, "level">>;
@@ -155,7 +167,16 @@ export function computeNeedsReply(opts: { vertical?: string | null; limit?: numb
   let forwardFailed = 0;
   let registerErrors = 0;
   try {
-    forwardFailed = (db.prepare("SELECT COUNT(*) AS n FROM inbound_email_log WHERE forward_status = 'failed'").get() as { n: number }).n;
+    // Still being retried, plus the ones given up on in the last 7 days.
+    forwardFailed = (
+      db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM inbound_email_log
+            WHERE forward_status = 'failed'
+               OR (forward_status = 'exhausted' AND julianday(received_at) >= julianday('now') - 7)`,
+        )
+        .get() as { n: number }
+    ).n;
     registerErrors = (
       db
         .prepare(
