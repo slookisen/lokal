@@ -937,15 +937,21 @@ export function runOpplevelserExperiencesAdmissionPromotionTests(
         // cooperative / brand) and nothing a visitor can do.
         for (const [i, reason] of [
           "Rørosmat er et produsentsamvirke/merkevare for lokalmat fra Røros-regionen.",
-          "Samme organisasjon som på nettsiden.",
+          "Rørosmat er et produsentsamvirke/merkevare for lokalmat fra Røros-regionen",
           "This is a cooperative brand.",
-          "Kulturorganisasjon i naturskjønne omgivelser.",
+          "This is a cooperative brand",
+          "Rørosmat er en merkevare.",
+          "RØROSMAT ER ET SAMVIRKE.",
+          "Røros-merkevaren for lokalmat.",
+          "Brand of local food; same organisation.",
+          "Merkevare for markedsføring av lokalmat.",
           "Rørosmat er en organisasjon og merkevare for lokale produsenter.",
           "Andelslaget er et nettverk av produsenter i regionen.",
-          "Interesseorganisasjon for gårdbrukere i Valdres; samme navn som kilden.",
           "The page describes the same producer organisation and its brands.",
-          "Foreningen jobber for lokal kultur og struktur i bygda.",
           "Paraplyorganisasjon for lokalmatprodusenter, samme organisasjonsnummer.",
+          "Organisasjon for lokale matprodusenter i Trøndelag.",
+          "An organisation of local food producers.",
+          "Samvirke for kultur og struktur i bygda.",
         ].entries()) {
           assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation(reason), true, `adm-o1.${i}: org-only reason "${reason}" -> true`);
           const d = mod.evaluateContentJudgePromotion({ ...base, description: null }, "MATCH", reason);
@@ -973,6 +979,32 @@ export function runOpplevelserExperiencesAdmissionPromotionTests(
           "The brand offers a guided farm visit with cheese tasting.",
           "Samme organisasjon; beskrivelsen av fjellturen stemmer med kilden.",
           "Andelslaget arrangerer julemarked og konserter på låven.",
+          // Review B1 (lokal#1519): these were held by the first version.
+          "Bondens marked-foreningen tilbyr markedsdager på torget.",
+          "Andelslaget driver gårdsbutikk.",
+          "Foreningen driver museet.",
+          "Kunstforeningen har utstilling i galleriet.",
+          "Organisasjonen driver restaurant og kafé.",
+          "Samvirket driver hotell på gården.",
+          "Foreningen tilbyr fiske i elva med fiskekort.",
+          "Turistforeningen driver hytta.",
+          "Bryggeriet er et andelslag med bryggeripub.",
+          "Samvirket har åpent fjøs for barnefamilier.",
+          "Teaterforeningen setter opp friluftsspill hver sommer.",
+          "Seterforeningen holder seterdrift med melking og ysting om sommeren.",
+          "The association runs a museum.",
+          "The cooperative runs a farm shop and café.",
+          "Same organisation; the boat trip matches the source.",
+          "Same association; description matches the hiking trip.",
+          // ...and the same experience types next to a NARROW org term.
+          "Samvirket arrangerer bondens marked.",
+          "The cooperative runs a farmers market.",
+          "Merkevaren har egen pub.",
+          "Andelslaget driver veterantog på den gamle jernbanen.",
+          "Samvirket tilbyr ridning og klatring.",
+          "Andelslaget har badstue og sauna ved fjorden.",
+          "Samvirket driver dyrepark og bygdetun.",
+          "The cooperative offers a day trip by boat.",
         ].entries()) {
           assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation(reason), false, `adm-o5.${i}: org+experience reason "${reason}" -> false`);
           const d = mod.evaluateContentJudgePromotion({ ...base, description: null }, "MATCH", reason);
@@ -989,6 +1021,14 @@ export function runOpplevelserExperiencesAdmissionPromotionTests(
           "Same provider and same farm shop; consistent with the source.",
           "Samme organisasjonsnummer og navn som kilden.",
           "Gården i Brandbu tilbyr samme produkter.",
+          // Review B1 (lokal#1519): bare organisasjon/forening/association is
+          // no longer an organisation term — these were held by the first
+          // version and are now NOT held.
+          "Samme organisasjon som på nettsiden.",
+          "Kulturorganisasjon i naturskjønne omgivelser.",
+          "Interesseorganisasjon for gårdbrukere i Valdres; samme navn som kilden.",
+          "Foreningen jobber for lokal kultur og struktur i bygda.",
+          "Same association as on the website.",
           "",
           null,
         ].entries()) {
@@ -1000,11 +1040,19 @@ export function runOpplevelserExperiencesAdmissionPromotionTests(
 
         // "tur"/"kurs" word-boundary pitfalls: natur/kultur/struktur/konkurs
         // are NOT experience words, real compounds are.
-        assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation("Organisasjonen for natur og kultur."), true, "adm-o11a: natur/kultur do not count as 'tur'");
+        assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation("Samvirket for natur og kultur."), true, "adm-o11a: natur/kultur do not count as 'tur'");
         assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation("Samvirket gikk konkurs."), true, "adm-o11b: konkurs does not count as 'kurs'");
         assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation("Samvirket tilbyr turer."), false, "adm-o11c: 'turer' counts as experience");
-        assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation("Foreningen holder matkurs."), false, "adm-o11d: 'matkurs' counts as experience");
-        assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation("Hildebrand-organisasjonen."), true, "adm-o11e: org term still detected; 'Hildebrand' is not the word 'brand'");
+        assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation("Andelslaget holder matkurs."), false, "adm-o11d: 'matkurs' counts as experience");
+        assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation("Hildebrand-samvirket."), true, "adm-o11e: org term still detected; 'Hildebrand' is not the word 'brand'");
+        assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation("Hildebrand-gården."), false, "adm-o11g: 'Hildebrand' alone is not an organisation term");
+        // Marketing words are NOT the experience word "marked"/"market";
+        // "strip" is not "trip"; "public" is not "pub".
+        assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation("Samvirket driver markedsføring og markedsfører lokalmat."), true, "adm-o11h: markedsføring/markedsfører are not 'marked'");
+        assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation("A cooperative brand for marketing local food."), true, "adm-o11i: 'marketing' is not 'market'");
+        assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation("The cooperative brand on the comic strip."), true, "adm-o11j: 'strip' is not 'trip'");
+        assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation("A public cooperative brand."), true, "adm-o11k: 'public' is not 'pub'");
+        assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation("Samvirket har stor markedsandel."), true, "adm-o11l: 'markedsandel' is not 'marked'");
         assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation("Brandbu-gården, samme navn."), false, "adm-o11f: 'Brandbu' is not the word 'brand'");
 
         // judge_reason_org stacks after the other requirements, in order.

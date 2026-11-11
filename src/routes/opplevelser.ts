@@ -29952,61 +29952,59 @@ export function contentJudgeReasonMentionsNav(reason: string | null | undefined)
  *  Rørosmat is a producer cooperative / brand for local food, the stored
  *  description was empty, and the row was `would_promote`. Promotion guard
  *  `judge_reason_org`. Lowercase and æøå-folded, matched as substrings of
- *  the folded reason (Norwegian compounds: "produsentsamvirke",
- *  "paraplyorganisasjon", "interesseorganisasjon", "samvirket",
- *  "andelslaget", "merkevaren", "turistforeningen" are all covered).
- *  Choices:
- *   - "organisasjon"/"organisation"/"organization": the core terms. NOT
- *     "organisert"/"organised" (an organised tour IS an experience) — those
- *     are not substrings of these. "organisasjonsnummer"/"organisasjonsnr"
- *     is stripped before matching (an identifier mention, not a description
- *     of the provider as an organisation; out of this guard's scope).
- *   - "forening"/"association": member associations (Bondelagets
- *     lokallag-type text, venneforening, turistforening). A real DNT-style
- *     experience reason names the trip ("tur") and is not held.
- *   - Deliberately NOT generic company words (bedrift, selskap, firma,
- *     foretak, company, business): almost every MATCH reason names the
- *     provider that way, so they would hold far beyond the Rørosmat pattern.
- *   - Deliberately NOT bare "nettverk"/"network" (social-media/wifi prose) —
- *     only producer-network phrasings.
- *   - "brand"/"brands" is matched as a whole word (CONTENT_JUDGE_ORG_REASON_WORDS)
- *     so place/person names like "Brandbu"/"Hildebrand" never count. */
+ *  the folded reason (compounds such as "produsentsamvirke", "samvirket",
+ *  "andelslaget", "merkevaren", "Røros-merkevaren" are covered).
+ *  Deliberately NARROW (review B1, lokal#1519): only the producer-cooperative /
+ *  brand pattern. Bare "organisasjon"/"organisation"/"organization",
+ *  "forening" and "association" are NOT terms — associations (turistforening,
+ *  teaterforening, kunstforening, seterforening ...) run many real Norwegian
+ *  experiences, and "samme organisasjon" is how judges name any provider.
+ *  "organisasjon"/"organisation" only count in producer phrasings
+ *  ("produsentorganisasjon", "producer organisation", and the
+ *  CONTENT_JUDGE_ORG_REASON_PATTERNS). Generic company words (bedrift,
+ *  selskap, firma, company, business) are never terms. "brand"/"brands" are
+ *  matched as whole words (CONTENT_JUDGE_ORG_REASON_WORDS) so names like
+ *  "Brandbu"/"Hildebrand" never count. */
 export const CONTENT_JUDGE_ORG_REASON_TERMS: readonly string[] = [
-  "organisasjon",
-  "organisation",
-  "organization",
   "samvirke",
   "andelslag",
   "kooperativ",
   "cooperative",
   "co-operative",
   "merkevare",
-  "forening",
-  "association",
   "produsentnettverk",
   "nettverk av produsenter",
   "nettverk for produsenter",
   "producer network",
   "network of producers",
+  "produsentorganisasjon",
+  "producer organisation",
+  "producer organization",
+];
+/** Producer-organisation phrasings, tested against the folded reason. */
+export const CONTENT_JUDGE_ORG_REASON_PATTERNS: readonly RegExp[] = [
+  /organisasjon(?:en)? for (?:lokale |lokal)?(?:mat)?produsenter/,
+  /organi[sz]ations? (?:of|for) (?:local )?(?:food )?producers/,
 ];
 /** Organisation terms matched only as whole words (too short/ambiguous as
  *  substrings). */
 export const CONTENT_JUDGE_ORG_REASON_WORDS: readonly string[] = ["brand", "brands"];
 
 /** Experience terms: if the judge's reason contains ANY of these, it
- *  describes something a visitor can do, so `judge_reason_org` never holds
- *  it even when it also names an organisation ("Samvirket tilbyr guidet
- *  gårdsbesøk med smaking"). Lowercase and æøå-folded, matched as
- *  substrings — only terms ≥4 chars whose substrings are unambiguous here
- *  ("besok" covers "gardsbesok"/"besoke"; "smak" covers "smaking",
- *  "matsmaking", "smaksprove"; "aktivitet" covers "aktiviteter";
- *  "arranger" covers "arrangerer"/"arrangert"; "guide" covers "guidet",
- *  "guiden", "guided", "guiding"; "experience"/"activit"/"tasting"
- *  cover English inflections). Short/ambiguous stems ("tur", "kurs") and
- *  English words like "tour"/"visit"/"event"/"trail" are matched per
- *  word instead (see CONTENT_JUDGE_EXPERIENCE_WORD_PATTERNS). Erring
- *  towards treating a reason as an experience only makes this guard
- *  LESS strict, never loses a real row. */
+ *  describes something a visitor can do or visit, so `judge_reason_org`
+ *  never holds it even when it also names an organisation ("Samvirket tilbyr
+ *  guidet gårdsbesøk med smaking", "Andelslaget driver gårdsbutikk").
+ *  Lowercase and æøå-folded, matched as substrings — only stems whose
+ *  substrings are unambiguous here ("besok" covers "gardsbesok"; "smak"
+ *  covers "smaking"/"smaksprove"; "hotel" covers "hotell"; "hytt" covers
+ *  "hytte"/"hytta"; "fjos" covers "fjoset"; "klatr" covers
+ *  "klatring"/"klatre"; "seter"/"setra" cover "seterdrift"; "kafe"/"cafe"
+ *  cover "kafé"/"café" after accent folding; "fiske" covers "fiskekort").
+ *  Short/ambiguous stems ("tur", "kurs", "marked", "market", "trip", "pub")
+ *  and short English words are matched per word instead (see
+ *  CONTENT_JUDGE_EXPERIENCE_WORD_PATTERNS). Erring towards treating a
+ *  reason as an experience only makes this guard LESS strict, never loses a
+ *  real row (review B1, lokal#1519, broadened the list). */
 export const CONTENT_JUDGE_EXPERIENCE_REASON_TERMS: readonly string[] = [
   "opplevelse",
   "omvisning",
@@ -30029,6 +30027,53 @@ export const CONTENT_JUDGE_EXPERIENCE_REASON_TERMS: readonly string[] = [
   "festival",
   "cruise",
   "matsti",
+  "museum",
+  "museet",
+  "galleri",
+  "gallery",
+  "utstilling",
+  "exhibition",
+  "gardsbutikk",
+  "gardsutsalg",
+  "farm shop",
+  "farmshop",
+  "restaurant",
+  "kafe",
+  "cafe",
+  "hotel",
+  "hytt",
+  "cabin",
+  "farm stay",
+  "fiske",
+  "fishing",
+  "ridning",
+  "riding",
+  "konsert",
+  "concert",
+  "vandring",
+  "klatr",
+  "climbing",
+  "rafting",
+  "sauna",
+  "badstue",
+  "dyrepark",
+  "teater",
+  "theatre",
+  "theater",
+  "friluftsspill",
+  "forestilling",
+  "apen gard",
+  "apent gard",
+  "apne gard",
+  "fjos",
+  "bryggeri",
+  "brewery",
+  "veterantog",
+  "jernbane",
+  "railway",
+  "seter",
+  "setra",
+  "bygdetun",
   "tasting",
   "activit",
   "experience",
@@ -30036,41 +30081,58 @@ export const CONTENT_JUDGE_EXPERIENCE_REASON_TERMS: readonly string[] = [
 ];
 
 /** Per-word experience patterns, tested against each [a-z0-9]+ word of the
- *  folded reason. `tur`/`kurs` match as a word OR the tail of a compound
- *  ("kajakktur", "fjellturen", "sykkelturer", "matkurs", "ostekurset"), with
- *  an exclusion list for words that merely END in those letters: "natur",
- *  "kultur", "struktur", "litteratur", "temperatur", "arkitektur",
- *  "signatur", "karikatur", "agentur", "konkurs", "diskurs". English
- *  "course"/"class" are deliberately absent ("of course", "world-class"). So
- *  "Kulturorganisasjon i naturskjønne omgivelser" has NO experience word. */
+ *  folded reason (unless the word matches CONTENT_JUDGE_EXPERIENCE_WORD_EXCLUDES):
+ *   - `tur`/`kurs` as a word OR the tail of a compound ("kajakktur",
+ *     "fjellturen", "matkurs") — but not natur/kultur/struktur/litteratur/
+ *     temperatur/arkitektur/signatur/karikatur/agentur/konkurs/diskurs.
+ *   - `marked` anywhere in a word ("marked", "markedsdager", "julemarked",
+ *     "markedet") — but NOT marketing words: "markedsføring"/"markedsfører"
+ *     (folded "markedsfor...") and "markedsandel" are excluded.
+ *   - `market(s)` as a word tail ("market", "farmers market") — "marketing"
+ *     never ends in "market", so it does not count.
+ *   - `trip(s)` as a word tail ("trip", "daytrip") — "strip(s)" excluded.
+ *   - `pub` as a word tail ("pub", "bryggeripub", "puben") — never as a
+ *     substring ("public", "republikk").
+ *   - Exact English words: tour, visit, event, trail, hike, zoo (+ inflections).
+ *  English "course"/"class" are deliberately absent ("of course",
+ *  "world-class"). */
 export const CONTENT_JUDGE_EXPERIENCE_WORD_PATTERNS: readonly RegExp[] = [
   /tur(?:en|er|ene|ar|ane)?$/,
   /kurs(?:et|ene|er)?$/,
-  /^(?:tour|tours|touring|toured|visit|visits|visiting|visitor|visitors|event|events|trail|trails)$/,
+  /marked/,
+  /markets?$/,
+  /trips?$/,
+  /pub(?:en|er|s)?$/,
+  /^(?:tour|tours|touring|toured|visit|visits|visiting|visitor|visitors|event|events|trail|trails|hike|hikes|hiking|hiker|hikers|zoo|zoos)$/,
 ];
-const CONTENT_JUDGE_EXPERIENCE_WORD_EXCLUDE =
-  /(?:natur|kultur|struktur|litteratur|temperatur|arkitektur|signatur|karikatur|agentur|konkurs|diskurs)(?:en|er|ene|ar|ane|et)?$/;
+export const CONTENT_JUDGE_EXPERIENCE_WORD_EXCLUDES: readonly RegExp[] = [
+  /(?:natur|kultur|struktur|litteratur|temperatur|arkitektur|signatur|karikatur|agentur|konkurs|diskurs)(?:en|er|ene|ar|ane|et)?$/,
+  /markedsfor/,
+  /markedsandel/,
+  /strips?$/,
+];
 
-/** True iff the judge's reason describes an ORGANISATION (cooperative,
- *  brand, association, ...; CONTENT_JUDGE_ORG_REASON_TERMS/_WORDS) and NO
- *  experience (CONTENT_JUDGE_EXPERIENCE_REASON_TERMS/_WORD_PATTERNS) — a
- *  MATCH with such a reason only says "same provider", not "this is a real
- *  experience" (promotion guard `judge_reason_org`). Null/empty reason ->
- *  false (a missing reason is the `judge` requirement's concern). PURE. */
+/** True iff the judge's reason describes a producer cooperative / brand
+ *  (CONTENT_JUDGE_ORG_REASON_TERMS/_PATTERNS/_WORDS) and NO experience
+ *  (CONTENT_JUDGE_EXPERIENCE_REASON_TERMS/_WORD_PATTERNS) — a MATCH with such
+ *  a reason only says "same provider", not "this is a real experience"
+ *  (promotion guard `judge_reason_org`). Null/empty reason -> false (a
+ *  missing reason is the `judge` requirement's concern). PURE. */
 export function contentJudgeReasonOnlyDescribesOrganisation(reason: string | null | undefined): boolean {
   if (!reason) return false;
-  const folded = stripNorwegianAccentsForJudgeReason(reason.toLowerCase())
-    .replace(/\s+/g, " ")
-    .replace(/organisasjons(?:nummer|nr)/g, " ");
+  const folded = stripNorwegianAccentsForJudgeReason(reason.toLowerCase()).replace(/\s+/g, " ");
   const words = folded.match(/[a-z0-9]+/g) ?? [];
   const mentionsOrg =
     CONTENT_JUDGE_ORG_REASON_TERMS.some((t) => folded.includes(stripNorwegianAccentsForJudgeReason(t))) ||
+    CONTENT_JUDGE_ORG_REASON_PATTERNS.some((p) => p.test(folded)) ||
     words.some((w) => CONTENT_JUDGE_ORG_REASON_WORDS.includes(w));
   if (!mentionsOrg) return false;
   const mentionsExperience =
     CONTENT_JUDGE_EXPERIENCE_REASON_TERMS.some((t) => folded.includes(stripNorwegianAccentsForJudgeReason(t))) ||
     words.some(
-      (w) => !CONTENT_JUDGE_EXPERIENCE_WORD_EXCLUDE.test(w) && CONTENT_JUDGE_EXPERIENCE_WORD_PATTERNS.some((p) => p.test(w)),
+      (w) =>
+        !CONTENT_JUDGE_EXPERIENCE_WORD_EXCLUDES.some((x) => x.test(w)) &&
+        CONTENT_JUDGE_EXPERIENCE_WORD_PATTERNS.some((p) => p.test(w)),
     );
   return !mentionsExperience;
 }
@@ -30087,8 +30149,8 @@ export type ContentJudgePromotionDecision = {
   contentQualityOk: boolean;
   /** `judge_reason_nav`: the judge's reason does not mention nav/menu chrome. */
   judgeReasonNavOk: boolean;
-  /** `judge_reason_org`: the judge's reason does not ONLY describe an
-   *  organisation (cooperative/brand/association) without any experience
+  /** `judge_reason_org`: the judge's reason does not ONLY describe a
+   *  producer cooperative/brand without any experience
    *  (contentJudgeReasonOnlyDescribesOrganisation). */
   judgeReasonOrgOk: boolean;
   missing: string[];
@@ -30111,8 +30173,8 @@ export type ContentJudgePromotionDecision = {
  *    isLikelyNavMenuLeakage) is applied. A null/blank description passes.
  *  - `judge_reason_nav`: the judge's own reason must not mention nav/menu
  *    chrome (contentJudgeReasonMentionsNav).
- *  - `judge_reason_org`: the judge's own reason must not describe ONLY an
- *    organisation (producer cooperative, brand, association, ...) with no
+ *  - `judge_reason_org`: the judge's own reason must not describe ONLY a
+ *    producer cooperative / brand (samvirke, andelslag, merkevare, ...) with no
  *    experience at all (contentJudgeReasonOnlyDescribesOrganisation) — such
  *    a MATCH says only "same provider" (prod row 73f9ed8c, 2026-11-11).
  */
