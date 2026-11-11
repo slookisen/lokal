@@ -23,11 +23,16 @@
 //
 // Signals
 //   brreg       org.nr known (agents.org_nr or an `org_nr:` tag) → look it up
-//               in Enhetsregisteret: found, name match (normalised, tolerant),
+//               in Enhetsregisteret: found, name match (normalised, strict:
+//               a shared non-generic token of ≥4 letters, see
+//               precheckNameMatches), whether the org.nr is self-reported
+//               (an `org_nr:` tag from the public /register body, or a column
+//               value that only mirrors such a tag with no audited write),
 //               NACE (naeringskode1.kode), kommune/kommunenummer, deleted
 //               (slettedato or HTTP 410), konkurs, under avvikling. No org.nr →
 //               name search; a single plausible, live name match counts (only
-//               its org.nr + the match flag are stored).
+//               its org.nr + the match flag are stored; never the search URL,
+//               which carries the profile name — often a person's name).
 //   email       contact e-mail domain: own / free-mail / disposable / invalid;
 //               MX lookup (DNS) for an own domain.
 //   website     the profile URL's host answers 2xx (SSRF-guarded fetch with
@@ -37,10 +42,17 @@
 //   duplicates  other RFB agents (not this one, not merged) with the same
 //               org.nr or the same contact e-mail ("exact"), or the same
 //               normalised name in the same city ("possible"). ≤ 5 ids each.
-//   owner_claim a verified (not revoked) owner claim exists for the profile.
-//               Recorded for the reviewer; not part of rule R1.
+//   domain_tie  the own e-mail domain or the website domain plausibly ties to
+//               the entity: the registrable domain's label (normalised, æøå
+//               folded) contains a non-generic token (≥4 letters) of the Brreg
+//               name or the profile name, or the answering website shows the
+//               Brreg name. Only booleans are stored.
+//   owner_claim the shared customer rule (customer-rule.ts: agents.claimed_at
+//               OR a verified agent_claims row; a revoked claim has status
+//               'revoked', so it never counts). Recorded for the reviewer; not
+//               part of the rule.
 //
-// Rule R1
+// Rule R2 (R1 + the self-reported org.nr / domain-tie hardening)
 //   avvis      disposable e-mail
 //              OR the Brreg entity for the profile's org.nr is deleted/konkurs
 //              OR an exact duplicate (same org.nr or same contact e-mail) of an
@@ -50,7 +62,9 @@
 //              AND (own e-mail domain with MX, OR website answers and shows
 //                 the name)
 //              AND no possible/exact duplicate of any kind
-//              AND no unavailable source.
+//              AND no unavailable source
+//              AND, when the entity came from registrant input (self-reported
+//                 org.nr or a name search), a domain tie (see domain_tie).
 //   spor_forst everything else (any unavailable source, free-mail without
 //              other support, name+place duplicate, under avvikling, …).
 //
@@ -70,6 +84,7 @@ import {
   type HttpAnswer,
 } from "./claim-assessment";
 import { emailDomain, isFreeMailDomain, isProbeableDomain, registrableDomain, websiteHost } from "./claim-domain-rule";
+import { customerRuleSql } from "./customer-rule";
 
 /** Env flag (read at call time). ON unless exactly "false". */
 export const REGISTRATION_PRECHECK_FLAG = "REGISTRATION_PRECHECK_ENABLED";
@@ -78,7 +93,7 @@ export function registrationPrecheckEnabled(env: NodeJS.ProcessEnv = process.env
   return env[REGISTRATION_PRECHECK_FLAG] !== "false";
 }
 
-export const REGISTRATION_PRECHECK_RULE_VERSION = "R1" as const;
+export const REGISTRATION_PRECHECK_RULE_VERSION = "R2" as const;
 export const REGISTRATION_PRECHECK_SOURCE_TIMEOUT_MS = 4000;
 export const REGISTRATION_PRECHECK_TOTAL_TIMEOUT_MS = 12000;
 export const REGISTRATION_PRECHECK_DUPLICATE_CAP = 5;
@@ -97,6 +112,8 @@ export interface BrregSignal {
   status: PrecheckStatus;
   mode: "org_nr" | "name_search" | "none";
   org_nr: string | null;
+  /** The org.nr came from the registrant (an `org_nr:` tag), not an audited write. */
+  org_nr_self_reported: boolean;
   found: boolean;
   name_match: boolean;
   nace: string | null;
@@ -107,6 +124,7 @@ export interface BrregSignal {
   under_avvikling: boolean;
   /** name_search only: how many hits matched the name plausibly. */
   name_hits?: number;
+  /** org_nr mode only (the URL holds just the org.nr); never for a name search. */
   source_url?: string;
   note?: string;
 }
@@ -137,6 +155,18 @@ export interface DuplicateSignal {
   name_place_ids: string[];
 }
 
+export interface DomainTieSignal {
+  /** Own e-mail domain's label carries a name token (null: no own domain). */
+  email_domain: boolean | null;
+  /** Website domain's label carries a name token (null: no website host). */
+  website_domain: boolean | null;
+  /** The answering website shows the Brreg name (null: not checked). */
+  website_shows_brreg_name: boolean | null;
+  tied: boolean;
+  /** The rule needs the tie (self-reported org.nr or a name-search entity). */
+  required: boolean;
+}
+
 export interface RegistrationPrecheck {
   recommendation: PrecheckRecommendation;
   reasons: string[];
@@ -145,6 +175,7 @@ export interface RegistrationPrecheck {
     email: EmailSignal;
     website: WebsiteSignal;
     duplicates: DuplicateSignal;
+    domain_tie: DomainTieSignal;
     owner_claim: { confirmed: boolean };
   };
   unavailable_sources: PrecheckSource[];
@@ -159,6 +190,8 @@ export interface RegistrationPrecheckInput {
   url: string | null;
   city: string | null;
   orgNr: string | null;
+  /** True when orgNr came from the registrant (`org_nr:` tag), not an audited write. */
+  orgNrSelfReported: boolean;
   duplicates: DuplicateSignal;
   ownerClaimConfirmed: boolean;
 }
@@ -193,26 +226,55 @@ function significantTokens(name: string): string[] {
   return normaliseNamePruned(name).split(" ").filter((t) => t.length >= 3 && !GENERIC_NAME_TOKENS.has(t));
 }
 
-/**
- * Tolerant business-name match: equal after normalisation (diacritics folded,
- * company-form suffix dropped), or every significant token of one name is in
- * the other (so "Solbakken Gård" matches "SOLBAKKEN GÅRD AS" and "Solbakken
- * Gård Kari Nordmann", but "Gård" alone never matches anything).
- */
-export function precheckNameMatches(a: string, b: string): boolean {
-  const na = normaliseNamePruned(String(a ?? ""));
-  const nb = normaliseNamePruned(String(b ?? ""));
-  if (!na || !nb) return false;
-  if (na === nb) return true;
-  const ta = significantTokens(na);
-  const tb = significantTokens(nb);
-  if (!ta.length || !tb.length) return false;
-  const setA = new Set(na.split(" "));
-  const setB = new Set(nb.split(" "));
-  return ta.every((t) => setB.has(t)) || tb.every((t) => setA.has(t));
+/** Significant tokens long enough to identify a business (≥4 letters). */
+function strongTokens(name: string): string[] {
+  return significantTokens(name).filter((t) => t.length >= 4);
 }
 
-/** The profile name (normalised) appears in the page text (normalised). */
+/**
+ * Business-name match between the PROFILE name and the BRREG name (order
+ * matters). Both are normalised (diacritics folded, company-form suffix
+ * dropped) and must share at least one non-generic token of ≥4 letters —
+ * equality alone is not enough ("Gård" vs "GÅRD AS" never matches). Then:
+ *   - the same significant tokens ("Solbakken Gård" ~ "SOLBAKKEN GÅRD AS"), or
+ *   - the profile's significant tokens lead the Brreg name (an ENK name adds
+ *     the owner: "Solbakken Gård" ~ "Solbakken Gård Kari Nordmann"), or
+ *   - every significant Brreg token is in the profile name AND the Brreg name
+ *     has ≥2 of them (a lone, often surname-like Brreg token inside a longer
+ *     profile name — "Nordre Hansen Gård" vs "HANSEN" — does not count).
+ */
+export function precheckNameMatches(profileName: string, brregName: string): boolean {
+  const np = normaliseNamePruned(String(profileName ?? ""));
+  const nb = normaliseNamePruned(String(brregName ?? ""));
+  if (!np || !nb) return false;
+  const tp = significantTokens(np);
+  const tb = significantTokens(nb);
+  const strongB = new Set(strongTokens(nb));
+  if (!strongTokens(np).some((t) => strongB.has(t))) return false;
+  const setP = new Set(tp);
+  const setB = new Set(tb);
+  if (setP.size === setB.size && [...setP].every((t) => setB.has(t))) return true;
+  if (tp.length <= tb.length && tp.every((t, i) => tb[i] === t)) return true;
+  return tb.length >= 2 && tb.every((t) => setP.has(t));
+}
+
+/** The registrable domain's first label, normalised (æøå folded, no hyphens). */
+function domainLabel(host: string | null): string | null {
+  if (!host) return null;
+  const reg = registrableDomain(host.toLowerCase());
+  if (!reg) return null;
+  const label = normaliseName(reg.split(".")[0] ?? "").replace(/[^a-z0-9]/g, "");
+  return label || null;
+}
+
+/** A domain label carries a non-generic name token (≥4 letters) of one of the names. */
+export function domainTiesToName(host: string | null, names: string[]): boolean {
+  const label = domainLabel(host);
+  if (!label) return false;
+  return names.some((n) => strongTokens(String(n ?? "")).some((t) => label.includes(t)));
+}
+
+/** The name (normalised) appears in the page text (normalised). */
 export function pageShowsName(html: string, name: string): boolean {
   const target = normaliseNamePruned(name);
   if (target.length < 3) return false;
@@ -255,10 +317,15 @@ export async function assessRegistration(
   const unavailable = new Set<PrecheckSource>();
   const orgNr = normalizeOrgNr(input.orgNr);
 
+  const orgNrSelfReported = !!orgNr && input.orgNrSelfReported === true;
+  // The Brreg name stays in memory only (domain tie); it is never stored.
+  let brregName = "";
+
   // ── Brreg ──
   const brregP = (async (): Promise<BrregSignal> => {
     const base: BrregSignal = {
-      status: "ok", mode: orgNr ? "org_nr" : "name_search", org_nr: orgNr, found: false, name_match: false,
+      status: "ok", mode: orgNr ? "org_nr" : "name_search", org_nr: orgNr, org_nr_self_reported: orgNrSelfReported,
+      found: false, name_match: false,
       nace: null, kommune: null, kommunenummer: null, deleted: false, konkurs: false, under_avvikling: false,
     };
     const fail = (note: string): BrregSignal => { unavailable.add("brreg"); return { ...base, status: "unavailable", note }; };
@@ -274,6 +341,7 @@ export async function assessRegistration(
         let json: unknown;
         try { json = JSON.parse(r.body); } catch { return fail("bad_json"); }
         const e = readBrregEnhet(json);
+        brregName = e.navn;
         return {
           ...base, found: true, name_match: precheckNameMatches(input.name, e.navn), nace: e.nace,
           kommune: e.kommune, kommunenummer: e.kommunenummer, deleted: e.deleted, konkurs: e.konkurs,
@@ -284,8 +352,9 @@ export async function assessRegistration(
       }
     }
     if (!String(input.name ?? "").trim()) return { ...base, status: "skipped", mode: "none", note: "no_name" };
+    // Privacy: the search URL carries the profile name (often a person's
+    // name) — it is used for the request only, never stored.
     const url = BRREG_NAME_SEARCH_URL(input.name.trim());
-    base.source_url = url;
     try {
       const r = await withTimeout(deps.fetchApi(url, timeout), timeout);
       if (r.status < 200 || r.status >= 300) return fail(`http_${r.status}`);
@@ -296,6 +365,7 @@ export async function assessRegistration(
       const live = hits.filter((e) => !e.deleted && !e.konkurs);
       if (hits.length === 1 && live.length === 1) {
         const e = live[0]!;
+        brregName = e.navn;
         return {
           ...base, org_nr: e.orgNr, found: true, name_match: true, nace: e.nace, kommune: e.kommune,
           kommunenummer: e.kommunenummer, under_avvikling: e.underAvvikling, name_hits: 1,
@@ -330,6 +400,7 @@ export async function assessRegistration(
 
   // ── website ──
   const host = input.url ? websiteHost(input.url) : null;
+  let pageBody = "";
   const websiteP = (async (): Promise<WebsiteSignal> => {
     const base: WebsiteSignal = { status: "ok", host, answers: null, name_on_page: null };
     if (!host) return { ...base, status: "skipped", note: "no_website" };
@@ -343,7 +414,8 @@ export async function assessRegistration(
       }
       if (r.status >= 500) { unavailable.add("website"); return { ...base, status: "unavailable", note: `http_${r.status}` }; }
       if (r.status < 200 || r.status >= 300) return { ...base, answers: false, name_on_page: false, note: `http_${r.status}` };
-      return { ...base, answers: true, name_on_page: pageShowsName(String(r.body ?? ""), input.name) };
+      pageBody = String(r.body ?? "");
+      return { ...base, answers: true, name_on_page: pageShowsName(pageBody, input.name) };
     } catch {
       unavailable.add("website");
       return { ...base, status: "unavailable", note: "unavailable" };
@@ -353,6 +425,22 @@ export async function assessRegistration(
   const [brreg, emailSig, website] = await Promise.all([brregP, emailP, websiteP]);
   const dup = input.duplicates;
   const unavailableSources = [...unavailable].sort() as PrecheckSource[];
+
+  // ── domain tie (booleans only; the Brreg name and page text are not stored) ──
+  const tieNames = [brregName, input.name].filter((n) => !!String(n ?? "").trim());
+  const ownMail = emailSig.domain_type === "own";
+  const tieRequired = brreg.found && (brreg.mode === "name_search" || brreg.org_nr_self_reported);
+  const domainTie: DomainTieSignal = {
+    email_domain: ownMail ? domainTiesToName(domain, tieNames) : null,
+    website_domain: host ? domainTiesToName(host, tieNames) : null,
+    website_shows_brreg_name: website.answers === true && brregName
+      ? strongTokens(brregName).length > 0 && pageShowsName(pageBody, brregName) : null,
+    tied: false,
+    required: tieRequired,
+  };
+  pageBody = "";
+  domainTie.tied = (ownMail && emailSig.mx === true && domainTie.email_domain === true)
+    || (website.answers === true && (domainTie.website_domain === true || domainTie.website_shows_brreg_name === true));
 
   // ── reasons (short, Norwegian) ──
   const reasons: string[] = [];
@@ -365,6 +453,7 @@ export async function assessRegistration(
       reasons.push(`Brreg: org.nr ${brreg.org_nr} funnet, navnet ${brreg.name_match ? "stemmer" : "stemmer ikke"}`);
       if (brreg.under_avvikling) reasons.push("Brreg: enheten er under avvikling");
     }
+    if (brreg.org_nr_self_reported) reasons.push("Brreg: org.nr er selvoppgitt");
   } else if (brreg.mode === "name_search") {
     if (brreg.found) {
       reasons.push(`Brreg: ett treff på navnet (org.nr ${brreg.org_nr}); org.nr ikke oppgitt`);
@@ -388,9 +477,12 @@ export async function assessRegistration(
   const exactUnvetted = dup.exact_ids.filter((id) => !dup.exact_vetted_ids.includes(id));
   if (exactUnvetted.length) reasons.push(`Mulig duplikat: samme org.nr eller e-post som ${exactUnvetted.length} ikke-godkjent(e) profil(er)`);
   if (dup.name_place_ids.length) reasons.push(`Mulig duplikat: ${dup.name_place_ids.length} profil(er) med samme navn og sted`);
+  if (tieRequired) {
+    reasons.push(domainTie.tied ? "Domene: knyttet til enheten" : "Domene: domenet er ikke knyttet til enheten");
+  }
   reasons.push(input.ownerClaimConfirmed ? "Eierkrav: bekreftet" : "Eierkrav: ingen bekreftet");
 
-  // ── rule R1 ──
+  // ── rule R2 ──
   const brregDead = brreg.mode === "org_nr" && brreg.found && (brreg.deleted || brreg.konkurs);
   const avvis = emailSig.domain_type === "disposable" || brregDead || dup.exact_vetted_ids.length > 0;
   const brregMatch = brreg.status === "ok" && brreg.found && brreg.name_match && !brreg.deleted && !brreg.konkurs
@@ -399,13 +491,17 @@ export async function assessRegistration(
     || (website.answers === true && website.name_on_page === true);
   const anyDuplicate = dup.exact_ids.length > 0 || dup.name_place_ids.length > 0;
   const recommendation: PrecheckRecommendation = avvis ? "avvis"
-    : brregMatch && contactSupport && !anyDuplicate && unavailableSources.length === 0 ? "godkjenn"
+    : brregMatch && contactSupport && !anyDuplicate && unavailableSources.length === 0
+      && (!tieRequired || domainTie.tied) ? "godkjenn"
     : "spor_forst";
 
   return {
     recommendation,
     reasons,
-    signals: { brreg, email: emailSig, website, duplicates: dup, owner_claim: { confirmed: input.ownerClaimConfirmed } },
+    signals: {
+      brreg, email: emailSig, website, duplicates: dup, domain_tie: domainTie,
+      owner_claim: { confirmed: input.ownerClaimConfirmed },
+    },
     unavailable_sources: unavailableSources,
     rule_version: REGISTRATION_PRECHECK_RULE_VERSION,
     assessed_at: deps.now().toISOString(),
@@ -426,19 +522,45 @@ interface AgentPrecheckRow {
   tags: string | null;
   origin: string | null;
   is_vetted: number | null;
+  claimed_at: string | null;
 }
 
 function readAgentRow(db: Db, agentId: string): AgentPrecheckRow | undefined {
   return db.prepare(
-    `SELECT id, name, contact_email, url, city, org_nr, tags, origin, is_vetted FROM agents WHERE id = ?`
+    `SELECT id, name, contact_email, url, city, org_nr, tags, origin, is_vetted, claimed_at FROM agents WHERE id = ?`
   ).get(agentId) as AgentPrecheckRow | undefined;
 }
 
 function orgNrOfRow(row: { org_nr: string | null; tags: string | null }): string | null {
   const col = normalizeOrgNr(row.org_nr);
   if (col) return col;
+  return orgNrTagOfRow(row);
+}
+
+/** The `org_nr:` tag — registrant input from the public /register body. */
+function orgNrTagOfRow(row: { tags: string | null }): string | null {
   const m = String(row.tags ?? "").match(/org_nr:(\d{9})(?!\d)/);
   return m ? m[1]! : null;
+}
+
+/**
+ * Self-reported = the org.nr is the registrant's own `org_nr:` tag: either
+ * there is no column value, or the column only mirrors the tag (the one-time
+ * tag→column backfill) with no audited write (agents_org_nr_audit, written by
+ * the admin/Brreg org.nr path) of that value.
+ */
+function orgNrIsSelfReported(db: Db, agentId: string, row: { org_nr: string | null; tags: string | null }, orgNr: string | null): boolean {
+  if (!orgNr) return false;
+  const tag = orgNrTagOfRow(row);
+  if (tag !== orgNr) return false;
+  if (!normalizeOrgNr(row.org_nr)) return true;
+  try {
+    return !db.prepare(
+      `SELECT 1 FROM agents_org_nr_audit WHERE agent_id = ? AND field_name = 'org_nr' AND new_value = ? LIMIT 1`
+    ).get(agentId, orgNr);
+  } catch {
+    return true; // no audit table: nothing proves another source
+  }
 }
 
 const normCity = (c: unknown): string => (typeof c === "string" ? normaliseName(c) : "");
@@ -448,6 +570,7 @@ export function gatherRegistrationPrecheckInput(db: Db, agentId: string): Regist
   const row = readAgentRow(db, agentId);
   if (!row) return null;
   const orgNr = orgNrOfRow(row);
+  const orgNrSelfReported = orgNrIsSelfReported(db, agentId, row, orgNr);
   const email = String(row.contact_email ?? "").trim().toLowerCase();
   const cap = REGISTRATION_PRECHECK_DUPLICATE_CAP;
   const others = "a.id <> ? AND COALESCE(a.vertical_id, 'rfb') = 'rfb' AND a.merged_into IS NULL";
@@ -485,12 +608,13 @@ export function gatherRegistrationPrecheckInput(db: Db, agentId: string): Regist
     }
   }
 
-  let ownerClaimConfirmed = false;
+  // The shared customer rule (claimed_at OR a verified claim), same as the
+  // review queue. Revoking a claim sets status = 'revoked' (and restores /
+  // clears claimed_at), so a revoked claim never counts here.
+  let ownerClaimConfirmed = !!row.claimed_at;
   try {
-    ownerClaimConfirmed = !!db.prepare(
-      `SELECT 1 FROM agent_claims WHERE agent_id = ? AND status = 'verified' AND revoked_at IS NULL LIMIT 1`
-    ).get(agentId);
-  } catch { /* claims table absent in a stripped-down DB: no claim */ }
+    ownerClaimConfirmed = !!db.prepare(`SELECT 1 FROM agents a WHERE a.id = ? AND ${customerRuleSql("a")}`).get(agentId);
+  } catch { /* claims table absent in a stripped-down DB: claimed_at alone */ }
 
   return {
     name: String(row.name ?? ""),
@@ -498,6 +622,7 @@ export function gatherRegistrationPrecheckInput(db: Db, agentId: string): Regist
     url: row.url,
     city: row.city,
     orgNr,
+    orgNrSelfReported,
     duplicates: {
       exact_ids: exactIds.slice(0, cap),
       exact_vetted_ids: exactIds.filter((id) => exact.get(id)).slice(0, cap),
