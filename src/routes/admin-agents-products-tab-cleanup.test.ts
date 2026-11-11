@@ -189,9 +189,16 @@ export function runAdminAgentsProductsTabCleanupTests(opts: { log?: boolean } = 
         ], "planner: «Sesong» rows -> category / price split, meaningful season -> note");
         assertEq(sesong.changes[1].dropped_cells, ["availability: Ikke oppgitt"], "planner: «Sesong» «Ikke oppgitt» dropped as availability");
         assertEq(sesong.changes[3].dropped_cells, undefined, "planner: «Sesong» meaningful cell not dropped");
+        // Season column OUTSIDE the default position pins the mapping (-> availability/note).
         for (const w of ["Sesong", "Sesonger", "Sesongvare"]) {
-          const h = mod.planProductsTabCleanup([{ name: `Produkt${T}${w}`, category: "other" }]);
-          assertEq(h.changes.map((c) => c.action), ["removed_header"], `planner: «${w}» is a header word`);
+          const h = mod.planProductsTabCleanup([
+            { name: `Navn${T}${w}${T}Kategori${T}Pris`, category: "other" },
+            { name: `Z${T}Høst${T}Syltetøy${T}95 kr`, category: "other" },
+          ]);
+          assertEq(h.changes.map((c) => c.action), ["removed_header", "split"], `planner: «${w}» is a header word`);
+          assertEq(h.products, [{ name: "Z", category: "preserves", price: "kr 95", priceUnit: "kr", note: "Høst" }],
+            `planner: «${w}» column (index 1) -> note, category/price read from their header positions`);
+          assertEq(h.changes[1].dropped_cells, undefined, `planner: «${w}» column -> nothing dropped`);
         }
         // Existing header fixture still behaves the same.
         const legacy = mod.planProductsTabCleanup([HEADER, SOLBAER]);
