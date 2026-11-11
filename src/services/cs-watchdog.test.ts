@@ -104,7 +104,10 @@ export function runCsWatchdogTests(opts: { log?: boolean } = {}): Promise<TestSu
       eq((db.prepare("SELECT forward_payload FROM inbound_email_log WHERE id='inb-ex-40d'").get() as any)?.forward_payload, null, "cw13b: a forward given up on > 30 days ago loses its stored mail body, the row stays");
 
       // ── watchdog ────────────────────────────────────────────────────
-      const now = new Date();
+      // Same clock as the forward-retry rows above (inserted relative to T0): with the real
+      // clock, those rows became due for retry once wall time passed T0, and the retry
+      // mail was counted as a watchdog alert (cw14/15/17/18/21 red from 2026-11-11T10:0xZ).
+      const now = new Date(T0.getTime());
       crm.crmService.ingestThread(
         { threadId: "wd-old", subject: "Spørsmål om åpningstider", category: "innkommende",
           messages: [{ messageId: "wd-old-m", direction: "in", fromEmail: "kunde@x.no", sentAt: hoursBefore(now, 30) }] },
