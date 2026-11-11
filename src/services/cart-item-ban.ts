@@ -26,14 +26,19 @@
  * An alcohol word in the NAME does not ban the row when the name shows it is
  * food (FOOD_HEADS): the alcohol word is the first part of a compound whose
  * last part is a food word («Rødvinspølse», «Aquavitgelé», «Konjakkpølse»),
- * or it comes after «med»/«m»/«i» that follows a food word in the name
- * («Pølse med akevitt», «Kirsebærgelé med Cognac»). The last part of a
+ * or the name is exactly «<food> med/m/i <alcohol>» with nothing after the
+ * alcohol word but weights/numbers («Pølse med akevitt», «Kirsebærgelé med
+ * Cognac»; not «Pølse med akevitt og pils»). A drinkable food («Varm
+ * sjokolade med likør») is never the food side. The last part of a
  * compound decides: «Sjokoladelikør» is a liqueur. An alcohol word FIRST and
  * a food word after it is a flavoured drink («Likør Sjokolade», «Juleøl
  * Sjokolade», «Porter Ost») and stays banned. Fail-closed, the exemption is
  * off when the name or the description has a drink sign (a volume such as
  * «70 cl» / «0,5 l», «flaske», «% vol», «% alkohol» or a % figure above
- * 2.5), and for a drink producer unless the row has an explicit food
+ * 2.5, «prosent», «flaske» in any word), for a hot/served drink («varm»,
+ * «drikk», «kopp», «serveres»), for bundles and gift packs («Gavepakke»,
+ * «Julekurv», «Smaksboks», category «Gaver»), for a name with more than one
+ * alcohol word, and for a drink producer unless the row has an explicit food
  * category. It never lifts an alcohol category (also free text such as
  * «Likører», «alkoholholdige drikker»), a beverages row with an alcohol word
  * or a drink producer's beverage (those checks read the text without it).
@@ -190,13 +195,14 @@ export function isFoodToken(t: string, strict = false): boolean {
 }
 
 // Drink signs in the name OR the description cancel the food exemption
-// (fail-closed): a volume («70 cl», «0,5 l», «1 liter»), a bottle
-// («flaske»), «% vol», «% alkohol» or a % figure above 2.5.
+// (fail-closed): a volume («70 cl», «0,5 l», «1 liter», «centiliter», a bare
+// «liter»), a bottle (any token with «flaske»: «halvflaske», «glassflaske»),
+// «% vol», «% alkohol», «alk. 40», «40 prosent» or a % figure above 2.5.
 export function hasDrinkSigns(name: string, description: string): boolean {
   const text = `${name} ${description}`.toLowerCase();
-  if (/(^|[^\p{L}\d])\d+(?:[.,]\d+)?\s*(?:cl|ml|dl|l|ltr|liter|litre|liters)(?!\p{L})/u.test(text)) return true;
-  if (tokens(text).some((t) => t.startsWith("flaske") || t === "fl" || t === "bottle")) return true;
-  if (/%\s*vol|vol\.?\s*%|\balc\.?\s*\d|%\s*alk/.test(text)) return true;
+  if (/(^|[^\p{L}\d])\d+(?:[.,]\d+)?\s*(?:cl|ml|dl|l|ltr|liter|litre|liters|centiliter|milliliter|desiliter)(?!\p{L})/u.test(text)) return true;
+  if (tokens(text).some((t) => t.includes("flaske") || t === "fl" || t.includes("bottle") || t === "liter" || t.endsWith("liter"))) return true;
+  if (/%\s*vol|vol\.?\s*%|\balc\.?\s*\d|%\s*alk|\d\s*prosent|\balk\.?\s*\d/.test(text)) return true;
   for (const m of text.matchAll(/(\d+(?:[.,]\d+)?)\s*%/g)) {
     if (parseFloat(m[1]!.replace(",", ".")) > 2.5) return true;
   }
@@ -206,23 +212,45 @@ export function hasDrinkSigns(name: string, description: string): boolean {
 // «<food> med <alcohol>»: the alcohol word is an ingredient.
 const INGREDIENT_PREPOSITIONS = new Set(["med", "m", "i"]);
 
+// Food words that are also drinks (hot chocolate, cocoa, coffee, tea,
+// toddy, punch): never the food side of «<food> med <alcohol>».
+const DRINKABLE_FOOD_HEADS = ["sjokolade", "kakao", "kaffe", "te", "toddy", "punsj"];
+// Tokens allowed after the alcohol word: weights, counts, numbers.
+const TRAILING_FILLER = /^(\d+([.,]\d+)?(g|gr|gram|kg|stk|pk)?|g|gr|gram|kg|stk|pk|ca)$/;
+
 /**
  * True when the alcohol hit at nameTokens[i] is an ingredient of a food:
- * a food compound itself («Rødvinspølse»), or after «med»/«m»/«i» that
- * follows a food word in the name («Festpølse med akevitt»). The word before
- * «med» is read strictly: «Paradis», «Spesialpris», «Julefrokost» are not
- * «-is»/«-ost» food. An alcohol word before a food word («Likør Sjokolade»)
- * is a flavoured drink, never an ingredient. The category is not a source
- * («Gave med akevitt» in «ost» stays banned). The caller has already ruled
- * out drink signs.
+ * a food compound itself («Rødvinspølse»), or exactly «<food> med/m/i
+ * <alcohol>» with the food word right before the preposition, the alcohol
+ * word right after it, and nothing after the alcohol word but weights and
+ * numbers («Festpølse med akevitt 280g»; not «Pølse med akevitt og pils»,
+ * not «Spekepølse med ost og akevitt»). The food word is read strictly
+ * («Paradis», «Julefrokost» are not food) and never a drinkable head
+ * («Varm sjokolade med likør»). An alcohol word before a food word
+ * («Likør Sjokolade») is a flavoured drink, never an ingredient. The caller
+ * has already ruled out drink signs, bundles and a second alcohol word.
  */
 function alcoholIsIngredient(tks: readonly string[], i: number): boolean {
   if (isFoodToken(tks[i]!)) return true;
-  for (let j = i - 1; j > 0; j--) {
-    if (!INGREDIENT_PREPOSITIONS.has(tks[j]!)) continue;
-    if (tks.slice(0, j).some((x) => isFoodToken(x, true))) return true;
-  }
-  return false;
+  if (i < 2 || !INGREDIENT_PREPOSITIONS.has(tks[i - 1]!)) return false;
+  const food = tks[i - 2]!;
+  if (!isFoodToken(food, true) || DRINKABLE_FOOD_HEADS.some((h) => food === h || food.endsWith(h))) return false;
+  // One food item only: no «og»/«and» list before it («Kjeks og ost med portvin»).
+  if (tks.slice(0, i - 2).some((t) => t === "og" || t === "and" || t === "pluss")) return false;
+  return tks.slice(i + 1).every((t) => TRAILING_FILLER.test(t));
+}
+
+// Bundles and gift packs («Gavepakke», «Julekurv», «Smaksboks», «Gaver»):
+// they may hold a bottle, so the food exemption is off (fail-closed).
+const BUNDLE_HEADS = ["pakke", "kurv", "boks", "kasse", "sett", "eske", "kolli"];
+function isBundleToken(t: string): boolean {
+  if (t.startsWith("gave") || t.startsWith("smaksprove")) return true;
+  return BUNDLE_HEADS.some((h) => ["", "r", "er", "en", "ene", "ne"].some((e) => t.endsWith(h + e)));
+}
+// Signs of a hot or served drink («Varm sjokolade med likør», «Serveres varm»).
+function isServedDrinkToken(t: string): boolean {
+  return t === "varm" || t === "varme" || t.startsWith("drikk") || t.startsWith("drink") || t.startsWith("kopp") ||
+    t === "servering" || t === "serveres";
 }
 
 // Category words that say the row is food (besides FOOD_HEADS), used only to
@@ -233,8 +261,13 @@ const FOOD_CATEGORY_WORDS = new Set([
 ]);
 
 /** Free-text alcohol category: a known category, an alcohol word/stem («Likører», «Gin & likør») or «alkohol…». */
+// For category tokens only the explicit lists count, not the generic
+// «-ol»/«-vin» compound rules («Honning og propol»), and «alkoholfri…» is
+// not alcohol («Alkoholfri drikke»).
 function isAlcoholCategoryToken(t: string): boolean {
-  return ALCOHOL_CATEGORIES.has(t) || t.startsWith("alkohol") || isAlcoholToken(t);
+  if (NOT_ALCOHOL_TOKENS.has(t) || t.endsWith("eddik") || t.startsWith("alkoholfri")) return false;
+  return ALCOHOL_CATEGORIES.has(t) || ALCOHOL_WORDS.has(t) || t.startsWith("alkohol") ||
+    ALCOHOL_STEMS.some((s) => t.startsWith(s) || t.endsWith(s));
 }
 
 // Explicit alcohol-free markers: the only way out for the alcohol kind.
@@ -390,7 +423,11 @@ export function classifyCartItemBan(input: CartItemBanInput): CartItemBan | null
   // A drink producer's row needs an explicit (non-drink) food category for it.
   const foodCategory = !alcoholCategory && !isBeverageCategory &&
     categoryTokens.some((t) => FOOD_CATEGORY_WORDS.has(t) || isFoodToken(t, true));
-  const foodExemptionOpen = !hasDrinkSigns(name, description) && (!drinkProducer || foodCategory);
+  const foodExemptionOpen = !hasDrinkSigns(name, description) && (!drinkProducer || foodCategory) &&
+    !nameTokens.some(isBundleToken) && !categoryTokens.some(isBundleToken) &&
+    !textTokens.some(isServedDrinkToken) &&
+    nameTokens.filter((t) => isAlcoholToken(t)).length <= 1 &&
+    !/[,&+;]/.test(name); // a list in the name («Ost, kjeks & portvin») may hold a bottle
   const nameAlcoholHit = alcoholWordHit(nameTokens, foodExemptionOpen ? (i) => alcoholIsIngredient(nameTokens, i) : undefined) || roseHit;
   const alcoholFree = hasAlcoholFreeMarker(textTokens, raw) ||
     (!nameAlcoholHit && hasJuiceOrNoAddedAlcoholMarker(nameTokens, name));

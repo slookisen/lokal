@@ -876,6 +876,40 @@ export async function runOrderBestillingerSkive1Tests(opts: { log?: boolean } = 
       assertEq([banSvc.isFoodToken("pris"), banSvc.isFoodToken("tost"), banSvc.isFoodToken("brost")], [false, false, false], "alk-mat-69: a short head needs a first part of 4+ letters");
       assertEq(banSvc.isFoodToken("geitost"), true, "alk-mat-70: …and with 4+ letters it is food (Geitost)");
       assertEq([banSvc.hasDrinkSigns("Pølse", "40 % vol"), banSvc.hasDrinkSigns("Pølse 425g", ""), banSvc.hasDrinkSigns("Pølse", "0,5 l")], [true, false, true], "alk-mat-71: hasDrinkSigns reads the description");
+      // Review round 2 (lokal#1517). B1: bundles, lists and gift packs with a drink stay alcohol.
+      for (const [n, cat] of [["Gavepakke spekepølse med akevitt"], ["Gaveeske ost med portvin"], ["Julepakke: pølse med akevitt"],
+        ["Julekurv: pølse og ost med akevitt"], ["Smaksboks: salami med akevitt og øl"], ["Spekepølse med ost og akevitt"],
+        ["Pølse med akevitt og pils"], ["Ost med akevitt, øl og vin"], ["Kjeks og ost med portvin"], ["Ost med akevitt", "Gaver"],
+        ["Pølse med akevitt og sennep"], ["Salami med akevitt", "Gavekurver"], ["Pølse med akevitt i gaveeske"]] as Array<[string, string?]>) {
+        assertEq(c(n, cat), "alcohol", `alk-mat-72: bundle/list «${n}»${cat ? ` (category «${cat}»)` : ""}`);
+      }
+      assertEq(c("Parisersnabb med konjakk 200g"), null, "alk-mat-73: weights after the alcohol word are allowed (Parisersnabb med konjakk 200g)");
+      assertEq(c("Festpølse med akevitt 280g"), null, "alk-mat-74: (Festpølse med akevitt 280g)");
+      assertEq(c("Festpølse med akevitt 280 g 2 stk"), null, "alk-mat-75: (weights + counts)");
+      assertEq(c("Festpølse med akevitt 280 g, 2 stk"), "alcohol", "alk-mat-92: a comma in the name is a list, fail-closed");
+      // B2: hot/served drinks built on chocolate or other drinkable heads.
+      assertEq(c("Varm sjokolade med likør"), "alcohol", "alk-mat-76: «Varm sjokolade med likør»");
+      assertEq(c("Varm sjokolade med whisky"), "alcohol", "alk-mat-77: «Varm sjokolade med whisky»");
+      assertEq(c("Sjokolade med whisky", undefined, [], "Serveres varm"), "alcohol", "alk-mat-78: «Sjokolade med whisky», «Serveres varm»");
+      assertEq(c("Sjokolade med whisky"), "alcohol", "alk-mat-79: «sjokolade» is never the food side of «med»");
+      assertEq(c("Kakao med konjakk"), "alcohol", "alk-mat-80: «Kakao med konjakk»");
+      assertEq(c("Ost, kjeks & portvin"), "alcohol", "alk-mat-81: a list in the name («Ost, kjeks & portvin»)");
+      assertEq(c("Toddy med whisky"), "alcohol", "alk-mat-82: «Toddy med whisky»");
+      assertEq(c("Gelé med cognac", undefined, [], "En kopp til kaffen"), "alcohol", "alk-mat-83: «kopp» in the description");
+      assertEq(c("Pølse med akevitt", undefined, [], "God drikke til maten"), "alcohol", "alk-mat-84: «drikk…» in the description");
+      assertEq(c("Konjakksjokolade"), null, "alk-mat-85: compound head rule still makes «Konjakksjokolade» food");
+      assertEq(c("Whiskykaramell"), null, "alk-mat-86: (Whiskykaramell)");
+      // N1: more drink signs.
+      for (const [n, d] of [["Pølse med akevitt 40 prosent"], ["Pølse med akevitt", "40 prosent"], ["Pølse med akevitt alk. 40"],
+        ["Pølse med akevitt", "Alk 40"], ["Pølse med akevitt 70 centiliter"], ["Pølse med akevitt halvflaske"],
+        ["Pølse med akevitt", "I glassflaske"], ["Pølse med akevitt literflaske"], ["Pølse med akevitt", "Selges per liter"]] as Array<[string, string?]>) {
+        assertEq(c(n, undefined, [], d), "alcohol", `alk-mat-87: drink sign «${n}»${d ? ` / «${d}»` : ""}`);
+      }
+      // N2: category tokens use only the explicit lists.
+      assertEq(c("Sprudlende eple", "Alkoholfri drikke"), null, "alk-mat-88: category «Alkoholfri drikke» is not alcohol");
+      assertEq(c("Honning", "Honning og propol"), null, "alk-mat-89: category «Honning og propol» is not alcohol");
+      assertEq(c("Sprudlende eple", "Likører"), "alcohol", "alk-mat-90: category «Likører» still is");
+      assertEq(c("Eddik", "Rødvinseddik"), null, "alk-mat-91: category «Rødvinseddik» is vinegar");
       // The food word list itself (folded tokens).
       for (const t of ["polse", "spekepolse", "festpolse", "parisersnabb", "skinke", "gele", "kirsebaergele", "syltetoy", "marmelade", "sjokolade",
         "konfekt", "troffel", "trofler", "karamell", "fudge", "kake", "kaker", "pepperkake", "kjeks", "is", "vaniljeis", "saus", "sennep",
