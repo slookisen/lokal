@@ -67,7 +67,7 @@ import { isOrderAutocompleteEnabled, noShowEarliestMs, formatPickupTimeOslo } fr
 import { randomUUID } from "crypto";
 import { PRICE_BY_AGREEMENT, PARTIAL_SUM_LABEL, summarizePricing } from "../services/order-pricing";
 import type { PaymentsStripeClient } from "../services/payment-provider";
-import { emailWithheldIds } from "../services/email-reveal-guard";
+import { rfbEmailHiddenIds } from "../services/contact-form-only";
 
 // ─── Public cart/order router ────────────────────────────────────────────────
 export const cartRouter = Router();
@@ -419,8 +419,10 @@ cartRouter.post("/cart/:id/submit", cartWishesLimiter, async (req: Request, res:
   // stored cart_handoffs rows are untouched, and orders[].producer_contact
   // (the seller's contact for the buyer's own order) is not limited.
   // Switch on: Cache-Control: private. Switch off: nothing changes.
+  // S-D2: a contact-form-only producer's handoff e-mail is null too
+  // (CONTACT_FORM_RFB on; rfbEmailHiddenIds); orders[] keep theirs.
   const handoffs = Array.isArray(result.contact_handoffs) ? result.contact_handoffs : [];
-  const withheld = emailWithheldIds(req, res, "rfb", handoffs.filter((h) => !!h.email).map((h) => h.agent_id));
+  const withheld = rfbEmailHiddenIds(req, res, handoffs.filter((h) => !!h.email).map((h) => h.agent_id));
   if (withheld && withheld.size > 0) {
     res.status(201).json({ ...result, contact_handoffs: handoffs.map((h) => (withheld.has(h.agent_id) ? { ...h, email: null } : h)) });
     return;
