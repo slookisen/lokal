@@ -53972,3 +53972,24 @@ runSerial(async () => {
     failures.push("registration-confirmation: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-11-10-rfb-bakke-rydding-dublett-og-innlimte-varer S2:
+// POST /admin/agents/products-tab-cleanup — splits pasted tab-separated
+// product rows of one profile (dry-run default, curated lock, audit with old
+// value, catalog rename/retire). Own in-memory DB pinned on getDb(), sets
+// ADMIN_KEY only if unset (both restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── S2: produkter med innlimte tabulatorrader ──");
+  try {
+    const { runAdminAgentsProductsTabCleanupTests } = require("../src/routes/admin-agents-products-tab-cleanup.test") as
+      typeof import("../src/routes/admin-agents-products-tab-cleanup.test");
+    const r = await runAdminAgentsProductsTabCleanupTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("products-tab-cleanup: " + f);
+    console.log(`  products-tab-cleanup: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("products-tab-cleanup: unexpected error: " + String(err?.message || err));
+  }
+});

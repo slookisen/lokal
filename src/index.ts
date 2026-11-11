@@ -142,6 +142,7 @@ import adminAgentsFacebookTierShadowRoutes from "./routes/admin-agents-facebook-
 import adminDrinkCoverageRoutes from "./routes/admin-drink-coverage";
 import adminEnrichmentWritePauseRoutes from "./routes/admin-enrichment-write-pause";
 import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-merge";
+import adminAgentsProductsTabCleanupRoutes from "./routes/admin-agents-products-tab-cleanup";
 import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
 import adminAgentsBusinessTypeRoutes from "./routes/admin-agents-business-type";
 import adminTestProducerRoutes from "./routes/admin-test-producer";
@@ -976,6 +977,10 @@ app.use("/admin/enrichment-write-pause", adminLimiter, adminEnrichmentWritePause
 // (dev-request duplicate-merge lever). Same ordering rule as the siblings
 // above — mount BEFORE /admin/agents.
 app.use("/admin/agents/duplicate-merge", adminLimiter, adminAgentsDuplicateMergeRoutes);
+// POST /admin/agents/products-tab-cleanup (dev-request 2026-11-10-rfb-bakke-
+// rydding-dublett-og-innlimte-varer, S2): splits pasted tab-separated product
+// rows, one profile per call, dry-run default. Mount BEFORE /admin/agents.
+app.use("/admin/agents/products-tab-cleanup", adminLimiter, adminAgentsProductsTabCleanupRoutes);
 // POST /admin/agents/deactivate — standalone-row catalog-hygiene deactivate
 // lever (dev-request 2026-08-10-rfb-hjemmesidejakt-full-loype, Skive 8).
 // Same ordering rule as the siblings above — mount BEFORE /admin/agents.
