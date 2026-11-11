@@ -142,6 +142,11 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
         );
         assertEq(onOpplevagent.join(","), "experiences",
           "pi8f: EXACTLY ONE vertical replies to opplevagent.no — a second would route another platform's replies through the Opplevagent forwarder and destroy the steg-4 discriminator");
+        // pi8g — each platform replies to its own receiving domain now that
+        // all three receive (finn-tannlege.com since 2026-11-11).
+        assertEq(crmMod.CRM_VERTICALS.map((v) => `${v}:${ident.resolveCrmIdentity(v).replyTo}`).join(","),
+          "rfb:kontakt@rettfrabonden.com,dental:kontakt@finn-tannlege.com,experiences:kontakt@opplevagent.no",
+          "pi8g: every platform's reply-to is its own receiving address — a dental reply comes back to dental, not to Rett fra Bonden");
       }
 
       // ═══════════════════════════════════════════════════════════════

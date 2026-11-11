@@ -34,11 +34,11 @@
 //
 // ── DENTAL ──────────────────────────────────────────────────────────
 //
-// finn-tannlege.com has no inbound alias (steg 3 documents why), so there is no
-// dental mail on this path at all — dental enquiries arrive through
-// POST /api/contact, which carries an explicit platform field. If a dental
-// alias is ever configured, add it to PLATFORM_ADDRESSES and nothing else
-// changes.
+// kontakt@finn-tannlege.com receives since 2026-11-11 (MX = Resend inbound),
+// so a Gmail copy of a dental mail can reach this path too; it routes to
+// `dental` like the other two platform aliases. Dental contact-form enquiries
+// still arrive through POST /api/contact, which carries an explicit platform
+// field.
 
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
@@ -77,6 +77,7 @@ type DecidingField = (typeof DECIDING_FIELDS)[number];
 const PLATFORM_ADDRESSES: Readonly<Record<string, CrmVertical>> = {
   "kontakt@rettfrabonden.com": "rfb",
   "kontakt@opplevagent.no": "experiences",
+  "kontakt@finn-tannlege.com": "dental",
 };
 
 // dev-requests/2026-08-21-crm-untriaged-kofrysning-og-lopetellerfeil.md: a

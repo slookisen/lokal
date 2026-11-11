@@ -40,6 +40,9 @@
  *              (neutral subject); a bounce copy with no log row is read from
  *              «(fra … <mailer-daemon@…>)»; a failed alias lookup answers 500
  *              with nothing filed and the retry reopens the thread.
+ *   ci107-ci109 DMARC and TLS reports to a platform address are automated
+ *              («report»): filed, but never «trenger svar»; a customer subject
+ *              that mentions a report is not caught.
  *   ci105-ci106 second re-review: «(fra …)» with parentheses in the sender
  *              name is parsed whole; the alias branch is one transaction (a
  *              DB error during the reopen rolls the messages back).
@@ -425,6 +428,24 @@ export function runCsInboundTests(opts: { log?: boolean } = {}): Promise<TestSum
         eq(txState, [500, 0, "done"], "ci106: a DB error during the reopen rolls the whole alias branch back (500, nothing filed, still done)");
         await call("POST", "/ingest", { threadId: "gm-thread-1", primaryFromEmail: "kari@testgard.no", vertical: "rfb", messages: [lateAnswer] });
         eq([filed("gm-tx-1"), threadStatus()], [1, "new"], "ci106b: …and the retry files the message and reopens the thread");
+
+        // ci107-ci109: DMARC aggregate and TLS reports are machine mail.
+        const H = { messageId: null, inReplyTo: [], references: [], autoSubmitted: null, precedence: null, xAutoreply: false };
+        eq([
+          ci.classifyAutomated({ subject: "Report domain: rettfrabonden.com Submitter: google.com Report-ID: 15228928930211912773", fromEmail: "noreply-dmarc-support@google.com", headers: H }).kind,
+          ci.classifyAutomated({ subject: "Report Domain: opplevagent.no Submitter: enterprise.protection.outlook.com Report-ID: <abc@x>", fromEmail: "someone@microsoft.com", headers: H }).kind,
+          ci.classifyAutomated({ subject: "DMARC Aggregate Report for finn-tannlege.com", fromEmail: "rapport@domeneshop.no", headers: H }).kind,
+          ci.classifyAutomated({ subject: "Report Domain: rettfrabonden.com Submitter: google.com Report-ID: <2026.11.10T00.00.00Z+rettfrabonden.com@google.com>", fromEmail: "noreply-smtp-tls-reporting@google.com", headers: H }).kind,
+        ], ["report", "report", "report", "report"], "ci107: DMARC aggregate reports (Google, Microsoft, Domeneshop) and SMTP TLS reports are «report», by sender or by the providers' report subject");
+        eq([
+          ci.classifyAutomated({ subject: "Spørsmål om rapport fra Mattilsynet", fromEmail: "kari@testgard.no", headers: H }).kind,
+          ci.classifyAutomated({ subject: "Report on our farm", fromEmail: "ola@gard.no", headers: H }).kind,
+          ci.classifyAutomated({ subject: "Re: Report domain for nettsiden vår", fromEmail: "ola@gard.no", headers: H }).kind,
+        ], [null, null, null], "ci108: a customer subject that only mentions a report or a domain is never taken for one");
+        const dm = await hook({ email_id: "em-dmarc-1", from: "noreply-dmarc-support@google.com", to: ["kontakt@rettfrabonden.com"], subject: "Report domain: rettfrabonden.com Submitter: google.com Report-ID: 99887766", created_at: hoursAgo(1) });
+        const dmRow = logRow("em-dmarc-1");
+        eq([dm.code, dmRow?.crm_status, dmRow?.automated_kind, nr.computeNeedsReply({}).threads.some((t) => t.thread_id === dmRow?.crm_thread_id)],
+          [200, "registered", "report", false], "ci109: a DMARC report is filed (and forwarded) but never listed as «trenger svar»");
       }
 
       // ci77-ci78 (review #8): a copy of an e-mail the server parked as untriaged opens no second item
