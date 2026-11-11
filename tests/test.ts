@@ -48534,6 +48534,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-11-verifier-ny-verifisering-og-delta-ledd (slice B):
+// agents_verified delta mode counts verifier_verified_events (written by
+// applyVerifierOutcome) instead of current status/last_verified_at.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-11-verifier-ny-verifisering-og-delta-ledd: verified events ──");
+  try {
+    const { runAdminVerifierClaimCountsVerifiedEventsTests } =
+      require("../src/routes/admin-verifier-claim-counts-verified-events.test") as
+        typeof import("../src/routes/admin-verifier-claim-counts-verified-events.test");
+    const vve = await runAdminVerifierClaimCountsVerifiedEventsTests({ log: false });
+    passed += vve.passed;
+    failed += vve.failed;
+    for (const f of vve.failures) failures.push("admin-verifier-claim-counts-verified-events: " + f);
+    console.log(`  admin-verifier-claim-counts-verified-events: ${vve.passed} passed, ${vve.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-verifier-claim-counts-verified-events: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-02-experiences-karantene-utgang-match-til-verified: the
 // content-judge sweep's new quarantine-exit promotion transition
 // (needs_review -> verified, gated on judge MATCH + provider brreg_active=1
