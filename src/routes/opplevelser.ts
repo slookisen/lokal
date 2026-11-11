@@ -29945,7 +29945,137 @@ export function contentJudgeReasonMentionsNav(reason: string | null | undefined)
   return CONTENT_JUDGE_NAV_REASON_TERMS.some((t) => folded.includes(stripNorwegianAccentsForJudgeReason(t)));
 }
 
-/** The six promotion requirements (see the block comment above), each
+/** Organisation/brand terms that, when the judge's OWN MATCH reason uses
+ *  them and describes NO experience (see CONTENT_JUDGE_EXPERIENCE_*), mean
+ *  the judge only matched "same provider" — e.g. prod row 73f9ed8c
+ *  "Rørosmat Local Food Trail" (2026-11-11 dry-run): the reason only said
+ *  Rørosmat is a producer cooperative / brand for local food, the stored
+ *  description was empty, and the row was `would_promote`. Promotion guard
+ *  `judge_reason_org`. Lowercase and æøå-folded, matched as substrings of
+ *  the folded reason (Norwegian compounds: "produsentsamvirke",
+ *  "paraplyorganisasjon", "interesseorganisasjon", "samvirket",
+ *  "andelslaget", "merkevaren", "turistforeningen" are all covered).
+ *  Choices:
+ *   - "organisasjon"/"organisation"/"organization": the core terms. NOT
+ *     "organisert"/"organised" (an organised tour IS an experience) — those
+ *     are not substrings of these. "organisasjonsnummer"/"organisasjonsnr"
+ *     is stripped before matching (an identifier mention, not a description
+ *     of the provider as an organisation; out of this guard's scope).
+ *   - "forening"/"association": member associations (Bondelagets
+ *     lokallag-type text, venneforening, turistforening). A real DNT-style
+ *     experience reason names the trip ("tur") and is not held.
+ *   - Deliberately NOT generic company words (bedrift, selskap, firma,
+ *     foretak, company, business): almost every MATCH reason names the
+ *     provider that way, so they would hold far beyond the Rørosmat pattern.
+ *   - Deliberately NOT bare "nettverk"/"network" (social-media/wifi prose) —
+ *     only producer-network phrasings.
+ *   - "brand"/"brands" is matched as a whole word (CONTENT_JUDGE_ORG_REASON_WORDS)
+ *     so place/person names like "Brandbu"/"Hildebrand" never count. */
+export const CONTENT_JUDGE_ORG_REASON_TERMS: readonly string[] = [
+  "organisasjon",
+  "organisation",
+  "organization",
+  "samvirke",
+  "andelslag",
+  "kooperativ",
+  "cooperative",
+  "co-operative",
+  "merkevare",
+  "forening",
+  "association",
+  "produsentnettverk",
+  "nettverk av produsenter",
+  "nettverk for produsenter",
+  "producer network",
+  "network of producers",
+];
+/** Organisation terms matched only as whole words (too short/ambiguous as
+ *  substrings). */
+export const CONTENT_JUDGE_ORG_REASON_WORDS: readonly string[] = ["brand", "brands"];
+
+/** Experience terms: if the judge's reason contains ANY of these, it
+ *  describes something a visitor can do, so `judge_reason_org` never holds
+ *  it even when it also names an organisation ("Samvirket tilbyr guidet
+ *  gårdsbesøk med smaking"). Lowercase and æøå-folded, matched as
+ *  substrings — only terms ≥4 chars whose substrings are unambiguous here
+ *  ("besok" covers "gardsbesok"/"besoke"; "smak" covers "smaking",
+ *  "matsmaking", "smaksprove"; "aktivitet" covers "aktiviteter";
+ *  "arranger" covers "arrangerer"/"arrangert"; "guide" covers "guidet",
+ *  "guiden", "guided", "guiding"; "experience"/"activit"/"tasting"
+ *  cover English inflections). Short/ambiguous stems ("tur", "kurs") and
+ *  English words like "tour"/"visit"/"event"/"trail" are matched per
+ *  word instead (see CONTENT_JUDGE_EXPERIENCE_WORD_PATTERNS). Erring
+ *  towards treating a reason as an experience only makes this guard
+ *  LESS strict, never loses a real row. */
+export const CONTENT_JUDGE_EXPERIENCE_REASON_TERMS: readonly string[] = [
+  "opplevelse",
+  "omvisning",
+  "guide",
+  "smak",
+  "aktivitet",
+  "arrangement",
+  "arranger",
+  "besok",
+  "servering",
+  "serverer",
+  "overnatting",
+  "workshop",
+  "foredrag",
+  "ekskursjon",
+  "kajakk",
+  "padling",
+  "seiling",
+  "safari",
+  "festival",
+  "cruise",
+  "matsti",
+  "tasting",
+  "activit",
+  "experience",
+  "excursion",
+];
+
+/** Per-word experience patterns, tested against each [a-z0-9]+ word of the
+ *  folded reason. `tur`/`kurs` match as a word OR the tail of a compound
+ *  ("kajakktur", "fjellturen", "sykkelturer", "matkurs", "ostekurset"), with
+ *  an exclusion list for words that merely END in those letters: "natur",
+ *  "kultur", "struktur", "litteratur", "temperatur", "arkitektur",
+ *  "signatur", "karikatur", "agentur", "konkurs", "diskurs". English
+ *  "course"/"class" are deliberately absent ("of course", "world-class"). So
+ *  "Kulturorganisasjon i naturskjønne omgivelser" has NO experience word. */
+export const CONTENT_JUDGE_EXPERIENCE_WORD_PATTERNS: readonly RegExp[] = [
+  /tur(?:en|er|ene|ar|ane)?$/,
+  /kurs(?:et|ene|er)?$/,
+  /^(?:tour|tours|touring|toured|visit|visits|visiting|visitor|visitors|event|events|trail|trails)$/,
+];
+const CONTENT_JUDGE_EXPERIENCE_WORD_EXCLUDE =
+  /(?:natur|kultur|struktur|litteratur|temperatur|arkitektur|signatur|karikatur|agentur|konkurs|diskurs)(?:en|er|ene|ar|ane|et)?$/;
+
+/** True iff the judge's reason describes an ORGANISATION (cooperative,
+ *  brand, association, ...; CONTENT_JUDGE_ORG_REASON_TERMS/_WORDS) and NO
+ *  experience (CONTENT_JUDGE_EXPERIENCE_REASON_TERMS/_WORD_PATTERNS) — a
+ *  MATCH with such a reason only says "same provider", not "this is a real
+ *  experience" (promotion guard `judge_reason_org`). Null/empty reason ->
+ *  false (a missing reason is the `judge` requirement's concern). PURE. */
+export function contentJudgeReasonOnlyDescribesOrganisation(reason: string | null | undefined): boolean {
+  if (!reason) return false;
+  const folded = stripNorwegianAccentsForJudgeReason(reason.toLowerCase())
+    .replace(/\s+/g, " ")
+    .replace(/organisasjons(?:nummer|nr)/g, " ");
+  const words = folded.match(/[a-z0-9]+/g) ?? [];
+  const mentionsOrg =
+    CONTENT_JUDGE_ORG_REASON_TERMS.some((t) => folded.includes(stripNorwegianAccentsForJudgeReason(t))) ||
+    words.some((w) => CONTENT_JUDGE_ORG_REASON_WORDS.includes(w));
+  if (!mentionsOrg) return false;
+  const mentionsExperience =
+    CONTENT_JUDGE_EXPERIENCE_REASON_TERMS.some((t) => folded.includes(stripNorwegianAccentsForJudgeReason(t))) ||
+    words.some(
+      (w) => !CONTENT_JUDGE_EXPERIENCE_WORD_EXCLUDE.test(w) && CONTENT_JUDGE_EXPERIENCE_WORD_PATTERNS.some((p) => p.test(w)),
+    );
+  return !mentionsExperience;
+}
+
+/** The seven promotion requirements (see the block comment above), each
  *  evaluated separately. `row` is the state going INTO this write. */
 export type ContentJudgePromotionDecision = {
   wasNeedsReview: boolean;
@@ -29957,13 +30087,18 @@ export type ContentJudgePromotionDecision = {
   contentQualityOk: boolean;
   /** `judge_reason_nav`: the judge's reason does not mention nav/menu chrome. */
   judgeReasonNavOk: boolean;
+  /** `judge_reason_org`: the judge's reason does not ONLY describe an
+   *  organisation (cooperative/brand/association) without any experience
+   *  (contentJudgeReasonOnlyDescribesOrganisation). */
+  judgeReasonOrgOk: boolean;
   missing: string[];
   eligible: boolean;
 };
 
 /**
- * Promotion guard (2026-11-09) — two deterministic requirements on top of
- * judge/brreg_active/source_verified/confidence; both can only make
+ * Promotion guard (2026-11-09; `judge_reason_org` 2026-11-11) — three
+ * deterministic requirements on top of
+ * judge/brreg_active/source_verified/confidence; all can only make
  * promotion STRICTER, never looser:
  *  - `content_quality`: a non-empty (trimmed) `description` must not look
  *    like nav-menu/chrome text (looksLikeNavBoilerplate, search-enrich.ts).
@@ -29976,6 +30111,10 @@ export type ContentJudgePromotionDecision = {
  *    isLikelyNavMenuLeakage) is applied. A null/blank description passes.
  *  - `judge_reason_nav`: the judge's own reason must not mention nav/menu
  *    chrome (contentJudgeReasonMentionsNav).
+ *  - `judge_reason_org`: the judge's own reason must not describe ONLY an
+ *    organisation (producer cooperative, brand, association, ...) with no
+ *    experience at all (contentJudgeReasonOnlyDescribesOrganisation) — such
+ *    a MATCH says only "same provider" (prod row 73f9ed8c, 2026-11-11).
  */
 export function evaluateContentJudgePromotion(
   row: Pick<ContentJudgeSweepRow, "verification_status" | "confidence" | "evidence_url_verification" | "p_brreg_active" | "p_field_provenance" | "description">,
@@ -29991,6 +30130,7 @@ export function evaluateContentJudgePromotion(
   const description = typeof row.description === "string" ? row.description.trim() : "";
   const contentQualityOk = description === "" || !looksLikeNavBoilerplate(description);
   const judgeReasonNavOk = !contentJudgeReasonMentionsNav(judgeReason);
+  const judgeReasonOrgOk = !contentJudgeReasonOnlyDescribesOrganisation(judgeReason);
   const missing: string[] = [];
   if (!judgeOk) missing.push("judge");
   if (!brregActiveOk) missing.push("brreg_active");
@@ -29998,6 +30138,7 @@ export function evaluateContentJudgePromotion(
   if (!confidenceOk) missing.push("confidence");
   if (!contentQualityOk) missing.push("content_quality");
   if (!judgeReasonNavOk) missing.push("judge_reason_nav");
+  if (!judgeReasonOrgOk) missing.push("judge_reason_org");
   return {
     wasNeedsReview,
     judgeOk,
@@ -30006,6 +30147,7 @@ export function evaluateContentJudgePromotion(
     confidenceOk,
     contentQualityOk,
     judgeReasonNavOk,
+    judgeReasonOrgOk,
     missing,
     eligible: wasNeedsReview && missing.length === 0,
   };
@@ -30193,6 +30335,7 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
         confidence_ok: boolean;
         content_quality: boolean;
         judge_reason_nav: boolean;
+        judge_reason_org: boolean;
         status: "not_applicable" | "held" | "would_promote" | "promoted";
         missing?: string[];
       };
@@ -30307,6 +30450,7 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
         confidenceOk,
         contentQualityOk,
         judgeReasonNavOk,
+        judgeReasonOrgOk,
         missing: missingPromotionReqs,
         eligible: eligibleForPromotion,
       } = evaluateContentJudgePromotion(row, outcome.verdict, outcome.reason);
@@ -30369,6 +30513,7 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
           confidence_ok: confidenceOk,
           content_quality: contentQualityOk,
           judge_reason_nav: judgeReasonNavOk,
+          judge_reason_org: judgeReasonOrgOk,
           status: promotionStatus,
           ...(promotionStatus === "held" ? { missing: missingPromotionReqs } : {}),
         },

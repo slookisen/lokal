@@ -443,6 +443,7 @@ export function runOpplevelserExperiencesAdmissionPromotionTests(
         assertEq(p1?.missing, undefined, "adm-2g: no 'missing' field when eligible");
         assertEq(p1?.content_quality, true, "adm-2h: promotion.content_quality=true reported per row (short Norwegian description is not nav chrome)");
         assertEq(p1?.judge_reason_nav, true, "adm-2i: promotion.judge_reason_nav=true reported per row (judge reason has no nav/menu terms)");
+        assertEq(p1?.judge_reason_org, true, "adm-2j: promotion.judge_reason_org=true reported per row (judge reason is not organisation-only)");
 
         const p2 = byId.get("adm-promote-evidenceurl")?.promotion;
         assertEq(p2?.source_verified, true, "adm-3a: adm-promote-evidenceurl promotion.source_verified=true (via evidence_url, hjemmeside NOT verified)");
@@ -929,6 +930,90 @@ export function runOpplevelserExperiencesAdmissionPromotionTests(
           "Gjenspeiler nøyaktig navigasjonsmeny og overskrifter.",
         );
         assertEq(d7.missing, ["confidence", "content_quality", "judge_reason_nav"], "adm-g7: missing lists old + both new requirements in order");
+
+        // ── Promotion guard 2026-11-11: judge_reason_org ──
+        // Prod row 73f9ed8c "Rørosmat Local Food Trail" was would_promote on a
+        // MATCH whose reason only described an ORGANISATION (producer
+        // cooperative / brand) and nothing a visitor can do.
+        for (const [i, reason] of [
+          "Rørosmat er et produsentsamvirke/merkevare for lokalmat fra Røros-regionen.",
+          "Samme organisasjon som på nettsiden.",
+          "This is a cooperative brand.",
+          "Kulturorganisasjon i naturskjønne omgivelser.",
+          "Rørosmat er en organisasjon og merkevare for lokale produsenter.",
+          "Andelslaget er et nettverk av produsenter i regionen.",
+          "Interesseorganisasjon for gårdbrukere i Valdres; samme navn som kilden.",
+          "The page describes the same producer organisation and its brands.",
+          "Foreningen jobber for lokal kultur og struktur i bygda.",
+          "Paraplyorganisasjon for lokalmatprodusenter, samme organisasjonsnummer.",
+        ].entries()) {
+          assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation(reason), true, `adm-o1.${i}: org-only reason "${reason}" -> true`);
+          const d = mod.evaluateContentJudgePromotion({ ...base, description: null }, "MATCH", reason);
+          assertEq(d.judgeReasonOrgOk, false, `adm-o2.${i}: org-only reason "${reason}" -> judgeReasonOrgOk=false`);
+          assertEq(d.eligible, false, `adm-o3.${i}: org-only reason "${reason}" -> NOT eligible (held)`);
+          assertEq(d.missing, ["judge_reason_org"], `adm-o4.${i}: org-only reason "${reason}" -> missing=['judge_reason_org']`);
+        }
+
+        // "No loss of real rows": reasons naming an organisation AND an
+        // experience are NOT held.
+        for (const [i, reason] of [
+          "Samvirket tilbyr guidet gårdsbesøk med smaking.",
+          "Organisasjonen arrangerer omvisning i ysteriet.",
+          "The cooperative runs guided tasting tours.",
+          "Rørosmat er et samvirke som tilbyr matsti gjennom Røros sentrum.",
+          "Andelslaget driver kajakkutleie og guidede padleturer på fjorden.",
+          "Merkevaren står bak en matopplevelse med lokale råvarer i gamle Røros.",
+          "Foreningen arrangerer seiltur med veteranbåten hver søndag.",
+          "Turistforeningen tilbyr fjellturer med overnatting på hytta.",
+          "Produsentsamvirket holder ostekurs for grupper.",
+          "Organisasjonen driver gårdsbutikk med servering av lokal mat.",
+          "Bondelagets lokalforening inviterer til åpen gård med aktiviteter for barn.",
+          "Samvirket har en sykkeltur mellom gårdene med smaksprøver.",
+          "The association organises an annual food festival.",
+          "The brand offers a guided farm visit with cheese tasting.",
+          "Samme organisasjon; beskrivelsen av fjellturen stemmer med kilden.",
+          "Andelslaget arrangerer julemarked og konserter på låven.",
+        ].entries()) {
+          assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation(reason), false, `adm-o5.${i}: org+experience reason "${reason}" -> false`);
+          const d = mod.evaluateContentJudgePromotion({ ...base, description: null }, "MATCH", reason);
+          assertEq(d.judgeReasonOrgOk, true, `adm-o6.${i}: org+experience reason "${reason}" -> judgeReasonOrgOk=true`);
+          assertEq(d.eligible, true, `adm-o7.${i}: org+experience reason "${reason}" -> still eligible`);
+        }
+
+        // Plain experience / neutral reasons (no organisation term) are never
+        // held; neither are null/empty reasons nor org-number mentions.
+        for (const [i, reason] of [
+          "Stemmer godt med kilden.",
+          "Guidet kajakktur langs fjorden, som beskrevet på siden.",
+          "Kilden beskriver en natur- og kulturvandring.",
+          "Same provider and same farm shop; consistent with the source.",
+          "Samme organisasjonsnummer og navn som kilden.",
+          "Gården i Brandbu tilbyr samme produkter.",
+          "",
+          null,
+        ].entries()) {
+          assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation(reason), false, `adm-o8.${i}: reason ${JSON.stringify(reason)} -> false`);
+          const d = mod.evaluateContentJudgePromotion({ ...base, description: noProse }, "MATCH", reason);
+          assertEq(d.judgeReasonOrgOk, true, `adm-o9.${i}: reason ${JSON.stringify(reason)} -> judgeReasonOrgOk=true`);
+        }
+        assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation(undefined), false, "adm-o10: undefined reason -> false");
+
+        // "tur"/"kurs" word-boundary pitfalls: natur/kultur/struktur/konkurs
+        // are NOT experience words, real compounds are.
+        assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation("Organisasjonen for natur og kultur."), true, "adm-o11a: natur/kultur do not count as 'tur'");
+        assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation("Samvirket gikk konkurs."), true, "adm-o11b: konkurs does not count as 'kurs'");
+        assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation("Samvirket tilbyr turer."), false, "adm-o11c: 'turer' counts as experience");
+        assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation("Foreningen holder matkurs."), false, "adm-o11d: 'matkurs' counts as experience");
+        assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation("Hildebrand-organisasjonen."), true, "adm-o11e: org term still detected; 'Hildebrand' is not the word 'brand'");
+        assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation("Brandbu-gården, samme navn."), false, "adm-o11f: 'Brandbu' is not the word 'brand'");
+
+        // judge_reason_org stacks after the other requirements, in order.
+        const dOrgStack = mod.evaluateContentJudgePromotion(
+          { ...base, confidence: "low", description: navDump },
+          "MATCH",
+          "Navigasjonsmeny for et produsentsamvirke.",
+        );
+        assertEq(dOrgStack.missing, ["confidence", "content_quality", "judge_reason_nav", "judge_reason_org"], "adm-o12: judge_reason_org listed last after the other requirements");
       }
 
       // ── Promotion guard through the sweep route (dry-run): a needs_review
@@ -972,6 +1057,8 @@ export function runOpplevelserExperiencesAdmissionPromotionTests(
         assertEq(g?.verdict, "MATCH", "adm-g8a: guard row judged MATCH");
         assertEq(g?.promotion?.content_quality, false, "adm-g8b: dry-run promotion.content_quality=false for the nav-dump row");
         assertEq(g?.promotion?.judge_reason_nav, true, "adm-g8c: dry-run promotion.judge_reason_nav=true (judge reason clean)");
+        assertEq(g?.promotion?.judge_reason_org, true, "adm-g8l: dry-run promotion.judge_reason_org=true (judge reason clean)");
+        assertEq(gReason?.promotion?.judge_reason_org, true, "adm-g8m: nav-reason row promotion.judge_reason_org=true (no organisation term)");
         assertEq(g?.promotion?.status, "held", "adm-g8d: nav-dump row held (not would_promote)");
         assertEq(g?.promotion?.missing, ["content_quality"], "adm-g8e: dry-run promotion.missing=['content_quality']");
       }
