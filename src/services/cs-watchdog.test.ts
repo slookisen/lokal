@@ -104,17 +104,20 @@ export function runCsWatchdogTests(opts: { log?: boolean } = {}): Promise<TestSu
       eq((db.prepare("SELECT forward_payload FROM inbound_email_log WHERE id='inb-ex-40d'").get() as any)?.forward_payload, null, "cw13b: a forward given up on > 30 days ago loses its stored mail body, the row stays");
 
       // ── watchdog ────────────────────────────────────────────────────
-      // Same clock as the forward-retry rows above (inserted relative to T0): with the real
-      // clock, those rows became due for retry once wall time passed T0, and the retry
-      // mail was counted as a watchdog alert (cw14/15/17/18/21 red from 2026-11-11T10:0xZ).
+      // Two clocks meet here. Forward retry and alert de-dup take `now`, and the
+      // forward-retry rows above are relative to T0, so `now` is T0: on the wall clock
+      // those rows became due once real time passed T0, and the retry mail was counted
+      // as a watchdog alert (cw14/15/17/18/21 red from 2026-11-11T10:0xZ). Thread ages
+      // come from SQL julianday('now') (crm-needs-reply), so the thread fixtures below
+      // are relative to the real clock instead.
       const now = new Date(T0.getTime());
       crm.crmService.ingestThread(
         { threadId: "wd-old", subject: "Spørsmål om åpningstider", category: "innkommende",
-          messages: [{ messageId: "wd-old-m", direction: "in", fromEmail: "kunde@x.no", sentAt: hoursBefore(now, 30) }] },
+          messages: [{ messageId: "wd-old-m", direction: "in", fromEmail: "kunde@x.no", sentAt: hoursBefore(new Date(), 30) }] },
         "kunde@x.no", "rfb");
       crm.crmService.ingestThread(
         { threadId: "wd-fresh", subject: "Ny sak", category: "innkommende",
-          messages: [{ messageId: "wd-fresh-m", direction: "in", fromEmail: "kunde2@x.no", sentAt: hoursBefore(now, 1) }] },
+          messages: [{ messageId: "wd-fresh-m", direction: "in", fromEmail: "kunde2@x.no", sentAt: hoursBefore(new Date(), 1) }] },
         "kunde2@x.no", "rfb");
       const alerts: any[] = [];
       const alertSend = async (o: any) => { alerts.push(o); return { success: true }; };
@@ -131,7 +134,7 @@ export function runCsWatchdogTests(opts: { log?: boolean } = {}): Promise<TestSu
       eq([alerts.length, w2.alerted_items], [1, 0], "cw21: a second run does not re-alert the same items");
       crm.crmService.ingestThread(
         { threadId: "wd-old2", subject: "Annen sak", category: "innkommende",
-          messages: [{ messageId: "wd-old2-m", direction: "in", fromEmail: "kunde3@x.no", sentAt: hoursBefore(now, 26) }] },
+          messages: [{ messageId: "wd-old2-m", direction: "in", fromEmail: "kunde3@x.no", sentAt: hoursBefore(new Date(), 26) }] },
         "kunde3@x.no", "rfb");
       const w3 = await cw.runCsWatchdog({ send: alertSend, now: new Date(now.getTime() + 2 * 60_000), adminEmail: "", trigger: "manual" });
       eq([w3.alerted_items, w3.alert_sent], [1, false], "cw22: no admin address → the new item is still counted, alert_sent false");
