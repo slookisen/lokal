@@ -3373,13 +3373,14 @@ export async function runVerifierBatch(opts: {
 // Build a run-envelope payload from verifier results, ready to POST
 // to /admin/runs.
 // dev-request 2026-10-10-rfb-verifier-kapasitet-til-fulle-profiler (point
-// 5): how pickBatchBiased spent this run's slots. Emitted only when at least
-// one result carries pick_slot (i.e. the run used pickBatchBiased), so other
-// pickers' envelopes are unchanged. `custom` claims: report-only counts, not
-// DB-state claims for the snapshot probe. Rows merged in by
-// includeStaleReviewRequired carry no pick_slot and are not counted here.
+// 5): how pickBatchBiased spent this run's slots. `custom` claims:
+// report-only counts, not DB-state claims for the snapshot probe. Rows merged
+// in by includeStaleReviewRequired carry no pick_slot and are not counted here.
+// dev-request 2026-11-11-verifier-ny-verifisering-og-delta-ledd (slice A):
+// always emitted — with 0 counts when no result carries pick_slot (another
+// picker, or an empty batch) — so every lokal-agent-verifier envelope carries
+// the four verifier_slots_* kinds.
 export function pickSlotClaims(results: VerifierResult[]): Array<{ type: "custom"; value: number; meta: { kind: string } }> {
-  if (!results.some((x) => x.pick_slot)) return [];
   const count = (slot: VerifierPickSlot) => results.filter((x) => x.pick_slot === slot).length;
   return [
     { type: "custom", value: count("verified_recheck"), meta: { kind: "verifier_slots_verified_recheck" } },
