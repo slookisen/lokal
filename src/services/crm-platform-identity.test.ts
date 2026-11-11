@@ -134,9 +134,8 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
         }
         // pi8f — reply-to is what preserves the INBOUND discriminator, and
         // nothing pinned it per vertical: swapping dental's to the opplevagent
-        // address left the suite green. A distinctness set would over-constrain
-        // (rfb and dental legitimately share one address today), so the property
-        // is narrower and exact: opplevagent.no belongs to experiences alone.
+        // address left the suite green. The property is narrow and exact:
+        // opplevagent.no belongs to experiences alone (pi8g pins the full map).
         const onOpplevagent = crmMod.CRM_VERTICALS.filter(
           (v) => ident.resolveCrmIdentity(v).replyTo.endsWith("@opplevagent.no"),
         );

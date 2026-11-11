@@ -441,7 +441,10 @@ export function runCsInboundTests(opts: { log?: boolean } = {}): Promise<TestSum
           ci.classifyAutomated({ subject: "Spørsmål om rapport fra Mattilsynet", fromEmail: "kari@testgard.no", headers: H }).kind,
           ci.classifyAutomated({ subject: "Report on our farm", fromEmail: "ola@gard.no", headers: H }).kind,
           ci.classifyAutomated({ subject: "Re: Report domain for nettsiden vår", fromEmail: "ola@gard.no", headers: H }).kind,
-        ], [null, null, null], "ci108: a customer subject that only mentions a report or a domain is never taken for one");
+          ci.classifyAutomated({ subject: "Fwd: Report domain: gard.no Submitter: google.com Report-ID: 123", fromEmail: "ola@gard.no", headers: H }).kind,
+          ci.classifyAutomated({ subject: "DMARC aggregate report – hva betyr dette?", fromEmail: "ola@gard.no", headers: H }).kind,
+          ci.classifyAutomated({ subject: "DMARC Aggregate Report for gard.no – kan dere se på den?", fromEmail: "ola@gard.no", headers: H }).kind,
+        ], [null, null, null, null, null, null], "ci108: a customer subject that only mentions a report or a domain — or forwards a report with a question — is never taken for one");
         const dm = await hook({ email_id: "em-dmarc-1", from: "noreply-dmarc-support@google.com", to: ["kontakt@rettfrabonden.com"], subject: "Report domain: rettfrabonden.com Submitter: google.com Report-ID: 99887766", created_at: hoursAgo(1) });
         const dmRow = logRow("em-dmarc-1");
         eq([dm.code, dmRow?.crm_status, dmRow?.automated_kind, nr.computeNeedsReply({}).threads.some((t) => t.thread_id === dmRow?.crm_thread_id)],

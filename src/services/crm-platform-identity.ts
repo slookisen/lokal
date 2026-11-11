@@ -24,8 +24,8 @@
 //     the recipient actually reads in their inbox list; the address is fine
 //     print. Honest, not impersonation: it IS the same company.
 //   • REPLY-TO — kontakt@opplevagent.no for experiences. This is also what
-//     PRESERVES the inbound discriminator: replies arrive through the
-//     Opplevagent forwarder (ImprovMX) rather than the RFB one (AWS SES), which
+//     PRESERVES the inbound discriminator: replies arrive addressed to the
+//     vertical's own domain (all three receive through Resend inbound), which
 //     is the signal steg 4 sorts on. Without it the whole separation collapses
 //     on the return path (funn 4).
 //

@@ -13,7 +13,7 @@
 //       (marketing thread whose first message is inbound) — a reply to OUR
 //       outreach (marketing thread started outbound) does need an answer,
 //     • its latest inbound is newer than its latest REAL outbound (sent_at),
-//     • that latest inbound is not an automated mail (auto-reply/bounce),
+//     • that latest inbound is not an automated mail (auto-reply/bounce/DMARC or TLS report),
 //     • and nobody marked it «trenger ikke svar» after that inbound.
 //
 // Age is hours since the latest inbound; level P0 ≥ 24 h, P1 ≥ 12 h.

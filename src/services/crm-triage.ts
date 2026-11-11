@@ -68,11 +68,12 @@ type DecidingField = (typeof DECIDING_FIELDS)[number];
 /**
  * The platform aliases. Lowercase keys; lookups lowercase the input.
  *
- * NOT derived from crm-platform-identity's replyTo map, deliberately: dental's
- * replyTo is kontakt@rettfrabonden.com (it has no inbound alias), so deriving
- * this from that table would make kontakt@rettfrabonden.com map to two
- * verticals and every RFB mail permanently "ambiguous". Outbound identity and
- * inbound discriminator are different questions that happen to share strings.
+ * NOT derived from crm-platform-identity's replyTo map, deliberately. Each
+ * vertical has its own inbound alias today (dental's kontakt@finn-tannlege.com
+ * since 2026-11-11), but outbound identity and inbound discriminator are
+ * different questions that happen to share strings: a later replyTo change must
+ * not silently re-route inbound mail, and two verticals sharing a replyTo must
+ * not make every mail to that address permanently "ambiguous".
  */
 const PLATFORM_ADDRESSES: Readonly<Record<string, CrmVertical>> = {
   "kontakt@rettfrabonden.com": "rfb",
