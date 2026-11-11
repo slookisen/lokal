@@ -1056,12 +1056,85 @@ export function runOpplevelserExperiencesAdmissionPromotionTests(
         assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation("Brandbu-gården, samme navn."), false, "adm-o11f: 'Brandbu' is not the word 'brand'");
 
         // judge_reason_org stacks after the other requirements, in order.
+        // (Review r2: judge_reason_org only applies with an EMPTY description,
+        // so the stack test uses description "" — and a nav-dump description
+        // now no longer adds judge_reason_org.)
         const dOrgStack = mod.evaluateContentJudgePromotion(
+          { ...base, confidence: "low", description: "" },
+          "MATCH",
+          "Navigasjonsmeny for et produsentsamvirke.",
+        );
+        assertEq(dOrgStack.missing, ["confidence", "judge_reason_nav", "judge_reason_org"], "adm-o12: judge_reason_org listed last after the other requirements");
+        const dOrgStackDesc = mod.evaluateContentJudgePromotion(
           { ...base, confidence: "low", description: navDump },
           "MATCH",
           "Navigasjonsmeny for et produsentsamvirke.",
         );
-        assertEq(dOrgStack.missing, ["confidence", "content_quality", "judge_reason_nav", "judge_reason_org"], "adm-o12: judge_reason_org listed last after the other requirements");
+        assertEq(dOrgStackDesc.missing, ["confidence", "content_quality", "judge_reason_nav"], "adm-o12b: non-empty description -> judge_reason_org never added");
+
+        // ── Review r2 (lokal#1519): STRUCTURAL GATE — judge_reason_org only
+        // applies when the stored description is empty (null/""/blank).
+        const orgOnlyReasons = [
+          "Rørosmat er et produsentsamvirke/merkevare for lokalmat fra Røros-regionen",
+          "This is a cooperative brand",
+          "Rørosmat er en merkevare.",
+          "RØROSMAT ER ET SAMVIRKE.",
+          "Brand of local food; same organisation.",
+        ];
+        for (const [i, reason] of orgOnlyReasons.entries()) {
+          for (const [j, desc] of [null, "", "   ", "\n\t "].entries()) {
+            const d = mod.evaluateContentJudgePromotion({ ...base, description: desc }, "MATCH", reason);
+            assertEq(d.missing, ["judge_reason_org"], `adm-r2a.${i}.${j}: empty description ${JSON.stringify(desc)} + org-only reason "${reason}" -> held`);
+            assertEq(d.eligible, false, `adm-r2b.${i}.${j}: empty description + org-only reason -> NOT eligible`);
+          }
+          for (const [j, desc] of ["Kort om gården.", noProse, "x"].entries()) {
+            const d = mod.evaluateContentJudgePromotion({ ...base, description: desc }, "MATCH", reason);
+            assertEq(d.judgeReasonOrgOk, true, `adm-r2c.${i}.${j}: non-empty description + org-only reason "${reason}" -> judgeReasonOrgOk=true`);
+            assertEq(d.eligible, true, `adm-r2d.${i}.${j}: non-empty description + org-only reason -> eligible`);
+            assertEq(d.missing, [], `adm-r2e.${i}.${j}: non-empty description -> missing=[]`);
+          }
+        }
+
+        // Hyphenated / soft-hyphenated org terms are detected.
+        for (const [i, reason] of [
+          "Andels-laget i bygda.",
+          "Merke\u00advare for lokalmat.",
+          "Sam-virke for gårdbrukere.",
+          "Sam\u2011virket i dalen.",
+          "A co-operative brand.",
+        ].entries()) {
+          assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation(reason), true, `adm-r2f.${i}: hyphenated org term in "${reason}" detected`);
+          const d = mod.evaluateContentJudgePromotion({ ...base, description: null }, "MATCH", reason);
+          assertEq(d.missing, ["judge_reason_org"], `adm-r2g.${i}: hyphenated org-only reason + empty description -> held`);
+        }
+
+        // Reviewer r2 phrasings (empty description) no longer held thanks to
+        // the added experience terms.
+        for (const [i, reason] of [
+          "Samvirket driver sykkelutleie.",
+          "Andelslaget leier ut båter.",
+          "Samvirket har ysteri-visning for grupper.",
+          "Andelslaget driver sjokoladeverksted.",
+          "Merkevaren driver gjestegård i dalen.",
+          "Samvirket driver pensjonat og vertshus.",
+          "Andelslaget har camping og glamping ved sjøen.",
+          "Samvirket har merket tursti mellom gårdene.",
+          "Andelslaget driver golfbane.",
+          "Samvirket tilbyr hundekjøring og kanoturer.",
+          "Andelslaget arrangerer jakt på småvilt.",
+          "The cooperative runs a guesthouse.",
+          "The cooperative offers accommodation and canoe rental.",
+          "The brand runs a B&B.",
+          "Samvirket driver turløype og turistinformasjon.",
+        ].entries()) {
+          assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation(reason), false, `adm-r2h.${i}: "${reason}" -> describes an experience`);
+          const d = mod.evaluateContentJudgePromotion({ ...base, description: null }, "MATCH", reason);
+          assertEq(d.judgeReasonOrgOk, true, `adm-r2i.${i}: "${reason}" + empty description -> not held`);
+          assertEq(d.eligible, true, `adm-r2j.${i}: "${reason}" + empty description -> eligible`);
+        }
+        // "turn..."/"turb..." are not the prefix "tur".
+        assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation("Samvirket har høy turnover."), true, "adm-r2k: 'turnover' is not 'tur'");
+        assertEq(mod.contentJudgeReasonOnlyDescribesOrganisation("Samvirket eier en turbin."), true, "adm-r2l: 'turbin' is not 'tur'");
       }
 
       // ── Promotion guard through the sweep route (dry-run): a needs_review

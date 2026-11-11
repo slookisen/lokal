@@ -30078,6 +30078,30 @@ export const CONTENT_JUDGE_EXPERIENCE_REASON_TERMS: readonly string[] = [
   "activit",
   "experience",
   "excursion",
+  // Review r2 (lokal#1519): rentals, workshops, lodging, outdoor activities.
+  "utleie",
+  "leier ut",
+  "rental",
+  "ysteri",
+  "visning",
+  "verksted",
+  "gjestegard",
+  "pensjonat",
+  "vertshus",
+  "fjellstu",
+  "glamping",
+  "camping",
+  "campsite",
+  "accommodation",
+  "overnight",
+  "guesthouse",
+  "b&b",
+  "golf",
+  "hundekjoring",
+  "kano",
+  "canoe",
+  "jakt",
+  "hunting",
 ];
 
 /** Per-word experience patterns, tested against each [a-z0-9]+ word of the
@@ -30103,6 +30127,10 @@ export const CONTENT_JUDGE_EXPERIENCE_WORD_PATTERNS: readonly RegExp[] = [
   /markets?$/,
   /trips?$/,
   /pub(?:en|er|s)?$/,
+  // `tur` as a word PREFIX too ("tursti", "turloype", "turveg", "turist"),
+  // except "turn..." (turnover, "in turn") and "turb..." (turbin, turbo) —
+  // see CONTENT_JUDGE_EXPERIENCE_WORD_EXCLUDES.
+  /^tur/,
   /^(?:tour|tours|touring|toured|visit|visits|visiting|visitor|visitors|event|events|trail|trails|hike|hikes|hiking|hiker|hikers|zoo|zoos)$/,
 ];
 export const CONTENT_JUDGE_EXPERIENCE_WORD_EXCLUDES: readonly RegExp[] = [
@@ -30110,6 +30138,8 @@ export const CONTENT_JUDGE_EXPERIENCE_WORD_EXCLUDES: readonly RegExp[] = [
   /markedsfor/,
   /markedsandel/,
   /strips?$/,
+  /^turn/,
+  /^turb/,
 ];
 
 /** True iff the judge's reason describes a producer cooperative / brand
@@ -30122,9 +30152,14 @@ export function contentJudgeReasonOnlyDescribesOrganisation(reason: string | nul
   if (!reason) return false;
   const folded = stripNorwegianAccentsForJudgeReason(reason.toLowerCase()).replace(/\s+/g, " ");
   const words = folded.match(/[a-z0-9]+/g) ?? [];
+  // Org terms are matched with ASCII hyphens, soft hyphens (U+00AD) and
+  // non-breaking hyphens (U+2011) removed, so "andels-laget", "Merke\u00advare"
+  // and "Sam-virke" are detected ("co-operative" -> "cooperative" on both sides).
+  const dehyphen = (x: string) => x.replace(/[-\u00ad\u2011]/g, "");
+  const orgFolded = dehyphen(folded);
   const mentionsOrg =
-    CONTENT_JUDGE_ORG_REASON_TERMS.some((t) => folded.includes(stripNorwegianAccentsForJudgeReason(t))) ||
-    CONTENT_JUDGE_ORG_REASON_PATTERNS.some((p) => p.test(folded)) ||
+    CONTENT_JUDGE_ORG_REASON_TERMS.some((t) => orgFolded.includes(dehyphen(stripNorwegianAccentsForJudgeReason(t)))) ||
+    CONTENT_JUDGE_ORG_REASON_PATTERNS.some((p) => p.test(orgFolded)) ||
     words.some((w) => CONTENT_JUDGE_ORG_REASON_WORDS.includes(w));
   if (!mentionsOrg) return false;
   const mentionsExperience =
@@ -30149,9 +30184,10 @@ export type ContentJudgePromotionDecision = {
   contentQualityOk: boolean;
   /** `judge_reason_nav`: the judge's reason does not mention nav/menu chrome. */
   judgeReasonNavOk: boolean;
-  /** `judge_reason_org`: the judge's reason does not ONLY describe a
-   *  producer cooperative/brand without any experience
-   *  (contentJudgeReasonOnlyDescribesOrganisation). */
+  /** `judge_reason_org`: the row has a non-empty description, OR the judge's
+   *  reason does not ONLY describe a producer cooperative/brand without any
+   *  experience (contentJudgeReasonOnlyDescribesOrganisation). Always true
+   *  when the stored description is non-empty. */
   judgeReasonOrgOk: boolean;
   missing: string[];
   eligible: boolean;
@@ -30177,6 +30213,15 @@ export type ContentJudgePromotionDecision = {
  *    producer cooperative / brand (samvirke, andelslag, merkevare, ...) with no
  *    experience at all (contentJudgeReasonOnlyDescribesOrganisation) — such
  *    a MATCH says only "same provider" (prod row 73f9ed8c, 2026-11-11).
+ *    STRUCTURAL GATE (review r2, lokal#1519): applies ONLY when the row's
+ *    trimmed `description` is EMPTY (null/blank). With a non-empty
+ *    description `judgeReasonOrgOk` is always true, whatever the reason
+ *    says. Why: two independent reviews (r1, r2) found ~50% false holds on
+ *    real experiences run by cooperatives/brands/associations with every
+ *    word list tried — an experience word list is never complete. An empty
+ *    description + an org-only reason is the actual failure (73f9ed8c had an
+ *    empty description): the judge then had nothing to compare but "same
+ *    organisation". A row with a real description never depends on the list.
  */
 export function evaluateContentJudgePromotion(
   row: Pick<ContentJudgeSweepRow, "verification_status" | "confidence" | "evidence_url_verification" | "p_brreg_active" | "p_field_provenance" | "description">,
@@ -30192,7 +30237,7 @@ export function evaluateContentJudgePromotion(
   const description = typeof row.description === "string" ? row.description.trim() : "";
   const contentQualityOk = description === "" || !looksLikeNavBoilerplate(description);
   const judgeReasonNavOk = !contentJudgeReasonMentionsNav(judgeReason);
-  const judgeReasonOrgOk = !contentJudgeReasonOnlyDescribesOrganisation(judgeReason);
+  const judgeReasonOrgOk = description !== "" || !contentJudgeReasonOnlyDescribesOrganisation(judgeReason);
   const missing: string[] = [];
   if (!judgeOk) missing.push("judge");
   if (!brregActiveOk) missing.push("brreg_active");
