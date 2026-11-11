@@ -330,7 +330,8 @@ export function normalizeSubject(s: string | null | undefined): string {
   const PREFIX = /^(((re|sv|aw|vs|fw|fwd|vb|videresend|videresendt|wg|tr)\s*(\[\d+\])?\s*:)|\[innkommende\])\s*/i;
   for (let i = 0; i < 10 && PREFIX.test(t); i++) t = t.replace(PREFIX, "").trim();
   // The forward appends « (fra <sender>)»; a reply to the forward keeps it.
-  t = t.replace(/\s*\(fra [^()]*\)\s*$/i, "").trim();
+  const f = forwardSuffix(t);
+  if (f) t = t.slice(0, f.start).trim();
   return t.toLowerCase();
 }
 
@@ -393,13 +394,19 @@ export function findThreadForInbound(input: {
 
 // ─── Aliases (Gmail thread id → server thread id) ─────────────────────
 
-export function resolveThreadAlias(id: string): string {
+/**
+ * The server thread a Gmail thread id is an alias of, or the id itself.
+ * `strict` lets a DB error through: /ingest must answer 500 (the caller
+ * retries) rather than file the messages on the Gmail thread id.
+ */
+export function resolveThreadAlias(id: string, opts: { strict?: boolean } = {}): string {
   try {
     const r = getDb().prepare("SELECT thread_id FROM crm_thread_aliases WHERE alias_id = ?").get(id) as
       | { thread_id: string }
       | undefined;
     return r?.thread_id ?? id;
-  } catch {
+  } catch (e) {
+    if (opts.strict) throw e;
     return id;
   }
 }
@@ -436,10 +443,74 @@ export function isOurPlatformAddress(email: string | null | undefined): boolean 
   return Object.keys(INBOUND_DOMAIN_VERTICALS).some((o) => d === o || d.endsWith("." + o));
 }
 
+/**
+ * The trailing «(fra …)» the forward appends to a subject, with balanced
+ * parentheses, so a sender name such as «Mail Delivery System (Gmail)» is
+ * kept whole. Null when the subject does not end in one.
+ */
+export function forwardSuffix(subject: string | null | undefined): { start: number; inner: string } | null {
+  const s = (subject ?? "").replace(/\s+$/, "");
+  if (!s.endsWith(")")) return null;
+  const lower = s.toLowerCase();
+  let i = lower.lastIndexOf("(fra ");
+  for (let tries = 0; i >= 0 && tries < 5; tries++) {
+    let depth = 0;
+    let closesAtEnd = false;
+    for (let j = i; j < s.length; j++) {
+      if (s[j] === "(") depth++;
+      else if (s[j] === ")" && --depth === 0) {
+        closesAtEnd = j === s.length - 1;
+        break;
+      }
+    }
+    if (closesAtEnd) return { start: i, inner: s.slice(i + 5, s.length - 1) };
+    i = i > 0 ? lower.lastIndexOf("(fra ", i - 1) : -1;
+  }
+  return null;
+}
+
 /** «[Innkommende] X (fra …)» → «X»: the forward's own decoration off a subject before classifying it. */
 export function stripForwardSubject(subject: string | null): string | null {
   if (!subject) return subject;
-  return subject.replace(/^\s*\[Innkommende\]\s*/i, "").replace(/\s*\(fra [^()]*\)\s*$/i, "");
+  const t = subject.replace(/^\s*\[Innkommende\]\s*/i, "");
+  const f = forwardSuffix(t);
+  return f ? t.slice(0, f.start).replace(/\s+$/, "") : t;
+}
+
+/**
+ * The original sender a forward names at the end of its subject:
+ * «… (fra Name <addr>)» or «… (fra addr)». Null without that suffix.
+ */
+export function forwardOriginalSender(subject: string | null | undefined): { email: string | null; name: string } | null {
+  const f = forwardSuffix(subject);
+  if (!f) return null;
+  const inner = f.inner.trim();
+  const angles = [...inner.matchAll(/<([^<>\s]+@[^<>\s]+)>/g)];
+  const bare = /^([^\s<>@]+@[^\s<>@]+)$/.exec(inner);
+  const email = (angles.length ? angles[angles.length - 1][1] : bare?.[1] ?? null)?.toLowerCase() ?? null;
+  const name = inner.replace(/<[^<>]*>/g, "").replace(/^"+|"+$/g, "").trim();
+  return { email, name };
+}
+
+/**
+ * classifyAutomated for the Gmail copy of a forward. The copy is sent from
+ * our own address, so the original sender is read from «(fra …)» in its
+ * subject: a bounce from «Mail Delivery Subsystem <mailer-daemon@…>» stays a
+ * bounce when its log row is gone.
+ */
+export function classifyForwardCopy(input: { subject: string | null | undefined; fromEmail: string; headers: InboundHeaders }): {
+  kind: AutomatedKind;
+  reason: string | null;
+} {
+  const orig = forwardOriginalSender(input.subject);
+  const r = classifyAutomated({
+    subject: stripForwardSubject(input.subject ?? null),
+    fromEmail: orig?.email ?? input.fromEmail,
+    headers: input.headers,
+  });
+  if (r.kind !== null || !orig?.name) return r;
+  if (BOUNCE_SUBJECT_RE.test(orig.name)) return { kind: "bounce", reason: "bounce sender name" };
+  return r;
 }
 
 export type MarkerTarget =

@@ -68,6 +68,7 @@
 // bounce diagnostic (bounce.message — the remote MTA's text) is kept, capped,
 // in email_bounces.reason only, for the enrichment agent's investigation.
 
+import { recordMessageDelivery } from "./crm-delivery-status";
 import crypto from "crypto";
 import { getDb } from "../database/init";
 import { getDb as getVerticalDb } from "../database/db-factory";
@@ -223,6 +224,17 @@ export function processResendWebhookEvent(svixId: string, event: any): ResendWeb
       console.warn(`[resend-webhook] delivery attribution failed (delivery recorded without it): ${err?.message ?? err}`);
     }
   }
+  // S3 (CS på serveren): which CRM message a bounce / complaint / soft bounce
+  // belongs to — same recipient + time rule as a delivery. Read-only, best effort.
+  let verdictCrmMessageId: string | null = null;
+  if (email && outcome !== "ambiguous_recipient") {
+    try {
+      const acceptedAt = [data?.created_at, event?.created_at].map((v) => parseDbTime(v)).find((t) => Number.isFinite(t));
+      verdictCrmMessageId = resolveVerdictCrmMessage(email, new Date(acceptedAt ?? Date.now()), data?.subject);
+    } catch (err: any) {
+      console.warn(`[resend-webhook] message attribution failed (event recorded without it): ${err?.message ?? err}`);
+    }
+  }
   let duplicate = false;
   db.transaction(() => {
     if (ledger.run(svixId, type, email, outcome).changes === 0) {
@@ -230,6 +242,20 @@ export function processResendWebhookEvent(svixId: string, event: any): ResendWeb
       return;
     }
     const resendEmailId = typeof data?.email_id === "string" ? data.email_id.slice(0, 128) : undefined;
+    if (verdictCrmMessageId) {
+      recordMessageDelivery({
+        crmMessageId: verdictCrmMessageId,
+        status:
+          outcome === "delivery_recorded" ? "delivered"
+          : outcome === "complaint_recorded" ? "complained"
+          : outcome === "hard_bounce_recorded" ? "bounced"
+          : "soft_bounced",
+        eventType: type,
+        detail: type === "email.bounced" ? `${bounceKind || "?"}${bounceSubType ? "/" + bounceSubType : ""}` : null,
+        svixId,
+        at: isoOrNow(event?.created_at ?? data?.created_at),
+      });
+    }
     if (outcome === "delivery_recorded") {
       // Address only — no subject/from/body/headers.
       db.prepare(
@@ -454,6 +480,45 @@ export function resolveDeliveryCrmMessage(email: string, acceptedAt: Date): stri
     if (parseRecipientList(r.to_emails).includes(email)) return r.id;
   }
   return null;
+}
+
+/**
+ * S3 (CS på serveren): the CRM message a delivery VERDICT (delivered / bounced /
+ * complained) belongs to. Stricter than resolveDeliveryCrmMessage, because a
+ * verdict changes what the CRM shows (a bounced reply puts its thread back
+ * in «trenger svar»): the subject must match when Resend gives one, and two
+ * candidate sends within VERDICT_AMBIGUITY_MS of each other make it
+ * ambiguous → null (no verdict recorded rather than a wrong one).
+ */
+export const VERDICT_AMBIGUITY_MS = 10 * 60_000;
+function normSubject(s: unknown): string {
+  return typeof s === "string" ? s.replace(/\s+/g, " ").trim().toLowerCase() : "";
+}
+export function resolveVerdictCrmMessage(email: string, acceptedAt: Date, subject: unknown): string | null {
+  const hi = acceptedAt.getTime() + BOUNCE_ATTRIBUTION_CLOCK_SLACK_MS;
+  const lo = acceptedAt.getTime() - DELIVERY_ATTRIBUTION_LOOKBACK_DAYS * 86400_000;
+  const toSql = (ms: number) => new Date(ms).toISOString().slice(0, 19).replace("T", " ");
+  const like = "%" + email.toLowerCase().replace(/[\\%_]/g, (c) => "\\" + c) + "%";
+  const rows = getDb()
+    .prepare(
+      `SELECT id, to_emails, sent_at, subject FROM crm_messages
+        WHERE direction = 'out' AND sent_at IS NOT NULL
+          AND datetime(sent_at) >= datetime(?) AND datetime(sent_at) <= datetime(?)
+          AND LOWER(to_emails) LIKE ? ESCAPE '\\'
+        ORDER BY datetime(sent_at) DESC, rowid DESC
+        LIMIT ${DELIVERY_CANDIDATE_LIMIT}`,
+    )
+    .all(toSql(lo), toSql(hi), like) as Array<{ id: string; to_emails: string | null; sent_at: string; subject: string | null }>;
+  const want = normSubject(subject);
+  const cands = rows.filter((r) => {
+    const at = parseDbTime(r.sent_at);
+    if (!Number.isFinite(at) || at < lo || at > hi) return false;
+    if (!parseRecipientList(r.to_emails).includes(email)) return false;
+    return !want || normSubject(r.subject) === want;
+  });
+  if (cands.length === 0) return null;
+  if (cands.length > 1 && Math.abs(parseDbTime(cands[0].sent_at) - parseDbTime(cands[1].sent_at)) < VERDICT_AMBIGUITY_MS) return null;
+  return cands[0].id;
 }
 
 export interface EmailDeliveryEvent {

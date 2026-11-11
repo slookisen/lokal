@@ -1,3 +1,4 @@
+import { deliveryForMessages } from "./crm-delivery-status";
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
 import { getDb as getVerticalDb } from "../database/db-factory";
@@ -1220,7 +1221,10 @@ class CrmService {
       ORDER BY created_at DESC
     `).all(threadId);
 
-    return { thread, messages, actions };
+    // S3 (CS på serveren): Resend's verdict per outbound message, keyed by message id.
+    const deliveries = deliveryForMessages((messages as Array<{ id: string; direction: string }>).filter((m) => m.direction === "out").map((m) => m.id));
+
+    return { thread, messages, actions, deliveries };
   }
 
   /**

@@ -45073,6 +45073,74 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── dev-request 2026-11-10-cs-paa-serveren: S2 (svarforslag, sendejobb, godkjenningskø, utboks) ──");
+  try {
+    const { runCsReplyProposalsTests } = require("../src/services/cs-reply-proposals.test") as
+      typeof import("../src/services/cs-reply-proposals.test");
+    const crp = await runCsReplyProposalsTests({ log: false });
+    passed += crp.passed;
+    failed += crp.failed;
+    for (const f of crp.failures) failures.push("cs-reply-proposals: " + f);
+    console.log(`  cs-reply-proposals: ${crp.passed} passed, ${crp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("cs-reply-proposals: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ cs-reply-proposals: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-10-cs-paa-serveren: S3 (leveringsstatus per CRM-melding) ──");
+  try {
+    const { runCrmDeliveryStatusTests } = require("../src/services/crm-delivery-status.test") as
+      typeof import("../src/services/crm-delivery-status.test");
+    const cds = await runCrmDeliveryStatusTests({ log: false });
+    passed += cds.passed;
+    failed += cds.failed;
+    for (const f of cds.failures) failures.push("crm-delivery-status: " + f);
+    console.log(`  crm-delivery-status: ${cds.passed} passed, ${cds.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-delivery-status: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ crm-delivery-status: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-10-cs-paa-serveren: S5 (kontaktskjema: kvittering, avviste innsendinger) ──");
+  try {
+    const { runContactFormCsTests } = require("../src/services/contact-form-cs.test") as
+      typeof import("../src/services/contact-form-cs.test");
+    const cft = await runContactFormCsTests({ log: false });
+    passed += cft.passed;
+    failed += cft.failed;
+    for (const f of cft.failures) failures.push("contact-form-cs: " + f);
+    console.log(`  contact-form-cs: ${cft.passed} passed, ${cft.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("contact-form-cs: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ contact-form-cs: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-10-cs-paa-serveren: S4 (endringer og fjerning, utført og verifisert av serveren) ──");
+  try {
+    const { runCsChangeRequestsTests } = require("../src/services/cs-change-requests.test") as
+      typeof import("../src/services/cs-change-requests.test");
+    const cct = await runCsChangeRequestsTests({ log: false });
+    passed += cct.passed;
+    failed += cct.failed;
+    for (const f of cct.failures) failures.push("cs-change-requests: " + f);
+    console.log(`  cs-change-requests: ${cct.passed} passed, ${cct.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("cs-change-requests: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ cs-change-requests: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-07-27-crm-plattformadskillelse: steg 4 (innkommende triage + utriaged-bøtte) ──");
   try {
     const { runCrmTriageTests } = require("../src/services/crm-triage.test") as
