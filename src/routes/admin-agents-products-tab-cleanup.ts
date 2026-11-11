@@ -8,6 +8,12 @@
 // dry run, so this is the honest, previewable, audited lever for that one
 // defect. ONE profile per call.
 //
+// In short: a split price is stored as TEXT «kr 95» + priceUnit "kr" (the
+// ProductInfo.price string form, not the number 95), and the apply also
+// renames / retires the matching rows of the `products` catalog table
+// (only this agent's rows; a referenced row is set out_of_stock, never
+// deleted) — both detailed below.
+//
 // Body: { agent_id: string, apply?: boolean }  (?apply=1|true also applies —
 // isExplicitApply, shared with duplicate-merge). Dry run by default; a dry
 // run writes nothing.

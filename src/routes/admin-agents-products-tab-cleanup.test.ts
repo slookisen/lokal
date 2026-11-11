@@ -312,6 +312,57 @@ export function runAdminAgentsProductsTabCleanupTests(opts: { log?: boolean } = 
           "malformed products -> skipped, nothing written");
       }
 
+      // ── catalog safety branches ───────────────────────────────────────
+      {
+        agent("cat", [SOLBAER, AQUAVIT, MARVPOSTEI, KJEKS, SPEKEPOLSE]);
+        agent("neighbour", [EGG]);
+        // SOLBAER: old row referenced by a cart item AND the cleaned name already
+        //   has its own catalog row -> retire_out_of_stock (no rename, no 500).
+        insertCatalog.run("c-solbaer-old", "cat", SOLBAER.name, "solbærsyltetøy syltetøy 95 kr ikke oppgitt");
+        insertCatalog.run("c-solbaer-new", "cat", "Solbærsyltetøy", "solbærsyltetøy");
+        db.prepare(`INSERT INTO cart_items (id, cart_id, product_id, agent_id, qty) VALUES ('ci1', 'cart1', 'c-solbaer-old', 'cat', 1)`).run();
+        // AQUAVIT: removed row referenced by a cart wish -> retire_out_of_stock.
+        insertCatalog.run("c-aquavit", "cat", AQUAVIT.name, "aquavitgelé gelé 110 kr ikke oppgitt");
+        db.prepare(`INSERT INTO cart_wishes (id, cart_id, term, qty, chosen_product_id) VALUES ('cw1', 'cart2', 'gelé', 1, 'c-aquavit')`).run();
+        // KJEKS: unreferenced old row, cleaned name already in the catalog -> retire_delete.
+        insertCatalog.run("c-kjeks-old", "cat", KJEKS.name, "havrekjeks kjeks ikke oppgitt ikke oppgitt");
+        insertCatalog.run("c-kjeks-new", "cat", "Havrekjeks", "havrekjeks");
+        // MARVPOSTEI: only ANOTHER producer has a row with the old key, and
+        //   another producer has rows with the new keys -> neither is touched.
+        insertCatalog.run("n-marv-old", "neighbour", MARVPOSTEI.name, "marvpostei postei 85 kr ikke oppgitt");
+        insertCatalog.run("n-speke-new", "neighbour", "Spekepølse", "spekepølse");
+        // SPEKEPOLSE: own old row, no refs, new key free for THIS agent -> rename_in_place.
+        insertCatalog.run("c-speke-old", "cat", SPEKEPOLSE.name, "spekepølse spekemat 120 kr/kg fra september");
+        const row = (id: string) => db.prepare(`SELECT * FROM products WHERE id = ?`).get(id) as any;
+        const neighbourBefore = JSON.stringify(db.prepare(`SELECT * FROM products WHERE agent_id = 'neighbour' ORDER BY id`).all());
+        const keptNewBefore = JSON.stringify([row("c-solbaer-new"), row("c-kjeks-new")]);
+
+        const d = await call({ agent_id: "cat" });
+        const act = (i: number) => d.body.rows.find((r: any) => r.index === i)?.catalog?.action;
+        assertEq([act(0), act(1), act(2), act(3), act(4)],
+          ["retire_out_of_stock", "retire_out_of_stock", "none", "retire_delete", "rename_in_place"], "catalog dry run: planned actions");
+        assertEq(d.body.rows.find((r: any) => r.index === 0).catalog.references, { cart_items: 1, cart_wishes: 0 }, "catalog dry run: cart_items reference counted");
+        assertEq(d.body.rows.find((r: any) => r.index === 1).catalog.references, { cart_items: 0, cart_wishes: 1 }, "catalog dry run: cart_wishes reference counted");
+        assertEq(d.body.rows.find((r: any) => r.index === 0).catalog.existing_product_id, "c-solbaer-new", "catalog dry run: existing new-name row reported");
+        assertEq(row("c-solbaer-old").availability, "in_stock", "catalog dry run: availability untouched");
+
+        const r = await call({ agent_id: "cat", apply: true });
+        assertEq([r.status, r.body.outcome], [200, "written"], "catalog apply: new name already in catalog -> no 500, written");
+        assertEq(audits("cat").length, 1, "catalog apply: audit row written");
+        assertTrue(!storedProducts("cat").includes("\\t"), "catalog apply: products cleaned");
+        const so = row("c-solbaer-old");
+        assertEq(so ? [so.name_norm, so.availability] : null, ["solbærsyltetøy syltetøy 95 kr ikke oppgitt", "out_of_stock"],
+          "catalog apply: cart_items-referenced row kept, availability = out_of_stock");
+        const aq = row("c-aquavit");
+        assertEq(aq ? aq.availability : null, "out_of_stock", "catalog apply: cart_wishes-referenced row kept, availability = out_of_stock");
+        assertEq(row("c-kjeks-old"), undefined, "catalog apply: unreferenced old row with existing new name -> deleted");
+        assertEq(JSON.stringify([row("c-solbaer-new"), row("c-kjeks-new")]), keptNewBefore, "catalog apply: existing new-name rows byte-identical");
+        const sp = row("c-speke-old");
+        assertEq(sp ? [sp.name, sp.name_norm] : null, ["Spekepølse", "spekepølse"], "catalog apply: own row renamed in place");
+        assertEq(JSON.stringify(db.prepare(`SELECT * FROM products WHERE agent_id = 'neighbour' ORDER BY id`).all()), neighbourBefore,
+          "catalog apply: another producer's rows with the same name_norm byte-identical");
+      }
+
       // ── query-string apply ────────────────────────────────────────────
       {
         agent("q", [SOLBAER]);
