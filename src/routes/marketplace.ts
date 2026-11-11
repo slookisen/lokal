@@ -74,6 +74,7 @@ import { issueOwnerSessionForSelgerLogin } from "./owner-portal";
 import { revokeOwnerAccessExceptVerifiedOwners } from "../services/owner-access-revocation";
 import { HOMEPAGE_CONTACT_PROVENANCE_EXCLUSION_SQL } from "../services/homepage-contact-provenance";
 import { emailWithheldIds, withKnowledgeEmailNull } from "../services/email-reveal-guard";
+import { rfbEmailHiddenIds } from "../services/contact-form-only";
 import { hasContactRetentionMarkers } from "../services/privacy-retention";
 import { invalidateAgentGeocode } from "../services/agent-geocode-reset";
 import { scheduleRegistrationConfirmation } from "../services/registration-confirmation";
@@ -302,9 +303,15 @@ function contactBlockWithoutEmail<T extends ContactBlock | null>(block: T): T {
   return { ...block, email: null };
 }
 
-/** The list's contact blocks with the e-mail left out where this request is over the rfb limit (switch off: as given). */
+// S-D2 (dev-request 2026-09-09-…, «Kontaktskjema som valg per profil»): with
+// CONTACT_FORM_RFB on, a profile with agents.contact_form_only = 1 has its
+// e-mail left out of these answers the same way (rfbEmailHiddenIds,
+// services/contact-form-only.ts) and spends no budget. Switch off: the flag
+// is not read.
+
+/** The list's contact blocks with the e-mail left out where this request is over the rfb limit or the profile is contact-form-only (switches off: as given). */
 function guardContactBlocks<T extends { agentId: string; contact: ContactBlock | null }>(req: Request, res: Response, rows: T[]): T[] {
-  const withheld = emailWithheldIds(req, res, "rfb", rows.filter((r) => !!r.contact?.email).map((r) => r.agentId));
+  const withheld = rfbEmailHiddenIds(req, res, rows.filter((r) => !!r.contact?.email).map((r) => r.agentId));
   if (!withheld || withheld.size === 0) return rows;
   return rows.map((r) => (withheld.has(r.agentId) ? { ...r, contact: contactBlockWithoutEmail(r.contact) } : r));
 }
@@ -1126,11 +1133,12 @@ router.get("/agents/:id/vcard", (req: Request, res: Response) => {
     res.status(404).json({ success: false, error: "Agent ikke funnet" });
     return;
   }
-  // S-A5: the EMAIL line follows the rfb per-IP limit (see guardContactBlocks).
+  // S-A5: the EMAIL line follows the rfb per-IP limit (see guardContactBlocks);
+  // S-D2: no EMAIL line for a contact-form-only profile (CONTACT_FORM_RFB on).
   let emailGuarded = false;
   const vcard = buildVCard(agentId, (id) => {
     emailGuarded = true;
-    return !emailWithheldIds(req, res, "rfb", [id])?.has(id);
+    return !rfbEmailHiddenIds(req, res, [id])?.has(id);
   });
   if (!vcard) {
     res.status(404).json({ success: false, error: "Agent ikke funnet" });
@@ -1193,8 +1201,9 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
     if (cityName) contact.city = cityName;
     contact.country = "Norway";
     if (isDisplayablePhone(k.phone)) contact.phone = k.phone;
-    // S-A5: the e-mail follows the rfb per-IP limit (see guardContactBlocks).
-    const emailWithheld = emailWithheldIds(req, res, "rfb", k.email ? [agentId] : []);
+    // S-A5: the e-mail follows the rfb per-IP limit (see guardContactBlocks);
+    // S-D2: left out for a contact-form-only profile (CONTACT_FORM_RFB on).
+    const emailWithheld = rfbEmailHiddenIds(req, res, k.email ? [agentId] : []);
     if (k.email && !emailWithheld?.has(agentId)) contact.email = k.email;
     if (k.website) contact.website = addUtmParams(k.website);
     if (Object.keys(contact).length > 1) card.contact = contact;
@@ -1795,7 +1804,9 @@ router.get("/agents/:id/info", (req: Request, res: Response) => {
   // S-A5: knowledge.email follows the rfb per-IP limit (see
   // guardContactBlocks); withheld it reads null, as a producer without one.
   // The owner's own /selger read (X-Claim-Token) is not limited.
-  const infoEmailWithheld = emailWithheldIds(req, res, "rfb", info.knowledge.email && !isOwnerRead ? [agentId] : []);
+  // S-D2: null for a contact-form-only profile (CONTACT_FORM_RFB on), except
+  // in the owner's own read.
+  const infoEmailWithheld = rfbEmailHiddenIds(req, res, info.knowledge.email && !isOwnerRead ? [agentId] : []);
   if (infoEmailWithheld?.has(agentId)) info = withKnowledgeEmailNull(info);
   const data = {
     ...info,

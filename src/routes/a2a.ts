@@ -34,7 +34,8 @@ import { capFreeText } from "../utils/free-text";
 import { logInternalError, rpcInternalErrorReply } from "../utils/internal-error";
 import { searchCountable } from "../services/search-tracking";
 import { publicAgentInfo, publicFieldChoices } from "../owner-features/enforce";
-import { emailWithheldIds, withKnowledgeEmailNull } from "../services/email-reveal-guard";
+import { emailRevealGuardEnabled, withKnowledgeEmailNull } from "../services/email-reveal-guard";
+import { rfbEmailHiddenIds } from "../services/contact-form-only";
 import { guardConversationEmails, messageForListener, liveStreamCacheControl } from "../services/conversation-email-guard";
 import { readSearchText, geocodeSearchPlace, discoveryQueryOf, outsideNorwayText, noProductMatchText } from "../services/rfb-search-reading";
 import {
@@ -806,8 +807,9 @@ function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
   // REST answers share (switch EMAIL_REVEAL_GUARD_RFB, default off). Over
   // the limit, or for CCBot, it reads null as for a producer without one.
   // Switch on: Cache-Control: private. Switch off: nothing changes.
+  // S-D2: null for a contact-form-only profile too (CONTACT_FORM_RFB on).
   let shown = publicAgentInfo(info, publicFieldChoices(agentId));
-  const emailWithheld = emailWithheldIds(req, res, "rfb", shown.knowledge.email ? [String(agentId)] : []);
+  const emailWithheld = rfbEmailHiddenIds(req, res, shown.knowledge.email ? [String(agentId)] : []);
   if (emailWithheld?.has(String(agentId))) shown = withKnowledgeEmailNull(shown);
 
   res.json({
@@ -936,8 +938,9 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
     // S-A5 (RFB A2A): x-knowledge.email follows the rfb per-IP limit (as
     // agent/info above); withheld it is left out as for a producer without
     // one. Switch on: Cache-Control: private instead of public. Off: as before.
+    // S-D2: left out for a contact-form-only profile too (CONTACT_FORM_RFB on).
     const agentId = req.params.id as string;
-    const emailWithheld = emailWithheldIds(req, res, "rfb", knowledge.email ? [agentId] : []);
+    const emailWithheld = rfbEmailHiddenIds(req, res, knowledge.email ? [agentId] : []);
     const enriched: Record<string, any> = { ...card };
     enriched["x-knowledge"] = {
       address: knowledge.address,
@@ -975,7 +978,9 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
     for (const key of Object.keys(xk)) {
       if (xk[key] === undefined || xk[key] === null) delete xk[key];
     }
-    res.header("Cache-Control", emailWithheld === null ? "public, max-age=1800" : "private");
+    // Private only when the per-IP guard is on (the answer then varies by
+    // client); S-D2's contact-form flag is per profile, so it stays public.
+    res.header("Cache-Control", emailRevealGuardEnabled("rfb") ? "private" : "public, max-age=1800");
     res.json(enriched);
     return;
   }

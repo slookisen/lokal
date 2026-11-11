@@ -52858,6 +52858,8 @@ runSerial(async () => {
 // S-D1 adds the contact-form option per RFB profile (CONTACT_FORM_RFB, default
 // off; flagged profile → form instead of e-mail, POST /produsent/:slug/kontakt
 // forwards via a stubbed sender).
+// S-D2 hides a flagged profile's e-mail in the RFB REST and A2A answers too
+// (same switch; MCP untouched; the buyer's own order keeps it).
 // Switch off = byte-identical answers. Sets env
 // flags and swaps the dental db-factory (restored in finally) — runSerial,
 // tail position.
@@ -52884,6 +52886,8 @@ runSerial(async () => {
     ["dental mcp email reveal", () => (require("../src/routes/dental-mcp-email-reveal.test") as typeof import("../src/routes/dental-mcp-email-reveal.test")).runDentalMcpEmailRevealTests({ log: false })],
     // S-D1: «Kontaktskjema som valg per profil» on rettfrabonden.com — agents.contact_form_only (admin POST /admin/agents/:id/contact-form-only), the form on /produsent/:slug and POST /produsent/:slug/kontakt (CONTACT_FORM_RFB; switch off = byte-identical; stubbed sender, no network).
     ["rfb contact form only", () => (require("../src/routes/rfb-contact-form-only.test") as typeof import("../src/routes/rfb-contact-form-only.test")).runRfbContactFormOnlyTests({ log: false })],
+    // S-D2: a contact-form-only profile's e-mail left out of the RFB REST + A2A answers (card/info/vcard, search/discover, cart submit handoffs, catalog offers, agent.json, A2A agent/info, conversations; CONTACT_FORM_RFB; switch off = byte-identical; buyer's own order keeps it; MCP untouched).
+    ["rfb contact form only s-d2", () => (require("../src/routes/rfb-contact-form-only-sd2.test") as typeof import("../src/routes/rfb-contact-form-only-sd2.test")).runRfbContactFormOnlySd2Tests({ log: false })],
   ] as Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]>) {
     try {
       const r = await load();
