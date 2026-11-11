@@ -9,6 +9,22 @@
 //   * dry-run by DEFAULT. `apply` must be an explicit truthy form.
 //   * Row-level lock: if EITHER agent in the pair has `agents.claimed_at`,
 //     the WHOLE PAIR is skipped (`skipped_claimed`) — neither row is touched.
+//     Per-pair opt-in `allow_claimed_survivor: true` (strict boolean `true`
+//     only) lifts this for the SURVIVOR side alone: the pair is then not
+//     skipped merely because the survivor is claimed. A claimed DUPLICATE is
+//     ALWAYS `skipped_claimed`, with or without the option. Everything else
+//     (fill-only, the survivor's curated_fields per-field lock, provenance
+//     append, audit rows, duplicate deactivation) is unchanged — a claimed
+//     survivor's owner-set values are never overwritten because fill-only
+//     only writes blank fields and curated fields are skipped. The duplicate's
+//     own curated_fields are never consulted (it is only read, then
+//     deactivated). The option is honoured on both the dry-run plan and the
+//     in-transaction re-check on apply. Any present value other than the
+//     booleans true/false (e.g. "true", 1) rejects that item as
+//     `rejected_invalid_item` (detail `allow_claimed_survivor_must_be_boolean`)
+//     so a caller never believes it opted in when it did not. When the option
+//     is true the result item echoes `allow_claimed_survivor: true`; without
+//     it (absent or false) the result item is exactly as before.
 //   * Per-field lock: `agent_knowledge.curated_fields` on the SURVIVOR is
 //     checked before filling each field. A locked field is skipped on its
 //     own (`skipped_curated_field:<name>`) — it does not abort the pair.
@@ -552,12 +568,28 @@ interface PairResult {
   detail?: string;
 }
 
+/**
+ * Row-level claim lock. A claimed duplicate always blocks the pair; a claimed
+ * survivor blocks it unless the caller opted in per pair with
+ * `allow_claimed_survivor: true` (default false — every other caller keeps
+ * the original "either side claimed → skip" rule).
+ */
+export function isClaimBlocked(survivor: AgentSnapshot, duplicate: AgentSnapshot, allowClaimedSurvivor = false): boolean {
+  if (duplicate.claimedAt) return true;
+  return !!survivor.claimedAt && !allowClaimedSurvivor;
+}
+
 /** Dry-run preview: reads once, writes nothing. */
-function planMergePair(db: ReturnType<typeof getDb>, survivorId: string, duplicateId: string): PairResult {
+function planMergePair(
+  db: ReturnType<typeof getDb>,
+  survivorId: string,
+  duplicateId: string,
+  allowClaimedSurvivor = false,
+): PairResult {
   const survivor = readAgentSnapshot(db, survivorId);
   const duplicate = readAgentSnapshot(db, duplicateId);
   if (!survivor || !duplicate) return { outcome: "not_found" };
-  if (survivor.claimedAt || duplicate.claimedAt) return { outcome: "skipped_claimed" };
+  if (isClaimBlocked(survivor, duplicate, allowClaimedSurvivor)) return { outcome: "skipped_claimed" };
   if (isAlreadyMergedPair(survivor, duplicate)) return { outcome: "skipped_already_merged" };
 
   const plan = computeFillPlan(survivor, duplicate);
@@ -581,13 +613,14 @@ function applyMergePair(
   duplicateId: string,
   reason: string,
   batchTag: string,
+  allowClaimedSurvivor = false,
 ): PairResult {
   try {
     const tx = db.transaction((): PairResult => {
       const survivor = readAgentSnapshot(db, survivorId);
       const duplicate = readAgentSnapshot(db, duplicateId);
       if (!survivor || !duplicate) return { outcome: "not_found" };
-      if (survivor.claimedAt || duplicate.claimedAt) return { outcome: "skipped_claimed" };
+      if (isClaimBlocked(survivor, duplicate, allowClaimedSurvivor)) return { outcome: "skipped_claimed" };
       if (isAlreadyMergedPair(survivor, duplicate)) return { outcome: "skipped_already_merged" };
 
       const plan = computeFillPlan(survivor, duplicate);
@@ -605,6 +638,8 @@ interface ResultItem {
   survivor_id: string;
   duplicate_id: string;
   outcome: PairOutcome;
+  /** Echoed only when the caller set it to true for this pair. */
+  allow_claimed_survivor?: true;
   fields_filled?: string[];
   detail?: string;
 }
@@ -649,7 +684,7 @@ router.post("/", (req: Request, res: Response) => {
   const usedIds = new Set<string>();
 
   for (const raw of body.pairs as unknown[]) {
-    const it = (raw ?? {}) as { survivor_id?: unknown; duplicate_id?: unknown; reason?: unknown };
+    const it = (raw ?? {}) as { survivor_id?: unknown; duplicate_id?: unknown; reason?: unknown; allow_claimed_survivor?: unknown };
     const survivorId = typeof it.survivor_id === "string" ? it.survivor_id.trim() : "";
     const duplicateId = typeof it.duplicate_id === "string" ? it.duplicate_id.trim() : "";
     const reason = typeof it.reason === "string" ? it.reason.trim() : "";
@@ -663,6 +698,21 @@ router.post("/", (req: Request, res: Response) => {
       });
       continue;
     }
+
+    // Strict boolean opt-in: absent/false = original behaviour; true = opt in;
+    // anything else is rejected so a "true"/1 never silently means "no".
+    const allowRaw = it.allow_claimed_survivor;
+    if (allowRaw !== undefined && typeof allowRaw !== "boolean") {
+      results.push({
+        survivor_id: survivorId,
+        duplicate_id: duplicateId,
+        outcome: "rejected_invalid_item",
+        detail: "allow_claimed_survivor_must_be_boolean",
+      });
+      continue;
+    }
+    const allowClaimedSurvivor = allowRaw === true;
+    const echo = allowClaimedSurvivor ? { allow_claimed_survivor: true as const } : {};
 
     if (usedIds.has(survivorId) || usedIds.has(duplicateId)) {
       results.push({
@@ -684,22 +734,24 @@ router.post("/", (req: Request, res: Response) => {
     usedIds.add(duplicateId);
 
     if (dryRun) {
-      const plan = planMergePair(db, survivorId, duplicateId);
+      const plan = planMergePair(db, survivorId, duplicateId, allowClaimedSurvivor);
       results.push({
         survivor_id: survivorId,
         duplicate_id: duplicateId,
         outcome: plan.outcome,
+        ...echo,
         ...(plan.fieldsFilled ? { fields_filled: plan.fieldsFilled } : {}),
         ...(plan.detail ? { detail: plan.detail } : {}),
       });
       continue;
     }
 
-    const applied = applyMergePair(db, survivorId, duplicateId, reason, batchTag);
+    const applied = applyMergePair(db, survivorId, duplicateId, reason, batchTag, allowClaimedSurvivor);
     results.push({
       survivor_id: survivorId,
       duplicate_id: duplicateId,
       outcome: applied.outcome,
+      ...echo,
       ...(applied.fieldsFilled ? { fields_filled: applied.fieldsFilled } : {}),
       ...(applied.detail ? { detail: applied.detail } : {}),
     });
