@@ -30,6 +30,11 @@
  *   (l) provenance append (not overwrite)
  *   (m) survivor with no agent_knowledge row gets one created
  *   (n) not_found handling, batch hygiene (one bad pair doesn't abort batch)
+ *   (o) per-pair `allow_claimed_survivor: true` opt-in (dev-request
+ *       2026-11-10-rfb-bakke-rydding-dublett-og-innlimte-varer, S1): claimed
+ *       survivor merges; claimed duplicate always skipped; survivor curated
+ *       lock still respected; non-boolean values rejected; no new keys
+ *       without the option
  */
 
 import Database from "better-sqlite3";
@@ -277,6 +282,58 @@ export function runAdminAgentsDuplicateMergeTests(opts: { log?: boolean } = {}):
       insertAgent.run("dm-surv-10", "New Would-Be Survivor Ten AS", "", "key-dm-surv-10", null);
       insertKnowledge.run("dm-surv-10", null, null, null, null, null, null, "{}", "{}");
 
+      // (11) allow_claimed_survivor: CLAIMED survivor with blanks, unclaimed
+      //      duplicate that carries curated_fields of its own (must not block).
+      insertAgent.run("dm-surv-11", "Survivor Eleven AS", "", "key-dm-surv-11", "2026-03-01T00:00:00.000Z");
+      insertKnowledge.run("dm-surv-11", null, null, null, null, null, null, "{}", "{}");
+      insertAgent.run("dm-dup-11", "Duplicate Eleven AS", "post@dup11.no", "key-dm-dup-11", null);
+      insertKnowledge.run(
+        "dm-dup-11",
+        "Gate 11",
+        "1111",
+        null,
+        null,
+        null,
+        null,
+        JSON.stringify({ address: { by: "owner" } }),
+        JSON.stringify({ address: [{ value: "Gate 11", source_type: "homepage", fetched_at: "2026-02-01T00:00:00.000Z" }] }),
+      );
+
+      // (12) allow_claimed_survivor: unclaimed survivor, CLAIMED duplicate.
+      insertAgent.run("dm-surv-12", "Survivor Twelve AS", "", "key-dm-surv-12", null);
+      insertKnowledge.run("dm-surv-12", null, null, null, null, null, null, "{}", "{}");
+      insertAgent.run("dm-dup-12", "Duplicate Twelve AS", "post@dup12.no", "key-dm-dup-12", "2026-03-01T00:00:00.000Z");
+      insertKnowledge.run("dm-dup-12", "Gate 12", null, null, null, null, null, "{}", "{}");
+
+      // (13) allow_claimed_survivor: BOTH claimed.
+      insertAgent.run("dm-surv-13", "Survivor Thirteen AS", "", "key-dm-surv-13", "2026-03-01T00:00:00.000Z");
+      insertKnowledge.run("dm-surv-13", null, null, null, null, null, null, "{}", "{}");
+      insertAgent.run("dm-dup-13", "Duplicate Thirteen AS", "post@dup13.no", "key-dm-dup-13", "2026-03-01T00:00:00.000Z");
+      insertKnowledge.run("dm-dup-13", "Gate 13", null, null, null, null, null, "{}", "{}");
+
+      // (14) allow_claimed_survivor: CLAIMED survivor with a curated (locked,
+      //      blank) phone and an owner-set address; duplicate has all three.
+      insertAgent.run("dm-surv-14", "Survivor Fourteen AS", "post@surv14.no", "key-dm-surv-14", "2026-03-01T00:00:00.000Z");
+      insertKnowledge.run(
+        "dm-surv-14",
+        "Eiers adresse 14",
+        null,
+        null,
+        null,
+        null,
+        null,
+        JSON.stringify({ phone: { by: "owner" }, address: { by: "owner" } }),
+        "{}",
+      );
+      insertAgent.run("dm-dup-14", "Duplicate Fourteen AS", "post@dup14.no", "key-dm-dup-14", null);
+      insertKnowledge.run("dm-dup-14", "Annen adresse 14", null, "https://dup14.no", "14141414", null, null, "{}", "{}");
+
+      // (15) allow_claimed_survivor given as non-boolean ("true" / 1) or false.
+      insertAgent.run("dm-surv-15", "Survivor Fifteen AS", "", "key-dm-surv-15", "2026-03-01T00:00:00.000Z");
+      insertKnowledge.run("dm-surv-15", null, null, null, null, null, null, "{}", "{}");
+      insertAgent.run("dm-dup-15", "Duplicate Fifteen AS", "post@dup15.no", "key-dm-dup-15", null);
+      insertKnowledge.run("dm-dup-15", "Gate 15", null, null, null, null, null, "{}", "{}");
+
       delete require.cache[require.resolve("./admin-agents-duplicate-merge")];
       const routeMod = require("./admin-agents-duplicate-merge");
       const router = routeMod.default;
@@ -485,6 +542,135 @@ export function runAdminAgentsDuplicateMergeTests(opts: { log?: boolean } = {}):
       assertEq(agentRow("dm-orig-surv-10")?.contact_email, "post@origsurv10.no", "dm-60f: original survivor-10 (untouched party) unaffected");
       assertEq(auditFor("dm-surv-10").length, 0, "dm-60g: no audit rows written for would-be survivor-10");
       assertEq(auditFor("dm-dup-10").length, 0, "dm-60h: no NEW audit rows written for duplicate-10");
+
+      // ── (o) allow_claimed_survivor per-pair opt-in ───────────────────────
+      const PAIR_ACS = (survivor_id: string, duplicate_id: string, allow: unknown) => ({
+        pairs: [{ survivor_id, duplicate_id, reason: "duplicate_of_same_producer", allow_claimed_survivor: allow }],
+      });
+
+      // Without the option: claimed survivor still skipped, response item
+      // carries exactly the original keys (no echo, no new keys).
+      r = await post(PAIR("dm-surv-11", "dm-dup-11"));
+      assertEq(
+        r.body?.results?.[0],
+        { survivor_id: "dm-surv-11", duplicate_id: "dm-dup-11", outcome: "skipped_claimed" },
+        "dm-acs-01: claimed survivor without option -> skipped_claimed, original keys only (dry-run)",
+      );
+      r = await post(PAIR("dm-surv-11", "dm-dup-11"), testKey, { apply: "1" });
+      assertEq(
+        r.body?.results?.[0],
+        { survivor_id: "dm-surv-11", duplicate_id: "dm-dup-11", outcome: "skipped_claimed" },
+        "dm-acs-02: claimed survivor without option -> skipped_claimed, original keys only (apply)",
+      );
+      assertEq(agentRow("dm-dup-11")?.is_active, 1, "dm-acs-03: without option duplicate-11 left active");
+      // Explicit false behaves exactly like absent.
+      r = await post(PAIR_ACS("dm-surv-11", "dm-dup-11", false));
+      assertEq(
+        r.body?.results?.[0],
+        { survivor_id: "dm-surv-11", duplicate_id: "dm-dup-11", outcome: "skipped_claimed" },
+        "dm-acs-04: allow_claimed_survivor:false == absent (skipped_claimed, no echo)",
+      );
+
+      // With the option: dry run would_merge, writes nothing.
+      r = await post(PAIR_ACS("dm-surv-11", "dm-dup-11", true));
+      assertEq(r.body?.results?.[0]?.outcome, "would_merge", "dm-acs-05: claimed survivor + option -> would_merge (dry-run)");
+      assertEq(r.body?.results?.[0]?.allow_claimed_survivor, true, "dm-acs-06: option echoed when true");
+      assertEq(
+        r.body?.results?.[0]?.fields_filled,
+        ["contact_email", "address", "postal_code"],
+        "dm-acs-07: dry-run preview lists the fills",
+      );
+      assertEq(agentRow("dm-surv-11")?.contact_email, "", "dm-acs-08: dry-run wrote nothing to survivor-11");
+      assertEq(auditFor("dm-surv-11").length, 0, "dm-acs-09: dry-run wrote no audit rows");
+
+      // With the option: apply merged, full discipline unchanged.
+      r = await post(PAIR_ACS("dm-surv-11", "dm-dup-11", true), testKey, { apply: "1" });
+      assertEq(r.body?.results?.[0]?.outcome, "merged", "dm-acs-10: claimed survivor + option -> merged (apply)");
+      assertEq(r.body?.results?.[0]?.detail, undefined, "dm-acs-11: duplicate's own curated_fields do not skip anything");
+      assertEq(agentRow("dm-surv-11")?.contact_email, "post@dup11.no", "dm-acs-12: claimed survivor contact_email filled");
+      assertEq(agentRow("dm-surv-11")?.claimed_at, "2026-03-01T00:00:00.000Z", "dm-acs-13: survivor claimed_at untouched");
+      assertEq(knowledgeRow("dm-surv-11")?.address, "Gate 11", "dm-acs-14: claimed survivor address filled");
+      assertEq(agentRow("dm-dup-11")?.is_active, 0, "dm-acs-15: duplicate-11 deactivated");
+      assertEq(agentRow("dm-dup-11")?.merged_into, "dm-surv-11", "dm-acs-16: duplicate-11 merged_into = survivor");
+      assertEq(
+        auditFor("dm-surv-11")
+          .map((a) => a.field_name)
+          .sort(),
+        ["address", "contact_email", "field_provenance", "postal_code"],
+        "dm-acs-17: per-field audit rows + field_provenance row on survivor",
+      );
+      assertEq(auditFor("dm-dup-11").map((a) => a.field_name), ["merge"], "dm-acs-18: merge-decision audit row on duplicate");
+      let prov11: any = {};
+      try {
+        prov11 = JSON.parse(knowledgeRow("dm-surv-11")?.field_provenance ?? "{}");
+      } catch {
+        prov11 = {};
+      }
+      assertEq(prov11.address?.[0]?.value, "Gate 11", "dm-acs-19: duplicate provenance appended onto survivor");
+
+      // Claimed DUPLICATE: always skipped, with or without the option.
+      for (const [label, body] of [
+        ["without option", PAIR("dm-surv-12", "dm-dup-12")],
+        ["with option", PAIR_ACS("dm-surv-12", "dm-dup-12", true)],
+      ] as const) {
+        r = await post(body);
+        assertEq(r.body?.results?.[0]?.outcome, "skipped_claimed", `dm-acs-20: claimed duplicate ${label} -> skipped_claimed (dry-run)`);
+        r = await post(body, testKey, { apply: "1" });
+        assertEq(r.body?.results?.[0]?.outcome, "skipped_claimed", `dm-acs-21: claimed duplicate ${label} -> skipped_claimed (apply)`);
+      }
+      assertEq(agentRow("dm-surv-12")?.contact_email, "", "dm-acs-22: survivor-12 untouched");
+      assertEq(knowledgeRow("dm-surv-12")?.address, null, "dm-acs-23: survivor-12 knowledge untouched");
+      assertEq(agentRow("dm-dup-12")?.is_active, 1, "dm-acs-24: claimed duplicate-12 left active");
+      assertEq(agentRow("dm-dup-12")?.merged_into, null, "dm-acs-25: claimed duplicate-12 merged_into null");
+      assertEq(auditFor("dm-surv-12").length + auditFor("dm-dup-12").length, 0, "dm-acs-26: no audit rows for pair-12");
+
+      // Both claimed + option: still skipped.
+      r = await post(PAIR_ACS("dm-surv-13", "dm-dup-13", true), testKey, { apply: "1" });
+      assertEq(r.body?.results?.[0]?.outcome, "skipped_claimed", "dm-acs-27: both claimed + option -> skipped_claimed");
+      assertEq(agentRow("dm-dup-13")?.is_active, 1, "dm-acs-28: duplicate-13 left active");
+      assertEq(agentRow("dm-surv-13")?.contact_email, "", "dm-acs-29: survivor-13 untouched");
+      assertEq(auditFor("dm-surv-13").length + auditFor("dm-dup-13").length, 0, "dm-acs-30: no audit rows for pair-13");
+
+      // Claimed survivor with curated/owner-set fields + option.
+      r = await post(PAIR_ACS("dm-surv-14", "dm-dup-14", true), testKey, { apply: "1" });
+      assertEq(r.body?.results?.[0]?.outcome, "merged", "dm-acs-31: claimed survivor with curated field + option -> merged");
+      assertEq(r.body?.results?.[0]?.detail, "skipped_curated_field:phone", "dm-acs-32: curated phone reported skipped");
+      assertEq(r.body?.results?.[0]?.fields_filled, ["website"], "dm-acs-33: only the unlocked blank field filled");
+      const kn14 = knowledgeRow("dm-surv-14");
+      assertEq(kn14?.phone, null, "dm-acs-34: curated phone NOT written");
+      assertEq(kn14?.address, "Eiers adresse 14", "dm-acs-35: owner-set address NOT overwritten");
+      assertEq(kn14?.website, "https://dup14.no", "dm-acs-36: empty website filled");
+      assertEq(agentRow("dm-surv-14")?.contact_email, "post@surv14.no", "dm-acs-37: owner contact_email NOT overwritten");
+      assertEq(agentRow("dm-dup-14")?.merged_into, "dm-surv-14", "dm-acs-38: duplicate-14 merged into survivor");
+
+      // Non-boolean option values: rejected, nothing written.
+      for (const bad of ["true", 1] as const) {
+        r = await post(PAIR_ACS("dm-surv-15", "dm-dup-15", bad), testKey, { apply: "1" });
+        assertEq(
+          r.body?.results?.[0],
+          {
+            survivor_id: "dm-surv-15",
+            duplicate_id: "dm-dup-15",
+            outcome: "rejected_invalid_item",
+            detail: "allow_claimed_survivor_must_be_boolean",
+          },
+          `dm-acs-39: allow_claimed_survivor=${JSON.stringify(bad)} -> rejected_invalid_item`,
+        );
+      }
+      assertEq(agentRow("dm-dup-15")?.is_active, 1, "dm-acs-40: duplicate-15 left active after rejected items");
+      assertEq(agentRow("dm-surv-15")?.contact_email, "", "dm-acs-41: survivor-15 untouched after rejected items");
+      assertEq(auditFor("dm-surv-15").length + auditFor("dm-dup-15").length, 0, "dm-acs-42: no audit rows for pair-15");
+
+      // Auth gate still applies to an option-carrying request.
+      r = await post(PAIR_ACS("dm-surv-15", "dm-dup-15", true), false, { apply: "1" });
+      assertEq(r.status, 403, "dm-acs-43: no X-Admin-Key with option -> 403");
+      assertEq(agentRow("dm-dup-15")?.is_active, 1, "dm-acs-44: unauthenticated request wrote nothing");
+
+      // Pure helper default: other callers (no flag) keep "either side claimed".
+      const snapS = routeMod.readAgentSnapshot(db, "dm-surv-15");
+      const snapD = routeMod.readAgentSnapshot(db, "dm-dup-15");
+      assertEq(routeMod.isClaimBlocked(snapS, snapD), true, "dm-acs-45: isClaimBlocked defaults to blocking a claimed survivor");
+      assertEq(routeMod.isClaimBlocked(snapS, snapD, true), false, "dm-acs-46: isClaimBlocked opt-in unblocks claimed survivor");
 
       // ── (h) admin-key already covered above (dm-01/02) ────────────────────
 
