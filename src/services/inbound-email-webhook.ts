@@ -24,6 +24,13 @@
 //   • With CS_INBOUND_SERVER_INGEST_ENABLED on, the e-mail is registered in
 //     the CRM by the server itself (cs-inbound.registerInboundInCrm), on the
 //     platform its recipient domain names. Off = log + forward only.
+//
+// Pilot inbox (pilot@rettfrabonden.com, a hidden test producer's contact
+// address): mail to it — also the platform's own magic-link mails — still
+// gets a log row and reaches ADMIN_EMAIL, but is NEVER registered in the CRM
+// (crm_status 'pilot_skipped') and is forwarded as «[Pilot] <subject>» with
+// NO Inbound-ID marker, so the CS pipeline (FORWARD_SUBJECT_RE / marker
+// ingest) cannot recognise or process it.
 
 import type { Request, Response } from "express";
 import { getDb } from "../database/init";
@@ -43,6 +50,20 @@ import {
 } from "./cs-inbound";
 
 export const INBOUND_FETCH_TIMEOUT_MS = 8000;
+
+/** Inbox addresses whose mail bypasses the CRM and the CS pipeline. */
+export const PILOT_INBOX_ADDRESSES: readonly string[] = ["pilot@rettfrabonden.com"];
+
+/** Bare, lowercased address of a recipient entry ("Name <a@b>" or "a@b"). */
+function normalizeRecipient(v: string): string {
+  return (v.match(/<([^>]+)>/)?.[1] ?? v).trim().toLowerCase();
+}
+
+/** True when any To or Cc recipient is a pilot inbox (case-insensitive, bare address). */
+export function isPilotInboundMail(toEmails: readonly string[], ccEmails: readonly string[]): boolean {
+  const pilot = new Set(PILOT_INBOX_ADDRESSES.map(normalizeRecipient));
+  return [...toEmails, ...ccEmails].some((a) => typeof a === "string" && pilot.has(normalizeRecipient(a)));
+}
 
 export interface InboundEmailDeps {
   fetchImpl?: typeof fetch;
@@ -124,6 +145,7 @@ export async function handleInboundEmailWebhook(req: Request, res: Response, dep
     const fromEmail = bareAddress(from).toLowerCase();
     const toEmails = addressesOf(to);
     const ccEmails = addressesOf(cc);
+    const pilot = isPilotInboundMail(toEmails, ccEmails);
 
     // Log row first (synchronous): from here on the e-mail cannot vanish
     // without a trace, whatever fails below.
@@ -194,7 +216,10 @@ export async function handleInboundEmailWebhook(req: Request, res: Response, dep
         console.error("[Inbound] log update failed:", e);
       }
       const serverIngest = deps.serverIngest ?? csInboundServerIngestEnabled();
-      if (!serverIngest) {
+      if (pilot) {
+        try { updateInboundLog(logId, { crm_status: "pilot_skipped" }); } catch { /* logged above */ }
+        console.log(`[Inbound] Pilot inbox mail — not registered in CRM`);
+      } else if (!serverIngest) {
         try { updateInboundLog(logId, { crm_status: "disabled" }); } catch { /* logged above */ }
       } else {
         try {
@@ -235,19 +260,21 @@ export async function handleInboundEmailWebhook(req: Request, res: Response, dep
     const forwardTo = process.env.ADMIN_EMAIL || "da.fredriksen@gmail.com";
     const bodyHtml = html || (text ? `<pre>${escapeHtml(text)}</pre>` : `<p><em>Ingen innhold i eposten.</em></p>`);
     const bodyText = text || "(ingen tekstinnhold)";
-    const markerText = logId ? `\n\n--\n${inboundMarkerLine(logId)}` : "";
-    const markerHtml = logId
-      ? `<p style="color:#999;font-size:11px;margin-top:24px;">${escapeHtml(inboundMarkerLine(logId))}</p>`
+    // Pilot mail: no marker anywhere, so no CS path can claim the copy.
+    const markerId = pilot ? null : logId;
+    const markerText = markerId ? `\n\n--\n${inboundMarkerLine(markerId)}` : "";
+    const markerHtml = markerId
+      ? `<p style="color:#999;font-size:11px;margin-top:24px;">${escapeHtml(inboundMarkerLine(markerId))}</p>`
       : "";
 
     // The marker also goes in the header block at the TOP, so a copy whose
     // text the reader truncates, or whose HTML ends inside the customer's own
     // quoted history, still carries it on an unquoted line.
-    const markerTopHtml = logId ? `<br><span style="color:#999">${escapeHtml(inboundMarkerLine(logId))}</span>` : "";
-    const markerTopText = logId ? `\n${inboundMarkerLine(logId)}` : "";
+    const markerTopHtml = markerId ? `<br><span style="color:#999">${escapeHtml(inboundMarkerLine(markerId))}</span>` : "";
+    const markerTopText = markerId ? `\n${inboundMarkerLine(markerId)}` : "";
     const forwardOptions = {
       to: forwardTo,
-      subject: `[Innkommende] ${subject} (fra ${from})`,
+      subject: pilot ? `[Pilot] ${subject}` : `[Innkommende] ${subject} (fra ${from})`,
       htmlContent: `
         <div style="border-bottom:1px solid #ccc;padding-bottom:8px;margin-bottom:16px;color:#666;font-size:13px;">
           <strong>Fra:</strong> ${from}<br>
