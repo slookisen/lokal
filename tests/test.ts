@@ -45056,6 +45056,23 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── pilot-innboks (pilot@rettfrabonden.com): forbi CRM og CS, videresendt som [Pilot] ──");
+  try {
+    const { runInboundPilotTests } = require("../src/services/inbound-pilot.test") as
+      typeof import("../src/services/inbound-pilot.test");
+    const ipt = await runInboundPilotTests({ log: false });
+    passed += ipt.passed;
+    failed += ipt.failed;
+    for (const f of ipt.failures) failures.push("inbound-pilot: " + f);
+    console.log(`  inbound-pilot: ${ipt.passed} passed, ${ipt.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("inbound-pilot: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ inbound-pilot: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-11-10-cs-paa-serveren: S1b (CS-vakt, ny videresending, daglig oppsummering) ──");
   try {
     const { runCsWatchdogTests } = require("../src/services/cs-watchdog.test") as

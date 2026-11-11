@@ -52,6 +52,7 @@ import {
   rejectProposal,
   type ProposalStatus,
 } from "../services/cs-reply-proposals";
+import { isPilotForwardCopy } from "../services/inbound-email-webhook";
 
 // ─── Admin auth (matches the fleet-wide admin-route pattern, e.g.
 // admin-affiliations.ts / admin-hanen.ts: ADMIN_KEY primary,
@@ -1230,6 +1231,15 @@ function autoRouteByKnownContact(fromEmail: string): CrmVertical | null {
 router.post("/ingest", (req, res) => {
   const parsed = ingestSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
+
+  // Pilot forward copies («[Pilot] …» from our own address) may hold magic-link
+  // tokens: drop them before any routing, parking or CRM write.
+  const nonPilot = parsed.data.messages.filter((m) => !isPilotForwardCopy(m, parsed.data.subject));
+  if (nonPilot.length < parsed.data.messages.length) {
+    console.log(`[crm/ingest] dropped ${parsed.data.messages.length - nonPilot.length} pilot forward copy(ies) in ${parsed.data.threadId}`);
+    if (nonPilot.length === 0) return res.json({ threadId: null, newMessages: 0, alreadyHandled: true, pilotDropped: true, gmailThreadId: parsed.data.threadId });
+    parsed.data.messages = nonPilot;
+  }
 
   // ─── CS på serveren, S1a: the Gmail copy of a server-registered e-mail ──
   // The server already registered the original (cs-inbound). Its forwarded
