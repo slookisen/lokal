@@ -5864,6 +5864,21 @@ function initSchema(db: Database.Database): void {
   ]) {
     try { db.exec(stmt); } catch { /* already exists — expected */ }
   }
+  // dev-request 2026-11-10-rfb-registreringer-og-eierkrav-folges-opp, slice
+  // S2 (record-only): the stored self-registration pre-check recommendation
+  // (JSON, services/registration-precheck.ts) and when it was written, one row
+  // per agent. A side table on purpose, not new `agents` columns: widening
+  // `agents` tips SQLite's planner off idx_agents_geo for the unordered public
+  // scans (name-search-fts.test.ts's plan check), which changes the order of
+  // discover/find-match answers. Never read by any visibility gate. Additive
+  // and idempotent; a rollback leaves it in place.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS agent_registration_precheck (
+      agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+      registration_precheck TEXT NOT NULL,      -- JSON (RegistrationPrecheck)
+      registration_precheck_at TEXT NOT NULL    -- ISO-8601, when it was written
+    )
+  `);
   try {
     db.exec(
       `CREATE INDEX IF NOT EXISTS idx_agents_self_registered_review_queue
