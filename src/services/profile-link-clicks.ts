@@ -34,9 +34,10 @@
 //
 // ─── Privacy ─────────────────────────────────────────────────────────────────
 // No new personal data: one row holds the platform, the page entity and its
-// provider id, the link kind, the pseudonymised session id (the same
-// "<ipHash>:<userAgent>" analyticsService.getOrCreateSessionId gives page
-// views and contact_clicks — a hashed IP, never a raw one) and is_bot from
+// provider id, the link kind, the pseudonymised session id (the same id
+// analyticsService.getOrCreateSessionId gives page views and contact_clicks:
+// the salted IP hash, a coarse device bucket of the UA and a suffix — never
+// a raw IP or the full UA string) and is_bot from
 // parseUserAgent (the same client classification). The table lives in
 // lokal.db next to contact_clicks, so the admin overview reads it without
 // opening a vertical database.

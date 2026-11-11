@@ -2313,7 +2313,7 @@ ${emailView === null ? "" : emailTrapLinkFor("dental")}</main>`;
 // 2026-10-23-admin-ordre-og-henvisningsdashbord, S4). Target read only from
 // dental_agents by id + a closed kind (services/profile-link-clicks.ts);
 // Opplevagent surfaces 404 here.
-router.get("/ut/:surface/:id/:kind", profileLinkRedirectHandler(["klinikk"]));
+router.get("/ut/:surface/:id/:kind", generalLimiter, profileLinkRedirectHandler(["klinikk"]));
 
 router.get("/klinikk/id/:id", (req: Request, res: Response) => {
   const agent = getDentalAgentById(String(req.params.id));

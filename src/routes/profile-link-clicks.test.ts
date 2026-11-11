@@ -88,6 +88,9 @@ export async function runProfileLinkClicksTests(opts: { log?: boolean } = {}): P
   ];
   const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
   let server: http.Server | null = null;
+  // Pin IMPORT_VALUES_HIDDEN on (its production value); another suite may have left an override.
+  const importDisplay = require("../services/dental-import-display") as typeof import("../services/dental-import-display");
+  const prevImportHidden = importDisplay.__setImportValuesHiddenForTesting(true);
   let dbFactory: typeof import("../database/db-factory") | null = null;
 
   try {
@@ -140,6 +143,9 @@ export async function runProfileLinkClicksTests(opts: { log?: boolean } = {}): P
     exp.prepare("UPDATE experiences SET booking_url = 'data:text/html,<script>alert(1)</script>' WHERE id = ?").run(expData);
     exp.prepare("UPDATE experiences SET booking_url = 'www.evil.example' WHERE id = ?").run(expBare);
     const expHidden = mkExp("Skjult opplevelse", provA, { booking_url: "https://skjult.example.no", verification_status: "needs_review" });
+    // N4: a provider whose only experience is unpublished has no /tilbyder/ page.
+    const provUnpub = expStore.createProvider({ navn: "Upublisert Tilbyder AS", hjemmeside: "https://upublisert.example.no", brreg_verified: 1, brreg_active: 1, verification_status: "verified" } as any);
+    mkExp("Upublisert tur", provUnpub, { verification_status: "needs_review" });
 
     // Gårdssalg producers: a public one, a hidden (delisted) one, a test one.
     const gsA = expStore.createProvider({ navn: "Sider fra Bakken", fylke: "Vestland", kommune: "Ullensvang", hjemmeside: "https://bakken-sider.example.no", telefon: "55 00 11 22", epost: "post@bakken-sider.example.no" } as any);
@@ -159,6 +165,8 @@ export async function runProfileLinkClicksTests(opts: { log?: boolean } = {}): P
       .run("https://booking.sentrumtann.example.no/time", "https://www.facebook.com/sentrumtann", clinic);
     const clinicRejected = dentalStore.createDentalAgent({ navn: "Avvist Klinikk AS", org_nr: "923456782", hjemmeside: "https://avvist.example.no", organisasjonsform: "AS" } as any);
     dent.prepare("UPDATE dental_agents SET verification_status = 'rejected' WHERE id = ?").run(clinicRejected);
+    // N4: an import-only row (no org.nr., organisasjonsform or naeringskode) is hidden on the profile page.
+    const clinicImport = dentalStore.createDentalAgent({ navn: "Importert Klinikk", hjemmeside: "https://importert.example.no" } as any);
     const clinicJs = dentalStore.createDentalAgent({ navn: "Rar Lenke Klinikk AS", org_nr: "923456783", organisasjonsform: "AS" } as any);
     dent.prepare("UPDATE dental_agents SET online_booking_url = 'javascript:alert(document.cookie)' WHERE id = ?").run(clinicJs);
 
@@ -291,6 +299,8 @@ export async function runProfileLinkClicksTests(opts: { log?: boolean } = {}): P
       { path: `/ut/opplevelse/${expHidden}/booking`, label: "unpublished (needs_review) experience" },
       { path: `/ut/gardssalg/${gsHidden}/website`, label: "hidden (delisted) gårdssalg producer" },
       { path: `/ut/klinikk/${clinicRejected}/website`, host: "dental", label: "rejected clinic" },
+      { path: `/ut/klinikk/${clinicImport}/website`, host: "dental", label: "hidden import-only clinic" },
+      { path: `/ut/tilbyder/${provUnpub}/website`, label: "provider without a published experience (no /tilbyder/ page)" },
       { path: `/ut/klinikk/${clinic}/../../evil.example/website`, host: "dental", label: "path traversal" },
       { path: "/ut/opplevelse/https%3A%2F%2Fevil.example/booking", label: "URL as the id" },
       { path: `/ut/opplevelse/${exp1}%2F..%2Fx/booking`, label: "encoded slash in the id" },
@@ -308,6 +318,21 @@ export async function runProfileLinkClicksTests(opts: { log?: boolean } = {}): P
       const r = await req("GET", `/ut/gardssalg/${gsTest}/website`);
       assertEq([r.status, r.headers.location], [302, `https://testgard.example.no/?${UTM_GS}`], "ac5 test provider: redirects to its own stored site");
       assertEq([lastClick().is_test, lastClick().provider_id], [1, gsTest], "ac5 test provider: row is_test = 1");
+      // N4: a bot click on a test provider is stored with both flags; the overview counts it as bot (bot wins).
+      const rb = await req("GET", `/ut/gardssalg/${gsTest}/website`, { ua: UA_BOT });
+      assertEq([rb.status, lastClick().is_bot, lastClick().is_test], [302, 1, 1], "ac6 bot on test provider: stored with is_bot = 1 and is_test = 1");
+    }
+
+    // ── B1: the /ut routes chain the shared generalLimiter (same check as /sok, /reise) ──
+    {
+      const { generalLimiter } = require("../middleware/security") as typeof import("../middleware/security");
+      for (const [name, router] of [["experiences-seo", expSeo], ["dental-seo", dentalSeo]] as const) {
+        const layers = (router.stack as any[]).filter((l) => l.route && l.route.path === "/ut/:surface/:id/:kind" && l.route.methods.get);
+        assertEq(layers.length, 1, `b1 ${name}: GET /ut/:surface/:id/:kind registered once`);
+        const st = layers[0]?.route.stack as any[] | undefined;
+        const i = st ? st.findIndex((s) => s.handle === generalLimiter) : -1;
+        assertTrue(!!st && i >= 0 && i < st.length - 1, `b1 ${name}: /ut chains the exported generalLimiter instance before its handler`);
+      }
     }
 
     // ── AC5: the beacon ───────────────────────────────────────────────────
@@ -390,6 +415,7 @@ export async function runProfileLinkClicksTests(opts: { log?: boolean } = {}): P
       const gsH = body.henvisninger.gardssalg;
       assertEq(gsH.test.providers, [{ provider_id: gsTest, name: "Testgård (kun test)", total: 1 }], "overview gardssalg: test provider in its own row, named");
       assertEq(gsH.test.total, 1, "overview gardssalg: test click not in the main total");
+      assertEq(gsH.bot.total, sql("platform = 'gardssalg' AND is_bot = 1"), "overview gardssalg: the bot click on the test provider is counted as bot, not test");
       assertTrue(body.henvisninger.rfb && body.henvisninger.rfb.available, "overview: RFB block still present for plattform=alle");
       assertTrue(svc.PROFIL_HENVISNING_TYPER.every((t) => t in opp.by_type && t in opp.type_forklaring), "overview: every type has a count and an explanation");
 
@@ -451,6 +477,7 @@ export async function runProfileLinkClicksTests(opts: { log?: boolean } = {}): P
     if (server) await new Promise<void>((r) => server!.close(() => r()));
     try { dbFactory?.__resetDbFactoryForTesting(); } catch { /* ignore */ }
     restoreModuleCache();
+    importDisplay.__setImportValuesHiddenForTesting(prevImportHidden);
     initMod.__setDbForTesting(prevMainDb as any);
     try { mainDb.close(); } catch { /* ignore */ }
     for (const k of ENV_KEYS) {

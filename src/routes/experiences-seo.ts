@@ -9616,7 +9616,7 @@ ${oaSiteFooter({})}
 // services/profile-link-clicks.ts for the open-redirect guard. Surfaces of
 // finn-tannlege.com (klinikk) 404 here.
 // ═══════════════════════════════════════════════════════════
-router.get("/ut/:surface/:id/:kind", profileLinkRedirectHandler(["opplevelse", "tilbyder", "gardssalg"]));
+router.get("/ut/:surface/:id/:kind", generalLimiter, profileLinkRedirectHandler(["opplevelse", "tilbyder", "gardssalg"]));
 
 router.get("/opplevelse/:slug", (req: Request, res: Response, next: NextFunction) => {
   const slug = String(req.params.slug || "");
