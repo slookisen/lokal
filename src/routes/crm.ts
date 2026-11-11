@@ -23,6 +23,20 @@ import { getDb } from "../database/init";
 import { isOutreachPaused } from "./admin-outreach-candidates";
 import { unsubscribeHeaderValues } from "../services/avmeld-service";
 import { getOutreachMaxTouchVernConfig, getMaxTouchStatusForEmail } from "../services/outreach-max-touch-vern";
+import {
+  classifyAutomated,
+  forwardCopyMarker,
+  inboundLogAutomatedKind,
+  inboundLogExists,
+  isOurPlatformAddress,
+  readInboundHeaders,
+  recordThreadAlias,
+  resolveThreadAlias,
+  serverThreadForMarker,
+  stripForwardSubject,
+} from "../services/cs-inbound";
+import { computeNeedsReply, markNoReplyNeeded } from "../services/crm-needs-reply";
+import { buildDailyDigest, INBOUND_LOG_RETENTION_DAYS } from "../services/cs-watchdog";
 
 // ─── Admin auth (matches the fleet-wide admin-route pattern, e.g.
 // admin-affiliations.ts / admin-hanen.ts: ADMIN_KEY primary,
@@ -43,6 +57,24 @@ function requireAdminAuth(req: Request, res: Response, next: Function): void {
 
 const router = Router();
 router.use(requireAdminAuth);
+
+// CS på serveren, S1a: a Gmail thread id the CS agent ingested as a copy of a
+// server-registered e-mail is an ALIAS of the server thread
+// (crm_thread_aliases). Every /threads/:id route resolves it, so the agent can
+// keep using the id it knows. Ids without an alias pass through unchanged.
+router.param("id", (req, _res, next, id) => {
+  // Never throw here: a throw would skip the route entirely. req.path is a
+  // getter on real Express requests but may be absent on hand-built ones.
+  try {
+    const p = typeof (req as any).path === "string" ? (req as any).path : String((req as any).url ?? "");
+    if (p.startsWith("/threads/") && typeof id === "string" && id) {
+      req.params.id = resolveThreadAlias(id);
+    }
+  } catch {
+    // leave the id as given
+  }
+  next();
+});
 
 // ?vertical=rfb|dental|experiences — anything else (or omitted) = all verticals.
 function parseVertical(req: Request): CrmVertical | undefined {
@@ -1184,6 +1216,162 @@ router.post("/ingest", (req, res) => {
   const parsed = ingestSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
 
+  // ─── CS på serveren, S1a: the Gmail copy of a server-registered e-mail ──
+  // The server already registered the original (cs-inbound). Its forwarded
+  // Gmail copy is an inbound message with subject «[Innkommende] …» whose own,
+  // UNQUOTED text carries "Inbound-ID: inb-…" (forwardCopyMarker). That copy is
+  // NOT filed again: when it is the FIRST message of the Gmail thread, the
+  // Gmail thread id becomes an alias of the server thread and the other
+  // messages (Daniel's Gmail reply, the customer's answer to it) are filed
+  // there. A Gmail thread id that is already an alias goes straight to its
+  // server thread. A quoted marker (a reply), a «Fwd:» of the copy, or a copy
+  // that is not the thread's first message never creates an alias. Routing is
+  // skipped only on this path — the server decided the platform when it
+  // registered the original.
+  {
+    let canonical: { threadId: string; vertical: string; contactId: string } | null = null;
+    let parkedLogId: string | null = null;
+    const aliasTarget = resolveThreadAlias(parsed.data.threadId);
+    if (aliasTarget !== parsed.data.threadId) {
+      const t = getDb().prepare("SELECT id, vertical_id, contact_id FROM crm_threads WHERE id = ?").get(aliasTarget) as
+        | { id: string; vertical_id: string; contact_id: string }
+        | undefined;
+      if (t) canonical = { threadId: t.id, vertical: t.vertical_id, contactId: t.contact_id };
+    }
+    // The thread's first message: the earliest by sentAt when every message
+    // carries one, otherwise the first in the payload (Gmail's own order). Only
+    // for THIS message may the Gmail thread subject stand in for a missing
+    // per-message subject.
+    const msgs = parsed.data.messages;
+    const times = msgs.map((m) => (m.sentAt ? Date.parse(m.sentAt) : NaN));
+    const first = times.every((t) => Number.isFinite(t)) ? msgs[times.indexOf(Math.min(...times))] : msgs[0];
+    // The Gmail thread subject may stand in for a missing per-message subject
+    // only for a message SENT FROM one of our own platform addresses (the
+    // forward is) — never for a customer's reply, which may carry an old
+    // marker unquoted in its history. Decided per message, so a re-sent
+    // aliased thread recognises its subject-less copy too.
+    const copyIdOf = (m: (typeof parsed.data.messages)[number]): string | null =>
+      forwardCopyMarker(m, isOurPlatformAddress(m.fromEmail) ? parsed.data.subject : undefined);
+    const firstCopyId = copyIdOf(first);
+    if (!canonical) {
+      const logId = firstCopyId;
+      if (logId) {
+        const hit = serverThreadForMarker(logId);
+        if (hit?.kind === "thread") canonical = { threadId: hit.threadId, vertical: hit.vertical, contactId: hit.contactId };
+        else if (hit?.kind === "untriaged") parkedLogId = logId;
+      }
+    }
+    // A copy is kept (filed here) only when its log row says the server did
+    // NOT file that e-mail (flag off, registration error) — then it is the
+    // only record. A copy the server filed (thread or parked) is left out, and
+    // so is one whose log row was purged after 90 days (it was handled then;
+    // filing it now would be a duplicate). No subject fallback here: a message
+    // without its own subject is never taken for a copy (a customer's
+    // plain-text reply may carry the marker unquoted).
+    // A missing log row means "purged after the retention window" ONLY when
+    // the copy itself is that old. A recent copy with no row (restored backup,
+    // a log insert that failed) is filed — a duplicate beats a lost e-mail.
+    const purgedLongAgo = (m: (typeof parsed.data.messages)[number]): boolean => {
+      const t = m.sentAt ? Date.parse(m.sentAt) : NaN;
+      return Number.isFinite(t) && Date.now() - t > (INBOUND_LOG_RETENTION_DAYS - 7) * 86400_000;
+    };
+    const serverFiled = (m: (typeof parsed.data.messages)[number]): boolean => {
+      const id = copyIdOf(m);
+      if (id === null) return false;
+      if (!inboundLogExists(id)) return purgedLongAgo(m);
+      return serverThreadForMarker(id) !== null;
+    };
+    if (canonical) {
+      recordThreadAlias(parsed.data.threadId, canonical.threadId, "cs_gmail_copy");
+      const rest = parsed.data.messages.filter((m) => !serverFiled(m));
+      let newMessages = 0;
+      if (rest.length > 0) {
+        const existed = new Set(
+          (getDb()
+            .prepare(`SELECT id FROM crm_messages WHERE id IN (${rest.map(() => "?").join(",")})`)
+            .all(...rest.map((m) => m.messageId)) as Array<{ id: string }>).map((r) => r.id),
+        );
+        // The contact is the server thread's own — never whatever primaryFromEmail
+        // the caller sent (on a forwarded copy that is often our own address).
+        const contact = getDb().prepare("SELECT email FROM crm_contacts WHERE id = ?").get(canonical.contactId) as { email: string } | undefined;
+        try {
+          const r = crmService.ingestThread(
+            { threadId: canonical.threadId, messages: rest },
+            contact?.email || parsed.data.primaryFromEmail,
+            canonical.vertical as CrmVertical,
+          );
+          newMessages = r.newMessages;
+        } catch (err: any) {
+          return res.status(500).json({ error: String(err?.message ?? "ingest failed") });
+        }
+        // A NEW inbound message from a person (e.g. the customer answering
+        // Daniel's Gmail reply directly) reopens a done/archived thread, as on
+        // the server path. Never Daniel's own reply, never an already-filed
+        // message, never an auto-reply or bounce.
+        const newHumanIn = rest.some((m) => {
+          if (existed.has(m.messageId) || m.direction !== "in" || m.rawMetadata?.automated === true) return false;
+          // A kept copy of an e-mail the server logged: its own classification counts.
+          const cid = copyIdOf(m);
+          if (cid && inboundLogAutomatedKind(cid)) return false;
+          return classifyAutomated({ subject: stripForwardSubject(m.subject ?? null), fromEmail: m.fromEmail, headers: readInboundHeaders(m.rawMetadata ?? {}) }).kind === null;
+        });
+        if (newMessages > 0 && newHumanIn) {
+          const st = getDb().prepare("SELECT status FROM crm_threads WHERE id = ?").get(canonical.threadId) as { status: string } | undefined;
+          if (st && (st.status === "done" || st.status === "archived")) {
+            crmService.setThreadStatus(canonical.threadId, "new", "system");
+            crmService.logAction({
+              threadId: canonical.threadId,
+              contactId: canonical.contactId,
+              type: "reopened_by_inbound",
+              actor: "system",
+              payload: { previousStatus: st.status, via: "cs_gmail_ingest" },
+            });
+          }
+        }
+      }
+      return res.json({
+        threadId: canonical.threadId,
+        contactId: canonical.contactId,
+        newMessages,
+        serverRegistered: true,
+        gmailThreadId: parsed.data.threadId,
+      });
+    }
+    // The server parked the original as untriaged. The copy alone adds nothing
+    // (filing it would open a second item for the same e-mail); if the Gmail
+    // thread holds more than the copy, fall through so nothing is lost.
+    if (parkedLogId && parsed.data.messages.every((m) => serverFiled(m))) {
+      // Same contract as a parked ingest (202 + untriaged: true): the caller
+      // must not compose against this thread.
+      const parkedRow = getDb()
+        .prepare("SELECT id, reason FROM crm_untriaged WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1")
+        .get(`inbound-${parkedLogId}`) as { id: string; reason: string } | undefined;
+      return res.status(202).json({
+        untriaged: true,
+        untriagedId: parkedRow?.id ?? null,
+        reason: parkedRow?.reason ?? null,
+        openUntriaged: countOpenUntriaged(),
+        threadId: null,
+        newMessages: 0,
+        serverRegistered: true,
+        parkedUntriaged: true,
+        untriagedThreadId: `inbound-${parkedLogId}`,
+        gmailThreadId: parsed.data.threadId,
+      });
+    }
+    // Falling through to normal routing: copies the server already filed
+    // (parked or on its own thread) are left out, so the e-mail is not filed twice.
+    const unfiled = parsed.data.messages.filter((m) => !serverFiled(m));
+    if (unfiled.length < parsed.data.messages.length) {
+      if (unfiled.length === 0) {
+        // Only copies of e-mails already handled by the server (or purged from
+        // its log after 90 days): nothing new to file.
+        return res.json({ threadId: null, newMessages: 0, serverRegistered: true, alreadyHandled: true, gmailThreadId: parsed.data.threadId });
+      }
+      parsed.data.messages = unfiled;
+    }
+  }
+
   // ─── steg 4: resolve the platform, or park ───────────────────
   //
   // Three cases, and none of them is a guess:
@@ -1342,6 +1530,47 @@ router.post("/ingest", (req, res) => {
   }
 
   res.json(result);
+});
+
+// ─── GET /admin/crm/needs-reply ──────────────────────────────
+// CS på serveren, S1a: every customer thread whose latest (human) inbound is
+// newer than its latest real outbound, with age and level (P1 ≥ 12 h, P0 ≥
+// 24 h), plus open untriaged rows and inbound mail whose forward failed.
+// ?vertical=rfb|dental|experiences filters threads.
+router.get("/needs-reply", (req, res) => {
+  try {
+    const limitRaw = parseInt(String(req.query.limit ?? ""), 10);
+    res.json(computeNeedsReply({ vertical: parseVertical(req) ?? null, limit: Number.isFinite(limitRaw) ? limitRaw : undefined }));
+  } catch (err: any) {
+    res.status(500).json({ error: String(err?.message ?? "needs-reply failed") });
+  }
+});
+
+// ─── GET /admin/crm/daily-digest/preview ─────────────────────
+// CS på serveren, S1b: the exact digest the 07:00 job would e-mail now —
+// read-only, sends nothing (for checking and for the morning report).
+router.get("/daily-digest/preview", (_req, res) => {
+  try {
+    const d = buildDailyDigest(new Date());
+    res.json({ subject: d.subject, text: d.text, counts: d.counts });
+  } catch (err: any) {
+    res.status(500).json({ error: String(err?.message ?? "digest failed") });
+  }
+});
+
+// ─── POST /admin/crm/threads/:id/no-reply-needed ─────────────
+// Mark «trenger ikke svar» (reason required). A later inbound makes the
+// thread need a reply again.
+router.post("/threads/:id/no-reply-needed", (req, res) => {
+  const schema = z.object({
+    reason: z.string().min(1).max(300),
+    actor: z.enum(["claude", "daniel", "system"]).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
+  const r = markNoReplyNeeded(req.params.id, parsed.data.reason, parsed.data.actor ?? "daniel");
+  if (!r.ok) return res.status(r.error === "thread_not_found" ? 404 : 400).json({ error: r.error });
+  res.json({ success: true });
 });
 
 // ─── GET /admin/crm/untriaged ────────────────────────────────

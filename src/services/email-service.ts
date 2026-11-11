@@ -8,6 +8,11 @@ import { applyTestSendRedirect, TestSendNotConfiguredError } from "./send-guard"
 import { crmFromHeader } from "./crm-platform-identity";
 import { unsubscribeHeaderValues } from "./avmeld-service";
 import { claimRequestMoreBody, claimRequestMoreSignOff, claimRequestMoreSubject } from "./claim-request-more-texts";
+import {
+  REGISTRATION_CONFIRMATION_SUBJECT,
+  buildRegistrationConfirmationHtml,
+  buildRegistrationConfirmationText,
+} from "./registration-confirmation-texts";
 import { isOwnerSessionSlidingEnabled, ownerSessionMaxDays } from "./owner-session-sliding";
 
 /** One line under the eierkrav B1 buttons in the admin claim-review notice. */
@@ -436,6 +441,30 @@ export class EmailService {
         error: error instanceof Error ? error.message : 'Unknown error',
       };
     }
+  }
+
+  /**
+   * Confirmation to a producer who registered through the public
+   * POST /api/marketplace/register (S1, 2026-11-10). Only ever called by
+   * services/registration-confirmation.ts, which owns the flag, the 24 h
+   * per-address limit and the fire-and-forget wiring. Default sender, replies
+   * go to customer service (supportEmail). The recipient is the producer's
+   * own address, so it is kept out of the send log.
+   */
+  async sendRegistrationConfirmation(
+    email: string,
+    agentName: string
+  ): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    return this.sendEmail({
+      to: email,
+      subject: REGISTRATION_CONFIRMATION_SUBJECT,
+      htmlContent: buildRegistrationConfirmationHtml(agentName),
+      textContent: buildRegistrationConfirmationText(agentName),
+      replyTo: this.supportEmail,
+      redactRecipientInLogs: true,
+      // Transactional reply to the producer's own action, not outreach (F8).
+      omitAgentHeader: true,
+    });
   }
 
   /**

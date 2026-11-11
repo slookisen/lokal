@@ -76,6 +76,7 @@ import { HOMEPAGE_CONTACT_PROVENANCE_EXCLUSION_SQL } from "../services/homepage-
 import { emailWithheldIds, withKnowledgeEmailNull } from "../services/email-reveal-guard";
 import { hasContactRetentionMarkers } from "../services/privacy-retention";
 import { invalidateAgentGeocode } from "../services/agent-geocode-reset";
+import { scheduleRegistrationConfirmation } from "../services/registration-confirmation";
 // dev-request 2026-11-10-rfb-registreringer-og-eierkrav-folges-opp (S2).
 import { scheduleRegistrationPrecheck } from "../services/registration-precheck";
 import {
@@ -607,6 +608,8 @@ router.post("/register", (req: Request, res: Response) => {
         registeredAt: agent.registeredAt,
       },
     });
+    // S1 2026-11-10: flagged (REGISTRATION_CONFIRMATION_EMAIL_ENABLED), fire-and-forget, never throws.
+    scheduleRegistrationConfirmation({ email: registration.contactEmail, name: registration.name, agentId: agent.id });
 
     // dev-request 2026-11-10-rfb-registreringer-og-eierkrav-folges-opp (S2):
     // record-only pre-check recommendation, started AFTER the response above

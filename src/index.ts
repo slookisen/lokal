@@ -84,6 +84,7 @@ import adminOutreachCandidatesRoutes from "./routes/admin-outreach-candidates";
 import adminOutreachMaxTouchVernRoutes from "./routes/admin-outreach-max-touch-vern";
 import { rfbMarketingLaneRouter, rfbMarketingDailyRunRouter } from "./routes/admin-rfb-marketing";
 import { tickRfbMarketingDaily } from "./services/rfb-marketing-daily";
+import { tickCsWatchdog, type CsTickState } from "./services/cs-watchdog";
 import { rfbEnrichmentNightlyRouter } from "./routes/admin-rfb-enrichment-nightly";
 import {
   isRfbEnrichmentNightlyEnabled,
@@ -2791,6 +2792,30 @@ if (process.env.RFB_MARKETING_PLATFORM_ENABLED === "1") {
   });
   setTimeout(() => { void rfbMarketingDailyTick(); }, 120_000);
   setInterval(() => { void rfbMarketingDailyTick(); }, 10 * 60_000);
+}
+
+// ─── CS på serveren, S1b (dev-request 2026-11-10-cs-paa-serveren) ─────────
+// The CS watchdog (hourly: «trenger svar», retry of failed inbound forwards,
+// admin alert for anything over 24 h, run-ledger row) and the daily digest
+// (07:00 Europe/Oslo, e-mail to ADMIN_NOTIFICATION_EMAIL). Independent of the
+// CS LLM routine — this is what notices when that routine has stopped.
+// Flags CS_WATCHDOG_ENABLED / CS_DAILY_DIGEST_ENABLED (default off). Both
+// stamps persist in boot_job_state, so a restart does not double-run.
+// Registered always: with both flags off the tick only purges inbound_email_log
+// once a day (the log is written for every inbound e-mail regardless of flags).
+{
+  let csWatchState: CsTickState = { lastWatchdogAt: null, lastDigestAt: null, lastDigestAttemptAt: null, lastPurgeAt: null };
+  const csWatchdogTick = trackJob("cs-watchdog", async () => {
+    try {
+      const r = await tickCsWatchdog(csWatchState);
+      csWatchState = { lastWatchdogAt: r.lastWatchdogAt, lastDigestAt: r.lastDigestAt, lastDigestAttemptAt: r.lastDigestAttemptAt, lastPurgeAt: r.lastPurgeAt };
+      if (r.ranWatchdog || r.ranDigest) console.log(`[cs-watchdog] tick watchdog=${r.ranWatchdog} digest=${r.ranDigest}`);
+    } catch (err) {
+      console.error("[cs-watchdog] tick failed (non-fatal, retried next tick):", err);
+    }
+  });
+  setTimeout(() => { void csWatchdogTick(); }, 180_000);
+  setInterval(() => { void csWatchdogTick(); }, 10 * 60_000);
 }
 
 // ─── dev-request 2026-10-10-rfb-berikelse-nattjobb (R6; Daniel GO 2026-10-10,

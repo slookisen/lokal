@@ -229,6 +229,7 @@ body[data-vertical="rfb"] .topbar{border-bottom:2px solid #4ade80}
       </div>
       <span class="kpi" id="kpiP0" style="display:none"><span class="num">0</span> P0</span>
       <span class="kpi"><span class="num" id="kpiNew">0</span> nye</span>
+      <span class="kpi warn clickable" data-action="openNeedsReply" title="Tråder der siste inngående melding er nyere enn siste svar (CS på serveren)"><span class="num" id="kpiNeedsReply">0</span> trenger svar<span id="kpiNeedsReplyP0" style="display:none"> · <span class="num">0</span> &gt;24 t</span></span>
       <span class="kpi warn clickable" data-action="openAwaiting" title="Vis tråder som venter på Daniel"><span class="num" id="kpiAwait">0</span> venter</span>
       <span class="kpi"><span class="num" id="kpiOutbox">0</span> i kø</span>
       <button class="btn-sm" data-action="refresh">↻ Oppdater</button>
@@ -696,6 +697,13 @@ async function loadSummary() {
       document.getElementById('kpiP0').style.display = 'none';
     }
   } catch (e) { toast(e.message, true); }
+  try {
+    const nr = await api('/needs-reply?limit=500');
+    document.getElementById('kpiNeedsReply').textContent = nr.counts.threads + nr.counts.untriaged_open;
+    const p0 = document.getElementById('kpiNeedsReplyP0');
+    if (nr.counts.p0 > 0) { p0.querySelector('.num').textContent = nr.counts.p0; p0.style.display = 'inline'; }
+    else { p0.style.display = 'none'; }
+  } catch (e) { /* older server without /needs-reply — keep the KPI at 0 */ }
 }
 
 function onSearchChange() {
@@ -962,6 +970,8 @@ function slugify(s) {
 // ─── Awaiting-review (venter) modal ───
 async function openAwaiting() {
   document.getElementById('awaitOverlay').style.display = 'flex';
+  document.getElementById('awaitTitle').textContent = 'Eposter som venter på Daniel';
+  document.getElementById('awaitSubtitle').innerHTML = 'Tråder satt til <code>awaiting_review</code>';
   const list = document.getElementById('awaitList');
   list.innerHTML = '<div class="await-empty">Laster…</div>';
   try {
@@ -999,6 +1009,68 @@ async function openAwaiting() {
   } catch (e) {
     list.innerHTML = `<div class="await-empty" style="color:var(--danger)">Feil: ${escapeHtml(e.message)}</div>`;
   }
+}
+
+// ─── «Trenger svar» (CS på serveren, S1) — reuses the awaiting modal ───
+const PLATFORM_LABEL = { rfb: 'RFB', experiences: 'OpplevAgent', dental: 'Tannlege' };
+async function openNeedsReply() {
+  document.getElementById('awaitOverlay').style.display = 'flex';
+  document.getElementById('awaitTitle').textContent = 'Trenger svar';
+  document.getElementById('awaitSubtitle').textContent = 'Siste inngående melding er nyere enn siste svar. Eldst først.';
+  const list = document.getElementById('awaitList');
+  list.innerHTML = '<div class="await-empty">Laster…</div>';
+  try {
+    const nr = await api('/needs-reply?limit=500');
+    const rows = [];
+    for (const t of nr.threads) {
+      const lvl = t.level === 'p0' ? '<span class="pill p0">&gt;24 t</span>' : t.level === 'p1' ? '<span class="pill p1">&gt;12 t</span>' : '';
+      rows.push(`
+        <div class="await-row">
+          <div class="row-top">
+            <div class="subject">${escapeHtml(t.subject || '(uten emne)')}</div>
+            <div class="when" title="${escapeHtml(fmtFull(t.last_inbound_at))}">${Math.floor(t.age_hours)} t</div>
+          </div>
+          <div class="from"><span class="name">${escapeHtml(t.contact_name || t.contact_email)}</span> · ${escapeHtml(t.contact_email)}</div>
+          <div class="meta">
+            <span class="pill">${escapeHtml(PLATFORM_LABEL[t.vertical] || t.vertical)}</span>
+            ${lvl}
+            <span style="color:var(--text-dim)">Status: ${escapeHtml(t.status)}</span>
+          </div>
+          <div class="actions">
+            <button class="btn-secondary" data-action="markNoReplyNeeded" data-id="${escapeHtml(t.thread_id)}" title="Marker at tråden ikke trenger svar (begrunnelse kreves)">Trenger ikke svar</button>
+            <button class="btn-primary" data-action="openThreadFromAwait" data-id="${escapeHtml(t.thread_id)}" data-contact="${escapeHtml(t.contact_id)}" data-type="${escapeHtml(t.contact_type || 'unknown')}">Åpne tråd →</button>
+          </div>
+        </div>`);
+    }
+    for (const u of nr.untriaged) {
+      rows.push(`
+        <div class="await-row">
+          <div class="row-top">
+            <div class="subject">${escapeHtml(u.subject || '(uten emne)')}</div>
+            <div class="when" title="${escapeHtml(fmtFull(u.created_at))}">${Math.floor(u.age_hours)} t</div>
+          </div>
+          <div class="from"><span class="name">${escapeHtml(u.from_email)}</span></div>
+          <div class="meta"><span class="pill">Ikke fordelt til plattform</span>${u.level === 'p0' ? '<span class="pill p0">&gt;24 t</span>' : ''}</div>
+        </div>`);
+    }
+    if (nr.counts.forward_failed > 0) {
+      rows.unshift(`<div class="await-empty" style="color:var(--danger)">${nr.counts.forward_failed} innkommende e-post kunne ikke videresendes til Gmail (prøves på nytt av CS-vakten, eller ga opp de siste 7 døgn).</div>`);
+    }
+    list.innerHTML = rows.length ? rows.join('') : '<div class="await-empty">Alt er besvart \u2728</div>';
+  } catch (e) {
+    list.innerHTML = `<div class="await-empty" style="color:var(--danger)">Feil: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function markNoReplyNeeded(threadId) {
+  const reason = prompt('Hvorfor trenger tråden ikke svar? (f.eks. «bare takk», «spam»)');
+  if (!reason || !reason.trim()) return;
+  try {
+    await api('/threads/' + encodeURIComponent(threadId) + '/no-reply-needed', { method: 'POST', body: JSON.stringify({ reason: reason.trim(), actor: 'daniel' }) });
+    toast('Markert: trenger ikke svar');
+    await refresh();
+    await openNeedsReply();
+  } catch (e) { toast(e.message, true); }
 }
 
 function closeAwait() {
@@ -1113,6 +1185,8 @@ const ACTIONS = {
   saveContactNotes: id => saveContactNotes(id),
   saveThreadNotes: id => saveThreadNotes(id),
   openAwaiting,
+  openNeedsReply,
+  markNoReplyNeeded: id => markNoReplyNeeded(id),
   closeAwait,
   openThreadFromAwait: (id, _val, el) => {
     const contact = el?.dataset?.contact;
