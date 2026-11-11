@@ -130,11 +130,16 @@ export async function runDentalPrivacyTruthTests(opts: { log?: boolean } = {}): 
     "the page says the marker holds nothing about the person and is used to count visits from AI answers");
   assertTrue(/summeres per dag, klinikkside og AI-tjeneste, uten IP-hash eller annen kobling til den besøkende, og summene vises på klinikksidene\. Summene slettes ikke automatisk i dag/.test(t2),
     "totals without the IP hash, shown on clinic pages, no automatic deletion");
-  assertTrue(!/kontaktknapp/i.test(t2), "no contact-click claim: dental profile pages do not count contact clicks");
+  assertTrue(!/kontaktknapp/i.test(t2), "no RFB contact-button wording on Finn-tannlege");
   const dentalSrc = fs.readFileSync(path.join(__dirname, "dental-seo.ts"), "utf8");
   assertTrue(!/api\/track\/contact-click/.test(dentalSrc) && /recordAiProfileClick/.test(dentalSrc),
-    "code: dental counts AI-answer visits but has no contact-click beacon");
-  assertTrue(/Sist oppdatert: 2026-11-08/.test(text), "updated date is 2026-11-08");
+    "code: dental counts AI-answer visits and never uses the RFB contact-click beacon");
+  // 6. Clicks on to the clinic (dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord, S4).
+  assertTrue(/Når du klikker på en lenke på en klinikkside videre til klinikken \(timebestilling, nettside, telefon eller e-post\), teller vi klikket uten cookies og uten navn eller kontaktopplysninger om deg - bare hvilken klinikk, hvilken lenke, tidspunktet og den samme pseudonyme besøks-ID-en som sidebesøkene \(med en saltet, forkortet hash av IP-adressen, aldri hele IP-adressen\), og klikkene slettes ikke automatisk i dag\./.test(t2),
+    "the page says clicks on to the clinic are counted with the pseudonymous visit ID, not deleted automatically");
+  assertTrue(/profileLinkRedirectHandler\(\["klinikk"\]\)/.test(dentalSrc) && /profileLinkBeaconAttrs\("klinikk"/.test(dentalSrc),
+    "code: clinic pages count clicks (redirect + beacon), as the page says");
+  assertTrue(/Sist oppdatert: 2026-11-11/.test(text), "updated date is 2026-11-11");
 
   return { passed, failed, failures };
 }

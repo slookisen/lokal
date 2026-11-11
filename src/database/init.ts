@@ -4977,6 +4977,41 @@ function initSchema(db: Database.Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_contact_clicks_agent_id ON contact_clicks(agent_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_contact_clicks_created_at ON contact_clicks(created_at)`);
 
+  // dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord, slice S4:
+  // profile_link_clicks — the contact_clicks twin for the outgoing links on
+  // the Opplevagent (opplevelse / tilbyder / gårdssalg produsent) and
+  // Finn-tannlege (klinikk) profile pages: GET /ut/:surface/:id/:kind on the
+  // vertical's host and POST /api/track/profile-click
+  // (services/profile-link-clicks.ts). A sibling table rather than new
+  // contact_clicks columns, so every RFB reader of contact_clicks (owner
+  // stats, partner report, S3 admin numbers) keeps counting only RFB.
+  // Brand-new table → CREATE IF NOT EXISTS is the whole migration.
+  //   platform    : 'opplevelser' | 'gardssalg' | 'tannlege'
+  //   entity_type : 'experience' | 'provider' | 'clinic'; entity_id its id in
+  //                 the vertical DB (no FK — another database)
+  //   provider_id : the provider / clinic that owns the link
+  //   kind        : 'booking' | 'website' | 'directory' (redirect) or
+  //                 'phone' | 'email' (beacon). Never a URL.
+  //   session_id / is_bot : exactly as contact_clicks (hashed-IP session,
+  //                 parseUserAgent bot flag) — no new personal data.
+  //   is_test     : 1 when the provider is a test provider
+  //                 (experience_providers.is_test_provider = 1) at click time.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS profile_link_clicks (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      platform    TEXT NOT NULL,
+      entity_type TEXT NOT NULL,
+      entity_id   TEXT NOT NULL,
+      provider_id TEXT,
+      kind        TEXT NOT NULL,
+      session_id  TEXT,
+      is_bot      INTEGER NOT NULL DEFAULT 0,
+      is_test     INTEGER NOT NULL DEFAULT 0,
+      created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_profile_link_clicks_platform_created ON profile_link_clicks(platform, created_at)`);
+
   // B4: where the visitor who clicked came from (utm_source on the landing
   // URL / same-origin Referer). Nullable, additive; metadata-only ALTER.
   try {

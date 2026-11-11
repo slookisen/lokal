@@ -189,7 +189,7 @@ export async function runOpplevagentPrivacyTruthTests(opts: { log?: boolean } = 
   assertTrue(/utsendingslogg/.test(noT) && /send log/.test(enT) && /korrespondansen/.test(noT) && /correspondence/.test(enT),
     "both parts say the send log and the correspondence are stored");
   assertTrue(/kontakt@opplevagent\.no/.test(noT) && /kontakt@opplevagent\.no/.test(enT), "deletion/objection contact address is on the page in both parts");
-  assertTrue(/8\. november 2026/.test(noT) && /8 November 2026/.test(enT), "both parts show today's updated date, 8 November 2026");
+  assertTrue(/11\. november 2026/.test(noT) && /11 November 2026/.test(enT), "both parts show today's updated date, 11 November 2026");
 
   // 1b. AI-answer marker (dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 6).
   {
@@ -203,7 +203,28 @@ export async function runOpplevagentPrivacyTruthTests(opts: { log?: boolean } = 
     assertTrue(/summeres per dag, side og AI-tjeneste, uten IP-hash eller annen kobling til den besøkende, og summene vises på opplevelsessidene\. Summene slettes ikke automatisk i dag/.test(noA) &&
       /summed per day, page and AI service, with no IP hash or other link to the visitor, and the totals are shown on the experience pages\. The totals are not deleted automatically today/.test(enA),
       "both parts: totals without the IP hash, shown on experience pages, no automatic deletion");
-    assertTrue(!/kontaktknapp/i.test(noA) && !/contact button/i.test(enA), "no contact-click claim: Opplevagent pages do not count contact clicks");
+    // S4 (dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord): clicks on to the provider are
+    // now counted (profile_link_clicks); the page says so, in the same terms as the code.
+    assertTrue(!/kontaktknapp/i.test(noA) && !/contact button/i.test(enA), "no RFB contact-button wording on Opplevagent");
+    assertTrue(/<strong>Klikk videre til tilbyderen:<\/strong> når du klikker på en lenke på en opplevelses-, tilbyder- eller produsentside videre til tilbyderen \(booking, nettside, telefon eller e-post\), teller vi klikket uten cookies og uten navn eller kontaktopplysninger om deg/.test(no) &&
+      /<strong>Clicks on to the provider:<\/strong> when you click a link on an experience, provider or producer page that leads on to the provider \(booking, website, phone or email\), we count the click without cookies and without your name or contact details/.test(en),
+      "both parts say clicks on to the provider are counted without cookies or contact details");
+    assertTrue(/samme pseudonyme besøks-ID-en som sidebesøkene \(med en saltet, forkortet hash av IP-adressen, aldri hele IP-adressen\), og klikkene slettes ikke automatisk i dag/.test(noA) &&
+      /same pseudonymous visit ID as the page visits \(with a salted, truncated hash of the IP address, never the full IP address\), and the clicks are not deleted automatically today/.test(enA),
+      "both parts: pseudonymous visit ID (salted IP hash), no automatic deletion");
+    {
+      const root = path.join(__dirname, "..");
+      const initSrc = fs.readFileSync(path.join(root, "database", "init.ts"), "utf8");
+      const t = initSrc.match(/CREATE TABLE IF NOT EXISTS profile_link_clicks \(([\s\S]*?)\)\s*`/);
+      assertTrue(!!t && !/\bip\b|ip_hash|email|epost|navn|\bname\b|cookie/i.test(t[1]) && /session_id/.test(t[1]),
+        "code: profile_link_clicks holds the visit ID but no IP, name, e-mail or cookie column");
+      const plcSrc = fs.readFileSync(path.join(root, "services", "profile-link-clicks.ts"), "utf8");
+      assertTrue(/analyticsService\.getOrCreateSessionId\(req, res\)/.test(plcSrc), "code: the visit ID is the page-visit session id");
+      const walk = (d: string): string[] => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) =>
+        e.isDirectory() ? walk(path.join(d, e.name)) : (e.name.endsWith(".ts") && !e.name.endsWith(".test.ts") ? [path.join(d, e.name)] : []));
+      assertTrue(!walk(root).some((f) => /DELETE\s+FROM\s+profile_link_clicks/i.test(fs.readFileSync(f, "utf8"))),
+        "code: no automatic deletion of profile_link_clicks (as the page says) — update /personvern if one is added");
+    }
   }
 
   // 2. «fjern» hides, does not delete.

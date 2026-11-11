@@ -110,7 +110,7 @@ export async function runGardssalgGuestContactSweepTests(opts: { log?: boolean }
     const seoSrc = fs.readFileSync(require.resolve("../routes/experiences-seo"), "utf8");
     assertTrue(seoSrc.includes("Navn, e-post, telefon og kommentar slettes automatisk 30 dager etter at forespørselen er avgjort (gjennomført besøk, uteblitt eller kansellert), eller 30 dager etter ønsket besøksdato hvis den aldri ble avgjort. Dato, produsent, antall personer og status beholdes uten opplysninger om deg. Ber du om det, sletter vi tidligere."), "personvern: new Norwegian sentence");
     assertTrue(!/Besøksforespørsler<\/td><td>Ingen automatisk sletting i dag/.test(seoSrc), "personvern: old visit-request text gone");
-    assertTrue(seoSrc.includes("<strong>Sist oppdatert:</strong> 8. november 2026") && seoSrc.includes("<strong>Last updated:</strong> 8 November 2026"), "personvern: updated dates");
+    assertTrue(seoSrc.includes("<strong>Sist oppdatert:</strong> 11. november 2026") && seoSrc.includes("<strong>Last updated:</strong> 11 November 2026"), "personvern: updated dates");
 
     // Admin dry-run route.
     const prevKey = process.env.ADMIN_KEY;

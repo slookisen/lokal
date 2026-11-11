@@ -91,6 +91,22 @@ function hrefAfter(html: string, before: string): string | null {
   return m ? decodeAttr(m[1]) : null;
 }
 
+// S4 (dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord): the profile
+// links now point at the counting redirect /ut/<surface>/<id>/<kind>; the
+// UTM tags moved to its target. Resolves such an href to the URL the redirect
+// sends the browser to (read from the DB, as GET /ut/... does, without
+// recording a click); null when the redirect would 404. Any other href is
+// returned as is.
+type Plc = typeof import("../services/profile-link-clicks");
+function utTarget(plc: Plc, href: string | null): string | null {
+  if (href === null) return null;
+  const m = /^\/ut\/([a-z]+)\/([^/]+)\/([a-z]+)$/.exec(href);
+  if (!m) return href;
+  if (!plc.isProfileLinkSurface(m[1])) return null;
+  const entity = plc.resolveProfileLinkEntity(m[1], decodeURIComponent(m[2]));
+  return entity ? plc.resolveProfileLinkTarget(entity, m[3]) : null;
+}
+
 function tagged(url: string, source: string, campaign: string): string {
   const u = new URL(url);
   u.searchParams.set("utm_source", source);
@@ -153,11 +169,14 @@ export async function runOutboundUtmTests(opts: { log?: boolean } = {}): Promise
   // ══════════════════════════════════════════════════════════════
   {
     const prevDentalPath = process.env.DENTAL_DB_PATH;
+    const prevEnableDental = process.env.ENABLE_DENTAL;
     process.env.DENTAL_DB_PATH = ":memory:";
+    process.env.ENABLE_DENTAL = "1";
     const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([
       require.resolve("../database/db-factory"),
       require.resolve("./dental-seo"),
       require.resolve("../services/dental-store"),
+      require.resolve("../services/profile-link-clicks"),
     ]);
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -166,6 +185,8 @@ export async function runOutboundUtmTests(opts: { log?: boolean } = {}): Promise
       const store = require("../services/dental-store") as typeof import("../services/dental-store");
       const dentalSeo = require("./dental-seo") as typeof import("./dental-seo");
       const router = dentalSeo.default as any;
+      const plc = require("../services/profile-link-clicks") as Plc;
+      const T = (h: string | null) => utTarget(plc, h);
       const mkClinic = (navn: string, orgNr: string, hjemmeside: string): string => store.createDentalAgent({
         navn, org_nr: orgNr, adresse: "Storgata 2", postnummer: "5700", poststed: "VOSS", fylke: "Vestland",
         telefon: "+47 56 51 00 00", hjemmeside,
@@ -183,16 +204,18 @@ export async function runOutboundUtmTests(opts: { log?: boolean } = {}): Promise
         const tag = `dental ${path.startsWith("/klinikk/id/") ? "/klinikk/id/:id" : "/klinikk/<slug>"}`;
         const r = await callHtmlRoute(router, path);
         assertTrue(r.handled && r.status === 200, `${tag}: renders 200 (status ${r.status})`);
-        const href = hrefAfter(r.body, '<div class="info-label">Hjemmeside</div>');
+        const rawHref = hrefAfter(r.body, '<div class="info-label">Hjemmeside</div>');
+        assertEq(rawHref, `/ut/klinikk/${clinicId}/website`, `${tag}: Hjemmeside href is the counting redirect (S4)`);
+        const href = T(rawHref);
         assertEq(href, expected, `${tag}: Hjemmeside href is the stored URL plus UTM`);
         assertTrue(!!href && href.includes("utm_source=finn-tannlege&utm_medium=referral&utm_campaign=clinic_profile"),
           `${tag}: Hjemmeside href carries utm_source=finn-tannlege&utm_medium=referral&utm_campaign=clinic_profile (AC-S1-1)`);
-        assertTrue(r.body.includes("utm_source=finn-tannlege&amp;utm_medium=referral&amp;utm_campaign=clinic_profile"),
-          `${tag}: the & between the UTM params is HTML-escaped in the attribute`);
+        assertTrue(!r.body.includes("utm_source=finn-tannlege"),
+          `${tag}: the UTM tags are on the redirect target, not in the page (S4)`);
         assertTrue(r.body.includes('rel="nofollow noopener" target="_blank">voss-tann.example.no/om-oss</a>'),
           `${tag}: Hjemmeside link text is the stored URL without scheme, as before`);
-        assertEq(hrefsWhere(r.body, /class="btn-book"/), [booking], `${tag}: «Book time online» href is online_booking_url as stored`);
-        assertEq(hrefAfter(r.body, '<div class="info-label">Oversikt hos fylkeskommunen</div>'), directory,
+        assertEq(hrefsWhere(r.body, /class="btn-book"/).map(T), [booking], `${tag}: «Book time online» href is online_booking_url as stored`);
+        assertEq(T(hrefAfter(r.body, '<div class="info-label">Oversikt hos fylkeskommunen</div>')), directory,
           `${tag}: directory_url href is as stored`);
         const blocks = assertNoUtmInJsonLd(r.body, tag);
         const dentist = flat(blocks).find((n) => n?.["@type"] === "Dentist");
@@ -203,7 +226,7 @@ export async function runOutboundUtmTests(opts: { log?: boolean } = {}): Promise
       const ownUtm = "https://egen-tann.example.no/?utm_source=nyhetsbrev&utm_medium=email";
       const ownId = mkClinic("Egen Utm Tannklinikk AS", "918800202", ownUtm);
       const own = await callHtmlRoute(router, `/klinikk/id/${ownId}`);
-      assertEq(hrefAfter(own.body, '<div class="info-label">Hjemmeside</div>'), ownUtm,
+      assertEq(T(hrefAfter(own.body, '<div class="info-label">Hjemmeside</div>')), ownUtm,
         "dental: a hjemmeside with its own utm_source is rendered untouched");
       assertTrue(!own.body.includes("utm_source=finn-tannlege"), "dental: … and finn-tannlege UTM is not added anywhere on that page");
 
@@ -211,7 +234,7 @@ export async function runOutboundUtmTests(opts: { log?: boolean } = {}): Promise
       const quoteId = mkClinic("Sitat Tannklinikk AS", "918800203", 'https://sitat.example.no/a"onmouseover="alert(1)');
       const quote = await callHtmlRoute(router, `/klinikk/id/${quoteId}`);
       assertTrue(quote.status === 200 && !quote.body.includes('"onmouseover="'), "dental: a quote in hjemmeside cannot break out of the href attribute");
-      const quoteHref = hrefAfter(quote.body, '<div class="info-label">Hjemmeside</div>') ?? "";
+      const quoteHref = T(hrefAfter(quote.body, '<div class="info-label">Hjemmeside</div>')) ?? "";
       assertTrue(quoteHref.startsWith("https://sitat.example.no/") && quoteHref.includes("utm_campaign=clinic_profile"),
         "dental: … and the link still goes to the clinic with UTM");
     } catch (err) {
@@ -219,6 +242,7 @@ export async function runOutboundUtmTests(opts: { log?: boolean } = {}): Promise
       failures.push(`dental section: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
     } finally {
       if (prevDentalPath === undefined) delete process.env.DENTAL_DB_PATH; else process.env.DENTAL_DB_PATH = prevDentalPath;
+      if (prevEnableDental === undefined) delete process.env.ENABLE_DENTAL; else process.env.ENABLE_DENTAL = prevEnableDental;
       try { (require("../database/db-factory") as typeof import("../database/db-factory")).__resetDbFactoryForTesting(); } catch { /* best-effort */ }
       restoreModuleCache();
     }
@@ -230,13 +254,16 @@ export async function runOutboundUtmTests(opts: { log?: boolean } = {}): Promise
   {
     const prevDb = process.env.EXPERIENCES_DB_PATH;
     const prevSwitcher = process.env.OPPLEVAGENT_LANG_SWITCHER_ENABLED;
+    const prevEnableExp = process.env.ENABLE_EXPERIENCES;
     process.env.EXPERIENCES_DB_PATH = ":memory:";
+    process.env.ENABLE_EXPERIENCES = "1";
     delete process.env.OPPLEVAGENT_LANG_SWITCHER_ENABLED;
     const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([
       require.resolve("../database/db-factory"),
       require.resolve("../services/experience-store"),
       require.resolve("../services/booking-store"),
       require.resolve("../services/gardssalg-claim"),
+      require.resolve("../services/profile-link-clicks"),
       require.resolve("./experiences-seo"),
     ]);
     try {
@@ -287,6 +314,8 @@ export async function runOutboundUtmTests(opts: { log?: boolean } = {}): Promise
       insGs.run({ id: "ou-gs-own", navn: "Egen Utm Bryggeri", slug: "egen-utm-bryggeri", site: ownUtm });
 
       const router = (require("./experiences-seo") as typeof import("./experiences-seo")).default as any;
+      const plc = require("../services/profile-link-clicks") as Plc;
+      const T = (h: string | null) => utTarget(plc, h);
       const provTagged = tagged(site, "opplevagent", "provider_profile");
 
       // /opplevelse without booking_url: CTA and provider name go to the site.
@@ -294,10 +323,10 @@ export async function runOutboundUtmTests(opts: { log?: boolean } = {}): Promise
         const tag = "oa /opplevelse (no booking_url)";
         const r = await callHtmlRoute(router, "/opplevelse/ou-uten-booking");
         assertTrue(r.handled && r.status === 200, `${tag}: renders 200 (status ${r.status})`);
-        assertEq(hrefsWhere(r.body, /class="cta"/), [provTagged], `${tag}: website CTA href carries utm_source=opplevagent / provider_profile (AC-S1-2)`);
-        assertEq(hrefAfter(r.body, '<p class="prov-name">'), provTagged, `${tag}: provider-name link carries the same UTM`);
+        assertEq(hrefsWhere(r.body, /class="cta"/).map(T), [provTagged], `${tag}: website CTA href carries utm_source=opplevagent / provider_profile (AC-S1-2)`);
+        assertEq(T(hrefAfter(r.body, '<p class="prov-name">')), provTagged, `${tag}: provider-name link carries the same UTM`);
         assertTrue(r.body.includes(">Full Tilbyder AS</a>"), `${tag}: provider-name link text unchanged`);
-        assertEq(hrefAfter(r.body, '<p class="evidence">Kilde: '), evidence, `${tag}: «Kilde:» href is evidence_url as stored`);
+        assertEq(T(hrefAfter(r.body, '<p class="evidence">Kilde: ')), evidence, `${tag}: «Kilde:» href is evidence_url as stored`);
         const blocks = assertNoUtmInJsonLd(r.body, tag);
         assertTrue(JSON.stringify(blocks).includes(JSON.stringify(site)), `${tag}: JSON-LD still names the stored website`);
       }
@@ -306,8 +335,8 @@ export async function runOutboundUtmTests(opts: { log?: boolean } = {}): Promise
         const tag = "oa /opplevelse (booking_url)";
         const r = await callHtmlRoute(router, "/opplevelse/ou-med-booking");
         assertTrue(r.handled && r.status === 200, `${tag}: renders 200 (status ${r.status})`);
-        assertEq(hrefsWhere(r.body, /class="cta"/), [booking], `${tag}: booking CTA href is booking_url as stored`);
-        assertEq(hrefAfter(r.body, '<p class="prov-name">'), provTagged, `${tag}: provider-name link still carries UTM`);
+        assertEq(hrefsWhere(r.body, /class="cta"/).map(T), [booking], `${tag}: booking CTA href is booking_url as stored`);
+        assertEq(T(hrefAfter(r.body, '<p class="prov-name">')), provTagged, `${tag}: provider-name link still carries UTM`);
         assertNoUtmInJsonLd(r.body, tag);
       }
       // /tilbyder, Brreg-verified: chip + contact «Nettside».
@@ -316,8 +345,8 @@ export async function runOutboundUtmTests(opts: { log?: boolean } = {}): Promise
         const r = await callHtmlRoute(router, "/tilbyder/full-tilbyder");
         assertTrue(r.handled && r.status === 200, `${tag}: renders 200 (status ${r.status})`);
         assertTrue(r.body.includes("✓ Verifisert mot Brønnøysundregistrene"), `${tag}: the verified chip branch rendered`);
-        assertEq(hrefsWhere(r.body, /class="chip"/), [provTagged], `${tag}: «Tilbyderens nettside» chip href carries UTM (AC-S1-2)`);
-        assertEq(hrefAfter(r.body, "<strong>Nettside:</strong> "), provTagged, `${tag}: contact «Nettside» href carries UTM`);
+        assertEq(hrefsWhere(r.body, /class="chip"/).map(T), [provTagged], `${tag}: «Tilbyderens nettside» chip href carries UTM (AC-S1-2)`);
+        assertEq(T(hrefAfter(r.body, "<strong>Nettside:</strong> ")), provTagged, `${tag}: contact «Nettside» href carries UTM`);
         assertTrue(r.body.includes(">full.example.no</a></li>"), `${tag}: contact «Nettside» link text is still the host`);
         const blocks = assertNoUtmInJsonLd(r.body, tag);
         const org = flat(blocks).find((n) => n?.["@type"] === "Organization" && n?.name === "Full Tilbyder AS");
@@ -329,18 +358,18 @@ export async function runOutboundUtmTests(opts: { log?: boolean } = {}): Promise
         const r = await callHtmlRoute(router, "/tilbyder/uverifisert-tilbyder");
         assertTrue(r.handled && r.status === 200, `${tag}: renders 200 (status ${r.status})`);
         assertTrue(!r.body.includes("✓ Verifisert mot Brønnøysundregistrene"), `${tag}: the unverified chip branch rendered`);
-        assertEq(hrefsWhere(r.body, /class="chip"/), [tagged("https://uverifisert.example.no/turer", "opplevagent", "provider_profile")],
+        assertEq(hrefsWhere(r.body, /class="chip"/).map(T), [tagged("https://uverifisert.example.no/turer", "opplevagent", "provider_profile")],
           `${tag}: «Tilbyderens nettside» chip href carries UTM`);
       }
       // The provider's own utm_source wins on every link.
       {
         const tag = "oa own utm_source";
         const exp = await callHtmlRoute(router, "/opplevelse/ou-egen-utm");
-        assertEq(hrefsWhere(exp.body, /class="cta"/), [ownUtm], `${tag}: /opplevelse CTA href untouched`);
-        assertEq(hrefAfter(exp.body, '<p class="prov-name">'), ownUtm, `${tag}: /opplevelse provider-name href untouched`);
+        assertEq(hrefsWhere(exp.body, /class="cta"/).map(T), [ownUtm], `${tag}: /opplevelse CTA href untouched`);
+        assertEq(T(hrefAfter(exp.body, '<p class="prov-name">')), ownUtm, `${tag}: /opplevelse provider-name href untouched`);
         const prov = await callHtmlRoute(router, "/tilbyder/egen-utm-tilbyder");
-        assertEq(hrefsWhere(prov.body, /class="chip"/), [ownUtm], `${tag}: /tilbyder chip href untouched`);
-        assertEq(hrefAfter(prov.body, "<strong>Nettside:</strong> "), ownUtm, `${tag}: /tilbyder contact href untouched`);
+        assertEq(hrefsWhere(prov.body, /class="chip"/).map(T), [ownUtm], `${tag}: /tilbyder chip href untouched`);
+        assertEq(T(hrefAfter(prov.body, "<strong>Nettside:</strong> ")), ownUtm, `${tag}: /tilbyder contact href untouched`);
         for (const [path, body] of [["/opplevelse", exp.body], ["/tilbyder", prov.body]]) {
           assertTrue(!body.includes("utm_source=opplevagent"), `${tag}: ${path} adds no opplevagent UTM anywhere`);
         }
@@ -350,7 +379,10 @@ export async function runOutboundUtmTests(opts: { log?: boolean } = {}): Promise
         const tag = "oa unparseable website";
         const r = await callHtmlRoute(router, "/tilbyder/ugyldig-url-tilbyder");
         assertTrue(r.handled && r.status === 200, `${tag}: renders 200 (status ${r.status})`);
-        assertEq(hrefsWhere(r.body, /class="chip"/), [unparseable], `${tag}: chip href is the stored value, no UTM`);
+        // S4: the chip goes through /ut/; a stored value that is not a valid absolute URL
+        // (no browser could open it) makes the redirect 404 instead of handing it on.
+        assertEq(hrefsWhere(r.body, /class="chip"/), ["/ut/tilbyder/ou-bad/website"], `${tag}: chip href is the counting redirect`);
+        assertEq(hrefsWhere(r.body, /class="chip"/).map(T), [null], `${tag}: … which 404s for an unparseable stored value (never redirects to it)`);
       }
       // Gårdssalg producer page: intro link + «Nettside» fact.
       {
@@ -358,16 +390,16 @@ export async function runOutboundUtmTests(opts: { log?: boolean } = {}): Promise
         const r = await callHtmlRoute(router, "/kategori/gardssalg/produsent/vossa-bryggeri");
         assertTrue(r.handled && r.status === 200, `${tag}: renders 200 (status ${r.status})`);
         const gsTagged = tagged(gsSite, "opplevagent", "gardssalg_profile");
-        assertEq(hrefAfter(r.body, "Les mer om produsenten og produktene på "), gsTagged,
+        assertEq(T(hrefAfter(r.body, "Les mer om produsenten og produktene på ")), gsTagged,
           `${tag}: intro link carries utm_source=opplevagent / gardssalg_profile (AC-S1-2)`);
-        assertEq(hrefAfter(r.body, '<th scope="row">Nettside</th><td>'), gsTagged, `${tag}: «Nettside» fact href carries the same UTM`);
+        assertEq(T(hrefAfter(r.body, '<th scope="row">Nettside</th><td>')), gsTagged, `${tag}: «Nettside» fact href carries the same UTM`);
         assertTrue(r.body.includes(">gard.example.no</a>"), `${tag}: link text is still the host`);
         assertTrue(!r.body.includes("utm_campaign=provider_profile"), `${tag}: the page uses the gardssalg_profile row only`);
         const blocks = assertNoUtmInJsonLd(r.body, tag);
         assertTrue(flat(blocks).some((n) => Array.isArray(n?.sameAs) && n.sameAs.includes(gsSite)), `${tag}: JSON-LD sameAs is the stored website`);
 
         const own = await callHtmlRoute(router, "/kategori/gardssalg/produsent/egen-utm-bryggeri");
-        assertEq(hrefAfter(own.body, '<th scope="row">Nettside</th><td>'), ownUtm, `${tag}: a website with its own utm_source is untouched`);
+        assertEq(T(hrefAfter(own.body, '<th scope="row">Nettside</th><td>')), ownUtm, `${tag}: a website with its own utm_source is untouched`);
         assertTrue(!own.body.includes("utm_source=opplevagent"), `${tag}: … and no opplevagent UTM is added anywhere on that page`);
       }
     } catch (err) {
@@ -376,6 +408,7 @@ export async function runOutboundUtmTests(opts: { log?: boolean } = {}): Promise
     } finally {
       if (prevDb === undefined) delete process.env.EXPERIENCES_DB_PATH; else process.env.EXPERIENCES_DB_PATH = prevDb;
       if (prevSwitcher === undefined) delete process.env.OPPLEVAGENT_LANG_SWITCHER_ENABLED; else process.env.OPPLEVAGENT_LANG_SWITCHER_ENABLED = prevSwitcher;
+      if (prevEnableExp === undefined) delete process.env.ENABLE_EXPERIENCES; else process.env.ENABLE_EXPERIENCES = prevEnableExp;
       try { (require("../database/db-factory") as typeof import("../database/db-factory")).__resetDbFactoryForTesting(); } catch { /* best-effort */ }
       restoreModuleCache();
     }
