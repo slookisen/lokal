@@ -43,10 +43,11 @@
 //               org.nr or the same contact e-mail ("exact"), or the same
 //               normalised name in the same city ("possible"). ≤ 5 ids each.
 //   domain_tie  the own e-mail domain or the website domain plausibly ties to
-//               the entity: the registrable domain's label (normalised, æøå
-//               folded) contains a non-generic token (≥4 letters) of the Brreg
-//               name or the profile name, or the answering website shows the
-//               Brreg name. Only booleans are stored.
+//               the Brreg entity: the registrable domain's label (normalised,
+//               æøå folded) starts or ends with a non-generic Brreg-name token
+//               (≥4 letters). Never the registrant-typed profile name, never
+//               page text alone (anyone can point at a page showing a name).
+//               The e-mail domain only counts with MX. Only booleans stored.
 //   owner_claim the shared customer rule (customer-rule.ts: agents.claimed_at
 //               OR a verified agent_claims row; a revoked claim has status
 //               'revoked', so it never counts). Recorded for the reviewer; not
@@ -160,8 +161,6 @@ export interface DomainTieSignal {
   email_domain: boolean | null;
   /** Website domain's label carries a name token (null: no website host). */
   website_domain: boolean | null;
-  /** The answering website shows the Brreg name (null: not checked). */
-  website_shows_brreg_name: boolean | null;
   tied: boolean;
   /** The rule needs the tie (self-reported org.nr or a name-search entity). */
   required: boolean;
@@ -267,11 +266,18 @@ function domainLabel(host: string | null): string | null {
   return label || null;
 }
 
-/** A domain label carries a non-generic name token (≥4 letters) of one of the names. */
+/**
+ * A domain label is tied to a (Brreg) name: the label — also with the ASCII
+ * spellings aa/oe folded to a/o — starts or ends with a non-generic token
+ * (≥4 letters) of the name (a concatenation of consecutive tokens starts with
+ * the first one). Boundary match, not substring: "kari" never ties makarios.
+ */
 export function domainTiesToName(host: string | null, names: string[]): boolean {
   const label = domainLabel(host);
   if (!label) return false;
-  return names.some((n) => strongTokens(String(n ?? "")).some((t) => label.includes(t)));
+  const labels = new Set([label, label.replace(/aa/g, "a").replace(/oe/g, "o")]);
+  return names.some((n) => strongTokens(String(n ?? "")).some((t) =>
+    [...labels].some((l) => l.startsWith(t) || l.endsWith(t))));
 }
 
 /** The name (normalised) appears in the page text (normalised). */
@@ -400,7 +406,6 @@ export async function assessRegistration(
 
   // ── website ──
   const host = input.url ? websiteHost(input.url) : null;
-  let pageBody = "";
   const websiteP = (async (): Promise<WebsiteSignal> => {
     const base: WebsiteSignal = { status: "ok", host, answers: null, name_on_page: null };
     if (!host) return { ...base, status: "skipped", note: "no_website" };
@@ -414,8 +419,7 @@ export async function assessRegistration(
       }
       if (r.status >= 500) { unavailable.add("website"); return { ...base, status: "unavailable", note: `http_${r.status}` }; }
       if (r.status < 200 || r.status >= 300) return { ...base, answers: false, name_on_page: false, note: `http_${r.status}` };
-      pageBody = String(r.body ?? "");
-      return { ...base, answers: true, name_on_page: pageShowsName(pageBody, input.name) };
+      return { ...base, answers: true, name_on_page: pageShowsName(String(r.body ?? ""), input.name) };
     } catch {
       unavailable.add("website");
       return { ...base, status: "unavailable", note: "unavailable" };
@@ -426,21 +430,19 @@ export async function assessRegistration(
   const dup = input.duplicates;
   const unavailableSources = [...unavailable].sort() as PrecheckSource[];
 
-  // ── domain tie (booleans only; the Brreg name and page text are not stored) ──
-  const tieNames = [brregName, input.name].filter((n) => !!String(n ?? "").trim());
+  // ── domain tie (booleans only; the Brreg name is not stored) ──
+  // Brreg name only: the profile name is registrant input and proves nothing.
+  const tieNames = brregName.trim() ? [brregName] : [];
   const ownMail = emailSig.domain_type === "own";
   const tieRequired = brreg.found && (brreg.mode === "name_search" || brreg.org_nr_self_reported);
   const domainTie: DomainTieSignal = {
     email_domain: ownMail ? domainTiesToName(domain, tieNames) : null,
     website_domain: host ? domainTiesToName(host, tieNames) : null,
-    website_shows_brreg_name: website.answers === true && brregName
-      ? strongTokens(brregName).length > 0 && pageShowsName(pageBody, brregName) : null,
     tied: false,
     required: tieRequired,
   };
-  pageBody = "";
   domainTie.tied = (ownMail && emailSig.mx === true && domainTie.email_domain === true)
-    || (website.answers === true && (domainTie.website_domain === true || domainTie.website_shows_brreg_name === true));
+    || (website.answers === true && domainTie.website_domain === true);
 
   // ── reasons (short, Norwegian) ──
   const reasons: string[] = [];
