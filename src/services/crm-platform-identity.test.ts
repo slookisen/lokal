@@ -134,14 +134,18 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
         }
         // pi8f — reply-to is what preserves the INBOUND discriminator, and
         // nothing pinned it per vertical: swapping dental's to the opplevagent
-        // address left the suite green. A distinctness set would over-constrain
-        // (rfb and dental legitimately share one address today), so the property
-        // is narrower and exact: opplevagent.no belongs to experiences alone.
+        // address left the suite green. The property is narrow and exact:
+        // opplevagent.no belongs to experiences alone (pi8g pins the full map).
         const onOpplevagent = crmMod.CRM_VERTICALS.filter(
           (v) => ident.resolveCrmIdentity(v).replyTo.endsWith("@opplevagent.no"),
         );
         assertEq(onOpplevagent.join(","), "experiences",
           "pi8f: EXACTLY ONE vertical replies to opplevagent.no — a second would route another platform's replies through the Opplevagent forwarder and destroy the steg-4 discriminator");
+        // pi8g — each platform replies to its own receiving domain now that
+        // all three receive (finn-tannlege.com since 2026-11-11).
+        assertEq(crmMod.CRM_VERTICALS.map((v) => `${v}:${ident.resolveCrmIdentity(v).replyTo}`).join(","),
+          "rfb:kontakt@rettfrabonden.com,dental:kontakt@finn-tannlege.com,experiences:kontakt@opplevagent.no",
+          "pi8g: every platform's reply-to is its own receiving address — a dental reply comes back to dental, not to Rett fra Bonden");
       }
 
       // ═══════════════════════════════════════════════════════════════
