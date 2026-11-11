@@ -43,6 +43,7 @@ import {
   htmlToPlainText,
   inboundMarkerLine,
   insertInboundLog,
+  isOurPlatformAddress,
   newInboundLogId,
   readInboundHeaders,
   registerInboundInCrm,
@@ -63,6 +64,33 @@ function normalizeRecipient(v: string): string {
 export function isPilotInboundMail(toEmails: readonly string[], ccEmails: readonly string[]): boolean {
   const pilot = new Set(PILOT_INBOX_ADDRESSES.map(normalizeRecipient));
   return [...toEmails, ...ccEmails].some((a) => typeof a === "string" && pilot.has(normalizeRecipient(a)));
+}
+
+const PILOT_FORWARD_SUBJECT_RE = /^\s*\[Pilot\]/i;
+const REPLY_FORWARD_PREFIX_RE = /^\s*(?:(?:re|sv|aw|fw|fwd|vs|vb)\s*:\s*)+/i;
+
+/** True when `email` is the address our forwards are sent from (a platform domain, or SMTP_FROM). */
+function isOurForwardSender(email: string | null | undefined): boolean {
+  if (typeof email !== "string" || !email.trim()) return false;
+  if (isOurPlatformAddress(email)) return true;
+  const smtpFrom = process.env.SMTP_FROM;
+  return !!smtpFrom && normalizeRecipient(smtpFrom) === normalizeRecipient(email);
+}
+
+/**
+ * True when `m` is a «[Pilot] …» forward copy (it may hold a magic-link token)
+ * as the CS routine sees it in Gmail: sent from one of our own addresses, with
+ * a subject — after any Re:/SV:/Fwd:/VS: prefixes — starting with «[Pilot]».
+ * The Gmail thread subject stands in only when the message carries none.
+ * /admin/crm/ingest drops such messages before anything is written.
+ */
+export function isPilotForwardCopy(
+  m: { fromEmail?: string | null; subject?: string | null },
+  threadSubject?: string | null,
+): boolean {
+  if (!isOurForwardSender(m.fromEmail)) return false;
+  const subject = m.subject ?? threadSubject ?? "";
+  return PILOT_FORWARD_SUBJECT_RE.test(subject.replace(REPLY_FORWARD_PREFIX_RE, ""));
 }
 
 export interface InboundEmailDeps {
