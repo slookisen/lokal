@@ -361,11 +361,13 @@ export async function runRegistrationPrecheckTests(opts: { log?: boolean } = {})
     eq([JSON.parse(stored.registration_precheck).recommendation, stored.registration_precheck_at, stored.is_vetted, stored.origin],
       ["avvis", NOW.toISOString(), 0, "self_registered"], "route: stored JSON + time; is_vetted stays 0");
 
-    // Queue: precheck + age_days, old fields first, order unchanged.
+    // Queue: precheck + age_days, old fields first. self-a has a verified
+    // owner claim (c1 above), so since S4b it sorts first; the rest stay
+    // oldest first.
     insert("self-b", { name: "Bekkely", city: null, created: "2026-10-20T09:00:00.000Z" });
     const q = await invoke(queueH, makeReq({}));
     const ids = (q.body.entries as any[]).map((x) => x.id);
-    eq(ids, ["self-b", "unvetted-mail", "self-a"], "queue: oldest first, only unvetted self_registered rows");
+    eq(ids, ["self-a", "self-b", "unvetted-mail"], "queue: owner-confirmed first (S4b), then oldest first, only unvetted self_registered rows");
     const a = (q.body.entries as any[]).find((x) => x.id === "self-a");
     eq(Object.keys(a).slice(0, 5), ["id", "name", "contact_email", "url", "created_at"], "queue: original fields first, same order");
     eq([a.precheck?.recommendation, a.precheck_at, a.org_nr, a.city], ["avvis", NOW.toISOString(), ORG, "Mesnali"], "queue: precheck parsed + org_nr/city");

@@ -54061,3 +54061,25 @@ runSerial(async () => {
     failures.push("products-tab-cleanup: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-11-10-rfb-registreringer-og-eierkrav-folges-opp S4b:
+// GET /admin/agents/self-registered-review-queue marks owner_confirmed
+// (customerRuleSql) + owner_label «eier bekreftet», sorts those rows first
+// (each group oldest first) and adds owner_confirmed_count; read-only.
+// Own in-memory DB pinned on getDb(), sets ADMIN_KEY (restored in finally)
+// — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── S4b: registreringskø med «eier bekreftet» øverst ──");
+  try {
+    const { runSelfRegisteredQueueOwnerS4bTests } = require("../src/routes/self-registered-queue-owner-s4b.test") as
+      typeof import("../src/routes/self-registered-queue-owner-s4b.test");
+    const r = await runSelfRegisteredQueueOwnerS4bTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("self-registered-queue-owner-s4b: " + f);
+    console.log(`  self-registered-queue-owner-s4b: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("self-registered-queue-owner-s4b: unexpected error: " + String(err?.message || err));
+  }
+});
