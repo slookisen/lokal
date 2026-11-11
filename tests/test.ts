@@ -45090,6 +45090,74 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── dev-request 2026-11-10-cs-paa-serveren: S2 (svarforslag, sendejobb, godkjenningskø, utboks) ──");
+  try {
+    const { runCsReplyProposalsTests } = require("../src/services/cs-reply-proposals.test") as
+      typeof import("../src/services/cs-reply-proposals.test");
+    const crp = await runCsReplyProposalsTests({ log: false });
+    passed += crp.passed;
+    failed += crp.failed;
+    for (const f of crp.failures) failures.push("cs-reply-proposals: " + f);
+    console.log(`  cs-reply-proposals: ${crp.passed} passed, ${crp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("cs-reply-proposals: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ cs-reply-proposals: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-10-cs-paa-serveren: S3 (leveringsstatus per CRM-melding) ──");
+  try {
+    const { runCrmDeliveryStatusTests } = require("../src/services/crm-delivery-status.test") as
+      typeof import("../src/services/crm-delivery-status.test");
+    const cds = await runCrmDeliveryStatusTests({ log: false });
+    passed += cds.passed;
+    failed += cds.failed;
+    for (const f of cds.failures) failures.push("crm-delivery-status: " + f);
+    console.log(`  crm-delivery-status: ${cds.passed} passed, ${cds.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-delivery-status: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ crm-delivery-status: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-10-cs-paa-serveren: S5 (kontaktskjema: kvittering, avviste innsendinger) ──");
+  try {
+    const { runContactFormCsTests } = require("../src/services/contact-form-cs.test") as
+      typeof import("../src/services/contact-form-cs.test");
+    const cft = await runContactFormCsTests({ log: false });
+    passed += cft.passed;
+    failed += cft.failed;
+    for (const f of cft.failures) failures.push("contact-form-cs: " + f);
+    console.log(`  contact-form-cs: ${cft.passed} passed, ${cft.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("contact-form-cs: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ contact-form-cs: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-10-cs-paa-serveren: S4 (endringer og fjerning, utført og verifisert av serveren) ──");
+  try {
+    const { runCsChangeRequestsTests } = require("../src/services/cs-change-requests.test") as
+      typeof import("../src/services/cs-change-requests.test");
+    const cct = await runCsChangeRequestsTests({ log: false });
+    passed += cct.passed;
+    failed += cct.failed;
+    for (const f of cct.failures) failures.push("cs-change-requests: " + f);
+    console.log(`  cs-change-requests: ${cct.passed} passed, ${cct.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("cs-change-requests: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ cs-change-requests: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-07-27-crm-plattformadskillelse: steg 4 (innkommende triage + utriaged-bøtte) ──");
   try {
     const { runCrmTriageTests } = require("../src/services/crm-triage.test") as
@@ -53987,5 +54055,48 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("registration-confirmation: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-11-10-rfb-bakke-rydding-dublett-og-innlimte-varer S2:
+// POST /admin/agents/products-tab-cleanup — splits pasted tab-separated
+// product rows of one profile (dry-run default, curated lock, audit with old
+// value, catalog rename/retire). Own in-memory DB pinned on getDb(), sets
+// ADMIN_KEY only if unset (both restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── S2: produkter med innlimte tabulatorrader ──");
+  try {
+    const { runAdminAgentsProductsTabCleanupTests } = require("../src/routes/admin-agents-products-tab-cleanup.test") as
+      typeof import("../src/routes/admin-agents-products-tab-cleanup.test");
+    const r = await runAdminAgentsProductsTabCleanupTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("products-tab-cleanup: " + f);
+    console.log(`  products-tab-cleanup: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("products-tab-cleanup: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-11-10-rfb-registreringer-og-eierkrav-folges-opp S4b:
+// GET /admin/agents/self-registered-review-queue marks owner_confirmed
+// (customerRuleSql) + owner_label «eier bekreftet», sorts those rows first
+// (each group oldest first) and adds owner_confirmed_count; read-only.
+// Own in-memory DB pinned on getDb(), sets ADMIN_KEY (restored in finally)
+// — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── S4b: registreringskø med «eier bekreftet» øverst ──");
+  try {
+    const { runSelfRegisteredQueueOwnerS4bTests } = require("../src/routes/self-registered-queue-owner-s4b.test") as
+      typeof import("../src/routes/self-registered-queue-owner-s4b.test");
+    const r = await runSelfRegisteredQueueOwnerS4bTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("self-registered-queue-owner-s4b: " + f);
+    console.log(`  self-registered-queue-owner-s4b: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("self-registered-queue-owner-s4b: unexpected error: " + String(err?.message || err));
   }
 });

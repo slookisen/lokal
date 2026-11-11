@@ -25,6 +25,8 @@ import { unsubscribeHeaderValues } from "../services/avmeld-service";
 import { getOutreachMaxTouchVernConfig, getMaxTouchStatusForEmail } from "../services/outreach-max-touch-vern";
 import {
   classifyAutomated,
+  classifyForwardCopy,
+  csInboundServerIngestEnabled,
   forwardCopyMarker,
   inboundLogAutomatedKind,
   inboundLogExists,
@@ -36,7 +38,20 @@ import {
   stripForwardSubject,
 } from "../services/cs-inbound";
 import { computeNeedsReply, markNoReplyNeeded } from "../services/crm-needs-reply";
-import { buildDailyDigest, INBOUND_LOG_RETENTION_DAYS } from "../services/cs-watchdog";
+import { buildDailyDigest, csDailyDigestEnabled, csWatchdogEnabled, INBOUND_LOG_RETENTION_DAYS } from "../services/cs-watchdog";
+import { csChangeRequestsEnabled } from "../services/cs-change-requests";
+import { contactReceiptEnabled } from "../services/contact-form-cs";
+import {
+  REPLY_KINDS,
+  csAutosendEnabled,
+  approveProposal,
+  createReplyProposal,
+  editProposal,
+  getProposal,
+  listProposals,
+  rejectProposal,
+  type ProposalStatus,
+} from "../services/cs-reply-proposals";
 import { isPilotForwardCopy } from "../services/inbound-email-webhook";
 
 // ─── Admin auth (matches the fleet-wide admin-route pattern, e.g.
@@ -1241,7 +1256,14 @@ router.post("/ingest", (req, res) => {
   {
     let canonical: { threadId: string; vertical: string; contactId: string } | null = null;
     let parkedLogId: string | null = null;
-    const aliasTarget = resolveThreadAlias(parsed.data.threadId);
+    // Strict: a failed lookup answers 500 (the caller retries) instead of
+    // filing the messages on the Gmail thread id.
+    let aliasTarget: string;
+    try {
+      aliasTarget = resolveThreadAlias(parsed.data.threadId, { strict: true });
+    } catch (err: any) {
+      return res.status(500).json({ error: `alias lookup failed: ${String(err?.message ?? err)}` });
+    }
     if (aliasTarget !== parsed.data.threadId) {
       const t = getDb().prepare("SELECT id, vertical_id, contact_id FROM crm_threads WHERE id = ?").get(aliasTarget) as
         | { id: string; vertical_id: string; contact_id: string }
@@ -1249,9 +1271,8 @@ router.post("/ingest", (req, res) => {
       if (t) canonical = { threadId: t.id, vertical: t.vertical_id, contactId: t.contact_id };
     }
     // The thread's first message: the earliest by sentAt when every message
-    // carries one, otherwise the first in the payload (Gmail's own order). Only
-    // for THIS message may the Gmail thread subject stand in for a missing
-    // per-message subject.
+    // carries one, otherwise the first in the payload (Gmail's own order).
+    // Only this message can make the Gmail thread id a new alias.
     const msgs = parsed.data.messages;
     const times = msgs.map((m) => (m.sentAt ? Date.parse(m.sentAt) : NaN));
     const first = times.every((t) => Number.isFinite(t)) ? msgs[times.indexOf(Math.min(...times))] : msgs[0];
@@ -1275,9 +1296,9 @@ router.post("/ingest", (req, res) => {
     // NOT file that e-mail (flag off, registration error) — then it is the
     // only record. A copy the server filed (thread or parked) is left out, and
     // so is one whose log row was purged after 90 days (it was handled then;
-    // filing it now would be a duplicate). No subject fallback here: a message
-    // without its own subject is never taken for a copy (a customer's
-    // plain-text reply may carry the marker unquoted).
+    // filing it now would be a duplicate). The subject fallback in copyIdOf
+    // applies only to a message sent from one of our own addresses, so a
+    // customer's plain-text reply carrying the marker unquoted is still filed.
     // A missing log row means "purged after the retention window" ONLY when
     // the copy itself is that old. A recent copy with no row (restored backup,
     // a log insert that failed) is filed — a duplicate beats a lost e-mail.
@@ -1292,52 +1313,58 @@ router.post("/ingest", (req, res) => {
       return serverThreadForMarker(id) !== null;
     };
     if (canonical) {
-      recordThreadAlias(parsed.data.threadId, canonical.threadId, "cs_gmail_copy");
+      const target = canonical;
+      // Reads first (a DB error here throws before anything is written).
       const rest = parsed.data.messages.filter((m) => !serverFiled(m));
       let newMessages = 0;
-      if (rest.length > 0) {
-        const existed = new Set(
-          (getDb()
-            .prepare(`SELECT id FROM crm_messages WHERE id IN (${rest.map(() => "?").join(",")})`)
-            .all(...rest.map((m) => m.messageId)) as Array<{ id: string }>).map((r) => r.id),
-        );
-        // The contact is the server thread's own — never whatever primaryFromEmail
-        // the caller sent (on a forwarded copy that is often our own address).
-        const contact = getDb().prepare("SELECT email FROM crm_contacts WHERE id = ?").get(canonical.contactId) as { email: string } | undefined;
-        try {
-          const r = crmService.ingestThread(
-            { threadId: canonical.threadId, messages: rest },
-            contact?.email || parsed.data.primaryFromEmail,
-            canonical.vertical as CrmVertical,
+      // The alias, the messages and the reopen are one transaction: a DB error
+      // anywhere answers 500 with nothing written, and the retry does it all.
+      try {
+        getDb().transaction(() => {
+          recordThreadAlias(parsed.data.threadId, target.threadId, "cs_gmail_copy");
+          if (rest.length === 0) return;
+          const existed = new Set(
+            (getDb()
+              .prepare(`SELECT id FROM crm_messages WHERE id IN (${rest.map(() => "?").join(",")})`)
+              .all(...rest.map((m) => m.messageId)) as Array<{ id: string }>).map((r) => r.id),
           );
-          newMessages = r.newMessages;
-        } catch (err: any) {
-          return res.status(500).json({ error: String(err?.message ?? "ingest failed") });
-        }
-        // A NEW inbound message from a person (e.g. the customer answering
-        // Daniel's Gmail reply directly) reopens a done/archived thread, as on
-        // the server path. Never Daniel's own reply, never an already-filed
-        // message, never an auto-reply or bounce.
-        const newHumanIn = rest.some((m) => {
-          if (existed.has(m.messageId) || m.direction !== "in" || m.rawMetadata?.automated === true) return false;
-          // A kept copy of an e-mail the server logged: its own classification counts.
-          const cid = copyIdOf(m);
-          if (cid && inboundLogAutomatedKind(cid)) return false;
-          return classifyAutomated({ subject: stripForwardSubject(m.subject ?? null), fromEmail: m.fromEmail, headers: readInboundHeaders(m.rawMetadata ?? {}) }).kind === null;
-        });
-        if (newMessages > 0 && newHumanIn) {
-          const st = getDb().prepare("SELECT status FROM crm_threads WHERE id = ?").get(canonical.threadId) as { status: string } | undefined;
-          if (st && (st.status === "done" || st.status === "archived")) {
-            crmService.setThreadStatus(canonical.threadId, "new", "system");
-            crmService.logAction({
-              threadId: canonical.threadId,
-              contactId: canonical.contactId,
-              type: "reopened_by_inbound",
-              actor: "system",
-              payload: { previousStatus: st.status, via: "cs_gmail_ingest" },
-            });
+          // The contact is the server thread's own — never whatever primaryFromEmail
+          // the caller sent (on a forwarded copy that is often our own address).
+          const contact = getDb().prepare("SELECT email FROM crm_contacts WHERE id = ?").get(target.contactId) as { email: string } | undefined;
+          // A NEW inbound message from a person (e.g. the customer answering
+          // Daniel's Gmail reply directly) reopens a done/archived thread, as on
+          // the server path. Never Daniel's own reply, never an already-filed
+          // message, never an auto-reply or bounce.
+          const newHumanIn = rest.some((m) => {
+            if (existed.has(m.messageId) || m.direction !== "in" || m.rawMetadata?.automated === true) return false;
+            const headers = readInboundHeaders(m.rawMetadata ?? {});
+            const cid = copyIdOf(m);
+            if (!cid) return classifyAutomated({ subject: stripForwardSubject(m.subject ?? null), fromEmail: m.fromEmail, headers }).kind === null;
+            // A kept copy of an e-mail the server logged: its own classification counts.
+            if (inboundLogAutomatedKind(cid)) return false;
+            return classifyForwardCopy({ subject: m.subject ?? parsed.data.subject ?? null, fromEmail: m.fromEmail, headers }).kind === null;
+          });
+          newMessages = crmService.ingestThread(
+            { threadId: target.threadId, messages: rest },
+            contact?.email || parsed.data.primaryFromEmail,
+            target.vertical as CrmVertical,
+          ).newMessages;
+          if (newMessages > 0 && newHumanIn) {
+            const st = getDb().prepare("SELECT status FROM crm_threads WHERE id = ?").get(target.threadId) as { status: string } | undefined;
+            if (st && (st.status === "done" || st.status === "archived")) {
+              crmService.setThreadStatus(target.threadId, "new", "system");
+              crmService.logAction({
+                threadId: target.threadId,
+                contactId: target.contactId,
+                type: "reopened_by_inbound",
+                actor: "system",
+                payload: { previousStatus: st.status, via: "cs_gmail_ingest" },
+              });
+            }
           }
-        }
+        })();
+      } catch (err: any) {
+        return res.status(500).json({ error: String(err?.message ?? "ingest failed") });
       }
       return res.json({
         threadId: canonical.threadId,
@@ -1550,7 +1577,19 @@ router.post("/ingest", (req, res) => {
 router.get("/needs-reply", (req, res) => {
   try {
     const limitRaw = parseInt(String(req.query.limit ?? ""), 10);
-    res.json(computeNeedsReply({ vertical: parseVertical(req) ?? null, limit: Number.isFinite(limitRaw) ? limitRaw : undefined }));
+    // server_mode (S6): which server parts are switched on, so the CS routine
+    // moves each duty to the server only when the server actually does it.
+    res.json({
+      ...computeNeedsReply({ vertical: parseVertical(req) ?? null, limit: Number.isFinite(limitRaw) ? limitRaw : undefined }),
+      server_mode: {
+        inbound_ingest: csInboundServerIngestEnabled(),
+        autosend: csAutosendEnabled(),
+        change_requests: csChangeRequestsEnabled(),
+        watchdog: csWatchdogEnabled(),
+        daily_digest: csDailyDigestEnabled(),
+        contact_receipt: contactReceiptEnabled(),
+      },
+    });
   } catch (err: any) {
     res.status(500).json({ error: String(err?.message ?? "needs-reply failed") });
   }
@@ -1581,6 +1620,97 @@ router.post("/threads/:id/no-reply-needed", (req, res) => {
   const r = markNoReplyNeeded(req.params.id, parsed.data.reason, parsed.data.actor ?? "daniel");
   if (!r.ok) return res.status(r.error === "thread_not_found" ? 404 : 400).json({ error: r.error });
   res.json({ success: true });
+});
+
+// ─── CS på serveren, S2: reply proposals + approval queue ────────────
+// dev-request 2026-11-10-cs-paa-serveren, skive S2. The CS routine proposes;
+// the server sends (cs-autosend) or parks the proposal here with the reason.
+// The recipient is never a parameter: it is the sender of the thread's latest
+// human inbound message.
+const proposalSchema = z.object({
+  kind: z.enum(REPLY_KINDS),
+  subject: z.string().max(500).nullable().optional(),
+  bodyText: z.string().min(1).max(50000),
+  bodyHtml: z.string().max(100000).nullable().optional(),
+  changeRequestIds: z.array(z.string().min(1).max(120)).max(20).optional(),
+  evidence: z.unknown().optional(),
+  createdBy: z.enum(["claude", "daniel"]).default("claude"),
+});
+
+router.post("/threads/:id/reply-proposals", (req, res) => {
+  const parsed = proposalSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
+  const r = createReplyProposal({ threadId: req.params.id, ...parsed.data, evidence: parsed.data.evidence });
+  if (!r.ok) return res.status(r.status).json({ error: r.error, detail: r.detail });
+  res.status(201).json({ proposal: r.proposal, superseded: r.superseded });
+});
+
+router.get("/threads/:id/reply-proposals", (req, res) => {
+  res.json({ items: listProposals({ threadId: req.params.id, limit: 100 }) });
+});
+
+const PROPOSAL_STATUSES: ReadonlyArray<ProposalStatus | "open"> = [
+  "open", "pending", "approval_needed", "approved", "sending", "sent", "failed", "rejected", "superseded",
+];
+
+router.get("/reply-proposals", (req, res) => {
+  const status = (req.query.status as string | undefined) ?? "approval_needed";
+  if (!PROPOSAL_STATUSES.includes(status as any)) return res.status(400).json({ error: "invalid status" });
+  const limit = Math.min(parseInt(String(req.query.limit ?? "100"), 10) || 100, 500);
+  res.json({ items: listProposals({ status: status as any, limit }) });
+});
+
+router.get("/reply-proposals/:pid", (req, res) => {
+  const p = getProposal(req.params.pid);
+  if (!p) return res.status(404).json({ error: "proposal not found" });
+  res.json({ proposal: p });
+});
+
+const proposalEditSchema = z.object({
+  subject: z.string().min(1).max(500).optional(),
+  bodyText: z.string().min(1).max(50000).optional(),
+  bodyHtml: z.string().max(100000).nullable().optional(),
+  kind: z.enum(REPLY_KINDS).optional(),
+  changeRequestIds: z.array(z.string().min(1).max(120)).max(20).optional(),
+  note: z.string().max(300).optional(),
+  /** Daniel saw the customer's newer message and still sends this reply. */
+  acknowledgeNewerInbound: z.boolean().optional(),
+});
+
+/** Where an approval came from — the admin page marks its own calls. Audit only (the admin key is shared). */
+function approvalSource(req: Request): "admin-crm" | "api" {
+  return req.get("X-Admin-Client") === "admin-crm" ? "admin-crm" : "api";
+}
+
+router.post("/reply-proposals/:pid/approve", async (req, res) => {
+  const parsed = proposalEditSchema.safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
+  const { note, acknowledgeNewerInbound, ...edits } = parsed.data;
+  try {
+    const r = await approveProposal(req.params.pid, { edits, note: note ?? null, actor: "daniel", source: approvalSource(req), acknowledgeNewerInbound: acknowledgeNewerInbound === true });
+    if (!r.ok) return res.status(r.status).json({ error: r.error });
+    const sent = r.result.outcome === "sent";
+    res.status(sent ? 200 : 409).json({ sent, result: r.result, proposal: r.proposal });
+  } catch (err: any) {
+    res.status(500).json({ error: String(err?.message ?? err) });
+  }
+});
+
+router.post("/reply-proposals/:pid/edit", (req, res) => {
+  const parsed = proposalEditSchema.safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
+  const { note: _note, acknowledgeNewerInbound: _ack, ...edits } = parsed.data;
+  const r = editProposal(req.params.pid, edits, "daniel");
+  if (!r.ok) return res.status(r.status).json({ error: r.error });
+  res.json({ proposal: r.proposal });
+});
+
+router.post("/reply-proposals/:pid/reject", (req, res) => {
+  const parsed = z.object({ reason: z.string().trim().min(1).max(300), actor: z.enum(["daniel", "claude"]).default("daniel") }).safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
+  const r = rejectProposal(req.params.pid, parsed.data.reason, parsed.data.actor);
+  if (!r.ok) return res.status(r.status).json({ error: r.error });
+  res.json({ success: true, proposal: getProposal(req.params.pid) });
 });
 
 // ─── GET /admin/crm/untriaged ────────────────────────────────
@@ -1832,6 +1962,24 @@ router.post("/outbox/:id/result", (req, res) => {
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "invalid body" });
+
+  // CS på serveren, S2.5: a result is only accepted for a row that is still
+  // waiting (pending / processing). An unknown id is 404; a repeat of the SAME
+  // outcome is an idempotent 200; anything else (e.g. "completed" on a row the
+  // server already marked failed) is 409 — it used to overwrite silently.
+  const current = getDb().prepare("SELECT status FROM crm_outbox WHERE id = ?").get(req.params.id) as { status: string } | undefined;
+  if (!current) return res.status(404).json({ error: "outbox item not found" });
+  if (current.status === parsed.data.status) {
+    // Same outcome again. A new resultId (e.g. a re-created Gmail draft) is
+    // recorded rather than silently dropped.
+    if (parsed.data.resultId) {
+      getDb().prepare("UPDATE crm_outbox SET result_id = ? WHERE id = ? AND COALESCE(result_id, '') != ?").run(parsed.data.resultId, req.params.id, parsed.data.resultId);
+    }
+    return res.json({ success: true, unchanged: true });
+  }
+  if (current.status !== "pending" && current.status !== "processing") {
+    return res.status(409).json({ error: "outbox_not_pending", status: current.status });
+  }
 
   crmService.markOutboxResult(req.params.id, parsed.data.status, parsed.data.resultId, parsed.data.error);
 

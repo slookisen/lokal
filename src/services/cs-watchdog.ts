@@ -23,6 +23,9 @@ import { computeNeedsReply, NeedsReplyReport } from "./crm-needs-reply";
 import { recordRun } from "./run-ledger";
 import { EnvelopeBuilder } from "../types/run-envelope";
 import { getJobLastCompletedAt, markJobCompleted } from "./boot-job-gate";
+import { parkPendingWhenAutosendOff, recoverExpiredLeases } from "./cs-reply-proposals";
+import { failedReplyDeliveries } from "./crm-delivery-status";
+import { contactRejectionsSince } from "./contact-form-cs";
 
 export const CS_WATCHDOG_FLAG = "CS_WATCHDOG_ENABLED";
 export const CS_DAILY_DIGEST_FLAG = "CS_DAILY_DIGEST_ENABLED";
@@ -250,7 +253,8 @@ export async function runCsWatchdog(
     now?: Date;
     adminEmail?: string | null;
     trigger?: "cron" | "manual";
-    /** More alert items from later slices (S2 outbound problems). */
+    env?: NodeJS.ProcessEnv;
+    /** Extra alert items (tests; later slices). */
     extraItems?: (now: Date) => AlertItem[];
   } = {},
 ): Promise<WatchdogResult> {
@@ -315,6 +319,104 @@ export async function runCsWatchdog(
     .all(now.toISOString()) as Array<{ id: string; subject: string | null; from_email: string | null; crm_error: string | null }>;
   for (const r of regErrors) {
     items.push({ key: `register:${r.id}`, once: true, line: `• [Ikke registrert i CRM] ${r.subject ?? "(uten emne)"} — fra ${r.from_email ?? "?"}: ${r.crm_error ?? "ukjent feil"}` });
+  }
+  // S2: replies that did not get out, and outbox rows nobody finished.
+  try {
+    const parked = parkPendingWhenAutosendOff(deps.env ?? process.env, now);
+    if (parked > 0) env.notes(`autosend off: ${parked} pending proposal(s) moved to the approval queue`);
+    recoverExpiredLeases(now);
+    for (const f of db
+      .prepare(
+        `SELECT p.id, p.vertical, p.subject, p.to_email, p.block_reason, p.block_detail, p.last_error
+           FROM cs_reply_proposals p
+          WHERE p.status = 'failed' AND julianday(p.updated_at) >= julianday(?) - 7
+          ORDER BY p.updated_at ASC LIMIT 100`,
+      )
+      .all(now.toISOString()) as Array<{ id: string; vertical: string; subject: string; to_email: string; block_reason: string | null; block_detail: string | null; last_error: string | null }>) {
+      items.push({
+        key: `proposal:${f.id}`,
+        once: true,
+        line: `• [Svar ikke sendt] [${platformName(f.vertical)}] ${f.subject} — til ${f.to_email}: ${f.block_detail ?? f.last_error ?? f.block_reason ?? "ukjent feil"}`,
+      });
+    }
+    // Daniel pressed Send but the row is still «approved» without a live lease — stuck.
+    for (const a of db
+      .prepare(
+        `SELECT id, vertical, subject FROM cs_reply_proposals
+          WHERE status = 'approved' AND julianday(updated_at) < julianday(?) - 15.0 / 1440
+            AND (lease_until IS NULL OR julianday(lease_until) < julianday(?))
+          LIMIT 50`,
+      )
+      .all(now.toISOString(), now.toISOString()) as Array<{ id: string; vertical: string; subject: string }>) {
+      items.push({ key: `proposal-stuck:${a.id}`, once: true, line: `• [Godkjent svar henger] [${platformName(a.vertical)}] ${a.subject} — godkjent, men ikke sendt (${a.id})` });
+    }
+  } catch (e: any) {
+    env.error(`proposal checks: ${String(e?.message ?? e)}`);
+  }
+  const draftStaleMin = Math.max(60, parseInt(String((deps.env ?? process.env).CS_OUTBOX_DRAFT_STALE_MINUTES ?? ""), 10) || 360);
+  for (const o of db
+    .prepare(
+      `SELECT id, intent, status, vertical_id, subject, created_at FROM crm_outbox
+        WHERE (intent = 'resend_send' AND status IN ('pending', 'processing') AND julianday(created_at) < julianday(?) - 1.0 / 24)
+           OR (intent = 'gmail_draft' AND status IN ('pending', 'processing') AND julianday(created_at) < julianday(?) - ? / 1440.0)
+        ORDER BY created_at ASC LIMIT 100`,
+    )
+    .all(now.toISOString(), now.toISOString(), draftStaleMin) as Array<{ id: string; intent: string; status: string; vertical_id: string; subject: string; created_at: string }>) {
+    // A resend_send row that waits for its own retry belongs to a proposal and is not stuck.
+    const owner = (() => {
+      try {
+        return db.prepare(`SELECT status FROM cs_reply_proposals WHERE outbox_id = ?`).get(o.id) as { status: string } | undefined;
+      } catch {
+        return undefined;
+      }
+    })();
+    if (owner && (owner.status === "pending" || owner.status === "approved" || owner.status === "sending")) continue;
+    items.push({
+      key: `outbox:${o.id}`,
+      once: true,
+      line: `• [Utboks henger] [${platformName(o.vertical_id)}] ${o.subject} — ${o.intent === "gmail_draft" ? "Gmail-utkast" : "sending"} ${o.status} siden ${o.created_at}`,
+    });
+  }
+  // S3: a reply that bounced or drew a complaint — the thread is back in «Trenger svar».
+  for (const d of failedReplyDeliveries(new Date(now.getTime() - 7 * 86400_000).toISOString())) {
+    items.push({
+      key: `delivery:${d.crm_message_id}`,
+      once: true,
+      line: `• [Svar ${d.status === "complained" ? "merket som spam" : "kom ikke fram (bounce)"}] [${platformName(d.vertical)}] ${d.subject ?? "(uten emne)"} — til ${d.to_emails ?? "?"}${d.detail ? `: ${d.detail}` : ""}`,
+    });
+  }
+  // S4: change requests that failed, and requests nobody is executing.
+  try {
+    for (const c of db
+      .prepare(
+        `SELECT id, vertical, target_name, kind, status, status_reason FROM cs_change_requests
+          WHERE status IN ('failed', 'verify_failed') AND julianday(updated_at) >= julianday(?) - 7
+          ORDER BY updated_at ASC LIMIT 100`,
+      )
+      .all(now.toISOString()) as Array<{ id: string; vertical: string; target_name: string | null; kind: string; status: string; status_reason: string | null }>) {
+      items.push({
+        key: `change:${c.id}`,
+        once: true,
+        line: `• [${c.kind === "removal" ? "Fjerning" : "Endring"} ${c.status === "verify_failed" ? "ikke bekreftet på siden" : "feilet"}] [${platformName(c.vertical)}] ${c.target_name ?? "?"}: ${c.status_reason ?? "ukjent"} (${c.id})`,
+      });
+    }
+    for (const c of db
+      .prepare(
+        `SELECT id, vertical, target_name, kind FROM cs_change_requests
+          WHERE (status IN ('queued', 'executing') AND julianday(updated_at) < julianday(?) - 30.0 / 1440)
+             OR (status = 'deleting' AND deleted_at IS NULL AND julianday(updated_at) < julianday(?) - 30.0 / 1440)
+             OR (status IN ('hidden', 'deleting') AND delete_after IS NOT NULL AND julianday(delete_after) < julianday(?) - 2.0 / 24)
+          LIMIT 50`,
+      )
+      .all(now.toISOString(), now.toISOString(), now.toISOString()) as Array<{ id: string; vertical: string; target_name: string | null; kind: string }>) {
+      items.push({
+        key: `change-stuck:${c.id}`,
+        once: true,
+        line: `• [${c.kind === "removal" ? "Fjerning" : "Endring"} henger] [${platformName(c.vertical)}] ${c.target_name ?? "?"} — ikke ferdig til forventet tid (er CS_CHANGE_REQUESTS_ENABLED på? sletting utsatt?) (${c.id})`,
+      });
+    }
+  } catch (e: any) {
+    env.error(`change-request checks: ${String(e?.message ?? e)}`);
   }
   for (const extra of deps.extraItems?.(now) ?? []) items.push(extra);
   // Threads last: a backlog of old threads must never push a one-time problem
@@ -475,12 +577,97 @@ export function buildDailyDigest(now: Date = new Date()): { subject: string; tex
     const f = forms.find((r) => r.vertical === v)?.n ?? 0;
     lines.push(`• ${v === "-" ? "Ukjent plattform" : platformName(v)}: ${total} e-post${by ? ` (${by})` : ""}, ${f} kontaktskjema`);
   }
+  // S5: rejected contact-form submissions (spam protection at work, or a broken form).
+  const rejected = contactRejectionsSince(since);
+  if (rejected.length > 0) {
+    const byP = new Map<string, string[]>();
+    for (const r of rejected) byP.set(r.platform, [...(byP.get(r.platform) ?? []), `${r.reason} ${r.n}`]);
+    for (const [p, parts] of byP) lines.push(`• ${platformName(p)}: kontaktskjema avvist — ${parts.join(", ")}`);
+  }
   lines.push("");
   lines.push("UT");
   if (outbound.length === 0) lines.push("• Ingen svar eller utsendinger registrert i CRM.");
   for (const v of [...new Set(outbound.map((r) => r.vertical))].sort()) {
     const rows = outbound.filter((r) => r.vertical === v);
     lines.push(`• ${platformName(v)}: ${rows.map((r) => `${r.status} ${r.n}`).join(", ")}`);
+  }
+  // S2: what the server sent on its own vs. what Daniel sent from the queue, and what waits for him.
+  let proposalCounts: Record<string, unknown> = {};
+  try {
+    const sentRows = db
+      .prepare(
+        `SELECT vertical, sent_mode, COUNT(*) AS n FROM cs_reply_proposals
+          WHERE status = 'sent' AND julianday(sent_at) >= julianday(?) GROUP BY 1, 2`,
+      )
+      .all(since) as Array<{ vertical: string; sent_mode: string; n: number }>;
+    for (const v of [...new Set(sentRows.map((r) => r.vertical))].sort()) {
+      const auto = sentRows.find((r) => r.vertical === v && r.sent_mode === "auto")?.n ?? 0;
+      const appr = sentRows.find((r) => r.vertical === v && r.sent_mode === "approved")?.n ?? 0;
+      lines.push(`• ${platformName(v)}: ${auto} svar sendt automatisk, ${appr} sendt av Daniel fra godkjenningskøen`);
+    }
+    const queue = db
+      .prepare(
+        `SELECT p.id, p.vertical, p.subject, p.block_reason, (julianday(?) - julianday(p.created_at)) * 24.0 AS age_h
+           FROM cs_reply_proposals p WHERE p.status = 'approval_needed' ORDER BY p.created_at ASC LIMIT 200`,
+      )
+      .all(now.toISOString()) as Array<{ id: string; vertical: string; subject: string; block_reason: string | null; age_h: number }>;
+    const failed = db
+      .prepare(
+        `SELECT vertical, subject, to_email, COALESCE(block_detail, last_error, block_reason) AS why FROM cs_reply_proposals
+          WHERE status = 'failed' AND julianday(updated_at) >= julianday(?) ORDER BY updated_at ASC LIMIT 50`,
+      )
+      .all(since) as Array<{ vertical: string; subject: string; to_email: string; why: string | null }>;
+    const viaApi = (
+      db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM crm_actions WHERE type = 'proposal_approved' AND julianday(created_at) >= julianday(?)
+             AND json_valid(payload) AND json_extract(payload, '$.source') = 'api'`,
+        )
+        .get(since) as { n: number }
+    ).n;
+    lines.push("");
+    lines.push(`GODKJENNINGSKØ: ${queue.length} svarforslag venter på deg${queue.some((q) => q.age_h > 48) ? ` (${queue.filter((q) => q.age_h > 48).length} over 48 t — påminnelse)` : ""}`);
+    for (const q of queue.slice(0, 20)) {
+      lines.push(`• ${Math.floor(q.age_h)} t — [${platformName(q.vertical)}] ${q.subject} — stoppet: ${q.block_reason ?? "?"}${q.age_h > 48 ? " ⚠" : ""}`);
+    }
+    if (queue.length > 20) lines.push(`• … og ${queue.length - 20} til.`);
+    if (failed.length > 0) {
+      lines.push("");
+      lines.push(`SVAR SOM IKKE KOM UT siste døgn: ${failed.length}`);
+      for (const f of failed.slice(0, 20)) lines.push(`• [${platformName(f.vertical)}] ${f.subject} — til ${f.to_email}: ${f.why ?? "ukjent feil"}`);
+    }
+    const bounced = failedReplyDeliveries(since);
+    if (bounced.length > 0) {
+      lines.push("");
+      lines.push(`SVAR SOM BOUNCET ELLER BLE MERKET SOM SPAM siste døgn: ${bounced.length} (trådene ligger igjen i «Trenger svar»)`);
+      for (const b of bounced.slice(0, 20)) lines.push(`• [${platformName(b.vertical)}] ${b.subject ?? "(uten emne)"} — ${b.status}${b.detail ? ` (${b.detail})` : ""}`);
+    }
+    if (viaApi > 0) lines.push(`Merk: ${viaApi} forslag ble godkjent via API-et, ikke fra admin-siden.`);
+    // S4: changes and removals.
+    const ch = db
+      .prepare(
+        `SELECT vertical, kind, status, COUNT(*) AS n FROM cs_change_requests
+          WHERE julianday(updated_at) >= julianday(?) OR status IN ('approval_needed', 'queued', 'executing', 'hidden', 'deleting')
+          GROUP BY 1, 2, 3`,
+      )
+      .all(since) as Array<{ vertical: string; kind: string; status: string; n: number }>;
+    if (ch.length > 0) {
+      lines.push("");
+      lines.push("ENDRINGER OG SLETTINGER (utført og kontrollert av serveren)");
+      const label: Record<string, string> = {
+        verified: "utført og bekreftet", hidden: "skjult, slettes etter 24 t", approval_needed: "venter på deg", queued: "i kø",
+        executing: "utføres nå", deleting: "slettes nå",
+        executed: "utført, venter på bekreftelse", failed: "feilet", verify_failed: "ikke bekreftet på siden", cancelled: "angret", rejected: "avvist",
+      };
+      for (const v of [...new Set(ch.map((r) => r.vertical))].sort()) {
+        const parts = ch.filter((r) => r.vertical === v).map((r) => `${r.kind === "removal" ? "fjerning" : "endring"} ${label[r.status] ?? r.status} ${r.n}`);
+        lines.push(`• ${platformName(v)}: ${parts.join(", ")}`);
+      }
+    }
+    proposalCounts = { ...proposalCounts, change_requests: ch };
+    proposalCounts = { ...proposalCounts, sent: sentRows, approval_queue: queue.length, approval_over_48h: queue.filter((q) => q.age_h > 48).length, failed_24h: failed.length, approved_via_api: viaApi };
+  } catch {
+    // cs_reply_proposals missing (pre-migration DB)
   }
   lines.push("");
   lines.push(`TRENGER SVAR: ${report.counts.threads} (${report.counts.p0} over 24 t, ${report.counts.p1} over 12 t)`);
@@ -503,7 +690,7 @@ export function buildDailyDigest(now: Date = new Date()): { subject: string; tex
   return {
     subject,
     text: lines.join("\n"),
-    counts: { inbound, forms, outbound, needs_reply: report.counts },
+    counts: { inbound, forms, contact_form_rejected: rejected, outbound, needs_reply: report.counts, proposals: proposalCounts },
   };
 }
 
@@ -618,7 +805,7 @@ export async function tickCsWatchdog(
         lastWatchdogAt = now;
         ranWatchdog = true;
         try {
-          await runCsWatchdog({ now, send: deps.send, extraItems: deps.extraItems });
+          await runCsWatchdog({ now, send: deps.send, env, extraItems: deps.extraItems });
           markJobCompleted(db, CS_WATCHDOG_JOB, now);
         } catch (e: any) {
           // Not completed: retried at the next hourly slot. Recorded so the failure is visible.

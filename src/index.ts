@@ -78,6 +78,7 @@ import adminDbBackupRoutes, { diskUsage, createBackupAgeSweepTick, BACKUP_AGE_SW
 import adminSearchConsolesRoutes from "./routes/admin-search-consoles";
 import adminConversationsTrafficClassRoutes from "./routes/admin-conversations-traffic-class";
 import adminCrossVerticalContactLookupRoutes from "./routes/admin-cross-vertical-contact-lookup";
+import adminCsChangeRequestsRoutes from "./routes/admin-cs-change-requests";
 import adminAgentsRoutes from "./routes/admin-agents";
 import adminOutreachPoolRoutes from "./routes/admin-outreach-pool";
 import adminOutreachCandidatesRoutes from "./routes/admin-outreach-candidates";
@@ -85,6 +86,8 @@ import adminOutreachMaxTouchVernRoutes from "./routes/admin-outreach-max-touch-v
 import { rfbMarketingLaneRouter, rfbMarketingDailyRunRouter } from "./routes/admin-rfb-marketing";
 import { tickRfbMarketingDaily } from "./services/rfb-marketing-daily";
 import { tickCsWatchdog, type CsTickState } from "./services/cs-watchdog";
+import { csAutosendEnabled, runCsAutosend } from "./services/cs-reply-proposals";
+import { csChangeRequestsEnabled, runCsChangeRequests } from "./services/cs-change-requests";
 import { rfbEnrichmentNightlyRouter } from "./routes/admin-rfb-enrichment-nightly";
 import {
   isRfbEnrichmentNightlyEnabled,
@@ -142,6 +145,7 @@ import adminAgentsFacebookTierShadowRoutes from "./routes/admin-agents-facebook-
 import adminDrinkCoverageRoutes from "./routes/admin-drink-coverage";
 import adminEnrichmentWritePauseRoutes from "./routes/admin-enrichment-write-pause";
 import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-merge";
+import adminAgentsProductsTabCleanupRoutes from "./routes/admin-agents-products-tab-cleanup";
 import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
 import adminAgentsBusinessTypeRoutes from "./routes/admin-agents-business-type";
 import adminTestProducerRoutes from "./routes/admin-test-producer";
@@ -976,6 +980,10 @@ app.use("/admin/enrichment-write-pause", adminLimiter, adminEnrichmentWritePause
 // (dev-request duplicate-merge lever). Same ordering rule as the siblings
 // above — mount BEFORE /admin/agents.
 app.use("/admin/agents/duplicate-merge", adminLimiter, adminAgentsDuplicateMergeRoutes);
+// POST /admin/agents/products-tab-cleanup (dev-request 2026-11-10-rfb-bakke-
+// rydding-dublett-og-innlimte-varer, S2): splits pasted tab-separated product
+// rows, one profile per call, dry-run default. Mount BEFORE /admin/agents.
+app.use("/admin/agents/products-tab-cleanup", adminLimiter, adminAgentsProductsTabCleanupRoutes);
 // POST /admin/agents/deactivate — standalone-row catalog-hygiene deactivate
 // lever (dev-request 2026-08-10-rfb-hjemmesidejakt-full-loype, Skive 8).
 // Same ordering rule as the siblings above — mount BEFORE /admin/agents.
@@ -1341,6 +1349,7 @@ if (process.env.CRM_ENABLED !== "0") {
 // customer-service "fjern" flow; exact-email-match only, never fuzzy name
 // matching. GET /admin/cross-vertical-contact-lookup.
 app.use("/admin", adminLimiter, adminCrossVerticalContactLookupRoutes);
+app.use("/admin/cs", adminLimiter, adminCsChangeRequestsRoutes);
 
 // Billing skeleton (Produsent-Premium, test-mode Stripe) — dev-request
 // 2026-07-13-billing-skjelett-moerkt. Feature-flagged via BILLING_ENABLED
@@ -2816,6 +2825,49 @@ if (process.env.RFB_MARKETING_PLATFORM_ENABLED === "1") {
   });
   setTimeout(() => { void csWatchdogTick(); }, 180_000);
   setInterval(() => { void csWatchdogTick(); }, 10 * 60_000);
+}
+
+// ─── CS på serveren, S2: the reply-proposal send worker (CS_AUTOSEND_ENABLED) ──
+// Every minute: recover expired leases, then evaluate + send due proposals
+// (or park them in the approval queue with the reason). With the flag off the
+// worker is not registered and the watchdog moves new proposals to the queue.
+if (csAutosendEnabled()) {
+  let csAutosendBusy = false;
+  const csAutosendTick = trackJob("cs-autosend", async () => {
+    if (csAutosendBusy) return;
+    csAutosendBusy = true;
+    try {
+      const r = await runCsAutosend();
+      if (r.run_id) console.log(`[cs-autosend] ${r.processed.map((p) => p.outcome).join(",")} recovered=${r.recovered_leases.length}`);
+    } catch (err) {
+      console.error("[cs-autosend] tick failed (non-fatal, retried next minute):", err);
+    } finally {
+      csAutosendBusy = false;
+    }
+  });
+  setTimeout(() => { void csAutosendTick(); }, 200_000);
+  setInterval(() => { void csAutosendTick(); }, 60_000);
+}
+
+// ─── CS på serveren, S4: change requests executed + verified by the server
+// (CS_CHANGE_REQUESTS_ENABLED). Every 5 min: execute queued requests, re-read
+// public surfaces for executed ones, delete hidden removals after 24 h.
+if (csChangeRequestsEnabled()) {
+  let csChangeBusy = false;
+  const csChangeTick = trackJob("cs-change-requests", async () => {
+    if (csChangeBusy) return;
+    csChangeBusy = true;
+    try {
+      const r = await runCsChangeRequests();
+      if (r.run_id) console.log(`[cs-change-requests] ${r.processed.map((p) => `${p.id}:${p.from}->${p.to}`).join(" ")}`);
+    } catch (err) {
+      console.error("[cs-change-requests] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      csChangeBusy = false;
+    }
+  });
+  setTimeout(() => { void csChangeTick(); }, 240_000);
+  setInterval(() => { void csChangeTick(); }, 5 * 60_000);
 }
 
 // ─── dev-request 2026-10-10-rfb-berikelse-nattjobb (R6; Daniel GO 2026-10-10,

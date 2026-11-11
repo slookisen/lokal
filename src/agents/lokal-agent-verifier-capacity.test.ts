@@ -398,8 +398,16 @@ export async function runLokalAgentVerifierCapacityTests(opts: { log?: boolean }
       assertTrue(claim("verifier_slots_growth_other") === 1, "point 5: growth_other claim");
       assertTrue(claim("verifier_slots_verified_fill") === 0, "point 5: verified_fill claim");
       const legacy: any = buildRunEnvelope({ run_id: "r", started_at: "s", finished_at: "f", results: [results[4]!] });
-      assertTrue(!legacy.claims.some((c: any) => String(c.meta?.kind ?? "").startsWith("verifier_slots_")),
-        "point 5: no slot claims when no result carries pick_slot (other pickers unchanged)");
+      const legacyClaim = (k: string) => legacy.claims.find((c: any) => c.meta?.kind === k)?.value;
+      for (const k of ["verifier_slots_verified_recheck", "verifier_slots_verified_fill",
+        "verifier_slots_growth_full_profile", "verifier_slots_growth_other"]) {
+        assertTrue(legacyClaim(k) === 0, `slice A: ${k} present with 0 when no result carries pick_slot`);
+      }
+      const empty: any = buildRunEnvelope({ run_id: "r", started_at: "s", finished_at: "f", results: [] });
+      const emptyClaim = (k: string) => empty.claims.find((c: any) => c.meta?.kind === k)?.value;
+      assertTrue(emptyClaim("verifier_slots_verified_fill") === 0 && emptyClaim("verifier_slots_verified_recheck") === 0,
+        "slice A: slot claims present with 0 on an empty batch");
+      assertTrue(emptyClaim("agents_newly_verified") === 0, "slice A: agents_newly_verified present with 0 on an empty batch");
     }
 
     // ── AC3: the sweep passes Brreg data to the verifier ─────────────────

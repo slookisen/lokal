@@ -127,11 +127,17 @@ export const ERASURE_TABLES: readonly TableSpec[] = [
   { table: "crm_outbox", where: `thread_id IN (${THREADS}) OR contact_id IN (${CONTACTS})`, params: 2 },
   { table: "crm_actions", where: `thread_id IN (${THREADS}) OR contact_id IN (${CONTACTS})`, params: 2 },
   { table: "crm_retro_tagging_audit", where: `thread_id IN (${THREADS})`, params: 1 },
+  // S3: Resend's verdict per message goes with the message.
+  { table: "crm_message_delivery", where: `crm_message_id IN (${MESSAGES})`, params: 1 },
   { table: "crm_messages", where: `thread_id IN (${THREADS})`, params: 1 },
   // CS på serveren, S1: the free-text «trenger ikke svar» reason and the
   // Gmail-thread aliases belong to the thread and go with it.
   { table: "crm_thread_flags", where: `thread_id IN (${THREADS})`, params: 1 },
   { table: "crm_thread_aliases", where: `thread_id IN (${THREADS})`, params: 1 },
+  // S4: change requests carry the requester's address and the request.
+  { table: "cs_change_requests", where: `thread_id IN (${THREADS}) OR LOWER(TRIM(requester_email)) = ?`, params: 2 },
+  // S2: reply proposals carry the recipient and the reply text.
+  { table: "cs_reply_proposals", where: `thread_id IN (${THREADS}) OR LOWER(TRIM(to_email)) = ?`, params: 2 },
   // CS på serveren, S1a — placed BEFORE crm_threads: its crm_thread_id clause
   // only matches while the threads still exist. One row per inbound e-mail
   // (sender + subject, and the forward copy with the body while a forward is
@@ -149,6 +155,8 @@ export const ERASURE_TABLES: readonly TableSpec[] = [
   { table: "crm_threads", where: `contact_id IN (${CONTACTS})`, params: 1 },
   { table: "crm_contacts", where: `LOWER(TRIM(email)) = ?`, params: 1 },
   { table: "crm_untriaged", where: `LOWER(TRIM(from_email)) = ?`, params: 1 },
+  // CS på serveren, S5: the receipt log of the public contact form.
+  { table: "contact_form_receipts", where: `LOWER(TRIM(email)) = ?`, params: 1 },
   { table: "outreach_sent_log", where: `LOWER(TRIM(recipient_email)) = ?`, params: 1 },
   { table: "rfb_marketing_send_ledger", where: `LOWER(TRIM(recipient_email)) = ?`, params: 1 },
   { table: "resend_webhook_events", where: `LOWER(TRIM(email)) = ?`, params: 1 },

@@ -2441,19 +2441,29 @@ router.post("/org-nr-review-approve", (req: Request, res: Response) => {
 // (`precheck`, parsed JSON or null; services/registration-precheck.ts),
 // `precheck_at`, `age_days` (whole days since created_at), `org_nr` and
 // `city`. The original five fields and the order are unchanged.
+//
+// S4b (same dev-request): each entry also carries `owner_confirmed` — the
+// shared customer/verified-owner rule (customerRuleSql: claimed_at set OR a
+// verified agent_claims row) — and `owner_label` ("eier bekreftet" or null).
+// Owner-confirmed rows sort first; within each group oldest first (id as the
+// final tie-breaker). Top-level `owner_confirmed_count` sits next to `count`.
+// Read-only: the queue never writes; only self-registered-review-approve
+// releases a profile.
 router.get("/self-registered-review-queue", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
   const db = getDb();
   const rows = db.prepare(
     `SELECT a.id, a.name, a.contact_email, a.url, a.created_at, a.org_nr, a.city,
-            p.registration_precheck, p.registration_precheck_at
+            p.registration_precheck, p.registration_precheck_at,
+            CASE WHEN ${customerRuleSql("a")} THEN 1 ELSE 0 END AS owned
        FROM agents a
        LEFT JOIN agent_registration_precheck p ON p.agent_id = a.id
       WHERE a.origin = 'self_registered' AND a.is_vetted = 0
-      ORDER BY a.created_at ASC`
+      ORDER BY owned DESC, a.created_at ASC, a.id ASC`
   ).all() as Array<{
     id: string; name: string; contact_email: string; url: string; created_at: string | null;
     org_nr: string | null; city: string | null; registration_precheck: string | null; registration_precheck_at: string | null;
+    owned: number;
   }>;
   const nowMs = Date.now();
   const entries = rows.map((r) => {
@@ -2465,9 +2475,11 @@ router.get("/self-registered-review-queue", (req: Request, res: Response) => {
       id: r.id, name: r.name, contact_email: r.contact_email, url: r.url, created_at: r.created_at,
       org_nr: r.org_nr, city: r.city,
       precheck, precheck_at: r.registration_precheck_at, age_days: ageDaysSince(r.created_at, nowMs),
+      owner_confirmed: r.owned === 1, owner_label: r.owned === 1 ? "eier bekreftet" : null,
     };
   });
-  res.json({ count: entries.length, entries });
+  const ownerConfirmedCount = entries.filter((e) => e.owner_confirmed).length;
+  res.json({ count: entries.length, owner_confirmed_count: ownerConfirmedCount, entries });
 });
 
 /** Whole days since an SQLite/ISO timestamp (SQLite's "YYYY-MM-DD HH:MM:SS" is UTC), or null. */
