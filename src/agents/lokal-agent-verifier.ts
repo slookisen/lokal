@@ -3492,7 +3492,23 @@ export function buildRunEnvelope(input: {
       { type: "db_state_change", ...snap("agents_review_required", review) },
       { type: "db_state_change", ...snap("agents_pending_verify", pending) },
       { type: "db_state_change", ...snap("agents_data_insufficient", dataInsufficient) },
-      { type: "db_state_change", ...snap("http_unreachable", httpUnreachable) },
+      // WHY (dev-request 2026-10-26-lokal-agent-verifier-snapshot-drift-
+      // toleranse, slice 3): the controller reads `http_unreachable` as
+      // http_unreachable_per_run (threshold 25), but the snapshot value is a
+      // DB-wide cumulative gauge that only grows. Claim this run's own tally
+      // instead, as type `custom` with no meta.probe so platform-verifier
+      // skips it (never compares it to the DB snapshot). The gauge moves to
+      // http_unreachable_known_total below.
+      { type: "custom", value: httpUnreachable, meta: { kind: "http_unreachable", scope: "per_run" } },
+      ...(typeof input.snapshotCounts?.http_unreachable === "number"
+        ? [
+            {
+              type: "db_state_change",
+              value: input.snapshotCounts.http_unreachable,
+              meta: { kind: "http_unreachable_known_total", scope: "snapshot", batch_count: httpUnreachable },
+            },
+          ]
+        : []),
       { type: "db_state_change", ...snap("brreg_inactive_flagged", brregFlagged) },
       { type: "db_state_change", ...snap("agents_domain_incoherent", domainIncoherent) },
       {
