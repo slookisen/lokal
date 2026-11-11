@@ -2545,6 +2545,29 @@ function initSchema(db: Database.Database): void {
     // best-effort
   }
 
+  // ─── dev-request 2026-11-11-verifier-ny-verifisering-og-delta-ledd (slice B)
+  // — append-only log of "this verifier run set this agent to verified". One
+  // row per verified outcome, written only by applyVerifierOutcome
+  // (lokal-agent-verifier.ts), keyed on the run's runStartedAt. Read by
+  // GET /admin/verifier/claim-counts?kind=agents_verified (delta mode) so the
+  // per-run agents_verified claim is probed against what the run actually
+  // did, not against agent_knowledge's CURRENT status/last_verified_at, which
+  // later runs overwrite. Purely observational, no gate reads it.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS verifier_verified_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        run_started_at TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_verifier_verified_events_run
+        ON verifier_verified_events(run_started_at);
+    `);
+  } catch {
+    // best-effort
+  }
+
   // ─── dev-request 2026-09-01-rfb-pending-verify-unpark-lever (Daniel Alternativ B,
   // 2026-09-02) — dedikert ferskhetskolonne for unpark-leverens filter, FRIKOBLET fra
   // agent_knowledge.updated_at (som 3 reviewrunder viste IKKE er et pålitelig

@@ -1331,6 +1331,24 @@ export function applyVerifierOutcome(
     // sweep_processed_at column not present in this DB — skip.
   }
 
+  // dev-request 2026-11-11-verifier-ny-verifisering-og-delta-ledd (slice B):
+  // append-only "verified by this run" event, for BOTH UPDATE branches
+  // above. The UPDATE overwrites last_verified_at / verification_status on
+  // every re-process, so a later run (hourly, review-queue or bulk sweep)
+  // erases the evidence an earlier run's agents_verified claim is probed
+  // against. This event row keeps it: claim-counts?kind=agents_verified
+  // (delta) counts these by run_started_at. Best-effort — the table may be
+  // absent in minimal test-harness schemas; it must never break verification.
+  if (outcome.new_verification_status === "verified") {
+    try {
+      db.prepare(
+        `INSERT INTO verifier_verified_events (agent_id, run_started_at) VALUES (?, ?)`
+      ).run(agentId, outcome.runStartedAt);
+    } catch {
+      // verifier_verified_events table not present in this DB — skip.
+    }
+  }
+
   // dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction
   // (item 6 follow-up): pending_verify no-progress parking. Runs
   // unconditionally, for every outcome (not just pending_verify->pending_verify)
