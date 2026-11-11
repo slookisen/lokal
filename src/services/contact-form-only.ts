@@ -55,10 +55,16 @@ import { emailService, type EmailOptions } from "./email-service";
 import { emailWithheldIds } from "./email-reveal-guard";
 import { getDb } from "../database/init";
 
-export type ContactFormHost = "rfb";
+export type ContactFormHost = "rfb" | "dental";
 
+/**
+ * S-D3a adds finn-tannlege.com ("dental", CONTACT_FORM_DENTAL; the flag is
+ * dental_agents.contact_form_only, services/dental-contact-form-only.ts).
+ * Each host has its own switch and its own per-IP limit store.
+ */
 export const CONTACT_FORM_SWITCH_ENV: Readonly<Record<ContactFormHost, string>> = {
   rfb: "CONTACT_FORM_RFB",
+  dental: "CONTACT_FORM_DENTAL",
 };
 
 /** Forwarded messages per client IP per sliding hour. */
@@ -169,6 +175,11 @@ const BIDI_CHARS_RE = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
 // Controls a multi-line message may not carry (tab, LF, CR are allowed).
 const MESSAGE_BAD_CHARS_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g;
 const EMAIL_RE = /^[^\s@<>()",;:\\[\]]+@[^\s@<>()",;:\\[\]]+\.[^\s@<>()",;:\\[\]]{2,}$/;
+
+/** One line of plain text: controls → space, bidi marks gone, whitespace collapsed. */
+export function contactFormOneLine(s: string): string {
+  return oneLine(s);
+}
 
 function oneLine(s: string): string {
   return s.replace(CONTROL_CHARS_RE, " ").replace(BIDI_CHARS_RE, "").replace(/\s+/g, " ").trim();
@@ -309,7 +320,9 @@ export class ContactFormRateStore {
   }
 }
 
-let rateStore = new ContactFormRateStore();
+// One limit store per host (S-D3a): a message to a clinic does not spend an
+// RFB budget, nor the other way round.
+let rateStores: Record<ContactFormHost, ContactFormRateStore> = { rfb: new ContactFormRateStore(), dental: new ContactFormRateStore() };
 let logLine: (line: string) => void = (line) => console.log(line);
 
 /** The short hashed client id used in log lines (never the IP). */
@@ -321,8 +334,9 @@ function logClientId(key: string): string {
  * The limit check for one request. "no_ip" (no usable req.ip) fails closed
  * like the e-mail reveal guard. `ok` carries the key to record after a send.
  */
-export function contactFormRateCheck(req: Request): { ok: true; key: string; client: string } | { ok: false; reason: "limit" | "no_ip"; retryAfter: number; client?: string } {
+export function contactFormRateCheck(req: Request, host: ContactFormHost = "rfb"): { ok: true; key: string; client: string } | { ok: false; reason: "limit" | "no_ip"; retryAfter: number; client?: string } {
   if (typeof req.ip !== "string" || req.ip.trim() === "") return { ok: false, reason: "no_ip", retryAfter: 3600 };
+  const rateStore = rateStores[host];
   const key = rateStore.clientKey(req.ip);
   const client = logClientId(key);
   const wait = rateStore.retryAfterSeconds(key);
@@ -330,8 +344,8 @@ export function contactFormRateCheck(req: Request): { ok: true; key: string; cli
   return { ok: true, key, client };
 }
 
-export function contactFormRecordSend(key: string): void {
-  rateStore.record(key);
+export function contactFormRecordSend(key: string, host: ContactFormHost = "rfb"): void {
+  rateStores[host].record(key);
 }
 
 /** One JSON log line: profile id, outcome, hashed client — never an address, an IP or the text. */
@@ -341,7 +355,7 @@ export function logContactFormEvent(fields: { outcome: string; profile_id?: stri
 
 /** Test-only: a fresh limit store (optionally with a clock), log sink and sender. */
 export function __resetContactFormForTesting(opts: ContactFormRateStoreOptions & { log?: (line: string) => void; sender?: ContactFormSender } = {}): void {
-  rateStore = new ContactFormRateStore(opts);
+  rateStores = { rfb: new ContactFormRateStore(opts), dental: new ContactFormRateStore(opts) };
   logLine = opts.log ?? ((line) => console.log(line));
   sender = opts.sender ?? ((o) => emailService.sendEmail(o));
 }

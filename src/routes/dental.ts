@@ -79,6 +79,7 @@ import { getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
 import { toDentalClinicCard } from "../services/dental-clinic-card";
 import { hasAcuteVaktQuote } from "../services/dental-acute-claim";
 import { emailRevealGuardEnabled, revealEmailFor } from "../services/email-reveal-guard";
+import { dentalContactFormOnlyIds } from "../services/dental-contact-form-only";
 import { ENRICHMENT_WRITE_PAUSE_HTTP_STATUS } from "../services/enrichment-write-pause";
 import { dentalEnrichmentWritePauseBlock } from "../services/dental-enrichment-write-pause";
 
@@ -223,19 +224,32 @@ function withoutEmailProvenance(prov: unknown): unknown {
   return Object.fromEntries(Object.entries(prov).filter(([key]) => !EMAIL_PROVENANCE_KEYS.has(key)));
 }
 
-/** The ids among `agents` whose e-mail this request may not see; null = switch off (change nothing). */
+/**
+ * The ids among `agents` whose e-mail this request may not see; null = both
+ * switches off (change nothing).
+ *
+ * S-D3a (same dev-request): with CONTACT_FORM_DENTAL on, a clinic with the
+ * contact-form-only flag has no e-mail in the public view either (the
+ * X-Admin-Key view keeps it), and it is not passed to the guard, so it spends
+ * no budget. That part depends on the flag, not on the client, so it adds no
+ * Cache-Control. Switch off → the flag is not read.
+ */
 function restEmailWithheld(
   req: Request,
   res: Response,
   agents: ReadonlyArray<{ id: string; epost?: string | null }>,
   adminView: boolean
 ): ReadonlySet<string> | null {
-  if (!emailRevealGuardEnabled("dental")) return null;
+  const flagged = adminView ? null : dentalContactFormOnlyIds(agents.filter((a) => !!a.epost).map((a) => a.id));
+  const hasFlagged = flagged !== null && flagged.size > 0;
+  if (!emailRevealGuardEnabled("dental")) return hasFlagged ? flagged : null;
   res.set("Cache-Control", "private");
   if (adminView) return null;
-  const withEmail = agents.filter((a) => !!a.epost).map((a) => a.id);
+  const withEmail = agents.filter((a) => !!a.epost && !(hasFlagged && flagged.has(a.id))).map((a) => a.id);
   const allowed = revealEmailFor(req, "dental", withEmail);
-  return allowed === null ? null : new Set(withEmail.filter((id) => !allowed.has(id)));
+  const withheld = allowed === null ? null : new Set(withEmail.filter((id) => !allowed.has(id)));
+  if (!hasFlagged) return withheld;
+  return new Set([...(withheld ?? []), ...flagged]);
 }
 
 function withoutEmail<T extends { epost?: string | null }>(agent: T): T {
