@@ -524,6 +524,8 @@ export interface ClientIpStatsLine extends ClientIpCounters {
  *   general  generalLimiter 300 (security.ts): /api except /api/tannlege*,
  *            /ut and /reise (index.ts), /sok (seo.ts, experiences-seo.ts,
  *            dental-seo.ts), /reise, /for-tilbydere/finn and the gårdssalg
+ *            self-registration form /for-tilbydere/registrer (experiences-
+ *            seo.ts / gardssalg-self-register.ts) and the gårdssalg
  *            booking form post (experiences-seo.ts; I-T of
  *            2026-10-17-integrasjonstest-oppfolging), every gårdssalg claim
  *            route, /kategori/gardssalg/eier/* and
@@ -544,6 +546,7 @@ export interface ClientIpStatsLine extends ClientIpCounters {
  *            with many sessions meets first.
  * ac2LimitersFor maps a request to them. Not rated: the limiters with another
  * window — registrationLimiter and consumerKeyIssuanceLimiter (50 an hour),
+ * gardssalgSelfRegisterLimiter (10 an hour),
  * cartWishesLimiter and the MCP sideEffect quota (20 a minute),
  * resendWebhookLimiter (120 a minute, Svix only), adminLimiter (500 an hour,
  * admin key). A key near one of those does not fail the criterion.
@@ -596,6 +599,8 @@ export function ac2LimitersFor(path: string, sessionKeyed: () => boolean = () =>
     lower === "/sok/" ||
     lower === "/for-tilbydere/finn" ||
     lower === "/for-tilbydere/finn/" ||
+    lower === "/for-tilbydere/registrer" ||
+    lower === "/for-tilbydere/registrer/" ||
     /^\/kategori\/gardssalg\/book\/[^/]+\/?$/.test(lower) ||
     under(lower, "/kategori/gardssalg/eier")
   ) {

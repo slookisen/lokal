@@ -2456,6 +2456,72 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Migration experience_data_corrections failed:", err);
   }
 
+  // ─── Gårdssalg self-registration (dev-request 2026-11-01-opplevagent-
+  // drikkeprodusent-selvregistrering, skive 1) ──────────────────────────────
+  // Additive only. A drink producer with no profile can register one at
+  // /for-tilbydere/registrer (routes/gardssalg-self-register.ts, behind
+  // GARDSSALG_SELF_REGISTER_ENABLED). The new row is created hidden
+  // (catalog_hidden=1, catalog_hidden_reason='self_registered_pending_review')
+  // and stays hidden until a human approves it (skive 3).
+  //   origin                — 'self_registered' for a row created by that
+  //                           form; NULL for every other row. Its own column
+  //                           rather than content_source, which carries the
+  //                           enrichment content-lock semantics ('manual' /
+  //                           'claim') and must not gain a third meaning.
+  //   possible_duplicate_of — set when the submitter confirmed "not me" on
+  //                           the "Er dette deg?" step: the id of the
+  //                           experience_providers row, or 'rfb:<agent id>'
+  //                           for an RFB agent with the same org.nr. A
+  //                           marker for the manual review only; nothing is
+  //                           ever merged automatically.
+  try { db.exec("ALTER TABLE experience_providers ADD COLUMN origin TEXT"); } catch { /* already present */ }
+  try { db.exec("ALTER TABLE experience_providers ADD COLUMN possible_duplicate_of TEXT"); } catch { /* already present */ }
+
+  // gardssalg_self_registrations — one row per accepted submission of the
+  // self-registration form. Holds what the submitter typed (their name,
+  // e-mail and phone, the description and producer type), the Brreg outcome
+  // and the duplicate signals. The submitter's e-mail is NEVER written to
+  // experience_providers.epost here (dev-request 2026-08-06-aldri-gjett-
+  // epostadresse): it is the submitter's own claim (submitter_email_source =
+  // 'self_registered') and only becomes the profile address on approval.
+  // status:
+  //   'pending_review'     — a hidden provider row was created (provider_id).
+  //   'exists_hidden'      — the org.nr already has a hidden / quarantined
+  //                          profile (provider_id = that row, after following
+  //                          merged_into); no new row, manual review.
+  //   'brreg_unavailable'  — Brreg did not answer; NO provider row was
+  //                          created (provider_id NULL), manual review.
+  // provider_id has no FK (same database, but the row must outlive a later
+  // hard delete of the provider for the audit trail).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS gardssalg_self_registrations (
+        id TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        provider_id TEXT,
+        org_nr TEXT NOT NULL,
+        submitted_name TEXT NOT NULL,
+        submitted_place TEXT,
+        submitted_producer_type TEXT,
+        submitted_website TEXT,
+        description TEXT,
+        submitter_name TEXT NOT NULL,
+        submitter_email TEXT NOT NULL,
+        submitter_email_source TEXT NOT NULL DEFAULT 'self_registered',
+        submitter_phone TEXT,
+        brreg_status TEXT NOT NULL,
+        brreg_checked_at TEXT,
+        duplicate_signals TEXT,
+        possible_duplicate_of TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    db.exec("CREATE INDEX IF NOT EXISTS idx_gardssalg_self_reg_org_nr ON gardssalg_self_registrations(org_nr)");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_gardssalg_self_reg_status ON gardssalg_self_registrations(status, created_at)");
+  } catch (e) {
+    console.log(`[experiences] gardssalg_self_registrations init skipped: ${(e as Error).message}`);
+  }
+
   // dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent: the
   // profile_translations / profile_translation_audit tables (EN/SV
   // translations of experience + gårdssalg-provider prose, staged

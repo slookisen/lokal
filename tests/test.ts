@@ -43561,6 +43561,28 @@ runSerial(async () => {
   }
 });
 
+// ── dev-request 2026-11-01-opplevagent-drikkeprodusent-selvregistrering,
+// skive 1 (AC1–AC5): /for-tilbydere/registrer — flag, duplicate check, Brreg
+// gate (mocked), RFB filters, IP limit, hidden row on no public surface. Own
+// in-memory experiences db and a real http.Server (raw http.request, never
+// global fetch), restored in its own finally — runSerial like the suites
+// around it.
+runSerial(async () => {
+  console.log("\n── gardssalg-self-register: /for-tilbydere/registrer (skive 1) ──");
+  try {
+    const { runGardssalgSelfRegisterTests } = require("../src/routes/gardssalg-self-register.test") as
+      typeof import("../src/routes/gardssalg-self-register.test");
+    const gsr = await runGardssalgSelfRegisterTests({ log: false });
+    passed += gsr.passed;
+    failed += gsr.failed;
+    for (const f of gsr.failures) failures.push("gardssalg-self-register: " + f);
+    console.log(`  gardssalg-self-register: ${gsr.passed} passed, ${gsr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-self-register: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── OA-01 (dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas):
 // the claim page now sees Opplevagent's own outreach — tier outreach_delivered
 // reads experience_outreach_sent_log (real, delivered, same provider, no

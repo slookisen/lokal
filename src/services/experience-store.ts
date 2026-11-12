@@ -1540,6 +1540,16 @@ export function getPublishedProviderBySlug(slug: string): Record<string, unknown
 }
 
 /**
+ * The slug backfillProviderSlugs() below gives a provider row:
+ * <slugified-navn>--<first-8-chars-of-id>. Exported for callers that create a
+ * row and must set its slug in the same transaction (gårdssalg self-
+ * registration, services/gardssalg-self-register.ts).
+ */
+export function providerSlugFor(navn: string, id: string): string {
+  return `${slugify(navn)}--${id.slice(0, 8)}`;
+}
+
+/**
  * Backfill the slug column for experience_providers rows that have none.
  * Slug format: <slugified-navn>--<first-8-chars-of-id>.
  * Idempotent and boot-safe: skips rows already having a slug.
