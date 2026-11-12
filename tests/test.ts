@@ -53988,6 +53988,28 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord, slice S5:
+// nightly frozen day sums (admin_order_daily_sums) for the admin order /
+// referral dashboard and the read rule in oversikt (AC7: a deleted row does
+// not change a past day). Own in-memory DBs pinned on the route module,
+// swaps ADMIN_KEY / ADMIN_ORDER_DAILY_SUMS_DISABLED (restored in finally) —
+// runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── admin-order-daily-sums: nightly frozen day sums + oversikt read rule (S5) ──");
+  try {
+    const { runAdminOrderDailySumsTests } = require("../src/services/admin-order-daily-sums.test") as
+      typeof import("../src/services/admin-order-daily-sums.test");
+    const r = await runAdminOrderDailySumsTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-order-daily-sums: " + f);
+    console.log(`  admin-order-daily-sums: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-order-daily-sums: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // Claude directory checklist (2026-11-07): the hidden RFB test fixture
 // (catalog_hidden = 1) is still described by id on lokal_info (orderable by
 // product id), but its contact details and vCard link appear in no public

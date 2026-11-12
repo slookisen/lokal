@@ -20,6 +20,11 @@
 //     same shape, bot and test-provider clicks apart): gardssalg for
 //     plattform=gardssalg|alle, opplevelser and tannlege for plattform=alle.
 //
+//     Slice S5: for a past day whose rows were deleted after the nightly job
+//     froze it, the counts come from admin_order_daily_sums instead (the
+//     block then has a `dagssummer` field naming those days); see
+//     services/admin-order-stats.ts «Daily sums» for the read rule.
+//
 //   GET /admin/api/ordre/eksport.csv?plattform=&fra=&til=&oppl=   (slice S2)
 //     The oversikt numbers as a CSV of aggregates only (no order rows).
 //
@@ -58,6 +63,7 @@ import {
   toCsv,
   type OrderListRow,
   type OversiktForCsv,
+  type DailySumsRead,
   type Periode,
   type Plattform,
   type Opplosning,
@@ -114,18 +120,26 @@ function now(): Date {
   return _nowForTesting ?? new Date();
 }
 
+/**
+ * Slice S5: the frozen daily sums (admin_order_daily_sums) live in lokal.db
+ * for every platform, gårdssalg included (see services/admin-order-daily-sums.ts).
+ */
+function sums(): DailySumsRead {
+  return { db: rfbDb() };
+}
+
 /** The per-platform oversikt blocks (shared by /oversikt and /eksport.csv). */
 type Blocks = Pick<OversiktForCsv, "rfb" | "gardssalg" | "henvisninger" | "ai_leveranser">;
 function computeBlocks(plattform: Plattform, periode: Periode, oppl: Opplosning): Blocks {
   const out: Blocks = {};
   if (plattform === "rfb" || plattform === "alle") {
-    out.rfb = computeRfbOverview(rfbDb(), periode, oppl, now());
+    out.rfb = computeRfbOverview(rfbDb(), periode, oppl, now(), sums());
   }
   if (plattform === "gardssalg" || plattform === "alle") {
     const e = expDb();
     if ("error" in e) out.gardssalg = gardssalgUnavailable(e.error);
     else {
-      try { out.gardssalg = computeGardssalgOverview(e.db, periode, oppl); }
+      try { out.gardssalg = computeGardssalgOverview(e.db, periode, oppl, sums()); }
       catch (err) { out.gardssalg = gardssalgUnavailable(`Lesing feilet: ${err instanceof Error ? err.message : String(err)}`); }
     }
   }
@@ -133,7 +147,7 @@ function computeBlocks(plattform: Plattform, periode: Periode, oppl: Opplosning)
   // AI-assistent» (profile_ai_deliveries), kept as separate blocks.
   const henv: NonNullable<Blocks["henvisninger"]> = {};
   if (plattform === "rfb" || plattform === "alle") {
-    henv.rfb = computeRfbReferrals(rfbDb(), periode, oppl);
+    henv.rfb = computeRfbReferrals(rfbDb(), periode, oppl, sums());
     out.ai_leveranser = { rfb: computeRfbAiDeliveries(rfbDb(), periode, oppl) };
   }
   // Slice S4: clicks on the Opplevagent and Finn-tannlege profile links
@@ -153,7 +167,7 @@ function computeBlocks(plattform: Plattform, periode: Periode, oppl: Opplosning)
       };
     }
     for (const p of profilPlattformer) {
-      try { henv[p] = computeProfilReferrals(rfbDb(), p, periode, oppl, p === "tannlege" ? () => null : nameOf); }
+      try { henv[p] = computeProfilReferrals(rfbDb(), p, periode, oppl, p === "tannlege" ? () => null : nameOf, sums()); }
       catch (err) { henv[p] = { available: false, forklaring: "Henvisninger kunne ikke leses.", merknader: [`Lesing feilet: ${err instanceof Error ? err.message : String(err)}`] }; }
     }
   }
@@ -178,7 +192,9 @@ router.get("/oversikt", (req: Request, res: Response) => {
       forklaring:
         "Lesetall for bestillinger (Rett fra Bonden) og besøksforespørsler på gårdssalg (Opplevagent). " +
         "Ingen kjøper- eller gjesteopplysninger. Testdata er talt for seg i hver plattforms test-blokk. " +
-        "Henvisninger (klikk videre til produsenten, tilbyderen eller klinikken) og leveranser til AI-assistenter er egne tall og er ikke lagt sammen.",
+        "Henvisninger (klikk videre til produsenten, tilbyderen eller klinikken) og leveranser til AI-assistenter er egne tall og er ikke lagt sammen. " +
+        "Tallene leses fra de levende radene. Hver natt låses gårsdagens tall som dagssummer uten persondata; er enkeltrader for en tidligere dag slettet senere, " +
+        "brukes dagssummene for den dagen (blokken får da feltet dagssummer). Svartider og «ubesvarte over 24 t» leses alltid fra de levende radene.",
       ...computeBlocks(plattform, periode, oppl),
     };
     res.json(body);

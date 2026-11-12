@@ -55,6 +55,7 @@ import { langMiddleware } from "./i18n/middleware";
 import { asPublicViewMiddleware } from "./middleware/as-public-view";
 import { analyticsService, shouldRunAutoPrune } from "./services/analytics-service";
 import { runPrivacyRetentionTick } from "./services/privacy-retention";
+import { runAdminOrderDailySumsTick } from "./services/admin-order-daily-sums";
 import { mcpUsageLogger } from "./services/mcp-usage-logger";
 import { startEventLoopMonitor, requestTrackerMiddleware, trackJob, getEventLoopSummary } from "./services/event-loop-monitor";
 import { startEventLoopPersistence, pruneEventLoopEvents } from "./services/event-loop-persist";
@@ -1855,6 +1856,14 @@ app.listen(Number(PORT), HOST, async () => {
       // setImmediate between transactions, capped per night, own running
       // flag, starts only in 03–06 UTC. Never throws.
       await runPrivacyRetentionTick(getDb());
+
+      // dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord, slice S5:
+      // freeze yesterday's (and, on the first nights, older) admin order /
+      // referral day sums without personal data (services/admin-order-daily-sums.ts),
+      // before the WAL checkpoint below. Chunked with a setImmediate between
+      // chunks, capped per night, own running flag, starts only in 03–06 UTC.
+      // ADMIN_ORDER_DAILY_SUMS_DISABLED=1 turns it off. Never throws.
+      await runAdminOrderDailySumsTick(getDb());
 
       // Slice 4 of 2026-10-08-serverheng…: big-table indexes are built here, in
       // the 03:00 window, not at boot (services/night-indexes.ts).
