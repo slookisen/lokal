@@ -125,10 +125,23 @@ export function htmlToPlainText(html: string): string {
 
 const FORWARD_SUBJECT_RE = /^\s*\[Innkommende\]/i;
 
+// The forward's own header block, exactly as inbound-email-webhook writes it
+// at the very top of the text: «Videresent fra: …», «Til: …», «Emne: …» and
+// the marker, one per line. Anchored at the start of the body, so a reply
+// (own text first), a quote («> Videresent fra:») or a «Fwd:» (its own
+// forwarded-message header first) never matches.
+const FORWARD_HEADER_BLOCK_RE =
+  /^[ \t]*(?:\r?\n[ \t]*)*Videresent fra:[^\r\n]*\r?\nTil:[^\r\n]*\r?\nEmne:[^\r\n]*\r?\nInbound-ID:[ \t]*(inb-[A-Za-z0-9-]{8,64})[ \t]*(?:\r?\n|$)/;
+
 /**
  * The log id if `m` IS the server's forwarded copy: an inbound message whose
- * subject starts with «[Innkommende]» (a «Fwd:»/«Re:» of it does not) and
- * whose own, unquoted text carries the marker. Anything else returns null.
+ * own, unquoted text carries the marker, and which is recognisable as the
+ * copy in one of two ways:
+ *  - its subject starts with «[Innkommende]» (a «Fwd:»/«Re:» of it does not);
+ *  - the CS agent filed it unwrapped, with the original sender and subject in
+ *    place of the forward's own: its text still starts with the forward's
+ *    header block (FORWARD_HEADER_BLOCK_RE).
+ * Anything else returns null.
  */
 export function forwardCopyMarker(
   m: {
@@ -142,8 +155,9 @@ export function forwardCopyMarker(
 ): string | null {
   if (m.direction !== "in") return null;
   const subject = m.subject ?? fallbackSubject ?? "";
-  if (!FORWARD_SUBJECT_RE.test(subject)) return null;
-  return findUnquotedInboundMarker(m.bodyText, m.bodyHtml);
+  if (FORWARD_SUBJECT_RE.test(subject)) return findUnquotedInboundMarker(m.bodyText, m.bodyHtml);
+  if (typeof m.bodyText !== "string" || !m.bodyText) return null;
+  return FORWARD_HEADER_BLOCK_RE.exec(m.bodyText.slice(0, 4000))?.[1] ?? null;
 }
 
 // ─── Platform from recipient domain ──────────────────────────────────

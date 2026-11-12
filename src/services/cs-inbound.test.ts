@@ -43,6 +43,9 @@
  *   ci107-ci109 DMARC and TLS reports to a platform address are automated
  *              («report»): filed, but never «trenger svar»; a customer subject
  *              that mentions a report is not caught.
+ *   ci110-ci114 the CS agent files the Gmail copy unwrapped (original sender
+ *              and subject): still recognised by the forward's header block,
+ *              so no duplicate thread; a reply, quote or Fwd never is.
  *   ci105-ci106 second re-review: «(fra …)» with parentheses in the sender
  *              name is parsed whole; the alias branch is one transaction (a
  *              DB error during the reopen rolls the messages back).
@@ -449,6 +452,33 @@ export function runCsInboundTests(opts: { log?: boolean } = {}): Promise<TestSum
         const dmRow = logRow("em-dmarc-1");
         eq([dm.code, dmRow?.crm_status, dmRow?.automated_kind, nr.computeNeedsReply({}).threads.some((t) => t.thread_id === dmRow?.crm_thread_id)],
           [200, "registered", "report", false], "ci109: a DMARC report is filed (and forwarded) but never listed as «trenger svar»");
+      }
+
+      // ci110-ci114: the CS agent often files the Gmail copy UNWRAPPED — the
+      // original sender and subject instead of the forward's own — with the
+      // forward's text verbatim. It is still the copy: no duplicate thread.
+      {
+        await hook({ email_id: "em-unwrap-1", from: "Ola Nordmann <ola@nordgard.no>", to: ["kontakt@rettfrabonden.com"], subject: "Når kan vi hente?", created_at: hoursAgo(1) });
+        const u = logRow("em-unwrap-1");
+        const copyText = String(sent[sent.length - 1]?.textContent);
+        ok(!!u?.crm_thread_id && copyText.startsWith("Videresent fra:") && copyText.includes(`Inbound-ID: ${u.id}`), "ci110a: setup — the server filed the e-mail and forwarded it with its header block");
+        const unwrapped = { messageId: "gm-unwrap-1", direction: "in", fromEmail: "ola@nordgard.no", subject: "Når kan vi hente?", bodyText: copyText, sentAt: hoursAgo(1) };
+        eq(ci.forwardCopyMarker(unwrapped), u.id, "ci110: an unwrapped copy (original sender and subject) is recognised by the forward's header block");
+        const ru = await call("POST", "/ingest", { threadId: "gm-thread-unwrap", primaryFromEmail: "ola@nordgard.no", vertical: "rfb", messages: [unwrapped] });
+        eq([ru.status, ru.body?.threadId, ru.body?.serverRegistered], [200, u.crm_thread_id, true], "ci111: ingest of it answers with the server thread");
+        eq([
+          (db.prepare("SELECT COUNT(*) n FROM crm_threads WHERE id = 'gm-thread-unwrap'").get() as any).n,
+          (db.prepare("SELECT COUNT(*) n FROM crm_messages WHERE id = 'gm-unwrap-1'").get() as any).n,
+          (db.prepare("SELECT thread_id FROM crm_thread_aliases WHERE alias_id = 'gm-thread-unwrap'").get() as any)?.thread_id,
+        ], [0, 0, u.crm_thread_id], "ci112: no duplicate thread, no duplicate message; the Gmail id becomes an alias");
+        eq([
+          ci.forwardCopyMarker({ direction: "in", subject: "Re: Når kan vi hente?", bodyText: `Takk!\n\n${copyText}` }),
+          ci.forwardCopyMarker({ direction: "in", subject: "Re: Når kan vi hente?", bodyText: copyText.split("\n").map((l) => `> ${l}`).join("\n") }),
+          ci.forwardCopyMarker({ direction: "in", subject: "Fwd: Når kan vi hente?", bodyText: `---------- Forwarded message ---------\n${copyText}` }),
+          ci.forwardCopyMarker({ direction: "out", subject: "Når kan vi hente?", bodyText: copyText }),
+          ci.forwardCopyMarker({ direction: "in", subject: "Når kan vi hente?", bodyText: copyText.replace(/^Inbound-ID: .*$/m, "") }),
+        ], [null, null, null, null, null], "ci113: a reply, a quote, a Fwd, an outbound message or a header block without the marker is never taken for the copy");
+        eq(ci.forwardCopyMarker({ direction: "in", subject: "Når kan vi hente?", bodyText: "\r\n" + copyText.replace(/\n/g, "\r\n") }), u.id, "ci114: CRLF line ends and a leading blank line still match");
       }
 
       // ci77-ci78 (review #8): a copy of an e-mail the server parked as untriaged opens no second item
