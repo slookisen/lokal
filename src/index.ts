@@ -172,6 +172,7 @@ import adminCrmChimeraContactsDiagnoseRoutes from "./routes/admin-crm-chimera-co
 import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside-cleanup";
 import adminDentalMarkInactiveRoutes from "./routes/admin-dental-mark-inactive";
 import adminDentalContactFormOnlyRoutes from "./routes/admin-dental-contact-form-only";
+import adminExperiencesContactFormOnlyRoutes from "./routes/admin-experiences-contact-form-only";
 import adminDentalHjemmesideDiscoveryRoutes from "./routes/admin-dental-hjemmeside-discovery";
 import adminDentalCatalogClassRoutes from "./routes/admin-dental-catalog-class";
 import adminDentalWrongEntityRetroSanitizeRoutes from "./routes/admin-dental-wrong-entity-retro-sanitize";
@@ -1173,6 +1174,11 @@ app.use("/admin/dental/mark-inactive", adminLimiter, adminDentalMarkInactiveRout
 // S-D3a: per-clinic contact-form flag (record only; read only while
 // CONTACT_FORM_DENTAL is on). POST /admin/dental/agents/:id/contact-form-only
 app.use("/admin/dental/agents", adminLimiter, adminDentalContactFormOnlyRoutes);
+// dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
+// S-D3b: per-producer contact-form flag on opplevagent.no (record only; read
+// only while CONTACT_FORM_EXPERIENCES is on).
+// POST /admin/experiences/providers/:id/contact-form-only
+app.use("/admin/experiences/providers", adminLimiter, adminExperiencesContactFormOnlyRoutes);
 // dev-request 2026-09-02-dental-permanent-triage-needs-review-drain, slice 3c-1:
 // deterministic needs_review drain. POST /admin/dental/triage/dry-run (never
 // writes) and POST /admin/dental/triage/run (503 unless DENTAL_TRIAGE_JOB_ENABLED=true).

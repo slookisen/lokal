@@ -55,16 +55,20 @@ import { emailService, type EmailOptions } from "./email-service";
 import { emailWithheldIds } from "./email-reveal-guard";
 import { getDb } from "../database/init";
 
-export type ContactFormHost = "rfb" | "dental";
+export type ContactFormHost = "rfb" | "dental" | "experiences";
 
 /**
  * S-D3a adds finn-tannlege.com ("dental", CONTACT_FORM_DENTAL; the flag is
  * dental_agents.contact_form_only, services/dental-contact-form-only.ts).
+ * S-D3b adds opplevagent.no ("experiences", CONTACT_FORM_EXPERIENCES; the
+ * flag is experience_providers.contact_form_only,
+ * services/experiences-contact-form-only.ts).
  * Each host has its own switch and its own per-IP limit store.
  */
 export const CONTACT_FORM_SWITCH_ENV: Readonly<Record<ContactFormHost, string>> = {
   rfb: "CONTACT_FORM_RFB",
   dental: "CONTACT_FORM_DENTAL",
+  experiences: "CONTACT_FORM_EXPERIENCES",
 };
 
 /** Forwarded messages per client IP per sliding hour. */
@@ -320,9 +324,9 @@ export class ContactFormRateStore {
   }
 }
 
-// One limit store per host (S-D3a): a message to a clinic does not spend an
-// RFB budget, nor the other way round.
-let rateStores: Record<ContactFormHost, ContactFormRateStore> = { rfb: new ContactFormRateStore(), dental: new ContactFormRateStore() };
+// One limit store per host (S-D3a, S-D3b): a message to a clinic or a
+// gårdssalg producer does not spend an RFB budget, nor the other way round.
+let rateStores: Record<ContactFormHost, ContactFormRateStore> = { rfb: new ContactFormRateStore(), dental: new ContactFormRateStore(), experiences: new ContactFormRateStore() };
 let logLine: (line: string) => void = (line) => console.log(line);
 
 /** The short hashed client id used in log lines (never the IP). */
@@ -355,7 +359,7 @@ export function logContactFormEvent(fields: { outcome: string; profile_id?: stri
 
 /** Test-only: a fresh limit store (optionally with a clock), log sink and sender. */
 export function __resetContactFormForTesting(opts: ContactFormRateStoreOptions & { log?: (line: string) => void; sender?: ContactFormSender } = {}): void {
-  rateStores = { rfb: new ContactFormRateStore(opts), dental: new ContactFormRateStore(opts) };
+  rateStores = { rfb: new ContactFormRateStore(opts), dental: new ContactFormRateStore(opts), experiences: new ContactFormRateStore(opts) };
   logLine = opts.log ?? ((line) => console.log(line));
   sender = opts.sender ?? ((o) => emailService.sendEmail(o));
 }

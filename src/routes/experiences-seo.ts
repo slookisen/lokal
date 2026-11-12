@@ -174,6 +174,12 @@ import { EXPERIENCE_TAGS, type ExperienceTag } from "../services/experience-tags
 import { isGardssalgContactEmailFlaggedForReview } from "./opplevelser";
 import { emailRevealGuardEnabled, isCcBotUserAgent, revealEmailFor } from "../services/email-reveal-guard";
 import { EMAIL_TRAP_ROBOTS_DISALLOW, EMAIL_TRAP_ROUTE_PATHS, emailTrapHandler, emailTrapLinkFor } from "../services/email-reveal-trap";
+import {
+  CONTACT_FORM_EMAIL_MAX, CONTACT_FORM_HONEYPOT_FIELD, CONTACT_FORM_MESSAGE_MAX, CONTACT_FORM_NAME_MAX,
+  contactFormHoneypotFilled, contactFormRateCheck, contactFormRecordSend, logContactFormEvent, sendContactFormMail,
+  validateContactFormInput, type ContactFormField,
+} from "../services/contact-form-only";
+import { buildExperiencesContactFormMail, experiencesContactFormEnabled, isExperiencesContactFormOnly } from "../services/experiences-contact-form-only";
 // dev-request 2026-08-07-orch-fylke-2024-migrasjon: the /fylke/:fylke 301
 // fallback below reuses norway-fylke.ts's own historical-alias map
 // (ALIAS_TO_CANONICAL), merged-legacy equivalence classes
@@ -6243,6 +6249,117 @@ function gardssalgProfileEmailView(req: Request, provider: GardssalgProviderRow,
   return isCcBotUserAgent(req.get("user-agent")) || gardssalgRevealableEmail(provider) === null ? "none" : "reveal";
 }
 
+// ─── S-D3b: contact form instead of e-mail (dev-request
+// 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting, «Kontaktskjema
+// som valg per profil», opplevagent.no) ──────────────────────────────────────
+// Only with CONTACT_FORM_EXPERIENCES on and experience_providers
+// .contact_form_only = 1 (set by an admin when the producer asks). The
+// gårdssalg producer page then carries this form in place of the «E-post» row
+// (and of «Vis e-post»), JSON-LD has no `email`, GET …/:providerSlug/epost
+// answers 404, and POST …/:providerSlug/kontakt forwards the message
+// (services/experiences-contact-form-only.ts). A plain HTML form post, no
+// script. No form where the page would not show the e-mail anyway
+// (gardssalgRevealableEmail: none stored, under review, hidden, test
+// producer). Switch off → the flag is not read.
+type GardssalgContactFormCopy = {
+  label: string; name: string; email: string; message: string; note: string; send: string; honey: string;
+  thanksTitle: string; thanks: string; back: string; invalidTitle: string; invalid: Record<ContactFormField, string>;
+  limitedTitle: string; limited: string; failedTitle: string; failed: string; notFound: string; catalog: string;
+};
+const GARDSSALG_CONTACT_FORM_COPY: Record<Lang, GardssalgContactFormCopy> = {
+  no: {
+    label: "Send melding",
+    name: "Navn",
+    email: "Din e-post (for svar)",
+    message: "Melding",
+    note: "Opplevagent sender meldingen videre til produsenten, som svarer direkte til e-postadressen du oppgir.",
+    send: "Send melding",
+    honey: "Ikke fyll ut dette feltet",
+    thanksTitle: "Takk for meldingen",
+    thanks: "Meldingen er sendt videre til produsenten. Svaret kommer direkte fra produsenten til e-postadressen du oppga.",
+    back: "Tilbake til",
+    invalidTitle: "Meldingen ble ikke sendt",
+    invalid: {
+      name: `Skriv inn navnet ditt (høyst ${CONTACT_FORM_NAME_MAX} tegn).`,
+      reply_email: "Skriv inn en gyldig e-postadresse, så produsenten kan svare deg.",
+      message: `Skriv en melding (høyst ${CONTACT_FORM_MESSAGE_MAX} tegn).`,
+    },
+    limitedTitle: "For mange meldinger",
+    limited: "Det er sendt for mange meldinger herfra den siste timen. Prøv igjen senere, eller kontakt produsenten på telefon eller via nettsiden.",
+    failedTitle: "Meldingen ble ikke sendt",
+    failed: "Noe gikk galt da meldingen skulle sendes. Prøv igjen senere, eller kontakt produsenten på telefon eller via nettsiden.",
+    notFound: "Ikke funnet",
+    catalog: "Gårdssalg og smaking →",
+  },
+  en: {
+    label: "Send a message",
+    name: "Name",
+    email: "Your e-mail (for the reply)",
+    message: "Message",
+    note: "Opplevagent forwards the message to the producer, who replies directly to the e-mail address you give.",
+    send: "Send message",
+    honey: "Do not fill in this field",
+    thanksTitle: "Thank you for your message",
+    thanks: "The message has been forwarded to the producer. The reply comes directly from the producer to the e-mail address you gave.",
+    back: "Back to",
+    invalidTitle: "The message was not sent",
+    invalid: {
+      name: `Enter your name (at most ${CONTACT_FORM_NAME_MAX} characters).`,
+      reply_email: "Enter a valid e-mail address so the producer can reply.",
+      message: `Write a message (at most ${CONTACT_FORM_MESSAGE_MAX} characters).`,
+    },
+    limitedTitle: "Too many messages",
+    limited: "Too many messages have been sent from here in the last hour. Please try again later, or contact the producer by phone or through their website.",
+    failedTitle: "The message was not sent",
+    failed: "Something went wrong while sending the message. Please try again later, or contact the producer by phone or through their website.",
+    notFound: "Not found",
+    catalog: "Farm sales and tasting →",
+  },
+  sv: {
+    label: "Skicka meddelande",
+    name: "Namn",
+    email: "Din e-post (för svar)",
+    message: "Meddelande",
+    note: "Opplevagent skickar meddelandet vidare till producenten, som svarar direkt till e-postadressen du anger.",
+    send: "Skicka meddelande",
+    honey: "Fyll inte i det här fältet",
+    thanksTitle: "Tack för meddelandet",
+    thanks: "Meddelandet har skickats vidare till producenten. Svaret kommer direkt från producenten till e-postadressen du angav.",
+    back: "Tillbaka till",
+    invalidTitle: "Meddelandet skickades inte",
+    invalid: {
+      name: `Skriv ditt namn (högst ${CONTACT_FORM_NAME_MAX} tecken).`,
+      reply_email: "Skriv en giltig e-postadress, så att producenten kan svara dig.",
+      message: `Skriv ett meddelande (högst ${CONTACT_FORM_MESSAGE_MAX} tecken).`,
+    },
+    limitedTitle: "För många meddelanden",
+    limited: "För många meddelanden har skickats härifrån den senaste timmen. Försök igen senare, eller kontakta producenten per telefon eller via webbplatsen.",
+    failedTitle: "Meddelandet skickades inte",
+    failed: "Något gick fel när meddelandet skulle skickas. Försök igen senare, eller kontakta producenten per telefon eller via webbplatsen.",
+    notFound: "Hittades inte",
+    catalog: "Gårdsförsäljning och provsmakning →",
+  },
+};
+
+/** The path of the contact-form POST for a producer slug (named and localized like the «Vis e-post» path). */
+export function gardssalgContactFormPath(slug: string, lang: Lang = "no"): string {
+  return localizedPath(`/kategori/gardssalg/produsent/${encodeURIComponent(slug)}/kontakt`, lang);
+}
+
+/** The «Praktisk info» value cell with the form (replaces the e-mail row). */
+function gardssalgContactFormCell(slug: string, lang: Lang): string {
+  const c = GARDSSALG_CONTACT_FORM_COPY[lang];
+  const field = "display:block;width:100%;box-sizing:border-box;padding:8px 10px;margin:4px 0 10px;border:1px solid var(--line);border-radius:6px;font:inherit";
+  return `<form method="post" action="${escapeHtml(gardssalgContactFormPath(slug, lang))}" id="kontaktskjema" class="produsent-contact-form">`
+    + `<div hidden aria-hidden="true" style="display:none"><label>${escapeHtml(c.honey)} <input type="text" name="${CONTACT_FORM_HONEYPOT_FIELD}" value="" tabindex="-1" autocomplete="off"></label></div>`
+    + `<label style="display:block">${escapeHtml(c.name)}<input type="text" name="name" required maxlength="${CONTACT_FORM_NAME_MAX}" autocomplete="name" style="${field}"></label>`
+    + `<label style="display:block">${escapeHtml(c.email)}<input type="email" name="reply_email" required maxlength="${CONTACT_FORM_EMAIL_MAX}" autocomplete="email" style="${field}"></label>`
+    + `<label style="display:block">${escapeHtml(c.message)}<textarea name="message" required maxlength="${CONTACT_FORM_MESSAGE_MAX}" rows="5" style="${field};resize:vertical"></textarea></label>`
+    + `<p style="font-size:.8rem;color:var(--mist);margin:0 0 10px">${escapeHtml(c.note)}</p>`
+    + `<button type="submit" class="reserve-cta" style="border:none;cursor:pointer;width:100%">${escapeHtml(c.send)}</button>`
+    + `</form>`;
+}
+
 router.get(
   "/kategori/gardssalg/produsent/:providerSlug",
   (req: Request, res: Response, next: NextFunction) => {
@@ -6379,12 +6496,21 @@ router.get(
     // the two would fix nothing). telefon is untouched — this gate is
     // email-only.
     const epostUnderReview = isGardssalgContactEmailFlaggedForReview(provider.field_provenance, provider.epost);
+    // S-D3b: a producer with the contact-form-only flag (CONTACT_FORM_EXPERIENCES
+    // on) shows a contact form instead of the e-mail row, «Vis e-post» and
+    // JSON-LD `email`; the guard is then asked about no e-mail (nothing
+    // counted). No form where the e-mail would not be shown anyway (none,
+    // under review, hidden, test producer — its POST is a 404). Switch off →
+    // the flag is not read, exactly as before.
+    const contactFormOnly = experiencesContactFormEnabled() && isExperiencesContactFormOnly(String(provider.id ?? ""));
+    const contactFormShown = contactFormOnly && gardssalgRevealableEmail(provider) !== null;
     // Slice 4 (S-A1/S-A3): the e-mail this request may see, on top of the
     // review gate. Switch off → null → exactly the line below as before.
-    const emailView = gardssalgProfileEmailView(req, provider, provider.epost && !epostUnderReview ? provider.epost : null);
-    const emailShown = emailView === null || emailView === "show";
+    const emailView = gardssalgProfileEmailView(req, provider, !contactFormOnly && provider.epost && !epostUnderReview ? provider.epost : null);
+    const emailShown = !contactFormOnly && (emailView === null || emailView === "show");
     if (provider.epost && !epostUnderReview && emailShown) facts.push([L.gsEmail, `<a href="mailto:${escapeHtml(provider.epost)}">${escapeHtml(provider.epost)}</a>`]);
     else if (emailView === "reveal") facts.push([L.gsEmail, `<a href="${escapeHtml(gardssalgEmailRevealPath(slug, uiLang))}" rel="nofollow">${escapeHtml(L.gsEmailReveal)}</a>`]);
+    else if (contactFormShown) facts.push([GARDSSALG_CONTACT_FORM_COPY[uiLang].label, gardssalgContactFormCell(slug, uiLang)]);
     const factsRows = facts.map(([k, v]) => `<tr><th scope="row">${escapeHtml(k)}</th><td>${v}</td></tr>`).join("");
     const factsBlock = facts.length
       ? `<table class="facts"><caption class="skip-link">Praktisk info</caption><tbody>${factsRows}</tbody></table>
@@ -6731,7 +6857,12 @@ router.get(
         ensureProviderSlugs();
         provider = getGardssalgProviderBySlug(slug);
       }
-      const email = provider ? gardssalgRevealableEmail(provider) : null;
+      // S-D3b: a contact-form-only producer (CONTACT_FORM_EXPERIENCES on)
+      // answers exactly like a producer without e-mail (404, no address).
+      // Switch off → not read.
+      const email = provider && !(experiencesContactFormEnabled() && isExperiencesContactFormOnly(String(provider.id ?? "")))
+        ? gardssalgRevealableEmail(provider)
+        : null;
       const profilePath = localizedPath(`/kategori/gardssalg/produsent/${encodeURIComponent(slug)}`, uiLang);
       const page = (title: string, body: string) => `<!doctype html>
 <html lang="${htmlLangAttr(uiLang)}">
@@ -6781,6 +6912,125 @@ ${oaSiteFooter({ lang: uiLang })}
     }
   },
 );
+
+// S-D3b: POST /kategori/gardssalg/produsent/:providerSlug/kontakt — forwards a
+// contact-form message to a flagged producer's stored address (named like GET
+// …/:providerSlug/epost; /en and /sv reach it through langMiddleware). Only
+// with CONTACT_FORM_EXPERIENCES on; off → next("route"), so the path answers
+// exactly as on main (the router's catch-all 404). On: the producer must have
+// a public profile (getGardssalgProviderBySlug), an e-mail the page would show
+// (gardssalgRevealableEmail: stored, not under review, not hidden, not the
+// test producer) and the contact_form_only flag, else 404. Honeypot filled →
+// answered like a success, nothing sent. Per-IP limit (5 per hour, req.ip =
+// the trusted client IP, the experiences store) → 429 with Retry-After.
+// Invalid input → 400. One mail via emailService, Reply-To = the sender's
+// address, From = Opplevagent (as the booking notices). HTML page (plain form
+// post), JSON when the client asks for JSON. The producer's address is never
+// in the answer or a log line. Cache-Control: private, no-store; noindex.
+const gardssalgContactFormBodyParsers = [
+  express.urlencoded({ extended: false, limit: "16kb" }),
+  express.json({ limit: "16kb" }),
+];
+router.post("/kategori/gardssalg/produsent/:providerSlug/kontakt", (_req: Request, _res: Response, next: NextFunction) => {
+  // Switch off → skip this route (and its body parsers) entirely.
+  if (!experiencesContactFormEnabled()) { next("route"); return; }
+  next();
+}, ...gardssalgContactFormBodyParsers, async (req: Request, res: Response) => {
+  res.set("Cache-Control", "private, no-store");
+  res.set("X-Robots-Tag", "noindex, nofollow");
+  const slug = String(req.params.providerSlug || "");
+  const uiLang: Lang = isOpplevagentLangSwitcherEnabled() && (req.lang === "en" || req.lang === "sv") ? req.lang : "no";
+  const c = GARDSSALG_CONTACT_FORM_COPY[uiLang];
+  const wantsJson = req.accepts(["html", "json"]) === "json";
+  const page = (title: string, body: string) => `<!doctype html>
+<html lang="${htmlLangAttr(uiLang)}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHtml(title)} | Opplevagent</title>
+<meta name="robots" content="noindex, nofollow">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+${pwaHeadTags()}
+<style>${BROWSE_CSS}${OA_CHROME_CSS}</style>
+</head>
+<body>
+<a class="skip-link" href="#main">${uiLang === "en" ? "Skip to content" : uiLang === "sv" ? "Hoppa till innehållet" : "Hopp til innhold"}</a>
+${oaSiteNav({ lang: uiLang })}
+<main id="main" class="container"><div class="head" style="padding:48px 0;max-width:720px"><h1>${escapeHtml(title)}</h1>${body}</div></main>
+${oaSiteFooter({ lang: uiLang })}
+</body>
+</html>`;
+  try {
+    let provider: GardssalgProviderRow | null = null;
+    if (slug) {
+      ensureProviderSlugs();
+      provider = getGardssalgProviderBySlug(slug);
+    }
+    const providerId = provider ? String(provider.id ?? "") : "";
+    const stored = provider && providerId && isExperiencesContactFormOnly(providerId) ? gardssalgRevealableEmail(provider) : null;
+    const email = typeof stored === "string" && stored.trim() !== "" ? stored.trim() : null;
+    if (!provider || !email) {
+      if (wantsJson) { res.status(404).json({ ok: false, error: "not_found" }); return; }
+      res.status(404).send(page(c.notFound, `<p><a href="${localizedPath("/kategori/gardssalg", uiLang)}">${escapeHtml(c.catalog)}</a></p>`));
+      return;
+    }
+    const name = String(provider.navn || "");
+    const profilePath = localizedPath(`/kategori/gardssalg/produsent/${encodeURIComponent(slug)}`, uiLang);
+    const back = `<p style="margin-top:20px"><a href="${escapeHtml(profilePath)}">&larr; ${escapeHtml(c.back)} ${escapeHtml(name)}</a></p>`;
+    const thanks = () => {
+      if (wantsJson) { res.status(200).json({ ok: true }); return; }
+      res.status(200).send(page(c.thanksTitle, `<p>${escapeHtml(c.thanks)}</p>${back}`));
+    };
+    if (contactFormHoneypotFilled(req.body)) {
+      logContactFormEvent({ host: "experiences", outcome: "honeypot", profile_id: providerId });
+      thanks();
+      return;
+    }
+    const rate = contactFormRateCheck(req, "experiences");
+    if (!rate.ok) {
+      logContactFormEvent({ host: "experiences", outcome: rate.reason === "limit" ? "rate_limited" : "no_ip", profile_id: providerId, ...(rate.client ? { client: rate.client } : {}) });
+      res.set("Retry-After", String(rate.retryAfter));
+      res.status(429);
+      if (wantsJson) { res.json({ ok: false, error: "rate_limited", retry_after: rate.retryAfter }); return; }
+      res.send(page(c.limitedTitle, `<p>${escapeHtml(c.limited)}</p>${back}`));
+      return;
+    }
+    const parsed = validateContactFormInput(req.body);
+    if (!parsed.ok) {
+      logContactFormEvent({ host: "experiences", outcome: "invalid", profile_id: providerId, client: rate.client, fields: parsed.errors });
+      res.status(400);
+      if (wantsJson) { res.json({ ok: false, error: "invalid", fields: parsed.errors }); return; }
+      const backToForm = `<p style="margin-top:20px"><a href="${escapeHtml(profilePath)}#kontaktskjema">&larr; ${escapeHtml(c.back)} ${escapeHtml(name)}</a></p>`;
+      res.send(page(c.invalidTitle, `<ul>${parsed.errors.map((f) => `<li>${escapeHtml(c.invalid[f])}</li>`).join("")}</ul>${backToForm}`));
+      return;
+    }
+    contactFormRecordSend(rate.key, "experiences");
+    const mail = buildExperiencesContactFormMail({
+      providerName: name,
+      profileUrl: `${baseUrl()}/kategori/gardssalg/produsent/${encodeURIComponent(slug)}`,
+      input: parsed.value,
+      to: email,
+    });
+    let sent = false;
+    try {
+      sent = (await sendContactFormMail(mail)).success === true;
+    } catch {
+      sent = false;
+    }
+    logContactFormEvent({ host: "experiences", outcome: sent ? "forwarded" : "send_failed", profile_id: providerId, client: rate.client });
+    if (!sent) {
+      res.status(502);
+      if (wantsJson) { res.json({ ok: false, error: "send_failed" }); return; }
+      res.send(page(c.failedTitle, `<p>${escapeHtml(c.failed)}</p>${back}`));
+      return;
+    }
+    thanks();
+  } catch (err) {
+    // The error text could carry an address (mail layer) — log the kind only.
+    console.error("SEO /kategori/gardssalg/produsent/:providerSlug/kontakt error:", err instanceof Error ? err.name : "unknown");
+    if (!res.headersSent) res.status(500).send(uiLang === "en" ? "Internal error" : "Intern feil");
+  }
+});
 
 // ─── Gårdssalg reservation → confirmation journey (2026-07-02) ──────────────
 //
