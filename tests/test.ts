@@ -51608,6 +51608,24 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-01-visibility-mcp-versjonsnummer-spriker: serverInfo.version and the server
+// card version of each vertical equal the version in its published npm package.json.
+runSerial(async () => {
+  console.log("\n── mcp-versions: serverInfo + server-card version == npm package.json ──");
+  try {
+    const { runMcpVersionsTests } = require("../src/config/mcp-versions.test") as
+      typeof import("../src/config/mcp-versions.test");
+    const mv = await runMcpVersionsTests({ log: false });
+    passed += mv.passed;
+    failed += mv.failed;
+    for (const f of mv.failures) failures.push("mcp-versions: " + f);
+    console.log(`  mcp-versions: ${mv.passed} passed, ${mv.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("mcp-versions: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker (G3-S6): the Claude directory
 // packs equal what scripts/gen-connector-packs.ts generates from the code. Throwaway MCP servers,
 // file reads, PAYMENTS_ENABLED unset while rendering (restored) — runSerial, tail position.

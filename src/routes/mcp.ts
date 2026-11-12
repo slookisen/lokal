@@ -13,6 +13,7 @@
  * ChatGPT Developer Mode: paste https://rettfrabonden.com/mcp as the MCP URL.
  */
 
+import { mcpPackageVersion } from "../config/mcp-versions";
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -2313,7 +2314,7 @@ async function getOrCreateSession(
 
   const server = new McpServer({
     name: "rett-fra-bonden",
-    version: "0.4.0",
+    version: mcpPackageVersion("rfb"),
     title: RFB_MCP_SERVER_TITLE,
     websiteUrl: BRAND_ENTITIES.rfb.url,
     icons: RFB_MCP_SERVER_ICONS,

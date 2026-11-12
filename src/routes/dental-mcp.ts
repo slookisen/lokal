@@ -11,6 +11,7 @@
  * ChatGPT / Claude Desktop: paste https://finn-tannlege.com/mcp as the MCP URL.
  */
 
+import { mcpPackageVersion } from "../config/mcp-versions";
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -644,7 +645,7 @@ async function getOrCreateDentalSession(
 
   const server = new McpServer({
     name: "finn-tannlege",
-    version: "0.1.0",
+    version: mcpPackageVersion("dental"),
     title: DENTAL_MCP_SERVER_TITLE,
     description: DENTAL_MCP_SERVER_DESCRIPTION,
     websiteUrl: BRAND_ENTITIES.dental.url,

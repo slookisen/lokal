@@ -23,6 +23,7 @@
  * src/index.ts, so rettfrabonden.com and finn-tannlege.com never reach it.
  */
 
+import { mcpPackageVersion } from "../config/mcp-versions";
 import express, { Router, Request, Response, NextFunction } from "express";
 import { createSitemapCache, resolveSitemapCacheTtlMs, logSlowSitemap } from "./sitemap-cache-util";
 import { isAsPublicView } from "../services/agent-visibility";
@@ -3324,7 +3325,7 @@ function experiencesMcpServerCard() {
     ...mcpProtocolDeclaration(),
     name: "opplevagent",
     title: "Opplevagent — Norwegian experiences marketplace",
-    version: "0.1.0",
+    version: mcpPackageVersion("experiences"),
     description:
       `Discover ${totalLabel} curated, Brreg-verified Norwegian experiences and activities. ` +
       "Filter by county (fylke), municipality, category, weather suitability, season, indoor/outdoor, " +

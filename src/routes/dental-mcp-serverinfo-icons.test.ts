@@ -38,6 +38,8 @@ import * as path from "path";
 import express from "express";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
+import { mcpPackageVersion } from "../config/mcp-versions";
+const dentalPkgVersion = mcpPackageVersion("dental");
 
 export interface TestSummary { passed: number; failed: number; failures: string[] }
 
@@ -200,7 +202,7 @@ export async function runDentalMcpServerInfoIconsTests(opts: { log?: boolean } =
     ok(initRes.ok && !!sessionId, `I1: initialize answers 2xx with a session id (got ${initRes.status})`);
     const info = init.result?.serverInfo ?? {};
     eq(Object.keys(info), SERVER_INFO_KEYS, "I2: serverInfo has name, version, title, description, websiteUrl and icons, nothing else");
-    ok(info.name === "finn-tannlege" && info.version === "0.1.0" && init.result?.instructions === mcp.DENTAL_MCP_INSTRUCTIONS,
+    ok(info.name === "finn-tannlege" && info.version === dentalPkgVersion && init.result?.instructions === mcp.DENTAL_MCP_INSTRUCTIONS,
       "I3: name, version and instructions unchanged (non-goals of G3-S5)");
     ok(info.title === mcp.DENTAL_MCP_SERVER_TITLE && String(info.title).startsWith(`${brand.name} — `),
       `I4: serverInfo.title leads with the brand name from BRAND_ENTITIES.dental («${info.title}»)`);
