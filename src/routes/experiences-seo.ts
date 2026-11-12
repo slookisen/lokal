@@ -290,6 +290,8 @@ import {
   FOR_TILBYDERE_FAQ_META,
   type ForTilbydereSection,
 } from "./experiences-for-tilbydere-faq";
+import { createGardssalgSelfRegisterRouter, GARDSSALG_SELF_REGISTER_PATH } from "./gardssalg-self-register";
+import { isGardssalgSelfRegisterEnabled } from "../services/gardssalg-self-register";
 import { faqPairsFromJsonLd, type FaqPair } from "../services/faq-section";
 
 const router = Router();
@@ -2704,6 +2706,11 @@ router.get(`/${INDEXNOW_KEY}.txt`, (_req: Request, res: Response) => {
 //   /kategori/gardssalg/status/     booking status page (bookingRef+guestToken).
 //   /admin/                         admin surface — X-Admin-Key gated
 //                                   regardless; this is defense-in-depth.
+//   /for-tilbydere/registrer        gårdssalg self-registration form (dev-
+//                                   request 2026-11-01-opplevagent-drikke-
+//                                   produsent-selvregistrering). Served
+//                                   whether GARDSSALG_SELF_REGISTER_ENABLED is
+//                                   on or off (off = 404 there anyway).
 // Every one of these already carries its own noindex meta tag (svar/
 // gjestesvar/status/bekreft render through the shared previsitPage() shell;
 // confirm/eier render their own) — Disallow keeps crawlers from spending
@@ -2726,6 +2733,7 @@ Disallow: /kategori/gardssalg/bekreft/
 Disallow: /kategori/gardssalg/svar/
 Disallow: /kategori/gardssalg/gjestesvar/
 Disallow: /kategori/gardssalg/status/
+Disallow: /for-tilbydere/registrer
 Disallow: /admin/`;
 
 router.get("/robots.txt", (_req: Request, res: Response) => {
@@ -10561,7 +10569,15 @@ router.get("/for-tilbydere/finn", generalLimiter, (req: Request, res: Response) 
   const resultBlock = !q
     ? `<div class="ft-hint"><p><strong>Skriv inn bedriftsnavnet</strong> (eller stedet) i feltet over, så finner vi profilen din. Du kan også bla i <a href="/kategori/gardssalg">katalogen</a>.</p></div>`
     : hits.length === 0
-    ? `<div class="ft-hint"><p>Ingen treff på «${escapeHtml(q)}». Prøv et kortere navn eller stedet bedriften ligger på — eller bla i <a href="/kategori/gardssalg">katalogen</a>. Finner du ikke bedriften, ta kontakt på <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>, så hjelper vi deg.</p></div>`
+    ? `<div class="ft-hint"><p>Ingen treff på «${escapeHtml(q)}». Prøv et kortere navn eller stedet bedriften ligger på — eller bla i <a href="/kategori/gardssalg">katalogen</a>. Finner du ikke bedriften, ta kontakt på <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>, så hjelper vi deg.</p>${
+        // dev-request 2026-11-01-opplevagent-drikkeprodusent-selvregistrering:
+        // the self-registration door, in addition to the contact address, and
+        // only while GARDSSALG_SELF_REGISTER_ENABLED is on (off = byte-identical
+        // to before).
+        isGardssalgSelfRegisterEnabled()
+          ? `<p class="ft-register"><strong>Finner du ikke bedriften?</strong> <a href="${GARDSSALG_SELF_REGISTER_PATH}?navn=${encodeURIComponent(q)}">Registrer den</a>.</p>`
+          : ""
+      }</div>`
     : `<p class="count">${hits.length} treff — klikk «Er dette din bedrift?» på din egen oppføring for å ta eierskap.</p>
   <ul class="ft-hits">
 ${hitCards}
@@ -10584,6 +10600,12 @@ ${hitCards}
     main,
   }));
 });
+
+// GET|POST /for-tilbydere/registrer — gårdssalg self-registration (dev-request
+// 2026-11-01-opplevagent-drikkeprodusent-selvregistrering, skive 1). Its own
+// module; mounted here so it shares this router's host gate, page chrome and
+// 404. Flag off → both routes fall through to the 404 below (AC1).
+router.use(createGardssalgSelfRegisterRouter(forTilbyderePage));
 
 // ═══════════════════════════════════════════════════════════
 // GET /kontakt — public contact form (opplevagent.no)

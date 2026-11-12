@@ -247,7 +247,18 @@ export function runForTilbydereTests(opts: { log?: boolean } = {}): Promise<Test
         countOccurrences(robots.body, "Disallow: /kategori/gardssalg/bekreft/") === uaGroups,
         "c3: the /bekreft/ token path stays Disallow'd in every UA group"
       );
-      assertTrue(!robots.body.includes("Disallow: /for-tilbydere"), "c4: /for-tilbydere is NOT Disallow'd (covered by Allow: /)");
+      // c4 was `!includes("Disallow: /for-tilbydere")`; dev-request 2026-11-01-
+      // opplevagent-drikkeprodusent-selvregistrering added
+      // "Disallow: /for-tilbydere/registrer" (the self-registration form), so
+      // the check is now per line: the page and /finn stay crawlable.
+      assertTrue(
+        !/^Disallow: \/for-tilbydere\/?$/m.test(robots.body) && !robots.body.includes("Disallow: /for-tilbydere/finn"),
+        "c4: /for-tilbydere and /for-tilbydere/finn are NOT Disallow'd (covered by Allow: /)"
+      );
+      assertTrue(
+        countOccurrences(robots.body, "Disallow: /for-tilbydere/registrer\n") === uaGroups,
+        "c5: the self-registration form /for-tilbydere/registrer is Disallow'd in every UA group, like the claim paths"
+      );
 
       // ── (d) /for-tilbydere/finn: hits, hidden-exclusion, empty q ───────
       const finnHit = invokeRoute(router, "/for-tilbydere/finn", {}, "/for-tilbydere/finn", { q: "bryggeri" });
