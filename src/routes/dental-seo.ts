@@ -1,5 +1,5 @@
 
-import { Router, Request, Response } from "express";
+import express, { Router, Request, Response } from "express";
 import { createSitemapCache, resolveSitemapCacheTtlMs, logSlowSitemap } from "./sitemap-cache-util";
 import {
   listPublicDentalAgents,
@@ -30,6 +30,7 @@ import { isDisplayablePhone } from "../services/contact-normalizer";
 // clinic's own «Hjemmeside» link carries UTM; booking and directory_url links
 // and the JSON-LD sameAs stay as stored.
 import { addUtmParams, OUTBOUND_UTM } from "../utils/url-utm";
+import { profileLinkHref, profileLinkBeaconAttrs, profileClickBeaconScript, profileLinkRedirectHandler } from "../services/profile-link-clicks";
 const CLINIC_SITE_UTM = OUTBOUND_UTM.dental.clinic_profile;
 import { resolveAcuteClaim, ACUTE_ACCEPTS_LABEL } from "../services/dental-acute-claim";
 import { resolveHelfoClaim, HELFO_CLAIM_REQUIRES_SOURCE } from "../services/dental-helfo-claim";
@@ -66,6 +67,12 @@ import { isDentalSyntheticProbeId } from "../services/dental-contamination";
 import { isHiddenImportRow } from "../services/dental-import-display";
 import { shownDentalAgent } from "../services/dental-places-display";
 import { emailRevealGuardEnabled, isCcBotUserAgent, revealEmailFor } from "../services/email-reveal-guard";
+import {
+  CONTACT_FORM_EMAIL_MAX, CONTACT_FORM_HONEYPOT_FIELD, CONTACT_FORM_MESSAGE_MAX, CONTACT_FORM_NAME_MAX,
+  contactFormHoneypotFilled, contactFormRateCheck, contactFormRecordSend, logContactFormEvent, sendContactFormMail,
+  validateContactFormInput, type ContactFormField,
+} from "../services/contact-form-only";
+import { buildDentalContactFormMail, dentalContactFormEnabled, isDentalContactFormOnly } from "../services/dental-contact-form-only";
 import { EMAIL_TRAP_ROBOTS_DISALLOW, EMAIL_TRAP_ROUTE_PATHS, emailTrapHandler, emailTrapLinkFor } from "../services/email-reveal-trap";
 import { placesDisplayPolicyEnabled } from "../services/places-display-policy";
 import { planDentalSearch, MAX_POSTSTED_IN, MAX_TERM_CHARS, type DentalSearchPlan, type DentalSearchTolkning } from "../services/dental-query-parser";
@@ -1859,6 +1866,62 @@ function profileEmailView(req: Request, res: Response, agent: { id?: string; epo
   return isCcBotUserAgent(req.get("user-agent")) ? "none" : "reveal";
 }
 
+// ─── S-D3a: contact form instead of e-mail (dev-request
+// 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting, «Kontaktskjema
+// som valg per profil», finn-tannlege.com) ──────────────────────────────────
+// Only with CONTACT_FORM_DENTAL on and dental_agents.contact_form_only = 1
+// (set by an admin when the clinic asks). The profile then carries this form
+// in place of the e-mail line (and of «Vis e-post»), JSON-LD has no `email`,
+// GET /klinikk/id/:id/epost answers 404, and POST /klinikk/id/:id/kontakt
+// forwards the message (services/dental-contact-form-only.ts). A plain HTML
+// form post, no script. Switch off → the flag is not read.
+const DENTAL_CONTACT_FORM_COPY: {
+  label: string; name: string; email: string; message: string; note: string; send: string; honey: string;
+  thanksTitle: string; thanks: string; back: string; invalidTitle: string; invalid: Record<ContactFormField, string>;
+  limitedTitle: string; limited: string; failedTitle: string; failed: string;
+} = {
+  label: "Send melding til klinikken",
+  name: "Navn",
+  email: "Din e-post (for svar)",
+  message: "Melding",
+  note: "Finn-tannlege.com sender meldingen videre til klinikken, som svarer direkte til e-postadressen du oppgir. Ikke skriv helseopplysninger i meldingen. Trenger du hjelp raskt, ring klinikken.",
+  send: "Send melding",
+  honey: "Ikke fyll ut dette feltet",
+  thanksTitle: "Takk for meldingen",
+  thanks: "Meldingen er sendt videre til klinikken. Svaret kommer direkte fra klinikken til e-postadressen du oppga.",
+  back: "Tilbake til",
+  invalidTitle: "Meldingen ble ikke sendt",
+  invalid: {
+    name: `Skriv inn navnet ditt (høyst ${CONTACT_FORM_NAME_MAX} tegn).`,
+    reply_email: "Skriv inn en gyldig e-postadresse, så klinikken kan svare deg.",
+    message: `Skriv en melding (høyst ${CONTACT_FORM_MESSAGE_MAX} tegn).`,
+  },
+  limitedTitle: "For mange meldinger",
+  limited: "Det er sendt for mange meldinger herfra den siste timen. Prøv igjen senere, eller kontakt klinikken på telefon.",
+  failedTitle: "Meldingen ble ikke sendt",
+  failed: "Noe gikk galt da meldingen skulle sendes. Prøv igjen senere, eller kontakt klinikken på telefon.",
+};
+
+/** The path of the contact-form POST for a clinic id (named like the «Vis e-post» path). */
+export function dentalContactFormPath(id: string): string {
+  return `/klinikk/id/${encodeURIComponent(id)}/kontakt`;
+}
+
+/** The info-grid item with the form (replaces the e-mail line). */
+function dentalContactFormItem(id: string): string {
+  const c = DENTAL_CONTACT_FORM_COPY;
+  const field = "display:block;width:100%;box-sizing:border-box;padding:8px 10px;margin:4px 0 10px;border:1px solid #d1d5db;border-radius:6px;font:inherit";
+  return `<div class="info-item" id="kontaktskjema" style="grid-column:1/-1"><div class="info-label">${escapeHtml(c.label)}</div><div class="info-value">`
+    + `<form method="post" action="${escapeHtml(dentalContactFormPath(id))}" class="clinic-contact-form">`
+    + `<div hidden aria-hidden="true" style="display:none"><label>${escapeHtml(c.honey)} <input type="text" name="${CONTACT_FORM_HONEYPOT_FIELD}" value="" tabindex="-1" autocomplete="off"></label></div>`
+    + `<label style="display:block">${escapeHtml(c.name)}<input type="text" name="name" required maxlength="${CONTACT_FORM_NAME_MAX}" autocomplete="name" style="${field}"></label>`
+    + `<label style="display:block">${escapeHtml(c.email)}<input type="email" name="reply_email" required maxlength="${CONTACT_FORM_EMAIL_MAX}" autocomplete="email" style="${field}"></label>`
+    + `<label style="display:block">${escapeHtml(c.message)}<textarea name="message" required maxlength="${CONTACT_FORM_MESSAGE_MAX}" rows="5" style="${field};resize:vertical"></textarea></label>`
+    + `<p style="font-size:.82rem;color:var(--g500);margin:0 0 10px">${escapeHtml(c.note)}</p>`
+    + `<button type="submit" class="btn-primary" style="border:none;cursor:pointer">${escapeHtml(c.send)}</button>`
+    + `</form></div></div>`;
+}
+
 function renderClinicProfile(
   stored: DentalAgentRow,
   req: Request,
@@ -1890,8 +1953,15 @@ function renderClinicProfile(
   const canonical = clinicProfileUrl(agent);
   // Slice 2 (S-A1/S-A3): the e-mail this request may see. Switch off → null →
   // agent.epost, exactly as before.
-  const emailView = profileEmailView(req, res, agent);
-  const shownEmail = emailView === null || emailView === "show" ? agent.epost : null;
+  // S-D3a: a clinic with the contact-form-only flag (CONTACT_FORM_DENTAL on)
+  // shows a contact form instead of the e-mail, «Vis e-post» and JSON-LD
+  // `email`; the guard is then asked about no e-mail (nothing counted). No
+  // form on a closed clinic (its POST is a 404). Switch off → the flag is not
+  // read, exactly as before.
+  const contactFormOnly = dentalContactFormEnabled() && isDentalContactFormOnly(agent.id ?? "");
+  const contactFormShown = contactFormOnly && !!agent.epost && agent.is_inactive !== 1;
+  const emailView = profileEmailView(req, res, contactFormOnly ? { ...agent, epost: null } : agent);
+  const shownEmail = contactFormOnly ? null : emailView === null || emailView === "show" ? agent.epost : null;
 
   // ── Header badges
   // dev-request 2026-10-06-dental-nedlagte-og-akuttpastander (skive A): a
@@ -1946,13 +2016,23 @@ function renderClinicProfile(
   }
 
   // ── Action buttons
+  // dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord S4: booking,
+  // website and directory links go through the counting redirect GET
+  // /ut/klinikk/:id/{booking,website,directory} (services/profile-link-
+  // clicks.ts reads the same stored columns, website with the same
+  // CLINIC_SITE_UTM — never a URL from the request); tel: and mailto: links
+  // fire the click beacon (data-track-*). No id → the direct links as before.
+  const clinicId = agent.id ? String(agent.id) : "";
+  const outHref = (kind: "booking" | "website" | "directory", direct: string): string =>
+    escapeHtml(clinicId ? profileLinkHref("klinikk", clinicId, kind) : direct);
+  const telTrack = clinicId ? profileLinkBeaconAttrs("klinikk", clinicId, "phone") : "";
   const _callTelHref = safeTelHref(agent.telefon);
   const callBtn = _callTelHref
-    ? `<a href="${_callTelHref}" class="btn-call">${ICON_PHONE} Ring ${escapeHtml(agent.telefon)}</a>`
+    ? `<a href="${_callTelHref}" class="btn-call"${telTrack}>${ICON_PHONE} Ring ${escapeHtml(agent.telefon)}</a>`
     : "";
   const _bookUrl = safeUrl(agent.online_booking_url);
   const bookBtn = _bookUrl
-    ? `<a href="${escapeHtml(_bookUrl)}" rel="nofollow noopener" target="_blank" class="btn-book">Book time online</a>`
+    ? `<a href="${outHref("booking", _bookUrl)}" rel="nofollow noopener" target="_blank" class="btn-book">Book time online</a>`
     : "";
 
   // ── Om oss
@@ -1969,16 +2049,17 @@ function renderClinicProfile(
   // as before.
   if (agent.adresse) infoItems.push(`<div class="info-item"><div class="info-label">Adresse</div><div class="info-value">${escapeHtml(agent.adresse)}${postnummer ? `, ${escapeHtml(postnummer)}` : ""}${agent.poststed ? ` ${escapeHtml(agent.poststed)}` : ""}</div></div>`);
   else if (stored.adresse && (postnummer || agent.poststed)) infoItems.push(`<div class="info-item"><div class="info-label">Postnummer og sted</div><div class="info-value">${[postnummer, agent.poststed].filter(Boolean).map((v) => escapeHtml(v!)).join(" ")}</div></div>`);
-  { const h = safeTelHref(agent.telefon); if (h) infoItems.push(`<div class="info-item"><div class="info-label">Telefon</div><div class="info-value"><a href="${h}">${escapeHtml(agent.telefon)}</a></div></div>`); }
-  { const h = safeTelHref(agent.mobil); if (h) infoItems.push(`<div class="info-item"><div class="info-label">Mobil</div><div class="info-value"><a href="${h}">${escapeHtml(agent.mobil)}</a></div></div>`); }
-  if (shownEmail) infoItems.push(`<div class="info-item"><div class="info-label">E-post</div><div class="info-value"><a href="mailto:${escapeHtml(shownEmail)}">${escapeHtml(shownEmail)}</a></div></div>`);
+  { const h = safeTelHref(agent.telefon); if (h) infoItems.push(`<div class="info-item"><div class="info-label">Telefon</div><div class="info-value"><a href="${h}"${telTrack}>${escapeHtml(agent.telefon)}</a></div></div>`); }
+  { const h = safeTelHref(agent.mobil); if (h) infoItems.push(`<div class="info-item"><div class="info-label">Mobil</div><div class="info-value"><a href="${h}"${telTrack}>${escapeHtml(agent.mobil)}</a></div></div>`); }
+  if (shownEmail) infoItems.push(`<div class="info-item"><div class="info-label">E-post</div><div class="info-value"><a href="mailto:${escapeHtml(shownEmail)}"${clinicId ? profileLinkBeaconAttrs("klinikk", clinicId, "email") : ""}>${escapeHtml(shownEmail)}</a></div></div>`);
   else if (emailView === "reveal") infoItems.push(`<div class="info-item"><div class="info-label">E-post</div><div class="info-value"><a href="${escapeHtml(dentalEmailRevealPath(agent.id ?? ""))}" rel="nofollow">${DENTAL_EMAIL_REVEAL_LABEL}</a></div></div>`);
-  { const u = safeUrl(agent.hjemmeside); if (u) infoItems.push(`<div class="info-item"><div class="info-label">Hjemmeside</div><div class="info-value"><a href="${escapeHtml(addUtmParams(u, CLINIC_SITE_UTM.source, "referral", CLINIC_SITE_UTM.campaign))}" rel="nofollow noopener" target="_blank">${escapeHtml(u.replace(/^https?:\/\//,""))}</a></div></div>`); }
+  else if (contactFormShown) infoItems.push(dentalContactFormItem(agent.id ?? ""));
+  { const u = safeUrl(agent.hjemmeside); if (u) infoItems.push(`<div class="info-item"><div class="info-label">Hjemmeside</div><div class="info-value"><a href="${outHref("website", addUtmParams(u, CLINIC_SITE_UTM.source, "referral", CLINIC_SITE_UTM.campaign))}" rel="nofollow noopener" target="_blank">${escapeHtml(u.replace(/^https?:\/\//,""))}</a></div></div>`); }
   // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5d):
   // directory_url is NEVER the clinic's own homepage (that's `hjemmeside`
   // above) -- it's a county-directory listing, a Facebook page, or similar.
   // Label it accordingly so a visitor never mistakes it for the clinic's site.
-  { const u = safeUrl(agent.directory_url); if (u) infoItems.push(`<div class="info-item"><div class="info-label">${escapeHtml(directoryUrlLabel(u))}</div><div class="info-value"><a href="${escapeHtml(u)}" rel="nofollow noopener" target="_blank">${escapeHtml(u.replace(/^https?:\/\//,""))}</a></div></div>`); }
+  { const u = safeUrl(agent.directory_url); if (u) infoItems.push(`<div class="info-item"><div class="info-label">${escapeHtml(directoryUrlLabel(u))}</div><div class="info-value"><a href="${outHref("directory", u)}" rel="nofollow noopener" target="_blank">${escapeHtml(u.replace(/^https?:\/\//,""))}</a></div></div>`); }
   if (agent.org_nr) infoItems.push(`<div class="info-item"><div class="info-label">Organisasjonsnr.</div><div class="info-value">${escapeHtml(agent.org_nr)}</div></div>`);
   if (agent.registreringsdato) infoItems.push(`<div class="info-item"><div class="info-label">Registrert</div><div class="info-value">${escapeHtml(agent.registreringsdato)}</div></div>`);
   if (agent.antall_ansatte !== null && agent.antall_ansatte !== undefined) infoItems.push(`<div class="info-item"><div class="info-label">Antall ansatte</div><div class="info-value">${escapeHtml(String(agent.antall_ansatte))}</div></div>`);
@@ -2263,7 +2344,7 @@ function renderClinicProfile(
       <div class="clinic-badges" style="margin-bottom:12px">${badges.join("")}</div>
       <h1 class="profile-name">${escapeHtml(agent.navn)}</h1>
       <div class="profile-loc">${ICON_PIN} ${isValidLocality(agent.poststed) ? escapeHtml(officialPlaceLabel(agent.poststed!)) : ""}${isValidLocality(agent.poststed) && isValidLocality(agent.fylke) ? `, ${escapeHtml(agent.fylke!)}` : !isValidLocality(agent.poststed) && isValidLocality(agent.fylke) ? escapeHtml(agent.fylke!) : ""}</div>
-      <div class="profile-actions">${callBtn}${bookBtn}</div>
+      <div class="profile-actions">${callBtn}${bookBtn}</div>${clinicId ? profileClickBeaconScript() : ""}
     </div>
   </div>
   <div class="container" style="padding-top:32px;padding-bottom:48px">
@@ -2297,6 +2378,13 @@ ${emailView === null ? "" : emailTrapLinkFor("dental")}</main>`;
   }));
 }
 
+// GET /ut/klinikk/:id/:kind — counting redirect for the clinic profile's
+// outgoing booking / website / directory links (dev-request
+// 2026-10-23-admin-ordre-og-henvisningsdashbord, S4). Target read only from
+// dental_agents by id + a closed kind (services/profile-link-clicks.ts);
+// Opplevagent surfaces 404 here.
+router.get("/ut/:surface/:id/:kind", generalLimiter, profileLinkRedirectHandler(["klinikk"]));
+
 router.get("/klinikk/id/:id", (req: Request, res: Response) => {
   const agent = getDentalAgentById(String(req.params.id));
   if (!agent) {
@@ -2322,7 +2410,10 @@ router.get("/klinikk/id/:id/epost", (req: Request, res: Response, next) => {
   res.set("X-Robots-Tag", "noindex, nofollow");
   const stored = getDentalAgentById(String(req.params.id));
   const agent = stored ? shownDentalAgent(stored) : null;
-  if (!agent || !agent.epost || agent.verification_status === "rejected" || isDentalSyntheticProbeId(agent.id)) {
+  // S-D3a: a contact-form-only clinic (CONTACT_FORM_DENTAL on) answers exactly
+  // like a clinic without e-mail (404, no address). Switch off → not read.
+  if (!agent || !agent.epost || agent.verification_status === "rejected" || isDentalSyntheticProbeId(agent.id)
+    || (dentalContactFormEnabled() && isDentalContactFormOnly(agent.id))) {
     sendDentalNotFound(res,
       `<div class="container"><div class="empty-state" style="padding:80px 0"><h3>Klinikk ikke funnet</h3><p>Siden du leter etter finnes ikke.</p><a href="/" class="btn-secondary" style="margin-top:16px">Til forsiden</a></div></div>`,
       { title: "Ikke funnet — Finn-tannlege.com" }
@@ -2345,6 +2436,104 @@ router.get("/klinikk/id/:id/epost", (req: Request, res: Response, next) => {
   }
   res.set("Retry-After", "3600");
   res.status(429).send(shell(`<p>Grensen for hvor mange e-postadresser som kan vises herfra, er nådd. Prøv igjen senere, eller kontakt klinikken på telefon eller via nettsiden.</p>`));
+});
+
+// S-D3a: POST /klinikk/id/:id/kontakt — forwards a contact-form message to a
+// flagged clinic's stored address (named like GET /klinikk/id/:id/epost).
+// Only with CONTACT_FORM_DENTAL on; off → next("route"), so the path answers
+// exactly as on main (the catch-all 404). On: the clinic must have a public,
+// active profile (not rejected, not the test row, not a hidden import row,
+// not closed), the contact_form_only flag and a stored e-mail, else 404.
+// Honeypot filled → answered like a success, nothing sent. Per-IP limit (5
+// per hour, req.ip = the trusted client IP, dental's own store) → 429 with
+// Retry-After. Invalid input → 400. One mail via emailService, Reply-To = the
+// sender's address. HTML thank-you page (plain form post), JSON when the
+// client asks for JSON. The clinic's address is never in the answer or a log
+// line. Cache-Control: private, no-store; noindex.
+const dentalContactFormBodyParsers = [
+  express.urlencoded({ extended: false, limit: "16kb" }),
+  express.json({ limit: "16kb" }),
+];
+router.post("/klinikk/id/:id/kontakt", (_req: Request, _res: Response, next) => {
+  // Switch off → skip this route (and its body parsers) entirely.
+  if (!dentalContactFormEnabled()) { next("route"); return; }
+  next();
+}, ...dentalContactFormBodyParsers, async (req: Request, res: Response) => {
+  res.set("Cache-Control", "private, no-store");
+  res.set("X-Robots-Tag", "noindex, nofollow");
+  const c = DENTAL_CONTACT_FORM_COPY;
+  const wantsJson = req.accepts(["html", "json"]) === "json";
+  const page = (title: string, body: string) => dentalShell(
+    `<main><div class="container" style="padding-top:32px;padding-bottom:48px"><div class="section-box"><h1 style="font-size:1.4rem">${escapeHtml(title)}</h1>${body}</div></div></main>`,
+    { title: `${title} | Finn-tannlege.com`, robots: "noindex, nofollow", canonical: null }
+  );
+  const idParam = String(req.params.id);
+  try {
+    const stored = getDentalAgentById(idParam);
+    const agent = stored ? shownDentalAgent(stored) : null;
+    const visible = !!agent && !!stored && agent.verification_status !== "rejected" && !isDentalSyntheticProbeId(agent.id)
+      && !isHiddenImportRow(stored) && agent.is_inactive !== 1;
+    const email = visible && agent && isDentalContactFormOnly(agent.id) && typeof agent.epost === "string" && agent.epost.trim() !== ""
+      ? agent.epost.trim()
+      : null;
+    if (!agent || !email) {
+      if (wantsJson) { res.status(404).json({ ok: false, error: "not_found" }); return; }
+      sendDentalNotFound(res,
+        `<div class="container"><div class="empty-state" style="padding:80px 0"><h3>Klinikk ikke funnet</h3><p>Siden du leter etter finnes ikke.</p><a href="/" class="btn-secondary" style="margin-top:16px">Til forsiden</a></div></div>`,
+        { title: "Ikke funnet — Finn-tannlege.com" }
+      );
+      return;
+    }
+    const profileUrl = clinicProfileUrl(agent);
+    const back = `<p style="margin-top:20px"><a href="${escapeHtml(profileUrl)}">&larr; ${escapeHtml(c.back)} ${escapeHtml(agent.navn)}</a></p>`;
+    const thanks = () => {
+      if (wantsJson) { res.status(200).json({ ok: true }); return; }
+      res.status(200).send(page(c.thanksTitle, `<p>${escapeHtml(c.thanks)}</p>${back}`));
+    };
+    if (contactFormHoneypotFilled(req.body)) {
+      logContactFormEvent({ host: "dental", outcome: "honeypot", profile_id: agent.id });
+      thanks();
+      return;
+    }
+    const rate = contactFormRateCheck(req, "dental");
+    if (!rate.ok) {
+      logContactFormEvent({ host: "dental", outcome: rate.reason === "limit" ? "rate_limited" : "no_ip", profile_id: agent.id, ...(rate.client ? { client: rate.client } : {}) });
+      res.set("Retry-After", String(rate.retryAfter));
+      res.status(429);
+      if (wantsJson) { res.json({ ok: false, error: "rate_limited", retry_after: rate.retryAfter }); return; }
+      res.send(page(c.limitedTitle, `<p>${escapeHtml(c.limited)}</p>${back}`));
+      return;
+    }
+    const parsed = validateContactFormInput(req.body);
+    if (!parsed.ok) {
+      logContactFormEvent({ host: "dental", outcome: "invalid", profile_id: agent.id, client: rate.client, fields: parsed.errors });
+      res.status(400);
+      if (wantsJson) { res.json({ ok: false, error: "invalid", fields: parsed.errors }); return; }
+      const backToForm = `<p style="margin-top:20px"><a href="${escapeHtml(profileUrl)}#kontaktskjema">&larr; ${escapeHtml(c.back)} ${escapeHtml(agent.navn)}</a></p>`;
+      res.send(page(c.invalidTitle, `<ul>${parsed.errors.map((f) => `<li>${escapeHtml(c.invalid[f])}</li>`).join("")}</ul>${backToForm}`));
+      return;
+    }
+    contactFormRecordSend(rate.key, "dental");
+    const mail = buildDentalContactFormMail({ clinicName: agent.navn, profileUrl, input: parsed.value, to: email });
+    let sent = false;
+    try {
+      sent = (await sendContactFormMail(mail)).success === true;
+    } catch {
+      sent = false;
+    }
+    logContactFormEvent({ host: "dental", outcome: sent ? "forwarded" : "send_failed", profile_id: agent.id, client: rate.client });
+    if (!sent) {
+      res.status(502);
+      if (wantsJson) { res.json({ ok: false, error: "send_failed" }); return; }
+      res.send(page(c.failedTitle, `<p>${escapeHtml(c.failed)}</p>${back}`));
+      return;
+    }
+    thanks();
+  } catch (err) {
+    // The error text could carry an address (mail layer) — log the kind only.
+    console.error(`[dental] /klinikk/id/${idParam.replace(/[^a-zA-Z0-9-]/g, "?").slice(0, 64)}/kontakt error:`, err instanceof Error ? err.name : "unknown");
+    if (!res.headersSent) res.status(500).send("Intern feil");
+  }
 });
 
 router.get("/klinikk/:slug", (req: Request, res: Response) => {
@@ -3371,8 +3560,9 @@ router.get("/personvern", (_req: Request, res: Response) => {
   // 2026-10-13: faktarettinger (dev-request 2026-10-06-personvernerklaeringer-del-a-na-del-b-pa-t, del A);
   // visit and search statistics described (2026-10-13-statistikk-riktig-for-investorer, S2:
   // searches are now logged); operator → AGENTPLATFORM.NO AS (2026-10-08). 2026-11-08: the
-  // AI-answer marker (dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 6).
-  const updatedDate = "2026-11-08";
+  // AI-answer marker (dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 6). 2026-11-11:
+  // clicks on to the clinic (dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord, S4).
+  const updatedDate = "2026-11-11";
   const html = `
 <main>
   <div class="content-page">
@@ -3397,6 +3587,8 @@ router.get("/personvern", (_req: Request, res: Response) => {
     <p>Søk lagres uten navn eller konto, og vi forsøker ikke å knytte dem til deg. Disse enkeltregistreringene slettes automatisk etter 60 dager. Før sletting summeres de til tall uten kobling til den besøkende (for eksempel antall besøk per dag og antall søk per søketekst), og bare disse tallene beholdes. Statistikken lagres i databasen hos Fly.io (se under) og deles ikke med andre.</p>
 
     <p>Har lenken du kom fra et merke (<code>utm_source</code>, <code>utm_medium</code>, <code>utm_campaign</code>), lagres også merket sammen med sidebesøket. Lenker til klinikksider som vi gir AI-assistenter som ChatGPT og Claude, har et slikt merke (for eksempel <code>utm_source=claude&amp;utm_campaign=ai_search</code>). Merket sier bare hvilken AI-tjeneste lenken ble gitt til &mdash; det inneholder ingenting om deg. Sammen med referanse-URL-en lar det oss telle besøk som kom fra et AI-svar. Disse besøkene summeres per dag, klinikkside og AI-tjeneste, uten IP-hash eller annen kobling til den besøkende, og summene vises på klinikksidene. Summene slettes ikke automatisk i dag.</p>
+
+    <p>Når du klikker på en lenke på en klinikkside videre til klinikken (timebestilling, nettside, telefon eller e-post), teller vi klikket uten cookies og uten navn eller kontaktopplysninger om deg &mdash; bare hvilken klinikk, hvilken lenke, tidspunktet og den samme pseudonyme besøks-ID-en som sidebesøkene (med en saltet, forkortet hash av IP-adressen, aldri hele IP-adressen), og klikkene slettes ikke automatisk i dag.</p>
 
     <h2>Navngitte personer</h2>
     <p>Tannleger og annet helsepersonell kan fremgå av profilene med navn og tittel/spesialitet. Dette er offentlig tilgjengelig informasjon knyttet til yrkesutøvelse og autorisasjon &mdash; ikke privat informasjon. Grunnlaget er at offentligheten har rett og behov for å kjenne til autorisert helsepersonells spesialkompetanse.</p>

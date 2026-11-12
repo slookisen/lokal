@@ -35,7 +35,7 @@ import { EMAIL_TRAP_ROBOTS_DISALLOW, EMAIL_TRAP_ROUTE_PATHS, emailTrapHandler, e
 import {
   CONTACT_FORM_EMAIL_MAX, CONTACT_FORM_HONEYPOT_FIELD, CONTACT_FORM_MESSAGE_MAX, CONTACT_FORM_NAME_MAX,
   buildContactFormMail, contactFormEnabled, contactFormHoneypotFilled, contactFormRateCheck, contactFormRecordSend,
-  isContactFormOnly, logContactFormEvent, sendContactFormMail, validateContactFormInput, type ContactFormField,
+  isContactFormOnly, logContactFormEvent, withContactFormOnlyProducerEmailNull, sendContactFormMail, validateContactFormInput, type ContactFormField,
 } from "../services/contact-form-only";
 // dev-request 2026-10-17-integrasjonstest-oppfolging, I-G: knowledge list
 // fields read by type (see "knowledge fields read by type" below).
@@ -4549,7 +4549,9 @@ router.get([HANDELISTE_PATH_NO, HANDELISTE_PATH_EN], (req: Request, res: Respons
       && isAgentIdPubliclyVisible(getDb(), rawProducer, { surface: "gated" })
       ? findProducerOrderables(rawProducer, { limit: HANDELISTE_MAX_ITEMS })
       : null;
-    const page = buildHandelistePage(lang, orderables ? { producer_name: orderables.producer.name, offers: orderables.offers } : null);
+    // S-D2: a contact-form-only producer's e-mail is null in the pre-selected
+    // offers (CONTACT_FORM_RFB on; switch off → the same offers, flag not read).
+    const page = buildHandelistePage(lang, orderables ? { producer_name: orderables.producer.name, offers: withContactFormOnlyProducerEmailNull(orderables.offers) } : null);
     const noPath = HANDELISTE_PATH_NO;
     const localized = lang === "en" ? "/en" + HANDELISTE_PATH_EN : noPath;
     res.setHeader("Cache-Control", "no-store");

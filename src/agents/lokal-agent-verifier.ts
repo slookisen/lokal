@@ -1331,6 +1331,24 @@ export function applyVerifierOutcome(
     // sweep_processed_at column not present in this DB — skip.
   }
 
+  // dev-request 2026-11-11-verifier-ny-verifisering-og-delta-ledd (slice B):
+  // append-only "verified by this run" event, for BOTH UPDATE branches
+  // above. The UPDATE overwrites last_verified_at / verification_status on
+  // every re-process, so a later run (hourly, review-queue or bulk sweep)
+  // erases the evidence an earlier run's agents_verified claim is probed
+  // against. This event row keeps it: claim-counts?kind=agents_verified
+  // (delta) counts these by run_started_at. Best-effort — the table may be
+  // absent in minimal test-harness schemas; it must never break verification.
+  if (outcome.new_verification_status === "verified") {
+    try {
+      db.prepare(
+        `INSERT INTO verifier_verified_events (agent_id, run_started_at) VALUES (?, ?)`
+      ).run(agentId, outcome.runStartedAt);
+    } catch {
+      // verifier_verified_events table not present in this DB — skip.
+    }
+  }
+
   // dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction
   // (item 6 follow-up): pending_verify no-progress parking. Runs
   // unconditionally, for every outcome (not just pending_verify->pending_verify)
@@ -3373,13 +3391,14 @@ export async function runVerifierBatch(opts: {
 // Build a run-envelope payload from verifier results, ready to POST
 // to /admin/runs.
 // dev-request 2026-10-10-rfb-verifier-kapasitet-til-fulle-profiler (point
-// 5): how pickBatchBiased spent this run's slots. Emitted only when at least
-// one result carries pick_slot (i.e. the run used pickBatchBiased), so other
-// pickers' envelopes are unchanged. `custom` claims: report-only counts, not
-// DB-state claims for the snapshot probe. Rows merged in by
-// includeStaleReviewRequired carry no pick_slot and are not counted here.
+// 5): how pickBatchBiased spent this run's slots. `custom` claims:
+// report-only counts, not DB-state claims for the snapshot probe. Rows merged
+// in by includeStaleReviewRequired carry no pick_slot and are not counted here.
+// dev-request 2026-11-11-verifier-ny-verifisering-og-delta-ledd (slice A):
+// always emitted — with 0 counts when no result carries pick_slot (another
+// picker, or an empty batch) — so every lokal-agent-verifier envelope carries
+// the four verifier_slots_* kinds.
 export function pickSlotClaims(results: VerifierResult[]): Array<{ type: "custom"; value: number; meta: { kind: string } }> {
-  if (!results.some((x) => x.pick_slot)) return [];
   const count = (slot: VerifierPickSlot) => results.filter((x) => x.pick_slot === slot).length;
   return [
     { type: "custom", value: count("verified_recheck"), meta: { kind: "verifier_slots_verified_recheck" } },
@@ -3491,7 +3510,23 @@ export function buildRunEnvelope(input: {
       { type: "db_state_change", ...snap("agents_review_required", review) },
       { type: "db_state_change", ...snap("agents_pending_verify", pending) },
       { type: "db_state_change", ...snap("agents_data_insufficient", dataInsufficient) },
-      { type: "db_state_change", ...snap("http_unreachable", httpUnreachable) },
+      // WHY (dev-request 2026-10-26-lokal-agent-verifier-snapshot-drift-
+      // toleranse, slice 3): the controller reads `http_unreachable` as
+      // http_unreachable_per_run (threshold 25), but the snapshot value is a
+      // DB-wide cumulative gauge that only grows. Claim this run's own tally
+      // instead, as type `custom` with no meta.probe so platform-verifier
+      // skips it (never compares it to the DB snapshot). The gauge moves to
+      // http_unreachable_known_total below.
+      { type: "custom", value: httpUnreachable, meta: { kind: "http_unreachable", scope: "per_run" } },
+      ...(typeof input.snapshotCounts?.http_unreachable === "number"
+        ? [
+            {
+              type: "db_state_change",
+              value: input.snapshotCounts.http_unreachable,
+              meta: { kind: "http_unreachable_known_total", scope: "snapshot", batch_count: httpUnreachable },
+            },
+          ]
+        : []),
       { type: "db_state_change", ...snap("brreg_inactive_flagged", brregFlagged) },
       { type: "db_state_change", ...snap("agents_domain_incoherent", domainIncoherent) },
       {

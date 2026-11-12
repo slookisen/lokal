@@ -17,6 +17,7 @@
  * (revertable) + catalog rename / retire; a second apply is a no-op; curated
  * `products` -> skipped_curated / products_locked on dry run and apply;
  * owner-locked profile still cleaned (reported); apply:"false" is a dry run;
+ * «Navn/Kategori/Pris/Sesong» header (Bakke S2b) removed, season -> note;
  * PUT /admin/knowledge still stores a tab row as before.
  *
  * Harness: __pinInMemoryDbForTesting (getDb() -> fresh in-memory DB, restored
@@ -171,6 +172,37 @@ export function runAdminAgentsProductsTabCleanupTests(opts: { log?: boolean } = 
         ]);
         assertEq(swapped.products, [{ name: "Bringebærsyltetøy", category: "preserves", price: "kr 90", priceUnit: "kr" }],
           "planner: columns read from the header row");
+        // «Sesong» header (the real Bakke header): removed, not split into «Navn».
+        const sesong = mod.planProductsTabCleanup([
+          { name: `Navn${T}Kategori${T}Pris${T}Sesong`, category: "other", price: "" },
+          { name: `Solbærsyltetøy${T}Syltetøy${T}95 kr${T}Ikke oppgitt`, category: "other", price: "" },
+          { name: `Havrekjeks${T}Kjeks${T}45 kr${T}Ikke oppgitt`, category: "other", price: "" },
+          { name: `Jordbærsyltetøy${T}Syltetøy${T}95 kr${T}Juni–august`, category: "other", price: "" },
+        ]);
+        assertEq(sesong.changes.map((c) => c.action), ["removed_header", "split", "split", "split"],
+          "planner: «Sesong» header -> removed_header, rows split");
+        assertTrue(!sesong.products.some((p: any) => p && p.name === "Navn"), "planner: «Sesong» header -> no product named «Navn»");
+        assertEq(sesong.products, [
+          { name: "Solbærsyltetøy", category: "preserves", price: "kr 95", priceUnit: "kr" },
+          { name: "Havrekjeks", category: "bakery", price: "kr 45", priceUnit: "kr" },
+          { name: "Jordbærsyltetøy", category: "preserves", price: "kr 95", priceUnit: "kr", note: "Juni–august" },
+        ], "planner: «Sesong» rows -> category / price split, meaningful season -> note");
+        assertEq(sesong.changes[1].dropped_cells, ["availability: Ikke oppgitt"], "planner: «Sesong» «Ikke oppgitt» dropped as availability");
+        assertEq(sesong.changes[3].dropped_cells, undefined, "planner: «Sesong» meaningful cell not dropped");
+        // Season column OUTSIDE the default position pins the mapping (-> availability/note).
+        for (const w of ["Sesong", "Sesonger", "Sesongvare"]) {
+          const h = mod.planProductsTabCleanup([
+            { name: `Navn${T}${w}${T}Kategori${T}Pris`, category: "other" },
+            { name: `Z${T}Høst${T}Syltetøy${T}95 kr`, category: "other" },
+          ]);
+          assertEq(h.changes.map((c) => c.action), ["removed_header", "split"], `planner: «${w}» is a header word`);
+          assertEq(h.products, [{ name: "Z", category: "preserves", price: "kr 95", priceUnit: "kr", note: "Høst" }],
+            `planner: «${w}» column (index 1) -> note, category/price read from their header positions`);
+          assertEq(h.changes[1].dropped_cells, undefined, `planner: «${w}» column -> nothing dropped`);
+        }
+        // Existing header fixture still behaves the same.
+        const legacy = mod.planProductsTabCleanup([HEADER, SOLBAER]);
+        assertEq(legacy.changes.map((c) => c.action), ["removed_header", "split"], "planner: «Tilgjengelighet» header unchanged");
         // Two identical tab lines -> one product.
         const twice = mod.planProductsTabCleanup([SOLBAER, SOLBAER]);
         assertEq(twice.changes.map((c) => c.action), ["split", "removed_duplicate"], "planner: identical tab rows -> split + removed_duplicate");
@@ -238,6 +270,18 @@ export function runAdminAgentsProductsTabCleanupTests(opts: { log?: boolean } = 
         assertEq(byIdx(2).catalog?.action, "rename_in_place", "dry run: catalog rename planned for the split row");
         assertEq(byIdx(5).catalog?.action, "retire_delete", "dry run: catalog retire planned for the alcohol row");
         assertEq(dry.body.owner_locked, false, "dry run: owner_locked reported");
+      }
+
+      // ── «Sesong» header via the route (dry run) ───────────────────────
+      {
+        const SESONG_HEADER = { name: `Navn${T}Kategori${T}Pris${T}Sesong`, category: "other", seasonal: false, price: "" };
+        agent("sesong", [SESONG_HEADER, SOLBAER, KJEKS]);
+        const before = storedProducts("sesong");
+        const r = await call({ agent_id: "sesong" });
+        assertEq([r.status, r.body.dry_run, r.body.counts?.removed_header, r.body.counts?.split], [200, true, 1, 2],
+          "«Sesong» dry run: header removed (removed_header 1), rows split");
+        assertTrue(!r.body.rows.some((x: any) => x.after && x.after.name === "Navn"), "«Sesong» dry run: no «Navn» product");
+        assertEq([storedProducts("sesong"), audits("sesong").length], [before, 0], "«Sesong» dry run: nothing written");
       }
 
       // apply:"false" / unknown forms stay dry.

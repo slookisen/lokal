@@ -113,14 +113,24 @@ tr.test td{color:var(--warn);font-style:italic}
     <div id="gsBody"></div>
   </section>
 
-  <section>
-    <h2>Opplevagent — opplevelser</h2>
-    <div class="placeholder">Kommer. Tallene for opplevelser kommer i en senere leveranse.</div>
+  <section id="secGsHenv">
+    <h2>Opplevagent gårdssalg — henvisninger (klikk videre til produsenten)</h2>
+    <div class="lead" id="henvGsLead"></div>
+    <div id="henvGsBody"></div>
   </section>
 
-  <section>
-    <h2>Finn-tannlege</h2>
-    <div class="placeholder">Kommer. Tallene for Finn-tannlege kommer i en senere leveranse.</div>
+  <section id="secOpplHenv">
+    <h2>Opplevagent opplevelser — henvisninger (klikk videre til tilbyderen)</h2>
+    <div class="lead">Opplevelser har ingen bestillinger hos oss: bookingen skjer hos tilbyderen. Her telles klikkene videre.</div>
+    <div class="lead" id="henvOpplLead"></div>
+    <div id="henvOpplBody"></div>
+  </section>
+
+  <section id="secTannHenv">
+    <h2>Finn-tannlege — henvisninger (klikk videre til klinikken)</h2>
+    <div class="lead">Finn-tannlege har ingen bestillinger hos oss: timen bestilles hos klinikken. Her telles klikkene videre.</div>
+    <div class="lead" id="henvTannLead"></div>
+    <div id="henvTannBody"></div>
   </section>
 </div>
 
@@ -139,7 +149,7 @@ const STATUS_NO = {
   awaiting_provider: 'Venter på produsent', provider_confirmed: 'Produsent bekreftet', provider_declined: 'Produsent avslo',
   time_suggested: 'Nytt tidspunkt foreslått', expired: 'Utløpt'
 };
-const HENV_NO = { nettside: 'Nettside', sosiale_medier: 'Sosiale medier', telefon: 'Telefon', e_post: 'E-post', annet: 'Annet' };
+const HENV_NO = { booking: 'Booking', nettside: 'Nettside', sosiale_medier: 'Sosiale medier', telefon: 'Telefon', e_post: 'E-post', annet: 'Annet' };
 const AI_KANAL_NO = {
   ai_page_list: 'Listeside hentet av AI-assistent', ai_page_profile: 'Profilside hentet av AI-assistent',
   mcp: 'MCP-verktøysvar', a2a: 'A2A-svar', annet: 'Annet'
@@ -326,6 +336,35 @@ function renderHenv(h, target) {
   (h.merknader || []).forEach(m => target.appendChild(el('div', { cls: 'note', text: m })));
 }
 
+// Slice S4: clicks on the Opplevagent / Finn-tannlege profile links
+// (profile_link_clicks). Same layout as renderHenv; bot and test-provider
+// clicks in their own rows, never in the main number.
+function renderProfilHenv(h, target, leadEl) {
+  target.replaceChildren();
+  leadEl.textContent = h.forklaring;
+  if (!h.available) {
+    (h.merknader || []).forEach(m => target.appendChild(el('div', { cls: 'note', text: m })));
+    return;
+  }
+  target.appendChild(el('div', { cls: 'cards' }, [
+    card(fmtNum(h.total), 'Klikk fra folk', 'Klikk på booking, nettside, telefon eller e-post på profilsidene i perioden, uten bot-klikk og uten testtilbydere.'),
+    card(fmtNum(h.bot.total), 'Bot-klikk (ikke med)', h.bot.forklaring),
+    card(fmtNum(h.test.total), 'Testklikk (ikke med)', h.test.forklaring)
+  ]));
+  target.appendChild(el('h3', { text: 'Per type' }));
+  const typeRows = Object.keys(h.by_type).map(t => ({ cells: [HENV_NO[t] || t, (h.type_forklaring && h.type_forklaring[t]) || '', fmtNum(h.by_type[t]), fmtNum(h.bot.by_type[t]), fmtNum(h.test.by_type[t])] }));
+  target.appendChild(table(['Type', 'Hva det teller', 'Klikk fra folk', 'Bot-klikk', 'Testklikk'], typeRows, 2));
+  target.appendChild(el('div', { cls: 'note', text: 'Bot-klikk og testklikk er tatt med her bare for å vise hva som er holdt utenfor; de er ikke med i «Klikk fra folk».' }));
+  if (h.test.providers && h.test.providers.length) {
+    target.appendChild(el('h3', { text: 'Testtilbydere (ikke med over)' }));
+    target.appendChild(table(['Testtilbyder', 'Testklikk'], h.test.providers.map(p => ({ test: true, cells: [p.name || p.provider_id, fmtNum(p.total)] })), 1));
+  }
+  target.appendChild(el('h3', { text: 'Per tidsbolk' }));
+  target.appendChild(table(['Bolk', 'Klikk fra folk', 'Booking', 'Nettside', 'Telefon', 'E-post', 'Annet'],
+    h.series.map(s => ({ cells: [s.bucket, fmtNum(s.total), fmtNum(s.by_type.booking), fmtNum(s.by_type.nettside), fmtNum(s.by_type.telefon), fmtNum(s.by_type.e_post), fmtNum(s.by_type.annet)] })), 1));
+  (h.merknader || []).forEach(m => target.appendChild(el('div', { cls: 'note', text: m })));
+}
+
 // Slice S3: «levert til AI-assistent» (profile_ai_deliveries). A separate
 // number — never added to the clicks above.
 function renderAi(a, target) {
@@ -394,11 +433,22 @@ function renderAlle(body, target) {
   const rows = [
     { cells: ['Rett fra Bonden', fmtNum(r ? r.total : null)] },
     { cells: ['Opplevagent gårdssalg', g ? fmtNum(g.total) : 'ikke tilgjengelig'] },
-    { cells: ['Opplevagent opplevelser', 'kommer'] },
-    { cells: ['Finn-tannlege', 'kommer'] },
+    { cells: ['Opplevagent opplevelser', 'ingen bestillinger hos oss (se henvisninger)'] },
+    { cells: ['Finn-tannlege', 'ingen bestillinger hos oss (se henvisninger)'] },
     { test: true, cells: ['Testdata (ikke med over)', fmtNum(testTotal)] }
   ];
   target.appendChild(table(['Plattform', 'Antall'], rows, 1));
+  // Slice S3/S4: clicks on to the producer / provider / clinic per platform.
+  const hv = body.henvisninger || {};
+  const henvRow = (navn, h) => ({ cells: [navn, h && h.available ? fmtNum(h.total) : 'ikke tilgjengelig', h && h.available ? fmtNum(h.bot.total) : '–', h && h.available ? fmtNum(h.test.total) : '–'] });
+  target.appendChild(el('h3', { text: 'Henvisninger (klikk videre) per plattform' }));
+  target.appendChild(table(['Plattform', 'Klikk fra folk', 'Bot-klikk (ikke med)', 'Testklikk (ikke med)'], [
+    henvRow('Rett fra Bonden', hv.rfb),
+    henvRow('Opplevagent gårdssalg', hv.gardssalg),
+    henvRow('Opplevagent opplevelser', hv.opplevelser),
+    henvRow('Finn-tannlege', hv.tannlege)
+  ], 1));
+  target.appendChild(el('div', { cls: 'note', text: 'Klikk fra en profilside videre til produsenten, tilbyderen eller klinikken. Ikke lagt sammen med bestillingene over.' }));
 }
 
 function render(body) {
@@ -411,6 +461,10 @@ function render(body) {
   if (body.henvisninger && body.henvisninger.rfb) renderHenv(body.henvisninger.rfb, document.getElementById('henvBody'));
   if (body.ai_leveranser && body.ai_leveranser.rfb) renderAi(body.ai_leveranser.rfb, document.getElementById('aiBody'));
   if (body.gardssalg) renderGs(body.gardssalg, document.getElementById('gsBody'));
+  const hv = body.henvisninger || {};
+  if (hv.gardssalg) renderProfilHenv(hv.gardssalg, document.getElementById('henvGsBody'), document.getElementById('henvGsLead'));
+  if (hv.opplevelser) renderProfilHenv(hv.opplevelser, document.getElementById('henvOpplBody'), document.getElementById('henvOpplLead'));
+  if (hv.tannlege) renderProfilHenv(hv.tannlege, document.getElementById('henvTannBody'), document.getElementById('henvTannLead'));
 }
 
 const ACTIONS = { login, logout, csv: (_id, _v, _el, e) => downloadCsv(e) };

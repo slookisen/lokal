@@ -43561,6 +43561,28 @@ runSerial(async () => {
   }
 });
 
+// ── dev-request 2026-11-01-opplevagent-drikkeprodusent-selvregistrering,
+// skive 1 (AC1–AC5): /for-tilbydere/registrer — flag, duplicate check, Brreg
+// gate (mocked), RFB filters, IP limit, hidden row on no public surface. Own
+// in-memory experiences db and a real http.Server (raw http.request, never
+// global fetch), restored in its own finally — runSerial like the suites
+// around it.
+runSerial(async () => {
+  console.log("\n── gardssalg-self-register: /for-tilbydere/registrer (skive 1) ──");
+  try {
+    const { runGardssalgSelfRegisterTests } = require("../src/routes/gardssalg-self-register.test") as
+      typeof import("../src/routes/gardssalg-self-register.test");
+    const gsr = await runGardssalgSelfRegisterTests({ log: false });
+    passed += gsr.passed;
+    failed += gsr.failed;
+    for (const f of gsr.failures) failures.push("gardssalg-self-register: " + f);
+    console.log(`  gardssalg-self-register: ${gsr.passed} passed, ${gsr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-self-register: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── OA-01 (dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas):
 // the claim page now sees Opplevagent's own outreach — tier outreach_delivered
 // reads experience_outreach_sent_log (real, delivered, same provider, no
@@ -45056,6 +45078,23 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── pilot-innboks (pilot@rettfrabonden.com): forbi CRM og CS, videresendt som [Pilot] ──");
+  try {
+    const { runInboundPilotTests } = require("../src/services/inbound-pilot.test") as
+      typeof import("../src/services/inbound-pilot.test");
+    const ipt = await runInboundPilotTests({ log: false });
+    passed += ipt.passed;
+    failed += ipt.failed;
+    for (const f of ipt.failures) failures.push("inbound-pilot: " + f);
+    console.log(`  inbound-pilot: ${ipt.passed} passed, ${ipt.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("inbound-pilot: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ inbound-pilot: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-11-10-cs-paa-serveren: S1b (CS-vakt, ny videresending, daglig oppsummering) ──");
   try {
     const { runCsWatchdogTests } = require("../src/services/cs-watchdog.test") as
@@ -45069,6 +45108,74 @@ runSerial(async () => {
     failed++;
     failures.push("cs-watchdog: unexpected error: " + String(err?.message || err));
     console.log(`  ✗ cs-watchdog: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-10-cs-paa-serveren: S2 (svarforslag, sendejobb, godkjenningskø, utboks) ──");
+  try {
+    const { runCsReplyProposalsTests } = require("../src/services/cs-reply-proposals.test") as
+      typeof import("../src/services/cs-reply-proposals.test");
+    const crp = await runCsReplyProposalsTests({ log: false });
+    passed += crp.passed;
+    failed += crp.failed;
+    for (const f of crp.failures) failures.push("cs-reply-proposals: " + f);
+    console.log(`  cs-reply-proposals: ${crp.passed} passed, ${crp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("cs-reply-proposals: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ cs-reply-proposals: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-10-cs-paa-serveren: S3 (leveringsstatus per CRM-melding) ──");
+  try {
+    const { runCrmDeliveryStatusTests } = require("../src/services/crm-delivery-status.test") as
+      typeof import("../src/services/crm-delivery-status.test");
+    const cds = await runCrmDeliveryStatusTests({ log: false });
+    passed += cds.passed;
+    failed += cds.failed;
+    for (const f of cds.failures) failures.push("crm-delivery-status: " + f);
+    console.log(`  crm-delivery-status: ${cds.passed} passed, ${cds.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-delivery-status: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ crm-delivery-status: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-10-cs-paa-serveren: S5 (kontaktskjema: kvittering, avviste innsendinger) ──");
+  try {
+    const { runContactFormCsTests } = require("../src/services/contact-form-cs.test") as
+      typeof import("../src/services/contact-form-cs.test");
+    const cft = await runContactFormCsTests({ log: false });
+    passed += cft.passed;
+    failed += cft.failed;
+    for (const f of cft.failures) failures.push("contact-form-cs: " + f);
+    console.log(`  contact-form-cs: ${cft.passed} passed, ${cft.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("contact-form-cs: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ contact-form-cs: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-10-cs-paa-serveren: S4 (endringer og fjerning, utført og verifisert av serveren) ──");
+  try {
+    const { runCsChangeRequestsTests } = require("../src/services/cs-change-requests.test") as
+      typeof import("../src/services/cs-change-requests.test");
+    const cct = await runCsChangeRequestsTests({ log: false });
+    passed += cct.passed;
+    failed += cct.failed;
+    for (const f of cct.failures) failures.push("cs-change-requests: " + f);
+    console.log(`  cs-change-requests: ${cct.passed} passed, ${cct.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("cs-change-requests: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ cs-change-requests: unexpected error: ${String(err?.message || err)}`);
   }
 });
 
@@ -48463,6 +48570,26 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("admin-verifier-claim-counts: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-11-11-verifier-ny-verifisering-og-delta-ledd (slice B):
+// agents_verified delta mode counts verifier_verified_events (written by
+// applyVerifierOutcome) instead of current status/last_verified_at.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-11-verifier-ny-verifisering-og-delta-ledd: verified events ──");
+  try {
+    const { runAdminVerifierClaimCountsVerifiedEventsTests } =
+      require("../src/routes/admin-verifier-claim-counts-verified-events.test") as
+        typeof import("../src/routes/admin-verifier-claim-counts-verified-events.test");
+    const vve = await runAdminVerifierClaimCountsVerifiedEventsTests({ log: false });
+    passed += vve.passed;
+    failed += vve.failed;
+    for (const f of vve.failures) failures.push("admin-verifier-claim-counts-verified-events: " + f);
+    console.log(`  admin-verifier-claim-counts-verified-events: ${vve.passed} passed, ${vve.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-verifier-claim-counts-verified-events: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -52773,6 +52900,11 @@ runSerial(async () => {
 // S-D1 adds the contact-form option per RFB profile (CONTACT_FORM_RFB, default
 // off; flagged profile → form instead of e-mail, POST /produsent/:slug/kontakt
 // forwards via a stubbed sender).
+// S-D2 hides a flagged profile's e-mail in the RFB REST and A2A answers too
+// (same switch; MCP untouched; the buyer's own order keeps it).
+// S-D3a does the same per clinic on finn-tannlege.com (CONTACT_FORM_DENTAL:
+// the form on the clinic pages, POST /klinikk/id/:id/kontakt, the e-mail left
+// out of REST, A2A and MCP tannlege_info).
 // Switch off = byte-identical answers. Sets env
 // flags and swaps the dental db-factory (restored in finally) — runSerial,
 // tail position.
@@ -52799,6 +52931,10 @@ runSerial(async () => {
     ["dental mcp email reveal", () => (require("../src/routes/dental-mcp-email-reveal.test") as typeof import("../src/routes/dental-mcp-email-reveal.test")).runDentalMcpEmailRevealTests({ log: false })],
     // S-D1: «Kontaktskjema som valg per profil» on rettfrabonden.com — agents.contact_form_only (admin POST /admin/agents/:id/contact-form-only), the form on /produsent/:slug and POST /produsent/:slug/kontakt (CONTACT_FORM_RFB; switch off = byte-identical; stubbed sender, no network).
     ["rfb contact form only", () => (require("../src/routes/rfb-contact-form-only.test") as typeof import("../src/routes/rfb-contact-form-only.test")).runRfbContactFormOnlyTests({ log: false })],
+    // S-D2: a contact-form-only profile's e-mail left out of the RFB REST + A2A answers (card/info/vcard, search/discover, cart submit handoffs, catalog offers, agent.json, A2A agent/info, conversations; CONTACT_FORM_RFB; switch off = byte-identical; buyer's own order keeps it; MCP untouched).
+    ["rfb contact form only s-d2", () => (require("../src/routes/rfb-contact-form-only-sd2.test") as typeof import("../src/routes/rfb-contact-form-only-sd2.test")).runRfbContactFormOnlySd2Tests({ log: false })],
+    // S-D3a: the same option per clinic on finn-tannlege.com — dental_agents.contact_form_only (admin POST /admin/dental/agents/:id/contact-form-only), the form on /klinikk/:slug + /klinikk/id/:id, «Vis e-post» 404, POST /klinikk/id/:id/kontakt, and the e-mail left out of REST /api/tannlege/agents[/:id], A2A message/send and MCP tannlege_info (CONTACT_FORM_DENTAL; switch off = byte-identical; stubbed sender, no network).
+    ["dental contact form only", () => (require("../src/routes/dental-contact-form-only.test") as typeof import("../src/routes/dental-contact-form-only.test")).runDentalContactFormOnlyTests({ log: false })],
   ] as Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]>) {
     try {
       const r = await load();
@@ -53991,5 +54127,50 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("products-tab-cleanup: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-11-10-rfb-registreringer-og-eierkrav-folges-opp S4b:
+// GET /admin/agents/self-registered-review-queue marks owner_confirmed
+// (customerRuleSql) + owner_label «eier bekreftet», sorts those rows first
+// (each group oldest first) and adds owner_confirmed_count; read-only.
+// Own in-memory DB pinned on getDb(), sets ADMIN_KEY (restored in finally)
+// — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── S4b: registreringskø med «eier bekreftet» øverst ──");
+  try {
+    const { runSelfRegisteredQueueOwnerS4bTests } = require("../src/routes/self-registered-queue-owner-s4b.test") as
+      typeof import("../src/routes/self-registered-queue-owner-s4b.test");
+    const r = await runSelfRegisteredQueueOwnerS4bTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("self-registered-queue-owner-s4b: " + f);
+    console.log(`  self-registered-queue-owner-s4b: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("self-registered-queue-owner-s4b: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord S4: counting
+// redirects GET /ut/<surface>/<id>/<kind> + beacon POST /api/track/profile-click
+// for the Opplevagent and Finn-tannlege profile links, and their clicks in
+// /admin/api/ordre/{oversikt,eksport.csv} (bots and test providers apart).
+// Own in-memory lokal/experiences/dental DBs (init pin + db-factory swap),
+// a local HTTP server, swaps ENABLE_* / *_DB_PATH / ADMIN_KEY (restored in
+// finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── S4: tellende lenker på Opplevagent og Finn-tannlege ──");
+  try {
+    const { runProfileLinkClicksTests } = require("../src/routes/profile-link-clicks.test") as
+      typeof import("../src/routes/profile-link-clicks.test");
+    const r = await runProfileLinkClicksTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("profile-link-clicks: " + f);
+    console.log(`  profile-link-clicks: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("profile-link-clicks: unexpected error: " + String(err?.message || err));
   }
 });

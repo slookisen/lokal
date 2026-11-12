@@ -125,10 +125,25 @@ export function htmlToPlainText(html: string): string {
 
 const FORWARD_SUBJECT_RE = /^\s*\[Innkommende\]/i;
 
+// The forward's own header block, exactly as inbound-email-webhook writes it
+// at the very top of the text: «Videresent fra: …», «Til: …», «Emne: …» and
+// the marker, one per line (the webhook keeps each value on one line).
+// Anchored at the start of the body (only whitespace, a BOM or a zero-width
+// space may come first), so a reply
+// (own text first), a quote («> Videresent fra:») or a «Fwd:» (its own
+// forwarded-message header first) never matches.
+const FORWARD_HEADER_BLOCK_RE =
+  /^[\s\uFEFF\u200B]*Videresent fra:[^\r\n]*\r?\nTil:[^\r\n]*\r?\nEmne:[^\r\n]*\r?\nInbound-ID:[ \t]*(inb-[A-Za-z0-9-]{8,64})[ \t]*(?:\r?\n|$)/;
+
 /**
  * The log id if `m` IS the server's forwarded copy: an inbound message whose
- * subject starts with «[Innkommende]» (a «Fwd:»/«Re:» of it does not) and
- * whose own, unquoted text carries the marker. Anything else returns null.
+ * own, unquoted text carries the marker, and which is recognisable as the
+ * copy in one of two ways:
+ *  - its subject starts with «[Innkommende]» (a «Fwd:»/«Re:» of it does not);
+ *  - the CS agent filed it unwrapped, with the original sender and subject in
+ *    place of the forward's own: its text still starts with the forward's
+ *    header block (FORWARD_HEADER_BLOCK_RE).
+ * Anything else returns null.
  */
 export function forwardCopyMarker(
   m: {
@@ -142,8 +157,9 @@ export function forwardCopyMarker(
 ): string | null {
   if (m.direction !== "in") return null;
   const subject = m.subject ?? fallbackSubject ?? "";
-  if (!FORWARD_SUBJECT_RE.test(subject)) return null;
-  return findUnquotedInboundMarker(m.bodyText, m.bodyHtml);
+  if (FORWARD_SUBJECT_RE.test(subject)) return findUnquotedInboundMarker(m.bodyText, m.bodyHtml);
+  if (typeof m.bodyText !== "string" || !m.bodyText) return null;
+  return FORWARD_HEADER_BLOCK_RE.exec(m.bodyText.slice(0, 4000))?.[1] ?? null;
 }
 
 // ─── Platform from recipient domain ──────────────────────────────────
@@ -290,7 +306,7 @@ export function readInboundHeaders(...sources: unknown[]): InboundHeaders {
 
 // ─── Automated mail ───────────────────────────────────────────────────
 
-export type AutomatedKind = "auto_reply" | "bounce" | null;
+export type AutomatedKind = "auto_reply" | "bounce" | "report" | null;
 
 const BOUNCE_FROM_RE = /^(mailer-daemon|postmaster|mail-daemon|bounce[s]?)@/i;
 const BOUNCE_SUBJECT_RE =
@@ -302,12 +318,28 @@ const BOUNCE_SUBJECT_RE =
 const AUTOREPLY_SUBJECT_RE =
   /^(automatisk svar|autosvar|autoreply|auto-reply|automatic reply|out of office|abwesend|fraværende|frånvarande|ikke på kontoret|not in the office|away from the office)(?=$|[\s:;,.!\-–—()])|^auto:/i;
 
+// Machine reports about our own domains: DMARC aggregate reports (Google,
+// Microsoft, Yahoo, Domeneshop …) and SMTP TLS reports. They come to the
+// platform addresses because the domains' DMARC records name them (rua=), and
+// none of them is a person waiting for a reply. Matched on the reporting
+// sender's local part, or on the report subject every big provider uses
+// («Report domain: <domain> Submitter: <org> Report-ID: …», or the whole
+// subject «DMARC Aggregate Report for <domain>»). The subject is tested as it
+// arrives: report generators never prefix Re:/Fwd:, so a person who forwards
+// a report with a question (or writes «DMARC aggregate report – hva betyr
+// dette?») stays a human mail that needs a reply. A false «report» would hide
+// a customer from «trenger svar»; a missed report only adds a thread to mark.
+const REPORT_FROM_RE = /^(noreply-dmarc-support|dmarcreport|dmarc[._-]?reports?|dmarc[._-]?noreply|noreply[._-]?dmarc(?:[._-]?reports?)?|dmarc[._-]?support|tls[._-]?rpt|noreply-smtp-tls-reporting|smtp-tls-reporting)@/i;
+const REPORT_SUBJECT_RE = /^(\[?preview\]?\s*)?report\s+domain:\s*\S+\s+submitter:|^dmarc\s+aggregate\s+report\s+for\s+[^\s@]+\.[a-z]{2,}\s*$/i;
+
 export function classifyAutomated(input: { subject: string | null | undefined; fromEmail: string; headers: InboundHeaders }): {
   kind: AutomatedKind;
   reason: string | null;
 } {
   const subj = (input.subject ?? "").trim();
   if (BOUNCE_FROM_RE.test(input.fromEmail.trim())) return { kind: "bounce", reason: `sender ${input.fromEmail}` };
+  if (REPORT_FROM_RE.test(input.fromEmail.trim())) return { kind: "report", reason: `report sender ${input.fromEmail}` };
+  if (REPORT_SUBJECT_RE.test(subj)) return { kind: "report", reason: "DMARC/TLS report subject" };
   if (BOUNCE_SUBJECT_RE.test(subj)) return { kind: "bounce", reason: "bounce subject" };
   const as = input.headers.autoSubmitted?.trim().toLowerCase();
   if (as && as !== "no") return { kind: "auto_reply", reason: `Auto-Submitted: ${as}` };
@@ -330,7 +362,8 @@ export function normalizeSubject(s: string | null | undefined): string {
   const PREFIX = /^(((re|sv|aw|vs|fw|fwd|vb|videresend|videresendt|wg|tr)\s*(\[\d+\])?\s*:)|\[innkommende\])\s*/i;
   for (let i = 0; i < 10 && PREFIX.test(t); i++) t = t.replace(PREFIX, "").trim();
   // The forward appends « (fra <sender>)»; a reply to the forward keeps it.
-  t = t.replace(/\s*\(fra [^()]*\)\s*$/i, "").trim();
+  const f = forwardSuffix(t);
+  if (f) t = t.slice(0, f.start).trim();
   return t.toLowerCase();
 }
 
@@ -393,13 +426,19 @@ export function findThreadForInbound(input: {
 
 // ─── Aliases (Gmail thread id → server thread id) ─────────────────────
 
-export function resolveThreadAlias(id: string): string {
+/**
+ * The server thread a Gmail thread id is an alias of, or the id itself.
+ * `strict` lets a DB error through: /ingest must answer 500 (the caller
+ * retries) rather than file the messages on the Gmail thread id.
+ */
+export function resolveThreadAlias(id: string, opts: { strict?: boolean } = {}): string {
   try {
     const r = getDb().prepare("SELECT thread_id FROM crm_thread_aliases WHERE alias_id = ?").get(id) as
       | { thread_id: string }
       | undefined;
     return r?.thread_id ?? id;
-  } catch {
+  } catch (e) {
+    if (opts.strict) throw e;
     return id;
   }
 }
@@ -423,7 +462,7 @@ export function inboundLogExists(logId: string): boolean {
   return !!getDb().prepare("SELECT 1 FROM inbound_email_log WHERE id = ?").get(logId);
 }
 
-/** The automated classification the server stored for this e-mail (auto_reply / bounce), or null. */
+/** The automated classification the server stored for this e-mail (auto_reply / bounce / report), or null. */
 export function inboundLogAutomatedKind(logId: string): string | null {
   const r = getDb().prepare("SELECT automated_kind FROM inbound_email_log WHERE id = ?").get(logId) as { automated_kind: string | null } | undefined;
   return r?.automated_kind ?? null;
@@ -436,10 +475,74 @@ export function isOurPlatformAddress(email: string | null | undefined): boolean 
   return Object.keys(INBOUND_DOMAIN_VERTICALS).some((o) => d === o || d.endsWith("." + o));
 }
 
+/**
+ * The trailing «(fra …)» the forward appends to a subject, with balanced
+ * parentheses, so a sender name such as «Mail Delivery System (Gmail)» is
+ * kept whole. Null when the subject does not end in one.
+ */
+export function forwardSuffix(subject: string | null | undefined): { start: number; inner: string } | null {
+  const s = (subject ?? "").replace(/\s+$/, "");
+  if (!s.endsWith(")")) return null;
+  const lower = s.toLowerCase();
+  let i = lower.lastIndexOf("(fra ");
+  for (let tries = 0; i >= 0 && tries < 5; tries++) {
+    let depth = 0;
+    let closesAtEnd = false;
+    for (let j = i; j < s.length; j++) {
+      if (s[j] === "(") depth++;
+      else if (s[j] === ")" && --depth === 0) {
+        closesAtEnd = j === s.length - 1;
+        break;
+      }
+    }
+    if (closesAtEnd) return { start: i, inner: s.slice(i + 5, s.length - 1) };
+    i = i > 0 ? lower.lastIndexOf("(fra ", i - 1) : -1;
+  }
+  return null;
+}
+
 /** «[Innkommende] X (fra …)» → «X»: the forward's own decoration off a subject before classifying it. */
 export function stripForwardSubject(subject: string | null): string | null {
   if (!subject) return subject;
-  return subject.replace(/^\s*\[Innkommende\]\s*/i, "").replace(/\s*\(fra [^()]*\)\s*$/i, "");
+  const t = subject.replace(/^\s*\[Innkommende\]\s*/i, "");
+  const f = forwardSuffix(t);
+  return f ? t.slice(0, f.start).replace(/\s+$/, "") : t;
+}
+
+/**
+ * The original sender a forward names at the end of its subject:
+ * «… (fra Name <addr>)» or «… (fra addr)». Null without that suffix.
+ */
+export function forwardOriginalSender(subject: string | null | undefined): { email: string | null; name: string } | null {
+  const f = forwardSuffix(subject);
+  if (!f) return null;
+  const inner = f.inner.trim();
+  const angles = [...inner.matchAll(/<([^<>\s]+@[^<>\s]+)>/g)];
+  const bare = /^([^\s<>@]+@[^\s<>@]+)$/.exec(inner);
+  const email = (angles.length ? angles[angles.length - 1][1] : bare?.[1] ?? null)?.toLowerCase() ?? null;
+  const name = inner.replace(/<[^<>]*>/g, "").replace(/^"+|"+$/g, "").trim();
+  return { email, name };
+}
+
+/**
+ * classifyAutomated for the Gmail copy of a forward. The copy is sent from
+ * our own address, so the original sender is read from «(fra …)» in its
+ * subject: a bounce from «Mail Delivery Subsystem <mailer-daemon@…>» stays a
+ * bounce when its log row is gone.
+ */
+export function classifyForwardCopy(input: { subject: string | null | undefined; fromEmail: string; headers: InboundHeaders }): {
+  kind: AutomatedKind;
+  reason: string | null;
+} {
+  const orig = forwardOriginalSender(input.subject);
+  const r = classifyAutomated({
+    subject: stripForwardSubject(input.subject ?? null),
+    fromEmail: orig?.email ?? input.fromEmail,
+    headers: input.headers,
+  });
+  if (r.kind !== null || !orig?.name) return r;
+  if (BOUNCE_SUBJECT_RE.test(orig.name)) return { kind: "bounce", reason: "bounce sender name" };
+  return r;
 }
 
 export type MarkerTarget =

@@ -173,7 +173,9 @@ export async function runDentalProfileEmailRevealTests(opts: { log?: boolean } =
     const slugPage = (i: number, ip: string, ua?: string) => get(`/klinikk/${dentalSeo.slugifyClinic(c[i]!.navn, c[i]!.org_nr)}`, ip, ua);
     const reveal = (id: string, ip: string, ua?: string) => get(`/klinikk/id/${id}/epost`, ip, ua);
     const rest = (id: string, ip: string) => get(`/api/tannlege/agents/${id}`, ip);
-    const mailtoOf = (email: string) => `<a href="mailto:${email.replace(/&/g, "&amp;").replace(/'/g, "&#39;")}">`;
+    // S4 (dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord): the mailto: link now also
+    // carries the click-beacon data-track-* attributes after its href.
+    const mailtoOf = (email: string) => `<a href="mailto:${email.replace(/&/g, "&amp;").replace(/'/g, "&#39;")}"`;
     const revealLink = (id: string) => `<a href="/klinikk/id/${id}/epost" rel="nofollow">Vis e-post</a>`;
     const shows = (r: HttpResult, i: number) => r.text.includes(mailtoOf(emails[i]!)) && JSON.stringify(jsonLdBlocks(r.text)).includes(JSON.stringify(emails[i]));
     const isRevealOnly = (r: HttpResult, i: number) =>

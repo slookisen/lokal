@@ -23,6 +23,12 @@
  * per-IP counter: with the switch on their reply previews never show the ✉️
  * line and spend no budget (withoutSellerEmailAlways).
  *
+ * S-D2 («Kontaktskjema som valg per profil»): with CONTACT_FORM_RFB on, a
+ * conversation whose seller has agents.contact_form_only = 1 always has the
+ * seller's e-mail left out the same way, on every one of these answers, and
+ * spends no budget. CONTACT_FORM_RFB off: the flag is not read and every
+ * function behaves as before.
+ *
  * Nothing here logs; the guard logs ids and counts only.
  */
 
@@ -30,6 +36,7 @@ import type { Request, Response } from "express";
 import { emailRevealGuardEnabled, emailWithheldIds, revealEmailFor } from "./email-reveal-guard";
 import { knowledgeService } from "./knowledge-service";
 import { getDb } from "../database/init";
+import { contactFormEnabled, contactFormOnlyIds } from "./contact-form-only";
 
 /** A «✉️ …» line of the seller's contact block (with or without the emoji variation selector). */
 const EMAIL_LINE_RE = /^\s*✉/u;
@@ -166,19 +173,30 @@ function carriesEmail(conv: ConvLike, cache: Map<string, string | null>): boolea
  * e-mail in the answer). Switch off: `convs` as given, headers untouched.
  */
 export function guardConversationEmails<C extends ConvLike>(req: Request, res: Response, convs: C[]): C[] {
-  if (!emailRevealGuardEnabled("rfb")) return convs;
+  const guardOn = emailRevealGuardEnabled("rfb");
+  // S-D2: the contact-form-only sellers (null with CONTACT_FORM_RFB off).
+  const flagged = flaggedSellers(convs);
+  if (!guardOn && !(flagged && flagged.size > 0)) return convs;
   const cache = new Map<string, string | null>();
   const carrying = convs.map((c) => carriesEmail(c, cache));
   const ids: string[] = [];
-  convs.forEach((c, i) => { const p = producerOf(c); if (carrying[i] && p) ids.push(p); });
+  convs.forEach((c, i) => { const p = producerOf(c); if (carrying[i] && p && !flagged?.has(p)) ids.push(p); });
   const withheld = emailWithheldIds(req, res, "rfb", ids);
-  if (withheld === null) return convs;
   return convs.map((c, i) => {
     if (!carrying[i]) return c;
     const p = producerOf(c);
+    if (p && flagged?.has(p)) return conversationWithoutEmail(c, cache);
+    if (withheld === null) return c;
     // A seller message with no producer id cannot be counted: left out.
     return !p || withheld.has(p) ? conversationWithoutEmail(c, cache) : c;
   });
+}
+
+/** S-D2: the sellers of `convs` with the contact-form-only flag; null with CONTACT_FORM_RFB off (the flag is not read). */
+function flaggedSellers(convs: ConvLike[]): ReadonlySet<string> | null {
+  if (!contactFormEnabled("rfb")) return null;
+  const ids = convs.map((c) => (c ? producerOf(c) : null)).filter((p): p is string => !!p);
+  return ids.length === 0 ? new Set() : contactFormOnlyIds(getDb(), ids);
 }
 
 /** The seller agent of a stored conversation (the /api/live and AG-UI streams get bare messages). */
@@ -197,10 +215,16 @@ function storedSellerOf(conversationId: unknown): string | null {
  * message without the seller's e-mail: `msg` as given.
  */
 export function messageForListener<M extends MsgLike & { conversationId?: string }>(req: Request, msg: M, cache: Map<string, string | null> = new Map()): M {
-  if (!emailRevealGuardEnabled("rfb") || !msg || msg.senderRole !== "seller") return msg;
+  const guardOn = emailRevealGuardEnabled("rfb");
+  const formOn = contactFormEnabled("rfb");
+  if ((!guardOn && !formOn) || !msg || msg.senderRole !== "seller") return msg;
   const seller = storedSellerOf(msg.conversationId) ?? msg.senderAgentId ?? null;
+  // S-D2: a contact-form-only seller's e-mail is always left out (no budget).
+  const flagged = formOn && !!seller && !!contactFormOnlyIds(getDb(), [seller])?.has(seller);
+  if (!guardOn && !flagged) return msg;
   const emails = sellerEmailsIn(msg, seller, cache);
   if (emails.length === 0) return msg;
+  if (flagged) return messageWithoutEmail(msg, emails);
   if (seller) {
     const allowed = revealEmailFor(req, "rfb", [seller]);
     if (allowed === null || allowed.has(seller)) return msg;
@@ -214,9 +238,15 @@ export function messageForListener<M extends MsgLike & { conversationId?: string
  * the front page showcase). Switch off: `convs` as given.
  */
 export function withoutSellerEmailAlways<C extends ConvLike>(convs: C[]): C[] {
-  if (!emailRevealGuardEnabled("rfb")) return convs;
+  if (emailRevealGuardEnabled("rfb")) {
+    const cache = new Map<string, string | null>();
+    return convs.map((c) => conversationWithoutEmail(c, cache));
+  }
+  // S-D2: guard off, CONTACT_FORM_RFB on → only the contact-form-only sellers' e-mail is left out.
+  const flagged = flaggedSellers(convs);
+  if (!flagged || flagged.size === 0) return convs;
   const cache = new Map<string, string | null>();
-  return convs.map((c) => conversationWithoutEmail(c, cache));
+  return convs.map((c) => { const p = producerOf(c); return p && flagged.has(p) ? conversationWithoutEmail(c, cache) : c; });
 }
 
 /** Cache-Control for a live stream: "no-cache" as before; switch on: also private. */

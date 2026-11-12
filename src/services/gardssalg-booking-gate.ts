@@ -40,7 +40,7 @@ export function hasBookingRequestEmail(epost: string | null | undefined): boolea
 
 // ── Owner enable gate ───────────────────────────────────────────────────────
 
-export type OwnerBookingBlockReason = "admin_brake" | "no_booking_email";
+export type OwnerBookingBlockReason = "admin_brake" | "no_booking_email" | "pending_review";
 
 export interface OwnerBookingBlock {
   reason: OwnerBookingBlockReason;
@@ -52,6 +52,11 @@ export interface OwnerBookingBlock {
 
 export const OWNER_BOOKING_ADMIN_BRAKE_MSG =
   "Booking er stanset av Opplevagent. Du kan ikke slå den på igjen selv. Ta kontakt med kontakt@opplevagent.no.";
+export const OWNER_BOOKING_PENDING_REVIEW_MSG =
+  "Booking kan ikke slås på før Opplevagent har godkjent registreringen. Ta kontakt med kontakt@opplevagent.no.";
+/** catalog_hidden_reason of a self-registered row awaiting manual review
+ *  (dev-request 2026-11-01-opplevagent-drikkeprodusent-selvregistrering). */
+export const SELF_REGISTERED_PENDING_REVIEW_REASON = "self_registered_pending_review";
 export const OWNER_BOOKING_NO_EMAIL_MSG =
   "Booking kan ikke slås på før profilen har en e-postadresse som forespørslene kan sendes til. Ta kontakt med kontakt@opplevagent.no.";
 
@@ -59,11 +64,20 @@ export interface OwnerBookingGateRow {
   epost: string | null;
   booking_admin_brake_at: string | null;
   booking_admin_brake_note: string | null;
+  /** Optional: callers that select it get the pending-review block below.
+   *  Callers that do not are unchanged. */
+  catalog_hidden_reason?: string | null;
 }
 
 /** Why the owner may not switch booking ON for this row, or null if allowed.
  *  The admin brake is checked first: it wins even when an address exists. */
 export function ownerBookingEnableBlock(row: OwnerBookingGateRow): OwnerBookingBlock | null {
+  // A self-registered row is never bookable before a human has approved it
+  // (dev-request 2026-11-01-opplevagent-drikkeprodusent-selvregistrering,
+  // Spec E), even if it has an e-mail address.
+  if (row.catalog_hidden_reason === SELF_REGISTERED_PENDING_REVIEW_REASON) {
+    return { reason: "pending_review", message: OWNER_BOOKING_PENDING_REVIEW_MSG, note: null };
+  }
   if (row.booking_admin_brake_at) {
     const note = typeof row.booking_admin_brake_note === "string" && row.booking_admin_brake_note.trim() !== ""
       ? row.booking_admin_brake_note.trim()

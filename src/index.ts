@@ -78,6 +78,7 @@ import adminDbBackupRoutes, { diskUsage, createBackupAgeSweepTick, BACKUP_AGE_SW
 import adminSearchConsolesRoutes from "./routes/admin-search-consoles";
 import adminConversationsTrafficClassRoutes from "./routes/admin-conversations-traffic-class";
 import adminCrossVerticalContactLookupRoutes from "./routes/admin-cross-vertical-contact-lookup";
+import adminCsChangeRequestsRoutes from "./routes/admin-cs-change-requests";
 import adminAgentsRoutes from "./routes/admin-agents";
 import adminOutreachPoolRoutes from "./routes/admin-outreach-pool";
 import adminOutreachCandidatesRoutes from "./routes/admin-outreach-candidates";
@@ -85,6 +86,8 @@ import adminOutreachMaxTouchVernRoutes from "./routes/admin-outreach-max-touch-v
 import { rfbMarketingLaneRouter, rfbMarketingDailyRunRouter } from "./routes/admin-rfb-marketing";
 import { tickRfbMarketingDaily } from "./services/rfb-marketing-daily";
 import { tickCsWatchdog, type CsTickState } from "./services/cs-watchdog";
+import { csAutosendEnabled, runCsAutosend } from "./services/cs-reply-proposals";
+import { csChangeRequestsEnabled, runCsChangeRequests } from "./services/cs-change-requests";
 import { rfbEnrichmentNightlyRouter } from "./routes/admin-rfb-enrichment-nightly";
 import {
   isRfbEnrichmentNightlyEnabled,
@@ -168,6 +171,7 @@ import adminPrivacyErasureRoutes from "./routes/admin-privacy-erasure";
 import adminCrmChimeraContactsDiagnoseRoutes from "./routes/admin-crm-chimera-contacts-diagnose";
 import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside-cleanup";
 import adminDentalMarkInactiveRoutes from "./routes/admin-dental-mark-inactive";
+import adminDentalContactFormOnlyRoutes from "./routes/admin-dental-contact-form-only";
 import adminDentalHjemmesideDiscoveryRoutes from "./routes/admin-dental-hjemmeside-discovery";
 import adminDentalCatalogClassRoutes from "./routes/admin-dental-catalog-class";
 import adminDentalWrongEntityRetroSanitizeRoutes from "./routes/admin-dental-wrong-entity-retro-sanitize";
@@ -194,6 +198,7 @@ import { mountBillingRoutes } from "./routes/admin-billing";
 import { mountPaymentRoutes, mountPaymentWebhook } from "./routes/payments";
 import contactRouter from "./routes/contact";
 import contactTrackingRoutes, { redirectRouter as contactRedirectRouter } from "./routes/contact-tracking";
+import { profileClickTrackRouter } from "./services/profile-link-clicks";
 import { list as blocklistList } from "./services/blocklist-service";
 import { bounceService } from "./services/bounce-service";
 import { seedData } from "./seed";
@@ -689,6 +694,12 @@ app.use("/api", contactRouter);
 // is a short top-level path (/ut/...) so it can be dropped straight into
 // a profile page as an href, same style as a URL-shortener endpoint.
 app.use("/api/track", contactTrackingRoutes);
+// dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord S4: the click
+// beacon for tel:/mailto: links on Opplevagent and Finn-tannlege profile
+// pages (POST /api/track/profile-click; /api/* passes their host gates). The
+// counting redirect for those hosts lives in their own SEO routers
+// (GET /ut/:surface/:id/:kind in experiences-seo.ts / dental-seo.ts).
+app.use("/api/track", profileClickTrackRouter);
 app.use("/ut", contactRedirectRouter);
 app.use("/api/producers", producerRoutes);
 app.use("/api/producers", scanRoutes);
@@ -1165,6 +1176,10 @@ app.use("/admin/dental/hjemmeside-cleanup-sweep", adminLimiter, adminDentalHjemm
 // research). dry-run by default, dry_run:false writes.
 // POST /admin/dental/mark-inactive
 app.use("/admin/dental/mark-inactive", adminLimiter, adminDentalMarkInactiveRoutes);
+// dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
+// S-D3a: per-clinic contact-form flag (record only; read only while
+// CONTACT_FORM_DENTAL is on). POST /admin/dental/agents/:id/contact-form-only
+app.use("/admin/dental/agents", adminLimiter, adminDentalContactFormOnlyRoutes);
 // dev-request 2026-09-02-dental-permanent-triage-needs-review-drain, slice 3c-1:
 // deterministic needs_review drain. POST /admin/dental/triage/dry-run (never
 // writes) and POST /admin/dental/triage/run (503 unless DENTAL_TRIAGE_JOB_ENABLED=true).
@@ -1346,6 +1361,7 @@ if (process.env.CRM_ENABLED !== "0") {
 // customer-service "fjern" flow; exact-email-match only, never fuzzy name
 // matching. GET /admin/cross-vertical-contact-lookup.
 app.use("/admin", adminLimiter, adminCrossVerticalContactLookupRoutes);
+app.use("/admin/cs", adminLimiter, adminCsChangeRequestsRoutes);
 
 // Billing skeleton (Produsent-Premium, test-mode Stripe) — dev-request
 // 2026-07-13-billing-skjelett-moerkt. Feature-flagged via BILLING_ENABLED
@@ -2821,6 +2837,49 @@ if (process.env.RFB_MARKETING_PLATFORM_ENABLED === "1") {
   });
   setTimeout(() => { void csWatchdogTick(); }, 180_000);
   setInterval(() => { void csWatchdogTick(); }, 10 * 60_000);
+}
+
+// ─── CS på serveren, S2: the reply-proposal send worker (CS_AUTOSEND_ENABLED) ──
+// Every minute: recover expired leases, then evaluate + send due proposals
+// (or park them in the approval queue with the reason). With the flag off the
+// worker is not registered and the watchdog moves new proposals to the queue.
+if (csAutosendEnabled()) {
+  let csAutosendBusy = false;
+  const csAutosendTick = trackJob("cs-autosend", async () => {
+    if (csAutosendBusy) return;
+    csAutosendBusy = true;
+    try {
+      const r = await runCsAutosend();
+      if (r.run_id) console.log(`[cs-autosend] ${r.processed.map((p) => p.outcome).join(",")} recovered=${r.recovered_leases.length}`);
+    } catch (err) {
+      console.error("[cs-autosend] tick failed (non-fatal, retried next minute):", err);
+    } finally {
+      csAutosendBusy = false;
+    }
+  });
+  setTimeout(() => { void csAutosendTick(); }, 200_000);
+  setInterval(() => { void csAutosendTick(); }, 60_000);
+}
+
+// ─── CS på serveren, S4: change requests executed + verified by the server
+// (CS_CHANGE_REQUESTS_ENABLED). Every 5 min: execute queued requests, re-read
+// public surfaces for executed ones, delete hidden removals after 24 h.
+if (csChangeRequestsEnabled()) {
+  let csChangeBusy = false;
+  const csChangeTick = trackJob("cs-change-requests", async () => {
+    if (csChangeBusy) return;
+    csChangeBusy = true;
+    try {
+      const r = await runCsChangeRequests();
+      if (r.run_id) console.log(`[cs-change-requests] ${r.processed.map((p) => `${p.id}:${p.from}->${p.to}`).join(" ")}`);
+    } catch (err) {
+      console.error("[cs-change-requests] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      csChangeBusy = false;
+    }
+  });
+  setTimeout(() => { void csChangeTick(); }, 240_000);
+  setInterval(() => { void csChangeTick(); }, 5 * 60_000);
 }
 
 // ─── dev-request 2026-10-10-rfb-berikelse-nattjobb (R6; Daniel GO 2026-10-10,

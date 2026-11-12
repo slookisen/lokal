@@ -467,7 +467,8 @@ export async function runAdminOrderStatsTests(opts: { log?: boolean } = {}): Pro
       for (const v of ["Alfa Gård", "Gård A", BUYER.name, GUEST.name, "620"]) assertTrue(!page.text.includes(v), `s2-ac1: page HTML holds no data («${v}»)`);
       assertTrue(!/\.innerHTML\s*=|insertAdjacentHTML|document\.write/.test(page.text), "s2-ac1: page never writes HTML strings into the DOM");
       assertTrue(!/method:\s*'(POST|PUT|PATCH|DELETE)'/i.test(page.text), "s2-ac1: page makes no write calls");
-      assertTrue(page.text.includes("Opplevagent — opplevelser") && page.text.includes("Finn-tannlege") && page.text.includes("Kommer"), "s2-ac1: placeholders for later platforms");
+      // S4 replaced the S2 placeholders for opplevelser and Finn-tannlege with their click sections.
+      assertTrue(page.text.includes("Opplevagent opplevelser — henvisninger") && page.text.includes("Finn-tannlege — henvisninger"), "s2-ac1: sections for the platforms without orders (S4: their clicks)");
     }
 
     // ── S2-AC2: no personal data in any CSV ────────────────────────────────
@@ -533,7 +534,8 @@ export async function runAdminOrderStatsTests(opts: { log?: boolean } = {}): Pro
       assertTrue(rfbOnly.length > 0 && rfbOnly.every((d) => d[0] === "rfb"), "s2-ac8: plattform=rfb exports only rfb rows");
       routeMod.__setAdminOrderStatsTestDbs(db, null);
       const off = parseCsv((await reqH("GET", `${CSV}?plattform=gardssalg&${P}`, K)).text.replace(/^﻿/, "")).slice(1);
-      assertEq(off.map((d) => [d[0], d[2], d[6]]), [["gardssalg", "tilgjengelig", "0"]], "s2-ac8: unavailable gårdssalg → one 0 flag row, no free text");
+      // S4: the gårdssalg click rows come from lokal.db (profile_link_clicks), not the experiences DB.
+      assertEq(off.filter((d) => !d[2].startsWith("henvisninger_")).map((d) => [d[0], d[2], d[6]]), [["gardssalg", "tilgjengelig", "0"]], "s2-ac8: unavailable gårdssalg → one 0 flag row, no free text");
       routeMod.__setAdminOrderStatsTestDbs(db, exp);
     }
 
@@ -697,7 +699,8 @@ export async function runAdminOrderStatsTests(opts: { log?: boolean } = {}): Pro
       assertTrue(!("ai_leveranser" in henv) && !("henvisninger" in aiDel) && !("total" in ov3.henvisninger) , "s3-ai: two separate blocks, no combined click+delivery number");
       assertTrue(ov3.rfb.total === 7 && Object.keys(ov3.rfb).every((k: string) => !/henvis|ai_lev/.test(k)), "s3-ai: the S1 rfb order block is unchanged");
       const gsOnly = (await req("GET", `/admin/api/ordre/oversikt?plattform=gardssalg&${P}`, K)).body;
-      assertTrue(gsOnly.henvisninger === undefined && gsOnly.ai_leveranser === undefined, "s3-ai: plattform=gardssalg has no RFB click / AI blocks");
+      // S4: plattform=gardssalg carries the gårdssalg profile clicks, never the RFB ones.
+      assertTrue(gsOnly.henvisninger?.rfb === undefined && gsOnly.ai_leveranser === undefined, "s3-ai: plattform=gardssalg has no RFB click / AI blocks");
       const rfbOnly = (await req("GET", `/admin/api/ordre/oversikt?plattform=rfb&${P}`, K)).body;
       assertTrue(rfbOnly.henvisninger.rfb.total === 6 && rfbOnly.ai_leveranser.rfb.total === 10, "s3-ai: plattform=rfb has both blocks");
     }
@@ -707,7 +710,8 @@ export async function runAdminOrderStatsTests(opts: { log?: boolean } = {}): Pro
       const r = await reqH("GET", `${CSV}?plattform=alle&${P}&oppl=dag`, K);
       const rows = parseCsv(r.text.replace(/^﻿/, ""));
       const header = rows[0];
-      const data = rows.slice(1).filter((d) => /^(henvisninger_|ai_leveranser_)/.test(d[2]));
+      // S4 adds henvisninger_* rows for opplevelser / gardssalg / tannlege; the S3 count is RFB's.
+      const data = rows.slice(1).filter((d) => d[0] === "rfb" && /^(henvisninger_|ai_leveranser_)/.test(d[2]));
       const vi = header.indexOf("verdi");
       const find = (om: string, kat: string, key: string, maal: string) =>
         data.find((d) => d[0] === "rfb" && d[1] === om && d[2] === kat && d[3] === key && d[5] === maal)?.[vi];
@@ -726,7 +730,7 @@ export async function runAdminOrderStatsTests(opts: { log?: boolean } = {}): Pro
         + 2 + 4 + 5 + 39 + 1 + 4;                              // ai_leveranser: flag, total, 4 channels, 5 AIs, 39 days, test total+4 channels
       assertEq(data.length, expectedS3, "s3-csv: S3 aggregate row count");
       const gsCsv = parseCsv((await reqH("GET", `${CSV}?plattform=gardssalg&${P}`, K)).text.replace(/^﻿/, "")).slice(1);
-      assertTrue(gsCsv.every((d) => !/^(henvisninger_|ai_leveranser_)/.test(d[2])), "s3-csv: plattform=gardssalg exports no S3 rows");
+      assertTrue(gsCsv.every((d) => d[0] !== "rfb" && !/^ai_leveranser_/.test(d[2])), "s3-csv: plattform=gardssalg exports no S3 (RFB) rows");
     }
 
     // ── S3-AC2 / AC1: no personal data, auth unchanged ─────────────────────

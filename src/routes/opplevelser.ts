@@ -863,7 +863,8 @@ import { CRM_SENDER_ADDRESS } from "../services/crm-platform-identity";
 // was removed; a merge with main's independently-built AC6 slice (#508)
 // silently dropped the import since neither side's diff hunk touched the
 // same line the other needed, tsc caught it as the two branches combined.
-import { normalizeDomain, normalizeEmail, isBlocked, add as blocklistAdd, loadOwnerRemovedMatcher } from "../services/blocklist-service";
+import { normalizeDomain, normalizeEmail, isBlocked, add as blocklistAdd, loadOwnerRemovedMatcher, PROTECTED_DOMAINS as BLOCKLIST_PROTECTED_DOMAINS_V } from "../services/blocklist-service";
+import { isHostedPlatformHost as isHostedPlatformHostV } from "../services/claim-domain-rule";
 import type { GardssalgTerminalStatus } from "../services/experience-store";
 import {
   countRecipientAddressTypes,
@@ -928,6 +929,7 @@ import { findLocalOrgnrCandidate } from "../services/local-orgnr-candidates";
 // dev-request 2026-07-19-brreg-nace-drikkeprodusenter — kommune→fylke best-effort
 // ved landing av nye NACE-oppdagede providere.
 import { cityToFylke } from "../services/norway-fylke";
+import { GARDSSALG_NACE_PRODUCER_TYPE } from "../services/gardssalg-nace-producer-type";
 import { resolveFylke2024 } from "../services/fylke-2024-migration";
 import { fillFylkeFromKommune, runGardssalgFylkeFromKommune } from "../services/gardssalg-fylke-from-kommune";
 import {
@@ -6781,14 +6783,9 @@ router.get("/admin/gardssalg-content-quality-count", requireAdmin, (req: Request
 //
 // Both map to `vingård`, already a member of DRINK_PRODUCER_TYPES
 // (route-corridor-service.ts) — no new taxonomy.
-const GARDSSALG_NACE_PRODUCER_TYPE: Record<string, string> = {
-  "11.010": "destilleri",
-  "11.020": "vingård",
-  "11.030": "sideri",
-  "11.040": "mjøderi",
-  "11.050": "bryggeri",
-  "01.210": "vingård",
-};
+// The map itself lives in services/gardssalg-nace-producer-type.ts (moved
+// unchanged, dev-request 2026-11-01-opplevagent-drikkeprodusent-
+// selvregistrering) so the self-registration Brreg gate reads the same map.
 const GS_ND_PAGE_SIZE = 100;
 const GS_ND_MAX_PAGES_PER_CODE = 10; // 1000/code — far above the real ~240 ceiling
 const GS_ND_DEFAULT_MAX_CREATE = 400;
@@ -29944,7 +29941,234 @@ export function contentJudgeReasonMentionsNav(reason: string | null | undefined)
   return CONTENT_JUDGE_NAV_REASON_TERMS.some((t) => folded.includes(stripNorwegianAccentsForJudgeReason(t)));
 }
 
-/** The six promotion requirements (see the block comment above), each
+/** Organisation/brand terms that, when the judge's OWN MATCH reason uses
+ *  them and describes NO experience (see CONTENT_JUDGE_EXPERIENCE_*), mean
+ *  the judge only matched "same provider" — e.g. prod row 73f9ed8c
+ *  "Rørosmat Local Food Trail" (2026-11-11 dry-run): the reason only said
+ *  Rørosmat is a producer cooperative / brand for local food, the stored
+ *  description was empty, and the row was `would_promote`. Promotion guard
+ *  `judge_reason_org`. Lowercase and æøå-folded, matched as substrings of
+ *  the folded reason (compounds such as "produsentsamvirke", "samvirket",
+ *  "andelslaget", "merkevaren", "Røros-merkevaren" are covered).
+ *  Deliberately NARROW (review B1, lokal#1519): only the producer-cooperative /
+ *  brand pattern. Bare "organisasjon"/"organisation"/"organization",
+ *  "forening" and "association" are NOT terms — associations (turistforening,
+ *  teaterforening, kunstforening, seterforening ...) run many real Norwegian
+ *  experiences, and "samme organisasjon" is how judges name any provider.
+ *  "organisasjon"/"organisation" only count in producer phrasings
+ *  ("produsentorganisasjon", "producer organisation", and the
+ *  CONTENT_JUDGE_ORG_REASON_PATTERNS). Generic company words (bedrift,
+ *  selskap, firma, company, business) are never terms. "brand"/"brands" are
+ *  matched as whole words (CONTENT_JUDGE_ORG_REASON_WORDS) so names like
+ *  "Brandbu"/"Hildebrand" never count. */
+export const CONTENT_JUDGE_ORG_REASON_TERMS: readonly string[] = [
+  "samvirke",
+  "andelslag",
+  "kooperativ",
+  "cooperative",
+  "co-operative",
+  "merkevare",
+  "produsentnettverk",
+  "nettverk av produsenter",
+  "nettverk for produsenter",
+  "producer network",
+  "network of producers",
+  "produsentorganisasjon",
+  "producer organisation",
+  "producer organization",
+];
+/** Producer-organisation phrasings, tested against the folded reason. */
+export const CONTENT_JUDGE_ORG_REASON_PATTERNS: readonly RegExp[] = [
+  /organisasjon(?:en)? for (?:lokale |lokal)?(?:mat)?produsenter/,
+  /organi[sz]ations? (?:of|for) (?:local )?(?:food )?producers/,
+];
+/** Organisation terms matched only as whole words (too short/ambiguous as
+ *  substrings). */
+export const CONTENT_JUDGE_ORG_REASON_WORDS: readonly string[] = ["brand", "brands"];
+
+/** Experience terms: if the judge's reason contains ANY of these, it
+ *  describes something a visitor can do or visit, so `judge_reason_org`
+ *  never holds it even when it also names an organisation ("Samvirket tilbyr
+ *  guidet gårdsbesøk med smaking", "Andelslaget driver gårdsbutikk").
+ *  Lowercase and æøå-folded, matched as substrings — only stems whose
+ *  substrings are unambiguous here ("besok" covers "gardsbesok"; "smak"
+ *  covers "smaking"/"smaksprove"; "hotel" covers "hotell"; "hytt" covers
+ *  "hytte"/"hytta"; "fjos" covers "fjoset"; "klatr" covers
+ *  "klatring"/"klatre"; "seter"/"setra" cover "seterdrift"; "kafe"/"cafe"
+ *  cover "kafé"/"café" after accent folding; "fiske" covers "fiskekort").
+ *  Short/ambiguous stems ("tur", "kurs", "marked", "market", "trip", "pub")
+ *  and short English words are matched per word instead (see
+ *  CONTENT_JUDGE_EXPERIENCE_WORD_PATTERNS). Erring towards treating a
+ *  reason as an experience only makes this guard LESS strict, never loses a
+ *  real row (review B1, lokal#1519, broadened the list). */
+export const CONTENT_JUDGE_EXPERIENCE_REASON_TERMS: readonly string[] = [
+  "opplevelse",
+  "omvisning",
+  "guide",
+  "smak",
+  "aktivitet",
+  "arrangement",
+  "arranger",
+  "besok",
+  "servering",
+  "serverer",
+  "overnatting",
+  "workshop",
+  "foredrag",
+  "ekskursjon",
+  "kajakk",
+  "padling",
+  "seiling",
+  "safari",
+  "festival",
+  "cruise",
+  "matsti",
+  "museum",
+  "museet",
+  "galleri",
+  "gallery",
+  "utstilling",
+  "exhibition",
+  "gardsbutikk",
+  "gardsutsalg",
+  "farm shop",
+  "farmshop",
+  "restaurant",
+  "kafe",
+  "cafe",
+  "hotel",
+  "hytt",
+  "cabin",
+  "farm stay",
+  "fiske",
+  "fishing",
+  "ridning",
+  "riding",
+  "konsert",
+  "concert",
+  "vandring",
+  "klatr",
+  "climbing",
+  "rafting",
+  "sauna",
+  "badstue",
+  "dyrepark",
+  "teater",
+  "theatre",
+  "theater",
+  "friluftsspill",
+  "forestilling",
+  "apen gard",
+  "apent gard",
+  "apne gard",
+  "fjos",
+  "bryggeri",
+  "brewery",
+  "veterantog",
+  "jernbane",
+  "railway",
+  "seter",
+  "setra",
+  "bygdetun",
+  "tasting",
+  "activit",
+  "experience",
+  "excursion",
+  // Review r2 (lokal#1519): rentals, workshops, lodging, outdoor activities.
+  "utleie",
+  "leier ut",
+  "rental",
+  "ysteri",
+  "visning",
+  "verksted",
+  "gjestegard",
+  "pensjonat",
+  "vertshus",
+  "fjellstu",
+  "glamping",
+  "camping",
+  "campsite",
+  "accommodation",
+  "overnight",
+  "guesthouse",
+  "b&b",
+  "golf",
+  "hundekjoring",
+  "kano",
+  "canoe",
+  "jakt",
+  "hunting",
+];
+
+/** Per-word experience patterns, tested against each [a-z0-9]+ word of the
+ *  folded reason (unless the word matches CONTENT_JUDGE_EXPERIENCE_WORD_EXCLUDES):
+ *   - `tur`/`kurs` as a word OR the tail of a compound ("kajakktur",
+ *     "fjellturen", "matkurs") — but not natur/kultur/struktur/litteratur/
+ *     temperatur/arkitektur/signatur/karikatur/agentur/konkurs/diskurs.
+ *   - `marked` anywhere in a word ("marked", "markedsdager", "julemarked",
+ *     "markedet") — but NOT marketing words: "markedsføring"/"markedsfører"
+ *     (folded "markedsfor...") and "markedsandel" are excluded.
+ *   - `market(s)` as a word tail ("market", "farmers market") — "marketing"
+ *     never ends in "market", so it does not count.
+ *   - `trip(s)` as a word tail ("trip", "daytrip") — "strip(s)" excluded.
+ *   - `pub` as a word tail ("pub", "bryggeripub", "puben") — never as a
+ *     substring ("public", "republikk").
+ *   - Exact English words: tour, visit, event, trail, hike, zoo (+ inflections).
+ *  English "course"/"class" are deliberately absent ("of course",
+ *  "world-class"). */
+export const CONTENT_JUDGE_EXPERIENCE_WORD_PATTERNS: readonly RegExp[] = [
+  /tur(?:en|er|ene|ar|ane)?$/,
+  /kurs(?:et|ene|er)?$/,
+  /marked/,
+  /markets?$/,
+  /trips?$/,
+  /pub(?:en|er|s)?$/,
+  // `tur` as a word PREFIX too ("tursti", "turloype", "turveg", "turist"),
+  // except "turn..." (turnover, "in turn") and "turb..." (turbin, turbo) —
+  // see CONTENT_JUDGE_EXPERIENCE_WORD_EXCLUDES.
+  /^tur/,
+  /^(?:tour|tours|touring|toured|visit|visits|visiting|visitor|visitors|event|events|trail|trails|hike|hikes|hiking|hiker|hikers|zoo|zoos)$/,
+];
+export const CONTENT_JUDGE_EXPERIENCE_WORD_EXCLUDES: readonly RegExp[] = [
+  /(?:natur|kultur|struktur|litteratur|temperatur|arkitektur|signatur|karikatur|agentur|konkurs|diskurs)(?:en|er|ene|ar|ane|et)?$/,
+  /markedsfor/,
+  /markedsandel/,
+  /strips?$/,
+  /^turn/,
+  /^turb/,
+];
+
+/** True iff the judge's reason describes a producer cooperative / brand
+ *  (CONTENT_JUDGE_ORG_REASON_TERMS/_PATTERNS/_WORDS) and NO experience
+ *  (CONTENT_JUDGE_EXPERIENCE_REASON_TERMS/_WORD_PATTERNS) — a MATCH with such
+ *  a reason only says "same provider", not "this is a real experience"
+ *  (promotion guard `judge_reason_org`). Null/empty reason -> false (a
+ *  missing reason is the `judge` requirement's concern). PURE. */
+export function contentJudgeReasonOnlyDescribesOrganisation(reason: string | null | undefined): boolean {
+  if (!reason) return false;
+  const folded = stripNorwegianAccentsForJudgeReason(reason.toLowerCase()).replace(/\s+/g, " ");
+  const words = folded.match(/[a-z0-9]+/g) ?? [];
+  // Org terms are matched with ASCII hyphens, soft hyphens (U+00AD) and
+  // non-breaking hyphens (U+2011) removed, so "andels-laget", "Merke\u00advare"
+  // and "Sam-virke" are detected ("co-operative" -> "cooperative" on both sides).
+  const dehyphen = (x: string) => x.replace(/[-\u00ad\u2011]/g, "");
+  const orgFolded = dehyphen(folded);
+  const mentionsOrg =
+    CONTENT_JUDGE_ORG_REASON_TERMS.some((t) => orgFolded.includes(dehyphen(stripNorwegianAccentsForJudgeReason(t)))) ||
+    CONTENT_JUDGE_ORG_REASON_PATTERNS.some((p) => p.test(orgFolded)) ||
+    words.some((w) => CONTENT_JUDGE_ORG_REASON_WORDS.includes(w));
+  if (!mentionsOrg) return false;
+  const mentionsExperience =
+    CONTENT_JUDGE_EXPERIENCE_REASON_TERMS.some((t) => folded.includes(stripNorwegianAccentsForJudgeReason(t))) ||
+    words.some(
+      (w) =>
+        !CONTENT_JUDGE_EXPERIENCE_WORD_EXCLUDES.some((x) => x.test(w)) &&
+        CONTENT_JUDGE_EXPERIENCE_WORD_PATTERNS.some((p) => p.test(w)),
+    );
+  return !mentionsExperience;
+}
+
+/** The seven promotion requirements (see the block comment above), each
  *  evaluated separately. `row` is the state going INTO this write. */
 export type ContentJudgePromotionDecision = {
   wasNeedsReview: boolean;
@@ -29956,13 +30180,19 @@ export type ContentJudgePromotionDecision = {
   contentQualityOk: boolean;
   /** `judge_reason_nav`: the judge's reason does not mention nav/menu chrome. */
   judgeReasonNavOk: boolean;
+  /** `judge_reason_org`: the row has a non-empty description, OR the judge's
+   *  reason does not ONLY describe a producer cooperative/brand without any
+   *  experience (contentJudgeReasonOnlyDescribesOrganisation). Always true
+   *  when the stored description is non-empty. */
+  judgeReasonOrgOk: boolean;
   missing: string[];
   eligible: boolean;
 };
 
 /**
- * Promotion guard (2026-11-09) — two deterministic requirements on top of
- * judge/brreg_active/source_verified/confidence; both can only make
+ * Promotion guard (2026-11-09; `judge_reason_org` 2026-11-11) — three
+ * deterministic requirements on top of
+ * judge/brreg_active/source_verified/confidence; all can only make
  * promotion STRICTER, never looser:
  *  - `content_quality`: a non-empty (trimmed) `description` must not look
  *    like nav-menu/chrome text (looksLikeNavBoilerplate, search-enrich.ts).
@@ -29975,6 +30205,19 @@ export type ContentJudgePromotionDecision = {
  *    isLikelyNavMenuLeakage) is applied. A null/blank description passes.
  *  - `judge_reason_nav`: the judge's own reason must not mention nav/menu
  *    chrome (contentJudgeReasonMentionsNav).
+ *  - `judge_reason_org`: the judge's own reason must not describe ONLY a
+ *    producer cooperative / brand (samvirke, andelslag, merkevare, ...) with no
+ *    experience at all (contentJudgeReasonOnlyDescribesOrganisation) — such
+ *    a MATCH says only "same provider" (prod row 73f9ed8c, 2026-11-11).
+ *    STRUCTURAL GATE (review r2, lokal#1519): applies ONLY when the row's
+ *    trimmed `description` is EMPTY (null/blank). With a non-empty
+ *    description `judgeReasonOrgOk` is always true, whatever the reason
+ *    says. Why: two independent reviews (r1, r2) found ~50% false holds on
+ *    real experiences run by cooperatives/brands/associations with every
+ *    word list tried — an experience word list is never complete. An empty
+ *    description + an org-only reason is the actual failure (73f9ed8c had an
+ *    empty description): the judge then had nothing to compare but "same
+ *    organisation". A row with a real description never depends on the list.
  */
 export function evaluateContentJudgePromotion(
   row: Pick<ContentJudgeSweepRow, "verification_status" | "confidence" | "evidence_url_verification" | "p_brreg_active" | "p_field_provenance" | "description">,
@@ -29990,6 +30233,7 @@ export function evaluateContentJudgePromotion(
   const description = typeof row.description === "string" ? row.description.trim() : "";
   const contentQualityOk = description === "" || !looksLikeNavBoilerplate(description);
   const judgeReasonNavOk = !contentJudgeReasonMentionsNav(judgeReason);
+  const judgeReasonOrgOk = description !== "" || !contentJudgeReasonOnlyDescribesOrganisation(judgeReason);
   const missing: string[] = [];
   if (!judgeOk) missing.push("judge");
   if (!brregActiveOk) missing.push("brreg_active");
@@ -29997,6 +30241,7 @@ export function evaluateContentJudgePromotion(
   if (!confidenceOk) missing.push("confidence");
   if (!contentQualityOk) missing.push("content_quality");
   if (!judgeReasonNavOk) missing.push("judge_reason_nav");
+  if (!judgeReasonOrgOk) missing.push("judge_reason_org");
   return {
     wasNeedsReview,
     judgeOk,
@@ -30005,6 +30250,7 @@ export function evaluateContentJudgePromotion(
     confidenceOk,
     contentQualityOk,
     judgeReasonNavOk,
+    judgeReasonOrgOk,
     missing,
     eligible: wasNeedsReview && missing.length === 0,
   };
@@ -30192,6 +30438,7 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
         confidence_ok: boolean;
         content_quality: boolean;
         judge_reason_nav: boolean;
+        judge_reason_org: boolean;
         status: "not_applicable" | "held" | "would_promote" | "promoted";
         missing?: string[];
       };
@@ -30306,6 +30553,7 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
         confidenceOk,
         contentQualityOk,
         judgeReasonNavOk,
+        judgeReasonOrgOk,
         missing: missingPromotionReqs,
         eligible: eligibleForPromotion,
       } = evaluateContentJudgePromotion(row, outcome.verdict, outcome.reason);
@@ -30368,6 +30616,7 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
           confidence_ok: confidenceOk,
           content_quality: contentQualityOk,
           judge_reason_nav: judgeReasonNavOk,
+          judge_reason_org: judgeReasonOrgOk,
           status: promotionStatus,
           ...(promotionStatus === "held" ? { missing: missingPromotionReqs } : {}),
         },
@@ -33107,6 +33356,7 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
     override_owner_removed?: unknown;
     mode?: unknown;
     confirm_owned?: unknown;
+    skip_blocklist?: unknown;
   };
 
   if (typeof body.hidden !== "boolean") {
@@ -33128,6 +33378,14 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
     return;
   }
   const confirmOwned = body.confirm_owned === true;
+  // CS på serveren (S4): the change-request worker writes the blocklist
+  // itself from its plan, which leaves out identifiers another active
+  // profile uses. It asks the route not to add its own rows.
+  if (body.skip_blocklist !== undefined && typeof body.skip_blocklist !== "boolean") {
+    res.status(400).json({ error: "Body field 'skip_blocklist' must be a boolean" });
+    return;
+  }
+  const skipBlocklist = body.skip_blocklist === true;
   const apply =
     body.apply === true ||
     body.apply === 1 ||
@@ -33282,10 +33540,13 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
           } catch (clearErr) {
             console.error("[opplevelser] gardssalg-provider-visibility confirmation clear failed (non-critical):", clearErr);
           }
-          try {
+          if (!skipBlocklist) try {
+            // Never a shared platform host or free-mail domain as a website block.
+            const hjemDomain = normalizeDomain(row.hjemmeside ?? "");
+            const hjemUsable = !!hjemDomain && !BLOCKLIST_PROTECTED_DOMAINS_V.has(hjemDomain) && !isHostedPlatformHostV(hjemDomain);
             const bl = blocklistAdd({
               orgNr: row.org_nr ?? undefined,
-              website: row.hjemmeside ?? undefined,
+              website: hjemUsable ? (row.hjemmeside ?? undefined) : undefined,
               email: row.epost ?? undefined,
               reason: "gardssalg-provider-visibility hide (fjern oss)",
             });

@@ -15,6 +15,10 @@
 //     Slice S3 adds `henvisninger.rfb` (contact clicks per type and period,
 //     bot and test clicks apart) and `ai_leveranser.rfb` («levert til
 //     AI-assistent», never added to clicks) for plattform=rfb|alle.
+//     Slice S4 adds `henvisninger.{opplevelser,gardssalg,tannlege}` (clicks
+//     on the Opplevagent / Finn-tannlege profile links, profile_link_clicks;
+//     same shape, bot and test-provider clicks apart): gardssalg for
+//     plattform=gardssalg|alle, opplevelser and tannlege for plattform=alle.
 //
 //   GET /admin/api/ordre/eksport.csv?plattform=&fra=&til=&oppl=   (slice S2)
 //     The oversikt numbers as a CSV of aggregates only (no order rows).
@@ -42,6 +46,9 @@ import {
   computeGardssalgOverview,
   computeRfbReferrals,
   computeRfbAiDeliveries,
+  computeProfilReferrals,
+  PROFIL_HENVISNING_PLATTFORMER,
+  type ProfilHenvisningPlattform,
   gardssalgUnavailable,
   listRfbOrders,
   listGardssalgBookings,
@@ -124,10 +131,33 @@ function computeBlocks(plattform: Plattform, periode: Periode, oppl: Opplosning)
   }
   // Slice S3: RFB clicks (contact_clicks, /ut/) and «levert til
   // AI-assistent» (profile_ai_deliveries), kept as separate blocks.
+  const henv: NonNullable<Blocks["henvisninger"]> = {};
   if (plattform === "rfb" || plattform === "alle") {
-    out.henvisninger = { rfb: computeRfbReferrals(rfbDb(), periode, oppl) };
+    henv.rfb = computeRfbReferrals(rfbDb(), periode, oppl);
     out.ai_leveranser = { rfb: computeRfbAiDeliveries(rfbDb(), periode, oppl) };
   }
+  // Slice S4: clicks on the Opplevagent and Finn-tannlege profile links
+  // (profile_link_clicks in lokal.db). gardssalg with plattform=gardssalg|alle,
+  // opplevelser and tannlege (no orders, no plattform value of their own)
+  // with plattform=alle. Test-provider names come from the experiences DB
+  // when it is open; otherwise the name is null.
+  const profilPlattformer: ProfilHenvisningPlattform[] =
+    plattform === "alle" ? [...PROFIL_HENVISNING_PLATTFORMER] : plattform === "gardssalg" ? ["gardssalg"] : [];
+  if (profilPlattformer.length > 0) {
+    let nameOf: (id: string) => string | null = () => null;
+    const e = expDb();
+    if (!("error" in e)) {
+      nameOf = (id: string) => {
+        const r = e.db.prepare("SELECT navn FROM experience_providers WHERE id = ?").get(id) as { navn: string | null } | undefined;
+        return r?.navn ?? null;
+      };
+    }
+    for (const p of profilPlattformer) {
+      try { henv[p] = computeProfilReferrals(rfbDb(), p, periode, oppl, p === "tannlege" ? () => null : nameOf); }
+      catch (err) { henv[p] = { available: false, forklaring: "Henvisninger kunne ikke leses.", merknader: [`Lesing feilet: ${err instanceof Error ? err.message : String(err)}`] }; }
+    }
+  }
+  if (Object.keys(henv).length > 0) out.henvisninger = henv;
   return out;
 }
 
@@ -148,7 +178,7 @@ router.get("/oversikt", (req: Request, res: Response) => {
       forklaring:
         "Lesetall for bestillinger (Rett fra Bonden) og besøksforespørsler på gårdssalg (Opplevagent). " +
         "Ingen kjøper- eller gjesteopplysninger. Testdata er talt for seg i hver plattforms test-blokk. " +
-        "Henvisninger (klikk videre til produsenten) og leveranser til AI-assistenter er egne tall og er ikke lagt sammen.",
+        "Henvisninger (klikk videre til produsenten, tilbyderen eller klinikken) og leveranser til AI-assistenter er egne tall og er ikke lagt sammen.",
       ...computeBlocks(plattform, periode, oppl),
     };
     res.json(body);

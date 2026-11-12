@@ -29,22 +29,42 @@
  * Logs: one JSON line per outcome with the host, the profile id and a short
  * hashed client id — never an e-mail address, never an IP, never the text.
  *
- * Not in S-D1 (later slices): hiding the e-mail of a flagged profile in the
- * RFB REST / A2A / MCP answers (S-D2), and the dental + experiences hosts
- * (S-D3). Operational step before the first flag is set: check that the
- * privacy policy text covers forwarding of contact-form messages.
+ * S-D2 (RFB REST + A2A, not MCP): with the switch on, a flagged profile's
+ * e-mail is also left out of the public API answers, exactly as for a
+ * producer without one (no new field): the contact blocks of /search and
+ * /discover, /agents/:id/card, /info and /vcard, contact_handoffs of cart
+ * submit, the offers of /catalog/offers and the /handleliste pre-selection,
+ * the per-producer A2A card (x-knowledge) and A2A agent/info, and the seller auto-reply's ✉️
+ * line in the public conversation answers (conversation-email-guard.ts).
+ * contactFormOnlyIds / rfbEmailHiddenIds below; a flagged profile spends no
+ * e-mail reveal budget. The buyer's own order (orders[].producer_contact,
+ * order status, receipts) keeps the seller's e-mail. Switch off → the flag is
+ * not read and every answer is as before.
+ *
+ * Not yet (later slices): the RFB MCP answers (contract freeze), and the
+ * dental + experiences hosts (S-D3). Operational step before the first flag
+ * is set: check that the privacy policy text covers forwarding of
+ * contact-form messages.
  */
 
 import crypto from "crypto";
 import type Database from "better-sqlite3";
-import type { Request } from "express";
+import type { Request, Response } from "express";
 import { createStatsKey } from "../middleware/client-ip";
 import { emailService, type EmailOptions } from "./email-service";
+import { emailWithheldIds } from "./email-reveal-guard";
+import { getDb } from "../database/init";
 
-export type ContactFormHost = "rfb";
+export type ContactFormHost = "rfb" | "dental";
 
+/**
+ * S-D3a adds finn-tannlege.com ("dental", CONTACT_FORM_DENTAL; the flag is
+ * dental_agents.contact_form_only, services/dental-contact-form-only.ts).
+ * Each host has its own switch and its own per-IP limit store.
+ */
 export const CONTACT_FORM_SWITCH_ENV: Readonly<Record<ContactFormHost, string>> = {
   rfb: "CONTACT_FORM_RFB",
+  dental: "CONTACT_FORM_DENTAL",
 };
 
 /** Forwarded messages per client IP per sliding hour. */
@@ -78,6 +98,63 @@ export function isContactFormOnly(db: Database.Database, agentId: string): boole
   }
 }
 
+/** Ids per IN (…) query, well below SQLite's bound-parameter limit. */
+const FLAG_QUERY_CHUNK = 500;
+
+/**
+ * S-D2: the ids among `agentIds` that have the contact-form-only flag. null
+ * when the switch for `host` is off: the flag is not read and the caller
+ * changes nothing. Duplicates / empty ids are ignored; a failed read (no
+ * column) counts as unflagged, like isContactFormOnly.
+ */
+export function contactFormOnlyIds(db: Database.Database, agentIds: readonly string[], host: ContactFormHost = "rfb", env: Env = process.env): ReadonlySet<string> | null {
+  if (!contactFormEnabled(host, env)) return null;
+  const ids = Array.from(new Set(agentIds.filter((id) => typeof id === "string" && id !== "")));
+  const flagged = new Set<string>();
+  for (let i = 0; i < ids.length; i += FLAG_QUERY_CHUNK) {
+    const chunk = ids.slice(i, i + FLAG_QUERY_CHUNK);
+    try {
+      const rows = db.prepare(`SELECT id FROM agents WHERE contact_form_only = 1 AND id IN (${chunk.map(() => "?").join(",")})`).all(...chunk) as Array<{ id: string }>;
+      for (const r of rows) flagged.add(r.id);
+    } catch { /* no column: nothing flagged */ }
+  }
+  return flagged;
+}
+
+/**
+ * S-D2, for an RFB API answer: the ids among `idsWithEmail` (each a profile
+ * that HAS an e-mail in this answer) whose e-mail this answer leaves out —
+ * the flagged profiles (switch CONTACT_FORM_RFB on) plus what the per-IP
+ * e-mail guard withholds (emailWithheldIds, EMAIL_REVEAL_GUARD_RFB). A
+ * flagged profile is not passed to the guard, so it spends no budget. Both
+ * switches off → null, as emailWithheldIds; the contact-form switch off →
+ * exactly emailWithheldIds (headers included).
+ */
+export function rfbEmailHiddenIds(req: Request, res: Response, idsWithEmail: readonly string[], db?: Database.Database): ReadonlySet<string> | null {
+  const flagged = contactFormEnabled("rfb") && idsWithEmail.length > 0
+    ? contactFormOnlyIds(db ?? getDb(), idsWithEmail)
+    : null;
+  if (!flagged || flagged.size === 0) return emailWithheldIds(req, res, "rfb", idsWithEmail);
+  const withheld = emailWithheldIds(req, res, "rfb", idsWithEmail.filter((id) => !flagged.has(id)));
+  return new Set([...(withheld ?? []), ...flagged]);
+}
+
+/**
+ * S-D2, for offer-shaped items (catalog-offers.ts Offer / CategoryMatch:
+ * `producer.email`): `items` with producer.email null for a flagged producer,
+ * as for a producer without one. Switch off, or no flagged producer with an
+ * e-mail among them → `items` itself (the flag is not read with the switch
+ * off). Applied at the REST / page layer only; findOffers is shared with MCP.
+ */
+export function withContactFormOnlyProducerEmailNull<T extends { producer?: { agent_id: string; email: string | null } | null }>(items: T[], db?: Database.Database): T[] {
+  if (!contactFormEnabled("rfb") || !Array.isArray(items)) return items;
+  const ids = items.filter((o) => !!o?.producer?.email).map((o) => o.producer!.agent_id);
+  if (ids.length === 0) return items;
+  const flagged = contactFormOnlyIds(db ?? getDb(), ids);
+  if (!flagged || flagged.size === 0) return items;
+  return items.map((o) => (o?.producer?.email && flagged.has(o.producer.agent_id) ? { ...o, producer: { ...o.producer, email: null } } : o));
+}
+
 /**
  * Sets the flag (admin). Returns the stored value, or null for an unknown id.
  * The only DB write of S-D; never touches the e-mail address.
@@ -98,6 +175,11 @@ const BIDI_CHARS_RE = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
 // Controls a multi-line message may not carry (tab, LF, CR are allowed).
 const MESSAGE_BAD_CHARS_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g;
 const EMAIL_RE = /^[^\s@<>()",;:\\[\]]+@[^\s@<>()",;:\\[\]]+\.[^\s@<>()",;:\\[\]]{2,}$/;
+
+/** One line of plain text: controls → space, bidi marks gone, whitespace collapsed. */
+export function contactFormOneLine(s: string): string {
+  return oneLine(s);
+}
 
 function oneLine(s: string): string {
   return s.replace(CONTROL_CHARS_RE, " ").replace(BIDI_CHARS_RE, "").replace(/\s+/g, " ").trim();
@@ -238,7 +320,9 @@ export class ContactFormRateStore {
   }
 }
 
-let rateStore = new ContactFormRateStore();
+// One limit store per host (S-D3a): a message to a clinic does not spend an
+// RFB budget, nor the other way round.
+let rateStores: Record<ContactFormHost, ContactFormRateStore> = { rfb: new ContactFormRateStore(), dental: new ContactFormRateStore() };
 let logLine: (line: string) => void = (line) => console.log(line);
 
 /** The short hashed client id used in log lines (never the IP). */
@@ -250,8 +334,9 @@ function logClientId(key: string): string {
  * The limit check for one request. "no_ip" (no usable req.ip) fails closed
  * like the e-mail reveal guard. `ok` carries the key to record after a send.
  */
-export function contactFormRateCheck(req: Request): { ok: true; key: string; client: string } | { ok: false; reason: "limit" | "no_ip"; retryAfter: number; client?: string } {
+export function contactFormRateCheck(req: Request, host: ContactFormHost = "rfb"): { ok: true; key: string; client: string } | { ok: false; reason: "limit" | "no_ip"; retryAfter: number; client?: string } {
   if (typeof req.ip !== "string" || req.ip.trim() === "") return { ok: false, reason: "no_ip", retryAfter: 3600 };
+  const rateStore = rateStores[host];
   const key = rateStore.clientKey(req.ip);
   const client = logClientId(key);
   const wait = rateStore.retryAfterSeconds(key);
@@ -259,8 +344,8 @@ export function contactFormRateCheck(req: Request): { ok: true; key: string; cli
   return { ok: true, key, client };
 }
 
-export function contactFormRecordSend(key: string): void {
-  rateStore.record(key);
+export function contactFormRecordSend(key: string, host: ContactFormHost = "rfb"): void {
+  rateStores[host].record(key);
 }
 
 /** One JSON log line: profile id, outcome, hashed client — never an address, an IP or the text. */
@@ -270,7 +355,7 @@ export function logContactFormEvent(fields: { outcome: string; profile_id?: stri
 
 /** Test-only: a fresh limit store (optionally with a clock), log sink and sender. */
 export function __resetContactFormForTesting(opts: ContactFormRateStoreOptions & { log?: (line: string) => void; sender?: ContactFormSender } = {}): void {
-  rateStore = new ContactFormRateStore(opts);
+  rateStores = { rfb: new ContactFormRateStore(opts), dental: new ContactFormRateStore(opts) };
   logLine = opts.log ?? ((line) => console.log(line));
   sender = opts.sender ?? ((o) => emailService.sendEmail(o));
 }

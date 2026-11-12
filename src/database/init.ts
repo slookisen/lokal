@@ -2545,6 +2545,29 @@ function initSchema(db: Database.Database): void {
     // best-effort
   }
 
+  // ─── dev-request 2026-11-11-verifier-ny-verifisering-og-delta-ledd (slice B)
+  // — append-only log of "this verifier run set this agent to verified". One
+  // row per verified outcome, written only by applyVerifierOutcome
+  // (lokal-agent-verifier.ts), keyed on the run's runStartedAt. Read by
+  // GET /admin/verifier/claim-counts?kind=agents_verified (delta mode) so the
+  // per-run agents_verified claim is probed against what the run actually
+  // did, not against agent_knowledge's CURRENT status/last_verified_at, which
+  // later runs overwrite. Purely observational, no gate reads it.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS verifier_verified_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        run_started_at TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_verifier_verified_events_run
+        ON verifier_verified_events(run_started_at);
+    `);
+  } catch {
+    // best-effort
+  }
+
   // ─── dev-request 2026-09-01-rfb-pending-verify-unpark-lever (Daniel Alternativ B,
   // 2026-09-02) — dedikert ferskhetskolonne for unpark-leverens filter, FRIKOBLET fra
   // agent_knowledge.updated_at (som 3 reviewrunder viste IKKE er et pålitelig
@@ -3311,6 +3334,144 @@ function initSchema(db: Database.Database): void {
     );
   } catch (err) {
     console.error("Migration idx_crm_outbox_result_id_norm failed:", err);
+  }
+
+  // ─── CS på serveren, S2: reply proposals (dev-request 2026-11-10-cs-paa-serveren) ──
+  // The CS routine writes proposals; the server sends them (or parks them in
+  // the approval queue with the reason). No CHECK constraints on purpose: the
+  // status/kind vocabulary is validated in code (cs-reply-proposals.ts), so a
+  // new value never needs a table rebuild.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS cs_reply_proposals (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        vertical TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        to_email TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        body_text TEXT NOT NULL,
+        body_html TEXT,
+        in_reply_to TEXT,
+        answers_message_id TEXT,
+        change_request_ids TEXT NOT NULL DEFAULT '[]',
+        evidence TEXT,
+        created_by TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        block_reason TEXT,
+        block_detail TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        lease_until TEXT,
+        next_attempt_at TEXT,
+        outbox_id TEXT,
+        crm_message_id TEXT,
+        smtp_message_id TEXT,
+        last_error TEXT,
+        decided_by TEXT,
+        decided_at TEXT,
+        decision_note TEXT,
+        sent_at TEXT,
+        sent_mode TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_cs_reply_proposals_status ON cs_reply_proposals(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_cs_reply_proposals_thread ON cs_reply_proposals(thread_id);
+      CREATE INDEX IF NOT EXISTS idx_cs_reply_proposals_to_sent ON cs_reply_proposals(to_email, sent_at);
+    `);
+  } catch (err) {
+    console.error("Migration cs_reply_proposals failed:", err);
+  }
+
+  // ─── CS på serveren, S3: Resend's delivery verdict per CRM message ──
+  // Side table instead of new crm_messages.delivery_status values: widening
+  // that CHECK would mean rebuilding crm_messages and its triggers.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS crm_message_delivery (
+        crm_message_id TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        event_type TEXT,
+        detail TEXT,
+        svix_id TEXT,
+        event_at TEXT,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_crm_message_delivery_status ON crm_message_delivery(status, updated_at);
+    `);
+  } catch (err) {
+    console.error("Migration crm_message_delivery failed:", err);
+  }
+
+  // ─── CS på serveren, S5: contact form — rejected submissions per day
+  // (no personal data: day, platform, reason, count) and the receipt log
+  // (one automatic receipt per address per 24 h).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS contact_form_rejections (
+        day TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (day, platform, reason)
+      );
+      CREATE TABLE IF NOT EXISTS contact_form_receipts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        thread_id TEXT,
+        outcome TEXT NOT NULL,
+        sent_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_contact_form_receipts_email ON contact_form_receipts(email, sent_at);
+    `);
+  } catch (err) {
+    console.error("Migration contact_form tables failed:", err);
+  }
+
+  // ─── CS på serveren, S4: change requests (profile_update / removal),
+  // executed and verified by the server (services/cs-change-requests.ts).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS cs_change_requests (
+        id TEXT PRIMARY KEY,
+        vertical TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        target_name TEXT,
+        thread_id TEXT,
+        requester_email TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        changes TEXT NOT NULL DEFAULT '{}',
+        evidence TEXT,
+        authority TEXT NOT NULL,
+        status TEXT NOT NULL,
+        status_reason TEXT,
+        steps TEXT NOT NULL DEFAULT '[]',
+        snapshot TEXT,
+        blocklist_ids TEXT NOT NULL DEFAULT '[]',
+        cross_vertical TEXT,
+        created_by TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        executed_at TEXT,
+        hidden_at TEXT,
+        delete_after TEXT,
+        deleted_at TEXT,
+        verified_at TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        blocklist_plan TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_cs_change_requests_status ON cs_change_requests(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_cs_change_requests_thread ON cs_change_requests(thread_id);
+    `);
+  } catch (err) {
+    console.error("Migration cs_change_requests failed:", err);
+  }
+  // A database built from an earlier S4 commit has no blocklist_plan yet.
+  try {
+    db.exec("ALTER TABLE cs_change_requests ADD COLUMN blocklist_plan TEXT");
+  } catch {
+    /* already exists — expected */
   }
 
   // ─── M1 (Phase 5.4a): agent_knowledge_audit ─────────────────
@@ -4838,6 +4999,41 @@ function initSchema(db: Database.Database): void {
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_contact_clicks_agent_id ON contact_clicks(agent_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_contact_clicks_created_at ON contact_clicks(created_at)`);
+
+  // dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord, slice S4:
+  // profile_link_clicks — the contact_clicks twin for the outgoing links on
+  // the Opplevagent (opplevelse / tilbyder / gårdssalg produsent) and
+  // Finn-tannlege (klinikk) profile pages: GET /ut/:surface/:id/:kind on the
+  // vertical's host and POST /api/track/profile-click
+  // (services/profile-link-clicks.ts). A sibling table rather than new
+  // contact_clicks columns, so every RFB reader of contact_clicks (owner
+  // stats, partner report, S3 admin numbers) keeps counting only RFB.
+  // Brand-new table → CREATE IF NOT EXISTS is the whole migration.
+  //   platform    : 'opplevelser' | 'gardssalg' | 'tannlege'
+  //   entity_type : 'experience' | 'provider' | 'clinic'; entity_id its id in
+  //                 the vertical DB (no FK — another database)
+  //   provider_id : the provider / clinic that owns the link
+  //   kind        : 'booking' | 'website' | 'directory' (redirect) or
+  //                 'phone' | 'email' (beacon). Never a URL.
+  //   session_id / is_bot : exactly as contact_clicks (hashed-IP session,
+  //                 parseUserAgent bot flag) — no new personal data.
+  //   is_test     : 1 when the provider is a test provider
+  //                 (experience_providers.is_test_provider = 1) at click time.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS profile_link_clicks (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      platform    TEXT NOT NULL,
+      entity_type TEXT NOT NULL,
+      entity_id   TEXT NOT NULL,
+      provider_id TEXT,
+      kind        TEXT NOT NULL,
+      session_id  TEXT,
+      is_bot      INTEGER NOT NULL DEFAULT 0,
+      is_test     INTEGER NOT NULL DEFAULT 0,
+      created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_profile_link_clicks_platform_created ON profile_link_clicks(platform, created_at)`);
 
   // B4: where the visitor who clicked came from (utm_source on the landing
   // URL / same-origin Referer). Nullable, additive; metadata-only ALTER.

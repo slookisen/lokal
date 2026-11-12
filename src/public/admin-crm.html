@@ -230,6 +230,7 @@ body[data-vertical="rfb"] .topbar{border-bottom:2px solid #4ade80}
       <span class="kpi" id="kpiP0" style="display:none"><span class="num">0</span> P0</span>
       <span class="kpi"><span class="num" id="kpiNew">0</span> nye</span>
       <span class="kpi warn clickable" data-action="openNeedsReply" title="Tråder der siste inngående melding er nyere enn siste svar (CS på serveren)"><span class="num" id="kpiNeedsReply">0</span> trenger svar<span id="kpiNeedsReplyP0" style="display:none"> · <span class="num">0</span> &gt;24 t</span></span>
+      <span class="kpi clickable" data-action="openApprovalQueue" title="Svarforslag som serveren stoppet — send, endre eller avvis (CS på serveren, S2)"><span class="num" id="kpiApproval">0</span> venter på godkjenning</span>
       <span class="kpi warn clickable" data-action="openAwaiting" title="Vis tråder som venter på Daniel"><span class="num" id="kpiAwait">0</span> venter</span>
       <span class="kpi"><span class="num" id="kpiOutbox">0</span> i kø</span>
       <button class="btn-sm" data-action="refresh">↻ Oppdater</button>
@@ -704,6 +705,12 @@ async function loadSummary() {
     if (nr.counts.p0 > 0) { p0.querySelector('.num').textContent = nr.counts.p0; p0.style.display = 'inline'; }
     else { p0.style.display = 'none'; }
   } catch (e) { /* older server without /needs-reply — keep the KPI at 0 */ }
+  try {
+    const q = await api('/reply-proposals?status=approval_needed&limit=500');
+    let ch = 0;
+    try { ch = (await apiCs('/change-requests?status=approval_needed&limit=500')).items.length; } catch (e) { ch = 0; }
+    document.getElementById('kpiApproval').textContent = q.items.length + ch;
+  } catch (e) { /* older server without S2 — keep the KPI at 0 */ }
 }
 
 function onSearchChange() {
@@ -848,7 +855,7 @@ async function selectThread(id) {
             </select>
           </span>
         </div>
-        ${messages.map(m => renderMessage(m)).join('')}
+        ${messages.map(m => renderMessage(m, (data.deliveries || {})[m.id])).join('')}
       </div>
 
       <div class="compose">
@@ -874,8 +881,12 @@ async function selectThread(id) {
   } catch (e) { toast(e.message, true); }
 }
 
-function renderMessage(m) {
+const DELIVERY_LABEL = { delivered: 'levert', bounced: 'kom ikke fram (bounce)', complained: 'merket som spam', soft_bounced: 'midlertidig avvist' };
+function renderMessage(m, delivery) {
   const initial = (m.from_email || '?').charAt(0).toUpperCase();
+  const dTag = delivery
+    ? `<span class="pill${delivery.status === 'bounced' || delivery.status === 'complained' ? ' p0' : ''}" title="${escapeHtml(delivery.detail || '')}">${escapeHtml(DELIVERY_LABEL[delivery.status] || delivery.status)}</span>`
+    : '';
   const body = m.body_text || m.snippet || '(ingen tekst)';
   const long = body.length > 400;
   return `
@@ -884,7 +895,7 @@ function renderMessage(m) {
       <div class="content">
         <div class="meta-row">
           <span><strong>${escapeHtml(m.from_email)}</strong></span>
-          <span>${fmtFull(m.sent_at || m.received_at)}</span>
+          <span>${dTag} ${fmtFull(m.sent_at || m.received_at)}</span>
         </div>
         <div class="body${long ? ' collapsed' : ''}" id="msg-${m.id}">${escapeHtml(body)}</div>
         ${long ? `<span class="show-more" data-action="toggleMsg" data-id="${m.id}">Vis mer ▾</span>` : ''}
@@ -1035,6 +1046,7 @@ async function openNeedsReply() {
             <span class="pill">${escapeHtml(PLATFORM_LABEL[t.vertical] || t.vertical)}</span>
             ${lvl}
             <span style="color:var(--text-dim)">Status: ${escapeHtml(t.status)}</span>
+            ${t.proposal ? `<span class="pill" title="${escapeHtml(t.proposal.block_reason || '')}">Svarforslag: ${escapeHtml(PROPOSAL_STATUS_LABEL[t.proposal.status] || t.proposal.status)}</span>` : ''}
           </div>
           <div class="actions">
             <button class="btn-secondary" data-action="markNoReplyNeeded" data-id="${escapeHtml(t.thread_id)}" title="Marker at tråden ikke trenger svar (begrunnelse kreves)">Trenger ikke svar</button>
@@ -1060,6 +1072,206 @@ async function openNeedsReply() {
   } catch (e) {
     list.innerHTML = `<div class="await-empty" style="color:var(--danger)">Feil: ${escapeHtml(e.message)}</div>`;
   }
+}
+
+// ─── CS på serveren, S2: godkjenningskø ────────────────────────────
+const PROPOSAL_STATUS_LABEL = {
+  pending: 'venter på sending', approval_needed: 'venter på godkjenning', approved: 'godkjent', sending: 'sendes',
+  sent: 'sendt', failed: 'feilet', rejected: 'avvist', superseded: 'erstattet',
+};
+const BLOCK_REASON_LABEL = {
+  autosending_av: 'Automatisk sending er av',
+  kind_krever_godkjenning: 'Typen sendes ikke automatisk',
+  endring_mangler: 'Bekrefter en endring, men ingen endring er koblet til',
+  endring_ikke_verifisert: 'Endringen er ikke verifisert som utført',
+  feil_merkevare: 'Nevner en annen plattform',
+  tegnsett: 'Feil i æøå / tegnsett',
+  mottaker_avvist: 'Mottakeren har bounce/klage',
+  duplikat: 'Samme tekst er allerede sendt',
+  kvote_mottaker: 'Svarkvote for mottakeren brukt opp',
+  kvote_dag: 'Dagens svarkvote brukt opp',
+  transport_ikke_live: 'E-post er i tørrkjøring',
+  ny_melding_etter_forslag: 'Kunden har skrevet igjen etter forslaget',
+  mottaker_endret: 'Siste melding er fra en annen adresse',
+  ingen_innkommende: 'Ingen melding fra kunden i tråden',
+  traad_mangler: 'Tråden finnes ikke',
+  feil_plattform: 'Feil plattform',
+  endret: 'Endret av deg',
+  sending_feilet: 'Sendingen feilet',
+  venter_paa_endring: 'Venter på at endringen blir bekreftet',
+  mottaker_ikke_kontakt: 'Siste melding er fra en annen enn trådens kontakt',
+  mottaker_er_egen_adresse: 'Mottakeren er en av våre egne adresser',
+  endring_feil_traad: 'Koblet endring gjelder en annen tråd',
+  ukjent_utfall: 'Sendingen ble avbrutt — kan ha blitt levert',
+  lagring_feilet: 'Kunne ikke lagre sendingen',
+};
+const UI_HEADERS = { 'X-Admin-Client': 'admin-crm' };
+
+async function apiCs(path, opts = {}) {
+  const res = await fetch('/admin/cs' + path, {
+    ...opts,
+    headers: { ...(opts.headers || {}), ...UI_HEADERS, 'X-Admin-Key': adminKey, ...(opts.body ? { 'Content-Type': 'application/json' } : {}) }
+  });
+  if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
+const CHANGE_STATUS_LABEL = {
+  approval_needed: 'venter på deg', queued: 'i kø', executing: 'utføres nå', executed: 'utført, kontrolleres', hidden: 'skjult — slettes etter 24 t', deleting: 'slettes nå',
+  verified: 'utført og bekreftet', verify_failed: 'ikke bekreftet på siden', failed: 'feilet', cancelled: 'angret', rejected: 'avvist',
+};
+
+function renderChangeRequest(c) {
+  const id = escapeHtml(c.id);
+  let changes = '';
+  try { const ch = JSON.parse(c.changes || '{}'); changes = Object.entries(ch).map(([k, v]) => `${escapeHtml(k)}: «${escapeHtml(v)}»`).join('<br>'); } catch (e) { changes = ''; }
+  const buttons = c.status === 'approval_needed'
+    ? `<button class="btn-secondary" data-action="rejectChange" data-id="${id}">Avvis</button>
+       <button class="btn-primary" data-action="approveChange" data-id="${id}">Godkjenn og utfør</button>`
+    : c.status === 'hidden'
+    ? `<button class="btn-secondary" data-action="cancelChange" data-id="${id}">Angre fjerning</button>`
+    : '';
+  return `
+    <div class="await-row">
+      <div class="row-top">
+        <div class="subject">${c.kind === 'removal' ? 'Fjerning' : 'Endring'}: ${escapeHtml(c.target_name || c.target_id)}</div>
+        <div class="when">${Math.floor(c.age_hours)} t</div>
+      </div>
+      <div class="from"><span class="name">Fra: ${escapeHtml(c.requester_email)}</span></div>
+      <div class="meta">
+        <span class="pill">${escapeHtml(PLATFORM_LABEL[c.vertical] || c.vertical)}</span>
+        <span class="pill">${escapeHtml(CHANGE_STATUS_LABEL[c.status] || c.status)}</span>
+        ${c.status_reason ? `<span style="color:var(--danger)">${escapeHtml(c.status_reason)}</span>` : ''}
+      </div>
+      ${changes ? `<div class="from" style="margin-top:6px">${changes}</div>` : ''}
+      <div class="actions">${buttons}</div>
+    </div>`;
+}
+
+async function approveChange(id) {
+  if (!confirm('Utføre denne endringen nå? (fjerning: profilen skjules straks og slettes etter 24 t)')) return;
+  try { const r = await apiCs('/change-requests/' + encodeURIComponent(id) + '/approve', { method: 'POST', body: '{}' }); toast(r.note || 'Godkjent — utføres av serveren'); }
+  catch (e) { toast(e.message, true); }
+  await openApprovalQueue();
+}
+async function rejectChange(id) {
+  const reason = prompt('Hvorfor avvises forespørselen?');
+  if (!reason || !reason.trim()) return;
+  try { await apiCs('/change-requests/' + encodeURIComponent(id) + '/reject', { method: 'POST', body: JSON.stringify({ reason: reason.trim() }) }); toast('Avvist'); }
+  catch (e) { toast(e.message, true); }
+  await openApprovalQueue();
+}
+async function cancelChange(id) {
+  const reason = prompt('Hvorfor angres fjerningen? (profilen blir synlig igjen, sperrene fjernes)');
+  if (!reason || !reason.trim()) return;
+  try { await apiCs('/change-requests/' + encodeURIComponent(id) + '/cancel', { method: 'POST', body: JSON.stringify({ reason: reason.trim() }) }); toast('Fjerningen er angret'); }
+  catch (e) { toast(e.message, true); }
+  await openApprovalQueue();
+}
+
+async function openApprovalQueue() {
+  document.getElementById('awaitOverlay').style.display = 'flex';
+  document.getElementById('awaitTitle').textContent = 'Godkjenningskø';
+  document.getElementById('awaitSubtitle').textContent = 'Svarforslag serveren ikke sendte selv. Send, endre eller avvis. Eldst først.';
+  const list = document.getElementById('awaitList');
+  list.innerHTML = '<div class="await-empty">Laster…</div>';
+  try {
+    const q = await api('/reply-proposals?status=approval_needed&limit=200');
+    const failedQ = await api('/reply-proposals?status=failed&limit=100');
+    const approvedQ = await api('/reply-proposals?status=approved&limit=100');
+    const items = [...q.items, ...failedQ.items, ...approvedQ.items.filter(p => p.age_hours > 0.25)];
+    const rows = items.map(p => {
+      const old = p.age_hours > 48 ? '<span class="pill p0">&gt;48 t</span>' : '';
+      const reason = BLOCK_REASON_LABEL[p.block_reason] || p.block_reason || '';
+      const id = escapeHtml(p.id);
+      return `
+        <div class="await-row" id="prop-${id}">
+          <div class="row-top">
+            <div class="subject">${escapeHtml(p.thread_subject || p.subject)}</div>
+            <div class="when" title="${escapeHtml(fmtFull(p.created_at))}">${Math.floor(p.age_hours)} t</div>
+          </div>
+          <div class="from"><span class="name">Til: ${escapeHtml(p.contact_name || p.to_email)}</span> · ${escapeHtml(p.to_email)}</div>
+          <div class="meta">
+            <span class="pill">${escapeHtml(PLATFORM_LABEL[p.vertical] || p.vertical)}</span>
+            <span class="pill">${escapeHtml(p.kind)}</span>
+            ${old}
+            <span style="color:var(--danger)" title="${escapeHtml(p.block_detail || '')}">Stoppet: ${escapeHtml(reason)}</span>
+          </div>
+          <input class="prop-subject" data-pid="${id}" value="${escapeHtml(p.subject)}" style="width:100%;margin-top:6px" aria-label="Emne">
+          <textarea class="prop-body" data-pid="${id}" rows="8" style="width:100%;margin-top:6px" aria-label="Svartekst">${escapeHtml(p.body_text)}</textarea>
+          <div class="actions">
+            <button class="btn-secondary" data-action="rejectProposal" data-id="${id}">Avvis</button>
+            <button class="btn-secondary" data-action="saveProposal" data-id="${id}">Lagre endring</button>
+            <button class="btn-secondary" data-action="openThreadFromAwait" data-id="${escapeHtml(p.thread_id)}" data-contact="${escapeHtml(p.contact_id || '')}" data-type="${escapeHtml(p.contact_type || 'unknown')}">Åpne tråd →</button>
+            ${p.status === 'approval_needed' || (p.status === 'failed' && p.block_reason !== 'ukjent_utfall')
+              ? `<button class="btn-primary" data-action="approveProposal" data-id="${id}" data-reason="${escapeHtml(p.block_reason || '')}">Send</button>`
+              : `<span style="color:var(--text-dim)">${p.status === 'failed' ? 'Kan ha blitt sendt — sjekk tråden før noe sendes på nytt' : 'Godkjent, men ikke sendt'}</span>`}
+          </div>
+        </div>`;
+    });
+    try {
+      const waiting = await apiCs('/change-requests?status=approval_needed&limit=200');
+      const hidden = await apiCs('/change-requests?status=hidden&limit=200');
+      const failedCh = await apiCs('/change-requests?status=verify_failed&limit=50');
+      const chRows = [...waiting.items, ...hidden.items, ...failedCh.items].map(renderChangeRequest);
+      if (chRows.length) rows.push('<div class="await-empty" style="text-align:left;font-weight:600">Endringer og fjerninger</div>', ...chRows);
+    } catch (e) { /* older server without S4 */ }
+    list.innerHTML = rows.length ? rows.join('') : '<div class="await-empty">Ingen svarforslag eller endringer venter \u2728</div>';
+  } catch (e) {
+    list.innerHTML = `<div class="await-empty" style="color:var(--danger)">Feil: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function proposalEdits(pid) {
+  const subj = document.querySelector(`.prop-subject[data-pid="${CSS.escape(pid)}"]`);
+  const body = document.querySelector(`.prop-body[data-pid="${CSS.escape(pid)}"]`);
+  const edits = {};
+  if (subj && subj.value !== subj.defaultValue) edits.subject = subj.value;
+  if (body && body.value !== body.defaultValue) edits.bodyText = body.value;
+  return edits;
+}
+
+async function approveProposal(pid, _val, el) {
+  const reason = el?.dataset?.reason || '';
+  const body = proposalEdits(pid);
+  if (reason === 'ny_melding_etter_forslag') {
+    if (!confirm('Kunden har skrevet igjen etter at forslaget ble laget. Har du lest den nye meldingen (Åpne tråd), og skal dette svaret likevel sendes?')) return;
+    body.acknowledgeNewerInbound = true;
+  } else if (!confirm('Sende dette svaret til kunden nå?')) return;
+  try {
+    // Read the body also on 409 (not sent): it carries the reason.
+    const res = await fetch(API + '/reply-proposals/' + encodeURIComponent(pid) + '/approve', {
+      method: 'POST',
+      headers: { ...UI_HEADERS, 'X-Admin-Key': adminKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const r = await res.json().catch(() => ({}));
+    if (r.sent) toast('Sendt');
+    else toast('Ikke sendt: ' + (BLOCK_REASON_LABEL[r.result?.reason] || r.result?.detail || r.error || res.status), true);
+  } catch (e) { toast(e.message, true); }
+  await refresh();
+  await openApprovalQueue();
+}
+
+async function saveProposal(pid) {
+  const edits = proposalEdits(pid);
+  if (!Object.keys(edits).length) { toast('Ingen endring'); return; }
+  try {
+    await api('/reply-proposals/' + encodeURIComponent(pid) + '/edit', { method: 'POST', headers: UI_HEADERS, body: JSON.stringify(edits) });
+    toast('Lagret — trykk Send når du er klar');
+  } catch (e) { toast(e.message, true); }
+  await openApprovalQueue();
+}
+
+async function rejectProposal(pid) {
+  const reason = prompt('Hvorfor avvises forslaget? (tråden blir stående i «Trenger svar»)');
+  if (!reason || !reason.trim()) return;
+  try {
+    await api('/reply-proposals/' + encodeURIComponent(pid) + '/reject', { method: 'POST', headers: UI_HEADERS, body: JSON.stringify({ reason: reason.trim(), actor: 'daniel' }) });
+    toast('Avvist');
+  } catch (e) { toast(e.message, true); }
+  await refresh();
+  await openApprovalQueue();
 }
 
 async function markNoReplyNeeded(threadId) {
@@ -1187,6 +1399,13 @@ const ACTIONS = {
   openAwaiting,
   openNeedsReply,
   markNoReplyNeeded: id => markNoReplyNeeded(id),
+  openApprovalQueue,
+  approveProposal: (id, val, el) => approveProposal(id, val, el),
+  saveProposal: id => saveProposal(id),
+  rejectProposal: id => rejectProposal(id),
+  approveChange: id => approveChange(id),
+  rejectChange: id => rejectChange(id),
+  cancelChange: id => cancelChange(id),
   closeAwait,
   openThreadFromAwait: (id, _val, el) => {
     const contact = el?.dataset?.contact;

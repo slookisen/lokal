@@ -27,7 +27,8 @@
 //   - Columns: by default cell 0 = name, 1 = category, 2 = price,
 //     3 = availability. When a header row is present its cells decide the
 //     columns instead (produkt/navn → name, kategori → category, pris →
-//     price, tilgjengelighet → availability).
+//     price, tilgjengelighet / sesong → availability, whose meaningful
+//     value goes to `note` — see «Availability» under split below).
 //   - removed_header: a tab row with >= 2 non-empty cells that are ALL known
 //     column-header words (HEADER_WORDS).
 //   - removed_alcohol: the raw row matches ALCOHOL_RE (cognac, aquavit,
@@ -150,6 +151,7 @@ const HEADER_WORDS: Readonly<Record<string, Column | null>> = {
   kategori: "category", type: "category",
   pris: "price", "pris (kr)": "price", "pris kr": "price",
   tilgjengelighet: "availability", tilgjengelig: "availability",
+  sesong: "availability", sesonger: "availability", sesongvare: "availability",
   enhet: null, beskrivelse: null, merknad: null, kommentar: null,
 };
 

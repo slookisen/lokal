@@ -159,6 +159,10 @@ export async function runHostGateRateLimitTests(opts: { log?: boolean } = {}): P
     ["w2", expRouter, "get", "/for-tilbydere/finn", "experiences-seo.ts GET /for-tilbydere/finn"],
     ["w3", expRouter, "post", "/kategori/gardssalg/book/:providerSlug", "experiences-seo.ts POST /kategori/gardssalg/book/:providerSlug"],
     ["w4", dentalRouter, "get", "/sok", "dental-seo.ts GET /sok"],
+    // S4 (dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord): the counting
+    // redirects on the two vertical hosts never reach index.ts's app.use("/ut", generalLimiter).
+    ["w9", expRouter, "get", "/ut/:surface/:id/:kind", "experiences-seo.ts GET /ut/:surface/:id/:kind"],
+    ["w10", dentalRouter, "get", "/ut/:surface/:id/:kind", "dental-seo.ts GET /ut/:surface/:id/:kind"],
   ];
   for (const [id, router, method, routePath, label] of wired) {
     const layers = routeLayers(router, method, routePath);
@@ -188,10 +192,10 @@ export async function runHostGateRateLimitTests(opts: { log?: boolean } = {}): P
 
   // ── g1-g4: scope guard ────────────────────────────────────────────────
   assertEq(limitedRoutes(expRouter, generalLimiter),
-    ["GET /for-tilbydere/finn", "GET /reise", "GET /sok", "POST /kategori/gardssalg/book/:providerSlug"],
-    "g1: experiences-seo.ts — generalLimiter sits on exactly /sok, /reise, /for-tilbydere/finn and the booking form post");
-  assertEq(limitedRoutes(dentalRouter, generalLimiter), ["GET /sok"],
-    "g2: dental-seo.ts — generalLimiter sits on exactly GET /sok (no sitemap, robots, llms.txt, agent-card or indexable page)");
+    ["GET /for-tilbydere/finn", "GET /reise", "GET /sok", "GET /ut/:surface/:id/:kind", "POST /kategori/gardssalg/book/:providerSlug"],
+    "g1: experiences-seo.ts — generalLimiter sits on exactly /sok, /reise, /for-tilbydere/finn, /ut/:surface/:id/:kind and the booking form post");
+  assertEq(limitedRoutes(dentalRouter, generalLimiter), ["GET /sok", "GET /ut/:surface/:id/:kind"],
+    "g2: dental-seo.ts — generalLimiter sits on exactly GET /sok and GET /ut/:surface/:id/:kind (no sitemap, robots, llms.txt, agent-card or indexable page)");
   assertTrue(!expRouter.stack.some((l) => !l.route && l.handle === generalLimiter),
     "g3: experiences-seo.ts has no router-wide generalLimiter (crawler-facing pages stay unlimited)");
   assertTrue(!dentalRouter.stack.some((l) => !l.route && l.handle === generalLimiter),
@@ -218,8 +222,8 @@ export async function runHostGateRateLimitTests(opts: { log?: boolean } = {}): P
         }
       }
     }
-    assertTrue(checked === 6 && uncounted.length === 0,
-      `a1: ac2LimitersFor counts all 6 route-level generalLimiter paths on the SEO routers as general (checked ${checked}, uncounted ${JSON.stringify(uncounted)})`);
+    assertTrue(checked === 8 && uncounted.length === 0,
+      `a1: ac2LimitersFor counts all 8 route-level generalLimiter paths on the SEO routers as general (checked ${checked}, uncounted ${JSON.stringify(uncounted)})`);
   }
 
   // ── i1-i5: index.ts order (source inspection) ────────────────────────
