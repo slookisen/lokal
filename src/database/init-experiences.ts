@@ -2084,6 +2084,19 @@ export function initExperiencesSchema(db: Database.Database): void {
     db.exec("ALTER TABLE experience_providers ADD COLUMN terminal_status TEXT DEFAULT NULL");
   } catch { /* already present */ }
 
+  // ─── dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
+  // S-D3b («Kontaktskjema som valg per profil», opplevagent.no) ─────────────
+  // contact_form_only: 1 = the producer asked that its e-mail is not shown;
+  // with CONTACT_FORM_EXPERIENCES on, the gårdssalg producer page shows a
+  // contact form instead (services/experiences-contact-form-only.ts). DEFAULT
+  // 0, so every existing row is a no-op; GARDSSALG_PROVIDER_COLUMNS does not
+  // list it, so no answer carries it. Only writer: POST
+  // /admin/experiences/providers/:id/contact-form-only. Read only while the
+  // switch is on. Rollback: switch off (the column is additive).
+  try {
+    db.exec("ALTER TABLE experience_providers ADD COLUMN contact_form_only INTEGER NOT NULL DEFAULT 0");
+  } catch { /* already present */ }
+
   // ─── experiences.evidence_url_verification (dev-request 2026-08-24-
   // evidence-url-verifisering-gate) ───────────────────────────────────────
   // `experiences.evidence_url` (the citation substantiating that a specific

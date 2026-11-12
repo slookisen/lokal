@@ -52905,6 +52905,9 @@ runSerial(async () => {
 // S-D3a does the same per clinic on finn-tannlege.com (CONTACT_FORM_DENTAL:
 // the form on the clinic pages, POST /klinikk/id/:id/kontakt, the e-mail left
 // out of REST, A2A and MCP tannlege_info).
+// S-D3b does it per gårdssalg producer on opplevagent.no
+// (CONTACT_FORM_EXPERIENCES: the form on /kategori/gardssalg/produsent/:slug,
+// «Vis e-post» 404, POST …/:slug/kontakt; MCP and A2A untouched).
 // Switch off = byte-identical answers. Sets env
 // flags and swaps the dental db-factory (restored in finally) — runSerial,
 // tail position.
@@ -52935,6 +52938,8 @@ runSerial(async () => {
     ["rfb contact form only s-d2", () => (require("../src/routes/rfb-contact-form-only-sd2.test") as typeof import("../src/routes/rfb-contact-form-only-sd2.test")).runRfbContactFormOnlySd2Tests({ log: false })],
     // S-D3a: the same option per clinic on finn-tannlege.com — dental_agents.contact_form_only (admin POST /admin/dental/agents/:id/contact-form-only), the form on /klinikk/:slug + /klinikk/id/:id, «Vis e-post» 404, POST /klinikk/id/:id/kontakt, and the e-mail left out of REST /api/tannlege/agents[/:id], A2A message/send and MCP tannlege_info (CONTACT_FORM_DENTAL; switch off = byte-identical; stubbed sender, no network).
     ["dental contact form only", () => (require("../src/routes/dental-contact-form-only.test") as typeof import("../src/routes/dental-contact-form-only.test")).runDentalContactFormOnlyTests({ log: false })],
+    // S-D3b: the same option per gårdssalg producer on opplevagent.no — experience_providers.contact_form_only (admin POST /admin/experiences/providers/:id/contact-form-only), the form on /kategori/gardssalg/produsent/:providerSlug, «Vis e-post» 404, POST …/:providerSlug/kontakt (CONTACT_FORM_EXPERIENCES; switch off = byte-identical; per-host rate store; stubbed sender, no network; MCP/A2A untouched).
+    ["experiences contact form only", () => (require("../src/routes/experiences-contact-form-only.test") as typeof import("../src/routes/experiences-contact-form-only.test")).runExperiencesContactFormOnlyTests({ log: false })],
   ] as Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]>) {
     try {
       const r = await load();
