@@ -29,7 +29,7 @@
 import Database from "better-sqlite3";
 import {
   type RegistrationPrecheckDeps, type RegistrationPrecheckInput, BRREG_ENHET_URL, assessRegistration,
-  precheckNameMatches, readBrregEnhet, registrationPrecheckEnabled,
+  domainTiesToName, precheckNameMatches, readBrregEnhet, registrationPrecheckEnabled,
 } from "./registration-precheck";
 
 export interface TestSummary {
@@ -130,6 +130,7 @@ function baseInput(over: Partial<RegistrationPrecheckInput> = {}): RegistrationP
     url: "https://solbakkengard.no",
     city: "Mesnali",
     orgNr: ORG,
+    orgNrSelfReported: true,
     duplicates: { exact_ids: [], exact_vetted_ids: [], name_place_ids: [] },
     ownerClaimConfirmed: false,
     ...over,
@@ -165,6 +166,19 @@ export async function runRegistrationPrecheckTests(opts: { log?: boolean } = {})
   ok(precheckNameMatches("Solbakken Gård", "Solbakken Gård Kari Nordmann"), "name: ENK with owner name");
   ok(!precheckNameMatches("Gård", "Solbakken Gård"), "name: generic word alone never matches");
   ok(!precheckNameMatches("Solbakken Gård", "Nordbakken Gård AS"), "name: different farm");
+  ok(!precheckNameMatches("Gård", "GÅRD AS"), "name R2: equal after normalisation but only generic → no match");
+  ok(!precheckNameMatches("Nordre Hansen Gård", "HANSEN"), "name R2: lone Brreg token inside a longer profile name → no match");
+  ok(!precheckNameMatches("Bø Gård", "BØ GÅRD AS"), "name R2: no non-generic token of ≥4 letters → no match");
+  ok(precheckNameMatches("Hansen Bakeri", "HANSEN BAKERI AS"), "name R2: legit exact company name still matches");
+  ok(precheckNameMatches("Nordre Hansen Gård", "Nordre Hansen Gård DA"), "name R2: near-exact name with company form matches");
+  ok(precheckNameMatches("Lille Hansen Bakeri Hamar", "HANSEN BAKERI AS"), "name R2: ≥2 Brreg tokens inside a longer profile name match");
+  ok(domainTiesToName("www.solbakken-gard.no", ["Solbakken Gård"]), "tie: hyphenated domain label carries the name token");
+  ok(domainTiesToName("mail.bjorkely.no", ["Bjørkely Gård AS"]), "tie: Norwegian letters folded (ø → o)");
+  ok(domainTiesToName("bjoerkely.no", ["Bjørkely Gård AS"]), "tie: ASCII spelling oe folded");
+  ok(domainTiesToName("gardenbjorkely.no", ["Bjørkely Gård AS"]), "tie: label ending with the token ties");
+  ok(!domainTiesToName("gardsmat.no", ["Solbakken Gård"]), "tie: generic-only label does not tie");
+  ok(!domainTiesToName("makarios.com", ["Kari Hansen"]), "tie B2: token inside the label (substring) does not tie");
+  ok(!domainTiesToName("lie.no", ["Lie Gård AS"]) && !domainTiesToName("liegard.no", ["Lie Gård AS"]), "tie: a 3-letter token never ties");
   const e = readBrregEnhet(brregEnhet());
   eq([e.orgNr, e.nace, e.kommune, e.kommunenummer, e.deleted, e.konkurs, e.underAvvikling],
     [ORG, "01.410", "RINGSAKER", "3411", false, false, false], "readBrregEnhet: real fixture fields");
@@ -175,7 +189,12 @@ export async function runRegistrationPrecheckTests(opts: { log?: boolean } = {})
     const calls: string[] = [];
     const r = await run({}, {}, calls);
     eq(r.recommendation, "godkjenn", "G1: org.nr found + name + own domain MX → godkjenn");
-    eq(r.rule_version, "R1", "G1: rule version");
+    eq(r.rule_version, "R2", "G1: rule version (R2 after the self-reported org.nr hardening)");
+    eq([r.signals.brreg.org_nr_self_reported, r.signals.domain_tie.required, r.signals.domain_tie.tied], [true, true, true],
+      "G1: tag org.nr is self-reported; domain tied to the name");
+    ok(r.reasons.includes("Brreg: org.nr er selvoppgitt"), "G1: self-reported reason");
+    ok(r.reasons.includes("Domene: knyttet til enheten"), "G1: domain-tie reason");
+    eq(r.signals.brreg.source_url, BRREG_ENHET_URL(ORG), "G1: org_nr mode keeps source_url (holds only the org.nr)");
     eq(r.assessed_at, NOW.toISOString(), "G1: assessed_at from the clock");
     eq(r.unavailable_sources, [], "G1: no unavailable source");
     eq([r.signals.brreg.nace, r.signals.brreg.kommune, r.signals.brreg.kommunenummer, r.signals.brreg.found, r.signals.brreg.name_match],
@@ -194,7 +213,54 @@ export async function runRegistrationPrecheckTests(opts: { log?: boolean } = {})
       { orgNr: null });
     eq(r.recommendation, "godkjenn", "G3: no org.nr, single plausible name-search match → godkjenn");
     eq([r.signals.brreg.mode, r.signals.brreg.org_nr, r.signals.brreg.name_hits], ["name_search", ORG, 1], "G3: only org.nr + match flag");
+    eq(r.signals.brreg.source_url, undefined, "G3 privacy: name_search stores no source_url");
+    const json = JSON.stringify(r);
+    ok(!/solbakken(%20|\+| )g/i.test(json) && !json.includes("navn="), "G3 privacy: the profile name / search query is nowhere in the stored JSON");
   }
+  {
+    const r = await run({ search: [] }, { orgNr: null, name: "Kari Nordmann" });
+    const json = JSON.stringify(r);
+    ok(!/kari/i.test(json) && !/nordmann/i.test(json) && r.signals.brreg.source_url === undefined,
+      "N3 privacy: a person-name name search stores no name and no source_url");
+  }
+
+  // ── R2: self-reported org.nr needs a domain tie ─────────────────────────
+  {
+    const r = await run({ site: "noname" }, { contactEmail: "post@tilfeldigdomene.no", url: "https://tilfeldigdomene.no" });
+    eq(r.recommendation, "spor_forst", "N1: tag org.nr + matching name + unrelated own domain with MX → spor_forst");
+    ok(r.reasons.includes("Domene: domenet er ikke knyttet til enheten"), "N1: reason «domenet er ikke knyttet til enheten»");
+    ok(r.reasons.includes("Brreg: org.nr er selvoppgitt"), "N1: reason «org.nr er selvoppgitt»");
+    eq([r.signals.domain_tie.email_domain, r.signals.domain_tie.website_domain, r.signals.domain_tie.tied], [false, false, false], "N1: tie booleans");
+  }
+  eq((await run({ site: "noname" }, { contactEmail: "post@solbakken-gard.no", url: null })).recommendation, "godkjenn",
+    "N1: tag org.nr + name + own e-mail domain tied to the name → godkjenn");
+  eq((await run({ brreg: brregEnhet({ navn: "SOLBAKKEN GÅRD AS" }) }, { contactEmail: "post@evil.no", url: "https://evil.no" })).recommendation,
+    "spor_forst", "B1: unrelated domain whose page shows the Brreg name → spor_forst (page text alone never ties)");
+  {
+    const r = await run({ brreg: brregEnhet({ navn: "SOLBAKKEN GÅRD AS" }), site: "noname" },
+      { name: "Kari Nordmann Solbakken Evilcorp", contactEmail: "post@evilcorp.no", url: "https://evilcorp.no" });
+    eq([r.recommendation, r.signals.domain_tie.email_domain, r.signals.domain_tie.website_domain], ["spor_forst", false, false],
+      "B2: domain tied only to the registrant-typed profile name → spor_forst");
+  }
+  {
+    const r = await run({ mx: "none", site: "noname" }, { contactEmail: "post@solbakkengard.no", url: null });
+    eq([r.recommendation, r.signals.domain_tie.email_domain, r.signals.domain_tie.tied], ["spor_forst", true, false],
+      "N1: tied own e-mail domain WITHOUT MX → no tie, spor_forst");
+  }
+  eq((await run({}, { contactEmail: "post@tilfeldigdomene.no", url: "https://tilfeldigdomene.no" })).recommendation, "spor_forst",
+    "N1: unrelated domain; page shows the profile name → spor_forst");
+  {
+    const r = await run({ site: "noname" }, { contactEmail: "post@tilfeldigdomene.no", url: "https://tilfeldigdomene.no", orgNrSelfReported: false });
+    eq([r.recommendation, r.signals.brreg.org_nr_self_reported, r.signals.domain_tie.required], ["godkjenn", false, false],
+      "N1: audited (not self-reported) org.nr does not need the tie");
+    ok(!r.reasons.includes("Brreg: org.nr er selvoppgitt"), "N1: no self-reported reason for an audited org.nr");
+  }
+  eq((await run({ brreg: brregEnhet({ navn: "HANSEN" }) }, { name: "Nordre Hansen Gård", contactEmail: "post@nordrehansen.no", url: null })).recommendation,
+    "spor_forst", "N1: «Nordre Hansen Gård» vs Brreg «HANSEN» → no name match → spor_forst");
+  eq((await run({ search: [brregEnhet({ navn: "SOLBAKKEN GÅRD AS" })] }, { orgNr: null, contactEmail: "post@tilfeldigdomene.no", url: "https://tilfeldigdomene.no" }, [])).recommendation,
+    "spor_forst", "B1: name search + unrelated domain whose page shows the name → spor_forst");
+  eq((await run({ search: [brregEnhet({ navn: "SOLBAKKEN GÅRD AS" })], site: "noname" }, { orgNr: null, contactEmail: "post@tilfeldigdomene.no", url: "https://tilfeldigdomene.no" })).recommendation,
+    "spor_forst", "N1: name search + unrelated domain, page without the name → spor_forst");
   eq((await run({ site: "redirect" }, { contactEmail: "solbakken@gmail.com" })).recommendation, "godkjenn",
     "G4: bare host redirects, www.<host> answers with the name → godkjenn");
 
@@ -329,9 +395,26 @@ export async function runRegistrationPrecheckTests(opts: { log?: boolean } = {})
     eq(g.ownerClaimConfirmed, false, "gather: no owner claim");
     db.prepare(`INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, status) VALUES ('c1', 'self-a', 'K', 'k@x.no', 'verified')`).run();
     eq(rp.gatherRegistrationPrecheckInput(db as any, "self-a")!.ownerClaimConfirmed, true, "gather: verified owner claim recorded");
+    db.prepare(`UPDATE agent_claims SET status = 'revoked', revoked_at = datetime('now') WHERE id = 'c1'`).run();
+    eq(rp.gatherRegistrationPrecheckInput(db as any, "self-a")!.ownerClaimConfirmed, false, "gather: revoked claim (status 'revoked') not confirmed");
+    db.prepare(`UPDATE agents SET claimed_at = '2026-11-05 10:00:00' WHERE id = 'self-a'`).run();
+    eq(rp.gatherRegistrationPrecheckInput(db as any, "self-a")!.ownerClaimConfirmed, true, "gather: claimed_at only → confirmed owner (shared customer rule)");
+    db.prepare(`UPDATE agents SET claimed_at = NULL WHERE id = 'self-a'`).run();
+    db.prepare(`UPDATE agent_claims SET status = 'verified', revoked_at = NULL WHERE id = 'c1'`).run();
+    eq(rp.gatherRegistrationPrecheckInput(db as any, "self-a")!.orgNrSelfReported, false, "gather: column org.nr without a tag → not self-reported");
     eq(rp.gatherRegistrationPrecheckInput(db as any, "missing"), null, "gather: unknown id → null");
     db.prepare(`UPDATE agents SET tags = '["org_nr:987654321"]', org_nr = NULL WHERE id = 'self-a'`).run();
-    eq(rp.gatherRegistrationPrecheckInput(db as any, "self-a")!.orgNr, "987654321", "gather: org.nr from an org_nr: tag");
+    eq([rp.gatherRegistrationPrecheckInput(db as any, "self-a")!.orgNr, rp.gatherRegistrationPrecheckInput(db as any, "self-a")!.orgNrSelfReported],
+      ["987654321", true], "gather: org.nr from an org_nr: tag, self-reported");
+    db.prepare(`UPDATE agents SET org_nr = '987654321' WHERE id = 'self-a'`).run();
+    eq(rp.gatherRegistrationPrecheckInput(db as any, "self-a")!.orgNrSelfReported, true, "gather: column mirroring the tag without an audit row → still self-reported");
+    db.prepare(`INSERT INTO agents_org_nr_audit (id, agent_id, field_name, old_value, new_value) VALUES ('au1', 'self-a', 'org_nr', NULL, '987654321')`).run();
+    eq(rp.gatherRegistrationPrecheckInput(db as any, "self-a")!.orgNrSelfReported, false, "gather: audited org.nr write → not self-reported");
+    db.prepare(`DELETE FROM agents_org_nr_audit WHERE id = 'au1'`).run();
+    const auditSql = (db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agents_org_nr_audit'`).get() as any).sql as string;
+    db.exec(`DROP TABLE agents_org_nr_audit`);
+    eq(rp.gatherRegistrationPrecheckInput(db as any, "self-a")!.orgNrSelfReported, true, "gather: audit table missing → self-reported (fail closed)");
+    db.exec(auditSql);
     db.prepare(`UPDATE agents SET tags = '[]', org_nr = ? WHERE id = 'self-a'`).run(ORG);
 
     // ── routes ──
