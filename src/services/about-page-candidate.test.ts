@@ -354,12 +354,42 @@ export function runAboutPageCandidateTests(opts: { log?: boolean } = {}): TestSu
       const h1s = `<html><body>${prose}${"<h1>x ".repeat(50_000)}</body></html>`;
       const metas = `<html><head>${"<meta content='x' ".repeat(50_000)}</head><body>${prose}</body></html>`;
       assertTrue(titles.length > 450_000, "patho-0: the unclosed-<title> page is ~450 kB");
-      const tTitle = time(titles);
-      assertTrue(tTitle < 200, `patho-1: 50k unclosed <title> (450 kB) evaluated in < 200 ms (got ${tTitle.toFixed(0)} ms; was ~39 s)`);
-      const tH1 = time(h1s);
-      assertTrue(tH1 < 200, `patho-2: 50k unclosed <h1> evaluated in < 200 ms (got ${tH1.toFixed(0)} ms; was ~5 s)`);
-      const tMeta = time(metas);
-      assertTrue(tMeta < 2000, `patho-3: 50k unclosed <meta> (900 kB) evaluated in < 2 s (got ${tMeta.toFixed(0)} ms; was ~47 s)`);
+      // Timing guard relative to an in-run baseline (dev-request
+      // 2026-11-09-about-page-candidate-determinism-fast-tidsgrense): a fixed
+      // 200 ms limit flaked on CI runners (207–384 ms observed) although the
+      // real regressions took ~5–47 s. Each pathological page is compared with
+      // a well-formed twin of the same byte length (the same tag, closed)
+      // through the same calls, both as the min of a few runs, and must stay
+      // within max(K × baseline, floor) — and always below an absolute
+      // backstop far under the old quadratic times, so a slow runner widens
+      // the limit but a 5 s+ quadratic path still fails.
+      const PATHO_K = 25;
+      const PATHO_FLOOR_MS = 500;
+      const minOf = (html: string, stopAboveMs: number): number => {
+        let best = Infinity;
+        for (let i = 0; i < 3; i++) {
+          const ms = time(html);
+          best = Math.min(best, ms);
+          if (ms > stopAboveMs) break; // a real regression: do not repeat a multi-second run
+        }
+        return best;
+      };
+      const closedTwin = (unit: string, closed: string, n: number): string => closed.repeat(Math.round((n * unit.length) / closed.length));
+      const timingGuard = (label: string, pathoHtml: string, baselineHtml: string, backstopMs: number): void => {
+        const baseMs = minOf(baselineHtml, backstopMs);
+        const pathoMs = minOf(pathoHtml, backstopMs);
+        const limitMs = Math.min(Math.max(PATHO_K * baseMs, PATHO_FLOOR_MS), backstopMs);
+        assertTrue(
+          pathoMs <= limitMs,
+          `${label}: ${pathoMs.toFixed(0)} ms vs well-formed baseline ${baseMs.toFixed(1)} ms; limit ${limitMs.toFixed(0)} ms = min(max(${PATHO_K} × baseline, ${PATHO_FLOOR_MS} ms), backstop ${backstopMs} ms)`,
+        );
+      };
+      const titlesOk = `<html><body>${prose}${closedTwin("<title>x ", "<title>x</title> ", 50_000)}</body></html>`;
+      const h1sOk = `<html><body>${prose}${closedTwin("<h1>x ", "<h1>x</h1> ", 50_000)}</body></html>`;
+      const metasOk = `<html><head>${closedTwin("<meta content='x' ", "<meta content='x'> ", 50_000)}</head><body>${prose}</body></html>`;
+      timingGuard("patho-1: 50k unclosed <title> (450 kB; was ~39 s)", titles, titlesOk, 2000);
+      timingGuard("patho-2: 50k unclosed <h1> (300 kB; was ~5 s)", h1s, h1sOk, 2000);
+      timingGuard("patho-3: 50k unclosed <meta> (900 kB; was ~47 s)", metas, metasOk, 4000);
       // Bounded, but the guards still work on a normal page.
       const spam =
         "<html><head><title>Beste casino på nett i 2026</title></head><body><main><p>" + LONG_PROSE_1 + "</p><p>" + LONG_PROSE_2 + "</p></main></body></html>";
