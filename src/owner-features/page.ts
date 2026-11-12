@@ -1,0 +1,1336 @@
+// ─── «Mine valg» — the owner page (HTML) ────────────────────────────────────
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere, slice S2b, redesigned in
+// S2e («v2 — ny utforming», Daniel 2026-10-28). Pure rendering: the route
+// (routes/owner-features.ts) gathers the data and wraps the body in the owner
+// portal shell. Groups, order and rows come from the registry only — a new
+// registry entry gets a row in its group with no UI change (AC10).
+//
+// v2 principles this file carries:
+//   2. Only real choices in the main view: a `coming_soon` entry is never a
+//      (grey) switch; all of them sit in one closed «Planlagt — si fra hvis du
+//      vil ha dette (N)» box at the bottom, each with «Gi meg beskjed».
+//   3. Two honest levels. T8 (RFB): «Minst mulig» / «Utnytte mulighetene»;
+//      the level that applies is computed from the switches, the status line
+//      says who chose, deviations are «Unntak» (gårdssalg: unchanged, a level
+//      is marked only after the owner chose it).
+//   4. orders.enabled explains itself where it is taken (fold-out) and shows
+//      the prerequisite check (orderable items) above the switch.
+//   5. No fake values: an unbuilt entry shows no value and is not in «Slik er
+//      du nå».
+//   6. One switch, one place: the profile pause and the order address live
+//      here (the /eier cards link here instead).
+//   7. Words: no «Gjelder ikke» for something the owner can get later; «Nytt»
+//      only on live entries; «Alltid» / «Låst på» explained the first time.
+//   8. The first-login answer is the comms.news row's value at once.
+//      T7: no first-login card any more — the «Nyheter og tips» question
+//      stands at the top of «Kontakt fra Rett fra Bonden» (the last group)
+//      while unanswered; «Ja takk» and «Ikke nå» weigh the same, a real no
+//      is a quiet link button; the row says «Du sa ja/nei {dato}.».
+//   9. Foldable cards, jump links on mobile; a save updates only its card
+//      when JavaScript runs (progressive enhancement), and every form works
+//      as a plain POST → 303 without it.
+// Mobile first (375 px, tap targets ≥ 44 px), light and dark (AC13). Every
+// piece of text and every attribute value goes through escapeHtml.
+
+import { escapeHtml } from "../routes/owner-portal";
+import {
+  OWNER_FEATURE_GROUPS,
+  OWNER_FEATURE_REGISTRY,
+  STOCK_CHECK_SOFT_EXPIRY_DESCRIPTION,
+  findOwnerFeature,
+  ownerFeatureEntryForEnv,
+  ownerFeatureStatus,
+  visibleOwnerFeatureOptions,
+  type LocalizedText,
+  type OwnerFeatureEntry,
+  type OwnerFeatureGroup,
+  type OwnerFeatureValue,
+  type OwnerFeatureVertical,
+} from "./registry";
+import type { ResolvedOwnerFeature, ResolvedOwnerFeatures } from "./resolve";
+import {
+  OWNER_LEVELS,
+  OWNER_LEVEL_CUSTOM_LABEL,
+  OWNER_LEVEL_DEFAULT_KEY,
+  deriveOwnerLevel,
+  ownerLevelStatus,
+  type OwnerLevel,
+  type OwnerChangeLogRow,
+  type OwnerLevelKey,
+  type OwnerLevelPreview,
+  type OwnerLevelStatus,
+} from "./changes";
+import type { OwnerStats } from "../services/owner-stats-service";
+import {
+  OWNER_ANCHOR_FALLBACK,
+  OWNER_ANCHOR_LEVEL,
+  OWNER_ANCHOR_LEVEL_PREVIEW,
+  OWNER_ANCHOR_LOG,
+  OWNER_ANCHOR_PLANNED,
+  ownerPlannedAnchor,
+  ownerRowAnchor,
+} from "./anchors";
+import { OPPLEVAGENT_PRICE_MESSAGE } from "./price-message";
+import { OWNER_TOKEN_CSS } from "../owner-ui/tokens";
+import { OWNER_ENHANCE_SCRIPT, OWNER_STATUS_CSS, OWNER_STATUS_HTML } from "../owner-ui/enhance";
+import { OWNER_COMMS_GROUP_NOTE, OWNER_NEWS_CONSENT_TEXT, OWNER_NEWS_PLACEMENT_QUESTION, OWNER_NOTIFY_GROUP_NOTE } from "./news-consent";
+import { stockSoftExpiryActiveFor } from "../services/stock-soft-expiry";
+import { OWNER_ORDER_LIMITS_HEADING, ownerAutocancelLine, ownerOrderLimitLines, type OrderLimitsConfig } from "./order-texts";
+
+/** Entries that need this key on are shown only when it is on (spec «Grensesnitt»). */
+export const OWNER_PAGE_REVEAL_KEY = "orders.enabled";
+/** «Nytt» badge for this many days after `since` (spec principle 6). */
+export const OWNER_PAGE_NEW_DAYS = 30;
+/** «Slik er du nå» status line — only the `live` ones are shown (v2 principle 5). */
+export const OWNER_PAGE_STATUS_KEYS = [
+  "visibility.profile", "visibility.ai_assistants", "orders.enabled",
+  "payments.prepay", "products.weekly_sync", "notify.report",
+];
+/** The key whose row carries the order explanation and the prerequisite check. */
+export const OWNER_PAGE_ORDERS_KEY = "orders.enabled";
+/** The pause row (the old /eier «Pause og sletting» card). */
+export const OWNER_PAGE_PAUSE_KEY = "visibility.profile";
+/** The order-address row (the old form inside the /eier «Bestillinger» card). */
+export const OWNER_PAGE_ORDER_EMAIL_KEY = "orders.email";
+/** T7: the consent row whose question stands at the top of its group. */
+export const OWNER_PAGE_NEWS_KEY = "comms.news";
+/** Heading of the planned box; the count is appended as « (N)». */
+export const OWNER_PAGE_PLANNED_TITLE = "Planlagt — si fra hvis du vil ha dette";
+
+const CS_EMAIL = "kontakt@rettfrabonden.com";
+
+/**
+ * What differs between the verticals that share this page (dev-request
+ * 2026-10-22-opplevagent-mine-valg-gardssalg O1a: the gårdssalg tab is the
+ * SAME component). Omitted = Rett fra Bonden, rendered exactly as before.
+ */
+export interface OwnerPageVariant {
+  vertical: OwnerFeatureVertical;
+  /** Who promises / locks («Alltid» explanation, the change log's admin actor). */
+  platformName: string;
+  /** Customer service address (deletion request on the pause row). */
+  csEmail: string;
+  /** The page's own path + tail (forms, links). */
+  pagePath: (tail: string) => string;
+  /** «Tilbake til eierportalen». */
+  backHref: string;
+  groups: Array<{ key: OwnerFeatureGroup; label: LocalizedText }>;
+  levels: readonly OwnerLevel[];
+  /** «Slik er du nå» keys (only the built ones show). */
+  statusKeys: readonly string[];
+  /** Entries that need this key on are shown only when it is on. */
+  revealKey: string;
+  /** The pause confirm panel offers the RFB resume date (owner_profile_pause.pause_until). */
+  pauseResumeDate: boolean;
+}
+
+/** Gårdssalg booking row (booking.enabled): the prerequisite check and the explanation. */
+export interface OwnerPageBooking {
+  /** The address booking requests go to now (experience_providers.epost), or null. */
+  requestEmail: string | null;
+  /** Opplevagent stopped booking (admin brake); note = the operator's reason. */
+  adminBrake: { note: string | null } | null;
+  /** Where a missing or wrong address is fixed. */
+  fixHref: string;
+  /** Real timings from booking-store (previsitReminderHours / previsitExpireHours). */
+  reminderHours: number;
+  expireHours: number;
+  /** Largest group a request can be for (BookingInputSchema party_size max). */
+  maxPartySize: number;
+  /** «Les mer» (/for-tilbydere#besok) — only when that page is published. */
+  readMoreUrl: string | null;
+}
+
+/** Gårdssalg statistics block (the portal's own GET …/stats numbers). */
+export interface OwnerPageGardssalgStats {
+  humanViews: number;
+  aiSearchViews: number;
+  /** The page-view window of the source (ownerStatsWindowDays, raw retention). */
+  windowDays: number;
+  aiDeliveries: { value: number; label: string } | null;
+  tip: string;
+}
+
+/** Daniel 29.10, verbatim (O1 «Prisbudskapet»): used at «Ta imot besøk». */
+export const OWNER_PAGE_PRICE_MESSAGE = OPPLEVAGENT_PRICE_MESSAGE;
+/** The gårdssalg row that carries the visit explanation, the price message and the prerequisite check. */
+export const OWNER_PAGE_BOOKING_KEY = "booking.enabled";
+
+export interface OwnerPageNotice {
+  ok: boolean;
+  text: string;
+  /** Set when «Angre» applies to this change. */
+  undoBatchId?: number | null;
+}
+
+export interface OwnerPageOrderable {
+  /** Items that pass isRowOrderableForRealOrder (with orders switched on). */
+  count: number;
+  /** Where the owner edits the items. */
+  itemsHref: string;
+}
+
+export interface OwnerPageOrderEmail {
+  /** OWNER_ORDER_EMAIL_ENABLED: the change form is offered. */
+  enabled: boolean;
+  /** The address order mail goes to now (override or the profile e-mail). */
+  current: string | null;
+  /** A change waiting for the click from the new address. */
+  pending: string | null;
+}
+
+export interface OwnerPageModel {
+  agent: { id: string; name: string };
+  resolved: ResolvedOwnerFeatures;
+  registry?: OwnerFeatureEntry[];
+  /** The owner's own level choice; null = none made (no level marked). Gårdssalg only since T8. */
+  level: OwnerLevelKey | "custom" | null;
+  /**
+   * T8 (RFB page): the owner's own level choice (readOwnerLevelChoiceFor) and
+   * when it was made — only for the status line's «Du valgte …». The level
+   * that applies is computed from `resolved`. Unset/null = no owner choice.
+   */
+  levelChoice?: { level: OwnerLevel; at: string } | null;
+  /** T7: the «Nyheter og tips» question stands at the top of #gruppe-comms. */
+  showIntro: boolean;
+  /** T7: the comms.news row's «Du sa ja/nei {dato}.» (null/unset = nothing to say). */
+  newsAnswer?: { answer: "yes" | "no"; at: string } | null;
+  notice: OwnerPageNotice | null;
+  /**
+   * T5 (anchor contract, owner-features/anchors.ts): the id of the card or
+   * row the notice stands in (niva, valg-<key>, gruppe-<group>,
+   * planlagt[-<key>], endringslogg). Unset or not on the page → the message
+   * slot at the bottom. Never the top card.
+   */
+  noticeAt?: string | null;
+  /** In-page confirm panel for one switch (confirmOn / confirmOff). */
+  confirm: { key: string; value: boolean } | null;
+  levelPreview: OwnerLevelPreview | null;
+  log: { rows: OwnerChangeLogRow[]; page: number; pages: number; total: number };
+  now?: Date;
+  /** Planned keys this owner already asked to hear about. */
+  interest?: ReadonlySet<string>;
+  /** Prerequisite check on the orders.enabled row. */
+  orderable?: OwnerPageOrderable | null;
+  /** The orders.email row. */
+  orderEmail?: OwnerPageOrderEmail | null;
+  /** Resume date of a current profile pause (visibility.profile off). */
+  pauseUntil?: string | null;
+  /** FAQ anchor for «Les mer» — only when that page is published (else null: inline text only). */
+  ordersReadMoreUrl?: string | null;
+  /** Real follow-up timings for the explanation (ORDER_REMINDER_HOURS / ORDER_AUTOCANCEL_HOURS). */
+  orderTimings?: {
+    reminderHours: number; autocancelHours: number; dailyCap?: number; capNotice?: boolean;
+    /**
+     * T11: present only with ORDER_CAP_V2_ENABLED on — the per-buyer limits and
+     * the platform ceiling (order-texts.ts) replace the daily-cap line, and
+     * the auto-cancel line promises «kunden får beskjed» only with
+     * `buyerReceipts` (ORDER_BUYER_RECEIPTS_ENABLED). Absent = B4 text as before.
+     */
+    limits?: OrderLimitsConfig;
+    buyerReceipts?: boolean;
+  };
+  /**
+   * S2f statistics block at the top (v2 principle 1). undefined = no block;
+   * null = the read failed (the block says so and keeps the link).
+   */
+  stats?: OwnerPageStats | null;
+  /** The vertical's differences; omitted = Rett fra Bonden. */
+  variant?: OwnerPageVariant;
+  /** Gårdssalg: the booking.enabled row's check and explanation. */
+  booking?: OwnerPageBooking | null;
+  /** Gårdssalg: the statistics block (instead of `stats`). undefined = none, null = read failed. */
+  gardssalgStats?: OwnerPageGardssalgStats | null;
+  /** «Se all statistikk» (the Statistikk tab in /selger). */
+  statsHref?: string;
+}
+
+// ── S2f: «Dette har profilen gjort for deg» ─────────────────────────────────
+// The numbers are the /selger Statistikk tab's own: the same getOwnerStats()
+// payload (GET /api/agents/:id/owner-stats), the same fields and the same
+// windows and labels as selger.html renderOwnerStats() — no new counting and
+// no new definition. People's page views, all AI search and «Med i AI-søk»
+// are over 12 months («siste 12 måneder» / «siden <dato>»); the ChatGPT /
+// Claude / other split and the contact clicks exist only for the raw window
+// (windowDays, 60), as in the tab, and say so. Clicks to the map are not
+// counted anywhere yet, so the block says that instead of showing a number.
+
+/** The statistics block's numbers, read off one getOwnerStats() payload. */
+export interface OwnerPageStats {
+  humanViews: { value: number; label: string };
+  aiViews: { value: number; label: string };
+  aiSplit: { chatgpt: number; claude: number; other: number; days: number };
+  aiDeliveries: { value: number; label: string };
+  clicks: { phone: number; website: number; days: number };
+  /** The public threshold (PUBLIC_STATS_MIN_VIEWS) at render time. */
+  minPublicViews: number;
+  /** One concrete tip from what the profile is missing (shown with low numbers). */
+  tip: string;
+}
+
+/** What the tip looks at (agent_knowledge columns). */
+export interface OwnerProfileGaps {
+  opening_hours?: unknown;
+  products?: unknown;
+  about?: unknown;
+  phone?: unknown;
+  website?: unknown;
+}
+
+function blankJson(v: unknown): boolean {
+  if (v === null || v === undefined) return true;
+  if (Array.isArray(v)) return v.length === 0;
+  if (typeof v === "object") return Object.keys(v as object).length === 0;
+  const t = String(v).trim();
+  if (t === "" || t === "[]" || t === "{}" || t === "null") return true;
+  try {
+    const p = JSON.parse(t);
+    if (Array.isArray(p)) return p.length === 0;
+    if (p && typeof p === "object") return Object.keys(p).length === 0;
+  } catch { /* free text: not blank */ }
+  return false;
+}
+
+/** ONE tip, from the first thing the profile is missing (else: share the link). */
+export function ownerProfileTip(k: OwnerProfileGaps | null | undefined): string {
+  const g = k || {};
+  if (blankJson(g.opening_hours)) return "Legg til åpningstider, så vet folk når de kan komme.";
+  if (blankJson(g.products)) return "Legg inn varene dine, så har folk og AI-assistenter noe konkret å finne.";
+  if (blankJson(g.about)) return "Skriv noen setninger om gården og det du lager.";
+  if (blankJson(g.phone)) return "Legg til telefonnummeret ditt, så kan folk ringe deg direkte.";
+  if (blankJson(g.website)) return "Legg til nettsiden din, så kan folk lese mer om deg.";
+  return "Del lenken til profilen din i egne kanaler, for eksempel Facebook eller nyhetsbrevet ditt.";
+}
+
+/**
+ * The block's numbers from the tab's payload — exactly the fields and labels
+ * selger.html shows: year.humanViews, year.aiViews, aiPlatforms, aiDeliveries.
+ * window.total with year.labels.nb.aiDeliveries, contactClicksByKind.
+ */
+export function ownerPageStatsFrom(s: OwnerStats, opts: { minPublicViews: number; profile?: OwnerProfileGaps | null }): OwnerPageStats {
+  const wd = s.windowDays || 60;
+  const nb = (s.year && s.year.labels && s.year.labels.nb) || ({} as Record<string, string>);
+  const clicks = (kind: string) => (s.contactClicksByKind || []).filter((c) => c.kind === kind).reduce((n, c) => n + (c.count || 0), 0);
+  return {
+    humanViews: { value: s.year?.humanViews?.value ?? 0, label: nb.humanViews || `${wd}d` },
+    aiViews: { value: s.year?.aiViews?.value ?? 0, label: nb.aiViews || `${wd}d` },
+    aiSplit: { chatgpt: s.aiPlatforms?.chatgpt ?? 0, claude: s.aiPlatforms?.claude ?? 0, other: s.aiPlatforms?.other ?? 0, days: wd },
+    aiDeliveries: { value: s.aiDeliveries?.window?.total ?? 0, label: nb.aiDeliveries || "siste 12 måneder" },
+    clicks: { phone: clicks("phone"), website: clicks("website"), days: wd },
+    minPublicViews: opts.minPublicViews,
+    tip: ownerProfileTip(opts.profile),
+  };
+}
+
+/** Used when PUBLIC_STATS_MIN_VIEWS is 0 (no public threshold): what still counts as low. */
+export const OWNER_PAGE_LOW_VIEWS_FALLBACK = 20;
+
+/**
+ * «Low» numbers: fewer people's page views over 12 months than the public
+ * threshold (PUBLIC_STATS_MIN_VIEWS, default 20) — the same point at which
+ * the public tiles appear on the profile. With the threshold switched off
+ * (0) the default 20 is used, so a new profile still gets the tip.
+ */
+export function ownerStatsAreLow(st: OwnerPageStats): boolean {
+  const min = st.minPublicViews > 0 ? st.minPublicViews : OWNER_PAGE_LOW_VIEWS_FALLBACK;
+  return st.humanViews.value < min;
+}
+
+const esc = (v: unknown): string => escapeHtml(String(v ?? ""));
+
+/** Is the entry built (shown in the main view with its value)? A liveFlag entry with its flag off is not. */
+export function isOwnerFeatureBuilt(e: OwnerFeatureEntry): boolean {
+  return ownerFeatureStatus(e) !== "coming_soon";
+}
+
+/**
+ * The value as text (rows, change log, notices). Never «Gjelder ikke»
+ * (v2 principle 7): null reads «Ikke valgt» unless the type names it.
+ */
+export function formatOwnerFeatureValue(e: OwnerFeatureEntry | undefined, v: OwnerFeatureValue): string {
+  if (e && e.type === "guarantee") return "Alltid";
+  if (v === true) return e && e.type === "locked" ? "Låst på" : "På";
+  if (v === false) return "Av";
+  if (v === null || v === undefined) {
+    if (e && e.type === "number") return "Ingen";
+    if (e && e.type === "email") return "Profilens e-post";
+    return "Ikke valgt";
+  }
+  if (e && e.type === "choice") {
+    const o = (e.options || []).find((x) => x.value === v);
+    if (o) return o.label.no;
+  }
+  return String(v);
+}
+
+/** The value shown in a row: none at all for an unbuilt entry (v2 principle 5). */
+export function ownerFeatureRowValue(e: OwnerFeatureEntry, r: ResolvedOwnerFeature | undefined): string | null {
+  if (!isOwnerFeatureBuilt(e) || !r) return null;
+  return formatOwnerFeatureValue(e, r.value);
+}
+
+function formatWhen(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  try {
+    return new Intl.DateTimeFormat("nb-NO", { timeZone: "Europe/Oslo", dateStyle: "short", timeStyle: "short" }).format(d);
+  } catch {
+    return d.toISOString().replace("T", " ").slice(0, 16) + " UTC";
+  }
+}
+
+/** An ISO time as the Oslo date, dd.mm.yyyy. */
+function formatDate(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  try {
+    return new Intl.DateTimeFormat("nb-NO", { timeZone: "Europe/Oslo", day: "2-digit", month: "2-digit", year: "numeric" }).format(d);
+  } catch {
+    return d.toISOString().slice(0, 10);
+  }
+}
+
+function formatDay(ymd: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd);
+  return m ? `${m[3]}.${m[2]}.${m[1]}` : ymd;
+}
+
+const ACTOR_LABELS: Record<string, string> = {
+  owner: "Du",
+  cs: "Kundeservice",
+  admin: "Rett fra Bonden",
+  system: "Systemet",
+};
+
+function isNew(e: OwnerFeatureEntry, now: Date): boolean {
+  if (ownerFeatureStatus(e) !== "live") return false;
+  const since = new Date(`${e.since}T00:00:00Z`).getTime();
+  if (Number.isNaN(since)) return false;
+  const age = now.getTime() - since;
+  return age >= 0 && age < OWNER_PAGE_NEW_DAYS * 86_400_000;
+}
+
+function actionPath(m: OwnerPageModel, tail: string): string {
+  if (m.variant) return m.variant.pagePath(tail);
+  return `/eier/${encodeURIComponent(m.agent.id)}/valg${tail}`;
+}
+
+function platformName(m: OwnerPageModel): string {
+  return m.variant ? m.variant.platformName : "Rett fra Bonden";
+}
+
+function pageGroups(m: OwnerPageModel): Array<{ key: OwnerFeatureGroup; label: LocalizedText }> {
+  return m.variant ? m.variant.groups : OWNER_FEATURE_GROUPS;
+}
+
+/** Per-render state: «Alltid» / «Låst på» are explained the first time only. */
+interface RenderCtx {
+  m: OwnerPageModel;
+  now: Date;
+  explainedAlways: boolean;
+  explainedLocked: boolean;
+  /** T5: the notice has been placed in its card or row (else it goes to the slot). */
+  noticePlaced: boolean;
+  /** T5: the switch confirm panel has been placed in its row. */
+  confirmPlaced: boolean;
+  /** T8 (RFB page only): the level status from the switches; null = none / gårdssalg. */
+  levelStatus: OwnerLevelStatus | null;
+}
+
+/** T5: the notice, when it belongs at element `id` and is not placed yet. */
+function noticeAtHtml(ctx: RenderCtx, id: string): string {
+  const m = ctx.m;
+  if (!m.notice || ctx.noticePlaced || m.noticeAt !== id) return "";
+  ctx.noticePlaced = true;
+  return noticeHtml(m, true);
+}
+
+/** T5: is element `id` (a row) the target of the notice or the confirm panel? */
+function isTarget(m: OwnerPageModel, key: string): boolean {
+  return m.noticeAt === ownerRowAnchor(key) || (!!m.confirm && m.confirm.key === key);
+}
+
+/**
+ * `data-mv-row` names the card the form sits in (the T9 script saves it in
+ * place); `once` (T9) marks a form whose POST is never sent again by the
+ * script (it sends an e-mail).
+ */
+function rowForm(m: OwnerPageModel, tail: string, swap: string, inner: string, once = false): string {
+  return `<form method="post" action="${esc(actionPath(m, tail))}" class="mv-ctl-form" data-mv-row="${esc(swap)}"${once ? ` data-mv-once="1"` : ""}>${inner}</form>`;
+}
+
+/** The control for one row. */
+function controlHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeature, swap: string): string {
+  const valueText = ownerFeatureRowValue(e, r) ?? "";
+  if (e.type === "guarantee") return `<span class="mv-state mv-always">Alltid</span>`;
+  if (e.key === OWNER_PAGE_ORDER_EMAIL_KEY) return orderEmailControlHtml(ctx, e, r, swap);
+  const state = `<span class="mv-state">${esc(valueText)}</span>`;
+  if (!r.changeable || e.type === "locked" || e.type === "action") return state;
+  const form = (inner: string) => rowForm(ctx.m, "/sett", swap, `<input type="hidden" name="key" value="${esc(e.key)}">${inner}`);
+  const fieldId = `mv-f-${e.key.replace(/[^a-z0-9]/gi, "-")}`;
+  switch (e.type) {
+    case "switch": {
+      const on = r.value === true;
+      return state + form(
+        `<input type="hidden" name="value" value="${on ? "false" : "true"}">` +
+        `<button type="submit" class="ep-btn ${on ? "ep-btn-secondary" : "ep-btn-primary"}" aria-pressed="${on ? "true" : "false"}">${on ? "Slå av" : "Slå på"}</button>`,
+      );
+    }
+    case "choice": {
+      const opts = visibleOwnerFeatureOptions(e).map((o) =>
+        `<option value="${esc(o.value)}"${o.value === r.value ? " selected" : ""}>${esc(o.label.no)}</option>`).join("");
+      return form(
+        `<label class="mv-sr" for="${esc(fieldId)}">${esc(e.label.no)}</label>` +
+        `<select id="${esc(fieldId)}" name="value">${opts}</select>` +
+        `<button type="submit" class="ep-btn ep-btn-secondary">Lagre</button>`,
+      );
+    }
+    case "number":
+    case "email":
+    case "date": {
+      const type = e.type === "number" ? "number" : e.type === "email" ? "email" : "date";
+      const extra = e.type === "number"
+        ? `${e.min !== undefined ? ` min="${esc(e.min)}"` : ""}${e.max !== undefined ? ` max="${esc(e.max)}"` : ""} inputmode="numeric"`
+        : "";
+      return form(
+        `<label class="mv-sr" for="${esc(fieldId)}">${esc(e.label.no)}</label>` +
+        `<input id="${esc(fieldId)}" name="value" type="${type}" value="${esc(r.value ?? "")}"${extra}>` +
+        `<button type="submit" class="ep-btn ep-btn-secondary">Lagre</button>`,
+      );
+    }
+    default:
+      return state;
+  }
+}
+
+/** orders.email: the address now, a pending change, and the confirmation form (S1b punkt 7). */
+function orderEmailControlHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeature, swap: string): string {
+  const oe = ctx.m.orderEmail;
+  const current = oe?.current ?? null;
+  const shown = current ?? (r.value == null ? "" : String(r.value));
+  const state = `<span class="mv-state">${shown ? esc(shown) : "Ingen adresse"}</span>`;
+  if (!oe || !oe.enabled) return state;
+  const fieldId = "mv-f-orders-email";
+  return state + rowForm(
+    ctx.m, "/ordre-epost", swap,
+    `<label class="mv-sr" for="${fieldId}">Ny adresse for bestillinger</label>` +
+    `<input id="${fieldId}" name="email" type="email" required autocomplete="email" placeholder="Ny adresse">` +
+    `<button type="submit" class="ep-btn ep-btn-secondary">Send bekreftelse</button>`,
+    true,
+  );
+}
+
+/** Text under the label for the special rows (prerequisite check, explanation, pause, order address). */
+function rowExtraHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeature): string {
+  const m = ctx.m;
+  if (!m.variant && e.key === OWNER_PAGE_ORDERS_KEY) return ordersCheckHtml(m) + ordersExplainHtml(m);
+  if (m.variant?.vertical === "gardssalg" && e.key === OWNER_PAGE_BOOKING_KEY) return bookingCheckHtml(m) + bookingExplainHtml(m);
+  if (e.key === OWNER_PAGE_PAUSE_KEY) {
+    const paused = r.value === false;
+    const cs = m.variant ? m.variant.csEmail : CS_EMAIL;
+    const subject = encodeURIComponent(`Be om sletting av profil: ${m.agent.name || m.agent.id} (${m.agent.id})`);
+    const body = encodeURIComponent(`Hei,\n\nJeg ber om at profilen ${m.agent.name || ""} (${m.agent.id}) slettes fra ${platformName(m)}.\n\nHilsen`);
+    // A row hidden by «fjern» / an admin quality hide is not the owner's pause
+    // (gårdssalg: requirement visibilityOwnerControlled) — its reason says so.
+    return (paused && r.block !== "requirement_not_met"
+      ? `<p class="mv-check" role="status">Profilen er på midlertidig pause${m.pauseUntil ? ` til ${esc(formatDay(m.pauseUntil))}` : ""}. Den vises ikke i søk, lister, AI-tjenester eller kart.</p>`
+      : "") +
+      `<p class="mv-desc">Vil du heller at profilen slettes for godt? <a href="mailto:${cs}?subject=${subject}&amp;body=${body}">Be om sletting</a> — kundeservice hjelper deg.</p>`;
+  }
+  if (!m.variant && e.key === OWNER_PAGE_NEWS_KEY && m.newsAnswer) {
+    const day = formatDate(m.newsAnswer.at);
+    return `<p class="mv-desc" data-news-answer="${esc(m.newsAnswer.answer)}">${esc(m.newsAnswer.answer === "yes" ? `Du sa ja ${day}.` : `Du sa nei ${day}.`)}</p>`;
+  }
+  if (e.key === OWNER_PAGE_ORDER_EMAIL_KEY) {
+    const oe = m.orderEmail;
+    if (!oe) return "";
+    return (oe.pending
+      ? `<p class="mv-check" role="status">Venter på bekreftelse fra <strong>${esc(oe.pending)}</strong>. Klikk lenken vi sendte dit. Til da går bestillinger til den gamle adressen.</p>`
+      : "") +
+      (oe.enabled ? `<p class="mv-desc">Vi sender en lenke til den nye adressen. Bestillinger går til den gamle adressen til lenken er brukt.</p>` : "");
+  }
+  return "";
+}
+
+/**
+ * Gårdssalg (O1 principle 4): the prerequisite check right at the «Ta imot
+ * besøk» switch — the admin brake first (it wins over the owner), then the
+ * address booking requests go to (the same rule the portal and the admin
+ * lever use), with where it is fixed — and the price message, verbatim.
+ */
+function bookingCheckHtml(m: OwnerPageModel): string {
+  const b = m.booking;
+  const price = `<p class="mv-check mv-price" data-price-message="1">${esc(OWNER_PAGE_PRICE_MESSAGE)}</p>`;
+  if (!b) return price;
+  const cs = m.variant ? m.variant.csEmail : CS_EMAIL;
+  let check: string;
+  if (b.adminBrake) {
+    check = `<p class="mv-check mv-check-missing" data-booking-check="admin_brake">Booking er stanset av ${esc(platformName(m))}.${b.adminBrake.note ? ` Grunn: ${esc(b.adminBrake.note)}.` : ""} Du kan ikke slå den på igjen selv. Ta kontakt med <a href="mailto:${esc(cs)}">${esc(cs)}</a>.</p>`;
+  } else if (!b.requestEmail) {
+    check = `<p class="mv-check mv-check-missing" data-booking-check="no_email">Profilen mangler en e-postadresse som forespørslene kan sendes til, så besøk kan ikke slås på ennå. <a href="${esc(b.fixHref)}">Be oss legge inn adressen</a>.</p>`;
+  } else {
+    check = `<p class="mv-check" data-booking-check="ok">Forespørsler sendes til <strong>${esc(b.requestEmail)}</strong>. Er adressen feil? <a href="${esc(b.fixHref)}">Si fra</a>.</p>`;
+  }
+  return check + price;
+}
+
+/** Gårdssalg (O1 principle 4): «Slik fungerer det», read from booking-store as built. */
+function bookingExplainHtml(m: OwnerPageModel): string {
+  const b = m.booking;
+  if (!b) return "";
+  const name = esc(platformName(m));
+  const readMore = b.readMoreUrl ? `<p><a href="${esc(b.readMoreUrl)}">Les mer</a></p>` : "";
+  return `<details class="mv-explain-box">
+            <summary>Slik fungerer besøk</summary>
+            <h3>Slik fungerer det</h3>
+            <ul>
+              <li>Gjesten ber om dato, tidspunkt og antall personer (opptil ${esc(b.maxPartySize)}) på profilen din eller via en AI-assistent.</li>
+              <li>Du får en e-post med lenke til en svarside der du bekrefter, avslår eller foreslår et annet tidspunkt. Du trenger ikke logge inn.</li>
+              <li>Besøket skjer hos dere. ${name} selger ingenting og håndterer ikke betaling.</li>
+              <li>Etter besøket bekrefter du med lenken i den samme e-posten om gjesten kom.</li>
+            </ul>
+            <h3>Dette må du gjøre</h3>
+            <ul>
+              <li>Svar på hver forespørsel: bekreft, avslå eller foreslå et annet tidspunkt.</li>
+              <li>Svarer du ikke, får du en påminnelse etter ${esc(b.reminderHours)} timer.</li>
+              <li>Er forespørselen fortsatt ubesvart etter ${esc(b.expireHours)} timer, utløper den, og gjesten får beskjed.</li>
+              <li>Bekreft oppmøte etter besøket.</li>
+            </ul>
+            <h3>Hva koster det?</h3>
+            <p>${esc(OWNER_PAGE_PRICE_MESSAGE)}</p>
+            <h3>Slik slår du av</h3>
+            <ul>
+              <li>Trykk «Slå av» på denne raden. Da får gjesten kontaktinformasjonen din i stedet, og profilen er fortsatt synlig.</li>
+              <li>Vil du bare ta en pause, bruk «Sesongpause». Den vises når besøk er slått på.</li>
+              <li>Forespørsler du allerede har fått, må du fortsatt svare på.</li>
+            </ul>
+            ${readMore}
+          </details>`;
+}
+
+/** v2 principle 4: the prerequisite check stands above the orders switch. */
+function ordersCheckHtml(m: OwnerPageModel): string {
+  const o = m.orderable;
+  if (!o) return "";
+  const link = `<a href="${esc(o.itemsHref)}">Gå til varene dine</a>`;
+  if (o.count <= 0) {
+    return `<p class="mv-check mv-check-missing" data-orderable="0">Du har ingen varer som kan bestilles ennå. Legg inn varer eller hent dem fra nettsiden din. ${link}</p>`;
+  }
+  const n = Math.floor(o.count);
+  return `<p class="mv-check" data-orderable="${n}">Du har ${n} ${n === 1 ? "vare" : "varer"} som kan bestilles. ${link}</p>`;
+}
+
+/** v2 principle 4: the fold-out explanation, from the flow as it is built. */
+function ordersExplainHtml(m: OwnerPageModel): string {
+  const t = m.orderTimings ?? { reminderHours: 24, autocancelHours: 72 };
+  // B4: the daily cap, from the configuration the route passes in
+  // (ORDER_CAP_NEW_PER_PRODUCER_PER_DAY); no line when it is not given.
+  // T11 (ORDER_CAP_V2_ENABLED, `t.limits` given): the per-buyer limits and the
+  // platform ceiling replace the daily-cap line (texts: order-texts.ts), and
+  // the auto-cancel line says «kunden får beskjed» only with buyer receipts on.
+  // Without `t.limits` the output is byte-identical to B4.
+  const limits = t.limits;
+  const limitsBlock = limits
+    ? `\n            <h3>${esc(OWNER_ORDER_LIMITS_HEADING)}</h3>` +
+      `\n            <ul data-order-limits="${esc(limits.openPerBuyer)}/${esc(limits.perBuyerPerDay)}/${esc(limits.producerCeilingPerDay)}">` +
+      ownerOrderLimitLines(limits).map((l) => `\n              <li>${esc(l)}</li>`).join("") +
+      `\n            </ul>`
+    : "";
+  const autocancelLine = limits
+    ? esc(ownerAutocancelLine(t.autocancelHours, t.buyerReceipts === true))
+    : `Er bestillingen fortsatt ubesvart etter ${esc(t.autocancelHours)} timer, blir den kansellert, og kunden får beskjed.`;
+  const capLine = !limits && t.dailyCap && t.dailyCap > 0
+    ? `<li data-order-cap="${esc(t.dailyCap)}">Du kan få inntil ${esc(t.dailyCap)} bestillinger per døgn. Kommer det flere, blir de gjort om til en kontaktforespørsel: kunden får kontaktinformasjonen din i stedet${t.capNotice ? ", og du får én samlet e-post om det dagen etter" : ""}.</li>`
+    : "";
+  const readMore = m.ordersReadMoreUrl
+    ? `<p><a href="${esc(m.ordersReadMoreUrl)}">Les mer</a></p>` : "";
+  return `<details class="mv-explain-box">
+            <summary>Slik fungerer bestillinger</summary>
+            <h3>Slik fungerer det</h3>
+            <ul>
+              <li>Kunder og AI-assistenter kan sende deg en bestilling på varer du har merket som på lager.</li>
+              <li>Du får en e-post med emnet «Ny henteordre» til adressen under «Bestillinger sendes til».</li>
+              <li>I e-posten bekrefter eller avslår du bestillingen med ett klikk. Du trenger ikke logge inn.</li>
+              <li>Kunden henter varene hos deg og betaler når varene hentes. Rett fra Bonden tar ikke betalt.</li>
+              ${capLine}
+            </ul>${limitsBlock}
+            <h3>Dette må du gjøre</h3>
+            <ul>
+              <li>Svar på hver bestilling: bekreft eller avslå.</li>
+              <li>Svarer du ikke, får du en påminnelse etter ${esc(t.reminderHours)} timer.</li>
+              <li>${autocancelLine}</li>
+              <li>Hold varene oppdatert, så kunden bare kan bestille det du har.</li>
+            </ul>
+            <h3>Slik slår du av</h3>
+            <ul>
+              <li>Trykk «Slå av» på denne raden. Da får kunden kontaktinformasjonen din i stedet.</li>
+              <li>Bestillinger du allerede har fått, må du fortsatt svare på.</li>
+            </ul>
+            ${readMore}
+          </details>`;
+}
+
+/**
+ * A row's description for this owner. B2b-3: `products.stock_check` follows
+ * the soft-expiry rule when it is active for the producer; every other row
+ * (and the rule off) → the entry's description as before.
+ */
+export function ownerRowDescription(agentId: string, e: OwnerFeatureEntry, env: NodeJS.ProcessEnv = process.env): LocalizedText {
+  if (e.key === "products.stock_check" && stockSoftExpiryActiveFor(agentId, env)) return STOCK_CHECK_SOFT_EXPIRY_DESCRIPTION;
+  return ownerFeatureEntryForEnv(e, env).description;
+}
+
+function rowHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeature, swap: string): string {
+  // T8: a row that deviates from the level that applies is an «Unntak».
+  const ls = ctx.levelStatus;
+  const exception = ls && ls.kind === "custom" ? ls.exceptions.find((x) => x.key === e.key) : undefined;
+  const badges =
+    (isNew(e, ctx.now) ? ` <span class="mv-badge mv-badge-new">Nytt</span>` : "") +
+    (e.consent ? ` <span class="mv-badge">Samtykke</span>` : "") +
+    (exception ? ` <span class="mv-badge" data-level-exception="${esc(e.key)}">Unntak</span>` : "");
+  const exceptionText = exception && ls
+    ? `<p class="mv-desc">Nivået «${esc(ls.level.label.no)}» har dette ${exception.levelValue === true ? "på" : "av"}.</p>` : "";
+  const reason = r.reason && e.type !== "guarantee" && r.block !== "confirm_by_email"
+    ? `<p class="mv-reason">${esc(r.reason.no)}</p>` : "";
+  let explain = "";
+  if (e.type === "guarantee" && !ctx.explainedAlways) {
+    ctx.explainedAlways = true;
+    explain = `<p class="mv-explain">«Alltid» betyr et løfte fra ${esc(platformName(ctx.m))}. Det gjelder hele tiden og kan ikke slås av.</p>`;
+  } else if (e.type === "locked" && r.value === true && !ctx.explainedLocked) {
+    ctx.explainedLocked = true;
+    explain = `<p class="mv-explain">«Låst på» betyr at dette hører til noe du har slått på. Det følger det valget og kan ikke slås av alene.</p>`;
+  }
+  // T5: the row's own message and its confirm panel stand inside li#valg-<key>.
+  let confirm = "";
+  if (ctx.m.confirm && ctx.m.confirm.key === e.key && !ctx.confirmPlaced) {
+    confirm = confirmHtml(ctx.m, swap);
+    if (confirm) ctx.confirmPlaced = true;
+  }
+  // T7: the news row shows the versioned consent text — only here, on the
+  // allowlisted RFB page (the registry description feeds public pages).
+  const desc = !ctx.m.variant && e.key === OWNER_PAGE_NEWS_KEY ? OWNER_NEWS_CONSENT_TEXT.row.no : ownerRowDescription(ctx.m.agent.id, e).no;
+  return `<li class="mv-item" id="${esc(ownerRowAnchor(e.key))}" data-key="${esc(e.key)}">
+          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong>${badges}<p class="mv-desc">${esc(desc)}</p>${exceptionText}${reason}${explain}${rowExtraHtml(ctx, e, r)}</div>
+          <div class="mv-item-ctl">${controlHtml(ctx, e, r, swap)}</div>${noticeAtHtml(ctx, ownerRowAnchor(e.key))}${confirm}
+        </li>`;
+}
+
+/** The built entries of one group, split as the page shows them. */
+function groupEntries(m: OwnerPageModel, registry: OwnerFeatureEntry[], group: string) {
+  const reveal = findOwnerFeature(m.variant ? m.variant.revealKey : OWNER_PAGE_REVEAL_KEY, registry);
+  const revealOn = !!reveal && m.resolved.byKey[reveal.key]?.value === true;
+  const entries = registry.filter((e) => e.group === group && isOwnerFeatureBuilt(e) && m.resolved.byKey[e.key]);
+  const hidden = entries.filter((e) => !!reveal && !revealOn && e.requires.includes(reveal.key as any));
+  const shown = entries.filter((e) => !hidden.includes(e));
+  return { reveal, shown, hidden };
+}
+
+/** One card per group (T9: each is a region `gruppe-<key>`; "" = the group has nothing to show). */
+function groupRegions(ctx: RenderCtx, registry: OwnerFeatureEntry[]): OwnerPageRegion[] {
+  const m = ctx.m;
+  return pageGroups(m).map((g) => {
+    const swap = `gruppe-${g.key}`;
+    const { reveal, shown, hidden } = groupEntries(m, registry, g.key);
+    if (shown.length === 0 && hidden.length === 0) return { id: swap, html: "" };
+    const basic = shown.filter((e) => !e.advanced).map((e) => rowHtml(ctx, e, m.resolved.byKey[e.key], swap)).join("");
+    const advEntries = shown.filter((e) => e.advanced);
+    const adv = advEntries.map((e) => rowHtml(ctx, e, m.resolved.byKey[e.key], swap)).join("");
+    // T5: «Flere valg» opens when the message or confirm panel is in one of its rows.
+    const advOpen = advEntries.some((e) => isTarget(m, e.key));
+    const hiddenNote = hidden.length && reveal
+      ? `<p class="mv-note">${hidden.length} valg til vises når du slår på «${esc(reveal.label.no)}».</p>`
+      : "";
+    // T7: the group subtitles, and the news question at the top of «comms» (RFB page only).
+    const note = m.variant ? "" : g.key === "comms" ? OWNER_COMMS_GROUP_NOTE : g.key === "notify" ? OWNER_NOTIFY_GROUP_NOTE : "";
+    return { id: swap, html: `<section class="ep-card mv-group" id="${esc(swap)}" data-group="${esc(g.key)}" aria-labelledby="mv-h-${esc(g.key)}">
+        <details class="mv-fold" open>
+          <summary class="mv-fold-summary"><h2 id="mv-h-${esc(g.key)}">${esc(g.label.no)}</h2></summary>
+          ${note ? `<p class="mv-desc mv-group-note">${esc(note)}</p>` : ""}
+          ${noticeAtHtml(ctx, swap)}
+          ${g.key === "comms" ? newsQuestionHtml(m, swap) : ""}
+          ${basic ? `<ul class="mv-list">${basic}</ul>` : ""}
+          ${adv ? `<details class="mv-more"${advOpen ? " open" : ""}><summary>Flere valg</summary><ul class="mv-list">${adv}</ul></details>` : ""}
+          ${hiddenNote}
+        </details>
+      </section>` };
+  });
+}
+
+/** v2 principle 2: every planned entry, closed by default, «Gi meg beskjed» per row, no value. */
+function plannedHtml(ctx: RenderCtx, registry: OwnerFeatureEntry[]): string {
+  const m = ctx.m;
+  const planned = registry.filter((e) => !isOwnerFeatureBuilt(e) && m.resolved.byKey[e.key]);
+  if (planned.length === 0) return "";
+  const groupLabel = new Map(pageGroups(m).map((g) => [g.key as string, g.label.no] as const));
+  const interest = m.interest ?? new Set<string>();
+  const rows = planned.map((e) => {
+    const asked = interest.has(e.key);
+    const ctl = asked
+      ? `<span class="mv-state mv-asked">Du har sagt fra</span>`
+      : rowForm(m, "/interesse", "planlagt",
+          `<input type="hidden" name="key" value="${esc(e.key)}"><button type="submit" class="ep-btn ep-btn-secondary">Gi meg beskjed</button>`);
+    return `<li class="mv-item mv-item-planned" id="${esc(ownerPlannedAnchor(e.key))}" data-planned-key="${esc(e.key)}">
+          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong> <span class="mv-badge">${esc(groupLabel.get(e.group) ?? "")}</span><p class="mv-desc">${esc(ownerFeatureEntryForEnv(e).description.no)}</p></div>
+          <div class="mv-item-ctl">${ctl}</div>${noticeAtHtml(ctx, ownerPlannedAnchor(e.key))}
+        </li>`;
+  }).join("");
+  // T5: the box (closed by default) opens when the message stands in it.
+  const open = !!m.notice && (m.noticeAt === OWNER_ANCHOR_PLANNED || planned.some((e) => m.noticeAt === ownerPlannedAnchor(e.key)));
+  return `<details class="ep-card mv-planned" id="${OWNER_ANCHOR_PLANNED}"${open ? " open" : ""}>
+        <summary class="mv-fold-summary"><h2 id="mv-h-planlagt">${esc(OWNER_PAGE_PLANNED_TITLE)} (${planned.length})</h2></summary>
+        ${noticeAtHtml(ctx, OWNER_ANCHOR_PLANNED)}
+        <p class="mv-desc">Dette er ikke bygget ennå. Trykk «Gi meg beskjed» på det du vil ha. Vi lagrer bare at du har sagt fra: ingenting på profilen endres, og vi sender ingen e-post nå.</p>
+        <ul class="mv-list">${rows}</ul>
+      </details>`;
+}
+
+function levelsHtml(ctx: RenderCtx): string {
+  const m = ctx.m;
+  if (!m.variant) return rfbLevelsHtml(ctx);
+  // Gårdssalg: unchanged until T20 (marked only after the owner's own choice).
+  const cards = m.variant.levels.map((l) => {
+    const current = m.level === l.key;
+    return `<li class="mv-level"${current ? ` aria-current="true"` : ""} data-level="${esc(l.key)}">
+          <strong>${esc(l.label.no)}</strong>${l.recommended ? ` <span class="mv-badge mv-badge-new">Anbefalt</span>` : ""}${l.key === "bare_synlig" ? ` <span class="mv-badge">Standard</span>` : ""}
+          <p class="mv-desc">${esc(l.description.no)}</p>
+          ${current
+            ? `<span class="mv-state">Valgt</span>`
+            : `<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m, `?niva=${encodeURIComponent(l.key)}#${OWNER_ANCHOR_LEVEL_PREVIEW}`))}" data-mv-row="${OWNER_ANCHOR_LEVEL}">Velg «${esc(l.label.no)}»</a>`}
+        </li>`;
+  }).join("");
+  const note = m.level === "custom"
+    ? `<p class="mv-note">Nå: <strong>${esc(OWNER_LEVEL_CUSTOM_LABEL.no)}</strong> — du har endret noe etter at du valgte nivå.</p>`
+    : m.level === null
+      ? `<p class="mv-note">Du har ikke valgt nivå ennå. Valgene dine står under.</p>`
+      : "";
+  // T5: the preview and the level message stand inside the level card.
+  return `<section class="ep-card" id="${OWNER_ANCHOR_LEVEL}" aria-labelledby="mv-h-niva">
+        <h2 id="mv-h-niva">Hvor aktiv vil du være?</h2>
+        ${note}
+        ${noticeAtHtml(ctx, OWNER_ANCHOR_LEVEL)}
+        <ul class="mv-levels">${cards}</ul>
+        ${levelPreviewHtml(m)}
+        ${statusLineHtml(m)}
+      </section>`;
+}
+
+/**
+ * T8: the RFB level status, computed from the switches (no owner choice
+ * needed to compute it; `choice` only says who chose). Shared by «Mine valg»
+ * and the T15b «Oversikt» block, so both always show the same level.
+ */
+export function ownerRfbLevelStatus(
+  resolved: ResolvedOwnerFeatures,
+  choice: { level: OwnerLevel; at: string } | null,
+  registry: OwnerFeatureEntry[] = OWNER_FEATURE_REGISTRY,
+): OwnerLevelStatus | null {
+  return ownerLevelStatus(deriveOwnerLevel(resolved, OWNER_LEVELS, registry), choice);
+}
+
+/**
+ * T8: the level status line's text (plain, not escaped). «Tilpasset» ends
+ * after the number of exceptions; the reset link is the page's own.
+ */
+export function ownerLevelStatusText(st: OwnerLevelStatus): string {
+  const name = st.level.label.no;
+  switch (st.kind) {
+    case "default":
+      return "Du står på standardvalgene. Du trenger ikke gjøre noe.";
+    case "chosen":
+      return `Du valgte «${name}» ${formatDate(st.at)}.`;
+    case "matches":
+      return `Valgene dine passer med «${name}».`;
+    case "custom":
+      return `Tilpasset: valgene dine bygger på «${name}», med ${st.exceptions.length} unntak.`;
+  }
+}
+
+/** T8: the level status line on the RFB page (who chose; «Tilpasset» with the reset link). */
+function levelStatusLineHtml(m: OwnerPageModel, st: OwnerLevelStatus | null): string {
+  if (!st) return "";
+  const text = esc(ownerLevelStatusText(st));
+  if (st.kind !== "custom") return `<p class="mv-note" data-level-status="${st.kind}">${text}</p>`;
+  const name = esc(st.level.label.no);
+  const href = actionPath(m, `?niva=${encodeURIComponent(st.level.key)}#${OWNER_ANCHOR_LEVEL_PREVIEW}`);
+  return `<p class="mv-note" data-level-status="custom">${text} <a href="${esc(href)}" data-mv-row="${OWNER_ANCHOR_LEVEL}">Tilbakestill til «${name}»</a></p>`;
+}
+
+/**
+ * T8 (RFB page): «Minst mulig» («Standard») and «Utnytte mulighetene». The
+ * card of the level that applies now (from the switches, with no exceptions)
+ * is marked «Gjelder nå» (aria-current, Q1); the status line says who chose.
+ */
+function rfbLevelsHtml(ctx: RenderCtx): string {
+  const m = ctx.m;
+  const st = ctx.levelStatus;
+  const applies = st && st.kind !== "custom" ? st.level.key : null;
+  const cards = OWNER_LEVELS.map((l) => {
+    const current = applies === l.key;
+    return `<li class="mv-level"${current ? ` aria-current="true"` : ""} data-level="${esc(l.key)}">
+          <strong>${esc(l.label.no)}</strong>${l.key === OWNER_LEVEL_DEFAULT_KEY ? ` <span class="mv-badge">Standard</span>` : ""}
+          <p class="mv-desc">${esc(l.description.no)}</p>
+          ${current
+            ? `<span class="mv-state">Gjelder nå</span>`
+            : `<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m, `?niva=${encodeURIComponent(l.key)}#${OWNER_ANCHOR_LEVEL_PREVIEW}`))}" data-mv-row="${OWNER_ANCHOR_LEVEL}">Velg «${esc(l.label.no)}»</a>`}
+        </li>`;
+  }).join("");
+  // T5: the preview and the level message stand inside the level card.
+  return `<section class="ep-card" id="${OWNER_ANCHOR_LEVEL}" aria-labelledby="mv-h-niva">
+        <h2 id="mv-h-niva">Hvor aktiv vil du være?</h2>
+        <p class="mv-desc">Velg nivå. Valgene lenger ned settes etter nivået, og du kan gjøre unntak.</p>
+        ${levelStatusLineHtml(m, st)}
+        ${noticeAtHtml(ctx, OWNER_ANCHOR_LEVEL)}
+        <ul class="mv-levels">${cards}</ul>
+        <p class="mv-desc">Nivået endrer aldri om profilen er synlig, og aldri «Nyheter og tips». Det bestemmer du selv.</p>
+        ${rfbLevelPreviewHtml(m, st)}
+        ${statusLineHtml(m)}
+      </section>`;
+}
+
+function statusLineHtml(m: OwnerPageModel): string {
+  const registry = m.registry ?? OWNER_FEATURE_REGISTRY;
+  const items = (m.variant ? m.variant.statusKeys : OWNER_PAGE_STATUS_KEYS).map((k) => {
+    const e = findOwnerFeature(k, registry);
+    const r = m.resolved.byKey[k];
+    const v = e ? ownerFeatureRowValue(e, r) : null;
+    if (!e || v === null) return "";
+    return `<li data-status-key="${esc(k)}"><span>${esc(e.label.no)}:</span> <strong>${esc(v)}</strong></li>`;
+  }).join("");
+  return items ? `<div class="mv-status"><h3>Slik er du nå</h3><ul>${items}</ul></div>` : "";
+}
+
+function levelPreviewHtml(m: OwnerPageModel): string {
+  const p = m.levelPreview;
+  if (!p) return "";
+  const registry = m.registry ?? OWNER_FEATURE_REGISTRY;
+  const label = (k: string) => findOwnerFeature(k, registry)?.label.no ?? k;
+  const changes = p.changes.map((c) => {
+    const e = findOwnerFeature(c.key, registry);
+    const confirm = c.to === true ? e?.confirmOn : c.to === false ? e?.confirmOff : undefined;
+    return `<li><strong>${esc(label(c.key))}</strong>: ${esc(formatOwnerFeatureValue(e, c.from))} → ${esc(formatOwnerFeatureValue(e, c.to))}${confirm ? `<p class="mv-desc">${esc(confirm.no)}</p>` : ""}</li>`;
+  }).join("");
+  const skipped = p.skipped.map((s) => `<li><strong>${esc(label(s.key))}</strong> endres ikke: ${esc(s.reason.no)}</li>`).join("");
+  const cancel = `<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m, `#${OWNER_ANCHOR_LEVEL}`))}" data-mv-cancel="1">Avbryt</a>`;
+  const confirmForm = `<form method="post" action="${esc(actionPath(m, "/niva"))}" class="mv-ctl-form" data-mv-row="${OWNER_ANCHOR_LEVEL}">
+            <input type="hidden" name="level" value="${esc(p.level.key)}">
+            <input type="hidden" name="confirmed" value="1">
+            <button type="submit" class="ep-btn ep-btn-primary">Bekreft «${esc(p.level.label.no)}»</button>
+          </form>`;
+  const body = p.changes.length
+    ? `<p>Dette endres:</p><ul>${changes}</ul>${skipped ? `<ul>${skipped}</ul>` : ""}
+        <div class="ep-form-actions">
+          ${confirmForm}
+          ${cancel}
+        </div>`
+    : `<p>Valgene dine er allerede slik. Bekreft for å velge nivået.</p>${skipped ? `<ul>${skipped}</ul>` : ""}
+        <div class="ep-form-actions">${skipped ? "" : confirmForm}${cancel}</div>`;
+  return `<section class="mv-confirm mv-confirm-inline" id="${OWNER_ANCHOR_LEVEL_PREVIEW}" role="region" aria-labelledby="mv-h-niva-forhandsvis">
+        <h3 id="mv-h-niva-forhandsvis">Bytte til «${esc(p.level.label.no)}»?</h3>
+        ${body}
+      </section>`;
+}
+
+/** T10: shown under the stock-check change in the RFB level preview. */
+const LEVEL_PREVIEW_STOCK_CHECK_NOTE = "Påminnelse om lagerstatus på e-post (høyst én hver 14. dag)";
+/** T10: «Dette må du gjøre» when a level switches orders off. */
+const LEVEL_PREVIEW_ORDERS_OFF_TODO = "Bestillinger du allerede har fått, må du fortsatt svare på. Nye kunder får kontaktinformasjonen din i stedet.";
+const LEVEL_PREVIEW_GOOD_TO_KNOW = "Du kan gjøre unntak etterpå. Trykker du «Angre», går hele nivåbyttet tilbake.";
+
+/**
+ * T10 (RFB page, punkt 3 «Velge»): the level preview inside the level card —
+ * «Dette endres», «Følger med», «Endres ikke», «Dette må du gjøre», «Dette
+ * mangler» and «Godt å vite» (a section only when it has something). A hard
+ * requirement (OwnerLevelPreview.requirements.hard) gives «Du kan ikke velge
+ * «{nivå}» før dette er på plass:» and NO confirm button (the POST refuses it
+ * too, applyOwnerLevel → not_ready); a soft one is a warning and the level can
+ * still be confirmed. Plain links and forms — works without JavaScript; the
+ * T9 script swaps the #niva region rendered by this same function.
+ */
+function rfbLevelPreviewHtml(m: OwnerPageModel, st: OwnerLevelStatus | null): string {
+  const p = m.levelPreview;
+  if (!p) return "";
+  const registry = m.registry ?? OWNER_FEATURE_REGISTRY;
+  const label = (k: string) => findOwnerFeature(k, registry)?.label.no ?? k;
+  const name = esc(p.level.label.no);
+  const req = p.requirements ?? { hard: [], soft: [] };
+  const blocked = req.hard.length > 0;
+  const exceptions = new Set(st && st.kind === "custom" ? st.exceptions.map((x) => x.key) : []);
+  const section = (title: string, inner: string) =>
+    inner ? `<div class="mv-preview-part"><h4>${esc(title)}</h4>${inner}</div>` : "";
+  const list = (items: string[]) => (items.length ? `<ul>${items.join("")}</ul>` : "");
+
+  const changes = p.changes.map((c) => {
+    const e = findOwnerFeature(c.key, registry);
+    const note = c.key === "products.stock_check" && c.to === true ? `<p class="mv-desc">${esc(LEVEL_PREVIEW_STOCK_CHECK_NOTE)}</p>` : "";
+    return `<li><strong>${esc(label(c.key))}</strong>: ${esc(formatOwnerFeatureValue(e, c.from))} → ${esc(formatOwnerFeatureValue(e, c.to))}${exceptions.has(c.key) ? " (ditt unntak)" : ""}${note}</li>`;
+  });
+  const follows = (p.follows ?? []).map((f) => {
+    const e = findOwnerFeature(f.key, registry);
+    return `<li><strong>${esc(label(f.key))}</strong>: ${esc(formatOwnerFeatureValue(e, f.from))} → ${esc(formatOwnerFeatureValue(e, f.to))}</li>`;
+  });
+  const unchanged = p.skipped.map((s) => `<li><strong>${esc(label(s.key))}</strong> endres ikke: ${esc(s.reason.no)}</li>`);
+  const vis = m.resolved.byKey["visibility.profile"];
+  if (vis) unchanged.push(`<li>Profilen er synlig: ${vis.value === false ? "Av" : "På"}</li>`);
+  if (findOwnerFeature("comms.news", registry)) unchanged.push(`<li>Nyheter og tips: du bestemmer selv</li>`);
+  const ordersOnAfter = p.level.values.some(([k, v]) => k === "orders.enabled" && v === true);
+  if (ordersOnAfter && m.orderEmail?.current) unchanged.push(`<li>Bestillinger sendes til: ${esc(m.orderEmail.current)}</li>`);
+
+  const todo: string[] = [];
+  for (const c of p.changes) {
+    const e = findOwnerFeature(c.key, registry);
+    if (c.key === "orders.enabled" && c.to === false) { todo.push(`<li>${esc(LEVEL_PREVIEW_ORDERS_OFF_TODO)}</li>`); continue; }
+    const t = c.to === true ? e?.confirmOn : c.to === false ? e?.confirmOff : undefined;
+    if (t) todo.push(`<li>${esc(t.no)}</li>`);
+  }
+
+  const missing = blocked
+    ? `<p>Du kan ikke velge «${name}» før dette er på plass:</p>${list(req.hard.map((h) => `<li data-level-requirement="${esc(h.code)}">${esc(h.text.no)}</li>`))}`
+    : list(req.soft.map((w) => `<li data-level-warning="${esc(w.code)}">${esc(w.text.no)}</li>`));
+
+  const cancel = `<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m, `#${OWNER_ANCHOR_LEVEL}`))}" data-mv-cancel="1">Avbryt</a>`;
+  const confirmForm = `<form method="post" action="${esc(actionPath(m, "/niva"))}" class="mv-ctl-form" data-mv-row="${OWNER_ANCHOR_LEVEL}">
+            <input type="hidden" name="level" value="${esc(p.level.key)}">
+            <input type="hidden" name="confirmed" value="1">
+            <button type="submit" class="ep-btn ep-btn-primary">Bekreft «${name}»</button>
+          </form>`;
+  const showConfirm = !blocked && (p.changes.length > 0 || p.skipped.length === 0);
+  const same = !blocked && p.changes.length === 0 ? `<p>Valgene dine er allerede slik. Bekreft for å velge nivået.</p>` : "";
+  return `<section class="mv-confirm mv-confirm-inline" id="${OWNER_ANCHOR_LEVEL_PREVIEW}" role="region" aria-labelledby="mv-h-niva-forhandsvis"${blocked ? ` data-level-blocked="1"` : ""}>
+        <h3 id="mv-h-niva-forhandsvis">Bytte til «${name}»?</h3>
+        ${same}${section("Dette endres", list(changes))}${section("Følger med", list(follows))}${section("Endres ikke", list(unchanged))}${section("Dette må du gjøre", list(todo))}${section("Dette mangler", missing)}${section("Godt å vite", blocked ? "" : `<p>${esc(LEVEL_PREVIEW_GOOD_TO_KNOW)}</p>`)}
+        <div class="ep-form-actions">
+          ${showConfirm ? confirmForm : ""}
+          ${cancel}
+        </div>
+      </section>`;
+}
+
+/** The switch confirm panel — rendered inside li#valg-<key> (T5); `swap` = the row's card for the script. */
+function confirmHtml(m: OwnerPageModel, swap: string): string {
+  const c = m.confirm;
+  if (!c) return "";
+  const registry = m.registry ?? OWNER_FEATURE_REGISTRY;
+  const e = findOwnerFeature(c.key, registry);
+  const text = e ? (c.value ? e.confirmOn : e.confirmOff) : undefined;
+  if (!e || !text) return "";
+  // The pause keeps the optional resume date the /eier pause card had.
+  const until = e.key === OWNER_PAGE_PAUSE_KEY && !c.value && (!m.variant || m.variant.pauseResumeDate)
+    ? `<div class="ep-field"><label for="mv-pause-until">Kommer tilbake (valgfritt)</label><input id="mv-pause-until" name="until" type="date" aria-label="Dato profilen kommer tilbake"></div>`
+    : "";
+  return `<div class="mv-confirm mv-confirm-inline" data-confirm-key="${esc(e.key)}" role="region" aria-labelledby="mv-h-bekreft">
+        <h3 id="mv-h-bekreft" tabindex="-1">${esc(c.value ? "Slå på" : "Slå av")} «${esc(e.label.no)}»?</h3>
+        <p>${esc(text.no)}</p>
+        <form method="post" action="${esc(actionPath(m, "/sett"))}" class="mv-confirm-form" data-mv-row="${esc(swap)}">
+          <input type="hidden" name="key" value="${esc(e.key)}">
+          <input type="hidden" name="value" value="${c.value ? "true" : "false"}">
+          <input type="hidden" name="confirmed" value="1">
+          ${until}
+          <div class="ep-form-actions">
+            <button type="submit" class="ep-btn ep-btn-primary">Ja, ${esc(c.value ? "slå på" : "slå av")}</button>
+            <a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m, `#${ownerRowAnchor(e.key)}`))}" data-mv-cancel="1">Avbryt</a>
+          </div>
+        </form>
+      </div>`;
+}
+
+/**
+ * T7: the «Nyheter og tips» question at the top of «Kontakt fra Rett fra
+ * Bonden» — never a pop-up, never at the top of the page, never by e-mail.
+ * «Ja takk» and «Ikke nå» carry the same class (neither is primary); «Nei,
+ * ikke spør meg igjen» is a quiet POST link button. The answer lands in the
+ * group (or, for «Ja takk», in the row #valg-comms.news).
+ */
+function newsQuestionHtml(m: OwnerPageModel, swap: string): string {
+  if (!m.showIntro || m.variant) return "";
+  const t = OWNER_NEWS_CONSENT_TEXT;
+  const form = (answer: "yes" | "later" | "never", label: string, cls: string) =>
+    rowForm(m, "/intro", swap,
+      `<input type="hidden" name="answer" value="${answer}"><input type="hidden" name="placement" value="${esc(OWNER_NEWS_PLACEMENT_QUESTION)}">` +
+      `<button type="submit" class="${cls}">${esc(label)}</button>`);
+  return `<div class="mv-question" data-news-question="1" role="group" aria-labelledby="mv-h-intro">
+          <h3 id="mv-h-intro">${esc(t.question)}</h3>
+          <p>${esc(t.body)}</p>
+          <p class="mv-desc">${esc(t.always)}</p>
+          <div class="ep-form-actions mv-question-actions">${form("yes", t.yes, "ep-btn ep-btn-secondary mv-answer")}${form("later", t.later, "ep-btn ep-btn-secondary mv-answer")}</div>
+          <p class="mv-desc">${esc(t.laterNote)}</p>
+          ${form("never", t.never, "mv-linkbtn")}
+        </div>`;
+}
+
+function logHtml(ctx: RenderCtx): string {
+  const m = ctx.m;
+  const registry = m.registry ?? OWNER_FEATURE_REGISTRY;
+  const items = m.log.rows.map((r) => {
+    const e = findOwnerFeature(r.key, registry);
+    const label = e ? e.label.no : r.key;
+    const who = r.actor === "admin" ? platformName(m) : (ACTOR_LABELS[r.actor] ?? "Systemet");
+    return `<li class="ep-audit-item"><strong>${esc(label)}</strong>: ${esc(formatOwnerFeatureValue(e, r.old_value))} → ${esc(formatOwnerFeatureValue(e, r.new_value))}${r.undo ? ` <span class="mv-badge">Angret</span>` : ""}
+          <div class="ep-audit-meta">${esc(formatWhen(r.at))} · ${esc(who)}</div></li>`;
+  }).join("");
+  const nav: string[] = [];
+  if (m.log.page > 1) nav.push(`<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m, `?side=${m.log.page - 1}#endringslogg`))}" data-mv-row="${OWNER_ANCHOR_LOG}">Nyere</a>`);
+  if (m.log.page < m.log.pages) nav.push(`<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m, `?side=${m.log.page + 1}#endringslogg`))}" data-mv-row="${OWNER_ANCHOR_LOG}">Eldre</a>`);
+  return `<section class="ep-card" id="endringslogg" aria-labelledby="mv-h-logg">
+        <details class="mv-fold" open>
+          <summary class="mv-fold-summary"><h2 id="mv-h-logg">Endringslogg</h2></summary>
+          ${noticeAtHtml(ctx, OWNER_ANCHOR_LOG)}
+          <p class="mv-desc">Hva som er endret, når og av hvem. Nyeste først.</p>
+          ${items ? `<ul class="ep-audit-list">${items}</ul>` : `<p class="mv-desc">Ingen endringer ennå.</p>`}
+          ${nav.length ? `<div class="ep-form-actions mv-pager">${nav.join("")}<span class="mv-desc">Side ${m.log.page} av ${m.log.pages}</span></div>` : ""}
+        </details>
+      </section>`;
+}
+
+/** The message; `inline` = in its card or row (T5), else the sticky slot at the bottom. */
+function noticeHtml(m: OwnerPageModel, inline = false): string {
+  const n = m.notice;
+  if (!n) return "";
+  const undo = n.undoBatchId
+    ? `<form method="post" action="${esc(actionPath(m, "/angre"))}" class="mv-ctl-form" data-mv="angre"><input type="hidden" name="batch" value="${esc(n.undoBatchId)}"><button type="submit" class="ep-btn ep-btn-secondary">Angre</button></form>`
+    : "";
+  return `<div class="mv-toast${inline ? " mv-toast-inline" : ""} ${n.ok ? "mv-toast-ok" : "mv-toast-error"}" role="${n.ok ? "status" : "alert"}"><span>${esc(n.text)}</span>${undo}</div>`;
+}
+
+const nbNum = (n: number) => n.toLocaleString("nb-NO");
+
+/**
+ * Gårdssalg (O1 principle 1, proof first): the portal's own Statistikk
+ * numbers (getGardssalgOwnerStats — the same source as GET
+ * /api/opplevelser/gardssalg-claim/:id/stats, no new counting), each with the
+ * period its source covers. Low numbers get one sentence and one tip.
+ */
+function gardssalgStatsHtml(m: OwnerPageModel): string {
+  const st = m.gardssalgStats;
+  if (st === undefined) return "";
+  const link = m.statsHref ? `<div class="ep-form-actions"><a class="ep-btn ep-btn-secondary" href="${esc(m.statsHref)}">Se all statistikk</a></div>` : "";
+  if (st === null) {
+    return `<section class="ep-card" id="statistikk" aria-labelledby="statistikk-h"><h2 id="statistikk-h">Dette har profilen gjort for deg</h2>
+      <p class="mv-note">Statistikken kunne ikke lastes akkurat nå. Prøv igjen senere.</p>${link}</section>`;
+  }
+  const tile = (value: number, label: string, period: string) =>
+    `<li class="mv-stat"><strong>${esc(nbNum(value))}</strong><span>${esc(label)}</span><small>${esc(period)}</small></li>`;
+  const low = st.humanViews < OWNER_PAGE_LOW_VIEWS_FALLBACK;
+  return `<section class="ep-card" id="statistikk" aria-labelledby="statistikk-h">
+      <h2 id="statistikk-h">Dette har profilen gjort for deg</h2>
+      <ul class="mv-stats">
+        ${tile(st.humanViews, "Personer som så profilen", `siste ${st.windowDays} dager`)}
+        ${tile(st.aiSearchViews, "Funnet via AI-assistenter", `siste ${st.windowDays} dager`)}
+        ${st.aiDeliveries ? tile(st.aiDeliveries.value, "Med i treffene til AI-assistenter", st.aiDeliveries.label) : ""}
+      </ul>
+      ${low ? `<p class="mv-note">Tallene er lave ennå, og det er vanlig for en profil som er ny eller lite kjent.</p>
+      <p class="mv-check">Tips: ${esc(st.tip)}</p>` : ""}
+      ${link}
+    </section>`;
+}
+
+/** S2f: the statistics block (v2 principle 1: proof first). */
+function statsHtml(m: OwnerPageModel): string {
+  if (m.gardssalgStats !== undefined) return gardssalgStatsHtml(m);
+  if (m.stats === undefined) return "";
+  const link = m.statsHref ? `<div class="ep-form-actions"><a class="ep-btn ep-btn-secondary" href="${esc(m.statsHref)}">Se all statistikk</a></div>` : "";
+  const st = m.stats;
+  if (st === null) {
+    return `<section class="ep-card" id="statistikk" aria-labelledby="statistikk-h"><h2 id="statistikk-h">Dette har profilen gjort for deg</h2>
+      <p class="mv-note">Statistikken kunne ikke lastes akkurat nå. Prøv igjen senere.</p>${link}</section>`;
+  }
+  const tile = (value: number, label: string, period: string, extra = "") =>
+    `<li class="mv-stat"><strong>${esc(nbNum(value))}</strong><span>${esc(label)}</span><small>${esc(period)}</small>${extra}</li>`;
+  const split = `<small>${esc(`ChatGPT ${nbNum(st.aiSplit.chatgpt)} · Claude ${nbNum(st.aiSplit.claude)} · Andre ${nbNum(st.aiSplit.other)} (siste ${st.aiSplit.days} dager)`)}</small>`;
+  const low = ownerStatsAreLow(st);
+  const lowHtml = !low ? "" : st.minPublicViews > 0
+    ? `<p class="mv-note">Tallene er lave ennå, og de vises ikke offentlig på profilen før den har ${esc(st.minPublicViews)} sidevisninger fra mennesker siste 12 måneder (her ser du dem alltid).</p>
+      <p class="mv-check">Tips: ${esc(st.tip)}</p>`
+    : `<p class="mv-note">Tallene er lave ennå, og det er vanlig for en profil som er ny eller lite kjent.</p>
+      <p class="mv-check">Tips: ${esc(st.tip)}</p>`;
+  return `<section class="ep-card" id="statistikk" aria-labelledby="statistikk-h">
+      <h2 id="statistikk-h">Dette har profilen gjort for deg</h2>
+      <ul class="mv-stats">
+        ${tile(st.humanViews.value, "Besøk på profilen", st.humanViews.label)}
+        ${tile(st.aiViews.value, "Hentet av AI-assistenter", st.aiViews.label, split)}
+        ${tile(st.aiDeliveries.value, "Med i treffene til AI-assistenter", st.aiDeliveries.label)}
+        ${tile(st.clicks.phone, "Trykk på telefon", `siste ${st.clicks.days} dager`)}
+        ${tile(st.clicks.website, "Trykk på nettside", `siste ${st.clicks.days} dager`)}
+      </ul>
+      <p class="mv-note">Trykk på kart telles ikke ennå.</p>
+      ${lowHtml}
+      ${link}
+    </section>`;
+}
+
+/** v2 principle 9: jump links (shown on narrow screens). */
+function jumpNavHtml(m: OwnerPageModel, registry: OwnerFeatureEntry[]): string {
+  const hasStats = m.stats !== undefined || m.gardssalgStats !== undefined;
+  const links: Array<[string, string]> = hasStats ? [["statistikk", "Statistikk"], ["niva", "Nivå"]] : [["niva", "Nivå"]];
+  for (const g of pageGroups(m)) {
+    const { shown, hidden } = groupEntries(m, registry, g.key);
+    if (shown.length || hidden.length) links.push([`gruppe-${g.key}`, g.label.no]);
+  }
+  if (registry.some((e) => !isOwnerFeatureBuilt(e) && m.resolved.byKey[e.key])) links.push(["planlagt", "Planlagt"]);
+  links.push(["endringslogg", "Endringslogg"]);
+  return `<nav class="mv-jump" aria-label="Hopp til">${links.map(([id, label]) => `<a href="#${esc(id)}">${esc(label)}</a>`).join("")}</nav>`;
+}
+
+/**
+ * v2 principle 9 / T9: a save updates only the regions it changed. The
+ * shared enhancement script (owner-ui/enhance.ts) over the plain forms,
+ * which keep working without JavaScript (303 + anchor, T5).
+ */
+export const OWNER_PAGE_SCRIPT = OWNER_ENHANCE_SCRIPT;
+
+/**
+ * Page-only CSS on top of PORTAL_PALETTE_CSS: layout, ≥ 44 px targets, dark
+ * mode. T6: the colours are the shared owner tokens (src/owner-ui/tokens.ts),
+ * which switch with prefers-color-scheme; the dark block only re-colours the
+ * shell's ep-* classes (kept dark-only, as the gårdssalg shell has its own
+ * light ep-* colours).
+ */
+export const OWNER_PAGE_CSS = `
+${OWNER_TOKEN_CSS}  .mv-page, .mv-page * { overflow-wrap: anywhere; }
+  .mv-page { max-width: 100%; }
+  .mv-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .mv-desc { margin: 4px 0 0; font-size: 0.88rem; color: var(--ow-muted); }
+  .mv-reason { margin: 4px 0 0; font-size: 0.85rem; color: var(--ow-warn); }
+  .mv-explain { margin: 4px 0 0; font-size: 0.85rem; color: var(--ow-text-soft); font-style: italic; }
+  .mv-note { font-size: 0.88rem; color: var(--ow-muted); margin: 12px 0 0; }
+  .mv-check { margin: 8px 0 0; font-size: 0.9rem; font-weight: 600; color: var(--ow-accent); }
+  .mv-check-missing { color: var(--ow-warn); }
+  .mv-list { list-style: none; margin: 0; padding: 0; }
+  .mv-item { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; padding: 12px 0; border-bottom: 1px solid var(--ow-divider); }
+  .mv-item:last-child { border-bottom: none; }
+  .mv-item-text { flex: 1 1 220px; min-width: 0; }
+  .mv-item-ctl { flex: 0 1 auto; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; max-width: 100%; }
+  .mv-ctl-form, .mv-confirm-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0; max-width: 100%; }
+  .mv-confirm-form { flex-direction: column; align-items: stretch; }
+  .mv-ctl-form select, .mv-ctl-form input:not([type=hidden]), .mv-confirm-form input:not([type=hidden]) { min-height: 44px; max-width: 100%; padding: 8px 10px; font-size: 1rem; font-family: inherit; border: 1px solid var(--ow-input-border); border-radius: 8px; background: var(--ow-input-bg); color: var(--ow-input-text); }
+  .mv-state { display: inline-flex; align-items: center; min-height: 44px; font-weight: 600; }
+  .mv-always { color: var(--ow-accent); }
+  .mv-asked { color: var(--ow-accent); }
+  .mv-badge { display: inline-block; font-size: 0.72rem; font-weight: 600; padding: 2px 8px; border-radius: 999px; background: var(--ow-badge-bg); color: var(--ow-badge-text); vertical-align: middle; }
+  .mv-badge-new { background: var(--ow-badge-new-bg); color: var(--ow-badge-new-text); }
+  .mv-levels { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: 1fr; gap: 12px; }
+  .mv-level { border: 1px solid var(--ow-border); border-radius: 10px; padding: 14px; display: flex; flex-direction: column; gap: 6px; }
+  .mv-level[aria-current="true"] { border-color: var(--ow-accent-line); box-shadow: inset 0 0 0 1px var(--ow-accent-line); }
+  @media (min-width: 640px) { .mv-levels { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .mv-status { margin-top: 16px; }
+  .mv-status h3 { font-size: 0.95rem; margin: 0 0 6px; }
+  .mv-status ul { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 0.88rem; }
+  .mv-fold-summary { min-height: 44px; display: flex; align-items: center; cursor: pointer; list-style: none; }
+  .mv-fold-summary::-webkit-details-marker { display: none; }
+  .mv-fold-summary h2 { margin: 0; flex: 1 1 auto; }
+  .mv-fold-summary::after { content: "▾"; margin-left: 8px; color: var(--ow-accent); }
+  details:not([open]) > .mv-fold-summary::after { content: "▸"; }
+  .mv-more summary, .mv-explain-box summary { min-height: 44px; display: flex; align-items: center; cursor: pointer; font-weight: 600; color: var(--ow-accent); }
+  .mv-explain-box { margin-top: 8px; font-size: 0.9rem; }
+  .mv-explain-box h3 { font-size: 0.92rem; margin: 10px 0 4px; }
+  .mv-explain-box ul { margin: 0; padding-left: 18px; }
+  .mv-jump { display: flex; flex-wrap: wrap; gap: 4px 8px; margin-top: 12px; }
+  .mv-jump a { display: inline-flex; align-items: center; min-height: 44px; padding: 0 10px; border: 1px solid var(--ow-border); border-radius: 999px; font-size: 0.88rem; text-decoration: none; }
+  @media (min-width: 900px) { .mv-jump { display: none; } }
+  .mv-confirm { border-color: var(--ow-accent-line); }
+  .mv-confirm-inline { flex: 1 1 100%; min-width: 0; margin-top: 12px; padding: 12px 14px; border: 1px solid var(--ow-accent-line); border-radius: 10px; }
+  .mv-confirm-inline h3 { font-size: 1rem; margin: 0 0 6px; }
+  .mv-preview-part h4 { font-size: 0.95rem; margin: 10px 0 4px; }
+  .mv-preview-part ul { margin: 0; padding-left: 20px; }
+  .mv-item > .mv-toast { flex: 1 1 100%; }
+  .mv-toast { position: sticky; bottom: 0; z-index: 10; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; margin-top: 16px; padding: 10px 14px; border-radius: 10px; font-size: 0.95rem; box-shadow: 0 -2px 8px rgba(0,0,0,0.08); }
+  .mv-toast-ok { background: var(--ow-ok-bg); color: var(--ow-ok-text); border: 1px solid var(--ow-ok-line); }
+  .mv-toast-error { background: var(--ow-err-bg); color: var(--ow-err-text); border: 1px solid var(--ow-err-line); }
+  .mv-toast.mv-toast-inline { position: static; box-shadow: none; margin-top: 8px; }
+  .mv-pager { align-items: center; }
+  .mv-group-note { margin: 0 0 8px; }
+  .mv-question { margin: 4px 0 12px; padding: 12px 14px; border: 1px solid var(--ow-border); border-radius: 10px; }
+  .mv-question h3 { font-size: 1rem; margin: 0 0 6px; }
+  .mv-question p { margin: 6px 0 0; }
+  .mv-question-actions { margin-top: 12px; }
+  .mv-linkbtn { display: inline-flex; align-items: center; min-height: 44px; padding: 0 4px; margin-top: 4px; background: none; border: none; color: var(--ow-accent); font: inherit; font-size: 0.92rem; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+  .mv-linkbtn:hover { text-decoration-thickness: 2px; }
+  .mv-linkbtn:focus-visible { outline: 3px solid var(--ow-accent-line); outline-offset: 2px; border-radius: 4px; }
+  .mv-stats { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  @media (min-width: 640px) { .mv-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+  .mv-stat { border: 1px solid var(--ow-border); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .mv-stat strong { font-size: 1.4rem; color: var(--ow-accent); }
+  .mv-stat span { font-size: 0.88rem; font-weight: 600; }
+  .mv-stat small { font-size: 0.78rem; color: var(--ow-muted); }
+${OWNER_STATUS_CSS}  @media (prefers-color-scheme: dark) {
+    body { background: var(--ow-page-bg); color: var(--ow-text); }
+    a, .ep-logo { color: var(--ow-accent); }
+    .ep-logo span { color: var(--ow-logo-accent); }
+    .ep-card { background: var(--ow-surface); border-color: var(--ow-border); box-shadow: none; }
+    .ep-card h1, .ep-card h2 { color: var(--ow-accent); }
+    .ep-card h2, .ep-audit-item { border-color: var(--ow-divider); }
+    .ep-btn-primary { background: var(--ow-btn-primary-bg); color: var(--ow-btn-primary-text); }
+    .ep-btn-primary:hover, .ep-btn-primary:focus { background: var(--ow-btn-primary-hover); }
+    .ep-btn-secondary { background: var(--ow-btn-secondary-bg); color: var(--ow-btn-secondary-text); border-color: var(--ow-accent-line); }
+    .ep-btn-secondary:hover { background: var(--ow-btn-secondary-hover); }
+    .ep-btn-ghost { color: var(--ow-faint); }
+    .ep-audit-meta { color: var(--ow-faint); }
+  }
+`;
+
+/** T9: one region of the page — what `?fragment=<id>` answers with. */
+export interface OwnerPageRegion {
+  id: string;
+  /** "" = the region has nothing to show in this state. */
+  html: string;
+}
+
+/**
+ * T9: the page's regions in page order, rendered by the same functions (and
+ * in the same order, so a message or panel lands in the same place) as the
+ * full page: statistics, level card, one card per group, planned, change
+ * log, message slot.
+ */
+export function renderOwnerFeaturesPageRegions(m: OwnerPageModel): OwnerPageRegion[] {
+  const registry = m.registry ?? OWNER_FEATURE_REGISTRY;
+  // T8: the RFB level status, computed from the switches (gårdssalg: none, page unchanged).
+  const levelStatus = m.variant ? null : ownerRfbLevelStatus(m.resolved, m.levelChoice ?? null, registry);
+  const ctx: RenderCtx = { m, now: m.now ?? new Date(), explainedAlways: false, explainedLocked: false, noticePlaced: false, confirmPlaced: false, levelStatus };
+  const regions: OwnerPageRegion[] = [
+    { id: "statistikk", html: statsHtml(m) },
+    { id: OWNER_ANCHOR_LEVEL, html: levelsHtml(ctx) },
+    ...groupRegions(ctx, registry),
+    { id: OWNER_ANCHOR_PLANNED, html: plannedHtml(ctx, registry) },
+    { id: OWNER_ANCHOR_LOG, html: logHtml(ctx) },
+  ];
+  regions.push({ id: OWNER_ANCHOR_FALLBACK, html: `<div id="${OWNER_ANCHOR_FALLBACK}">${ctx.confirmPlaced ? "" : confirmHtml(m, OWNER_ANCHOR_FALLBACK)}${ctx.noticePlaced ? "" : noticeHtml(m)}</div>` });
+  return regions;
+}
+
+/**
+ * T9: `?fragment=<id>[,<id>…]` — only those regions, in page order, from the
+ * same render as the full page. null = an id that is not one of this page's
+ * regions (the route answers 404).
+ */
+export function renderOwnerFeaturesPageFragment(m: OwnerPageModel, ids: readonly string[]): string | null {
+  const regions = renderOwnerFeaturesPageRegions(m);
+  const known = new Set(regions.map((r) => r.id));
+  if (ids.length === 0 || !ids.every((id) => known.has(id))) return null;
+  const want = new Set(ids);
+  return regions.filter((r) => want.has(r.id)).map((r) => r.html).join("");
+}
+
+/** The page body (inside portalShell). */
+export function renderOwnerFeaturesPageBody(m: OwnerPageModel): string {
+  const registry = m.registry ?? OWNER_FEATURE_REGISTRY;
+  const back = m.variant ? m.variant.backHref : `/eier/${encodeURIComponent(m.agent.id)}/portal`;
+  const regions = renderOwnerFeaturesPageRegions(m);
+  const html = (id: string) => regions.find((r) => r.id === id)?.html ?? "";
+  const groups = regions.filter((r) => r.id.startsWith("gruppe-")).map((r) => r.html).join("\n");
+  return `<style>${OWNER_PAGE_CSS}</style>
+    <div class="mv-page">
+      <div class="ep-card">
+        <h1>Mine valg</h1>
+        <p><strong>${esc(m.agent.name)}</strong>. Endringer lagres med en gang, og du kan angre den siste.</p>
+        <div class="ep-form-actions"><a class="ep-btn ep-btn-secondary" href="${esc(back)}">Tilbake til eierportalen</a></div>
+        ${jumpNavHtml(m, registry)}
+      </div>
+      ${html("statistikk")}
+      ${html(OWNER_ANCHOR_LEVEL)}
+      ${groups}
+      ${html(OWNER_ANCHOR_PLANNED)}
+      ${html(OWNER_ANCHOR_LOG)}
+      ${html(OWNER_ANCHOR_FALLBACK)}
+      ${OWNER_STATUS_HTML}
+    </div>
+    <script>${OWNER_PAGE_SCRIPT}</script>`;
+}

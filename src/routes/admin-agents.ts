@@ -36,11 +36,13 @@ import {
   normalizeEnrichmentVertical,
 } from "../services/enrichment-write-pause";
 import { slugify } from "../utils/slug";
+import { catalogHiddenIdExclusionSql } from "../services/agent-visibility";
 // POST /:id/slug-alias below (dev-request 2026-09-03-rfb-korrigering-navn-
 // sted-kategorier, Mål 1): reuses the SAME insertAgentSlugAlias helper that
 // updateAgent()'s rename hook writes through internally — no duplicated SQL
 // between the automatic path and this one-shot manual-backfill route.
 import { insertAgentSlugAlias } from "../services/marketplace-registry";
+import { setContactFormOnly } from "../services/contact-form-only";
 import {
   verifyOrgNumber,
   fetchBrregActivityDescription,
@@ -71,6 +73,7 @@ import { canCorrectRoadOnlyAddress } from "../services/street-address-parse";
 // goes through; mergeFieldProvenance is the SAME field_provenance merge
 // every other write path uses.
 import { canCorrectFactualField, mergeFieldProvenance } from "./admin-knowledge";
+import { judgeRfbAboutCandidate, isRfbJudgeInfraFailure } from "../services/rfb-about-judge";
 // dev-request rfb-kvalitetsgate-parity: RFB's own port of gårdssalg's
 // LLM-judge quality-gate cascade (see judgeRfbAboutCandidate below) reuses
 // ONLY the cheap, deterministic, universal prefilter — length/mangled-
@@ -97,6 +100,9 @@ import { findLocalOrgnrCandidate, type LocalOrgnrHit } from "../services/local-o
 // self-registered-review-approve route below is the ONLY caller in this
 // file — see that route for why the ping moved here from routes/marketplace.ts.
 import { pingIndexNow } from "../services/indexnow-service";
+// dev-request 2026-11-10-rfb-registreringer-og-eierkrav-folges-opp (S2): the
+// record-only pre-check behind POST /self-registered-precheck below.
+import { REGISTRATION_PRECHECK_BATCH_CAP, runRegistrationPrecheck } from "../services/registration-precheck";
 // dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep 5b —
 // shared LLM-judge + deterministic-backstop contact gate for
 // POST /brreg-contact-backfill below (mirrors lokal#655's marketplace.ts
@@ -109,12 +115,23 @@ import { gateContactCandidates } from "../services/contact-candidate-judge";
 // the call site's own comment for why this is safe to add here (candidate
 // text is LLM-generated, not raw scraped markup, so this is defense-in-depth
 // rather than the primary gate for this write path).
-import { looksLikeCodeArtifact, looksLikeThemeSpam } from "../services/description-quality";
+import {
+  looksLikeCodeArtifact, looksLikeThemeSpam,
+  organicClaimGateEnabled, organicClaimGateApplies, hasUnverifiedOrganicClaim,
+  stripOrganicListForWrite, stripOrganicCategoriesForWrite, logOrganicClaimGate,
+  REFUSED_ORGANIC_CLAIM_UNVERIFIED, STRIPPED_ORGANIC_CLAIM_UNVERIFIED,
+} from "../services/description-quality";
+import { readDebioVerified } from "../services/debio-approval";
 // The claim admin queue (decision 11=A) — see GET /claim-review-queue below.
-import { knowledgeService } from "../services/knowledge-service";
-import { emailService } from "../services/email-service";
-import { trustScoreService } from "../services/trust-score-service";
+import { knowledgeService, findRegisterSiblingMatch } from "../services/knowledge-service";
+// D3b (POST /register duplicate fill): the shared "is customer / owner-locked"
+// rule (agents.claimed_at set OR a verified agent_claims row) — one definition.
+import { customerRuleSql } from "../services/customer-rule";
 import { maskEmail } from "../services/gardssalg-claim";
+import { applyClaimApprove, applyClaimReject, applyClaimRevoke, sendClaimApprovedLoginMail } from "../services/claim-review-actions";
+import { isClaimRequestMoreEnabled, requestMoreConfirmation, REQUEST_MORE_NOTE_MAX } from "../services/claim-request-more";
+import { isClaimMergeApproveEnabled, runClaimMergeApprove, CLAIM_MERGE_APPROVE_NOTE_MAX } from "../services/claim-merge-approve";
+import { isExplicitApply } from "./admin-agents-duplicate-merge";
 
 import { deleteAgentProfileTranslations } from "../services/profile-translations";
 const router = Router();
@@ -394,6 +411,10 @@ router.get("/", (req: Request, res: Response) => {
 //      (skipped when org_nr is absent — nothing to match on)
 //   2. name+city match   → { success: false, duplicate: true, existing_id }
 //   3. Insert new agent with trust_score 0.3 (lower than owner-claimed 0.5)
+//   (D3: a third sibling check behind REGISTER_SIBLING_DEDUP_ENABLED; D3b:
+//   with REGISTER_DUPLICATE_FILL_ENABLED, rfb, any duplicate hit also fills
+//   empty email/website on the existing profile and adds `filled: string[]`
+//   to the response — see fillRegisterDuplicateContact above this route.)
 //
 // Columns: only those confirmed present in agents table are written.
 //   vertical_id  → confirmed via ALTER TABLE (Phase 4.6a)
@@ -413,6 +434,168 @@ router.get("/", (req: Request, res: Response) => {
 // backed contact — distinct from the A2A-protocol-required placeholder)
 // ALSO becomes agents.contact_email when given, replacing the
 // "kontakt@rettfrabonden.com" placeholder that column otherwise gets.
+// ─── D3b: fill empty email/website on the existing profile on a duplicate ──
+// dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice
+// D3b. Behind REGISTER_DUPLICATE_FILL_ENABLED (read per request, only "true"),
+// rfb only. When POST /register hits one of its three duplicate checks, the
+// email/website discovery found would otherwise be lost: this fills them into
+// the EXISTING profile, fill-only (a field is written only while it is NULL or
+// whitespace-only — never an overwrite), with provenance via
+// mergeFieldProvenance (the same merge the new-agent path below uses).
+//
+// Guards (all checked on a fresh snapshot inside ONE better-sqlite3
+// transaction, so a claim landing between read and write cannot slip in):
+//   - existing agent row missing or not rfb → nothing.
+//   - owner-claimed profile (customerRuleSql: claimed_at set OR a verified
+//     agent_claims row — the same rule knowledgeService.isAgentClaimed's
+//     agent_claims query is part of) → nothing.
+//   - agent_knowledge.owner_updated_at set → nothing: an owner has edited the
+//     profile, so an empty field may be a deliberate owner choice.
+//   - per field: curated_fields[field] truthy → that field is skipped. This is
+//     canCorrectFactualField's hard refusal #1 (curated_locked), the rule every
+//     automated write applies first. canCorrectFactualField itself is not
+//     called: email/website are not in CORRECTABLE_FACTUAL_FIELDS (it would
+//     answer field_not_correctable), and its remaining Tier-A/Tier-S logic only
+//     protects a POPULATED value — this path is a pure ADD by construction
+//     (the isPureAdd shortcut), so the curated lock is the only rule left.
+//   - no valid http(s) source_url (body source_url, else body url) → nothing.
+export const REGISTER_PLACEHOLDER_CONTACT_EMAIL = "kontakt@rettfrabonden.com";
+
+export function registerDuplicateFillEnabled(): boolean {
+  return process.env.REGISTER_DUPLICATE_FILL_ENABLED === "true";
+}
+
+/** Trimmed http(s) URL string, or null for anything else. */
+function registerHttpUrlOrNull(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const t = value.trim();
+  if (!t) return null;
+  try {
+    const u = new URL(t);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    if (!u.hostname) return null;
+    return t;
+  } catch {
+    return null;
+  }
+}
+
+/** A website candidate: http(s), and the host is not / does not end with rettfrabonden.com. */
+function registerWebsiteOrNull(value: unknown): string | null {
+  const t = registerHttpUrlOrNull(value);
+  if (!t) return null;
+  const host = new URL(t).hostname.toLowerCase().replace(/\.$/, "");
+  if (host.endsWith("rettfrabonden.com")) return null;
+  return t;
+}
+
+export interface RegisterDuplicateFillInput {
+  email: string | null;
+  website: string | null;
+  sourceType: string;
+  sourceUrl: string | null;
+}
+
+/** Builds the fill input from the request body (pure, no DB). */
+export function buildRegisterDuplicateFillInput(body: {
+  email?: unknown; url?: unknown; source?: unknown; source_url?: unknown;
+}): RegisterDuplicateFillInput {
+  const email = typeof body.email === "string" && body.email.trim() && isValidEmailFormat(body.email.trim())
+    ? body.email.trim() : null;
+  const sourceType = typeof body.source === "string" && body.source.trim() ? body.source.trim() : "agent_registration";
+  return {
+    email,
+    website: registerWebsiteOrNull(body.url),
+    sourceType,
+    sourceUrl: registerHttpUrlOrNull(body.source_url) ?? registerHttpUrlOrNull(body.url),
+  };
+}
+
+function isCuratedFieldLocked(curatedFieldsJson: string | null | undefined, field: string): boolean {
+  if (!curatedFieldsJson) return false;
+  try {
+    const parsed = JSON.parse(curatedFieldsJson);
+    return !!(parsed && typeof parsed === "object" && (parsed as Record<string, unknown>)[field]);
+  } catch {
+    return false; // malformed curated_fields → not locked (same convention as isRfbFieldCurated)
+  }
+}
+
+/**
+ * Fill-only write of email/website into an existing profile (see the block
+ * comment above). Returns the fields actually written, e.g. ["email","website"].
+ */
+export function fillRegisterDuplicateContact(
+  db: ReturnType<typeof getDb>,
+  existingId: string,
+  input: RegisterDuplicateFillInput,
+): string[] {
+  if (!input.sourceUrl || (!input.email && !input.website)) return [];
+  const run = db.transaction((): string[] => {
+    const agent = db.prepare(
+      `SELECT a.contact_email AS contact_email, COALESCE(a.vertical_id, 'rfb') AS vertical_id,
+              ${customerRuleSql("a")} AS owned
+         FROM agents a WHERE a.id = ?`,
+    ).get(existingId) as { contact_email: string | null; vertical_id: string; owned: number } | undefined;
+    if (!agent || agent.vertical_id !== "rfb" || agent.owned) return [];
+
+    const k = db.prepare(
+      `SELECT email, website, field_provenance, curated_fields, owner_updated_at FROM agent_knowledge WHERE agent_id = ?`,
+    ).get(existingId) as {
+      email: string | null; website: string | null; field_provenance: string | null;
+      curated_fields: string | null; owner_updated_at: string | null;
+    } | undefined;
+    if (k?.owner_updated_at) return [];
+
+    const blank = (v: string | null | undefined): boolean => v == null || String(v).trim() === "";
+    const fills: Array<{ field: "email" | "website"; value: string }> = [];
+    if (input.email && blank(k?.email) && !isCuratedFieldLocked(k?.curated_fields, "email")) {
+      fills.push({ field: "email", value: input.email });
+    }
+    if (input.website && blank(k?.website) && !isCuratedFieldLocked(k?.curated_fields, "website")) {
+      fills.push({ field: "website", value: input.website });
+    }
+    if (fills.length === 0) return [];
+
+    const nowIso = new Date().toISOString();
+    if (!k) {
+      db.prepare(
+        `INSERT OR IGNORE INTO agent_knowledge (agent_id, field_provenance, updated_at) VALUES (?, '{}', ?)`,
+      ).run(existingId, nowIso);
+    }
+    let existingProv: Record<string, unknown> = {};
+    if (k?.field_provenance) {
+      try {
+        const parsed = JSON.parse(k.field_provenance);
+        if (parsed && typeof parsed === "object") existingProv = parsed as Record<string, unknown>;
+      } catch {
+        /* tolerate junk, mirrors other call sites */
+      }
+    }
+    const incoming: Record<string, Array<{ value: string; source_type: string; fetched_at: string; source_url: string }>> = {};
+    for (const f of fills) {
+      incoming[f.field] = [{ value: f.value, source_type: input.sourceType, fetched_at: nowIso, source_url: input.sourceUrl! }];
+    }
+    const mergedProv = mergeFieldProvenance(existingProv, incoming);
+
+    // Column names come from the fixed "email" | "website" union above, never from input.
+    const sets = fills.map((f) => `${f.field} = ?`);
+    db.prepare(
+      `UPDATE agent_knowledge SET ${sets.join(", ")}, field_provenance = ?, updated_at = ? WHERE agent_id = ?`,
+    ).run(...fills.map((f) => f.value), JSON.stringify(mergedProv), nowIso, existingId);
+
+    const filledEmail = fills.find((f) => f.field === "email");
+    if (filledEmail && (agent.contact_email ?? "").trim().toLowerCase() === REGISTER_PLACEHOLDER_CONTACT_EMAIL) {
+      db.prepare(`UPDATE agents SET contact_email = ? WHERE id = ?`).run(filledEmail.value, existingId);
+    }
+    return fills.map((f) => f.field);
+  });
+  return run();
+}
+
+/** Økologi S3b: a net-new agent's Debio status (debio_verified defaults to 0). */
+const REGISTER_NEW_AGENT_DEBIO = { debio_verified: 0 } as const;
+
 router.post("/register", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
@@ -458,6 +641,8 @@ router.post("/register", async (req: Request, res: Response) => {
     description,
     lat,
     lng,
+    address: dedupAddress,
+    postal_code: dedupPostalCode,
   } = req.body as {
     name?: string;
     url?: string;
@@ -468,11 +653,14 @@ router.post("/register", async (req: Request, res: Response) => {
     nace_code?: string;
     categories?: string[];
     tags?: string[];
-    phone?: string;
+    phone?: string | number; // a number is read only by the sibling dedup (D3-N1/N4)
     email?: string;
     description?: string;
     lat?: number;
     lng?: number;
+    // G7 D3: read only for the sibling dedup below — never persisted.
+    address?: unknown;
+    postal_code?: unknown;
   };
 
   if (!name || !url || !city || !vertical_id) {
@@ -519,6 +707,24 @@ router.post("/register", async (req: Request, res: Response) => {
     });
     return;
   }
+  // Økologi S3b (RFB_ORGANIC_CLAIM_GATE, A2A dev-request 2026-10-28-rfb-
+  // okologisk-merking-debio-register-og-tekstrevisjon, S3 punkt 1): this is
+  // the harvest door, and a net-new agent never has a valid Debio status
+  // (debio_verified starts at 0; only the register sync sets it). So with the
+  // flag on, a description with an organic claim is refused (same shape as
+  // the gates above, plus the outcome code), and tags/categories lose their
+  // organic entries below. Flag off: unchanged.
+  const organicGateOn = organicClaimGateApplies(REGISTER_NEW_AGENT_DEBIO);
+  if (organicGateOn && typeof description === "string" && description.trim() && hasUnverifiedOrganicClaim(description, REGISTER_NEW_AGENT_DEBIO)) {
+    logOrganicClaimGate("POST /admin/agents/register", REFUSED_ORGANIC_CLAIM_UNVERIFIED, `new:${String(name)}`, "description");
+    res.status(400).json({
+      error: "description contains an organic claim for a producer without Debio status — rejected",
+      detail: "description contains an organic claim for a producer without Debio status — rejected",
+      outcome: REFUSED_ORGANIC_CLAIM_UNVERIFIED,
+      field: "description",
+    });
+    return;
+  }
 
   const VALID_VERTICALS = ["rfb", "dental", "experiences"] as const;
   if (!VALID_VERTICALS.includes(vertical_id as typeof VALID_VERTICALS[number])) {
@@ -528,6 +734,22 @@ router.post("/register", async (req: Request, res: Response) => {
     });
     return;
   }
+
+  // D3b: on a duplicate hit, fill empty email/website on the existing profile
+  // (REGISTER_DUPLICATE_FILL_ENABLED, rfb only). Flag off / non-rfb: returns
+  // {} with no query, so the duplicate body is byte-identical to before.
+  const duplicateFillOn = registerDuplicateFillEnabled() && vertical_id === "rfb";
+  const duplicateFillExtra = (db: ReturnType<typeof getDb>, existingId: string): { filled?: string[] } => {
+    if (!duplicateFillOn) return {};
+    try {
+      return { filled: fillRegisterDuplicateContact(db, existingId, buildRegisterDuplicateFillInput(req.body ?? {})) };
+    } catch (err: any) {
+      // The transaction rolled back, so nothing was written; the duplicate
+      // answer itself still stands.
+      console.error(`[register] duplicate fill failed for ${existingId}:`, err?.message || err);
+      return { filled: [] };
+    }
+  };
 
   try {
     const db = getDb();
@@ -551,6 +773,7 @@ router.post("/register", async (req: Request, res: Response) => {
           duplicate: true,
           existing_id: byOrgNr.id,
           message: "Agent with this org_nr already exists",
+          ...duplicateFillExtra(db, byOrgNr.id),
         });
         return;
       }
@@ -569,8 +792,38 @@ router.post("/register", async (req: Request, res: Response) => {
         duplicate: true,
         existing_id: byNameCity.id,
         message: "Agent with this name+city already exists",
+        ...duplicateFillExtra(db, byNameCity.id),
       });
       return;
+    }
+
+    // ── Dedup 3: owner-claim sibling rule (G7 discovery-dedup D3) ──
+    // REGISTER_SIBLING_DEDUP_ENABLED (read per request, default off), rfb
+    // only: refuse a new profile that matches an existing RFB profile on
+    // org.nr (column or tag), normalized phone, or street address + postal
+    // code — the same rule as the owner-claim assessment
+    // (knowledge-service.ts claimSiblingsForRow). `address`/`postal_code`
+    // are read for this check only and never stored. Runs before the Brreg
+    // lookup and the INSERT, so a hit writes nothing. Flag off: no query.
+    if (process.env.REGISTER_SIBLING_DEDUP_ENABLED === "true" && vertical_id === "rfb") {
+      const sibling = findRegisterSiblingMatch(db, {
+        org_nr,
+        // D3-N1/N4: a phone sent as a JSON number reaches the rule too.
+        phone: typeof phone === "number" ? phone : trimmedPhone,
+        address: dedupAddress,
+        postal_code: dedupPostalCode,
+      });
+      if (sibling) {
+        res.json({
+          success: false,
+          duplicate: true,
+          existing_id: sibling.existingId,
+          match: sibling.match,
+          message: `Agent matching an existing RFB profile on ${sibling.match} already exists`,
+          ...duplicateFillExtra(db, sibling.existingId),
+        });
+        return;
+      }
     }
 
     // ── Build tags array ─────────────────────────────────────
@@ -580,7 +833,18 @@ router.post("/register", async (req: Request, res: Response) => {
     if (org_nr) builtTags.push(`org_nr:${org_nr}`);
     if (source) builtTags.push(`source:${source}`);
     if (nace_code) builtTags.push(`nace:${nace_code}`);
-    if (extraTags && Array.isArray(extraTags)) builtTags.push(...extraTags);
+    const organicStripped: string[] = [];
+    if (extraTags && Array.isArray(extraTags)) {
+      // Økologi S3b: organic tags stripped for the (always unverified) new agent.
+      const tg = organicGateOn ? stripOrganicListForWrite(extraTags) : { list: extraTags, changed: false };
+      if (tg.changed) organicStripped.push("tags");
+      builtTags.push(...tg.list);
+    }
+    let registerCategories: unknown[] = categories && Array.isArray(categories) ? categories : [];
+    if (organicGateOn) {
+      const cg = stripOrganicCategoriesForWrite(registerCategories);
+      if (cg.changed) { registerCategories = cg.list; organicStripped.push("categories"); }
+    }
 
     // ── Slice 2 of dev-request 2026-06-30-brreg-verification-gate ────
     // rfb + experiences only — dental stays Legelisten-primary, brreg_*
@@ -616,7 +880,7 @@ router.post("/register", async (req: Request, res: Response) => {
     // supplies a real, evidence-gated email (see header comment), use it
     // directly instead of the placeholder; agent_knowledge.email +
     // field_provenance carry the same value below, with provenance.
-    const contactEmailValue = trimmedEmail || "kontakt@rettfrabonden.com";
+    const contactEmailValue = trimmedEmail || REGISTER_PLACEHOLDER_CONTACT_EMAIL;
 
     db.prepare(
       `INSERT INTO agents (
@@ -647,7 +911,7 @@ router.post("/register", async (req: Request, res: Response) => {
       city,
       lat ?? null,
       lng ?? null,
-      JSON.stringify(categories && Array.isArray(categories) ? categories : []),
+      JSON.stringify(registerCategories),
       JSON.stringify(builtTags),
       vertical_id,
       org_nr ?? null,
@@ -655,6 +919,9 @@ router.post("/register", async (req: Request, res: Response) => {
       brreg_flag,
       brreg_checked_at,
     );
+    for (const f of organicStripped) {
+      logOrganicClaimGate("POST /admin/agents/register", STRIPPED_ORGANIC_CLAIM_UNVERIFIED, id, f);
+    }
 
     // ── Contact-field enrichment: agent_knowledge.email/.phone + provenance ──
     // Only runs when at least one of email/phone was actually supplied —
@@ -1135,6 +1402,19 @@ router.post("/brreg-catalog-sweep", async (req: Request, res: Response) => {
 // idempotent (a previously-filled agent is never re-selected — the SQL
 // WHERE clause excludes it — and never re-written even if somehow re-
 // selected, thanks to the atomic WHERE on the UPDATE itself).
+/**
+ * Økologi S3b (RFB_ORGANIC_CLAIM_GATE): Brreg's activity text («Drift av
+ * økologisk gårdsbruk») is prose, so for a producer without a valid Debio
+ * status it is not written at all (skipped, reason
+ * refused_organic_claim_unverified) — never cut. Flag off: false.
+ */
+function brregFallbackRefusesOrganic(db: ReturnType<typeof getDb>, agentId: string, text: string): boolean {
+  if (!organicClaimGateEnabled()) return false;
+  if (!hasUnverifiedOrganicClaim(text, readDebioVerified(db, agentId))) return false;
+  logOrganicClaimGate("brreg-description-fallback", REFUSED_ORGANIC_CLAIM_UNVERIFIED, agentId, "description");
+  return true;
+}
+
 const BRREG_DESCRIPTION_FALLBACK_DEFAULT_LIMIT = 25;
 const BRREG_DESCRIPTION_FALLBACK_MAX_LIMIT = 100;
 const BRREG_DESCRIPTION_FALLBACK_CONCURRENCY = 3;
@@ -1237,6 +1517,10 @@ router.post("/brreg-description-fallback", async (req: Request, res: Response) =
           skipped.push({ agent_id: row.agent_id, reason: "no_brreg_description" });
           return;
         }
+        if (brregFallbackRefusesOrganic(db, row.agent_id, text)) {
+          skipped.push({ agent_id: row.agent_id, reason: REFUSED_ORGANIC_CLAIM_UNVERIFIED });
+          return;
+        }
         wouldWrite.push({ agent_id: row.agent_id, name: row.name, org_nr: row.org_nr, description_preview: text });
       }
 
@@ -1273,6 +1557,10 @@ router.post("/brreg-description-fallback", async (req: Request, res: Response) =
       }
       if (!text) {
         skipped.push({ agent_id: row.agent_id, reason: "no_brreg_description" });
+        return;
+      }
+      if (brregFallbackRefusesOrganic(db, row.agent_id, text)) {
+        skipped.push({ agent_id: row.agent_id, reason: REFUSED_ORGANIC_CLAIM_UNVERIFIED });
         return;
       }
 
@@ -1512,35 +1800,39 @@ export interface AgentOrgNrReviewQueueEntry {
 // Exported (2026-08-22-rfb-website-email-selvforsyning) so the sibling
 // selvforsyning route's own org_nr-missing cohort selector reuses this EXACT
 // predicate instead of drifting from it.
-export function agentsOrgNrBackfillCandidateWhereSql(): string {
+// dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post (AC6): the
+// catalog_hidden test rows (the order fixture and the unclaimed claim-test
+// fixture) are never candidates — catalogHiddenIdExclusionSql, the
+// verifier's own exclusion; "" (the exact SQL as before) when no row is hidden.
+export function agentsOrgNrBackfillCandidateWhereSql(db: ReturnType<typeof getDb>): string {
   return `
     a.role = 'producer'
     AND a.is_active = 1
     AND a.umbrella_type IS NULL
     AND COALESCE(a.vertical_id, 'rfb') = 'rfb'
     AND (a.org_nr IS NULL OR TRIM(a.org_nr) = '')
-    AND a.claimed_at IS NULL
+    AND a.claimed_at IS NULL${catalogHiddenIdExclusionSql(db, "a")}
   `;
 }
 
-function agentsOrgNrBackfillSelectSql(): string {
+function agentsOrgNrBackfillSelectSql(db: ReturnType<typeof getDb>): string {
   return `
     SELECT a.id AS id, a.name AS name, a.org_nr AS org_nr, a.claimed_at AS claimed_at,
            k.postal_code AS postal_code, a.city AS city
       FROM agents a
       LEFT JOIN agent_knowledge k ON k.agent_id = a.id
-     WHERE ${agentsOrgNrBackfillCandidateWhereSql()}
+     WHERE ${agentsOrgNrBackfillCandidateWhereSql(db)}
   `;
 }
 
 function countAgentsOrgNrBackfillCandidates(db: ReturnType<typeof getDb>): number {
-  const row = db.prepare(`SELECT COUNT(*) AS n FROM (${agentsOrgNrBackfillSelectSql()})`).get() as { n: number };
+  const row = db.prepare(`SELECT COUNT(*) AS n FROM (${agentsOrgNrBackfillSelectSql(db)})`).get() as { n: number };
   return row?.n ?? 0;
 }
 
 function fetchAgentsOrgNrBackfillBatch(db: ReturnType<typeof getDb>, cap: number): AgentOrgNrBackfillTargetRow[] {
   return db
-    .prepare(`${agentsOrgNrBackfillSelectSql()} ORDER BY a.created_at ASC, a.id ASC LIMIT ?`)
+    .prepare(`${agentsOrgNrBackfillSelectSql(db)} ORDER BY a.created_at ASC, a.id ASC LIMIT ?`)
     .all(cap) as AgentOrgNrBackfillTargetRow[];
 }
 
@@ -1549,7 +1841,9 @@ function fetchAgentsOrgNrBackfillBatch(db: ReturnType<typeof getDb>, cap: number
 // getGardssalgProviderOrgnrTarget's override semantics: an admin can force a
 // lookup attempt on any RFB producer agent; eligibility (lock/already-filled)
 // is still enforced at write time, just reported as a specific `unresolved`
-// reason rather than silently omitted from the target list.
+// reason rather than silently omitted from the target list. The
+// catalog_hidden test rows are the one exception (AC6 above): never a target,
+// not even by id.
 function getAgentOrgNrBackfillTarget(db: ReturnType<typeof getDb>, agentId: string): AgentOrgNrBackfillTargetRow | null {
   const row = db
     .prepare(
@@ -1557,7 +1851,7 @@ function getAgentOrgNrBackfillTarget(db: ReturnType<typeof getDb>, agentId: stri
               k.postal_code AS postal_code, a.city AS city
          FROM agents a
          LEFT JOIN agent_knowledge k ON k.agent_id = a.id
-        WHERE a.id = ? AND a.role = 'producer' AND COALESCE(a.vertical_id, 'rfb') = 'rfb'`,
+        WHERE a.id = ? AND a.role = 'producer' AND COALESCE(a.vertical_id, 'rfb') = 'rfb'${catalogHiddenIdExclusionSql(db, "a")}`,
     )
     .get(agentId) as AgentOrgNrBackfillTargetRow | undefined;
   return row ?? null;
@@ -2141,16 +2435,115 @@ router.post("/org-nr-review-approve", (req: Request, res: Response) => {
 // GET lists the queue, oldest first — the incident this closes (Mikhailo T,
 // 2026-07-30) was a same-day drive-by; there's no reason a newer spam
 // signup should ever be reviewed ahead of an older, possibly-legitimate one.
+//
+// dev-request 2026-11-10-rfb-registreringer-og-eierkrav-folges-opp (S2): each
+// entry also carries the stored, record-only pre-check recommendation
+// (`precheck`, parsed JSON or null; services/registration-precheck.ts),
+// `precheck_at`, `age_days` (whole days since created_at), `org_nr` and
+// `city`. The original five fields and the order are unchanged.
+//
+// S4b (same dev-request): each entry also carries `owner_confirmed` — the
+// shared customer/verified-owner rule (customerRuleSql: claimed_at set OR a
+// verified agent_claims row) — and `owner_label` ("eier bekreftet" or null).
+// Owner-confirmed rows sort first; within each group oldest first (id as the
+// final tie-breaker). Top-level `owner_confirmed_count` sits next to `count`.
+// Read-only: the queue never writes; only self-registered-review-approve
+// releases a profile.
 router.get("/self-registered-review-queue", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
   const db = getDb();
-  const entries = db.prepare(
-    `SELECT id, name, contact_email, url, created_at
-       FROM agents
-      WHERE origin = 'self_registered' AND is_vetted = 0
-      ORDER BY created_at ASC`
-  ).all();
-  res.json({ count: entries.length, entries });
+  const rows = db.prepare(
+    `SELECT a.id, a.name, a.contact_email, a.url, a.created_at, a.org_nr, a.city,
+            p.registration_precheck, p.registration_precheck_at,
+            CASE WHEN ${customerRuleSql("a")} THEN 1 ELSE 0 END AS owned
+       FROM agents a
+       LEFT JOIN agent_registration_precheck p ON p.agent_id = a.id
+      WHERE a.origin = 'self_registered' AND a.is_vetted = 0
+      ORDER BY owned DESC, a.created_at ASC, a.id ASC`
+  ).all() as Array<{
+    id: string; name: string; contact_email: string; url: string; created_at: string | null;
+    org_nr: string | null; city: string | null; registration_precheck: string | null; registration_precheck_at: string | null;
+    owned: number;
+  }>;
+  const nowMs = Date.now();
+  const entries = rows.map((r) => {
+    let precheck: unknown = null;
+    if (r.registration_precheck) {
+      try { precheck = JSON.parse(r.registration_precheck); } catch { precheck = null; }
+    }
+    return {
+      id: r.id, name: r.name, contact_email: r.contact_email, url: r.url, created_at: r.created_at,
+      org_nr: r.org_nr, city: r.city,
+      precheck, precheck_at: r.registration_precheck_at, age_days: ageDaysSince(r.created_at, nowMs),
+      owner_confirmed: r.owned === 1, owner_label: r.owned === 1 ? "eier bekreftet" : null,
+    };
+  });
+  const ownerConfirmedCount = entries.filter((e) => e.owner_confirmed).length;
+  res.json({ count: entries.length, owner_confirmed_count: ownerConfirmedCount, entries });
+});
+
+/** Whole days since an SQLite/ISO timestamp (SQLite's "YYYY-MM-DD HH:MM:SS" is UTC), or null. */
+export function ageDaysSince(createdAt: string | null | undefined, nowMs: number): number | null {
+  if (typeof createdAt !== "string" || !createdAt.trim()) return null;
+  let s = createdAt.trim();
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(s)) s = s.replace(" ", "T") + "Z";
+  const t = Date.parse(s);
+  if (!Number.isFinite(t)) return null;
+  return Math.max(0, Math.floor((nowMs - t) / 86_400_000));
+}
+
+// POST /admin/agents/self-registered-precheck (S2): runs the record-only
+// pre-check on demand, regardless of REGISTRATION_PRECHECK_ENABLED. Body
+// { agentId } → that one agent (must be in the queue: origin self_registered
+// and is_vetted 0, else 409 like the approve route), or { all: true } → every
+// queued agent, oldest first, sequentially, at most 50 per call. Only stores
+// its row in agent_registration_precheck; never touches is_vetted or anything else.
+router.post("/self-registered-precheck", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const body = (req.body ?? {}) as { agentId?: unknown; all?: unknown };
+  const agentId = typeof body.agentId === "string" ? body.agentId.trim() : "";
+  const db = getDb();
+  if (agentId) {
+    const agent = db.prepare(`SELECT id, origin, is_vetted FROM agents WHERE id = ?`).get(agentId) as
+      { id: string; origin: string; is_vetted: number } | undefined;
+    if (!agent) {
+      res.status(404).json({ error: "Agent not found" });
+      return;
+    }
+    if (agent.origin !== "self_registered" || agent.is_vetted !== 0) {
+      res.status(409).json({ error: "not_in_self_registered_queue", detail: "Only unvetted self_registered agents are pre-checked" });
+      return;
+    }
+    try {
+      const precheck = await runRegistrationPrecheck(agentId);
+      res.json({ success: true, agentId, precheck });
+    } catch (err: any) {
+      res.status(502).json({ success: false, agentId, error: "precheck_failed", detail: err?.message === "precheck timeout" ? "timeout" : "error" });
+    }
+    return;
+  }
+  if (body.all !== true) {
+    res.status(400).json({ error: "Requires { agentId } or { all: true }" });
+    return;
+  }
+  const ids = (db.prepare(
+    `SELECT id FROM agents WHERE origin = 'self_registered' AND is_vetted = 0 ORDER BY created_at ASC LIMIT ?`
+  ).all(REGISTRATION_PRECHECK_BATCH_CAP + 1) as Array<{ id: string }>).map((r) => r.id);
+  const batch = ids.slice(0, REGISTRATION_PRECHECK_BATCH_CAP);
+  const results: Array<{ agentId: string; recommendation: string | null; error?: string }> = [];
+  const summary: Record<string, number> = { godkjenn: 0, spor_forst: 0, avvis: 0, failed: 0 };
+  for (const id of batch) {
+    try {
+      const p = await runRegistrationPrecheck(id);
+      if (!p) { results.push({ agentId: id, recommendation: null, error: "gone" }); summary.failed!++; continue; }
+      results.push({ agentId: id, recommendation: p.recommendation });
+      summary[p.recommendation] = (summary[p.recommendation] ?? 0) + 1;
+    } catch (err: any) {
+      results.push({ agentId: id, recommendation: null, error: err?.message === "precheck timeout" ? "timeout" : "error" });
+      summary.failed!++;
+    }
+  }
+  res.json({ success: true, assessed: results.length, more_remaining: ids.length > batch.length, summary, results });
 });
 
 // POST flips is_vetted to 1 for exactly one agent, then — and ONLY then —
@@ -2207,7 +2600,11 @@ router.post("/self-registered-review-approve", (req: Request, res: Response) => 
 // already has an owner. Until approved it has no code, no token, no badge
 // and no write access. GET lists oldest first: profile, the claimant's name
 // and address, the reason and the time — at most CLAIM_REVIEW_QUEUE_LIST_MAX
-// entries (knowledge-service.ts); `count` is how many wait in all.
+// entries (knowledge-service.ts); `count` is how many wait in all. Each entry
+// carries `recommendation`, the claim domain rule's advice (dev-request
+// 2026-10-27-rfb-eierkrav-domeneregel-og-cs-sjekkliste, claim-domain-rule.ts),
+// and `assessment`, the stored owner-claim auto-assessment (claim-assessment.ts,
+// slice A, record-only; parsed JSON, or null when none was made).
 router.get("/claim-review-queue", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
   const { total, entries } = knowledgeService.listClaimReviewQueue();
@@ -2219,9 +2616,9 @@ router.get("/claim-review-queue", (req: Request, res: Response) => {
 // proven_email; else the address the claimant gave), the badge follows the
 // quarantine gate (self_registered rows still get none), claimed_at/
 // claimed_via are stamped 'admin_approval' (fill-only), and the owner gets
-// "X er nå ditt" with a one-time login link to that address — the claim token
-// itself is never mailed. An existing owner keeps its claim and token and is
-// not mailed. Body: { claimId, email? }.
+// «Profilen til X er nå din» with a one-time owner-portal login link to that
+// address — the claim token itself is never mailed. An existing owner keeps
+// its claim and token and is not mailed. Body: { claimId, email? }.
 router.post("/claim-review-approve", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
   const body = (req.body ?? {}) as { claimId?: unknown; email?: unknown };
@@ -2231,22 +2628,22 @@ router.post("/claim-review-approve", async (req: Request, res: Response) => {
     return;
   }
 
-  const approved = knowledgeService.approveClaimReview(claimId, body.email as string | undefined);
+  const approved = applyClaimApprove(claimId, body.email as string | undefined);
   if (!approved.ok) {
     const status = approved.error === "not_found" ? 404 : approved.error === "not_pending_review" ? 409 : 400;
     res.status(status).json({ error: approved.error });
     return;
   }
-  trustScoreService.update(approved.agentId);
 
-  // Same one-time login link as POST /api/marketplace/auth/magic-link.
-  let loginLinkSent = false;
-  const link = knowledgeService.createMagicLink(approved.email);
-  if (link.success && link.token) {
-    const baseUrl = process.env.APP_URL || "https://rettfrabonden.com";
-    const sent = await emailService.sendClaimConfirmation(approved.email, link.agentName || "din agent", `${baseUrl}/api/marketplace/auth/m/${link.token}`, approved.agentId);
-    loginLinkSent = sent.success && sent.messageId !== "DRY_RUN";
-  }
+  // K5 (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post): a one-time,
+  // 15-minute login straight into the owner portal (/eier) for the approved
+  // address and this agent — no longer the /selger marketplace link. The
+  // portal login (request-magic-link) also accepts this address from now on.
+  // Not held by request-magic-link's visitor rate limit (createOwnerLoginLink
+  // checks none). The approval is already stored, so a failure here only
+  // means no mail (loginLinkSent false), never a 500 to retry into a 409.
+  // Shared with the signed claim-action links (services/claim-review-actions.ts).
+  const loginLinkSent = await sendClaimApprovedLoginMail(claimId, approved, "[admin-agents] claim-review-approve");
 
   res.json({
     success: true,
@@ -2268,12 +2665,185 @@ router.post("/claim-review-reject", (req: Request, res: Response) => {
     res.status(400).json({ error: "Requires { claimId, note? }" });
     return;
   }
-  const rejected = knowledgeService.rejectClaimReview(claimId, body.note as string | undefined);
+  const rejected = applyClaimReject(claimId, body.note as string | undefined);
   if (!rejected.ok) {
     res.status(rejected.error === "not_found" ? 404 : 409).json({ error: rejected.error });
     return;
   }
   res.json({ success: true, claimId, agentId: rejected.agentId, status: "rejected" });
+});
+
+// ─── POST /admin/agents/claim-request-more ──────────────────────────────────
+//     (dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk,
+//     slice B3a) ────────────────────────────────────────────────────────────
+//
+// «Be om mer bekreftelse»: the person who submitted a queued claim gets ONE
+// mail asking for a bit more proof (services/claim-request-more.ts, shared
+// with the signed request_more link). The claim stays pending_review; the
+// request is stamped on the claim (request_more_at/_via/_note, via 'admin').
+// Body: { claimId, note? } (note is stored, never mailed).
+//   503 claim_request_more_disabled  CLAIM_REQUEST_MORE_ENABLED is not "true"
+//   400 bad body · 404 unknown claim · 409 not_pending_review
+//   409 already_requested            one request per claim per 24 h (link or admin)
+//   502 email_send_failed            the mail did not go out (send error, or
+//       DRY_RUN without SMTP — it reached nobody). Chosen over 200 with
+//       email_sent:false so a failure is never read as done: nothing is
+//       stamped, the 24 h window does not start, and the call can be retried.
+//   200 { success, claimId, email_sent: true }
+router.post("/claim-request-more", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  if (!isClaimRequestMoreEnabled()) {
+    res.status(503).json({ success: false, error: "claim_request_more_disabled" });
+    return;
+  }
+  const body = (req.body ?? {}) as { claimId?: unknown; note?: unknown };
+  const claimId = typeof body.claimId === "string" ? body.claimId.trim() : "";
+  const noteOk = body.note === undefined || (typeof body.note === "string" && body.note.length <= REQUEST_MORE_NOTE_MAX);
+  if (!claimId || claimId.length > 200 || !noteOk) {
+    res.status(400).json({ success: false, error: `Requires { claimId, note? } (note at most ${REQUEST_MORE_NOTE_MAX} characters)` });
+    return;
+  }
+  try {
+    const r = await requestMoreConfirmation({ claimId }, "admin", { note: body.note as string | undefined });
+    if (r.ok) {
+      res.json({ success: true, claimId: r.claimId, email_sent: true });
+      return;
+    }
+    switch (r.error) {
+      case "disabled":
+        res.status(503).json({ success: false, error: "claim_request_more_disabled" });
+        return;
+      case "not_found":
+        res.status(404).json({ success: false, error: "not_found" });
+        return;
+      case "not_pending_review":
+      case "already_requested":
+        res.status(409).json({ success: false, error: r.error });
+        return;
+      case "email_failed":
+        res.status(502).json({ success: false, error: "email_send_failed", claimId: r.claimId, email_sent: false });
+        return;
+      default:
+        res.status(500).json({ success: false, error: "server_error" });
+        return;
+    }
+  } catch (err) {
+    console.error("[admin-agents] claim-request-more failed:", err instanceof Error ? err.message : "error");
+    res.status(500).json({ success: false, error: "server_error" });
+  }
+});
+
+// ─── POST /admin/agents/claim-merge-approve ─────────────────────────────────
+//     (dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk,
+//     slice D1) ─────────────────────────────────────────────────────────────
+//
+// «Slå sammen og godkjenn»: a queued claim's profile (the survivor) absorbs a
+// sibling profile the admin names (`duplicateId`) with duplicate-merge's
+// fill-only rules plus G8 (opening hours, delivery, map point), then the claim
+// is approved exactly as claim-review-approve does, and the owner gets the
+// same login mail. Merge + approval are one transaction
+// (services/claim-merge-approve.ts); the mail goes out after commit.
+// Body: { claimId, duplicateId, note?, apply? } — dry-run unless `apply` is an
+// explicit truthy form (as duplicate-merge).
+//   503 claim_merge_approve_disabled  CLAIM_MERGE_APPROVE_ENABLED is not "true"
+//   400 bad body · 400 duplicate_is_claim_agent
+//   404 claim_not_found · 404 duplicate_not_found
+//   409 not_pending_review · has_owner · survivor_inactive · duplicate_inactive
+//       · not_a_sibling · duplicate_claimed
+//   409 approve_failed (+ reason, rolledBack: true) — nothing was written
+//   200 dry-run: { success, dryRun: true, filled, moved, geocodeReset, wouldApprove: true, … }
+//   200 apply:   { success, dryRun: false, filled, moved, geocodeReset, approved: true, loginLinkSent, sentTo (masked), … }
+router.post("/claim-merge-approve", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  if (!isClaimMergeApproveEnabled()) {
+    res.status(503).json({ success: false, error: "claim_merge_approve_disabled" });
+    return;
+  }
+  const body = (req.body ?? {}) as { claimId?: unknown; duplicateId?: unknown; note?: unknown; apply?: unknown };
+  const claimId = typeof body.claimId === "string" ? body.claimId.trim() : "";
+  const duplicateId = typeof body.duplicateId === "string" ? body.duplicateId.trim() : "";
+  const noteOk = body.note === undefined || (typeof body.note === "string" && body.note.length <= CLAIM_MERGE_APPROVE_NOTE_MAX);
+  if (!claimId || claimId.length > 200 || !duplicateId || duplicateId.length > 200 || !noteOk) {
+    res.status(400).json({
+      success: false,
+      error: `Requires { claimId, duplicateId, note?, apply? } (note at most ${CLAIM_MERGE_APPROVE_NOTE_MAX} characters)`,
+    });
+    return;
+  }
+  const apply = isExplicitApply(body.apply, req.query?.apply);
+  let r: ReturnType<typeof runClaimMergeApprove>;
+  try {
+    r = runClaimMergeApprove({ claimId, duplicateId, note: body.note as string | undefined, apply });
+  } catch (err) {
+    console.error("[admin-agents] claim-merge-approve failed (rolled back):", err instanceof Error ? err.message : "error");
+    res.status(500).json({ success: false, error: "server_error", rolledBack: true });
+    return;
+  }
+  if (!r.ok) {
+    const { ok: _ok, status, ...rest } = r;
+    res.status(status).json({ success: false, ...rest });
+    return;
+  }
+  const { ok: _ok, approved, ...summary } = r;
+  if (!approved) {
+    res.json({ success: true, ...summary, wouldApprove: true });
+    return;
+  }
+  console.log(
+    `[admin-agents] claim-merge-approve: claim ${claimId} approved on ${r.agentId} after merging ${duplicateId} (filled ${r.filled.length}, moved ${r.moved.length}, geocodeReset ${r.geocodeReset})`,
+  );
+  // Same login mail as claim-review-approve, after the commit. A failure only
+  // means no mail (loginLinkSent false), never an undo.
+  const loginLinkSent = await sendClaimApprovedLoginMail(
+    claimId,
+    { agentId: r.agentId, email: approved.email },
+    "[admin-agents] claim-merge-approve",
+  );
+  res.json({
+    success: true,
+    ...summary,
+    approved: true,
+    isVerified: approved.isVerified,
+    loginLinkSent,
+    sentTo: maskEmail(approved.email),
+  });
+});
+
+// ─── POST /admin/agents/claim-revoke ────────────────────────────────────────
+//     (dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk,
+//     slice C1) ─────────────────────────────────────────────────────────────
+//
+// Undo of an owner claim (code path or claim-review-approve): the verified
+// claim becomes 'revoked', its claim token stops working, the owner's login
+// rows for this agent + the claim's address are expired, and — when no other
+// verified claim on the agent remains — is_verified/claimed_at/claimed_via and
+// data_source go back to the pre-grant snapshot (knowledge-service.ts
+// revokeClaimOwnership). `restored`: "snapshot" | "partial_no_snapshot" (a
+// claim granted before C1: owner stamps cleared, is_verified untouched) |
+// "kept_other_owner". Admin-only; no e-mail is sent. Body: { claimId, note? }.
+const CLAIM_REVOKE_NOTE_MAX = 1000;
+router.post("/claim-revoke", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const body = (req.body ?? {}) as { claimId?: unknown; note?: unknown };
+  const claimId = typeof body.claimId === "string" ? body.claimId.trim() : "";
+  const noteOk = body.note === undefined || (typeof body.note === "string" && body.note.length <= CLAIM_REVOKE_NOTE_MAX);
+  if (!claimId || claimId.length > 200 || !noteOk) {
+    res.status(400).json({ error: `Requires { claimId, note? } (note at most ${CLAIM_REVOKE_NOTE_MAX} characters)` });
+    return;
+  }
+  const note = typeof body.note === "string" && body.note.trim() ? body.note.trim() : undefined;
+  const revoked = applyClaimRevoke(claimId, note);
+  if (!revoked.ok) {
+    res.status(revoked.error === "not_found" ? 404 : 409).json({ error: revoked.error });
+    return;
+  }
+  res.json({
+    success: true,
+    claimId,
+    agentId: revoked.agentId,
+    restored: revoked.restored,
+    ownerRemains: revoked.ownerRemains,
+  });
 });
 
 // ─── POST /admin/agents/brreg-contact-backfill ──────────────────────────────
@@ -2315,7 +2885,7 @@ router.post("/claim-review-reject", (req: Request, res: Response) => {
 //
 // ── source_type MUST be the literal string "brreg" ──────────────────────────
 // tierForSource() (cross-source-validator.ts) does an EXACT string match
-// against TIER_B = ["brreg", "facebook_official_page"] — no `:`-splitting.
+// against TIER_B = ["brreg", "facebook_official_page", "directory_listing"] — no `:`-splitting.
 // Any other spelling (e.g. "brreg_fallback") silently falls to Tier-C and
 // contributes NOTHING to the gate, with no visible error. Never prefix it.
 //
@@ -3053,128 +3623,13 @@ router.get("/category-sanity-report", (req: Request, res: Response) => {
 // invariant — exactly mirroring gårdssalg's own layering (the LLM-calling
 // judge lives in the route file, opplevelser.ts; the pure cheap prefilter it
 // reuses lives in the service file, search-enrich.ts).
-export interface RfbJudgeVerdict {
-  approved: boolean;
-  reasoning: string;
-}
-
-const RFB_JUDGE_APPROVE_TOKEN = "GODKJENN";
-const RFB_JUDGE_REJECT_TOKEN = "AVVIS";
-const RFB_JUDGE_CANDIDATE_CHAR_CAP = 4000;
-// Every fail-closed branch's reasoning below ends in this exact literal
-// suffix — isRfbJudgeInfraFailure() (used by the retro-scan's null-vs-leave
-// decision) tells a genuine AVVIS verdict (real model reasoning) apart from
-// an infra failure by checking for it. Mirrors
-// GARDSSALG_JUDGE_INFRA_FAILURE_SUFFIX exactly (routes/opplevelser.ts).
-const RFB_JUDGE_INFRA_FAILURE_SUFFIX = "avvist fail-closed";
-
-export async function judgeRfbAboutCandidate(
-  candidateText: string,
-  producerName: string,
-  kind: "description" | "about"
-): Promise<RfbJudgeVerdict> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    return { approved: false, reasoning: `ANTHROPIC_API_KEY mangler — ${RFB_JUDGE_INFRA_FAILURE_SUFFIX}` };
-  }
-
-  const sectionLabel =
-    kind === "description"
-      ? "kort produsentbeskrivelse"
-      : "utfyllende «Om produsenten»-tekst";
-  const cappedCandidate = (candidateText || "").slice(0, RFB_JUDGE_CANDIDATE_CHAR_CAP);
-  const prompt = `Du er en kvalitetsdommer for produsentprofiler på Rett fra Bonden, en norsk markedsplattform som kobler forbrukere direkte med lokale matprodusenter. Vurder om kandidatteksten under er egnet til å publiseres som ${sectionLabel} for produsenten "${producerName}".
-
-Kandidattekst:
-${cappedCandidate}
-
-Godkjenn KUN hvis teksten er:
-- sammenhengende, ekte norsk prosa spesifikt om DENNE produsenten (ikke en paraplyorganisasjon/bransjeforening sine mange medlemmer omtalt samlet),
-- fri for lekket navigasjonsmeny-, sidetopp- eller bunntekst-innhold (lenkelister, "hjem"/"kontakt"/"meny"-navigasjon, "skip to content"/"jump to ..."-lenker, cookie-/samtykketekst, "hopp til innhold" og lignende),
-- fri for åpenbart oppstykket, avkuttet eller ødelagt tekst,
-- faktisk informativ om produsenten, ikke bare en generisk floskel.
-
-Vurder ikke lengde, ikke volum — vurder KUN om teksten fremhever DENNE produsentens særegne egenskaper (produkter, sted, driftsform, historie, utmerkelser): en kort tekst som konkret navngir slikt skal godkjennes selv om den er kort, mens en lang men trekk-løs/generisk tekst skal avvises selv om den er lang. Kort-men-spesifikk = godkjenn; trekk-løs/generisk = avvis, uansett lengde.
-
-Svar med EKSAKT ett av disse to ordene alene på første linje, etterfulgt av en kort norsk begrunnelse på én setning på neste linje:
-${RFB_JUDGE_APPROVE_TOKEN}
-<kort begrunnelse>
-
-eller
-
-${RFB_JUDGE_REJECT_TOKEN}
-<kort begrunnelse>
-
-Ved minste tvil, svar ${RFB_JUDGE_REJECT_TOKEN}.`;
-
-  let response: Awaited<ReturnType<typeof fetch>>;
-  try {
-    response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5",
-        max_tokens: 200,
-        messages: [{ role: "user", content: prompt }],
-      }),
-    });
-  } catch {
-    return { approved: false, reasoning: `nettverksfeil under dommer-kall — ${RFB_JUDGE_INFRA_FAILURE_SUFFIX}` }; // never fabricate
-  }
-
-  if (!response.ok) {
-    return { approved: false, reasoning: `dommer-API svarte status ${response.status} — ${RFB_JUDGE_INFRA_FAILURE_SUFFIX}` };
-  }
-
-  let result: any;
-  try {
-    result = await response.json();
-  } catch {
-    return { approved: false, reasoning: `ikke-parsbar JSON fra dommer-API — ${RFB_JUDGE_INFRA_FAILURE_SUFFIX}` };
-  }
-
-  const contentArr = Array.isArray(result?.content) ? result.content : [];
-  const text = contentArr.find((c: any) => c?.type === "text")?.text;
-  if (typeof text !== "string") {
-    return { approved: false, reasoning: `uventet svarformat fra dommer-API — ${RFB_JUDGE_INFRA_FAILURE_SUFFIX}` };
-  }
-
-  const lines = text.trim().split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
-  const verdictToken = (lines[0] || "").toUpperCase();
-  const reasoning = lines.slice(1).join(" ").trim();
-
-  // Only the EXACT approve token approves. Anything else — the reject
-  // token, an empty response, garbage, a token that merely CONTAINS the
-  // approve word inside a longer sentence — is a reject. Fail-closed on any
-  // ambiguity, never a silent approval.
-  if (verdictToken === RFB_JUDGE_APPROVE_TOKEN) {
-    return { approved: true, reasoning: reasoning || "godkjent av LLM-dommer" };
-  }
-  if (verdictToken === RFB_JUDGE_REJECT_TOKEN) {
-    return { approved: false, reasoning: reasoning || "avvist av LLM-dommer" };
-  }
-  return { approved: false, reasoning: `uventet/tvetydig dommersvar — ${RFB_JUDGE_INFRA_FAILURE_SUFFIX}` };
-}
-
-/**
- * True iff `verdict.reasoning` is one of judgeRfbAboutCandidate's own
- * fail-closed sentinel reasons (missing key / network / non-200 /
- * unparseable JSON / unexpected shape / ambiguous verdict) rather than a
- * genuine AVVIS verdict from the model. Used by the retro-scan below, which
- * — unlike every OTHER call site of this judge — must NOT treat an infra
- * failure the same as a real rejection: for a fresh CANDIDATE, "not
- * approved" safely means "don't publish it", but for the retro-scan, "not
- * approved" would otherwise mean "null out content that's already live" — a
- * destructive action an API outage must never trigger. Mirrors
- * isJudgeInfraFailure (routes/opplevelser.ts) exactly.
- */
-export function isRfbJudgeInfraFailure(verdict: RfbJudgeVerdict): boolean {
-  return verdict.reasoning.endsWith(RFB_JUDGE_INFRA_FAILURE_SUFFIX);
-}
+// The judge itself (and isRfbJudgeInfraFailure) moved, unchanged, to
+// services/rfb-about-judge.ts (dev-request 2026-10-28-rfb-uttrekk-adresse-og-
+// hjemmeside-forverring, skive B) so admin-knowledge.ts's
+// refreshHomepageContent can use it without a circular import (this file
+// imports admin-knowledge). Re-exported here so every existing import keeps
+// working.
+export { judgeRfbAboutCandidate, isRfbJudgeInfraFailure, type RfbJudgeVerdict } from "../services/rfb-about-judge";
 
 /**
  * The RFB-specific description/about quality gate: the cheap, deterministic
@@ -3301,7 +3756,7 @@ interface RfbRetroScanTarget {
  * portal-style `{locked_at, by}` object both count as locked). Tolerates
  * malformed/missing JSON (treated as "not locked"), matching the defensive-
  * parse convention used throughout this file and admin-knowledge.ts. */
-function isRfbFieldCurated(curatedFieldsJson: string | null | undefined, field: "description" | "about"): boolean {
+export function isRfbFieldCurated(curatedFieldsJson: string | null | undefined, field: "description" | "about"): boolean {
   if (!curatedFieldsJson) return false;
   try {
     const parsed = JSON.parse(curatedFieldsJson);
@@ -4109,6 +4564,7 @@ type TynneProfilerFieldOutcome =
   | "generation_failed_cheap_bar" // candidate generated, but classifyAboutCheapBar rejected it (mangled/boilerplate/foreign) BEFORE the judge ever saw it — see the cheap-bar prefilter call in processTynneProfilerRow below
   | "judge_rejected"
   | "judge_infra_failure"
+  | "refused_organic_claim_unverified" // økologi S3b: generated text carries an organic claim, producer has no valid Debio status (RFB_ORGANIC_CLAIM_GATE)
   | "write_lock_race"; // approved, but the immediate-before-write re-check found the row/field newly locked
 
 interface TynneProfilerFieldAttempt {
@@ -4136,6 +4592,7 @@ const TYNNE_PROFILER_ROW_CAUSE_PRIORITY: readonly TynneProfilerFieldOutcome[] = 
   "judge_infra_failure",
   "generation_failed",
   "generation_failed_cheap_bar",
+  "refused_organic_claim_unverified",
   "judge_rejected",
 ];
 
@@ -4610,6 +5067,19 @@ async function processTynneProfilerRow(
               };
               continue;
             }
+            // Økologi S3b (RFB_ORGANIC_CLAIM_GATE, A2A dev-request 2026-10-28-
+            // rfb-okologisk-merking-…, S3 punkt 1): generated prose with an
+            // organic claim is never written for a producer without a valid
+            // Debio status — refused whole, before the judge (saves the call).
+            if (organicClaimGateEnabled() && hasUnverifiedOrganicClaim(candidate, readDebioVerified(db, queueRow.agent_id))) {
+              logOrganicClaimGate("tynne-profiler-improve", REFUSED_ORGANIC_CLAIM_UNVERIFIED, queueRow.agent_id, f);
+              fieldResults[f] = {
+                field: f,
+                outcome: REFUSED_ORGANIC_CLAIM_UNVERIFIED,
+                reasoning: "generated text contains an organic claim; the producer has no valid Debio status",
+              };
+              continue;
+            }
             // Deterministic cheap-bar prefilter BEFORE the judge — same
             // ordering as rfbRetroScanShouldNull above (classifyAboutCheapBar
             // first, only escalate to the judge when the candidate isn't
@@ -4883,6 +5353,35 @@ router.post("/:id/slug-alias", (req: Request, res: Response) => {
     res.json({ success: true, old_slug: oldSlug, agent_id: id });
   } catch (err: any) {
     res.status(500).json({ error: "slug-alias write failed", detail: err.message });
+  }
+});
+
+// ─── POST /admin/agents/:id/contact-form-only (dev-request
+// 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting, S-D1) ─────────
+// Sets agents.contact_form_only when the producer asks that their e-mail is
+// not shown (services/contact-form-only.ts). Body: { enabled: true|false }.
+// Record only: no mail is sent, the e-mail address is not touched, nothing is
+// echoed but the id and the flag. Works whatever CONTACT_FORM_RFB is (the
+// flag is only read while the switch is on), so a flag can be set before the
+// switch is turned on. 400 for a non-boolean `enabled`, 404 for an unknown id.
+router.post("/:id/contact-form-only", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const id = req.params.id as string;
+  const enabled = req.body?.enabled;
+  if (typeof enabled !== "boolean") {
+    res.status(400).json({ error: "enabled (boolean) is required" });
+    return;
+  }
+  try {
+    const result = setContactFormOnly(getDb(), id, enabled);
+    if (!result) {
+      res.status(404).json({ error: "Agent not found", agent_id: id });
+      return;
+    }
+    console.log(JSON.stringify({ evt: "contact_form_only_set", host: "rfb", profile_id: result.id, contact_form_only: result.contact_form_only }));
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: "contact-form-only write failed" });
   }
 });
 

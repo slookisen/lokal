@@ -73,6 +73,21 @@
 //                           1–4 changed tonight first, then cohort rows whose
 //                           homepage has been unreachable >= 14 days (so a
 //                           Brreg konkurs/inactive verdict lands as today).
+//   6  owner_refresh        ONLY with OWNER_AUTO_UPDATES_ENABLED (dev-request
+//                           2026-11-01-rfb-hold-profilen-oppdatert; off = no
+//                           step, no report key, no envelope claim): verified-
+//                           owner profiles whose auto.updates is fill_empty /
+//                           automatic — NOT the cohort below, which still
+//                           leaves every owned profile out. Runs after step 5,
+//                           so steps 1–5 select, write and spend exactly as
+//                           before; it gets what is left of the run deadline
+//                           and of tonight's LLM budget (reserved per profile
+//                           like every LLM row), honours the write-pause and
+//                           the 08Z ban, and stamps its rotation memory as
+//                           step `owner_refresh`. What it may write and how:
+//                           services/rfb-owner-refresh.ts. Its rows are not
+//                           re-verified (an owned profile is no outreach
+//                           candidate) and its numbers stay out of `totals`.
 //
 // Cohort (who the steps may pick): RFB producers that are not contacted —
 // neither `already_sent` nor `already_contacted` exactly as GET /admin/pool-
@@ -148,6 +163,28 @@
 // when the window ended without one (reason, e.g. the lock was held).
 // Manual surfaces: GET /admin/rfb-enrichment-nightly/preview and POST
 // /admin/rfb-enrichment-nightly/run (routes/admin-rfb-enrichment-nightly.ts).
+//
+// Open owner claims go first (dev-request 2026-10-30-rfb-eierkrav-automatisk-
+// vurdering-og-ettklikk, slice D4) — ONLY with
+// RFB_ENRICHMENT_CLAIM_PRIORITY_ENABLED === "true" (default OFF; off = the
+// claims query never runs and selection + report are exactly as before). No
+// new table: the "queue" is a priority derived from agent_claims at load
+// time. An open claim is a row with status pending / code_sent /
+// pending_review, created within RFB_ENRICHMENT_CLAIM_PRIORITY_DAYS (default
+// 30) and source <> 'test' (newest per agent, read once per cohort load).
+//   • Cohort: a row with an open claim that would otherwise be left out ONLY
+//     as `unvetted` is admitted; every other exclusion still wins (such a row
+//     is still counted as `unvetted`, the first reason, as before).
+//   • Selection: a cohort row with an open claim that is thin (is_vetted not
+//     1, or no knowledge website, or no e-mail in agent_knowledge.email nor
+//     agents.contact_email — our own kontakt@rettfrabonden.com counts as
+//     none — or no agent_knowledge.address) gets priority 0, ahead of tiers
+//     1–6, within each step's own cap. The rotation memory is bypassed for
+//     it only when the step's last attempt is OLDER than the claim (one fresh
+//     attempt per claim, never every night). stepEligible, caps, LLM budget,
+//     write-pause, the 08Z ban and the lock are unchanged.
+//   • Report: cohort.claim_priority (prioritised rows) and
+//     cohort.claim_priority_admitted_unvetted — present only with the flag.
 
 import { getDb, isContentQualified, isOwnPlatformHomepage } from "../database/init";
 import { recordRun, acquireLock, releaseLock } from "./run-ledger";
@@ -163,6 +200,7 @@ import {
   isDirectoryOrAggregatorHost,
 } from "./cross-source-validator";
 import { outreachSentLogHasVerticalColumn } from "./outreach-suppression-signals";
+import { hasContactRetentionMarkers } from "./privacy-retention";
 import { createLlmCallMeter, runWithLlmCallMeter, type LlmCallMeter } from "./llm-call-meter";
 import { refreshRfbCandidateHomepage } from "./rfb-marketing-daily";
 import { generateGardssalgProductList, type GardssalgProductsExtractionDiagnostic } from "./gardssalg-product-list";
@@ -188,6 +226,23 @@ import contactExtractionRouter, {
   RFB_CX_HARD_CAP,
 } from "../routes/admin-rfb-contact-extraction";
 import bmProducerHarvestRouter from "../routes/admin-bm-producer-harvest";
+import {
+  OWNER_REFRESH_PER_ROW_MS,
+  OWNER_REFRESH_STEP,
+  buildOwnerRefreshPreview,
+  loadOwnerRefreshCohort,
+  newOwnerRefreshStepReport,
+  ownerRefreshRowLlmCallsMax,
+  refreshOwnedProfile,
+  resolveOwnerRefreshCap,
+  tallyOwnerRefreshRow,
+  judgeUnavailableStamp,
+  type OwnerRefreshDeps,
+  type OwnerRefreshPreview,
+  type OwnerRefreshRowOutcome,
+  type OwnerRefreshStepReport,
+} from "./rfb-owner-refresh";
+import { ownerAutoUpdatesEnabled } from "../owner-features/registry";
 import {
   runVerifierBatch,
   resolveBrregLookup,
@@ -345,6 +400,18 @@ export function resolveRfbEnrichmentMaxRuntimeMs(): number {
 
 export function resolveRfbEnrichmentRetryDays(): number {
   return intEnv("RFB_ENRICHMENT_RETRY_DAYS", RFB_ENRICHMENT_RETRY_DAYS_DEFAULT, 1, 90);
+}
+
+/** D4: open owner claims on thin profiles go first. Only the exact string "true" turns it on. */
+export function isRfbEnrichmentClaimPriorityEnabled(): boolean {
+  return process.env.RFB_ENRICHMENT_CLAIM_PRIORITY_ENABLED === "true";
+}
+
+export const RFB_ENRICHMENT_CLAIM_PRIORITY_DAYS_DEFAULT = 30;
+
+/** D4: how old an open claim may be and still give priority; unset/junk → 30, clamped to [1, 365]. */
+export function resolveRfbEnrichmentClaimPriorityDays(): number {
+  return intEnv("RFB_ENRICHMENT_CLAIM_PRIORITY_DAYS", RFB_ENRICHMENT_CLAIM_PRIORITY_DAYS_DEFAULT, 1, 365);
 }
 
 export function resolveRfbEnrichmentUsdPerCall(): number {
@@ -783,7 +850,7 @@ export function readRfbEnrichmentAttempts(db: Db): Map<string, Map<string, numbe
   return out;
 }
 
-function stampAttempt(db: Db, agentId: string, step: RfbEnrichmentStep, at: Date, outcome: string, runId: string): void {
+function stampAttempt(db: Db, agentId: string, step: RfbEnrichmentStep | typeof OWNER_REFRESH_STEP, at: Date, outcome: string, runId: string): void {
   try {
     db.prepare(
       `INSERT INTO rfb_enrichment_nightly_attempts (agent_id, step, last_attempted_at, last_outcome, last_run_id)
@@ -873,6 +940,40 @@ export interface RfbEnrichmentCohort {
   considered: number;
   excluded: Record<RfbEnrichmentExclusion, number>;
   by_tier: Record<string, number>;
+  /**
+   * D4, only with RFB_ENRICHMENT_CLAIM_PRIORITY_ENABLED (absent otherwise):
+   * cohort row id → its newest open owner claim's created_at (ms, never later
+   * than the load's now), for rows that are thin / not reviewed. These rows
+   * get priority 0 in every step's selection.
+   */
+  claimPriority?: Map<string, number>;
+  /** D4, flag on only: rows admitted although unvetted, because of an open claim. */
+  claimPriorityAdmittedUnvetted?: number;
+}
+
+/** What the preview / run report show of the cohort. The claim_priority keys exist only with the D4 flag. */
+export interface RfbEnrichmentCohortSummary {
+  considered: number;
+  eligible: number;
+  excluded: Record<RfbEnrichmentExclusion, number>;
+  by_tier: Record<string, number>;
+  claim_priority?: number;
+  claim_priority_admitted_unvetted?: number;
+}
+
+export function summarizeRfbEnrichmentCohort(cohort: RfbEnrichmentCohort): RfbEnrichmentCohortSummary {
+  return {
+    considered: cohort.considered,
+    eligible: cohort.rows.length,
+    excluded: cohort.excluded,
+    by_tier: cohort.by_tier,
+    ...(cohort.claimPriority
+      ? {
+          claim_priority: cohort.claimPriority.size,
+          claim_priority_admitted_unvetted: cohort.claimPriorityAdmittedUnvetted ?? 0,
+        }
+      : {}),
+  };
 }
 
 interface BaseRow {
@@ -901,6 +1002,8 @@ interface BaseRow {
   url_last_probed: string | null;
   homepage_unreachable_since: string | null;
   curated_fields: string | null;
+  /** agent_knowledge.address (street address) — read only by the D4 thinness check. */
+  k_address: string | null;
 }
 
 function baseRowsSql(extraWhere = ""): string {
@@ -917,7 +1020,7 @@ function baseRowsSql(extraWhere = ""): string {
            k.verification_review_reason AS verification_review_reason,
            k.url_last_status AS url_last_status, k.url_last_probed AS url_last_probed,
            k.homepage_unreachable_since AS homepage_unreachable_since,
-           k.curated_fields AS curated_fields
+           k.curated_fields AS curated_fields, k.address AS k_address
       FROM agents a
       LEFT JOIN agent_knowledge k ON k.agent_id = a.id
      WHERE a.role = 'producer'
@@ -1006,6 +1109,20 @@ export function readRfbContactedSignals(db: Db): RfbContactedSignals {
     )
     .all() as Array<{ e: string | null; last_sent: string | null }>;
   for (const r of crmRows) if (r.e !== null && r.last_sent) crmOutEmails.add(r.e);
+  // Slettefrist slice A: outbound messages the 24-month retention job deleted
+  // are kept as crm_contacts.retention_last_outbound_at (their MAX(sent_at)).
+  if (hasContactRetentionMarkers(db)) {
+    for (const r of db
+      .prepare(
+        `SELECT LOWER(email) AS e, MAX(retention_last_outbound_at) AS last_sent
+           FROM crm_contacts
+          WHERE retention_last_outbound_at IS NOT NULL
+          GROUP BY LOWER(email)`,
+      )
+      .all() as Array<{ e: string | null; last_sent: string | null }>) {
+      if (r.e !== null && r.last_sent) crmOutEmails.add(r.e);
+    }
+  }
 
   const sentAgentIds = new Set<string>();
   const sentRecipients = new Set<string>();
@@ -1068,11 +1185,15 @@ function toCohortRow(r: BaseRow): RfbEnrichmentCohortRow {
  * The uncontacted RFB cohort. Read-only; yields to the event loop between
  * phases and every 200 rows of the per-row checks.
  */
-export async function loadRfbEnrichmentCohort(db: Db): Promise<RfbEnrichmentCohort> {
+export async function loadRfbEnrichmentCohort(db: Db, nowMs: number = Date.now()): Promise<RfbEnrichmentCohort> {
   const base = db.prepare(baseRowsSql()).all() as BaseRow[];
   await yieldToEventLoop();
   const contacted = readRfbContactedSignals(db);
   const optOut = readOptOutAgentIds(db);
+  // D4: read only with the flag on — off, this query never runs.
+  const openClaims = isRfbEnrichmentClaimPriorityEnabled()
+    ? readRfbOpenOwnerClaims(db, nowMs, resolveRfbEnrichmentClaimPriorityDays())
+    : null;
   await yieldToEventLoop();
 
   const excluded: Record<RfbEnrichmentExclusion, number> = {
@@ -1088,31 +1209,20 @@ export async function loadRfbEnrichmentCohort(db: Db): Promise<RfbEnrichmentCoho
   };
   const rows: RfbEnrichmentCohortRow[] = [];
   const byTier: Record<string, number> = {};
+  const claimPriority = openClaims ? new Map<string, number>() : null;
+  let admittedUnvetted = 0;
   for (let i = 0; i < base.length; i++) {
     if (i > 0 && i % 200 === 0) await yieldToEventLoop();
     const r = base[i];
-    let reason: RfbEnrichmentExclusion | null = null;
-    if (r.umbrella_type) reason = "umbrella";
-    else if (r.is_active !== 1) reason = "inactive";
-    else if (r.is_vetted !== null && r.is_vetted !== 1) reason = "unvetted";
-    else if (r.is_customer === 1) reason = "customer";
-    else if (hasCuratedLock(r.curated_fields)) reason = "curated";
-    else if (r.verification_status === "opt_out" || optOut.has(r.id)) reason = "opt_out";
-    else if (isContactedPerPoolBlockerExplain(r, contacted)) reason = "contacted";
-    else if (
-      isBlocked({
-        agentId: r.id,
-        name: r.name ?? undefined,
-        email: trimmed(r.k_email) || undefined,
-        website: trimmed(r.k_website) || undefined,
-      }).blocked
-    )
-      reason = "blocklisted";
-    else {
-      const terminal = classifyTerminalRow(r.verification_status, r.verification_review_reason);
-      if (terminal.outcome === "skipped_confirmed_dead" || terminal.outcome === "skipped_non_producer") {
-        reason = "terminal_dead";
-      }
+    const claimMs = openClaims?.get(r.id);
+    let reason = cohortExclusionOf(r, optOut, contacted, false);
+    let admitted = false;
+    // D4: an open claim lifts ONLY the unvetted exclusion. A row that would
+    // also be left out for another reason stays out, counted as unvetted
+    // (its first reason, exactly as without the flag).
+    if (reason === "unvetted" && claimMs !== undefined && cohortExclusionOf(r, optOut, contacted, true) === null) {
+      reason = null;
+      admitted = true;
     }
     if (reason) {
       excluded[reason]++;
@@ -1121,8 +1231,107 @@ export async function loadRfbEnrichmentCohort(db: Db): Promise<RfbEnrichmentCoho
     const row = toCohortRow(r);
     rows.push(row);
     byTier[String(row.tier)] = (byTier[String(row.tier)] ?? 0) + 1;
+    if (claimPriority && claimMs !== undefined && rfbEnrichmentRowIsThin(r)) {
+      claimPriority.set(r.id, claimMs);
+      if (admitted) admittedUnvetted++;
+    }
   }
-  return { rows, considered: base.length, excluded, by_tier: byTier };
+  const out: RfbEnrichmentCohort = { rows, considered: base.length, excluded, by_tier: byTier };
+  if (claimPriority) {
+    out.claimPriority = claimPriority;
+    out.claimPriorityAdmittedUnvetted = admittedUnvetted;
+  }
+  return out;
+}
+
+/** The first reason a base row is left out of the cohort (null = in). `ignoreUnvetted`: D4's second look. */
+function cohortExclusionOf(
+  r: BaseRow,
+  optOut: Set<string>,
+  contacted: RfbContactedSignals,
+  ignoreUnvetted: boolean,
+): RfbEnrichmentExclusion | null {
+  let reason: RfbEnrichmentExclusion | null = null;
+  if (r.umbrella_type) reason = "umbrella";
+  else if (r.is_active !== 1) reason = "inactive";
+  else if (!ignoreUnvetted && r.is_vetted !== null && r.is_vetted !== 1) reason = "unvetted";
+  else if (r.is_customer === 1) reason = "customer";
+  else if (hasCuratedLock(r.curated_fields)) reason = "curated";
+  else if (r.verification_status === "opt_out" || optOut.has(r.id)) reason = "opt_out";
+  else if (isContactedPerPoolBlockerExplain(r, contacted)) reason = "contacted";
+  else if (
+    isBlocked({
+      agentId: r.id,
+      name: r.name ?? undefined,
+      email: trimmed(r.k_email) || undefined,
+      website: trimmed(r.k_website) || undefined,
+    }).blocked
+  )
+    reason = "blocklisted";
+  else {
+    const terminal = classifyTerminalRow(r.verification_status, r.verification_review_reason);
+    if (terminal.outcome === "skipped_confirmed_dead" || terminal.outcome === "skipped_non_producer") {
+      reason = "terminal_dead";
+    }
+  }
+  return reason;
+}
+
+/** Statuses of an owner claim that is still open (D4). */
+const RFB_OPEN_CLAIM_STATUSES = ["pending", "code_sent", "pending_review"] as const;
+
+/**
+ * D4: agent_id → newest open owner claim's created_at (ms), one set-based
+ * read. Open = status pending / code_sent / pending_review, source not
+ * 'test', created within `days` of `nowMs`. created_at is SQLite
+ * datetime('now') ("YYYY-MM-DD HH:MM:SS", UTC, no zone) or ISO-8601 — both
+ * parsed as UTC; unparseable rows are ignored. A claim stamped after `nowMs`
+ * (clock skew) is clamped to `nowMs`, so it still gets its one fresh attempt.
+ * A missing table reads as no claims.
+ */
+export function readRfbOpenOwnerClaims(db: Db, nowMs: number, days: number): Map<string, number> {
+  const out = new Map<string, number>();
+  let rows: Array<{ agent_id: string; created_at: string | null }> = [];
+  try {
+    rows = db
+      .prepare(
+        `SELECT agent_id, created_at FROM agent_claims
+          WHERE status IN (${RFB_OPEN_CLAIM_STATUSES.map((s) => `'${s}'`).join(", ")})
+            AND COALESCE(source, '') <> 'test'`,
+      )
+      .all() as typeof rows;
+  } catch {
+    return out;
+  }
+  const cutoff = nowMs - days * 86_400_000;
+  for (const r of rows) {
+    const t = parseMs(r.created_at);
+    if (t === null || t < cutoff) continue;
+    const ms = Math.min(t, nowMs);
+    const prev = out.get(r.agent_id);
+    if (prev === undefined || ms > prev) out.set(r.agent_id, ms);
+  }
+  return out;
+}
+
+/** Our own support address, stored as a placeholder contact e-mail on some rows — counts as no e-mail (D4). */
+const RFB_PLACEHOLDER_EMAIL = "kontakt@rettfrabonden.com";
+
+function realEmail(v: string | null | undefined): boolean {
+  const e = trimmed(v).toLowerCase();
+  return e !== "" && e !== RFB_PLACEHOLDER_EMAIL;
+}
+
+/**
+ * D4 "thin / not reviewed": not vetted, or no knowledge website, or no real
+ * e-mail (neither agent_knowledge.email nor agents.contact_email), or no
+ * street address (agent_knowledge.address).
+ */
+function rfbEnrichmentRowIsThin(r: BaseRow): boolean {
+  if (r.is_vetted !== 1) return true;
+  if (trimmed(r.k_website) === "") return true;
+  if (!realEmail(r.k_email) && !realEmail(r.contact_email)) return true;
+  return trimmed(r.k_address) === "";
 }
 
 /**
@@ -1268,7 +1477,7 @@ function buildSelectionContext(
     attempts,
     brregCandidateIds: idSet(
       db,
-      `SELECT a.id AS id FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id WHERE ${rfbBssCandidateWhereSql()}`,
+      `SELECT a.id AS id FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id WHERE ${rfbBssCandidateWhereSql(db)}`,
     ),
     cxEligibleIds: idSet(db, rfbCxSelectSql(RFB_CX_ELIGIBLE_WHERE)),
     pendingQueueAgentIds: idSet(db, `SELECT agent_id AS id FROM agents_website_review_queue WHERE status = 'pending'`),
@@ -1287,13 +1496,17 @@ export async function selectRfbEnrichmentStepRows(
   cap: number,
 ): Promise<RfbEnrichmentSelection> {
   const last = ctx.attempts.get(step) ?? new Map<string, number>();
-  const picked: Array<{ row: RfbEnrichmentCohortRow; attemptMs: number; second: number }> = [];
+  const picked: Array<{ row: RfbEnrichmentCohortRow; attemptMs: number; second: number; rank: number }> = [];
   const skipped: Record<string, number> = {};
   for (let i = 0; i < cohort.rows.length; i++) {
     if (i > 0 && i % 200 === 0) await yieldToEventLoop();
     const r = cohort.rows[i];
     const attemptMs = last.get(r.id) ?? null;
-    if (attemptMs !== null && attemptMs > ctx.nowMs - ctx.retryMs) continue;
+    // D4 (flag on only): a prioritised row's claim newer than this step's
+    // last attempt earns ONE fresh attempt inside the retry window.
+    const claimMs = cohort.claimPriority?.get(r.id);
+    const freshClaim = claimMs !== undefined && attemptMs !== null && attemptMs < claimMs;
+    if (attemptMs !== null && attemptMs > ctx.nowMs - ctx.retryMs && !freshClaim) continue;
     const ok = stepEligible(step, r, ctx);
     if (typeof ok === "string") {
       skipped[ok] = (skipped[ok] ?? 0) + 1;
@@ -1306,10 +1519,11 @@ export async function selectRfbEnrichmentStepRows(
     // those rows the call cannot add an e-mail — they come after the rows
     // where it can (their org_nr/website gain is unchanged).
     const second = step === "brreg_contact" && trimmed(r.contact_email) !== "" ? 1 : 0;
-    picked.push({ row: r, attemptMs: attemptMs ?? 0, second });
+    // D4: a prioritised row ranks 0, ahead of tiers 1–6 (no priority → its tier, as before).
+    picked.push({ row: r, attemptMs: attemptMs ?? 0, second, rank: claimMs !== undefined ? 0 : r.tier });
   }
   // Stable sort: cohort order (created_at, id) breaks the remaining ties.
-  picked.sort((a, b) => a.row.tier - b.row.tier || a.second - b.second || a.attemptMs - b.attemptMs);
+  picked.sort((a, b) => a.rank - b.rank || a.second - b.second || a.attemptMs - b.attemptMs);
   const rows = picked.slice(0, Math.max(0, cap)).map((p) => p.row);
   const out: RfbEnrichmentSelection = { eligible: picked.length, rows, skipped };
   if (step === "url_check") {
@@ -1773,7 +1987,7 @@ export interface RfbEnrichmentPreview {
   llm_calls_per_row_max: Record<RfbEnrichmentStep, number>;
   max_runtime_minutes: number;
   retry_days: number;
-  cohort: { considered: number; eligible: number; excluded: Record<RfbEnrichmentExclusion, number>; by_tier: Record<string, number> };
+  cohort: RfbEnrichmentCohortSummary;
   steps: Array<{
     step: RfbEnrichmentStep;
     cap: number;
@@ -1787,6 +2001,8 @@ export interface RfbEnrichmentPreview {
     note?: string;
     bm?: { offset: number; limit: number; last_total: number | null; cursor_updated_at: string | null };
   }>;
+  /** Step 6 — only with OWNER_AUTO_UPDATES_ENABLED (absent otherwise). */
+  owner_refresh?: OwnerRefreshPreview;
 }
 
 export interface RfbEnrichmentNightlyReport {
@@ -1817,10 +2033,12 @@ export interface RfbEnrichmentNightlyReport {
     by_source: Record<string, number>;
     cap_reached: boolean;
   };
-  cohort: { considered: number; eligible: number; excluded: Record<RfbEnrichmentExclusion, number>; by_tier: Record<string, number> } | null;
+  cohort: RfbEnrichmentCohortSummary | null;
   steps: RfbEnrichmentStepReport[];
   totals: { attempted: number; written: number; changed_agents: number; re_verified: number; new_verified: number; new_in_pool: number };
   preview?: RfbEnrichmentPreview;
+  /** Step 6 — only with OWNER_AUTO_UPDATES_ENABLED, in an apply run that reached the steps (absent otherwise). */
+  owner_refresh?: OwnerRefreshStepReport;
   envelope_recorded: boolean;
   errors: string[];
 }
@@ -1832,6 +2050,8 @@ export interface RfbEnrichmentNightlyDeps {
   productNameExtractor?: HcrProductNamesExtractor;
   /** The run's clock (tests); default: `now` plus real elapsed time. */
   clock?: () => Date;
+  /** Step 6's about judges / fetch seam (tests: stubs — never a real model call or fetch). */
+  ownerRefresh?: OwnerRefreshDeps;
 }
 
 function roundUsd(n: number): number {
@@ -1896,7 +2116,7 @@ function isInPool(db: Db, agentId: string): boolean {
 export async function buildRfbEnrichmentPreview(db: Db, now: Date): Promise<RfbEnrichmentPreview> {
   const caps = resolveRfbEnrichmentCaps();
   const windowHours = resolveRfbEnrichmentWindowHours();
-  const cohort = await loadRfbEnrichmentCohort(db);
+  const cohort = await loadRfbEnrichmentCohort(db, now.getTime());
   const ctx = buildSelectionContext(db, now.getTime(), readRfbEnrichmentAttempts(db));
   const perRow = {} as Record<RfbEnrichmentStep, number>;
   for (const s of RFB_ENRICHMENT_STEP_ORDER) perRow[s] = rfbEnrichmentLlmCallsPerRowMax(s);
@@ -1928,6 +2148,14 @@ export async function buildRfbEnrichmentPreview(db: Db, now: Date): Promise<RfbE
     });
   }
   const last = getJobLastCompletedAt(db, RFB_ENRICHMENT_NIGHTLY_JOB_STATE_KEY);
+  // Step 6 (OWNER_AUTO_UPDATES_ENABLED only — the preview is unchanged without it).
+  const ownerRefresh = ownerAutoUpdatesEnabled()
+    ? await buildOwnerRefreshPreview(db, {
+        nowMs: now.getTime(),
+        fillEmptyRetryMs: resolveRfbEnrichmentRetryDays() * 86_400_000,
+        cap: resolveOwnerRefreshCap(),
+      })
+    : null;
   return {
     generated_at: now.toISOString(),
     enabled_by_env: isRfbEnrichmentNightlyEnabled(),
@@ -1942,8 +2170,9 @@ export async function buildRfbEnrichmentPreview(db: Db, now: Date): Promise<RfbE
     llm_calls_per_row_max: perRow,
     max_runtime_minutes: resolveRfbEnrichmentMaxRuntimeMs() / 60_000,
     retry_days: resolveRfbEnrichmentRetryDays(),
-    cohort: { considered: cohort.considered, eligible: cohort.rows.length, excluded: cohort.excluded, by_tier: cohort.by_tier },
+    cohort: summarizeRfbEnrichmentCohort(cohort),
     steps,
+    ...(ownerRefresh ? { owner_refresh: ownerRefresh } : {}),
   };
 }
 
@@ -2187,8 +2416,8 @@ async function runSteps(rc: RunContext): Promise<void> {
     ...(rc.deps?.executors ?? {}),
   };
 
-  const cohort = await loadRfbEnrichmentCohort(db);
-  report.cohort = { considered: cohort.considered, eligible: cohort.rows.length, excluded: cohort.excluded, by_tier: cohort.by_tier };
+  const cohort = await loadRfbEnrichmentCohort(db, now.getTime());
+  report.cohort = summarizeRfbEnrichmentCohort(cohort);
   const attempts = readRfbEnrichmentAttempts(db);
 
   /** agent_id → the first step that changed it tonight (step 5's work list, in order). */
@@ -2563,6 +2792,80 @@ async function runSteps(rc: RunContext): Promise<void> {
     finishStep(sr, t0, llmBefore);
   }
 
+  // 6 — owner refresh (OWNER_AUTO_UPDATES_ENABLED only; header step 6). After
+  // step 5 on purpose: steps 1–5 above ran exactly as without it. It may use
+  // the time up to the run deadline (step 5's reserve is spent) and what is
+  // left of tonight's LLM budget; its outcomes stay out of report.steps,
+  // `totals` and the run's stopped_reason (its own report has them).
+  if (ownerAutoUpdatesEnabled()) {
+    const t0 = Date.now();
+    const llmBefore = meter.calls;
+    const orr = newOwnerRefreshStepReport(resolveOwnerRefreshCap());
+    report.owner_refresh = orr;
+    const skip = globalStop ?? (orr.cap <= 0 ? "cap_zero" : writesPaused ? "enrichment_write_paused" : null);
+    if (skip) {
+      orr.skipped_reason = skip;
+    } else {
+      try {
+        const cohort = await loadOwnerRefreshCohort(db, {
+          nowMs: now.getTime(),
+          fillEmptyRetryMs: resolveRfbEnrichmentRetryDays() * 86_400_000,
+        });
+        const take = cohort.eligible.slice(0, orr.cap);
+        orr.considered = cohort.considered;
+        orr.eligible = cohort.eligible.length;
+        orr.selected = take.length;
+        orr.skipped_before_selection = cohort.skipped;
+        for (const row of take) {
+          await yieldToEventLoop();
+          const t = clock();
+          if (isRfbEnrichmentForbiddenHour(t)) { orr.stopped_reason = "forbidden_hour"; break; }
+          if (t.getTime() >= rc.deadline.getTime()) { orr.stopped_reason = "time_budget"; break; }
+          if (writePauseActive()) { orr.stopped_reason = "enrichment_write_paused"; break; }
+          const perRowLlm = ownerRefreshRowLlmCallsMax(row);
+          if (perRowLlm > 0 && (llmCapReached || meter.calls + perRowLlm > llmCap)) {
+            // Tonight's LLM budget is spent: a profile that needs the about
+            // judges waits (not attempted, not stamped); the others go on.
+            llmCapReached = true;
+            orr.outcomes.skipped_llm_cap = (orr.outcomes.skipped_llm_cap ?? 0) + 1;
+            continue;
+          }
+          const reserved = reserveLlm(perRowLlm);
+          if (reserved === null) {
+            orr.outcomes.skipped_llm_counter_unwritable = (orr.outcomes.skipped_llm_counter_unwritable ?? 0) + 1;
+            continue;
+          }
+          const callsBefore = meter.calls;
+          let out: OwnerRefreshRowOutcome;
+          try {
+            out = await refreshOwnedProfile(db, row, {
+              deadlineAt: Date.now() + Math.min(OWNER_REFRESH_PER_ROW_MS, rc.deadline.getTime() - clock().getTime()),
+              runId: report.run_id,
+              deps: rc.deps?.ownerRefresh,
+            });
+          } catch (err) {
+            // refreshOwnedProfile catches its own failures; anything that still
+            // throws is a real outcome too (stamped), never retried every night.
+            out = { outcome: "error", written: [], refused: [], detail: errMessage(err) };
+          }
+          // A refresh we stopped waiting for may still make its judge calls.
+          const actual = meter.calls - callsBefore;
+          settleLlm(reserved, out.outcome === "timeout" ? Math.max(reserved, actual) : actual);
+          tallyOwnerRefreshRow(orr, row, out);
+          if (!out.transient) stampAttempt(db, row.id, OWNER_REFRESH_STEP, clock(), out.outcome, report.run_id);
+          // An unavailable about judge: the streak (due again next night until it is full).
+          else if (out.judge_unavailable) stampAttempt(db, row.id, OWNER_REFRESH_STEP, clock(), judgeUnavailableStamp(row.last_outcome), report.run_id);
+        }
+      } catch (err) {
+        orr.errors.push(`owner refresh aborted: ${errMessage(err)}`);
+      }
+    }
+    orr.llm_calls = meter.calls - llmBefore;
+    orr.est_cost_usd = roundUsd(orr.llm_calls * usdPerCall);
+    orr.duration_ms = Date.now() - t0;
+    orr.rows = orr.rows.slice(0, 100);
+  }
+
   report.llm.cap_reached = llmCapReached;
   if (globalStop && !report.stopped_reason) report.stopped_reason = globalStop;
   const t = report.totals;
@@ -2686,6 +2989,34 @@ function recordEnvelope(
             stopped_reason: report.stopped_reason,
           },
         },
+        // Step 6 (OWNER_AUTO_UPDATES_ENABLED only): its own claim, so the
+        // claims above read exactly as without it. Its errors are here, not
+        // in the run's status.
+        ...(report.owner_refresh
+          ? [{
+              type: "custom" as const,
+              value: report.owner_refresh.written,
+              meta: {
+                kind: "rfb_enrichment_owner_refresh",
+                cap: report.owner_refresh.cap,
+                considered: report.owner_refresh.considered,
+                eligible: report.owner_refresh.eligible,
+                selected: report.owner_refresh.selected,
+                attempted: report.owner_refresh.attempted,
+                written: report.owner_refresh.written,
+                fields_written: report.owner_refresh.fields_written,
+                refused: report.owner_refresh.refused,
+                outcomes: report.owner_refresh.outcomes,
+                skipped_before_selection: report.owner_refresh.skipped_before_selection,
+                skipped_reason: report.owner_refresh.skipped_reason,
+                stopped_reason: report.owner_refresh.stopped_reason,
+                llm_calls: report.owner_refresh.llm_calls,
+                est_cost_usd: report.owner_refresh.est_cost_usd,
+                agent_ids: report.owner_refresh.changed_agent_ids.slice(0, 100),
+                errors: report.owner_refresh.errors,
+              },
+            }]
+          : []),
       ],
       evidence:
         reverifyIdx >= 0

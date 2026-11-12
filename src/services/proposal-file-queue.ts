@@ -31,7 +31,7 @@ import { randomUUID } from "crypto";
 import type Database from "better-sqlite3";
 import { getDb as getExpDbDefault } from "../database/db-factory";
 import { getDb as getMainDbDefault } from "../database/init";
-import { enrichmentWritePauseBlock } from "./enrichment-write-pause";
+import { enrichmentWritePauseBlock, type EnrichmentVertical } from "./enrichment-write-pause";
 import { listRecentRuns, recordRun } from "./run-ledger";
 
 export const PROPOSAL_QUEUE_REPO = "slookisen/A2A";
@@ -57,7 +57,16 @@ export type ProposalApplyResult =
 export type ProposalApplyFn = (
   expDb: Database.Database,
   items: unknown[],
-  opts: { dryRun: false; homepageFetchImpl: typeof fetch; logTag: string },
+  opts: {
+    dryRun: false;
+    homepageFetchImpl: typeof fetch;
+    logTag: string;
+    // Additive (content-judgement lane, skive 3k): the tick's clock and
+    // whatever file-level fields the caller's `validate` passed through as
+    // `context`. Existing callers ignore both.
+    now?: Date;
+    fileContext?: Record<string, unknown>;
+  },
 ) => Promise<ProposalApplyResult>;
 
 export interface ProposalQueueConfig {
@@ -72,20 +81,36 @@ export interface ProposalQueueConfig {
   failuresTable: string;
   /** Flag check — the caller's own env switch. */
   enabled: (env: Record<string, string | undefined>) => boolean;
-  /** Structural check of a parsed file; item-level validation is apply's. */
-  validate: (parsed: unknown) => { items: unknown[] } | { error: string };
+  /** Structural check of a parsed file; item-level validation is apply's.
+   *  `context` (optional) is handed to apply as `opts.fileContext`. */
+  validate: (parsed: unknown) => { items: unknown[]; context?: Record<string, unknown> } | { error: string };
   apply: ProposalApplyFn;
   /** The id of a written row in an apply result row (for the evidence list). */
   writtenId: (result: Record<string, unknown>) => string | null;
   /** The envelope's claims for a tick — `written` and `processed` are the
-   *  tick's totals; the caller names the claim kinds. */
-  claims: (totals: { written: number; processed: number }) => Array<{ type: "db_state_change"; value: number; meta: Record<string, unknown> }>;
+   *  tick's totals, `totals` the per-key sum of every applied file's totals;
+   *  the caller names the claim kinds. */
+  claims: (totals: { written: number; processed: number; totals: Record<string, number> }) => Array<{ type: "db_state_change"; value: number; meta: Record<string, unknown> }>;
+  /** Optional evidence for claims past index 1 (indexes 0/1 are always the
+   *  written ids and the processed paths). */
+  extraEvidence?: Array<{ claimIdx: number; id: (result: Record<string, unknown>) => string | null }>;
   maxAgeDays?: number;
   filesPerTick?: number;
+  /** Optional per-UTC-day cap on recorded files (rows of `filesTable`
+   *  whose processed_at falls on the tick's UTC day, errors included).
+   *  Unset = no daily cap (the original behaviour). */
+  maxFilesPerDay?: number;
   maxAttemptsPerTick?: number;
   maxFileBytes?: number;
   maxFailures?: number;
   userAgent?: string;
+  /** Additive (dental-triage judgement lane, slice 3c-2): which vertical's
+   *  enrichment write-pause gates the tick, and the run-ledger vertical.
+   *  Both default to "experiences" — every earlier caller is unchanged. A
+   *  non-experiences caller also passes its own `deps.expDb` (the ledger
+   *  tables then live in that vertical's DB). */
+  pauseVertical?: EnrichmentVertical;
+  ledgerVertical?: string;
 }
 
 export interface ProposalQueueDeps {
@@ -121,6 +146,9 @@ export interface ProposalQueueTickReport {
    *  apply) — not recorded as processed unless fail_count reached the cap. */
   failures: Array<{ path: string; fail_count: number; error: string }>;
   written: number;
+  /** True when `maxFilesPerDay` stopped this tick from evaluating further
+   *  files (the rest wait for the next UTC day). Always false without a cap. */
+  daily_cap_reached: boolean;
   envelope_recorded: boolean;
 }
 
@@ -259,12 +287,14 @@ export async function runProposalFileQueueTick(
   const maxFileBytes = config.maxFileBytes ?? PROPOSAL_QUEUE_MAX_FILE_BYTES;
   const maxFailures = config.maxFailures ?? PROPOSAL_QUEUE_MAX_FAILURES;
   const tag = config.logTag;
+  const pauseVertical: EnrichmentVertical = config.pauseVertical ?? "experiences";
+  const ledgerVertical = config.ledgerVertical ?? "experiences";
   // run-YYYY-MM-DD-<agent>-<seq>-<vertical>; seq = HHMMSSmmm + a short random
   // suffix, because recordRun() is ON CONFLICT(run_id) DO NOTHING and two
   // ticks must never share an id.
   const runId =
     `run-${today}-${config.agent}-` +
-    `${startedAt.replace(/[^0-9]/g, "").slice(8, 17)}${randomUUID().slice(0, 6)}-experiences`;
+    `${startedAt.replace(/[^0-9]/g, "").slice(8, 17)}${randomUUID().slice(0, 6)}-${ledgerVertical}`;
   const report: ProposalQueueTickReport = {
     run_id: runId,
     skipped_reason: null,
@@ -273,6 +303,7 @@ export async function runProposalFileQueueTick(
     processed: [],
     failures: [],
     written: 0,
+    daily_cap_reached: false,
     envelope_recorded: false,
   };
 
@@ -281,8 +312,8 @@ export async function runProposalFileQueueTick(
     return report;
   }
   const mainDb = deps.mainDb ?? getMainDbDefault;
-  if (enrichmentWritePauseBlock(mainDb, "experiences")) {
-    console.log(`[${tag}] experiences write-pause is active — tick skipped, nothing fetched`);
+  if (enrichmentWritePauseBlock(mainDb, pauseVertical)) {
+    console.log(`[${tag}] ${pauseVertical} write-pause is active — tick skipped, nothing fetched`);
     report.skipped_reason = "paused";
     return report;
   }
@@ -319,9 +350,16 @@ export async function runProposalFileQueueTick(
      ON CONFLICT(path) DO UPDATE SET
        fail_count = fail_count + 1, last_error = excluded.last_error, last_failed_at = excluded.last_failed_at`,
   );
+  const maxFilesPerDay = config.maxFilesPerDay;
+  // processed_at is SQLite datetime('now') ("YYYY-MM-DD HH:MM:SS", UTC);
+  // the day compared is the tick's own UTC day.
+  const filesRecordedToday = (): number =>
+    (expDb.prepare(`SELECT COUNT(*) AS n FROM ${config.filesTable} WHERE substr(processed_at, 1, 10) = ?`).get(today) as { n: number }).n;
   const failCountOf = (path: string): number =>
     (expDb.prepare(`SELECT fail_count FROM ${config.failuresTable} WHERE path = ?`).get(path) as { fail_count: number } | undefined)?.fail_count ?? 0;
   const writtenIds: string[] = [];
+  const extraEvidenceIds: string[][] = (config.extraEvidence ?? []).map(() => []);
+  const summedTotals: Record<string, number> = {};
 
   const recordFile = (f: ContentsEntry, outcome: ProposalFileOutcome, resultJson: unknown): void => {
     recordFileStmt.run(f.path, f.sha, JSON.stringify(resultJson));
@@ -428,7 +466,12 @@ export async function runProposalFileQueueTick(
     let attempts = 0;
     for (const f of candidates) {
       if (evaluated >= filesPerTick || attempts >= maxAttemptsPerTick) break;
-      if (enrichmentWritePauseBlock(mainDb, "experiences")) {
+      if (maxFilesPerDay !== undefined && filesRecordedToday() >= maxFilesPerDay) {
+        report.daily_cap_reached = true;
+        console.log(`[${tag}] daily cap of ${maxFilesPerDay} file(s) reached for ${today} — remaining files left for the next UTC day`);
+        break;
+      }
+      if (enrichmentWritePauseBlock(mainDb, pauseVertical)) {
         console.log(`[${tag}] write-pause became active mid-tick — remaining files left for a later tick`);
         break;
       }
@@ -467,7 +510,7 @@ export async function runProposalFileQueueTick(
       }
       let out: ProposalApplyResult;
       try {
-        out = await apply(expDb, v.items, { dryRun: false, homepageFetchImpl, logTag: tag });
+        out = await apply(expDb, v.items, { dryRun: false, homepageFetchImpl, logTag: tag, now, fileContext: v.context });
       } catch (err) {
         // review N2: an unexpected exception in the apply step is a per-file
         // failure (same cap), never a tick-killer.
@@ -482,6 +525,13 @@ export async function runProposalFileQueueTick(
         for (const r of out.results) {
           const id = config.writtenId(r);
           if (id) writtenIds.push(id);
+          (config.extraEvidence ?? []).forEach((x, i) => {
+            const extraId = x.id(r);
+            if (extraId) extraEvidenceIds[i].push(extraId);
+          });
+        }
+        for (const [k, n] of Object.entries(out.totals)) {
+          if (typeof n === "number" && Number.isFinite(n)) summedTotals[k] = (summedTotals[k] ?? 0) + n;
         }
       }
       evaluated++;
@@ -495,15 +545,15 @@ export async function runProposalFileQueueTick(
     ...report.failures.map((x) => ({ message: x.error, meta: { path: x.path, fail_count: x.fail_count } })),
     ...(report.github_error ? [{ message: report.github_error, meta: {} }] : []),
   ];
-  const claims = config.claims({ written: report.written, processed: report.processed.length });
+  const claims = config.claims({ written: report.written, processed: report.processed.length, totals: summedTotals });
   try {
     if (allGithubFailed) {
       // At most ONE `failed` envelope per UTC day: a fixed run_id per day,
       // and recordRun() ignores a repeat.
       recordRun(
         {
-          run_id: `run-${today}-${config.agent}-github-failed-experiences`,
-          vertical: "experiences",
+          run_id: `run-${today}-${config.agent}-github-failed-${ledgerVertical}`,
+          vertical: ledgerVertical,
           agent: config.agent,
           trigger_source: "cron",
           started_at: startedAt,
@@ -521,7 +571,7 @@ export async function runProposalFileQueueTick(
       recordRun(
         {
           run_id: runId,
-          vertical: "experiences",
+          vertical: ledgerVertical,
           agent: config.agent,
           trigger_source: "cron",
           started_at: startedAt,
@@ -531,6 +581,7 @@ export async function runProposalFileQueueTick(
           evidence: [
             { claim_idx: 0, ids: writtenIds },
             { claim_idx: 1, ids: report.processed.map((p) => p.path) },
+            ...(config.extraEvidence ?? []).map((x, i) => ({ claim_idx: x.claimIdx, ids: extraEvidenceIds[i] })),
           ],
           notes: [
             ...report.processed.map((p) => `${p.path}: ${p.status}${p.totals ? ` written=${p.totals.written} rejected=${p.totals.rejected ?? 0} skipped=${p.totals.skipped_recorded ?? 0}` : ` (${p.error})`}`),

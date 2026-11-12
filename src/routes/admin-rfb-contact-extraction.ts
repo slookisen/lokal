@@ -104,6 +104,7 @@ import {
 // POST /register contact-field write for the closest sibling pattern) —
 // reused here rather than reinvented.
 import { mergeFieldProvenance } from "./admin-knowledge";
+import { catalogHiddenIdExclusionSql } from "../services/agent-visibility";
 import { extractGardssalgContactEmail, gardssalgContactPageLinks, homepageRegistrableDomain, gardssalgPageText } from "../services/experience-store";
 import { fetchPage, DEFAULT_FETCH_TIMEOUT_MS, MAX_RETRY_AFTER_WAIT_MS } from "../services/fetch-page";
 import { hostFromUrlLike, FREE_MAIL_DOMAINS } from "../services/cross-source-validator";
@@ -266,9 +267,17 @@ export const RFB_CX_ELIGIBLE_WHERE = `
   )
 `;
 
+// dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post (AC6): the four
+// selectors below never pick a catalog_hidden test row (the order fixture, or
+// the unclaimed claim-test fixture, whose agent_knowledge.email is where its
+// claim codes go — an owner may have set a website during a test, and arm
+// does not clear it). catalogHiddenIdExclusionSql, the verifier's own
+// exclusion; "" (the exact SQL as before) when no row is hidden. The exported
+// RFB_CX_ELIGIBLE_WHERE / rfbCxSelectSql are unchanged: the nightly job's own
+// batch is already publicListableSql-filtered.
 function selectRfbCxTargets(db: ReturnType<typeof getDb>, limit: number): RfbCxTargetRow[] {
   return db
-    .prepare(`${rfbCxSelectSql(RFB_CX_ELIGIBLE_WHERE)} ORDER BY a.created_at ASC, a.id ASC LIMIT ?`)
+    .prepare(`${rfbCxSelectSql(RFB_CX_ELIGIBLE_WHERE + catalogHiddenIdExclusionSql(db, "a"))} ORDER BY a.created_at ASC, a.id ASC LIMIT ?`)
     .all(limit) as RfbCxTargetRow[];
 }
 
@@ -276,7 +285,7 @@ function selectRfbCxTargetsByIds(db: ReturnType<typeof getDb>, ids: string[]): R
   if (ids.length === 0) return [];
   const placeholders = ids.map(() => "?").join(",");
   const rows = db
-    .prepare(`${rfbCxSelectSql(`${RFB_CX_ELIGIBLE_WHERE} AND a.id IN (${placeholders})`)}`)
+    .prepare(`${rfbCxSelectSql(`${RFB_CX_ELIGIBLE_WHERE}${catalogHiddenIdExclusionSql(db, "a")} AND a.id IN (${placeholders})`)}`)
     .all(...ids) as RfbCxTargetRow[];
   // Preserve caller order, same convention as the sibling discovery route's
   // agentIds handling.
@@ -310,7 +319,7 @@ const RFB_CX_BACKFILL_ELIGIBLE_WHERE = `
 
 function selectRfbCxBackfillTargets(db: ReturnType<typeof getDb>, limit: number): RfbCxTargetRow[] {
   return db
-    .prepare(`${rfbCxSelectSql(RFB_CX_BACKFILL_ELIGIBLE_WHERE)} ORDER BY a.created_at ASC, a.id ASC LIMIT ?`)
+    .prepare(`${rfbCxSelectSql(RFB_CX_BACKFILL_ELIGIBLE_WHERE + catalogHiddenIdExclusionSql(db, "a"))} ORDER BY a.created_at ASC, a.id ASC LIMIT ?`)
     .all(limit) as RfbCxTargetRow[];
 }
 
@@ -318,7 +327,7 @@ function selectRfbCxBackfillTargetsByIds(db: ReturnType<typeof getDb>, ids: stri
   if (ids.length === 0) return [];
   const placeholders = ids.map(() => "?").join(",");
   const rows = db
-    .prepare(`${rfbCxSelectSql(`${RFB_CX_BACKFILL_ELIGIBLE_WHERE} AND a.id IN (${placeholders})`)}`)
+    .prepare(`${rfbCxSelectSql(`${RFB_CX_BACKFILL_ELIGIBLE_WHERE}${catalogHiddenIdExclusionSql(db, "a")} AND a.id IN (${placeholders})`)}`)
     .all(...ids) as RfbCxTargetRow[];
   const byId = new Map(rows.map((r) => [r.id, r]));
   return ids.map((id) => byId.get(id)).filter((r): r is RfbCxTargetRow => !!r);
@@ -518,7 +527,15 @@ type ItemOutcome =
   // site (front page + linked contact/about/team pages) was read, but the
   // harvested a.contact_email does not appear on any of those pages — no
   // traceable source, so nothing is written.
-  | "rejected_not_on_site";
+  | "rejected_not_on_site"
+  // scrape mode (dev-request 2026-10-31-rfb-enrichment-kontaktutvinning-
+  // cross-domain-kandidat): the only address the extractor found is on a
+  // FOREIGN domain — neither the website's own domain nor free-mail
+  // (extractGardssalgContactEmail's tier 3, needsReview). The
+  // lokal-agent-enrichment §M2 wrong-entity guard says such a page is not
+  // proven to belong to the producer: flag for review, never write — in
+  // dry-run too, so a preview never lists a row apply must not write.
+  | "wrong_entity_suspected";
 
 interface ResultItem {
   agent_id: string;
@@ -938,6 +955,26 @@ router.post("/rfb-contact-extraction", async (req: Request, res: Response) => {
         results.push({
           agent_id: t.id, agent_name: t.name, outcome: "rejected_platform_domain",
           email: email.email, email_source: email.source, source_url: emailUrl,
+        });
+        continue;
+      }
+
+      // §M2 wrong-entity guard (dev-request 2026-10-31-rfb-enrichment-
+      // kontaktutvinning-cross-domain-kandidat): a foreign-domain candidate
+      // (the extractor's tier 3, needsReview — mailto_other_domain /
+      // text_other_domain) is NOT proven to belong to this producer
+      // (2026-10-31: «Arktis Gelato» would have got kontakt@kringlaas.no from
+      // gelato.no). Reported as wrong_entity_suspected with the address and
+      // page for a human to review, never written — dry-run included, so the
+      // caller's apply list (outcome "written") can never contain it. Checked
+      // BEFORE the LLM judge: no model call is spent on a row this route
+      // will not write anyway.
+      if (email.needsReview) {
+        results.push({
+          agent_id: t.id, agent_name: t.name, outcome: "wrong_entity_suspected",
+          email: email.email, email_source: email.source, source_url: emailUrl,
+          old_value: t.contact_email,
+          detail: "foreign_domain_not_proven_own",
         });
         continue;
       }

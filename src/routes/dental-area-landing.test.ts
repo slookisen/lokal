@@ -156,6 +156,10 @@ export async function runDentalAreaLandingTests(opts: { log?: boolean } = {}): P
       specialties?: string | null;
       postnummer?: string;
     }
+    // F2-S6: a Helfo row carries the source its claim needs (resolveHelfoClaim).
+    const HELFO_PROV = { helfo_agreement: [{ value: "true", source_type: "homepage", source_url: "https://example.test/helfo", fetched_at: "2026-05-01T10:00:00Z" }] };
+    const provenanceOf = (x: Extra): string | null =>
+      x.helfo ? JSON.stringify({ ...(x.provenance ? JSON.parse(x.provenance) : {}), ...HELFO_PROV }) : x.provenance ?? null;
     const mk = (navn: string, poststed: string, fylke: string, x: Extra = {}): string => {
       const org_nr = String(++orgSeq);
       const id = store.createDentalAgent({ navn, org_nr, poststed, fylke, adresse: "Storgata 1", telefon: "22110099", ...(x.postnummer ? { postnummer: x.postnummer } : {}) } as any);
@@ -167,7 +171,7 @@ export async function runDentalAreaLandingTests(opts: { log?: boolean } = {}): P
         x.klass ?? "klinikk", x.inactive ? 1 : 0,
         x.rejected ? "rejected" : x.verified ? "verified" : "unverified",
         x.helfo ? "true" : "unknown", x.acuteVakt ?? 0,
-        x.provenance ?? null, x.focus ?? null, x.specialists ?? null, x.specialties ?? null, x.updatedAt ?? null, id
+        provenanceOf(x), x.focus ?? null, x.specialists ?? null, x.specialties ?? null, x.updatedAt ?? null, id
       );
       // F2-S8: a verified clinic gets what the verifier stores when the rule
       // passes, so it shows «Verifisert» (unless noBasis).
@@ -318,7 +322,7 @@ export async function runDentalAreaLandingTests(opts: { log?: boolean } = {}): P
 
       // Served from the cache: same object, and a later write is not seen until the TTL / a reset.
       assertTrue(areaFacts.getDentalAreaFacts() === f, "A7: a second call returns the cached aggregate");
-      db.prepare("UPDATE dental_agents SET helfo_agreement = 'true' WHERE poststed = 'OSLO'").run();
+      db.prepare("UPDATE dental_agents SET helfo_agreement = 'true', field_provenance = ? WHERE poststed = 'OSLO'").run(JSON.stringify(HELFO_PROV));
       assertEq(areaFacts.getDentalAreaFacts().byPoststed.get("OSLO")!.helfo_true, 2, "A8: within the TTL a write is not re-read (no scan per request)");
       areaFacts.__resetDentalAreaFactsForTesting();
       assertEq(areaFacts.getDentalAreaFacts().byPoststed.get("OSLO")!.helfo_true, 4, "A9: after the cache is dropped the write shows");

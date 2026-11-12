@@ -119,7 +119,9 @@ const SEED: SeedAgent[] = [
   { id: "a-meieri-budget", name: "Rimelig Gårdsost", city: "Gausdal", lat: null, lng: null, categories: ["dairy"], trust: 0.55, tags: ["budget"] },
   { id: "a-meieri-plain",  name: "Fjellgardens Ysteri", city: "Vågå", lat: null, lng: null, categories: ["dairy"], trust: 0.60 },
   // Organic — one genuinely tagged, so "økologisk"/"organic" keeps its
-  // selective effect where the data is real (AC4).
+  // selective effect where the data is real (AC4). Debio-verified: since
+  // økologi S0 (dev-request 2026-10-28-rfb-okologisk-merking-…) an organic tag
+  // only counts for a producer with a valid Debio status (debio_verified = 1).
   { id: "a-fisk-organic", name: "Øko Fiskehus", city: "Kristiansund", lat: null, lng: null, categories: ["fish"], trust: 0.72, tags: ["organic"] },
   // Independent-review finding on PR #823: the geo auto-expand ladder must
   // re-capture tagsRelaxed per step, not just the first (narrow) call — an
@@ -146,6 +148,7 @@ function seedAgents(db: Database.Database): void {
       "key-" + a.id, a.lat, a.lng, a.city, JSON.stringify(a.categories), JSON.stringify(a.tags || []), a.trust,
     );
   }
+  db.prepare("UPDATE agents SET debio_verified = 1 WHERE id = 'a-fisk-organic'").run();
 }
 
 /** Geocoder stub: only the two hardcoded places these tests need are ever hit. */

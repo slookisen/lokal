@@ -1,0 +1,666 @@
+/**
+ * registry-governance-s4.test.ts — dev-request 2026-10-22-rfb-mine-valg-eierbrytere,
+ * slice S4 «styringsregelen», the lokal CI part:
+ *
+ *   shape      every entry in OWNER_FEATURE_REGISTRY has NO+EN label and
+ *              description text (and NO+EN option labels), a known group, a
+ *              default for every segment (owner + unclaimed) and a valid
+ *              status; registry keys == OWNER_FEATURE_KEYS, no duplicates.
+ *   readers    every `live` entry has at least one real reader in src/
+ *              (non-test files) — see READER DEFINITION below.
+ *   lookups    no non-test source under src/ passes a string-literal key that
+ *              is not in OWNER_FEATURE_KEYS to a key-taking lookup
+ *              (featureOn, rfbFeatureOn, featureValue, resolveOwnerFeature,
+ *              setOwnerFeatureValue, getOwnerFeature, findOwnerFeature).
+ *   matrix     (S4-2a) every surface of every `live` entry has a case in
+ *              OWNER_FEATURE_MATRIX_CASES (owner-feature-matrix.test.ts, the
+ *              suite that runs default → on → off → on again per case), and
+ *              no case names a key that is not a live registry entry or a
+ *              surface the entry does not declare (stale case), no duplicates.
+ *   levels     (rule 5, T8 of dev-request 2026-10-30-rfb-eierportal-testrunde-1)
+ *              OWNER_LEVELS names only live registry keys and never a key
+ *              a level must not set (OWNER_LEVEL_FORBIDDEN_KEYS /
+ *              _PREFIXES, and any consent entry); «Minst mulig» equals the
+ *              owner default; no two levels have the same preset.
+ *   self-check the checkers run on a small synthetic registry + source fixture
+ *              (missing EN label, live key without reader, unknown featureOn
+ *              key, live surface without matrix case, stale matrix case) and
+ *              must report each — proves the gate can fail.
+ *
+ * READER DEFINITION. Live entries today are read through storage adapters and
+ * enforcement lists rather than a literal featureOn('<key>'), so a «reader» is
+ * any of:
+ *   (a) a key-taking lookup call (list above) with the key as a string literal
+ *       in a non-test src file;
+ *   (b) the key as a string literal in a non-test src file outside
+ *       NON_READER_FILES (enforcement lists such as ENFORCED_OWNER_FEATURE_KEYS
+ *       / OWNER_VISIBILITY_KEYS, adapters writing owner_feature_settings).
+ *       NON_READER_FILES only define, set or display values and never enforce
+ *       them: registry.ts (the definitions), changes.ts (OWNER_LEVELS presets
+ *       write values) and page.ts (OWNER_PAGE_STATUS_KEYS only show them). A
+ *       key named only there has no enforcement, so it does not count;
+ *   (c) a storage adapter declared on the entry (`storage`) — the adapter's
+ *       column stays the source of truth and is read by existing code.
+ * Two structural cases count as read without a reader of their own, because
+ * they have no independent value a reader could branch on:
+ *   (d) type `locked` with `lockedWhen`: the value is derived entirely from
+ *       the parent key, so the parent must itself have a direct reader (a–c);
+ *   (e) type `guarantee`: a fixed promise (the resolver always returns the
+ *       default, never an owner choice); it must default to ON for owners.
+ * Every live entry that passes only via (d) or (e) is printed in the log so
+ * the exemption stays visible.
+ *
+ * GÅRDSSALG (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, O1a):
+ * the same rules 1–3 run over GARDSSALG_OWNER_FEATURE_REGISTRY, with a
+ * stricter reader rule — the gårdssalg keys reuse RFB key names, so a bare
+ * literal proves nothing. A live gårdssalg entry is read only by
+ *   (a') a key-taking lookup with the vertical "gardssalg" (featureOn("gardssalg",
+ *        …), gardssalgFeatureOn(…)) and the key as a string literal, or
+ *   (c)  its storage adapter,
+ * or structurally (d)/(e) as above. Rule 4 (the CI matrix) is RFB-only; the
+ * gårdssalg live surfaces are covered by the O1a suite and get their probe in
+ * O2. Every gårdssalg entry has verticals ["gardssalg"], and no gårdssalg
+ * text names Rett fra Bonden (O1 principle 9).
+ *
+ * Pure static check: no DB, no env, no globals (importing the matrix suite
+ * only reads its coverage map; the suite itself runs separately). Exported
+ * runRegistryGovernanceS4Tests({log}) -> TestSummary; wired into tests/test.ts.
+ * Standalone: npx tsx src/owner-features/registry-governance-s4.test.ts
+ */
+
+import * as fs from "fs";
+import * as path from "path";
+import * as ts from "typescript";
+import {
+  GARDSSALG_OWNER_FEATURE_GROUPS,
+  GARDSSALG_OWNER_FEATURE_KEYS,
+  GARDSSALG_OWNER_FEATURE_REGISTRY,
+  OWNER_FEATURE_GROUPS,
+  OWNER_FEATURE_KEYS,
+  OWNER_FEATURE_REGISTRY,
+  type OwnerFeatureEntry,
+} from "./registry";
+import { OWNER_FEATURE_MATRIX_CASES, matrixCaseId, type OwnerFeatureMatrixCase } from "./owner-feature-matrix.test";
+import { OWNER_LEVELS, OWNER_LEVEL_DEFAULT_KEY, type OwnerLevel } from "./changes";
+
+export interface TestSummary {
+  passed: number;
+  failed: number;
+  failures: string[];
+}
+
+const SRC_ROOT = path.resolve(__dirname, "..");
+
+/**
+ * Files whose key literals never count as a reader (rule 2b): they define,
+ * write (level presets) or display values but do not enforce them. Paths are
+ * relative to src/, '/'-separated.
+ */
+export const NON_READER_FILES = [
+  "owner-features/registry.ts",
+  "owner-features/changes.ts",
+  "owner-features/page.ts",
+];
+
+const VALID_STATUSES = ["live", "beta", "coming_soon"] as const;
+const SEGMENTS = ["owner", "unclaimed"] as const;
+
+/** Key-taking lookups → index of the key argument. */
+export const KEY_LOOKUPS: Record<string, number> = {
+  featureOn: 2,
+  featureValue: 2,
+  resolveOwnerFeature: 2,
+  setOwnerFeatureValue: 2,
+  rfbFeatureOn: 1,
+  gardssalgFeatureOn: 1,
+  getOwnerFeature: 0,
+  findOwnerFeature: 0,
+};
+
+export interface LookupCall {
+  file: string;
+  line: number;
+  fn: string;
+  key: string;
+  /** The vertical the lookup names (string-literal first argument, or the wrapper's own); null = unknown. */
+  vertical: string | null;
+}
+
+/** Lookups whose first argument is the vertical. */
+const VERTICAL_ARG_LOOKUPS = new Set(["featureOn", "featureValue", "resolveOwnerFeature", "setOwnerFeatureValue"]);
+const WRAPPER_VERTICAL: Record<string, string> = { rfbFeatureOn: "rfb", gardssalgFeatureOn: "gardssalg" };
+
+export interface SourceScan {
+  /** String literals per file (relative to src/). */
+  literals: Map<string, Set<string>>;
+  /** Key-taking lookup calls whose key argument is a string literal. */
+  calls: LookupCall[];
+}
+
+function calleeName(expr: ts.Expression): string | null {
+  if (ts.isIdentifier(expr)) return expr.text;
+  if (ts.isPropertyAccessExpression(expr)) return expr.name.text;
+  return null;
+}
+
+/**
+ * The string literal behind `node`, after unwrapping casts and parentheses
+ * (`"k" as OwnerFeatureKey`, `<any>"k"`, `"k" satisfies …`, `("k")`, `"k"!`),
+ * so a cast cannot hide an unknown key from rule 3 (or a reader from rule 2a).
+ */
+function literalText(node: ts.Node): string | null {
+  while (
+    ts.isAsExpression(node) || ts.isTypeAssertionExpression(node) || ts.isSatisfiesExpression(node) ||
+    ts.isParenthesizedExpression(node) || ts.isNonNullExpression(node)
+  ) {
+    node = node.expression;
+  }
+  if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
+  return null;
+}
+
+/** Scans one source text into `scan` (`file` relative to src/, '/'-separated). */
+export function scanSourceText(file: string, text: string, scan: SourceScan): void {
+  const sf = ts.createSourceFile(file, text, ts.ScriptTarget.ES2022, false, ts.ScriptKind.TS);
+  const lits = new Set<string>();
+  const visit = (node: ts.Node): void => {
+    const lit = literalText(node);
+    if (lit !== null) lits.add(lit);
+    if (ts.isCallExpression(node)) {
+      const fn = calleeName(node.expression);
+      if (fn && Object.prototype.hasOwnProperty.call(KEY_LOOKUPS, fn)) {
+        const arg = node.arguments[KEY_LOOKUPS[fn]];
+        const key = arg ? literalText(arg) : null;
+        if (key !== null) {
+          const line = sf.getLineAndCharacterOfPosition(arg!.getStart(sf)).line + 1;
+          const vertical = VERTICAL_ARG_LOOKUPS.has(fn)
+            ? (node.arguments[0] ? literalText(node.arguments[0]) : null)
+            : (WRAPPER_VERTICAL[fn] ?? null);
+          scan.calls.push({ file, line, fn, key, vertical });
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  scan.literals.set(file, lits);
+}
+
+function listSourceFiles(dir: string, out: string[] = []): string[] {
+  for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, ent.name);
+    if (ent.isDirectory()) {
+      if (ent.name === "node_modules") continue;
+      listSourceFiles(p, out);
+    } else if (/\.tsx?$/.test(ent.name) && !/\.test\.tsx?$/.test(ent.name) && !ent.name.endsWith(".d.ts")) {
+      out.push(p);
+    }
+  }
+  return out;
+}
+
+/** Scans every non-test .ts file under src/. */
+export function scanSrc(root: string = SRC_ROOT): SourceScan {
+  const scan: SourceScan = { literals: new Map(), calls: [] };
+  for (const file of listSourceFiles(root)) {
+    const rel = path.relative(root, file).split(path.sep).join("/");
+    scanSourceText(rel, fs.readFileSync(file, "utf8"), scan);
+  }
+  return scan;
+}
+
+function hasText(v: unknown): boolean {
+  return typeof v === "string" && v.trim().length > 0;
+}
+
+function localizedProblems(where: string, v: { no?: unknown; en?: unknown } | undefined): string[] {
+  const out: string[] = [];
+  if (!v || !hasText(v.no)) out.push(`${where}: missing Norwegian text`);
+  if (!v || !hasText(v.en)) out.push(`${where}: missing English text`);
+  return out;
+}
+
+/** Rule 1: NO+EN texts, group, default per segment, status; keys match OWNER_FEATURE_KEYS. */
+export function checkEntryShape(
+  registry: readonly OwnerFeatureEntry[],
+  keys: readonly string[],
+  groups: readonly string[],
+): string[] {
+  const problems: string[] = [];
+  const seen = new Set<string>();
+  for (const e of registry) {
+    const k = e.key || "<no key>";
+    if (seen.has(k)) problems.push(`${k}: duplicate registry entry`);
+    seen.add(k);
+    if (!keys.includes(k)) problems.push(`${k}: not in OWNER_FEATURE_KEYS`);
+    problems.push(...localizedProblems(`${k}.label`, e.label));
+    problems.push(...localizedProblems(`${k}.description`, e.description));
+    for (const o of e.options ?? []) problems.push(...localizedProblems(`${k}.options[${o.value}].label`, o.label));
+    if (e.confirmOn) problems.push(...localizedProblems(`${k}.confirmOn`, e.confirmOn));
+    if (e.confirmOff) problems.push(...localizedProblems(`${k}.confirmOff`, e.confirmOff));
+    if (!groups.includes(e.group)) problems.push(`${k}: unknown group ${JSON.stringify(e.group)}`);
+    if (!(VALID_STATUSES as readonly string[]).includes(e.status)) problems.push(`${k}: invalid status ${JSON.stringify(e.status)}`);
+    const d = e.default as Record<string, unknown> | undefined;
+    for (const seg of SEGMENTS) {
+      if (!d || !Object.prototype.hasOwnProperty.call(d, seg)) {
+        problems.push(`${k}: no default for segment ${seg}`);
+        continue;
+      }
+      const v = d[seg];
+      if (!(v === null || typeof v === "boolean" || typeof v === "string" || typeof v === "number")) {
+        problems.push(`${k}: default.${seg} has invalid type ${typeof v}`);
+      }
+    }
+  }
+  for (const k of keys) if (!seen.has(k)) problems.push(`${k}: in OWNER_FEATURE_KEYS but has no registry entry`);
+  return problems;
+}
+
+export interface ReaderReport {
+  problems: string[];
+  /** Live keys that pass only via the structural cases (d) / (e). */
+  structural: string[];
+}
+
+/** Rule 2: every live entry has a reader (see READER DEFINITION). */
+export function checkLiveReaders(
+  registry: readonly OwnerFeatureEntry[],
+  scan: SourceScan,
+  nonReaderFiles: readonly string[] = NON_READER_FILES,
+): ReaderReport {
+  const byKey = new Map(registry.map((e) => [e.key, e] as const));
+  const callKeys = new Set(scan.calls.map((c) => c.key));
+  const directReader = (key: string): string | null => {
+    if (callKeys.has(key)) return "lookup call";
+    for (const [file, lits] of scan.literals) {
+      if (!nonReaderFiles.includes(file) && lits.has(key)) return `literal in ${file}`;
+    }
+    if (byKey.get(key)?.storage) return "storage adapter";
+    return null;
+  };
+  const problems: string[] = [];
+  const structural: string[] = [];
+  for (const e of registry) {
+    if (e.status !== "live") continue;
+    if (directReader(e.key)) continue;
+    if (e.type === "locked" && e.lockedWhen) {
+      const parent = byKey.get(e.lockedWhen);
+      if (parent && parent.status === "live" && directReader(parent.key)) {
+        structural.push(`${e.key} (locked, derived from ${parent.key})`);
+        continue;
+      }
+      problems.push(`${e.key}: live locked entry, but its parent ${e.lockedWhen} is not live or has no reader`);
+      continue;
+    }
+    if (e.type === "guarantee") {
+      if (e.default.owner === true) {
+        structural.push(`${e.key} (guarantee, fixed on)`);
+        continue;
+      }
+      problems.push(`${e.key}: live guarantee must default to ON for owners`);
+      continue;
+    }
+    problems.push(`${e.key}: live entry has no reader in src/ (no lookup call, no key literal outside ${NON_READER_FILES.join(", ")}, no storage adapter)`);
+  }
+  return { problems, structural };
+}
+
+/**
+ * Rule 2 for a vertical whose keys reuse other verticals' names (gårdssalg):
+ * a live entry needs a lookup naming THIS vertical with the key literal, or a
+ * storage adapter; (d)/(e) as in checkLiveReaders. Bare literals do not count.
+ */
+export function checkLiveReadersForVertical(
+  registry: readonly OwnerFeatureEntry[],
+  scan: SourceScan,
+  vertical: string,
+): ReaderReport {
+  const byKey = new Map(registry.map((e) => [e.key, e] as const));
+  const callKeys = new Set(scan.calls.filter((c) => c.vertical === vertical).map((c) => c.key));
+  const directReader = (key: string): boolean => callKeys.has(key) || !!byKey.get(key)?.storage;
+  const problems: string[] = [];
+  const structural: string[] = [];
+  for (const e of registry) {
+    if (e.status !== "live") continue;
+    if (directReader(e.key)) continue;
+    if (e.type === "locked" && e.lockedWhen) {
+      const parent = byKey.get(e.lockedWhen);
+      if (parent && parent.status === "live" && directReader(parent.key)) {
+        structural.push(`${e.key} (locked, derived from ${parent.key})`);
+        continue;
+      }
+      problems.push(`${vertical}:${e.key}: live locked entry, but its parent ${e.lockedWhen} is not live or has no ${vertical} reader`);
+      continue;
+    }
+    if (e.type === "guarantee") {
+      if (e.default.owner === true) {
+        structural.push(`${e.key} (guarantee, fixed on)`);
+        continue;
+      }
+      problems.push(`${vertical}:${e.key}: live guarantee must default to ON for owners`);
+      continue;
+    }
+    problems.push(`${vertical}:${e.key}: live entry has no ${vertical} reader in src/ (no featureOn("${vertical}", …"${e.key}") / ${vertical}FeatureOn lookup, no storage adapter)`);
+  }
+  return { problems, structural };
+}
+
+/** Rule 3: no lookup with a string-literal key outside OWNER_FEATURE_KEYS. */
+export function checkUnknownLookupKeys(calls: readonly LookupCall[], keys: readonly string[]): string[] {
+  return calls
+    .filter((c) => !keys.includes(c.key))
+    .map((c) => `${c.file}:${c.line}: ${c.fn}(…${JSON.stringify(c.key)}…) — key not in OWNER_FEATURE_KEYS`);
+}
+
+/**
+ * Rule 4 (S4-2a): the CI matrix covers every surface of every live entry, and
+ * names nothing the registry does not have.
+ */
+export function checkMatrixCoverage(
+  registry: readonly OwnerFeatureEntry[],
+  cases: readonly Pick<OwnerFeatureMatrixCase, "key" | "surface">[],
+): string[] {
+  const problems: string[] = [];
+  const byKey = new Map(registry.map((e) => [e.key, e] as const));
+  const caseIds = new Set<string>();
+  for (const c of cases) {
+    const id = matrixCaseId(c);
+    if (caseIds.has(id)) problems.push(`${id}: duplicate matrix case`);
+    caseIds.add(id);
+    const e = byKey.get(c.key);
+    if (!e) problems.push(`${id}: stale matrix case — key not in the registry`);
+    else if (e.status !== "live") problems.push(`${id}: stale matrix case — ${c.key} is ${e.status}, not live`);
+    else if (!(e.surfaces as readonly string[]).includes(c.surface)) problems.push(`${id}: stale matrix case — ${c.key} does not declare surface ${c.surface}`);
+  }
+  for (const e of registry) {
+    if (e.status !== "live") continue;
+    for (const s of e.surfaces) {
+      if (!caseIds.has(matrixCaseId({ key: e.key, surface: s }))) problems.push(`${e.key} × ${s}: live surface has no matrix case in OWNER_FEATURE_MATRIX_CASES`);
+    }
+  }
+  return problems;
+}
+
+/** Rule 5: keys a level never sets (the owner decides them alone, or they are not level material). */
+export const OWNER_LEVEL_FORBIDDEN_KEYS: readonly string[] = [
+  "orders.email",
+  "comms.news",
+  "comms.featured",
+  "comms.beta",
+  "stats.share_partner",
+  "auto.photos",
+  "orders.auto_confirm",
+  "orders.daily_cap",
+  "orders.pause",
+];
+export const OWNER_LEVEL_FORBIDDEN_PREFIXES: readonly string[] = ["visibility.", "contact.", "payments."];
+
+/**
+ * Rule 5 (T8): the level presets. Every preset key is a live registry entry
+ * and not forbidden (OWNER_LEVEL_FORBIDDEN_KEYS / _PREFIXES, or `consent`);
+ * the default level («Minst mulig») sets only owner-default values and
+ * exists; no two levels have the same preset.
+ */
+export function checkLevelPresets(
+  levels: readonly Pick<OwnerLevel, "key" | "values">[],
+  registry: readonly OwnerFeatureEntry[],
+  defaultKey: string = OWNER_LEVEL_DEFAULT_KEY,
+): string[] {
+  const problems: string[] = [];
+  const byKey = new Map(registry.map((e) => [e.key, e] as const));
+  for (const l of levels) {
+    for (const [key, value] of l.values) {
+      const e = byKey.get(key);
+      if (OWNER_LEVEL_FORBIDDEN_KEYS.includes(key) || OWNER_LEVEL_FORBIDDEN_PREFIXES.some((p) => key.startsWith(p)) || e?.consent) {
+        problems.push(`${l.key}: ${key} must never be in a level`);
+      }
+      if (!e) problems.push(`${l.key}: ${key} is not in the registry`);
+      else if (e.status !== "live") problems.push(`${l.key}: ${key} is ${e.status}, not live`);
+      if (l.key === defaultKey && e && JSON.stringify(value) !== JSON.stringify(e.default.owner)) {
+        problems.push(`${l.key}: ${key}=${JSON.stringify(value)} deviates from the owner default ${JSON.stringify(e.default.owner)}`);
+      }
+    }
+  }
+  if (!levels.some((l) => l.key === defaultKey)) problems.push(`${defaultKey}: the default level is missing`);
+  const sig = (l: Pick<OwnerLevel, "values">) => JSON.stringify([...l.values].map(([k, v]) => [k, v ?? null]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))));
+  for (let i = 0; i < levels.length; i++) {
+    for (let j = i + 1; j < levels.length; j++) {
+      if (sig(levels[i]) === sig(levels[j])) problems.push(`${levels[i].key} = ${levels[j].key}: the two levels do not differ`);
+    }
+  }
+  return problems;
+}
+
+/**
+ * T10 (orderGateReady): a level that switches a real-order key ON must meet
+ * the real-order gate first, and that check may only stop switching ON.
+ * Every live switch with the `order_gate` surface has `enableRequires`
+ * orderGateReady; orderGateReady never stands in `requires` (that would show
+ * an owner who already has orders on as off).
+ */
+export function checkOrderGateRequirement(registry: readonly OwnerFeatureEntry[]): string[] {
+  const problems: string[] = [];
+  for (const e of registry) {
+    if ((e.requires as readonly string[]).includes("orderGateReady")) problems.push(`${e.key}: orderGateReady must be an enableRequires, never requires`);
+    if (e.status === "live" && e.type === "switch" && e.surfaces.includes("order_gate") && e.storage && !(e.enableRequires ?? []).includes("orderGateReady")) {
+      problems.push(`${e.key}: a live order_gate switch without enableRequires orderGateReady`);
+    }
+  }
+  return problems;
+}
+
+export async function runRegistryGovernanceS4Tests(opts: { log?: boolean } = {}): Promise<TestSummary> {
+  const log = opts.log ?? false;
+  let passed = 0;
+  let failed = 0;
+  const failures: string[] = [];
+
+  function assertTrue(cond: boolean, label: string, detail: string[] = []): void {
+    if (cond) {
+      passed++;
+      if (log) console.info(`  ok ${label}`);
+    } else {
+      failed++;
+      const msg = `✗ ${label}` + detail.map((d) => `\n    ${d}`).join("");
+      failures.push(msg);
+      if (log) console.info("  " + msg);
+    }
+  }
+
+  try {
+    const keys = OWNER_FEATURE_KEYS as readonly string[];
+    const groups = OWNER_FEATURE_GROUPS.map((g) => g.key as string);
+
+    // ── Self-check: the checkers must report a synthetic violation of each rule.
+    const base = OWNER_FEATURE_REGISTRY.find((e) => e.key === "contact.phone")!;
+    const fx = (over: Partial<OwnerFeatureEntry>): OwnerFeatureEntry => ({ ...base, storage: undefined, ...over });
+    const fixtureKeys = ["fx.no_en", "fx.live_no_reader", "fx.live_read", "fx.lock_orphan", "fx.bad_guarantee", "fx.preset_only", "fx.cast_read"];
+    const fixture: OwnerFeatureEntry[] = [
+      fx({ key: "fx.no_en", label: { no: "Bare norsk", en: "" } }),
+      fx({ key: "fx.live_no_reader", status: "live" }),
+      fx({ key: "fx.live_read", status: "live" }),
+      fx({ key: "fx.lock_orphan", type: "locked", status: "live", lockedWhen: "fx.live_no_reader" as any }),
+      fx({ key: "fx.bad_guarantee", type: "guarantee", status: "live", default: { owner: false, unclaimed: null } }),
+      fx({ key: "fx.bad_status", status: "shipped" as any, default: { owner: true } as any }),
+      fx({ key: "fx.preset_only", status: "live" }),
+      fx({ key: "fx.cast_read", status: "live", confirmOn: { no: "Sikker?", en: "" } }),
+    ];
+    const fxScan: SourceScan = { literals: new Map(), calls: [] };
+    scanSourceText(
+      "fixture/reader.ts",
+      [
+        `import { featureOn, rfbFeatureOn } from "../owner-features/resolve";`,
+        `// "fx.live_no_reader" in a comment is not a reader`,
+        `export const a = featureOn("rfb", id, "fx.live_read");`,
+        `export const b = rfbFeatureOn(id, "fx.typo_key");`,
+        `export const c = featureOn("rfb", "a", "nope.key" as OwnerFeatureKey, { db });`,
+        `export const d = rfbFeatureOn(id, (<any>"fx.cast_read")!);`,
+      ].join("\n"),
+      fxScan,
+    );
+    // Preset / display files: their literals must not count as readers.
+    scanSourceText("owner-features/changes.ts", `export const L = [{ values: { "fx.preset_only": true } }];`, fxScan);
+    scanSourceText("owner-features/page.ts", `export const K = ["fx.preset_only"];`, fxScan);
+    const shapeFx = checkEntryShape(fixture, fixtureKeys, groups);
+    assertTrue(shapeFx.some((p) => p.startsWith("fx.no_en.label: missing English")), "self-check: missing EN label is reported", shapeFx);
+    assertTrue(shapeFx.some((p) => p.startsWith("fx.bad_status: invalid status")), "self-check: invalid status is reported", shapeFx);
+    assertTrue(shapeFx.some((p) => p === "fx.bad_status: no default for segment unclaimed"), "self-check: missing segment default is reported", shapeFx);
+    assertTrue(shapeFx.some((p) => p.startsWith("fx.bad_status: not in OWNER_FEATURE_KEYS")), "self-check: entry outside OWNER_FEATURE_KEYS is reported", shapeFx);
+    assertTrue(shapeFx.some((p) => p === "fx.cast_read.confirmOn: missing English text"), "self-check: confirmOn without EN is reported", shapeFx);
+    const readersFx = checkLiveReaders(fixture, fxScan);
+    assertTrue(readersFx.problems.some((p) => p.startsWith("fx.live_no_reader:")), "self-check: live key without reader is reported (comment does not count)", readersFx.problems);
+    assertTrue(!readersFx.problems.some((p) => p.startsWith("fx.live_read:")), "self-check: featureOn literal counts as reader", readersFx.problems);
+    assertTrue(readersFx.problems.some((p) => p.startsWith("fx.preset_only:")), "self-check: key named only in changes.ts presets / page.ts display is reported", readersFx.problems);
+    assertTrue(!readersFx.problems.some((p) => p.startsWith("fx.cast_read:")), "self-check: cast featureOn literal counts as reader", readersFx.problems);
+    assertTrue(readersFx.problems.some((p) => p.startsWith("fx.lock_orphan:")), "self-check: locked entry whose parent has no reader is reported", readersFx.problems);
+    assertTrue(readersFx.problems.some((p) => p.startsWith("fx.bad_guarantee:")), "self-check: guarantee defaulting off is reported", readersFx.problems);
+    const unknownFx = checkUnknownLookupKeys(fxScan.calls, fixtureKeys);
+    assertTrue(unknownFx.some((u) => u.includes(`rfbFeatureOn(…"fx.typo_key"…)`)), "self-check: unknown featureOn key is reported", unknownFx);
+    assertTrue(unknownFx.some((u) => u.includes(`featureOn(…"nope.key"…)`)), "self-check: unknown featureOn key behind `as` cast is reported", unknownFx);
+    assertTrue(unknownFx.length === 2, "self-check: exactly the two unknown keys are reported (cast known key is fine)", unknownFx);
+
+    const fxMatrixReg: OwnerFeatureEntry[] = [
+      fx({ key: "fx.mx_live", status: "live", surfaces: ["order_gate", "email:fx_mail"] }),
+      fx({ key: "fx.mx_soon", status: "coming_soon", surfaces: ["profile_html"] }),
+    ];
+    const matrixFx = checkMatrixCoverage(fxMatrixReg, [
+      { key: "fx.mx_live", surface: "order_gate" },
+      { key: "fx.mx_live", surface: "order_gate" },
+      { key: "fx.mx_live", surface: "job:fx_gone" },
+      { key: "fx.mx_gone", surface: "order_gate" },
+      { key: "fx.mx_soon", surface: "profile_html" },
+    ]);
+    assertTrue(matrixFx.some((p) => p.startsWith("fx.mx_live × email:fx_mail: live surface has no matrix case")), "self-check: live surface without matrix case is reported", matrixFx);
+    assertTrue(matrixFx.some((p) => p.startsWith("fx.mx_live × job:fx_gone: stale matrix case")), "self-check: matrix case for an undeclared surface is reported", matrixFx);
+    assertTrue(matrixFx.some((p) => p.startsWith("fx.mx_gone × order_gate: stale matrix case — key not in the registry")), "self-check: matrix case for an unknown key is reported", matrixFx);
+    assertTrue(matrixFx.some((p) => p.startsWith("fx.mx_soon × profile_html: stale matrix case")), "self-check: matrix case for a non-live key is reported", matrixFx);
+    assertTrue(matrixFx.some((p) => p === "fx.mx_live × order_gate: duplicate matrix case"), "self-check: duplicate matrix case is reported", matrixFx);
+    assertTrue(!matrixFx.some((p) => p.startsWith("fx.mx_soon ×") && p.includes("no matrix case")), "self-check: a coming_soon entry needs no matrix case", matrixFx);
+    assertTrue(matrixFx.length === 5, "self-check: exactly the five matrix problems are reported", matrixFx);
+
+    // Rule 5 self-check: each mutant of the real presets must be reported.
+    const lv = (key: string, values: Array<[string, unknown]>) => ({ key, values } as unknown as Pick<OwnerLevel, "key" | "values">);
+    const real = OWNER_LEVELS.map((l) => lv(l.key, [...l.values]));
+    const lv5 = (levels: Array<Pick<OwnerLevel, "key" | "values">>) => checkLevelPresets(levels, OWNER_FEATURE_REGISTRY);
+    assertTrue(lv5(real).length === 0, "self-check: the real presets pass rule 5 unmutated", lv5(real));
+    for (const forbidden of ["comms.news", "visibility.profile", "orders.email", "orders.auto_confirm", "orders.daily_cap", "orders.pause", "comms.featured", "stats.share_partner", "auto.photos", "comms.beta", "contact.phone"]) {
+      const mut = real.map((l, i) => (i === 1 ? lv(l.key, [...l.values, [forbidden, true]]) : l));
+      const out = lv5(mut);
+      assertTrue(out.some((p) => p.includes(`${forbidden} must never be in a level`)), `self-check: rule 5 reports forbidden key ${forbidden} in a level`, out);
+    }
+    const payFx = checkLevelPresets([lv("minst_mulig", [["orders.enabled", false]]), lv("x", [["payments.fx", true]])],
+      [...OWNER_FEATURE_REGISTRY, fx({ key: "payments.fx", status: "live" })]);
+    assertTrue(payFx.some((p) => p.includes("payments.fx must never be in a level")), "self-check: rule 5 reports a payments.* key", payFx);
+    const consentFx = checkLevelPresets([lv("minst_mulig", [["orders.enabled", false]]), lv("x", [["fx.consent", true]])],
+      [...OWNER_FEATURE_REGISTRY, fx({ key: "fx.consent", status: "live", consent: true })]);
+    assertTrue(consentFx.some((p) => p.includes("fx.consent must never be in a level")), "self-check: rule 5 reports any consent entry", consentFx);
+    const devMut = lv5([lv("minst_mulig", [["orders.enabled", true]]), real[1]]);
+    assertTrue(devMut.some((p) => p.startsWith("minst_mulig: orders.enabled=true deviates from the owner default")), "self-check: rule 5 reports a «Minst mulig» that deviates from the owner default", devMut);
+    const devMut2 = lv5([lv("minst_mulig", [["orders.enabled", false], ["products.stock_check", false]]), real[1]]);
+    assertTrue(devMut2.some((p) => p.startsWith("minst_mulig: products.stock_check=false deviates")), "self-check: rule 5 reports an extra non-default key in «Minst mulig»", devMut2);
+    const sameMut = lv5([real[0], lv("utnytte_mulighetene", [...real[0].values])]);
+    assertTrue(sameMut.some((p) => p.includes("the two levels do not differ")), "self-check: rule 5 reports two levels that do not differ", sameMut);
+    const sameOrder = lv5([lv("minst_mulig", [["orders.enabled", false]]), lv("a", [["orders.enabled", true], ["products.stock_check", true]]), lv("b", [["products.stock_check", true], ["orders.enabled", true]])]);
+    assertTrue(sameOrder.some((p) => p === "a = b: the two levels do not differ"), "self-check: rule 5 compares presets regardless of key order", sameOrder);
+    const notLive = lv5([real[0], lv("utnytte_mulighetene", [["orders.enabled", true], ["orders.auto_confirm_x", true]])]);
+    assertTrue(notLive.some((p) => p.includes("orders.auto_confirm_x is not in the registry")), "self-check: rule 5 reports a key outside the registry", notLive);
+    const soon = OWNER_FEATURE_REGISTRY.find((e) => e.status === "coming_soon" && !e.consent && !OWNER_LEVEL_FORBIDDEN_KEYS.includes(e.key) && !OWNER_LEVEL_FORBIDDEN_PREFIXES.some((p) => e.key.startsWith(p)));
+    if (soon) {
+      const soonMut = lv5([real[0], lv("utnytte_mulighetene", [...real[1].values, [soon.key, true]])]);
+      assertTrue(soonMut.some((p) => p === `utnytte_mulighetene: ${soon.key} is coming_soon, not live`), "self-check: rule 5 reports a coming_soon key in a level", soonMut);
+    }
+    const noDefault = lv5([real[1]]);
+    assertTrue(noDefault.some((p) => p.includes("the default level is missing")), "self-check: rule 5 reports a missing «Minst mulig»", noDefault);
+
+    // ── Rule 1: registry shape.
+    const shape = checkEntryShape(OWNER_FEATURE_REGISTRY, keys, groups);
+    assertTrue(OWNER_FEATURE_REGISTRY.length > 0, "registry is not empty");
+    assertTrue(shape.length === 0, `rule 1: all ${OWNER_FEATURE_REGISTRY.length} entries have NO+EN texts, group, default per segment, valid status`, shape);
+
+    // ── Rule 2 + 3 against the real src/ tree.
+    const scan = scanSrc();
+    assertTrue(scan.literals.size > 50, `src/ scan found non-test source files (${scan.literals.size})`);
+    assertTrue(NON_READER_FILES.every((f) => scan.literals.has(f)), "every NON_READER_FILES path exists in the src/ scan (no stale exclusion)");
+
+    const live = OWNER_FEATURE_REGISTRY.filter((e) => e.status === "live");
+    const readers = checkLiveReaders(OWNER_FEATURE_REGISTRY, scan);
+    assertTrue(readers.problems.length === 0, `rule 2: every live entry (${live.length}) has a reader in src/`, readers.problems);
+    if (readers.structural.length) {
+      console.info(`  note: live entries read only structurally (d/e): ${readers.structural.join(", ")}`);
+    }
+
+    // Gårdssalg lookups are checked against their own keys below.
+    const unknown = checkUnknownLookupKeys(scan.calls.filter((c) => c.vertical !== "gardssalg"), keys);
+    assertTrue(unknown.length === 0, `rule 3: no lookup with an unknown string-literal key (${scan.calls.length} literal-key calls checked)`, unknown);
+
+    // ── Rule 4: CI matrix per live key × surface.
+    const liveSurfaces = live.reduce((n, e) => n + e.surfaces.length, 0);
+    const matrix = checkMatrixCoverage(OWNER_FEATURE_REGISTRY, OWNER_FEATURE_MATRIX_CASES);
+    assertTrue(matrix.length === 0, `rule 4: every live surface (${liveSurfaces}) has a matrix case, no stale case (${OWNER_FEATURE_MATRIX_CASES.length} cases)`, matrix);
+
+    // ── Rule 5 (T8): the RFB level presets.
+    assertTrue(JSON.stringify(OWNER_LEVELS.map((l) => l.key)) === JSON.stringify(["minst_mulig", "utnytte_mulighetene"]),
+      "rule 5: OWNER_LEVELS is exactly «minst_mulig», «utnytte_mulighetene»", OWNER_LEVELS.map((l) => l.key));
+    const levelProblems = checkLevelPresets(OWNER_LEVELS, OWNER_FEATURE_REGISTRY);
+    assertTrue(levelProblems.length === 0, `rule 5: the ${OWNER_LEVELS.length} levels use only live, allowed keys; «Minst mulig» = owner default; the levels differ`, levelProblems);
+    // T10: orderGateReady on orders.enabled, only as enableRequires.
+    const gateProblems = checkOrderGateRequirement(OWNER_FEATURE_REGISTRY);
+    assertTrue(gateProblems.length === 0, "rule 5 (T10): orders.enabled needs orderGateReady to switch on, and orderGateReady is never a `requires`", gateProblems);
+    const gateMut = checkOrderGateRequirement(OWNER_FEATURE_REGISTRY.map((e) => (e.key === "orders.enabled" ? { ...e, enableRequires: [] } : e)));
+    assertTrue(gateMut.some((p) => p.startsWith("orders.enabled: a live order_gate switch without")), "self-check (T10): orders.enabled without orderGateReady is reported", gateMut);
+    const gateMut2 = checkOrderGateRequirement(OWNER_FEATURE_REGISTRY.map((e) => (e.key === "orders.enabled" ? { ...e, requires: [...e.requires, "orderGateReady" as const] } : e)));
+    assertTrue(gateMut2.some((p) => p === "orders.enabled: orderGateReady must be an enableRequires, never requires"), "self-check (T10): orderGateReady as `requires` is reported", gateMut2);
+
+    // ── Gårdssalg (O1a): rules 1–3 over the gårdssalg registry. ─────────────
+    const gsKeys = GARDSSALG_OWNER_FEATURE_KEYS as readonly string[];
+    const gsGroups = GARDSSALG_OWNER_FEATURE_GROUPS.map((g) => g.key as string);
+    const gsShape = checkEntryShape(GARDSSALG_OWNER_FEATURE_REGISTRY, gsKeys, gsGroups);
+    assertTrue(GARDSSALG_OWNER_FEATURE_REGISTRY.length === 34, `gardssalg: the registry has the 34 Vedlegg A entries (${GARDSSALG_OWNER_FEATURE_REGISTRY.length})`);
+    assertTrue(gsShape.length === 0, `gardssalg rule 1: all ${GARDSSALG_OWNER_FEATURE_REGISTRY.length} entries have NO+EN texts, group, default per segment, valid status`, gsShape);
+    const gsVertical = GARDSSALG_OWNER_FEATURE_REGISTRY.filter((e) => e.verticals.length !== 1 || e.verticals[0] !== "gardssalg").map((e) => e.key);
+    assertTrue(gsVertical.length === 0, "gardssalg: every entry has verticals [\"gardssalg\"]", gsVertical);
+    const rfbNamed = GARDSSALG_OWNER_FEATURE_REGISTRY
+      .filter((e) => /rett fra bonden/i.test(JSON.stringify([e.label, e.description, e.confirmOn ?? null, e.confirmOff ?? null, e.options ?? null])))
+      .map((e) => e.key);
+    assertTrue(rfbNamed.length === 0, "gardssalg: no entry text names Rett fra Bonden (principle 9)", rfbNamed);
+    const gsReaders = checkLiveReadersForVertical(GARDSSALG_OWNER_FEATURE_REGISTRY, scan, "gardssalg");
+    const gsLive = GARDSSALG_OWNER_FEATURE_REGISTRY.filter((e) => e.status === "live");
+    assertTrue(gsReaders.problems.length === 0, `gardssalg rule 2: every live entry (${gsLive.length}) has a gardssalg reader in src/`, gsReaders.problems);
+    if (gsReaders.structural.length) console.info(`  note: gardssalg live entries read only structurally (d/e): ${gsReaders.structural.join(", ")}`);
+    // Self-check: a bare literal of a shared key name does not count for gårdssalg.
+    const gsFxScan: SourceScan = { literals: new Map(), calls: [] };
+    scanSourceText("fixture/gs.ts", [
+      `export const a = rfbFeatureOn(id, "fx.gs_rfb_only");`,
+      `export const b = gardssalgFeatureOn(id, "fx.gs_read");`,
+      `export const c = featureOn("gardssalg", id, "fx.gs_read2");`,
+      `export const d = ["fx.gs_literal"];`,
+    ].join("\n"), gsFxScan);
+    const gsFx = checkLiveReadersForVertical([
+      fx({ key: "fx.gs_rfb_only", status: "live" }), fx({ key: "fx.gs_read", status: "live" }),
+      fx({ key: "fx.gs_read2", status: "live" }), fx({ key: "fx.gs_literal", status: "live" }),
+    ], gsFxScan, "gardssalg");
+    assertTrue(
+      gsFx.problems.length === 2 && gsFx.problems.some((p) => p.startsWith("gardssalg:fx.gs_rfb_only:")) && gsFx.problems.some((p) => p.startsWith("gardssalg:fx.gs_literal:")),
+      "gardssalg self-check: an rfb lookup or a bare literal is not a gardssalg reader; gardssalgFeatureOn / featureOn(\"gardssalg\") are",
+      gsFx.problems,
+    );
+    const allKeys = [...new Set([...keys, ...gsKeys])];
+    const unknownAll = checkUnknownLookupKeys(scan.calls, allKeys);
+    assertTrue(unknownAll.length === 0, "gardssalg rule 3: no lookup with a key outside both registries", unknownAll);
+    const gsCallsWrongKey = scan.calls.filter((c) => c.vertical === "gardssalg" && !gsKeys.includes(c.key)).map((c) => `${c.file}:${c.line}: ${c.key}`);
+    assertTrue(gsCallsWrongKey.length === 0, "gardssalg rule 3: every gardssalg lookup names a gardssalg key", gsCallsWrongKey);
+  } catch (err: any) {
+    failed++;
+    failures.push("unexpected error: " + String(err?.stack || err));
+  }
+
+  return { passed, failed, failures };
+}
+
+if (require.main === module) {
+  runRegistryGovernanceS4Tests({ log: true }).then((r) => {
+    console.info(`\nregistry-governance-s4: ${r.passed} passed, ${r.failed} failed`);
+    for (const f of r.failures) console.info(f);
+    process.exit(r.failed ? 1 : 0);
+  });
+}

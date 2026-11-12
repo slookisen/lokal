@@ -189,7 +189,43 @@ export async function runOpplevagentPrivacyTruthTests(opts: { log?: boolean } = 
   assertTrue(/utsendingslogg/.test(noT) && /send log/.test(enT) && /korrespondansen/.test(noT) && /correspondence/.test(enT),
     "both parts say the send log and the correspondence are stored");
   assertTrue(/kontakt@opplevagent\.no/.test(noT) && /kontakt@opplevagent\.no/.test(enT), "deletion/objection contact address is on the page in both parts");
-  assertTrue(/13\. oktober 2026/.test(noT) && /13 October 2026/.test(enT), "both parts show today's updated date, 13 October 2026");
+  assertTrue(/11\. november 2026/.test(noT) && /11 November 2026/.test(enT), "both parts show today's updated date, 11 November 2026");
+
+  // 1b. AI-answer marker (dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 6).
+  {
+    const noA = noT.replace(/&amp;/g, "&"), enA = enT.replace(/&amp;/g, "&");
+    assertTrue(/utm_campaign=ai_search/.test(noA) && /utm_campaign=ai_search/.test(enA) && /utm_medium/.test(noA) && /utm_medium/.test(enA),
+      "both parts name the utm_* marker on links given to AI assistants");
+    assertTrue(/det inneholder ingenting om deg/.test(noA) && /it contains nothing about you/.test(enA),
+      "both parts say the marker holds nothing about the person");
+    assertTrue(/telle besøk som kom fra et AI-svar/.test(noA) && /count visits that came from an AI answer/.test(enA),
+      "both parts say the marker is used to count visits from AI answers");
+    assertTrue(/summeres per dag, side og AI-tjeneste, uten IP-hash eller annen kobling til den besøkende, og summene vises på opplevelsessidene\. Summene slettes ikke automatisk i dag/.test(noA) &&
+      /summed per day, page and AI service, with no IP hash or other link to the visitor, and the totals are shown on the experience pages\. The totals are not deleted automatically today/.test(enA),
+      "both parts: totals without the IP hash, shown on experience pages, no automatic deletion");
+    // S4 (dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord): clicks on to the provider are
+    // now counted (profile_link_clicks); the page says so, in the same terms as the code.
+    assertTrue(!/kontaktknapp/i.test(noA) && !/contact button/i.test(enA), "no RFB contact-button wording on Opplevagent");
+    assertTrue(/<strong>Klikk videre til tilbyderen:<\/strong> når du klikker på en lenke på en opplevelses-, tilbyder- eller produsentside videre til tilbyderen \(booking, nettside, telefon eller e-post\), teller vi klikket uten cookies og uten navn eller kontaktopplysninger om deg/.test(no) &&
+      /<strong>Clicks on to the provider:<\/strong> when you click a link on an experience, provider or producer page that leads on to the provider \(booking, website, phone or email\), we count the click without cookies and without your name or contact details/.test(en),
+      "both parts say clicks on to the provider are counted without cookies or contact details");
+    assertTrue(/samme pseudonyme besøks-ID-en som sidebesøkene \(med en saltet, forkortet hash av IP-adressen, aldri hele IP-adressen\), og klikkene slettes ikke automatisk i dag/.test(noA) &&
+      /same pseudonymous visit ID as the page visits \(with a salted, truncated hash of the IP address, never the full IP address\), and the clicks are not deleted automatically today/.test(enA),
+      "both parts: pseudonymous visit ID (salted IP hash), no automatic deletion");
+    {
+      const root = path.join(__dirname, "..");
+      const initSrc = fs.readFileSync(path.join(root, "database", "init.ts"), "utf8");
+      const t = initSrc.match(/CREATE TABLE IF NOT EXISTS profile_link_clicks \(([\s\S]*?)\)\s*`/);
+      assertTrue(!!t && !/\bip\b|ip_hash|email|epost|navn|\bname\b|cookie/i.test(t[1]) && /session_id/.test(t[1]),
+        "code: profile_link_clicks holds the visit ID but no IP, name, e-mail or cookie column");
+      const plcSrc = fs.readFileSync(path.join(root, "services", "profile-link-clicks.ts"), "utf8");
+      assertTrue(/analyticsService\.getOrCreateSessionId\(req, res\)/.test(plcSrc), "code: the visit ID is the page-visit session id");
+      const walk = (d: string): string[] => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) =>
+        e.isDirectory() ? walk(path.join(d, e.name)) : (e.name.endsWith(".ts") && !e.name.endsWith(".test.ts") ? [path.join(d, e.name)] : []));
+      assertTrue(!walk(root).some((f) => /DELETE\s+FROM\s+profile_link_clicks/i.test(fs.readFileSync(f, "utf8"))),
+        "code: no automatic deletion of profile_link_clicks (as the page says) — update /personvern if one is added");
+    }
+  }
 
   // 2. «fjern» hides, does not delete.
   assertTrue(/<strong>skjules<\/strong>/.test(no) && /<strong>hidden<\/strong>/.test(en), "both parts say the profile is hidden after «fjern»");
@@ -218,7 +254,11 @@ export async function runOpplevagentPrivacyTruthTests(opts: { log?: boolean } = 
     "ground truth: the nightly prune deletes page views, searches and the MCP/A2A log after 60 days by default");
   const statsRow = /<tr><td>(Besøks- og søkestatistikk og teknisk MCP\/A2A-logg|Visit and search statistics and the technical MCP\/A2A log)<\/td><td>[^<]*<\/td><\/tr>/g;
   assertTrue((html.match(statsRow) ?? []).length === 4, "both parts have the statistics rows (legal basis and retention)");
-  const rest = html.replace(statsRow, "");
+  // The visit-request rows are the second sanctioned auto-deletion (dev-request
+  // 2026-10-23-opplevagent-besoksforesporsler-automatisk-sletting): backed by
+  // services/gardssalg-guest-contact-sweep.ts.
+  const visitRow = /<tr><td>(Besøksforespørsler|Visit requests)<\/td><td>[^<]*<\/td><\/tr>/g;
+  const rest = html.replace(statsRow, "").replace(visitRow, "");
   assertTrue(!/slettes automatisk/i.test(rest) && !/automatically deleted/i.test(rest) && !/slettes etter \d/i.test(rest) && !/deleted after \d/i.test(rest),
     "the page contains no 'slettes automatisk' / 'automatically deleted' promise outside the statistics rows");
   assertTrue(!/eierskap[^.]{0,80}(lagres|lagret)/i.test(html) && !/(lagres|lagret)[^.]{0,80}eierskap/i.test(html) &&

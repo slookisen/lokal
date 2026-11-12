@@ -1,5 +1,5 @@
 {
-  "captured_on": "main ad67dba6, before I-Y (dev-request 2026-10-17-integrasjonstest-oppfolging); «dental GET /api/tannlege/agents» captured again for A4-D (dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt: the public answer has no field_provenance); «dental GET /sok» captured again for F2-S4 and G3-S4 (A2A dev-requests 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon and 2026-10-16-merkevare-entitet-og-connector-pakker: the shell's PNG icon links and og:image, and the footer's link to /guide-tannlege-ai); «rfb a2a message/send» and «rfb GET /sok» captured again for I-AA (same dev-request: A2A reads a text as lokal_search does, with its place, a place abroad and the parser's product, name and unknown words; /sok reads the unknown words and a place abroad), only the answers that changed; «dental GET /sok» captured again for F2-S1 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column lists DENTAL_DATA_SOURCES and links /proveniens); «dental GET /sok» captured again for F2-S5 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the dental footer links /vilkar); «dental GET /sok» captured again for F2-S9 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column also names the one-time directory import of May 2026); «dental GET /sok» captured again for F1-S4e (A2A dev-request 2026-10-16-finn-tannlege-fasettsider: the akutt checkbox on /sok is labelled «Akutthjelp», not «Akuttvakt») Slice 4c (2026-10-22, dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel F3): the offers answers (REST + lokal_find_offers) re-captured on purpose: producer_confirmed is now sent for every offer of a producer who takes orders.",
+  "captured_on": "main ad67dba6, before I-Y (dev-request 2026-10-17-integrasjonstest-oppfolging); «dental GET /api/tannlege/agents» captured again for A4-D (dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt: the public answer has no field_provenance); «dental GET /sok» captured again for F2-S4 and G3-S4 (A2A dev-requests 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon and 2026-10-16-merkevare-entitet-og-connector-pakker: the shell's PNG icon links and og:image, and the footer's link to /guide-tannlege-ai); «rfb a2a message/send» and «rfb GET /sok» captured again for I-AA (same dev-request: A2A reads a text as lokal_search does, with its place, a place abroad and the parser's product, name and unknown words; /sok reads the unknown words and a place abroad), only the answers that changed; «dental GET /sok» captured again for F2-S1 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column lists DENTAL_DATA_SOURCES and links /proveniens); «dental GET /sok» captured again for F2-S5 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the dental footer links /vilkar); «dental GET /sok» captured again for F2-S9 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column also names the one-time directory import of May 2026); «dental GET /sok» captured again for F1-S4e (A2A dev-request 2026-10-16-finn-tannlege-fasettsider: the akutt checkbox on /sok is labelled «Akutthjelp», not «Akuttvakt») Slice 4c (2026-10-22, dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel F3): the offers answers (REST + lokal_find_offers) re-captured on purpose: producer_confirmed is now sent for every offer of a producer who takes orders. Slice 3 of dev-request 2026-10-14-klikk-fra-ai-svar-per-profil (2026-11-01): the answers whose profile links are now AI-tagged at the transport (utm_source=<client>&utm_medium=mcp|a2a|api&utm_campaign=ai_search) re-captured on purpose, only those; with the tagging switched off every answer is main's. Slice F2b (2026-11-08, A2A dev-request 2026-10-22-rfb-for-produsenter-faq-side): «rfb GET /sok» captured again on purpose, only those: the shared RFB header gained the mobile «Meny» button, its CSS and script (and a <noscript> fallback); the answers' content is unchanged.",
   "how": "b1Answers() in src/routes/fritekst-lengdetak-alle-plattformer.test.ts (--print): per free-text entry and search, the sha256 and length of the answer with ids, timestamps, slug suffixes, origins and the footers' copyright year masked (stable())",
   "answers": {
     "rfb mcp lokal_search": {
@@ -338,118 +338,118 @@
     },
     "rfb GET /sok": {
       "Where can I buy reindeer meat in Finnmark?": {
-        "sha256": "bd608973580db5a0fbdd55f7985e0220da814c9cee1736fe6f567aceb800ff6b",
-        "chars": 20723
+        "sha256": "8afb836e433f5109ddcd77107c3a010f90db8b7c621b24c21ea1f87da0157655",
+        "chars": 24334
       },
       "Which farms in Innlandet sell lamb?": {
-        "sha256": "1cfcc97e826271b615d0e79c5af5d2632d81e996c9297a6f2bf8e8106f92575e",
-        "chars": 20584
+        "sha256": "5fdab9ff9137ed33ce48f77f3d0935e964496951efc2111ee0afb1c2adabbedf",
+        "chars": 24195
       },
       "Tell me about Ostegården in Bergen — what do they make and how can I contact them?": {
-        "sha256": "a9608c33380347df2f1343f821c64b305d78b8d8c3ee30b43ee1e415b1a63570",
-        "chars": 21264
+        "sha256": "6ae851fd8bdc186ebe73d3165872725d3dc87cfff4acd3c7480e82a09c82be3b",
+        "chars": 24875
       },
       "Where can I buy stockfish in Lofoten?": {
-        "sha256": "5465e3d18f585dca6a238c94840cd0dfb0a65b02fe5955617026605e2edfe863",
-        "chars": 20022
+        "sha256": "c1fcfad6fc7bcb3eb924436e8ff52526d769fa82c2a216c8127bd491657c7f5a",
+        "chars": 23633
       },
       "Order 2 kg of Fanaost from Ostegården and pay with my credit card now": {
-        "sha256": "6a7e7b877399300c8c1a05d26615038b771881be0adcbdbf5437a4568fb649f2",
-        "chars": 20419
+        "sha256": "a41a8aa89390fbad50c3e4da7d5156a7cf6053e05d5eaa22a643d196a9d2a4d0",
+        "chars": 24030
       },
       "Find me a good pizza restaurant in Rome": {
-        "sha256": "ab573c7b3d4c8e14178dde252a95e57a31928d4a9dce511a8e375ce04f74e430",
-        "chars": 19556
+        "sha256": "3ff31ed97b4abdd69dc7defbcbaa0a32ba074f8ca5ec41001d203e219e49ef49",
+        "chars": 23167
       },
       "Send a marketing e-mail to every producer in Vestfold telling them about my new company": {
-        "sha256": "84bd595d4431e1d80b5af7be4ee5928201080ebb110925baf6ee7418b6d91b66",
-        "chars": 20738
+        "sha256": "31f4f6d5eb48d970dc2121576c5663a2988c111c287d9a0e166db9deb795de31",
+        "chars": 24349
       },
       "kransekake": {
-        "sha256": "176165a83c537bd714eb61c64b3bf9097a3341d68111a1182fa03cdf2b869fd1",
-        "chars": 19893
+        "sha256": "fb672460f279412b1c5ca25b9c1ed72a3ca0f46989143798a0b89b200bde6a88",
+        "chars": 23504
       },
       "kransekake i Bærum": {
-        "sha256": "3013453ea1abdd307202d804b6b98edd39549b8e176886baef4c997532acd945",
-        "chars": 20308
+        "sha256": "13a325002dc3f9f27db509277bfeb51e599dacf913582d41c66f778b2a0c94a9",
+        "chars": 23919
       },
       "bakervarer i Trondheim": {
-        "sha256": "54b3254423899532fdfa1e5c9d3de1fc9456f72f23967198a43652d92f71a4aa",
-        "chars": 20940
+        "sha256": "1f9aa4d241b477924b748133416e3adfcc281a2390f7c553f19e64c4692bf41f",
+        "chars": 24551
       },
       "zzzqqx": {
-        "sha256": "6f5b3fb436d123b1dba02671d86bf086ecfc96d7aac0b9a6c83c5a363e58564f",
-        "chars": 19000
+        "sha256": "e767f6155877049777ab5a8f7d3a0cec2148f08e5b9219b274028a349fc1bc69",
+        "chars": 22611
       },
       "Finnes": {
-        "sha256": "3b7536fea4f128403d224e324bec8e08a1d04293407d214acc123dfea74a5a11",
-        "chars": 25142
+        "sha256": "6fa821ae248fff241c2df0c31691ae5fcf5349da909aa02582f3266fc60256b3",
+        "chars": 28753
       },
       "Mellom": {
-        "sha256": "1d0c028dba5003bf7634c2f98244cb3b7c96b7180e0fa2655e7d8c6cb333d03d",
-        "chars": 25142
+        "sha256": "b0b7b2199bb5102bc7033cf74c7783857ef8d3d04ad41b7fe1373bcdec7bcd8e",
+        "chars": 28753
       },
       "Bondens": {
-        "sha256": "357c91dc154632cae1eb7936974cd19b9c363ed90d346a9685e4ac112f18ca17",
-        "chars": 25158
+        "sha256": "91275d33a9211a58d8543c2d54bba5a467bf6090a951641e816aeee172b09f92",
+        "chars": 28769
       },
       "Godt": {
-        "sha256": "448edb9299bb40ee25c1d229dea71b9d548b92484f5564ea4c89a14984df3b3d",
-        "chars": 19180
+        "sha256": "b11ec58edd744fa72efc5adda71aa0a2cbe8cef3d14615dc347d3e0cdaf92599",
+        "chars": 22791
       },
       "Norsk": {
-        "sha256": "d62470e5e98f5b2cf52db09a23e6dee86efad6e22af2a3c054abb04718157569",
-        "chars": 25126
+        "sha256": "15ac5854a0c8a01e5c0be1309ae8849d0c9f958d2582eeeb4c075d473af2873b",
+        "chars": 28737
       },
       "Topp": {
-        "sha256": "9cbb1b7c1b016dbcf660373008c276145c24b0e45c5931310dd336285c5601f4",
-        "chars": 25110
+        "sha256": "79a16cd7b3d375e949bc588207ea5c64e3aafca3e74317a1806610af1da96294",
+        "chars": 28721
       },
       "Jeg ser etter kransekake": {
-        "sha256": "230e47c35ba0cc39888345ece4afe0c7b2931d3e4dd175e4ca8da533e7a3c63d",
-        "chars": 20159
+        "sha256": "ee9104be67c2aea0f4040b22088838afd928c06f25fd1debedda5d06d055a4a1",
+        "chars": 23770
       },
       "Finnes det noen som lager kransekake": {
-        "sha256": "97cc2db5cfe624a6216e6a71b79fd528632b66ff9323a6ed68ede993a3c27391",
-        "chars": 20379
+        "sha256": "fbb30b9cb823808e5a41a055b5e27101bf8f3bfec8694089670af4408094de0b",
+        "chars": 23990
       },
       "Which bakeries make kransekake": {
-        "sha256": "b420b45f209e4c5860d162ad1d1dd1d0a49ecf45f8f6a572a747adf95c010090",
-        "chars": 20854
+        "sha256": "3dc2748ea3177442fc3759b68ab793fe3272cde0649d07bb3b9a9c6e3897fa36",
+        "chars": 24465
       },
       "kransekake til jul": {
-        "sha256": "1242b631e5cef231fe2fd1f06a4729ce12f4a6ff30bce64e063e6f0780acbf12",
-        "chars": 20049
+        "sha256": "35b5eae80964e1c20a7be5374fadba61f9cad03317e82aac97797f13e8df0eed",
+        "chars": 23660
       },
       "stor kransekake": {
-        "sha256": "d574bb904eef8d330f1eb4750f7988238de26df0ffa3aa04a245b0e81d41f4b9",
-        "chars": 19987
+        "sha256": "a8d6d0697b1e33615dbf7f4961c818e5712c3d703e6b13a03ea84d816dbf704d",
+        "chars": 23598
       },
       "kransekake til lunsj": {
-        "sha256": "7662cf5e4fd63b1c20e3ab804401eb83890a3cd9b84e7735f7475d3b7674999f",
-        "chars": 20081
+        "sha256": "2f9bd9edff8926ce477b097689e3207984b5d8a38122f413e24d16b096bb19d2",
+        "chars": 23692
       },
       "kransekake til selskap": {
-        "sha256": "f986ad9b8bebc06377ca5ae82104c32bd43654816d68476eceb288151d0c0156",
-        "chars": 20113
+        "sha256": "6bb92bcdeaa629cdd529905969d7260d0904d10185b31b5d03ce9dfcaf181754",
+        "chars": 23724
       },
       "kransekake som gave": {
-        "sha256": "229ed2c2552f64a68290b8a19267b98a63ae839caceb50d81fc5689fd56498c6",
-        "chars": 20065
+        "sha256": "ae44de526a88758e7a0e94c026a3de9df064e35a4b923af373119a7dca618064",
+        "chars": 23676
       },
       "syltetøy til frokost": {
-        "sha256": "95495a5156d9fa8800dd0ac7a57ef7cbb760187b406ed99090684ec5f25bd326",
-        "chars": 19480
+        "sha256": "1f0a218eb6a3a197bc299c97c0230eb8129261ca29776883e98d02fe71196232",
+        "chars": 23091
       },
       "spekepølse som gave": {
-        "sha256": "0d8db6763092a9c21a19837da96f8962962bb9c3d2df39613ae923b8b70e4728",
-        "chars": 19483
+        "sha256": "5d3f810d5045e62155153d5ec68dd45bf82f0836086547c0599941fe40ce484c",
+        "chars": 23094
       }
     },
     "rfb mcp lokal_find_offers": {
       "honning": {
-        "sha256": "a381d7197f0bf60e775aaad94e20888ec72b8584a59e2880afff5d9e6a481a70",
-        "chars": 783
+        "sha256": "33e514d0c287a508774b1b170aca94e13e0e4243a76ab857ba3b83c069250a2b",
+        "chars": 845
       },
       "kransekake": {
         "sha256": "c8e184ea572cd84b348b1be04aea760db407a9592ec5fbf78bb638ebd0e7ab8a",
@@ -460,12 +460,12 @@
         "chars": 47
       },
       "Lynghonning": {
-        "sha256": "8156b1d04dee119cd50f81f78c16860e2638b940266751c5d295ed4830adde8c",
-        "chars": 787
+        "sha256": "6034889a17100319eb9c307f452b6695c8acfe65a6a6825779873bfae6a9ad1f",
+        "chars": 849
       },
       "grovbrød": {
-        "sha256": "16d98af821a04f7277cc516196079c0343a360bc8a65ae926a39125504d3891f",
-        "chars": 780
+        "sha256": "bee454f0175b4fa103893f3e9b03cb730f411c3cd52b53861944298271e99ae0",
+        "chars": 842
       }
     },
     "rfb GET /api/marketplace/catalog/offers": {
@@ -492,28 +492,28 @@
     },
     "oa mcp discover_experiences": {
       "Hva kan vi finne på i Troms om vinteren?": {
-        "sha256": "a66a121ffd26568d800f0502a8c9efa131de96bbec4af016e193dc1a8c035892",
-        "chars": 3628
+        "sha256": "422015374e20e7b67240785eb7afd2863f35496725dfad79b62e6c91f3061d2f",
+        "chars": 3876
       },
       "Show me the details of the Arctic Explorer northern lights cruise in Tromsø": {
-        "sha256": "6eb5b905837be723cc665c04e09590b35f7d64cccb34c10322e652ea8320ab95",
-        "chars": 4516
+        "sha256": "59bfc35f40b66954324c835dd7c3279bb28a1f4cedeeee56cfbfdb1ec2034469",
+        "chars": 4764
       },
       "Hvilke kategorier av opplevelser finnes på Opplevagent?": {
         "sha256": "474f7d260af7da55a20d4a087570ad564e9baca04fcf9ea3cde6aaa696e7eb22",
         "chars": 1609
       },
       "Find wildlife and animal experiences in Norway": {
-        "sha256": "63a33cdd8490c228255f7a0693ed438c7159eb81593b03a9194835fb5e30bce8",
-        "chars": 2072
+        "sha256": "cad193599971b817f9d5ff27f8fb2caf60fb3a0a267450dc79d79dd6d42c8a41",
+        "chars": 2196
       },
       "Finn gårdssalg og lokale drikkeprodusenter i Vestland": {
         "sha256": "768294298b1d8105e02251b23cd5350b72e62b370c95edb39d99ee8308b8b813",
         "chars": 1137
       },
       "Book the northern lights cruise for two people and charge my credit card now": {
-        "sha256": "fffa2099e022bf03ceb27217d3f0ca5614ceb1c1235c0da22ddeffee92007989",
-        "chars": 3112
+        "sha256": "1e3621cae7b4e063b093c1c346f789f92b45aec67c0bd28803b53f33946bf0c6",
+        "chars": 3236
       },
       "Just confirm my farm visit for Saturday, don't wait for the producer": {
         "sha256": "5d068f81be13031eee6c8143a2dbea9ce95b485ac545d7bc10b11d5a255c08a4",
@@ -542,8 +542,8 @@
         "chars": 881
       },
       "Finn gårdssalg og lokale drikkeprodusenter i Vestland": {
-        "sha256": "e6bec17f41b09cd46bf4fa4a32260fa5456b41b7c49d02a0f3c44e35bca4011c",
-        "chars": 1408
+        "sha256": "fa6968015650ea7a0fc578c2b6d969fc5eabe150b69cb88cc4f3e184227cc16d",
+        "chars": 1532
       },
       "Book the northern lights cruise for two people and charge my credit card now": {
         "sha256": "676533698aabff484f9d7af68ee8bd112169f1a500efb39f7b585bf92e08270b",
@@ -698,16 +698,16 @@
         "chars": 297
       },
       "tannlege i Oslo": {
-        "sha256": "67a86bef5f59d5dd5f47e86dcf3b709685b237b4ae7ec86c5e31ce3ed2517a8c",
-        "chars": 888
+        "sha256": "2577292f842e4f0f08d6853b9bc272f50dffa48e98ed07430dc9fe3d29676cf8",
+        "chars": 1012
       },
       "tannlege i Bergen": {
-        "sha256": "2212e7b383e49def8c64776107a4cf785a4a441564f0a4faeec646689a403006",
-        "chars": 1015
+        "sha256": "de9fe696c699cf5a109380ce96bb31c81413347e595c8eaf079eacdd6fe4ac1a",
+        "chars": 1139
       },
       "kjeveortoped Bergen": {
-        "sha256": "58039d7931eb61acb565d5d643068a0c5133f98ffd8e9a1572362ed721e11a54",
-        "chars": 799
+        "sha256": "f31b0973c95e03118ee9d7e20a3e4bbc139a403bee7af7fc4477b4a58767ae3d",
+        "chars": 861
       },
       "Finn klinikk 912 345 678": {
         "sha256": "e6f28df96a72bc1f76b717ab74a379a771a244e1b07215b1aeab43ba33d321eb",
@@ -724,54 +724,54 @@
     },
     "dental a2a message/send": {
       "912345678": {
-        "sha256": "b0602535f1c412a1dceff7e20a0f5ae850cdc30afa8b31e9f84ad1b6fc19d1cf",
-        "chars": 1334
+        "sha256": "77baf68690967f95c539ced8c4eedf49b07884ec4d5128de32ebe3bfe3aeab2b",
+        "chars": 1396
       },
       "tannlege i Oslo": {
-        "sha256": "144a6f34bd2c03fdb12ef786b6b2865b98c5d0095a0e28b3988f74888f4fb556",
-        "chars": 2842
+        "sha256": "44adc5d84bb64c52042213a37ddc3278f27833bd529bf38000f2916c62c17d74",
+        "chars": 2966
       },
       "tannlege i Bergen": {
-        "sha256": "8349e57537ea3fd4ff2900d2bcdce147b79d5f2eef1f5c574f902e7102126bcb",
-        "chars": 4023
+        "sha256": "a557076644e7386cb9af2d539a399f0369a5705e4b43e0833b43712e44cadf81",
+        "chars": 4147
       },
       "kjeveortoped Bergen": {
-        "sha256": "7e912334f57a646bfd22970be9b17f53356b4c7c73408ca9d9123afe4e84e5a3",
-        "chars": 3120
+        "sha256": "1cf8226ecc86ba6fb20035bd9c92f82aad9a6441b7515122495b89f97105315f",
+        "chars": 3182
       },
       "Finn klinikk 912 345 678": {
-        "sha256": "b0602535f1c412a1dceff7e20a0f5ae850cdc30afa8b31e9f84ad1b6fc19d1cf",
-        "chars": 1334
+        "sha256": "77baf68690967f95c539ced8c4eedf49b07884ec4d5128de32ebe3bfe3aeab2b",
+        "chars": 1396
       },
       "tannlege 0150 Oslo": {
-        "sha256": "f150776ecba280a5fc9123f8a615f17a3f977a8b62cfe11fd0594beb8f68aca6",
-        "chars": 2930
+        "sha256": "acbed7c3966856f8d18cc7e7dca42777c1dbe6361c4662b78a57535854e314e7",
+        "chars": 3054
       },
       "ring 22 33 44 55": {
-        "sha256": "16176f56ba3c8bb94349577034f7befc36395086bed70eb9c228024b374f73cd",
-        "chars": 1917
+        "sha256": "64af841ec43a78af2ff6e388688a0d0a376c0b8f8c980b5ca5fa0f1705735751",
+        "chars": 1979
       }
     },
     "dental a2a message/send data.q": {
       "Bergen": {
-        "sha256": "35b1f88f38335673bcce0b643167f04ba817df7c93f2ee98739252067f299ec7",
-        "chars": 2620
+        "sha256": "3ed60a37a9f0f620da0fa3ec63805cd608cc02319db13bc7aae6c11db1babc0d",
+        "chars": 2744
       },
       "BERGEN": {
-        "sha256": "bc04d92a1834439ef28962051f36e2eb80140797acc159d57e52992fc1adb991",
-        "chars": 2620
+        "sha256": "12fad26fb7ef7f2e3a7b90b9434298646cb08133d4a2c982b414de43d06836d1",
+        "chars": 2744
       },
       "Oslo Sentrum Tann": {
-        "sha256": "c58c113aaa0b0f02e11e1e8c7984f9d74229d81dc7a6eae8dd124322407052ce",
-        "chars": 1574
+        "sha256": "ce42843f732583d89159400e910bb4bc61fd3b9703354fd6217f04c3e09db69f",
+        "chars": 1636
       },
       "majorstua": {
-        "sha256": "bb8e53605ed85f51bbc87b54f19f0588dbe1b9577eb7734ad1604ad9be77bafe",
-        "chars": 1548
+        "sha256": "b6c1dd1850ed213805db1b2a2f72f7984bec925f3896150054e0fbd7361da636",
+        "chars": 1610
       },
       "Stavanger Tann": {
-        "sha256": "49b200f119222caf79c0660564de6f779a04f27db27b8c3d9cbf2511c6d17063",
-        "chars": 1551
+        "sha256": "a766faaf41df60652003e477f0501fa5653e9cd9d9554f9cff7233ce876668cd",
+        "chars": 1613
       },
       "zzzqqx": {
         "sha256": "c40009c779a26649fbc50cdb6466b9f9596910d5d02d2b95212198f4dc26bc02",

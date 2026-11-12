@@ -66,6 +66,7 @@ import { renderPage, shouldEscalateToRender } from "../services/render-page";
 import { decodePunycodeLabel, transliterateNorwegian } from "../services/cross-source-validator";
 import { braveSearch, pageLooksLikeThemeSpam, type BraveResult } from "../services/search-enrich";
 import { mergeFieldProvenance } from "./admin-knowledge";
+import { catalogHiddenIdExclusionSql } from "../services/agent-visibility";
 // dev-request 2026-08-20-enrichment-write-pause-mekanisk-gjerde — the
 // mechanical fence. `getDb` is passed as a THUNK (never `getDb()`) so a
 // getDb() that throws fails closed as a 423 instead of escaping as a 500.
@@ -84,6 +85,7 @@ import {
 import {
   classifyContactCandidateDefect,
   judgeContactCandidate,
+  type ContactCandidateJudgeVerdict,
 } from "../services/contact-candidate-judge";
 
 // ─── agents_website_review_queue (lazy, ensureXTable pattern) ──────────────
@@ -207,13 +209,20 @@ export const RFB_WD_RENDER_TIMEOUT_MS = 12_000;
 // retry + 12s headless render + 12s render retry). With 25-50 targets
 // processed sequentially and no overall budget, one stubborn "no_website"
 // target could alone burn multiple minutes, which is exactly what produced
-// the observed 0-bytes/60s timeout at both limit=50 and limit=25. 30s
-// leaves margin under that observed 60s cutoff even though a single
-// in-flight host attempt already started can still finish past the budget
-// (this stops NEW host attempts from starting, not one already running).
+// the observed 0-bytes/60s timeout at both limit=50 and limit=25.
 // Long-term fix is parallelizing host attempts — explicitly out of scope
 // for this mitigation (see the dev-request's own FUNN TIL OPPFØLGING).
-export const RFB_WD_TIME_BUDGET_MS = 30_000;
+//
+// 15 s (was 30 s): a prod probe on 2026-11-06 (see BM_HARVEST_TIME_BUDGET_MS,
+// admin-bm-producer-harvest.ts) showed the caller→route response window is
+// ~30 s, not ~60 s, and a 30 s budget plus one in-flight host attempt (up to
+// ~44 s) came back as HTTP 502 "upstream request failed". The budget now
+// bounds the in-flight work too: a host attempt or a Brave search that is
+// still running when the remaining budget is spent is abandoned (raced
+// against the remaining budget, see raceRfbWdBudget) — its late result is
+// ignored, it never writes or proposes anything, and the target lands in
+// skipped_due_to_time_budget. Worst-case response ≈ budget + a small margin.
+export const RFB_WD_TIME_BUDGET_MS = 15_000;
 
 // Test-only injection point for the wall-clock used by the time-budget
 // check above (mirrors __setRfbWdRenderPageImplForTesting /
@@ -227,6 +236,38 @@ export function __setRfbWdNowForTesting(fn: (() => number) | null): void {
 }
 function effectiveRfbWdNowMs(): number {
   return rfbWdNowForTesting ? rfbWdNowForTesting() : Date.now();
+}
+
+/** Budget left (ms) for a run that started at `startedAt` (effectiveRfbWdNowMs clock). */
+function rfbWdRemainingBudgetMs(startedAt: number): number {
+  return RFB_WD_TIME_BUDGET_MS - (effectiveRfbWdNowMs() - startedAt);
+}
+
+const RFB_WD_ABANDONED: unique symbol = Symbol("rfb_wd_abandoned");
+
+/**
+ * Starts `startWork` and races it against `remainingMs` of real time (the remaining budget, read
+ * from the injectable clock, so a test can make it short). Returns
+ * RFB_WD_ABANDONED when the timer wins; the timer is always cleared. The
+ * abandoned promise keeps running but its result (or rejection) is dropped —
+ * callers must never act on it.
+ */
+async function raceRfbWdBudget<T>(startWork: () => Promise<T>, remainingMs: number): Promise<T | typeof RFB_WD_ABANDONED> {
+  // No budget left: never start the work at all.
+  if (remainingMs <= 0) return RFB_WD_ABANDONED;
+  const work = startWork();
+  // A late rejection after abandonment must not surface as an unhandled
+  // rejection; a rejection that wins the race still reaches the caller.
+  work.catch(() => undefined);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<typeof RFB_WD_ABANDONED>((resolve) => {
+    timer = setTimeout(() => resolve(RFB_WD_ABANDONED), remainingMs);
+  });
+  try {
+    return await Promise.race([work, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 // Per-call fallback counters, threaded through tryRfbWebsiteCandidateHost by
@@ -413,7 +454,13 @@ interface RfbWdTargetRow {
 // been a discovery candidate. Measured 2026-08-13
 // (enrichment-reports/2026-08-13-websoek-jakt-wrong-contact-og-wilsgaard.md,
 // Funn A): 64% of the then-current discovery queue (30/47) were such rows.
-function rfbWdSelectSql(extraWhere: string): string {
+// dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post (AC6): the
+// catalog_hidden test rows (the order fixture and the unclaimed claim-test
+// fixture) are never selected — not by the batch modes, not by an agentIds
+// override — so no website (and through it no harvested e-mail) is ever
+// proposed for them. catalogHiddenIdExclusionSql, the verifier's own
+// exclusion; "" (the exact SQL as before) when no row is hidden.
+function rfbWdSelectSql(db: ReturnType<typeof getDb>, extraWhere: string): string {
   return `
     SELECT a.id AS id, a.name AS name, a.org_nr AS org_nr, a.city AS city,
            k.postal_code AS postal_code, k.phone AS phone, k.address AS address,
@@ -422,7 +469,7 @@ function rfbWdSelectSql(extraWhere: string): string {
       JOIN agent_knowledge k ON k.agent_id = a.id
      WHERE a.role = 'producer'
        AND COALESCE(a.vertical_id, 'rfb') = 'rfb'
-       AND a.umbrella_type IS NULL  /* Phase 5.11 A4.1: exclude umbrella agents from marketing outreach */
+       AND a.umbrella_type IS NULL  /* Phase 5.11 A4.1: exclude umbrella agents from marketing outreach */${catalogHiddenIdExclusionSql(db, "a")}
        ${extraWhere}
   `;
 }
@@ -440,7 +487,7 @@ function rfbWdSelectSql(extraWhere: string): string {
 function selectRfbWebsiteDiscoveryTargets(db: ReturnType<typeof getDb>, limit: number): RfbWdTargetRow[] {
   return db
     .prepare(
-      `${rfbWdSelectSql(
+      `${rfbWdSelectSql(db,
         `AND k.verification_status IN ('pending_verify','review_required')
          AND (k.website IS NULL OR TRIM(k.website) = '')`,
       )} ORDER BY RANDOM() LIMIT ?`,
@@ -463,7 +510,7 @@ function selectRfbWebsiteDiscoveryTargets(db: ReturnType<typeof getDb>, limit: n
 function selectRfbWebsiteReplacementTargets(db: ReturnType<typeof getDb>, limit: number): RfbWdTargetRow[] {
   const rows = db
     .prepare(
-      `${rfbWdSelectSql(`AND k.website IS NOT NULL AND TRIM(k.website) != ''`)} ORDER BY a.created_at ASC, a.id ASC`,
+      `${rfbWdSelectSql(db, `AND k.website IS NOT NULL AND TRIM(k.website) != ''`)} ORDER BY a.created_at ASC, a.id ASC`,
     )
     .all() as RfbWdTargetRow[];
   const out: RfbWdTargetRow[] = [];
@@ -483,7 +530,7 @@ function selectRfbWebsiteReplacementTargets(db: ReturnType<typeof getDb>, limit:
 // on any RFB producer agent; already-has-a-website is still enforced, just
 // reported as `already_has_website` rather than silently omitted.
 function getRfbWebsiteDiscoveryTarget(db: ReturnType<typeof getDb>, agentId: string): RfbWdTargetRow | null {
-  const row = db.prepare(`${rfbWdSelectSql("AND a.id = @id")}`).get({ id: agentId }) as RfbWdTargetRow | undefined;
+  const row = db.prepare(`${rfbWdSelectSql(db, "AND a.id = @id")}`).get({ id: agentId }) as RfbWdTargetRow | undefined;
   return row ?? null;
 }
 
@@ -854,6 +901,48 @@ async function tryRfbWebsiteCandidateHost(
   return null;
 }
 
+/**
+ * tryRfbWebsiteCandidateHost bounded by the remaining time budget. The
+ * attempt gets PRIVATE tried/excluded/fallback-counter state, merged into the
+ * caller's only when the attempt finished in time — so an abandoned attempt
+ * that resolves later cannot change anything the caller reports or writes.
+ * existingHosts/hostsProposedThisBatch are only read by the attempt (the
+ * caller adds a host to hostsProposedThisBatch only for a hit it accepted).
+ */
+async function tryRfbWebsiteCandidateHostWithinBudget(
+  host: string,
+  evidenceTarget: Parameters<typeof gardssalgWebsiteEvidenceMatch>[1],
+  existingHosts: Set<string>,
+  hostsProposedThisBatch: Set<string>,
+  tried: string[],
+  excludedHere: Array<{ host: string; reason: string }>,
+  fallbackCounters: RfbWdFallbackCounters,
+  remainingMs: number,
+): Promise<{ abandoned: true } | { abandoned: false; hit: RfbWdHit | null }> {
+  const attemptTried: string[] = [];
+  const attemptExcluded: Array<{ host: string; reason: string }> = [];
+  const attemptCounters: RfbWdFallbackCounters = { attempted: 0, verified: 0 };
+  const outcome = await raceRfbWdBudget(
+    () =>
+      tryRfbWebsiteCandidateHost(
+        host,
+        evidenceTarget,
+        existingHosts,
+        hostsProposedThisBatch,
+        attemptTried,
+        attemptExcluded,
+        attemptCounters,
+      ),
+    remainingMs,
+  );
+  if (outcome === RFB_WD_ABANDONED) return { abandoned: true };
+  tried.push(...attemptTried);
+  excludedHere.push(...attemptExcluded);
+  fallbackCounters.attempted += attemptCounters.attempted;
+  fallbackCounters.verified += attemptCounters.verified;
+  return { abandoned: false, hit: outcome };
+}
+
 function rfbWdConfidence(evidence: RfbWdEvidence): number {
   if (evidence.org_nr_found) return 1.0;
   if (evidence.phone_found) return 0.95;
@@ -869,6 +958,12 @@ function rfbWdConfidence(evidence: RfbWdEvidence): number {
 // else in this route or elsewhere reads this table yet (a future
 // approve/apply slice would), and `DELETE FROM agents_website_review_queue`
 // undoes every effect of every call.
+// A row the judge closed as 'rejected' stays rejected (verdict kept in
+// `reason`) when discovery re-proposes the SAME candidate_url — otherwise
+// every re-discovery would reopen it and the judge would re-judge it daily.
+// A different candidate_url is new evidence and reopens the row as 'pending'.
+// (In SQLite every SET expression sees the row's OLD values, so the
+// candidate_url comparison is against the stored URL.)
 function upsertRfbWebsiteReviewQueue(
   db: ReturnType<typeof getDb>,
   entry: {
@@ -896,10 +991,18 @@ function upsertRfbWebsiteReviewQueue(
        final_url = excluded.final_url,
        evidence = excluded.evidence,
        confidence = excluded.confidence,
-       reason = excluded.reason,
+       reason = CASE
+         WHEN agents_website_review_queue.status = 'rejected'
+              AND agents_website_review_queue.candidate_url = excluded.candidate_url
+         THEN agents_website_review_queue.reason
+         ELSE excluded.reason END,
        existing_url = excluded.existing_url,
        batch_id = excluded.batch_id,
-       status = 'pending',
+       status = CASE
+         WHEN agents_website_review_queue.status = 'rejected'
+              AND agents_website_review_queue.candidate_url = excluded.candidate_url
+         THEN 'rejected'
+         ELSE 'pending' END,
        updated_at = datetime('now')`,
   ).run({
     id: uuid(),
@@ -991,6 +1094,7 @@ export async function evaluateRfbWebsiteCandidate(
   batchId: string,
   reason: string = "website_discovery_candidate_external",
   contactOverride?: { telefon?: string | null; mobil?: string | null; kommune?: string | null },
+  budget?: { remainingMs: () => number },
 ): Promise<RfbWdCandidateOutcome> {
   let t = getRfbWebsiteDiscoveryTarget(db, candidate.agentId);
   if (!t && ensureKnowledgeRowForExternalCandidate(db, candidate.agentId)) {
@@ -1020,15 +1124,36 @@ export async function evaluateRfbWebsiteCandidate(
   };
   const tried: string[] = [];
   const excludedHere: Array<{ host: string; reason: string }> = [];
-  const hit = await tryRfbWebsiteCandidateHost(
-    host,
-    evidenceTarget,
-    existingHosts,
-    hostsProposedThisBatch,
-    tried,
-    excludedHere,
-    fallbackCounters,
-  );
+  let hit: RfbWdHit | null;
+  if (budget) {
+    // Only this route's external-candidates branch passes a budget: an
+    // attempt still running when it is spent is abandoned — nothing is
+    // queued from it, whenever it resolves.
+    const attempt = await tryRfbWebsiteCandidateHostWithinBudget(
+      host,
+      evidenceTarget,
+      existingHosts,
+      hostsProposedThisBatch,
+      tried,
+      excludedHere,
+      fallbackCounters,
+      budget.remainingMs(),
+    );
+    if (attempt.abandoned) {
+      return { outcome: "rejected", agent_id: t.id, agent_name: t.name, reason: "time_budget_exceeded", tried: [], excluded: [] };
+    }
+    hit = attempt.hit;
+  } else {
+    hit = await tryRfbWebsiteCandidateHost(
+      host,
+      evidenceTarget,
+      existingHosts,
+      hostsProposedThisBatch,
+      tried,
+      excludedHere,
+      fallbackCounters,
+    );
+  }
 
   if (hit) {
     hostsProposedThisBatch.add(hit.host);
@@ -1187,8 +1312,22 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
       excluded: Array<{ host: string; reason: string }>;
     }> = [];
     const seenAgentIds = new Set<string>();
+    // Same time budget as the auto-select/agentIds loop below: no new
+    // candidate starts once it is spent, and the one in flight is abandoned
+    // (no queue write) when it runs past it.
+    const extStartedAt = effectiveRfbWdNowMs();
+    const skippedDueToTimeBudgetExt: string[] = [];
+    let timeBudgetExceededExt = false;
 
     for (const c of candidates) {
+      // timeBudgetExceededExt latches the budget as spent: once an
+      // evaluation was abandoned (the race timer can fire while the clock
+      // still reads ~1 ms left), no further candidate may start.
+      if (timeBudgetExceededExt || rfbWdRemainingBudgetMs(extStartedAt) <= 0) {
+        skippedDueToTimeBudgetExt.push(c.agentId);
+        timeBudgetExceededExt = true;
+        continue;
+      }
       if (seenAgentIds.has(c.agentId)) {
         rejectedExt.push({ agent_id: c.agentId, agent_name: "", reason: "duplicate_agent_in_request", tried: [], excluded: [] });
         continue;
@@ -1209,6 +1348,7 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
         batchId,
         undefined,
         c.contactOverride,
+        { remainingMs: () => (timeBudgetExceededExt ? 0 : rfbWdRemainingBudgetMs(extStartedAt)) },
       );
 
       switch (outcome.outcome) {
@@ -1229,6 +1369,11 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
           });
           break;
         case "rejected":
+          if (outcome.reason === "time_budget_exceeded") {
+            skippedDueToTimeBudgetExt.push(outcome.agent_id);
+            timeBudgetExceededExt = true;
+            break;
+          }
           rejectedExt.push({
             agent_id: outcome.agent_id,
             agent_name: outcome.agent_name,
@@ -1252,6 +1397,8 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
       headless_fallback_attempted: fallbackCountersExt.attempted,
       headless_fallback_verified: fallbackCountersExt.verified,
       knowledge_rows_created: 0,
+      time_budget_exceeded: timeBudgetExceededExt,
+      skipped_due_to_time_budget: skippedDueToTimeBudgetExt,
     });
     return;
   }
@@ -1330,6 +1477,13 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
   const fallbackCounters: RfbWdFallbackCounters = { attempted: 0, verified: 0 };
   const skippedDueToTimeBudget: string[] = [];
   let timeBudgetExceeded = false;
+  // Latched once an in-flight attempt/search is abandoned: the race timer
+  // can fire while the clock still reads ~1 ms left, and no further target,
+  // host attempt or search may start after that.
+  let wdBudgetLatched = false;
+  const wdBudgetSpent = (): boolean =>
+    wdBudgetLatched || effectiveRfbWdNowMs() - wdStartedAt >= RFB_WD_TIME_BUDGET_MS;
+  const wdRemainingMs = (): number => (wdBudgetLatched ? 0 : rfbWdRemainingBudgetMs(wdStartedAt));
 
   const proposed: Array<{
     agent_id: string;
@@ -1351,7 +1505,7 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
   }> = [];
 
   for (const t of targets) {
-    if (effectiveRfbWdNowMs() - wdStartedAt >= RFB_WD_TIME_BUDGET_MS) {
+    if (wdBudgetSpent()) {
       skippedDueToTimeBudget.push(t.id);
       timeBudgetExceeded = true;
       continue;
@@ -1374,13 +1528,17 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
 
     let hit: RfbWdHit | null = null;
     let budgetHitForThisTarget = false;
+    // An in-flight host attempt or Brave search abandoned at the budget: the
+    // target was not evaluated to a conclusion, so it is reported in
+    // skipped_due_to_time_budget (a later call retries it), never proposed.
+    let abandonedForThisTarget = false;
     for (const host of hosts) {
-      if (effectiveRfbWdNowMs() - wdStartedAt >= RFB_WD_TIME_BUDGET_MS) {
+      if (wdBudgetSpent()) {
         budgetHitForThisTarget = true;
         timeBudgetExceeded = true;
         break;
       }
-      hit = await tryRfbWebsiteCandidateHost(
+      const attempt = await tryRfbWebsiteCandidateHostWithinBudget(
         host,
         evidenceTarget,
         existingHosts,
@@ -1388,7 +1546,16 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
         tried,
         excludedHere,
         fallbackCounters,
+        wdRemainingMs(),
       );
+      if (attempt.abandoned) {
+        abandonedForThisTarget = true;
+        wdBudgetLatched = true;
+        budgetHitForThisTarget = true;
+        timeBudgetExceeded = true;
+        break;
+      }
+      hit = attempt.hit;
       if (hit) break;
     }
 
@@ -1415,31 +1582,47 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
     if (!hit && !budgetHitForThisTarget) {
       const searchImpl = effectiveRfbWdSearchImpl();
       if (searchImpl) {
-        if (effectiveRfbWdNowMs() - wdStartedAt >= RFB_WD_TIME_BUDGET_MS) {
+        if (wdBudgetSpent()) {
           budgetHitForThisTarget = true;
           timeBudgetExceeded = true;
         } else {
           searchAttempted = true;
           try {
             const query = gardssalgWebsiteSearchQuery({ navn: t.name, kommune: t.city });
-            const results = await searchImpl(query);
-            const searchHosts = gardssalgWebsiteSearchCandidateHosts(results, RFB_WD_SEARCH_MAX_CANDIDATES);
-            for (const host of searchHosts) {
-              if (effectiveRfbWdNowMs() - wdStartedAt >= RFB_WD_TIME_BUDGET_MS) {
-                budgetHitForThisTarget = true;
-                timeBudgetExceeded = true;
-                break;
+            const results = await raceRfbWdBudget(() => searchImpl(query), wdRemainingMs());
+            if (results === RFB_WD_ABANDONED) {
+              abandonedForThisTarget = true;
+              wdBudgetLatched = true;
+              budgetHitForThisTarget = true;
+              timeBudgetExceeded = true;
+            } else {
+              const searchHosts = gardssalgWebsiteSearchCandidateHosts(results, RFB_WD_SEARCH_MAX_CANDIDATES);
+              for (const host of searchHosts) {
+                if (wdBudgetSpent()) {
+                  budgetHitForThisTarget = true;
+                  timeBudgetExceeded = true;
+                  break;
+                }
+                const attempt = await tryRfbWebsiteCandidateHostWithinBudget(
+                  host,
+                  evidenceTarget,
+                  existingHosts,
+                  hostsProposedThisBatch,
+                  tried,
+                  excludedHere,
+                  fallbackCounters,
+                  wdRemainingMs(),
+                );
+                if (attempt.abandoned) {
+                  abandonedForThisTarget = true;
+                  wdBudgetLatched = true;
+                  budgetHitForThisTarget = true;
+                  timeBudgetExceeded = true;
+                  break;
+                }
+                hit = attempt.hit;
+                if (hit) break;
               }
-              hit = await tryRfbWebsiteCandidateHost(
-                host,
-                evidenceTarget,
-                existingHosts,
-                hostsProposedThisBatch,
-                tried,
-                excludedHere,
-                fallbackCounters,
-              );
-              if (hit) break;
             }
           } catch {
             // A search failure (network/HTTP error) must not abort the row —
@@ -1451,7 +1634,9 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
       }
     }
 
-    if (hit) {
+    if (!hit && abandonedForThisTarget) {
+      skippedDueToTimeBudget.push(t.id);
+    } else if (hit) {
       hostsProposedThisBatch.add(hit.host);
       let candidateUrl: string;
       try {
@@ -1932,13 +2117,19 @@ router.post("/rfb-website-review-approve", (req: Request, res: Response) => {
 // tests, e.g. "aa10: qualifying queue row flipped to applied") — a
 // judge-approved row lands in that identical state, not a parallel one.
 //
-// On AVVIS / any fail-closed outcome: the row's `status` column is left
-// UNTOUCHED ('pending') — only `reason` is updated (a plain SQL UPDATE) so
-// the judge's verdict is visible on the row without ever silently
-// resolving it. A rejected row stays eligible for a human reviewer, or for
-// re-judging on a later run (there is no "already judged, don't ask again"
-// marker — a future slice could add one; out of scope here, since nothing
-// in this slice makes re-judging incorrect, only potentially redundant).
+// On a real AVVIS (the structural backstop, or an actual model answer from
+// the LLM judge — an explicit AVVIS or an ambiguous answer): the row is
+// CLOSED — `status = 'rejected'`
+// with the verdict in `reason`; the row is never deleted (dev-request
+// 2026-10-31 S2: while it stayed `pending`, the same rows were re-judged
+// every day and counted as stale forever). `still_pending` and GET
+// /rfb-website-review-queue-staleness count only `pending`, so a rejected
+// row drops out of both. A judge-call infrastructure failure (verdict
+// `infraFailure`: missing API key, network error, timeout, non-2xx, bad
+// JSON, or a thrown error) is NOT a verdict: the row stays 'pending' and
+// only `reason` is updated, so it is judged again on a later run.
+// "GODKJENN but write blocked/threw" is not a judge rejection:
+// applyRfbAgentWebsite decides the status there, as before.
 export const RFB_WD_JUDGE_MIN_CONFIDENCE = 0.9;
 export const RFB_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE = 0.95;
 
@@ -2006,6 +2197,13 @@ function rfbWdJudgeAppendReason(db: ReturnType<typeof getDb>, rowId: string, not
   ).run(note, rowId);
 }
 
+/** The judge's AVVIS: close a still-pending row as 'rejected', keeping the verdict in `reason`. */
+function rfbWdJudgeReject(db: ReturnType<typeof getDb>, rowId: string, note: string): void {
+  db.prepare(
+    `UPDATE agents_website_review_queue SET status = 'rejected', reason = ?, updated_at = datetime('now') WHERE id = ? AND status = 'pending'`,
+  ).run(note, rowId);
+}
+
 router.post("/rfb-website-review-judge", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
@@ -2068,13 +2266,13 @@ router.post("/rfb-website-review-judge", async (req: Request, res: Response) => 
     const defect = classifyContactCandidateDefect("website", q.candidate_url);
     if (defect.defective) {
       const note = `judge backstop AVVIS: ${defect.reason ?? "flagged defective"}`;
-      rfbWdJudgeAppendReason(db, q.id, note);
+      rfbWdJudgeReject(db, q.id, note);
       rejected++;
       results.push({ agent_id: q.agent_id, verdict: "AVVIS", reason: note });
       continue;
     }
 
-    let verdict: { approved: boolean; reason?: string };
+    let verdict: ContactCandidateJudgeVerdict;
     try {
       verdict = await judgeContactCandidate({
         fieldType: "website",
@@ -2085,13 +2283,25 @@ router.post("/rfb-website-review-judge", async (req: Request, res: Response) => 
     } catch (err: any) {
       // judgeContactCandidate's own contract never throws, but this loop
       // must fail-closed even if that contract is ever violated — never let
-      // one row's unexpected error crash the rest of the batch.
-      verdict = { approved: false, reason: `uventet dommerfeil — avvist fail-closed: ${err?.message ?? String(err)}` };
+      // one row's unexpected error crash the rest of the batch. No verdict
+      // was obtained, so this is an infrastructure failure, not an AVVIS.
+      verdict = {
+        approved: false,
+        reason: `uventet dommerfeil — avvist fail-closed: ${err?.message ?? String(err)}`,
+        infraFailure: true,
+      };
     }
 
     if (!verdict.approved) {
       const note = `LLM judge AVVIS: ${verdict.reason ?? "avvist"}`;
-      rfbWdJudgeAppendReason(db, q.id, note);
+      if (verdict.infraFailure) {
+        // No model verdict (missing key, network, timeout, non-2xx, bad
+        // JSON, thrown error): keep the row 'pending' so a later run can
+        // judge it — only the reason is recorded.
+        rfbWdJudgeAppendReason(db, q.id, note);
+      } else {
+        rfbWdJudgeReject(db, q.id, note);
+      }
       rejected++;
       results.push({ agent_id: q.agent_id, verdict: "AVVIS", reason: note });
       continue;

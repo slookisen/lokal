@@ -424,17 +424,14 @@ Ved minste tvil, svar ${JUDGE_MISMATCH_TOKEN}.`;
  * verdict (the sweep's boilerplate-description check) does not have to
  * fetch the same URL twice.
  *
- * `currentSummary` is the same idea for a different unrelated need: it is
- * `summarizeAbout(fetchResult.html)` — the SAME extractive summary
- * (meta-description-first, capped ~300 chars) that the content-refresh
- * writer would store as `row.description` for this page today — computed
- * from the html already in scope, no re-fetch. It is present whenever a
- * real page was fetched and `null` for the dead/parked/empty-url branches,
- * exactly like `pageText`. A caller comparing `row.description` (which is
- * ALWAYS meta-derived-or-capped-paragraph, never the full page body) against
- * "would this page currently produce the same description" must compare
- * against `currentSummary`, not `pageText` — `pageText` is the full visible
- * body and is a different shape entirely.
+ * `currentSummary` is `summarizeAbout(fetchResult.html)` — the extractive
+ * summary (meta-description-first, capped ~300 chars) a content-refresh
+ * writer would store for this page — computed from the html already in
+ * scope, no re-fetch; `null` for the dead/parked/empty-url branches.
+ * Informational only: the content-judge sweep's boilerplate-description
+ * nulling does NOT compare against it (a description equal to the page's
+ * meta summary is the owner's own genuine text); it nulls only a full copy
+ * of `pageText`.
  */
 export type EvidencePageUnresolvedReason = "evidence_page_dead" | "evidence_page_parked" | "judge_failed";
 
@@ -480,20 +477,46 @@ export async function judgeExperienceEvidencePage(
     };
   }
 
-  const parkedByRequestedUrl = classifyHjemmeside(trimmed).reason === "parked";
-  const parkedByFinalUrl = classifyHjemmeside(fetchResult.finalUrl).reason === "parked";
+  return judgeFetchedEvidencePage(row, trimmed, fetchResult.html, fetchResult.finalUrl);
+}
+
+/**
+ * The post-fetch half of judgeExperienceEvidencePage() above, factored out
+ * (dev-request 2026-08-14-fetch-vegg-headless-fallback, slice R1) so a caller
+ * that already HAS the page content from a different fetch path — POST
+ * /admin/experiences-rejected-rejudge renders the evidence page headless via
+ * the render-worker instead of fetchPage() — runs the EXACT same parked-
+ * domain classification and LLM judge, never a second copy of either.
+ * judgeExperienceEvidencePage() itself delegates here unchanged, so its
+ * behaviour is byte-for-byte what it was before the split.
+ *
+ * Contract: `html`/`finalUrl` come from a SUCCESSFUL fetch — the caller owns
+ * the dead-page (fetch failure / HTTP >= 400) classification, since only the
+ * caller knows its own fetch mechanism's failure shape. `requestedUrl` is the
+ * (already trimmed) URL that was asked for; BOTH it and `finalUrl` are
+ * checked against classifyHjemmeside()'s parking-host list, same as before.
+ * Never throws (judgeExperienceContentMatch is never-throw).
+ */
+export async function judgeFetchedEvidencePage(
+  row: HoldoutExperienceRow,
+  requestedUrl: string,
+  html: string,
+  finalUrl: string,
+): Promise<EvidenceJudgeOutcome> {
+  const parkedByRequestedUrl = classifyHjemmeside(requestedUrl).reason === "parked";
+  const parkedByFinalUrl = classifyHjemmeside(finalUrl).reason === "parked";
   if (parkedByRequestedUrl || parkedByFinalUrl) {
     return {
       verdict: "unresolved",
-      reason: `evidenssiden er en parkert domeneside (${fetchResult.finalUrl})`,
+      reason: `evidenssiden er en parkert domeneside (${finalUrl})`,
       unresolvedReason: "evidence_page_parked",
       pageText: null,
       currentSummary: null,
     };
   }
 
-  const pageText = visibleTextOf(fetchResult.html);
-  const currentSummary = summarizeAbout(fetchResult.html);
+  const pageText = visibleTextOf(html);
+  const currentSummary = summarizeAbout(html);
   const judged = await judgeExperienceContentMatch(row, pageText);
   if (!judged.ok) {
     return { verdict: "unresolved", reason: judged.reasoning, unresolvedReason: "judge_failed", pageText, currentSummary };

@@ -169,7 +169,15 @@ export function runLokalAgentVerifierSnapshotClaimsTests(
       assertEq(rr?.value, 3, "sc-05: with snapshotCounts, review_required claims the DB-wide count");
       assertEq(rr?.meta, { kind: "agents_review_required", scope: "snapshot", batch_count: 1 }, "sc-06: batch tally preserved in meta.batch_count");
       for (const kind of SNAPSHOT_CLAIM_KINDS) {
+        // http_unreachable is per-run since slice 3 (see sc-12..sc-17); its
+        // gauge is claimed as http_unreachable_known_total.
+        if (kind === "http_unreachable") continue;
         assertEq(findClaim(withSnap, kind)?.value, snap[kind], `sc-07: ${kind} claims snapshot value`);
+        assertEq(
+          findClaim(withSnap, kind)?.meta,
+          { kind, scope: "snapshot", batch_count: kind === "agents_review_required" ? 1 : 0 },
+          `sc-07b: ${kind} snapshot meta unchanged`,
+        );
       }
       // agents_verified is a per-run delta and must be untouched.
       assertEq(findClaim(withSnap, "agents_verified")?.value, 0, "sc-08: agents_verified stays the per-run count");
@@ -178,6 +186,43 @@ export function runLokalAgentVerifierSnapshotClaimsTests(
       const partial = buildRunEnvelope({ ...base, snapshotCounts: { agents_pending_verify: 7 } });
       assertEq(findClaim(partial, "agents_pending_verify")?.value, 7, "sc-10: partial snapshot applies to present kind");
       assertEq(findClaim(partial, "agents_review_required")?.value, 1, "sc-11: partial snapshot falls back to batch for absent kind");
+
+      // dev-request 2026-10-26-lokal-agent-verifier-snapshot-drift-toleranse
+      // slice 3: http_unreachable = this run's own count (type custom, no
+      // probe); the DB-wide gauge is http_unreachable_known_total.
+      const unreachResults = [
+        makeResult({ agent_id: "u1", flags: ["website_unreachable"], new_verification_status: "review_required" }),
+        makeResult({ agent_id: "u2", flags: [] }),
+      ];
+      const ubase = { ...base, results: unreachResults };
+      const claimOf = (env: Record<string, unknown>, kind: string) =>
+        ((env as any).claims as Array<any>).find((c) => c.meta?.kind === kind);
+      const uSnap = buildRunEnvelope({ ...ubase, snapshotCounts: snap });
+      assertEq(
+        claimOf(uSnap, "http_unreachable"),
+        { type: "custom", value: 1, meta: { kind: "http_unreachable", scope: "per_run" } },
+        "sc-12: with snapshotCounts, http_unreachable = this run's count, type custom, scope per_run, no probe",
+      );
+      assertEq(
+        claimOf(uSnap, "http_unreachable_known_total"),
+        { type: "db_state_change", value: 2, meta: { kind: "http_unreachable_known_total", scope: "snapshot", batch_count: 1 } },
+        "sc-13: with snapshotCounts, http_unreachable_known_total = DB snapshot, batch_count = run count",
+      );
+      const uLegacy = buildRunEnvelope(ubase);
+      assertEq(
+        claimOf(uLegacy, "http_unreachable"),
+        { type: "custom", value: 1, meta: { kind: "http_unreachable", scope: "per_run" } },
+        "sc-14: without snapshotCounts, http_unreachable = this run's count",
+      );
+      assertEq(claimOf(uLegacy, "http_unreachable_known_total"), undefined, "sc-15: without snapshotCounts, no http_unreachable_known_total");
+      const uPartial = buildRunEnvelope({ ...ubase, snapshotCounts: { agents_pending_verify: 7 } });
+      assertEq(claimOf(uPartial, "http_unreachable_known_total"), undefined, "sc-16: snapshotCounts without http_unreachable emits no known_total");
+      assertEq(claimOf(uPartial, "http_unreachable")?.value, 1, "sc-17: partial snapshot keeps http_unreachable per-run");
+      assertEq(
+        claimOf(uSnap, "agents_review_required"),
+        { type: "db_state_change", value: 3, meta: { kind: "agents_review_required", scope: "snapshot", batch_count: 1 } },
+        "sc-18: other snapshot kinds unchanged (agents_review_required full claim)",
+      );
     } finally {
       initMod.__setDbForTesting(prevDb as any);
       try { db.close(); } catch { /* ignore */ }

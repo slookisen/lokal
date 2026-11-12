@@ -590,8 +590,14 @@ export function createExperience(input: Experience): string {
  * `admission_verdict = ` / `admission_checked_at = `), so this one change is
  * enough to make the _prev columns correct for every future call site.
  */
-export function stampExperienceAdmissionVerdict(experienceId: string, verdict: string): void {
-  const db = getDb(VERTICAL);
+export function stampExperienceAdmissionVerdict(
+  experienceId: string,
+  verdict: string,
+  // Optional explicit handle (the content-judgement job's per-row
+  // transaction, dev-request 2026-10-06 step 3k) — defaults to the same
+  // singleton every existing caller already used, so they are unchanged.
+  db: ReturnType<typeof getDb> = getDb(VERTICAL),
+): void {
   db.prepare(
     `UPDATE experiences
         SET admission_verdict_prev = admission_verdict,
@@ -1531,6 +1537,16 @@ export function getPublishedProviderBySlug(slug: string): Record<string, unknown
     )
     .get({ slug }) as Record<string, unknown> | undefined;
   return row ?? null;
+}
+
+/**
+ * The slug backfillProviderSlugs() below gives a provider row:
+ * <slugified-navn>--<first-8-chars-of-id>. Exported for callers that create a
+ * row and must set its slug in the same transaction (gårdssalg self-
+ * registration, services/gardssalg-self-register.ts).
+ */
+export function providerSlugFor(navn: string, id: string): string {
+  return `${slugify(navn)}--${id.slice(0, 8)}`;
 }
 
 /**
@@ -5296,7 +5312,14 @@ export function applyGardssalgProviderContent(
   contaminatedFields?: Array<"about_text" | "visit_text">,
   // dev-request 2026-07-21-opplevagent-norske-tegn-encoding, criterion 3 —
   // see this function's own doc comment above for the full rationale.
-  forceFields?: Array<"about_text" | "visit_text" | "opening_hours_text">
+  forceFields?: Array<"about_text" | "visit_text" | "opening_hours_text">,
+  // dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse —
+  // OPTIONAL, omitted by every pre-existing call site (byte-identical when
+  // not passed): a per-field source URL for a written field whose text came
+  // from a different page than `evidenceUrl` (the about page). Used for that
+  // field's field_provenance.source_url and its audit row's source_url;
+  // content_evidence_url stays `evidenceUrl`.
+  fieldSourceUrls?: Partial<Record<"about_text" | "visit_text" | "opening_hours_text" | "products", string>>
 ): string[] {
   const db = getDb(VERTICAL);
   const row = db
@@ -5465,8 +5488,10 @@ export function applyGardssalgProviderContent(
     }
   }
   const fetchedAt = new Date().toISOString();
+  const sourceUrlFor = (f: string): string =>
+    (fieldSourceUrls as Record<string, string | undefined> | undefined)?.[f] ?? evidenceUrl;
   for (const f of written) {
-    provenance[f] = { source_url: evidenceUrl, fetched_at: fetchedAt };
+    provenance[f] = { source_url: sourceUrlFor(f), fetched_at: fetchedAt };
   }
   sets.push("field_provenance = @field_provenance");
   params.field_provenance = JSON.stringify(provenance);
@@ -5485,7 +5510,7 @@ export function applyGardssalgProviderContent(
         field_name: f,
         old_value: oldValues[f] ?? null,
         new_value: (params[f] as string | undefined) ?? null,
-        source_url: evidenceUrl,
+        source_url: sourceUrlFor(f),
         batch_id: batchId ?? null,
       });
     }
@@ -7595,14 +7620,16 @@ export function applyGardssalgSetProducerType(
  * routes/opplevelser.ts) on the very next read. No separate rollback route
  * exists or is needed.
  *
- * Validation of `terminalStatus` against the three allowed values
- * ("krever_eier" | "dod_kilde" | null) is the HTTP handler's job (same
+ * Validation of `terminalStatus` against the allowed values
+ * ("krever_eier" | "dod_kilde" | "eier_fjernet" | null) is the HTTP handler's job (same
  * division of labor as validatePhoneForWrite's caller above) — this function
  * trusts its typed parameter.
  */
+export type GardssalgTerminalStatus = "krever_eier" | "dod_kilde" | "eier_fjernet";
+
 export function applyGardssalgSetTerminalStatus(
   providerId: string,
-  terminalStatus: "krever_eier" | "dod_kilde" | null,
+  terminalStatus: GardssalgTerminalStatus | null,
   reason: string,
   sourceUrl?: string
 ): GardssalgSetTerminalStatusResult {

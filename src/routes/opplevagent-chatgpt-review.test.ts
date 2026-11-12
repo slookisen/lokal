@@ -224,8 +224,14 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
       // ── (e) annotation table ──────────────────────────────────────────
       const list = await rpc("tools/list", {});
       const tools: any[] = list.result?.tools ?? [];
-      assertTrue(!instructions.includes("Rett fra Bonden") && !tools.find((t) => t.name === "discover_experiences")?.description?.includes("Rett fra Bonden") && instructions.includes("out_of_scope"),
-        "s3: scope guidance stays within this app without directing selection of another plugin");
+      // S9 (A2A 2026-10-16-mcp-beskrivelser-intensjonsord-og-lint, AC-S9-1): all five descriptions and the
+      // instructions name no other app or its tools and never steer the choice of tool.
+      const s3Forbidden = ["Rett fra Bonden", "lokal_", "Finn-tannlege", "tannlege_", "instead of", "prefer"];
+      const s3Texts: Array<[string, string]> = [["instructions", instructions],
+        ...Object.keys(OPPLEVAGENT_EXPECTED_ANNOTATIONS).map((name): [string, string] => [name, tools.find((t) => t.name === name)?.description ?? ""])];
+      const s3Hits = s3Texts.flatMap(([where, text]) => s3Forbidden.filter((w) => text.toLowerCase().includes(w.toLowerCase())).map((w) => `${where}: «${w}»`));
+      assertTrue(s3Texts.every(([, text]) => text.length > 0) && s3Hits.length === 0 && instructions.includes("out_of_scope"),
+        "s3: scope guidance stays within this app without directing selection of another plugin" + (s3Hits.length ? ` (${s3Hits.join(", ")})` : ""));
       for (const [name, expected] of Object.entries(OPPLEVAGENT_EXPECTED_ANNOTATIONS)) {
         const tool = tools.find((t) => t.name === name);
         assertTrue(!!tool, `e1: tools/list exposes ${name}`);
@@ -354,9 +360,9 @@ export function runOpplevagentChatgptReviewTests(opts: { log?: boolean } = {}): 
       const legalSrc = require("fs").readFileSync(require.resolve("./experiences-seo"), "utf8") as string;
       assertTrue(!/opptil 180 dager/.test(legalSrc) && !/up to 180 days/.test(legalSrc),
         "i1: /personvern no longer promises a 180-day analytics window no job enforces");
-      assertTrue(/<tr><td>Besøksforespørsler<\/td><td>Ingen automatisk sletting i dag\. De lagres til du ber oss slette dem, og vi sletter dem da innen 30 dager/.test(legalSrc)
-        && /<tr><td>Visit requests<\/td><td>No automatic deletion today\. They are kept until you ask us to delete them, and we then delete them within 30 days/.test(legalSrc),
-        "i2: /personvern states plainly (NO + EN) that visit requests are not auto-deleted and how deletion works");
+      assertTrue(/<tr><td>Besøksforespørsler<\/td><td>Navn, e-post, telefon og kommentar slettes automatisk 30 dager etter at forespørselen er avgjort/.test(legalSrc)
+        && /<tr><td>Visit requests<\/td><td>Name, email, phone and comment are deleted automatically 30 days after the request is resolved/.test(legalSrc),
+        "i2: /personvern states plainly (NO + EN) that visit requests are auto-deleted 30 days after resolution (sweep 2026-10-23)");
       assertTrue(/1a\. Besøksforespørsler til gårdssalg/.test(legalSrc) && /1a\. Farm-sale visit requests/.test(legalSrc)
         && /ikke<\/strong> en bekreftet booking/.test(legalSrc) && /not<\/strong> a confirmed booking/.test(legalSrc),
         "i3: /vilkar describes visit requests (NO + EN): forwarded by email, never a confirmed booking");

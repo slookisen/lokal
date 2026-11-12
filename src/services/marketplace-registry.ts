@@ -20,6 +20,9 @@ import { formatRfbDistanceLabel, shouldSuppressDistance } from "./geo-precision"
 // geocoding-service.ts (→ database/init) would have. Aliased to the old local
 // name so every call site below reads exactly as it did.
 import { haversineDistanceKm as haversine, toRadians as toRad } from "./geo-distance";
+// Fase B3 (mine ordrer): the order-task skill and method list for the card,
+// behind ORDER_AGENT_ACTIONS_ENABLED. Pure apart from the env switch.
+import { managePickupOrderSkill, rfbJsonRpcMethods, isOrderAgentActionsEnabled } from "./order-a2a-card";
 import {
   assertEnrichmentWriteAllowedOrThrow,
   normalizeEnrichmentVertical,
@@ -34,9 +37,12 @@ import { norwegianTermsForEnglishQuery, isEnglishFoodWord } from "../i18n/produc
 // isolation rule as geo-distance.ts and product-glossary.ts above.
 import { classifyDrinkSubcategoryFromText, type DrinkSubcategory } from "./drink-taxonomy";
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: the ONE shared
-// public-listability predicate (catalog_hidden + RFB vertical). PURE (zero
-// imports), same isolation rule as geo-distance.ts above.
-import { publicListableSql, isAgentPubliclyVisible, activeVettedListableSql, ownerPauseEnabled, readOwnerPauseRow } from "./agent-visibility";
+// public-listability predicate (catalog_hidden + RFB vertical). PURE (no
+// project imports; only node:async_hooks for the S2d-2 as-public view), same
+// isolation rule as geo-distance.ts above.
+import { isDebioVerifiedValue, stripOrganicCategories, stripOrganicTags } from "./organic-claims";
+import { textEntries } from "../utils/text-entries";
+import { isDelistedAgentId, publicListableSql, isAgentPubliclyVisible, activeVettedListableSql, isAsPublicView, ownerPauseEnabled, readOwnerPauseRow, notOwnerHiddenSql, ownerVisibilityEnforced, type OwnerVisibilityAudience } from "./agent-visibility";
 // S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok: FTS5 prefilter for the
 // name search. PURE (type-only import), same isolation rule as above.
 import {
@@ -132,6 +138,14 @@ export interface DiscoverOptions {
    * marked as no matches.
    */
   countUnmatched?: boolean;
+  /**
+   * S2c-2 (dev-request 2026-10-22-rfb-mine-valg-eierbrytere): "ai" = the
+   * caller is an AI-facing surface (MCP, A2A, the REST search/discover API):
+   * profiles whose owner switched off «Synlig for AI-assistenter» are left
+   * out. Default "all" (the /sok web search). No effect, and no query, unless
+   * OWNER_FEATURES_ENFORCE is on (agent-visibility.ts).
+   */
+  audience?: OwnerVisibilityAudience;
 }
 
 class MarketplaceRegistry {
@@ -257,6 +271,8 @@ class MarketplaceRegistry {
   discover(query: DiscoveryQuery, meta?: DiscoverMeta, opts: DiscoverOptions = {}): DiscoveryResult[] {
     const db = getDb();
     const trackDiscovery = opts.trackDiscovery !== false;
+    // S2c-2: one id list per call ("" unless enforced and someone is hidden).
+    const ownerAiSql = opts.audience === "ai" ? notOwnerHiddenSql("ai_assistants") : "";
 
     // ── 0. Name-based search: if query contains a producer name, find it directly ──
     // This handles "Bjørndal Gård Oppdal", "hva tilbyr Bjørndal Gård?" etc.
@@ -271,7 +287,7 @@ class MarketplaceRegistry {
       // on any public discovery surface, including this name-match path.
       // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: nor may
       // a catalog_hidden fixture or a non-RFB-vertical row (agent-visibility.ts).
-      const publicNameSql = `is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1 AND ${publicListableSql()}`;
+      const publicNameSql = `is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1 AND ${publicListableSql()}${ownerAiSql}`;
       // S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok: the full scan used
       // to have no ORDER BY; its plan (SCAN … USING INDEX idx_agents_geo) returned
       // rows in (lat, lng, rowid) order, and the stable sorts below keep that order
@@ -311,7 +327,7 @@ class MarketplaceRegistry {
 
       if (nameRows.length > 0) {
         // Found by name — return these as top results, skip geo filtering
-        let nameCandidates = nameRows.map(r => this.rowToAgent(r)!);
+        let nameCandidates = nameRows.filter(r => !isDelistedAgentId(r.id)).map(r => this.rowToAgent(r)!);
         if (query.role) {
           nameCandidates = nameCandidates.filter(a => a.role === query.role);
         }
@@ -372,7 +388,7 @@ class MarketplaceRegistry {
           // The geo filter now runs FIRST (on the full matchedCount/trust-
           // ordered list), and the top-10 cut applies to what survives it.
           // With no location in the query, this is the original code path.
-          let fuzzyCandidates = fuzzyRows.map(x => this.rowToAgent(x.row)!);
+          let fuzzyCandidates = fuzzyRows.filter(x => !isDelistedAgentId(x.row.id)).map(x => this.rowToAgent(x.row)!);
           if (query.role) fuzzyCandidates = fuzzyCandidates.filter(a => a.role === query.role);
           fuzzyCandidates = this.filterNameCandidatesByGeo(fuzzyCandidates, query, meta).slice(0, 10);
           if (fuzzyCandidates.length > 0) {
@@ -393,7 +409,7 @@ class MarketplaceRegistry {
     // self-registered, not-yet-vetted rows from this public discovery path.
     // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: plus the
     // shared public-listability predicate (catalog_hidden + RFB vertical).
-    let sql = `SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1 AND ${publicListableSql()}`;
+    let sql = `SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1 AND ${publicListableSql()}${ownerAiSql}`;
     const params: any[] = [];
 
     // 1. Filter by role
@@ -416,7 +432,7 @@ class MarketplaceRegistry {
     }
 
     const rows = db.prepare(sql).all(...params) as any[];
-    let candidates = rows.map(r => this.rowToAgent(r)!);
+    let candidates = rows.filter(r => !isDelistedAgentId(r.id)).map(r => this.rowToAgent(r)!);
 
     // 3. Filter by categories (in-app â€" JSON array matching)
     // Slice I-W: through categoryValueMatches, so «bakery» and the old «bread» find each other.
@@ -1402,7 +1418,8 @@ class MarketplaceRegistry {
       // Both need to find us. Bilingual descriptions = 2x discovery surface.
       name: "Rett fra Bonden",
       description: "A2A marketplace for local food in Norway. " +
-        `Connect AI agents with ${stats.totalAgents || 1169}+ verified local farms, shops, cooperatives, farm shops, REKO rings, and markets. ` +
+        `Connect AI agents with ${stats.totalAgents || 1169}+ local farms, shops, cooperatives, farm shops, REKO rings, and markets, ` +
+        "cross-checked against the Brønnøysund register (the only badge is \"Verified by owner\", set by the owner). " +
         "Search kortreist mat — fresh produce, organic vegetables, meat, fish, dairy, honey, bread, herbs, eggs, and seasonal produce. " +
         "Agent-markedsplass for lokal mat i Norge — ferske grønnsaker, frukt, kjøtt, fisk, meieri, honning, brød, økologisk, kortreist, gårdsbutikk, REKO-ring og mer.",
       // A2A spec: this MUST be the JSON-RPC endpoint, not the website root.
@@ -1422,7 +1439,7 @@ class MarketplaceRegistry {
       // the card's own `name` keeps the brand.
       provider: {
         ...agentCardProvider(),
-        contactUrl: `${baseUrl}/docs`,
+        contactUrl: `${baseUrl}/kontakt`,
         description: "Open agent-to-agent food marketplace operator. " +
           "Norges første A2A-markedsplass for lokal mat.",
       },
@@ -1437,7 +1454,7 @@ class MarketplaceRegistry {
       additionalInterfaces: [
         { url: `${baseUrl}/api/marketplace`, transport: "HTTP+JSON" },
       ],
-      documentationUrl: `${baseUrl}/docs`,
+      documentationUrl: `${baseUrl}/teknologi`,
       // dev-request 2026-07-25-proveniens-transparens: additive link to the
       // public "how we verify our data" page (field_provenance / cross-source
       // agreement machinery, already live server-side — docs only, no new
@@ -1467,7 +1484,7 @@ class MarketplaceRegistry {
         {
           type: "json-rpc",
           url: `${baseUrl}/a2a`,
-          methods: ["message/send", "tasks/get", "tasks/list", "agent/authenticatedExtendedCard"],
+          methods: rfbJsonRpcMethods(),
           description: "A2A JSON-RPC 2.0 endpoint for agent-to-agent communication",
         },
         {
@@ -1484,12 +1501,12 @@ class MarketplaceRegistry {
         {
           id: "discover-local-food-agents",
           name: "Discover Local Food Agents / Finn lokale matagenter",
-          description: `Search a registry of ${stats.totalAgents || 1396}+ verified local food producers in Norway. ` +
+          description: `Search a registry of ${stats.totalAgents || 1396}+ local food producers in Norway, cross-checked against the Brønnøysund register. ` +
             "Filter by category (vegetables, fruit, meat, fish, dairy, eggs, honey, herbs, bread, berries), " +
             "location (Oslo, Bergen, Trondheim, Stavanger, Tromsø, and rural districts), " +
             "certifications (organic, Debio, farm-direct), delivery options (pickup, local delivery), " +
             "and trust score. Returns ranked results with contact info and A2A endpoints. " +
-            `Søk blant ${stats.totalAgents || 1396}+ verifiserte lokale ${getConfig().domain_dictionary.entity_plural_long} i Norge.`,
+            `Søk blant ${stats.totalAgents || 1396}+ lokale ${getConfig().domain_dictionary.entity_plural_long} i Norge, kryssjekket mot Brønnøysundregistrene.`,
           tags: [
             // English discovery keywords (what agents actually search for)
             "local food", "fresh produce", "organic", "farm direct", "vegetables", "fruit",
@@ -1533,20 +1550,24 @@ class MarketplaceRegistry {
         {
           id: "search-compare-food",
           name: "Search & Compare Local Food / Søk og sammenlign",
-          description: "Natural language search across all producers. Compare prices, delivery options, " +
+          // Not a price-comparison service: prices are shown only where a producer
+          // has listed them (A2A dev-request 2026-11-06-rfb-claude-katalog-innsending).
+          description: "Natural language search across all producers. Compare delivery options, " +
             "organic certifications, and availability. Supports both English and Norwegian queries. " +
-            "Søk, sammenlign priser, leveringsalternativer og tilgjengelighet.",
+            "Søk og sammenlign leveringsalternativer, økologisk sertifisering og tilgjengelighet.",
           tags: [
-            "search", "compare", "price", "delivery", "availability",
-            "søk", "sammenlign", "pris", "levering", "tilgjengelighet",
+            "search", "compare", "delivery", "availability",
+            "søk", "sammenlign", "levering", "tilgjengelighet",
           ],
           inputModes: ["text/plain", "application/json"],
           outputModes: ["application/json"],
           examples: [
-            "compare cheese prices in Oslo",
-            "finn billig honning nær Trondheim",
+            "cheese producers with pickup in Oslo",
+            "finn honning med levering nær Trondheim",
           ],
         },
+        // Fase B3 (mine ordrer): only with ORDER_AGENT_ACTIONS_ENABLED on; off, the card is unchanged.
+        ...(isOrderAgentActionsEnabled() ? [managePickupOrderSkill()] : []),
       ],
 
       // ─── Security ──────────────────────────────────────────
@@ -1665,8 +1686,17 @@ class MarketplaceRegistry {
   // public by-id lookups (card/info/vcard/trust, /api/agents/:id/stats, the
   // marketing lane). The order flow never goes through here — it uses
   // /catalog/agents/:id/products, the cart routes and lokal_info by id.
-  isQuarantinedFromPublicView(agentId: string, opts: { ignoreOwnerPause?: boolean } = {}): boolean {
+  // S2c-2: the owner's visibility choice applies here too (visibility.profile;
+  // with audience "ai" also visibility.ai_assistants). ignoreOwnerPause skips
+  // it like the pause — the owner's own read is not a public view.
+  // claimTestFixtureInfo: GET /agents/:id/info ONLY (dev-request
+  // 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post AC6, option A) — the armed
+  // claim-test fixture is not quarantined there (agent-visibility.ts,
+  // isArmedClaimTestFixtureRow). Every other caller leaves it unset.
+  isQuarantinedFromPublicView(agentId: string, opts: { ignoreOwnerPause?: boolean; audience?: OwnerVisibilityAudience; claimTestFixtureInfo?: boolean } = {}): boolean {
     const db = getDb();
+    // Økologi S0: a delisted id (agent-visibility.ts) is never a public view.
+    if (isDelistedAgentId(agentId)) return true;
     const found = db.prepare("SELECT origin, is_vetted, is_active, catalog_hidden, vertical_id FROM agents WHERE id = ?").get(agentId) as
       { origin: string | null; is_vetted: number | null; is_active: number | null; catalog_hidden: number | null; vertical_id: string | null } | undefined;
     if (!found) return false;
@@ -1677,7 +1707,9 @@ class MarketplaceRegistry {
     // The rule itself lives in agent-visibility.ts (isAgentPubliclyVisible):
     // flag off = the quarantine rule this method has always applied; flag
     // OWNER_VISIBILITY_ENFORCE_BY_ID on = also is_active.
-    return !isAgentPubliclyVisible(row, { surface: "gated" });
+    const ownerChoice = ownerVisibilityEnforced() && !opts.ignoreOwnerPause ? { agentId, audience: opts.audience } : {};
+    const claimFixture = opts.claimTestFixtureInfo === true ? { claimTestFixtureInfo: true } : {};
+    return !isAgentPubliclyVisible(row, { surface: "gated", ...ownerChoice, ...claimFixture });
   }
 
   getAgentByApiKey(apiKey: string): RegisteredAgent | undefined {
@@ -1792,8 +1824,15 @@ class MarketplaceRegistry {
     const includeUnvetted = opts?.includeUnvetted === true;
     const db = getDb();
     if (includeUnvetted) {
-      const rows = db.prepare("SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL ORDER BY trust_score DESC, created_at DESC").all() as any[];
+      const rows = db.prepare("SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL ORDER BY trust_score DESC, created_at DESC, rowid ASC").all() as any[];
       return rows.map(r => this.rowToAgent(r)!);
+    }
+    // S2d-2 «Vis som offentlig»: an as-public view (admin key + ?as_public=1)
+    // sees the test fixture, so it neither reads nor fills the shared cache.
+    if (isAsPublicView()) {
+      return (db.prepare(`SELECT * FROM agents WHERE umbrella_type IS NULL AND ${activeVettedListableSql()} ORDER BY trust_score DESC, created_at DESC, rowid ASC`).all() as any[])
+        .filter(r => !isDelistedAgentId(r.id))
+        .map(r => this.rowToAgent(r)!);
     }
     const now = Date.now();
     if (this._agentsCache && (now - this._agentsCacheTime) < MarketplaceRegistry.CACHE_TTL) {
@@ -1810,8 +1849,14 @@ class MarketplaceRegistry {
     // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: + the shared
     // public-listability predicate (no catalog_hidden fixture, RFB vertical only)
     // — this one line covers every public list surface built on this method.
-    const rows = db.prepare(`SELECT * FROM agents WHERE umbrella_type IS NULL AND ${activeVettedListableSql()} ORDER BY trust_score DESC, created_at DESC`).all() as any[];
-    this._agentsCache = rows.map(r => this.rowToAgent(r)!);
+    // dev-request 2026-10-26-marketplace-agents-endepunkt-ignorerer-limit: the
+    // `rowid ASC` tie-break (all three queries here) gives equal trust_score +
+    // created_at rows one fixed order, so GET /api/marketplace/agents pages
+    // with limit/offset neither repeat nor skip a row between calls. rowid is
+    // the order SQLite already returned ties in, so no surface reorders.
+    const rows = db.prepare(`SELECT * FROM agents WHERE umbrella_type IS NULL AND ${activeVettedListableSql()} ORDER BY trust_score DESC, created_at DESC, rowid ASC`).all() as any[];
+    // Økologi S0: a delisted id (agent-visibility.ts) is on no public list.
+    this._agentsCache = rows.filter(r => !isDelistedAgentId(r.id)).map(r => this.rowToAgent(r)!);
     this._agentsCacheTime = now;
     return this._agentsCache;
   }
@@ -1939,7 +1984,9 @@ class MarketplaceRegistry {
 
   getStats(): { totalAgents: number; activeProducers: number; cities: string[]; totalListings: number } {
     const now = Date.now();
-    if (this._statsCache && (now - this._statsCacheTime) < MarketplaceRegistry.CACHE_TTL) {
+    // S2d-2: an as-public view (it counts the test fixture) neither reads nor fills the cache.
+    const asPublic = isAsPublicView();
+    if (!asPublic && this._statsCache && (now - this._statsCacheTime) < MarketplaceRegistry.CACHE_TTL) {
       return this._statsCache;
     }
     const db = getDb();
@@ -1975,12 +2022,14 @@ class MarketplaceRegistry {
       if (normalized) normalizedCities.add(normalized);
     }
 
-    this._statsCache = {
+    const stats = {
       totalAgents: total,
       activeProducers,
       cities: Array.from(normalizedCities),
       totalListings,
     };
+    if (asPublic) return stats;
+    this._statsCache = stats;
     this._statsCacheTime = now;
     return this._statsCache;
   }
@@ -2170,6 +2219,18 @@ class MarketplaceRegistry {
   private rowToAgent(row: any): RegisteredAgent | undefined {
     if (!row) return undefined;
 
+    // Økologi S0 (A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-
+    // register-og-tekstrevisjon): without a valid Debio status (until S1:
+    // debio_verified = 1) a producer's organic tags («organic», «økologisk»,
+    // «debio» …, shared list in organic-claims.ts) are not part of the agent
+    // any public reader sees — the /agents list, cards, MCP, A2A — and so the
+    // «organic» tag family in discover() (tag filter + ranking) only matches
+    // verified producers. Read-side only: agents.tags is unchanged.
+    const organicAllowed = isDebioVerifiedValue(row.debio_verified);
+    const rawTags = row.tags ? JSON.parse(row.tags) : [];
+    const rawSkills = row.skills ? JSON.parse(row.skills) : [];
+    const rawCategories = row.categories ? JSON.parse(row.categories) : [];
+
     return {
       id: row.id,
       name: row.name,
@@ -2192,9 +2253,17 @@ class MarketplaceRegistry {
       discoveryCount: row.discovery_count || 0,
       interactionCount: row.interaction_count || 0,
       capabilities: row.capabilities ? JSON.parse(row.capabilities) : {},
-      skills: row.skills ? JSON.parse(row.skills) : [],
-      categories: row.categories ? JSON.parse(row.categories) : [],
-      tags: row.tags ? JSON.parse(row.tags) : [],
+      // Unverified: tags read as text entries (a non-list value is one entry or
+      // none, like getAgentInfo's lists) and filtered; a skill's tags likewise.
+      skills: organicAllowed ? rawSkills : (Array.isArray(rawSkills) ? rawSkills : []).map((sk: any) =>
+        sk && typeof sk === "object" && sk.tags !== undefined ? { ...sk, tags: stripOrganicTags(textEntries(sk.tags)) } : sk),
+      // Økologi S0b: an organic category value («organic», «økologisk» …) is
+      // not shown either, so discover()'s category filter/ranking and every
+      // category list (profile chips, JSON-LD additionalType, answer-first
+      // opening, FAQ, /agents, card, MCP, A2A) only carry it for verified
+      // producers. Read-side only: agents.categories is unchanged.
+      categories: organicAllowed ? rawCategories : stripOrganicCategories(textEntries(rawCategories)),
+      tags: organicAllowed ? rawTags : stripOrganicTags(textEntries(rawTags)),
       languages: row.languages ? JSON.parse(row.languages) : ["no"],
       location: row.lat != null && row.lng != null ? {
         lat: row.lat,

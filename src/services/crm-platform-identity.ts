@@ -24,8 +24,8 @@
 //     the recipient actually reads in their inbox list; the address is fine
 //     print. Honest, not impersonation: it IS the same company.
 //   • REPLY-TO — kontakt@opplevagent.no for experiences. This is also what
-//     PRESERVES the inbound discriminator: replies arrive through the
-//     Opplevagent forwarder (ImprovMX) rather than the RFB one (AWS SES), which
+//     PRESERVES the inbound discriminator: replies arrive addressed to the
+//     vertical's own domain (all three receive through Resend inbound), which
 //     is the signal steg 4 sorts on. Without it the whole separation collapses
 //     on the return path (funn 4).
 //
@@ -60,22 +60,20 @@ const CRM_PLATFORM_IDENTITIES: Readonly<Record<CrmVertical, CrmPlatformIdentity>
     replyTo: "kontakt@rettfrabonden.com",
   },
   experiences: {
-    // Daniel confirmed the ImprovMX alias for kontakt@opplevagent.no is live
-    // (2026-07-28). Before that it was a possible black hole — every
-    // opplevagent reply-to had nowhere to land (funn 3). The DNS check that
-    // established this: opplevagent.no MX = mx1/mx2.improvmx.com, forwarding to
-    // the same Gmail as RFB. Deliberately NOT Cloudflare Email Routing, which
-    // would have required moving the whole zone off subsys.no.
+    // kontakt@opplevagent.no receives: since 2026-11-11 opplevagent.no's MX is
+    // Resend inbound (before that ImprovMX, from 2026-07-28), so a reply lands
+    // in the server's inbound webhook, is filed on `experiences` by recipient
+    // domain (cs-inbound.ts) and forwarded to Daniel's Gmail.
     displayName: "Opplevagent",
     replyTo: "kontakt@opplevagent.no",
   },
   dental: {
     displayName: "Finn Tannlege",
-    // finn-tannlege.com has no inbound forwarder configured. Pointing reply-to
-    // at an address that does not receive would recreate funn 3 on a third
-    // platform, so this deliberately routes to the address that DOES work.
-    // Revisit when the domain gets its own alias.
-    replyTo: "kontakt@rettfrabonden.com",
+    // finn-tannlege.com receives since 2026-11-11 (MX = Resend inbound,
+    // tested end to end: a mail to kontakt@finn-tannlege.com was filed on
+    // `dental`). A dental reply therefore comes back to the dental platform,
+    // not to Rett fra Bonden's address.
+    replyTo: "kontakt@finn-tannlege.com",
   },
 };
 

@@ -22,6 +22,7 @@ import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { registeredMcpTools } from "../services/mcp-tool-manifest";
 import { agentCardProvider } from "../services/company-legal";
+import { BRAND_ENTITIES, brandMcpIcons, RFB_MCP_SERVER_TITLE } from "../config/brand-entities";
 
 const router = Router();
 
@@ -52,10 +53,10 @@ function mcpServerCard() {
     // never written down. See services/mcp-protocol-version.ts.
     ...mcpProtocolDeclaration(),
     name: "lokal",
-    title: "Lokal — A2A marketplace for local food in Norway",
+    title: RFB_MCP_SERVER_TITLE,
     version: "1.0.0",
     description:
-      `Discover ${stats.totalAgents || "1,290+"} verified Norwegian food producers. ` +
+      `Discover ${stats.totalAgents || "1,290+"} Norwegian food producers, cross-checked against the Brønnøysund register. ` +
       "Search by category, region, certification, and trust score. Supports " +
       "natural-language queries in Norwegian and English.",
     homepage: BASE_URL,
@@ -64,7 +65,7 @@ function mcpServerCard() {
       url: "https://github.com/slookisen/lokal",
     },
     documentation: `${BASE_URL}/teknologi`,
-    icon: `${BASE_URL}/favicon.ico`,
+    icon: brandMcpIcons(BRAND_ENTITIES.rfb)?.[0]?.src ?? `${BASE_URL}/favicon.ico`,
     // T3 (dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as): the
     // organisation behind the server is the company, same as the agent card's
     // provider; `name`/`title` above keep the brand.
@@ -167,7 +168,7 @@ function agentSkillsIndex() {
         id: "discover-local-food-agents",
         name: "Discover Local Food Agents",
         description:
-          `Search ${count} verified Norwegian producers. Filter by category, region, certification, and trust score.`,
+          `Search ${count} Norwegian producers, cross-checked against the Brønnøysund register. Filter by category, region, certification, and trust score.`,
         url: `${BASE_URL}/.well-known/agent-skills/discover-local-food-agents`,
         tags: ["search", "discovery", "local-food", "norway"],
         inputModes: ["text/plain", "application/json"],
@@ -196,9 +197,9 @@ function agentSkillsIndex() {
         id: "search-compare-food",
         name: "Search & Compare Local Food",
         description:
-          "Natural-language search across producers. Compare prices, delivery options, organic certifications, availability.",
+          "Natural-language search across producers. Compare delivery options, certifications, availability.",
         url: `${BASE_URL}/.well-known/agent-skills/search-compare-food`,
-        tags: ["search", "compare", "price", "delivery"],
+        tags: ["search", "compare", "delivery"],
         inputModes: ["text/plain", "application/json"],
         outputModes: ["application/json"],
         invocation: {

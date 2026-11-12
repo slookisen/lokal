@@ -17,6 +17,8 @@
  * On success: creates a CRM thread (category "innkommende", subject
  * prefixed with "[Kontaktskjema]") via direct DB write — minimum privilege,
  * no reads, no admin routes.
+ * Then e-mails a text-only copy to ADMIN_NOTIFICATION_EMAIL (Reply-To = the
+ * visitor), fire-and-forget: it never delays or changes the response.
  *
  * NEVER exposes internal errors to the caller.
  */
@@ -24,6 +26,8 @@
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
+import { emailService, maskEmails } from "../services/email-service";
+import { countContactRejection, sendContactReceipt } from "../services/contact-form-cs";
 
 const router = Router();
 
@@ -129,7 +133,7 @@ function createContactThread(params: {
   subject: string;
   message: string;
   platform: Platform;
-}): void {
+}): string {
   const db = getDb();
   const now = new Date().toISOString();
   const lowerEmail = params.email.trim().toLowerCase();
@@ -212,6 +216,8 @@ function createContactThread(params: {
       name: params.name,
     }),
   );
+
+  return threadId;
 }
 
 // ─── POST /contact ───────────────────────────────────────────
@@ -223,6 +229,7 @@ router.post("/contact", async (req: Request, res: Response): Promise<void> => {
     // 1. Honeypot check
     const honey = String(body._honey ?? "");
     if (honey.length > 0) {
+      countContactRejection(inferPlatform(req), "honeypot");
       res.status(400).json({ success: false, error: "invalid" });
       return;
     }
@@ -234,14 +241,17 @@ router.post("/contact", async (req: Request, res: Response): Promise<void> => {
     const subject = String(body.subject ?? "").trim();
 
     if (name.length > 100 || email.length > 254 || message.length > 2000 || subject.length > 200) {
+      countContactRejection(inferPlatform(req), "invalid_input");
       res.status(422).json({ success: false, error: "field_too_long" });
       return;
     }
     if (!name || !email || !message) {
+      countContactRejection(inferPlatform(req), "invalid_input");
       res.status(422).json({ success: false, error: "missing_required_fields" });
       return;
     }
     if (!EMAIL_RE.test(email)) {
+      countContactRejection(inferPlatform(req), "invalid_input");
       res.status(422).json({ success: false, error: "invalid_email" });
       return;
     }
@@ -266,6 +276,7 @@ router.post("/contact", async (req: Request, res: Response): Promise<void> => {
     const rawPlatform = String(body.platform ?? "").trim().toLowerCase();
     const VALID_PLATFORMS: Platform[] = ["rfb", "experiences", "dental"];
     if (rawPlatform !== "" && !VALID_PLATFORMS.includes(rawPlatform as Platform)) {
+      countContactRejection(inferPlatform(req), "invalid_input");
       res.status(422).json({
         success: false,
         error: "invalid_platform",
@@ -279,6 +290,7 @@ router.post("/contact", async (req: Request, res: Response): Promise<void> => {
     const cfToken = String(body.cfTurnstileResponse ?? "");
     const turnstileOk = await verifyTurnstile(cfToken);
     if (!turnstileOk) {
+      countContactRejection(platform, "captcha_failed");
       res.status(403).json({ success: false, error: "captcha_failed" });
       return;
     }
@@ -286,12 +298,34 @@ router.post("/contact", async (req: Request, res: Response): Promise<void> => {
     // 5. Rate limit
     const ip = clientIp(req);
     if (!checkRateLimit(ip)) {
+      countContactRejection(platform, "rate_limit");
       res.status(429).json({ success: false, error: "rate_limit_exceeded" });
       return;
     }
 
     // 6. Create CRM thread
-    createContactThread({ name, email, subject, message, platform });
+    const threadId = createContactThread({ name, email, subject, message, platform });
+
+    // 6b. E-mail copy to the admin (Daniel, 2026-11-01). Not awaited: the
+    // thread above is already written, and a slow or failing send must never
+    // delay or change the response. The service never throws; the .catch is
+    // a belt, and logs no message content or visitor address.
+    emailService
+      .sendAdminContactFormCopy({ platform, name, email, subject, message, threadId })
+      .catch((err: unknown) => {
+        console.error("[contact] Admin copy failed:", maskEmails(err instanceof Error ? err.message : String(err)));
+      });
+
+    // 6c. CS på serveren, S5: a missing admin address is an error, not a
+    // silent skip — the copy above then goes nowhere.
+    if (!process.env.ADMIN_NOTIFICATION_EMAIL) {
+      console.error(`[contact] ADMIN_NOTIFICATION_EMAIL is not set — no admin copy of form thread ${threadId}`);
+    }
+
+    // 6d. Automatic receipt to the visitor (CS_CONTACT_RECEIPT_ENABLED): fixed
+    // template, at most one per address per 24 h, never echoes the form text.
+    // Not awaited, never throws.
+    void sendContactReceipt({ email, platform, threadId }).catch(() => undefined);
 
     // 7. Success
     res.status(200).json({

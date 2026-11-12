@@ -18,15 +18,22 @@
 import { formatAddressLine } from "../utils/address-format";
 import { randomUUID, randomBytes } from "crypto";
 import { getDb } from "../database/init";
+import { isContactHiddenAgentId } from "./agent-visibility";
 import { recordTrustEvent } from "./trust-event-service";
 import { sendOrderNotificationForOrder, OrderNotificationInput } from "./order-notify-service";
-import { computeEffectiveAvailability } from "./supply-graph";
+import { evaluateStockFreshness, producerStockExpiresAt, producerStockHardExpiresAt, type StockFreshness } from "./supply-graph";
+import { stockSoftExpiryActiveFor, stockSoftExpiryBuyerTextNb } from "./stock-soft-expiry";
 import { knowledgeService } from "./knowledge-service";
 import { slugify } from "../utils/slug";
 import { isBlocked } from "./blocklist-service";
 import { isCategoryLabel } from "../utils/category-label";
 import { classifyCartItemBan, banErrorText, BAN_CHECK_FAILED_ERROR, type BannedItemKind } from "./cart-item-ban";
 import { summarizePricing } from "./order-pricing";
+import {
+  claimOrderCapAdminAlert, isOrderCapNoticeEnabled, isOrderCapV2Enabled, orderCapHandoffFields, orderCapHandoffFieldsV2,
+  orderCapReasonForDetail, osloDayStartUtc, recordOrderCapEvent, ORDER_CAP_CEILING_PREWARN_AT,
+  type OrderCapDetail, type OrderCapReason,
+} from "./order-cap-notice";
 
 // ─── Test-DB override (module-local, race-proof) ─────────────────────────────
 // In production _cartTestDb is always null → getDb() is used as normal.
@@ -78,6 +85,12 @@ export interface CartGroup {
     producer_confirmed: boolean;
     /** Skive 4: ingredients / allergens / net weight where stated (pre-packaged food); null otherwise. */
     food_info: FoodInfo | null;
+    /** B2b-1 (soft expiry, only when the rule is active and the row is in the soft window): last confirmed by the producer (ISO). */
+    stock_confirmed_at?: string;
+    /** B2b-1: present (true) with stock_confirmed_at — the producer confirms the item is in stock before the order holds. */
+    needs_producer_confirmation?: true;
+    /** B2b-1: the buyer's text for such a line (bokmål). */
+    stock_note?: string;
   }>;
   subtotal_nok: number;
 }
@@ -384,6 +397,265 @@ function unconfirmedItemError(
   }
 }
 
+/** The product row fields the orderability check reads. */
+export interface OrderabilityRow {
+  agent_id: string;
+  name: string;
+  description?: string | null;
+  category?: string | null;
+  price_nok: number | null;
+  availability: string;
+  availability_updated_at: string | null;
+  availability_source: string | null;
+}
+
+// ─── Orderability reasons (dev-request rfb-bestillinger, slice B1) ──────────
+// One shared core, evaluateOrderability(), behind BOTH the real-order gate
+// isRowOrderableForRealOrder() (stops at the first failing check, exactly the
+// checks and order it always had) and orderabilityReasons() (runs every check
+// and says why), so the owner portal and the gate cannot drift. No new rule:
+// the profile-level boolean is always isEligibleForRealOrder() itself; the
+// detailed profile reasons only explain a «no» it already gave.
+
+/** Stable reason codes. `level` tells whether the product or the whole profile blocks. */
+export type OrderabilityReasonCode =
+  | "category_label"          // a category name, not a product (I-S2)
+  | "alcohol"                 // F9
+  | "service"                 // F9 (services / experiences)
+  | "ban_check_failed"        // F9 classifier error (fail-closed)
+  | "stock_status_expired"    // producer-set «in stock» older than the staleness window
+  | "not_in_stock"            // effective availability is not 'in_stock'
+  | "not_confirmed_by_owner"  // availability_source is not producer-stated (skive 4)
+  | "orders_off"              // agents.order_notifications_opt_in != 1
+  | "owner_not_verified"      // agents.is_verified != 1
+  | "order_email_missing"     // no order / contact e-mail
+  | "order_email_suppressed"  // the recipient e-mail is blocklisted
+  | "profile_not_checked"     // T10 (orderReadiness only): no verified internal cross-check (agent_knowledge), or second-line only
+  | "producer_not_eligible";  // any other isEligibleForRealOrder() «no» (cross-check, umbrella, inactive, read error)
+
+export interface OrderabilityReason {
+  code: OrderabilityReasonCode;
+  level: "product" | "profile";
+  /** stock_status_expired: when the producer-set status stopped counting (ISO), null when never set. */
+  expired_at?: string | null;
+  /** not_in_stock: the effective availability. */
+  availability?: string;
+}
+
+export interface OrderabilityResult {
+  orderable: boolean;
+  reasons: OrderabilityReason[];
+  /** A producer_dashboard row: when its stock status expires / expired (ISO); else null. */
+  stock_expires_at: string | null;
+  /** B2b-1 (soft expiry active, row in the soft window): last confirmed by the producer (ISO). Absent otherwise. */
+  stock_confirmed_at?: string;
+  /** B2b-1: present (true) with stock_confirmed_at. Absent otherwise. */
+  needs_producer_confirmation?: true;
+}
+
+/**
+ * B2b-1: a row's effective stock state for the order path — the soft-expiry
+ * rule when it is active for the row's producer (stock-soft-expiry.ts), else
+ * exactly computeEffectiveAvailability().
+ */
+export function orderPathStockFreshness(
+  row: { agent_id: string; availability: string; availability_updated_at: string | null; availability_source: string | null },
+  now: Date,
+): StockFreshness {
+  return evaluateStockFreshness(row.availability, row.availability_updated_at, row.availability_source ?? "", now, stockSoftExpiryActiveFor(row.agent_id));
+}
+
+/** B2b-1: the soft-window fields of a freshness result ({} outside the soft window). */
+export function softExpiryFields(f: StockFreshness): { stock_confirmed_at?: string; needs_producer_confirmation?: true } {
+  return f.needs_producer_confirmation && f.stock_confirmed_at
+    ? { stock_confirmed_at: f.stock_confirmed_at, needs_producer_confirmation: true }
+    : {};
+}
+
+/** Profile-level part: isEligibleForRealOrder() plus, when asked, why not. */
+export interface ProducerOrderability {
+  eligible: boolean;
+  reasons: OrderabilityReason[];
+}
+
+/**
+ * Explains a «no» from isEligibleForRealOrder(); never decides it. Never throws.
+ * `assumeOrdersOn` (T10, orderReadiness): explains the gate as it would answer
+ * with orders switched on — no orders_off, and the cross-check named
+ * (profile_not_checked) instead of the generic reason. Default: as before.
+ */
+function explainNotEligible(db: any, agentId: string, assumeOrdersOn = false): OrderabilityReason[] {
+  const out: OrderabilityReason[] = [];
+  const profile = (code: OrderabilityReasonCode) => out.push({ code, level: "profile" });
+  try {
+    const row = db.prepare(`
+      SELECT a.is_verified AS is_verified, a.order_notifications_opt_in AS opt_in,
+             a.order_notification_email AS override_email, a.contact_email AS contact_email
+      FROM agents a WHERE a.id = ?
+    `).get(agentId) as { is_verified: number | null; opt_in: number | null; override_email: string | null; contact_email: string | null } | undefined;
+    if (row) {
+      if (row.opt_in !== 1 && !assumeOrdersOn) profile("orders_off");
+      if (row.is_verified !== 1) profile("owner_not_verified");
+      const email = (row.override_email || "").trim() || (row.contact_email || "").trim();
+      if (!email) profile("order_email_missing");
+      else if (isBlocked({ email }).blocked) profile("order_email_suppressed");
+      if (assumeOrdersOn) {
+        const checked = db.prepare(`
+          SELECT 1 FROM agent_knowledge k
+          WHERE k.agent_id = ? AND k.verification_status = 'verified'
+            AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
+        `).get(agentId);
+        if (!checked) profile("profile_not_checked");
+      }
+    }
+  } catch { /* fall through to the generic reason */ }
+  if (out.length === 0) profile("producer_not_eligible");
+  return out;
+}
+
+/**
+ * The profile-level verdict, computed once per producer. `eligible` is
+ * isEligibleForRealOrder() (a gate that cannot be evaluated counts as «no»,
+ * as in the gate); with `explain` the reasons say why not.
+ */
+export function producerOrderability(db: any, agentId: string, explain = true): ProducerOrderability {
+  let eligible = false;
+  try {
+    eligible = isEligibleForRealOrder(agentId, db);
+  } catch {
+    eligible = false;
+  }
+  return { eligible, reasons: eligible || !explain ? [] : explainNotEligible(db, agentId) };
+}
+
+/**
+ * T10 (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 3): what the
+ * level preview needs before a level may switch orders on. No new rule:
+ *   ready            isEligibleForRealOrder() itself, as it answers with
+ *                    agents.order_notifications_opt_in = 1 — when the column
+ *                    is off it is set to 1 inside a transaction that is
+ *                    always rolled back, so `ready` is true if and only if
+ *                    the real gate would be true with orders on. A gate that
+ *                    cannot be evaluated counts as «no».
+ *   missing          explainNotEligible() for that answer (never orders_off);
+ *                    [] when ready; never empty when not ready.
+ *   orderable_if_on  product rows that pass every product check of
+ *                    isRowOrderableForRealOrder() (the profile check taken as
+ *                    passed) — «Du har 0 varer som kan bestilles» is a soft
+ *                    warning, not a requirement.
+ */
+export interface OrderReadiness {
+  ready: boolean;
+  missing: OrderabilityReason[];
+  orderable_if_on: number;
+}
+
+class ReadinessRollback extends Error {
+  constructor(readonly ready: boolean) { super("order readiness rollback"); }
+}
+
+function eligibleWithOrdersOn(db: any, agentId: string): boolean {
+  const row = db.prepare(`SELECT order_notifications_opt_in AS opt_in FROM agents WHERE id = ?`).get(agentId) as { opt_in: number | null } | undefined;
+  if (!row) return false;
+  if (row.opt_in === 1) return isEligibleForRealOrder(agentId, db);
+  try {
+    db.transaction(() => {
+      db.prepare(`UPDATE agents SET order_notifications_opt_in = 1 WHERE id = ?`).run(agentId);
+      throw new ReadinessRollback(isEligibleForRealOrder(agentId, db));
+    })();
+  } catch (e) {
+    if (e instanceof ReadinessRollback) return e.ready;
+    throw e;
+  }
+  return false;
+}
+
+export function orderReadiness(db: any, agentId: string, now: Date = new Date()): OrderReadiness {
+  let ready = false;
+  try { ready = eligibleWithOrdersOn(db, agentId); } catch { ready = false; }
+  let missing: OrderabilityReason[] = [];
+  if (!ready) {
+    missing = explainNotEligible(db, agentId, true);
+    if (missing.length === 0) missing = [{ code: "producer_not_eligible", level: "profile" }];
+  }
+  let orderable = 0;
+  try {
+    const rows = db
+      .prepare(
+        `SELECT agent_id, name, description, category, price_nok, availability, availability_updated_at, availability_source
+           FROM products WHERE agent_id = ?`,
+      )
+      .all(agentId) as OrderabilityRow[];
+    const passed: ProducerOrderability = { eligible: true, reasons: [] };
+    orderable = rows.filter((r) => evaluateOrderability(db, r, now, true, passed).length === 0).length;
+  } catch { orderable = 0; }
+  return { ready, missing, orderable_if_on: orderable };
+}
+
+/**
+ * The shared core. Checks in the gate's order; `firstOnly` stops at the first
+ * failing check (the gate), otherwise every check runs (the reasons).
+ */
+function evaluateOrderability(
+  db: any,
+  row: OrderabilityRow,
+  now: Date,
+  firstOnly: boolean,
+  producer?: ProducerOrderability,
+): OrderabilityReason[] {
+  const reasons: OrderabilityReason[] = [];
+  if (isCategoryLabelRow(row)) {
+    reasons.push({ code: "category_label", level: "product" });
+    if (firstOnly) return reasons;
+  }
+  const banned = bannedItemError(db, row);
+  if (banned) {
+    reasons.push({ code: banned.kind === "check_failed" ? "ban_check_failed" : banned.kind, level: "product" });
+    if (firstOnly) return reasons;
+  }
+  // B2b-1: with the soft-expiry rule active for the producer, the soft window counts as in stock.
+  const soft = stockSoftExpiryActiveFor(row.agent_id);
+  const effective = evaluateStockFreshness(row.availability, row.availability_updated_at, row.availability_source ?? "", now, soft).availability;
+  if (effective !== "in_stock") {
+    if (row.availability === "in_stock") {
+      // Only a producer_dashboard row can degrade (supply-graph.ts).
+      const exp = soft ? producerStockHardExpiresAt(row.availability_updated_at) : producerStockExpiresAt(row.availability_updated_at);
+      reasons.push({ code: "stock_status_expired", level: "product", expired_at: exp ? exp.toISOString() : null });
+    } else {
+      reasons.push({ code: "not_in_stock", level: "product", availability: effective });
+    }
+    if (firstOnly) return reasons;
+  }
+  if (!isProducerStatedSource(row.availability_source)) {
+    reasons.push({ code: "not_confirmed_by_owner", level: "product" });
+    if (firstOnly) return reasons;
+  }
+  const p = producer ?? producerOrderability(db, row.agent_id, !firstOnly);
+  if (!p.eligible) reasons.push(...(p.reasons.length ? p.reasons : [{ code: "producer_not_eligible" as const, level: "profile" as const }]));
+  return reasons;
+}
+
+/**
+ * Why a product row can or cannot become a line of a REAL order now — the
+ * owner portal's view of isRowOrderableForRealOrder(). `orderable` is always
+ * exactly what the gate answers for the same (row, now) (tested over one
+ * fixture row per reason). Pass `producer` (producerOrderability()) to
+ * evaluate many rows of one producer with one profile read.
+ */
+export function orderabilityReasons(
+  db: any,
+  row: OrderabilityRow,
+  now: Date = new Date(),
+  producer?: ProducerOrderability,
+): OrderabilityResult {
+  const reasons = evaluateOrderability(db, row, now, false, producer);
+  const exp = row.availability_source === "producer_dashboard" ? producerStockExpiresAt(row.availability_updated_at) : null;
+  return {
+    orderable: reasons.length === 0, reasons, stock_expires_at: exp ? exp.toISOString() : null,
+    ...softExpiryFields(orderPathStockFreshness(row, now)),
+  };
+}
+
 /**
  * Skive 3 (bestillingsknapp, dev-request
  * 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel): whether a product
@@ -396,30 +668,29 @@ function unconfirmedItemError(
  *   - a producer-stated row (skive 4) of a producer who passes
  *     isEligibleForRealOrder() (skive 2; a gate that cannot be evaluated
  *     counts as «no», as in catalog-offers.ts compareOffersForProducer).
+ * B1: the checks live in evaluateOrderability(), shared with
+ * orderabilityReasons(); this stops at the first failing one, as before.
  */
 export function isRowOrderableForRealOrder(
   db: any,
-  row: {
-    agent_id: string;
-    name: string;
-    description?: string | null;
-    category?: string | null;
-    price_nok: number | null;
-    availability: string;
-    availability_updated_at: string | null;
-    availability_source: string | null;
-  },
+  row: OrderabilityRow,
   now: Date = new Date(),
 ): boolean {
-  if (isCategoryLabelRow(row)) return false;
-  if (bannedItemError(db, row)) return false;
-  if (computeEffectiveAvailability(row.availability, row.availability_updated_at, row.availability_source ?? "", now) !== "in_stock") return false;
-  if (!isProducerStatedSource(row.availability_source)) return false;
-  try {
-    return isEligibleForRealOrder(row.agent_id, db);
-  } catch {
-    return false;
-  }
+  return evaluateOrderability(db, row, now, true).length === 0;
+}
+
+/**
+ * B1 (AC2): how many of the producer's product rows isRowOrderableForRealOrder()
+ * accepts right now — the number «Mine valg» and the owner portal show.
+ */
+export function countOrderableProducts(agentId: string, db: any = _cartTestDb ?? getDb(), now: Date = new Date()): number {
+  const rows = db
+    .prepare(
+      `SELECT agent_id, name, description, category, price_nok, availability, availability_updated_at, availability_source
+         FROM products WHERE agent_id = ?`,
+    )
+    .all(agentId) as OrderabilityRow[];
+  return rows.filter((r) => isRowOrderableForRealOrder(db, r, now)).length;
 }
 
 // ─── Add / upsert item ───────────────────────────────────────────────────────
@@ -480,12 +751,8 @@ export function addCartItem(
   // producer_dashboard-sourced value that's gone stale (>14 days, see
   // supply-graph.ts) must degrade to 'unknown' and be rejected here, not
   // silently trusted forever. Enrichment-sourced rows are unaffected.
-  const effectiveAvailability = computeEffectiveAvailability(
-    product.availability,
-    product.availability_updated_at,
-    product.availability_source,
-    new Date()
-  );
+  // B2b-1: the soft-expiry rule when it is active for the producer (else unchanged).
+  const effectiveAvailability = orderPathStockFreshness(product, new Date()).availability;
   if (effectiveAvailability !== "in_stock") {
     return { success: false, status: 409, error: `Product is not in stock (availability: ${effectiveAvailability})` };
   }
@@ -857,6 +1124,8 @@ export function viewCart(cartId: string): CartView | null {
       p.name   AS product_name,
       p.unit   AS unit,
       p.availability_source AS availability_source,
+      p.availability AS availability,
+      p.availability_updated_at AS availability_updated_at,
       p.ingredients AS ingredients,
       p.allergens   AS allergens,
       p.net_weight  AS net_weight,
@@ -877,6 +1146,8 @@ export function viewCart(cartId: string): CartView | null {
     product_name: string;
     unit: string | null;
     availability_source: string | null;
+    availability: string;
+    availability_updated_at: string | null;
     ingredients: string | null;
     allergens: string | null;
     net_weight: string | null;
@@ -884,6 +1155,7 @@ export function viewCart(cartId: string): CartView | null {
   }>;
 
   // Group by producer
+  const now = new Date();
   const groupMap = new Map<string, CartGroup>();
   for (const r of rows) {
     if (!groupMap.has(r.agent_id)) {
@@ -908,6 +1180,7 @@ export function viewCart(cartId: string): CartView | null {
       line_note: r.line_note,
       producer_confirmed: isProducerStatedSource(r.availability_source),
       food_info: foodInfoOf(r),
+      ...cartLineSoftExpiry(orderPathStockFreshness(r, now)),
     });
     if (line_total != null) group.subtotal_nok += line_total;
   }
@@ -920,6 +1193,12 @@ export function viewCart(cartId: string): CartView | null {
   ).is_partial;
 
   return { success: true, cart_id: cartId, status: cart.status, groups, total_nok, total_is_partial, item_count };
+}
+
+/** B2b-1: a cart line's soft-expiry fields and buyer text ({} outside the soft window). */
+function cartLineSoftExpiry(f: StockFreshness): { stock_confirmed_at?: string; needs_producer_confirmation?: true; stock_note?: string } {
+  const x = softExpiryFields(f);
+  return x.stock_confirmed_at ? { ...x, stock_note: stockSoftExpiryBuyerTextNb(x.stock_confirmed_at) } : {};
 }
 
 // ─── Submit cart ─────────────────────────────────────────────────────────────
@@ -971,6 +1250,16 @@ export interface ContactHandoff {
   email: string | null;
   profile_url: string;
   message: string;
+  /**
+   * B4 (ORDER_CAP_NOTICE_ENABLED only): present when a spam cap (F8) turned
+   * this producer's order into a handoff. cap_notice is the buyer text
+   * (order-cap-notice.ts orderCapBuyerNotice, Norwegian).
+   */
+  cap_reached?: true;
+  /** T11 (ORDER_CAP_V2_ENABLED): additive values 'platform_ceiling' | 'buyer_daily_cap'. */
+  cap_reason?: OrderCapReason | OrderCapDetail;
+  cap?: number;
+  cap_notice?: string;
 }
 
 export type SubmitResult =
@@ -1024,7 +1313,10 @@ function buildContactHandoff(
   lines: Array<{ name: string; qty: number; unit?: string | null }>
 ): ContactHandoff {
   const info = knowledgeService.getAgentInfo(agentId);
-  const k = info?.knowledge;
+  // A catalog_hidden producer (the hidden test fixture, e.g. when its order
+  // cap is hit or it is retired) never shows its phone/e-mail here: they are
+  // a real person's (agent-visibility.ts). profile_url and message stay.
+  const k = isContactHiddenAgentId(cartServiceDb(), agentId) ? undefined : info?.knowledge;
   return {
     agent_id: agentId,
     name: agentName,
@@ -1061,29 +1353,121 @@ function envPositiveInt(name: string, dflt: number): number {
 export function orderCapOpenPerBuyer(): number { return envPositiveInt("ORDER_CAP_OPEN_PENDING_PER_BUYER", 3); }
 export function orderCapNewPerDay(): number { return envPositiveInt("ORDER_CAP_NEW_PER_PRODUCER_PER_DAY", 10); }
 
-function orderCapReached(db: any, agentId: string, contact?: SubmitContactInput): boolean {
+/**
+ * Which cap (if any) turns this producer's order into a handoff (B4: the
+ * reason and the limit are reported to the buyer and counted for the
+ * producer's daily digest, see order-cap-notice.ts). null = no cap reached.
+ */
+function orderCapReached(db: any, agentId: string, contact?: SubmitContactInput): { reason: OrderCapReason; cap: number } | null {
   try {
     const perDay = db.prepare(
       "SELECT COUNT(*) AS n FROM orders WHERE agent_id = ? AND created_at >= datetime('now', '-1 day')"
     ).get(agentId) as { n: number };
-    if (perDay.n >= orderCapNewPerDay()) return true;
+    if (perDay.n >= orderCapNewPerDay()) return { reason: "producer_daily_cap", cap: orderCapNewPerDay() };
     const email = (contact?.buyer_email || "").trim().toLowerCase();
     const phone = (contact?.buyer_phone || "").replace(/\s+/g, "");
     if (email) {
       const open = db.prepare(
         "SELECT COUNT(*) AS n FROM orders WHERE agent_id = ? AND status = 'pending' AND lower(buyer_email) = ?"
       ).get(agentId, email) as { n: number };
-      if (open.n >= orderCapOpenPerBuyer()) return true;
+      if (open.n >= orderCapOpenPerBuyer()) return { reason: "buyer_open_cap", cap: orderCapOpenPerBuyer() };
     } else if (phone) {
       const open = db.prepare(
         "SELECT COUNT(*) AS n FROM orders WHERE agent_id = ? AND status = 'pending' AND replace(buyer_phone, ' ', '') = ?"
       ).get(agentId, phone) as { n: number };
-      if (open.n >= orderCapOpenPerBuyer()) return true;
+      if (open.n >= orderCapOpenPerBuyer()) return { reason: "buyer_open_cap", cap: orderCapOpenPerBuyer() };
     }
-    return false;
+    return null;
   } catch {
     // A cap that cannot be read must not block a real buyer.
-    return false;
+    return null;
+  }
+}
+
+// ─── T11: order caps v2 (ORDER_CAP_V2_ENABLED) ───────────────────────────────
+// dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 5. The producer-wide
+// 10/day cap is gone (many different buyers may order the same day). Per buyer
+// per producer: ORDER_CAP_OPEN_PENDING_PER_BUYER (3) open unanswered and
+// ORDER_CAP_NEW_PER_BUYER_PER_DAY (10) new per Oslo day. Per producer: the
+// platform ceiling ORDER_CAP_PRODUCER_CEILING_PER_DAY (50) new per Oslo day,
+// all statuses. A day runs midnight to midnight Europe/Oslo. No limit per IP
+// or AI assistant (shared outgoing addresses).
+export function orderCapNewPerBuyerPerDay(): number { return envPositiveInt("ORDER_CAP_NEW_PER_BUYER_PER_DAY", 10); }
+/** Read only with ORDER_CAP_V2_ENABLED on. */
+export function orderCapProducerCeilingPerDay(): number { return envPositiveInt("ORDER_CAP_PRODUCER_CEILING_PER_DAY", 50); }
+
+/**
+ * The buyer's e-mail as the caps compare it: trimmed, lower case, without a
+ * «+tag» in the local part (« Ola+x@Example.no » → «ola@example.no»). "" = none.
+ */
+export function normalizeBuyerEmailForCap(raw: string | null | undefined): string {
+  const e = String(raw ?? "").trim().toLowerCase();
+  if (!e) return "";
+  const at = e.lastIndexOf("@");
+  if (at <= 0) return e;
+  const local = e.slice(0, at).split("+")[0]!;
+  return `${local || e.slice(0, at)}@${e.slice(at + 1)}`;
+}
+
+/**
+ * The buyer's phone as the caps compare it: digits only, without the
+ * Norwegian country code (+47 / 0047 / 47 before 8 digits):
+ * «+47 900 00 000» and «90000000» are the same buyer. "" = none.
+ */
+export function normalizeBuyerPhoneForCap(raw: string | null | undefined): string {
+  const s = String(raw ?? "").trim();
+  let d = s.replace(/\D+/g, "");
+  if (s.startsWith("+") && d.startsWith("47")) d = d.slice(2);
+  else if (d.startsWith("0047")) d = d.slice(4);
+  else if (d.length === 10 && d.startsWith("47")) d = d.slice(2);
+  return d;
+}
+
+export type OrderCapV2Hit = { reason: OrderCapReason; detail: OrderCapDetail; cap: number; todayCount: number };
+
+/**
+ * Which v2 cap (if any) turns this producer's order into a handoff. The
+ * buyer is recognised by e-mail OR phone (both normalised, both checked: a
+ * new e-mail with the same phone is the same buyer). Order: the platform
+ * ceiling (the day is full for everyone), then the buyer's open orders, then
+ * the buyer's new orders today. `now` is injectable for the tests. A read
+ * error never blocks the buyer (null).
+ */
+export function orderCapReachedV2(db: any, agentId: string, contact?: SubmitContactInput, now: Date = new Date()): OrderCapV2Hit | null {
+  try {
+    const dayStart = osloDayStartUtc(now);
+    const rows = db.prepare(
+      "SELECT buyer_email, buyer_phone, status, created_at FROM orders WHERE agent_id = ? AND (status = 'pending' OR created_at >= ?)"
+    ).all(agentId, dayStart) as Array<{ buyer_email: string | null; buyer_phone: string | null; status: string; created_at: string }>;
+    const today = rows.filter((r) => String(r.created_at) >= dayStart);
+    const ceiling = orderCapProducerCeilingPerDay();
+    if (today.length >= ceiling) return { reason: orderCapReasonForDetail("platform_ceiling"), detail: "platform_ceiling", cap: ceiling, todayCount: today.length };
+    const email = normalizeBuyerEmailForCap(contact?.buyer_email);
+    const phone = normalizeBuyerPhoneForCap(contact?.buyer_phone);
+    if (!email && !phone) return null;
+    const sameBuyer = (r: { buyer_email: string | null; buyer_phone: string | null }) =>
+      (!!email && normalizeBuyerEmailForCap(r.buyer_email) === email) || (!!phone && normalizeBuyerPhoneForCap(r.buyer_phone) === phone);
+    const openCap = orderCapOpenPerBuyer();
+    if (rows.filter((r) => r.status === "pending" && sameBuyer(r)).length >= openCap) {
+      return { reason: orderCapReasonForDetail("buyer_open_cap"), detail: "buyer_open_cap", cap: openCap, todayCount: today.length };
+    }
+    const perBuyer = orderCapNewPerBuyerPerDay();
+    if (today.filter(sameBuyer).length >= perBuyer) {
+      return { reason: orderCapReasonForDetail("buyer_daily_cap"), detail: "buyer_daily_cap", cap: perBuyer, todayCount: today.length };
+    }
+    return null;
+  } catch {
+    // A cap that cannot be read must not block a real buyer.
+    return null;
+  }
+}
+
+/** New orders for the producer since Oslo midnight (all statuses); null on a read error. */
+function ordersTodayForProducer(db: any, agentId: string, now: Date): number | null {
+  try {
+    return (db.prepare("SELECT COUNT(*) AS n FROM orders WHERE agent_id = ? AND created_at >= ?").get(agentId, osloDayStartUtc(now)) as { n: number }).n;
+  } catch {
+    return null;
   }
 }
 
@@ -1202,12 +1586,8 @@ export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: 
   const now = new Date();
   const withEffective = items.map(i => ({
     ...i,
-    effectiveAvailability: computeEffectiveAvailability(
-      i.availability,
-      i.availability_updated_at,
-      i.availability_source,
-      now
-    ),
+    // B2b-1: the soft-expiry rule when it is active for the producer (else unchanged).
+    effectiveAvailability: orderPathStockFreshness(i, now).availability,
   }));
   const unavailable = withEffective.filter(i => i.effectiveAvailability !== "in_stock");
   if (unavailable.length > 0) {
@@ -1288,10 +1668,20 @@ export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: 
 
   // F8: per-producer spam cap. A producer over the cap gets a contact handoff
   // instead of one more order (no order row, no e-mail).
+  // B4: the cap and its reason are kept per producer — recorded for the
+  // producer's daily digest and admin count, and (ORDER_CAP_NOTICE_ENABLED)
+  // told to the buyer on the handoff.
+  // T11: ORDER_CAP_V2_ENABLED swaps the rule (per buyer + platform ceiling);
+  // off, orderCapReached() exactly as before.
+  const capV2On = isOrderCapV2Enabled();
+  const capNow = new Date();
+  const cappedAgents = new Map<string, { reason: OrderCapReason; cap: number; detail?: OrderCapDetail }>();
   for (const agent_id of Array.from(eligibleAgentIds)) {
-    if (orderCapReached(db, agent_id, contact)) {
+    const capHit = capV2On ? orderCapReachedV2(db, agent_id, contact, capNow) : orderCapReached(db, agent_id, contact);
+    if (capHit) {
       eligibleAgentIds.delete(agent_id);
       ineligibleAgentIds.add(agent_id);
+      cappedAgents.set(agent_id, capHit);
     }
   }
 
@@ -1514,9 +1904,34 @@ export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: 
 
   // Built AFTER the transaction committed (cart_handoffs rows already
   // written inside it) — this only reads agent contact info, no writes.
-  const contact_handoffs: ContactHandoff[] = Array.from(handoffByAgent.entries()).map(([agent_id, v]) =>
-    buildContactHandoff(agent_id, v.name, v.lines)
-  );
+  // B4: every cap hit is counted (no buyer data); the buyer is told only
+  // with ORDER_CAP_NOTICE_ENABLED on — off, the response is unchanged.
+  for (const [agent_id, hit] of cappedAgents) {
+    if (hit.detail) recordOrderCapEvent({ agent_id, cart_id: cartId, reason: hit.reason, cap: hit.cap, reason_detail: hit.detail }, db);
+    else recordOrderCapEvent({ agent_id, cart_id: cartId, reason: hit.reason, cap: hit.cap }, db);
+  }
+  // T11: the admin's internal alerts (never a producer or buyer e-mail), at
+  // most one per producer per Oslo day per kind: at the ceiling, and the
+  // pre-warning once a producer reaches ORDER_CAP_CEILING_PREWARN_AT today.
+  if (capV2On) {
+    const ceiling = orderCapProducerCeilingPerDay();
+    for (const [agent_id, hit] of cappedAgents) {
+      if (hit.detail === "platform_ceiling") claimOrderCapAdminAlert({ agent_id, kind: "ceiling", count: ceiling, cap: ceiling, now: capNow }, db);
+    }
+    if (ORDER_CAP_CEILING_PREWARN_AT < ceiling) {
+      for (const agent_id of new Set(orderSummaries.map((o) => o.agent_id))) {
+        const n = ordersTodayForProducer(db, agent_id, capNow);
+        if (n !== null && n >= ORDER_CAP_CEILING_PREWARN_AT) claimOrderCapAdminAlert({ agent_id, kind: "prewarn", count: n, cap: ceiling, now: capNow }, db);
+      }
+    }
+  }
+  const capNoticeOn = isOrderCapNoticeEnabled();
+  const contact_handoffs: ContactHandoff[] = Array.from(handoffByAgent.entries()).map(([agent_id, v]) => {
+    const h = buildContactHandoff(agent_id, v.name, v.lines);
+    const hit = cappedAgents.get(agent_id);
+    if (!capNoticeOn || !hit) return h;
+    return hit.detail ? { ...h, ...orderCapHandoffFieldsV2(hit.detail, hit.cap) } : { ...h, ...orderCapHandoffFields(hit.reason, hit.cap) };
+  });
 
   const orders = orderSummaries.map((o) => ({ ...o, producer_contact: producerContact(o.agent_id, o.producer_name) }));
   return { success: true, orders, contact_handoffs, terms_url: TERMS_OF_PURCHASE_URL };
@@ -1789,6 +2204,11 @@ export function transitionOrder(
     completionSource?: OrderCompletionSource | null;
     /** Fase A1: set orders.pickup_time in the same write (confirm with a pickup time). */
     pickupTime?: string | null;
+    /**
+     * T12: orders.cancel_detail in the same write ('sold_out' | 'cannot_deliver'; cancelled only).
+     * Tekstpakke C punkt 10: also 'sold_out' on a decline («Avslå – utsolgt»).
+     */
+    cancelDetail?: string | null;
   }
 ): TransitionResult {
   const db = _cartTestDb ?? getDb();
@@ -1855,6 +2275,7 @@ export function transitionOrder(
     ? (opts?.completionSource ?? (actorRole === "admin" ? "admin" : actorRole === "seller" ? "seller" : actorRole === "buyer" ? "buyer" : null))
     : null;
   const pickupTime = toStatus === "confirmed" ? (opts?.pickupTime ?? null) : null;
+  const cancelDetail = toStatus === "cancelled" || toStatus === "declined" ? (opts?.cancelDetail ?? null) : null;
 
   // Concurrency guard: the UPDATE re-asserts the from-status we validated
   // against (id AND status), so two racing transitions (multi-instance, or
@@ -1874,6 +2295,9 @@ export function transitionOrder(
     }
     if (pickupTime) {
       db.prepare("UPDATE orders SET pickup_time = ? WHERE id = ?").run(pickupTime, orderId);
+    }
+    if (cancelDetail) {
+      db.prepare("UPDATE orders SET cancel_detail = ? WHERE id = ?").run(cancelDetail, orderId);
     }
     db.prepare(`
       INSERT INTO order_events (id, order_id, from_status, to_status, actor, actor_role, channel, idempotency_key, created_at)

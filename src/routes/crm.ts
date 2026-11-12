@@ -17,12 +17,42 @@ import {
   countOpenUntriaged,
   isAutoDismissedSender,
 } from "../services/crm-triage";
-import { emailService } from "../services/email-service";
+import { emailService, GARDSSALG_OUTREACH_FROM_NAME } from "../services/email-service";
 import { plainTextToEmailHtml } from "../utils/plain-text-to-html";
 import { getDb } from "../database/init";
 import { isOutreachPaused } from "./admin-outreach-candidates";
 import { unsubscribeHeaderValues } from "../services/avmeld-service";
 import { getOutreachMaxTouchVernConfig, getMaxTouchStatusForEmail } from "../services/outreach-max-touch-vern";
+import {
+  classifyAutomated,
+  classifyForwardCopy,
+  csInboundServerIngestEnabled,
+  forwardCopyMarker,
+  inboundLogAutomatedKind,
+  inboundLogExists,
+  isOurPlatformAddress,
+  readInboundHeaders,
+  recordThreadAlias,
+  resolveThreadAlias,
+  serverThreadForMarker,
+  stripForwardSubject,
+} from "../services/cs-inbound";
+import { computeNeedsReply, markNoReplyNeeded } from "../services/crm-needs-reply";
+import { buildDailyDigest, csDailyDigestEnabled, csWatchdogEnabled, INBOUND_LOG_RETENTION_DAYS } from "../services/cs-watchdog";
+import { csChangeRequestsEnabled } from "../services/cs-change-requests";
+import { contactReceiptEnabled } from "../services/contact-form-cs";
+import {
+  REPLY_KINDS,
+  csAutosendEnabled,
+  approveProposal,
+  createReplyProposal,
+  editProposal,
+  getProposal,
+  listProposals,
+  rejectProposal,
+  type ProposalStatus,
+} from "../services/cs-reply-proposals";
+import { isPilotForwardCopy } from "../services/inbound-email-webhook";
 
 // ─── Admin auth (matches the fleet-wide admin-route pattern, e.g.
 // admin-affiliations.ts / admin-hanen.ts: ADMIN_KEY primary,
@@ -43,6 +73,24 @@ function requireAdminAuth(req: Request, res: Response, next: Function): void {
 
 const router = Router();
 router.use(requireAdminAuth);
+
+// CS på serveren, S1a: a Gmail thread id the CS agent ingested as a copy of a
+// server-registered e-mail is an ALIAS of the server thread
+// (crm_thread_aliases). Every /threads/:id route resolves it, so the agent can
+// keep using the id it knows. Ids without an alias pass through unchanged.
+router.param("id", (req, _res, next, id) => {
+  // Never throw here: a throw would skip the route entirely. req.path is a
+  // getter on real Express requests but may be absent on hand-built ones.
+  try {
+    const p = typeof (req as any).path === "string" ? (req as any).path : String((req as any).url ?? "");
+    if (p.startsWith("/threads/") && typeof id === "string" && id) {
+      req.params.id = resolveThreadAlias(id);
+    }
+  } catch {
+    // leave the id as given
+  }
+  next();
+});
 
 // ?vertical=rfb|dental|experiences — anything else (or omitted) = all verticals.
 function parseVertical(req: Request): CrmVertical | undefined {
@@ -167,6 +215,17 @@ function checkMaxTouchVern(db: ReturnType<typeof getDb>, toEmail: string): Recor
   };
 }
 
+// ─── From display-name override on POST /threads/:id/send ───────────────────
+// A reply (e.g. a thank-you) on a thread that STARTED with a cold outreach mail
+// must carry the same sender name as that outreach, or the producer sees the
+// conversation switch from "Daniel Fredriksen" to "Opplevagent" mid-thread.
+// Allow-listed, exact match: only the name(s) the cold outreach is actually
+// sent as (GARDSSALG_OUTREACH_FROM_NAME is used by both the gårdssalg and the
+// RFB outreach lanes). Anything else — including the empty string — is a 400,
+// so this cannot be used to send as an arbitrary display name. Only the
+// display name changes; the address and reply-to stay the thread platform's.
+const SEND_FROM_DISPLAY_NAME_ALLOW_LIST: readonly string[] = [GARDSSALG_OUTREACH_FROM_NAME];
+
 const sendSchema = z
   .object({
     intent: z.enum(["gmail_draft", "resend_send"]),
@@ -177,8 +236,19 @@ const sendSchema = z
     bodyHtml: z.string().optional(),
     replyToMessageId: z.string().nullable().optional(),
     createdBy: z.enum(["claude", "daniel"]),
+    fromDisplayName: z.string().optional(),
   })
   .superRefine((data, ctx) => {
+    if (data.fromDisplayName !== undefined && !SEND_FROM_DISPLAY_NAME_ALLOW_LIST.includes(data.fromDisplayName)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["fromDisplayName"],
+        message:
+          `fromDisplayName ${JSON.stringify(data.fromDisplayName)} is not allowed — only the outreach sender ` +
+          `name(s) ${JSON.stringify(SEND_FROM_DISPLAY_NAME_ALLOW_LIST)} may be used (exact match; omit the field ` +
+          `to send with the thread platform's own display name).`,
+      });
+    }
     const trimmed = data.subject.trim();
     if (trimmed.length === 0 || REPLY_PREFIX_ONLY_SUBJECT.test(trimmed)) {
       ctx.addIssue({
@@ -344,10 +414,12 @@ router.post("/threads/:id/notes", (req, res) => {
 // ─── POST /admin/crm/threads/:id/send ────────────────────────
 // intent='resend_send' → sends immediately via SMTP
 // intent='gmail_draft' → enqueues outbox; CS-agent picks up and creates Gmail draft
+// fromDisplayName (optional, allow-listed) only affects resend_send: crm_outbox has no
+// From column, so the override is not carried to a gmail_draft (no schema change here).
 router.post("/threads/:id/send", async (req, res) => {
   const parsed = sendSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
-  const { intent, toEmails, ccEmails, subject, bodyText, bodyHtml, replyToMessageId, createdBy } = parsed.data;
+  const { intent, toEmails, ccEmails, subject, bodyText, bodyHtml, replyToMessageId, createdBy, fromDisplayName } = parsed.data;
   const threadId = req.params.id;
 
   // Look up contact for logging
@@ -489,7 +561,9 @@ router.post("/threads/:id/send", async (req, res) => {
         textContent: bodyText,
         htmlContent: bodyHtml ?? plainTextToEmailHtml(bodyText),
         inReplyToMessageId: replyToMessageId ?? undefined,
-        from: crmFromHeader(thread.vertical_id),
+        // fromDisplayName is already allow-listed by sendSchema; undefined
+        // keeps the platform display name. Address + reply-to unchanged.
+        from: crmFromHeader(thread.vertical_id, fromDisplayName),
         replyTo: identity.replyTo,
       });
       if (result.success) {
@@ -508,7 +582,10 @@ router.post("/threads/:id/send", async (req, res) => {
           contactId: thread.contact_id,
           type: "sent",
           actor: createdBy,
-          payload: { outboxId: queued.id, messageId: result.messageId, channel: "resend_smtp", internalMessageId: reserved.messageId },
+          payload: {
+            outboxId: queued.id, messageId: result.messageId, channel: "resend_smtp", internalMessageId: reserved.messageId,
+            ...(fromDisplayName !== undefined ? { fromDisplayName } : {}),
+          },
         });
         return res.json({ success: true, outboxId: queued.id, messageId: result.messageId, internalMessageId: reserved.messageId, channel: "resend_smtp" });
       } else {
@@ -1155,6 +1232,185 @@ router.post("/ingest", (req, res) => {
   const parsed = ingestSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
 
+  // Pilot forward copies («[Pilot] …» from our own address) may hold magic-link
+  // tokens: drop them before any routing, parking or CRM write.
+  const nonPilot = parsed.data.messages.filter((m) => !isPilotForwardCopy(m, parsed.data.subject));
+  if (nonPilot.length < parsed.data.messages.length) {
+    console.log(`[crm/ingest] dropped ${parsed.data.messages.length - nonPilot.length} pilot forward copy(ies) in ${parsed.data.threadId}`);
+    if (nonPilot.length === 0) return res.json({ threadId: null, newMessages: 0, alreadyHandled: true, pilotDropped: true, gmailThreadId: parsed.data.threadId });
+    parsed.data.messages = nonPilot;
+  }
+
+  // ─── CS på serveren, S1a: the Gmail copy of a server-registered e-mail ──
+  // The server already registered the original (cs-inbound). Its forwarded
+  // Gmail copy is an inbound message with subject «[Innkommende] …» whose own,
+  // UNQUOTED text carries "Inbound-ID: inb-…" — or the same copy filed
+  // unwrapped by the CS agent (original sender and subject), recognised by the
+  // forward's header block at the top of its text (forwardCopyMarker). That copy is
+  // NOT filed again: when it is the FIRST message of the Gmail thread, the
+  // Gmail thread id becomes an alias of the server thread and the other
+  // messages (Daniel's Gmail reply, the customer's answer to it) are filed
+  // there. A Gmail thread id that is already an alias goes straight to its
+  // server thread. A quoted marker (a reply), a «Fwd:» of the copy, or a copy
+  // that is not the thread's first message never creates an alias. Routing is
+  // skipped only on this path — the server decided the platform when it
+  // registered the original.
+  {
+    let canonical: { threadId: string; vertical: string; contactId: string } | null = null;
+    let parkedLogId: string | null = null;
+    // Strict: a failed lookup answers 500 (the caller retries) instead of
+    // filing the messages on the Gmail thread id.
+    let aliasTarget: string;
+    try {
+      aliasTarget = resolveThreadAlias(parsed.data.threadId, { strict: true });
+    } catch (err: any) {
+      return res.status(500).json({ error: `alias lookup failed: ${String(err?.message ?? err)}` });
+    }
+    if (aliasTarget !== parsed.data.threadId) {
+      const t = getDb().prepare("SELECT id, vertical_id, contact_id FROM crm_threads WHERE id = ?").get(aliasTarget) as
+        | { id: string; vertical_id: string; contact_id: string }
+        | undefined;
+      if (t) canonical = { threadId: t.id, vertical: t.vertical_id, contactId: t.contact_id };
+    }
+    // The thread's first message: the earliest by sentAt when every message
+    // carries one, otherwise the first in the payload (Gmail's own order).
+    // Only this message can make the Gmail thread id a new alias.
+    const msgs = parsed.data.messages;
+    const times = msgs.map((m) => (m.sentAt ? Date.parse(m.sentAt) : NaN));
+    const first = times.every((t) => Number.isFinite(t)) ? msgs[times.indexOf(Math.min(...times))] : msgs[0];
+    // The Gmail thread subject may stand in for a missing per-message subject
+    // only for a message SENT FROM one of our own platform addresses (the
+    // forward is) — never for a customer's reply, which may carry an old
+    // marker unquoted in its history. Decided per message, so a re-sent
+    // aliased thread recognises its subject-less copy too.
+    const copyIdOf = (m: (typeof parsed.data.messages)[number]): string | null =>
+      forwardCopyMarker(m, isOurPlatformAddress(m.fromEmail) ? parsed.data.subject : undefined);
+    const firstCopyId = copyIdOf(first);
+    if (!canonical) {
+      const logId = firstCopyId;
+      if (logId) {
+        const hit = serverThreadForMarker(logId);
+        if (hit?.kind === "thread") canonical = { threadId: hit.threadId, vertical: hit.vertical, contactId: hit.contactId };
+        else if (hit?.kind === "untriaged") parkedLogId = logId;
+      }
+    }
+    // A copy is kept (filed here) only when its log row says the server did
+    // NOT file that e-mail (flag off, registration error) — then it is the
+    // only record. A copy the server filed (thread or parked) is left out, and
+    // so is one whose log row was purged after 90 days (it was handled then;
+    // filing it now would be a duplicate). The subject fallback in copyIdOf
+    // applies only to a message sent from one of our own addresses, so a
+    // customer's plain-text reply carrying the marker unquoted is still filed.
+    // A missing log row means "purged after the retention window" ONLY when
+    // the copy itself is that old. A recent copy with no row (restored backup,
+    // a log insert that failed) is filed — a duplicate beats a lost e-mail.
+    const purgedLongAgo = (m: (typeof parsed.data.messages)[number]): boolean => {
+      const t = m.sentAt ? Date.parse(m.sentAt) : NaN;
+      return Number.isFinite(t) && Date.now() - t > (INBOUND_LOG_RETENTION_DAYS - 7) * 86400_000;
+    };
+    const serverFiled = (m: (typeof parsed.data.messages)[number]): boolean => {
+      const id = copyIdOf(m);
+      if (id === null) return false;
+      if (!inboundLogExists(id)) return purgedLongAgo(m);
+      return serverThreadForMarker(id) !== null;
+    };
+    if (canonical) {
+      const target = canonical;
+      // Reads first (a DB error here throws before anything is written).
+      const rest = parsed.data.messages.filter((m) => !serverFiled(m));
+      let newMessages = 0;
+      // The alias, the messages and the reopen are one transaction: a DB error
+      // anywhere answers 500 with nothing written, and the retry does it all.
+      try {
+        getDb().transaction(() => {
+          recordThreadAlias(parsed.data.threadId, target.threadId, "cs_gmail_copy");
+          if (rest.length === 0) return;
+          const existed = new Set(
+            (getDb()
+              .prepare(`SELECT id FROM crm_messages WHERE id IN (${rest.map(() => "?").join(",")})`)
+              .all(...rest.map((m) => m.messageId)) as Array<{ id: string }>).map((r) => r.id),
+          );
+          // The contact is the server thread's own — never whatever primaryFromEmail
+          // the caller sent (on a forwarded copy that is often our own address).
+          const contact = getDb().prepare("SELECT email FROM crm_contacts WHERE id = ?").get(target.contactId) as { email: string } | undefined;
+          // A NEW inbound message from a person (e.g. the customer answering
+          // Daniel's Gmail reply directly) reopens a done/archived thread, as on
+          // the server path. Never Daniel's own reply, never an already-filed
+          // message, never an auto-reply or bounce.
+          const newHumanIn = rest.some((m) => {
+            if (existed.has(m.messageId) || m.direction !== "in" || m.rawMetadata?.automated === true) return false;
+            const headers = readInboundHeaders(m.rawMetadata ?? {});
+            const cid = copyIdOf(m);
+            if (!cid) return classifyAutomated({ subject: stripForwardSubject(m.subject ?? null), fromEmail: m.fromEmail, headers }).kind === null;
+            // A kept copy of an e-mail the server logged: its own classification counts.
+            if (inboundLogAutomatedKind(cid)) return false;
+            return classifyForwardCopy({ subject: m.subject ?? parsed.data.subject ?? null, fromEmail: m.fromEmail, headers }).kind === null;
+          });
+          newMessages = crmService.ingestThread(
+            { threadId: target.threadId, messages: rest },
+            contact?.email || parsed.data.primaryFromEmail,
+            target.vertical as CrmVertical,
+          ).newMessages;
+          if (newMessages > 0 && newHumanIn) {
+            const st = getDb().prepare("SELECT status FROM crm_threads WHERE id = ?").get(target.threadId) as { status: string } | undefined;
+            if (st && (st.status === "done" || st.status === "archived")) {
+              crmService.setThreadStatus(target.threadId, "new", "system");
+              crmService.logAction({
+                threadId: target.threadId,
+                contactId: target.contactId,
+                type: "reopened_by_inbound",
+                actor: "system",
+                payload: { previousStatus: st.status, via: "cs_gmail_ingest" },
+              });
+            }
+          }
+        })();
+      } catch (err: any) {
+        return res.status(500).json({ error: String(err?.message ?? "ingest failed") });
+      }
+      return res.json({
+        threadId: canonical.threadId,
+        contactId: canonical.contactId,
+        newMessages,
+        serverRegistered: true,
+        gmailThreadId: parsed.data.threadId,
+      });
+    }
+    // The server parked the original as untriaged. The copy alone adds nothing
+    // (filing it would open a second item for the same e-mail); if the Gmail
+    // thread holds more than the copy, fall through so nothing is lost.
+    if (parkedLogId && parsed.data.messages.every((m) => serverFiled(m))) {
+      // Same contract as a parked ingest (202 + untriaged: true): the caller
+      // must not compose against this thread.
+      const parkedRow = getDb()
+        .prepare("SELECT id, reason FROM crm_untriaged WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1")
+        .get(`inbound-${parkedLogId}`) as { id: string; reason: string } | undefined;
+      return res.status(202).json({
+        untriaged: true,
+        untriagedId: parkedRow?.id ?? null,
+        reason: parkedRow?.reason ?? null,
+        openUntriaged: countOpenUntriaged(),
+        threadId: null,
+        newMessages: 0,
+        serverRegistered: true,
+        parkedUntriaged: true,
+        untriagedThreadId: `inbound-${parkedLogId}`,
+        gmailThreadId: parsed.data.threadId,
+      });
+    }
+    // Falling through to normal routing: copies the server already filed
+    // (parked or on its own thread) are left out, so the e-mail is not filed twice.
+    const unfiled = parsed.data.messages.filter((m) => !serverFiled(m));
+    if (unfiled.length < parsed.data.messages.length) {
+      if (unfiled.length === 0) {
+        // Only copies of e-mails already handled by the server (or purged from
+        // its log after 90 days): nothing new to file.
+        return res.json({ threadId: null, newMessages: 0, serverRegistered: true, alreadyHandled: true, gmailThreadId: parsed.data.threadId });
+      }
+      parsed.data.messages = unfiled;
+    }
+  }
+
   // ─── steg 4: resolve the platform, or park ───────────────────
   //
   // Three cases, and none of them is a guess:
@@ -1313,6 +1569,150 @@ router.post("/ingest", (req, res) => {
   }
 
   res.json(result);
+});
+
+// ─── GET /admin/crm/needs-reply ──────────────────────────────
+// CS på serveren, S1a: every customer thread whose latest (human) inbound is
+// newer than its latest real outbound, with age and level (P1 ≥ 12 h, P0 ≥
+// 24 h), plus open untriaged rows and inbound mail whose forward failed.
+// ?vertical=rfb|dental|experiences filters threads.
+router.get("/needs-reply", (req, res) => {
+  try {
+    const limitRaw = parseInt(String(req.query.limit ?? ""), 10);
+    // server_mode (S6): which server parts are switched on, so the CS routine
+    // moves each duty to the server only when the server actually does it.
+    res.json({
+      ...computeNeedsReply({ vertical: parseVertical(req) ?? null, limit: Number.isFinite(limitRaw) ? limitRaw : undefined }),
+      server_mode: {
+        inbound_ingest: csInboundServerIngestEnabled(),
+        autosend: csAutosendEnabled(),
+        change_requests: csChangeRequestsEnabled(),
+        watchdog: csWatchdogEnabled(),
+        daily_digest: csDailyDigestEnabled(),
+        contact_receipt: contactReceiptEnabled(),
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: String(err?.message ?? "needs-reply failed") });
+  }
+});
+
+// ─── GET /admin/crm/daily-digest/preview ─────────────────────
+// CS på serveren, S1b: the exact digest the 07:00 job would e-mail now —
+// read-only, sends nothing (for checking and for the morning report).
+router.get("/daily-digest/preview", (_req, res) => {
+  try {
+    const d = buildDailyDigest(new Date());
+    res.json({ subject: d.subject, text: d.text, counts: d.counts });
+  } catch (err: any) {
+    res.status(500).json({ error: String(err?.message ?? "digest failed") });
+  }
+});
+
+// ─── POST /admin/crm/threads/:id/no-reply-needed ─────────────
+// Mark «trenger ikke svar» (reason required). A later inbound makes the
+// thread need a reply again.
+router.post("/threads/:id/no-reply-needed", (req, res) => {
+  const schema = z.object({
+    reason: z.string().min(1).max(300),
+    actor: z.enum(["claude", "daniel", "system"]).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
+  const r = markNoReplyNeeded(req.params.id, parsed.data.reason, parsed.data.actor ?? "daniel");
+  if (!r.ok) return res.status(r.error === "thread_not_found" ? 404 : 400).json({ error: r.error });
+  res.json({ success: true });
+});
+
+// ─── CS på serveren, S2: reply proposals + approval queue ────────────
+// dev-request 2026-11-10-cs-paa-serveren, skive S2. The CS routine proposes;
+// the server sends (cs-autosend) or parks the proposal here with the reason.
+// The recipient is never a parameter: it is the sender of the thread's latest
+// human inbound message.
+const proposalSchema = z.object({
+  kind: z.enum(REPLY_KINDS),
+  subject: z.string().max(500).nullable().optional(),
+  bodyText: z.string().min(1).max(50000),
+  bodyHtml: z.string().max(100000).nullable().optional(),
+  changeRequestIds: z.array(z.string().min(1).max(120)).max(20).optional(),
+  evidence: z.unknown().optional(),
+  createdBy: z.enum(["claude", "daniel"]).default("claude"),
+});
+
+router.post("/threads/:id/reply-proposals", (req, res) => {
+  const parsed = proposalSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
+  const r = createReplyProposal({ threadId: req.params.id, ...parsed.data, evidence: parsed.data.evidence });
+  if (!r.ok) return res.status(r.status).json({ error: r.error, detail: r.detail });
+  res.status(201).json({ proposal: r.proposal, superseded: r.superseded });
+});
+
+router.get("/threads/:id/reply-proposals", (req, res) => {
+  res.json({ items: listProposals({ threadId: req.params.id, limit: 100 }) });
+});
+
+const PROPOSAL_STATUSES: ReadonlyArray<ProposalStatus | "open"> = [
+  "open", "pending", "approval_needed", "approved", "sending", "sent", "failed", "rejected", "superseded",
+];
+
+router.get("/reply-proposals", (req, res) => {
+  const status = (req.query.status as string | undefined) ?? "approval_needed";
+  if (!PROPOSAL_STATUSES.includes(status as any)) return res.status(400).json({ error: "invalid status" });
+  const limit = Math.min(parseInt(String(req.query.limit ?? "100"), 10) || 100, 500);
+  res.json({ items: listProposals({ status: status as any, limit }) });
+});
+
+router.get("/reply-proposals/:pid", (req, res) => {
+  const p = getProposal(req.params.pid);
+  if (!p) return res.status(404).json({ error: "proposal not found" });
+  res.json({ proposal: p });
+});
+
+const proposalEditSchema = z.object({
+  subject: z.string().min(1).max(500).optional(),
+  bodyText: z.string().min(1).max(50000).optional(),
+  bodyHtml: z.string().max(100000).nullable().optional(),
+  kind: z.enum(REPLY_KINDS).optional(),
+  changeRequestIds: z.array(z.string().min(1).max(120)).max(20).optional(),
+  note: z.string().max(300).optional(),
+  /** Daniel saw the customer's newer message and still sends this reply. */
+  acknowledgeNewerInbound: z.boolean().optional(),
+});
+
+/** Where an approval came from — the admin page marks its own calls. Audit only (the admin key is shared). */
+function approvalSource(req: Request): "admin-crm" | "api" {
+  return req.get("X-Admin-Client") === "admin-crm" ? "admin-crm" : "api";
+}
+
+router.post("/reply-proposals/:pid/approve", async (req, res) => {
+  const parsed = proposalEditSchema.safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
+  const { note, acknowledgeNewerInbound, ...edits } = parsed.data;
+  try {
+    const r = await approveProposal(req.params.pid, { edits, note: note ?? null, actor: "daniel", source: approvalSource(req), acknowledgeNewerInbound: acknowledgeNewerInbound === true });
+    if (!r.ok) return res.status(r.status).json({ error: r.error });
+    const sent = r.result.outcome === "sent";
+    res.status(sent ? 200 : 409).json({ sent, result: r.result, proposal: r.proposal });
+  } catch (err: any) {
+    res.status(500).json({ error: String(err?.message ?? err) });
+  }
+});
+
+router.post("/reply-proposals/:pid/edit", (req, res) => {
+  const parsed = proposalEditSchema.safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
+  const { note: _note, acknowledgeNewerInbound: _ack, ...edits } = parsed.data;
+  const r = editProposal(req.params.pid, edits, "daniel");
+  if (!r.ok) return res.status(r.status).json({ error: r.error });
+  res.json({ proposal: r.proposal });
+});
+
+router.post("/reply-proposals/:pid/reject", (req, res) => {
+  const parsed = z.object({ reason: z.string().trim().min(1).max(300), actor: z.enum(["daniel", "claude"]).default("daniel") }).safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
+  const r = rejectProposal(req.params.pid, parsed.data.reason, parsed.data.actor);
+  if (!r.ok) return res.status(r.status).json({ error: r.error });
+  res.json({ success: true, proposal: getProposal(req.params.pid) });
 });
 
 // ─── GET /admin/crm/untriaged ────────────────────────────────
@@ -1564,6 +1964,24 @@ router.post("/outbox/:id/result", (req, res) => {
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "invalid body" });
+
+  // CS på serveren, S2.5: a result is only accepted for a row that is still
+  // waiting (pending / processing). An unknown id is 404; a repeat of the SAME
+  // outcome is an idempotent 200; anything else (e.g. "completed" on a row the
+  // server already marked failed) is 409 — it used to overwrite silently.
+  const current = getDb().prepare("SELECT status FROM crm_outbox WHERE id = ?").get(req.params.id) as { status: string } | undefined;
+  if (!current) return res.status(404).json({ error: "outbox item not found" });
+  if (current.status === parsed.data.status) {
+    // Same outcome again. A new resultId (e.g. a re-created Gmail draft) is
+    // recorded rather than silently dropped.
+    if (parsed.data.resultId) {
+      getDb().prepare("UPDATE crm_outbox SET result_id = ? WHERE id = ? AND COALESCE(result_id, '') != ?").run(parsed.data.resultId, req.params.id, parsed.data.resultId);
+    }
+    return res.json({ success: true, unchanged: true });
+  }
+  if (current.status !== "pending" && current.status !== "processing") {
+    return res.status(409).json({ error: "outbox_not_pending", status: current.status });
+  }
 
   crmService.markOutboxResult(req.params.id, parsed.data.status, parsed.data.resultId, parsed.data.error);
 

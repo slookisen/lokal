@@ -16,14 +16,21 @@
 //     counts — per producer when agent_id is given, across all producers
 //     otherwise. Read-only; the producer dashboard can consume this later.
 //
+//   POST /admin/orders/close-stale   { order_ids, reason, older_than, dry_run? }
+//     Closes old pending/confirmed orders as cancelled / legacy_cleanup with
+//     no e-mail, trust event or payment change (dry run by default).
+//
 // Auth follows the same convention as admin-runs.ts / admin-db-table-sizes:
 // X-Admin-Key header checked against ADMIN_KEY (ANALYTICS_ADMIN_KEY fallback).
 
 import { Router, Request, Response } from "express";
+import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
-import { isEligibleForRealOrder } from "../services/cart-service";
+import { isEligibleForRealOrder, orderCapNewPerBuyerPerDay, orderCapNewPerDay, orderCapOpenPerBuyer, orderCapProducerCeilingPerDay } from "../services/cart-service";
 import { orderReminderHours, listAutoCompleteDue } from "../services/order-followups";
+import { isOrderCapNoticeEnabled, isOrderCapV2Enabled, listOrderCapStats, ORDER_CAP_CEILING_PREWARN_AT } from "../services/order-cap-notice";
 import { isOrderAutocompleteEnabled, orderAutocompleteSinceMs } from "../services/order-lifecycle";
+import { countRfbOrdersByStatus, combineRfbStatusCounts, sqliteDaysAgo } from "../services/admin-order-stats";
 
 const router = Router();
 
@@ -182,17 +189,18 @@ router.get("/pilot-status", (req: Request, res: Response) => {
     const passes = optIn.filter((a) => isEligibleForRealOrder(a.id, db));
     const verified = db.prepare("SELECT COUNT(*) AS n FROM agents WHERE is_verified = 1").get() as { n: number };
 
-    const byStatus: Record<string, number> = { pending: 0, confirmed: 0, declined: 0, ready: 0, completed: 0, cancelled: 0 };
-    const rows = db.prepare(
-      "SELECT status, COUNT(*) AS n FROM orders WHERE created_at >= datetime('now', '-30 days') GROUP BY status"
-    ).all() as Array<{ status: string; n: number }>;
-    for (const r of rows) byStatus[r.status] = r.n;
+    // S2 of the admin order-statistics dev-request: the 30-day counts come
+    // from services/admin-order-stats.ts (the module behind
+    // GET /admin/api/ordre/oversikt), so both read the same SQL. Semantics
+    // unchanged: every order (test producers included, real + test added),
+    // created_at >= datetime('now', '-30 days').
     // Fase A1 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-kjoperagent):
     // completed orders split by who closed them; 'auto' = closed by the
     // follow-ups job (henting ikke bekreftet), shown apart from confirmed ones.
-    const completedAuto = (db.prepare(
-      "SELECT COUNT(*) AS n FROM orders WHERE status = 'completed' AND completion_source = 'auto' AND created_at >= datetime('now', '-30 days')"
-    ).get() as { n: number }).n;
+    const split = countRfbOrdersByStatus(db, sqliteDaysAgo(new Date(), 30));
+    const counts30d = combineRfbStatusCounts(split.real, split.test);
+    const byStatus = counts30d.by_status;
+    const completedAuto = counts30d.completed_auto;
 
     // B2: dry run of the automatic close — how many confirmed/ready orders the
     // job WOULD close right now (whether or not the switch is on). Ids only.
@@ -223,6 +231,48 @@ router.get("/pilot-status", (req: Request, res: Response) => {
         order_ids: dueNow.slice(0, 50),
       },
       unanswered: { over_hours: hours, count: unanswered.length, orders: unanswered },
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ success: false, error: msg });
+  }
+});
+
+// ─── GET /cap-stats ─────────────────────────────────────────────────────────
+// B4 (dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier):
+// how many submits the F8 spam caps turned into contact handoffs, per
+// producer per Europe/Oslo day (?days=1..365, default 30), and whether that
+// day's producer digest was sent. Counts and producer names only — no buyer
+// data. Same 401 convention as /pilot-status.
+router.get("/cap-stats", (req: Request, res: Response) => {
+  if (!requirePilotAdmin(req, res)) return;
+  try {
+    const db = _adminOrdersTestDb ?? getDb();
+    const days = Number(req.query.days) || 30;
+    // T11: with ORDER_CAP_V2_ENABLED on, the rows also carry the reason_detail
+    // counts and the internal admin alerts; off, the answer is unchanged.
+    const v2 = isOrderCapV2Enabled();
+    const rows = listOrderCapStats({ days, db, detail: v2 });
+    res.json({
+      success: true,
+      notice_enabled: isOrderCapNoticeEnabled(),
+      caps: v2
+        ? {
+          new_per_producer_per_day: orderCapNewPerDay(), open_pending_per_buyer: orderCapOpenPerBuyer(),
+          v2_enabled: true, new_per_buyer_per_day: orderCapNewPerBuyerPerDay(),
+          producer_ceiling_per_day: orderCapProducerCeilingPerDay(), ceiling_prewarn_at: ORDER_CAP_CEILING_PREWARN_AT,
+        }
+        : { new_per_producer_per_day: orderCapNewPerDay(), open_pending_per_buyer: orderCapOpenPerBuyer() },
+      window_days: Math.min(Math.max(Math.floor(days), 1), 365),
+      total_producer_daily_cap: rows.reduce((n, r) => n + r.producer_daily_cap, 0),
+      total_buyer_open_cap: rows.reduce((n, r) => n + r.buyer_open_cap, 0),
+      ...(v2
+        ? {
+          total_platform_ceiling: rows.reduce((n, r) => n + (r.platform_ceiling ?? 0), 0),
+          total_buyer_daily_cap: rows.reduce((n, r) => n + (r.buyer_daily_cap ?? 0), 0),
+        }
+        : {}),
+      days: rows,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -267,6 +317,112 @@ router.get("/handoff-stats", (req: Request, res: Response) => {
       total_handoffs: producers.reduce((n, p) => n + p.handoffs, 0),
       producers,
     });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ success: false, error: msg });
+  }
+});
+
+// ─── POST /close-stale ──────────────────────────────────────────────────────
+// Owner decision before the order pilot: give old RFB orders that never became
+// a real trade (pending 0-NOK orders, confirmed test orders) a final status so
+// the 30-day contact sweep (services/cart-contact-sweep.ts, terminal status +
+// updated_at older than 30 days) removes the buyer's contact copy later.
+//
+//   body: { order_ids: string[] (1..100), reason: "legacy_cleanup",
+//           older_than: ISO date/time (only orders created before it),
+//           dry_run?: boolean (default true; applies only when === false) }
+//
+// Deliberately a direct SQL update, NOT cart-service.transitionOrder() or
+// services/order-actions.ts: those paths fire the buyer receipt / producer
+// mail and write trust_events. This one sends no e-mail, writes no
+// trust_events row and never touches a payment — an order with a payment row
+// that is not canceled/refunded/failed/expired is skipped (has_open_payment).
+// Final state: status 'cancelled', cancel_reason 'legacy_cleanup',
+// updated_at now, plus one order_events row (actor/role/channel 'admin',
+// idempotency_key = the reason). Logs counts only (no buyer data).
+const CLOSE_STALE_MAX_IDS = 100;
+const CLOSE_STALE_REASONS: ReadonlySet<string> = new Set(["legacy_cleanup"]);
+const CLOSE_STALE_ALLOWED_STATUSES: ReadonlySet<string> = new Set(["pending", "confirmed"]);
+const PAYMENT_FINAL_STATUSES: ReadonlySet<string> = new Set(["canceled", "refunded", "failed", "expired"]);
+
+type CloseStaleResult = { order_id: string; result: "would_close" | "closed" | "skipped"; reason?: string; from_status?: string };
+
+router.post("/close-stale", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const body = req.body || {};
+  const ids = body.order_ids;
+  if (!Array.isArray(ids) || ids.length === 0 || ids.length > CLOSE_STALE_MAX_IDS
+      || !ids.every((x: unknown) => typeof x === "string" && x.trim().length > 0)) {
+    res.status(400).json({ success: false, error: `order_ids must be a non-empty array of up to ${CLOSE_STALE_MAX_IDS} order id strings` });
+    return;
+  }
+  const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+  if (!CLOSE_STALE_REASONS.has(reason)) {
+    res.status(400).json({ success: false, error: "reason must be \"legacy_cleanup\"" });
+    return;
+  }
+  const olderThanMs = typeof body.older_than === "string" ? Date.parse(body.older_than) : NaN;
+  if (!Number.isFinite(olderThanMs)) {
+    res.status(400).json({ success: false, error: "older_than must be an ISO date/time string" });
+    return;
+  }
+  if (body.dry_run !== undefined && typeof body.dry_run !== "boolean") {
+    res.status(400).json({ success: false, error: "dry_run must be a boolean" });
+    return;
+  }
+  const dryRun = body.dry_run !== false;
+  const olderThan = new Date(olderThanMs).toISOString();
+  // created_at is SQLite datetime('now') text ("YYYY-MM-DD HH:MM:SS", UTC).
+  const olderThanSql = olderThan.slice(0, 19).replace("T", " ");
+  const uniqueIds: string[] = Array.from(new Set((ids as string[]).map((x) => x.trim())));
+
+  try {
+    const db = _adminOrdersTestDb ?? getDb();
+    const getOrder = db.prepare("SELECT id, status, cancel_reason, created_at FROM orders WHERE id = ?");
+    let getPayment: any = null;
+    try { getPayment = db.prepare("SELECT status FROM payments WHERE order_id = ?"); } catch { getPayment = null; }
+    const updOrder = db.prepare(
+      "UPDATE orders SET status = 'cancelled', cancel_reason = ?, updated_at = datetime('now') WHERE id = ? AND status = ?"
+    );
+    const insEvent = db.prepare(`
+      INSERT INTO order_events (id, order_id, from_status, to_status, actor, actor_role, channel, idempotency_key, created_at)
+      VALUES (?, ?, ?, 'cancelled', 'admin', 'admin', 'admin', ?, datetime('now'))
+    `);
+
+    const evaluate = (): Array<CloseStaleResult & { _status?: string }> => uniqueIds.map((id) => {
+      const o = getOrder.get(id) as { id: string; status: string; cancel_reason: string | null; created_at: string } | undefined;
+      if (!o) return { order_id: id, result: "skipped", reason: "not_found" };
+      if (o.status === "cancelled" && o.cancel_reason === reason) return { order_id: id, result: "skipped", reason: "already_closed" };
+      if (!CLOSE_STALE_ALLOWED_STATUSES.has(o.status)) return { order_id: id, result: "skipped", reason: `status_not_allowed:${o.status}` };
+      if (!(o.created_at < olderThanSql)) return { order_id: id, result: "skipped", reason: "too_new" };
+      const p = getPayment ? (getPayment.get(id) as { status: string } | undefined) : undefined;
+      if (p && !PAYMENT_FINAL_STATUSES.has(p.status)) return { order_id: id, result: "skipped", reason: "has_open_payment" };
+      return { order_id: id, result: dryRun ? "would_close" : "closed", from_status: o.status };
+    });
+
+    let results: CloseStaleResult[];
+    if (dryRun) {
+      results = evaluate();
+    } else {
+      results = db.transaction(() => {
+        const out = evaluate();
+        for (const r of out) {
+          if (r.result !== "closed") continue;
+          const upd = updOrder.run(reason, r.order_id, r.from_status);
+          if (upd.changes !== 1) throw new Error(`concurrent status change on ${r.order_id}`);
+          insEvent.run(randomUUID(), r.order_id, r.from_status, reason);
+        }
+        return out;
+      })();
+    }
+
+    const doneKey = dryRun ? "would_close" : "closed";
+    const done = results.filter((r) => r.result === doneKey).length;
+    const skipped = results.length - done;
+    console.log(`[admin-orders] close-stale dry_run=${dryRun} reason=${reason} ${doneKey}=${done} skipped=${skipped}`);
+    res.json({ success: true, dry_run: dryRun, reason, older_than: olderThan, counts: { [doneKey]: done, skipped }, results });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     res.status(500).json({ success: false, error: msg });

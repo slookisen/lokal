@@ -103,6 +103,11 @@ export async function runAnalyticsRollupReadBlendTests(opts: { log?: boolean } =
   })();
   const prevFlag = process.env.ANALYTICS_ROLLUP_READ;
   const prevAdminKey = process.env.ADMIN_KEY;
+  // «Mine valg» S2f: this suite checks the tiles' numbers and labels on a fixture
+  // below the public threshold (PUBLIC_STATS_MIN_VIEWS, 20): it runs with the
+  // threshold off (0); mine-valg-s2f.test.ts covers the threshold itself.
+  const prevMinViews = process.env.PUBLIC_STATS_MIN_VIEWS;
+  process.env.PUBLIC_STATS_MIN_VIEWS = "0";
 
   const testDb = new Database(":memory:");
 
@@ -499,6 +504,7 @@ export async function runAnalyticsRollupReadBlendTests(opts: { log?: boolean } =
 
     if (log) console.log(`\nanalytics-rollup-read-blend: ${passed} passed, ${failed} failed`);
   } finally {
+    if (prevMinViews === undefined) delete process.env.PUBLIC_STATS_MIN_VIEWS; else process.env.PUBLIC_STATS_MIN_VIEWS = prevMinViews;
     if (prevFlag === undefined) delete process.env.ANALYTICS_ROLLUP_READ;
     else process.env.ANALYTICS_ROLLUP_READ = prevFlag;
     if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;

@@ -900,17 +900,26 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
       const none = notifySvc.renderOrderNotificationEmailV2(base);
       const v1 = notifySvc.renderOrderNotificationEmailV1({ ...base, buyer_name: "Ignored", buyer_email: "ignored@example.com" });
       assertTrue(!none.textContent.includes("Kunde:"), "render-04: v2 with no buyer fields has no «Kunde» block");
-      // Fase A2: v2 differs from v1 ONLY by the new main button (compact per-order view) and the «Se alle ordrene dine» link.
+      // Fase A2: v2 differs from v1 ONLY by the new main button (compact per-order view) and the «Se alle bestillingene dine» link;
+      // tekstpakke C punkt 1: «Bestilling:» instead of «Ordre-ref:», no «Kjøper-ref» row, the new link note and payment line.
+      const C_PAY = "Kunden betaler deg når varene hentes. Rett fra Bonden tar ikke betalt.";
+      const V1_PAY = "Ingen betaling skjer via plattformen; oppgjør ved henting som vanlig.";
       const a2Text = none.textContent
         .replace("Se og bekreft bestillingen", "Bekreft eller avslå ordren her")
         .replace("/kompakt", "")
-        .replace(/Se alle ordrene dine \(krever innlogging\): \S+\n\n/, "");
+        .replace(/Se alle bestillingene dine \(krever innlogging\): \S+\n\n/, "")
+        .replace("Bestilling: 01234567\n", "Ordre-ref: 01234567\nKjøper-ref: bref_unit_00…\n")
+        .replace(C_PAY, V1_PAY);
       const a2Html = none.htmlContent
         .replace(/ style="display:inline-block;[^"]*"/, "")
         .replace("Se og bekreft bestillingen", "Bekreft eller avslå ordren her")
         .replace("/kompakt", "")
         .replace("</a><br>", "</a> — her bekrefter eller avslår du ordren.<br>")
-        .replace(/<p><a href="[^"]*\/ordrer">Se alle ordrene dine<\/a> \(krever innlogging\)<\/p>\n/, "");
+        .replace(/<p><a href="[^"]*\/ordrer">Se alle bestillingene dine<\/a> \(krever innlogging\)<\/p>\n/, "")
+        .replace(">Bestilling:</td><td>01234567</td></tr>\n",
+          ">Ordre-ref:</td><td>01234567</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Kjøper-ref:</td><td>bref_unit_00…</td></tr>\n")
+        .replace("Lenken er personlig for denne bestillingen. Ikke del den videre.", "Lenken er personlig for denne ordren — ikke del den videre.")
+        .replace(C_PAY, V1_PAY);
       assertEq(a2Text, v1.textContent, "render-05: v2 without buyer fields renders the v1 text body (apart from the Fase A2 links)");
       assertEq(a2Html, v1.htmlContent, "render-06: v2 without buyer fields renders the v1 HTML body (apart from the Fase A2 links)");
       assertTrue(!v1.textContent.includes("Ignored") && !v1.htmlContent.includes("ignored@example.com"), "render-07: v1 ignores buyer fields entirely");

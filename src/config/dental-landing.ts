@@ -190,7 +190,7 @@ export const DENTAL_STATIC_PAGE_DATES: Readonly<Record<string, string>> = {
   "/om": "2026-10-19",
   // Same day as the page's own «Sist oppdatert» (updatedDate in the
   // /personvern handler); a test keeps the two equal.
-  "/personvern": "2026-10-13",
+  "/personvern": "2026-11-11",
   // The /vilkar handler prints this as its own «Sist oppdatert» (F2-S5, A2A
   // dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon). It is the
   // day the terms take effect: the day Daniel approved the text, 2026-10-19

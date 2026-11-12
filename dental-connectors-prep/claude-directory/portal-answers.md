@@ -25,10 +25,10 @@ The client must send `initialize` first. A request without a live session gets 4
 
 | Tool | `title` | `annotations.title` | readOnlyHint | destructiveHint | openWorldHint | What it does (first sentence) |
 |---|---|---|---|---|---|---|
-| `tannlege_search` | Search Norwegian dental clinics | (same) | true | false | true | Find a dentist (tannlege), orthodontist (kjeveortoped) or emergency dentist (akutt tannlege) in Norway by place, county (fylke), specialty, Helfo direct billing or emergency care. |
-| `tannlege_info` | Get full details for a dental clinic | Get dental clinic details | true | false | true | Get the full record of one dental clinic in Norway, a dentist (tannlege) or specialist practice, by organisation number (org_nr) or id. |
+| `tannlege_search` | Search Norwegian dental clinics | (same) | true | false | false | Find a dentist (tannlege), orthodontist (kjeveortoped) or emergency dentist (akutt tannlege) in Norway by place, county (fylke), specialty, Helfo direct billing or emergency care. |
+| `tannlege_info` | Get full details for a dental clinic | Get dental clinic details | true | false | false | Get the full record of one dental clinic in Norway, a dentist (tannlege) or specialist practice, by organisation number (org_nr) or id. |
 | `tannlege_stats` | Norwegian dental market statistics | (same) | true | false | false | Counts of dentist practices (tannlegeklinikker) in Norway: the total, per county (fylke), and how many have Helfo direct billing, belong to a chain, show an emergency claim (akutt) or list a specialist. |
-| `tannlege_akutt` | Find dental clinics for emergency care in Norway | Find dental clinics for emergency care | true | false | true | Find an emergency dentist (akutt tannlege) in Norway: dental clinics that say they take emergency patients, optionally in one county (fylke). |
+| `tannlege_akutt` | Find dental clinics for emergency care in Norway | Find dental clinics for emergency care | true | false | false | Find an emergency dentist (akutt tannlege) in Norway: dental clinics that say they take emergency patients, optionally in one county (fylke). |
 | `tannlege_kjeder` | List Norwegian dental chains | (same) | true | false | false | List dentist chains (tannlegekjeder) in Norway that are registered in the directory, each with its number of clinic locations. |
 
 ### Write (0)

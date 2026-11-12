@@ -12,20 +12,28 @@
  */
 
 import { Router, Request, Response } from "express";
+import { RFB_CHATGPT_APP_URL } from "../config/distribution-channels";
 import { marketplaceRegistry } from "../services/marketplace-registry";
-import { knowledgeService } from "../services/knowledge-service";
+import { knowledgeService, publicOwnerAboutText } from "../services/knowledge-service";
 import { slugify } from "../utils/slug";
-import { failsProducerRoleGate } from "../services/agent-visibility";
+import { failsProducerRoleGate, withoutOwnerHidden } from "../services/agent-visibility";
 import { getConfig } from "../config/vertical-config";
 import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
 import { isJunkDescription } from "../services/description-quality";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { registeredMcpTools } from "../services/mcp-tool-manifest";
 import { companyFooterLineHtml, companyOperatorSentence } from "../services/company-legal";
+import { debioProcessText } from "../services/debio-approval";
 
 /** ONE catalog number for every RFB discovery document (services/honest-count.ts); falls back to the list the handler already holds. */
 function rfbCatalogCount(fallback: number): number {
   return safeHonestCatalogCount("rfb") ?? fallback;
+}
+
+/** The skill ids the served RFB agent card actually lists (the card itself, never a hand-kept copy). */
+function rfbAgentCardSkillIds(): string[] {
+  const card = marketplaceRegistry.getRegistryCard(BASE_URL) as { skills?: Array<{ id?: string }> };
+  return (card.skills || []).map((s) => String(s.id || "")).filter(Boolean);
 }
 
 const router = Router();
@@ -44,7 +52,9 @@ const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 
 router.get("/llms.txt", (_req: Request, res: Response) => {
   try {
-    const agents = marketplaceRegistry.getActiveAgents();
+    // S2c-2 (dev-request 2026-10-22-rfb-mine-valg-eierbrytere): without the
+    // profiles hidden from AI assistants (same array when nobody is).
+    const agents = withoutOwnerHidden(marketplaceRegistry.getActiveAgents(), "ai_assistants");
 
     // Count categories and cities (city counts also drive the per-city
     // produsent-page links and the category x city matrix examples below).
@@ -211,8 +221,9 @@ filtre når en AI-agent vil anbefale en bestemt kvalitetsstandard eller sertifis
   Hanen-medlemmer driver alt fra gårdshotell til serveringssteder med egen råvareproduksjon.
 - **Bondens Marked** — nasjonalt nettverk av bondensmarkeder. Produsentene selger direkte
   til forbruker på faste markedsdager, og må selv produsere det de selger.
-- **Debio** — den offisielle kontrollorganisasjonen for økologisk mat i Norge (Ø-merket).
-  Debio-godkjente produsenter er sertifisert økologiske etter EU/EØS-regelverket.
+- **Debio** — den offisielle kontrollorganisasjonen for økologisk produksjon i Norge. Debio er
+  ikke en paraply her: hvilke produsenter som er Debio-godkjente, hentes fra Debios offentlige
+  register (se «Datakvalitet og verifisering» under), og bare treff vises som «Debio-godkjent».
 - **Norsk Gardsmat** _(planlagt — venter på epost-svar)_ — kvalitetsmerke for tradisjonell norsk gårdsmat. Strengere krav til
   norske råvarer og håndverksmessig produksjon enn økologi-sertifisering alene.
 
@@ -224,12 +235,13 @@ Hver produsentprofil viser hvilke paraplyer de er medlem av. Se også:
 
 Rett fra Bonden er bygget på Agent-to-Agent-protokollen (A2A). En AI-agent kan:
 
-1. Lese **agent-kortet** på \`${BASE_URL}/.well-known/agent-card.json\` for å oppdage
-   tilgjengelige verktøy (${registeredMcpTools("rfb").map((t) => "`" + t.name + "`").join(", ")}).
-2. Bruke **MCP-endepunktet** på \`${BASE_URL}/mcp\` for direkte verktøyskall via JSON-RPC.
+1. Lese **agent-kortet** på \`${BASE_URL}/.well-known/agent-card.json\`. Det beskriver plattformen
+   og lister A2A-ferdighetene (skills) ${rfbAgentCardSkillIds().map((id) => "`" + id + "`").join(", ")}.
+2. Bruke **MCP-endepunktet** på \`${BASE_URL}/mcp\` for direkte verktøyskall via JSON-RPC. MCP-server-kortet
+   lister tilgjengelige verktøy (${registeredMcpTools("rfb").map((t) => "`" + t.name + "`").join(", ")}).
 3. Lese **OpenAPI-spec** på \`${BASE_URL}/openapi.json\` for tradisjonell REST-tilgang.
 
-Eksempel — finn produsenter i Oslo som selger økologisk honning (korrekt MCP JSON-RPC 2.0):
+Eksempel — finn produsenter i Oslo som selger honning (korrekt MCP JSON-RPC 2.0):
 
 \`\`\`
 POST ${BASE_URL}/mcp
@@ -242,7 +254,7 @@ Content-Type: application/json
   "params": {
     "name": "lokal_search",
     "arguments": {
-      "query": "økologisk honning Oslo",
+      "query": "honning Oslo",
       "limit": 10
     }
   }
@@ -261,11 +273,11 @@ Content-Type: application/json
 - [Forsiden](${BASE_URL}/): Søk og utforsk lokale ${getConfig().domain_dictionary.entity_plural_long}
 - [Om oss](${BASE_URL}/om): Historien bak plattformen
 - [Teknologi](${BASE_URL}/teknologi): Hvordan A2A-teknologien fungerer
-- [Personvern](${BASE_URL}/personvern): Ingen cookies, ingen sporing
+- [Personvern](${BASE_URL}/personvern): Bare nødvendige informasjonskapsler (innlogging for selgere, språkvalg), ingen annonse- eller sporingscookies og ingen tredjeparts sporing. Sidebesøk og søk logges i vår egen database med saltet IP-hash.
 
-## ChatGPT Custom GPT
+## ChatGPT-app
 
-ChatGPT Custom GPT — Rett fra Bonden: https://chatgpt.com/g/g-69dbf8593c1c81919050f8da98cd327d-rett-fra-bonden
+ChatGPT app — Rett fra Bonden: ${RFB_CHATGPT_APP_URL}
 
 ## Kontakt
 
@@ -316,8 +328,8 @@ Hvert felt i en produsentprofil (adresse, telefon, produkter, m.m.) lagres med h
 som ga oss verdien og når den sist ble bekreftet — ikke bare ett samlet «verifisert»-flagg for
 hele profilen. Adresse og telefon regnes som bekreftet først når minst to uavhengige kilder
 (Brønnøysundregistrene, Google Places, produsentens egen nettside, offisiell Facebook-side,
-eller produsenten selv) er enige, eller når produsenten har bekreftet direkte. Produsenter som
-oppgir økologisk sertifisering kryssjekkes i tillegg mot Debio (finnoko.debio.no). Rene
+eller produsenten selv) er enige, eller når produsenten har bekreftet direkte.
+${debioProcessText("no")} Rene
 AI-gjetninger (kategoriinferens, sesongantakelser, generiske søketreff) telles aldri som bevis
 alene. Produsenter som ennå ikke er bekreftet forblir synlige i katalogen — de skjules ikke.
 Kryssjekkingen i seg selv gir ikke noe merke på profilen — det eneste merket vi viser fram er
@@ -328,8 +340,8 @@ Every field in a producer profile (address, phone, products, etc.) is stored wit
 supplied that value and when it was last confirmed — not one combined "verified" flag for the
 whole profile. Address and phone are treated as confirmed only once at least two independent
 sources (Brønnøysundregistrene, Google Places, the producer's own website, an official Facebook
-page, or the producer directly) agree. Producers claiming organic certification are additionally
-cross-checked against Debio (finnoko.debio.no). Plain AI guesses (category inference, seasonal
+page, or the producer directly) agree. ${debioProcessText("en")}
+Plain AI guesses (category inference, seasonal
 assumptions, generic search hits) never count as evidence on their own. Producers not yet
 confirmed remain listed — they are not hidden. Cross-checking on its own does not add a badge
 to the profile — the only badge we show is "Verified by owner," set only when the owner
@@ -351,7 +363,8 @@ themselves has confirmed their profile. See ${BASE_URL}/proveniens for the full 
 
 router.get("/llms-full.txt", (_req: Request, res: Response) => {
   try {
-    const agents = marketplaceRegistry.getActiveAgents();
+    // S2c-2: without the profiles hidden from AI assistants (see /llms.txt).
+    const agents = withoutOwnerHidden(marketplaceRegistry.getActiveAgents(), "ai_assistants");
     const lines: string[] = [
       `# ${getConfig().display_name} — Komplett produsentoversikt`,
       ``,
@@ -397,10 +410,12 @@ router.get("/llms-full.txt", (_req: Request, res: Response) => {
           // Redact PII from about text before including in AI-readable dump.
           // Emails and Norwegian phone numbers must not appear in /llms-full.txt.
           // Take extra chars before redaction so truncation doesn't expose a partial address.
-          const aboutRedacted = k.about.substring(0, 300)
+          // Økologi S3c-2: owner-text read step (gate off = k.about unchanged).
+          const aboutRedacted = publicOwnerAboutText(a.id, k.about).substring(0, 300)
             .replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, "[e-post]")
             .replace(/(\+47|0047)?[\s\-.]?\d{3}[\s\-.]?\d{2}[\s\-.]?\d{3}/g, "[tlf]");
-          parts.push(aboutRedacted.substring(0, 120));
+          // (Only empty when the read step dropped every sentence.)
+          if (aboutRedacted) parts.push(aboutRedacted.substring(0, 120));
         }
         lines.push(parts.join(" | "));
       }
@@ -540,7 +555,7 @@ router.get("/.well-known/ai-plugin.json", (_req: Request, res: Response) => {
       "gårdsbutikker og REKO-ringer med kontaktinfo og åpningstider.",
     description_for_model:
       "Plugin for searching and discovering local food producers in Norway. " +
-      `Provides access to ${rfbCatalogCount(stats.totalAgents) || "1,290+"} verified producers ` +
+      `Provides access to ${rfbCatalogCount(stats.totalAgents) || "1,290+"} producers, cross-checked against the Brønnøysund register, ` +
       "including farms, farmers' markets, REKO rings, farm shops, and " +
       "cooperatives. Use the search endpoint for natural-language queries " +
       "(Norwegian or English) and the agents endpoint for structured lookups " +
@@ -577,8 +592,8 @@ function serveApiIndex(_req: Request, res: Response): void {
     version: "v1",
     description:
       "REST API for Norwegian local food producers. " +
-      `${rfbCatalogCount(stats.totalAgents) || "1,290+"} verified agents across farms, markets, ` +
-      "REKO rings, and cooperatives.",
+      `${rfbCatalogCount(stats.totalAgents) || "1,290+"} producers across farms, markets, ` +
+      "REKO rings, and cooperatives, cross-checked against the Brønnøysund register.",
     documentation: `${BASE_URL}/openapi.json`,
     protocols: {
       rest: `${BASE_URL}/api/marketplace`,
@@ -665,7 +680,7 @@ API-base: ${BASE_URL}/api/marketplace
 Name: ${getConfig().display_name}
 Description: Local food marketplace with ${rfbCatalogCount(agents.length)}+ producers in Norway
 Languages: no, en
-Categories: food, marketplace, local-commerce, organic, farm-direct
+Categories: food, marketplace, local-commerce, farm-direct
 Region: NO
 
 # Rate limits

@@ -128,7 +128,7 @@ function homepageMarkdown(): string {
 **${BASE_URL}**
 
 Rett fra Bonden is an agent-to-agent marketplace connecting AI agents with ${count}+
-verified local food producers across Norway. Search fresh produce, organic
+local food producers across Norway, cross-checked against the Brønnøysund register. Search fresh produce,
 vegetables, meat, fish, dairy, honey, bread, and more — all farm-direct.
 
 ## For AI Agents
@@ -144,9 +144,9 @@ vegetables, meat, fish, dairy, honey, bread, and more — all farm-direct.
 
 | Skill | Description |
 |---|---|
-| \`discover-local-food-agents\` | Search ${count}+ verified producers by category, region, certification |
+| \`discover-local-food-agents\` | Search ${count}+ producers by category, region, certification |
 | \`register-food-agent\` | Onboard a new farm, shop, or cooperative |
-| \`search-compare-food\` | Natural-language search; compare prices, delivery, certifications |
+| \`search-compare-food\` | Natural-language search; compare delivery options, certifications |
 | \`agent-conversation\` | Open a buyer–seller negotiation channel |
 
 ## Coverage
@@ -154,7 +154,7 @@ vegetables, meat, fish, dairy, honey, bread, and more — all farm-direct.
 - **Categories:** vegetables, fruit, meat, fish, dairy, eggs, honey, herbs, bread, berries
 - **Regions:** all of Norway — from Oslo and Bergen to rural districts
 - **Languages:** Norwegian (primary), English (fully supported)
-- **Certifications:** organic (Debio), farm-direct, biodynamic
+- **Debio approval:** shown only for producers matched in Debio's public register
 
 ## Authentication
 
@@ -187,13 +187,13 @@ fishermen, producers, and cooperatives across the country.
 ## Why A2A?
 
 Traditional marketplaces optimize for ads and scale. We optimize for
-**match quality**. When an agent asks "find me organic carrots near Oslo
+**match quality**. When an agent asks "find me carrots near Oslo
 with weekend delivery", it gets a ranked, honest answer — not a feed
 sorted by who paid the most for placement.
 
 ## What we cover
 
-- ${producerCount()}+ verified producers across Norway
+- ${producerCount()}+ producers across Norway, cross-checked against the Brønnøysund register
 - Categories: vegetables, fruit, meat, fish, dairy, eggs, honey, bread, berries, herbs
 - Every major region from Agder to Finnmark
 - Full bilingual support: Norwegian (primary) and English

@@ -23,7 +23,8 @@ import { RFB_VERIFIER_SCOPE_SQL } from "../agents/lokal-agent-verifier";
 import {
   crossSourceAgreement,
   tierForSource,
-  isInferenceSource,
+  validEvidenceRecords,
+  type FieldName,
   type ProvenanceRecord,
   type SourceTier,
 } from "../services/cross-source-validator";
@@ -75,28 +76,14 @@ function parseFieldProvenance(
   }
 }
 
-// Mirrors the exact "valid" (evidence, non-inference) record extraction that
-// crossSourceAgreement() does internally (cross-source-validator.ts) — same
-// value-presence filter, same isInferenceSource() deny-list — so
-// blocker_breakdown's source_count distribution can never disagree with the
-// verdict the verifier itself computed for the same field.
+// Delegates to the validator's own evidence extraction (validEvidenceRecords:
+// value-presence, S1b existence-only drop, inference deny-list) so
+// blocker_breakdown's source_count can never disagree with the verifier's verdict.
 function getValidFieldRecords(
   fieldProvenance: Record<string, ProvenanceRecord[] | ProvenanceRecord | unknown>,
-  fieldName: string
+  fieldName: FieldName
 ): ProvenanceRecord[] {
-  const raw = fieldProvenance[fieldName];
-  let records: ProvenanceRecord[];
-  if (!raw) {
-    records = [];
-  } else if (Array.isArray(raw)) {
-    records = raw as ProvenanceRecord[];
-  } else if (typeof raw === "object" && raw !== null) {
-    records = [raw as ProvenanceRecord];
-  } else {
-    records = [];
-  }
-  const allValid = records.filter((r) => r && typeof r.value === "string" && r.value.trim() !== "");
-  return allValid.filter((r) => !isInferenceSource(r.source_type));
+  return validEvidenceRecords(fieldProvenance, fieldName);
 }
 
 // GET /admin/outreach-ready-pool/stats — pool size + breakdowns
@@ -301,6 +288,27 @@ router.get("/stats", (req: Request, res: Response) => {
         next_release_at: string | null;
         oldest_parked_since: string | null;
       };
+
+    // dev-request 2026-10-27-parkering-released-reparked-tellere: released /
+    // reparked event counters (last 24h and the 24h before that). Tolerates a
+    // missing events table (minimal test schemas) -> all zeros.
+    let parkingEvents = { rel: 0, rep: 0, relPrev: 0, repPrev: 0 };
+    try {
+      const pe = db
+        .prepare(
+          `SELECT
+             COALESCE(SUM(CASE WHEN kind = 'released' AND created_at > datetime('now','-24 hours') THEN 1 ELSE 0 END), 0) AS rel,
+             COALESCE(SUM(CASE WHEN kind = 'reparked' AND created_at > datetime('now','-24 hours') THEN 1 ELSE 0 END), 0) AS rep,
+             COALESCE(SUM(CASE WHEN kind = 'released' AND created_at <= datetime('now','-24 hours') AND created_at > datetime('now','-48 hours') THEN 1 ELSE 0 END), 0) AS rel_prev,
+             COALESCE(SUM(CASE WHEN kind = 'reparked' AND created_at <= datetime('now','-24 hours') AND created_at > datetime('now','-48 hours') THEN 1 ELSE 0 END), 0) AS rep_prev
+           FROM pending_verify_parking_events
+          WHERE created_at > datetime('now','-48 hours')`
+        )
+        .get() as { rel: number; rep: number; rel_prev: number; rep_prev: number };
+      parkingEvents = { rel: pe.rel, rep: pe.rep, relPrev: pe.rel_prev, repPrev: pe.rep_prev };
+    } catch {
+      // table absent — keep zeros.
+    }
 
     // dev-request 2026-07-13-enrichment-tynne-profiler-trust-score (item 1,
     // stats slice): progress gauge for the low_quality re-enrichment cohort
@@ -560,6 +568,10 @@ router.get("/stats", (req: Request, res: Response) => {
         },
         next_release_at: pendingVerifyParking?.next_release_at ?? null,
         oldest_parked_since: pendingVerifyParking?.oldest_parked_since ?? null,
+        parking_released_24h: parkingEvents.rel,
+        parking_reparked_24h: parkingEvents.rep,
+        parking_released_prev_24h: parkingEvents.relPrev,
+        parking_reparked_prev_24h: parkingEvents.repPrev,
       },
       low_quality_cohort: {
         total: lowQualityRows.length,

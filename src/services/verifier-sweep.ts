@@ -29,8 +29,8 @@
 //   pickPendingVerifyBatch always selects the oldest un-processed pending_verify
 //   agents first. The sweep is therefore restartable without double-processing.
 
-import { runVerifierBatch, pickPendingVerifyBatch, countPendingVerify } from "../agents/lokal-agent-verifier";
-import type { VerifierResult } from "../agents/lokal-agent-verifier";
+import { runVerifierBatch, pickPendingVerifyBatch, countPendingVerify, resolveBrregLookup } from "../agents/lokal-agent-verifier";
+import type { VerifierResult, BrregFn } from "../agents/lokal-agent-verifier";
 import { getDb } from "../database/init";
 import { recordRun } from "./run-ledger";
 
@@ -49,6 +49,13 @@ export interface SweepJobState {
   /** Total agents processed so far (sum across all chunks) */
   processed: number;
   verified: number;
+  /**
+   * Of `verified`, the agents whose prior verification_status was not
+   * `verified` (same definition as the full run's `agents_newly_verified`).
+   * Tracked separately because the explicit `agentIds` path (pickByIds) can
+   * re-process already-verified rows, so `verified` is not always growth.
+   */
+  newly_verified: number;
   review_required: number;
   data_insufficient: number;
   /** Agents that remain pending_verify after processing (re-verified but still pending) */
@@ -84,6 +91,7 @@ let _sweepJob: SweepJobState = {
   chunkSize: 50,
   processed: 0,
   verified: 0,
+  newly_verified: 0,
   review_required: 0,
   data_insufficient: 0,
   still_pending: 0,
@@ -95,6 +103,40 @@ let _sweepJob: SweepJobState = {
   inference_only_field: 0,
   website_ownership_unverified: 0,
 };
+
+/**
+ * Claims for the bulk sweep's summary run-envelope.
+ *
+ * dev-request 2026-10-26-lokal-agent-verifier-snapshot-drift-toleranse, slice 2:
+ * the values here are this sweep's own per-run tallies. platform-verifier probes
+ * the global kinds `agents_review_required` / `agents_data_insufficient` as
+ * SNAPSHOTS (DB-wide count via claim-counts?mode=snapshot), so posting a per-sweep
+ * tally under those names failed verification on every sweep. Only the full
+ * lokal-agent-verifier run posts the global names (with snapshot values). The
+ * sweep therefore uses its own `bulk_sweep_*` kinds; `agents_verified` stays,
+ * as it is a genuine per-run delta.
+ *
+ * dev-request 2026-11-11-verifier-ny-verifisering-og-delta-ledd (slice A): the
+ * sweep posts under the same agent as the full run, so it also always carries
+ * `agents_newly_verified` (per-run delta, from the separate `newly_verified`
+ * counter — not `verified`, because the explicit-agentIds path can re-process
+ * already-verified rows) and the `verifier_slots_verified_fill` /
+ * `verifier_slots_verified_recheck` custom claims, always 0 here: the sweep
+ * picks via pickPendingVerifyBatch/pickByIds, never pickBatchBiased slots.
+ */
+export function buildSweepRunEnvelopeClaims(
+  job: Pick<SweepJobState, "verified" | "newly_verified" | "review_required" | "data_insufficient" | "processed">,
+): Array<{ type: "db_state_change" | "custom"; value: number; meta: { kind: string } }> {
+  return [
+    { type: "db_state_change", value: job.verified, meta: { kind: "agents_verified" } },
+    { type: "db_state_change", value: job.newly_verified, meta: { kind: "agents_newly_verified" } },
+    { type: "db_state_change", value: job.review_required, meta: { kind: "bulk_sweep_review_required" } },
+    { type: "db_state_change", value: job.data_insufficient, meta: { kind: "bulk_sweep_data_insufficient" } },
+    { type: "db_state_change", value: job.processed, meta: { kind: "bulk_sweep_processed" } },
+    { type: "custom", value: 0, meta: { kind: "verifier_slots_verified_fill" } },
+    { type: "custom", value: 0, meta: { kind: "verifier_slots_verified_recheck" } },
+  ];
+}
 
 export function getSweepJob(): Readonly<SweepJobState> {
   return { ..._sweepJob };
@@ -134,6 +176,7 @@ export interface StartSweepOpts {
     pickFn: (db: any, limit?: number) => any[];
     db?: any;
     agentIds?: string[];
+    brregLookup?: BrregFn | null;
   }) => Promise<{ run_id: string; started_at: string; finished_at: string; results: VerifierResult[] }>;
   /**
    * Injectable sleep — defaults to defaultSleep. Pass `() => Promise.resolve()`
@@ -142,6 +185,15 @@ export interface StartSweepOpts {
   sleep?: (ms: number) => Promise<void>;
   /** Injectable DB — defaults to getDb(). */
   db?: any;
+  /**
+   * dev-request 2026-10-10-rfb-verifier-kapasitet-til-fulle-profiler (point
+   * 4): the Brreg lookup passed to every runVerifierBatch chunk. Defaults to
+   * resolveBrregLookup — the same lookup the scheduled path
+   * (routes/admin-run-verifier.ts) passes — so Brreg name-match as an
+   * identity source and the NACE/Brreg flags work in the sweep too. Tests
+   * inject a mock (no network).
+   */
+  brregLookup?: BrregFn | null;
   /**
    * dev-request 2026-09-16-run-verifier-agentids-og-pool-blocker-explain-
    * gate-felt: optional explicit id filter. When set (non-empty), REPLACES
@@ -187,6 +239,7 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
   const sleepFn = opts.sleep ?? defaultSleep;
   const db = opts.db ?? getDb();
   const agentIds = opts.agentIds && opts.agentIds.length > 0 ? [...opts.agentIds] : undefined;
+  const brregLookup = opts.brregLookup === undefined ? resolveBrregLookup : opts.brregLookup;
 
   const jobId = makeJobId();
   const startedAt = new Date().toISOString();
@@ -201,6 +254,7 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
     chunkSize,
     processed: 0,
     verified: 0,
+    newly_verified: 0,
     review_required: 0,
     data_insufficient: 0,
     still_pending: 0,
@@ -251,11 +305,13 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
                 pickFn: pickPendingVerifyBatch,
                 agentIds: chunkAgentIds,
                 db,
+                brregLookup,
               })
             : await runBatchFn({
                 batchSize: chunkSize,
                 pickFn: pickPendingVerifyBatch,
                 db,
+                brregLookup,
               });
           // Advance the cursor only after a successful chunk, so a failed
           // chunk (caught below) is retried on the same slice of ids rather
@@ -301,6 +357,9 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
         // Aggregate counts into job state.
         _sweepJob.processed += results.length;
         _sweepJob.verified += results.filter((r) => r.new_verification_status === "verified").length;
+        _sweepJob.newly_verified += results.filter(
+          (r) => r.new_verification_status === "verified" && r.prior_verification_status !== "verified",
+        ).length;
         _sweepJob.review_required += results.filter((r) => r.new_verification_status === "review_required").length;
         _sweepJob.data_insufficient += results.filter((r) => r.new_verification_status === "data_insufficient").length;
         // orch-pr-20260614-4: flag-level counters (single source of truth in VerifierResult.flags).
@@ -342,12 +401,7 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
           started_at: startedAt,
           finished_at: _sweepJob.finishedAt,
           status: "completed" as const,
-          claims: [
-            { type: "db_state_change" as const, value: _sweepJob.verified, meta: { kind: "agents_verified" } },
-            { type: "db_state_change" as const, value: _sweepJob.review_required, meta: { kind: "agents_review_required" } },
-            { type: "db_state_change" as const, value: _sweepJob.data_insufficient, meta: { kind: "agents_data_insufficient" } },
-            { type: "db_state_change" as const, value: _sweepJob.processed, meta: { kind: "bulk_sweep_processed" } },
-          ],
+          claims: buildSweepRunEnvelopeClaims(_sweepJob),
           evidence: [],
           notes: `Bulk pending_verify sweep: processed ${_sweepJob.processed} agents, ${_sweepJob.verified} verified, ${_sweepJob.still_pending} still_pending`,
         };

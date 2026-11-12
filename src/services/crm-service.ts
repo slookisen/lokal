@@ -1,3 +1,4 @@
+import { deliveryForMessages } from "./crm-delivery-status";
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
 import { getDb as getVerticalDb } from "../database/db-factory";
@@ -644,13 +645,25 @@ class CrmService {
    */
   private recomputeThreadStats(threadId: string): number {
     const db = getDb();
+    // Latest by TIME, not by string: rows mix 'YYYY-MM-DD HH:MM:SS' (SQLite
+    // datetime('now')) and ISO 'YYYY-MM-DDTHH:MM:SS(.sss)Z' (JS / Resend). On
+    // the same date 'T' sorts after ' ', so a string MAX could pick an OLDER
+    // ISO value over a newer one and make a later message look already
+    // answered (CS på serveren, S1 review). The stored value is unchanged —
+    // only which one wins.
     const stats = db.prepare(`
+      WITH m AS (
+        SELECT
+          CASE WHEN direction = 'in' THEN COALESCE(sent_at, received_at) ELSE sent_at END AS v_msg,
+          CASE WHEN direction = 'in' THEN COALESCE(sent_at, received_at) END AS v_in,
+          CASE WHEN direction = 'out' THEN sent_at END AS v_out
+        FROM crm_messages WHERE thread_id = ?
+      )
       SELECT
-        COUNT(*) AS cnt,
-        MAX(CASE WHEN direction = 'in' THEN COALESCE(sent_at, received_at) ELSE sent_at END) AS last_msg,
-        MAX(CASE WHEN direction = 'in' THEN COALESCE(sent_at, received_at) END) AS last_in,
-        MAX(CASE WHEN direction = 'out' THEN sent_at END) AS last_out
-      FROM crm_messages WHERE thread_id = ?
+        (SELECT COUNT(*) FROM m) AS cnt,
+        (SELECT v_msg FROM m WHERE v_msg IS NOT NULL ORDER BY julianday(v_msg) DESC, v_msg DESC LIMIT 1) AS last_msg,
+        (SELECT v_in FROM m WHERE v_in IS NOT NULL ORDER BY julianday(v_in) DESC, v_in DESC LIMIT 1) AS last_in,
+        (SELECT v_out FROM m WHERE v_out IS NOT NULL ORDER BY julianday(v_out) DESC, v_out DESC LIMIT 1) AS last_out
     `).get(threadId) as any;
 
     db.prepare(`
@@ -1208,7 +1221,10 @@ class CrmService {
       ORDER BY created_at DESC
     `).all(threadId);
 
-    return { thread, messages, actions };
+    // S3 (CS på serveren): Resend's verdict per outbound message, keyed by message id.
+    const deliveries = deliveryForMessages((messages as Array<{ id: string; direction: string }>).filter((m) => m.direction === "out").map((m) => m.id));
+
+    return { thread, messages, actions, deliveries };
   }
 
   /**

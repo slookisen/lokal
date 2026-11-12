@@ -981,7 +981,7 @@ googleRating, google_rating, googleReviewCount, google_review_count,
 tripadvisorRating, tripadvisor_rating, views_count, ai_conversations_count
 ```
 
-Every write goes through `agent_knowledge_audit` with `(agent_id, field, old_value, new_value, changed_by, changed_at)`. Daniel's admin reader can replay the full edit history of any producer; the owner's `my-audit` returns only their own rows.
+Every write goes through `agent_knowledge_audit` with `(agent_id, field, old_value, new_value, changed_by, changed_at)`. Daniel's admin reader can replay the full edit history of any producer; the owner's `my-audit` returns only their own rows, as the portal's «Endringslogg» shows them (`src/routes/owner-audit-log.ts`, dev-request 2026-11-02-rfb-endringslogg-lettlest): only fields in `OWNER_AUDIT_FIELDS` (fail closed), Norwegian names and values, «Du» / «Rett fra Bonden» / «Automatisk fra nettsiden din», no notes, no technical rows; e-mail fields without values and addresses inside other values (the forms listed at `stripEmailAddresses`) replaced by «…».
 
 **Magic-link UX (PR-8, B2 spec):**
 The email body explicitly names the agent (so a producer who manages two farms knows which one this link unlocks) and states the 7-day expiry up front:
@@ -3150,6 +3150,8 @@ Tool description (verbatim — these strings shape LLM tool-selection, see C.29 
 
 > Resolve a Norwegian place name (city, town, region, fylke, or kommune) to lat/lng coordinates. Use this when you need explicit coordinates for `lokal_discover` (e.g., 'show me organic farms within 10 km of Florø'). Returns coordinates + suggested search radius. Covers all of Norway via Kartverket Stedsnavn API fallback. **Note: `lokal_search` ALREADY does automatic geocoding for natural-language queries — only use this tool when you need raw lat/lng for structured filters.**
 
+2026-11-06 (A2A dev-request 2026-10-16-mcp-beskrivelser-intensjonsord-og-lint, S6): the HTTP-MCP text in `src/routes/mcp.ts` now reads 'show me farms within 10 km of Florø' (no organic example, Debio text rules); the npm stdio server `mcp-server/` is unchanged.
+
 The "already does automatic geocoding" note is deliberate: without it, models call `lokal_geocode` then `lokal_discover(lat, lng)` for queries that `lokal_search` would have resolved in one hop.
 
 **Verify:**
@@ -3565,6 +3567,8 @@ curl -X POST https://opplevagent.no/mcp \
 **Defensive DB handling:** if the experiences DB isn't open, every tool returns a graceful `"Ingen data tilgjengelig / No experience data available at this time."` text result — never throws. Mirrors `safeCategories()` in `experiences-seo.ts`.
 
 **Discoverability:** `experiences-seo.ts` `llms.txt` gains an MCP section (endpoint URL, 3 tool names, example `tools/call` cURL). The landing's "For AI-agenter" endpoint list and footer "For agenter" column both gain a `/mcp` link.
+
+2026-11-06 (A2A dev-request 2026-10-16-mcp-beskrivelser-intensjonsord-og-lint, S7 + S9): the server now has five tools (adds `discover_gardssalg` and `book_gardssalg`). Every tool's `title` and the first sentence of its `description` open with the user's intent within Daniel's positioning decision 1=B (gårdssalg, smaking og drikke): `discover_experiences` says it searches Opplevagent's published catalogue of experiences in Norway, including food and drink tastings and producer visits; `discover_gardssalg` and `book_gardssalg` say they plan or request a visit or tasting at a Norwegian drink producer and do not sell or order products. The intent words live in `src/config/mcp-intent-terms.ts` (with `BROAD_TERMS_NOT_CHOSEN`, the alternative-A words no first sentence may use), checked by `src/routes/opplevagent-tool-metadata.test.ts`. Names, annotations, `inputSchema`, `_meta` and `OPPLEVAGENT_MCP_INSTRUCTIONS` are unchanged; `tests/fixtures/opplevagent-mcp-contract-freeze.json` was updated for the five tools only.
 ---
 
 <a id="phase-24"></a>

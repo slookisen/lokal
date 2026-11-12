@@ -303,6 +303,27 @@ export function aiAgentEntryOf(userAgent: string): AiAgentEntry | null {
   return AI_AGENT_REGISTRY.find((e) => ua.includes(e.token)) ?? null;
 }
 
+/**
+ * ai-sok B5 (dev-request 2026-09-24-ai-sok-bli-svaret-rfb): SQL twin of
+ * aiAgentEntryOf for the rollup. A CASE over `column` that yields the FIRST
+ * registry token occurring in it (registry order, case-sensitive like
+ * String.includes, via instr()), else NULL. Run against session_id
+ * (`${ipHash}:${UA}`); the hash part is hex and cannot contain a token.
+ * Tokens are fixed literals from AI_AGENT_REGISTRY; quotes are escaped anyway.
+ */
+export function aiAgentTokenCaseSql(column: string): string {
+  const whens = AI_AGENT_REGISTRY.map((e) => {
+    const lit = "'" + e.token.replace(/'/g, "''") + "'";
+    return `WHEN instr(${column}, ${lit}) > 0 THEN ${lit}`;
+  }).join(" ");
+  return `CASE ${whens} ELSE NULL END`;
+}
+
+/** Registry row for a stored token (rollup rows store the token only). */
+export function aiAgentEntryByToken(token: string): AiAgentEntry | null {
+  return AI_AGENT_REGISTRY.find((e) => e.token === token) ?? null;
+}
+
 /** aiAgents: page views per vendor and purpose. Sums to aiVendors (google/perplexity/other fold into `other` there). */
 export interface AiAgentCounts { user: number; search: number; training: number }
 export type AiAgents = Record<AiAgentVendor, AiAgentCounts>;

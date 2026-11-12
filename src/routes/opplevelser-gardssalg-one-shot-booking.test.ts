@@ -416,7 +416,7 @@ export function runOpplevelserGardssalgOneShotBookingTests(opts: { log?: boolean
       const m5 = await callTool("book_gardssalg", { provider_query: "Egge gård", slot_at: ahead.slot, requested_weekday: actualName, ...guest });
       assertEq(m5.parsed.reason, "not_live", "m5: resolved-by-name producer with booking_live=0 -> not_live (the existing gate, unchanged)");
       assertEq(m5.parsed.provider?.navn, "Egge Gård", "m5b: …and the response names WHICH producer");
-      assertEq(m5.parsed.provider?.profile_url, "https://opplevagent.no/kategori/gardssalg/produsent/egge-gaard", "m5c: …with the profile link for the guest");
+      assertEq(m5.parsed.provider?.profile_url, "https://opplevagent.no/kategori/gardssalg/produsent/egge-gaard?utm_source=node_sdk&utm_medium=mcp&utm_campaign=ai_search", "m5c: …with the profile link for the guest (AI-tagged over MCP, klikk-fra-ai-svar S3)");
       assertEq(m5.parsed.provider?.resolved_from_query, "Egge gård", "m5d: …and records that it was resolved from the query");
       assertTrue(/Egge Gård/.test(m5.parsed.message) && /profilsiden/.test(m5.parsed.message), "m5e: message carries the name and the profile hint");
       assertEq(countRows(), 0, "m5f: no row created");

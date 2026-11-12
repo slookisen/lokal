@@ -575,7 +575,7 @@ function initSchema(db: Database.Database): void {
       claimant_phone TEXT,
       verification_method TEXT DEFAULT 'email',  -- 'email' | 'phone' | 'manual'
       verification_code TEXT,                     -- 6-digit code sent to verify
-      status TEXT DEFAULT 'pending' CHECK(status IN ('pending','code_sent','verified','rejected','expired','pending_review','superseded')),
+      status TEXT DEFAULT 'pending' CHECK(status IN ('pending','code_sent','verified','rejected','expired','pending_review','superseded','revoked')),
       claim_token TEXT,                           -- Token for managing agent after claim
       claim_token_expires_at TEXT,                -- Token expires 30 days after issue
       notes TEXT,                                 -- Admin notes
@@ -585,8 +585,17 @@ function initSchema(db: Database.Database): void {
       expires_at TEXT,                            -- Code expiry: 24 h (rows from before 2026-10-17: 7 days)
       code_sent_to TEXT,                          -- The farm's own address the code went to (NULL: no code sent)
       failed_attempts INTEGER DEFAULT 0,          -- Wrong codes entered; the 5th expires the claim
-      review_reason TEXT,                         -- Admin queue: 'no_known_email' | 'listed_email_wrong' | 'has_owner'
-      claimant_email_typed TEXT                   -- Audit: the address the claimant typed, kept when claimant_email becomes the owner's address
+      review_reason TEXT,                         -- Admin queue: 'no_known_email' | 'listed_email_wrong' | 'has_owner' | 'shared_address'
+      claimant_email_typed TEXT,                  -- Audit: the address the claimant typed, kept when claimant_email becomes the owner's address
+      recommendation TEXT,                        -- Claim domain rule (2026-10-27): 'domain_match_independent' | 'domain_code_sent' | 'free_mail_needs_extra' | 'has_owner' | 'needs_review' | 'shared_address' (2026-10-29: the code's address is the known e-mail of >1 RFB profile)
+      claim_assessment TEXT,                      -- Owner-claim auto-assessment (2026-10-30, slice A, record-only): JSON from claim-assessment.ts; NULL = not assessed
+      claim_assessment_at TEXT,                   -- When claim_assessment was written (ISO-8601)
+      pre_grant_state TEXT,                       -- Owner-claim revoke (2026-10-30, slice C1): JSON snapshot of agents.is_verified/claimed_at/claimed_via + agent_knowledge.data_source taken just before grantClaimOwnership; NULL = granted before C1
+      revoked_at TEXT,                            -- When an admin revoked this verified claim (POST /admin/agents/claim-revoke), ISO-8601
+      revoke_note TEXT,                           -- The admin's note on the revoke
+      request_more_at TEXT,                       -- Eierkrav B3a: when «Be om mer bekreftelse» was last sent to the claimant (ISO-8601; at most once per 24 h)
+      request_more_via TEXT,                      -- Eierkrav B3a: 'action_link' | 'admin'
+      request_more_note TEXT                      -- Eierkrav B3a: the admin's optional note (never mailed)
     );
 
     -- ════════════════════════════════════════════════════════════
@@ -981,7 +990,8 @@ function initSchema(db: Database.Database): void {
     -- bounces») ───────────────────────────────────────────────────
     -- Idempotency ledger for POST /webhooks/resend (routes/resend-webhook.ts).
     -- One row per svix-id Resend delivered for an event we ACT on
-    -- (email.bounced / email.complained); unrelated event types write nothing.
+    -- (email.bounced / email.complained / email.delivered); unrelated event
+    -- types write nothing.
     -- Svix retries the same svix-id until it gets a 2xx, so a PRIMARY KEY on
     -- it turns a replay into a no-op. Holds the recipient address and the
     -- outcome only — never the payload (subject/body/from are not stored).
@@ -992,6 +1002,28 @@ function initSchema(db: Database.Database): void {
       outcome TEXT NOT NULL,
       received_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    -- ─── email_delivery_events (eierkrav skive C2, 2026-11-06) ─────
+    -- One row per Resend email.delivered event (routes/resend-webhook.ts →
+    -- services/resend-webhook.ts), so a verifier can tell "delivered to the
+    -- receiving MTA" from "only handed to Resend". svix_id UNIQUE = the same
+    -- idempotency key as resend_webhook_events (a Svix retry is a no-op).
+    -- crm_message_id: the OUTBOUND crm_messages row this delivery was
+    -- attributed to by recipient + time (we send through Resend's SMTP relay
+    -- and never learn Resend's email_id at send time), NULL when none fits.
+    -- Plain TEXT, no FK: purely additive, never constrains crm_messages.
+    -- Recipient address only — never subject/body/headers.
+    CREATE TABLE IF NOT EXISTS email_delivery_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      svix_id TEXT NOT NULL UNIQUE,
+      resend_email_id TEXT,
+      email TEXT NOT NULL,
+      delivered_at TEXT NOT NULL,
+      crm_message_id TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_email_delivery_events_email ON email_delivery_events(email, delivered_at);
+    CREATE INDEX IF NOT EXISTS idx_email_delivery_events_crm_message ON email_delivery_events(crm_message_id);
 
 
     -- Analytics indexes (for fast aggregation)
@@ -1526,6 +1558,37 @@ function initSchema(db: Database.Database): void {
       // Column already exists — expected after first migration
     }
   }
+  // dev-request 2026-10-27-rfb-eierkrav-domeneregel-og-cs-sjekkliste: the rule
+  // a claim matched (knowledge-service.ts assessClaimDomain). Additive and
+  // idempotent; existing rows keep NULL.
+  try {
+    db.exec(`ALTER TABLE agent_claims ADD COLUMN recommendation TEXT`);
+  } catch {
+    // Column already exists — expected after first migration
+  }
+  // dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post (K1): «Send
+  // koden på nytt» — how often the same code was sent again, and when (the
+  // platform cap counts resends). Additive and idempotent; existing rows
+  // start at 0/NULL. A rollback leaves them in place.
+  for (const col of ["resend_count INTEGER DEFAULT 0", "resent_at TEXT"]) {
+    try {
+      db.exec(`ALTER TABLE agent_claims ADD COLUMN ${col}`);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
+  // dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk,
+  // slice A (record-only): the stored owner-claim auto-assessment (JSON,
+  // services/claim-assessment.ts) and when it was written. Written only with
+  // CLAIM_AUTO_ASSESSMENT_ENABLED === "true". Additive and idempotent;
+  // existing rows keep NULL. A rollback leaves them in place.
+  for (const col of ["claim_assessment TEXT", "claim_assessment_at TEXT"]) {
+    try {
+      db.exec(`ALTER TABLE agent_claims ADD COLUMN ${col}`);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
   // SQLite cannot ALTER a CHECK, so widening the status list rebuilds the
   // table (same pattern as crm_threads above). The new table is the stored
   // CREATE text with only the CHECK clause swapped, so every column — also
@@ -1569,6 +1632,68 @@ function initSchema(db: Database.Database): void {
     }
   } catch (e) {
     console.warn("[init][agent-claims-11a] status-CHECK widening skipped:", e instanceof Error ? e.message : String(e));
+  }
+
+  // dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk,
+  // slice C1 (admin claim-revoke): the pre-grant snapshot that a revoke
+  // restores the profile from, and the revoke stamp. Additive and idempotent;
+  // existing rows keep NULL (a revoke of such a claim restores only partly,
+  // knowledge-service.ts revokeClaimOwnership). A rollback leaves them in place.
+  for (const col of ["pre_grant_state TEXT", "revoked_at TEXT", "revoke_note TEXT"]) {
+    try {
+      db.exec(`ALTER TABLE agent_claims ADD COLUMN ${col}`);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
+  // Eierkrav B3a («Be om mer bekreftelse», services/claim-request-more.ts):
+  // when the request was last sent, by which path, and the admin's note.
+  // Additive and idempotent; existing rows keep NULL. A rollback leaves them
+  // in place.
+  for (const col of ["request_more_at TEXT", "request_more_via TEXT", "request_more_note TEXT"]) {
+    try {
+      db.exec(`ALTER TABLE agent_claims ADD COLUMN ${col}`);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
+  // Slice C1: the status 'revoked'. Same rebuild as the 11=A widening above
+  // (stored CREATE text with only the CHECK swapped, rows copied unchanged,
+  // indexes recreated). Runs after it, so it only ever sees the 11=A CHECK. If
+  // the stored text does not hold that exact CHECK, nothing is rebuilt and a
+  // revoke fails at write time (its transaction rolls back), never silently.
+  try {
+    const OLD_CLAIM_STATUS_CHECK = "CHECK(status IN ('pending','code_sent','verified','rejected','expired','pending_review','superseded'))";
+    const NEW_CLAIM_STATUS_CHECK = "CHECK(status IN ('pending','code_sent','verified','rejected','expired','pending_review','superseded','revoked'))";
+    const claimsRow = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_claims'"
+    ).get() as { sql: string } | undefined;
+    if (claimsRow && !/'revoked'/.test(claimsRow.sql)) {
+      const createNew = claimsRow.sql.replace(/^CREATE TABLE\s+"?agent_claims"?/, "CREATE TABLE agent_claims__revoke_new");
+      if (createNew === claimsRow.sql || !createNew.includes(OLD_CLAIM_STATUS_CHECK)) {
+        console.warn("[init][agent-claims-revoke] status CHECK not in the expected form — rebuild skipped");
+      } else {
+        const indexSql = (db.prepare(
+          "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='agent_claims' AND sql IS NOT NULL"
+        ).all() as Array<{ sql: string }>).map((r) => r.sql);
+        const fkWasOn = db.pragma("foreign_keys", { simple: true }) === 1;
+        db.pragma("foreign_keys = OFF");
+        try {
+          db.transaction(() => {
+            db.exec(createNew.replace(OLD_CLAIM_STATUS_CHECK, NEW_CLAIM_STATUS_CHECK));
+            db.exec(`INSERT INTO agent_claims__revoke_new SELECT * FROM agent_claims`);
+            db.exec(`DROP TABLE agent_claims`);
+            db.exec(`ALTER TABLE agent_claims__revoke_new RENAME TO agent_claims`);
+            for (const sql of indexSql) db.exec(sql);
+          })();
+          console.log("[init][agent-claims-revoke] agent_claims.status CHECK widened to include 'revoked'");
+        } finally {
+          if (fkWasOn) db.pragma("foreign_keys = ON");
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("[init][agent-claims-revoke] status-CHECK widening skipped:", e instanceof Error ? e.message : String(e));
   }
 
   // ─── Tier 2: Add seasonality, delivery_radius, min_order_value ──
@@ -1911,6 +2036,24 @@ function initSchema(db: Database.Database): void {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_crm_contacts_provider ON crm_contacts(provider_id)`);
   } catch {
     // Index already exists
+  }
+
+  // ─── crm_contacts.retention_last_{inbound,outbound}_at (slettefrist slice A) ───
+  // dev-request 2026-10-12-slettefrist-korrespondanse-og-oversettelser, slice A
+  // (services/privacy-retention.ts). The nightly 24-month retention job deletes
+  // a contact's old threads/messages but KEEPS the crm_contacts row (status,
+  // agent_id, provider_id are suppression memory). Before deleting the
+  // messages it records here the latest inbound time (COALESCE(sent_at,
+  // received_at)) and the latest outbound sent_at of the deleted messages, so
+  // every lifetime «has ever replied» / «was ever contacted» reader gives the
+  // same answer after the cleanup as before (AC1). NULL = nothing deleted.
+  // Additive, idempotent ALTERs; no index (only read joined via the contact).
+  for (const col of ["retention_last_inbound_at", "retention_last_outbound_at"]) {
+    try {
+      db.exec(`ALTER TABLE crm_contacts ADD COLUMN ${col} TEXT`);
+    } catch {
+      // Column already exists — expected after first migration
+    }
   }
 
   // Healing sweep, BEFORE the triggers exist: classifyEmail() used to match every
@@ -2380,6 +2523,49 @@ function initSchema(db: Database.Database): void {
     } catch {
       // Column already exists — expected after first migration
     }
+  }
+
+  // ─── dev-request 2026-10-27-parkering-released-reparked-tellere — append-only
+  // event log for pending_verify parking releases/re-parks, read by
+  // GET /admin/outreach-ready-pool/stats (24h / prev-24h counters). Written
+  // only by applyVerifierOutcome and the pending-verify-unpark lever; purely
+  // observational, no gate reads it.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS pending_verify_parking_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('released','reparked')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_pv_parking_events_kind_created
+        ON pending_verify_parking_events(kind, created_at);
+    `);
+  } catch {
+    // best-effort
+  }
+
+  // ─── dev-request 2026-11-11-verifier-ny-verifisering-og-delta-ledd (slice B)
+  // — append-only log of "this verifier run set this agent to verified". One
+  // row per verified outcome, written only by applyVerifierOutcome
+  // (lokal-agent-verifier.ts), keyed on the run's runStartedAt. Read by
+  // GET /admin/verifier/claim-counts?kind=agents_verified (delta mode) so the
+  // per-run agents_verified claim is probed against what the run actually
+  // did, not against agent_knowledge's CURRENT status/last_verified_at, which
+  // later runs overwrite. Purely observational, no gate reads it.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS verifier_verified_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        run_started_at TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_verifier_verified_events_run
+        ON verifier_verified_events(run_started_at);
+    `);
+  } catch {
+    // best-effort
   }
 
   // ─── dev-request 2026-09-01-rfb-pending-verify-unpark-lever (Daniel Alternativ B,
@@ -2948,7 +3134,7 @@ function initSchema(db: Database.Database): void {
            a dental/experiences row that sits in agents (this is the RFB
            pool). catalog_hidden is added further down this function; SQLite
            resolves VIEW columns at query time, so the order is harmless. */
-        AND ${publicListableSql("a")}
+        AND ${publicListableSql("a", { ownerChoices: false })}
         AND k.verification_status = 'verified'
         AND k.enrichment_status IN ('rich','partial')
         AND ${POOL_CONTENT_THRESHOLD_SQL}
@@ -3063,6 +3249,229 @@ function initSchema(db: Database.Database): void {
     `);
   } catch (err) {
     console.error("Migration inbound_email_seen failed:", err);
+  }
+
+  // ─── CS på serveren, S1a (dev-request 2026-11-10-cs-paa-serveren) ──────
+  // inbound_email_log: one row per inbound e-mail the Resend webhook accepted
+  // (keyed by our own id; email_id UNIQUE when Resend gave one). Records the
+  // forward-to-Gmail outcome (so a failed forward is visible and retryable,
+  // not logged as success) and the server-side CRM registration outcome.
+  // forward_payload holds the forward mail only while it is NOT yet delivered
+  // (cleared on success) so a retry job can resend it.
+  //
+  // crm_thread_aliases: a Gmail thread id the CS agent ingests whose message
+  // carries our "Inbound-ID:" marker is an alias of the thread the server
+  // already registered; /threads/:id routes and /ingest resolve aliases.
+  //
+  // crm_thread_flags: «trenger ikke svar» per thread. Kept OUT of crm_threads
+  // on purpose: older migrations rebuild crm_threads with an explicit column
+  // list, which would silently drop a column added here.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS inbound_email_log (
+        id TEXT PRIMARY KEY,
+        email_id TEXT UNIQUE,
+        received_at TEXT NOT NULL DEFAULT (datetime('now')),
+        from_email TEXT,
+        to_emails TEXT,
+        cc_emails TEXT,
+        subject TEXT,
+        rfc_message_id TEXT,
+        in_reply_to TEXT,
+        vertical TEXT,
+        automated_kind TEXT,
+        body_fetch TEXT,
+        crm_status TEXT NOT NULL DEFAULT 'pending',
+        crm_thread_id TEXT,
+        crm_linked_by TEXT,
+        crm_error TEXT,
+        forward_status TEXT NOT NULL DEFAULT 'pending',
+        forward_attempts INTEGER NOT NULL DEFAULT 0,
+        forward_error TEXT,
+        forwarded_at TEXT,
+        forward_payload TEXT,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_inbound_email_log_received ON inbound_email_log(received_at);
+      CREATE INDEX IF NOT EXISTS idx_inbound_email_log_forward ON inbound_email_log(forward_status);
+      CREATE INDEX IF NOT EXISTS idx_inbound_email_log_rfc ON inbound_email_log(rfc_message_id);
+
+      CREATE TABLE IF NOT EXISTS crm_thread_aliases (
+        alias_id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        source TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS crm_thread_flags (
+        thread_id TEXT PRIMARY KEY,
+        no_reply_reason TEXT,
+        no_reply_at TEXT,
+        no_reply_by TEXT,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      -- S1b: one row per alerted item (thread:<id>, untriaged:<id>,
+      -- forward:<logId>, register:<logId>) so the CS watchdog alerts each
+      -- problem at most once per 24 h.
+      CREATE TABLE IF NOT EXISTS cs_alert_log (
+        alert_key TEXT PRIMARY KEY,
+        first_alerted_at TEXT NOT NULL,
+        last_alerted_at TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 1
+      );
+    `);
+  } catch (err) {
+    console.error("Migration cs-inbound (S1a) failed:", err);
+  }
+  // Expression index for In-Reply-To lookups against the SMTP Message-ID we
+  // stored on every send (crm_outbox.result_id, "<id@host>"). Separate try: a
+  // missing crm_outbox (fresh test DBs that skip the CRM block) must not undo
+  // the tables above.
+  try {
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_crm_outbox_result_id_norm ON crm_outbox(LOWER(REPLACE(REPLACE(result_id,'<',''),'>','')))",
+    );
+  } catch (err) {
+    console.error("Migration idx_crm_outbox_result_id_norm failed:", err);
+  }
+
+  // ─── CS på serveren, S2: reply proposals (dev-request 2026-11-10-cs-paa-serveren) ──
+  // The CS routine writes proposals; the server sends them (or parks them in
+  // the approval queue with the reason). No CHECK constraints on purpose: the
+  // status/kind vocabulary is validated in code (cs-reply-proposals.ts), so a
+  // new value never needs a table rebuild.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS cs_reply_proposals (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        vertical TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        to_email TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        body_text TEXT NOT NULL,
+        body_html TEXT,
+        in_reply_to TEXT,
+        answers_message_id TEXT,
+        change_request_ids TEXT NOT NULL DEFAULT '[]',
+        evidence TEXT,
+        created_by TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        block_reason TEXT,
+        block_detail TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        lease_until TEXT,
+        next_attempt_at TEXT,
+        outbox_id TEXT,
+        crm_message_id TEXT,
+        smtp_message_id TEXT,
+        last_error TEXT,
+        decided_by TEXT,
+        decided_at TEXT,
+        decision_note TEXT,
+        sent_at TEXT,
+        sent_mode TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_cs_reply_proposals_status ON cs_reply_proposals(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_cs_reply_proposals_thread ON cs_reply_proposals(thread_id);
+      CREATE INDEX IF NOT EXISTS idx_cs_reply_proposals_to_sent ON cs_reply_proposals(to_email, sent_at);
+    `);
+  } catch (err) {
+    console.error("Migration cs_reply_proposals failed:", err);
+  }
+
+  // ─── CS på serveren, S3: Resend's delivery verdict per CRM message ──
+  // Side table instead of new crm_messages.delivery_status values: widening
+  // that CHECK would mean rebuilding crm_messages and its triggers.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS crm_message_delivery (
+        crm_message_id TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        event_type TEXT,
+        detail TEXT,
+        svix_id TEXT,
+        event_at TEXT,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_crm_message_delivery_status ON crm_message_delivery(status, updated_at);
+    `);
+  } catch (err) {
+    console.error("Migration crm_message_delivery failed:", err);
+  }
+
+  // ─── CS på serveren, S5: contact form — rejected submissions per day
+  // (no personal data: day, platform, reason, count) and the receipt log
+  // (one automatic receipt per address per 24 h).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS contact_form_rejections (
+        day TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (day, platform, reason)
+      );
+      CREATE TABLE IF NOT EXISTS contact_form_receipts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        thread_id TEXT,
+        outcome TEXT NOT NULL,
+        sent_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_contact_form_receipts_email ON contact_form_receipts(email, sent_at);
+    `);
+  } catch (err) {
+    console.error("Migration contact_form tables failed:", err);
+  }
+
+  // ─── CS på serveren, S4: change requests (profile_update / removal),
+  // executed and verified by the server (services/cs-change-requests.ts).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS cs_change_requests (
+        id TEXT PRIMARY KEY,
+        vertical TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        target_name TEXT,
+        thread_id TEXT,
+        requester_email TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        changes TEXT NOT NULL DEFAULT '{}',
+        evidence TEXT,
+        authority TEXT NOT NULL,
+        status TEXT NOT NULL,
+        status_reason TEXT,
+        steps TEXT NOT NULL DEFAULT '[]',
+        snapshot TEXT,
+        blocklist_ids TEXT NOT NULL DEFAULT '[]',
+        cross_vertical TEXT,
+        created_by TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        executed_at TEXT,
+        hidden_at TEXT,
+        delete_after TEXT,
+        deleted_at TEXT,
+        verified_at TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        blocklist_plan TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_cs_change_requests_status ON cs_change_requests(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_cs_change_requests_thread ON cs_change_requests(thread_id);
+    `);
+  } catch (err) {
+    console.error("Migration cs_change_requests failed:", err);
+  }
+  // A database built from an earlier S4 commit has no blocklist_plan yet.
+  try {
+    db.exec("ALTER TABLE cs_change_requests ADD COLUMN blocklist_plan TEXT");
+  } catch {
+    /* already exists — expected */
   }
 
   // ─── M1 (Phase 5.4a): agent_knowledge_audit ─────────────────
@@ -3917,6 +4326,119 @@ function initSchema(db: Database.Database): void {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_agents_debio_verified ON agents(debio_verified) WHERE debio_verified = 1`);
   } catch { /* partial index unsupported or already created */ }
 
+  // ─── Økologi S1 (A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-
+  // register-og-tekstrevisjon): status from Debio's full register ─────────
+  // Written by syncDebioRegister() (services/debio-register-sync.ts), daily
+  // behind RFB_DEBIO_REGISTER_SYNC or via POST /admin/debio/register-sync.
+  // No row = never checked against the register (finnoko-only, as before).
+  // agents.debio_verified stays the column every reader uses; the register
+  // sync derives it (= 1 iff debio_status 'okologisk' and the certificate
+  // valid). No Debio person names or streets are stored (S1.6): the review
+  // table keeps only sid / org.nr. / status / validity / product groups /
+  // postal code / city / method / score.
+  //
+  // One row per agent in a side table, NOT six new columns on `agents`: any
+  // wider `agents` row flips SQLite's index choice for the unordered public
+  // scans (idx_agents_geo → idx_agents_role), which reorders discover /
+  // find-match / lokal_discover answers (dyre-oppslag-tak,
+  // strukturerte-lister-tak, name-search-fts pin that order).
+  //   debio_status         : okologisk | karens | annet | ingen
+  //   debio_cert_valid_to  : YYYY-MM-DD of the certificate behind the status
+  //   debio_product_groups : JSON array of product-group codes (LBP, FIO …)
+  //   debio_sid            : Debio certificate sid
+  //   debio_checked_at     : ISO-8601 of the register run that set the row
+  //   debio_match_method   : org_nr | tag_org_nr | finnoko_domain | name_postal |
+  //                          street_postal | street_city | review (NULL = no match)
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_debio_status (
+        agent_id TEXT PRIMARY KEY,
+        debio_status TEXT NOT NULL CHECK (debio_status IN ('okologisk','karens','annet','ingen')),
+        debio_cert_valid_to TEXT,
+        debio_product_groups TEXT,
+        debio_sid TEXT,
+        debio_checked_at TEXT NOT NULL,
+        debio_match_method TEXT
+      )
+    `);
+  } catch (err) {
+    console.error("Migration agent_debio_status (økologi S1) failed:", err);
+  }
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS debio_register_sync_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        last_attempt_at TEXT,
+        last_success_at TEXT,
+        last_success_rows INTEGER,
+        last_reject_at TEXT,
+        last_reject_reason TEXT
+      );
+      CREATE TABLE IF NOT EXISTS debio_match_review (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        entity_key TEXT NOT NULL,
+        debio_sid TEXT,
+        org_nr TEXT,
+        status TEXT NOT NULL,
+        cert_valid_to TEXT,
+        product_groups TEXT,
+        postal_code TEXT,
+        city TEXT,
+        match_method TEXT NOT NULL,
+        score REAL,
+        reasons TEXT,
+        state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','approved','rejected')),
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        decided_at TEXT,
+        UNIQUE (agent_id, entity_key)
+      );
+      CREATE INDEX IF NOT EXISTS idx_debio_match_review_state ON debio_match_review(state);
+      CREATE TABLE IF NOT EXISTS debio_status_changes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        old_status TEXT,
+        new_status TEXT,
+        old_verified INTEGER,
+        new_verified INTEGER,
+        reason TEXT NOT NULL,
+        debio_sid TEXT,
+        source TEXT NOT NULL,
+        changed_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_debio_status_changes_agent ON debio_status_changes(agent_id);
+    `);
+  } catch (err) {
+    console.error("Migration debio register (økologi S1) failed:", err);
+  }
+
+  // ─── Økologi S4b-2: Debio certificate-detail lines, stored weekly ────────
+  // Written only by syncDebioCertDetails() (services/debio-cert-detail-sync.ts),
+  // behind RFB_DEBIO_CERT_DETAIL_SYNC (off by default) or via
+  // POST /admin/debio/cert-detail-sync. One row per agent; nothing reads the
+  // lines yet (S4c). lines_json holds only {label, statusCode, statusText,
+  // organic} per line — never partnerFullName or any other Debio name /
+  // street (S1.6). ok=0 rows carry a body-free last_error and wait 7 days.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_debio_cert_detail (
+        agent_id TEXT PRIMARY KEY,
+        enquiry_orig_sid INTEGER,
+        fetched_at TEXT NOT NULL,
+        ok INTEGER NOT NULL,
+        recognized INTEGER NOT NULL DEFAULT 0,
+        lines_json TEXT,
+        status_counts_json TEXT,
+        organic_line_count INTEGER NOT NULL DEFAULT 0,
+        line_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT
+      )
+    `);
+  } catch (err) {
+    console.error("Migration agent_debio_cert_detail (økologi S4b-2) failed:", err);
+  }
+
 
   // ─── Phase 0 (orch-pr-20260614-5): products catalog table ────────────────
   // Queryable product catalog seeded from agent_knowledge.products via
@@ -3977,6 +4499,21 @@ function initSchema(db: Database.Database): void {
   // '250 g'). Additive nullable columns; NULL = not stated. Same
   // try/catch-duplicate-column guard as above.
   for (const col of ["ingredients TEXT", "allergens TEXT", "net_weight TEXT"]) {
+    try {
+      db.exec(`ALTER TABLE products ADD COLUMN ${col}`);
+    } catch {
+      // Column already exists
+    }
+  }
+
+  // dev-request 2026-10-21-rfb-produktimport-fra-egen-nettside, skive 2: the
+  // provenance product-catalog-sync carries over from agent_knowledge.products
+  // (ProductInfo.sourceUrl / fetchedAt / confirmedAt). source_url = the page a
+  // price was read from, fetched_at = when, owner_confirmed_at = when the owner
+  // last saved/confirmed it. Additive nullable columns; NULL = unknown. None of
+  // them is read by the orderability gate. Same try/catch-duplicate-column
+  // guard as above.
+  for (const col of ["source_url TEXT", "fetched_at TEXT", "owner_confirmed_at TEXT"]) {
     try {
       db.exec(`ALTER TABLE products ADD COLUMN ${col}`);
     } catch {
@@ -4062,9 +4599,12 @@ function initSchema(db: Database.Database): void {
   //   agents.order_notifications_opt_in : send-gate. 0 (default) = NEVER
   //       notify this producer about orders. Only an explicit admin action
   //       (POST /admin/orders/notification-optin) flips it to 1.
-  //   agents.order_notification_email   : admin-set override recipient. When
-  //       set, it wins over contact_email AND counts as "verified contact"
-  //       (an admin explicitly chose it — this is how Daniel points a test
+  //   agents.order_notification_email   : override recipient, admin-set OR
+  //       owner-confirmed (S1b punkt 7: a verified owner requests it and it
+  //       is written only after the link mailed to the new address is used —
+  //       routes/owner-portal.ts). When set, it wins over contact_email AND
+  //       counts as "verified contact" (an admin explicitly chose it, or the
+  //       owner proved control of it — this is also how Daniel points a test
   //       agent at his own inbox, mirroring the booking test-provider
   //       pattern). When NULL, contact_email is used and the agent must be
   //       verification_status='verified' in agent_knowledge.
@@ -4274,6 +4814,31 @@ function initSchema(db: Database.Database): void {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_agents_org_nr ON agents(org_nr) WHERE org_nr IS NOT NULL`);
   } catch { /* partial index unsupported or already created */ }
 
+  // ─── Økologi S3c (A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-
+  // register-og-tekstrevisjon): an org.nr. the OWNER typed in the portal ────
+  // (POST /eier/:agentId/org-nr). A CANDIDATE only: the Debio register sync
+  // turns it into a pending debio_match_review row (match_method
+  // 'owner_org_nr') that a person approves. Never copied into agents.org_nr,
+  // which the sync treats as a safe automatic match.
+  //
+  // A side table, NOT new columns on `agents`: a wider `agents` row flips
+  // SQLite's index choice for the unordered public scans (see the økologi S1
+  // note at agent_debio_status; dyre-oppslag-tak, strukturerte-lister-tak and
+  // name-search-fts fail with two extra TEXT columns on `agents`).
+  //   owner_org_nr    : 9 digits, MOD11-checked
+  //   owner_org_nr_at : ISO-8601 of the owner's save
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_owner_org_nr (
+        agent_id TEXT PRIMARY KEY,
+        owner_org_nr TEXT NOT NULL,
+        owner_org_nr_at TEXT NOT NULL
+      )
+    `);
+  } catch (err) {
+    console.error("Migration agent_owner_org_nr (økologi S3c) failed:", err);
+  }
+
   // ─── agents_org_nr_audit / agents_org_nr_review_queue (dev-request ─────
   // 2026-07-26-rfb-outreach-tilsig-blokkerdiagnose-og-orgnr, Steg 2) ────────
   //
@@ -4435,10 +5000,55 @@ function initSchema(db: Database.Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_contact_clicks_agent_id ON contact_clicks(agent_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_contact_clicks_created_at ON contact_clicks(created_at)`);
 
+  // dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord, slice S4:
+  // profile_link_clicks — the contact_clicks twin for the outgoing links on
+  // the Opplevagent (opplevelse / tilbyder / gårdssalg produsent) and
+  // Finn-tannlege (klinikk) profile pages: GET /ut/:surface/:id/:kind on the
+  // vertical's host and POST /api/track/profile-click
+  // (services/profile-link-clicks.ts). A sibling table rather than new
+  // contact_clicks columns, so every RFB reader of contact_clicks (owner
+  // stats, partner report, S3 admin numbers) keeps counting only RFB.
+  // Brand-new table → CREATE IF NOT EXISTS is the whole migration.
+  //   platform    : 'opplevelser' | 'gardssalg' | 'tannlege'
+  //   entity_type : 'experience' | 'provider' | 'clinic'; entity_id its id in
+  //                 the vertical DB (no FK — another database)
+  //   provider_id : the provider / clinic that owns the link
+  //   kind        : 'booking' | 'website' | 'directory' (redirect) or
+  //                 'phone' | 'email' (beacon). Never a URL.
+  //   session_id / is_bot : exactly as contact_clicks (hashed-IP session,
+  //                 parseUserAgent bot flag) — no new personal data.
+  //   is_test     : 1 when the provider is a test provider
+  //                 (experience_providers.is_test_provider = 1) at click time.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS profile_link_clicks (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      platform    TEXT NOT NULL,
+      entity_type TEXT NOT NULL,
+      entity_id   TEXT NOT NULL,
+      provider_id TEXT,
+      kind        TEXT NOT NULL,
+      session_id  TEXT,
+      is_bot      INTEGER NOT NULL DEFAULT 0,
+      is_test     INTEGER NOT NULL DEFAULT 0,
+      created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_profile_link_clicks_platform_created ON profile_link_clicks(platform, created_at)`);
+
   // B4: where the visitor who clicked came from (utm_source on the landing
   // URL / same-origin Referer). Nullable, additive; metadata-only ALTER.
   try {
     db.exec(`ALTER TABLE contact_clicks ADD COLUMN utm_source TEXT`);
+  } catch {
+    // Column already exists
+  }
+
+  // «Klikk fra AI-svar» slice 4 (dev-request 2026-10-14-klikk-fra-ai-svar-per-
+  // profil): the AI the clicker's landing came from, classified server-side
+  // (classifyAiClickSource: chatgpt|claude|perplexity|gemini|copilot|other),
+  // NULL = no AI attribution. Nullable, additive; metadata-only ALTER, no backfill.
+  try {
+    db.exec(`ALTER TABLE contact_clicks ADD COLUMN ai_source TEXT`);
   } catch {
     // Column already exists
   }
@@ -4460,6 +5070,23 @@ function initSchema(db: Database.Database): void {
       view_count   INTEGER NOT NULL DEFAULT 0,
       session_count INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (day, utm_source, utm_medium, utm_campaign, bot_type, vertical_id)
+    )
+  `);
+
+  // ai-sok B5: per-AI-agent rollup (search indexer vs user fetch vs training
+  // crawler survive the nightly prune). page_view_daily's coarse bot_type
+  // ('chatgpt' = GPTBot + ChatGPT-User + OAI-SearchBot) is left untouched, so
+  // every existing reader keeps its numbers. One row per day x registry token
+  // x vertical; vendor/purpose are looked up from AI_AGENT_REGISTRY when read.
+  // Written by retention-service.ts in the same transaction as page_view_daily.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS page_view_ai_agent_daily (
+      day           TEXT NOT NULL,
+      agent         TEXT NOT NULL,
+      vertical_id   TEXT NOT NULL DEFAULT 'rfb',
+      view_count    INTEGER NOT NULL DEFAULT 0,
+      session_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, agent, vertical_id)
     )
   `);
 
@@ -5197,6 +5824,134 @@ function initSchema(db: Database.Database): void {
     db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_order_events_idem ON order_events(order_id, idempotency_key) WHERE idempotency_key IS NOT NULL`);
   } catch { /* best-effort — the lookup before the transition still works */ }
 
+  // Fase B2 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-kjoperagent):
+  // the message thread per order (services/order-messages.ts). Additive; no
+  // existing table changes. One row per message:
+  //   author_role     : 'buyer' (MCP lokal_order_message / the order card) or
+  //                     'seller' (Mine ordrer).
+  //   body            : the trimmed text, at most 1000 characters.
+  //   channel         : 'mcp' | 'web' | 'owner_portal'.
+  //   idempotency_key : the caller's key, namespaced per role ('b:' / 's:');
+  //                     a repeat of the same key returns the stored message.
+  //   created_at      : ISO-8601 UTC (the per-order rate limit compares it).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS order_messages (
+      id              TEXT PRIMARY KEY,
+      order_id        TEXT NOT NULL,
+      author_role     TEXT NOT NULL CHECK(author_role IN ('buyer','seller')),
+      body            TEXT NOT NULL,
+      channel         TEXT NOT NULL,
+      idempotency_key TEXT,
+      created_at      TEXT NOT NULL
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_order_messages_order_id ON order_messages(order_id, created_at)`);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_order_messages_idem ON order_messages(order_id, idempotency_key) WHERE idempotency_key IS NOT NULL`);
+
+  // B4 (dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier):
+  // the daily-cap notice (services/order-cap-notice.ts). Additive; no existing
+  // table changes, no buyer data.
+  //   order_cap_events  : one row per (submit, producer) the F8 spam cap turned
+  //     into a contact handoff. reason 'producer_daily_cap' |
+  //     'buyer_open_cap'; cap = the limit in force; oslo_day = the
+  //     Europe/Oslo calendar day (YYYY-MM-DD) of the submit.
+  //   order_cap_notices : the sent marker of the producer's daily digest. The
+  //     primary key (agent_id, oslo_day) is what guarantees ONE e-mail per
+  //     producer per day across overlapping runs and restarts. status
+  //     'claimed' | 'sent' | 'skipped' | 'failed'.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS order_cap_events (
+      id          TEXT PRIMARY KEY,
+      agent_id    TEXT NOT NULL,
+      cart_id     TEXT,
+      reason      TEXT NOT NULL CHECK(reason IN ('producer_daily_cap','buyer_open_cap')),
+      cap         INTEGER NOT NULL,
+      oslo_day    TEXT NOT NULL,
+      created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_order_cap_events_day ON order_cap_events(oslo_day, agent_id)`);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS order_cap_notices (
+      agent_id        TEXT NOT NULL,
+      oslo_day        TEXT NOT NULL,
+      over_cap_count  INTEGER NOT NULL,
+      cap             INTEGER NOT NULL,
+      status          TEXT NOT NULL DEFAULT 'claimed',
+      created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+      sent_at         TEXT,
+      PRIMARY KEY (agent_id, oslo_day)
+    )
+  `);
+  // T11 (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 5; order
+  // caps v2 behind ORDER_CAP_V2_ENABLED). Additive only — the CHECK on
+  // order_cap_events.reason is NOT widened:
+  //   order_cap_events.reason_detail : nullable; the v2 rule that hit
+  //     ('platform_ceiling' | 'buyer_daily_cap' | 'buyer_open_cap';
+  //     'owner_daily_cap' is reserved for T17). NULL on every v1 row.
+  //   order_cap_admin_alerts : the internal admin alert marker. The primary
+  //     key (agent_id, oslo_day, kind) is what guarantees ONE alert per
+  //     producer per Oslo day per kind ('ceiling' | 'prewarn') across
+  //     overlapping submits and restarts. No buyer data. status 'claimed' |
+  //     'sent' | 'failed'.
+  try {
+    const capEvCols = new Set((db.prepare(`PRAGMA table_info(order_cap_events)`).all() as Array<{ name: string }>).map((c) => c.name));
+    if (!capEvCols.has("reason_detail")) db.exec(`ALTER TABLE order_cap_events ADD COLUMN reason_detail TEXT`);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS order_cap_admin_alerts (
+        agent_id     TEXT NOT NULL,
+        oslo_day     TEXT NOT NULL,
+        kind         TEXT NOT NULL,
+        order_count  INTEGER NOT NULL,
+        cap          INTEGER NOT NULL,
+        status       TEXT NOT NULL DEFAULT 'claimed',
+        created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (agent_id, oslo_day, kind)
+      )
+    `);
+  } catch (err) {
+    console.error("Migration order caps v2 (T11) failed:", err);
+  }
+
+  // T12 (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 6;
+  // cancellation from «Mine ordrer»). Additive only, no CHECK:
+  //   orders.cancel_detail : nullable; why the producer cancelled a confirmed
+  //     order ('sold_out' | 'cannot_deliver', with cancel_reason
+  //     'producer_cancelled'). NULL on every older row and every other reason.
+  //     Tekstpakke C punkt 10: also 'sold_out' on a declined order
+  //     («Avslå – utsolgt»); same column, no new migration.
+  try {
+    const orderCols = new Set((db.prepare(`PRAGMA table_info(orders)`).all() as Array<{ name: string }>).map((c) => c.name));
+    if (!orderCols.has("cancel_detail")) db.exec(`ALTER TABLE orders ADD COLUMN cancel_detail TEXT`);
+  } catch (err) {
+    console.error("Migration orders.cancel_detail (T12) failed:", err);
+  }
+
+  // B2 (dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier):
+  // the stock-check reminder (services/stock-check-reminder.ts). Additive.
+  //   stock_check_notices : one row per reserved reminder e-mail. The job
+  //     inserts it inside BEGIN IMMEDIATE only when the producer has no row
+  //     newer than 14 days (created_at, ISO) — the restart- and overlap-safe
+  //     «at most one e-mail per 14 days» marker. id = sha256 of the confirm
+  //     link's nonce (the link is valid only while its row exists);
+  //     product_ids = JSON array of the rows the e-mail lists. status
+  //     'claimed' | 'sent' | 'skipped' | 'failed'.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS stock_check_notices (
+      id               TEXT PRIMARY KEY,
+      agent_id         TEXT NOT NULL,
+      product_ids      TEXT NOT NULL DEFAULT '[]',
+      item_count       INTEGER NOT NULL DEFAULT 0,
+      status           TEXT NOT NULL DEFAULT 'claimed',
+      created_at       TEXT NOT NULL,
+      sent_at          TEXT,
+      link_expires_at  TEXT NOT NULL,
+      confirmed_at     TEXT,
+      confirmed_count  INTEGER
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_stock_check_notices_agent ON stock_check_notices(agent_id, created_at)`);
+
   // producer_terms_acceptances (prerequisites 4 + 5): a producer accepted
   //   /produsentvilkar (terms_version) and declared whether they sell as a
   //   trader (angrerettloven § 9 a) — required before connecting Stripe.
@@ -5305,6 +6060,21 @@ function initSchema(db: Database.Database): void {
   ]) {
     try { db.exec(stmt); } catch { /* already exists — expected */ }
   }
+  // dev-request 2026-11-10-rfb-registreringer-og-eierkrav-folges-opp, slice
+  // S2 (record-only): the stored self-registration pre-check recommendation
+  // (JSON, services/registration-precheck.ts) and when it was written, one row
+  // per agent. A side table on purpose, not new `agents` columns: widening
+  // `agents` tips SQLite's planner off idx_agents_geo for the unordered public
+  // scans (name-search-fts.test.ts's plan check), which changes the order of
+  // discover/find-match answers. Never read by any visibility gate. Additive
+  // and idempotent; a rollback leaves it in place.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS agent_registration_precheck (
+      agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+      registration_precheck TEXT NOT NULL,      -- JSON (RegistrationPrecheck)
+      registration_precheck_at TEXT NOT NULL    -- ISO-8601, when it was written
+    )
+  `);
   try {
     db.exec(
       `CREATE INDEX IF NOT EXISTS idx_agents_self_registered_review_queue
@@ -5319,13 +6089,32 @@ function initSchema(db: Database.Database): void {
   // direct-id order-flow path (/catalog/agents/:id/products, cart add/submit,
   // /produsent/ordre/:token, admin inbox) keeps working. Same idea as
   // experience_providers.catalog_hidden. DEFAULT 0, so every existing row is a
-  // no-op. The ONE place that reads it is services/agent-visibility.ts. The
-  // only writer is POST /admin/test-producer (routes/admin-test-producer.ts),
-  // which only ever touches the single origin='test_fixture' row.
-  // Rollback: the column is additive and may stay; retire the fixture with the
-  // endpoint (or UPDATE agents SET is_active=0 WHERE origin='test_fixture').
+  // no-op. The ONE place that reads it is services/agent-visibility.ts. There
+  // are exactly two writers, each pinned to its own single fixture row:
+  //   * POST /admin/test-producer (routes/admin-test-producer.ts) — the order
+  //     fixture, origin='test_fixture';
+  //   * POST /admin/test-claim-fixture (routes/admin-test-claim-fixture.ts,
+  //     dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post AC6) — the
+  //     unclaimed claim-test fixture, origin='test_claim_fixture', which GET
+  //     /api/marketplace/agents/:id/info alone serves while it is armed.
+  // Rollback: the column is additive and may stay; retire a fixture with its
+  // endpoint (or UPDATE agents SET is_active=0 WHERE origin IN
+  // ('test_fixture','test_claim_fixture')).
   try {
     db.exec(`ALTER TABLE agents ADD COLUMN catalog_hidden INTEGER NOT NULL DEFAULT 0`);
+  } catch { /* already exists — expected */ }
+
+  // ─── dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
+  // S-D1 («Kontaktskjema som valg per profil», rettfrabonden.com) ─────────────
+  // contact_form_only: 1 = the producer asked that their e-mail is not shown;
+  // with CONTACT_FORM_RFB on, /produsent/:slug shows a contact form instead
+  // and POST /produsent/:slug/kontakt forwards the message to the stored
+  // address (services/contact-form-only.ts). DEFAULT 0, so every existing row
+  // is a no-op. Only writer: POST /admin/agents/:id/contact-form-only (admin,
+  // on the producer's request). Read only while the switch is on.
+  // Rollback: switch off (the column is additive and may stay).
+  try {
+    db.exec(`ALTER TABLE agents ADD COLUMN contact_form_only INTEGER NOT NULL DEFAULT 0`);
   } catch { /* already exists — expected */ }
 
   // ─── dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S1b punkt 6 ───────
@@ -5347,6 +6136,206 @@ function initSchema(db: Database.Database): void {
     `);
   } catch (err) {
     console.error("Migration owner_profile_pause failed:", err);
+  }
+
+  // ─── dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S1b punkt 7 ───────
+  // Owner-requested change of agents.order_notification_email, pending until
+  // the confirmation link sent to the NEW address is clicked. Only the sha256
+  // of the token is stored. requested_at / expires_at / consumed_at are all
+  // ISO-8601 (Date#toISOString) and compared only against ISO strings.
+  // outcome: NULL = pending; 'confirmed' | 'superseded' | 'send_failed'.
+  // owner_basis: fingerprint of the ownership basis at request time
+  // (claimed_at/claimed_via + verified claim ids); confirm requires it to be
+  // unchanged, so a token never survives an ownership reset or re-claim.
+  // Read/written only by routes/owner-portal.ts while OWNER_ORDER_EMAIL_ENABLED
+  // is on. Additive, brand-new table.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS owner_order_email_change (
+        token_hash TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        new_email TEXT NOT NULL,
+        requested_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        consumed_at TEXT,
+        outcome TEXT,
+        requested_by TEXT,
+        owner_basis TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_owner_order_email_change_agent
+        ON owner_order_email_change(agent_id, requested_at);
+    `);
+  } catch (err) {
+    console.error("Migration owner_order_email_change failed:", err);
+  }
+
+  // ─── dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S2a ───────────────
+  // «Mine valg» owner feature settings + change log (owner-features/).
+  // owner_feature_settings holds ONLY explicit choices; everything else falls
+  // back to the registry default, so a changed default never changes a stored
+  // choice. Keyed on (vertical, subject_id): vertical 'rfb' → subject_id =
+  // agents.id (gårdssalg reuses it with experience_providers.id). Entries with
+  // a storage adapter (orders.enabled ↔ agents.order_notifications_opt_in)
+  // never get a row here — the column stays the source of truth.
+  // admin_locked = 1 (set_by 'admin') overrides the owner. value_json /
+  // old_json / new_json are JSON; set_at / at are ISO-8601
+  // (Date#toISOString). owner_feature_audit gets exactly one row per change,
+  // adapter writes included. Additive, brand-new tables.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS owner_feature_settings (
+        vertical TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        value_json TEXT NOT NULL,
+        set_by TEXT NOT NULL CHECK (set_by IN ('owner','admin','cs','system')),
+        admin_locked INTEGER NOT NULL DEFAULT 0,
+        set_at TEXT NOT NULL,
+        PRIMARY KEY (vertical, subject_id, key)
+      );
+      CREATE TABLE IF NOT EXISTS owner_feature_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        vertical TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        old_json TEXT,
+        new_json TEXT,
+        actor TEXT NOT NULL,
+        actor_detail TEXT,
+        at TEXT NOT NULL,
+        text_version TEXT,
+        placement TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_owner_feature_audit_subject
+        ON owner_feature_audit(vertical, subject_id, at);
+    `);
+  } catch (err) {
+    console.error("Migration owner_feature_settings/owner_feature_audit failed:", err);
+  }
+
+  // ─── dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S2b ───────────────
+  // The «Mine valg» page (owner-features/page.ts). Two additive, brand-new
+  // tables; owner_feature_audit is unchanged.
+  // owner_feature_change_batch: one row per change the owner made on the page
+  // (one switch = kind 'single', one level = kind 'level', an undo = kind
+  // 'undo'). The audit rows it wrote are the contiguous id range
+  // first_audit_id..last_audit_id (written in one transaction). «Angre»
+  // reverts the newest batch as one unit and stamps undone_at /
+  // undone_by_batch; new_row_keys (JSON array) lists the settings rows the
+  // batch created, which an undo removes again. owner_feature_intro: the first-login card («Nyheter og
+  // tips», ja/nei) — one row once answered, so the card shows only until then.
+  // Times are ISO-8601 (Date#toISOString).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS owner_feature_change_batch (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        vertical TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('single','level','undo')),
+        level TEXT,
+        first_audit_id INTEGER NOT NULL,
+        last_audit_id INTEGER NOT NULL,
+        actor_detail TEXT,
+        created_at TEXT NOT NULL,
+        undone_at TEXT,
+        undone_by_batch INTEGER,
+        new_row_keys TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_owner_feature_change_batch_subject
+        ON owner_feature_change_batch(vertical, subject_id, id);
+      CREATE TABLE IF NOT EXISTS owner_feature_intro (
+        vertical TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        answer TEXT NOT NULL CHECK (answer IN ('yes','no')),
+        answered_at TEXT NOT NULL,
+        actor_detail TEXT,
+        PRIMARY KEY (vertical, subject_id)
+      );
+    `);
+  } catch (err) {
+    console.error("Migration owner_feature_change_batch/owner_feature_intro failed:", err);
+  }
+
+  // ─── dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S2e ───────────────
+  // «Planlagt — si fra hvis du vil ha dette»: one row per (subject, key) when
+  // the owner presses «Gi meg beskjed» on a `coming_soon` entry. Additive,
+  // brand-new table; idempotent (PRIMARY KEY, INSERT … ON CONFLICT DO
+  // NOTHING). It has no effect on any surface and nothing is e-mailed;
+  // admins read the counts per key (GET /admin/owner-features/interest).
+  // registered_at is ISO-8601 (Date#toISOString).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS owner_feature_interest (
+        vertical TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        registered_at TEXT NOT NULL,
+        actor_detail TEXT,
+        PRIMARY KEY (vertical, subject_id, key)
+      );
+      CREATE INDEX IF NOT EXISTS idx_owner_feature_interest_key
+        ON owner_feature_interest(vertical, key);
+    `);
+  } catch (err) {
+    console.error("Migration owner_feature_interest failed:", err);
+  }
+
+  // S2e (v2 principle 3): the level the owner chose themselves («Bare synlig» /
+  // «Ta imot bestillinger»), one row per subject, so the page marks a level
+  // only after the owner's own choice — also when choosing it changed no
+  // switch (no batch is written then). batch_id = the level batch it wrote
+  // (NULL when nothing changed); undoing that batch removes the row.
+  // chosen_at is ISO-8601.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS owner_feature_level_choice (
+        vertical TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        level TEXT NOT NULL,
+        chosen_at TEXT NOT NULL,
+        actor_detail TEXT,
+        batch_id INTEGER,
+        PRIMARY KEY (vertical, subject_id)
+      );
+    `);
+  } catch (err) {
+    console.error("Migration owner_feature_level_choice failed:", err);
+  }
+
+  // ─── eierportal testrunde 1, T7 — «Nyheter og tips» nederst ─────────────
+  // owner_feature_audit.text_version / placement: nullable, written only for
+  // consent keys (comms.news): which version of the consent text the owner
+  // saw (owner-features/news-consent.ts) and where it was answered
+  // ('mine_valg_question' / 'mine_valg_row'; T15 adds the Oversikt place).
+  // Added to the CREATE TABLE above for new databases; idempotent ALTER for
+  // existing ones. owner_feature_prompt: one row per (subject, question key)
+  // — state 'later' (rounds = how many times «Ikke nå», snoozed_until = when
+  // the question may come back), 'yes' or 'never' (answered_at = the time of
+  // the explicit answer). «Ikke nå» writes no owner_feature_settings and no
+  // audit row. A subject with an owner_feature_intro row (S2b first-login
+  // card) counts as answered. No CHECK on state, so a later slice can add a
+  // state without a table rebuild; the code validates it. Times are ISO-8601.
+  // Additive only.
+  try {
+    const have = new Set((db.prepare(`PRAGMA table_info(owner_feature_audit)`).all() as Array<{ name: string }>).map((c) => c.name));
+    for (const col of ["text_version", "placement"]) {
+      if (!have.has(col)) db.exec(`ALTER TABLE owner_feature_audit ADD COLUMN ${col} TEXT`);
+    }
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS owner_feature_prompt (
+        vertical TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        state TEXT NOT NULL,
+        rounds INTEGER NOT NULL DEFAULT 0,
+        snoozed_until TEXT,
+        answered_at TEXT,
+        actor_detail TEXT,
+        PRIMARY KEY (vertical, subject_id, key)
+      );
+    `);
+  } catch (err) {
+    console.error("Migration owner_feature_prompt / owner_feature_audit consent columns failed:", err);
   }
 
   // ─── dev-request 2026-07-31-rfb-poolgate-uten-telefon-og-batchkapasitet
@@ -5701,6 +6690,17 @@ function initSchema(db: Database.Database): void {
       console.error("Migration client_ip_shadow_windows.covered_ms failed:", err);
     }
   }
+  // Trinn 1e: the window's non_public fallbacks per range code, path class and
+  // UA class, as compact JSON of counts (codes only: no IP, no hash, no host
+  // name). Additive; rows from before stay NULL and are read as unknown.
+  // Idempotent on "duplicate column name".
+  try {
+    db.exec(`ALTER TABLE client_ip_shadow_windows ADD COLUMN non_public_by_json TEXT`);
+  } catch (err: any) {
+    if (!String(err?.message || "").includes("duplicate column name")) {
+      console.error("Migration client_ip_shadow_windows.non_public_by_json failed:", err);
+    }
+  }
 
   // ─── dev-request 2026-09-09-outreach-profilkvalitet: agents-city-backfill ──
   // columns (services/agents-city-backfill.ts). `agents.city` itself already
@@ -5805,6 +6805,30 @@ function initSchema(db: Database.Database): void {
     console.error("Migration rfb_marketing_lane_state/rfb_marketing_send_ledger failed:", err);
   }
 
+  // ─── privacy_erasure_audit (dev-request 2026-10-12-slettefrist-
+  // korrespondanse-og-oversettelser, slice C) ─────────────────────────
+  // One row per APPLIED art. 17 erasure by POST /admin/privacy/erasure-by-email
+  // (routes/admin-privacy-erasure.ts), written in the same transaction as the
+  // DELETEs. Holds a keyed hash of the normalized address, never the address.
+  // Insert-only; dry-runs write nothing. Purely additive.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS privacy_erasure_audit (
+        id TEXT PRIMARY KEY,
+        requested_at TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        requested_by TEXT,
+        email_hash TEXT NOT NULL,
+        include_suppression INTEGER NOT NULL DEFAULT 0,
+        counts_json TEXT NOT NULL,
+        total_rows INTEGER NOT NULL
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_privacy_erasure_audit_hash ON privacy_erasure_audit(email_hash)`);
+  } catch (err) {
+    console.error("Migration privacy_erasure_audit failed:", err);
+  }
+
   // ─── profile_ai_deliveries (dev-request 2026-10-14-med-i-ai-svar-per-profil, S1) ───
   // «Med i AI-svar»: how many times each profile was sent to an AI assistant,
   // per UTC day x channel (ai_page_list | ai_page_profile | mcp | a2a) x AI
@@ -5826,6 +6850,27 @@ function initSchema(db: Database.Database): void {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_profile_ai_deliveries_vertical_day ON profile_ai_deliveries(vertical_id, day)`);
   } catch (err) {
     console.error("Migration profile_ai_deliveries failed:", err);
+  }
+
+  // ─── profile_ai_clicks (dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 2) ───
+  // «Klikk fra AI-svar»: how many people came to each profile page from an AI
+  // assistant's answer, per UTC day x AI (chatgpt | claude | perplexity |
+  // gemini | copilot | other). Daily sums only, no IP, session, user agent or
+  // URL; written in batches by profile-ai-clicks.ts. Additive.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS profile_ai_clicks (
+        vertical_id TEXT NOT NULL,
+        profile_id TEXT NOT NULL,
+        day TEXT NOT NULL,
+        ai_vendor TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 0,
+        UNIQUE (vertical_id, profile_id, day, ai_vendor)
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_profile_ai_clicks_vertical_day ON profile_ai_clicks(vertical_id, day)`);
+  } catch (err) {
+    console.error("Migration profile_ai_clicks failed:", err);
   }
 
   // ─── search_console_weekly (A2A dev-request 2026-10-16-gsc-bing-ai-rapporter, S6c) ───
@@ -5880,6 +6925,259 @@ function initSchema(db: Database.Database): void {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_order_activation_links_agent ON order_activation_links(agent_id)`);
   } catch (err) {
     console.error("Migration order_activation_links failed:", err);
+  }
+
+  // ─── claim_action_links (dev-request 2026-10-30-rfb-eierkrav-automatisk-
+  // vurdering-og-ettklikk, slice C4 — signerte ett-klikks-lenker) ──────────
+  // One row per admin-minted, HMAC-signed one-time link that approves,
+  // rejects or revokes one owner claim (services/claim-action-link.ts). The
+  // token itself is never stored: `nonce_hash` is sha256(nonce) hex. `used_at`
+  // is the single-use guard (a conditional UPDATE … WHERE used_at IS NULL in
+  // the same transaction as the claim decision); `used_result` records the
+  // outcome. Additive; brand-new table.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS claim_action_links (
+        id TEXT PRIMARY KEY,
+        nonce_hash TEXT NOT NULL UNIQUE,
+        claim_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        created_by TEXT NOT NULL DEFAULT 'admin',
+        used_at TEXT,
+        used_result TEXT,
+        duplicate_id TEXT
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_claim_action_links_claim ON claim_action_links(claim_id)`);
+  } catch (err) {
+    console.error("Migration claim_action_links failed:", err);
+  }
+  // Eierkrav D2 («Slå sammen og godkjenn» as a signed link): the sibling
+  // profile a merge_approve link is bound to (NULL for every other action).
+  // Additive and idempotent; existing rows keep NULL. A rollback leaves it in
+  // place.
+  try {
+    db.exec(`ALTER TABLE claim_action_links ADD COLUMN duplicate_id TEXT`);
+  } catch {
+    // Column already exists — expected after first migration
+  }
+
+  // ─── product_import_runs / product_import_run_results (dev-request
+  // 2026-10-21-rfb-produktimport-fra-egen-nettside, Skive 1) ──────────────
+  // The dry-run measurement (POST /admin/product-import/dry-run, flag
+  // PRODUCT_IMPORT_DRYRUN_ENABLED) stores its run and one row per measured
+  // profile here — and NOWHERE else: no write to agent_knowledge or products.
+  // `mode` is 'dry_run' for every Skive 1 row. Additive; brand-new tables.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS product_import_runs (
+        id TEXT PRIMARY KEY,
+        mode TEXT NOT NULL DEFAULT 'dry_run',
+        status TEXT NOT NULL DEFAULT 'running',
+        params_json TEXT NOT NULL DEFAULT '{}',
+        profiles_total INTEGER NOT NULL DEFAULT 0,
+        profiles_done INTEGER NOT NULL DEFAULT 0,
+        llm_call_cap INTEGER NOT NULL DEFAULT 0,
+        llm_calls INTEGER NOT NULL DEFAULT 0,
+        summary_json TEXT,
+        error TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        finished_at TEXT,
+        sample_json TEXT,
+        resume_count INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+    // Round 2 (resume after a deploy): the run's profile list in processing
+    // order, and how often it was resumed on boot. Additive, idempotent.
+    const pirCols = db.prepare(`PRAGMA table_info(product_import_runs)`).all() as Array<{ name: string }>;
+    if (!pirCols.some((c) => c.name === "sample_json")) {
+      db.exec(`ALTER TABLE product_import_runs ADD COLUMN sample_json TEXT`);
+    }
+    if (!pirCols.some((c) => c.name === "resume_count")) {
+      db.exec(`ALTER TABLE product_import_runs ADD COLUMN resume_count INTEGER NOT NULL DEFAULT 0`);
+    }
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS product_import_run_results (
+        run_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        agent_name TEXT,
+        website TEXT,
+        is_owned INTEGER NOT NULL DEFAULT 0,
+        outcome TEXT NOT NULL,
+        tier TEXT,
+        product_count INTEGER NOT NULL DEFAULT 0,
+        priced_count INTEGER NOT NULL DEFAULT 0,
+        llm_calls INTEGER NOT NULL DEFAULT 0,
+        duration_ms INTEGER NOT NULL DEFAULT 0,
+        result_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (run_id, agent_id)
+      )
+    `);
+  } catch (err) {
+    console.error("Migration product_import_runs failed:", err);
+  }
+
+  // ─── product_import_runs (owner fetch) / product_import_candidates
+  // (dev-request 2026-10-21-rfb-produktimport-fra-egen-nettside, Skive 3) ──
+  // The owner button «Hent produkter fra nettsiden min» (flag
+  // PRODUCT_IMPORT_ENABLED) logs one product_import_runs row per fetch with
+  // mode 'owner_fetch' and the columns below (the profile, the outcome, the
+  // new/changed/not-found counts at fetch time and, after «Publiser valgte»,
+  // what was published/removed). Its candidates are staged in
+  // product_import_candidates and NOWHERE else until the owner publishes:
+  // never in agent_knowledge.products or products. Additive, idempotent.
+  try {
+    const ownerRunCols: Array<[string, string]> = [
+      ["agent_id", "TEXT"],
+      ["outcome", "TEXT"],
+      ["tier", "TEXT"],
+      ["count_new", "INTEGER NOT NULL DEFAULT 0"],
+      ["count_changed", "INTEGER NOT NULL DEFAULT 0"],
+      ["count_not_found", "INTEGER NOT NULL DEFAULT 0"],
+      ["count_published", "INTEGER NOT NULL DEFAULT 0"],
+      ["count_removed", "INTEGER NOT NULL DEFAULT 0"],
+      ["published_by_owner", "INTEGER NOT NULL DEFAULT 0"],
+      ["published_at", "TEXT"],
+    ];
+    const have = new Set(
+      (db.prepare(`PRAGMA table_info(product_import_runs)`).all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    for (const [col, type] of ownerRunCols) {
+      if (!have.has(col)) db.exec(`ALTER TABLE product_import_runs ADD COLUMN ${col} ${type}`);
+    }
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_product_import_runs_agent_mode ON product_import_runs(agent_id, mode, created_at)`,
+    );
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS product_import_candidates (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        position INTEGER NOT NULL DEFAULT 0,
+        name TEXT NOT NULL,
+        name_norm TEXT NOT NULL,
+        price_nok REAL,
+        price_text TEXT NOT NULL DEFAULT '',
+        unit TEXT,
+        price_is_from INTEGER NOT NULL DEFAULT 0,
+        price_excl_vat INTEGER NOT NULL DEFAULT 0,
+        pack_size TEXT,
+        tier TEXT NOT NULL,
+        source_url TEXT,
+        rules_json TEXT NOT NULL DEFAULT '[]',
+        fetched_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        reject_reason TEXT,
+        published_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_product_import_candidates_run ON product_import_candidates(run_id, position)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_product_import_candidates_agent ON product_import_candidates(agent_id)`);
+  } catch (err) {
+    console.error("Migration product_import_candidates failed:", err);
+  }
+
+  // ─── product_import outreach pre-extraction (Skive 3b-1) ────────────────
+  // POST /admin/product-import/prepare (flag PRODUCT_IMPORT_OUTREACH_ENABLED)
+  // logs one product_import_runs row per recipient with mode
+  // 'outreach_prepare', the campaign slug and the prepare batch id; its
+  // candidates carry the diff kind (new / changed / unchanged) and the old
+  // price. Status 'eligible' / 'unchanged' / 'rejected' — never 'pending',
+  // so the owner preview/publish (mode 'owner_fetch') never sees them.
+  // Additive, nullable, idempotent.
+  try {
+    const addCols = (table: string, cols: Array<[string, string]>) => {
+      const have = new Set((db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((c) => c.name));
+      for (const [col, type] of cols) if (!have.has(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);
+    };
+    addCols("product_import_runs", [["campaign", "TEXT"], ["prepare_id", "TEXT"]]);
+    addCols("product_import_candidates", [["diff_kind", "TEXT"], ["old_price_nok", "REAL"]]);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_product_import_runs_campaign ON product_import_runs(campaign, mode, created_at)`);
+  } catch (err) {
+    console.error("Migration product_import outreach columns failed:", err);
+  }
+
+  // ─── product_import_outreach_events (Skive 3b-2) ────────────────────────
+  // Append-only log per outreach recipient (flag PRODUCT_IMPORT_OUTREACH_ENABLED):
+  // 'opened' (the signed landing link was opened; detail = the session state),
+  // 'refetch_started' (the list was older than 7 days and an owner fetch was
+  // started; run_id = that owner_fetch run) and 'confirmed' (count = products
+  // published, in_stock = whether «på lager» was chosen). «Extracted» is the
+  // 3b-1 product_import_runs row itself. Never read by products / profiles.
+  // Additive, brand-new table, idempotent.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS product_import_outreach_events (
+        id TEXT PRIMARY KEY,
+        campaign TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        event TEXT NOT NULL,
+        run_id TEXT,
+        count INTEGER,
+        in_stock INTEGER,
+        detail TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_product_import_outreach_events_campaign ON product_import_outreach_events(campaign, agent_id, created_at)`,
+    );
+  } catch (err) {
+    console.error("Migration product_import_outreach_events failed:", err);
+  }
+
+  // ─── product_auto_sync_state (Produktimport skive 4-1) ──────────────────
+  // Weekly auto-sync of a verified owner's products from their own website
+  // (flag PRODUCT_AUTO_SYNC_ENABLED, default off). One row per profile:
+  // product_sync_mode ('off' | 'weekly'; a profile without a row is 'off'),
+  // the consecutive lock/failure count, the last run / last success, the last
+  // change summary (JSON) and the last lock reason; after 3 locks in a row the
+  // job sets the mode back to 'off' with disabled_reason. Runs are logged in
+  // product_import_runs with mode 'auto_sync'; new products wait there as
+  // 'pending' candidates. Additive, brand-new table, idempotent.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS product_auto_sync_state (
+        agent_id TEXT PRIMARY KEY,
+        product_sync_mode TEXT NOT NULL DEFAULT 'off',
+        consecutive_blocks INTEGER NOT NULL DEFAULT 0,
+        last_run_at TEXT,
+        last_run_id TEXT,
+        last_success_at TEXT,
+        last_change_summary TEXT,
+        last_block_reason TEXT,
+        disabled_reason TEXT,
+        disabled_at TEXT,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_product_auto_sync_state_mode ON product_auto_sync_state(product_sync_mode, last_run_at)`);
+  } catch (err) {
+    console.error("Migration product_auto_sync_state failed:", err);
+  }
+
+  // ─── registration_confirmation_email_log (S1, 2026-11-10) ───────────────
+  // One row per normalized (trim + lowercase) address that got the
+  // self-registration confirmation mail; last_sent_at (ISO-8601 UTC) drives
+  // the «at most one per address per 24 h» limit across restarts. Written only
+  // after a successful send, and only while REGISTRATION_CONFIRMATION_EMAIL_
+  // ENABLED is "true" (services/registration-confirmation.ts). Additive,
+  // brand-new table, idempotent.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS registration_confirmation_email_log (
+        email_normalized TEXT PRIMARY KEY,
+        last_sent_at TEXT NOT NULL,
+        last_agent_id TEXT,
+        send_count INTEGER NOT NULL DEFAULT 1
+      )
+    `);
+  } catch (err) {
+    console.error("Migration registration_confirmation_email_log failed:", err);
   }
 
   // ─── S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok ──────────────

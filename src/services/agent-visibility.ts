@@ -19,19 +19,260 @@
 // submit, /produsent/ordre/:token, admin inbox) deliberately do NOT use it:
 // the fixture must stay orderable by id while invisible in every list.
 //
-// PURE (no imports), so marketplace-registry.ts can use it without breaching
-// its rfb-vertical isolation (same rule as geo-distance.ts).
+// PURE (no project imports — only Node's async_hooks for the as-public view
+// below), so marketplace-registry.ts can use it without breaching its
+// rfb-vertical isolation (same rule as geo-distance.ts).
+
+import { AsyncLocalStorage } from "node:async_hooks";
 
 /** The only vertical whose `agents` rows are RFB food producers. */
 export const RFB_VERTICAL_ID = "rfb";
+
+// ─── Delisted by id (økologi S0) ────────────────────────────────────────────
+// A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
+// tekstrevisjon, S0 point 5: «Debio Sertifisering» is Debio itself, not a
+// producer; Debio was told 2026-08-02 the profile was gone, yet it still
+// showed in /api/marketplace/agents and /agents/:id/info. Read-side exclusion
+// until ops sets agents.is_active = 0 on the row (no migration here): never
+// listed (getActiveAgents, discover), and 404 / "not found" on every public
+// by-id surface that asks isAgentIdPubliclyVisible / isAgentPubliclyVisible /
+// isQuarantinedFromPublicView. The stored row is not changed.
+const DELISTED_AGENT_IDS: ReadonlySet<string> = new Set([
+  "41fde168-d82b-4b1b-a173-ed72df8c944e", // «Debio Sertifisering» (debio.no)
+]);
+
+/** Is this agent id delisted from every public surface (see above)? */
+export function isDelistedAgentId(agentId: unknown): boolean {
+  return typeof agentId === "string" && DELISTED_AGENT_IDS.has(agentId);
+}
 
 function col(alias: string | undefined, name: string): string {
   return alias ? `${alias}.${name}` : name;
 }
 
+// ─── «Vis som offentlig» — the as-public view (dev-request ─────────────────
+// 2026-10-22-rfb-mine-valg-eierbrytere, slice S2d-2, AC22) ───────────────────
+// The hidden RFB test fixture (origin = 'test_fixture' AND catalog_hidden = 1,
+// POST /admin/test-producer) is invisible everywhere, so an owner switch on it
+// («Mine valg», visibility.*) cannot be observed. A request that carries a
+// valid admin key AND the explicit opt-in `?as_public=1` (on one of the public
+// surfaces listed in middleware/as-public-view.ts) runs inside this
+// request-scoped context: the helpers in this file then read catalog_hidden as
+// 0 for rows with origin = 'test_fixture' ONLY. Every other gate (is_active,
+// vertical, vetting, role, owner pause, the owner's visibility choices) still
+// applies, so toggling a switch on the fixture is observable. A real hidden
+// row is never affected. Outside the context (every normal request, every
+// boot/background job) every helper answers byte-identically to before.
+
+/** The `agents.origin` the test fixture carries (routes/admin-test-producer.ts). */
+export const TEST_FIXTURE_ORIGIN = "test_fixture";
+
+// ─── The claim-test fixture (dev-request 2026-11-01-rfb-kravflyt-tal-eiere- ─
+// fra-e-post, AC6; Daniel's option A, 2026-11-01) ────────────────────────────
+// POST /admin/test-claim-fixture keeps ONE hidden, unclaimed RFB profile so
+// the owner-claim flow can be tested in production. Its marker is
+// origin = 'test_claim_fixture' AND catalog_hidden = 1 — a different origin
+// from the order fixture above, so POST /admin/test-producer, the switch probe
+// and the as-public view (all pinned to 'test_fixture') never see it, and
+// catalog_hidden = 1 keeps it off every list/search/feed/sitemap/llms/MCP/A2A
+// surface and every by-id surface that asks isAgentPubliclyVisible.
+//
+// The ONE exception: GET /api/marketplace/agents/:id/info — selger.html's
+// single-store lookup for /selger?agent=<id> and the owner dashboard after
+// the claim — passes `claimTestFixtureInfo`, and isAgentPubliclyVisible then
+// reads catalog_hidden as 0 for the ARMED fixture only
+// (isArmedClaimTestFixtureRow). Every other gate (delisted, owner pause and
+// choices, is_active under the by-id flag, vertical, vetting) still applies.
+// The claim routes need no exception: they never checked visibility. And
+// lokal_info's allowCatalogHidden (the ORDER fixture's exception, for its
+// order flow by id) never reaches the claim fixture.
+
+/** The `agents.origin` the claim-test fixture carries (routes/admin-test-claim-fixture.ts). */
+export const CLAIM_TEST_FIXTURE_ORIGIN = "test_claim_fixture";
+
+/** The claim-test fixture's marker: origin AND catalog_hidden, both. */
+export function isClaimTestFixtureRow(row: { origin?: string | null; catalog_hidden?: number | null } | null | undefined): boolean {
+  return !!row && row.origin === CLAIM_TEST_FIXTURE_ORIGIN && Number(row.catalog_hidden) === 1;
+}
+
+/** GET /agents/:id/info's exception: the claim-test fixture, armed (is_active = 1; retire turns it off). */
+export function isArmedClaimTestFixtureRow(
+  row: { origin?: string | null; catalog_hidden?: number | null; is_active?: number | null } | null | undefined,
+): boolean {
+  return isClaimTestFixtureRow(row) && Number(row!.is_active) === 1;
+}
+
+const asPublicViewStore = new AsyncLocalStorage<true>();
+
+/** Is the current request an admin's «Vis som offentlig» view? */
+export function isAsPublicView(): boolean {
+  return asPublicViewStore.getStore() === true;
+}
+
+/** Run `fn` (and everything it awaits) as an as-public view. */
+export function runAsPublicView<T>(fn: () => T): T {
+  return asPublicViewStore.run(true, fn);
+}
+
 /** The catalog_hidden half of the predicate on its own. */
-export function notCatalogHiddenSql(alias?: string): string {
-  return `COALESCE(${col(alias, "catalog_hidden")}, 0) = 0`;
+export function notCatalogHiddenSql(alias?: string, opts: { asPublic?: boolean } = {}): string {
+  const base = `COALESCE(${col(alias, "catalog_hidden")}, 0) = 0`;
+  // As-public view: the fixture reads as not hidden. COALESCE keeps the OR
+  // two-valued, so NOT (…) (notPubliclyListableAgentIdsSql) stays exact.
+  if (opts.asPublic !== false && isAsPublicView()) {
+    return `(${base} OR COALESCE(${col(alias, "origin")}, '') = '${TEST_FIXTURE_ORIGIN}')`;
+  }
+  return base;
+}
+
+/** In-memory twin of notCatalogHiddenSql() for a raw `agents` row. */
+function catalogHiddenForView(row: { catalog_hidden?: number | null; origin?: string | null }): boolean {
+  if ((row.catalog_hidden ?? 0) === 0) return false;
+  return !(isAsPublicView() && row.origin === TEST_FIXTURE_ORIGIN);
+}
+
+// ─── No contact details for a catalog_hidden row (Claude directory checklist,
+// 2026-11-07) ─────────────────────────────────────────────────────────────────
+// lokal_info passes `allowCatalogHidden` (and the ungated by-id surfaces answer
+// any id with OWNER_VISIBILITY_ENFORCE_BY_ID off), so the hidden test fixture
+// is still described by id — it must stay orderable by product id. Its contact
+// details (address, phone, e-mail, website, vCard) belong to a real person and
+// must appear in no public answer. Same "hidden for this view" rule as the
+// lists (catalogHiddenForView): inside the admin as-public view the ORDER
+// fixture reads as public, contact included; every other catalog_hidden row
+// (the claim-test fixture too) never shows contact details.
+
+/** The one line a hidden row shows where its contact block would be. */
+export const HIDDEN_CONTACT_NOTE_NB = "Kontaktinformasjon vises ikke for denne profilen.";
+
+/** Contact fields of a knowledge object that a hidden row never shows. */
+export const HIDDEN_ROW_CONTACT_FIELDS = ["address", "postalCode", "phone", "email", "website"] as const;
+
+/** Are this raw `agents` row's contact details withheld on a public answer? */
+export function contactHiddenForView(row: { catalog_hidden?: number | null; origin?: string | null } | null | undefined): boolean {
+  return !!row && catalogHiddenForView({ catalog_hidden: row.catalog_hidden == null ? 0 : Number(row.catalog_hidden), origin: row.origin });
+}
+
+/**
+ * contactHiddenForView() for a caller that only holds an id. An unknown id or
+ * a failed read (a schema without the column) is false: the answer is then
+ * exactly today's.
+ */
+export function isContactHiddenAgentId(
+  db: { prepare(sql: string): { get(...params: unknown[]): unknown } },
+  agentId: string,
+): boolean {
+  try {
+    const row = db.prepare("SELECT catalog_hidden, origin FROM agents WHERE id = ?").get(agentId) as
+      { catalog_hidden: number | null; origin: string | null } | undefined;
+    return contactHiddenForView(row);
+  } catch {
+    return false;
+  }
+}
+
+/** Marker that replaces e-mail, link and phone text in a hidden row's free text. */
+export const CONTACT_TEXT_REDACTION_NB = "[kontaktinfo fjernet]";
+
+// E-mail, any case. The lookbehind lets a match start only where a local
+// part starts, so text without "@" is scanned once (no quadratic retries).
+const REDACT_EMAIL_RE = /(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/gi;
+const REDACT_URL_RE = /(?:https?:\/\/|www\.)[^\s<>"')\]]*[^\s<>"')\].,;:!?]/gi;
+// Bare domain: a label, then a known TLD (any case: "gard.no", "GARD.NO"), not
+// followed by more word characters. "egg.Neste" or "2.5 kg" never match; a path
+// after the domain goes with it.
+const REDACT_DOMAIN_RE = /(?<![A-Za-z0-9@.-])[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.(?:no|com|org|net|dk|se|fi|eu|io|info|nu)(?![A-Za-z0-9-])(?:\/[^\s<>"')\]]*[^\s<>"')\].,;:!?])?/gi;
+// Norwegian phone: exactly 8 digits — 12345678, 123 45 678 or 12 34 56 78, with
+// the same space, hyphen or dot between all groups (912-34-567, 91.23.45.67) —
+// and an optional +47 / 0047 / 47 prefix. Not preceded by a digit, "." or ","
+// (or digit + "-"), not followed by a digit or by ".", "," or "-" and a digit:
+// so dates (01.05.2026), decimals (12.5), times (10.00-14.00) and postal codes
+// never match.
+const REDACT_PHONE_RE = /(?<![\d.,]|\d-)(?:(?:\+47|0047)[ .-]?|47 )?(?:\d{8}|\d{3}([ .-])\d{2}\1\d{3}|\d{2}([ .-])\d{2}\2\d{2}\2\d{2})(?!\d|[.,-]\d)/g;
+
+/**
+ * Replaces e-mail addresses, links and Norwegian phone numbers in free text
+ * with CONTACT_TEXT_REDACTION_NB. Conservative: prices, kg amounts, years and
+ * 4-digit postal codes are left alone. Pure.
+ */
+export function redactContactText(text: string): string {
+  if (typeof text !== "string" || !text) return text;
+  return text
+    .replace(REDACT_EMAIL_RE, CONTACT_TEXT_REDACTION_NB)
+    .replace(REDACT_URL_RE, CONTACT_TEXT_REDACTION_NB)
+    .replace(REDACT_DOMAIN_RE, CONTACT_TEXT_REDACTION_NB)
+    .replace(REDACT_PHONE_RE, CONTACT_TEXT_REDACTION_NB);
+}
+
+/**
+ * A copy of a knowledge object without HIDDEN_ROW_CONTACT_FIELDS, with
+ * externalLinks and images emptied and contact text in `about` and the
+ * HIDDEN_ROW_FREE_TEXT_FIELDS redacted (the same value when it is no object).
+ */
+export function withoutContactFields<T>(k: T): T {
+  if (!k || typeof k !== "object") return k;
+  const out: any = { ...(k as any) };
+  for (const f of HIDDEN_ROW_CONTACT_FIELDS) delete out[f];
+  out.externalLinks = [];
+  out.images = [];
+  if (typeof out.about === "string") out.about = redactContactText(out.about);
+  return redactKnowledgeFreeText(out);
+}
+
+/** Free-text knowledge fields a hidden row shows only with contact text redacted. */
+export const HIDDEN_ROW_FREE_TEXT_FIELDS = ["description", "specialties", "paymentMethods", "deliveryOptions", "openingHours"] as const;
+
+// Opening-hours entry keys left as stored: schema.org dayOfWeek may be a URI
+// ("https://schema.org/Saturday") the URL pattern would otherwise eat, and the
+// validity dates are dates. Every other string in an entry (note, description,
+// hours, period, day/days labels, and open/close/opens/closes/from/to — a clock
+// time there never matches, free text there is redacted) can be rendered as
+// free text by utils/opening-hours.ts.
+const OPENING_HOURS_KEPT_KEYS = new Set(["dayOfWeek", "validFrom", "validThrough"]);
+
+function redactStringsDeep(v: unknown): unknown {
+  if (typeof v === "string") return redactContactText(v);
+  if (Array.isArray(v)) return v.map(redactStringsDeep);
+  return v;
+}
+
+function redactOpeningHoursEntry(e: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(e)) {
+    out[key] = OPENING_HOURS_KEPT_KEYS.has(key) ? value : redactStringsDeep(value);
+  }
+  return out;
+}
+
+function redactFreeTextValue(v: unknown): unknown {
+  if (typeof v === "string") return redactContactText(v);
+  if (Array.isArray(v)) {
+    return v.map((e) => {
+      if (typeof e === "string") return redactContactText(e);
+      if (Array.isArray(e)) return redactStringsDeep(e);
+      // An opening-hours entry object, in any stored form.
+      if (e && typeof e === "object") return redactOpeningHoursEntry(e as Record<string, unknown>);
+      return e;
+    });
+  }
+  return v;
+}
+
+/**
+ * A copy of a knowledge object with redactContactText run over
+ * HIDDEN_ROW_FREE_TEXT_FIELDS: strings, string entries of arrays (also
+ * nested), and every string value of an opening-hours entry object except
+ * dayOfWeek / validFrom / validThrough (see OPENING_HOURS_KEPT_KEYS).
+ * Numbers, booleans and null are untouched. Only for a contact-hidden row.
+ * The same value when it is no object.
+ */
+export function redactKnowledgeFreeText<T>(k: T): T {
+  if (!k || typeof k !== "object") return k;
+  const out: any = { ...(k as any) };
+  for (const f of HIDDEN_ROW_FREE_TEXT_FIELDS) {
+    if (f in out) out[f] = redactFreeTextValue(out[f]);
+  }
+  return out;
 }
 
 /**
@@ -43,6 +284,7 @@ export function notCatalogHiddenSql(alias?: string): string {
  * without a fixture (including the minimal hand-built schemas older tests
  * use). Ids come from our own table and are quote-escaped. A failed read
  * (no column) also yields "" — fail-open, the fixture is merely re-verified.
+ * Deliberately NOT affected by the as-public view: not a public surface.
  */
 export function catalogHiddenIdExclusionSql(
   db: { prepare(sql: string): { all(...params: unknown[]): unknown[] } },
@@ -61,14 +303,23 @@ export function catalogHiddenIdExclusionSql(
 /**
  * SQL fragment for "publicly listable on an RFB surface". `alias` is the
  * table alias the caller's query uses for `agents` (omit for an unaliased
- * `FROM agents`). Always wrap-safe: it is a plain AND-chain with no OR, so it
- * can be appended as `AND ${publicListableSql("a")}` anywhere.
+ * `FROM agents`). Always wrap-safe: it is a plain AND-chain (the as-public
+ * view's OR is parenthesised), so it can be appended as `AND ${publicListableSql("a")}` anywhere.
  */
-export function publicListableSql(alias?: string): string {
-  const base = `${notCatalogHiddenSql(alias)} AND COALESCE(${col(alias, "vertical_id")}, '${RFB_VERTICAL_ID}') = '${RFB_VERTICAL_ID}'`;
+export function publicListableSql(alias?: string, opts: { ownerChoices?: boolean } = {}): string {
+  // `ownerChoices: false` (SQL that outlives the request) never carries the
+  // request-scoped as-public exception either.
+  const base = `${notCatalogHiddenSql(alias, { asPublic: opts.ownerChoices !== false })} AND COALESCE(${col(alias, "vertical_id")}, '${RFB_VERTICAL_ID}') = '${RFB_VERTICAL_ID}'`;
   // S1b punkt 6: with OWNER_PAUSE_ENABLED on, an owner-paused profile is not
   // listable either. Flag off = the exact string above (byte-identical SQL).
-  return ownerPauseEnabled() ? `${base} AND ${notOwnerPausedSql(alias)}` : base;
+  const paused = ownerPauseEnabled() ? `${base} AND ${notOwnerPausedSql(alias)}` : base;
+  // S2c-2: a profile whose owner switched «Profilen er synlig»
+  // (visibility.profile) off is not listable either — same effect as the
+  // pause. "" (the exact string above) unless OWNER_FEATURES_ENFORCE is on and
+  // an allowlisted profile resolves hidden. `ownerChoices: false` is for SQL
+  // that outlives the request (the outreach VIEW built at boot): a baked-in
+  // id list would go stale.
+  return opts.ownerChoices === false ? paused : paused + notOwnerHiddenSql("profile", alias);
 }
 
 // ─── Owner pause — S1b punkt 6 «Pause som virker» (dev-request ─────────────
@@ -149,9 +400,9 @@ export function notPubliclyListableAgentIdsSql(): string {
  * In-memory twin of publicListableSql() for a raw `agents` row (snake_case
  * columns). Missing/NULL columns read exactly like the SQL COALESCE defaults.
  */
-export function isPubliclyListable(row: ({ catalog_hidden?: number | null; vertical_id?: string | null } & OwnerPauseRow) | null | undefined): boolean {
+export function isPubliclyListable(row: ({ catalog_hidden?: number | null; vertical_id?: string | null; origin?: string | null } & OwnerPauseRow) | null | undefined): boolean {
   if (!row) return false;
-  if ((row.catalog_hidden ?? 0) !== 0) return false;
+  if (catalogHiddenForView(row)) return false;
   if (ownerPauseEnabled() && isOwnerPaused(row)) return false;
   return (row.vertical_id ?? RFB_VERTICAL_ID) === RFB_VERTICAL_ID;
 }
@@ -186,6 +437,7 @@ export function hasProducerPage(
         is_vetted?: number | null;
         catalog_hidden?: number | null;
         vertical_id?: string | null;
+        origin?: string | null;
       }
     | null
     | undefined,
@@ -214,13 +466,19 @@ export function hasProducerPage(
 // `is_active = 0` is no longer served by id, and the ungated surfaces gain the
 // quarantine rule — sits behind OWNER_VISIBILITY_ENFORCE_BY_ID (default OFF:
 // with the flag unset every call below answers exactly as the surface did
-// before). S2 will teach this predicate to read the owner's visibility choice.
+// before). S2c-2 adds the owner's visibility choice (see the end of this file).
 //
 // Deliberate deviation: lokal_info passes `allowCatalogHidden` because the
 // hidden RFB test fixture (catalog_hidden = 1) must stay orderable by id
 // (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt AC1/AC2 —
 // the order flow resolves product ids through lokal_info). It is still
 // subject to is_active / vertical / vetted.
+//
+// Second deliberate deviation (dev-request 2026-11-01-rfb-kravflyt-tal-
+// eiere-fra-e-post, AC6, option A): GET /agents/:id/info passes
+// `claimTestFixtureInfo`, so the ARMED claim-test fixture is served there and
+// on no other gated surface (see CLAIM_TEST_FIXTURE_ORIGIN above). With the
+// flag off the ungated surfaces still answer any existing id, as before.
 
 /** Env flag (read at call time, "1" or "true" = on). Default OFF. */
 export const BY_ID_VISIBILITY_FLAG = "OWNER_VISIBILITY_ENFORCE_BY_ID";
@@ -249,13 +507,36 @@ export interface AgentVisibilityOptions {
   surface: "gated" | "ungated";
   /** Keep the catalog_hidden test fixture reachable (lokal_info only). */
   allowCatalogHidden?: boolean;
+  /**
+   * The armed claim-test fixture reads as not hidden (isArmedClaimTestFixtureRow).
+   * Passed by GET /api/marketplace/agents/:id/info ONLY — see the block at the
+   * top of this file. No other row and no other surface is affected.
+   */
+  claimTestFixtureInfo?: boolean;
+  /**
+   * S2c-2: "ai" = an AI-facing surface (MCP, A2A): the owner's «Synlig for
+   * AI-assistenter» (visibility.ai_assistants) applies on top of
+   * visibility.profile. Default: only visibility.profile.
+   */
+  audience?: OwnerVisibilityAudience;
+  /** S2c-2: the row's id, so the owner's visibility choice can be read (isAgentPubliclyVisible). */
+  agentId?: string;
+}
+
+/**
+ * A self-registered profile still waiting for a human review
+ * (self-registered-review-approve sets is_vetted = 1). Only the vetting half
+ * of the quarantine rule — listability is checked separately.
+ */
+export function isAwaitingSelfRegisteredReview(row: { origin?: string | null; is_vetted?: number | null }): boolean {
+  return row.origin === "self_registered" && row.is_vetted !== 1;
 }
 
 /** Today's quarantine rule (what isQuarantinedFromPublicView() has always answered). */
 function quarantinedToday(row: AgentVisibilityRow, allowCatalogHidden: boolean): boolean {
   const listable = isPubliclyListable(allowCatalogHidden ? { ...row, catalog_hidden: 0 } : row);
   if (!listable) return true;
-  return row.origin === "self_registered" && row.is_vetted !== 1;
+  return isAwaitingSelfRegisteredReview(row);
 }
 
 /**
@@ -266,14 +547,23 @@ function quarantinedToday(row: AgentVisibilityRow, allowCatalogHidden: boolean):
  */
 export function isAgentPubliclyVisible(row: AgentVisibilityRow | null | undefined, opts: AgentVisibilityOptions): boolean {
   if (!row) return false;
+  if (opts.agentId && isDelistedAgentId(opts.agentId)) return false;
   // S1b punkt 6: an owner-paused profile is served on no by-id surface
   // (independent of OWNER_VISIBILITY_ENFORCE_BY_ID). Flag off = skipped.
   if (ownerPauseEnabled() && isOwnerPaused(row)) return false;
+  // S2c-2: the owner's visibility choice (no query unless enforced + allowlisted).
+  if (opts.agentId && ownerHidesAgent(opts.agentId, audienceChoice(opts.audience))) return false;
+  // The claim-test fixture's one exception (GET /agents/:id/info only): its
+  // catalog_hidden reads as 0, nothing else changes. false for every other row.
+  const claimFixture = opts.claimTestFixtureInfo === true && isArmedClaimTestFixtureRow(row);
   if (!byIdVisibilityEnforced()) {
-    return opts.surface === "gated" ? !quarantinedToday(row, false) : true;
+    return opts.surface === "gated" ? !quarantinedToday(row, claimFixture) : true;
   }
   if (row.is_active != null && !row.is_active) return false;
-  return !quarantinedToday(row, opts.allowCatalogHidden === true);
+  // lokal_info's allowCatalogHidden is the ORDER fixture's exception (its
+  // order flow by id); it never reaches the claim-test fixture.
+  const allowHidden = (opts.allowCatalogHidden === true && !isClaimTestFixtureRow(row)) || claimFixture;
+  return !quarantinedToday(row, allowHidden);
 }
 
 /** Row lookup + isAgentPubliclyVisible() for callers that only hold an id. */
@@ -282,6 +572,10 @@ export function isAgentIdPubliclyVisible(
   agentId: string,
   opts: AgentVisibilityOptions,
 ): boolean {
+  if (isDelistedAgentId(agentId)) return false;
+  // S2c-2: the owner's visibility choice first (no query unless
+  // OWNER_FEATURES_ENFORCE is on and the id is allowlisted).
+  if (ownerHidesAgent(agentId, audienceChoice(opts.audience))) return false;
   // Flag off + ungated: today's answer is "yes" without reading anything.
   const pause = ownerPauseEnabled();
   if (opts.surface === "ungated" && !byIdVisibilityEnforced() && !pause) return true;
@@ -311,4 +605,113 @@ export function publiclyVisibleSql(alias?: string): string {
  */
 export function activeVettedListableSql(alias?: string): string {
   return `${col(alias, "is_active")} = 1 AND ${col(alias, "is_vetted")} = 1 AND ${publicListableSql(alias)}`;
+}
+
+// ─── «Mine valg» — the owner's visibility choices (dev-request ──────────────
+// 2026-10-22-rfb-mine-valg-eierbrytere, slice S2c-2) ─────────────────────────
+// The six «Hvem kan finne deg» keys, enforced through THIS file so every
+// surface asks the same predicate:
+//   profile         visibility.profile — same effect as the owner pause:
+//                   publicListableSql() (search, lists, feeds, sitemap,
+//                   llms*.txt …) and every by-id check above; the profile page
+//                   shows «Midlertidig pause» (isProfileOwnerHidden).
+//   ai_assistants   visibility.ai_assistants — AI-facing surfaces only
+//                   (audience "ai": MCP tools + resource, A2A, the REST
+//                   search/discover API, llms*.txt).
+//   search_engines  visibility.search_engines — noindex on the profile page,
+//                   left out of sitemap.xml (and so of IndexNow).
+//   shopping_feeds  visibility.shopping_feeds — the ACP feed and CSV.
+//   english         visibility.english — no /en profile page, no EN hreflang,
+//                   no EN sitemap entry.
+//   leaderboard     visibility.leaderboard — /api/leaderboard.
+// A key is hidden for a profile when it OR visibility.profile resolves off
+// (the registry's `requires: visibility.profile`).
+//
+// Gate: OWNER_FEATURES_ENFORCE ("1"/"true") — read here without any import —
+// AND the profile in OWNER_FEATURES_ALLOWED_SUBJECTS (checked by the lazily
+// required owner-features/visibility.ts, which holds the lookup). Gate off:
+// every helper below answers "nothing hidden" without a query or a require,
+// and every SQL fragment is "" (byte-identical SQL). List surfaces get ONE
+// id-set per call (one query for all allowlisted profiles), never a lookup
+// per row. The lazy require keeps this file import-free (marketplace-registry
+// isolation) and avoids an import cycle (database/init imports this file).
+
+export type OwnerVisibilityChoice =
+  | "profile" | "ai_assistants" | "search_engines" | "shopping_feeds" | "english" | "leaderboard";
+
+export const OWNER_VISIBILITY_CHOICES: readonly OwnerVisibilityChoice[] = [
+  "profile", "ai_assistants", "search_engines", "shopping_feeds", "english", "leaderboard",
+];
+
+export type OwnerVisibilityAudience = "all" | "ai";
+
+function audienceChoice(audience: OwnerVisibilityAudience | undefined): OwnerVisibilityChoice {
+  return audience === "ai" ? "ai_assistants" : "profile";
+}
+
+const OWNER_FEATURES_ENFORCE_FLAG = "OWNER_FEATURES_ENFORCE";
+
+/** Is the owner-choice enforcement switched on at all (env only, no DB)? */
+export function ownerVisibilityEnforced(): boolean {
+  const v = process.env[OWNER_FEATURES_ENFORCE_FLAG];
+  return v === "1" || v === "true";
+}
+
+interface OwnerVisibilityModule {
+  ownerHiddenIdsFor(choice: OwnerVisibilityChoice): ReadonlySet<string>;
+  ownerHiddenChoicesFor(agentId: string): ReadonlySet<OwnerVisibilityChoice>;
+}
+
+function ownerVisibilityModule(): OwnerVisibilityModule {
+  return require("../owner-features/visibility") as OwnerVisibilityModule;
+}
+
+const NONE_HIDDEN: ReadonlySet<never> = new Set<never>();
+
+/** Ids of the profiles hidden for `choice` (empty, without a query, when not enforced). */
+export function ownerHiddenAgentIds(choice: OwnerVisibilityChoice): ReadonlySet<string> {
+  if (!ownerVisibilityEnforced()) return NONE_HIDDEN;
+  return ownerVisibilityModule().ownerHiddenIdsFor(choice);
+}
+
+/** The choices that hide this profile (empty, without a query, when not enforced or not allowlisted). */
+export function ownerHiddenChoices(agentId: string): ReadonlySet<OwnerVisibilityChoice> {
+  if (!agentId || !ownerVisibilityEnforced()) return NONE_HIDDEN;
+  return ownerVisibilityModule().ownerHiddenChoicesFor(agentId);
+}
+
+/** Does the owner's choice hide this profile on a `choice` surface? */
+export function ownerHidesAgent(agentId: string, choice: OwnerVisibilityChoice): boolean {
+  return ownerHiddenChoices(agentId).has(choice);
+}
+
+/**
+ * ` AND <alias>.id NOT IN ('…')` for the profiles hidden for `choice`, or ""
+ * when none is (always "" with the gate off). Ids come from our own table
+ * and are quote-escaped. Append it after an existing condition.
+ */
+export function notOwnerHiddenSql(choice: OwnerVisibilityChoice, alias?: string): string {
+  const ids = ownerHiddenAgentIds(choice);
+  if (ids.size === 0) return "";
+  return ` AND ${col(alias, "id")} NOT IN (${[...ids].sort().map((id) => `'${id.replace(/'/g, "''")}'`).join(", ")})`;
+}
+
+/** `list` without the profiles hidden for `choice` — the same array when none is. */
+export function withoutOwnerHidden<T extends { id: string }>(list: T[], choice: OwnerVisibilityChoice): T[] {
+  const ids = ownerHiddenAgentIds(choice);
+  if (ids.size === 0) return list;
+  return list.filter((x) => !ids.has(x.id));
+}
+
+/**
+ * Should /produsent/:slug show «Midlertidig pause» for this profile: owner
+ * pause (OWNER_PAUSE_ENABLED) or visibility.profile off (enforced)? No query
+ * with both gates off.
+ */
+export function isProfileOwnerHidden(
+  db: { prepare(sql: string): { get(...params: unknown[]): unknown } },
+  agentId: string,
+): boolean {
+  if (ownerPauseEnabled() && isOwnerPaused(readOwnerPauseRow(db, agentId))) return true;
+  return ownerHidesAgent(agentId, "profile");
 }

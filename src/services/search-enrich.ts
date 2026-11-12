@@ -932,10 +932,22 @@ function isHighLinkDensityBlock(blockHtml: string): boolean {
 // upstream. Bounding the slice BEFORE any tag-stripping/link-density scan
 // keeps worst-case scan cost flat regardless of how large/broken the input
 // HTML is.
-const MAX_PROSE_SCAN_LEN = 25_000;
+export const MAX_PROSE_SCAN_LEN = 25_000;
 
 export function extractProseText(html: string): string {
   if (!html) return "";
+  const text = flattenHtmlToText(proseHtmlOf(html));
+  return text.slice(0, 20_000);
+}
+
+/**
+ * extractProseText's HTML stage, before tags are flattened to text: the
+ * scan-length cap, the script/style/noscript/template drop, the
+ * nav/header/footer/aside drop and the disguised-nav-menu <ul>/<ol> drop.
+ * Shared by extractProseText and extractProseParagraphs so both read the
+ * page with the same chrome removed. PURE.
+ */
+function proseHtmlOf(html: string): string {
   let h = html.slice(0, MAX_PROSE_SCAN_LEN);
   h = h
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
@@ -944,10 +956,87 @@ export function extractProseText(html: string): string {
     .replace(/<template[\s\S]*?<\/template>/gi, " ");
   h = stripBlocksByTagNames(h, ["nav", "header", "footer", "aside"]);
   h = stripBlocksByTagNames(h, ["ul", "ol"], isHighLinkDensityBlock);
-  const text = decodeHtmlEntities(h.replace(/<[^>]+>/g, " "))
+  return h;
+}
+
+/** Tags → spaces, entities decoded, whitespace collapsed (extractProseText's last step). PURE. */
+function flattenHtmlToText(h: string): string {
+  return decodeHtmlEntities(h.replace(/<[^>]+>/g, " "))
     .replace(/\s+/g, " ")
     .trim();
-  return text.slice(0, 20_000);
+}
+
+// Block-level boundaries for extractProseParagraphs. Inline markup (<a>,
+// <strong>, <span>, <br>, …) is NOT a boundary: it is flattened to a space
+// inside its paragraph, exactly as extractProseText does.
+const PROSE_BLOCK_BOUNDARY_RE =
+  /<\/?(?:p|div|h[1-6]|li|dd|dt|section|article|main|blockquote|figure|figcaption|table|tr|td|th|hr)(?![\w-])[^>]*>/gi;
+
+/**
+ * extractProseText split into its block-level pieces (paragraphs, headings,
+ * list items, …), each flattened the same way, in page order, empty pieces
+ * dropped. Same chrome removal as extractProseText (proseHtmlOf). PURE.
+ *
+ * dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse, spec 2:
+ * extractProseText collapses the whole page into one line, so «the first 2–3
+ * substantial paragraphs of the about page» cannot be read from it.
+ */
+export function extractProseParagraphs(html: string): string[] {
+  if (!html) return [];
+  return proseHtmlOf(html)
+    .split(PROSE_BLOCK_BOUNDARY_RE)
+    .map(flattenHtmlToText)
+    .filter((s) => s.length > 0);
+}
+
+/** summarizeAboutPageProse's default cap (spec 2: «tak på for eksempel 500 tegn»). */
+export const ABOUT_PAGE_PROSE_MAX_CHARS = 500;
+/** A paragraph shorter than this is a heading/caption/CTA, not prose. */
+export const ABOUT_PAGE_PROSE_MIN_PARAGRAPH_CHARS = 60;
+/** At most this many paragraphs are joined. */
+export const ABOUT_PAGE_PROSE_MAX_PARAGRAPHS = 3;
+
+/**
+ * DETERMINISTIC, extractive about-text candidate from an «Om oss»/«Om gården»/
+ * «Historie»/«About» sub-page (dev-request 2026-10-27-rfb-berikelse-om-oss-
+ * sider-til-beskrivelse, spec 2). PURE, no generative text.
+ *
+ * Unlike summarizeAbout it ignores og:description/meta description — on most
+ * CMS sites those are the same site-wide text as the homepage, which is the
+ * thing this candidate is meant to improve on. Instead it takes the first
+ * ABOUT_PAGE_PROSE_MAX_PARAGRAPHS substantial prose paragraphs of the page
+ * (extractProseParagraphs — nav/header/footer/aside and nav-menu lists
+ * removed), in page order. A paragraph counts when it is at least
+ * ABOUT_PAGE_PROSE_MIN_PARAGRAPH_CHARS long, has a sentence ending and clears
+ * classifyAboutCheapBar at that length (not boilerplate/cookie text, not
+ * mangled, Norwegian); exact repeats are skipped. The joined text is cut to
+ * `maxChars`: at the last sentence end when that keeps at least 40% of it,
+ * else at the last word boundary. "" when no paragraph qualifies. The
+ * caller's quality/substantiation/code/spam guards still apply.
+ */
+export function summarizeAboutPageProse(html: string, maxChars: number = ABOUT_PAGE_PROSE_MAX_CHARS): string {
+  if (!html) return "";
+  const picked: string[] = [];
+  const seen = new Set<string>();
+  for (const p of extractProseParagraphs(html)) {
+    if (picked.length >= ABOUT_PAGE_PROSE_MAX_PARAGRAPHS) break;
+    if (p.length < ABOUT_PAGE_PROSE_MIN_PARAGRAPH_CHARS) continue;
+    if (!/[.!?…](?:["»”)]*)(?:\s|$)/.test(p)) continue;
+    if (classifyAboutCheapBar(p, ABOUT_PAGE_PROSE_MIN_PARAGRAPH_CHARS) !== "ok") continue;
+    const key = p.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    picked.push(p);
+  }
+  if (picked.length === 0) return "";
+  const joined = picked.join(" ");
+  if (joined.length <= maxChars) return joined;
+  const slice = joined.slice(0, maxChars);
+  let sentenceEnd = -1;
+  for (const m of slice.matchAll(/[.!?…](?:["»”)]*)(?=\s|$)/g)) sentenceEnd = m.index! + m[0].length;
+  if (sentenceEnd >= Math.floor(maxChars * 0.4)) return slice.slice(0, sentenceEnd).trim();
+  const lastSpace = slice.lastIndexOf(" ");
+  return (lastSpace > Math.floor(maxChars * 0.4) ? slice.slice(0, lastSpace) : slice).trim();
 }
 
 // Norwegian → category vocabulary, mirroring the platform's canonical map in
@@ -2003,6 +2092,132 @@ export function classifyAboutCheapBar(text: string | null | undefined, minLen = 
  */
 export function meetsAboutCheapBar(text: string | null | undefined, minLen = 80): boolean {
   return classifyAboutCheapBar(text, minLen) === "ok";
+}
+
+/**
+ * Literal nav-chrome markers for looksLikeNavBoilerplate below — a SEPARATE
+ * list from NAV_BOILERPLATE_MARKERS (which meetsAboutQualityBar keeps using,
+ * unchanged). That list's bare "til toppen" is fine for producer about-text
+ * (where it is a "back to top" anchor), but in the experience catalogue
+ * "til toppen" is ordinary summit-hike prose ("Vi tar deg med til toppen av
+ * fjellet."), so here only the full anchor phrase "tilbake til toppen" counts
+ * (PR #1488 review B1). Lowercase, æøå-folded.
+ */
+const EXPERIENCE_NAV_BOILERPLATE_MARKERS: readonly string[] = [
+  "top of page", "hopp til innhold", "tilbake til toppen",
+];
+
+/**
+ * Site-navigation / social-link vocabulary for hasNavWordRun below (lowercase,
+ * æøå-folded via stripNorwegianAccents; multi-word entries are matched as one
+ * unit, so "Kontakt oss" counts once, not as "kontakt" + something). Only used
+ * by the experience-description path (looksLikeNavBoilerplate) — never by
+ * meetsAboutQualityBar / isLikelyNavMenuLeakage.
+ */
+const SITE_NAV_RUN_TERMS: readonly string[] = [
+  // Norwegian
+  "hjem", "heim", "forside", "hovedside", "meny", "kontakt", "kontakt oss", "om oss",
+  "booking", "bestill", "takeaway", "aktiviteter", "historie", "bilder", "galleri",
+  "linker", "lenker", "nyheter", "arrangementer", "priser", "nettbutikk", "blogg",
+  "velg en side",
+  // English
+  "home", "menu", "contact", "contact us", "about", "about us", "gallery", "news",
+  "shop", "blog", "events",
+  // social links
+  "facebook", "instagram", "x", "twitter", "youtube", "tiktok", "linkedin", "rss",
+];
+
+/** SITE_NAV_RUN_TERMS split into token arrays, longest phrase first. */
+const SITE_NAV_RUN_PHRASES: readonly string[][] = SITE_NAV_RUN_TERMS
+  .map((t) => t.split(" "))
+  .sort((a, b) => b.length - a.length);
+
+/** Window (in units: a nav phrase or any other word) and distinct-term floor. */
+const NAV_RUN_WINDOW = 6;
+const NAV_RUN_MIN_DISTINCT = 3;
+
+/**
+ * True if `text` contains a RUN of site-navigation words — leaked menu/social
+ * chrome such as "Hjem Meny Booking Kontakt Bestill Takeaway" or "Facebook X
+ * Instagram RSS". HTML entities are decoded first (`&#8211;`, `&amp;`,
+ * `&nbsp;`). The text is cut into segments at sentence punctuation
+ * (. , ! ? : ;) — punctuation between tokens always breaks a run, so prose
+ * listings like "historie, aktiviteter for barn, bilder" never match. Within a
+ * segment, a nav term only counts when it is written Capitalized (menu labels
+ * are; mid-sentence prose words are not). Flags when any window of
+ * NAV_RUN_WINDOW consecutive units holds ≥ NAV_RUN_MIN_DISTINCT DISTINCT nav
+ * terms. PURE, no network/IO.
+ */
+export function hasNavWordRun(text: string | null | undefined): boolean {
+  if (!text) return false;
+  const decoded = decodeHtmlEntities(String(text));
+  for (const segment of decoded.split(/[.,!?:;]+/)) {
+    const raw = segment
+      .split(/[\s|]+/)
+      .map((t) => t.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ""))
+      .filter((t) => t !== "");
+    if (raw.length < NAV_RUN_MIN_DISTINCT) continue;
+    const folded = raw.map((t) => stripNorwegianAccents(t.toLowerCase()));
+    // Collapse the segment into units: a matched nav phrase (term) or null.
+    const units: (string | null)[] = [];
+    let i = 0;
+    while (i < raw.length) {
+      let matched: string[] | null = null;
+      if (/^\p{Lu}/u.test(raw[i])) {
+        for (const phrase of SITE_NAV_RUN_PHRASES) {
+          if (i + phrase.length > folded.length) continue;
+          if (phrase.every((w, k) => folded[i + k] === w)) { matched = phrase; break; }
+        }
+      }
+      if (matched) {
+        units.push(matched.join(" "));
+        i += matched.length;
+      } else {
+        units.push(null);
+        i += 1;
+      }
+    }
+    for (let start = 0; start < units.length; start++) {
+      const distinct = new Set<string>();
+      for (let k = start; k < Math.min(units.length, start + NAV_RUN_WINDOW); k++) {
+        const u = units[k];
+        if (u !== null) distinct.add(u);
+      }
+      if (distinct.size >= NAV_RUN_MIN_DISTINCT) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * True if `text` looks like leaked NAVIGATION-MENU chrome rather than prose:
+ * an English skip/jump link ("skip to content"), a literal nav marker
+ * (EXPERIENCE_NAV_BOILERPLATE_MARKERS, e.g. "hopp til innhold", "tilbake til
+ * toppen"), or a menu-shaped string (isLikelyNavMenuLeakage: numbered/
+ * pipe-separated/flat-Title-Case menu list or a verbatim repeated
+ * breadcrumb), or an embedded run of site-nav/social-link words
+ * (hasNavWordRun — experience-only, not part of meetsAboutQualityBar). The
+ * nav layer of meetsAboutQualityBar below, WITHOUT its
+ * length (≥80) and Norwegian-language requirements and WITHOUT the bare
+ * "til toppen" marker — for callers whose text can legitimately be short,
+ * English or about summit hikes (stored experience descriptions, see
+ * evaluateContentJudgePromotion in routes/opplevelser.ts). Empty/blank text
+ * returns false (nothing to judge). PURE, no network/IO.
+ */
+export function looksLikeNavBoilerplate(text: string | null | undefined): boolean {
+  if (!text) return false;
+  const trimmed = String(text).replace(/\s+/g, " ").trim();
+  if (trimmed === "") return false;
+  const lowerAscii = stripNorwegianAccents(trimmed.toLowerCase());
+  if (NAV_SKIP_OR_JUMP_LINK_RE.test(lowerAscii)) return true;
+  for (const marker of EXPERIENCE_NAV_BOILERPLATE_MARKERS) {
+    if (lowerAscii.includes(marker)) return true;
+  }
+  if (isLikelyNavMenuLeakage(trimmed)) return true;
+  // 2026-11-10: a run of site-nav / social-link words embedded in otherwise
+  // prose-like text (e.g. "Anno &#8211; Spise og Drikke Hjem Meny ... Booking
+  // Kontakt Bestill Takeaway Velkommen til Anno ..."), see hasNavWordRun.
+  return hasNavWordRun(trimmed);
 }
 
 /**

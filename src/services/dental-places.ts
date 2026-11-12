@@ -29,6 +29,9 @@ import { isConfidentPlaceMatch as isConfidentSharedPlaceMatch } from "./places-m
 // Phase 2G leaves out places.internationalPhoneNumber, places.websiteUri and
 // places.regularOpeningHours: the mask is then displayName, formattedAddress,
 // businessStatus and addressComponents. The list above is the switch-on mask.
+// Since A5 (places-match.ts PLACES_ADDRESS_FETCH_ENABLED = false) it also
+// leaves out places.formattedAddress; with both switches off Phase 2G selects
+// no clinic and sends nothing to Google.
 export interface PlacesTimePoint {
   day?: number; // 0=Sunday .. 6=Saturday
   hour?: number;

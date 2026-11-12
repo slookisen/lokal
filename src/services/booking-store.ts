@@ -15,6 +15,7 @@ import { z } from "zod";
 import { getDb } from "../database/db-factory";
 import { emailService } from "./email-service";
 import { crmFromHeader } from "./crm-platform-identity";
+import { tokenLogLabel } from "../utils/log-label";
 
 const VERTICAL = "experiences";
 const APP_URL = process.env.APP_URL || "https://opplevagent.no";
@@ -561,8 +562,9 @@ ${statusUrl ? `<p>Du kan når som helst se gjeldende status her: <a href="${stat
     ],
   });
 
-  // Producer confirm link — logged so Daniel can verify manually
-  console.log(`[booking] ${booking.booking_ref} confirm_url=${confirmUrl}`);
+  // Producer confirm link sent. Never log the URL itself: it carries the
+  // producer's confirm_token (T1, eierportal bølge 0) — log a hash label.
+  console.log(`[booking] ${booking.booking_ref} confirm link sent (token ${tokenLogLabel(booking.confirm_token)})`);
 }
 
 // ─── Producer notification email (dev-request 2026-07-12-gardssalg-dark-
@@ -1353,7 +1355,10 @@ export async function processBookingFollowups(
           UPDATE gardssalg_bookings SET expired_guest_notified_at = ?
           WHERE booking_id = ? AND expired_guest_notified_at IS NULL
         `).run(now.toISOString(), booking.booking_id);
-        if (claim.changes === 1) {
+        if (claim.changes === 1 && !booking.guest_email?.trim()) {
+          // Guest contact already cleared by the gardssalg-guest-contact-sweep:
+          // nothing to e-mail. The claim stays set so the row is not re-examined.
+        } else if (claim.changes === 1) {
           try {
             await sendPrevisitExpiredToGuest(booking);
             result.expired_guests_notified++;

@@ -620,6 +620,9 @@ export async function runAdminEnrichmentWritePauseTests(
         // — plus its own test file, which sets up pause state directly via
         // the service to prove the wiring.
         "routes/admin-agents-content-correction.ts",
+        // S2w: the content-correction tests set pause state via the service
+        // to prove the list/product fields are gated too.
+        "routes/admin-agents-content-quality.test.ts",
       "routes/admin-agents-description-code-artifact-sweep.test.ts",
         "routes/admin-agents-description-code-artifact-sweep.ts",
       "routes/admin-agents-internal-note-sweep.ts",
@@ -642,6 +645,11 @@ export async function runAdminEnrichmentWritePauseTests(
         // SAME shared opplevelser.ts helper, plus its own test file, which
         // sets/clears the pause via the service to prove the wiring.
         "routes/opplevelser-experience-description-write.test.ts",
+        // experience-facts-write (dev-request 2026-10-16-opplevagent-
+        // katalogfakta-alder-og-title-no, S3a): gated by the SAME shared
+        // opplevelser.ts helper; its test file sets/clears the pause via the
+        // service to prove the 423.
+        "routes/experience-facts-proposals.test.ts",
         // experiences-data-corrections (+ /revert): two more routes gated by
         // the SAME shared opplevelser.ts helper, plus their own test file,
         // which sets/clears the pause via the service to prove the wiring.
@@ -675,6 +683,18 @@ export async function runAdminEnrichmentWritePauseTests(
         // the experiences pause before fetching/applying; its test file sets
         // the pause via the service to prove that.
         "services/experience-description-proposals-job.test.ts",
+        // A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
+        // felles-serverjobbramme, step 3n: the org.nr daily job checks the
+        // experiences pause before every apply tick (the services it drives do
+        // not check it themselves).
+        "services/experience-orgnr-job.ts",
+        // Step 3f: the gårdssalg website-verification daily job checks the
+        // experiences pause before every apply page (and treats a pause thrown
+        // by the apply as paused).
+        "services/gardssalg-website-verification-job.ts",
+        // Step 3m: the gårdssalg review-queue parking daily job checks the
+        // experiences pause before every apply run.
+        "services/gardssalg-website-review-queue-park-job.ts",
         // The description proposals job itself no longer imports the guard:
         // its mechanics moved VERBATIM into services/proposal-file-queue.ts
         // (tillegg 2026-10-15 «4b-forslag»), which checks the experiences
@@ -683,6 +703,20 @@ export async function runAdminEnrichmentWritePauseTests(
         // pause via the service to prove it, same convention as the others.
         "services/proposal-file-queue.ts",
         "services/gardssalg-visit-proposals-job.test.ts",
+        // experience-facts-proposals-job (S3b, dev-request 2026-10-16-
+        // opplevagent-katalogfakta-alder-og-title-no): the third lane on the
+        // same queue; its test file sets the pause via the service to prove
+        // the tick is skipped before any GitHub fetch.
+        "services/experience-facts-proposals-job.test.ts",
+        // experience-content-judgement-job (skive 3k, same dev-request): the
+        // job runs on the same queue; its apply step re-checks the pause per
+        // row through opplevelser.ts's shared helper. Its test file sets the
+        // pause via the service to prove both.
+        "services/experience-content-judgement-job.test.ts",
+        // gardssalg-website-judgement-job (skive 3j, same dev-request): same
+        // shape as the content-judgement job above; its test file sets the
+        // pause via the service to prove the whole-file gate.
+        "services/gardssalg-website-judgement-job.test.ts",
         // gardssalg-content-refresh-job («4b-det», A2A dev-request 2026-10-06-
         // experiences-enrichment-plattformjobb-og-felles-serverjobbramme,
         // tillegg 2026-10-15): the daily job drives the SAME shared core as
@@ -690,6 +724,11 @@ export async function runAdminEnrichmentWritePauseTests(
         // experiences pause itself (423); the job imports only the status
         // constant to recognise that 423 and end the run as `paused`.
         "services/gardssalg-content-refresh-job.ts",
+        // gardssalg-self-register (dev-request 2026-11-01-opplevagent-
+        // drikkeprodusent-selvregistrering, skive 1): the public
+        // /for-tilbydere/registrer form creates an experience_providers row,
+        // so it checks the experiences pause before writing anything.
+        "services/gardssalg-self-register.ts",
         "services/rfb-marketing-daily.test.ts",
         "services/rfb-marketing-daily.ts",
         // dev-request 2026-10-10-rfb-berikelse-nattjobb (R6): the nightly RFB
@@ -698,11 +737,44 @@ export async function runAdminEnrichmentWritePauseTests(
         // the pause via the service to prove the writing steps stop.
         "services/rfb-enrichment-nightly.test.ts",
         "services/rfb-enrichment-nightly.ts",
+        // dev-request 2026-11-01-rfb-hold-profilen-oppdatert: the owner refresh
+        // (step 6 of the nightly run, which checks the pause) — its test file
+        // sets the pause via the service to prove the owner step stops.
+        "services/rfb-owner-refresh.test.ts",
         // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-
         // places-treffvakt (S3): the Places match guard's test file sets the
         // rfb pause via the service to prove both google-rating routes still
         // answer 423 before any Places call (acceptance h).
         "routes/rfb-places-match-guard.test.ts",
+        // dev-request 2026-10-27-dental-skrivepause-gjerde-mangler-paa-
+        // tannlege-put (P0): the dental router (PUT /agents/:id, claim-batch,
+        // stage-v-drift-result, google-places-batch write mode) checks the
+        // dental pause through one shared helper; its test file sets/clears
+        // the pause via the service to prove the wiring.
+        "routes/dental.ts",
+        "routes/dental-enrichment-write-pause.test.ts",
+        // The shared dental helper (enrichmentWritePauseBlock(() => getDb("rfb"),
+        // "dental")) used by dental.ts, the admin-dental-* apply sweeps and the
+        // geocode worker, plus the sweeps' own direct pause-constant imports.
+        "services/dental-enrichment-write-pause.ts",
+        "routes/admin-dental-brreg-address-sweep.ts",
+        "routes/admin-dental-hjemmeside-cleanup.ts",
+        "routes/admin-dental-hjemmeside-discovery.ts",
+        "routes/admin-dental-offentlig-klinikk-hjemmeside-korrigering.ts",
+        "routes/admin-dental-schema-probe-sweep.ts",
+        "routes/admin-dental-wrong-entity-retro-sanitize.ts",
+        "routes/admin-dental-write-pause.test.ts",
+        // dev-request 2026-09-02-dental-permanent-triage-needs-review-drain
+        // (3c-1): the dental-triage job and its /run route check the dental
+        // pause before writing; its test file sets/clears the pause.
+        "routes/admin-dental-triage.ts",
+        "services/dental-triage.ts",
+        "services/dental-triage.test.ts",
+        // Slice 3c-2: the dental-triage judgement job (shared file queue with
+        // pauseVertical "dental") re-checks the dental pause before the file
+        // and before each row's write; its test file sets/clears the pause.
+        "services/dental-triage-judgement-job.ts",
+        "services/dental-triage-judgement-job.test.ts",
       ].sort(),
       "ewp-125: the guard is imported by exactly the gated surfaces, the shared write primitives, its own admin route, and the test files",
     );

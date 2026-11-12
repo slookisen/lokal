@@ -16,6 +16,7 @@
 
 import { readFileSync, existsSync, statSync } from "fs";
 import { join } from "path";
+import { createSwSim } from "./sw-test-harness";
 
 export interface TestSummary {
   passed: number;
@@ -69,7 +70,7 @@ export function runOpplevagentServiceWorkerTests(opts: { log?: boolean } = {}): 
 
   if (mod) {
     assertTrue(typeof mod.shouldBypass === "function", "opplevagent-sw.js exports a shouldBypass(request) guard function");
-    assertTrue(mod.CACHE_VERSION === "opplevagent-pwa-v1", `opplevagent-sw.js CACHE_VERSION is "opplevagent-pwa-v1" (got "${mod.CACHE_VERSION}")`);
+    assertTrue(mod.CACHE_VERSION === "opplevagent-pwa-v2", `opplevagent-sw.js CACHE_VERSION is "opplevagent-pwa-v2" — bumped past v1 so activate deletes old entries (got "${mod.CACHE_VERSION}")`);
     assertTrue(Array.isArray(mod.APP_SHELL) && mod.APP_SHELL.length > 0, "opplevagent-sw.js exports a non-empty APP_SHELL precache list");
 
     if (typeof mod.APP_SHELL !== "undefined") {
@@ -93,6 +94,88 @@ export function runOpplevagentServiceWorkerTests(opts: { log?: boolean } = {}): 
       assertTrue(!mod.shouldBypass(mk(`${origin}/manifest.json`), origin), "shouldBypass: GET /manifest.json (same-origin, not api/admin) is NOT bypassed");
       assertTrue(!mod.shouldBypass(mk(`${origin}/favicon-192.png`), origin), "shouldBypass: GET /favicon-192.png is NOT bypassed");
       assertTrue(!mod.shouldBypass(mk(`${origin}/`), origin), "shouldBypass: GET / (navigation) is NOT bypassed");
+    }
+
+    // ── F-g: owner pages, query URLs and no-store/private responses are never cached ──
+    assertTrue(typeof mod.isCacheableStatic === "function", "opplevagent-sw.js exports isCacheableStatic(url)");
+    assertTrue(typeof mod.isCacheableResponse === "function", "opplevagent-sw.js exports isCacheableResponse(response)");
+    assertTrue(typeof mod.isPrivatePath === "function", "opplevagent-sw.js exports isPrivatePath(pathname)");
+
+    if (typeof mod.shouldBypass === "function") {
+      const origin = "https://opplevagent.no";
+      const mk = (url: string, method = "GET") => ({ url, method } as any);
+      const bypassed = [
+        "/kategori/gardssalg/eier/slug",
+        "/kategori/gardssalg/eier/slug/portal",
+        "/kategori/gardssalg/eier/slug/valg",
+        "/kategori/gardssalg/eier/slug/valg?fragment=1",
+        "/kategori/gardssalg/eier/magic-link-verify",
+        "/Kategori/Gardssalg/Eier/slug",
+        "/kategori/frukt/eier",
+        "/eier/abc/valg",
+        "/sok?q=gard",
+        "/for-tilbydere/finn?q=x",
+        "/favicon-192.png?v=2",
+      ];
+      for (const p of bypassed) {
+        assertTrue(mod.shouldBypass(mk(`${origin}${p}`), origin), `shouldBypass: GET ${p} is bypassed (owner path or query URL)`);
+      }
+      assertTrue(!mod.shouldBypass(mk(`${origin}/kategori/gardssalg`), origin), "shouldBypass: public /kategori/gardssalg is NOT bypassed");
+      assertTrue(!mod.shouldBypass(mk(`${origin}/tilbyder/some-slug`), origin), "shouldBypass: public /tilbyder/:slug is NOT bypassed");
+    }
+
+    if (typeof mod.isCacheableStatic === "function") {
+      const origin = "https://opplevagent.no";
+      const notCacheable = [
+        "/kategori/gardssalg/eier/slug/valg?fragment=1",
+        "/kategori/gardssalg/eier/slug/valg",
+        "/kategori/gardssalg/eier/slug/portal",
+        "/kategori/frukt/eier",
+        "/kategori/frukt/eier/logo.png",
+        "/eier/abc/valg",
+        "/favicon-192.png?v=2",
+        "/manifest.json?x=1",
+        "/",
+        "/sok",
+        "/kategori/gardssalg",
+        "/tilbyder/some-slug",
+        "/opplevelse/some-slug",
+        "/openapi.json",
+        "/agent-card.json",
+        "/llms.txt",
+      ];
+      for (const p of notCacheable) {
+        assertTrue(!mod.isCacheableStatic(`${origin}${p}`), `isCacheableStatic: ${p} is NOT cacheable`);
+      }
+      const cacheable = [
+        "/favicon-192.png",
+        "/favicon.svg",
+        "/manifest.json",
+        "/offline.html",
+        "/logo.svg",
+        "/og/gardssalg.png",
+        "/leaflet/leaflet.css",
+        "/leaflet/leaflet.js",
+        "/install-prompt.js",
+        "/site.webmanifest",
+      ];
+      for (const p of cacheable) {
+        assertTrue(mod.isCacheableStatic(`${origin}${p}`), `isCacheableStatic: ${p} is cacheable`);
+      }
+      for (const p of mod.APP_SHELL as string[]) {
+        assertTrue(mod.isCacheableStatic(`${origin}${p}`), `isCacheableStatic: APP_SHELL entry ${p} is cacheable`);
+      }
+    }
+
+    if (typeof mod.isCacheableResponse === "function") {
+      const res = (cc: string | null, status = 200) =>
+        new Response("x", { status, headers: cc === null ? {} : { "Cache-Control": cc } });
+      assertTrue(mod.isCacheableResponse(res(null)), "isCacheableResponse: 200 without Cache-Control is stored");
+      assertTrue(mod.isCacheableResponse(res("public, max-age=86400")), "isCacheableResponse: 200 public,max-age is stored");
+      assertTrue(!mod.isCacheableResponse(res("no-store")), "isCacheableResponse: Cache-Control: no-store is NOT stored");
+      assertTrue(!mod.isCacheableResponse(res("private")), "isCacheableResponse: Cache-Control: private is NOT stored");
+      assertTrue(!mod.isCacheableResponse(res("max-age=0, No-Store")), "isCacheableResponse: max-age=0, No-Store (mixed case) is NOT stored");
+      assertTrue(!mod.isCacheableResponse(res(null, 404)), "isCacheableResponse: 404 is NOT stored");
     }
   }
 
@@ -141,6 +224,35 @@ export async function runOpplevagentServiceWorkerHttpTests(opts: { log?: boolean
   // off disk, not that opplevagent.no visitors can reach it.
   const filePath = join(__dirname, "opplevagent-sw.js");
   assertTrue(existsSync(filePath), "opplevagent-sw.js exists on disk (served via GET /sw.js in experiences-seo.ts — see experiences-seo-pwa.test.ts for the HTTP-reachability check)");
+
+  // ── F-g: drive the real fetch handler in a sandbox ─────────────────────
+  const swSrc = readFileSync(filePath, "utf8");
+  const origin = "https://opplevagent.no";
+  const sim = createSwSim(swSrc, origin, (url) => {
+    if (url.endsWith("/nostore.png")) return new Response("x", { status: 200, headers: { "Cache-Control": "no-store" } });
+    if (url.endsWith("/private.css")) return new Response("x", { status: 200, headers: { "Cache-Control": "private, max-age=60" } });
+    return new Response("fresh", { status: 200 });
+  });
+
+  for (const p of ["/kategori/gardssalg/eier/slug/valg?fragment=1", "/kategori/gardssalg/eier/slug/valg", "/kategori/gardssalg/eier/slug/portal", "/sok?q=1", "/opplevelse/x", "/openapi.json"]) {
+    const r = await sim.dispatch({ url: `${origin}${p}` });
+    assertTrue(!r.intercepted, `fetch handler: non-navigation GET ${p} is NOT intercepted (no respondWith)`);
+  }
+  const navOwner = await sim.dispatch({ url: `${origin}/kategori/gardssalg/eier/slug/portal`, mode: "navigate" });
+  assertTrue(!navOwner.intercepted, "fetch handler: navigation to the gardssalg owner portal is NOT intercepted");
+  const nav = await sim.dispatch({ url: `${origin}/`, mode: "navigate" });
+  assertTrue(nav.intercepted, "fetch handler: navigation to / is still intercepted (network-first with offline fallback)");
+
+  const icon = await sim.dispatch({ url: `${origin}/favicon-192.png` });
+  assertTrue(icon.intercepted && sim.puts.includes(`${origin}/favicon-192.png`), "fetch handler: normal static 200 response for /favicon-192.png is intercepted and stored");
+  const css = await sim.dispatch({ url: `${origin}/leaflet/leaflet.css` });
+  assertTrue(css.intercepted && sim.puts.includes(`${origin}/leaflet/leaflet.css`), "fetch handler: GET /leaflet/leaflet.css is intercepted and stored");
+  const ns = await sim.dispatch({ url: `${origin}/nostore.png` });
+  assertTrue(ns.intercepted && !sim.puts.includes(`${origin}/nostore.png`), "fetch handler: static response with Cache-Control: no-store is NOT stored");
+  const pv = await sim.dispatch({ url: `${origin}/private.css` });
+  assertTrue(pv.intercepted && !sim.puts.includes(`${origin}/private.css`), "fetch handler: static response with Cache-Control: private is NOT stored");
+  const extra = sim.puts.filter((u) => !u.endsWith("/favicon-192.png") && !u.endsWith("/leaflet/leaflet.css"));
+  assertTrue(extra.length === 0, `fetch handler: nothing but the two static files was ever written to the cache (extra: ${JSON.stringify(extra)})`);
 
   return { passed: passed.n, failed: failed.n, failures };
 }

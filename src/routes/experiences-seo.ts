@@ -25,6 +25,7 @@
 
 import express, { Router, Request, Response, NextFunction } from "express";
 import { createSitemapCache, resolveSitemapCacheTtlMs, logSlowSitemap } from "./sitemap-cache-util";
+import { isAsPublicView } from "../services/agent-visibility";
 import * as QRCode from "qrcode";
 // dev-request 2026-07-19-opplevagent-kart-fylke-gardssalg, slice 1: reads the
 // vendored Leaflet assets (src/public/leaflet/) off disk for the
@@ -35,7 +36,9 @@ import * as fs from "fs";
 import * as path from "path";
 import { analyticsService } from "../services/analytics-service";
 import { recordAiPageDelivery } from "../services/profile-ai-deliveries";
+import { recordAiProfileClick } from "../services/profile-ai-clicks";
 import { aiDeliveriesTileFor } from "../services/profile-ai-deliveries-tile";
+import { aiClicksTileFor } from "../services/profile-ai-clicks-tile";
 import { TRAFFIC_YEAR_KEYS, trafficYearCell, trafficYearLangOf, type TrafficYear, type TrafficYearKey } from "../services/traffic-year-compute";
 import { filterQueryText } from "../services/search-tracking";
 import { getExperiencesAgentCard, OPPLEVAGENT_CUSTOM_GPT_URL } from "../services/experiences-agent-card";
@@ -47,7 +50,8 @@ import { isJunkDescription, looksTruncatedMidWord } from "../services/descriptio
 // dev-request 2026-10-16-utgaende-lenker-utm-eller-referrer-policy (S1): links
 // to the provider's own website carry UTM; booking_url, «Kilde:» and JSON-LD
 // url/sameAs stay as stored.
-import { addUtmParams, OUTBOUND_UTM } from "../utils/url-utm";
+import { addUtmParams, OUTBOUND_UTM, withRequestQuery } from "../utils/url-utm";
+import { profileLinkHref, profileLinkBeaconAttrs, profileClickBeaconScript, profileLinkRedirectHandler } from "../services/profile-link-clicks";
 const PROVIDER_SITE_UTM = OUTBOUND_UTM.opplevagent.provider_profile;
 const GARDSSALG_SITE_UTM = OUTBOUND_UTM.opplevagent.gardssalg_profile;
 // dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E1-S1:
@@ -93,6 +97,7 @@ import { INDEXNOW_KEY } from "../services/indexnow-service";
 import { htmlLangAttr, ogLocale, localizedPath, isSvLocaleEnabled, type Lang } from "../i18n/t";
 import { getPublishedProfileTranslations } from "../services/profile-translations";
 import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
+import { BRAND_ENTITIES, brandMcpIcons } from "../config/brand-entities";
 import {
   listCategories,
   getPublishedExperienceBySlug,
@@ -168,6 +173,8 @@ import { EXPERIENCE_TAGS, type ExperienceTag } from "../services/experience-tags
 // imported here rather than duplicated, so each stamp keeps exactly one
 // reader.
 import { isGardssalgContactEmailFlaggedForReview } from "./opplevelser";
+import { emailRevealGuardEnabled, isCcBotUserAgent, revealEmailFor } from "../services/email-reveal-guard";
+import { EMAIL_TRAP_ROBOTS_DISALLOW, EMAIL_TRAP_ROUTE_PATHS, emailTrapHandler, emailTrapLinkFor } from "../services/email-reveal-trap";
 // dev-request 2026-08-07-orch-fylke-2024-migrasjon: the /fylke/:fylke 301
 // fallback below reuses norway-fylke.ts's own historical-alias map
 // (ALIAS_TO_CANONICAL), merged-legacy equivalence classes
@@ -229,6 +236,8 @@ import {
 // — the SAME shared choke point POST /api/opplevelser/book and the
 // book_gardssalg MCP tool use, never re-derived here.
 import { checkBookingSlotAllowed } from "../services/gardssalg-opening-hours";
+// «Mine valg» booking.pause (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg O1a).
+import { gardssalgBookingPausedByOwner, GARDSSALG_NOT_TAKING_REQUESTS_TEXT } from "../services/gardssalg-booking-gate";
 import { getOaHomeCounters } from "../services/oa-home-counters";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { safeHonestCatalogCount } from "../services/honest-count";
@@ -272,8 +281,26 @@ import { CATEGORY_COLORS, CATEGORY_COLOR_FALLBACK } from "../services/category-p
 // of re-implementing it here.
 import { parseNameLocationSuffix, normaliseHint } from "../services/location-suffix-parser";
 import { capFreeText, capName } from "../utils/free-text";
+import { OPPLEVAGENT_PRICE_MESSAGE } from "../owner-features/price-message";
+// dev-request O4 (= G4), slice O4a: «For tilbydere» with sections and FAQ,
+// behind FOR_TILBYDERE_FAQ_ENABLED. The text is data in its own module.
+import {
+  isForTilbydereFaqEnabled,
+  buildForTilbydereFaqLd,
+  FOR_TILBYDERE_SECTIONS,
+  FOR_TILBYDERE_FAQ_META,
+  type ForTilbydereSection,
+} from "./experiences-for-tilbydere-faq";
+import { createGardssalgSelfRegisterRouter, GARDSSALG_SELF_REGISTER_PATH } from "./gardssalg-self-register";
+import { isGardssalgSelfRegisterEnabled } from "../services/gardssalg-self-register";
+import { faqPairsFromJsonLd, type FaqPair } from "../services/faq-section";
 
 const router = Router();
+
+// S-A4 (dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting):
+// the e-mail trap path. Switch EMAIL_REVEAL_GUARD_EXPERIENCES off → next()
+// (the ordinary 404, as on main).
+router.get(EMAIL_TRAP_ROUTE_PATHS, emailTrapHandler("experiences"));
 
 // Lazy, one-shot backfill of experience_providers.slug (additive migration).
 let _providerSlugBackfillDone = false;
@@ -341,6 +368,11 @@ function pwaHeadTags(opts: { includeThemeColor?: boolean } = {}): string {
 // item 3) so untrusted DB text (provider names, kommune names, …) gets the
 // exact same `& < > " '` escaping there as everywhere else in this file —
 // XML escaping doesn't differ from HTML escaping for that character set.
+/** Gårdssalg guest-contact sweep leaves '' in guest_name/guest_email: render «slettet». */
+export function escapeOrDeleted(text: unknown): string {
+  return typeof text === "string" && text.trim() ? escapeHtml(text) : "slettet";
+}
+
 export function escapeHtml(text: unknown): string {
   return String(text ?? "")
     .replace(/&/g, "&amp;")
@@ -433,6 +465,7 @@ function oaProfileLabels(lang: Lang) {
     provAll: "Alle opplevelser fra denne tilbyderen →", provUnmatched: "Tilbyder er ikke matchet ennå.",
     gsKicker: "Gårdssalg &amp; smaking", gsCrumb: "Gårdssalg og smaking", gsAbout: "Om produsenten", gsVisit: "Besøket", gsPractical: "Praktisk info",
     gsReserve: "Reserver", gsAddress: "Adresse", gsHours: "Åpningstider", gsSite: "Nettside", gsEmail: "E-post",
+    gsEmailReveal: "Vis e-post",
     gsMeta: (navn: string, sted: string) => `${navn}${sted ? " i " + sted : ""} — produsentprofil på Opplevagent med fakta om produsenten.`,
   };
   const en: typeof no = {
@@ -454,6 +487,7 @@ function oaProfileLabels(lang: Lang) {
     provAll: "All experiences from this provider →", provUnmatched: "Provider not matched yet.",
     gsKicker: "Farm sales &amp; tasting", gsCrumb: "Farm sales and tasting", gsAbout: "About the producer", gsVisit: "The visit", gsPractical: "Practical information",
     gsReserve: "Reserve", gsAddress: "Address", gsHours: "Opening hours", gsSite: "Website", gsEmail: "Email",
+    gsEmailReveal: "Show e-mail",
     gsMeta: (navn: string, sted: string) => `${navn}${sted ? " in " + sted : ""} — producer profile on Opplevagent with facts about the producer.`,
   };
   const sv: typeof no = {
@@ -475,6 +509,7 @@ function oaProfileLabels(lang: Lang) {
     provAll: "Alla upplevelser från denna arrangör →", provUnmatched: "Arrangören är inte matchad ännu.",
     gsKicker: "Gårdsförsäljning &amp; provsmakning", gsCrumb: "Gårdsförsäljning och provsmakning", gsAbout: "Om producenten", gsVisit: "Besöket", gsPractical: "Praktisk information",
     gsReserve: "Reservera", gsAddress: "Adress", gsHours: "Öppettider", gsSite: "Webbplats", gsEmail: "E-post",
+    gsEmailReveal: "Visa e-post",
     gsMeta: (navn: string, sted: string) => `${navn}${sted ? " i " + sted : ""} — producentprofil på Opplevagent med fakta om producenten.`,
   };
   if (lang === "en") return en;
@@ -2672,6 +2707,11 @@ router.get(`/${INDEXNOW_KEY}.txt`, (_req: Request, res: Response) => {
 //   /kategori/gardssalg/status/     booking status page (bookingRef+guestToken).
 //   /admin/                         admin surface — X-Admin-Key gated
 //                                   regardless; this is defense-in-depth.
+//   /for-tilbydere/registrer        gårdssalg self-registration form (dev-
+//                                   request 2026-11-01-opplevagent-drikke-
+//                                   produsent-selvregistrering). Served
+//                                   whether GARDSSALG_SELF_REGISTER_ENABLED is
+//                                   on or off (off = 404 there anyway).
 // Every one of these already carries its own noindex meta tag (svar/
 // gjestesvar/status/bekreft render through the shared previsitPage() shell;
 // confirm/eier render their own) — Disallow keeps crawlers from spending
@@ -2694,6 +2734,7 @@ Disallow: /kategori/gardssalg/bekreft/
 Disallow: /kategori/gardssalg/svar/
 Disallow: /kategori/gardssalg/gjestesvar/
 Disallow: /kategori/gardssalg/status/
+Disallow: /for-tilbydere/registrer
 Disallow: /admin/`;
 
 router.get("/robots.txt", (_req: Request, res: Response) => {
@@ -2708,7 +2749,7 @@ router.get("/robots.txt", (_req: Request, res: Response) => {
 # Oversikt:      ${url}/llms.txt
 # Discovery:     ${url}/api/opplevelser/discover
 
-${buildRobotsGroups(GARDSSALG_ROBOTS_DISALLOWS)}
+${buildRobotsGroups(GARDSSALG_ROBOTS_DISALLOWS + "\n" + EMAIL_TRAP_ROBOTS_DISALLOW)}
 
 Sitemap: ${url}/sitemap.xml
 `);
@@ -2929,7 +2970,9 @@ export function __resetExperiencesSitemapCacheForTesting(): void {
 router.get("/sitemap.xml", (_req: Request, res: Response) => {
   const startedAt = Date.now();
   try {
-    const xml = getExperiencesSitemapXml();
+    // «Vis som offentlig» (O2a): an admin's as-public view neither reads nor
+    // fills the cache (it may list the hidden test producer).
+    const xml = isAsPublicView() ? buildExperiencesSitemapXml() : getExperiencesSitemapXml();
     res.setHeader("Content-Type", "application/xml; charset=utf-8");
     res.setHeader("Cache-Control", `public, max-age=${Math.floor(resolveSitemapCacheTtlMs() / 1000)}`);
     res.send(xml);
@@ -3302,7 +3345,7 @@ function experiencesMcpServerCard() {
       url: "https://github.com/slookisen/lokal",
     },
     documentation: `${url}/llms.txt`,
-    icon: `${url}/favicon.svg`,
+    icon: brandMcpIcons(BRAND_ENTITIES.experiences)?.[0]?.src, // the 512 PNG logo (was favicon.svg), as serverInfo icons[0]
     // T3: the organisation behind the server is the company (same as the agent
     // card's provider); `name`/`title` above keep the brand.
     vendor: {
@@ -3719,23 +3762,31 @@ function renderOpplevelseDetail(
     : `<p class="lede lede-soft">Detaljert beskrivelse publiseres fortløpende. ${escapeHtml(displayTitle)} er en ${escapeHtml(catLabel(cat).toLowerCase())}-opplevelse${place ? " i " + escapeHtml(place) : ""}. Se tilbyderens nettside for program, priser og bestilling.</p>`;
 
   // Booking CTA.
+  // dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord S4: the booking
+  // and website links go through the counting redirect GET
+  // /ut/opplevelse/:id/{booking,website} (services/profile-link-clicks.ts),
+  // which reads the same stored columns (experiences.booking_url, the
+  // provider's hjemmeside, website with the same UTM) — never a URL from the
+  // request. The phone link fires the click beacon (data-track-*).
   const bookingUrl = safeHttpUrl(exp.booking_url);
+  const expId = String(exp.id);
+  const siteHref = escapeHtml(profileLinkHref("opplevelse", expId, "website"));
   let cta = "";
   if (bookingUrl) {
-    cta = `<a class="cta" href="${escapeHtml(bookingUrl)}" target="_blank" rel="noopener nofollow">${L.ctaBook}</a>`;
+    cta = `<a class="cta" href="${escapeHtml(profileLinkHref("opplevelse", expId, "booking"))}" target="_blank" rel="noopener nofollow">${L.ctaBook}</a>`;
   } else if (provSite) {
-    cta = `<a class="cta" href="${escapeHtml(addUtmParams(provSite, PROVIDER_SITE_UTM.source, "referral", PROVIDER_SITE_UTM.campaign))}" target="_blank" rel="noopener nofollow">${L.ctaSite}</a>`;
+    cta = `<a class="cta" href="${siteHref}" target="_blank" rel="noopener nofollow">${L.ctaSite}</a>`;
   } else {
     cta = `<p class="cta-soft">${L.ctaSoft}</p>`;
   }
   // Phone — rendered only when the provider has one on file (no fabrication).
   const phoneBlock = provTel
-    ? `<p class="prov-phone">${L.phone}: <a href="tel:${escapeHtml(provTel.replace(/\s+/g, ""))}">${escapeHtml(provTel)}</a></p>`
+    ? `<p class="prov-phone">${L.phone}: <a href="tel:${escapeHtml(provTel.replace(/\s+/g, ""))}"${profileLinkBeaconAttrs("opplevelse", expId, "phone")}>${escapeHtml(provTel)}</a></p>${profileClickBeaconScript()}`
     : "";
 
   // Provider card.
   const provInner = provName
-    ? `<p class="prov-name">${provSite ? `<a href="${escapeHtml(addUtmParams(provSite, PROVIDER_SITE_UTM.source, "referral", PROVIDER_SITE_UTM.campaign))}" target="_blank" rel="noopener">${escapeHtml(provName)}</a>` : escapeHtml(provName)}</p>
+    ? `<p class="prov-name">${provSite ? `<a href="${siteHref}" target="_blank" rel="noopener nofollow">${escapeHtml(provName)}</a>` : escapeHtml(provName)}</p>
        ${brregVerified ? `<p class="prov-verified">${L.provVerified}${orgNr ? ` · org.nr ${escapeHtml(orgNr)}` : ""}</p>` : `<p class="prov-soft">${L.provPending}</p>`}
        <p class="prov-link"><a href="/tilbyder/${escapeHtml(String(provider!.slug || provider!.id))}">${L.provAll}</a></p>`
     : `<p class="prov-soft">${L.provUnmatched}</p>`;
@@ -4035,6 +4086,7 @@ ${oaSiteNav({ lang: uiLang, path: noPath, switcher: switcherOn })}
     <div class="badges">${badges.join("")}</div>
   </header>
   ${aiDeliveriesTileFor("experiences", exp.id)}
+  ${aiClicksTileFor("experiences", exp.id)}
   <div class="layout">
     <article>
       ${heroMedia}
@@ -6155,6 +6207,59 @@ export function decideOwnerCtaSwap(
   };
 }
 
+// ─── E-mail on the gårdssalg producer profile (dev-request
+// 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting, slice 4: S-A1
+// and S-A3 on opplevagent.no /kategori/gardssalg/produsent/:providerSlug) ───
+// With EMAIL_REVEAL_GUARD_EXPERIENCES on, the profile page gives the
+// producer's own e-mail (the «E-post» fact row's mailto: and JSON-LD `email`)
+// only within the per-IP limit of services/email-reveal-guard.ts — one
+// experiences counter per client, and a profile seen again in the window is
+// free. Over the limit the fact row shows «Vis e-post», a plain link to GET
+// /kategori/gardssalg/produsent/:providerSlug/epost (no script), and the
+// address is nowhere in the HTML; JSON-LD has no `email`. CCBot (S-A3) gets
+// neither the address nor «Vis e-post», also on its first request, and spends
+// no budget. The guard comes on top of the AC4 review gate (epostUnderReview):
+// a flagged address is still shown nowhere, costs nothing and is never
+// revealed by the endpoint either. With the switch on the page depends on the
+// client, so it is Cache-Control: private. Switch off: revealEmailFor is not
+// called and the page and its headers are byte-identical to main. Platform
+// addresses (kontakt@opplevagent.no) are not producer e-mail and are left
+// alone. The guard's log line carries profile ids and counts only, never an
+// address or an IP.
+
+/** The path of the «Vis e-post» endpoint for a producer slug (localized like the profile's links). */
+export function gardssalgEmailRevealPath(slug: string, lang: Lang = "no"): string {
+  return localizedPath(`/kategori/gardssalg/produsent/${encodeURIComponent(slug)}/epost`, lang);
+}
+
+/**
+ * The producer's e-mail as the «Vis e-post» endpoint may give it: the stored
+ * address unless empty or under review (AC4), and only for a row that is
+ * neither hidden nor the test producer (those reach the profile page only in
+ * an admin's «Vis som offentlig» request). null = 404.
+ */
+function gardssalgRevealableEmail(provider: GardssalgProviderRow): string | null {
+  if (Number(provider.catalog_hidden) === 1 || Number(provider.is_test_provider) === 1) return null;
+  const epost = provider.epost;
+  if (!epost || isGardssalgContactEmailFlaggedForReview(provider.field_provenance, epost)) return null;
+  return epost;
+}
+
+/**
+ * How the profile shows the producer's e-mail to this request: null = switch
+ * off (change nothing); "show" = as today; "reveal" = «Vis e-post» without the
+ * address; "none" = nothing (CCBot, or no e-mail shown).
+ */
+function gardssalgProfileEmailView(req: Request, provider: GardssalgProviderRow, email: string | null): "show" | "reveal" | "none" | null {
+  if (!emailRevealGuardEnabled("experiences")) return null;
+  const providerId = String(provider.id ?? "");
+  if (!email || !providerId) return "none";
+  const allowed = revealEmailFor(req, "experiences", [providerId]);
+  if (allowed !== null && allowed.has(providerId)) return "show";
+  // No «Vis e-post» for CCBot, nor where the endpoint would answer 404.
+  return isCcBotUserAgent(req.get("user-agent")) || gardssalgRevealableEmail(provider) === null ? "none" : "reveal";
+}
+
 router.get(
   "/kategori/gardssalg/produsent/:providerSlug",
   (req: Request, res: Response, next: NextFunction) => {
@@ -6214,6 +6319,12 @@ router.get(
     const meta = drinkTypeMeta(provider.producer_type);
     const badge = drinkBadge(provider.producer_type);
     const site = safeHttpUrl(provider.hjemmeside);
+    // S4 (dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord): the
+    // website goes through the counting redirect /ut/gardssalg/:id/website
+    // (same stored hjemmeside, same GARDSSALG_SITE_UTM); phone and e-mail
+    // fire the click beacon. No id (never for a real row) → direct link.
+    const gsId = String(provider.id ?? "");
+    const gsSiteHref = site ? escapeHtml(gsId ? profileLinkHref("gardssalg", gsId, "website") : addUtmParams(site, GARDSSALG_SITE_UTM.source, "referral", GARDSSALG_SITE_UTM.campaign)) : "";
     const lat = numOrNull(provider.lat);
     const lon = numOrNull(provider.lon);
     // Step D fallback (experiences-geocode-worker.ts): a kommune/fylke
@@ -6258,7 +6369,7 @@ router.get(
     const aboutBody = hasRealAbout
       ? `<p>${escapeHtml(tr.about_text || (provider.about_text as string))}</p>`
       : site
-      ? `<p>${escapeHtml(provider.navn)} er en lokal drikkeprodusent${sted ? " i " + escapeHtml(sted) : ""}. Les mer om produsenten og produktene på <a href="${escapeHtml(addUtmParams(site, GARDSSALG_SITE_UTM.source, "referral", GARDSSALG_SITE_UTM.campaign))}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a>.</p>`
+      ? `<p>${escapeHtml(provider.navn)} er en lokal drikkeprodusent${sted ? " i " + escapeHtml(sted) : ""}. Les mer om produsenten og produktene på <a href="${gsSiteHref}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a>.</p>`
       : `<p>${escapeHtml(provider.navn)} er en lokal drikkeprodusent${sted ? " i " + escapeHtml(sted) : ""}. Utfyllende presentasjon publiseres fortløpende.</p>`;
 
     // "Besøket" — real enriched copy (visit_text) when present; otherwise the
@@ -6282,8 +6393,8 @@ router.get(
       && !isJunkDescription(provider.opening_hours_text)
       && !looksTruncatedMidWord(provider.opening_hours_text)
     ) facts.push([L.gsHours, escapeHtml(tr.opening_hours_text || provider.opening_hours_text)]);
-    if (site) facts.push([L.gsSite, `<a href="${escapeHtml(addUtmParams(site, GARDSSALG_SITE_UTM.source, "referral", GARDSSALG_SITE_UTM.campaign))}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a>`]);
-    if (isDisplayablePhone(provider.telefon)) facts.push([L.phone, `<a href="tel:${escapeHtml(provider.telefon)}">${escapeHtml(provider.telefon)}</a>`]);
+    if (site) facts.push([L.gsSite, `<a href="${gsSiteHref}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a>`]);
+    if (isDisplayablePhone(provider.telefon)) facts.push([L.phone, `<a href="tel:${escapeHtml(provider.telefon)}"${gsId ? profileLinkBeaconAttrs("gardssalg", gsId, "phone") : ""}>${escapeHtml(provider.telefon)}</a>`]);
     // epostUnderReview: Skive C(b)/AC4 — a flagged (domain-deviating) address
     // is published NOWHERE on this page until a human resolves it: not in the
     // visible fact row here, and not in the JSON-LD `email` further down (the
@@ -6291,10 +6402,15 @@ router.get(
     // the two would fix nothing). telefon is untouched — this gate is
     // email-only.
     const epostUnderReview = isGardssalgContactEmailFlaggedForReview(provider.field_provenance, provider.epost);
-    if (provider.epost && !epostUnderReview) facts.push([L.gsEmail, `<a href="mailto:${escapeHtml(provider.epost)}">${escapeHtml(provider.epost)}</a>`]);
+    // Slice 4 (S-A1/S-A3): the e-mail this request may see, on top of the
+    // review gate. Switch off → null → exactly the line below as before.
+    const emailView = gardssalgProfileEmailView(req, provider, provider.epost && !epostUnderReview ? provider.epost : null);
+    const emailShown = emailView === null || emailView === "show";
+    if (provider.epost && !epostUnderReview && emailShown) facts.push([L.gsEmail, `<a href="mailto:${escapeHtml(provider.epost)}"${gsId ? profileLinkBeaconAttrs("gardssalg", gsId, "email") : ""}>${escapeHtml(provider.epost)}</a>`]);
+    else if (emailView === "reveal") facts.push([L.gsEmail, `<a href="${escapeHtml(gardssalgEmailRevealPath(slug, uiLang))}" rel="nofollow">${escapeHtml(L.gsEmailReveal)}</a>`]);
     const factsRows = facts.map(([k, v]) => `<tr><th scope="row">${escapeHtml(k)}</th><td>${v}</td></tr>`).join("");
     const factsBlock = facts.length
-      ? `<table class="facts"><caption class="skip-link">Praktisk info</caption><tbody>${factsRows}</tbody></table>
+      ? `<table class="facts"><caption class="skip-link">Praktisk info</caption><tbody>${factsRows}</tbody></table>${gsId ? profileClickBeaconScript() : ""}
          <p class="produsent-note">Sesong, varighet, pris og kapasitet legges til etter hvert som profilen berikes.</p>`
       : `<p class="produsent-note">Praktisk info legges til etter hvert som profilen berikes. Kontakt produsenten ved reservasjon.</p>`;
 
@@ -6407,7 +6523,7 @@ router.get(
     if (isDisplayablePhone(provider.telefon)) ld.telephone = provider.telefon;
     // Same review gate as the visible "E-post" fact row above — see
     // epostUnderReview's comment there (AC4).
-    if (provider.epost && !epostUnderReview) ld.email = provider.epost;
+    if (provider.epost && !epostUnderReview && emailShown) ld.email = provider.epost;
     // Machine signal must match reality: an InStock Offer pointing at /book
     // while booking is paused told agents a visit could be reserved, so a
     // paused page says nothing about booking. dev-request 2026-10-16-rfb-
@@ -6519,6 +6635,7 @@ ${switcherOn ? oaSiteNav({ active: "gardssalg", lang, path: noPath, switcher: tr
     <a href="${localizedPath("/", uiLang) || "/"}">${L.home}</a> · <a href="/kategori/gardssalg">${L.gsCrumb}</a> · ${escapeHtml(provider.navn)}
   </nav>
   ${aiDeliveriesTileFor("experiences", String(provider.id))}
+  ${aiClicksTileFor("experiences", String(provider.id))}
   <div class="produsent-layout">
     <article>
       <div class="info-card">
@@ -6566,7 +6683,7 @@ ${switcherOn ? oaSiteNav({ active: "gardssalg", lang, path: noPath, switcher: tr
     </aside>
   </div>
   <p class="legal-note" style="font-size:.78rem;color:#7a7163;margin-top:24px;padding-top:16px;border-top:1px solid #e4ded0">Vi formidler besøket og smakingen hos produsenten. Selve salget skjer hos produsenten, som har egen kommunal bevilling.</p>
-</main>
+${emailView === null ? "" : emailTrapLinkFor("experiences")}</main>
 ${switcherOn ? oaSiteFooter({ lang }) : oaSiteFooter({})}
 <script>
 (function () {
@@ -6603,9 +6720,88 @@ ${switcherOn ? oaSiteFooter({ lang }) : oaSiteFooter({})}
 </html>`;
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
-    res.setHeader("Cache-Control", "public, max-age=300");
+    // Slice 4: with the guard on the page depends on the client → private.
+    res.setHeader("Cache-Control", emailView === null ? "public, max-age=300" : "private");
     recordAiPageDelivery(req, res, "ai_page_profile", [String(provider.id)], "experiences");
+    recordAiProfileClick(req, res, String(provider.id), "experiences");
     res.send(html);
+  },
+);
+
+// «Vis e-post» (slice 4, S-A1): read-only, no DB write. Only with
+// EMAIL_REVEAL_GUARD_EXPERIENCES on; off → next(), so the path answers exactly
+// as on main (the router's catch-all 404) and nothing new is exposed. On: the
+// same guard and experiences counter as the profile page. Within the limit →
+// 200 with the address; over it → 429 «prøv igjen senere» without it; CCBot →
+// 403 without it; a slug with no public profile (unknown, hidden, merged, test
+// producer) or no public e-mail (none stored, or under review — AC4) → 404.
+// Always Cache-Control: private and noindex. Four path segments, so it cannot
+// collide with the profile route or /kategori/:category/:kommune.
+router.get(
+  "/kategori/gardssalg/produsent/:providerSlug/epost",
+  (req: Request, res: Response, next: NextFunction) => {
+    if (!emailRevealGuardEnabled("experiences")) return next();
+    res.setHeader("Cache-Control", "private");
+    res.setHeader("X-Robots-Tag", "noindex, nofollow");
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    const slug = String(req.params.providerSlug || "");
+    const uiLang: Lang = isOpplevagentLangSwitcherEnabled() && (req.lang === "en" || req.lang === "sv") ? req.lang : "no";
+    const en = uiLang === "en";
+    const sv = uiLang === "sv";
+    try {
+      let provider: GardssalgProviderRow | null = null;
+      if (slug) {
+        ensureProviderSlugs();
+        provider = getGardssalgProviderBySlug(slug);
+      }
+      const email = provider ? gardssalgRevealableEmail(provider) : null;
+      const profilePath = localizedPath(`/kategori/gardssalg/produsent/${encodeURIComponent(slug)}`, uiLang);
+      const page = (title: string, body: string) => `<!doctype html>
+<html lang="${htmlLangAttr(uiLang)}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHtml(title)} | Opplevagent</title>
+<meta name="robots" content="noindex, nofollow">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+${pwaHeadTags()}
+<style>${BROWSE_CSS}${OA_CHROME_CSS}</style>
+</head>
+<body>
+<a class="skip-link" href="#main">${en ? "Skip to content" : sv ? "Hoppa till innehållet" : "Hopp til innhold"}</a>
+${oaSiteNav({ lang: uiLang })}
+<main id="main" class="container"><div class="head" style="padding:48px 0;max-width:720px"><h1>${escapeHtml(title)}</h1>${body}</div></main>
+${oaSiteFooter({ lang: uiLang })}
+</body>
+</html>`;
+      if (!provider || !email) {
+        const title = en ? "Not found" : sv ? "Hittades inte" : "Ikke funnet";
+        res.status(404).send(page(title, `<p><a href="${localizedPath("/kategori/gardssalg", uiLang)}">${en ? "Farm sales and tasting →" : sv ? "Gårdsförsäljning och provsmakning →" : "Gårdssalg og smaking →"}</a></p>`));
+        return;
+      }
+      const name = String(provider.navn || "");
+      const title = en ? `E-mail for ${name}` : sv ? `E-post till ${name}` : `E-post til ${name}`;
+      const back = `<p style="margin-top:20px"><a href="${escapeHtml(profilePath)}">&larr; ${en ? "Back to" : sv ? "Tillbaka till" : "Tilbake til"} ${escapeHtml(name)}</a></p>`;
+      const id = String(provider.id);
+      const allowed = revealEmailFor(req, "experiences", [id]);
+      if (allowed !== null && allowed.has(id)) {
+        res.status(200).send(page(title, `<p style="font-size:1.05rem"><a href="mailto:${escapeHtml(email)}">${escapeHtml(email)}</a></p>${back}`));
+        return;
+      }
+      if (isCcBotUserAgent(req.get("user-agent"))) {
+        res.status(403).send(page(title, `<p>${en ? "The e-mail address is not shown to this client." : sv ? "E-postadressen visas inte för den här klienten." : "E-postadressen vises ikke for denne klienten."}</p>${back}`));
+        return;
+      }
+      res.setHeader("Retry-After", "3600");
+      res.status(429).send(page(title, `<p>${en
+        ? "The limit for how many e-mail addresses can be shown from here has been reached. Please try again later, or contact the producer by phone or through their website."
+        : sv
+          ? "Gränsen för hur många e-postadresser som kan visas härifrån är nådd. Försök igen senare, eller kontakta producenten per telefon eller via webbplatsen."
+          : "Grensen for hvor mange e-postadresser som kan vises herfra, er nådd. Prøv igjen senere, eller kontakt produsenten på telefon eller via nettsiden."}</p>${back}`));
+    } catch (err) {
+      console.error("SEO /kategori/gardssalg/produsent/:providerSlug/epost error:", err instanceof Error ? err.message : String(err));
+      res.status(500).send(en ? "Internal error" : "Intern feil");
+    }
   },
 );
 
@@ -6644,6 +6840,9 @@ function bookingErrorMessage(code: string): string {
     // booking): plain "not activated" fact, no "coming soon" promise.
     case "paused":
       return BOOKING_NOT_ACTIVATED_INTEREST_MSG;
+    // «Mine valg» booking.pause (O1a): the owner is not taking requests now.
+    case "not_taking":
+      return GARDSSALG_NOT_TAKING_REQUESTS_TEXT.no;
     // dev-request 2026-07-14-booking-flyt-v1, slice 1 ("myk åpningstids-
     // validering"). The no-JS fallback has no natural place for a "resend
     // with confirmation" step (see the POST handler below for why this path
@@ -6719,9 +6918,14 @@ router.get(
     const panelClaimCta = provider.claimed_at == null
       ? ` Er dette din bedrift? <a href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}">Ta over profilen og aktiver booking</a>.`
       : "";
+    // «Mine valg» booking.pause (O1a): said up front, so the guest does not
+    // fill in a request that the POST below refuses.
+    const ownerPaused = !notLive && gardssalgBookingPausedByOwner(provider.id);
     const pausedNotice = notLive
       ? `<div class="notice-paused" role="status"><strong>Booking ikke aktivert</strong>${BOOKING_NOT_ACTIVATED_INTEREST_MSG}${panelClaimCta}</div>`
-      : "";
+      : ownerPaused
+        ? `<div class="notice-paused" role="status" data-owner-paused="1"><strong>Tar ikke imot forespørsler nå</strong>${escapeHtml(GARDSSALG_NOT_TAKING_REQUESTS_TEXT.no)}</div>`
+        : "";
 
     const html = `<!doctype html>
 <html lang="nb">
@@ -6892,6 +7096,13 @@ router.post(
       res.redirect(303, `${backTo}?error=paused`);
       return;
     }
+    // «Mine valg» booking.pause (dev-request 2026-10-22-opplevagent-mine-valg-
+    // gardssalg O1a): the owner's seasonal pause refuses the request with the
+    // not-taking line; the profile stays visible.
+    if (gardssalgBookingPausedByOwner(provider.id)) {
+      res.redirect(303, `${backTo}?error=not_taking`);
+      return;
+    }
 
     const body = (req.body || {}) as Record<string, unknown>;
     const partySize = parseInt(String(body.party_size ?? ""), 10);
@@ -7044,10 +7255,10 @@ ${BROWSE_CSS}
     <div class="recap">
       <div><strong>Dato/tid:</strong> ${escapeHtml(slotFormatted)}</div>
       <div><strong>Antall:</strong> ${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</div>
-      <div><strong>Navn:</strong> ${escapeHtml(booking.guest_name)}</div>
+      <div><strong>Navn:</strong> ${escapeOrDeleted(booking.guest_name)}</div>
       ${booking.notes ? `<div><strong>Kommentar:</strong> ${escapeHtml(booking.notes)}</div>` : ""}
     </div>
-    <p class="hint">En bekreftelse er sendt til ${escapeHtml(booking.guest_email)}.</p>
+    <p class="hint">En bekreftelse er sendt til ${escapeOrDeleted(booking.guest_email)}.</p>
     <a class="ics-link" href="${icsUrl}">Last ned kalenderfil (.ics)</a>
   </div>
 </main>
@@ -7076,7 +7287,8 @@ ${BROWSE_CSS}
 // time-guarded via visitTimeReached() — "bekreft oppmøte" only after the
 // visit — while "angre" (undo, back to reserved) is always available so a
 // mis-click on «Ikke møtt» is never permanent (billable/commission hangs on
-// this). Confirmed attendance counts toward the commission base.
+// this). The page itself only says that attendance is registered, plus the
+// price message (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, O1b).
 const BEKREFT_STATUS_LABEL: Record<string, string> = {
   reserved: "Reservert — oppmøte ikke registrert ennå",
   confirmed_attended: "Oppmøte bekreftet",
@@ -7183,13 +7395,14 @@ ${BROWSE_CSS}
     <div class="recap">
       <div><strong>Dato/tid:</strong> ${escapeHtml(slotFormatted)}</div>
       <div><strong>Antall:</strong> ${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</div>
-      <div><strong>Gjest:</strong> ${escapeHtml(booking.guest_name)}</div>
-      <div><strong>E-post:</strong> ${escapeHtml(booking.guest_email)}</div>
+      <div><strong>Gjest:</strong> ${escapeOrDeleted(booking.guest_name)}</div>
+      <div><strong>E-post:</strong> ${escapeOrDeleted(booking.guest_email)}</div>
       ${booking.guest_phone ? `<div><strong>Telefon:</strong> ${escapeHtml(booking.guest_phone)}</div>` : ""}
       ${booking.notes ? `<div><strong>Kommentar fra gjesten:</strong> ${escapeHtml(booking.notes)}</div>` : ""}
     </div>
     ${actionsHtml}
-    <p class="hint">Denne siden er for produsenten. Bekreftet oppmøte regnes med i provisjonsgrunnlaget; «Ikke møtt» holdes utenfor. Lenken er personlig for denne reservasjonen.</p>
+    <p class="hint">Denne siden er for produsenten. Oppmøtet blir registrert. Lenken er personlig for denne reservasjonen.</p>
+    <p class="hint" data-price-message="1">${escapeHtml(OPPLEVAGENT_PRICE_MESSAGE)}</p>
   </div>
 </main>
 </body>
@@ -7336,8 +7549,8 @@ function previsitRecapHtml(booking: GardssalgBooking, forProducer: boolean): str
       <div><strong>Dato/tid:</strong> ${escapeHtml(previsitSlotNb(booking.slot_at))}</div>
       ${booking.suggested_slot_at && booking.pre_status === "time_suggested" ? `<div><strong>Foreslått nytt tidspunkt:</strong> ${escapeHtml(previsitSlotNb(booking.suggested_slot_at))}</div>` : ""}
       <div><strong>Antall:</strong> ${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</div>
-      ${forProducer ? `<div><strong>Gjest:</strong> ${escapeHtml(booking.guest_name)}</div>
-      <div><strong>E-post:</strong> ${escapeHtml(booking.guest_email)}</div>
+      ${forProducer ? `<div><strong>Gjest:</strong> ${escapeOrDeleted(booking.guest_name)}</div>
+      <div><strong>E-post:</strong> ${escapeOrDeleted(booking.guest_email)}</div>
       ${booking.guest_phone ? `<div><strong>Telefon:</strong> ${escapeHtml(booking.guest_phone)}</div>` : ""}
       ${booking.notes ? `<div><strong>Kommentar fra gjesten:</strong> ${escapeHtml(booking.notes)}</div>` : ""}` : ""}
     </div>`;
@@ -8660,11 +8873,16 @@ export function buildProviderContact(
     ? [street, [postal, locality].filter(Boolean).join(" ")].filter((x) => x && x.trim()).join(", ")
     : "";
   if (addr) rows.push(`<li><strong>Adresse:</strong> ${escapeHtml(addr)}</li>`);
-  if (phone) rows.push(`<li><strong>Telefon:</strong> <a href="tel:${escapeHtml(phone)}">${escapeHtml(phone)}</a></li>`);
-  if (site) rows.push(`<li><strong>Nettside:</strong> <a href="${escapeHtml(addUtmParams(site, PROVIDER_SITE_UTM.source, "referral", PROVIDER_SITE_UTM.campaign))}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a></li>`);
+  // S4 (dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord): phone
+  // fires the click beacon, the website goes through the counting redirect
+  // /ut/tilbyder/:id/website (same stored hjemmeside, same UTM). Without a
+  // provider id (never on the /tilbyder/ page) the links stay direct.
+  const pid = clean(provider.id);
+  if (phone) rows.push(`<li><strong>Telefon:</strong> <a href="tel:${escapeHtml(phone)}"${pid ? profileLinkBeaconAttrs("tilbyder", pid, "phone") : ""}>${escapeHtml(phone)}</a></li>`);
+  if (site) rows.push(`<li><strong>Nettside:</strong> <a href="${escapeHtml(pid ? profileLinkHref("tilbyder", pid, "website") : addUtmParams(site, PROVIDER_SITE_UTM.source, "referral", PROVIDER_SITE_UTM.campaign))}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a></li>`);
   if (orgNr) rows.push(`<li><strong>Org.nr.:</strong> ${escapeHtml(orgNr)}</li>`);
   const contactHtml = rows.length
-    ? `<section class="prov-contact" aria-label="Kontaktinformasjon"><ul style="list-style:none;padding:0;margin:12px 0">${rows.join("")}</ul></section>`
+    ? `<section class="prov-contact" aria-label="Kontaktinformasjon"><ul style="list-style:none;padding:0;margin:12px 0">${rows.join("")}</ul></section>${pid && phone ? profileClickBeaconScript() : ""}`
     : "";
 
   let organizationLd: Record<string, unknown> | null = null;
@@ -8697,7 +8915,7 @@ router.get("/tilbyder/:providerSlugOrId", (req: Request, res: Response, next: Ne
     try { provider = getPublishedProviderById(param); } catch { provider = null; }
     if (!provider) return next();
     const slug = provider.slug as string | null;
-    if (slug) { res.redirect(301, `/tilbyder/${encodeURIComponent(slug)}`); return; }
+    if (slug) { res.redirect(301, withRequestQuery(`/tilbyder/${encodeURIComponent(slug)}`, req.originalUrl)); return; }
     // No slug yet (backfill race) — serve by ID temporarily
   } else {
     // Normal slug-based lookup
@@ -8722,9 +8940,11 @@ router.get("/tilbyder/:providerSlugOrId", (req: Request, res: Response, next: Ne
   let ledeBits = `Alle håndplukkede opplevelser fra ${navn}`;
   if (place) ledeBits += ` (${place})`;
   ledeBits += ".";
+  // S4: the website chip goes through the counting redirect (same target).
+  const provSiteHref = escapeHtml(profileLinkHref("tilbyder", providerId, "website"));
   const verifiedNote = brregVerified
-    ? `<div class="chips"><span class="chip">✓ Verifisert mot Brønnøysundregistrene</span>${provSite ? `<a class="chip" href="${escapeHtml(addUtmParams(provSite, PROVIDER_SITE_UTM.source, "referral", PROVIDER_SITE_UTM.campaign))}" target="_blank" rel="noopener nofollow">Tilbyderens nettside →</a>` : ""}</div>`
-    : provSite ? `<div class="chips"><a class="chip" href="${escapeHtml(addUtmParams(provSite, PROVIDER_SITE_UTM.source, "referral", PROVIDER_SITE_UTM.campaign))}" target="_blank" rel="noopener nofollow">Tilbyderens nettside →</a></div>` : "";
+    ? `<div class="chips"><span class="chip">✓ Verifisert mot Brønnøysundregistrene</span>${provSite ? `<a class="chip" href="${provSiteHref}" target="_blank" rel="noopener nofollow">Tilbyderens nettside →</a>` : ""}</div>`
+    : provSite ? `<div class="chips"><a class="chip" href="${provSiteHref}" target="_blank" rel="noopener nofollow">Tilbyderens nettside →</a></div>` : "";
 
   const providerCanonicalPath = `/tilbyder/${encodeURIComponent(String(provider.slug || providerId))}`;
   const contact = buildProviderContact(provider, `${baseUrl()}${providerCanonicalPath}`);
@@ -9396,6 +9616,16 @@ ${oaSiteFooter({})}
   res.send(html);
 });
 
+// ═══════════════════════════════════════════════════════════
+// GET /ut/:surface/:id/:kind — counting redirect for the outgoing links on
+// the opplevelse, tilbyder and gårdssalg produsent pages (dev-request
+// 2026-10-23-admin-ordre-og-henvisningsdashbord, S4). The target is read only
+// from this vertical's database by id + a closed kind; see
+// services/profile-link-clicks.ts for the open-redirect guard. Surfaces of
+// finn-tannlege.com (klinikk) 404 here.
+// ═══════════════════════════════════════════════════════════
+router.get("/ut/:surface/:id/:kind", generalLimiter, profileLinkRedirectHandler(["opplevelse", "tilbyder", "gardssalg"]));
+
 router.get("/opplevelse/:slug", (req: Request, res: Response, next: NextFunction) => {
   const slug = String(req.params.slug || "");
   let exp: ReturnType<typeof getPublishedExperienceBySlug> = null;
@@ -9416,7 +9646,7 @@ router.get("/opplevelse/:slug", (req: Request, res: Response, next: NextFunction
       canonicalSlug = null;
     }
     if (canonicalSlug && canonicalSlug !== slug) {
-      res.redirect(301, `/opplevelse/${encodeURIComponent(canonicalSlug)}`);
+      res.redirect(301, withRequestQuery(`/opplevelse/${encodeURIComponent(canonicalSlug)}`, req.originalUrl));
       return;
     }
     return next(); // → Norwegian 404 catch-all (no rfb/dental leak)
@@ -9443,6 +9673,7 @@ router.get("/opplevelse/:slug", (req: Request, res: Response, next: NextFunction
   res.setHeader("Cache-Control", "public, max-age=300");
   if (noindex) res.setHeader("X-Robots-Tag", NOINDEX_FOLLOW);
   recordAiPageDelivery(req, res, "ai_page_profile", [exp.id], "experiences");
+  recordAiProfileClick(req, res, exp.id, "experiences");
   res.send(renderOpplevelseDetail(exp, provider, related, baseUrl(), req.lang, noindex));
 });
 
@@ -9686,7 +9917,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=3600");
   res.send(legalPage("Personvern / Privacy", `<div class="lang"><a href="#en">English</a></div>
-<h1>Personvern</h1><p><strong>Sist oppdatert:</strong> 13. oktober 2026</p>
+<h1>Personvern</h1><p><strong>Sist oppdatert:</strong> 11. november 2026</p>
 <p>Opplevagent (opplevagent.no) er en agent-til-agent-markedsplass som hjelper AI-agenter og mennesker med å finne norske opplevelser og aktiviteter — turer, kurs, severdigheter og ting å gjøre. Vi respekterer personvernet til tilbydere, brukere og AI-agenter som samhandler med plattformen.</p>
 <h2>Hva vi samler inn</h2><ul>
 <li><strong>Opplevelsesdata:</strong> tittel, beskrivelse, tilbyder, kategori, fylke/kommune, varighet, pris, sesong og bookinglenke — offentlig tilgjengelig informasjon hentet fra tilbydernes egne nettsider og åpne kilder (Brønnøysundregistrene, Visit Norway / CBIS m.fl.).</li>
@@ -9695,6 +9926,8 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <li><strong>Agent-forespørsler:</strong> for hvert søk logger vi hvilket verktøy som ble brukt, hvilke filtre/søkeord som ble sendt, og navnet på AI-klienten (f.eks. ChatGPT eller Claude, utledet av nettleser-/klientstrengen). Vi lagrer ikke IP-adresse, navn, konto eller andre personlige identifikatorer i denne loggen.</li>
 <li><strong>Teknisk logg over MCP/A2A-kall:</strong> separat fra loggen over logger vi for hvert kall verktøy, protokoll, svartid, AI-klientens nettleser-/klientstreng og en saltet, forkortet hash av IP-adressen, for å se hvilke AI-klienter som bruker tjenesten.</li>
 <li><strong>Besøks- og søkestatistikk:</strong> for hvert sidebesøk registrerer serveren, uten cookies, hvilken side som ble vist, hvor du kom fra (referanse-URL), tidspunktet, en saltet og forkortet hash av IP-adressen (aldri hele IP-adressen) og en grov klassifisering av nettleseren (f.eks. mobil, PC eller søkemotor). Søk på nettsiden og via API-et lagres med søketekst, valgte filtre (f.eks. sted eller tema), antall treff og den samme IP-hashen.</li>
+<li><strong>Besøk fra AI-svar:</strong> har lenken du kom fra et merke (<code>utm_source</code>, <code>utm_medium</code>, <code>utm_campaign</code>), lagres også merket sammen med sidebesøket. Lenker til opplevelsessider som vi gir AI-assistenter som ChatGPT og Claude, har et slikt merke (for eksempel <code>utm_source=claude&amp;utm_campaign=ai_search</code>). Merket sier bare hvilken AI-tjeneste lenken ble gitt til — det inneholder ingenting om deg. Sammen med referanse-URL-en lar det oss telle besøk som kom fra et AI-svar. Disse besøkene summeres per dag, side og AI-tjeneste, uten IP-hash eller annen kobling til den besøkende, og summene vises på opplevelsessidene. Summene slettes ikke automatisk i dag.</li>
+<li><strong>Klikk videre til tilbyderen:</strong> når du klikker på en lenke på en opplevelses-, tilbyder- eller produsentside videre til tilbyderen (booking, nettside, telefon eller e-post), teller vi klikket uten cookies og uten navn eller kontaktopplysninger om deg — bare hvilken profil, hvilken lenke, tidspunktet og den samme pseudonyme besøks-ID-en som sidebesøkene (med en saltet, forkortet hash av IP-adressen, aldri hele IP-adressen), og klikkene slettes ikke automatisk i dag.</li>
 <li><strong>Besøksforespørsler til gårdssalg:</strong> når du ber om et besøk hos en gårdssalg-produsent — på nettsiden eller via en AI-assistent som ChatGPT eller Claude — lagrer vi navn, e-postadresse, eventuelt telefonnummer, ønsket dato/tid, antall personer og en eventuell kommentar. Opplysningene sendes på e-post til produsenten du ba om å besøke, slik at produsenten kan svare deg, og du får selv en kvittering med en statuslenke. Formålet er kun å formidle og følge opp forespørselen; opplysningene brukes ikke til markedsføring.</li></ul>
 <h2>Tilbyderprofiler og e-post vi sender uten at du har bedt om det</h2>
 <p>De fleste profilene i katalogen har vi laget uten at tilbyderen har meldt seg på. De bygger på opplysninger som allerede er offentlige: Brønnøysundregistrene, tilbyderens egen nettside, Visit Norway / CBIS, Rett fra Bondens produsentregister, nettsøk (Brave Search) og kataloger og oppføringssider. Vi kan sende tilbyderen en e-post om at profilen finnes, slik at den kan se over, rette eller overta profilen. Grunnlaget er berettiget interesse (personvernforordningen art. 6 nr. 1 bokstav f): å gi tilbydere synlighet i en gratis katalog som AI-assistenter kan hente fra.</p>
@@ -9723,7 +9956,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <tr><td>Sperreliste</td><td>Så lenge tjenesten finnes, slik at en fjernet profil ikke opprettes på nytt og vi ikke tar kontakt igjen. Lagrer nettstedsdomene, avsenderens e-postadresse og årsak.</td></tr>
 <tr><td>Besøks- og søkestatistikk og teknisk MCP/A2A-logg</td><td>Slettes automatisk etter 60 dager. Før sletting summeres de til tall uten kobling til den besøkende (for eksempel antall besøk per dag og antall søk per søketekst), og bare disse tallene beholdes.</td></tr>
 <tr><td>Agent-forespørsler</td><td>Loggen over, uten personopplysninger, slettes ikke automatisk i dag.</td></tr>
-<tr><td>Besøksforespørsler</td><td>Ingen automatisk sletting i dag. De lagres til du ber oss slette dem, og vi sletter dem da innen 30 dager. E-posten som er sendt til produsenten, ligger også i produsentens og din egen innboks; den kan vi ikke slette.</td></tr>
+<tr><td>Besøksforespørsler</td><td>Navn, e-post, telefon og kommentar slettes automatisk 30 dager etter at forespørselen er avgjort (gjennomført besøk, uteblitt eller kansellert), eller 30 dager etter ønsket besøksdato hvis den aldri ble avgjort. Dato, produsent, antall personer og status beholdes uten opplysninger om deg. Ber du om det, sletter vi tidligere. E-posten som er sendt til produsenten, ligger også i produsentens og din egen innboks; den kan vi ikke slette.</td></tr>
 <tr><td>Sikkerhetskopier av databasen</td><td>Daglige kopier hos Tigris beholdes i 7 dager, og én kopi per uke i 4 uker til. Før større endringer tar vi i tillegg av og til en manuell kopi på serveren; de ti nyeste beholdes, og ingen kopi lever lenger enn 30 dager. En slettet opplysning kan derfor ligge i en sikkerhetskopi en stund etter at den er slettet.</td></tr>
 </tbody></table>
 <h2>Rettighetene dine</h2><p>Etter personopplysningsloven og personvernforordningen (GDPR) har du rett til å:</p><ul>
@@ -9734,7 +9967,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <li><strong>Klage</strong> — du kan klage til Datatilsynet (datatilsynet.no).</li></ul>
 <h2>Kontakt</h2><p>${companyControllerSentenceHtml("nb", { siteName: "Opplevagent", siteEmail: "kontakt@opplevagent.no" })}</p>
 <hr>
-<h1 id="en">Privacy Policy</h1><p><strong>Last updated:</strong> 13 October 2026</p>
+<h1 id="en">Privacy Policy</h1><p><strong>Last updated:</strong> 11 November 2026</p>
 <p>Opplevagent (opplevagent.no) is an agent-to-agent marketplace that helps AI agents and humans find Norwegian experiences and activities — tours, courses, attractions, and things to do. We respect the privacy of providers, end-users, and AI agents that interact with the platform.</p>
 <h2>What we collect</h2><ul>
 <li><strong>Experience data:</strong> title, description, provider, category, county/municipality, duration, price, season, and booking link — public information gathered from providers' own websites and open sources (the Norwegian business registry, Visit Norway / CBIS, etc.).</li>
@@ -9743,6 +9976,8 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <li><strong>Agent requests:</strong> for each search we log which tool was used, which filters/search terms were sent, and the name of the AI client (e.g. ChatGPT or Claude, derived from the browser/client string). This log holds no IP address, name, account or other personal identifier.</li>
 <li><strong>Technical log of MCP/A2A calls:</strong> separately from the log above, for each call we log the tool, protocol, response time, the AI client's browser/client string and a salted, truncated hash of the IP address, to see which AI clients use the service.</li>
 <li><strong>Visit and search statistics:</strong> for each page visit the server records, without cookies, which page was shown, where you came from (referrer URL), the time, a salted and truncated hash of the IP address (never the full IP address) and a rough classification of the browser (e.g. mobile, desktop or search engine). Searches on the website and through the API are stored with the search text, the filters chosen (e.g. place or theme), the number of results and the same IP hash.</li>
+<li><strong>Visits from AI answers:</strong> if the link you arrived from has a marker (<code>utm_source</code>, <code>utm_medium</code>, <code>utm_campaign</code>), the marker is stored with the page visit. Links to experience pages that we give AI assistants such as ChatGPT and Claude carry such a marker (for example <code>utm_source=claude&amp;utm_campaign=ai_search</code>). The marker only says which AI service the link was given to — it contains nothing about you. Together with the referrer it lets us count visits that came from an AI answer. These visits are summed per day, page and AI service, with no IP hash or other link to the visitor, and the totals are shown on the experience pages. The totals are not deleted automatically today.</li>
+<li><strong>Clicks on to the provider:</strong> when you click a link on an experience, provider or producer page that leads on to the provider (booking, website, phone or email), we count the click without cookies and without your name or contact details — only which profile, which link, the time and the same pseudonymous visit ID as the page visits (with a salted, truncated hash of the IP address, never the full IP address), and the clicks are not deleted automatically today.</li>
 <li><strong>Farm-sale visit requests:</strong> when you request a visit to a farm-sale (gårdssalg) producer — on the website or through an AI assistant such as ChatGPT or Claude — we store your name, email address, optional phone number, requested date/time, party size and any note. These details are emailed to the producer you asked to visit so they can reply to you, and you receive a receipt with a status link. They are used only to pass on and follow up the request, never for marketing.</li></ul>
 <h2>Provider profiles and emails we send without being asked</h2>
 <p>Most profiles in the catalogue were created without the provider signing up. They are built on information that is already public: the Norwegian business registry, the provider's own website, Visit Norway / CBIS, the Rett fra Bonden producer register, web search (Brave Search) and directory and listing pages. We may email the provider to say the profile exists, so they can review, correct or take over the profile. The basis is legitimate interest (GDPR art. 6(1)(f)): giving providers visibility in a free catalogue that AI assistants can fetch from.</p>
@@ -9771,7 +10006,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <tr><td>Do-not-contact list</td><td>For as long as the service exists, so that a removed profile is not re-created and we do not contact you again. Stores the website domain, the sender's email address and the reason.</td></tr>
 <tr><td>Visit and search statistics and the technical MCP/A2A log</td><td>Deleted automatically after 60 days. Before deletion they are summed into totals with no link to the visitor (for example visits per day and searches per search text), and only those totals are kept.</td></tr>
 <tr><td>Agent requests</td><td>The log above, without personal data, is not deleted automatically today.</td></tr>
-<tr><td>Visit requests</td><td>No automatic deletion today. They are kept until you ask us to delete them, and we then delete them within 30 days. The email already sent to the producer also sits in the producer's and your own inbox, which we cannot delete.</td></tr>
+<tr><td>Visit requests</td><td>Name, email, phone and comment are deleted automatically 30 days after the request is resolved (visit completed, no-show or cancelled), or 30 days after the requested visit date if it was never resolved. The date, producer, party size and status are kept without any information about you. If you ask, we delete sooner. The email already sent to the producer also sits in the producer's and your own inbox, which we cannot delete.</td></tr>
 <tr><td>Database backups</td><td>Daily copies with Tigris are kept for 7 days, and one copy per week for 4 more weeks. Before larger changes we occasionally also take a manual copy on the server; the ten newest are kept, and never longer than 30 days. A deleted detail can therefore remain in a backup for a while after it is deleted.</td></tr>
 </tbody></table>
 <h2>Your rights</h2><p>Under the Norwegian Personal Data Act and the GDPR you have the right to:</p><ul>
@@ -9939,8 +10174,34 @@ function forTilbydereSearchForm(currentQ: string): string {
   </div>`;
 }
 
+// The three ownership steps and the e-mail-verification note under them.
+// Shared by the old /for-tilbydere page and the sectioned page behind
+// FOR_TILBYDERE_FAQ_ENABLED (#ta-over), so the strings live in one place.
+// Interpolated at the same indentation as before, so the old page's HTML is
+// byte-identical.
+const FOR_TILBYDERE_STEPS_HTML = `<div class="ft-steps">
+      <div class="ft-step">
+        <span class="n" aria-hidden="true">1</span>
+        <h3>Finn profilen din</h3>
+        <p>Søk over, eller finn bedriften i katalogen. Hver produsent har en egen profilside på Opplevagent.</p>
+      </div>
+      <div class="ft-step">
+        <span class="n" aria-hidden="true">2</span>
+        <h3>Klikk «Er dette din bedrift?»</h3>
+        <p>På profilsiden finner du knappen «Er dette din bedrift?». Den starter overtakelsen — ingen registrering eller passord.</p>
+      </div>
+      <div class="ft-step">
+        <span class="n" aria-hidden="true">3</span>
+        <h3>Bekreft via e-post</h3>
+        <p>Vi sender en magisk innloggingslenke til adressen som er registrert for bedriften hos Brønnøysundregistrene eller på bedriftens egen nettside. Klikk lenken — ferdig verifisert.</p>
+      </div>
+    </div>`;
+const FOR_TILBYDERE_STEPS_NOTE_HTML = `<p style="font-size:.86rem;color:var(--mist);max-width:64ch">E-postverifiseringen er hele sikkerheten: bare den som har tilgang til bedriftens registrerte adresse kan ta eierskap. Har du ikke tilgang til den adressen, hjelper vi deg manuelt på <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>.</p>`;
+
 // Shared head/body shell for the two pages — S1 chrome composition, same
 // BROWSE_CSS-then-OA_CHROME_CSS order as renderGardssalgCatalogPage().
+// `extraCss` is appended right after FOR_TILBYDERE_CSS with no separator, so
+// a caller that omits it gets byte-identical HTML.
 function forTilbyderePage(opts: {
   title: string;
   metaDesc: string;
@@ -9948,6 +10209,7 @@ function forTilbyderePage(opts: {
   canonical: string;  // full <link rel="canonical" …> tag, or "" for none
   jsonLd: string;
   main: string;
+  extraCss?: string;
 }): string {
   return `<!doctype html>
 <html lang="no">
@@ -9964,7 +10226,7 @@ ${opts.jsonLd}
 <style>
 ${BROWSE_CSS}
 ${OA_CHROME_CSS}
-${FOR_TILBYDERE_CSS}
+${FOR_TILBYDERE_CSS}${opts.extraCss || ""}
 </style>
 </head>
 <body>
@@ -9978,7 +10240,117 @@ ${oaSiteFooter({})}
 </html>`;
 }
 
+// ─── «For tilbydere» with sections and FAQ (dev-request O4 = G4, slice O4a) ──
+// Served by GET /for-tilbydere only while FOR_TILBYDERE_FAQ_ENABLED is on
+// (default off: the page above is served unchanged). All the text is data in
+// experiences-for-tilbydere-faq.ts (one file for Daniel's text review); this
+// renderer escapes every string. The visible FAQ is read back out of the same
+// FAQPage object the JSON-LD serialises (faqPairsFromJsonLd), so markup and
+// text cannot drift. Accordion = <details>/<summary>, no JS, no inline
+// handlers. The clickable «Mine valg» demo is slice O4b.
+
+const FOR_TILBYDERE_FAQ_CSS = `
+  .ftf-menu{margin:18px 0 6px}
+  .ftf-menu ul{list-style:none;display:flex;flex-wrap:wrap;gap:8px;padding:0;margin:0}
+  .ftf-menu a{display:inline-block;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-pill);padding:6px 14px;font-size:.86rem;font-weight:600;color:var(--fjord-900)}
+  .ftf-menu a:hover{border-color:var(--fjord-800);text-decoration:none}
+  .ftf-sec{scroll-margin-top:80px}
+  .ftf-faq{margin:12px 0 0;max-width:64ch}
+  .ftf-qa{border-bottom:1px solid var(--line);padding:10px 0}
+  .ftf-qa summary{cursor:pointer;font-weight:700;color:var(--fjord-900)}
+  .ftf-qa p{margin-top:6px;font-size:.93rem;color:var(--ink-soft)}
+  .ftf-price{font-weight:600;color:var(--fjord-900)}
+`;
+
+/** Visible FAQ accordion; every question and answer is escaped. Exported for the escaping test. */
+export function renderForTilbydereFaqAccordion(pairs: readonly FaqPair[]): string {
+  if (pairs.length === 0) return "";
+  return `<div class="ftf-faq">${pairs
+    .map((p) => `<details class="ftf-qa"><summary>${escapeHtml(p.q)}</summary><p>${escapeHtml(p.a)}</p></details>`)
+    .join("")}</div>`;
+}
+
+function forTilbydereFaqSectionHtml(s: ForTilbydereSection, faqLd: object): string {
+  const h = `ftf-${s.id}-h`;
+  const paras = s.paragraphs.map((p) => `<p>${escapeHtml(p)}</p>`).join("\n    ");
+  const bullets = s.bullets && s.bullets.length
+    ? `<ul class="ft-edit-list">${s.bullets.map((b) => `<li>${escapeHtml(b)}</li>`).join("")}</ul>`
+    : "";
+  const links = (s.links || [])
+    .map((l) => `<p><a href="${escapeHtml(l.href)}">${escapeHtml(l.label)}</a></p>`)
+    .join("");
+  let extra = "";
+  if (s.id === "ta-over") {
+    extra = `${forTilbydereSearchForm("")}
+    ${FOR_TILBYDERE_STEPS_HTML}
+    ${FOR_TILBYDERE_STEPS_NOTE_HTML}`;
+  } else if (s.id === "sporsmal") {
+    extra = renderForTilbydereFaqAccordion(faqPairsFromJsonLd(faqLd));
+  }
+  // Daniel's «Prisbudskapet», verbatim from owner-features/price-message.ts.
+  const price = s.id === "pris" ? `<p class="ftf-price" data-price-message="1">${escapeHtml(OPPLEVAGENT_PRICE_MESSAGE)}</p>` : "";
+  const body = [price, paras, bullets, extra, links].filter((x) => x !== "").join("\n    ");
+  return `<section class="ft-section ftf-sec" id="${escapeHtml(s.id)}" aria-labelledby="${escapeHtml(h)}">
+    <h2 id="${escapeHtml(h)}">${escapeHtml(s.title)}</h2>
+    ${body}
+  </section>`;
+}
+
+/** The whole sectioned page (flag on). Exported for tests. */
+export function renderForTilbydereFaqPage(): string {
+  const url = baseUrl();
+  const canonical = `${url}/for-tilbydere`;
+  const M = FOR_TILBYDERE_FAQ_META;
+  const faqLd = buildForTilbydereFaqLd(canonical);
+  const jsonLd = [
+    {
+      "@context": "https://schema.org",
+      "@type": "WebPage",
+      name: M.webPageName,
+      description: M.metaDesc,
+      url: canonical,
+    },
+    {
+      "@context": "https://schema.org",
+      "@type": "BreadcrumbList",
+      itemListElement: [
+        { "@type": "ListItem", position: 1, name: "Forsiden", item: `${url}/` },
+        { "@type": "ListItem", position: 2, name: "For tilbydere", item: canonical },
+      ],
+    },
+    faqLd,
+  ]
+    .map((o) => jsonLdScriptTag(o))
+    .join("\n");
+  const menu = `<nav class="ftf-menu" aria-label="${escapeHtml(M.menuLabel)}"><ul>${FOR_TILBYDERE_SECTIONS
+    .map((s) => `<li><a href="#${escapeHtml(s.id)}">${escapeHtml(s.menu)}</a></li>`)
+    .join("")}</ul></nav>`;
+  const main = `
+  <nav class="breadcrumb" aria-label="Brødsmulesti"><a href="/">Forsiden</a> · For tilbydere</nav>
+  <header class="head ft-hero">
+    <h1>${escapeHtml(M.h1)}</h1>
+    <p class="lede">${escapeHtml(M.lede)}</p>
+  </header>
+  ${menu}
+  ${FOR_TILBYDERE_SECTIONS.map((s) => forTilbydereFaqSectionHtml(s, faqLd)).join("\n  ")}`;
+  return forTilbyderePage({
+    title: M.title,
+    metaDesc: M.metaDesc,
+    robotsMeta: `<meta name="robots" content="index, follow">`,
+    canonical: `<link rel="canonical" href="${canonical}">`,
+    jsonLd,
+    main,
+    extraCss: FOR_TILBYDERE_FAQ_CSS,
+  });
+}
+
 router.get("/for-tilbydere", (_req: Request, res: Response) => {
+  if (isForTilbydereFaqEnabled()) {
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.send(renderForTilbydereFaqPage());
+    return;
+  }
   const url = baseUrl();
   const canonical = `${url}/for-tilbydere`;
   const jsonLd = [
@@ -10016,24 +10388,8 @@ router.get("/for-tilbydere", (_req: Request, res: Response) => {
 
   <section class="ft-section" aria-labelledby="ft-steg-h">
     <h2 id="ft-steg-h">Slik tar du eierskap — tre steg</h2>
-    <div class="ft-steps">
-      <div class="ft-step">
-        <span class="n" aria-hidden="true">1</span>
-        <h3>Finn profilen din</h3>
-        <p>Søk over, eller finn bedriften i katalogen. Hver produsent har en egen profilside på Opplevagent.</p>
-      </div>
-      <div class="ft-step">
-        <span class="n" aria-hidden="true">2</span>
-        <h3>Klikk «Er dette din bedrift?»</h3>
-        <p>På profilsiden finner du knappen «Er dette din bedrift?». Den starter overtakelsen — ingen registrering eller passord.</p>
-      </div>
-      <div class="ft-step">
-        <span class="n" aria-hidden="true">3</span>
-        <h3>Bekreft via e-post</h3>
-        <p>Vi sender en magisk innloggingslenke til adressen som er registrert for bedriften hos Brønnøysundregistrene eller på bedriftens egen nettside. Klikk lenken — ferdig verifisert.</p>
-      </div>
-    </div>
-    <p style="font-size:.86rem;color:var(--mist);max-width:64ch">E-postverifiseringen er hele sikkerheten: bare den som har tilgang til bedriftens registrerte adresse kan ta eierskap. Har du ikke tilgang til den adressen, hjelper vi deg manuelt på <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>.</p>
+    ${FOR_TILBYDERE_STEPS_HTML}
+    ${FOR_TILBYDERE_STEPS_NOTE_HTML}
   </section>
 
   <section class="ft-section" aria-labelledby="ft-rediger-h">
@@ -10160,7 +10516,7 @@ router.get("/slik-fungerer-det", (_req: Request, res: Response) => {
       <li><b>2. Dere får forespørselen</b><span>På e-posten deres, med navn, tidspunkt og antall.</span></li>
       <li><b>3. Dere bekrefter selv</b><span>Ingenting er avtalt før dere har sagt ja. Dere kan foreslå et annet tidspunkt eller avslå.</span></li>
     </ol>
-    <div class="sf-note"><b>Det koster ingenting.</b> Verken profilen, overtakelsen eller påmeldingene. Vi tar ikke betalt fra gjesten og tar ingen andel av et salg — Opplevagent håndterer ikke betaling i det hele tatt, og selger ikke alkohol. Systemet avtaler et besøk; alt annet skjer hos dere.</div>
+    <div class="sf-note" data-price-message="1"><b>Hva koster det?</b> ${escapeHtml(OPPLEVAGENT_PRICE_MESSAGE)} Vi tar ikke betalt fra gjesten — Opplevagent håndterer ikke betaling i det hele tatt, og selger ikke alkohol. Systemet avtaler et besøk; alt annet skjer hos dere.</div>
   </section>
 
   <section class="ft-section" aria-labelledby="sf-lov-h">
@@ -10247,7 +10603,15 @@ router.get("/for-tilbydere/finn", generalLimiter, (req: Request, res: Response) 
   const resultBlock = !q
     ? `<div class="ft-hint"><p><strong>Skriv inn bedriftsnavnet</strong> (eller stedet) i feltet over, så finner vi profilen din. Du kan også bla i <a href="/kategori/gardssalg">katalogen</a>.</p></div>`
     : hits.length === 0
-    ? `<div class="ft-hint"><p>Ingen treff på «${escapeHtml(q)}». Prøv et kortere navn eller stedet bedriften ligger på — eller bla i <a href="/kategori/gardssalg">katalogen</a>. Finner du ikke bedriften, ta kontakt på <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>, så hjelper vi deg.</p></div>`
+    ? `<div class="ft-hint"><p>Ingen treff på «${escapeHtml(q)}». Prøv et kortere navn eller stedet bedriften ligger på — eller bla i <a href="/kategori/gardssalg">katalogen</a>. Finner du ikke bedriften, ta kontakt på <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>, så hjelper vi deg.</p>${
+        // dev-request 2026-11-01-opplevagent-drikkeprodusent-selvregistrering:
+        // the self-registration door, in addition to the contact address, and
+        // only while GARDSSALG_SELF_REGISTER_ENABLED is on (off = byte-identical
+        // to before).
+        isGardssalgSelfRegisterEnabled()
+          ? `<p class="ft-register"><strong>Finner du ikke bedriften?</strong> <a href="${GARDSSALG_SELF_REGISTER_PATH}?navn=${encodeURIComponent(q)}">Registrer den</a>.</p>`
+          : ""
+      }</div>`
     : `<p class="count">${hits.length} treff — klikk «Er dette din bedrift?» på din egen oppføring for å ta eierskap.</p>
   <ul class="ft-hits">
 ${hitCards}
@@ -10270,6 +10634,12 @@ ${hitCards}
     main,
   }));
 });
+
+// GET|POST /for-tilbydere/registrer — gårdssalg self-registration (dev-request
+// 2026-11-01-opplevagent-drikkeprodusent-selvregistrering, skive 1). Its own
+// module; mounted here so it shares this router's host gate, page chrome and
+// 404. Flag off → both routes fall through to the 404 below (AC1).
+router.use(createGardssalgSelfRegisterRouter(forTilbyderePage));
 
 // ═══════════════════════════════════════════════════════════
 // GET /kontakt — public contact form (opplevagent.no)
@@ -10507,12 +10877,12 @@ const OA_MCP_GUIDE_TOOL_COPY: Record<string, Record<GuideLang, GuideToolCopy>> =
   },
   discover_gardssalg: {
     no: {
-      card: "Finner gårdssalg: bryggerier, ciderier, vingårder, destillerier, gårdskafeer, mjøderier og seltzerier som selger rett fra gården. Filtrer på fylke, kommune og produsenttype, eller slå opp én produsent ved navn og sted i <code>query</code>, f.eks. «Fjordgard Bryggeri». Med <code>lat</code>/<code>lng</code> kommer de nærmeste først. Returnerer navn, sted, produsenttype, profilside og om produsenten tar imot besøksforespørsler nå.",
-      faq: "discover_gardssalg finner drikkeprodusenter med gårdssalg (bryggeri, cideri, vingård, destilleri, gårdskafé, mjøderi og seltzeri) etter fylke, kommune og type, eller én produsent ved navn i query",
+      card: "Finner norske drikkeprodusenter å besøke eller smake hos: bryggerier, siderier, vingårder, destillerier, mjøderier, gårdskafeer og seltzerier med gårdssalg. Verktøyet selger eller bestiller ikke produkter. Filtrer på fylke, kommune og produsenttype, eller slå opp én produsent ved navn og sted i <code>query</code>, f.eks. «Fjordgard Bryggeri». Med <code>lat</code>/<code>lng</code> kommer de nærmeste først. Returnerer navn, sted, produsenttype, profilside og om produsenten tar imot besøksforespørsler nå.",
+      faq: "discover_gardssalg finner drikkeprodusenter med gårdssalg å besøke eller smake hos (bryggeri, sideri, vingård, destilleri, gårdskafé, mjøderi og seltzeri) etter fylke, kommune og type, eller én produsent ved navn i query (verktøyet selger eller bestiller ikke produkter)",
     },
     en: {
-      card: "Finds farm sales (gårdssalg): breweries, cideries, wineries, distilleries, farm cafés, meaderies, and seltzer makers that sell straight from the farm. Filter by county (fylke), municipality (kommune), and producer type, or look up one producer by name and place in <code>query</code>, e.g. \"Fjordgard Bryggeri\". With <code>lat</code>/<code>lng</code> the nearest come first. Returns name, location, producer type, profile page, and whether the producer takes visit requests right now.",
-      faq: "discover_gardssalg finds drink producers with a farm sale (brewery, cidery, winery, distillery, farm café, meadery, and seltzer maker) by county, municipality, and type, or one producer by name in query",
+      card: "Finds Norwegian drink producers to visit or taste at: breweries, cideries, wineries, distilleries, meaderies, farm cafés, and seltzer makers with a farm sale (gårdssalg). The tool does not sell or order products. Filter by county (fylke), municipality (kommune), and producer type, or look up one producer by name and place in <code>query</code>, e.g. \"Fjordgard Bryggeri\". With <code>lat</code>/<code>lng</code> the nearest come first. Returns name, location, producer type, profile page, and whether the producer takes visit requests right now.",
+      faq: "discover_gardssalg finds drink producers with a farm sale to visit or taste at (brewery, cidery, winery, distillery, farm café, meadery, and seltzer maker) by county, municipality, and type, or one producer by name in query (the tool does not sell or order products)",
     },
   },
   book_gardssalg: {

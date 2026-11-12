@@ -53,6 +53,8 @@ import {
 } from "./cart-service";
 import { isPaymentsLifecycleActive, onOrderTransitioned, type OrderPaymentEffect } from "./payment-service";
 import type { PaymentsStripeClient } from "./payment-provider";
+import { markOrderItemsSoldOut, refreshStockConfirmationForOrder, soldOutIdsFromBody, stockSoftExpiryActiveFor } from "./stock-soft-expiry";
+import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
 import { sendBuyerOrderReceipt, type ReceiptEvent } from "./order-receipt-service";
 import { sendAdminOrderAlert, sendProducerBuyerCancelNotice } from "./order-notify-service";
 import {
@@ -77,6 +79,10 @@ export type OrderAction =
 
 export type OrderChannel = "producer_page" | "owner_portal" | "admin" | "system_job" | "mcp" | "a2a" | "web";
 
+/** T12: orders.cancel_detail values. */
+export type OrderCancelDetail = "sold_out" | "cannot_deliver";
+export const ORDER_CANCEL_DETAILS: ReadonlySet<string> = new Set<OrderCancelDetail>(["sold_out", "cannot_deliver"]);
+
 export interface OrderActor {
   role: OrderActorRole;
   channel: OrderChannel;
@@ -90,6 +96,19 @@ export interface OrderActionOptions {
   pickupTime?: string | null;
   /** Free-text reason for logs; the stored cancel_reason comes from the action. */
   reason?: string | null;
+  /**
+   * B2b-1 «Utsolgt», decline by the seller only: the order's products to set
+   * 'out_of_stock' (empty = none, a plain decline). Ignored unless the soft-expiry
+   * rule is active for the producer (stock-soft-expiry.ts).
+   */
+  soldOut?: { productIds?: readonly string[] | null } | null;
+  /**
+   * T12 (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 6), the
+   * seller's `cannot_deliver` only: why the order is cancelled, stored in
+   * orders.cancel_detail in the same write. With 'sold_out' the seller may
+   * also pass `soldOut` (the items are set out of stock, as «Avslå – utsolgt»).
+   */
+  cancelDetail?: OrderCancelDetail | null;
   /** The payment step's Stripe client; null/absent = no payment step (payments off, system jobs). */
   payments?: PaymentsStripeClient | null;
   /** Injectable clock and env (tests). */
@@ -282,6 +301,15 @@ export async function applyOrderAction(
     }
   }
 
+  const cancelDetail = opts.cancelDetail ?? null;
+  if (cancelDetail !== null) {
+    if (action !== "cannot_deliver") return { success: false, status: 400, error: "cancelDetail is only accepted with cannot_deliver" };
+    if (!ORDER_CANCEL_DETAILS.has(cancelDetail)) return { success: false, status: 400, error: "cancelDetail must be sold_out or cannot_deliver" };
+  }
+  if (opts.soldOut && action === "cannot_deliver" && cancelDetail !== "sold_out") {
+    return { success: false, status: 400, error: "soldOut with cannot_deliver needs cancelDetail sold_out" };
+  }
+
   let pickupTime: string | null = null;
   if (opts.pickupTime != null && String(opts.pickupTime).trim() !== "") {
     if (action !== "confirm") return { success: false, status: 400, error: "pickupTime is only accepted with confirm" };
@@ -302,6 +330,10 @@ export async function applyOrderAction(
     idempotencyKey: idemKey,
     completionSource,
     pickupTime,
+    // Tekstpakke C punkt 10: «Avslå – utsolgt» (a seller's decline with the
+    // sold-out choice) stores 'sold_out' on the declined order, so the
+    // decline receipt can say why. A plain decline stores nothing.
+    cancelDetail: action === "decline" && actor.role === "seller" && opts.soldOut ? "sold_out" : cancelDetail,
   });
   if (!t.success) {
     if (idemKey !== null && t.error === IDEMPOTENCY_KEY_TAKEN) {
@@ -315,6 +347,21 @@ export async function applyOrderAction(
     `[order-actions] order=${orderId} action=${action} role=${actor.role} channel=${actor.channel}` +
     `${actor.ref ? ` ref=${actor.ref}` : ""} ${order.status}→${spec.to}`,
   );
+
+  // B2b-1 (soft stock expiry): the producer's confirmation of the order
+  // confirms the stock of its producer_dashboard items; «Utsolgt» sets the
+  // chosen items to out of stock — on a decline, and (T12) on «Varen er
+  // utsolgt» (cannot_deliver with cancelDetail sold_out). Only with the rule
+  // active for the producer; never fails the action.
+  const soldOutWrite = (action === "decline" || (action === "cannot_deliver" && cancelDetail === "sold_out")) && !!opts.soldOut;
+  if (actor.role === "seller" && (action === "confirm" || soldOutWrite) && stockSoftExpiryActiveFor(order.agent_id, env)) {
+    try {
+      if (action === "confirm") refreshStockConfirmationForOrder(db, orderId, order.agent_id, now);
+      else markOrderItemsSoldOut(db, orderId, order.agent_id, opts.soldOut?.productIds ?? null, now, action === "decline" ? "declined" : "cancelled");
+    } catch (err) {
+      console.error(`[order-actions] B2b-1 stock write failed order=${orderId} action=${action}:`, err instanceof Error ? err.message : "error");
+    }
+  }
 
   // Payment step (unchanged rules). The automatic close moves no money.
   let payment_effect: OrderPaymentEffect = "none";
@@ -333,6 +380,56 @@ export async function applyOrderAction(
   }
 
   return { success: true, order_id: orderId, action, status: spec.to, replayed: false, payment_effect };
+}
+
+// ─── T12: the seller's form actions behind the owner-features allowlist ─────
+
+/**
+ * T12 (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 6): the
+ * cancellation component's posted `action` → the shared layer's action, for
+ * the three order pages («Mine ordrer», the compact page from the e-mail and
+ * the old order page). No new transitions: «Varen er utsolgt» and «Jeg kan
+ * ikke levere likevel» are `cannot_deliver` with orders.cancel_detail;
+ * «Avslå – utsolgt» is `decline` with the sold-out write. The sold-out write
+ * keeps B2b-1's gate (stockSoftExpiryActiveFor): with the rule off,
+ * «Avslå – utsolgt» stays an unknown action and «Varen er utsolgt» cancels
+ * without touching the items. null = not a T12 action. The caller checks
+ * the allowlist (t12OrderActionsActive) first.
+ */
+export function t12SellerActionFrom(body: Record<string, unknown>, agentId: string, env: NodeJS.ProcessEnv = process.env): {
+  action: OrderAction;
+  soldOut: { productIds: string[] } | null;
+  cancelDetail: OrderCancelDetail | null;
+} | null {
+  const raw = String(body["action"] ?? "");
+  switch (raw) {
+    case "confirm":
+    case "decline":
+    case "complete":
+    case "no_show":
+    case "buyer_cancelled":
+      return { action: raw, soldOut: null, cancelDetail: null };
+    case "decline_sold_out":
+      return stockSoftExpiryActiveFor(agentId, env)
+        ? { action: "decline", soldOut: { productIds: soldOutIdsFromBody(body["sold_out"]) }, cancelDetail: null }
+        : null;
+    case "cancel_sold_out":
+      return {
+        action: "cannot_deliver",
+        soldOut: stockSoftExpiryActiveFor(agentId, env) ? { productIds: soldOutIdsFromBody(body["sold_out"]) } : null,
+        cancelDetail: "sold_out",
+      };
+    case "cancel_cannot_deliver":
+      return { action: "cannot_deliver", soldOut: null, cancelDetail: "cannot_deliver" };
+    default:
+      return null;
+  }
+}
+
+/** T12: the cancellation component and its actions only for a producer on OWNER_FEATURES_ALLOWED_SUBJECTS. */
+export function t12OrderActionsActive(agentId: string | null | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (!agentId) return false;
+  try { return isSubjectAllowedForOwnerFeatures("rfb", agentId, env); } catch { return false; }
 }
 
 const IDEM_KEY_CONFLICT = "idempotencyKey was already used for a different action on this order";

@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="no">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<title>Ordreoversikt — admin</title>
+<style>
+:root{--bg:#0f1117;--surface:#1a1d27;--surface2:#232733;--border:#2d3142;--text:#e8eaf0;--text-dim:#8b90a0;--accent:#4ade80;--accent2:#22d3ee;--warn:#fbbf24;--danger:#f87171;--radius:10px}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;font-size:14px}
+.login-screen{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px}
+.login-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:36px;max-width:380px;width:100%;text-align:center}
+.login-card h1{font-size:20px;font-weight:600;margin-bottom:6px}
+.login-card .subtitle{color:var(--text-dim);font-size:13px;margin-bottom:24px}
+.login-card input{width:100%;padding:11px 14px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:monospace;margin-bottom:14px;outline:none}
+.login-card input:focus{border-color:var(--accent)}
+.login-card button{width:100%;padding:11px;background:var(--accent);color:#000;border:none;border-radius:8px;font-weight:600;cursor:pointer}
+.login-error{color:var(--danger);font-size:12px;margin-top:10px;display:none}
+#app{display:none;max-width:1200px;margin:0 auto;padding:20px 16px 60px}
+.topbar{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-bottom:16px}
+.topbar h1{font-size:20px;font-weight:600}
+.controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.controls label{color:var(--text-dim);font-size:12px}
+select,.btn{background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:7px 10px;font-size:13px}
+.btn{cursor:pointer;text-decoration:none}
+.meta{color:var(--text-dim);font-size:12px;margin-bottom:18px}
+section{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:18px;margin-bottom:18px}
+section h2{font-size:16px;font-weight:600;margin-bottom:4px}
+.lead{color:var(--text-dim);font-size:12px;margin-bottom:14px}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px;margin-bottom:14px}
+.card{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:12px}
+.card .v{font-size:22px;font-weight:600}
+.card .l{font-size:12px;font-weight:600;margin-top:2px}
+.card .e{font-size:11px;color:var(--text-dim);margin-top:6px;line-height:1.35}
+h3{font-size:13px;font-weight:600;margin:14px 0 6px}
+.tablewrap{max-height:360px;overflow:auto;border:1px solid var(--border);border-radius:8px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:6px 10px;border-bottom:1px solid var(--border)}
+th{background:var(--surface2);color:var(--text-dim);font-weight:600;position:sticky;top:0}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+tr.test td{color:var(--warn);font-style:italic}
+.note{font-size:12px;color:var(--text-dim);margin-top:6px;line-height:1.4}
+.placeholder{color:var(--text-dim);font-style:italic}
+.err{color:var(--danger);font-size:13px;margin:10px 0}
+</style>
+</head>
+<body>
+
+<div class="login-screen" id="loginScreen">
+  <div class="login-card">
+    <h1>Ordreoversikt</h1>
+    <div class="subtitle">Bestillinger, besøksforespørsler og henvisninger — kun lesing</div>
+    <input type="password" id="adminKey" placeholder="Admin-nøkkel" autofocus>
+    <button data-action="login">Logg inn</button>
+    <div class="login-error" id="loginError"></div>
+  </div>
+</div>
+
+<div id="app">
+  <div class="topbar">
+    <h1>Ordreoversikt</h1>
+    <div class="controls">
+      <label for="periodSel">Periode</label>
+      <select id="periodSel">
+        <option value="7">Siste 7 dager</option>
+        <option value="30" selected>Siste 30 dager</option>
+        <option value="90">Siste 90 dager</option>
+        <option value="aar">Hittil i år</option>
+        <option value="alt">Alt (inntil 3 år)</option>
+      </select>
+      <label for="opplSel">Oppløsning</label>
+      <select id="opplSel">
+        <option value="dag" selected>Dag</option>
+        <option value="uke">Uke</option>
+        <option value="maaned">Måned</option>
+      </select>
+      <a class="btn" id="csvLink" href="/admin/api/ordre/eksport.csv" data-action="csv">Last ned CSV (kun summer)</a>
+      <button class="btn" data-action="logout">Logg ut</button>
+    </div>
+  </div>
+  <div class="meta" id="meta"></div>
+  <div class="err" id="err"></div>
+
+  <section id="secAlle">
+    <h2>Samlet</h2>
+    <div class="lead">Alle plattformer lagt sammen for valgt periode. Testdata er holdt utenfor og vist i egen rad.</div>
+    <div id="alleBody"></div>
+  </section>
+
+  <section id="secRfb">
+    <h2>Rett fra Bonden — bestillinger</h2>
+    <div class="lead" id="rfbLead"></div>
+    <div id="rfbBody"></div>
+  </section>
+
+  <section id="secRfbHenv">
+    <h2>Rett fra Bonden — henvisninger (klikk videre til produsenten)</h2>
+    <div class="lead" id="henvLead"></div>
+    <div id="henvBody"></div>
+  </section>
+
+  <section id="secRfbAi">
+    <h2>Rett fra Bonden — levert til AI-assistent</h2>
+    <div class="lead" id="aiLead"></div>
+    <div id="aiBody"></div>
+  </section>
+
+  <section id="secGs">
+    <h2>Opplevagent — gårdssalg</h2>
+    <div class="lead" id="gsLead"></div>
+    <div id="gsBody"></div>
+  </section>
+
+  <section id="secGsHenv">
+    <h2>Opplevagent gårdssalg — henvisninger (klikk videre til produsenten)</h2>
+    <div class="lead" id="henvGsLead"></div>
+    <div id="henvGsBody"></div>
+  </section>
+
+  <section id="secOpplHenv">
+    <h2>Opplevagent opplevelser — henvisninger (klikk videre til tilbyderen)</h2>
+    <div class="lead">Opplevelser har ingen bestillinger hos oss: bookingen skjer hos tilbyderen. Her telles klikkene videre.</div>
+    <div class="lead" id="henvOpplLead"></div>
+    <div id="henvOpplBody"></div>
+  </section>
+
+  <section id="secTannHenv">
+    <h2>Finn-tannlege — henvisninger (klikk videre til klinikken)</h2>
+    <div class="lead">Finn-tannlege har ingen bestillinger hos oss: timen bestilles hos klinikken. Her telles klikkene videre.</div>
+    <div class="lead" id="henvTannLead"></div>
+    <div id="henvTannBody"></div>
+  </section>
+</div>
+
+<script>
+// Read-only admin page (slice S2). Same login pattern as admin-crm.html:
+// the admin key is kept in sessionStorage ('rfb_admin_key') and sent as
+// X-Admin-Key on every data call. All data is written to the DOM with
+// textContent / createElement — never innerHTML.
+const API = '/admin/api/ordre';
+let adminKey = sessionStorage.getItem('rfb_admin_key') || '';
+
+const STATUS_NO = {
+  pending: 'Venter på svar', confirmed: 'Bekreftet', declined: 'Avslått', ready: 'Klar til henting',
+  completed: 'Fullført', cancelled: 'Kansellert',
+  reserved: 'Reservert', confirmed_attended: 'Møtte opp', no_show: 'Møtte ikke',
+  awaiting_provider: 'Venter på produsent', provider_confirmed: 'Produsent bekreftet', provider_declined: 'Produsent avslo',
+  time_suggested: 'Nytt tidspunkt foreslått', expired: 'Utløpt'
+};
+const HENV_NO = { booking: 'Booking', nettside: 'Nettside', sosiale_medier: 'Sosiale medier', telefon: 'Telefon', e_post: 'E-post', annet: 'Annet' };
+const AI_KANAL_NO = {
+  ai_page_list: 'Listeside hentet av AI-assistent', ai_page_profile: 'Profilside hentet av AI-assistent',
+  mcp: 'MCP-verktøysvar', a2a: 'A2A-svar', annet: 'Annet'
+};
+const AI_NO = { chatgpt: 'ChatGPT', claude: 'Claude', perplexity: 'Perplexity', other: 'Annen AI', unknown: 'Ukjent AI' };
+const OPPL_NO = { dag: 'dag', uke: 'uke (mandag–søndag)', maaned: 'måned' };
+
+function el(tag, opts, children) {
+  const e = document.createElement(tag);
+  if (opts) {
+    if (opts.cls) e.className = opts.cls;
+    if (opts.text !== undefined && opts.text !== null) e.textContent = String(opts.text);
+  }
+  (children || []).forEach(c => { if (c) e.appendChild(c); });
+  return e;
+}
+function fmtNum(n) {
+  if (n === null || n === undefined) return '–';
+  return Number(n).toLocaleString('nb-NO', { maximumFractionDigits: 2 });
+}
+function fmtKr(n) { return n === null || n === undefined ? '–' : fmtNum(n) + ' kr'; }
+function fmtHours(n) { return n === null || n === undefined ? '–' : fmtNum(n) + ' t'; }
+
+function card(value, label, explanation) {
+  return el('div', { cls: 'card' }, [
+    el('div', { cls: 'v', text: value }),
+    el('div', { cls: 'l', text: label }),
+    el('div', { cls: 'e', text: explanation })
+  ]);
+}
+
+// rows: array of { cells: [...], test?: bool }; numeric columns right-aligned.
+function table(headers, rows, numericFrom) {
+  const thead = el('thead', null, [el('tr', null, headers.map((h, i) => el('th', { cls: i >= numericFrom ? 'num' : '', text: h })))]);
+  const tbody = el('tbody', null, rows.map(r => {
+    const tr = el('tr', { cls: r.test ? 'test' : '' }, r.cells.map((c, i) => el('td', { cls: i >= numericFrom ? 'num' : '', text: c })));
+    return tr;
+  }));
+  return el('div', { cls: 'tablewrap' }, [el('table', null, [thead, tbody])]);
+}
+
+function isoDate(d) { return d.toISOString().slice(0, 10); }
+function periodRange() {
+  const v = document.getElementById('periodSel').value;
+  const til = new Date();
+  const tilIso = isoDate(til);
+  const back = days => isoDate(new Date(Date.parse(tilIso + 'T00:00:00Z') - (days - 1) * 86400000));
+  if (v === 'aar') return { fra: tilIso.slice(0, 4) + '-01-01', til: tilIso };
+  if (v === 'alt') return { fra: back(1096), til: tilIso };
+  return { fra: back(Number(v)), til: tilIso };
+}
+function query() {
+  const r = periodRange();
+  const p = new URLSearchParams({ plattform: 'alle', fra: r.fra, til: r.til, oppl: document.getElementById('opplSel').value });
+  return p.toString();
+}
+
+async function login() {
+  const key = document.getElementById('adminKey').value.trim();
+  if (!key) return;
+  const res = await fetch(API + '/oversikt?plattform=rfb', { headers: { 'X-Admin-Key': key } });
+  if (!res.ok) {
+    document.getElementById('loginError').textContent = 'Feil nøkkel';
+    document.getElementById('loginError').style.display = 'block';
+    return;
+  }
+  adminKey = key;
+  sessionStorage.setItem('rfb_admin_key', key);
+  showApp();
+}
+
+function logout() {
+  sessionStorage.removeItem('rfb_admin_key');
+  location.reload();
+}
+
+function showApp() {
+  document.getElementById('loginScreen').style.display = 'none';
+  document.getElementById('app').style.display = 'block';
+  refresh();
+}
+
+function updateCsvLink() {
+  document.getElementById('csvLink').setAttribute('href', API + '/eksport.csv?' + query());
+}
+
+// The CSV route needs X-Admin-Key, which a plain link cannot send: fetch it
+// with the header and hand the browser the file.
+async function downloadCsv(e) {
+  if (e) e.preventDefault();
+  const url = API + '/eksport.csv?' + query();
+  const res = await fetch(url, { headers: { 'X-Admin-Key': adminKey } });
+  if (res.status === 401) { logout(); return; }
+  if (!res.ok) { document.getElementById('err').textContent = 'CSV-eksport feilet (' + res.status + ').'; return; }
+  const blob = await res.blob();
+  const cd = res.headers.get('Content-Disposition') || '';
+  const m = /filename="([^"]+)"/.exec(cd);
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = m ? m[1] : 'ordre-oversikt.csv';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+}
+
+async function refresh() {
+  updateCsvLink();
+  const errEl = document.getElementById('err');
+  errEl.textContent = '';
+  let res;
+  try {
+    res = await fetch(API + '/oversikt?' + query(), { headers: { 'X-Admin-Key': adminKey } });
+  } catch (e) { errEl.textContent = 'Kunne ikke hente tall: ' + e.message; return; }
+  if (res.status === 401) { logout(); return; }
+  const body = await res.json().catch(() => null);
+  if (!res.ok || !body || !body.success) {
+    errEl.textContent = 'Kunne ikke hente tall (' + res.status + ')' + (body && body.detail ? ': ' + body.detail : '');
+    return;
+  }
+  render(body);
+}
+
+function statusRows(byStatus, testByStatus) {
+  const rows = Object.keys(byStatus).map(s => ({ cells: [STATUS_NO[s] || s, s, fmtNum(byStatus[s])] }));
+  if (testByStatus) {
+    const t = Object.values(testByStatus).reduce((a, b) => a + b, 0);
+    rows.push({ test: true, cells: ['Testdata (ikke med over)', 'test', fmtNum(t)] });
+  }
+  return rows;
+}
+
+function renderRfb(r, target) {
+  target.replaceChildren();
+  document.getElementById('rfbLead').textContent = r.forklaring;
+  target.appendChild(el('div', { cls: 'cards' }, [
+    card(fmtNum(r.total), 'Bestillinger', 'Antall bestillinger sendt inn i perioden, alle statuser, uten testprodusenten.'),
+    card(fmtKr(r.sum_nok.amount), 'Omsetning (akseptert)', r.sum_nok.forklaring),
+    card(fmtHours(r.response_time.median_hours), 'Svartid (median)', 'Median timer fra innsending til produsentens første svar. Målt på ' + fmtNum(r.response_time.measured) + ' bestillinger; ' + fmtNum(r.response_time.unanswered) + ' uten svar.'),
+    card(fmtNum(r.unanswered_over_24h.count), 'Ubesvart over 24 t (nå)', r.unanswered_over_24h.forklaring),
+    card(fmtNum(r.cart_handoffs.count), 'Kontakt-overleveringer', r.cart_handoffs.forklaring)
+  ]));
+  target.appendChild(el('h3', { text: 'Per status' }));
+  target.appendChild(table(['Status', 'Kode', 'Antall'], statusRows(r.by_status, r.test.by_status), 2));
+  target.appendChild(el('div', { cls: 'note', text: 'Teller bestillinger etter nåværende status. Testraden er bestillinger hos testprodusenten.' }));
+
+  target.appendChild(el('h3', { text: 'Per produsent' }));
+  const prodRows = r.producers.map(p => ({ cells: [p.name || p.agent_id, fmtNum(p.total), fmtKr(p.sum_nok)] }));
+  prodRows.push({ test: true, cells: ['Testdata (' + r.test.producers.length + ' testprodusent(er))', fmtNum(r.test.total), fmtKr(r.test.sum_nok)] });
+  target.appendChild(table(['Produsent', 'Bestillinger', 'Omsetning (akseptert)'], prodRows, 1));
+  target.appendChild(el('div', { cls: 'note', text: 'Antall bestillinger og akseptert beløp per produsent i perioden.' }));
+
+  target.appendChild(el('h3', { text: 'Per tidsbolk' }));
+  target.appendChild(table(['Bolk', 'Bestillinger', 'Omsetning (akseptert)'],
+    r.series.map(s => ({ cells: [s.bucket, fmtNum(s.total), fmtKr(s.sum_nok)] })), 1));
+  target.appendChild(el('div', { cls: 'note', text: 'Bestillinger per tidsbolk etter innsendingsdato (UTC), uten testdata.' }));
+}
+
+// Slice S3: clicks (contact_clicks, /ut/). Bot and test clicks are shown
+// in their own rows, never in the main number.
+function renderHenv(h, target) {
+  target.replaceChildren();
+  document.getElementById('henvLead').textContent = h.forklaring;
+  if (!h.available) {
+    (h.merknader || []).forEach(m => target.appendChild(el('div', { cls: 'note', text: m })));
+    return;
+  }
+  target.appendChild(el('div', { cls: 'cards' }, [
+    card(fmtNum(h.total), 'Klikk fra folk', 'Klikk på nettside, sosiale medier, telefon eller e-post på produsentsidene i perioden, uten bot-klikk og uten testprodusenten.'),
+    card(fmtNum(h.bot.total), 'Bot-klikk (ikke med)', h.bot.forklaring),
+    card(fmtNum(h.test.total), 'Testklikk (ikke med)', h.test.forklaring)
+  ]));
+  target.appendChild(el('h3', { text: 'Per type' }));
+  const typeRows = Object.keys(h.by_type).map(t => ({ cells: [HENV_NO[t] || t, (h.type_forklaring && h.type_forklaring[t]) || '', fmtNum(h.by_type[t]), fmtNum(h.bot.by_type[t]), fmtNum(h.test.by_type[t])] }));
+  target.appendChild(table(['Type', 'Hva det teller', 'Klikk fra folk', 'Bot-klikk', 'Testklikk'], typeRows, 2));
+  target.appendChild(el('div', { cls: 'note', text: 'Bot-klikk og testklikk er tatt med her bare for å vise hva som er holdt utenfor; de er ikke med i «Klikk fra folk».' }));
+  const social = Object.keys(h.sosiale_medier_per_kanal || {});
+  if (social.length) {
+    target.appendChild(el('h3', { text: 'Sosiale medier per kanal' }));
+    target.appendChild(table(['Kanal', 'Klikk fra folk'], social.map(k => ({ cells: [k, fmtNum(h.sosiale_medier_per_kanal[k])] })), 1));
+  }
+  target.appendChild(el('h3', { text: 'Per tidsbolk' }));
+  target.appendChild(table(['Bolk', 'Klikk fra folk', 'Nettside', 'Sosiale medier', 'Telefon', 'E-post'],
+    h.series.map(s => ({ cells: [s.bucket, fmtNum(s.total), fmtNum(s.by_type.nettside), fmtNum(s.by_type.sosiale_medier), fmtNum(s.by_type.telefon), fmtNum(s.by_type.e_post)] })), 1));
+  (h.merknader || []).forEach(m => target.appendChild(el('div', { cls: 'note', text: m })));
+}
+
+// Slice S4: clicks on the Opplevagent / Finn-tannlege profile links
+// (profile_link_clicks). Same layout as renderHenv; bot and test-provider
+// clicks in their own rows, never in the main number.
+function renderProfilHenv(h, target, leadEl) {
+  target.replaceChildren();
+  leadEl.textContent = h.forklaring;
+  if (!h.available) {
+    (h.merknader || []).forEach(m => target.appendChild(el('div', { cls: 'note', text: m })));
+    return;
+  }
+  target.appendChild(el('div', { cls: 'cards' }, [
+    card(fmtNum(h.total), 'Klikk fra folk', 'Klikk på booking, nettside, telefon eller e-post på profilsidene i perioden, uten bot-klikk og uten testtilbydere.'),
+    card(fmtNum(h.bot.total), 'Bot-klikk (ikke med)', h.bot.forklaring),
+    card(fmtNum(h.test.total), 'Testklikk (ikke med)', h.test.forklaring)
+  ]));
+  target.appendChild(el('h3', { text: 'Per type' }));
+  const typeRows = Object.keys(h.by_type).map(t => ({ cells: [HENV_NO[t] || t, (h.type_forklaring && h.type_forklaring[t]) || '', fmtNum(h.by_type[t]), fmtNum(h.bot.by_type[t]), fmtNum(h.test.by_type[t])] }));
+  target.appendChild(table(['Type', 'Hva det teller', 'Klikk fra folk', 'Bot-klikk', 'Testklikk'], typeRows, 2));
+  target.appendChild(el('div', { cls: 'note', text: 'Bot-klikk og testklikk er tatt med her bare for å vise hva som er holdt utenfor; de er ikke med i «Klikk fra folk».' }));
+  if (h.test.providers && h.test.providers.length) {
+    target.appendChild(el('h3', { text: 'Testtilbydere (ikke med over)' }));
+    target.appendChild(table(['Testtilbyder', 'Testklikk'], h.test.providers.map(p => ({ test: true, cells: [p.name || p.provider_id, fmtNum(p.total)] })), 1));
+  }
+  target.appendChild(el('h3', { text: 'Per tidsbolk' }));
+  target.appendChild(table(['Bolk', 'Klikk fra folk', 'Booking', 'Nettside', 'Telefon', 'E-post', 'Annet'],
+    h.series.map(s => ({ cells: [s.bucket, fmtNum(s.total), fmtNum(s.by_type.booking), fmtNum(s.by_type.nettside), fmtNum(s.by_type.telefon), fmtNum(s.by_type.e_post), fmtNum(s.by_type.annet)] })), 1));
+  (h.merknader || []).forEach(m => target.appendChild(el('div', { cls: 'note', text: m })));
+}
+
+// Slice S3: «levert til AI-assistent» (profile_ai_deliveries). A separate
+// number — never added to the clicks above.
+function renderAi(a, target) {
+  target.replaceChildren();
+  document.getElementById('aiLead').textContent = a.forklaring;
+  if (!a.available) {
+    (a.merknader || []).forEach(m => target.appendChild(el('div', { cls: 'note', text: m })));
+    return;
+  }
+  target.appendChild(el('div', { cls: 'cards' }, [
+    card(fmtNum(a.total), 'Levert til AI-assistent', 'Ganger en produsentprofil var med i det vi leverte til en AI-assistent. Ikke klikk, og ikke lagt sammen med klikkene.'),
+    card(fmtNum(a.test.total), 'Testprodusent (ikke med)', a.test.forklaring)
+  ]));
+  target.appendChild(el('h3', { text: 'Per kanal' }));
+  target.appendChild(table(['Kanal', 'Kode', 'Levert til AI-assistent'],
+    Object.keys(a.by_channel).map(c => ({ cells: [AI_KANAL_NO[c] || c, c, fmtNum(a.by_channel[c])] })), 2));
+  target.appendChild(el('h3', { text: 'Per AI-assistent' }));
+  target.appendChild(table(['AI', 'Levert til AI-assistent'],
+    Object.keys(a.by_vendor).map(v => ({ cells: [AI_NO[v] || v, fmtNum(a.by_vendor[v])] })), 1));
+  target.appendChild(el('h3', { text: 'Per tidsbolk' }));
+  target.appendChild(table(['Bolk', 'Levert til AI-assistent'], a.series.map(s => ({ cells: [s.bucket, fmtNum(s.total)] })), 1));
+  (a.merknader || []).forEach(m => target.appendChild(el('div', { cls: 'note', text: m })));
+}
+
+function renderGs(g, target) {
+  target.replaceChildren();
+  document.getElementById('gsLead').textContent = g.forklaring;
+  if (!g.available) {
+    (g.merknader || []).forEach(m => target.appendChild(el('div', { cls: 'note', text: m })));
+    return;
+  }
+  target.appendChild(el('div', { cls: 'cards' }, [
+    card(fmtNum(g.total), 'Besøksforespørsler', 'Antall forespørsler sendt inn i perioden, alle statuser, uten testtilbydere og test-forespørsler.'),
+    card(fmtNum(g.party_size_sum), 'Personer', 'Sum antall personer i forespørslene.'),
+    card(fmtNum(g.attended), 'Møtte opp', 'Forespørsler med status «møtte opp» etter besøket.'),
+    card(fmtNum(g.no_show), 'Møtte ikke', 'Forespørsler der gjesten ikke møtte.'),
+    card(fmtHours(g.response_time.median_hours), 'Svartid (median)', g.response_time.forklaring),
+    card(fmtNum(g.billable.count), 'Merket fakturerbar', g.billable.forklaring)
+  ]));
+  target.appendChild(el('h3', { text: 'Per status (etter besøket)' }));
+  target.appendChild(table(['Status', 'Kode', 'Antall'], statusRows(g.by_status, g.test.by_status), 2));
+  target.appendChild(el('h3', { text: 'Per forhåndsstatus (produsentens svar)' }));
+  target.appendChild(table(['Forhåndsstatus', 'Kode', 'Antall'], statusRows(g.by_pre_status, null), 2));
+  target.appendChild(el('div', { cls: 'note', text: 'Forhåndsstatus viser om produsenten har svart på forespørselen.' }));
+
+  target.appendChild(el('h3', { text: 'Per tilbyder' }));
+  const provRows = g.providers.map(p => ({ cells: [p.name || p.provider_id, fmtNum(p.total), fmtNum(p.party_size_sum)] }));
+  provRows.push({ test: true, cells: ['Testdata (ikke med over)', fmtNum(g.test.total), fmtNum(g.test.party_size_sum)] });
+  target.appendChild(table(['Tilbyder', 'Forespørsler', 'Personer'], provRows, 1));
+
+  target.appendChild(el('h3', { text: 'Per tidsbolk' }));
+  target.appendChild(table(['Bolk', 'Forespørsler', 'Personer'],
+    g.series.map(s => ({ cells: [s.bucket, fmtNum(s.total), fmtNum(s.party_size_sum)] })), 1));
+  (g.merknader || []).forEach(m => target.appendChild(el('div', { cls: 'note', text: m })));
+}
+
+function renderAlle(body, target) {
+  target.replaceChildren();
+  const r = body.rfb, g = body.gardssalg && body.gardssalg.available ? body.gardssalg : null;
+  const total = (r ? r.total : 0) + (g ? g.total : 0);
+  const testTotal = (r ? r.test.total : 0) + (g ? g.test.total : 0);
+  target.appendChild(el('div', { cls: 'cards' }, [
+    card(fmtNum(total), 'Bestillinger og forespørsler', 'Rett fra Bonden-bestillinger pluss gårdssalg-forespørsler i perioden, uten testdata.'),
+    card(fmtKr(r ? r.sum_nok.amount : null), 'Omsetning (RFB, akseptert)', 'Bare Rett fra Bonden har beløp; gårdssalg betales ved oppmøte og har ingen beløp her.')
+  ]));
+  const rows = [
+    { cells: ['Rett fra Bonden', fmtNum(r ? r.total : null)] },
+    { cells: ['Opplevagent gårdssalg', g ? fmtNum(g.total) : 'ikke tilgjengelig'] },
+    { cells: ['Opplevagent opplevelser', 'ingen bestillinger hos oss (se henvisninger)'] },
+    { cells: ['Finn-tannlege', 'ingen bestillinger hos oss (se henvisninger)'] },
+    { test: true, cells: ['Testdata (ikke med over)', fmtNum(testTotal)] }
+  ];
+  target.appendChild(table(['Plattform', 'Antall'], rows, 1));
+  // Slice S3/S4: clicks on to the producer / provider / clinic per platform.
+  const hv = body.henvisninger || {};
+  const henvRow = (navn, h) => ({ cells: [navn, h && h.available ? fmtNum(h.total) : 'ikke tilgjengelig', h && h.available ? fmtNum(h.bot.total) : '–', h && h.available ? fmtNum(h.test.total) : '–'] });
+  target.appendChild(el('h3', { text: 'Henvisninger (klikk videre) per plattform' }));
+  target.appendChild(table(['Plattform', 'Klikk fra folk', 'Bot-klikk (ikke med)', 'Testklikk (ikke med)'], [
+    henvRow('Rett fra Bonden', hv.rfb),
+    henvRow('Opplevagent gårdssalg', hv.gardssalg),
+    henvRow('Opplevagent opplevelser', hv.opplevelser),
+    henvRow('Finn-tannlege', hv.tannlege)
+  ], 1));
+  target.appendChild(el('div', { cls: 'note', text: 'Klikk fra en profilside videre til produsenten, tilbyderen eller klinikken. Ikke lagt sammen med bestillingene over.' }));
+}
+
+function render(body) {
+  const p = body.periode;
+  document.getElementById('meta').textContent =
+    'Periode ' + p.fra + ' – ' + p.til + ' (' + p.tidssone + '), oppløsning ' + (OPPL_NO[p.oppl] || p.oppl) +
+    '. Hentet ' + new Date(body.generated_at).toLocaleString('nb-NO') + '. ' + body.forklaring;
+  renderAlle(body, document.getElementById('alleBody'));
+  if (body.rfb) renderRfb(body.rfb, document.getElementById('rfbBody'));
+  if (body.henvisninger && body.henvisninger.rfb) renderHenv(body.henvisninger.rfb, document.getElementById('henvBody'));
+  if (body.ai_leveranser && body.ai_leveranser.rfb) renderAi(body.ai_leveranser.rfb, document.getElementById('aiBody'));
+  if (body.gardssalg) renderGs(body.gardssalg, document.getElementById('gsBody'));
+  const hv = body.henvisninger || {};
+  if (hv.gardssalg) renderProfilHenv(hv.gardssalg, document.getElementById('henvGsBody'), document.getElementById('henvGsLead'));
+  if (hv.opplevelser) renderProfilHenv(hv.opplevelser, document.getElementById('henvOpplBody'), document.getElementById('henvOpplLead'));
+  if (hv.tannlege) renderProfilHenv(hv.tannlege, document.getElementById('henvTannBody'), document.getElementById('henvTannLead'));
+}
+
+const ACTIONS = { login, logout, csv: (_id, _v, _el, e) => downloadCsv(e) };
+document.body.addEventListener('click', e => {
+  let t = e.target;
+  while (t && t !== document.body && !(t.dataset && t.dataset.action)) t = t.parentElement;
+  if (!t || !t.dataset || !t.dataset.action) return;
+  const fn = ACTIONS[t.dataset.action];
+  if (fn) fn(t.dataset.id, undefined, t, e);
+});
+document.body.addEventListener('keypress', e => {
+  if (e.target.id === 'adminKey' && e.key === 'Enter') login();
+});
+document.getElementById('periodSel').addEventListener('change', refresh);
+document.getElementById('opplSel').addEventListener('change', refresh);
+
+if (adminKey) showApp();
+</script>
+</body>
+</html>

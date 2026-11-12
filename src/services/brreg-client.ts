@@ -64,6 +64,9 @@ type RawBrregAddress = {
   // Present on the real API; read only by fetchBrregAddressEvidence below.
   land?: string | null;
   landkode?: string | null;
+  // Present on the real API; read only by lookupBrregEnhet below.
+  kommune?: string | null;
+  kommunenummer?: string | null;
 };
 
 type RawEnhet = {
@@ -685,6 +688,108 @@ export async function fetchBrregAddressEvidence(
     base.activeSubUnits.push({ orgnumber: trimOrNull(u.organisasjonsnummer) ?? "", address });
   }
   return base;
+}
+
+// ─── Full unit lookup for gårdssalg self-registration (dev-request ─────
+//     2026-11-01-opplevagent-drikkeprodusent-selvregistrering, skive 1) ───
+//
+// lookupBrregEnhet(orgNr) reads GET /enheter/{orgNr} once and returns every
+// field the self-registration Brreg gate needs: name, status flags, all three
+// NACE codes, organisation form and the business address with kommune.
+// Unlike verifyOrgNumber() it keeps "Brreg did not answer" apart from "no such
+// unit": a transport error, timeout, non-2xx other than 404/410 or bad JSON is
+// { kind: "error" }, so the caller can refuse to publish anything instead of
+// treating an outage as "org.nr does not exist". 410 Gone is Brreg's answer
+// for a deleted unit and comes back as found + slettet. No cache: a cached
+// status would hide a later konkurs/avvikling. Never throws.
+
+export type BrregEnhetLookup =
+  | { kind: "error" }
+  | { kind: "not_found" }
+  | {
+      kind: "found";
+      orgNr: string;
+      navn: string | null;
+      konkurs: boolean;
+      underAvvikling: boolean;
+      underTvangsavvikling: boolean;
+      slettet: boolean;
+      /** Not konkurs, not under (tvangs)avvikling, not deleted. */
+      active: boolean;
+      /** naeringskode1 (the primary code), or null. */
+      naeringskode1: string | null;
+      /** naeringskode1..3, in that order, blanks dropped. */
+      nace: string[];
+      orgForm: string | null;
+      adresse: string | null;
+      postnummer: string | null;
+      poststed: string | null;
+      kommune: string | null;
+      kommunenummer: string | null;
+    };
+
+export async function lookupBrregEnhet(
+  orgNr: string,
+  fetchImpl: typeof fetch = fetch,
+  timeoutMs: number = REQUEST_TIMEOUT_MS,
+): Promise<BrregEnhetLookup> {
+  const cleanOrgNr = (orgNr || "").trim();
+  if (!/^\d{9}$/.test(cleanOrgNr)) return { kind: "not_found" };
+  const url = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(cleanOrgNr)}`;
+  let res: Response;
+  try {
+    res = await fetchWithTimeout(url, timeoutMs, fetchImpl);
+  } catch (err) {
+    console.warn("[brreg-client] lookupBrregEnhet fetch failed:", err instanceof Error ? err.message : err);
+    return { kind: "error" };
+  }
+  if (res.status === 404) return { kind: "not_found" };
+  const empty = {
+    navn: null, naeringskode1: null, nace: [] as string[], orgForm: null,
+    adresse: null, postnummer: null, poststed: null, kommune: null, kommunenummer: null,
+  };
+  if (res.status === 410) {
+    return {
+      kind: "found", orgNr: cleanOrgNr, ...empty,
+      konkurs: false, underAvvikling: false, underTvangsavvikling: false, slettet: true, active: false,
+    };
+  }
+  if (!res.ok) return { kind: "error" };
+  let json: RawEnhetDetail & { organisasjonsform?: { kode?: string } | null };
+  try {
+    json = (await res.json()) as typeof json;
+  } catch {
+    return { kind: "error" };
+  }
+  if (!json || typeof json.organisasjonsnummer !== "string") return { kind: "error" };
+
+  const konkurs = json.konkurs === true;
+  const underAvvikling = json.underAvvikling === true;
+  const underTvangsavvikling = json.underTvangsavviklingEllerTvangsopplosning === true;
+  const slettet = typeof json.slettedato === "string" && json.slettedato.trim() !== "";
+  const nace = [json.naeringskode1?.kode, json.naeringskode2?.kode, json.naeringskode3?.kode]
+    .filter((k): k is string => typeof k === "string" && k.trim().length > 0)
+    .map((k) => k.trim());
+  const addr = json.forretningsadresse ?? json.postadresse ?? null;
+  const structured = toStructuredAddress(addr);
+  return {
+    kind: "found",
+    orgNr: cleanOrgNr,
+    navn: trimOrNull(json.navn),
+    konkurs,
+    underAvvikling,
+    underTvangsavvikling,
+    slettet,
+    active: !konkurs && !underAvvikling && !underTvangsavvikling && !slettet,
+    naeringskode1: trimOrNull(json.naeringskode1?.kode),
+    nace,
+    orgForm: trimOrNull(json.organisasjonsform?.kode)?.toUpperCase() ?? null,
+    adresse: structured?.adresse ?? null,
+    postnummer: structured?.postnummer ?? null,
+    poststed: structured?.poststed ?? null,
+    kommune: trimOrNull(addr?.kommune),
+    kommunenummer: trimOrNull(addr?.kommunenummer),
+  };
 }
 
 // ─── Website (hjemmeside) lookup (dev-request 2026-07-12-experiences- ───

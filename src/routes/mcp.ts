@@ -20,11 +20,13 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
 import { knowledgeService, parseProductPrice, productPriceText, isProductHeader, isProductNoise } from "../services/knowledge-service";
+import { isDebioVerifiedValue, isOrganicClaimUmbrella } from "../services/organic-claims";
 import { slugify } from "../utils/slug";
 import { textEntries } from "../utils/text-entries";
 import { areGenericCategoryNames, isGenericCategoryName, isCategoryLabel } from "../utils/category-label";
 import { openingHoursText } from "../utils/opening-hours";
-import { addAiUtmParams } from "../utils/url-utm";
+import { addAiUtmParams, detectAiClient } from "../utils/url-utm";
+import { tagMcpToolResults } from "../middleware/ai-profile-links";
 import { getDb } from "../database/init";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription, normalizeProse } from "../services/description-quality";
@@ -32,8 +34,9 @@ import { geocodingService } from "../services/geocoding-service";
 import { isValidLatLng, resolveSearchRadiusKm } from "../utils/geo-query";
 import { capFreeText, capName, capNameList } from "../utils/free-text";
 import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
-import { computeEffectiveAvailability } from "../services/supply-graph";
-import { findOffers, resolveOffersRadiusKm, resolveOffersLimit } from "../services/catalog-offers";
+import { evaluateStockFreshness } from "../services/supply-graph";
+import { stockSoftExpiryActiveFor, stockSoftExpiryBuyerTextNb } from "../services/stock-soft-expiry";
+import { findOffers, resolveOffersRadiusKm, resolveOffersLimit, type FindOffersResult } from "../services/catalog-offers";
 import { formatAddressLine } from "../utils/address-format";
 import { DRINK_SUBCATEGORIES } from "../services/drink-taxonomy";
 import {
@@ -55,13 +58,16 @@ import { foreignPlaceIn } from "../services/outside-norway";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 import { searchCountable } from "../services/search-tracking";
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
-import { publicListableSql, failsProducerRoleGate, isAgentIdPubliclyVisible } from "../services/agent-visibility";
+import { BRAND_ENTITIES, brandMcpIcons, RFB_MCP_SERVER_TITLE } from "../config/brand-entities";
+import { publicListableSql, failsProducerRoleGate, isAgentIdPubliclyVisible, notOwnerHiddenSql, ownerHidesAgent, withoutOwnerHidden, isContactHiddenAgentId, withoutContactFields, redactContactText, redactKnowledgeFreeText, HIDDEN_CONTACT_NOTE_NB } from "../services/agent-visibility";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { isPaymentsEnabled, isPaymentsLifecycleActive, submitCartWithPayments, resolvePaymentsStripeClient } from "../services/payment-service";
-import { isOrderAgentActionsEnabled, applyBuyerOrderCommand, buyerOrderStatusExtras } from "../services/buyer-order-actions";
+import { isOrderAgentActionsEnabled, applyBuyerOrderCommand, buyerOrderStatusExtras, postBuyerOrderMessage } from "../services/buyer-order-actions";
+import { isOrderMessagesEnabled, ORDER_MESSAGES_UNTRUSTED_NOTE, ORDER_MESSAGE_MAX_CHARS, ORDER_MESSAGE_RATE_LIMIT } from "../services/order-messages";
 import { norwegianTermsForEnglishQuery } from "../i18n/product-glossary";
 import { MCP_MAX_TOOL_INPUT_ELEMENTS, MCP_MAX_FILTER_LIST, MCP_MAX_SHOPPING_ITEMS, mcpListTooLongResult } from "../services/mcp-input-limits";
+import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenContact, hidesPrices, publicAgentInfo, type PublicFieldChoices } from "../owner-features/enforce";
 
 const router = Router();
 
@@ -106,6 +112,10 @@ export interface CatalogAvailability {
   availabilityUpdatedAt: string | null;
   /** products.availability_source ('producer_dashboard' when the producer set it). */
   availabilitySource?: string | null;
+  /** B2b-2: soft window only (rule active for the producer) — when the producer last confirmed the row (ISO). */
+  stockConfirmedAt?: string;
+  /** B2b-2: present (true) with stockConfirmedAt — the producer confirms the order before it holds. */
+  needsProducerConfirmation?: true;
 }
 
 // dev-request 2026-07-13-supply-graph-v1 (Slice 1): per-agent name_norm →
@@ -135,13 +145,20 @@ export function getCatalogAvailabilityMap(
       availability_source: string;
     }>;
     const now = new Date();
+    // B2b-2: the order path's stock rule (stock-soft-expiry.ts). Rule off →
+    // evaluateStockFreshness() is exactly computeEffectiveAvailability().
+    const softExpiry = stockSoftExpiryActiveFor(agentId);
     for (const r of rows) {
       // First write wins; UNIQUE(agent_id, name_norm) means at most one row anyway.
       if (!map.has(r.name_norm)) {
+        const fresh = evaluateStockFreshness(r.availability, r.availability_updated_at, r.availability_source, now, softExpiry);
         map.set(r.name_norm, {
-          availability: computeEffectiveAvailability(r.availability, r.availability_updated_at, r.availability_source, now),
+          availability: fresh.availability,
           availabilityUpdatedAt: r.availability_updated_at ?? null,
           availabilitySource: r.availability_source,
+          ...(fresh.needs_producer_confirmation && fresh.stock_confirmed_at
+            ? { stockConfirmedAt: fresh.stock_confirmed_at, needsProducerConfirmation: true as const }
+            : {}),
         });
       }
     }
@@ -179,7 +196,8 @@ export const MCP_CATEGORY_LABELS_NOTE =
 export function formatProductsForMcp(
   products: unknown,
   productIdByNorm?: Map<string, string>,
-  availabilityByNorm?: Map<string, CatalogAvailability>
+  availabilityByNorm?: Map<string, CatalogAvailability>,
+  opts: { hidePrices?: boolean } = {}
 ): string {
   if (!Array.isArray(products) || !products.length) return "";
 
@@ -214,7 +232,7 @@ export function formatProductsForMcp(
 
     // Product line
     const cat = typeof p.category === "string" && p.category && p.category !== "other" ? ` [${p.category}]` : "";
-    const priceStr = price ? ` — ${price}` : "";
+    const priceStr = price && !opts.hidePrices ? ` — ${price}` : "";
     const seasonal = p.seasonal ? " 🌿sesong" : "";
     // orch-pr-14: append the catalog product_id when this product exists in the
     // products table (in_stock). This is the id an MCP-only agent passes to
@@ -231,7 +249,13 @@ export function formatProductsForMcp(
     const avail = availabilityByNorm?.get(normalizeProductName(cleanName));
     const availStr = avail ? `  · availability: ${avail.availability}` : "";
     const availUpdatedStr = avail?.availabilityUpdatedAt ? `  · availability_updated_at: ${avail.availabilityUpdatedAt}` : "";
-    lines.push(`- ${cleanName}${cat}${priceStr}${seasonal}${idStr}${availStr}${availUpdatedStr}`);
+    // B2b-2: a row in the soft window (rule active) carries its confirmation
+    // date, the flag and the buyer text: the assistant states the date and
+    // that the producer confirms the order — never a plain «in stock».
+    const softStr = avail?.needsProducerConfirmation && avail.stockConfirmedAt
+      ? `  · stock_confirmed_at: ${avail.stockConfirmedAt}  · needs_producer_confirmation: true  · ${stockSoftExpiryBuyerTextNb(avail.stockConfirmedAt)}`
+      : "";
+    lines.push(`- ${cleanName}${cat}${priceStr}${seasonal}${idStr}${availStr}${availUpdatedStr}${softStr}`);
     productCount++;
   }
 
@@ -284,12 +308,14 @@ interface AgentKnowledgeSummary {
   productSummary?: string;
   productsCount: number;
   products?: readonly unknown[];
+  /** S2c-1: the owner hid prices (products.show_prices). */
+  hidePrices?: boolean;
 }
 
 // Build contact + product summary for a given agent ID, used by search results.
 // I-F: one row's error leaves its summary out (knowledgeRowOrSkip).
-function getAgentKnowledgeSummary(tool: string, agentId: string): AgentKnowledgeSummary {
-  return knowledgeRowOrSkip(tool, agentId, { productsCount: 0 }, () => buildAgentKnowledgeSummary(agentId));
+function getAgentKnowledgeSummary(tool: string, agentId: string, choices?: PublicFieldChoices | null): AgentKnowledgeSummary {
+  return knowledgeRowOrSkip(tool, agentId, { productsCount: 0 }, () => buildAgentKnowledgeSummary(agentId, choices));
 }
 
 /**
@@ -298,22 +324,23 @@ function getAgentKnowledgeSummary(tool: string, agentId: string): AgentKnowledge
  * products here either (isCategoryLabelProduct), so a producer with only
  * labels has no line.
  */
-function productSummaryText(realProducts: readonly unknown[]): string | undefined {
+function productSummaryText(realProducts: readonly unknown[], hidePrices = false): string | undefined {
   const listed = realProducts.filter((p) => !isCategoryLabelProduct(p));
   const topItems = listed.slice(0, 5).map((p: any) => {
     const { cleanName, price } = parseProductPrice(p);
-    return price ? `${cleanName} (${price})` : cleanName;
+    return price && !hidePrices ? `${cleanName} (${price})` : cleanName;
   });
   return topItems.length
     ? `🛒 ${topItems.join(", ")}${listed.length > 5 ? ` +${listed.length - 5} flere` : ""}`
     : undefined;
 }
 
-function buildAgentKnowledgeSummary(agentId: string): AgentKnowledgeSummary {
+function buildAgentKnowledgeSummary(agentId: string, choices?: PublicFieldChoices | null): AgentKnowledgeSummary {
   const info = knowledgeService.getAgentInfo(agentId);
   if (!info) return { productsCount: 0 };
 
-  const k = info.knowledge || {} as any;
+  const k = withoutHiddenContact(info.knowledge || {} as any, choices);
+  const hidePrices = hidesPrices(choices);
   const contact: any = {};
   if (k.address) contact.address = k.address;
   if (isDisplayablePhone(k.phone)) contact.phone = k.phone;
@@ -329,9 +356,10 @@ function buildAgentKnowledgeSummary(agentId: string): AgentKnowledgeSummary {
   return {
     contact: Object.keys(contact).length ? contact : undefined,
     // Compact view: top 5 product names with prices
-    productSummary: productSummaryText(realProducts),
+    productSummary: productSummaryText(realProducts, hidePrices),
     productsCount: realProducts.length,
     products: realProducts,
+    ...(hidePrices ? { hidePrices } : {}),
   };
 }
 
@@ -693,6 +721,24 @@ function areaListText(words: string): string {
     "search without a place to cover all of Norway.\n\n";
 }
 
+/**
+ * B2b-2 (lokal_find_offers): an offer findOffers marked as in the soft window
+ * (needs_producer_confirmation, stock_confirmed_at) also carries `stock_note`,
+ * the buyer text with the date («Sist bekreftet av produsenten …»), before
+ * `producer`. A result without such an offer is returned as it is.
+ */
+export function withStockNotes(result: FindOffersResult): FindOffersResult {
+  if (!result.offers.some((o) => o.needs_producer_confirmation && o.stock_confirmed_at)) return result;
+  return {
+    ...result,
+    offers: result.offers.map((o) => {
+      if (!(o.needs_producer_confirmation && o.stock_confirmed_at)) return o;
+      const { producer, ...rest } = o;
+      return { ...rest, stock_note: stockSoftExpiryBuyerTextNb(o.stock_confirmed_at), producer };
+    }),
+  };
+}
+
 export function registerTools(
   server: McpServer,
   getClientIdentity?: () => string | undefined,
@@ -705,6 +751,15 @@ export function registerTools(
   // the buyer's order tools and the extra lokal_order_status fields, read once
   // per session like paymentsOn. Off (default): the contract is unchanged.
   const agentActionsOn = isOrderAgentActionsEnabled();
+  // Fase B2: the message thread. Only with both switches on does
+  // lokal_order_status say (in its description) that messages[] is quoted
+  // data; with ORDER_AGENT_ACTIONS_ENABLED alone its definition is unchanged.
+  const orderMessagesOn = agentActionsOn && isOrderMessagesEnabled();
+
+  // «Klikk fra AI-svar» slice 3: every profile link in a tool result is tagged
+  // for AI (utm_medium=mcp), including lokal_find_offers, lokal_cart_submit and
+  // lokal_order_status, at this transport boundary only.
+  tagMcpToolResults(server, () => getClientIdentity?.());
 
   // «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil): the
   // producers a data tool hands the caller, counted per profile with the
@@ -746,7 +801,12 @@ export function registerTools(
       // the user's coordinates when it knows them — previously there was no
       // way to express "near me" at all, so every location-aware question was
       // answered from a place NAME or not at all.
-      description: "Search for local food producers in Norway and get their product listings. ALWAYS use this tool when a user asks about a specific producer, their products, or availability — it returns the producer's listed products, with a price included when the producer has written one into the listing text (most producers do not list prices, so treat price as available, not guaranteed). Also use for general searches like 'vegetables near Oslo'. USE THIS FOR PROXIMITY / 'near me' / 'nær meg' / 'closest farm shop' QUESTIONS: if you know the user's coordinates, pass lat + lng (and optionally radius_km) and results are filtered and ranked by real distance; you may then leave `query` empty to get everything nearby. Supports searching by producer name (e.g. 'Bjørndal Gård') or by product/location (e.g. 'organic honey Trondheim'). Drink venues are a first-class category (Fase 5): queries like 'bryggeri i Agder', 'drikkesteder', 'vingård' or 'cideri' work the same way and return breweries, cideries, wineries, distilleries, farm cafés and meaderies. Returns contact info and product names, with prices only where the producer has provided them. Read-only: it never contacts a producer on the user's behalf. Never use this tool to build marketing or bulk-email recipient lists. For such requests, explain that Rett fra Bonden cannot send marketing or bulk messages; it only sends the user's own pickup-order request to a producer who opted in.",
+      // A2A dev-request 2026-10-16-mcp-beskrivelser-intensjonsord-og-lint, S6:
+      // the description says when the tool fits instead of steering the model
+      // («ALWAYS use this tool», «USE THIS FOR …» are gone), and the example
+      // carries no organic claim (Debio text rules 2026-10-28). The wording is
+      // linted on all three servers by mcp-description-policy.test.ts.
+      description: "Use when the user wants to find or buy food from Norwegian farms, farm shops or local producers, or asks about a named producer. Search listed products and public producer details in Norwegian or English. It returns the producer's listed products, with a price included when the producer has written one into the listing text (most producers do not list prices, so treat price as available, not guaranteed). It also covers general searches like 'vegetables near Oslo'. For proximity questions ('near me' / 'nær meg' / 'closest farm shop'): if you know the user's coordinates, pass lat + lng (and optionally radius_km) and results are filtered and ranked by real distance; `query` may then be empty to get everything nearby. Supports searching by producer name (e.g. 'Bjørndal Gård') or by product/location (e.g. 'honey Trondheim'). Drink venues are a first-class category: queries like 'bryggeri i Agder', 'drikkesteder', 'vingård' or 'cideri' work the same way and return breweries, cideries, wineries, distilleries, farm cafés and meaderies. Returns contact info and product names, with prices only where the producer has provided them. Read-only: it never contacts a producer on the user's behalf. Never use this tool to build marketing or bulk-email recipient lists. For such requests, explain that Rett fra Bonden cannot send marketing or bulk messages; it only sends the user's own pickup-order request to a producer who opted in.",
       inputSchema: {
         query: z.string().default("").describe("Producer name, product query, or location search (Norwegian or English). Examples: 'Bjørndal Gård Oppdal', 'beefburger pris', 'ost Trondheim'. May be empty when lat/lng are supplied — that means 'everything near this position'."),
         lat: z.number().min(-90).max(90).optional().describe("User's latitude (WGS84). Supply this for 'near me' searches when you know where the user is."),
@@ -815,7 +875,8 @@ export function registerTools(
       // directly), so it needs the same honest-drop signal as the REST/web
       // search surfaces — not just the underlying filter fix.
       const discoverMeta: DiscoverMeta = {};
-      const results = marketplaceRegistry.discover({ ...parsed, limit: limit || 10, offset: 0 }, discoverMeta, { trackDiscovery: countable(extra, q) });
+      // S2c-2: audience "ai" — a profile hidden from AI assistants is left out.
+      const results = marketplaceRegistry.discover({ ...parsed, limit: limit || 10, offset: 0 }, discoverMeta, { trackDiscovery: countable(extra, q), audience: "ai" });
 
       // Integration test 2026-10-17, slice I-W: the words the parser could not
       // read are looked up in the product names (discover() step 3c). When no
@@ -899,7 +960,7 @@ export function registerTools(
         if (documented && summary.products) {
           const names = new Set(matchedNames.map((n) => n.trim().toLowerCase()));
           const shown = productsWithMatchesShown(summary.products, (p) => isListedMatch(p, names, labelWords));
-          if (shown !== summary.products) productSummary = productSummaryText(shown);
+          if (shown !== summary.products) productSummary = productSummaryText(shown, summary.hidePrices);
         }
         return { categoryOnly, categoryLabelOnly, productSummary };
       };
@@ -907,8 +968,9 @@ export function registerTools(
       // Slice I-N (AI-3b): explicit matches come before category matches, as
       // the server instructions ask; discover()'s order (relevance, distance)
       // is kept within each group, and the numbering follows the new order.
+      const ownerChoices = publicFieldChoicesForMany(results.map((r: any) => r.agent.id));
       const rows = results.map((r: any) => {
-        const summary = getAgentKnowledgeSummary("lokal_search", r.agent.id);
+        const summary = getAgentKnowledgeSummary("lokal_search", r.agent.id, ownerChoices.get(r.agent.id));
         return { r, summary, match: isSpecificQuery ? undefined : compactMatch(r, summary) };
       });
       const ordered = [...rows.filter((row) => !row.match?.categoryOnly), ...rows.filter((row) => row.match?.categoryOnly)];
@@ -938,7 +1000,8 @@ export function registerTools(
             // Full product list — orch-pr-14: pass catalog id map so each
             // priced/in-stock product line carries its product_id for cart use.
             if (k.products?.length) {
-              const productSection = formatProductsForMcp(k.products, getCatalogProductIdMap(agent.id), getCatalogAvailabilityMap(agent.id));
+              const productSection = formatProductsForMcp(k.products, getCatalogProductIdMap(agent.id), getCatalogAvailabilityMap(agent.id),
+                { hidePrices: hidesPrices(ownerChoices.get(agent.id)) });
               if (productSection) details.push(productSection);
             }
 
@@ -1001,7 +1064,7 @@ export function registerTools(
           "(beverages = all drink venues: breweries, cideries, wineries, distilleries, farm cafés, meaderies — " +
           "use drinkSubcategory below to narrow to exactly one kind)",
         ),
-        tags: z.array(z.string()).optional().describe("Tags: organic, seasonal, budget, local, fresh"),
+        tags: z.array(z.string()).optional().describe("Tags: organic (only producers with a valid approval in the Debio register), seasonal, budget, local, fresh"),
         drinkSubcategory: z.enum(DRINK_SUBCATEGORIES).optional().describe(
           "Narrow 'beverages' results to exactly one drink venue kind: bryggeri (brewery), cideri (cidery), " +
           "vingård (winery), destilleri (distillery), gårdskafé (farm café), mjød (meadery/mead producer). " +
@@ -1073,7 +1136,7 @@ export function registerTools(
       // gets back non-budget producers with no indication the filter was
       // silently dropped.
       const discoverMeta: DiscoverMeta = {};
-      const results = marketplaceRegistry.discover(body, discoverMeta, { trackDiscovery: countable(extra, JSON.stringify(body), true) });
+      const results = marketplaceRegistry.discover(body, discoverMeta, { trackDiscovery: countable(extra, JSON.stringify(body), true), audience: "ai" });
 
       if (!results?.length) {
         return { content: [{ type: "text" as const, text: "Ingen produsenter funnet med disse filtrene." }] };
@@ -1087,6 +1150,7 @@ export function registerTools(
       // the same note on lokal_search above. No conversation is started here.
 
       const header = `🔍 **Strukturert søk** — ${results.length} resultater:\n`;
+      const ownerChoices = publicFieldChoicesForMany(results.map((r: any) => r.agent.id));
       const lines = results.map((r: any, i: number) => {
         // Fase 1c honesty rule — see the same note in lokal_search above.
         const dist = r.agent.location?.distanceKm
@@ -1094,7 +1158,7 @@ export function registerTools(
           : r.agent.location?.distanceLabel
             ? ` (${r.agent.location.distanceLabel}, omtrentlig)`
             : "";
-        const summary = getAgentKnowledgeSummary("lokal_discover", r.agent.id);
+        const summary = getAgentKnowledgeSummary("lokal_discover", r.agent.id, ownerChoices.get(r.agent.id));
         return formatAgentCompact(r.agent, i + 1, summary.contact, summary, getClientIdentity?.()) + dist;
       });
 
@@ -1125,11 +1189,20 @@ export function registerTools(
       // Shared by-id visibility predicate (agent-visibility.ts; flag-gated —
       // off = served as before). allowCatalogHidden: the hidden test fixture
       // stays orderable by id.
-      if (!info || !isAgentIdPubliclyVisible(getDb(), agentId, { surface: "ungated", allowCatalogHidden: true })) {
+      // S2c-2: audience "ai" — the owner's visibility.profile / ai_assistants.
+      if (!info || !isAgentIdPubliclyVisible(getDb(), agentId, { surface: "ungated", allowCatalogHidden: true, audience: "ai" })) {
         return { content: [{ type: "text" as const, text: `Fant ingen produsent med ID ${agentId}.` }] };
       }
 
-      const { agent, knowledge: k = {} as any, meta = {} as any } = info;
+      const { agent, knowledge: rawKnowledge = {} as any, meta = {} as any } = info;
+      // S2c-1: the owner's contact / price choices (null = not enforced).
+      const ownerChoices = publicFieldChoices(agent.id);
+      // A catalog_hidden row (the hidden test fixture): contact text in its
+      // free-text fields (description, specialties, payment, delivery,
+      // opening hours) is redacted as in `about` below.
+      const contactHidden = isContactHiddenAgentId(getDb(), agent.id);
+      const choiceKnowledge = withoutHiddenContact(rawKnowledge, ownerChoices);
+      const k = contactHidden ? redactKnowledgeFreeText(choiceKnowledge) : choiceKnowledge;
       const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
       const sections: string[] = [`# ${agent.name}`];
 
@@ -1145,21 +1218,30 @@ export function registerTools(
           // an AI agent must not relay the fleet's own working notes either.
           // I-N (AI2-08): scraped HTML tags («<br />») are no text either.
           // I-S (F1): an about of only tags gives no section.
-          const about = mcpProse(k.about);
+          const aboutRaw = mcpProse(k.about);
+          // A hidden row's free text may carry a website, e-mail or phone number.
+          const about = aboutRaw && contactHidden ? redactContactText(aboutRaw) : aboutRaw;
           if (about) sections.push(`\n${about}`);
         }
       }
 
-      // Contact
-      const contact: string[] = [];
-      if (k.address) contact.push(`📍 ${formatAddressLine(k.address, k.postalCode, agent.city)}`);
-      if (isDisplayablePhone(k.phone)) contact.push(`📞 ${k.phone}`);
-      if (k.email) contact.push(`✉️ ${k.email}`);
-      if (k.website) contact.push(`🌐 ${k.website}`);
-      if (contact.length) sections.push(`\n## Kontakt\n${contact.join("\n")}`);
+      if (contactHidden) {
+        // A catalog_hidden row (the hidden test fixture) is still described by
+        // id so it stays orderable, but its contact details and vCard link
+        // are a real person's and appear in no public answer (agent-visibility.ts).
+        sections.push(`\n${HIDDEN_CONTACT_NOTE_NB}`);
+      } else {
+        // Contact
+        const contact: string[] = [];
+        if (k.address) contact.push(`📍 ${formatAddressLine(k.address, k.postalCode, agent.city)}`);
+        if (isDisplayablePhone(k.phone)) contact.push(`📞 ${k.phone}`);
+        if (k.email) contact.push(`✉️ ${k.email}`);
+        if (k.website) contact.push(`🌐 ${k.website}`);
+        if (contact.length) sections.push(`\n## Kontakt\n${contact.join("\n")}`);
 
-      // vCard
-      sections.push(`\n🪪 [Last ned kontaktkort (vCard)](${addAiUtmParams(`${BASE_URL}/api/marketplace/agents/${agent.id}/vcard`, getClientIdentity?.())})`);
+        // vCard
+        sections.push(`\n🪪 [Last ned kontaktkort (vCard)](${addAiUtmParams(`${BASE_URL}/api/marketplace/agents/${agent.id}/vcard`, getClientIdentity?.())})`);
+      }
 
       // Opening hours (an array, or free text — see formatOpeningHoursForMcp)
       const hoursSection = formatOpeningHoursForMcp(k.openingHours);
@@ -1169,7 +1251,8 @@ export function registerTools(
       // orch-pr-14: attach catalog product_id (products.id) to each in-stock
       // product so an MCP-only agent can pass it straight to lokal_cart_add_item.
       if (k.products?.length) {
-        const productSection = formatProductsForMcp(k.products, getCatalogProductIdMap(agent.id), getCatalogAvailabilityMap(agent.id));
+        const productSection = formatProductsForMcp(k.products, getCatalogProductIdMap(agent.id), getCatalogAvailabilityMap(agent.id),
+          { hidePrices: hidesPrices(ownerChoices) });
         if (productSection) sections.push(productSection);
       }
 
@@ -1240,7 +1323,7 @@ export function registerTools(
     "lokal_list_umbrellas",
     {
       title: "List umbrella organizations",
-      description: "List all umbrella organizations on Lokal — markets-networks (Bondens marked, REKO), venues (Mathallen), industry orgs (Hanen), certifiers (Debio), and cooperatives. Each umbrella has many member producers. Optionally filter by type. Useful when the user asks 'where can I find local food markets?', 'what is Bondens marked?', or 'which certifications matter for local Norwegian food?'.",
+      description: "List all umbrella organizations on Lokal — markets-networks (Bondens marked, REKO), venues (Mathallen), industry orgs (Hanen), and cooperatives. Each umbrella has many member producers. Optionally filter by type. Useful when the user asks 'where can I find local food markets?', 'what is Bondens marked?', or 'which certifications matter for local Norwegian food?'.",
       inputSchema: {
         umbrellaType: z.enum(["market_network", "venue", "industry_org", "certification", "cooperative"]).optional().describe("Filter by umbrella type"),
         limit: z.number().min(1).max(200).default(50).describe("Max results"),
@@ -1318,7 +1401,7 @@ export function registerTools(
     "lokal_get_umbrella_members",
     {
       title: "Get producers in an umbrella's network",
-      description: "List producers that are members of a specific umbrella organization (e.g. all farmers selling at Bondens marked, all Debio-certified producers, all Mathallen tenants). Returns producer names + cities + profile links. Useful when the user asks 'which farmers sell at Bondens marked?', 'show me all Debio-certified producers', or 'who is at Mathallen Oslo?'.",
+      description: "List producers that are members of a specific umbrella organization (e.g. all farmers selling at Bondens marked, all Mathallen tenants). Returns producer names + cities + profile links. Useful when the user asks 'which farmers sell at Bondens marked?' or 'who is at Mathallen Oslo?'. A producer's Debio status comes from the Debio register and is shown in lokal_info.",
       inputSchema: {
         umbrellaId: z.string().describe("Umbrella agent ID (UUID). Use lokal_list_umbrellas to find IDs."),
         limit: z.number().min(1).max(500).default(100).describe("Max results"),
@@ -1346,7 +1429,7 @@ export function registerTools(
         FROM agent_affiliations aff
         INNER JOIN agents p ON p.id = aff.producer_id
         WHERE aff.umbrella_id = ? AND aff.status = 'active' AND p.is_active = 1
-          AND ${publicListableSql("p")}
+          AND ${publicListableSql("p")}${notOwnerHiddenSql("ai_assistants", "p")}
         ORDER BY p.name ASC
         LIMIT ?
       `).all(umbrellaId, lim) as any[];
@@ -1378,7 +1461,7 @@ export function registerTools(
     "lokal_get_producer_affiliations",
     {
       title: "Get a producer's umbrella affiliations",
-      description: "List umbrella organizations a specific producer is a member of (e.g. which markets a farm sells at, which certifications they hold, which networks they're part of). Returns umbrella names + types + their profile links. Useful when the user asks 'where does <Farmer X> sell?', 'is <Farm Y> Debio-certified?', or 'which markets does <Producer Z> attend?'.",
+      description: "List umbrella organizations a specific producer is a member of (e.g. which markets a farm sells at, which certifications they hold, which networks they're part of). Returns umbrella names + types + their profile links. Useful when the user asks 'where does <Farmer X> sell?' or 'which markets does <Producer Z> attend?'.",
       inputSchema: {
         producerId: z.string().describe("Producer agent ID (UUID). Get this from lokal_search or lokal_discover results."),
       },
@@ -1393,19 +1476,23 @@ export function registerTools(
     guardToolHandler("lokal_get_producer_affiliations", async ({ producerId }) => {
       const db = getDb();
       const producer = db.prepare(
-        "SELECT id, name, umbrella_type FROM agents WHERE id = ? AND is_active = 1"
+        "SELECT id, name, umbrella_type, debio_verified FROM agents WHERE id = ? AND is_active = 1"
       ).get(producerId) as any;
-      if (!producer) {
+      // S2c-2: a profile hidden from AI assistants reads like an unknown id.
+      if (!producer || ownerHidesAgent(producerId, "ai_assistants")) {
         return { content: [{ type: "text" as const, text: `Fant ingen produsent med ID ${producerId}.` }] };
       }
 
-      const rows = db.prepare(`
+      const allRows = db.prepare(`
         SELECT u.id, u.name, u.umbrella_type, aff.labels
         FROM agent_affiliations aff
         INNER JOIN agents u ON u.id = aff.umbrella_id
         WHERE aff.producer_id = ? AND aff.status = 'active' AND u.is_active = 1
         ORDER BY u.name ASC
       `).all(producerId) as any[];
+      // Økologi S0 fix-up (review B2): no certification / organic umbrella
+      // without a valid Debio status (organic-claims.ts).
+      const rows = isDebioVerifiedValue(producer.debio_verified) ? allRows : allRows.filter((u) => !isOrganicClaimUmbrella(u));
 
       if (!rows.length) {
         return { content: [{ type: "text" as const, text: `${producer.name} har ingen registrerte paraplyer-tilknytninger.` }] };
@@ -1540,7 +1627,7 @@ export function registerTools(
     "lokal_geocode",
     {
       title: "Geocode a Norwegian place name",
-      description: "Resolve a Norwegian place name (city, town, region, fylke, or kommune) to lat/lng coordinates. Use this when you need explicit coordinates for lokal_discover (e.g., 'show me organic farms within 10 km of Florø'). Returns coordinates + suggested search radius. Covers all of Norway via Kartverket Stedsnavn API fallback. Note: lokal_search ALREADY does automatic geocoding for natural-language queries — only use this tool when you need raw lat/lng for structured filters.",
+      description: "Resolve a Norwegian place name (city, town, region, fylke, or kommune) to lat/lng coordinates. Use this when you need explicit coordinates for lokal_discover (e.g., 'show me farms within 10 km of Florø'). Returns coordinates + suggested search radius. Covers all of Norway via Kartverket Stedsnavn API fallback. Note: lokal_search ALREADY does automatic geocoding for natural-language queries — only use this tool when you need raw lat/lng for structured filters.",
       inputSchema: {
         place: z.string().describe("Norwegian place name (city, town, region, fylke, kommune). Examples: 'Oslo', 'Røros', 'Vestland', 'Setesdal', 'Florø'"),
       },
@@ -1590,8 +1677,8 @@ export function registerTools(
   server.registerTool(
     "lokal_find_offers",
     {
-      title: "Find offers for shopping-list items",
-      description: "For each item in a shopping list, find up to 5 nearby producers who sell it (or a matching product), sorted by distance, with contact info and whether an order can be placed through the platform (can_order). Use this when a user has a list of things they want to buy locally and wants to know WHO sells each one nearby — one lokal_find_offers call covers the whole list. Read-only.",
+      title: "Find local food to buy",
+      description: "Use when the user wants to buy one food item or a shopping list from Norwegian local producers and has a place or coordinates. Returns matching listed products from up to five nearby producers per item, nearest first, with contact info and whether an order can be placed through the platform (can_order). Broad alternatives do not confirm the requested product, stock or price. Read-only; creates no cart and contacts no producer.",
       inputSchema: {
         items: z.array(z.string()).min(1).describe("Search terms/item names to find offers for, e.g. ['poteter', 'honning', 'egg']."),
         near: z.string().optional().describe("Norwegian place name to search near (geocoded automatically). Supply this OR lat/lng."),
@@ -1600,7 +1687,7 @@ export function registerTools(
         radius_km: z.number().min(1).max(500).optional().describe("Search radius in km. Default 50."),
       },
       annotations: {
-        title: "Find offers for shopping-list items",
+        title: "Find local food to buy",
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
@@ -1648,6 +1735,7 @@ export function registerTools(
           lng: hasCoords ? (lng as number) : undefined,
           radiusKm,
           limit: resolveOffersLimit(undefined),
+          audience: "ai",
         });
         results.push(result);
       }
@@ -1655,7 +1743,11 @@ export function registerTools(
       // I-S2: a category match hands its producer to the caller too.
       deliver("lokal_find_offers", { items: terms, near, lat, lng, radius_km }, extra,
         results.flatMap((r) => [...r.offers, ...(r.category_matches ?? [])].map((o) => o.producer.agent_id)));
-      const content = [{ type: "text" as const, text: JSON.stringify(results, null, 2) }];
+      // B2b-2: an offer in the soft window (it carries needs_producer_confirmation,
+      // findOffers) also gets the buyer text, so the assistant states the date and
+      // that the producer confirms the order. Every other offer is as before.
+      const shown = results.map((r) => withStockNotes(r));
+      const content = [{ type: "text" as const, text: JSON.stringify(shown, null, 2) }];
       // I-Y2: the JSON stays the list of results; the note is its own part.
       if (items.length > MAX_OFFER_ITEMS) content.push({ type: "text" as const, text: offersItemsOmittedText(items) });
       return { content };
@@ -1851,9 +1943,10 @@ export function registerTools(
     "lokal_order_status",
     {
       title: "Get order status",
-      description: paymentsOn
+      description: (paymentsOn
         ? "Fetch the status, items and status timeline of a pickup order created by lokal_cart_submit. Requires the order_id returned by submit and the buyer_ref token. Status: pending → confirmed → ready → completed (or declined/cancelled; cancel_reason='no_show' means the buyer did not pick up, 'producer_cancelled' that the producer could not deliver (a captured payment is refunded), 'buyer_cancelled' that the buyer withdrew, 'payment_expired' that the producer did not confirm a prepaid order in time and the reservation was released). The timeline array lists every status transition with timestamps. producer_contact is the seller's phone/e-mail/profile for cancellation, the right of withdrawal and complaints. Prepaid orders also carry payment: status (requires_payment → authorized → captured, or canceled/expired/refunded), amount_nok, refunded_nok, fees, the checkout_url while it can still be paid, and events. The producer is the seller."
-        : "Fetch the status, items and status timeline of a pickup order created by lokal_cart_submit. Requires the order_id returned by submit and the buyer_ref token. Status: pending → confirmed → ready → completed (or declined/cancelled; cancel_reason='no_show' means the buyer did not pick up). The timeline array lists every status transition with timestamps.",
+        : "Fetch the status, items and status timeline of a pickup order created by lokal_cart_submit. Requires the order_id returned by submit and the buyer_ref token. Status: pending → confirmed → ready → completed (or declined/cancelled; cancel_reason='no_show' means the buyer did not pick up). The timeline array lists every status transition with timestamps.")
+        + (orderMessagesOn ? ` ${ORDER_MESSAGES_UNTRUSTED_NOTE} Each item is {from: 'buyer' | 'seller', text, created_at}.` : ""),
       inputSchema: {
         order_id:  z.string().describe("Order ID from lokal_cart_submit"),
         buyer_ref: z.string().describe("Buyer capability token (same as used for the cart)"),
@@ -1874,7 +1967,7 @@ export function registerTools(
     })
   );
 
-  // Tools 15–16 (Fase B1): the buyer's own actions on an order. Registered
+  // Tools 15–17 (Fase B1, B2): the buyer's own actions on an order. Registered
   // ONLY with ORDER_AGENT_ACTIONS_ENABLED on — off, tools/list is unchanged.
   if (agentActionsOn) {
     const buyerOrderInput = {
@@ -1943,6 +2036,35 @@ export function registerTools(
         return { content: [{ type: "text" as const, text: cartResultText("lokal_order_picked_up", result) }] };
       })
     );
+
+    // Tool 17 (Fase B2): a message from the buyer to the producer on one order.
+    // Registered with the B1 tools (ORDER_AGENT_ACTIONS_ENABLED); answers only
+    // while ORDER_MESSAGES_ENABLED is on too.
+    server.registerTool(
+      "lokal_order_message",
+      {
+        title: "Send a message about a pickup order",
+        description: `Send a short message from the buyer to the producer about a pickup order placed with lokal_cart_submit, for example a question about the pickup. Requires the order_id and the buyer_ref token. The producer gets the message by e-mail and answers in their order overview; the answer appears in lokal_order_status messages[]. Only send what the user has asked you to send, in their words. At most ${ORDER_MESSAGE_MAX_CHARS} characters (leading and trailing whitespace is trimmed; an empty message is refused) and at most ${ORDER_MESSAGE_RATE_LIMIT} messages per order per hour (error 429). The buyer's e-mail address is not given to the producer by this tool. ${ORDER_MESSAGES_UNTRUSTED_NOTE} Possible when lokal_order_status lists 'message' in available_actions. Wrong buyer_ref or unknown order: error 403.`,
+        inputSchema: {
+          ...buyerOrderInput,
+          message: z.string().describe(`The message text, at most ${ORDER_MESSAGE_MAX_CHARS} characters. It is sent to the producer as written.`),
+        },
+        annotations: {
+          title: "Message the producer",
+          readOnlyHint: false,
+          destructiveHint: false,
+          // Without an idempotency_key the same call sends the message again.
+          idempotentHint: false,
+          // Reaches a third party: the producer gets an e-mail.
+          openWorldHint: true,
+        },
+      },
+      guardToolHandler("lokal_order_message", async ({ order_id, buyer_ref, idempotency_key, message }) => {
+        if (!isOrderAgentActionsEnabled()) return actionsOffResult();
+        const result = await postBuyerOrderMessage(order_id, buyer_ref, message, "mcp", { idempotencyKey: idempotency_key ?? null });
+        return { content: [{ type: "text" as const, text: cartResultText("lokal_order_message", result) }] };
+      })
+    );
   }
 
   // ─── MCP Resources ──────────────────────────────────────────
@@ -1954,7 +2076,8 @@ export function registerTools(
     "lokal://producers/overview",
     { description: "Overview of all local food producers — count, cities, and categories", mimeType: "text/plain" },
     async () => {
-      const agents = marketplaceRegistry.getActiveAgents();
+      // S2c-2: counts without the profiles hidden from AI assistants.
+      const agents = withoutOwnerHidden(marketplaceRegistry.getActiveAgents(), "ai_assistants");
       const cities = new Map<string, number>();
       for (const a of agents) {
         const city = (a as any).city || a.location?.city || "Ukjent";
@@ -1979,10 +2102,16 @@ export function registerTools(
       const agentId = uri.pathname?.split("/").pop() || "";
       const info = knowledgeService.getAgentInfo(agentId);
       // Shared by-id visibility predicate (flag-gated, see lokal_info).
-      if (!info || !isAgentIdPubliclyVisible(getDb(), agentId, { surface: "ungated" })) {
+      if (!info || !isAgentIdPubliclyVisible(getDb(), agentId, { surface: "ungated", audience: "ai" })) {
         return { contents: [{ uri: uri.href, text: "Producer not found", mimeType: "text/plain" }] };
       }
-      return { contents: [{ uri: uri.href, text: JSON.stringify(info, null, 2), mimeType: "application/json" }] };
+      // S2c-1: without what the owner hid (not enforced = as before).
+      const choiceShown = publicAgentInfo(info, publicFieldChoices(agentId));
+      // A catalog_hidden row never shows its contact details (see lokal_info).
+      const shown = isContactHiddenAgentId(getDb(), agentId)
+        ? { ...choiceShown, knowledge: withoutContactFields(choiceShown.knowledge) }
+        : choiceShown;
+      return { contents: [{ uri: uri.href, text: JSON.stringify(shown, null, 2), mimeType: "application/json" }] };
     }
   );
 }
@@ -2061,20 +2190,7 @@ interface McpSession {
 // ─── MCP client identity detection ─────────────────────────
 // Identifies the AI platform from request headers.
 function detectMcpClient(req: Request): string | undefined {
-  const ua = (req.headers["user-agent"] || "").toLowerCase();
-  const origin = (req.headers["origin"] || "").toLowerCase();
-  const referer = (req.headers["referer"] || "").toLowerCase();
-
-  if (ua.includes("chatgpt") || ua.includes("openai") || origin.includes("openai") || origin.includes("chatgpt")) return "ChatGPT";
-  if (ua.includes("claude") || origin.includes("claude.ai") || origin.includes("anthropic")) return "Claude";
-  if (ua.includes("cursor")) return "Cursor";
-  if (ua.includes("copilot") || origin.includes("github.com")) return "GitHub Copilot";
-  if (ua.includes("windsurf")) return "Windsurf";
-  if (ua.includes("cline")) return "Cline";
-  if (ua.includes("continue")) return "Continue";
-  if (ua.includes("python")) return "Python SDK";
-  if (ua.includes("node")) return "Node SDK";
-  return undefined;
+  return detectAiClient(req.headers["user-agent"], req.headers["origin"]);
 }
 
 
@@ -2143,6 +2259,14 @@ export function rfbMcpInstructions(): string {
   return isPaymentsEnabled() ? RFB_MCP_INSTRUCTIONS_PREPAY : RFB_MCP_INSTRUCTIONS;
 }
 
+/**
+ * serverInfo `title` and `icons` (G3-S5, A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker):
+ * the brand's name and 512 PNG logo from BRAND_ENTITIES.rfb, so the connector
+ * shows the brand instead of the bare `name`. websiteUrl is BRAND_ENTITIES.rfb.url.
+ */
+export { RFB_MCP_SERVER_TITLE };
+export const RFB_MCP_SERVER_ICONS = brandMcpIcons(BRAND_ENTITIES.rfb);
+
 async function getOrCreateSession(
   sessionId: string | undefined,
   isInitialize: boolean,
@@ -2187,7 +2311,13 @@ async function getOrCreateSession(
   const clientIdentity = req ? detectMcpClient(req) : undefined;
   const requestMeta = req ? buildRequestMeta(req) : undefined;
 
-  const server = new McpServer({ name: "rett-fra-bonden", version: "0.4.0" }, { instructions: rfbMcpInstructions(), maxToolInputElements: MCP_MAX_TOOL_INPUT_ELEMENTS });
+  const server = new McpServer({
+    name: "rett-fra-bonden",
+    version: "0.4.0",
+    title: RFB_MCP_SERVER_TITLE,
+    websiteUrl: BRAND_ENTITIES.rfb.url,
+    icons: RFB_MCP_SERVER_ICONS,
+  }, { instructions: rfbMcpInstructions(), maxToolInputElements: MCP_MAX_TOOL_INPUT_ELEMENTS });
   const sessionRef: { clientIdentity?: string; requestMeta?: import("../services/conversation-service").RequestMeta } = { clientIdentity, requestMeta };
   registerTools(server, () => sessionRef.clientIdentity, () => sessionRef.requestMeta);
 

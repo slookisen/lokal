@@ -14,6 +14,23 @@ name: Fleet auto-approve
 # reason to reach for the riskier `_target` event, and staying on the
 # non-`_target` events avoids ever running workflow code with base-repo
 # secrets against untrusted fork input.
+#
+# Scheduled re-evaluation sweep (`schedule` every 30 min + manual
+# `workflow_dispatch`, dev-request 2026-11-06-fleet-auto-approve-gate-poll-
+# budsjett-ingen-ny-evaluering): the `evaluate` job polls checks for a bounded
+# budget and then gives up, trusting "a future comment/push" to re-run it. In
+# practice no such event comes (check_suite events from GITHUB_TOKEN-driven
+# activity never fire, nobody comments), so an APPROVED PR hung forever —
+# lokal#1401 was APPROVED 2026-11-05T02:52Z, the gate gave up at 03:03Z and
+# never looked again until the PR had gone stale against main. On a sweep run,
+# `resolve-pr` lists open, non-draft fleet PRs that carry a trusted
+# REVIEW-VERDICT: APPROVED comment and no github-actions[bot] approval on their
+# current head SHA (max 10, oldest first), and `evaluate` runs as a matrix over
+# them with every existing gate unchanged. Sweep runs use a shorter poll budget,
+# skip silently when GitHub has not computed mergeability yet, and never re-post
+# a gate note identical to the latest one already on the PR. On every trigger, a
+# PR that conflicts with main gets one visible "needs a rebase" note instead of
+# a doomed approve/merge attempt.
 
 on:
   pull_request:
@@ -25,6 +42,14 @@ on:
     types: [created]
   check_suite:
     types: [completed]
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Optional: evaluate only this PR number (blank = sweep all eligible PRs)'
+        required: false
+        default: ''
 
 permissions:
   pull-requests: write
@@ -35,11 +60,14 @@ permissions:
 jobs:
   resolve-pr:
     runs-on: ubuntu-latest
-    permissions: {}
+    # Read-only: the sweep path lists open PRs, their comments and reviews.
+    permissions:
+      pull-requests: read
+      issues: read
     outputs:
-      pr_number: ${{ steps.resolve.outputs.pr_number }}
+      pr_numbers: ${{ steps.resolve.outputs.pr_numbers }}
     steps:
-      - name: Resolve PR number for this event
+      - name: Resolve PR number(s) for this event
         id: resolve
         uses: actions/github-script@v7
         with:
@@ -53,15 +81,79 @@ jobs:
               const prs = context.payload.check_suite.pull_requests || [];
               if (prs.length > 0) prNumber = prs[0].number;
             }
-            core.setOutput('pr_number', prNumber ?? '');
+            if (context.eventName !== 'schedule' && context.eventName !== 'workflow_dispatch') {
+              core.setOutput('pr_numbers', JSON.stringify(prNumber ? [prNumber] : []));
+              return;
+            }
+
+            // Sweep path (schedule / workflow_dispatch). An explicit dispatch input
+            // targets one PR; the evaluate job still runs every gate on it.
+            const { owner, repo } = context.repo;
+            const inputPr = String((context.payload.inputs || {}).pr_number || '').trim();
+            if (inputPr !== '') {
+              if (!/^[1-9][0-9]*$/.test(inputPr)) {
+                core.setFailed(`workflow_dispatch pr_number "${inputPr}" is not a PR number`);
+                return;
+              }
+              core.setOutput('pr_numbers', JSON.stringify([parseInt(inputPr, 10)]));
+              return;
+            }
+
+            // Same trusted set and verdict anchor as the evaluate job below — keep in
+            // sync (asserted by scripts/test-fleet-auto-approve-scheduled-reeval.js).
+            const FLEET_IDENTITIES = ['slookisen', 'claude[bot]'];
+            const verdictRe = /^REVIEW-VERDICT:\s*APPROVED\s*—\s*(\S+)/m;
+            const SWEEP_MAX_PRS = 10;
+
+            const open = await github.paginate(github.rest.pulls.list, {
+              owner, repo, state: 'open', sort: 'created', direction: 'asc', per_page: 100,
+            });
+            const candidates = open
+              .filter(p => !p.draft && !p.merged_at && p.user && FLEET_IDENTITIES.includes(p.user.login))
+              .sort((a, b) => a.number - b.number);
+            const picked = [];
+            for (const p of candidates) {
+              if (picked.length >= SWEEP_MAX_PRS) break;
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: p.number, per_page: 100,
+              });
+              const hasVerdict = comments.some(
+                c => c.user && FLEET_IDENTITIES.includes(c.user.login) && verdictRe.test(c.body || '')
+              );
+              if (!hasVerdict) continue;
+              const reviews = await github.paginate(github.rest.pulls.listReviews, {
+                owner, repo, pull_number: p.number, per_page: 100,
+              });
+              const alreadyApproved = reviews.some(
+                r => r.user && r.user.login === 'github-actions[bot]' && r.state === 'APPROVED' && r.commit_id === p.head.sha
+              );
+              if (alreadyApproved) {
+                core.info(`#${p.number}: already approved by github-actions[bot] on ${p.head.sha} — skip`);
+                continue;
+              }
+              picked.push(p.number);
+            }
+            core.info(`sweep: ${candidates.length} open fleet PR(s), ${picked.length} picked for re-evaluation: [${picked.join(', ')}]`);
+            core.setOutput('pr_numbers', JSON.stringify(picked));
 
   evaluate:
     needs: resolve-pr
-    if: needs.resolve-pr.outputs.pr_number != ''
+    if: needs.resolve-pr.outputs.pr_numbers != '' && needs.resolve-pr.outputs.pr_numbers != '[]'
+    # Explicit name so the check-run name is predictable; OWN_JOB_NAMES below
+    # excludes it from this gate's own "checks still running" test.
+    name: evaluate (${{ matrix.pr_number }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        pr_number: ${{ fromJSON(needs.resolve-pr.outputs.pr_numbers) }}
     concurrency:
-      group: fleet-auto-approve-pr-${{ needs.resolve-pr.outputs.pr_number }}
-      cancel-in-progress: true
+      group: fleet-auto-approve-pr-${{ matrix.pr_number }}
+      # Event runs keep cancel-in-progress (a newer push/comment supersedes an
+      # older evaluation). A sweep run must not cancel an event run that is
+      # mid-way through its full poll budget, so sweep runs queue instead.
+      cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
     permissions:
       pull-requests: write
       contents: write
@@ -73,19 +165,53 @@ jobs:
         id: gate
         uses: actions/github-script@v7
         env:
-          PR_NUMBER: ${{ needs.resolve-pr.outputs.pr_number }}
+          PR_NUMBER: ${{ matrix.pr_number }}
           A2A_READ_PAT: ${{ secrets.A2A_READ_PAT }}
         with:
           script: |
             const prNumber = parseInt(process.env.PR_NUMBER, 10);
             const { owner, repo } = context.repo;
 
-            const note = (msg) => github.rest.issues.createComment({
-              owner, repo, issue_number: prNumber,
-              body: `**fleet-auto-approve:** ${msg}`,
-            });
+            // Sweep = scheduled / manual re-evaluation (see header). Event runs
+            // (pull_request / issue_comment / check_suite) behave as before.
+            const isSweep = context.eventName === 'schedule' || context.eventName === 'workflow_dispatch';
 
-            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+            const GATE_NOTE_PREFIX = '**fleet-auto-approve:**';
+            const postNote = (msg) => github.rest.issues.createComment({
+              owner, repo, issue_number: prNumber,
+              body: `${GATE_NOTE_PREFIX} ${msg}`,
+            });
+            // Post only if the most recent gate note on the PR is not already this
+            // exact text — keeps a 30-minute sweep from re-posting the same note.
+            const noteOnce = async (msg) => {
+              const body = `${GATE_NOTE_PREFIX} ${msg}`;
+              const existing = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: prNumber, per_page: 100,
+              });
+              const lastGateNote = [...existing].reverse().find(
+                c => c.user && c.user.login === 'github-actions[bot]' && (c.body || '').startsWith(GATE_NOTE_PREFIX)
+              );
+              if (lastGateNote && (lastGateNote.body || '').trim() === body.trim()) {
+                core.info('identical gate note is already the latest on this PR — not re-posting');
+                return;
+              }
+              return postNote(msg);
+            };
+            const note = (msg) => (isSweep ? noteOnce(msg) : postNote(msg));
+
+            // Fresh-state decision for a just-fetched PR (pure; mirrored-by-extraction in
+            // scripts/test-fleet-auto-approve-scheduled-reeval.js, which evals this exact
+            // source). 'closed' | 'dirty' | 'draft' | 'unknown' | 'proceed'.
+            function gateDecisionForFreshPr(p) {
+              if (!p) return 'unknown';
+              if (p.merged || p.state !== 'open') return 'closed';
+              if (p.mergeable === false || p.mergeable_state === 'dirty') return 'dirty';
+              if (p.draft) return 'draft';
+              if (p.mergeable === null || p.mergeable === undefined) return 'unknown';
+              return 'proceed';
+            }
+
+            let { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
 
             // 1. PR author must be a trusted fleet identity. `claude[bot]` is the
             //    GitHub-App identity Daniel's own Claude sessions/Cloud Routines write
@@ -96,6 +222,28 @@ jobs:
             const FLEET_IDENTITIES = ['slookisen', 'claude[bot]'];
             if (!FLEET_IDENTITIES.includes(pr.user.login)) {
               core.info(`author=${pr.user.login} not in [${FLEET_IDENTITIES.join(', ')}] — not a fleet PR, no-op`);
+              return;
+            }
+
+            // 1.2. Fresh-state guard (dev-request 2026-11-06-fleet-auto-approve-gate-
+            //      poll-budsjett-ingen-ny-evaluering, AC2). `mergeable` is null while
+            //      GitHub is still computing it — refetch once after ~3s.
+            let freshDecision = gateDecisionForFreshPr(pr);
+            if (freshDecision === 'unknown') {
+              await new Promise((r) => setTimeout(r, 3000));
+              ({ data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber }));
+              freshDecision = gateDecisionForFreshPr(pr);
+            }
+            if (freshDecision === 'dirty') {
+              // All trigger types: approving/merging a conflicting PR can only fail.
+              await noteOnce('this PR conflicts with main (merge conflict) and needs a rebase before the gate can act. No auto-approve until the branch is updated.');
+              core.info(`mergeable=${pr.mergeable} mergeable_state=${pr.mergeable_state} — conflicts with main, no-op`);
+              return;
+            }
+            if (isSweep && freshDecision !== 'proceed') {
+              // closed/merged, draft, or mergeability still unknown — nothing to do on
+              // this sweep; the next one (or an event) will look again.
+              core.info(`sweep: fresh state is '${freshDecision}' — skipping this run without a note`);
               return;
             }
 
@@ -763,7 +911,9 @@ jobs:
             //    (15s intervals) and finish the approve+merge in this same run if checks
             //    land green within that budget.
             const POLL_INTERVAL_MS = 15000;
-            const MAX_POLLS = 40; // 40 sleeps of 15s = ~10 minutes total (41st fetch is a no-sleep final check)
+            // Sweep runs fire every 30 min, so they get a short budget (~1 min) instead of
+            // stacking 10-minute jobs; event runs keep the full ~10 minutes.
+            const MAX_POLLS = isSweep ? 4 : 40; // 40 sleeps of 15s = ~10 minutes total (41st fetch is a no-sleep final check)
             // Self-check race: this very workflow's own check runs (the `resolve-pr`
             // and `evaluate` jobs of fleet-auto-approve.yml, whose check-run `name`
             // defaults to the job's display name since neither sets a custom `name:`)
@@ -774,17 +924,40 @@ jobs:
             // non-completed check is fleet-auto-approve's own, and the gate could
             // never pass. Exclude them from both the incomplete and failed checks.
             // Keep this list in sync if either job is ever renamed.
+            // The evaluate job is a matrix named `evaluate (<pr>)`, so match that shape too.
             const OWN_JOB_NAMES = ['resolve-pr', 'evaluate'];
+            const isOwnJob = (name) => OWN_JOB_NAMES.includes(name) || /^evaluate \(.*\)$/.test(name || '');
+            // Retry a GitHub API call on transient 5xx only (Octokit errors carry a
+            // numeric `.status`). 4xx and non-HTTP errors are rethrown at once; after
+            // the last attempt the last error is rethrown. Pure — extracted and tested
+            // by scripts/test-fleet-auto-approve-5xx-retry.js
+            // (dev-request 2026-10-24-fleet-auto-approve-ingen-retry-ved-github-500:
+            // a single HttpError 500 on check-runs killed the gate run, lokal#1243).
+            async function withRetry5xx(fn, { attempts = 3, delaysMs = [2000, 4000, 8000], sleep, log, label = 'GitHub API call' } = {}) {
+              const doSleep = sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
+              for (let attempt = 1; ; attempt++) {
+                try {
+                  return await fn();
+                } catch (err) {
+                  const status = err && typeof err.status === 'number' ? err.status : null;
+                  if (status === null || status < 500 || attempt >= attempts) throw err;
+                  const delay = delaysMs[Math.min(attempt - 1, delaysMs.length - 1)];
+                  if (log) log(`${label} failed with HTTP ${status} (attempt ${attempt}/${attempts}) — retrying in ${delay}ms`);
+                  await doSleep(delay);
+                }
+              }
+            }
+            const retryOpts = (label) => ({ label, log: (m) => core.warning(m) });
             let combined, checkRuns, statusesOk, externalCheckRuns, checksIncomplete;
             for (let poll = 0; poll <= MAX_POLLS; poll++) {
-              ({ data: combined } = await github.rest.repos.getCombinedStatusForRef({
+              ({ data: combined } = await withRetry5xx(() => github.rest.repos.getCombinedStatusForRef({
                 owner, repo, ref: pr.head.sha,
-              }));
-              ({ data: checkRuns } = await github.rest.checks.listForRef({
+              }), retryOpts('getCombinedStatusForRef')));
+              ({ data: checkRuns } = await withRetry5xx(() => github.rest.checks.listForRef({
                 owner, repo, ref: pr.head.sha, per_page: 100,
-              }));
+              }), retryOpts('checks.listForRef')));
               statusesOk = combined.state === 'success' || (combined.state === 'pending' && combined.statuses.length === 0);
-              externalCheckRuns = checkRuns.check_runs.filter(r => !OWN_JOB_NAMES.includes(r.name));
+              externalCheckRuns = checkRuns.check_runs.filter(r => !isOwnJob(r.name));
               checksIncomplete = externalCheckRuns.some(r => r.status !== 'completed');
               if (!checksIncomplete || poll === MAX_POLLS) break;
               core.info(`checks still running — poll ${poll + 1}/${MAX_POLLS}, waiting ${POLL_INTERVAL_MS}ms`);
@@ -796,6 +969,11 @@ jobs:
               // rescue it (that's the whole reason we polled) — post a visible note so a
               // check that outlives the poll budget doesn't reproduce the original
               // invisible-stuck-PR symptom this fix exists to eliminate.
+              if (isSweep) {
+                // The next sweep re-evaluates in 30 min — no note every half hour.
+                core.info('sweep: checks still running after the short poll budget — next sweep will re-evaluate');
+                return;
+              }
               await note('checks still running after the ~10-minute poll budget. No auto-approve yet — a future comment or push will re-evaluate.');
               core.info('checks still incomplete after full poll budget — giving up for this run; a future comment/push will re-evaluate');
               return;

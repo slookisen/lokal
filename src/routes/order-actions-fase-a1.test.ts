@@ -318,10 +318,10 @@ export async function runOrderActionsFaseA1Tests(opts: { log?: boolean } = {}): 
       assertTrue(r.status === 303 && (r.location || "").includes("done=confirmed"), "one-02: one POST confirms (303, done=confirmed)");
       assertEq(row(id).pickup_time, fp.utcIso, "one-03: the pickup time is stored as UTC (Oslo 15:30)");
       await settle();
-      const conf = receipts.find((x) => x.subject.startsWith("Ordrebekreftelse"));
+      const conf = receipts.find((x) => x.subject.startsWith("Bestillingen er bekreftet av"));
       assertTrue(!!conf && conf.to === BUYER_MAIL, "one-04: the buyer gets the confirmation receipt");
       assertTrue(!!conf && conf.textContent.includes(`Hentetid: ${fp.text}`), "one-05: …with the pickup time in Oslo time");
-      assertTrue(!!conf && conf.textContent.includes("ordren avsluttes av seg selv") && conf.textContent.includes("kontakt@rettfrabonden.com"),
+      assertTrue(!!conf && conf.textContent.includes("bestillingen avsluttes av seg selv") && conf.textContent.includes("kontakt@rettfrabonden.com"),
         "one-06: …saying the order closes by itself and how to say something is wrong");
       page = await req("GET", `/produsent/ordre/${tokenOf(id)}`);
       assertTrue(!page.text.includes("Klar for henting</button>") && !page.text.includes('value="ready"'), "one-07: no «Klar for henting» button any more");
@@ -333,7 +333,7 @@ export async function runOrderActionsFaseA1Tests(opts: { log?: boolean } = {}): 
       receipts.length = 0;
       await req("POST", `/produsent/ordre/${tokenOf(id2)}`, { form: { action: "confirm" } });
       await settle();
-      const conf2 = receipts.find((x) => x.subject.startsWith("Ordrebekreftelse"));
+      const conf2 = receipts.find((x) => x.subject.startsWith("Bestillingen er bekreftet av"));
       assertTrue(!!conf2 && !conf2.textContent.includes("avsluttes av seg selv") && conf2.textContent.includes("Avtal tid og sted"),
         "one-09: switch off / no pickup time → no auto-close promise, «Avtal tid og sted»");
       const bad = seedOrder({ status: "pending", notifySent: true });

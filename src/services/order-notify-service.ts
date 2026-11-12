@@ -48,6 +48,10 @@ import { isBlocked } from "./blocklist-service";
 import { emailService, EmailOptions } from "./email-service";
 import { isOrderAutocompleteEnabled } from "./order-lifecycle";
 import { PRICE_BY_AGREEMENT, PARTIAL_SUM_LABEL } from "./order-pricing";
+import { formatOsloDayLabel, formatOsloDayMonthLabel } from "./order-cap-notice";
+import type { StockCheckEmailInput } from "./stock-check-reminder";
+import { stockSoftExpiryActiveFor } from "./stock-soft-expiry";
+import { getSupplyGraphHardStaleDays } from "./supply-graph";
 
 const APP_URL = process.env.APP_URL || "https://rettfrabonden.com";
 
@@ -211,6 +215,12 @@ function sumLabelOf(order: OrderNotificationInput): string {
 
 const NO_PAYMENT_HTML = "<p>Ingen betaling skjer via plattformen; oppgjør ved henting som vanlig.</p>";
 const NO_PAYMENT_TEXT = "Ingen betaling skjer via plattformen; oppgjør ved henting som vanlig.";
+/**
+ * Tekstpakke C punkt 1 (approved 2026-11-09): the v2 payment line for an
+ * order without prepayment — the same sentence as the short order page
+ * (tekstpakke A). v1 (the pinned rollback template) keeps NO_PAYMENT_*.
+ */
+export const OWNER_PAY_AT_PICKUP_TEXT = "Kunden betaler deg når varene hentes. Rett fra Bonden tar ikke betalt.";
 
 function formatNok(n: number): string {
   return Number.isInteger(n) ? String(n) : n.toFixed(2).replace(".", ",");
@@ -226,8 +236,9 @@ function paymentCopy(order: OrderNotificationInput, orderRef: string): Required<
   if (order.reminder) {
     return {
       ...merged,
-      subject: `Påminnelse: henteordre venter på svar — ${orderRef}`,
-      intro: "Påminnelse: du har en henteordre via Rett fra Bonden som ikke er besvart ennå. Kunden venter på bekreftelse eller avslag",
+      // Tekstpakke C punkt 2 (approved 2026-11-09): «bestilling» in sentences.
+      subject: `Påminnelse: bestilling venter på svar — ${orderRef}`,
+      intro: "Påminnelse: du har en bestilling via Rett fra Bonden som ikke er besvart ennå. Kunden venter på svar",
     };
   }
   return merged;
@@ -309,16 +320,20 @@ ${pay.html}
 export function renderOrderNotificationEmailV2(order: OrderNotificationInput): RenderedOrderNotificationEmail {
   const orderRef = order.order_id.slice(0, 8);
   // Fase A2: the main button opens THIS order in the compact «Mine ordrer» view
-  // (per-order token, no login); «Se alle ordrene dine» needs a login.
+  // (per-order token, no login); «Se alle bestillingene dine» needs a login.
   const confirmUrl = `${APP_URL}/produsent/ordre/${encodeURIComponent(order.confirm_token)}/kompakt`;
   const allOrdersUrl = `${APP_URL}/eier/${encodeURIComponent(order.agent_id)}/ordrer`;
   const itemRows = renderItemRowsHtml(order.items);
   const itemLines = renderItemLinesText(order.items);
-  const pay = paymentCopy(order, orderRef);
+  const pay0 = paymentCopy(order, orderRef);
+  // Tekstpakke C punkt 1: no prepayment → the approved payment line (v1 unchanged).
+  const pay = pay0.text === NO_PAYMENT_TEXT
+    ? { ...pay0, html: `<p>${escHtml(OWNER_PAY_AT_PICKUP_TEXT)}</p>`, text: OWNER_PAY_AT_PICKUP_TEXT }
+    : pay0;
   const linkLabel = pay.link === DEFAULT_LINK ? "Se og bekreft bestillingen" : pay.link;
   // Only the new-order mail promises the automatic close, and only while it is switched on (never a promise the platform does not keep).
   const autoCloseLine = !order.reminder && !order.payment?.status?.startsWith("payment_") && isOrderAutocompleteEnabled()
-    ? "Du trenger bare å bekrefte eller avslå. Ordren avsluttes av seg selv etter henting." : "";
+    ? "Du trenger bare å bekrefte eller avslå. Bestillingen avsluttes av seg selv etter henting." : "";
 
   const buyerName = (order.buyer_name || "").trim() || null;
   const buyerEmail = (order.buyer_email || "").trim() || null;
@@ -349,8 +364,7 @@ export function renderOrderNotificationEmailV2(order: OrderNotificationInput): R
 <p>Hei,</p>
 <p>${escHtml(pay.intro)}:</p>
 <table style="border-collapse:collapse;font-family:sans-serif">
-  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Ordre-ref:</td><td>${escHtml(orderRef)}</td></tr>
-  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Kjøper-ref:</td><td>${escHtml(maskBuyerRef(order.buyer_ref))}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Bestilling:</td><td>${escHtml(orderRef)}</td></tr>
   ${order.pickup_time ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">Hentetid:</td><td>${escHtml(order.pickup_time)}</td></tr>` : ""}
   ${order.total_nok != null ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">${sumLabelOf(order)}:</td><td>${order.total_nok} kr</td></tr>` : ""}
 </table>
@@ -359,13 +373,13 @@ ${buyerBlockHtml}<p style="font-weight:bold;margin-bottom:4px">Varer:</p>
   ${itemRows}
 </table>
 <p><a href="${confirmUrl}" style="display:inline-block;background:#2c5b3f;color:#ffffff;padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:bold">${escHtml(linkLabel)}</a><br>
-Lenken er personlig for denne ordren — ikke del den videre.</p>
-${autoCloseLine ? `<p>${escHtml(autoCloseLine)}</p>\n` : ""}<p><a href="${allOrdersUrl}">Se alle ordrene dine</a> (krever innlogging)</p>
+Lenken er personlig for denne bestillingen. Ikke del den videre.</p>
+${autoCloseLine ? `<p>${escHtml(autoCloseLine)}</p>\n` : ""}<p><a href="${allOrdersUrl}">Se alle bestillingene dine</a> (krever innlogging)</p>
 ${pay.html}
 <p>Hilsen<br>Rett fra Bonden</p>
     `.trim();
 
-  const textContent = `Hei,\n\n${pay.intro}.\nOrdre-ref: ${orderRef}\nKjøper-ref: ${maskBuyerRef(order.buyer_ref)}${order.pickup_time ? `\nHentetid: ${order.pickup_time}` : ""}${order.total_nok != null ? `\n${sumLabelOf(order)}: ${order.total_nok} kr` : ""}\n${buyerBlockText}\nVarer:\n${itemLines}\n\n${linkLabel} (personlig lenke, ikke del videre):\n${confirmUrl}\n\n${autoCloseLine ? autoCloseLine + "\n\n" : ""}Se alle ordrene dine (krever innlogging): ${allOrdersUrl}\n\n${pay.text}\n\nHilsen\nRett fra Bonden`;
+  const textContent = `Hei,\n\n${pay.intro}.\nBestilling: ${orderRef}${order.pickup_time ? `\nHentetid: ${order.pickup_time}` : ""}${order.total_nok != null ? `\n${sumLabelOf(order)}: ${order.total_nok} kr` : ""}\n${buyerBlockText}\nVarer:\n${itemLines}\n\n${linkLabel} (personlig lenke, ikke del videre):\n${confirmUrl}\n\n${autoCloseLine ? autoCloseLine + "\n\n" : ""}Se alle bestillingene dine (krever innlogging): ${allOrdersUrl}\n\n${pay.text}\n\nHilsen\nRett fra Bonden`;
 
   return {
     subject: pay.subject,
@@ -550,16 +564,16 @@ export async function sendProducerBuyerCancelNotice(orderId: string, kind: "with
     const orderRef = o.id.slice(0, 8);
     const allOrdersUrl = `${APP_URL}/eier/${encodeURIComponent(o.agent_id)}/ordrer`;
     const what = kind === "withdraw"
-      ? `Kunden har trukket bestillingen ${orderRef} før du bekreftet den. Ordren er kansellert, og den teller ikke mot deg. Du trenger ikke gjøre noe.`
-      : `Kunden har avbestilt bestillingen ${orderRef} etter at du bekreftet den. Ordren er kansellert, så du trenger ikke holde av varene.`;
+      ? `Kunden har trukket bestillingen ${orderRef} før du bekreftet den. Bestillingen er kansellert. Du trenger ikke gjøre noe.`
+      : `Kunden har avbestilt bestillingen ${orderRef} etter at du bekreftet den. Bestillingen er kansellert, så du trenger ikke holde av varene.`;
     const itemLines = items.map((i) => `- ${i.qty ?? "?"} × ${i.name_snapshot || "Vare"}`).join("\n");
-    const textContent = `Hei,\n\n${what}\n\nVarer:\n${itemLines}\n\nSe alle ordrene dine (krever innlogging): ${allOrdersUrl}\n\nHilsen\nRett fra Bonden`;
+    const textContent = `Hei,\n\n${what}\n\nVarer:\n${itemLines}\n\nSe alle bestillingene dine (krever innlogging): ${allOrdersUrl}\n\nHilsen\nRett fra Bonden`;
     const subject = kind === "withdraw" ? `Kunden har trukket bestillingen (${orderRef})` : `Kunden har avbestilt (${orderRef})`;
     const send: SendFn = _sendOverride ?? ((opts) => emailService.sendEmail(opts));
     const res = await send({
       to: recipient.email,
       subject,
-      htmlContent: `<p>Hei,</p>\n<p>${escHtml(what)}</p>\n<p><a href="${allOrdersUrl}">Se alle ordrene dine</a> (krever innlogging)</p>\n<p>Hilsen<br>Rett fra Bonden</p>`,
+      htmlContent: `<p>Hei,</p>\n<p>${escHtml(what)}</p>\n<p><a href="${allOrdersUrl}">Se alle bestillingene dine</a> (krever innlogging)</p>\n<p>Hilsen<br>Rett fra Bonden</p>`,
       textContent,
       replyTo: DEFAULT_ORDER_NOTIFY_REPLY_TO,
       // F8: transactional, not outreach.
@@ -573,6 +587,245 @@ export async function sendProducerBuyerCancelNotice(orderId: string, kind: "with
     return "failed";
   } catch (err) {
     console.error(`[order-notify] buyer-cancel notice FAILED order=${orderId}:`, err);
+    return "failed";
+  }
+}
+
+/**
+ * Fase B2 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-kjoperagent):
+ * the producer is told that the BUYER wrote a message on an order (MCP
+ * lokal_order_message or the order card). Same gated recipient
+ * (resolveOrderNotificationRecipient) and the same send path as the order
+ * e-mail, and like sendProducerBuyerCancelNotice only for an order whose
+ * order e-mail reached the producer (notify_sent_at). The mail carries the
+ * message text (escaped) and links to the order: the per-order view of the
+ * order e-mail (no login) and «Mine ordrer» (login), where the producer
+ * answers. No buyer contact data in it: the Reply-To is the platform
+ * address, so a reply never reveals anything new to either side.
+ * Fire-and-forget; never throws; the text is never logged.
+ */
+export async function sendProducerOrderMessageNotice(orderId: string, messageText: string): Promise<OrderNotifyOutcome> {
+  try {
+    const db = _notifyTestDb ?? getDb();
+    const o = db.prepare(`
+      SELECT o.id, o.agent_id, o.notify_sent_at, o.confirm_token, a.name AS producer_name
+      FROM orders o INNER JOIN agents a ON a.id = o.agent_id
+      WHERE o.id = ?
+    `).get(orderId) as { id: string; agent_id: string; notify_sent_at: string | null; confirm_token: string | null; producer_name: string } | undefined;
+    if (!o) return "skipped";
+    if (!o.notify_sent_at) {
+      console.log(`[order-notify] message notice skipped order=${orderId} reason=order_not_sent`);
+      return "skipped";
+    }
+    const recipient = resolveOrderNotificationRecipient(o.agent_id);
+    if (!recipient.eligible) {
+      console.log(`[order-notify] message notice skipped order=${orderId} agent=${o.agent_id} reason=${recipient.reason}`);
+      return "skipped";
+    }
+    const orderRef = o.id.slice(0, 8);
+    const orderUrl = o.confirm_token ? `${APP_URL}/produsent/ordre/${encodeURIComponent(o.confirm_token)}/kompakt` : null;
+    const mineUrl = `${APP_URL}/eier/${encodeURIComponent(o.agent_id)}/ordrer?o=${encodeURIComponent(o.id)}#o-${encodeURIComponent(o.id)}`;
+    const quoted = messageText.split("\n").map((l) => `> ${l}`).join("\n");
+    const textContent =
+      `Hei,\n\nKunden har skrevet en melding om bestillingen ${orderRef}:\n\n${quoted}\n\n` +
+      (orderUrl ? `Se bestillingen: ${orderUrl}\n` : "") +
+      `Svar kunden i Mine ordrer (krever innlogging): ${mineUrl}\n\n` +
+      `Ikke svar på denne e-posten. Svaret ditt kommer fram når du skriver det i Mine ordrer.\n\nHilsen\nRett fra Bonden`;
+    const htmlContent =
+      `<p>Hei,</p>\n<p>Kunden har skrevet en melding om bestillingen ${escHtml(orderRef)}:</p>\n` +
+      `<blockquote style="margin:0 0 12px;padding:8px 12px;border-left:3px solid #ccc;white-space:pre-wrap">${escHtml(messageText)}</blockquote>\n` +
+      (orderUrl ? `<p><a href="${escHtml(orderUrl)}">Se bestillingen</a></p>\n` : "") +
+      `<p><a href="${escHtml(mineUrl)}">Svar kunden i Mine ordrer</a> (krever innlogging)</p>\n` +
+      `<p>Ikke svar på denne e-posten. Svaret ditt kommer fram når du skriver det i Mine ordrer.</p>\n<p>Hilsen<br>Rett fra Bonden</p>`;
+    const send: SendFn = _sendOverride ?? ((opts) => emailService.sendEmail(opts));
+    const res = await send({
+      to: recipient.email,
+      subject: `Ny melding fra kunden (${orderRef})`,
+      htmlContent,
+      textContent,
+      replyTo: DEFAULT_ORDER_NOTIFY_REPLY_TO,
+      // F8: transactional, not outreach.
+      omitAgentHeader: true,
+    });
+    if (res && res.success) {
+      console.log(`[order-notify] message notice sent order=${orderId} agent=${o.agent_id}`);
+      return "sent";
+    }
+    console.error(`[order-notify] message notice FAILED order=${orderId} agent=${o.agent_id}: ${res?.error || "unknown error"}`);
+    return "failed";
+  } catch (err) {
+    console.error(`[order-notify] message notice FAILED order=${orderId}:`, (err as any)?.message ?? "error");
+    return "failed";
+  }
+}
+
+/**
+ * B4 (dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier):
+ * the producer's daily digest of submits the daily cap turned into contact
+ * requests. FIRST VERSION — Daniel approves this text (recorded in
+ * daniel-responses/) before ORDER_CAP_NOTICE_ENABLED is turned on (AC8).
+ * No buyer data in it.
+ *
+ * Tekstpakke C punkt 4: with `v2` (set by processOrderCapNotices when
+ * ORDER_CAP_V2_ENABLED is on) the digest is the platform-ceiling text;
+ * without it, byte-identical to before.
+ */
+export type OrderCapNoticeInput = { agent_id: string; count: number; cap: number; oslo_day: string; v2?: boolean };
+export function renderOrderCapNoticeEmail(input: OrderCapNoticeInput): {
+  subject: string; textContent: string; htmlContent: string;
+} {
+  const n = Math.max(0, Math.floor(input.count));
+  const mineUrl = `${APP_URL}/eier/${encodeURIComponent(input.agent_id)}/ordrer`;
+  if (input.v2) {
+    // Tekstpakke C punkt 4 (approved 2026-11-09), ORDER_CAP_V2_ENABLED only:
+    // the digest covers the platform ceiling alone; `cap` is the ceiling
+    // in force when the hits were recorded. No «døgn», no old cap.
+    const dayV2 = formatOsloDayMonthLabel(input.oslo_day);
+    const leadV2 = `I går (${dayV2}) fikk du mer enn ${input.cap} bestillinger gjennom Rett fra Bonden. ` +
+      (n === 1 ? "Den neste kunden fikk" : `De neste ${n} kundene fikk`) +
+      " kontaktinformasjonen din i stedet, så de kan ta kontakt med deg direkte.";
+    const subjectV2 = `${n === 1 ? "1 kunde" : `${n} kunder`} fikk kontaktinformasjonen din i går`;
+    return {
+      subject: subjectV2,
+      textContent:
+        `Hei,\n\n${leadV2}\n\n` +
+        `Se bestillingene du har fått i Mine ordrer (krever innlogging): ${mineUrl}\n\n` +
+        `Du får høyst én slik e-post per dag.\n\nHilsen\nRett fra Bonden`,
+      htmlContent:
+        `<p>Hei,</p>\n<p>${escHtml(leadV2)}</p>\n` +
+        `<p><a href="${escHtml(mineUrl)}">Se bestillingene i Mine ordrer</a> (krever innlogging)</p>\n` +
+        `<p>Du får høyst én slik e-post per dag.</p>\n<p>Hilsen<br>Rett fra Bonden</p>`,
+    };
+  }
+  const day = formatOsloDayLabel(input.oslo_day);
+  const what = n === 1 ? "1 bestilling kom" : `${n} bestillinger kom`;
+  const lead = `${what} etter grensen din på ${input.cap} bestillinger per døgn i går (${day}) og ble sendt som kontaktforespørsel.`;
+  const explain = "Kundene fikk kontaktinformasjonen din i stedet for å sende bestillingen, så de kan ta kontakt med deg direkte.";
+  const subject = `${what} etter grensen din i går`;
+  const textContent =
+    `Hei,\n\n${lead}\n\n${explain}\n\n` +
+    `Se bestillingene du har fått i Mine ordrer (krever innlogging): ${mineUrl}\n\n` +
+    `Du får høyst én slik e-post per dag.\n\nHilsen\nRett fra Bonden`;
+  const htmlContent =
+    `<p>Hei,</p>\n<p>${escHtml(lead)}</p>\n<p>${escHtml(explain)}</p>\n` +
+    `<p><a href="${escHtml(mineUrl)}">Se bestillingene i Mine ordrer</a> (krever innlogging)</p>\n` +
+    `<p>Du får høyst én slik e-post per dag.</p>\n<p>Hilsen<br>Rett fra Bonden</p>`;
+  return { subject, textContent, htmlContent };
+}
+
+/** B4: sends the daily digest (same gated recipient as the order e-mail). Never throws. */
+export async function sendProducerOrderCapNotice(input: OrderCapNoticeInput): Promise<OrderNotifyOutcome> {
+  try {
+    const recipient = resolveOrderNotificationRecipient(input.agent_id);
+    if (!recipient.eligible) {
+      console.log(`[order-notify] cap notice skipped agent=${input.agent_id} day=${input.oslo_day} reason=${recipient.reason}`);
+      return "skipped";
+    }
+    const rendered = renderOrderCapNoticeEmail(input);
+    const send: SendFn = _sendOverride ?? ((opts) => emailService.sendEmail(opts));
+    const res = await send({
+      to: recipient.email,
+      subject: rendered.subject,
+      htmlContent: rendered.htmlContent,
+      textContent: rendered.textContent,
+      replyTo: DEFAULT_ORDER_NOTIFY_REPLY_TO,
+      // F8: transactional, not outreach.
+      omitAgentHeader: true,
+    });
+    if (res && res.success) {
+      console.log(`[order-notify] cap notice sent agent=${input.agent_id} day=${input.oslo_day} count=${input.count}`);
+      return "sent";
+    }
+    console.error(`[order-notify] cap notice FAILED agent=${input.agent_id} day=${input.oslo_day}: ${res?.error || "unknown error"}`);
+    return "failed";
+  } catch (err) {
+    console.error(`[order-notify] cap notice FAILED agent=${input.agent_id}:`, (err as any)?.message ?? "error");
+    return "failed";
+  }
+}
+
+/**
+ * B2 (dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier):
+ * the stock-check reminder, «Bekreft at varene fortsatt er på lager». FIRST
+ * VERSION — Daniel approves this text (recorded in daniel-responses/) before
+ * STOCK_CHECK_EMAIL_ENABLED is turned on (AC8). The link opens a page that
+ * shows what will be confirmed; nothing changes before the owner presses the
+ * button there.
+ */
+/**
+ * B2 reminder e-mail. B2b-3: with the soft-expiry rule active for the producer
+ * (stockSoftExpiryActiveFor — flag AND allowlist; `env` for tests) the lead,
+ * item lines and «why» describe the soft rule (still orderable, customers see
+ * the stock status is not recently confirmed, hard stop after
+ * getSupplyGraphHardStaleDays()). Rule off → byte-identical to before.
+ */
+export function renderStockCheckReminderEmail(input: StockCheckEmailInput, env: NodeJS.ProcessEnv = process.env): {
+  subject: string; textContent: string; htmlContent: string;
+} {
+  const date = (iso: string) => {
+    const d = new Date(iso);
+    return Number.isNaN(d.getTime()) ? "" : d.toLocaleDateString("nb-NO", { timeZone: "Europe/Oslo", day: "2-digit", month: "2-digit", year: "numeric" });
+  };
+  const one = input.items.length === 1;
+  const soft = stockSoftExpiryActiveFor(input.agent_id, env);
+  const subject = "Bekreft at varene fortsatt er på lager";
+  const lead = soft
+    ? (one
+      ? "Lagerstatusen for denne varen er snart ikke lenger bekreftet nylig:"
+      : `Lagerstatusen for ${input.items.length} av varene dine er snart ikke lenger bekreftet nylig:`)
+    : (one
+      ? "Lagerstatusen for denne varen går snart ut:"
+      : `Lagerstatusen for ${input.items.length} av varene dine går snart ut:`);
+  const lines = input.items.map((i) => `${i.name} (${soft ? "bekreftet til" : "gjelder til"} ${date(i.expires_at)})`);
+  const why = soft
+    ? "Kundene kan fortsatt bestille varen, men fra denne datoen ser de at lagerstatusen ikke er bekreftet nylig. Når du bekrefter varen, fornyes datoen. " +
+      `Har ingen bekreftet varen på ${getSupplyGraphHardStaleDays()} dager, kan den ikke bestilles før du har bekreftet den igjen.`
+    : "Når lagerstatusen har gått ut, kan kundene ikke bestille varen hos deg gjennom Rett fra Bonden før du har bekreftet den igjen.";
+  const how = `Lenken viser først hvilke varer som blir bekreftet. Ingenting endres før du trykker «Bekreft». Lenken gjelder til ${date(input.link_expires_at)}.`;
+  const portalUrl = `${APP_URL}/eier/${encodeURIComponent(input.agent_id)}/portal`;
+  const notAny = "Har du ikke varen lenger, kan du endre lagerstatusen når du er logget inn";
+  const optOut = "Du får høyst én slik e-post hver 14. dag. Vil du ikke ha disse påminnelsene, svarer du på denne e-posten, så slår vi dem av.";
+  const textContent =
+    `Hei,\n\n${lead}\n\n${lines.map((l) => `- ${l}`).join("\n")}\n\n${why}\n\n` +
+    `Bekreft at varene fortsatt er på lager: ${input.confirm_url}\n\n${how}\n\n` +
+    `${notAny}: ${portalUrl}\n\n${optOut}\n\nHilsen\nRett fra Bonden`;
+  const htmlContent =
+    `<p>Hei,</p>\n<p>${escHtml(lead)}</p>\n<ul>${lines.map((l) => `<li>${escHtml(l)}</li>`).join("")}</ul>\n` +
+    `<p>${escHtml(why)}</p>\n` +
+    `<p><a href="${escHtml(input.confirm_url)}">Bekreft at varene fortsatt er på lager</a></p>\n` +
+    `<p>${escHtml(how)}</p>\n` +
+    `<p>${escHtml(notAny)}: <a href="${escHtml(portalUrl)}">${escHtml(portalUrl)}</a></p>\n` +
+    `<p>${escHtml(optOut)}</p>\n<p>Hilsen<br>Rett fra Bonden</p>`;
+  return { subject, textContent, htmlContent };
+}
+
+/** B2: sends the stock-check reminder (same gated recipient as the order e-mail). Never throws. */
+export async function sendProducerStockCheckReminder(input: StockCheckEmailInput): Promise<OrderNotifyOutcome> {
+  try {
+    const recipient = resolveOrderNotificationRecipient(input.agent_id);
+    if (!recipient.eligible) {
+      console.log(`[order-notify] stock-check reminder skipped agent=${input.agent_id} reason=${recipient.reason}`);
+      return "skipped";
+    }
+    const rendered = renderStockCheckReminderEmail(input);
+    const send: SendFn = _sendOverride ?? ((opts) => emailService.sendEmail(opts));
+    const res = await send({
+      to: recipient.email,
+      subject: rendered.subject,
+      htmlContent: rendered.htmlContent,
+      textContent: rendered.textContent,
+      replyTo: DEFAULT_ORDER_NOTIFY_REPLY_TO,
+      // Transactional (the owner's own order setting), not outreach.
+      omitAgentHeader: true,
+    });
+    if (res && res.success) {
+      console.log(`[order-notify] stock-check reminder sent agent=${input.agent_id} items=${input.items.length}`);
+      return "sent";
+    }
+    console.error(`[order-notify] stock-check reminder FAILED agent=${input.agent_id}: ${res?.error || "unknown error"}`);
+    return "failed";
+  } catch (err) {
+    console.error(`[order-notify] stock-check reminder FAILED agent=${input.agent_id}:`, (err as any)?.message ?? "error");
     return "failed";
   }
 }

@@ -104,6 +104,7 @@ import {
   type BrregContact,
 } from "../services/brreg-client";
 import { parseNameLocationSuffix, normaliseDomain } from "../services/location-suffix-parser";
+import { catalogHiddenIdExclusionSql } from "../services/agent-visibility";
 import {
   agentsOrgNrBackfillCandidateWhereSql,
   agentOrgNrPostalCorroborated,
@@ -209,7 +210,13 @@ interface RfbBssTargetRow {
 // Exported (dev-request 2026-10-10-rfb-berikelse-nattjobb) so the nightly
 // enrichment job selects its Brreg-step rows with THIS predicate instead of a
 // copy of it (services/rfb-enrichment-nightly.ts). Export-only change.
-export function rfbBssCandidateWhereSql(): string {
+// dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post (AC6): the
+// catalog_hidden test rows (the order fixture and the UNCLAIMED claim-test
+// fixture, whose agent_knowledge.email is where its claim codes go) are never
+// candidates — catalogHiddenIdExclusionSql, the verifier's own exclusion; ""
+// (the exact SQL as before) on a DB without a hidden row. Both predicates get
+// it, so the mirror stays exact.
+export function rfbBssCandidateWhereSql(db: ReturnType<typeof getDb>): string {
   return `
     a.role = 'producer'
     AND a.is_active = 1
@@ -219,11 +226,11 @@ export function rfbBssCandidateWhereSql(): string {
     AND (
       (a.org_nr IS NULL OR TRIM(a.org_nr) = '')
       OR (k.website IS NULL OR TRIM(k.website) = '')
-    )
+    )${catalogHiddenIdExclusionSql(db, "a")}
   `;
 }
 
-function rfbBssSelectSql(extraWhere: string): string {
+function rfbBssSelectSql(db: ReturnType<typeof getDb>, extraWhere: string): string {
   return `
     SELECT a.id AS id, a.name AS name, a.org_nr AS org_nr, a.claimed_at AS claimed_at,
            a.city AS city, a.url AS url, a.contact_email AS contact_email,
@@ -231,12 +238,12 @@ function rfbBssSelectSql(extraWhere: string): string {
            k.curated_fields AS curated_fields
       FROM agents a
       LEFT JOIN agent_knowledge k ON k.agent_id = a.id
-     WHERE ${rfbBssCandidateWhereSql()} ${extraWhere}
+     WHERE ${rfbBssCandidateWhereSql(db)} ${extraWhere}
   `;
 }
 
 function countRfbBssCandidates(db: ReturnType<typeof getDb>): number {
-  const row = db.prepare(`SELECT COUNT(*) AS n FROM (${rfbBssSelectSql("")})`).get() as { n: number };
+  const row = db.prepare(`SELECT COUNT(*) AS n FROM (${rfbBssSelectSql(db, "")})`).get() as { n: number };
   return row?.n ?? 0;
 }
 
@@ -250,7 +257,7 @@ function countOrgNrOnlyPool(db: ReturnType<typeof getDb>): number {
   const row = db
     .prepare(
       `SELECT COUNT(*) AS n FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id
-        WHERE ${agentsOrgNrBackfillCandidateWhereSql()}`,
+        WHERE ${agentsOrgNrBackfillCandidateWhereSql(db)}`,
     )
     .get() as { n: number };
   return row?.n ?? 0;
@@ -258,7 +265,7 @@ function countOrgNrOnlyPool(db: ReturnType<typeof getDb>): number {
 
 function fetchRfbBssBatch(db: ReturnType<typeof getDb>, cap: number): RfbBssTargetRow[] {
   return db
-    .prepare(`${rfbBssSelectSql("")} ORDER BY a.created_at ASC, a.id ASC LIMIT ?`)
+    .prepare(`${rfbBssSelectSql(db, "")} ORDER BY a.created_at ASC, a.id ASC LIMIT ?`)
     .all(cap) as RfbBssTargetRow[];
 }
 
@@ -267,7 +274,8 @@ function fetchRfbBssBatch(db: ReturnType<typeof getDb>, cap: number): RfbBssTarg
 // getAgentOrgNrBackfillTarget's / getRfbWebsiteDiscoveryTarget's own override
 // semantics exactly: an admin can force an attempt on any RFB producer row;
 // already-resolved/locked state is still enforced, just reported as a
-// specific outcome rather than silently omitted.
+// specific outcome rather than silently omitted. The catalog_hidden test
+// rows are the one exception (AC6 above): never a target, not even by id.
 function getRfbBssTarget(db: ReturnType<typeof getDb>, agentId: string): RfbBssTargetRow | null {
   const row = db
     .prepare(
@@ -277,7 +285,7 @@ function getRfbBssTarget(db: ReturnType<typeof getDb>, agentId: string): RfbBssT
               k.curated_fields AS curated_fields
          FROM agents a
          LEFT JOIN agent_knowledge k ON k.agent_id = a.id
-        WHERE a.id = ? AND a.role = 'producer' AND COALESCE(a.vertical_id, 'rfb') = 'rfb'`,
+        WHERE a.id = ? AND a.role = 'producer' AND COALESCE(a.vertical_id, 'rfb') = 'rfb'${catalogHiddenIdExclusionSql(db, "a")}`,
     )
     .get(agentId) as RfbBssTargetRow | undefined;
   return row ?? null;

@@ -208,6 +208,9 @@ export async function runGoogleRatingBatchProvenanceStaleRefillTests(
     process.env.ADMIN_KEY = ADMIN_KEY;
     delete process.env.ANALYTICS_ADMIN_KEY;
     process.env.GOOGLE_PLACES_API_KEY = "test-places-key";
+    // Run with the A5 switch on: the suite asserts the pre-A5 Places address
+    // and phone writes (PLACES_ADDRESS_FETCH_ENABLED, places-match.ts).
+    (require("../services/places-match") as typeof import("../services/places-match")).__setPlacesAddressFetchForTesting(true);
 
     delete require.cache[require.resolve("./marketplace")];
     const marketplaceRouter = require("./marketplace").default as any;
@@ -415,6 +418,7 @@ export async function runGoogleRatingBatchProvenanceStaleRefillTests(
     );
   } finally {
     (globalThis as any).fetch = prevFetch;
+    (require("../services/places-match") as typeof import("../services/places-match")).__setPlacesAddressFetchForTesting(null);
     if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
     else process.env.ADMIN_KEY = prevAdminKey;
     if (prevAnalyticsAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY;

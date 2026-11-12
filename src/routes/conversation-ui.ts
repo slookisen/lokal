@@ -17,6 +17,7 @@ import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { interactionLogger } from "../services/interaction-logger";
+import { guardConversationEmails, messageForListener, withoutSellerEmailAlways, liveStreamCacheControl } from "../services/conversation-email-guard";
 import { redactPII } from "../utils/pii-redact";
 import { parseUserAgent, MIN_HUMAN_REFERRAL_COUNT } from "../services/analytics-service";
 import { readHumanReferralStrip, samtalerHtmlCacheFor } from "../services/samtaler-strip";
@@ -770,11 +771,15 @@ router.get("/samtaler", async (req: Request, res: Response) => {
     const statsMap = new Map(sourceStats.map(s => [s.source, s]));
 
     // ─── Filtered conversations (max 50) ────────────────────────
-    const conversations = conversationService.listConversations({
+    // S-A5 (dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting):
+    // this page is the same for every visitor (finished-HTML cache), so it
+    // cannot follow the per-IP counter — with EMAIL_REVEAL_GUARD_RFB on the
+    // reply previews never show the ✉️ line (no budget spent). Off: as before.
+    const conversations = withoutSellerEmailAlways(conversationService.listConversations({
       limit: 50,
       source: filterSource,
       includeInternal: isAdminView,
-    });
+    }));
 
     // ─── Stats cards ────────────────────────────────────────────
     const sourceLabels: Record<string, { icon: string; label: string }> = {
@@ -955,8 +960,8 @@ router.get("/samtaler", async (req: Request, res: Response) => {
 
 router.get("/samtale/:id", (req: Request, res: Response) => {
   try {
-    const conv = conversationService.getConversation(req.params.id as string);
-    if (!conv) {
+    const stored = conversationService.getConversation(req.params.id as string);
+    if (!stored) {
       res.status(404).send(chatShell("Ikke funnet", "Samtalen finnes ikke", `
         <div class="container">
           <div class="empty-state">
@@ -968,6 +973,10 @@ router.get("/samtale/:id", (req: Request, res: Response) => {
       `));
       return;
     }
+
+    // S-A5: the seller's ✉️ line (contact card) follows the rfb per-IP limit
+    // (services/conversation-email-guard.ts); switch on: Cache-Control: private.
+    const conv = guardConversationEmails(req, res, [stored])[0]!;
 
     const buyerName = conv.buyerAgentName || "Anonym kjøper";
     const sellerName = conv.sellerAgentName || "Ukjent selger";
@@ -1122,23 +1131,36 @@ router.get("/samtale/:id", (req: Request, res: Response) => {
 //   TextMessageEnd, StateSnapshot, Custom
 
 // ─── AG-UI SSE clients per conversation ─────────────────────
-const agUiClients = new Map<string, Set<Response>>();
+// S-A5: each client keeps its own request, so a seller message's ✉️ line
+// follows that client's rfb per-IP counter (services/conversation-email-guard.ts;
+// switch EMAIL_REVEAL_GUARD_RFB off = the same events to everyone, as before).
+const agUiClients = new Map<string, Map<Response, Request>>();
 
-function sendAgUiEvent(conversationId: string, event: object) {
+function sendAgUiEvent(conversationId: string, event: object | ((clientReq: Request) => object)) {
   const clients = agUiClients.get(conversationId);
   if (!clients?.size) return;
-  const data = JSON.stringify(event);
-  for (const client of clients) {
+  const shared = typeof event === "function" ? null : JSON.stringify(event);
+  for (const [client, clientReq] of clients) {
+    let data: string;
+    try { data = shared ?? JSON.stringify((event as (r: Request) => object)(clientReq)); } catch { continue; }
     try { client.write(`data: ${data}\n\n`); } catch { clients.delete(client); }
   }
 }
 
 // Forward conversation messages to AG-UI clients in real-time
-interactionLogger.on("message", (msg: any) => {
-  if (!msg.conversationId) return;
-  const clients = agUiClients.get(msg.conversationId);
+interactionLogger.on("message", (rawMsg: any) => {
+  if (!rawMsg.conversationId) return;
+  const clients = agUiClients.get(rawMsg.conversationId);
   if (!clients?.size) return;
 
+  // S-A5: the message as each client may see it (switch off: rawMsg itself).
+  const cache = new Map<string, string | null>();
+  const views = new Map<Request, any>();
+  const view = (clientReq: Request): any => {
+    if (!views.has(clientReq)) views.set(clientReq, messageForListener(clientReq, rawMsg, cache));
+    return views.get(clientReq);
+  };
+  const msg = rawMsg;
   const messageId = msg.id || randomUUID();
   const role = msg.senderRole === "buyer" ? "user" : msg.senderRole === "seller" ? "assistant" : "system";
 
@@ -1150,12 +1172,13 @@ interactionLogger.on("message", (msg: any) => {
     timestamp: new Date().toISOString(),
   });
 
-  sendAgUiEvent(msg.conversationId, {
+  const contentTimestamp = new Date().toISOString();
+  sendAgUiEvent(msg.conversationId, (clientReq) => ({
     type: "TextMessageContent",
     messageId,
-    delta: msg.content,
-    timestamp: new Date().toISOString(),
-  });
+    delta: view(clientReq).content,
+    timestamp: contentTimestamp,
+  }));
 
   sendAgUiEvent(msg.conversationId, {
     type: "TextMessageEnd",
@@ -1165,17 +1188,18 @@ interactionLogger.on("message", (msg: any) => {
 
   // Also emit custom event with A2A-specific metadata
   if (msg.messageType && msg.messageType !== "text") {
-    sendAgUiEvent(msg.conversationId, {
+    const customTimestamp = new Date().toISOString();
+    sendAgUiEvent(msg.conversationId, (clientReq) => ({
       type: "Custom",
       name: "a2a.message_type",
       value: {
         messageType: msg.messageType,
         senderRole: msg.senderRole,
         senderAgentName: msg.senderAgentName,
-        metadata: msg.metadata,
+        metadata: view(clientReq).metadata,
       },
-      timestamp: new Date().toISOString(),
-    });
+      timestamp: customTimestamp,
+    }));
   }
 });
 
@@ -1203,16 +1227,19 @@ router.get("/api/ag-ui/conversations", (req: Request, res: Response) => {
 // "join" a conversation.
 
 router.post("/api/ag-ui/conversation/:id/run", (req: Request, res: Response) => {
-  const conv = conversationService.getConversation(req.params.id as string);
-  if (!conv) {
+  const stored = conversationService.getConversation(req.params.id as string);
+  if (!stored) {
     res.status(404).json({ type: "RunError", message: "Conversation not found", code: "NOT_FOUND" });
     return;
   }
+  // S-A5: the replayed seller ✉️ line follows the rfb per-IP limit
+  // (services/conversation-email-guard.ts); live updates per client below.
+  const conv = guardConversationEmails(req, res, [stored])[0]!;
 
   // Set up SSE
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
+    "Cache-Control": liveStreamCacheControl(),
     "Connection": "keep-alive",
     "X-Accel-Buffering": "no",
   });
@@ -1221,8 +1248,8 @@ router.post("/api/ag-ui/conversation/:id/run", (req: Request, res: Response) => 
   const threadId = conv.id;
 
   // Register this client for live updates
-  if (!agUiClients.has(threadId)) agUiClients.set(threadId, new Set());
-  agUiClients.get(threadId)!.add(res);
+  if (!agUiClients.has(threadId)) agUiClients.set(threadId, new Map());
+  agUiClients.get(threadId)!.set(res, req);
   req.on("close", () => {
     agUiClients.get(threadId)?.delete(res);
     if (agUiClients.get(threadId)?.size === 0) agUiClients.delete(threadId);
@@ -1319,7 +1346,7 @@ router.get("/api/ag-ui/conversation/:id", (req: Request, res: Response) => {
 
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
+    "Cache-Control": liveStreamCacheControl(),
     "Connection": "keep-alive",
     "X-Accel-Buffering": "no",
   });
@@ -1338,8 +1365,8 @@ router.get("/api/ag-ui/conversation/:id", (req: Request, res: Response) => {
   })}\n\n`);
 
   // Register for live updates
-  if (!agUiClients.has(convId)) agUiClients.set(convId, new Set());
-  agUiClients.get(convId)!.add(res);
+  if (!agUiClients.has(convId)) agUiClients.set(convId, new Map());
+  agUiClients.get(convId)!.set(res, req);
   req.on("close", () => {
     agUiClients.get(convId)?.delete(res);
     if (agUiClients.get(convId)?.size === 0) agUiClients.delete(convId);

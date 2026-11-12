@@ -14,22 +14,41 @@ import {
 } from "../services/a2a-traffic-classifier";
 import { hashIP } from "../services/analytics-service";
 import { discoveryService } from "../services/discovery-service";
-import { knowledgeService, relabelCertifications, productEntries } from "../services/knowledge-service";
+import { knowledgeService, relabelCertifications, productEntries, parseProductPrice, publicOwnerAboutText } from "../services/knowledge-service";
+import { catalogNameNorm, softStockByNameNorm, stockSoftExpiryBuyerTextNb } from "../services/stock-soft-expiry";
+import { stripOrganicEntries } from "../services/organic-claims";
+import { textEntries } from "../utils/text-entries";
 import { redactPII } from "../utils/pii-redact";
 import { getDb } from "../database/init";
-import { isAgentIdPubliclyVisible } from "../services/agent-visibility";
+import { isAgentIdPubliclyVisible, isDelistedAgentId, ownerHidesAgent, isContactHiddenAgentId, withoutContactFields } from "../services/agent-visibility";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
 import { signAgentCard, getJWKS } from "../services/agent-card-signing";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { recordA2aDelivery } from "../services/profile-ai-deliveries";
+import { aiProfileLinksJson } from "../middleware/ai-profile-links";
 import { agentCardProvider } from "../services/company-legal";
 import { isPaymentsEnabled } from "../services/payment-service";
 import { a2aMessageData, capA2aData } from "../utils/a2a-message";
 import { capFreeText } from "../utils/free-text";
 import { logInternalError, rpcInternalErrorReply } from "../utils/internal-error";
 import { searchCountable } from "../services/search-tracking";
+import { publicAgentInfo, publicFieldChoices } from "../owner-features/enforce";
+import { emailRevealGuardEnabled, withKnowledgeEmailNull } from "../services/email-reveal-guard";
+import { rfbEmailHiddenIds } from "../services/contact-form-only";
+import { guardConversationEmails, messageForListener, liveStreamCacheControl } from "../services/conversation-email-guard";
 import { readSearchText, geocodeSearchPlace, discoveryQueryOf, outsideNorwayText, noProductMatchText } from "../services/rfb-search-reading";
+import {
+  isOrderAgentActionsEnabled,
+  orderIdForTaskRequest,
+  getOrderTask,
+  cancelOrderTask,
+  managePickupOrderSkill,
+  rfbJsonRpcMethods,
+  A2A_TASK_NOT_FOUND,
+  A2A_TASK_NOT_CANCELABLE,
+  type OrderTaskRpcResult,
+} from "../services/order-a2a-task";
 
 // ─── A2A Routes ──────────────────────────────────────────────
 // Two protocols served here:
@@ -103,13 +122,13 @@ router.get("/a2a", (_req: Request, res: Response) => {
     const cities = [...new Set(agents.map((a: any) => a.city).filter(Boolean))];
     const card = {
       name: "Rett fra Bonden",
-      description: `A2A marketplace for local food in Norway. Connect AI agents with ${agents.length}+ verified local farms, shops, cooperatives, farm shops, REKO rings, and markets. Agent-markedsplass for lokal mat i Norge.`,
+      description: `A2A marketplace for local food in Norway. Connect AI agents with ${agents.length}+ local farms, shops, cooperatives, farm shops, REKO rings, and markets, cross-checked against the Brønnøysund register. Agent-markedsplass for lokal mat i Norge.`,
       url: process.env.BASE_URL || "https://rettfrabonden.com",
       // T3 (dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as):
       // same provider as the .well-known card (getRegistryCard) — the company.
       provider: {
         ...agentCardProvider(),
-        contactUrl: `${process.env.BASE_URL || "https://rettfrabonden.com"}/docs`,
+        contactUrl: `${process.env.BASE_URL || "https://rettfrabonden.com"}/kontakt`,
         description: "Open agent-to-agent food marketplace operator. Norges første A2A-markedsplass for lokal mat.",
       },
       version: "1.0.0",
@@ -122,7 +141,7 @@ router.get("/a2a", (_req: Request, res: Response) => {
       additionalInterfaces: [
         { url: `${process.env.BASE_URL || "https://rettfrabonden.com"}/api/marketplace`, transport: "HTTP+JSON" },
       ],
-      documentationUrl: `${process.env.BASE_URL || "https://rettfrabonden.com"}/docs`,
+      documentationUrl: `${process.env.BASE_URL || "https://rettfrabonden.com"}/teknologi`,
       // dev-request 2026-07-25-proveniens-transparens: additive link to the
       // public "how we verify our data" page (field_provenance / cross-source
       // agreement machinery, already live server-side — this is docs only,
@@ -159,13 +178,15 @@ router.get("/a2a", (_req: Request, res: Response) => {
       },
       security: [],
       interfaces: [
-        { type: "json-rpc", url: `${process.env.BASE_URL || "https://rettfrabonden.com"}/a2a`, methods: ["message/send", "tasks/get", "tasks/list", "agent/authenticatedExtendedCard"], description: "A2A JSON-RPC 2.0 endpoint" },
+        { type: "json-rpc", url: `${process.env.BASE_URL || "https://rettfrabonden.com"}/a2a`, methods: rfbJsonRpcMethods(), description: "A2A JSON-RPC 2.0 endpoint" },
         { type: "rest", url: `${process.env.BASE_URL || "https://rettfrabonden.com"}/api/marketplace`, description: "REST API for search, discovery, registration" },
       ],
       skills: [
-        { id: "discover-local-food-agents", name: "Discover Local Food Agents", description: `Search ${agents.length}+ verified local food producers in Norway`, tags: ["local food", "organic", "farm direct", "Norway"], examples: ["Find organic farms near Oslo", "finn grønnsaker i Bergen"] },
+        { id: "discover-local-food-agents", name: "Discover Local Food Agents", description: `Search ${agents.length}+ local food producers in Norway, cross-checked against the Brønnøysund register`, tags: ["local food", "farm direct", "Norway"], examples: ["Find farms near Oslo", "finn grønnsaker i Bergen"] },
         { id: "agent-conversation", name: "Start Agent Negotiation", description: "Initiate buyer-seller conversation between agents", tags: ["negotiate", "order", "transaction"], examples: ["negotiate delivery of tomatoes"] },
         { id: "build-shopping-cart", name: "Build a shopping cart", description: `Cart and order flow is available via the MCP server (POST /mcp): find offers with lokal_find_offers, then lokal_cart_create, lokal_cart_add_item, lokal_cart_view and lokal_cart_submit (${isPaymentsEnabled() ? "pickup order; producers that take prepayment return a Stripe payment link the buyer approves themselves, the others are paid at pickup" : "pickup order, no payment"}). Not available through message/send on /a2a.`, tags: ["cart", "order", "local food", "pickup", "mcp"], examples: ["MCP tools/call lokal_find_offers {items: [\"potet\"], near: \"Oslo\"}", "MCP tools/call lokal_cart_create"] },
+        // Fase B3 (mine ordrer): only with ORDER_AGENT_ACTIONS_ENABLED on; off, the card is unchanged.
+        ...(isOrderAgentActionsEnabled() ? [managePickupOrderSkill()] : []),
       ],
       "x-lokal": { type: "registry", region: "Norway", stats: { totalAgents: agents.length, cities: cities.slice(0, 30) } },
     };
@@ -182,7 +203,8 @@ router.get("/a2a", (_req: Request, res: Response) => {
   }
 });
 
-router.post("/a2a", (req: Request, res: Response) => {
+// «Klikk fra AI-svar» slice 3: profile links in the answer are tagged for AI (utm_medium=a2a).
+router.post("/a2a", aiProfileLinksJson("a2a"), (req: Request, res: Response) => {
   // Defensive: a request without Content-Type: application/json (or with a malformed
   // body) leaves req.body as undefined, and destructuring it throws — Express then
   // emits a default HTML 500 to a JSON-RPC client. Return a clean parse error instead.
@@ -229,6 +251,18 @@ router.post("/a2a", (req: Request, res: Response) => {
       case "tasks/list":
       case "ListTasks": // A2A v1.0
         handleTasksList(params, id, res);
+        break;
+      case "tasks/cancel":
+      case "CancelTask": // A2A v1.0
+        // Fase B3: only the buyer's pickup order can be cancelled, and only
+        // with ORDER_AGENT_ACTIONS_ENABLED on. Off: "Method not found" as before.
+        if (!isOrderAgentActionsEnabled()) {
+          res.json({ jsonrpc: "2.0", error: { code: -32601, message: `Method not found: ${method}` }, id });
+          break;
+        }
+        handleTasksCancel(params, id, res).catch((err) => {
+          if (!res.headersSent) res.json(rpcInternalError(id, "POST /a2a tasks/cancel", err));
+        });
         break;
       case "agent/authenticatedExtendedCard":
         handleExtendedCard(params, id, req, res);
@@ -462,7 +496,7 @@ async function handleMessageSend(params: any, id: any, req: Request, res: Respon
     // the producers there are no matches, nor counted as discovered.
     const discoverMeta: DiscoverMeta = {};
     const found = hasIntent && !outsideNorway
-      ? marketplaceRegistry.discover(query, discoverMeta, { trackDiscovery: countable, countUnmatched: false })
+      ? marketplaceRegistry.discover(query, discoverMeta, { trackDiscovery: countable, countUnmatched: false, audience: "ai" })
       : [];
     const unmatchedTerms = discoverMeta.unmatchedTerms;
     const results = unmatchedTerms ? [] : found;
@@ -594,10 +628,32 @@ async function handleMessageSend(params: any, id: any, req: Request, res: Respon
 // Check the status of a previously submitted task.
 // Part of the A2A task lifecycle (Gap 7 fix).
 
-function handleTasksGet(params: any, id: any, res: Response) {
+function taskIdOf(params: any): any {
   // v1.0 GetTask may address the task by resource name "tasks/<id>".
-  const taskId = params?.taskId || params?.id
+  return params?.taskId || params?.id
     || (typeof params?.name === "string" ? params.name.replace(/^tasks\//, "") : undefined);
+}
+
+function marketplaceTaskExists(taskId: string): boolean {
+  return !!marketplaceRegistry.getTask(taskId);
+}
+
+function sendOrderTaskReply(r: OrderTaskRpcResult, id: any, res: Response): void {
+  res.json("error" in r ? { jsonrpc: "2.0", error: r.error, id } : { jsonrpc: "2.0", result: r.result, id });
+}
+
+function handleTasksGet(params: any, id: any, res: Response) {
+  const taskId = taskIdOf(params);
+  // Fase B3: with ORDER_AGENT_ACTIONS_ENABLED on, an order id ("order:<id>",
+  // or the bare id with metadata.buyer_ref and no marketplace task of that id)
+  // is the buyer's pickup order. Off, or any other id: unchanged.
+  if (typeof taskId === "string" && taskId && isOrderAgentActionsEnabled()) {
+    const orderId = orderIdForTaskRequest(taskId, params, marketplaceTaskExists);
+    if (orderId !== null) {
+      sendOrderTaskReply(getOrderTask(orderId, params), id, res);
+      return;
+    }
+  }
   if (!taskId) {
     res.json({
       jsonrpc: "2.0",
@@ -622,6 +678,28 @@ function handleTasksGet(params: any, id: any, res: Response) {
     result: { task: toA2ATask(task) },
     id,
   });
+}
+
+// ─── tasks/cancel (Fase B3) ──────────────────────────────────
+// Only reached with ORDER_AGENT_ACTIONS_ENABLED on. A pickup order: the
+// buyer's withdraw / cancel through the shared order-action layer (channel
+// 'a2a'). A marketplace task finishes inside message/send, so it cannot be
+// cancelled.
+
+async function handleTasksCancel(params: any, id: any, res: Response) {
+  const taskId = taskIdOf(params);
+  if (typeof taskId !== "string" || !taskId) {
+    res.json({ jsonrpc: "2.0", error: { code: -32602, message: "Invalid params: 'taskId' required" }, id });
+    return;
+  }
+  const orderId = orderIdForTaskRequest(taskId, params, marketplaceTaskExists);
+  if (orderId === null) {
+    res.json(marketplaceTaskExists(taskId)
+      ? { jsonrpc: "2.0", error: { code: A2A_TASK_NOT_CANCELABLE, message: `Task cannot be canceled: ${taskId}` }, id }
+      : { jsonrpc: "2.0", error: { code: A2A_TASK_NOT_FOUND, message: `Task not found: ${taskId}` }, id });
+    return;
+  }
+  sendOrderTaskReply(await cancelOrderTask(orderId, params), id, res);
 }
 
 // ─── tasks/list ──────────────────────────────────────────────
@@ -660,6 +738,35 @@ function handleExtendedCard(params: any, id: any, req: Request, res: Response) {
 // This is the core of the dummy-agent system: every seller has
 // an agent that can answer based on what we know about them.
 
+/**
+ * B2b-2 (bestillinger, «myk utløp»): agent/info's product list. A product
+ * whose catalog row is in the soft window (STOCK_SOFT_EXPIRY_ENABLED on and
+ * the producer on the owner-features allowlist, stock-soft-expiry.ts) gets
+ * stock_confirmed_at, needs_producer_confirmation: true and stock_note (the
+ * buyer text with the date: the producer confirms the order). Nothing in the
+ * window → the info object as it was, untouched.
+ */
+export function withSoftStockProducts<T extends { knowledge: any }>(info: T, agentId: string): T {
+  const products = info?.knowledge?.products;
+  if (!Array.isArray(products) || products.length === 0) return info;
+  const soft = softStockByNameNorm(getDb(), agentId);
+  if (soft.size === 0) return info;
+  let changed = false;
+  const out = products.map((p: any) => {
+    if (!p || typeof p !== "object" || typeof p.name !== "string") return p;
+    const f = soft.get(catalogNameNorm(parseProductPrice(p).cleanName));
+    if (!f) return p;
+    changed = true;
+    return { ...p, ...f, stock_note: stockSoftExpiryBuyerTextNb(f.stock_confirmed_at) };
+  });
+  return changed ? { ...info, knowledge: { ...info.knowledge, products: out } } : info;
+}
+
+/** The info without its contact fields when the row is catalog_hidden for this view; else the same object. */
+function withoutHiddenRowContact<T extends { knowledge: any }>(info: T, agentId: string): T {
+  return isContactHiddenAgentId(getDb(), agentId) ? { ...info, knowledge: withoutContactFields(info.knowledge) } : info;
+}
+
 function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
   const agentId = params?.agentId;
   if (!agentId) {
@@ -672,7 +779,11 @@ function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
   }
 
   const info = knowledgeService.getAgentInfo(agentId);
-  if (!info) {
+  // S2c-2 (dev-request 2026-10-22-rfb-mine-valg-eierbrytere): a profile whose
+  // owner hid it (visibility.profile) or hid it from AI assistants
+  // (visibility.ai_assistants) reads like an unknown id. No query unless
+  // OWNER_FEATURES_ENFORCE is on and the id is allowlisted.
+  if (!info || ownerHidesAgent(String(agentId), "ai_assistants") || isDelistedAgentId(String(agentId))) {
     res.json({
       jsonrpc: "2.0",
       error: { code: -32602, message: `Agent not found: ${agentId}` },
@@ -690,6 +801,17 @@ function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
     });
   }
 
+  // dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
+  // S-A5 (RFB A2A): knowledge.email follows the rfb per-IP limit of
+  // services/email-reveal-guard.ts, the counter the profile page and the
+  // REST answers share (switch EMAIL_REVEAL_GUARD_RFB, default off). Over
+  // the limit, or for CCBot, it reads null as for a producer without one.
+  // Switch on: Cache-Control: private. Switch off: nothing changes.
+  // S-D2: null for a contact-form-only profile too (CONTACT_FORM_RFB on).
+  let shown = publicAgentInfo(info, publicFieldChoices(agentId));
+  const emailWithheld = rfbEmailHiddenIds(req, res, shown.knowledge.email ? [String(agentId)] : []);
+  if (emailWithheld?.has(String(agentId))) shown = withKnowledgeEmailNull(shown);
+
   res.json({
     jsonrpc: "2.0",
     result: {
@@ -698,7 +820,11 @@ function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
         toA2ADataArtifact({
           artifactId: `info-${agentId}`,
           name: "agent-info",
-          data: info,
+          // S2c-1: without what the owner hid (not enforced = as before).
+          // B2b-2: products in the stock rule's soft window carry the date.
+          // A catalog_hidden row (the hidden test fixture) never shows its
+          // contact details (agent-visibility.ts, as lokal_info).
+          data: withSoftStockProducts(withoutHiddenRowContact(shown, String(agentId)), String(agentId)),
         }),
       ],
     },
@@ -778,7 +904,8 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
   // 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt): 404 like an unknown id
   // for the hidden test fixture, a non-RFB-vertical row, or an unvetted
   // self-registered agent — see isQuarantinedFromPublicView.
-  if (marketplaceRegistry.isQuarantinedFromPublicView(req.params.id as string)) {
+  // S2c-2: audience "ai" — an A2A card is for AI agents (visibility.ai_assistants).
+  if (marketplaceRegistry.isQuarantinedFromPublicView(req.params.id as string, { audience: "ai" })) {
     res.status(404).json({ error: "Agent not found" });
     return;
   }
@@ -804,22 +931,35 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
       console.log(`[description-guard] suppressed junk knowledge.about (agent.json x-knowledge) for ${req.params.id} (${card.name})`);
       safeAbout = undefined;
     }
+    // Økologi S3c-2: owner-written about of a producer without a valid Debio
+    // status → no organic sentence (gate off = unchanged).
+    safeAbout = publicOwnerAboutText(req.params.id as string, safeAbout);
+    // dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
+    // S-A5 (RFB A2A): x-knowledge.email follows the rfb per-IP limit (as
+    // agent/info above); withheld it is left out as for a producer without
+    // one. Switch on: Cache-Control: private instead of public. Off: as before.
+    // S-D2: left out for a contact-form-only profile too (CONTACT_FORM_RFB on).
+    const agentId = req.params.id as string;
+    const emailWithheld = rfbEmailHiddenIds(req, res, knowledge.email ? [agentId] : []);
     const enriched: Record<string, any> = { ...card };
     enriched["x-knowledge"] = {
       address: knowledge.address,
       postalCode: knowledge.postalCode,
       phone: isDisplayablePhone(knowledge.phone) ? knowledge.phone : undefined,
-      email: knowledge.email,
+      email: emailWithheld?.has(agentId) ? undefined : knowledge.email,
       website: knowledge.website,
       openingHours: knowledge.openingHours,
       // Integration test 2026-10-17 (I-G): products is DB JSON. Stored as
       // text, `products?.map` threw, and so did `p.name` on a null product;
       // it is read in getAgentInfo's fixed shape (productEntries).
+      // Økologi S0: no organic claim without a valid Debio status
+      // (organic-claims.ts) — organic:false, organic words out of specialties.
       products: productEntries(knowledge.products).map((p: any) => ({
-        name: p.name, category: p.category, seasonal: p.seasonal, months: p.months, organic: p.organic,
+        name: p.name, category: p.category, seasonal: p.seasonal, months: p.months,
+        organic: isDebioVerified ? p.organic : (p.organic === undefined ? undefined : false),
         price: p.price, priceUnit: p.priceUnit,
       })),
-      specialties: knowledge.specialties,
+      specialties: isDebioVerified ? knowledge.specialties : stripOrganicEntries(textEntries(knowledge.specialties)),
       certifications: relabelCertifications(knowledge.certifications, isDebioVerified),
       paymentMethods: knowledge.paymentMethods,
       deliveryOptions: knowledge.deliveryOptions,
@@ -838,7 +978,9 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
     for (const key of Object.keys(xk)) {
       if (xk[key] === undefined || xk[key] === null) delete xk[key];
     }
-    res.header("Cache-Control", "public, max-age=1800");
+    // Private only when the per-IP guard is on (the answer then varies by
+    // client); S-D2's contact-form flag is per profile, so it stays public.
+    res.header("Cache-Control", emailRevealGuardEnabled("rfb") ? "private" : "public, max-age=1800");
     res.json(enriched);
     return;
   }
@@ -927,12 +1069,16 @@ router.get("/api/discovery", (_req: Request, res: Response) => {
 // Connect with EventSource("/api/live") in the dashboard
 // ═══════════════════════════════════════════════════════════════
 
-const sseClients = new Set<Response>();
+// S-A5 (dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting):
+// each listener keeps its own request, so a seller message's ✉️ line follows
+// that listener's rfb per-IP counter (services/conversation-email-guard.ts;
+// switch EMAIL_REVEAL_GUARD_RFB off = the same bytes to everyone, as before).
+const sseClients = new Map<Response, Request>();
 
 router.get("/api/live", (req: Request, res: Response) => {
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
+    "Cache-Control": liveStreamCacheControl(),
     "Connection": "keep-alive",
     "X-Accel-Buffering": "no",
   });
@@ -940,14 +1086,14 @@ router.get("/api/live", (req: Request, res: Response) => {
   // Send initial connection event
   res.write(`data: ${JSON.stringify({ type: "connected", timestamp: new Date().toISOString() })}\n\n`);
 
-  sseClients.add(res);
+  sseClients.set(res, req);
   req.on("close", () => sseClients.delete(res));
 });
 
 // Forward interactions and messages to SSE clients
 interactionLogger.on("interaction", (event: InteractionEvent) => {
   const data = JSON.stringify({ eventType: "interaction", ...event });
-  for (const client of sseClients) {
+  for (const client of sseClients.keys()) {
     try { client.write(`data: ${data}\n\n`); } catch { sseClients.delete(client); }
   }
 });
@@ -961,8 +1107,15 @@ interactionLogger.on("message", (msg: any) => {
     safe.content = redactPII(msg.content);
   }
   const data = JSON.stringify({ type: "conversation_message", ...safe });
-  for (const client of sseClients) {
-    try { client.write(`data: ${data}\n\n`); } catch { sseClients.delete(client); }
+  // S-A5: a seller message's ✉️ line per listener (see sseClients above).
+  const cache = new Map<string, string | null>();
+  for (const [client, clientReq] of sseClients) {
+    let line = data;
+    try {
+      const shown = messageForListener(clientReq, safe, cache);
+      if (shown !== safe) line = JSON.stringify({ type: "conversation_message", ...shown });
+    } catch { /* guard failure: the message is not sent to this listener */ continue; }
+    try { client.write(`data: ${line}\n\n`); } catch { sseClients.delete(client); }
   }
 });
 
@@ -1014,7 +1167,9 @@ router.post("/api/conversations", (req: Request, res: Response) => {
     requestMeta, // (item 3) internal-traffic classification
     trafficClass,
   });
-  res.json({ success: true, data: conversation });
+  // S-A5: the seller auto-reply's ✉️ line follows the rfb per-IP limit
+  // (services/conversation-email-guard.ts); the stored rows are unchanged.
+  res.json({ success: true, data: guardConversationEmails(req, res, [conversation])[0] });
 });
 
 // Redact PII from a conversation's public-facing fields without touching
@@ -1042,7 +1197,9 @@ router.get("/api/conversations", (req: Request, res: Response) => {
     status: (req.query.status as string) || undefined,
     agentId: (req.query.agentId as string) || undefined,
   });
-  const safe = conversations.map(redactConversationForPublic);
+  // S-A5: each seller whose reply carries an e-mail counts on the rfb per-IP
+  // limit once, in list order (services/conversation-email-guard.ts).
+  const safe = guardConversationEmails(req, res, conversations).map(redactConversationForPublic);
   res.json({ success: true, data: safe, count: safe.length });
 });
 
@@ -1053,7 +1210,8 @@ router.get("/api/conversations/:id", (req: Request, res: Response) => {
     res.status(404).json({ success: false, error: "Conversation not found" });
     return;
   }
-  res.json({ success: true, data: redactConversationForPublic(conversation) });
+  // S-A5: the seller's ✉️ line follows the rfb per-IP limit (see the list above).
+  res.json({ success: true, data: redactConversationForPublic(guardConversationEmails(req, res, [conversation])[0]) });
 });
 
 // POST /api/conversations/:id/messages — Add message to conversation
@@ -1148,6 +1306,8 @@ router.get("/api/agents/:id/metrics", (req: Request, res: Response) => {
 // GET /api/leaderboard — Top sellers (social proof)
 router.get("/api/leaderboard", (req: Request, res: Response) => {
   const limit = parseInt(req.query.limit as string) || 10;
+  // S2c-2: getLeaderboard leaves out profiles whose owner switched off
+  // «Vis meg på topplister» (visibility.leaderboard) or the profile.
   const leaderboard = conversationService.getLeaderboard(limit);
   res.json({ success: true, data: leaderboard });
 });

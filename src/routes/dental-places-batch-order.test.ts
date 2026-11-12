@@ -19,6 +19,16 @@
  * placesFieldMask(…, false), whatever RFB's lever says; the lever itself is
  * not flipped here, because this block does not run in the runSerial chain).
  * Every one of them is in the Places call log, none marked as a rating call.
+ *
+ * d-f) A6 (phone, website, opening hours off). Blocks a-f run with the A5
+ * switch (PLACES_ADDRESS_FETCH_ENABLED) on, the pre-A5 behaviour.
+ *
+ * g-h) A5, same dev-request: with the address switch off (the production
+ * default) Phase 2G no longer selects a clinic because its address is empty,
+ * sends no places.formattedAddress, looks up and writes no address (Brreg's
+ * included: by_field.adresse 0) and writes no address provenance, also when
+ * Places answers with one. g: with A6 off too, nothing is left to fetch. h:
+ * with A6 set back on, the homepage is still filled, without the address.
  */
 
 export interface TestSummary {
@@ -96,6 +106,9 @@ export function runDentalPlacesBatchOrderTests(opts: { log?: boolean } = {}): Pr
       // opening_hours, the full masks): run with the A6 switch on. Block d
       // below runs with it off.
       pm.__setDentalPlacesContactFieldsFetchForTesting(true);
+      // Blocks a-f assert the pre-A5 address behaviour: A5 switch on. Blocks
+      // g-h below run with it off.
+      pm.__setPlacesAddressFetchForTesting(true);
       // No network: Google answers "no places" for every query.
       (globalThis as any).fetch = async (url: unknown, init?: any) => {
         if (String(url).includes("places.googleapis.com")) masks.push(String(init?.headers?.["X-Goog-FieldMask"] ?? ""));
@@ -153,8 +166,8 @@ export function runDentalPlacesBatchOrderTests(opts: { log?: boolean } = {}): Pr
       assertEq([...new Set(masks)].sort(), PRE_A2_MASKS, "c1: dental sends its pre-S4-A2 Enterprise and Pro masks, byte for byte");
       assertEq(masks.filter(ratingField), [], "c2: no dental Places call asks for a Google rating field");
       const logged = db.prepare(`SELECT endpoint FROM places_api_call_log`).all() as Array<{ endpoint: string }>;
-      assertEq([logged.length, [...new Set(logged.map((r) => r.endpoint))]], [masks.length, ["google-places-batch"]],
-        "c3: every dental Places call is logged with its mask, none marked as a rating call (+rating)");
+      assertEq([logged.length, [...new Set(logged.map((r) => r.endpoint))]], [masks.length, ["google-places-batch+address"]],
+        "c3: every dental Places call is logged with its mask, none marked as a rating call (+rating); the address mark (A5) as the masks ask for it");
 
       // d) A6: switch off (the production default). Places answers with phone,
       //    website and opening hours for every query.
@@ -226,12 +239,82 @@ export function runDentalPlacesBatchOrderTests(opts: { log?: boolean } = {}): Pr
       const provOn = JSON.parse((db.prepare(`SELECT field_provenance FROM dental_agents WHERE id = 'a6-kontakt'`).get() as any).field_provenance ?? "{}");
       assertEq(Object.keys(provOn).sort(), ["address", "opening_hours", "phone", "website"], "f4: switch on writes the google_places provenance for the three fields");
       pm.__setDentalPlacesContactFieldsFetchForTesting(null);
+
+      // g) A5: address switch off (the production default), A6 off too.
+      //    Places answers with an address for every query, and Brreg would too.
+      pm.__setPlacesAddressFetchForTesting(null);
+      assertEq(pm.placesAddressFetchEnabled(), false, "g0: PLACES_ADDRESS_FETCH_ENABLED defaults to false");
+      const tracker = require("../services/places-usage-tracker") as typeof import("../services/places-usage-tracker");
+      const a5Calls: Array<{ mask: string; query: string }> = [];
+      let a5Brreg = 0;
+      (globalThis as any).fetch = async (url: unknown, init?: any) => {
+        const u = String(url);
+        if (u.includes("brreg.no")) {
+          a5Brreg++;
+          return { ok: true, status: 200, text: async () => "{}", json: async () => ({ _embedded: { enheter: [{
+            organisasjonsnummer: "999888777", navn: "A5 HJEMMESIDE TANNKLINIKK AS",
+            forretningsadresse: { adresse: ["Brreggata 3"], postnummer: "0150", poststed: "OSLO" },
+          }] } }) };
+        }
+        if (!u.includes("places.googleapis.com")) return { ok: false, status: 404, json: async () => ({}), text: async () => "" };
+        const query = String(JSON.parse(String(init?.body ?? "{}")).textQuery ?? "");
+        a5Calls.push({ mask: String(init?.headers?.["X-Goog-FieldMask"] ?? ""), query });
+        return {
+          ok: true, status: 200, text: async () => "{}",
+          json: async () => ({ places: [{
+            displayName: { text: query.replace(/ Norway$/, "").replace(/ Oslo$/, "") },
+            addressComponents: [{ longText: "0150", shortText: "0150", types: ["postal_code"] }, { longText: "Oslo", shortText: "Oslo", types: ["postal_town"] }],
+            formattedAddress: "Placesveien 7, 0150 Oslo, Norge",
+            websiteUri: "https://a5-klinikk.example.no",
+          }] }),
+        };
+      };
+      db.prepare(`DELETE FROM dental_agents`).run();
+      db.prepare(`DELETE FROM places_api_call_log`).run();
+      const ins3 = db.prepare(
+        `INSERT INTO dental_agents (id, navn, postnummer, poststed, adresse, telefon, hjemmeside, opening_hours)
+         VALUES (@id, @navn, '0150', 'Oslo', @adresse, @telefon, @hjemmeside, @oh)`
+      );
+      // a5-adresse: only the address is missing. a5-hjemmeside: the homepage and the address are missing.
+      ins3.run({ id: "a5-adresse", navn: "A5 Adresse Tannklinikk", adresse: "", telefon: "22110000", hjemmeside: "https://a5-adresse.example.no", oh: "[]" });
+      ins3.run({ id: "a5-hjemmeside", navn: "A5 Hjemmeside Tannklinikk", adresse: "", telefon: "22110001", hjemmeside: "", oh: "[]" });
+      const a5Row = (id: string) => db.prepare(`SELECT adresse, hjemmeside, field_provenance, places_attempted_at FROM dental_agents WHERE id = ?`).get(id) as any;
+      const g = await callBatch(router, headers, { limit: 10, write: true });
+      assertEq([g.status, idsOf(g), g.body?.data?.pool_empty], [200, [], true], "g1: A5+A6 off -> no row is selected because its address is empty (pool_empty)");
+      assertEq([a5Calls.length, a5Brreg], [0, 0], "g2: no Places call and no Brreg address lookup");
+      assertEq(g.body?.data?.by_field, { hjemmeside: 0, adresse: 0, telefon: 0, opening_hours: 0 }, "g3: by_field.adresse is 0");
+      const gIds = await callBatch(router, headers, { agentIds: ["a5-adresse"], write: true });
+      assertEq((gIds.body?.data?.results ?? []).map((x: any) => x.status), ["skipped_places_fields_disabled"], "g4: agentIds with only the address missing -> nothing left to fetch, skipped");
+      assertEq([a5Calls.length, (db.prepare(`SELECT COUNT(*) AS n FROM places_api_call_log`).get() as any).n, a5Row("a5-adresse").places_attempted_at ?? null], [0, 0, null],
+        "g5: no fetch, no logPlacesCall, no no-retry marker");
+      assertEq([a5Row("a5-adresse").adresse, a5Row("a5-adresse").field_provenance ?? null], ["", null], "g6: the address stays empty, no provenance written");
+
+      // h) A6 set back on, address still off: the homepage is filled as before,
+      //    without the address (the acceptance for Phase 2G before A6).
+      pm.__setDentalPlacesContactFieldsFetchForTesting(true);
+      const h = await callBatch(router, headers, { limit: 10, write: true });
+      assertEq(idsOf(h), ["a5-hjemmeside"], "h1: only the row missing a contact field is selected, not the one missing only its address");
+      assertEq(a5Calls.length, 1, "h2: one Places call");
+      assertEq(a5Calls.filter((c) => c.mask.split(",").includes("places.formattedAddress")).length, 0, "h3: X-Goog-FieldMask has no places.formattedAddress");
+      assertEq(a5Calls[0]?.mask.split(",").includes("places.addressComponents"), true, "h4: …but still places.addressComponents for the match guard");
+      assertEq(a5Brreg, 0, "h5: no Brreg address lookup");
+      assertEq(h.body?.data?.by_field, { hjemmeside: 1, adresse: 0, telefon: 0, opening_hours: 0 }, "h6: the homepage is written, by_field.adresse is 0");
+      const hRow = a5Row("a5-hjemmeside");
+      assertEq([hRow.adresse, hRow.hjemmeside], ["", "https://a5-klinikk.example.no"], "h7: the address stays empty although Places answered with one");
+      const hProv = JSON.parse(hRow.field_provenance ?? "{}");
+      assertEq(Object.keys(hProv).sort(), ["website"], "h8: no address provenance (no google_places record, no brreg record)");
+      assertEq(JSON.stringify(hProv).includes("0150") || JSON.stringify(hProv).includes("Placesveien"), false, "h9: no street, postal code or town from Places in the provenance");
+      const hLog = db.prepare(`SELECT endpoint FROM places_api_call_log`).all() as Array<{ endpoint: string }>;
+      assertEq([hLog.map((r) => r.endpoint), tracker.getPlacesAddressFieldCallsThisMonth(db as any)], [["google-places-batch"], 0],
+        "h10: the logged call carries no +address mark; address-field calls this month = 0");
+      pm.__setDentalPlacesContactFieldsFetchForTesting(null);
     } catch (err: any) {
       failed++;
       failures.push("dental-places-batch-order: unexpected error: " + String(err?.stack || err));
     } finally {
       (globalThis as any).fetch = prevFetch;
       pm.__setDentalPlacesContactFieldsFetchForTesting(null);
+      pm.__setPlacesAddressFetchForTesting(null);
       try { (require("../database/db-factory") as typeof import("../database/db-factory")).__resetDbFactoryForTesting(); } catch {}
       restoreModuleCache();
       const restore = (k: string, v: string | undefined) => { if (v === undefined) delete process.env[k]; else process.env[k] = v; };

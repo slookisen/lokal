@@ -174,7 +174,15 @@ export function runRfbPoolgateStegCTests(opts: { log?: boolean } = {}): Promise<
       };
 
       const crmRouter = (require("./crm") as typeof import("./crm")).default as any;
-      const runVerifierRouter = (require("./admin-run-verifier") as any).default as any;
+      const runVerifierMod = require("./admin-run-verifier") as any;
+      const runVerifierRouter = runVerifierMod.default as any;
+      // C1 is about batchSize resolution, not the POST / route's 20 s time
+      // budget (S5c, lokal#1452). On a loaded CI runner a 100-agent round can
+      // take longer than 20 s and stop early (processed 28 instead of 100), so
+      // the route clock is frozen for C1: the deadline is never reached.
+      // Restored right after C1 and again in finally.
+      const frozenRouteNow = Date.now();
+      runVerifierMod.__setVerifyRouteNowForTesting(() => frozenRouteNow);
 
       // ═══════════════════════════════════════════════════════════════
       // C1 — VERIFY_BATCH_SIZE default for POST /admin/run-verifier
@@ -290,6 +298,7 @@ export function runRfbPoolgateStegCTests(opts: { log?: boolean } = {}): Promise<
         body: { batchSize: 250 },
       });
       assertEq(r6.body.processed, 100, "c1-7: explicit batchSize=250 (no env) still clamps to 100 — [1,100] ceiling untouched");
+      runVerifierMod.__setVerifyRouteNowForTesting(null);
 
       delete process.env.VERIFY_BATCH_SIZE;
 
@@ -497,6 +506,7 @@ export function runRfbPoolgateStegCTests(opts: { log?: boolean } = {}): Promise<
         "rfb-poolgate-stegc: unexpected error: " + String(err?.stack || err?.message || err),
       );
     } finally {
+      try { (require("./admin-run-verifier") as any).__setVerifyRouteNowForTesting(null); } catch { /* best-effort */ }
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = prevAdminKey;
       if (prevVerifyBatchSize === undefined) delete process.env.VERIFY_BATCH_SIZE; else process.env.VERIFY_BATCH_SIZE = prevVerifyBatchSize;
       if (prevOutreachMaxPerDay === undefined) delete process.env.OUTREACH_MAX_PER_DAY; else process.env.OUTREACH_MAX_PER_DAY = prevOutreachMaxPerDay;

@@ -29,9 +29,30 @@ import { producerContact, producerTraderStatus, TERMS_OF_PURCHASE_URL, type Prod
 import { companyOperatorSentence } from "./company-legal";
 import { PRICE_BY_AGREEMENT, PARTIAL_SUM_LABEL, summarizePricing } from "./order-pricing";
 import { formatPickupTimeOslo, isOrderAutocompleteEnabled } from "./order-lifecycle";
+import { buyerCancelDetailSentence } from "../owner-features/order-texts";
+
+/**
+ * Tekstpakke C punkt 8: the auto-cancel deadline the receipt names, read from
+ * the same setting as the follow-ups job. Lazy (order-followups imports the
+ * order action layer, which imports this module).
+ */
+function orderAutocancelHours(): number {
+  const { orderAutocancelHours: hours } = require("./order-followups") as typeof import("./order-followups");
+  return hours();
+}
 
 export function isBuyerReceiptsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.ORDER_BUYER_RECEIPTS_ENABLED === "1";
+}
+
+/**
+ * T12 (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 6; pakke C):
+ * «1» lets the cancellation receipt use orders.cancel_detail for its reason
+ * sentence. Default OFF until Daniel has approved text package C: off, the
+ * receipt is byte-identical to before for every order.
+ */
+export function isCancelDetailReceiptEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.ORDER_CANCEL_DETAIL_RECEIPT_ENABLED === "1";
 }
 
 type SendFn = (opts: EmailOptions) => Promise<{ success: boolean; messageId?: string; error?: string }>;
@@ -90,6 +111,12 @@ export interface ReceiptData {
   autoCloseOn?: boolean;
   /** Fase B1: the buyer's order card (/ordre/:id?ref=…); null/absent = no link line. */
   cardUrl?: string | null;
+  /** T12: orders.cancel_detail — passed only with ORDER_CANCEL_DETAIL_RECEIPT_ENABLED=1; absent = today's text. */
+  cancelDetail?: string | null;
+  /** Tekstpakke C punkt 10: orders.cancel_detail of a declined order ('sold_out' = «Avslå – utsolgt»). */
+  declineDetail?: string | null;
+  /** Tekstpakke C punkt 8: the auto-cancel deadline in hours; absent = orderAutocancelHours(). */
+  autocancelHours?: number;
 }
 
 /**
@@ -167,12 +194,12 @@ export function renderBuyerReceipt(event: ReceiptEvent, d: ReceiptData): Rendere
   if (event === "submitted") {
     const text =
       `Hei!\n\nVi har sendt bestillingen din til ${d.producerName}. Dette er en forespørsel: bestillingen gjelder ikke før ${d.producerName} har bekreftet den, og du får en ny e-post når produsenten svarer.\n\n` +
-      `Ordre: ${d.orderRef}\nSelger: ${d.producerName}\n${contactLines}\n\n` +
+      `Bestilling: ${d.orderRef}\nSelger: ${d.producerName}\n${contactLines}\n\n` +
       `Varer:\n${itemLines}\n${sumLine}\n\n` +
       `Henting: Du henter varene hos ${d.producerName}. Avtal tid og sted med produsenten.\n` +
       `Betaling: Du betaler ${d.producerName} ved henting. Ingenting er belastet nå.\n\n` +
       (d.cardUrl ? `Se bestillingen, eller trekk den gratis før produsenten har bekreftet: ${d.cardUrl}\n\n` : "") +
-      `Hører du ikke fra produsenten, kan du kontakte dem direkte (kontaktinformasjon over). Bestillingen blir kansellert hvis produsenten ikke svarer innen kort tid.\n\n` +
+      `Hører du ikke fra produsenten, kan du kontakte dem direkte (kontaktinformasjon over). Svarer ikke produsenten innen ${d.autocancelHours ?? orderAutocancelHours()} timer, blir bestillingen kansellert, og du får beskjed.\n\n` +
       footer;
     return { subject: `Bestillingen din er sendt til ${d.producerName} (${d.orderRef})`, text };
   }
@@ -195,27 +222,28 @@ export function renderBuyerReceipt(event: ReceiptEvent, d: ReceiptData): Rendere
     const text =
       `Hei!\n\n${d.producerName} har bekreftet bestillingen din via Rett fra Bonden. Kjøpet er dermed bindende. ` +
       `Denne e-posten er bekreftelsen din – ta vare på den.\n\n` +
-      `Ordre: ${d.orderRef}\nSelger: ${d.producerName}\n${contactLines}\n\n` +
+      `Bestilling: ${d.orderRef}\nSelger: ${d.producerName}\n${contactLines}\n\n` +
       `Varer:\n${itemLines}\n${sumLine}\n\n` +
       (d.pickupTime
         ? `Henting: Du henter varene hos ${d.producerName}. Hentetid: ${formatPickupTimeOslo(d.pickupTime)}.\n`
         : `Henting: Du henter varene hos ${d.producerName}. Avtal tid og sted med produsenten.\n`) +
       `Betaling: ${pay}\n\n` +
-      (d.cardUrl ? `Ordrekort: Se bestillingen, avbestill eller si fra at du har hentet: ${d.cardUrl}\n\n` : "") +
+      (d.cardUrl ? `Bestillingen din: se den, avbestill eller si fra at du har hentet: ${d.cardUrl}\n\n` : "") +
       // Fase A1: only promised while the automatic close is actually on.
       (d.autoCloseOn
-        ? `Du trenger ikke gjøre noe mer etter hentingen: ordren avsluttes av seg selv etter hentetiden. ` +
+        ? `Du trenger ikke gjøre noe mer etter hentingen: bestillingen avsluttes av seg selv etter hentetiden. ` +
           `Stemmer ikke noe – for eksempel hvis du ikke fikk hentet varene – sier du fra til ${d.producerName} (kontaktinformasjon over) ` +
           `eller til Rett fra Bonden på ${PLATFORM_CONTACT}, så retter vi det.\n\n`
         : "") +
       rights +
       footer;
-    return { subject: `Ordrebekreftelse fra ${d.producerName} (${d.orderRef})`, text };
+    return { subject: `Bestillingen er bekreftet av ${d.producerName} (${d.orderRef})`, text };
   }
 
   if (event === "declined") {
     const text =
-      `Hei!\n\n${d.producerName} kunne dessverre ikke ta imot bestillingen din (ordre ${d.orderRef}).${notChargedLine(p)}\n\n` +
+      // Tekstpakke C punkt 10: «Avslå – utsolgt» stores cancel_detail 'sold_out' on the declined order.
+      `Hei!\n\n${d.producerName} kunne dessverre ikke ta imot bestillingen din${d.declineDetail === "sold_out" ? " fordi varen er utsolgt" : ""} (bestilling ${d.orderRef}).${notChargedLine(p)}\n\n` +
       `Vil du spørre produsenten direkte:\n${contactLines}\n\n` + footer;
     return { subject: `Bestillingen ble ikke bekreftet (${d.orderRef})`, text };
   }
@@ -236,7 +264,7 @@ export function renderBuyerReceipt(event: ReceiptEvent, d: ReceiptData): Rendere
       pay = notChargedLine(p);
       break;
     case "producer_cancelled":
-      why = `${d.producerName} har kansellert bestillingen fordi den ikke kan leveres.`;
+      why = buyerCancelDetailSentence(d.cancelDetail, d.producerName) ?? `${d.producerName} har kansellert bestillingen fordi den ikke kan leveres.`;
       // A captured payment is refunded automatically (and retried by the
       // maintenance job if Stripe failed), so «captured» also gets the line.
       pay = paid ? REFUND : notChargedLine(p);
@@ -263,7 +291,7 @@ export function renderBuyerReceipt(event: ReceiptEvent, d: ReceiptData): Rendere
     default:
       return null; // other reasons: no receipt
   }
-  const text = `Hei!\n\n${why}${pay} (Ordre ${d.orderRef}.)\n\nKontakt produsenten:\n${contactLines}\n\n` + footer;
+  const text = `Hei!\n\n${why}${pay} (Bestilling ${d.orderRef}.)\n\nKontakt produsenten:\n${contactLines}\n\n` + footer;
   if (d.cancelReason === "no_show") return { subject: `Bestillingen er registrert som ikke hentet (${d.orderRef})`, text };
   return { subject: `Bestillingen er kansellert (${d.orderRef})`, text };
 }
@@ -281,12 +309,12 @@ export async function sendBuyerOrderReceipt(orderId: string, event: ReceiptEvent
   try {
     const db = _testDb ?? getDb();
     const o = db.prepare(`
-      SELECT o.id, o.agent_id, o.buyer_ref, o.total_nok, o.cancel_reason, o.pickup_time, o.buyer_email AS order_email, c.buyer_email AS cart_email,
+      SELECT o.id, o.agent_id, o.buyer_ref, o.total_nok, o.cancel_reason, o.cancel_detail, o.pickup_time, o.buyer_email AS order_email, c.buyer_email AS cart_email,
              a.name AS producer_name
       FROM orders o INNER JOIN agents a ON a.id = o.agent_id LEFT JOIN carts c ON c.id = o.cart_id
       WHERE o.id = ?
     `).get(orderId) as
-      | { id: string; agent_id: string; buyer_ref: string; total_nok: number | null; cancel_reason: string | null; pickup_time: string | null; order_email: string | null; cart_email: string | null; producer_name: string }
+      | { id: string; agent_id: string; buyer_ref: string; total_nok: number | null; cancel_reason: string | null; cancel_detail: string | null; pickup_time: string | null; order_email: string | null; cart_email: string | null; producer_name: string }
       | undefined;
     if (!o) return;
     const to = plausibleEmail(o.order_email) ?? plausibleEmail(o.cart_email);
@@ -318,6 +346,10 @@ export async function sendBuyerOrderReceipt(orderId: string, event: ReceiptEvent
       autoCloseOn: isOrderAutocompleteEnabled(),
       // Fase B1: the buyer's order card, from the receipts that leave the order open.
       cardUrl: event === "submitted" || event === "confirmed" ? buyerOrderCardUrl(o.id, o.buyer_ref) : null,
+      // T12 (pakke C): the cancel detail only with its own switch on.
+      ...(isCancelDetailReceiptEnabled() ? { cancelDetail: o.cancel_detail } : {}),
+      // Tekstpakke C punkt 10: the reason of «Avslå – utsolgt» (no flag: approved text).
+      ...(event === "declined" ? { declineDetail: o.cancel_detail } : {}),
     });
     if (!rendered) return;
     const replyTo = plausibleEmail(contact.email) ?? "kontakt@rettfrabonden.com";
@@ -328,5 +360,57 @@ export async function sendBuyerOrderReceipt(orderId: string, event: ReceiptEvent
     else console.error(`[buyer-receipt] send FAILED order=${orderId} event=${event}: ${maskEmails(String(res?.error || "unknown error"))}`);
   } catch (err: any) {
     console.error(`[buyer-receipt] FAILED order=${orderId} event=${event}: ${maskEmails(String(err?.message || err))}`);
+  }
+}
+
+/**
+ * Fase B2 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-kjoperagent):
+ * the buyer is told that the producer answered in the order's message
+ * thread, with the text and a link to the order card (/ordre/:id?ref=). Only
+ * when the order has a buyer address (the order's consented copy, else the
+ * cart's, as the receipts); none → nothing is sent. Not behind
+ * ORDER_BUYER_RECEIPTS_ENABLED: the thread has its own switch
+ * (ORDER_MESSAGES_ENABLED, checked before the message is stored). The
+ * Reply-To is the platform address (not the producer's), so a reply by
+ * e-mail never hands the producer the buyer's address. The address and the
+ * text are never logged. Fire-and-forget; never throws.
+ */
+export async function sendBuyerOrderMessageNotice(orderId: string, messageText: string): Promise<"sent" | "skipped" | "failed"> {
+  try {
+    const db = _testDb ?? getDb();
+    const o = db.prepare(`
+      SELECT o.id, o.buyer_ref, o.buyer_email AS order_email, c.buyer_email AS cart_email, a.name AS producer_name
+      FROM orders o INNER JOIN agents a ON a.id = o.agent_id LEFT JOIN carts c ON c.id = o.cart_id
+      WHERE o.id = ?
+    `).get(orderId) as
+      | { id: string; buyer_ref: string; order_email: string | null; cart_email: string | null; producer_name: string }
+      | undefined;
+    if (!o) return "skipped";
+    const to = plausibleEmail(o.order_email) ?? plausibleEmail(o.cart_email);
+    if (!to) {
+      console.log(`[buyer-message] skipped order=${orderId} reason=no_email`);
+      return "skipped";
+    }
+    if (isBlocked({ email: to }).blocked) {
+      console.log(`[buyer-message] skipped order=${orderId} reason=suppressed`);
+      return "skipped";
+    }
+    const orderRef = o.id.slice(0, 8);
+    const quoted = messageText.split("\n").map((l) => `> ${l}`).join("\n");
+    const text =
+      `Hei!\n\n${o.producer_name} har svart på bestillingen din (bestilling ${orderRef}):\n\n${quoted}\n\n` +
+      `Se bestillingen og svar: ${buyerOrderCardUrl(o.id, o.buyer_ref)}\n\n` +
+      `Ikke svar på denne e-posten. Svaret ditt kommer fram når du skriver det på bestillingssiden.\n\nHilsen\nRett fra Bonden`;
+    const send: SendFn = _sendOverride ?? ((opts) => emailService.sendEmail(opts));
+    const res = await send({
+      to, subject: `Ny melding om bestillingen din (${orderRef})`, textContent: text,
+      replyTo: "kontakt@rettfrabonden.com", redactRecipientInLogs: true, omitAgentHeader: true,
+    });
+    if (res?.success) { console.log(`[buyer-message] sent order=${orderId}`); return "sent"; }
+    console.error(`[buyer-message] send FAILED order=${orderId}: ${maskEmails(String(res?.error || "unknown error"))}`);
+    return "failed";
+  } catch (err: any) {
+    console.error(`[buyer-message] FAILED order=${orderId}: ${maskEmails(String(err?.message || err))}`);
+    return "failed";
   }
 }

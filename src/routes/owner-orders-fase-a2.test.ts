@@ -250,7 +250,7 @@ export async function runOwnerOrdersFaseA2Tests(opts: { log?: boolean } = {}): P
       assertTrue(ev.length === 1 && ev[0].to_status === "confirmed" && ev[0].actor_role === "seller" && ev[0].channel === "owner_portal", "prg-05: ONE order_events row, role seller, channel owner_portal");
       const page = await req("GET", r.location!.replace(/#.*/, ""), { headers: { Cookie: COOKIE_A } });
       const m = new RegExp(`<details class="mo-row" id="o-${pOld}" open>`).test(page.text);
-      assertTrue(m && page.text.includes("Ordren er bekreftet."), "prg-06: the GET after the redirect shows the same row unfolded and a confirmation");
+      assertTrue(m && page.text.includes("Bestillingen er bekreftet."), "prg-06: the GET after the redirect shows the same row unfolded and a confirmation");
       // Same form key twice → one transition.
       const again = await req("POST", A(`/${pOld}`), { headers: { Cookie: COOKIE_A }, form: { action: "confirm", idem: "prg-key-0001" } });
       await settle();
@@ -300,7 +300,7 @@ export async function runOwnerOrdersFaseA2Tests(opts: { log?: boolean } = {}): P
       assertTrue(v.text.includes("Token Kunde Ett") && v.text.includes(`id="o-${t1}" open`) && v.text.includes('value="confirm"'), "ac4-02: shows that order, unfolded, with Bekreft/Avslå");
       assertTrue(!v.text.includes("Token Kunde To") && !v.text.includes(t2) && !v.text.includes("Eldst Kunde") && !v.text.includes("Gård B2"), "ac4-03: no data about any other order");
       assertTrue(!v.setCookie, "ac4-04: the token view sets no cookie (no session is created)");
-      assertTrue(v.text.includes('href="/eier/ag-a2/ordrer">Se alle ordrene dine'), "ac4-05: «Se alle ordrene dine» links to the login-protected list");
+      assertTrue(v.text.includes('href="/eier/ag-a2/ordrer">Se alle bestillingene dine'), "ac4-05: «Se alle bestillingene dine» links to the login-protected list");
       // The token gives no access to the portal or the list.
       const list = await req("GET", A("?tab=venter"), { headers: { Cookie: `rfb_owner_session=ctok_${t1}` } });
       assertEq(list.status, 302, "ac4-06: the token is no portal session (list → login)");
@@ -315,11 +315,22 @@ export async function runOwnerOrdersFaseA2Tests(opts: { log?: boolean } = {}): P
       const e1 = events(t1);
       assertTrue(e1.length === 1 && e1[0].actor_role === "seller" && e1[0].channel === "producer_page", "ac4-11: event: seller via producer_page");
       const done = await req("GET", `${K(t1)}?done=confirmed`);
-      assertTrue(done.text.includes("Ordren er bekreftet.") && done.text.includes("mo-ok\">Bekreftet"), "ac4-12: the view shows the new status after the redirect");
+      assertTrue(done.text.includes("Bestillingen er bekreftet.") && done.text.includes("mo-ok\">Bekreftet"), "ac4-12: the view shows the new status after the redirect");
       const tokenOnList = await req("POST", `/eier/ag-a2/ordrer/${t2}`, { headers: { Cookie: `rfb_owner_session=ctok_${t1}` }, form: { action: "confirm" } });
       assertTrue(tokenOnList.status === 302 && row(t2).status === "pending", "ac4-13: the token cannot act on other orders through the portal route");
       const csx = await req("POST", K(t2), { headers: { Origin: "https://evil.example" }, form: { action: "decline" } });
       assertTrue(csx.status === 403 && row(t2).status === "pending", "ac4-14: cross-site post to the token view → 403");
+      assertTrue(csx.text.includes("Kunne ikke lagre") && csx.text.includes(`href="${K(t2)}">Tilbake til ordren</a>`) && csx.text.includes("kontakt@rettfrabonden.com"), "t0a-o1: refused → «Kunne ikke lagre» with «Tilbake til ordren»");
+      const csMeta = await req("POST", K(t2), { headers: { "Sec-Fetch-Site": "cross-site" }, form: { action: "decline" } });
+      assertTrue(csMeta.status === 403 && row(t2).status === "pending" && events(t2).length === 0, "t0a-o2: Sec-Fetch-Site: cross-site without Origin → 403, zero writes");
+      const nullTok = seedOrder({ status: "pending", buyerName: "Null Origin Kunde" });
+      const nullAct = await req("POST", K(nullTok), { headers: { Origin: "null", "Sec-Fetch-Site": "same-origin" }, form: { action: "confirm", pickup_time: futureLocal(3) } });
+      await settle();
+      assertTrue(nullAct.status === 303 && row(nullTok).status === "confirmed", "t0a-o3: «Ny henteordre» button (plain form POST, Origin: null) → accepted");
+      const nullSess = seedOrder({ status: "pending", buyerName: "Null Origin Sesjon" });
+      const nullSessAct = await req("POST", A(`/${nullSess}`), { headers: { Cookie: COOKIE_A, Origin: "null" }, form: { action: "confirm", pickup_time: futureLocal(3) } });
+      await settle();
+      assertTrue(nullSessAct.status === 303 && row(nullSess).status === "confirmed", "t0a-o4: owner-session order action with Origin: null → accepted");
       // Not a mutation on GET (mail scanners prefetch links).
       await req("GET", `${K(t2)}?action=confirm`);
       assertEq(row(t2).status, "pending", "ac4-15: GET never changes an order");
@@ -362,11 +373,11 @@ export async function runOwnerOrdersFaseA2Tests(opts: { log?: boolean } = {}): P
       };
       const off = notifySvc.renderOrderNotificationEmailV2(input);
       assertTrue(off.htmlContent.includes(">Se og bekreft bestillingen</a>") && off.htmlContent.includes("/produsent/ordre/tok123/kompakt"), "mail-01: main button «Se og bekreft bestillingen» → compact per-order view");
-      assertTrue(off.htmlContent.includes("/eier/ag-a2/ordrer") && off.textContent.includes("Se alle ordrene dine (krever innlogging)"), "mail-02: «Se alle ordrene dine» → login-protected list");
+      assertTrue(off.htmlContent.includes("/eier/ag-a2/ordrer") && off.textContent.includes("Se alle bestillingene dine (krever innlogging)"), "mail-02: «Se alle bestillingene dine» → login-protected list");
       assertTrue(!off.textContent.includes("avsluttes av seg selv"), "mail-03: switch off → no promise of an automatic close");
       process.env.ORDER_AUTOCOMPLETE_ENABLED = "1";
       const on = notifySvc.renderOrderNotificationEmailV2(input);
-      assertTrue(on.textContent.includes("Du trenger bare å bekrefte eller avslå. Ordren avsluttes av seg selv etter henting.") && on.htmlContent.includes("Ordren avsluttes av seg selv etter henting."), "mail-04: switch on → the sentence is in text and html");
+      assertTrue(on.textContent.includes("Du trenger bare å bekrefte eller avslå. Bestillingen avsluttes av seg selv etter henting.") && on.htmlContent.includes("Bestillingen avsluttes av seg selv etter henting."), "mail-04: switch on → the sentence is in text and html");
       const rem = notifySvc.renderOrderNotificationEmailV2({ ...input, reminder: true });
       assertTrue(rem.htmlContent.includes("Se og bekreft bestillingen") && rem.htmlContent.includes("/kompakt") && !rem.textContent.includes("avsluttes av seg selv"), "mail-05: the reminder links to the same place, without the sentence");
       const v1 = notifySvc.renderOrderNotificationEmailV1(input);

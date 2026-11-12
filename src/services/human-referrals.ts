@@ -116,6 +116,13 @@ const AI_REFERRAL_HOSTS: Array<[string, string, string]> = [
   ["you.com", "you", "You.com"],
 ];
 
+/**
+ * The AI answer hosts above, for the profile page's landing capture
+ * (contact-ai-attribution.ts, slice 4): the browser only flags the landing,
+ * the server classifies it again through classifyAiClickSource.
+ */
+export const AI_REFERRAL_HOST_DOMAINS: readonly string[] = AI_REFERRAL_HOSTS.map(([d]) => d);
+
 const AI_LABELS: Record<string, string> = {
   chatgpt: "ChatGPT", claude: "Claude", perplexity: "Perplexity", gemini: "Gemini", copilot: "Copilot",
   mistral: "Mistral", metaai: "Meta AI", grok: "Grok", deepseek: "DeepSeek", you: "You.com", kagi: "Kagi Assistant", annenai: "Annen AI",
@@ -156,10 +163,15 @@ function utmValues(v: string | string[] | null | undefined): string[] {
 }
 
 function aiKeyFromUtmSource(v: string | string[] | null | undefined): string | null {
-  // First whitelist hit wins, so an array classifies as AI regardless of order.
+  // Any whitelist hit makes it AI, so an array classifies as AI regardless of order.
   // Exact value or the token as a domain prefix (perplexity.ai) — never a substring, so a producer's own
   // campaign («claudes-gard», «geminifarm») is not counted as an AI click.
-  for (const val of utmValues(v)) for (const [token, key] of AI_UTM_SOURCES) if (val === token || val.startsWith(token + ".")) return key;
+  // Our own mark (addAiUtmParams: a slug such as «claude», no dot) wins over one the AI app appended
+  // itself (ChatGPT's «chatgpt.com»), in either order (slice 3, double utm_source).
+  const vals = utmValues(v);
+  for (const val of [...vals.filter((x) => !x.includes(".")), ...vals.filter((x) => x.includes("."))]) {
+    for (const [token, key] of AI_UTM_SOURCES) if (val === token || val.startsWith(token + ".")) return key;
+  }
   return null;
 }
 

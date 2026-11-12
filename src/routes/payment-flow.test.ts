@@ -269,7 +269,7 @@ export async function runPaymentFlowTests(opts: { log?: boolean } = {}): Promise
     eq(r.status, 201, "F1-01: submit with payments off → 201");
     ok(!("payments" in r.body) && r.body.orders.every((o: any) => !("payment_mode" in o)), "F1-02: response shape unchanged (no payments, no payment_mode)");
     eq(sentTo("betal@example.no").length, 1, "F1-03: producer notified at once as before");
-    ok(sent[0]!.textContent.includes("Ingen betaling skjer via plattformen"), "F1-04: notification text unchanged");
+    ok(sent[0]!.textContent.includes("Kunden betaler deg når varene hentes. Rett fra Bonden tar ikke betalt."), "F1-04: notification text unchanged (tekstpakke C payment line)");
     eq(count("checkout.create"), 0, "F1-05: Stripe never called");
 
     // ── F2. submit with payments on ────────────────────────────────────────
@@ -387,7 +387,7 @@ export async function runPaymentFlowTests(opts: { log?: boolean } = {}): Promise
     fake.setFailCreate(false);
     oid = r.body.orders[0].order_id;
     ok(r.status === 201 && r.body.payments.length === 0 && r.body.orders[0].payment_mode === "at_pickup", "F8-01: Stripe down → submit still succeeds, pay at pickup");
-    ok(sentTo("betal@example.no").length === 1 && sentTo("betal@example.no")[0]!.textContent.includes("Ingen betaling skjer via plattformen"), "F8-02: producer notified at once with the normal text");
+    ok(sentTo("betal@example.no").length === 1 && sentTo("betal@example.no")[0]!.textContent.includes("Kunden betaler deg når varene hentes. Rett fra Bonden tar ikke betalt."), "F8-02: producer notified at once with the normal text");
     eq((db.prepare(`SELECT COUNT(*) AS n FROM payment_events WHERE type = 'checkout_create_failed'`).get() as any).n, 1, "F8-03: failure logged");
 
     // ── F9. no link: pay_at_pickup, unpriced line, below minimum ───────────
@@ -743,7 +743,7 @@ export async function runPaymentFlowTests(opts: { log?: boolean } = {}): Promise
     r = await req("POST", `/produsent/ordre/${tokenOf(kOid)}`, { form: { action: "confirm" } });
     await settle();
     const conf = receiptsTo(kOid)[0];
-    ok(!!conf && conf.to === "kari@example.no" && conf.replyTo === "gard@example.no" && conf.subject.startsWith("Ordrebekreftelse fra Betal Gård"),
+    ok(!!conf && conf.to === "kari@example.no" && conf.replyTo === "gard@example.no" && conf.subject.startsWith("Bestillingen er bekreftet av Betal Gård"),
       "F17-06: confirmation receipt to the buyer, Reply-To the producer");
     ok(!!conf && conf.textContent!.includes("Kjøpet er dermed bindende") && conf.textContent!.includes("Du har betalt 120 kr på forhånd") && conf.textContent!.includes("/kjopsvilkar")
       && conf.textContent!.includes("Telefon: +47 400 00 000") && conf.textContent!.includes("Adresse: Gårdsveien 1") && conf.textContent!.includes("AGENTPLATFORM.NO AS"),

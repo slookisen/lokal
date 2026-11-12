@@ -37,6 +37,9 @@ import { KJOPSVILKAR_PATH } from "./rfb-kjopsvilkar";
 import { BETALING_PATH } from "./rfb-betaling";
 import { isPaymentsEnabled } from "../services/payment-service";
 import { serializeJsonForScript } from "../services/safe-script-json";
+import { isOrderCapNoticeEnabled, isOrderCapV2Enabled, orderCapBuyerNotice } from "../services/order-cap-notice";
+import { buyerOrderCapNotice } from "../owner-features/order-texts";
+import { stockSoftExpiryBuyerTemplate, stockSoftExpiryEnabled } from "../services/stock-soft-expiry";
 import type { Offer } from "../services/catalog-offers";
 
 export function isHandelisteEnabled(): boolean {
@@ -377,6 +380,11 @@ const CLIENT_SCRIPT = `
   // mark, shown before submit. Text only (textContent), whatever the data holds.
   function foodNodes(o){
     var out = [];
+    // B2b-1 (soft stock expiry): the date the producer last confirmed the row, and that the producer confirms the order.
+    if (o.needs_producer_confirmation === true && C.__stock_soft && typeof o.stock_confirmed_at === 'string') {
+      var sd = new Date(o.stock_confirmed_at);
+      if (!isNaN(sd.getTime())) out.push(mk('div', { cls: 'hl-meta hl-stock-soft', text: String(C.__stock_soft).replace('{date}', sd.toLocaleDateString('nb-NO', { timeZone: 'Europe/Oslo', day: '2-digit', month: '2-digit', year: 'numeric' })) }));
+    }
     if (o.producer_confirmed === true) out.push(mk('div', { cls: 'hl-meta', text: C.producer_confirmed }));
     var f = o.food_info;
     if (f && typeof f === 'object') {
@@ -600,6 +608,9 @@ const CLIENT_SCRIPT = `
       box.appendChild(mk('p', { cls: 'hl-hint', text: C.contact_p }));
       res.handoffs.forEach(function(h){
         var card = mk('div', { cls: 'hl-handoff' }, [mk('strong', { text: String(h.name || '') })]);
+        // B4: a spam cap turned this producer's order into a contact request (flag on only).
+        var capT = h.cap_reason === 'producer_daily_cap' ? C.__cap_daily : (h.cap_reason === 'buyer_open_cap' ? C.__cap_open : null);
+        if (capT && h.cap_reached === true) card.appendChild(mk('div', { cls: 'hl-msg', text: String(capT).split('{cap}').join(String(Number(h.cap) || '')) }));
         var links = mk('div', { cls: 'hl-meta' });
         var tel = telHref(h.phone);
         if (tel) links.appendChild(mk('a', { href: tel, text: C.call + ' ' + String(h.phone) }));
@@ -719,7 +730,24 @@ export function buildHandelistePage(lang: Lang, preselect?: HandelistePreselect 
   const pre = preselect && preselect.offers.length > 0
     ? { __preselect: { producer_name: preselect.producer_name, offers: preselect.offers.slice(0, HANDELISTE_MAX_ITEMS) }, __preselect_note: PRESELECT_NOTE[lang === "en" ? "en" : "no"] }
     : {};
-  const copy = { ...c, ...payHow, __lang: lang, __max_items: HANDELISTE_MAX_ITEMS, __initial: HANDELISTE_OFFERS_INITIAL, ...pre };
+  // B4: the buyer's daily-cap text (the same function as the API's cap_notice),
+  // only with ORDER_CAP_NOTICE_ENABLED on — off, the copy is unchanged.
+  const capV2 = isOrderCapNoticeEnabled() && isOrderCapV2Enabled();
+  const capLang = lang === "en" ? "en" : "no";
+  const capCopy = capV2
+    ? {
+      __cap_v2: {
+        platform_ceiling: buyerOrderCapNotice("platform_ceiling", "{cap}", capLang),
+        buyer_open_cap: buyerOrderCapNotice("buyer_open_cap", "{cap}", capLang),
+        buyer_daily_cap: buyerOrderCapNotice("buyer_daily_cap", "{cap}", capLang),
+      },
+    }
+    : isOrderCapNoticeEnabled()
+    ? { __cap_daily: orderCapBuyerNotice("producer_daily_cap", "{cap}", lang === "en" ? "en" : "no"), __cap_open: orderCapBuyerNotice("buyer_open_cap", "{cap}", lang === "en" ? "en" : "no") }
+    : {};
+  // B2b-1: the soft-expiry buyer text, only with STOCK_SOFT_EXPIRY_ENABLED on — off, the copy is unchanged.
+  const softCopy = stockSoftExpiryEnabled() ? { __stock_soft: stockSoftExpiryBuyerTemplate(lang === "en" ? "en" : "no") } : {};
+  const copy = { ...c, ...payHow, ...capCopy, ...softCopy, __lang: lang, __max_items: HANDELISTE_MAX_ITEMS, __initial: HANDELISTE_OFFERS_INITIAL, ...pre };
   const e = escapeText;
   const content = `
   <main class="hl-wrap">
@@ -772,10 +800,17 @@ export function buildHandelistePage(lang: Lang, preselect?: HandelistePreselect 
       </section>
     </form>
     <script type="application/json" id="hl-copy">${serializeJsonForScript(copy)}</script>
-    <script>${CLIENT_SCRIPT}</script>
+    <script>${capV2 ? HANDELISTE_CLIENT_SCRIPT_CAP_V2 : CLIENT_SCRIPT}</script>
   </main>`;
   return { title: c.title, description: c.description, content, extraCss: HANDELISTE_CSS };
 }
 
 /** Exposed for tests (syntax check + endpoint-contract assertions). */
 export const HANDELISTE_CLIENT_SCRIPT = CLIENT_SCRIPT;
+
+// T11 (ORDER_CAP_V2_ENABLED + ORDER_CAP_NOTICE_ENABLED): the handoff card also
+// knows the v2 cap_reason values. Only this one line differs, and only the v2
+// page serves it — off, the page carries CLIENT_SCRIPT byte for byte.
+const CAP_LINE_V1 = "var capT = h.cap_reason === 'producer_daily_cap' ? C.__cap_daily : (h.cap_reason === 'buyer_open_cap' ? C.__cap_open : null);";
+const CAP_LINE_V2 = "var capT = (C.__cap_v2 && C.__cap_v2[h.cap_reason]) || null;";
+export const HANDELISTE_CLIENT_SCRIPT_CAP_V2 = CLIENT_SCRIPT.replace(CAP_LINE_V1, CAP_LINE_V2);

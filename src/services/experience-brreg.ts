@@ -111,6 +111,14 @@ const norm = (s: string): string =>
     .replace(/\s+/g, " ")
     .trim();
 
+/**
+ * The name-match threshold of the Brreg enrichment accept gate
+ * (classifyProvider below). Exported so the gårdssalg self-registration Brreg
+ * gate and duplicate check (services/gardssalg-self-register.ts) use the same
+ * number instead of a copy.
+ */
+export const BRREG_NAME_SIMILARITY_MIN = 0.6;
+
 export function nameSimilarity(a: string, b: string): number {
   const A = new Set(norm(a).split(" ").filter(Boolean));
   const B = new Set(norm(b).split(" ").filter(Boolean));
@@ -201,7 +209,7 @@ export async function classifyProvider(
       !e.forretningsadresse?.kommune ||
       norm(provider.kommune) === norm(e.forretningsadresse.kommune);
     // Accept gate: strong name match AND plausible NACE (kommune is a tiebreaker).
-    const score = (sim >= 0.6 ? sim : 0) * (naceOk(nace) ? 1 : 0.2) * (kommuneOk ? 1 : 0.7);
+    const score = (sim >= BRREG_NAME_SIMILARITY_MIN ? sim : 0) * (naceOk(nace) ? 1 : 0.2) * (kommuneOk ? 1 : 0.7);
     if (score > bestScore) {
       bestScore = score;
       best = { e, sim, nace, kommuneOk };
@@ -213,7 +221,7 @@ export async function classifyProvider(
   // provider's — kommune failed to disambiguate, so accepting the top hit
   // risks attaching data (phone/email/description) from the WRONG entity.
   // Refuse to guess: fall through to `unverified` instead of force-matching.
-  const collisionCandidates = candidates.filter((c) => nameSimilarity(provider.name, c.navn || "") >= 0.6);
+  const collisionCandidates = candidates.filter((c) => nameSimilarity(provider.name, c.navn || "") >= BRREG_NAME_SIMILARITY_MIN);
   if (collisionCandidates.length >= 2 && best && best.kommuneOk === false) {
     return {
       provider_name: provider.name,
@@ -229,7 +237,7 @@ export async function classifyProvider(
     };
   }
 
-  if (best && best.sim >= 0.6 && naceOk(best.nace)) {
+  if (best && best.sim >= BRREG_NAME_SIMILARITY_MIN && naceOk(best.nace)) {
     const active = isActive(best.e);
     return {
       provider_name: provider.name,

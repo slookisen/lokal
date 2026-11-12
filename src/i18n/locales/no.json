@@ -10,10 +10,11 @@
     "lang_en": "English",
     "lang_sv": "Svenska",
     "home": "Hjem",
-    "back_home": "Tilbake til forsiden"
+    "back_home": "Tilbake til forsiden",
+    "menu": "Meny"
   },
   "footer": {
-    "tagline": "Norges første agent-til-agent (A2A) nettverk for lokal mat. Vi gjør matprodusenter synlige for AI-assistenter — så kundene finner deg når de spør.",
+    "tagline": "Norges første agent-til-agent (A2A) nettverk for lokal mat. Vi gjør matprodusenter synlige for AI-assistenter — så kundene kan finne deg når de spør.",
     "platform": "Plattformen",
     "search_producers": "Søk produsenter",
     "how_it_works": "Hvordan det fungerer",
@@ -92,7 +93,7 @@
     "title": "Om Rett fra Bonden — Lokal mat i Norge",
     "description": "Rett fra Bonden er Norges første agent-til-agent nettverk for lokal mat. Les om vår misjon, hvordan plattformen fungerer, og hvem vi er.",
     "page_title": "Om Rett fra Bonden",
-    "intro": "Rett fra Bonden er en plattform som gjør norske matprodusenter synlige for AI-assistenter — slik at kundene finner deg når de spør sin AI om lokal mat.",
+    "intro": "Rett fra Bonden er en plattform som gjør norske matprodusenter synlige for AI-assistenter — slik at kundene kan finne deg når de spør sin AI om lokal mat.",
     "mission_title": "Vår misjon",
     "mission_body": "Vi vil at flere skal kjøpe mat direkte fra norske gårder, markeder og lokale produsenter. Når AI-assistenter blir hovedinngangen til informasjon, må også lokal mat være synlig der.",
     "story_title": "Historien",
@@ -149,7 +150,7 @@
     "download_vcard": "Last ned kontaktkort",
     "updated_prefix": "Profil oppdatert:",
     "badge_brreg": "Registrert i Brønnøysund",
-    "badge_organic": "Økologisk",
+    "badge_organic": "Debio-godkjent",
     "no_contact": "Ingen kontaktinfo tilgjengelig ennå.",
     "affiliations": "Tilknytninger",
     "season": "Sesongkalender",
@@ -167,7 +168,13 @@
     "season_note_nb": "Notat på norsk",
     "rating_on_source": "på {source}",
     "rating_count_on_source": "{count} anmeldelser på {source}",
-    "rating_count_on_source_one": "{count} anmeldelse på {source}"
+    "rating_count_on_source_one": "{count} anmeldelse på {source}",
+    "products_prices_fetched": "Priser hentet fra {host} {date}",
+    "products_auto_updated": "Oppdatert automatisk fra {host} {date}",
+    "products_confirmed_by_owner": "bekreftet av eier",
+    "products_updated_by_owner": "Oppdatert av eier {date}",
+    "products_price_caveat": "Prisene kan ha endret seg, sjekk med produsenten.",
+    "updated_by_owner": "Oppdatert av eier"
   },
   "common": {
     "see_profile": "Se profil →",

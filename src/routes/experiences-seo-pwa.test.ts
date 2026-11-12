@@ -204,7 +204,7 @@ export function runExperiencesSeoPwaTests(opts: { log?: boolean } = {}): Promise
       // ── (c) sw.js / install-prompt.js / offline.html ───────────────────
       const sw = await callRoute(seoRouter, "/sw.js");
       assertTrue(sw.handled && sw.status === 200, `c1: GET /sw.js renders 200 (got ${sw.status})`);
-      assertTrue(sw.body.includes("opplevagent-pwa-v1"), "c2: served sw.js body carries the opplevagent CACHE_VERSION");
+      assertTrue(sw.body.includes("opplevagent-pwa-v2"), "c2: served sw.js body carries the opplevagent CACHE_VERSION");
 
       const ip = await callRoute(seoRouter, "/install-prompt.js");
       assertTrue(ip.handled && ip.status === 200, `c3: GET /install-prompt.js renders 200 (got ${ip.status})`);

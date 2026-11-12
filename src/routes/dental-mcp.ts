@@ -13,6 +13,7 @@
 
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
@@ -28,6 +29,7 @@ import {
   listSpecialistsForClinic,
 } from "../services/dental-store";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
+import { isHiddenImportRow } from "../services/dental-import-display";
 import {
   isDentalQueryParserDisabled,
   parseDentalQuery,
@@ -42,6 +44,7 @@ import type { PlaceGazetteer } from "../services/search-intent/norwegian-query";
 import { capFreeText, capName } from "../utils/free-text";
 import { getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
+import { tagMcpToolResults } from "../middleware/ai-profile-links";
 import { toDentalClinicCard, type DentalSearchCard } from "../services/dental-clinic-card";
 import { DENTAL_EMERGENCY_NOTICE } from "../config/dental-landing";
 
@@ -51,6 +54,8 @@ import { companyFooterLineHtml } from "../services/company-legal";
 import { BRAND_ENTITIES, brandMcpIcons } from "../config/brand-entities";
 import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
 import { MCP_MAX_TOOL_INPUT_ELEMENTS } from "../services/mcp-input-limits";
+import { emailRevealGuardEnabled, revealEmailFor } from "../services/email-reveal-guard";
+import { dentalContactFormOnlyIds } from "../services/dental-contact-form-only";
 
 const router = Router();
 
@@ -262,6 +267,10 @@ function toolInternalError(tool: string, err: unknown) {
 // ─── Tool registrations ──────────────────────────────────────
 
 export function registerDentalTools(server: McpServer): void {
+  // «Klikk fra AI-svar» slice 3: clinic profile links in every tool result
+  // are tagged for AI (utm_medium=mcp) here, never in clinicProfileUrl.
+  tagMcpToolResults(server);
+
   // «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil, S2): the
   // clinics a data tool hands the caller, counted with the same rules as rfb
   // (profile-ai-deliveries.ts recordMcpDelivery).
@@ -297,7 +306,7 @@ export function registerDentalTools(server: McpServer): void {
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
-        openWorldHint: true,
+        openWorldHint: false,
       },
     },
     async ({ query, fylke: fylkeAsSent, spesialitet, helfo, akutt, limit }, extra) => {
@@ -364,7 +373,7 @@ export function registerDentalTools(server: McpServer): void {
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
-        openWorldHint: true,
+        openWorldHint: false,
       },
     },
     async ({ org_nr, id }, extra) => {
@@ -383,7 +392,9 @@ export function registerDentalTools(server: McpServer): void {
           : null;
 
         // The synthetic schema-probe row (org_nr 999999999) is not a clinic.
-        if (!agent || isDentalSyntheticProbeId(agent.id)) {
+        // F2-S10: nor is a row the May 2026 directory import added on its own
+        // public (no org.nr., so only an id lookup can reach it).
+        if (!agent || isDentalSyntheticProbeId(agent.id) || isHiddenImportRow(agent)) {
           return {
             content: [{ type: "text" as const, text: "Klinikk ikke funnet." }],
             isError: true,
@@ -393,7 +404,10 @@ export function registerDentalTools(server: McpServer): void {
         // The detail card: the keys this tool has always returned, with the
         // phone, acute_vakt (only with «Akuttvakt», F1-S4c) and profile-link
         // rules of the search card.
-        const result = toDentalClinicCard(agent, "detail", { specialists: listSpecialistsForClinic(agent.id) });
+        const card = toDentalClinicCard(agent, "detail", { specialists: listSpecialistsForClinic(agent.id) });
+        // S-D3a: a contact-form-only clinic (CONTACT_FORM_DENTAL on) has epost
+        // null, as a clinic without e-mail, and is not counted by the guard.
+        const result = card.epost && (dentalContactFormOnlyIds([agent.id])?.has(agent.id) === true || !dentalMcpEmailAllowed(agent.id)) ? { ...card, epost: null } : card;
 
         deliver("tannlege_info", { org_nr, id }, extra, [agent.id]);
         return {
@@ -469,7 +483,7 @@ export function registerDentalTools(server: McpServer): void {
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
-        openWorldHint: true,
+        openWorldHint: false,
       },
     },
     async ({ fylke: fylkeAsSent }) => {
@@ -545,6 +559,24 @@ export function registerDentalTools(server: McpServer): void {
       }
     }
   );
+}
+
+// ─── E-mail reveal guard (dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting, S-A5) ──
+// tannlege_info shares the dental counter of the REST, A2A and profile-page
+// answers (services/email-reveal-guard.ts). The tool handler runs inside the
+// POST handler's transport.handleRequest, so the Express request (req.ip, the
+// app's one trusted client IP, and the User-Agent) reaches it through this
+// store. Switch off → revealEmailFor is null and the card is unchanged. Switch
+// on with no request in reach (not over HTTP) → fail closed, as for no IP.
+const dentalMcpRequestStore = new AsyncLocalStorage<Request>();
+
+/** Whether this request may see clinic `id`'s e-mail (true when the switch is off). */
+function dentalMcpEmailAllowed(id: string): boolean {
+  if (!emailRevealGuardEnabled("dental")) return true;
+  const req = dentalMcpRequestStore.getStore();
+  if (!req) return false;
+  const allowed = revealEmailFor(req, "dental", [id]);
+  return allowed === null || allowed.has(id);
 }
 
 // ─── Session management ──────────────────────────────────────
@@ -652,7 +684,7 @@ router.post(["/", "/mcp"], async (req: Request, res: Response) => {
       sendMcpSessionNotFound(res);
       return;
     }
-    await result.session.transport.handleRequest(req, res, req.body);
+    await dentalMcpRequestStore.run(req, () => result.session.transport.handleRequest(req, res, req.body));
   } catch (err: any) {
     console.error("[dental-mcp] POST error:", err.message);
     if (!res.headersSent) {

@@ -46,6 +46,12 @@ import { Router, Request, Response } from "express";
 import { runDebioCrossCheck, DEFAULT_SINCE_ISO, DebioSource } from "../services/debio-cross-check";
 import { syncDebioVerifications } from "../services/debio-verification-service";
 import { startJob } from "../services/job-tracker";
+import { syncDebioRegister, listMatchReview, decideMatchReview, manualDebioLink } from "../services/debio-register-sync";
+import { buildOrganicClaimsSummary } from "../services/organic-claims-summary";
+import { getDb } from "../database/init";
+import { fetchDebioCertificateDetail, normalizeCertDetail, describeShape } from "../services/debio-cert-detail-client";
+import { fetchDebioRegister, type DebioRegisterRow } from "../services/debio-register-client";
+import { syncDebioCertDetails, debioCertDetailSyncEnabled, certDetailStatus } from "../services/debio-cert-detail-sync";
 
 const router = Router();
 
@@ -187,6 +193,279 @@ router.post("/sync", async (req: Request, res: Response) => {
       error: "Debio sync failed",
       detail: err?.message || String(err),
     });
+  }
+});
+
+// ─── Økologi S1: Debio full-register sync + match review ─────────────
+// A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
+// tekstrevisjon, slice S1 (services/debio-register-sync.ts).
+//
+// POST /admin/debio/register-sync   body { dry_run?: boolean } (default true)
+//   Fetches the register, matches, and returns the counts (rows fetched /
+//   normalized / rejected, matches per method, review candidates, would-
+//   reset). dry_run:false writes. Runs regardless of RFB_DEBIO_REGISTER_SYNC
+//   (manual ops); the daily scheduler runs only with the flag on.
+router.post("/register-sync", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const dryRun = req.body?.dry_run !== false;
+  try {
+    const result = await syncDebioRegister(getDb(), { dryRun });
+    res.json({ success: result.accepted, ...result });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: "Debio register sync failed", detail: err?.message || String(err) });
+  }
+});
+
+// GET /admin/debio/match-review?state=pending|approved|rejected|all
+//   Candidates below the sure threshold: the agent side, the Debio sid,
+//   org.nr., status, validity, product groups, postal code, city, method,
+//   score and reason codes — no Debio person names.
+router.get("/match-review", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const raw = String(req.query?.state ?? "pending");
+  const state = (["pending", "approved", "rejected", "all"].includes(raw) ? raw : "pending") as "pending" | "approved" | "rejected" | "all";
+  const items = listMatchReview(getDb(), state);
+  res.json({ success: true, state, count: items.length, items });
+});
+
+// GET /admin/debio/organic-claims-summary   (økologi S3f)
+//   Read-only daily count of organic claim words on active RFB producer
+//   profiles, per Debio status (okologisk|karens|annet|ingen|ukjent), plus
+//   unverified profiles with hits (alert when > 0) and a sample (max 50).
+//   Writes nothing. See services/organic-claims-summary.ts.
+router.get("/organic-claims-summary", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    res.json({ success: true, ...buildOrganicClaimsSummary(getDb()) });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: "organic claims summary failed", detail: err?.message || String(err) });
+  }
+});
+
+// POST /admin/debio/match-review/manual
+//   body { agent_id, debio_sid, reason, apply? }   (økologi S1d)
+//   Links a producer to a register entry the sync never proposed. Dry run
+//   unless apply is literally true. The candidate is built the way the sync
+//   builds one (match_method 'manual', reasons ["manual: <reason>"]) and
+//   approved through the same path as POST /match-review/:id. Missing field →
+//   400; unknown agent or sid → 404; not an active producer → 409; register
+//   unavailable / too few rows → 502. Registered before /match-review/:id.
+let manualLinkFetch: typeof fetch | undefined;
+/** Tests only: the register fetch used by POST /match-review/manual (undefined = real fetch). */
+export function __setManualLinkFetchForTesting(f: typeof fetch | undefined): void {
+  manualLinkFetch = f;
+}
+
+router.post("/match-review/manual", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const out = await manualDebioLink(getDb(), req.body ?? {}, { fetchImpl: manualLinkFetch });
+    if (!out.ok) { res.status(out.http).json({ success: false, error: out.error, ...(out.detail ? { detail: out.detail } : {}) }); return; }
+    const { ok: _ok, ...rest } = out;
+    res.json({ success: true, ...rest });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: "manual Debio link failed", detail: err?.message || String(err) });
+  }
+});
+
+// POST /admin/debio/match-review/:id   body { action: "approve" | "reject" }
+//   approve → the agent gets the candidate's status (never automatic);
+//   reject → the candidate is never proposed again for that agent.
+router.post("/match-review/:id", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const id = Number(req.params.id);
+  const action = req.body?.action;
+  if (!Number.isInteger(id) || id <= 0) { res.status(400).json({ success: false, error: "invalid id" }); return; }
+  if (action !== "approve" && action !== "reject") { res.status(400).json({ success: false, error: "action must be approve or reject" }); return; }
+  const out = decideMatchReview(getDb(), id, action);
+  if (!out) { res.status(404).json({ success: false, error: "review row not found" }); return; }
+  res.json({ success: true, ...out });
+});
+
+// ─── Økologi S4a: Debio certificate-detail probe (read-only) ─────────
+// POST /admin/debio/cert-detail-probe
+//   body { enquiryOrigSid: <positive integer> }   (S4a)
+//     | { registerSid: "<1–12 digits>" }          (S4a-2)
+//   Exactly one of the two; both, neither or an invalid value → 400.
+//   Calls Debio's getcertificatedetail once and returns the response SHAPE
+//   (key paths + types, no values) plus what normalizeCertDetail() makes of
+//   it: { ok, reason?, shape, recognized, line_count, lines (≤ 50; per line
+//   statusCode, organic, label_present, label_length, status_text_present —
+//   no free-text values while the real shape is unknown), status_counts,
+//   certificate_url }. Captures the real shape from
+//   prod before S4b stores anything. No database access at all; no Debio
+//   person name / street in the response (S1.6).
+//
+//   S4a-2: the register entity sid is NOT what getcertificatedetail takes
+//   (it returned an empty shell). With `registerSid` the route fetches the
+//   register once (fetchDebioRegister), takes the normalized row whose `sid`
+//   equals it and probes with its first `enquiryOrigSids` entry (a
+//   certificate valid now, latest `to` first). Register fetch failed →
+//   ok:false, reason "register_http_<n>" | "register_invalid_json" |
+//   "register_fetch_failed: <cause>" (never a response body); no such row →
+//   "register_sid_not_found"; the row has no enquiryOrigSid →
+//   "no_enquiry_orig_sid" (all with the same empty fields as a detail
+//   failure). Otherwise the S4a response plus enquiry_orig_sid_used and
+//   enquiry_orig_sid_count (also on a detail failure). The enquiryOrigSid
+//   path is unchanged.
+const CERT_PROBE_MAX_LINES = 50;
+const CERT_PROBE_REASON_MAX_CHARS = 300;
+let certDetailFetch: typeof fetch | undefined;
+/** Tests only: the fetch used by POST /cert-detail-probe (undefined = real transport). */
+export function __setCertDetailFetchForTesting(f: typeof fetch | undefined): void {
+  certDetailFetch = f;
+}
+let certProbeRegisterFetch: typeof fetch | undefined;
+/** Tests only: the register fetch used by POST /cert-detail-probe with registerSid (undefined = real transport). */
+export function __setCertProbeRegisterFetchForTesting(f: typeof fetch | undefined): void {
+  certProbeRegisterFetch = f;
+}
+
+const certProbeFailure = (reason: string) =>
+  ({ ok: false, reason, shape: [] as string[], recognized: false, line_count: 0, lines: [] as unknown[], status_counts: {}, certificate_url: null });
+
+/** A register fetch error → a reason without any response body (it could carry personal data). */
+function registerFailureReason(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  const http = /^debio register HTTP (\d+)/.exec(msg);
+  if (http) return `register_http_${http[1]}`;
+  if (/^debio register JSON parse failed/.test(msg)) return "register_invalid_json";
+  return `register_fetch_failed: ${msg}`.slice(0, CERT_PROBE_REASON_MAX_CHARS);
+}
+
+async function certDetailProbe(sid: number): Promise<Record<string, unknown>> {
+  const fetched = await fetchDebioCertificateDetail(sid, { fetchImpl: certDetailFetch });
+  if (!fetched.ok) return certProbeFailure(fetched.reason);
+  const norm = normalizeCertDetail(fetched.raw);
+  const statusCounts: Record<string, number> = {};
+  for (const l of norm.lines) {
+    const k = l.statusCode === null ? "none" : String(l.statusCode);
+    statusCounts[k] = (statusCounts[k] ?? 0) + 1;
+  }
+  const lines = norm.lines.slice(0, CERT_PROBE_MAX_LINES).map((l) => ({
+    statusCode: l.statusCode,
+    organic: l.organic,
+    label_present: l.label !== null,
+    label_length: l.label === null ? 0 : l.label.length,
+    status_text_present: l.statusText !== null,
+  }));
+  return {
+    ok: true,
+    shape: describeShape(fetched.raw),
+    recognized: norm.recognized,
+    line_count: norm.lines.length,
+    lines,
+    status_counts: statusCounts,
+    certificate_url: norm.certificateUrl,
+  };
+}
+
+router.post("/cert-detail-probe", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const hasSid = Object.prototype.hasOwnProperty.call(body, "enquiryOrigSid");
+  const hasRegisterSid = Object.prototype.hasOwnProperty.call(body, "registerSid");
+  if (hasSid && hasRegisterSid) {
+    res.status(400).json({ success: false, error: "give exactly one of enquiryOrigSid or registerSid" });
+    return;
+  }
+  if (hasRegisterSid) {
+    const registerSid = body.registerSid;
+    if (typeof registerSid !== "string" || !/^\d{1,12}$/.test(registerSid)) {
+      res.status(400).json({ success: false, error: "registerSid must be a string of 1–12 digits" });
+      return;
+    }
+    try {
+      let rows: DebioRegisterRow[];
+      try {
+        rows = (await fetchDebioRegister({ fetchImpl: certProbeRegisterFetch })).rows;
+      } catch (e) {
+        res.json(certProbeFailure(registerFailureReason(e)));
+        return;
+      }
+      const row = rows.find((r) => r.sid === registerSid);
+      if (!row) { res.json(certProbeFailure("register_sid_not_found")); return; }
+      if (row.enquiryOrigSids.length === 0) { res.json(certProbeFailure("no_enquiry_orig_sid")); return; }
+      const used = row.enquiryOrigSids[0];
+      const out = await certDetailProbe(used);
+      res.json({ ...out, enquiry_orig_sid_used: used, enquiry_orig_sid_count: row.enquiryOrigSids.length });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: "cert-detail probe failed", detail: err?.message || String(err) });
+    }
+    return;
+  }
+  const sid = req.body?.enquiryOrigSid;
+  if (typeof sid !== "number" || !Number.isSafeInteger(sid) || sid <= 0) {
+    res.status(400).json({ success: false, error: "enquiryOrigSid must be a positive integer" });
+    return;
+  }
+  try {
+    res.json(await certDetailProbe(sid));
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: "cert-detail probe failed", detail: err?.message || String(err) });
+  }
+});
+
+// ─── Økologi S4b-2: weekly certificate-detail storage ────────────────
+// POST /admin/debio/cert-detail-sync   body { dry_run?: boolean, max?: 1–50 }
+//   Runs syncDebioCertDetails() once (services/debio-cert-detail-sync.ts).
+//   dry_run defaults to TRUE: one register call, candidates / ids reported,
+//   no detail calls, no writes. dry_run:false stores into
+//   agent_debio_cert_detail only (2 s between detail calls). Runs regardless
+//   of RFB_DEBIO_CERT_DETAIL_SYNC (manual ops); the 6-hourly scheduler runs
+//   only with the flag on. Invalid dry_run / max → 400.
+// GET /admin/debio/cert-detail-status
+//   Counts and fetched_at range only — no labels, names or ids.
+let certDetailSyncFetch: typeof fetch | undefined;
+let certDetailSyncRegisterFetch: typeof fetch | undefined;
+let certDetailSyncDelayMs: number | undefined;
+let certDetailSyncNow: Date | undefined;
+/** Tests only: the detail fetch, register fetch, delay and clock used by POST /cert-detail-sync (undefined = real). */
+export function __setCertDetailSyncForTesting(o: { fetchImpl?: typeof fetch; registerFetchImpl?: typeof fetch; delayMs?: number; now?: Date } | undefined): void {
+  certDetailSyncFetch = o?.fetchImpl;
+  certDetailSyncRegisterFetch = o?.registerFetchImpl;
+  certDetailSyncDelayMs = o?.delayMs;
+  certDetailSyncNow = o?.now;
+}
+
+router.post("/cert-detail-sync", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const raw = req.body;
+  if (raw !== undefined && raw !== null && (typeof raw !== "object" || Array.isArray(raw))) {
+    res.status(400).json({ success: false, error: "body must be a JSON object" });
+    return;
+  }
+  const body = (raw ?? {}) as Record<string, unknown>;
+  if (body.dry_run !== undefined && typeof body.dry_run !== "boolean") {
+    res.status(400).json({ success: false, error: "dry_run must be a boolean" });
+    return;
+  }
+  if (body.max !== undefined && (typeof body.max !== "number" || !Number.isInteger(body.max) || body.max < 1 || body.max > 50)) {
+    res.status(400).json({ success: false, error: "max must be an integer 1–50" });
+    return;
+  }
+  const dryRun = body.dry_run !== false;
+  try {
+    const result = await syncDebioCertDetails(getDb(), {
+      dryRun,
+      maxPerRun: body.max as number | undefined,
+      fetchImpl: certDetailSyncFetch,
+      registerFetchImpl: certDetailSyncRegisterFetch,
+      delayMs: certDetailSyncDelayMs,
+      now: certDetailSyncNow,
+    });
+    res.json({ success: result.ok, ...result });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: "cert-detail sync failed", detail: err?.message || String(err) });
+  }
+});
+
+router.get("/cert-detail-status", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    res.json({ ok: true, flag_enabled: debioCertDetailSyncEnabled(), ...certDetailStatus(getDb()) });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: "cert-detail status failed", detail: err?.message || String(err) });
   }
 });
 
