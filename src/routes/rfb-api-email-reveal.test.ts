@@ -37,6 +37,12 @@
  *   M  lists: each producer with an e-mail counts on its own, in list order;
  *      200 producers read through each surface give ≤ N e-mails (N = limit)
  *   K  the owner's own /info read (X-Claim-Token) is not limited
+ *      — but a bogus token, or a valid token for another agent, is treated
+ *      like no token (review M5)
+ *   V  vcard of a producer without an e-mail: no EMAIL line, Cache-Control:
+ *      private with the switch on, no budget spent (review M10)
+ *   W  lists / cart: a producer without an e-mail listed among those with one
+ *      spends no budget (review M11)
  *   G  the guard's log lines carry no e-mail address and no IP
  *   T  S-A4 trap path /kontakt-arkiv on rettfrabonden.com: disallowed in every
  *     robots.txt group (switch on or off, same robots.txt); the hidden link
@@ -503,6 +509,61 @@ export async function runRfbApiEmailRevealTests(opts: { log?: boolean } = {}): P
       eq(own.r.headers["cache-control"], "private", "K2: the owner's /info read is Cache-Control: private with the switch on");
       const pub = await info(P[0]!.id, "203.0.113.70");
       ok(pub.email === null, "K3: the same /info read without the token, limit 0 → e-mail null");
+      // Review M5 (lokal#1436): only a claim token for exactly this agent bypasses the budget.
+      const bogus = await info(P[0]!.id, "203.0.113.71", BROWSER, { "x-claim-token": "rae-bogus-token-does-not-exist" });
+      ok(bogus.r.status === 200 && bogus.email === null && !leaks(bogus.r.text, P[0]!.email), "K4: a bogus X-Claim-Token is treated like no token (limit 0 → e-mail null, address nowhere)");
+      eq(bogus.r.headers["cache-control"], "private", "K5: ... Cache-Control: private");
+      const foreign = await info(P[1]!.id, "203.0.113.71", BROWSER, { "x-claim-token": token });
+      ok(foreign.r.status === 200 && foreign.email === null && !leaks(foreign.r.text, P[1]!.email), "K6: a valid claim token for ANOTHER agent does not bypass the budget (e-mail null)");
+      freshGuard(1);
+      const spent = await info(P[2]!.id, "203.0.113.72", BROWSER, { "x-claim-token": "rae-bogus-token-does-not-exist" });
+      const next = await info(MASS[0]!.id, "203.0.113.72");
+      ok(spent.email === P[2]!.email && next.email === null, "K7: a read with a bogus token spends the IP's budget like a tokenless read (limit 1: the next profile is withheld)");
+    }
+
+    // ── V: vcard for a producer without an e-mail (review M10, lokal#1436) ──
+    {
+      freshGuard(1);
+      const ip = "203.0.113.75";
+      const v = await vcard(NOEMAIL.id, ip);
+      ok(v.r.status === 200 && v.email === undefined && !/^EMAIL/m.test(v.r.text), "V1: switch on → vcard of a producer without an e-mail has no EMAIL line");
+      eq(v.r.headers["cache-control"], "private", "V2: switch on → vcard of a producer without an e-mail is Cache-Control: private (no shared cache entry)");
+      ok(/^X-LOKAL-AGENT-ID:rer-p4\r?$/m.test(v.r.text) && v.r.text.includes(`FN;CHARSET=UTF-8:${NOEMAIL.name}`) && !anyLeak(v.r.text),
+        "V3: ... it is that producer's own vCard (FN, agent id), no other producer's address in it");
+      const after = await vcard(P[0]!.id, ip);
+      ok(after.email === P[0]!.email, "V4: the no-e-mail vcard spent none of the IP's budget (limit 1: the next producer still gets its EMAIL line)");
+      const v2 = await vcard(NOEMAIL.id, ip);
+      ok(v2.email === undefined && v2.r.headers["cache-control"] === "private" && stable(v2.r.text) === stable(v.r.text), "V5: over the limit → the no-e-mail vcard is unchanged and still private");
+      switchOff();
+      const vOff = await vcard(NOEMAIL.id, ip);
+      eq(vOff.r.headers["cache-control"], undefined, "V6: switch off → the no-e-mail vcard has no Cache-Control (as before)");
+      switchOn();
+    }
+
+    // ── W: producers without an e-mail spend no list budget (review M11, lokal#1436) ──
+    for (const [name, run] of [["discover", discover], ["search", search]] as const) {
+      // List order (switch off): the no-e-mail producer rer-p4 sits among the first
+      // producers with an e-mail. With limit 4 the 4th e-mail goes to the first
+      // producer WITH an e-mail after it; were rer-p4 counted, that one would be withheld.
+      const LIMIT = 4;
+      freshGuard(LIMIT);
+      const offRows = listContacts({ status: 200, text: offBodies.get(name)!, headers: {} });
+      const expectIds = offRows.filter((x) => x.contact?.email).slice(0, LIMIT).map((x) => x.id);
+      const noIdx = offRows.findIndex((x) => x.id === NOEMAIL.id);
+      const lastIdx = offRows.findIndex((x) => x.id === expectIds[LIMIT - 1]);
+      ok(expectIds.length === LIMIT && noIdx >= 0 && noIdx < lastIdx && !offRows[noIdx]!.contact?.email,
+        `W0: ${name} lists the no-e-mail producer before the ${LIMIT}th producer with an e-mail (idx ${noIdx} < ${lastIdx})`);
+      const r = await run("203.0.113.80");
+      eq(listContacts(r).filter((x) => x.contact?.email).map((x) => x.id), expectIds,
+        `W1: ${name}, limit ${LIMIT} → the first ${LIMIT} producers WITH an e-mail get it; the one without, listed among them, spent nothing`);
+    }
+    {
+      freshGuard(1);
+      const cr = await cartSubmit([NOEMAIL.id, P[0]!.id], "203.0.113.82");
+      const h = (body(cr)?.contact_handoffs ?? []) as any[];
+      const byId = new Map(h.map((x) => [x.agent_id, x]));
+      ok(cr.status === 201 && byId.get(NOEMAIL.id)?.email === null && byId.get(P[0]!.id)?.email === P[0]!.email,
+        "W2: cart submit [no e-mail, P0], limit 1 → the no-e-mail handoff spent nothing, P0 keeps its e-mail");
     }
 
     // ── G: log lines ────────────────────────────────────────────────────
