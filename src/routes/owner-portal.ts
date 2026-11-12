@@ -702,11 +702,14 @@ function normalizeOwnerProfileValue(dbField: string, value: unknown): string | n
 // the raw «Åpningstider» text this portal used to store. The portal now
 // stores the owner's text as a JSON string (JSON.stringify(text)), the text
 // variant knowledge-service already reads. Older rows hold the raw text;
-// both read back as the same text here.
+// both read back as the same text here. A CS change request stores the
+// owner's text as a one-item list (["…"]), the form the knowledge write path
+// takes; it reads back as that text too.
 function ownerProfileStoredText(dbField: string, stored: unknown): unknown {
   if (dbField !== "opening_hours" || typeof stored !== "string") return stored;
   try {
     const parsed = JSON.parse(stored);
+    if (Array.isArray(parsed) && parsed.length === 1 && typeof parsed[0] === "string") return parsed[0];
     return typeof parsed === "string" ? parsed : stored;
   } catch {
     return stored; // a raw-text row from before T0d

@@ -21,7 +21,8 @@
  *   cq20-cq22  Opplevagent: content field + lock; removal = hide (no delete).
  *   cq23-cq27  routes, run ledger, watchdog + digest.
  *   cqo1-cqo6  opening hours (RFB): text written as a one-item list, locked,
- *              verified on card + page; day-and-time text; clear; limits.
+ *              verified on the public card; day-and-time text; CR/LF and tab;
+ *              clear; limits.
  *   cqr8-cqr18 second re-review: an Opplevagent removal through the REAL
  *              visibility route blocklists only the plan (never an e-mail,
  *              org.nr or site another active profile uses) and verifies on
@@ -554,12 +555,15 @@ export function runCsChangeRequestsTests(opts: { log?: boolean } = {}): Promise<
         const o1call = calls.filter((c) => c.path === "/api/marketplace/agents/ag-oh/knowledge").pop();
         eq([o1.ok, R(o1.request.id).status, ohRow(), o1call?.body?.openingHours, calls.some((c) => /ag-oh\/curated-fields$/.test(c.path) && c.body.field === "opening_hours")],
           [true, "verified", JSON.stringify(["Onsdag, ellers når vi er hjemme"]), ["Onsdag, ellers når vi er hjemme"], true],
-          "cqo1: the owner's opening hours as text are written as a one-item list, locked (opening_hours) and seen on the public card + page → verified");
+          "cqo1: the owner's opening hours as text are written as a one-item list, locked (opening_hours) and seen on the public card → verified");
         eq(JSON.parse(R(o1.request.id).snapshot ?? "{}").openingHours?.old, dayRows, "cqo1b: the snapshot keeps the earlier day rows exactly as stored");
 
         const o2 = ohCreate("Man–fre 10–17, lør 10–14");
         await cq.runCsChangeRequests(deps());
         eq([R(o2.request.id).status, ohRow()], ["verified", JSON.stringify(["Man–fre 10–17, lør 10–14"])], "cqo2: text in the day-and-time form is stored as written and verified");
+        const o2b = ohCreate("Man–fre 10–17,\r\nLør\t10–14");
+        await cq.runCsChangeRequests(deps());
+        eq(R(o2b.request.id).status, "verified", "cqo2b: a CR/LF or tab in the text (escaped in the card JSON) still verifies");
 
         staleSurface = true;
         const o3 = ohCreate("Lørdag 12–15");

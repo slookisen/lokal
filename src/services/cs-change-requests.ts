@@ -599,7 +599,7 @@ function normText(s: string): string {
     .replace(/&lt;/gi, "<")
     .replace(/&gt;/gi, ">")
     .replace(/&nbsp;/gi, " ")
-    .replace(/\\n/g, " ")
+    .replace(/\\[nrt]/g, " ") // JSON escapes of a line break or tab (card JSON)
     .replace(/\s+/g, " ")
     .trim()
     .toLowerCase();
