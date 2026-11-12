@@ -324,7 +324,7 @@ export async function runExperiencesContactFormOnlyTests(opts: { log?: boolean }
       // Apart from the form row and the e-mail row/JSON-LD, the page is the switch-off page.
       const stripForm = (html: string) => html.replace(/<tr><th scope="row">Send melding<\/th><td><form[\s\S]*?<\/form><\/td><\/tr>/, "");
       const stripEmail = (html: string) => html
-        .replace(/<tr><th scope="row">E-post<\/th><td><a href="mailto:[^"]*">[^<]*<\/a><\/td><\/tr>/, "")
+        .replace(/<tr><th scope="row">E-post<\/th><td><a href="mailto:[^"]*"[^>]*>[^<]*<\/a><\/td><\/tr>/, "")
         .replace(/,"email":"[^"]*"/, "");
       ok(stripForm(t) === stripEmail(offBase["page F"]!.text), "F7: otherwise byte-identical to the switch-off page (form row in, e-mail row + JSON-LD email out)");
       for (const key of ["page U", "page N", "page R"]) {
