@@ -300,19 +300,26 @@ export async function handleInboundEmailWebhook(req: Request, res: Response, dep
     // quoted history, still carries it on an unquoted line.
     const markerTopHtml = markerId ? `<br><span style="color:#999">${escapeHtml(inboundMarkerLine(markerId))}</span>` : "";
     const markerTopText = markerId ? `\n${inboundMarkerLine(markerId)}` : "";
+    // Each header value on ONE line: a decoded sender or subject carrying a
+    // CR/LF must not add a line to the copy's header block (a line such as
+    // «Inbound-ID: …» above ours would decide which thread the copy is).
+    const oneLine = (v: unknown): string => String(v ?? "").replace(/[\r\n]+/g, " ");
+    const fwdFrom = oneLine(from);
+    const fwdTo = oneLine(Array.isArray(to) ? to.join(", ") : to);
+    const fwdSubject = oneLine(subject);
     const forwardOptions = {
       to: forwardTo,
-      subject: pilot ? `[Pilot] ${subject}` : `[Innkommende] ${subject} (fra ${from})`,
+      subject: pilot ? `[Pilot] ${fwdSubject}` : `[Innkommende] ${fwdSubject} (fra ${fwdFrom})`,
       htmlContent: `
         <div style="border-bottom:1px solid #ccc;padding-bottom:8px;margin-bottom:16px;color:#666;font-size:13px;">
-          <strong>Fra:</strong> ${from}<br>
-          <strong>Til:</strong> ${Array.isArray(to) ? to.join(", ") : to}<br>
-          <strong>Emne:</strong> ${subject}${markerTopHtml}
+          <strong>Fra:</strong> ${fwdFrom}<br>
+          <strong>Til:</strong> ${fwdTo}<br>
+          <strong>Emne:</strong> ${fwdSubject}${markerTopHtml}
         </div>
         ${bodyHtml}
         ${markerHtml}
       `,
-      textContent: `Videresent fra: ${from}\nTil: ${Array.isArray(to) ? to.join(", ") : to}\nEmne: ${subject}${markerTopText}\n\n${bodyText}${markerText}`,
+      textContent: `Videresent fra: ${fwdFrom}\nTil: ${fwdTo}\nEmne: ${fwdSubject}${markerTopText}\n\n${bodyText}${markerText}`,
       replyTo: senderEmail,
     };
 

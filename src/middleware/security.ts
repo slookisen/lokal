@@ -324,6 +324,23 @@ export const registrationLimiter = rateLimit({
   message: { success: false, error: "Registreringsgrense nådd. Maks 50 registreringer per time." },
 });
 
+// Gårdssalg self-registration limiter — dev-request 2026-11-01-opplevagent-
+// drikkeprodusent-selvregistrering, Spec C («egen IP-grense på
+// registreringen, som registrationLimiter, i tillegg til generalLimiter»).
+// Same shape as registrationLimiter above, its own instance and counter, with
+// a far lower ceiling: this is a public, human-only HTML form (no batch
+// onboarding runs use it), and every accepted POST does a live Brreg lookup
+// and may create a hidden provider row. Mounted on POST /for-tilbydere/registrer
+// only (routes/gardssalg-self-register.ts), after generalLimiter.
+export const gardssalgSelfRegisterLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: sharedValidate,
+  message: { success: false, error: "For mange registreringer fra denne adressen. Prøv igjen om en time." },
+});
+
 // Consumer API-key issuance limiter — dev-request
 // 2026-07-13-agent-identity-usage-ledger, slice 1. Same generous shape as
 // registrationLimiter above (anti-spam on a free, self-service, unauthenticated

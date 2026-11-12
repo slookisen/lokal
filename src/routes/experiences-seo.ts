@@ -51,6 +51,7 @@ import { isJunkDescription, looksTruncatedMidWord } from "../services/descriptio
 // to the provider's own website carry UTM; booking_url, «Kilde:» and JSON-LD
 // url/sameAs stay as stored.
 import { addUtmParams, OUTBOUND_UTM, withRequestQuery } from "../utils/url-utm";
+import { profileLinkHref, profileLinkBeaconAttrs, profileClickBeaconScript, profileLinkRedirectHandler } from "../services/profile-link-clicks";
 const PROVIDER_SITE_UTM = OUTBOUND_UTM.opplevagent.provider_profile;
 const GARDSSALG_SITE_UTM = OUTBOUND_UTM.opplevagent.gardssalg_profile;
 // dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E1-S1:
@@ -296,6 +297,8 @@ import {
   FOR_TILBYDERE_FAQ_META,
   type ForTilbydereSection,
 } from "./experiences-for-tilbydere-faq";
+import { createGardssalgSelfRegisterRouter, GARDSSALG_SELF_REGISTER_PATH } from "./gardssalg-self-register";
+import { isGardssalgSelfRegisterEnabled } from "../services/gardssalg-self-register";
 import { faqPairsFromJsonLd, type FaqPair } from "../services/faq-section";
 
 const router = Router();
@@ -2710,6 +2713,11 @@ router.get(`/${INDEXNOW_KEY}.txt`, (_req: Request, res: Response) => {
 //   /kategori/gardssalg/status/     booking status page (bookingRef+guestToken).
 //   /admin/                         admin surface — X-Admin-Key gated
 //                                   regardless; this is defense-in-depth.
+//   /for-tilbydere/registrer        gårdssalg self-registration form (dev-
+//                                   request 2026-11-01-opplevagent-drikke-
+//                                   produsent-selvregistrering). Served
+//                                   whether GARDSSALG_SELF_REGISTER_ENABLED is
+//                                   on or off (off = 404 there anyway).
 // Every one of these already carries its own noindex meta tag (svar/
 // gjestesvar/status/bekreft render through the shared previsitPage() shell;
 // confirm/eier render their own) — Disallow keeps crawlers from spending
@@ -2732,6 +2740,7 @@ Disallow: /kategori/gardssalg/bekreft/
 Disallow: /kategori/gardssalg/svar/
 Disallow: /kategori/gardssalg/gjestesvar/
 Disallow: /kategori/gardssalg/status/
+Disallow: /for-tilbydere/registrer
 Disallow: /admin/`;
 
 router.get("/robots.txt", (_req: Request, res: Response) => {
@@ -3759,23 +3768,31 @@ function renderOpplevelseDetail(
     : `<p class="lede lede-soft">Detaljert beskrivelse publiseres fortløpende. ${escapeHtml(displayTitle)} er en ${escapeHtml(catLabel(cat).toLowerCase())}-opplevelse${place ? " i " + escapeHtml(place) : ""}. Se tilbyderens nettside for program, priser og bestilling.</p>`;
 
   // Booking CTA.
+  // dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord S4: the booking
+  // and website links go through the counting redirect GET
+  // /ut/opplevelse/:id/{booking,website} (services/profile-link-clicks.ts),
+  // which reads the same stored columns (experiences.booking_url, the
+  // provider's hjemmeside, website with the same UTM) — never a URL from the
+  // request. The phone link fires the click beacon (data-track-*).
   const bookingUrl = safeHttpUrl(exp.booking_url);
+  const expId = String(exp.id);
+  const siteHref = escapeHtml(profileLinkHref("opplevelse", expId, "website"));
   let cta = "";
   if (bookingUrl) {
-    cta = `<a class="cta" href="${escapeHtml(bookingUrl)}" target="_blank" rel="noopener nofollow">${L.ctaBook}</a>`;
+    cta = `<a class="cta" href="${escapeHtml(profileLinkHref("opplevelse", expId, "booking"))}" target="_blank" rel="noopener nofollow">${L.ctaBook}</a>`;
   } else if (provSite) {
-    cta = `<a class="cta" href="${escapeHtml(addUtmParams(provSite, PROVIDER_SITE_UTM.source, "referral", PROVIDER_SITE_UTM.campaign))}" target="_blank" rel="noopener nofollow">${L.ctaSite}</a>`;
+    cta = `<a class="cta" href="${siteHref}" target="_blank" rel="noopener nofollow">${L.ctaSite}</a>`;
   } else {
     cta = `<p class="cta-soft">${L.ctaSoft}</p>`;
   }
   // Phone — rendered only when the provider has one on file (no fabrication).
   const phoneBlock = provTel
-    ? `<p class="prov-phone">${L.phone}: <a href="tel:${escapeHtml(provTel.replace(/\s+/g, ""))}">${escapeHtml(provTel)}</a></p>`
+    ? `<p class="prov-phone">${L.phone}: <a href="tel:${escapeHtml(provTel.replace(/\s+/g, ""))}"${profileLinkBeaconAttrs("opplevelse", expId, "phone")}>${escapeHtml(provTel)}</a></p>${profileClickBeaconScript()}`
     : "";
 
   // Provider card.
   const provInner = provName
-    ? `<p class="prov-name">${provSite ? `<a href="${escapeHtml(addUtmParams(provSite, PROVIDER_SITE_UTM.source, "referral", PROVIDER_SITE_UTM.campaign))}" target="_blank" rel="noopener">${escapeHtml(provName)}</a>` : escapeHtml(provName)}</p>
+    ? `<p class="prov-name">${provSite ? `<a href="${siteHref}" target="_blank" rel="noopener nofollow">${escapeHtml(provName)}</a>` : escapeHtml(provName)}</p>
        ${brregVerified ? `<p class="prov-verified">${L.provVerified}${orgNr ? ` · org.nr ${escapeHtml(orgNr)}` : ""}</p>` : `<p class="prov-soft">${L.provPending}</p>`}
        <p class="prov-link"><a href="/tilbyder/${escapeHtml(String(provider!.slug || provider!.id))}">${L.provAll}</a></p>`
     : `<p class="prov-soft">${L.provUnmatched}</p>`;
@@ -6419,6 +6436,12 @@ router.get(
     const meta = drinkTypeMeta(provider.producer_type);
     const badge = drinkBadge(provider.producer_type);
     const site = safeHttpUrl(provider.hjemmeside);
+    // S4 (dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord): the
+    // website goes through the counting redirect /ut/gardssalg/:id/website
+    // (same stored hjemmeside, same GARDSSALG_SITE_UTM); phone and e-mail
+    // fire the click beacon. No id (never for a real row) → direct link.
+    const gsId = String(provider.id ?? "");
+    const gsSiteHref = site ? escapeHtml(gsId ? profileLinkHref("gardssalg", gsId, "website") : addUtmParams(site, GARDSSALG_SITE_UTM.source, "referral", GARDSSALG_SITE_UTM.campaign)) : "";
     const lat = numOrNull(provider.lat);
     const lon = numOrNull(provider.lon);
     // Step D fallback (experiences-geocode-worker.ts): a kommune/fylke
@@ -6463,7 +6486,7 @@ router.get(
     const aboutBody = hasRealAbout
       ? `<p>${escapeHtml(tr.about_text || (provider.about_text as string))}</p>`
       : site
-      ? `<p>${escapeHtml(provider.navn)} er en lokal drikkeprodusent${sted ? " i " + escapeHtml(sted) : ""}. Les mer om produsenten og produktene på <a href="${escapeHtml(addUtmParams(site, GARDSSALG_SITE_UTM.source, "referral", GARDSSALG_SITE_UTM.campaign))}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a>.</p>`
+      ? `<p>${escapeHtml(provider.navn)} er en lokal drikkeprodusent${sted ? " i " + escapeHtml(sted) : ""}. Les mer om produsenten og produktene på <a href="${gsSiteHref}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a>.</p>`
       : `<p>${escapeHtml(provider.navn)} er en lokal drikkeprodusent${sted ? " i " + escapeHtml(sted) : ""}. Utfyllende presentasjon publiseres fortløpende.</p>`;
 
     // "Besøket" — real enriched copy (visit_text) when present; otherwise the
@@ -6487,8 +6510,8 @@ router.get(
       && !isJunkDescription(provider.opening_hours_text)
       && !looksTruncatedMidWord(provider.opening_hours_text)
     ) facts.push([L.gsHours, escapeHtml(tr.opening_hours_text || provider.opening_hours_text)]);
-    if (site) facts.push([L.gsSite, `<a href="${escapeHtml(addUtmParams(site, GARDSSALG_SITE_UTM.source, "referral", GARDSSALG_SITE_UTM.campaign))}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a>`]);
-    if (isDisplayablePhone(provider.telefon)) facts.push([L.phone, `<a href="tel:${escapeHtml(provider.telefon)}">${escapeHtml(provider.telefon)}</a>`]);
+    if (site) facts.push([L.gsSite, `<a href="${gsSiteHref}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a>`]);
+    if (isDisplayablePhone(provider.telefon)) facts.push([L.phone, `<a href="tel:${escapeHtml(provider.telefon)}"${gsId ? profileLinkBeaconAttrs("gardssalg", gsId, "phone") : ""}>${escapeHtml(provider.telefon)}</a>`]);
     // epostUnderReview: Skive C(b)/AC4 — a flagged (domain-deviating) address
     // is published NOWHERE on this page until a human resolves it: not in the
     // visible fact row here, and not in the JSON-LD `email` further down (the
@@ -6508,12 +6531,12 @@ router.get(
     // review gate. Switch off → null → exactly the line below as before.
     const emailView = gardssalgProfileEmailView(req, provider, !contactFormOnly && provider.epost && !epostUnderReview ? provider.epost : null);
     const emailShown = !contactFormOnly && (emailView === null || emailView === "show");
-    if (provider.epost && !epostUnderReview && emailShown) facts.push([L.gsEmail, `<a href="mailto:${escapeHtml(provider.epost)}">${escapeHtml(provider.epost)}</a>`]);
+    if (provider.epost && !epostUnderReview && emailShown) facts.push([L.gsEmail, `<a href="mailto:${escapeHtml(provider.epost)}"${gsId ? profileLinkBeaconAttrs("gardssalg", gsId, "email") : ""}>${escapeHtml(provider.epost)}</a>`]);
     else if (emailView === "reveal") facts.push([L.gsEmail, `<a href="${escapeHtml(gardssalgEmailRevealPath(slug, uiLang))}" rel="nofollow">${escapeHtml(L.gsEmailReveal)}</a>`]);
     else if (contactFormShown) facts.push([GARDSSALG_CONTACT_FORM_COPY[uiLang].label, gardssalgContactFormCell(slug, uiLang)]);
     const factsRows = facts.map(([k, v]) => `<tr><th scope="row">${escapeHtml(k)}</th><td>${v}</td></tr>`).join("");
     const factsBlock = facts.length
-      ? `<table class="facts"><caption class="skip-link">Praktisk info</caption><tbody>${factsRows}</tbody></table>
+      ? `<table class="facts"><caption class="skip-link">Praktisk info</caption><tbody>${factsRows}</tbody></table>${gsId ? profileClickBeaconScript() : ""}
          <p class="produsent-note">Sesong, varighet, pris og kapasitet legges til etter hvert som profilen berikes.</p>`
       : `<p class="produsent-note">Praktisk info legges til etter hvert som profilen berikes. Kontakt produsenten ved reservasjon.</p>`;
 
@@ -9100,11 +9123,16 @@ export function buildProviderContact(
     ? [street, [postal, locality].filter(Boolean).join(" ")].filter((x) => x && x.trim()).join(", ")
     : "";
   if (addr) rows.push(`<li><strong>Adresse:</strong> ${escapeHtml(addr)}</li>`);
-  if (phone) rows.push(`<li><strong>Telefon:</strong> <a href="tel:${escapeHtml(phone)}">${escapeHtml(phone)}</a></li>`);
-  if (site) rows.push(`<li><strong>Nettside:</strong> <a href="${escapeHtml(addUtmParams(site, PROVIDER_SITE_UTM.source, "referral", PROVIDER_SITE_UTM.campaign))}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a></li>`);
+  // S4 (dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord): phone
+  // fires the click beacon, the website goes through the counting redirect
+  // /ut/tilbyder/:id/website (same stored hjemmeside, same UTM). Without a
+  // provider id (never on the /tilbyder/ page) the links stay direct.
+  const pid = clean(provider.id);
+  if (phone) rows.push(`<li><strong>Telefon:</strong> <a href="tel:${escapeHtml(phone)}"${pid ? profileLinkBeaconAttrs("tilbyder", pid, "phone") : ""}>${escapeHtml(phone)}</a></li>`);
+  if (site) rows.push(`<li><strong>Nettside:</strong> <a href="${escapeHtml(pid ? profileLinkHref("tilbyder", pid, "website") : addUtmParams(site, PROVIDER_SITE_UTM.source, "referral", PROVIDER_SITE_UTM.campaign))}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a></li>`);
   if (orgNr) rows.push(`<li><strong>Org.nr.:</strong> ${escapeHtml(orgNr)}</li>`);
   const contactHtml = rows.length
-    ? `<section class="prov-contact" aria-label="Kontaktinformasjon"><ul style="list-style:none;padding:0;margin:12px 0">${rows.join("")}</ul></section>`
+    ? `<section class="prov-contact" aria-label="Kontaktinformasjon"><ul style="list-style:none;padding:0;margin:12px 0">${rows.join("")}</ul></section>${pid && phone ? profileClickBeaconScript() : ""}`
     : "";
 
   let organizationLd: Record<string, unknown> | null = null;
@@ -9162,9 +9190,11 @@ router.get("/tilbyder/:providerSlugOrId", (req: Request, res: Response, next: Ne
   let ledeBits = `Alle håndplukkede opplevelser fra ${navn}`;
   if (place) ledeBits += ` (${place})`;
   ledeBits += ".";
+  // S4: the website chip goes through the counting redirect (same target).
+  const provSiteHref = escapeHtml(profileLinkHref("tilbyder", providerId, "website"));
   const verifiedNote = brregVerified
-    ? `<div class="chips"><span class="chip">✓ Verifisert mot Brønnøysundregistrene</span>${provSite ? `<a class="chip" href="${escapeHtml(addUtmParams(provSite, PROVIDER_SITE_UTM.source, "referral", PROVIDER_SITE_UTM.campaign))}" target="_blank" rel="noopener nofollow">Tilbyderens nettside →</a>` : ""}</div>`
-    : provSite ? `<div class="chips"><a class="chip" href="${escapeHtml(addUtmParams(provSite, PROVIDER_SITE_UTM.source, "referral", PROVIDER_SITE_UTM.campaign))}" target="_blank" rel="noopener nofollow">Tilbyderens nettside →</a></div>` : "";
+    ? `<div class="chips"><span class="chip">✓ Verifisert mot Brønnøysundregistrene</span>${provSite ? `<a class="chip" href="${provSiteHref}" target="_blank" rel="noopener nofollow">Tilbyderens nettside →</a>` : ""}</div>`
+    : provSite ? `<div class="chips"><a class="chip" href="${provSiteHref}" target="_blank" rel="noopener nofollow">Tilbyderens nettside →</a></div>` : "";
 
   const providerCanonicalPath = `/tilbyder/${encodeURIComponent(String(provider.slug || providerId))}`;
   const contact = buildProviderContact(provider, `${baseUrl()}${providerCanonicalPath}`);
@@ -9836,6 +9866,16 @@ ${oaSiteFooter({})}
   res.send(html);
 });
 
+// ═══════════════════════════════════════════════════════════
+// GET /ut/:surface/:id/:kind — counting redirect for the outgoing links on
+// the opplevelse, tilbyder and gårdssalg produsent pages (dev-request
+// 2026-10-23-admin-ordre-og-henvisningsdashbord, S4). The target is read only
+// from this vertical's database by id + a closed kind; see
+// services/profile-link-clicks.ts for the open-redirect guard. Surfaces of
+// finn-tannlege.com (klinikk) 404 here.
+// ═══════════════════════════════════════════════════════════
+router.get("/ut/:surface/:id/:kind", generalLimiter, profileLinkRedirectHandler(["opplevelse", "tilbyder", "gardssalg"]));
+
 router.get("/opplevelse/:slug", (req: Request, res: Response, next: NextFunction) => {
   const slug = String(req.params.slug || "");
   let exp: ReturnType<typeof getPublishedExperienceBySlug> = null;
@@ -10127,7 +10167,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=3600");
   res.send(legalPage("Personvern / Privacy", `<div class="lang"><a href="#en">English</a></div>
-<h1>Personvern</h1><p><strong>Sist oppdatert:</strong> 8. november 2026</p>
+<h1>Personvern</h1><p><strong>Sist oppdatert:</strong> 11. november 2026</p>
 <p>Opplevagent (opplevagent.no) er en agent-til-agent-markedsplass som hjelper AI-agenter og mennesker med å finne norske opplevelser og aktiviteter — turer, kurs, severdigheter og ting å gjøre. Vi respekterer personvernet til tilbydere, brukere og AI-agenter som samhandler med plattformen.</p>
 <h2>Hva vi samler inn</h2><ul>
 <li><strong>Opplevelsesdata:</strong> tittel, beskrivelse, tilbyder, kategori, fylke/kommune, varighet, pris, sesong og bookinglenke — offentlig tilgjengelig informasjon hentet fra tilbydernes egne nettsider og åpne kilder (Brønnøysundregistrene, Visit Norway / CBIS m.fl.).</li>
@@ -10137,6 +10177,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <li><strong>Teknisk logg over MCP/A2A-kall:</strong> separat fra loggen over logger vi for hvert kall verktøy, protokoll, svartid, AI-klientens nettleser-/klientstreng og en saltet, forkortet hash av IP-adressen, for å se hvilke AI-klienter som bruker tjenesten.</li>
 <li><strong>Besøks- og søkestatistikk:</strong> for hvert sidebesøk registrerer serveren, uten cookies, hvilken side som ble vist, hvor du kom fra (referanse-URL), tidspunktet, en saltet og forkortet hash av IP-adressen (aldri hele IP-adressen) og en grov klassifisering av nettleseren (f.eks. mobil, PC eller søkemotor). Søk på nettsiden og via API-et lagres med søketekst, valgte filtre (f.eks. sted eller tema), antall treff og den samme IP-hashen.</li>
 <li><strong>Besøk fra AI-svar:</strong> har lenken du kom fra et merke (<code>utm_source</code>, <code>utm_medium</code>, <code>utm_campaign</code>), lagres også merket sammen med sidebesøket. Lenker til opplevelsessider som vi gir AI-assistenter som ChatGPT og Claude, har et slikt merke (for eksempel <code>utm_source=claude&amp;utm_campaign=ai_search</code>). Merket sier bare hvilken AI-tjeneste lenken ble gitt til — det inneholder ingenting om deg. Sammen med referanse-URL-en lar det oss telle besøk som kom fra et AI-svar. Disse besøkene summeres per dag, side og AI-tjeneste, uten IP-hash eller annen kobling til den besøkende, og summene vises på opplevelsessidene. Summene slettes ikke automatisk i dag.</li>
+<li><strong>Klikk videre til tilbyderen:</strong> når du klikker på en lenke på en opplevelses-, tilbyder- eller produsentside videre til tilbyderen (booking, nettside, telefon eller e-post), teller vi klikket uten cookies og uten navn eller kontaktopplysninger om deg — bare hvilken profil, hvilken lenke, tidspunktet og den samme pseudonyme besøks-ID-en som sidebesøkene (med en saltet, forkortet hash av IP-adressen, aldri hele IP-adressen), og klikkene slettes ikke automatisk i dag.</li>
 <li><strong>Besøksforespørsler til gårdssalg:</strong> når du ber om et besøk hos en gårdssalg-produsent — på nettsiden eller via en AI-assistent som ChatGPT eller Claude — lagrer vi navn, e-postadresse, eventuelt telefonnummer, ønsket dato/tid, antall personer og en eventuell kommentar. Opplysningene sendes på e-post til produsenten du ba om å besøke, slik at produsenten kan svare deg, og du får selv en kvittering med en statuslenke. Formålet er kun å formidle og følge opp forespørselen; opplysningene brukes ikke til markedsføring.</li></ul>
 <h2>Tilbyderprofiler og e-post vi sender uten at du har bedt om det</h2>
 <p>De fleste profilene i katalogen har vi laget uten at tilbyderen har meldt seg på. De bygger på opplysninger som allerede er offentlige: Brønnøysundregistrene, tilbyderens egen nettside, Visit Norway / CBIS, Rett fra Bondens produsentregister, nettsøk (Brave Search) og kataloger og oppføringssider. Vi kan sende tilbyderen en e-post om at profilen finnes, slik at den kan se over, rette eller overta profilen. Grunnlaget er berettiget interesse (personvernforordningen art. 6 nr. 1 bokstav f): å gi tilbydere synlighet i en gratis katalog som AI-assistenter kan hente fra.</p>
@@ -10176,7 +10217,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <li><strong>Klage</strong> — du kan klage til Datatilsynet (datatilsynet.no).</li></ul>
 <h2>Kontakt</h2><p>${companyControllerSentenceHtml("nb", { siteName: "Opplevagent", siteEmail: "kontakt@opplevagent.no" })}</p>
 <hr>
-<h1 id="en">Privacy Policy</h1><p><strong>Last updated:</strong> 8 November 2026</p>
+<h1 id="en">Privacy Policy</h1><p><strong>Last updated:</strong> 11 November 2026</p>
 <p>Opplevagent (opplevagent.no) is an agent-to-agent marketplace that helps AI agents and humans find Norwegian experiences and activities — tours, courses, attractions, and things to do. We respect the privacy of providers, end-users, and AI agents that interact with the platform.</p>
 <h2>What we collect</h2><ul>
 <li><strong>Experience data:</strong> title, description, provider, category, county/municipality, duration, price, season, and booking link — public information gathered from providers' own websites and open sources (the Norwegian business registry, Visit Norway / CBIS, etc.).</li>
@@ -10186,6 +10227,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <li><strong>Technical log of MCP/A2A calls:</strong> separately from the log above, for each call we log the tool, protocol, response time, the AI client's browser/client string and a salted, truncated hash of the IP address, to see which AI clients use the service.</li>
 <li><strong>Visit and search statistics:</strong> for each page visit the server records, without cookies, which page was shown, where you came from (referrer URL), the time, a salted and truncated hash of the IP address (never the full IP address) and a rough classification of the browser (e.g. mobile, desktop or search engine). Searches on the website and through the API are stored with the search text, the filters chosen (e.g. place or theme), the number of results and the same IP hash.</li>
 <li><strong>Visits from AI answers:</strong> if the link you arrived from has a marker (<code>utm_source</code>, <code>utm_medium</code>, <code>utm_campaign</code>), the marker is stored with the page visit. Links to experience pages that we give AI assistants such as ChatGPT and Claude carry such a marker (for example <code>utm_source=claude&amp;utm_campaign=ai_search</code>). The marker only says which AI service the link was given to — it contains nothing about you. Together with the referrer it lets us count visits that came from an AI answer. These visits are summed per day, page and AI service, with no IP hash or other link to the visitor, and the totals are shown on the experience pages. The totals are not deleted automatically today.</li>
+<li><strong>Clicks on to the provider:</strong> when you click a link on an experience, provider or producer page that leads on to the provider (booking, website, phone or email), we count the click without cookies and without your name or contact details — only which profile, which link, the time and the same pseudonymous visit ID as the page visits (with a salted, truncated hash of the IP address, never the full IP address), and the clicks are not deleted automatically today.</li>
 <li><strong>Farm-sale visit requests:</strong> when you request a visit to a farm-sale (gårdssalg) producer — on the website or through an AI assistant such as ChatGPT or Claude — we store your name, email address, optional phone number, requested date/time, party size and any note. These details are emailed to the producer you asked to visit so they can reply to you, and you receive a receipt with a status link. They are used only to pass on and follow up the request, never for marketing.</li></ul>
 <h2>Provider profiles and emails we send without being asked</h2>
 <p>Most profiles in the catalogue were created without the provider signing up. They are built on information that is already public: the Norwegian business registry, the provider's own website, Visit Norway / CBIS, the Rett fra Bonden producer register, web search (Brave Search) and directory and listing pages. We may email the provider to say the profile exists, so they can review, correct or take over the profile. The basis is legitimate interest (GDPR art. 6(1)(f)): giving providers visibility in a free catalogue that AI assistants can fetch from.</p>
@@ -10811,7 +10853,15 @@ router.get("/for-tilbydere/finn", generalLimiter, (req: Request, res: Response) 
   const resultBlock = !q
     ? `<div class="ft-hint"><p><strong>Skriv inn bedriftsnavnet</strong> (eller stedet) i feltet over, så finner vi profilen din. Du kan også bla i <a href="/kategori/gardssalg">katalogen</a>.</p></div>`
     : hits.length === 0
-    ? `<div class="ft-hint"><p>Ingen treff på «${escapeHtml(q)}». Prøv et kortere navn eller stedet bedriften ligger på — eller bla i <a href="/kategori/gardssalg">katalogen</a>. Finner du ikke bedriften, ta kontakt på <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>, så hjelper vi deg.</p></div>`
+    ? `<div class="ft-hint"><p>Ingen treff på «${escapeHtml(q)}». Prøv et kortere navn eller stedet bedriften ligger på — eller bla i <a href="/kategori/gardssalg">katalogen</a>. Finner du ikke bedriften, ta kontakt på <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>, så hjelper vi deg.</p>${
+        // dev-request 2026-11-01-opplevagent-drikkeprodusent-selvregistrering:
+        // the self-registration door, in addition to the contact address, and
+        // only while GARDSSALG_SELF_REGISTER_ENABLED is on (off = byte-identical
+        // to before).
+        isGardssalgSelfRegisterEnabled()
+          ? `<p class="ft-register"><strong>Finner du ikke bedriften?</strong> <a href="${GARDSSALG_SELF_REGISTER_PATH}?navn=${encodeURIComponent(q)}">Registrer den</a>.</p>`
+          : ""
+      }</div>`
     : `<p class="count">${hits.length} treff — klikk «Er dette din bedrift?» på din egen oppføring for å ta eierskap.</p>
   <ul class="ft-hits">
 ${hitCards}
@@ -10834,6 +10884,12 @@ ${hitCards}
     main,
   }));
 });
+
+// GET|POST /for-tilbydere/registrer — gårdssalg self-registration (dev-request
+// 2026-11-01-opplevagent-drikkeprodusent-selvregistrering, skive 1). Its own
+// module; mounted here so it shares this router's host gate, page chrome and
+// 404. Flag off → both routes fall through to the 404 below (AC1).
+router.use(createGardssalgSelfRegisterRouter(forTilbyderePage));
 
 // ═══════════════════════════════════════════════════════════
 // GET /kontakt — public contact form (opplevagent.no)

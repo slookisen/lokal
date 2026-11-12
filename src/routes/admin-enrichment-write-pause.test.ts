@@ -724,6 +724,11 @@ export async function runAdminEnrichmentWritePauseTests(
         // experiences pause itself (423); the job imports only the status
         // constant to recognise that 423 and end the run as `paused`.
         "services/gardssalg-content-refresh-job.ts",
+        // gardssalg-self-register (dev-request 2026-11-01-opplevagent-
+        // drikkeprodusent-selvregistrering, skive 1): the public
+        // /for-tilbydere/registrer form creates an experience_providers row,
+        // so it checks the experiences pause before writing anything.
+        "services/gardssalg-self-register.ts",
         "services/rfb-marketing-daily.test.ts",
         "services/rfb-marketing-daily.ts",
         // dev-request 2026-10-10-rfb-berikelse-nattjobb (R6): the nightly RFB

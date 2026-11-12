@@ -720,6 +720,164 @@ export function computeRfbReferrals(db: Db, periode: Periode, oppl: Opplosning):
   };
 }
 
+// ─── Opplevagent / Finn-tannlege referrals (profile_link_clicks) — slice S4 ──
+//
+// One profile_link_clicks row = one click on an outgoing link of an
+// Opplevagent (opplevelse / tilbyder / gårdssalg produsent) or Finn-tannlege
+// (klinikk) profile page: the counting redirect GET /ut/:surface/:id/:kind
+// (booking, website, directory) or the beacon POST /api/track/profile-click
+// (phone, email) — services/profile-link-clicks.ts. Same shape and the same
+// three disjoint groups as the RFB block above:
+//   * bot  : is_bot = 1 (any provider)
+//   * test : is_bot = 0 at a test provider (is_test = 1, stamped at click
+//            time from experience_providers.is_test_provider)
+//   * main : the rest
+// Only platform, provider_id, kind, is_bot, is_test and created_at are read
+// — never session_id.
+
+export const PROFIL_HENVISNING_PLATTFORMER = ["opplevelser", "gardssalg", "tannlege"] as const;
+export type ProfilHenvisningPlattform = typeof PROFIL_HENVISNING_PLATTFORMER[number];
+export const PROFIL_HENVISNING_TYPER = ["booking", "nettside", "telefon", "e_post", "annet"] as const;
+export type ProfilHenvisningType = typeof PROFIL_HENVISNING_TYPER[number];
+
+/** profile_link_clicks.kind → the admin type (closed mapping; unknown kinds → 'annet'). */
+export function profilHenvisningType(kind: string): ProfilHenvisningType {
+  if (kind === "booking") return "booking";
+  if (kind === "website") return "nettside";
+  if (kind === "phone") return "telefon";
+  if (kind === "email") return "e_post";
+  return "annet";
+}
+
+function zeroProfilTypes(): Record<ProfilHenvisningType, number> {
+  return zeroCounts(PROFIL_HENVISNING_TYPER) as Record<ProfilHenvisningType, number>;
+}
+
+const PROFIL_PLATTFORM_NAVN: Record<ProfilHenvisningPlattform, { navn: string; side: string; mottaker: string }> = {
+  opplevelser: { navn: "Opplevagent opplevelser", side: "en opplevelses- eller tilbyderside på opplevagent.no", mottaker: "tilbyderen" },
+  gardssalg: { navn: "Opplevagent gårdssalg", side: "en gårdssalg-produsentside på opplevagent.no", mottaker: "produsenten" },
+  tannlege: { navn: "Finn-tannlege", side: "en klinikkside på finn-tannlege.com", mottaker: "klinikken" },
+};
+
+export interface ProfilReferrals {
+  available: true;
+  plattform: ProfilHenvisningPlattform;
+  forklaring: string;
+  total: number;
+  by_type: Record<ProfilHenvisningType, number>;
+  type_forklaring: Record<ProfilHenvisningType, string>;
+  series: Array<{ bucket: string; total: number; by_type: Record<ProfilHenvisningType, number> }>;
+  bot: { forklaring: string; total: number; by_type: Record<ProfilHenvisningType, number> };
+  test: {
+    forklaring: string;
+    total: number;
+    by_type: Record<ProfilHenvisningType, number>;
+    providers: Array<{ provider_id: string; name: string | null; total: number }>;
+  };
+  merknader: string[];
+}
+
+/**
+ * Clicks on one platform's profile links in the period. `providerName`
+ * (optional) names the test providers; it reads the vertical database, which
+ * the caller may not have open — then the name is null.
+ */
+export function computeProfilReferrals(
+  db: Db,
+  plattform: ProfilHenvisningPlattform,
+  periode: Periode,
+  oppl: Opplosning,
+  providerName: (providerId: string) => string | null = () => null,
+): ProfilReferrals | Unavailable {
+  const meta = PROFIL_PLATTFORM_NAVN[plattform];
+  if (!tableExists(db, "profile_link_clicks")) {
+    return { available: false, forklaring: `Henvisninger for ${meta.navn} (profile_link_clicks) kunne ikke leses.`, merknader: ["Tabellen profile_link_clicks finnes ikke i denne databasen."] };
+  }
+  const bucket = bucketSql("c.created_at", oppl);
+  const rows = db.prepare(
+    `SELECT c.provider_id AS provider_id, c.kind AS kind, ${bucket} AS bucket,
+            CASE WHEN c.is_bot = 1 THEN 1 ELSE 0 END AS is_bot,
+            CASE WHEN c.is_test = 1 THEN 1 ELSE 0 END AS is_test,
+            COUNT(*) AS n
+       FROM profile_link_clicks c
+      WHERE c.platform = ? AND c.created_at >= ? AND c.created_at < ?
+      GROUP BY c.provider_id, c.kind, bucket, is_bot, is_test`
+  ).all(plattform, periode.fra, periode.til_eksklusiv) as Array<{ provider_id: string | null; kind: string; bucket: string; is_bot: number; is_test: number; n: number }>;
+
+  const byType = zeroProfilTypes();
+  const botByType = zeroProfilTypes();
+  const testByType = zeroProfilTypes();
+  let total = 0, botTotal = 0, testTotal = 0;
+  const testProviders = new Map<string, { provider_id: string; name: string | null; total: number }>();
+  const series = new Map<string, ProfilReferrals["series"][number]>();
+  for (const k of bucketKeys(periode, oppl)) series.set(k, { bucket: k, total: 0, by_type: zeroProfilTypes() });
+
+  for (const r of rows) {
+    const t = profilHenvisningType(r.kind);
+    if (Number(r.is_bot) === 1) {
+      botTotal += r.n;
+      botByType[t] += r.n;
+      continue;
+    }
+    if (Number(r.is_test) === 1) {
+      testTotal += r.n;
+      testByType[t] += r.n;
+      const id = r.provider_id ?? "";
+      const tp = testProviders.get(id) ?? { provider_id: id, name: null, total: 0 };
+      tp.total += r.n;
+      testProviders.set(id, tp);
+      continue;
+    }
+    total += r.n;
+    byType[t] += r.n;
+    const s = series.get(r.bucket);
+    if (s) { s.total += r.n; s.by_type[t] += r.n; }
+  }
+  for (const tp of testProviders.values()) {
+    try { tp.name = tp.provider_id ? providerName(tp.provider_id) : null; } catch { tp.name = null; }
+  }
+
+  return {
+    available: true,
+    plattform,
+    forklaring:
+      `Klikk fra ${meta.side} videre til ${meta.mottaker} (tabellen profile_link_clicks), per type og per tidsbolk ` +
+      "(UTC-dato for klikket). Bare klikk fra folk: bot-klikk og klikk hos testtilbydere er holdt utenfor og vist for seg.",
+    total,
+    by_type: byType,
+    type_forklaring: {
+      booking: `Klikk på bookinglenken (videresending via /ut/ til ${meta.mottaker}s egen bookingside).`,
+      nettside: `Klikk på nettside-lenken til ${meta.mottaker} (videresending via /ut/).`,
+      telefon: `Klikk på telefonnummeret til ${meta.mottaker} (tel:-lenke, registrert med klikk-beacon).`,
+      e_post: `Klikk på e-postadressen til ${meta.mottaker} (mailto:-lenke, registrert med klikk-beacon).`,
+      annet: plattform === "tannlege"
+        ? "Klikk på klinikkens oppføring i en annen katalog eller på sosiale medier (videresending via /ut/)."
+        : "Klikk med en type som ikke passer i de andre gruppene.",
+    },
+    series: [...series.values()],
+    bot: {
+      forklaring:
+        "Klikk der nettleseren identifiserte seg som en bot (profile_link_clicks.is_bot = 1, satt ved klikket med den samme " +
+        "klienttolkningen som sidevisningene bruker). Ikke med i tallene over.",
+      total: botTotal,
+      by_type: botByType,
+    },
+    test: {
+      forklaring: plattform === "tannlege"
+        ? "Finn-tannlege har ingen testklinikker med offentlig side; raden er med for å vise at ingenting er holdt utenfor her."
+        : "Klikk fra folk hos testtilbydere (experience_providers.is_test_provider = 1). Ikke med i tallene over.",
+      total: testTotal,
+      by_type: testByType,
+      providers: [...testProviders.values()],
+    },
+    merknader: [
+      "Telefon- og e-postklikk registreres bare når siden kjører JavaScript; selve oppringingen eller e-posten ser vi ikke.",
+      "Et klikk betyr at noen åpnet lenken, ikke at de bestilte eller tok kontakt.",
+      "Tellingen startet da lenkene på profilsidene ble lagt om (leveranse S4); dager før det har ingen klikk.",
+    ],
+  };
+}
+
 // ─── RFB AI deliveries (profile_ai_deliveries) — slice S3 ───────────────────
 //
 // «Levert til AI-assistent»: how many times an RFB producer profile was in
@@ -991,8 +1149,8 @@ export interface OversiktForCsv {
   oppl: Opplosning;
   rfb?: RfbOverview;
   gardssalg?: GardssalgOverview | GardssalgUnavailable;
-  /** Slice S3: clicks per platform (RFB only so far). */
-  henvisninger?: { rfb?: RfbReferrals | Unavailable };
+  /** Slice S3: clicks per platform (RFB); slice S4 adds Opplevagent and Finn-tannlege. */
+  henvisninger?: { rfb?: RfbReferrals | Unavailable } & Partial<Record<ProfilHenvisningPlattform, ProfilReferrals | Unavailable>>;
   /** Slice S3: «levert til AI-assistent» per platform (RFB only so far). Never added to clicks. */
   ai_leveranser?: { rfb?: RfbAiDeliveries | Unavailable };
 }
@@ -1081,6 +1239,25 @@ export function oversiktCsvRows(o: OversiktForCsv): CsvRow[] {
       for (const [t, n] of Object.entries(h.test.by_type)) add(P, "test", "henvisninger_type", t, null, "antall_klikk", n);
       for (const p of h.test.producers) add(P, "test", "henvisninger_produsent", p.agent_id, p.name, "antall_klikk", p.total);
     }
+  }
+  // Slice S4: Opplevagent / Finn-tannlege clicks, same rows as RFB's
+  // (kategori henvisninger_*, maal antall_klikk), plattform = the block key.
+  for (const P of PROFIL_HENVISNING_PLATTFORMER) {
+    const ph = o.henvisninger?.[P];
+    if (!ph) continue;
+    if (!ph.available) {
+      add(P, "ekte", "henvisninger_tilgjengelig", null, null, "tilgjengelig", 0);
+      continue;
+    }
+    add(P, "ekte", "henvisninger_tilgjengelig", null, null, "tilgjengelig", 1);
+    add(P, "ekte", "henvisninger_total", null, null, "antall_klikk", ph.total);
+    for (const [t, n] of Object.entries(ph.by_type)) add(P, "ekte", "henvisninger_type", t, null, "antall_klikk", n);
+    for (const s of ph.series) add(P, "ekte", "henvisninger_bolk", s.bucket, null, "antall_klikk", s.total);
+    add(P, "bot", "henvisninger_total", null, null, "antall_klikk", ph.bot.total);
+    for (const [t, n] of Object.entries(ph.bot.by_type)) add(P, "bot", "henvisninger_type", t, null, "antall_klikk", n);
+    add(P, "test", "henvisninger_total", null, null, "antall_klikk", ph.test.total);
+    for (const [t, n] of Object.entries(ph.test.by_type)) add(P, "test", "henvisninger_type", t, null, "antall_klikk", n);
+    for (const p of ph.test.providers) add(P, "test", "henvisninger_tilbyder", p.provider_id, p.name, "antall_klikk", p.total);
   }
   const ai = o.ai_leveranser?.rfb;
   if (ai) {

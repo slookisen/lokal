@@ -929,6 +929,7 @@ import { findLocalOrgnrCandidate } from "../services/local-orgnr-candidates";
 // dev-request 2026-07-19-brreg-nace-drikkeprodusenter — kommune→fylke best-effort
 // ved landing av nye NACE-oppdagede providere.
 import { cityToFylke } from "../services/norway-fylke";
+import { GARDSSALG_NACE_PRODUCER_TYPE } from "../services/gardssalg-nace-producer-type";
 import { resolveFylke2024 } from "../services/fylke-2024-migration";
 import { fillFylkeFromKommune, runGardssalgFylkeFromKommune } from "../services/gardssalg-fylke-from-kommune";
 import {
@@ -6782,14 +6783,9 @@ router.get("/admin/gardssalg-content-quality-count", requireAdmin, (req: Request
 //
 // Both map to `vingård`, already a member of DRINK_PRODUCER_TYPES
 // (route-corridor-service.ts) — no new taxonomy.
-const GARDSSALG_NACE_PRODUCER_TYPE: Record<string, string> = {
-  "11.010": "destilleri",
-  "11.020": "vingård",
-  "11.030": "sideri",
-  "11.040": "mjøderi",
-  "11.050": "bryggeri",
-  "01.210": "vingård",
-};
+// The map itself lives in services/gardssalg-nace-producer-type.ts (moved
+// unchanged, dev-request 2026-11-01-opplevagent-drikkeprodusent-
+// selvregistrering) so the self-registration Brreg gate reads the same map.
 const GS_ND_PAGE_SIZE = 100;
 const GS_ND_MAX_PAGES_PER_CODE = 10; // 1000/code — far above the real ~240 ceiling
 const GS_ND_DEFAULT_MAX_CREATE = 400;
