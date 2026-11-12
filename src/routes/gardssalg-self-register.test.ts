@@ -116,8 +116,17 @@ export function runGardssalgSelfRegisterTests(opts: { log?: boolean } = {}): Pro
     const seoPath = require.resolve("./experiences-seo");
     const routePath = require.resolve("./gardssalg-self-register");
     const svcPath = require.resolve("../services/gardssalg-self-register");
+    const claimSvcPath = require.resolve("../services/gardssalg-claim");
+    const claimRoutePath = require.resolve("./gardssalg-claim");
     const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache"))
-      .swapOutModules([dbFactoryPath, expStorePath, seoPath, routePath, svcPath]);
+      .swapOutModules([dbFactoryPath, expStorePath, seoPath, routePath, svcPath, claimSvcPath, claimRoutePath]);
+    const emailSvcMod = require("../services/email-service") as typeof import("../services/email-service");
+    const origSendConfirm = emailSvcMod.emailService.sendGardssalgSelfRegisterConfirmLink;
+    const sends: Array<{ to: string; providerName: string; confirmUrl: string; validHours: number }> = [];
+    (emailSvcMod.emailService as any).sendGardssalgSelfRegisterConfirmLink = async (o: { to: string; providerName: string; confirmUrl: string; validHours: number }) => {
+      sends.push({ ...o });
+      return { success: true, messageId: "stub" };
+    };
 
     let server: any = null;
     let svc: typeof import("../services/gardssalg-self-register") | null = null;
@@ -173,6 +182,7 @@ export function runGardssalgSelfRegisterTests(opts: { log?: boolean } = {}): Pro
         "900000010": enhet("900000010", "AVVIKLING BRYGG AS", "11.050", { underAvvikling: true }),
         "900000011": enhet("900000011", "SPERRET GÅRD AS", "11.020"),
         "900000012": enhet("900000012", "ORIGIN NULL GÅRD AS", "01.210"),
+        "900000013": enhet("900000013", "GJETT IKKE GÅRD AS", "11.020"),
       };
       const brregCalls: string[] = [];
       const stubFetch = (async (input: unknown) => {
@@ -215,6 +225,10 @@ export function runGardssalgSelfRegisterTests(opts: { log?: boolean } = {}): Pro
       // instead of eating into 127.0.0.1's quota that the other route suites
       // in this process share. Both keys are reset in `finally`.
       app.set("trust proxy", true);
+      // The ordinary owner-claim router (ahead of experiences-seo's catch-all
+      // 404, as index.ts mounts it), so the draft session can be shown to be
+      // refused there (portal JSON, pause/resume, magic-link-verify).
+      app.use("/", (require("./gardssalg-claim") as any).default);
       app.use("/", (seo as any).default);
       const httpMod = require("http") as typeof import("http");
       server = httpMod.createServer(app);
@@ -515,10 +529,242 @@ export function runGardssalgSelfRegisterTests(opts: { log?: boolean } = {}): Pro
         const originNull = await post(valid({ org_nr: "900000012", company_name: "Origin Null Gård" }), { Origin: `http://127.0.0.1:${port}`, "Sec-Fetch-Site": "same-origin" });
         assertTrue(originNull.body.includes('data-outcome="created"'), "dup-11: a same-origin POST (real Origin, Sec-Fetch-Site same-origin) is accepted too");
       }
+
+      // ── Skive 2 ────────────────────────────────────────────────────────
+      const claimSvc = require("../services/gardssalg-claim") as typeof import("../services/gardssalg-claim");
+      const cryptoMod = require("crypto") as typeof import("crypto");
+      const provRow = () => db.prepare("SELECT * FROM experience_providers WHERE id = ?").get(createdId) as any;
+      const regRow = () => db.prepare("SELECT * FROM gardssalg_self_registrations WHERE provider_id = ?").get(createdId) as any;
+      const countClaims = () => (db.prepare("SELECT COUNT(*) AS n FROM gardssalg_claims").get() as { n: number }).n;
+      function postForm(urlPath: string, fields: Record<string, string>, headers: Record<string, string> = {}) {
+        return req("POST", urlPath, {
+          headers: { "Content-Type": "application/x-www-form-urlencoded", Origin: "null", ...headers },
+          body: form(fields),
+        });
+      }
+
+      // ── N1: the booking gate sees catalog_hidden_reason on the REAL paths ─
+      {
+        const viaPortalSelect = claimSvc.getClaimProviderById(createdId);
+        assertEq(viaPortalSelect?.catalog_hidden_reason, "self_registered_pending_review",
+          "n1-1: getClaimProviderById (the portal's real SELECT) now returns catalog_hidden_reason");
+        assertEq(viaPortalSelect ? ownerBookingEnableBlock(viaPortalSelect)?.reason : null, "pending_review",
+          "n1-2: ownerBookingEnableBlock on that real row → pending_review");
+        db.prepare("UPDATE experience_providers SET epost = 'post@testvin.no' WHERE id = ?").run(createdId);
+        const upd = claimSvc.updateClaimedProviderProfile(createdId, { booking_live: 1 });
+        assertTrue(!upd.ok && (upd as any).error === "booking_blocked" && (upd as any).block?.reason === "pending_review",
+          "n1-3: updateClaimedProviderProfile (real service SELECT) refuses booking for the pending row even with an e-mail address");
+        assertEq(provRow()?.booking_live, 0, "n1-4: … and nothing was written (booking_live still 0)");
+        db.prepare("UPDATE experience_providers SET epost = NULL WHERE id = ?").run(createdId);
+      }
+
+      // ── AC6 / Spec D: the e-mail code ──────────────────────────────────
+      let token = "";
+      let sessionCookie = "";
+      {
+        const mine = sends.filter((x) => x.providerName === "Testvin Gård");
+        const last = mine[mine.length - 1];
+        assertEq(last?.to, "kari@testvin.no", "ac6-1: a valid submission sends the confirm link to the typed address");
+        const m = /^https:\/\/opplevagent\.no\/for-tilbydere\/registrer\/bekreft\?t=([0-9a-f]{64})$/.exec(last?.confirmUrl || "");
+        assertTrue(!!m, `ac6-2: the link is ${"<base>"}/for-tilbydere/registrer/bekreft?t=<64 hex> (got ${last?.confirmUrl})`);
+        token = m ? m[1] : "";
+        const reg = regRow();
+        assertEq(reg?.email_code_hash, cryptoMod.createHash("sha256").update(token).digest("hex"),
+          "ac6-3: only the SHA-256 of the token is stored");
+        assertTrue(!JSON.stringify(reg).includes(token), "ac6-4: the raw token is nowhere on the registration row");
+        const hrs = (Date.parse(reg?.email_code_expires_at) - Date.now()) / 3600000;
+        assertTrue(hrs > 47 && hrs <= 48, `ac6-5: the code expires in 48 h (got ${hrs.toFixed(2)})`);
+
+        // GET changes nothing.
+        const snapReg = JSON.stringify(regRow());
+        const snapProv = JSON.stringify(provRow());
+        const claimsBefore = countClaims();
+        const g = await req("GET", `/for-tilbydere/registrer/bekreft?t=${token}`);
+        assertEq(g.status, 200, "ac6-6: GET on the confirm link → 200");
+        assertTrue(g.body.includes('method="post" action="/for-tilbydere/registrer/bekreft"') && g.body.includes(`name="t" value="${token}"`),
+          "ac6-7: … a page whose button POSTs the token");
+        assertTrue(g.body.includes('<meta name="robots" content="noindex, nofollow">'), "ac6-8: the confirm page is noindex");
+        assertEq(g.headers["set-cookie"], undefined, "ac6-9: GET sets no cookie");
+        assertEq([JSON.stringify(regRow()), JSON.stringify(provRow()), countClaims()], [snapReg, snapProv, claimsBefore],
+          "ac6-10: GET on the confirm link changed nothing (registration, provider, claims)");
+        const g2 = await req("HEAD", `/for-tilbydere/registrer/bekreft?t=${token}`);
+        assertEq([g2.status, JSON.stringify(regRow()), countClaims()], [200, snapReg, claimsBefore], "ac6-11: HEAD changes nothing either");
+
+        // Wrong / malformed code.
+        const wrong = await postForm("/for-tilbydere/registrer/bekreft", { t: cryptoMod.randomBytes(32).toString("hex") });
+        assertTrue(wrong.status === 400 && wrong.body.includes('data-outcome="confirm_invalid"'), `ac6-12: a wrong code → 400 (got ${wrong.status})`);
+        const junk = await postForm("/for-tilbydere/registrer/bekreft", { t: "x' OR 1=1 --" });
+        assertEq(junk.status, 400, "ac6-13: a malformed code → 400");
+        assertEq(wrong.headers["set-cookie"], undefined, "ac6-14: a refused code sets no cookie");
+        const foreign = await postForm("/for-tilbydere/registrer/bekreft", { t: token }, { Origin: "https://evil.example" });
+        assertEq(foreign.status, 403, "ac6-15: a foreign Origin on the confirm POST → 403 (shared write guard)");
+        const xs = await postForm("/for-tilbydere/registrer/bekreft", { t: token }, { "Sec-Fetch-Site": "cross-site" });
+        assertEq(xs.status, 403, "ac6-16: Sec-Fetch-Site: cross-site on the confirm POST → 403");
+        assertEq([JSON.stringify(regRow()), countClaims()], [snapReg, claimsBefore], "ac6-17: refused POSTs changed nothing");
+
+        // Valid code, Origin: null (plain form under no-referrer).
+        const ok = await postForm("/for-tilbydere/registrer/bekreft", { t: token });
+        assertEq([ok.status, ok.headers.location], [303, "/for-tilbydere/registrer/utkast"], "ac6-18: a valid code (Origin: null) → 303 to the draft editor");
+        const setCookie = ([] as string[]).concat(ok.headers["set-cookie"] || []).find((c) => c.startsWith("oa_owner_session=")) || "";
+        assertTrue(/HttpOnly/i.test(setCookie) && /Secure/i.test(setCookie) && /SameSite=Lax/i.test(setCookie),
+          "ac6-19: … setting the oa_owner_session cookie (HttpOnly, Secure, SameSite=Lax)");
+        sessionCookie = setCookie.split(";")[0];
+        const sessTok = sessionCookie.slice("oa_owner_session=".length);
+        const reg2 = regRow();
+        assertTrue(!!reg2?.email_code_used_at && !!reg2?.email_confirmed_at && reg2?.status === "pending_review",
+          "ac6-20: the code is marked used, the e-mail confirmed, and the registration stays pending_review");
+        const assess = JSON.parse(reg2?.claim_assessment || "{}");
+        assertEq([assess.result, assess.rule_version, assess.reason], ["yellow", svc!.SELF_REGISTER_ASSESSMENT_RULE_VERSION, "assessment_module_missing"],
+          "ac6-21: claim_assessment = yellow (no assessment module yet) with the rule version");
+        assertTrue(Array.isArray(assess.signals) && assess.signals.every((x: any) => x.source && x.at),
+          "ac6-22: … each signal carries its source and time");
+        const claim = db.prepare("SELECT * FROM gardssalg_claims WHERE token = ?").get(sessTok) as any;
+        assertEq([claim?.provider_id, claim?.draft_mode, claim?.used, claim?.email, claim?.email_source, claim?.revoked_at],
+          [createdId, 1, 0, "kari@testvin.no", "self_registered", null],
+          "ac6-23: the session is a gardssalg_claims row: draft_mode=1, used=0, the typed address, source self_registered");
+        const p = provRow();
+        assertEq([p?.catalog_hidden, p?.catalog_hidden_reason, p?.claimed_at, p?.content_source === "claim", p?.epost],
+          [1, "self_registered_pending_review", null, false, null],
+          "ac6-24: the row stays hidden/pending, no claimed_at (no badge), not content_source='claim', no epost");
+        assertEq(claimSvc.isGardssalgProviderClaimed(createdId), false, "ac6-25: the provider does not count as claimed");
+
+        const reuse = await postForm("/for-tilbydere/registrer/bekreft", { t: token });
+        assertTrue(reuse.status === 409 && reuse.body.includes('data-outcome="confirm_used"'), `ac6-26: reusing the code → 409 (got ${reuse.status})`);
+        assertEq((db.prepare("SELECT COUNT(*) AS n FROM gardssalg_claims WHERE provider_id = ?").get(createdId) as any).n, 1,
+          "ac6-27: … and no second session was issued");
+
+        // Expired code (another pending registration).
+        const dupReg = db.prepare("SELECT r.id FROM gardssalg_self_registrations r WHERE r.org_nr = '900000007' AND r.status = 'pending_review'").get() as any;
+        const issued = svc!.issueSelfRegisterConfirmToken(dupReg?.id);
+        assertTrue(!!issued && issued.to === "kari@testvin.no", "ac6-28: a code can be issued for another pending registration");
+        assertEq(svc!.confirmSelfRegisterEmail(issued!.token, new Date(Date.now() + 49 * 3600 * 1000)).ok, false, "ac6-29: the service refuses a code past its 48 h");
+        db.prepare("UPDATE gardssalg_self_registrations SET email_code_expires_at = ? WHERE id = ?").run(new Date(Date.now() - 1000).toISOString(), dupReg?.id);
+        const expired = await postForm("/for-tilbydere/registrer/bekreft", { t: issued!.token });
+        assertTrue(expired.status === 410 && expired.body.includes('data-outcome="confirm_expired"'), `ac6-30: an expired code → 410 (got ${expired.status})`);
+        assertEq((db.prepare("SELECT email_confirmed_at FROM gardssalg_self_registrations WHERE id = ?").get(dupReg?.id) as any)?.email_confirmed_at, null,
+          "ac6-31: … and nothing was confirmed");
+      }
+
+      // ── AC6 / Spec E: draft mode ───────────────────────────────────────
+      {
+        const noCookie = await req("GET", "/for-tilbydere/registrer/utkast");
+        assertEq(noCookie.status, 401, "ac6-32: the draft editor without a session → 401");
+        const page = await req("GET", "/for-tilbydere/registrer/utkast", { headers: { Cookie: sessionCookie } });
+        assertEq(page.status, 200, "ac6-33: the draft editor with the draft session → 200");
+        assertTrue(page.body.includes('data-draft-mode="1"') && page.body.includes("ikke publisert"), "ac6-34: … in draft mode, saying the profile is not published");
+        assertTrue(!/bekreftet av eier/i.test(page.body), "ac6-35: … with no «bekreftet av eier» badge");
+        assertTrue(!page.body.includes('name="field_booking_live"') && page.body.includes('data-booking-state="pending_review"'),
+          "ac6-36: … and no booking switch (pending review message instead)");
+        assertTrue(!/publiser<\/button>|action="[^"]*(resume|publish)/i.test(page.body), "ac6-37: … and no publish action");
+
+        const save = await postForm("/for-tilbydere/registrer/utkast", {
+          field_about_text: "Vi lager vin av egne druer.",
+          field_visit_text: "Gårdssalg lørdager.",
+          field_opening_hours_text: "Lør 12–16",
+          field_products: "Rødvin, Hvitvin",
+          field_hjemmeside: "https://testvin.no",
+        }, { Cookie: sessionCookie });
+        assertEq([save.status, save.headers.location], [303, "/for-tilbydere/registrer/utkast?status=saved"], "ac6-38: saving the draft (Origin: null) → 303 saved");
+        const p = provRow();
+        assertEq([p?.about_text, p?.visit_text, p?.opening_hours_text, p?.products, p?.hjemmeside],
+          ["Vi lager vin av egne druer.", "Gårdssalg lørdager.", "Lør 12–16", JSON.stringify(["Rødvin", "Hvitvin"]), "https://testvin.no"],
+          "ac6-39: the CLAIM_EDITABLE_FIELDS were written to the hidden row");
+        assertEq([p?.catalog_hidden, p?.catalog_hidden_reason, p?.booking_live, p?.claimed_at, p?.epost], [1, "self_registered_pending_review", 0, null, null],
+          "ac6-40: … which stays hidden, pending, booking off, unclaimed, without epost");
+        const audit = (db.prepare("SELECT COUNT(*) AS n FROM gardssalg_content_audit WHERE provider_id = ? AND changed_by = 'owner'").get(createdId) as any).n;
+        assertTrue(audit >= 5, "ac6-41: the edits are audited like owner-portal edits");
+
+        // Booking through the real path, with and without an address.
+        const book = await postForm("/for-tilbydere/registrer/utkast", { field_booking_live: "1" }, { Cookie: sessionCookie });
+        assertTrue(book.status === 409 && book.body.includes('data-status="booking_blocked"'), `ac6-42: posting booking on → 409 refused (got ${book.status})`);
+        db.prepare("UPDATE experience_providers SET epost = 'post@testvin.no' WHERE id = ?").run(createdId);
+        const book2 = await postForm("/for-tilbydere/registrer/utkast", { field_booking_live: "1", field_about_text: "Endret" }, { Cookie: sessionCookie });
+        assertEq(book2.status, 409, "ac6-43: … also when the row has an e-mail address (pending review wins)");
+        assertEq([provRow()?.booking_live, provRow()?.about_text], [0, "Vi lager vin av egne druer."], "ac6-44: a refused save writes nothing");
+        db.prepare("UPDATE experience_providers SET epost = NULL WHERE id = ?").run(createdId);
+
+        const foreignSave = await postForm("/for-tilbydere/registrer/utkast", { field_about_text: "Hack" }, { Cookie: sessionCookie, Origin: "https://evil.example" });
+        assertEq(foreignSave.status, 403, "ac6-45: a foreign Origin on the draft save → 403");
+        const noSessSave = await postForm("/for-tilbydere/registrer/utkast", { field_about_text: "Hack" });
+        assertEq(noSessSave.status, 401, "ac6-46: a draft save without a session → 401");
+        assertEq(provRow()?.about_text, "Vi lager vin av egne druer.", "ac6-47: neither changed the row");
+
+        // The draft session opens nothing on the ordinary owner surfaces.
+        const sessTok = sessionCookie.slice("oa_owner_session=".length);
+        assertEq(claimSvc.verifyGardssalgOwnerSessionToken(sessTok).valid, false, "ac6-48: verifyGardssalgOwnerSessionToken refuses the draft token");
+        const prof = await req("GET", `/api/opplevelser/gardssalg-claim/${createdId}/profile`, { headers: { Cookie: sessionCookie } });
+        assertEq(prof.status, 401, "ac6-49: the owner JSON profile route → 401 for the draft session");
+        const resume = await req("POST", `/api/opplevelser/gardssalg-claim/${createdId}/resume`, { headers: { Cookie: sessionCookie } });
+        assertEq(resume.status, 401, "ac6-50: the owner resume (publish) route → 401 for the draft session");
+        const upd = await req("POST", `/api/opplevelser/gardssalg-claim/${createdId}/update-profile`, {
+          headers: { Cookie: sessionCookie, "Content-Type": "application/json" }, body: JSON.stringify({ booking_live: 1 }),
+        });
+        assertEq(upd.status, 401, "ac6-51: the owner update-profile JSON route → 401 for the draft session");
+        const mlv = await req("GET", `/kategori/gardssalg/eier/magic-link-verify?token=${sessTok}`);
+        assertEq(mlv.headers.location, "/kategori/gardssalg?error=invalid_token", "ac6-52: magic-link-verify refuses the draft token");
+        const c2 = db.prepare("SELECT used, draft_mode FROM gardssalg_claims WHERE token = ?").get(sessTok) as any;
+        assertEq([c2?.used, c2?.draft_mode, provRow()?.claimed_at, provRow()?.content_source === "claim"], [0, 1, null, false],
+          "ac6-53: … and did not turn it into a claim (no used, no claimed_at, no content_source='claim')");
+        assertEq(provRow()?.catalog_hidden, 1, "ac6-54: the row is still hidden after every attempt");
+
+        // Still on no public surface.
+        for (const surface of GARDSSALG_SURFACES) {
+          const n = (db.prepare(`SELECT COUNT(*) AS n FROM experience_providers WHERE id = ? AND ${gardssalgVisibleSql(surface)}`).get(createdId) as any).n;
+          assertEq(n, 0, `ac6-55: after draft edits gardssalgVisibleSql('${surface}') still excludes the row`);
+        }
+        assertEq(store.searchGardssalgProvidersByQuery("Testvin", 30).length, 0, "ac6-56: search still does not find it");
+        assertTrue(!store.searchGardssalgProviders({}, 100, { surface: "mcp" }).some((x: any) => x.id === createdId)
+          && !store.searchGardssalgProviders({}, 100, { surface: "a2a" }).some((x: any) => x.id === createdId), "ac6-57: MCP/A2A still do not list it");
+        const finn = await req("GET", "/for-tilbydere/finn?q=Testvin");
+        assertTrue(!finn.body.includes(createdSlug), "ac6-58: /for-tilbydere/finn still does not list it");
+        const sitemap = await req("GET", "/sitemap.xml");
+        assertTrue(!sitemap.body.includes(createdSlug), "ac6-59: sitemap still does not list it");
+        const produsent = await req("GET", `/kategori/gardssalg/produsent/${createdSlug}`);
+        assertEq(produsent.status, 404, "ac6-60: the produsent page is still 404");
+
+        // A row that leaves pending review ends the draft session.
+        db.prepare("UPDATE experience_providers SET catalog_hidden_reason = 'self_registered_rejected' WHERE id = ?").run(createdId);
+        const after = await req("GET", "/for-tilbydere/registrer/utkast", { headers: { Cookie: sessionCookie } });
+        assertEq(after.status, 401, "ac6-61: once the row is no longer pending review the draft session is refused");
+        db.prepare("UPDATE experience_providers SET catalog_hidden_reason = 'self_registered_pending_review' WHERE id = ?").run(createdId);
+        db.prepare("UPDATE gardssalg_claims SET expires_at = ? WHERE token = ?").run(new Date(Date.now() - 1000).toISOString(), sessTok);
+        const exp = await req("GET", "/for-tilbydere/registrer/utkast", { headers: { Cookie: sessionCookie } });
+        assertEq(exp.status, 401, "ac6-62: an expired draft session is refused");
+      }
+
+      // ── Never guess an e-mail address (2026-08-06) ──────────────────────
+      {
+        const before = sends.length;
+        const r = await post(valid({ org_nr: "900000013", company_name: "Gjett Ikke Gård", email: "eier.privat@gmail.com", website: "https://gjettikke.no" }));
+        assertTrue(r.body.includes('data-outcome="created"'), "ng-1: a registration with a website and a free-mail address is created");
+        await new Promise((res) => setTimeout(res, 20));
+        const mine = sends.slice(before);
+        assertEq(mine.map((x) => x.to), ["eier.privat@gmail.com"], "ng-2: the code goes to the typed address only — never post@/kontakt@<website domain>");
+        const row = db.prepare("SELECT id, epost, hjemmeside FROM experience_providers WHERE org_nr = '900000013'").get() as any;
+        assertEq([row?.epost, row?.hjemmeside], [null, null], "ng-3: the profile gets no epost and no website before approval");
+        assertEq((db.prepare("SELECT COUNT(*) AS n FROM gardssalg_claims WHERE email LIKE '%gjettikke.no'").get() as any).n, 0,
+          "ng-4: no claim/session row names a derived address");
+        const allTyped = new Set(["kari@testvin.no", "eier.privat@gmail.com"]);
+        assertTrue(sends.every((x) => allTyped.has(x.to)), "ng-5: every confirm link in this suite went to an address a submitter typed");
+      }
+
+      // ── Flag OFF → the skive-2 routes are 404 too ───────────────────────
+      {
+        delete process.env.GARDSSALG_SELF_REGISTER_ENABLED;
+        const claimsBefore = countClaims();
+        const a = await req("GET", `/for-tilbydere/registrer/bekreft?t=${token}`);
+        const b = await postForm("/for-tilbydere/registrer/bekreft", { t: token });
+        const c = await req("GET", "/for-tilbydere/registrer/utkast", { headers: { Cookie: sessionCookie } });
+        const d = await postForm("/for-tilbydere/registrer/utkast", { field_about_text: "x" }, { Cookie: sessionCookie });
+        assertEq([a.status, b.status, c.status, d.status], [404, 404, 404, 404], "off-1: flag off — GET/POST bekreft and GET/POST utkast are 404");
+        assertEq(countClaims(), claimsBefore, "off-2: flag off — nothing was written");
+        process.env.GARDSSALG_SELF_REGISTER_ENABLED = "true";
+      }
     } catch (err: any) {
       failed++;
       failures.push(`✗ unexpected error: ${String(err?.stack || err?.message || err)}`);
     } finally {
+      (emailSvcMod.emailService as any).sendGardssalgSelfRegisterConfirmLink = origSendConfirm;
       if (server) {
         try { server.close(); } catch { /* ignore */ }
       }
