@@ -20,6 +20,8 @@
  *              a 423 on delete is retried.
  *   cq20-cq22  Opplevagent: content field + lock; removal = hide (no delete).
  *   cq23-cq27  routes, run ledger, watchdog + digest.
+ *   cqo1-cqo6  opening hours (RFB): text written as a one-item list, locked,
+ *              verified on card + page; day-and-time text; clear; limits.
  *   cqr8-cqr18 second re-review: an Opplevagent removal through the REAL
  *              visibility route blocklists only the plan (never an e-mail,
  *              org.nr or site another active profile uses) and verifies on
@@ -40,6 +42,7 @@
 import Database from "better-sqlite3";
 import * as initMod from "../database/init";
 import * as dbFactory from "../database/db-factory";
+import { openingHoursText } from "../utils/opening-hours";
 
 export interface TestSummary {
   passed: number;
@@ -132,6 +135,8 @@ export function runCsChangeRequestsTests(opts: { log?: boolean } = {}): Promise<
           for (const [k, col] of [["phone", "phone"], ["about", "about"], ["email", "email"], ["address", "address"]] as const) {
             if (body[k] !== undefined) db.prepare(`UPDATE agent_knowledge SET ${col} = ? WHERE agent_id = ?`).run(body[k], decodeURIComponent(m[1]));
           }
+          // As the real write path: openingHours is stored only when it is a list.
+          if (Array.isArray(body.openingHours)) db.prepare("UPDATE agent_knowledge SET opening_hours = ? WHERE agent_id = ?").run(JSON.stringify(body.openingHours), decodeURIComponent(m[1]));
           return res(200, { success: true });
         }
         m = /^\/api\/marketplace\/agents\/([^/?]+)\/description$/.exec(path);
@@ -174,15 +179,20 @@ export function runCsChangeRequestsTests(opts: { log?: boolean } = {}): Promise<
         let m = /^\/api\/marketplace\/agents\/([^/]+)\/card$/.exec(path);
         if (m && cardDown) return r(503, "");
         if (m) {
-          const a = db.prepare(`SELECT a.id, a.name, k.phone, k.about, k.address FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id WHERE a.id = ?`).get(decodeURIComponent(m[1])) as any;
+          const a = db.prepare(`SELECT a.id, a.name, k.phone, k.about, k.address, k.opening_hours FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id WHERE a.id = ?`).get(decodeURIComponent(m[1])) as any;
           if (!a) return r(404, "{}");
-          return r(200, JSON.stringify(staleSurface ? { id: a.id, name: a.name, phone: "22 22 22 22", about: "Gammel tekst om gården" } : a));
+          // As the real card: the stored opening hours list, when there is one.
+          const { opening_hours: oh, ...rest } = a;
+          const hours = oh ? JSON.parse(oh) : [];
+          const card = Array.isArray(hours) && hours.length ? { ...rest, openingHours: hours } : rest;
+          return r(200, JSON.stringify(staleSurface ? { id: a.id, name: a.name, phone: "22 22 22 22", about: "Gammel tekst om gården" } : card));
         }
         m = /^\/produsent\/(.+)$/.exec(path);
         if (m) {
-          const a = (db.prepare(`SELECT a.id, a.name, a.is_active, a.catalog_hidden, k.phone, k.about FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id`).all() as any[]).find((x) => slugify(x.name) === decodeURIComponent(m![1]));
+          const a = (db.prepare(`SELECT a.id, a.name, a.is_active, a.catalog_hidden, k.phone, k.about, k.opening_hours FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id`).all() as any[]).find((x) => slugify(x.name) === decodeURIComponent(m![1]));
           if (!a || a.is_active !== 1) return r(404, "Ikke funnet");
-          return r(200, staleSurface ? `<h1>${a.name}</h1><p>22 22 22 22</p><p>Gammel tekst om gården</p>` : `<h1>${a.name}</h1><p>${a.phone}</p><p>${a.about}</p>`);
+          const hoursText = a.opening_hours ? openingHoursText(JSON.parse(a.opening_hours)) : "";
+          return r(200, staleSurface ? `<h1>${a.name}</h1><p>22 22 22 22</p><p>Gammel tekst om gården</p>` : `<h1>${a.name}</h1><p>${a.phone}</p><p>${a.about}</p><p>${hoursText}</p>`);
         }
         if (path.startsWith("/api/marketplace/search")) {
           const rows = db.prepare("SELECT id, name FROM agents WHERE is_active = 1 AND COALESCE(catalog_hidden, 0) = 0").all();
@@ -529,6 +539,55 @@ export function runCsChangeRequestsTests(opts: { log?: boolean } = {}): Promise<
       await cw.runCsWatchdog({ send: async (o: any) => { alerts.push(o); return { success: true }; }, adminEmail: "admin@example.no", trigger: "manual", now: new Date(Date.now() + 4 * 3600_000) });
       ok(String(alerts[0]?.textContent ?? "").includes("ikke bekreftet på siden"), "cq26: the watchdog alerts a change that was not confirmed on the page");
       ok(cw.buildDailyDigest(new Date()).text.includes("ENDRINGER OG SLETTINGER"), "cq27: the digest reports changes and removals per platform");
+
+      // ── cqo1-cqo6: opening hours (Daniel 2026-11-12: the routine fixes opening hours itself, too) ──
+      {
+        mkAgent("ag-oh", "Åpningsgården", "post@apningsgarden.no", "https://apningsgarden.no");
+        const dayRows = JSON.stringify([{ day: "sat", open: "10:00", close: "14:00" }]);
+        db.prepare("UPDATE agent_knowledge SET opening_hours = ? WHERE agent_id = 'ag-oh'").run(dayRows);
+        const tOh = mkThread("rfb", "post@apningsgarden.no");
+        const ohCreate = (openingHours: string) => create({ targetId: "ag-oh", threadId: tOh, requesterEmail: "post@apningsgarden.no", changes: { openingHours } }) as any;
+        const ohRow = () => (db.prepare("SELECT opening_hours FROM agent_knowledge WHERE agent_id = 'ag-oh'").get() as any)?.opening_hours;
+
+        const o1 = ohCreate("Onsdag, ellers når vi er hjemme");
+        await cq.runCsChangeRequests(deps());
+        const o1call = calls.filter((c) => c.path === "/api/marketplace/agents/ag-oh/knowledge").pop();
+        eq([o1.ok, R(o1.request.id).status, ohRow(), o1call?.body?.openingHours, calls.some((c) => /ag-oh\/curated-fields$/.test(c.path) && c.body.field === "opening_hours")],
+          [true, "verified", JSON.stringify(["Onsdag, ellers når vi er hjemme"]), ["Onsdag, ellers når vi er hjemme"], true],
+          "cqo1: the owner's opening hours as text are written as a one-item list, locked (opening_hours) and seen on the public card + page → verified");
+        eq(JSON.parse(R(o1.request.id).snapshot ?? "{}").openingHours?.old, dayRows, "cqo1b: the snapshot keeps the earlier day rows exactly as stored");
+
+        const o2 = ohCreate("Man–fre 10–17, lør 10–14");
+        await cq.runCsChangeRequests(deps());
+        eq([R(o2.request.id).status, ohRow()], ["verified", JSON.stringify(["Man–fre 10–17, lør 10–14"])], "cqo2: text in the day-and-time form is stored as written and verified");
+
+        staleSurface = true;
+        const o3 = ohCreate("Lørdag 12–15");
+        await cq.runCsChangeRequests(deps());
+        const o3stale = R(o3.request.id).status;
+        staleSurface = false;
+        await cq.runCsChangeRequests(deps());
+        eq([o3stale, R(o3.request.id).status], ["executed", "verified"], "cqo3: hours stored but not yet on the public surfaces stay executed, and verify once they show");
+
+        const o4 = ohCreate("");
+        await cq.runCsChangeRequests(deps());
+        eq([R(o4.request.id).status, ohRow()], ["verified", "[]"], "cqo4: an empty value clears the hours, verified once the old text is gone from the page");
+
+        eq([
+          (ohCreate("x".repeat(1001)) as any).status,
+          (cq.createChangeRequest({ vertical: "experiences", targetId: "ep-1", threadId: null, requesterEmail: "hei@siderivest.no", kind: "profile_update", createdBy: "claude", apply: false, changes: { openingHours: "Lørdag 12–15" } } as any, { env: ON }) as any).status,
+        ], [400, 422], "cqo5: more than 1000 characters → 400; Opplevagent keeps its own field (opening_hours_text), so openingHours there → 422");
+
+        eq([
+          cq.openingHoursComparable(null),
+          cq.openingHoursComparable("[]"),
+          cq.openingHoursComparable(JSON.stringify(["Onsdag"])),
+          cq.openingHoursComparable(dayRows),
+          cq.openingHoursComparable("Lørdag 10–14"),
+          cq.openingHoursComparable(JSON.stringify(["Onsdag", "Fredag"])),
+        ], [null, "", "Onsdag", dayRows, "Lørdag 10–14", JSON.stringify(["Onsdag", "Fredag"])],
+          "cqo6: only a one-item text list (or plain text) compares as text; day rows stay their raw JSON");
+      }
     } catch (err: any) {
       failed++;
       failures.push("unexpected error: " + String(err?.stack || err));
