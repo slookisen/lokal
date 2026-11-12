@@ -253,6 +253,230 @@ function sqliteDateTime(d: Date): string {
   return d.toISOString().slice(0, 19).replace("T", " ");
 }
 
+// ─── Daily sums (admin_order_daily_sums) — slice S5 ─────────────────────────
+//
+// Spec point 9 / AC7: a nightly job (services/admin-order-daily-sums.ts)
+// freezes, for every completed UTC day, the SAME grouped rows the live
+// queries below produce (one row per plattform × metrikk × dimensjon × dag),
+// so the history survives when single rows are later deleted. A written row
+// is never overwritten (INSERT OR IGNORE). No personal data: a dimension is a
+// small JSON object of producer/provider id, status, click type and the
+// bot/test flags — never a name, e-mail, phone, note, session or IP.
+//
+// Each source has one marker row per day (metrikk '<kilde>.rader',
+// dimensjon '') whose verdi is the number of source rows that day when it
+// was frozen. Its presence means "this day is frozen", also for a day with
+// zero rows.
+//
+// READ RULE (which days come from the frozen sums): for a day D in the
+// period, the frozen sums replace the live rows of D only when a marker for
+// D exists AND the live row count for D is now LOWER than the frozen count —
+// i.e. rows have been deleted since D was frozen. Every other day (today,
+// days not yet frozen, days where nothing disappeared) is read live. So the
+// numbers for data nobody deleted are exactly the live numbers (also after a
+// later status change, which a frozen sum would not see), and a deleted row
+// never lowers a past day's numbers. Live-only figures (not reconstructable
+// from day sums): response-time measures, the «ubesvarte over 24 t»
+// snapshot and the AI-delivery block (profile_ai_deliveries is itself a
+// daily-sum table).
+
+export const DAILY_SUMS_TABLE = "admin_order_daily_sums";
+
+/** The UTC calendar day of a stored timestamp, as the text-range filters see it. */
+function DAG_SQL(col: string): string {
+  return `substr(${col}, 1, 10)`;
+}
+
+export interface DailySumCodec {
+  /** admin_order_daily_sums.plattform */
+  plattform: string;
+  /** metrikk prefix: '<kilde>.<maal>' rows plus the '<kilde>.rader' marker. */
+  kilde: string;
+  /** Group columns stored in dimensjon (JSON, in this order). */
+  dims: string[];
+  /** maal → row field. 'antall' is always the row count field n. */
+  measures: Record<string, string>;
+  /** Row order of the live query (its ORDER BY), applied after a merge. */
+  order: string[];
+  /** Write-time normalization of a dimension value (closed vocabularies). */
+  normalize?: (field: string, v: unknown) => unknown;
+}
+
+const RFB_CLICK_KIND_RE = /^(website|phone|email)$/;
+const EXTERNAL_KIND_STORE_RE = /^external:([a-z0-9_-]{1,40})$/;
+/** contact_clicks.kind as stored in a daily sum: same admin type and channel, closed vocabulary. */
+export function normalizeRfbClickKind(kind: unknown): string {
+  const k = String(kind ?? "");
+  if (RFB_CLICK_KIND_RE.test(k)) return k;
+  if (k.startsWith("external:")) {
+    const m = EXTERNAL_KIND_STORE_RE.exec("external:" + k.slice("external:".length).toLowerCase());
+    return m ? m[0] : "external:annet";
+  }
+  return "annet";
+}
+const PROFIL_KIND_STORE = new Set(["booking", "website", "phone", "email", "directory"]);
+export function normalizeProfilClickKind(kind: unknown): string {
+  const k = String(kind ?? "");
+  return PROFIL_KIND_STORE.has(k) ? k : "annet";
+}
+const normalizeFlag = (v: unknown) => (Number(v) === 1 ? 1 : 0);
+
+export const ORDRE_CODEC: DailySumCodec = {
+  plattform: "rfb", kilde: "ordre",
+  dims: ["agent_id", "status", "is_test"],
+  measures: { antall: "n", sum_nok: "sum_nok" },
+  order: ["agent_id", "status", "bucket", "is_test", "dag"],
+  normalize: (f, v) => (f === "is_test" ? normalizeFlag(v) : v),
+};
+export const OVERLEVERINGER_CODEC: DailySumCodec = {
+  plattform: "rfb", kilde: "overleveringer",
+  dims: ["is_test"],
+  measures: { antall: "n" },
+  order: ["is_test", "dag"],
+  normalize: (f, v) => (f === "is_test" ? normalizeFlag(v) : v),
+};
+export const FORESPOERSLER_CODEC: DailySumCodec = {
+  plattform: "gardssalg", kilde: "forespoersler",
+  dims: ["provider_id", "status", "pre_status", "is_test"],
+  measures: { antall: "n", personer: "party", fakturerbar: "billable" },
+  order: ["provider_id", "status", "pre_status", "bucket", "is_test", "dag"],
+  normalize: (f, v) => (f === "is_test" ? normalizeFlag(v) : v),
+};
+export const RFB_KLIKK_CODEC: DailySumCodec = {
+  plattform: "rfb", kilde: "klikk",
+  dims: ["agent_id", "kind", "is_bot", "is_test"],
+  measures: { antall: "n" },
+  order: ["agent_id", "kind", "bucket", "is_bot", "is_test", "dag"],
+  normalize: (f, v) => (f === "kind" ? normalizeRfbClickKind(v) : f === "is_bot" || f === "is_test" ? normalizeFlag(v) : v),
+};
+export function profilKlikkCodec(plattform: string): DailySumCodec {
+  return {
+    plattform, kilde: "klikk",
+    dims: ["provider_id", "kind", "is_bot", "is_test"],
+    measures: { antall: "n" },
+    order: ["provider_id", "kind", "bucket", "is_bot", "is_test", "dag"],
+    normalize: (f, v) => (f === "kind" ? normalizeProfilClickKind(v) : f === "is_bot" || f === "is_test" ? normalizeFlag(v) : v),
+  };
+}
+
+export function dailySumMarkerMetric(codec: DailySumCodec): string {
+  return `${codec.kilde}.rader`;
+}
+
+/** The dimensjon string of a grouped row (JSON of codec.dims, in order). */
+export function encodeDailySumDimension(codec: DailySumCodec, row: Record<string, unknown>): string {
+  const o: Record<string, unknown> = {};
+  for (const f of codec.dims) {
+    const v = row[f] === undefined ? null : row[f];
+    o[f] = codec.normalize ? codec.normalize(f, v) : v;
+  }
+  return JSON.stringify(o);
+}
+
+/** Where to read frozen sums from. `force` (equivalence tests): use every frozen day, deleted rows or not. */
+export interface DailySumsRead { db: Db; force?: boolean }
+
+export interface DagssumBruk { dager: string[]; forklaring: string }
+
+function dagssumBruk(days: string[]): DagssumBruk | null {
+  if (days.length === 0) return null;
+  return {
+    dager: Array.from(new Set(days)).sort(),
+    forklaring:
+      "For disse dagene er enkeltrader slettet etter at dagen ble låst. Tallene for dagene er derfor hentet fra dagssummene " +
+      "(skrevet natten etter dagen, uten persondata) i stedet for fra de gjenværende radene. Status er slik den var da dagen ble låst.",
+  };
+}
+
+/** Day key → bucket key, the same keys bucketSql() gives for that day. */
+export function bucketOfDay(dag: string, oppl: Opplosning): string | null {
+  const d = parseDate(dag);
+  if (!d) return null;
+  if (oppl === "dag") return dag;
+  if (oppl === "maaned") return dag.slice(0, 7);
+  const dow = (d.getUTCDay() + 6) % 7; // 0 = Monday
+  return isoDate(addDays(d, -dow));
+}
+
+function cmpSqlValue(a: unknown, b: unknown): number {
+  // SQLite ORDER BY: NULL first, numbers before text, text by BINARY.
+  const rank = (v: unknown) => (v === null || v === undefined ? 0 : typeof v === "number" ? 1 : 2);
+  const ra = rank(a), rb = rank(b);
+  if (ra !== rb) return ra - rb;
+  if (ra === 0) return 0;
+  if (ra === 1) return (a as number) - (b as number);
+  const sa = String(a), sb = String(b);
+  return sa < sb ? -1 : sa > sb ? 1 : 0;
+}
+
+/**
+ * The read rule above, for one source: live rows of the days whose rows have
+ * disappeared are replaced by the frozen rows of those days. `fill` sets the
+ * fields a frozen row does not store (display name). Returns the rows in the
+ * live query's order and the days that came from the frozen sums.
+ */
+export function applyDailySums<R extends { dag: string | null; n: number }>(
+  read: DailySumsRead | null | undefined,
+  codec: DailySumCodec,
+  live: R[],
+  periode: Periode,
+  oppl: Opplosning,
+  fill?: (r: R) => void,
+): { rows: R[]; days: string[] } {
+  if (!read) return { rows: live, days: [] };
+  if (!tableExists(read.db, DAILY_SUMS_TABLE)) return { rows: live, days: [] };
+  const markers = read.db.prepare(
+    `SELECT dag, verdi FROM ${DAILY_SUMS_TABLE}
+      WHERE plattform = ? AND metrikk = ? AND dimensjon = '' AND dag >= ? AND dag <= ?`
+  ).all(codec.plattform, dailySumMarkerMetric(codec), periode.fra, periode.til) as Array<{ dag: string; verdi: number }>;
+  if (markers.length === 0) return { rows: live, days: [] };
+  const liveCount = new Map<string, number>();
+  for (const r of live) if (r.dag !== null) liveCount.set(r.dag, (liveCount.get(r.dag) ?? 0) + Number(r.n));
+  const useDays = markers
+    .filter((m) => read.force === true || (liveCount.get(m.dag) ?? 0) < Number(m.verdi))
+    .map((m) => m.dag);
+  if (useDays.length === 0) return { rows: live, days: [] };
+
+  const use = new Set(useDays);
+  const out = live.filter((r) => !(r.dag !== null && use.has(r.dag)));
+  const stmt = read.db.prepare(
+    `SELECT metrikk, dimensjon, verdi FROM ${DAILY_SUMS_TABLE}
+      WHERE plattform = ? AND dag = ? AND metrikk >= ? AND metrikk < ? AND dimensjon <> ''`
+  );
+  const fieldOf = new Map<string, string>();
+  for (const [maal, field] of Object.entries(codec.measures)) fieldOf.set(`${codec.kilde}.${maal}`, field);
+  for (const dag of useDays) {
+    const byDim = new Map<string, Record<string, unknown>>();
+    const frozen = stmt.all(codec.plattform, dag, `${codec.kilde}.`, `${codec.kilde}/`) as Array<{ metrikk: string; dimensjon: string; verdi: number }>;
+    for (const f of frozen) {
+      const field = fieldOf.get(f.metrikk);
+      if (!field) continue;
+      let row = byDim.get(f.dimensjon);
+      if (!row) {
+        let dims: Record<string, unknown>;
+        try { dims = JSON.parse(f.dimensjon) as Record<string, unknown>; } catch { continue; }
+        row = { ...dims, dag, bucket: bucketOfDay(dag, oppl) };
+        for (const fld of Object.values(codec.measures)) row[fld] = 0;
+        byDim.set(f.dimensjon, row);
+      }
+      row[field] = Number(f.verdi);
+    }
+    for (const row of byDim.values()) {
+      const r = row as unknown as R;
+      fill?.(r);
+      out.push(r);
+    }
+  }
+  out.sort((a, b) => {
+    for (const k of codec.order) {
+      const c = cmpSqlValue((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]);
+      if (c !== 0) return c;
+    }
+    return 0;
+  });
+  return { rows: out, days: useDays };
+}
+
 // ─── RFB overview ───────────────────────────────────────────────────────────
 
 export interface RfbProducerRow {
@@ -274,6 +498,8 @@ export interface RfbOverview {
   response_time: { measured: number; unanswered: number; median_hours: number | null; avg_hours: number | null; forklaring: string };
   unanswered_over_24h: { count: number; hours: number; forklaring: string };
   cart_handoffs: { count: number; forklaring: string };
+  /** Slice S5: present only when frozen daily sums replaced live rows for some day. */
+  dagssummer?: DagssumBruk;
   test: {
     forklaring: string;
     total: number;
@@ -285,20 +511,63 @@ export interface RfbOverview {
   };
 }
 
-export function computeRfbOverview(db: Db, periode: Periode, oppl: Opplosning, now: Date = new Date()): RfbOverview {
-  const range = [periode.fra, periode.til_eksklusiv];
-  const bucket = bucketSql("o.created_at", oppl);
+export interface RfbOrderGroupRow { dag: string | null; agent_id: string; name: string | null; status: string; bucket: string | null; is_test: number; n: number; sum_nok: number | null }
 
-  // One grouped pass: producer × bucket × status × test flag.
-  const rows = db.prepare(
-    `SELECT o.agent_id AS agent_id, a.name AS name, o.status AS status, ${bucket} AS bucket,
+/**
+ * One grouped pass over orders created in [fra, tilEksklusiv): producer ×
+ * status × bucket × test flag × day. Shared by the oversikt (live read) and
+ * the nightly daily-sum job (services/admin-order-daily-sums.ts), so the two
+ * count with the same SQL and the same test rule.
+ */
+export function queryRfbOrderRows(db: Db, fra: string, tilEksklusiv: string, oppl: Opplosning): RfbOrderGroupRow[] {
+  const bucket = bucketSql("o.created_at", oppl);
+  return db.prepare(
+    `SELECT ${DAG_SQL("o.created_at")} AS dag, o.agent_id AS agent_id, a.name AS name, o.status AS status, ${bucket} AS bucket,
             ${RFB_IS_TEST_SQL} AS is_test,
             COUNT(*) AS n,
             SUM(CASE WHEN o.status IN ${RFB_REVENUE_SQL} THEN COALESCE(o.total_nok, 0) ELSE 0 END) AS sum_nok
        FROM orders o LEFT JOIN agents a ON a.id = o.agent_id
       WHERE o.created_at >= ? AND o.created_at < ?
-      GROUP BY o.agent_id, o.status, bucket, is_test`
-  ).all(...range) as Array<{ agent_id: string; name: string | null; status: string; bucket: string; is_test: number; n: number; sum_nok: number | null }>;
+      GROUP BY o.agent_id, o.status, bucket, is_test, dag
+      ORDER BY o.agent_id, o.status, bucket, is_test, dag`
+  ).all(fra, tilEksklusiv) as RfbOrderGroupRow[];
+}
+
+export interface RfbHandoffGroupRow { dag: string | null; bucket: string | null; is_test: number; n: number }
+
+/** cart_handoffs created in [fra, tilEksklusiv) per test flag × day (shared with the nightly job). */
+export function queryRfbHandoffRows(db: Db, fra: string, tilEksklusiv: string): RfbHandoffGroupRow[] {
+  return db.prepare(
+    `SELECT ${DAG_SQL("h.created_at")} AS dag, NULL AS bucket, ${RFB_HANDOFF_IS_TEST_SQL} AS is_test, COUNT(*) AS n
+       FROM cart_handoffs h LEFT JOIN agents a ON a.id = h.agent_id
+      WHERE h.created_at >= ? AND h.created_at < ?
+      GROUP BY is_test, dag
+      ORDER BY is_test, dag`
+  ).all(fra, tilEksklusiv) as RfbHandoffGroupRow[];
+}
+
+/** Display name of an RFB producer (frozen daily-sum rows carry only the id). */
+function rfbAgentNameLookup(db: Db): (id: string) => string | null {
+  const cache = new Map<string, string | null>();
+  return (id: string) => {
+    if (!cache.has(id)) {
+      let name: string | null = null;
+      try { name = (db.prepare("SELECT name FROM agents WHERE id = ?").get(id) as { name: string | null } | undefined)?.name ?? null; } catch { name = null; }
+      cache.set(id, name);
+    }
+    return cache.get(id) ?? null;
+  };
+}
+
+export function computeRfbOverview(db: Db, periode: Periode, oppl: Opplosning, now: Date = new Date(), sums: DailySumsRead | null = null): RfbOverview {
+  const range = [periode.fra, periode.til_eksklusiv];
+
+  // One grouped pass: producer × bucket × status × test flag (× day, so a
+  // day whose rows were deleted can be read from the frozen daily sums).
+  const nameOf = rfbAgentNameLookup(db);
+  const orderMerge = applyDailySums(sums, ORDRE_CODEC, queryRfbOrderRows(db, periode.fra, periode.til_eksklusiv, oppl), periode, oppl,
+    (r) => { r.name = nameOf(r.agent_id); });
+  const rows = orderMerge.rows;
 
   const byStatus = zeroCounts(RFB_ORDER_STATUSES);
   const testByStatus = zeroCounts(RFB_ORDER_STATUSES);
@@ -327,7 +596,7 @@ export function computeRfbOverview(db: Db, periode: Periode, oppl: Opplosning, n
     p.by_status[r.status] = (p.by_status[r.status] ?? 0) + r.n;
     p.sum_nok += amount;
     producers.set(r.agent_id, p);
-    const s = series.get(r.bucket);
+    const s = series.get(r.bucket ?? "");
     if (s) {
       s.total += r.n;
       s.by_status[r.status] = (s.by_status[r.status] ?? 0) + r.n;
@@ -361,13 +630,11 @@ export function computeRfbOverview(db: Db, periode: Periode, oppl: Opplosning, n
       GROUP BY is_test`
   ).all(cutoff) as Array<{ is_test: number; n: number }>;
 
-  const handoffs = db.prepare(
-    `SELECT ${RFB_HANDOFF_IS_TEST_SQL} AS is_test, COUNT(*) AS n
-       FROM cart_handoffs h LEFT JOIN agents a ON a.id = h.agent_id
-      WHERE h.created_at >= ? AND h.created_at < ?
-      GROUP BY is_test`
-  ).all(...range) as Array<{ is_test: number; n: number }>;
-  const pick = (rs: Array<{ is_test: number; n: number }>, t: number) => rs.find((r) => Number(r.is_test) === t)?.n ?? 0;
+  const handoffMerge = applyDailySums(sums, OVERLEVERINGER_CODEC, queryRfbHandoffRows(db, periode.fra, periode.til_eksklusiv), periode, oppl);
+  const handoffs = handoffMerge.rows;
+  const pick = (rs: Array<{ is_test: number; n: number }>, t: number) =>
+    rs.reduce((acc, r) => acc + (Number(r.is_test) === t ? Number(r.n) : 0), 0);
+  const dagssummer = dagssumBruk([...orderMerge.days, ...handoffMerge.days]);
 
   const producerList = [...producers.values()]
     .map((p) => ({ ...p, sum_nok: round2(p.sum_nok) }))
@@ -418,6 +685,7 @@ export function computeRfbOverview(db: Db, periode: Periode, oppl: Opplosning, n
       cart_handoffs: pick(handoffs, 1),
       producers: [...testProducers.values()],
     },
+    ...(dagssummer ? { dagssummer } : {}),
   };
 }
 
@@ -443,6 +711,8 @@ export interface GardssalgOverview {
   series: Array<{ bucket: string; total: number; by_status: Record<string, number>; party_size_sum: number }>;
   response_time: { measured: number; median_hours: number | null; avg_hours: number | null; forklaring: string };
   merknader: string[];
+  /** Slice S5: present only when frozen daily sums replaced live rows for some day. */
+  dagssummer?: DagssumBruk;
   test: {
     forklaring: string;
     total: number;
@@ -460,19 +730,38 @@ export function gardssalgUnavailable(reason: string): GardssalgUnavailable {
   };
 }
 
-export function computeGardssalgOverview(db: Db, periode: Periode, oppl: Opplosning): GardssalgOverview {
-  const range = [periode.fra, periode.til_eksklusiv];
+export interface GardssalgGroupRow { dag: string | null; provider_id: string; name: string | null; status: string; pre_status: string; bucket: string | null; is_test: number; n: number; party: number | null; billable: number | null }
+
+/** gardssalg_bookings created in [fra, tilEksklusiv), grouped (shared with the nightly job). */
+export function queryGardssalgRows(db: Db, fra: string, tilEksklusiv: string, oppl: Opplosning): GardssalgGroupRow[] {
   const bucket = bucketSql("b.created_at", oppl);
-  const rows = db.prepare(
-    `SELECT b.provider_id AS provider_id, p.navn AS name, b.status AS status,
+  return db.prepare(
+    `SELECT ${DAG_SQL("b.created_at")} AS dag, b.provider_id AS provider_id, p.navn AS name, b.status AS status,
             COALESCE(b.pre_status, 'awaiting_provider') AS pre_status, ${bucket} AS bucket,
             ${GS_IS_TEST_SQL} AS is_test,
             COUNT(*) AS n, SUM(COALESCE(b.party_size, 0)) AS party,
             SUM(CASE WHEN COALESCE(b.billable, 0) = 1 THEN 1 ELSE 0 END) AS billable
        FROM gardssalg_bookings b LEFT JOIN experience_providers p ON p.id = b.provider_id
       WHERE b.created_at >= ? AND b.created_at < ?
-      GROUP BY b.provider_id, b.status, pre_status, bucket, is_test`
-  ).all(...range) as Array<{ provider_id: string; name: string | null; status: string; pre_status: string; bucket: string; is_test: number; n: number; party: number | null; billable: number | null }>;
+      GROUP BY b.provider_id, b.status, pre_status, bucket, is_test, dag
+      ORDER BY b.provider_id, b.status, pre_status, bucket, is_test, dag`
+  ).all(fra, tilEksklusiv) as GardssalgGroupRow[];
+}
+
+/**
+ * `sums` (slice S5): the database holding admin_order_daily_sums (lokal.db,
+ * not the experiences DB this function otherwise reads). null = live only.
+ */
+export function computeGardssalgOverview(db: Db, periode: Periode, oppl: Opplosning, sums: DailySumsRead | null = null): GardssalgOverview {
+  const range = [periode.fra, periode.til_eksklusiv];
+  const providerName = (id: string): string | null => {
+    try { return (db.prepare("SELECT navn FROM experience_providers WHERE id = ?").get(id) as { navn: string | null } | undefined)?.navn ?? null; }
+    catch { return null; }
+  };
+  const merged = applyDailySums(sums, FORESPOERSLER_CODEC, queryGardssalgRows(db, periode.fra, periode.til_eksklusiv, oppl), periode, oppl,
+    (r) => { r.name = providerName(r.provider_id); });
+  const rows = merged.rows;
+  const dagssummer = dagssumBruk(merged.days);
 
   const byStatus = zeroCounts(GARDSSALG_STATUSES);
   const byPre = zeroCounts(GARDSSALG_PRE_STATUSES);
@@ -504,7 +793,7 @@ export function computeGardssalgOverview(db: Db, periode: Periode, oppl: Opplosn
     p.by_status[r.status] = (p.by_status[r.status] ?? 0) + r.n;
     p.party_size_sum += ps;
     providers.set(r.provider_id, p);
-    const s = series.get(r.bucket);
+    const s = series.get(r.bucket ?? "");
     if (s) {
       s.total += r.n;
       s.by_status[r.status] = (s.by_status[r.status] ?? 0) + r.n;
@@ -566,6 +855,7 @@ export function computeGardssalgOverview(db: Db, periode: Periode, oppl: Opplosn
       party_size_sum: testParty,
       providers: [...testProviders.values()],
     },
+    ...(dagssummer ? { dagssummer } : {}),
   };
 }
 
@@ -631,22 +921,36 @@ export interface RfbReferrals {
     producers: Array<{ agent_id: string; name: string | null; total: number }>;
   };
   merknader: string[];
+  /** Slice S5: present only when frozen daily sums replaced live rows for some day. */
+  dagssummer?: DagssumBruk;
 }
 
-export function computeRfbReferrals(db: Db, periode: Periode, oppl: Opplosning): RfbReferrals | Unavailable {
-  if (!tableExists(db, "contact_clicks")) {
-    return { available: false, forklaring: "Henvisninger (contact_clicks) kunne ikke leses.", merknader: ["Tabellen contact_clicks finnes ikke i denne databasen."] };
-  }
+export interface RfbClickGroupRow { dag: string | null; agent_id: string; name: string | null; kind: string; bucket: string | null; is_bot: number; is_test: number; n: number }
+
+/** contact_clicks created in [fra, tilEksklusiv), grouped (shared with the nightly job). */
+export function queryRfbClickRows(db: Db, fra: string, tilEksklusiv: string, oppl: Opplosning): RfbClickGroupRow[] {
   const bucket = bucketSql("c.created_at", oppl);
-  const rows = db.prepare(
-    `SELECT c.agent_id AS agent_id, a.name AS name, c.kind AS kind, ${bucket} AS bucket,
+  return db.prepare(
+    `SELECT ${DAG_SQL("c.created_at")} AS dag, c.agent_id AS agent_id, a.name AS name, c.kind AS kind, ${bucket} AS bucket,
             CASE WHEN c.is_bot = 1 THEN 1 ELSE 0 END AS is_bot,
             ${RFB_CLICK_IS_TEST_SQL} AS is_test,
             COUNT(*) AS n
        FROM contact_clicks c LEFT JOIN agents a ON a.id = c.agent_id
       WHERE c.created_at >= ? AND c.created_at < ?
-      GROUP BY c.agent_id, c.kind, bucket, is_bot, is_test`
-  ).all(periode.fra, periode.til_eksklusiv) as Array<{ agent_id: string; name: string | null; kind: string; bucket: string; is_bot: number; is_test: number; n: number }>;
+      GROUP BY c.agent_id, c.kind, bucket, is_bot, is_test, dag
+      ORDER BY c.agent_id, c.kind, bucket, is_bot, is_test, dag`
+  ).all(fra, tilEksklusiv) as RfbClickGroupRow[];
+}
+
+export function computeRfbReferrals(db: Db, periode: Periode, oppl: Opplosning, sums: DailySumsRead | null = null): RfbReferrals | Unavailable {
+  if (!tableExists(db, "contact_clicks")) {
+    return { available: false, forklaring: "Henvisninger (contact_clicks) kunne ikke leses.", merknader: ["Tabellen contact_clicks finnes ikke i denne databasen."] };
+  }
+  const nameOf = rfbAgentNameLookup(db);
+  const merged = applyDailySums(sums, RFB_KLIKK_CODEC, queryRfbClickRows(db, periode.fra, periode.til_eksklusiv, oppl), periode, oppl,
+    (r) => { r.name = nameOf(r.agent_id); });
+  const rows = merged.rows;
+  const dagssummer = dagssumBruk(merged.days);
 
   const byType = zeroTypes();
   const botByType = zeroTypes();
@@ -676,7 +980,7 @@ export function computeRfbReferrals(db: Db, periode: Periode, oppl: Opplosning):
     byType[t] += r.n;
     const ch = externalChannel(r.kind);
     if (ch !== null) social[ch] = (social[ch] ?? 0) + r.n;
-    const s = series.get(r.bucket);
+    const s = series.get(r.bucket ?? "");
     if (s) { s.total += r.n; s.by_type[t] += r.n; }
   }
 
@@ -717,6 +1021,7 @@ export function computeRfbReferrals(db: Db, periode: Periode, oppl: Opplosning):
       "Telefon- og e-postklikk registreres bare når siden kjører JavaScript; selve oppringingen eller e-posten ser vi ikke.",
       "Et klikk betyr at noen åpnet lenken, ikke at de tok kontakt eller handlet.",
     ],
+    ...(dagssummer ? { dagssummer } : {}),
   };
 }
 
@@ -775,6 +1080,8 @@ export interface ProfilReferrals {
     providers: Array<{ provider_id: string; name: string | null; total: number }>;
   };
   merknader: string[];
+  /** Slice S5: present only when frozen daily sums replaced live rows for some day. */
+  dagssummer?: DagssumBruk;
 }
 
 /**
@@ -782,27 +1089,38 @@ export interface ProfilReferrals {
  * (optional) names the test providers; it reads the vertical database, which
  * the caller may not have open — then the name is null.
  */
+export interface ProfilClickGroupRow { dag: string | null; provider_id: string | null; kind: string; bucket: string | null; is_bot: number; is_test: number; n: number }
+
+/** One platform's profile_link_clicks created in [fra, tilEksklusiv), grouped (shared with the nightly job). */
+export function queryProfilClickRows(db: Db, plattform: ProfilHenvisningPlattform, fra: string, tilEksklusiv: string, oppl: Opplosning): ProfilClickGroupRow[] {
+  const bucket = bucketSql("c.created_at", oppl);
+  return db.prepare(
+    `SELECT ${DAG_SQL("c.created_at")} AS dag, c.provider_id AS provider_id, c.kind AS kind, ${bucket} AS bucket,
+            CASE WHEN c.is_bot = 1 THEN 1 ELSE 0 END AS is_bot,
+            CASE WHEN c.is_test = 1 THEN 1 ELSE 0 END AS is_test,
+            COUNT(*) AS n
+       FROM profile_link_clicks c
+      WHERE c.platform = ? AND c.created_at >= ? AND c.created_at < ?
+      GROUP BY c.provider_id, c.kind, bucket, is_bot, is_test, dag
+      ORDER BY c.provider_id, c.kind, bucket, is_bot, is_test, dag`
+  ).all(plattform, fra, tilEksklusiv) as ProfilClickGroupRow[];
+}
+
 export function computeProfilReferrals(
   db: Db,
   plattform: ProfilHenvisningPlattform,
   periode: Periode,
   oppl: Opplosning,
   providerName: (providerId: string) => string | null = () => null,
+  sums: DailySumsRead | null = null,
 ): ProfilReferrals | Unavailable {
   const meta = PROFIL_PLATTFORM_NAVN[plattform];
   if (!tableExists(db, "profile_link_clicks")) {
     return { available: false, forklaring: `Henvisninger for ${meta.navn} (profile_link_clicks) kunne ikke leses.`, merknader: ["Tabellen profile_link_clicks finnes ikke i denne databasen."] };
   }
-  const bucket = bucketSql("c.created_at", oppl);
-  const rows = db.prepare(
-    `SELECT c.provider_id AS provider_id, c.kind AS kind, ${bucket} AS bucket,
-            CASE WHEN c.is_bot = 1 THEN 1 ELSE 0 END AS is_bot,
-            CASE WHEN c.is_test = 1 THEN 1 ELSE 0 END AS is_test,
-            COUNT(*) AS n
-       FROM profile_link_clicks c
-      WHERE c.platform = ? AND c.created_at >= ? AND c.created_at < ?
-      GROUP BY c.provider_id, c.kind, bucket, is_bot, is_test`
-  ).all(plattform, periode.fra, periode.til_eksklusiv) as Array<{ provider_id: string | null; kind: string; bucket: string; is_bot: number; is_test: number; n: number }>;
+  const merged = applyDailySums(sums, profilKlikkCodec(plattform), queryProfilClickRows(db, plattform, periode.fra, periode.til_eksklusiv, oppl), periode, oppl);
+  const rows = merged.rows;
+  const dagssummer = dagssumBruk(merged.days);
 
   const byType = zeroProfilTypes();
   const botByType = zeroProfilTypes();
@@ -830,7 +1148,7 @@ export function computeProfilReferrals(
     }
     total += r.n;
     byType[t] += r.n;
-    const s = series.get(r.bucket);
+    const s = series.get(r.bucket ?? "");
     if (s) { s.total += r.n; s.by_type[t] += r.n; }
   }
   for (const tp of testProviders.values()) {
@@ -875,6 +1193,7 @@ export function computeProfilReferrals(
       "Et klikk betyr at noen åpnet lenken, ikke at de bestilte eller tok kontakt.",
       "Tellingen startet da lenkene på profilsidene ble lagt om (leveranse S4); dager før det har ingen klikk.",
     ],
+    ...(dagssummer ? { dagssummer } : {}),
   };
 }
 

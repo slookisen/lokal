@@ -5035,6 +5035,32 @@ function initSchema(db: Database.Database): void {
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_profile_link_clicks_platform_created ON profile_link_clicks(platform, created_at)`);
 
+  // dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord, slice S5:
+  // admin_order_daily_sums — frozen per-day sums for the admin order /
+  // referral dashboard (spec point 9, AC7), written by the nightly job in
+  // services/admin-order-daily-sums.ts and read by services/admin-order-stats.ts.
+  // One row per plattform ('rfb' | 'gardssalg' | 'opplevelser' | 'tannlege')
+  // × metrikk ('<kilde>.<maal>', e.g. 'ordre.antall', plus the per-day
+  // marker '<kilde>.rader' with dimensjon '') × dimensjon (JSON of producer /
+  // provider id, status, click type, bot / test flag) × dag (UTC
+  // 'YYYY-MM-DD'). NO personal data: no name, e-mail, phone, note, session,
+  // IP or URL. Rows are only ever INSERT OR IGNORE'd (a day, once written, is
+  // frozen). Gårdssalg sums live here too, not in experiences.db, so one
+  // table holds the whole history. Brand-new additive table → CREATE IF NOT
+  // EXISTS is the whole migration; rollback may leave it in place.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS admin_order_daily_sums (
+      plattform   TEXT NOT NULL,
+      metrikk     TEXT NOT NULL,
+      dimensjon   TEXT NOT NULL DEFAULT '',
+      dag         TEXT NOT NULL,
+      verdi       REAL NOT NULL DEFAULT 0,
+      computed_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (plattform, metrikk, dimensjon, dag)
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_admin_order_daily_sums_dag ON admin_order_daily_sums(plattform, dag)`);
+
   // B4: where the visitor who clicked came from (utm_source on the landing
   // URL / same-origin Referer). Nullable, additive; metadata-only ALTER.
   try {
