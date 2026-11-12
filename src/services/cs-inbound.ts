@@ -290,7 +290,7 @@ export function readInboundHeaders(...sources: unknown[]): InboundHeaders {
 
 // ─── Automated mail ───────────────────────────────────────────────────
 
-export type AutomatedKind = "auto_reply" | "bounce" | null;
+export type AutomatedKind = "auto_reply" | "bounce" | "report" | null;
 
 const BOUNCE_FROM_RE = /^(mailer-daemon|postmaster|mail-daemon|bounce[s]?)@/i;
 const BOUNCE_SUBJECT_RE =
@@ -302,12 +302,28 @@ const BOUNCE_SUBJECT_RE =
 const AUTOREPLY_SUBJECT_RE =
   /^(automatisk svar|autosvar|autoreply|auto-reply|automatic reply|out of office|abwesend|fraværende|frånvarande|ikke på kontoret|not in the office|away from the office)(?=$|[\s:;,.!\-–—()])|^auto:/i;
 
+// Machine reports about our own domains: DMARC aggregate reports (Google,
+// Microsoft, Yahoo, Domeneshop …) and SMTP TLS reports. They come to the
+// platform addresses because the domains' DMARC records name them (rua=), and
+// none of them is a person waiting for a reply. Matched on the reporting
+// sender's local part, or on the report subject every big provider uses
+// («Report domain: <domain> Submitter: <org> Report-ID: …», or the whole
+// subject «DMARC Aggregate Report for <domain>»). The subject is tested as it
+// arrives: report generators never prefix Re:/Fwd:, so a person who forwards
+// a report with a question (or writes «DMARC aggregate report – hva betyr
+// dette?») stays a human mail that needs a reply. A false «report» would hide
+// a customer from «trenger svar»; a missed report only adds a thread to mark.
+const REPORT_FROM_RE = /^(noreply-dmarc-support|dmarcreport|dmarc[._-]?reports?|dmarc[._-]?noreply|noreply[._-]?dmarc|dmarc[._-]?support|tls[._-]?rpt|noreply-smtp-tls-reporting|smtp-tls-reporting)@/i;
+const REPORT_SUBJECT_RE = /^(\[?preview\]?\s*)?report\s+domain:\s*\S+\s+submitter:|^dmarc\s+aggregate\s+report\s+for\s+[^\s@]+\.[a-z]{2,}\s*$/i;
+
 export function classifyAutomated(input: { subject: string | null | undefined; fromEmail: string; headers: InboundHeaders }): {
   kind: AutomatedKind;
   reason: string | null;
 } {
   const subj = (input.subject ?? "").trim();
   if (BOUNCE_FROM_RE.test(input.fromEmail.trim())) return { kind: "bounce", reason: `sender ${input.fromEmail}` };
+  if (REPORT_FROM_RE.test(input.fromEmail.trim())) return { kind: "report", reason: `report sender ${input.fromEmail}` };
+  if (REPORT_SUBJECT_RE.test(subj)) return { kind: "report", reason: "DMARC/TLS report subject" };
   if (BOUNCE_SUBJECT_RE.test(subj)) return { kind: "bounce", reason: "bounce subject" };
   const as = input.headers.autoSubmitted?.trim().toLowerCase();
   if (as && as !== "no") return { kind: "auto_reply", reason: `Auto-Submitted: ${as}` };
@@ -430,7 +446,7 @@ export function inboundLogExists(logId: string): boolean {
   return !!getDb().prepare("SELECT 1 FROM inbound_email_log WHERE id = ?").get(logId);
 }
 
-/** The automated classification the server stored for this e-mail (auto_reply / bounce), or null. */
+/** The automated classification the server stored for this e-mail (auto_reply / bounce / report), or null. */
 export function inboundLogAutomatedKind(logId: string): string | null {
   const r = getDb().prepare("SELECT automated_kind FROM inbound_email_log WHERE id = ?").get(logId) as { automated_kind: string | null } | undefined;
   return r?.automated_kind ?? null;

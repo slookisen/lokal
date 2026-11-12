@@ -794,6 +794,19 @@ export function initDentalSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // ─── dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
+  // S-D3a («Kontaktskjema som valg per profil», finn-tannlege.com) ──────────
+  // contact_form_only: 1 = the clinic asked that its e-mail is not shown;
+  // with CONTACT_FORM_DENTAL on, the clinic page shows a contact form instead
+  // and the public REST/A2A/MCP answers leave the e-mail out
+  // (services/dental-contact-form-only.ts). DEFAULT 0, so every existing row
+  // is a no-op; hydrateAgent does not read it, so no answer carries it. Only
+  // writer: POST /admin/dental/agents/:id/contact-form-only. Read only while
+  // the switch is on. Rollback: switch off (the column is additive).
+  try {
+    db.exec("ALTER TABLE dental_agents ADD COLUMN contact_form_only INTEGER NOT NULL DEFAULT 0");
+  } catch { /* already present */ }
+
   // dev-request 2026-09-02-dental-permanent-triage-needs-review-drain, slice
   // 3c-2: once-per-file ledger + per-path failure counter for the dental-
   // triage judgement file queue (services/dental-triage-judgement-job.ts on

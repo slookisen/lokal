@@ -129,6 +129,11 @@ export function runCrmTriageTests(opts: { log?: boolean } = {}): Promise<TestSum
           "tr4: matching is case-insensitive — mail servers do not preserve case and a case-sensitive map would park every second message");
       }
       {
+        const r = triage.deriveVertical({ deliveredTo: "kontakt@finn-tannlege.com" });
+        assertTrue(r.routed === true && r.vertical === "dental",
+          "tr4b: finn-tannlege.com receives since 2026-11-11 — its alias routes to dental");
+      }
+      {
         const r = triage.deriveVertical({ deliveredTo: [RFB, OPPLEV] });
         assertEq(r.routed, false, "tr5: BOTH aliases present → refuses rather than picking the first");
         assertTrue(!r.routed && r.code === "ambiguous_platform_addresses", "tr5b: …and says it was ambiguous, not merely unmatched");
@@ -181,9 +186,10 @@ export function runCrmTriageTests(opts: { log?: boolean } = {}): Promise<TestSum
       // routing for every future message and would otherwise land unremarked.
       {
         const table = triage.__platformAddressesForTesting();
-        assertEq(Object.keys(table).length, 2, "tr14b: exactly two platform aliases are configured");
+        assertEq(Object.keys(table).length, 3, "tr14b: exactly three platform aliases are configured");
         assertEq(table[RFB], "rfb", "tr14c: …rfb");
-        assertEq(table[OPPLEV], "experiences", "tr14d: …and experiences. finn-tannlege.com has NO inbound alias (steg 3), so dental cannot appear on this path at all");
+        assertEq(table[OPPLEV], "experiences", "tr14d: …experiences");
+        assertEq(table["kontakt@finn-tannlege.com"], "dental", "tr14e: …and dental (finn-tannlege.com receives since 2026-11-11), never pointed at rfb");
       }
 
       // ═══════════════════════════════════════════════════════════════

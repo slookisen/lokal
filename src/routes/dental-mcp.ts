@@ -55,6 +55,7 @@ import { BRAND_ENTITIES, brandMcpIcons } from "../config/brand-entities";
 import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
 import { MCP_MAX_TOOL_INPUT_ELEMENTS } from "../services/mcp-input-limits";
 import { emailRevealGuardEnabled, revealEmailFor } from "../services/email-reveal-guard";
+import { dentalContactFormOnlyIds } from "../services/dental-contact-form-only";
 
 const router = Router();
 
@@ -404,7 +405,9 @@ export function registerDentalTools(server: McpServer): void {
         // phone, acute_vakt (only with «Akuttvakt», F1-S4c) and profile-link
         // rules of the search card.
         const card = toDentalClinicCard(agent, "detail", { specialists: listSpecialistsForClinic(agent.id) });
-        const result = card.epost && !dentalMcpEmailAllowed(agent.id) ? { ...card, epost: null } : card;
+        // S-D3a: a contact-form-only clinic (CONTACT_FORM_DENTAL on) has epost
+        // null, as a clinic without e-mail, and is not counted by the guard.
+        const result = card.epost && (dentalContactFormOnlyIds([agent.id])?.has(agent.id) === true || !dentalMcpEmailAllowed(agent.id)) ? { ...card, epost: null } : card;
 
         deliver("tannlege_info", { org_nr, id }, extra, [agent.id]);
         return {

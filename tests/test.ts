@@ -48551,6 +48551,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-11-verifier-ny-verifisering-og-delta-ledd (slice B):
+// agents_verified delta mode counts verifier_verified_events (written by
+// applyVerifierOutcome) instead of current status/last_verified_at.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-11-verifier-ny-verifisering-og-delta-ledd: verified events ──");
+  try {
+    const { runAdminVerifierClaimCountsVerifiedEventsTests } =
+      require("../src/routes/admin-verifier-claim-counts-verified-events.test") as
+        typeof import("../src/routes/admin-verifier-claim-counts-verified-events.test");
+    const vve = await runAdminVerifierClaimCountsVerifiedEventsTests({ log: false });
+    passed += vve.passed;
+    failed += vve.failed;
+    for (const f of vve.failures) failures.push("admin-verifier-claim-counts-verified-events: " + f);
+    console.log(`  admin-verifier-claim-counts-verified-events: ${vve.passed} passed, ${vve.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-verifier-claim-counts-verified-events: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-02-experiences-karantene-utgang-match-til-verified: the
 // content-judge sweep's new quarantine-exit promotion transition
 // (needs_review -> verified, gated on judge MATCH + provider brreg_active=1
@@ -52858,6 +52878,11 @@ runSerial(async () => {
 // S-D1 adds the contact-form option per RFB profile (CONTACT_FORM_RFB, default
 // off; flagged profile → form instead of e-mail, POST /produsent/:slug/kontakt
 // forwards via a stubbed sender).
+// S-D2 hides a flagged profile's e-mail in the RFB REST and A2A answers too
+// (same switch; MCP untouched; the buyer's own order keeps it).
+// S-D3a does the same per clinic on finn-tannlege.com (CONTACT_FORM_DENTAL:
+// the form on the clinic pages, POST /klinikk/id/:id/kontakt, the e-mail left
+// out of REST, A2A and MCP tannlege_info).
 // Switch off = byte-identical answers. Sets env
 // flags and swaps the dental db-factory (restored in finally) — runSerial,
 // tail position.
@@ -52884,6 +52909,10 @@ runSerial(async () => {
     ["dental mcp email reveal", () => (require("../src/routes/dental-mcp-email-reveal.test") as typeof import("../src/routes/dental-mcp-email-reveal.test")).runDentalMcpEmailRevealTests({ log: false })],
     // S-D1: «Kontaktskjema som valg per profil» on rettfrabonden.com — agents.contact_form_only (admin POST /admin/agents/:id/contact-form-only), the form on /produsent/:slug and POST /produsent/:slug/kontakt (CONTACT_FORM_RFB; switch off = byte-identical; stubbed sender, no network).
     ["rfb contact form only", () => (require("../src/routes/rfb-contact-form-only.test") as typeof import("../src/routes/rfb-contact-form-only.test")).runRfbContactFormOnlyTests({ log: false })],
+    // S-D2: a contact-form-only profile's e-mail left out of the RFB REST + A2A answers (card/info/vcard, search/discover, cart submit handoffs, catalog offers, agent.json, A2A agent/info, conversations; CONTACT_FORM_RFB; switch off = byte-identical; buyer's own order keeps it; MCP untouched).
+    ["rfb contact form only s-d2", () => (require("../src/routes/rfb-contact-form-only-sd2.test") as typeof import("../src/routes/rfb-contact-form-only-sd2.test")).runRfbContactFormOnlySd2Tests({ log: false })],
+    // S-D3a: the same option per clinic on finn-tannlege.com — dental_agents.contact_form_only (admin POST /admin/dental/agents/:id/contact-form-only), the form on /klinikk/:slug + /klinikk/id/:id, «Vis e-post» 404, POST /klinikk/id/:id/kontakt, and the e-mail left out of REST /api/tannlege/agents[/:id], A2A message/send and MCP tannlege_info (CONTACT_FORM_DENTAL; switch off = byte-identical; stubbed sender, no network).
+    ["dental contact form only", () => (require("../src/routes/dental-contact-form-only.test") as typeof import("../src/routes/dental-contact-form-only.test")).runDentalContactFormOnlyTests({ log: false })],
   ] as Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]>) {
     try {
       const r = await load();

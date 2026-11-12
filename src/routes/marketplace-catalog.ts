@@ -35,6 +35,7 @@ import { evaluateStockFreshness, type StockFreshness } from "../services/supply-
 import { stockSoftExpiryActiveFor, stockSoftExpiryBuyerTextNb } from "../services/stock-soft-expiry";
 import { runProductCatalogSync, normalizeName } from "../services/product-catalog-sync";
 import { findOffers, resolveOffersRadiusKm, resolveOffersLimit } from "../services/catalog-offers";
+import { contactFormEnabled, withContactFormOnlyProducerEmailNull } from "../services/contact-form-only";
 import { isValidLatLng } from "../utils/geo-query";
 import { capFreeText, capName } from "../utils/free-text";
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: the ONE shared
@@ -708,6 +709,18 @@ catalogRouter.get("/offers", async (req: Request, res: Response) => {
       radiusKm: resolveOffersRadiusKm(req.query.radius_km),
       limit: resolveOffersLimit(req.query.limit),
     });
+    // S-D2 (dev-request 2026-09-09-…, «Kontaktskjema som valg per profil»):
+    // with CONTACT_FORM_RFB on, a contact-form-only producer's e-mail is
+    // null in this answer, as for a producer without one. Applied here, not
+    // in findOffers (shared with MCP lokal_find_offers). Switch off: as before.
+    if (contactFormEnabled("rfb")) {
+      const offers = withContactFormOnlyProducerEmailNull(result.offers);
+      const categoryMatches = result.category_matches ? withContactFormOnlyProducerEmailNull(result.category_matches) : undefined;
+      if (offers !== result.offers || categoryMatches !== result.category_matches) {
+        res.json({ ...result, offers, ...(categoryMatches ? { category_matches: categoryMatches } : {}) });
+        return;
+      }
+    }
     res.json(result);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

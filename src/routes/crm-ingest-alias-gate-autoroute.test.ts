@@ -366,7 +366,7 @@ export function runCrmIngestAliasGateAutorouteTests(
         assertEq(res.status, 202, "6a: genuinely unknown sender -> 202 parked");
         assertEq(res.body?.untriaged, true, "6b: untriaged:true");
         assertTrue(typeof res.body?.untriagedId === "string", "6c: untriagedId present");
-        assertEq(res.body?.reason, "none of the recipient addresses is a known platform alias (kontakt@rettfrabonden.com, kontakt@opplevagent.no) — the mail reached the mailbox some other way", "6d: reason is deriveVertical's verbatim no_platform_address message, unchanged");
+        assertEq(res.body?.reason, "none of the recipient addresses is a known platform alias (kontakt@rettfrabonden.com, kontakt@opplevagent.no, kontakt@finn-tannlege.com) — the mail reached the mailbox some other way", "6d: reason is deriveVertical's verbatim no_platform_address message, unchanged");
         assertTrue(typeof res.body?.openUntriaged === "number", "6e: openUntriaged count present");
         const after = await countUntriaged();
         assertEq(after, before + 1, "6f: exactly one new crm_untriaged row");

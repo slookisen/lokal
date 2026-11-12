@@ -34,11 +34,11 @@
 //
 // ── DENTAL ──────────────────────────────────────────────────────────
 //
-// finn-tannlege.com has no inbound alias (steg 3 documents why), so there is no
-// dental mail on this path at all — dental enquiries arrive through
-// POST /api/contact, which carries an explicit platform field. If a dental
-// alias is ever configured, add it to PLATFORM_ADDRESSES and nothing else
-// changes.
+// kontakt@finn-tannlege.com receives since 2026-11-11 (MX = Resend inbound),
+// so a Gmail copy of a dental mail can reach this path too; it routes to
+// `dental` like the other two platform aliases. Dental contact-form enquiries
+// still arrive through POST /api/contact, which carries an explicit platform
+// field.
 
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
@@ -68,15 +68,17 @@ type DecidingField = (typeof DECIDING_FIELDS)[number];
 /**
  * The platform aliases. Lowercase keys; lookups lowercase the input.
  *
- * NOT derived from crm-platform-identity's replyTo map, deliberately: dental's
- * replyTo is kontakt@rettfrabonden.com (it has no inbound alias), so deriving
- * this from that table would make kontakt@rettfrabonden.com map to two
- * verticals and every RFB mail permanently "ambiguous". Outbound identity and
- * inbound discriminator are different questions that happen to share strings.
+ * NOT derived from crm-platform-identity's replyTo map, deliberately. Each
+ * vertical has its own inbound alias today (dental's kontakt@finn-tannlege.com
+ * since 2026-11-11), but outbound identity and inbound discriminator are
+ * different questions that happen to share strings: a later replyTo change must
+ * not silently re-route inbound mail, and two verticals sharing a replyTo must
+ * not make every mail to that address permanently "ambiguous".
  */
 const PLATFORM_ADDRESSES: Readonly<Record<string, CrmVertical>> = {
   "kontakt@rettfrabonden.com": "rfb",
   "kontakt@opplevagent.no": "experiences",
+  "kontakt@finn-tannlege.com": "dental",
 };
 
 // dev-requests/2026-08-21-crm-untriaged-kofrysning-og-lopetellerfeil.md: a

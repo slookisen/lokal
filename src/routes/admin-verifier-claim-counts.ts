@@ -69,6 +69,31 @@
 // to sit in that status can overcount. Real and bounded, called out inline
 // on each affected case below.
 //
+// agents_verified, delta mode — event-based (dev-request 2026-11-11-verifier-
+// ny-verifisering-og-delta-ledd, slice B): the lokal-agent-verifier's
+// `agents_verified` claim is "results THIS run set to verified". The original
+// delta query (current verification_status='verified' AND current
+// last_verified_at inside the window) measured "still verified with this exact
+// stamp" instead: applyVerifierOutcome overwrites last_verified_at (and the
+// status) every time a later hourly run, review-queue run or bulk sweep
+// re-processes the row, so the older a run, the fewer of its rows still
+// matched (observed: claimed 8-9 per run, probed 0-9). A tolerance would only
+// hide that, so instead applyVerifierOutcome now appends one row per verified
+// outcome to verifier_verified_events (agent_id, run_started_at), and delta
+// mode for this one kind counts those events whose run_started_at is inside
+// [since, until] — one per (agent_id, run_started_at) pair, i.e. per agent
+// per run, which is exactly what the claim sums. The events are historical
+// facts, so they are NOT filtered on the agent's current is_active (a later
+// deactivation must not shrink what a past run did). Sample rows come from the
+// same events (LEFT JOIN agents for the name). Response shape is unchanged.
+//
+// Fallback: windows that start before the first event ever recorded (i.e.
+// runs from before this table was deployed, or an empty/absent table) use the
+// original current-state query unchanged — see agentsVerifiedUsesEvents().
+// A run that verified >=1 agent always has an event stamped at exactly its
+// own started_at (== since), so any post-deploy run with a non-zero claim is
+// always probed via events. Snapshot mode and every other kind are untouched.
+//
 // Non-goals (out of scope for this slice — dev-request 2026-08-29-verifier-
 // claim-kind-katalog-gap): outreach_pool_added, lokal_prs_conflict_rebased,
 // active_escalations have no endpoint here — don't invent one.
@@ -207,6 +232,29 @@ function buildQuery(
   };
 }
 
+// agents_verified delta mode (see file-header comment): count/sample from the
+// append-only verifier_verified_events log, one per (agent_id, run_started_at)
+// pair whose run_started_at lies inside [since, until]. Fixed SQL, two bound
+// placeholders — nothing from the query string reaches SQL.
+const VERIFIED_EVENTS_IN_WINDOW = `SELECT DISTINCT agent_id, run_started_at
+       FROM verifier_verified_events
+      WHERE datetime(run_started_at) BETWEEN datetime(?) AND datetime(?)`;
+
+// True when the events log covers the window: at least one event exists and
+// the earliest one is at or before `since`. Otherwise (table absent, empty, or
+// the window predates the first recorded event — i.e. pre-deploy runs) the
+// caller falls back to the original current-state delta query.
+function agentsVerifiedUsesEvents(db: any, since: string): boolean {
+  try {
+    const row = db
+      .prepare(`SELECT MIN(datetime(run_started_at)) AS m, datetime(?) AS s FROM verifier_verified_events`)
+      .get(since) as { m: string | null; s: string | null } | undefined;
+    return !!row && row.m !== null && row.s !== null && row.m <= row.s;
+  } catch {
+    return false;
+  }
+}
+
 // dev-request 2026-10-09-lokal-agent-verifier-batch-claim-vs-snapshot-probe-
 // mismatch: current-state (mode=snapshot) counts for the snapshot-semantic
 // claim kinds, computed with the SAME condition + is_active filter the
@@ -292,6 +340,32 @@ router.get("/", (req: Request, res: Response) => {
 
   try {
     const db = getDb();
+
+    if (kind === "agents_verified" && mode === "delta" && agentsVerifiedUsesEvents(db, since as string)) {
+      const evCount = db
+        .prepare(`SELECT COUNT(*) AS c FROM (${VERIFIED_EVENTS_IN_WINDOW})`)
+        .get(since, until) as { c: number } | undefined;
+      const evSample = db
+        .prepare(
+          `SELECT ev.agent_id AS id, a.name AS name
+             FROM (SELECT DISTINCT agent_id FROM (${VERIFIED_EVENTS_IN_WINDOW})) ev
+             LEFT JOIN agents a ON a.id = ev.agent_id
+            ORDER BY ev.agent_id
+            LIMIT 5`
+        )
+        .all(since, until) as Array<{ id: string; name: string }>;
+      res.json({
+        success: true,
+        kind,
+        mode,
+        count: evCount?.c ?? 0,
+        since,
+        until,
+        sample: evSample,
+      });
+      return;
+    }
+
     const { where, params } = buildQuery(kind, mode, since, until);
 
     const countRow = db

@@ -49,6 +49,7 @@ import { recordA2aDelivery } from "../services/profile-ai-deliveries";
 import { aiProfileLinksJson } from "../middleware/ai-profile-links";
 import { toDentalA2aClinic } from "../services/dental-clinic-card";
 import { revealEmailFor } from "../services/email-reveal-guard";
+import { dentalContactFormOnlyIds } from "../services/dental-contact-form-only";
 import { a2aMessageData } from "../utils/a2a-message";
 import { capFreeText, capName } from "../utils/free-text";
 import { rpcInternalErrorReply } from "../utils/internal-error";
@@ -515,13 +516,24 @@ export function withDentalA2aEmailGuard(
   };
 }
 
-/** The guard for one request: null when the switch is off; else the withheld ids, and Cache-Control: private. */
+/**
+ * The guard for one request: null when the switch is off; else the withheld
+ * ids, and Cache-Control: private. S-D3a: with CONTACT_FORM_DENTAL on, the
+ * clinics with the contact-form-only flag are withheld too (not passed to the
+ * guard, so they spend no budget; flag-only adds no Cache-Control). Switch off
+ * → the flag is not read.
+ */
 function dentalA2aEmailWithheld(req: Request, res: Response): (ids: string[]) => ReadonlySet<string> | null {
   return (ids) => {
-    const allowed = revealEmailFor(req, "dental", ids);
-    if (allowed === null) return null;
+    const flagged = dentalContactFormOnlyIds(ids);
+    const hasFlagged = flagged !== null && flagged.size > 0;
+    const asked = hasFlagged ? ids.filter((id) => !flagged.has(id)) : ids;
+    const allowed = revealEmailFor(req, "dental", asked);
+    if (allowed === null) return hasFlagged ? flagged : null;
     res.set("Cache-Control", "private");
-    return new Set(ids.filter((id) => !allowed.has(id)));
+    const withheld = new Set(asked.filter((id) => !allowed.has(id)));
+    if (hasFlagged) for (const id of flagged) withheld.add(id);
+    return withheld;
   };
 }
 
