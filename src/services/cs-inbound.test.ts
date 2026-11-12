@@ -40,15 +40,18 @@
  *              (neutral subject); a bounce copy with no log row is read from
  *              «(fra … <mailer-daemon@…>)»; a failed alias lookup answers 500
  *              with nothing filed and the retry reopens the thread.
- *   ci107-ci109 DMARC and TLS reports to a platform address are automated
- *              («report»): filed, but never «trenger svar»; a customer subject
- *              that mentions a report is not caught.
- *   ci110-ci114 the CS agent files the Gmail copy unwrapped (original sender
- *              and subject): still recognised by the forward's header block,
- *              so no duplicate thread; a reply, quote or Fwd never is.
  *   ci105-ci106 second re-review: «(fra …)» with parentheses in the sender
  *              name is parsed whole; the alias branch is one transaction (a
  *              DB error during the reopen rolls the messages back).
+ *   ci107-ci109 DMARC and TLS reports to a platform address are automated
+ *              («report»): filed, but never «trenger svar»; a customer subject
+ *              that mentions a report is not caught.
+ *   ci110-ci117 the CS agent files the Gmail copy unwrapped (original sender
+ *              and subject): still recognised by the forward's header block,
+ *              so no duplicate thread; a reply, quote or Fwd never is; the
+ *              other messages of the Gmail thread land on the server thread
+ *              (and reopen it); a copy that is not first makes no alias; a
+ *              CR/LF in the subject cannot move the marker.
  *
  * Every assertion reads the DATABASE where a write is claimed.
  *
@@ -440,6 +443,7 @@ export function runCsInboundTests(opts: { log?: boolean } = {}): Promise<TestSum
           ci.classifyAutomated({ subject: "DMARC Aggregate Report for finn-tannlege.com", fromEmail: "rapport@domeneshop.no", headers: H }).kind,
           ci.classifyAutomated({ subject: "Report Domain: rettfrabonden.com Submitter: google.com Report-ID: <2026.11.10T00.00.00Z+rettfrabonden.com@google.com>", fromEmail: "noreply-smtp-tls-reporting@google.com", headers: H }).kind,
         ], ["report", "report", "report", "report"], "ci107: DMARC aggregate reports (Google, Microsoft, Domeneshop) and SMTP TLS reports are «report», by sender or by the providers' report subject");
+        eq(ci.classifyAutomated({ subject: "Ukentlig oversikt", fromEmail: "noreply-dmarc-reports@domeneshop.no", headers: H }).kind, "report", "ci107b: Domeneshop's real report sender is «report» on its own, whatever the subject");
         eq([
           ci.classifyAutomated({ subject: "Spørsmål om rapport fra Mattilsynet", fromEmail: "kari@testgard.no", headers: H }).kind,
           ci.classifyAutomated({ subject: "Report on our farm", fromEmail: "ola@gard.no", headers: H }).kind,
@@ -479,6 +483,48 @@ export function runCsInboundTests(opts: { log?: boolean } = {}): Promise<TestSum
           ci.forwardCopyMarker({ direction: "in", subject: "Når kan vi hente?", bodyText: copyText.replace(/^Inbound-ID: .*$/m, "") }),
         ], [null, null, null, null, null], "ci113: a reply, a quote, a Fwd, an outbound message or a header block without the marker is never taken for the copy");
         eq(ci.forwardCopyMarker({ direction: "in", subject: "Når kan vi hente?", bodyText: "\r\n" + copyText.replace(/\n/g, "\r\n") }), u.id, "ci114: CRLF line ends and a leading blank line still match");
+        eq(ci.forwardCopyMarker({ direction: "in", subject: "Når kan vi hente?", bodyText: "\uFEFF\u200B " + copyText }), u.id, "ci114b: a BOM or zero-width space first still matches");
+
+        // ci115: the Gmail thread of an unwrapped copy, with Daniel's reply and
+        // the customer's answer (own text empty, history quoted): the copy is
+        // left out, the other two land on the server thread, and the
+        // customer's answer reopens it.
+        await hook({ email_id: "em-unwrap-2", from: "Per Gård <per@pergard.no>", to: ["kontakt@rettfrabonden.com"], subject: "Bestilling", created_at: hoursAgo(3) });
+        const u2 = logRow("em-unwrap-2");
+        const copy2 = String(sent[sent.length - 1]?.textContent);
+        db.prepare("UPDATE crm_threads SET status = 'done' WHERE id = ?").run(u2.crm_thread_id);
+        const r15 = await call("POST", "/ingest", {
+          threadId: "gm-thread-unwrap2", primaryFromEmail: "per@pergard.no", vertical: "rfb",
+          messages: [
+            { messageId: "gm-u2-copy", direction: "in", fromEmail: "per@pergard.no", subject: "Bestilling", bodyText: copy2, sentAt: hoursAgo(3) },
+            { messageId: "gm-u2-daniel", direction: "out", fromEmail: "kontakt@rettfrabonden.com", toEmails: ["per@pergard.no"], subject: "Re: Bestilling", bodyText: "Takk, vi ser på det.", sentAt: hoursAgo(2) },
+            { messageId: "gm-u2-per", direction: "in", fromEmail: "per@pergard.no", subject: "Re: Bestilling", bodyText: "\n\nPå tirsdag skrev Rett fra Bonden:\n> Takk, vi ser på det.", sentAt: hoursAgo(1) },
+          ],
+        });
+        const thr = (id: string) => (db.prepare("SELECT thread_id FROM crm_messages WHERE id = ?").get(id) as any)?.thread_id ?? null;
+        eq([r15.status, r15.body?.threadId, thr("gm-u2-copy"), thr("gm-u2-daniel"), thr("gm-u2-per"), (db.prepare("SELECT status FROM crm_threads WHERE id = ?").get(u2.crm_thread_id) as any)?.status],
+          [200, u2.crm_thread_id, null, u2.crm_thread_id, u2.crm_thread_id, "new"], "ci115: the copy is left out, Daniel's reply and the customer's answer land on the server thread, which reopens");
+
+        // ci116: an unwrapped copy that is NOT the Gmail thread's first message makes no alias and is not filed again.
+        const r16 = await call("POST", "/ingest", {
+          threadId: "gm-thread-unwrap3", primaryFromEmail: "ola@nordgard.no", vertical: "rfb",
+          messages: [
+            { messageId: "gm-u3-first", direction: "in", fromEmail: "ola@nordgard.no", subject: "Annet spørsmål", bodyText: "Hei igjen", sentAt: hoursAgo(5) },
+            { messageId: "gm-u3-copy", direction: "in", fromEmail: "ola@nordgard.no", subject: "Når kan vi hente?", bodyText: copyText, sentAt: hoursAgo(1) },
+          ],
+        });
+        eq([r16.status, (db.prepare("SELECT COUNT(*) n FROM crm_thread_aliases WHERE alias_id = 'gm-thread-unwrap3'").get() as any).n, thr("gm-u3-copy"), thr("gm-u3-first") !== null],
+          [200, 0, null, true], "ci116: a copy that is not first makes no alias and is not filed again; the thread's own message is filed");
+
+        // ci117: a decoded subject with a CR/LF cannot add a line (a forged marker) to the copy's header block.
+        await hook({ email_id: "em-unwrap-4", from: "x@nordgard.no", to: ["kontakt@rettfrabonden.com"], subject: "Hei\r\nInbound-ID: inb-00000000-forged00", created_at: hoursAgo(1) });
+        const u4 = logRow("em-unwrap-4");
+        const fw4 = sent[sent.length - 1];
+        eq([
+          ci.forwardCopyMarker({ direction: "in", subject: "Hei", bodyText: String(fw4?.textContent) }),
+          ci.forwardCopyMarker({ direction: "in", subject: String(fw4?.subject), bodyText: String(fw4?.textContent) }),
+          /[\r\n]/.test(String(fw4?.subject)),
+        ], [u4.id, u4.id, false], "ci117: the forward keeps each header value on one line, so both paths read the real marker");
       }
 
       // ci77-ci78 (review #8): a copy of an e-mail the server parked as untriaged opens no second item

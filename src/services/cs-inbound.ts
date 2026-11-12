@@ -127,11 +127,13 @@ const FORWARD_SUBJECT_RE = /^\s*\[Innkommende\]/i;
 
 // The forward's own header block, exactly as inbound-email-webhook writes it
 // at the very top of the text: «Videresent fra: …», «Til: …», «Emne: …» and
-// the marker, one per line. Anchored at the start of the body, so a reply
+// the marker, one per line (the webhook keeps each value on one line).
+// Anchored at the start of the body (only whitespace, a BOM or a zero-width
+// space may come first), so a reply
 // (own text first), a quote («> Videresent fra:») or a «Fwd:» (its own
 // forwarded-message header first) never matches.
 const FORWARD_HEADER_BLOCK_RE =
-  /^[ \t]*(?:\r?\n[ \t]*)*Videresent fra:[^\r\n]*\r?\nTil:[^\r\n]*\r?\nEmne:[^\r\n]*\r?\nInbound-ID:[ \t]*(inb-[A-Za-z0-9-]{8,64})[ \t]*(?:\r?\n|$)/;
+  /^[\s\uFEFF\u200B]*Videresent fra:[^\r\n]*\r?\nTil:[^\r\n]*\r?\nEmne:[^\r\n]*\r?\nInbound-ID:[ \t]*(inb-[A-Za-z0-9-]{8,64})[ \t]*(?:\r?\n|$)/;
 
 /**
  * The log id if `m` IS the server's forwarded copy: an inbound message whose
@@ -327,7 +329,7 @@ const AUTOREPLY_SUBJECT_RE =
 // a report with a question (or writes «DMARC aggregate report – hva betyr
 // dette?») stays a human mail that needs a reply. A false «report» would hide
 // a customer from «trenger svar»; a missed report only adds a thread to mark.
-const REPORT_FROM_RE = /^(noreply-dmarc-support|dmarcreport|dmarc[._-]?reports?|dmarc[._-]?noreply|noreply[._-]?dmarc|dmarc[._-]?support|tls[._-]?rpt|noreply-smtp-tls-reporting|smtp-tls-reporting)@/i;
+const REPORT_FROM_RE = /^(noreply-dmarc-support|dmarcreport|dmarc[._-]?reports?|dmarc[._-]?noreply|noreply[._-]?dmarc(?:[._-]?reports?)?|dmarc[._-]?support|tls[._-]?rpt|noreply-smtp-tls-reporting|smtp-tls-reporting)@/i;
 const REPORT_SUBJECT_RE = /^(\[?preview\]?\s*)?report\s+domain:\s*\S+\s+submitter:|^dmarc\s+aggregate\s+report\s+for\s+[^\s@]+\.[a-z]{2,}\s*$/i;
 
 export function classifyAutomated(input: { subject: string | null | undefined; fromEmail: string; headers: InboundHeaders }): {
