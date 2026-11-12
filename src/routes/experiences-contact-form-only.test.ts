@@ -34,6 +34,11 @@
  *       untouched; unknown / unflagged / no e-mail / under review / hidden /
  *       test producer → 404; send failure → 502; switch off → 404;
  *       Cache-Control: private, no-store
+ *   X   HTML in the producer name: escaped in the back link of the
+ *       thank-you, 429, 502 and 400 pages (and /en); the mail is text only,
+ *       its greeting carries the name as text (review N1)
+ *   S   /sv POST (SV_LOCALE_ENABLED + switcher): Swedish thank-you and 400;
+ *       /en 400; switcher off → Norwegian; SV locale off → 404 (review N6)
  *   G   no POST/admin body carries a producer address; log lines carry no
  *       address, no IP and no message text
  *
@@ -75,6 +80,8 @@ const FIXTURE = {
   R: { id: "ecf-p4", slug: "skjemaprove-bryggeri-review", navn: "Skjemaprøve Bryggeri Review", epost: "avvik@annet-domene.example" },
   H: { id: "ecf-p5", slug: "skjult-skjemaprove-sideri", navn: "Skjult Skjemaprøve Sideri", epost: "skjult@skjemaprove-sideri.example" },
   T: { id: "ecf-p6", slug: "test-skjemaprove-sideri", navn: "Test Skjemaprøve Sideri", epost: "test@skjemaprove-sideri.example" },
+  // Review N1 (lokal#1525): HTML and the five escaped characters in the producer name.
+  X: { id: "ecf-p7", slug: "html-skjemaprove-sideri", navn: `Ond <script>alert("x")</script> & 'Co' <b>Sideri</b>`, epost: "html@skjemaprove-sideri.example" },
 };
 
 function seed(db: any): void {
@@ -99,6 +106,7 @@ function seed(db: any): void {
   row(FIXTURE.R, { prov: JSON.stringify({ contact_email_flagged_review: { flagged_email: FIXTURE.R.epost, flagged_at: "2026-10-01T00:00:00.000Z" } }) });
   row(FIXTURE.H, { hidden: 1 });
   row(FIXTURE.T, { test: 1 });
+  row(FIXTURE.X);
 }
 
 export async function runExperiencesContactFormOnlyTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
@@ -116,7 +124,7 @@ export async function runExperiencesContactFormOnlyTests(opts: { log?: boolean }
   const envKeys = [
     "EXPERIENCES_DB_PATH", "CONTACT_FORM_EXPERIENCES", "CONTACT_FORM_DENTAL", "CONTACT_FORM_RFB",
     "EMAIL_REVEAL_GUARD_EXPERIENCES", "EMAIL_REVEAL_PER_IP_PER_HOUR", "OPPLEVAGENT_LANG_SWITCHER_ENABLED",
-    "ADMIN_KEY", "ANALYTICS_ADMIN_KEY",
+    "ADMIN_KEY", "ANALYTICS_ADMIN_KEY", "SV_LOCALE_ENABLED",
   ];
   const prevEnv = Object.fromEntries(envKeys.map((k) => [k, process.env[k]]));
   for (const k of envKeys) delete process.env[k];
@@ -161,8 +169,8 @@ export async function runExperiencesContactFormOnlyTests(opts: { log?: boolean }
     freshGuard();
     freshContactForm();
 
-    const { F, U, N, R, H, T } = FIXTURE;
-    const providerEmails = [F.epost, U.epost, R.epost, H.epost, T.epost];
+    const { F, U, N, R, H, T, X } = FIXTURE;
+    const providerEmails = [F.epost, U.epost, R.epost, H.epost, T.epost, X.epost];
     const setFlag = (id: string, on: boolean) => db.prepare("UPDATE experience_providers SET contact_form_only = ? WHERE id = ?").run(on ? 1 : 0, id);
     const flagRow = (id: string) => (db.prepare("SELECT contact_form_only, epost FROM experience_providers WHERE id = ?").get(id) as any);
     const leaks = (text: string, email: string) => [email, encodeURIComponent(email), JSON.stringify(email).slice(1, -1)].some((f) => text.includes(f)) || text.includes(email.split("@")[0]! + "@");
@@ -486,6 +494,92 @@ export async function runExperiencesContactFormOnlyTests(opts: { log?: boolean }
       eq((await postForm(F.slug, "198.51.100.42")).status, 404, "P39: switch turned off -> POST 404");
       eq(sent.length, 0, "P40: ... nothing sent");
     }
+
+    // ── X: HTML in the producer name (review N1, lokal#1525) ──────────────
+    process.env.CONTACT_FORM_EXPERIENCES = "on";
+    setFlag(X.id, true);
+    {
+      const escName = "Ond &lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt; &amp; &#39;Co&#39; &lt;b&gt;Sideri&lt;/b&gt;";
+      const backLink = (prefix = "", hash = "", back = "Tilbake til") => `<a href="${prefix}${pagePath(X.slug)}${hash}">&larr; ${back} ${escName}</a>`;
+      const rawFree = (html: string) => !html.includes(X.navn) && !html.includes("<script>alert") && !html.includes("<b>Sideri</b>") && !html.includes(`'Co'`);
+
+      freshContactForm();
+      const r = await postForm(X.slug, "198.51.100.50");
+      ok(r.status === 200 && r.text.includes("Takk for meldingen"), `X1: HTML name -> thank-you page 200 (got ${r.status})`);
+      ok(r.text.includes(backLink()), "X2: thank-you page -> the back link carries the escaped name");
+      ok(rawFree(r.text), "X3: thank-you page -> the raw name / tags nowhere");
+      eq(sent.length, 1, "X4: one mail sent");
+      const m = sent[0];
+      const greeting = m?.textContent.split("\n")[0];
+      eq(greeting, `Hei ${X.navn}!`, "X5: the plain-text greeting carries the name as text (one line, not HTML-escaped: text/plain)");
+      ok(!!m && m.htmlContent === undefined && !m.textContent.includes("&lt;"), "X6: the mail is text only (no HTML part where the name could render)");
+
+      freshContactForm();
+      const noIp = await postForm(X.slug, "198.51.100.51", goodFields, { "x-test-no-ip": "1" });
+      ok(noIp.status === 429 && noIp.text.includes(backLink()) && rawFree(noIp.text), `X7: 429 page -> escaped back link, raw name nowhere (got ${noIp.status})`);
+
+      freshContactForm();
+      sendResult = { success: false, error: "boom" };
+      const fail = await postForm(X.slug, "198.51.100.52");
+      ok(fail.status === 502 && fail.text.includes(backLink()) && rawFree(fail.text), `X8: 502 page -> escaped back link, raw name nowhere (got ${fail.status})`);
+
+      freshContactForm();
+      const bad = await postForm(X.slug, "198.51.100.53", { ...goodFields, reply_email: "nei" });
+      ok(bad.status === 400 && bad.text.includes(backLink("", "#kontaktskjema")) && rawFree(bad.text), `X9: 400 page -> escaped back link to the form, raw name nowhere (got ${bad.status})`);
+      eq(sent.length, 0, "X10: the 400 sent nothing");
+
+      process.env.OPPLEVAGENT_LANG_SWITCHER_ENABLED = "true";
+      const enOk = await request("POST", `/en${kontakt(X.slug)}`, "198.51.100.54", form(goodFields), { "content-type": "application/x-www-form-urlencoded", accept: "text/html" });
+      ok(enOk.status === 200 && enOk.text.includes(backLink("/en", "", "Back to")) && rawFree(enOk.text), `X11: /en thank-you page -> escaped back link to /en/… (got ${enOk.status})`);
+      delete process.env.OPPLEVAGENT_LANG_SWITCHER_ENABLED;
+      ok(!leaks(r.text + noIp.text + fail.text + bad.text + enOk.text, X.epost), "X12: the producer's address is in none of these answers");
+    }
+    setFlag(X.id, false);
+
+    // ── S: /sv and /en POST variants (review N6, lokal#1525) ──────────────
+    // langMiddleware recognises /sv only with SV_LOCALE_ENABLED=true; the
+    // answer is Swedish only with the opplevagent language switcher on too.
+    {
+      const postSv = (ip: string, fields: Record<string, string> = goodFields) =>
+        request("POST", `/sv${kontakt(F.slug)}`, ip, form(fields), { "content-type": "application/x-www-form-urlencoded", accept: "text/html" });
+      process.env.OPPLEVAGENT_LANG_SWITCHER_ENABLED = "true";
+      process.env.SV_LOCALE_ENABLED = "true";
+      freshContactForm();
+      const sv = await postSv("198.51.100.60");
+      ok(sv.status === 200 && sv.text.includes("Tack för meddelandet") && sv.text.includes(`<html lang="sv"`), `S1: /sv POST -> Swedish thank-you page (got ${sv.status})`);
+      ok(sv.text.includes(`<a href="/sv${pagePath(F.slug)}">&larr; Tillbaka till ${F.navn}</a>`), "S2: ... back link to the /sv profile");
+      eq(sent.length, 1, "S3: /sv POST -> one mail");
+      ok(!!sent[0] && sent[0].to === F.epost && sent[0].replyTo === goodFields.reply_email && sent[0].textContent.includes(`/kategori/gardssalg/produsent/${F.slug}`), "S4: ... to the stored address, Reply-To the sender, profile link in the mail");
+      ok(!leaks(sv.text, F.epost), "S5: ... the address not in the answer");
+      eq([sv.headers["cache-control"], sv.headers["x-robots-tag"]], ["private, no-store", "noindex, nofollow"], "S6: ... private, no-store + noindex");
+
+      freshContactForm();
+      const svBad = await postSv("198.51.100.61", { ...goodFields, reply_email: "inte-en-adress" });
+      ok(svBad.status === 400 && svBad.text.includes("Meddelandet skickades inte") && svBad.text.includes("Skriv en giltig e-postadress"), `S7: /sv invalid reply e-mail -> 400 Swedish error (got ${svBad.status})`);
+      ok(svBad.text.includes(`<a href="/sv${pagePath(F.slug)}#kontaktskjema">&larr; Tillbaka till ${F.navn}</a>`) && !leaks(svBad.text, F.epost), "S8: ... back link to the /sv form, no address");
+      eq(sent.length, 0, "S9: /sv invalid -> nothing sent");
+
+      const enBad = await request("POST", `/en${kontakt(F.slug)}`, "198.51.100.62", form({ ...goodFields, message: "" }), { "content-type": "application/x-www-form-urlencoded", accept: "text/html" });
+      ok(enBad.status === 400 && enBad.text.includes("The message was not sent") && enBad.text.includes("Write a message") && enBad.text.includes(`<a href="/en${pagePath(F.slug)}#kontaktskjema">`), `S10: /en invalid message -> 400 English error, back to the /en form (got ${enBad.status})`);
+      eq(sent.length, 0, "S11: /en invalid -> nothing sent");
+
+      // Switcher off, /sv locale on: the prefix is stripped, the answer is Norwegian.
+      delete process.env.OPPLEVAGENT_LANG_SWITCHER_ENABLED;
+      freshContactForm();
+      const svNo = await postSv("198.51.100.63");
+      ok(svNo.status === 200 && svNo.text.includes("Takk for meldingen") && svNo.text.includes(`<a href="${pagePath(F.slug)}">`) && sent.length === 1, `S12: /sv POST with the switcher off -> Norwegian thank-you, unprefixed back link, one mail (got ${svNo.status})`);
+
+      // /sv locale off: /sv/… is not a language prefix → no route, nothing sent.
+      delete process.env.SV_LOCALE_ENABLED;
+      process.env.OPPLEVAGENT_LANG_SWITCHER_ENABLED = "true";
+      freshContactForm();
+      const svOff = await postSv("198.51.100.64");
+      eq(svOff.status, 404, "S13: SV_LOCALE_ENABLED off -> POST /sv/…/kontakt is a 404");
+      eq(sent.length, 0, "S14: ... nothing sent");
+      delete process.env.OPPLEVAGENT_LANG_SWITCHER_ENABLED;
+    }
+    delete process.env.CONTACT_FORM_EXPERIENCES;
+    freshContactForm();
 
     // ── G: bodies and logs ────────────────────────────────────────────────
     {
