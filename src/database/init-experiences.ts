@@ -1272,6 +1272,13 @@ export function initExperiencesSchema(db: Database.Database): void {
     // Same column for DBs created before the guard landed (CREATE TABLE IF NOT
     // EXISTS above is a no-op for them). Idempotent — error means present.
     try { db.exec(`ALTER TABLE gardssalg_claims ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0`); } catch { /* already present */ }
+    // dev-request 2026-11-01-opplevagent-drikkeprodusent-selvregistrering,
+    // skive 2 (Spec E): draft_mode=1 marks the owner session a self-registered
+    // submitter gets after confirming the e-mail code. Such a row stays
+    // used=0 (so no "claimed"/"owner" query — all keyed on used=1 — counts
+    // it), is refused by verifyClaimToken and verifyGardssalgOwnerSessionToken,
+    // and is accepted only by the self-registration draft routes.
+    try { db.exec(`ALTER TABLE gardssalg_claims ADD COLUMN draft_mode INTEGER NOT NULL DEFAULT 0`); } catch { /* already present */ }
     db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_gardssalg_claims_token ON gardssalg_claims(token)`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_claims_provider ON gardssalg_claims(provider_id)`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_claims_created ON gardssalg_claims(provider_id, created_at)`);
@@ -2531,6 +2538,25 @@ export function initExperiencesSchema(db: Database.Database): void {
     `);
     db.exec("CREATE INDEX IF NOT EXISTS idx_gardssalg_self_reg_org_nr ON gardssalg_self_registrations(org_nr)");
     db.exec("CREATE INDEX IF NOT EXISTS idx_gardssalg_self_reg_status ON gardssalg_self_registrations(status, created_at)");
+    // Skive 2 (Spec D): the e-mail code. One code per registration: the
+    // random token itself is only ever in the e-mail; the row keeps its
+    // SHA-256 (email_code_hash), when it expires, when it was sent and when
+    // it was used (single use). email_confirmed_at = the submitter proved
+    // access to the mailbox (not ownership). claim_assessment = JSON
+    // {result, rule_version, signals[], assessed_at}; until the 2026-10-30
+    // assessment module exists the result is always 'yellow' (Daniel's queue).
+    // Additive, idempotent: an error means the column is already there.
+    for (const col of [
+      "email_code_hash TEXT",
+      "email_code_expires_at TEXT",
+      "email_code_sent_at TEXT",
+      "email_code_used_at TEXT",
+      "email_confirmed_at TEXT",
+      "claim_assessment TEXT",
+    ]) {
+      try { db.exec(`ALTER TABLE gardssalg_self_registrations ADD COLUMN ${col}`); } catch { /* already present */ }
+    }
+    db.exec("CREATE INDEX IF NOT EXISTS idx_gardssalg_self_reg_code ON gardssalg_self_registrations(email_code_hash)");
   } catch (e) {
     console.log(`[experiences] gardssalg_self_registrations init skipped: ${(e as Error).message}`);
   }

@@ -837,6 +837,31 @@ https://rettfrabonden.com`;
   }
 
   /**
+   * dev-request 2026-11-01-opplevagent-drikkeprodusent-selvregistrering,
+   * skive 2 (Spec D): the e-mail-code link sent to the address a
+   * self-registering producer typed in /for-tilbydere/registrer. It proves
+   * access to that mailbox only. Same transport, From and Reply-To as
+   * sendGardssalgClaimMagicLink() just above; the link opens a confirm page
+   * whose button POSTs (a GET changes nothing, so mail scanners are harmless).
+   */
+  async sendGardssalgSelfRegisterConfirmLink(opts: {
+    to: string;
+    providerName: string;
+    confirmUrl: string;
+    validHours: number;
+  }): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const { to, providerName, confirmUrl, validHours } = opts;
+    return await this.sendEmail({
+      to,
+      subject: `Bekreft registreringen av ${providerName} — Opplevagent`,
+      htmlContent: buildGardssalgSelfRegisterConfirmHtml(providerName, confirmUrl, validHours),
+      textContent: buildGardssalgSelfRegisterConfirmText(providerName, confirmUrl, validHours),
+      replyTo: "kontakt@opplevagent.no",
+      from: crmFromHeader("experiences"),
+    });
+  }
+
+  /**
    * dev-request 2026-08-07-outreach-pool-krav123-og-pilot, AC4 (pilot
    * send-mechanic). The cold-outreach email for a gårdssalg/opplevagent
    * producer whose profile is already outreach_ready — copy is the
@@ -1830,6 +1855,49 @@ function buildGardssalgClaimMagicLinkHtml(providerName: string, verifyUrl: strin
   </div>
 </body>
 </html>`;
+}
+
+function buildGardssalgSelfRegisterConfirmHtml(providerName: string, confirmUrl: string, validHours: number): string {
+  const safeName = epEscape(providerName);
+  const safeUrl = epEscape(confirmUrl);
+  return `<!DOCTYPE html>
+<html lang="nb">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 24px 20px;">
+  <div style="font-size: 22px; font-weight: 700; color: #0f5a50; border-bottom: 3px solid #0f5a50; padding-bottom: 16px;">opplevagent.no</div>
+  <h1 style="font-size: 20px; color: #1a1a1a;">Hei!</h1>
+  <p>Vi har mottatt en registrering av <strong>${safeName}</strong> på Opplevagent med denne e-postadressen.</p>
+  <p>Klikk lenken under og trykk «Bekreft» på siden som åpnes. Da kan du fylle ut profilen mens vi vurderer registreringen. Profilen blir ikke synlig før vi har godkjent den.</p>
+  ${ctaButtonHtml({ href: safeUrl, label: "Bekreft e-postadressen", color: "#0f5a50", radius: "8px", margin: "18px auto", center: true })}
+  <p style="font-size: 14px; color: #666;">Eller kopier og lim inn denne lenken i nettleseren:<br /><code>${safeUrl}</code></p>
+  <p>Lenken er gyldig i ${validHours} timer og kan bare brukes én gang.</p>
+  <p>Hvis du ikke har registrert noe hos oss, kan du trygt ignorere e-posten.</p>
+  <p style="margin-top: 36px; font-size: 13px; color: #666;">Mvh,<br>Opplevagent — kontakt@opplevagent.no<br>https://opplevagent.no</p>
+</body>
+</html>`;
+}
+
+function buildGardssalgSelfRegisterConfirmText(providerName: string, confirmUrl: string, validHours: number): string {
+  return `Hei!
+
+Vi har mottatt en registrering av ${providerName} på Opplevagent med denne e-postadressen.
+
+Åpne lenken under og trykk «Bekreft» på siden som åpnes. Da kan du fylle ut profilen mens vi vurderer registreringen. Profilen blir ikke synlig før vi har godkjent den.
+
+${confirmUrl}
+
+Lenken er gyldig i ${validHours} timer og kan bare brukes én gang.
+
+Hvis du ikke har registrert noe hos oss, kan du trygt ignorere e-posten.
+
+Mvh,
+Opplevagent
+kontakt@opplevagent.no
+https://opplevagent.no
+`;
 }
 
 function buildGardssalgClaimMagicLinkText(providerName: string, verifyUrl: string): string {

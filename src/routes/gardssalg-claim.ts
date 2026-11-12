@@ -194,7 +194,8 @@ function bookingBlockAlertHtml(block: OwnerBookingBlock): string {
       Du kan ikke slå booking på igjen selv. Ta kontakt med ${CLAIM_MANUAL_FALLBACK_EMAIL}.
     </div>`;
   }
-  return `<div class="gc-alert gc-alert-error" role="alert" data-booking-state="needs_booking_email">${escapeHtml(block.message)}</div>`;
+  const state = block.reason === "pending_review" ? "pending_review" : "needs_booking_email";
+  return `<div class="gc-alert gc-alert-error" role="alert" data-booking-state="${state}">${escapeHtml(block.message)}</div>`;
 }
 
 // ── Cookie parsing (no new deps — same fallback approach as owner-portal.ts

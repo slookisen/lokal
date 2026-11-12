@@ -8,9 +8,9 @@
 //
 // Skive 1 = the form, the server-side duplicate check (Spec A), the live Brreg
 // gate (Spec B), the RFB filters (Spec C) and creating the HIDDEN row (the
-// creation half of Spec E). No e-mail is sent, no session is issued, and
-// nothing is ever published from here: the e-mail code + draft mode (skive 2)
-// and the admin queue with approve/reject (skive 3) come later.
+// creation half of Spec E). Skive 2 (bottom of this file) adds the e-mail
+// code and the draft-mode session. Nothing is ever published from here: the
+// admin queue with approve/reject (skive 3) comes later.
 //
 // Order of the checks in submitSelfRegistration(), each one before anything
 // is written:
@@ -58,7 +58,7 @@ import { createProvider, brregDisplayName, providerSlugFor } from "./experience-
 import { isGardssalgVisibleOnSurface } from "./gardssalg-visibility";
 import { GARDSSALG_NACE_PRODUCER_TYPE } from "./gardssalg-nace-producer-type";
 import { SELF_REGISTERED_PENDING_REVIEW_REASON } from "./gardssalg-booking-gate";
-import { randomUUID } from "crypto";
+import crypto, { randomUUID } from "crypto";
 
 const VERTICAL = "experiences";
 
@@ -602,4 +602,234 @@ export async function submitSelfRegistration(input: SelfRegisterInput): Promise<
     }
     throw err;
   }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Skive 2 — Spec D (e-mail code) + Spec E (draft mode)
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// D. After a "created" submission the route asks for a confirm link
+//    (issueSelfRegisterConfirmToken) and e-mails it to the address the
+//    submitter typed — the ONLY use of that address before approval
+//    (dev-request 2026-08-06-aldri-gjett-epostadresse: never guessed, never
+//    derived, never written to experience_providers.epost here). The token is
+//    32 random bytes; only its SHA-256 is stored, with an expiry, and it can
+//    be used once. The link opens a confirm page (GET changes nothing — mail
+//    scanners open links); only the POST from that page confirms
+//    (confirmSelfRegisterEmail). Confirming proves access to the mailbox, not
+//    ownership, so the claim is assessed: until the 2026-10-30 assessment
+//    module exists the result is ALWAYS 'yellow' and the registration stays
+//    in Daniel's queue (claim_assessment, rule version below).
+//
+// E. The confirm also issues a draft-mode owner session: a gardssalg_claims
+//    row (the same table, token shape and oa_owner_session cookie as
+//    verifyClaimToken) with draft_mode=1 and used=0. used=0 keeps it out of
+//    every "claimed / has an owner" query (all keyed on used=1), so no
+//    «bekreftet av eier» badge, no claimed_at, no content_source='claim'.
+//    verifyClaimToken and verifyGardssalgOwnerSessionToken refuse draft rows,
+//    so the ordinary portal, its pause/resume (publish) and JSON routes stay
+//    closed to it. Only verifySelfRegisterDraftSession below accepts it, and
+//    only while the row is still hidden with reason
+//    self_registered_pending_review. Edits go through the real
+//    updateClaimedProviderProfile (CLAIM_EDITABLE_FIELDS), whose booking gate
+//    (ownerBookingEnableBlock) refuses booking for the pending row.
+
+/** How long the e-mailed confirm link is valid. */
+export const SELF_REGISTER_CONFIRM_VALID_HOURS = 48;
+/** How long the draft-mode session lasts (same as an ordinary claim session). */
+export const SELF_REGISTER_DRAFT_SESSION_HOURS = 7 * 24;
+/** The rule version recorded with every claim_assessment written here. */
+export const SELF_REGISTER_ASSESSMENT_RULE_VERSION = "selvreg-s2-no-module-2026-11-12";
+export const SELF_REGISTERED_CLAIM_EMAIL_SOURCE = "self_registered";
+
+export function hashSelfRegisterToken(token: string): string {
+  return crypto.createHash("sha256").update(token, "utf8").digest("hex");
+}
+
+export interface IssuedSelfRegisterConfirm {
+  token: string;
+  /** The submitter's own typed address — the code's only recipient. */
+  to: string;
+  providerName: string;
+  expiresAt: string;
+}
+
+/**
+ * Issue the e-mail code for one 'pending_review' registration whose provider
+ * row is still hidden pending review. Replaces any earlier unused code of the
+ * same registration. Returns null when the registration does not qualify.
+ */
+export function issueSelfRegisterConfirmToken(registrationId: string): IssuedSelfRegisterConfirm | null {
+  const db = getDb(VERTICAL);
+  const reg = db
+    .prepare(
+      `SELECT r.id, r.submitter_email, r.email_confirmed_at, p.navn
+         FROM gardssalg_self_registrations r
+         JOIN experience_providers p ON p.id = r.provider_id
+        WHERE r.id = ? AND r.status = 'pending_review'
+          AND p.catalog_hidden = 1 AND p.catalog_hidden_reason = ?`,
+    )
+    .get(registrationId, SELF_REGISTERED_PENDING_REVIEW_REASON) as
+    | { id: string; submitter_email: string; email_confirmed_at: string | null; navn: string }
+    | undefined;
+  if (!reg || reg.email_confirmed_at) return null;
+  const token = crypto.randomBytes(32).toString("hex");
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + SELF_REGISTER_CONFIRM_VALID_HOURS * 3600 * 1000).toISOString();
+  db.prepare(
+    `UPDATE gardssalg_self_registrations
+        SET email_code_hash = @hash, email_code_expires_at = @expires, email_code_sent_at = @now, email_code_used_at = NULL
+      WHERE id = @id`,
+  ).run({ id: reg.id, hash: hashSelfRegisterToken(token), expires: expiresAt, now: now.toISOString() });
+  return { token, to: reg.submitter_email, providerName: reg.navn, expiresAt };
+}
+
+export interface SelfRegisterClaimAssessment {
+  result: "yellow";
+  rule_version: string;
+  assessed_at: string;
+  reason: "assessment_module_missing";
+  signals: Array<{ signal: string; value: unknown; source: string; at: string }>;
+}
+
+export type ConfirmSelfRegisterResult =
+  | { ok: true; providerId: string; registrationId: string; sessionToken: string; assessment: SelfRegisterClaimAssessment }
+  | { ok: false; error: "invalid" | "expired" | "used" };
+
+/** Token shape: 64 lower-case hex characters (32 random bytes). */
+function isTokenShape(token: unknown): token is string {
+  return typeof token === "string" && /^[0-9a-f]{64}$/.test(token);
+}
+
+/**
+ * The POST half of the confirm link. Single use: the code is marked used in
+ * the same transaction that issues the draft session, guarded on
+ * email_code_used_at IS NULL so two concurrent POSTs cannot both win.
+ */
+export function confirmSelfRegisterEmail(token: unknown, now: Date = new Date()): ConfirmSelfRegisterResult {
+  if (!isTokenShape(token)) return { ok: false, error: "invalid" };
+  const db = getDb(VERTICAL);
+  const reg = db
+    .prepare(
+      `SELECT r.id, r.provider_id, r.submitter_email, r.email_code_expires_at, r.email_code_used_at, r.brreg_status,
+              r.duplicate_signals, r.possible_duplicate_of, p.catalog_hidden, p.catalog_hidden_reason
+         FROM gardssalg_self_registrations r
+         LEFT JOIN experience_providers p ON p.id = r.provider_id
+        WHERE r.email_code_hash = ?`,
+    )
+    .get(hashSelfRegisterToken(token)) as
+    | {
+        id: string;
+        provider_id: string | null;
+        submitter_email: string;
+        email_code_expires_at: string | null;
+        email_code_used_at: string | null;
+        brreg_status: string;
+        duplicate_signals: string | null;
+        possible_duplicate_of: string | null;
+        catalog_hidden: number | null;
+        catalog_hidden_reason: string | null;
+      }
+    | undefined;
+  if (!reg || !reg.provider_id) return { ok: false, error: "invalid" };
+  if (reg.email_code_used_at) return { ok: false, error: "used" };
+  const expiresMs = Date.parse(String(reg.email_code_expires_at || ""));
+  if (!Number.isFinite(expiresMs) || expiresMs <= now.getTime()) return { ok: false, error: "expired" };
+  // The row must still be the hidden, pending one (not approved, rejected or
+  // re-hidden for another reason since the code was sent).
+  if (Number(reg.catalog_hidden) !== 1 || reg.catalog_hidden_reason !== SELF_REGISTERED_PENDING_REVIEW_REASON) {
+    return { ok: false, error: "invalid" };
+  }
+
+  const at = now.toISOString();
+  const assessment: SelfRegisterClaimAssessment = {
+    result: "yellow",
+    rule_version: SELF_REGISTER_ASSESSMENT_RULE_VERSION,
+    assessed_at: at,
+    reason: "assessment_module_missing",
+    signals: [
+      { signal: "mailbox_access_proven", value: true, source: "self_register_email_code", at },
+      { signal: "brreg_status", value: reg.brreg_status, source: "gardssalg_self_registrations", at },
+      { signal: "possible_duplicate_of", value: reg.possible_duplicate_of, source: "gardssalg_self_registrations", at },
+    ],
+  };
+  const sessionToken = crypto.randomBytes(32).toString("hex");
+  const claimId = `gsc_${crypto.randomBytes(8).toString("hex")}`;
+  const sessionExpires = new Date(now.getTime() + SELF_REGISTER_DRAFT_SESSION_HOURS * 3600 * 1000).toISOString();
+
+  const won = db.transaction((): boolean => {
+    const upd = db
+      .prepare(
+        `UPDATE gardssalg_self_registrations
+            SET email_code_used_at = @at, email_confirmed_at = @at, claim_assessment = @assessment
+          WHERE id = @id AND email_code_used_at IS NULL`,
+      )
+      .run({ id: reg.id, at, assessment: JSON.stringify(assessment) });
+    if (upd.changes !== 1) return false;
+    db.prepare(
+      `INSERT INTO gardssalg_claims (id, provider_id, email, email_source, token, used, created_at, expires_at, is_test, draft_mode)
+       VALUES (?, ?, ?, ?, ?, 0, ?, ?, 0, 1)`,
+    ).run(claimId, reg.provider_id, reg.submitter_email, SELF_REGISTERED_CLAIM_EMAIL_SOURCE, sessionToken, at, sessionExpires);
+    return true;
+  })();
+  if (!won) return { ok: false, error: "used" };
+  console.log(`[gardssalg-self-register] e-mail confirmed for registration ${reg.id}; draft session issued for ${reg.provider_id} (assessment yellow → manual review)`);
+  return { ok: true, providerId: reg.provider_id, registrationId: reg.id, sessionToken, assessment };
+}
+
+export interface SelfRegisterDraftSession {
+  valid: boolean;
+  providerId?: string;
+}
+
+/**
+ * A draft-mode session: a gardssalg_claims row with draft_mode=1, used=0,
+ * not revoked, not expired, whose provider row is still hidden pending
+ * review. Anything else (an ordinary owner token included) is not a draft
+ * session.
+ */
+export function verifySelfRegisterDraftSession(token: string | undefined | null, now: Date = new Date()): SelfRegisterDraftSession {
+  if (!isTokenShape(token)) return { valid: false };
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT c.provider_id, c.expires_at
+         FROM gardssalg_claims c
+         JOIN experience_providers p ON p.id = c.provider_id
+        WHERE c.token = ? AND c.draft_mode = 1 AND c.used = 0 AND c.revoked_at IS NULL
+          AND p.catalog_hidden = 1 AND p.catalog_hidden_reason = ?`,
+    )
+    .get(token, SELF_REGISTERED_PENDING_REVIEW_REASON) as { provider_id: string; expires_at: string } | undefined;
+  if (!row) return { valid: false };
+  const exp = Date.parse(row.expires_at);
+  if (!Number.isFinite(exp) || exp <= now.getTime()) return { valid: false };
+  return { valid: true, providerId: row.provider_id };
+}
+
+export interface SelfRegisterDraftProfile {
+  id: string;
+  navn: string;
+  kommune: string | null;
+  about_text: string | null;
+  visit_text: string | null;
+  opening_hours_text: string | null;
+  products: string | null;
+  hjemmeside: string | null;
+  booking_live: number | null;
+  epost: string | null;
+  booking_admin_brake_at: string | null;
+  booking_admin_brake_note: string | null;
+  catalog_hidden_reason: string | null;
+}
+
+export function getSelfRegisterDraftProfile(providerId: string): SelfRegisterDraftProfile | null {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT id, navn, kommune, about_text, visit_text, opening_hours_text, products, hjemmeside, booking_live,
+              epost, booking_admin_brake_at, booking_admin_brake_note, catalog_hidden_reason
+         FROM experience_providers WHERE id = ?`,
+    )
+    .get(providerId) as SelfRegisterDraftProfile | undefined;
+  return row ?? null;
 }

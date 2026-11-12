@@ -480,10 +480,15 @@ export interface ClaimProviderRow {
   // Admin brake (G1 item 3, services/gardssalg-booking-gate.ts).
   booking_admin_brake_at: string | null;
   booking_admin_brake_note: string | null;
+  // Read by ownerBookingEnableBlock: a self-registered row pending review
+  // ('self_registered_pending_review') can never switch booking on (review
+  // N1 of lokal#1527 — this SELECT used to leave it out, so the gate never
+  // saw it on the real portal path).
+  catalog_hidden_reason: string | null;
 }
 
 const CLAIM_PROVIDER_COLUMNS =
-  "id, navn, slug, org_nr, brreg_verified, hjemmeside, content_source, field_provenance, about_text, visit_text, opening_hours_text, products, booking_live, epost, booking_admin_brake_at, booking_admin_brake_note";
+  "id, navn, slug, org_nr, brreg_verified, hjemmeside, content_source, field_provenance, about_text, visit_text, opening_hours_text, products, booking_live, epost, booking_admin_brake_at, booking_admin_brake_note, catalog_hidden_reason";
 
 export function getClaimProviderById(providerId: string): ClaimProviderRow | null {
   const db = getDb(VERTICAL);
@@ -2274,7 +2279,8 @@ export function verifyClaimToken(token: string): VerifyClaimResult {
   const claim = db
     .prepare(
       `SELECT id, provider_id, token FROM gardssalg_claims
-       WHERE token = ? AND expires_at > datetime('now') AND revoked_at IS NULL`,
+       WHERE token = ? AND expires_at > datetime('now') AND revoked_at IS NULL
+         AND COALESCE(draft_mode, 0) = 0`,
     )
     .get(token) as { id: string; provider_id: string; token: string } | undefined;
 
@@ -2310,7 +2316,8 @@ export function verifyGardssalgOwnerSessionToken(token: string | undefined | nul
   const claim = db
     .prepare(
       `SELECT provider_id FROM gardssalg_claims
-       WHERE token = ? AND used = 1 AND expires_at > datetime('now') AND revoked_at IS NULL`,
+       WHERE token = ? AND used = 1 AND expires_at > datetime('now') AND revoked_at IS NULL
+         AND COALESCE(draft_mode, 0) = 0`,
     )
     .get(token) as { provider_id: string } | undefined;
   if (!claim) return { valid: false };
@@ -2486,7 +2493,7 @@ export function updateClaimedProviderProfile(
   const row = db
     .prepare(
       `SELECT id, content_source, about_text, visit_text, opening_hours_text, products, hjemmeside, booking_live,
-              epost, booking_admin_brake_at, booking_admin_brake_note
+              epost, booking_admin_brake_at, booking_admin_brake_note, catalog_hidden_reason
          FROM experience_providers WHERE id = ?`,
     )
     .get(providerId) as
@@ -2497,6 +2504,7 @@ export function updateClaimedProviderProfile(
         epost: string | null;
         booking_admin_brake_at: string | null;
         booking_admin_brake_note: string | null;
+        catalog_hidden_reason: string | null;
       } & Record<string, unknown>)
     | undefined;
   if (!row) return { ok: false, error: "provider_not_found" };
