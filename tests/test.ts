@@ -11734,9 +11734,11 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     /name: "rett-fra-bonden"/.test(mcpSrc),
     "phase5.11-a7: McpServer name is 'rett-fra-bonden' (matches npm package)"
   );
+  // dev-request 2026-11-01-visibility-mcp-versjonsnummer-spriker: the version is no
+  // longer a literal — it is read from mcp-server/package.json (the npm package).
   assertTrue(
-    /version: "0\.4\.0"/.test(mcpSrc),
-    "phase5.11-a7: McpServer version is '0.4.0' (matches npm-published lokal-mcp)"
+    /version: mcpPackageVersion\("rfb"\)/.test(mcpSrc),
+    "phase5.11-a7: McpServer version is read from the npm package (mcpPackageVersion('rfb'))"
   );
   assertTrue(
     !/name: "lokal", version: "0\.3\.0"/.test(mcpSrc),

@@ -290,7 +290,8 @@ export async function runDentalMcpInstructionsTests(opts: { log?: boolean } = {}
     ok(typeof instructions === "string" && instructions.trim().length > 0, "I2: initialize.result.instructions is not empty");
     ok(instructions === mcp.DENTAL_MCP_INSTRUCTIONS, "I3: instructions === DENTAL_MCP_INSTRUCTIONS");
     const info = init.result?.serverInfo ?? {};
-    eq([info.name, info.version], ["finn-tannlege", "0.1.0"], "I4: serverInfo name and version unchanged");
+    const { mcpPackageVersion } = require("../config/mcp-versions") as typeof import("../config/mcp-versions");
+    eq([info.name, info.version], ["finn-tannlege", mcpPackageVersion("dental")], "I4: serverInfo name unchanged, version from the npm package");
     ok(typeof info.title === "string" && info.title.length > 0 && info.title === mcp.DENTAL_MCP_SERVER_TITLE, "I5: serverInfo.title is set (DENTAL_MCP_SERVER_TITLE)");
     ok(info.description === mcp.DENTAL_MCP_SERVER_DESCRIPTION && info.description.length > 0, "I6: serverInfo.description is set (DENTAL_MCP_SERVER_DESCRIPTION)");
     eq(info.websiteUrl, BRAND_ENTITIES.dental.url, "I7: serverInfo.websiteUrl is the brand URL");

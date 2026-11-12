@@ -31,17 +31,38 @@ async function serve(routers: Array<[string | null, any]>): Promise<{ base: stri
   return { base: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, close: () => new Promise<void>((res) => server.close(() => res())) };
 }
 
+// Real HTTP via node:http, never the global fetch: tests/test.ts stubs globalThis.fetch
+// in some blocks, and this suite runs inside that harness.
+function httpRequest(url: string, opts: { method?: string; headers?: Record<string, string>; body?: string } = {}): Promise<{ status: number; header: (n: string) => string | undefined; text: string }> {
+  return new Promise((resolve, reject) => {
+    const req = http.request(url, { method: opts.method ?? "GET", headers: opts.headers }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (c) => chunks.push(Buffer.from(c)));
+      res.on("end", () => {
+        const h = res.headers;
+        resolve({
+          status: res.statusCode ?? 0,
+          header: (n: string) => { const v = h[n.toLowerCase()]; return Array.isArray(v) ? v[0] : v; },
+          text: Buffer.concat(chunks).toString("utf8"),
+        });
+      });
+    });
+    req.on("error", reject);
+    if (opts.body !== undefined) req.write(opts.body);
+    req.end();
+  });
+}
+
 async function initializeVersion(base: string): Promise<string | undefined> {
-  const r = await fetch(`${base}/mcp`, {
+  const r = await httpRequest(`${base}/mcp`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "mcp-versions-test", version: "1.0.0" } } }),
   });
-  const text = await r.text();
-  const sid = r.headers.get("mcp-session-id");
-  if (sid) await (await fetch(`${base}/mcp`, { method: "DELETE", headers: { "mcp-session-id": sid } })).text();
-  const line = text.split("\n").find((l) => l.startsWith("data:"));
-  const body = JSON.parse(line ? line.slice(5) : text);
+  const sid = r.header("mcp-session-id");
+  if (sid) await httpRequest(`${base}/mcp`, { method: "DELETE", headers: { "mcp-session-id": sid } });
+  const line = r.text.split("\n").find((l) => l.startsWith("data:"));
+  const body = JSON.parse(line ? line.slice(5) : r.text);
   return body?.result?.serverInfo?.version;
 }
 
@@ -78,7 +99,7 @@ export async function runMcpVersionsTests(opts: { log?: boolean } = {}): Promise
       const s = await serve([[null, get()]]);
       try {
         for (const p of CARD_PATHS) {
-          const body = await (await fetch(`${s.base}${p}`)).json() as any;
+          const body = JSON.parse((await httpRequest(`${s.base}${p}`)).text) as any;
           const card = Array.isArray(body) ? body[0] : body;
           eq(card?.version, pkgs[v].version, `C ${v} ${p}: card version equals package.json`);
         }
