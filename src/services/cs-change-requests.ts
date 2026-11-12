@@ -76,7 +76,40 @@ const RFB_FIELDS: Record<string, { route: RfbRoute; key: string; lock: string; c
   postalCode: { route: "knowledge", key: "postalCode", lock: "postal_code", column: { table: "agent_knowledge", name: "postal_code" }, max: 10 },
   website: { route: "knowledge", key: "website", lock: "website", column: { table: "agent_knowledge", name: "website" }, max: 500 },
   about: { route: "knowledge", key: "about", lock: "about", column: { table: "agent_knowledge", name: "about" }, max: 4000 },
+  // The owner's opening hours as text («Onsdag 10–17, ellers når vi er
+  // hjemme», «Man–fre 10–17, lør 10–14»). Stored as a one-item text list,
+  // which every surface already reads (utils/opening-hours.ts): text in the
+  // day-and-time form becomes day rows, any other text shows as written.
+  // An empty value clears the hours.
+  openingHours: { route: "knowledge", key: "openingHours", lock: "opening_hours", column: { table: "agent_knowledge", name: "opening_hours" }, max: 1000 },
 };
+
+/** The knowledge value a change request writes for an RFB field (opening hours are a list). */
+function rfbKnowledgeValue(field: string, value: string): unknown {
+  if (field !== "openingHours") return value;
+  const text = value.trim();
+  return text ? [text] : [];
+}
+
+/**
+ * The stored opening hours as the text a change request compares with: a
+ * one-item text list is that text, an empty list (or nothing) is "", and any
+ * other stored form (day objects from enrichment or the owner portal) stays
+ * its raw JSON, so it never equals a request's text.
+ */
+export function openingHoursComparable(raw: string | null): string | null {
+  if (raw == null) return null;
+  let v: unknown;
+  try {
+    v = JSON.parse(raw);
+  } catch {
+    return raw; // free text stored by the owner portal
+  }
+  if (Array.isArray(v) && v.length === 0) return "";
+  if (Array.isArray(v) && v.length === 1 && typeof v[0] === "string") return v[0];
+  if (typeof v === "string") return v;
+  return raw;
+}
 
 const EXP_FIELDS: Record<string, { path: string; body: (v: string) => Record<string, unknown>; lock?: string; column: string; max: number }> = {
   name: { path: "gardssalg-set-provider-name", body: (v) => ({ value: v }), column: "navn", max: 200 },
@@ -566,7 +599,7 @@ function normText(s: string): string {
     .replace(/&lt;/gi, "<")
     .replace(/&gt;/gi, ">")
     .replace(/&nbsp;/gi, " ")
-    .replace(/\\n/g, " ")
+    .replace(/\\[nrt]/g, " ") // JSON escapes of a line break or tab (card JSON)
     .replace(/\s+/g, " ")
     .trim()
     .toLowerCase();
@@ -617,7 +650,8 @@ function dbValue(vertical: ChangeVertical, targetId: string, field: string): str
       const row = getDb()
         .prepare(f.column.table === "agents" ? `SELECT ${f.column.name} AS v FROM agents WHERE id = ?` : `SELECT ${f.column.name} AS v FROM agent_knowledge WHERE agent_id = ?`)
         .get(targetId) as { v: unknown } | undefined;
-      return row?.v == null ? null : String(row.v);
+      const raw = row?.v == null ? null : String(row.v);
+      return field === "openingHours" ? openingHoursComparable(raw) : raw;
     }
     const row = getVerticalDb("experiences").prepare(`SELECT ${EXP_FIELDS[field].column} AS v FROM experience_providers WHERE id = ?`).get(targetId) as { v: unknown } | undefined;
     return row?.v == null ? null : String(row.v);
@@ -669,7 +703,7 @@ async function executeProfileUpdate(r: ChangeRequestRow, deps: ExecDeps): Promis
       const m = RFB_FIELDS[f];
       if (m.route === "description") desc[m.key] = v;
       else if (m.route === "patch") patch[m.key] = v;
-      else know[m.key] = v;
+      else know[m.key] = rfbKnowledgeValue(f, v);
     }
     if (changes.phone !== undefined) {
       know.owner_relay_evidence = { channel: "email", ref: evidence.messageId ?? r.thread_id ?? r.id, received_at: r.created_at };
@@ -744,7 +778,10 @@ export async function verifyProfileUpdate(r: ChangeRequestRow, deps: ExecDeps): 
   let all = true;
   for (const [f, v] of Object.entries(changes)) {
     const stored = dbValue(r.vertical, r.target_id, f) ?? "";
-    const inDb = stored === v || (f === "phone" && digits(v).length >= 8 && digits(stored).endsWith(digits(v).slice(-8)));
+    const inDb =
+      stored === v ||
+      (f === "openingHours" && stored === v.trim()) ||
+      (f === "phone" && digits(v).length >= 8 && digits(stored).endsWith(digits(v).slice(-8)));
     if (!inDb) {
       results[f] = "ikke_lagret";
       all = false;

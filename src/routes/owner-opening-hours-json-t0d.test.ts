@@ -231,6 +231,19 @@ export async function runOwnerOpeningHoursJsonT0dTests(opts: { log?: boolean } =
       assertTrue(!(await ohInput(NEW_ID)).input.includes("[]"), "b-07: empty hours are not shown as []");
     }
 
+    // ── b2: a one-item text list (written by a CS change request) reads as its text ──
+    {
+      const CS_HOURS = "Onsdag, ellers når vi er hjemme";
+      db.prepare("UPDATE agent_knowledge SET opening_hours = ? WHERE agent_id = ?").run(JSON.stringify([CS_HOURS]), NEW_ID);
+      const page = await ohInput(NEW_ID);
+      assertTrue(page.input.includes(`value="${CS_HOURS}"`) && !page.input.includes("[") && !page.input.includes("&quot;"),
+        `b2-01: the portal input shows the change request's hours as text, not as a list (got: ${page.input})`);
+      const nAud = audits(NEW_ID).length;
+      const r = await up(NEW_ID, { opening_hours: CS_HOURS });
+      assertEq([r.body?.updated_fields, audits(NEW_ID).length, row(NEW_ID).opening_hours], [[], nAud, JSON.stringify([CS_HOURS])],
+        "b2-02: re-saving the shown text is a no-op; the list stays as the change request wrote it");
+    }
+
     // ── c: a raw-text row from before T0d ────────────────────────────────
     {
       const before = errorLog.length;
