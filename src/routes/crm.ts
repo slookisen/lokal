@@ -1244,7 +1244,9 @@ router.post("/ingest", (req, res) => {
   // ─── CS på serveren, S1a: the Gmail copy of a server-registered e-mail ──
   // The server already registered the original (cs-inbound). Its forwarded
   // Gmail copy is an inbound message with subject «[Innkommende] …» whose own,
-  // UNQUOTED text carries "Inbound-ID: inb-…" (forwardCopyMarker). That copy is
+  // UNQUOTED text carries "Inbound-ID: inb-…" — or the same copy filed
+  // unwrapped by the CS agent (original sender and subject), recognised by the
+  // forward's header block at the top of its text (forwardCopyMarker). That copy is
   // NOT filed again: when it is the FIRST message of the Gmail thread, the
   // Gmail thread id becomes an alias of the server thread and the other
   // messages (Daniel's Gmail reply, the customer's answer to it) are filed
