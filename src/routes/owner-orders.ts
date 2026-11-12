@@ -19,7 +19,7 @@
 import express, { Router, Request, Response } from "express";
 import { rateLimit } from "express-rate-limit";
 import { getDb } from "../database/init";
-import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
+import { ownerFeatureAccess } from "../owner-features/feature-tiers";
 import { verifyOwnerSession, ownerSessionAllows, isVerifiedOwner } from "./owner-portal";
 import { ownerDashboardActiveFor, renderOwnerShellStart } from "../owner-ui/shell";
 import { ownerActionCounts, ownerItemsPageActiveFor } from "../owner-ui/overview-data";
@@ -156,7 +156,7 @@ function pickupFrom(body: Record<string, unknown>, action: OrderAction): string 
 // T6: the shared owner theme only for a subject on OWNER_FEATURES_ALLOWED_SUBJECTS
 // (off the list = the page is byte-identical to before).
 function ownerThemeFor(agentId: string): boolean {
-  try { return isSubjectAllowedForOwnerFeatures("rfb", agentId); } catch { return false; }
+  try { return ownerFeatureAccess("owner_theme", "rfb", agentId).allowed; } catch { return false; }
 }
 
 // ── Owner session: the list ────────────────────────────────────────────────

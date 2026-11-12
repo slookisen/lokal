@@ -25,7 +25,7 @@ import { customerRuleSql } from "../services/customer-rule";
 import { getSupplyGraphHardStaleDays, getSupplyGraphStaleDays } from "../services/supply-graph";
 import { stockSoftExpiryActiveFor } from "../services/stock-soft-expiry";
 import { writeOrderNotificationsOptInWithAudit } from "../services/order-opt-in";
-import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
+import { ownerFeatureAccess } from "../owner-features/feature-tiers";
 import {
   OWNER_FEATURE_GROUPS, getOwnerFeature, ownerAutoUpdatesEnabled, ownerFeatureEntryForEnv, visibleOwnerFeatureOptions, type OwnerFeatureValue,
 } from "../owner-features/registry";
@@ -2122,7 +2122,7 @@ function renderOwnerPortalPage(req: Request, res: Response, addForm: OwnerItemsA
     // allowlist = "" = the portal is byte-identical to before).
     let hasOwnerFeatures = false;
     try {
-      hasOwnerFeatures = isSubjectAllowedForOwnerFeatures("rfb", agentId) && isVerifiedOwner(agentId, session);
+      hasOwnerFeatures = ownerFeatureAccess("mine_valg", "rfb", agentId).allowed && isVerifiedOwner(agentId, session);
     } catch { hasOwnerFeatures = false; }
 
     // S1b punkt 6: «Pause og sletting» card — only with OWNER_PAUSE_ENABLED on
@@ -2456,7 +2456,7 @@ function renderOwnerPortalPage(req: Request, res: Response, addForm: OwnerItemsA
     // for a subject on OWNER_FEATURES_ALLOWED_SUBJECTS (off the list = the
     // portal is byte-identical to before).
     let ownerTheme = false;
-    try { ownerTheme = isSubjectAllowedForOwnerFeatures("rfb", agentId); } catch { ownerTheme = false; }
+    try { ownerTheme = ownerFeatureAccess("owner_theme", "rfb", agentId).allowed; } catch { ownerTheme = false; }
     const pageBody = ownerTheme ? `<style>${OWNER_PORTAL_THEME_CSS}</style>${ownerThemeHtml(body)}` : body;
 
     return res.send(portalShell(`Eierportal · ${agent.name}`, pageBody,
@@ -3628,7 +3628,7 @@ export function weeklySyncNudgeHtml(agentId: string): string {
   let choice: ReturnType<typeof importPageAutoSyncChoice> = null;
   try {
     // «Mine valg» 404s for subjects off the allowlist (pageGate): no link to a page the owner cannot open.
-    if (!isSubjectAllowedForOwnerFeatures("rfb", agentId)) return "";
+    if (!ownerFeatureAccess("mine_valg", "rfb", agentId).allowed) return "";
     choice = importPageAutoSyncChoice(agentId);
   } catch { choice = null; }
   if (!choice || choice.mode === "weekly") return "";

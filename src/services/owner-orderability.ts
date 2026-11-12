@@ -45,7 +45,7 @@ import {
 import { setProducerAvailabilityByProductId } from "./supply-graph";
 import { validateProducerList } from "../routes/marketplace-catalog";
 import { normalizeName } from "./product-catalog-sync";
-import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
+import { ownerFeatureAccess } from "../owner-features/feature-tiers";
 
 export const OWNER_ORDERABILITY_PORTAL_FLAG = "OWNER_ORDERABILITY_PORTAL_ENABLED";
 
@@ -56,7 +56,7 @@ export function ownerOrderabilityPortalEnabled(env: NodeJS.ProcessEnv = process.
 
 /** B1a: the flag AND this producer on the owner-features allowlist (`rfb:<id>`). */
 export function ownerOrderabilityPortalEnabledFor(agentId: string, env: NodeJS.ProcessEnv = process.env): boolean {
-  return ownerOrderabilityPortalEnabled(env) && isSubjectAllowedForOwnerFeatures("rfb", agentId, env);
+  return ownerOrderabilityPortalEnabled(env) && ownerFeatureAccess("orderability", "rfb", agentId, env).allowed;
 }
 
 /** Reasons a stock confirmation cannot fix: such rows get no confirm button and are skipped by «Bekreft alle». */
