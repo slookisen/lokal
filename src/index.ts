@@ -198,6 +198,7 @@ import { mountBillingRoutes } from "./routes/admin-billing";
 import { mountPaymentRoutes, mountPaymentWebhook } from "./routes/payments";
 import contactRouter from "./routes/contact";
 import contactTrackingRoutes, { redirectRouter as contactRedirectRouter } from "./routes/contact-tracking";
+import { profileClickTrackRouter } from "./services/profile-link-clicks";
 import { list as blocklistList } from "./services/blocklist-service";
 import { bounceService } from "./services/bounce-service";
 import { seedData } from "./seed";
@@ -693,6 +694,12 @@ app.use("/api", contactRouter);
 // is a short top-level path (/ut/...) so it can be dropped straight into
 // a profile page as an href, same style as a URL-shortener endpoint.
 app.use("/api/track", contactTrackingRoutes);
+// dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord S4: the click
+// beacon for tel:/mailto: links on Opplevagent and Finn-tannlege profile
+// pages (POST /api/track/profile-click; /api/* passes their host gates). The
+// counting redirect for those hosts lives in their own SEO routers
+// (GET /ut/:surface/:id/:kind in experiences-seo.ts / dental-seo.ts).
+app.use("/api/track", profileClickTrackRouter);
 app.use("/ut", contactRedirectRouter);
 app.use("/api/producers", producerRoutes);
 app.use("/api/producers", scanRoutes);

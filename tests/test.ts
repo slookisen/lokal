@@ -54129,3 +54129,26 @@ runSerial(async () => {
     failures.push("self-registered-queue-owner-s4b: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord S4: counting
+// redirects GET /ut/<surface>/<id>/<kind> + beacon POST /api/track/profile-click
+// for the Opplevagent and Finn-tannlege profile links, and their clicks in
+// /admin/api/ordre/{oversikt,eksport.csv} (bots and test providers apart).
+// Own in-memory lokal/experiences/dental DBs (init pin + db-factory swap),
+// a local HTTP server, swaps ENABLE_* / *_DB_PATH / ADMIN_KEY (restored in
+// finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── S4: tellende lenker på Opplevagent og Finn-tannlege ──");
+  try {
+    const { runProfileLinkClicksTests } = require("../src/routes/profile-link-clicks.test") as
+      typeof import("../src/routes/profile-link-clicks.test");
+    const r = await runProfileLinkClicksTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("profile-link-clicks: " + f);
+    console.log(`  profile-link-clicks: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("profile-link-clicks: unexpected error: " + String(err?.message || err));
+  }
+});

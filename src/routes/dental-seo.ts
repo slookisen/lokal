@@ -30,6 +30,7 @@ import { isDisplayablePhone } from "../services/contact-normalizer";
 // clinic's own «Hjemmeside» link carries UTM; booking and directory_url links
 // and the JSON-LD sameAs stay as stored.
 import { addUtmParams, OUTBOUND_UTM } from "../utils/url-utm";
+import { profileLinkHref, profileLinkBeaconAttrs, profileClickBeaconScript, profileLinkRedirectHandler } from "../services/profile-link-clicks";
 const CLINIC_SITE_UTM = OUTBOUND_UTM.dental.clinic_profile;
 import { resolveAcuteClaim, ACUTE_ACCEPTS_LABEL } from "../services/dental-acute-claim";
 import { resolveHelfoClaim, HELFO_CLAIM_REQUIRES_SOURCE } from "../services/dental-helfo-claim";
@@ -2015,13 +2016,23 @@ function renderClinicProfile(
   }
 
   // ── Action buttons
+  // dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord S4: booking,
+  // website and directory links go through the counting redirect GET
+  // /ut/klinikk/:id/{booking,website,directory} (services/profile-link-
+  // clicks.ts reads the same stored columns, website with the same
+  // CLINIC_SITE_UTM — never a URL from the request); tel: and mailto: links
+  // fire the click beacon (data-track-*). No id → the direct links as before.
+  const clinicId = agent.id ? String(agent.id) : "";
+  const outHref = (kind: "booking" | "website" | "directory", direct: string): string =>
+    escapeHtml(clinicId ? profileLinkHref("klinikk", clinicId, kind) : direct);
+  const telTrack = clinicId ? profileLinkBeaconAttrs("klinikk", clinicId, "phone") : "";
   const _callTelHref = safeTelHref(agent.telefon);
   const callBtn = _callTelHref
-    ? `<a href="${_callTelHref}" class="btn-call">${ICON_PHONE} Ring ${escapeHtml(agent.telefon)}</a>`
+    ? `<a href="${_callTelHref}" class="btn-call"${telTrack}>${ICON_PHONE} Ring ${escapeHtml(agent.telefon)}</a>`
     : "";
   const _bookUrl = safeUrl(agent.online_booking_url);
   const bookBtn = _bookUrl
-    ? `<a href="${escapeHtml(_bookUrl)}" rel="nofollow noopener" target="_blank" class="btn-book">Book time online</a>`
+    ? `<a href="${outHref("booking", _bookUrl)}" rel="nofollow noopener" target="_blank" class="btn-book">Book time online</a>`
     : "";
 
   // ── Om oss
@@ -2038,17 +2049,17 @@ function renderClinicProfile(
   // as before.
   if (agent.adresse) infoItems.push(`<div class="info-item"><div class="info-label">Adresse</div><div class="info-value">${escapeHtml(agent.adresse)}${postnummer ? `, ${escapeHtml(postnummer)}` : ""}${agent.poststed ? ` ${escapeHtml(agent.poststed)}` : ""}</div></div>`);
   else if (stored.adresse && (postnummer || agent.poststed)) infoItems.push(`<div class="info-item"><div class="info-label">Postnummer og sted</div><div class="info-value">${[postnummer, agent.poststed].filter(Boolean).map((v) => escapeHtml(v!)).join(" ")}</div></div>`);
-  { const h = safeTelHref(agent.telefon); if (h) infoItems.push(`<div class="info-item"><div class="info-label">Telefon</div><div class="info-value"><a href="${h}">${escapeHtml(agent.telefon)}</a></div></div>`); }
-  { const h = safeTelHref(agent.mobil); if (h) infoItems.push(`<div class="info-item"><div class="info-label">Mobil</div><div class="info-value"><a href="${h}">${escapeHtml(agent.mobil)}</a></div></div>`); }
-  if (shownEmail) infoItems.push(`<div class="info-item"><div class="info-label">E-post</div><div class="info-value"><a href="mailto:${escapeHtml(shownEmail)}">${escapeHtml(shownEmail)}</a></div></div>`);
+  { const h = safeTelHref(agent.telefon); if (h) infoItems.push(`<div class="info-item"><div class="info-label">Telefon</div><div class="info-value"><a href="${h}"${telTrack}>${escapeHtml(agent.telefon)}</a></div></div>`); }
+  { const h = safeTelHref(agent.mobil); if (h) infoItems.push(`<div class="info-item"><div class="info-label">Mobil</div><div class="info-value"><a href="${h}"${telTrack}>${escapeHtml(agent.mobil)}</a></div></div>`); }
+  if (shownEmail) infoItems.push(`<div class="info-item"><div class="info-label">E-post</div><div class="info-value"><a href="mailto:${escapeHtml(shownEmail)}"${clinicId ? profileLinkBeaconAttrs("klinikk", clinicId, "email") : ""}>${escapeHtml(shownEmail)}</a></div></div>`);
   else if (emailView === "reveal") infoItems.push(`<div class="info-item"><div class="info-label">E-post</div><div class="info-value"><a href="${escapeHtml(dentalEmailRevealPath(agent.id ?? ""))}" rel="nofollow">${DENTAL_EMAIL_REVEAL_LABEL}</a></div></div>`);
   else if (contactFormShown) infoItems.push(dentalContactFormItem(agent.id ?? ""));
-  { const u = safeUrl(agent.hjemmeside); if (u) infoItems.push(`<div class="info-item"><div class="info-label">Hjemmeside</div><div class="info-value"><a href="${escapeHtml(addUtmParams(u, CLINIC_SITE_UTM.source, "referral", CLINIC_SITE_UTM.campaign))}" rel="nofollow noopener" target="_blank">${escapeHtml(u.replace(/^https?:\/\//,""))}</a></div></div>`); }
+  { const u = safeUrl(agent.hjemmeside); if (u) infoItems.push(`<div class="info-item"><div class="info-label">Hjemmeside</div><div class="info-value"><a href="${outHref("website", addUtmParams(u, CLINIC_SITE_UTM.source, "referral", CLINIC_SITE_UTM.campaign))}" rel="nofollow noopener" target="_blank">${escapeHtml(u.replace(/^https?:\/\//,""))}</a></div></div>`); }
   // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5d):
   // directory_url is NEVER the clinic's own homepage (that's `hjemmeside`
   // above) -- it's a county-directory listing, a Facebook page, or similar.
   // Label it accordingly so a visitor never mistakes it for the clinic's site.
-  { const u = safeUrl(agent.directory_url); if (u) infoItems.push(`<div class="info-item"><div class="info-label">${escapeHtml(directoryUrlLabel(u))}</div><div class="info-value"><a href="${escapeHtml(u)}" rel="nofollow noopener" target="_blank">${escapeHtml(u.replace(/^https?:\/\//,""))}</a></div></div>`); }
+  { const u = safeUrl(agent.directory_url); if (u) infoItems.push(`<div class="info-item"><div class="info-label">${escapeHtml(directoryUrlLabel(u))}</div><div class="info-value"><a href="${outHref("directory", u)}" rel="nofollow noopener" target="_blank">${escapeHtml(u.replace(/^https?:\/\//,""))}</a></div></div>`); }
   if (agent.org_nr) infoItems.push(`<div class="info-item"><div class="info-label">Organisasjonsnr.</div><div class="info-value">${escapeHtml(agent.org_nr)}</div></div>`);
   if (agent.registreringsdato) infoItems.push(`<div class="info-item"><div class="info-label">Registrert</div><div class="info-value">${escapeHtml(agent.registreringsdato)}</div></div>`);
   if (agent.antall_ansatte !== null && agent.antall_ansatte !== undefined) infoItems.push(`<div class="info-item"><div class="info-label">Antall ansatte</div><div class="info-value">${escapeHtml(String(agent.antall_ansatte))}</div></div>`);
@@ -2333,7 +2344,7 @@ function renderClinicProfile(
       <div class="clinic-badges" style="margin-bottom:12px">${badges.join("")}</div>
       <h1 class="profile-name">${escapeHtml(agent.navn)}</h1>
       <div class="profile-loc">${ICON_PIN} ${isValidLocality(agent.poststed) ? escapeHtml(officialPlaceLabel(agent.poststed!)) : ""}${isValidLocality(agent.poststed) && isValidLocality(agent.fylke) ? `, ${escapeHtml(agent.fylke!)}` : !isValidLocality(agent.poststed) && isValidLocality(agent.fylke) ? escapeHtml(agent.fylke!) : ""}</div>
-      <div class="profile-actions">${callBtn}${bookBtn}</div>
+      <div class="profile-actions">${callBtn}${bookBtn}</div>${clinicId ? profileClickBeaconScript() : ""}
     </div>
   </div>
   <div class="container" style="padding-top:32px;padding-bottom:48px">
@@ -2366,6 +2377,13 @@ ${emailView === null ? "" : emailTrapLinkFor("dental")}</main>`;
     jsonLd: jsonLdArr,
   }));
 }
+
+// GET /ut/klinikk/:id/:kind — counting redirect for the clinic profile's
+// outgoing booking / website / directory links (dev-request
+// 2026-10-23-admin-ordre-og-henvisningsdashbord, S4). Target read only from
+// dental_agents by id + a closed kind (services/profile-link-clicks.ts);
+// Opplevagent surfaces 404 here.
+router.get("/ut/:surface/:id/:kind", generalLimiter, profileLinkRedirectHandler(["klinikk"]));
 
 router.get("/klinikk/id/:id", (req: Request, res: Response) => {
   const agent = getDentalAgentById(String(req.params.id));
@@ -3542,8 +3560,9 @@ router.get("/personvern", (_req: Request, res: Response) => {
   // 2026-10-13: faktarettinger (dev-request 2026-10-06-personvernerklaeringer-del-a-na-del-b-pa-t, del A);
   // visit and search statistics described (2026-10-13-statistikk-riktig-for-investorer, S2:
   // searches are now logged); operator → AGENTPLATFORM.NO AS (2026-10-08). 2026-11-08: the
-  // AI-answer marker (dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 6).
-  const updatedDate = "2026-11-08";
+  // AI-answer marker (dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 6). 2026-11-11:
+  // clicks on to the clinic (dev-request 2026-10-23-admin-ordre-og-henvisningsdashbord, S4).
+  const updatedDate = "2026-11-11";
   const html = `
 <main>
   <div class="content-page">
@@ -3568,6 +3587,8 @@ router.get("/personvern", (_req: Request, res: Response) => {
     <p>Søk lagres uten navn eller konto, og vi forsøker ikke å knytte dem til deg. Disse enkeltregistreringene slettes automatisk etter 60 dager. Før sletting summeres de til tall uten kobling til den besøkende (for eksempel antall besøk per dag og antall søk per søketekst), og bare disse tallene beholdes. Statistikken lagres i databasen hos Fly.io (se under) og deles ikke med andre.</p>
 
     <p>Har lenken du kom fra et merke (<code>utm_source</code>, <code>utm_medium</code>, <code>utm_campaign</code>), lagres også merket sammen med sidebesøket. Lenker til klinikksider som vi gir AI-assistenter som ChatGPT og Claude, har et slikt merke (for eksempel <code>utm_source=claude&amp;utm_campaign=ai_search</code>). Merket sier bare hvilken AI-tjeneste lenken ble gitt til &mdash; det inneholder ingenting om deg. Sammen med referanse-URL-en lar det oss telle besøk som kom fra et AI-svar. Disse besøkene summeres per dag, klinikkside og AI-tjeneste, uten IP-hash eller annen kobling til den besøkende, og summene vises på klinikksidene. Summene slettes ikke automatisk i dag.</p>
+
+    <p>Når du klikker på en lenke på en klinikkside videre til klinikken (timebestilling, nettside, telefon eller e-post), teller vi klikket uten cookies og uten navn eller kontaktopplysninger om deg &mdash; bare hvilken klinikk, hvilken lenke, tidspunktet og den samme pseudonyme besøks-ID-en som sidebesøkene (med en saltet, forkortet hash av IP-adressen, aldri hele IP-adressen), og klikkene slettes ikke automatisk i dag.</p>
 
     <h2>Navngitte personer</h2>
     <p>Tannleger og annet helsepersonell kan fremgå av profilene med navn og tittel/spesialitet. Dette er offentlig tilgjengelig informasjon knyttet til yrkesutøvelse og autorisasjon &mdash; ikke privat informasjon. Grunnlaget er at offentligheten har rett og behov for å kjenne til autorisert helsepersonells spesialkompetanse.</p>
