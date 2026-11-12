@@ -443,6 +443,21 @@ export async function runAdminOrderDailySumsTests(opts: { log?: boolean } = {}):
       big.close(); big2.close(); big3.close();
     }
 
+    // An existing row is never overwritten (INSERT OR IGNORE): a row that is
+    // already there for a day without a marker keeps its value.
+    {
+      const fz = new Database(":memory:");
+      initMod.__initSchemaForTesting(fz as any);
+      fz.prepare(`INSERT INTO contact_clicks (agent_id, kind, session_id, is_bot, created_at) VALUES ('ag-x', 'website', ?, 0, ?)`).run(SESSION, `${YESTERDAY} 10:00:00`);
+      const dim = JSON.stringify({ agent_id: "ag-x", kind: "website", is_bot: 0, is_test: 0 });
+      fz.prepare(`INSERT INTO ${T} (plattform, metrikk, dimensjon, dag, verdi) VALUES ('rfb', 'klikk.antall', ?, ?, 99)`).run(dim, YESTERDAY);
+      const r = await job.runAdminOrderDailySums(fz, null, { now: () => NOW });
+      assertEq(r.days_written["rfb.klikk"], 1, "frozen: the day is processed (marker missing)");
+      assertEq(sumValue(fz, "rfb", "klikk.antall", dim, YESTERDAY), 99, "frozen: an existing row is never overwritten");
+      assertEq(sumValue(fz, "rfb", "klikk.rader", "", YESTERDAY), 1, "frozen: marker written");
+      fz.close();
+    }
+
     // The table is created by the schema (idempotent).
     {
       initMod.__initSchemaForTesting(db as any);
