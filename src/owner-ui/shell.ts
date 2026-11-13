@@ -47,7 +47,7 @@
 // passes `statsPage: true` then: Mer → Statistikk goes to /statistikk, and on
 // that page it carries aria-current="page". Without it the link is as in T15a.
 
-import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
+import { ownerFeatureAccess } from "../owner-features/feature-tiers";
 
 export const OWNER_DASHBOARD_ENABLED_ENV = "OWNER_DASHBOARD_ENABLED";
 
@@ -68,7 +68,7 @@ export function ownerDashboardActiveFor(
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
   try {
-    return verifiedOwner && isOwnerDashboardEnabled(env) && isSubjectAllowedForOwnerFeatures(vertical, agentId, env);
+    return verifiedOwner && isOwnerDashboardEnabled(env) && ownerFeatureAccess("dashboard", vertical, agentId, env).allowed;
   } catch {
     return false;
   }

@@ -25,7 +25,7 @@
 // the log the owner's product writes already use.
 
 import crypto from "crypto";
-import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
+import { ownerFeatureAccess } from "../owner-features/feature-tiers";
 import { evaluateStockFreshness, setProducerAvailabilityByProductId } from "./supply-graph";
 
 export const STOCK_SOFT_EXPIRY_FLAG = "STOCK_SOFT_EXPIRY_ENABLED";
@@ -38,7 +38,7 @@ export function stockSoftExpiryEnabled(env: NodeJS.ProcessEnv = process.env): bo
 /** The flag AND this producer on the owner-features allowlist (`rfb:<id>`). */
 export function stockSoftExpiryActiveFor(agentId: string | null | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
   if (!agentId) return false;
-  return stockSoftExpiryEnabled(env) && isSubjectAllowedForOwnerFeatures("rfb", agentId, env);
+  return stockSoftExpiryEnabled(env) && ownerFeatureAccess("stock_soft_expiry", "rfb", agentId, env).allowed;
 }
 
 /** dd.mm.åååå in Norwegian time ("" when unparseable). */

@@ -54,7 +54,7 @@ import {
 import { isPaymentsLifecycleActive, onOrderTransitioned, type OrderPaymentEffect } from "./payment-service";
 import type { PaymentsStripeClient } from "./payment-provider";
 import { markOrderItemsSoldOut, refreshStockConfirmationForOrder, soldOutIdsFromBody, stockSoftExpiryActiveFor } from "./stock-soft-expiry";
-import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
+import { ownerFeatureAccess } from "../owner-features/feature-tiers";
 import { sendBuyerOrderReceipt, type ReceiptEvent } from "./order-receipt-service";
 import { sendAdminOrderAlert, sendProducerBuyerCancelNotice } from "./order-notify-service";
 import {
@@ -429,7 +429,7 @@ export function t12SellerActionFrom(body: Record<string, unknown>, agentId: stri
 /** T12: the cancellation component and its actions only for a producer on OWNER_FEATURES_ALLOWED_SUBJECTS. */
 export function t12OrderActionsActive(agentId: string | null | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
   if (!agentId) return false;
-  try { return isSubjectAllowedForOwnerFeatures("rfb", agentId, env); } catch { return false; }
+  try { return ownerFeatureAccess("orders", "rfb", agentId, env).allowed; } catch { return false; }
 }
 
 const IDEM_KEY_CONFLICT = "idempotencyKey was already used for a different action on this order";

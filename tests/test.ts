@@ -54235,3 +54235,24 @@ runSerial(async () => {
     failures.push("profile-link-clicks: unexpected error: " + String(err?.message || err));
   }
 });
+
+// A2A dev-request 2026-11-09-rfb-eierverktoy-beta-for-alle, S1: the owner
+// feature tier register (pilot | beta | ga, default pilot for all) and the
+// central ownerFeatureAccess gate every pilot-list owner feature goes through.
+// Pure (env objects passed in); swaps console.warn/error and the beta
+// enrollment lookup (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── beta-for-alle S1: funksjonsnivåer og sentral tilgangssjekk ──");
+  try {
+    const { runFeatureTiersTests } = require("../src/owner-features/feature-tiers.test") as
+      typeof import("../src/owner-features/feature-tiers.test");
+    const r = await runFeatureTiersTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("feature-tiers: " + f);
+    console.log(`  feature-tiers: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("feature-tiers: unexpected error: " + String(err?.message || err));
+  }
+});

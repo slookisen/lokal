@@ -10,7 +10,7 @@
 // `pilot` matches exactly — no trimming, no case folding (fail closed).
 // Where a call site has no agent id, pilot counts as off.
 
-import { isSubjectAllowedForOwnerFeatures } from "./allowlist";
+import { OWNER_PILOT_FLAG_FEATURE, ownerFeatureAccess } from "./feature-tiers";
 
 export type OwnerFlagMode = "off" | "pilot" | "all";
 
@@ -43,7 +43,8 @@ export function ownerFlagEnabledFor(
 ): boolean {
   const mode = ownerFlagMode(name, env);
   if (mode === "all") return true;
-  if (mode === "pilot") return !!agentId && isSubjectAllowedForOwnerFeatures("rfb", agentId, env);
+  // beta-for-alle S1: pilot mode goes through the central tier gate (default tier pilot = the pilot list, as before).
+  if (mode === "pilot") return !!agentId && ownerFeatureAccess(OWNER_PILOT_FLAG_FEATURE[name] ?? name, "rfb", agentId, env).allowed;
   return false;
 }
 

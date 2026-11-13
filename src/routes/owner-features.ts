@@ -8,7 +8,7 @@ import {
   parseResumeDate, ownerUnifiedSessionEnabledFor, ownerEmailNeedsClaimantLoginPage,
 } from "./owner-portal";
 import { isCrossSiteWrite } from "../middleware/same-origin-write";
-import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
+import { ownerFeatureAccess } from "../owner-features/feature-tiers";
 import { OWNER_FEATURE_GROUPS, OWNER_FEATURE_REGISTRY, ownerFeatureEntryForEnv, ownerFeatureStatus, visibleOwnerFeatureOptions, type OwnerFeatureEntry } from "../owner-features/registry";
 import {
   resolveOwnerFeatures,
@@ -96,7 +96,7 @@ type Gate =
 
 function gate(req: Request): Gate {
   const agentId = String(req.params.id || "");
-  if (!isSubjectAllowedForOwnerFeatures(VERTICAL, agentId)) return { ok: false, send: notFound };
+  if (!ownerFeatureAccess("mine_valg", VERTICAL, agentId).allowed) return { ok: false, send: notFound };
   const session = verifyOwnerSession(req);
   if (!session.valid || !session.token) {
     return {
@@ -249,7 +249,7 @@ function simplePage(status: number, title: string, html: string) {
 
 function pageGate(req: Request): Gate {
   const agentId = String((req.params as any).agentId || "");
-  if (!isSubjectAllowedForOwnerFeatures(VERTICAL, agentId)) {
+  if (!ownerFeatureAccess("mine_valg", VERTICAL, agentId).allowed) {
     return { ok: false, send: simplePage(404, "Fant ikke siden", `<h1>Fant ikke siden</h1>`) };
   }
   const session = verifyOwnerSession(req);

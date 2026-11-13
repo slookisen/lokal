@@ -68,7 +68,8 @@ import {
 } from "./owner-orderability";
 import { serverSignatureFor } from "./avmeld-service";
 import { rfbFeatureOn } from "../owner-features/resolve";
-import { isSubjectAllowedForOwnerFeatures, ownerFeaturesAllowedSubjects } from "../owner-features/allowlist";
+import { ownerFeaturesAllowedSubjects } from "../owner-features/allowlist";
+import { ownerFeatureAccess } from "../owner-features/feature-tiers";
 import { osloHour } from "./order-cap-notice";
 
 export const STOCK_CHECK_EMAIL_FLAG = "STOCK_CHECK_EMAIL_ENABLED";
@@ -116,7 +117,7 @@ export function stockCheckOn(agentId: string, opts: { db?: any; env?: NodeJS.Pro
 
 /** B1a: the producer is on the owner-features allowlist (`rfb:<id>`). */
 export function stockCheckAllowlisted(agentId: string, env: NodeJS.ProcessEnv = process.env): boolean {
-  return isSubjectAllowedForOwnerFeatures("rfb", agentId, env);
+  return ownerFeatureAccess("stock_check", "rfb", agentId, env).allowed;
 }
 
 /** B1a: the allowlisted rfb producer ids (the job selects only these). */
