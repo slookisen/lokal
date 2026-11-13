@@ -28,6 +28,7 @@ import { writeOrderNotificationsOptInWithAudit } from "../services/order-opt-in"
 import {
   OWNER_SESSION_FIXED_MS,
   isOwnerSessionSlidingEnabled,
+  isSlidingOwnerSessionRowId,
   newOwnerSessionLifetimeMs,
   parseOwnerSessionTime,
   renewOwnerSessionOnUse,
@@ -335,13 +336,14 @@ router.get("/magic-link-verify", (req: Request, res: Response) => {
         return res.redirect(302, "/?error=invalid_token");
       }
       openOwnerSession(res, agentId, String(magicLink.email || ""));
-    } else if (isOwnerSessionSlidingEnabled() && !String(magicLink.id || "").startsWith(OWNER_BRIDGE_ID_PREFIX)) {
+    } else if (isOwnerSessionSlidingEnabled() && isSlidingOwnerSessionRowId(magicLink.id)) {
       // OWNER_SESSION_SLIDING_ENABLED (dev-request 2026-11-09-rfb-eierokt-
       // fornyes-ved-bruk): the first use starts the session — used_at = now,
       // expires_at = now + the new-session lifetime (30 days, capped). A link
       // that is already used keeps its used_at (the 90-day cap's start) and
       // only gets the usual renewal, so clicking the mail again never resets
-      // the cap. A bridge row ("mlbridge_") keeps today's branch below: it is
+      // the cap. Only "ml_"/"mlsess_" rows (the allowlist); a /selger uuid
+      // row or a bridge row ("mlbridge_") keeps today's branch below: it is
       // never lengthened.
       const lifetimeMs = newOwnerSessionLifetimeMs();
       const nowMs = Date.now();

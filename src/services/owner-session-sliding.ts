@@ -35,8 +35,31 @@ export const OWNER_SESSION_FIXED_MS = 7 * DAY_MS;
 /** A renewal is written only when it moves the expiry more than this. */
 export const OWNER_SESSION_RENEW_MIN_STEP_MS = DAY_MS;
 
-/** magic_links bridge rows (15-minute /selger hand-off) are never renewed. */
-const OWNER_BRIDGE_ID_PREFIX = "mlbridge_";
+/**
+ * ALLOWLIST of magic_links id prefixes that are genuine /eier owner sessions,
+ * the only rows that ever slide (security review of 8c920ba, B1):
+ *   "ml_"     — the e-mailed /eier login link whose token becomes the session
+ *               (routes/owner-portal.ts createOwnerLoginLink, kind "request");
+ *   "mlsess_" — a session row opened by openOwnerSession (routes/owner-portal.ts)
+ *               and by the order-activation service.
+ * Everything else keeps today's fixed expiry: the /selger e-mail login rows
+ * (uuid id, 15 minutes, knowledge-service createMagicLink), the "mlbridge_"
+ * hand-off rows (15 minutes) and the "mlclaim_" claim-approval links.
+ */
+const SLIDING_OWNER_SESSION_ID_PREFIXES = ["ml_", "mlsess_"] as const;
+
+export function isSlidingOwnerSessionRowId(id: unknown): boolean {
+  const s = typeof id === "string" ? id : "";
+  return SLIDING_OWNER_SESSION_ID_PREFIXES.some((p) => s.startsWith(p));
+}
+
+let warnedCapBelowIdle = false;
+/** Logs once per process when OWNER_SESSION_MAX_DAYS < OWNER_SESSION_IDLE_DAYS (the cap then rules). */
+function warnIfCapBelowIdle(env: NodeJS.ProcessEnv): void {
+  if (warnedCapBelowIdle || ownerSessionMaxDays(env) >= ownerSessionIdleDays(env)) return;
+  warnedCapBelowIdle = true;
+  console.warn(`[owner-session] OWNER_SESSION_MAX_DAYS (${ownerSessionMaxDays(env)}) is below OWNER_SESSION_IDLE_DAYS (${ownerSessionIdleDays(env)}); the cap rules`);
+}
 
 export function isOwnerSessionSlidingEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.OWNER_SESSION_SLIDING_ENABLED === "1" || env.OWNER_SESSION_SLIDING_ENABLED === "true";
@@ -58,6 +81,7 @@ export function ownerSessionIdleDays(env: NodeJS.ProcessEnv = process.env): numb
  */
 export function newOwnerSessionLifetimeMs(env: NodeJS.ProcessEnv = process.env): number {
   if (!isOwnerSessionSlidingEnabled(env)) return OWNER_SESSION_FIXED_MS;
+  warnIfCapBelowIdle(env);
   return Math.min(ownerSessionIdleDays(env), ownerSessionMaxDays(env)) * DAY_MS;
 }
 
@@ -87,7 +111,8 @@ export interface OwnerSessionRow {
 /**
  * Renews the session row verifyOwnerSession() has just accepted (used, not
  * expired, not a claim-approval link — the caller's checks). Returns the new
- * expiry (ms) when a write happened, else null (flag off, bridge row, step
+ * expiry (ms) when a write happened, else null (flag off, a row outside the
+ * "ml_"/"mlsess_" allowlist — /selger uuid rows, bridge rows — step
  * under 24 hours, unreadable timestamps, or the row expired / was revoked in
  * the meantime).
  */
@@ -95,7 +120,7 @@ export function renewOwnerSessionOnUse(db: Db, row: OwnerSessionRow, nowMs: numb
   if (!isOwnerSessionSlidingEnabled()) return null;
   const token = typeof row.token === "string" ? row.token : "";
   if (!token) return null;
-  if (String(row.id || "").startsWith(OWNER_BRIDGE_ID_PREFIX)) return null;
+  if (!isSlidingOwnerSessionRowId(row.id)) return null;
   const stored = parseOwnerSessionTime(row.expires_at);
   if (!Number.isFinite(stored) || stored <= nowMs) return null;
   let start = parseOwnerSessionTime(row.used_at);

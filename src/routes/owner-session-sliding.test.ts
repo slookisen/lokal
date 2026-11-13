@@ -341,6 +341,40 @@ export async function runOwnerSessionSlidingTests(opts: { log?: boolean } = {}):
       eq([sessionCookie(brLogin)?.maxAge, row(brNew.token).expires_at], [7 * 24 * 60 * 60, expBrNew],
         "on-25: /magic-link-verify with a bridge token keeps today's branch — expires_at untouched");
 
+      // on-40..46 (security review B1): a /selger e-mail login row (uuid id,
+      // 15 minutes, knowledge-service createMagicLink; verifyMagicLink sets
+      // used = 1 only) is outside the "ml_"/"mlsess_" allowlist — never
+      // renewed via cookie, Bearer or /magic-link-verify; today's expiry stays.
+      const selgerRow = (n: number, used: 0 | 1): { token: string; exp: string } => {
+        const token = `oss-selger-${n}-${"y".repeat(32)}`;
+        const exp = new Date(Date.now() + 15 * 60_000).toISOString();
+        db.prepare(`INSERT INTO magic_links (id, email, token, agent_id, used, expires_at) VALUES (?, 'eier@oss-a.example.test', ?, ?, ?, ?)`)
+          .run(`3f2b9c1e-0000-4000-8000-00000000000${n}`, token, AG, used, exp);
+        return { token, exp };
+      };
+      eq([sliding.isSlidingOwnerSessionRowId("ml_ab"), sliding.isSlidingOwnerSessionRowId("mlsess_ab"),
+        sliding.isSlidingOwnerSessionRowId("3f2b9c1e-0000-4000-8000-000000000001"), sliding.isSlidingOwnerSessionRowId("mlbridge_ab"),
+        sliding.isSlidingOwnerSessionRowId("mlclaim_ab"), sliding.isSlidingOwnerSessionRowId(null)],
+        [true, true, false, false, false, false], "on-40: the allowlist is exactly ml_ and mlsess_");
+      const su1 = selgerRow(1, 1);
+      const wS1 = writes();
+      const suCookie = await probe(su1.token);
+      eq([suCookie.json?.valid, writes() - wS1, sessionCookie(suCookie), row(su1.token).expires_at], [true, 0, null, su1.exp],
+        "on-41: a used /selger uuid row via cookie — accepted as today, no renewal, no Set-Cookie, 15-minute expiry kept");
+      const suBearer = await probe(su1.token, "bearer");
+      eq([suBearer.json?.valid, suBearer.setCookie.length, row(su1.token).expires_at], [true, 0, su1.exp],
+        "on-42: a used /selger uuid row via Bearer — no renewal, expiry kept");
+      eq(sliding.renewOwnerSessionOnUse(db as any, row(su1.token)), null, "on-43: renewOwnerSessionOnUse refuses a uuid row");
+      const su2 = selgerRow(2, 0);
+      const suLink = await verifyLink(su2.token);
+      eq([suLink.status, sessionCookie(suLink)?.maxAge, row(su2.token).used, row(su2.token).expires_at], [302, 7 * 24 * 60 * 60, 1, su2.exp],
+        "on-44: /magic-link-verify with an unused /selger token keeps today's branch — expires_at stays 15 minutes");
+      const suRe = await verifyLink(su1.token);
+      eq([suRe.status, sessionCookie(suRe)?.maxAge, row(su1.token).expires_at], [302, 7 * 24 * 60 * 60, su1.exp],
+        "on-45: /magic-link-verify with a used /selger token keeps today's branch — no 30-day session");
+      db.prepare("UPDATE magic_links SET expires_at = ? WHERE token = ?").run(new Date(Date.now() - 1000).toISOString(), su1.token);
+      eq((await probe(su1.token)).json?.valid, false, "on-46: … and it ends when its 15 minutes run out");
+
       // on-26..27: a re-clicked e-mail link never resets the cap.
       const rc = session();
       advance(rc, 85 * DAY); // the cap (t0 + 90 d) is now 5 days ahead
