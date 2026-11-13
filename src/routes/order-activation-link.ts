@@ -1,38 +1,33 @@
-// ─── Order activation link routes (RFB «aktiveringslenke», skive 2) ────────
-// dev-request 2026-10-21 live-go handlevogn-pilot og første handel, skive 2.
-// Token format, storage and session: services/order-activation-link.ts.
+// ─── Order activation link routes — RETIRED ────────────────────────────────
+// dev-request 2026-11-06-rfb-aktiveringslenke-l1-pensjoneres.
 //
-//   POST /admin/orders/activation-link   { agent_id }      (admin router)
-//     X-Admin-Key (401 without/wrong key, 503 when no admin key configured,
-//     same as GET /admin/orders/pilot-status). 503 when
-//     ORDER_ACTIVATION_LINK_SECRET is unset — never a fallback key. Returns
-//     the URL to admin only; nothing is sent from here.
+// The «aktiveringslenke» L1 (order activation link) is retired: it created no
+// proper owner claim and is superseded by the owner-claim flow. The public
+// pages and the admin generate endpoint no longer do anything:
 //
-//   GET  /aktiver-bestillinger?t=<token>                   (public router)
-//     Landing page: profile name, the address orders go to, how ordering
-//     works, link to /kjopsvilkar, and the «Jeg representerer …» checkbox.
-//   POST /aktiver-bestillinger   (form: t, bekreft=1)
-//     One click: ownership (fill-only) + opt-in + owner-portal session, then
-//     303 → /eier/<id>/portal#bestillinger. The valid token in the body is the
-//     CSRF guard; the checkbox is required.
+//   GET/POST /aktiver-bestillinger              (public router, mounted "/")
+//     Always 410 with a short Norwegian page pointing producers to the owner
+//     portal (/selger). No token is inspected, no cookie is set, no DB row is
+//     written — regardless of token and regardless of whether
+//     ORDER_ACTIVATION_LINK_SECRET is set.
 //
-// The token travels in the query string / form body, never in the path, so
-// the page-view and slow-request logs (both path-only) never store it.
-// Status pages: used → 409, expired / address changed → 410, bad or unknown
-// token → 404 (reveals nothing), secret unset → 503.
+//   POST /admin/orders/activation-link          (admin router, "/admin/orders")
+//     410 JSON after the unchanged admin-key check (401/503 for missing/wrong
+//     key). Never creates a link.
+//
+// What remains (untouched, code removal is a later case):
+//   - the order_activation_links table (src/database/init.ts),
+//   - the service src/services/order-activation-link.ts (no live callers any
+//     more; kept until the later code-removal case),
+//   - the activation_link revocation branch in routes/marketplace.ts
+//     (reset-claim, inline SQL — does not use the service),
+//   - a new read-only usage endpoint for observability:
+//       GET /admin/orders/activation-link/usage  (admin router)
+//     returns row/claim counts; no writes.
 
-import express, { Router, Request, Response } from "express";
-import {
-  activationSecret,
-  createActivationLink,
-  inspectActivationToken,
-  redeemActivationLink,
-  tokenLogLabel,
-  ORDER_ACTIVATION_PATH,
-  ORDER_ACTIVATION_SECRET_ENV,
-  OWNER_SESSION_VALID_MS,
-  type ActivationContext,
-} from "../services/order-activation-link";
+import { Router, Request, Response } from "express";
+import { getDb } from "../database/init";
+import { ORDER_ACTIVATION_PATH, ORDER_ACTIVATION_CLAIMED_VIA } from "../services/order-activation-link";
 
 // ─── Admin ──────────────────────────────────────────────────────────────────
 
@@ -52,40 +47,48 @@ function requireAdmin401(req: Request, res: Response): boolean {
   return true;
 }
 
-orderActivationAdminRouter.post("/activation-link", (req: Request, res: Response) => {
+// Read-only observability for the retired link: counts only, static SQL, no
+// writes. If the table does not exist (fresh DB / migration not run), report
+// zeros rather than 500.
+orderActivationAdminRouter.get("/activation-link/usage", (req: Request, res: Response) => {
   if (!requireAdmin401(req, res)) return;
-  const agentId = typeof req.body?.agent_id === "string" ? req.body.agent_id.trim() : "";
   try {
-    // Fail closed before anything else: no secret → 503, never a fallback key.
-    if (!activationSecret()) {
-      return res.status(503).json({ success: false, error: "activation_secret_missing", message: `${ORDER_ACTIVATION_SECRET_ENV} is not configured` });
+    const db = getDb();
+    const tableExists = !!db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'order_activation_links'")
+      .get();
+    let activationLinks = 0;
+    let redeemedLinks = 0;
+    if (tableExists) {
+      activationLinks = (db.prepare("SELECT COUNT(*) AS n FROM order_activation_links").get() as { n: number }).n;
+      // `used_at` is the table's redeemed/used marker (a timestamp set when the
+      // link was consumed, NULL otherwise).
+      redeemedLinks = (db
+        .prepare("SELECT COUNT(*) AS n FROM order_activation_links WHERE used_at IS NOT NULL")
+        .get() as { n: number }).n;
     }
-    if (!agentId) return res.status(400).json({ success: false, error: "agent_id_required" });
-    const r = createActivationLink(agentId);
-    if (!r.ok) {
-      const map: Record<typeof r.reason, [number, string]> = {
-        secret_missing: [503, `${ORDER_ACTIVATION_SECRET_ENV} is not configured`],
-        agent_not_found: [404, "No agent with that id"],
-        no_registered_email: [409, "The agent has no registered address (agent_knowledge.email)"],
-        self_registered_profile: [409, "Self-registered profiles cannot be activated by link; use the claim review"],
-      };
-      const [status, message] = map[r.reason];
-      return res.status(status).json({ success: false, error: r.reason === "secret_missing" ? "activation_secret_missing" : r.reason, message });
-    }
-    console.log(`[order-activation] link generated for agent ${r.agent_id} (link ${r.link_id.slice(0, 10)}, expires ${r.expires_at})`);
+    const agentsClaimed = (db
+      .prepare("SELECT COUNT(*) AS n FROM agents WHERE claimed_via = ?")
+      .get(ORDER_ACTIVATION_CLAIMED_VIA) as { n: number }).n;
     return res.json({
       success: true,
-      agent_id: r.agent_id,
-      name: r.name,
-      address: r.address,
-      url: r.url,
-      expires_at: r.expires_at,
-      note: "Return to admin only. Not sent by the platform; single use, bound to the address above.",
+      activation_links: activationLinks,
+      redeemed_links: redeemedLinks,
+      agents_claimed_via_activation_link: agentsClaimed,
     });
   } catch (err) {
-    console.error("[order-activation] admin generate failed:", err instanceof Error ? err.message : "error");
+    console.error("[order-activation] usage query failed:", err instanceof Error ? err.message : "error");
     return res.status(500).json({ success: false, error: "server_error" });
   }
+});
+
+orderActivationAdminRouter.post("/activation-link", (req: Request, res: Response) => {
+  if (!requireAdmin401(req, res)) return;
+  return res.status(410).json({
+    success: false,
+    error: "activation_link_retired",
+    message: "Aktiveringslenker for bestillinger er pensjonert. Produsenter tar over profilen og slår på bestillinger via eierportalen.",
+  });
 });
 
 // ─── Public pages ───────────────────────────────────────────────────────────
@@ -107,13 +110,8 @@ const PAGE_CSS = `
   .ep-logo span{color:#8a6d1e}
   .ep-card{background:#fff;border:1px solid #e5e5dc;border-radius:12px;padding:24px 20px;margin-bottom:16px}
   .ep-card h1{font-size:1.4rem;margin:0 0 12px}
-  .ep-card h2{font-size:1.05rem;margin:16px 0 8px}
   .ep-muted{color:#737373;font-size:0.9rem}
-  .ep-error{background:#fdecea;border:1px solid #f5c2bd;color:#8a1f11;border-radius:8px;padding:10px 12px;margin-bottom:12px}
-  .ep-check{display:flex;gap:10px;align-items:flex-start;margin:16px 0}
-  .ep-check input{margin-top:4px;width:18px;height:18px}
   .ep-btn{display:inline-block;background:#2D5016;color:#fff;border:0;border-radius:8px;padding:12px 18px;font-size:1rem;cursor:pointer;text-decoration:none}
-  ol{padding-left:20px}
 `;
 
 function shell(title: string, body: string): string {
@@ -138,98 +136,24 @@ function shell(title: string, body: string): string {
 }
 
 function sendPage(res: Response, status: number, title: string, body: string): void {
-  // The URL carries a capability token: never cache it, never leak it as a referrer.
   res.setHeader("Cache-Control", "no-store");
   res.setHeader("Referrer-Policy", "no-referrer");
   res.setHeader("X-Robots-Tag", "noindex, nofollow");
   res.status(status).type("html").send(shell(title, body));
 }
 
-function activationFormHtml(ctx: ActivationContext, token: string, error?: string): string {
-  const name = escapeHtml(ctx.name);
-  return `<div class="ep-card">
-      <h1>Ta imot bestillinger for ${name}</h1>
-      ${error ? `<div class="ep-error" role="alert">${escapeHtml(error)}</div>` : ""}
-      <p>Profil: <strong>${name}</strong></p>
-      <p>Bestillinger sendes til: <strong>${escapeHtml(ctx.address)}</strong></p>
-      <h2>Slik fungerer bestilling</h2>
-      <ol>
-        <li>En kunde sender en bestillingsforespørsel via Rett fra Bonden.</li>
-        <li>Du får forespørselen på e-post og bekrefter (eller avslår) den.</li>
-        <li>Kunden henter varene og betaler deg direkte ved henting.</li>
-      </ol>
-      <p class="ep-muted">Du er selger og mottar betalingen selv. Les mer i <a href="/kjopsvilkar">kjøpsvilkårene</a>. Du kan slå av bestillinger igjen når som helst i eierportalen.</p>
-      <form method="post" action="${ORDER_ACTIVATION_PATH}">
-        <input type="hidden" name="t" value="${escapeHtml(token)}">
-        <label class="ep-check">
-          <input type="checkbox" name="bekreft" value="1" required>
-          <span>Jeg representerer ${name} og vil ta imot bestillinger</span>
-        </label>
-        <button type="submit" class="ep-btn">Bekreft og gå til eierportalen</button>
-      </form>
-    </div>`;
+// Both routes always answer 410 with the same retirement page. No token is
+// read, no cookie is set, no DB row is written.
+function retiredPage(_req: Request, res: Response): void {
+  sendPage(res, 410, "Lenken er erstattet", `<div class="ep-card">
+      <h1>Lenken er erstattet</h1>
+      <p>Aktiveringslenker for bestillinger brukes ikke lenger.</p>
+      <p>Er du produsent, kan du ta over profilen din og slå på bestillinger via eierportalen.</p>
+      <p><a class="ep-btn" href="/selger">Gå til eierportalen</a></p>
+    </div>`);
 }
 
-function statusPage(res: Response, state: "unavailable" | "invalid" | "used" | "expired" | "address_changed", agentId?: string): void {
-  switch (state) {
-    case "unavailable":
-      return sendPage(res, 503, "Midlertidig utilgjengelig",
-        `<div class="ep-card"><h1>Midlertidig utilgjengelig</h1><p>Aktiveringslenker kan ikke brukes akkurat nå. Prøv igjen senere, eller kontakt Rett fra Bonden.</p></div>`);
-    case "used": {
-      const login = agentId ? `/eier/${encodeURIComponent(agentId)}` : "/";
-      return sendPage(res, 409, "Lenken er allerede brukt",
-        `<div class="ep-card"><h1>Lenken er allerede brukt</h1><p>Denne aktiveringslenken kan bare brukes én gang, og den er allerede brukt.</p><p>Du kan logge inn i eierportalen med e-postadressen din for å se bestillinger eller endre innstillingene.</p><p><a class="ep-btn" href="${escapeHtml(login)}">Gå til innlogging</a></p></div>`);
-    }
-    case "expired":
-    case "address_changed":
-      return sendPage(res, 410, "Lenken er utløpt",
-        `<div class="ep-card"><h1>Lenken gjelder ikke lenger</h1><p>Aktiveringslenken er utløpt eller ikke lenger gyldig. Lenker gjelder i 14 dager og bare for e-postadressen som var registrert da lenken ble laget.</p><p>Kontakt Rett fra Bonden for å få en ny lenke.</p></div>`);
-    case "invalid":
-    default:
-      return sendPage(res, 404, "Ugyldig lenke",
-        `<div class="ep-card"><h1>Ugyldig lenke</h1><p>Vi fant ikke denne lenken. Sjekk at hele lenken ble kopiert, eller kontakt Rett fra Bonden.</p></div>`);
-  }
-}
-
-router.get(ORDER_ACTIVATION_PATH, (req: Request, res: Response) => {
-  const token = typeof req.query.t === "string" ? req.query.t : "";
-  try {
-    const r = inspectActivationToken(token);
-    if (r.state !== "valid") return statusPage(res, r.state, r.state === "used" ? r.agent_id : undefined);
-    return sendPage(res, 200, "Ta imot bestillinger", activationFormHtml(r.ctx, token));
-  } catch (err) {
-    console.error(`[order-activation] GET failed (token ${tokenLogLabel(token)}):`, err instanceof Error ? err.message : "error");
-    return statusPage(res, "unavailable");
-  }
-});
-
-router.post(ORDER_ACTIVATION_PATH, express.urlencoded({ extended: false }), (req: Request, res: Response) => {
-  const token = typeof req.body?.t === "string" ? req.body.t : "";
-  try {
-    const check = inspectActivationToken(token);
-    if (check.state !== "valid") return statusPage(res, check.state, check.state === "used" ? check.agent_id : undefined);
-    if (req.body?.bekreft !== "1") {
-      return sendPage(res, 400, "Ta imot bestillinger",
-        activationFormHtml(check.ctx, token, "Kryss av for at du representerer produsenten før du fortsetter."));
-    }
-    const r = redeemActivationLink(token, { ip: req.ip, userAgent: req.get("user-agent") || undefined });
-    if (r.state !== "redeemed") return statusPage(res, r.state, r.state === "used" ? r.agent_id : undefined);
-    // Same cookie as /magic-link-verify (routes/owner-portal.ts) — the
-    // session row behind it is read by verifyOwnerSession().
-    res.cookie("rfb_owner_session", r.session_token, {
-      path: "/",
-      maxAge: OWNER_SESSION_VALID_MS,
-      httpOnly: true,
-      secure: true,
-      sameSite: "lax",
-    });
-    console.log(`[order-activation] link used for agent ${r.agent_id} (${r.outcome}, token ${tokenLogLabel(token)})`);
-    res.setHeader("Cache-Control", "no-store");
-    return res.redirect(303, `/eier/${encodeURIComponent(r.agent_id)}/portal#bestillinger`);
-  } catch (err) {
-    console.error(`[order-activation] POST failed (token ${tokenLogLabel(token)}):`, err instanceof Error ? err.message : "error");
-    return statusPage(res, "unavailable");
-  }
-});
+router.get(ORDER_ACTIVATION_PATH, retiredPage);
+router.post(ORDER_ACTIVATION_PATH, retiredPage);
 
 export default router;
