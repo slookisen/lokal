@@ -5,7 +5,7 @@ import { getConfig } from "../config/vertical-config";
 // redirect, applied at the single send boundary below so no call site can
 // bypass it.
 import { applyTestSendRedirect, TestSendNotConfiguredError } from "./send-guard";
-import { crmFromHeader } from "./crm-platform-identity";
+import { crmFromHeader, crmSenderAddress } from "./crm-platform-identity";
 import { unsubscribeHeaderValues } from "./avmeld-service";
 import { claimRequestMoreBody, claimRequestMoreSignOff, claimRequestMoreSubject } from "./claim-request-more-texts";
 import {
@@ -2320,12 +2320,13 @@ export const GARDSSALG_OUTREACH_FROM_NAME = "Daniel Fredriksen";
 
 /**
  * `"Daniel Fredriksen" <kontakt@rettfrabonden.com>`. The ADDRESS is taken from
- * the platform identity (crmFromHeader) so it can never drift from it; only the
+ * the platform identity (crmSenderAddress) so it can never drift from it; only the
  * display name differs from the other Opplevagent mail.
  */
 export function gardssalgOutreachFromHeader(): string {
-  const m = /<([^<>\s]+@[^<>\s]+)>/.exec(crmFromHeader("experiences"));
-  return `"${GARDSSALG_OUTREACH_FROM_NAME}" <${m ? m[1] : "kontakt@rettfrabonden.com"}>`;
+  // crmSenderAddress follows OPPLEVAGENT_SENDER_DOMAIN_ENABLED (O4-1): off =
+  // kontakt@rettfrabonden.com exactly as before, on = kontakt@opplevagent.no.
+  return `"${GARDSSALG_OUTREACH_FROM_NAME}" <${crmSenderAddress("experiences")}>`;
 }
 
 /**

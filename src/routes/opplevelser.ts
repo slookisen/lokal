@@ -867,7 +867,7 @@ import {
   GARDSSALG_OUTREACH_REPLY_TO,
 } from "../services/email-service";
 import { crmService } from "../services/crm-service";
-import { CRM_SENDER_ADDRESS } from "../services/crm-platform-identity";
+import { crmSenderAddress } from "../services/crm-platform-identity";
 // Used by isGardssalgEpostSynthesisPatternMatch() below (AC6 epost-synthesis
 // audit) — re-added after the post@<domain> claim-derivation tier that used
 // to import this (dev-request 2026-08-06-aldri-gjett-epostadresse slice 1)
@@ -21275,7 +21275,7 @@ export async function sendGardssalgOutreachToEligibleProvider(
                 // SAME send cannot create a duplicate message row.
                 messageId: sendResult.messageId ?? `outreach-${providerId}-${sentAtIso}`,
                 direction: "out",
-                fromEmail: CRM_SENDER_ADDRESS,
+                fromEmail: crmSenderAddress("experiences"), // same address the send used (O4-1 flag)
                 toEmails: [email],
                 subject: rendered.subject,
                 bodyText: rendered.text,

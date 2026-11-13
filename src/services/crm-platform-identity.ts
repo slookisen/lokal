@@ -33,6 +33,11 @@
 // dedicated sender domain later — if the Resend plan is ever upgraded — is a
 // config change rather than another sweep through the call sites.
 //
+// UPDATE (O4-1, dev-request 2026-11-06-opplevagent-avsenderdomene-og-minimum-
+// for-pilot): that dedicated sender domain now exists as an option for
+// Opplevagent — see crmSenderAddress / OPPLEVAGENT_SENDER_DOMAIN_ENABLED below.
+// With the flag off (the default) everything above still holds exactly.
+//
 // ── FAIL-CLOSED ─────────────────────────────────────────────────────
 //
 // A vertical with no configured identity REFUSES to send. It never quietly
@@ -88,6 +93,45 @@ export function __identityTableForTesting(): Record<CrmVertical, CrmPlatformIden
 
 /** The one address Resend has verified. Every platform sends FROM this. */
 export const CRM_SENDER_ADDRESS = "kontakt@rettfrabonden.com";
+
+// ─── Opplevagent sender domain (dev-request 2026-11-06-opplevagent-
+// avsenderdomene-og-minimum-for-pilot, slice O4-1) ─────────────────────
+//
+// Once opplevagent.no is a verified sending domain in Resend (runbook:
+// docs/runbooks/opplevagent-resend-avsenderdomene.md), Opplevagent mail can
+// go out FROM kontakt@opplevagent.no instead of the shared RFB address. Behind
+// OPPLEVAGENT_SENDER_DOMAIN_ENABLED, default OFF: switching it on before the
+// domain is verified would make Resend reject every Opplevagent send. Off =
+// every From header byte-identical to before. rfb and dental never change.
+
+export const OPPLEVAGENT_SENDER_DOMAIN_FLAG = "OPPLEVAGENT_SENDER_DOMAIN_ENABLED";
+
+/** Opplevagent's own sender address, used only while the flag is on. */
+export const OPPLEVAGENT_SENDER_ADDRESS = "kontakt@opplevagent.no";
+
+/** OPPLEVAGENT_SENDER_DOMAIN_ENABLED: "1" or "true" (any case, trimmed) = on;
+ *  anything else, unset included, = off. Read on every call. */
+export function isOpplevagentSenderDomainEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = (env[OPPLEVAGENT_SENDER_DOMAIN_FLAG] || "").trim().toLowerCase();
+  return v === "true" || v === "1";
+}
+
+/**
+ * The bare sender ADDRESS for a platform. `experiences` gets
+ * kontakt@opplevagent.no while the flag is on; everything else — rfb, dental,
+ * and experiences with the flag off — gets CRM_SENDER_ADDRESS. Validates the
+ * vertical like resolveCrmIdentity (fail-closed, never an RFB fallback for an
+ * unknown platform).
+ */
+export function crmSenderAddress(vertical: unknown): string {
+  return senderAddressFor(assertVertical(vertical, "crmSenderAddress"));
+}
+
+/** The address rule itself, without validation (crmFromHeader validates on its own terms). */
+function senderAddressFor(vertical: unknown): string {
+  if (vertical === "experiences" && isOpplevagentSenderDomainEnabled()) return OPPLEVAGENT_SENDER_ADDRESS;
+  return CRM_SENDER_ADDRESS;
+}
 
 /**
  * Resolve the outbound identity for a platform, or THROW.
@@ -201,7 +245,9 @@ export function crmFromHeader(vertical: unknown, displayNameOverride?: string): 
   // The override changes the display name only (dev-request
   // 2026-10-22-rfb-utsending-v4: the cold RFB outreach goes out as
   // "Daniel Fredriksen"); the ADDRESS always comes from the platform identity.
+  // Since O4-1 the address is per platform too (crmSenderAddress): experiences
+  // gets kontakt@opplevagent.no while OPPLEVAGENT_SENDER_DOMAIN_ENABLED is on.
   const displayName = displayNameOverride ?? resolveCrmIdentity(vertical).displayName;
   const escaped = displayName.replace(/([\\"])/g, "\\$1");
-  return `"${escaped}" <${CRM_SENDER_ADDRESS}>`;
+  return `"${escaped}" <${senderAddressFor(vertical)}>`;
 }

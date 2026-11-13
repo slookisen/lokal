@@ -13,6 +13,8 @@
  *              helper's output. A helper can be perfect while nothing calls it;
  *              that is exactly how lokal#377's cap was deletable with 10 443
  *              tests green.
+ *   pi38-pi52  O4-1: OPPLEVAGENT_SENDER_DOMAIN_ENABLED — off = old From headers
+ *              byte for byte; on = experiences FROM kontakt@opplevagent.no.
  *   pi17-pi22  The steg-3 PRECONDITION: outreach_sent_log is an RFB-only
  *              ledger, so an `experiences` send must not write a suppression
  *              row against an RFB agent_id. A silent under-send — the producer
@@ -146,6 +148,66 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
         assertEq(crmMod.CRM_VERTICALS.map((v) => `${v}:${ident.resolveCrmIdentity(v).replyTo}`).join(","),
           "rfb:kontakt@rettfrabonden.com,dental:kontakt@finn-tannlege.com,experiences:kontakt@opplevagent.no",
           "pi8g: every platform's reply-to is its own receiving address — a dental reply comes back to dental, not to Rett fra Bonden");
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      // pi38-pi52 — O4-1 (dev-request 2026-11-06-opplevagent-avsenderdomene-
+      // og-minimum-for-pilot): OPPLEVAGENT_SENDER_DOMAIN_ENABLED. Off = every
+      // From header byte-identical to before; on = experiences sends FROM
+      // kontakt@opplevagent.no, rfb and dental untouched.
+      // ═══════════════════════════════════════════════════════════════
+      {
+        const emailMod = require("./email-service") as typeof import("./email-service");
+        const FLAG = "OPPLEVAGENT_SENDER_DOMAIN_ENABLED";
+        const prevFlag = process.env[FLAG];
+        try {
+          delete process.env[FLAG];
+          assertEq(ident.crmFromHeader("rfb"), '"Rett fra Bonden" <kontakt@rettfrabonden.com>',
+            "pi38: flag unset — rfb From header is the old string");
+          assertEq(ident.crmFromHeader("experiences"), '"Opplevagent" <kontakt@rettfrabonden.com>',
+            "pi39: flag unset — experiences From header is the old string");
+          assertEq(ident.crmFromHeader("dental"), '"Finn Tannlege" <kontakt@rettfrabonden.com>',
+            "pi40: flag unset — dental From header is the old string");
+          assertEq(emailMod.gardssalgOutreachFromHeader(), '"Daniel Fredriksen" <kontakt@rettfrabonden.com>',
+            "pi41: flag unset — the gårdssalg outreach From header is the old string");
+          assertEq(ident.crmFromHeader("experiences", "Daniel Fredriksen"), '"Daniel Fredriksen" <kontakt@rettfrabonden.com>',
+            "pi42: flag unset — a display-name override keeps the old address");
+          assertEq(ident.CRM_SENDER_ADDRESS, "kontakt@rettfrabonden.com",
+            "pi43: CRM_SENDER_ADDRESS itself is unchanged");
+
+          for (const off of ["", "false", "0", "yes", "on", "tru"]) {
+            process.env[FLAG] = off;
+            assertEq(ident.crmSenderAddress("experiences"), "kontakt@rettfrabonden.com",
+              `pi44[${JSON.stringify(off)}]: anything but "true"/"1" leaves the flag off`);
+          }
+
+          process.env[FLAG] = "true";
+          assertEq(ident.crmFromHeader("experiences"), '"Opplevagent" <kontakt@opplevagent.no>',
+            "pi45: flag on — experiences sends FROM kontakt@opplevagent.no");
+          assertEq(ident.crmFromHeader("rfb"), '"Rett fra Bonden" <kontakt@rettfrabonden.com>',
+            "pi46: flag on — rfb unchanged");
+          assertEq(ident.crmFromHeader("dental"), '"Finn Tannlege" <kontakt@rettfrabonden.com>',
+            "pi47: flag on — dental unchanged");
+          assertEq(ident.crmFromHeader("experiences", "Daniel Fredriksen"), '"Daniel Fredriksen" <kontakt@opplevagent.no>',
+            "pi48: flag on — a display-name override still sets only the name; the address follows the platform");
+          assertEq(ident.crmFromHeader("rfb", "Daniel Fredriksen"), '"Daniel Fredriksen" <kontakt@rettfrabonden.com>',
+            "pi48b: flag on — the rfb override keeps the RFB address");
+          assertEq(emailMod.gardssalgOutreachFromHeader(), '"Daniel Fredriksen" <kontakt@opplevagent.no>',
+            "pi49: flag on — the gårdssalg outreach follows the flag");
+          assertEq(ident.resolveCrmIdentity("experiences").replyTo, "kontakt@opplevagent.no",
+            "pi50: flag on — reply-to unchanged (the inbound discriminator)");
+
+          process.env[FLAG] = " 1 ";
+          assertEq(ident.crmSenderAddress("experiences"), "kontakt@opplevagent.no",
+            "pi51: \"1\" (trimmed) turns the flag on too");
+          process.env[FLAG] = "TRUE";
+          assertEq(ident.crmSenderAddress("experiences"), "kontakt@opplevagent.no",
+            "pi51b: case-insensitive, like the repo's other flags");
+          assertThrows(() => ident.crmSenderAddress("opplevagent"), /vertical must be one of/,
+            "pi52: crmSenderAddress is fail-closed on an unknown vertical — never an RFB fallback");
+        } finally {
+          if (prevFlag === undefined) delete process.env[FLAG]; else process.env[FLAG] = prevFlag;
+        }
       }
 
       // ═══════════════════════════════════════════════════════════════
