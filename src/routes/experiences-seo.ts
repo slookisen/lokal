@@ -6791,6 +6791,8 @@ ${BROWSE_CSS}
    already says so in words; this fix is the matching visual signal). */
 .reserve-cta-paused{display:block;text-align:center;background:var(--canvas-2);color:var(--ink-soft);font-weight:800;padding:14px 18px;border-radius:var(--r-pill);border:1px solid var(--line);box-shadow:none}
 .reserve-cta-paused:hover{text-decoration:none;background:var(--line)}
+/* display:block above would otherwise beat the UA [hidden]{display:none}: the hidden owner slot must stay hidden until the swap script removes the attribute. */
+.reserve-cta-paused[hidden]{display:none}
 ${bookingPaused ? `.reserve-contact-list{list-style:none;margin:0;padding:0;font-size:.9rem;color:var(--ink-soft)}
 .reserve-contact-list li{padding:6px 0;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
 .reserve-contact-list li:last-child{border-bottom:none}

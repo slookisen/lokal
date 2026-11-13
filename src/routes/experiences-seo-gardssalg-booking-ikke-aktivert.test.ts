@@ -213,6 +213,13 @@ export function runExperiencesSeoGardssalgBookingIkkeAktivertTests(opts: { log?:
         id: "gs-bna-paused-contact", navn: "Pauset Kontakt Mjøderi", producer_type: "mjøderi",
         booking_live: 0, slug: "pauset-kontakt-mjoderi", claimed_at: null,
       });
+      // N1: special characters in phone + website host, for the /book escape test.
+      insertProvider.run({
+        id: "gs-bna-paused-escape", navn: "Pauset Escape Mjøderi", producer_type: "mjøderi",
+        booking_live: 0, slug: "pauset-escape-mjoderi", claimed_at: null,
+      });
+      db.prepare(`UPDATE experience_providers SET telefon = ?, hjemmeside = ? WHERE id = ?`)
+        .run("<script>x</script> 55 12 34 56 &", "https://a&b<i>.example.no", "gs-bna-paused-escape");
       db.prepare(`UPDATE experience_providers SET telefon = ?, epost = ?, hjemmeside = ? WHERE id = ?`)
         .run("+47 55 12 34 56", "post@kontakt-mjoderi.no", "https://kontakt-mjoderi.no", "gs-bna-paused-contact");
 
@@ -281,6 +288,24 @@ export function runExperiencesSeoGardssalgBookingIkkeAktivertTests(opts: { log?:
         assertTrue(r.handled && r.status === 200 && !r.body.includes('id="book-form"'), `p1: paused panel with contact info renders without the form (status ${r.status})`);
         assertTrue(r.body.includes('href="tel:+47 55 12 34 56"') && r.body.includes("kontakt-mjoderi.no</a>"), "p2: paused panel shows phone + website");
         assertTrue(!r.body.includes("post@kontakt-mjoderi.no"), "p3: the panel does not print the e-mail (published only under the profile page's gates)");
+      }
+
+      {
+        // B1: the hidden owner slot must stay hidden — `.reserve-cta-paused{display:block}`
+        // alone would override the UA [hidden] rule and show an empty grey button.
+        const r = await callHtmlRoute(seoRouter, "/kategori/gardssalg/produsent/pauset-kontakt-mjoderi");
+        assertTrue(r.body.includes('<a id="reserve-owner-cta" class="reserve-cta-paused" hidden></a>'), "q1: booking-off profile renders the hidden owner slot");
+        assertTrue(/\.reserve-cta-paused\[hidden\]\s*\{\s*display\s*:\s*none\s*\}/.test(r.body), "q2: CSS hides .reserve-cta-paused[hidden] so the empty owner slot is never visible");
+        assertTrue(r.body.indexOf(".reserve-cta-paused[hidden]") > r.body.indexOf(".reserve-cta-paused{display:block"), "q3: the [hidden] rule comes after the display:block rule");
+      }
+      {
+        // N1: /book booking-off panel HTML-escapes phone + website host.
+        const r = await callHtmlRoute(seoRouter, "/kategori/gardssalg/book/pauset-escape-mjoderi");
+        assertTrue(r.handled && r.status === 200 && r.body.includes('id="book-contact"'), `r1: panel with special-char contact renders (status ${r.status})`);
+        const panel = r.body.slice(r.body.indexOf('id="book-contact"'), r.body.indexOf("</div>", r.body.indexOf('id="book-contact"')));
+        assertTrue(!panel.includes("<script") && !panel.includes("<i>"), "r2: no raw <script / <i> tag in the panel contact block");
+        assertTrue(panel.includes("&lt;script&gt;") && panel.includes("&amp;"), "r3: phone text is HTML-escaped (&lt;script&gt;, &amp;)");
+        assertTrue(/Nettside: <a [^>]*>[^<]*<\/a>/.test(panel) && !panel.includes("a&b<i>"), "r4: website host is not rendered raw");
       }
 
       // ── AC4: activated provider — no paused notice on the profile ───────
