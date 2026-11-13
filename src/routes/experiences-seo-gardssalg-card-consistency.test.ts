@@ -50,8 +50,10 @@
  *       set, and does not render any badge markup at all when it is NULL.
  *   (e) zero per-card "Kommer snart" badges (single-marker-row invariant).
  *   (f) CTA text/class: "Book besøk" + gs-card-cta (active) while live
- *       (booking_live=1 + BOOKING_DISPATCH_ENABLED=true); "Meld interesse" +
- *       gs-card-cta-paused (neutral) while paused — same isBookingPaused()
+ *       (booking_live=1 + BOOKING_DISPATCH_ENABLED=true); "Se kontaktinfo" +
+ *       gs-card-cta-paused (neutral, links to the profile) while paused
+ *       (dev-request 2026-11-06-opplevagent-meld-interesse-fjernes-mens-
+ *       booking-av; was "Meld interesse" → /book) — same isBookingPaused()
  *       source used everywhere else on this route, not a new parallel check.
  *
  * Same synthetic router.handle() harness + in-memory-DB (EXPERIENCES_DB_PATH
@@ -301,10 +303,12 @@ export function runExperiencesSeoGardssalgCardConsistencyTests(opts: { log?: boo
         const pausedIdx = r.body.indexOf("Trysil Bryggeri");
         const pausedSlice = r.body.slice(pausedIdx, r.body.indexOf("</article>", pausedIdx));
         assertTrue(pausedSlice.includes('class="gs-card-cta-paused"'), "f4: a paused fixture's CTA uses the neutral gs-card-cta-paused class");
-        assertTrue(pausedSlice.includes(">Meld interesse<"), "f5: a paused fixture's CTA reads 'Meld interesse'");
+        assertTrue(pausedSlice.includes(">Se kontaktinfo<") && !pausedSlice.includes("Meld interesse"), "f5: a paused fixture's CTA reads 'Se kontaktinfo', never 'Meld interesse'");
         assertTrue(!pausedSlice.includes(">Book besøk<"), "f6: a paused fixture's CTA does NOT say 'Book besøk'");
-        // Same href either way — only the label/styling change, never the target.
-        assertTrue(pausedSlice.includes('href="/kategori/gardssalg/book/trysil-bryggeri"'), "f7: the paused CTA still links to the real booking panel (interest path lives there)");
+        // Paused ⇒ the CTA opens the profile (contact info), never the booking form.
+        assertTrue(pausedSlice.includes('href="/kategori/gardssalg/produsent/trysil-bryggeri" class="gs-card-cta-paused"'), "f7: the paused CTA links to the profile page's contact info");
+        assertTrue(!pausedSlice.includes('href="/kategori/gardssalg/book/'), "f7b: the paused card has no link into the booking form");
+        assertTrue(liveSlice.includes('href="/kategori/gardssalg/book/'), "f7c: the live card still links to the booking panel");
       }
 
       // ── CSS: both classes are defined exactly once, active keeps the

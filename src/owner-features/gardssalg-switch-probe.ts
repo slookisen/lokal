@@ -941,9 +941,15 @@ const profileReserveReader: GardssalgSurfaceReader = async (ctx) => {
   const f = ctx.fixture;
   const r = await asPublic(() => invokeHandler(ctx, kit.handlers.profile, probeReq(ctx, profileHref(f), { params: { providerSlug: f.slug }, asPublic: true })));
   const h = text(r);
-  const seen = r.status === 200 && h.includes('id="reserve-cta"');
-  const v = seen ? h.includes('class="reserve-cta"') : null;
-  return { endpoints: { reserver_knapp: v }, requireAll: true, detail: seen ? (v ? "«Reserver besøk»" : "«Meld interesse» (booking av)") : "testraden ikke sett" };
+  // Booking on renders the «Reserver besøk» link (#reserve-cta); booking off
+  // renders the contact card (#reserve-contact) and no reserve link at all
+  // (dev-request 2026-11-06-opplevagent-meld-interesse-fjernes-mens-booking-av).
+  // The exact id+class pair is matched because the contact form's submit
+  // button also carries class="reserve-cta".
+  const live = h.includes('id="reserve-cta" class="reserve-cta"');
+  const seen = r.status === 200 && (live || h.includes('id="reserve-contact"'));
+  const v = seen ? live : null;
+  return { endpoints: { reserver_knapp: v }, requireAll: true, detail: seen ? (v ? "«Reserver besøk»" : "kontaktinfo (booking av)") : "testraden ikke sett" };
 };
 
 /** A request e-mail to the producer would go out: the channel gate is open and the profile has an address. */
@@ -1051,7 +1057,7 @@ export function defaultGardssalgSwitchProbeReaders(): Record<string, GardssalgSu
       out[caseId(key, s)] = { read: bookingNoteReader(key, s), needsVisibleRow: true, observe: `${s} som offentlig: booking-merknaden for testprodusenten` };
     }
   }
-  out[caseId("booking.enabled", "profile_html")] = { read: profileReserveReader, pollMs: HEAVY_POLL_MS, needsVisibleRow: true, observe: "profilsiden som offentlig: «Reserver besøk» / «Meld interesse»" };
+  out[caseId("booking.enabled", "profile_html")] = { read: profileReserveReader, pollMs: HEAVY_POLL_MS, needsVisibleRow: true, observe: "profilsiden som offentlig: «Reserver besøk» / kontaktinfo" };
   for (const key of ["booking.enabled", "booking.attendance", "notify.booking_email"]) {
     out[caseId(key, "email:booking_request")] = syncReader(requestMailSync, "porten + adresse: forespørsels-e-posten sendes / sendes ikke (ingenting sendes)");
   }

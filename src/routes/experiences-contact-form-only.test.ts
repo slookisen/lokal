@@ -330,9 +330,13 @@ export async function runExperiencesContactFormOnlyTests(opts: { log?: boolean }
       ok(!t.includes("Vis e-post") && !t.includes(`${pagePath(F.slug)}/epost`), "F5: no «Vis e-post»");
       eq(on["page F"]!.cacheControl, "public, max-age=300", "F6: Cache-Control as on main (the flag does not vary by client)");
       // Apart from the form row and the e-mail row/JSON-LD, the page is the switch-off page.
-      const stripForm = (html: string) => html.replace(/<tr><th scope="row">Send melding<\/th><td><form[\s\S]*?<\/form><\/td><\/tr>/, "");
+      // (Booking off: the aside contact card repeats the same row as a <li> —
+      // dev-request 2026-11-06-opplevagent-meld-interesse-fjernes-mens-booking-av.)
+      const stripForm = (html: string) => html.replace(/<tr><th scope="row">Send melding<\/th><td><form[\s\S]*?<\/form><\/td><\/tr>/, "")
+        .replace(/<li><span class="reserve-contact-k">Send melding<\/span> <a href="#kontaktskjema">Send melding<\/a><\/li>/, "");
       const stripEmail = (html: string) => html
         .replace(/<tr><th scope="row">E-post<\/th><td><a href="mailto:[^"]*"[^>]*>[^<]*<\/a><\/td><\/tr>/, "")
+        .replace(/<li><span class="reserve-contact-k">E-post<\/span> <a href="mailto:[^"]*"[^>]*>[^<]*<\/a><\/li>/, "")
         .replace(/,"email":"[^"]*"/, "");
       ok(stripForm(t) === stripEmail(offBase["page F"]!.text), "F7: otherwise byte-identical to the switch-off page (form row in, e-mail row + JSON-LD email out)");
       for (const key of ["page U", "page N", "page R"]) {

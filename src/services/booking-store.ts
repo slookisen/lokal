@@ -90,9 +90,13 @@ export function isBookingPaused(
 // these strings, never a re-worded inline variant.
 export const BOOKING_NOT_ACTIVATED_MSG =
   "Booking er ikke aktivert for denne produsenten ennå.";
-export const BOOKING_NOT_ACTIVATED_INTEREST_MSG =
+// dev-request 2026-11-06-opplevagent-meld-interesse-fjernes-mens-booking-av:
+// the former «interest» variant promised an interest message that was never
+// stored; with booking off the visitor is pointed at the producer's own
+// contact routes instead (no promise of a reply or a booking).
+export const BOOKING_NOT_ACTIVATED_CONTACT_MSG =
   BOOKING_NOT_ACTIVATED_MSG +
-  " Du kan sende en interessemelding, men ingen reservasjon blir bekreftet før booking er aktivert.";
+  " Ta kontakt med produsenten direkte.";
 
 export type BookingStatus =
   | "reserved"

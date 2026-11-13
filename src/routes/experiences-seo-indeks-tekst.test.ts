@@ -569,12 +569,12 @@ export function runExperiencesSeoIndeksTekstTests(opts: { log?: boolean } = {}):
             && metaContent(r.body, "property", "og:type") === "website" && metaContent(r.body, "property", "og:site_name") === "Opplevagent"
             && metaContent(r.body, "name", "twitter:card") === "summary_large_image",
             `ib-g2: ${p} og:url/title/description match canonical, <title> and meta description; twitter:card is summary_large_image`);
-          assertTrue(!!desc && !/\bbook/i.test(desc) && /meld interesse/i.test(desc),
-            `ib-g3: booking paused → ${p} meta description invites an interest request and never says «book» (got ${JSON.stringify(desc)})`);
+          assertTrue(!!desc && !/\bbook/i.test(desc) && !/interesse/i.test(desc) && /tar kontakt/i.test(desc),
+            `ib-g3: booking paused → ${p} meta description points at contacting the producer, never «book» or an interest request (got ${JSON.stringify(desc)})`);
           const hero = unescapeHtml((r.body.match(/<p class="hero-sub">([^<]*)<\/p>/) || [])[1] || "");
-          assertTrue(!/\bbook/i.test(hero) && /meld interesse/i.test(hero),
+          assertTrue(!/\bbook/i.test(hero) && !/interesse/i.test(hero) && /tar kontakt/i.test(hero),
             `ib-g4: booking paused → ${p} hero copy never says «book» (got ${JSON.stringify(hero)})`);
-          assertTrue(r.body.includes("Meld interesse") && !r.body.includes(">Book besøk<"), `ib-g5: ${p}: the card CTA says «Meld interesse», matching the copy`);
+          assertTrue(r.body.includes(">Se kontaktinfo<") && !r.body.includes("Meld interesse") && !r.body.includes(">Book besøk<"), `ib-g5: ${p}: the card CTA says «Se kontaktinfo», matching the copy`);
         }
         const typeLd = ldBlocks((await callHtmlRoute(router, "/kategori/gardssalg/bryggeri")).body).find((b) => b["@type"] === "CollectionPage");
         assertTrue(!!typeLd && !/\bbook/i.test(typeLd.description), "ib-g6: the type page's CollectionPage description follows the paused copy");
@@ -588,7 +588,7 @@ export function runExperiencesSeoIndeksTekstTests(opts: { log?: boolean } = {}):
           const r = await callHtmlRoute(router, p);
           const desc = metaContent(r.body, "name", "description") || "";
           const hero = unescapeHtml((r.body.match(/<p class="hero-sub">([^<]*)<\/p>/) || [])[1] || "");
-          assertTrue(/\bbook/i.test(desc) && /\bbook/i.test(hero) && !/meld interesse/i.test(desc),
+          assertTrue(/\bbook/i.test(desc) && /\bbook/i.test(hero) && !/tar kontakt/i.test(desc),
             `ib-g8: booking live → ${p} keeps the booking copy (meta ${JSON.stringify(desc)})`);
           assertTrue(metaContent(r.body, "property", "og:image") === OG_IMAGE, `ib-g9: ${p} has the same share card with booking live`);
         }

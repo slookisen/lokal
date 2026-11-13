@@ -29890,7 +29890,11 @@ withFreshModules([
   assertTrue(!listGB.body.includes(`/tilbyder/${slugGB}`),
     "gb-08c: listing no longer links this provider to the dead /tilbyder/<slug> route");
   assertTrue(listGB.body.includes("Book besøk"), "gb-08d: 'Book besøk' CTA text still present");
-  assertTrue(!!otherRowGB && listGB.body.includes(`/kategori/gardssalg/book/${otherRowGB.slug}`),
+  // dev-request 2026-11-06-opplevagent-meld-interesse-fjernes-mens-booking-av:
+  // a paused producer's card CTA opens the profile («Se kontaktinfo»), a live
+  // one the booking panel — either way the CTA renders without a website.
+  assertTrue(!!otherRowGB && (listGB.body.includes(`/kategori/gardssalg/book/${otherRowGB.slug}`)
+      || listGB.body.includes(`href="/kategori/gardssalg/produsent/${otherRowGB.slug}" class="gs-card-cta-paused"`)),
     "gb-08e: CTA gate is now slug-based, not hjemmeside-based (shows for a producer with no website)");
 
   console.log("  gardssalg-book: OK (panel render, unknown-slug 404, no-JS POST create+redirect, provider ownership, CTA fix)");
@@ -30087,7 +30091,11 @@ withFreshModules([
   assertTrue(panelGDL.body.includes("<strong>Booking ikke aktivert</strong>"), "gdl-03c: panel notice heading is 'Booking ikke aktivert'");
   assertTrue(!panelGDL.body.includes("Du betaler ingenting nå — dette er en reservasjon."),
     "gdl-03d: panel does NOT show the 'this is a reservation' microcopy that would imply it works today");
-  assertTrue(panelGDL.body.includes('method="POST"'), "gdl-03e: the reservation <form> itself is still present (only submission is blocked)");
+  // dev-request 2026-11-06-opplevagent-meld-interesse-fjernes-mens-booking-av:
+  // the form is no longer rendered while paused (its submission stored
+  // nothing); the panel points at the producer's contact info instead.
+  assertTrue(!panelGDL.body.includes('id="book-form"') && !panelGDL.body.includes('method="POST"') && panelGDL.body.includes('id="book-contact"'),
+    "gdl-03e: no reservation <form> while paused — the contact block replaces it");
 
   // gdl-04: produsent profile — same signal on the reserve CTA; CTA
   // href/button text unchanged (no-regression guarantee for the existing
@@ -30096,9 +30104,11 @@ withFreshModules([
     { providerSlug: slugGDL }, `/kategori/gardssalg/produsent/${slugGDL}`);
   assertEq(profileGDL.status, 200, "gdl-04a: GET produsent profile still 200 when paused");
   assertTrue(profileGDL.body.includes('class="reserve-notice"'), "gdl-04b: profile reserve CTA shows the 'not active yet' notice");
-  assertTrue(profileGDL.body.includes(`href="/kategori/gardssalg/book/${slugGDL}"`),
-    "gdl-04c: profile CTA href is unchanged");
-  assertTrue(profileGDL.body.includes("Reserver besøk"), "gdl-04d: profile CTA button text is unchanged");
+  // dev-request 2026-11-06-opplevagent-meld-interesse-fjernes-mens-booking-av:
+  // paused ⇒ no reserve/interest CTA at all, the contact card instead.
+  assertTrue(!profileGDL.body.includes(`href="/kategori/gardssalg/book/${slugGDL}"`) && profileGDL.body.includes('id="reserve-contact"'),
+    "gdl-04c: paused profile has no link into the booking form, the contact card instead");
+  assertTrue(!profileGDL.body.includes("Reserver besøk") && !profileGDL.body.includes("Meld interesse"), "gdl-04d: paused profile has no «Reserver besøk» / «Meld interesse»");
 
   // gdl-05: category browse page — NO booking-status marker on the cards
   // (the original discreet "Kommer snart" badge was removed by dev-request
@@ -30126,7 +30136,7 @@ withFreshModules([
   const errBannerGDL = invokeSeoGDL("get", "/kategori/gardssalg/book/:providerSlug",
     { providerSlug: slugGDL }, `/kategori/gardssalg/book/${slugGDL}`, { query: { error: "paused" } });
   assertTrue(errBannerGDL.body.includes('role="alert"'), "gdl-07a: ?error=paused renders the role=alert error banner");
-  assertTrue(errBannerGDL.body.includes("før booking er aktivert"), "gdl-07b: ?error=paused banner shows the same honest 'ikke aktivert' copy");
+  assertTrue(errBannerGDL.body.includes("ikke aktivert for denne produsenten ennå. Ta kontakt med produsenten direkte."), "gdl-07b: ?error=paused banner shows the same honest 'ikke aktivert' copy");
 
   // gdl-08: POST /api/opplevelser/book (JSON API) while paused → explicit
   // paused/coming-soon JSON (200, so the panel's fetch() script doesn't treat
@@ -31204,11 +31214,12 @@ withFreshModules([
   // source of truth shared with the booking panel and category cards).
   assertTrue(profGP.body.includes("Sider"), "gp-04: drink-type badge shows 'Sider' for producer_type=sideri");
 
-  // gp-05: CTA links to the existing booking route for the SAME slug — the
-  // booking flow itself is untouched by this profile-page slice.
-  assertTrue(profGP.body.includes(`href="/kategori/gardssalg/book/${slugGP}"`),
-    "gp-05: 'Reserver besøk' CTA links to the unchanged /kategori/gardssalg/book/<slug> route");
-  assertTrue(profGP.body.includes("Reserver besøk"), "gp-05b: CTA button text present");
+  // gp-05: this fixture is booking-paused, so (dev-request 2026-11-06-
+  // opplevagent-meld-interesse-fjernes-mens-booking-av) the aside shows the
+  // contact card instead of a reserve CTA into the booking route.
+  assertTrue(!profGP.body.includes(`href="/kategori/gardssalg/book/${slugGP}"`) && profGP.body.includes('id="reserve-contact"'),
+    "gp-05: paused profile shows the contact card, no CTA into /kategori/gardssalg/book/<slug>");
+  assertTrue(!profGP.body.includes("Reserver besøk") && !profGP.body.includes("Meld interesse"), "gp-05b: no reserve/interest CTA text while paused");
 
   // gp-06: practical-info rows — only real data, all five seeded fields.
   assertTrue(/<th scope="row">Sted<\/th>/.test(profGP.body), "gp-06a: practical info has a Sted row");
@@ -31280,8 +31291,11 @@ withFreshModules([
   assertEq(listGP.status, 200, "gp-11a: GET /kategori/gardssalg → 200");
   assertTrue(listGP.body.includes(`href="/kategori/gardssalg/produsent/${slugGP}"`),
     "gp-11b: category listing links the provider name to the new profile route");
-  assertTrue(listGP.body.includes(`href="/kategori/gardssalg/book/${slugGP}"`),
-    "gp-11c: category listing's 'Book besøk' CTA still links straight to the booking route");
+  // Paused fixture ⇒ the card CTA reads «Se kontaktinfo» and opens the
+  // profile (dev-request 2026-11-06-opplevagent-meld-interesse-fjernes-mens-
+  // booking-av); only a live card links straight to the booking route.
+  assertTrue(listGP.body.includes(`href="/kategori/gardssalg/produsent/${slugGP}" class="gs-card-cta-paused"`) && !listGP.body.includes(`href="/kategori/gardssalg/book/${slugGP}"`),
+    "gp-11c: a paused card's CTA links to the profile, not the booking route");
 
   // gp-12: no-regression check — the booking panel route (unchanged by this
   // slice) still renders 200 for the same slug the profile page now serves.

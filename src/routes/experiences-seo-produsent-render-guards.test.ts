@@ -24,7 +24,7 @@
  *       all three fields renders verbatim.
  *   (c) the reserve-CTA renders the active amber/coral class + "Reserver
  *       besøk" label when booking is NOT paused, and the new muted
- *       .reserve-cta-paused class + "Meld interesse" label when it IS
+ *       contact card (no reserve CTA, no "Meld interesse") when it IS
  *       paused — id="reserve-cta" present in both cases (the owner-swap
  *       script's hook must survive either state).
  *   (i) 2026-08-17 P0 consent-bug fix: catalog_hidden=1 makes the profile
@@ -298,14 +298,17 @@ export function runExperiencesSeoProdusentRenderGuardsTests(opts: { log?: boolea
         assertTrue(!r.body.includes('class="reserve-cta-paused"'), "g4: the paused class is not applied to the CTA anchor when booking is live (the CSS rule itself may still be present in <style>)");
       }
 
-      // ── (c2) paused — muted class + 'Meld interesse' label ────────────────
+      // ── (c2) paused — contact card instead of a reserve CTA ───────────────
+      // dev-request 2026-11-06-opplevagent-meld-interesse-fjernes-mens-
+      // booking-av: the paused «Meld interesse» CTA (whose form stored
+      // nothing) is gone; the aside shows the producer's contact info.
       {
         const r = await callHtmlRoute(seoRouter, "/kategori/gardssalg/produsent/pausetgard-seltzeri");
         assertTrue(r.handled && r.status === 200, `h1: paused-CTA fixture renders (status ${r.status})`);
-        assertTrue(r.body.includes('id="reserve-cta" class="reserve-cta-paused"'), "h2: paused state uses the new neutral .reserve-cta-paused class");
-        assertTrue(r.body.includes(">Meld interesse<"), "h3: paused state uses the 'Meld interesse' label, not 'Reserver besøk'");
-        assertTrue(!r.body.includes(">Reserver besøk<"), "h4: the active label does not also appear");
-        assertTrue(r.body.includes('id="reserve-cta"'), "h5: id=\"reserve-cta\" is still present (owner-swap script hook)");
+        assertTrue(r.body.includes('id="reserve-contact"') && !r.body.includes('id="reserve-cta"'), "h2: paused state renders the contact card and no reserve-CTA anchor");
+        assertTrue(!r.body.includes("Meld interesse"), "h3: paused state has no 'Meld interesse' label");
+        assertTrue(!r.body.includes(">Reserver besøk<"), "h4: the active label does not appear either");
+        assertTrue(r.body.includes('<a id="reserve-owner-cta" class="reserve-cta-paused" hidden></a>'), "h5: a hidden, label-less owner-swap slot replaces the reserve-cta hook");
       }
 
       // ── (i) catalog_hidden=1 → 404 by slug (2026-08-17 P0 consent-bug fix)
