@@ -26,11 +26,10 @@ on:
       - main                 # build-check runs on PRs to main; deploy is gated below
   schedule:
     # Deploy windows for the fleet's merges (dev-request 2026-10-08-deployvinduer-
-    # for-flaatens-merger). Never inside 06:30-09:30 UTC (send window); the
-    # decision script enforces that too. Deploys only if main HEAD != prod.
-    - cron: "0 10 * * *"
-    - cron: "0 14 * * *"
-    - cron: "0 19 * * *"
+    # for-flaatens-merger): every 3 hours around the clock (Daniel 2026-11-13),
+    # except 09:00 UTC, which falls inside the 06:30-09:30 UTC send window; the
+    # decision script enforces that window too. Deploys only if main HEAD != prod.
+    - cron: "0 0,3,6,12,15,18,21 * * *"
   workflow_dispatch:       # lets you trigger manually from Actions tab
     inputs:
       force:
@@ -144,7 +143,7 @@ jobs:
 
       # Deploy-window decision. Deploy NOW only for: PR merged by Daniel
       # (slookisen), PR label deploy-nå, a Revert commit, manual dispatch by a
-      # human. Otherwise wait for the 10/14/19 UTC schedule run. The fleet gate
+      # human. Otherwise wait for the next 3-hourly schedule run (00/03/06/12/15/18/21 UTC). The fleet gate
       # (fleet-auto-approve.yml) merges under GITHUB_TOKEN (no push event) and
       # then dispatches this workflow; that dispatch has actor
       # github-actions[bot] and is NOT manual: the PR lookup runs for it too and
@@ -185,7 +184,7 @@ jobs:
             echo "::warning::PR lookup via GitHub API failed; deploy decision fell back to fail-open."
           fi
           if [ "$DEPLOY" != "true" ]; then
-            echo "Deploy: venter på deployvindu (${RESULT#*reason=}). Neste vindu 10:00, 14:00 eller 19:00 UTC." >> "$GITHUB_STEP_SUMMARY"
+            echo "Deploy: venter på deployvindu (${RESULT#*reason=}). Neste vindu: hver 3. time (00, 03, 06, 12, 15, 18, 21 UTC; 09 UTC hoppes over pga. utsendingsvinduet)." >> "$GITHUB_STEP_SUMMARY"
           fi
 
       # Serverheng skive 6 (A2A dev-request 2026-10-08-serverheng-hovedtraad-

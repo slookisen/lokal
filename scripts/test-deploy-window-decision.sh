@@ -32,6 +32,12 @@ t "schedule unequal SHA"    true  EVENT=schedule NOW_HHMM=1400 LIVE_SHA=abc THIS
 t "schedule live unknown"   true  EVENT=schedule NOW_HHMM=1900 LIVE_SHA= THIS_SHA=def
 t "schedule in send window" false EVENT=schedule NOW_HHMM=0800 LIVE_SHA=abc THIS_SHA=def
 t "schedule 10:00 ok"       true  EVENT=schedule NOW_HHMM=1000 LIVE_SHA=abc THIS_SHA=def
+t "schedule 00:00 ok"       true  EVENT=schedule NOW_HHMM=0000 LIVE_SHA=abc THIS_SHA=def
+t "schedule 03:00 ok"       true  EVENT=schedule NOW_HHMM=0300 LIVE_SHA=abc THIS_SHA=def
+t "schedule 06:00 ok"       true  EVENT=schedule NOW_HHMM=0600 LIVE_SHA=abc THIS_SHA=def
+t "schedule 09:00 blocked"  false EVENT=schedule NOW_HHMM=0900 LIVE_SHA=abc THIS_SHA=def
+t "schedule late 06:45"     false EVENT=schedule NOW_HHMM=0645 LIVE_SHA=abc THIS_SHA=def
+t "schedule 21:00 ok"       true  EVENT=schedule NOW_HHMM=2100 LIVE_SHA=abc THIS_SHA=def
 t "schedule NOW_HHMM junk"  true  EVENT=schedule NOW_HHMM=xx LIVE_SHA=abc THIS_SHA=abc
 t "schedule NOW_HHMM empty" true  EVENT=schedule LIVE_SHA=abc THIS_SHA=abc
 exit $fail
