@@ -2557,6 +2557,18 @@ export function initExperiencesSchema(db: Database.Database): void {
       try { db.exec(`ALTER TABLE gardssalg_self_registrations ADD COLUMN ${col}`); } catch { /* already present */ }
     }
     db.exec("CREATE INDEX IF NOT EXISTS idx_gardssalg_self_reg_code ON gardssalg_self_registrations(email_code_hash)");
+    // Skive 3 (admin queue): approve/reject set status 'approved' / 'rejected'
+    // (status is free text) and stamp reviewed_at; review_note is the
+    // optional admin note on a reject (stored, never mailed).
+    // admin_notified_at = when the admin notice for the confirmed e-mail
+    // went out (set once, so it is never sent twice). Additive, idempotent.
+    for (const col of [
+      "reviewed_at TEXT",
+      "review_note TEXT",
+      "admin_notified_at TEXT",
+    ]) {
+      try { db.exec(`ALTER TABLE gardssalg_self_registrations ADD COLUMN ${col}`); } catch { /* already present */ }
+    }
   } catch (e) {
     console.log(`[experiences] gardssalg_self_registrations init skipped: ${(e as Error).message}`);
   }

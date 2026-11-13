@@ -43583,6 +43583,28 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-01-opplevagent-drikkeprodusent-selvregistrering,
+// skive 3 (Spec F): the admin review queue (list / approve / reject) for
+// self-registered gårdssalg producers, the admin notice on confirm, owner
+// locks on approve/reject and the «Mine valg» booking adapter. Own in-memory
+// experiences db and a real http.Server, restored in its own finally —
+// runSerial like the suites around it.
+runSerial(async () => {
+  console.log("\n── gardssalg-self-register-review: admin queue approve/reject (skive 3) ──");
+  try {
+    const { runGardssalgSelfRegisterReviewTests } = require("../src/routes/gardssalg-self-register-review.test") as
+      typeof import("../src/routes/gardssalg-self-register-review.test");
+    const gsrr = await runGardssalgSelfRegisterReviewTests({ log: false });
+    passed += gsrr.passed;
+    failed += gsrr.failed;
+    for (const f of gsrr.failures) failures.push("gardssalg-self-register-review: " + f);
+    console.log(`  gardssalg-self-register-review: ${gsrr.passed} passed, ${gsrr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-self-register-review: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── OA-01 (dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas):
 // the claim page now sees Opplevagent's own outreach — tier outreach_delivered
 // reads experience_outreach_sent_log (real, delivered, same provider, no

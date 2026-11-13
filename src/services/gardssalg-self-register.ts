@@ -57,7 +57,7 @@ import { findRegisterSiblingMatch, isSingleEmailAddress, EMAIL_ADDRESS_MAX_LENGT
 import { createProvider, brregDisplayName, providerSlugFor } from "./experience-store";
 import { isGardssalgVisibleOnSurface } from "./gardssalg-visibility";
 import { GARDSSALG_NACE_PRODUCER_TYPE } from "./gardssalg-nace-producer-type";
-import { SELF_REGISTERED_PENDING_REVIEW_REASON } from "./gardssalg-booking-gate";
+import { SELF_REGISTERED_PENDING_REVIEW_REASON, SELF_REGISTERED_REJECTED_REASON } from "./gardssalg-booking-gate";
 import crypto, { randomUUID } from "crypto";
 
 const VERTICAL = "experiences";
@@ -832,4 +832,677 @@ export function getSelfRegisterDraftProfile(providerId: string): SelfRegisterDra
     )
     .get(providerId) as SelfRegisterDraftProfile | undefined;
   return row ?? null;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Skive 3 — Spec F (admin review queue: list, approve, reject)
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// GET  /api/opplevelser/admin/gardssalg-self-registered-review-queue
+// POST …/gardssalg-self-registered-review-queue-approve  { providerId }
+// POST …/gardssalg-self-registered-review-queue-reject   { providerId, note? }
+// (routes/opplevelser.ts, X-Admin-Key, behind GARDSSALG_SELF_REGISTER_ENABLED;
+// shaped like RFB's /admin/agents/claim-review-queue + -approve/-reject).
+//
+// Approve (only a row still hidden with self_registered_pending_review):
+//   - catalog_hidden=0, catalog_hidden_reason cleared (the row is public);
+//   - experience_providers.epost = the address the submitter typed, only
+//     now, with field_provenance.epost.source_type='self_registered' (never
+//     a guessed address; an epost already on the row is left as it is);
+//   - the owner locks the draft session set (field_provenance.owner_locks)
+//     are kept: they are the owner's own edits;
+//   - the draft claim (mailbox proven by the e-mail code) becomes an
+//     ordinary owner claim through gardssalg-claim's own writes
+//     (promoteSelfRegisteredDraftClaim: used=1, content_source='claim',
+//     claimed_at); any other draft row is revoked;
+//   - a fresh ordinary login link (issueSelfRegisteredOwnerLoginLink) is
+//     mailed to the owner, the mail is filed in the CRM, and IndexNow is
+//     pinged for /kategori/gardssalg/produsent/<slug>.
+// Reject (same precondition): the row stays hidden with
+//   catalog_hidden_reason='self_registered_rejected', every draft session for
+//   it is revoked, the draft's owner locks are cleared (an admin lock is
+//   kept), and the submitter gets a short mail (CRM-filed). The draft text
+//   stays on the hidden row.
+// Both are one transaction guarded on the pending reason, so a second call
+// (or two concurrent ones) answers 409 and changes nothing.
+
+export { SELF_REGISTERED_REJECTED_REASON };
+
+/** The draft session's own cookie (review N3 of lokal#1534): never the real
+ *  owner's oa_owner_session, scoped to the self-registration path so the
+ *  ordinary owner routes never see it. */
+export const SELF_REGISTER_DRAFT_COOKIE = "oa_selfreg_draft";
+export const SELF_REGISTER_DRAFT_COOKIE_PATH = "/for-tilbydere/registrer";
+
+const OPPLEVAGENT_PUBLIC_BASE_URL = "https://opplevagent.no";
+const OPPLEVAGENT_INDEXNOW_HOST = "opplevagent.no";
+
+function opplevagentBaseUrl(): string {
+  return (process.env.OPPLEVAGENT_BASE_URL || OPPLEVAGENT_PUBLIC_BASE_URL).replace(/\/$/, "");
+}
+
+export function selfRegisteredProducerPath(slug: string): string {
+  return `/kategori/gardssalg/produsent/${encodeURIComponent(slug)}`;
+}
+
+/** Side-effect seam for skive 3 (tests replace it; production = the real
+ *  IndexNow helper). */
+export interface SelfRegisterReviewDeps {
+  pingIndexNow(urls: string[], host: string): void;
+  /** crmService.ingestThread (the CRM lives on the main database). */
+  crmIngestThread(input: import("./crm-service").IngestThreadInput, primaryEmail: string, vertical: "experiences"): unknown;
+  /** Removes the cold-outreach row the CRM trigger may write for a message id. */
+  clearColdOutreachRow(messageId: string): void;
+}
+
+let reviewDepsOverride: Partial<SelfRegisterReviewDeps> | null = null;
+
+/** Test-only: replace the review side effects; null restores the defaults. */
+export function __setSelfRegisterReviewDepsForTesting(d: Partial<SelfRegisterReviewDeps> | null): void {
+  reviewDepsOverride = d;
+}
+
+function reviewDeps(): SelfRegisterReviewDeps {
+  const defaults: SelfRegisterReviewDeps = {
+    pingIndexNow: (urls, host) =>
+      (require("./indexnow-service") as typeof import("./indexnow-service")).pingIndexNow(urls, host),
+    crmIngestThread: (input, primaryEmail, vertical) =>
+      (require("./crm-service") as typeof import("./crm-service")).crmService.ingestThread(input, primaryEmail, vertical),
+    clearColdOutreachRow: (messageId) => {
+      getRfbDb()
+        .prepare("DELETE FROM outreach_sent_log WHERE message_id = ? AND notes LIKE 'auto:cold_outreach%'")
+        .run(messageId);
+    },
+  };
+  return { ...defaults, ...(reviewDepsOverride ?? {}) };
+}
+
+// ── Queue ────────────────────────────────────────────────────────────────────
+
+export const SELF_REGISTER_QUEUE_STATUSES = ["pending_review", "exists_hidden", "brreg_unavailable"] as const;
+export const SELF_REGISTER_QUEUE_LIST_MAX = 200;
+
+export type SelfRegisterEmailLinkState = "not_sent" | "pending" | "expired" | "confirmed";
+
+export function selfRegisterEmailLinkState(
+  r: { email_code_sent_at: string | null; email_code_expires_at: string | null; email_confirmed_at: string | null },
+  now: Date = new Date(),
+): SelfRegisterEmailLinkState {
+  if (r.email_confirmed_at) return "confirmed";
+  if (!r.email_code_sent_at) return "not_sent";
+  const exp = Date.parse(String(r.email_code_expires_at || ""));
+  if (!Number.isFinite(exp) || exp <= now.getTime()) return "expired";
+  return "pending";
+}
+
+function parseJsonOrNull(raw: string | null | undefined): unknown {
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+function wholeDaysSince(ts: string | null | undefined, nowMs: number): number | null {
+  if (typeof ts !== "string" || !ts.trim()) return null;
+  let s = ts.trim();
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(s)) s = s.replace(" ", "T") + "Z";
+  const t = Date.parse(s);
+  if (!Number.isFinite(t)) return null;
+  return Math.max(0, Math.floor((nowMs - t) / 86_400_000));
+}
+
+export interface SelfRegisterQueueEntry {
+  registration_id: string;
+  status: string;
+  /** true = approve/reject act on provider_id (the row is hidden pending review). */
+  actionable: boolean;
+  provider_id: string | null;
+  provider_name: string | null;
+  provider_slug: string | null;
+  catalog_hidden_reason: string | null;
+  org_nr: string;
+  submitted_name: string;
+  submitted_place: string | null;
+  submitted_producer_type: string | null;
+  submitted_website: string | null;
+  description: string | null;
+  brreg: { status: string; checked_at: string | null };
+  duplicate_signals: unknown;
+  possible_duplicate_of: string | null;
+  submitter: { name: string; email: string; phone: string | null };
+  assessment: unknown;
+  email_link: {
+    state: SelfRegisterEmailLinkState;
+    sent_at: string | null;
+    expires_at: string | null;
+    used_at: string | null;
+    confirmed_at: string | null;
+  };
+  draft_session_active: boolean;
+  created_at: string;
+  age_days: number | null;
+}
+
+/** Oldest first (created_at, then id). `total` counts every open entry;
+ *  at most SELF_REGISTER_QUEUE_LIST_MAX are returned. Read-only. */
+export function listSelfRegisterReviewQueue(now: Date = new Date()): { total: number; entries: SelfRegisterQueueEntry[] } {
+  const db = getDb(VERTICAL);
+  const placeholders = SELF_REGISTER_QUEUE_STATUSES.map(() => "?").join(", ");
+  const total = (db
+    .prepare(`SELECT COUNT(*) AS n FROM gardssalg_self_registrations WHERE status IN (${placeholders})`)
+    .get(...SELF_REGISTER_QUEUE_STATUSES) as { n: number }).n;
+  const rows = db
+    .prepare(
+      `SELECT r.id, r.status, r.provider_id, r.org_nr, r.submitted_name, r.submitted_place, r.submitted_producer_type,
+              r.submitted_website, r.description, r.submitter_name, r.submitter_email, r.submitter_phone,
+              r.brreg_status, r.brreg_checked_at, r.duplicate_signals, r.possible_duplicate_of, r.claim_assessment,
+              r.email_code_sent_at, r.email_code_expires_at, r.email_code_used_at, r.email_confirmed_at, r.created_at,
+              p.navn AS provider_name, p.slug AS provider_slug, p.catalog_hidden, p.catalog_hidden_reason,
+              (SELECT COUNT(*) FROM gardssalg_claims c
+                WHERE c.provider_id = r.provider_id AND c.draft_mode = 1 AND c.used = 0 AND c.revoked_at IS NULL
+                  AND c.expires_at > ?) AS draft_sessions
+         FROM gardssalg_self_registrations r
+         LEFT JOIN experience_providers p ON p.id = r.provider_id
+        WHERE r.status IN (${placeholders})
+        ORDER BY r.created_at ASC, r.id ASC
+        LIMIT ?`,
+    )
+    .all(now.toISOString(), ...SELF_REGISTER_QUEUE_STATUSES, SELF_REGISTER_QUEUE_LIST_MAX) as Array<Record<string, any>>;
+  const nowMs = now.getTime();
+  const entries: SelfRegisterQueueEntry[] = rows.map((r) => ({
+    registration_id: r.id,
+    status: r.status,
+    actionable:
+      r.status === "pending_review" &&
+      !!r.provider_id &&
+      Number(r.catalog_hidden) === 1 &&
+      r.catalog_hidden_reason === SELF_REGISTERED_PENDING_REVIEW_REASON,
+    provider_id: r.provider_id ?? null,
+    provider_name: r.provider_name ?? null,
+    provider_slug: r.provider_slug ?? null,
+    catalog_hidden_reason: r.catalog_hidden_reason ?? null,
+    org_nr: r.org_nr,
+    submitted_name: r.submitted_name,
+    submitted_place: r.submitted_place ?? null,
+    submitted_producer_type: r.submitted_producer_type ?? null,
+    submitted_website: r.submitted_website ?? null,
+    description: r.description ?? null,
+    brreg: { status: r.brreg_status, checked_at: r.brreg_checked_at ?? null },
+    duplicate_signals: parseJsonOrNull(r.duplicate_signals),
+    possible_duplicate_of: r.possible_duplicate_of ?? null,
+    submitter: { name: r.submitter_name, email: r.submitter_email, phone: r.submitter_phone ?? null },
+    assessment: parseJsonOrNull(r.claim_assessment),
+    email_link: {
+      state: selfRegisterEmailLinkState(r as any, now),
+      sent_at: r.email_code_sent_at ?? null,
+      expires_at: r.email_code_expires_at ?? null,
+      used_at: r.email_code_used_at ?? null,
+      confirmed_at: r.email_confirmed_at ?? null,
+    },
+    draft_session_active: Number(r.draft_sessions) > 0,
+    created_at: r.created_at,
+    age_days: wholeDaysSince(r.created_at, nowMs),
+  }));
+  return { total, entries };
+}
+
+// ── Approve / reject ─────────────────────────────────────────────────────────
+
+export type SelfRegisterReviewError =
+  | "provider_not_found"
+  | "not_pending_review"
+  | "already_approved"
+  | "already_rejected"
+  | "registration_not_found";
+
+interface ReviewProviderRow {
+  id: string;
+  navn: string;
+  slug: string | null;
+  epost: string | null;
+  catalog_hidden: number | null;
+  catalog_hidden_reason: string | null;
+  field_provenance: string | null;
+}
+
+interface ReviewRegistrationRow {
+  id: string;
+  submitter_email: string;
+  submitter_name: string;
+}
+
+class ReviewConflict extends Error {
+  constructor(readonly code: SelfRegisterReviewError) {
+    super(code);
+  }
+}
+
+function loadForReview(
+  providerId: string,
+): { ok: true; provider: ReviewProviderRow; registration: ReviewRegistrationRow } | { ok: false; error: SelfRegisterReviewError } {
+  const db = getDb(VERTICAL);
+  const provider = db
+    .prepare(
+      `SELECT id, navn, slug, epost, catalog_hidden, catalog_hidden_reason, field_provenance
+         FROM experience_providers WHERE id = ?`,
+    )
+    .get(providerId) as ReviewProviderRow | undefined;
+  if (!provider) return { ok: false, error: "provider_not_found" };
+  if (Number(provider.catalog_hidden) !== 1 || provider.catalog_hidden_reason !== SELF_REGISTERED_PENDING_REVIEW_REASON) {
+    const decided = db
+      .prepare(
+        `SELECT status FROM gardssalg_self_registrations
+          WHERE provider_id = ? AND status IN ('approved', 'rejected')
+          ORDER BY reviewed_at DESC LIMIT 1`,
+      )
+      .get(providerId) as { status: string } | undefined;
+    if (decided?.status === "approved") return { ok: false, error: "already_approved" };
+    if (decided?.status === "rejected") return { ok: false, error: "already_rejected" };
+    return { ok: false, error: "not_pending_review" };
+  }
+  const registration = db
+    .prepare(
+      `SELECT id, submitter_email, submitter_name FROM gardssalg_self_registrations
+        WHERE provider_id = ? AND status = 'pending_review'
+        ORDER BY created_at DESC LIMIT 1`,
+    )
+    .get(providerId) as ReviewRegistrationRow | undefined;
+  if (!registration) return { ok: false, error: "registration_not_found" };
+  return { ok: true, provider, registration };
+}
+
+function parseProvenance(raw: string | null | undefined): Record<string, unknown> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function insertReviewAudit(providerId: string, field: string, oldValue: string | null, newValue: string | null): void {
+  getDb(VERTICAL)
+    .prepare(
+      `INSERT INTO gardssalg_content_audit (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (?, ?, ?, ?, ?, NULL, 'self-register-review', 'admin', datetime('now'))`,
+    )
+    .run(randomUUID(), providerId, field, oldValue, newValue);
+}
+
+export interface ApprovedSelfRegistration {
+  providerId: string;
+  registrationId: string;
+  providerName: string;
+  slug: string | null;
+  /** The submitter's typed address: the login link's recipient. */
+  email: string;
+  /** Whether experience_providers.epost was set from it on this approval. */
+  epostSet: boolean;
+  /** Whether a draft claim (mailbox proven) became an owner claim now. */
+  ownerClaimPromoted: boolean;
+  /** The fresh login link's token (mailed only; never in an HTTP response). */
+  loginToken: string | null;
+  loginClaimId: string | null;
+}
+
+export function approveSelfRegistration(
+  providerId: string,
+): { ok: true; approved: ApprovedSelfRegistration } | { ok: false; error: SelfRegisterReviewError } {
+  const loaded = loadForReview(providerId);
+  if (!loaded.ok) return loaded;
+  const { provider, registration } = loaded;
+  const db = getDb(VERTICAL);
+  // gardssalg-claim is required here (not at module load) to keep this
+  // module's import graph as it was for skive 1/2.
+  const claimSvc = require("./gardssalg-claim") as typeof import("./gardssalg-claim");
+  const email = String(registration.submitter_email || "").trim().toLowerCase();
+  const at = new Date().toISOString();
+  try {
+    const approved = db.transaction((): ApprovedSelfRegistration => {
+      // Re-read inside the transaction: the guard below is what makes a
+      // second (or concurrent) approve a 409 that changes nothing.
+      const current = db
+        .prepare(`SELECT epost, field_provenance FROM experience_providers WHERE id = ?`)
+        .get(providerId) as { epost: string | null; field_provenance: string | null } | undefined;
+      const hasEpost = !!(current?.epost && String(current.epost).trim());
+      const epostSet = !hasEpost && isSingleEmailAddress(email);
+      const provenance = parseProvenance(current?.field_provenance);
+      if (epostSet) {
+        provenance.epost = {
+          source_type: SELF_REGISTERED_CLAIM_EMAIL_SOURCE,
+          value: email,
+          fetched_at: at,
+          registration_id: registration.id,
+        };
+      }
+      // owner_locks are left exactly as the draft session stamped them.
+      const upd = db
+        .prepare(
+          `UPDATE experience_providers
+              SET catalog_hidden = 0,
+                  catalog_hidden_reason = NULL,
+                  epost = CASE WHEN @epost_set = 1 THEN @epost ELSE epost END,
+                  field_provenance = @fp,
+                  updated_at = datetime('now')
+            WHERE id = @id AND catalog_hidden = 1 AND catalog_hidden_reason = @pending`,
+        )
+        .run({
+          id: providerId,
+          epost_set: epostSet ? 1 : 0,
+          epost: email,
+          fp: epostSet ? JSON.stringify(provenance) : current?.field_provenance ?? null,
+          pending: SELF_REGISTERED_PENDING_REVIEW_REASON,
+        });
+      if (upd.changes !== 1) throw new ReviewConflict("not_pending_review");
+      insertReviewAudit(providerId, "catalog_hidden_reason", SELF_REGISTERED_PENDING_REVIEW_REASON, null);
+      if (epostSet) insertReviewAudit(providerId, "epost", null, email);
+
+      // The draft claim (newest live draft row) becomes the owner claim;
+      // any other draft row is revoked.
+      const drafts = db
+        .prepare(
+          `SELECT id FROM gardssalg_claims
+            WHERE provider_id = ? AND draft_mode = 1 AND used = 0 AND revoked_at IS NULL
+            ORDER BY created_at DESC, id DESC`,
+        )
+        .all(providerId) as Array<{ id: string }>;
+      let ownerClaimPromoted = false;
+      if (drafts.length > 0) {
+        ownerClaimPromoted = claimSvc.promoteSelfRegisteredDraftClaim(drafts[0]!.id);
+        for (const d of drafts.slice(1)) {
+          db.prepare(`UPDATE gardssalg_claims SET revoked_at = datetime('now') WHERE id = ? AND revoked_at IS NULL`).run(d.id);
+        }
+      }
+      const login = isSingleEmailAddress(email) ? claimSvc.issueSelfRegisteredOwnerLoginLink(providerId, email) : null;
+
+      db.prepare(
+        `UPDATE gardssalg_self_registrations SET status = 'approved', reviewed_at = ? WHERE id = ?`,
+      ).run(at, registration.id);
+      return {
+        providerId,
+        registrationId: registration.id,
+        providerName: provider.navn,
+        slug: provider.slug,
+        email,
+        epostSet,
+        ownerClaimPromoted,
+        loginToken: login?.token ?? null,
+        loginClaimId: login?.claimId ?? null,
+      };
+    })();
+    console.log(`[gardssalg-self-register] registration ${approved.registrationId} approved; provider ${providerId} is public (owner claim promoted: ${approved.ownerClaimPromoted})`);
+    return { ok: true, approved };
+  } catch (err) {
+    if (err instanceof ReviewConflict) return { ok: false, error: err.code };
+    throw err;
+  }
+}
+
+export interface RejectedSelfRegistration {
+  providerId: string;
+  registrationId: string;
+  providerName: string;
+  email: string;
+  revokedSessions: number;
+  clearedOwnerLocks: string[];
+}
+
+export const SELF_REGISTER_REVIEW_NOTE_MAX = 1000;
+
+export function rejectSelfRegistration(
+  providerId: string,
+  note?: string,
+): { ok: true; rejected: RejectedSelfRegistration } | { ok: false; error: SelfRegisterReviewError } {
+  const loaded = loadForReview(providerId);
+  if (!loaded.ok) return loaded;
+  const { provider, registration } = loaded;
+  const db = getDb(VERTICAL);
+  const at = new Date().toISOString();
+  try {
+    const rejected = db.transaction((): RejectedSelfRegistration => {
+      const current = db
+        .prepare(`SELECT field_provenance FROM experience_providers WHERE id = ?`)
+        .get(providerId) as { field_provenance: string | null } | undefined;
+      const provenance = parseProvenance(current?.field_provenance);
+      // The draft session's owner locks go; an Opplevagent support lock
+      // (locked_by:"admin") stays.
+      const clearedOwnerLocks: string[] = [];
+      const locks = provenance.owner_locks;
+      if (locks && typeof locks === "object" && !Array.isArray(locks)) {
+        const kept: Record<string, unknown> = {};
+        for (const [field, v] of Object.entries(locks as Record<string, unknown>)) {
+          if (v && typeof v === "object" && (v as Record<string, unknown>).locked_by === "admin") kept[field] = v;
+          else clearedOwnerLocks.push(field);
+        }
+        if (Object.keys(kept).length > 0) provenance.owner_locks = kept;
+        else delete provenance.owner_locks;
+      }
+      const upd = db
+        .prepare(
+          `UPDATE experience_providers
+              SET catalog_hidden = 1,
+                  catalog_hidden_reason = @rejected,
+                  booking_live = 0,
+                  field_provenance = @fp,
+                  updated_at = datetime('now')
+            WHERE id = @id AND catalog_hidden = 1 AND catalog_hidden_reason = @pending`,
+        )
+        .run({
+          id: providerId,
+          rejected: SELF_REGISTERED_REJECTED_REASON,
+          fp: Object.keys(provenance).length > 0 ? JSON.stringify(provenance) : current?.field_provenance ?? null,
+          pending: SELF_REGISTERED_PENDING_REVIEW_REASON,
+        });
+      if (upd.changes !== 1) throw new ReviewConflict("not_pending_review");
+      insertReviewAudit(providerId, "catalog_hidden_reason", SELF_REGISTERED_PENDING_REVIEW_REASON, SELF_REGISTERED_REJECTED_REASON);
+      if (clearedOwnerLocks.length > 0) insertReviewAudit(providerId, "owner_locks", clearedOwnerLocks.join(","), null);
+      const revoked = db
+        .prepare(
+          `UPDATE gardssalg_claims SET revoked_at = datetime('now')
+            WHERE provider_id = ? AND draft_mode = 1 AND revoked_at IS NULL`,
+        )
+        .run(providerId);
+      db.prepare(
+        `UPDATE gardssalg_self_registrations SET status = 'rejected', reviewed_at = ?, review_note = ? WHERE id = ?`,
+      ).run(at, note ? note.slice(0, SELF_REGISTER_REVIEW_NOTE_MAX) : null, registration.id);
+      return {
+        providerId,
+        registrationId: registration.id,
+        providerName: provider.navn,
+        email: String(registration.submitter_email || "").trim().toLowerCase(),
+        revokedSessions: revoked.changes,
+        clearedOwnerLocks,
+      };
+    })();
+    console.log(`[gardssalg-self-register] registration ${rejected.registrationId} rejected; provider ${providerId} stays hidden (${rejected.revokedSessions} draft session(s) revoked)`);
+    return { ok: true, rejected };
+  } catch (err) {
+    if (err instanceof ReviewConflict) return { ok: false, error: err.code };
+    throw err;
+  }
+}
+
+// ── Mails after the decision (never undo it) ─────────────────────────────────
+
+/** Placeholder the CRM copy carries instead of the login link. */
+export const SELF_REGISTER_LOGIN_LINK_PLACEHOLDER = "[innloggingslenke]";
+
+export function selfRegisterCrmThreadId(registrationId: string): string {
+  return `gardssalg-selfreg-${registrationId}`;
+}
+
+/**
+ * Files one sent self-registration decision mail in the CRM, the way the
+ * other Opplevagent producer mails are filed (crmService.ingestThread on the
+ * 'experiences' vertical, as the outreach send does). The copy never holds
+ * the login link. Fail-open: returns false and logs on any error.
+ */
+export function recordSelfRegisterDecisionMail(input: {
+  kind: "approved" | "rejected";
+  registrationId: string;
+  providerId: string;
+  email: string;
+  rendered: { subject: string; htmlContent: string; textContent: string };
+  sendResult: { success: boolean; messageId?: string } | null | undefined;
+}): boolean {
+  if (input.sendResult?.success !== true) return false;
+  try {
+    const d = reviewDeps();
+    const { CRM_SENDER_ADDRESS } = require("./crm-platform-identity") as typeof import("./crm-platform-identity");
+    const smtpId = input.sendResult.messageId && input.sendResult.messageId !== "DRY_RUN" ? input.sendResult.messageId : null;
+    const messageId = smtpId ?? `selfreg-${input.kind}-${input.registrationId}`;
+    d.crmIngestThread(
+      {
+        threadId: selfRegisterCrmThreadId(input.registrationId),
+        subject: input.rendered.subject,
+        category: "system",
+        messages: [
+          {
+            messageId,
+            direction: "out",
+            fromEmail: CRM_SENDER_ADDRESS,
+            toEmails: [input.email],
+            subject: input.rendered.subject,
+            bodyText: input.rendered.textContent.trim(),
+            bodyHtml: input.rendered.htmlContent.trim(),
+            sentAt: new Date().toISOString(),
+            rawMetadata: {
+              source: "gardssalg-self-register",
+              kind: input.kind,
+              registration_id: input.registrationId,
+              provider_id: input.providerId,
+              smtp_message_id: smtpId,
+            },
+          },
+        ],
+      },
+      input.email,
+      "experiences",
+    );
+    // A transactional mail the producer asked for, not a cold-outreach touch
+    // (same clean-up as claim-crm-tracking.ts).
+    try { d.clearColdOutreachRow(messageId); } catch { /* no outreach log: nothing to clean */ }
+    return true;
+  } catch (err) {
+    console.error(
+      `[gardssalg-self-register] CRM copy of the ${input.kind} mail for registration ${input.registrationId} not recorded:`,
+      err instanceof Error ? err.message : String(err),
+    );
+    return false;
+  }
+}
+
+/** After an approval: IndexNow ping, the owner mail with the login link,
+ *  its CRM copy. Never throws. */
+export async function finishSelfRegisterApproval(
+  a: ApprovedSelfRegistration,
+): Promise<{ loginLinkSent: boolean; crmRecorded: boolean; indexNowPinged: boolean }> {
+  const base = opplevagentBaseUrl();
+  let indexNowPinged = false;
+  if (a.slug) {
+    try {
+      reviewDeps().pingIndexNow([`${OPPLEVAGENT_PUBLIC_BASE_URL}${selfRegisteredProducerPath(a.slug)}`], OPPLEVAGENT_INDEXNOW_HOST);
+      indexNowPinged = true;
+    } catch (err) {
+      console.warn("[gardssalg-self-register] IndexNow ping failed:", err instanceof Error ? err.message : err);
+    }
+  }
+  if (!a.loginToken) return { loginLinkSent: false, crmRecorded: false, indexNowPinged };
+  const { emailService, buildGardssalgSelfRegisterApprovedEmail } = require("./email-service") as typeof import("./email-service");
+  const profileUrl = a.slug ? `${base}${selfRegisteredProducerPath(a.slug)}` : base;
+  const loginUrl = `${base}/kategori/gardssalg/eier/magic-link-verify?token=${a.loginToken}`;
+  let sendResult: { success: boolean; messageId?: string } | null = null;
+  try {
+    sendResult = await emailService.sendGardssalgSelfRegisterApproved({ to: a.email, providerName: a.providerName, loginUrl, profileUrl });
+  } catch (err) {
+    console.error("[gardssalg-self-register] approved mail error:", err instanceof Error ? err.message : err);
+  }
+  const loginLinkSent = sendResult?.success === true && sendResult.messageId !== "DRY_RUN";
+  if (!loginLinkSent) console.error(`[gardssalg-self-register] approved mail for registration ${a.registrationId} was not sent`);
+  const crmRecorded = recordSelfRegisterDecisionMail({
+    kind: "approved",
+    registrationId: a.registrationId,
+    providerId: a.providerId,
+    email: a.email,
+    rendered: buildGardssalgSelfRegisterApprovedEmail(a.providerName, SELF_REGISTER_LOGIN_LINK_PLACEHOLDER, profileUrl),
+    sendResult,
+  });
+  return { loginLinkSent, crmRecorded, indexNowPinged };
+}
+
+/** After a rejection: the short mail to the submitter and its CRM copy.
+ *  Never throws. */
+export async function finishSelfRegisterRejection(r: RejectedSelfRegistration): Promise<{ mailSent: boolean; crmRecorded: boolean }> {
+  if (!isSingleEmailAddress(r.email)) return { mailSent: false, crmRecorded: false };
+  const { emailService, buildGardssalgSelfRegisterRejectedEmail } = require("./email-service") as typeof import("./email-service");
+  let sendResult: { success: boolean; messageId?: string } | null = null;
+  try {
+    sendResult = await emailService.sendGardssalgSelfRegisterRejected({ to: r.email, providerName: r.providerName });
+  } catch (err) {
+    console.error("[gardssalg-self-register] rejected mail error:", err instanceof Error ? err.message : err);
+  }
+  const mailSent = sendResult?.success === true && sendResult.messageId !== "DRY_RUN";
+  const crmRecorded = recordSelfRegisterDecisionMail({
+    kind: "rejected",
+    registrationId: r.registrationId,
+    providerId: r.providerId,
+    email: r.email,
+    rendered: buildGardssalgSelfRegisterRejectedEmail(r.providerName),
+    sendResult,
+  });
+  return { mailSent, crmRecorded };
+}
+
+// ── Admin notice on a confirmed e-mail ───────────────────────────────────────
+
+/**
+ * Tells the admin, once, that a self-registration confirmed its e-mail and
+ * waits in the queue — through the same channel the RFB owner-claim flow
+ * uses (emailService → ADMIN_NOTIFICATION_EMAIL). Fired at the confirm step,
+ * as RFB's sendAdminClaimNotification fires when the claimant proves the
+ * code, not at the bare form submission (an unconfirmed submission can be
+ * anyone typing anything). admin_notified_at is claimed first, so a repeat
+ * call sends nothing. Never throws; returns whether a notice was started.
+ */
+export function notifyAdminSelfRegisterConfirmed(registrationId: string): boolean {
+  try {
+    const db = getDb(VERTICAL);
+    const claimed = db
+      .prepare(
+        `UPDATE gardssalg_self_registrations SET admin_notified_at = ?
+          WHERE id = ? AND admin_notified_at IS NULL AND email_confirmed_at IS NOT NULL`,
+      )
+      .run(new Date().toISOString(), registrationId);
+    if (claimed.changes !== 1) return false;
+    const r = db
+      .prepare(
+        `SELECT r.provider_id, r.org_nr, r.submitter_name, r.submitter_email, r.brreg_status, r.possible_duplicate_of,
+                r.claim_assessment, p.navn
+           FROM gardssalg_self_registrations r
+           LEFT JOIN experience_providers p ON p.id = r.provider_id
+          WHERE r.id = ?`,
+      )
+      .get(registrationId) as Record<string, any> | undefined;
+    if (!r) return false;
+    const assessment = parseJsonOrNull(r.claim_assessment) as { result?: unknown } | null;
+    const { emailService } = require("./email-service") as typeof import("./email-service");
+    Promise.resolve()
+      .then(() => emailService.sendAdminGardssalgSelfRegisterNotification({
+        providerName: String(r.navn || r.org_nr),
+        providerId: String(r.provider_id || ""),
+        orgNr: String(r.org_nr),
+        submitterName: String(r.submitter_name),
+        submitterEmail: String(r.submitter_email),
+        brregStatus: String(r.brreg_status),
+        possibleDuplicateOf: r.possible_duplicate_of ?? null,
+        assessmentResult: assessment && typeof assessment.result === "string" ? assessment.result : null,
+      }))
+      .then((res) => {
+        if (!res.success) console.error(`[gardssalg-self-register] admin notice for registration ${registrationId} failed`);
+      })
+      .catch((e) => console.error("[gardssalg-self-register] admin notice error:", e instanceof Error ? e.message : e));
+    return true;
+  } catch (err) {
+    console.error("[gardssalg-self-register] admin notice error:", err instanceof Error ? err.message : err);
+    return false;
+  }
 }

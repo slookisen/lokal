@@ -57,6 +57,15 @@ export const OWNER_BOOKING_PENDING_REVIEW_MSG =
 /** catalog_hidden_reason of a self-registered row awaiting manual review
  *  (dev-request 2026-11-01-opplevagent-drikkeprodusent-selvregistrering). */
 export const SELF_REGISTERED_PENDING_REVIEW_REASON = "self_registered_pending_review";
+/** catalog_hidden_reason of a self-registered row an admin rejected (skive 3).
+ *  The row stays hidden and is never bookable. */
+export const SELF_REGISTERED_REJECTED_REASON = "self_registered_rejected";
+
+/** A self-registered row that has not been approved (pending or rejected):
+ *  booking can never be switched on for it. */
+export function isSelfRegisteredUnapprovedReason(reason: string | null | undefined): boolean {
+  return reason === SELF_REGISTERED_PENDING_REVIEW_REASON || reason === SELF_REGISTERED_REJECTED_REASON;
+}
 export const OWNER_BOOKING_NO_EMAIL_MSG =
   "Booking kan ikke slås på før profilen har en e-postadresse som forespørslene kan sendes til. Ta kontakt med kontakt@opplevagent.no.";
 
@@ -75,7 +84,8 @@ export function ownerBookingEnableBlock(row: OwnerBookingGateRow): OwnerBookingB
   // A self-registered row is never bookable before a human has approved it
   // (dev-request 2026-11-01-opplevagent-drikkeprodusent-selvregistrering,
   // Spec E), even if it has an e-mail address.
-  if (row.catalog_hidden_reason === SELF_REGISTERED_PENDING_REVIEW_REASON) {
+  // Skive 3: a rejected self-registration is refused the same way.
+  if (isSelfRegisteredUnapprovedReason(row.catalog_hidden_reason)) {
     return { reason: "pending_review", message: OWNER_BOOKING_PENDING_REVIEW_MSG, note: null };
   }
   if (row.booking_admin_brake_at) {

@@ -841,6 +841,17 @@ import {
   CATALOG_HIDDEN_REASON_TEST_FIXTURE,
 } from "../services/gardssalg-claim";
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
+// dev-request 2026-11-01-opplevagent-drikkeprodusent-selvregistrering,
+// skive 3 — the self-registration review queue below.
+import {
+  isGardssalgSelfRegisterEnabled,
+  listSelfRegisterReviewQueue,
+  approveSelfRegistration,
+  rejectSelfRegistration,
+  finishSelfRegisterApproval,
+  finishSelfRegisterRejection,
+  SELF_REGISTER_REVIEW_NOTE_MAX,
+} from "../services/gardssalg-self-register";
 import {
   emailService,
   // dev-request 2026-08-09-outreach-send-uten-crm-spor: the pilot-send route
@@ -11151,6 +11162,127 @@ router.post("/admin/gardssalg-claim-revoke", requireAdmin, (req: Request, res: R
 
   res.json({ success: true, dry_run: false, provider_id: providerId, revoked, claimed_at_reset: claimedAtReset });
 });
+
+// ─── Gårdssalg self-registration review queue (admin) ───────────────────────
+//
+// dev-request 2026-11-01-opplevagent-drikkeprodusent-selvregistrering,
+// skive 3 (Spec F). Shaped like RFB's /admin/agents/claim-review-queue +
+// -approve / -reject (routes/admin-agents.ts): X-Admin-Key, GET lists
+// oldest first with `count` (all open) + `entries`, the POSTs take one id.
+//
+//   GET  /admin/gardssalg-self-registered-review-queue
+//        → { count, entries } (services/gardssalg-self-register.ts,
+//          listSelfRegisterReviewQueue: name, org.nr, Brreg outcome, the
+//          duplicate signals, submitter + e-mail, the assessment, timestamps
+//          and the e-mail link state — confirmed / pending / expired /
+//          not_sent — so a failed or expired link shows).
+//   POST /admin/gardssalg-self-registered-review-queue-approve { providerId }
+//   POST /admin/gardssalg-self-registered-review-queue-reject  { providerId, note? }
+//        404 provider_not_found · 409 not_pending_review / already_approved /
+//        already_rejected / registration_not_found · 400 bad body.
+//        The decision is stored first; the mail after it (loginLinkSent /
+//        mailSent false on a failed send) never turns into a 500 to retry
+//        into a 409 — the RFB approve's rule.
+//
+// GARDSSALG_SELF_REGISTER_ENABLED off: the gate calls next("route"), so the
+// three paths fall through exactly as they did before they existed (404).
+function gardssalgSelfRegisterAdminGate(_req: Request, _res: Response, next: NextFunction): void {
+  if (isGardssalgSelfRegisterEnabled()) return next();
+  next("route");
+}
+
+router.get("/admin/gardssalg-self-registered-review-queue", gardssalgSelfRegisterAdminGate, requireAdmin, (_req: Request, res: Response) => {
+  try {
+    const { total, entries } = listSelfRegisterReviewQueue();
+    res.json({ count: total, entries });
+  } catch (err) {
+    console.error("[opplevelser] gardssalg-self-registered-review-queue failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+function selfRegisterReviewStatus(error: string): number {
+  return error === "provider_not_found" ? 404 : 409;
+}
+
+router.post(
+  "/admin/gardssalg-self-registered-review-queue-approve",
+  gardssalgSelfRegisterAdminGate,
+  requireAdmin,
+  async (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as { providerId?: unknown };
+    const providerId = typeof body.providerId === "string" ? body.providerId.trim() : "";
+    if (!providerId || providerId.length > 200) {
+      res.status(400).json({ error: "Requires { providerId }" });
+      return;
+    }
+    let r: ReturnType<typeof approveSelfRegistration>;
+    try {
+      r = approveSelfRegistration(providerId);
+    } catch (err) {
+      console.error("[opplevelser] gardssalg-self-registered approve failed (rolled back)", err);
+      res.status(500).json({ error: "Internal error" });
+      return;
+    }
+    if (!r.ok) {
+      res.status(selfRegisterReviewStatus(r.error)).json({ error: r.error });
+      return;
+    }
+    const after = await finishSelfRegisterApproval(r.approved);
+    res.json({
+      success: true,
+      providerId,
+      registrationId: r.approved.registrationId,
+      status: "approved",
+      catalogHidden: false,
+      epostSet: r.approved.epostSet,
+      ownerClaimPromoted: r.approved.ownerClaimPromoted,
+      loginLinkSent: after.loginLinkSent,
+      sentTo: maskEmail(r.approved.email),
+      crmRecorded: after.crmRecorded,
+      indexNowPinged: after.indexNowPinged,
+    });
+  },
+);
+
+router.post(
+  "/admin/gardssalg-self-registered-review-queue-reject",
+  gardssalgSelfRegisterAdminGate,
+  requireAdmin,
+  async (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as { providerId?: unknown; note?: unknown };
+    const providerId = typeof body.providerId === "string" ? body.providerId.trim() : "";
+    const noteOk = body.note === undefined || (typeof body.note === "string" && body.note.length <= SELF_REGISTER_REVIEW_NOTE_MAX);
+    if (!providerId || providerId.length > 200 || !noteOk) {
+      res.status(400).json({ error: `Requires { providerId, note? } (note at most ${SELF_REGISTER_REVIEW_NOTE_MAX} characters)` });
+      return;
+    }
+    let r: ReturnType<typeof rejectSelfRegistration>;
+    try {
+      r = rejectSelfRegistration(providerId, body.note as string | undefined);
+    } catch (err) {
+      console.error("[opplevelser] gardssalg-self-registered reject failed (rolled back)", err);
+      res.status(500).json({ error: "Internal error" });
+      return;
+    }
+    if (!r.ok) {
+      res.status(selfRegisterReviewStatus(r.error)).json({ error: r.error });
+      return;
+    }
+    const after = await finishSelfRegisterRejection(r.rejected);
+    res.json({
+      success: true,
+      providerId,
+      registrationId: r.rejected.registrationId,
+      status: "rejected",
+      revokedSessions: r.rejected.revokedSessions,
+      clearedOwnerLocks: r.rejected.clearedOwnerLocks,
+      mailSent: after.mailSent,
+      sentTo: maskEmail(r.rejected.email),
+      crmRecorded: after.crmRecorded,
+    });
+  },
+);
 
 // ─── GET /api/opplevelser/admin/gardssalg-content-audit (admin, read-only) ──
 //

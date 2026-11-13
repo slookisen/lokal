@@ -2041,7 +2041,12 @@ export type ClaimEmailSource =
   | "found_site_other"
   | "found_umbrella_member"
   | "outreach_delivered"
-  | "manual";
+  | "manual"
+  // dev-request 2026-11-01-opplevagent-drikkeprodusent-selvregistrering:
+  // the address a self-registering producer typed and proved with the
+  // e-mail code (skive 2), used for the draft session and, after admin
+  // approval (skive 3), for the owner login link.
+  | "self_registered";
 
 export interface IssuedClaim {
   claimId: string;
@@ -2286,20 +2291,62 @@ export function verifyClaimToken(token: string): VerifyClaimResult {
 
   if (!claim) return { valid: false };
 
-  const txn = db.transaction(() => {
-    db.prepare(`UPDATE gardssalg_claims SET used = 1, used_at = datetime('now') WHERE id = ?`).run(claim.id);
-    db.prepare(
-      `UPDATE experience_providers SET content_source = 'claim', updated_at = datetime('now')
-       WHERE id = ? AND (content_source IS NULL OR content_source NOT IN ('manual', 'claim'))`,
-    ).run(claim.provider_id);
-    db.prepare(
-      `UPDATE experience_providers SET claimed_at = datetime('now')
-       WHERE id = ? AND claimed_at IS NULL`,
-    ).run(claim.provider_id);
-  });
+  const txn = db.transaction(() => markClaimUsedAndLockProvider(db, claim.id, claim.provider_id));
   txn();
 
   return { valid: true, providerId: claim.provider_id, token: claim.token };
+}
+
+/** The writes a used claim makes: the claim row used, content_source='claim'
+ *  (never over 'manual'), claimed_at first-claim-wins. Shared by
+ *  verifyClaimToken() and promoteSelfRegisteredDraftClaim() so there is one
+ *  ownership model. Runs inside the caller's transaction. */
+function markClaimUsedAndLockProvider(db: ReturnType<typeof getDb>, claimId: string, providerId: string): void {
+  db.prepare(`UPDATE gardssalg_claims SET used = 1, used_at = datetime('now') WHERE id = ?`).run(claimId);
+  db.prepare(
+    `UPDATE experience_providers SET content_source = 'claim', updated_at = datetime('now')
+     WHERE id = ? AND (content_source IS NULL OR content_source NOT IN ('manual', 'claim'))`,
+  ).run(providerId);
+  db.prepare(
+    `UPDATE experience_providers SET claimed_at = datetime('now')
+     WHERE id = ? AND claimed_at IS NULL`,
+  ).run(providerId);
+}
+
+/**
+ * dev-request 2026-11-01-opplevagent-drikkeprodusent-selvregistrering,
+ * skive 3: on admin approval the self-registered producer's draft claim
+ * (draft_mode=1, used=0, not revoked — the row the e-mail code issued, so the
+ * mailbox is proven) becomes an ordinary owner claim: draft_mode=0 and the
+ * same writes verifyClaimToken() makes on a click (used=1, content_source=
+ * 'claim', claimed_at). Returns false when the claim is not such a draft row.
+ * Call inside the approval transaction.
+ */
+export function promoteSelfRegisteredDraftClaim(claimId: string): boolean {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT id, provider_id FROM gardssalg_claims
+        WHERE id = ? AND draft_mode = 1 AND used = 0 AND revoked_at IS NULL`,
+    )
+    .get(claimId) as { id: string; provider_id: string } | undefined;
+  if (!row) return false;
+  db.prepare(`UPDATE gardssalg_claims SET draft_mode = 0 WHERE id = ?`).run(row.id);
+  markClaimUsedAndLockProvider(db, row.id, row.provider_id);
+  return true;
+}
+
+/**
+ * Skive 3: the owner login link mailed on approval of a self-registration —
+ * an ordinary magic-link row (insertGardssalgClaimRow, email_source
+ * 'self_registered') to the address the submitter typed, opened through
+ * /kategori/gardssalg/eier/magic-link-verify like every other claim link.
+ * The draft session's own token is never mailed.
+ */
+export function issueSelfRegisteredOwnerLoginLink(providerId: string, email: string): IssuedClaim | null {
+  const normalized = normalizeEmail(email);
+  if (!normalized || !isPlausibleEmailShape(normalized)) return null;
+  return insertGardssalgClaimRow(providerId, normalized, "self_registered");
 }
 
 // ── Session verification (cookie or Bearer, mirrors RFB's

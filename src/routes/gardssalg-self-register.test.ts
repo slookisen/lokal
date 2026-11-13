@@ -605,11 +605,16 @@ export function runGardssalgSelfRegisterTests(opts: { log?: boolean } = {}): Pro
         // Valid code, Origin: null (plain form under no-referrer).
         const ok = await postForm("/for-tilbydere/registrer/bekreft", { t: token });
         assertEq([ok.status, ok.headers.location], [303, "/for-tilbydere/registrer/utkast"], "ac6-18: a valid code (Origin: null) → 303 to the draft editor");
-        const setCookie = ([] as string[]).concat(ok.headers["set-cookie"] || []).find((c) => c.startsWith("oa_owner_session=")) || "";
+        const allSet = ([] as string[]).concat(ok.headers["set-cookie"] || []);
+        const setCookie = allSet.find((c) => c.startsWith("oa_selfreg_draft=")) || "";
         assertTrue(/HttpOnly/i.test(setCookie) && /Secure/i.test(setCookie) && /SameSite=Lax/i.test(setCookie),
-          "ac6-19: … setting the oa_owner_session cookie (HttpOnly, Secure, SameSite=Lax)");
+          "ac6-19: … setting the draft cookie oa_selfreg_draft (HttpOnly, Secure, SameSite=Lax)");
+        assertTrue(/Path=\/for-tilbydere\/registrer(;|$)/i.test(setCookie),
+          "n3-1: the draft cookie is scoped to Path=/for-tilbydere/registrer");
+        assertTrue(!allSet.some((c) => c.startsWith("oa_owner_session=")),
+          "n3-2: confirming sets no oa_owner_session cookie (a real owner session is not replaced)");
         sessionCookie = setCookie.split(";")[0];
-        const sessTok = sessionCookie.slice("oa_owner_session=".length);
+        const sessTok = sessionCookie.slice("oa_selfreg_draft=".length);
         const reg2 = regRow();
         assertTrue(!!reg2?.email_code_used_at && !!reg2?.email_confirmed_at && reg2?.status === "pending_review",
           "ac6-20: the code is marked used, the e-mail confirmed, and the registration stays pending_review");
@@ -689,9 +694,36 @@ export function runGardssalgSelfRegisterTests(opts: { log?: boolean } = {}): Pro
         assertEq(noSessSave.status, 401, "ac6-46: a draft save without a session → 401");
         assertEq(provRow()?.about_text, "Vi lager vin av egne druer.", "ac6-47: neither changed the row");
 
+        // Review N1: a save without field_products keeps the product list.
+        const noProducts = await postForm("/for-tilbydere/registrer/utkast", { field_visit_text: "Gårdssalg lørdager og søndager." }, { Cookie: sessionCookie });
+        assertEq(noProducts.headers.location, "/for-tilbydere/registrer/utkast?status=saved", "n1-5: a draft save without field_products → 303 saved");
+        assertEq([provRow()?.visit_text, provRow()?.products], ["Gårdssalg lørdager og søndager.", JSON.stringify(["Rødvin", "Hvitvin"])],
+          "n1-6: … the posted field is written and the product list is kept (not wiped)");
+        const emptyProducts = await postForm("/for-tilbydere/registrer/utkast", { field_products: "" }, { Cookie: sessionCookie });
+        assertEq([emptyProducts.status, provRow()?.products], [303, JSON.stringify([])], "n1-7: an explicitly posted empty field_products does clear the list");
+        await postForm("/for-tilbydere/registrer/utkast", { field_products: "Rødvin, Hvitvin" }, { Cookie: sessionCookie });
+
+        // Review N2: "0" is off.
+        const routeMod = require("./gardssalg-self-register") as typeof import("./gardssalg-self-register");
+        assertEq(["1", "on", "true", " TRUE ", "On"].map(routeMod.parseDraftCheckbox), [true, true, true, true, true],
+          "n2-1: parseDraftCheckbox reads 1 / on / true (any case, trimmed) as on");
+        assertEq(["0", "", "off", "false", "no", "2"].map(routeMod.parseDraftCheckbox), [false, false, false, false, false, false],
+          "n2-2: … and 0 / empty / off / false / anything else as off");
+        assertEq([undefined, null, 1, ["0"], ["0", "1"]].map(routeMod.parseDraftCheckbox), [false, false, false, false, true],
+          "n2-3: … a non-string is off; a repeated field takes its last value");
+        const off = await postForm("/for-tilbydere/registrer/utkast", { field_booking_live: "0", field_about_text: "Vi lager vin av egne druer." }, { Cookie: sessionCookie });
+        assertEq([off.status, off.headers.location, provRow()?.booking_live], [303, "/for-tilbydere/registrer/utkast?status=saved", 0],
+          "n2-4: field_booking_live=\"0\" is read as off: a normal save, not a refused booking switch-on");
+
         // The draft session opens nothing on the ordinary owner surfaces.
-        const sessTok = sessionCookie.slice("oa_owner_session=".length);
+        const sessTok = sessionCookie.slice("oa_selfreg_draft=".length);
         assertEq(claimSvc.verifyGardssalgOwnerSessionToken(sessTok).valid, false, "ac6-48: verifyGardssalgOwnerSessionToken refuses the draft token");
+        // Even presented as oa_owner_session the draft token opens nothing.
+        const asOwner = await req("GET", `/api/opplevelser/gardssalg-claim/${createdId}/profile`, { headers: { Cookie: `oa_owner_session=${sessTok}` } });
+        assertEq(asOwner.status, 401, "n3-3: the draft token sent as oa_owner_session → 401 on the owner JSON profile route");
+        // A real owner's oa_owner_session does not open the draft editor.
+        const ownerOnly = await req("GET", "/for-tilbydere/registrer/utkast", { headers: { Cookie: `oa_owner_session=${sessTok}` } });
+        assertEq(ownerOnly.status, 401, "n3-4: the draft editor reads only oa_selfreg_draft (oa_owner_session → 401)");
         const prof = await req("GET", `/api/opplevelser/gardssalg-claim/${createdId}/profile`, { headers: { Cookie: sessionCookie } });
         assertEq(prof.status, 401, "ac6-49: the owner JSON profile route → 401 for the draft session");
         const resume = await req("POST", `/api/opplevelser/gardssalg-claim/${createdId}/resume`, { headers: { Cookie: sessionCookie } });
