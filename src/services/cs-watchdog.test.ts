@@ -237,9 +237,17 @@ export function runCsWatchdogTests(opts: { log?: boolean } = {}): Promise<TestSu
           const okSend = async () => { dCalls++; return { success: true }; };
           const d3 = await cw.tickCsWatchdog(d2, { now: new Date(dNow.getTime() + 60 * 60_000), send: okSend, env: { CS_DAILY_DIGEST_ENABLED: "1" } as any });
           ok(d3.ranDigest === true && d3.lastDigestAt !== null, "cw49: …but retried after an hour, and then recorded");
+          // The watchdog run of cw45/cw46 was persisted at `later` (real time + 2 h),
+          // so this clock must be at least 55 min past it, and at 07:30 Oslo on a
+          // later day than the cw47-cw49 digest. A fixed date broke CI on
+          // 2026-11-13 between 03:35Z and 04:30Z, when `later` fell within 55 min
+          // of it and the watchdog was not due.
+          const boomNow = new Date(later.getTime() + 3600_000);
+          boomNow.setUTCHours(6, 30, 0, 0);
+          if (boomNow.getTime() < later.getTime() + 3600_000) boomNow.setUTCDate(boomNow.getUTCDate() + 1);
           const boom = await cw.tickCsWatchdog(
             { lastWatchdogAt: null, lastDigestAt: null },
-            { now: new Date("2026-11-13T06:30:00Z"), send: okSend, env: { CS_WATCHDOG_ENABLED: "1", CS_DAILY_DIGEST_ENABLED: "1" } as any, extraItems: () => { throw new Error("boom"); } },
+            { now: boomNow, send: okSend, env: { CS_WATCHDOG_ENABLED: "1", CS_DAILY_DIGEST_ENABLED: "1" } as any, extraItems: () => { throw new Error("boom"); } },
           );
           eq([boom.ranWatchdog, boom.ranDigest], [true, true], "cw50: a watchdog that throws does not stop the digest");
           ok(!!db.prepare("SELECT 1 FROM runs WHERE agent = 'cs-watchdog' AND status = 'failed' AND errors LIKE '%boom%'").get(), "cw51: …and the failed watchdog run is in the ledger");
