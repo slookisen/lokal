@@ -26,9 +26,16 @@
  * An alcohol word in the NAME does not ban the row when the name shows it is
  * food (FOOD_HEADS): the alcohol word is the first part of a compound whose
  * last part is a food word («Rødvinspølse», «Aquavitgelé», «Konjakkpølse»),
- * or the name is exactly «<food> med/m/i <alcohol>» with nothing after the
- * alcohol word but weights/numbers («Pølse med akevitt», «Kirsebærgelé med
- * Cognac»; not «Pølse med akevitt og pils»). A drinkable food («Varm
+ * or an «<alcohol>marinert/-gravet/-røkt» participle right before a food noun
+ * with nothing after it but a weight («Cognacmarinert laks», «Akevittmarinert
+ * gravlaks»). «<food> med/m/i <alcohol>» passes only under alternative A
+ * (owner's choice D2, 2026-11-12): the name ends in a weight in g/kg right
+ * after the alcohol word and nothing else («Festpølse med akevitt 280g»,
+ * «Parisersnabb med konjakk 200g»), and no package/gift word stands in the
+ * name, the category or the description (PACKAGE: «Julegave», «Gavepakning»,
+ * «Pakketilbud», «Kombo», «Duo», «6 pk», «x6», ...). «Kirsebærgelé med
+ * Cognac» without a weight, «Pølse med øl 6 pk» and «Pølse med akevitt og
+ * pils» stay banned. A drinkable food («Varm
  * sjokolade med likør») is never the food side. The last part of a
  * compound decides: «Sjokoladelikør» is a liqueur. An alcohol word FIRST and
  * a food word after it is a flavoured drink («Likør Sjokolade», «Juleøl
@@ -101,7 +108,11 @@ const ALCOHOL_WORDS = new Set([
   "vermouth", "vermut", "cava", "pastis",
 ]);
 // Whole tokens that look like alcohol but are goods.
-const NOT_ALCOHOL_TOKENS = new Set(["rommegrot", "rommekolle", "romsaus", "vinaigrette", "vinegar", "vineddik", "vinbaer"]);
+// «Mjødurt» (meadowsweet) is a herb, not mead; «Sideretter» are side dishes, not cider.
+const NOT_ALCOHOL_TOKENS = new Set([
+  "rommegrot", "rommekolle", "romsaus", "vinaigrette", "vinegar", "vineddik", "vinbaer", "mjodurt",
+  "siderett", "sideretten", "sideretter", "siderettene",
+]);
 // Food heads (dev-request 2026-11-11-rfb-alkoholregel-bare-drikkevarer),
 // folded like the tokens (gelé→gele, syltetøy→syltetoy, pålegg→palegg,
 // paté→pate). A token is food when it IS one of these (also with a plural or
@@ -215,37 +226,94 @@ const INGREDIENT_PREPOSITIONS = new Set(["med", "m", "i"]);
 // Food words that are also drinks (hot chocolate, cocoa, coffee, tea,
 // toddy, punch): never the food side of «<food> med <alcohol>».
 const DRINKABLE_FOOD_HEADS = ["sjokolade", "kakao", "kaffe", "te", "toddy", "punsj"];
-// Tokens allowed after the alcohol word: weights, counts, numbers.
-const TRAILING_FILLER = /^(\d+([.,]\d+)?(g|gr|gram|kg|stk|pk)?|g|gr|gram|kg|stk|pk|ca)$/;
+// Alternative A: after the alcohol word of «<food> med <alcohol>» (and after
+// the food noun of a participle) there is a weight in g/kg and nothing else.
+// The tokens split «1,5kg» into «1» «5kg» and «200 g» into «200» «g».
+const WEIGHT_TAIL = /^(\d+ )?\d+ ?(g|gr|gram|kg)$/;
+function isWeightTail(tail: readonly string[]): boolean {
+  return WEIGHT_TAIL.test(tail.join(" "));
+}
+
+// «<alcohol>marinert laks», «<alcohol>gravet ørret», «<alcohol>røkt ost»: a
+// participle compound describing the food noun after it. Not «-lagret»
+// («Sherrylagret Single Malt» is whisky).
+const ALCOHOL_PARTICIPLES = [
+  "marinert", "marinerte", "gravet", "gravede", "gravlagt", "gravlagte", "rokt", "rokte", "glasert", "glaserte",
+  "syltet", "syltede", "flambert", "flamberte",
+];
+// Fish and meat nouns a participle may describe (besides FOOD_HEADS, read strictly).
+const PARTICIPLE_FOOD_NOUNS = [
+  "laks", "orret", "roye", "sild", "makrell", "torsk", "kveite", "filet", "kjott", "biff", "ribbe", "stek", "lammelar",
+  "fenalar", "svinekam", "nakke", "bryst", "kylling", "reker",
+];
+function isParticipleFoodNoun(t: string): boolean {
+  if (isFoodToken(t, true)) return true;
+  return PARTICIPLE_FOOD_NOUNS.some((h) => t === h || (h.length >= 4 && t.length > h.length + 1 && t.endsWith(h)));
+}
+function alcoholParticiple(t: string): boolean {
+  return ALCOHOL_PARTICIPLES.some((p) => t.length > p.length && t.endsWith(p) && isAlcoholPrefix(t.slice(0, t.length - p.length)));
+}
 
 /**
  * True when the alcohol hit at nameTokens[i] is an ingredient of a food:
- * a food compound itself («Rødvinspølse»), or exactly «<food> med/m/i
- * <alcohol>» with the food word right before the preposition, the alcohol
- * word right after it, and nothing after the alcohol word but weights and
- * numbers («Festpølse med akevitt 280g»; not «Pølse med akevitt og pils»,
- * not «Spekepølse med ost og akevitt»). The food word is read strictly
- * («Paradis», «Julefrokost» are not food) and never a drinkable head
- * («Varm sjokolade med likør»). An alcohol word before a food word
- * («Likør Sjokolade») is a flavoured drink, never an ingredient. The caller
- * has already ruled out drink signs, bundles and a second alcohol word.
+ * a food compound itself («Rødvinspølse»); with `noPackage` (no package or
+ * gift word in the name, category or description) also an alcohol
+ * participle before a food noun with at most a weight after it
+ * («Cognacmarinert laks», «Akevittmarinert gravlaks 300g»), or exactly
+ * «<food> med/m/i <alcohol> <weight g/kg>» with the food word right before
+ * the preposition and nothing after the alcohol word but that weight
+ * («Festpølse med akevitt 280g»; not «Pølse med akevitt», «Pølse med øl
+ * 6 pk», «Pølse med akevitt og pils», «Spekepølse med ost og akevitt»). The
+ * food word is read strictly («Paradis», «Julefrokost» are not food) and
+ * never a drinkable head («Varm sjokolade med likør»). An alcohol word
+ * before a food word («Likør Sjokolade») is a flavoured drink, never an
+ * ingredient. The caller has already ruled out drink signs, bundles and a
+ * second alcohol word.
  */
-function alcoholIsIngredient(tks: readonly string[], i: number): boolean {
+function alcoholIsIngredient(tks: readonly string[], i: number, noPackage: boolean): boolean {
   if (isFoodToken(tks[i]!)) return true;
+  if (!noPackage) return false;
+  // One food item only: no «og»/«and» list anywhere in the name.
+  if (tks.some((t) => t === "og" || t === "and" || t === "pluss")) return false;
+  if (alcoholParticiple(tks[i]!)) {
+    const noun = tks[i + 1];
+    return !!noun && !isAlcoholToken(noun) && isParticipleFoodNoun(noun) &&
+      (i + 2 === tks.length || isWeightTail(tks.slice(i + 2)));
+  }
   if (i < 2 || !INGREDIENT_PREPOSITIONS.has(tks[i - 1]!)) return false;
   const food = tks[i - 2]!;
   if (!isFoodToken(food, true) || DRINKABLE_FOOD_HEADS.some((h) => food === h || food.endsWith(h))) return false;
-  // One food item only: no «og»/«and» list before it («Kjeks og ost med portvin»).
-  if (tks.slice(0, i - 2).some((t) => t === "og" || t === "and" || t === "pluss")) return false;
-  return tks.slice(i + 1).every((t) => TRAILING_FILLER.test(t));
+  return isWeightTail(tks.slice(i + 1));
 }
 
 // Bundles and gift packs («Gavepakke», «Julekurv», «Smaksboks», «Gaver»):
 // they may hold a bottle, so the food exemption is off (fail-closed).
 const BUNDLE_HEADS = ["pakke", "kurv", "boks", "kasse", "sett", "eske", "kolli"];
 function isBundleToken(t: string): boolean {
-  if (t.startsWith("gave") || t.startsWith("smaksprove")) return true;
+  // «gave» anywhere: «Gavepakke», «Julegave», «Julegaver», «Firmagave».
+  if (t.includes("gave") || t.startsWith("gift") || t.startsWith("smaksprove")) return true;
   return BUNDLE_HEADS.some((h) => ["", "r", "er", "en", "ene", "ne"].some((e) => t.endsWith(h + e)));
+}
+
+// Alternative A, package/gift words (whole tokens, or the listed parts of a
+// compound) that close «<food> med <alcohol>» and the participle rule when
+// they stand in the name, the category or the description: bundles and
+// gifts (isBundleToken), «pakning», «pakketilbud», combos, multipacks
+// («6 pk», «6pk», «x6», «6x», «2 x 280g», «multipack»). «Vakuumpakning» is
+// how food is packed, not a package deal. Bare «sett» is a package only in
+// the name and category; in a description it is also the verb («har du
+// sett»), so there only compounds count («Gavesett», «Julesett»).
+const PACKAGE_WORDS = new Set([
+  "pk", "pkn", "pakn", "pakning", "pakninger", "pakningen", "pack", "pak", "multipack", "multipak", "sixpack",
+  "kombo", "combo", "kombinasjon", "duo", "trio", "kvartett", "bundle", "hamper", "x",
+]);
+function isPackageToken(t: string, inDescription = false): boolean {
+  if (t.startsWith("vakuum")) return false;
+  if (inDescription && t === "sett") return false;
+  if (isBundleToken(t) || PACKAGE_WORDS.has(t)) return true;
+  if (t.startsWith("pakke") || t.startsWith("kombo") || t.startsWith("combo")) return true;
+  if (/pakning(er|en|ene)?$/.test(t) || /(kombo|combo|duo|trio|pack)$/.test(t)) return true;
+  return /^\d+(pk|pkn|pak|pack|x)$/.test(t) || /^x\d+$/.test(t);
 }
 // Signs of a hot or served drink («Varm sjokolade med likør», «Serveres varm»).
 function isServedDrinkToken(t: string): boolean {
@@ -406,8 +474,12 @@ export function classifyCartItemBan(input: CartItemBanInput): CartItemBan | null
   }
 
   // ── Alcohol ─────────────────────────────────────────────────────────────
-  const alcoholCategory = categoryTokens.some((t) => isAlcoholCategoryToken(t));
-  const isBeverageCategory = categoryTokens.some((t) => t === "beverages" || t === "beverage" || t === "drikke" || t === "drikkevarer" || t === "drinks");
+  // «Rogn og rom»: «rom» next to a roe word in the category is roe, not rum.
+  const categoryHasRoe = categoryTokens.some((t) => isRoeToken(t));
+  const alcoholCategory = categoryTokens.some((t) => !(categoryHasRoe && t === "rom") && isAlcoholCategoryToken(t));
+  // Drink categories: «Drikke», «Drikker», «Drikk», «Drikkevarer», «Leskedrikker», «Varme drikker».
+  const isBeverageCategory = categoryTokens.some((t) => t === "beverages" || t === "beverage" || t === "drinks" ||
+    t.startsWith("drikk") || t.endsWith("drikk") || t.endsWith("drikke") || t.endsWith("drikker"));
   const drinkProducer = producerTypeTokens.some((t) => DRINK_PRODUCER_TYPES.has(t) || startsWithAny(t, ["bryggeri", "destilleri", "cideri", "sideri", "vingard", "mjoderi", "brenneri"]));
 
   const alcoholWordHit = (tks: string[], ingredient?: (i: number) => boolean): boolean =>
@@ -427,8 +499,12 @@ export function classifyCartItemBan(input: CartItemBanInput): CartItemBan | null
     !nameTokens.some(isBundleToken) && !categoryTokens.some(isBundleToken) &&
     !textTokens.some(isServedDrinkToken) &&
     nameTokens.filter((t) => isAlcoholToken(t)).length <= 1 &&
-    !/[,&+;]/.test(name); // a list in the name («Ost, kjeks & portvin») may hold a bottle
-  const nameAlcoholHit = alcoholWordHit(nameTokens, foodExemptionOpen ? (i) => alcoholIsIngredient(nameTokens, i) : undefined) || roseHit;
+    // a list in the name («Ost, kjeks & portvin») may hold a bottle; a decimal comma («1,5kg») is no list
+    !/[,&+;]/.test(name.replace(/(\d),(\d)/g, "$1$2"));
+  // Alternative A: no package or gift word anywhere for the «med» and participle rules.
+  const noPackage = !nameTokens.some((t) => isPackageToken(t)) && !categoryTokens.some((t) => isPackageToken(t)) &&
+    !tokens(description).some((t) => isPackageToken(t, true));
+  const nameAlcoholHit = alcoholWordHit(nameTokens, foodExemptionOpen ? (i) => alcoholIsIngredient(nameTokens, i, noPackage) : undefined) || roseHit;
   const alcoholFree = hasAlcoholFreeMarker(textTokens, raw) ||
     (!nameAlcoholHit && hasJuiceOrNoAddedAlcoholMarker(nameTokens, name));
 

@@ -797,11 +797,12 @@ export async function runOrderBestillingerSkive1Tests(opts: { log?: boolean } = 
       assertEq(c("Parisersnabb med konjakk 200g"), null, "alk-mat-03: «<food> med <alcohol>» (Parisersnabb med konjakk)");
       assertEq(c("Festpølse med akevitt 280g"), null, "alk-mat-04: «Festpølse med akevitt 280g»");
       assertEq(c("Ølpølse 280g"), null, "alk-mat-05: «Ølpølse 280g»");
-      assertEq(c("Kirsebærgelé med Cognac"), null, "alk-mat-06: «Kirsebærgelé med Cognac»");
+      // Alternative A (2026-11-12, D2): «<food> med <alcohol>» needs a weight in g/kg; was null before.
+      assertEq(c("Kirsebærgelé med Cognac"), "alcohol", "alk-mat-06: «Kirsebærgelé med Cognac» has no weight, stays banned (alternative A)");
       assertEq(c("Aquavitgelé"), null, "alk-mat-07: «Aquavitgelé»");
       assertEq(c("Konjakkpølse"), null, "alk-mat-08: «Konjakkpølse»");
-      assertEq(c("Pølse med akevitt"), null, "alk-mat-09: «Pølse med akevitt»");
-      assertEq(c("Gelé med cognac"), null, "alk-mat-10: «Gelé med cognac»");
+      assertEq(c("Pølse med akevitt"), "alcohol", "alk-mat-09: «Pølse med akevitt» has no weight (alternative A)");
+      assertEq(c("Gelé med cognac"), "alcohol", "alk-mat-10: «Gelé med cognac» has no weight (alternative A)");
       assertEq(c("Akevitt sennep"), "alcohol", "alk-mat-11: an alcohol word before a food word stays alcohol, fail-closed (Akevitt sennep)");
       assertEq(c("Whisky fudge 200 g"), "alcohol", "alk-mat-12: «Whisky fudge 200 g» stays alcohol (alcohol word first)");
       assertEq(c("Akevitt 70 cl"), "alcohol", "alk-mat-13: «Akevitt 70 cl»");
@@ -828,7 +829,8 @@ export async function runOrderBestillingerSkive1Tests(opts: { log?: boolean } = 
       assertEq(c("Cognac"), "alcohol", "alk-mat-34: «Cognac»");
       assertEq(c("Akevitt 0,7 l"), "alcohol", "alk-mat-35: «0,7 l»");
       assertEq(c("Med akevitt", "pølser"), "alcohol", "alk-mat-36: «med» needs something before it, also with a food category");
-      assertEq(c("Spekepølse med rødvin", "pålegg"), null, "alk-mat-37: food name + food category");
+      assertEq(c("Spekepølse med rødvin", "pålegg"), "alcohol", "alk-mat-37: a food category is no weight (alternative A)");
+      assertEq(c("Spekepølse med rødvin 300g", "pålegg"), null, "alk-mat-37b: food name + weight + food category");
       assertEq(c("Hvitvin Solaris"), "alcohol", "alk-mat-38: a grape name ending in «-is» is not ice cream (Hvitvin Solaris)");
       assertEq(c("Rødvin Merlot Tost"), "alcohol", "alk-mat-39: a short-head compound after the alcohol word is not a food head");
       assertEq(c("Vaniljeis med konjakk"), "alcohol", "alk-mat-40: before «med» a short-head compound is read strictly (Vaniljeis med konjakk stays alcohol)");
@@ -885,7 +887,7 @@ export async function runOrderBestillingerSkive1Tests(opts: { log?: boolean } = 
       }
       assertEq(c("Parisersnabb med konjakk 200g"), null, "alk-mat-73: weights after the alcohol word are allowed (Parisersnabb med konjakk 200g)");
       assertEq(c("Festpølse med akevitt 280g"), null, "alk-mat-74: (Festpølse med akevitt 280g)");
-      assertEq(c("Festpølse med akevitt 280 g 2 stk"), null, "alk-mat-75: (weights + counts)");
+      assertEq(c("Festpølse med akevitt 280 g 2 stk"), "alcohol", "alk-mat-75: a count after the weight is more than the weight (alternative A)");
       assertEq(c("Festpølse med akevitt 280 g, 2 stk"), "alcohol", "alk-mat-92: a comma in the name is a list, fail-closed");
       // B2: hot/served drinks built on chocolate or other drinkable heads.
       assertEq(c("Varm sjokolade med likør"), "alcohol", "alk-mat-76: «Varm sjokolade med likør»");
@@ -920,6 +922,91 @@ export async function runOrderBestillingerSkive1Tests(opts: { log?: boolean } = 
         assertEq(banSvc.isFoodToken(t), false, `alk-mat-notfood: «${t}» is not food`);
       }
       assertEq([banSvc.isFoodToken("solaris"), banSvc.isFoodToken("solaris", true), banSvc.isFoodToken("is", true), banSvc.isFoodToken("ostepolse", true)], [true, false, true, true], "alk-mat-strict: short-head compounds only count when not strict");
+      // Alternative A (dev-request 2026-11-11-rfb-alkoholregel-bare-drikkevarer, owner's choice D2 2026-11-12):
+      // «<food> med <alcohol>» passes only with a weight in g/kg right after the alcohol word and no
+      // package/gift word in the name, category or description. Compounds stay food. Default is ban.
+      // [name, category, description, expected]
+      const altA: Array<[string, string | undefined, string | undefined, "alcohol" | null]> = [
+        // Food.
+        ["Rødvinspølse", undefined, undefined, null],
+        ["Rødvinspølse 425g", undefined, undefined, null],
+        ["Parisersnabb med konjakk 200g", undefined, undefined, null],
+        ["Festpølse med akevitt 280g", undefined, undefined, null],
+        ["Festpølse med akevitt 200 g", undefined, undefined, null],
+        ["Festpølse med akevitt 1,5kg", undefined, undefined, null],
+        ["Festpølse med akevitt 1 kg", undefined, undefined, null],
+        ["Ølpølse 280g", undefined, undefined, null],
+        ["Aquavitgelé", undefined, undefined, null],
+        ["Akevittpølse", undefined, undefined, null],
+        ["Whiskykaramell", undefined, undefined, null],
+        ["Mjødurt Gelé", undefined, undefined, null],
+        ["Cognacmarinert laks", undefined, undefined, null],
+        ["Akevittmarinert gravlaks", undefined, undefined, null],
+        ["Akevittmarinert gravlaks 300g", undefined, undefined, null],
+        ["Festpølse med akevitt 280g", undefined, "Leveres i vakuumpakning", null],
+        ["Lakserogn", "Rogn og rom", undefined, null],
+        ["Potetsalat", "Sideretter", undefined, null],
+        // Drinks.
+        ["Akevitt 70 cl", undefined, undefined, "alcohol"],
+        ["Plommevin", undefined, undefined, "alcohol"],
+        ["Juleøl 0,5 l", undefined, undefined, "alcohol"],
+        ["Sjokoladelikør 50 cl", undefined, undefined, "alcohol"],
+        ["Eplesider", undefined, undefined, "alcohol"],
+        ["Gin", undefined, undefined, "alcohol"],
+        ["Mjød", undefined, undefined, "alcohol"],
+        ["Mjødurtmjød", undefined, undefined, "alcohol"],
+        ["Cider fra Den Lille Juicefabrikken", undefined, undefined, "alcohol"],
+        ["Likør Sjokolade", undefined, undefined, "alcohol"],
+        ["Juleøl Sjokolade", undefined, undefined, "alcohol"],
+        ["Varm sjokolade med likør", undefined, undefined, "alcohol"],
+        ["Sherrylagret Single Malt", undefined, undefined, "alcohol"],
+        ["Cognacmarinert laks 70 cl", undefined, undefined, "alcohol"],
+        // Drink categories («drikk…» / «…drikker»).
+        ["Festpølse med akevitt 280g", "Drikker", undefined, "alcohol"],
+        ["Rødvinspølse", "Drikk", undefined, "alcohol"],
+        ["Rødvinspølse", "Leskedrikker", undefined, "alcohol"],
+        ["Rødvinspølse", "Varme drikker", undefined, "alcohol"],
+        // Package and gift words in the name, category or description.
+        ["Julegave spekepølse med akevitt", undefined, undefined, "alcohol"],
+        ["Julegave spekepølse med akevitt 280g", undefined, undefined, "alcohol"],
+        ["Gavepakke spekepølse med akevitt", undefined, undefined, "alcohol"],
+        ["Gavepakke spekepølse med akevitt 280g", undefined, undefined, "alcohol"],
+        ["Spekepølse med akevitt 280g", "Julegaver", undefined, "alcohol"],
+        ["Pakketilbud pølse med akevitt 280g", undefined, undefined, "alcohol"],
+        ["Kombo pølse med akevitt 280g", undefined, undefined, "alcohol"],
+        ["Duo: pølse med akevitt 280g", undefined, undefined, "alcohol"],
+        ["Trio pølse med akevitt 280g", undefined, undefined, "alcohol"],
+        ["Pølsesett med akevitt 280g", undefined, undefined, "alcohol"],
+        ["Pølse med akevitt 280g", "Sett", undefined, "alcohol"],
+        ["Pølse med akevitt 280g", "Pakker", undefined, "alcohol"],
+        ["Pølse med øl 6 pk", undefined, undefined, "alcohol"],
+        ["Pølse med akevitt 280g 6-pk", undefined, undefined, "alcohol"],
+        ["Pølse med akevitt 280g x6", undefined, undefined, "alcohol"],
+        ["Pølse med akevitt 6x280g", undefined, undefined, "alcohol"],
+        ["2 x Pølse med akevitt 280g", undefined, undefined, "alcohol"],
+        ["Festpølse med akevitt 280g", undefined, "Selges i 6 pk", "alcohol"],
+        ["Festpølse med akevitt 280g", undefined, "Fin julegave", "alcohol"],
+        ["Ost med portvin 200g", undefined, "Gavepakke med ost og portvin", "alcohol"],
+        ["Akevittmarinert gravlaks", undefined, "Gavepakning", "alcohol"],
+        // Nothing but the weight after the alcohol word.
+        ["Pølse med akevitt og pils", undefined, undefined, "alcohol"],
+        ["Pølse med akevitt og pils 280g", undefined, undefined, "alcohol"],
+        ["Festpølse med akevitt ekstra 280g", undefined, undefined, "alcohol"],
+        ["Akevittmarinert gravlaks og pils", undefined, undefined, "alcohol"],
+        // Consequences of alternative A: no weight, or a gift word → banned until the producer gives a weight.
+        ["Kirsebærgelé med Cognac", undefined, undefined, "alcohol"],
+        ["Tyttebærsirup med cognac", undefined, undefined, "alcohol"],
+        ["Granskuddsirup med aquavit", undefined, undefined, "alcohol"],
+        ["Gavepakning med Rognebærsirup og Tyttebærsaus m/cognac", undefined, undefined, "alcohol"],
+        // A comma makes it a list, and the participle stands after the noun: banned.
+        ["Kvita Salatost, whiskyrøkt", undefined, undefined, "alcohol"],
+      ];
+      const importRules = require("../services/product-import/rules") as typeof import("../services/product-import/rules");
+      for (const [n, cat, d, want] of altA) {
+        assertEq(c(n, cat, [], d), want, `alk-a: «${n}»${cat ? ` (category «${cat}»)` : ""}${d ? ` / «${d}»` : ""} → ${want ?? "food"}`);
+        // Parity: the product import (name + category, no description) uses the same rule.
+        assertEq(importRules.gateVerdict(n, cat ?? null), c(n, cat), `alk-a-parity: gateVerdict agrees with classifyCartItemBan on «${n}»${cat ? ` (category «${cat}»)` : ""}`);
+      }
       delete process.env.ORDER_BUYER_RECEIPTS_ENABLED;
     }
 
