@@ -199,6 +199,7 @@ function escapeHtml(text: string): string {
 import { safeMetaDescription, TRAILING_REPLACEMENT_CHAR_REGEX } from "../utils/meta-description";
 export { safeMetaDescription, TRAILING_REPLACEMENT_CHAR_REGEX };
 import { formatAddressLine } from "../utils/address-format";
+import { isOwnerSessionSlidingEnabled, ownerSessionIdleDays, ownerSessionMaxDays } from "../services/owner-session-sliding";
 export { formatAddressLine };
 // dev-request 2026-07-25-reisesok…, Fase 2c — the /reise corridor page.
 import { corridorSearch, DEFAULT_MAX_DETOUR_KM } from "../services/route-corridor-service";
@@ -3359,6 +3360,17 @@ router.get("/personvern", (req: Request, res: Response) => {
   // payment lifecycle is on — otherwise the page is exactly as before.
   const pp = isPaymentsLifecycleActive() ? renderPrepaymentPrivacy(lang) : null;
   const rc = isBuyerReceiptsEnabled();
+  // OWNER_SESSION_SLIDING_ENABLED (dev-request 2026-11-09-rfb-eierokt-fornyes-
+  // ved-bruk): the sign-in cookie sentence in Daniel's approved wording
+  // (2026-11-09), numbers from the same settings as the session code. Off →
+  // the sentence exactly as before.
+  const sliding = isOwnerSessionSlidingEnabled();
+  const loginCookieEn = sliding
+    ? `a sign-in session cookie for sellers who verify a magic link (httpOnly, expires after ${ownerSessionIdleDays()} days without use and after ${ownerSessionMaxDays()} days at the latest) or a farm-shop ownership claim (httpOnly, expires after 7 days)`
+    : `a sign-in session cookie for sellers who verify a magic link or a farm-shop ownership claim (httpOnly, expires after 7 days)`;
+  const loginCookieNb = sliding
+    ? `en innloggings-cookie for selgere som verifiserer en magisk lenke (httpOnly, utløper etter ${ownerSessionIdleDays()} dager uten bruk og senest etter ${ownerSessionMaxDays()} dager) eller et gårdssalg-eierskapskrav (httpOnly, utløper etter 7 dager)`
+    : `en innloggings-cookie for selgere som verifiserer en magisk lenke eller et gårdssalg-eierskapskrav (httpOnly, utløper etter 7 dager)`;
   const content = en ? `
   <section class="pv-hero">
     <h1>Privacy</h1>
@@ -3386,7 +3398,7 @@ router.get("/personvern", (req: Request, res: Response) => {
     <h3>Visits from AI answers and contact clicks</h3>
     <p>Links to producer pages that we give AI assistants such as ChatGPT and Claude carry a marker (for example <code>utm_source=claude&amp;utm_campaign=ai_search</code>). The marker only says which AI service the link was given to — it contains nothing about you. Together with the referrer it lets us count visits that came from an AI answer. These visits are summed per day, page and AI service, without the IP hash or any other link to the visitor, and the totals are shown on the producer pages.</p>
     <p>When you click a contact button on a producer page (email, phone, website or social media), we count the click: which producer, which button, the time, which source the visit came from (for example an AI answer) and the visit ID. The visit ID contains the same salted, truncated hash of your IP address as the page visits (never the full IP address). Unlike the page visits, contact clicks are not deleted automatically today. Producers see the number of clicks in their dashboard.</p>
-    <p>We use only a small number of essential cookies: a sign-in session cookie for sellers who verify a magic link or a farm-shop ownership claim (httpOnly, expires after 7 days), and one or two cookies that remember your language choice — a cookie set when you use the language switcher (expires after 1 year), and a session-only cookie the server may set when you follow a language-specific link (cleared when you close your browser). We set no third-party analytics, advertising or tracking cookies such as Google Analytics — all analysis happens in our own database.</p>
+    <p>We use only a small number of essential cookies: ${loginCookieEn}, and one or two cookies that remember your language choice — a cookie set when you use the language switcher (expires after 1 year), and a session-only cookie the server may set when you follow a language-specific link (cleared when you close your browser). We set no third-party analytics, advertising or tracking cookies such as Google Analytics — all analysis happens in our own database.</p>
 
     <h3>Search and AI queries</h3>
     <p>When you search for producers \u2014 via the website, ChatGPT, Claude MCP or the API \u2014 we store:</p>
@@ -3564,7 +3576,7 @@ ${pp ? `        ${pp.legalBasisRow}\n` : ""}      </tbody>
     <h3>Besøk fra AI-svar og kontakt-klikk</h3>
     <p>Lenker til produsentsider som vi gir AI-assistenter som ChatGPT og Claude, har et merke (for eksempel <code>utm_source=claude&amp;utm_campaign=ai_search</code>). Merket sier bare hvilken AI-tjeneste lenken ble gitt til — det inneholder ingenting om deg. Sammen med referanse-URL-en lar det oss telle besøk som kom fra et AI-svar. Disse besøkene summeres per dag, side og AI-tjeneste, uten IP-hash eller annen kobling til den besøkende, og summene vises på produsentsidene.</p>
     <p>Når du klikker på en kontaktknapp på en produsentside (e-post, telefon, nettside eller sosiale medier), teller vi klikket: hvilken produsent, hvilken knapp, tidspunktet, hvilken kilde besøket kom fra (for eksempel et AI-svar) og besøks-ID-en. Besøks-ID-en inneholder den samme saltede, forkortede hashen av IP-adressen din som sidebesøkene (aldri hele IP-adressen). Til forskjell fra sidebesøkene slettes kontakt-klikk ikke automatisk i dag. Produsentene ser antallet klikk i oversikten sin.</p>
-    <p>Vi bruker kun et fåtall nødvendige (essensielle) informasjonskapsler: en innloggings-cookie for selgere som verifiserer en magisk lenke eller et gårdssalg-eierskapskrav (httpOnly, utløper etter 7 dager), og én eller to cookies som husker språkvalget ditt — en cookie som settes når du bruker språkvelgeren (utløper etter 1 år), og en økt-cookie (session-cookie) som serveren kan sette når du følger en språkspesifikk lenke (slettes når du lukker nettleseren). Vi bruker ingen tredjeparts analyse-, annonse- eller sporingscookies som Google Analytics — all analyse skjer i vår egen database.</p>
+    <p>Vi bruker kun et fåtall nødvendige (essensielle) informasjonskapsler: ${loginCookieNb}, og én eller to cookies som husker språkvalget ditt — en cookie som settes når du bruker språkvelgeren (utløper etter 1 år), og en økt-cookie (session-cookie) som serveren kan sette når du følger en språkspesifikk lenke (slettes når du lukker nettleseren). Vi bruker ingen tredjeparts analyse-, annonse- eller sporingscookies som Google Analytics — all analyse skjer i vår egen database.</p>
 
     <h3>Søk og AI-spørringer</h3>
     <p>Når du søker etter produsenter \u2014 enten via nettsiden, ChatGPT, Claude MCP eller API-et \u2014 lagrer vi:</p>

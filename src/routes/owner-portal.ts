@@ -25,6 +25,14 @@ import { customerRuleSql } from "../services/customer-rule";
 import { getSupplyGraphHardStaleDays, getSupplyGraphStaleDays } from "../services/supply-graph";
 import { stockSoftExpiryActiveFor } from "../services/stock-soft-expiry";
 import { writeOrderNotificationsOptInWithAudit } from "../services/order-opt-in";
+import {
+  OWNER_SESSION_FIXED_MS,
+  isOwnerSessionSlidingEnabled,
+  isSlidingOwnerSessionRowId,
+  newOwnerSessionLifetimeMs,
+  parseOwnerSessionTime,
+  renewOwnerSessionOnUse,
+} from "../services/owner-session-sliding";
 import { ownerFeatureAccess } from "../owner-features/feature-tiers";
 import { betaCardHtml } from "../owner-features/beta-card";
 import { ownerBetaMode } from "../owner-features/beta-mode";
@@ -328,6 +336,32 @@ router.get("/magic-link-verify", (req: Request, res: Response) => {
         return res.redirect(302, "/?error=invalid_token");
       }
       openOwnerSession(res, agentId, String(magicLink.email || ""));
+    } else if (isOwnerSessionSlidingEnabled() && isSlidingOwnerSessionRowId(magicLink.id)) {
+      // OWNER_SESSION_SLIDING_ENABLED (dev-request 2026-11-09-rfb-eierokt-
+      // fornyes-ved-bruk): the first use starts the session — used_at = now,
+      // expires_at = now + the new-session lifetime (30 days, capped). A link
+      // that is already used keeps its used_at (the 90-day cap's start) and
+      // only gets the usual renewal, so clicking the mail again never resets
+      // the cap. Only "ml_"/"mlsess_" rows (the allowlist); a /selger uuid
+      // row or a bridge row ("mlbridge_") keeps today's branch below: it is
+      // never lengthened.
+      const lifetimeMs = newOwnerSessionLifetimeMs();
+      const nowMs = Date.now();
+      const first = db.prepare(
+        `UPDATE magic_links SET used = 1, used_at = datetime('now'), expires_at = ? WHERE token = ? AND used = 0`
+      ).run(new Date(nowMs + lifetimeMs).toISOString(), token);
+      let cookieMaxAgeMs = lifetimeMs;
+      if (first.changes === 0) {
+        const row = db.prepare(
+          `SELECT id, token, used_at, created_at, expires_at FROM magic_links
+            WHERE token = ? AND used = 1 AND ${OWNER_TOKEN_NOT_EXPIRED_SQL}`
+        ).get(token) as any;
+        if (!row) return res.redirect(302, "/?error=invalid_token");
+        const renewed = renewOwnerSessionOnUse(db, row, nowMs);
+        cookieMaxAgeMs = (renewed ?? parseOwnerSessionTime(row.expires_at)) - nowMs;
+        if (!(cookieMaxAgeMs > 0)) return res.redirect(302, "/?error=invalid_token");
+      }
+      setOwnerSessionCookie(res, token, cookieMaxAgeMs);
     } else {
       // 2. Mark as used
       db.prepare(
@@ -413,6 +447,28 @@ function isClaimApprovalLinkId(id: unknown): boolean {
   return String(id || "").startsWith(OWNER_CLAIM_LINK_ID_PREFIX);
 }
 
+/**
+ * OWNER_SESSION_SLIDING_ENABLED: renew the session row just accepted (see
+ * services/owner-session-sliding.ts). A cookie session gets its cookie re-set
+ * with maxAge = the time to the new expiry, on the request's own response
+ * (Express sets req.res); a Bearer session only gets the row. Never throws —
+ * a failed renewal leaves the session exactly as it was.
+ */
+function renewAcceptedOwnerSession(req: Request, link: any, token: string, viaCookie: boolean): void {
+  if (!isOwnerSessionSlidingEnabled()) return;
+  try {
+    const nowMs = Date.now();
+    const next = renewOwnerSessionOnUse(getDb(), { ...link, token }, nowMs);
+    if (next === null || !viaCookie) return;
+    const res = (req as any).res as Response | undefined;
+    if (res && !res.headersSent && typeof res.cookie === "function") {
+      setOwnerSessionCookie(res, token, next - nowMs);
+    }
+  } catch (err) {
+    console.error("[owner-portal] owner session renewal failed:", err instanceof Error ? err.message : "error");
+  }
+}
+
 export function verifyOwnerSession(req: Request): { valid: boolean; agentId?: string; token?: string } {
   // Try cookie first
   const cookieToken = readSessionCookie(req);
@@ -420,11 +476,12 @@ export function verifyOwnerSession(req: Request): { valid: boolean; agentId?: st
     const db = getDb();
     const link = db
       .prepare(
-        `SELECT id, agent_id FROM magic_links
+        `SELECT id, agent_id, used_at, created_at, expires_at FROM magic_links
          WHERE token = ? AND used = 1 AND ${OWNER_TOKEN_NOT_EXPIRED_SQL}`
       )
       .get(cookieToken) as any;
     if (link && !isClaimApprovalLinkId(link.id)) {
+      renewAcceptedOwnerSession(req, link, cookieToken, true);
       return { valid: true, agentId: link.agent_id, token: cookieToken };
     }
   }
@@ -436,11 +493,12 @@ export function verifyOwnerSession(req: Request): { valid: boolean; agentId?: st
     const db = getDb();
     const link = db
       .prepare(
-        `SELECT id, agent_id FROM magic_links
+        `SELECT id, agent_id, used_at, created_at, expires_at FROM magic_links
          WHERE token = ? AND used = 1 AND ${OWNER_TOKEN_NOT_EXPIRED_SQL}`
       )
       .get(token) as any;
     if (link && !isClaimApprovalLinkId(link.id)) {
+      renewAcceptedOwnerSession(req, link, token, false);
       return { valid: true, agentId: link.agent_id, token };
     }
   }
@@ -550,30 +608,35 @@ function ownerForbiddenJson(agentId: unknown, session: { valid: boolean; agentId
 // Kept out of the request-magic-link rate limit (that limit counts e-mails).
 const OWNER_SESSION_ID_PREFIX = "mlsess_";
 const OWNER_BRIDGE_ID_PREFIX = "mlbridge_";
-const OWNER_SESSION_VALID_MS = MAGIC_LINK_VALID_HOURS * 60 * 60 * 1000;
+// The fixed 7 days (flag off) live in services/owner-session-sliding.ts.
+const OWNER_SESSION_VALID_MS = OWNER_SESSION_FIXED_MS;
 const OWNER_BRIDGE_VALID_MS = 15 * 60 * 1000; // same as knowledge-service createMagicLink
 
-function setOwnerSessionCookie(res: Response, token: string): void {
+function setOwnerSessionCookie(res: Response, token: string, maxAgeMs: number = OWNER_SESSION_VALID_MS): void {
   res.cookie("rfb_owner_session", token, {
     path: "/",
-    maxAge: OWNER_SESSION_VALID_MS,
+    maxAge: maxAgeMs,
     httpOnly: true,
     secure: true,
     sameSite: "lax",
   });
 }
 
-/** A fresh /eier session (magic_links row, used = 1, ISO timestamps, 7 days) + its cookie. */
+/**
+ * A fresh /eier session (magic_links row, used = 1, ISO timestamps) + its
+ * cookie. 7 days; with OWNER_SESSION_SLIDING_ENABLED 30 days (capped).
+ */
 function openOwnerSession(res: Response, agentId: string, email: string): void {
   const token = crypto.randomBytes(32).toString("hex");
   const now = new Date();
-  const expiresAt = new Date(now.getTime() + OWNER_SESSION_VALID_MS);
+  const lifetimeMs = newOwnerSessionLifetimeMs();
+  const expiresAt = new Date(now.getTime() + lifetimeMs);
   getDb().prepare(
     `INSERT INTO magic_links (id, email, token, agent_id, used, used_at, created_at, expires_at)
      VALUES (?, ?, ?, ?, 1, ?, ?, ?)`
   ).run(`${OWNER_SESSION_ID_PREFIX}${crypto.randomBytes(8).toString("hex")}`, email, token, agentId,
     now.toISOString(), now.toISOString(), expiresAt.toISOString());
-  setOwnerSessionCookie(res, token);
+  setOwnerSessionCookie(res, token, lifetimeMs);
 }
 
 /**

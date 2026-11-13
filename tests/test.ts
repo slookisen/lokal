@@ -54368,3 +54368,24 @@ runSerial(async () => {
     failures.push("beta-card: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-11-09-rfb-eierokt-fornyes-ved-bruk: the RFB owner session
+// renewed by use (OWNER_SESSION_SLIDING_ENABLED, default off) — fake-clock
+// AC1 cases, flag-off byte-identity and the /personvern sentence. Pins getDb()
+// to its own in-memory DB, runs an in-process server, swaps OWNER_SESSION_* /
+// OWNER_* env (all restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── eierøkt fornyes ved bruk: 30 dager uten bruk, tak 90, flagg av = som før ──");
+  try {
+    const { runOwnerSessionSlidingTests } = require("../src/routes/owner-session-sliding.test") as
+      typeof import("../src/routes/owner-session-sliding.test");
+    const r = await runOwnerSessionSlidingTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-session-sliding: " + f);
+    console.log(`  owner-session-sliding: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-session-sliding: unexpected error: " + String(err?.message || err));
+  }
+});
