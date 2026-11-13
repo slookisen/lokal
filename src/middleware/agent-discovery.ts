@@ -147,7 +147,7 @@ vegetables, meat, fish, dairy, honey, bread, and more — all farm-direct.
 | \`discover-local-food-agents\` | Search ${count}+ producers by category, region, certification |
 | \`register-food-agent\` | Onboard a new farm, shop, or cooperative |
 | \`search-compare-food\` | Natural-language search; compare delivery options, certifications |
-| \`agent-conversation\` | Open a buyer–seller negotiation channel |
+| \`producer-profile-answer\` | Automated third-person answer from a producer's public profile, marked «Automatisk svar fra Rett fra Bonden» |
 
 ## Coverage
 
@@ -159,7 +159,7 @@ vegetables, meat, fish, dairy, honey, bread, and more — all farm-direct.
 ## Authentication
 
 - Read operations (search, discover, get): **open**, no auth required
-- Write operations (register, negotiate): **API key** via \`X-API-Key\` header
+- Write operations (register): **API key** via \`X-API-Key\` header
 - Obtain a key: \`POST ${BASE_URL}/api/marketplace/register\`
 
 ## Documentation
@@ -202,7 +202,7 @@ sorted by who paid the most for placement.
 
 1. Producers register as agents (with an A2A Agent Card)
 2. Consumer agents discover via MCP, A2A JSON-RPC, or REST
-3. Match, negotiate, and transact directly — no intermediary markup
+3. Match and contact producers directly — no intermediary markup
 
 ## For developers
 

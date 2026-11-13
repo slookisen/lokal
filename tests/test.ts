@@ -531,7 +531,8 @@ function fanoutConv(o: {
 }
 
 // (a) N one-shot conversations for the SAME query+session collapse to ONE card
-// with a "N produsenter svarte" header (N = distinct producers).
+// with a "N produsenter funnet" header (N = distinct producers; «svarte» until
+// 2026-11-13 — the producers do not answer, the platform does).
 {
   const fanout = [
     fanoutConv({ id: "c1", query: "honning bergen", sellerId: "s1", sellerName: "Birøkter A", reply: "Hei fra Birøkter A! 👋", taskId: "task-XYZ" }),
@@ -545,9 +546,9 @@ function fanoutConv(o: {
   assertEq(groups.length, 1, "group: 6-producer fan-out for one query+session → ONE card");
   assertEq(groups[0]!.conversations.length, 6, "group: all 6 distinct producers kept inside the card");
   assertEq(groups[0]!.queryText, "honning bergen", "group: card carries the query text");
-  // The rendered header is `${count} produsenter svarte`; prove the count is 6.
-  assertEq(`${groups[0]!.conversations.length} produsenter svarte`, "6 produsenter svarte",
-    "group: header renders «honning bergen» → 6 produsenter svarte");
+  // The rendered header is `${count} produsenter funnet`; prove the count is 6.
+  assertEq(`${groups[0]!.conversations.length} produsenter funnet`, "6 produsenter funnet",
+    "group: header renders «honning bergen» → 6 produsenter funnet");
 }
 
 // (b) Different queries stay in separate cards.
@@ -708,7 +709,9 @@ const ITEM5_REPLY = [
   };
   const html = renderTranscriptBody(conv);
   const qIdx = html.indexOf("honning fra bergen");
-  const replyIdx = html.indexOf("Hei fra Kjells Gård");
+  // The stored reply (written in the producer's name before 2026-11-13) is
+  // shown in the third person (thirdPersonAutoReply).
+  const replyIdx = html.indexOf("Ifølge profilen til Kjells Gård");
   assertTrue(qIdx >= 0, "transcript: question text rendered");
   assertTrue(replyIdx >= 0, "transcript: producer reply rendered");
   assertTrue(qIdx < replyIdx, "transcript: question bubble comes BEFORE the producer reply (timeline)");
@@ -726,7 +729,8 @@ const ITEM5_REPLY = [
   assertTrue(bubbleSlice.slice(0, cardIdx - replyIdx).indexOf("Se profilen") === -1,
     "transcript: profile-link boilerplate NOT inside the reply bubble");
   // Slice-1 honesty preserved.
-  assertTrue(html.includes("automatisk svar fra profilen"), "transcript: auto-reply tag preserved on producer bubble");
+  assertTrue(html.includes(">Automatisk svar fra Rett fra Bonden</span>"), "transcript: auto-reply tag preserved on producer bubble («Automatisk svar fra Rett fra Bonden»)");
+  assertTrue(!html.includes("Hei fra Kjells Gård") && !html.includes("Ta gjerne kontakt"), "transcript: the stored first-person lines are shown in the third person");
   assertTrue(!html.includes("Forhandling"), "transcript: no fabricated 'Forhandling' label");
 }
 
@@ -35628,8 +35632,8 @@ const _samtalerSeoPromise: Promise<void> = new Promise<void>(r => { _samtalerSeo
       "seo6: grouped query text is present in raw server-rendered HTML");
     assertTrue(list.body.includes("Bergen Honninggård"),
       "seo6: producer name is present in raw server-rendered HTML");
-    assertTrue(/Hei fra Bergen Honninggård/.test(list.body),
-      "seo6: producer auto-reply snippet is present in raw server-rendered HTML (not client-injected)");
+    assertTrue(/Automatisk svar fra Rett fra Bonden\.\nIfølge profilen til Bergen Honninggård/.test(list.body),
+      "seo6: producer auto-reply snippet is present in raw server-rendered HTML (not client-injected; third person, marked)");
 
     // ?kilde= filter variants must canonicalize to the bare /samtaler —
     // never register as duplicate content.
@@ -48911,6 +48915,15 @@ runSerial(async () => {
     failed += asg.failed;
     for (const f of asg.failures) failures.push("a2a-spam-guard: " + f);
     console.log(`  a2a-spam-guard: ${asg.passed} passed, ${asg.failed} failed`);
+
+    // dev-request 2026-11-06-rfb-svar-til-kjoperagenter-tredje-person.
+    const { runRfbTredjepersonSvarTests } = require("../src/routes/rfb-tredjeperson-svar.test") as
+      typeof import("../src/routes/rfb-tredjeperson-svar.test");
+    const tps = await runRfbTredjepersonSvarTests({ log: false });
+    passed += tps.passed;
+    failed += tps.failed;
+    for (const f of tps.failures) failures.push("rfb-tredjeperson-svar: " + f);
+    console.log(`  rfb-tredjeperson-svar: ${tps.passed} passed, ${tps.failed} failed`);
 
     const { runAdminConversationsTrafficClassTests } = require("../src/routes/admin-conversations-traffic-class.test") as
       typeof import("../src/routes/admin-conversations-traffic-class.test");
