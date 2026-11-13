@@ -17,8 +17,10 @@
 //
 // What remains (untouched, code removal is a later case):
 //   - the order_activation_links table (src/database/init.ts),
-//   - the service src/services/order-activation-link.ts (still used by the
-//     revocation branch in routes/marketplace.ts and its own tests),
+//   - the service src/services/order-activation-link.ts (no live callers any
+//     more; kept until the later code-removal case),
+//   - the activation_link revocation branch in routes/marketplace.ts
+//     (reset-claim, inline SQL — does not use the service),
 //   - a new read-only usage endpoint for observability:
 //       GET /admin/orders/activation-link/usage  (admin router)
 //     returns row/claim counts; no writes.
@@ -93,6 +95,12 @@ orderActivationAdminRouter.post("/activation-link", (req: Request, res: Response
 
 const router = Router();
 
+function escapeHtml(text: unknown): string {
+  return String(text ?? "").replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" } as Record<string, string>
+  )[c]);
+}
+
 const PAGE_CSS = `
   *{box-sizing:border-box}
   body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f7f7f2;color:#1f2a14;line-height:1.5}
@@ -115,7 +123,7 @@ function shell(title: string, body: string): string {
   <meta name="robots" content="noindex,nofollow">
   <meta name="referrer" content="no-referrer">
   <link rel="icon" href="/favicon-192.png" sizes="192x192" type="image/png">
-  <title>${title} — Rett fra Bonden</title>
+  <title>${escapeHtml(title)} — Rett fra Bonden</title>
   <style>${PAGE_CSS}</style>
 </head>
 <body>

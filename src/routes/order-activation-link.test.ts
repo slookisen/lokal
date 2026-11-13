@@ -14,6 +14,8 @@
  *            key (with and without secret), never creates a link.
  *   admin    GET  /admin/orders/activation-link/usage → 401 without key,
  *            correct counts with key.
+ *   reset    POST /api/marketplace/admin/agents/:id/reset-claim still clears
+ *            an activation_link claim (kept revocation branch).
  *
  * Standalone: npx tsx src/routes/order-activation-link.test.ts
  * Wired into `npm test` by tests/test.ts.
@@ -75,6 +77,10 @@ export async function runOrderActivationLinkTests(opts: { log?: boolean } = {}):
     const insKnow = db.prepare("INSERT INTO agent_knowledge (agent_id, verification_status, email) VALUES (?, 'verified', ?)");
     insAgent.run("ag-ny", "Ny <Gård> & Sønn", "ny@example.no", "k1");
     insKnow.run("ag-ny", "ny@example.no");
+    insAgent.run("ag-prefilled", "Forhåndsutfylt Gård", "pre@example.no", "k8");
+    insKnow.run("ag-prefilled", "pre@example.no");
+    // Control for reset-claim: an earlier, non-activation claim stamp.
+    db.prepare("UPDATE agents SET claimed_at = '2025-05-05T05:05:05.000Z', claimed_via = 'admin_approval' WHERE id = 'ag-prefilled'").run();
 
     const agentRow = (id: string) => db.prepare(
       "SELECT is_verified, claimed_at, claimed_via, order_notifications_opt_in FROM agents WHERE id = ?"
@@ -89,10 +95,12 @@ export async function runOrderActivationLinkTests(opts: { log?: boolean } = {}):
     {
       const express = require("express");
       const act = require("./order-activation-link") as typeof import("./order-activation-link");
+      const marketplace = require("./marketplace").default;
       const app = express();
       app.use(express.json());
       app.use("/", act.default);
       app.use("/admin/orders", act.orderActivationAdminRouter);
+      app.use("/api/marketplace", marketplace);
       server = http.createServer(app);
       await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", () => resolve()));
     }
@@ -230,6 +238,20 @@ export async function runOrderActivationLinkTests(opts: { log?: boolean } = {}):
       db.prepare("UPDATE order_activation_links SET used_at = '2026-02-02T00:00:00.000Z' WHERE agent_id = 'ag-ny'").run();
       const u2 = await req("GET", "/admin/orders/activation-link/usage", { headers: admin });
       assertEq(u2.body?.redeemed_links, 1, "usage-06: redeemed_links reflects a consumed link");
+    }
+
+    // ── reset-claim still revokes an activation_link claim ────────────────
+    // The revocation branch in routes/marketplace.ts is kept; its claim is
+    // seeded directly (the public redeem route is retired).
+    {
+      db.prepare("UPDATE agents SET is_verified = 1, claimed_at = '2026-03-03T03:03:03.000Z', claimed_via = 'activation_link' WHERE id = 'ag-ny'").run();
+      const rc = await req("POST", "/api/marketplace/admin/agents/ag-ny/reset-claim", { headers: admin });
+      assertEq(rc.status, 200, "reset-01: reset-claim → 200");
+      const r = agentRow("ag-ny");
+      assertEq([r.is_verified, r.claimed_at, r.claimed_via], [0, null, null], "reset-02: activation_link claim cleared");
+      await req("POST", "/api/marketplace/admin/agents/ag-prefilled/reset-claim", { headers: admin });
+      const p = agentRow("ag-prefilled");
+      assertEq([p.is_verified, p.claimed_at, p.claimed_via], [0, "2025-05-05T05:05:05.000Z", "admin_approval"], "reset-03: other claim stamps unchanged (as before)");
     }
 
     // ── Usage with no links table → zeros, not 500 ─────────────────────────
