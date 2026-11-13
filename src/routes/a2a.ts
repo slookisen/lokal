@@ -28,6 +28,7 @@ import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { recordA2aDelivery } from "../services/profile-ai-deliveries";
 import { aiProfileLinksJson } from "../middleware/ai-profile-links";
 import { agentCardProvider } from "../services/company-legal";
+import { rfbAgentCardFaqLinks } from "./rfb-for-produsenter";
 import { isPaymentsEnabled } from "../services/payment-service";
 import { a2aMessageData, capA2aData } from "../utils/a2a-message";
 import { capFreeText } from "../utils/free-text";
@@ -856,6 +857,10 @@ function serveAgentCard(_req: Request, res: Response) {
       llms: `${BASE_URL}/llms.txt`,
       openapi: `${BASE_URL}/openapi.json`,
     },
+    // A2A dev-request 2026-11-06-faq-fra-forsiden-begge-plattformer: the FAQ
+    // pages, only while FOR_PRODUSENTER_PAGE_ENABLED is on (no key when off,
+    // so the card is unchanged).
+    ...rfbAgentCardFaqLinks(BASE_URL),
   };
 
   // JWS card signing (dev-request 2026-07-13-a2a-card-v1-signing slice 2) —

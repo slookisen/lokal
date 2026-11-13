@@ -49,7 +49,10 @@ import { textEntries } from "../utils/text-entries";
 import { serializeJsonForScript } from "../services/safe-script-json";
 import { getConfig } from "../config/vertical-config";
 import { renderKjopsvilkarContent, KJOPSVILKAR_PATH } from "./rfb-kjopsvilkar";
-import { renderForProdusenterPage, FOR_PRODUSENTER_PATH, FOR_PRODUSENTER_CSS, isForProdusenterPageEnabled, forProdusenterSitemapPaths, forProducersNavHref } from "./rfb-for-produsenter";
+import { renderForProdusenterPage, FOR_PRODUSENTER_PATH, FOR_PRODUSENTER_CSS, isForProdusenterPageEnabled, forProdusenterSitemapPaths, forProducersNavHref, buildForProdusenterFaqLd } from "./rfb-for-produsenter";
+// A2A dev-request 2026-11-06-faq-fra-forsiden-begge-plattformer: «Spørsmål og
+// svar» on the front page + menu/footer link, behind FOR_PRODUSENTER_PAGE_ENABLED.
+import { FRONT_PAGE_FAQ_ANCHOR, FRONT_PAGE_FAQ_LABELS, RFB_FRONT_FAQ_QUESTIONS, RFB_FRONT_FAQ_CSS, pickFaqPairs, renderFrontPageFaqColumns } from "./front-page-faq";
 import { renderProdusentvilkarContent } from "./rfb-produsentvilkar";
 import { PRODUSENTVILKAR_PATH } from "../config/producer-terms";
 import { generalLimiter } from "../middleware/security";
@@ -792,6 +795,71 @@ export const NAV_MENU_JS = `<script>
   })();
   </script>`;
 
+// ─── «Spørsmål og svar» on the front page ───────────────────
+// A2A dev-request 2026-11-06-faq-fra-forsiden-begge-plattformer. Behind
+// FOR_PRODUSENTER_PAGE_ENABLED: with the flag off every helper returns "",
+// so the front page, header and footer are byte-identical to before. The Q/A
+// are picked from the FAQPage objects the FAQ pages themselves render
+// (/for-produsenter and /guide-mat-ai), never retyped (front-page-faq.ts).
+
+function rfbFrontFaqHref(lang: Lang): string {
+  return `${localizedPath("/", lang)}#${FRONT_PAGE_FAQ_ANCHOR}`;
+}
+
+function rfbFrontFaqLabels(lang: Lang) {
+  return lang === "en" ? FRONT_PAGE_FAQ_LABELS.rfb.en : FRONT_PAGE_FAQ_LABELS.rfb.no;
+}
+
+/** Header link to the front-page block; "" while the flag is off. */
+export function rfbFrontFaqNavLink(lang: Lang): string {
+  if (!isForProdusenterPageEnabled()) return "";
+  return `\n      <a href="${rfbFrontFaqHref(lang)}">${escapeHtml(rfbFrontFaqLabels(lang).nav)}</a>`;
+}
+
+/** Footer link to the front-page block; "" while the flag is off. */
+export function rfbFrontFaqFooterLink(lang: Lang): string {
+  if (!isForProdusenterPageEnabled()) return "";
+  return `<a href="${rfbFrontFaqHref(lang)}">${escapeHtml(rfbFrontFaqLabels(lang).nav)}</a>`;
+}
+
+/** The two front-page columns, each read from its FAQ page's own FAQPage object. Exported for tests. */
+export function rfbFrontPageFaqColumns(lang: Lang) {
+  const L = rfbFrontFaqLabels(lang);
+  const en = lang === "en";
+  const producersUrl = `${BASE_URL}${localizedPath(FOR_PRODUSENTER_PATH, lang)}`;
+  const buyersUrl = `${BASE_URL}${localizedPath("/guide-mat-ai", lang)}`;
+  const producerPairs = faqPairsFromJsonLd(buildForProdusenterFaqLd(lang, producersUrl));
+  const buyerPairs = faqPairsFromJsonLd(buildMcpGuideFaqJsonLd(lang, buyersUrl));
+  return [
+    {
+      id: "kjopere",
+      title: L.buyers,
+      pairs: pickFaqPairs(buyerPairs, en ? RFB_FRONT_FAQ_QUESTIONS.buyers.en : RFB_FRONT_FAQ_QUESTIONS.buyers.no),
+      moreHref: localizedPath("/guide-mat-ai", lang),
+      moreLabel: L.moreBuyers,
+    },
+    {
+      id: "produsenter",
+      title: L.producers,
+      pairs: pickFaqPairs(producerPairs, en ? RFB_FRONT_FAQ_QUESTIONS.producers.en : RFB_FRONT_FAQ_QUESTIONS.producers.no),
+      moreHref: localizedPath(FOR_PRODUSENTER_PATH, lang),
+      moreLabel: L.moreProducers,
+    },
+  ];
+}
+
+/** The front-page block; "" while FOR_PRODUSENTER_PAGE_ENABLED is off. Exported for tests. */
+export function renderRfbFrontPageFaq(lang: Lang): string {
+  if (!isForProdusenterPageEnabled()) return "";
+  const L = rfbFrontFaqLabels(lang);
+  return `<section class="sec fq-sec" id="${FRONT_PAGE_FAQ_ANCHOR}" aria-labelledby="fq-title">
+      <div class="sh">
+        <h2 class="sh-title" id="fq-title">${escapeHtml(L.heading)}</h2>
+      </div>
+      ${renderFrontPageFaqColumns(rfbFrontPageFaqColumns(lang))}
+    </section>`;
+}
+
 // ─── Page shell ─────────────────────────────────────────────
 
 export function shell(
@@ -937,7 +1005,7 @@ export function shell(
       <a href="/samtaler">${escapeHtml(t(lang, "nav.conversations"))}</a>
       <a href="${localizedPath("/sok", lang)}">${escapeHtml(t(lang, "nav.search"))}</a>
       <a href="${localizedPath("/teknologi", lang)}">${escapeHtml(t(lang, "nav.how_it_works"))}</a>
-      <a href="${localizedPath("/om", lang)}">${escapeHtml(t(lang, "nav.about"))}</a>
+      <a href="${localizedPath("/om", lang)}">${escapeHtml(t(lang, "nav.about"))}</a>${rfbFrontFaqNavLink(lang)}
       ${langSwitcher}
       <a href="${forProducersNavHref(lang)}" class="nav-cta">${escapeHtml(t(lang, "nav.for_producers"))}</a>
     </div>
@@ -951,7 +1019,7 @@ export function shell(
       </div>
       <div class="ft-col">
         <h4>${escapeHtml(t(lang, "footer.platform"))}</h4>
-        <a href="${localizedPath("/sok", lang)}">${escapeHtml(t(lang, "footer.search_producers"))}</a><a href="${localizedPath("/reise", lang)}">${lang === "en" ? "Along your route" : "Langs ruten"}</a><a href="${localizedPath("/kategori", lang)}">${lang === "en" ? "Sales channels" : "Salgskanaler"}</a><a href="${localizedPath("/teknologi", lang)}">${escapeHtml(t(lang, "footer.how_it_works"))}</a><a href="${localizedPath("/om", lang)}">${escapeHtml(t(lang, "footer.about_link"))}</a><a href="${localizedPath("/personvern", lang)}">${escapeHtml(t(lang, "footer.privacy"))}</a><a href="${localizedPath(KJOPSVILKAR_PATH, lang)}">${escapeHtml(t(lang, "footer.terms_of_purchase"))}</a><a href="${localizedPath("/kontakt", lang)}">${lang === "en" ? "Contact us" : "Kontakt oss"}</a>
+        <a href="${localizedPath("/sok", lang)}">${escapeHtml(t(lang, "footer.search_producers"))}</a><a href="${localizedPath("/reise", lang)}">${lang === "en" ? "Along your route" : "Langs ruten"}</a><a href="${localizedPath("/kategori", lang)}">${lang === "en" ? "Sales channels" : "Salgskanaler"}</a><a href="${localizedPath("/teknologi", lang)}">${escapeHtml(t(lang, "footer.how_it_works"))}</a><a href="${localizedPath("/om", lang)}">${escapeHtml(t(lang, "footer.about_link"))}</a><a href="${localizedPath("/personvern", lang)}">${escapeHtml(t(lang, "footer.privacy"))}</a><a href="${localizedPath(KJOPSVILKAR_PATH, lang)}">${escapeHtml(t(lang, "footer.terms_of_purchase"))}</a><a href="${localizedPath("/kontakt", lang)}">${lang === "en" ? "Contact us" : "Kontakt oss"}</a>${rfbFrontFaqFooterLink(lang)}
       </div>
       <div class="ft-col">
         <h4>${escapeHtml(t(lang, "footer.for_producers"))}</h4>
@@ -1749,6 +1817,10 @@ router.get("/", (req: Request, res: Response) => {
         </div>`;
     }).join("\n");
 
+    // «Spørsmål og svar» (dev-request 2026-11-06-faq-fra-forsiden-begge-plattformer):
+    // "" while FOR_PRODUSENTER_PAGE_ENABLED is off, so the page is unchanged.
+    const frontFaqHtml = renderRfbFrontPageFaq(lang);
+
     const content = `
     <section class="hero">
       <div class="hero-inner">
@@ -1860,7 +1932,7 @@ ${umbrellaSectionHtml}
         <div class="how-step"><div class="how-num">2</div><h3>${escapeHtml(t(lang, "home.how_step2_title"))}</h3><p>${escapeHtml(t(lang, "home.how_step2_body"))}</p></div>
         <div class="how-step"><div class="how-num">3</div><h3>${escapeHtml(t(lang, "home.how_step3_title"))}</h3><p>${escapeHtml(t(lang, "home.how_step3_body"))}</p></div>
       </div>
-    </section>
+    </section>${frontFaqHtml ? `\n\n    ${frontFaqHtml}` : ""}
 
     <section class="seller-cta">
       <h2>${escapeHtml(t(lang, "home.seller_cta_title"))}</h2>
@@ -1892,7 +1964,7 @@ ${umbrellaSectionHtml}
       t(lang, "home.title"),
       t(lang, "home.description", { count: totalAgents }),
       content,
-      { canonical: BASE_URL + (lang === "en" ? "/en" : ""), jsonLd: [jsonLd, orgJsonLd], extraCss: LANDING_CSS, lang, pathForAlternate: "/" }
+      { canonical: BASE_URL + (lang === "en" ? "/en" : ""), jsonLd: [jsonLd, orgJsonLd], extraCss: frontFaqHtml ? LANDING_CSS + RFB_FRONT_FAQ_CSS : LANDING_CSS, lang, pathForAlternate: "/" }
     ));
   } catch (err) {
     console.error("SEO / error:", err);
@@ -3690,13 +3762,27 @@ router.get(BETALING_PATH, (req: Request, res: Response, next: any) => {
 // GET /for-produsenter (+ /en/for-produsenter via the language prefix
 // middleware) — «Slik fungerer Rett fra Bonden for produsenter» (A2A
 // dev-request 2026-10-22-rfb-for-produsenter-faq-side, F1). Behind
-// FOR_PRODUSENTER_PAGE_ENABLED (default off => next(), i.e. the normal 404
-// through the reserved slug in /:city; not in the sitemap; the header
-// «For produsenter» keeps pointing at /selger). Content and the facts it must
+// FOR_PRODUSENTER_PAGE_ENABLED (default off => the site's 404 page, see
+// below; not in the sitemap; the header «For produsenter» keeps pointing at
+// /selger). Content and the facts it must
 // stay true to live in rfb-for-produsenter.ts.
-router.get(FOR_PRODUSENTER_PATH, (req: Request, res: Response, next: any) => {
-  if (!isForProdusenterPageEnabled()) return next();
+router.get(FOR_PRODUSENTER_PATH, (req: Request, res: Response) => {
   const lang = req.lang;
+  // Flag off: the site's own 404 page (noindex, self-canonical), not
+  // Express's raw «Cannot GET» (dev-request 2026-11-06-faq-fra-forsiden-
+  // begge-plattformer, AC3). Nothing about the page is revealed.
+  if (!isForProdusenterPageEnabled()) {
+    const en = lang === "en";
+    return res.status(404).send(shell(
+      en ? "Page not found" : "Fant ikke siden",
+      en ? "The page does not exist." : "Siden finnes ikke.",
+      `<div class="sec" style="text-align:center;padding:80px 24px;">
+          <h1 style="font-size:1.8rem;margin-bottom:12px;">${en ? "Page not found" : "Fant ikke siden"}</h1>
+          <p style="color:var(--g500);"><a href="${localizedPath("/", lang)}">${escapeHtml(t(lang, "nav.back_home"))}</a></p>
+        </div>`,
+      { robots: "noindex, follow", lang, canonical: `${BASE_URL}${localizedPath(FOR_PRODUSENTER_PATH, lang)}` },
+    ));
+  }
   const canonical = `${BASE_URL}${localizedPath(FOR_PRODUSENTER_PATH, lang)}`;
   const page = renderForProdusenterPage(lang, canonical);
   res.send(shell(page.title, page.description, page.content,

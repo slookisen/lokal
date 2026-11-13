@@ -298,6 +298,10 @@ import {
   FOR_TILBYDERE_FAQ_META,
   type ForTilbydereSection,
 } from "./experiences-for-tilbydere-faq";
+// A2A dev-request 2026-11-06-faq-fra-forsiden-begge-plattformer: «Spørsmål og
+// svar» on the front page + menu/footer/llms.txt links, behind the same
+// FOR_TILBYDERE_FAQ_ENABLED. Q/A picked from the FAQ pages' FAQPage objects.
+import { FRONT_PAGE_FAQ_ANCHOR, FRONT_PAGE_FAQ_LABELS, OA_FRONT_FAQ_QUESTIONS, OA_FRONT_FAQ_CSS, pickFaqPairs, renderFrontPageFaqColumns } from "./front-page-faq";
 import { createGardssalgSelfRegisterRouter, GARDSSALG_SELF_REGISTER_PATH } from "./gardssalg-self-register";
 import { isGardssalgSelfRegisterEnabled } from "../services/gardssalg-self-register";
 import { faqPairsFromJsonLd, type FaqPair } from "../services/faq-section";
@@ -535,6 +539,56 @@ function oaProfileLabels(lang: Lang) {
   return no;
 }
 
+// ─── «Spørsmål og svar» on the front page ───────────────────────────────────
+// A2A dev-request 2026-11-06-faq-fra-forsiden-begge-plattformer. Behind
+// FOR_TILBYDERE_FAQ_ENABLED; with the flag off every helper returns "", so
+// the front page, header, footer and llms.txt are byte-identical to before.
+// Norwegian only, like /for-tilbydere and /slik-fungerer-det: an EN/SV page
+// would otherwise link to Norwegian-only text (same honesty rule as the footer).
+
+function oaFrontFaqOn(lang: Lang): boolean {
+  return lang === "no" && isForTilbydereFaqEnabled();
+}
+
+/** Header link to the front-page block; "" while off or not Norwegian. */
+export function oaFrontFaqNavLink(lang: Lang): string {
+  if (!oaFrontFaqOn(lang)) return "";
+  return `
+      <a href="/#${FRONT_PAGE_FAQ_ANCHOR}">${escapeHtml(FRONT_PAGE_FAQ_LABELS.oa.nav)}</a>`;
+}
+
+/** Footer link to the front-page block; "" while off or not Norwegian. */
+export function oaFrontFaqFooterLink(lang: Lang): string {
+  if (!oaFrontFaqOn(lang)) return "";
+  return `
+      <a href="/#${FRONT_PAGE_FAQ_ANCHOR}">${escapeHtml(FRONT_PAGE_FAQ_LABELS.oa.nav)}</a>`;
+}
+
+/** The two front-page columns, each read from its FAQ page's own FAQPage object. Exported for tests. */
+export function oaFrontPageFaqColumns() {
+  const url = baseUrl();
+  const L = FRONT_PAGE_FAQ_LABELS.oa;
+  const guestPairs = faqPairsFromJsonLd(buildOpplevagentMcpGuideFaqJsonLd("no", `${url}/guide-opplevelser-mcp`));
+  const providerPairs = faqPairsFromJsonLd(buildForTilbydereFaqLd(`${url}/for-tilbydere`));
+  return [
+    { id: "gjester", title: L.guests, pairs: pickFaqPairs(guestPairs, OA_FRONT_FAQ_QUESTIONS.guests), moreHref: "/guide-opplevelser-mcp", moreLabel: L.moreGuests },
+    { id: "tilbydere", title: L.providers, pairs: pickFaqPairs(providerPairs, OA_FRONT_FAQ_QUESTIONS.providers), moreHref: "/for-tilbydere#sporsmal", moreLabel: L.moreProviders },
+  ];
+}
+
+/** The front-page block; "" while FOR_TILBYDERE_FAQ_ENABLED is off or the page is not Norwegian. Exported for tests. */
+export function renderOaFrontPageFaq(lang: Lang): string {
+  if (!oaFrontFaqOn(lang)) return "";
+  return `<section class="section" id="${FRONT_PAGE_FAQ_ANCHOR}" aria-labelledby="fq-title">
+    <div class="container">
+      <div class="sec-head center">
+        <h2 id="fq-title">${escapeHtml(FRONT_PAGE_FAQ_LABELS.oa.heading)}</h2>
+      </div>
+      ${renderFrontPageFaqColumns(oaFrontPageFaqColumns())}
+    </div>
+  </section>`;
+}
+
 function oaSiteNav(opts: { active?: OaNavActive; lang?: Lang; path?: string; switcher?: boolean } = {}): string {
   const lang: Lang = opts.lang === "en" || opts.lang === "sv" ? opts.lang : "no";
   const S = homeStrings(lang);
@@ -570,7 +624,7 @@ function oaSiteNav(opts: { active?: OaNavActive; lang?: Lang; path?: string; swi
       <a href="/opplevelser"${cur("opplevelser")}>${S.navAll}</a>
       <a href="${langPrefix}#kategorier"${cur("kategorier")}>${S.navCategories}</a>
       <a href="/kategori/gardssalg"${cur("gardssalg")}>${navGardssalg}</a>
-      <a href="/for-tilbydere"${cur("tilbydere")}>${S.navProviders}</a>${langToggle}
+      <a href="/for-tilbydere"${cur("tilbydere")}>${S.navProviders}</a>${oaFrontFaqNavLink(lang)}${langToggle}
       <a class="nav-cta" href="/opplevelser">${S.navExplore}</a>
     </nav>
   </div>
@@ -599,7 +653,7 @@ function oaSiteFooter(opts: { lang?: Lang } = {}): string {
       <a href="/opplevelser">${S.navAll}</a>
       <a href="${langPrefix}#kategorier">${S.navCategories}</a>
       <a href="${langPrefix}#slik-funker-det">${S.navHow}</a>
-      <a href="/for-tilbydere">${S.navProviders}</a>
+      <a href="/for-tilbydere">${S.navProviders}</a>${oaFrontFaqFooterLink(lang)}
       <!-- dev-request 2026-08-08-opplevagent-slik-fungerer-det: the producer-
            facing explainer the outreach email points at. NO-only for now —
            the page itself is Norwegian, so an EN footer link would promise a
@@ -2266,6 +2320,9 @@ ${yearItemsHtml}
     },
   ];
   const ldScripts = jsonLd.map((ld) => jsonLdScriptTag(ld)).join("\n");
+  // «Spørsmål og svar» (dev-request 2026-11-06-faq-fra-forsiden-begge-plattformer):
+  // "" while FOR_TILBYDERE_FAQ_ENABLED is off, so the page is unchanged.
+  const oaFrontFaqHtml = renderOaFrontPageFaq(lang);
 
   const desc = S.metaDesc;
   // E2-S3: the default PNG card (it was the square app icon, favicon.svg).
@@ -2494,7 +2551,7 @@ ${ldScripts}
      loft-kategorimotiver): discreet line-drawn backdrop for the #kategorier
      section ONLY — never the hero, which keeps its own untouched illustrated
      scene above. */
-  ${stillSketchCss("hjem")}
+  ${stillSketchCss("hjem")}${oaFrontFaqHtml ? OA_FRONT_FAQ_CSS : ""}
 </style>
 </head>
 <body>
@@ -2637,7 +2694,7 @@ ${oaSiteNav({ active: "hjem", lang, switcher: isOpplevagentLangSwitcherEnabled()
         </div>
       </div>
     </div>
-  </section>
+  </section>${oaFrontFaqHtml ? `\n\n  ${oaFrontFaqHtml}` : ""}
 
   <section class="section" id="for-agenter" aria-labelledby="agent-title">
     <div class="container">
@@ -3008,6 +3065,19 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
 // GET /llms.txt
 // ═══════════════════════════════════════════════════════════
 
+// A2A dev-request 2026-11-06-faq-fra-forsiden-begge-plattformer: links to the
+// FAQ pages while FOR_TILBYDERE_FAQ_ENABLED is on; "" while it is off, so
+// llms.txt is byte-identical. Exported for tests.
+export function oaFaqLlmsSection(url: string): string {
+  if (!isForTilbydereFaqEnabled()) return "";
+  return `## Spørsmål og svar
+
+- ${url}/#${FRONT_PAGE_FAQ_ANCHOR} — spørsmål og svar for gjester og tilbydere på forsiden
+- ${url}/for-tilbydere#sporsmal — spørsmål og svar for tilbydere
+
+`;
+}
+
 router.get("/llms.txt", (_req: Request, res: Response) => {
   const url = baseUrl();
   // ONE catalog number (services/honest-count.ts): published experiences — the same
@@ -3190,7 +3260,7 @@ bookingstatus (se discover_gardssalgs \`booking.live\`) avvises med en
 tydelig melding, aldri en stille feil. Ingen betaling — pickup/oppmøte, som
 i dag.
 
-## Lisens
+${oaFaqLlmsSection(url)}## Lisens
 
 Provider-data verifiseres mot Brønnøysundregistrene (CC0). Innhold gjengis
 som faktaoppsummering med kildehenvisning.

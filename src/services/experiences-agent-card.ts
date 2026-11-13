@@ -15,6 +15,8 @@ import { signAgentCard } from "./agent-card-signing";
 import { registeredMcpTools } from "./mcp-tool-manifest";
 import { agentCardProvider } from "./company-legal";
 import { distributionFor, OPPLEVAGENT_CUSTOM_GPT_URL } from "../config/distribution-channels";
+import { isForTilbydereFaqEnabled } from "../routes/experiences-for-tilbydere-faq";
+import { FRONT_PAGE_FAQ_ANCHOR } from "../routes/front-page-faq";
 
 const OPPLEVAGENT_BASE_URL =
   process.env.OPPLEVAGENT_BASE_URL || "https://opplevagent.no";
@@ -178,6 +180,12 @@ export function getExperiencesAgentCard(honestCount?: number | null): object {
     "x-mcp-tools": registeredMcpTools("experiences").map((t) => t.name),
     // Channels come from config/distribution-channels.ts (one source, each with a probe URL).
     "x-distribution": distributionFor("experiences", `${url}/.well-known/agent-card.json`),
+    // A2A dev-request 2026-11-06-faq-fra-forsiden-begge-plattformer: the FAQ
+    // pages, only while FOR_TILBYDERE_FAQ_ENABLED is on (no key when off, so
+    // the card is unchanged).
+    ...(isForTilbydereFaqEnabled()
+      ? { "x-faq": { frontPage: `${url}/#${FRONT_PAGE_FAQ_ANCHOR}`, providers: `${url}/for-tilbydere#sporsmal` } }
+      : {}),
   };
   // JWS card signing (dev-request 2026-07-13-a2a-card-v1-signing slice 2) —
   // sign the card exactly as assembled above (no `signatures` key present

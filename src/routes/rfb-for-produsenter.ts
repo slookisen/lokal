@@ -62,6 +62,7 @@ import { OWNER_FEATURE_REGISTRY, ownerFeatureEntryForEnv, ownerFeatureStatus, ty
 import { OWNER_LEVELS } from "../owner-features/changes";
 import { ownerOrderLimitLines, type OrderLimitsConfig } from "../owner-features/order-texts";
 import { currentForProdusenterFacts, type ForProdusenterFacts, type PilotFeatureKey, type PilotState } from "../owner-features/today-facts";
+import { FRONT_PAGE_FAQ_ANCHOR } from "./front-page-faq";
 
 // F2a: the facts module lives in owner-features/today-facts.ts; re-exported
 // so existing callers (tests, rfb-owner-refresh) keep importing it from here.
@@ -83,6 +84,17 @@ export function forProdusenterSitemapPaths(env: NodeJS.ProcessEnv = process.env)
 /** Header «For produsenter» target: /selger (as before) while the flag is off. */
 export function forProducersNavHref(lang: Lang, env: NodeJS.ProcessEnv = process.env): string {
   return isForProdusenterPageEnabled(env) ? localizedPath(FOR_PRODUSENTER_PATH, lang) : "/selger";
+}
+
+/**
+ * Agent-card links to the FAQ pages (A2A dev-request 2026-11-06-faq-fra-
+ * forsiden-begge-plattformer): {} while the flag is off, so the card is
+ * unchanged; on: `x-faq` with the front-page block and this page.
+ */
+export function rfbAgentCardFaqLinks(baseUrl: string, env: NodeJS.ProcessEnv = process.env): { "x-faq"?: { frontPage: string; producers: string } } {
+  if (!isForProdusenterPageEnabled(env)) return {};
+  const base = baseUrl.replace(/\/$/, "");
+  return { "x-faq": { frontPage: `${base}/#${FRONT_PAGE_FAQ_ANCHOR}`, producers: `${base}${FOR_PRODUSENTER_PATH}` } };
 }
 
 /** The anchors, in menu order. Used by «Les mer» links later — never rename after publishing. */

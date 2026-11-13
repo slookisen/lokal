@@ -50324,6 +50324,29 @@ runSerial(async () => {
   }
 });
 
+// «Spørsmål og svar» on the front pages (A2A dev-request
+// 2026-11-06-faq-fra-forsiden-begge-plattformer): flags off = front pages,
+// menus, footers, llms.txt and agent cards byte-identical (and equal to the
+// flag-on page minus the additions); flags on = block + menu + footer links on
+// both platforms; Q/A picked from the FAQ pages' own FAQPage objects (AC2);
+// /for-produsenter flag off = the site's 404 page (AC3). Calls the handlers
+// directly; restores both flags in finally — tail position.
+runSerial(async () => {
+  console.log("\n── Spørsmål og svar fra forsiden (rettfrabonden.com + opplevagent.no) ──");
+  try {
+    const { runFrontPageFaqTests } = require("../src/routes/front-page-faq.test") as
+      typeof import("../src/routes/front-page-faq.test");
+    const r = await runFrontPageFaqTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("front-page-faq: " + f);
+    console.log(`  front-page-faq: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("front-page-faq: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // «For produsenter» F2a (A2A dev-request 2026-10-22-rfb-for-produsenter-faq-side,
 // «Endringer fra Daniel 08.11»): the facts module owner-features/today-facts.ts,
 // the three states for_alle / i_pilot / planlagt checked against the code's own
