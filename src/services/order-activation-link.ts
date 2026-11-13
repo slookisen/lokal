@@ -37,6 +37,7 @@
 
 import crypto from "crypto";
 import { getDb } from "../database/init";
+import { newOwnerSessionLifetimeMs } from "./owner-session-sliding";
 
 export const ORDER_ACTIVATION_SECRET_ENV = "ORDER_ACTIVATION_LINK_SECRET";
 export const ORDER_ACTIVATION_SECRET_MIN_LENGTH = 32;
@@ -44,8 +45,8 @@ export const ORDER_ACTIVATION_VALID_DAYS = 14;
 export const ORDER_ACTIVATION_PATH = "/aktiver-bestillinger";
 export const ORDER_ACTIVATION_BASE_URL = "https://rettfrabonden.com";
 export const ORDER_ACTIVATION_CLAIMED_VIA = "activation_link";
-/** Same lifetime as an e-mailed owner magic link (owner-portal MAGIC_LINK_VALID_HOURS). */
-export const OWNER_SESSION_VALID_MS = 7 * 24 * 60 * 60 * 1000;
+// Session lifetime: the shared owner-session helper (7 days; 30 days capped
+// with OWNER_SESSION_SLIDING_ENABLED) — services/owner-session-sliding.ts.
 const OWNER_SESSION_ID_PREFIX = "mlsess_";
 
 const TOKEN_VERSION = "v1";
@@ -287,7 +288,7 @@ export function redeemActivationLink(
       `INSERT INTO magic_links (id, email, token, agent_id, used, used_at, created_at, expires_at)
        VALUES (?, ?, ?, ?, 1, ?, ?, ?)`
     ).run(sessionId, ctx.address, sessionToken, ctx.agent_id, nowIso, nowIso,
-      new Date(now.getTime() + OWNER_SESSION_VALID_MS).toISOString());
+      new Date(now.getTime() + newOwnerSessionLifetimeMs()).toISOString());
 
     db.prepare(
       "UPDATE order_activation_links SET used_outcome = ?, session_link_id = ? WHERE id = ?"
