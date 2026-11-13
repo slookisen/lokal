@@ -44,6 +44,7 @@ import {
   isStreetAddressPreferredSource,
   canCorrectRoadOnlyAddress,
 } from "../services/street-address-parse";
+import { ADMIN_CORRECTED, adminCorrectedAddressBlocks } from "../services/admin-corrected-address";
 import { randomUUID } from "crypto";
 import {
   isJunkDescription, looksLikeCodeArtifact, hasInternalNote, looksLikeThemeSpam,
@@ -2758,6 +2759,19 @@ router.put("/agents/:id/knowledge", async (req: Request, res: Response) => {
       logOrganicStripped("PUT /agents/:id/knowledge", agentId, og.stripped);
     }
   }
+  // dev-request 2026-11-08-rfb-adresse-skriveveier-respekterer-admin-retting:
+  // ADMIN lane only (the owner lanes always pass). An address a person
+  // corrected with POST /admin/agents/content-correction is not replaced by a
+  // different value; it is dropped from the body, the rest is written as
+  // before, and the response carries address_rejected_reason. `dataSource:
+  // "owner"` on the shared admin key is not the owner (same rule as below).
+  let addressRejectedReason: string | undefined;
+  if (isAdmin && body.address !== undefined && body.address !== null && adminCorrectedAddressBlocks(getDb(), agentId, body.address)) {
+    addressRejectedReason = ADMIN_CORRECTED;
+    console.log(`[knowledge PUT] admin address write REFUSED for agent ${agentId} — ${ADMIN_CORRECTED}; not written`);
+    const { address: _droppedAddress, ...restBody } = body;
+    body = restBody;
+  }
   let phoneWrite: PhoneWriteVerdict | undefined;
   let phoneBefore: string | null = null;
   if (isAdmin && typeof body.phone === "string") {
@@ -2788,6 +2802,7 @@ router.put("/agents/:id/knowledge", async (req: Request, res: Response) => {
           error: "phone_not_substantiated",
           phone_write: phoneWrite,
           phone_rejected_reason: phoneWrite.outcome,
+          ...(addressRejectedReason ? { address_rejected_reason: addressRejectedReason } : {}),
         });
         return;
       }
@@ -2844,6 +2859,8 @@ router.put("/agents/:id/knowledge", async (req: Request, res: Response) => {
       // W40 write guards: present only on an admin call that carried `phone`.
       ...(phoneWrite ? { phone_write: phoneWrite } : {}),
       ...(phoneWrite && !phoneWrite.allowed ? { phone_rejected_reason: phoneWrite.outcome } : {}),
+      // Present only when an admin-corrected address was left alone ("admin_corrected").
+      ...(addressRejectedReason ? { address_rejected_reason: addressRejectedReason } : {}),
     });
   } catch (err: any) {
     res.status(400).json({ success: false, error: err.message });
@@ -4113,8 +4130,16 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
                   isCurated: curatedAddr,
                 })
               ) {
-                writeAddr = true;
-                addressCorrected = true;
+                // dev-request 2026-11-08-rfb-adresse-skriveveier-respekterer-
+                // admin-retting: never over an address a person corrected
+                // with content-correction (the empty-column fill above is
+                // unchanged — an empty column is never admin-corrected).
+                if (adminCorrectedAddressBlocks(db, agentId, gAddrRaw)) {
+                  addressSkippedReason = ADMIN_CORRECTED;
+                } else {
+                  writeAddr = true;
+                  addressCorrected = true;
+                }
               }
             }
 
@@ -8598,7 +8623,7 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
     // was replaced by a newly extracted guarded value under low_quality mode
     // (see processAgent's write transaction below); absent/false for every
     // other outcome, including the pre-existing fill-if-empty path.
-    | { agentId: string; status: "enriched"; fieldsFound: string[]; provenanceWritten: boolean; emailReplaced?: boolean; addressCorrected?: boolean }
+    | { agentId: string; status: "enriched"; fieldsFound: string[]; provenanceWritten: boolean; emailReplaced?: boolean; addressCorrected?: boolean; addressAdminCorrected?: boolean }
     | { agentId: string; status: "no_data" }
     | { agentId: string; status: "ownership_unverified" }
     | { agentId: string; status: "fetch_error"; error: string }
@@ -8924,6 +8949,7 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
     let curatedFieldsCache: ReturnType<typeof knowledgeService.getCuratedFields> | null = null;
     let emailReplaced = false;
     let addressCorrected = false;
+    let addressAdminCorrected = false;
 
     // dev-request 2026-09-01-rfb-pending-verify-unpark-lever (Daniel Alternativ B,
     // write-site (g)): mirrors write-site (f)'s already-fixed provenanceChanged
@@ -8975,11 +9001,18 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
             isCurated: !!curatedFieldsCache["address"],
           })
         ) {
-          sets.push("address = ?");
-          params.push(extractedAddress);
-          columnWritten = true;
-          addressCorrected = true;
-          invalidateAgentGeocode(db, agentId);
+          // dev-request 2026-11-08-rfb-adresse-skriveveier-respekterer-admin-
+          // retting: never over an address a person corrected with
+          // content-correction (provenance is still merged as before).
+          if (adminCorrectedAddressBlocks(db, agentId, extractedAddress)) {
+            addressAdminCorrected = true;
+          } else {
+            sets.push("address = ?");
+            params.push(extractedAddress);
+            columnWritten = true;
+            addressCorrected = true;
+            invalidateAgentGeocode(db, agentId);
+          }
         }
       }
       // orch-pr-<N> (2026-07-05): mirrors the phone/address backfill above.
@@ -9064,6 +9097,8 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       ...(emailReplaced ? { emailReplaced: true } : {}),
       // W40 write guards: a road-designation-only address was corrected.
       ...(addressCorrected ? { addressCorrected: true } : {}),
+      // Admin-corrected address left alone (see processAgent's write block).
+      ...(addressAdminCorrected ? { addressAdminCorrected: true } : {}),
     };
   }
 
@@ -9134,6 +9169,12 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
     .filter((o): o is Extract<AgentOutcome, { status: "enriched" }> => o.status === "enriched" && !!(o as any).addressCorrected)
     .map((o) => o.agentId);
 
+  // dev-request 2026-11-08-rfb-adresse-skriveveier-respekterer-admin-retting:
+  // agents whose admin-corrected address was left alone this run.
+  const addressAdminCorrectedIds = outcomes
+    .filter((o): o is Extract<AgentOutcome, { status: "enriched" }> => o.status === "enriched" && !!o.addressAdminCorrected)
+    .map((o) => o.agentId);
+
   const byField: Record<string, number> = {};
   for (const o of outcomes) {
     if (o.status === "enriched") {
@@ -9157,6 +9198,8 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       email_replaced: emailReplaced,
       address_corrected: addressCorrectedIds.length,
       address_corrected_ids: addressCorrectedIds,
+      // Additive: present only when an admin-corrected address was left alone.
+      ...(addressAdminCorrectedIds.length ? { address_skipped_admin_corrected_ids: addressAdminCorrectedIds, address_skipped_reason: ADMIN_CORRECTED } : {}),
       by_field: byField,
       errors,
       // Agents that crossed the 3-failure parking threshold during this run

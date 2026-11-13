@@ -53630,6 +53630,29 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-08-rfb-adresse-skriveveier-respekterer-admin-retting:
+// automatic address write paths (PUT /admin/knowledge with/without
+// allow_correct, PUT /agents/:id/knowledge admin lane, Brreg backfill,
+// Places batch, homepage batch) leave an admin-corrected address alone.
+// Global DB handle, ADMIN_KEY, GOOGLE_PLACES_API_KEY, ANTHROPIC_API_KEY,
+// global fetch and the Places address switch are swapped and restored in
+// finally — runSerial.
+runSerial(async () => {
+  console.log("\n── admin-corrected address guard ──");
+  try {
+    const { runAdminCorrectedAddressGuardTests } = require("../src/routes/admin-corrected-address-guard.test") as
+      typeof import("../src/routes/admin-corrected-address-guard.test");
+    const r = await runAdminCorrectedAddressGuardTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-corrected-address-guard: " + f);
+    console.log(`  admin-corrected-address-guard: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-corrected-address-guard: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // POST /admin/rfb-website-discovery + the review queue, approve and judge
 // routes (incl. dev-request 2026-10-31 S2: a real judge AVVIS closes the row
 // as 'rejected', an infrastructure failure keeps it 'pending', and a rejection
