@@ -23,12 +23,12 @@ import {
   getSelfRegisterDraftProfile,
   SELF_REGISTER_CONFIRM_VALID_HOURS,
   SELF_REGISTER_DRAFT_SESSION_HOURS,
+  SELF_REGISTER_DRAFT_COOKIE,
+  SELF_REGISTER_DRAFT_COOKIE_PATH,
+  notifyAdminSelfRegisterConfirmed,
   type SelfRegisterDraftProfile,
 } from "../services/gardssalg-self-register";
-import {
-  GARDSSALG_OWNER_SESSION_COOKIE,
-  updateClaimedProviderProfile,
-} from "../services/gardssalg-claim";
+import { updateClaimedProviderProfile } from "../services/gardssalg-claim";
 import { OWNER_BOOKING_PENDING_REVIEW_MSG } from "../services/gardssalg-booking-gate";
 import { emailService } from "../services/email-service";
 
@@ -58,10 +58,18 @@ import { emailService } from "../services/email-service";
 // Skive 2 adds, under the same flag gate: the e-mail code sent after a
 // "created" outcome, the confirm page (GET .../bekreft renders a button and
 // changes nothing; POST .../bekreft confirms and issues the draft-mode
-// oa_owner_session), and the draft editor (GET/POST .../utkast) for the
+// session), and the draft editor (GET/POST .../utkast) for the
 // hidden row. Both POSTs run the same shared same-origin write guard as the
 // form above (Origin: null from a plain form under no-referrer is allowed).
-// Nothing is published from here (skive 3 approves). The pages are
+// Nothing is published from here (skive 3 approves, through the admin queue
+// in routes/opplevelser.ts).
+//
+// Skive 3 (review N3 of lokal#1534): the draft session has its own cookie,
+// oa_selfreg_draft, Path=/for-tilbydere/registrer — no longer the real
+// owner's oa_owner_session, so confirming a registration never logs a real
+// owner out, and the ordinary owner routes (which read oa_owner_session
+// only) never receive it. The draft token is still refused there anyway.
+// The confirm POST also sends the admin notice (once). The pages are
 // noindex,nofollow and the path prefix is Disallow'd in robots.txt
 // (GARDSSALG_ROBOTS_DISALLOWS, experiences-seo.ts).
 
@@ -426,8 +434,9 @@ export function createGardssalgSelfRegisterRouter(render: SelfRegisterPageRender
     <p>${msg} Skriv til <a href="mailto:${SELF_REGISTER_CONTACT}">${SELF_REGISTER_CONTACT}</a>, så hjelper vi deg.</p>
   </div>`));
       }
-      res.cookie(GARDSSALG_OWNER_SESSION_COOKIE, result.sessionToken, {
-        path: "/",
+      notifyAdminSelfRegisterConfirmed(result.registrationId);
+      res.cookie(SELF_REGISTER_DRAFT_COOKIE, result.sessionToken, {
+        path: SELF_REGISTER_DRAFT_COOKIE_PATH,
         maxAge: SELF_REGISTER_DRAFT_SESSION_HOURS * 3600 * 1000,
         httpOnly: true,
         secure: true,
@@ -444,7 +453,7 @@ export function createGardssalgSelfRegisterRouter(render: SelfRegisterPageRender
     flagGate,
     generalLimiter,
     (req: Request, res: Response) => {
-      const session = verifySelfRegisterDraftSession(readOwnerSessionCookie(req));
+      const session = verifySelfRegisterDraftSession(readDraftSessionCookie(req));
       const profile = session.valid && session.providerId ? getSelfRegisterDraftProfile(session.providerId) : null;
       if (!profile) return noDraftSession(res);
       const status = typeof req.query.status === "string" ? req.query.status : "";
@@ -459,7 +468,7 @@ export function createGardssalgSelfRegisterRouter(render: SelfRegisterPageRender
     express.urlencoded({ extended: false, limit: "32kb" }),
     (req: Request, res: Response) => {
       if (checkSameOriginWrite(req, GARDSSALG_SELF_REGISTER_DRAFT_PATH).refused) return refused(res, GARDSSALG_SELF_REGISTER_DRAFT_PATH);
-      const session = verifySelfRegisterDraftSession(readOwnerSessionCookie(req));
+      const session = verifySelfRegisterDraftSession(readDraftSessionCookie(req));
       if (!session.valid || !session.providerId) return noDraftSession(res);
       const b = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
       // CLAIM_EDITABLE_FIELDS through the owner portal's own writer. The form
@@ -469,10 +478,15 @@ export function createGardssalgSelfRegisterRouter(render: SelfRegisterPageRender
         about_text: b.field_about_text,
         visit_text: b.field_visit_text,
         opening_hours_text: b.field_opening_hours_text,
-        products: String(b.field_products ?? "").split(",").map((x) => x.trim()).filter(Boolean),
         hjemmeside: b.field_hjemmeside,
       };
-      if ("field_booking_live" in b) payload.booking_live = b.field_booking_live ? 1 : 0;
+      // Review N1 (lokal#1534): only a posted product field is written — a
+      // save without it must not wipe the stored product list.
+      if ("field_products" in b) {
+        payload.products = String(b.field_products ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+      }
+      // Review N2: "0" / "" / "off" are off; only "1", "on" and "true" are on.
+      if ("field_booking_live" in b) payload.booking_live = parseDraftCheckbox(b.field_booking_live) ? 1 : 0;
       for (const k of Object.keys(payload)) if (payload[k] === undefined) delete payload[k];
       let outcome: ReturnType<typeof updateClaimedProviderProfile>;
       try {
@@ -536,15 +550,25 @@ function sendConfirmLink(registrationId: string): void {
     .catch((e) => console.error("[gardssalg-self-register] sendGardssalgSelfRegisterConfirmLink error:", e));
 }
 
-function readOwnerSessionCookie(req: Request): string | undefined {
-  const fromMiddleware = (req as any).cookies?.[GARDSSALG_OWNER_SESSION_COOKIE] as string | undefined;
+/** A posted checkbox/switch value: true only for "1", "on" or "true"
+ *  (trimmed, any case). Exported for the tests. */
+export function parseDraftCheckbox(v: unknown): boolean {
+  const s = (Array.isArray(v) ? v[v.length - 1] : v);
+  if (typeof s !== "string") return false;
+  const t = s.trim().toLowerCase();
+  return t === "1" || t === "on" || t === "true";
+}
+
+/** The draft session cookie (oa_selfreg_draft) — never oa_owner_session. */
+function readDraftSessionCookie(req: Request): string | undefined {
+  const fromMiddleware = (req as any).cookies?.[SELF_REGISTER_DRAFT_COOKIE] as string | undefined;
   if (fromMiddleware) return fromMiddleware;
   const header = req.headers.cookie;
   if (!header) return undefined;
   for (const pair of header.split(";")) {
     const idx = pair.indexOf("=");
     if (idx < 0) continue;
-    if (pair.slice(0, idx).trim() !== GARDSSALG_OWNER_SESSION_COOKIE) continue;
+    if (pair.slice(0, idx).trim() !== SELF_REGISTER_DRAFT_COOKIE) continue;
     const value = pair.slice(idx + 1).trim();
     try { return decodeURIComponent(value); } catch { return value; }
   }

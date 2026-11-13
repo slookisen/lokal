@@ -57,6 +57,8 @@ export const GARDSSALG_BOOKING_ENABLED_ADAPTER: OwnerFeatureStorageAdapter = {
           no: out.block.note ? `${out.block.message} Grunn: ${out.block.note}.` : out.block.message,
           en: out.block.reason === "admin_brake"
             ? "Booking was stopped by Opplevagent. You cannot switch it back on yourself. Contact kontakt@opplevagent.no."
+            : out.block.reason === "pending_review"
+            ? SELF_REGISTERED_BOOKING_BLOCKED_EN
             : "Booking cannot be switched on until the profile has an e-mail address the requests can be sent to. Contact kontakt@opplevagent.no.",
         },
       };
@@ -64,6 +66,9 @@ export const GARDSSALG_BOOKING_ENABLED_ADAPTER: OwnerFeatureStorageAdapter = {
     return false;
   },
 };
+
+const SELF_REGISTERED_BOOKING_BLOCKED_EN =
+  "Booking cannot be switched on until Opplevagent has approved the registration. Contact kontakt@opplevagent.no.";
 
 export const GARDSSALG_PROFILE_VISIBLE_ADAPTER: OwnerFeatureStorageAdapter = {
   column: "experience_providers.catalog_hidden (owner_pause)",
@@ -126,6 +131,11 @@ export function loadGardssalgSubjectFacts(providerId: string): GardssalgSubjectF
         en: "Booking was stopped by Opplevagent. You cannot switch it back on yourself. Contact kontakt@opplevagent.no.",
       }
     : undefined;
+  // A self-registered row that is pending review or rejected
+  // (dev-request 2026-11-01-opplevagent-drikkeprodusent-selvregistrering,
+  // review N5) is booking-blocked here too, as ownerBookingEnableBlock does on
+  // the portal writer: the booking entry's enable condition is not met.
+  const selfRegBlocked = gate.isSelfRegisteredUnapprovedReason(row.catalog_hidden_reason);
   const state = svc.getOwnedVisibilityState(row);
   return {
     exists: true,
@@ -141,7 +151,9 @@ export function loadGardssalgSubjectFacts(providerId: string): GardssalgSubjectF
               en: "Booking cannot be switched on until the profile has an e-mail address the requests can be sent to. Contact kontakt@opplevagent.no.",
             },
           },
-      noBookingAdminBrake: brake ? { met: false, reason: brakeReason } : { met: true },
+      noBookingAdminBrake: selfRegBlocked
+        ? { met: false, reason: { no: gate.OWNER_BOOKING_PENDING_REVIEW_MSG, en: SELF_REGISTERED_BOOKING_BLOCKED_EN } }
+        : brake ? { met: false, reason: brakeReason } : { met: true },
       // The rest is not wired for gårdssalg: no entry requires them.
       isVerifiedBadge: { met: false },
       visibilityOwnerControlled: state === "visible" || state === "owner_pause"

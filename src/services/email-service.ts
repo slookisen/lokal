@@ -862,6 +862,106 @@ https://rettfrabonden.com`;
   }
 
   /**
+   * dev-request 2026-11-01-opplevagent-drikkeprodusent-selvregistrering,
+   * skive 3: «Profilen er godkjent» to the address the self-registering
+   * producer typed (and proved with the e-mail code), with an ordinary
+   * owner-portal login link. Same transport, From and Reply-To as
+   * sendGardssalgClaimMagicLink(). The text is built by
+   * buildGardssalgSelfRegisterApprovedEmail(), which the CRM copy also uses
+   * (with a placeholder instead of the link).
+   */
+  async sendGardssalgSelfRegisterApproved(opts: {
+    to: string;
+    providerName: string;
+    loginUrl: string;
+    profileUrl: string;
+  }): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const rendered = buildGardssalgSelfRegisterApprovedEmail(opts.providerName, opts.loginUrl, opts.profileUrl);
+    return await this.sendEmail({
+      to: opts.to,
+      subject: rendered.subject,
+      htmlContent: rendered.htmlContent,
+      textContent: rendered.textContent,
+      replyTo: "kontakt@opplevagent.no",
+      from: crmFromHeader("experiences"),
+    });
+  }
+
+  /** Skive 3: the short «Registreringen ble ikke godkjent» to the submitter.
+   *  No link, no secret; the admin note is never in it. */
+  async sendGardssalgSelfRegisterRejected(opts: {
+    to: string;
+    providerName: string;
+  }): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const rendered = buildGardssalgSelfRegisterRejectedEmail(opts.providerName);
+    return await this.sendEmail({
+      to: opts.to,
+      subject: rendered.subject,
+      htmlContent: rendered.htmlContent,
+      textContent: rendered.textContent,
+      replyTo: "kontakt@opplevagent.no",
+      from: crmFromHeader("experiences"),
+    });
+  }
+
+  /**
+   * Skive 3: tells the admin that a self-registered gårdssalg producer has
+   * confirmed its e-mail and waits in the review queue. The same channel and
+   * skip rule as the RFB owner-claim notices (sendAdminClaimNotification /
+   * sendAdminClaimReviewNotification): ADMIN_NOTIFICATION_EMAIL, skipped
+   * when it is not set. Every value is HTML-escaped.
+   */
+  async sendAdminGardssalgSelfRegisterNotification(opts: {
+    providerName: string;
+    providerId: string;
+    orgNr: string;
+    submitterName: string;
+    submitterEmail: string;
+    brregStatus: string;
+    possibleDuplicateOf: string | null;
+    assessmentResult: string | null;
+  }): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const adminEmail = process.env.ADMIN_NOTIFICATION_EMAIL;
+    if (!adminEmail) {
+      logger.info('ADMIN_NOTIFICATION_EMAIL not set — skipping gardssalg self-registration notification');
+      return { success: true, messageId: 'NO_ADMIN_EMAIL' };
+    }
+    try {
+      const queuePath = GARDSSALG_SELF_REGISTER_QUEUE_PATH;
+      const subject = `Ny selvregistrert gårdssalg venter på godkjenning: ${opts.providerName}`;
+      const lines: Array<[string, string]> = [
+        ['Produsent', `${opts.providerName} (${opts.providerId})`],
+        ['Org.nr.', opts.orgNr],
+        ['Innsender', opts.submitterName],
+        ['E-post (bekreftet)', opts.submitterEmail],
+        ['Brreg', opts.brregStatus],
+        ['Mulig duplikat av', opts.possibleDuplicateOf ?? 'ingen'],
+        ['Vurdering', opts.assessmentResult ?? 'ingen'],
+      ];
+      const row = (label: string, value: string) =>
+        `<tr><td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;">${label}:</td><td style="padding: 8px; border-bottom: 1px solid #eee;">${this.escapeHtml(value)}</td></tr>`;
+      const htmlContent = `
+        <div style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+          <h2 style="color: #0f5a50;">Selvregistrert gårdssalg venter på godkjenning</h2>
+          <p>Profilen er skjult til den er godkjent. Innsenderen har bekreftet e-postadressen og kan fylle ut et utkast.</p>
+          <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
+            ${lines.map(([l, v]) => row(l, v)).join('\n            ')}
+          </table>
+          <p>Køen: GET ${this.escapeHtml(queuePath)} (X-Admin-Key)</p>
+          <p style="color: #888; font-size: 12px;">Automatisk varsling fra Opplevagent</p>
+        </div>`;
+      const textContent = `Selvregistrert gårdssalg venter på godkjenning\n\nProfilen er skjult til den er godkjent. Innsenderen har bekreftet e-postadressen og kan fylle ut et utkast.\n\n${lines.map(([l, v]) => `${l}: ${v}`).join('\n')}\n\nKøen: GET ${queuePath} (X-Admin-Key)`;
+      return await this.sendEmail({ to: adminEmail, subject, htmlContent, textContent });
+    } catch (error) {
+      logger.error('Error sending admin gardssalg self-registration notification', {
+        providerId: opts.providerId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
    * dev-request 2026-08-07-outreach-pool-krav123-og-pilot, AC4 (pilot
    * send-mechanic). The cold-outreach email for a gårdssalg/opplevagent
    * producer whose profile is already outreach_ready — copy is the
@@ -1898,6 +1998,90 @@ Opplevagent
 kontakt@opplevagent.no
 https://opplevagent.no
 `;
+}
+
+/** The admin review queue for self-registered gårdssalg producers (skive 3). */
+export const GARDSSALG_SELF_REGISTER_QUEUE_PATH = "/api/opplevelser/admin/gardssalg-self-registered-review-queue";
+
+export interface RenderedGardssalgMail {
+  subject: string;
+  htmlContent: string;
+  textContent: string;
+}
+
+/** «Profilen er godkjent» (skive 3). Also rendered for the CRM copy, with a
+ *  placeholder instead of the login link. */
+export function buildGardssalgSelfRegisterApprovedEmail(providerName: string, loginUrl: string, profileUrl: string): RenderedGardssalgMail {
+  const safeName = epEscape(providerName);
+  const safeLogin = epEscape(loginUrl);
+  const safeProfile = epEscape(profileUrl);
+  const subject = `${providerName} er godkjent på Opplevagent`;
+  const htmlContent = `<!DOCTYPE html>
+<html lang="nb">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 24px 20px;">
+  <div style="font-size: 22px; font-weight: 700; color: #0f5a50; border-bottom: 3px solid #0f5a50; padding-bottom: 16px;">opplevagent.no</div>
+  <h1 style="font-size: 20px; color: #1a1a1a;">Hei!</h1>
+  <p>Vi har godkjent registreringen av <strong>${safeName}</strong>. Profilen er nå synlig på Opplevagent:<br /><a href="${safeProfile}">${safeProfile}</a></p>
+  <p>Du kan logge inn på eierportalen og endre profilen med lenken under. Der kan du også slå på booking.</p>
+  ${ctaButtonHtml({ href: safeLogin, label: "Logg inn på eierportalen", color: "#0f5a50", radius: "8px", margin: "18px auto", center: true })}
+  <p style="font-size: 14px; color: #666;">Eller kopier og lim inn denne lenken i nettleseren:<br /><code>${safeLogin}</code></p>
+  <p>Lenken er personlig. Ikke del den med andre.</p>
+  <p style="margin-top: 36px; font-size: 13px; color: #666;">Mvh,<br>Opplevagent — kontakt@opplevagent.no<br>https://opplevagent.no</p>
+</body>
+</html>`;
+  const textContent = `Hei!
+
+Vi har godkjent registreringen av ${providerName}. Profilen er nå synlig på Opplevagent:
+${profileUrl}
+
+Du kan logge inn på eierportalen og endre profilen med lenken under. Der kan du også slå på booking.
+
+${loginUrl}
+
+Lenken er personlig. Ikke del den med andre.
+
+Mvh,
+Opplevagent
+kontakt@opplevagent.no
+https://opplevagent.no
+`;
+  return { subject, htmlContent, textContent };
+}
+
+/** «Registreringen ble ikke godkjent» (skive 3): short, no link. */
+export function buildGardssalgSelfRegisterRejectedEmail(providerName: string): RenderedGardssalgMail {
+  const safeName = epEscape(providerName);
+  const subject = `Registreringen av ${providerName} på Opplevagent`;
+  const htmlContent = `<!DOCTYPE html>
+<html lang="nb">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 24px 20px;">
+  <div style="font-size: 22px; font-weight: 700; color: #0f5a50; border-bottom: 3px solid #0f5a50; padding-bottom: 16px;">opplevagent.no</div>
+  <h1 style="font-size: 20px; color: #1a1a1a;">Hei!</h1>
+  <p>Vi har vurdert registreringen av <strong>${safeName}</strong>, og vi kan dessverre ikke godkjenne den. Profilen blir ikke publisert.</p>
+  <p>Mener du at dette er feil, kan du svare på denne e-posten eller skrive til kontakt@opplevagent.no.</p>
+  <p style="margin-top: 36px; font-size: 13px; color: #666;">Mvh,<br>Opplevagent — kontakt@opplevagent.no<br>https://opplevagent.no</p>
+</body>
+</html>`;
+  const textContent = `Hei!
+
+Vi har vurdert registreringen av ${providerName}, og vi kan dessverre ikke godkjenne den. Profilen blir ikke publisert.
+
+Mener du at dette er feil, kan du svare på denne e-posten eller skrive til kontakt@opplevagent.no.
+
+Mvh,
+Opplevagent
+kontakt@opplevagent.no
+https://opplevagent.no
+`;
+  return { subject, htmlContent, textContent };
 }
 
 function buildGardssalgClaimMagicLinkText(providerName: string, verifyUrl: string): string {
