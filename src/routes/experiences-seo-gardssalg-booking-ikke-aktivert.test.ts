@@ -4,7 +4,7 @@
  * the "Kommer snart" chip is gone from the catalog/type-page cards, and the
  * paused state everywhere else states the honest fact — "Booking er ikke
  * aktivert for denne produsenten ennå." (BOOKING_NOT_ACTIVATED_MSG /
- * BOOKING_NOT_ACTIVATED_INTEREST_MSG, services/booking-store.ts — the ONE
+ * BOOKING_NOT_ACTIVATED_CONTACT_MSG, services/booking-store.ts — the ONE
  * copy source) — with a claim-CTA coupling on unclaimed surfaces only.
  *
  * Covers (mapping to the dev-request's acceptance criteria):
@@ -14,9 +14,13 @@
  *         copy; unclaimed surfaces carry the "Er dette din bedrift? Ta over
  *         profilen og aktiver booking" link to the claim flow; CLAIMED
  *         surfaces never do (the claimed-badge invariant from
- *         experiences-seo-gardssalg-claimed-badge.test.ts holds); the
- *         interest-message path (booking form) is untouched; the no-JS
+ *         experiences-seo-gardssalg-claimed-badge.test.ts holds); the no-JS
  *         ?error=paused banner carries the same copy.
+ *   2026-11-06-opplevagent-meld-interesse-fjernes-mens-booking-av — booking
+ *         off ⇒ no interest/reservation form, no «Meld interesse», no
+ *         «Reserver besøk» on profile or panel; the producer's contact info
+ *         is shown instead (and a neutral no-contact line when there is
+ *         none). Booking on ⇒ the reserve CTA and form are still there.
  *   AC4 — an activated provider (booking_live=1 + dispatch on) shows NO
  *         paused notice on profile or panel — same isBookingPaused() source.
  *   +   — POST /api/opplevelser/book against a paused provider returns the
@@ -163,13 +167,13 @@ export function runExperiencesSeoGardssalgBookingIkkeAktivertTests(opts: { log?:
       dbFactory.__resetDbFactoryForTesting();
       const db = dbFactory.getDb("experiences");
       const bookingStore = require("../services/booking-store") as typeof import("../services/booking-store");
-      const { BOOKING_NOT_ACTIVATED_MSG, BOOKING_NOT_ACTIVATED_INTEREST_MSG } = bookingStore;
+      const { BOOKING_NOT_ACTIVATED_MSG, BOOKING_NOT_ACTIVATED_CONTACT_MSG } = bookingStore;
 
       // Probe parity with the dev-request: the shared copy itself must never
       // smuggle the old promise back in.
       assertTrue(!BOOKING_NOT_ACTIVATED_MSG.toLowerCase().includes("kommer snart"), "s1: BOOKING_NOT_ACTIVATED_MSG carries no 'kommer snart'");
-      assertTrue(BOOKING_NOT_ACTIVATED_INTEREST_MSG.includes(BOOKING_NOT_ACTIVATED_MSG), "s2: interest-variant extends the base message");
-      assertTrue(BOOKING_NOT_ACTIVATED_INTEREST_MSG.toLowerCase().includes("interessemelding"), "s3: interest-variant keeps the interest-message path visible");
+      assertTrue(BOOKING_NOT_ACTIVATED_CONTACT_MSG.includes(BOOKING_NOT_ACTIVATED_MSG), "s2: contact-variant extends the base message");
+      assertTrue(!BOOKING_NOT_ACTIVATED_CONTACT_MSG.toLowerCase().includes("interesse"), "s3: contact-variant promises no interest message (nothing is stored)");
 
       // ── Fixtures — same raw-insert shape as
       // experiences-seo-gardssalg-typesider.test.ts. 7 providers ≥ the
@@ -201,6 +205,23 @@ export function runExperiencesSeoGardssalgBookingIkkeAktivertTests(opts: { log?:
           booking_live: i % 2 ? 0 : null, slug: `fyllgard-${i}`, claimed_at: null,
         });
       }
+
+      // dev-request 2026-11-06-opplevagent-meld-interesse-fjernes-mens-booking-av:
+      // a paused producer WITH contact info (phone, e-mail, website); the
+      // other paused fixtures carry none and exercise the no-contact line.
+      insertProvider.run({
+        id: "gs-bna-paused-contact", navn: "Pauset Kontakt Mjøderi", producer_type: "mjøderi",
+        booking_live: 0, slug: "pauset-kontakt-mjoderi", claimed_at: null,
+      });
+      // N1: special characters in phone + website host, for the /book escape test.
+      insertProvider.run({
+        id: "gs-bna-paused-escape", navn: "Pauset Escape Mjøderi", producer_type: "mjøderi",
+        booking_live: 0, slug: "pauset-escape-mjoderi", claimed_at: null,
+      });
+      db.prepare(`UPDATE experience_providers SET telefon = ?, hjemmeside = ? WHERE id = ?`)
+        .run("<script>x</script> 55 12 34 56 &", "https://a&b<i>.example.no", "gs-bna-paused-escape");
+      db.prepare(`UPDATE experience_providers SET telefon = ?, epost = ?, hjemmeside = ? WHERE id = ?`)
+        .run("+47 55 12 34 56", "post@kontakt-mjoderi.no", "https://kontakt-mjoderi.no", "gs-bna-paused-contact");
 
       const seoRouter = (require("./experiences-seo") as typeof import("./experiences-seo")).default as any;
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
@@ -239,11 +260,61 @@ export function runExperiencesSeoGardssalgBookingIkkeAktivertTests(opts: { log?:
         assertTrue(!r.body.includes("Ta over profilen"), "d5: ...and no 'Ta over profilen' text at all");
       }
 
+      // ── 2026-11-06: booking off ⇒ contact info, no interest/reserve CTA ─
+      {
+        const r = await callHtmlRoute(seoRouter, "/kategori/gardssalg/produsent/pauset-kontakt-mjoderi");
+        assertTrue(r.handled && r.status === 200, `m1: paused profile with contact info renders (status ${r.status})`);
+        assertTrue(!r.body.includes("Meld interesse") && !r.body.includes("Reserver besøk"), "m2: no «Meld interesse» / «Reserver besøk» while booking is off");
+        assertTrue(!r.body.includes('id="reserve-cta"') && !r.body.includes('href="/kategori/gardssalg/book/'), "m3: no reserve link / no link into the booking form");
+        assertTrue(!r.body.includes('name="guest_name"') && !r.body.toLowerCase().includes("interessemelding"), "m4: no interest form and no interest-message promise");
+        const card = r.body.slice(r.body.indexOf('id="reserve-contact"'), r.body.indexOf("</div>", r.body.indexOf('id="reserve-contact"')));
+        assertTrue(r.body.includes('id="reserve-contact"') && r.body.includes("Kontakt produsenten"), "m5: the contact card replaces the reserve card");
+        assertTrue(card.includes('href="tel:+47 55 12 34 56"'), "m6: contact card carries the phone as a tel: link");
+        assertTrue(card.includes('href="mailto:post@kontakt-mjoderi.no"'), "m7: contact card carries the e-mail as a mailto: link");
+        assertTrue(card.includes("kontakt-mjoderi.no</a>") && card.includes('rel="noopener nofollow"'), "m8: contact card carries the website");
+        assertTrue(!card.includes("Vi har ikke kontaktinformasjon"), "m9: no no-contact fallback when contact info exists");
+      }
+      {
+        const r = await callHtmlRoute(seoRouter, "/kategori/gardssalg/produsent/pauset-uclaimet-bryggeri");
+        assertTrue(!r.body.includes("Meld interesse") && !r.body.includes("Reserver besøk") && !r.body.includes('id="reserve-cta"'), "n1: no-contact paused profile has no interest/reserve CTA either");
+        assertTrue(r.body.includes('id="reserve-contact"') && r.body.includes('class="reserve-contact-none"'), "n2: no-contact paused profile shows the neutral fallback line");
+        assertTrue(r.body.includes("Finn produsenten via egne kanaler"), "n3: fallback tells the visitor what they can do");
+        const fallbackAt = r.body.indexOf(">", r.body.indexOf('class="reserve-contact-none"')) + 1;
+        const fallback = r.body.slice(fallbackAt, r.body.indexOf("</p>", fallbackAt));
+        assertTrue(!/svar|booking|reserv|interesse/i.test(fallback), `n4: fallback promises no reply/booking (got ${JSON.stringify(fallback)})`);
+      }
+      {
+        const r = await callHtmlRoute(seoRouter, "/kategori/gardssalg/book/pauset-kontakt-mjoderi");
+        assertTrue(r.handled && r.status === 200 && !r.body.includes('id="book-form"'), `p1: paused panel with contact info renders without the form (status ${r.status})`);
+        assertTrue(r.body.includes('href="tel:+47 55 12 34 56"') && r.body.includes("kontakt-mjoderi.no</a>"), "p2: paused panel shows phone + website");
+        assertTrue(!r.body.includes("post@kontakt-mjoderi.no"), "p3: the panel does not print the e-mail (published only under the profile page's gates)");
+      }
+
+      {
+        // B1: the hidden owner slot must stay hidden — `.reserve-cta-paused{display:block}`
+        // alone would override the UA [hidden] rule and show an empty grey button.
+        const r = await callHtmlRoute(seoRouter, "/kategori/gardssalg/produsent/pauset-kontakt-mjoderi");
+        assertTrue(r.body.includes('<a id="reserve-owner-cta" class="reserve-cta-paused" hidden></a>'), "q1: booking-off profile renders the hidden owner slot");
+        assertTrue(/\.reserve-cta-paused\[hidden\]\s*\{\s*display\s*:\s*none\s*\}/.test(r.body), "q2: CSS hides .reserve-cta-paused[hidden] so the empty owner slot is never visible");
+        assertTrue(r.body.indexOf(".reserve-cta-paused[hidden]") > r.body.indexOf(".reserve-cta-paused{display:block"), "q3: the [hidden] rule comes after the display:block rule");
+      }
+      {
+        // N1: /book booking-off panel HTML-escapes phone + website host.
+        const r = await callHtmlRoute(seoRouter, "/kategori/gardssalg/book/pauset-escape-mjoderi");
+        assertTrue(r.handled && r.status === 200 && r.body.includes('id="book-contact"'), `r1: panel with special-char contact renders (status ${r.status})`);
+        const panel = r.body.slice(r.body.indexOf('id="book-contact"'), r.body.indexOf("</div>", r.body.indexOf('id="book-contact"')));
+        assertTrue(!panel.includes("<script") && !panel.includes("<i>"), "r2: no raw <script / <i> tag in the panel contact block");
+        assertTrue(panel.includes("&lt;script&gt;") && panel.includes("&amp;"), "r3: phone text is HTML-escaped (&lt;script&gt;, &amp;)");
+        assertTrue(/Nettside: <a [^>]*>[^<]*<\/a>/.test(panel) && !panel.includes("a&b<i>"), "r4: website host is not rendered raw");
+      }
+
       // ── AC4: activated provider — no paused notice on the profile ───────
       {
         const r = await callHtmlRoute(seoRouter, "/kategori/gardssalg/produsent/aktivert-vingard");
         assertTrue(r.handled && r.status === 200, `e1: activated profile renders (status ${r.status})`);
         assertTrue(!r.body.includes(BOOKING_NOT_ACTIVATED_MSG), "e2: no 'ikke aktivert' notice for booking_live=1 + dispatch on");
+        assertTrue(r.body.includes('<a id="reserve-cta" class="reserve-cta" href="/kategori/gardssalg/book/aktivert-vingard">Reserver besøk</a>'), "e2b: booking on keeps the «Reserver besøk» CTA exactly as before");
+        assertTrue(!r.body.includes('id="reserve-contact"'), "e2c: no paused contact card when booking is on");
         assertTrue(!r.body.toLowerCase().includes("kommer snart"), "e3: and no 'kommer snart' either");
       }
 
@@ -253,9 +324,11 @@ export function runExperiencesSeoGardssalgBookingIkkeAktivertTests(opts: { log?:
         assertTrue(r.handled && r.status === 200, `f1: unclaimed paused panel renders (status ${r.status})`);
         assertTrue(r.body.includes('class="notice-paused"'), "f2: the paused notice block is rendered");
         assertTrue(r.body.includes("<strong>Booking ikke aktivert</strong>"), "f3: notice heading is 'Booking ikke aktivert' (not 'Kommer snart')");
-        assertTrue(r.body.includes(BOOKING_NOT_ACTIVATED_INTEREST_MSG), "f4: notice body is the shared interest-variant copy");
+        assertTrue(r.body.includes(BOOKING_NOT_ACTIVATED_CONTACT_MSG), "f4: notice body is the shared contact-variant copy");
         assertTrue(r.body.includes(CTA_LINE) && r.body.includes('href="/kategori/gardssalg/eier/pauset-uclaimet-bryggeri"'), "f5: claim coupling on the panel too");
-        assertTrue(r.body.includes('name="guest_name"'), "f6: the interest-message path (booking form) is untouched");
+        assertTrue(!r.body.includes('id="book-form"') && !r.body.includes('name="guest_name"'), "f6: no reservation/interest form while booking is off");
+        assertTrue(!r.body.includes("Reserver besøk") && !r.body.includes("Meld interesse"), "f6b: no «Reserver besøk» / «Meld interesse» on the paused panel");
+        assertTrue(r.body.includes('id="book-contact"') && r.body.includes('href="/kategori/gardssalg/produsent/pauset-uclaimet-bryggeri"'), "f6c: the panel points at the profile's contact info instead");
         assertTrue(!r.body.toLowerCase().includes("kommer snart"), "f7: no 'kommer snart' left on the panel");
       }
 
@@ -263,7 +336,7 @@ export function runExperiencesSeoGardssalgBookingIkkeAktivertTests(opts: { log?:
       {
         const r = await callHtmlRoute(seoRouter, "/kategori/gardssalg/book/pauset-claimet-cideri");
         assertTrue(r.handled && r.status === 200, `g1: claimed paused panel renders (status ${r.status})`);
-        assertTrue(r.body.includes(BOOKING_NOT_ACTIVATED_INTEREST_MSG), "g2: honest notice present");
+        assertTrue(r.body.includes(BOOKING_NOT_ACTIVATED_CONTACT_MSG), "g2: honest notice present");
         assertTrue(!r.body.includes(OLD_CTA_BUTTON) && !r.body.includes(CTA_LINE), "g3: no claim CTA on a claimed provider's panel");
       }
 
@@ -272,17 +345,19 @@ export function runExperiencesSeoGardssalgBookingIkkeAktivertTests(opts: { log?:
         const r = await callHtmlRoute(seoRouter, "/kategori/gardssalg/book/aktivert-vingard");
         assertTrue(r.handled && r.status === 200, `h1: activated panel renders (status ${r.status})`);
         assertTrue(!r.body.includes('class="notice-paused"'), "h2: no paused-notice block when genuinely bookable");
+        assertTrue(r.body.includes('id="book-form"') && r.body.includes('name="guest_name"') && r.body.includes(">Reserver besøk</button>"), "h3: the reservation form is still there when booking is on");
+        assertTrue(!r.body.includes('id="book-contact"'), "h4: no paused contact block when booking is on");
       }
 
       // ── AC2: the no-JS ?error=paused banner carries the same copy ───────
       {
         const r = await callHtmlRoute(seoRouter, "/kategori/gardssalg/book/pauset-uclaimet-bryggeri?error=paused");
         assertTrue(r.handled && r.status === 200, `i1: panel with ?error=paused renders (status ${r.status})`);
-        assertTrue(r.body.includes(BOOKING_NOT_ACTIVATED_INTEREST_MSG), "i2: the error banner uses the shared copy");
+        assertTrue(r.body.includes(BOOKING_NOT_ACTIVATED_CONTACT_MSG), "i2: the error banner uses the shared copy");
       }
 
       // ── AC5 options: positive card markers, exact-count discipline ──────
-      // Fixture census: 7 visible rows — gs-bna-live is the ONLY activated
+      // Fixture census: 8 visible rows — gs-bna-live is the ONLY activated
       // one (booking_live=1, dispatch on) and is claimed; gs-bna-paused-
       // claimed is the only other claimed row; everything else is paused +
       // unclaimed. So: «Booking tilgjengelig» ×1, «Eier-bekreftet» ×2.

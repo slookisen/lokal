@@ -233,7 +233,7 @@ import {
   osloDatetimeLocalToUtcIso,
   defaultBookingSlotAtDatetimeLocal,
   BOOKING_NOT_ACTIVATED_MSG,
-  BOOKING_NOT_ACTIVATED_INTEREST_MSG,
+  BOOKING_NOT_ACTIVATED_CONTACT_MSG,
   // slice 1 ("myk åpningstidsvalidering"): normalise BEFORE
   // checkBookingSlotAllowed() — see that call site's own comment.
   normaliseBookingSlotInput,
@@ -472,6 +472,11 @@ function oaProfileLabels(lang: Lang) {
     gsKicker: "Gårdssalg &amp; smaking", gsCrumb: "Gårdssalg og smaking", gsAbout: "Om produsenten", gsVisit: "Besøket", gsPractical: "Praktisk info",
     gsReserve: "Reserver", gsAddress: "Adresse", gsHours: "Åpningstider", gsSite: "Nettside", gsEmail: "E-post",
     gsEmailReveal: "Vis e-post",
+    // dev-request 2026-11-06-opplevagent-meld-interesse-fjernes-mens-booking-av:
+    // the aside card a booking-off profile shows instead of a reserve CTA.
+    gsContact: "Kontakt produsenten",
+    gsContactNone: "Vi har ikke kontaktinformasjon for denne produsenten ennå. Finn produsenten via egne kanaler",
+    gsContactNoneHours: ", eller kom innom i åpningstidene som står under Praktisk info",
     gsMeta: (navn: string, sted: string) => `${navn}${sted ? " i " + sted : ""} — produsentprofil på Opplevagent med fakta om produsenten.`,
   };
   const en: typeof no = {
@@ -494,6 +499,9 @@ function oaProfileLabels(lang: Lang) {
     gsKicker: "Farm sales &amp; tasting", gsCrumb: "Farm sales and tasting", gsAbout: "About the producer", gsVisit: "The visit", gsPractical: "Practical information",
     gsReserve: "Reserve", gsAddress: "Address", gsHours: "Opening hours", gsSite: "Website", gsEmail: "Email",
     gsEmailReveal: "Show e-mail",
+    gsContact: "Contact the producer",
+    gsContactNone: "We do not have contact details for this producer yet. Find the producer through their own channels",
+    gsContactNoneHours: ", or drop by during the opening hours listed under Practical information",
     gsMeta: (navn: string, sted: string) => `${navn}${sted ? " in " + sted : ""} — producer profile on Opplevagent with facts about the producer.`,
   };
   const sv: typeof no = {
@@ -516,6 +524,9 @@ function oaProfileLabels(lang: Lang) {
     gsKicker: "Gårdsförsäljning &amp; provsmakning", gsCrumb: "Gårdsförsäljning och provsmakning", gsAbout: "Om producenten", gsVisit: "Besöket", gsPractical: "Praktisk information",
     gsReserve: "Reservera", gsAddress: "Adress", gsHours: "Öppettider", gsSite: "Webbplats", gsEmail: "E-post",
     gsEmailReveal: "Visa e-post",
+    gsContact: "Kontakta producenten",
+    gsContactNone: "Vi har inga kontaktuppgifter för denna producent ännu. Hitta producenten via deras egna kanaler",
+    gsContactNoneHours: ", eller kom förbi under öppettiderna som står under Praktisk information",
     gsMeta: (navn: string, sted: string) => `${navn}${sted ? " i " + sted : ""} — producentprofil på Opplevagent med fakta om producenten.`,
   };
   if (lang === "en") return en;
@@ -1618,8 +1629,11 @@ function isGardssalgCategorySlug(category: string | null | undefined): boolean {
 //
 // `metaDescPaused`/`ledePaused` (dev-request 2026-10-17-integrasjonstest-
 // oppfolging, SD-11): the copy while booking is not live for the vertical
-// (gardssalgBookingLive() false). The cards then say «Meld interesse», so
-// the page invites an interest request instead of promising a booking.
+// (gardssalgBookingLive() false). The cards then link to the profile's
+// contact info («Se kontaktinfo»), so the page points at the producer's own
+// contact routes instead of promising a booking — and never an interest
+// request we would not store (dev-request 2026-11-06-opplevagent-meld-
+// interesse-fjernes-mens-booking-av).
 export type GardssalgTypePageDef = {
   label: string;          // chip/breadcrumb label — same canonical labels as DRINK_TYPE_META
   producerTypes: string[]; // raw producer_type spellings aggregated by this page
@@ -1636,54 +1650,54 @@ export const GARDSSALG_TYPE_PAGES: Record<string, GardssalgTypePageDef> = {
     producerTypes: ["bryggeri"],
     title: "Bryggerier med gårdssalg og smaking | Opplevagent",
     metaDesc: "Besøk lokale bryggerier — book ølsmaking eller omvisning rett hos bryggeriet. Verifisert mot Brønnøysundregistrene.",
-    metaDescPaused: "Besøk lokale bryggerier — meld interesse for ølsmaking eller omvisning hos bryggeriet. Verifisert mot Brønnøysundregistrene.",
+    metaDescPaused: "Lokale bryggerier — se hva bryggeriet tilbyr og hvordan du tar kontakt. Verifisert mot Brønnøysundregistrene.",
     lede: (n) => `Det finnes ${n} ${n === 1 ? "bryggeri" : "bryggerier"} på Opplevagent — book en ølsmaking eller omvisning rett hos bryggeriet.`,
-    ledePaused: (n) => `Det finnes ${n} ${n === 1 ? "bryggeri" : "bryggerier"} på Opplevagent — meld interesse for en ølsmaking eller omvisning hos bryggeriet.`,
+    ledePaused: (n) => `Det finnes ${n} ${n === 1 ? "bryggeri" : "bryggerier"} på Opplevagent — se hva bryggeriet tilbyr og hvordan du tar kontakt.`,
   },
   destilleri: {
     label: "Destillat",
     producerTypes: ["destilleri"],
     title: "Destillerier med gårdssalg og smaking | Opplevagent",
     metaDesc: "Besøk lokale destillerier — book smaking av destillater eller omvisning rett hos produsenten. Verifisert mot Brønnøysundregistrene.",
-    metaDescPaused: "Besøk lokale destillerier — meld interesse for smaking av destillater eller omvisning hos produsenten. Verifisert mot Brønnøysundregistrene.",
+    metaDescPaused: "Lokale destillerier — se hva produsenten tilbyr og hvordan du tar kontakt. Verifisert mot Brønnøysundregistrene.",
     lede: (n) => `Det finnes ${n} ${n === 1 ? "destilleri" : "destillerier"} på Opplevagent — book en smaking eller omvisning rett hos destilleriet.`,
-    ledePaused: (n) => `Det finnes ${n} ${n === 1 ? "destilleri" : "destillerier"} på Opplevagent — meld interesse for en smaking eller omvisning hos destilleriet.`,
+    ledePaused: (n) => `Det finnes ${n} ${n === 1 ? "destilleri" : "destillerier"} på Opplevagent — se hva destilleriet tilbyr og hvordan du tar kontakt.`,
   },
   sider: {
     label: "Sider",
     producerTypes: ["cideri", "sideri"],
     title: "Siderier med gårdssalg og smaking | Opplevagent",
     metaDesc: "Besøk lokale siderprodusenter — book sidersmaking eller omvisning i frukthagen rett hos produsenten. Verifisert mot Brønnøysundregistrene.",
-    metaDescPaused: "Besøk lokale siderprodusenter — meld interesse for sidersmaking eller omvisning i frukthagen hos produsenten. Verifisert mot Brønnøysundregistrene.",
+    metaDescPaused: "Lokale siderprodusenter — se hva produsenten tilbyr og hvordan du tar kontakt. Verifisert mot Brønnøysundregistrene.",
     lede: (n) => `Det finnes ${n} ${n === 1 ? "siderprodusent" : "siderprodusenter"} på Opplevagent — book en sidersmaking rett hos produsenten.`,
-    ledePaused: (n) => `Det finnes ${n} ${n === 1 ? "siderprodusent" : "siderprodusenter"} på Opplevagent — meld interesse for en sidersmaking hos produsenten.`,
+    ledePaused: (n) => `Det finnes ${n} ${n === 1 ? "siderprodusent" : "siderprodusenter"} på Opplevagent — se hva produsenten tilbyr og hvordan du tar kontakt.`,
   },
   fruktvin: {
     label: "Fruktvin",
     producerTypes: ["vingård", "vingard", "vingaard"],
     title: "Fruktvin — vingårder med gårdssalg og smaking | Opplevagent",
     metaDesc: "Besøk lokale fruktvinprodusenter — book smaking av fruktvin og en tur i vingården rett hos produsenten. Verifisert mot Brønnøysundregistrene.",
-    metaDescPaused: "Besøk lokale fruktvinprodusenter — meld interesse for smaking av fruktvin og en tur i vingården hos produsenten. Verifisert mot Brønnøysundregistrene.",
+    metaDescPaused: "Lokale fruktvinprodusenter — se hva produsenten tilbyr og hvordan du tar kontakt. Verifisert mot Brønnøysundregistrene.",
     lede: (n) => `Det finnes ${n} ${n === 1 ? "fruktvinprodusent" : "fruktvinprodusenter"} på Opplevagent — book en smaking rett hos produsenten.`,
-    ledePaused: (n) => `Det finnes ${n} ${n === 1 ? "fruktvinprodusent" : "fruktvinprodusenter"} på Opplevagent — meld interesse for en smaking hos produsenten.`,
+    ledePaused: (n) => `Det finnes ${n} ${n === 1 ? "fruktvinprodusent" : "fruktvinprodusenter"} på Opplevagent — se hva produsenten tilbyr og hvordan du tar kontakt.`,
   },
   mjod: {
     label: "Mjød",
     producerTypes: ["mjøderi", "mjoderi", "mjoederi"],
     title: "Mjøderier med gårdssalg og smaking | Opplevagent",
     metaDesc: "Besøk lokale mjøderier — book mjødsmaking eller omvisning rett hos produsenten. Verifisert mot Brønnøysundregistrene.",
-    metaDescPaused: "Besøk lokale mjøderier — meld interesse for mjødsmaking eller omvisning hos produsenten. Verifisert mot Brønnøysundregistrene.",
+    metaDescPaused: "Lokale mjøderier — se hva produsenten tilbyr og hvordan du tar kontakt. Verifisert mot Brønnøysundregistrene.",
     lede: (n) => `Det finnes ${n} ${n === 1 ? "mjøderi" : "mjøderier"} på Opplevagent — book en mjødsmaking rett hos produsenten.`,
-    ledePaused: (n) => `Det finnes ${n} ${n === 1 ? "mjøderi" : "mjøderier"} på Opplevagent — meld interesse for en mjødsmaking hos produsenten.`,
+    ledePaused: (n) => `Det finnes ${n} ${n === 1 ? "mjøderi" : "mjøderier"} på Opplevagent — se hva produsenten tilbyr og hvordan du tar kontakt.`,
   },
   kombucha: {
     label: "Kombucha",
     producerTypes: ["seltzeri"],
     title: "Kombucha-produsenter med gårdssalg og smaking | Opplevagent",
     metaDesc: "Besøk lokale kombucha-produsenter — book smaking eller omvisning rett hos produsenten. Verifisert mot Brønnøysundregistrene.",
-    metaDescPaused: "Besøk lokale kombucha-produsenter — meld interesse for smaking eller omvisning hos produsenten. Verifisert mot Brønnøysundregistrene.",
+    metaDescPaused: "Lokale kombucha-produsenter — se hva produsenten tilbyr og hvordan du tar kontakt. Verifisert mot Brønnøysundregistrene.",
     lede: (n) => `Det finnes ${n} ${n === 1 ? "kombucha-produsent" : "kombucha-produsenter"} på Opplevagent — book en smaking rett hos produsenten.`,
-    ledePaused: (n) => `Det finnes ${n} ${n === 1 ? "kombucha-produsent" : "kombucha-produsenter"} på Opplevagent — meld interesse for en smaking hos produsenten.`,
+    ledePaused: (n) => `Det finnes ${n} ${n === 1 ? "kombucha-produsent" : "kombucha-produsenter"} på Opplevagent — se hva produsenten tilbyr og hvordan du tar kontakt.`,
   },
 };
 
@@ -5875,8 +5889,14 @@ function renderGardssalgCatalogPage(opts: { typeSlug?: string | null; page: numb
     // .gs-card-cta-paused's own comment); punkt 4 only swaps its flat grey
     // for the card's own colour, so a grid of not-yet-activated producers
     // stops reading as a grid of disabled buttons.
+    // dev-request 2026-11-06-opplevagent-meld-interesse-fjernes-mens-booking-av:
+    // booking off ⇒ the outline CTA no longer says «Meld interesse» nor
+    // points at /book (whose form stored nothing); it opens the profile,
+    // where the producer's contact info is. Booking on ⇒ unchanged.
     const link = bookHref
-      ? `<a href="${bookHref}" class="${bookingPaused ? "gs-card-cta-paused" : "gs-card-cta"}"${bookingPaused ? ` style="background:#fff;border-color:${accent}66;color:${accent}"` : ""}>${bookingPaused ? "Meld interesse" : "Book besøk"}</a>`
+      ? bookingPaused
+        ? `<a href="${profileHref}" class="gs-card-cta-paused" style="background:#fff;border-color:${accent}66;color:${accent}">Se kontaktinfo</a>`
+        : `<a href="${bookHref}" class="gs-card-cta">Book besøk</a>`
       : "";
     // Cards carry POSITIVE markers only (dev-request 2026-08-09-gardssalg-
     // kommer-snart-fjernes-eier-aktivert-booking, AC5 options — Daniel
@@ -5929,14 +5949,15 @@ function renderGardssalgCatalogPage(opts: { typeSlug?: string | null; page: numb
   // SD-11 (dev-request 2026-10-17-integrasjonstest-oppfolging): the meta
   // description and the hero only promise booking while booking is live for
   // the vertical — the same collective flag as the homepage's #drikkested
-  // section. Otherwise they invite an interest request, like the cards'
-  // «Meld interesse» button.
+  // section. Otherwise they point at the producer's contact info, like the
+  // cards' «Se kontaktinfo» link (never an interest request — dev-request
+  // 2026-11-06-opplevagent-meld-interesse-fjernes-mens-booking-av).
   const bookingLive = gardssalgBookingLive();
   const metaDesc = typeDef
     ? (bookingLive ? typeDef.metaDesc : typeDef.metaDescPaused)
     : bookingLive
       ? "Besøk lokale drikkeprodusenter — bryggeri, sideri, mjød og mer. Book en smaking eller omvisning rett hos produsenten."
-      : "Besøk lokale drikkeprodusenter — bryggeri, sideri, mjød og mer. Meld interesse for en smaking eller omvisning hos produsenten.";
+      : "Lokale drikkeprodusenter — bryggeri, sideri, mjød og mer. Se hva produsenten tilbyr og hvordan du tar kontakt.";
   // Type-page h1 = the <title> minus the brand suffix; base keeps its
   // pre-S3 hero copy byte-identically.
   const heroH1 = typeDef ? typeDef.title.replace(/ \| Opplevagent$/, "") : "Lokale drikkeprodusenter";
@@ -5948,7 +5969,7 @@ function renderGardssalgCatalogPage(opts: { typeSlug?: string | null; page: numb
     ? (bookingLive ? typeDef.lede(total) : typeDef.ledePaused(total))
     : bookingLive
       ? "Besøk bryggeri, sideri, mjøderi og mer — book en smaking eller omvisning rett hos produsenten."
-      : "Besøk bryggeri, sideri, mjøderi og mer — meld interesse for en smaking eller omvisning hos produsenten.";
+      : "Bryggeri, sideri, mjøderi og mer — se hva produsenten tilbyr og hvordan du tar kontakt.";
   // Share card (SD-11, reviewer-FUNN from #1099): the gårdssalg PNG card,
   // the same one the producer profiles use; the page's own title is in
   // og:title and the alt text.
@@ -6020,7 +6041,7 @@ ${BROWSE_CSS}
    .gs-card-cta keeps the pre-existing active "Book besøk" styling verbatim
    (was inline); .gs-card-cta-paused mirrors the produsent-profil page's own
    .reserve-cta-paused convention (arbeidspunkt 5, PR #571) — a neutral,
-   non-gradient style for "Meld interesse" so the button never looks bookable
+   non-gradient style for "Se kontaktinfo" so the button never looks bookable
    while it isn't. */
 .gs-card-cta{display:inline-block;margin-top:10px;padding:8px 16px;background:var(--fjord-700);color:#fff;border-radius:6px;font-size:.84rem;font-weight:600;text-decoration:none}
 .gs-card-cta:hover{text-decoration:none}
@@ -6377,6 +6398,29 @@ function gardssalgContactFormCell(slug: string, lang: Lang): string {
     + `</form>`;
 }
 
+// dev-request 2026-11-06-opplevagent-meld-interesse-fjernes-mens-booking-av:
+// what the /book panel shows INSTEAD of the reservation form while booking is
+// off for the producer. Phone and website only (same escaping, same tel: link
+// and same counting website redirect as the profile page's facts rows); the
+// e-mail is deliberately NOT printed here — it is published under the review,
+// «Vis e-post» and contact-form gates that only the profile page applies, so
+// this panel links there instead of re-deciding them. No promise of a reply
+// or a booking.
+function gardssalgBookPanelContactHtml(provider: GardssalgProviderRow, profilePath: string): string {
+  const rows: string[] = [];
+  const gsId = String(provider.id ?? "");
+  if (isDisplayablePhone(provider.telefon)) {
+    rows.push(`<li>Telefon: <a href="tel:${escapeHtml(provider.telefon)}">${escapeHtml(provider.telefon)}</a></li>`);
+  }
+  const site = safeHttpUrl(provider.hjemmeside);
+  if (site) {
+    const href = escapeHtml(gsId ? profileLinkHref("gardssalg", gsId, "website") : addUtmParams(site, GARDSSALG_SITE_UTM.source, "referral", GARDSSALG_SITE_UTM.campaign));
+    rows.push(`<li>Nettside: <a href="${href}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a></li>`);
+  }
+  const list = rows.length ? `<ul class="microcopy" style="list-style:none">${rows.join("")}</ul>` : "";
+  return `<div id="book-contact">${list}<p class="microcopy"><a href="${escapeHtml(profilePath)}">Se kontaktinfo på profilsiden</a></p></div>`;
+}
+
 router.get(
   "/kategori/gardssalg/produsent/:providerSlug",
   (req: Request, res: Response, next: NextFunction) => {
@@ -6534,6 +6578,19 @@ router.get(
     if (provider.epost && !epostUnderReview && emailShown) facts.push([L.gsEmail, `<a href="mailto:${escapeHtml(provider.epost)}"${gsId ? profileLinkBeaconAttrs("gardssalg", gsId, "email") : ""}>${escapeHtml(provider.epost)}</a>`]);
     else if (emailView === "reveal") facts.push([L.gsEmail, `<a href="${escapeHtml(gardssalgEmailRevealPath(slug, uiLang))}" rel="nofollow">${escapeHtml(L.gsEmailReveal)}</a>`]);
     else if (contactFormShown) facts.push([GARDSSALG_CONTACT_FORM_COPY[uiLang].label, gardssalgContactFormCell(slug, uiLang)]);
+    // dev-request 2026-11-06-opplevagent-meld-interesse-fjernes-mens-booking-av:
+    // while booking is off the aside shows the producer's own contact routes
+    // instead of a «Meld interesse» CTA (whose form stored nothing). The rows
+    // are the SAME cells the facts table just built — same e-mail review /
+    // reveal / contact-form gates, same escaping and beacons — never a
+    // parallel lookup. The contact form itself lives in the facts table
+    // (id="kontaktskjema"), so the aside only links to it.
+    const hoursShown = facts.some(([k]) => k === L.gsHours);
+    const pausedContactRows: Array<[string, string]> = facts.filter(([k]) => k === L.gsSite || k === L.phone || k === L.gsEmail);
+    if (contactFormShown) pausedContactRows.push([GARDSSALG_CONTACT_FORM_COPY[uiLang].label, `<a href="#kontaktskjema">${escapeHtml(GARDSSALG_CONTACT_FORM_COPY[uiLang].label)}</a>`]);
+    const pausedContactHtml = pausedContactRows.length
+      ? `<ul class="reserve-contact-list">${pausedContactRows.map(([k, v]) => `<li><span class="reserve-contact-k">${escapeHtml(k)}</span> ${v}</li>`).join("")}</ul>`
+      : `<p class="reserve-contact-none">${escapeHtml(L.gsContactNone)}${hoursShown ? escapeHtml(L.gsContactNoneHours) : ""}.</p>`;
     const factsRows = facts.map(([k, v]) => `<tr><th scope="row">${escapeHtml(k)}</th><td>${v}</td></tr>`).join("");
     const factsBlock = facts.length
       ? `<table class="facts"><caption class="skip-link">Praktisk info</caption><tbody>${factsRows}</tbody></table>${gsId ? profileClickBeaconScript() : ""}
@@ -6734,7 +6791,14 @@ ${BROWSE_CSS}
    already says so in words; this fix is the matching visual signal). */
 .reserve-cta-paused{display:block;text-align:center;background:var(--canvas-2);color:var(--ink-soft);font-weight:800;padding:14px 18px;border-radius:var(--r-pill);border:1px solid var(--line);box-shadow:none}
 .reserve-cta-paused:hover{text-decoration:none;background:var(--line)}
-.reserve-notice{font-size:.8rem;font-weight:600;color:var(--fjord-800);background:var(--canvas-2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-bottom:10px}
+/* display:block above would otherwise beat the UA [hidden]{display:none}: the hidden owner slot must stay hidden until the swap script removes the attribute. */
+.reserve-cta-paused[hidden]{display:none}
+${bookingPaused ? `.reserve-contact-list{list-style:none;margin:0;padding:0;font-size:.9rem;color:var(--ink-soft)}
+.reserve-contact-list li{padding:6px 0;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
+.reserve-contact-list li:last-child{border-bottom:none}
+.reserve-contact-k{display:block;font-size:.74rem;font-weight:600;color:var(--mist)}
+.reserve-contact-none{font-size:.86rem;color:var(--ink-soft);margin:0}
+` : ""}.reserve-notice{font-size:.8rem;font-weight:600;color:var(--fjord-800);background:var(--canvas-2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-bottom:10px}
 .map-card{display:flex;align-items:center;gap:12px;color:var(--ink-soft);background:var(--canvas-2);border:1px solid var(--line);border-radius:var(--r-md);padding:14px 16px}
 .map-card:hover{text-decoration:none;border-color:var(--fjord-600)}
 .map-card svg{color:var(--fjord-600);flex:0 0 22px}
@@ -6779,11 +6843,16 @@ ${switcherOn ? oaSiteNav({ active: "gardssalg", lang, path: noPath, switcher: tr
       </div>
     </article>
     <aside>
-      <div class="aside-card">
+      ${bookingPaused ? `<div class="aside-card" id="reserve-contact">
+        <h2>${L.gsContact}</h2>
+        <p class="reserve-notice">${BOOKING_NOT_ACTIVATED_MSG}${isClaimed ? "" : ` Er dette din bedrift? <a href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}">Ta over profilen og aktiver booking</a>.`}</p>
+        ${pausedContactHtml}
+        <a id="reserve-owner-cta" class="reserve-cta-paused" hidden></a>
+      </div>` : `<div class="aside-card">
         <h2>${L.gsReserve}</h2>
-        ${bookingPaused ? `<p class="reserve-notice">${BOOKING_NOT_ACTIVATED_MSG}${isClaimed ? "" : ` Er dette din bedrift? <a href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}">Ta over profilen og aktiver booking</a>.`}</p>` : ""}
-        <a id="reserve-cta" class="${bookingPaused ? "reserve-cta-paused" : "reserve-cta"}" href="${bookHref}">${bookingPaused ? "Meld interesse" : "Reserver besøk"}</a>
-      </div>
+        
+        <a id="reserve-cta" class="reserve-cta" href="${bookHref}">Reserver besøk</a>
+      </div>`}
       <div class="aside-card">
         <h2>${L.place}</h2>
         ${mapBlock}
@@ -6814,12 +6883,15 @@ ${switcherOn ? oaSiteFooter({ lang }) : oaSiteFooter({})}
 <script>
 (function () {
   // dev-request 2026-08-06-eier-ser-reserver-knapp-paa-egen-profil: swap
-  // "Reserver besøk" to an owner action ONLY for the logged-in owner of
+  // the #reserve-cta link to an owner action ONLY for the logged-in owner of
   // THIS provider, entirely client-side — this page's server-rendered HTML
   // (see the doc comment above decideOwnerCtaSwap() in experiences-seo.ts)
   // is identical for every visitor/cache. Fails closed to "no change" if
   // the fetch errors, is unauthenticated, or is for a different provider.
-  var cta = document.getElementById("reserve-cta");
+  // Booking off: no reserve link is rendered at all; the owner
+  // action goes into the hidden, label-less #reserve-owner-cta slot instead
+  // (dev-request 2026-11-06-opplevagent-meld-interesse-fjernes-mens-booking-av).
+  var cta = document.getElementById("reserve-cta") || document.getElementById("reserve-owner-cta");
   if (!cta || !window.fetch) return;
   var decideOwnerCtaSwap = ${decideOwnerCtaSwap.toString()};
   var providerId = ${serializeJsonForScript(provider.id)};
@@ -6832,6 +6904,7 @@ ${switcherOn ? oaSiteFooter({ lang }) : oaSiteFooter({})}
       if (!decision.swap) return;
       cta.textContent = decision.primaryLabel;
       cta.setAttribute("href", decision.primaryHref);
+      cta.removeAttribute("hidden");
       var secondary = document.createElement("a");
       secondary.id = "reserve-cta-preview";
       secondary.setAttribute("href", decision.secondaryHref);
@@ -7089,7 +7162,7 @@ function bookingErrorMessage(code: string): string {
     // (dev-request 2026-08-09-gardssalg-kommer-snart-fjernes-eier-aktivert-
     // booking): plain "not activated" fact, no "coming soon" promise.
     case "paused":
-      return BOOKING_NOT_ACTIVATED_INTEREST_MSG;
+      return BOOKING_NOT_ACTIVATED_CONTACT_MSG;
     // «Mine valg» booking.pause (O1a): the owner is not taking requests now.
     case "not_taking":
       return GARDSSALG_NOT_TAKING_REQUESTS_TEXT.no;
@@ -7172,18 +7245,24 @@ router.get(
     // fill in a request that the POST below refuses.
     const ownerPaused = !notLive && gardssalgBookingPausedByOwner(provider.id);
     const pausedNotice = notLive
-      ? `<div class="notice-paused" role="status"><strong>Booking ikke aktivert</strong>${BOOKING_NOT_ACTIVATED_INTEREST_MSG}${panelClaimCta}</div>`
+      ? `<div class="notice-paused" role="status"><strong>Booking ikke aktivert</strong>${BOOKING_NOT_ACTIVATED_CONTACT_MSG}${panelClaimCta}</div>`
       : ownerPaused
         ? `<div class="notice-paused" role="status" data-owner-paused="1"><strong>Tar ikke imot forespørsler nå</strong>${escapeHtml(GARDSSALG_NOT_TAKING_REQUESTS_TEXT.no)}</div>`
         : "";
 
+    // dev-request 2026-11-06-opplevagent-meld-interesse-fjernes-mens-booking-av:
+    // booking off ⇒ no reservation form at all (its submission is hard-stopped
+    // and nothing is stored), only the producer's own contact routes. Booking
+    // on ⇒ the form below, byte-identical to before.
+    const profilePagePath = `/kategori/gardssalg/produsent/${encodeURIComponent(slug)}`;
+    const pausedContactBlock = notLive ? gardssalgBookPanelContactHtml(provider, profilePagePath) : "";
     const html = `<!doctype html>
 <html lang="nb">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Book besøk hos ${escapeHtml(provider.navn)} | Opplevagent</title>
-<meta name="description" content="Reserver en smaking eller omvisning hos ${escapeHtml(provider.navn)}${sted ? " i " + escapeHtml(sted) : ""}. Ingen betaling nå — kun en reservasjon.">
+<title>${notLive ? "Kontakt" : "Book besøk hos"} ${escapeHtml(provider.navn)} | Opplevagent</title>
+<meta name="description" content="${notLive ? `Kontaktinformasjon for ${escapeHtml(provider.navn)}${sted ? " i " + escapeHtml(sted) : ""}.` : `Reserver en smaking eller omvisning hos ${escapeHtml(provider.navn)}${sted ? " i " + escapeHtml(sted) : ""}. Ingen betaling nå — kun en reservasjon.`}">
 <meta name="robots" content="noindex, follow">
 <link rel="canonical" href="${canonical}">
 ${pwaHeadTags()}
@@ -7223,7 +7302,7 @@ ${BROWSE_CSS}
     ${sted ? `<div class="sted">${escapeHtml(sted)}</div>` : ""}
     <h1>${escapeHtml(provider.navn)}</h1>
     ${badge}
-    ${notLive ? "" : `<p class="microcopy">Du betaler ingenting nå — dette er en reservasjon.</p>`}
+    ${notLive ? pausedContactBlock : `<p class="microcopy">Du betaler ingenting nå — dette er en reservasjon.</p>
     <form class="book-form" method="POST" action="${canonical}" id="book-form">
       <input type="hidden" name="provider_id" value="${escapeHtml(provider.id)}">
       <label for="slot_at">Dato og tid (norsk tid)</label>
@@ -7240,7 +7319,7 @@ ${BROWSE_CSS}
       <textarea id="notes" name="notes" maxlength="500" rows="3" placeholder="F.eks. allergier, spørsmål eller ønsker for besøket"></textarea>
       <button type="submit">Reserver besøk</button>
       <p class="hint" id="book-form-status" role="status" aria-live="polite"></p>
-    </form>
+    </form>`}
   </div>
 </main>
 <footer style="margin-top:48px;padding:24px 0;border-top:1px solid #e4ded0;font-size:.8rem;color:#7a7163;text-align:center">

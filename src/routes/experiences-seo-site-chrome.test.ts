@@ -408,7 +408,7 @@ export function runExperiencesSeoSiteChromeTests(opts: { log?: boolean } = {}): 
       assertTrue(produsent.body.includes('class="site-footer"'), "k3: produsent page has the full .site-footer (not the old hand-rolled footer)");
       assertTrue(produsent.body.includes('href="/llms.txt"'), "k4: produsent footer links llms.txt");
       assertTrue(produsent.body.includes('href="/personvern"'), "k5: produsent footer links /personvern");
-      assertTrue(produsent.body.includes('id="reserve-cta"'), "k6: produsent page content unaffected — reserve CTA (id=\"reserve-cta\") still present");
+      assertTrue(produsent.body.includes('id="reserve-cta"') || produsent.body.includes('id="reserve-contact"'), "k6: produsent page content unaffected — reserve CTA (id=\"reserve-cta\") or, booking off, the contact card (id=\"reserve-contact\") still present");
       assertTrue(produsent.body.includes("Om produsenten"), "k7: produsent page content unaffected — \"Om produsenten\" heading still present");
 
       // ── (l) /kontakt — same 4-marker probe as (i)/(k), plus the contact
