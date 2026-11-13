@@ -67,6 +67,7 @@ import { validatePhoneForWrite } from "../services/contact-normalizer";
 // W40 write guards (Kvestad Sideri): a Brreg street address corrects a stored
 // road-designation-only address in applyAgentBrregContact below.
 import { canCorrectRoadOnlyAddress } from "../services/street-address-parse";
+import { ADMIN_CORRECTED, adminCorrectedAddressBlocks } from "../services/admin-corrected-address";
 // Reused, unchanged, from the admin-knowledge factual-field write gate (see
 // POST /brreg-description-fallback below): canCorrectFactualField's
 // curated-lock refusal is the SAME hard rule every other admin write path
@@ -3091,7 +3092,13 @@ export function applyAgentBrregContact(
   agentId: string,
   values: { address?: string | null; phone?: string | null },
   evidenceUrl: string,
-  opts: { dryRun?: boolean; batchId?: string } = {},
+  opts: {
+    dryRun?: boolean;
+    batchId?: string;
+    /** Out: set to "admin_corrected" when a road-designation upgrade was refused
+     *  because the stored address is an admin content-correction. */
+    report?: { addressSkippedReason?: string };
+  } = {},
 ): string[] {
   const dryRun = !!opts.dryRun;
 
@@ -3134,7 +3141,7 @@ export function applyAgentBrregContact(
   } catch {
     /* malformed curated_fields -> not locked */
   }
-  const roadOnlyCorrectFrom =
+  const roadOnlyEligible =
     !!addressVal && !addressColumnBlank &&
     canCorrectRoadOnlyAddress({
       currAddr: kRow!.address!,
@@ -3143,9 +3150,13 @@ export function applyAgentBrregContact(
       ownName: agentRow.name,
       existingAddressProvenance: existingProv.address,
       isCurated: addressCuratedLocked,
-    })
-      ? kRow!.address!
-      : null;
+    });
+  // dev-request 2026-11-08-rfb-adresse-skriveveier-respekterer-admin-retting:
+  // never upgrade an address a person corrected with content-correction (the
+  // fill of an EMPTY column below is unchanged; provenance is still added).
+  const roadOnlyAdminCorrected = roadOnlyEligible && adminCorrectedAddressBlocks(db, agentId, addressVal);
+  if (roadOnlyAdminCorrected && opts.report) opts.report.addressSkippedReason = ADMIN_CORRECTED;
+  const roadOnlyCorrectFrom = roadOnlyEligible && !roadOnlyAdminCorrected ? kRow!.address! : null;
   const addressWouldFillColumn = !!addressVal && (addressColumnBlank || roadOnlyCorrectFrom !== null);
   const phoneWouldFillColumn = !!phoneVal && phoneColumnBlank;
 
@@ -3320,6 +3331,8 @@ router.post("/brreg-contact-backfill", async (req: Request, res: Response) => {
     let brregHitAny = 0;
     const changed: Array<{ agent_id: string; fields: string[]; address: string | null; phone: string | null; source_url: string }> = [];
     const skippedLocked: string[] = [];
+    // dev-request 2026-11-08-rfb-adresse-skriveveier-respekterer-admin-retting.
+    const addressSkippedAdminCorrected: string[] = [];
     const unresolved: Array<{ agent_id: string; reason: string }> = [];
     const errors: Array<{ agent_id: string; error: string }> = [];
 
@@ -3406,14 +3419,16 @@ router.post("/brreg-contact-backfill", async (req: Request, res: Response) => {
         continue;
       }
 
+      const applyReport: { addressSkippedReason?: string } = {};
       if (dryRun) {
         const wouldTouch = applyAgentBrregContact(
           db,
           agentId,
           { address: gatedAddress, phone: gatedPhone },
           evidenceUrl,
-          { dryRun: true },
+          { dryRun: true, report: applyReport },
         );
+        if (applyReport.addressSkippedReason === ADMIN_CORRECTED) addressSkippedAdminCorrected.push(agentId);
         if (wouldTouch.length === 0) {
           unresolved.push({ agent_id: agentId, reason: "already_up_to_date" });
           continue;
@@ -3432,8 +3447,9 @@ router.post("/brreg-contact-backfill", async (req: Request, res: Response) => {
             agentId,
             { address: gatedAddress, phone: gatedPhone },
             evidenceUrl,
-            { dryRun: false, batchId },
+            { dryRun: false, batchId, report: applyReport },
           );
+          if (applyReport.addressSkippedReason === ADMIN_CORRECTED) addressSkippedAdminCorrected.push(agentId);
           if (written.length > 0) {
             changed.push({
               agent_id: agentId,
@@ -3466,6 +3482,10 @@ router.post("/brreg-contact-backfill", async (req: Request, res: Response) => {
       agents_enriched: changed.length,
       changed,
       skipped_locked: skippedLocked,
+      // Additive: present only when an admin-corrected address was left alone.
+      ...(addressSkippedAdminCorrected.length
+        ? { address_skipped_admin_corrected: addressSkippedAdminCorrected, address_skipped_reason: ADMIN_CORRECTED }
+        : {}),
       unresolved,
       errors,
     });

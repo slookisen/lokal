@@ -183,6 +183,7 @@ import { readDebioVerified } from "../services/debio-approval";
 // W40 RFB spot-check write guards: road-designation precedence for address
 // corrections + the phone-must-be-on-its-source-page gate for the PUT below.
 import { parseStoredStreetAddress, streetAddressBeatsRoadDesignation } from "../services/street-address-parse";
+import { ADMIN_CORRECTED, adminCorrectedAddressBlocks } from "../services/admin-corrected-address";
 import {
   guardAutoPhoneWrite,
   recordOwnerRelayPhoneAudit,
@@ -1064,8 +1065,21 @@ router.put("/", async (req: Request, res: Response) => {
   // address written through this route — see stripTrailingNorgeSuffix()
   // below for the pure function + the GET/POST sweep for existing rows.
   // Touches ONLY that trailing token; the rest of the string is untouched.
-  if (typeof body.address === "string")
-    columnUpdates.push({ col: "address", val: stripTrailingNorgeSuffix(body.address) });
+  // dev-request 2026-11-08-rfb-adresse-skriveveier-respekterer-admin-retting:
+  // an address a person corrected with POST /admin/agents/content-correction
+  // is not replaced by a different value here — with or without allow_correct
+  // (this lane is the shared admin key, never the owner). The rest of the call
+  // is written as before; the response carries address_rejected_reason.
+  let addressRejectedReason: string | undefined;
+  if (typeof body.address === "string") {
+    const addressVal = stripTrailingNorgeSuffix(body.address);
+    if (adminCorrectedAddressBlocks(db, agentId, addressVal)) {
+      addressRejectedReason = ADMIN_CORRECTED;
+      console.log(`[admin-knowledge] address write REFUSED for agent ${agentId} — ${ADMIN_CORRECTED}; not written`);
+    } else {
+      columnUpdates.push({ col: "address", val: addressVal });
+    }
+  }
   // ── Phone write guard (W40 RFB spot-check, Aalan Gård) ─────────────────
   // This endpoint is the admin/auto enrichment lane (X-Admin-Key only). A
   // phone value is written only when it is SEEN on the source page the write
@@ -1517,6 +1531,12 @@ router.put("/", async (req: Request, res: Response) => {
     agentColumnUpdates.push(...keptAgentUpdates);
   }
 
+  // Admin-corrected address (refused above, before the allow_correct gate saw
+  // it): reported in corrections[] like any other refused field.
+  if (allowCorrect && addressRejectedReason) {
+    corrections.push({ field: "address", action: "refused", reason: addressRejectedReason });
+  }
+
   // Merge in the city write decided above — AFTER the generic allow_correct-
   // gated loop, which has no "city" entry in its own existingColVal map and
   // would otherwise treat any city entry it saw as a pure ADD and
@@ -1663,6 +1683,8 @@ router.put("/", async (req: Request, res: Response) => {
     // absent, or canCorrectFactualField refused it) — absent (not null) on
     // every ordinary call, same convention as website_rejected_reason above.
     ...(cityRejectedReason ? { city_rejected_reason: cityRejectedReason } : {}),
+    // Present only when an admin-corrected address was left alone ("admin_corrected").
+    ...(addressRejectedReason ? { address_rejected_reason: addressRejectedReason } : {}),
     // W40 write guards: present only when the call carried a `phone` — the
     // guard's verdict (outcome: verified / unchanged / cleared / owner_relay /
     // rejected_no_source_url / rejected_source_url_invalid /
