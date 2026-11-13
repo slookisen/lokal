@@ -4,8 +4,10 @@
 // stats.public_counts / public_search_terms / public_trust on the surfaces
 // each declares in the registry (`surfaces`).
 //
-// Gate: OWNER_FEATURES_ENFORCE ("1"/"true") AND the subject is in
-// OWNER_FEATURES_ALLOWED_SUBJECTS. Otherwise the lookup returns nothing
+// Gate: OWNER_FEATURES_ENFORCE ("1"/"true") AND the subject has the
+// `mine_valg` owner feature (feature-tiers.ts ownerFeatureAllowedRfbIds: the
+// pilot list OWNER_FEATURES_ALLOWED_SUBJECTS by default; beta/ga per tier,
+// beta-for-alle S2). Otherwise the lookup returns nothing
 // without touching the DB, and every surface renders exactly as before.
 // Values come from the resolver (./resolve.ts), so a key that is still
 // `coming_soon` keeps its default (shown) — only an admin lock or the status
@@ -15,7 +17,7 @@
 // (resolveOwnerFeatureKeysForSubjects). A failed lookup for an allowlisted
 // subject hides the enforced fields (fail closed) and logs.
 
-import { ownerFeaturesAllowedSubjects } from "./allowlist";
+import { ownerFeatureAllowedRfbIds } from "./feature-tiers";
 import { resolveOwnerFeatureKeysForSubjects, type ResolvedOwnerFeature } from "./resolve";
 import type { OwnerFeatureEntry, OwnerFeatureKey } from "./registry";
 import { isProductHeader, isProductNoise, parseProductPrice, productPriceText } from "../services/knowledge-service";
@@ -82,9 +84,9 @@ export function publicFieldChoicesForMany(agentIds: Iterable<string>, opts: Enfo
   const env = opts.env ?? process.env;
   const out = new Map<string, PublicFieldChoices>();
   if (!ownerFeaturesEnforceOn(env)) return out;
-  const allowed = new Set(ownerFeaturesAllowedSubjects(env));
+  const allowed = new Set(ownerFeatureAllowedRfbIds("mine_valg", { env, db: opts.db }));
   if (allowed.size === 0) return out;
-  const ids = [...new Set(agentIds)].filter((id) => typeof id === "string" && allowed.has(`rfb:${id}`));
+  const ids = [...new Set(agentIds)].filter((id) => typeof id === "string" && allowed.has(id));
   if (ids.length === 0) return out;
   try {
     const resolved = resolveOwnerFeatureKeysForSubjects("rfb", ids, ENFORCED_OWNER_FEATURE_KEYS, {
@@ -199,9 +201,9 @@ export function debioSwitchOffAgentIds(agentIds: Iterable<string>, opts: Enforce
   const env = opts.env ?? process.env;
   const out = new Set<string>();
   if (!ownerFeaturesEnforceOn(env)) return out;
-  const allowed = new Set(ownerFeaturesAllowedSubjects(env));
+  const allowed = new Set(ownerFeatureAllowedRfbIds("mine_valg", { env, db: opts.db }));
   if (allowed.size === 0) return out;
-  const ids = [...new Set(agentIds)].filter((id) => typeof id === "string" && allowed.has(`rfb:${id}`));
+  const ids = [...new Set(agentIds)].filter((id) => typeof id === "string" && allowed.has(id));
   if (ids.length === 0) return out;
   try {
     const resolved = resolveOwnerFeatureKeysForSubjects("rfb", ids, ["auto.debio"], {

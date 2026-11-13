@@ -6,8 +6,10 @@
 // (publicListableSql, isAgentIdPubliclyVisible, notOwnerHiddenSql,
 // ownerHiddenAgentIds, ownerHidesAgent), so the rule lives in one place.
 //
-// Only subjects in OWNER_FEATURES_ALLOWED_SUBJECTS (`rfb:<agents.id>`) are
-// looked up; a profile outside the allowlist is never hidden and costs no
+// Only subjects with the `mine_valg` owner feature are looked up
+// (feature-tiers.ts ownerFeatureAllowedRfbIds: the pilot list
+// OWNER_FEATURES_ALLOWED_SUBJECTS `rfb:<agents.id>` by default; beta/ga per
+// tier, beta-for-alle S2); a profile outside the allowlist is never hidden and costs no
 // query. All allowlisted profiles resolve with ONE query
 // (resolveOwnerFeatureKeysForSubjects), so a list surface pays one lookup per
 // request, not one per row. Values come from the resolver: a key that is still
@@ -15,7 +17,7 @@
 // flip after the S2d switch probe, makes a choice take effect.
 // A failed lookup hides the allowlisted profiles everywhere (fail closed) and logs.
 
-import { ownerFeaturesAllowedSubjects } from "./allowlist";
+import { ownerFeatureAllowedRfbIds } from "./feature-tiers";
 import { resolveOwnerFeatureKeysForSubjects, type ResolvedOwnerFeature } from "./resolve";
 import type { OwnerFeatureEntry, OwnerFeatureKey } from "./registry";
 import type { OwnerVisibilityChoice } from "../services/agent-visibility";
@@ -51,11 +53,8 @@ function hiddenChoices(byKey: Record<string, ResolvedOwnerFeature>): Set<OwnerVi
   return new Set(CHOICES.filter(off));
 }
 
-function allowlistedIds(env: NodeJS.ProcessEnv): string[] {
-  return ownerFeaturesAllowedSubjects(env)
-    .filter((s) => s.startsWith("rfb:"))
-    .map((s) => s.slice(4))
-    .filter(Boolean);
+function allowlistedIds(env: NodeJS.ProcessEnv, db?: any): string[] {
+  return ownerFeatureAllowedRfbIds("mine_valg", { env, db });
 }
 
 /**
@@ -68,9 +67,10 @@ export function ownerHiddenChoicesForMany(
 ): Map<string, Set<OwnerVisibilityChoice>> {
   const env = opts.env ?? process.env;
   const out = new Map<string, Set<OwnerVisibilityChoice>>();
-  const allowed = allowlistedIds(env);
+  const allowed = allowlistedIds(env, opts.db);
   if (allowed.length === 0) return out;
-  const wanted = agentIds === null ? allowed : [...new Set(agentIds)].filter((id) => allowed.includes(id));
+  const allowedSet = new Set(allowed);
+  const wanted = agentIds === null ? allowed : [...new Set(agentIds)].filter((id) => allowedSet.has(id));
   if (wanted.length === 0) return out;
   try {
     const resolved = resolveOwnerFeatureKeysForSubjects("rfb", wanted, KEYS, {

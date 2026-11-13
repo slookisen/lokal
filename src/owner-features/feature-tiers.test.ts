@@ -68,6 +68,18 @@ const DIRECT_PILOT_LIST_EXCEPTIONS = new Set([
   "src/owner-features/switch-probe.ts",
 ]);
 
+/**
+ * S2 (review N1): production files allowed to read the raw pilot list
+ * (ownerFeaturesAllowedSubjects) — the list itself and the tier module. The
+ * bulk paths enforce.ts, visibility.ts, today-facts.ts and
+ * stock-check-reminder.ts go through feature-tiers ownerFeatureAllowedRfbIds /
+ * rfbPilotIds.
+ */
+const DIRECT_PILOT_LIST_READ_EXCEPTIONS = new Set([
+  "src/owner-features/allowlist.ts",
+  "src/owner-features/feature-tiers.ts",
+]);
+
 function walk(dir: string, out: string[]): void {
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
     const p = path.join(dir, e.name);
@@ -176,13 +188,15 @@ export async function runFeatureTiersTests(opts: { log?: boolean } = {}): Promis
         check(`S1 beta ${k}: pilot owner allowed`, ownerFeatureAccess(k, "rfb", PIL, env).allowed);
         check(`S1 beta ${k}: normal owner denied (no enrollment yet)`, !ownerFeatureAccess(k, "rfb", OUT, env).allowed);
       }
-      // With a test enrollment lookup (S2 shape): beta opens, rfb only.
+      // With a test enrollment lookup: beta opens only with OWNER_BETA_MODE=offer (S2), rfb only.
       __setBetaEnrollmentLookupForTesting(() => true);
+      check("beta + enrolled, mode unset (off): denied", !ownerFeatureAccess("dashboard", "rfb", OUT, env).allowed);
+      env.OWNER_BETA_MODE = "offer";
       const b = ownerFeatureAccess("dashboard", "rfb", OUT, env);
       check("beta + enrolled (test lookup): allowed, source beta", b.allowed && b.source === "beta");
       check("beta + enrolled: non-rfb vertical still denied", !ownerFeatureAccess("dashboard", "gardssalg", OUT, env).allowed);
       check("beta + enrolled: pilot tier feature still denied",
-        !ownerFeatureAccess("dashboard", "rfb", OUT, envOf({ OWNER_FEATURE_TIERS: "orders=beta" })).allowed);
+        !ownerFeatureAccess("dashboard", "rfb", OUT, envOf({ OWNER_FEATURE_TIERS: "orders=beta", OWNER_BETA_MODE: "offer" })).allowed);
       __setBetaEnrollmentLookupForTesting(() => { throw new Error("db down"); });
       check("AC2 beta: enrollment lookup throws → denied", !ownerFeatureAccess("dashboard", "rfb", OUT, env).allowed);
       check("AC2 beta: lookup throws, pilot owner still allowed", ownerFeatureAccess("dashboard", "rfb", PIL, env).allowed);
@@ -264,7 +278,12 @@ export async function runFeatureTiersTests(opts: { log?: boolean } = {}): Promis
         const pilotBeta = envOf({ [flag]: "pilot", OWNER_FEATURE_TIERS: `${key}=beta` });
         check(`flag ${flag}=pilot, tier beta (S1): out no`, !ownerFlagEnabledFor(flag, OUT, pilotBeta));
         const pilotGa = envOf({ [flag]: "pilot", OWNER_FEATURE_TIERS: `${key}=ga` });
-        check(`flag ${flag}=pilot, tier ga: out yes`, ownerFlagEnabledFor(flag, OUT, pilotGa));
+        if (key === "product_import_outreach") {
+          // N7 (S2): outreach is capped at beta — ga never opens it for everyone.
+          check(`flag ${flag}=pilot, tier ga: capped at beta, out no`, !ownerFlagEnabledFor(flag, OUT, pilotGa));
+        } else {
+          check(`flag ${flag}=pilot, tier ga: out yes`, ownerFlagEnabledFor(flag, OUT, pilotGa));
+        }
         const all = envOf({ [flag]: "1" });
         check(`flag ${flag}=1: on for everyone as today`, ownerFlagEnabledFor(flag, OUT, all) && ownerFlagEnabledFor(flag, null, all));
       }
@@ -278,6 +297,7 @@ export async function runFeatureTiersTests(opts: { log?: boolean } = {}): Promis
       const used = new Set<string>();
       const direct: string[] = [];
       const nonLiteral: string[] = [];
+      const bulkDirect: string[] = [];
       for (const abs of files) {
         const rel = path.relative(root, abs).split(path.sep).join("/");
         const src = fs.readFileSync(abs, "utf8");
@@ -290,6 +310,7 @@ export async function runFeatureTiersTests(opts: { log?: boolean } = {}): Promis
           }
         }
         if (/isSubjectAllowedForOwnerFeatures\(/.test(src) && !DIRECT_PILOT_LIST_EXCEPTIONS.has(rel)) direct.push(rel);
+        if (/ownerFeaturesAllowedSubjects\(/.test(src) && !DIRECT_PILOT_LIST_READ_EXCEPTIONS.has(rel)) bulkDirect.push(rel);
       }
       const expectedNonLiteral = ["src/owner-features/owner-flag-mode.ts: OWNER_PILOT_FLAG_FEATURE[name] ?? name"];
       check("completeness: call sites found", used.size >= 6, [...used].join(","));
@@ -297,6 +318,9 @@ export async function runFeatureTiersTests(opts: { log?: boolean } = {}): Promis
       check("completeness: only the owner-flag mapping passes a non-literal key",
         nonLiteral.length === expectedNonLiteral.length && nonLiteral.every((x) => expectedNonLiteral.includes(x)), nonLiteral.join(" | "));
       check("completeness: no production path around ownerFeatureAccess", direct.length === 0, direct.join(", "));
+      // S2 (review N1): the bulk paths (enforce, visibility, today-facts,
+      // stock-check) read the allowed ids through ownerFeatureAllowedRfbIds.
+      check("completeness: no bulk path reads the pilot list directly", bulkDirect.length === 0, bulkDirect.join(", "));
       const covered = new Set<string>([...used, ...Object.values(OWNER_PILOT_FLAG_FEATURE)]);
       const unused = OWNER_FEATURE_KEYS.filter((k) => !covered.has(k));
       check("completeness: every registry key has a call site", unused.length === 0, unused.join(","));
