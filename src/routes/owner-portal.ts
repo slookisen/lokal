@@ -26,6 +26,9 @@ import { getSupplyGraphHardStaleDays, getSupplyGraphStaleDays } from "../service
 import { stockSoftExpiryActiveFor } from "../services/stock-soft-expiry";
 import { writeOrderNotificationsOptInWithAudit } from "../services/order-opt-in";
 import { ownerFeatureAccess } from "../owner-features/feature-tiers";
+import { betaCardHtml } from "../owner-features/beta-card";
+import { ownerBetaMode } from "../owner-features/beta-mode";
+import { BETA_TEXTS } from "../owner-features/beta-texts";
 import {
   OWNER_FEATURE_GROUPS, getOwnerFeature, ownerAutoUpdatesEnabled, ownerFeatureEntryForEnv, visibleOwnerFeatureOptions, type OwnerFeatureValue,
 } from "../owner-features/registry";
@@ -2108,6 +2111,14 @@ function renderOwnerPortalPage(req: Request, res: Response, addForm: OwnerItemsA
       alert = pa.ok
         ? `<div class="ep-alert ep-alert-ok" role="status">${escapeHtml(pa.text)}</div>`
         : `<div class="ep-alert ep-alert-error" role="alert">${escapeHtml(pa.text)}</div>`;
+    } else if (betaPortalAlert(status)) {
+      // beta-for-alle S3: the PRG status after opt-in / opt-out / interest.
+      // Only in OWNER_BETA_MODE=offer, so with the flag off the portal is
+      // byte-identical to today (an unknown status is ignored, as before).
+      const ba = betaPortalAlert(status)!;
+      alert = ba.ok
+        ? `<div class="ep-alert ep-alert-ok" role="status">${escapeHtml(ba.text)}</div>`
+        : `<div class="ep-alert ep-alert-error" role="alert">${escapeHtml(ba.text)}</div>`;
     }
 
     // Prepayment card (A2A dev-request 2026-10-09-rfb-forhandsbetaling-
@@ -2212,6 +2223,18 @@ function renderOwnerPortalPage(req: Request, res: Response, addForm: OwnerItemsA
     }
 
     const ownerFeaturesCardHtml = hasOwnerFeatures ? ownerFeaturesEntryCardHtml(agentId) : "";
+
+    // beta-for-alle S3: the beta card on the regular owner page — only with
+    // OWNER_BETA_MODE=offer, for a verified NON-pilot owner (betaCardState fails
+    // closed on any DB error / wrong mode / wrong vertical / unverified owner).
+    // Off/unset mode → "" (the portal is byte-identical to today, AC1).
+    let betaCardHtmlStr = "";
+    try {
+      betaCardHtmlStr = betaCardHtml(agentId, isVerifiedOwner(agentId, session), process.env, db);
+    } catch (e) {
+      console.error("[owner-portal] beta card failed:", e instanceof Error ? e.message : "error");
+      betaCardHtmlStr = "";
+    }
 
     // H2 (dev-request 2026-11-01-rfb-hold-profilen-oppdatert): the auto.updates
     // card for every verified owner, allowlist or not — only with
@@ -2370,7 +2393,7 @@ function renderOwnerPortalPage(req: Request, res: Response, addForm: OwnerItemsA
         </form>${organicNoticeHtml ? `\n        <form id="ep-orgnr-form" method="post" action="/eier/${encodeURIComponent(agent.id)}/org-nr"></form>` : ""}
       </div>
 
-      ${autoUpdatesCardHtml}${ownerFeaturesCardHtml}${ownerSelgerCardHtml(agent.id)}${productImportCard}${orderabilityCardHtml}${ownerOrdersEntryCardHtml(agent.id, pendingOrderCount)}${ordersOrMovedCardHtml}${paymentCardHtml}${pauseCardHtml}
+      ${autoUpdatesCardHtml}${ownerFeaturesCardHtml}${betaCardHtmlStr}${ownerSelgerCardHtml(agent.id)}${productImportCard}${orderabilityCardHtml}${ownerOrdersEntryCardHtml(agent.id, pendingOrderCount)}${ordersOrMovedCardHtml}${paymentCardHtml}${pauseCardHtml}
 
       <div class="ep-card">
         <h2>Statistikk</h2>
@@ -2792,6 +2815,30 @@ const ORDER_EMAIL_ERROR_STATUS: Record<string, string> = {
   email_blocked: "order_email_blocked",
   rate_limited: "order_email_rate",
 };
+
+// beta-for-alle S3: the portal PRG status after opt-in / opt-out / interest
+// (POST /eier/:id/beta/*). Texts are the placeholders in beta-texts.ts (AC8).
+const BETA_STATUS_ALERTS: Record<string, { ok: boolean; text: string }> = {
+  beta_on: { ok: true, text: BETA_TEXTS.alertOn },
+  beta_capped: { ok: true, text: BETA_TEXTS.alertCapped },
+  beta_interest: { ok: true, text: BETA_TEXTS.alertInterest },
+  beta_interest_exists: { ok: true, text: BETA_TEXTS.alertInterestExists },
+  beta_off: { ok: true, text: BETA_TEXTS.alertOff },
+  beta_no_change: { ok: true, text: BETA_TEXTS.alertNoChange },
+  beta_not_offered: { ok: false, text: BETA_TEXTS.alertNotOffered },
+  beta_terms: { ok: false, text: BETA_TEXTS.alertTermsRequired },
+  beta_error: { ok: false, text: BETA_TEXTS.alertError },
+};
+
+/**
+ * The beta PRG alert for a `status`, or null. Only in OWNER_BETA_MODE=offer, so
+ * with the flag off/unset the portal is byte-identical to today (AC1) and an
+ * unknown status falls through, exactly as before.
+ */
+function betaPortalAlert(status: string): { ok: boolean; text: string } | null {
+  if (ownerBetaMode() !== "offer") return null;
+  return Object.prototype.hasOwnProperty.call(BETA_STATUS_ALERTS, status) ? BETA_STATUS_ALERTS[status] : null;
+}
 
 const orderEmailConfirmLimiter = rateLimit({
   windowMs: 60 * 1000,

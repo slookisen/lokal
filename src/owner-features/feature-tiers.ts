@@ -35,7 +35,7 @@
 
 import { isSubjectAllowedForOwnerFeatures, ownerFeaturesAllowedSubjects } from "./allowlist";
 import { ownerBetaMode, type OwnerBetaMode } from "./beta-mode";
-import { activeBetaAgentIds, isBetaEnrollmentActive } from "./beta-enrollment";
+import { activeVerifiedBetaAgentIds, isVerifiedBetaEnrollmentActive, rfbAgentSql } from "./beta-enrollment";
 import { customerRuleSql } from "../services/customer-rule";
 import { getDb } from "../database/init";
 
@@ -174,7 +174,9 @@ function betaRowsHonoured(mode: OwnerBetaMode): boolean {
 // for vertical rfb, a `beta` tier and OWNER_BETA_MODE offer/all.
 export type BetaEnrollmentLookup = (vertical: string, agentId: string, env: NodeJS.ProcessEnv) => boolean;
 
-const DB_ENROLLMENT: BetaEnrollmentLookup = (vertical, agentId) => isBetaEnrollmentActive(vertical, agentId);
+// N2 (S3): an `active` row grants beta only while the owner is still verified,
+// and (B1) only for an agent whose own agents.vertical_id is rfb.
+const DB_ENROLLMENT: BetaEnrollmentLookup = (vertical, agentId) => isVerifiedBetaEnrollmentActive(vertical, agentId);
 let betaEnrollmentLookup: BetaEnrollmentLookup = DB_ENROLLMENT;
 
 /** Test hook: swap the enrollment lookup (null = the owner_beta_enrollment table). */
@@ -251,10 +253,11 @@ export interface OwnerFeatureBulkOptions {
  * The same answer as ownerFeatureAccess, for the bulk paths that select many
  * subjects at once (enforce.ts, visibility.ts, stock-check-reminder.ts):
  *   - effective tier pilot → the rfb pilot list (no DB access — today's behaviour)
- *   - beta → pilot list ∪ `active` enrollment rows while OWNER_BETA_MODE is
+ *   - beta → pilot list ∪ `active` enrollment rows of rfb agents with a
+ *     still-verified owner while OWNER_BETA_MODE is
  *     offer (or all, for a beta-capped feature); mode off → pilot list only
- *   - ga → pilot list ∪ every agent with a verified owner (customerRuleSql,
- *     the same rule as isVerifiedOwner)
+ *   - ga → pilot list ∪ every rfb agent (agents.vertical_id) with a verified
+ *     owner (customerRuleSql, the same rule as isVerifiedOwner)
  * Fail closed: a DB error leaves only the pilot list (logged).
  * Order: pilot ids first, in list order, then the rest sorted.
  */
@@ -275,10 +278,12 @@ export function ownerFeatureAllowedRfbIds(feature: OwnerFeatureKey, opts: OwnerF
   try {
     if (tier === "ga") {
       const db = opts.db ?? getDb();
-      extra = (db.prepare(`SELECT a.id AS id FROM agents a WHERE ${customerRuleSql("a")} ORDER BY a.id`).all() as Array<{ id: string }>)
+      // B1: only rfb agents (agents.vertical_id), never dental/experiences.
+      extra = (db.prepare(`SELECT a.id AS id FROM agents a WHERE ${rfbAgentSql("a")} AND ${customerRuleSql("a")} ORDER BY a.id`).all() as Array<{ id: string }>)
         .map((r) => r.id);
     } else if (tier === "beta" && betaRowsHonoured(mode)) {
-      extra = activeBetaAgentIds(OWNER_FEATURE_TIER_VERTICAL, opts.db);
+      // N2: only active rows whose owner is still verified (customerRuleSql).
+      extra = activeVerifiedBetaAgentIds(OWNER_FEATURE_TIER_VERTICAL, opts.db);
     }
   } catch (err) {
     try { console.error(`[owner-feature-tiers] bulk lookup failed for ${String(feature)}, pilot list only:`, (err as any)?.message ?? "error"); } catch { /* never throw */ }

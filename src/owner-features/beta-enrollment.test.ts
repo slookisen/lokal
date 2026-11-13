@@ -186,6 +186,10 @@ export async function runBetaEnrollmentTests(opts: { log?: boolean } = {}): Prom
     // ── AC4: the cap ────────────────────────────────────────────────────
     {
       reset();
+      // S3 review N2: an active beta row grants access only while the owner is
+      // still a verified owner, so the cap's synthetic owners need a claim.
+      for (const id of ["c1", "c2", "c3", "c4", "c5", "c6"]) insAgent.run(id, `Gård ${id}`, `${id}@farm.example.no`, `k-${id}`);
+      db.prepare("UPDATE agents SET claimed_at = '2026-11-01T00:00:00Z' WHERE id IN ('c1','c2','c3','c4','c5','c6')").run();
       const capEnv = (cap: string | undefined) => envOf({ OWNER_BETA_MODE: "offer", OWNER_BETA_CAP: cap });
       const ids = ["c1", "c2", "c3"];
       const res = ids.map((id) => be.optIn("rfb", id, "v1", { env: capEnv("2") }));

@@ -116,6 +116,7 @@ import ownerPortalRoutes from "./routes/owner-portal";
 import ownerProductImportRoutes from "./routes/owner-product-import";
 import ownerProductOutreachRoutes from "./routes/owner-product-outreach";
 import ownerFeaturesRoutes from "./routes/owner-features";
+import ownerBetaRoutes from "./routes/owner-beta";
 import ownerOrdersRoutes from "./routes/owner-orders";
 import buyerOrderCardRoutes from "./routes/buyer-order-card";
 import avmeldRoutes from "./routes/avmeld";
@@ -585,6 +586,11 @@ app.use("/", ownerPortalRoutes);
 // (GET/PUT /api/owner/:id/features). Same owner session + isVerifiedOwner;
 // 404 for every subject not in OWNER_FEATURES_ALLOWED_SUBJECTS (default empty).
 app.use("/", ownerFeaturesRoutes);
+// dev-request 2026-11-09-rfb-eierverktoy-beta-for-alle S3: owner beta opt-in /
+// opt-out / register-interest (POST /eier/:id/beta/{pa,av,interesse}). Owner
+// session + isVerifiedOwner + same-origin guard; beta-enrollment enforces rfb
+// only, mode offer (opt-out any mode) and the cap. Harmless with the flag off.
+app.use("/", ownerBetaRoutes);
 // dev-request 2026-10-21-rfb-produktimport-fra-egen-nettside, Skive 3-1: owner product import
 // from the profile's own website (/api/agents/:id/product-import[/fetch|/runs/:runId[/publish]]).
 // Flag PRODUCT_IMPORT_ENABLED (default off → 404); same owner session + isVerifiedOwner + is_verified=1.

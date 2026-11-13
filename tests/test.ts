@@ -54300,3 +54300,25 @@ runSerial(async () => {
     failures.push("beta-enrollment: unexpected error: " + String(err?.message || err));
   }
 });
+
+// beta-for-alle S3 (2026-11-09-rfb-eierverktoy-beta-for-alle): the owner beta
+// card, opt-in/opt-out/register-interest POST routes, the Beta badge, the N1
+// (admin outreach cap) and N2 (verified-owner intersection) review follow-ups,
+// and AC1 (no beta markup with the flag off). Own in-memory DB; swaps the main
+// test DB, the enrollment test DB and OWNER_BETA_* / OWNER_FEATURE_* env
+// (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── beta-for-alle S3: eier-beta-kort, slå på/av, merke, N1/N2 ──");
+  try {
+    const { runBetaCardTests } = require("../src/owner-features/beta-card.test") as
+      typeof import("../src/owner-features/beta-card.test");
+    const r = await runBetaCardTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("beta-card: " + f);
+    console.log(`  beta-card: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("beta-card: unexpected error: " + String(err?.message || err));
+  }
+});

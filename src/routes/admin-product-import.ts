@@ -38,7 +38,7 @@ import {
   activeOutreachPrepareId,
   getOutreachReport,
   OUTREACH_CAMPAIGN_RE,
-  productImportOutreachEnabledFor,
+  productImportOutreachAdminEnabledFor,
   productImportOutreachMode,
   renderOutreachReportMd,
   startOutreachPrepare,
@@ -139,7 +139,10 @@ router.post("/prepare", (req: Request, res: Response) => {
   const input = validatePrepareInput(req.body);
   if (!input.ok) return res.status(400).json({ error: input.error, message: input.message });
   const pilot = productImportOutreachMode() === "pilot";
-  const agentIds = pilot ? input.agentIds.filter((id) => productImportOutreachEnabledFor(id)) : input.agentIds;
+  // N1 (beta-for-alle S3): admin-initiated outreach is capped at the pilot
+  // list and never follows a `beta` tier — a beta owner is reached only when
+  // the owner started the import, never by this admin call.
+  const agentIds = pilot ? input.agentIds.filter((id) => productImportOutreachAdminEnabledFor(id)) : input.agentIds;
   const rejected = pilot
     ? input.agentIds.filter((id) => !agentIds.includes(id)).map((agent_id) => ({
       agent_id,

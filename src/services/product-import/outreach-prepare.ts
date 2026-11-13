@@ -33,6 +33,7 @@ import { getDb } from "../../database/init";
 import { normalizeName } from "../product-catalog-sync";
 import { extractProductsFromWebsite, HostPacer, type ProductImportDeps, type ProductImportResult } from "./extractor";
 import { ownerFlagEnabledFor, ownerFlagMode, type OwnerFlagMode } from "../../owner-features/owner-flag-mode";
+import { isSubjectAllowedForOwnerFeatures } from "../../owner-features/allowlist";
 import { PRODUCT_IMPORT_DRYRUN_CONCURRENCY, PRODUCT_IMPORT_DRYRUN_HOST_INTERVAL_MS } from "./dry-run";
 import { currentProductsOf, diffAgainst, producerTypesOf, profileWebsite, publishBlockReason, readCurrentList } from "./owner-import";
 
@@ -58,6 +59,25 @@ export function productImportOutreachMode(env: NodeJS.ProcessEnv = process.env):
 /** The outreach is on for this owner (pilot: `rfb:<id>` in OWNER_FEATURES_ALLOWED_SUBJECTS). */
 export function productImportOutreachEnabledFor(agentId: string | null | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
   return ownerFlagEnabledFor(PRODUCT_IMPORT_OUTREACH_FLAG, agentId, env);
+}
+
+/**
+ * N1 (beta-for-alle S3): admin-initiated outreach (POST /admin/product-import/
+ * prepare) is capped at the PILOT LIST and never follows a `beta` tier. The
+ * spec: no new outreach to beta owners unless the owner started the import
+ * themselves. With `product_import_outreach=beta` + OWNER_BETA_MODE=offer,
+ * productImportOutreachEnabledFor() returns true for a beta-enrolled owner
+ * (ownerFeatureAccess source `beta`), so admin-triggered mail could fan out to
+ * owners who never asked for it. This predicate ignores beta rows:
+ *   "all"   → the flag is fully on (admin may target anyone, as before)
+ *   "pilot" → only `rfb:<id>` on OWNER_FEATURES_ALLOWED_SUBJECTS (never beta)
+ *   "off"   → nobody.
+ */
+export function productImportOutreachAdminEnabledFor(agentId: string | null | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
+  const mode = productImportOutreachMode(env);
+  if (mode === "off") return false;
+  if (mode === "all") return true;
+  return isSubjectAllowedForOwnerFeatures("rfb", agentId ?? "", env);
 }
 
 /** The configured measured LLM accuracy (0–1), or null when absent/invalid. PURE. */
