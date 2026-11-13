@@ -66,6 +66,10 @@ const DIRECT_PILOT_LIST_EXCEPTIONS = new Set([
   // hidden test producer admin routes and the switch probes behind them.
   "src/routes/admin-test-producer.ts",
   "src/owner-features/switch-probe.ts",
+  // beta-for-alle S3: the beta card hides itself from a pilot owner, and
+  // admin-initiated product-import outreach is capped at the pilot list (N1).
+  "src/owner-features/beta-card.ts",
+  "src/services/product-import/outreach-prepare.ts",
 ]);
 
 /**

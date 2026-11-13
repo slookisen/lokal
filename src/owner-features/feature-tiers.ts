@@ -35,7 +35,7 @@
 
 import { isSubjectAllowedForOwnerFeatures, ownerFeaturesAllowedSubjects } from "./allowlist";
 import { ownerBetaMode, type OwnerBetaMode } from "./beta-mode";
-import { activeBetaAgentIds, isBetaEnrollmentActive } from "./beta-enrollment";
+import { activeVerifiedBetaAgentIds, isVerifiedBetaEnrollmentActive } from "./beta-enrollment";
 import { customerRuleSql } from "../services/customer-rule";
 import { getDb } from "../database/init";
 
@@ -174,7 +174,8 @@ function betaRowsHonoured(mode: OwnerBetaMode): boolean {
 // for vertical rfb, a `beta` tier and OWNER_BETA_MODE offer/all.
 export type BetaEnrollmentLookup = (vertical: string, agentId: string, env: NodeJS.ProcessEnv) => boolean;
 
-const DB_ENROLLMENT: BetaEnrollmentLookup = (vertical, agentId) => isBetaEnrollmentActive(vertical, agentId);
+// N2 (S3): an `active` row grants beta only while the owner is still verified.
+const DB_ENROLLMENT: BetaEnrollmentLookup = (vertical, agentId) => isVerifiedBetaEnrollmentActive(vertical, agentId);
 let betaEnrollmentLookup: BetaEnrollmentLookup = DB_ENROLLMENT;
 
 /** Test hook: swap the enrollment lookup (null = the owner_beta_enrollment table). */
@@ -278,7 +279,8 @@ export function ownerFeatureAllowedRfbIds(feature: OwnerFeatureKey, opts: OwnerF
       extra = (db.prepare(`SELECT a.id AS id FROM agents a WHERE ${customerRuleSql("a")} ORDER BY a.id`).all() as Array<{ id: string }>)
         .map((r) => r.id);
     } else if (tier === "beta" && betaRowsHonoured(mode)) {
-      extra = activeBetaAgentIds(OWNER_FEATURE_TIER_VERTICAL, opts.db);
+      // N2: only active rows whose owner is still verified (customerRuleSql).
+      extra = activeVerifiedBetaAgentIds(OWNER_FEATURE_TIER_VERTICAL, opts.db);
     }
   } catch (err) {
     try { console.error(`[owner-feature-tiers] bulk lookup failed for ${String(feature)}, pilot list only:`, (err as any)?.message ?? "error"); } catch { /* never throw */ }

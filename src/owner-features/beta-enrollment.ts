@@ -21,6 +21,7 @@
 
 import { getDb } from "../database/init";
 import { ownerBetaCap, ownerBetaMode } from "./beta-mode";
+import { customerRuleSql } from "../services/customer-rule";
 
 export const OWNER_BETA_VERTICAL = "rfb";
 /** owner_feature_audit.key for every enrollment change. */
@@ -72,6 +73,38 @@ export function isBetaEnrollmentActive(vertical: string, agentId: string, db?: a
 export function activeBetaAgentIds(vertical: string, db?: any): string[] {
   const rows = dbOf(db)
     .prepare(`SELECT agent_id FROM owner_beta_enrollment WHERE vertical = ? AND status = 'active' ORDER BY agent_id`)
+    .all(vertical) as Array<{ agent_id: string }>;
+  return rows.map((r) => r.agent_id).filter((id) => typeof id === "string" && id.length > 0);
+}
+
+// ── N2 (S3): a beta row only counts while the owner is STILL a verified owner.
+// A profile whose claim was revoked (claimed_at cleared and no verified
+// agent_claims row — the same customerRuleSql as isVerifiedOwner) keeps its
+// row but must not get beta. The single and bulk access paths use these two,
+// so the intersection happens in one place, for both.
+
+/** true only for an `active` row whose agent STILL passes the verified-owner rule. Throws on a DB error. */
+export function isVerifiedBetaEnrollmentActive(vertical: string, agentId: string, db?: any): boolean {
+  if (!vertical || !agentId) return false;
+  const row = dbOf(db)
+    .prepare(
+      `SELECT 1 AS ok FROM owner_beta_enrollment e
+         JOIN agents a ON a.id = e.agent_id
+        WHERE e.vertical = ? AND e.agent_id = ? AND e.status = 'active' AND ${customerRuleSql("a")}`,
+    )
+    .get(vertical, agentId) as { ok?: number } | undefined;
+  return !!row;
+}
+
+/** The agent ids with an `active` row AND a still-verified owner in `vertical`. Throws on a DB error. */
+export function activeVerifiedBetaAgentIds(vertical: string, db?: any): string[] {
+  const rows = dbOf(db)
+    .prepare(
+      `SELECT e.agent_id AS agent_id FROM owner_beta_enrollment e
+         JOIN agents a ON a.id = e.agent_id
+        WHERE e.vertical = ? AND e.status = 'active' AND ${customerRuleSql("a")}
+        ORDER BY e.agent_id`,
+    )
     .all(vertical) as Array<{ agent_id: string }>;
   return rows.map((r) => r.agent_id).filter((id) => typeof id === "string" && id.length > 0);
 }
