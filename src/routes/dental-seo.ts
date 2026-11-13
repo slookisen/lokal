@@ -1,4 +1,5 @@
 
+import { mcpPackageVersion } from "../config/mcp-versions";
 import express, { Router, Request, Response } from "express";
 import { createSitemapCache, resolveSitemapCacheTtlMs, logSlowSitemap } from "./sitemap-cache-util";
 import {
@@ -4661,7 +4662,7 @@ function dentalMcpServerCard() {
     ...mcpProtocolDeclaration(),
     name: "finn-tannlege",
     title: DENTAL_MCP_SERVER_TITLE,
-    version: "0.1.0",
+    version: mcpPackageVersion("dental"),
     description: `Search and compare ${totalLabel} Norwegian dental clinics. ${DENTAL_MCP_SERVER_DESCRIPTION}`,
     homepage: DENTAL_BASE_URL,
     repository: {

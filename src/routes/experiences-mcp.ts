@@ -46,6 +46,7 @@
  * app.use('/a2a', jsonRpcLimiter) mount is never reached for MCP requests.
  */
 
+import { mcpPackageVersion } from "../config/mcp-versions";
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
 import { fylkeEquivalents, normaliseFylke } from "../services/norway-fylke";
 import { outsideNorwayPlace } from "../services/outside-norway";
@@ -1741,7 +1742,7 @@ async function getOrCreateExperiencesSession(
 
   const server = new McpServer({
     name: "opplevagent",
-    version: "0.1.0",
+    version: mcpPackageVersion("experiences"),
     title: OPPLEVAGENT_MCP_SERVER_TITLE,
     websiteUrl: BRAND_ENTITIES.experiences.url,
     icons: OPPLEVAGENT_MCP_SERVER_ICONS,

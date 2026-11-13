@@ -62,6 +62,9 @@ COPY verticals/ ./verticals/
 # inspected from inside the container (e.g. by CI checks or registry validators).
 COPY mcp-server/ ./mcp-server/
 COPY mcp-server-dental/ ./mcp-server-dental/
+# Only package.json: src/config/mcp-versions.ts reads the published MCP version from
+# mcp-server*/package.json at runtime (serverInfo.version + server-card version).
+COPY mcp-server-opplevagent/package.json ./mcp-server-opplevagent/package.json
 
 # Build check: fail the image build if a file the running app needs is missing,
 # if tsx is still installed, or if better-sqlite3 / uuid (ESM-only, loaded via

@@ -16,6 +16,7 @@
  * spec moves forward.
  */
 
+import { mcpPackageVersion } from "../config/mcp-versions";
 import { Router, Request, Response } from "express";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
@@ -54,7 +55,7 @@ function mcpServerCard() {
     ...mcpProtocolDeclaration(),
     name: "lokal",
     title: RFB_MCP_SERVER_TITLE,
-    version: "1.0.0",
+    version: mcpPackageVersion("rfb"),
     description:
       `Discover ${stats.totalAgents || "1,290+"} Norwegian food producers, cross-checked against the Brønnøysund register. ` +
       "Search by category, region, certification, and trust score. Supports " +
