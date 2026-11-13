@@ -789,6 +789,137 @@ export async function runOrderBestillingerSkive1Tests(opts: { log?: boolean } = 
       assertEq(c("Rognkjeksrom"), null, "1b-r3-12: lumpfish roe");
       assertEq(c("Sikkerhetsrom") !== null, true, "1b-r3-13: a word that only STARTS like a fish («sik…rom») is not roe");
       assertEq(c("Spritz-kaker"), null, "1b-r3-14: «Spritz-kaker» are cookies");
+
+      // Food exemption (dev-request 2026-11-11-rfb-alkoholregel-bare-drikkevarer):
+      // alcohol as an ingredient of food passes; drinks stay banned.
+      assertEq(c("Rødvinspølse"), null, "alk-mat-01: «Rødvinspølse» is a sausage (alcohol first, food head last)");
+      assertEq(c("Rødvinspølse 425g"), null, "alk-mat-02: «Rødvinspølse 425g» (a weight is not a drink sign)");
+      assertEq(c("Parisersnabb med konjakk 200g"), null, "alk-mat-03: «<food> med <alcohol>» (Parisersnabb med konjakk)");
+      assertEq(c("Festpølse med akevitt 280g"), null, "alk-mat-04: «Festpølse med akevitt 280g»");
+      assertEq(c("Ølpølse 280g"), null, "alk-mat-05: «Ølpølse 280g»");
+      assertEq(c("Kirsebærgelé med Cognac"), null, "alk-mat-06: «Kirsebærgelé med Cognac»");
+      assertEq(c("Aquavitgelé"), null, "alk-mat-07: «Aquavitgelé»");
+      assertEq(c("Konjakkpølse"), null, "alk-mat-08: «Konjakkpølse»");
+      assertEq(c("Pølse med akevitt"), null, "alk-mat-09: «Pølse med akevitt»");
+      assertEq(c("Gelé med cognac"), null, "alk-mat-10: «Gelé med cognac»");
+      assertEq(c("Akevitt sennep"), "alcohol", "alk-mat-11: an alcohol word before a food word stays alcohol, fail-closed (Akevitt sennep)");
+      assertEq(c("Whisky fudge 200 g"), "alcohol", "alk-mat-12: «Whisky fudge 200 g» stays alcohol (alcohol word first)");
+      assertEq(c("Akevitt 70 cl"), "alcohol", "alk-mat-13: «Akevitt 70 cl»");
+      assertEq(c("Plommevin"), "alcohol", "alk-mat-14: «Plommevin»");
+      assertEq(c("Juleøl 0,5 l"), "alcohol", "alk-mat-15: «Juleøl 0,5 l»");
+      assertEq(c("Sjokoladelikør 50 cl"), "alcohol", "alk-mat-16: «Sjokoladelikør 50 cl»");
+      assertEq(c("Sjokoladelikør"), "alcohol", "alk-mat-17: the last part decides: «Sjokoladelikør» is a liqueur");
+      assertEq(c("Eplesider"), "alcohol", "alk-mat-18: «Eplesider»");
+      assertEq(c("Gin"), "alcohol", "alk-mat-19: «Gin»");
+      assertEq(c("Rødvinspølse", "alkohol"), "alcohol", "alk-mat-20: an alcohol category is not lifted by a food name");
+      assertEq(c("Rødvinspølse", "wine"), "alcohol", "alk-mat-21: (category «wine»)");
+      assertEq(c("Rødvinspølse", "beverages"), "alcohol", "alk-mat-22: beverages + an alcohol word stays alcohol");
+      assertEq(c("Ølpølse", "beverages", ["bryggeri"]), "alcohol", "alk-mat-23: a drink producer's beverage stays alcohol");
+      assertEq(c("Pølse med akevitt 70 cl"), "alcohol", "alk-mat-24: a volume is a drink sign");
+      assertEq(c("Konjakk 40 % vol"), "alcohol", "alk-mat-25: «% vol»");
+      assertEq(c("Gelé med konjakk 12 %"), "alcohol", "alk-mat-26: a % figure above 2.5 is a drink sign");
+      assertEq(c("Pølse med akevitt, flaske"), "alcohol", "alk-mat-27: «flaske» is a drink sign");
+      assertEq(c("Gavepakke med akevitt"), "alcohol", "alk-mat-28: «med <alcohol>» after a non-food word stays alcohol");
+      assertEq(c("Akevitt og pølse"), "alcohol", "alk-mat-29: alcohol as the first item stays alcohol");
+      assertEq(c("Gin med is"), "alcohol", "alk-mat-30: «Gin med is» stays alcohol");
+      assertEq(c("Pastis"), "alcohol", "alk-mat-31: «Pastis» is a drink, not «-is» ice cream");
+      assertEq(c("Likør"), "alcohol", "alk-mat-32: «Likør»");
+      assertEq(c("Juleøl"), "alcohol", "alk-mat-33: «Juleøl»");
+      assertEq(c("Cognac"), "alcohol", "alk-mat-34: «Cognac»");
+      assertEq(c("Akevitt 0,7 l"), "alcohol", "alk-mat-35: «0,7 l»");
+      assertEq(c("Med akevitt", "pølser"), "alcohol", "alk-mat-36: «med» needs something before it, also with a food category");
+      assertEq(c("Spekepølse med rødvin", "pålegg"), null, "alk-mat-37: food name + food category");
+      assertEq(c("Hvitvin Solaris"), "alcohol", "alk-mat-38: a grape name ending in «-is» is not ice cream (Hvitvin Solaris)");
+      assertEq(c("Rødvin Merlot Tost"), "alcohol", "alk-mat-39: a short-head compound after the alcohol word is not a food head");
+      assertEq(c("Vaniljeis med konjakk"), "alcohol", "alk-mat-40: before «med» a short-head compound is read strictly (Vaniljeis med konjakk stays alcohol)");
+      // Review round 1 (lokal#1517). B1: an alcohol word FIRST and a food word after it is a flavoured drink.
+      for (const n of ["Likør Sjokolade", "Likør karamell", "Likør Gelé", "Vodka Karamell", "Brandy Karamell", "Calvados Karamell",
+        "Rum Karamell", "Whisky Karamell", "Aquavit sjokolade", "Akevitt Kirsebærgelé", "Aquavit Trøffel", "Hvitvin Sjokolade",
+        "Fruktvin Gelé", "Cider Karamell", "Sider Karamell", "Mjød Karamell", "Mjød Is", "Gårdsøl Karamell", "Juleøl Sjokolade",
+        "Stout Sjokolade", "Imperial Stout Marmelade", "Porter Ost", "Likør - Sjokolade", "Likør, sjokolade", "Likør (sjokolade)",
+        "Likør: Sjokolade & Chili"]) {
+        assertEq(c(n), "alcohol", `alk-mat-41: flavoured drink «${n}»`);
+      }
+      // B1, owner import: name + producer types, no category.
+      assertEq(c("Juleøl Sjokolade", undefined, ["bryggeri"]), "alcohol", "alk-mat-42: «Juleøl Sjokolade» from a brewery");
+      assertEq(c("Stout Karamell", undefined, ["bryggeri"]), "alcohol", "alk-mat-43: «Stout Karamell» from a brewery");
+      assertEq(c("Porter Sjokolade", undefined, ["mikrobryggeri"]), "alcohol", "alk-mat-44: «Porter Sjokolade» from a microbrewery");
+      // B1: a drink producer's row is food only with an explicit food category.
+      assertEq(c("Rødvinspølse", undefined, ["bryggeri"]), "alcohol", "alk-mat-45: a drink producer's «Rødvinspølse» without a category stays alcohol");
+      assertEq(c("Rødvinspølse", "pølser", ["bryggeri"]), null, "alk-mat-46: …with a food category it is food");
+      assertEq(c("Rødvinspølse", "kjøtt", ["vingard"]), null, "alk-mat-47: …also with a generic food category («kjøtt»)");
+      assertEq(c("Rødvinspølse", "beverages", ["bryggeri"]), "alcohol", "alk-mat-48: …but never in beverages");
+      // B2: drink signs in the description.
+      assertEq(c("Likør Sjokolade", undefined, [], "Søt likør, 50 cl flaske"), "alcohol", "alk-mat-49: description «50 cl flaske»");
+      assertEq(c("Likør Sjokolade", undefined, [], "18 % alkohol"), "alcohol", "alk-mat-50: description «18 % alkohol»");
+      assertEq(c("Rødvinspølse", undefined, [], "Flaske 70 cl"), "alcohol", "alk-mat-51: «Rødvinspølse» with «Flaske 70 cl» in the description");
+      assertEq(c("Rødvinspølse", undefined, [], "Levert på flaske"), "alcohol", "alk-mat-52: «flaske» alone in the description");
+      assertEq(c("Rødvinspølse", undefined, [], "Inneholder 70 cl rødvin"), "alcohol", "alk-mat-53: a volume alone in the description");
+      assertEq(c("Rødvinspølse", undefined, [], "Styrke oppgitt i % vol"), "alcohol", "alk-mat-54: «% vol» in the description (no figure)");
+      assertEq(c("Rødvinspølse", undefined, [], "Styrke: % alkohol"), "alcohol", "alk-mat-55: «% alkohol» in the description (no figure)");
+      assertEq(c("Rødvinspølse", undefined, [], "Inneholder 12 % rødvin"), "alcohol", "alk-mat-56: a % figure above 2.5 in the description");
+      assertEq(c("Rødvinspølse", undefined, [], "Kjøttinnhold 2 %, røkt"), null, "alk-mat-57: a % figure of 2.5 or less is no drink sign");
+      // N1: the word before «med» is read strictly.
+      assertEq(c("Paradis med gin"), "alcohol", "alk-mat-58: «Paradis med gin»");
+      assertEq(c("Spesialpris med akevitt"), "alcohol", "alk-mat-59: «Spesialpris med akevitt»");
+      assertEq(c("Julefrokost med akevitt"), "alcohol", "alk-mat-60: «Julefrokost med akevitt»");
+      // N2: free-text alcohol categories; a food category alone lifts nothing.
+      assertEq(c("Kirsebærgelé med Cognac", "Likører"), "alcohol", "alk-mat-61: category «Likører»");
+      assertEq(c("Rødvinspølse", "Gin & likør"), "alcohol", "alk-mat-62: category «Gin & likør»");
+      assertEq(c("Ølpølse", "alkoholholdige drikker"), "alcohol", "alk-mat-63: category «alkoholholdige drikker»");
+      assertEq(c("Smaksprøve med akevitt", "pølser"), "alcohol", "alk-mat-64: a food category does not make «med <alcohol>» food");
+      assertEq(c("Gave med akevitt", "ost"), "alcohol", "alk-mat-65: (Gave med akevitt / ost)");
+      // N3: mutants of the food test.
+      assertEq(c("Vodkaparis"), "alcohol", "alk-mat-66: an alcohol compound counts as food only when the alcohol part ends right before the food head");
+      assertEq(banSvc.isFoodToken("konjakkbris"), false, "alk-mat-67: (konjakk|br|is is not konjakk + is)");
+      assertEq(banSvc.isFoodToken("kompost"), false, "alk-mat-68: «kompost» is on the not-food list");
+      assertEq([banSvc.isFoodToken("pris"), banSvc.isFoodToken("tost"), banSvc.isFoodToken("brost")], [false, false, false], "alk-mat-69: a short head needs a first part of 4+ letters");
+      assertEq(banSvc.isFoodToken("geitost"), true, "alk-mat-70: …and with 4+ letters it is food (Geitost)");
+      assertEq([banSvc.hasDrinkSigns("Pølse", "40 % vol"), banSvc.hasDrinkSigns("Pølse 425g", ""), banSvc.hasDrinkSigns("Pølse", "0,5 l")], [true, false, true], "alk-mat-71: hasDrinkSigns reads the description");
+      // Review round 2 (lokal#1517). B1: bundles, lists and gift packs with a drink stay alcohol.
+      for (const [n, cat] of [["Gavepakke spekepølse med akevitt"], ["Gaveeske ost med portvin"], ["Julepakke: pølse med akevitt"],
+        ["Julekurv: pølse og ost med akevitt"], ["Smaksboks: salami med akevitt og øl"], ["Spekepølse med ost og akevitt"],
+        ["Pølse med akevitt og pils"], ["Ost med akevitt, øl og vin"], ["Kjeks og ost med portvin"], ["Ost med akevitt", "Gaver"],
+        ["Pølse med akevitt og sennep"], ["Salami med akevitt", "Gavekurver"], ["Pølse med akevitt i gaveeske"]] as Array<[string, string?]>) {
+        assertEq(c(n, cat), "alcohol", `alk-mat-72: bundle/list «${n}»${cat ? ` (category «${cat}»)` : ""}`);
+      }
+      assertEq(c("Parisersnabb med konjakk 200g"), null, "alk-mat-73: weights after the alcohol word are allowed (Parisersnabb med konjakk 200g)");
+      assertEq(c("Festpølse med akevitt 280g"), null, "alk-mat-74: (Festpølse med akevitt 280g)");
+      assertEq(c("Festpølse med akevitt 280 g 2 stk"), null, "alk-mat-75: (weights + counts)");
+      assertEq(c("Festpølse med akevitt 280 g, 2 stk"), "alcohol", "alk-mat-92: a comma in the name is a list, fail-closed");
+      // B2: hot/served drinks built on chocolate or other drinkable heads.
+      assertEq(c("Varm sjokolade med likør"), "alcohol", "alk-mat-76: «Varm sjokolade med likør»");
+      assertEq(c("Varm sjokolade med whisky"), "alcohol", "alk-mat-77: «Varm sjokolade med whisky»");
+      assertEq(c("Sjokolade med whisky", undefined, [], "Serveres varm"), "alcohol", "alk-mat-78: «Sjokolade med whisky», «Serveres varm»");
+      assertEq(c("Sjokolade med whisky"), "alcohol", "alk-mat-79: «sjokolade» is never the food side of «med»");
+      assertEq(c("Kakao med konjakk"), "alcohol", "alk-mat-80: «Kakao med konjakk»");
+      assertEq(c("Ost, kjeks & portvin"), "alcohol", "alk-mat-81: a list in the name («Ost, kjeks & portvin»)");
+      assertEq(c("Toddy med whisky"), "alcohol", "alk-mat-82: «Toddy med whisky»");
+      assertEq(c("Gelé med cognac", undefined, [], "En kopp til kaffen"), "alcohol", "alk-mat-83: «kopp» in the description");
+      assertEq(c("Pølse med akevitt", undefined, [], "God drikke til maten"), "alcohol", "alk-mat-84: «drikk…» in the description");
+      assertEq(c("Konjakksjokolade"), null, "alk-mat-85: compound head rule still makes «Konjakksjokolade» food");
+      assertEq(c("Whiskykaramell"), null, "alk-mat-86: (Whiskykaramell)");
+      // N1: more drink signs.
+      for (const [n, d] of [["Pølse med akevitt 40 prosent"], ["Pølse med akevitt", "40 prosent"], ["Pølse med akevitt alk. 40"],
+        ["Pølse med akevitt", "Alk 40"], ["Pølse med akevitt 70 centiliter"], ["Pølse med akevitt halvflaske"],
+        ["Pølse med akevitt", "I glassflaske"], ["Pølse med akevitt literflaske"], ["Pølse med akevitt", "Selges per liter"]] as Array<[string, string?]>) {
+        assertEq(c(n, undefined, [], d), "alcohol", `alk-mat-87: drink sign «${n}»${d ? ` / «${d}»` : ""}`);
+      }
+      // N2: category tokens use only the explicit lists.
+      assertEq(c("Sprudlende eple", "Alkoholfri drikke"), null, "alk-mat-88: category «Alkoholfri drikke» is not alcohol");
+      assertEq(c("Honning", "Honning og propol"), null, "alk-mat-89: category «Honning og propol» is not alcohol");
+      assertEq(c("Sprudlende eple", "Likører"), "alcohol", "alk-mat-90: category «Likører» still is");
+      assertEq(c("Eddik", "Rødvinseddik"), null, "alk-mat-91: category «Rødvinseddik» is vinegar");
+      // The food word list itself (folded tokens).
+      for (const t of ["polse", "spekepolse", "festpolse", "parisersnabb", "skinke", "gele", "kirsebaergele", "syltetoy", "marmelade", "sjokolade",
+        "konfekt", "troffel", "trofler", "karamell", "fudge", "kake", "kaker", "pepperkake", "kjeks", "is", "vaniljeis", "saus", "sennep",
+        "marinade", "ost", "geitost", "palegg", "postei", "pate", "salami", "rodvinspolse", "aquavitgele", "olpolse", "konjakkpolse"]) {
+        assertEq(banSvc.isFoodToken(t), true, `alk-mat-food: «${t}» is food`);
+      }
+      for (const t of ["likor", "sjokoladelikor", "pastis", "most", "eplemost", "cognac", "konjakk", "juleol", "akevitt", "gin", "cidermost", "anis", "eplesider", "rodvin"]) {
+        assertEq(banSvc.isFoodToken(t), false, `alk-mat-notfood: «${t}» is not food`);
+      }
+      assertEq([banSvc.isFoodToken("solaris"), banSvc.isFoodToken("solaris", true), banSvc.isFoodToken("is", true), banSvc.isFoodToken("ostepolse", true)], [true, false, true, true], "alk-mat-strict: short-head compounds only count when not strict");
       delete process.env.ORDER_BUYER_RECEIPTS_ENABLED;
     }
 
