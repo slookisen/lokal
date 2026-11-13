@@ -10,10 +10,14 @@
 //   2. isVerifiedOwner of THIS agent (else 403) — only the owner's own row, AND
 //   3. the shared same-origin write guard (checkSameOriginWrite — it handles
 //      the browser-form `Origin: null` case; see middleware/same-origin-write.ts).
-// Then it calls the S2 write (beta-enrollment.ts) — which itself enforces rfb
-// only, mode `offer` for opt-in/interest (opt-out any mode), the cap, and the
-// single owner_feature_audit row — and redirects (PRG) back to the portal with
-// a status message. Nothing is e-mailed. Mode ≠ offer → opt-in/interest is
+// Opt-in and interest are then refused (`beta_not_offered`, no row) for an
+// agent whose own agents.vertical_id is not rfb (betaJoinAllowed — the
+// S2 write only checks its `vertical` argument, which is always the constant
+// `rfb`) and for a pilot owner (who already has the tools; a pilot row would
+// take a cap slot). Then it calls the S2 write (beta-enrollment.ts) — which
+// enforces mode `offer` for opt-in/interest (opt-out any mode), the cap, and
+// the single owner_feature_audit row — and redirects (PRG) back to the portal
+// with a status message. Nothing is e-mailed. Mode ≠ offer → opt-in/interest is
 // rejected by beta-enrollment (`not_offered`); opt-out still works.
 //
 // With OWNER_BETA_MODE unset/off these are harmless: opt-in/interest answer
@@ -27,6 +31,7 @@ import {
 } from "./owner-portal";
 import { isCrossSiteWrite } from "../middleware/same-origin-write";
 import { optIn, optOut, registerInterest, OWNER_BETA_VERTICAL, type BetaWriteResult } from "../owner-features/beta-enrollment";
+import { betaJoinAllowed } from "../owner-features/beta-card";
 import { BETA_TERMS_VERSION } from "../owner-features/beta-texts";
 
 const router = Router();
@@ -59,6 +64,15 @@ function betaGate(req: Request): Gate {
   return { ok: true, agentId, token: session.token };
 }
 
+/**
+ * Opt-in / interest only for a non-pilot Rett fra Bonden agent (the same rule
+ * as the card: betaJoinAllowed). Fail closed: a DB error throws to the
+ * handler's catch → beta_error, no row.
+ */
+function joinRefused(agentId: string): boolean {
+  return !betaJoinAllowed(agentId, process.env);
+}
+
 function back(res: Response, agentId: string, status: string): Response {
   res.redirect(303, `/eier/${encodeURIComponent(agentId)}/portal?status=${encodeURIComponent(status)}`);
   return res;
@@ -80,6 +94,7 @@ router.post("/eier/:agentId/beta/pa", express.urlencoded({ extended: false }), (
     if (refused) return refused;
     const body = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
     const accepted = body.vilkar === "1" || body.vilkar === "on" || body.vilkar === "true";
+    if (joinRefused(g.agentId)) return back(res, g.agentId, "beta_not_offered");
     if (!accepted) return back(res, g.agentId, "beta_terms");
     const out: BetaWriteResult = optIn(OWNER_BETA_VERTICAL, g.agentId, BETA_TERMS_VERSION, { actor: "owner", actorDetail: sessionEmail(g.token) });
     if (out.kind === "not_offered") return back(res, g.agentId, "beta_not_offered");
@@ -98,6 +113,7 @@ router.post("/eier/:agentId/beta/interesse", express.urlencoded({ extended: fals
     if (!g.ok) return g.send(res);
     const refused = guard(req, res, g.agentId, "/eier/:agentId/beta/interesse");
     if (refused) return refused;
+    if (joinRefused(g.agentId)) return back(res, g.agentId, "beta_not_offered");
     const out: BetaWriteResult = registerInterest(OWNER_BETA_VERTICAL, g.agentId, { actor: "owner", actorDetail: sessionEmail(g.token) });
     if (out.kind === "not_offered") return back(res, g.agentId, "beta_not_offered");
     if (out.kind !== "ok") return back(res, g.agentId, "beta_error");

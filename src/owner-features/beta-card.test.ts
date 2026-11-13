@@ -31,6 +31,7 @@ const NORMAL = "s3-normal";   // verified owner, NOT on the pilot list
 const PILOT = "s3-pilot";     // verified owner, on the pilot list
 const UNVER = "s3-unverified"; // no verified owner (claim pending)
 const REVOKED = "s3-revoked"; // was a verified owner, claim later revoked
+const DENTAL = "s3-dental";   // verified owner, but agents.vertical_id = 'dental' (B1)
 const DAY = 24 * 60 * 60 * 1000;
 
 function envOf(extra: Record<string, string | undefined> = {}): NodeJS.ProcessEnv {
@@ -97,7 +98,7 @@ export async function runBetaCardTests(opts: { log?: boolean } = {}): Promise<Te
     const insAgent = db.prepare(`INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, categories)
       VALUES (?, ?, 'Testprodusent', 'self', ?, 'https://example.no', 'producer', ?, '["vegetables"]')`);
     const tok: Record<string, string> = {};
-    for (const id of [NORMAL, PILOT, UNVER, REVOKED]) {
+    for (const id of [NORMAL, PILOT, UNVER, REVOKED, DENTAL]) {
       insAgent.run(id, `Gård ${id}`, `${id}@farm.example.no`, `k-${id}`);
       db.prepare(`INSERT INTO agent_knowledge (agent_id, email, website, products, data_source) VALUES (?, ?, 'https://example.no', '[]', 'hybrid')`).run(id, `${id}@farm.example.no`);
       tok[id] = `tok-${id}`;
@@ -105,7 +106,8 @@ export async function runBetaCardTests(opts: { log?: boolean } = {}): Promise<Te
         .run(`ml-${id}`, `${id}@farm.example.no`, tok[id], id, new Date().toISOString(), new Date(Date.now() + 30 * DAY).toISOString());
     }
     // NORMAL, PILOT, REVOKED are verified owners (claimed_at); UNVER has only a pending claim.
-    db.prepare("UPDATE agents SET claimed_at = '2026-11-01T00:00:00Z' WHERE id IN (?, ?, ?)").run(NORMAL, PILOT, REVOKED);
+    db.prepare("UPDATE agents SET claimed_at = '2026-11-01T00:00:00Z' WHERE id IN (?, ?, ?, ?)").run(NORMAL, PILOT, REVOKED, DENTAL);
+    db.prepare("UPDATE agents SET vertical_id = 'dental' WHERE id = ?").run(DENTAL);
     db.prepare("INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, status) VALUES ('c-unver', ?, 'Noen', 'noen@example.no', 'pending')").run(UNVER);
 
     const offer = envOf({ OWNER_BETA_MODE: "offer", OWNER_FEATURE_TIERS: "dashboard=beta,orders=beta" });
@@ -178,6 +180,31 @@ export async function runBetaCardTests(opts: { log?: boolean } = {}): Promise<Te
       db.prepare("DELETE FROM owner_beta_enrollment").run();
     }
 
+    // ── B1: an agent whose own agents.vertical_id ≠ rfb never gets beta ─────
+    {
+      check("B1 card: dental agent with a verified owner → hidden", bc.betaCardState(DENTAL, true, offer, db).kind === "hidden");
+      check("B1 card html: dental agent → empty", bc.betaCardHtml(DENTAL, true, offer, db) === "");
+      check("B1 card: rfb control (NORMAL) still gets the offer card", bc.betaCardState(NORMAL, true, offer, db).kind === "offer");
+      check("B1 eligibility: unknown agent id → not eligible", be.isRfbBetaEligibleAgent("no-such-agent", db) === false);
+      // Even a row written behind the routes' back (S2 write only checks its argument) grants nothing.
+      be.optIn("rfb", DENTAL, "v1", { env: offer });
+      be.optIn("rfb", NORMAL, "v1", { env: offer });
+      check("B1 setup: a raw active row exists for the dental agent", be.betaEnrollmentStatus("rfb", DENTAL, db) === "active");
+      const acc = ft.ownerFeatureAccess("orders", "rfb", DENTAL, offer);
+      check("B1 single: dental agent with an active row → denied, source null", acc.allowed === false && acc.source === null);
+      check("B1 single: rfb control → allowed via beta", ft.ownerFeatureAccess("orders", "rfb", NORMAL, offer).source === "beta");
+      check("B1 single (N2 helper): isVerifiedBetaEnrollmentActive false for dental", be.isVerifiedBetaEnrollmentActive("rfb", DENTAL, db) === false);
+      const bulk = ft.ownerFeatureAllowedRfbIds("orders", { env: offer, db });
+      check("B1 bulk beta: dental agent not in the set", !bulk.includes(DENTAL));
+      check("B1 bulk beta: rfb control in the set", bulk.includes(NORMAL));
+      check("B1 bulk (N2 helper): activeVerifiedBetaAgentIds excludes dental", !be.activeVerifiedBetaAgentIds("rfb", db).includes(DENTAL));
+      const gaEnv = envOf({ OWNER_FEATURE_TIERS: "orders=ga" });
+      const gaSet = ft.ownerFeatureAllowedRfbIds("orders", { env: gaEnv, db });
+      check("B1 bulk ga: dental agent with a verified owner not in the set", !gaSet.includes(DENTAL));
+      check("B1 bulk ga: rfb verified owners in the set", gaSet.includes(NORMAL) && gaSet.includes(REVOKED));
+      db.prepare("DELETE FROM owner_beta_enrollment").run();
+    }
+
     // ── N1: admin-initiated outreach is capped at the pilot list ────────────
     {
       be.optIn("rfb", NORMAL, "v1", { env: offer }); // NORMAL is a beta owner (not pilot)
@@ -189,6 +216,35 @@ export async function runBetaCardTests(opts: { log?: boolean } = {}): Promise<Te
       check("N1: mode off → nobody", op.productImportOutreachAdminEnabledFor(PILOT, envOf({ PRODUCT_IMPORT_OUTREACH_ENABLED: "0" })) === false);
       be.optOut("rfb", NORMAL);
       db.prepare("DELETE FROM owner_beta_enrollment").run();
+    }
+
+    // ── N1 route wiring: admin POST /admin/product-import/prepare never starts
+    //    outreach for a beta-enrolled (non-pilot) owner who did not start it ──
+    {
+      const KEYS = ["ADMIN_KEY", "PRODUCT_IMPORT_OUTREACH_ENABLED", "OWNER_BETA_MODE", "OWNER_FEATURE_TIERS", "OWNER_FEATURES_ALLOWED_SUBJECTS"];
+      const saved: Record<string, string | undefined> = {};
+      for (const k of KEYS) saved[k] = process.env[k];
+      process.env.ADMIN_KEY = "s3-admin-key";
+      process.env.PRODUCT_IMPORT_OUTREACH_ENABLED = "pilot";
+      process.env.OWNER_BETA_MODE = "offer";
+      process.env.OWNER_FEATURE_TIERS = "product_import_outreach=beta";
+      process.env.OWNER_FEATURES_ALLOWED_SUBJECTS = `rfb:${PILOT}`;
+      try {
+        be.optIn("rfb", NORMAL, "v1", { env: process.env });
+        check("N1 route setup: NORMAL is beta-enrolled with outreach access", ft.ownerFeatureAccess("product_import_outreach", "rfb", NORMAL, process.env).source === "beta");
+        const adminRouter = (require("../routes/admin-product-import") as any).default;
+        const prep = handlerOf(adminRouter, "/prepare");
+        const r = await invoke(prep, { body: { agentIds: [NORMAL], campaign: "s3-n1-beta" }, headers: { "x-admin-key": "s3-admin-key" } });
+        let parsed: any = {};
+        try { parsed = JSON.parse(r.body); } catch { /* keep {} */ }
+        check("N1 route: beta owner only → 400 no_pilot_agent_ids", r.status === 400 && parsed.error === "no_pilot_agent_ids", `status ${r.status} ${r.body.slice(0, 120)}`);
+        check("N1 route: the beta owner is listed as rejected", JSON.stringify((parsed.rejected || []).map((x: any) => x.agent_id)) === JSON.stringify([NORMAL]));
+        const runs = Number((db.prepare("SELECT COUNT(*) AS n FROM product_import_runs WHERE campaign = ?").get("s3-n1-beta") as any)?.n ?? 0);
+        check("N1 route: no run started for the beta owner", runs === 0);
+      } finally {
+        db.prepare("DELETE FROM owner_beta_enrollment").run();
+        for (const k of KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+      }
     }
 
     // ── POST routes (gate, terms, same-origin, PRG, only-own-row) ───────────
@@ -219,6 +275,11 @@ export async function runBetaCardTests(opts: { log?: boolean } = {}): Promise<Te
       check("route: opt-in with terms → beta_on", on.status === 303 && String(on.location).includes("status=beta_on"));
       check("route: active row written", rowOf(NORMAL) === "active");
 
+      // Cross-site opt-out → 403, the active row is untouched.
+      const xsiteAv = await invoke(H.av, { params: { agentId: NORMAL }, token: tok[NORMAL], body: {}, headers: { "sec-fetch-site": "cross-site" } });
+      check("route: cross-site opt-out → 403", xsiteAv.status === 403);
+      check("route: cross-site opt-out changed nothing", rowOf(NORMAL) === "active");
+
       // Only own row: a session for NORMAL cannot change PILOT's row.
       const other = await invoke(H.pa, { params: { agentId: PILOT }, token: tok[NORMAL], body: { vilkar: "1" } });
       check("route: session for another agent → 403", other.status === 403);
@@ -231,7 +292,8 @@ export async function runBetaCardTests(opts: { log?: boolean } = {}): Promise<Te
       // Opt-in rejected when mode ≠ offer; opt-out still allowed.
       process.env.OWNER_BETA_MODE = "off";
       const offModeIn = await invoke(H.pa, { params: { agentId: UNVER }, token: tok[UNVER], body: { vilkar: "1" } });
-      check("route: mode off → opt-in refused at the gate (unverified) ", offModeIn.status === 403 || String(offModeIn.location).includes("status=beta"));
+      check("route: mode off, unverified owner → 403 at the gate", offModeIn.status === 403);
+      check("route: mode off, unverified owner → no row", rowOf(UNVER) === null);
       // A verified owner in mode off: opt-in answers not_offered.
       const offModeNormal = await invoke(H.pa, { params: { agentId: REVOKED }, token: tok[REVOKED], body: { vilkar: "1" } });
       check("route: mode off, verified owner → beta_not_offered", offModeNormal.status === 303 && String(offModeNormal.location).includes("status=beta_not_offered"));
@@ -242,6 +304,28 @@ export async function runBetaCardTests(opts: { log?: boolean } = {}): Promise<Te
       const interest = await invoke(H.interesse, { params: { agentId: REVOKED }, token: tok[REVOKED], body: {} });
       check("route: register interest → beta_interest", interest.status === 303 && String(interest.location).includes("status=beta_interest"));
       check("route: interest row written", rowOf(REVOKED) === "interested");
+
+      // Cross-site register-interest → 403, nothing written.
+      db.prepare("DELETE FROM owner_beta_enrollment WHERE agent_id = ?").run(REVOKED);
+      const xsiteInt = await invoke(H.interesse, { params: { agentId: REVOKED }, token: tok[REVOKED], body: {}, headers: { "sec-fetch-site": "cross-site" } });
+      check("route: cross-site interest → 403", xsiteInt.status === 403);
+      check("route: cross-site interest wrote nothing", rowOf(REVOKED) === null);
+
+      // B1: a dental agent's own verified owner cannot opt in or register interest.
+      const dentPa = await invoke(H.pa, { params: { agentId: DENTAL }, token: tok[DENTAL], body: { vilkar: "1" } });
+      check("B1 route /pa: dental agent → beta_not_offered", dentPa.status === 303 && String(dentPa.location).includes("status=beta_not_offered"));
+      check("B1 route /pa: dental agent → no row", rowOf(DENTAL) === null);
+      const dentInt = await invoke(H.interesse, { params: { agentId: DENTAL }, token: tok[DENTAL], body: {} });
+      check("B1 route /interesse: dental agent → beta_not_offered", dentInt.status === 303 && String(dentInt.location).includes("status=beta_not_offered"));
+      check("B1 route /interesse: dental agent → no row", rowOf(DENTAL) === null);
+
+      // N4: a pilot owner POSTing /pa directly takes no cap slot (and no interest row).
+      const pilotPa = await invoke(H.pa, { params: { agentId: PILOT }, token: tok[PILOT], body: { vilkar: "1" } });
+      check("N4 route /pa: pilot owner → beta_not_offered", pilotPa.status === 303 && String(pilotPa.location).includes("status=beta_not_offered"));
+      check("N4 route /pa: pilot owner → no row (no cap slot)", rowOf(PILOT) === null);
+      check("N4: active count unchanged by the pilot POST", be.betaEnrollmentCounts("rfb", db).active === 0);
+      const pilotInt = await invoke(H.interesse, { params: { agentId: PILOT }, token: tok[PILOT], body: {} });
+      check("N4 route /interesse: pilot owner → beta_not_offered, no row", String(pilotInt.location).includes("status=beta_not_offered") && rowOf(PILOT) === null);
 
       db.prepare("DELETE FROM owner_beta_enrollment").run();
       if (prevMode === undefined) delete process.env.OWNER_BETA_MODE; else process.env.OWNER_BETA_MODE = prevMode;

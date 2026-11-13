@@ -7,6 +7,9 @@
 //
 // Rules:
 //   - Only vertical `rfb`. Every other vertical is refused (no row written).
+//     NOTE: this checks the `vertical` ARGUMENT, not the agent's own
+//     agents.vertical_id — the S3 routes check that (isRfbBetaEligibleAgent)
+//     and the read paths intersect with it (rfbAgentSql).
 //   - optIn / registerInterest only while OWNER_BETA_MODE is exactly `offer`.
 //     optOut is always allowed (an owner can always leave).
 //   - The cap (OWNER_BETA_CAP): an opt-in when the number of OTHER `active`
@@ -82,27 +85,53 @@ export function activeBetaAgentIds(vertical: string, db?: any): string[] {
 // agent_claims row — the same customerRuleSql as isVerifiedOwner) keeps its
 // row but must not get beta. The single and bulk access paths use these two,
 // so the intersection happens in one place, for both.
+//
+// B1 (S3 review r1): the enrollment table's `vertical` column is always the
+// constant `rfb` (OWNER_BETA_VERTICAL) — it says nothing about the agent. The
+// agent's OWN vertical is agents.vertical_id (NOT NULL DEFAULT 'rfb'; same
+// rule as ownerAutoUpdatesAppliesTo / rfb-owner-refresh:
+// COALESCE(vertical_id, 'rfb') = 'rfb'). A row for a dental/experiences agent
+// therefore never grants beta, in either path.
 
-/** true only for an `active` row whose agent STILL passes the verified-owner rule. Throws on a DB error. */
+/** SQL fragment: the agent row `alias` belongs to Rett fra Bonden (vertical rfb). */
+export function rfbAgentSql(alias: string): string {
+  if (!/^[a-z_][a-z0-9_]*$/i.test(alias)) throw new Error("invalid alias");
+  return `COALESCE(${alias}.vertical_id, 'rfb') = 'rfb'`;
+}
+
+/**
+ * true only when `agentId` is an existing Rett fra Bonden agent (its own
+ * agents.vertical_id is rfb). The beta card and the opt-in / interest routes
+ * use it to fail closed for every other vertical. Throws on a DB error.
+ */
+export function isRfbBetaEligibleAgent(agentId: string, db?: any): boolean {
+  if (!agentId) return false;
+  const row = dbOf(db)
+    .prepare(`SELECT 1 AS ok FROM agents a WHERE a.id = ? AND ${rfbAgentSql("a")}`)
+    .get(agentId) as { ok?: number } | undefined;
+  return !!row;
+}
+
+/** true only for an `active` row whose agent is an rfb agent (agents.vertical_id) and STILL passes the verified-owner rule. Throws on a DB error. */
 export function isVerifiedBetaEnrollmentActive(vertical: string, agentId: string, db?: any): boolean {
   if (!vertical || !agentId) return false;
   const row = dbOf(db)
     .prepare(
       `SELECT 1 AS ok FROM owner_beta_enrollment e
          JOIN agents a ON a.id = e.agent_id
-        WHERE e.vertical = ? AND e.agent_id = ? AND e.status = 'active' AND ${customerRuleSql("a")}`,
+        WHERE e.vertical = ? AND e.agent_id = ? AND e.status = 'active' AND ${rfbAgentSql("a")} AND ${customerRuleSql("a")}`,
     )
     .get(vertical, agentId) as { ok?: number } | undefined;
   return !!row;
 }
 
-/** The agent ids with an `active` row AND a still-verified owner in `vertical`. Throws on a DB error. */
+/** The agent ids with an `active` row, an rfb agent (agents.vertical_id) AND a still-verified owner. Throws on a DB error. */
 export function activeVerifiedBetaAgentIds(vertical: string, db?: any): string[] {
   const rows = dbOf(db)
     .prepare(
       `SELECT e.agent_id AS agent_id FROM owner_beta_enrollment e
          JOIN agents a ON a.id = e.agent_id
-        WHERE e.vertical = ? AND e.status = 'active' AND ${customerRuleSql("a")}
+        WHERE e.vertical = ? AND e.status = 'active' AND ${rfbAgentSql("a")} AND ${customerRuleSql("a")}
         ORDER BY e.agent_id`,
     )
     .all(vertical) as Array<{ agent_id: string }>;

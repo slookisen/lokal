@@ -2,8 +2,9 @@
 // A2A dev-request 2026-11-09-rfb-eierverktoy-beta-for-alle, slice S3.
 //
 // betaCardState decides WHAT a verified owner sees on the regular owner page:
-//   - hidden — nothing (mode ≠ offer, unverified owner, a pilot owner, wrong
-//     vertical, a claim-pending/ownerless profile, or any DB error → fail closed)
+//   - hidden — nothing (mode ≠ offer, unverified owner, a pilot owner, an
+//     agent whose own agents.vertical_id is not rfb, a claim-pending/ownerless
+//     profile, or any DB error → fail closed)
 //   - offer  — the opt-in card (lists only `beta`-tier features; a required
 //     terms checkbox + a link to the terms). At/over OWNER_BETA_CAP it is the
 //     «Meld interesse» card instead; an `interested` owner sees «Slå på» again
@@ -17,7 +18,7 @@
 // HTML; all strings are the placeholders in beta-texts.ts (AC8).
 
 import { ownerBetaCap, ownerBetaMode } from "./beta-mode";
-import { betaEnrollmentCounts, betaEnrollmentStatus, OWNER_BETA_VERTICAL } from "./beta-enrollment";
+import { betaEnrollmentCounts, betaEnrollmentStatus, isRfbBetaEligibleAgent, OWNER_BETA_VERTICAL } from "./beta-enrollment";
 import { isSubjectAllowedForOwnerFeatures } from "./allowlist";
 import { OWNER_FEATURE_KEYS, ownerFeatureEffectiveTier, type OwnerFeatureKey } from "./feature-tiers";
 import { BETA_FEATURE_PLACEHOLDER_NAMES, BETA_TERMS_HREF, BETA_TEXTS } from "./beta-texts";
@@ -32,6 +33,19 @@ const HIDDEN: BetaCardState = { kind: "hidden" };
 /** The `beta`-tier owner features (effective tier), in registry order. */
 export function betaTierFeatures(env: NodeJS.ProcessEnv = process.env): OwnerFeatureKey[] {
   return OWNER_FEATURE_KEYS.filter((k) => ownerFeatureEffectiveTier(k, env) === "beta");
+}
+
+/**
+ * Opt-in / register-interest is open to this agent at all: NOT a pilot owner
+ * (they already have the tools; a pilot row would take a cap slot) AND an
+ * existing agent whose own agents.vertical_id is rfb. Shared by the card and
+ * the POST routes (routes/owner-beta.ts). Throws on a DB error (callers fail
+ * closed).
+ */
+export function betaJoinAllowed(agentId: string, env: NodeJS.ProcessEnv = process.env, db?: any): boolean {
+  if (!agentId) return false;
+  if (isSubjectAllowedForOwnerFeatures(OWNER_BETA_VERTICAL, agentId, env)) return false;
+  return isRfbBetaEligibleAgent(agentId, db);
 }
 
 /**
@@ -52,8 +66,11 @@ export function betaCardState(
     // Only a verified owner (valid session + verified ownership); this already
     // excludes claim-pending and ownerless profiles and unverified sessions.
     if (!isVerified) return HIDDEN;
-    // A pilot owner already has the tools — never the beta card/badge.
-    if (isSubjectAllowedForOwnerFeatures(OWNER_BETA_VERTICAL, agentId, env)) return HIDDEN;
+    // A pilot owner already has the tools — never the beta card/badge. Beta is
+    // Rett fra Bonden only: the agent's OWN agents.vertical_id must be rfb
+    // (COALESCE(vertical_id,'rfb')='rfb'); a dental/experiences agent, or an
+    // unknown id, never sees the card.
+    if (!betaJoinAllowed(agentId, env, db)) return HIDDEN;
 
     const status = betaEnrollmentStatus(OWNER_BETA_VERTICAL, agentId, db);
     const features = betaTierFeatures(env);
