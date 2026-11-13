@@ -4,8 +4,8 @@
  * src/routes/rfb-for-produsenter.ts, route GET /for-produsenter in seo.ts).
  *
  * Proves:
- *   1. Flag off (FOR_PRODUSENTER_PAGE_ENABLED unset): the route falls through
- *      (next() → the normal 404), the header «For produsenter» still points
+ *   1. Flag off (FOR_PRODUSENTER_PAGE_ENABLED unset): the route answers the
+ *      site's 404 page (not «Cannot GET»), the header «For produsenter» still points
  *      at /selger, the footer is unchanged and the sitemap helper is empty.
  *   2. Flag on: 200 in NO and EN with canonical + hreflang, the header points
  *      at the localized /for-produsenter, the sitemap lists it, the /:city
@@ -92,7 +92,11 @@ export async function runRfbForProdusenterTests(opts: { log?: boolean } = {}): P
     const offNo = invokeGet(seoRouter, FOR_PRODUSENTER_PATH, "no");
     const offEn = invokeGet(seoRouter, FOR_PRODUSENTER_PATH, "en");
     assertTrue(offNo.found, "setup: GET /for-produsenter is registered on the RFB seo router");
-    assertTrue(offNo.nextCalled && offNo.body === "" && offEn.nextCalled && offEn.body === "", "flag off: NO and EN fall through to next() (the normal 404), nothing sent");
+    // dev-request 2026-11-06-faq-fra-forsiden-begge-plattformer AC3: the site's
+    // own 404 page, not Express's raw «Cannot GET».
+    assertTrue(!offNo.nextCalled && offNo.status === 404 && offNo.body.includes("<h1 style=\"font-size:1.8rem;margin-bottom:12px;\">Fant ikke siden</h1>") && !offNo.body.includes("Cannot GET"), "flag off: NO answers the site's 404 page (status 404), not «Cannot GET»");
+    assertTrue(!offEn.nextCalled && offEn.status === 404 && offEn.body.includes("Page not found") && !offEn.body.includes("Cannot GET"), "flag off: EN answers the site's 404 page (status 404)");
+    assertTrue(offNo.body.includes('<meta name="robots" content="noindex, follow">') && !offNo.body.includes("Slik fungerer Rett fra Bonden for produsenter"), "flag off: the 404 page is noindex and reveals nothing of the page");
     const pvOff = invokeGet(seoRouter, "/personvern", "no");
     const pvOffEn = invokeGet(seoRouter, "/personvern", "en");
     assertTrue(navOf(pvOff.body).includes('<a href="/selger" class="nav-cta">') && !pvOff.body.includes("/for-produsenter"), "flag off: header «For produsenter» still /selger, no /for-produsenter anywhere (NO)");
@@ -213,7 +217,7 @@ export async function runRfbForProdusenterTests(opts: { log?: boolean } = {}): P
       delete process.env[FLAG];
       const offPanel = navOf(invokeGet(seoRouter, "/om", "no").body);
       assertTrue(offPanel.includes('<a href="/selger" class="nav-cta">') && !offPanel.includes("/for-produsenter") && offPanel.includes('aria-controls="navLinks"'), "F2b flag off: the menu's «For produsenter» still → /selger (same rule as desktop)");
-      assertTrue(invokeGet(seoRouter, FOR_PRODUSENTER_PATH, "no").nextCalled, "F2b flag off: /for-produsenter still 404");
+      assertTrue(invokeGet(seoRouter, FOR_PRODUSENTER_PATH, "no").status === 404, "F2b flag off: /for-produsenter still 404");
       process.env[FLAG] = "1";
     }
 

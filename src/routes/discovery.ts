@@ -24,6 +24,8 @@ import { safeHonestCatalogCount } from "../services/honest-count";
 import { registeredMcpTools } from "../services/mcp-tool-manifest";
 import { companyFooterLineHtml, companyOperatorSentence } from "../services/company-legal";
 import { debioProcessText } from "../services/debio-approval";
+import { isForProdusenterPageEnabled } from "./rfb-for-produsenter";
+import { FRONT_PAGE_FAQ_ANCHOR } from "./front-page-faq";
 
 /** ONE catalog number for every RFB discovery document (services/honest-count.ts); falls back to the list the handler already holds. */
 function rfbCatalogCount(fallback: number): number {
@@ -49,6 +51,16 @@ const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 // they check /llms.txt for a structured summary of what we are.
 // This is the single highest-impact discovery file we can add.
 // ═══════════════════════════════════════════════════════════════
+
+// A2A dev-request 2026-11-06-faq-fra-forsiden-begge-plattformer: links to the
+// FAQ pages under «For mennesker» while FOR_PRODUSENTER_PAGE_ENABLED is on;
+// "" while it is off, so llms.txt is byte-identical. Exported for tests.
+export function rfbFaqLlmsLines(): string {
+  if (!isForProdusenterPageEnabled()) return "";
+  return `
+- [Spørsmål og svar](${BASE_URL}/#${FRONT_PAGE_FAQ_ANCHOR}): Spørsmål og svar for kjøpere og produsenter på forsiden
+- [For produsenter](${BASE_URL}/for-produsenter): Slik fungerer Rett fra Bonden for produsenter, med spørsmål og svar`;
+}
 
 router.get("/llms.txt", (_req: Request, res: Response) => {
   try {
@@ -272,7 +284,7 @@ Content-Type: application/json
 
 - [Forsiden](${BASE_URL}/): Søk og utforsk lokale ${getConfig().domain_dictionary.entity_plural_long}
 - [Om oss](${BASE_URL}/om): Historien bak plattformen
-- [Teknologi](${BASE_URL}/teknologi): Hvordan A2A-teknologien fungerer
+- [Teknologi](${BASE_URL}/teknologi): Hvordan A2A-teknologien fungerer${rfbFaqLlmsLines()}
 - [Personvern](${BASE_URL}/personvern): Bare nødvendige informasjonskapsler (innlogging for selgere, språkvalg), ingen annonse- eller sporingscookies og ingen tredjeparts sporing. Sidebesøk og søk logges i vår egen database med saltet IP-hash.
 
 ## ChatGPT-app
