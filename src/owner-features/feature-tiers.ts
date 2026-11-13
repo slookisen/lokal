@@ -6,9 +6,9 @@
 // (OWNER_FEATURES_ALLOWED_SUBJECTS, owner-features/allowlist.ts) has a key in
 // OWNER_FEATURE_TIER_REGISTRY and one tier:
 //   pilot  only owners on the pilot list (as before)
-//   beta   the pilot list OR owners enrolled in the beta (S1: no enrollment
-//          table yet — the lookup is a stub that always says «not enrolled»,
-//          so beta behaves exactly like pilot)
+//   beta   the pilot list OR owners enrolled in the beta (S2: an `active`
+//          owner_beta_enrollment row, honoured only while OWNER_BETA_MODE is
+//          `offer` — see beta-mode.ts; mode `off` = pilot list only)
 //   ga     every owner of the profile (the caller keeps its own
 //          verified-owner check, as today)
 // The code default is `pilot` for all. Env OWNER_FEATURE_TIERS
@@ -24,9 +24,20 @@
 // calling here): flag off → off whatever the tier; flag `pilot` → this tier
 // logic; flag `1` → on for everyone as today.
 //
+// OWNER_BETA_MODE=all (graduation) treats every `beta` feature as `ga`.
+// product_import_outreach is capped at `beta` (registry maxTier): it never
+// resolves to `ga`, neither from OWNER_FEATURE_TIERS nor from mode `all`, so
+// the outreach mail can never fan out to every owner by a config change.
+//
 // ownerFeatureAccess never throws: any error means «not allowed».
+// The bulk paths (enforce.ts, visibility.ts, stock-check-reminder.ts) ask
+// ownerFeatureAllowedRfbIds for the same answer as a set of agent ids.
 
-import { isSubjectAllowedForOwnerFeatures } from "./allowlist";
+import { isSubjectAllowedForOwnerFeatures, ownerFeaturesAllowedSubjects } from "./allowlist";
+import { ownerBetaMode, type OwnerBetaMode } from "./beta-mode";
+import { activeBetaAgentIds, isBetaEnrollmentActive } from "./beta-enrollment";
+import { customerRuleSql } from "../services/customer-rule";
+import { getDb } from "../database/init";
 
 export const OWNER_FEATURE_TIERS_ENV = "OWNER_FEATURE_TIERS";
 
@@ -47,12 +58,13 @@ export const OWNER_FEATURE_TIER_REGISTRY = {
   orders: { defaultTier: "pilot", gate: "services/order-actions.ts t12OrderActionsActive (T12 cancellation + overview)" },
   orderability: { defaultTier: "pilot", gate: "services/owner-orderability.ts ownerOrderabilityPortalEnabledFor (OWNER_ORDERABILITY_PORTAL_ENABLED)" },
   product_import: { defaultTier: "pilot", gate: "owner-flag-mode.ts PRODUCT_IMPORT_ENABLED=pilot" },
-  product_import_outreach: { defaultTier: "pilot", gate: "owner-flag-mode.ts PRODUCT_IMPORT_OUTREACH_ENABLED=pilot" },
+  // N7: capped at beta — the outreach mail never goes to every owner by a tier/mode change.
+  product_import_outreach: { defaultTier: "pilot", maxTier: "beta", gate: "owner-flag-mode.ts PRODUCT_IMPORT_OUTREACH_ENABLED=pilot" },
   order_email: { defaultTier: "pilot", gate: "owner-flag-mode.ts OWNER_ORDER_EMAIL_ENABLED=pilot" },
   unified_session: { defaultTier: "pilot", gate: "owner-flag-mode.ts OWNER_UNIFIED_SESSION_ENABLED=pilot" },
   stock_check: { defaultTier: "pilot", gate: "services/stock-check-reminder.ts stockCheckAllowlisted" },
   stock_soft_expiry: { defaultTier: "pilot", gate: "services/stock-soft-expiry.ts stockSoftExpiryActiveFor (STOCK_SOFT_EXPIRY_ENABLED)" },
-} as const satisfies Record<string, { defaultTier: OwnerFeatureTier; gate: string }>;
+} as const satisfies Record<string, { defaultTier: OwnerFeatureTier; maxTier?: "pilot" | "beta"; gate: string }>;
 
 export type OwnerFeatureKey = keyof typeof OWNER_FEATURE_TIER_REGISTRY;
 export const OWNER_FEATURE_KEYS = Object.keys(OWNER_FEATURE_TIER_REGISTRY) as OwnerFeatureKey[];
@@ -130,17 +142,44 @@ export function ownerFeatureTier(feature: string, env: NodeJS.ProcessEnv = proce
   return parseOwnerFeatureTiers(env)[feature];
 }
 
-// ── Beta enrollment (S1 stub) ───────────────────────────────────────────────
-// S2 adds the enrollment table and replaces this lookup. Until then nobody is
-// enrolled, so `beta` resolves to the pilot list only.
+/** The highest tier a feature may resolve to (product_import_outreach: beta). */
+function maxTierOf(feature: OwnerFeatureKey): OwnerFeatureTier {
+  const e = OWNER_FEATURE_TIER_REGISTRY[feature] as { maxTier?: OwnerFeatureTier };
+  return e.maxTier ?? "ga";
+}
+
+/**
+ * The tier the gates enforce: the configured tier, with OWNER_BETA_MODE=all
+ * lifting `beta` to `ga`, and capped at the feature's maxTier
+ * (product_import_outreach never above `beta`). Unknown feature → pilot.
+ */
+export function ownerFeatureEffectiveTier(feature: string, env: NodeJS.ProcessEnv = process.env): OwnerFeatureTier {
+  if (!isOwnerFeatureKey(feature)) return ownerFeatureTier(feature, env);
+  let tier = ownerFeatureTier(feature, env);
+  if (tier === "beta" && ownerBetaMode(env) === "all") tier = "ga";
+  if (tier === "ga" && maxTierOf(feature) !== "ga") {
+    logOnce(`${feature} is capped at ${maxTierOf(feature)}; ga is not applied`);
+    tier = maxTierOf(feature);
+  }
+  return tier;
+}
+
+/** Beta rows count in modes offer and all (in `all` only a beta-capped feature still asks). Off → ignored. */
+function betaRowsHonoured(mode: OwnerBetaMode): boolean {
+  return mode === "offer" || mode === "all";
+}
+
+// ── Beta enrollment lookup ──────────────────────────────────────────────────
+// S2: an `active` owner_beta_enrollment row (beta-enrollment.ts). Asked only
+// for vertical rfb, a `beta` tier and OWNER_BETA_MODE offer/all.
 export type BetaEnrollmentLookup = (vertical: string, agentId: string, env: NodeJS.ProcessEnv) => boolean;
 
-const S1_NO_ENROLLMENT: BetaEnrollmentLookup = () => false;
-let betaEnrollmentLookup: BetaEnrollmentLookup = S1_NO_ENROLLMENT;
+const DB_ENROLLMENT: BetaEnrollmentLookup = (vertical, agentId) => isBetaEnrollmentActive(vertical, agentId);
+let betaEnrollmentLookup: BetaEnrollmentLookup = DB_ENROLLMENT;
 
-/** Test hook: swap the enrollment lookup (null = the S1 stub). */
+/** Test hook: swap the enrollment lookup (null = the owner_beta_enrollment table). */
 export function __setBetaEnrollmentLookupForTesting(fn: BetaEnrollmentLookup | null): void {
-  betaEnrollmentLookup = fn ?? S1_NO_ENROLLMENT;
+  betaEnrollmentLookup = fn ?? DB_ENROLLMENT;
 }
 
 export type OwnerFeatureAccessSource = OwnerFeatureTier | null;
@@ -156,9 +195,10 @@ const DENIED: OwnerFeatureAccess = Object.freeze({ allowed: false, source: null 
  * feature's own flag first (and, as today, a verified owner where it did).
  *   - on the pilot list (`<vertical>:<agentId>`) → allowed, source `pilot`
  *   - vertical ≠ rfb → nothing more (today's behaviour)
- *   - tier `ga` → allowed, source `ga`
- *   - tier `beta` and enrolled → allowed, source `beta` (S1: never enrolled)
- *   - otherwise / any error → not allowed, source null
+ *   - effective tier `ga` → allowed, source `ga`
+ *   - effective tier `beta`, OWNER_BETA_MODE offer (or all, for a
+ *     beta-capped feature) and an `active` enrollment row → allowed, source `beta`
+ *   - otherwise / any error (DB included) → not allowed, source null
  */
 export function ownerFeatureAccess(
   feature: OwnerFeatureKey | string,
@@ -170,9 +210,11 @@ export function ownerFeatureAccess(
     if (!vertical || !agentId) return DENIED;
     if (isSubjectAllowedForOwnerFeatures(vertical, agentId, env)) return { allowed: true, source: "pilot" };
     if (vertical !== OWNER_FEATURE_TIER_VERTICAL) return DENIED;
-    const tier = ownerFeatureTier(feature, env);
+    const tier = ownerFeatureEffectiveTier(feature, env);
     if (tier === "ga") return { allowed: true, source: "ga" };
-    if (tier === "beta" && betaEnrollmentLookup(vertical, agentId, env) === true) return { allowed: true, source: "beta" };
+    if (tier === "beta" && betaRowsHonoured(ownerBetaMode(env)) && betaEnrollmentLookup(vertical, agentId, env) === true) {
+      return { allowed: true, source: "beta" };
+    }
     return DENIED;
   } catch (err) {
     try { console.error(`[owner-feature-tiers] access check failed for ${String(feature)}, denying:`, (err as any)?.message ?? "error"); } catch { /* never throw */ }
@@ -188,4 +230,64 @@ export function ownerFeatureAllowed(
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
   return ownerFeatureAccess(feature, vertical, agentId, env).allowed;
+}
+
+// ── Bulk: the allowed rfb agent ids for one feature ─────────────────────────
+
+/** The rfb agent ids on the pilot list (OWNER_FEATURES_ALLOWED_SUBJECTS `rfb:<id>`). */
+export function rfbPilotIds(env: NodeJS.ProcessEnv = process.env): string[] {
+  return ownerFeaturesAllowedSubjects(env)
+    .filter((s) => s.startsWith(`${OWNER_FEATURE_TIER_VERTICAL}:`))
+    .map((s) => s.slice(OWNER_FEATURE_TIER_VERTICAL.length + 1))
+    .filter(Boolean);
+}
+
+export interface OwnerFeatureBulkOptions {
+  env?: NodeJS.ProcessEnv;
+  db?: any;
+}
+
+/**
+ * The same answer as ownerFeatureAccess, for the bulk paths that select many
+ * subjects at once (enforce.ts, visibility.ts, stock-check-reminder.ts):
+ *   - effective tier pilot → the rfb pilot list (no DB access — today's behaviour)
+ *   - beta → pilot list ∪ `active` enrollment rows while OWNER_BETA_MODE is
+ *     offer (or all, for a beta-capped feature); mode off → pilot list only
+ *   - ga → pilot list ∪ every agent with a verified owner (customerRuleSql,
+ *     the same rule as isVerifiedOwner)
+ * Fail closed: a DB error leaves only the pilot list (logged).
+ * Order: pilot ids first, in list order, then the rest sorted.
+ */
+export function ownerFeatureAllowedRfbIds(feature: OwnerFeatureKey, opts: OwnerFeatureBulkOptions = {}): string[] {
+  const env = opts.env ?? process.env;
+  const pilot = rfbPilotIds(env);
+  let tier: OwnerFeatureTier;
+  let mode: OwnerBetaMode;
+  try {
+    tier = ownerFeatureEffectiveTier(feature, env);
+    mode = ownerBetaMode(env);
+  } catch (err) {
+    try { console.error(`[owner-feature-tiers] tier read failed for ${String(feature)}, pilot list only:`, (err as any)?.message ?? "error"); } catch { /* never throw */ }
+    return pilot;
+  }
+  if (tier === "pilot") return pilot;
+  let extra: string[] = [];
+  try {
+    if (tier === "ga") {
+      const db = opts.db ?? getDb();
+      extra = (db.prepare(`SELECT a.id AS id FROM agents a WHERE ${customerRuleSql("a")} ORDER BY a.id`).all() as Array<{ id: string }>)
+        .map((r) => r.id);
+    } else if (tier === "beta" && betaRowsHonoured(mode)) {
+      extra = activeBetaAgentIds(OWNER_FEATURE_TIER_VERTICAL, opts.db);
+    }
+  } catch (err) {
+    try { console.error(`[owner-feature-tiers] bulk lookup failed for ${String(feature)}, pilot list only:`, (err as any)?.message ?? "error"); } catch { /* never throw */ }
+    return pilot;
+  }
+  const out = [...pilot];
+  const seen = new Set(pilot);
+  for (const id of extra) {
+    if (typeof id === "string" && id.length > 0 && !seen.has(id)) { seen.add(id); out.push(id); }
+  }
+  return out;
 }

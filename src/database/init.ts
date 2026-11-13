@@ -7206,6 +7206,31 @@ function initSchema(db: Database.Database): void {
     console.error("Migration registration_confirmation_email_log failed:", err);
   }
 
+  // ─── owner_beta_enrollment (beta-for-alle S2, 2026-11-13) ───────────────
+  // A2A dev-request 2026-11-09-rfb-eierverktoy-beta-for-alle. One row per
+  // owner (vertical, agent_id): status active | opted_out | interested, the
+  // beta terms version accepted, and ISO-8601 UTC timestamps. No e-mail or IP.
+  // Read only while OWNER_BETA_MODE is offer/all (owner-features/
+  // beta-enrollment.ts); every change also writes one owner_feature_audit row.
+  // Additive, brand-new table, idempotent.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS owner_beta_enrollment (
+        vertical TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('active','opted_out','interested')),
+        opted_in_at TEXT,
+        opted_out_at TEXT,
+        terms_version TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (vertical, agent_id)
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_owner_beta_enrollment_status ON owner_beta_enrollment(vertical, status)`);
+  } catch (err) {
+    console.error("Migration owner_beta_enrollment failed:", err);
+  }
+
   // ─── S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok ──────────────
   // agents_name_fts (FTS5 trigram over agents.name) + its three sync triggers,
   // populated here only when empty or out of step with agents (one INSERT …

@@ -54278,3 +54278,25 @@ runSerial(async () => {
     failures.push("feature-tiers: unexpected error: " + String(err?.message || err));
   }
 });
+
+// A2A dev-request 2026-11-09-rfb-eierverktoy-beta-for-alle, S2: the
+// owner_beta_enrollment table, OWNER_BETA_MODE / OWNER_BETA_CAP, the enrollment
+// writes (cap + audit), beta access and the bulk paths, GET
+// /admin/owner-beta/stats. Own in-memory DB; swaps console.warn/error, the
+// enrollment test DB and process.env ADMIN_KEY / OWNER_BETA_* (restored in
+// finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── beta-for-alle S2: påmeldingstabell, hovedflagg, tak og admin-tall ──");
+  try {
+    const { runBetaEnrollmentTests } = require("../src/owner-features/beta-enrollment.test") as
+      typeof import("../src/owner-features/beta-enrollment.test");
+    const r = await runBetaEnrollmentTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("beta-enrollment: " + f);
+    console.log(`  beta-enrollment: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("beta-enrollment: unexpected error: " + String(err?.message || err));
+  }
+});

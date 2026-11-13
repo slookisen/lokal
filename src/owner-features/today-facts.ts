@@ -20,7 +20,8 @@
 // (today-facts.test.ts) checks every state against that predicate for an
 // allowlisted and a non-allowlisted id, so the table cannot drift silently.
 
-import { ownerFeaturesAllowedSubjects } from "./allowlist";
+import { OWNER_PILOT_FLAG_FEATURE, ownerFeatureEffectiveTier, rfbPilotIds, type OwnerFeatureKey as TierFeatureKey } from "./feature-tiers";
+import { ownerBetaMode } from "./beta-mode";
 import { ownerFlagMode, type OwnerFlagMode } from "./owner-flag-mode";
 import { ownerAutoUpdatesEnabled } from "./registry";
 import type { OrderLimitsConfig } from "./order-texts";
@@ -47,8 +48,10 @@ export interface PilotGate {
   source: string;
   /** The function's switch: "all" = on for everyone it applies to, "pilot" = allowlist only, "off". */
   mode: (env: NodeJS.ProcessEnv) => OwnerFlagMode;
-  /** The code ANDs the owner-features allowlist whatever the switch says (no «for alle» possible). */
+  /** The code ANDs the owner-features allowlist whatever the switch says (no «for alle» from the switch alone). */
   allowlistAlways: boolean;
+  /** beta-for-alle S2: the feature-tiers key whose tier (pilot | beta | ga) widens the allowlist. */
+  tierFeature?: TierFeatureKey;
 }
 
 const boolMode = (on: (env: NodeJS.ProcessEnv) => boolean) => (env: NodeJS.ProcessEnv): OwnerFlagMode => (on(env) ? "all" : "off");
@@ -57,20 +60,20 @@ const noSwitch = (): OwnerFlagMode => "all";
 /** One row per function: the same switch and allowlist rule as the code that serves it. */
 export const PILOT_FEATURE_GATES: Record<PilotFeatureKey, PilotGate> = {
   // routes/owner-features.ts gate(): «Mine valg» 404s off the allowlist; no env switch.
-  mine_valg: { source: "routes/owner-features.ts gate() — isSubjectAllowedForOwnerFeatures", mode: noSwitch, allowlistAlways: true },
+  mine_valg: { source: "routes/owner-features.ts gate() — isSubjectAllowedForOwnerFeatures", mode: noSwitch, allowlistAlways: true, tierFeature: "mine_valg" },
   // routes/owner-portal.ts: the «Varer» card (T13 V1a) under ownerOrderabilityPortalEnabledFor.
-  varer: { source: "services/owner-orderability.ts ownerOrderabilityPortalEnabledFor (OWNER_ORDERABILITY_PORTAL_ENABLED + allowlist)", mode: boolMode(ownerOrderabilityPortalEnabled), allowlistAlways: true },
+  varer: { source: "services/owner-orderability.ts ownerOrderabilityPortalEnabledFor (OWNER_ORDERABILITY_PORTAL_ENABLED + allowlist)", mode: boolMode(ownerOrderabilityPortalEnabled), allowlistAlways: true, tierFeature: "orderability" },
   // T12: «Kanseller bestillingen» in «Mine ordrer» and the e-mail order page.
-  kanseller: { source: "services/order-actions.ts t12OrderActionsActive — allowlist", mode: noSwitch, allowlistAlways: true },
+  kanseller: { source: "services/order-actions.ts t12OrderActionsActive — allowlist", mode: noSwitch, allowlistAlways: true, tierFeature: "orders" },
   // B2: the job selects only allowlisted producers (stock-check-reminder.ts allowlistedRfbIds).
-  lagerpaminnelse: { source: "services/stock-check-reminder.ts (STOCK_CHECK_EMAIL_ENABLED + allowlist)", mode: boolMode(isStockCheckEmailEnabled), allowlistAlways: true },
+  lagerpaminnelse: { source: "services/stock-check-reminder.ts (STOCK_CHECK_EMAIL_ENABLED + allowlist)", mode: boolMode(isStockCheckEmailEnabled), allowlistAlways: true, tierFeature: "stock_check" },
   // B2b-1: soft stock expiry.
-  myk_utlop: { source: "services/stock-soft-expiry.ts stockSoftExpiryActiveFor (STOCK_SOFT_EXPIRY_ENABLED + allowlist)", mode: boolMode(stockSoftExpiryEnabled), allowlistAlways: true },
+  myk_utlop: { source: "services/stock-soft-expiry.ts stockSoftExpiryActiveFor (STOCK_SOFT_EXPIRY_ENABLED + allowlist)", mode: boolMode(stockSoftExpiryEnabled), allowlistAlways: true, tierFeature: "stock_soft_expiry" },
 };
 
 /** At least one RFB subject on OWNER_FEATURES_ALLOWED_SUBJECTS (`rfb:<id>`). */
 export function rfbPilotHasMembers(env: NodeJS.ProcessEnv = process.env): boolean {
-  return ownerFeaturesAllowedSubjects(env).some((s) => s.startsWith("rfb:") && s.length > "rfb:".length);
+  return rfbPilotIds(env).length > 0;
 }
 
 /** PURE: the state of one function under `env`. */
@@ -78,12 +81,17 @@ export function pilotFeatureState(gate: PilotGate, env: NodeJS.ProcessEnv = proc
   const mode = gate.mode(env);
   if (mode === "off") return "planlagt";
   if (mode === "all" && !gate.allowlistAlways) return "for_alle";
+  // beta-for-alle S2: the tier widens the allowlist like the gate does
+  // (feature-tiers.ts ownerFeatureAccess). Default tier pilot → as before.
+  const tier = gate.tierFeature ? ownerFeatureEffectiveTier(gate.tierFeature, env) : "pilot";
+  if (tier === "ga") return "for_alle";
+  if (tier === "beta" && ownerBetaMode(env) === "offer") return "i_pilot";
   return rfbPilotHasMembers(env) ? "i_pilot" : "planlagt";
 }
 
 /** A gate for a pilot-capable owner flag (owner-flag-mode.ts: «1»/«true» = all, «pilot» = allowlist). */
 export function ownerModeGate(flag: string, source = flag): PilotGate {
-  return { source, mode: (env) => ownerFlagMode(flag, env), allowlistAlways: false };
+  return { source, mode: (env) => ownerFlagMode(flag, env), allowlistAlways: false, tierFeature: OWNER_PILOT_FLAG_FEATURE[flag] };
 }
 
 export function currentPilotStates(env: NodeJS.ProcessEnv = process.env): Record<PilotFeatureKey, PilotState> {

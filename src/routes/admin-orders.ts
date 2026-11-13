@@ -54,7 +54,7 @@ function requireAdmin(req: Request, res: Response): boolean {
 
 // F10: 401 (not 403) for a missing or wrong key, so a probe without the key
 // reads as «unauthorised». 503 when no admin key is configured at all.
-function requirePilotAdmin(req: Request, res: Response): boolean {
+export function requirePilotAdmin(req: Request, res: Response): boolean {
   const expected = process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
   if (!expected) {
     res.status(503).json({ error: "Admin not configured" });

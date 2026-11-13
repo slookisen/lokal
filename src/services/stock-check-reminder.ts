@@ -68,8 +68,7 @@ import {
 } from "./owner-orderability";
 import { serverSignatureFor } from "./avmeld-service";
 import { rfbFeatureOn } from "../owner-features/resolve";
-import { ownerFeaturesAllowedSubjects } from "../owner-features/allowlist";
-import { ownerFeatureAccess } from "../owner-features/feature-tiers";
+import { ownerFeatureAccess, ownerFeatureAllowedRfbIds } from "../owner-features/feature-tiers";
 import { osloHour } from "./order-cap-notice";
 
 export const STOCK_CHECK_EMAIL_FLAG = "STOCK_CHECK_EMAIL_ENABLED";
@@ -120,12 +119,18 @@ export function stockCheckAllowlisted(agentId: string, env: NodeJS.ProcessEnv = 
   return ownerFeatureAccess("stock_check", "rfb", agentId, env).allowed;
 }
 
-/** B1a: the allowlisted rfb producer ids (the job selects only these). */
-function allowlistedRfbIds(env: NodeJS.ProcessEnv): string[] {
-  return ownerFeaturesAllowedSubjects(env)
-    .filter((s) => s.startsWith("rfb:"))
-    .map((s) => s.slice("rfb:".length))
-    .filter(Boolean);
+/**
+ * B1a: the rfb producer ids with the `stock_check` owner feature (the job
+ * selects only these): the pilot list by default; beta/ga per tier
+ * (feature-tiers.ts ownerFeatureAllowedRfbIds, beta-for-alle S2).
+ */
+function allowlistedRfbIds(env: NodeJS.ProcessEnv, db?: any): string[] {
+  return ownerFeatureAllowedRfbIds("stock_check", { env, db });
+}
+
+/** Test hook: the ids the job would select from (allowlistedRfbIds). */
+export function __stockCheckAllowedRfbIdsForTesting(env: NodeJS.ProcessEnv, db?: any): string[] {
+  return allowlistedRfbIds(env, db);
 }
 
 // ─── Which rows ─────────────────────────────────────────────────────────────
@@ -373,7 +378,7 @@ export async function processStockCheckReminders(
   });
   const windowStart = new Date(now.getTime() - STOCK_CHECK_EMAIL_WINDOW_DAYS * DAY_MS).toISOString();
   // B1a: only producers on the owner-features allowlist; none listed = no run.
-  const allowed = allowlistedRfbIds(env);
+  const allowed = allowlistedRfbIds(env, db);
   if (allowed.length === 0) return out;
   const rows = db.prepare(`
     SELECT DISTINCT p.agent_id AS agent_id

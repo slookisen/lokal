@@ -37,6 +37,7 @@ import { catalogRouter as marketplaceCatalogRouter, adminCatalogRouter } from ".
 import { runProductCatalogSync } from "./services/product-catalog-sync";
 import { cartRouter, adminOrderRouter, producerOrderRouter } from "./routes/marketplace-cart";
 import adminOrdersRoutes from "./routes/admin-orders";
+import adminOwnerBetaRoutes from "./routes/admin-owner-beta";
 import orderActivationRoutes, { orderActivationAdminRouter } from "./routes/order-activation-link";
 import claimActionLinkRoutes, { claimActionAdminRouter } from "./routes/claim-action-link";
 import dentalRoutes from "./routes/dental";
@@ -1334,6 +1335,8 @@ app.use("/admin/products", adminLimiter, adminCatalogRouter);
 app.use("/admin/marketplace", adminLimiter, adminOrderRouter);
 // dev-request 2026-07-13-pilot-ordre-loop: notification opt-in + seller order inbox
 app.use("/admin/orders", adminLimiter, adminOrdersRoutes);
+// beta-for-alle S2: GET /admin/owner-beta/stats — mode, cap, enrollment counts, tier per feature (no names/contact).
+app.use("/admin/owner-beta", adminLimiter, adminOwnerBetaRoutes);
 // skive 2: POST /admin/orders/activation-link — signed one-time link, returned to admin only.
 app.use("/admin/orders", adminLimiter, orderActivationAdminRouter);
 
