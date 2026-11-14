@@ -168,6 +168,20 @@ export function runOpplevelserGardssalgOutreachReplyGuardTouchCapTests(
       const emailF = mk("prov-f-reserved2");
       addLog("prov-f-reserved2", emailF, 90, "reserved");
       addLog("prov-f-reserved2", emailF, 50, "reserved");
+      // prov-g-cooldown: 1 send 5d ago -> own cooldown (dev-request
+      // 2026-10-08-outreach-sendinger-mangler-epost-i-rapport, i1-i6 below).
+      const emailG = mk("prov-g-cooldown");
+      addLog("prov-g-cooldown", emailG, 5, null);
+      // A newer is_test send never shows up as prov-c's recipient (i7).
+      expDb
+        .prepare(`INSERT INTO experience_outreach_sent_log (provider_id, recipient_email, sent_at, is_test) VALUES (?, ?, ?, 1)`)
+        .run("prov-c-max", "test@example.invalid", new Date(Date.now() - 1 * 86400_000).toISOString());
+      // prov-h-shared: own old send (100d) to an old address, current address
+      // shared with prov-g whose send 5d ago puts prov-h in cooldown (i8).
+      const insertShared = expDb.prepare(`UPDATE experience_providers SET epost = ? WHERE id = ?`);
+      mk("prov-h-shared");
+      insertShared.run(emailG, "prov-h-shared");
+      addLog("prov-h-shared", "gammel@prov-h-shared.no", 100, null);
 
       const ids = ["prov-a-fresh", "prov-b-replied", "prov-c-max", "prov-d-followup", "prov-e-replied-first", "prov-f-reserved2"];
       const elig = computeGardssalgOutreachSendEligibility(expDb, ids, { skipRecipientDedupe: true });
@@ -204,6 +218,27 @@ export function runOpplevelserGardssalgOutreachReplyGuardTouchCapTests(
       const candIds = prep.response.candidates.map((c: any) => c.provider_id).sort();
       assertEq(candIds, ["prov-a-fresh", "prov-d-followup"], "h5: daily-prep candidates = fresh + 1-send follow-up only");
       assertEq(prep.selected.map((s) => s.provider_id).sort(), ["prov-a-fresh", "prov-d-followup"], "h6: selected agrees with preview");
+
+      // dev-request 2026-10-08-outreach-sendinger-mangler-epost-i-rapport:
+      // rows this lane has already mailed carry the latest send's recipient,
+      // so the outreach report can show who got today's mail.
+      const rowById = new Map(prep.response.excluded.map((x: any) => [x.provider_id, x]));
+      const rowC: any = rowById.get("prov-c-max");
+      const lastC = expDb
+        .prepare(`SELECT sent_at FROM experience_outreach_sent_log WHERE provider_id = ? AND notes = 'reserved'`)
+        .get("prov-c-max") as { sent_at: string };
+      assertEq(rowC?.recipient_email, emailC, "i1: max_touch_reached row carries the latest send's recipient_email");
+      assertEq(rowC?.last_sent_at, lastC.sent_at, "i2: max_touch_reached row carries the latest send's sent_at as last_sent_at");
+      assertEq(rowC?.quarantine_until, undefined, "i3: max_touch_reached row gets no quarantine_until (the cap is not a quarantine)");
+      const rowG: any = rowById.get("prov-g-cooldown");
+      assertEq(rowG?.reason, "cooldown_suppressed", "i4: 5-day-old own send -> cooldown_suppressed");
+      assertEq(rowG?.recipient_email, emailG, "i5: own-cooldown row carries recipient_email");
+      assertEq(typeof rowG?.quarantine_until, "string", "i5b: own-cooldown row keeps quarantine_until");
+      assertEq((rowById.get("prov-b-replied") as any)?.recipient_email, undefined, "i6: replied row gets no recipient_email");
+      assertEq(rowC?.recipient_email === "test@example.invalid", false, "i7: an is_test send is never reported as the recipient");
+      const rowH: any = rowById.get("prov-h-shared");
+      assertEq(rowH?.reason, "cooldown_suppressed", "i8a: shared address mailed 5d ago -> cooldown_suppressed");
+      assertEq([rowH?.recipient_email, rowH?.last_sent_at], [emailG, rowG?.last_sent_at], "i8b: cooldown row pairs last_sent_at with the address of the send that caused it, not the provider's own older send");
     } catch (err) {
       failed++;
       failures.push(`✗ reply-guard/touch-cap suite threw: ${(err as Error)?.stack ?? err}`);
