@@ -206,6 +206,19 @@ export async function runRfbForProdusenterInnlenkerTests(opts: { log?: boolean }
     console.log = prevLog;
     setFlag(prevFlag);
     if (prevDb) initMod.__setDbForTesting(prevDb as any);
+    // The renders above warmed process-wide caches from the one-producer
+    // in-memory DB (registry agents/stats, 60 s TTL). Drop them so later
+    // suites (e.g. discovery-truth lokal_stats) read their own DB.
+    try {
+      const { marketplaceRegistry } = require("../services/marketplace-registry") as typeof import("../services/marketplace-registry");
+      marketplaceRegistry._agentsCache = null;
+      marketplaceRegistry._statsCache = null;
+      marketplaceRegistry._agentsCacheTime = 0;
+      marketplaceRegistry._statsCacheTime = 0;
+      (marketplaceRegistry as any)._slugIdMap = null;
+    } catch { /* not loaded */ }
+    try { (require("./seo") as typeof import("./seo")).__resetSitemapCacheForTesting(); } catch { /* not loaded */ }
+    try { (require("./agent-stats") as typeof import("./agent-stats")).__resetAgentStatsCacheForTesting(); } catch { /* not loaded */ }
     db.close();
   }
   return { passed, failed, failures };
