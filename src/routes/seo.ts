@@ -861,6 +861,33 @@ export function renderRfbFrontPageFaq(lang: Lang): string {
     </section>`;
 }
 
+// ─── Inbound links to /for-produsenter (F3) ─────────────────
+// A2A dev-request 2026-10-22-rfb-for-produsenter-faq-side, AC7: /teknologi
+// and the unclaimed-profile banner link to /for-produsenter. Behind
+// FOR_PRODUSENTER_PAGE_ENABLED: with the flag off both helpers return "", so
+// the pages are byte-identical to before (and never link to a 404).
+
+/** «Er du produsent?» box at the end of /teknologi; "" while the flag is off. Exported for tests. */
+export function renderTeknologiProducerBox(lang: Lang): string {
+  if (!isForProdusenterPageEnabled()) return "";
+  const en = lang === "en";
+  return `
+  <section class="tech-sec" id="for-produsenter">
+    <div class="setup-guide">
+      <h3>${escapeHtml(en ? "Are you a producer?" : "Er du produsent?")}</h3>
+      <p><a href="${localizedPath(FOR_PRODUSENTER_PATH, lang)}">${escapeHtml(en ? "Read how Rett fra Bonden works for producers" : "Les hvordan Rett fra Bonden fungerer for produsenter")}</a></p>
+    </div>
+  </section>`;
+}
+
+/** Extra «Les hvordan det fungerer» line in the «Eier denne butikken?» banner; "" while the flag is off. Exported for tests. */
+export function claimHeroHowItWorksLink(lang: Lang): string {
+  if (!isForProdusenterPageEnabled()) return "";
+  const en = lang === "en";
+  return `
+             <p class="claim-hero-more"><a href="${localizedPath(FOR_PRODUSENTER_PATH, lang)}#eierskap">${escapeHtml(en ? "Read how it works" : "Les hvordan det fungerer")}</a></p>`;
+}
+
 // ─── Page shell ─────────────────────────────────────────────
 
 export function shell(
@@ -2874,7 +2901,7 @@ router.get("/teknologi", (req: Request, res: Response) => {
   res.send(shell(
     t(lang, "tech.title"),
     t(lang, "tech.description"),
-    content,
+    content + renderTeknologiProducerBox(lang),
     { canonical: `${BASE_URL}${localizedPath("/teknologi", lang)}`, extraCss: TECH_CSS, lang, pathForAlternate: "/teknologi" }
   ));
 });
@@ -4949,6 +4976,8 @@ const PROFILE_CSS = `
   .claim-hero { background: linear-gradient(135deg, #2D5016, #1a3d0a); color: var(--white); border-radius: var(--r-lg); padding: 20px 24px; margin: 0 0 20px; display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
   .claim-hero h2 { font-size: 1.15rem; font-weight: 700; margin: 0 0 4px; color: var(--white); }
   .claim-hero p { font-size: 0.9rem; opacity: 0.9; margin: 0; }
+  .claim-hero p.claim-hero-more { margin-top: 6px; }
+  .claim-hero p.claim-hero-more a { color: var(--white); text-decoration: underline; }
   .claim-hero a.claim-hero-btn { display: inline-flex; align-items: center; min-height: 44px; padding: 12px 24px; background: #D4A373; color: #1a1a1a; border-radius: 8px; font-weight: 700; font-size: 0.95rem; text-decoration: none; white-space: nowrap; }
   .claim-hero a.claim-hero-btn:hover, .claim-hero a.claim-hero-btn:focus { background: #e8c9a0; outline: 2px solid #fff; }
   @media (max-width: 600px) { .claim-hero { flex-direction: column; align-items: stretch; text-align: center; } .claim-hero a.claim-hero-btn { width: 100%; justify-content: center; } }
@@ -7269,7 +7298,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       ? `<div class="claim-hero">
            <div>
              <h2>${lang === "en" ? "Do you own this shop?" : "Eier denne butikken?"}</h2>
-             <p>${lang === "en" ? "Take ownership of " + escapeHtml(agent.name) + " and manage your own profile." : "Ta eierskap over " + escapeHtml(agent.name) + " og styr din egen profil."}</p>
+             <p>${lang === "en" ? "Take ownership of " + escapeHtml(agent.name) + " and manage your own profile." : "Ta eierskap over " + escapeHtml(agent.name) + " og styr din egen profil."}</p>${claimHeroHowItWorksLink(lang)}
            </div>
            <a href="/selger?agent=${encodeURIComponent(agent.id)}" class="claim-hero-btn">${lang === "en" ? "Take ownership here" : "Ta eierskap her"}</a>
          </div>`
