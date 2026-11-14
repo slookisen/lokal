@@ -112,14 +112,24 @@ export async function runTrustScoreMcpRoutesRemovedTests(opts: { log?: boolean }
   const prevLog = console.log;
   if (!log) console.log = () => { /* silence registry chatter */ };
 
+  // Fresh copies of mcp.ts and marketplace-registry.ts for this block, with
+  // the previous require.cache entries put back in `finally`. A bare
+  // `delete require.cache[...]` left the rest of the suite with two live
+  // registry copies: routes loaded earlier (mcp.ts, a2a.ts) kept the old one
+  // and its 60 s agents cache, which later suites' cache resets (on the copy
+  // require.cache holds) never reached — discovery-truth's lokal_stats then
+  // read another suite's agents when it ran within 60 s of them.
+  const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([
+    require.resolve("./mcp"),
+    require.resolve("../services/marketplace-registry"),
+  ]);
+
   try {
     // ══════════════════════════════════════════════════════════════
     // (1) src/routes/mcp.ts — lokal_info / lokal_search / lokal_discover
     // no longer print "Trust NN%" anywhere in their text output, for an
     // agent with trustScore > 0.
     // ══════════════════════════════════════════════════════════════
-    const mcpRoutePath = require.resolve("./mcp");
-    delete require.cache[mcpRoutePath];
     const { registerTools } = require("./mcp") as typeof import("./mcp");
 
     const tools = new Map<string, CapturedTool>();
@@ -177,8 +187,6 @@ export async function runTrustScoreMcpRoutesRemovedTests(opts: { log?: boolean }
     // /api/marketplace/search sit on top of), not by reaching into the
     // private method directly.
     // ══════════════════════════════════════════════════════════════
-    const registryPath = require.resolve("../services/marketplace-registry");
-    delete require.cache[registryPath];
     const { marketplaceRegistry } = require("../services/marketplace-registry") as
       typeof import("../services/marketplace-registry");
 
@@ -216,6 +224,7 @@ export async function runTrustScoreMcpRoutesRemovedTests(opts: { log?: boolean }
   } finally {
     console.log = prevLog;
     if (prevDb) __setDbForTesting(prevDb as any);
+    restoreModuleCache();
   }
 
   return { passed, failed, failures };
