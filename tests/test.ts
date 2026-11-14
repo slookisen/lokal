@@ -50403,6 +50403,27 @@ runSerial(async () => {
   }
 });
 
+// «For produsenter» F2c-1 (A2A dev-request 2026-10-22-rfb-for-produsenter-faq-side,
+// AC6): registry faqAnchor on every RFB consent/confirm entry, each anchor a
+// section id rendered on /for-produsenter (NO + EN, flag on), and the «Les mer»
+// link on RFB «Mine valg» (flag on only; never on the gårdssalg page). Swaps
+// getDb() and FOR_PRODUSENTER_PAGE_ENABLED, restored in finally — runSerial.
+runSerial(async () => {
+  console.log("\n── for produsenter F2c-1 («Les mer» via faqAnchor) ──");
+  try {
+    const { runFaqAnchorTests } = require("../src/owner-features/faq-anchor.test") as
+      typeof import("../src/owner-features/faq-anchor.test");
+    const r = await runFaqAnchorTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("faq-anchor: " + f);
+    console.log(`  faq-anchor: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("faq-anchor: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, track C3:
 // checkCartToken() enforces carts.expires_at (the "valid for 7 days" promise
 // is now literally true). Own in-memory DB — tail position, not load-bearing.
