@@ -211,7 +211,7 @@ function pilotInvite(where: "mine-valg" | "avslutning", lang: "no" | "en", f: Fo
 function orderLimitLinesEn(cfg: OrderLimitsConfig): string[] {
   return [
     "Many different customers can order from you on the same day.",
-    `To stop misuse, one customer can have at most ${cfg.openPerBuyer} unanswered orders with you at a time, and send you at most ${cfg.perBuyerPerDay} new orders per day.`,
+    `One customer can have at most ${cfg.openPerBuyer} unanswered orders with you at a time, and send you at most ${cfg.perBuyerPerDay} new orders per day.`,
     `If you get more than ${cfg.producerCeilingPerDay} orders in one day, we take no more for you for the rest of the day. Customers then get your contact details instead.`,
     "A day runs from midnight to midnight.",
   ];
