@@ -21828,6 +21828,10 @@ export function computeGardssalgOutreachDailyPrep(expDb: ReturnType<typeof getEx
     quarantine_until?: string;
     address_basis?: GardssalgAddressBasis;
     address_published?: boolean;
+    // dev-request 2026-10-08-outreach-sendinger-mangler-epost-i-rapport:
+    // the address of this lane's latest real send to this provider, on
+    // own-cooldown and max_touch_reached rows only (reporting, not a filter).
+    recipient_email?: string;
   };
 
   // ── producer_type / naeringskode / hjemmeside / field_provenance /
@@ -22042,6 +22046,29 @@ export function computeGardssalgOutreachDailyPrep(expDb: ReturnType<typeof getEx
       cross_platform: s.cross_platform,
       quarantine_until: s.last_sent_at ? quarantineUntil(s.last_sent_at) : undefined,
     });
+  }
+  // dev-request 2026-10-08-outreach-sendinger-mangler-epost-i-rapport: the
+  // outreach report lists today's recipients from these rows (last_sent_at =
+  // today), but they carried no address. A row this lane has already mailed
+  // (own cooldown, or max_touch_reached after the second touch) now gets the
+  // recipient of its latest real send, read from the send log by
+  // provider_id. max_touch_reached rows also get that send's time as
+  // last_sent_at (set after quarantine_until above, so they get none: the
+  // touch cap is not a quarantine). Cross-platform cooldown rows are not
+  // this lane's sends and stay unchanged. Reporting only; no decision reads it.
+  const latestOwnSendStmt = expDb.prepare(
+    `SELECT recipient_email, sent_at FROM experience_outreach_sent_log
+      WHERE provider_id = ? AND is_test = 0
+      ORDER BY sent_at DESC, id DESC LIMIT 1`,
+  );
+  for (const row of excluded) {
+    const ownSend =
+      row.reason === "max_touch_reached" || (row.reason === "cooldown_suppressed" && !row.cross_platform);
+    if (!ownSend) continue;
+    const last = latestOwnSendStmt.get(row.provider_id) as { recipient_email: string; sent_at: string } | undefined;
+    if (!last) continue;
+    row.recipient_email = last.recipient_email;
+    if (row.reason === "max_touch_reached" && !row.last_sent_at) row.last_sent_at = last.sent_at;
   }
   // Skive 3 checks 1-3 exclusions (address/profile-text/industry) — computed
   // further above, over the full eligible list, before the daily cap.
