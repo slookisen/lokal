@@ -50360,6 +50360,27 @@ runSerial(async () => {
   }
 });
 
+// «For produsenter» F3 — inbound links (A2A dev-request
+// 2026-10-22-rfb-for-produsenter-faq-side, AC7): /teknologi box, the
+// «Eier denne butikken?» banner link to #eierskap, #synlighet → /teknologi;
+// flag off = no box, no banner link. In-memory RFB DB swapped in and restored;
+// restores FOR_PRODUSENTER_PAGE_ENABLED in finally — tail position.
+runSerial(async () => {
+  console.log("\n── for produsenter F3 (innlenker: /teknologi + profilbanner) ──");
+  try {
+    const { runRfbForProdusenterInnlenkerTests } = require("../src/routes/rfb-for-produsenter-innlenker.test") as
+      typeof import("../src/routes/rfb-for-produsenter-innlenker.test");
+    const r = await runRfbForProdusenterInnlenkerTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-for-produsenter-innlenker: " + f);
+    console.log(`  rfb-for-produsenter-innlenker: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-for-produsenter-innlenker: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // «For produsenter» F2a (A2A dev-request 2026-10-22-rfb-for-produsenter-faq-side,
 // «Endringer fra Daniel 08.11»): the facts module owner-features/today-facts.ts,
 // the three states for_alle / i_pilot / planlagt checked against the code's own
