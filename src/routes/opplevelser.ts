@@ -22049,26 +22049,40 @@ export function computeGardssalgOutreachDailyPrep(expDb: ReturnType<typeof getEx
   }
   // dev-request 2026-10-08-outreach-sendinger-mangler-epost-i-rapport: the
   // outreach report lists today's recipients from these rows (last_sent_at =
-  // today), but they carried no address. A row this lane has already mailed
-  // (own cooldown, or max_touch_reached after the second touch) now gets the
-  // recipient of its latest real send, read from the send log by
-  // provider_id. max_touch_reached rows also get that send's time as
-  // last_sent_at (set after quarantine_until above, so they get none: the
-  // touch cap is not a quarantine). Cross-platform cooldown rows are not
-  // this lane's sends and stay unchanged. Reporting only; no decision reads it.
+  // today), but they carried no address. Reporting only; no decision reads it.
+  // - Own cooldown: the recipient of the exact send-log row that caused the
+  //   cooldown (same sent_at, same address as the provider's current e-mail,
+  //   which is what the cooldown check matched on), so last_sent_at and
+  //   recipient_email always describe one send, also when the address is
+  //   shared with another provider.
+  // - max_touch_reached: the provider's latest send-log row (the cap counts
+  //   per provider), plus its sent_at as last_sent_at. Set after
+  //   quarantine_until above, so these rows get none: the cap is no quarantine.
+  // Reserved rows (notes = 'reserved', send outcome unknown) count, as they do
+  // for cooldown and the cap. Cross-platform cooldown rows are not this
+  // lane's sends and stay unchanged.
+  const cooldownSendStmt = expDb.prepare(
+    `SELECT l.recipient_email FROM experience_outreach_sent_log l
+       JOIN experience_providers p ON p.id = ?
+      WHERE l.is_test = 0 AND l.sent_at = ?
+        AND LOWER(l.recipient_email) = LOWER(TRIM(p.epost))
+      ORDER BY l.id DESC LIMIT 1`,
+  );
   const latestOwnSendStmt = expDb.prepare(
     `SELECT recipient_email, sent_at FROM experience_outreach_sent_log
       WHERE provider_id = ? AND is_test = 0
       ORDER BY sent_at DESC, id DESC LIMIT 1`,
   );
   for (const row of excluded) {
-    const ownSend =
-      row.reason === "max_touch_reached" || (row.reason === "cooldown_suppressed" && !row.cross_platform);
-    if (!ownSend) continue;
-    const last = latestOwnSendStmt.get(row.provider_id) as { recipient_email: string; sent_at: string } | undefined;
-    if (!last) continue;
-    row.recipient_email = last.recipient_email;
-    if (row.reason === "max_touch_reached" && !row.last_sent_at) row.last_sent_at = last.sent_at;
+    if (row.reason === "cooldown_suppressed" && !row.cross_platform && row.last_sent_at) {
+      const hit = cooldownSendStmt.get(row.provider_id, row.last_sent_at) as { recipient_email: string } | undefined;
+      if (hit) row.recipient_email = hit.recipient_email;
+    } else if (row.reason === "max_touch_reached") {
+      const last = latestOwnSendStmt.get(row.provider_id) as { recipient_email: string; sent_at: string } | undefined;
+      if (!last) continue;
+      row.recipient_email = last.recipient_email;
+      if (!row.last_sent_at) row.last_sent_at = last.sent_at;
+    }
   }
   // Skive 3 checks 1-3 exclusions (address/profile-text/industry) — computed
   // further above, over the full eligible list, before the daily cap.
