@@ -3408,6 +3408,22 @@ export function pickSlotClaims(results: VerifierResult[]): Array<{ type: "custom
   ];
 }
 
+// dev-request 2026-10-30-verifier-verified-demoted-agent-id-i-meta: max
+// agent ids carried in a claim's meta.agent_ids. The claim's value is always
+// the full count.
+export const CLAIM_AGENT_IDS_MAX = 20;
+
+// Sorted (deterministic regardless of batch order), de-duplicated, capped.
+function claimAgentIds(rows: VerifierResult[]): string[] {
+  return [...new Set(rows.map((x) => x.agent_id))].sort().slice(0, CLAIM_AGENT_IDS_MAX);
+}
+
+function sortedCounts(counts: Record<string, number>): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const k of Object.keys(counts).sort()) out[k] = counts[k];
+  return out;
+}
+
 export function buildRunEnvelope(input: {
   run_id: string;
   started_at: string;
@@ -3465,9 +3481,25 @@ export function buildRunEnvelope(input: {
   // diagnostic batch. This is the one aggregate number that answers that —
   // any row that WAS verified going in and is NOT verified coming out — kept
   // in every envelope instead of only visible in one forced call's response.
-  const verifiedDemoted = r.filter(
+  const verifiedDemotedResults = r.filter(
     (x) => x.prior_verification_status === "verified" && x.new_verification_status !== "verified"
-  ).length;
+  );
+  const verifiedDemoted = verifiedDemotedResults.length;
+  // dev-request 2026-10-30-verifier-verified-demoted-agent-id-i-meta (slice 1):
+  // which rows were demoted and why, so a drop in data_verified can be read
+  // from /admin/runs without a DB read. The reason is the status the row was
+  // demoted to (new_verification_status) — the one single-valued, already-
+  // computed cause on VerifierResult. `reasons` counts every demoted row;
+  // `agent_ids` is capped (value stays the full count, so value >
+  // agent_ids.length means the list was truncated).
+  const verifiedDemotedReasons: Record<string, number> = {};
+  for (const x of verifiedDemotedResults) {
+    verifiedDemotedReasons[x.new_verification_status] = (verifiedDemotedReasons[x.new_verification_status] ?? 0) + 1;
+  }
+  // dev-request 2026-10-30-verifier-verified-demoted-agent-id-i-meta (slice 2):
+  // the agents behind agents_verified, so the claim can be reconciled against
+  // the verified stock per run. Same cap as verified_demoted.
+  const verifiedAgentIds = claimAgentIds(r.filter((x) => x.new_verification_status === "verified"));
   // dev-request 2026-10-01-rfb-verifier-innsyn-second-line-c5: split growth
   // from maintenance. newly + reverified === agents_verified.
   const newlyVerified = r.filter(
@@ -3504,7 +3536,7 @@ export function buildRunEnvelope(input: {
     finished_at: input.finished_at,
     status: "completed",
     claims: [
-      { type: "db_state_change", value: verified, meta: { kind: "agents_verified" } },
+      { type: "db_state_change", value: verified, meta: { kind: "agents_verified", agent_ids: verifiedAgentIds } },
       { type: "db_state_change", value: newlyVerified, meta: { kind: "agents_newly_verified" } },
       { type: "db_state_change", value: reverified, meta: { kind: "agents_reverified" } },
       { type: "db_state_change", ...snap("agents_review_required", review) },
@@ -3555,7 +3587,15 @@ export function buildRunEnvelope(input: {
           examples: verifiedSecondLineResults.slice(0, 5).map((x) => ({ agent_id: x.agent_id, name: x.agent_name })),
         },
       },
-      { type: "db_state_change", value: verifiedDemoted, meta: { kind: "verified_demoted" } },
+      {
+        type: "db_state_change",
+        value: verifiedDemoted,
+        meta: {
+          kind: "verified_demoted",
+          agent_ids: claimAgentIds(verifiedDemotedResults),
+          reasons: sortedCounts(verifiedDemotedReasons),
+        },
+      },
       { type: "db_state_change", value: paraplyBlocked, meta: { kind: "agents_paraply_epost_mangler" } },
       {
         type: "db_state_change",
