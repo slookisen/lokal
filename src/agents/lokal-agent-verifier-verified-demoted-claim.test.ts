@@ -24,7 +24,7 @@
  * Standalone: npx tsx src/agents/lokal-agent-verifier-verified-demoted-claim.test.ts
  */
 
-import { buildRunEnvelope, type VerifierResult } from "./lokal-agent-verifier";
+import { buildRunEnvelope, CLAIM_AGENT_IDS_MAX, type VerifierResult } from "./lokal-agent-verifier";
 
 export interface TestSummary {
   passed: number;
@@ -236,6 +236,70 @@ export function runLokalAgentVerifierVerifiedDemotedClaimTests(
     });
     assertEq(findClaim(rrEmpty, "review_required_reevaluated")?.value, 0, "rr-08: reevaluated is 0 on an empty batch");
     assertEq(findClaim(rrEmpty, "review_required_promoted")?.value, 0, "rr-09: promoted is 0 on an empty batch");
+
+    // ── dev-request 2026-10-30-verifier-verified-demoted-agent-id-i-meta
+    // slice 1: verified_demoted carries meta.agent_ids + meta.reasons; value
+    // and kind unchanged. ───────────────────────────────────────────────────
+    assertEq(demotedClaim?.meta, {
+      kind: "verified_demoted",
+      agent_ids: ["agent-demoted-1", "agent-demoted-2"],
+      reasons: { needs_review: 1, review_required: 1 },
+    }, "vdm-01: verified_demoted meta has sorted agent_ids and reasons per demoted-to status");
+    assertEq(reconfirmedClaim?.meta, { kind: "verified_demoted", agent_ids: [], reasons: {} },
+      "vdm-02: no demotions -> empty agent_ids and reasons");
+
+    // Order-independence: same rows, reversed batch order -> same meta.
+    const reversed = buildRunEnvelope({
+      run_id: "run-demoted-rev",
+      started_at: "2026-11-14T00:00:00.000Z",
+      finished_at: "2026-11-14T00:01:00.000Z",
+      results: [...demotedResults].reverse(),
+    });
+    assertEq(findClaim(reversed, "verified_demoted")?.meta, demotedClaim?.meta,
+      "vdm-03: agent_ids/reasons are deterministic regardless of batch order");
+
+    // Cap: 25 demotions -> value 25, agent_ids capped at 20, reasons count all 25.
+    assertEq(CLAIM_AGENT_IDS_MAX, 20, "vdm-04: agent_ids cap is 20");
+    const many: VerifierResult[] = Array.from({ length: 25 }, (_, i) =>
+      makeResult({
+        agent_id: `d-${String(i).padStart(2, "0")}`,
+        prior_verification_status: "verified",
+        new_verification_status: i < 15 ? "review_required" : "data_insufficient",
+      }));
+    const manyEnvelope = buildRunEnvelope({
+      run_id: "run-demoted-many",
+      started_at: "2026-11-14T00:00:00.000Z",
+      finished_at: "2026-11-14T00:01:00.000Z",
+      results: many,
+    });
+    const manyClaim = findClaim(manyEnvelope, "verified_demoted");
+    assertEq(manyClaim?.value, 25, "vdm-05: value stays the full count above the cap");
+    assertEq((manyClaim?.meta.agent_ids as string[]).length, 20, "vdm-06: agent_ids capped at 20");
+    assertEq(manyClaim?.meta.agent_ids, many.slice(0, 20).map((x) => x.agent_id),
+      "vdm-07: capped agent_ids are the first 20 in sorted order");
+    assertEq(manyClaim?.meta.reasons, { data_insufficient: 10, review_required: 15 },
+      "vdm-08: reasons count every demoted row, not just the capped ids");
+
+    // ── slice 2: agents_verified carries meta.agent_ids; value/kind unchanged.
+    const verifiedClaim = findClaim(mixedEnvelope, "agents_verified");
+    assertEq(verifiedClaim?.meta, { kind: "agents_verified", agent_ids: ["n1", "n2", "r1", "r2", "r3"] },
+      "vdm-09: agents_verified meta.agent_ids lists newly + re-verified agents, excluding non-verified");
+    assertEq(findClaim(demotedEnvelope, "agents_verified")?.meta.agent_ids, ["agent-unrelated"],
+      "vdm-10: agents_verified agent_ids exclude demoted rows");
+    const manyVerified = Array.from({ length: 30 }, (_, i) =>
+      makeResult({ agent_id: `v-${String(29 - i).padStart(2, "0")}`, new_verification_status: "verified" }));
+    const mvEnvelope = buildRunEnvelope({
+      run_id: "run-verified-many",
+      started_at: "2026-11-14T00:00:00.000Z",
+      finished_at: "2026-11-14T00:01:00.000Z",
+      results: manyVerified,
+    });
+    const mvClaim = findClaim(mvEnvelope, "agents_verified");
+    assertEq(mvClaim?.value, 30, "vdm-11: agents_verified value stays the full count above the cap");
+    assertEq(mvClaim?.meta.agent_ids, Array.from({ length: 20 }, (_, i) => `v-${String(i).padStart(2, "0")}`),
+      "vdm-12: agents_verified agent_ids capped at 20, sorted");
+    assertEq(findClaim(rrEmpty, "agents_verified")?.meta, { kind: "agents_verified", agent_ids: [] },
+      "vdm-13: empty batch -> agents_verified agent_ids is []");
 
     return { passed, failed, failures };
   })();
