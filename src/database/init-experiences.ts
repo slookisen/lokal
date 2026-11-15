@@ -1799,6 +1799,12 @@ export function initExperiencesSchema(db: Database.Database): void {
     `);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_experience_outreach_sent_log_recipient_email ON experience_outreach_sent_log(recipient_email)`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_experience_outreach_sent_log_provider ON experience_outreach_sent_log(provider_id)`);
+    // dev-request 2026-11-15-opplevagent-fem-henvendelser (A1): the template name each
+    // send used, written at reservation. NULL on rows from before this column.
+    const sentLogCols = db.prepare(`PRAGMA table_info(experience_outreach_sent_log)`).all() as Array<{ name: string }>;
+    if (!sentLogCols.some((c) => c.name === "template")) {
+      db.exec(`ALTER TABLE experience_outreach_sent_log ADD COLUMN template TEXT`);
+    }
   } catch (err) {
     console.error("Migration experience_outreach_sent_log failed:", err);
   }

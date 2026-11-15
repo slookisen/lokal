@@ -32010,6 +32010,17 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gorg.failures) failures.push("opplevelser-gardssalg-outreach-reply-guard-touch-cap: " + f);
     console.log(`  opplevelser-gardssalg-outreach-reply-guard-touch-cap: ${gorg.passed} passed, ${gorg.failed} failed`);
 
+    // dev-request 2026-11-15-opplevagent-fem-henvendelser, A1: rounds, template
+    // per round without fallback, promise_given, ordering and per-round counts.
+    console.log("\n── opplevelser-gardssalg-outreach-rounds-a1: rounds + promise_given + no_template_for_touch ──");
+    const { runOpplevelserGardssalgOutreachRoundsA1Tests } = require("../src/routes/opplevelser-gardssalg-outreach-rounds-a1.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-outreach-rounds-a1.test");
+    const gora1 = await runOpplevelserGardssalgOutreachRoundsA1Tests({ log: false });
+    passed += gora1.passed;
+    failed += gora1.failed;
+    for (const f of gora1.failures) failures.push("opplevelser-gardssalg-outreach-rounds-a1: " + f);
+    console.log(`  opplevelser-gardssalg-outreach-rounds-a1: ${gora1.passed} passed, ${gora1.failed} failed`);
+
     // dev-request 2026-08-09-daglig-outreach-klargjoering-og-stoerrelsesgate,
     // Skive 1: antall_ansatte size signal + hard exclusion gate layered onto
     // the readiness/preflight/pilot-send trio above, plus the new DB-backed

@@ -2449,9 +2449,29 @@ export function renderGardssalgOutreachVariant(
 ): { subject: string; text: string; html?: string } {
   if (template === "personal-v4") return renderGardssalgOutreachV4First(providerName, profileUrl, ctx);
   if (template === "personal-v4-followup") return renderGardssalgOutreachV4Followup(providerName, profileUrl, ctx);
-  return template === "personal"
-    ? renderGardssalgOutreachPersonal(providerName, profileUrl)
-    : renderGardssalgOutreach(providerName, profileUrl);
+  if (template === "personal") return renderGardssalgOutreachPersonal(providerName, profileUrl);
+  if (template === "standard") return renderGardssalgOutreach(providerName, profileUrl);
+  // dev-request 2026-11-15-opplevagent-fem-henvendelser (A1): an unknown name never
+  // falls back to `standard` (an August text with a September deadline).
+  throw new UnknownGardssalgOutreachTemplateError(String(template));
+}
+
+export class UnknownGardssalgOutreachTemplateError extends Error {
+  constructor(public readonly template: string) {
+    super(`unknown gårdssalg outreach template: ${template}`);
+    this.name = "UnknownGardssalgOutreachTemplateError";
+  }
+}
+
+const GARDSSALG_OUTREACH_TEMPLATE_NAMES: ReadonlySet<string> = new Set<GardssalgOutreachTemplate>([
+  "standard",
+  "personal",
+  "personal-v4",
+  "personal-v4-followup",
+]);
+
+export function isGardssalgOutreachTemplate(name: unknown): name is GardssalgOutreachTemplate {
+  return typeof name === "string" && GARDSSALG_OUTREACH_TEMPLATE_NAMES.has(name);
 }
 
 export const emailService = new EmailService();
