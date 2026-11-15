@@ -36,6 +36,9 @@ import {
   isVelocityScraper,
   SCRAPER_UNIQUE_PAGES_PER_10_MIN,
   SCRAPER_PRODUSENT_PAGES_PER_HOUR,
+  SCRAPER_BURST_VIEWS,
+  SCRAPER_BURST_WINDOW_MS,
+  maxViewsInWindow,
   TrafficCategory,
 } from "./traffic-classifier";
 
@@ -342,6 +345,19 @@ export function runTrafficClassifierTests(opts: { log?: boolean } = {}): TestSum
   assertEq(isVelocityScraper({ uniquePagesIn10Min: 40, produsentPagesInHour: 201 }), true, "vel3 201 /produsent pages / hour → scraper");
   assertEq(isVelocityScraper({ uniquePagesIn10Min: 40, produsentPagesInHour: 200 }), false, "vel4 exactly 200 / hour is not");
   assertEq(isVelocityScraper(null), false, "vel5 no velocity evidence → not a scraper");
+  // Burst rule (2026-11-15): >= 10 page views within any 60 s window.
+  assertEq(SCRAPER_BURST_VIEWS, 10, "burst0 burst threshold is 10 views");
+  assertEq(SCRAPER_BURST_WINDOW_MS, 60_000, "burst0 burst window is 60 s");
+  assertEq(isVelocityScraper({ uniquePagesIn10Min: 10, produsentPagesInHour: 0, viewsIn60s: 10 }), true, "burst1 10 views in 60 s → scraper (inclusive >=)");
+  assertEq(isVelocityScraper({ uniquePagesIn10Min: 9, produsentPagesInHour: 0, viewsIn60s: 9 }), false, "burst2 9 views in 60 s is not");
+  assertEq(isVelocityScraper({ uniquePagesIn10Min: 2, produsentPagesInHour: 0 }), false, "burst3 no viewsIn60s (caller did not compute it) → rule does not apply");
+  assertEq(isVelocityScraper({ uniquePagesIn10Min: 1, produsentPagesInHour: 0, viewsIn60s: 47 }), true, "burst4 views, not distinct pages: 47 reloads of one page in 1 s → scraper");
+  assertEq(classifySession(`ip1:${realChrome}`, { velocity: { uniquePagesIn10Min: 44, produsentPagesInHour: 44, viewsIn60s: 47 } }), "scraper",
+    "burst5 prod 2026-11-15: 47 views over 44 pages in 1 s from a browser UA → scraper");
+  assertEq(maxViewsInWindow([]), 0, "burst6 maxViewsInWindow of no views is 0");
+  assertEq(maxViewsInWindow(Array.from({ length: 10 }, (_, i) => i * 6_000)), 10, "burst7 10 views spread over 54 s all fall in one 60 s window");
+  assertEq(maxViewsInWindow(Array.from({ length: 12 }, (_, i) => i * 50_000)), 2, "burst8 12 views over ~10 minutes: at most 2 in any 60 s");
+  assertEq(maxViewsInWindow([0, 60_000, 60_001]), 2, "burst9 the window is inclusive at both ends (60 s apart count together, 60.001 s does not)");
   const scraperVelocity = { uniquePagesIn10Min: 1570, produsentPagesInHour: 1570 };
   assertEq(classifySession(`ip1:${realChrome}`, { velocity: scraperVelocity }), "scraper",
     "vel6 browser-UA session at 1,570 pages in 7.5 min (prod 2026-10-03) → scraper");

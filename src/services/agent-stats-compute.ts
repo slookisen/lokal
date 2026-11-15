@@ -20,7 +20,10 @@ import { getRetentionWindowDays } from "./retention-window";
 import { redactPII } from "../utils/pii-redact";
 import { COUNTABLE_CONV_SQL, countableConvSql, isPublicQueryTerm } from "./a2a-traffic-classifier";
 import { AI_DELIVERY_WINDOW_DAYS, computeAiDeliveries, type AiDeliveries } from "./profile-ai-deliveries-compute";
-import { classifySession, storedClientClass, uaFromSessionId, aiVendorBucket, type SessionVelocity } from "./traffic-classifier";
+import {
+  classifySession, storedClientClass, uaFromSessionId, aiVendorBucket, maxViewsInWindow, SCRAPER_BURST_WINDOW_MS, type SessionVelocity,
+} from "./traffic-classifier";
+import { pageViewSql } from "./page-view-definition";
 import { computeProfileYear, profileYearRawFrom, type ProfileYear } from "./profile-year-compute";
 
 /**
@@ -66,12 +69,19 @@ export function sqliteDatetime(date: Date): string {
  * Per-session request velocity around `anchorMs` (the query behind
  * getSessionVelocity in analytics-service.ts, over an explicit connection).
  * Returns null when the read fails, exactly like getSessionVelocity.
+ *
+ * opts.burst adds viewsIn60s (the scraper burst rule): the most page views
+ * (pageViewSql) the session made in any SCRAPER_BURST_WINDOW_MS window inside
+ * the same 60-minute span — one more read of that session's rows in the span.
+ * Off by default, so the write path (getSessionVelocity →
+ * agentViewTrafficCategory) is unchanged; the read side passes it.
  */
 export function readSessionVelocity(
   db: Database.Database,
   sessionId: string,
   anchorMs: number,
-  mode: "trailing" | "centered"
+  mode: "trailing" | "centered",
+  opts: { burst?: boolean } = {}
 ): SessionVelocity | null {
   try {
     const span = (ms: number): [string, string] => mode === "trailing"
@@ -86,7 +96,18 @@ export function readSessionVelocity(
       FROM analytics_page_views
       WHERE created_at >= ? AND created_at <= ? AND session_id = ?
     `).get(from10, to10, fromHour, toHour, sessionId) as { u10: number; p60: number } | undefined;
-    return { uniquePagesIn10Min: row?.u10 ?? 0, produsentPagesInHour: row?.p60 ?? 0 };
+    const v: SessionVelocity = { uniquePagesIn10Min: row?.u10 ?? 0, produsentPagesInHour: row?.p60 ?? 0 };
+    if (opts.burst) {
+      const times = (db.prepare(`
+        SELECT created_at FROM analytics_page_views
+        WHERE created_at >= ? AND created_at <= ? AND session_id = ? AND ${pageViewSql()}
+        ORDER BY created_at
+      `).all(fromHour, toHour, sessionId) as Array<{ created_at: string }>)
+        .map((r) => Date.parse(r.created_at.replace(" ", "T") + "Z"))
+        .filter(Number.isFinite);
+      v.viewsIn60s = maxViewsInWindow(times, SCRAPER_BURST_WINDOW_MS);
+    }
+    return v;
   } catch (err) {
     console.error("[analytics] Failed to read session velocity:", err);
     return null;
@@ -179,7 +200,7 @@ export function computeAgentStats(
   humanLooking.forEach((s, i) => {
     if (i < MAX_VELOCITY_CHECKS) {
       const anchor = Date.parse((s.first_seen ?? s.first_any).replace(" ", "T") + "Z");
-      const velocity = Number.isFinite(anchor) ? readSessionVelocity(db, s.session_id || "", anchor, "centered") : null;
+      const velocity = Number.isFinite(anchor) ? readSessionVelocity(db, s.session_id || "", anchor, "centered", { burst: true }) : null;
       if (classifySession(s.session_id || "", { velocity }) !== "human") return;
     }
     humanViews += s.views;

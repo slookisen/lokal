@@ -10,6 +10,8 @@
  *       legacy) handling; static files, redirects and old rows left out;
  *       entry sources and external referrers; zero-filled series; vertical
  *       filter; the totals-only mode.
+ *   (e) The burst rule: >= 10 page views within 60 s makes a browser-looking
+ *       session a scraper; totals are unchanged.
  *   (c) The analytics middleware stores pages and scanner probes only, with
  *       client_class from the full UA ('dev' for our own scripts).
  *
@@ -30,6 +32,7 @@ import {
 } from "./page-view-definition";
 import { computeTrafficReport, TRAFFIC_GROUPS, VISIT_GAP_MS } from "./traffic-report";
 import { computeUmbrellaTraffic, summaryFromReport } from "./admin-stats-compute";
+import { readSessionVelocity } from "./agent-stats-compute";
 
 export interface TestSummary {
   passed: number;
@@ -310,6 +313,57 @@ export async function runTrafficReportTests(opts: { log?: boolean } = {}): Promi
        u?.human_pageviews_profile === page?.humanViews && u?.ai_bot_pageviews === page?.aiViews,
       "d11: rows from before the write-time class take their session's class, as in the report",
       { umbrella: u && { human: u.human_pageviews_profile, ai: u.ai_bot_pageviews, all: u.pageViews_via_profile }, page });
+    db.close();
+  }
+
+  // ── (e) Burst rule: >= 10 page views within 60 s is a scraper (2026-11-15) ──
+  {
+    const db = new Database(":memory:");
+    initMod.__initSchemaForTesting(db as any);
+    const now = Date.UTC(2026, 10, 15, 12, 0, 0);
+    const H = 3600_000;
+    const M = 60_000;
+    const ins = db.prepare(`
+      INSERT INTO analytics_page_views (path, session_id, is_owner, status_code, vertical_id, created_at, client_class)
+      VALUES (?, ?, 0, 200, 'rfb', ?, 'human')
+    `);
+    const pv = (sid: string, atMs: number, path: string) => ins.run(path, sid, ts(atMs));
+
+    // 10 views within 60 s (one per 6 s, distinct pages): never 60 pages in 10 minutes → caught by the burst rule only.
+    for (let i = 0; i < 10; i++) pv("ipT:desktop:tttt", now - 10 * H + i * 6_000, `/produsent/t${i}`);
+    // 9 views within 48 s, then a 10th 61 s after the first: at most 9 in any 60 s → a person.
+    for (let i = 0; i < 9; i++) pv("ipN:desktop:nnnn", now - 9 * H + i * 6_000, `/produsent/n${i}`);
+    pv("ipN:desktop:nnnn", now - 9 * H + 61_000, "/sok");
+    // Prod 2026-11-15: 47 views over 44 pages within one second.
+    for (let i = 0; i < 47; i++) pv("ipJ:desktop:jjjj", now - 8 * H + (i % 2) * 500, `/produsent/j${i % 44}`);
+    // Normal reading pace: 3 views over 2 minutes; 12 views spread over 10 minutes.
+    pv("ipL:mobile:llll", now - 7 * H, "/");
+    pv("ipL:mobile:llll", now - 7 * H + M, "/sok");
+    pv("ipL:mobile:llll", now - 7 * H + 2 * M, "/produsent/l");
+    for (let i = 0; i < 12; i++) pv("ipM:desktop:mmmm", now - 6 * H + Math.floor((i * 10 * M) / 11), `/produsent/m${i}`);
+
+    const r = computeTrafficReport(db as any, 24, undefined, now);
+    const clsOf = (id: string) => r.busiestSessions.find((x) => x.id === id)?.cls;
+    ok(clsOf("ipT") === "scraper", "e1: 10 page views within 60 s from a browser is a scraper, not a person (AC1)", r.busiestSessions);
+    ok(clsOf("ipN") === "human", "e2: 9 page views within 60 s stays human (boundary)", r.busiestSessions);
+    ok(clsOf("ipJ") === "scraper", "e3: 47 views over 44 pages in 1 s (prod 2026-11-15) is a scraper", r.busiestSessions);
+    ok(clsOf("ipL") === "human" && clsOf("ipM") === "human",
+      "e4: normal reading pace stays human: 3 views over 2 minutes, 12 views over 10 minutes (AC2)", r.busiestSessions);
+    ok(r.human.topSessions.every((x) => x.id !== "ipT" && x.id !== "ipJ"), "e5: the burst sessions are not in the most-active-people list", r.human.topSessions);
+    // AC5: the sessions move to 'scraper'; nothing is dropped from the totals.
+    const all = 10 + 10 + 47 + 3 + 12;
+    ok(eq(r.classes.scraper, { views: 57, visitors: 2, visits: 2 }) && eq(r.groups.human, { views: 25, visitors: 3, visits: 3 }),
+      "e6: the moved sessions are counted in scraper (57 views, 2 visitors), people keep the rest (AC5)", { scraper: r.classes.scraper, human: r.groups.human });
+    const sum = TRAFFIC_GROUPS.reduce((a, g) => a + r.groups[g].views, 0);
+    ok(r.totals.views === all && r.totals.visitors === 5 && sum === all,
+      "e7: the overall total is unchanged by the burst rule: every view is still counted, the groups still add up (AC5)", { totals: r.totals, sum });
+    ok(r.version === 2, "e8: reports computed with the burst rule carry classifier version 2", r.version);
+    // The profile-page reader (agent-stats-compute) gets the same 60 s count; the write path does not ask for it.
+    const vT = readSessionVelocity(db as any, "ipT:desktop:tttt", now - 10 * H, "centered", { burst: true });
+    const vN = readSessionVelocity(db as any, "ipN:desktop:nnnn", now - 9 * H, "centered", { burst: true });
+    const vPlain = readSessionVelocity(db as any, "ipT:desktop:tttt", now - 10 * H, "centered");
+    ok(vT?.viewsIn60s === 10 && vN?.viewsIn60s === 9 && vPlain !== null && vPlain.viewsIn60s === undefined,
+      "e9: readSessionVelocity({ burst }) counts the most views in any 60 s (10 and 9); without it the field is absent", { vT, vN, vPlain });
     db.close();
   }
 

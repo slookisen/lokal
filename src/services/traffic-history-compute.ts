@@ -53,8 +53,13 @@ type Db = Database.Database;
  * 4: aiLookups (dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S0).
  * 5: aiAgents (vendor × purpose, G2-S2). Rows stored at version 4 have no
  *    aiAgents, so they are recomputed while their raw days exist.
+ * 6: scraper burst rule (traffic-classifier.ts SCRAPER_BURST_VIEWS: >=10 page
+ *    views within 60 s). Sessions move from human to scraper; totals are
+ *    unchanged. Days still in the raw rows are recomputed at version 6; days
+ *    already pruned keep version 5, and traffic-alerts.ts flags any compared
+ *    window that spans both (classifierChange).
  */
-export const TRAFFIC_HISTORY_VERSION = 5;
+export const TRAFFIC_HISTORY_VERSION = 6;
 
 export type HistoryPeriod = "day" | "week" | "month";
 export type HistoryVertical = VerticalId | "all";
