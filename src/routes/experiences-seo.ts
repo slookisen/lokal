@@ -206,6 +206,7 @@ import {
   fillOa1,
   formatOsloInstant,
   calendarFileAllowed,
+  dropFristSentences,
 } from "../services/gardssalg-honest-receipt";
 import { getDb, getDb as getExpDbForReise } from "../database/db-factory";
 import {
@@ -7629,8 +7630,12 @@ router.get(
     // producer has confirmed. Flag off: byte-identical to before.
     const honest = honestReceiptEnabled();
     const fristText = honest ? formatOsloInstant(booking.respond_token_expires_at, "nb") : "";
-    const honestLead = honest && fristText
-      ? fillOa1(escapeHtml(oa1Text("receipt.lead", "nb")), { produsent: escapeHtml(provider.navn), frist: escapeHtml(fristText) })
+    // No answer deadline -> the {frist} sentence is dropped (never reworded).
+    const honestLead = honest
+      ? fillOa1(
+          escapeHtml(fristText ? oa1Text("receipt.lead", "nb") : dropFristSentences(oa1Text("receipt.lead", "nb"))),
+          { produsent: escapeHtml(provider.navn), frist: escapeHtml(fristText) },
+        )
       : "";
     const showIcsLink = !honest || calendarFileAllowed(booking);
 

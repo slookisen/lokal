@@ -206,6 +206,9 @@ export function runGardssalgHonestReceiptTests(opts: { log?: boolean } = {}): Pr
       assertTrue(folded.split("\r\n").every((l) => Buffer.byteLength(l, "utf8") <= 75), "i2: folded lines <= 75 octets");
       assertEq(hr.icsUnfold(folded), longLine, "i3: unfold restores the line");
       assertEq(hr.composeSted({ adresse: " Gardsvegen 1 ", postnummer: "5700", poststed: "Voss" }), "Gardsvegen 1, 5700 Voss", "i4: {sted}");
+      assertEq(hr.dropFristSentences(OA1_EXPECTED["receipt.lead"].nb), "Besøket er ikke bekreftet ennå. Du får e-post når produsenten har bekreftet, foreslått et annet tidspunkt eller avslått.", "i6: dropFristSentences (nb lead)");
+      assertEq(hr.dropFristSentences(OA1_EXPECTED["receipt.lead"].en), "Your visit is not confirmed yet. We will email you when the producer has confirmed, suggested another time or declined.", "i7: dropFristSentences (en lead)");
+      assertEq(hr.dropFristSentences("Ingen frist her."), "Ingen frist her.", "i8: dropFristSentences leaves other text alone");
       assertEq(hr.composeSted({ adresse: null, postnummer: null, poststed: "Voss" }), "Voss", "i5: {sted} partial");
 
       // ── fixtures ────────────────────────────────────────────────────────
@@ -375,6 +378,7 @@ export function runGardssalgHonestReceiptTests(opts: { log?: boolean } = {}): Pr
         const ics2 = hr.icsUnfold(c2?.attachments?.[0]?.content ?? "");
         assertTrue(ics2.includes(`SUMMARY:Besøk hos Testsideri AS — ${b2.booking_ref}`), "n27: SUMMARY = ics.summary");
         assertTrue(ics2.includes(`DESCRIPTION:Besøk avtalt via opplevagent.no. Referanse: ${b2.booking_ref}. Status og avlysning: ${statusUrlOf(b2)}`), "n28: DESCRIPTION = ics.description");
+        assertTrue(!!b2.guest_status_token && ics2.includes(b2.guest_status_token), "n28b: the e-mailed .ics (to the guest) keeps the status link");
         assertTrue(ics2.includes("LOCATION:Gardsvegen 1\\, 5700 Voss"), "n29: LOCATION = {sted}");
         assertTrue(!ics2.includes("on2@example.no") && !ics2.includes("ATTENDEE"), "n30: no guest data in the file");
         const uid2 = /UID:([^\r\n]+)/.exec(ics2)?.[1];
@@ -385,6 +389,12 @@ export function runGardssalgHonestReceiptTests(opts: { log?: boolean } = {}): Pr
         const d2 = await icsDownload(b2.booking_ref);
         assertEq(d2.status, 200, "n34: .ics download after confirmation");
         assertTrue(hr.icsUnfold(d2.text).includes("LOCATION:Gardsvegen 1\\, 5700 Voss"), "n35: downloaded .ics has LOCATION");
+        // Review B1: the download needs only the booking reference, so it
+        // must never carry the guest's status credential.
+        const d2u = hr.icsUnfold(d2.text);
+        assertTrue(!d2u.includes(b2.guest_status_token!), "n35b: downloaded .ics has no guest status token");
+        assertTrue(!d2u.includes("/status/") && !d2u.includes("DESCRIPTION"), "n35c: downloaded .ics has no status URL (no DESCRIPTION)");
+        assertTrue(d2u.includes(`SUMMARY:Besøk hos Testsideri AS — ${b2.booking_ref}`), "n35d: downloaded .ics keeps SUMMARY");
         assertTrue((await page(b2.booking_ref)).includes("ics-link\" href"), "n36: page shows the .ics link once confirmed");
 
         // Declined request -> never an .ics.
@@ -393,6 +403,25 @@ export function runGardssalgHonestReceiptTests(opts: { log?: boolean } = {}): Pr
         await postForm(`/kategori/gardssalg/svar/${b3.respond_token}`, { action: "avsla" });
         assertTrue(!sends.some((s) => (s.attachments ?? []).length > 0), "n37: declined -> no .ics in any mail");
         assertEq((await icsDownload(b3.booking_ref)).status, 404, "n38: declined -> no .ics download");
+
+        // Review N1: no answer deadline -> still the honest receipt (no
+        // legacy subject, no .ics), only the {frist} sentence dropped.
+        const { booking: b4 } = await book("on4@example.no");
+        expDb.prepare("UPDATE gardssalg_bookings SET respond_token_expires_at = NULL WHERE booking_id = ?").run(b4.booking_id);
+        const b4n = bookingStore.getBookingByRef(b4.booking_ref)!;
+        sends.length = 0;
+        await bookingStore.sendBookingConfirmation(b4n);
+        const [m4] = guestMails("on4@example.no");
+        assertEq(m4?.subject, `Vi har mottatt forespørselen din — ${b4.booking_ref}`, "n39: null deadline -> honest subject");
+        assertEq(m4?.hasAttachmentsKey, false, "n40: null deadline -> no .ics attachment");
+        assertTrue(!sends.some((s) => s.subject.startsWith("Bekreftelse på påmelding")), "n41: null deadline -> never the legacy receipt");
+        assertTrue(
+          m4?.textContent.includes("\n\nDu får e-post når produsenten har bekreftet, foreslått et annet tidspunkt eller avslått. Svarer ikke produsenten innen fristen, utløper forespørselen, og du får beskjed.\n\n") === true
+            && !m4.textContent.includes("svarer innen") && !m4.textContent.includes("{frist}"),
+          "n42: null deadline -> only the {frist} sentence dropped from the body",
+        );
+        const p4 = await page(b4.booking_ref);
+        assertTrue(p4.includes("<p>Besøket er ikke bekreftet ennå. Du får e-post når produsenten har bekreftet, foreslått et annet tidspunkt eller avslått.</p>"), "n43: null deadline -> page lead without the {frist} sentence");
       }
     } catch (err) {
       failed++;

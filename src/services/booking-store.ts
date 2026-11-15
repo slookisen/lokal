@@ -542,7 +542,10 @@ export async function sendBookingConfirmation(booking: GardssalgBooking): Promis
   // O1-2 (R3/G13): with GARDSSALG_HONEST_RECEIPT_ENABLED the guest gets a
   // receipt that says "received, not confirmed" and NO calendar file (that
   // goes with the producer's confirmation). Flag off: the legacy mail below.
-  if (honestReceiptEnabled() && (await sendHonestReceipt(booking))) return;
+  if (honestReceiptEnabled()) {
+    await sendHonestReceipt(booking);
+    return;
+  }
 
   const confirmUrl = `${APP_URL}/kategori/gardssalg/bekreft/${booking.confirm_token}`;
   const ics = buildIcs(booking);
@@ -604,17 +607,15 @@ ${statusUrl ? `<p>Du kan når som helst se gjeldende status her: <a href="${stat
   console.log(`[booking] ${booking.booking_ref} confirm link sent (token ${tokenLogLabel(booking.confirm_token)})`);
 }
 
-// O1-2: the honest receipt (text package OA-1 §1.2). Returns false when the
-// booking has no answer deadline to show — the caller then keeps the legacy
-// receipt. The provider row is read before the first await.
-async function sendHonestReceipt(booking: GardssalgBooking): Promise<boolean> {
+// O1-2: the honest receipt (text package OA-1 §1.2), never the legacy one
+// with the flag on. The provider row is read before the first await.
+async function sendHonestReceipt(booking: GardssalgBooking): Promise<void> {
   const provider = loadReceiptProvider(booking.provider_id);
   const mail = buildHonestReceiptEmail(
     booking,
     { producerName: provider.navn, statusUrl: guestStatusUrl(booking) },
     "nb",
   );
-  if (!mail) return false;
   await emailService.sendEmail({
     to: booking.guest_email,
     subject: mail.subject,
@@ -624,8 +625,7 @@ async function sendHonestReceipt(booking: GardssalgBooking): Promise<boolean> {
     from: crmFromHeader("experiences"),
     isTestSend: booking.is_test === 1,
   });
-  console.log(`[booking] ${booking.booking_ref} confirm link sent (token ${tokenLogLabel(booking.confirm_token)})`);
-  return true;
+  console.log(`[booking] ${booking.booking_ref} honest guest receipt sent`);
 }
 
 // ─── Producer notification email (dev-request 2026-07-12-gardssalg-dark-

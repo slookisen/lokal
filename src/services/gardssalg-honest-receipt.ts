@@ -129,6 +129,18 @@ export function oa1Text(key: Oa1ReceiptKey, lang: ReceiptLang = "nb"): string {
   return OA1_RECEIPT_TEXTS[key][lang];
 }
 
+/**
+ * Drops every sentence that contains {frist} (O1-2 review N1): a booking
+ * without an answer deadline keeps the honest text minus that sentence —
+ * never a reworded or invented one.
+ */
+export function dropFristSentences(template: string): string {
+  return template
+    .split("\n")
+    .map((line) => line.split(/(?<=\.) /).filter((sentence) => !sentence.includes("{frist}")).join(" "))
+    .join("\n");
+}
+
 /** Replaces {placeholder}s; values are inserted as given (escape before if needed). */
 export function fillOa1(template: string, vars: Record<string, string>): string {
   return template.replace(/\{([a-zæøå-]+)\}/g, (m, name: string) =>
@@ -194,8 +206,8 @@ export interface HonestReceiptEmail {
 }
 
 /**
- * The guest receipt. Returns null when the booking has no answer deadline
- * ({frist} cannot be filled) — the caller then keeps the legacy receipt.
+ * The guest receipt. Without an answer deadline the sentence that needs
+ * {frist} is dropped (dropFristSentences); never the legacy receipt.
  * The «Din kommentar» line is only included when the guest wrote a note
  * (package rule); the status line only when the booking has a status link.
  */
@@ -203,11 +215,11 @@ export function buildHonestReceiptEmail(
   booking: GardssalgBooking,
   ctx: { producerName: string; statusUrl: string | null },
   lang: ReceiptLang = "nb",
-): HonestReceiptEmail | null {
+): HonestReceiptEmail {
   const frist = formatOsloInstant(booking.respond_token_expires_at, lang);
-  if (!frist) return null;
+  const body = frist ? oa1Text("receipt.email.body", lang) : dropFristSentences(oa1Text("receipt.email.body", lang));
 
-  const paragraphs = oa1Text("receipt.email.body", lang)
+  const paragraphs = body
     .split("\n\n")
     .map((p) => p.split("\n").filter((line) => !(line.includes("{kommentar}") && !booking.notes)))
     .filter((lines) => !(lines.some((l) => l.includes("{statusside}")) && !ctx.statusUrl));
@@ -317,20 +329,19 @@ export function calendarFileAllowed(booking: Pick<GardssalgBooking, "pre_status"
   return booking.pre_status === "provider_confirmed" && booking.status !== "cancelled";
 }
 
-function statusUrlFor(booking: GardssalgBooking): string | null {
-  const appUrl = process.env.APP_URL || "https://opplevagent.no";
-  return booking.guest_status_token
-    ? `${appUrl}/kategori/gardssalg/status/${encodeURIComponent(booking.booking_ref)}/${booking.guest_status_token}`
-    : null;
-}
-
-/** The confirmed calendar file for the download route, or null before the producer has confirmed. */
+/**
+ * The confirmed calendar file for the download route, or null before the
+ * producer has confirmed. The route is reachable with the booking reference
+ * alone (receipt page, arrival QR), so this file never carries the guest's
+ * status link (its token is a guest credential): statusUrl null drops
+ * DESCRIPTION. Only the e-mailed file, sent to the guest, has it.
+ */
 export function confirmedIcsForBooking(booking: GardssalgBooking, lang: ReceiptLang = "nb"): string | null {
   if (!calendarFileAllowed(booking)) return null;
   const provider = loadReceiptProvider(booking.provider_id);
   return buildConfirmedIcs(
     booking,
-    { producerName: provider.navn, sted: provider.sted, statusUrl: statusUrlFor(booking) },
+    { producerName: provider.navn, sted: provider.sted, statusUrl: null },
     lang,
   );
 }
