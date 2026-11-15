@@ -4,6 +4,7 @@ import {
   getClaimProviderBySlug,
   deriveOrgLinkedEmailCandidatesWithHarvest,
   issueClaimMagicLink,
+  resendClaimLinkForToken,
   verifyClaimToken,
   verifyGardssalgOwnerSessionToken,
   revokeClaimToken,
@@ -29,6 +30,7 @@ import { generalLimiter } from "../middleware/security";
 import { ownerBookingEnableBlock, type OwnerBookingBlock } from "../services/gardssalg-booking-gate";
 import { createGardssalgOwnerFeaturesRouter, gardssalgOwnerDashboardOnForSession, gardssalgOwnerFeaturesTabOpen } from "./gardssalg-owner-features";
 import { wrapGardssalgDashboard } from "../owner-ui/gardssalg-dashboard";
+import { CLAIM_LINK_TEXTS } from "./gardssalg-claim-texts";
 
 // ─────────────────────────────────────────────────────────────────
 // GÅRDSSALG PRODUCER OWNER-CLAIM — dev-request 2026-07-21-opplevagent-
@@ -319,6 +321,98 @@ function manualFallbackBlock(): string {
   </div>`;
 }
 
+// ── Dead claim link: message + «Send ny lenke» (A2A dev-request 2026-11-12-
+// opplevagent-o3-eierkrav-og-innlogging, O3-1; funn R12) ──────────────────
+// An expired, revoked, unknown or missing token on magic-link-verify used to
+// redirect to /kategori/gardssalg?error=invalid_token, which shows nothing.
+// It now answers 200 with the approved OA-4 texts and a form that posts the
+// same token back to /kategori/gardssalg/eier/send-ny-lenke. That POST sends
+// a new link only to the address already on that claim row (see
+// resendClaimLinkForToken) and answers with the same page whether or not
+// anything was sent. Both pages are no-store and no-referrer (the token is in
+// the URL and in the form); nothing here logs a token or a link.
+const CLAIM_TOKEN_SHAPE = /^[0-9a-f]{64}$/;
+
+function claimHelpHtml(): string {
+  const [before, after] = CLAIM_LINK_TEXTS["claim.help"].split("{kontaktadresse}");
+  return `<p>${escapeHtml(before)}<a href="mailto:${CLAIM_MANUAL_FALLBACK_EMAIL}">${CLAIM_MANUAL_FALLBACK_EMAIL}</a>${escapeHtml(after)}</p>`;
+}
+
+function claimInvalidPage(token: string): string {
+  const T = CLAIM_LINK_TEXTS;
+  // Only a token-shaped value is echoed back into the form; anything else
+  // posts an empty token, which gets the same answer.
+  const tokenValue = CLAIM_TOKEN_SHAPE.test(token) ? token : "";
+  return shell(T["claim.invalid.heading"], `<div class="gc-card" data-gc-claim-invalid="1">
+    <h1>${escapeHtml(T["claim.invalid.heading"])}</h1>
+    <p>${escapeHtml(T["claim.invalid.body"])}</p>
+    <form id="gc-claim-resend-form" method="post" action="/kategori/gardssalg/eier/send-ny-lenke">
+      <input type="hidden" name="token" value="${escapeHtml(tokenValue)}">
+      <div class="gc-form-actions">
+        <button type="submit" class="gc-btn gc-btn-primary">${escapeHtml(T["claim.invalid.button"])}</button>
+      </div>
+    </form>
+    ${claimHelpHtml()}
+  </div>`);
+}
+
+function claimResendAnswerPage(outcome: "done" | "too_many"): string {
+  const T = CLAIM_LINK_TEXTS;
+  const text = outcome === "too_many" ? T["claim.resend.tooMany"] : T["claim.resend.done"];
+  const cls = outcome === "too_many" ? "gc-alert gc-alert-error" : "gc-alert gc-alert-ok";
+  return shell(T["claim.invalid.button"], `<div class="gc-card" data-gc-claim-resend="${outcome}">
+    <h1>${escapeHtml(T["claim.invalid.button"])}</h1>
+    <div class="${cls}" role="status">${escapeHtml(text)}</div>
+    ${claimHelpHtml()}
+  </div>`);
+}
+
+function sendClaimLinkPage(res: Response, html: string) {
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  return res.status(200).send(html);
+}
+
+/** Mails a claim row's link with the existing claim-link e-mail. Never logs the link. */
+function mailClaimLink(providerId: string, providerName: string, claim: { token: string; email: string; isTest: boolean }): void {
+  const verifyUrl = `${OPPLEVAGENT_BASE_URL}/kategori/gardssalg/eier/magic-link-verify?token=${claim.token}`;
+  emailService
+    .sendGardssalgClaimMagicLink({
+      to: claim.email,
+      providerName,
+      verifyUrl,
+      // Read from the claim row (is_test) rather than hardcoded.
+      isTestSend: claim.isTest,
+    })
+    .then((emailResult) => {
+      if (!emailResult.success) {
+        console.error(`[gardssalg-claim] Failed to send magic link email for provider ${providerId}`);
+      }
+    })
+    .catch((e) => console.error("[gardssalg-claim] sendGardssalgClaimMagicLink error:", e));
+}
+
+// POST /kategori/gardssalg/eier/send-ny-lenke — the «Send ny lenke» form.
+// Reads only `token` from the body; an address in the body is never read.
+router.post(
+  "/kategori/gardssalg/eier/send-ny-lenke",
+  generalLimiter,
+  express.urlencoded({ extended: false }),
+  (req: Request, res: Response) => {
+    let outcome: "done" | "too_many" = "done";
+    try {
+      const result = resendClaimLinkForToken((req.body as any)?.token);
+      outcome = result.outcome;
+      if (result.outcome === "done" && result.issued) {
+        mailClaimLink(result.issued.providerId, result.issued.providerName || "din profil", result.issued);
+      }
+    } catch (err: any) {
+      console.error("[gardssalg-claim] POST send-ny-lenke error:", String(err?.message || err));
+    }
+    return sendClaimLinkPage(res, claimResendAnswerPage(outcome));
+  },
+);
+
 // ─────────────────────────────────────────────────────────────────
 // GET /kategori/gardssalg/eier/magic-link-verify?token=... — validate,
 // mark used, stamp content_source='claim' (verifyClaimToken), set session
@@ -333,11 +427,11 @@ router.get("/kategori/gardssalg/eier/magic-link-verify", generalLimiter, (req: R
   try {
     const { token } = req.query;
     if (!token || typeof token !== "string") {
-      return res.redirect(302, "/kategori/gardssalg?error=invalid_token");
+      return sendClaimLinkPage(res, claimInvalidPage(""));
     }
     const result = verifyClaimToken(token);
     if (!result.valid || !result.providerId) {
-      return res.redirect(302, "/kategori/gardssalg?error=invalid_token");
+      return sendClaimLinkPage(res, claimInvalidPage(token));
     }
 
     res.cookie(GARDSSALG_OWNER_SESSION_COOKIE, result.token, {
@@ -568,24 +662,9 @@ router.post(
       return res.redirect(303, `${redirectBase}?status=error&reason=${encodeURIComponent(result.error)}`);
     }
 
-    const verifyUrl = `${OPPLEVAGENT_BASE_URL}/kategori/gardssalg/eier/magic-link-verify?token=${result.claim.token}`;
-    emailService
-      .sendGardssalgClaimMagicLink({
-        to: result.claim.email,
-        providerName: provider?.navn || "din profil",
-        verifyUrl,
-        // Always false on this public route (issueClaimMagicLink above is
-        // called with no opts, so result.claim.isTest can only be false here).
-        // Read from the claim row rather than hardcoded so the admin test
-        // route below shares this exact send path.
-        isTestSend: result.claim.isTest,
-      })
-      .then((emailResult) => {
-        if (!emailResult.success) {
-          console.error(`[gardssalg-claim] Failed to send magic link email for provider ${providerId}`);
-        }
-      })
-      .catch((e) => console.error("[gardssalg-claim] sendGardssalgClaimMagicLink error:", e));
+    // result.claim.isTest is always false on this public route
+    // (issueClaimMagicLink above is called without opts.isTest).
+    mailClaimLink(providerId, provider?.navn || "din profil", result.claim);
 
     if (wantsJson) {
       return res.json({ success: true, maskedEmail: result.claim.maskedEmail, message: "Innloggingslenke sendt." });

@@ -2183,6 +2183,78 @@ export async function issueClaimMagicLink(
   return { ok: true, claim };
 }
 
+// ── «Send ny lenke» from a dead claim link (A2A dev-request 2026-11-12-
+// opplevagent-o3-eierkrav-og-innlogging, O3-1) ─────────────────────────────
+// The visitor posts back the token of the link that no longer works. The new
+// link goes ONLY to the address on that claim row — the request carries no
+// address and none is ever read from it — and the caller answers the same
+// whether or not anything was sent (no existence leak).
+//
+// Not resent: draft rows (self-registration sessions), revoked rows, rows of a
+// provider that has had any claim revoked since this row was issued (an admin
+// revoke or a self-registration rejection must not be undone by an old link),
+// a missing provider, and a provider over the per-provider limit
+// (isClaimRateLimited — silently, so that limit never shows).
+//
+// The visible limit (outcome "too_many") counts per submitted token string,
+// hashed, in memory: CLAIM_RESEND_MAX_PER_KEY in CLAIM_RATE_LIMIT_WINDOW_HOURS.
+// It counts every string the same, real or made up, so «for mange» is
+// reached the same way for a token that matches nothing. Per process, reset
+// on restart — the per-provider limit above is the durable one.
+export const CLAIM_RESEND_MAX_PER_KEY = 3;
+const CLAIM_RESEND_KEYS_MAX = 10_000;
+const claimResendAttempts = new Map<string, number[]>();
+
+export function __resetClaimResendLimiterForTesting(): void {
+  claimResendAttempts.clear();
+}
+
+export type ResendClaimLinkResult =
+  | { outcome: "done"; issued: (IssuedClaim & { providerId: string; providerName: string }) | null }
+  | { outcome: "too_many" };
+
+export function resendClaimLinkForToken(token: unknown, nowMs: number = Date.now()): ResendClaimLinkResult {
+  const raw = typeof token === "string" ? token.slice(0, 200) : "";
+  const key = crypto.createHash("sha256").update(raw).digest("hex");
+  const windowMs = CLAIM_RATE_LIMIT_WINDOW_HOURS * 60 * 60 * 1000;
+  const recent = (claimResendAttempts.get(key) || []).filter((t) => nowMs - t < windowMs);
+  if (recent.length >= CLAIM_RESEND_MAX_PER_KEY) {
+    claimResendAttempts.set(key, recent);
+    return { outcome: "too_many" };
+  }
+  recent.push(nowMs);
+  claimResendAttempts.delete(key);
+  claimResendAttempts.set(key, recent);
+  while (claimResendAttempts.size > CLAIM_RESEND_KEYS_MAX) {
+    const oldest = claimResendAttempts.keys().next().value as string;
+    claimResendAttempts.delete(oldest);
+  }
+
+  if (!/^[0-9a-f]{64}$/.test(raw)) return { outcome: "done", issued: null };
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT provider_id, email, email_source, created_at, is_test FROM gardssalg_claims
+        WHERE token = ? AND revoked_at IS NULL AND COALESCE(draft_mode, 0) = 0`,
+    )
+    .get(raw) as { provider_id: string; email: string; email_source: ClaimEmailSource; created_at: string; is_test: number } | undefined;
+  if (!row || !row.email) return { outcome: "done", issued: null };
+
+  const revokedSince = db
+    .prepare(
+      `SELECT 1 FROM gardssalg_claims
+        WHERE provider_id = ? AND revoked_at IS NOT NULL AND datetime(revoked_at) >= datetime(?) LIMIT 1`,
+    )
+    .get(row.provider_id, row.created_at);
+  if (revokedSince) return { outcome: "done", issued: null };
+  const provider = getClaimProviderById(row.provider_id);
+  if (!provider) return { outcome: "done", issued: null };
+  if (isClaimRateLimited(row.provider_id)) return { outcome: "done", issued: null };
+
+  const claim = insertGardssalgClaimRow(row.provider_id, row.email, row.email_source, { isTest: row.is_test === 1 });
+  return { outcome: "done", issued: { ...claim, providerId: row.provider_id, providerName: provider.navn } };
+}
+
 // ── Admin-granted claim (dev-request 2026-07-30-opplevagent-claim-epost-og-
 // perfelt-laas, item 2 ONLY — item 3 per-field lock and item 4 CTA-hiding are
 // separate slices, not built here) ────────────────────────────────────────
