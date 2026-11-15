@@ -2196,12 +2196,25 @@ export async function issueClaimMagicLink(
 // a missing provider, and a provider over the per-provider limit
 // (isClaimRateLimited — silently, so that limit never shows).
 //
+// Same eligibility gate as issueClaimMagicLink (review B1): the source row
+// must be at most CLAIM_RESEND_SOURCE_MAX_AGE_DAYS old (every source), and for
+// a self-serve (derived) email_source the provider must still be
+// brreg_verified and the row's address must still be one of the provider's
+// current deriveOrgLinkedEmailCandidatesWithHarvest() candidates. A "manual"
+// (admin-granted) or "self_registered" row was vouched for by a human, not
+// derived, so only the age bound applies to it. Every failed gate gives the
+// same silent "done".
+//
 // The visible limit (outcome "too_many") counts per submitted token string,
 // hashed, in memory: CLAIM_RESEND_MAX_PER_KEY in CLAIM_RATE_LIMIT_WINDOW_HOURS.
 // It counts every string the same, real or made up, so «for mange» is
 // reached the same way for a token that matches nothing. Per process, reset
 // on restart — the per-provider limit above is the durable one.
 export const CLAIM_RESEND_MAX_PER_KEY = 3;
+/** 30 days: a dead link older than this (4× the 7-day link life) is not resent;
+ *  the owner asks again on the profile's claim page, which re-derives everything. */
+export const CLAIM_RESEND_SOURCE_MAX_AGE_DAYS = 30;
+const CLAIM_RESEND_NON_DERIVED_SOURCES: readonly ClaimEmailSource[] = ["manual", "self_registered"];
 const CLAIM_RESEND_KEYS_MAX = 10_000;
 const claimResendAttempts = new Map<string, number[]>();
 
@@ -2213,7 +2226,11 @@ export type ResendClaimLinkResult =
   | { outcome: "done"; issued: (IssuedClaim & { providerId: string; providerName: string }) | null }
   | { outcome: "too_many" };
 
-export function resendClaimLinkForToken(token: unknown, nowMs: number = Date.now()): ResendClaimLinkResult {
+export async function resendClaimLinkForToken(
+  token: unknown,
+  nowMs: number = Date.now(),
+  opts: { fetchImpl?: typeof fetch } = {},
+): Promise<ResendClaimLinkResult> {
   const raw = typeof token === "string" ? token.slice(0, 200) : "";
   const key = crypto.createHash("sha256").update(raw).digest("hex");
   const windowMs = CLAIM_RATE_LIMIT_WINDOW_HOURS * 60 * 60 * 1000;
@@ -2235,9 +2252,10 @@ export function resendClaimLinkForToken(token: unknown, nowMs: number = Date.now
   const row = db
     .prepare(
       `SELECT provider_id, email, email_source, created_at, is_test FROM gardssalg_claims
-        WHERE token = ? AND revoked_at IS NULL AND COALESCE(draft_mode, 0) = 0`,
+        WHERE token = ? AND revoked_at IS NULL AND COALESCE(draft_mode, 0) = 0
+          AND datetime(created_at) >= datetime('now', '-' || ? || ' days')`,
     )
-    .get(raw) as { provider_id: string; email: string; email_source: ClaimEmailSource; created_at: string; is_test: number } | undefined;
+    .get(raw, CLAIM_RESEND_SOURCE_MAX_AGE_DAYS) as { provider_id: string; email: string; email_source: ClaimEmailSource; created_at: string; is_test: number } | undefined;
   if (!row || !row.email) return { outcome: "done", issued: null };
 
   const revokedSince = db
@@ -2249,6 +2267,15 @@ export function resendClaimLinkForToken(token: unknown, nowMs: number = Date.now
   if (revokedSince) return { outcome: "done", issued: null };
   const provider = getClaimProviderById(row.provider_id);
   if (!provider) return { outcome: "done", issued: null };
+  if (!CLAIM_RESEND_NON_DERIVED_SOURCES.includes(row.email_source)) {
+    if (!(!!provider.org_nr && provider.brreg_verified === 1)) return { outcome: "done", issued: null };
+    const candidates = await deriveOrgLinkedEmailCandidatesWithHarvest(provider, undefined, {
+      fetchImpl: opts.fetchImpl,
+      cacheKey: provider.id,
+    });
+    const want = normalizeEmail(row.email);
+    if (!want || !candidates.some((c) => normalizeEmail(c.email) === want)) return { outcome: "done", issued: null };
+  }
   if (isClaimRateLimited(row.provider_id)) return { outcome: "done", issued: null };
 
   const claim = insertGardssalgClaimRow(row.provider_id, row.email, row.email_source, { isTest: row.is_test === 1 });

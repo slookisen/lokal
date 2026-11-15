@@ -398,10 +398,10 @@ router.post(
   "/kategori/gardssalg/eier/send-ny-lenke",
   generalLimiter,
   express.urlencoded({ extended: false }),
-  (req: Request, res: Response) => {
+  async (req: Request, res: Response) => {
     let outcome: "done" | "too_many" = "done";
     try {
-      const result = resendClaimLinkForToken((req.body as any)?.token);
+      const result = await resendClaimLinkForToken((req.body as any)?.token);
       outcome = result.outcome;
       if (result.outcome === "done" && result.issued) {
         mailClaimLink(result.issued.providerId, result.issued.providerName || "din profil", result.issued);
