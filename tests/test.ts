@@ -1521,6 +1521,25 @@ runSerial(async () => {
   }
 });
 
+// ── dev-request 2026-11-15-rfb-utsending-loftesetning-holdes: promise_given
+// in the mode=second gate, pool-blocker-explain and executeCompose ──
+runSerial(async () => {
+  console.log("── rfb-outreach-promise-given (gate + explain + compose guard) ──");
+  try {
+    const { runRfbOutreachPromiseGivenTests } =
+      require("../src/routes/rfb-outreach-promise-given.test") as
+        typeof import("../src/routes/rfb-outreach-promise-given.test");
+    const r = await runRfbOutreachPromiseGivenTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-outreach-promise-given: " + f);
+    console.log(`  rfb-outreach-promise-given: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-outreach-promise-given: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── 2026-07-15 gate-integrity fixes (dedupe tiebreak parity + defense-in-depth
 // re-verification) for GET /admin/outreach-candidates ──
 console.log("── admin-outreach-candidates (gate-integrity: dedupe tiebreak parity + re-verification) ──");
@@ -25533,6 +25552,7 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
       to_emails TEXT,
       sent_at TEXT,
       received_at TEXT DEFAULT (datetime('now')),
+      raw_metadata TEXT DEFAULT '{}',
       delivery_status TEXT NOT NULL DEFAULT 'sent'
     );
 

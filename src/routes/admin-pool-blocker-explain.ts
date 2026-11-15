@@ -48,6 +48,7 @@ import { hasContactRetentionMarkers } from "../services/privacy-retention";
 import { hasHomepageContactProvenance } from "../services/homepage-contact-provenance";
 import { buildCrossPlatformIdentity } from "../services/cross-platform-match";
 import { getRecentlyEmailedAddresses, getCrossPlatformSuppressors, getOpenExperiencesDb } from "../services/outreach-suppression-signals";
+import { loadRfbPromiseGivenEmails } from "../services/rfb-outreach-promise";
 
 const router = Router();
 
@@ -446,6 +447,9 @@ router.get("/", (req: Request, res: Response) => {
   // outreach-suppression-signals.ts.
   const recentlyEmailedAddresses = getRecentlyEmailedAddresses(db, cooldownDays);
   const crossPlatformSuppressors = getCrossPlatformSuppressors(db, cooldownDays, { expDb: getOpenExperiencesDb() });
+  // dev-request 2026-11-15-rfb-utsending-loftesetning-holdes: the gate's
+  // mode=second promise_given set, same helper.
+  const promiseGivenEmails = loadRfbPromiseGivenEmails(db);
 
   // contacted_at = MAX(sent_at) of outbound CRM messages to a.contact_email.
   // Slettefrist slice A: messages the 24-month retention job deleted are kept
@@ -550,6 +554,8 @@ router.get("/", (req: Request, res: Response) => {
       }).blocked,
       recent_crm_send_email_match: email.length > 0 && recentlyEmailedAddresses.has(emailLower),
       cross_platform_cooldown: crossPlatformFound !== undefined,
+      // Holds the address in mode=second (and at compose) — see rfb-outreach-promise.ts.
+      promise_given: email.length > 0 && promiseGivenEmails.has(emailLower),
     };
 
     // ── Funnel A: outreach-ready pool legs (admin-outreach-pool.ts order) ──
