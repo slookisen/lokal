@@ -1375,6 +1375,9 @@ export async function processBookingFollowups(
     try {
       // A request whose visit time has already passed is not re-sent (and not
       // claimed): asking the producer to answer it would be pointless.
+      // Known, accepted: such a row (failed, slot passed) is then neither
+      // re-sent nor expired — it stays awaiting_provider with no guest e-mail;
+      // the admin already got the failure alert for it.
       const slotMs = stampMs(booking.slot_at);
       if (Number.isFinite(slotMs) && slotMs <= now.getTime()) continue;
       // The claim re-checks the state the SELECT saw: a row answered,

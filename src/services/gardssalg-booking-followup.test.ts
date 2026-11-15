@@ -16,7 +16,8 @@
  *   (k) the retry claim: taken elsewhere -> no send; state changed -> no
  *       claim; gate off -> claim released and retried later; past slot -> skipped.
  *   (l) a producer without an address: "not_live" (send outcome and the
- *       POST /book response), admin alerted, the row never followed up.
+ *       POST /book response), admin alerted, the row never followed up —
+ *       also when created before the floor (not legacy, never re-sent).
  *   (a) AK3: GET /admin/booking-followups/dry-run — 403 without the admin
  *       key, 200 with { would_remind, would_expire } matching the job.
  *
@@ -390,6 +391,30 @@ export function runGardssalgBookingFollowupTests(opts: { log?: boolean } = {}): 
       assertEq(row(noAddr.booking_ref)?.notify_failed_at, null, "l3: not a failure either, so no retry");
       assertEq(alerts.length, 1, "l4: the admin is alerted");
       assertTrue(/ingen e-postadresse/.test(alerts[0]?.subject ?? ""), "l5: the alert names the missing address");
+      assertTrue(!!row(noAddr.booking_ref)?.notify_retried_at, "l5b: not_live stamps notify_retried_at (no further send attempt)");
+
+      // l-pre (round-2 B1): a not_live row created BEFORE the floor is not
+      // legacy — never reminded, never expired, never re-sent.
+      const preNoAddr = mk("fu-noaddr", "pre-ingen-adresse@example.no");
+      assertEq(await bookingStore.sendProducerNotification(preNoAddr, null), "not_live", "lp1: pre-floor no address -> not_live");
+      expDb.prepare("UPDATE gardssalg_bookings SET created_at = ?, respond_token_expires_at = ? WHERE booking_id = ?")
+        .run("2019-12-01T10:00:00.000Z", "2019-12-03T22:00:00.000Z", preNoAddr.booking_id);
+      const preRow = row(preNoAddr.booking_ref)!;
+      assertEq(fu.isLegacyPreFloorRow(preRow), false, "lp2: a pre-floor not_live row is not legacy");
+      const dryP = bookingStore.countBookingFollowupsDue(new Date(pinnedFloorMs + 25 * H));
+      assertEq(dryP.legacy_counted_from_floor, 0, "lp3: dry-run does not count it as legacy");
+      assertEq([dryP.would_remind, dryP.would_expire], [0, 0], "lp4: dry-run at floor + 25 h: nothing due");
+      assertEq(bookingStore.countBookingFollowupsDue(new Date(Date.now() + 365 * 24 * H)).legacy_counted_from_floor, 0, "lp5: nor a year on");
+      const preRetriedAt = preRow.notify_retried_at;
+      sends.length = 0;
+      r = await bookingStore.processBookingFollowups(new Date(Date.now() + 2 * H));
+      assertEq(r.producer_notify_retried, 0, "lp6: the re-send path does not pick the not_live row");
+      assertEq(row(preNoAddr.booking_ref)?.notify_retried_at, preRetriedAt, "lp7: notify_retried_at unchanged by the job");
+      await bookingStore.processBookingFollowups(new Date(Date.now() + 365 * 24 * H));
+      const preAfter = row(preNoAddr.booking_ref)!;
+      assertEq(preAfter.pre_status, "awaiting_provider", "lp8: never expired, even a year on");
+      assertEq(preAfter.reminder_sent_at, null, "lp9: never reminded");
+      assertTrue(!sends.some((s) => s.to === "pre-ingen-adresse@example.no"), "lp10: the guest got no expiry e-mail");
 
       const bookLayer = (opplevelserRouter.stack as any[]).find((l: any) => l.route?.path === "/book" && l.route.methods?.post);
       const callBook = async (provider_id: string, guest_email: string): Promise<any> => {

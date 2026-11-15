@@ -26,6 +26,20 @@
  * notify_* column NULL — starts its clock AT the floor (followupRowClockStartMs()).
  * Rows created at/after the floor keep "no registered notification ⇒ never".
  *
+ * A producer WITHOUT an address ("not_live") is never e-mailed, so such a row
+ * must not look legacy either: recordProducerNotifyOutcome() stamps
+ * notify_retried_at on it (see the comment there). That excludes it from the
+ * legacy rule above AND from the job's single re-send (whose SELECT/claim
+ * require notify_failed_at IS NOT NULL AND notify_retried_at IS NULL).
+ *
+ * Known residual window: "sent"/"failed" are stamped after the send resolves
+ * (seconds). A row created between the deploy and the floor whose process
+ * restarts inside that window keeps every notify_* NULL and is treated as
+ * legacy. Its producer e-mail was in flight (most likely delivered, with the
+ * stated expiry promise), so counting from the floor is the lesser error; an
+ * extra "attempted" column was judged not worth it for a <1-day, seconds-wide
+ * window. After the floor the window does not exist (no legacy rule there).
+ *
  * This module has no import of booking-store (booking-store imports it).
  */
 
@@ -162,7 +176,18 @@ export async function recordProducerNotifyOutcome(
         .run(stamp, booking.booking_id);
       return;
     }
-    if (outcome === "failed" && !opts.retry) {
+    if (outcome === "not_live") {
+      // No address: the producer never gets the request. notify_retried_at is
+      // the marker "no (further) send attempt will be made" — it is the column
+      // the job's re-send already uses to mean exactly that, so no schema
+      // change is needed. Effects: the row is not legacy (isLegacyPreFloorRow
+      // needs every notify_* NULL), so it is never reminded/expired; and the
+      // re-send never picks it (needs notify_failed_at IS NOT NULL AND
+      // notify_retried_at IS NULL). notify_sent_at stays NULL = not delivered.
+      // COALESCE keeps the retry claim's stamp when the re-send ends here.
+      db.prepare("UPDATE gardssalg_bookings SET notify_retried_at = COALESCE(notify_retried_at, ?) WHERE booking_id = ?")
+        .run(stamp, booking.booking_id);
+    } else if (outcome === "failed" && !opts.retry) {
       db.prepare("UPDATE gardssalg_bookings SET notify_failed_at = COALESCE(notify_failed_at, ?) WHERE booking_id = ?")
         .run(stamp, booking.booking_id);
     }
