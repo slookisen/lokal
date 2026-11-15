@@ -71,6 +71,7 @@ import {
   ownerRowAnchor,
 } from "./anchors";
 import { OPPLEVAGENT_PRICE_MESSAGE } from "./price-message";
+import { forProdusenterSectionHref, isForProdusenterPageEnabled } from "../routes/rfb-for-produsenter-anchors";
 import { OWNER_TOKEN_CSS } from "../owner-ui/tokens";
 import { OWNER_ENHANCE_SCRIPT, OWNER_STATUS_CSS, OWNER_STATUS_HTML } from "../owner-ui/enhance";
 import { OWNER_COMMS_GROUP_NOTE, OWNER_NEWS_CONSENT_TEXT, OWNER_NEWS_PLACEMENT_QUESTION, OWNER_NOTIFY_GROUP_NOTE } from "./news-consent";
@@ -680,6 +681,25 @@ export function ownerRowDescription(agentId: string, e: OwnerFeatureEntry, env: 
   return ownerFeatureEntryForEnv(e, env).description;
 }
 
+const FAQ_READ_MORE = { no: "Les mer", en: "Read more" } as const;
+
+/**
+ * F2c-1 (A2A dev-request 2026-10-22-rfb-for-produsenter-faq-side, AC6): a
+ * «Les mer» link from a row to the /for-produsenter section that explains it
+ * (the entry's faqAnchor), same tab. RFB page only (gårdssalg has its own
+ * FAQ) and only while FOR_PRODUSENTER_PAGE_ENABLED is on; otherwise "" so the
+ * row is byte-identical to before.
+ */
+export function ownerFaqReadMoreHtml(
+  m: Pick<OwnerPageModel, "variant">,
+  e: OwnerFeatureEntry,
+  lang: "no" | "en" = "no",
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  if (!e.faqAnchor || (m.variant && m.variant.vertical !== "rfb") || !isForProdusenterPageEnabled(env)) return "";
+  return `<p class="mv-desc"><a href="${esc(forProdusenterSectionHref(e.faqAnchor, lang))}" data-faq-anchor="${esc(e.faqAnchor)}">${esc(FAQ_READ_MORE[lang])}</a></p>`;
+}
+
 function rowHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeature, swap: string): string {
   // T8: a row that deviates from the level that applies is an «Unntak».
   const ls = ctx.levelStatus;
@@ -710,7 +730,7 @@ function rowHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeature, 
   // allowlisted RFB page (the registry description feeds public pages).
   const desc = !ctx.m.variant && e.key === OWNER_PAGE_NEWS_KEY ? OWNER_NEWS_CONSENT_TEXT.row.no : ownerRowDescription(ctx.m.agent.id, e).no;
   return `<li class="mv-item" id="${esc(ownerRowAnchor(e.key))}" data-key="${esc(e.key)}">
-          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong>${badges}<p class="mv-desc">${esc(desc)}</p>${exceptionText}${reason}${explain}${rowExtraHtml(ctx, e, r)}</div>
+          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong>${badges}<p class="mv-desc">${esc(desc)}</p>${exceptionText}${reason}${explain}${rowExtraHtml(ctx, e, r)}${ownerFaqReadMoreHtml(ctx.m, e)}</div>
           <div class="mv-item-ctl">${controlHtml(ctx, e, r, swap)}</div>${noticeAtHtml(ctx, ownerRowAnchor(e.key))}${confirm}
         </li>`;
 }

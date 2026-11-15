@@ -341,7 +341,8 @@ export async function runRfbForProdusenterTests(opts: { log?: boolean } = {}): P
     assertTrue(!hostile.includes("<script>") && !hostile.includes("<img") && hostile.includes("&lt;script&gt;alert(1)&lt;/script&gt; &quot;q&quot; &amp; &#39;x&#39;") && hostile.includes("&lt;img src=x onerror=alert(1)&gt; «a»"), "escaping: questions and answers are HTML-escaped");
 
     // Not in F1
-    assertTrue(!/sellerFaq|faqAnchor/.test(fs.readFileSync(path.join(SRC, "owner-features/registry.ts"), "utf8")), "scope: registry has no sellerFaq/faqAnchor fields yet (later slice)");
+    // F2c-1 added faqAnchor (owner-features/faq-anchor.test.ts); sellerFaq is a later slice.
+    assertTrue(!/sellerFaq/.test(fs.readFileSync(path.join(SRC, "owner-features/registry.ts"), "utf8")), "scope: registry has no sellerFaq field yet (later slice)");
   } finally {
     if (prevFlag === undefined) delete process.env[FLAG]; else process.env[FLAG] = prevFlag;
   }

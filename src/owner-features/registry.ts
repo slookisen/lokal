@@ -30,6 +30,7 @@ import { readOrderNotificationsOptIn, writeOrderNotificationsOptIn, readOrderNot
 import { readOwnerProfileVisible, writeOwnerProfileVisible } from "../services/owner-pause-store";
 import { GARDSSALG_BOOKING_ENABLED_ADAPTER, GARDSSALG_PROFILE_VISIBLE_ADAPTER } from "./gardssalg-adapters";
 import { PRODUCT_WEEKLY_SYNC_ADAPTER, PRODUCT_WEEKLY_SYNC_FLAG } from "./product-weekly-sync";
+import type { ForProdusenterAnchor } from "../routes/rfb-for-produsenter-anchors";
 
 export const OWNER_FEATURE_KEYS = [
   // Hvem kan finne deg
@@ -299,6 +300,14 @@ export interface OwnerFeatureEntry {
    * `confirm_by_email`); the page offers the confirmation form instead.
    */
   confirmByEmail?: boolean;
+  /**
+   * F2c-1 (A2A dev-request 2026-10-22-rfb-for-produsenter-faq-side, AC6):
+   * the /for-produsenter section that explains this choice. The RFB «Mine
+   * valg» row links «Les mer» there while FOR_PRODUSENTER_PAGE_ENABLED is on.
+   * Required on every RFB entry with consent or confirmOn/confirmOff
+   * (owner-features/faq-anchor.test.ts).
+   */
+  faqAnchor?: ForProdusenterAnchor;
 }
 
 export const OWNER_FEATURE_GROUPS: Array<{ key: OwnerFeatureGroup; label: LocalizedText }> = [
@@ -391,6 +400,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   // ── Hvem kan finne deg ──────────────────────────────────────────────────
   entry({
     key: "visibility.profile", group: "visibility", type: "switch",
+    faqAnchor: "personvern",
     label: t("Profilen er synlig", "Profile is visible"),
     description: t(
       "Når denne er av, er profilen borte fra søk, lister, AI-assistenter, feeder og kart. Profilsiden viser «Midlertidig pause».",
@@ -408,6 +418,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   }),
   entry({
     key: "visibility.ai_assistants", group: "visibility", type: "switch",
+    faqAnchor: "synlighet",
     label: t("Synlig for AI-assistenter", "Visible to AI assistants"),
     description: t("AI-assistenter som ChatGPT og Claude kan finne og anbefale deg.", "AI assistants such as ChatGPT and Claude can find and recommend you."),
     default: { owner: true, unclaimed: true },
@@ -453,6 +464,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   // ── Kontaktinformasjon ──────────────────────────────────────────────────
   entry({
     key: "contact.phone", group: "contact", type: "switch",
+    faqAnchor: "personvern",
     label: t("Vis telefonnummer", "Show phone number"),
     description: t("Telefonnummeret ditt vises på profilen og for AI-assistenter.", "Your phone number is shown on your profile and to AI assistants."),
     default: { owner: true, unclaimed: true },
@@ -460,6 +472,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   }),
   entry({
     key: "contact.email_mode", group: "contact", type: "choice",
+    faqAnchor: "personvern",
     label: t("E-postadressen din", "Your e-mail address"),
     description: t("Hvordan e-postadressen din vises for besøkende og AI-assistenter.", "How your e-mail address is shown to visitors and AI assistants."),
     options: [
@@ -473,6 +486,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   }),
   entry({
     key: "contact.address", group: "contact", type: "choice",
+    faqAnchor: "personvern",
     label: t("Adresse", "Address"),
     description: t("Hvor mye av adressen din som vises.", "How much of your address is shown."),
     options: [
@@ -486,6 +500,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   // ── Produkter og priser ─────────────────────────────────────────────────
   entry({
     key: "products.import", group: "products", type: "action",
+    faqAnchor: "oppdatering",
     label: t("Hent produkter fra nettsiden min", "Import products from my website"),
     description: t("Henter produktene fra nettsiden din som forslag du godkjenner.", "Fetches the products from your website as suggestions you approve."),
     default: { owner: null, unclaimed: null },
@@ -502,6 +517,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   // job's own rule. Switching on runs nothing at once; the job picks it up.
   entry({
     key: "products.weekly_sync", group: "products", type: "switch",
+    faqAnchor: "oppdatering",
     label: t("Hold produktene oppdatert fra nettsiden", "Keep products updated from my website"),
     description: t(
       "Vi sjekker nettsiden din hver uke. Varer du har bekreftet, får ny pris automatisk. Nye varer venter til du godkjenner dem, og store avvik stopper oppdateringen.",
@@ -541,6 +557,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   // active (services/stock-soft-expiry.ts stockSoftExpiryActiveFor).
   entry({
     key: "products.stock_check", group: "products", type: "switch",
+    faqAnchor: "bestillinger",
     label: t("Minn meg på å bekrefte lagerstatus", "Remind me to confirm stock"),
     description: t(
       "Vi sier fra før lagerstatusen på en vare går ut, slik at kundene fortsatt kan bestille den. Du får høyst én e-post hver 14. dag.",
@@ -558,6 +575,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   // ── Bestillinger ────────────────────────────────────────────────────────
   entry({
     key: "orders.enabled", group: "orders", type: "switch",
+    faqAnchor: "bestillinger",
     label: t("Ta imot bestillinger", "Accept orders"),
     description: t(
       "Kunder og AI-assistenter kan sende deg bestillinger på henting. Uten denne får kunden kontaktinformasjonen din i stedet.",
@@ -581,6 +599,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   }),
   entry({
     key: "orders.email", group: "orders", type: "email",
+    faqAnchor: "bestillinger",
     label: t("Bestillinger sendes til", "Orders are sent to"),
     description: t(
       "E-postadressen bestillingene går til. Standard er profilens e-post. En ny adresse gjelder når du har klikket lenken vi sender dit.",
@@ -599,6 +618,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   }),
   entry({
     key: "orders.pause", group: "orders", type: "switch",
+    faqAnchor: "bestillinger",
     label: t("Ferie: ta ikke imot nye bestillinger", "Holiday: do not accept new orders"),
     description: t("Nye bestillinger stoppes mens du er borte. Profilen er fortsatt synlig.", "New orders are stopped while you are away. Your profile stays visible."),
     default: { owner: false, unclaimed: null },
@@ -648,6 +668,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   }),
   entry({
     key: "orders.reminder", group: "orders", type: "locked",
+    faqAnchor: "bestillinger",
     label: t("Påminnelse om ubesvarte bestillinger", "Reminder about unanswered orders"),
     description: t("Du får en påminnelse når en bestilling ikke er besvart.", "You get a reminder when an order has not been answered."),
     default: { owner: false, unclaimed: null },
@@ -710,6 +731,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   }),
   entry({
     key: "orders.auto_confirm", group: "orders", type: "switch",
+    faqAnchor: "bestillinger",
     label: t("Bekreft bestillinger automatisk", "Confirm orders automatically"),
     description: t("Bestillinger bekreftes til kunden uten at du trykker.", "Orders are confirmed to the customer without you pressing anything."),
     default: { owner: false, unclaimed: null },
@@ -723,6 +745,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   // ── Betaling ────────────────────────────────────────────────────────────
   entry({
     key: "payments.prepay", group: "payments", type: "switch",
+    faqAnchor: "betaling",
     label: t("Ta imot forhåndsbetaling", "Accept prepayment"),
     description: t("Kunden kan betale på forhånd med kort.", "The customer can pay in advance by card."),
     default: { owner: false, unclaimed: null },
@@ -733,6 +756,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   }),
   entry({
     key: "payments.pay_at_pickup", group: "payments", type: "switch",
+    faqAnchor: "betaling",
     label: t("Tillat betaling ved henting", "Allow payment at pickup"),
     description: t("Kunden kan betale når varene hentes.", "The customer can pay when the goods are picked up."),
     default: { owner: true, unclaimed: null },
@@ -744,6 +768,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   // ── Varsler til deg ─────────────────────────────────────────────────────
   entry({
     key: "notify.order_email", group: "notify", type: "locked",
+    faqAnchor: "bestillinger",
     label: t("Ordrevarsel på e-post", "Order notification by e-mail"),
     description: t("Hver ny bestilling sendes til deg på e-post.", "Every new order is sent to you by e-mail."),
     default: { owner: false, unclaimed: null },
@@ -764,6 +789,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   }),
   entry({
     key: "notify.report", group: "notify", type: "choice",
+    faqAnchor: "statistikk",
     label: t("Rapport om profilen din", "Report about your profile"),
     description: t("Visninger, med i AI-svar og klikk, sendt på e-post.", "Views, AI-answer mentions and clicks, sent by e-mail."),
     options: [
@@ -795,6 +821,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   // ── Hjelp med å holde profilen oppdatert ────────────────────────────────
   entry({
     key: "auto.guarantee", group: "auto", type: "guarantee",
+    faqAnchor: "oppdatering",
     label: t("Det du skriver selv, overskrives aldri", "What you write yourself is never overwritten"),
     // dev-request 2026-11-01-rfb-hold-profilen-oppdatert (Daniel approved
     // 2026-11-01): with OWNER_AUTO_UPDATES_ENABLED on, new information may be
@@ -819,6 +846,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   // «Foreslå til meg» is hidden until a suggestion page exists.
   entry({
     key: "auto.updates", group: "auto", type: "choice",
+    faqAnchor: "oppdatering",
     label: t("Oppdatering fra nettsiden din og offentlige kilder", "Updates from your website and public sources"),
     description: t("Hva som skjer når vi finner ny informasjon om deg.", "What happens when we find new information about you."),
     options: [
@@ -868,6 +896,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   }),
   entry({
     key: "auto.photos", group: "auto", type: "switch",
+    faqAnchor: "oppdatering",
     label: t("Hent bilder fra nettsiden min", "Fetch photos from my website"),
     description: t("Bilder fra nettsiden din kan brukes på profilen.", "Photos from your website can be used on your profile."),
     default: { owner: false, unclaimed: false },
@@ -879,6 +908,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   // ── Statistikk og offentlige tall ───────────────────────────────────────
   entry({
     key: "stats.public_counts", group: "stats", type: "switch",
+    faqAnchor: "statistikk",
     label: t("Vis besøkstall og «Med i AI-søk» på profilen", "Show visit counts and “In AI search” on the profile"),
     // S2f: the public threshold (PUBLIC_STATS_MIN_VIEWS, default 20; services/public-stats-threshold.ts).
     description: t(
@@ -906,6 +936,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   }),
   entry({
     key: "stats.share_partner", group: "stats", type: "switch",
+    faqAnchor: "statistikk",
     label: t("Del statistikken min med samarbeidspartnere", "Share my statistics with partners"),
     description: t("Partnere du er tilknyttet kan se statistikken din i sine rapporter.", "Partners you are affiliated with can see your statistics in their reports."),
     default: { owner: false, unclaimed: false },
@@ -918,6 +949,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   // ── Kontakt fra Rett fra Bonden ─────────────────────────────────────────
   entry({
     key: "comms.unsubscribe", group: "comms", type: "guarantee",
+    faqAnchor: "personvern",
     label: t("Avmelding uten å slette profilen", "Unsubscribe without deleting the profile"),
     description: t("Du kan alltid melde deg av e-post fra oss uten at profilen slettes.", "You can always unsubscribe from our e-mails without your profile being deleted."),
     default: { owner: true, unclaimed: true },
@@ -926,6 +958,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   }),
   entry({
     key: "comms.news", group: "comms", type: "switch",
+    faqAnchor: "personvern",
     label: t("Nyheter og tips", "News and tips"),
     // T7: the allowlisted «Mine valg» page shows the versioned consent text
     // (news-consent.ts) in this row instead; this description stays as it is
@@ -956,6 +989,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   }),
   entry({
     key: "comms.featured", group: "comms", type: "switch",
+    faqAnchor: "mine-valg",
     label: t("Rett fra Bonden kan vise fram gården min", "Rett fra Bonden may feature my farm"),
     description: t("Vi kan omtale gården din i sosiale medier og nyhetsbrev.", "We may feature your farm on social media and in newsletters."),
     default: { owner: false, unclaimed: false },

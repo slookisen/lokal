@@ -63,18 +63,15 @@ import { OWNER_LEVELS } from "../owner-features/changes";
 import { ownerOrderLimitLines, type OrderLimitsConfig } from "../owner-features/order-texts";
 import { currentForProdusenterFacts, type ForProdusenterFacts, type PilotFeatureKey, type PilotState } from "../owner-features/today-facts";
 import { FRONT_PAGE_FAQ_ANCHOR } from "./front-page-faq";
+import { FOR_PRODUSENTER_PATH, isForProdusenterPageEnabled, type ForProdusenterAnchor } from "./rfb-for-produsenter-anchors";
 
 // F2a: the facts module lives in owner-features/today-facts.ts; re-exported
 // so existing callers (tests, rfb-owner-refresh) keep importing it from here.
 export { currentForProdusenterFacts, type ForProdusenterFacts } from "../owner-features/today-facts";
 
-export const FOR_PRODUSENTER_PATH = "/for-produsenter";
-
-/** FOR_PRODUSENTER_PAGE_ENABLED: "1" or "true" (any case, trimmed) = on; anything else = off. */
-export function isForProdusenterPageEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const v = (env.FOR_PRODUSENTER_PAGE_ENABLED || "").trim().toLowerCase();
-  return v === "true" || v === "1";
-}
+// F2c-1: the path, the flag and the anchors live in rfb-for-produsenter-
+// anchors.ts (the registry and the «Mine valg» page use them); re-exported here.
+export { FOR_PRODUSENTER_PATH, isForProdusenterPageEnabled, FOR_PRODUSENTER_ANCHORS, forProdusenterSectionHref, type ForProdusenterAnchor } from "./rfb-for-produsenter-anchors";
 
 /** Sitemap paths for this page: [] while the flag is off. */
 export function forProdusenterSitemapPaths(env: NodeJS.ProcessEnv = process.env): string[] {
@@ -96,13 +93,6 @@ export function rfbAgentCardFaqLinks(baseUrl: string, env: NodeJS.ProcessEnv = p
   const base = baseUrl.replace(/\/$/, "");
   return { "x-faq": { frontPage: `${base}/#${FRONT_PAGE_FAQ_ANCHOR}`, producers: `${base}${FOR_PRODUSENTER_PATH}` } };
 }
-
-/** The anchors, in menu order. Used by «Les mer» links later — never rename after publishing. */
-export const FOR_PRODUSENTER_ANCHORS = [
-  "oversikt", "synlighet", "eierskap", "mine-valg", "bestillinger", "betaling",
-  "oppdatering", "statistikk", "personvern", "pris", "kontakt",
-] as const;
-export type ForProdusenterAnchor = (typeof FOR_PRODUSENTER_ANCHORS)[number];
 
 const SELGER_FIND = "/selger#findSection";
 const SELGER_LOGIN = "/selger#loginBanner";
