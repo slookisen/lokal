@@ -32224,6 +32224,18 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gbcr.failures) failures.push("opplevelser-gardssalg-bookings-count: " + f);
     console.log(`  opplevelser-gardssalg-bookings-count: ${gbcr.passed} passed, ${gbcr.failed} failed`);
 
+    // O1-1 (R1/R11): booking follow-up after restart — first run 5 min after
+    // boot, clock from the registered producer notification, one retry +
+    // admin alert for a failed producer e-mail, admin dry-run count.
+    console.log("\n── gardssalg-booking-followup: boot run + registered-notification clock + retry/alert + dry-run ──");
+    const { runGardssalgBookingFollowupTests } = require("../src/services/gardssalg-booking-followup.test") as
+      typeof import("../src/services/gardssalg-booking-followup.test");
+    const gbfu = await runGardssalgBookingFollowupTests({ log: false });
+    passed += gbfu.passed;
+    failed += gbfu.failed;
+    for (const f of gbfu.failures) failures.push("gardssalg-booking-followup: " + f);
+    console.log(`  gardssalg-booking-followup: ${gbfu.passed} passed, ${gbfu.failed} failed`);
+
     // GET /admin/gardssalg-provider-lookup — read-only, case-insensitive
     // substring lookup of experience_providers by navn, returning
     // id/navn/rfb_seed_source/created_at. Closes the gap where /admin/
@@ -42151,6 +42163,11 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
   const prevExpirePV = process.env.BOOKING_PREVISIT_EXPIRE_HOURS;
   delete process.env.BOOKING_PREVISIT_REMINDER_HOURS;
   delete process.env.BOOKING_PREVISIT_EXPIRE_HOURS;
+  // O1-1: the followup clock starts at the registered producer notification,
+  // never before BOOKING_FOLLOWUP_CLOCK_FLOOR (default: the deploy date). This
+  // block's bookings are made "now", so pin the floor into the past.
+  const prevClockFloorPV = process.env.BOOKING_FOLLOWUP_CLOCK_FLOOR;
+  process.env.BOOKING_FOLLOWUP_CLOCK_FLOOR = "2020-01-01T00:00:00Z";
 
   // P0 CI fix (2026-09-11): this block used to have no top-level try/finally,
   // so any assertion failure that THROWS (rather than merely recording a
@@ -42307,6 +42324,8 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
       guest_name: "Gjest Previsit", guest_email: "gjest-pv@example.no", ...extra,
     });
     assertEq(r.status, 201, "pv-book: booking created (201)");
+    // O1-1: let the fire-and-forget producer send stamp notify_sent_at.
+    await new Promise((res) => setImmediate(res));
     return bookStPV.getBookingByRef(String(r.json?.booking_ref));
   }
 
@@ -42970,6 +42989,8 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
     else process.env.BOOKING_PREVISIT_REMINDER_HOURS = prevReminderPV;
     if (prevExpirePV === undefined) delete process.env.BOOKING_PREVISIT_EXPIRE_HOURS;
     else process.env.BOOKING_PREVISIT_EXPIRE_HOURS = prevExpirePV;
+    if (prevClockFloorPV === undefined) delete process.env.BOOKING_FOLLOWUP_CLOCK_FLOOR;
+    else process.env.BOOKING_FOLLOWUP_CLOCK_FLOOR = prevClockFloorPV;
     dbFacOwnPV?.__resetDbFactoryForTesting();
     restoreModulesPV();
   }

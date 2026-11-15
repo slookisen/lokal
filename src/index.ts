@@ -72,6 +72,7 @@ import { AGENT_USAGE_PREWARM_INTERVAL_MS, prewarmAgentToolCalls } from "./servic
 import { prewarmAgentStats } from "./services/agent-stats-reader";
 import { sweepExpiredCartContactData } from "./services/cart-contact-sweep";
 import { sweepExpiredGardssalgGuestContact } from "./services/gardssalg-guest-contact-sweep";
+import { scheduleBookingFollowupsJob } from "./services/gardssalg-booking-followup";
 import analyticsRoutes from "./routes/analytics";
 import agentStatsRoutes from "./routes/agent-stats";
 import adminRunsRoutes from "./routes/admin-runs";
@@ -3054,16 +3055,20 @@ if (
   process.env.RFB_DISABLE_BOOKING_FOLLOWUPS !== "1" &&
   process.env.ENABLE_EXPERIENCES === "1"
 ) {
-  setInterval(trackJob("booking-followups", async () => {
+  // O1-1 (R1): like order-followups below, a bare hourly setInterval never
+  // ran with restarts more often than hourly; scheduleBookingFollowupsJob()
+  // also runs it once 5 min after boot (idempotent, so harmless).
+  const bookingFollowupsTick = trackJob("booking-followups", async () => {
     try {
       const { processBookingFollowups } = await import("./services/booking-store");
       const r = await processBookingFollowups();
       if (
-        r.reminders_sent || r.reminders_suppressed ||
+        r.producer_notify_retried || r.reminders_sent || r.reminders_suppressed ||
         r.expired || r.expired_guests_notified || r.errors
       ) {
         console.log(
-          `[booking-followups] tick examined=${r.examined} reminders=${r.reminders_sent} ` +
+          `[booking-followups] tick examined=${r.examined} notify_retried=${r.producer_notify_retried} ` +
+          `reminders=${r.reminders_sent} ` +
           `suppressed=${r.reminders_suppressed} expired=${r.expired} ` +
           `guests_notified=${r.expired_guests_notified} errors=${r.errors}`
         );
@@ -3071,7 +3076,8 @@ if (
     } catch (err) {
       console.error("[booking-followups] tick failed:", err);
     }
-  }), 60 * 60_000);
+  });
+  scheduleBookingFollowupsJob(bookingFollowupsTick);
 }
 
 // ─── F4 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel):

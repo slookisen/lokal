@@ -119,6 +119,7 @@ import {
   // checkBookingSlotAllowed() — see that call site's own comment.
   normaliseBookingSlotInput,
 } from "../services/booking-store";
+import { producerNotifyAddressStatus } from "../services/gardssalg-booking-followup";
 // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 item 7: one
 // source for the booking note (discover_gardssalg) and the "not taking
 // requests now" line (book_gardssalg) for owned profiles that are off.
@@ -1651,6 +1652,8 @@ export function registerExperienceTools(
               provider: providerInfo,
               slot_at_local: slotLocal,
               party_size: booking.party_size,
+              // O1-1 (R11): same field as POST /api/opplevelser/book.
+              producer_notification: { status: producerNotifyAddressStatus(provider?.epost) },
               message:
                 `Produsent: ${providerInfo?.navn || parsed.data.provider_id} · Tidspunkt: ${slotLocal} · ${booking.party_size} person(er). ` +
                 `Reservasjonsforespørsel mottatt (${booking.booking_ref}) — status: PENDING/AVVENTER. ` +

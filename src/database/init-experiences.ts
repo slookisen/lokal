@@ -1107,6 +1107,24 @@ export function initExperiencesSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // ─── O1-1 (R1/R11): registered producer notification ───────────────────
+  // notify_sent_at   — the producer's booking e-mail was handed to the mailer
+  //                    successfully. The followup job's 24 h / 60 h clock
+  //                    starts here; a row without it is never reminded or
+  //                    expired (services/gardssalg-booking-followup.ts).
+  // notify_failed_at — the first send failed (admin alerted).
+  // notify_retried_at— the followup job's single re-send was claimed, OR the producer had no address
+  //                    (not_live): no send will ever be attempted. Both exclude the row from retry and
+  //                    from the legacy pre-floor rule; do not treat NULL here as "never notified".
+  // Additive, nullable; existing rows stay NULL.
+  for (const stmt of [
+    "ALTER TABLE gardssalg_bookings ADD COLUMN notify_sent_at TEXT",
+    "ALTER TABLE gardssalg_bookings ADD COLUMN notify_failed_at TEXT",
+    "ALTER TABLE gardssalg_bookings ADD COLUMN notify_retried_at TEXT",
+  ]) {
+    try { db.exec(stmt); } catch { /* already present */ }
+  }
+
   // ─── listing_url (dev-request 2026-07-12-experiences-enrichment-supply-
   // and-aggregator-hygiene, Daniel's 2026-07-19 decision, step 1) ───────────
   // A chunk of experience_providers.hjemmeside rows carry a DMO/aggregator/

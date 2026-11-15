@@ -549,6 +549,21 @@ export function runOpplevelserBookingSendGuardTests(
       assertEq(happy.body.intended_recipients.producer, "ekte.produsent@gard.no", "o6: response names the real producer it did NOT contact");
       assertEq(sent.map((m) => m.to), [REDIRECT, REDIRECT], "o7: both emails went to the redirect address");
       assertEq(happy.body.sends.map((s: any) => s.ok), [true, true], "o8: both sends reported back to the operator");
+      assertEq(happy.body.sends[1]?.outcome, "sent", "o8b: the producer send carries its outcome");
+
+      // O1-1 (N6): a failed producer send is reported as failed, not ok.
+      const okTransporter = emailSvc.transporter;
+      emailSvc.transporter = {
+        sendMail: async (mailOptions: Record<string, any>) => {
+          if (/Ny reservasjon/.test(String(mailOptions.subject))) throw new Error("smtp 451 test");
+          sent.push(mailOptions);
+          return { messageId: `stub-${sent.length}` };
+        },
+      };
+      const failedSend = await callRoute(opplevelserRouter, { headers: auth, body: bookingInput });
+      emailSvc.transporter = okTransporter;
+      assertEq(failedSend.status, 200, "o8c: a failed producer send still answers 200 (the test result is in sends)");
+      assertEq(failedSend.body.sends?.[1], { kind: "producer_notification", ok: false, outcome: "failed" }, "o8d: the failed producer send is reported ok:false with outcome failed");
 
       // ── (o-q) provider_query + requested_weekday on the admin route ──────
       // 2026-09-17 follow-up to dev-request 2026-09-16-opplevagent-en-setning-
