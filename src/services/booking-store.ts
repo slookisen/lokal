@@ -25,6 +25,14 @@ import {
   stampMs,
   type ProducerNotifyOutcome,
 } from "./gardssalg-booking-followup";
+import {
+  honestReceiptEnabled,
+  buildHonestReceiptEmail,
+  buildConfirmedIcs,
+  loadReceiptProvider,
+  oa1Text,
+  CONFIRMED_ICS_CONTENT_TYPE,
+} from "./gardssalg-honest-receipt";
 
 const VERTICAL = "experiences";
 const APP_URL = process.env.APP_URL || "https://opplevagent.no";
@@ -531,6 +539,14 @@ export function buildIcs(booking: GardssalgBooking): string {
 }
 
 export async function sendBookingConfirmation(booking: GardssalgBooking): Promise<void> {
+  // O1-2 (R3/G13): with GARDSSALG_HONEST_RECEIPT_ENABLED the guest gets a
+  // receipt that says "received, not confirmed" and NO calendar file (that
+  // goes with the producer's confirmation). Flag off: the legacy mail below.
+  if (honestReceiptEnabled()) {
+    await sendHonestReceipt(booking);
+    return;
+  }
+
   const confirmUrl = `${APP_URL}/kategori/gardssalg/bekreft/${booking.confirm_token}`;
   const ics = buildIcs(booking);
 
@@ -589,6 +605,27 @@ ${statusUrl ? `<p>Du kan når som helst se gjeldende status her: <a href="${stat
   // Producer confirm link sent. Never log the URL itself: it carries the
   // producer's confirm_token (T1, eierportal bølge 0) — log a hash label.
   console.log(`[booking] ${booking.booking_ref} confirm link sent (token ${tokenLogLabel(booking.confirm_token)})`);
+}
+
+// O1-2: the honest receipt (text package OA-1 §1.2), never the legacy one
+// with the flag on. The provider row is read before the first await.
+async function sendHonestReceipt(booking: GardssalgBooking): Promise<void> {
+  const provider = loadReceiptProvider(booking.provider_id);
+  const mail = buildHonestReceiptEmail(
+    booking,
+    { producerName: provider.navn, statusUrl: guestStatusUrl(booking) },
+    "nb",
+  );
+  await emailService.sendEmail({
+    to: booking.guest_email,
+    subject: mail.subject,
+    htmlContent: mail.htmlContent,
+    textContent: mail.textContent,
+    replyTo: `kontakt@opplevagent.no`,
+    from: crmFromHeader("experiences"),
+    isTestSend: booking.is_test === 1,
+  });
+  console.log(`[booking] ${booking.booking_ref} honest guest receipt sent`);
 }
 
 // ─── Producer notification email (dev-request 2026-07-12-gardssalg-dark-
@@ -1087,6 +1124,25 @@ export async function sendPrevisitConfirmedToGuest(
   const lead = acceptedSuggestion
     ? "Du har akseptert det nye tidspunktet — reservasjonen er nå bekreftet:"
     : "Gode nyheter — produsenten har bekreftet reservasjonen din:";
+  // O1-2 (R4): with GARDSSALG_HONEST_RECEIPT_ENABLED the calendar file comes
+  // HERE — on the producer's confirmation, and as a new file when the guest
+  // accepted a new time — with the producer's address as LOCATION. Flag off:
+  // icsLine is "" and no attachment, so the mail is byte-identical to before.
+  let icsLine = "";
+  let icsAttachment: { filename: string; content: string; contentType: string } | null = null;
+  if (honestReceiptEnabled()) {
+    const provider = loadReceiptProvider(booking.provider_id);
+    icsLine = oa1Text(acceptedSuggestion ? "confirmed.newTimeIcsLine" : "confirmed.icsLine", "nb");
+    icsAttachment = {
+      filename: `gardssalg-${booking.booking_ref}.ics`,
+      content: buildConfirmedIcs(
+        booking,
+        { producerName: provider.navn, sted: provider.sted, statusUrl: guestStatusUrl(booking) },
+        "nb",
+      ),
+      contentType: CONFIRMED_ICS_CONTENT_TYPE,
+    };
+  }
   await emailService.sendEmail({
     to: booking.guest_email,
     isTestSend: booking.is_test === 1,
@@ -1098,16 +1154,17 @@ export async function sendPrevisitConfirmedToGuest(
   <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Bookingref:</td><td>${booking.booking_ref}</td></tr>
   <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Dato/tid:</td><td>${slotFormatted}</td></tr>
   <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Antall:</td><td>${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</td></tr>
-</table>
+</table>${icsLine ? `\n<p>${escEmailHtml(icsLine)}</p>` : ""}
 <p>Velkommen! Produsenten registrerer oppmøtet etter besøket.</p>
 ${statusFooterHtml(booking)}
 <p>Hilsen<br>Opplevagent</p>`.trim(),
-    textContent: `Hei ${booking.guest_name},\n\n${acceptedSuggestion ? "Du har akseptert det nye tidspunktet — reservasjonen er nå bekreftet." : "Produsenten har bekreftet reservasjonen din."}\nBookingref: ${booking.booking_ref}\nDato/tid: ${slotFormatted}\nAntall: ${booking.party_size}${guestStatusUrl(booking) ? `\nStatus: ${guestStatusUrl(booking)}` : ""}\n\nHilsen\nOpplevagent`,
+    textContent: `Hei ${booking.guest_name},\n\n${acceptedSuggestion ? "Du har akseptert det nye tidspunktet — reservasjonen er nå bekreftet." : "Produsenten har bekreftet reservasjonen din."}\nBookingref: ${booking.booking_ref}\nDato/tid: ${slotFormatted}\nAntall: ${booking.party_size}${icsLine ? `\n\n${icsLine}` : ""}${guestStatusUrl(booking) ? `\nStatus: ${guestStatusUrl(booking)}` : ""}\n\nHilsen\nOpplevagent`,
     replyTo: "kontakt@opplevagent.no",
     // Steg 3 / funn 2: this mail carries Opplevagent content, so it must READ
     // as Opplevagent in the inbox list. The address stays rettfrabonden.com —
     // Resend verifies one domain — so the display name is what carries it.
     from: crmFromHeader("experiences"),
+    ...(icsAttachment ? { attachments: [icsAttachment] } : {}),
   });
 }
 
