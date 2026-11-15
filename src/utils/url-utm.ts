@@ -111,6 +111,32 @@ export function aiSourceFromClient(clientIdentity?: string): string {
   return AI_CLIENT_TO_UTM_SOURCE[clientIdentity] ?? "ai_assistant";
 }
 
+// ─── source_client: which AI assistant a booking/order came from ───
+// dev-request 2026-11-12-f1-felles-for-ai-kanalene, slice F1-1 (gårdssalg
+// bookings; RFB slice C1-B2 is meant to reuse the same functions). The stored
+// value is one of the fixed slugs above, never a raw client name or
+// User-Agent, so the label names an assistant and never a person.
+// Unknown/unidentified client → null (stored as NULL), not "ai_assistant".
+
+/** Every value a `source_client` column may hold (besides NULL). */
+export const SOURCE_CLIENT_LABELS: readonly string[] = Object.freeze(
+  [...new Set(Object.values(AI_CLIENT_TO_UTM_SOURCE))],
+);
+
+/** True when `v` is one of SOURCE_CLIENT_LABELS. */
+export function isSourceClientLabel(v: unknown): v is string {
+  return typeof v === "string" && SOURCE_CLIENT_LABELS.includes(v);
+}
+
+/**
+ * The `source_client` label for a detected client identity (a return value of
+ * detectAiClient / aiClientFromHeaders), or null when unknown or unset.
+ */
+export function sourceClientLabel(clientIdentity?: string | null): string | null {
+  if (!clientIdentity || !Object.prototype.hasOwnProperty.call(AI_CLIENT_TO_UTM_SOURCE, clientIdentity)) return null;
+  return AI_CLIENT_TO_UTM_SOURCE[clientIdentity];
+}
+
 /** The transport a link travelled through to the AI client (utm_medium). */
 export type AiUtmMedium = "mcp" | "a2a" | "api";
 

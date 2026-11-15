@@ -16,6 +16,7 @@ import { getDb } from "../database/db-factory";
 import { emailService } from "./email-service";
 import { crmFromHeader } from "./crm-platform-identity";
 import { tokenLogLabel } from "../utils/log-label";
+import { isSourceClientLabel } from "../utils/url-utm";
 import {
   awaitingExpiryDueMs,
   previsitReminderDue,
@@ -181,6 +182,8 @@ export interface GardssalgBooking {
   notify_sent_at: string | null;
   notify_failed_at: string | null;
   notify_retried_at: string | null;
+  /** F1-1: AI assistant label (SOURCE_CLIENT_LABELS) or null. */
+  source_client: string | null;
 }
 
 export const BookingInputSchema = z.object({
@@ -276,6 +279,7 @@ function hydrate(row: Record<string, unknown>): GardssalgBooking {
     notify_sent_at:           (row.notify_sent_at as string | null) ?? null,
     notify_failed_at:         (row.notify_failed_at as string | null) ?? null,
     notify_retried_at:        (row.notify_retried_at as string | null) ?? null,
+    source_client:            (row.source_client as string | null) ?? null,
   };
 }
 
@@ -295,10 +299,15 @@ function hydrate(row: Record<string, unknown>): GardssalgBooking {
 // tool) parse their untrusted payload with, and zod strips unknown keys — so
 // there is no field name a public caller could smuggle to reach this. Only an
 // admin-gated call site passes it.
+//
+// `opts.sourceClient` (dev-request 2026-11-12-f1, F1-1) is the AI assistant
+// the booking came from, set by the MCP tool and by the REST route for an
+// ai_search caller. Only a value in SOURCE_CLIENT_LABELS is stored; anything
+// else (and the web form, which never passes it) is stored as NULL.
 export function createBooking(
   input: BookingInput,
   source: string = "opplevagent",
-  opts: { isTest?: boolean } = {},
+  opts: { isTest?: boolean; sourceClient?: string | null } = {},
 ): GardssalgBooking {
   const db = getDb(VERTICAL);
 
@@ -349,6 +358,7 @@ export function createBooking(
     notify_sent_at:           null,
     notify_failed_at:         null,
     notify_retried_at:        null,
+    source_client:            isSourceClientLabel(opts.sourceClient) ? opts.sourceClient : null,
   };
 
   db.prepare(`
@@ -357,13 +367,13 @@ export function createBooking(
       guest_name, guest_email, guest_phone, booking_ref, confirm_token,
       source, status, commission_rate, notes, created_at,
       pre_status, respond_token, respond_token_expires_at, guest_status_token,
-      is_test
+      is_test, source_client
     ) VALUES (
       @booking_id, @experience_id, @provider_id, @slot_at, @party_size,
       @guest_name, @guest_email, @guest_phone, @booking_ref, @confirm_token,
       @source, @status, @commission_rate, @notes, @created_at,
       @pre_status, @respond_token, @respond_token_expires_at, @guest_status_token,
-      @is_test
+      @is_test, @source_client
     )
   `).run(booking);
 

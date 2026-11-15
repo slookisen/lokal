@@ -1125,6 +1125,12 @@ export function initExperiencesSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // ─── source_client (dev-request 2026-11-12-f1-felles-for-ai-kanalene, F1-1)
+  // Which AI assistant the booking came from: one of SOURCE_CLIENT_LABELS in
+  // utils/url-utm.ts ('chatgpt', 'claude', …), NULL for the web form, plain
+  // REST and every row created before this column. Additive, nullable.
+  try { db.exec("ALTER TABLE gardssalg_bookings ADD COLUMN source_client TEXT"); } catch { /* already present */ }
+
   // ─── listing_url (dev-request 2026-07-12-experiences-enrichment-supply-
   // and-aggregator-hygiene, Daniel's 2026-07-19 decision, step 1) ───────────
   // A chunk of experience_providers.hjemmeside rows carry a DMO/aggregator/

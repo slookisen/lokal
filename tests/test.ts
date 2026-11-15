@@ -52984,6 +52984,25 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-12-f1-felles-for-ai-kanalene, slice F1-1: source_client
+// (which AI assistant) on gårdssalg bookings — MCP, REST, web form, allow-list.
+// Swaps the experiences DB, BOOKING_DISPATCH_ENABLED and the mailer — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-12-f1-felles-for-ai-kanalene F1-1: source_client på gårdssalg-bookinger ──");
+  try {
+    const { runOpplevelserGardssalgSourceClientTests } = require("../src/routes/opplevelser-gardssalg-source-client.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-source-client.test");
+    const r = await runOpplevelserGardssalgSourceClientTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("opplevelser-gardssalg-source-client: " + f);
+    console.log(`  opplevelser-gardssalg-source-client: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-gardssalg-source-client: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post AC6 (option A):
 // POST /admin/test-claim-fixture — ONE hidden, unclaimed claim-test profile;
 // GET /agents/:id/info is its only public exception; the claim flow end to end

@@ -16730,6 +16730,7 @@ router.post("/admin/gardssalg-mojibake-backfill", requireAdmin, async (req: Requ
 
 import { getDb as getRfbDb } from "../database/init";
 import { storedClientClass } from "../services/traffic-classifier";
+import { restSourceClient } from "../middleware/ai-profile-links";
 import { getDb as getExpDb } from "../database/db-factory";
 import { buildCrossPlatformIdentity, type CrossPlatformMatch } from "../services/cross-platform-match";
 import { getRfbSendIndexForOpplevagent } from "../services/outreach-suppression-signals";
@@ -34158,7 +34159,9 @@ router.post("/book", async (req: Request, res: Response) => {
 
   let booking;
   try {
-    booking = createBooking(parsed.data);
+    // F1-1: an AI caller (ai_search UA) gets its fixed source_client label;
+    // the web form and plain REST get NULL.
+    booking = createBooking(parsed.data, undefined, { sourceClient: restSourceClient(req.headers) });
   } catch (err) {
     console.error("[booking] createBooking failed", err);
     res.status(500).json({ error: "Kunne ikke opprette påmelding" });
