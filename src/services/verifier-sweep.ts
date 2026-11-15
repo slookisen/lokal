@@ -29,7 +29,14 @@
 //   pickPendingVerifyBatch always selects the oldest un-processed pending_verify
 //   agents first. The sweep is therefore restartable without double-processing.
 
-import { runVerifierBatch, pickPendingVerifyBatch, countPendingVerify, resolveBrregLookup } from "../agents/lokal-agent-verifier";
+import {
+  runVerifierBatch,
+  pickPendingVerifyBatch,
+  countPendingVerify,
+  resolveBrregLookup,
+  countOutreachPoolAdded,
+  OUTREACH_POOL_ADDED_DETAIL,
+} from "../agents/lokal-agent-verifier";
 import type { VerifierResult, BrregFn } from "../agents/lokal-agent-verifier";
 import { getDb } from "../database/init";
 import { recordRun } from "./run-ledger";
@@ -56,6 +63,11 @@ export interface SweepJobState {
    * re-process already-verified rows, so `verified` is not always growth.
    */
   newly_verified: number;
+  /**
+   * Agents that entered outreach_ready_pool this sweep — the same rule
+   * (countOutreachPoolAdded) as the hourly run's `outreach_pool_added` claim.
+   */
+  outreach_pool_added: number;
   review_required: number;
   data_insufficient: number;
   /** Agents that remain pending_verify after processing (re-verified but still pending) */
@@ -92,6 +104,7 @@ let _sweepJob: SweepJobState = {
   processed: 0,
   verified: 0,
   newly_verified: 0,
+  outreach_pool_added: 0,
   review_required: 0,
   data_insufficient: 0,
   still_pending: 0,
@@ -123,16 +136,29 @@ let _sweepJob: SweepJobState = {
  * already-verified rows) and the `verifier_slots_verified_fill` /
  * `verifier_slots_verified_recheck` custom claims, always 0 here: the sweep
  * picks via pickPendingVerifyBatch/pickByIds, never pickBatchBiased slots.
+ *
+ * dev-request 2026-11-15-verifier-timelane-ny-verifisering-gap: the sweep does
+ * most of the new verifications, so it also posts `outreach_pool_added`, with
+ * the hourly run's rule and detail string. Always emitted (0 when none), as
+ * the hourly run does.
  */
 export function buildSweepRunEnvelopeClaims(
-  job: Pick<SweepJobState, "verified" | "newly_verified" | "review_required" | "data_insufficient" | "processed">,
-): Array<{ type: "db_state_change" | "custom"; value: number; meta: { kind: string } }> {
+  job: Pick<
+    SweepJobState,
+    "verified" | "newly_verified" | "outreach_pool_added" | "review_required" | "data_insufficient" | "processed"
+  >,
+): Array<{ type: "db_state_change" | "custom"; value: number; meta: { kind: string; detail?: string } }> {
   return [
     { type: "db_state_change", value: job.verified, meta: { kind: "agents_verified" } },
     { type: "db_state_change", value: job.newly_verified, meta: { kind: "agents_newly_verified" } },
     { type: "db_state_change", value: job.review_required, meta: { kind: "bulk_sweep_review_required" } },
     { type: "db_state_change", value: job.data_insufficient, meta: { kind: "bulk_sweep_data_insufficient" } },
     { type: "db_state_change", value: job.processed, meta: { kind: "bulk_sweep_processed" } },
+    {
+      type: "db_state_change",
+      value: job.outreach_pool_added,
+      meta: { kind: "outreach_pool_added", detail: OUTREACH_POOL_ADDED_DETAIL },
+    },
     { type: "custom", value: 0, meta: { kind: "verifier_slots_verified_fill" } },
     { type: "custom", value: 0, meta: { kind: "verifier_slots_verified_recheck" } },
   ];
@@ -255,6 +281,7 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
     processed: 0,
     verified: 0,
     newly_verified: 0,
+    outreach_pool_added: 0,
     review_required: 0,
     data_insufficient: 0,
     still_pending: 0,
@@ -360,6 +387,7 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
         _sweepJob.newly_verified += results.filter(
           (r) => r.new_verification_status === "verified" && r.prior_verification_status !== "verified",
         ).length;
+        _sweepJob.outreach_pool_added += countOutreachPoolAdded(results);
         _sweepJob.review_required += results.filter((r) => r.new_verification_status === "review_required").length;
         _sweepJob.data_insufficient += results.filter((r) => r.new_verification_status === "data_insufficient").length;
         // orch-pr-20260614-4: flag-level counters (single source of truth in VerifierResult.flags).
