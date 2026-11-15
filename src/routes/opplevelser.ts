@@ -958,6 +958,8 @@ import {
   sendProducerNotification,
   // booking-flyt-v1 slice 2: pre-visit reminder + auto-expiry engine
   processBookingFollowups,
+  // O1-1: read-only dry-run of the same engine
+  countBookingFollowupsDue,
   // slice 1 ("myk åpningstidsvalidering"): the slot-bounds/opening-hours
   // check must judge the SAME canonical UTC instant createBooking() ends up
   // storing — a naked datetime-local slot_at is Oslo wall time, not server-
@@ -980,6 +982,8 @@ import {
   gardssalgBookingPausedByOwner,
   GARDSSALG_NOT_TAKING_REQUESTS_TEXT,
 } from "../services/gardssalg-booking-gate";
+// O1-1 (R11): the producer-notification status echoed on POST /book.
+import { producerNotifyAddressStatus } from "../services/gardssalg-booking-followup";
 // dev-request 2026-09-16-opplevagent-en-setning-booking-via-ai: name →
 // provider resolution + requested-weekday guard + the shared honest-outcome
 // payloads, applied to POST /book BEFORE the unchanged BookingInputSchema →
@@ -34031,6 +34035,10 @@ router.post("/book", async (req: Request, res: Response) => {
     provider: providerInfo,
     slot_at_local: slotLocal,
     party_size: booking.party_size,
+    // O1-1 (R11): "not_live" when the producer has no address on file — the
+    // request then reaches nobody (admin alerted, never reminded/expired).
+    // "queued" = the producer e-mail is being sent (fire-and-forget).
+    producer_notification: { status: producerNotifyAddressStatus(providerBook?.epost) },
     message: `Påmelding registrert! Bekreftelse sendes til ${booking.guest_email}.`,
   });
 });
@@ -34112,6 +34120,23 @@ router.post(
     } catch (err) {
       console.error("[booking-followups] admin run failed:", err);
       res.status(500).json({ error: "Kunne ikke kjøre booking-followups" });
+    }
+  },
+);
+
+// ─── GET /api/opplevelser/admin/booking-followups/dry-run ────────────
+// O1-1: how many rows the followup job would remind and expire right now.
+// Read-only (no claim, no send), admin-keyed. Uses the same decision function
+// as processBookingFollowups().
+router.get(
+  "/admin/booking-followups/dry-run",
+  requireAdmin,
+  (_req: Request, res: Response) => {
+    try {
+      res.json(countBookingFollowupsDue());
+    } catch (err) {
+      console.error("[booking-followups] dry-run failed:", err);
+      res.status(500).json({ error: "Kunne ikke telle booking-followups" });
     }
   },
 );
