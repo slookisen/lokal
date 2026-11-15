@@ -49,7 +49,7 @@ import { textEntries } from "../utils/text-entries";
 import { serializeJsonForScript } from "../services/safe-script-json";
 import { getConfig } from "../config/vertical-config";
 import { renderKjopsvilkarContent, KJOPSVILKAR_PATH } from "./rfb-kjopsvilkar";
-import { renderForProdusenterPage, FOR_PRODUSENTER_PATH, FOR_PRODUSENTER_CSS, isForProdusenterPageEnabled, forProdusenterSitemapPaths, forProducersNavHref, buildForProdusenterFaqLd } from "./rfb-for-produsenter";
+import { renderForProdusenterPage, FOR_PRODUSENTER_PATH, forProdusenterPageCss, isForProdusenterPageEnabled, forProdusenterSitemapPaths, forProducersNavHref, buildForProdusenterFaqLd } from "./rfb-for-produsenter";
 // A2A dev-request 2026-11-06-faq-fra-forsiden-begge-plattformer: «Spørsmål og
 // svar» on the front page + menu/footer link, behind FOR_PRODUSENTER_PAGE_ENABLED.
 import { FRONT_PAGE_FAQ_ANCHOR, FRONT_PAGE_FAQ_LABELS, RFB_FRONT_FAQ_QUESTIONS, RFB_FRONT_FAQ_CSS, pickFaqPairs, renderFrontPageFaqColumns } from "./front-page-faq";
@@ -3839,7 +3839,7 @@ router.get(FOR_PRODUSENTER_PATH, (req: Request, res: Response) => {
   const canonical = `${BASE_URL}${localizedPath(FOR_PRODUSENTER_PATH, lang)}`;
   const page = renderForProdusenterPage(lang, canonical);
   res.send(shell(page.title, page.description, page.content,
-    { canonical, jsonLd: page.jsonLd, extraCss: FOR_PRODUSENTER_CSS, lang, pathForAlternate: FOR_PRODUSENTER_PATH }));
+    { canonical, jsonLd: page.jsonLd, extraCss: forProdusenterPageCss(), lang, pathForAlternate: FOR_PRODUSENTER_PATH }));
 });
 
 router.get(KJOPSVILKAR_PATH, (req: Request, res: Response) => {

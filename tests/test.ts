@@ -50424,6 +50424,28 @@ runSerial(async () => {
   }
 });
 
+// «For produsenter» F2c-2 (A2A dev-request 2026-10-22-rfb-for-produsenter-faq-side,
+// AC5): the clickable «Mine valg» demo in #mine-valg behind
+// FOR_PRODUSENTER_DEMO_ENABLED — built from the registry (fixture sellerFaq via
+// the render's registry seam), coming_soon disabled, no write calls (markup +
+// script run on a fake DOM), flag off byte-identical, EN. Sets the page/demo
+// env flags for the route check, restored in finally — runSerial.
+runSerial(async () => {
+  console.log("\n── for produsenter F2c-2 («Mine valg»-demo) ──");
+  try {
+    const { runRfbForProdusenterDemoTests } = require("../src/routes/rfb-for-produsenter-demo.test") as
+      typeof import("../src/routes/rfb-for-produsenter-demo.test");
+    const r = await runRfbForProdusenterDemoTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-for-produsenter-demo: " + f);
+    console.log(`  rfb-for-produsenter-demo: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-for-produsenter-demo: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, track C3:
 // checkCartToken() enforces carts.expires_at (the "valid for 7 days" promise
 // is now literally true). Own in-memory DB — tail position, not load-bearing.

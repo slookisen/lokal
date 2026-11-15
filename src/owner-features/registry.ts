@@ -308,6 +308,14 @@ export interface OwnerFeatureEntry {
    * (owner-features/faq-anchor.test.ts).
    */
   faqAnchor?: ForProdusenterAnchor;
+  /**
+   * F2c-2 (same dev-request, AC5): a short explanation for sellers, shown in
+   * the «Mine valg» demo on /for-produsenter (FOR_PRODUSENTER_DEMO_ENABLED)
+   * instead of `description`. Visible text on that page needs Daniel's
+   * approval, so it is set only with approved wording; unset = the demo
+   * shows `description` (the text the owner page already shows).
+   */
+  sellerFaq?: LocalizedText;
 }
 
 export const OWNER_FEATURE_GROUPS: Array<{ key: OwnerFeatureGroup; label: LocalizedText }> = [

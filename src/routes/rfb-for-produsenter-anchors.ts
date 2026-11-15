@@ -19,6 +19,16 @@ export function isForProdusenterPageEnabled(env: NodeJS.ProcessEnv = process.env
   return v === "true" || v === "1";
 }
 
+/**
+ * FOR_PRODUSENTER_DEMO_ENABLED (slice F2c-2, AC5): the clickable «Mine valg»
+ * demo in #mine-valg. "1" or "true" (any case, trimmed) = on; anything else
+ * = off, and the page is byte-identical to the page without the demo.
+ */
+export function isForProdusenterDemoEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = (env.FOR_PRODUSENTER_DEMO_ENABLED || "").trim().toLowerCase();
+  return v === "true" || v === "1";
+}
+
 /** The anchors, in menu order. Used by «Les mer» links — never rename after publishing. */
 export const FOR_PRODUSENTER_ANCHORS = [
   "oversikt", "synlighet", "eierskap", "mine-valg", "bestillinger", "betaling",
