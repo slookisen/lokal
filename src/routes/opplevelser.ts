@@ -10708,7 +10708,7 @@ router.post("/admin/booking-test-send", requireAdmin, async (req: Request, res: 
 
   // AWAITED here (unlike the fire-and-forget public path) so the operator gets
   // the actual send outcome back in the response — that IS the test result.
-  const sends: Array<{ kind: string; ok: boolean; error?: string }> = [];
+  const sends: Array<{ kind: string; ok: boolean; error?: string; outcome?: string }> = [];
   try {
     await sendBookingConfirmation(booking);
     sends.push({ kind: "guest_confirmation", ok: true });
@@ -10716,8 +10716,9 @@ router.post("/admin/booking-test-send", requireAdmin, async (req: Request, res: 
     sends.push({ kind: "guest_confirmation", ok: false, error: e?.message ?? String(e) });
   }
   try {
-    await sendProducerNotification(booking, provider?.epost ?? null, provider?.opening_hours_text ?? null);
-    sends.push({ kind: "producer_notification", ok: true });
+    // O1-1: sendProducerNotification never throws — its outcome IS the result.
+    const outcome = await sendProducerNotification(booking, provider?.epost ?? null, provider?.opening_hours_text ?? null);
+    sends.push({ kind: "producer_notification", ok: outcome === "sent", outcome });
   } catch (e: any) {
     sends.push({ kind: "producer_notification", ok: false, error: e?.message ?? String(e) });
   }

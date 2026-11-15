@@ -21,6 +21,8 @@ import {
   previsitReminderDue,
   recordProducerNotifyOutcome,
   followupClockFloorMs,
+  isLegacyPreFloorRow,
+  stampMs,
   type ProducerNotifyOutcome,
 } from "./gardssalg-booking-followup";
 
@@ -1371,8 +1373,19 @@ export async function processBookingFollowups(
   for (const raw of failedNotify) {
     const booking = hydrate(raw);
     try {
+      // A request whose visit time has already passed is not re-sent (and not
+      // claimed): asking the producer to answer it would be pointless.
+      const slotMs = stampMs(booking.slot_at);
+      if (Number.isFinite(slotMs) && slotMs <= now.getTime()) continue;
+      // The claim re-checks the state the SELECT saw: a row answered,
+      // cancelled or delivered in between is left alone.
       const claim = db
-        .prepare("UPDATE gardssalg_bookings SET notify_retried_at = ? WHERE booking_id = ? AND notify_retried_at IS NULL")
+        .prepare(`
+          UPDATE gardssalg_bookings SET notify_retried_at = ?
+          WHERE booking_id = ? AND notify_retried_at IS NULL
+            AND status = 'reserved' AND pre_status = 'awaiting_provider'
+            AND notify_sent_at IS NULL AND notify_failed_at IS NOT NULL
+        `)
         .run(now.toISOString(), booking.booking_id);
       if (claim.changes !== 1) continue;
       const provider = getProviderDispatchRow(booking.provider_id);
@@ -1507,7 +1520,8 @@ export async function processBookingFollowups(
 // awaiting_provider: reminder previsitReminderHours() and expiry
 // previsitExpireHours() after the REGISTERED producer notification
 // (notify_sent_at, never before FOLLOWUP_CLOCK_FLOOR) — a row without one is
-// neither reminded nor expired. time_suggested: the producer HAS answered, so
+// neither reminded nor expired, except a legacy row created before the floor
+// with every notify_* column NULL, whose clock starts at the floor. time_suggested: the producer HAS answered, so
 // the guest-side deadline (previsitExpiryDueMs()) is unchanged. Shared by the
 // job and the dry-run count, so the two can never disagree.
 export function previsitFollowupDue(
@@ -1528,8 +1542,17 @@ export function previsitFollowupDue(
 export interface BookingFollowupDryRun {
   would_remind: number;
   would_expire: number;
-  /** awaiting_provider rows without a registered producer notification (never reminded/expired). */
+  /**
+   * awaiting_provider rows created at/after the clock floor without a
+   * registered producer notification (never reminded/expired). Legacy rows
+   * are NOT counted here — see legacy_counted_from_floor.
+   */
   without_registered_notification: number;
+  /**
+   * awaiting_provider rows created before the clock floor with every notify_*
+   * column NULL (predate the columns): reminded/expired counting from the floor.
+   */
+  legacy_counted_from_floor: number;
   clock_floor: string;
 }
 
@@ -1548,6 +1571,7 @@ export function countBookingFollowupsDue(now: Date = new Date()): BookingFollowu
     would_remind: 0,
     would_expire: 0,
     without_registered_notification: 0,
+    legacy_counted_from_floor: 0,
     clock_floor: new Date(followupClockFloorMs()).toISOString(),
   };
   const nowMs = now.getTime();
@@ -1556,7 +1580,10 @@ export function countBookingFollowupsDue(now: Date = new Date()): BookingFollowu
     const due = previsitFollowupDue(booking, nowMs);
     if (due.expire) out.would_expire++;
     else if (due.remind) out.would_remind++;
-    if (booking.pre_status === "awaiting_provider" && !booking.notify_sent_at) out.without_registered_notification++;
+    if (booking.pre_status === "awaiting_provider" && !booking.notify_sent_at) {
+      if (isLegacyPreFloorRow(booking)) out.legacy_counted_from_floor++;
+      else out.without_registered_notification++;
+    }
   }
   return out;
 }

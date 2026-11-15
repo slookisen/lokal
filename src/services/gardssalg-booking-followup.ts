@@ -20,6 +20,12 @@
  * reminded and never expired by the job: «the producer did not answer» would
  * be a false statement about a producer who never got the request.
  *
+ * Legacy rows: rows created BEFORE the floor predate the notify_* columns, so
+ * all three are NULL even though their producer was e-mailed (with the
+ * promise of automatic expiry). Such a row — created before the floor, every
+ * notify_* column NULL — starts its clock AT the floor (followupRowClockStartMs()).
+ * Rows created at/after the floor keep "no registered notification ⇒ never".
+ *
  * This module has no import of booking-store (booking-store imports it).
  */
 
@@ -59,6 +65,26 @@ export interface FollowupRow {
   respond_token_expires_at: string | null;
   reminder_sent_at: string | null;
   notify_sent_at: string | null;
+  // Legacy detection (isLegacyPreFloorRow()). Absent = not a legacy row.
+  created_at?: string | null;
+  notify_failed_at?: string | null;
+  notify_retried_at?: string | null;
+}
+
+/**
+ * A row created before the floor with every notify_* column NULL: it predates
+ * the registration columns, so "NULL" there means "not recorded", not "not sent".
+ */
+export function isLegacyPreFloorRow(row: FollowupRow, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (row.notify_sent_at || row.notify_failed_at || row.notify_retried_at) return false;
+  const created = stampMs(row.created_at);
+  return Number.isFinite(created) && created < followupClockFloorMs(env);
+}
+
+/** Clock start for a row: the floor for a legacy pre-floor row, else followupClockStartMs(notify_sent_at). */
+export function followupRowClockStartMs(row: FollowupRow, env: NodeJS.ProcessEnv = process.env): number {
+  if (isLegacyPreFloorRow(row, env)) return followupClockFloorMs(env);
+  return followupClockStartMs(row.notify_sent_at, env);
 }
 
 /** The one reminder: awaiting an answer, not yet reminded, reminderHours after the clock start. */
@@ -70,7 +96,7 @@ export function previsitReminderDue(
 ): boolean {
   if (!row.respond_token || row.status !== "reserved") return false;
   if (row.pre_status !== "awaiting_provider" || row.reminder_sent_at) return false;
-  const start = followupClockStartMs(row.notify_sent_at, env);
+  const start = followupRowClockStartMs(row, env);
   return Number.isFinite(start) && nowMs - start >= reminderHours * 3600_000;
 }
 
@@ -84,7 +110,7 @@ export function awaitingExpiryDueMs(
   expireHours: number,
   env: NodeJS.ProcessEnv = process.env,
 ): number {
-  const start = followupClockStartMs(row.notify_sent_at, env);
+  const start = followupRowClockStartMs(row, env);
   if (!Number.isFinite(start)) return NaN;
   const byClock = start + expireHours * 3600_000;
   const token = stampMs(row.respond_token_expires_at);

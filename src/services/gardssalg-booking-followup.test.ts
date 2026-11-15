@@ -9,8 +9,12 @@
  *   (n) AK2: a row with no registered producer notification is never
  *       reminded and never expired, even years overdue; a registered row is
  *       reminded at +24 h and expired at +60 h from notify_sent_at.
+ *   (g) B1: a legacy row (created before the floor, every notify_* NULL) is
+ *       reminded/expired counting from the floor, never before it.
  *   (r) a failed producer e-mail is stamped, alerts the admin, and is re-sent
  *       exactly once by the job; a failed re-send alerts again and stops.
+ *   (k) the retry claim: taken elsewhere -> no send; state changed -> no
+ *       claim; gate off -> claim released and retried later; past slot -> skipped.
  *   (l) a producer without an address: "not_live" (send outcome and the
  *       POST /book response), admin alerted, the row never followed up.
  *   (a) AK3: GET /admin/booking-followups/dry-run — 403 without the admin
@@ -163,6 +167,15 @@ export function runGardssalgBookingFollowupTests(opts: { log?: boolean } = {}): 
       assertEq(fu.awaitingExpiryDueMs(baseRow, 60), NaN, "c5: unregistered row never due for expiry");
       const oldRow = { ...baseRow, notify_sent_at: "2026-09-01T00:00:00Z", respond_token_expires_at: "2026-09-03T12:00:00Z" };
       assertEq(fu.awaitingExpiryDueMs(oldRow, 60), floorMs + 60 * H, "c6: an old row expires 60 h after the floor, not in a back-dated batch");
+      // B1: a legacy row (created before the floor, every notify_* NULL) starts at the floor.
+      const legacyRow = { ...baseRow, created_at: "2026-10-20T08:00:00.000Z", respond_token_expires_at: "2026-10-22T20:00:00.000Z" };
+      assertEq(fu.isLegacyPreFloorRow(legacyRow), true, "c9: pre-floor row with all notify_* NULL is legacy");
+      assertEq(fu.awaitingExpiryDueMs(legacyRow, 60), floorMs + 60 * H, "c10: a legacy row expires 60 h after the floor");
+      assertEq(fu.previsitReminderDue(legacyRow, floorMs + 23 * H, 24), false, "c11: legacy row not reminded before floor + 24 h");
+      assertEq(fu.previsitReminderDue(legacyRow, floorMs + 24 * H, 24), true, "c12: legacy row reminded at floor + 24 h");
+      assertEq(fu.isLegacyPreFloorRow({ ...legacyRow, notify_failed_at: "2026-10-20T08:00:01.000Z" }), false, "c13: a recorded failure is not legacy");
+      assertEq(fu.isLegacyPreFloorRow({ ...legacyRow, created_at: fu.FOLLOWUP_CLOCK_FLOOR }), false, "c14: a row created at the floor is not legacy");
+      assertEq(fu.awaitingExpiryDueMs({ ...legacyRow, created_at: "2026-11-17T08:00:00.000Z" }, 60), NaN, "c15: post-floor unregistered row still never expires");
       assertEq(fu.producerNotifyAddressStatus(" "), "not_live", "c7: blank address -> not_live");
       assertEq(fu.producerNotifyAddressStatus("post@gard.no"), "queued", "c8: an address -> queued");
 
@@ -231,6 +244,33 @@ export function runGardssalgBookingFollowupTests(opts: { log?: boolean } = {}): 
       assertEq(row(reg.booking_ref)?.pre_status, "expired", "n13: pre_status -> expired");
       assertEq(row(unreg.booking_ref)?.pre_status, "awaiting_provider", "n14: the unregistered row is still untouched");
 
+      // ── (g) B1: legacy row (pre-floor, notify_* all NULL) counts from the floor ──
+      // The floor is pinned at 2020-01-01 here; the row is back-dated to before it,
+      // WITHOUT notify_sent_at, with the respond deadline it got at creation.
+      const pinnedFloorMs = Date.parse("2020-01-01T00:00:00Z");
+      const legacy = mk("fu-live", "legacy@example.no");
+      expDb.prepare("UPDATE gardssalg_bookings SET created_at = ?, respond_token_expires_at = ? WHERE booking_id = ?")
+        .run("2019-12-01T10:00:00.000Z", "2019-12-03T22:00:00.000Z", legacy.booking_id);
+      assertEq(row(legacy.booking_ref)?.notify_sent_at, null, "g1: the legacy row has no notify_sent_at");
+      const dryG = bookingStore.countBookingFollowupsDue(new Date(pinnedFloorMs + 23 * H));
+      assertEq(dryG.legacy_counted_from_floor, 1, "g2: dry-run counts the legacy row separately");
+      assertEq(dryG.without_registered_notification, 1, "g3: without_registered_notification counts only the post-floor row");
+      assertEq([dryG.would_remind, dryG.would_expire], [0, 0], "g4: dry-run at floor + 23 h: nothing due yet");
+      sends.length = 0;
+      r = await bookingStore.processBookingFollowups(new Date(pinnedFloorMs + 23 * H));
+      assertEq([r.reminders_sent, r.expired], [0, 0], "g5: not reminded at floor + 23 h although created_at + 24 h passed long ago");
+      assertEq(bookingStore.countBookingFollowupsDue(new Date(pinnedFloorMs + 25 * H)).would_remind, 1, "g6: dry-run at floor + 25 h: one reminder");
+      r = await bookingStore.processBookingFollowups(new Date(pinnedFloorMs + 25 * H));
+      assertEq(r.reminders_sent, 1, "g7: reminded 24 h after the floor");
+      assertTrue(!!row(legacy.booking_ref)?.reminder_sent_at, "g8: reminder_sent_at stamped");
+      r = await bookingStore.processBookingFollowups(new Date(pinnedFloorMs + 59 * H));
+      assertEq(r.expired, 0, "g9: not expired at floor + 59 h (the stale creation deadline is ignored)");
+      assertEq(bookingStore.countBookingFollowupsDue(new Date(pinnedFloorMs + 61 * H)).would_expire, 1, "g10: dry-run at floor + 61 h: one expiry");
+      r = await bookingStore.processBookingFollowups(new Date(pinnedFloorMs + 61 * H));
+      assertEq(r.expired, 1, "g11: expired 60 h after the floor");
+      assertEq(row(legacy.booking_ref)?.pre_status, "expired", "g12: legacy row -> expired");
+      assertEq(row(unreg.booking_ref)?.pre_status, "awaiting_provider", "g13: the post-floor unregistered row is still untouched");
+
       // ── (r) failed producer e-mail: alert + exactly one retry ──────────
       alerts.length = 0;
       const fail1 = mk("fu-live", "feil@example.no");
@@ -274,6 +314,73 @@ export function runGardssalgBookingFollowupTests(opts: { log?: boolean } = {}): 
       assertEq(await bookingStore.sendProducerNotification(fail3, "post@sideri.no"), "failed", "r16: a thrown send -> failed (never rethrown)");
       emailSvc.sendEmail = okSend;
       assertTrue(!!row(fail3.booking_ref)?.notify_failed_at && alerts.length === 1, "r17: stamped and alerted");
+
+      // ── (k) N1/N2: retry claim lock, gate release, state re-check, past slot ──
+      const tickAt = () => new Date(Date.now() + 2 * H);
+      r = await bookingStore.processBookingFollowups(tickAt()); // drain fail3's retry
+      assertEq(r.producer_notify_retried, 1, "k0: fail3 retried (drain)");
+      const producerSends = () => sends.filter((s) => s.to === "post@sideri.no" && /Ny reservasjon/.test(s.subject)).length;
+      const failFirst = async (email: string) => {
+        const b = mk("fu-live", email);
+        failNext = 1;
+        await bookingStore.sendProducerNotification(b, "post@sideri.no");
+        return b;
+      };
+      // Run one tick with a hook that mutates the row between the retry SELECT and the claim.
+      const withHook = async (mutate: () => void) => {
+        const origPrepare = expDb.prepare;
+        (expDb as any).prepare = function (sql: string) {
+          const st = origPrepare.call(expDb, sql);
+          if (/^\s*SELECT[\s\S]*notify_failed_at IS NOT NULL AND notify_retried_at IS NULL/.test(sql)) {
+            return { all: (...a: unknown[]) => { const rows = (st as any).all(...a); mutate(); return rows; } };
+          }
+          return st;
+        };
+        try { return await bookingStore.processBookingFollowups(tickAt()); }
+        finally { (expDb as any).prepare = origPrepare; }
+      };
+
+      // k1-k3: claim already taken by another worker -> no send.
+      const taken = await failFirst("tatt@example.no");
+      sends.length = 0;
+      r = await withHook(() => {
+        expDb.prepare("UPDATE gardssalg_bookings SET notify_retried_at = ? WHERE booking_id = ?")
+          .run("2000-01-01T00:00:00.000Z", taken.booking_id);
+      });
+      assertEq(r.producer_notify_retried, 0, "k1: claim taken elsewhere -> not counted as retried");
+      assertEq(producerSends(), 0, "k2: claim taken elsewhere -> no producer send");
+      assertEq(row(taken.booking_ref)?.notify_retried_at, "2000-01-01T00:00:00.000Z", "k3: the other worker's claim is left as it was");
+
+      // k4-k5 (N2): state changed between SELECT and claim -> the claim refuses.
+      const answered = await failFirst("besvart@example.no");
+      sends.length = 0;
+      r = await withHook(() => {
+        expDb.prepare("UPDATE gardssalg_bookings SET pre_status = 'confirmed' WHERE booking_id = ?").run(answered.booking_id);
+      });
+      assertEq([r.producer_notify_retried, producerSends()], [0, 0], "k4: a row answered meanwhile is not re-sent");
+      assertEq(row(answered.booking_ref)?.notify_retried_at, null, "k5: and not claimed");
+
+      // k6-k9: dispatch gate off -> claim released; retried on the next tick with the gate on.
+      const gated = await failFirst("port@example.no");
+      sends.length = 0;
+      expDb.prepare("UPDATE experience_providers SET booking_live = 0 WHERE id = 'fu-live'").run();
+      r = await bookingStore.processBookingFollowups(tickAt());
+      assertEq([r.producer_notify_retried, producerSends()], [0, 0], "k6: gate off -> no retry send");
+      assertEq(row(gated.booking_ref)?.notify_retried_at, null, "k7: gate off -> claim released");
+      expDb.prepare("UPDATE experience_providers SET booking_live = 1 WHERE id = 'fu-live'").run();
+      r = await bookingStore.processBookingFollowups(tickAt());
+      assertEq([r.producer_notify_retried, producerSends()], [1, 1], "k8: gate on -> retried on the next tick");
+      assertTrue(!!row(gated.booking_ref)?.notify_sent_at, "k9: and registered");
+
+      // k10-k12 (N2): visit time already passed -> not re-sent, not claimed.
+      const past = await failFirst("passert@example.no");
+      expDb.prepare("UPDATE gardssalg_bookings SET slot_at = ? WHERE booking_id = ?")
+        .run(new Date(Date.now() - H).toISOString(), past.booking_id);
+      sends.length = 0;
+      r = await bookingStore.processBookingFollowups(tickAt());
+      assertEq(r.producer_notify_retried, 0, "k10: past slot -> no retry");
+      assertEq(producerSends(), 0, "k11: past slot -> no producer send");
+      assertEq(row(past.booking_ref)?.notify_retried_at, null, "k12: past slot -> not claimed");
 
       // ── (l) producer without an address ─────────────────────────────────
       alerts.length = 0;
