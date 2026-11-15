@@ -52901,6 +52901,27 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-12-f1-felles-for-ai-kanalene, slice F1-5: the hidden,
+// bookable gårdssalg test producer — reviewer-state dry-run/apply (AK3), a
+// walk over every public surface (AK1) and book_gardssalg by id (AK2).
+// Swaps the experiences DB, env (ADMIN_KEY, BOOKING_DISPATCH_ENABLED) and the
+// mailer — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-12-f1-felles-for-ai-kanalene F1-5: skjult, bookbar testprodusent ──");
+  try {
+    const { runOpplevelserTestProducerHiddenBookableTests } = require("../src/routes/opplevelser-test-producer-hidden-bookable.test") as
+      typeof import("../src/routes/opplevelser-test-producer-hidden-bookable.test");
+    const r = await runOpplevelserTestProducerHiddenBookableTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("opplevelser-test-producer-hidden-bookable: " + f);
+    console.log(`  opplevelser-test-producer-hidden-bookable: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-test-producer-hidden-bookable: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post AC6 (option A):
 // POST /admin/test-claim-fixture — ONE hidden, unclaimed claim-test profile;
 // GET /agents/:id/info is its only public exception; the claim flow end to end
