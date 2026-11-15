@@ -17948,6 +17948,12 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
   }
 });
 
+// F1-5 (dev-request 2026-11-12-f1-felles-for-ai-kanalene): GET (dry-run) /
+// POST (apply only when explicit) /admin/gardssalg/test-provider/reviewer-state
+// — see routes/opplevelser-test-producer-reviewer.ts. Before "/:id".
+import testProducerReviewerRouter from "./opplevelser-test-producer-reviewer";
+router.use(testProducerReviewerRouter);
+
 // ─── POST /api/opplevelser/admin/rfb-knowledge-enrich ────────────────────────
 //
 // Fills the sparse rfb-seeded gårdssalg providers from their rich RFB producer
