@@ -22,6 +22,7 @@
 
 import { isSubjectAllowedForOwnerFeatures } from "./allowlist";
 import { gardssalgFeatureOn } from "./resolve";
+import { ownerFlagMode, type OwnerFlagMode } from "./owner-flag-mode";
 
 export const OA_OWNER_FEATURES_ENABLED_ENV = "OA_OWNER_FEATURES_ENABLED";
 
@@ -50,4 +51,33 @@ export function gardssalgOwnerBookingPaused(providerId: string | null | undefine
     console.error(`[owner-features] booking.pause lookup failed for gardssalg ${providerId}:`, e);
     return true;
   }
+}
+
+// ─── The gårdssalg owner dashboard flag (O2-1) ──────────────────────────────
+// dev-request 2026-11-12-opplevagent-o2-eierdashbord-for-besok, slice O2-1.
+// GARDSSALG_OWNER_DASHBOARD_ENABLED reads the same three modes as the RFB
+// owner flags (owner-flag-mode.ts ownerFlagMode):
+//   "1" / "true" → all    every producer the rest of the gate lets through
+//   "pilot"      → pilot  only `gardssalg:<provider id>` on
+//                         OWNER_FEATURES_ALLOWED_SUBJECTS
+//   anything else → off   (default) — no dashboard, the owner pages exactly
+//                         as before.
+// This is the flag part only. The dashboard additionally stays limited to the
+// test producer in code until slice O2-5, and needs a verified owner session
+// (routes/gardssalg-owner-features.ts gardssalgOwnerDashboardActiveFor).
+
+export const GARDSSALG_OWNER_DASHBOARD_ENABLED_ENV = "GARDSSALG_OWNER_DASHBOARD_ENABLED";
+
+/** PURE: the mode of GARDSSALG_OWNER_DASHBOARD_ENABLED. */
+export function gardssalgOwnerDashboardMode(env: NodeJS.ProcessEnv = process.env): OwnerFlagMode {
+  return ownerFlagMode(GARDSSALG_OWNER_DASHBOARD_ENABLED_ENV, env);
+}
+
+/** PURE: the flag lets this producer in (all → yes; pilot → allowlisted; off → no). */
+export function gardssalgOwnerDashboardFlagOnFor(providerId: string | null | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (!providerId) return false;
+  const mode = gardssalgOwnerDashboardMode(env);
+  if (mode === "all") return true;
+  if (mode === "pilot") return isSubjectAllowedForOwnerFeatures("gardssalg", providerId, env);
+  return false;
 }

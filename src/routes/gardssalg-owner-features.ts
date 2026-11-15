@@ -17,7 +17,9 @@ import { getDb as getVerticalDb } from "../database/db-factory";
 import { getGardssalgOwnerStats } from "../services/gardssalg-owner-stats-service";
 import { previsitReminderHours, previsitExpireHours, BookingInputSchema } from "../services/booking-store";
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
-import { oaOwnerFeaturesEnabled } from "../owner-features/gardssalg";
+import { gardssalgOwnerDashboardFlagOnFor, gardssalgOwnerDashboardMode, oaOwnerFeaturesEnabled } from "../owner-features/gardssalg";
+import { renderGardssalgMineBesokEmpty, type MineBesokEmptyState } from "../owner-features/gardssalg-mine-besok";
+import { renderGardssalgStatsEmpty, wrapGardssalgDashboard } from "../owner-ui/gardssalg-dashboard";
 import {
   GARDSSALG_OWNER_FEATURE_GROUPS,
   GARDSSALG_OWNER_FEATURE_REGISTRY,
@@ -134,6 +136,59 @@ function isTestProvider(providerId: string): boolean {
 /** The tab is open for this producer: flag on, allowlisted, the test producer (O1a). */
 export function gardssalgOwnerFeaturesTabOpen(providerId: string, env: NodeJS.ProcessEnv = process.env): boolean {
   return oaOwnerFeaturesEnabled(env) && isSubjectAllowedForOwnerFeatures(VERTICAL, providerId, env) && isTestProvider(providerId);
+}
+
+// ── O2-1: the gårdssalg owner dashboard shell ─────────────────────────────
+// dev-request 2026-11-12-opplevagent-o2-eierdashbord-for-besok, slice O2-1.
+// GARDSSALG_OWNER_DASHBOARD_ENABLED (off | pilot | 1, owner-features/
+// gardssalg.ts) AND — until slice O2-5 — the test producer only, AND a
+// verified owner session for this producer with a live claim. Then:
+//   - the portal (Oversikt) and «Mine valg» are shown inside the shell
+//     (owner-ui/gardssalg-dashboard.ts) with the four tabs;
+//   - GET …/besok («Mine besøk») and GET …/statistikk («Statistikk») answer
+//     with a neutral empty state (O2-2 and O2-4 fill them).
+// Otherwise the portal and «Mine valg» are byte-identical to before and the
+// two new URLs answer 404. Every dashboard response is `no-store`; the GETs
+// read only.
+
+/** The dashboard's flag gate for this producer: the flag mode, the allowlist (pilot) and the test-producer lock (until O2-5). */
+export function gardssalgOwnerDashboardActiveFor(providerId: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  try {
+    return gardssalgOwnerDashboardFlagOnFor(providerId, env) && isTestProvider(providerId);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The shell is on for this request: the flag gate above AND the session is
+ * this producer's AND the claim is live. Never throws (any failure = no
+ * shell, the page as before).
+ */
+export function gardssalgOwnerDashboardOnForSession(
+  providerId: string,
+  session: { valid: boolean; providerId?: string },
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  try {
+    return session.valid && session.providerId === providerId
+      && gardssalgOwnerDashboardActiveFor(providerId, env) && isGardssalgProviderClaimed(providerId);
+  } catch {
+    return false;
+  }
+}
+
+/** «Mine besøk» empty-state choice: the booking switch and whether any request exists (read only). */
+function mineBesokEmptyState(provider: ClaimProviderRow): MineBesokEmptyState {
+  if (Number(provider.booking_live) !== 1) return "off";
+  try {
+    const row = getVerticalDb("experiences")
+      .prepare(`SELECT COUNT(*) AS n FROM gardssalg_bookings WHERE provider_id = ?`)
+      .get(provider.id) as { n: number } | undefined;
+    return Number(row?.n) === 0 ? "none" : "pending";
+  } catch {
+    return "pending";
+  }
 }
 
 function sessionEmail(token: string | undefined): string | null {
@@ -362,6 +417,62 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
     };
   }
 
+  // ── O2-1: «Mine besøk» and «Statistikk» in the dashboard shell ─────────
+  // Order of checks (nothing is read before they pass): flag off → 404;
+  // the producer row → 404; allowlist (pilot) and the test producer → 404;
+  // no session → 401; another producer's session or no live claim → 403.
+  type DashboardGate =
+    | { ok: true; provider: ClaimProviderRow; slug: string }
+    | { ok: false; send: (res: Response) => Response };
+
+  function dashboardGate(req: Request): DashboardGate {
+    if (gardssalgOwnerDashboardMode() === "off") return { ok: false, send: notFoundPage };
+    const slug = String((req.params as any).providerSlug || "");
+    const provider = getClaimProviderBySlug(slug);
+    if (!provider || !gardssalgOwnerDashboardActiveFor(provider.id)) return { ok: false, send: notFoundPage };
+    const session = deps.sessionFromRequest(req);
+    if (!session.valid || !session.token) {
+      return {
+        ok: false,
+        send: simplePage(401, "Logg inn", `<h1>Logg inn</h1><p>Din sesjon er utløpt. <a href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}">Logg inn på nytt</a>.</p>`),
+      };
+    }
+    if (session.providerId !== provider.id || !isGardssalgProviderClaimed(provider.id)) {
+      return { ok: false, send: simplePage(403, "Ingen tilgang", `<h1>Ingen tilgang</h1><p>Du har ikke tilgang til denne produsenten.</p>`) };
+    }
+    return { ok: true, provider, slug };
+  }
+
+  router.get(
+    "/kategori/gardssalg/eier/:providerSlug/besok",
+    generalLimiter,
+    (req: Request, res: Response) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      const g = dashboardGate(req);
+      if (!g.ok) return g.send(res);
+      const body = renderGardssalgMineBesokEmpty(mineBesokEmptyState(g.provider), CLAIM_MANUAL_FALLBACK_EMAIL);
+      return res.send(shell(`Mine besøk · ${g.provider.navn}`, wrapGardssalgDashboard(g.slug, "besok", body)));
+    } catch (e) {
+      return fail("GET besok")(res, e);
+    }
+  });
+
+  router.get(
+    "/kategori/gardssalg/eier/:providerSlug/statistikk",
+    generalLimiter,
+    (req: Request, res: Response) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      const g = dashboardGate(req);
+      if (!g.ok) return g.send(res);
+      const body = renderGardssalgStatsEmpty(CLAIM_MANUAL_FALLBACK_EMAIL);
+      return res.send(shell(`Statistikk · ${g.provider.navn}`, wrapGardssalgDashboard(g.slug, "statistikk", body)));
+    } catch (e) {
+      return fail("GET statistikk")(res, e);
+    }
+  });
+
   // ── The page ──────────────────────────────────────────────────────────
   router.get(
     "/kategori/gardssalg/eier/:providerSlug/valg",
@@ -455,7 +566,9 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
         return res.send(html);
       }
       const body = renderOwnerFeaturesPageBody(model);
-      return res.send(shell(`Mine valg · ${provider.navn}`, `${body}<style>${GARDSSALG_PAGE_CSS}</style>`));
+      // O2-1: inside the dashboard shell when it is on; off = as before.
+      const pageHtml = gardssalgOwnerDashboardActiveFor(provider.id) ? wrapGardssalgDashboard(slug, "valg", body) : body;
+      return res.send(shell(`Mine valg · ${provider.navn}`, `${pageHtml}<style>${GARDSSALG_PAGE_CSS}</style>`));
     } catch (e) {
       return fail("GET valg")(res, e);
     }
