@@ -27,7 +27,9 @@
  *   scanner       (classifySession only) vulnerability scanners — fake old
  *                 Chrome versions and/or wp-admin/.env-style probe paths
  *   scraper       (classifySession only) browser-looking session whose
- *                 request VELOCITY no human produces (isVelocityScraper)
+ *                 request VELOCITY no human produces (isVelocityScraper):
+ *                 >60 distinct pages in 10 minutes, >200 /produsent pages
+ *                 in an hour, or a BURST of >=10 page views within 60 s
  */
 
 export type TrafficCategory =
@@ -374,6 +376,14 @@ export const AI_AGENT_TOKEN_ALTERNATION = AI_AGENT_REGISTRY
 // Thresholds are strict (">"), and deliberately generous to real visitors.
 export const SCRAPER_UNIQUE_PAGES_PER_10_MIN = 60;
 export const SCRAPER_PRODUSENT_PAGES_PER_HOUR = 200;
+// Burst rule (2026-11-15): short machine bursts slipped under both rules
+// above — 8 of the 30 top "human" sessions in prod made >=10 page views
+// within 60 s, the largest 47 views over 44 pages in 1 second. A person
+// clicking through pages does not reach 10 views in a minute. This one is
+// inclusive (">="): SCRAPER_BURST_VIEWS views in any SCRAPER_BURST_WINDOW_MS.
+// It counts VIEWS, not distinct pages (a reload loop is a machine too).
+export const SCRAPER_BURST_VIEWS = 10;
+export const SCRAPER_BURST_WINDOW_MS = 60_000;
 
 /** Per-session request-velocity aggregates (see getSessionVelocity in analytics-service.ts). */
 export interface SessionVelocity {
@@ -381,13 +391,34 @@ export interface SessionVelocity {
   uniquePagesIn10Min: number;
   /** Distinct /produsent/* paths the session requested within one 60-minute window. */
   produsentPagesInHour: number;
+  /**
+   * Most page views (not distinct pages) the session made within one
+   * SCRAPER_BURST_WINDOW_MS window. Optional: callers that do not compute it
+   * leave it out and the burst rule does not apply to them.
+   */
+  viewsIn60s?: number;
 }
 
 /** Pure velocity rule — usable wherever per-session aggregates exist. */
 export function isVelocityScraper(v: SessionVelocity | null | undefined): boolean {
   if (!v) return false;
   return v.uniquePagesIn10Min > SCRAPER_UNIQUE_PAGES_PER_10_MIN
-    || v.produsentPagesInHour > SCRAPER_PRODUSENT_PAGES_PER_HOUR;
+    || v.produsentPagesInHour > SCRAPER_PRODUSENT_PAGES_PER_HOUR
+    || (v.viewsIn60s ?? 0) >= SCRAPER_BURST_VIEWS;
+}
+
+/**
+ * Most entries of an ascending list of timestamps (ms) that fall within any
+ * window of `windowMs` (inclusive at both ends). Two-pointer, O(n).
+ */
+export function maxViewsInWindow(sortedTs: readonly number[], windowMs: number = SCRAPER_BURST_WINDOW_MS): number {
+  let best = 0;
+  let lo = 0;
+  for (let hi = 0; hi < sortedTs.length; hi++) {
+    while (sortedTs[hi] - sortedTs[lo] > windowMs) lo++;
+    if (hi - lo + 1 > best) best = hi - lo + 1;
+  }
+  return best;
 }
 
 // ── Client class stored at write time ───────────────────────────────────────

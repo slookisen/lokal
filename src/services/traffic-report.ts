@@ -26,7 +26,7 @@
 //              session_id), turned into 'scanner' when the visitor probed
 //              wp-admin/.env-style paths in the window, and into 'scraper'
 //              when a browser-looking visitor read pages faster than a person
-//              can (isVelocityScraper). Owner traffic (is_owner = 1) is left
+//              can (isVelocityScraper, burst rule included). Owner traffic (is_owner = 1) is left
 //              out of every number and reported on its own.
 //
 // Pure: takes the DB handle and the clock, no database/init import, so it runs
@@ -42,6 +42,8 @@ import {
   emptyAiAgents,
   isVelocityScraper,
   SCANNER_PATH_PATTERNS,
+  SCRAPER_BURST_VIEWS,
+  SCRAPER_BURST_WINDOW_MS,
   SCRAPER_PRODUSENT_PAGES_PER_HOUR,
   SCRAPER_UNIQUE_PAGES_PER_10_MIN,
   storedClientClass,
@@ -102,7 +104,12 @@ export interface SessionRow {
 }
 
 export interface TrafficReport {
-  version: 1;
+  /**
+   * Classifier version of this report. 2 = the scraper burst rule
+   * (SCRAPER_BURST_VIEWS). Reports are computed live and never stored; the
+   * stored history version is TRAFFIC_HISTORY_VERSION (traffic-history-compute.ts).
+   */
+  version: 1 | 2;
   window: { hours: number; from: string; to: string; vertical: VerticalId | "all" };
   /** Oldest stored page-view row; the report covers [max(from, oldest), to]. */
   coverage: { oldestRow: string | null; complete: boolean };
@@ -490,7 +497,8 @@ export function computeTrafficReport(
     sLast[s] = ts;
     if (keepRows) n += 1;
 
-    // Velocity: trailing 10-minute distinct pages, trailing 60-minute distinct /produsent/ pages.
+    // Velocity: trailing 10-minute distinct pages, trailing 60-minute distinct
+    // /produsent/ pages, and trailing 60-second page VIEWS (the burst rule).
     if (sClass[s] === "human" && !sScraper[s]) {
       let q = velocity.get(s);
       if (!q) { q = []; velocity.set(s, q); }
@@ -498,12 +506,14 @@ export function computeTrafficReport(
       while (q.length && q[0].ts < ts - 3600_000) q.shift();
       const recent = new Set<number>();
       const produsent = new Set<number>();
+      let viewsIn60s = 0;
       for (let i = q.length - 1; i >= 0; i--) {
         const e = q[i];
         if (e.ts >= ts - 600_000) recent.add(e.p);
+        if (e.ts >= ts - SCRAPER_BURST_WINDOW_MS) viewsIn60s += 1;
         if (produsentPath[e.p]) produsent.add(e.p);
       }
-      if (isVelocityScraper({ uniquePagesIn10Min: recent.size, produsentPagesInHour: produsent.size })) {
+      if (isVelocityScraper({ uniquePagesIn10Min: recent.size, produsentPagesInHour: produsent.size, viewsIn60s })) {
         sScraper[s] = true;
         velocity.delete(s);
       }
@@ -718,7 +728,7 @@ export function computeTrafficReport(
   }
 
   return {
-    version: 1,
+    version: 2,
     window: { hours: spanHours, from: cutoff, to: sqliteDatetime(endMs), vertical: vertical ?? "all" },
     // Raw rows are pruned in whole UTC days (retention-service.ts), so a fixed
     // range starting at midnight is complete when its first day is stored.
@@ -773,4 +783,6 @@ export function computeTrafficReport(
 export const SCRAPER_THRESHOLDS = {
   uniquePagesPer10Min: SCRAPER_UNIQUE_PAGES_PER_10_MIN,
   produsentPagesPerHour: SCRAPER_PRODUSENT_PAGES_PER_HOUR,
+  burstViews: SCRAPER_BURST_VIEWS,
+  burstWindowMs: SCRAPER_BURST_WINDOW_MS,
 };
