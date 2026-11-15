@@ -32236,6 +32236,17 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gbfu.failures) failures.push("gardssalg-booking-followup: " + f);
     console.log(`  gardssalg-booking-followup: ${gbfu.passed} passed, ${gbfu.failed} failed`);
 
+    // O1-2 (R3/R4/G13): honest receipt + calendar file only on confirmation,
+    // behind GARDSSALG_HONEST_RECEIPT_ENABLED; flag off byte-identical.
+    console.log("\n── gardssalg-honest-receipt: OA-1 texts + flag off unchanged + .ics only after confirmation ──");
+    const { runGardssalgHonestReceiptTests } = require("../src/services/gardssalg-honest-receipt.test") as
+      typeof import("../src/services/gardssalg-honest-receipt.test");
+    const ghr = await runGardssalgHonestReceiptTests({ log: false });
+    passed += ghr.passed;
+    failed += ghr.failed;
+    for (const f of ghr.failures) failures.push("gardssalg-honest-receipt: " + f);
+    console.log(`  gardssalg-honest-receipt: ${ghr.passed} passed, ${ghr.failed} failed`);
+
     // GET /admin/gardssalg-provider-lookup — read-only, case-insensitive
     // substring lookup of experience_providers by navn, returning
     // id/navn/rfb_seed_source/created_at. Closes the gap where /admin/

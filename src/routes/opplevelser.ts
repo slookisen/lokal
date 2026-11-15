@@ -943,6 +943,13 @@ import { cityToFylke } from "../services/norway-fylke";
 import { GARDSSALG_NACE_PRODUCER_TYPE } from "../services/gardssalg-nace-producer-type";
 import { resolveFylke2024 } from "../services/fylke-2024-migration";
 import { fillFylkeFromKommune, runGardssalgFylkeFromKommune } from "../services/gardssalg-fylke-from-kommune";
+// O1-2 (dev-request 2026-11-12-opplevagent-o1-trygg-aa-aapne): honest receipt
+// + calendar file only for a confirmed visit, behind GARDSSALG_HONEST_RECEIPT_ENABLED.
+import {
+  honestReceiptEnabled,
+  receiptFormMessage,
+  confirmedIcsForBooking,
+} from "../services/gardssalg-honest-receipt";
 import {
   createBooking,
   getBookingByRef,
@@ -34040,7 +34047,9 @@ router.post("/book", async (req: Request, res: Response) => {
     // request then reaches nobody (admin alerted, never reminded/expired).
     // "queued" = the producer e-mail is being sent (fire-and-forget).
     producer_notification: { status: producerNotifyAddressStatus(providerBook?.epost) },
-    message: `Påmelding registrert! Bekreftelse sendes til ${booking.guest_email}.`,
+    message: honestReceiptEnabled()
+      ? receiptFormMessage(booking.guest_email)
+      : `Påmelding registrert! Bekreftelse sendes til ${booking.guest_email}.`,
   });
 });
 
@@ -34071,6 +34080,20 @@ router.get("/book/:ref/ics", (req: Request, res: Response) => {
   const booking = getBookingByRef(req.params.ref as string);
   if (!booking) {
     res.status(404).json({ error: "Booking ikke funnet" });
+    return;
+  }
+  // O1-2 (R4): flag on -> a calendar file exists only for a visit the
+  // producer has confirmed (same 404 as an unknown ref before that), and it
+  // is the confirmed file (LOCATION, no guest data). Flag off: unchanged.
+  if (honestReceiptEnabled()) {
+    const confirmedIcs = confirmedIcsForBooking(booking);
+    if (!confirmedIcs) {
+      res.status(404).json({ error: "Booking ikke funnet" });
+      return;
+    }
+    res.setHeader("Content-Type", "text/calendar; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="gardssalg-${booking.booking_ref}.ics"`);
+    res.send(confirmedIcs);
     return;
   }
   const ics = buildIcs(booking);
