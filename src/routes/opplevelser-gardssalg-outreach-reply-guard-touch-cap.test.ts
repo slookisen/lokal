@@ -4,8 +4,10 @@
  * (src/routes/opplevelser.ts) must refuse
  *   - reason "replied": the producer has >=1 inbound CRM message on a thread
  *     with its contact (same has_replied logic as the candidates route), and
- *   - reason "max_touch_reached": >=2 real rows in experience_outreach_sent_log
- *     (status sent AND reserved both count),
+ *   - reason "max_touch_reached": >=GARDSSALG_OUTREACH_MAX_TOUCHES real rows in
+ *     experience_outreach_sent_log (status sent AND reserved both count). The cap
+ *     was 2; dev-request 2026-11-15-opplevagent-fem-henvendelser (A2) raised it to 5,
+ *     so the fixtures below carry 5 rows,
  * and computeGardssalgOutreachDailyPrep must show the same reasons in its
  * `excluded` list. A producer with exactly 1 send (outside cooldown) and no
  * reply stays a follow-up candidate.
@@ -154,8 +156,11 @@ export function runOpplevelserGardssalgOutreachReplyGuardTouchCapTests(
       const emailB = mk("prov-b-replied");
       addLog("prov-b-replied", emailB, 50, null);
       addInbound("prov-b-replied", emailB);
-      // prov-c-max: 2 sends (one sent, one reserved), both outside cooldown, no reply -> max_touch_reached.
+      // prov-c-max: 5 sends (four sent, one reserved), all outside cooldown, no reply -> max_touch_reached (cap 5, A2).
       const emailC = mk("prov-c-max");
+      addLog("prov-c-max", emailC, 120, null);
+      addLog("prov-c-max", emailC, 110, null);
+      addLog("prov-c-max", emailC, 100, null);
       addLog("prov-c-max", emailC, 90, null);
       addLog("prov-c-max", emailC, 50, "reserved");
       // prov-d-followup: exactly 1 send 50d ago, no reply -> still eligible follow-up.
@@ -164,8 +169,11 @@ export function runOpplevelserGardssalgOutreachReplyGuardTouchCapTests(
       // prov-e-replied-first: reply and no sends at all -> replied wins (never cold-mail a replier).
       const emailE = mk("prov-e-replied-first");
       addInbound("prov-e-replied-first", emailE);
-      // prov-f-reserved2: two RESERVED rows only -> max_touch_reached (reserved counts).
+      // prov-f-reserved2: five RESERVED rows only -> max_touch_reached (reserved counts; cap 5, A2).
       const emailF = mk("prov-f-reserved2");
+      addLog("prov-f-reserved2", emailF, 120, "reserved");
+      addLog("prov-f-reserved2", emailF, 110, "reserved");
+      addLog("prov-f-reserved2", emailF, 100, "reserved");
       addLog("prov-f-reserved2", emailF, 90, "reserved");
       addLog("prov-f-reserved2", emailF, 50, "reserved");
       // prov-g-cooldown: 1 send 5d ago -> own cooldown (dev-request
@@ -193,10 +201,10 @@ export function runOpplevelserGardssalgOutreachReplyGuardTouchCapTests(
 
       assertEq(view("prov-a-fresh"), [true, null], "a1: no history -> eligible");
       assertEq(view("prov-b-replied"), [false, "replied"], "b1: inbound CRM reply -> replied (even though outside cooldown)");
-      assertEq(view("prov-c-max"), [false, "max_touch_reached"], "c1: 1 sent + 1 reserved row -> max_touch_reached");
+      assertEq(view("prov-c-max"), [false, "max_touch_reached"], "c1: 4 sent + 1 reserved row (cap 5) -> max_touch_reached");
       assertEq(view("prov-d-followup"), [true, null], "d1: 1 send, no reply -> still an eligible follow-up candidate");
       assertEq(view("prov-e-replied-first"), [false, "replied"], "e1: reply without any prior send -> replied");
-      assertEq(view("prov-f-reserved2"), [false, "max_touch_reached"], "f1: two reserved rows count -> max_touch_reached");
+      assertEq(view("prov-f-reserved2"), [false, "max_touch_reached"], "f1: five reserved rows count (cap 5) -> max_touch_reached");
 
       // A test send (is_test=1) never counts toward the cap.
       expDb

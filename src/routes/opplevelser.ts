@@ -866,6 +866,7 @@ import {
   gardssalgOutreachMonthPhrase,
   GARDSSALG_OUTREACH_REPLY_TO,
   isGardssalgOutreachTemplate,
+  GARDSSALG_OUTREACH_FOLLOWUP_TEMPLATES,
 } from "../services/email-service";
 import { crmService } from "../services/crm-service";
 import { crmSenderAddress } from "../services/crm-platform-identity";
@@ -20058,8 +20059,12 @@ export function gardssalgProducerHasCrmReply(rfbDb: ReturnType<typeof getRfbDb>,
   return retained !== undefined;
 }
 
-/** Max cold touches per producer in this lane: the first + one follow-up. */
-export const GARDSSALG_OUTREACH_MAX_TOUCHES = 2;
+/**
+ * Max cold touches per producer in this lane. dev-request 2026-11-15-opplevagent-fem-henvendelser
+ * (A2): 5 (was 2). Only rounds with a template in GARDSSALG_OUTREACH_TEMPLATE_BY_ROUND are
+ * sent; rounds 4 and 5 have none yet (`no_template_for_touch`). Rollback: set back to 2.
+ */
+export const GARDSSALG_OUTREACH_MAX_TOUCHES = 5;
 
 /**
  * dev-request 2026-11-15-opplevagent-fem-henvendelser (A1): the ONE lookup from round
@@ -20069,8 +20074,61 @@ export const GARDSSALG_OUTREACH_MAX_TOUCHES = 2;
  */
 export const GARDSSALG_OUTREACH_TEMPLATE_BY_ROUND: Readonly<Record<number, GardssalgOutreachTemplate>> = {
   1: "personal-v4",
-  2: "personal-v4-followup",
+  // A2: round 2 is the new text without the promise sentence (replaces F for new sends);
+  // round 3 is its own text. Rounds 4 and 5 are drafts, not approved: no entry.
+  2: "personal-v5-round2",
+  3: "personal-v5-round3",
 };
+
+/**
+ * dev-request 2026-11-15-opplevagent-fem-henvendelser (A2), stop rule per round from
+ * round 3 on: when at least MIN_SENDS of the round's sends are older than AGE_DAYS and
+ * MORE than RATE of those got «fjern» or an unsubscribe, the round is not sent
+ * (`round_stopped_optout_rate`). Complaint and bounce stop the lane as before.
+ */
+export const GARDSSALG_OUTREACH_ROUND_STOP_FROM_ROUND = 3;
+export const GARDSSALG_OUTREACH_ROUND_STOP_MIN_SENDS = 20;
+export const GARDSSALG_OUTREACH_ROUND_STOP_AGE_DAYS = 7;
+export const GARDSSALG_OUTREACH_ROUND_STOP_MAX_RATE = 0.05;
+
+/**
+ * Per round (from GARDSSALG_OUTREACH_ROUND_STOP_FROM_ROUND), the lane's sends older than
+ * GARDSSALG_OUTREACH_ROUND_STOP_AGE_DAYS and how many of them got «fjern» or an
+ * unsubscribe. Same data and same classifier as the per-round measurement (`by_round`):
+ * CRM out-messages carrying `touch_round`, replies on the thread/from the address, and
+ * email_bounces rows of type 'unsubscribe' after the send.
+ */
+export function computeGardssalgOutreachRoundOptoutStats(
+  rfbDb: ReturnType<typeof getRfbDb>,
+  now: Date = new Date(),
+): Record<string, { sends: number; optouts: number; stopped: boolean }> {
+  const cutoff = new Date(now.getTime() - GARDSSALG_OUTREACH_ROUND_STOP_AGE_DAYS * 24 * 60 * 60 * 1000);
+  const msgs = rfbDb
+    .prepare(
+      `SELECT sent_at, to_emails, raw_metadata FROM crm_messages
+        WHERE direction = 'out' AND raw_metadata LIKE '%"touch_round"%'
+          AND datetime(sent_at) <= datetime(?)`,
+    )
+    .all(cutoff.toISOString()) as Array<{ sent_at: string; to_emails: string | null; raw_metadata: string | null }>;
+  const classify = makeGardssalgOutreachOptoutClassifier(rfbDb);
+  const out: Record<string, { sends: number; optouts: number; stopped: boolean }> = {};
+  for (const m of msgs) {
+    let meta: Record<string, unknown> = {};
+    try { meta = JSON.parse(m.raw_metadata || "{}"); } catch { continue; }
+    const round = meta.touch_round;
+    const providerId = typeof meta.provider_id === "string" ? meta.provider_id : null;
+    if (typeof round !== "number" || !Number.isInteger(round) || round < GARDSSALG_OUTREACH_ROUND_STOP_FROM_ROUND || !providerId) continue;
+    const key = String(round);
+    const agg = (out[key] ??= { sends: 0, optouts: 0, stopped: false });
+    agg.sends++;
+    if (classify(providerId, m.to_emails, m.sent_at).unsubscribed) agg.optouts++;
+  }
+  for (const agg of Object.values(out)) {
+    agg.stopped =
+      agg.sends >= GARDSSALG_OUTREACH_ROUND_STOP_MIN_SENDS && agg.optouts / agg.sends > GARDSSALG_OUTREACH_ROUND_STOP_MAX_RATE;
+  }
+  return out;
+}
 
 /** Templates whose text promises «Jeg skriver ikke igjen om dette.» — no round after one (`promise_given`). */
 export const GARDSSALG_OUTREACH_PROMISE_TEMPLATES: ReadonlySet<string> = new Set(["personal-v4-followup"]);
@@ -20088,7 +20146,7 @@ export function latestGardssalgOutreachSendTemplate(
   const row = expDb
     .prepare(
       `SELECT template FROM experience_outreach_sent_log
-        WHERE provider_id = ? AND is_test = 0 ORDER BY sent_at DESC, id DESC LIMIT 1`,
+        WHERE provider_id = ? AND is_test = 0 ORDER BY datetime(sent_at) DESC, id DESC LIMIT 1`,
     )
     .get(providerId) as { template: string | null } | undefined;
   if (!row) return null;
@@ -20134,6 +20192,7 @@ export function computeGardssalgOutreachSendEligibility(
   const out: GardssalgOutreachEligibility[] = [];
   // Built on first use, once per call (not per provider).
   let rfbSendIndex: ReturnType<typeof getRfbSendIndexForOpplevagent> | null = null;
+  let roundOptoutStats: ReturnType<typeof computeGardssalgOutreachRoundOptoutStats> | undefined;
 
   for (const providerId of providerIds) {
     // G1 point 6: owned profiles never get cold outreach (checked first, so the reason is
@@ -20250,6 +20309,14 @@ export function computeGardssalgOutreachSendEligibility(
     if (!isGardssalgOutreachTemplate(template)) {
       out.push({ provider_id: providerId, eligible: false, status: "skipped", reason: "no_template_for_touch" });
       continue;
+    }
+    // A2 stop rule (from round 3): computed once per call, only when a round needs it.
+    if (touchRound >= GARDSSALG_OUTREACH_ROUND_STOP_FROM_ROUND) {
+      roundOptoutStats ??= computeGardssalgOutreachRoundOptoutStats(getRfbDb());
+      if (roundOptoutStats[String(touchRound)]?.stopped) {
+        out.push({ provider_id: providerId, eligible: false, status: "skipped", reason: "round_stopped_optout_rate" });
+        continue;
+      }
     }
 
     // ── Own-table cooldown: this vertical's persistent send log ─────────
@@ -20530,6 +20597,9 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
     let preflightNoGoCount = 0;
     let personalAddressCount = 0;
     let ownerClaimedCount = 0;
+    // dev-request 2026-11-15-opplevagent-fem-henvendelser (A2, N3): promise_given /
+    // no_template_for_touch / round_stopped_optout_rate (were folded into preflight_no_go).
+    let roundRuleCount = 0;
 
     type Candidate = { agent_id: string; name: string; email: string; last_sent_at: string | null };
     const survivors: Candidate[] = [];
@@ -20552,6 +20622,7 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
           preflight_no_go: preflightNoGoCount,
           personal_address: personalAddressCount,
           owner_claimed: ownerClaimedCount,
+          round_rule: roundRuleCount,
         },
         recipient_address_types: countRecipientAddressTypes([]),
       });
@@ -20681,6 +20752,12 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
           ownerClaimedCount++;
         } else if (e.reason === "max_touch_reached") {
           contactedOrCooldownCount++;
+        } else if (
+          e.reason === "promise_given" ||
+          e.reason === "no_template_for_touch" ||
+          e.reason === "round_stopped_optout_rate"
+        ) {
+          roundRuleCount++;
         } else if (e.reason === "cooldown_suppressed") {
           if (e.cross_platform) {
             crossPlatformCooldownCount++;
@@ -20822,6 +20899,7 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
         preflight_no_go: preflightNoGoCount,
         personal_address: personalAddressCount,
         owner_claimed: ownerClaimedCount,
+        round_rule: roundRuleCount,
       },
       // dev-request 2026-10-08-kryssplattform-karantene-produsent-og-domene:
       // one entry per cross-platform-suppressed provider, with the rule that
@@ -21229,7 +21307,8 @@ export async function sendGardssalgOutreachToEligibleProvider(
       arm: subjectArm,
       eierUrl: `https://opplevagent.no/kategori/gardssalg/eier/${elig.slug ?? ""}`,
     };
-  } else if (template === "personal-v4-followup") {
+  } else if (GARDSSALG_OUTREACH_FOLLOWUP_TEMPLATES.has(template)) {
+    // Every round after the first (F, round 2, round 3 — A2): reply in the first mail's thread.
     let first: ReturnType<typeof findGardssalgOutreachFirstMessage> = null;
     let firstSentAt: Date | null = null;
     try {
@@ -21250,6 +21329,7 @@ export async function sendGardssalgOutreachToEligibleProvider(
     const firstSubject = threadId ? (first?.subject ?? null) : null;
     if (threadId && firstSubject) inReplyToMessageId = threadId;
     renderCtx = {
+      eierUrl: `https://opplevagent.no/kategori/gardssalg/eier/${elig.slug ?? ""}`,
       monthPhrase: gardssalgOutreachMonthPhrase(firstSentAt, new Date()),
       // No usable first message: a new mail with subject A (spec endring 7).
       firstSubject: inReplyToMessageId ? firstSubject : null,
@@ -21373,7 +21453,7 @@ export async function sendGardssalgOutreachToEligibleProvider(
         crmService.ingestThread(
           {
             threadId: gardssalgOutreachThreadId(providerId),
-            subject: template === "personal-v4-followup" ? (renderCtx?.firstSubject ?? rendered.subject) : rendered.subject,
+            subject: GARDSSALG_OUTREACH_FOLLOWUP_TEMPLATES.has(template) ? (renderCtx?.firstSubject ?? rendered.subject) : rendered.subject,
             category: "marketing",
             messages: [
               {
@@ -21423,7 +21503,7 @@ export async function sendGardssalgOutreachToEligibleProvider(
       ...(crmRecorded === undefined ? {} : { crm_recorded: crmRecorded }),
       template,
       ...(subjectArm ? { subject_arm: subjectArm } : {}),
-      ...(template === "personal-v4-followup" ? { threaded: inReplyToMessageId !== undefined } : {}),
+      ...(GARDSSALG_OUTREACH_FOLLOWUP_TEMPLATES.has(template) ? { threaded: inReplyToMessageId !== undefined } : {}),
     };
   } catch (err) {
     // Every write above has its own catch, so only the send itself lands
@@ -22363,6 +22443,43 @@ interface GardssalgV4MeasurementRow {
   unsubscribed: boolean;
 }
 
+/**
+ * Per lane send: replied, «fjern» reply, and unsubscribed («fjern» or an email_bounces
+ * 'unsubscribe' row after the send). Shared by the v4 measurement (`by_round`) and the
+ * A2 per-round stop rule, so both count the same thing.
+ */
+export function makeGardssalgOutreachOptoutClassifier(rfbDb: ReturnType<typeof getRfbDb>) {
+  // Two statements instead of one OR: thread_id is indexed (idx_crm_messages_thread);
+  // from_email has no index on crm_messages, so that lookup is a scan, run once per
+  // send (a handful of v4 sends per week). datetime() normalises ISO ('T…Z') and
+  // space-format timestamps so same-day replies compare correctly.
+  const replyByThreadStmt = rfbDb.prepare(
+    `SELECT id, body_text FROM crm_messages
+      WHERE direction = 'in' AND thread_id = ?
+        AND datetime(COALESCE(sent_at, received_at)) >= datetime(?)`,
+  );
+  const replyByAddressStmt = rfbDb.prepare(
+    `SELECT id, body_text FROM crm_messages
+      WHERE direction = 'in' AND LOWER(from_email) = ?
+        AND datetime(COALESCE(sent_at, received_at)) >= datetime(?)`,
+  );
+  const unsubStmt = rfbDb.prepare(
+    `SELECT COUNT(*) AS n FROM email_bounces WHERE LOWER(TRIM(email)) = ? AND bounce_type = 'unsubscribe' AND datetime(bounced_at) >= datetime(?)`,
+  );
+  return (providerId: string, toEmails: string | null, sentAt: string): { replied: boolean; fjern: boolean; unsubscribed: boolean } => {
+    let recipient = "";
+    try { recipient = String((JSON.parse(toEmails || "[]") as unknown[])[0] ?? "").trim().toLowerCase(); } catch { /* none */ }
+    const replyRows = [
+      ...(replyByThreadStmt.all(gardssalgOutreachThreadId(providerId), sentAt) as Array<{ id: string; body_text: string | null }>),
+      ...(recipient ? (replyByAddressStmt.all(recipient, sentAt) as Array<{ id: string; body_text: string | null }>) : []),
+    ];
+    const replies = replyRows.filter((r, i) => replyRows.findIndex((x) => x.id === r.id) === i);
+    const fjern = replies.some((r) => /\bfjern\b/i.test(r.body_text ?? ""));
+    const unsubscribed = fjern || (recipient !== "" && (unsubStmt.get(recipient, sentAt) as { n: number }).n > 0);
+    return { replied: replies.length > 0, fjern, unsubscribed };
+  };
+}
+
 export function computeGardssalgV4Measurement(
   expDb: ReturnType<typeof getExpDb>,
   rfbDb: ReturnType<typeof getRfbDb>,
@@ -22384,23 +22501,7 @@ export function computeGardssalgV4Measurement(
   const claimStmt = expDb.prepare(
     `SELECT COUNT(*) AS n FROM gardssalg_claims WHERE provider_id = ? AND is_test = 0 AND created_at >= ?`,
   );
-  // Two statements instead of one OR: thread_id is indexed (idx_crm_messages_thread);
-  // from_email has no index on crm_messages, so that lookup is a scan, run once per
-  // send (a handful of v4 sends per week). datetime() normalises ISO ('T…Z') and
-  // space-format timestamps so same-day replies compare correctly.
-  const replyByThreadStmt = rfbDb.prepare(
-    `SELECT id, body_text FROM crm_messages
-      WHERE direction = 'in' AND thread_id = ?
-        AND datetime(COALESCE(sent_at, received_at)) >= datetime(?)`,
-  );
-  const replyByAddressStmt = rfbDb.prepare(
-    `SELECT id, body_text FROM crm_messages
-      WHERE direction = 'in' AND LOWER(from_email) = ?
-        AND datetime(COALESCE(sent_at, received_at)) >= datetime(?)`,
-  );
-  const unsubStmt = rfbDb.prepare(
-    `SELECT COUNT(*) AS n FROM email_bounces WHERE LOWER(TRIM(email)) = ? AND bounce_type = 'unsubscribe' AND datetime(bounced_at) >= datetime(?)`,
-  );
+  const classifyOptout = makeGardssalgOutreachOptoutClassifier(rfbDb);
 
   const sends: GardssalgV4MeasurementRow[] = [];
   // dev-request 2026-11-15-opplevagent-fem-henvendelser (A1): every lane send with a
@@ -22422,16 +22523,7 @@ export function computeGardssalgV4Measurement(
     const sentAt = new Date(m.sent_at);
     const windowEnd = new Date(sentAt.getTime() + GARDSSALG_V4_MEASUREMENT_WINDOW_HOURS * 60 * 60 * 1000);
     const sinceSql = toSqliteUtc(sentAt);
-    let recipient = "";
-    try { recipient = String((JSON.parse(m.to_emails || "[]") as unknown[])[0] ?? "").trim().toLowerCase(); } catch { /* none */ }
-
-    const replyRows = [
-      ...(replyByThreadStmt.all(gardssalgOutreachThreadId(providerId), m.sent_at) as Array<{ id: string; body_text: string | null }>),
-      ...(recipient ? (replyByAddressStmt.all(recipient, m.sent_at) as Array<{ id: string; body_text: string | null }>) : []),
-    ];
-    const replies = replyRows.filter((r, i) => replyRows.findIndex((x) => x.id === r.id) === i);
-    const fjernReply = replies.some((r) => /\bfjern\b/i.test(r.body_text ?? ""));
-    const unsubscribed = fjernReply || (recipient !== "" && (unsubStmt.get(recipient, m.sent_at) as { n: number }).n > 0);
+    const { replied, fjern: fjernReply, unsubscribed } = classifyOptout(providerId, m.to_emails, m.sent_at);
 
     const row: GardssalgV4MeasurementRow = {
       slug,
@@ -22444,7 +22536,7 @@ export function computeGardssalgV4Measurement(
       views_eier_72h: slug ? countGardssalgHumanViews(rfbDb, `/kategori/gardssalg/eier/${slug}`, sentAt, windowEnd) : null,
       claim_link_requested: (claimStmt.get(providerId, sinceSql) as { n: number }).n > 0,
       claimed: !!provider?.claimed_at,
-      replied: replies.length > 0,
+      replied,
       unsubscribed,
     };
     if (isV4) sends.push(row);
