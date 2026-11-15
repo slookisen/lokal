@@ -52489,6 +52489,25 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-12-opplevagent-o2-eierdashbord-for-besok, O2-1: the
+// gårdssalg owner dashboard shell and GARDSSALG_OWNER_DASHBOARD_ENABLED
+// (off | pilot | 1). Swaps getDb() + env — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-12-opplevagent-o2-eierdashbord-for-besok O2-1: dashbordskallet for gårdssalg ──");
+  try {
+    const { runGardssalgOwnerDashboardO21Tests } = require("../src/routes/gardssalg-owner-dashboard-o2-1.test") as
+      typeof import("../src/routes/gardssalg-owner-dashboard-o2-1.test");
+    const r = await runGardssalgOwnerDashboardO21Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-owner-dashboard-o2-1: " + f);
+    console.log(`  gardssalg-owner-dashboard-o2-1: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-owner-dashboard-o2-1: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // Eierportal bølge 0, T2: the «Mine valg» level preview (GET …/valg?niva=)
 // never writes — on gårdssalg (experiences.db booking_live, gardssalg_content_audit)
 // nor RFB; the preview equals the confirmed apply. Swaps getDb() + env — runSerial.

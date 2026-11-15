@@ -27,7 +27,8 @@ import { getGardssalgOwnerStats } from "../services/gardssalg-owner-stats-servic
 import { emailService } from "../services/email-service";
 import { generalLimiter } from "../middleware/security";
 import { ownerBookingEnableBlock, type OwnerBookingBlock } from "../services/gardssalg-booking-gate";
-import { createGardssalgOwnerFeaturesRouter, gardssalgOwnerFeaturesTabOpen } from "./gardssalg-owner-features";
+import { createGardssalgOwnerFeaturesRouter, gardssalgOwnerDashboardOnForSession, gardssalgOwnerFeaturesTabOpen } from "./gardssalg-owner-features";
+import { wrapGardssalgDashboard } from "../owner-ui/gardssalg-dashboard";
 
 // ─────────────────────────────────────────────────────────────────
 // GÅRDSSALG PRODUCER OWNER-CLAIM — dev-request 2026-07-21-opplevagent-
@@ -796,6 +797,13 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
       })();
       </script>
     `;
+    // O2-1 (dev-request 2026-11-12-opplevagent-o2-eierdashbord-for-besok): with
+    // the gårdssalg owner dashboard on for this owner, the portal is «Oversikt»
+    // inside the shell, sent no-store. Off = the response exactly as before.
+    if (gardssalgOwnerDashboardOnForSession(provider.id, session)) {
+      res.setHeader("Cache-Control", "no-store");
+      return res.send(shell(`Eierportal · ${provider.navn}`, wrapGardssalgDashboard(slug, "oversikt", body)));
+    }
     return res.send(shell(`Eierportal · ${provider.navn}`, body));
   } catch (err) {
     console.error("[gardssalg-claim] GET portal error:", err);
