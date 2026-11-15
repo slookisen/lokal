@@ -506,7 +506,7 @@ export function runOpplevelserGardssalgOneShotBookingTests(opts: { log?: boolean
       assertEq(rb8.status, 201, "r10: the web form's provider_id path is unchanged -> 201");
       assertEq(rb8.body?.provider?.id, "os-aegir", "r10b: provider echoed");
       assertTrue(!("resolved_from_query" in (rb8.body?.provider ?? {})), "r10c: no resolved_from_query on a provider_id call");
-      assertEq(Object.keys(rb8.body).sort(), ["booking_ref", "message", "party_size", "provider", "slot_at_local", "source", "status", "success"], "r10d: response keys = the pre-existing five + the three additive fields, nothing else");
+      assertEq(Object.keys(rb8.body).sort(), ["booking_ref", "message", "party_size", "producer_notification", "provider", "slot_at_local", "source", "status", "success"], "r10d: response keys = the pre-existing five + the three additive fields + producer_notification (O1-1), nothing else");
       assertEq(countRows(), 4, "r10e: row created");
     } finally {
       if (server) await new Promise<void>((r) => server!.close(() => r()));

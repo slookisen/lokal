@@ -621,8 +621,11 @@ export async function sendProducerNotification(
   // fire-and-forget.
   opts: { retry?: boolean } = {},
 ): Promise<ProducerNotifyOutcome> {
+  // Resolve the DB handle NOW (same tick as the caller): the send resolves
+  // later, and a late getDb() could open a different database.
+  const db = getDb(VERTICAL);
   const record = (outcome: ProducerNotifyOutcome, reason?: string) =>
-    recordProducerNotifyOutcome(getDb(VERTICAL), booking, outcome, { retry: opts.retry, reason });
+    recordProducerNotifyOutcome(db, booking, outcome, { retry: opts.retry, reason });
   if (!producerEmail || !producerEmail.trim()) {
     console.error(
       `[booking] producer notification SKIPPED — no epost on file for provider ${booking.provider_id} (booking ${booking.booking_ref})`,
