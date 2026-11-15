@@ -865,6 +865,7 @@ import {
   GardssalgOutreachRenderCtx,
   gardssalgOutreachMonthPhrase,
   GARDSSALG_OUTREACH_REPLY_TO,
+  isGardssalgOutreachTemplate,
 } from "../services/email-service";
 import { crmService } from "../services/crm-service";
 import { crmSenderAddress } from "../services/crm-platform-identity";
@@ -19932,6 +19933,10 @@ export type GardssalgOutreachEligibility =
       navn: string | null;
       slug: string | null;
       epost: string; // trimmed, non-empty — guaranteed present when eligible:true
+      // dev-request 2026-11-15-opplevagent-fem-henvendelser (A1): real sent-log rows + 1,
+      // and the template GARDSSALG_OUTREACH_TEMPLATE_BY_ROUND names for that round.
+      touch_round: number;
+      template: GardssalgOutreachTemplate;
       // Grep 7 (dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply,
       // Daniel 2026-08-20): the cross-platform 60-day cooldown no longer BLOCKS —
       // a recent RFB send to the same address is reported here instead, so
@@ -20043,10 +20048,62 @@ export function gardssalgProducerHasCrmReply(rfbDb: ReturnType<typeof getRfbDb>,
 /** Max cold touches per producer in this lane: the first + one follow-up. */
 export const GARDSSALG_OUTREACH_MAX_TOUCHES = 2;
 
+/**
+ * dev-request 2026-11-15-opplevagent-fem-henvendelser (A1): the ONE lookup from round
+ * number (real sent-log rows for the producer + 1) to template. A round without an
+ * entry is never sent (`no_template_for_touch`): no fallback to another round or to
+ * `standard`.
+ */
+export const GARDSSALG_OUTREACH_TEMPLATE_BY_ROUND: Readonly<Record<number, GardssalgOutreachTemplate>> = {
+  1: "personal-v4",
+  2: "personal-v4-followup",
+};
+
+/** Templates whose text promises «Jeg skriver ikke igjen om dette.» — no round after one (`promise_given`). */
+export const GARDSSALG_OUTREACH_PROMISE_TEMPLATES: ReadonlySet<string> = new Set(["personal-v4-followup"]);
+
+/**
+ * Template name of the producer's latest real (is_test = 0) send, from the sent log.
+ * Rows from before the `template` column carry NULL; for those the lane's own CRM
+ * filing of the latest send (raw_metadata.template on the outreach thread) is read.
+ */
+export function latestGardssalgOutreachSendTemplate(
+  expDb: Database.Database,
+  rfbDb: ReturnType<typeof getRfbDb>,
+  providerId: string,
+): string | null {
+  const row = expDb
+    .prepare(
+      `SELECT template FROM experience_outreach_sent_log
+        WHERE provider_id = ? AND is_test = 0 ORDER BY sent_at DESC, id DESC LIMIT 1`,
+    )
+    .get(providerId) as { template: string | null } | undefined;
+  if (!row) return null;
+  if (row.template) return row.template;
+  const msg = rfbDb
+    .prepare(
+      `SELECT raw_metadata FROM crm_messages
+        WHERE thread_id = ? AND direction = 'out' AND raw_metadata LIKE '%"template"%'
+        ORDER BY sent_at DESC, rowid DESC LIMIT 1`,
+    )
+    .get(gardssalgOutreachThreadId(providerId)) as { raw_metadata: string | null } | undefined;
+  try {
+    const t = (JSON.parse(msg?.raw_metadata || "{}") as { template?: unknown }).template;
+    return typeof t === "string" ? t : null;
+  } catch {
+    return null;
+  }
+}
+
 export function computeGardssalgOutreachSendEligibility(
   expDb: Database.Database,
   providerIds: string[],
-  opts?: { skipRecipientDedupe?: boolean; readinessRows?: ReturnType<typeof computeGardssalgReadinessRows> },
+  opts?: {
+    skipRecipientDedupe?: boolean;
+    readinessRows?: ReturnType<typeof computeGardssalgReadinessRows>;
+    /** Test seam only; default GARDSSALG_OUTREACH_TEMPLATE_BY_ROUND. */
+    templateByRound?: Readonly<Record<number, string>>;
+  },
 ): GardssalgOutreachEligibility[] {
   // Single preflight pass, reused per-provider below — same tiering
   // logic/outcome as POST /admin/gardssalg-outreach-preflight, folding in
@@ -20165,6 +20222,23 @@ export function computeGardssalgOutreachSendEligibility(
       continue;
     }
 
+    // ── Rounds (dev-request 2026-11-15-opplevagent-fem-henvendelser, A1): the promise
+    // in the latest send's template ends the lane for this producer; a round without
+    // a template is not sent. Both read names only, never the text.
+    if (touchCount > 0) {
+      const lastTemplate = latestGardssalgOutreachSendTemplate(expDb, getRfbDb(), providerId);
+      if (lastTemplate !== null && GARDSSALG_OUTREACH_PROMISE_TEMPLATES.has(lastTemplate)) {
+        out.push({ provider_id: providerId, eligible: false, status: "skipped", reason: "promise_given" });
+        continue;
+      }
+    }
+    const touchRound = touchCount + 1;
+    const template = (opts?.templateByRound ?? GARDSSALG_OUTREACH_TEMPLATE_BY_ROUND)[touchRound];
+    if (!isGardssalgOutreachTemplate(template)) {
+      out.push({ provider_id: providerId, eligible: false, status: "skipped", reason: "no_template_for_touch" });
+      continue;
+    }
+
     // ── Own-table cooldown: this vertical's persistent send log ─────────
     const ownPrior = expDb
       .prepare(
@@ -20240,6 +20314,8 @@ export function computeGardssalgOutreachSendEligibility(
       navn: providerRow?.navn ?? null,
       slug: providerRow?.slug ?? null,
       epost: email,
+      touch_round: touchRound,
+      template,
       ...(crossPrior
         ? {
             cross_platform_recent: true as const,
@@ -21167,6 +21243,20 @@ export async function sendGardssalgOutreachToEligibleProvider(
     };
   }
 
+  // dev-request 2026-11-15-opplevagent-fem-henvendelser (A1): render BEFORE the
+  // reservation. An unknown template name (or a render that throws) is a skip with
+  // nothing written — never a reservation left behind by a throw after it.
+  let rendered: ReturnType<typeof renderGardssalgOutreachVariant>;
+  if (!isGardssalgOutreachTemplate(template)) {
+    return { provider_id: providerId, status: "skipped", reason: "no_template_for_touch" };
+  }
+  try {
+    rendered = renderGardssalgOutreachVariant(template, providerName, profileUrl, renderCtx);
+  } catch (renderErr) {
+    console.error(`[${opts.source}] render failed — NOT sending`, { providerId, template, error: errMsg(renderErr) });
+    return { provider_id: providerId, status: "skipped", reason: `render_failed: ${errMsg(renderErr)}` };
+  }
+
   // Reserve BEFORE sending. sent_at takes the column DEFAULT exactly as the
   // old post-send INSERT did, so every reader's timestamp handling is unchanged.
   //
@@ -21185,19 +21275,19 @@ export async function sendGardssalgOutreachToEligibleProvider(
     reservation = isTest
       ? expDb
           .prepare(
-            `INSERT INTO experience_outreach_sent_log (provider_id, recipient_email, channel, message_id, notes, is_test)
-             VALUES (?, ?, 'email', NULL, ?, 1)`,
+            `INSERT INTO experience_outreach_sent_log (provider_id, recipient_email, channel, message_id, notes, is_test, template)
+             VALUES (?, ?, 'email', NULL, ?, 1, ?)`,
           )
-          .run(providerId, email, GARDSSALG_OUTREACH_SENT_LOG_RESERVED_NOTE)
+          .run(providerId, email, GARDSSALG_OUTREACH_SENT_LOG_RESERVED_NOTE, template)
       : expDb
           .prepare(
-            `INSERT INTO experience_outreach_sent_log (provider_id, recipient_email, channel, message_id, notes, is_test)
-             SELECT ?, ?, 'email', NULL, ?, 0
+            `INSERT INTO experience_outreach_sent_log (provider_id, recipient_email, channel, message_id, notes, is_test, template)
+             SELECT ?, ?, 'email', NULL, ?, 0, ?
               WHERE NOT EXISTS (
                 SELECT 1 FROM experience_outreach_sent_log
                  WHERE LOWER(recipient_email) = LOWER(?) AND sent_at >= ? AND is_test = 0)`,
           )
-          .run(providerId, email, GARDSSALG_OUTREACH_SENT_LOG_RESERVED_NOTE, email, gardssalgOutreachCooldownCutoffIso());
+          .run(providerId, email, GARDSSALG_OUTREACH_SENT_LOG_RESERVED_NOTE, template, email, gardssalgOutreachCooldownCutoffIso());
   } catch (dbErr) {
     console.error(`[${opts.source}] sent_log reservation failed — NOT sending`, { providerId, email, error: errMsg(dbErr) });
     return {
@@ -21267,7 +21357,6 @@ export async function sendGardssalgOutreachToEligibleProvider(
     let crmRecorded: boolean | undefined;
     if (!isTest) {
       try {
-        const rendered = renderGardssalgOutreachVariant(template, providerName, profileUrl, renderCtx);
         crmService.ingestThread(
           {
             threadId: gardssalgOutreachThreadId(providerId),
@@ -21291,6 +21380,9 @@ export async function sendGardssalgOutreachToEligibleProvider(
                   provider_id: providerId,
                   reply_to: GARDSSALG_OUTREACH_REPLY_TO,
                   template,
+                  // dev-request 2026-11-15-opplevagent-fem-henvendelser (A1): the round, when
+                  // the send used that round's template (read by the per-round measurement).
+                  ...(elig.touch_round !== undefined && elig.template === template ? { touch_round: elig.touch_round } : {}),
                   ...(subjectArm ? { subject_arm: subjectArm } : {}),
                   ...(inReplyToMessageId ? { in_reply_to: inReplyToMessageId } : {}),
                 },
@@ -21987,6 +22079,10 @@ export function computeGardssalgOutreachDailyPrep(expDb: ReturnType<typeof getEx
     afterDedup.push(e);
   }
 
+  // dev-request 2026-11-15-opplevagent-fem-henvendelser (A1): first touches before
+  // follow-ups inside the daily cap, then the lowest round; ties keep id order
+  // (Array.prototype.sort is stable).
+  afterDedup.sort((a, b) => a.touch_round - b.touch_round);
   const selected = afterDedup.slice(0, dailyCap);
   const overflow = afterDedup.slice(dailyCap);
 
@@ -21999,6 +22095,7 @@ export function computeGardssalgOutreachDailyPrep(expDb: ReturnType<typeof getEx
       name: e.navn ?? readyRow?.name ?? null,
       profile_url: profileUrl,
       recipient_email: e.epost,
+      touch_round: e.touch_round,
       address_basis: computeGardssalgAddressBasis(e.epost, extra?.hjemmeside ?? null, extra?.field_provenance ?? null),
       address_published: computeGardssalgAddressPublished(
         e.epost,
@@ -22082,7 +22179,7 @@ export function computeGardssalgOutreachDailyPrep(expDb: ReturnType<typeof getEx
     if (row.reason === "cooldown_suppressed" && !row.cross_platform && row.last_sent_at) {
       const hit = cooldownSendStmt.get(row.provider_id, row.last_sent_at) as { recipient_email: string } | undefined;
       if (hit) row.recipient_email = hit.recipient_email;
-    } else if (row.reason === "max_touch_reached") {
+    } else if (row.reason === "max_touch_reached" || row.reason === "promise_given") {
       const last = latestOwnSendStmt.get(row.provider_id) as { recipient_email: string; sent_at: string } | undefined;
       if (!last) continue;
       row.recipient_email = last.recipient_email;
@@ -22206,6 +22303,11 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
 const GARDSSALG_V4_MEASUREMENT_WINDOW_HOURS = 72;
 const GARDSSALG_V4_MEASUREMENT_DEFAULT_DAYS = 28;
 const GARDSSALG_V4_MEASUREMENT_MAX_DAYS = 60;
+/** Round of a send filed before CRM metadata carried `touch_round` (cap 2: E first, F second). */
+const GARDSSALG_V4_LEGACY_ROUND_BY_TEMPLATE: ReadonlyMap<string, number> = new Map([
+  ["personal-v4", 1],
+  ["personal-v4-followup", 2],
+]);
 
 /** `YYYY-MM-DD HH:MM:SS` (UTC) — the format SQLite's datetime('now') columns hold. */
 function toSqliteUtc(d: Date): string {
@@ -22259,7 +22361,8 @@ export function computeGardssalgV4Measurement(
   const msgs = rfbDb
     .prepare(
       `SELECT sent_at, to_emails, raw_metadata FROM crm_messages
-        WHERE direction = 'out' AND raw_metadata LIKE '%"template"%personal-v4%' AND datetime(sent_at) >= datetime(?)
+        WHERE direction = 'out' AND (raw_metadata LIKE '%"template"%personal-v4%' OR raw_metadata LIKE '%"touch_round"%')
+          AND datetime(sent_at) >= datetime(?)
         ORDER BY sent_at ASC, rowid ASC`,
     )
     .all(cutoff.toISOString()) as Array<{ sent_at: string; to_emails: string | null; raw_metadata: string | null }>;
@@ -22287,12 +22390,20 @@ export function computeGardssalgV4Measurement(
   );
 
   const sends: GardssalgV4MeasurementRow[] = [];
+  // dev-request 2026-11-15-opplevagent-fem-henvendelser (A1): every lane send with a
+  // round, any template name; `sends`/`summary` below keep the two v4 names as before.
+  const roundRows: Array<{ round: number; row: GardssalgV4MeasurementRow; fjern: boolean }> = [];
   for (const m of msgs) {
     let meta: Record<string, unknown> = {};
     try { meta = JSON.parse(m.raw_metadata || "{}"); } catch { /* skipped below */ }
     const template = typeof meta.template === "string" ? meta.template : null;
     const providerId = typeof meta.provider_id === "string" ? meta.provider_id : null;
-    if ((template !== "personal-v4" && template !== "personal-v4-followup") || !providerId) continue;
+    const isV4 = template === "personal-v4" || template === "personal-v4-followup";
+    const round =
+      typeof meta.touch_round === "number" && Number.isInteger(meta.touch_round) && meta.touch_round > 0
+        ? meta.touch_round
+        : template !== null ? GARDSSALG_V4_LEGACY_ROUND_BY_TEMPLATE.get(template) : undefined;
+    if (!template || !providerId || (!isV4 && round === undefined)) continue;
     const provider = providerStmt.get(providerId) as { slug: string | null; claimed_at: string | null } | undefined;
     const slug = provider?.slug ?? null;
     const sentAt = new Date(m.sent_at);
@@ -22309,7 +22420,7 @@ export function computeGardssalgV4Measurement(
     const fjernReply = replies.some((r) => /\bfjern\b/i.test(r.body_text ?? ""));
     const unsubscribed = fjernReply || (recipient !== "" && (unsubStmt.get(recipient, m.sent_at) as { n: number }).n > 0);
 
-    sends.push({
+    const row: GardssalgV4MeasurementRow = {
       slug,
       provider_id: providerId,
       sent_at: m.sent_at,
@@ -22322,11 +22433,12 @@ export function computeGardssalgV4Measurement(
       claimed: !!provider?.claimed_at,
       replied: replies.length > 0,
       unsubscribed,
-    });
+    };
+    if (isV4) sends.push(row);
+    if (round !== undefined) roundRows.push({ round, row, fjern: fjernReply });
   }
 
-  const summarise = (t: string) => {
-    const rows = sends.filter((s) => s.template === t);
+  const summariseRows = (rows: GardssalgV4MeasurementRow[]) => {
     return {
       sends: rows.length,
       replied: rows.filter((s) => s.replied).length,
@@ -22336,12 +22448,25 @@ export function computeGardssalgV4Measurement(
       with_views_72h: rows.filter((s) => (s.views_profile_72h ?? 0) + (s.views_eier_72h ?? 0) > 0).length,
     };
   };
+  const summarise = (t: string) => summariseRows(sends.filter((s) => s.template === t));
+  // Per round: sends, replies, «fjern»/unsubscribes (`unsubscribed` as above, plus «fjern»
+  // alone as `fjern`) and takeovers (`claimed`), with the template names seen in the round.
+  const byRound: Record<string, ReturnType<typeof summariseRows> & { fjern: number; templates: string[] }> = {};
+  for (const r of Array.from(new Set(roundRows.map((x) => x.round))).sort((a, b) => a - b)) {
+    const rows = roundRows.filter((x) => x.round === r);
+    byRound[String(r)] = {
+      ...summariseRows(rows.map((x) => x.row)),
+      fjern: rows.filter((x) => x.fjern).length,
+      templates: Array.from(new Set(rows.map((x) => x.row.template))).sort(),
+    };
+  }
   return {
     success: true,
     window_hours: GARDSSALG_V4_MEASUREMENT_WINDOW_HOURS,
     days: opts.days,
     summary: { first: summarise("personal-v4"), followup: summarise("personal-v4-followup"), total_sends: sends.length },
     sends,
+    by_round: byRound,
   };
 }
 
@@ -22667,7 +22792,9 @@ export interface GardssalgOutreachDailyRunReport {
   lane: GardssalgOutreachLaneState;
   auto_paused: boolean;
   recent_bounces: GardssalgOutreachBounceHit[];
-  candidates: Array<{ provider_id: string; name: string | null; recipient_email: string; touch: "first" | "second" }>;
+  candidates: Array<{ provider_id: string; name: string | null; recipient_email: string; touch: "first" | "second"; touch_round: number }>;
+  // dev-request 2026-11-15-opplevagent-fem-henvendelser (A1): `sent` rows per round ("1", "2", …).
+  sent_by_round: Record<string, number>;
   // dev-request 2026-10-08-mottakerpolicy-alle-adresser: address types of
   // `candidates` (reporting only; all zero on a skip). Also in the envelope.
   recipient_address_types: Record<RecipientAddressType, number>;
@@ -22759,6 +22886,20 @@ export async function tickGardssalgOutreachDaily(opts: {
   return { lastRunAt: opts.now, report };
 }
 
+/** `sent` result rows per candidate round, keyed by the round number as a string. */
+export function countGardssalgOutreachSentByRound(
+  candidates: ReadonlyArray<{ provider_id: string; touch_round: number }>,
+  results: ReadonlyArray<GardssalgOutreachSendResultRow>,
+): Record<string, number> {
+  const roundById = new Map(candidates.map((c) => [c.provider_id, c.touch_round]));
+  const out: Record<string, number> = {};
+  for (const r of results) {
+    const round = r.status === "sent" ? roundById.get(r.provider_id) : undefined;
+    if (round !== undefined) out[String(round)] = (out[String(round)] ?? 0) + 1;
+  }
+  return out;
+}
+
 async function runGardssalgOutreachDailyOnce(
   opts: { apply: boolean; trigger: "cron" | "manual"; now?: Date },
   runInProgress: boolean,
@@ -22806,6 +22947,7 @@ async function runGardssalgOutreachDailyOnce(
       candidates: partial.candidates ?? [],
       recipient_address_types: countRecipientAddressTypes((partial.candidates ?? []).map((c) => c.recipient_email)),
       results,
+      sent_by_round: countGardssalgOutreachSentByRound(partial.candidates ?? [], results),
       summary: results.length > 0 ? summariseGardssalgOutreachSendResults(results) : empty,
       errors: results
         .filter((r) => r.status === "error" || r.log_recorded === false)
@@ -22907,6 +23049,11 @@ async function runGardssalgOutreachDailyOnce(
             },
             { type: "custom", value: firstTouchSent, meta: { kind: "gardssalg_outreach_first_touch_sent" } },
             { type: "custom", value: secondTouchSent, meta: { kind: "gardssalg_outreach_second_touch_sent" } },
+            {
+              type: "custom",
+              value: report.summary.sent,
+              meta: { kind: "gardssalg_outreach_sent_by_round", counts: report.sent_by_round },
+            },
             // dev-request 2026-10-08-mottakerpolicy-alle-adresser: the address
             // types of this run's candidates, for reply-rate per type later.
             {
@@ -23021,19 +23168,15 @@ async function runGardssalgOutreachDailyOnce(
       autosvar_apply: autosvarApply,
     });
   }
-  const hasPriorSend = expDb.prepare(
-    `SELECT 1 FROM experience_outreach_sent_log WHERE provider_id = ? AND is_test = 0 LIMIT 1`,
-  );
+  // dev-request 2026-11-15-opplevagent-fem-henvendelser (A1): round and template come
+  // from the eligibility row (GARDSSALG_OUTREACH_TEMPLATE_BY_ROUND); `touch` is kept.
   const candidates = selected.map((e) => ({
     provider_id: e.provider_id,
     name: e.navn ?? null,
     recipient_email: e.epost,
-    touch: (hasPriorSend.get(e.provider_id) ? "second" : "first") as "first" | "second",
+    touch: (e.touch_round > 1 ? "second" : "first") as "first" | "second",
+    touch_round: e.touch_round,
   }));
-  // dev-request 2026-10-22-opplevagent-utsending-v4: text E for a first touch,
-  // text F for a second.
-  const templateFor = (providerId: string): GardssalgOutreachTemplate =>
-    candidates.find((c) => c.provider_id === providerId)?.touch === "second" ? "personal-v4-followup" : "personal-v4";
 
   const results: GardssalgOutreachSendResultRow[] = [];
   // Incident 2026-09-27/28: stop at the first row that stops the batch, same
@@ -23076,7 +23219,7 @@ async function runGardssalgOutreachDailyOnce(
       continue;
     }
     const row = await sendGardssalgOutreachToEligibleProvider(expDb, elig, {
-      template: templateFor(elig.provider_id),
+      template: elig.template,
       isTest: false,
       source: "gardssalg-outreach-daily-run",
     });
