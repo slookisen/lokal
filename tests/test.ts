@@ -32021,6 +32021,17 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gora1.failures) failures.push("opplevelser-gardssalg-outreach-rounds-a1: " + f);
     console.log(`  opplevelser-gardssalg-outreach-rounds-a1: ${gora1.passed} passed, ${gora1.failed} failed`);
 
+    // dev-request 2026-11-15-opplevagent-fem-henvendelser, A2: cap 5, approved texts
+    // for rounds 2 and 3 (golden), rounds 4/5 without a template, per-round stop rule.
+    console.log("\n── opplevelser-gardssalg-outreach-rounds-a2: cap 5 + round 2/3 texts + stop rule ──");
+    const { runOpplevelserGardssalgOutreachRoundsA2Tests } = require("../src/routes/opplevelser-gardssalg-outreach-rounds-a2.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-outreach-rounds-a2.test");
+    const gora2 = await runOpplevelserGardssalgOutreachRoundsA2Tests({ log: false });
+    passed += gora2.passed;
+    failed += gora2.failed;
+    for (const f of gora2.failures) failures.push("opplevelser-gardssalg-outreach-rounds-a2: " + f);
+    console.log(`  opplevelser-gardssalg-outreach-rounds-a2: ${gora2.passed} passed, ${gora2.failed} failed`);
+
     // dev-request 2026-08-09-daglig-outreach-klargjoering-og-stoerrelsesgate,
     // Skive 1: antall_ansatte size signal + hard exclusion gate layered onto
     // the readiness/preflight/pilot-send trio above, plus the new DB-backed

@@ -1,6 +1,7 @@
 /**
  * opplevelser-gardssalg-outreach-rounds-a1.test.ts — dev-request
- * 2026-11-15-opplevagent-fem-henvendelser, slice A1 (cap stays at 2):
+ * 2026-11-15-opplevagent-fem-henvendelser, slice A1 (written at cap 2; A2 raised the
+ * cap to 5 and mapped round 2 to `personal-v5-round2` — AK1d/AK1e follow that):
  *   AK1 — daily-prep candidates are the same set as before; only the order
  *         changes (first touches before follow-ups, then lowest round).
  *   AK2 — no template for the producer's round -> `no_template_for_touch`,
@@ -183,9 +184,10 @@ export function runOpplevelserGardssalgOutreachRoundsA1Tests(opts: { log?: boole
       assertEq([...candIds].sort(), fasitSet, "AK1a: daily-prep candidate set equals the pre-A1 fasit");
       assertEq(candIds, ["a1-p2-fresh", "a1-p4-fresh", "a1-p1-follow", "a1-p3-follow"], "AK1b: first touches before follow-ups, id order within a round");
       assertEq(prep.response.candidates.map((c: any) => c.touch_round), [1, 1, 2, 2], "AK1c: daily-prep shows touch_round per candidate");
-      assertEq(prep.selected.map((s) => s.template), ["personal-v4", "personal-v4", "personal-v4-followup", "personal-v4-followup"], "AK1d: template from the round table (today's E/F)");
+      assertEq(prep.selected.map((s) => s.template), ["personal-v4", "personal-v4", "personal-v5-round2", "personal-v5-round2"], "AK1d: template from the round table (E, then round 2 since A2)");
       const reasons = new Map(prep.response.excluded.map((x: any) => [x.provider_id, x.reason]));
-      assertEq([reasons.get("a1-p5-max"), reasons.get("a1-p6-cooldown")], ["max_touch_reached", "cooldown_suppressed"], "AK1e: cap 2 and cooldown unchanged");
+      // A2: cap 5, so E + F is no longer max_touch_reached; F's promise stops it instead.
+      assertEq([reasons.get("a1-p5-max"), reasons.get("a1-p6-cooldown")], ["promise_given", "cooldown_suppressed"], "AK1e: E then F -> promise_given (cap 5); cooldown unchanged");
 
       process.env.DAILY_PREP_MAX_CANDIDATES = "2";
       const capped = m.computeGardssalgOutreachDailyPrep(expDb);

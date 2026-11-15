@@ -2273,7 +2273,14 @@ kontakt@opplevagent.no
 // (kontakt@opplevagent.no), never the personal gmail the RFB template used
 // to carry (removed 2026-08-15, Daniel live) — and never the RFB identity:
 // the draft STYLE is borrowed, the platform separation is not.
-export type GardssalgOutreachTemplate = "standard" | "personal" | "personal-v4" | "personal-v4-followup";
+export type GardssalgOutreachTemplate =
+  | "standard"
+  | "personal"
+  | "personal-v4"
+  | "personal-v4-followup"
+  // dev-request 2026-11-15-opplevagent-fem-henvendelser (A2): round 2 and round 3.
+  | "personal-v5-round2"
+  | "personal-v5-round3";
 
 export function renderGardssalgOutreachPersonal(
   providerName: string,
@@ -2435,6 +2442,66 @@ export function renderGardssalgOutreachV4Followup(
   return { subject, text: paragraphs.join("\n\n") };
 }
 
+// ─── Gårdssalg outreach rounds 2 and 3 (dev-request 2026-11-15-opplevagent-fem-henvendelser, A2) ──
+//
+// Texts «Runde 2 (godkjent)» and «Runde 3 (godkjent)» from marketing-drafts/
+// 2026-11-15-utsendingstekster-opplevagent-runde-2-5.md, approved by Daniel
+// 2026-11-15 and used VERBATIM: only {navn}, {måned}, {profileUrl} and {eier_url}
+// are substituted. Round 2 is text F without «Jeg skriver ikke igjen om dette.».
+// Both are sent like F: plain text, `Re: <first subject>` in the first mail's
+// thread when it exists, else a new mail with subject A.
+
+/** Templates sent as a reply in the first mail's thread (every round after the first). */
+export const GARDSSALG_OUTREACH_FOLLOWUP_TEMPLATES: ReadonlySet<string> = new Set<GardssalgOutreachTemplate>([
+  "personal-v4-followup",
+  "personal-v5-round2",
+  "personal-v5-round3",
+]);
+
+function gardssalgOutreachFollowupSubject(providerName: string, ctx: GardssalgOutreachRenderCtx): string {
+  const first = ctx.firstSubject?.trim();
+  return first ? (/^Re: /i.test(first) ? first : `Re: ${first}`) : gardssalgOutreachSubjectA(providerName);
+}
+
+/** Round 2 — text F without the promise sentence. */
+export function renderGardssalgOutreachRound2(
+  providerName: string,
+  profileUrl: string,
+  ctx: GardssalgOutreachRenderCtx = {},
+): { subject: string; text: string; html?: string } {
+  if (!ctx.monthPhrase) throw new Error("renderGardssalgOutreachRound2: monthPhrase is required");
+  const navn = cleanOutreachProviderName(providerName);
+  const paragraphs = [
+    `Hei igjen,`,
+    `Jeg skrev til dere ${ctx.monthPhrase} om ${navn} på Opplevagent. Det holder med ett ord: tar dere imot besøk, ja eller nei?`,
+    `${profileUrl}`,
+    `Det er gratis å stå der. Vil dere ikke være med, svarer dere «fjern».`,
+    `Vennlig hilsen\nDaniel Fredriksen`,
+    `Slik behandler jeg opplysningene: https://opplevagent.no/personvern`,
+  ];
+  return { subject: gardssalgOutreachFollowupSubject(providerName, ctx), text: paragraphs.join("\n\n") };
+}
+
+/** Round 3 — «Kan dere se over siden?». */
+export function renderGardssalgOutreachRound3(
+  providerName: string,
+  profileUrl: string,
+  ctx: GardssalgOutreachRenderCtx = {},
+): { subject: string; text: string; html?: string } {
+  const navn = cleanOutreachProviderName(providerName);
+  const eierUrl = ctx.eierUrl ?? profileUrl.replace("/kategori/gardssalg/produsent/", "/kategori/gardssalg/eier/");
+  const paragraphs = [
+    `Hei,`,
+    `${navn} står på Opplevagent med det jeg har funnet i Brønnøysundregistrene og på nettsiden deres. Jeg har ikke hørt fra dere, så jeg vet ikke om det stemmer.`,
+    `Kan dere se over siden? Det tar to minutter: ${profileUrl}`,
+    `Er noe feil, svarer dere på denne e-posten, så retter jeg det. Dere kan også rette alt selv, uten passord: ${eierUrl}`,
+    `Vil dere ikke stå der, svarer dere «fjern».`,
+    `Vennlig hilsen\nDaniel Fredriksen`,
+    `Slik behandler jeg opplysningene: https://opplevagent.no/personvern`,
+  ];
+  return { subject: gardssalgOutreachFollowupSubject(providerName, ctx), text: paragraphs.join("\n\n") };
+}
+
 /**
  * The one variant dispatcher both the send path and the CRM-filing path go
  * through (same single-source rule as renderGardssalgOutreach itself, per
@@ -2449,6 +2516,8 @@ export function renderGardssalgOutreachVariant(
 ): { subject: string; text: string; html?: string } {
   if (template === "personal-v4") return renderGardssalgOutreachV4First(providerName, profileUrl, ctx);
   if (template === "personal-v4-followup") return renderGardssalgOutreachV4Followup(providerName, profileUrl, ctx);
+  if (template === "personal-v5-round2") return renderGardssalgOutreachRound2(providerName, profileUrl, ctx);
+  if (template === "personal-v5-round3") return renderGardssalgOutreachRound3(providerName, profileUrl, ctx);
   if (template === "personal") return renderGardssalgOutreachPersonal(providerName, profileUrl);
   if (template === "standard") return renderGardssalgOutreach(providerName, profileUrl);
   // dev-request 2026-11-15-opplevagent-fem-henvendelser (A1): an unknown name never
@@ -2468,6 +2537,8 @@ const GARDSSALG_OUTREACH_TEMPLATE_NAMES: ReadonlySet<string> = new Set<Gardssalg
   "personal",
   "personal-v4",
   "personal-v4-followup",
+  "personal-v5-round2",
+  "personal-v5-round3",
 ]);
 
 export function isGardssalgOutreachTemplate(name: unknown): name is GardssalgOutreachTemplate {
