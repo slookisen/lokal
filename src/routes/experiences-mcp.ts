@@ -118,8 +118,10 @@ import {
   // slice 1 ("myk åpningstidsvalidering"): normalise BEFORE
   // checkBookingSlotAllowed() — see that call site's own comment.
   normaliseBookingSlotInput,
+  getBookingByRef,
 } from "../services/booking-store";
 import { producerNotifyAddressStatus } from "../services/gardssalg-booking-followup";
+import { checkGardssalgBookingGuard, duplicateMessage, capReachedMessage } from "../services/gardssalg-booking-caps";
 // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 item 7: one
 // source for the booking note (discover_gardssalg) and the "not taking
 // requests now" line (book_gardssalg) for owned profiles that are off.
@@ -1589,6 +1591,47 @@ export function registerExperienceTools(
               }, null, 2),
             }],
             isError: true,
+          };
+        }
+
+        // O1-3 (G6/G7): duplicate guard + request caps, behind
+        // GARDSSALG_BOOKING_CAP_ENABLED (flag off → always "ok", no DB read).
+        // Either outcome: no new row and no e-mail.
+        const guard = checkGardssalgBookingGuard(parsed.data);
+        if (guard.kind === "duplicate") {
+          const existing = getBookingByRef(guard.booking_ref);
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                pending: true,
+                duplicate: true,
+                status: existing?.status ?? "reserved",
+                booking_ref: guard.booking_ref,
+                provider: providerInfo,
+                slot_at_local: existing ? formatSlotOslo(existing.slot_at) : slotLocal,
+                message: `${duplicateMessage(guard.booking_ref, "no")} / ${duplicateMessage(guard.booking_ref, "en")}`,
+              }, null, 2),
+            }],
+          };
+        }
+        if (guard.kind === "cap_reached") {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: false,
+                pending: false,
+                cap_reached: true,
+                reason: "cap_reached",
+                cap: guard.cap,
+                limit: guard.limit,
+                provider: providerInfo,
+                slot_at_local: slotLocal,
+                message: `${capReachedMessage(guard.cap, "no", providerInfo?.navn)} / ${capReachedMessage(guard.cap, "en", providerInfo?.navn)}`,
+              }, null, 2),
+            }],
           };
         }
 

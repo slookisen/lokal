@@ -32289,6 +32289,17 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of ghr.failures) failures.push("gardssalg-honest-receipt: " + f);
     console.log(`  gardssalg-honest-receipt: ${ghr.passed} passed, ${ghr.failed} failed`);
 
+    // O1-3 (G6/G7): duplicate guard + request caps behind
+    // GARDSSALG_BOOKING_CAP_ENABLED; flag off unchanged.
+    console.log("\n── gardssalg-booking-caps: duplicate guard + caps + flag off unchanged ──");
+    const { runGardssalgBookingCapsTests } = require("../src/services/gardssalg-booking-caps.test") as
+      typeof import("../src/services/gardssalg-booking-caps.test");
+    const gbc = await runGardssalgBookingCapsTests({ log: false });
+    passed += gbc.passed;
+    failed += gbc.failed;
+    for (const f of gbc.failures) failures.push("gardssalg-booking-caps: " + f);
+    console.log(`  gardssalg-booking-caps: ${gbc.passed} passed, ${gbc.failed} failed`);
+
     // GET /admin/gardssalg-provider-lookup — read-only, case-insensitive
     // substring lookup of experience_providers by navn, returning
     // id/navn/rfb_seed_source/created_at. Closes the gap where /admin/
