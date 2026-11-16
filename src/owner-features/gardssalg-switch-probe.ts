@@ -312,9 +312,10 @@ function caseId(key: string, surface: string): string {
   return `${key} × ${surface}`;
 }
 
-type EntryKind = "switch" | "locked" | "guarantee";
+type EntryKind = "switch" | "locked" | "guarantee" | "confirm_by_email";
 
 function entryKind(e: OwnerFeatureEntry): EntryKind | null {
+  if (e.confirmByEmail) return "confirm_by_email";
   if (e.type === "switch") return "switch";
   if (e.type === "locked") return "locked";
   if (e.type === "guarantee") return "guarantee";
@@ -326,6 +327,7 @@ function directionsFor(kind: EntryKind, baseline: OwnerFeatureValue): ProbeDirec
     case "switch": return baseline === false ? ["on", "off"] : ["off", "on"];
     case "locked": return ["off", "on", "parent_off", "parent_on"];
     case "guarantee": return ["off", "on"];
+    case "confirm_by_email": return ["off", "on"];
   }
 }
 
@@ -1030,6 +1032,21 @@ const outreachSync = (ctx: GardssalgProbeReaderContext): GardssalgSurfaceObserva
   };
 };
 
+/**
+ * O4-3 contact.booking_email: where a booking request for the test row goes
+ * now (gardssalgNotifyRecipient). Read only; the address is never in the
+ * report (a short hash stands for it).
+ */
+const notifyRecipientSync = (ctx: GardssalgProbeReaderContext): GardssalgSurfaceObservation => {
+  const row = ctx.expDb.prepare(`SELECT epost FROM experience_providers WHERE id = ?`).get(ctx.fixture.id) as { epost: string | null } | undefined;
+  const { gardssalgNotifyRecipient } = require("../services/gardssalg-notify-address") as typeof import("../services/gardssalg-notify-address");
+  const to = gardssalgNotifyRecipient(ctx.fixture.id, row?.epost ?? null);
+  const tag = typeof to === "string" && to.trim() !== ""
+    ? require("crypto").createHash("sha256").update(to.trim().toLowerCase()).digest("hex").slice(0, 8)
+    : "ingen";
+  return { endpoints: { recipient: tag !== "ingen" }, detail: `mottaker ${tag}`, requireAll: true };
+};
+
 const syncReader = (fn: (ctx: GardssalgProbeReaderContext) => GardssalgSurfaceObservation, observe: string): GardssalgSurfaceReaderDef => ({ read: fn, sync: fn, observe });
 
 const VISIBILITY_SURFACES = ["profile_html", "listing_html", "mcp_search", "mcp_info", "rest_card", "sitemap", "a2a"];
@@ -1065,6 +1082,9 @@ export function defaultGardssalgSwitchProbeReaders(): Record<string, GardssalgSu
   out[caseId("booking.reminder", "job:booking_previsit")] = syncReader(producerMailGateSync("previsit_reminder_step", "jobbens påminnelsessteg"), "sendGatedProducerEmail-porten: jobbens påminnelse sendes / hoppes over");
   out[caseId("content.guarantee", "job:gardssalg_content_refresh")] = syncReader(ownerLockSync("content_refresh"), "applyGardssalgProviderContent() på eierlåst tekst (rulles tilbake): teksten står");
   out[caseId("content.guarantee", "job:rfb_knowledge_enrich")] = syncReader(ownerLockSync("lock_guard"), "isGardssalgFieldOwnerLocked() på eierlåst tekst (rulles tilbake): låst");
+  for (const s of ["email:booking_request", "email:address_confirm", "email:address_change_notice", "owner_portal"]) {
+    out[caseId("contact.booking_email", s)] = syncReader(notifyRecipientSync, "gardssalgNotifyRecipient: mottakeren av forespørslene (endres bare med bekreftelseslenken)");
+  }
   out[caseId("comms.unsubscribe", "email:outreach")] = syncReader(outreachSync, "unsubscribeHeaderValues(…, experiences): kald e-post får List-Unsubscribe");
   return out;
 }
@@ -1423,6 +1443,38 @@ async function probeRefused(
   }
 }
 
+/** confirm_by_email (contact.booking_email, O4-3): a direct write is refused both ways and the recipient does not change. */
+async function probeConfirmByEmail(c: Ctx, e: OwnerFeatureEntry): Promise<void> {
+  const recipient = () => {
+    try { return notifyRecipientSync(c.readerCtx).detail ?? ""; } catch (err: any) { return `feil: ${String(err?.message || err)}`; }
+  };
+  for (const [d, value] of [["off", null], ["on", "switch-probe@example.invalid"]] as Array<[ProbeDirection, OwnerFeatureValue]>) {
+    const fp0 = storedFingerprint(c);
+    const rec0 = recipient();
+    const before = maxAuditId(c);
+    const w = probeWrite(c, e.key, value);
+    const status = putStatusFor(w);
+    const unchanged = storedFingerprint(c) === fp0 && maxAuditId(c) === before;
+    const refused = w.kind === "blocked" && w.block === "confirm_by_email";
+    c.afterFlip?.(e.key, d);
+    for (const s of e.surfaces) {
+      if (!c.readers[caseId(e.key, s)]) { missingReaderRows(c, e, s, [d]); continue; }
+      const rec1 = recipient();
+      const same = rec1 === rec0;
+      pushRow(c, {
+        key: e.key, surface: s, direction: d,
+        pass: refused && unchanged && same,
+        observed: `PUT ${JSON.stringify(value === null ? null : "switch-probe@…")} → ${status}${w.kind === "blocked" ? ` ${w.block}` : ""}; ${rec1}`,
+        expected: "409 confirm_by_email, ingenting lagret, mottakeren uendret (endres bare med bekreftelseslenken)",
+        ms_to_effect: null, write_status: status, change_logged: null, discriminating: false,
+        ...(!refused ? { reason: `ventet 409 confirm_by_email, fikk ${status}` }
+          : !unchanged ? { reason: "en avvist skriving endret lagret tilstand" }
+          : !same ? { reason: "mottakeren endret seg" } : {}),
+      });
+    }
+  }
+}
+
 /** locked: owner writes refused both ways; the effect follows the parent (lockedWhen) off and on. */
 async function probeLocked(c: Ctx, e: OwnerFeatureEntry): Promise<void> {
   const cur = resolvedNow(c).byKey[e.key]?.value === true;
@@ -1676,6 +1728,7 @@ export async function runGardssalgSwitchProbe(providerId: string, opts: Gardssal
       if (kind === "switch") await probeSwitch(c, e, b);
       else if (kind === "locked") await probeLocked(c, e);
       else if (kind === "guarantee") await probeGuarantee(c, e);
+      else if (kind === "confirm_by_email") await probeConfirmByEmail(c, e);
       else {
         for (const s of e.surfaces) {
           pushRow(c, { key: e.key, surface: s, direction: "on", pass: false, observed: "—", expected: "—", ms_to_effect: null, write_status: null, change_logged: null, discriminating: false, reason: `typen ${e.type} støttes ikke av proben` });

@@ -71,6 +71,11 @@ import {
   parseOwnerFragmentParam, withOwnerFragment,
 } from "../owner-features/anchors";
 import { OWNER_FRAGMENT_HEADER } from "../owner-ui/enhance";
+import {
+  gardssalgNotifyAddressConfirmEnabled, gardssalgNotifyRecipient, notifyAddressState, renderNotifyAddressBlock,
+  requestNotifyAddressConfirmation,
+} from "../services/gardssalg-notify-address";
+import { createGardssalgNotifyAddressRouter } from "./gardssalg-notify-address";
 
 // ─────────────────────────────────────────────────────────────────
 // «Mine valg» for gårdssalg owners — dev-request 2026-10-22-opplevagent-
@@ -673,8 +678,11 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
       const log = ownerFeatureChangeLog(VERTICAL, provider.id, Number.isFinite(page) ? page : 1);
 
       const epost = typeof provider.epost === "string" && provider.epost.trim() !== "" ? provider.epost.trim() : null;
+      // O4-3: with GARDSSALG_NOTIFY_ADDRESS_CONFIRM_ENABLED on, the address
+      // block (OA-3 §3.1) and where requests actually go; off: as before.
+      const addressConfirm = gardssalgNotifyAddressConfirmEnabled();
       const booking: OwnerPageBooking = {
-        requestEmail: epost,
+        requestEmail: addressConfirm && epost ? (gardssalgNotifyRecipient(provider.id, epost) ?? epost) : epost,
         adminBrake: provider.booking_admin_brake_at
           ? { note: provider.booking_admin_brake_note && provider.booking_admin_brake_note.trim() ? provider.booking_admin_brake_note.trim() : null }
           : null,
@@ -683,6 +691,9 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
         expireHours: previsitExpireHours(),
         maxPartySize: maxPartySize(),
         readMoreUrl: GARDSSALG_BOOKING_READ_MORE_URL,
+        ...(addressConfirm
+          ? { addressConfirmHtml: renderNotifyAddressBlock(notifyAddressState(provider.id, epost), PAGE_PATH(slug, "/adresse")) }
+          : {}),
       };
 
       const model: OwnerPageModel = {
@@ -764,6 +775,36 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
       return failBack("POST valg/sett")(req, res, e, anchor);
     }
   });
+
+  // ── O4-3: «Send bekreftelse» for the address requests go to ───────────
+  // POST …/valg/adresse — flag GARDSSALG_NOTIFY_ADDRESS_CONFIRM_ENABLED off:
+  // this route does not exist (falls through exactly as before). Then the
+  // page's own checks (pageGate: flag, allowlist, test producer, session,
+  // claim; writeGuard: Origin + per-session cap) and 303 back to the
+  // «Ta imot besøk» row, where the block shows the new state (addr.sent).
+  router.post(
+    "/kategori/gardssalg/eier/:providerSlug/valg/adresse",
+    (_req: Request, _res: Response, next: (arg?: unknown) => void) => (gardssalgNotifyAddressConfirmEnabled() ? next() : next("route")),
+    generalLimiter,
+    express.urlencoded({ extended: false }),
+    async (req: Request, res: Response) => {
+    const anchor = ownerRowAnchor("booking.enabled");
+    try {
+      const g = pageGate(req);
+      if (!g.ok) return g.send(res);
+      const guard = writeGuard(req, g.token, anchor);
+      if (guard) return guard(res);
+      const out = await requestNotifyAddressConfirmation(g.provider.id);
+      if (out.kind === "throttled") return backTo(res, g.slug, "melding=for_mange", anchor);
+      if (out.kind === "failed" || out.kind === "not_found" || out.kind === "off") return backTo(res, g.slug, "melding=feil", anchor);
+      return backTo(res, g.slug, "", anchor, { place: false });
+    } catch (e) {
+      return failBack("POST valg/adresse")(req, res, e, anchor);
+    }
+  });
+
+  // The page the e-mailed link opens (routes/gardssalg-notify-address.ts).
+  router.use(createGardssalgNotifyAddressRouter(shell));
 
   router.post(
     "/kategori/gardssalg/eier/:providerSlug/valg/niva",

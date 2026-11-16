@@ -41,6 +41,7 @@ import {
   deadlineAfterSuggestion,
 } from "./gardssalg-attendance-guard";
 import { gardssalgNow } from "./gardssalg-test-clock";
+import { gardssalgNotifyRecipient } from "./gardssalg-notify-address";
 import {
   emailText,
   fillEmailText,
@@ -743,6 +744,8 @@ export async function sendProducerNotification(
   // Resolve the DB handle NOW (same tick as the caller): the send resolves
   // later, and a late getDb() could open a different database.
   const db = getDb(VERTICAL);
+  // O4-3: the confirmed address while a changed one awaits confirmation (flag off: unchanged).
+  producerEmail = gardssalgNotifyRecipient(booking.provider_id, producerEmail);
   const record = (outcome: ProducerNotifyOutcome, reason?: string) =>
     recordProducerNotifyOutcome(db, booking, outcome, { retry: opts.retry, reason });
   if (!producerEmail || !producerEmail.trim()) {
@@ -1451,7 +1454,8 @@ function getProviderDispatchRow(provider_id: string): {
     .get(provider_id) as
     | { navn: string | null; epost: string | null; booking_live: number | null; catalog_hidden: number | null; is_test_provider: number | null }
     | undefined;
-  return row ?? null;
+  // O4-3: the confirmed address while a changed one awaits confirmation (flag off: unchanged).
+  return row ? { ...row, epost: gardssalgNotifyRecipient(provider_id, row.epost) ?? null } : null;
 }
 
 // Exported for O1-5 (gardssalg-cancel.ts): the producer's cancellation notice
