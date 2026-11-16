@@ -181,7 +181,9 @@ export function runLokalAgentVerifierSnapshotClaimsTests(
       }
       // agents_verified is a per-run delta and must be untouched.
       assertEq(findClaim(withSnap, "agents_verified")?.value, 0, "sc-08: agents_verified stays the per-run count");
-      assertEq(findClaim(withSnap, "agents_verified")?.meta, { kind: "agents_verified" }, "sc-09: agents_verified meta unchanged");
+      // meta carries agent_ids since dev-request 2026-10-30-verifier-verified-
+      // demoted-agent-id-i-meta (slice 2), but no snapshot scope/batch_count.
+      assertEq(findClaim(withSnap, "agents_verified")?.meta, { kind: "agents_verified", agent_ids: [] }, "sc-09: agents_verified meta not snapshot-scoped");
       // Partial snapshot object: kinds missing from it fall back to batch.
       const partial = buildRunEnvelope({ ...base, snapshotCounts: { agents_pending_verify: 7 } });
       assertEq(findClaim(partial, "agents_pending_verify")?.value, 7, "sc-10: partial snapshot applies to present kind");
