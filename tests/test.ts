@@ -26517,7 +26517,11 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
       buyer_email TEXT,
       buyer_phone TEXT,
       delivery_note TEXT,
-      contact_consent_at TEXT
+      contact_consent_at TEXT,
+      -- C1-B2 (dev-request 2026-11-12-rfb-c1-claude-knapp-sporing-
+      -- gjenkjenning): createCart() writes and submitCart() reads the
+      -- AI-assistant label (NULL outside MCP).
+      source_client TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_carts_buyer_ref ON carts(buyer_ref);
     CREATE TABLE cart_items (
@@ -26558,7 +26562,9 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
       -- kjoperagent): the shared order-action layer reads notify_sent_at and
       -- transitionOrder writes completion_source.
       notify_sent_at TEXT,
-      completion_source TEXT
+      completion_source TEXT,
+      -- C1-B2: submitCart() copies the cart's source_client onto every order.
+      source_client TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_orders_cart_id  ON orders(cart_id);
     CREATE INDEX IF NOT EXISTS idx_orders_agent_id ON orders(agent_id);
@@ -53111,6 +53117,27 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("opplevelser-gardssalg-source-client: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-11-12-rfb-c1-claude-knapp-sporing-gjenkjenning C1-B2:
+// carts.source_client / orders.source_client (which AI assistant an RFB order
+// came from) over the real /mcp router, the REST cart route and the admin
+// order statistics. Swaps getDb(), the cart test db, the admin-stats dbs and
+// env (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-12-rfb-c1 C1-B2: source_client på RFB-handlekurv og ordre ──");
+  try {
+    const { runRfbCartSourceClientTests } = require("../src/routes/rfb-cart-source-client.test") as
+      typeof import("../src/routes/rfb-cart-source-client.test");
+    const r = await runRfbCartSourceClientTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-cart-source-client: " + f);
+    console.log(`  rfb-cart-source-client: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-cart-source-client: unexpected error: " + String(err?.message || err));
   }
 });
 

@@ -26,7 +26,7 @@ import { slugify } from "../utils/slug";
 import { textEntries } from "../utils/text-entries";
 import { areGenericCategoryNames, isGenericCategoryName, isCategoryLabel } from "../utils/category-label";
 import { openingHoursText } from "../utils/opening-hours";
-import { addAiUtmParams, detectAiClient } from "../utils/url-utm";
+import { addAiUtmParams, aiClientFromHeaders, detectAiClient, sourceClientLabel } from "../utils/url-utm";
 import { tagMcpToolResults } from "../middleware/ai-profile-links";
 import { getDb } from "../database/init";
 import { isDisplayablePhone } from "../services/contact-normalizer";
@@ -1777,9 +1777,18 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    guardToolHandler("lokal_cart_create", async () => {
+    guardToolHandler("lokal_cart_create", async (_args: unknown, extra?: ToolExtra) => {
       try {
-        const result = svcCreateCart();
+        // C1-B2 (dev-request 2026-11-12-rfb-c1-claude-knapp-sporing-gjenkjenning):
+        // which AI assistant (session identity, else this call's headers /
+        // initialize client name — the F1-1 rule of book_gardssalg), stored on
+        // the cart only as a fixed label (sourceClientLabel), else NULL. Not in
+        // the result: the tool's answer is unchanged.
+        const sourceClient = sourceClientLabel(
+          getClientIdentity?.()
+            ?? aiClientFromHeaders(extra?.requestInfo?.headers, (server as any).server?.getClientVersion?.()?.name ?? null),
+        );
+        const result = svcCreateCart({ sourceClient });
         return {
           content: [{
             type: "text" as const,

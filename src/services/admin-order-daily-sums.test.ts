@@ -369,12 +369,14 @@ export async function runAdminOrderDailySumsTests(opts: { log?: boolean } = {}):
         // that used the frozen sums; the numbers stay the same.
         // Response-time figures are live-only by design (a median cannot be
         // rebuilt from day sums), so they are left out of the comparison.
+        // So is rfb.by_source_client (C1-B2): read from the remaining rows only.
         if (QUERIES[i].includes("/oversikt")) {
           const strip = (s: string) => {
             const o = JSON.parse(s.slice(4));
             for (const v of Object.values(o)) if (v && typeof v === "object") {
               delete (v as any).dagssummer;
               delete (v as any).response_time;
+              delete (v as any).by_source_client;
               for (const w of Object.values(v as object)) if (w && typeof w === "object") delete (w as any).dagssummer;
             }
             return o;
