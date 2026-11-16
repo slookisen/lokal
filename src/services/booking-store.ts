@@ -39,6 +39,7 @@ import {
   CONFIRMED_VISIT_SQL,
   deadlineAfterSuggestion,
 } from "./gardssalg-attendance-guard";
+import { gardssalgNow } from "./gardssalg-test-clock";
 
 const VERTICAL = "experiences";
 const APP_URL = process.env.APP_URL || "https://opplevagent.no";
@@ -464,10 +465,12 @@ export function reopenBooking(confirm_token: string): GardssalgBooking | null {
 // Fly), so for an Oslo visit the guard opens up to ~2h after the actual
 // local start — conservative in the right direction for "bekreft etter
 // besøket". An unparseable slot_at returns true so a broken row can still
-// be resolved rather than being stuck forever.
+// be resolved rather than being stuck forever. The default `now` is
+// gardssalgNow(): real time, except a test-only override off production
+// (O1-7, services/gardssalg-test-clock.ts).
 export function visitTimeReached(
   booking: Pick<GardssalgBooking, "slot_at">,
-  now: Date = new Date(),
+  now: Date = gardssalgNow(),
 ): boolean {
   const t = new Date(booking.slot_at).getTime();
   if (isNaN(t)) return true;

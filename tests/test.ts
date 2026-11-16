@@ -54788,3 +54788,31 @@ runSerial(async () => {
     failures.push("owner-session-sliding: unexpected error: " + String(err?.message || err));
   }
 });
+
+// O1-7 (2026-11-12-opplevagent-o1-trygg-aa-aapne): test-only clock for the
+// «Møtte»/«Ikke møtt» time gate (no effect under NODE_ENV=production, AK1),
+// and the route test for the existing guest-contact dry-run count (AK2).
+// Own in-memory DBs; swaps NODE_ENV / FLY_APP_NAME / GARDSSALG_TEST_NOW /
+// ADMIN_KEY (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── O1-7: testklokke for oppmøte + tørrkjøringstall for gjestekontakt ──");
+  try {
+    const { runGardssalgTestClockTests } = require("../src/services/gardssalg-test-clock.test") as
+      typeof import("../src/services/gardssalg-test-clock.test");
+    const r = await runGardssalgTestClockTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-test-clock: " + f);
+    console.log(`  gardssalg-test-clock: ${r.passed} passed, ${r.failed} failed`);
+    const { runAdminGardssalgGuestContactSweepRouteTests } = require("../src/routes/admin-gardssalg-guest-contact-sweep.test") as
+      typeof import("../src/routes/admin-gardssalg-guest-contact-sweep.test");
+    const d = await runAdminGardssalgGuestContactSweepRouteTests({ log: false });
+    passed += d.passed;
+    failed += d.failed;
+    for (const f of d.failures) failures.push("admin-gardssalg-guest-contact-sweep: " + f);
+    console.log(`  admin-gardssalg-guest-contact-sweep: ${d.passed} passed, ${d.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("o1-7 test clock / dry-run: unexpected error: " + String(err?.message || err));
+  }
+});
