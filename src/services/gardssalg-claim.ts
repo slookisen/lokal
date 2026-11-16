@@ -2396,6 +2396,35 @@ export function verifyClaimToken(token: string): VerifyClaimResult {
   return { valid: true, providerId: claim.provider_id, token: claim.token };
 }
 
+// ── O3-2: confirm step (A2A dev-request 2026-11-12-opplevagent-o3-eierkrav-
+// og-innlogging; flag GARDSSALG_CLAIM_CONFIRM_STEP_ENABLED in the route) ────
+// With the flag on, a GET on the link only looks (peekClaimToken: no write)
+// and the owner's POST from the confirm page takes ownership
+// (confirmClaimToken). Unlike verifyClaimToken, both require used = 0, so a
+// link works for one confirmation only and a second POST is rejected.
+const UNUSED_CLAIM_SQL = `SELECT id, provider_id, token FROM gardssalg_claims
+   WHERE token = ? AND used = 0 AND expires_at > datetime('now') AND revoked_at IS NULL
+     AND COALESCE(draft_mode, 0) = 0`;
+
+/** Read-only: is this an unused, live claim link? Writes nothing. */
+export function peekClaimToken(token: string): { valid: boolean; providerId?: string } {
+  const claim = getDb(VERTICAL).prepare(UNUSED_CLAIM_SQL).get(token) as { provider_id: string } | undefined;
+  return claim ? { valid: true, providerId: claim.provider_id } : { valid: false };
+}
+
+/** The confirm POST: the same writes as verifyClaimToken, once per link. The
+ *  check and the writes run in one transaction, so two POSTs cannot both win. */
+export function confirmClaimToken(token: string): VerifyClaimResult {
+  const db = getDb(VERTICAL);
+  const txn = db.transaction((): VerifyClaimResult => {
+    const claim = db.prepare(UNUSED_CLAIM_SQL).get(token) as { id: string; provider_id: string; token: string } | undefined;
+    if (!claim) return { valid: false };
+    markClaimUsedAndLockProvider(db, claim.id, claim.provider_id);
+    return { valid: true, providerId: claim.provider_id, token: claim.token };
+  });
+  return txn();
+}
+
 /** The writes a used claim makes: the claim row used, content_source='claim'
  *  (never over 'manual'), claimed_at first-claim-wins. Shared by
  *  verifyClaimToken() and promoteSelfRegisteredDraftClaim() so there is one

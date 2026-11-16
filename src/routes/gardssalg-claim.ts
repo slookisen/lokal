@@ -6,6 +6,9 @@ import {
   issueClaimMagicLink,
   resendClaimLinkForToken,
   verifyClaimToken,
+  peekClaimToken,
+  confirmClaimToken,
+  type VerifyClaimResult,
   verifyGardssalgOwnerSessionToken,
   revokeClaimToken,
   updateClaimedProviderProfile,
@@ -30,7 +33,7 @@ import { generalLimiter } from "../middleware/security";
 import { ownerBookingEnableBlock, type OwnerBookingBlock } from "../services/gardssalg-booking-gate";
 import { createGardssalgOwnerFeaturesRouter, gardssalgOwnerDashboardOnForSession, gardssalgOwnerFeaturesTabOpen } from "./gardssalg-owner-features";
 import { wrapGardssalgDashboard } from "../owner-ui/gardssalg-dashboard";
-import { CLAIM_LINK_TEXTS } from "./gardssalg-claim-texts";
+import { CLAIM_LINK_TEXTS, CLAIM_CONFIRM_TEXTS } from "./gardssalg-claim-texts";
 
 // ─────────────────────────────────────────────────────────────────
 // GÅRDSSALG PRODUCER OWNER-CLAIM — dev-request 2026-07-21-opplevagent-
@@ -429,27 +432,107 @@ router.get("/kategori/gardssalg/eier/magic-link-verify", generalLimiter, (req: R
     if (!token || typeof token !== "string") {
       return sendClaimLinkPage(res, claimInvalidPage(""));
     }
+    if (claimConfirmStepEnabled()) {
+      // O3-2: the GET only looks. No row changes, no cookie.
+      const peek = peekClaimToken(token);
+      const provider = peek.valid && peek.providerId ? getClaimProviderById(peek.providerId) : null;
+      if (!provider) return sendClaimLinkPage(res, claimInvalidPage(token));
+      return sendClaimLinkPage(res, claimConfirmPage(token, provider.navn));
+    }
     const result = verifyClaimToken(token);
     if (!result.valid || !result.providerId) {
       return sendClaimLinkPage(res, claimInvalidPage(token));
     }
-
-    res.cookie(GARDSSALG_OWNER_SESSION_COOKIE, result.token, {
-      path: "/",
-      maxAge: 7 * 24 * 60 * 60 * 1000,
-      httpOnly: true,
-      secure: true,
-      sameSite: "lax",
-    });
-
-    const provider = getClaimProviderById(result.providerId);
-    const target = provider?.slug ? `/kategori/gardssalg/eier/${encodeURIComponent(provider.slug)}/portal` : "/kategori/gardssalg";
-    return res.redirect(302, target);
+    return grantOwnerSessionAndRedirect(res, result);
   } catch (err) {
     console.error("[gardssalg-claim] magic-link-verify error:", err);
     return res.redirect(302, "/kategori/gardssalg?error=verify_failed");
   }
 });
+
+/** Session cookie + redirect to the portal after a successful claim — the
+ *  same answer the link GET has always given; the O3-2 confirm POST reuses it. */
+function grantOwnerSessionAndRedirect(res: Response, result: VerifyClaimResult) {
+  res.cookie(GARDSSALG_OWNER_SESSION_COOKIE, result.token, {
+    path: "/",
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+    httpOnly: true,
+    secure: true,
+    sameSite: "lax",
+  });
+
+  const provider = getClaimProviderById(result.providerId!);
+  const target = provider?.slug ? `/kategori/gardssalg/eier/${encodeURIComponent(provider.slug)}/portal` : "/kategori/gardssalg";
+  return res.redirect(302, target);
+}
+
+// ── O3-2: a GET does not grant ownership (A2A dev-request 2026-11-12-
+// opplevagent-o3-eierkrav-og-innlogging; flag GARDSSALG_CLAIM_CONFIRM_STEP_
+// ENABLED, default off, read per request) ───────────────────────────────────
+// With the flag on, the link GET above renders a confirm page (OA-4 part 2)
+// and writes nothing, so an e-mail scanner that opens the link triggers
+// nothing. Ownership and the session come only from the POST below, which
+// takes the token in the form body (never in a URL or a log) and accepts a
+// link once: a second POST gets the O3-1 dead-link page. The token itself is
+// the capability, as on send-ny-lenke; no session exists before this POST.
+// «Dette er ikke meg» posts action=not_me and changes nothing.
+// With the flag off the POST route falls through (next()), exactly as before
+// it existed, and the GET behaves as it always has.
+export function claimConfirmStepEnabled(): boolean {
+  return process.env.GARDSSALG_CLAIM_CONFIRM_STEP_ENABLED === "true";
+}
+
+const CLAIM_CONFIRM_PATH = "/kategori/gardssalg/eier/magic-link-confirm";
+
+function fillProdusent(text: string, produsent: string): string {
+  return text.split("{produsent}").map(escapeHtml).join(escapeHtml(produsent));
+}
+
+function claimConfirmPage(token: string, produsent: string): string {
+  const T = CLAIM_CONFIRM_TEXTS;
+  return shell(T["claim.confirm.heading"].replace("{produsent}", produsent), `<div class="gc-card" data-gc-claim-confirm="1">
+    <h1>${fillProdusent(T["claim.confirm.heading"], produsent)}</h1>
+    <p>${escapeHtml(T["claim.confirm.body"])}</p>
+    <p>${fillProdusent(T["claim.confirm.responsibility"], produsent)}</p>
+    <form id="gc-claim-confirm-form" method="post" action="${CLAIM_CONFIRM_PATH}">
+      <input type="hidden" name="token" value="${escapeHtml(token)}">
+      <div class="gc-form-actions">
+        <button type="submit" name="action" value="confirm" class="gc-btn gc-btn-primary">${escapeHtml(T["claim.confirm.button"])}</button>
+        <button type="submit" name="action" value="not_me" class="gc-btn gc-btn-ghost">${escapeHtml(T["claim.confirm.notMe"])}</button>
+      </div>
+    </form>
+    ${claimHelpHtml()}
+  </div>`);
+}
+
+function claimNotMePage(): string {
+  const T = CLAIM_CONFIRM_TEXTS;
+  return shell(T["claim.confirm.notMe"], `<div class="gc-card" data-gc-claim-not-me="1">
+    <h1>${escapeHtml(T["claim.confirm.notMe"])}</h1>
+    <p>${escapeHtml(T["claim.confirm.notMe.done"])}</p>
+  </div>`);
+}
+
+router.post(
+  CLAIM_CONFIRM_PATH,
+  generalLimiter,
+  express.urlencoded({ extended: false }),
+  (req: Request, res: Response, next: express.NextFunction) => {
+    if (!claimConfirmStepEnabled()) return next();
+    try {
+      const body = (req.body || {}) as Record<string, unknown>;
+      if (body.action === "not_me") return sendClaimLinkPage(res, claimNotMePage());
+      const token = typeof body.token === "string" ? body.token : "";
+      const result = token ? confirmClaimToken(token) : { valid: false };
+      if (!result.valid || !result.providerId) return sendClaimLinkPage(res, claimInvalidPage(token));
+      res.setHeader("Cache-Control", "no-store");
+      return grantOwnerSessionAndRedirect(res, result);
+    } catch (err: any) {
+      console.error("[gardssalg-claim] magic-link-confirm error:", String(err?.message || err));
+      return res.redirect(302, "/kategori/gardssalg?error=verify_failed");
+    }
+  },
+);
 
 // ─────────────────────────────────────────────────────────────────
 // GET /kategori/gardssalg/eier/:providerSlug — unauthenticated claim entry

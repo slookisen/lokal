@@ -212,6 +212,8 @@ export async function runGardssalgClaimHostGateTests(opts: { log?: boolean } = {
       ["w16", "post", "/kategori/gardssalg/eier/:providerSlug/resume"],
       // O3-1 (dev-request 2026-11-12-opplevagent-o3-eierkrav-og-innlogging): «Send ny lenke».
       ["w17", "post", "/kategori/gardssalg/eier/send-ny-lenke"],
+      // O3-2: the owner's confirm button (flag GARDSSALG_CLAIM_CONFIRM_STEP_ENABLED).
+      ["w18", "post", "/kategori/gardssalg/eier/magic-link-confirm"],
     ];
     for (const [id, method, routePath] of wired) {
       const label = `${method.toUpperCase()} ${routePath}`;
@@ -227,7 +229,7 @@ export async function runGardssalgClaimHostGateTests(opts: { log?: boolean } = {
 
     // ── g1-g3: scope ────────────────────────────────────────────────────
     const all = routeLabels(claimRouter);
-    assertEq(all.length, wired.length, `g1: the claim router has exactly the ${wired.length} routes above (a new one must be added to w1-w17)`);
+    assertEq(all.length, wired.length, `g1: the claim router has exactly the ${wired.length} routes above (a new one must be added to w1-w18)`);
     assertEq(routeLabels(claimRouter, generalLimiter), all, "g2: every claim route chains generalLimiter, and none is router-wide");
     assertTrue(!claimRouter.stack.some((l) => !l.route && l.handle === generalLimiter),
       "g2b: no router-wide generalLimiter (an unmatched /api/opplevelser/gardssalg-claim/* path is counted once, by the \"/api\" mount)");
@@ -251,8 +253,8 @@ export async function runGardssalgClaimHostGateTests(opts: { log?: boolean } = {
           if (!ac2LimitersFor(sample).includes("general")) uncounted.push(sample);
         }
       }
-      assertTrue(checked === 17 && uncounted.length === 0,
-        `a1: ac2LimitersFor counts all 17 route-level generalLimiter paths on the claim router as general (checked ${checked}, uncounted ${JSON.stringify(uncounted)})`);
+      assertTrue(checked === 18 && uncounted.length === 0,
+        `a1: ac2LimitersFor counts all 18 route-level generalLimiter paths on the claim router as general (checked ${checked}, uncounted ${JSON.stringify(uncounted)})`);
     }
 
     // ── i1-i5: index.ts order (source inspection) ───────────────────────
