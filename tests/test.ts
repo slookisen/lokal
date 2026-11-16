@@ -52707,6 +52707,25 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-12-opplevagent-o2-eierdashbord-for-besok, O2-2: «Mine
+// besøk» wired to a page — own requests only, the actions as plain POST forms
+// (Origin: null accepted), wrong-state rows refused. Swaps getDb() + env — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-12-opplevagent-o2-eierdashbord-for-besok O2-2: «Mine besøk» koblet til en side ──");
+  try {
+    const { runGardssalgOwnerDashboardO22Tests } = require("../src/routes/gardssalg-owner-dashboard-o2-2.test") as
+      typeof import("../src/routes/gardssalg-owner-dashboard-o2-2.test");
+    const r = await runGardssalgOwnerDashboardO22Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-owner-dashboard-o2-2: " + f);
+    console.log(`  gardssalg-owner-dashboard-o2-2: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-owner-dashboard-o2-2: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // Eierportal bølge 0, T2: the «Mine valg» level preview (GET …/valg?niva=)
 // never writes — on gårdssalg (experiences.db booking_live, gardssalg_content_audit)
 // nor RFB; the preview equals the confirmed apply. Swaps getDb() + env — runSerial.
