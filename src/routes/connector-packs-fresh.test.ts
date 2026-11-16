@@ -54,7 +54,7 @@ import { DENTAL_MCP_INSTRUCTIONS } from "./dental-mcp";
 import { emergencyDutyWithoutQuote } from "./dental-mcp-instructions.test";
 import { parseClaims } from "./distribution-metadata.test";
 import {
-  DIRECTIVE_PATTERNS, FLOOR_KEY, LIMITS, ONLY_IF_ASKED, PACKS, PACK_FILES, PACK_VERTICALS, PORTAL_FIELDS, PORTAL_URL, SERVER_INFO_FIELDS,
+  CONTRACT_WINDOW_DOC, DIRECTIVE_PATTERNS, FLOOR_KEY, LIMITS, ONLY_IF_ASKED, PACKS, PACK_FILES, PACK_VERTICALS, PORTAL_FIELDS, PORTAL_URL, SERVER_INFO_FIELDS,
   USE_CASE_LIMITS, cardTemplatesMd5, directivePhrases, formatInt, gatherPackInput, readCatalogFloors, readServerConstruction,
   renderConnectorPacks, renderPack, stalePackFiles, type PackInput, type PackSpec,
 } from "../../scripts/gen-connector-packs";
@@ -374,6 +374,15 @@ export function runConnectorPacksFreshTests(opts: { log?: boolean } = {}): TestS
 
       // ── (i) MCPB ───────────────────────────────────────────────────────────
       assertTrue(/## Not a directory path[\s\S]*MCPB/.test(readme), `i1 ${v}: the README says MCPB is not a directory path`);
+      // F1-2 (A2A dev-request 2026-11-12-f1-felles-for-ai-kanalene): the RFB and Opplevagent packs link the
+      // tool-contract window procedure; the dental pack, which it does not cover, does not.
+      const windowSection = readme.split("## When a tool definition changes")[1]?.split("\n## ")[0] ?? "";
+      if (v === "dental") {
+        assertTrue(!readme.includes(CONTRACT_WINDOW_DOC), `i4 ${v}: the dental README does not link the tool-contract window procedure`);
+      } else {
+        assertTrue(windowSection.includes(CONTRACT_WINDOW_DOC) && (windowSection.match(/^- \[ \] /gm) ?? []).length >= 4,
+          `i4 ${v}: the README has a tool-contract checklist that links ${CONTRACT_WINDOW_DOC}`);
+      }
 
       // ── (j) Connection and Data handling ─────────────────────────────────
       assertTrue(portal.includes(`| Protocol versions (MCP SDK) | ${SUPPORTED_PROTOCOL_VERSIONS.map((p) => `\`${p}\``).join(", ")} |`),

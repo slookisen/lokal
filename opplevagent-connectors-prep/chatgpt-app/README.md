@@ -1,5 +1,9 @@
 # Opplevagent — ChatGPT App submission checklist
 
+> **Changing a tool definition after publication?** Follow the tool-contract window procedure
+> (https://github.com/slookisen/A2A/blob/main/protocols/kontraktvindu-verktoytekster.md):
+> one window per server, before/after per tool, deploy → scan → upload, and one list for Daniel.
+
 > **2026-09-24: v1.0.0 was rejected (test cases).** Root causes, fixes and the
 > resubmission steps are in [`CHATGPT-APP-RESUBMISSION-2026-09-24.md`](../../CHATGPT-APP-RESUBMISSION-2026-09-24.md).
 > The card templates now live in `src/routes/opplevagent-widgets.ts` and are
