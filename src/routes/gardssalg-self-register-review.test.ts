@@ -36,6 +36,10 @@
  *         stored; a second reject / approve is 409.
  *   nd    approve of a registration that never confirmed its e-mail: public,
  *         no owner claim until the mailed link is used.
+ *   age   O6-2 (dev-request 2026-11-12-opplevagent-o6-tilfang-og-
+ *         selvregistrering): age_hours, age_business_days, stale per row and
+ *         stale_count / stale_threshold_business_days on the GET; the pure
+ *         helpers across a weekend, the 2-day boundary and unreadable dates.
  *   bad   400 / 404 / 409 for bad body, unknown id, an ordinary row.
  *   n5    the «Mine valg» booking adapter treats pending / rejected rows as
  *         booking-blocked, like ownerBookingEnableBlock.
@@ -319,6 +323,50 @@ export function runGardssalgSelfRegisterReviewTests(opts: { log?: boolean } = {}
           "q-12: a Brreg-unavailable submission is listed, not actionable, link not_sent");
         assertTrue(!g.body.includes("email_code_hash") && !g.body.includes(okDraftToken) && !/[0-9a-f]{64}/.test(g.body),
           "q-13: no code hash, no token in the queue response");
+
+        // O6-2 (AK3): age per row and the stale summary on the 200 response.
+        assertTrue(e.length > 0 && e.every((x) => typeof x.age_hours === "number" && typeof x.age_business_days === "number" && typeof x.stale === "boolean"),
+          "age-1: AK3 — every row carries age_hours, age_business_days and stale (200 with the flag on)");
+        assertEq(Object.keys(g.json || {}), ["count", "entries", "stale_count", "stale_threshold_business_days"],
+          "age-2: top level keeps count, entries first and adds stale_count, stale_threshold_business_days");
+        assertEq(g.json?.stale_threshold_business_days, 2, "age-3: stale_threshold_business_days = 2");
+        assertEq(g.json?.stale_count, e.filter((x) => x.stale === true).length, "age-4: stale_count = stale rows among entries");
+        // The fixtures are from 30.10–04.11.2026; on any later date they are more than 2 business days old.
+        assertEq(g.json?.stale_count, 5, "age-5: the old fixture rows are all stale");
+      }
+
+      // ── age: the O6-2 pure helpers, fixed now ─────────────────────────────
+      {
+        const s = svc;
+        // 2026-11-13 is a Friday, 2026-11-16 Monday, 2026-11-18 Wednesday.
+        assertEq(s.wholeHoursSince("2026-11-13 10:00:00", new Date("2026-11-13T15:59:59Z")), 5, "age-h1: age_hours floors (5 h 59 m → 5), space form read as UTC");
+        assertEq(s.wholeHoursSince("2026-11-13T10:00:00.000Z", new Date("2026-11-16T10:00:00Z")), 72, "age-h2: ISO form, 3 days → 72 h");
+        assertEq(s.wholeHoursSince("2026-11-13 10:00:00", new Date("2026-11-13T09:00:00Z")), 0, "age-h3: a future created_at → 0, never negative");
+        assertEq(s.businessDaysSince("2026-11-13 10:00:00", new Date("2026-11-16T08:00:00Z")), 1, "age-b1: Friday → Monday = 1 business day (weekend skipped)");
+        assertEq(s.businessDaysSince("2026-11-13 23:59:59", new Date("2026-11-18T00:00:01Z")), 3, "age-b2: Friday → Wednesday = 3");
+        assertEq(s.businessDaysSince("2026-11-13", new Date("2026-11-13T23:00:00Z")), 0, "age-b3: same day = 0");
+        assertEq(s.businessDaysSince("2026-11-14 12:00:00", new Date("2026-11-16T12:00:00Z")), 1, "age-b4: Saturday → Monday = 1");
+        assertEq(s.businessDaysSince("2026-11-02", new Date("2026-11-16T12:00:00Z")), 10, "age-b5: two full weeks = 10");
+        assertEq(s.businessDaysSince("2026-11-20", new Date("2026-11-16T12:00:00Z")), 0, "age-b6: a future date = 0");
+        const fri = s.selfRegisterQueueAge("2026-11-13 10:00:00", new Date("2026-11-18T10:00:00Z"));
+        assertEq(fri, { age_hours: 120, age_business_days: 3, stale: true }, "age-s1: Friday → Wednesday: 3 business days → stale");
+        const two = s.selfRegisterQueueAge("2026-11-13 10:00:00", new Date("2026-11-17T10:00:00Z"));
+        assertEq(two, { age_hours: 96, age_business_days: 2, stale: false }, "age-s2: exactly 2 business days → not stale (boundary)");
+        const mon = s.selfRegisterQueueAge("2026-11-13 10:00:00", new Date("2026-11-16T10:00:00Z"));
+        assertEq(mon, { age_hours: 72, age_business_days: 1, stale: false }, "age-s3: Friday → Monday: 72 h but 1 business day → not stale");
+        for (const bad of ["", "   ", "not a date", "2026-13-01 10:00:00", null, undefined] as Array<string | null | undefined>) {
+          assertEq(s.selfRegisterQueueAge(bad, new Date("2026-11-18T10:00:00Z")), { age_hours: null, age_business_days: null, stale: false },
+            `age-u: unreadable created_at ${JSON.stringify(bad)} → nulls, not stale`);
+        }
+        // An impossible date: the Python virkedager (date.fromisoformat) gives None, so business days are null and the row is not stale.
+        const feb30 = s.selfRegisterQueueAge("2026-02-30", new Date("2026-11-18T10:00:00Z"));
+        assertEq([feb30.age_business_days, feb30.stale], [null, false], "age-u2: 2026-02-30 → age_business_days null, not stale");
+        assertEq(s.SELF_REGISTER_QUEUE_STALE_BUSINESS_DAYS, 2, "age-c: the threshold constant is 2");
+        // listSelfRegisterReviewQueue takes `now`: r-nd (Wed 04.11) seen on Fri 06.11 = 2 (not stale), on Mon 09.11 = 3 (stale).
+        const q1 = s.listSelfRegisterReviewQueue(new Date("2026-11-06T12:00:00Z")).entries.find((x) => x.registration_id === "r-nd");
+        const q2 = s.listSelfRegisterReviewQueue(new Date("2026-11-09T12:00:00Z")).entries.find((x) => x.registration_id === "r-nd");
+        assertEq([q1?.age_hours, q1?.age_business_days, q1?.stale, q1?.age_days], [50, 2, false, 2], "age-l1: the service uses the injected now (2 business days, not stale)");
+        assertEq([q2?.age_business_days, q2?.stale], [3, true], "age-l2: one business day later the row is stale");
       }
 
       // ── bad input ───────────────────────────────────────────────────────

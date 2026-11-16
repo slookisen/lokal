@@ -846,6 +846,7 @@ import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
 import {
   isGardssalgSelfRegisterEnabled,
   listSelfRegisterReviewQueue,
+  SELF_REGISTER_QUEUE_STALE_BUSINESS_DAYS,
   approveSelfRegistration,
   rejectSelfRegistration,
   finishSelfRegisterApproval,
@@ -11191,6 +11192,14 @@ router.post("/admin/gardssalg-claim-revoke", requireAdmin, (req: Request, res: R
 //          duplicate signals, submitter + e-mail, the assessment, timestamps
 //          and the e-mail link state — confirmed / pending / expired /
 //          not_sent — so a failed or expired link shows).
+//        dev-request 2026-11-12-opplevagent-o6-tilfang-og-selvregistrering,
+//        slice O6-2 (age alarm, read-only): each entry also carries
+//        `age_hours` (whole hours since created_at), `age_business_days`
+//        (Mon–Fri after the created_at UTC date up to today, holidays not
+//        subtracted — the CS routine's `virkedager`) and `stale`
+//        (age_business_days > 2); the top level adds `stale_count` (stale
+//        rows among `entries`) and `stale_threshold_business_days` (2). The
+//        daily customer-service report raises a finding for a stale row.
 //   POST /admin/gardssalg-self-registered-review-queue-approve { providerId }
 //   POST /admin/gardssalg-self-registered-review-queue-reject  { providerId, note? }
 //        404 provider_not_found · 409 not_pending_review / already_approved /
@@ -11209,7 +11218,8 @@ function gardssalgSelfRegisterAdminGate(_req: Request, _res: Response, next: Nex
 router.get("/admin/gardssalg-self-registered-review-queue", gardssalgSelfRegisterAdminGate, requireAdmin, (_req: Request, res: Response) => {
   try {
     const { total, entries } = listSelfRegisterReviewQueue();
-    res.json({ count: total, entries });
+    const stale_count = entries.filter((e) => e.stale).length;
+    res.json({ count: total, entries, stale_count, stale_threshold_business_days: SELF_REGISTER_QUEUE_STALE_BUSINESS_DAYS });
   } catch (err) {
     console.error("[opplevelser] gardssalg-self-registered-review-queue failed", err);
     res.status(500).json({ error: "Internal error" });
