@@ -145,6 +145,17 @@ export interface VerifierResult {
   pick_slot?: VerifierPickSlot;
 }
 
+// dev-request 2026-11-15-verifier-timelane-ny-verifisering-gap: the single
+// outreach_pool_added rule, shared by the hourly run's envelope
+// (buildRunEnvelope) and the bulk sweep's (verifier-sweep.ts). A row counts
+// when runVerifierBatch stamped outreach_eligible_at, i.e. it is now in the
+// pool (verified, enrichment partial|rich, content threshold) and was not
+// verified going in.
+export const OUTREACH_POOL_ADDED_DETAIL = "transitioned to verified+(partial|rich)";
+export function countOutreachPoolAdded(results: Array<Pick<VerifierResult, "outreach_eligible_at">>): number {
+  return results.filter((x) => x.outreach_eligible_at !== null).length;
+}
+
 export interface BrregLookupResult {
   is_active: boolean;
   is_konkurs: boolean;
@@ -3435,7 +3446,7 @@ export function buildRunEnvelope(input: {
   const dataInsufficient = r.filter((x) => x.new_verification_status === "data_insufficient").length;
   const httpUnreachable = r.filter((x) => x.flags.includes("website_unreachable")).length;
   const brregFlagged = r.filter((x) => x.flags.includes("brreg_inactive") || x.flags.includes("brreg_konkurs")).length;
-  const newlyEligible = r.filter((x) => x.outreach_eligible_at !== null).length;
+  const newlyEligible = countOutreachPoolAdded(r);
   // orch-PR-20260512-33 (Eidsmo fix): track domain-coherence overrides so
   // operators can see at a glance how many agents this hourly run pulled
   // out of pool eligibility for mismatched website/email hosts.
@@ -3545,7 +3556,7 @@ export function buildRunEnvelope(input: {
       {
         type: "db_state_change",
         value: newlyEligible,
-        meta: { kind: "outreach_pool_added", detail: "transitioned to verified+(partial|rich)" },
+        meta: { kind: "outreach_pool_added", detail: OUTREACH_POOL_ADDED_DETAIL },
       },
       {
         type: "db_state_change",
