@@ -525,8 +525,9 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
 
       // ── (c) magic-link-verify ───────────────────────────────────────────
       const badVerify = await req("GET", "/kategori/gardssalg/eier/magic-link-verify?token=bogus");
-      assertEq(badVerify.status, 302, "c1: GET verify with a bogus token -> 302 redirect");
-      assertTrue(String(badVerify.headers.location || "").includes("error=invalid_token"), "c2: bogus-token redirect carries error=invalid_token");
+      // O3-1: a dead link now answers 200 with the message and the resend form.
+      assertEq(badVerify.status, 200, "c1: GET verify with a bogus token -> 200 page (O3-1), no redirect");
+      assertTrue(badVerify.body.includes('data-gc-claim-invalid="1"') && badVerify.body.includes('id="gc-claim-resend-form"'), "c2: bogus-token page shows the invalid-link message and the resend form");
 
       const claimRow = expDb.prepare("SELECT token FROM gardssalg_claims WHERE provider_id = ? ORDER BY created_at DESC LIMIT 1").get("prov-route-eligible") as any;
       assertTrue(!!claimRow?.token, "c3: a claim token exists to verify (fixture sanity check)");

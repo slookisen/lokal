@@ -733,7 +733,8 @@ export function runGardssalgSelfRegisterTests(opts: { log?: boolean } = {}): Pro
         });
         assertEq(upd.status, 401, "ac6-51: the owner update-profile JSON route → 401 for the draft session");
         const mlv = await req("GET", `/kategori/gardssalg/eier/magic-link-verify?token=${sessTok}`);
-        assertEq(mlv.headers.location, "/kategori/gardssalg?error=invalid_token", "ac6-52: magic-link-verify refuses the draft token");
+        assertEq([mlv.status, mlv.headers.location, String(mlv.body).includes('data-gc-claim-invalid="1"')], [200, undefined, true],
+          "ac6-52: magic-link-verify refuses the draft token (O3-1 invalid-link page)");
         const c2 = db.prepare("SELECT used, draft_mode FROM gardssalg_claims WHERE token = ?").get(sessTok) as any;
         assertEq([c2?.used, c2?.draft_mode, provRow()?.claimed_at, provRow()?.content_source === "claim"], [0, 1, null, false],
           "ac6-53: … and did not turn it into a claim (no used, no claimed_at, no content_source='claim')");

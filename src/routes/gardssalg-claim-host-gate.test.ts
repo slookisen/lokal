@@ -210,6 +210,8 @@ export async function runGardssalgClaimHostGateTests(opts: { log?: boolean } = {
       ["w14", "post", "/api/opplevelser/gardssalg-claim/:providerId/resume"],
       ["w15", "post", "/kategori/gardssalg/eier/:providerSlug/pause"],
       ["w16", "post", "/kategori/gardssalg/eier/:providerSlug/resume"],
+      // O3-1 (dev-request 2026-11-12-opplevagent-o3-eierkrav-og-innlogging): «Send ny lenke».
+      ["w17", "post", "/kategori/gardssalg/eier/send-ny-lenke"],
     ];
     for (const [id, method, routePath] of wired) {
       const label = `${method.toUpperCase()} ${routePath}`;
@@ -225,7 +227,7 @@ export async function runGardssalgClaimHostGateTests(opts: { log?: boolean } = {
 
     // ── g1-g3: scope ────────────────────────────────────────────────────
     const all = routeLabels(claimRouter);
-    assertEq(all.length, wired.length, `g1: the claim router has exactly the ${wired.length} routes above (a new one must be added to w1-w16)`);
+    assertEq(all.length, wired.length, `g1: the claim router has exactly the ${wired.length} routes above (a new one must be added to w1-w17)`);
     assertEq(routeLabels(claimRouter, generalLimiter), all, "g2: every claim route chains generalLimiter, and none is router-wide");
     assertTrue(!claimRouter.stack.some((l) => !l.route && l.handle === generalLimiter),
       "g2b: no router-wide generalLimiter (an unmatched /api/opplevelser/gardssalg-claim/* path is counted once, by the \"/api\" mount)");
@@ -249,8 +251,8 @@ export async function runGardssalgClaimHostGateTests(opts: { log?: boolean } = {
           if (!ac2LimitersFor(sample).includes("general")) uncounted.push(sample);
         }
       }
-      assertTrue(checked === 16 && uncounted.length === 0,
-        `a1: ac2LimitersFor counts all 16 route-level generalLimiter paths on the claim router as general (checked ${checked}, uncounted ${JSON.stringify(uncounted)})`);
+      assertTrue(checked === 17 && uncounted.length === 0,
+        `a1: ac2LimitersFor counts all 17 route-level generalLimiter paths on the claim router as general (checked ${checked}, uncounted ${JSON.stringify(uncounted)})`);
     }
 
     // ── i1-i5: index.ts order (source inspection) ───────────────────────
@@ -381,8 +383,8 @@ export async function runGardssalgClaimHostGateTests(opts: { log?: boolean } = {
     assertEq([status.status, status.body, status.remaining], [200, JSON.stringify({ isOwner: false }), "298"],
       "b3: GET …/session-status → 200 {isOwner:false}, same bucket");
     const verify = await hit(port, "GET", "/kategori/gardssalg/eier/magic-link-verify", oa);
-    assertEq([verify.status, verify.location, verify.remaining], [302, "/kategori/gardssalg?error=invalid_token", "297"],
-      "b4: GET magic-link-verify without a token → 302 to the error page, as before, same bucket");
+    assertEq([verify.status, verify.location, verify.remaining], [200, undefined, "297"],
+      "b4: GET magic-link-verify without a token → 200 invalid-link page (O3-1), same bucket");
     const request = await hit(port, "POST", "/kategori/gardssalg/eier/ukjent-id/request", { ...oa, json: {} });
     assertEq([request.status, request.body, request.remaining],
       [404, JSON.stringify({ success: false, error: "provider_not_found" }), "296"],
