@@ -300,8 +300,8 @@ const CLIENT_SCRIPT = `
   function addRow(term, qty, pre){
     var rows = el('hl-rows');
     if (rows.children.length >= MAX_ITEMS) return;
-    var t = mk('input', { type: 'text', maxlength: '80', placeholder: C.item_ph, 'aria-label': C.item_label });
-    var q = mk('input', { type: 'number', min: '1', max: '99', value: String(qty || 1), 'aria-label': C.qty_label });
+    var t = mk('input', { type: 'text', maxlength: '80', placeholder: C.item_ph, 'aria-label': C.item_label, autocomplete: 'off' });
+    var q = mk('input', { type: 'number', min: '1', max: '99', value: String(qty || 1), 'aria-label': C.qty_label, inputmode: 'numeric', autocomplete: 'off' });
     if (term) t.value = term;
     var rm = mk('button', { type: 'button', cls: 'hl-btn', text: C.remove_item });
     var row = mk('div', { cls: 'hl-row' }, [
@@ -760,7 +760,7 @@ export function buildHandelistePage(lang: Lang, preselect?: HandelistePreselect 
         <h2>${e(c.step1)}</h2>
         <div id="hl-rows"></div>
         <button type="button" class="hl-btn" id="hl-add">${e(c.add_item)}</button>
-        <div class="hl-row" style="margin-top:12px"><label>${e(c.place_label)}<input type="text" id="hl-place" maxlength="80" placeholder="${e(c.place_ph)}"></label></div>
+        <div class="hl-row" style="margin-top:12px"><label>${e(c.place_label)}<input type="text" id="hl-place" maxlength="80" autocomplete="address-level2" placeholder="${e(c.place_ph)}"></label></div>
         <div id="hl-msg1" class="hl-msg" hidden role="alert"></div>
         <div class="hl-actions"><button type="button" class="hl-btn primary" id="hl-find">${e(c.find)}</button></div>
       </section>
@@ -779,10 +779,10 @@ export function buildHandelistePage(lang: Lang, preselect?: HandelistePreselect 
         <h3>${e(c.contact_h)}</h3>
         <div class="hl-row">
           <label>${e(c.name_label)}<input type="text" id="hl-name" maxlength="120" autocomplete="name"></label>
-          <label>${e(c.email_label)}<input type="email" id="hl-email" maxlength="254" autocomplete="email"></label>
-          <label>${e(c.phone_label)}<input type="tel" id="hl-phone" maxlength="40" autocomplete="tel"></label>
+          <label>${e(c.email_label)}<input type="email" id="hl-email" maxlength="254" autocomplete="email" inputmode="email"></label>
+          <label>${e(c.phone_label)}<input type="tel" id="hl-phone" maxlength="40" autocomplete="tel" inputmode="tel"></label>
         </div>
-        <label style="font-size:.85rem;display:block">${e(c.note_label)}<textarea id="hl-note" rows="2" maxlength="500" placeholder="${e(c.note_ph)}"></textarea></label>
+        <label style="font-size:.85rem;display:block">${e(c.note_label)}<textarea id="hl-note" rows="2" maxlength="500" autocomplete="off" placeholder="${e(c.note_ph)}"></textarea></label>
         <label class="hl-check"><input type="checkbox" id="hl-consent"><span>${e(c.consent_label)}</span></label>
         <div class="hl-hp" aria-hidden="true"><label>Website<input type="text" id="hl-website" tabindex="-1" autocomplete="off"></label></div>
         <p class="hl-hint">${e(c.no_payment)}</p>
@@ -790,7 +790,7 @@ export function buildHandelistePage(lang: Lang, preselect?: HandelistePreselect 
         <div id="hl-msg3" class="hl-msg" hidden role="alert"></div>
         <div class="hl-actions">
           <button type="button" class="hl-btn" id="hl-back2">${e(c.back)}</button>
-          <button type="button" class="hl-btn primary" id="hl-submit">${e(c.submit)}</button>
+          <button type="button" class="hl-btn primary" id="hl-submit" aria-describedby="hl-terms">${e(c.submit)}</button>
         </div>
       </section>
       <section class="hl-step" id="hl-s4" hidden>
