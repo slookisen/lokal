@@ -59,6 +59,20 @@
  * the SAME static body regardless of the per-request JSON-RPC `id`, so every
  * limiter here overrides `handler` instead of `message`.
  *
+ * Google ranges (dev-request 2026-11-12-g1-google-klar, slice G1-2), behind
+ * MCP_RATE_LIMIT_GOOGLE_RANGES_ENABLED (default off; only the exact string
+ * "true" turns it on). Calls made by Google for Gemini users come from a few
+ * Google egress addresses, so per-IP buckets would put unrelated users in
+ * each other's way, unpredictably. With the flag on, a request whose client
+ * IP (req.ip, decided by client-ip.ts as for every other key here) is in
+ * google-ip-ranges.ts's published ranges is keyed on ONE shared bucket,
+ * GOOGLE_RANGES_BUCKET, wherever a limiter here would otherwise use the IP:
+ * the brake, the primary's IP fallback (a live session or a recognized key
+ * still wins), and the side-effect quotas (RFB's cart key keeps its
+ * buyer_ref part). Not counted against any per-IP bucket. The shared bucket
+ * itself gets GOOGLE_RANGES_LIMIT_MULTIPLIER × the limiter's own ceiling.
+ * With the flag off nothing changes: same keys, limits and headers.
+ *
  * Non-goals: `/a2a` and REST keep their own limiters — jsonRpcLimiter (RFB +
  * Opplevagent `/a2a`) and dentalLimiter (`/api/tannlege` + dental `/a2a`) are
  * unchanged (S3 of the 2026-10-16 dev-request, not in this change). Counters
@@ -68,6 +82,7 @@
 import rateLimit, { ipKeyGenerator, type RateLimitRequestHandler, type Store } from "express-rate-limit";
 import { Request, Response } from "express";
 import { keyedMax } from "./security";
+import { isGoogleMcpIp } from "./google-ip-ranges";
 
 // trustProxy: same reason as security.ts's sharedValidate (a static check on
 // `trust proxy` === true; the real guard is middleware/client-ip.ts, which
@@ -104,11 +119,47 @@ export function sendMcpRateLimited(req: Request, res: Response): void {
   });
 }
 
+// ─── Google ranges (G1-2) ────────────────────────────────────────────────────
+export const GOOGLE_RANGES_FLAG_ENV = "MCP_RATE_LIMIT_GOOGLE_RANGES_ENABLED";
+// Not an IP, so it can never collide with a per-IP key in the same store.
+export const GOOGLE_RANGES_BUCKET = "google-ranges";
+// The shared bucket's ceiling = this × the limiter's own per-IP ceiling
+// (brake 3000 → 30000 per 15 min, primary 200 → 2000 per 15 min, side-effect
+// 20 → 200 per min).
+export const GOOGLE_RANGES_LIMIT_MULTIPLIER = 10;
+
+export function googleRangesEnabled(): boolean {
+  return process.env[GOOGLE_RANGES_FLAG_ENV] === "true";
+}
+
+// True when the flag is on and this request's client IP is in Google's
+// published ranges (google-ip-ranges.ts).
+export function isGoogleRangesRequest(req: Request): boolean {
+  return googleRangesEnabled() && isGoogleMcpIp(req.ip);
+}
+
 // ─── Keys ────────────────────────────────────────────────────────────────────
 // The IP key every limiter here falls back to: express-rate-limit's own
-// default (IPv6 addresses grouped per /56).
+// default (IPv6 addresses grouped per /56) — or, flag on, the shared Google
+// bucket for an address in Google's ranges.
 export function mcpIpKey(req: Request): string {
+  if (isGoogleRangesRequest(req)) return GOOGLE_RANGES_BUCKET;
   return ipKeyGenerator(req.ip ?? "");
+}
+
+// Wraps a limiter's ceiling: the shared Google bucket gets
+// GOOGLE_RANGES_LIMIT_MULTIPLIER × it; every other key keeps it unchanged.
+// Only the bucket shared by ALL Google traffic is raised — a session, a
+// recognized key or a buyer_ref inside Google's ranges is one caller.
+export function googleRangesAwareMax(
+  max: number | ((req: Request) => number),
+  keyFor: (req: Request) => string
+): (req: Request) => number {
+  return (req: Request): number => {
+    const base = typeof max === "function" ? max(req) : max;
+    const key = keyFor(req);
+    return key === GOOGLE_RANGES_BUCKET || key === `ip:${GOOGLE_RANGES_BUCKET}` ? base * GOOGLE_RANGES_LIMIT_MULTIPLIER : base;
+  };
 }
 
 // The only shape a live session id has: every server here mints its own
@@ -141,7 +192,7 @@ export function mcpPrimaryKey(req: Request, isKnownSession?: (sessionId: string)
 
   if (req.consumerKeyId) return `key:${req.consumerKeyId}`;
 
-  return `ip:${ipKeyGenerator(req.ip ?? "")}`;
+  return `ip:${mcpIpKey(req)}`;
 }
 
 // ─── Side-effect tool calls ──────────────────────────────────────────────────
@@ -188,7 +239,7 @@ export function isCartSideEffectCall(body: unknown): boolean {
 // "open, unauthenticated create endpoint" shape registrationLimiter /
 // consumerKeyIssuanceLimiter already defend on their own endpoints.
 export function mcpCartToolKey(req: Request): string {
-  const ip = ipKeyGenerator(req.ip ?? "");
+  const ip = mcpIpKey(req);
   const entries = asToolCallEntries(req.body);
   const entry = entries.find((e) => e?.method === "tools/call");
   const buyerRef = entry?.params?.arguments?.buyer_ref;
@@ -275,7 +326,7 @@ export function createMcpRateLimiters(profile: McpRateLimitProfile): McpRateLimi
     ...shared,
     ...storeFor("brake"),
     windowMs: profile.brake.windowMs,
-    max: profile.brake.max,
+    max: googleRangesAwareMax(profile.brake.max, mcpIpKey),
     keyGenerator: mcpIpKey,
   });
 
@@ -284,7 +335,7 @@ export function createMcpRateLimiters(profile: McpRateLimitProfile): McpRateLimi
     ...shared,
     ...storeFor("primary"),
     windowMs: profile.primary.windowMs,
-    max: keyedMax(profile.primary.anonymousMax, profile.primary.keyedMax),
+    max: googleRangesAwareMax(keyedMax(profile.primary.anonymousMax, profile.primary.keyedMax), (req) => mcpPrimaryKey(req, isKnownSession)),
     keyGenerator: (req) => mcpPrimaryKey(req, isKnownSession),
   });
 
@@ -294,7 +345,7 @@ export function createMcpRateLimiters(profile: McpRateLimitProfile): McpRateLimi
         ...shared,
         ...storeFor("sideEffect"),
         windowMs: se.windowMs,
-        max: se.max,
+        max: googleRangesAwareMax(se.max, se.keyGenerator),
         keyGenerator: se.keyGenerator,
         skip: (req) => !isSideEffectToolCall(req.body, se.tools),
       })
