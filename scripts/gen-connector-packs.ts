@@ -37,6 +37,8 @@ const DIRECTORY_POLICY = "https://support.claude.com/en/articles/13145358-anthro
 const DEV_REQUEST = "A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker";
 /** When the portal facts above (who can submit, steps, limits) were read from the docs. */
 const DOCS_READ = "2026-10-17";
+/** The A2A procedure that batches tool-definition changes per server into one window (F1-2). */
+export const CONTRACT_WINDOW_DOC = "https://github.com/slookisen/A2A/blob/main/protocols/kontraktvindu-verktoytekster.md";
 /** When the hand-kept prerequisite rows were last checked. */
 const RECORDED = "2026-10-17";
 
@@ -146,6 +148,12 @@ export interface PackSpec {
   /** README rows for the folder's other contents ([path, what it is]), and lines on paths that are not the directory. */
   otherContents: ReadonlyArray<readonly [string, string]>;
   notADirectoryPath: readonly string[];
+  /**
+   * The server's contract-freeze test and ChatGPT submission JSON, for the README checklist that links the
+   * tool-contract window procedure (CONTRACT_WINDOW_DOC; A2A dev-request 2026-11-12-f1-felles-for-ai-kanalene,
+   * F1-2). null: the procedure does not cover this server.
+   */
+  contractWindow: { freezeTest: string; submissionJson: string } | null;
 }
 
 /** MCP App carousel screenshots: the PNGs in carousel order, their prompts file, and the card templates they show. */
@@ -224,6 +232,7 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
       "Prepayment: production runs with PAYMENTS_ENABLED unset, and the generator reads the tools that way. If it is switched on (A2A dev-request 2026-10-09-rfb-forhandsbetaling-stripe-connect), lokal_cart_submit's description and the financial-transactions answer change: update `productionToolDefinitions()` and `PACKS` in the generator, regenerate this pack and answer again before submitting.",
     ],
     otherContents: [["assets/rfb-square-512.png", "The icon to upload: square, full-bleed, no rounded corners (clients crop it themselves)."]],
+    contractWindow: { freezeTest: "src/routes/rfb-mcp-contract-freeze.test.ts", submissionJson: "chatgpt-app-submission.json" },
     notADirectoryPath: [
       "Desktop extension (MCPB): the directory no longer accepts local servers packaged as MCPB. `mcp-server/lokal-mcp.mcpb` and the npm package `lokal-mcp` still work for manual install, but they are not a directory submission.",
       "ChatGPT app: a separate submission to OpenAI (repo root `chatgpt-app-submission.json`), not covered here.",
@@ -293,6 +302,7 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
       ["chatgpt-app/", "The ChatGPT app submission (approved and listed by OpenAI); not part of this pack."],
       ["claude-desktop/", "Deprecated: the MCPB desktop-extension path, kept as history."],
     ],
+    contractWindow: { freezeTest: "src/routes/opplevagent-mcp-contract-freeze.test.ts", submissionJson: "opplevagent-chatgpt-app-submission.json" },
     notADirectoryPath: [
       "Desktop extension (MCPB): the directory no longer accepts local servers packaged as MCPB. `claude-desktop/` is kept as history only; do not submit `claude-desktop/manifest.json`.",
       "ChatGPT app: `chatgpt-app/` is a separate submission to OpenAI.",
@@ -371,6 +381,7 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
       "If life or health is in immediate danger: call 113. Emergency care says nothing about hours: the data has no out-of-hours times, and a clinic marked with emergency care may still be unable to see you now. Call the clinic before you go there; when it is closed, contact the out-of-hours medical service (legevakt) on 116 117 or the emergency dental service (tannlegevakt) where you live. tannlege_akutt's answer has advice on the municipal out-of-hours dental service (kommunal tannlegevakt).",
     ],
     otherContents: [["assets/finn-tannlege-square-512.png", "The icon to upload: the «Søket» mark (a tooth in a magnifier, white on teal), square, full-bleed, no rounded corners. The same file as the site's /favicon-512.png."]],
+    contractWindow: null,
     notADirectoryPath: ["Desktop extension (MCPB): the directory no longer accepts local servers packaged as MCPB. The npm package `finn-tannlege-mcp` still works for manual install, but it is not a directory submission."],
   },
 };
@@ -770,6 +781,21 @@ export function renderPack(spec: PackSpec, input: PackInput): Record<(typeof PAC
     "",
     `src/routes/connector-packs-fresh.test.ts fails when a file here differs from what the generator writes. After a change to any of these, run \`npx tsx ${GENERATOR}\` and commit the result. \`--verify-floors\` compares the floors with the live honest counts.`,
     "",
+    ...(spec.contractWindow
+      ? [
+          "## When a tool definition changes",
+          "",
+          `A change to a tool's name, title, description, input schema, annotations, \`_meta\`, widget HTML, or the server's instructions or serverInfo is a contract change. Follow the tool-contract window procedure: ${CONTRACT_WINDOW_DOC}.`,
+          "",
+          "- [ ] Gather this server's pending contract changes into one window; one contract change per PR, merged and deployed together.",
+          `- [ ] Show before/after text and hash per changed tool in the PR (\`npx tsx ${spec.contractWindow.freezeTest} --print\`).`,
+          "- [ ] Keep the live definition working: new input fields optional, nothing removed or renamed in the same window.",
+          `- [ ] Deploy, then scan, then upload: never upload \`${spec.contractWindow.submissionJson}\` or a ZIP before the deploy.`,
+          `- [ ] Regenerate this pack (\`npx tsx ${GENERATOR}\`) and commit the result.`,
+          "- [ ] Give Daniel the procedure's one list: what to rescan at OpenAI, what to edit or report in the Claude directory, and whether a new ZIP/version is needed.",
+          "",
+        ]
+      : []),
     "## Not a directory path",
     "",
     ...spec.notADirectoryPath.map((l) => `- ${l}`),
