@@ -10713,7 +10713,7 @@ router.post("/admin/booking-test-send", requireAdmin, async (req: Request, res: 
 
   let booking;
   try {
-    booking = createBooking(parsed.data, source, { isTest: true });
+    booking = createBooking(parsed.data, source, { isTest: true, guestLang: body.lang });
   } catch (e: any) {
     return res.status(500).json({ success: false, error: "create_failed", message: e?.message ?? String(e) });
   }
@@ -34297,7 +34297,9 @@ router.post("/book", async (req: Request, res: Response) => {
   try {
     // F1-1: an AI caller (ai_search UA) gets its fixed source_client label;
     // the web form and plain REST get NULL.
-    booking = createBooking(parsed.data, undefined, { sourceClient: restSourceClient(req.headers) });
+    // O4-2: `lang` ("nb" | "en") is the guest's language for the e-mails;
+    // missing or anything else → "nb" (normaliseGuestLang()).
+    booking = createBooking(parsed.data, undefined, { sourceClient: restSourceClient(req.headers), guestLang: rawBody.lang });
   } catch (err) {
     console.error("[booking] createBooking failed", err);
     res.status(500).json({ error: "Kunne ikke opprette påmelding" });

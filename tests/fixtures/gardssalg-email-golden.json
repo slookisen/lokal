@@ -1,0 +1,214 @@
+{
+  "guest.receipt.legacy.full": {
+    "to": "kari@example.no",
+    "subject": "Bekreftelse på påmelding — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei Kari &lt;Nordmann&gt; &amp; Co,</p>\n<p>Din påmelding er registrert! Her er din bekreftelse:</p>\n<table style=\"border-collapse:collapse;font-family:sans-serif\">\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Bookingref:</td><td>GARD-20261212-ABCDE</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Dato/tid:</td><td>lørdag 12. desember 2026 kl. 13:00</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Antall:</td><td>3 personer</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Din kommentar:</td><td>Vi gleder oss &lt;3 &amp; lurer på parkering</td></tr>\n</table>\n<p>Produsenten er varslet om forespørselen og svarer på e-post — du får beskjed så snart reservasjonen er bekreftet eller besvart.</p>\n<p>Du kan når som helst se gjeldende status her: <a href=\"https://opplevagent.no/kategori/gardssalg/status/GARD-20261212-ABCDE/s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0\">statusside for reservasjonen</a>.</p>\n<p>En kalenderinvitasjon (ICS) er vedlagt denne e-posten.</p>\n<p>Spørsmål? Svar på denne e-posten.</p>\n<p>Hilsen<br>Opplevagent</p>",
+    "textContent": "Hei Kari <Nordmann> & Co,\n\nDin påmelding er registrert.\nBookingref: GARD-20261212-ABCDE\nDato/tid: lørdag 12. desember 2026 kl. 13:00\nAntall: 3\nDin kommentar: Vi gleder oss <3 & lurer på parkering\n\nProdusenten er varslet om forespørselen og svarer på e-post — du får beskjed så snart reservasjonen er bekreftet eller besvart.\nStatus for reservasjonen: https://opplevagent.no/kategori/gardssalg/status/GARD-20261212-ABCDE/s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0\n\nHilsen\nOpplevagent",
+    "attachments": [
+      {
+        "filename": "gardssalg-GARD-20261212-ABCDE.ics",
+        "contentType": "text/calendar; charset=utf-8; method=REQUEST",
+        "content": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Opplevagent//Gardssalg Booking//NO\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:00000000-0000-4000-8000-000000000001@opplevagent.no\r\nDTSTAMP:<now>\r\nDTSTART:20261212T120000Z\r\nDTEND:20261212T140000Z\r\nSUMMARY:Gårdssalg & smaking — ref GARD-20261212-ABCDE\r\nDESCRIPTION:Påmelding via opplevagent.no. Bookingref: GARD-20261212-ABCDE\r\nATTENDEE;CN=Kari <Nordmann> & Co:mailto:kari@example.no\r\nEND:VEVENT\r\nEND:VCALENDAR"
+      }
+    ]
+  },
+  "guest.receipt.legacy.bare": {
+    "to": "kari@example.no",
+    "subject": "Bekreftelse på påmelding — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei Kari &lt;Nordmann&gt; &amp; Co,</p>\n<p>Din påmelding er registrert! Her er din bekreftelse:</p>\n<table style=\"border-collapse:collapse;font-family:sans-serif\">\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Bookingref:</td><td>GARD-20261212-ABCDE</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Dato/tid:</td><td>lørdag 12. desember 2026 kl. 13:00</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Antall:</td><td>1 person</td></tr>\n  \n</table>\n<p>Produsenten er varslet om forespørselen og svarer på e-post — du får beskjed så snart reservasjonen er bekreftet eller besvart.</p>\n\n<p>En kalenderinvitasjon (ICS) er vedlagt denne e-posten.</p>\n<p>Spørsmål? Svar på denne e-posten.</p>\n<p>Hilsen<br>Opplevagent</p>",
+    "textContent": "Hei Kari <Nordmann> & Co,\n\nDin påmelding er registrert.\nBookingref: GARD-20261212-ABCDE\nDato/tid: lørdag 12. desember 2026 kl. 13:00\nAntall: 1\n\nProdusenten er varslet om forespørselen og svarer på e-post — du får beskjed så snart reservasjonen er bekreftet eller besvart.\n\nHilsen\nOpplevagent",
+    "attachments": [
+      {
+        "filename": "gardssalg-GARD-20261212-ABCDE.ics",
+        "contentType": "text/calendar; charset=utf-8; method=REQUEST",
+        "content": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Opplevagent//Gardssalg Booking//NO\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:00000000-0000-4000-8000-000000000001@opplevagent.no\r\nDTSTAMP:<now>\r\nDTSTART:20261212T120000Z\r\nDTEND:20261212T140000Z\r\nSUMMARY:Gårdssalg & smaking — ref GARD-20261212-ABCDE\r\nDESCRIPTION:Påmelding via opplevagent.no. Bookingref: GARD-20261212-ABCDE\r\nATTENDEE;CN=Kari <Nordmann> & Co:mailto:kari@example.no\r\nEND:VEVENT\r\nEND:VCALENDAR"
+      }
+    ]
+  },
+  "guest.receipt.honest.full": {
+    "to": "kari@example.no",
+    "subject": "Vi har mottatt forespørselen din — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei Kari &lt;Nordmann&gt; &amp; Co,</p>\n<p>Vi har mottatt forespørselen din om besøk hos Testsideri &amp; Søn. Besøket er ikke bekreftet ennå.</p>\n<p>Referanse: GARD-20261212-ABCDE<br>\nTidspunkt du ba om: lørdag 12. desember 2026 kl. 13:00<br>\nAntall: 3<br>\nDin kommentar: Vi gleder oss &lt;3 &amp; lurer på parkering</p>\n<p>Produsenten har fått forespørselen og svarer innen fredag 4. desember 2026 kl. 11:00. Du får e-post når produsenten har bekreftet, foreslått et annet tidspunkt eller avslått. Svarer ikke produsenten innen fristen, utløper forespørselen, og du får beskjed.</p>\n<p>Du kan se status når som helst her: <a href=\"https://opplevagent.no/kategori/gardssalg/status/GARD-20261212-ABCDE/s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0\">https://opplevagent.no/kategori/gardssalg/status/GARD-20261212-ABCDE/s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0</a></p>\n<p>Har du spørsmål, svarer du på denne e-posten.</p>\n<p>Hilsen<br>\nOpplevagent</p>",
+    "textContent": "Hei Kari <Nordmann> & Co,\n\nVi har mottatt forespørselen din om besøk hos Testsideri & Søn. Besøket er ikke bekreftet ennå.\n\nReferanse: GARD-20261212-ABCDE\nTidspunkt du ba om: lørdag 12. desember 2026 kl. 13:00\nAntall: 3\nDin kommentar: Vi gleder oss <3 & lurer på parkering\n\nProdusenten har fått forespørselen og svarer innen fredag 4. desember 2026 kl. 11:00. Du får e-post når produsenten har bekreftet, foreslått et annet tidspunkt eller avslått. Svarer ikke produsenten innen fristen, utløper forespørselen, og du får beskjed.\n\nDu kan se status når som helst her: https://opplevagent.no/kategori/gardssalg/status/GARD-20261212-ABCDE/s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0\n\nHar du spørsmål, svarer du på denne e-posten.\n\nHilsen\nOpplevagent",
+    "attachments": null
+  },
+  "guest.receipt.honest.bare": {
+    "to": "kari@example.no",
+    "subject": "Vi har mottatt forespørselen din — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei Kari &lt;Nordmann&gt; &amp; Co,</p>\n<p>Vi har mottatt forespørselen din om besøk hos Testsideri &amp; Søn. Besøket er ikke bekreftet ennå.</p>\n<p>Referanse: GARD-20261212-ABCDE<br>\nTidspunkt du ba om: lørdag 12. desember 2026 kl. 13:00<br>\nAntall: 1</p>\n<p>Du får e-post når produsenten har bekreftet, foreslått et annet tidspunkt eller avslått. Svarer ikke produsenten innen fristen, utløper forespørselen, og du får beskjed.</p>\n<p>Har du spørsmål, svarer du på denne e-posten.</p>\n<p>Hilsen<br>\nOpplevagent</p>",
+    "textContent": "Hei Kari <Nordmann> & Co,\n\nVi har mottatt forespørselen din om besøk hos Testsideri & Søn. Besøket er ikke bekreftet ennå.\n\nReferanse: GARD-20261212-ABCDE\nTidspunkt du ba om: lørdag 12. desember 2026 kl. 13:00\nAntall: 1\n\nDu får e-post når produsenten har bekreftet, foreslått et annet tidspunkt eller avslått. Svarer ikke produsenten innen fristen, utløper forespørselen, og du får beskjed.\n\nHar du spørsmål, svarer du på denne e-posten.\n\nHilsen\nOpplevagent",
+    "attachments": null
+  },
+  "guest.confirmed.legacy.direct": {
+    "to": "kari@example.no",
+    "subject": "Reservasjonen er bekreftet — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei Kari &lt;Nordmann&gt; &amp; Co,</p>\n<p>Gode nyheter — produsenten har bekreftet reservasjonen din:</p>\n<table style=\"border-collapse:collapse;font-family:sans-serif\">\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Bookingref:</td><td>GARD-20261212-ABCDE</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Dato/tid:</td><td>lørdag 12. desember 2026 kl. 13:00</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Antall:</td><td>3 personer</td></tr>\n</table>\n<p>Velkommen! Produsenten registrerer oppmøtet etter besøket.</p>\n<p>Se gjeldende status når som helst: <a href=\"https://opplevagent.no/kategori/gardssalg/status/GARD-20261212-ABCDE/s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0\">statusside for reservasjonen</a>.</p>\n<p>Hilsen<br>Opplevagent</p>",
+    "textContent": "Hei Kari <Nordmann> & Co,\n\nProdusenten har bekreftet reservasjonen din.\nBookingref: GARD-20261212-ABCDE\nDato/tid: lørdag 12. desember 2026 kl. 13:00\nAntall: 3\nStatus: https://opplevagent.no/kategori/gardssalg/status/GARD-20261212-ABCDE/s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0\n\nHilsen\nOpplevagent",
+    "attachments": null
+  },
+  "guest.confirmed.legacy.accepted.bare": {
+    "to": "kari@example.no",
+    "subject": "Reservasjonen er bekreftet — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei Kari &lt;Nordmann&gt; &amp; Co,</p>\n<p>Du har akseptert det nye tidspunktet — reservasjonen er nå bekreftet:</p>\n<table style=\"border-collapse:collapse;font-family:sans-serif\">\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Bookingref:</td><td>GARD-20261212-ABCDE</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Dato/tid:</td><td>lørdag 12. desember 2026 kl. 13:00</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Antall:</td><td>1 person</td></tr>\n</table>\n<p>Velkommen! Produsenten registrerer oppmøtet etter besøket.</p>\n\n<p>Hilsen<br>Opplevagent</p>",
+    "textContent": "Hei Kari <Nordmann> & Co,\n\nDu har akseptert det nye tidspunktet — reservasjonen er nå bekreftet.\nBookingref: GARD-20261212-ABCDE\nDato/tid: lørdag 12. desember 2026 kl. 13:00\nAntall: 1\n\nHilsen\nOpplevagent",
+    "attachments": null
+  },
+  "guest.confirmed.honest.direct": {
+    "to": "kari@example.no",
+    "subject": "Reservasjonen er bekreftet — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei Kari &lt;Nordmann&gt; &amp; Co,</p>\n<p>Gode nyheter — produsenten har bekreftet reservasjonen din:</p>\n<table style=\"border-collapse:collapse;font-family:sans-serif\">\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Bookingref:</td><td>GARD-20261212-ABCDE</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Dato/tid:</td><td>lørdag 12. desember 2026 kl. 13:00</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Antall:</td><td>3 personer</td></tr>\n</table>\n<p>Kalenderfilen er lagt ved, slik at du kan legge besøket inn i kalenderen din.</p>\n<p>Velkommen! Produsenten registrerer oppmøtet etter besøket.</p>\n<p>Se gjeldende status når som helst: <a href=\"https://opplevagent.no/kategori/gardssalg/status/GARD-20261212-ABCDE/s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0\">statusside for reservasjonen</a>.</p>\n<p>Hilsen<br>Opplevagent</p>",
+    "textContent": "Hei Kari <Nordmann> & Co,\n\nProdusenten har bekreftet reservasjonen din.\nBookingref: GARD-20261212-ABCDE\nDato/tid: lørdag 12. desember 2026 kl. 13:00\nAntall: 3\n\nKalenderfilen er lagt ved, slik at du kan legge besøket inn i kalenderen din.\nStatus: https://opplevagent.no/kategori/gardssalg/status/GARD-20261212-ABCDE/s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0\n\nHilsen\nOpplevagent",
+    "attachments": [
+      {
+        "filename": "gardssalg-GARD-20261212-ABCDE.ics",
+        "contentType": "text/calendar; charset=utf-8; method=PUBLISH",
+        "content": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Opplevagent//Gardssalg Booking//NO\r\nMETHOD:PUBLISH\r\nBEGIN:VEVENT\r\nUID:00000000-0000-4000-8000-000000000001-20261212T120000Z@opplevagent.no\r\nDTSTAMP:<now>\r\nDTSTART:20261212T120000Z\r\nDTEND:20261212T140000Z\r\nSUMMARY:Besøk hos Testsideri & Søn — GARD-20261212-ABCDE\r\nDESCRIPTION:Besøk avtalt via opplevagent.no. Referanse: GARD-20261212-ABCD\r\n E. Status og avlysning: https://opplevagent.no/kategori/gardssalg/status/G\r\n ARD-20261212-ABCDE/s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0\r\nLOCATION:Gardsvegen 1\\, 5700 Voss\r\nEND:VEVENT\r\nEND:VCALENDAR"
+      }
+    ]
+  },
+  "guest.confirmed.honest.accepted": {
+    "to": "kari@example.no",
+    "subject": "Reservasjonen er bekreftet — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei Kari &lt;Nordmann&gt; &amp; Co,</p>\n<p>Du har akseptert det nye tidspunktet — reservasjonen er nå bekreftet:</p>\n<table style=\"border-collapse:collapse;font-family:sans-serif\">\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Bookingref:</td><td>GARD-20261212-ABCDE</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Dato/tid:</td><td>lørdag 12. desember 2026 kl. 13:00</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Antall:</td><td>3 personer</td></tr>\n</table>\n<p>Kalenderfilen med det nye tidspunktet er lagt ved. Slett den gamle avtalen hvis du har lagt den inn.</p>\n<p>Velkommen! Produsenten registrerer oppmøtet etter besøket.</p>\n<p>Se gjeldende status når som helst: <a href=\"https://opplevagent.no/kategori/gardssalg/status/GARD-20261212-ABCDE/s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0\">statusside for reservasjonen</a>.</p>\n<p>Hilsen<br>Opplevagent</p>",
+    "textContent": "Hei Kari <Nordmann> & Co,\n\nDu har akseptert det nye tidspunktet — reservasjonen er nå bekreftet.\nBookingref: GARD-20261212-ABCDE\nDato/tid: lørdag 12. desember 2026 kl. 13:00\nAntall: 3\n\nKalenderfilen med det nye tidspunktet er lagt ved. Slett den gamle avtalen hvis du har lagt den inn.\nStatus: https://opplevagent.no/kategori/gardssalg/status/GARD-20261212-ABCDE/s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0\n\nHilsen\nOpplevagent",
+    "attachments": [
+      {
+        "filename": "gardssalg-GARD-20261212-ABCDE.ics",
+        "contentType": "text/calendar; charset=utf-8; method=PUBLISH",
+        "content": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Opplevagent//Gardssalg Booking//NO\r\nMETHOD:PUBLISH\r\nBEGIN:VEVENT\r\nUID:00000000-0000-4000-8000-000000000001-20261212T120000Z@opplevagent.no\r\nDTSTAMP:<now>\r\nDTSTART:20261212T120000Z\r\nDTEND:20261212T140000Z\r\nSUMMARY:Besøk hos Testsideri & Søn — GARD-20261212-ABCDE\r\nDESCRIPTION:Besøk avtalt via opplevagent.no. Referanse: GARD-20261212-ABCD\r\n E. Status og avlysning: https://opplevagent.no/kategori/gardssalg/status/G\r\n ARD-20261212-ABCDE/s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0\r\nLOCATION:Gardsvegen 1\\, 5700 Voss\r\nEND:VEVENT\r\nEND:VCALENDAR"
+      }
+    ]
+  },
+  "guest.confirmed.honest.direct.bare": {
+    "to": "kari@example.no",
+    "subject": "Reservasjonen er bekreftet — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei Kari &lt;Nordmann&gt; &amp; Co,</p>\n<p>Gode nyheter — produsenten har bekreftet reservasjonen din:</p>\n<table style=\"border-collapse:collapse;font-family:sans-serif\">\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Bookingref:</td><td>GARD-20261212-ABCDE</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Dato/tid:</td><td>lørdag 12. desember 2026 kl. 13:00</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Antall:</td><td>1 person</td></tr>\n</table>\n<p>Kalenderfilen er lagt ved, slik at du kan legge besøket inn i kalenderen din.</p>\n<p>Velkommen! Produsenten registrerer oppmøtet etter besøket.</p>\n\n<p>Hilsen<br>Opplevagent</p>",
+    "textContent": "Hei Kari <Nordmann> & Co,\n\nProdusenten har bekreftet reservasjonen din.\nBookingref: GARD-20261212-ABCDE\nDato/tid: lørdag 12. desember 2026 kl. 13:00\nAntall: 1\n\nKalenderfilen er lagt ved, slik at du kan legge besøket inn i kalenderen din.\n\nHilsen\nOpplevagent",
+    "attachments": [
+      {
+        "filename": "gardssalg-GARD-20261212-ABCDE.ics",
+        "contentType": "text/calendar; charset=utf-8; method=PUBLISH",
+        "content": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Opplevagent//Gardssalg Booking//NO\r\nMETHOD:PUBLISH\r\nBEGIN:VEVENT\r\nUID:00000000-0000-4000-8000-000000000001-20261212T120000Z@opplevagent.no\r\nDTSTAMP:<now>\r\nDTSTART:20261212T120000Z\r\nDTEND:20261212T140000Z\r\nSUMMARY:Besøk hos Testsideri & Søn — GARD-20261212-ABCDE\r\nLOCATION:Gardsvegen 1\\, 5700 Voss\r\nEND:VEVENT\r\nEND:VCALENDAR"
+      }
+    ]
+  },
+  "guest.declined": {
+    "to": "kari@example.no",
+    "subject": "Reservasjonen kunne dessverre ikke bekreftes — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei Kari &lt;Nordmann&gt; &amp; Co,</p>\n<p>Vi beklager — reservasjonsforespørselen din (GARD-20261212-ABCDE, lørdag 12. desember 2026 kl. 13:00) kunne dessverre ikke bekreftes av produsenten denne gangen.</p>\n<p>Det finnes flere produsenter som tar imot besøk: <a href=\"https://opplevagent.no/kategori/gardssalg\">se alternative tilbydere her</a>.</p>\n<p>Se gjeldende status når som helst: <a href=\"https://opplevagent.no/kategori/gardssalg/status/GARD-20261212-ABCDE/s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0\">statusside for reservasjonen</a>.</p>\n<p>Hilsen<br>Opplevagent</p>",
+    "textContent": "Hei Kari <Nordmann> & Co,\n\nVi beklager — reservasjonsforespørselen din (GARD-20261212-ABCDE, lørdag 12. desember 2026 kl. 13:00) kunne dessverre ikke bekreftes av produsenten denne gangen.\nSe alternative tilbydere: https://opplevagent.no/kategori/gardssalg\n\nHilsen\nOpplevagent",
+    "attachments": null
+  },
+  "guest.declined.bare": {
+    "to": "kari@example.no",
+    "subject": "Reservasjonen kunne dessverre ikke bekreftes — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei Kari &lt;Nordmann&gt; &amp; Co,</p>\n<p>Vi beklager — reservasjonsforespørselen din (GARD-20261212-ABCDE, lørdag 12. desember 2026 kl. 13:00) kunne dessverre ikke bekreftes av produsenten denne gangen.</p>\n<p>Det finnes flere produsenter som tar imot besøk: <a href=\"https://opplevagent.no/kategori/gardssalg\">se alternative tilbydere her</a>.</p>\n\n<p>Hilsen<br>Opplevagent</p>",
+    "textContent": "Hei Kari <Nordmann> & Co,\n\nVi beklager — reservasjonsforespørselen din (GARD-20261212-ABCDE, lørdag 12. desember 2026 kl. 13:00) kunne dessverre ikke bekreftes av produsenten denne gangen.\nSe alternative tilbydere: https://opplevagent.no/kategori/gardssalg\n\nHilsen\nOpplevagent",
+    "attachments": null
+  },
+  "guest.suggestion": {
+    "to": "kari@example.no",
+    "subject": "Produsenten foreslår et nytt tidspunkt — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei Kari &lt;Nordmann&gt; &amp; Co,</p>\n<p>Produsenten kan dessverre ikke ta imot besøket lørdag 12. desember 2026 kl. 13:00, men foreslår i stedet:</p>\n<p style=\"font-size:1.05rem;font-weight:bold\">søndag 13. desember 2026 kl. 14:00</p>\n<p><a href=\"https://opplevagent.no/kategori/gardssalg/gjestesvar/d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0\">Svar på forslaget her</a> — du kan akseptere det nye tidspunktet eller avslå.</p>\n<p>Lenken er personlig for denne reservasjonen (GARD-20261212-ABCDE) — ikke del den videre.</p>\n<p>Se gjeldende status når som helst: <a href=\"https://opplevagent.no/kategori/gardssalg/status/GARD-20261212-ABCDE/s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0\">statusside for reservasjonen</a>.</p>\n<p>Hilsen<br>Opplevagent</p>",
+    "textContent": "Hei Kari <Nordmann> & Co,\n\nProdusenten kan dessverre ikke ta imot besøket lørdag 12. desember 2026 kl. 13:00, men foreslår i stedet:\nsøndag 13. desember 2026 kl. 14:00\n\nAksepter eller avslå forslaget her (personlig lenke):\nhttps://opplevagent.no/kategori/gardssalg/gjestesvar/d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0\n\nHilsen\nOpplevagent",
+    "attachments": null
+  },
+  "guest.suggestion.bare": {
+    "to": "kari@example.no",
+    "subject": "Produsenten foreslår et nytt tidspunkt — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei Kari &lt;Nordmann&gt; &amp; Co,</p>\n<p>Produsenten kan dessverre ikke ta imot besøket lørdag 12. desember 2026 kl. 13:00, men foreslår i stedet:</p>\n<p style=\"font-size:1.05rem;font-weight:bold\">søndag 13. desember 2026 kl. 14:00</p>\n<p><a href=\"https://opplevagent.no/kategori/gardssalg/gjestesvar/d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0\">Svar på forslaget her</a> — du kan akseptere det nye tidspunktet eller avslå.</p>\n<p>Lenken er personlig for denne reservasjonen (GARD-20261212-ABCDE) — ikke del den videre.</p>\n\n<p>Hilsen<br>Opplevagent</p>",
+    "textContent": "Hei Kari <Nordmann> & Co,\n\nProdusenten kan dessverre ikke ta imot besøket lørdag 12. desember 2026 kl. 13:00, men foreslår i stedet:\nsøndag 13. desember 2026 kl. 14:00\n\nAksepter eller avslå forslaget her (personlig lenke):\nhttps://opplevagent.no/kategori/gardssalg/gjestesvar/d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0\n\nHilsen\nOpplevagent",
+    "attachments": null
+  },
+  "guest.expired": {
+    "to": "kari@example.no",
+    "subject": "Forespørselen utløp uten svar — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei Kari &lt;Nordmann&gt; &amp; Co,</p>\n<p>Vi beklager — produsenten har dessverre ikke besvart reservasjonsforespørselen din (GARD-20261212-ABCDE, lørdag 12. desember 2026 kl. 13:00) i tide, så den er nå utløpt.</p>\n<p>Det finnes flere produsenter som tar imot besøk: <a href=\"https://opplevagent.no/kategori/gardssalg\">se alternative tilbydere her</a>.</p>\n<p>Se gjeldende status når som helst: <a href=\"https://opplevagent.no/kategori/gardssalg/status/GARD-20261212-ABCDE/s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0s0\">statusside for reservasjonen</a>.</p>\n<p>Hilsen<br>Opplevagent</p>",
+    "textContent": "Hei Kari <Nordmann> & Co,\n\nVi beklager — produsenten har dessverre ikke besvart reservasjonsforespørselen din (GARD-20261212-ABCDE, lørdag 12. desember 2026 kl. 13:00) i tide, så den er nå utløpt.\nSe alternative tilbydere: https://opplevagent.no/kategori/gardssalg\n\nHilsen\nOpplevagent",
+    "attachments": null
+  },
+  "guest.expired.suggested.bare": {
+    "to": "kari@example.no",
+    "subject": "Forespørselen utløp uten svar — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei Kari &lt;Nordmann&gt; &amp; Co,</p>\n<p>Vi beklager — det foreslåtte tidspunktet for reservasjonsforespørselen din (GARD-20261212-ABCDE, lørdag 12. desember 2026 kl. 13:00) ble dessverre ikke endelig avklart i tide, så forespørselen er nå utløpt.</p>\n<p>Det finnes flere produsenter som tar imot besøk: <a href=\"https://opplevagent.no/kategori/gardssalg\">se alternative tilbydere her</a>.</p>\n\n<p>Hilsen<br>Opplevagent</p>",
+    "textContent": "Hei Kari <Nordmann> & Co,\n\nVi beklager — det foreslåtte tidspunktet for reservasjonsforespørselen din (GARD-20261212-ABCDE, lørdag 12. desember 2026 kl. 13:00) ble dessverre ikke endelig avklart i tide, så forespørselen er nå utløpt.\nSe alternative tilbydere: https://opplevagent.no/kategori/gardssalg\n\nHilsen\nOpplevagent",
+    "attachments": null
+  },
+  "guest.producerCancelled": {
+    "to": "kari@example.no",
+    "subject": "Testsideri & Søn har avlyst besøket — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei Kari &lt;Nordmann&gt; &amp; Co,</p>\n<p>Testsideri &amp; Søn har dessverre måttet avlyse besøket lørdag 12. desember 2026 kl. 13:00. Referanse: GARD-20261212-ABCDE.</p>\n<p>Grunn fra produsenten: Stengt &lt;storm&gt;</p>\n<p>Hvis du har lagt besøket inn i kalenderen din, må du slette det selv. Vil du prøve et annet tidspunkt, kan du sende en ny forespørsel fra profilsiden: <a href=\"https://opplevagent.no/kategori/gardssalg/produsent/et-testsideri\">https://opplevagent.no/kategori/gardssalg/produsent/et-testsideri</a></p>\n<p>Hilsen<br>\nOpplevagent</p>",
+    "textContent": "Hei Kari <Nordmann> & Co,\n\nTestsideri & Søn har dessverre måttet avlyse besøket lørdag 12. desember 2026 kl. 13:00. Referanse: GARD-20261212-ABCDE.\n\nGrunn fra produsenten: Stengt <storm>\n\nHvis du har lagt besøket inn i kalenderen din, må du slette det selv. Vil du prøve et annet tidspunkt, kan du sende en ny forespørsel fra profilsiden: https://opplevagent.no/kategori/gardssalg/produsent/et-testsideri\n\nHilsen\nOpplevagent",
+    "attachments": null
+  },
+  "guest.producerCancelled.noProfile": {
+    "to": "kari@example.no",
+    "subject": "Testsideri & Søn har avlyst besøket — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei Kari &lt;Nordmann&gt; &amp; Co,</p>\n<p>Testsideri &amp; Søn har dessverre måttet avlyse besøket lørdag 12. desember 2026 kl. 13:00. Referanse: GARD-20261212-ABCDE.</p>\n<p>Grunn fra produsenten: Syk</p>\n<p>Hvis du har lagt besøket inn i kalenderen din, må du slette det selv.</p>\n<p>Hilsen<br>\nOpplevagent</p>",
+    "textContent": "Hei Kari <Nordmann> & Co,\n\nTestsideri & Søn har dessverre måttet avlyse besøket lørdag 12. desember 2026 kl. 13:00. Referanse: GARD-20261212-ABCDE.\n\nGrunn fra produsenten: Syk\n\nHvis du har lagt besøket inn i kalenderen din, må du slette det selv.\n\nHilsen\nOpplevagent",
+    "attachments": null
+  },
+  "producer.new.full": {
+    "to": "post@et-testsideri.example.no",
+    "subject": "Ny reservasjon — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei,</p>\n<p>Du har fått en ny reservasjonsforespørsel via Opplevagent:</p>\n<table style=\"border-collapse:collapse;font-family:sans-serif\">\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Bookingref:</td><td>GARD-20261212-ABCDE</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Dato/tid:</td><td>lørdag 12. desember 2026 kl. 13:00</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Antall:</td><td>3 personer</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Gjest:</td><td>Kari &lt;Nordmann&gt; &amp; Co</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">E-post:</td><td>kari@example.no</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Telefon:</td><td>+47 400 00 000</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Kommentar fra gjesten:</td><td>Vi gleder oss &lt;3 &amp; lurer på parkering</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Dine oppgitte åpningstider:</td><td>Lør 12–16 &lt;helg&gt;</td></tr>\n</table>\n<p><strong>Svar på forespørselen:</strong></p>\n<p><a href=\"https://opplevagent.no/kategori/gardssalg/svar/r0r0r0r0r0r0r0r0r0r0r0r0r0r0r0r0\" style=\"display:inline-block;background:#1d4e46;color:#ffffff;text-decoration:none;font-weight:700;padding:12px 22px;border-radius:8px\">Åpne svarsiden</a></p>\n<p>Der kan du bekrefte, foreslå et nytt tidspunkt eller avslå. Svarfrist: <strong>fredag 4. desember 2026 kl. 11:00</strong> — uten svar innen fristen utløper forespørselen automatisk og gjesten får beskjed.</p>\n<p>Spørsmål fra gjesten kan besvares direkte — gjestens e-post står over.</p>\n<p>Etter besøket: <a href=\"https://opplevagent.no/kategori/gardssalg/bekreft/c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0\">bekreft oppmøte eller ikke-oppmøte her</a>.<br>\nLenkene er personlige for denne reservasjonen — ikke del dem videre.</p>\n<p>Hilsen<br>Opplevagent</p>",
+    "textContent": "Hei,\n\nDu har fått en ny reservasjonsforespørsel via Opplevagent.\nBookingref: GARD-20261212-ABCDE\nDato/tid: lørdag 12. desember 2026 kl. 13:00\nAntall: 3\nGjest: Kari <Nordmann> & Co (kari@example.no, +47 400 00 000)\nKommentar fra gjesten: Vi gleder oss <3 & lurer på parkering\nDine oppgitte åpningstider: Lør 12–16 <helg>\n\nSvar på forespørselen (bekreft / foreslå nytt tidspunkt / avslå):\nhttps://opplevagent.no/kategori/gardssalg/svar/r0r0r0r0r0r0r0r0r0r0r0r0r0r0r0r0\nSvarfrist: fredag 4. desember 2026 kl. 11:00 — uten svar innen fristen utløper forespørselen automatisk og gjesten får beskjed.\n\nEtter besøket: bekreft oppmøte her (personlig lenke, ikke del videre):\nhttps://opplevagent.no/kategori/gardssalg/bekreft/c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0\n\nHilsen\nOpplevagent",
+    "attachments": null
+  },
+  "producer.new.noDeadline": {
+    "to": "post@et-testsideri.example.no",
+    "subject": "Ny reservasjon — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei,</p>\n<p>Du har fått en ny reservasjonsforespørsel via Opplevagent:</p>\n<table style=\"border-collapse:collapse;font-family:sans-serif\">\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Bookingref:</td><td>GARD-20261212-ABCDE</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Dato/tid:</td><td>lørdag 12. desember 2026 kl. 13:00</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Antall:</td><td>3 personer</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Gjest:</td><td>Kari &lt;Nordmann&gt; &amp; Co</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">E-post:</td><td>kari@example.no</td></tr>\n  \n  \n  \n</table>\n<p><strong>Svar på forespørselen:</strong></p>\n<p><a href=\"https://opplevagent.no/kategori/gardssalg/svar/r0r0r0r0r0r0r0r0r0r0r0r0r0r0r0r0\" style=\"display:inline-block;background:#1d4e46;color:#ffffff;text-decoration:none;font-weight:700;padding:12px 22px;border-radius:8px\">Åpne svarsiden</a></p>\n<p>Der kan du bekrefte, foreslå et nytt tidspunkt eller avslå.</p>\n<p>Spørsmål fra gjesten kan besvares direkte — gjestens e-post står over.</p>\n<p>Etter besøket: <a href=\"https://opplevagent.no/kategori/gardssalg/bekreft/c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0\">bekreft oppmøte eller ikke-oppmøte her</a>.<br>\nLenkene er personlige for denne reservasjonen — ikke del dem videre.</p>\n<p>Hilsen<br>Opplevagent</p>",
+    "textContent": "Hei,\n\nDu har fått en ny reservasjonsforespørsel via Opplevagent.\nBookingref: GARD-20261212-ABCDE\nDato/tid: lørdag 12. desember 2026 kl. 13:00\nAntall: 3\nGjest: Kari <Nordmann> & Co (kari@example.no)\n\nSvar på forespørselen (bekreft / foreslå nytt tidspunkt / avslå):\nhttps://opplevagent.no/kategori/gardssalg/svar/r0r0r0r0r0r0r0r0r0r0r0r0r0r0r0r0\n\nEtter besøket: bekreft oppmøte her (personlig lenke, ikke del videre):\nhttps://opplevagent.no/kategori/gardssalg/bekreft/c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0\n\nHilsen\nOpplevagent",
+    "attachments": null
+  },
+  "producer.new.legacy": {
+    "to": "post@et-testsideri.example.no",
+    "subject": "Ny reservasjon — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei,</p>\n<p>Du har fått en ny reservasjonsforespørsel via Opplevagent:</p>\n<table style=\"border-collapse:collapse;font-family:sans-serif\">\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Bookingref:</td><td>GARD-20261212-ABCDE</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Dato/tid:</td><td>lørdag 12. desember 2026 kl. 13:00</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Antall:</td><td>1 person</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Gjest:</td><td>Kari &lt;Nordmann&gt; &amp; Co</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">E-post:</td><td>kari@example.no</td></tr>\n  \n  \n  \n</table>\n\n<p>Spørsmål fra gjesten kan besvares direkte — gjestens e-post står over.</p>\n<p>Etter besøket: <a href=\"https://opplevagent.no/kategori/gardssalg/bekreft/c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0\">bekreft oppmøte eller ikke-oppmøte her</a>.<br>\nLenkene er personlige for denne reservasjonen — ikke del dem videre.</p>\n<p>Hilsen<br>Opplevagent</p>",
+    "textContent": "Hei,\n\nDu har fått en ny reservasjonsforespørsel via Opplevagent.\nBookingref: GARD-20261212-ABCDE\nDato/tid: lørdag 12. desember 2026 kl. 13:00\nAntall: 1\nGjest: Kari <Nordmann> & Co (kari@example.no)\n\nEtter besøket: bekreft oppmøte her (personlig lenke, ikke del videre):\nhttps://opplevagent.no/kategori/gardssalg/bekreft/c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0\n\nHilsen\nOpplevagent",
+    "attachments": null
+  },
+  "producer.reminder": {
+    "to": "post@et-testsideri.example.no",
+    "subject": "Påminnelse: ubesvart reservasjonsforespørsel — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei,</p>\n<p>En reservasjonsforespørsel venter fortsatt på svar fra deg:</p>\n<table style=\"border-collapse:collapse;font-family:sans-serif\">\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Bookingref:</td><td>GARD-20261212-ABCDE</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Dato/tid:</td><td>lørdag 12. desember 2026 kl. 13:00</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Antall:</td><td>3 personer</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Gjest:</td><td>Kari &lt;Nordmann&gt; &amp; Co</td></tr>\n</table>\n<p><a href=\"https://opplevagent.no/kategori/gardssalg/svar/r0r0r0r0r0r0r0r0r0r0r0r0r0r0r0r0\">Svar her: bekreft, foreslå nytt tidspunkt eller avslå</a>.</p>\n<p>Svarfrist: <strong>fredag 4. desember 2026 kl. 11:00</strong> — uten svar innen fristen utløper forespørselen automatisk og gjesten får beskjed.</p>\n<p>Hilsen<br>Opplevagent</p>",
+    "textContent": "Hei,\n\nEn reservasjonsforespørsel venter fortsatt på svar fra deg.\nBookingref: GARD-20261212-ABCDE\nDato/tid: lørdag 12. desember 2026 kl. 13:00\nAntall: 3\nGjest: Kari <Nordmann> & Co\n\nSvar her (bekreft / foreslå nytt tidspunkt / avslå):\nhttps://opplevagent.no/kategori/gardssalg/svar/r0r0r0r0r0r0r0r0r0r0r0r0r0r0r0r0\n\nSvarfrist: fredag 4. desember 2026 kl. 11:00 — uten svar innen fristen utløper forespørselen automatisk og gjesten får beskjed.\n\nHilsen\nOpplevagent",
+    "attachments": null
+  },
+  "producer.reminder.noDeadline": {
+    "to": "post@et-testsideri.example.no",
+    "subject": "Påminnelse: ubesvart reservasjonsforespørsel — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei,</p>\n<p>En reservasjonsforespørsel venter fortsatt på svar fra deg:</p>\n<table style=\"border-collapse:collapse;font-family:sans-serif\">\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Bookingref:</td><td>GARD-20261212-ABCDE</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Dato/tid:</td><td>lørdag 12. desember 2026 kl. 13:00</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Antall:</td><td>1 person</td></tr>\n  <tr><td style=\"padding:4px 12px 4px 0;font-weight:bold\">Gjest:</td><td>Kari &lt;Nordmann&gt; &amp; Co</td></tr>\n</table>\n<p><a href=\"https://opplevagent.no/kategori/gardssalg/svar/r0r0r0r0r0r0r0r0r0r0r0r0r0r0r0r0\">Svar her: bekreft, foreslå nytt tidspunkt eller avslå</a>.</p>\n<p>Uten svar utløper forespørselen automatisk og gjesten får beskjed.</p>\n<p>Hilsen<br>Opplevagent</p>",
+    "textContent": "Hei,\n\nEn reservasjonsforespørsel venter fortsatt på svar fra deg.\nBookingref: GARD-20261212-ABCDE\nDato/tid: lørdag 12. desember 2026 kl. 13:00\nAntall: 1\nGjest: Kari <Nordmann> & Co\n\nSvar her (bekreft / foreslå nytt tidspunkt / avslå):\nhttps://opplevagent.no/kategori/gardssalg/svar/r0r0r0r0r0r0r0r0r0r0r0r0r0r0r0r0\n\nUten svar utløper forespørselen automatisk og gjesten får beskjed.\n\nHilsen\nOpplevagent",
+    "attachments": null
+  },
+  "producer.guestAccepted": {
+    "to": "post@et-testsideri.example.no",
+    "subject": "Gjesten aksepterte det nye tidspunktet — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei,</p>\n<p>Gjesten Kari &lt;Nordmann&gt; &amp; Co har akseptert det nye tidspunktet for reservasjon GARD-20261212-ABCDE.</p>\n<p>Avtalt tidspunkt er nå: <strong>lørdag 12. desember 2026 kl. 13:00</strong>.</p>\n<p>Bekreft oppmøte etter besøket via lenken i den opprinnelige e-posten.</p>\n<p>Hilsen<br>Opplevagent</p>",
+    "textContent": "Hei,\n\nGjesten Kari <Nordmann> & Co har akseptert det nye tidspunktet for reservasjon GARD-20261212-ABCDE.\nAvtalt tidspunkt er nå: lørdag 12. desember 2026 kl. 13:00.\n\nHilsen\nOpplevagent",
+    "attachments": null
+  },
+  "producer.guestDeclined": {
+    "to": "post@et-testsideri.example.no",
+    "subject": "Gjesten avslo det nye tidspunktet — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei,</p>\n<p>Gjesten Kari &lt;Nordmann&gt; &amp; Co kunne dessverre ikke på det foreslåtte tidspunktet, og reservasjonsforespørselen GARD-20261212-ABCDE er avsluttet.</p>\n<p>Hilsen<br>Opplevagent</p>",
+    "textContent": "Hei,\n\nGjesten Kari <Nordmann> & Co kunne dessverre ikke på det foreslåtte tidspunktet, og reservasjonsforespørselen GARD-20261212-ABCDE er avsluttet.\n\nHilsen\nOpplevagent",
+    "attachments": null
+  },
+  "producer.guestCancelled": {
+    "to": "post@et-testsideri.example.no",
+    "subject": "Gjesten har avlyst — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei,</p>\n<p>Kari &lt;Nordmann&gt; &amp; Co har avlyst besøket lørdag 12. desember 2026 kl. 13:00 (3 personer). Referanse: GARD-20261212-ABCDE.</p>\n<p>Grunn fra gjesten: Syk &lt;barn&gt;</p>\n<p>Du trenger ikke gjøre noe. Tidspunktet er ledig igjen.</p>\n<p>Hilsen<br>\nOpplevagent</p>",
+    "textContent": "Hei,\n\nKari <Nordmann> & Co har avlyst besøket lørdag 12. desember 2026 kl. 13:00 (3 personer). Referanse: GARD-20261212-ABCDE.\n\nGrunn fra gjesten: Syk <barn>\n\nDu trenger ikke gjøre noe. Tidspunktet er ledig igjen.\n\nHilsen\nOpplevagent",
+    "attachments": null
+  },
+  "producer.guestWithdrew.noReason": {
+    "to": "post@et-testsideri.example.no",
+    "subject": "Gjesten har trukket forespørselen — GARD-20261212-ABCDE",
+    "htmlContent": "<p>Hei,</p>\n<p>Kari &lt;Nordmann&gt; &amp; Co har trukket forespørselen om besøk lørdag 12. desember 2026 kl. 13:00 (1 personer). Referanse: GARD-20261212-ABCDE.</p>\n<p>Du trenger ikke gjøre noe. Tidspunktet er ledig igjen.</p>\n<p>Hilsen<br>\nOpplevagent</p>",
+    "textContent": "Hei,\n\nKari <Nordmann> & Co har trukket forespørselen om besøk lørdag 12. desember 2026 kl. 13:00 (1 personer). Referanse: GARD-20261212-ABCDE.\n\nDu trenger ikke gjøre noe. Tidspunktet er ledig igjen.\n\nHilsen\nOpplevagent",
+    "attachments": null
+  }
+}

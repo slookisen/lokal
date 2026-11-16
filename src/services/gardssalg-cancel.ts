@@ -27,8 +27,9 @@
 // Texts: verbatim from the approved text package OA-1 §4 (A2A
 // marketing-drafts/2026-11-12-opplevagent-tekstpakke-oa-1.md, approved by
 // Daniel 2026-11-15). Do not reword here. E-mail to the producer is always
-// Norwegian; no guest language is stored yet, so the guest e-mail is
-// Norwegian too (the English text is kept and tested for the later switch).
+// Norwegian; the guest e-mail follows guestEmailLang() (O4-2: English only
+// with GARDSSALG_EMAIL_EN_ENABLED and guest_lang "en"). The e-mail texts
+// live in the O4-2 register, gardssalg-email-texts.ts.
 
 import { getDb } from "../database/db-factory";
 import { emailService } from "./email-service";
@@ -40,6 +41,7 @@ import {
   type GardssalgBooking,
 } from "./booking-store";
 import { fillOa1, formatOsloInstant, loadReceiptProvider } from "./gardssalg-honest-receipt";
+import { emailText, guestEmailLang } from "./gardssalg-email-texts";
 
 const APP_URL = process.env.APP_URL || "https://opplevagent.no";
 
@@ -87,58 +89,18 @@ export const OA1_CANCEL_TEXTS = {
   "cancel.producer.submit": { nb: "Ja, avlys besøket" },
   "cancel.producer.done.heading": { nb: "Besøket er avlyst" },
   "cancel.producer.done.body": { nb: "Vi har gitt {gjest} beskjed. Referanse: {ref}." },
-  "cancel.toGuest.subject": {
-    nb: "{produsent} har avlyst besøket — {ref}",
-    en: "{produsent} has cancelled the visit — {ref}",
-  },
-  "cancel.toGuest.body": {
-    nb: [
-      "Hei {gjest},",
-      "",
-      "{produsent} har dessverre måttet avlyse besøket {tid}. Referanse: {ref}.",
-      "",
-      "Grunn fra produsenten: {grunn}",
-      "",
-      "Hvis du har lagt besøket inn i kalenderen din, må du slette det selv. Vil du prøve et annet tidspunkt, kan du sende en ny forespørsel fra profilsiden: {profilside}",
-      "",
-      "Hilsen",
-      "Opplevagent",
-    ].join("\n"),
-    en: [
-      "Hi {gjest},",
-      "",
-      "Unfortunately, {produsent} has had to cancel the visit on {tid}. Reference: {ref}.",
-      "",
-      "Reason from the producer: {grunn}",
-      "",
-      "If you added the visit to your calendar, please delete it yourself. If you would like to try another time, you can send a new request from the profile page: {profilside}",
-      "",
-      "Best regards,",
-      "Opplevagent",
-    ].join("\n"),
-  },
+  // The e-mail texts live in the O4-2 register (gardssalg-email-texts.ts).
+  "cancel.toGuest.subject": { nb: emailText("cancel.toGuest.subject", "nb"), en: emailText("cancel.toGuest.subject", "en") },
+  "cancel.toGuest.body": { nb: emailText("cancel.toGuest.body", "nb"), en: emailText("cancel.toGuest.body", "en") },
   // E-mail to the producer when the guest cancels (always Norwegian).
-  "cancel.toProducer.subject": { nb: "Gjesten har avlyst — {ref}" },
-  "cancel.toProducer.subjectPending": { nb: "Gjesten har trukket forespørselen — {ref}" },
-  "cancel.toProducer.body": {
-    nb: [
-      "Hei,",
-      "",
-      "{gjest} har avlyst besøket {tid} ({antall} personer). Referanse: {ref}.",
-      "",
-      "Grunn fra gjesten: {grunn}",
-      "",
-      "Du trenger ikke gjøre noe. Tidspunktet er ledig igjen.",
-      "",
-      "Hilsen",
-      "Opplevagent",
-    ].join("\n"),
-  },
+  "cancel.toProducer.subject": { nb: emailText("cancel.toProducer.subject") },
+  "cancel.toProducer.subjectPending": { nb: emailText("cancel.toProducer.subjectPending") },
+  "cancel.toProducer.body": { nb: emailText("cancel.toProducer.body") },
 } as const;
 
 /** The package's substitution for a request that was not confirmed yet (§4.1, under the e-mail). */
-export const TO_PRODUCER_CANCELLED_PHRASE = "har avlyst besøket";
-export const TO_PRODUCER_WITHDRAWN_PHRASE = "har trukket forespørselen om besøk";
+export const TO_PRODUCER_CANCELLED_PHRASE = emailText("cancel.toProducer.cancelledPhrase");
+export const TO_PRODUCER_WITHDRAWN_PHRASE = emailText("cancel.toProducer.withdrawnPhrase");
 
 export type Oa1CancelKey = keyof typeof OA1_CANCEL_TEXTS;
 
@@ -384,7 +346,7 @@ export async function sendProducerCancelToGuest(booking: GardssalgBooking): Prom
     booking,
     { producerName: provider.navn, profileUrl: producerProfileUrl(booking.provider_id) },
     reason,
-    "nb",
+    guestEmailLang(booking),
   );
   await emailService.sendEmail({
     to: booking.guest_email,
