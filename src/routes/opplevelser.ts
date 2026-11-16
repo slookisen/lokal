@@ -1011,6 +1011,7 @@ import {
   unknownWeekdayPayload,
   weekdayMismatchPayload,
 } from "../services/gardssalg-booking-resolve";
+import { guestTokenMatches, GUEST_TOKEN_PARAM } from "../services/gardssalg-attendance-guard";
 // dev-request 2026-07-25-reisesok…, Fase 2 — corridor discovery API.
 import { buildReiseApiRouter } from "./reise-api";
 import { getDb as getExperiencesDbHandle } from "../database/db-factory";
@@ -34324,6 +34325,10 @@ router.post("/book", async (req: Request, res: Response) => {
     // request then reaches nobody (admin alerted, never reminded/expired).
     // "queued" = the producer e-mail is being sent (fire-and-forget).
     producer_notification: { status: producerNotifyAddressStatus(providerBook?.epost) },
+    // O1-4 (R8): the guest's own token for the confirmation page
+    // (?t=<guest_token>); without it the page shows no guest name, e-mail or
+    // note. Only on a NEW booking: the O1-3 duplicate answer never carries it.
+    guest_token: booking.guest_status_token,
     message: honestReceiptEnabled()
       ? receiptFormMessage(booking.guest_email)
       : `Påmelding registrert! Bekreftelse sendes til ${booking.guest_email}.`,
@@ -34373,7 +34378,9 @@ router.get("/book/:ref/ics", (req: Request, res: Response) => {
     res.send(confirmedIcs);
     return;
   }
-  const ics = buildIcs(booking);
+  // O1-4 (R8): the reference alone gives no guest name or e-mail; the
+  // guest's token (?t=, as on the confirm page) keeps the ATTENDEE line.
+  const ics = buildIcs(booking, guestTokenMatches(booking, req.query[GUEST_TOKEN_PARAM]));
   res.setHeader("Content-Type", "text/calendar; charset=utf-8");
   res.setHeader(
     "Content-Disposition",

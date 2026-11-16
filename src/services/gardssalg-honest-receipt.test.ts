@@ -255,10 +255,12 @@ export function runGardssalgHonestReceiptTests(opts: { log?: boolean } = {}): Pr
         await settle();
         return { status: r.status, body, booking: bookingStore.getBookingByRef(body.booking_ref)! };
       };
-      const page = async (ref: string) =>
-        (await fetch(`${base}/kategori/gardssalg/book/hr-testsideri/confirm/${encodeURIComponent(ref)}`)).text();
-      const icsDownload = async (ref: string) => {
-        const r = await fetch(`${base}/api/opplevelser/book/${encodeURIComponent(ref)}/ics`);
+      // O1-4 (R8): `t` is the guest's token; without it the page and the
+      // download carry no guest name/e-mail/note (gardssalg-attendance-guard.test.ts).
+      const page = async (ref: string, t?: string | null) =>
+        (await fetch(`${base}/kategori/gardssalg/book/hr-testsideri/confirm/${encodeURIComponent(ref)}${t ? `?t=${encodeURIComponent(t)}` : ""}`)).text();
+      const icsDownload = async (ref: string, t?: string | null) => {
+        const r = await fetch(`${base}/api/opplevelser/book/${encodeURIComponent(ref)}/ics${t ? `?t=${encodeURIComponent(t)}` : ""}`);
         return { status: r.status, text: await r.text() };
       };
       const postForm = async (path: string, form: Record<string, string>) => {
@@ -288,17 +290,17 @@ export function runGardssalgHonestReceiptTests(opts: { log?: boolean } = {}): Pr
         assertEq(m?.attachments?.length, 1, "o6: receipt still carries the .ics");
         assertTrue(/METHOD:REQUEST[\s\S]*SUMMARY:Gårdssalg & smaking — ref /.test(m?.attachments?.[0]?.content ?? ""), "o7: legacy .ics content");
 
-        const pOff = await page(b.booking_ref);
+        const pOff = await page(b.booking_ref, b.guest_status_token);
         assertTrue(pOff.includes("<title>Reservasjon bekreftet | Opplevagent</title>"), "o8: page title unchanged");
         assertTrue(pOff.includes("<h1>Reservasjon bekreftet</h1>"), "o9: page heading unchanged");
         assertTrue(pOff.includes(`<p class="hint">En bekreftelse er sendt til off@example.no.</p>\n    <a class="ics-link"`), "o10: page hint + .ics link unchanged");
         assertTrue(!pOff.includes("Besøket er ikke bekreftet"), "o11: no OA-1 lead with the flag off");
         for (const v of ["false", "1"]) {
           setFlag(v);
-          assertEq(await page(b.booking_ref), pOff, `o12: page byte-identical with flag ${JSON.stringify(v)}`);
+          assertEq(await page(b.booking_ref, b.guest_status_token), pOff, `o12: page byte-identical with flag ${JSON.stringify(v)}`);
         }
         setFlag(undefined);
-        const d = await icsDownload(b.booking_ref);
+        const d = await icsDownload(b.booking_ref, b.guest_status_token);
         assertEq(d.status, 200, "o13: .ics download before confirmation still 200 (unchanged)");
         assertTrue(d.text.includes("ATTENDEE;CN=Kari:mailto:off@example.no"), "o14: legacy download content");
 
@@ -333,7 +335,7 @@ export function runGardssalgHonestReceiptTests(opts: { log?: boolean } = {}): Pr
         assertEq(m?.hasAttachmentsKey, false, "n6: receipt has NO calendar file");
         assertTrue(!sends.some((s) => (s.attachments ?? []).length > 0), "n7: no e-mail carries an .ics before the producer confirmed");
 
-        const pOn = await page(b.booking_ref);
+        const pOn = await page(b.booking_ref, b.guest_status_token);
         assertTrue(pOn.includes("<title>Forespørselen er mottatt | Opplevagent</title>"), "n8: page title = receipt.pageTitle");
         assertTrue(pOn.includes("<h1>Vi har mottatt forespørselen</h1>"), "n9: heading = receipt.heading");
         assertTrue(pOn.includes(`<p>Besøket er ikke bekreftet ennå. Testsideri AS har fått forespørselen og svarer innen ${frist}. Du får e-post når produsenten har bekreftet, foreslått et annet tidspunkt eller avslått.</p>`), "n10: lead = receipt.lead filled");

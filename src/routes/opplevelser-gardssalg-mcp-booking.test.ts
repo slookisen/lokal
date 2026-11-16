@@ -375,6 +375,9 @@ export function runOpplevelserGardssalgMcpBookingTests(opts: { log?: boolean } =
       const stillReserved = bookingStore.getBookingByRef(okCall.parsed.booking_ref as string);
       assertEq(stillReserved?.status, "reserved", "d2: booking is still 'reserved' after the failed wrong-token attempt — no bypass mutated it");
 
+      // O1-4 (R6): attendance only after the producer has confirmed the visit.
+      assertEq(bookingStore.resolveBooking(realToken, "confirmed_attended", "test-producer"), null, "d2b: O1-4 — attendance refused before the producer has confirmed");
+      bookingStore.producerRespondConfirm(dbRow.respond_token as string);
       const resolved = bookingStore.resolveBooking(realToken, "confirmed_attended", "test-producer");
       assertTrue(!!resolved, "d3: the REAL confirm_token (read directly from the DB, never returned by the tool) resolves via the existing, untouched resolveBooking()");
       assertEq(resolved?.status, "confirmed_attended", "d4: resolveBooking() with the real token flips status as designed — proving the ONLY path to confirmation is that existing token flow, not this tool");
