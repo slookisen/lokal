@@ -169,9 +169,39 @@ export function detectAiClient(userAgent?: string | null, origin?: string | null
   return undefined;
 }
 
+// ─── Claude from the MCP initialize client name (C1-B3) ─────────
+// dev-request 2026-11-12-rfb-c1-claude-knapp-sporing-gjenkjenning, slice B3.
+// Real initialize names: "Claude", "claude-ai", "claude-code",
+// "Anthropic/ClaudeAI"; a name that starts with "Anthropic" is Claude too.
+// Only for telemetry and UTM: never access control, never a person.
+const GENERIC_SDK_CLIENTS: ReadonlySet<string> = new Set(["Python SDK", "Node SDK"]);
+
+/** The AI client an MCP `initialize` client name names, or undefined. */
+export function aiClientFromClientName(clientName?: string | null): string | undefined {
+  const name = String(clientName || "").trim();
+  if (!name) return undefined;
+  if (/^anthropic/i.test(name)) return "Claude";
+  return detectAiClient(name);
+}
+
+/**
+ * `identity` (from User-Agent/Origin) unless it is only a generic SDK
+ * (Python SDK / Node SDK) or unknown and the initialize client name names a
+ * specific assistant: then that assistant. Claude's own connectors may send a
+ * plain node/python UA, but a specific assistant UA (ChatGPT, Cursor …) always
+ * wins over the client name.
+ */
+export function preferNamedAssistant(identity: string | undefined, clientName?: string | null): string | undefined {
+  if (identity && !GENERIC_SDK_CLIENTS.has(identity)) return identity;
+  const named = aiClientFromClientName(clientName);
+  if (!identity) return named;
+  return named && !GENERIC_SDK_CLIENTS.has(named) ? named : identity;
+}
+
 /**
  * The AI client of a request from its headers (User-Agent, Origin) and, for
- * MCP, the client name it sent in `initialize`. Perplexity-User is known too.
+ * MCP, the client name it sent in `initialize` (preferNamedAssistant).
+ * Perplexity-User is known too.
  */
 export function aiClientFromHeaders(
   headers?: Record<string, string | string[] | undefined>,
@@ -179,9 +209,10 @@ export function aiClientFromHeaders(
 ): string | undefined {
   const h = (k: string) => { const v = headers?.[k]; return Array.isArray(v) ? v[0] : v; };
   const ua = h("user-agent");
-  return detectAiClient(ua, h("origin"))
-    ?? (/perplexity/i.test(ua || "") ? "Perplexity" : undefined)
-    ?? (clientName ? detectAiClient(clientName) : undefined);
+  return preferNamedAssistant(
+    detectAiClient(ua, h("origin")) ?? (/perplexity/i.test(ua || "") ? "Perplexity" : undefined),
+    clientName,
+  );
 }
 
 // ─── AI tagging of profile links in responses to AI clients ─────

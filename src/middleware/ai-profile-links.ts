@@ -19,15 +19,16 @@
 import type { NextFunction, Request, Response } from "express";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { classifyUA } from "../services/traffic-classifier";
-import { aiClientFromHeaders, sourceClientLabel, tagAiProfileLinks, type AiUtmMedium } from "../utils/url-utm";
+import { aiClientFromHeaders, preferNamedAssistant, sourceClientLabel, tagAiProfileLinks, type AiUtmMedium } from "../utils/url-utm";
 
 type ToolExtra = { requestInfo?: { headers?: Record<string, string | string[] | undefined> } } | undefined;
 
 /**
  * Wrap server.registerTool so every tool registered after this call returns
  * its result with tagged profile links. `clientIdentity` gives the session's
- * known client (detectMcpClient); otherwise the call's own headers and the
- * client name from `initialize` decide, else utm_source=ai_assistant.
+ * known client (detectMcpClient; a generic SDK yields to an assistant named
+ * in `initialize`); otherwise the call's own headers and the client name from
+ * `initialize` decide, else utm_source=ai_assistant.
  */
 export function tagMcpToolResults(server: McpServer, clientIdentity?: () => string | undefined): void {
   const s = server as any;
@@ -38,8 +39,13 @@ export function tagMcpToolResults(server: McpServer, clientIdentity?: () => stri
     register(name, config, async (...args: any[]) => {
       const result = await cb(...args);
       const extra = args[args.length - 1] as ToolExtra;
-      const client = clientIdentity?.()
-        ?? aiClientFromHeaders(extra?.requestInfo?.headers, s.server?.getClientVersion?.()?.name ?? null);
+      const clientName = s.server?.getClientVersion?.()?.name ?? null;
+      const session = clientIdentity?.();
+      // C1-B3: a session known only as a generic SDK still becomes the
+      // assistant its initialize client name names (preferNamedAssistant).
+      const client = session
+        ? preferNamedAssistant(session, clientName)
+        : aiClientFromHeaders(extra?.requestInfo?.headers, clientName);
       return tagAiProfileLinks(result, client, "mcp");
     });
 }
