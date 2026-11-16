@@ -281,11 +281,15 @@ function selectRfbCxTargets(db: ReturnType<typeof getDb>, limit: number): RfbCxT
     .all(limit) as RfbCxTargetRow[];
 }
 
-function selectRfbCxTargetsByIds(db: ReturnType<typeof getDb>, ids: string[]): RfbCxTargetRow[] {
+function selectRfbCxTargetsByIds(
+  db: ReturnType<typeof getDb>,
+  ids: string[],
+  cohortWhere: string = RFB_CX_ELIGIBLE_WHERE,
+): RfbCxTargetRow[] {
   if (ids.length === 0) return [];
   const placeholders = ids.map(() => "?").join(",");
   const rows = db
-    .prepare(`${rfbCxSelectSql(`${RFB_CX_ELIGIBLE_WHERE}${catalogHiddenIdExclusionSql(db, "a")} AND a.id IN (${placeholders})`)}`)
+    .prepare(`${rfbCxSelectSql(`${cohortWhere}${catalogHiddenIdExclusionSql(db, "a")} AND a.id IN (${placeholders})`)}`)
     .all(...ids) as RfbCxTargetRow[];
   // Preserve caller order, same convention as the sibling discovery route's
   // agentIds handling.
@@ -317,17 +321,56 @@ const RFB_CX_BACKFILL_ELIGIBLE_WHERE = `
   AND json_extract(k.field_provenance,'$.contact_email_dns_check.live') = 1
 `;
 
+// ─── opt-in: knowledge_gap (agentIds only) ─────────────────────────────────
+//
+// dev-request 2026-11-15-rfb-nattjobb-hull-kontaktuttrekk-bm-og-koer, slice
+// B1 step 2: the nightly enrichment job (services/rfb-enrichment-nightly.ts,
+// step contact_extraction) also takes rows whose agents.contact_email is set
+// and NOT DNS-dead but whose agent_knowledge.email — the column the outreach
+// funnel reads — is empty. For those rows it calls this route with explicit
+// agentIds and `knowledge_gap: true`, which swaps the cohort filter for the
+// one below (in BOTH modes; without the flag every caller gets exactly the
+// cohorts above, byte-identical SQL):
+//   - backfill_from_contact_email: this cohort is a superset of
+//     RFB_CX_BACKFILL_ELIGIBLE_WHERE — it also accepts a never-DNS-checked or
+//     unknown stamp, not only live = 1. That is safe because nothing is
+//     written on the DNS stamp: the address is copied only when
+//     findEmailOnOwnSite sees it on the producer's own site (the on-site
+//     proof IS the evidence; dev-request 2026-10-03-rfb-epostkilde-sporbar-
+//     aldri-gjettet). A DNS-dead stamp (live = 0 / false) stays excluded — it
+//     belongs to the normal cohort, whose replace-if-dead rule applies.
+//   - scrape mode: the fallback when the proof says rejected_not_on_site. The
+//     row is outside RFB_CX_ELIGIBLE_WHERE (its contact_email is set and not
+//     dead), so it is selected by this cohort instead, and the write is
+//     knowledge-email-only (applyRfbCxWrite knowledgeEmailOnly): the
+//     existing, non-dead agents.contact_email is never replaced by a scraped
+//     address — the replace rule is for blank-or-dead rows only.
+// json_valid guard: a malformed field_provenance must not throw the whole
+// query; it reads as "no stamp" (not dead), like rfbContactEmailDnsState's
+// "unknown". `IS NOT 0`: NULL (never checked), 1 (live) and any other value
+// pass; 0 / false (dead) does not.
+export const RFB_CX_KNOWLEDGE_GAP_WHERE = `
+  AND TRIM(COALESCE(k.email,'')) = ''
+  AND TRIM(COALESCE(a.contact_email,'')) != ''
+  AND (CASE WHEN json_valid(k.field_provenance)
+            THEN json_extract(k.field_provenance,'$.contact_email_dns_check.live') END) IS NOT 0
+`;
+
 function selectRfbCxBackfillTargets(db: ReturnType<typeof getDb>, limit: number): RfbCxTargetRow[] {
   return db
     .prepare(`${rfbCxSelectSql(RFB_CX_BACKFILL_ELIGIBLE_WHERE + catalogHiddenIdExclusionSql(db, "a"))} ORDER BY a.created_at ASC, a.id ASC LIMIT ?`)
     .all(limit) as RfbCxTargetRow[];
 }
 
-function selectRfbCxBackfillTargetsByIds(db: ReturnType<typeof getDb>, ids: string[]): RfbCxTargetRow[] {
+function selectRfbCxBackfillTargetsByIds(
+  db: ReturnType<typeof getDb>,
+  ids: string[],
+  cohortWhere: string = RFB_CX_BACKFILL_ELIGIBLE_WHERE,
+): RfbCxTargetRow[] {
   if (ids.length === 0) return [];
   const placeholders = ids.map(() => "?").join(",");
   const rows = db
-    .prepare(`${rfbCxSelectSql(`${RFB_CX_BACKFILL_ELIGIBLE_WHERE}${catalogHiddenIdExclusionSql(db, "a")} AND a.id IN (${placeholders})`)}`)
+    .prepare(`${rfbCxSelectSql(`${cohortWhere}${catalogHiddenIdExclusionSql(db, "a")} AND a.id IN (${placeholders})`)}`)
     .all(...ids) as RfbCxTargetRow[];
   const byId = new Map(rows.map((r) => [r.id, r]));
   return ids.map((id) => byId.get(id)).filter((r): r is RfbCxTargetRow => !!r);
@@ -607,6 +650,7 @@ export function applyRfbCxWrite(
   sourceUrl: string,
   batchId: string,
   sourceType: string = RFB_CX_PROVENANCE_SOURCE_TYPE,
+  opts: { knowledgeEmailOnly?: boolean } = {},
 ): { outcome: "written" | "skippedLocked" | "skippedCurated"; oldValue?: string | null } {
   const tx = db.transaction((): { outcome: "written" | "skippedLocked" | "skippedCurated"; oldValue?: string | null } => {
     const cur = db
@@ -645,7 +689,11 @@ export function applyRfbCxWrite(
     // Skip ONLY the contact_email column write + its audit row; the
     // fill-only agent_knowledge.email write below still runs, and the
     // caller-visible outcome stays "written" either way.
-    if (newEmail !== cur.contact_email) {
+    // opts.knowledgeEmailOnly (knowledge_gap scrape fallback, see
+    // RFB_CX_KNOWLEDGE_GAP_WHERE): the row's agents.contact_email is set and
+    // not DNS-dead, so it is left exactly as it is — only the fill-only
+    // agent_knowledge.email below may be written.
+    if (!opts.knowledgeEmailOnly && newEmail !== cur.contact_email) {
       db.prepare(`UPDATE agents SET contact_email = ? WHERE id = ?`).run(newEmail, agentId);
       db.prepare(
         `INSERT INTO agent_knowledge_audit
@@ -717,7 +765,7 @@ router.post("/rfb-contact-extraction", async (req: Request, res: Response) => {
   rfbCxLock = { startedAt: Date.now(), runId: rfbCxRunId };
 
   try {
-    const body = (req.body ?? {}) as { limit?: unknown; agentIds?: unknown; apply?: unknown; mode?: unknown };
+    const body = (req.body ?? {}) as { limit?: unknown; agentIds?: unknown; apply?: unknown; mode?: unknown; knowledge_gap?: unknown };
     const apply =
       body.apply === true ||
       body.apply === 1 ||
@@ -733,6 +781,13 @@ router.post("/rfb-contact-extraction", async (req: Request, res: Response) => {
     // (see the isBackfillMode branch below). Any other/absent mode value
     // keeps today's normal scrape flow completely untouched.
     const isBackfillMode = body.mode === "backfill_from_contact_email";
+    // Opt-in for the nightly job's explicit agentIds call only (see
+    // RFB_CX_KNOWLEDGE_GAP_WHERE). Strictly `true`; absent = unchanged.
+    const knowledgeGap = body.knowledge_gap === true;
+    if (knowledgeGap && !(Array.isArray(body.agentIds) && body.agentIds.length > 0)) {
+      res.status(400).json({ error: "knowledge_gap requires agentIds" });
+      return;
+    }
 
     const batchId = `rfb-contact-extraction-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
     const db = getDb();
@@ -749,7 +804,13 @@ router.post("/rfb-contact-extraction", async (req: Request, res: Response) => {
         res.status(400).json({ error: `Too many agentIds (max ${idCap} per call${isBackfillMode ? " in backfill_from_contact_email mode" : ""})` });
         return;
       }
-      targets = isBackfillMode ? selectRfbCxBackfillTargetsByIds(db, ids) : selectRfbCxTargetsByIds(db, ids);
+      targets = knowledgeGap
+        ? isBackfillMode
+          ? selectRfbCxBackfillTargetsByIds(db, ids, RFB_CX_KNOWLEDGE_GAP_WHERE)
+          : selectRfbCxTargetsByIds(db, ids, RFB_CX_KNOWLEDGE_GAP_WHERE)
+        : isBackfillMode
+          ? selectRfbCxBackfillTargetsByIds(db, ids)
+          : selectRfbCxTargetsByIds(db, ids);
       const foundIds = new Set(targets.map((t) => t.id));
       for (const id of ids) {
         if (!foundIds.has(id)) results.push({ agent_id: id, outcome: "not_found" });
@@ -1008,7 +1069,10 @@ router.post("/rfb-contact-extraction", async (req: Request, res: Response) => {
         continue;
       }
 
-      const written = applyRfbCxWrite(db, t.id, gatedEmail, emailUrl, batchId);
+      const written = applyRfbCxWrite(
+        db, t.id, gatedEmail, emailUrl, batchId, RFB_CX_PROVENANCE_SOURCE_TYPE,
+        knowledgeGap ? { knowledgeEmailOnly: true } : {},
+      );
       if (written.outcome === "written") {
         results.push({
           agent_id: t.id, agent_name: t.name, outcome: "written",
