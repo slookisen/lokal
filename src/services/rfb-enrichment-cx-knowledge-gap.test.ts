@@ -42,6 +42,15 @@
  *   n1 a full apply run (only contact_extraction capped on): eligible > 0
  *      (AK2), the outcomes are observable in the step report, attempts
  *      are stamped
+ *   n1 (review B1) the run-ledger claim's rejected_reasons lists only true
+ *      rejections (both new write outcomes count as written; sum == rejected)
+ *   t1 (review N1a) a scrape fallback answering cooldown_skipped stays
+ *      transient (not stamped); one answering 409 run_in_progress stops
+ *   t2 (review N3) past the run deadline / 08Z hour after the proof → the
+ *      proof outcome is recorded, the scrape is not started
+ *   r1 (review N1b) a knowledge_gap scrape dry run writes nothing
+ *   m1 (review N1c) a malformed field_provenance: taken by the gap path via
+ *      the json_valid guard, the gap id set does not crash
  *   ak4 every agent_knowledge.email written in this suite is literally on
  *      the stubbed own-site page its provenance names
  *
@@ -328,7 +337,7 @@ export async function runRfbEnrichmentCxKnowledgeGapTests(opts: { log?: boolean 
       pages.set("https://e3.no", `<html><body><a href="mailto:kontakt@e3.no">Kontakt</a></body></html>`);
       fetched.length = 0;
       const o3 = await exec.contactExtraction(await cohortRow("e3"));
-      assertEq([o3.outcome, o3.written, o3.knowledge_gap], ["rejected_not_on_site_then_scraped", true, true], "e3: rejected_not_on_site_then_scraped");
+      assertEq([o3.outcome, o3.written, o3.knowledge_gap], ["scraped_after_not_on_site", true, true], "e3: scraped_after_not_on_site");
       assertEq(kRow("e3").k_email, "kontakt@e3.no", "e3: k.email = the scraped own-site address");
       assertEq(kRow("e3").contact_email, "gammel@e3.no", "e3: the existing non-dead contact_email is NOT replaced");
       assertEq(auditCount("e3"), 0, "e3: no contact_email audit row (column not written)");
@@ -390,6 +399,21 @@ export async function runRfbEnrichmentCxKnowledgeGapTests(opts: { log?: boolean 
       const dry = await call({ mode: "backfill_from_contact_email", knowledge_gap: true, agentIds: ["r-never"] });
       assertEq([dry.body?.dry_run, dry.body?.results?.[0]?.outcome, kRow("r-never").k_email], [true, "written", ""], "r1: knowledge_gap dry run reports would-write, writes nothing");
       assertEq(fetched.length > 0, true, "r1: (sanity) the opt-in call fetched the own site");
+      // N1b: knowledge_gap scrape dry run (no mode, apply false) — would-write, writes nothing.
+      seedAgent("r-scrape", { field_provenance: dnsStamp(true) });
+      pages.set("https://r-scrape.no", `<a href="mailto:kontakt@r-scrape.no">Kontakt</a>`);
+      const auditBefore = auditCount("r-scrape");
+      const sdry = await call({ knowledge_gap: true, agentIds: ["r-scrape"], apply: false });
+      assertEq(
+        [sdry.body?.dry_run, sdry.body?.results?.[0]?.outcome, sdry.body?.results?.[0]?.email],
+        [true, "written", "kontakt@r-scrape.no"],
+        "r1 (N1b): knowledge_gap scrape dry run reports the would-write",
+      );
+      assertEq(
+        [kRow("r-scrape").k_email, kRow("r-scrape").contact_email, auditCount("r-scrape") - auditBefore],
+        ["", "post@r-scrape.no", 0],
+        "r1 (N1b): knowledge_gap scrape dry run writes nothing (k.email, contact_email, audit)",
+      );
     });
 
     // ── n1 a full apply run ────────────────────────────────────────────────
@@ -417,7 +441,7 @@ export async function runRfbEnrichmentCxKnowledgeGapTests(opts: { log?: boolean 
       assertEq([st.eligible > 0, st.eligible, st.selected, st.attempted, st.written], [true, 3, 3, 3, 2], "n1 (AK2): eligible > 0 — the new rows are taken");
       assertEq(
         st.extra?.contact_email_not_in_knowledge_outcomes,
-        { backfilled_from_contact_email: 1, rejected_not_on_site_then_scraped: 1, fetch_failed: 1 },
+        { backfilled_from_contact_email: 1, scraped_after_not_on_site: 1, fetch_failed: 1 },
         "n1: the new path's outcomes are tallied separately",
       );
       assertEq(st.extra?.contact_email_not_in_knowledge, { eligible: 3, selected: 3 }, "n1: selection counter in the step report");
@@ -428,12 +452,113 @@ export async function runRfbEnrichmentCxKnowledgeGapTests(opts: { log?: boolean 
         .all() as Array<{ agent_id: string; outcome: string }>;
       assertEq(
         stamped.map((s) => `${s.agent_id}:${s.outcome}`),
-        ["n-fail:fetch_failed", "n-found:backfilled_from_contact_email", "n-scrape:rejected_not_on_site_then_scraped"],
+        ["n-fail:fetch_failed", "n-found:backfilled_from_contact_email", "n-scrape:scraped_after_not_on_site"],
         "n1: every row stamped (retry window applies as for other rows)",
       );
+      // Review B1: the run-ledger claim splits written vs rejected correctly.
+      const env = db.prepare(`SELECT claims FROM runs WHERE agent = ?`).all(job.RFB_ENRICHMENT_NIGHTLY_AGENT) as Array<{ claims: string }>;
+      const claims = JSON.parse(env[env.length - 1]?.claims ?? "[]");
+      const cxClaim = claims.find((c: any) => c.meta?.kind === "rfb_enrichment_step_contact_extraction");
+      assertEq(
+        [cxClaim?.meta?.written, cxClaim?.meta?.rejected, cxClaim?.meta?.rejected_reasons],
+        [2, 1, { fetch_failed: 1 }],
+        "n1 (B1): rejected_reasons lists only the true rejection; both new write outcomes count as written",
+      );
+      const reasonSum = Object.values((cxClaim?.meta?.rejected_reasons ?? {}) as Record<string, number>).reduce((a, b) => a + b, 0);
+      assertEq(reasonSum, cxClaim?.meta?.rejected, "n1 (B1): sum(rejected_reasons) == rejected");
       const p = await job.buildRfbEnrichmentPreview(db, NIGHT);
       assertEq(p.steps.find((s) => s.step === "contact_extraction")!.eligible, 0, "n1: after the run, the retry window / filled k.email keep the rows out");
       assertAk4("n1");
+    });
+    // ── t1 transient scrape answers (review N1a) ───────────────────────────
+    await withDb("t1", async () => {
+      setEnv({
+        RFB_ENRICHMENT_NIGHTLY_ENABLED: "1",
+        RFB_ENRICHMENT_CAP_URL_CHECK: "0",
+        RFB_ENRICHMENT_CAP_EMAIL_DOMAIN_WEBSITE: "0",
+        RFB_ENRICHMENT_CAP_BRREG: "0",
+        RFB_ENRICHMENT_CAP_BM_SLUGS: "0",
+        RFB_ENRICHMENT_CAP_CONTACT_EXTRACTION: "5",
+        RFB_ENRICHMENT_CAP_CONTENT: "0",
+        RFB_ENRICHMENT_CAP_REVERIFY: "0",
+        RFB_ENRICHMENT_LLM_CAP: "5",
+        ANTHROPIC_API_KEY: "test-key-never-real",
+      });
+      // The proof reads the front page and /kontakt (address not there), then
+      // /om-oss answers 429 → the host is cooled down → the scrape's front
+      // fetch is cooldown_skipped.
+      seedAgent("t-cool", { field_provenance: dnsStamp(true) });
+      pages.set("https://t-cool.no", `<a href="/kontakt">Kontakt</a> <a href="/om-oss">Om oss</a>`);
+      pages.set("https://t-cool.no/kontakt", `<p>Ring oss.</p>`);
+      const base = globalThis.fetch;
+      globalThis.fetch = (async (url: any, init?: any) => {
+        if (String(url) === "https://t-cool.no/om-oss") {
+          fetched.push(String(url));
+          return { ok: false, status: 429, statusText: "Too Many", url: undefined, headers: { get: () => null }, arrayBuffer: async () => new ArrayBuffer(0) } as any;
+        }
+        return base(url, init);
+      }) as typeof fetch;
+      const r = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", now: NIGHT });
+      const st = r.steps.find((s) => s.step === "contact_extraction")!;
+      assertEq(st.outcomes, { cooldown_skipped: 1 }, "t1 (N1a): scrape cooldown keeps its transient code");
+      const stamped = db.prepare(`SELECT COUNT(*) AS n FROM rfb_enrichment_nightly_attempts WHERE step = 'contact_extraction'`).get() as { n: number };
+      assertEq(stamped.n, 0, "t1 (N1a): a cooldown_skipped scrape is not stamped — retried tomorrow");
+      assertEq(kRow("t-cool").k_email, "", "t1: nothing written");
+      globalThis.fetch = base;
+
+      // The executor returns any transient scrape answer as is (with
+      // knowledge_gap) — the same predicate then keeps it unstamped. (The
+      // route's run-lock is not driven end-to-end here: under the full gate
+      // another suite may have re-required the route module, so a lock set
+      // from this file would land in a different module instance.)
+      for (const t of [
+        { outcome: "run_in_progress", written: false, changed: false, stop: "contact_extraction_run_in_progress", knowledge_gap: true },
+        { outcome: "http_500", written: false, changed: false, error: true, knowledge_gap: true },
+        { outcome: "cooldown_skipped", written: false, changed: false, knowledge_gap: true },
+      ]) {
+        assertEq(job.isTransientRfbEnrichmentOutcome(t), true, `t1 (N1a): a ${t.outcome} scrape answer is transient (never stamped)`);
+      }
+    });
+
+    // ── t2 deadline / forbidden hour between proof and scrape (review N3) ──
+    await withDb("t2", async () => {
+      setEnv({ ANTHROPIC_API_KEY: "test-key-never-real" });
+      seedAgent("t-late", { field_provenance: dnsStamp(true) });
+      pages.set("https://t-late.no", `<a href="mailto:annen@t-late.no">x</a>`);
+      fetched.length = 0;
+      let asked = 0;
+      const o = await execFor().contactExtraction(await cohortRow("t-late"), {
+        stopBeforeSecondCall: () => {
+          asked++;
+          return "time_budget";
+        },
+      });
+      assertEq([o.outcome, o.stop, o.written, asked], ["rejected_not_on_site", "time_budget", false, 1], "t2 (N3): past the deadline → proof outcome recorded, step stops");
+      assertEq(fetched.filter((u) => u === "https://t-late.no").length, 1, "t2 (N3): the scrape is not started (one fetch only)");
+      assertEq([kRow("t-late").k_email, modelCalls], ["", 0], "t2 (N3): nothing written, no model call");
+      assertEq(job.isTransientRfbEnrichmentOutcome(o), true, "t2 (N3): not stamped — the row gets its scrape another night");
+      // Not asked when the proof already decided (found → no second call).
+      seedAgent("t-found", { field_provenance: dnsStamp(true) });
+      pages.set("https://t-found.no", `<a href="mailto:post@t-found.no">x</a>`);
+      let asked2 = 0;
+      const o2 = await execFor().contactExtraction(await cohortRow("t-found"), { stopBeforeSecondCall: () => (asked2++, "time_budget") });
+      assertEq([o2.outcome, asked2], ["backfilled_from_contact_email", 0], "t2 (N3): the check is only made before a second call");
+    });
+
+    // ── m1 malformed field_provenance (review N1c) ─────────────────────────
+    await withDb("m1", async () => {
+      setEnv({ ANTHROPIC_API_KEY: "test-key-never-real" });
+      seedAgent("m-bad", { field_provenance: "not json {" });
+      seedAgent("m-ok", { field_provenance: dnsStamp(true) });
+      pages.set("https://m-bad.no", `<a href="mailto:post@m-bad.no">x</a>`);
+      const p = await job.buildRfbEnrichmentPreview(db, NIGHT);
+      const cx = p.steps.find((s) => s.step === "contact_extraction")!;
+      assertEq([...cx.selected_ids].sort(), ["m-bad", "m-ok"], "m1 (N1c): the gap id set survives a malformed provenance and takes that row");
+      assertEq(cx.contact_email_not_in_knowledge, { eligible: 2, selected: 2 }, "m1 (N1c): both on the gap path");
+      assertEq(job.rfbCxRowTakesKnowledgeGapPath({ contact_email: "post@m-bad.no", k_email: "", field_provenance: "not json {" }), true, "m1: JS predicate agrees (unknown → gap path)");
+      const o = await execFor().contactExtraction(await cohortRow("m-bad"));
+      assertEq([o.outcome, kRow("m-bad").k_email], ["backfilled_from_contact_email", "post@m-bad.no"], "m1 (N1c): the route's knowledge_gap cohort takes it and the proof writes it");
+      assertAk4("m1");
     });
   } finally {
     globalThis.fetch = prevFetch;

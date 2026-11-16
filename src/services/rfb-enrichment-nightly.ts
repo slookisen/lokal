@@ -1054,8 +1054,12 @@ export function summarizeRfbContactEmailNotInKnowledge(rows: RfbEnrichmentCohort
 
 /** contact_extraction outcome: B1 step 2 copied the on-file address after seeing it on the own site. */
 export const RFB_ENRICHMENT_CX_BACKFILLED = "backfilled_from_contact_email";
-/** contact_extraction outcome: B1 step 2, the address was not on the site; the normal scrape wrote one. */
-export const RFB_ENRICHMENT_CX_NOT_ON_SITE_SCRAPED = "rejected_not_on_site_then_scraped";
+/**
+ * contact_extraction outcome: B1 step 2, the address was not on the site; the
+ * normal scrape wrote one. A WRITE (no `rejected_` prefix on purpose); the
+ * non-writing fallback outcomes are `rejected_not_on_site_then_<outcome>`.
+ */
+export const RFB_ENRICHMENT_CX_NOT_ON_SITE_SCRAPED = "scraped_after_not_on_site";
 
 /**
  * B1 step 2: does contact_extraction run this row on the knowledge-gap path
@@ -1865,7 +1869,15 @@ export interface RfbEnrichmentExecutors {
   emailDomainWebsite(row: RfbEnrichmentCohortRow): Promise<RfbEnrichmentRowOutcome>;
   brregContact(row: RfbEnrichmentCohortRow): Promise<RfbEnrichmentRowOutcome>;
   bmHarvest(args: RfbEnrichmentBmArgs): Promise<RfbEnrichmentBmOutcome>;
-  contactExtraction(row: RfbEnrichmentCohortRow): Promise<RfbEnrichmentRowOutcome>;
+  /**
+   * opts.stopBeforeSecondCall (B1 step 2): checked between the own-site proof
+   * and the scrape fallback of a knowledge-gap row; a non-null reason (run
+   * deadline, 08Z hour) means the scrape is not started.
+   */
+  contactExtraction(
+    row: RfbEnrichmentCohortRow,
+    opts?: { stopBeforeSecondCall?: () => string | null },
+  ): Promise<RfbEnrichmentRowOutcome>;
   /**
    * opts.productNames: the row's LLM reservation is in place — hand the
    * refresh the product-name extractor (generic stored products only).
@@ -1992,7 +2004,7 @@ export function createDefaultRfbEnrichmentExecutors(
       };
     },
 
-    async contactExtraction(row) {
+    async contactExtraction(row, opts) {
       const call = async (extra: Record<string, unknown>): Promise<RfbEnrichmentRowOutcome> => {
         const r = await callAdminRouterInProcess(contactExtractionRouter, {
           method: "POST",
@@ -2020,6 +2032,12 @@ export function createDefaultRfbEnrichmentExecutors(
       // other proof outcome (fetch_failed, cooldown_skipped, host_excluded,
       // rejected_domain_mismatch, …) is recorded as it is: no write, no scrape.
       if (proof.outcome !== "rejected_not_on_site") return { ...proof, knowledge_gap: true };
+      // The proof call took time: re-check the run deadline / forbidden hour
+      // before starting a second live fetch. Past it → the proof outcome is
+      // recorded, no scrape; `stop` ends the step and keeps the row unstamped
+      // (transient), so it gets its scrape on another night.
+      const late = opts?.stopBeforeSecondCall?.() ?? null;
+      if (late) return { ...proof, knowledge_gap: true, stop: late };
       const scraped = await call({ knowledge_gap: true });
       // A transient scrape answer (cooldown, run-lock, timeout, http_*) keeps
       // its own code so the row is retried tomorrow, not parked.
@@ -2862,7 +2880,16 @@ async function runSteps(rc: RunContext): Promise<void> {
   }
 
   // 3–4
-  await runRowStep("contact_extraction", (row) => exec.contactExtraction(row));
+  await runRowStep("contact_extraction", (row) =>
+    exec.contactExtraction(row, {
+      stopBeforeSecondCall: () => {
+        const t = clock();
+        if (isRfbEnrichmentForbiddenHour(t)) return "forbidden_hour";
+        if (t.getTime() >= rc.deadline.getTime() || t.getTime() >= rc.writeDeadline.getTime()) return "time_budget";
+        return null;
+      },
+    }),
+  );
   await runRowStep("content_refresh", (row, rowLlm) =>
     exec.contentRefresh(
       row,
@@ -3196,7 +3223,8 @@ function isWrittenOutcome(step: RfbEnrichmentStep, outcome: string): boolean {
     case "bm_harvest":
       return outcome === "written" || outcome === "phone_written" || outcome === "url_proposed";
     case "contact_extraction":
-      return outcome === "written";
+      // B1 step 2: the knowledge-gap path's two write outcomes.
+      return outcome === "written" || outcome === RFB_ENRICHMENT_CX_BACKFILLED || outcome === RFB_ENRICHMENT_CX_NOT_ON_SITE_SCRAPED;
     case "content_refresh":
       return (
         outcome === "refreshed" ||
