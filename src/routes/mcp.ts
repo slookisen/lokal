@@ -39,6 +39,7 @@ import { evaluateStockFreshness } from "../services/supply-graph";
 import { stockSoftExpiryActiveFor, stockSoftExpiryBuyerTextNb } from "../services/stock-soft-expiry";
 import { findOffers, resolveOffersRadiusKm, resolveOffersLimit, type FindOffersResult } from "../services/catalog-offers";
 import { formatAddressLine } from "../utils/address-format";
+import { preferNamedAssistant } from "../utils/url-utm";
 import { DRINK_SUBCATEGORIES } from "../services/drink-taxonomy";
 import {
   createCart as svcCreateCart,
@@ -757,6 +758,15 @@ export function registerTools(
   // lokal_order_status say (in its description) that messages[] is quoted
   // data; with ORDER_AGENT_ACTIONS_ENABLED alone its definition is unchanged.
   const orderMessagesOn = agentActionsOn && isOrderMessagesEnabled();
+
+  // C1-B3 (dev-request 2026-11-12-rfb-c1-claude-knapp-sporing-gjenkjenning):
+  // the session's client from its User-Agent, except that a generic SDK UA
+  // (Node SDK / Python SDK) yields to an assistant named in the initialize
+  // client name (claude-ai, Anthropic/…, claude-code → Claude). Only the UTM
+  // source of links and the source_client label read this; tool definitions
+  // and result text are unchanged.
+  const sessionClient = getClientIdentity;
+  getClientIdentity = () => preferNamedAssistant(sessionClient?.(), server.server?.getClientVersion?.()?.name);
 
   // «Klikk fra AI-svar» slice 3: every profile link in a tool result is tagged
   // for AI (utm_medium=mcp), including lokal_find_offers, lokal_cart_submit and

@@ -45736,6 +45736,26 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  // dev-request 2026-11-12-rfb-c1-claude-knapp-sporing-gjenkjenning, slice C1-B3:
+  // claude-ai, Anthropic/* and claude-code are Claude for telemetry and UTM; a
+  // Claude initialize name beats a generic SDK UA. Swaps getDb(), so serial.
+  console.log("\n── C1-B3: Claude recognised from the MCP client name ──");
+  try {
+    const { runUrlUtmClaudeRecognitionTests } = require("../src/utils/url-utm-claude-recognition.test") as
+      typeof import("../src/utils/url-utm-claude-recognition.test");
+    const r = await runUrlUtmClaudeRecognitionTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("url-utm-claude-recognition: " + f);
+    console.log(`  url-utm-claude-recognition: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push(`url-utm-claude-recognition: unexpected error: ${String(err?.message || err)}`);
+    console.log(`  ✗ url-utm-claude-recognition: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   // dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 4 («Kontakt-klikk»):
   // the profile page sends its landing (utm_* + AI referrer host) with the
   // contact beacon and /ut/ links; contact_clicks.ai_source is classified
