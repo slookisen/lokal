@@ -69,6 +69,8 @@ import { safeHonestCatalogCount } from "./honest-count";
 import { registeredMcpTools } from "./mcp-tool-manifest";
 import { agentCardProvider } from "./company-legal";
 import { distributionFor } from "../config/distribution-channels";
+// A2A dev-request F1-4: the ONE A2A protocol version (zero imports, PURE, same isolation rule).
+import { A2A_PROTOCOL_VERSION } from "./a2a-protocol-version";
 
 // ─── Marketplace Registry Service (SQLite-backed) ────────────
 // This is the CORE of what makes Lokal unique: the agent registry.
@@ -1444,12 +1446,12 @@ class MarketplaceRegistry {
           "Norges første A2A-markedsplass for lokal mat.",
       },
       version: "1.0.0",
-      // A2A v1.0 (Linux Foundation, released April 2026) top-level protocol fields.
-      // Dual-published alongside the legacy `authentication`/`interfaces` fields below —
-      // registries/clients on the old 0.3.0 shape keep working unchanged (dev-request
-      // 2026-07-13-a2a-card-v1-signing slice 1, additive-only by design: nothing legacy
-      // removed or altered, so this cannot regress an already-working consumer).
-      protocolVersion: "1.0.0",
+      // A2A top-level protocol fields (dev-request 2026-07-13-a2a-card-v1-signing
+      // slice 1), alongside the legacy `authentication`/`interfaces` fields below.
+      // protocolVersion is the version the server speaks (A2A dev-request F1-4,
+      // services/a2a-protocol-version.ts): this card's shape and the /a2a wire
+      // format are A2A v0.3, so it no longer says "1.0.0".
+      protocolVersion: A2A_PROTOCOL_VERSION,
       preferredTransport: "JSONRPC",
       additionalInterfaces: [
         { url: `${baseUrl}/api/marketplace`, transport: "HTTP+JSON" },

@@ -20165,7 +20165,7 @@ console.log("\n── orch-pr-19: opplevagent.no host-gate (experiences) ──"
   const card = getExperiencesAgentCard() as any;
 
   assertEq(card.name, "Opplevagent", "orch19-02a: name is 'Opplevagent'");
-  assertEq(card.protocolVersion, "1.0.0", "orch19-02b: protocolVersion is '1.0.0' (bumped by dev-request 2026-07-13-a2a-card-v1-signing slice 1)");
+  assertEq(card.protocolVersion, "0.3.0", "orch19-02b: protocolVersion is '0.3.0' — the A2A version the server speaks (A2A dev-request F1-4)");
   assertTrue(typeof card.url === "string" && card.url.length > 0, "orch19-02c: url is a string");
   assertTrue(card.url.endsWith("/a2a"), "orch19-02d: url ends with '/a2a'");
   assertTrue(!card.url.replace(/\/a2a$/, "").endsWith("/"), "orch19-02e: base url has NO double trailing slash");
@@ -40399,8 +40399,8 @@ withMemoryVerticalDb("EXPERIENCES_DB_PATH", () => {
       "prov-rfb-card-04: getRegistryCard() has additive provenancePageUrl");
     assertEq(registryCardProv.documentationUrl, "https://rettfrabonden.com/teknologi",
       "prov-rfb-card-05: getRegistryCard() documentationUrl is the routed /teknologi page");
-    assertEq(registryCardProv.protocolVersion, "1.0.0",
-      "prov-rfb-card-06: getRegistryCard() protocolVersion is unchanged (additive-only)");
+    assertEq(registryCardProv.protocolVersion, "0.3.0",
+      "prov-rfb-card-06: getRegistryCard() protocolVersion is the A2A version the server speaks (A2A dev-request F1-4)");
 
     // ── discovery.ts /llms.txt links to /proveniens ──
     // Source-grep approach (same pattern as PR-73's llms.txt-expansion block
@@ -41973,7 +41973,7 @@ withFreshModules(["../src/database/db-factory", "../src/services/dental-store"],
   try {
     buildTestDb();
     const rfbCard: any = marketplaceRegistry.getRegistryCard("https://rettfrabonden.com");
-    assertEq(rfbCard.protocolVersion, "1.0.0", "a2a-v1: rfb protocolVersion bumped to 1.0.0");
+    assertEq(rfbCard.protocolVersion, "0.3.0", "a2a-v1: rfb protocolVersion is 0.3.0, the version /a2a speaks (A2A dev-request F1-4)");
     assertEq(rfbCard.preferredTransport, "JSONRPC", "a2a-v1: rfb preferredTransport is JSONRPC");
     assertTrue(Array.isArray(rfbCard.additionalInterfaces) && rfbCard.additionalInterfaces.length === 1, "a2a-v1: rfb additionalInterfaces has one entry");
     assertEq(rfbCard.additionalInterfaces[0].url, "https://rettfrabonden.com/api/marketplace", "a2a-v1: rfb additionalInterfaces REST url");
@@ -41988,7 +41988,7 @@ withFreshModules(["../src/database/db-factory", "../src/services/dental-store"],
     assertEq(rfbCard.interfaces[0].type, "json-rpc", "a2a-v1: rfb legacy interfaces[0].type untouched");
 
     const dentalCard: any = getDentalAgentCard();
-    assertEq(dentalCard.protocolVersion, "1.0.0", "a2a-v1: dental protocolVersion bumped to 1.0.0");
+    assertEq(dentalCard.protocolVersion, "0.3.0", "a2a-v1: dental protocolVersion is 0.3.0, the version /a2a speaks (A2A dev-request F1-4)");
     assertEq(dentalCard.preferredTransport, "JSONRPC", "a2a-v1: dental preferredTransport is JSONRPC");
     assertEq(dentalCard.additionalInterfaces[0].url, "https://finn-tannlege.com/api/tannlege", "a2a-v1: dental additionalInterfaces REST url");
     assertEq(dentalCard.additionalInterfaces[0].transport, "HTTP+JSON", "a2a-v1: dental additionalInterfaces transport");
@@ -42004,7 +42004,7 @@ withFreshModules(["../src/database/db-factory", "../src/services/dental-store"],
     assertTrue(!("security" in dentalCard), "a2a-v1: dental has no `security` requirement array (advertisement only, not auth)");
 
     const expCard: any = getExperiencesAgentCard();
-    assertEq(expCard.protocolVersion, "1.0.0", "a2a-v1: experiences protocolVersion bumped to 1.0.0");
+    assertEq(expCard.protocolVersion, "0.3.0", "a2a-v1: experiences protocolVersion is 0.3.0, the version /a2a speaks (A2A dev-request F1-4)");
     assertEq(expCard.preferredTransport, "JSONRPC", "a2a-v1: experiences preferredTransport is JSONRPC");
     assertEq(expCard.additionalInterfaces[0].url, "https://opplevagent.no/api/opplevelser", "a2a-v1: experiences additionalInterfaces REST url");
     assertEq(expCard.additionalInterfaces[0].transport, "HTTP+JSON", "a2a-v1: experiences additionalInterfaces transport");
@@ -49000,6 +49000,16 @@ runSerial(async () => {
     failed += asg.failed;
     for (const f of asg.failures) failures.push("a2a-spam-guard: " + f);
     console.log(`  a2a-spam-guard: ${asg.passed} passed, ${asg.failed} failed`);
+
+    // A2A dev-request F1-4: the cards declare the A2A version the server speaks
+    // (A2A_PROTOCOL_VERSION), tied to each server's own /a2a answer.
+    const { runA2aProtocolVersionTests } = require("../src/routes/a2a-protocol-version.test") as
+      typeof import("../src/routes/a2a-protocol-version.test");
+    const apv = await runA2aProtocolVersionTests({ log: false });
+    passed += apv.passed;
+    failed += apv.failed;
+    for (const f of apv.failures) failures.push("a2a-protocol-version (F1-4): " + f);
+    console.log(`  a2a-protocol-version (F1-4): ${apv.passed} passed, ${apv.failed} failed`);
 
     // dev-request 2026-11-06-rfb-svar-til-kjoperagenter-tredje-person.
     const { runRfbTredjepersonSvarTests } = require("../src/routes/rfb-tredjeperson-svar.test") as

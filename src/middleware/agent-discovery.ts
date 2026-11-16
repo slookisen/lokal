@@ -16,6 +16,7 @@
 
 import { Request, Response, NextFunction } from "express";
 import { catalogVerticalForHost, safeHonestCatalogCount, type CatalogVertical } from "../services/honest-count";
+import { A2A_PROTOCOL_VERSION } from "../services/a2a-protocol-version";
 
 const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 const OPPLEVAGENT_BASE_URL = (process.env.OPPLEVAGENT_BASE_URL || "https://opplevagent.no").replace(/\/$/, "");
@@ -231,7 +232,7 @@ function techMarkdown(): string {
 
 All \`.well-known\` files follow published specs:
 
-- [/.well-known/agent-card.json](${BASE_URL}/.well-known/agent-card.json) — A2A v1.0.0
+- [/.well-known/agent-card.json](${BASE_URL}/.well-known/agent-card.json) — A2A v${A2A_PROTOCOL_VERSION}
 - [/.well-known/mcp/server-card.json](${BASE_URL}/.well-known/mcp/server-card.json) — MCP SEP-1649
 - [/.well-known/agent-skills/index.json](${BASE_URL}/.well-known/agent-skills/index.json) — Agent Skills v0.2.0
 - [/.well-known/api-catalog](${BASE_URL}/.well-known/api-catalog) — RFC 9727 linkset+json

@@ -198,13 +198,13 @@
     },
     "rfb GET /a2a": {
       "{}": {
-        "sha256": "4b553598c184fbe99767500ba22521afeca1a5548140eafef5ce47bda1194036",
+        "sha256": "23c5dd6cf955b3b1e66e9122b22f4961dfbd58dc57be23010de498b04b9a556d",
         "chars": 4275
       }
     },
     "oa GET /a2a": {
       "{}": {
-        "sha256": "58869010b04ecf20ed795d8828e741ac8333378e0a24b26eac4295aafb2d93c7",
+        "sha256": "0fb66e7a37c182c5338957a59589512cd9c588aeceda254958152cfaeeabe304",
         "chars": 6831
       }
     }
