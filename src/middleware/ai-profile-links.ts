@@ -19,7 +19,7 @@
 import type { NextFunction, Request, Response } from "express";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { classifyUA } from "../services/traffic-classifier";
-import { aiClientFromHeaders, tagAiProfileLinks, type AiUtmMedium } from "../utils/url-utm";
+import { aiClientFromHeaders, sourceClientLabel, tagAiProfileLinks, type AiUtmMedium } from "../utils/url-utm";
 
 type ToolExtra = { requestInfo?: { headers?: Record<string, string | string[] | undefined> } } | undefined;
 
@@ -66,4 +66,16 @@ export function aiProfileLinksJson(medium: AiUtmMedium) {
 export function aiProfileLinksForAiSearch(req: Request, res: Response, next: NextFunction): void {
   if (classifyUA(String(req.headers["user-agent"] || "")) === "ai_search") wrapJson(req, res, "api");
   next();
+}
+
+/**
+ * `source_client` label of a REST request (dev-request 2026-11-12-f1, F1-1):
+ * only an ai_search caller (ChatGPT-User, Claude-User, Perplexity-User …, the
+ * same rule as aiProfileLinksForAiSearch) gets a label; a browser (the web
+ * form) or a plain script gets null.
+ */
+export function restSourceClient(headers?: Record<string, string | string[] | undefined>): string | null {
+  const ua = headers?.["user-agent"];
+  if (classifyUA(String((Array.isArray(ua) ? ua[0] : ua) || "")) !== "ai_search") return null;
+  return sourceClientLabel(aiClientFromHeaders(headers));
 }
