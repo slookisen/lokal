@@ -4710,6 +4710,22 @@ function initSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already exists — expected */ }
   }
 
+  // ─── source_client (dev-request 2026-11-12-rfb-c1-claude-knapp-sporing-
+  // gjenkjenning, slice C1-B2) ─────────────────────────────────────────────
+  // Which AI assistant a cart (and the orders submitted from it) came from:
+  // one of SOURCE_CLIENT_LABELS in utils/url-utm.ts ('chatgpt', 'claude', …),
+  // the same label set as gardssalg_bookings.source_client (F1-1). Set only by
+  // the MCP tool lokal_cart_create; NULL for carts from the website, REST, A2A
+  // and every row created before this column. A coarse assistant tag: it never
+  // identifies a person and is never used for access control. Additive,
+  // nullable.
+  for (const stmt of [
+    `ALTER TABLE carts ADD COLUMN source_client TEXT`,
+    `ALTER TABLE orders ADD COLUMN source_client TEXT`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS cart_wishes (
       id                 TEXT PRIMARY KEY,

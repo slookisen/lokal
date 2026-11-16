@@ -41,6 +41,7 @@
 
 import type Database from "better-sqlite3";
 import { aiDeliveriesCountingSince, AI_DELIVERY_CHANNELS, AI_DELIVERY_VENDORS } from "./profile-ai-deliveries-compute";
+import { SOURCE_CLIENT_LABELS, isSourceClientLabel } from "../utils/url-utm";
 
 type Db = Database.Database;
 
@@ -498,6 +499,13 @@ export interface RfbOverview {
   response_time: { measured: number; unanswered: number; median_hours: number | null; avg_hours: number | null; forklaring: string };
   unanswered_over_24h: { count: number; hours: number; forklaring: string };
   cart_handoffs: { count: number; forklaring: string };
+  /**
+   * C1-B2 (dev-request 2026-11-12-rfb-c1-claude-knapp-sporing-gjenkjenning):
+   * orders in the period per AI-assistant label (orders.source_client). Keys:
+   * every label of SOURCE_CLIENT_LABELS plus RFB_SOURCE_CLIENT_NONE ('none')
+   * for NULL (website, REST, A2A, older orders). Live rows only.
+   */
+  by_source_client: { counts: Record<string, number>; test_counts: Record<string, number>; forklaring: string };
   /** Slice S5: present only when frozen daily sums replaced live rows for some day. */
   dagssummer?: DagssumBruk;
   test: {
@@ -557,6 +565,39 @@ function rfbAgentNameLookup(db: Db): (id: string) => string | null {
     }
     return cache.get(id) ?? null;
   };
+}
+
+/** The by_source_client key for an order without a label (NULL). */
+export const RFB_SOURCE_CLIENT_NONE = "none";
+
+/** Zero-filled by_source_client counts: every label (sorted), then 'none'. */
+function zeroSourceClientCounts(): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const l of [...SOURCE_CLIENT_LABELS].sort()) out[l] = 0;
+  out[RFB_SOURCE_CLIENT_NONE] = 0;
+  return out;
+}
+
+/**
+ * Orders created in [fra, tilEksklusiv) per source_client × test flag. Only
+ * the label column is read; a value outside SOURCE_CLIENT_LABELS (never
+ * written, see cart-service createCart) counts as 'none'.
+ */
+export function countRfbOrdersBySourceClient(db: Db, fra: string, tilEksklusiv: string): { counts: Record<string, number>; test_counts: Record<string, number> } {
+  const rows = db.prepare(
+    `SELECT o.source_client AS source_client, ${RFB_IS_TEST_SQL} AS is_test, COUNT(*) AS n
+       FROM orders o LEFT JOIN agents a ON a.id = o.agent_id
+      WHERE o.created_at >= ? AND o.created_at < ?
+      GROUP BY o.source_client, is_test`
+  ).all(fra, tilEksklusiv) as Array<{ source_client: string | null; is_test: number; n: number }>;
+  const counts = zeroSourceClientCounts();
+  const testCounts = zeroSourceClientCounts();
+  for (const r of rows) {
+    const key = isSourceClientLabel(r.source_client) ? r.source_client : RFB_SOURCE_CLIENT_NONE;
+    const target = Number(r.is_test) ? testCounts : counts;
+    target[key] = (target[key] ?? 0) + Number(r.n);
+  }
+  return { counts, test_counts: testCounts };
 }
 
 export function computeRfbOverview(db: Db, periode: Periode, oppl: Opplosning, now: Date = new Date(), sums: DailySumsRead | null = null): RfbOverview {
@@ -673,6 +714,13 @@ export function computeRfbOverview(db: Db, periode: Periode, oppl: Opplosning, n
     cart_handoffs: {
       count: pick(handoffs, 0),
       forklaring: "Antall kontakt-overleveringer (cart_handoffs) i perioden: kjøperen fikk produsentens kontaktinfo i stedet for en bestilling.",
+    },
+    by_source_client: {
+      ...countRfbOrdersBySourceClient(db, periode.fra, periode.til_eksklusiv),
+      forklaring:
+        "Bestillinger i perioden per AI-assistent (orders.source_client), satt når handlekurven ble opprettet med MCP-verktøyet " +
+        "lokal_cart_create. «none» = ingen etikett (nettsiden, REST, A2A, ukjent klient og eldre bestillinger). " +
+        "counts er uten testprodusenten, test_counts er testprodusenten. Leses bare fra gjenværende rader (ikke fra dagssummene).",
     },
     test: {
       forklaring:

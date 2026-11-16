@@ -29,6 +29,7 @@ import { isBlocked } from "./blocklist-service";
 import { isCategoryLabel } from "../utils/category-label";
 import { classifyCartItemBan, banErrorText, BAN_CHECK_FAILED_ERROR, type BannedItemKind } from "./cart-item-ban";
 import { summarizePricing } from "./order-pricing";
+import { isSourceClientLabel } from "../utils/url-utm";
 import {
   claimOrderCapAdminAlert, isOrderCapNoticeEnabled, isOrderCapV2Enabled, orderCapHandoffFields, orderCapHandoffFieldsV2,
   orderCapReasonForDetail, osloDayStartUtc, recordOrderCapEvent, ORDER_CAP_CEILING_PREWARN_AT,
@@ -230,17 +231,29 @@ export function isEligibleForRealOrder(agentId: string, dbOverride?: any): boole
 
 // ─── Create cart ─────────────────────────────────────────────────────────────
 
-export function createCart(): { cart_id: string; buyer_ref: string } {
+export interface CreateCartOptions {
+  /**
+   * C1-B2 (dev-request 2026-11-12-rfb-c1-claude-knapp-sporing-gjenkjenning):
+   * which AI assistant the cart came from, one of SOURCE_CLIENT_LABELS
+   * (utils/url-utm.ts). Only the MCP tool lokal_cart_create passes it. Any
+   * value that is not an allow-listed label is stored as NULL. Never used for
+   * access control and never shown to producers or buyers.
+   */
+  sourceClient?: string | null;
+}
+
+export function createCart(opts: CreateCartOptions = {}): { cart_id: string; buyer_ref: string } {
   const db = _cartTestDb ?? getDb();
   const cart_id = randomUUID();
   const buyer_ref = generateBuyerRef();
   // Carts expire after 7 days
   const expires_at = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+  const source_client = isSourceClientLabel(opts.sourceClient) ? opts.sourceClient : null;
 
   db.prepare(`
-    INSERT INTO carts (id, buyer_ref, buyer_kind, status, currency, created_at, updated_at, expires_at)
-    VALUES (?, ?, 'platform_agent', 'open', 'NOK', datetime('now'), datetime('now'), ?)
-  `).run(cart_id, buyer_ref, expires_at);
+    INSERT INTO carts (id, buyer_ref, buyer_kind, status, currency, created_at, updated_at, expires_at, source_client)
+    VALUES (?, ?, 'platform_agent', 'open', 'NOK', datetime('now'), datetime('now'), ?, ?)
+  `).run(cart_id, buyer_ref, expires_at, source_client);
 
   return { cart_id, buyer_ref };
 }
@@ -1718,7 +1731,12 @@ export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: 
     }
   }
 
-  const buyer_ref = (db.prepare("SELECT buyer_ref FROM carts WHERE id = ?").get(cartId) as any).buyer_ref;
+  const cartRow = db.prepare("SELECT buyer_ref, source_client FROM carts WHERE id = ?").get(cartId) as
+    { buyer_ref: string; source_client: string | null };
+  const buyer_ref = cartRow.buyer_ref;
+  // C1-B2: every order inherits the cart's AI-assistant label (NULL stays NULL;
+  // re-checked against the allow-list so only a fixed label is ever copied).
+  const source_client = isSourceClientLabel(cartRow.source_client) ? cartRow.source_client : null;
 
   // Prepayment decision per real-order producer (skive 2). Evaluated BEFORE
   // the transaction so a throwing hook can never half-write a submit.
@@ -1796,17 +1814,20 @@ export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: 
         INSERT INTO orders
           (id, cart_id, agent_id, buyer_ref, status, fulfilment, pickup_time,
            total_nok, confirm_token, created_at, updated_at,
-           buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent_at)
+           buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent_at,
+           source_client)
         VALUES
           (?, ?, ?, ?, 'pending', 'pickup', NULL, ?, ?, datetime('now'), datetime('now'),
-           ?, ?, ?, ?, CASE WHEN ? THEN datetime('now') ELSE NULL END)
+           ?, ?, ?, ?, CASE WHEN ? THEN datetime('now') ELSE NULL END,
+           ?)
       `).run(
         order_id, cartId, agent_id, buyer_ref, total_nok, confirm_token,
         sharedContact.buyer_name,
         sharedContact.buyer_email,
         sharedContact.buyer_phone,
         sharedContact.delivery_note,
-        consentNow ? 1 : 0
+        consentNow ? 1 : 0,
+        source_client
       );
       if (prepayAgentIds.has(agent_id)) {
         db.prepare(`UPDATE orders SET payment_mode = 'prepay' WHERE id = ?`).run(order_id);
