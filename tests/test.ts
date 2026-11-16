@@ -32333,6 +32333,18 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gag.failures) failures.push("gardssalg-attendance-guard: " + f);
     console.log(`  gardssalg-attendance-guard: ${gag.passed} passed, ${gag.failed} failed`);
 
+    // O1-5 (R2): cancellation by the guest or the producer behind
+    // GARDSSALG_CANCEL_ENABLED (OA-1 §4 texts, flag off inert, followup job
+    // and attendance leave a cancelled row alone).
+    console.log("\n── gardssalg-cancel: guest/producer cancellation + flag off inert + OA-1 §4 texts ──");
+    const { runGardssalgCancelTests } = require("../src/services/gardssalg-cancel.test") as
+      typeof import("../src/services/gardssalg-cancel.test");
+    const gcx = await runGardssalgCancelTests({ log: false });
+    passed += gcx.passed;
+    failed += gcx.failed;
+    for (const f of gcx.failures) failures.push("gardssalg-cancel: " + f);
+    console.log(`  gardssalg-cancel: ${gcx.passed} passed, ${gcx.failed} failed`);
+
     // GET /admin/gardssalg-provider-lookup — read-only, case-insensitive
     // substring lookup of experience_providers by navn, returning
     // id/navn/rfb_seed_source/created_at. Closes the gap where /admin/

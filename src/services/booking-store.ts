@@ -1310,7 +1310,9 @@ function getProviderDispatchRow(provider_id: string): {
   return row ?? null;
 }
 
-async function sendGatedProducerEmail(
+// Exported for O1-5 (gardssalg-cancel.ts): the producer's cancellation notice
+// goes through the same gates.
+export async function sendGatedProducerEmail(
   booking: GardssalgBooking,
   kind: string,
   build: (producerEmail: string) => { subject: string; htmlContent: string; textContent: string },
