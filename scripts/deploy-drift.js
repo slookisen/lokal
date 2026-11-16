@@ -10,7 +10,9 @@
  *
  * Safety net: every few minutes, compare main's head with prod's
  * /health.git_sha and dispatch fly-deploy.yml on main when main has been
- * ahead of prod for longer than GRACE_MINUTES. All decisions fail closed:
+ * ahead of prod for longer than GRACE_MINUTES and no push/workflow_dispatch
+ * run of fly-deploy.yml exists for that head sha at all (so it never redeploys
+ * over a Fly-level rollback). All decisions fail closed:
  * anything unexpected means "do nothing and say why".
  *
  * Dependency-free CommonJS so the workflow can require() it straight from the
@@ -27,6 +29,9 @@ const GRACE_MINUTES = 10;
 const POST_DEPLOY_SETTLE_MINUTES = GRACE_MINUTES;
 
 const SHA_RE = /^[0-9a-f]{40}$/;
+
+/** Events under which fly-deploy.yml actually deploys (pull_request runs only build). */
+const DEPLOY_EVENTS = new Set(['push', 'workflow_dispatch']);
 
 /**
  * Parse the body of GET https://rettfrabonden.com/health.
@@ -59,7 +64,11 @@ function parseHealth(text) {
  * @param {string|null} input.compareStatus    status of GET compare/{prod}...{main}
  *        ('ahead' | 'identical' | 'behind' | 'diverged'), null if the call failed
  * @param {Array<{event:string, status:string, conclusion:string|null, head_sha:string, updated_at?:string}>} input.runs
- *        recent fly-deploy.yml runs (any event; pull_request runs are ignored)
+ *        recent fly-deploy.yml runs (any event; pull_request runs are ignored).
+ *        Dispatch happens only when NO push/workflow_dispatch run exists for
+ *        main's head at all: once the head has been deployed (any conclusion),
+ *        prod lagging behind it is a failure or a deliberate rollback, which
+ *        a human resolves — the sweep never redeploys over it.
  * @param {Date|number} input.now
  * @param {number} [input.graceMinutes]
  * @returns {{ action: 'dispatch'|'noop', reason: string, level: 'info'|'warning' }}
@@ -87,35 +96,44 @@ function decideDeployDrift(input) {
     );
   }
 
-  // Only push / workflow_dispatch runs can deploy; pull_request runs are build-checks.
-  const deployRuns = (Array.isArray(input.runs) ? input.runs : []).filter(
-    (r) => r && r.event !== 'pull_request',
-  );
-
-  const active = deployRuns.find((r) => r.status !== 'completed');
+  // Any non-pull_request run that is not finished counts as a deploy underway
+  // (pull_request runs are build-checks and never deploy).
+  const allRuns = Array.isArray(input.runs) ? input.runs.filter(Boolean) : [];
+  const active = allRuns.find((r) => r.event !== 'pull_request' && r.status !== 'completed');
   if (active) {
-    return noop(`a fly-deploy run is already ${active.status} (${short(active.head_sha)}) — deploy underway`);
+    return noop(`a fly-deploy run (${active.event}) is already ${active.status} for ${short(active.head_sha)} — deploy underway`);
   }
 
-  const forHead = deployRuns.filter((r) => String(r.head_sha || '').toLowerCase() === mainSha);
-  const bad = forHead.find((r) => r.conclusion !== 'success');
-  if (bad) {
-    return noop(
-      `fly-deploy for ${short(mainSha)} already concluded "${bad.conclusion}" — not redispatching (no loop); needs a human`,
-      'warning',
-    );
-  }
-  if (forHead.some((r) => r.event === 'workflow_dispatch')) {
-    return noop(
-      `fly-deploy was already dispatched for ${short(mainSha)} and succeeded, yet prod still reports ${short(prodSha)} — not redispatching (at most once per sha); needs a human`,
-      'warning',
-    );
-  }
-  const recentSuccess = forHead.find(
-    (r) => r.updated_at && nowMs - Date.parse(r.updated_at) < POST_DEPLOY_SETTLE_MINUTES * 60000,
+  // Completed deploy-event runs (push or workflow_dispatch, any conclusion) for main's head.
+  const forHead = allRuns.filter(
+    (r) => DEPLOY_EVENTS.has(r.event) && String(r.head_sha || '').toLowerCase() === mainSha,
   );
-  if (recentSuccess) {
-    return noop(`fly-deploy for ${short(mainSha)} succeeded <${POST_DEPLOY_SETTLE_MINUTES} min ago — waiting for /health to catch up`);
+  if (forHead.length > 0) {
+    // Settle window first: right after a deploy (e.g. the gate's own dispatch),
+    // /health may simply not have caught up yet — no warning noise.
+    const recentSuccess = forHead.find(
+      (r) => r.conclusion === 'success' && r.updated_at &&
+        nowMs - Date.parse(r.updated_at) < POST_DEPLOY_SETTLE_MINUTES * 60000,
+    );
+    if (recentSuccess) {
+      return noop(
+        `fly-deploy (${recentSuccess.event}) for ${short(mainSha)} succeeded <${POST_DEPLOY_SETTLE_MINUTES} min ago — waiting for /health to catch up`,
+      );
+    }
+    const bad = forHead.find((r) => r.conclusion !== 'success');
+    if (bad) {
+      return noop(
+        `fly-deploy (${bad.event}) for ${short(mainSha)} already concluded "${bad.conclusion}" — not redispatching (no loop); needs a human`,
+        'warning',
+      );
+    }
+    // A successful deploy of the head exists, yet prod reports an older
+    // ancestor: most likely a Fly-level rollback (`fly releases rollback` /
+    // `fly deploy --image`). Redeploying would undo the rollback.
+    return noop(
+      `prod ${short(prodSha)} is behind main ${short(mainSha)}, which was already deployed once (${forHead[0].event}, "${forHead[0].conclusion}") — either that deploy never took effect or prod was rolled back (possible Fly rollback); not redispatching, a human decides`,
+      'warning',
+    );
   }
 
   const committedMs = input.mainCommittedAt ? Date.parse(input.mainCommittedAt) : NaN;
@@ -127,7 +145,7 @@ function decideDeployDrift(input) {
 
   return {
     action: 'dispatch',
-    reason: `main ${short(mainSha)} ahead of prod ${short(prodSha)} for ${ageMin.toFixed(1)} min (> grace ${grace} min) with no deploy run for it — dispatching fly-deploy.yml on main`,
+    reason: `main ${short(mainSha)} ahead of prod ${short(prodSha)} for ${ageMin.toFixed(1)} min (> grace ${grace} min) with no deploy run ever for that sha — dispatching fly-deploy.yml on main`,
     level: 'warning',
   };
 }

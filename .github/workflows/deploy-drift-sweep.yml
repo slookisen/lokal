@@ -11,6 +11,14 @@
 # with no fly-deploy run underway or already done for that sha, dispatches
 # fly-deploy.yml on main. workflow_dispatch is the documented exception that
 # GITHUB_TOKEN may trigger. Never deploys backwards: behind/diverged → no-op.
+#
+# Rollbacks: if main's head was ever deployed (push or workflow_dispatch run
+# of fly-deploy.yml, any conclusion) and prod still reports an older commit,
+# the sweep assumes a failure or a Fly-level rollback (`fly releases rollback`
+# / `fly deploy --image`) and only warns — it never redeploys over it.
+# Pause switch: set repo variable DEPLOY_DRIFT_SWEEP_DISABLED=true (Settings →
+# Variables → Actions) and the sweep exits without calling any API; delete the
+# variable or set it to anything else to resume.
 # Decision logic + tests: scripts/deploy-drift.js, tests/deploy-drift.test.ts.
 # dev-request 2026-11-16-fleet-gate-dispatch-sen-automerge.
 
@@ -34,13 +42,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - name: Pause switch
+        id: pause
+        env:
+          DEPLOY_DRIFT_SWEEP_DISABLED: ${{ vars.DEPLOY_DRIFT_SWEEP_DISABLED }}
+        run: |
+          if [ "$DEPLOY_DRIFT_SWEEP_DISABLED" = "true" ]; then
+            echo "Deploy drift sweep: **paused** — repo variable DEPLOY_DRIFT_SWEEP_DISABLED=true; no API calls made" >> "$GITHUB_STEP_SUMMARY"
+            echo "disabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "disabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout decision module
+        if: steps.pause.outputs.disabled != 'true'
         uses: actions/checkout@v4
         with:
           sparse-checkout: scripts/deploy-drift.js
           sparse-checkout-cone-mode: false
 
       - name: Compare main with prod and dispatch if drifted
+        if: steps.pause.outputs.disabled != 'true'
         uses: actions/github-script@v7
         with:
           script: |
@@ -49,7 +71,19 @@ jobs:
               require(path.join(process.env.GITHUB_WORKSPACE, 'scripts', 'deploy-drift.js'));
             const { owner, repo } = context.repo;
 
-            const { data: head } = await github.rest.repos.getCommit({ owner, repo, ref: 'main' });
+            const bail = async (what, e) => {
+              const line = `Deploy drift sweep: **noop** — ${what} failed: ${e.message} — fail closed`;
+              core.warning(line);
+              await core.summary.addRaw(line + '\n').write();
+            };
+
+            let head;
+            try {
+              ({ data: head } = await github.rest.repos.getCommit({ owner, repo, ref: 'main' }));
+            } catch (e) {
+              await bail('getCommit(main)', e);
+              return;
+            }
             const mainSha = head.sha;
             const mainCommittedAt = head.commit?.committer?.date || null;
 
@@ -83,8 +117,13 @@ jobs:
               });
               for (const r of data.workflow_runs) runsById.set(r.id, r);
             };
-            await listRuns({ branch: 'main' });
-            await listRuns({ head_sha: mainSha });
+            try {
+              await listRuns({ branch: 'main' });
+              await listRuns({ head_sha: mainSha });
+            } catch (e) {
+              await bail('listWorkflowRuns(fly-deploy.yml)', e);
+              return;
+            }
             const runs = [...runsById.values()].map((r) => ({
               event: r.event, status: r.status, conclusion: r.conclusion,
               head_sha: r.head_sha, updated_at: r.updated_at,

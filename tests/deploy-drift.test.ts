@@ -89,9 +89,9 @@ export function runDeployDriftTests(opts: { log?: boolean } = {}): TestSummary {
     "pull_request run in progress does not block",
   );
   expectAction(
-    base({ runs: [{ event: "workflow_dispatch", status: "in_progress", conclusion: null, head_sha: PROD }] }),
+    base({ runs: [{ event: "workflow_dispatch", status: "in_progress", conclusion: null, head_sha: "e".repeat(40) }] }),
     "noop",
-    "deploy in progress → noop",
+    "deploy in progress on another sha → noop",
   );
   expectAction(
     base({ runs: [{ event: "push", status: "queued", conclusion: null, head_sha: MAIN }] }),
@@ -118,8 +118,49 @@ export function runDeployDriftTests(opts: { log?: boolean } = {}): TestSummary {
   );
   expectAction(
     base({ runs: [{ event: "push", status: "completed", conclusion: "success", head_sha: MAIN, updated_at: minsAgo(25) }] }),
+    "noop",
+    "old successful push deploy but prod still stale → noop (head already deployed once; human decides)",
+  );
+  {
+    // B1: push deployed head H, operator then rolled prod back to ancestor P
+    // (fly releases rollback / fly deploy --image). compare P...H = ahead, no
+    // workflow_dispatch run for H. The sweep must NOT redeploy over the rollback.
+    const input = base({
+      mainCommittedAt: minsAgo(120),
+      runs: [
+        { event: "push", status: "completed", conclusion: "success", head_sha: MAIN, updated_at: minsAgo(90) },
+        { event: "push", status: "completed", conclusion: "success", head_sha: PROD, updated_at: minsAgo(200) },
+      ],
+    });
+    expectAction(input, "noop", "Fly rollback to ancestor after successful push deploy → noop (never redeploy over rollback)");
+    const d = drift.decideDeployDrift(input);
+    assertTrue(d.level === "warning" && /rollback/.test(d.reason) && /human/.test(d.reason), "rollback noop is a warning naming rollback + human");
+  }
+  {
+    const d = drift.decideDeployDrift(
+      base({ runs: [{ event: "workflow_dispatch", status: "completed", conclusion: "success", head_sha: MAIN, updated_at: minsAgo(3) }] }),
+    );
+    assertTrue(d.action === "noop" && d.level === "info" && /catch up/.test(d.reason), "gate dispatch just succeeded → info settling noop (settle checked before human warning)");
+  }
+  expectAction(
+    base({ runs: [{ event: "push", status: "completed", conclusion: "failure", head_sha: MAIN, updated_at: minsAgo(20) }] }),
+    "noop",
+    "push run for head concluded failure → noop",
+  );
+  expectAction(
+    base({ runs: [{ event: "push", status: "completed", conclusion: "cancelled", head_sha: MAIN, updated_at: minsAgo(20) }] }),
+    "noop",
+    "push run for head concluded cancelled → noop",
+  );
+  expectAction(
+    base({ runs: [{ event: "push", status: "queued", conclusion: null, head_sha: "d".repeat(40) }] }),
+    "noop",
+    "queued run on another sha → noop (deploy underway)",
+  );
+  expectAction(
+    base({ runs: [{ event: "pull_request", status: "completed", conclusion: "success", head_sha: MAIN, updated_at: minsAgo(20) }] }),
     "dispatch",
-    "old successful push deploy but prod still stale → one dispatch",
+    "completed pull_request build-check for head does not count as a deploy",
   );
   expectAction(
     base({ runs: [{ event: "workflow_dispatch", status: "completed", conclusion: "failure", head_sha: PROD, updated_at: minsAgo(40) }] }),
