@@ -53268,6 +53268,8 @@ runSerial(async () => {
     ["dental contact form only", () => (require("../src/routes/dental-contact-form-only.test") as typeof import("../src/routes/dental-contact-form-only.test")).runDentalContactFormOnlyTests({ log: false })],
     // S-D3b: the same option per gårdssalg producer on opplevagent.no — experience_providers.contact_form_only (admin POST /admin/experiences/providers/:id/contact-form-only), the form on /kategori/gardssalg/produsent/:providerSlug, «Vis e-post» 404, POST …/:providerSlug/kontakt (CONTACT_FORM_EXPERIENCES; switch off = byte-identical; per-host rate store; stubbed sender, no network; MCP/A2A untouched).
     ["experiences contact form only", () => (require("../src/routes/experiences-contact-form-only.test") as typeof import("../src/routes/experiences-contact-form-only.test")).runExperiencesContactFormOnlyTests({ log: false })],
+    // G1-3: browser-agent form check — /handleliste (RFB order form) + /kategori/gardssalg/book/:slug (Opplevagent visit request): one label per field, visible text byte-identical to main, autocomplete/inputmode tokens.
+    ["forms browser agent g1-3", () => (require("../src/routes/forms-browser-agent-g1-3.test") as typeof import("../src/routes/forms-browser-agent-g1-3.test")).runFormsBrowserAgentG13Tests({ log: false })],
   ] as Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]>) {
     try {
       const r = await load();

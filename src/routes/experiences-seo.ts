@@ -7387,18 +7387,18 @@ ${BROWSE_CSS}
     <form class="book-form" method="POST" action="${canonical}" id="book-form">
       <input type="hidden" name="provider_id" value="${escapeHtml(provider.id)}">
       <label for="slot_at">Dato og tid (norsk tid)</label>
-      <input id="slot_at" name="slot_at" type="datetime-local" value="${escapeHtml(defaultBookingSlotAtDatetimeLocal())}" required>
+      <input id="slot_at" name="slot_at" type="datetime-local" value="${escapeHtml(defaultBookingSlotAtDatetimeLocal())}" autocomplete="off" required>
       <label for="party_size">Antall personer</label>
-      <input id="party_size" name="party_size" type="number" min="1" max="50" value="2" required>
+      <input id="party_size" name="party_size" type="number" min="1" max="50" value="2" inputmode="numeric" autocomplete="off" required>
       <label for="guest_name">Navn</label>
       <input id="guest_name" name="guest_name" type="text" maxlength="200" autocomplete="name" required>
       <label for="guest_email">E-post</label>
-      <input id="guest_email" name="guest_email" type="email" autocomplete="email" required>
+      <input id="guest_email" name="guest_email" type="email" autocomplete="email" inputmode="email" required>
       <label for="guest_phone">Telefon <span style="font-weight:400;color:var(--mist)">(valgfritt)</span></label>
-      <input id="guest_phone" name="guest_phone" type="tel" maxlength="30" autocomplete="tel">
+      <input id="guest_phone" name="guest_phone" type="tel" maxlength="30" autocomplete="tel" inputmode="tel">
       <label for="notes">Kommentar til produsenten <span style="font-weight:400;color:var(--mist)">(valgfritt)</span></label>
-      <textarea id="notes" name="notes" maxlength="500" rows="3" placeholder="F.eks. allergier, spørsmål eller ønsker for besøket"></textarea>
-      <button type="submit">Reserver besøk</button>
+      <textarea id="notes" name="notes" maxlength="500" rows="3" autocomplete="off" placeholder="F.eks. allergier, spørsmål eller ønsker for besøket"></textarea>
+      <button type="submit" aria-describedby="book-form-status">Reserver besøk</button>
       <p class="hint" id="book-form-status" role="status" aria-live="polite"></p>
     </form>`}
   </div>
