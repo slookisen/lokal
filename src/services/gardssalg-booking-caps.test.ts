@@ -15,6 +15,13 @@
  *       MCP); a differently cased / padded e-mail is the same guest.
  *   (c) AK2, flag on: over each cap → cap_reached, the cap name, and no row
  *       and no e-mail; producer cap → one admin notice per producer per day.
+ *   (n) no-JS form (POST /kategori/gardssalg/book/:slug), flag on: an
+ *       identical second post → 303 to the existing ref's confirm page (no
+ *       row, no producer e-mail); over a cap → 303 ?error=cap_<cap> (no row);
+ *       GET ?error=cap_producer_per_day renders cap.producerDay with the
+ *       producer name.
+ *   (s) SQL lookup: lower(trim(guest_email)) matches a stored mixed-case /
+ *       padded e-mail at other producers (guest_per_day).
  *   (l) tools/list: book_gardssalg's listing is identical with the flag on
  *       and off (the hashed freeze in tests/fixtures/opplevagent-mcp-
  *       contract-freeze.json pins the full listing in the main gate).
@@ -101,6 +108,7 @@ export function runGardssalgBookingCapsTests(opts: { log?: boolean } = {}): Prom
       require.resolve("./gardssalg-booking-caps"),
       require.resolve("../routes/opplevelser"),
       require.resolve("../routes/experiences-mcp"),
+      require.resolve("../routes/experiences-seo"),
     ];
     const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
     const emailSvc = (require("./email-service") as typeof import("./email-service")).emailService as any;
@@ -157,6 +165,11 @@ export function runGardssalgBookingCapsTests(opts: { log?: boolean } = {}): Prom
       const two = [row({ booking_ref: "A", slot_at: slotAhead(8) }), row({ booking_ref: "B", slot_at: slotAhead(9) })];
       assertEq(ev(req(slotAhead(10)), two, now), { kind: "cap_reached", cap: "open_per_guest_producer", limit: 2 }, "u10: third open request with one producer -> cap");
       assertEq(ev(req(slotAhead(9)), two, now), { kind: "duplicate", booking_ref: "B" }, "u11: duplicate wins over a cap (the retry gets its ref back)");
+      const twoConfirmed = two.map((r) => ({ ...r, pre_status: "provider_confirmed" }));
+      assertEq(ev(req(slotAhead(10)), twoConfirmed, now).kind, "ok", "u11b: confirmed upcoming visits are not 'waiting for a reply' -> no open cap");
+      const twoSuggested = two.map((r) => ({ ...r, pre_status: "time_suggested" }));
+      assertEq(ev(req(slotAhead(10)), twoSuggested, now).kind, "cap_reached", "u11c: time_suggested requests still wait for a reply -> open cap");
+      assertEq(ev(req(slotAhead(10)), [two[0], twoConfirmed[1]], now).kind, "ok", "u11d: one pending + one confirmed -> under the open cap");
       const five = [1, 2, 3, 4, 5].map((i) => row({ booking_ref: `G${i}`, provider_id: `px${i}`, slot_at: slotAhead(10 + i) }));
       assertEq(ev(req(slotAhead(20)), five, now), { kind: "cap_reached", cap: "guest_per_day", limit: 5 }, "u12: sixth request in 24 h across producers -> cap");
       const fiveOld = five.map((r) => ({ ...r, created_at: new Date(now.getTime() - 25 * 3600_000).toISOString() }));
@@ -235,6 +248,10 @@ export function runGardssalgBookingCapsTests(opts: { log?: boolean } = {}): Prom
       const app = express();
       app.use(express.json());
       app.use("/api/opplevelser", (require("../routes/opplevelser") as typeof import("../routes/opplevelser")).default as any);
+      // The seo router (no-JS booking form) only sees /kategori/… so /mcp stays with the MCP router.
+      const seoRouter = (require("../routes/experiences-seo") as typeof import("../routes/experiences-seo")).default as any;
+      app.use((rq: express.Request, rs: express.Response, next: express.NextFunction) =>
+        rq.path.startsWith("/kategori/") ? seoRouter(rq, rs, next) : next());
       app.use((rq: express.Request, rs: express.Response, next: express.NextFunction) => (mcpRouter as any)(rq, rs, next));
       server = http.createServer(app);
       await new Promise<void>((r) => server!.listen(0, "127.0.0.1", r));
@@ -364,6 +381,49 @@ export function runGardssalgBookingCapsTests(opts: { log?: boolean } = {}): Prom
       await settle();
       assertEq([c12.body.cap, alerts.length], ["producer_per_day", 1], "c12: still capped, no second notice the same day");
       assertEq([rows(), sends.length], [before, mailsBefore], "c13: no row, no e-mail over the producer cap");
+
+      // ── (n) no-JS form, flag on ────────────────────────────────────────
+      const postForm = async (provider: string, email: string, slot: string) => {
+        const r = await fetch(`${base}/kategori/gardssalg/book/cap-test-${provider}`, {
+          method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ slot_at: slot, party_size: "2", guest_name: "Kari Test", guest_email: email }).toString(),
+          redirect: "manual",
+        });
+        await r.text();
+        await settle();
+        return { status: r.status, location: r.headers.get("location") || "" };
+      };
+      const formBack = "/kategori/gardssalg/book/cap-test-c6";
+      const sForm = slotAhead(8);
+      const n1 = await postForm("c6", "skjema@example.no", sForm);
+      const n1Ref = decodeURIComponent(n1.location.split("/confirm/")[1] || "");
+      assertTrue(n1.status === 303 && n1Ref.startsWith("GARD") && rows("cap-c6") === 1, "n1: first form post -> 303 to its confirm page, one row");
+      before = rows(); mailsBefore = sentTo("post@cap-c6.example.no");
+      const n2 = await postForm("c6", "skjema@example.no", sForm);
+      assertEq([n2.status, n2.location], [303, `${formBack}/confirm/${encodeURIComponent(n1Ref)}`], "n2: identical form post -> 303 to the existing ref's confirm page");
+      assertEq([rows(), sentTo("post@cap-c6.example.no")], [before, mailsBefore], "n3: duplicate form post -> no row, no producer e-mail");
+      const n4 = await postForm("c6", "skjema@example.no", slotAhead(9));
+      assertEq(n4.status, 303, "n4: second open request via the form is allowed");
+      before = rows(); mailsBefore = sends.length;
+      const n5 = await postForm("c6", "skjema@example.no", slotAhead(10));
+      assertEq([n5.status, n5.location], [303, `${formBack}?error=cap_open_per_guest_producer`], "n5: over the open cap -> 303 ?error=cap_open_per_guest_producer");
+      assertEq([rows(), sends.length], [before, mailsBefore], "n6: form cap -> no row, no e-mail");
+      const panel = await (await fetch(`${base}${formBack}?error=cap_producer_per_day`)).text();
+      assertTrue(panel.includes("Captest c6 AS har fått mange forespørsler i dag og kan ikke ta imot flere akkurat nå. Prøv igjen i morgen."), "n7: GET ?error=cap_producer_per_day renders cap.producerDay with the producer name");
+
+      // ── (s) SQL normalisation: stored mixed-case / padded e-mail ────────
+      const insBooking = db.prepare(
+        `INSERT INTO gardssalg_bookings (booking_id, provider_id, slot_at, party_size, guest_name, guest_email, booking_ref, confirm_token)
+         VALUES (?, ?, ?, 2, 'Mixed Test', ?, ?, ?)`,
+      );
+      ["c1", "c2", "c3", "c4", "c7"].forEach((p, i) =>
+        insBooking.run(`mx-id-${i}`, `cap-${p}`, slotAhead(25 + i), "  MiXed@Example.NO ", `GARD-MX${i}`, `mx-tok-${i}`));
+      assertEq(caps.checkGardssalgBookingGuard({ provider_id: "cap-c8", guest_email: "mixed@example.no", slot_at: slotAhead(31) }),
+        { kind: "cap_reached", cap: "guest_per_day", limit: 5 }, "s1: SQL lower(trim(guest_email)) finds the guest's rows at other producers");
+      insBooking.run("mx-id-dup", "cap-c8", slotAhead(32), " MIXED@example.no", "GARD-MXD", "mx-tok-dup");
+      assertEq(caps.checkGardssalgBookingGuard({ provider_id: "cap-c8", guest_email: "Mixed@Example.no", slot_at: slotAhead(32, 10) }),
+        { kind: "duplicate", booking_ref: "GARD-MXD" }, "s2: padded / mixed-case stored e-mail is the same guest (duplicate)");
+      db.prepare("DELETE FROM gardssalg_bookings WHERE booking_id LIKE 'mx-id-%'").run();
 
       // flag off again → caps gone (behaviour exactly as today).
       setFlag(undefined);

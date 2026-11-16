@@ -20,7 +20,11 @@
 // "Open" (isOpenRequest): status 'reserved' (the only pre-visit value of
 // BookingStatus) AND pre_status not 'provider_declined'/'expired' (declined
 // and expired requests keep status 'reserved') AND the visit time has not
-// passed. Rows marked is_test (admin test-send) are never counted.
+// passed. Open rows are matched for duplicates. The open-per-guest-per-
+// producer cap counts only open rows still awaiting an answer
+// (isAwaitingAnswer: pre_status 'awaiting_provider' or 'time_suggested'),
+// matching cap.guestOpen ("som venter på svar"); a confirmed upcoming visit
+// does not count. Rows marked is_test (admin test-send) are never counted.
 //
 // SQL here references only columns from the gardssalg_bookings CREATE TABLE
 // in src/database/init-experiences.ts (provider_id, guest_email, status,
@@ -143,6 +147,12 @@ export function isOpenRequest(row: Pick<GuardRow, "status" | "pre_status" | "slo
   return !Number.isFinite(t) || t >= now.getTime();
 }
 
+/** Open AND still waiting for an answer (awaiting_provider / time_suggested). */
+export function isAwaitingAnswer(row: Pick<GuardRow, "status" | "pre_status" | "slot_at">, now: Date): boolean {
+  const pre = row.pre_status ?? "awaiting_provider";
+  return (pre === "awaiting_provider" || pre === "time_suggested") && isOpenRequest(row, now);
+}
+
 /**
  * Decides one new request against the rows that can matter (any open row for
  * this producer or guest, and any row created in the last CAP_WINDOW_HOURS).
@@ -173,7 +183,7 @@ export function evaluateGardssalgBookingGuard(
     if (dup) return { kind: "duplicate", booking_ref: dup.r.booking_ref };
   }
 
-  if (openHere.length >= MAX_OPEN_PER_GUEST_PER_PRODUCER) {
+  if (openHere.filter((r) => isAwaitingAnswer(r, now)).length >= MAX_OPEN_PER_GUEST_PER_PRODUCER) {
     return { kind: "cap_reached", cap: "open_per_guest_producer", limit: MAX_OPEN_PER_GUEST_PER_PRODUCER };
   }
   const recent = live.filter((r) => createdMs(r.created_at) >= dayAgo);
