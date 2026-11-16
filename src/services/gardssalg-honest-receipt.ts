@@ -20,14 +20,20 @@
 // changed sentence goes through the text package first.
 //
 // Language: the package's English text is used when the guest's language is
-// "en" AND GARDSSALG_EMAIL_EN_ENABLED is on. No guest language is stored on a
-// booking yet, so every caller passes "nb" today; the English strings are
-// kept here (and tested) so the switch is a one-line change later.
+// "en" AND GARDSSALG_EMAIL_EN_ENABLED is on (O4-2: guestEmailLang() in
+// gardssalg-email-texts.ts, where the e-mail texts now live).
 
 import { getDb } from "../database/db-factory";
 import type { GardssalgBooking } from "./booking-store";
+import { GARDSSALG_EMAIL_TEXTS, type EmailTextEntry, type GardssalgEmailKey } from "./gardssalg-email-texts";
 
 export type ReceiptLang = "nb" | "en";
+
+/** An OA-1 e-mail text that has both languages, read from the O4-2 register. */
+function fromEmailRegister(key: GardssalgEmailKey): { nb: string; en: string } {
+  const e: EmailTextEntry = GARDSSALG_EMAIL_TEXTS[key];
+  return { nb: e.nb, en: e.en ?? e.nb };
+}
 
 export function honestReceiptEnabled(): boolean {
   return process.env.GARDSSALG_HONEST_RECEIPT_ENABLED === "true";
@@ -57,50 +63,9 @@ export const OA1_RECEIPT_TEXTS = {
     nb: "Forespørselen er sendt. Vi sender en kvittering til {e-post}.",
     en: "Your request has been sent. We are emailing a receipt to {e-post}.",
   },
-  "receipt.email.subject": {
-    nb: "Vi har mottatt forespørselen din — {ref}",
-    en: "We have received your request — {ref}",
-  },
-  "receipt.email.body": {
-    nb: [
-      "Hei {gjest},",
-      "",
-      "Vi har mottatt forespørselen din om besøk hos {produsent}. Besøket er ikke bekreftet ennå.",
-      "",
-      "Referanse: {ref}",
-      "Tidspunkt du ba om: {tid}",
-      "Antall: {antall}",
-      "Din kommentar: {kommentar}",
-      "",
-      "Produsenten har fått forespørselen og svarer innen {frist}. Du får e-post når produsenten har bekreftet, foreslått et annet tidspunkt eller avslått. Svarer ikke produsenten innen fristen, utløper forespørselen, og du får beskjed.",
-      "",
-      "Du kan se status når som helst her: {statusside}",
-      "",
-      "Har du spørsmål, svarer du på denne e-posten.",
-      "",
-      "Hilsen",
-      "Opplevagent",
-    ].join("\n"),
-    en: [
-      "Hi {gjest},",
-      "",
-      "We have received your request to visit {produsent}. The visit is not confirmed yet.",
-      "",
-      "Reference: {ref}",
-      "Time you asked for: {tid}",
-      "Guests: {antall}",
-      "Your note: {kommentar}",
-      "",
-      "The producer has received the request and will reply by {frist}. We will email you when the producer has confirmed, suggested another time or declined. If the producer does not reply by then, the request expires and we will let you know.",
-      "",
-      "You can check the status at any time here: {statusside}",
-      "",
-      "If you have questions, reply to this email.",
-      "",
-      "Best regards,",
-      "Opplevagent",
-    ].join("\n"),
-  },
+  // The e-mail texts live in the O4-2 register (gardssalg-email-texts.ts).
+  "receipt.email.subject": fromEmailRegister("receipt.email.subject"),
+  "receipt.email.body": fromEmailRegister("receipt.email.body"),
   "ics.summary": {
     nb: "Besøk hos {produsent} — {ref}",
     en: "Visit to {produsent} — {ref}",
@@ -113,14 +78,8 @@ export const OA1_RECEIPT_TEXTS = {
     nb: "{sted}",
     en: "{sted}",
   },
-  "confirmed.icsLine": {
-    nb: "Kalenderfilen er lagt ved, slik at du kan legge besøket inn i kalenderen din.",
-    en: "A calendar file is attached so you can add the visit to your calendar.",
-  },
-  "confirmed.newTimeIcsLine": {
-    nb: "Kalenderfilen med det nye tidspunktet er lagt ved. Slett den gamle avtalen hvis du har lagt den inn.",
-    en: "A calendar file with the new time is attached. Please delete the old entry if you added one.",
-  },
+  "confirmed.icsLine": fromEmailRegister("confirmed.icsLine"),
+  "confirmed.newTimeIcsLine": fromEmailRegister("confirmed.newTimeIcsLine"),
 } as const;
 
 export type Oa1ReceiptKey = keyof typeof OA1_RECEIPT_TEXTS;
@@ -152,16 +111,21 @@ export function fillOa1(template: string, vars: Record<string, string>): string 
 
 const DATE_LOCALE: Record<ReceiptLang, string> = { nb: "nb-NO", en: "en-GB" };
 
-/** {tid}/{frist} in words, Oslo time ("fredag 12. desember 2026 kl. 13:00"). */
+/**
+ * {tid}/{frist} in words, Oslo time: "fredag 12. desember 2026 kl. 13:00", or
+ * in English "Friday 12 December 2026 at 13:00" (OA-2, settled 2026-11-15:
+ * 24-hour clock, no comma after the weekday).
+ */
 export function formatOsloInstant(iso: string | null, lang: ReceiptLang = "nb"): string {
   if (!iso) return "";
   const d = new Date(iso);
   if (!Number.isFinite(d.getTime())) return "";
-  return d.toLocaleString(DATE_LOCALE[lang], {
+  const s = d.toLocaleString(DATE_LOCALE[lang], {
     dateStyle: "full",
     timeStyle: "short",
     timeZone: "Europe/Oslo",
   });
+  return lang === "en" ? s.replace(/^([A-Za-z]+), /, "$1 ") : s;
 }
 
 export interface ReceiptProvider {

@@ -32345,6 +32345,19 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gcx.failures) failures.push("gardssalg-cancel: " + f);
     console.log(`  gardssalg-cancel: ${gcx.passed} passed, ${gcx.failed} failed`);
 
+    // O4-2: every gårdssalg booking e-mail text in one register
+    // (gardssalg-email-texts.ts); Norwegian byte-identical to the pre-move
+    // golden capture, English (OA-2 A / OA-1) only with
+    // GARDSSALG_EMAIL_EN_ENABLED and guest_lang "en".
+    console.log("\n── gardssalg-email-texts: one text register + golden Norwegian e-mails + guest language ──");
+    const { runGardssalgEmailTextsTests } = require("../src/services/gardssalg-email-texts.test") as
+      typeof import("../src/services/gardssalg-email-texts.test");
+    const get = await runGardssalgEmailTextsTests({ log: false });
+    passed += get.passed;
+    failed += get.failed;
+    for (const f of get.failures) failures.push("gardssalg-email-texts: " + f);
+    console.log(`  gardssalg-email-texts: ${get.passed} passed, ${get.failed} failed`);
+
     // GET /admin/gardssalg-provider-lookup — read-only, case-insensitive
     // substring lookup of experience_providers by navn, returning
     // id/navn/rfb_seed_source/created_at. Closes the gap where /admin/

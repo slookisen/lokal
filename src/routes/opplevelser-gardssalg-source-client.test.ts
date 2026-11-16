@@ -247,7 +247,7 @@ export function runOpplevelserGardssalgSourceClientTests(opts: { log?: boolean }
 
       // ── (w) the no-JS web form fallback never passes a label ─────────
       const seoSrc = fs.readFileSync(path.join(__dirname, "experiences-seo.ts"), "utf8");
-      assertEq(seoSrc.match(/createBooking\([^)]+\)/g), ["createBooking(parsed.data)"], "w1: experiences-seo.ts calls createBooking(parsed.data) only (source_client NULL)");
+      assertEq(seoSrc.match(/createBooking\([^)]+\)/g), ["createBooking(parsed.data, undefined, { guestLang: body.lang })"], "w1: experiences-seo.ts calls createBooking with the guest language only (O4-2), never a source_client (NULL)");
     } catch (err: any) {
       failed++;
       failures.push(`✗ unexpected error: ${String(err?.stack || err)}`);

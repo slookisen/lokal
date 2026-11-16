@@ -1144,6 +1144,13 @@ export function initExperiencesSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // ─── O4-2: the guest's language (dev-request 2026-11-12-opplevagent-o4-
+  // epost-og-tekster). "nb" or "en", set by the web form and the REST API
+  // (createBooking() stores "nb" for anything else, the MCP tool included).
+  // Only decides the guest e-mails, and only with GARDSSALG_EMAIL_EN_ENABLED.
+  // Additive, nullable; existing rows stay NULL (= "nb").
+  try { db.exec("ALTER TABLE gardssalg_bookings ADD COLUMN guest_lang TEXT"); } catch { /* already present */ }
+
   // ─── listing_url (dev-request 2026-07-12-experiences-enrichment-supply-
   // and-aggregator-hygiene, Daniel's 2026-07-19 decision, step 1) ───────────
   // A chunk of experience_providers.hjemmeside rows carry a DMO/aggregator/
