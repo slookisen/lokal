@@ -198,7 +198,9 @@ export const CANCEL_REASON_MAX = 500;
 
 export function normaliseCancelReason(raw: unknown): string {
   const s = typeof raw === "string" ? raw.replace(/\r\n?/g, "\n").trim() : "";
-  return s.slice(0, CANCEL_REASON_MAX);
+  const cut = s.slice(0, CANCEL_REASON_MAX);
+  // Never keep half of a surrogate pair (an emoji cut at the limit).
+  return cut.length === CANCEL_REASON_MAX && /[\uD800-\uDBFF]$/.test(cut) ? cut.slice(0, -1) : cut;
 }
 
 export function getCancelInfo(booking_id: string): CancelInfo | null {

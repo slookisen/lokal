@@ -12,8 +12,12 @@
 //            producer: cancel a confirmed visit (reason required).
 //
 // GARDSSALG_CANCEL_ENABLED off → every route here calls next(), i.e. the
-// site's ordinary 404, and the helpers used by experiences-seo.ts return
-// null, so the status and svar pages are byte-identical to before.
+// site's ordinary 404, and the helpers used by experiences-seo.ts offer no
+// button. The READ side of a cancelled row (status 'cancelled' with
+// cancelled_by set: the status word, no «bekreftet — velkommen» note) does
+// NOT depend on the flag, so switching the flag off (the rollback) never shows
+// a cancelled visit as confirmed. Such rows exist only after the flag has been
+// on; every other row's page is byte-identical to before with the flag off.
 //
 // POSTs go through the shared same-origin write guard, which accepts the
 // `Origin: null` a browser sends on a plain form post under
@@ -94,9 +98,12 @@ export interface CancelPageView {
   actions: string;
 }
 
-/** The guest status page's cancellation block; null when the flag is off. */
+/**
+ * The guest status page's cancellation block. A cancelled row (cancelled_by
+ * set) gets its status word whatever the flag; otherwise null when the flag is
+ * off (no button).
+ */
 export function guestStatusCancelView(booking: GardssalgBooking, guestToken: string, done: string): CancelPageView | null {
-  if (!gardssalgCancelEnabled()) return null;
   if (booking.status === "cancelled") {
     const info = getCancelInfo(booking.booking_id);
     const label = cancelledStatusLabel(booking, info);
@@ -107,6 +114,7 @@ export function guestStatusCancelView(booking: GardssalgBooking, guestToken: str
       : "";
     return { label, extra, actions: "" };
   }
+  if (!gardssalgCancelEnabled()) return null;
   const mode = guestCancelMode(booking);
   if (!mode) return { label: null, extra: null, actions: "" };
   return {
@@ -116,9 +124,12 @@ export function guestStatusCancelView(booking: GardssalgBooking, guestToken: str
   };
 }
 
-/** The producer svar page's cancellation block; null when the flag is off. */
+/**
+ * The producer svar page's cancellation block. A cancelled row (cancelled_by
+ * set) gets its status word whatever the flag; otherwise null when the flag is
+ * off (no button).
+ */
 export function svarCancelView(booking: GardssalgBooking, respondToken: string, done: string): CancelPageView | null {
-  if (!gardssalgCancelEnabled()) return null;
   if (booking.status === "cancelled") {
     const info = getCancelInfo(booking.booking_id);
     const label = cancelledStatusLabel(booking, info);
@@ -128,6 +139,7 @@ export function svarCancelView(booking: GardssalgBooking, respondToken: string, 
       : "";
     return { label, extra, actions: "" };
   }
+  if (!gardssalgCancelEnabled()) return null;
   if (!producerMayCancel(booking)) return { label: null, extra: null, actions: "" };
   return {
     label: null,

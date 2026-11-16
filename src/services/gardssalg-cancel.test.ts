@@ -18,6 +18,11 @@
  *   (a)  AK1: status 'cancelled' with reason, timestamp and who; the followup
  *        job neither reminds nor expires the row afterwards; attendance
  *        («Møtte») is refused on a cancelled row.
+ *   (i)  idempotency at the DB level: guestCancel / producerCancel called twice
+ *        with the same stale booking object write once and e-mail once.
+ *   (b)  rollback (flag on → cancel → flag off): the status and svar pages
+ *        still show the cancelled/withdrawn status word, never «velkommen» /
+ *        «Bekreftet av produsenten» / «Venter på svar», and no cancel button.
  *
  * Fixtures: test producers in an in-memory experiences DB (example.no
  * addresses); every e-mail send is stubbed. No real data is touched.
@@ -201,6 +206,8 @@ export function runGardssalgCancelTests(opts: { log?: boolean } = {}): Promise<T
       assertEq(c.producerMayCancel(row("reserved", "provider_confirmed", "2020-01-01T10:00:00.000Z")), false, "u7: producer: not after the visit time");
       assertEq(c.normaliseCancelReason("  " + "x".repeat(600) + " "), "x".repeat(500), "u8: reason trimmed and capped at 500");
       assertEq(c.normaliseCancelReason(["a"]), "", "u9: non-string reason -> empty");
+      const emojiCut = c.normaliseCancelReason("x".repeat(499) + "\u{1F600}" + "y");
+      assertEq([emojiCut.length, emojiCut], [499, "x".repeat(499)], "u10: the 500 cap never keeps half of a surrogate pair");
 
       // ── fixtures ────────────────────────────────────────────────────────
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -224,11 +231,11 @@ export function runGardssalgCancelTests(opts: { log?: boolean } = {}): Promise<T
       const cancelCols = (ref: string) =>
         db.prepare("SELECT status, cancelled_by, cancel_reason, cancelled_at, resolved_at FROM gardssalg_bookings WHERE booking_ref = ?").get(ref) as any;
       let n = 0;
-      const book = (slot = slotAhead(6)) => {
+      const book = (slot = slotAhead(6), guestName?: string) => {
         n++;
         return store.createBooking({
           provider_id: "gc-p1", slot_at: slot, party_size: 2,
-          guest_name: `Gjest ${n}`, guest_email: `gjest-${n}@example.no`,
+          guest_name: guestName ?? `Gjest ${n}`, guest_email: `gjest-${n}@example.no`,
         });
       };
 
@@ -292,6 +299,16 @@ export function runGardssalgCancelTests(opts: { log?: boolean } = {}): Promise<T
       assertEq((await get(wrongTok)).status, 404, "g2: wrong guest token: cancel page 404");
       assertEq((await postForm(wrongTok, { reason: "x" })).status, 404, "g3: wrong guest token: POST 404");
       assertEq((await postForm(`/kategori/gardssalg/status/${encodeURIComponent(pending.booking_ref)}/avlys`, {})).status, 404, "g4: reference alone: POST 404");
+      const goodTok = String(pending.guest_status_token);
+      const statusBase = `/kategori/gardssalg/status/${encodeURIComponent(pending.booking_ref)}`;
+      for (const [label, tok] of [
+        ["token prefix", goodTok.slice(0, Math.floor(goodTok.length / 2))],
+        ["token minus its last char", goodTok.slice(0, -1)],
+        ["token plus one char", goodTok + "0"],
+      ] as const) {
+        assertEq((await get(`${statusBase}/${tok}/avlys`)).status, 404, `g4b: ${label}: cancel page 404`);
+        assertEq((await postForm(`${statusBase}/${tok}/avlys`, { reason: "x" })).status, 404, `g4c: ${label}: POST 404`);
+      }
       assertEq([rowOf(pending.booking_ref).status, sent.length], ["reserved", 0], "g5: nothing written, no e-mail without the token");
 
       const form1 = await get(`${pendingStatus}/avlys`);
@@ -382,6 +399,8 @@ export function runGardssalgCancelTests(opts: { log?: boolean } = {}): Promise<T
       const blank = await postForm(`${pcSvar}/avlys`, { reason: "   " });
       assertEq([blank.status, blank.location, rowOf(pc.booking_ref).status, sent.length], [303, `${pcSvar}/avlys?error=grunn`, "reserved", 0], "p7: blank reason -> refused, nothing written, no e-mail");
       assertTrue((await get(`${pcSvar}/avlys?error=grunn`)).text.includes(`<div class="bekreft-banner warn" role="alert">Skriv en kort grunn, så gjesten vet hvorfor.</div>`), "p8: cancel.producer.reasonMissing shown");
+      const pxs = await postForm(`${pcSvar}/avlys`, { reason: "x" }, { origin: "https://evil.example", "sec-fetch-site": "cross-site" });
+      assertEq([pxs.status, rowOf(pc.booking_ref).status, sent.length], [403, "reserved", 0], "p8b: producer route: cross-site POST refused (403), nothing written");
       const pok = await postForm(`${pcSvar}/avlys`, { reason: "Stengt pga. storm" }, { origin: "null" });
       assertEq([pok.status, pok.location], [303, `${pcSvar}?done=avlyst`], "p9: `Origin: null` form POST accepted");
       const pcc = cancelCols(pc.booking_ref);
@@ -395,6 +414,17 @@ export function runGardssalgCancelTests(opts: { log?: boolean } = {}): Promise<T
       assertEq([pagain.location, sent.length, cancelCols(pc.booking_ref).cancel_reason], [pcSvar, 1, "Stengt pga. storm"], "p15: second POST refused: no second e-mail");
       const gstat = await get(statusPath(pc));
       assertTrue(gstat.text.includes("Status: <strong>Avlyst av produsenten</strong>") && !gstat.text.includes("/avlys"), "p16: guest status page shows status.cancelledByProducer, no button");
+
+      // The guest's name is guest-controlled and shown to the producer: escaped in the done banner.
+      const evil = book(slotAhead(6), `<script>alert(1)</script><b>Ola</b>`);
+      store.producerRespondConfirm(String(evil.respond_token));
+      await postForm(`${svarPathOf(evil)}/avlys`, { reason: "Stengt" });
+      const evilDone = await get(`${svarPathOf(evil)}?done=avlyst`);
+      assertTrue(
+        evilDone.text.includes(`<strong>Besøket er avlyst</strong><br>Vi har gitt &lt;script&gt;alert(1)&lt;/script&gt;&lt;b&gt;Ola&lt;/b&gt; beskjed. Referanse: ${evil.booking_ref}.`)
+        && !evilDone.text.includes("<script>alert(1)") && !evilDone.text.includes("<b>Ola</b>"),
+        "p14b: guest name ({gjest}) escaped in the svar page done banner",
+      );
 
       const pastConf = book("2020-01-06T12:00:00.000Z");
       store.producerRespondConfirm(String(pastConf.respond_token));
@@ -429,8 +459,63 @@ export function runGardssalgCancelTests(opts: { log?: boolean } = {}): Promise<T
       const bk = await postForm(`/kategori/gardssalg/bekreft/${att.confirm_token}`, { action: "attended" });
       assertEq([bk.location.endsWith("?error=ugyldig"), rowOf(att.booking_ref).status, rowOf(att.booking_ref).billable], [true, "cancelled", 0], "a7: bekreft POST attended on a cancelled row refused, billable 0");
 
+      // ── (i) idempotency at the DB level (stale booking object) ──────────
+      // The JS rules alone would accept the stale object again; only the
+      // guarded UPDATE (status = 'reserved', .changes) stops the second call.
+      const sendOnOk = async (o: import("./gardssalg-cancel").CancelOutcome, who: "guest" | "producer") => {
+        if (!o.ok) return;
+        if (who === "guest") await c.sendGuestCancelToProducer(o.booking, o.mode);
+        else await c.sendProducerCancelToGuest(o.booking);
+      };
+      const ig = book();
+      store.producerRespondConfirm(String(ig.respond_token));
+      const igStale = rowOf(ig.booking_ref);
+      sent.length = 0;
+      const ig1 = c.guestCancel(igStale, "Første");
+      await sendOnOk(ig1, "guest");
+      const ig2 = c.guestCancel(igStale, "Andre");
+      await sendOnOk(ig2, "guest");
+      assertEq([ig1.ok, ig2.ok ? "ok" : ig2.reason], [true, "not_allowed"], "i1: guestCancel twice with the same stale object: second -> not_allowed");
+      assertEq([sent.length, cancelCols(ig.booking_ref).cancel_reason], [1, "Første"], "i2: guest: exactly one e-mail, first reason kept");
+      const ip = book();
+      store.producerRespondConfirm(String(ip.respond_token));
+      const ipStale = rowOf(ip.booking_ref);
+      sent.length = 0;
+      const ip1 = c.producerCancel(ipStale, "Første");
+      await sendOnOk(ip1, "producer");
+      const ip2 = c.producerCancel(ipStale, "Andre");
+      await sendOnOk(ip2, "producer");
+      assertEq([ip1.ok, ip2.ok ? "ok" : ip2.reason], [true, "not_allowed"], "i3: producerCancel twice with the same stale object: second -> not_allowed");
+      assertEq([sent.length, cancelCols(ip.booking_ref).cancel_reason], [1, "Første"], "i4: producer: exactly one e-mail, first reason kept");
+
       delete process.env.GARDSSALG_CANCEL_ENABLED;
       assertEq((await get(`${statusPath(fu)}/avlys`)).status, 404, "f8: flag switched off again: routes inert");
+
+      // ── (b) rollback: flag off after cancellations ──────────────────────
+      // pending: withdrawn by the guest; conf: confirmed, cancelled by the
+      // guest; pc: confirmed, cancelled by the producer.
+      for (const [label, b, word] of [
+        ["withdrawn by guest", pending, "Trukket av gjesten"],
+        ["cancelled by guest", conf, "Avlyst av gjesten"],
+        ["cancelled by producer", pc, "Avlyst av produsenten"],
+      ] as const) {
+        const sp = await get(statusPath(b));
+        assertTrue(sp.status === 200 && sp.text.includes(`Status: <strong>${word}</strong>`), `b1: flag off, status page (${label}): «${word}»`);
+        assertTrue(
+          !sp.text.includes("velkommen") && !sp.text.includes("Bekreftet av produsenten") && !sp.text.includes("Venter på svar"),
+          `b2: flag off, status page (${label}): no «velkommen» / «Bekreftet av produsenten» / «Venter på svar»`,
+        );
+        assertTrue(!sp.text.includes("/avlys") && !sp.text.includes(">Avlys<") && !sp.text.includes(">Trekk<"), `b3: flag off, status page (${label}): no cancel button`);
+        const sv = await get(svarPathOf(b));
+        assertTrue(sv.status === 200 && sv.text.includes(`Status: <strong>${word}</strong>`), `b4: flag off, svar page (${label}): «${word}»`);
+        assertTrue(
+          !sv.text.includes("Bekreftet av produsenten") && !sv.text.includes("Venter på svar") && !sv.text.includes("/avlys"),
+          `b5: flag off, svar page (${label}): no «Bekreftet av produsenten» / «Venter på svar», no cancel form`,
+        );
+      }
+      // A cancelled row without cancelled_by (not written by O1-5) keeps its old page (AK2).
+      const legacyCancelled = await get(svarPathOf(att));
+      assertTrue(legacyCancelled.text.includes("Status: <strong>Bekreftet av produsenten</strong>"), "b6: cancelled row without cancelled_by: old svar page unchanged");
     } catch (err) {
       failed++;
       failures.push(`✗ unexpected throw: ${(err as Error)?.stack || err}`);
