@@ -1629,7 +1629,7 @@ export function registerExperienceTools(
                 limit: guard.limit,
                 provider: providerInfo,
                 slot_at_local: slotLocal,
-                message: `${capReachedMessage(guard.cap, "no")} / ${capReachedMessage(guard.cap, "en")}`,
+                message: `${capReachedMessage(guard.cap, "no", providerInfo?.navn)} / ${capReachedMessage(guard.cap, "en", providerInfo?.navn)}`,
               }, null, 2),
             }],
           };

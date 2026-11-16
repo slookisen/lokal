@@ -7232,7 +7232,7 @@ ${oaSiteFooter({ lang: uiLang })}
 // call the exact same createBooking()/sendBookingConfirmation() functions
 // from ../services/booking-store — no business logic is duplicated.
 
-function bookingErrorMessage(code: string): string {
+function bookingErrorMessage(code: string, producerName?: string | null): string {
   switch (code) {
     case "invalid":
       return "Sjekk at alle obligatoriske felt er fylt ut riktig (dato/tid, antall personer, navn og e-post), og prøv igjen.";
@@ -7259,11 +7259,11 @@ function bookingErrorMessage(code: string): string {
       return "Det valgte tidspunktet må være i fremtiden og innenfor bookingvinduet. Velg et gyldig tidspunkt og prøv igjen.";
     // O1-3: the no-JS form's cap_reached redirect (?error=cap_<cap>).
     case "cap_open_per_guest_producer":
-      return capReachedMessage("open_per_guest_producer", "no");
+      return capReachedMessage("open_per_guest_producer", "no", producerName);
     case "cap_guest_per_day":
-      return capReachedMessage("guest_per_day", "no");
+      return capReachedMessage("guest_per_day", "no", producerName);
     case "cap_producer_per_day":
-      return capReachedMessage("producer_per_day", "no");
+      return capReachedMessage("producer_per_day", "no", producerName);
     default:
       return "Noe gikk galt. Prøv igjen.";
   }
@@ -7309,7 +7309,7 @@ router.get(
       errorParam === "outside_hours"
         ? bookingOutsideHoursMessage(String(req.query.hours || ""))
         : errorParam
-          ? bookingErrorMessage(errorParam)
+          ? bookingErrorMessage(errorParam, provider.navn)
           : "";
     const errorBanner = errorMsg
       ? `<div role="alert" style="background:#fdecea;border:1px solid #f3b6ae;color:#8a2f24;padding:12px 16px;border-radius:8px;margin-bottom:16px;font-size:.9rem">${escapeHtml(errorMsg)}</div>`

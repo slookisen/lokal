@@ -52,38 +52,52 @@ export const BOOKING_CAP_LIMITS: Record<BookingCapName, number> = {
 };
 
 // ─── Guest-facing sentences (NO + EN) ───────────────────────────────────────
-// Short, factual, neutral; for the text pack. Placeholders: {ref} {n}.
+// Verbatim from text package OA-1 §2 (A2A marketing-drafts/2026-11-12-
+// opplevagent-tekstpakke-oa-1.md, approved by Daniel 2026-11-15). Do not
+// reword here: a changed sentence goes through the text package first.
+// Placeholders: {ref} = booking reference, {produsent} = producer name.
 export const BOOKING_CAP_TEXTS = {
-  duplicate: {
-    no: "Denne forespørselen er allerede sendt ({ref}). Vi har ikke sendt den på nytt.",
-    en: "This request has already been sent ({ref}). We have not sent it again.",
+  "dup.message": {
+    no: "Du har allerede sendt denne forespørselen. Referansen er {ref}. Vi har ikke sendt den på nytt.",
+    en: "You have already sent this request. The reference is {ref}. We have not sent it again.",
   },
-  capLead: {
-    no: "Forespørselen ble ikke sendt.",
-    en: "The request was not sent.",
+  "cap.guestOpen": {
+    no: "Du har allerede forespørsler hos {produsent} som venter på svar. Vent til produsenten har svart, eller trekk en av dem, før du sender en ny.",
+    en: "You already have requests waiting for a reply from {produsent}. Please wait for the producer to reply, or withdraw one of them, before sending a new one.",
   },
-  open_per_guest_producer: {
-    no: "Du har allerede {n} åpne forespørsler hos denne produsenten. Vent på svar før du sender en ny.",
-    en: "You already have {n} open requests with this producer. Please wait for an answer before sending a new one.",
+  "cap.guestDay": {
+    no: "Du har sendt mange forespørsler i dag. Prøv igjen i morgen, eller skriv til oss hvis du planlegger et større opplegg.",
+    en: "You have sent many requests today. Please try again tomorrow, or write to us if you are planning something larger.",
   },
-  guest_per_day: {
-    no: "Du har sendt {n} forespørsler det siste døgnet. Prøv igjen senere.",
-    en: "You have sent {n} requests in the last 24 hours. Please try again later.",
-  },
-  producer_per_day: {
-    no: "Denne produsenten har fått mange forespørsler det siste døgnet. Prøv igjen senere, eller ta kontakt med produsenten direkte.",
-    en: "This producer has received many requests in the last 24 hours. Please try again later, or contact the producer directly.",
+  "cap.producerDay": {
+    no: "{produsent} har fått mange forespørsler i dag og kan ikke ta imot flere akkurat nå. Prøv igjen i morgen.",
+    en: "{produsent} has received many requests today and cannot take more right now. Please try again tomorrow.",
   },
 } as const;
+
+export type BookingCapTextKey = keyof typeof BOOKING_CAP_TEXTS;
+
+/** Which text-pack key each cap uses. */
+export const CAP_TEXT_KEY: Record<BookingCapName, BookingCapTextKey> = {
+  open_per_guest_producer: "cap.guestOpen",
+  guest_per_day: "cap.guestDay",
+  producer_per_day: "cap.producerDay",
+};
 
 export type CapLang = "no" | "en";
 
 export function duplicateMessage(ref: string, lang: CapLang): string {
-  return BOOKING_CAP_TEXTS.duplicate[lang].replace("{ref}", ref);
+  return BOOKING_CAP_TEXTS["dup.message"][lang].replace("{ref}", ref);
 }
 
-export function capReachedMessage(cap: BookingCapName, lang: CapLang): string {
-  return `${BOOKING_CAP_TEXTS.capLead[lang]} ${BOOKING_CAP_TEXTS[cap][lang].replace("{n}", String(BOOKING_CAP_LIMITS[cap]))}`;
+/**
+ * {produsent} is the producer's name. With no name on file, a neutral noun
+ * is used ("produsenten" / "the producer"), capitalised at sentence start.
+ */
+export function capReachedMessage(cap: BookingCapName, lang: CapLang, producerName?: string | null): string {
+  const name = String(producerName ?? "").trim() || (lang === "no" ? "produsenten" : "the producer");
+  const text = BOOKING_CAP_TEXTS[CAP_TEXT_KEY[cap]][lang].split("{produsent}").join(name);
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
 // ─── Pure logic ─────────────────────────────────────────────────────────────

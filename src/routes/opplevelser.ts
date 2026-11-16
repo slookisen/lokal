@@ -34276,8 +34276,8 @@ router.post("/book", async (req: Request, res: Response) => {
       cap: guard.cap,
       limit: guard.limit,
       provider: providerInfo,
-      message: capReachedMessage(guard.cap, "no"),
-      message_en: capReachedMessage(guard.cap, "en"),
+      message: capReachedMessage(guard.cap, "no", providerInfo?.navn),
+      message_en: capReachedMessage(guard.cap, "en", providerInfo?.navn),
     });
     return;
   }

@@ -166,13 +166,42 @@ export function runGardssalgBookingCapsTests(opts: { log?: boolean } = {}): Prom
       const ten = Array.from({ length: 10 }, (_, i) => row({ booking_ref: `P${i}`, guest_email: `g${i}@example.no`, slot_at: slotAhead(10 + i) }));
       assertEq(ev(req(slotAhead(30)), ten, now), { kind: "cap_reached", cap: "producer_per_day", limit: 10 }, "u15: eleventh request to one producer in 24 h -> cap");
 
-      // Messages: neutral, no "gratis"/"bekreftet".
+      // ── (t) text pack OA-1 §2, verbatim (approved by Daniel 2026-11-15) ─
+      // Do not "fix" these here: a mismatch means the code drifted.
+      const OA1_S2: Record<string, { no: string; en: string }> = {
+        "dup.message": {
+          no: "Du har allerede sendt denne forespørselen. Referansen er {ref}. Vi har ikke sendt den på nytt.",
+          en: "You have already sent this request. The reference is {ref}. We have not sent it again.",
+        },
+        "cap.guestOpen": {
+          no: "Du har allerede forespørsler hos {produsent} som venter på svar. Vent til produsenten har svart, eller trekk en av dem, før du sender en ny.",
+          en: "You already have requests waiting for a reply from {produsent}. Please wait for the producer to reply, or withdraw one of them, before sending a new one.",
+        },
+        "cap.guestDay": {
+          no: "Du har sendt mange forespørsler i dag. Prøv igjen i morgen, eller skriv til oss hvis du planlegger et større opplegg.",
+          en: "You have sent many requests today. Please try again tomorrow, or write to us if you are planning something larger.",
+        },
+        "cap.producerDay": {
+          no: "{produsent} har fått mange forespørsler i dag og kan ikke ta imot flere akkurat nå. Prøv igjen i morgen.",
+          en: "{produsent} has received many requests today and cannot take more right now. Please try again tomorrow.",
+        },
+      };
+      assertEq(Object.keys(caps.BOOKING_CAP_TEXTS).sort(), Object.keys(OA1_S2).sort(), "t1: exactly the OA-1 §2 keys (no capLead)");
+      for (const [key, exp] of Object.entries(OA1_S2)) {
+        const got = (caps.BOOKING_CAP_TEXTS as Record<string, { no: string; en: string }>)[key];
+        assertTrue(Buffer.from(got?.no ?? "", "utf8").equals(Buffer.from(exp.no, "utf8")), `t2: ${key} (no) byte-equal`);
+        assertTrue(Buffer.from(got?.en ?? "", "utf8").equals(Buffer.from(exp.en, "utf8")), `t3: ${key} (en) byte-equal`);
+      }
+      assertEq(caps.CAP_TEXT_KEY, { open_per_guest_producer: "cap.guestOpen", guest_per_day: "cap.guestDay", producer_per_day: "cap.producerDay" }, "t4: cap -> text key");
+      assertEq(caps.duplicateMessage("GARD-1", "no"), "Du har allerede sendt denne forespørselen. Referansen er GARD-1. Vi har ikke sendt den på nytt.", "t5: dup.message filled (no)");
+      assertEq(caps.capReachedMessage("producer_per_day", "en", "Testsideri AS"), "Testsideri AS has received many requests today and cannot take more right now. Please try again tomorrow.", "t6: {produsent} filled with the producer name");
+      assertEq(caps.capReachedMessage("open_per_guest_producer", "no", "Testsideri AS"), "Du har allerede forespørsler hos Testsideri AS som venter på svar. Vent til produsenten har svart, eller trekk en av dem, før du sender en ny.", "t7: cap.guestOpen filled (no)");
+      assertEq(caps.capReachedMessage("producer_per_day", "no", null), "Produsenten har fått mange forespørsler i dag og kan ikke ta imot flere akkurat nå. Prøv igjen i morgen.", "t8: no name on file -> neutral noun, capitalised");
       const allTexts = [
         caps.duplicateMessage("GARD-1", "no"), caps.duplicateMessage("GARD-1", "en"),
-        ...(["open_per_guest_producer", "guest_per_day", "producer_per_day"] as const).flatMap((c) => [caps.capReachedMessage(c, "no"), caps.capReachedMessage(c, "en")]),
+        ...(["open_per_guest_producer", "guest_per_day", "producer_per_day"] as const).flatMap((c) => [caps.capReachedMessage(c, "no", "X"), caps.capReachedMessage(c, "en", "X")]),
       ];
-      assertTrue(allTexts.every((t) => !/gratis|bekreftet|\{n\}|\{ref\}/i.test(t)), "u16: texts filled, no 'gratis'/'bekreftet'");
-      assertEq(caps.capReachedMessage("guest_per_day", "en"), "The request was not sent. You have sent 5 requests in the last 24 hours. Please try again later.", "u17: cap message composed");
+      assertTrue(allTexts.every((t) => !/gratis|bekreftet|\{produsent\}|\{ref\}/i.test(t)), "u16: texts filled, no 'gratis'/'bekreftet'");
 
       // ── fixtures ────────────────────────────────────────────────────────
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -278,7 +307,7 @@ export function runGardssalgBookingCapsTests(opts: { log?: boolean } = {}): Prom
       assertEq(a2.body.duplicate, true, "a3: duplicate:true");
       assertEq(a2.body.booking_ref, a1.body.booking_ref, "a4: the existing ref is returned");
       assertEq(a2.body.success, true, "a4b: success:true (the request exists)");
-      assertEq(a2.body.message, `Denne forespørselen er allerede sendt (${a1.body.booking_ref}). Vi har ikke sendt den på nytt.`, "a4c: NO message");
+      assertEq(a2.body.message, `Du har allerede sendt denne forespørselen. Referansen er ${a1.body.booking_ref}. Vi har ikke sendt den på nytt.`, "a4c: NO message (dup.message)");
       assertTrue(typeof a2.body.message_en === "string" && a2.body.message_en.includes(a1.body.booking_ref), "a4d: EN message carries the ref");
       assertEq(rows("cap-c1"), 1, "a5: AK1 one row (normalised e-mail matched)");
       assertEq(sentTo("post@cap-c1.example.no"), 1, "a6: AK1 one producer e-mail");
@@ -291,7 +320,7 @@ export function runGardssalgBookingCapsTests(opts: { log?: boolean } = {}): Prom
       const m2 = await mcpBook("c2", "kari@example.no", sOn);
       assertEq(m1.parsed.success, true, "a10: MCP first call created");
       assertEq([m2.parsed.duplicate, m2.parsed.booking_ref, m2.parsed.pending, m2.isError], [true, m1.parsed.booking_ref, true, false], "a11: MCP second call -> duplicate:true + existing ref, not an error");
-      assertTrue(typeof m2.parsed.message === "string" && m2.parsed.message.includes(" / This request has already been sent"), "a12: MCP message NO / EN");
+      assertTrue(typeof m2.parsed.message === "string" && m2.parsed.message.includes(" / You have already sent this request."), "a12: MCP message NO / EN");
       assertEq(rows("cap-c2"), 1, "a13: MCP AK1 one row");
       assertEq(sentTo("post@cap-c2.example.no"), 1, "a14: MCP AK1 one producer e-mail");
 
@@ -301,7 +330,7 @@ export function runGardssalgBookingCapsTests(opts: { log?: boolean } = {}): Prom
       let mailsBefore = sends.length;
       const c1 = await book("c1", "kari@example.no", slotAhead(12));
       assertEq([c1.status, c1.body.success, c1.body.cap_reached, c1.body.cap, c1.body.limit], [200, false, true, "open_per_guest_producer", 2], "c1: third open request with one producer -> cap_reached");
-      assertEq(c1.body.message, "Forespørselen ble ikke sendt. Du har allerede 2 åpne forespørsler hos denne produsenten. Vent på svar før du sender en ny.", "c1b: NO message");
+      assertEq(c1.body.message, "Du har allerede forespørsler hos Captest c1 AS som venter på svar. Vent til produsenten har svart, eller trekk en av dem, før du sender en ny.", "c1b: NO message (cap.guestOpen, producer name)");
       assertEq([rows(), sends.length], [before, mailsBefore], "c2: no row, no e-mail");
       // After a decline, the slot frees up.
       db.prepare("UPDATE gardssalg_bookings SET pre_status = 'provider_declined' WHERE booking_ref = ?").run(a3.body.booking_ref);
@@ -317,7 +346,7 @@ export function runGardssalgBookingCapsTests(opts: { log?: boolean } = {}): Prom
       assertEq([rows(), sends.length], [before, mailsBefore], "c6: no row, no e-mail");
       const cm = await mcpBook("c4", "kari@example.no", slotAhead(14));
       assertEq([cm.parsed.success, cm.parsed.cap_reached, cm.parsed.reason, cm.parsed.cap, cm.isError], [false, true, "cap_reached", "guest_per_day", false], "c7: MCP returns cap_reached as a normal result");
-      assertTrue(typeof cm.parsed.message === "string" && cm.parsed.message.includes(" / The request was not sent."), "c7b: MCP message NO / EN");
+      assertTrue(typeof cm.parsed.message === "string" && cm.parsed.message.includes(" / You have sent many requests today."), "c7b: MCP message NO / EN");
       assertEq(rows(), before, "c8: MCP cap -> no row");
 
       // producer per day: 10 guests to c5, then the 11th and 12th.
@@ -327,7 +356,7 @@ export function runGardssalgBookingCapsTests(opts: { log?: boolean } = {}): Prom
       before = rows(); mailsBefore = sends.length;
       const c10 = await book("c5", "gjest10@example.no", slotAhead(20));
       assertEq([c10.body.cap_reached, c10.body.cap, c10.body.limit], [true, "producer_per_day", 10], "c10: eleventh -> producer_per_day");
-      assertEq(c10.body.message_en, "The request was not sent. This producer has received many requests in the last 24 hours. Please try again later, or contact the producer directly.", "c10b: EN message");
+      assertEq(c10.body.message_en, "Captest c5 AS has received many requests today and cannot take more right now. Please try again tomorrow.", "c10b: EN message (cap.producerDay, producer name)");
       await settle();
       assertEq(alerts.length, 1, "c11: one admin notice");
       assertTrue(alerts[0]?.includes("cap-c5") === true, "c11b: …naming the producer");
