@@ -518,6 +518,27 @@ export function getPendingBookings(provider_id: string): GardssalgBooking[] {
   return rows.map(hydrate);
 }
 
+// O2-2 («Mine besøk» in the gårdssalg owner dashboard): the requests for ONE
+// provider in every status — the owner's list (waiting, upcoming, earlier).
+// Read only, scoped by provider_id. Every still-open row (status 'reserved',
+// the same set as getPendingBookings) is always included, so nothing the
+// owner can act on is cut; the closed history is capped at the newest
+// `historyLimit` rows by created_at.
+export const PROVIDER_BOOKINGS_HISTORY_LIMIT = 200;
+export function listProviderBookings(
+  provider_id: string,
+  historyLimit: number = PROVIDER_BOOKINGS_HISTORY_LIMIT,
+): GardssalgBooking[] {
+  if (!provider_id) return [];
+  const db = getDb(VERTICAL);
+  const closed = db
+    .prepare(
+      "SELECT * FROM gardssalg_bookings WHERE provider_id = ? AND status != 'reserved' ORDER BY created_at DESC LIMIT ?",
+    )
+    .all(provider_id, Math.max(0, Math.floor(historyLimit))) as Record<string, unknown>[];
+  return [...getPendingBookings(provider_id), ...closed.map(hydrate)];
+}
+
 // Guest-controlled strings (name, notes, …) are interpolated into email
 // HTML below — escape them so a note like "<script>…" renders as text in
 // the producer's mail client instead of as markup.

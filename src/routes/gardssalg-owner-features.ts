@@ -15,10 +15,20 @@ import {
 } from "../services/gardssalg-claim";
 import { getDb as getVerticalDb } from "../database/db-factory";
 import { getGardssalgOwnerStats } from "../services/gardssalg-owner-stats-service";
-import { previsitReminderHours, previsitExpireHours, BookingInputSchema } from "../services/booking-store";
+import {
+  previsitReminderHours, previsitExpireHours, BookingInputSchema,
+  getBookingByRef, listProviderBookings, isValidSuggestedSlot, visitTimeReached,
+  producerRespondConfirm, producerRespondDecline, producerSuggestTime, resolveBooking,
+  sendPrevisitConfirmedToGuest, sendPrevisitDeclinedToGuest, sendSuggestionToGuest,
+  type GardssalgBooking,
+} from "../services/booking-store";
+import { attendanceNotConfirmedText, attendanceRefusal } from "../services/gardssalg-attendance-guard";
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
 import { gardssalgOwnerDashboardFlagOnFor, gardssalgOwnerDashboardMode, oaOwnerFeaturesEnabled } from "../owner-features/gardssalg";
-import { renderGardssalgMineBesokEmpty, type MineBesokEmptyState } from "../owner-features/gardssalg-mine-besok";
+import {
+  renderGardssalgMineBesokEmpty, renderGardssalgMineBesokPage, mineBesokActions, mineBesokCardId, mineBesokWrongStateText,
+  GARDSSALG_VISITS_TEXTS, O2_2_EXTRA_TEXTS, type MineBesokAction, type MineBesokEmptyState,
+} from "../owner-features/gardssalg-mine-besok";
 import { renderGardssalgStatsEmpty, wrapGardssalgDashboard } from "../owner-ui/gardssalg-dashboard";
 import {
   GARDSSALG_OWNER_FEATURE_GROUPS,
@@ -422,7 +432,7 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
   // the producer row → 404; allowlist (pilot) and the test producer → 404;
   // no session → 401; another producer's session or no live claim → 403.
   type DashboardGate =
-    | { ok: true; provider: ClaimProviderRow; slug: string }
+    | { ok: true; provider: ClaimProviderRow; slug: string; token: string }
     | { ok: false; send: (res: Response) => Response };
 
   function dashboardGate(req: Request): DashboardGate {
@@ -440,7 +450,58 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
     if (session.providerId !== provider.id || !isGardssalgProviderClaimed(provider.id)) {
       return { ok: false, send: simplePage(403, "Ingen tilgang", `<h1>Ingen tilgang</h1><p>Du har ikke tilgang til denne produsenten.</p>`) };
     }
-    return { ok: true, provider, slug };
+    return { ok: true, provider, slug, token: session.token };
+  }
+
+  // ── O2-2: «Mine besøk» — the owner's own requests and their actions ────
+  // GET  …/besok            the list (read only; the O2-1 empty state when
+  //                         the producer has no request at all)
+  // POST …/besok/handling   ref + action=bekreft|foresla|avsla|attended|no_show
+  //                         (+ suggested_slot). Flag off → next('route'), so
+  //                         the URL is exactly as before (404). Then, as the
+  //                         GET: the dashboard gate (flag/pilot list, test-
+  //                         producer lock, session, claim); the same-origin
+  //                         check (isCrossSiteWrite — `Origin: null` under
+  //                         no-referrer is accepted, a foreign Origin or
+  //                         Sec-Fetch-Site cross-site/same-site is 403); the
+  //                         per-session write cap; the booking must belong to
+  //                         THIS producer (else 404, nothing written). The
+  //                         transition is the store's own (the same functions
+  //                         the e-mailed svar/bekreft links call, with the
+  //                         same guest e-mails); a row in the wrong state
+  //                         writes nothing. Every outcome is 303 back to the
+  //                         page with a message (PRG).
+  // No «Avlys besøket»: cancelling is slice O1-5, not built here.
+  const BESOK_PATH = (slug: string, tail = "") => `/kategori/gardssalg/eier/${encodeURIComponent(slug)}/besok${tail}`;
+  const BESOK_ACTIONS: readonly MineBesokAction[] = ["bekreft", "foresla", "avsla", "attended", "no_show"];
+
+  const besokBack = (res: Response, slug: string, melding: string, ref?: string): Response => {
+    const q = `?melding=${encodeURIComponent(melding)}${ref ? `&ref=${encodeURIComponent(ref)}` : ""}`;
+    res.redirect(303, BESOK_PATH(slug, `${q}#${ref ? mineBesokCardId(ref) : "innhold"}`));
+    return res;
+  };
+
+  /** The PRG message for `?melding=` (`ref` = a booking of THIS producer, for the state words). */
+  function besokNotice(provider: ClaimProviderRow, q: Record<string, unknown>, now: Date): { ok: boolean; text: string } | null {
+    const melding = typeof q.melding === "string" ? q.melding : "";
+    const T = GARDSSALG_VISITS_TEXTS;
+    switch (melding) {
+      case "bekreftet": return { ok: true, text: T["visits.confirm.done"] };
+      case "foreslatt": return { ok: true, text: T["visits.suggest.done"] };
+      case "avslatt": return { ok: true, text: T["visits.decline.done"] };
+      case "oppmote": return { ok: true, text: T["visits.attended.done"] };
+      case "ugyldig_tid": return { ok: false, text: O2_2_EXTRA_TEXTS["visits.suggest.invalid"] };
+      case "for_tidlig": return { ok: false, text: O2_2_EXTRA_TEXTS["visits.attended.tooEarly"] };
+      case "for_mange": case "ugyldig": case "feil": return { ok: false, text: PAGE_MESSAGES[melding].text };
+      case "feil_tilstand": case "ikke_bekreftet": {
+        const ref = typeof q.ref === "string" ? q.ref : "";
+        const b = ref ? getBookingByRef(ref) : null;
+        if (!b || b.provider_id !== provider.id) return null;
+        if (melding === "ikke_bekreftet" && attendanceRefusal(b)) return { ok: false, text: attendanceNotConfirmedText(b) };
+        return { ok: false, text: mineBesokWrongStateText(b, now) };
+      }
+      default: return null;
+    }
   }
 
   router.get(
@@ -451,10 +512,97 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
     try {
       const g = dashboardGate(req);
       if (!g.ok) return g.send(res);
-      const body = renderGardssalgMineBesokEmpty(mineBesokEmptyState(g.provider), CLAIM_MANUAL_FALLBACK_EMAIL);
+      const bookings = listProviderBookings(g.provider.id);
+      const now = new Date();
+      const body = bookings.length === 0
+        ? renderGardssalgMineBesokEmpty(mineBesokEmptyState(g.provider), CLAIM_MANUAL_FALLBACK_EMAIL)
+        : renderGardssalgMineBesokPage(bookings, now, {
+          actionPath: BESOK_PATH(g.slug, "/handling"),
+          notice: besokNotice(g.provider, req.query as Record<string, unknown>, now),
+        });
       return res.send(shell(`Mine besøk · ${g.provider.navn}`, wrapGardssalgDashboard(g.slug, "besok", body)));
     } catch (e) {
       return fail("GET besok")(res, e);
+    }
+  });
+
+  router.post(
+    "/kategori/gardssalg/eier/:providerSlug/besok/handling",
+    // Flag off: this route does not exist (the request falls through exactly as before).
+    (_req: Request, _res: Response, next: (arg?: unknown) => void) => (gardssalgOwnerDashboardMode() === "off" ? next("route") : next()),
+    generalLimiter,
+    express.urlencoded({ extended: false }),
+    (req: Request, res: Response) => {
+    res.setHeader("Cache-Control", "no-store");
+    const slug = String((req.params as any).providerSlug || "");
+    try {
+      const g = dashboardGate(req);
+      if (!g.ok) return g.send(res);
+      const { provider } = g;
+      if (isCrossSiteWrite(req)) {
+        return simplePage(403, WRITE_GUARD_REFUSED_TITLE, writeGuardRefusedBody({
+          contact: WRITE_GUARD_CONTACT_OPPLEVAGENT, backHref: BESOK_PATH(slug), backLabel: "Tilbake til Mine besøk",
+        }))(res);
+      }
+      const body = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
+      const ref = typeof body.ref === "string" ? body.ref : "";
+      // Ownership: only a request to THIS producer's profile; anything else is 404 and nothing is written.
+      const booking: GardssalgBooking | null = ref ? getBookingByRef(ref) : null;
+      if (!booking || booking.provider_id !== provider.id) return notFoundPage(res);
+      const capKey = crypto.createHash("sha256").update(g.token).digest("hex");
+      if (writeCap.isOver(capKey)) return besokBack(res, slug, "for_mange", booking.booking_ref);
+      writeCap.record(capKey);
+
+      const action = typeof body.action === "string" ? body.action : "";
+      if (!(BESOK_ACTIONS as readonly string[]).includes(action)) return besokBack(res, slug, "ugyldig", booking.booking_ref);
+      const act = action as MineBesokAction;
+      const now = new Date();
+
+      // State guard: the same predicate that decides which buttons the page shows
+      // (mineBesokActions — the svar/bekreft routes' own rules); the store
+      // functions below guard again, so a race also writes nothing.
+      if (!mineBesokActions(booking, now).includes(act)) {
+        if (act === "attended" || act === "no_show") {
+          if (booking.status === "reserved" && attendanceRefusal(booking)) return besokBack(res, slug, "ikke_bekreftet", booking.booking_ref);
+          if (booking.status === "reserved" && !visitTimeReached(booking, now)) return besokBack(res, slug, "for_tidlig", booking.booking_ref);
+        }
+        return besokBack(res, slug, "feil_tilstand", booking.booking_ref);
+      }
+
+      if (act === "bekreft") {
+        const updated = producerRespondConfirm(booking.respond_token!, now);
+        if (!updated || updated.pre_status !== "provider_confirmed") return besokBack(res, slug, "feil_tilstand", booking.booking_ref);
+        sendPrevisitConfirmedToGuest(updated).catch((e) =>
+          console.error("[booking-previsit] guest confirm email failed", updated.booking_ref, e));
+        console.log(`[gardssalg-owner-features] owner confirmed ${updated.booking_ref} for provider ${provider.id} (dashboard)`);
+        return besokBack(res, slug, "bekreftet", booking.booking_ref);
+      }
+      if (act === "avsla") {
+        const updated = producerRespondDecline(booking.respond_token!, now);
+        if (!updated || updated.pre_status !== "provider_declined") return besokBack(res, slug, "feil_tilstand", booking.booking_ref);
+        sendPrevisitDeclinedToGuest(updated).catch((e) =>
+          console.error("[booking-previsit] guest decline email failed", updated.booking_ref, e));
+        console.log(`[gardssalg-owner-features] owner declined ${updated.booking_ref} for provider ${provider.id} (dashboard)`);
+        return besokBack(res, slug, "avslatt", booking.booking_ref);
+      }
+      if (act === "foresla") {
+        const suggested = typeof body.suggested_slot === "string" ? body.suggested_slot.trim() : "";
+        if (!isValidSuggestedSlot(suggested, now)) return besokBack(res, slug, "ugyldig_tid", booking.booking_ref);
+        const updated = producerSuggestTime(booking.respond_token!, suggested, now);
+        if (!updated || updated.pre_status !== "time_suggested") return besokBack(res, slug, "feil_tilstand", booking.booking_ref);
+        sendSuggestionToGuest(updated).catch((e) =>
+          console.error("[booking-previsit] guest suggestion email failed", updated.booking_ref, e));
+        console.log(`[gardssalg-owner-features] owner suggested a new time for ${updated.booking_ref}, provider ${provider.id} (dashboard)`);
+        return besokBack(res, slug, "foreslatt", booking.booking_ref);
+      }
+      // attended / no_show — resolveBooking() refuses an unconfirmed visit (O1-4).
+      const resolved = resolveBooking(booking.confirm_token, act === "attended" ? "confirmed_attended" : "no_show", "eier-dashbord");
+      if (!resolved) return besokBack(res, slug, "feil_tilstand", booking.booking_ref);
+      console.log(`[gardssalg-owner-features] owner registered ${resolved.status} for ${resolved.booking_ref}, provider ${provider.id} (dashboard)`);
+      return besokBack(res, slug, "oppmote", booking.booking_ref);
+    } catch (e) {
+      console.error("[gardssalg-owner-features] POST besok/handling failed:", e);
+      return besokBack(res, slug, "feil");
     }
   });
 
