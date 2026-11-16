@@ -32,8 +32,9 @@
  *
  * Covers, per vertical (rfb via src/routes/mcp.ts, dental via
  * src/routes/dental-mcp.ts, opplevagent via src/routes/experiences-mcp.ts):
- *   (a) tools/list with an unknown/expired mcp-session-id -> 404, JSON-RPC
- *       `-32001` body, and the session map did NOT grow from that request —
+ *   (a) resources/subscribe with an unknown/expired mcp-session-id -> 404,
+ *       JSON-RPC `-32001` body (tools/list with an unknown id is answered
+ *       without a session since F1-3, see mcp-stale-id-recovery.test.ts), and the session map did NOT grow from that request —
  *       proven behaviorally (no direct access to the module-private Map):
  *       a following `initialize` reusing THAT SAME bogus id must mint a
  *       FRESH server id rather than "finding" a phantom session and
@@ -170,15 +171,24 @@ export function runMcpSession404Tests(opts: { log?: boolean } = {}): Promise<Tes
           });
         }
 
-        // ── (a) tools/list with an unknown/expired session id -> 404 ──────
+        // ── (a) a non-stateless request with an unknown/expired session id
+        // -> 404. F1-3 (mcp-stale-id-recovery.ts) answers tools/list,
+        // tools/call, ping and the read-only listings without a session
+        // instead (covered in mcp-stale-id-recovery.test.ts), so this case
+        // uses resources/subscribe, which needs a session and still 404s.
         const bogusId = `bogus-session-${v.label}-does-not-exist`;
-        const unknownRes = await post({ jsonrpc: "2.0", method: "tools/list", params: {}, id: "u1" }, bogusId);
-        assertTrue(unknownRes.status === 404, `${v.label} a1: tools/list with unknown session id returns 404 (got ${unknownRes.status})`);
+        const unknownRes = await post({ jsonrpc: "2.0", method: "resources/subscribe", params: { uri: "x:/y" }, id: "u1" }, bogusId);
+        assertTrue(unknownRes.status === 404, `${v.label} a1: resources/subscribe with unknown session id returns 404 (got ${unknownRes.status})`);
         const unknownBody = await unknownRes.json().catch(() => null);
         assertTrue(
           !!unknownBody && unknownBody.jsonrpc === "2.0" && unknownBody.error?.code === -32001,
           `${v.label} a2: 404 body is JSON-RPC shaped with error.code -32001 (got ${JSON.stringify(unknownBody)})`
         );
+        // A tools/list with the same unknown id (F1-3's stateless answer)
+        // must not add a session either: the initialize below proves it.
+        const statelessRes = await post({ jsonrpc: "2.0", method: "tools/list", params: {}, id: "u1b" }, bogusId);
+        assertTrue(statelessRes.status === 200, `${v.label} a2b: tools/list with unknown session id is answered (got ${statelessRes.status})`);
+        await statelessRes.text();
 
         // (a, continued) — the map-did-not-grow proof: re-send `initialize`
         // reusing the EXACT SAME bogus id. Pre-fix, (a) would have inserted

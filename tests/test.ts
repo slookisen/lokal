@@ -32966,6 +32966,17 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of ms404.failures) failures.push("mcp-session-404: " + f);
     console.log(`  mcp-session-404: ${ms404.passed} passed, ${ms404.failed} failed`);
 
+    // F1-3 (A2A dev-request 2026-11-12-f1-felles-for-ai-kanalene): a stale
+    // mcp-session-id on a stateless request is answered without a session.
+    console.log("\n── mcp-stale-id-recovery: stale id after a deploy, SDK client recovers (rfb + dental + opplevagent) ──");
+    const { runMcpStaleIdRecoveryTests } = require("../src/routes/mcp-stale-id-recovery.test") as
+      typeof import("../src/routes/mcp-stale-id-recovery.test");
+    const msr = await runMcpStaleIdRecoveryTests({ log: false });
+    passed += msr.passed;
+    failed += msr.failed;
+    for (const f of msr.failures) failures.push("mcp-stale-id-recovery: " + f);
+    console.log(`  mcp-stale-id-recovery: ${msr.passed} passed, ${msr.failed} failed`);
+
     // dev-request 2026-09-19-prod-event-loop-stall-mcp-unhealthy (A2A): the
     // event-loop stall monitor (src/services/event-loop-monitor.ts) and the
     // 60 s cache that keeps GET /health from a full COUNT(*) on every probe

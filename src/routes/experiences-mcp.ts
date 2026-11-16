@@ -58,6 +58,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { isMcpInitializeRequestBody, sendMcpSessionNotFound } from "../services/mcp-session-protocol";
+import { serveMcpRequestWithoutSession, shouldServeUnknownMcpIdStateless, TerminatedMcpIds } from "../services/mcp-stale-id-recovery";
 
 import {
   discoverExperiencesRelaxed,
@@ -1738,6 +1739,8 @@ interface ExperiencesMcpSession {
 }
 
 const experiencesSessions = new Map<string, ExperiencesMcpSession>();
+// F1-3: ids this process ended (DELETE or idle sweep) keep their 404.
+const terminatedExperiencesSessions = new TerminatedMcpIds();
 const EXPERIENCES_SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 // The rate limiter's "is this a live session?" check (router.use near the
@@ -1753,6 +1756,7 @@ setInterval(() => {
     if (now - session.lastActivity > EXPERIENCES_SESSION_TTL_MS) {
       session.transport.close?.();
       experiencesSessions.delete(id);
+      terminatedExperiencesSessions.add(id);
     }
   }
 }, 5 * 60 * 1000);
@@ -1760,6 +1764,21 @@ setInterval(() => {
 /** serverInfo title and icons (G3-S5): the brand's name and 512 PNG logo, read from BRAND_ENTITIES.experiences. */
 export const OPPLEVAGENT_MCP_SERVER_TITLE = `${BRAND_ENTITIES.experiences.name} — norske opplevelser`;
 export const OPPLEVAGENT_MCP_SERVER_ICONS = brandMcpIcons(BRAND_ENTITIES.experiences);
+
+/** The McpServer without tools; used by a new session and by the stateless answer to an unknown id (F1-3). */
+function buildOpplevagentMcpServer(): McpServer {
+  return new McpServer({
+    name: "opplevagent",
+    version: mcpPackageVersion("experiences"),
+    title: OPPLEVAGENT_MCP_SERVER_TITLE,
+    websiteUrl: BRAND_ENTITIES.experiences.url,
+    icons: OPPLEVAGENT_MCP_SERVER_ICONS,
+    description:
+      "AI-discoverable marketplace of Norwegian experiences — curated, Brreg-verified activities " +
+      "searchable by county, category, weather, season, and group size. / " +
+      "Kuratert markedsplass for norske opplevelser, sokbar for AI-agenter.",
+  }, { instructions: OPPLEVAGENT_MCP_INSTRUCTIONS, maxToolInputElements: MCP_MAX_TOOL_INPUT_ELEMENTS });
+}
 
 async function getOrCreateExperiencesSession(
   sessionId: string | undefined,
@@ -1794,17 +1813,7 @@ async function getOrCreateExperiencesSession(
   const clientIdentity = req ? detectExperiencesMcpClient(req) : undefined;
   const requestMeta = req ? buildRequestMeta(req) : undefined;
 
-  const server = new McpServer({
-    name: "opplevagent",
-    version: mcpPackageVersion("experiences"),
-    title: OPPLEVAGENT_MCP_SERVER_TITLE,
-    websiteUrl: BRAND_ENTITIES.experiences.url,
-    icons: OPPLEVAGENT_MCP_SERVER_ICONS,
-    description:
-      "AI-discoverable marketplace of Norwegian experiences — curated, Brreg-verified activities " +
-      "searchable by county, category, weather, season, and group size. / " +
-      "Kuratert markedsplass for norske opplevelser, sokbar for AI-agenter.",
-  }, { instructions: OPPLEVAGENT_MCP_INSTRUCTIONS, maxToolInputElements: MCP_MAX_TOOL_INPUT_ELEMENTS });
+  const server = buildOpplevagentMcpServer();
 
   // Getters read live from the sessions map (by id) rather than closing over
   // a snapshot, so a later request on the same session that resolves a
@@ -1844,6 +1853,16 @@ async function getOrCreateExperiencesSession(
 router.post(["/", "/mcp"], async (req: Request, res: Response) => {
   try {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    // F1-3: an id this process does not know (e.g. from before a deploy) on a
+    // stateless request is answered without a session instead of a 404.
+    if (shouldServeUnknownMcpIdStateless(sessionId, (id) => experiencesSessions.has(id) || terminatedExperiencesSessions.has(id), req.body)) {
+      const server = buildOpplevagentMcpServer();
+      const clientIdentity = detectExperiencesMcpClient(req);
+      const requestMeta = buildRequestMeta(req);
+      registerExperienceTools(server, () => clientIdentity, () => requestMeta);
+      await serveMcpRequestWithoutSession(server, req, res, req.body);
+      return;
+    }
     const result = await getOrCreateExperiencesSession(sessionId, isMcpInitializeRequestBody(req.body), req);
     if ("notFound" in result) {
       sendMcpSessionNotFound(res);
@@ -1915,6 +1934,7 @@ router.delete(["/", "/mcp"], async (req: Request, res: Response) => {
     const session = experiencesSessions.get(sessionId)!;
     session.transport.close?.();
     experiencesSessions.delete(sessionId);
+    terminatedExperiencesSessions.add(sessionId);
   }
   res.status(200).json({ ok: true });
 });

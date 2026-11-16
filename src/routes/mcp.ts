@@ -55,6 +55,7 @@ import {
 // conversation. buildRequestMeta stays for session/traffic classification.
 import { buildRequestMeta } from "../services/conversation-service";
 import { isMcpInitializeRequestBody, sendMcpSessionNotFound } from "../services/mcp-session-protocol";
+import { serveMcpRequestWithoutSession, shouldServeUnknownMcpIdStateless, TerminatedMcpIds } from "../services/mcp-stale-id-recovery";
 import { foreignPlaceIn } from "../services/outside-norway";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 import { searchCountable } from "../services/search-tracking";
@@ -2196,6 +2197,8 @@ function detectMcpClient(req: Request): string | undefined {
 
 
 const sessions = new Map<string, McpSession>();
+// F1-3: ids this process ended (DELETE or idle sweep) keep their 404.
+const terminatedSessions = new TerminatedMcpIds();
 const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 // The /mcp rate limiter's "is this a live session?" check (mcpPrimaryKey in
@@ -2212,6 +2215,7 @@ setInterval(() => {
     if (now - session.lastActivity > SESSION_TTL_MS) {
       session.transport.close?.();
       sessions.delete(id);
+      terminatedSessions.add(id);
     }
   }
 }, 5 * 60 * 1000);
@@ -2268,6 +2272,22 @@ export function rfbMcpInstructions(): string {
 export { RFB_MCP_SERVER_TITLE };
 export const RFB_MCP_SERVER_ICONS = brandMcpIcons(BRAND_ENTITIES.rfb);
 
+/** One McpServer with the full tool set; used by a new session and by the stateless answer to an unknown id (F1-3). */
+function buildRfbMcpServer(
+  clientIdentity: string | undefined,
+  requestMeta: import("../services/conversation-service").RequestMeta | undefined,
+): McpServer {
+  const server = new McpServer({
+    name: "rett-fra-bonden",
+    version: mcpPackageVersion("rfb"),
+    title: RFB_MCP_SERVER_TITLE,
+    websiteUrl: BRAND_ENTITIES.rfb.url,
+    icons: RFB_MCP_SERVER_ICONS,
+  }, { instructions: rfbMcpInstructions(), maxToolInputElements: MCP_MAX_TOOL_INPUT_ELEMENTS });
+  registerTools(server, () => clientIdentity, () => requestMeta);
+  return server;
+}
+
 async function getOrCreateSession(
   sessionId: string | undefined,
   isInitialize: boolean,
@@ -2312,15 +2332,7 @@ async function getOrCreateSession(
   const clientIdentity = req ? detectMcpClient(req) : undefined;
   const requestMeta = req ? buildRequestMeta(req) : undefined;
 
-  const server = new McpServer({
-    name: "rett-fra-bonden",
-    version: mcpPackageVersion("rfb"),
-    title: RFB_MCP_SERVER_TITLE,
-    websiteUrl: BRAND_ENTITIES.rfb.url,
-    icons: RFB_MCP_SERVER_ICONS,
-  }, { instructions: rfbMcpInstructions(), maxToolInputElements: MCP_MAX_TOOL_INPUT_ELEMENTS });
-  const sessionRef: { clientIdentity?: string; requestMeta?: import("../services/conversation-service").RequestMeta } = { clientIdentity, requestMeta };
-  registerTools(server, () => sessionRef.clientIdentity, () => sessionRef.requestMeta);
+  const server = buildRfbMcpServer(clientIdentity, requestMeta);
 
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => id,
@@ -2339,6 +2351,12 @@ async function getOrCreateSession(
 router.post("/", async (req: Request, res: Response) => {
   try {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    // F1-3: an id this process does not know (e.g. from before a deploy) on a
+    // stateless request is answered without a session instead of a 404.
+    if (shouldServeUnknownMcpIdStateless(sessionId, (id) => sessions.has(id) || terminatedSessions.has(id), req.body)) {
+      await serveMcpRequestWithoutSession(buildRfbMcpServer(detectMcpClient(req), buildRequestMeta(req)), req, res, req.body);
+      return;
+    }
     const result = await getOrCreateSession(sessionId, isMcpInitializeRequestBody(req.body), req);
     if ("notFound" in result) {
       sendMcpSessionNotFound(res);
@@ -2419,6 +2437,7 @@ router.delete("/", async (req: Request, res: Response) => {
     const session = sessions.get(sessionId)!;
     session.transport.close?.();
     sessions.delete(sessionId);
+    terminatedSessions.add(sessionId);
   }
   res.status(200).json({ ok: true });
 });
