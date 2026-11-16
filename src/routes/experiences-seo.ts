@@ -218,6 +218,9 @@ import {
   guestTokenQuery,
   GUEST_TOKEN_PARAM,
 } from "../services/gardssalg-attendance-guard";
+// O1-5 (R2): cancellation by the guest or the producer, behind
+// GARDSSALG_CANCEL_ENABLED (routes and page blocks in ./gardssalg-cancel).
+import { createGardssalgCancelRouter, guestStatusCancelView, svarCancelView } from "./gardssalg-cancel";
 import { getDb, getDb as getExpDbForReise } from "../database/db-factory";
 import {
   createBooking,
@@ -8054,7 +8057,8 @@ router.get(
 
     const provider = getProviderById(booking.provider_id) as { navn?: string | null } | null;
     const state = respondTokenState(booking);
-    const statusLabel = PRE_STATUS_LABEL[booking.pre_status] || booking.pre_status;
+    const cancelView = svarCancelView(booking, token, String(req.query.done || ""));
+    const statusLabel = cancelView?.label ?? (PRE_STATUS_LABEL[booking.pre_status] || booking.pre_status);
 
     const done = String(req.query.done || "");
     const errorParam = String(req.query.error || "");
@@ -8119,10 +8123,10 @@ router.get(
 
     const inner = `    <h1>Reservasjonsforespørsel hos ${escapeHtml(provider?.navn || "deg")}</h1>
     <div class="ref">${escapeHtml(booking.booking_ref)}</div>
-    ${banner}
+    ${banner}${cancelView?.extra ?? ""}
     <div class="status-line">Status: <strong>${escapeHtml(statusLabel)}</strong></div>
     ${previsitRecapHtml(booking, true)}
-    ${actionsHtml}
+    ${actionsHtml}${cancelView?.actions ?? ""}
     <p class="hint">Denne siden er for produsenten. Lenken er personlig for denne forespørselen${booking.respond_token_expires_at ? ` og utløper automatisk ${escapeHtml(previsitSlotNb(booking.respond_token_expires_at))}` : ""} — ikke del den videre.</p>`;
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -8356,9 +8360,10 @@ router.get(
     }
 
     const provider = getProviderById(booking.provider_id) as { navn?: string | null } | null;
-    const statusLabel = PRE_STATUS_LABEL[booking.pre_status] || booking.pre_status;
-    const extra =
-      booking.pre_status === "expired"
+    const cancelView = guestStatusCancelView(booking, guestToken, String(req.query.done || ""));
+    const statusLabel = cancelView?.label ?? (PRE_STATUS_LABEL[booking.pre_status] || booking.pre_status);
+    const extra = cancelView?.extra ??
+      (booking.pre_status === "expired"
         ? `<div class="bekreft-banner warn" role="status">Vi beklager — forespørselen ble dessverre ikke avklart i tide og er utløpt. <a href="/kategori/gardssalg">Se alternative tilbydere her</a>.</div>`
         : booking.pre_status === "provider_declined"
           ? `<div class="bekreft-banner warn" role="status">Vi beklager at forespørselen ikke kunne bekreftes. <a href="/kategori/gardssalg">Se alternative tilbydere her</a>.</div>`
@@ -8366,13 +8371,13 @@ router.get(
             ? `<div class="bekreft-banner ok" role="status">Sjekk e-posten din — du har fått en lenke for å akseptere eller avslå det nye tidspunktet.</div>`
             : booking.pre_status === "provider_confirmed"
               ? `<div class="bekreft-banner ok" role="status">Reservasjonen er bekreftet — velkommen!</div>`
-              : "";
+              : "");
 
     const inner = `    <h1>Reservasjon hos ${escapeHtml(provider?.navn || "produsenten")}</h1>
     <div class="ref">${escapeHtml(booking.booking_ref)}</div>
     <div class="status-line">Status: <strong>${escapeHtml(statusLabel)}</strong></div>
     ${extra}
-    ${previsitRecapHtml(booking, false)}
+    ${previsitRecapHtml(booking, false)}${cancelView?.actions ?? ""}
     <p class="hint">Denne siden viser alltid gjeldende status for reservasjonen din. Lenken er personlig — ikke del den videre.</p>`;
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -8380,6 +8385,10 @@ router.get(
     res.send(previsitPage(`Status — ${booking.booking_ref}`, inner));
   },
 );
+
+// O1-5: GET/POST …/status/:ref/:token/avlys and …/svar/:token/avlys. Flag off:
+// every route next()s to the 404 catch-all.
+router.use(createGardssalgCancelRouter(previsitPage));
 
 // Price wording for the FAQ and answer-first builders below (FUNN
 // sted-lede-fra-0-kr; dev-request 2026-10-17-integrasjonstest-oppfolging):

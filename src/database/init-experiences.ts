@@ -1131,6 +1131,19 @@ export function initExperiencesSchema(db: Database.Database): void {
   // REST and every row created before this column. Additive, nullable.
   try { db.exec("ALTER TABLE gardssalg_bookings ADD COLUMN source_client TEXT"); } catch { /* already present */ }
 
+  // ─── O1-5 (R2): cancellation by the guest or the producer ──────────────
+  // Written only by services/gardssalg-cancel.ts (behind GARDSSALG_CANCEL_ENABLED)
+  // together with status = 'cancelled'. cancelled_by is 'guest' or 'producer';
+  // cancel_reason is the text the canceller wrote (optional for the guest,
+  // required for the producer). Additive, nullable; existing rows stay NULL.
+  for (const stmt of [
+    "ALTER TABLE gardssalg_bookings ADD COLUMN cancelled_at TEXT",
+    "ALTER TABLE gardssalg_bookings ADD COLUMN cancelled_by TEXT",
+    "ALTER TABLE gardssalg_bookings ADD COLUMN cancel_reason TEXT",
+  ]) {
+    try { db.exec(stmt); } catch { /* already present */ }
+  }
+
   // ─── listing_url (dev-request 2026-07-12-experiences-enrichment-supply-
   // and-aggregator-hygiene, Daniel's 2026-07-19 decision, step 1) ───────────
   // A chunk of experience_providers.hjemmeside rows carry a DMO/aggregator/
