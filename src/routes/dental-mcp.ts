@@ -51,6 +51,7 @@ import { DENTAL_EMERGENCY_NOTICE } from "../config/dental-landing";
 
 import { createMcpRateLimiters, MCP_RATE_LIMIT_PROFILES } from "../middleware/mcp-rate-limit";
 import { isMcpInitializeRequestBody, sendMcpSessionNotFound } from "../services/mcp-session-protocol";
+import { serveMcpRequestWithoutSession, shouldServeUnknownMcpIdStateless, TerminatedMcpIds } from "../services/mcp-stale-id-recovery";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { BRAND_ENTITIES, brandMcpIcons } from "../config/brand-entities";
 import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
@@ -591,6 +592,8 @@ interface DentalMcpSession {
 }
 
 const dentalSessions = new Map<string, DentalMcpSession>();
+// F1-3: ids this process ended (DELETE or idle sweep) keep their 404.
+const terminatedDentalSessions = new TerminatedMcpIds();
 const DENTAL_SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 // The rate limiter's "is this a live session?" check (router.use at the top
@@ -606,9 +609,24 @@ setInterval(() => {
     if (now - session.lastActivity > DENTAL_SESSION_TTL_MS) {
       session.transport.close?.();
       dentalSessions.delete(id);
+      terminatedDentalSessions.add(id);
     }
   }
 }, 5 * 60 * 1000);
+
+/** One McpServer with the full tool set; used by a new session and by the stateless answer to an unknown id (F1-3). */
+function buildDentalMcpServer(): McpServer {
+  const server = new McpServer({
+    name: "finn-tannlege",
+    version: mcpPackageVersion("dental"),
+    title: DENTAL_MCP_SERVER_TITLE,
+    description: DENTAL_MCP_SERVER_DESCRIPTION,
+    websiteUrl: BRAND_ENTITIES.dental.url,
+    icons: DENTAL_MCP_SERVER_ICONS,
+  }, { instructions: DENTAL_MCP_INSTRUCTIONS, maxToolInputElements: MCP_MAX_TOOL_INPUT_ELEMENTS });
+  registerDentalTools(server);
+  return server;
+}
 
 async function getOrCreateDentalSession(
   sessionId: string | undefined,
@@ -643,16 +661,7 @@ async function getOrCreateDentalSession(
   // mints the server's own id — a client-supplied id is never adopted here.
   const id = randomUUID();
 
-  const server = new McpServer({
-    name: "finn-tannlege",
-    version: mcpPackageVersion("dental"),
-    title: DENTAL_MCP_SERVER_TITLE,
-    description: DENTAL_MCP_SERVER_DESCRIPTION,
-    websiteUrl: BRAND_ENTITIES.dental.url,
-    icons: DENTAL_MCP_SERVER_ICONS,
-  }, { instructions: DENTAL_MCP_INSTRUCTIONS, maxToolInputElements: MCP_MAX_TOOL_INPUT_ELEMENTS });
-
-  registerDentalTools(server);
+  const server = buildDentalMcpServer();
 
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => id,
@@ -680,6 +689,12 @@ async function getOrCreateDentalSession(
 router.post(["/", "/mcp"], async (req: Request, res: Response) => {
   try {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    // F1-3: an id this process does not know (e.g. from before a deploy) on a
+    // stateless request is answered without a session instead of a 404.
+    if (shouldServeUnknownMcpIdStateless(sessionId, (id) => dentalSessions.has(id) || terminatedDentalSessions.has(id), req.body)) {
+      await dentalMcpRequestStore.run(req, () => serveMcpRequestWithoutSession(buildDentalMcpServer(), req, res, req.body));
+      return;
+    }
     const result = await getOrCreateDentalSession(sessionId, isMcpInitializeRequestBody(req.body));
     if ("notFound" in result) {
       sendMcpSessionNotFound(res);
@@ -755,6 +770,7 @@ router.delete(["/", "/mcp"], async (req: Request, res: Response) => {
     const session = dentalSessions.get(sessionId)!;
     session.transport.close?.();
     dentalSessions.delete(sessionId);
+    terminatedDentalSessions.add(sessionId);
   }
   res.status(200).json({ ok: true });
 });

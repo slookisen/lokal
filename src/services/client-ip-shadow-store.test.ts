@@ -1519,7 +1519,8 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
         db.close();
         assertEq(
           [...flow, f[0], f[1], f[3]],
-          [[200, 202, 200, 200, 200, 200, 200, 404, 404, 404, 200], 4, 5, "mcp", 3],
+          // F1-3: the router answers tools/list with a stale id without a session (200, not 404).
+          [[200, 202, 200, 200, 200, 200, 200, 200, 200, 200, 200], 4, 5, "mcp", 3],
           "I6: through installClientIp's default and the real Opplevagent router, AC2 counts against mcp exactly the 5 requests its primary keyed on the IP (2 initialize, 3 stale ids: RateLimit-Remaining fell by 4 after the first), not the 6 in the session"
         );
       } finally {

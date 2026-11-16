@@ -16,7 +16,8 @@
  *       session map, with a scaled-down copy of the vertical's profile in
  *       front (the production ceilings are too large to burst in a test).
  *       S2 on the same path: well-formed but made-up session ids share the
- *       IP bucket (404 while it has room, then 429), and live sessions keep
+ *       IP bucket (answered without a session while it has room, F1-3;
+ *       then 429), and live sessions keep
  *       working after it is exhausted.
  *   (d) in process: the router's OWN chain (production profile) answers
  *       initialize with RateLimit-Limit 200 (600 with a valid key) on
@@ -252,7 +253,8 @@ export async function runMcpRateLimitVerticalsTests(opts: { log?: boolean } = {}
           // S2: a well-formed id the router never minted is no identity — it
           // is counted in the IP bucket, not in a fresh bucket of its own.
           const fake1 = await c.toolsList(randomUUID(), 5); // IP bucket: 3 of 3
-          assertEq(fake1.status, 404, `${v.label} s2-1: a made-up session id reaches the router (404) while the IP bucket has room`);
+          // F1-3: the router answers a stateless call with an unknown id without a session (200).
+          assertEq(fake1.status, 200, `${v.label} s2-1: a made-up session id reaches the router (200, F1-3) while the IP bucket has room`);
           const fake2 = await c.toolsList(randomUUID(), 6); // IP bucket: 4 > 3
           assertEq(fake2.status, 429, `${v.label} s2-2: the next made-up session id gets no new bucket -> 429 from the shared IP bucket`);
           const b2 = await c.toolsList(sidB, 7); // B: 3
@@ -295,7 +297,7 @@ export async function runMcpRateLimitVerticalsTests(opts: { log?: boolean } = {}
           const fake = await c.toolsList(randomUUID(), 2); // IP bucket: 3
           assertEq(
             [fake.status, fake.headers["ratelimit-remaining"]],
-            [404, String(anon - 3)],
+            [200, String(anon - 3)], // F1-3: answered without a session
             `${v.label} d4: a made-up session id is counted in the IP bucket (2 initializes + it)`
           );
 
@@ -385,7 +387,7 @@ export async function runMcpRateLimitVerticalsTests(opts: { log?: boolean } = {}
 
         const fakeSid = randomUUID();
         const fake = await c.toolsList(fakeSid, 2);
-        assertEq(fake.status, 404, "rfb r4: a made-up session id still gets the router's 404");
+        assertEq(fake.status, 200, "rfb r4: a made-up session id reaches the router, which answers tools/list without a session (F1-3)");
         assertEq(await mrl.mcpPrimaryLimiter.getKey(`sid:${fakeSid}`), undefined, "rfb r5 (S2): … and no bucket of its own");
         assertEq(
           (await mrl.mcpPrimaryLimiter.getKey(`ip:${mrl.mcpIpKey({ ip } as any)}`))?.totalHits,
