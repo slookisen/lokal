@@ -60,7 +60,7 @@ src/routes/connector-packs-fresh.test.ts fails when a file here differs from wha
 
 A change to a tool's name, title, description, input schema, annotations, `_meta`, widget HTML, or the server's instructions or serverInfo is a contract change. Follow the tool-contract window procedure: https://github.com/slookisen/A2A/blob/main/protocols/kontraktvindu-verktoytekster.md.
 
-- [ ] Gather this server's pending contract changes into one window; one kind of change per PR, merged and deployed together.
+- [ ] Gather this server's pending contract changes into one window; one contract change per PR, merged and deployed together.
 - [ ] Show before/after text and hash per changed tool in the PR (`npx tsx src/routes/opplevagent-mcp-contract-freeze.test.ts --print`).
 - [ ] Keep the live definition working: new input fields optional, nothing removed or renamed in the same window.
 - [ ] Deploy, then scan, then upload: never upload `opplevagent-chatgpt-app-submission.json` or a ZIP before the deploy.

@@ -380,8 +380,10 @@ export function runConnectorPacksFreshTests(opts: { log?: boolean } = {}): TestS
       if (v === "dental") {
         assertTrue(!readme.includes(CONTRACT_WINDOW_DOC), `i4 ${v}: the dental README does not link the tool-contract window procedure`);
       } else {
+        assertTrue(CONTRACT_WINDOW_DOC === "https://github.com/slookisen/A2A/blob/main/protocols/kontraktvindu-verktoytekster.md", `i4 ${v}: the procedure link is the A2A protocols file`);
         assertTrue(windowSection.includes(CONTRACT_WINDOW_DOC) && (windowSection.match(/^- \[ \] /gm) ?? []).length >= 4,
           `i4 ${v}: the README has a tool-contract checklist that links ${CONTRACT_WINDOW_DOC}`);
+        if (v === "experiences") assertTrue(fs.readFileSync(path.join(ROOT, "opplevagent-connectors-prep/chatgpt-app/README.md"), "utf8").includes(CONTRACT_WINDOW_DOC), "i4 experiences: chatgpt-app/README.md links the procedure");
       }
 
       // ── (j) Connection and Data handling ─────────────────────────────────

@@ -787,7 +787,7 @@ export function renderPack(spec: PackSpec, input: PackInput): Record<(typeof PAC
           "",
           `A change to a tool's name, title, description, input schema, annotations, \`_meta\`, widget HTML, or the server's instructions or serverInfo is a contract change. Follow the tool-contract window procedure: ${CONTRACT_WINDOW_DOC}.`,
           "",
-          "- [ ] Gather this server's pending contract changes into one window; one kind of change per PR, merged and deployed together.",
+          "- [ ] Gather this server's pending contract changes into one window; one contract change per PR, merged and deployed together.",
           `- [ ] Show before/after text and hash per changed tool in the PR (\`npx tsx ${spec.contractWindow.freezeTest} --print\`).`,
           "- [ ] Keep the live definition working: new input fields optional, nothing removed or renamed in the same window.",
           `- [ ] Deploy, then scan, then upload: never upload \`${spec.contractWindow.submissionJson}\` or a ZIP before the deploy.`,
