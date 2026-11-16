@@ -949,6 +949,56 @@ function wholeDaysSince(ts: string | null | undefined, nowMs: number): number | 
   return Math.max(0, Math.floor((nowMs - t) / 86_400_000));
 }
 
+/** Hours since `ts`, floored, ≥0 (same parsing as wholeDaysSince: a bare
+ *  `YYYY-MM-DD HH:MM:SS` is UTC). null when unreadable. dev-request
+ *  2026-11-12-opplevagent-o6-tilfang-og-selvregistrering, O6-2. */
+export function wholeHoursSince(ts: string | null | undefined, now: Date = new Date()): number | null {
+  if (typeof ts !== "string" || !ts.trim()) return null;
+  let s = ts.trim();
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(s)) s = s.replace(" ", "T") + "Z";
+  const t = Date.parse(s);
+  if (!Number.isFinite(t)) return null;
+  return Math.max(0, Math.floor((now.getTime() - t) / 3_600_000));
+}
+
+/** A queue row older than this many business days is `stale` (O6-2: the
+ *  daily customer-service report raises a finding for it). */
+export const SELF_REGISTER_QUEUE_STALE_BUSINESS_DAYS = 2;
+
+/** Weekdays (Mon–Fri) strictly after the UTC date of `createdAt` (its first
+ *  10 chars, YYYY-MM-DD) up to and including the UTC date of `now`. Holidays
+ *  are not subtracted. null when the date part is unreadable. Mirrors the
+ *  customer-service routine's Python `virkedager` exactly (O6-2). */
+export function businessDaysSince(createdAt: string | null | undefined, now: Date = new Date()): number | null {
+  if (createdAt === null || createdAt === undefined) return null;
+  const head = String(createdAt).trim().slice(0, 10);
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(head);
+  if (!m) return null;
+  const y = Number(m[1]), mo = Number(m[2]), d = Number(m[3]);
+  const back = new Date(0);
+  back.setUTCFullYear(y, mo - 1, d); // not Date.UTC: that maps years 0–99 to 19xx
+  const d0 = back.getTime();
+  if (back.getUTCFullYear() !== y || back.getUTCMonth() !== mo - 1 || back.getUTCDate() !== d) return null;
+  const nowMs = now.getTime();
+  if (!Number.isFinite(nowMs)) return null;
+  const today = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  const days = Math.round((today - d0) / 86_400_000);
+  if (days <= 0) return 0;
+  const fullWeeks = Math.floor(days / 7);
+  let count = fullWeeks * 5;
+  const startDow = back.getUTCDay();
+  for (let i = fullWeeks * 7 + 1; i <= days; i++) {
+    const dow = (startDow + i) % 7;
+    if (dow !== 0 && dow !== 6) count++;
+  }
+  return count;
+}
+
+/** true when the row has waited more than SELF_REGISTER_QUEUE_STALE_BUSINESS_DAYS business days. */
+export function isSelfRegisterQueueRowStale(ageBusinessDays: number | null): boolean {
+  return ageBusinessDays !== null && ageBusinessDays > SELF_REGISTER_QUEUE_STALE_BUSINESS_DAYS;
+}
+
 export interface SelfRegisterQueueEntry {
   registration_id: string;
   status: string;
@@ -979,6 +1029,18 @@ export interface SelfRegisterQueueEntry {
   draft_session_active: boolean;
   created_at: string;
   age_days: number | null;
+  /** O6-2: whole hours since created_at (null when unreadable). */
+  age_hours: number | null;
+  /** O6-2: weekdays after the created_at UTC date up to today (null when unreadable). */
+  age_business_days: number | null;
+  /** O6-2: age_business_days > SELF_REGISTER_QUEUE_STALE_BUSINESS_DAYS. */
+  stale: boolean;
+}
+
+/** The O6-2 age fields of one queue row. */
+export function selfRegisterQueueAge(createdAt: string | null | undefined, now: Date = new Date()): { age_hours: number | null; age_business_days: number | null; stale: boolean } {
+  const age_business_days = businessDaysSince(createdAt, now);
+  return { age_hours: wholeHoursSince(createdAt, now), age_business_days, stale: isSelfRegisterQueueRowStale(age_business_days) };
 }
 
 /** Oldest first (created_at, then id). `total` counts every open entry;
@@ -1040,6 +1102,7 @@ export function listSelfRegisterReviewQueue(now: Date = new Date()): { total: nu
     draft_session_active: Number(r.draft_sessions) > 0,
     created_at: r.created_at,
     age_days: wholeDaysSince(r.created_at, nowMs),
+    ...selfRegisterQueueAge(r.created_at, now),
   }));
   return { total, entries };
 }
