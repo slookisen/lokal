@@ -22,3 +22,16 @@ export const CLAIM_LINK_TEXTS = {
 } as const;
 
 export type ClaimLinkTextKey = keyof typeof CLAIM_LINK_TEXTS;
+
+// Slice O3-2 (flag GARDSSALG_CLAIM_CONFIRM_STEP_ENABLED): VERBATIM from the
+// same pack, part 2 «Eieren bekrefter med en knapp». `{produsent}` is filled
+// by the route with the provider's name.
+export const CLAIM_CONFIRM_TEXTS = {
+  "claim.confirm.heading": "Ta over profilen til {produsent}",
+  "claim.confirm.body":
+    "Når du bekrefter, blir du eier av profilen. Da kan du rette opplysningene, bestemme om stedet tar imot besøk, og svare på forespørsler.",
+  "claim.confirm.responsibility": "Du bekrefter at du har rett til å representere {produsent}.",
+  "claim.confirm.button": "Ja, ta over profilen",
+  "claim.confirm.notMe": "Dette er ikke meg",
+  "claim.confirm.notMe.done": "Ingenting er endret. Du kan lukke siden.",
+} as const;

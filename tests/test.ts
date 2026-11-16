@@ -52527,6 +52527,24 @@ runSerial(async () => {
   }
 });
 
+// A2A dev-request 2026-11-12-opplevagent-o3-eierkrav-og-innlogging, O3-2:
+// a GET on the claim link does not grant ownership (AK1/AK2/AK3).
+runSerial(async () => {
+  console.log("\n── O3-2: en GET gir ikke eierskap (bekreft med en knapp) ──");
+  try {
+    const { runGardssalgClaimConfirmStepO32Tests } = require("../src/routes/gardssalg-claim-confirm-step-o3-2.test") as
+      typeof import("../src/routes/gardssalg-claim-confirm-step-o3-2.test");
+    const r = await runGardssalgClaimConfirmStepO32Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-claim-confirm-step-o3-2: " + f);
+    console.log(`  gardssalg-claim-confirm-step-o3-2: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-claim-confirm-step-o3-2: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 pkt 4: eid profil —
 // eierens pause / «fjern» / kvalitetsskjul, og admin-spaken på eide rader.
 runSerial(async () => {
