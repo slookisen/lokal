@@ -446,6 +446,13 @@ import { extractEmails } from "./search-enrich";
 import { isAcceptableHomepageEmail, hostFromUrlLike, registrableDomain } from "./cross-source-validator";
 import { ownerBookingEnableBlock, type OwnerBookingBlock } from "./gardssalg-booking-gate";
 import { gardssalgVisibleSql, GARDSSALG_TEST_FIXTURE_REASON } from "./gardssalg-visibility";
+import {
+  gardssalgOwnerSessionCookieMaxAgeMs,
+  gardssalgNewOwnerSessionLifetimeMs,
+  isGardssalgOwnerSessionSlidingEnabled,
+  renewGardssalgOwnerSessionOnUse,
+  revokeOtherOwnersGardssalgSessions,
+} from "./gardssalg-owner-session-sliding";
 
 const VERTICAL = "experiences";
 
@@ -2430,7 +2437,24 @@ export function confirmClaimToken(token: string): VerifyClaimResult {
  *  verifyClaimToken() and promoteSelfRegisteredDraftClaim() so there is one
  *  ownership model. Runs inside the caller's transaction. */
 function markClaimUsedAndLockProvider(db: ReturnType<typeof getDb>, claimId: string, providerId: string): void {
-  db.prepare(`UPDATE gardssalg_claims SET used = 1, used_at = datetime('now') WHERE id = ?`).run(claimId);
+  if (!isGardssalgOwnerSessionSlidingEnabled()) {
+    db.prepare(`UPDATE gardssalg_claims SET used = 1, used_at = datetime('now') WHERE id = ?`).run(claimId);
+  } else {
+    // O3-3 (GARDSSALG_OWNER_SESSION_SLIDING_ENABLED): the first use opens the
+    // session with min(idle, cap) days; a re-click of an already used link is
+    // a use of the session — renewed, used_at (the cap anchor) kept.
+    const nowMs = Date.now();
+    const first = db.prepare(
+      `UPDATE gardssalg_claims SET used = 1, used_at = datetime('now'), expires_at = ? WHERE id = ? AND used = 0`,
+    ).run(new Date(nowMs + gardssalgNewOwnerSessionLifetimeMs()).toISOString(), claimId);
+    if (first.changes === 0) {
+      const row = db.prepare(`SELECT token, used_at, created_at, expires_at FROM gardssalg_claims WHERE id = ?`).get(claimId);
+      if (row) renewGardssalgOwnerSessionOnUse(db, row, nowMs);
+    }
+  }
+  // O3-3 AK2: a different address taking the provider ends the previous owner's sessions.
+  const claimed = db.prepare(`SELECT email FROM gardssalg_claims WHERE id = ?`).get(claimId) as { email: string } | undefined;
+  if (claimed) revokeOtherOwnersGardssalgSessions(db, providerId, claimId, claimed.email);
   db.prepare(
     `UPDATE experience_providers SET content_source = 'claim', updated_at = datetime('now')
      WHERE id = ? AND (content_source IS NULL OR content_source NOT IN ('manual', 'claim'))`,
@@ -2483,20 +2507,37 @@ export interface OwnerSession {
   valid: boolean;
   providerId?: string;
   token?: string;
+  /** O3-3, flag on: set when this call moved the session's expiry (ms). */
+  renewedExpiresAtMs?: number;
 }
 
 export function verifyGardssalgOwnerSessionToken(token: string | undefined | null): OwnerSession {
   if (!token) return { valid: false };
   const db = getDb(VERTICAL);
+  const sliding = isGardssalgOwnerSessionSlidingEnabled();
   const claim = db
     .prepare(
-      `SELECT provider_id FROM gardssalg_claims
+      `SELECT provider_id${sliding ? ", used_at, created_at, expires_at" : ""} FROM gardssalg_claims
        WHERE token = ? AND used = 1 AND expires_at > datetime('now') AND revoked_at IS NULL
          AND COALESCE(draft_mode, 0) = 0`,
     )
-    .get(token) as { provider_id: string } | undefined;
+    .get(token) as { provider_id: string; used_at?: string; created_at?: string; expires_at?: string } | undefined;
   if (!claim) return { valid: false };
+  if (sliding) {
+    // O3-3: renewed by use. Never throws — a failed renewal leaves the session as it was.
+    try {
+      const next = renewGardssalgOwnerSessionOnUse(db, { ...claim, token });
+      if (next !== null) return { valid: true, providerId: claim.provider_id, token, renewedExpiresAtMs: next };
+    } catch (err) {
+      console.error("[gardssalg-claim] owner session renewal failed:", err instanceof Error ? err.message : "error");
+    }
+  }
   return { valid: true, providerId: claim.provider_id, token };
+}
+
+/** Cookie maxAge for a session just granted (O3-3; flag off: 7 days, as before). */
+export function gardssalgOwnerSessionCookieMaxAge(token: string): number {
+  return gardssalgOwnerSessionCookieMaxAgeMs(getDb(VERTICAL), token);
 }
 
 /** GDPR-minimum revoke: invalidates the session/token immediately (unlike

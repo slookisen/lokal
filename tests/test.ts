@@ -52653,6 +52653,25 @@ runSerial(async () => {
   }
 });
 
+// A2A dev-request 2026-11-12-opplevagent-o3-eierkrav-og-innlogging, O3-3:
+// the gårdssalg owner session is renewed by use; an ownership change ends the
+// previous owner's sessions (AK1/AK2).
+runSerial(async () => {
+  console.log("\n── O3-3: gårdssalg-eierøkten fornyes ved bruk ──");
+  try {
+    const { runGardssalgOwnerSessionSlidingTests } = require("../src/services/gardssalg-owner-session-sliding.test") as
+      typeof import("../src/services/gardssalg-owner-session-sliding.test");
+    const r = await runGardssalgOwnerSessionSlidingTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-owner-session-sliding: " + f);
+    console.log(`  gardssalg-owner-session-sliding: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-owner-session-sliding: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 pkt 4: eid profil —
 // eierens pause / «fjern» / kvalitetsskjul, og admin-spaken på eide rader.
 runSerial(async () => {
