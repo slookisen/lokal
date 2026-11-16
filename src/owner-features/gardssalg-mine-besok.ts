@@ -33,6 +33,7 @@ import {
   type GardssalgBooking,
 } from "../services/booking-store";
 import { formatSlotOslo } from "../services/gardssalg-booking-resolve";
+import { GARDSSALG_DASHBOARD_TEXTS, gardssalgDashboardHelpHtml } from "../owner-ui/gardssalg-dashboard";
 
 export type MineBesokAction = "bekreft" | "foresla" | "avsla" | "attended" | "no_show";
 
@@ -218,4 +219,24 @@ export function renderGardssalgMineBesok(bookings: readonly GardssalgBooking[], 
 ${sectionHtml("besok-kommende", "Kommende", kommende, "Ingen kommende besøk.", now)}
 ${sectionHtml("besok-tidligere", "Tidligere", tidligere, "Ingen tidligere besøk.", now)}
 </div>`;
+}
+
+// ─── O2-1: the «Mine besøk» tab before it is wired (empty state) ────────────
+// dev-request 2026-11-12-opplevagent-o2-eierdashbord-for-besok, slice O2-1.
+// The tab exists in the dashboard shell, but the list and its actions come in
+// O2-2. Until then the tab shows a neutral empty state from tekstpakke OA-3:
+//   "off"      «Ta imot besøk» is off               → empty.visitsOff
+//   "none"     on, and the producer has no request   → empty.visits
+//   "pending"  on, and requests exist (or unknown)   → no «ingen forespørsler»
+//              line (it would be untrue); only the help line. The requests
+//              are in the owner's e-mail until O2-2.
+export type MineBesokEmptyState = "off" | "none" | "pending";
+
+export function renderGardssalgMineBesokEmpty(state: MineBesokEmptyState, contactEmail: string): string {
+  const T = GARDSSALG_DASHBOARD_TEXTS;
+  const line = state === "off" ? T["empty.visitsOff"] : state === "none" ? T["empty.visits"] : null;
+  return `<div class="gc-card" data-gardssalg-empty="besok" data-state="${state}">
+    <h1>${escapeHtml(T["tab.visits"])}</h1>
+    ${line ? `<p>${escapeHtml(line)}</p>\n    ` : ""}<p>${gardssalgDashboardHelpHtml(contactEmail)}</p>
+  </div>`;
 }

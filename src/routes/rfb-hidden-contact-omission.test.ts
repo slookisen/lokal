@@ -235,9 +235,9 @@ export async function runRfbHiddenContactOmissionTests(opts: { log?: boolean } =
       const { conversationService } = require("../services/conversation-service") as typeof import("../services/conversation-service");
       const h = conversationService.generateSellerResponse(HIDDEN, "poteter")?.text ?? "";
       assertEq(leaked(h, HIDDEN), [], "conv-1: the seller auto-reply of the hidden fixture has no contact details");
-      assertTrue(h.includes(HIDDEN_CONTACT_NOTE_NB) && !h.includes("Kontakt oss:"), "conv-2: …the note line instead");
+      assertTrue(h.includes(HIDDEN_CONTACT_NOTE_NB) && !h.includes("Kontakt oss:") && !h.includes("\nKontakt:\n"), "conv-2: …the note line instead");
       const v = conversationService.generateSellerResponse(VISIBLE, "gulrøtter")?.text ?? "";
-      assertTrue(v.includes("Kontakt oss:") && v.includes(CONTACT[VISIBLE].phone) && !v.includes(HIDDEN_CONTACT_NOTE_NB), "conv-3: a visible producer's auto-reply keeps «Kontakt oss»");
+      assertTrue(v.includes("\nKontakt:\n") && v.includes(CONTACT[VISIBLE].phone) && !v.includes(HIDDEN_CONTACT_NOTE_NB), "conv-3: a visible producer's auto-reply keeps its contact block («Kontakt:», third person since 2026-11-13)");
     }
 
     // contact_handoffs of lokal_cart_submit (the hidden fixture not opted in to orders).

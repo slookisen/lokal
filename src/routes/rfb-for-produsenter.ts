@@ -58,23 +58,20 @@
 
 import { localizedPath, type Lang } from "../i18n/t";
 import { faqPairsFromJsonLd, type FaqPair } from "../services/faq-section";
-import { OWNER_FEATURE_REGISTRY, ownerFeatureEntryForEnv, ownerFeatureStatus, type OwnerFeatureEntry } from "../owner-features/registry";
+import { OWNER_FEATURE_REGISTRY, ownerFeatureEntryForEnv, ownerFeatureStatus, type OwnerFeatureEntry, type OwnerFeatureValue } from "../owner-features/registry";
 import { OWNER_LEVELS } from "../owner-features/changes";
 import { ownerOrderLimitLines, type OrderLimitsConfig } from "../owner-features/order-texts";
 import { currentForProdusenterFacts, type ForProdusenterFacts, type PilotFeatureKey, type PilotState } from "../owner-features/today-facts";
 import { FRONT_PAGE_FAQ_ANCHOR } from "./front-page-faq";
+import { FOR_PRODUSENTER_PATH, forProdusenterSectionHref, isForProdusenterDemoEnabled, isForProdusenterPageEnabled, type ForProdusenterAnchor } from "./rfb-for-produsenter-anchors";
 
 // F2a: the facts module lives in owner-features/today-facts.ts; re-exported
 // so existing callers (tests, rfb-owner-refresh) keep importing it from here.
 export { currentForProdusenterFacts, type ForProdusenterFacts } from "../owner-features/today-facts";
 
-export const FOR_PRODUSENTER_PATH = "/for-produsenter";
-
-/** FOR_PRODUSENTER_PAGE_ENABLED: "1" or "true" (any case, trimmed) = on; anything else = off. */
-export function isForProdusenterPageEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const v = (env.FOR_PRODUSENTER_PAGE_ENABLED || "").trim().toLowerCase();
-  return v === "true" || v === "1";
-}
+// F2c-1: the path, the flag and the anchors live in rfb-for-produsenter-
+// anchors.ts (the registry and the «Mine valg» page use them); re-exported here.
+export { FOR_PRODUSENTER_PATH, isForProdusenterPageEnabled, isForProdusenterDemoEnabled, FOR_PRODUSENTER_ANCHORS, forProdusenterSectionHref, type ForProdusenterAnchor } from "./rfb-for-produsenter-anchors";
 
 /** Sitemap paths for this page: [] while the flag is off. */
 export function forProdusenterSitemapPaths(env: NodeJS.ProcessEnv = process.env): string[] {
@@ -96,13 +93,6 @@ export function rfbAgentCardFaqLinks(baseUrl: string, env: NodeJS.ProcessEnv = p
   const base = baseUrl.replace(/\/$/, "");
   return { "x-faq": { frontPage: `${base}/#${FRONT_PAGE_FAQ_ANCHOR}`, producers: `${base}${FOR_PRODUSENTER_PATH}` } };
 }
-
-/** The anchors, in menu order. Used by «Les mer» links later — never rename after publishing. */
-export const FOR_PRODUSENTER_ANCHORS = [
-  "oversikt", "synlighet", "eierskap", "mine-valg", "bestillinger", "betaling",
-  "oppdatering", "statistikk", "personvern", "pris", "kontakt",
-] as const;
-export type ForProdusenterAnchor = (typeof FOR_PRODUSENTER_ANCHORS)[number];
 
 const SELGER_FIND = "/selger#findSection";
 const SELGER_LOGIN = "/selger#loginBanner";
@@ -207,11 +197,188 @@ function pilotInvite(where: "mine-valg" | "avslutning", lang: "no" | "en", f: Fo
       </div>`;
 }
 
+// ─── F2c-2: the clickable «Mine valg» demo (#mine-valg, AC5) ───────────────
+// Behind FOR_PRODUSENTER_DEMO_ENABLED (default off). Built from the SAME
+// registry as «Mine valg»: the live RFB choices (liveRfbOwnerChoices) are
+// rows with their state, a `switch` row has a toggle button (aria-pressed);
+// every other RFB entry stands in a closed «Planlagt» box with its button
+// disabled. An example farm, no login, and NO write calls: no form, no
+// fetch/XHR, no storage — a toggle changes only the DOM in the reader's
+// browser (DEMO_JS), and a reload starts over. Not a Q/A: never in the
+// FAQPage JSON-LD. Row text = the entry's sellerFaq, else its description
+// (as «Mine valg» shows it); «Les mer» → its faqAnchor section.
+// The NO state words are the ones «Mine valg» shows (page.ts
+// formatOwnerFeatureValue / controlHtml; the test pins them).
+
+/** New UI strings for the demo — listed for Daniel's approval (F2c-2). */
+export const FOR_PRODUSENTER_DEMO_COPY = {
+  no: {
+    title: "Prøv «Mine valg»",
+    farm: "Eksempelgård",
+    note: "Dette er en demo. Ingenting lagres.",
+    planned: "Planlagt",
+    on: "På", off: "Av", always: "Alltid", lockedOn: "Låst på", profileEmail: "Profilens e-post", notChosen: "Ikke valgt", none: "Ingen",
+    switchOn: "Slå på", switchOff: "Slå av",
+    readMore: "Les mer",
+  },
+  en: {
+    title: "Try «Mine valg» (My choices)",
+    farm: "Example farm",
+    note: "This is a demo. Nothing is saved.",
+    planned: "Planned",
+    on: "On", off: "Off", always: "Always", lockedOn: "Locked on", profileEmail: "The profile's e-mail", notChosen: "Not chosen", none: "None",
+    switchOn: "Switch on", switchOff: "Switch off",
+    readMore: "Read more",
+  },
+} as const;
+
+/** Demo rows whose function is pilot-gated on its own (today-facts.ts): they carry the «I pilot» badge while i_pilot. */
+const DEMO_ROW_PILOT: Record<string, PilotFeatureKey> = {
+  "products.stock_check": "lagerpaminnelse",
+};
+
+type DemoCopy = (typeof FOR_PRODUSENTER_DEMO_COPY)["no" | "en"];
+
+/** The example farm's value: the owner default; a locked row follows its key's default. */
+function demoValue(e: OwnerFeatureEntry, byKey: Map<string, OwnerFeatureEntry>): OwnerFeatureValue {
+  if (e.type === "locked" && e.lockedWhen) return byKey.get(e.lockedWhen)?.default.owner === true;
+  return e.default.owner;
+}
+
+function demoStateText(e: OwnerFeatureEntry, v: OwnerFeatureValue, c: DemoCopy, lang: "no" | "en"): string {
+  if (e.type === "guarantee") return c.always;
+  if (v === true) return e.type === "locked" ? c.lockedOn : c.on;
+  if (v === false) return c.off;
+  if (v === null || v === undefined) return e.type === "number" ? c.none : e.type === "email" ? c.profileEmail : c.notChosen;
+  if (e.type === "choice") {
+    const o = (e.options || []).find((x) => x.value === v);
+    if (o) return o.label[lang];
+  }
+  return String(v);
+}
+
+function demoLabelId(e: OwnerFeatureEntry): string {
+  return `fp-demo-l-${e.key.replace(/[^a-z0-9]/gi, "-")}`;
+}
+
+function demoText(e: OwnerFeatureEntry, lang: "no" | "en", c: DemoCopy, facts: ForProdusenterFacts, labelId = ""): string {
+  const pilotKey = DEMO_ROW_PILOT[e.key];
+  const badge = pilotKey && facts.pilot[pilotKey] === "i_pilot" ? ` <span class="fp-badge">${esc(PILOT_COPY[lang].badge)}</span>` : "";
+  const text = (e.sellerFaq ?? e.description)[lang];
+  const more = e.faqAnchor
+    ? `<p class="fp-demo-desc"><a href="${esc(forProdusenterSectionHref(e.faqAnchor, lang))}" data-faq-anchor="${esc(e.faqAnchor)}">${esc(c.readMore)}</a></p>`
+    : "";
+  return `<div class="fp-demo-text"><strong${labelId ? ` id="${esc(labelId)}"` : ""}>${esc(e.label[lang])}</strong>${badge}<p class="fp-demo-desc"${e.sellerFaq ? ` data-seller-faq="1"` : ""}>${esc(text)}</p>${more}</div>`;
+}
+
+/**
+ * The demo block (trusted HTML, every text escaped) plus its script. Reads
+ * `registry` and `facts`; an entry's liveFlag / whileFlagOff follow the
+ * process env, as they do in «Mine valg» and the rest of this page.
+ */
+export function renderForProdusenterDemo(lang: "no" | "en", facts: ForProdusenterFacts, registry: OwnerFeatureEntry[] = OWNER_FEATURE_REGISTRY): string {
+  const c = FOR_PRODUSENTER_DEMO_COPY[lang];
+  const rfb = registry.filter((e) => e.verticals.includes("rfb"));
+  const live = liveRfbOwnerChoices(facts, rfb);
+  const liveKeys = new Set(live.map((e) => e.key));
+  const planned = rfb.filter((e) => !liveKeys.has(e.key)).map((e) => ownerFeatureEntryForEnv(e));
+  const byKey = new Map(rfb.map((e) => [e.key, e] as const));
+  const rows = live.map((e) => {
+    const v = demoValue(e, byKey);
+    const state = `<span class="fp-demo-state">${esc(demoStateText(e, v, c, lang))}</span>`;
+    const ctl = e.type === "switch"
+      ? `${state}<button type="button" class="fp-btn${v === true ? "" : " fp-btn-primary"}" aria-pressed="${v === true ? "true" : "false"}" aria-describedby="${esc(demoLabelId(e))}" data-demo-toggle>${esc(v === true ? c.switchOff : c.switchOn)}</button>`
+      : state;
+    const locked = e.type === "locked" && e.lockedWhen ? ` data-demo-locked-when="${esc(e.lockedWhen)}"` : "";
+    return `
+          <li class="fp-demo-item" data-demo-key="${esc(e.key)}" data-demo-type="${esc(e.type)}"${locked}>
+            ${demoText(e, lang, c, facts, demoLabelId(e))}
+            <div class="fp-demo-ctl">${ctl}</div>
+          </li>`;
+  }).join("");
+  const plannedRows = planned.map((e) => `
+            <li class="fp-demo-item fp-demo-planned-item" data-demo-planned-key="${esc(e.key)}">
+              ${demoText(e, lang, c, facts)}
+              <div class="fp-demo-ctl"><button type="button" class="fp-btn" disabled aria-disabled="true">${esc(c.switchOn)}</button></div>
+            </li>`).join("");
+  const pilotBadge = facts.pilot.mine_valg === "i_pilot" ? ` <span class="fp-badge">${esc(PILOT_COPY[lang].badge)}</span>` : "";
+  return `
+      <div class="fp-demo" id="fpDemo" data-demo="mine-valg" role="group" aria-labelledby="fp-h-demo"
+        data-t-on="${esc(c.on)}" data-t-off="${esc(c.off)}" data-t-locked-on="${esc(c.lockedOn)}" data-t-switch-on="${esc(c.switchOn)}" data-t-switch-off="${esc(c.switchOff)}">
+        <h3 id="fp-h-demo">${esc(c.title)}${pilotBadge}</h3>
+        <p class="fp-demo-farm"><strong>${esc(c.farm)}</strong></p>
+        <p class="fp-demo-note" role="note">${esc(c.note)}</p>
+        <ul class="fp-demo-list">${rows}
+        </ul>${planned.length ? `
+        <details class="fp-demo-planned" data-demo-planned="1">
+          <summary>${esc(c.planned)} (${planned.length})</summary>
+          <ul class="fp-demo-list">${plannedRows}
+          </ul>
+        </details>` : ""}
+      </div>${DEMO_JS}`;
+}
+
+// The demo's only script: toggles flip aria-pressed, the button text and the
+// row's state (and the rows locked to that key), in the DOM only. Nothing is
+// sent or stored anywhere.
+const DEMO_JS = `
+      <script>
+      (function(){
+        var demo = document.getElementById('fpDemo');
+        if (!demo) return;
+        var t = function(k){ return demo.getAttribute('data-t-' + k) || ''; };
+        demo.addEventListener('click', function(e){
+          var b = e.target && e.target.closest ? e.target.closest('button[data-demo-toggle]') : null;
+          if (!b || b.disabled) return;
+          var on = b.getAttribute('aria-pressed') !== 'true';
+          b.setAttribute('aria-pressed', on ? 'true' : 'false');
+          b.textContent = on ? t('switch-off') : t('switch-on');
+          if (on) b.classList.remove('fp-btn-primary'); else b.classList.add('fp-btn-primary');
+          var row = b.closest('[data-demo-key]');
+          if (!row) return;
+          var st = row.querySelector('.fp-demo-state');
+          if (st) st.textContent = on ? t('on') : t('off');
+          var key = row.getAttribute('data-demo-key');
+          demo.querySelectorAll('[data-demo-locked-when]').forEach(function(r){
+            if (r.getAttribute('data-demo-locked-when') !== key) return;
+            var s = r.querySelector('.fp-demo-state');
+            if (s) s.textContent = on ? t('locked-on') : t('off');
+          });
+        });
+      })();
+      </script>`;
+
+/** Demo-only CSS, added to the page only while the demo flag is on (forProdusenterPageCss). Rows wrap at 375 px. */
+export const FOR_PRODUSENTER_DEMO_CSS = `
+  .fp-demo { margin: 20px 0; padding: 16px; border: 1px solid var(--g200); border-radius: var(--r-md); background: var(--white); box-shadow: var(--shadow-sm); max-width: 100%; }
+  .fp-demo, .fp-demo * { overflow-wrap: anywhere; }
+  .fp-demo h3 { margin-top: 0; }
+  .fp-demo .fp-demo-farm { margin-bottom: 4px; }
+  .fp-demo .fp-demo-note { font-size: 0.9rem; color: var(--g500); }
+  .fp-demo-list { list-style: none; margin: 0; padding: 0; }
+  .fp-demo-item { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; padding: 12px 0; border-bottom: 1px solid var(--g200); }
+  .fp-demo-item:last-child { border-bottom: none; }
+  .fp-demo-text { flex: 1 1 220px; min-width: 0; }
+  .fp-demo .fp-demo-desc { font-size: 0.9rem; color: var(--g500); margin: 4px 0 0; }
+  .fp-demo-ctl { flex: 0 1 auto; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; max-width: 100%; }
+  .fp-demo-state { font-weight: 700; color: var(--charcoal); font-size: 0.9rem; }
+  .fp-demo .fp-btn[disabled] { opacity: 0.5; cursor: not-allowed; }
+  .fp-demo-planned { margin-top: 12px; border-top: 1px solid var(--g200); }
+  .fp-demo-planned summary { cursor: pointer; padding: 12px 0; font-weight: 700; color: var(--charcoal); }
+  .fp-demo-planned summary:focus-visible { outline: 2px solid var(--green-700); outline-offset: 2px; }
+  .fp-demo-planned-item { color: var(--g500); }
+`;
+
+/** The page's CSS: FOR_PRODUSENTER_CSS, plus the demo's only while FOR_PRODUSENTER_DEMO_ENABLED is on. */
+export function forProdusenterPageCss(env: NodeJS.ProcessEnv = process.env): string {
+  return isForProdusenterDemoEnabled(env) ? FOR_PRODUSENTER_CSS + FOR_PRODUSENTER_DEMO_CSS : FOR_PRODUSENTER_CSS;
+}
+
 /** T11 limit sentences in English (the NO lines come from order-texts.ts ownerOrderLimitLines). */
 function orderLimitLinesEn(cfg: OrderLimitsConfig): string[] {
   return [
     "Many different customers can order from you on the same day.",
-    `To stop misuse, one customer can have at most ${cfg.openPerBuyer} unanswered orders with you at a time, and send you at most ${cfg.perBuyerPerDay} new orders per day.`,
+    `One customer can have at most ${cfg.openPerBuyer} unanswered orders with you at a time, and send you at most ${cfg.perBuyerPerDay} new orders per day.`,
     `If you get more than ${cfg.producerCeilingPerDay} orders in one day, we take no more for you for the rest of the day. Customers then get your contact details instead.`,
     "A day runs from midnight to midnight.",
   ];
@@ -272,12 +439,12 @@ function levelsAnswer(lang: "no" | "en"): string {
     : `Det er to nivåer. ${parts.join(" ")}`;
 }
 
-function sectionsNo(f: ForProdusenterFacts): Section[] {
+function sectionsNo(f: ForProdusenterFacts, registry: OwnerFeatureEntry[] = OWNER_FEATURE_REGISTRY, demo = ""): Section[] {
   const tech = localizedPath("/teknologi", "no");
   const owners = localizedPath("/verifisert-av-eier", "no");
   const privacy = localizedPath("/personvern", "no");
   const contact = localizedPath("/kontakt", "no");
-  const choices = liveRfbOwnerChoices(f)
+  const choices = liveRfbOwnerChoices(f, registry)
     .map((e) => `<li><strong>${esc(e.label.no)}</strong>: ${esc(e.description.no)}</li>`).join("");
   const p = f.pilot;
   const mineValgForAlle = p.mine_valg === "for_alle";
@@ -340,7 +507,7 @@ function sectionsNo(f: ForProdusenterFacts): Section[] {
         forAlle: "Når du har tatt over profilen, finner du «Mine valg» i eierportalen. Der velger du hvor aktiv du vil være, og slår enkeltvalg av og på.",
         pilot: "I «Mine valg» i eierportalen velger produsentene i piloten hvor aktive de vil være, og slår enkeltvalg av og på.",
         planlagt: "«Mine valg» er planlagt. Der skal du kunne velge hvor aktiv du vil være, og slå enkeltvalg av og på.",
-      }, choicesHtml)}${pilotInvite("mine-valg", "no", f)}`,
+      }, choicesHtml)}${demo}${pilotInvite("mine-valg", "no", f)}`,
       qa: [
         ...mineValgQa("no", p.mine_valg),
       ],
@@ -459,12 +626,12 @@ function sectionsNo(f: ForProdusenterFacts): Section[] {
   ];
 }
 
-function sectionsEn(f: ForProdusenterFacts): Section[] {
+function sectionsEn(f: ForProdusenterFacts, registry: OwnerFeatureEntry[] = OWNER_FEATURE_REGISTRY, demo = ""): Section[] {
   const tech = localizedPath("/teknologi", "en");
   const owners = localizedPath("/verifisert-av-eier", "en");
   const privacy = localizedPath("/personvern", "en");
   const contact = localizedPath("/kontakt", "en");
-  const choices = liveRfbOwnerChoices(f)
+  const choices = liveRfbOwnerChoices(f, registry)
     .map((e) => `<li><strong>${esc(e.label.en)}</strong>: ${esc(e.description.en)}</li>`).join("");
   const p = f.pilot;
   const mineValgForAlle = p.mine_valg === "for_alle";
@@ -527,7 +694,7 @@ function sectionsEn(f: ForProdusenterFacts): Section[] {
         forAlle: "Once you have taken over your profile, you find «Mine valg» (My choices) in the owner portal. There you choose how active you want to be, and switch individual choices on and off.",
         pilot: "In «Mine valg» (My choices) in the owner portal, the producers in the pilot choose how active they want to be, and switch individual choices on and off.",
         planlagt: "«Mine valg» (My choices) is planned. There you will be able to choose how active you want to be, and switch individual choices on and off.",
-      }, choicesHtml)}${pilotInvite("mine-valg", "en", f)}`,
+      }, choicesHtml)}${demo}${pilotInvite("mine-valg", "en", f)}`,
       qa: [
         ...mineValgQa("en", p.mine_valg),
       ],
@@ -646,13 +813,14 @@ function sectionsEn(f: ForProdusenterFacts): Section[] {
   ];
 }
 
-function sectionsFor(lang: Lang, facts: ForProdusenterFacts): Section[] {
-  return lang === "en" ? sectionsEn(facts) : sectionsNo(facts);
+function sectionsFor(lang: Lang, facts: ForProdusenterFacts, registry: OwnerFeatureEntry[] = OWNER_FEATURE_REGISTRY, demo = ""): Section[] {
+  return lang === "en" ? sectionsEn(facts, registry, demo) : sectionsNo(facts, registry, demo);
 }
 
 /** The one FAQPage node for the page: every section's Q/A, in page order. */
-export function buildForProdusenterFaqLd(lang: Lang, canonicalUrl: string, facts: ForProdusenterFacts = currentForProdusenterFacts()): object {
-  const pairs = sectionsFor(lang, facts).flatMap((s) => s.qa);
+export function buildForProdusenterFaqLd(lang: Lang, canonicalUrl: string, facts: ForProdusenterFacts = currentForProdusenterFacts(), registry: OwnerFeatureEntry[] = OWNER_FEATURE_REGISTRY): object {
+  // The demo (F2c-2) is not a Q/A and never goes into the JSON-LD.
+  const pairs = sectionsFor(lang, facts, registry).flatMap((s) => s.qa);
   return {
     "@context": "https://schema.org",
     "@type": "FAQPage",
@@ -821,11 +989,21 @@ export interface ForProdusenterPage {
   jsonLd: object;
 }
 
+/** Test seam for the render: the registry the page reads (default OWNER_FEATURE_REGISTRY) and the env for the demo flag. */
+export interface ForProdusenterRenderOptions {
+  registry?: OwnerFeatureEntry[];
+  env?: NodeJS.ProcessEnv;
+}
+
 /** Pure render: the page body and its FAQPage JSON-LD (visible Q/A read back from that object). */
-export function renderForProdusenterPage(lang: Lang, canonicalUrl: string, facts: ForProdusenterFacts = currentForProdusenterFacts()): ForProdusenterPage {
+export function renderForProdusenterPage(lang: Lang, canonicalUrl: string, facts: ForProdusenterFacts = currentForProdusenterFacts(), opts: ForProdusenterRenderOptions = {}): ForProdusenterPage {
   const en = lang === "en";
-  const sections = sectionsFor(lang, facts);
-  const faqLd = buildForProdusenterFaqLd(lang, canonicalUrl, facts);
+  const registry = opts.registry ?? OWNER_FEATURE_REGISTRY;
+  // F2c-2: the «Mine valg» demo, only while FOR_PRODUSENTER_DEMO_ENABLED is on
+  // ("" otherwise, so the page is byte-identical to the page without it).
+  const demo = isForProdusenterDemoEnabled(opts.env) ? renderForProdusenterDemo(en ? "en" : "no", facts, registry) : "";
+  const sections = sectionsFor(lang, facts, registry, demo);
+  const faqLd = buildForProdusenterFaqLd(lang, canonicalUrl, facts, registry);
   // AC4: the visible Q/A come from the JSON-LD object itself, in order.
   const fromLd = faqPairsFromJsonLd(faqLd);
   let at = 0;

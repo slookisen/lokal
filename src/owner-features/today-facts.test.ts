@@ -274,6 +274,9 @@ export async function runTodayFactsTests(opts: { log?: boolean } = {}): Promise<
     const onEn = render("en", v2).content;
     assertTrue(onEn.includes(`at most ${v2.orderLimits.openPerBuyer} unanswered orders`) && onEn.includes(`more than ${v2.orderLimits.producerCeilingPerDay} orders in one day`) && !onEn.includes("up to 10 orders per day"), "ORDER_CAP_V2 on: EN mirrors the T11 rule");
     assertTrue(render("en", v1).content.includes(`up to ${v1.dailyCap} orders per day`), "ORDER_CAP_V2 off: EN old rule");
+    // Daniel 09.11 removed «for å hindre misbruk» from the NO line; the EN line follows (no «misuse» on either page).
+    assertTrue(!/misuse/i.test(onEn) && onEn.includes(`One customer can have at most ${v2.orderLimits.openPerBuyer} unanswered orders`), "ORDER_CAP_V2 on: EN limit line without «To stop misuse»");
+    assertTrue(!/misbruk/i.test(on), "ORDER_CAP_V2 on: NO limit lines without «misbruk»");
   }
 
   // ── 8. AC4: JSON-LD == visible Q/A in every state ─────────────────────

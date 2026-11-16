@@ -299,7 +299,11 @@ export async function runOwnerItemsPageT15cTests(opts: { log?: boolean } = {}): 
     };
     type PageKey = "portal" | "orders" | "valg" | "varer";
     const PAGES: PageKey[] = ["portal", "orders", "valg"];
-    const noIdem = (h: string) => h.replace(/name="idem" value="[^"]*"/g, `name="idem" value="*"`);
+    // Mask the per-form idempotency key and the pickup field's min ("now" to the minute, nowOsloLocalMin);
+    // two snapshots taken across a minute boundary otherwise differ (same fix as owner-shell-t15a, lokal#1553).
+    const noIdem = (h: string) => h
+      .replace(/name="idem" value="[^"]*"/g, `name="idem" value="*"`)
+      .replace(/name="pickup_time" min="[^"]*"/g, `name="pickup_time" min="*"`);
     const get = async (p: PageKey, id: string, token: string | null = `tok-${id}`, query: Record<string, string> = p === "orders" ? { tab: "venter" } : {}) => {
       const r = await invoke(H[p], makeReq({ params: { agentId: id }, token, query }));
       return { status: r.status, html: typeof r.body === "string" ? noIdem(r.body) : JSON.stringify(r.body) };

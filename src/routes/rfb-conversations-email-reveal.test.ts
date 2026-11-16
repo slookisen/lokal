@@ -26,7 +26,7 @@
  *   U  switch on, under the limit: bodies byte-identical to switch off, plus
  *      Cache-Control: private (streams: "no-cache, private")
  *   L  switch on, over the limit: only the ✉️ line goes (📍 📞 🌐 and
- *      «Kontakt oss:» stay); an e-mail-only seller reads as the auto-reply
+ *      «Kontakt:» stay); an e-mail-only seller reads as the auto-reply
  *      without an e-mail; the address nowhere in the body; a repeat seller is
  *      free; another IP has its own budget; metadata loses the address too
  *   M  a list counts each seller once, in list order
@@ -361,7 +361,7 @@ export async function runRfbConversationsEmailRevealTests(opts: { log?: boolean 
       const s2 = storedSellerText(P[1]!.id);
       ok(r2.status === 200 && !EMAIL_LINE.test(t2) && !leaks(r2.text, P[1]!.email), "L2: over the limit → no ✉️ line, the address nowhere in the body");
       eq(t2, s2.split("\n").filter((x) => !x.startsWith("✉️")).join("\n"), "L3: over the limit → only the ✉️ line is gone (📍 📞 🌐 and «Kontakt oss:» stay)");
-      ok(t2.includes("Kontakt oss:") && t2.includes("📍") && t2.includes("📞") && t2.includes("🌐"), "L4: over the limit → the other contact lines stay");
+      ok(t2.includes("\nKontakt:\n") && t2.includes("📍") && t2.includes("📞") && t2.includes("🌐"), "L4: over the limit → the other contact lines stay");
       eq(r2.headers["cache-control"], "private", "L5: over the limit → Cache-Control: private");
       const d2 = body(r2).data; const so2 = JSON.parse(offBodies.get(`one:${P[1]!.id}`)!).data;
       eq(Object.keys(d2), Object.keys(so2), "L6: over the limit → same keys as within the limit");

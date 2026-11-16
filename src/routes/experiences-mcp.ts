@@ -119,6 +119,7 @@ import {
   // checkBookingSlotAllowed() — see that call site's own comment.
   normaliseBookingSlotInput,
 } from "../services/booking-store";
+import { producerNotifyAddressStatus } from "../services/gardssalg-booking-followup";
 // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 item 7: one
 // source for the booking note (discover_gardssalg) and the "not taking
 // requests now" line (book_gardssalg) for owned profiles that are off.
@@ -156,6 +157,7 @@ import { conversationService, buildRequestMeta, type RequestMeta } from "../serv
 import { companyFooterLineHtml } from "../services/company-legal";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 import { tagMcpToolResults } from "../middleware/ai-profile-links";
+import { aiClientFromHeaders, sourceClientLabel } from "../utils/url-utm";
 import { isAsPublicView } from "../services/agent-visibility";
 import { capName } from "../utils/free-text";
 import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
@@ -1394,7 +1396,7 @@ export function registerExperienceTools(
         openWorldHint: true,
       },
     },
-    async ({ provider_id, provider_query, requested_weekday, experience_id, slot_at, party_size, guest_name, guest_email, guest_phone, notes, confirm_outside_hours }) => {
+    async ({ provider_id, provider_query, requested_weekday, experience_id, slot_at, party_size, guest_name, guest_email, guest_phone, notes, confirm_outside_hours }, extra) => {
       // «Vis som offentlig» (dev-request 2026-10-22-opplevagent-mine-valg-
       // gardssalg, O2a) is a read-only admin view of the public surfaces: no
       // visit request is ever created inside it.
@@ -1595,7 +1597,14 @@ export function registerExperienceTools(
           // "mcp" only stamps the channel column for analytics — createBooking()
           // is the exact same function (same DB table, same confirm-token +
           // respond-token issuance) the web form calls; nothing here reimplements it.
-          booking = createBooking(parsed.data, "mcp");
+          // F1-1: which AI assistant (session identity, else this call's
+          // headers / initialize client name; the same rule as the profile-link
+          // tagging), stored only as a fixed label.
+          const sourceClient = sourceClientLabel(
+            getClientIdentity?.()
+              ?? aiClientFromHeaders((extra as ToolExtra)?.requestInfo?.headers, (server as any).server?.getClientVersion?.()?.name ?? null),
+          );
+          booking = createBooking(parsed.data, "mcp", { sourceClient });
         } catch (err: any) {
           console.error("[book_gardssalg] createBooking failed", err);
           return {
@@ -1651,6 +1660,8 @@ export function registerExperienceTools(
               provider: providerInfo,
               slot_at_local: slotLocal,
               party_size: booking.party_size,
+              // O1-1 (R11): same field as POST /api/opplevelser/book.
+              producer_notification: { status: producerNotifyAddressStatus(provider?.epost) },
               message:
                 `Produsent: ${providerInfo?.navn || parsed.data.provider_id} · Tidspunkt: ${slotLocal} · ${booking.party_size} person(er). ` +
                 `Reservasjonsforespørsel mottatt (${booking.booking_ref}) — status: PENDING/AVVENTER. ` +

@@ -341,7 +341,11 @@ export async function runRfbForProdusenterTests(opts: { log?: boolean } = {}): P
     assertTrue(!hostile.includes("<script>") && !hostile.includes("<img") && hostile.includes("&lt;script&gt;alert(1)&lt;/script&gt; &quot;q&quot; &amp; &#39;x&#39;") && hostile.includes("&lt;img src=x onerror=alert(1)&gt; «a»"), "escaping: questions and answers are HTML-escaped");
 
     // Not in F1
-    assertTrue(!/sellerFaq|faqAnchor/.test(fs.readFileSync(path.join(SRC, "owner-features/registry.ts"), "utf8")), "scope: registry has no sellerFaq/faqAnchor fields yet (later slice)");
+    // F2c-1 added faqAnchor (owner-features/faq-anchor.test.ts); F2c-2 added the
+    // sellerFaq field and the demo (rfb-for-produsenter-demo.test.ts). Seller
+    // texts need Daniel's approval, so no real entry sets one yet.
+    assertTrue(/sellerFaq\?: LocalizedText;/.test(fs.readFileSync(path.join(SRC, "owner-features/registry.ts"), "utf8")), "scope: registry declares the optional sellerFaq field (F2c-2)");
+    assertTrue(require("../owner-features/registry").OWNER_FEATURE_REGISTRY.every((e: any) => e.sellerFaq === undefined), "scope: no registry entry sets sellerFaq before Daniel has approved the text");
   } finally {
     if (prevFlag === undefined) delete process.env[FLAG]; else process.env[FLAG] = prevFlag;
   }

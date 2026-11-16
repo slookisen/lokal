@@ -198,7 +198,7 @@ export async function runOrderA2aTaskFaseB3Tests(opts: { log?: boolean } = {}): 
       const onA2a = (await callRouter(a2aRouter, "GET", "/a2a")).body;
       const onReg = JSON.parse(JSON.stringify(regMod.marketplaceRegistry.getRegistryCard("https://rettfrabonden.com")));
       const ids = (c: any) => (c?.skills || []).map((s: any) => s.id);
-      assertEq(ids(offA2a), ["discover-local-food-agents", "agent-conversation", "build-shopping-cart"], "card-01: off → GET /a2a card skills as before");
+      assertEq(ids(offA2a), ["discover-local-food-agents", "producer-profile-answer", "build-shopping-cart"], "card-01: off → GET /a2a card skills as before (agent-conversation renamed producer-profile-answer, 2026-11-13)");
       assertEq(ids(offReg), ["discover-local-food-agents", "register-food-agent", "search-compare-food"], "card-02: off → registry card skills as before");
       assertEq([offA2a.interfaces[0].methods, offReg.interfaces[0].methods], [OLD_METHODS, OLD_METHODS], "card-03: off → method lists as before");
       assertEq([ids(onA2a).includes("manage-pickup-order"), ids(onReg).includes("manage-pickup-order")], [true, true], "card-04: on → both cards carry manage-pickup-order");

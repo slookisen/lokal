@@ -20,6 +20,11 @@
  *   4. sendMcpRateLimited(): a 429 always carries a valid JSON-RPC 2.0 error
  *      body (jsonrpc/error.code/error.message/id), never a bare HTTP error
  *      page — including echoing the caller's own request id.
+ *   6. G1-2 (dev-request 2026-11-12-g1-google-klar): google-ip-ranges.ts's
+ *      CIDR matcher, and MCP_RATE_LIMIT_GOOGLE_RANGES_ENABLED — off: a Google
+ *      address is limited per IP exactly as before (AK2); on: every address
+ *      in Google's ranges counts in ONE shared bucket, while other addresses
+ *      stay per IP (AK3).
  *   5. MCP_RATE_LIMIT_PROFILES / createMcpRateLimiters(): the numbers of all
  *      three profiles, RFB's exported limiters built from the rfb profile, one
  *      chain per call (a dental chain has no side-effect limiter), and an
@@ -63,7 +68,19 @@ import {
   MCP_RATE_LIMIT_PROFILES,
   createMcpRateLimiters,
   type McpLimiterName,
+  GOOGLE_RANGES_FLAG_ENV,
+  GOOGLE_RANGES_BUCKET,
+  GOOGLE_RANGES_LIMIT_MULTIPLIER,
+  googleRangesEnabled,
+  type McpRateLimitProfile,
 } from "./mcp-rate-limit";
+import {
+  ipInCidr,
+  isGoogleMcpIp,
+  GOOGLE_MCP_CIDRS,
+  GOOGLE_CONNECTED_APPS_CIDRS,
+  GOOGLE_USER_TRIGGERED_AGENTS_CIDRS,
+} from "./google-ip-ranges";
 
 export interface TestSummary {
   passed: number;
@@ -612,6 +629,188 @@ export async function runMcpRateLimitTests(opts: { log?: boolean } = {}): Promis
     } finally {
       await close();
     }
+  }
+
+  // ── G1-2: CIDR matcher (google-ip-ranges.ts) ──────────────────────────
+  {
+    const cases: Array<[string, string, boolean]> = [
+      ["74.125.232.0", "74.125.232.0/24", true],
+      ["74.125.232.255", "74.125.232.0/24", true],
+      ["74.125.231.255", "74.125.232.0/24", false],
+      ["74.125.233.0", "74.125.232.0/24", false],
+      ["108.177.79.255", "108.177.64.0/20", true],
+      ["108.177.80.0", "108.177.64.0/20", false],
+      ["10.0.0.1", "0.0.0.0/0", true],
+      ["10.0.0.1", "10.0.0.1/32", true],
+      ["10.0.0.2", "10.0.0.1/32", false],
+      ["::ffff:74.125.232.17", "74.125.232.0/24", true],
+      ["::FFFF:74.125.232.17", "74.125.232.0/24", true],
+      ["::ffff:4a7d:e811", "74.125.232.0/24", true],
+      ["::ffff:74.125.233.1", "74.125.232.0/24", false],
+      ["2001:4860:c::", "2001:4860:c::/124", true],
+      ["2001:4860:c::f", "2001:4860:c::/124", true],
+      ["2001:4860:c::10", "2001:4860:c::/124", false],
+      ["2001:4860:000c:0000:0000:0000:0000:0007", "2001:4860:c::/124", true],
+      ["2001:4860:c::7", "2001:4860::/32", true],
+      ["2001:4861::1", "2001:4860::/32", false],
+      ["74.125.232.17", "2001:4860::/32", false],
+      ["2001:4860:c::7", "74.125.232.0/24", false],
+      ["", "74.125.232.0/24", false],
+      ["not-an-ip", "74.125.232.0/24", false],
+      ["74.125.232", "74.125.232.0/24", false],
+      ["74.125.232.300", "74.125.232.0/24", false],
+      ["74.125.232.1 ", "74.125.232.0/24", true],
+      ["fe80::1%eth0", "fe80::/10", false],
+      ["74.125.232.1", "74.125.232.0", false],
+      ["74.125.232.1", "74.125.232.0/33", false],
+      ["74.125.232.1", "74.125.232.0/x", false],
+      ["74.125.232.1", "garbage/24", false],
+      ["2001:4860:c::7", "2001:4860:c::/129", false],
+    ];
+    for (const [ip, cidr, want] of cases) {
+      assertEq(ipInCidr(ip, cidr), want, `ipInCidr(${JSON.stringify(ip)}, ${cidr}) → ${want}`);
+    }
+    assertEq(ipInCidr(undefined as any, "74.125.232.0/24"), false, "ipInCidr: undefined → false");
+    assertEq(ipInCidr(123 as any, "74.125.232.0/24"), false, "ipInCidr: a number → false");
+
+    assertEq(GOOGLE_CONNECTED_APPS_CIDRS.length, 7, "google ranges: the 7 connected-apps CIDR blocks Google lists");
+    assertEq(GOOGLE_USER_TRIGGERED_AGENTS_CIDRS.length, 20, "google ranges: all 20 prefixes of user-triggered-agents.json");
+    assertTrue(GOOGLE_MCP_CIDRS.every((c) => ipInCidr(c.split("/")[0], c)), "google ranges: every listed CIDR parses and contains its own network address");
+    assertEq(
+      ["74.125.232.5", "::ffff:74.125.232.5", "136.122.1.1", "192.179.15.255", "2001:4860:c::75", "203.0.113.5", "127.0.0.1", "2001:4860:c::80", "", "x"].map((ip) => isGoogleMcpIp(ip)),
+      [true, true, true, true, true, false, false, false, false, false],
+      "isGoogleMcpIp: in-range IPv4 / mapped / IPv6 → true; outside, loopback, empty and garbage → false"
+    );
+    assertEq([isGoogleMcpIp(undefined), isGoogleMcpIp(null)], [false, false], "isGoogleMcpIp: undefined / null → false");
+  }
+
+  // ── G1-2: MCP_RATE_LIMIT_GOOGLE_RANGES_ENABLED (AK2 off, AK3 on) ───────
+  {
+    const prevFlag = process.env[GOOGLE_RANGES_FLAG_ENV];
+    const setFlag = (v: string | undefined) => {
+      if (v === undefined) delete process.env[GOOGLE_RANGES_FLAG_ENV];
+      else process.env[GOOGLE_RANGES_FLAG_ENV] = v;
+    };
+    const GOOGLE_A = "74.125.232.5";
+    const GOOGLE_B = "136.122.1.1";
+    const GOOGLE_V6 = "2001:4860:c::21";
+    const OTHER = "203.0.113.5";
+
+    // Only the exact string "true" turns it on.
+    try {
+      const seen = [undefined, "", "1", "TRUE", "yes", " true", "true"].map((v) => {
+        setFlag(v);
+        return googleRangesEnabled();
+      });
+      assertEq(seen, [false, false, false, false, false, false, true], "google flag: only the exact string \"true\" turns it on (default off)");
+
+      // Keys, flag off: exactly today's per-IP keys.
+      setFlag(undefined);
+      assertEq(mcpIpKey(fakeReq({ ip: GOOGLE_A })), GOOGLE_A, "AK2 keys: flag off — a Google address keeps its own IP key (brake / book_gardssalg)");
+      assertEq(mcpPrimaryKey(fakeReq({ ip: GOOGLE_A })), `ip:${GOOGLE_A}`, "AK2 keys: flag off — primary falls back to the Google address's own IP key");
+      assertEq(
+        mcpCartToolKey({ ip: GOOGLE_A, body: { method: "tools/call", params: { name: "lokal_cart_submit", arguments: { buyer_ref: "b1" } } } } as any),
+        `${GOOGLE_A}:b1`,
+        "AK2 keys: flag off — cart key is ip:buyer_ref as before"
+      );
+
+      // Keys, flag on.
+      setFlag("true");
+      assertEq(
+        [mcpIpKey(fakeReq({ ip: GOOGLE_A })), mcpIpKey(fakeReq({ ip: GOOGLE_B })), mcpIpKey(fakeReq({ ip: GOOGLE_V6 })), mcpIpKey(fakeReq({ ip: `::ffff:${GOOGLE_A}` }))],
+        [GOOGLE_RANGES_BUCKET, GOOGLE_RANGES_BUCKET, GOOGLE_RANGES_BUCKET, GOOGLE_RANGES_BUCKET],
+        "AK3 keys: flag on — every Google address (IPv4, IPv6, IPv4-mapped) shares the one Google key"
+      );
+      assertEq(mcpIpKey(fakeReq({ ip: OTHER })), OTHER, "AK3 keys: flag on — a non-Google address keeps its own IP key");
+      assertEq(mcpPrimaryKey(fakeReq({ ip: GOOGLE_B })), `ip:${GOOGLE_RANGES_BUCKET}`, "AK3 keys: flag on — primary's IP fallback is the Google bucket");
+      const sid = randomUUID();
+      assertEq(mcpPrimaryKey(fakeReq({ ip: GOOGLE_B, sid })), `sid:${sid}`, "AK3 keys: flag on — a session from a Google address still keys on the session");
+      assertEq(mcpPrimaryKey(fakeReq({ ip: GOOGLE_B, consumerKeyId: 42 })), "key:42", "AK3 keys: flag on — a recognized key from a Google address still keys on the key");
+      assertEq(
+        mcpCartToolKey({ ip: GOOGLE_A, body: { method: "tools/call", params: { name: "lokal_cart_submit", arguments: { buyer_ref: "b1" } } } } as any),
+        `${GOOGLE_RANGES_BUCKET}:b1`,
+        "AK3 keys: flag on — cart key is google-ranges:buyer_ref"
+      );
+    } finally {
+      setFlag(prevFlag);
+    }
+
+    // Behavioural: a small profile on injected stores; client IP set via
+    // X-Forwarded-For with `trust proxy` on, as in production.
+    const smallProfile = (stores: Partial<Record<McpLimiterName, MemoryStore>>): McpRateLimitProfile => ({
+      brake: { windowMs: 60_000, max: 1000 },
+      primary: { windowMs: 60_000, anonymousMax: 3, keyedMax: 3 },
+      sideEffect: { windowMs: 60_000, max: 2, tools: new Set(["book_gardssalg"]), keyGenerator: mcpIpKey },
+      createStore: (limiter) => (stores[limiter] = new MemoryStore()),
+    });
+    const runWith = async (
+      flag: string | undefined,
+      fn: (call: (ip: string, id: number, tool?: string) => ReturnType<typeof postJson>, stores: Partial<Record<McpLimiterName, MemoryStore>>) => Promise<void>
+    ) => {
+      setFlag(flag);
+      const stores: Partial<Record<McpLimiterName, MemoryStore>> = {};
+      const app = express();
+      app.set("trust proxy", true);
+      app.use(express.json());
+      app.use("/mcp", createMcpRateLimiters(smallProfile(stores)).chain);
+      app.post("/mcp", ok);
+      const { port, close } = await startServer(app);
+      try {
+        const call = (ip: string, id: number, tool = "discover_experiences") =>
+          postJson(port, "/mcp", JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name: tool, arguments: {} } }), {
+            "Content-Type": "application/json",
+            "X-Forwarded-For": ip,
+          });
+        await fn(call, stores);
+      } finally {
+        await close();
+        setFlag(prevFlag);
+      }
+    };
+
+    // AK2: flag off — a Google address is limited per IP, exactly as today.
+    await runWith(undefined, async (call, stores) => {
+      const a = [];
+      for (let i = 1; i <= 4; i++) a.push((await call(GOOGLE_A, i)).status);
+      assertEq(a, [200, 200, 200, 429], "AK2: flag off — the 4th call from one Google address is over ITS per-IP primary quota (3)");
+      const b = await call(GOOGLE_B, 5);
+      assertEq(b.status, 200, "AK2: flag off — another Google address has its own, fresh per-IP bucket");
+      assertEq([b.headers["ratelimit-limit"], b.headers["ratelimit-remaining"]], ["3", "2"], "AK2: flag off — per-IP limit headers unchanged (limit 3)");
+      assertEq((await stores.primary!.get(`ip:${GOOGLE_A}`))?.totalHits, 4, "AK2: flag off — counted under the Google address's own ip: key");
+      assertEq(await stores.primary!.get(`ip:${GOOGLE_RANGES_BUCKET}`), undefined, "AK2: flag off — the Google bucket is never used");
+    });
+
+    // AK3: flag on — Google addresses share one bucket; others stay per IP.
+    await runWith("true", async (call, stores) => {
+      const sharedLimit = String(3 * GOOGLE_RANGES_LIMIT_MULTIPLIER);
+      const a = await call(GOOGLE_A, 1);
+      const b = await call(GOOGLE_B, 2);
+      const c = await call(GOOGLE_V6, 3);
+      assertEq([a.status, b.status, c.status], [200, 200, 200], "AK3: flag on — calls from three Google addresses pass");
+      assertEq(
+        [a.headers["ratelimit-limit"], a.headers["ratelimit-remaining"], b.headers["ratelimit-remaining"], c.headers["ratelimit-remaining"]],
+        [sharedLimit, String(3 * GOOGLE_RANGES_LIMIT_MULTIPLIER - 1), String(3 * GOOGLE_RANGES_LIMIT_MULTIPLIER - 2), String(3 * GOOGLE_RANGES_LIMIT_MULTIPLIER - 3)],
+        "AK3: flag on — two different Google IPv4 addresses and one IPv6 count down ONE shared counter, with its own limit (3 × multiplier)"
+      );
+      assertEq((await stores.primary!.get(`ip:${GOOGLE_RANGES_BUCKET}`))?.totalHits, 3, "AK3: flag on — the primary counted all three in the Google bucket");
+      assertEq((await stores.brake!.get(GOOGLE_RANGES_BUCKET))?.totalHits, 3, "AK3: flag on — so did the brake");
+      assertEq(
+        [await stores.primary!.get(`ip:${GOOGLE_A}`), await stores.primary!.get(`ip:${GOOGLE_B}`), await stores.brake!.get(GOOGLE_A)],
+        [undefined, undefined, undefined],
+        "AK3: flag on — nothing counted against the Google addresses' per-IP buckets"
+      );
+
+      const o = [];
+      for (let i = 1; i <= 4; i++) o.push((await call(OTHER, 10 + i)).status);
+      assertEq(o, [200, 200, 200, 429], "AK3: flag on — a non-Google address is still limited per IP (3)");
+      const g = await call(GOOGLE_A, 20);
+      assertEq(g.status, 200, "AK3: flag on — the non-Google burst never touched the Google bucket");
+
+      const se = [];
+      for (let i = 1; i <= 3; i++) se.push((await call(GOOGLE_B, 30 + i, "book_gardssalg")).status);
+      assertEq(se, [200, 200, 200], "AK3: flag on — the side-effect quota for the Google bucket is 2 × multiplier, not 2");
+      assertEq((await stores.sideEffect!.get(GOOGLE_RANGES_BUCKET))?.totalHits, 3, "AK3: flag on — side-effect calls counted in the Google bucket");
+    });
   }
 
   // ── Source guard: the limiters the profiles mirror, and RFB's mount ─────

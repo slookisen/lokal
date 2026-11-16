@@ -60,6 +60,7 @@ import {
   OUTREACH_MAX_TOUCH_VERN_DEFAULT_ENABLED,
   OUTREACH_MAX_TOUCH_VERN_DEFAULT_THRESHOLD,
 } from "../services/outreach-max-touch-vern";
+import { loadRfbPromiseGivenEmails } from "../services/rfb-outreach-promise";
 
 import { isCategoryWord } from "./seo";
 import { CATEGORY_LABEL_NO } from "./admin-knowledge";
@@ -763,6 +764,9 @@ export function computeOutreachCandidates(
     // recipient-policy counter (lokal#997 key; malformed addresses only since 2026-10-08)
     let personalAddressCount = 0;
     let genericProductsOnlyCount = 0;
+    // dev-request 2026-11-15-rfb-utsending-loftesetning-holdes (mode=second only)
+    let promiseGivenCount = 0;
+    const promiseGivenEmails = mode === "second" ? loadRfbPromiseGivenEmails(db) : null;
     const maxTouchSuppressedList: Array<{
       agent_id: string;
       email: string;
@@ -901,6 +905,10 @@ export function computeOutreachCandidates(
       // dev-request 2026-10-08-outreach-sperre-generiske-produkter: every
       // product is a bare category name → the profile shows obvious errors.
       const suppressedForGenericProducts = productsAreGenericCategoryNames(row.products);
+      // dev-request 2026-11-15-rfb-utsending-loftesetning-holdes: this address
+      // got a template that promises not to write again (services/rfb-outreach-promise.ts).
+      const suppressedForPromiseGiven =
+        promiseGivenEmails !== null && promiseGivenEmails.has(row.email.trim().toLowerCase());
 
       if (suppressedForContacted) contactedOrCooldownCount++;
       if (suppressedForReplied) repliedCount++;
@@ -915,6 +923,7 @@ export function computeOutreachCandidates(
       if (suppressedForMaxTouch) maxTouchSuppressedCount++;
       if (suppressedForPersonalAddress) personalAddressCount++;
       if (suppressedForGenericProducts) genericProductsOnlyCount++;
+      if (suppressedForPromiseGiven) promiseGivenCount++;
 
       if (suppressedForGenericProducts || suppressedForCategoriesNotCorroborated) {
         const otherReason =
@@ -929,6 +938,7 @@ export function computeOutreachCandidates(
           suppressedForRecentCrmSend ||
           suppressedForCrossPlatform ||
           suppressedForMaxTouch ||
+          suppressedForPromiseGiven ||
           suppressedForPersonalAddress;
         if (!otherReason) {
           const reasons: string[] = [];
@@ -951,6 +961,7 @@ export function computeOutreachCandidates(
         !suppressedForRecentCrmSend &&
         !suppressedForCrossPlatform &&
         !suppressedForMaxTouch &&
+        !suppressedForPromiseGiven &&
         !suppressedForPersonalAddress &&
         !suppressedForGenericProducts
       ) {
@@ -1095,6 +1106,8 @@ export function computeOutreachCandidates(
         recent_crm_send_email_match: recentCrmSendCount,
         // dev-request 2026-08-29-outreach-max-touch-vern
         max_touch_suppressed: maxTouchSuppressedCount,
+        // dev-request 2026-11-15-rfb-utsending-loftesetning-holdes (mode=second; 0 in mode=first)
+        promise_given: promiseGivenCount,
         // steg 4 / 4e: skipped because ANOTHER platform mailed this address
         // inside the window. Overlaps with contacted_or_cooldown in mode=second
         // (where lastSentFor already reads every vertical) — the counters are

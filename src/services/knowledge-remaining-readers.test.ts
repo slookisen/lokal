@@ -298,8 +298,10 @@ export async function runKnowledgeRemainingReadersTests(opts: { log?: boolean } 
     await section("auto-reply: well-formed data", async () => {
       const reply = noThrow(() => conversationService.generateSellerResponse(WELL_FORMED), "auto-reply: well-formed, no query");
       assertEq(reply?.text, [
-        "Hei fra Byneset Gård Fixture! 👋",
-        "Her er det vi tilbyr (4 produkter):",
+        // dev-request 2026-11-06-rfb-svar-til-kjoperagenter-tredje-person:
+        // the platform's marker and the third person, not the producer's name.
+        "Automatisk svar fra Rett fra Bonden.",
+        "Ifølge profilen til Byneset Gård Fixture tilbyr de (4 produkter):",
         "",
         "**LAM**",
         "• Lammelår — kr 275/kg",
@@ -312,7 +314,7 @@ export async function runKnowledgeRemainingReadersTests(opts: { log?: boolean } 
         // Slice I-O: the season note «Kun i sesong» is shown with its times (main left it out).
         "🕐 Åpningstider: Man 10:00–17:00, Lør 10:00–14:00 (Kun i sesong), Lørdag i sesong 11:00–15:00",
         "",
-        "Kontakt oss:",
+        "Kontakt:",
         "📍 Bynesvegen 1, 7070 Trondheim",
         "📞 91234567",
         `✉️ post@${WELL_FORMED}.example.no`,
@@ -321,20 +323,20 @@ export async function runKnowledgeRemainingReadersTests(opts: { log?: boolean } 
         "💳 Betaling: Vipps, Kontant",
         "✅ Nyt Norge",
         "",
-        "🔗 Se profilen vår: https://rettfrabonden.com/produsent/byneset-gard-fixture",
+        "🔗 Se profilen til Byneset Gård Fixture: https://rettfrabonden.com/produsent/byneset-gard-fixture",
         "",
-        "Ta gjerne kontakt for spørsmål eller bestilling!",
-      ].join("\n"), "auto-reply: well-formed data gives the same text as before (golden from main; I-O: the season note)");
+        "Ta kontakt med Byneset Gård Fixture direkte for spørsmål eller bestilling.",
+      ].join("\n"), "auto-reply: well-formed data gives the same text as before (golden from main; I-O: the season note; third person since 2026-11-13)");
       assertEq(reply?.type, "offer", "auto-reply: well-formed products make an offer, as before");
 
       const matched = noThrow(() => conversationService.generateSellerResponse(WELL_FORMED, "honning og lam"),
         "auto-reply: well-formed, with a query");
       assertEq(matched?.text.split("\n").slice(0, 4), [
-        "Hei fra Byneset Gård Fixture! 👋",
-        "Vi har det du leter etter:",
+        "Automatisk svar fra Rett fra Bonden.",
+        "Ifølge profilen til Byneset Gård Fixture har de dette som passer søket:",
         "• Lammelår — kr 275/kg",
         "• Lammeskank — 189/kg",
-      ], "auto-reply: a query lists the matching products as before (golden from main)");
+      ], "auto-reply: a query lists the matching products as before (golden from main; third person since 2026-11-13)");
       assertEq(matched?.metadata.products.map((p: any) => p.name),
         ["Lammelår – kr 275/kg", "Lammeskank", "Honning"],
         "auto-reply: the matched products in the metadata are the same as before (golden from main)");

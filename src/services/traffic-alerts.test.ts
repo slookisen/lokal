@@ -6,8 +6,11 @@
  * Standalone: npx tsx src/services/traffic-alerts.test.ts
  */
 
-import { computeTrafficAlerts, type DailyTrafficPoint } from "./traffic-alerts";
-import { addDays } from "./traffic-history-compute";
+import Database from "better-sqlite3";
+import * as initMod from "../database/init";
+import { computeTrafficAlerts, computeTrafficAlertsFromDb, type DailyTrafficPoint } from "./traffic-alerts";
+import { addDays, computeHistorySummary, dayMs, planHistoryItems, TRAFFIC_HISTORY_VERSION } from "./traffic-history-compute";
+import { readStoredHistoryRows, writeHistorySummary } from "./traffic-history";
 
 export interface TestSummary {
   passed: number;
@@ -66,6 +69,42 @@ export function runTrafficAlertsTests(opts: { log?: boolean } = {}): TestSummary
   // Replay of the dental page-view drop 2026-10-16 report: 8,637 -> 2,102 (-75.7%).
   const replay = computeTrafficAlerts("dental", series(8637, 2102));
   check("dental replay 8637 -> 2102 is a high-severity fall", replay.length === 1 && replay[0].severity === "high" && replay[0].direction === "fall" && replay[0].delta === -0.757);
+
+  // AC3 of the burst rule (2026-11-15): history days stored at version 5 (before
+  // the rule), the next day computed at version 6 → the compared window spans
+  // the classifier change, so the human fall it causes is flagged.
+  {
+    check("burst rule bumps TRAFFIC_HISTORY_VERSION to 6", TRAFFIC_HISTORY_VERSION === 6);
+    const db = new Database(":memory:");
+    initMod.__initSchemaForTesting(db as any);
+    const ins = db.prepare("INSERT INTO traffic_history (period, period_start, period_end, vertical, version, partial_from, summary) VALUES ('day', ?, ?, 'rfb', 5, NULL, ?)");
+    // 2026-10-07..2026-10-15 stored at version 5; 2026-10-15 still has its raw rows.
+    for (let i = 0; i < 9; i++) {
+      const day = addDays("2026-10-07", i);
+      const t = (views: number) => ({ views, visitors: 0, visits: 0 });
+      ins.run(day, addDays(day, 1), JSON.stringify({ period: "day", start: day, end: addDays(day, 1), vertical: "rfb", version: 5,
+        groups: { human: t(1000), ai_search: t(0), ai_crawler: t(0), bot: t(0), dev: t(0) } }));
+    }
+    // Raw rows of 2026-10-15 only (earlier days pruned): 400 people with one
+    // view each and one browser-UA burst of 600 views within a minute.
+    const pv = db.prepare("INSERT INTO analytics_page_views (path, session_id, is_owner, status_code, vertical_id, created_at, client_class) VALUES (?, ?, 0, 200, 'rfb', ?, 'human')");
+    const at = (ms: number) => new Date(ms).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+    const d0 = dayMs("2026-10-15");
+    for (let i = 0; i < 400; i++) pv.run("/", `ip${i}:desktop:h${i}`, at(d0 + 3600_000 + i * 60_000));
+    for (let i = 0; i < 600; i++) pv.run(`/produsent/b${i % 50}`, "ipBurst:desktop:bbbb", at(d0 + 2 * 3600_000 + (i % 50) * 1000));
+    const nowMs = dayMs("2026-10-16") + 3600_000;
+    const plan = planHistoryItems(db as any, readStoredHistoryRows(db as any), nowMs).filter((x) => x.period === "day" && x.vertical === "rfb");
+    check("a version-5 day whose raw rows still exist is planned for recompute; pruned days are kept as stored",
+      plan.length === 1 && plan[0].start === "2026-10-15");
+    const summary = computeHistorySummary(db as any, plan[0], nowMs);
+    writeHistorySummary(db as any, summary);
+    check("the recomputed day carries version 6 and moves the burst to scraper, total unchanged",
+      summary.version === 6 && summary.groups.human.views === 400 && summary.classes.scraper.views === 600 && summary.totals.views === 1000);
+    const alerts = computeTrafficAlertsFromDb(db as any, "rfb", nowMs).filter((a) => a.vertical === "rfb" && a.group === "human");
+    check("version 5 -> 6 across the break flags classifierChange on the human fall it causes",
+      alerts.length === 1 && alerts[0].direction === "fall" && alerts[0].classifierChange === true);
+    db.close();
+  }
 
   return { passed, failed: failures.length, failures };
 }

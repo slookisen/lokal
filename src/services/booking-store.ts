@@ -16,6 +16,24 @@ import { getDb } from "../database/db-factory";
 import { emailService } from "./email-service";
 import { crmFromHeader } from "./crm-platform-identity";
 import { tokenLogLabel } from "../utils/log-label";
+import { isSourceClientLabel } from "../utils/url-utm";
+import {
+  awaitingExpiryDueMs,
+  previsitReminderDue,
+  recordProducerNotifyOutcome,
+  followupClockFloorMs,
+  isLegacyPreFloorRow,
+  stampMs,
+  type ProducerNotifyOutcome,
+} from "./gardssalg-booking-followup";
+import {
+  honestReceiptEnabled,
+  buildHonestReceiptEmail,
+  buildConfirmedIcs,
+  loadReceiptProvider,
+  oa1Text,
+  CONFIRMED_ICS_CONTENT_TYPE,
+} from "./gardssalg-honest-receipt";
 
 const VERTICAL = "experiences";
 const APP_URL = process.env.APP_URL || "https://opplevagent.no";
@@ -159,6 +177,13 @@ export interface GardssalgBooking {
    * any public booking payload. 0 for every existing and normal booking.
    */
   is_test: number;
+  // O1-1 (R1/R11): the registered producer notification. The followup
+  // clock starts at notify_sent_at; NULL = never reminded or expired.
+  notify_sent_at: string | null;
+  notify_failed_at: string | null;
+  notify_retried_at: string | null;
+  /** F1-1: AI assistant label (SOURCE_CLIENT_LABELS) or null. */
+  source_client: string | null;
 }
 
 export const BookingInputSchema = z.object({
@@ -251,6 +276,10 @@ function hydrate(row: Record<string, unknown>): GardssalgBooking {
     expired_guest_notified_at:(row.expired_guest_notified_at as string | null) ?? null,
     // Legacy rows predate the column; absent -> 0 (a real, non-test booking).
     is_test:                  Number(row.is_test ?? 0) === 1 ? 1 : 0,
+    notify_sent_at:           (row.notify_sent_at as string | null) ?? null,
+    notify_failed_at:         (row.notify_failed_at as string | null) ?? null,
+    notify_retried_at:        (row.notify_retried_at as string | null) ?? null,
+    source_client:            (row.source_client as string | null) ?? null,
   };
 }
 
@@ -270,10 +299,15 @@ function hydrate(row: Record<string, unknown>): GardssalgBooking {
 // tool) parse their untrusted payload with, and zod strips unknown keys — so
 // there is no field name a public caller could smuggle to reach this. Only an
 // admin-gated call site passes it.
+//
+// `opts.sourceClient` (dev-request 2026-11-12-f1, F1-1) is the AI assistant
+// the booking came from, set by the MCP tool and by the REST route for an
+// ai_search caller. Only a value in SOURCE_CLIENT_LABELS is stored; anything
+// else (and the web form, which never passes it) is stored as NULL.
 export function createBooking(
   input: BookingInput,
   source: string = "opplevagent",
-  opts: { isTest?: boolean } = {},
+  opts: { isTest?: boolean; sourceClient?: string | null } = {},
 ): GardssalgBooking {
   const db = getDb(VERTICAL);
 
@@ -321,6 +355,10 @@ export function createBooking(
     reminder_sent_at:         null,
     expired_guest_notified_at: null,
     is_test:                  opts.isTest === true ? 1 : 0,
+    notify_sent_at:           null,
+    notify_failed_at:         null,
+    notify_retried_at:        null,
+    source_client:            isSourceClientLabel(opts.sourceClient) ? opts.sourceClient : null,
   };
 
   db.prepare(`
@@ -329,13 +367,13 @@ export function createBooking(
       guest_name, guest_email, guest_phone, booking_ref, confirm_token,
       source, status, commission_rate, notes, created_at,
       pre_status, respond_token, respond_token_expires_at, guest_status_token,
-      is_test
+      is_test, source_client
     ) VALUES (
       @booking_id, @experience_id, @provider_id, @slot_at, @party_size,
       @guest_name, @guest_email, @guest_phone, @booking_ref, @confirm_token,
       @source, @status, @commission_rate, @notes, @created_at,
       @pre_status, @respond_token, @respond_token_expires_at, @guest_status_token,
-      @is_test
+      @is_test, @source_client
     )
   `).run(booking);
 
@@ -511,6 +549,14 @@ export function buildIcs(booking: GardssalgBooking): string {
 }
 
 export async function sendBookingConfirmation(booking: GardssalgBooking): Promise<void> {
+  // O1-2 (R3/G13): with GARDSSALG_HONEST_RECEIPT_ENABLED the guest gets a
+  // receipt that says "received, not confirmed" and NO calendar file (that
+  // goes with the producer's confirmation). Flag off: the legacy mail below.
+  if (honestReceiptEnabled()) {
+    await sendHonestReceipt(booking);
+    return;
+  }
+
   const confirmUrl = `${APP_URL}/kategori/gardssalg/bekreft/${booking.confirm_token}`;
   const ics = buildIcs(booking);
 
@@ -571,6 +617,27 @@ ${statusUrl ? `<p>Du kan når som helst se gjeldende status her: <a href="${stat
   console.log(`[booking] ${booking.booking_ref} confirm link sent (token ${tokenLogLabel(booking.confirm_token)})`);
 }
 
+// O1-2: the honest receipt (text package OA-1 §1.2), never the legacy one
+// with the flag on. The provider row is read before the first await.
+async function sendHonestReceipt(booking: GardssalgBooking): Promise<void> {
+  const provider = loadReceiptProvider(booking.provider_id);
+  const mail = buildHonestReceiptEmail(
+    booking,
+    { producerName: provider.navn, statusUrl: guestStatusUrl(booking) },
+    "nb",
+  );
+  await emailService.sendEmail({
+    to: booking.guest_email,
+    subject: mail.subject,
+    htmlContent: mail.htmlContent,
+    textContent: mail.textContent,
+    replyTo: `kontakt@opplevagent.no`,
+    from: crmFromHeader("experiences"),
+    isTestSend: booking.is_test === 1,
+  });
+  console.log(`[booking] ${booking.booking_ref} honest guest receipt sent`);
+}
+
 // ─── Producer notification email (dev-request 2026-07-12-gardssalg-dark-
 // launch-stop, slice 0, point 5) ────────────────────────────────────────────
 // Forward-looking wiring for once a producer is actually onboarded: when
@@ -596,12 +663,24 @@ export async function sendProducerNotification(
   // and additive: every existing caller that doesn't pass it keeps behaving
   // exactly as before.
   openingHoursText?: string | null,
-): Promise<void> {
-  if (!producerEmail) {
+  // O1-1 (R11): `retry` = the followup job's single re-send of a failed
+  // first send. The outcome is stamped on the row (notify_sent_at /
+  // notify_failed_at) and a failure or a missing address alerts the admin
+  // (recordProducerNotifyOutcome). Never throws, so the call sites stay
+  // fire-and-forget.
+  opts: { retry?: boolean } = {},
+): Promise<ProducerNotifyOutcome> {
+  // Resolve the DB handle NOW (same tick as the caller): the send resolves
+  // later, and a late getDb() could open a different database.
+  const db = getDb(VERTICAL);
+  const record = (outcome: ProducerNotifyOutcome, reason?: string) =>
+    recordProducerNotifyOutcome(db, booking, outcome, { retry: opts.retry, reason });
+  if (!producerEmail || !producerEmail.trim()) {
     console.error(
       `[booking] producer notification SKIPPED — no epost on file for provider ${booking.provider_id} (booking ${booking.booking_ref})`,
     );
-    return;
+    await record("not_live");
+    return "not_live";
   }
 
   const slotFormatted = new Date(booking.slot_at).toLocaleString("nb-NO", {
@@ -663,21 +742,36 @@ Lenkene er personlige for denne reservasjonen — ikke del dem videre.</p>
 
   const textContent = `Hei,\n\nDu har fått en ny reservasjonsforespørsel via Opplevagent.\nBookingref: ${booking.booking_ref}\nDato/tid: ${slotFormatted}\nAntall: ${booking.party_size}\nGjest: ${booking.guest_name} (${booking.guest_email}${booking.guest_phone ? ", " + booking.guest_phone : ""})${booking.notes ? `\nKommentar fra gjesten: ${booking.notes}` : ""}${hoursRaw ? `\nDine oppgitte åpningstider: ${hoursRaw}` : ""}\n${respondUrl ? `\nSvar på forespørselen (bekreft / foreslå nytt tidspunkt / avslå):\n${respondUrl}${deadlineFormatted ? `\nSvarfrist: ${deadlineFormatted} — uten svar innen fristen utløper forespørselen automatisk og gjesten får beskjed.` : ""}\n` : ""}\nEtter besøket: bekreft oppmøte her (personlig lenke, ikke del videre):\n${confirmUrl}\n\nHilsen\nOpplevagent`;
 
-  await emailService.sendEmail({
-    to: producerEmail,
-    subject: `Ny reservasjon — ${booking.booking_ref}`,
-    htmlContent,
-    textContent,
-    replyTo: `kontakt@opplevagent.no`,
-    // Steg 3 / funn 2: this mail carries Opplevagent content, so it must READ
-    // as Opplevagent in the inbox list. The address stays rettfrabonden.com —
-    // Resend verifies one domain — so the display name is what carries it.
-    from: crmFromHeader("experiences"),
-    // The PRODUCER email is the one carrying the actionable respond/confirm
-    // tokens — redirecting only the guest receipt would still hit a real
-    // producer with a test. See services/send-guard.ts.
-    isTestSend: booking.is_test === 1,
-  });
+  let sendResult: { success?: boolean; error?: string } | void;
+  try {
+    sendResult = await emailService.sendEmail({
+      to: producerEmail,
+      subject: `Ny reservasjon — ${booking.booking_ref}`,
+      htmlContent,
+      textContent,
+      replyTo: `kontakt@opplevagent.no`,
+      // Steg 3 / funn 2: this mail carries Opplevagent content, so it must READ
+      // as Opplevagent in the inbox list. The address stays rettfrabonden.com —
+      // Resend verifies one domain — so the display name is what carries it.
+      from: crmFromHeader("experiences"),
+      // The PRODUCER email is the one carrying the actionable respond/confirm
+      // tokens — redirecting only the guest receipt would still hit a real
+      // producer with a test. See services/send-guard.ts.
+      isTestSend: booking.is_test === 1,
+    });
+  } catch (err) {
+    console.error(`[booking] producer notification FAILED for ${booking.booking_ref}:`, err);
+    await record("failed", String((err as Error)?.message || err));
+    return "failed";
+  }
+  // emailService reports a transport failure as { success: false }.
+  if (sendResult && sendResult.success === false) {
+    console.error(`[booking] producer notification FAILED for ${booking.booking_ref}: ${sendResult.error || "unknown error"}`);
+    await record("failed", String(sendResult.error || "unknown error"));
+    return "failed";
+  }
+  await record("sent");
+  return "sent";
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1040,6 +1134,25 @@ export async function sendPrevisitConfirmedToGuest(
   const lead = acceptedSuggestion
     ? "Du har akseptert det nye tidspunktet — reservasjonen er nå bekreftet:"
     : "Gode nyheter — produsenten har bekreftet reservasjonen din:";
+  // O1-2 (R4): with GARDSSALG_HONEST_RECEIPT_ENABLED the calendar file comes
+  // HERE — on the producer's confirmation, and as a new file when the guest
+  // accepted a new time — with the producer's address as LOCATION. Flag off:
+  // icsLine is "" and no attachment, so the mail is byte-identical to before.
+  let icsLine = "";
+  let icsAttachment: { filename: string; content: string; contentType: string } | null = null;
+  if (honestReceiptEnabled()) {
+    const provider = loadReceiptProvider(booking.provider_id);
+    icsLine = oa1Text(acceptedSuggestion ? "confirmed.newTimeIcsLine" : "confirmed.icsLine", "nb");
+    icsAttachment = {
+      filename: `gardssalg-${booking.booking_ref}.ics`,
+      content: buildConfirmedIcs(
+        booking,
+        { producerName: provider.navn, sted: provider.sted, statusUrl: guestStatusUrl(booking) },
+        "nb",
+      ),
+      contentType: CONFIRMED_ICS_CONTENT_TYPE,
+    };
+  }
   await emailService.sendEmail({
     to: booking.guest_email,
     isTestSend: booking.is_test === 1,
@@ -1051,16 +1164,17 @@ export async function sendPrevisitConfirmedToGuest(
   <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Bookingref:</td><td>${booking.booking_ref}</td></tr>
   <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Dato/tid:</td><td>${slotFormatted}</td></tr>
   <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Antall:</td><td>${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</td></tr>
-</table>
+</table>${icsLine ? `\n<p>${escEmailHtml(icsLine)}</p>` : ""}
 <p>Velkommen! Produsenten registrerer oppmøtet etter besøket.</p>
 ${statusFooterHtml(booking)}
 <p>Hilsen<br>Opplevagent</p>`.trim(),
-    textContent: `Hei ${booking.guest_name},\n\n${acceptedSuggestion ? "Du har akseptert det nye tidspunktet — reservasjonen er nå bekreftet." : "Produsenten har bekreftet reservasjonen din."}\nBookingref: ${booking.booking_ref}\nDato/tid: ${slotFormatted}\nAntall: ${booking.party_size}${guestStatusUrl(booking) ? `\nStatus: ${guestStatusUrl(booking)}` : ""}\n\nHilsen\nOpplevagent`,
+    textContent: `Hei ${booking.guest_name},\n\n${acceptedSuggestion ? "Du har akseptert det nye tidspunktet — reservasjonen er nå bekreftet." : "Produsenten har bekreftet reservasjonen din."}\nBookingref: ${booking.booking_ref}\nDato/tid: ${slotFormatted}\nAntall: ${booking.party_size}${icsLine ? `\n\n${icsLine}` : ""}${guestStatusUrl(booking) ? `\nStatus: ${guestStatusUrl(booking)}` : ""}\n\nHilsen\nOpplevagent`,
     replyTo: "kontakt@opplevagent.no",
     // Steg 3 / funn 2: this mail carries Opplevagent content, so it must READ
     // as Opplevagent in the inbox list. The address stays rettfrabonden.com —
     // Resend verifies one domain — so the display name is what carries it.
     from: crmFromHeader("experiences"),
+    ...(icsAttachment ? { attachments: [icsAttachment] } : {}),
   });
 }
 
@@ -1288,6 +1402,8 @@ export async function sendGuestDecisionToProducer(
 // and the hourly tick in src/index.ts; `now` is injectable for clock tests.
 export interface BookingFollowupResult {
   examined: number;
+  /** O1-1 (R11): single re-sends of a failed producer notification attempted. */
+  producer_notify_retried: number;
   reminders_sent: number;
   reminders_suppressed: number;
   expired: number;
@@ -1301,12 +1417,66 @@ export async function processBookingFollowups(
   const db = getDb(VERTICAL);
   const result: BookingFollowupResult = {
     examined: 0,
+    producer_notify_retried: 0,
     reminders_sent: 0,
     reminders_suppressed: 0,
     expired: 0,
     expired_guests_notified: 0,
     errors: 0,
   };
+
+  // O1-1 (R11): one re-send of a producer notification that failed. Claimed
+  // first (notify_retried_at), like every other step. Before the send the
+  // respond deadline is re-stamped from now, so the deadline the e-mail
+  // states is the one the expiry below honours (the clock starts at the
+  // registered notification). Gate off → claim released, retried later.
+  const failedNotify = db
+    .prepare(`
+      SELECT * FROM gardssalg_bookings
+      WHERE respond_token IS NOT NULL AND status = 'reserved' AND pre_status = 'awaiting_provider'
+        AND notify_failed_at IS NOT NULL AND notify_retried_at IS NULL AND notify_sent_at IS NULL
+    `)
+    .all() as Record<string, unknown>[];
+  for (const raw of failedNotify) {
+    const booking = hydrate(raw);
+    try {
+      // A request whose visit time has already passed is not re-sent (and not
+      // claimed): asking the producer to answer it would be pointless.
+      // Known, accepted: such a row (failed, slot passed) is then neither
+      // re-sent nor expired — it stays awaiting_provider with no guest e-mail;
+      // the admin already got the failure alert for it.
+      const slotMs = stampMs(booking.slot_at);
+      if (Number.isFinite(slotMs) && slotMs <= now.getTime()) continue;
+      // The claim re-checks the state the SELECT saw: a row answered,
+      // cancelled or delivered in between is left alone.
+      const claim = db
+        .prepare(`
+          UPDATE gardssalg_bookings SET notify_retried_at = ?
+          WHERE booking_id = ? AND notify_retried_at IS NULL
+            AND status = 'reserved' AND pre_status = 'awaiting_provider'
+            AND notify_sent_at IS NULL AND notify_failed_at IS NOT NULL
+        `)
+        .run(now.toISOString(), booking.booking_id);
+      if (claim.changes !== 1) continue;
+      const provider = getProviderDispatchRow(booking.provider_id);
+      if (!provider || isBookingPaused(provider.booking_live, provider.catalog_hidden, provider.is_test_provider)) {
+        db.prepare("UPDATE gardssalg_bookings SET notify_retried_at = NULL WHERE booking_id = ?").run(booking.booking_id);
+        console.log(`[booking-previsit] producer notification retry SUPPRESSED by dispatch gate — booking ${booking.booking_ref}`);
+        continue;
+      }
+      booking.respond_token_expires_at = new Date(now.getTime() + previsitExpireHours() * 3600_000).toISOString();
+      db.prepare("UPDATE gardssalg_bookings SET respond_token_expires_at = ? WHERE booking_id = ?")
+        .run(booking.respond_token_expires_at, booking.booking_id);
+      const hours = db
+        .prepare("SELECT opening_hours_text FROM experience_providers WHERE id = ?")
+        .get(booking.provider_id) as { opening_hours_text: string | null } | undefined;
+      await sendProducerNotification(booking, provider.epost, hours?.opening_hours_text ?? null, { retry: true });
+      result.producer_notify_retried++;
+    } catch (err) {
+      result.errors++;
+      console.error(`[booking-previsit] producer notification retry failed for ${booking.booking_ref}:`, err);
+    }
+  }
 
   // Only slice-2 rows (respond_token set): live pre-visit loops on bookings
   // still post-visit-'reserved', plus already-expired rows whose guest was
@@ -1323,21 +1493,16 @@ export async function processBookingFollowups(
     .all() as Record<string, unknown>[];
 
   const nowMs = now.getTime();
-  const reminderMs = previsitReminderHours() * 3600_000;
 
   for (const raw of rows) {
     const booking = hydrate(raw);
     result.examined++;
     try {
-      // ── Expiry: awaiting_provider expires at the stamped
-      // respond_token_expires_at; time_suggested at that OR the suggested
-      // time itself, whichever comes first (previsitExpiryDueMs()). ──
-      const dueMs = previsitExpiryDueMs(booking);
-      const shouldExpire =
-        (booking.pre_status === "awaiting_provider" ||
-          booking.pre_status === "time_suggested") &&
-        Number.isFinite(dueMs) &&
-        dueMs <= nowMs;
+      // ── Expiry (previsitFollowupDue()): awaiting_provider 60 h after the
+      // registered producer notification; time_suggested at the token
+      // expiry OR the suggested time itself, whichever comes first. ──
+      const due = previsitFollowupDue(booking, nowMs);
+      const shouldExpire = due.expire;
 
       if (shouldExpire) {
         const flip = db.prepare(`
@@ -1380,12 +1545,7 @@ export async function processBookingFollowups(
 
       // ── Reminder: once, after previsitReminderHours() without an answer,
       // only while the request is still alive and unanswered. ──
-      if (
-        booking.pre_status === "awaiting_provider" &&
-        !booking.reminder_sent_at &&
-        Number.isFinite(Date.parse(booking.created_at)) &&
-        nowMs - Date.parse(booking.created_at) >= reminderMs
-      ) {
+      if (due.remind) {
         // Claim BEFORE sending (concurrency lock, as above).
         const claim = db.prepare(`
           UPDATE gardssalg_bookings SET reminder_sent_at = ?
@@ -1424,4 +1584,76 @@ export async function processBookingFollowups(
   }
 
   return result;
+}
+
+// ─── O1-1 (R1): what the followup job decides for one row ──────────────────
+// awaiting_provider: reminder previsitReminderHours() and expiry
+// previsitExpireHours() after the REGISTERED producer notification
+// (notify_sent_at, never before FOLLOWUP_CLOCK_FLOOR) — a row without one is
+// neither reminded nor expired, except a legacy row created before the floor
+// with every notify_* column NULL, whose clock starts at the floor. time_suggested: the producer HAS answered, so
+// the guest-side deadline (previsitExpiryDueMs()) is unchanged. Shared by the
+// job and the dry-run count, so the two can never disagree.
+export function previsitFollowupDue(
+  booking: GardssalgBooking,
+  nowMs: number,
+): { remind: boolean; expire: boolean } {
+  if (!booking.respond_token || booking.status !== "reserved") return { remind: false, expire: false };
+  if (booking.pre_status === "time_suggested") {
+    const dueMs = previsitExpiryDueMs(booking);
+    return { remind: false, expire: Number.isFinite(dueMs) && dueMs <= nowMs };
+  }
+  if (booking.pre_status !== "awaiting_provider") return { remind: false, expire: false };
+  const expireMs = awaitingExpiryDueMs(booking, previsitExpireHours());
+  const expire = Number.isFinite(expireMs) && expireMs <= nowMs;
+  return { expire, remind: !expire && previsitReminderDue(booking, nowMs, previsitReminderHours()) };
+}
+
+export interface BookingFollowupDryRun {
+  would_remind: number;
+  would_expire: number;
+  /**
+   * awaiting_provider rows created at/after the clock floor without a
+   * registered producer notification (never reminded/expired). Legacy rows
+   * are NOT counted here — see legacy_counted_from_floor.
+   */
+  without_registered_notification: number;
+  /**
+   * awaiting_provider rows created before the clock floor with every notify_*
+   * column NULL (predate the columns): reminded/expired counting from the floor.
+   */
+  legacy_counted_from_floor: number;
+  clock_floor: string;
+}
+
+// Read-only: how many rows processBookingFollowups() would remind and expire
+// at `now`. Ignores the dispatch gate (a gate-suppressed reminder still counts).
+export function countBookingFollowupsDue(now: Date = new Date()): BookingFollowupDryRun {
+  const db = getDb(VERTICAL);
+  const rows = db
+    .prepare(`
+      SELECT * FROM gardssalg_bookings
+      WHERE respond_token IS NOT NULL AND status = 'reserved'
+        AND pre_status IN ('awaiting_provider','time_suggested')
+    `)
+    .all() as Record<string, unknown>[];
+  const out: BookingFollowupDryRun = {
+    would_remind: 0,
+    would_expire: 0,
+    without_registered_notification: 0,
+    legacy_counted_from_floor: 0,
+    clock_floor: new Date(followupClockFloorMs()).toISOString(),
+  };
+  const nowMs = now.getTime();
+  for (const raw of rows) {
+    const booking = hydrate(raw);
+    const due = previsitFollowupDue(booking, nowMs);
+    if (due.expire) out.would_expire++;
+    else if (due.remind) out.would_remind++;
+    if (booking.pre_status === "awaiting_provider" && !booking.notify_sent_at) {
+      if (isLegacyPreFloorRow(booking)) out.legacy_counted_from_floor++;
+      else out.without_registered_notification++;
+    }
+  }
+  return out;
 }

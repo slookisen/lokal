@@ -198,6 +198,16 @@ import { corridorSearch, DEFAULT_MAX_DETOUR_KM } from "../services/route-corrido
 // already relies on. See route-intent.ts's module header for why this must
 // stay a strict whole-string resolver + reluctant heuristic, unmodified.
 import { resolveRouteIntent, detectRouteIntent, reiseUrlFor } from "../services/route-intent";
+// O1-2 (dev-request 2026-11-12-opplevagent-o1-trygg-aa-aapne): honest receipt page
+// behind GARDSSALG_HONEST_RECEIPT_ENABLED (text package OA-1 §1.1).
+import {
+  honestReceiptEnabled,
+  oa1Text,
+  fillOa1,
+  formatOsloInstant,
+  calendarFileAllowed,
+  dropFristSentences,
+} from "../services/gardssalg-honest-receipt";
 import { getDb, getDb as getExpDbForReise } from "../database/db-factory";
 import {
   createBooking,
@@ -7615,12 +7625,26 @@ router.get(
 
     const icsUrl = `/api/opplevelser/book/${encodeURIComponent(booking.booking_ref)}/ics`;
 
+    // O1-2 (R3/G13): flag on -> the page says the request is received, not
+    // confirmed (OA-1 §1.1), and the calendar link only shows for a visit the
+    // producer has confirmed. Flag off: byte-identical to before.
+    const honest = honestReceiptEnabled();
+    const fristText = honest ? formatOsloInstant(booking.respond_token_expires_at, "nb") : "";
+    // No answer deadline -> the {frist} sentence is dropped (never reworded).
+    const honestLead = honest
+      ? fillOa1(
+          escapeHtml(fristText ? oa1Text("receipt.lead", "nb") : dropFristSentences(oa1Text("receipt.lead", "nb"))),
+          { produsent: escapeHtml(provider.navn), frist: escapeHtml(fristText) },
+        )
+      : "";
+    const showIcsLink = !honest || calendarFileAllowed(booking);
+
     const html = `<!doctype html>
 <html lang="nb">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Reservasjon bekreftet | Opplevagent</title>
+<title>${honest ? escapeHtml(oa1Text("receipt.pageTitle", "nb")) : "Reservasjon bekreftet | Opplevagent"}</title>
 <meta name="robots" content="noindex, nofollow">
 ${pwaHeadTags()}
 <style>
@@ -7647,8 +7671,8 @@ ${BROWSE_CSS}
 </nav>
 <main id="main" class="container">
   <div class="confirm-panel">
-    <h1>Reservasjon bekreftet</h1>
-    <p>Hos ${escapeHtml(provider.navn)}</p>
+    <h1>${honest ? escapeHtml(oa1Text("receipt.heading", "nb")) : "Reservasjon bekreftet"}</h1>
+    <p>Hos ${escapeHtml(provider.navn)}</p>${honestLead ? `\n    <p>${honestLead}</p>` : ""}
     ${qrSvg ? `<div class="qr">${qrSvg}</div>` : ""}
     <div class="ref">${escapeHtml(booking.booking_ref)}</div>
     <p class="hint">Vis ved ankomst — produsenten bekrefter oppmøtet.</p>
@@ -7658,8 +7682,8 @@ ${BROWSE_CSS}
       <div><strong>Navn:</strong> ${escapeOrDeleted(booking.guest_name)}</div>
       ${booking.notes ? `<div><strong>Kommentar:</strong> ${escapeHtml(booking.notes)}</div>` : ""}
     </div>
-    <p class="hint">En bekreftelse er sendt til ${escapeOrDeleted(booking.guest_email)}.</p>
-    <a class="ics-link" href="${icsUrl}">Last ned kalenderfil (.ics)</a>
+    <p class="hint">${honest ? fillOa1(escapeHtml(oa1Text("receipt.formMessage", "nb")), { "e-post": escapeOrDeleted(booking.guest_email) }) : `En bekreftelse er sendt til ${escapeOrDeleted(booking.guest_email)}.`}</p>${showIcsLink ? `
+    <a class="ics-link" href="${icsUrl}">Last ned kalenderfil (.ics)</a>` : ""}
   </div>
 </main>
 <footer style="margin-top:48px;padding:24px 0;border-top:1px solid #e4ded0;font-size:.8rem;color:#7a7163;text-align:center">

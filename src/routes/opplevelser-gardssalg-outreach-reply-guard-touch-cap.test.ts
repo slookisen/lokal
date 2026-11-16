@@ -4,8 +4,10 @@
  * (src/routes/opplevelser.ts) must refuse
  *   - reason "replied": the producer has >=1 inbound CRM message on a thread
  *     with its contact (same has_replied logic as the candidates route), and
- *   - reason "max_touch_reached": >=2 real rows in experience_outreach_sent_log
- *     (status sent AND reserved both count),
+ *   - reason "max_touch_reached": >=GARDSSALG_OUTREACH_MAX_TOUCHES real rows in
+ *     experience_outreach_sent_log (status sent AND reserved both count). The cap
+ *     was 2; dev-request 2026-11-15-opplevagent-fem-henvendelser (A2) raised it to 5,
+ *     so the fixtures below carry 5 rows,
  * and computeGardssalgOutreachDailyPrep must show the same reasons in its
  * `excluded` list. A producer with exactly 1 send (outside cooldown) and no
  * reply stays a follow-up candidate.
@@ -154,8 +156,11 @@ export function runOpplevelserGardssalgOutreachReplyGuardTouchCapTests(
       const emailB = mk("prov-b-replied");
       addLog("prov-b-replied", emailB, 50, null);
       addInbound("prov-b-replied", emailB);
-      // prov-c-max: 2 sends (one sent, one reserved), both outside cooldown, no reply -> max_touch_reached.
+      // prov-c-max: 5 sends (four sent, one reserved), all outside cooldown, no reply -> max_touch_reached (cap 5, A2).
       const emailC = mk("prov-c-max");
+      addLog("prov-c-max", emailC, 120, null);
+      addLog("prov-c-max", emailC, 110, null);
+      addLog("prov-c-max", emailC, 100, null);
       addLog("prov-c-max", emailC, 90, null);
       addLog("prov-c-max", emailC, 50, "reserved");
       // prov-d-followup: exactly 1 send 50d ago, no reply -> still eligible follow-up.
@@ -164,10 +169,27 @@ export function runOpplevelserGardssalgOutreachReplyGuardTouchCapTests(
       // prov-e-replied-first: reply and no sends at all -> replied wins (never cold-mail a replier).
       const emailE = mk("prov-e-replied-first");
       addInbound("prov-e-replied-first", emailE);
-      // prov-f-reserved2: two RESERVED rows only -> max_touch_reached (reserved counts).
+      // prov-f-reserved2: five RESERVED rows only -> max_touch_reached (reserved counts; cap 5, A2).
       const emailF = mk("prov-f-reserved2");
+      addLog("prov-f-reserved2", emailF, 120, "reserved");
+      addLog("prov-f-reserved2", emailF, 110, "reserved");
+      addLog("prov-f-reserved2", emailF, 100, "reserved");
       addLog("prov-f-reserved2", emailF, 90, "reserved");
       addLog("prov-f-reserved2", emailF, 50, "reserved");
+      // prov-g-cooldown: 1 send 5d ago -> own cooldown (dev-request
+      // 2026-10-08-outreach-sendinger-mangler-epost-i-rapport, i1-i6 below).
+      const emailG = mk("prov-g-cooldown");
+      addLog("prov-g-cooldown", emailG, 5, null);
+      // A newer is_test send never shows up as prov-c's recipient (i7).
+      expDb
+        .prepare(`INSERT INTO experience_outreach_sent_log (provider_id, recipient_email, sent_at, is_test) VALUES (?, ?, ?, 1)`)
+        .run("prov-c-max", "test@example.invalid", new Date(Date.now() - 1 * 86400_000).toISOString());
+      // prov-h-shared: own old send (100d) to an old address, current address
+      // shared with prov-g whose send 5d ago puts prov-h in cooldown (i8).
+      const insertShared = expDb.prepare(`UPDATE experience_providers SET epost = ? WHERE id = ?`);
+      mk("prov-h-shared");
+      insertShared.run(emailG, "prov-h-shared");
+      addLog("prov-h-shared", "gammel@prov-h-shared.no", 100, null);
 
       const ids = ["prov-a-fresh", "prov-b-replied", "prov-c-max", "prov-d-followup", "prov-e-replied-first", "prov-f-reserved2"];
       const elig = computeGardssalgOutreachSendEligibility(expDb, ids, { skipRecipientDedupe: true });
@@ -179,10 +201,10 @@ export function runOpplevelserGardssalgOutreachReplyGuardTouchCapTests(
 
       assertEq(view("prov-a-fresh"), [true, null], "a1: no history -> eligible");
       assertEq(view("prov-b-replied"), [false, "replied"], "b1: inbound CRM reply -> replied (even though outside cooldown)");
-      assertEq(view("prov-c-max"), [false, "max_touch_reached"], "c1: 1 sent + 1 reserved row -> max_touch_reached");
+      assertEq(view("prov-c-max"), [false, "max_touch_reached"], "c1: 4 sent + 1 reserved row (cap 5) -> max_touch_reached");
       assertEq(view("prov-d-followup"), [true, null], "d1: 1 send, no reply -> still an eligible follow-up candidate");
       assertEq(view("prov-e-replied-first"), [false, "replied"], "e1: reply without any prior send -> replied");
-      assertEq(view("prov-f-reserved2"), [false, "max_touch_reached"], "f1: two reserved rows count -> max_touch_reached");
+      assertEq(view("prov-f-reserved2"), [false, "max_touch_reached"], "f1: five reserved rows count (cap 5) -> max_touch_reached");
 
       // A test send (is_test=1) never counts toward the cap.
       expDb
@@ -204,6 +226,27 @@ export function runOpplevelserGardssalgOutreachReplyGuardTouchCapTests(
       const candIds = prep.response.candidates.map((c: any) => c.provider_id).sort();
       assertEq(candIds, ["prov-a-fresh", "prov-d-followup"], "h5: daily-prep candidates = fresh + 1-send follow-up only");
       assertEq(prep.selected.map((s) => s.provider_id).sort(), ["prov-a-fresh", "prov-d-followup"], "h6: selected agrees with preview");
+
+      // dev-request 2026-10-08-outreach-sendinger-mangler-epost-i-rapport:
+      // rows this lane has already mailed carry the latest send's recipient,
+      // so the outreach report can show who got today's mail.
+      const rowById = new Map(prep.response.excluded.map((x: any) => [x.provider_id, x]));
+      const rowC: any = rowById.get("prov-c-max");
+      const lastC = expDb
+        .prepare(`SELECT sent_at FROM experience_outreach_sent_log WHERE provider_id = ? AND notes = 'reserved'`)
+        .get("prov-c-max") as { sent_at: string };
+      assertEq(rowC?.recipient_email, emailC, "i1: max_touch_reached row carries the latest send's recipient_email");
+      assertEq(rowC?.last_sent_at, lastC.sent_at, "i2: max_touch_reached row carries the latest send's sent_at as last_sent_at");
+      assertEq(rowC?.quarantine_until, undefined, "i3: max_touch_reached row gets no quarantine_until (the cap is not a quarantine)");
+      const rowG: any = rowById.get("prov-g-cooldown");
+      assertEq(rowG?.reason, "cooldown_suppressed", "i4: 5-day-old own send -> cooldown_suppressed");
+      assertEq(rowG?.recipient_email, emailG, "i5: own-cooldown row carries recipient_email");
+      assertEq(typeof rowG?.quarantine_until, "string", "i5b: own-cooldown row keeps quarantine_until");
+      assertEq((rowById.get("prov-b-replied") as any)?.recipient_email, undefined, "i6: replied row gets no recipient_email");
+      assertEq(rowC?.recipient_email === "test@example.invalid", false, "i7: an is_test send is never reported as the recipient");
+      const rowH: any = rowById.get("prov-h-shared");
+      assertEq(rowH?.reason, "cooldown_suppressed", "i8a: shared address mailed 5d ago -> cooldown_suppressed");
+      assertEq([rowH?.recipient_email, rowH?.last_sent_at], [emailG, rowG?.last_sent_at], "i8b: cooldown row pairs last_sent_at with the address of the send that caused it, not the provider's own older send");
     } catch (err) {
       failed++;
       failures.push(`✗ reply-guard/touch-cap suite threw: ${(err as Error)?.stack ?? err}`);

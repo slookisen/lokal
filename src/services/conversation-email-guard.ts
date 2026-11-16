@@ -40,7 +40,12 @@ import { contactFormEnabled, contactFormOnlyIds } from "./contact-form-only";
 
 /** A «✉️ …» line of the seller's contact block (with or without the emoji variation selector). */
 const EMAIL_LINE_RE = /^\s*✉/u;
-const CONTACT_HEADER = "Kontakt oss:";
+/**
+ * The header over the contact block: «Kontakt:» since the third-person reply
+ * (dev-request 2026-11-06-rfb-svar-til-kjoperagenter-tredje-person), «Kontakt
+ * oss:» in replies stored before it.
+ */
+const CONTACT_HEADERS = new Set(["Kontakt:", "Kontakt oss:"]);
 /** The other contact lines generateSellerResponse writes under the header: 📍 📞 🌐. */
 const CONTACT_LINE_RE = /^\s*(\u{1F4CD}|\u{1F4DE}|\u{1F310})/u;
 
@@ -71,7 +76,7 @@ export function withoutEmailLines(content: string): string {
   const out: string[] = [];
   for (let i = 0; i < kept.length; i++) {
     const line = kept[i]!;
-    if (line.trim() === CONTACT_HEADER && !CONTACT_LINE_RE.test(kept[i + 1] ?? "")) {
+    if (CONTACT_HEADERS.has(line.trim()) && !CONTACT_LINE_RE.test(kept[i + 1] ?? "")) {
       if (out.length > 0 && out[out.length - 1] === "") out.pop();
       continue;
     }

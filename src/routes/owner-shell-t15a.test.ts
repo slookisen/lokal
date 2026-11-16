@@ -268,8 +268,12 @@ export async function runOwnerShellT15aTests(opts: { log?: boolean } = {}): Prom
       orders: { section: "ordrer", href: `/eier/${ON_ID}/ordrer`, label: "Mine ordrer" },
       valg: { section: "valg", href: `/eier/${ON_ID}/valg`, label: "Mine valg" },
     };
-    // The orders page carries a fresh idempotency key per form; mask it.
-    const noIdem = (h: string) => h.replace(/name="idem" value="[^"]*"/g, `name="idem" value="*"`);
+    // The orders page carries a fresh idempotency key per form, and the pickup field's min is "now"
+    // to the minute (nowOsloLocalMin); mask both, or two snapshots taken across a minute boundary
+    // differ (determinism gate, Fly Deploy run 43669505946).
+    const noIdem = (h: string) => h
+      .replace(/name="idem" value="[^"]*"/g, `name="idem" value="*"`)
+      .replace(/name="pickup_time" min="[^"]*"/g, `name="pickup_time" min="*"`);
     const query = (p: PageKey): Record<string, string> => (p === "orders" ? { tab: "venter" } : {});
     const get = async (p: PageKey, id: string, tokenOf: string | null = id, q: Record<string, string> = query(p)) => {
       const r = await invoke(H[p], makeReq(id, tokenOf, q));

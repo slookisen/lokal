@@ -63,6 +63,37 @@ import {
 const router = Router();
 const BASE_URL = process.env.BASE_URL || "http://localhost:3000";
 
+// ─── Producer-answer skill (dev-request 2026-11-06-rfb-svar-til-kjoperagenter-tredje-person) ──
+// The skill that starts a conversation record per matching producer used to
+// be «agent-conversation» / «Start Agent Negotiation». Nothing is negotiated:
+// the platform answers in the third person from the producer's public
+// profile, marked «Automatisk svar fra Rett fra Bonden». The card shows only
+// the new id; the old id is still read as an alias of it.
+export const PRODUCER_ANSWER_SKILL_ID = "producer-profile-answer";
+export const RFB_SKILL_ALIASES: Readonly<Record<string, string>> = { "agent-conversation": PRODUCER_ANSWER_SKILL_ID };
+
+/** A requested skill id with an old id read as its current one; undefined when none was sent. */
+export function resolveRfbSkillId(skillId: unknown): string | undefined {
+  if (typeof skillId !== "string" || !skillId.trim()) return undefined;
+  const id = skillId.trim();
+  return RFB_SKILL_ALIASES[id] ?? id;
+}
+
+/** The skill id a message/send names (params.skillId, params.metadata.skillId or message.metadata.skillId). */
+export function requestedRfbSkillId(params: any): string | undefined {
+  return resolveRfbSkillId(params?.skillId ?? params?.metadata?.skillId ?? params?.message?.metadata?.skillId);
+}
+
+function producerAnswerSkill(): Record<string, unknown> {
+  return {
+    id: PRODUCER_ANSWER_SKILL_ID,
+    name: "Answer about a producer from its profile",
+    description: "message/send starts a conversation record with the best-matching producers. Each one gets an automated answer from Rett fra Bonden in the third person, built from the producer's public profile and marked «Automatisk svar fra Rett fra Bonden». The producer does not answer, and nothing is agreed or ordered.",
+    tags: ["producer info", "contact", "local food"],
+    examples: ["Which farms near Trondheim sell honey, and how do I contact them?"],
+  };
+}
+
 // ─── A2A v0.3.0 spec-compliant response helpers (Phase 4.13 / WO #4) ──
 // Spec: task.status is an object {state, timestamp}, not a bare string.
 // Spec: artifacts[] use {artifactId, name, parts: [{kind, ...}]}, not {type, data}.
@@ -184,7 +215,7 @@ router.get("/a2a", (_req: Request, res: Response) => {
       ],
       skills: [
         { id: "discover-local-food-agents", name: "Discover Local Food Agents", description: `Search ${agents.length}+ local food producers in Norway, cross-checked against the Brønnøysund register`, tags: ["local food", "farm direct", "Norway"], examples: ["Find farms near Oslo", "finn grønnsaker i Bergen"] },
-        { id: "agent-conversation", name: "Start Agent Negotiation", description: "Initiate buyer-seller conversation between agents", tags: ["negotiate", "order", "transaction"], examples: ["negotiate delivery of tomatoes"] },
+        producerAnswerSkill(),
         { id: "build-shopping-cart", name: "Build a shopping cart", description: `Cart and order flow is available via the MCP server (POST /mcp): find offers with lokal_find_offers, then lokal_cart_create, lokal_cart_add_item, lokal_cart_view and lokal_cart_submit (${isPaymentsEnabled() ? "pickup order; producers that take prepayment return a Stripe payment link the buyer approves themselves, the others are paid at pickup" : "pickup order, no payment"}). Not available through message/send on /a2a.`, tags: ["cart", "order", "local food", "pickup", "mcp"], examples: ["MCP tools/call lokal_find_offers {items: [\"potet\"], near: \"Oslo\"}", "MCP tools/call lokal_cart_create"] },
         // Fase B3 (mine ordrer): only with ORDER_AGENT_ACTIONS_ENABLED on; off, the card is unchanged.
         ...(isOrderAgentActionsEnabled() ? [managePickupOrderSkill()] : []),
@@ -572,6 +603,10 @@ async function handleMessageSend(params: any, id: any, req: Request, res: Respon
     // present only when the tag filter was actually dropped, so a
     // tagsRelaxed:false result is byte-identical to before this change.
     const relaxedFilters = tagsRelaxed ? ["tags"] : undefined;
+    // The skill the caller named, its old id read as the current one
+    // (RFB_SKILL_ALIASES); absent when none was named, so such an answer is
+    // as before.
+    const skill = requestedRfbSkillId(params);
     // Slice I-AA: lokal_search's texts for a place outside Norway and for
     // words that match no product nationwide (services/rfb-search-reading.ts).
     const note = outsideNorway ? outsideNorwayText(outsideNorway)
@@ -596,6 +631,7 @@ async function handleMessageSend(params: any, id: any, req: Request, res: Respon
               conversations,
               parsedQuery: loggedQuery,
               relaxed_filters: relaxedFilters,
+              skill,
               note,
             },
           }),

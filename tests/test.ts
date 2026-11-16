@@ -531,7 +531,8 @@ function fanoutConv(o: {
 }
 
 // (a) N one-shot conversations for the SAME query+session collapse to ONE card
-// with a "N produsenter svarte" header (N = distinct producers).
+// with a "N produsenter funnet" header (N = distinct producers; «svarte» until
+// 2026-11-13 — the producers do not answer, the platform does).
 {
   const fanout = [
     fanoutConv({ id: "c1", query: "honning bergen", sellerId: "s1", sellerName: "Birøkter A", reply: "Hei fra Birøkter A! 👋", taskId: "task-XYZ" }),
@@ -545,9 +546,9 @@ function fanoutConv(o: {
   assertEq(groups.length, 1, "group: 6-producer fan-out for one query+session → ONE card");
   assertEq(groups[0]!.conversations.length, 6, "group: all 6 distinct producers kept inside the card");
   assertEq(groups[0]!.queryText, "honning bergen", "group: card carries the query text");
-  // The rendered header is `${count} produsenter svarte`; prove the count is 6.
-  assertEq(`${groups[0]!.conversations.length} produsenter svarte`, "6 produsenter svarte",
-    "group: header renders «honning bergen» → 6 produsenter svarte");
+  // The rendered header is `${count} produsenter funnet`; prove the count is 6.
+  assertEq(`${groups[0]!.conversations.length} produsenter funnet`, "6 produsenter funnet",
+    "group: header renders «honning bergen» → 6 produsenter funnet");
 }
 
 // (b) Different queries stay in separate cards.
@@ -708,7 +709,9 @@ const ITEM5_REPLY = [
   };
   const html = renderTranscriptBody(conv);
   const qIdx = html.indexOf("honning fra bergen");
-  const replyIdx = html.indexOf("Hei fra Kjells Gård");
+  // The stored reply (written in the producer's name before 2026-11-13) is
+  // shown in the third person (thirdPersonAutoReply).
+  const replyIdx = html.indexOf("Ifølge profilen til Kjells Gård");
   assertTrue(qIdx >= 0, "transcript: question text rendered");
   assertTrue(replyIdx >= 0, "transcript: producer reply rendered");
   assertTrue(qIdx < replyIdx, "transcript: question bubble comes BEFORE the producer reply (timeline)");
@@ -726,7 +729,8 @@ const ITEM5_REPLY = [
   assertTrue(bubbleSlice.slice(0, cardIdx - replyIdx).indexOf("Se profilen") === -1,
     "transcript: profile-link boilerplate NOT inside the reply bubble");
   // Slice-1 honesty preserved.
-  assertTrue(html.includes("automatisk svar fra profilen"), "transcript: auto-reply tag preserved on producer bubble");
+  assertTrue(html.includes(">Automatisk svar fra Rett fra Bonden</span>"), "transcript: auto-reply tag preserved on producer bubble («Automatisk svar fra Rett fra Bonden»)");
+  assertTrue(!html.includes("Hei fra Kjells Gård") && !html.includes("Ta gjerne kontakt"), "transcript: the stored first-person lines are shown in the third person");
   assertTrue(!html.includes("Forhandling"), "transcript: no fabricated 'Forhandling' label");
 }
 
@@ -1514,6 +1518,25 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("crm-max-touch-vern-send-guard: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// ── dev-request 2026-11-15-rfb-utsending-loftesetning-holdes: promise_given
+// in the mode=second gate, pool-blocker-explain and executeCompose ──
+runSerial(async () => {
+  console.log("── rfb-outreach-promise-given (gate + explain + compose guard) ──");
+  try {
+    const { runRfbOutreachPromiseGivenTests } =
+      require("../src/routes/rfb-outreach-promise-given.test") as
+        typeof import("../src/routes/rfb-outreach-promise-given.test");
+    const r = await runRfbOutreachPromiseGivenTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-outreach-promise-given: " + f);
+    console.log(`  rfb-outreach-promise-given: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-outreach-promise-given: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -25529,6 +25552,7 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
       to_emails TEXT,
       sent_at TEXT,
       received_at TEXT DEFAULT (datetime('now')),
+      raw_metadata TEXT DEFAULT '{}',
       delivery_status TEXT NOT NULL DEFAULT 'sent'
     );
 
@@ -32006,6 +32030,28 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gorg.failures) failures.push("opplevelser-gardssalg-outreach-reply-guard-touch-cap: " + f);
     console.log(`  opplevelser-gardssalg-outreach-reply-guard-touch-cap: ${gorg.passed} passed, ${gorg.failed} failed`);
 
+    // dev-request 2026-11-15-opplevagent-fem-henvendelser, A1: rounds, template
+    // per round without fallback, promise_given, ordering and per-round counts.
+    console.log("\n── opplevelser-gardssalg-outreach-rounds-a1: rounds + promise_given + no_template_for_touch ──");
+    const { runOpplevelserGardssalgOutreachRoundsA1Tests } = require("../src/routes/opplevelser-gardssalg-outreach-rounds-a1.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-outreach-rounds-a1.test");
+    const gora1 = await runOpplevelserGardssalgOutreachRoundsA1Tests({ log: false });
+    passed += gora1.passed;
+    failed += gora1.failed;
+    for (const f of gora1.failures) failures.push("opplevelser-gardssalg-outreach-rounds-a1: " + f);
+    console.log(`  opplevelser-gardssalg-outreach-rounds-a1: ${gora1.passed} passed, ${gora1.failed} failed`);
+
+    // dev-request 2026-11-15-opplevagent-fem-henvendelser, A2: cap 5, approved texts
+    // for rounds 2 and 3 (golden), rounds 4/5 without a template, per-round stop rule.
+    console.log("\n── opplevelser-gardssalg-outreach-rounds-a2: cap 5 + round 2/3 texts + stop rule ──");
+    const { runOpplevelserGardssalgOutreachRoundsA2Tests } = require("../src/routes/opplevelser-gardssalg-outreach-rounds-a2.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-outreach-rounds-a2.test");
+    const gora2 = await runOpplevelserGardssalgOutreachRoundsA2Tests({ log: false });
+    passed += gora2.passed;
+    failed += gora2.failed;
+    for (const f of gora2.failures) failures.push("opplevelser-gardssalg-outreach-rounds-a2: " + f);
+    console.log(`  opplevelser-gardssalg-outreach-rounds-a2: ${gora2.passed} passed, ${gora2.failed} failed`);
+
     // dev-request 2026-08-09-daglig-outreach-klargjoering-og-stoerrelsesgate,
     // Skive 1: antall_ansatte size signal + hard exclusion gate layered onto
     // the readiness/preflight/pilot-send trio above, plus the new DB-backed
@@ -32219,6 +32265,29 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += gbcr.failed;
     for (const f of gbcr.failures) failures.push("opplevelser-gardssalg-bookings-count: " + f);
     console.log(`  opplevelser-gardssalg-bookings-count: ${gbcr.passed} passed, ${gbcr.failed} failed`);
+
+    // O1-1 (R1/R11): booking follow-up after restart — first run 5 min after
+    // boot, clock from the registered producer notification, one retry +
+    // admin alert for a failed producer e-mail, admin dry-run count.
+    console.log("\n── gardssalg-booking-followup: boot run + registered-notification clock + retry/alert + dry-run ──");
+    const { runGardssalgBookingFollowupTests } = require("../src/services/gardssalg-booking-followup.test") as
+      typeof import("../src/services/gardssalg-booking-followup.test");
+    const gbfu = await runGardssalgBookingFollowupTests({ log: false });
+    passed += gbfu.passed;
+    failed += gbfu.failed;
+    for (const f of gbfu.failures) failures.push("gardssalg-booking-followup: " + f);
+    console.log(`  gardssalg-booking-followup: ${gbfu.passed} passed, ${gbfu.failed} failed`);
+
+    // O1-2 (R3/R4/G13): honest receipt + calendar file only on confirmation,
+    // behind GARDSSALG_HONEST_RECEIPT_ENABLED; flag off byte-identical.
+    console.log("\n── gardssalg-honest-receipt: OA-1 texts + flag off unchanged + .ics only after confirmation ──");
+    const { runGardssalgHonestReceiptTests } = require("../src/services/gardssalg-honest-receipt.test") as
+      typeof import("../src/services/gardssalg-honest-receipt.test");
+    const ghr = await runGardssalgHonestReceiptTests({ log: false });
+    passed += ghr.passed;
+    failed += ghr.failed;
+    for (const f of ghr.failures) failures.push("gardssalg-honest-receipt: " + f);
+    console.log(`  gardssalg-honest-receipt: ${ghr.passed} passed, ${ghr.failed} failed`);
 
     // GET /admin/gardssalg-provider-lookup — read-only, case-insensitive
     // substring lookup of experience_providers by navn, returning
@@ -35628,8 +35697,8 @@ const _samtalerSeoPromise: Promise<void> = new Promise<void>(r => { _samtalerSeo
       "seo6: grouped query text is present in raw server-rendered HTML");
     assertTrue(list.body.includes("Bergen Honninggård"),
       "seo6: producer name is present in raw server-rendered HTML");
-    assertTrue(/Hei fra Bergen Honninggård/.test(list.body),
-      "seo6: producer auto-reply snippet is present in raw server-rendered HTML (not client-injected)");
+    assertTrue(/Automatisk svar fra Rett fra Bonden\.\nIfølge profilen til Bergen Honninggård/.test(list.body),
+      "seo6: producer auto-reply snippet is present in raw server-rendered HTML (not client-injected; third person, marked)");
 
     // ?kilde= filter variants must canonicalize to the bare /samtaler —
     // never register as duplicate content.
@@ -42147,6 +42216,11 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
   const prevExpirePV = process.env.BOOKING_PREVISIT_EXPIRE_HOURS;
   delete process.env.BOOKING_PREVISIT_REMINDER_HOURS;
   delete process.env.BOOKING_PREVISIT_EXPIRE_HOURS;
+  // O1-1: the followup clock starts at the registered producer notification,
+  // never before BOOKING_FOLLOWUP_CLOCK_FLOOR (default: the deploy date). This
+  // block's bookings are made "now", so pin the floor into the past.
+  const prevClockFloorPV = process.env.BOOKING_FOLLOWUP_CLOCK_FLOOR;
+  process.env.BOOKING_FOLLOWUP_CLOCK_FLOOR = "2020-01-01T00:00:00Z";
 
   // P0 CI fix (2026-09-11): this block used to have no top-level try/finally,
   // so any assertion failure that THROWS (rather than merely recording a
@@ -42303,6 +42377,8 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
       guest_name: "Gjest Previsit", guest_email: "gjest-pv@example.no", ...extra,
     });
     assertEq(r.status, 201, "pv-book: booking created (201)");
+    // O1-1: let the fire-and-forget producer send stamp notify_sent_at.
+    await new Promise((res) => setImmediate(res));
     return bookStPV.getBookingByRef(String(r.json?.booking_ref));
   }
 
@@ -42966,6 +43042,8 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
     else process.env.BOOKING_PREVISIT_REMINDER_HOURS = prevReminderPV;
     if (prevExpirePV === undefined) delete process.env.BOOKING_PREVISIT_EXPIRE_HOURS;
     else process.env.BOOKING_PREVISIT_EXPIRE_HOURS = prevExpirePV;
+    if (prevClockFloorPV === undefined) delete process.env.BOOKING_FOLLOWUP_CLOCK_FLOOR;
+    else process.env.BOOKING_FOLLOWUP_CLOCK_FLOOR = prevClockFloorPV;
     dbFacOwnPV?.__resetDbFactoryForTesting();
     restoreModulesPV();
   }
@@ -48912,6 +48990,15 @@ runSerial(async () => {
     for (const f of asg.failures) failures.push("a2a-spam-guard: " + f);
     console.log(`  a2a-spam-guard: ${asg.passed} passed, ${asg.failed} failed`);
 
+    // dev-request 2026-11-06-rfb-svar-til-kjoperagenter-tredje-person.
+    const { runRfbTredjepersonSvarTests } = require("../src/routes/rfb-tredjeperson-svar.test") as
+      typeof import("../src/routes/rfb-tredjeperson-svar.test");
+    const tps = await runRfbTredjepersonSvarTests({ log: false });
+    passed += tps.passed;
+    failed += tps.failed;
+    for (const f of tps.failures) failures.push("rfb-tredjeperson-svar: " + f);
+    console.log(`  rfb-tredjeperson-svar: ${tps.passed} passed, ${tps.failed} failed`);
+
     const { runAdminConversationsTrafficClassTests } = require("../src/routes/admin-conversations-traffic-class.test") as
       typeof import("../src/routes/admin-conversations-traffic-class.test");
     const tcb = await runAdminConversationsTrafficClassTests({ log: false });
@@ -50347,6 +50434,27 @@ runSerial(async () => {
   }
 });
 
+// «For produsenter» F3 — inbound links (A2A dev-request
+// 2026-10-22-rfb-for-produsenter-faq-side, AC7): /teknologi box, the
+// «Eier denne butikken?» banner link to #eierskap, #synlighet → /teknologi;
+// flag off = no box, no banner link. In-memory RFB DB swapped in and restored;
+// restores FOR_PRODUSENTER_PAGE_ENABLED in finally — tail position.
+runSerial(async () => {
+  console.log("\n── for produsenter F3 (innlenker: /teknologi + profilbanner) ──");
+  try {
+    const { runRfbForProdusenterInnlenkerTests } = require("../src/routes/rfb-for-produsenter-innlenker.test") as
+      typeof import("../src/routes/rfb-for-produsenter-innlenker.test");
+    const r = await runRfbForProdusenterInnlenkerTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-for-produsenter-innlenker: " + f);
+    console.log(`  rfb-for-produsenter-innlenker: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-for-produsenter-innlenker: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // «For produsenter» F2a (A2A dev-request 2026-10-22-rfb-for-produsenter-faq-side,
 // «Endringer fra Daniel 08.11»): the facts module owner-features/today-facts.ts,
 // the three states for_alle / i_pilot / planlagt checked against the code's own
@@ -50366,6 +50474,49 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("today-facts: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// «For produsenter» F2c-1 (A2A dev-request 2026-10-22-rfb-for-produsenter-faq-side,
+// AC6): registry faqAnchor on every RFB consent/confirm entry, each anchor a
+// section id rendered on /for-produsenter (NO + EN, flag on), and the «Les mer»
+// link on RFB «Mine valg» (flag on only; never on the gårdssalg page). Swaps
+// getDb() and FOR_PRODUSENTER_PAGE_ENABLED, restored in finally — runSerial.
+runSerial(async () => {
+  console.log("\n── for produsenter F2c-1 («Les mer» via faqAnchor) ──");
+  try {
+    const { runFaqAnchorTests } = require("../src/owner-features/faq-anchor.test") as
+      typeof import("../src/owner-features/faq-anchor.test");
+    const r = await runFaqAnchorTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("faq-anchor: " + f);
+    console.log(`  faq-anchor: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("faq-anchor: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// «For produsenter» F2c-2 (A2A dev-request 2026-10-22-rfb-for-produsenter-faq-side,
+// AC5): the clickable «Mine valg» demo in #mine-valg behind
+// FOR_PRODUSENTER_DEMO_ENABLED — built from the registry (fixture sellerFaq via
+// the render's registry seam), coming_soon disabled, no write calls (markup +
+// script run on a fake DOM), flag off byte-identical, EN. Sets the page/demo
+// env flags for the route check, restored in finally — runSerial.
+runSerial(async () => {
+  console.log("\n── for produsenter F2c-2 («Mine valg»-demo) ──");
+  try {
+    const { runRfbForProdusenterDemoTests } = require("../src/routes/rfb-for-produsenter-demo.test") as
+      typeof import("../src/routes/rfb-for-produsenter-demo.test");
+    const r = await runRfbForProdusenterDemoTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-for-produsenter-demo: " + f);
+    console.log(`  rfb-for-produsenter-demo: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-for-produsenter-demo: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -51869,6 +52020,27 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-15-rfb-nattjobb-hull-kontaktuttrekk-bm-og-koer, slice
+// B1 step 1: the nightly enrichment preview's read-only
+// contact_email_not_in_knowledge count (DNS buckets, website split, counts
+// only). Pins a fresh in-memory DB per block (restored in finally) —
+// runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-15-rfb-nattjobb-hull (B1-1): rfb-enrichment-contact-email-gap ──");
+  try {
+    const { runRfbEnrichmentContactEmailGapTests } = require("../src/services/rfb-enrichment-contact-email-gap.test") as
+      typeof import("../src/services/rfb-enrichment-contact-email-gap.test");
+    const rcg = await runRfbEnrichmentContactEmailGapTests({ log: false });
+    passed += rcg.passed;
+    failed += rcg.failed;
+    for (const f of rcg.failures) failures.push("rfb-enrichment-contact-email-gap: " + f);
+    console.log(`  rfb-enrichment-contact-email-gap: ${rcg.passed} passed, ${rcg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-enrichment-contact-email-gap: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-11-01-rfb-hold-profilen-oppdatert («Hold profilen
 // oppdatert»): the owner refresh as the nightly run's last step behind
 // OWNER_AUTO_UPDATES_ENABLED — AC1/AC2 (fill_empty / never / automatic, the
@@ -52296,6 +52468,24 @@ runSerial(async () => {
   }
 });
 
+// A2A dev-request 2026-11-12-opplevagent-o3-eierkrav-og-innlogging, O3-1:
+// a dead gårdssalg claim link shows a message and «Send ny lenke» (AK1/AK2).
+runSerial(async () => {
+  console.log("\n── O3-1: utløpt eller ugyldig lenke gir melding og «Send ny lenke» ──");
+  try {
+    const { runGardssalgClaimInvalidLinkO31Tests } = require("../src/routes/gardssalg-claim-invalid-link-o3-1.test") as
+      typeof import("../src/routes/gardssalg-claim-invalid-link-o3-1.test");
+    const r = await runGardssalgClaimInvalidLinkO31Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-claim-invalid-link-o3-1: " + f);
+    console.log(`  gardssalg-claim-invalid-link-o3-1: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-claim-invalid-link-o3-1: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 pkt 4: eid profil —
 // eierens pause / «fjern» / kvalitetsskjul, og admin-spaken på eide rader.
 runSerial(async () => {
@@ -52388,6 +52578,25 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("gardssalg-owner-features-o2a: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-11-12-opplevagent-o2-eierdashbord-for-besok, O2-1: the
+// gårdssalg owner dashboard shell and GARDSSALG_OWNER_DASHBOARD_ENABLED
+// (off | pilot | 1). Swaps getDb() + env — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-12-opplevagent-o2-eierdashbord-for-besok O2-1: dashbordskallet for gårdssalg ──");
+  try {
+    const { runGardssalgOwnerDashboardO21Tests } = require("../src/routes/gardssalg-owner-dashboard-o2-1.test") as
+      typeof import("../src/routes/gardssalg-owner-dashboard-o2-1.test");
+    const r = await runGardssalgOwnerDashboardO21Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-owner-dashboard-o2-1: " + f);
+    console.log(`  gardssalg-owner-dashboard-o2-1: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-owner-dashboard-o2-1: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -52821,6 +53030,46 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("admin-test-producer-owner-login: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-11-12-f1-felles-for-ai-kanalene, slice F1-5: the hidden,
+// bookable gårdssalg test producer — reviewer-state dry-run/apply (AK3), a
+// walk over every public surface (AK1) and book_gardssalg by id (AK2).
+// Swaps the experiences DB, env (ADMIN_KEY, BOOKING_DISPATCH_ENABLED) and the
+// mailer — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-12-f1-felles-for-ai-kanalene F1-5: skjult, bookbar testprodusent ──");
+  try {
+    const { runOpplevelserTestProducerHiddenBookableTests } = require("../src/routes/opplevelser-test-producer-hidden-bookable.test") as
+      typeof import("../src/routes/opplevelser-test-producer-hidden-bookable.test");
+    const r = await runOpplevelserTestProducerHiddenBookableTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("opplevelser-test-producer-hidden-bookable: " + f);
+    console.log(`  opplevelser-test-producer-hidden-bookable: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-test-producer-hidden-bookable: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-11-12-f1-felles-for-ai-kanalene, slice F1-1: source_client
+// (which AI assistant) on gårdssalg bookings — MCP, REST, web form, allow-list.
+// Swaps the experiences DB, BOOKING_DISPATCH_ENABLED and the mailer — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-12-f1-felles-for-ai-kanalene F1-1: source_client på gårdssalg-bookinger ──");
+  try {
+    const { runOpplevelserGardssalgSourceClientTests } = require("../src/routes/opplevelser-gardssalg-source-client.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-source-client.test");
+    const r = await runOpplevelserGardssalgSourceClientTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("opplevelser-gardssalg-source-client: " + f);
+    console.log(`  opplevelser-gardssalg-source-client: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-gardssalg-source-client: unexpected error: " + String(err?.message || err));
   }
 });
 

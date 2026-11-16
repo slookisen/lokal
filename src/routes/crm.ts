@@ -23,6 +23,7 @@ import { getDb } from "../database/init";
 import { isOutreachPaused } from "./admin-outreach-candidates";
 import { unsubscribeHeaderValues } from "../services/avmeld-service";
 import { getOutreachMaxTouchVernConfig, getMaxTouchStatusForEmail } from "../services/outreach-max-touch-vern";
+import { hasRfbPromiseGiven, PROMISE_GIVEN_REASON } from "../services/rfb-outreach-promise";
 import {
   classifyAutomated,
   classifyForwardCopy,
@@ -794,6 +795,23 @@ export function executeCompose(rawBody: unknown, deps: ComposeDeps = {}): Compos
     const maxTouchRefusal = checkMaxTouchVern(getDb(), to);
     if (maxTouchRefusal) {
       return notSent(429, maxTouchRefusal);
+    }
+
+    // ─── promise_given (dev-request 2026-11-15-rfb-utsending-loftesetning-
+    // holdes) ─────────────────────────────────────────────────────────────
+    // Send-path twin of the gate's promise_given: an address that got an RFB
+    // template promising not to write again gets no new RFB e-mail from
+    // compose. Like max-touch-vern, force/createdBy do not override it, and it
+    // runs before the daily-cap reservation below, so nothing is reserved.
+    // Replies continue on /threads/:id/send, which this does not touch.
+    if (vertical === "rfb" && intent === "resend_send" && hasRfbPromiseGiven(getDb(), to)) {
+      return notSent(409, {
+        success: false,
+        error: PROMISE_GIVEN_REASON,
+        reason:
+          "refusing to send: this address has received an RFB template that promises not to write again " +
+          "(services/rfb-outreach-promise.ts). force/createdBy do not override it.",
+      });
     }
 
     // ─── Bounce/complaint suppression (owner decision 2026-09-29 «Blacklist
