@@ -38,7 +38,14 @@
 //                           alone) — see buildRfbEnrichmentBmHarvestRequest.
 //   3  contact_extraction   POST /admin/rfb-contact-extraction, in process,
 //                           one row per call, for rows whose site answers and
-//                           that have no e-mail.
+//                           that have no e-mail. Also (B1 step 2, dev-request
+//                           2026-11-15-rfb-nattjobb-hull-kontaktuttrekk-bm-
+//                           og-koer) rows with a non-dead agents.contact_email
+//                           but no agent_knowledge.email: the address is
+//                           copied only when it is seen on the producer's own
+//                           site (backfill mode); not there → the normal
+//                           scrape, knowledge e-mail only. Same cap and LLM
+//                           budget — see rfbCxRowTakesKnowledgeGapPath.
 //   4  content_refresh      refreshRfbCandidateHomepage (the route's own
 //                           write-pause gate + target filter + per-agent body,
 //                           R2 rules included) for rows whose site answers
@@ -223,6 +230,7 @@ import brregSelfSufficiencyRouter, {
 import contactExtractionRouter, {
   rfbCxSelectSql,
   RFB_CX_ELIGIBLE_WHERE,
+  RFB_CX_KNOWLEDGE_GAP_WHERE,
   RFB_CX_HARD_CAP,
 } from "../routes/admin-rfb-contact-extraction";
 import bmProducerHarvestRouter from "../routes/admin-bm-producer-harvest";
@@ -1044,6 +1052,34 @@ export function summarizeRfbContactEmailNotInKnowledge(rows: RfbEnrichmentCohort
   return out;
 }
 
+/** contact_extraction outcome: B1 step 2 copied the on-file address after seeing it on the own site. */
+export const RFB_ENRICHMENT_CX_BACKFILLED = "backfilled_from_contact_email";
+/**
+ * contact_extraction outcome: B1 step 2, the address was not on the site; the
+ * normal scrape wrote one. A WRITE (no `rejected_` prefix on purpose); the
+ * non-writing fallback outcomes are `rejected_not_on_site_then_<outcome>`.
+ */
+export const RFB_ENRICHMENT_CX_NOT_ON_SITE_SCRAPED = "scraped_after_not_on_site";
+
+/**
+ * B1 step 2: does contact_extraction run this row on the knowledge-gap path
+ * (own-site proof of agents.contact_email, then scrape) rather than the
+ * normal scrape? Same split as the route's cohorts: a blank or DNS-dead
+ * contact_email is the normal cohort (RFB_CX_ELIGIBLE_WHERE); a set, not-dead
+ * one with an empty knowledge e-mail is RFB_CX_KNOWLEDGE_GAP_WHERE.
+ */
+export function rfbCxRowTakesKnowledgeGapPath(r: {
+  contact_email: string | null;
+  k_email: string | null;
+  field_provenance: string | null;
+}): boolean {
+  return (
+    trimmed(r.contact_email) !== "" &&
+    trimmed(r.k_email) === "" &&
+    rfbContactEmailDnsState(r.field_provenance) !== "dead"
+  );
+}
+
 interface BaseRow {
   id: string;
   name: string | null;
@@ -1425,6 +1461,8 @@ interface SelectionContext {
   attempts: Map<string, Map<string, number>>;
   brregCandidateIds?: Set<string>;
   cxEligibleIds?: Set<string>;
+  /** B1 step 2: the route's knowledge_gap cohort (contact_email set, not DNS-dead, k.email empty). */
+  cxKnowledgeGapIds?: Set<string>;
   pendingQueueAgentIds?: Set<string>;
 }
 
@@ -1435,6 +1473,8 @@ export interface RfbEnrichmentSelection {
   skipped: Record<string, number>;
   /** url_check only: rows whose URL is agents.url because k.website is blank. */
   a_url_only?: { eligible: number; selected: number };
+  /** contact_extraction only: rows taken by the B1 step 2 path (rfbCxRowTakesKnowledgeGapPath). */
+  contact_email_not_in_knowledge?: { eligible: number; selected: number };
 }
 
 function parseMs(v: string | null | undefined): number | null {
@@ -1494,8 +1534,11 @@ function stepEligible(step: RfbEnrichmentStep, r: RfbEnrichmentCohortRow, ctx: S
     case "brreg_contact":
       return !!ctx.brregCandidateIds?.has(r.id);
     case "contact_extraction":
+      // B1 step 2: the knowledge-gap rows share the step (same cap, same
+      // retry window, same LLM reservation); they never overlap the old
+      // cohort (that one needs a blank or DNS-dead contact_email).
       return (
-        !!ctx.cxEligibleIds?.has(r.id) &&
+        (!!ctx.cxEligibleIds?.has(r.id) || !!ctx.cxKnowledgeGapIds?.has(r.id)) &&
         trimmed(r.k_website) !== "" &&
         trimmed(r.k_email) === "" &&
         rfbEnrichmentSiteAnswers(r)
@@ -1548,6 +1591,7 @@ function buildSelectionContext(
       `SELECT a.id AS id FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id WHERE ${rfbBssCandidateWhereSql(db)}`,
     ),
     cxEligibleIds: idSet(db, rfbCxSelectSql(RFB_CX_ELIGIBLE_WHERE)),
+    cxKnowledgeGapIds: idSet(db, rfbCxSelectSql(RFB_CX_KNOWLEDGE_GAP_WHERE)),
     pendingQueueAgentIds: idSet(db, `SELECT agent_id AS id FROM agents_website_review_queue WHERE status = 'pending'`),
   };
 }
@@ -1597,6 +1641,13 @@ export async function selectRfbEnrichmentStepRows(
   if (step === "url_check") {
     const aOnly = (r: RfbEnrichmentCohortRow) => trimmed(r.k_website) === "";
     out.a_url_only = { eligible: picked.filter((p) => aOnly(p.row)).length, selected: rows.filter(aOnly).length };
+  }
+  if (step === "contact_extraction") {
+    const gap = (r: RfbEnrichmentCohortRow) => !!ctx.cxKnowledgeGapIds?.has(r.id);
+    out.contact_email_not_in_knowledge = {
+      eligible: picked.filter((p) => gap(p.row)).length,
+      selected: rows.filter(gap).length,
+    };
   }
   return out;
 }
@@ -1759,6 +1810,11 @@ export interface RfbEnrichmentRowOutcome {
   stop?: string;
   error?: boolean;
   detail?: string;
+  /**
+   * contact_extraction only: the row went the B1 step 2 path (tallied in the
+   * step's extra.contact_email_not_in_knowledge_outcomes).
+   */
+  knowledge_gap?: boolean;
 }
 
 export interface RfbEnrichmentBmOutcome {
@@ -1813,7 +1869,15 @@ export interface RfbEnrichmentExecutors {
   emailDomainWebsite(row: RfbEnrichmentCohortRow): Promise<RfbEnrichmentRowOutcome>;
   brregContact(row: RfbEnrichmentCohortRow): Promise<RfbEnrichmentRowOutcome>;
   bmHarvest(args: RfbEnrichmentBmArgs): Promise<RfbEnrichmentBmOutcome>;
-  contactExtraction(row: RfbEnrichmentCohortRow): Promise<RfbEnrichmentRowOutcome>;
+  /**
+   * opts.stopBeforeSecondCall (B1 step 2): checked between the own-site proof
+   * and the scrape fallback of a knowledge-gap row; a non-null reason (run
+   * deadline, 08Z hour) means the scrape is not started.
+   */
+  contactExtraction(
+    row: RfbEnrichmentCohortRow,
+    opts?: { stopBeforeSecondCall?: () => string | null },
+  ): Promise<RfbEnrichmentRowOutcome>;
   /**
    * opts.productNames: the row's LLM reservation is in place — hand the
    * refresh the product-name extractor (generic stored products only).
@@ -1940,18 +2004,49 @@ export function createDefaultRfbEnrichmentExecutors(
       };
     },
 
-    async contactExtraction(row) {
-      const r = await callAdminRouterInProcess(contactExtractionRouter, {
-        method: "POST",
-        path: "/rfb-contact-extraction",
-        body: { agentIds: [row.id], apply: true },
-      });
-      if (r.status === 409) return { outcome: "run_in_progress", written: false, changed: false, stop: "contact_extraction_run_in_progress" };
-      if (r.status !== 200) return rfbEnrichmentHttpFailureOutcome(r.status, String(r.body?.error ?? ""));
-      const item = Array.isArray(r.body?.results) ? r.body.results[0] : null;
-      const outcome = typeof item?.outcome === "string" ? item.outcome : "no_result";
-      const written = outcome === "written";
-      return { outcome, written, changed: written, ...(item?.detail ? { detail: String(item.detail) } : {}) };
+    async contactExtraction(row, opts) {
+      const call = async (extra: Record<string, unknown>): Promise<RfbEnrichmentRowOutcome> => {
+        const r = await callAdminRouterInProcess(contactExtractionRouter, {
+          method: "POST",
+          path: "/rfb-contact-extraction",
+          body: { agentIds: [row.id], apply: true, ...extra },
+        });
+        if (r.status === 409) return { outcome: "run_in_progress", written: false, changed: false, stop: "contact_extraction_run_in_progress" };
+        if (r.status !== 200) return rfbEnrichmentHttpFailureOutcome(r.status, String(r.body?.error ?? ""));
+        const item = Array.isArray(r.body?.results) ? r.body.results[0] : null;
+        const outcome = typeof item?.outcome === "string" ? item.outcome : "no_result";
+        const written = outcome === "written";
+        return { outcome, written, changed: written, ...(item?.detail ? { detail: String(item.detail) } : {}) };
+      };
+      if (!rfbCxRowTakesKnowledgeGapPath(row)) return call({});
+      // B1 step 2 (dev-request 2026-11-15-rfb-nattjobb-hull-kontaktuttrekk-
+      // bm-og-koer): first the own-site proof of the address already on file;
+      // written only when it is seen there (route's backfill mode, the
+      // knowledge_gap cohort also takes a never-checked/unknown DNS stamp).
+      const proof = await call({ mode: "backfill_from_contact_email", knowledge_gap: true });
+      if (proof.outcome === "written") {
+        return { ...proof, outcome: RFB_ENRICHMENT_CX_BACKFILLED, knowledge_gap: true };
+      }
+      // Site read, address not there → the normal scrape of the same site
+      // (knowledge e-mail only; the existing contact_email is kept). Any
+      // other proof outcome (fetch_failed, cooldown_skipped, host_excluded,
+      // rejected_domain_mismatch, …) is recorded as it is: no write, no scrape.
+      if (proof.outcome !== "rejected_not_on_site") return { ...proof, knowledge_gap: true };
+      // The proof call took time: re-check the run deadline / forbidden hour
+      // before starting a second live fetch. Past it → the proof outcome is
+      // recorded, no scrape; `stop` ends the step and keeps the row unstamped
+      // (transient), so it gets its scrape on another night.
+      const late = opts?.stopBeforeSecondCall?.() ?? null;
+      if (late) return { ...proof, knowledge_gap: true, stop: late };
+      const scraped = await call({ knowledge_gap: true });
+      // A transient scrape answer (cooldown, run-lock, timeout, http_*) keeps
+      // its own code so the row is retried tomorrow, not parked.
+      if (isTransientRfbEnrichmentOutcome(scraped)) return { ...scraped, knowledge_gap: true };
+      return {
+        ...scraped,
+        outcome: scraped.written ? RFB_ENRICHMENT_CX_NOT_ON_SITE_SCRAPED : `rejected_not_on_site_then_${scraped.outcome}`,
+        knowledge_gap: true,
+      };
     },
 
     async contentRefresh(row, deadlineAtMs, opts) {
@@ -2066,6 +2161,8 @@ export interface RfbEnrichmentPreview {
     skipped?: Record<string, number>;
     /** url_check: rows whose URL is agents.url because k.website is blank. */
     a_url_only?: { eligible: number; selected: number };
+    /** contact_extraction: of eligible/selected, rows on the B1 step 2 path. */
+    contact_email_not_in_knowledge?: { eligible: number; selected: number };
     note?: string;
     bm?: { offset: number; limit: number; last_total: number | null; cursor_updated_at: string | null };
   }>;
@@ -2214,6 +2311,7 @@ export async function buildRfbEnrichmentPreview(db: Db, now: Date): Promise<RfbE
       selected_ids: sel.rows.map((r) => r.id),
       ...(Object.keys(sel.skipped).length > 0 ? { skipped: sel.skipped } : {}),
       ...(sel.a_url_only ? { a_url_only: sel.a_url_only } : {}),
+      ...(sel.contact_email_not_in_knowledge ? { contact_email_not_in_knowledge: sel.contact_email_not_in_knowledge } : {}),
       ...(step === "reverify" ? { note: "plus every row steps 1–4 change tonight (taken first, same cap)" } : {}),
     });
   }
@@ -2603,6 +2701,7 @@ async function runSteps(rc: RunContext): Promise<void> {
       tallyMap[out.categories_corroboration] = (tallyMap[out.categories_corroboration] ?? 0) + 1;
     }
     if (out.product_names) tallyExtra(sr, "product_names", out.product_names);
+    if (out.knowledge_gap) tallyExtra(sr, "contact_email_not_in_knowledge_outcomes", out.outcome);
     sr.rows.push({ agent_id: agentId, outcome: out.outcome, ...(out.detail ? { detail: out.detail.slice(0, 200) } : {}) });
   };
 
@@ -2623,10 +2722,11 @@ async function runSteps(rc: RunContext): Promise<void> {
     const sel = await selectRfbEnrichmentStepRows(step, cohort, buildSelectionContext(db, now.getTime(), attempts), sr.cap);
     sr.eligible = sel.eligible;
     sr.selected = sel.rows.length;
-    if (Object.keys(sel.skipped).length > 0 || sel.a_url_only) {
+    if (Object.keys(sel.skipped).length > 0 || sel.a_url_only || sel.contact_email_not_in_knowledge) {
       sr.extra = {
         ...(Object.keys(sel.skipped).length > 0 ? { skipped_before_selection: sel.skipped } : {}),
         ...(sel.a_url_only ? { a_url_only: sel.a_url_only } : {}),
+        ...(sel.contact_email_not_in_knowledge ? { contact_email_not_in_knowledge: sel.contact_email_not_in_knowledge } : {}),
       };
     }
     const llmOptional = RFB_ENRICHMENT_LLM_OPTIONAL_STEPS.has(step);
@@ -2780,7 +2880,16 @@ async function runSteps(rc: RunContext): Promise<void> {
   }
 
   // 3–4
-  await runRowStep("contact_extraction", (row) => exec.contactExtraction(row));
+  await runRowStep("contact_extraction", (row) =>
+    exec.contactExtraction(row, {
+      stopBeforeSecondCall: () => {
+        const t = clock();
+        if (isRfbEnrichmentForbiddenHour(t)) return "forbidden_hour";
+        if (t.getTime() >= rc.deadline.getTime() || t.getTime() >= rc.writeDeadline.getTime()) return "time_budget";
+        return null;
+      },
+    }),
+  );
   await runRowStep("content_refresh", (row, rowLlm) =>
     exec.contentRefresh(
       row,
@@ -3114,7 +3223,8 @@ function isWrittenOutcome(step: RfbEnrichmentStep, outcome: string): boolean {
     case "bm_harvest":
       return outcome === "written" || outcome === "phone_written" || outcome === "url_proposed";
     case "contact_extraction":
-      return outcome === "written";
+      // B1 step 2: the knowledge-gap path's two write outcomes.
+      return outcome === "written" || outcome === RFB_ENRICHMENT_CX_BACKFILLED || outcome === RFB_ENRICHMENT_CX_NOT_ON_SITE_SCRAPED;
     case "content_refresh":
       return (
         outcome === "refreshed" ||

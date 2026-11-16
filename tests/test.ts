@@ -52052,6 +52052,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-15-rfb-nattjobb-hull-kontaktuttrekk-bm-og-koer (B1-2):
+// contact_extraction also takes contact_email-not-in-knowledge rows — own-site
+// proof first, scrape fallback on rejected_not_on_site (knowledge e-mail only),
+// default route cohorts unchanged. Fresh in-memory DB per block — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-15-rfb-nattjobb-hull (B1-2): rfb-enrichment-cx-knowledge-gap ──");
+  try {
+    const { runRfbEnrichmentCxKnowledgeGapTests } = require("../src/services/rfb-enrichment-cx-knowledge-gap.test") as
+      typeof import("../src/services/rfb-enrichment-cx-knowledge-gap.test");
+    const rkg = await runRfbEnrichmentCxKnowledgeGapTests({ log: false });
+    passed += rkg.passed;
+    failed += rkg.failed;
+    for (const f of rkg.failures) failures.push("rfb-enrichment-cx-knowledge-gap: " + f);
+    console.log(`  rfb-enrichment-cx-knowledge-gap: ${rkg.passed} passed, ${rkg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-enrichment-cx-knowledge-gap: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-11-01-rfb-hold-profilen-oppdatert («Hold profilen
 // oppdatert»): the owner refresh as the nightly run's last step behind
 // OWNER_AUTO_UPDATES_ENABLED — AC1/AC2 (fill_empty / never / automatic, the
