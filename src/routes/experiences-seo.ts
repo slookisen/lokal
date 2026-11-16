@@ -249,6 +249,7 @@ import {
   // checkBookingSlotAllowed() — see that call site's own comment.
   normaliseBookingSlotInput,
 } from "../services/booking-store";
+import { checkGardssalgBookingGuard, capReachedMessage } from "../services/gardssalg-booking-caps";
 // dev-request 2026-07-14-booking-flyt-v1, slice 1 ("myk åpningstidsvalidering")
 // — the SAME shared choke point POST /api/opplevelser/book and the
 // book_gardssalg MCP tool use, never re-derived here.
@@ -7256,6 +7257,13 @@ function bookingErrorMessage(code: string): string {
     // form fields.
     case "slot_bounds":
       return "Det valgte tidspunktet må være i fremtiden og innenfor bookingvinduet. Velg et gyldig tidspunkt og prøv igjen.";
+    // O1-3: the no-JS form's cap_reached redirect (?error=cap_<cap>).
+    case "cap_open_per_guest_producer":
+      return capReachedMessage("open_per_guest_producer", "no");
+    case "cap_guest_per_day":
+      return capReachedMessage("guest_per_day", "no");
+    case "cap_producer_per_day":
+      return capReachedMessage("producer_per_day", "no");
     default:
       return "Noe gikk galt. Prøv igjen.";
   }
@@ -7552,6 +7560,20 @@ router.post(
       }
       const hours = String((slotCheck.body as { opening_hours_text?: string | null }).opening_hours_text || "");
       res.redirect(303, `${backTo}?error=outside_hours&hours=${encodeURIComponent(hours)}`);
+      return;
+    }
+
+    // O1-3 (G6/G7): duplicate guard + request caps, behind
+    // GARDSSALG_BOOKING_CAP_ENABLED (flag off → always "ok"). A duplicate goes
+    // to the existing request's receipt page; a cap to the form with the
+    // cap's sentence. Either way: no new row, no e-mail.
+    const guard = checkGardssalgBookingGuard(parsed.data);
+    if (guard.kind === "duplicate") {
+      res.redirect(303, `${backTo}/confirm/${encodeURIComponent(guard.booking_ref)}`);
+      return;
+    }
+    if (guard.kind === "cap_reached") {
+      res.redirect(303, `${backTo}?error=cap_${guard.cap}`);
       return;
     }
 

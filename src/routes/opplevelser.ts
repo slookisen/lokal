@@ -952,6 +952,7 @@ import {
   receiptFormMessage,
   confirmedIcsForBooking,
 } from "../services/gardssalg-honest-receipt";
+import { checkGardssalgBookingGuard, duplicateMessage, capReachedMessage } from "../services/gardssalg-booking-caps";
 import {
   createBooking,
   getBookingByRef,
@@ -34246,6 +34247,38 @@ router.post("/book", async (req: Request, res: Response) => {
   );
   if (!slotCheck.ok) {
     res.status(slotCheck.status).json(slotCheck.body);
+    return;
+  }
+
+  // O1-3 (G6/G7): duplicate guard + request caps, behind
+  // GARDSSALG_BOOKING_CAP_ENABLED (flag off → always "ok", no DB read).
+  // Either outcome: no new row and no e-mail.
+  const guard = checkGardssalgBookingGuard(parsed.data);
+  if (guard.kind === "duplicate") {
+    const existing = getBookingByRef(guard.booking_ref);
+    res.status(200).json({
+      success: true,
+      duplicate: true,
+      booking_ref: guard.booking_ref,
+      status: existing?.status ?? "reserved",
+      provider: providerInfo,
+      slot_at_local: existing ? formatSlotOslo(existing.slot_at) : slotLocal,
+      message: duplicateMessage(guard.booking_ref, "no"),
+      message_en: duplicateMessage(guard.booking_ref, "en"),
+    });
+    return;
+  }
+  if (guard.kind === "cap_reached") {
+    res.status(200).json({
+      success: false,
+      cap_reached: true,
+      reason: "cap_reached",
+      cap: guard.cap,
+      limit: guard.limit,
+      provider: providerInfo,
+      message: capReachedMessage(guard.cap, "no"),
+      message_en: capReachedMessage(guard.cap, "en"),
+    });
     return;
   }
 
