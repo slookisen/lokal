@@ -371,6 +371,29 @@ export function runGardssalgNotifyAddressO43Tests(opts: { log?: boolean } = {}):
         assertEq((await request("GET", link)).status, 410, "k23: GET after use → 410");
       }
 
+      // ── registry: contact.booking_email (live behind the flag, confirmByEmail) ──
+      {
+        const reg = require("../owner-features/registry") as typeof import("../owner-features/registry");
+        const e = reg.GARDSSALG_OWNER_FEATURE_REGISTRY.find((x) => x.key === "contact.booking_email")!;
+        assertEq([e.status, e.liveFlag, e.devRequest, e.confirmByEmail, e.outward],
+          ["live", FLAG, "2026-11-12-opplevagent-o4-epost-og-tekster", true, true], "r1: contact.booking_email is live behind the flag, confirmByEmail, outward");
+        assertEq(e.surfaces, ["email:booking_request", "email:address_confirm", "email:address_change_notice", "owner_portal"], "r2: its surfaces");
+        assertEq(reg.ownerFeatureStatus(e, { [FLAG]: "true" } as any), "live", "r3: flag on → live");
+        assertEq(reg.ownerFeatureStatus(e, {} as any), "coming_soon", "r4: flag off → coming_soon");
+        const page = await getValg("o43agard", "o43-a");
+        const rowM = /<li class="mv-item" id="valg-contact\.booking_email"[\s\S]*?<\/li>/.exec(page.body);
+        assertTrue(!!rowM && rowM[0].includes(addrA), "r5: flag on → the row shows where requests go");
+        assertTrue(!!rowM && !rowM[0].includes("<form") && !rowM[0].includes("<input"), "r6: … with no direct edit form");
+        const ch = changes();
+        const put = await request("PUT", `/api/opplevelser/gardssalg-claim/o43-a/features/contact.booking_email`, { ...cookie("o43-a"), ...browserForm }, JSON.stringify({ value: "x@example.no" }), "application/json");
+        assertEq([put.status, JSON.parse(put.body).error], [409, "confirm_by_email"], "r7: a direct write → 409 confirm_by_email");
+        assertEq(changes(), ch, "r8: … nothing written");
+        setFlag(undefined);
+        const off = await getValg("o43agard", "o43-a");
+        assertTrue(!off.body.includes('id="valg-contact.booking_email"') && off.body.includes('data-planned-key="contact.booking_email"'), "r9: flag off → planned only, as before");
+        setFlag("true");
+      }
+
       // ── confirmed → the switch turns on ───────────────────────────────
       {
         const page = await getValg("o43agard", "o43-a");
@@ -444,6 +467,14 @@ export function runGardssalgNotifyAddressO43Tests(opts: { log?: boolean } = {}):
         try { await store.sendProducerNotification(booking, NEW, null); } catch { /* recorded below */ }
         const toProducer = sent.slice(n0).map((m) => m.to);
         assertTrue(toProducer.length >= 1 && toProducer.every((t) => t === addrA), "c11: the booking request e-mail goes to the old, confirmed address");
+        // N1: the gated producer e-mails (reminder, cancellation — getProviderDispatchRow) go there too.
+        const n0b = sent.length;
+        const gated = await store.sendGatedProducerEmail(booking, "o43-test", (to) => ({ subject: "o43 gated", htmlContent: to, textContent: to }));
+        assertEq(gated, true, "c11b: a gated producer e-mail is sent");
+        assertEq(sent.slice(n0b).map((m) => [m.to, m.text]), [[addrA, addrA]], "c11c: the gated producer e-mail (sendGatedProducerEmail) goes to the old, confirmed address");
+        const n0c = sent.length;
+        const rem = await store.sendPrevisitReminderToProducer({ ...booking, respond_token_expires_at: new Date(Date.now() + 24 * HOUR).toISOString() });
+        assertEq([rem, sent.slice(n0c).map((m) => m.to)], [true, [addrA]], "c11d: the producer reminder goes to the old, confirmed address");
 
         // Booking turned off: switching on again needs the new address confirmed.
         expDb.prepare(`UPDATE experience_providers SET booking_live = 0 WHERE id = 'o43-a'`).run();

@@ -72,6 +72,26 @@ export const GARDSSALG_BOOKING_ENABLED_ADAPTER: OwnerFeatureStorageAdapter = {
   },
 };
 
+/**
+ * O4-3 (dev-request 2026-11-12-opplevagent-o4-epost-og-tekster):
+ * contact.booking_email ↔ the address booking requests go to now
+ * (gardssalgNotifyRecipient: experience_providers.epost, or the confirmed
+ * old address while a changed one awaits confirmation). Read only: the
+ * address changes only through the e-mailed confirmation link
+ * (confirmByEmail), never by a direct write.
+ */
+export const GARDSSALG_NOTIFY_ADDRESS_ADAPTER: OwnerFeatureStorageAdapter = {
+  column: "experience_providers.epost (gardssalg_notify_address.confirmed_email)",
+  read: (_db, subjectId) => {
+    const row = experiencesDb().prepare(`SELECT epost FROM experience_providers WHERE id = ?`).get(subjectId) as
+      | { epost: string | null } | undefined;
+    if (!row) return null;
+    const to = notifyAddress().gardssalgNotifyRecipient(subjectId, row.epost);
+    return typeof to === "string" && to.trim() !== "" ? to.trim() : null;
+  },
+  write: () => false,
+};
+
 const SELF_REGISTERED_BOOKING_BLOCKED_EN =
   "Booking cannot be switched on until Opplevagent has approved the registration. Contact kontakt@opplevagent.no.";
 
