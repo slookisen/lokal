@@ -7,6 +7,7 @@
  */
 
 import { signAgentCard } from "./agent-card-signing";
+import { A2A_PROTOCOL_VERSION } from "./a2a-protocol-version";
 import { registeredMcpTools } from "./mcp-tool-manifest";
 import { agentCardProvider } from "./company-legal";
 import { distributionFor } from "../config/distribution-channels";
@@ -48,10 +49,11 @@ export function getDentalAgentCard(honestCount?: number | null): object {
       "A2A marketplace for Norwegian dental clinics with Helfo-agreement, speciality, and emergency-claim data." +
       (hasCount ? ` Katalog / catalog: ${honestCount} klinikker / clinics.` : ""),
     url: `${url}/a2a`,
-    // A2A v1.0 (Linux Foundation, released April 2026) top-level protocol fields,
-    // dual-published alongside legacy `authentication` below (additive-only —
-    // dev-request 2026-07-13-a2a-card-v1-signing slice 1).
-    protocolVersion: "1.0.0",
+    // A2A top-level protocol fields, alongside legacy `authentication` below
+    // (dev-request 2026-07-13-a2a-card-v1-signing slice 1). protocolVersion is
+    // the version the server speaks: the ONE constant (A2A dev-request F1-4,
+    // services/a2a-protocol-version.ts) — v0.3, not the "1.0.0" it used to say.
+    protocolVersion: A2A_PROTOCOL_VERSION,
     preferredTransport: "JSONRPC",
     additionalInterfaces: [
       { url: `${url}/api/tannlege`, transport: "HTTP+JSON" },

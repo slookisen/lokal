@@ -68,6 +68,8 @@
  *       Moved on purpose (2026-11-13, rfb-svar-til-kjoperagenter-tredje-person):
  *       the RFB GET /a2a card's «agent-conversation» / «Start Agent
  *       Negotiation» skill is now «producer-profile-answer» (old id an alias).
+ *       Moved on purpose (2026-11-16, A2A F1-4): the RFB and Opplevagent GET
+ *       /a2a cards' protocolVersion is "0.3.0" (A2A_PROTOCOL_VERSION), not "1.0.0".
  *
  * Data: I-Y's fixtures (own in-memory DBs, restored in finally; geocoding
  * offline), the real handlers: MCP tools through a duck-typed server, the

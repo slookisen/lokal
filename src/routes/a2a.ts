@@ -39,6 +39,7 @@ import { emailRevealGuardEnabled, withKnowledgeEmailNull } from "../services/ema
 import { rfbEmailHiddenIds } from "../services/contact-form-only";
 import { guardConversationEmails, messageForListener, liveStreamCacheControl } from "../services/conversation-email-guard";
 import { readSearchText, geocodeSearchPlace, discoveryQueryOf, outsideNorwayText, noProductMatchText } from "../services/rfb-search-reading";
+import { A2A_PROTOCOL_VERSION } from "../services/a2a-protocol-version";
 import {
   isOrderAgentActionsEnabled,
   orderIdForTaskRequest,
@@ -164,11 +165,11 @@ router.get("/a2a", (_req: Request, res: Response) => {
         description: "Open agent-to-agent food marketplace operator. Norges første A2A-markedsplass for lokal mat.",
       },
       version: "1.0.0",
-      // A2A v1.0 fields, dual-published alongside legacy `authentication`/`interfaces`
-      // below (additive-only — dev-request 2026-07-13-a2a-card-v1-signing slice 1).
-      // Kept in parity with marketplaceRegistry.getRegistryCard()'s v1.0 fields per
-      // that dev-request's acceptance criterion 4 (this card vs. the .well-known card).
-      protocolVersion: "1.0.0",
+      // A2A top-level protocol fields, alongside legacy `authentication`/`interfaces`
+      // below (dev-request 2026-07-13-a2a-card-v1-signing slice 1). Kept in parity
+      // with marketplaceRegistry.getRegistryCard() per that dev-request's acceptance
+      // criterion 4. protocolVersion: the ONE constant (A2A dev-request F1-4).
+      protocolVersion: A2A_PROTOCOL_VERSION,
       preferredTransport: "JSONRPC",
       additionalInterfaces: [
         { url: `${process.env.BASE_URL || "https://rettfrabonden.com"}/api/marketplace`, transport: "HTTP+JSON" },
@@ -873,7 +874,7 @@ function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
 // REST ENDPOINTS (backward compat + human use)
 // ═══════════════════════════════════════════════════════════════
 
-// GET /.well-known/agent-card.json — A2A Agent Card discovery (spec v1.0.0 compliant)
+// GET /.well-known/agent-card.json — A2A Agent Card discovery (protocolVersion: A2A_PROTOCOL_VERSION)
 // The official A2A spec requires agent-card.json, not agent.json.
 // We serve both paths: the correct one and the legacy one for backward compat.
 function serveAgentCard(_req: Request, res: Response) {
@@ -913,7 +914,7 @@ function serveAgentCard(_req: Request, res: Response) {
   res.json(card);
 }
 
-router.get("/.well-known/agent-card.json", agentCardUsageLogger("rfb"), serveAgentCard); // A2A spec v1.0.0
+router.get("/.well-known/agent-card.json", agentCardUsageLogger("rfb"), serveAgentCard); // A2A well-known path
 router.get("/.well-known/agent.json", agentCardUsageLogger("rfb"), serveAgentCard);       // Legacy compat
 
 // GET /.well-known/jwks.json — JWKS for verifying A2A agent-card signatures
