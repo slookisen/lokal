@@ -1151,6 +1151,29 @@ export function initExperiencesSchema(db: Database.Database): void {
   // Additive, nullable; existing rows stay NULL (= "nb").
   try { db.exec("ALTER TABLE gardssalg_bookings ADD COLUMN guest_lang TEXT"); } catch { /* already present */ }
 
+  // ─── O4-3: the confirmed address for visit requests (same dev-request) ───
+  // One row per producer: the confirmed address and the pending single-use
+  // link (stored only as its SHA-256 hash). Written only by
+  // services/gardssalg-notify-address.ts, behind
+  // GARDSSALG_NOTIFY_ADDRESS_CONFIRM_ENABLED. Additive.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS gardssalg_notify_address (
+      provider_id TEXT PRIMARY KEY,
+      confirmed_email TEXT,
+      confirmed_at TEXT,
+      pending_email TEXT,
+      token_hash TEXT,
+      token_expires_at TEXT,
+      token_sent_at TEXT,
+      send_window_start TEXT,
+      send_count INTEGER NOT NULL DEFAULT 0,
+      change_notice_for TEXT,
+      change_notice_sent_at TEXT,
+      updated_at TEXT
+    )
+  `);
+  db.exec("CREATE INDEX IF NOT EXISTS idx_gardssalg_notify_address_token ON gardssalg_notify_address(token_hash)");
+
   // ─── listing_url (dev-request 2026-07-12-experiences-enrichment-supply-
   // and-aggregator-hygiene, Daniel's 2026-07-19 decision, step 1) ───────────
   // A chunk of experience_providers.hjemmeside rows carry a DMO/aggregator/

@@ -140,6 +140,8 @@ export interface OwnerPageBooking {
   maxPartySize: number;
   /** «Les mer» (/for-tilbydere#besok) — only when that page is published. */
   readMoreUrl: string | null;
+  /** O4-3: the address-confirmation block (GARDSSALG_NOTIFY_ADDRESS_CONFIRM_ENABLED on only; absent = as before). */
+  addressConfirmHtml?: string | null;
 }
 
 /** Gårdssalg statistics block (the portal's own GET …/stats numbers). */
@@ -572,7 +574,7 @@ function bookingCheckHtml(m: OwnerPageModel): string {
   } else {
     check = `<p class="mv-check" data-booking-check="ok">Forespørsler sendes til <strong>${esc(b.requestEmail)}</strong>. Er adressen feil? <a href="${esc(b.fixHref)}">Si fra</a>.</p>`;
   }
-  return check + price;
+  return check + (b.addressConfirmHtml ?? "") + price;
 }
 
 /** Gårdssalg (O1 principle 4): «Slik fungerer det», read from booking-store as built. */
