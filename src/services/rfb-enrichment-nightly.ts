@@ -976,6 +976,74 @@ export function summarizeRfbEnrichmentCohort(cohort: RfbEnrichmentCohort): RfbEn
   };
 }
 
+/**
+ * dev-request 2026-11-15-rfb-nattjobb-hull-kontaktuttrekk-bm-og-koer, slice
+ * B1 step 1 ("tell først") — a read-only COUNT, no behaviour change.
+ *
+ * Cohort rows (the job's own active, uncontacted RFB cohort, AC1) whose
+ * agents.contact_email is set but whose agent_knowledge.email is empty. Such a
+ * row is outside contact_extraction's RFB_CX_ELIGIBLE_WHERE
+ * (routes/admin-rfb-contact-extraction.ts: contact_email blank or DNS-dead)
+ * unless its DNS stamp is dead, and the route's backfill_from_contact_email
+ * mode (DNS live = 1) is not run by this job. Counts only — never an address
+ * or an id.
+ */
+export interface RfbContactEmailNotInKnowledge {
+  total: number;
+  /**
+   * field_provenance.contact_email_dns_check.live, read as the
+   * contact-extraction cohort SQL reads it (json_extract → 1 live, 0 dead,
+   * NULL never checked). `unknown`: a stamp whose `live` is none of those, or
+   * a field_provenance that is not a JSON object — kept apart, not folded.
+   */
+  by_dns: { never_checked: number; live: number; dead: number; unknown: number };
+  /** agent_knowledge.website non-empty — what rfbCxSelectSql requires. */
+  with_website: number;
+  /** with_website AND rfbEnrichmentSiteAnswers — contact_extraction's own website test. */
+  with_responding_website: number;
+}
+
+type RfbContactEmailDnsState = keyof RfbContactEmailNotInKnowledge["by_dns"];
+
+/** The contact_email DNS-check state of a field_provenance blob (see by_dns). */
+export function rfbContactEmailDnsState(fieldProvenance: string | null): RfbContactEmailDnsState {
+  if (fieldProvenance === null || fieldProvenance === undefined) return "never_checked";
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fieldProvenance);
+  } catch {
+    return "unknown";
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "unknown";
+  const stamp = (parsed as Record<string, unknown>)["contact_email_dns_check"];
+  if (stamp === undefined || stamp === null) return "never_checked";
+  if (typeof stamp !== "object" || Array.isArray(stamp)) return "unknown";
+  const live = (stamp as Record<string, unknown>)["live"];
+  if (live === undefined || live === null) return "never_checked";
+  if (live === true || live === 1) return "live";
+  if (live === false || live === 0) return "dead";
+  return "unknown";
+}
+
+export function summarizeRfbContactEmailNotInKnowledge(rows: RfbEnrichmentCohortRow[]): RfbContactEmailNotInKnowledge {
+  const out: RfbContactEmailNotInKnowledge = {
+    total: 0,
+    by_dns: { never_checked: 0, live: 0, dead: 0, unknown: 0 },
+    with_website: 0,
+    with_responding_website: 0,
+  };
+  for (const r of rows) {
+    if (trimmed(r.contact_email) === "" || trimmed(r.k_email) !== "") continue;
+    out.total++;
+    out.by_dns[rfbContactEmailDnsState(r.field_provenance)]++;
+    if (trimmed(r.k_website) !== "") {
+      out.with_website++;
+      if (rfbEnrichmentSiteAnswers(r)) out.with_responding_website++;
+    }
+  }
+  return out;
+}
+
 interface BaseRow {
   id: string;
   name: string | null;
@@ -2003,6 +2071,8 @@ export interface RfbEnrichmentPreview {
   }>;
   /** Step 6 — only with OWNER_AUTO_UPDATES_ENABLED (absent otherwise). */
   owner_refresh?: OwnerRefreshPreview;
+  /** B1 step 1: read-only count of cohort rows with contact_email but no knowledge e-mail (counts only). */
+  contact_email_not_in_knowledge: RfbContactEmailNotInKnowledge;
 }
 
 export interface RfbEnrichmentNightlyReport {
@@ -2173,6 +2243,7 @@ export async function buildRfbEnrichmentPreview(db: Db, now: Date): Promise<RfbE
     cohort: summarizeRfbEnrichmentCohort(cohort),
     steps,
     ...(ownerRefresh ? { owner_refresh: ownerRefresh } : {}),
+    contact_email_not_in_knowledge: summarizeRfbContactEmailNotInKnowledge(cohort.rows),
   };
 }
 

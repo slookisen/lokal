@@ -52020,6 +52020,27 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-15-rfb-nattjobb-hull-kontaktuttrekk-bm-og-koer, slice
+// B1 step 1: the nightly enrichment preview's read-only
+// contact_email_not_in_knowledge count (DNS buckets, website split, counts
+// only). Pins a fresh in-memory DB per block (restored in finally) —
+// runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-15-rfb-nattjobb-hull (B1-1): rfb-enrichment-contact-email-gap ──");
+  try {
+    const { runRfbEnrichmentContactEmailGapTests } = require("../src/services/rfb-enrichment-contact-email-gap.test") as
+      typeof import("../src/services/rfb-enrichment-contact-email-gap.test");
+    const rcg = await runRfbEnrichmentContactEmailGapTests({ log: false });
+    passed += rcg.passed;
+    failed += rcg.failed;
+    for (const f of rcg.failures) failures.push("rfb-enrichment-contact-email-gap: " + f);
+    console.log(`  rfb-enrichment-contact-email-gap: ${rcg.passed} passed, ${rcg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-enrichment-contact-email-gap: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-11-01-rfb-hold-profilen-oppdatert («Hold profilen
 // oppdatert»): the owner refresh as the nightly run's last step behind
 // OWNER_AUTO_UPDATES_ENABLED — AC1/AC2 (fill_empty / never / automatic, the
