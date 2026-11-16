@@ -1048,11 +1048,10 @@ jobs:
                     // push/check_suite run when performed under this job's
                     // GITHUB_TOKEN (that's the whole reason this dispatch step
                     // exists). If auto-merge lands after this poll window, this
-                    // PR's deploy will NOT self-trigger — only the periodic
-                    // platform-verifier's /health.git_sha staleness probe (or a
-                    // human) will catch it. Say so plainly; do not claim a
-                    // self-healing path that doesn't exist.
-                    await note('approved; auto-merge enabled but not confirmed merged within ~12s. If/when it lands, fly-deploy.yml will NOT auto-dispatch for this PR (no push/check_suite event fires for a GITHUB_TOKEN-authored merge) — platform-verifier\'s periodic /health.git_sha probe should catch the staleness within its normal cycle, but for a faster fix trigger fly-deploy.yml manually from the Actions tab once /health confirms this merged.');
+                    // PR's deploy will NOT self-trigger from here — the
+                    // scheduled deploy-drift-sweep.yml (main vs /health.git_sha)
+                    // dispatches it after its grace period.
+                    await note('approved; auto-merge enabled but not confirmed merged within ~12s. If/when it lands, fly-deploy.yml will NOT auto-dispatch for this PR (no push/check_suite event fires for a GITHUB_TOKEN-authored merge) — deploy-drift-sweep.yml (every 5 min) dispatches it once main has been ahead of prod\'s /health.git_sha for >10 min.');
                   }
                 } catch (autoMergeErr) {
                   await note(`approved, but could not merge or enable auto-merge (${autoMergeErr.message}) — merge manually.`);

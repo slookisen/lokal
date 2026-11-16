@@ -1,0 +1,151 @@
+# Deploy drift sweep — safety net for merges that never got a deploy.
+#
+# A merge performed under GITHUB_TOKEN (fleet-auto-approve.yml's auto-merge)
+# fires no `push` event, so fly-deploy.yml only runs when the gate itself sees
+# the merge land within its ~12 s poll and dispatches it. An auto-merge that
+# lands later never deploys (lokal#1569 / #1578, 2026-11-16).
+#
+# Every 5 min this compares main's head with prod's /health.git_sha and, when
+# main is strictly ahead (compare status `ahead`) for longer than the grace
+# period in scripts/deploy-drift.js (GRACE_MINUTES = 10 → worst case ~15 min),
+# with no fly-deploy run underway or already done for that sha, dispatches
+# fly-deploy.yml on main. workflow_dispatch is the documented exception that
+# GITHUB_TOKEN may trigger. Never deploys backwards: behind/diverged → no-op.
+#
+# Rollbacks: if main's head was ever deployed (push or workflow_dispatch run
+# of fly-deploy.yml, any conclusion) and prod still reports an older commit,
+# the sweep assumes a failure or a Fly-level rollback (`fly releases rollback`
+# / `fly deploy --image`) and only warns — it never redeploys over it.
+# Pause switch: set repo variable DEPLOY_DRIFT_SWEEP_DISABLED=true (Settings →
+# Variables → Actions) and the sweep exits without calling any API; delete the
+# variable or set it to anything else to resume.
+# Decision logic + tests: scripts/deploy-drift.js, tests/deploy-drift.test.ts.
+# dev-request 2026-11-16-fleet-gate-dispatch-sen-automerge.
+
+name: Deploy drift sweep
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: deploy-drift-sweep
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Pause switch
+        id: pause
+        env:
+          DEPLOY_DRIFT_SWEEP_DISABLED: ${{ vars.DEPLOY_DRIFT_SWEEP_DISABLED }}
+        run: |
+          if [ "$DEPLOY_DRIFT_SWEEP_DISABLED" = "true" ]; then
+            echo "Deploy drift sweep: **paused** — repo variable DEPLOY_DRIFT_SWEEP_DISABLED=true; no API calls made" >> "$GITHUB_STEP_SUMMARY"
+            echo "disabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "disabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout decision module
+        if: steps.pause.outputs.disabled != 'true'
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/deploy-drift.js
+          sparse-checkout-cone-mode: false
+
+      - name: Compare main with prod and dispatch if drifted
+        if: steps.pause.outputs.disabled != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const path = require('path');
+            const { decideDeployDrift, parseHealth, GRACE_MINUTES } =
+              require(path.join(process.env.GITHUB_WORKSPACE, 'scripts', 'deploy-drift.js'));
+            const { owner, repo } = context.repo;
+
+            const bail = async (what, e) => {
+              const line = `Deploy drift sweep: **noop** — ${what} failed: ${e.message} — fail closed`;
+              core.warning(line);
+              await core.summary.addRaw(line + '\n').write();
+            };
+
+            let head;
+            try {
+              ({ data: head } = await github.rest.repos.getCommit({ owner, repo, ref: 'main' }));
+            } catch (e) {
+              await bail('getCommit(main)', e);
+              return;
+            }
+            const mainSha = head.sha;
+            const mainCommittedAt = head.commit?.committer?.date || null;
+
+            let health;
+            try {
+              const res = await fetch('https://rettfrabonden.com/health', {
+                signal: AbortSignal.timeout(10000),
+                headers: { accept: 'application/json' },
+              });
+              health = res.ok ? parseHealth(await res.text()) : { ok: false, error: `/health HTTP ${res.status}` };
+            } catch (e) {
+              health = { ok: false, error: `/health fetch failed: ${e.message}` };
+            }
+
+            let compareStatus = null;
+            if (health.ok && health.sha !== mainSha) {
+              try {
+                const { data } = await github.rest.repos.compareCommitsWithBasehead({
+                  owner, repo, basehead: `${health.sha}...${mainSha}`, per_page: 1,
+                });
+                compareStatus = data.status;
+              } catch (e) {
+                core.warning(`compare ${health.sha}...${mainSha} failed: ${e.message}`);
+              }
+            }
+
+            const runsById = new Map();
+            const listRuns = async (params) => {
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                owner, repo, workflow_id: 'fly-deploy.yml', per_page: 50, ...params,
+              });
+              for (const r of data.workflow_runs) runsById.set(r.id, r);
+            };
+            try {
+              await listRuns({ branch: 'main' });
+              await listRuns({ head_sha: mainSha });
+            } catch (e) {
+              await bail('listWorkflowRuns(fly-deploy.yml)', e);
+              return;
+            }
+            const runs = [...runsById.values()].map((r) => ({
+              event: r.event, status: r.status, conclusion: r.conclusion,
+              head_sha: r.head_sha, updated_at: r.updated_at,
+            }));
+
+            const decision = decideDeployDrift({
+              mainSha, mainCommittedAt, health, compareStatus, runs, now: new Date(),
+            });
+
+            if (decision.action === 'dispatch') {
+              try {
+                await github.rest.actions.createWorkflowDispatch({
+                  owner, repo, workflow_id: 'fly-deploy.yml', ref: 'main',
+                });
+              } catch (e) {
+                const msg = `Deploy drift sweep: wanted to dispatch but createWorkflowDispatch failed: ${e.message}`;
+                await core.summary.addRaw(msg + '\n').write();
+                core.setFailed(msg);
+                return;
+              }
+            }
+
+            const line = `Deploy drift sweep (grace ${GRACE_MINUTES} min): **${decision.action}** — ${decision.reason}`;
+            if (decision.level === 'warning') core.warning(line); else core.info(line);
+            await core.summary.addRaw(line + '\n').write();

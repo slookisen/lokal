@@ -1055,6 +1055,21 @@ console.log("\n── gardssalg-quality-update (defect classifier + margin proxy
   console.log(`  gardssalg-quality-update: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// dev-request 2026-11-16-fleet-gate-dispatch-sen-automerge: pure decision
+// logic (scripts/deploy-drift.js) behind .github/workflows/deploy-drift-sweep.yml,
+// which dispatches fly-deploy.yml when main has been ahead of prod's
+// /health.git_sha for longer than the grace period.
+console.log("\n── deploy-drift (main vs prod sweep decision) ──");
+{
+  const { runDeployDriftTests } = require("./deploy-drift.test") as
+    typeof import("./deploy-drift.test");
+  const r = runDeployDriftTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("deploy-drift: " + f);
+  console.log(`  deploy-drift: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── dev-request 2026-07-04-app-strategi-pwa, slice 1 of 3: manifest.json +
 // icons (rfb host only). Pins the required PWA fields on
 // src/public/manifest.json (name/short_name/start_url/display/icons).
