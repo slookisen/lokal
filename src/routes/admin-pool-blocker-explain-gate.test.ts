@@ -265,8 +265,8 @@ export function runAdminPoolBlockerExplainGateTests(opts: { log?: boolean } = {}
       const rExplain = callExplain({ agentId: "gate-clean" });
       assertEq(
         rExplain.body.agents[0].gate,
-        { blocklisted: false, recent_crm_send_email_match: false, cross_platform_cooldown: false },
-        "d1: a fully clean row reports all 3 gate reasons as false",
+        { blocklisted: false, recent_crm_send_email_match: false, cross_platform_cooldown: false, promise_given: false },
+        "d1: a fully clean row reports all 4 gate reasons as false",
       );
 
       const rCand = callCandidatesFirst();
