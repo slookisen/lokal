@@ -396,7 +396,8 @@ export function runGardssalgBookingCapsTests(opts: { log?: boolean } = {}): Prom
       const formBack = "/kategori/gardssalg/book/cap-test-c6";
       const sForm = slotAhead(8);
       const n1 = await postForm("c6", "skjema@example.no", sForm);
-      const n1Ref = decodeURIComponent(n1.location.split("/confirm/")[1] || "");
+      // O1-4 (R8): a new request's redirect carries ?t=<guest token>; the duplicate's does not.
+      const n1Ref = decodeURIComponent((n1.location.split("/confirm/")[1] || "").split("?")[0]);
       assertTrue(n1.status === 303 && n1Ref.startsWith("GARD") && rows("cap-c6") === 1, "n1: first form post -> 303 to its confirm page, one row");
       before = rows(); mailsBefore = sentTo("post@cap-c6.example.no");
       const n2 = await postForm("c6", "skjema@example.no", sForm);

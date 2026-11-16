@@ -34,6 +34,11 @@ import {
   oa1Text,
   CONFIRMED_ICS_CONTENT_TYPE,
 } from "./gardssalg-honest-receipt";
+import {
+  visitConfirmedByProducer,
+  CONFIRMED_VISIT_SQL,
+  deadlineAfterSuggestion,
+} from "./gardssalg-attendance-guard";
 
 const VERTICAL = "experiences";
 const APP_URL = process.env.APP_URL || "https://opplevagent.no";
@@ -403,7 +408,10 @@ export function getBookingByToken(
 // "bekreft-løkka") corrections BETWEEN the two resolved states — a mis-click
 // on "ikke møtt" must not be permanent, since billable/commission hangs on
 // it. Same status twice is an idempotent no-op (returns the row unchanged).
-// 'cancelled' is terminal. Returns null only for unknown token / cancelled.
+// 'cancelled' is terminal. Returns null for unknown token / cancelled.
+// O1-4 (R6): also null, with nothing written (status and billable
+// untouched), unless the producer has confirmed the visit — see
+// visitConfirmedByProducer() in gardssalg-attendance-guard.ts.
 export function resolveBooking(
   confirm_token: string,
   newStatus: "confirmed_attended" | "no_show",
@@ -412,19 +420,21 @@ export function resolveBooking(
   const db = getDb(VERTICAL);
   const existing = getBookingByToken(confirm_token);
   if (!existing || existing.status === "cancelled") return null;
+  if (!visitConfirmedByProducer(existing)) return null;
   if (existing.status === newStatus) return existing;
 
-  db.prepare(`
+  const result = db.prepare(`
     UPDATE gardssalg_bookings
     SET status = ?, resolved_by = ?, resolved_at = datetime('now'),
         billable = ?
-    WHERE confirm_token = ?
+    WHERE confirm_token = ? AND status != 'cancelled' AND ${CONFIRMED_VISIT_SQL}
   `).run(
     newStatus,
     resolvedBy,
     newStatus === "confirmed_attended" ? 1 : 0,
     confirm_token,
   );
+  if (result.changes === 0) return null;
 
   return getBookingByToken(confirm_token);
 }
@@ -522,7 +532,10 @@ function escEmailHtml(s: string): string {
 // (opplevelser.ts) and the gårdssalg SSR reservation form's no-JS fallback
 // (experiences-seo.ts) go through the exact same code — no duplicated
 // business logic between the JSON API and the progressively-enhanced form.
-export function buildIcs(booking: GardssalgBooking): string {
+// O1-4 (R8): includeGuest=false drops the ATTENDEE line (guest name and
+// e-mail) — used by the download route when the guest's token is missing.
+// The e-mailed file goes to the guest and keeps it.
+export function buildIcs(booking: GardssalgBooking, includeGuest: boolean = true): string {
   const dtStamp = new Date().toISOString().replace(/[-:.]/g, "").slice(0, 15) + "Z";
   const slotDate = new Date(booking.slot_at);
   const dtStart = slotDate.toISOString().replace(/[-:.]/g, "").slice(0, 15) + "Z";
@@ -542,7 +555,7 @@ export function buildIcs(booking: GardssalgBooking): string {
     `DTEND:${dtEnd}`,
     `SUMMARY:Gårdssalg & smaking — ref ${booking.booking_ref}`,
     `DESCRIPTION:Påmelding via opplevagent.no. Bookingref: ${booking.booking_ref}`,
-    `ATTENDEE;CN=${booking.guest_name}:mailto:${booking.guest_email}`,
+    ...(includeGuest ? [`ATTENDEE;CN=${booking.guest_name}:mailto:${booking.guest_email}`] : []),
     "END:VEVENT",
     "END:VCALENDAR",
   ].join("\r\n");
@@ -1026,6 +1039,9 @@ export function producerRespondDecline(
 // producer may correct a typo by re-suggesting (which ROTATES
 // guest_decision_token, dead-linking the previously emailed one) or still
 // decline. Returns null without mutating on invalid state/slot.
+// O1-4 (R7): every suggestion moves the answer deadline
+// (respond_token_expires_at) to 48 hours after the suggestion, never earlier
+// than it already was (deadlineAfterSuggestion()).
 export function producerSuggestTime(
   respond_token: string,
   suggested_slot_at: string,
@@ -1045,10 +1061,16 @@ export function producerSuggestTime(
   const db = getDb(VERTICAL);
   db.prepare(`
     UPDATE gardssalg_bookings
-    SET pre_status = 'time_suggested', suggested_slot_at = ?, guest_decision_token = ?
+    SET pre_status = 'time_suggested', suggested_slot_at = ?, guest_decision_token = ?,
+        respond_token_expires_at = ?
     WHERE respond_token = ? AND pre_status IN ('awaiting_provider','time_suggested')
       AND respond_token_used_at IS NULL AND status = 'reserved'
-  `).run(storedSlot, generateConfirmToken(), respond_token);
+  `).run(
+    storedSlot,
+    generateConfirmToken(),
+    deadlineAfterSuggestion(existing.respond_token_expires_at, now),
+    respond_token,
+  );
   return getBookingByRespondToken(respond_token);
 }
 

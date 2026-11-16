@@ -208,6 +208,16 @@ import {
   calendarFileAllowed,
   dropFristSentences,
 } from "../services/gardssalg-honest-receipt";
+// O1-4 (R6/R7/R8): attendance only on confirmed visits, 48 h after a
+// suggestion, guest data on the confirm page only with the guest's token.
+import {
+  OA1_ATTENDANCE_TEXTS,
+  attendanceRefusal,
+  attendanceNotConfirmedText,
+  guestTokenMatches,
+  guestTokenQuery,
+  GUEST_TOKEN_PARAM,
+} from "../services/gardssalg-attendance-guard";
 import { getDb, getDb as getExpDbForReise } from "../database/db-factory";
 import {
   createBooking,
@@ -7450,7 +7460,7 @@ ${BROWSE_CSS}
       })
       .then(function (res) {
         if (res.ok && res.data && res.data.success && res.data.booking_ref) {
-          window.location.href = ${serializeJsonForScript(canonical)} + "/confirm/" + encodeURIComponent(res.data.booking_ref);
+          window.location.href = ${serializeJsonForScript(canonical)} + "/confirm/" + encodeURIComponent(res.data.booking_ref) + (res.data.guest_token ? "?${GUEST_TOKEN_PARAM}=" + encodeURIComponent(res.data.guest_token) : "");
           return;
         }
         if (btn) btn.disabled = false;
@@ -7598,7 +7608,8 @@ router.post(
       console.error("[gardssalg-book] producer notification failed", booking.booking_ref, e),
     );
 
-    res.redirect(303, `${backTo}/confirm/${encodeURIComponent(booking.booking_ref)}`);
+    // O1-4 (R8): the guest's own token, so the page can show their details.
+    res.redirect(303, `${backTo}/confirm/${encodeURIComponent(booking.booking_ref)}${guestTokenQuery(booking)}`);
   },
 );
 
@@ -7645,7 +7656,10 @@ router.get(
       qrSvg = "";
     }
 
-    const icsUrl = `/api/opplevelser/book/${encodeURIComponent(booking.booking_ref)}/ics`;
+    // O1-4 (R8): the reference alone (QR, duplicate answer, a shared link)
+    // shows no guest name, e-mail or note; the guest's token (?t=) does.
+    const guestView = guestTokenMatches(booking, req.query[GUEST_TOKEN_PARAM]);
+    const icsUrl = `/api/opplevelser/book/${encodeURIComponent(booking.booking_ref)}/ics${guestView ? guestTokenQuery(booking) : ""}`;
 
     // O1-2 (R3/G13): flag on -> the page says the request is received, not
     // confirmed (OA-1 §1.1), and the calendar link only shows for a visit the
@@ -7701,10 +7715,11 @@ ${BROWSE_CSS}
     <div class="recap">
       <div><strong>Dato/tid:</strong> ${escapeHtml(slotFormatted)}</div>
       <div><strong>Antall:</strong> ${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</div>
-      <div><strong>Navn:</strong> ${escapeOrDeleted(booking.guest_name)}</div>
+${guestView ? `      <div><strong>Navn:</strong> ${escapeOrDeleted(booking.guest_name)}</div>
       ${booking.notes ? `<div><strong>Kommentar:</strong> ${escapeHtml(booking.notes)}</div>` : ""}
-    </div>
-    <p class="hint">${honest ? fillOa1(escapeHtml(oa1Text("receipt.formMessage", "nb")), { "e-post": escapeOrDeleted(booking.guest_email) }) : `En bekreftelse er sendt til ${escapeOrDeleted(booking.guest_email)}.`}</p>${showIcsLink ? `
+` : ""}    </div>
+    <p class="hint">${!guestView ? escapeHtml(OA1_ATTENDANCE_TEXTS["page.guestDataHidden"].nb) : honest ? fillOa1(escapeHtml(oa1Text("receipt.formMessage", "nb")), { "e-post": escapeOrDeleted(booking.guest_email) }) : `En bekreftelse er sendt til ${escapeOrDeleted(booking.guest_email)}.`}</p>${honest && guestView ? `
+    <p><a href="/kategori/gardssalg/status/${encodeURIComponent(booking.booking_ref)}/${encodeURIComponent(booking.guest_status_token || "")}">${escapeHtml(oa1Text("receipt.statusLink", "nb"))}</a></p>` : ""}${showIcsLink ? `
     <a class="ics-link" href="${icsUrl}">Last ned kalenderfil (.ics)</a>` : ""}
   </div>
 </main>
@@ -7771,6 +7786,8 @@ router.get(
         ? `<div class="bekreft-banner ok" role="status">Registrert: ${escapeHtml(BEKREFT_STATUS_LABEL[done])}</div>`
         : errorParam === "too_early"
           ? `<div class="bekreft-banner warn" role="alert">Oppmøte kan først registreres etter besøkstidspunktet.</div>`
+          : errorParam === "not_confirmed" && attendanceRefusal(booking)
+            ? `<div class="bekreft-banner warn" role="alert">${escapeHtml(attendanceNotConfirmedText(booking))}</div>`
           : errorParam
             ? `<div class="bekreft-banner warn" role="alert">Kunne ikke oppdatere reservasjonen. Prøv igjen.</div>`
             : "";
@@ -7782,6 +7799,15 @@ router.get(
     let actionsHtml = "";
     if (booking.status === "cancelled") {
       actionsHtml = "";
+    } else if (attendanceRefusal(booking)) {
+      // O1-4 (R6): no «Møtte»/«Ikke møtt» on a visit the producer has not
+      // confirmed; «Angre» stays for a row resolved before this guard.
+      actionsHtml = errorParam === "not_confirmed"
+        ? ""
+        : `<p class="bekreft-wait">${escapeHtml(attendanceNotConfirmedText(booking))}</p>`;
+      if (booking.status === "confirmed_attended" || booking.status === "no_show") {
+        actionsHtml += actBtn("reopen", "Angre — tilbake til reservert", "act-undo");
+      }
     } else if (!canConfirm) {
       actionsHtml = `<p class="bekreft-wait">Oppmøte kan registreres etter besøket (fra ${escapeHtml(slotFormatted)}).</p>`;
       if (booking.status === "confirmed_attended" || booking.status === "no_show") {
@@ -7885,6 +7911,13 @@ router.post(
 
     if (action !== "attended" && action !== "no_show") {
       res.redirect(303, `${backTo}?error=ugyldig`);
+      return;
+    }
+
+    // O1-4 (R6): only on a visit the producer has confirmed (resolveBooking()
+    // refuses too); nothing is written, billable is untouched.
+    if (booking.status !== "cancelled" && attendanceRefusal(booking)) {
+      res.redirect(303, `${backTo}?error=not_confirmed`);
       return;
     }
 
@@ -8079,6 +8112,7 @@ router.get(
       <label for="suggested_slot">Foreslå nytt tidspunkt (norsk tid)</label>
       <input id="suggested_slot" name="suggested_slot" type="datetime-local" required>
       <button type="submit" class="act-btn act-secondary">Send forslag til gjesten</button>
+      <p class="hint">${escapeHtml(OA1_ATTENDANCE_TEXTS["suggest.deadlineNote"].nb)}</p>
     </form>
     <form method="POST" action="${postTo}"><input type="hidden" name="action" value="avsla"><button type="submit" class="act-btn act-secondary">Avslå forespørselen</button></form>`;
     }

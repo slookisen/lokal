@@ -29886,7 +29886,8 @@ withFreshModules([
   const redirGB = goodPostGB.redirectTo || "";
   assertTrue(redirGB.startsWith(`/kategori/gardssalg/book/${slugGB}/confirm/`),
     "gb-05b: redirects to the confirm sub-path for the same provider slug");
-  const refGB = decodeURIComponent(redirGB.split("/confirm/")[1] || "");
+  // O1-4 (R8): the redirect carries the guest's token as ?t=… after the ref.
+  const refGB = decodeURIComponent((redirGB.split("/confirm/")[1] || "").split("?")[0]);
   assertTrue(/^GARD-\d{8}-[A-Z0-9]{5}$/.test(refGB), "gb-05c: booking_ref has the GARD-YYYYMMDD-XXXXX shape");
 
   const bookingGB = bookStGB.getBookingByRef(refGB);
@@ -30238,7 +30239,7 @@ withFreshModules([
   assertEq(postLiveGDL.status, 303, "gdl-11a: valid no-JS submission while live → 303 redirect (unchanged)");
   const redirLiveGDL = postLiveGDL.redirectTo || "";
   assertTrue(redirLiveGDL.includes("/confirm/"), "gdl-11b: redirects to the confirm sub-path (unchanged)");
-  const refLiveGDL = decodeURIComponent(redirLiveGDL.split("/confirm/")[1] || "");
+  const refLiveGDL = decodeURIComponent((redirLiveGDL.split("/confirm/")[1] || "").split("?")[0]);
   const bookingLiveGDL = bookStGDL.getBookingByRef(refLiveGDL);
   assertTrue(!!bookingLiveGDL, "gdl-11c: reserved row created via getBookingByRef() (unchanged)");
   assertEq(bookingLiveGDL?.status, "reserved", "gdl-11d: booking starts 'reserved' (unchanged)");
@@ -30769,8 +30770,10 @@ const _bekreftLoekkePromise = runSerial(async () => {
     { providerSlug: slugBKC }, `/kategori/gardssalg/book/${slugBKC}`,
     { body: { slot_at: formSlotWallBKC, party_size: "2", guest_name: "Nora Vik", guest_email: "nora@example.no", notes: `  ${noteRawBKC}  ` } });
   assertEq(postFormBKC.status, 303, "bkc-02a: no-JS submission with a note → 303");
-  const refFormBKC = decodeURIComponent((postFormBKC.redirectTo || "").split("/confirm/")[1] || "");
+  const refFormBKC = decodeURIComponent(((postFormBKC.redirectTo || "").split("/confirm/")[1] || "").split("?")[0]);
   const bookingFormBKC = bookStBKC.getBookingByRef(refFormBKC);
+  assertTrue((postFormBKC.redirectTo || "").endsWith(`?t=${bookingFormBKC?.guest_status_token}`),
+    "bkc-02l: O1-4 — the no-JS redirect carries the guest's own token (?t=)");
   assertEq(bookingFormBKC?.notes, noteRawBKC, "bkc-02b: note persisted on the booking row (trimmed)");
   const tokenFormBKC = String(bookingFormBKC?.confirm_token);
   const guestMailBKC = emailCallsBKC.find((c) => c.to === "nora@example.no");
@@ -30796,11 +30799,17 @@ const _bekreftLoekkePromise = runSerial(async () => {
     "bkc-02k: text version carries the bekreft link too");
 
   // ═══ (1c) the /confirm/:ref guest page shows the comment (escaped) ═══
+  // O1-4 (R8): the note shows only with the guest's token (?t=).
   const confirmPageBKC = await invokeSeoBKC("get", "/kategori/gardssalg/book/:providerSlug/confirm/:ref",
-    { providerSlug: slugBKC, ref: refFormBKC }, `/kategori/gardssalg/book/${slugBKC}/confirm/${refFormBKC}`);
+    { providerSlug: slugBKC, ref: refFormBKC }, `/kategori/gardssalg/book/${slugBKC}/confirm/${refFormBKC}`,
+    { query: { t: String(bookingFormBKC?.guest_status_token) } });
   assertEq(confirmPageBKC.status, 200, "bkc-03a: guest confirmation page renders");
   assertTrue(confirmPageBKC.body.includes("Kommentar:") && confirmPageBKC.body.includes("Har hund &lt;b&gt;og&lt;/b&gt;"),
     "bkc-03b: confirmation page shows the note, escaped");
+  const confirmPageRefOnlyBKC = await invokeSeoBKC("get", "/kategori/gardssalg/book/:providerSlug/confirm/:ref",
+    { providerSlug: slugBKC, ref: refFormBKC }, `/kategori/gardssalg/book/${slugBKC}/confirm/${refFormBKC}`);
+  assertTrue(confirmPageRefOnlyBKC.status === 200 && !confirmPageRefOnlyBKC.body.includes("Har hund") && !confirmPageRefOnlyBKC.body.includes("Nora Vik"),
+    "bkc-03c: O1-4 — with only the reference the page shows neither note nor name");
 
   // ═══ (1d) JSON API: notes persist; confirm_url no longer leaks to guest ═══
   const jsonBookBKC = await invokeOppBKC("post", "/book", {}, {
@@ -30824,6 +30833,10 @@ const _bekreftLoekkePromise = runSerial(async () => {
   assertEq(oldGetMissBKC.status, 404, "bkc-05d: unknown token on the legacy endpoint → 404");
 
   // ═══ (2b) bekreft page: GET mutates nothing; future visit → time-guarded ═══
+  // O1-4 (R6): attendance needs a visit the producer has confirmed; confirm
+  // it here so the time guard below is what is being tested.
+  assertTrue(!!bookStBKC.producerRespondConfirm(String(bookingFormBKC?.respond_token)),
+    "bkc-06-setup: producer confirms the visit (svar loop)");
   const bekreftPageBKC = await invokeSeoBKC("get", "/kategori/gardssalg/bekreft/:token",
     { token: tokenFormBKC }, `/kategori/gardssalg/bekreft/${tokenFormBKC}`);
   assertEq(bekreftPageBKC.status, 200, "bkc-06a: bekreft page renders for the producer");
@@ -30857,6 +30870,9 @@ const _bekreftLoekkePromise = runSerial(async () => {
   });
   const pastRefBKC = pastBookingBKC.booking_ref;
   const pastTokenBKC = pastBookingBKC.confirm_token;
+  // O1-4 (R6): attendance only on a visit the producer has confirmed.
+  assertTrue(!!bookStBKC.producerRespondConfirm(String(pastBookingBKC.respond_token)),
+    "bkc-08-setup: producer confirms the past visit (svar loop)");
   const pastPageBKC = await invokeSeoBKC("get", "/kategori/gardssalg/bekreft/:token",
     { token: pastTokenBKC }, `/kategori/gardssalg/bekreft/${pastTokenBKC}`);
   assertTrue(pastPageBKC.body.includes('value="attended"') && pastPageBKC.body.includes('value="no_show"'),
@@ -32299,6 +32315,17 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += gbc.failed;
     for (const f of gbc.failures) failures.push("gardssalg-booking-caps: " + f);
     console.log(`  gardssalg-booking-caps: ${gbc.passed} passed, ${gbc.failed} failed`);
+
+    // O1-4 (R6/R7/R8): attendance only on confirmed visits, 48 h after a
+    // suggestion, guest data on the confirm page / .ics only with the token.
+    console.log("\n── gardssalg-attendance-guard: attendance on confirmed visits + suggestion deadline + guest data behind token ──");
+    const { runGardssalgAttendanceGuardTests } = require("../src/services/gardssalg-attendance-guard.test") as
+      typeof import("../src/services/gardssalg-attendance-guard.test");
+    const gag = await runGardssalgAttendanceGuardTests({ log: false });
+    passed += gag.passed;
+    failed += gag.failed;
+    for (const f of gag.failures) failures.push("gardssalg-attendance-guard: " + f);
+    console.log(`  gardssalg-attendance-guard: ${gag.passed} passed, ${gag.failed} failed`);
 
     // GET /admin/gardssalg-provider-lookup — read-only, case-insensitive
     // substring lookup of experience_providers by navn, returning
@@ -42973,7 +43000,11 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
     provider_id: provIdPV, slot_at: "2020-01-06T12:00", party_size: 2,
     guest_name: "Gjest Previsit", guest_email: "gjest-pv11@example.no",
   });
-  bookStPV.resolveBooking(String(b11!.confirm_token), "confirmed_attended", "pv-test");
+  // O1-4 (R6): resolveBooking() now refuses an unconfirmed visit. This test
+  // needs a row resolved while pre_status is still awaiting_provider (rows
+  // resolved before O1-4), so it is set up directly.
+  dbPV.prepare("UPDATE gardssalg_bookings SET status = 'confirmed_attended', billable = 1, resolved_at = datetime('now') WHERE booking_ref = ?")
+    .run(String(b11!.booking_ref));
   assertEq(bookStPV.getBookingByRef(String(b11!.booking_ref))?.status, "confirmed_attended",
     "pv-27-setup: b11 resolved post-visit");
   assertEq(bookStPV.producerRespondConfirm(String(b11!.respond_token)), null,
