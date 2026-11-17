@@ -52862,6 +52862,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-12-opplevagent-o4-epost-og-tekster, O4-5b: the booking
+// e-mails to the producer filed in one CRM thread per booking
+// (GARDSSALG_BOOKING_CRM_ARCHIVE_ENABLED). Pins the main getDb() and swaps the
+// experiences db-factory, env and the mailer (all restored) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-12-opplevagent-o4-epost-og-tekster O4-5b: produsentens booking-e-poster i CRM-tråden ──");
+  try {
+    const { runGardssalgBookingCrmArchiveO45bTests } = require("../src/services/gardssalg-booking-crm-archive-o4-5b.test") as
+      typeof import("../src/services/gardssalg-booking-crm-archive-o4-5b.test");
+    const r = await runGardssalgBookingCrmArchiveO45bTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-booking-crm-archive-o4-5b: " + f);
+    console.log(`  gardssalg-booking-crm-archive-o4-5b: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-booking-crm-archive-o4-5b: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // Eierportal bølge 0, T2: the «Mine valg» level preview (GET …/valg?niva=)
 // never writes — on gårdssalg (experiences.db booking_live, gardssalg_content_audit)
 // nor RFB; the preview equals the confirmed apply. Swaps getDb() + env — runSerial.

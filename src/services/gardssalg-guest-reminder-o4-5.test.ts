@@ -337,13 +337,31 @@ export function runGardssalgGuestReminderO45Tests(opts: { log?: boolean } = {}):
         }
 
         // AK3 again through the route with the flag on: count == what the job sends, GET writes nothing.
-        // The route uses the real clock: a visit 24 h (less a second) from now is always tomorrow in Oslo.
-        const realNow = Date.now();
-        const fresh = mk({ email: "ny@example.no", slotMs: realNow + 24 * H - 1000 });
+        // The route reads the clock itself (countGuestRemindersDue() → new Date()), so the
+        // clock is pinned for that call only (FUNN o4-5-test-ak3-14-ekte-klokke: the real clock
+        // made «now + 24 h − 1 s» today in Oslo in the first second after midnight and around
+        // DST). Fixed tick: 2098-03-05 11:00 Oslo (CET, no DST nearby), before every other
+        // fixture; the visit is 08:00 Oslo the next day, 21 h ahead.
+        const FIXED = Date.parse("2098-03-05T10:00:00.000Z");
+        const fresh = mk({ email: "ny@example.no", slotMs: FIXED + 21 * H });
         const before = snapshot();
-        const ok = await callRoute(router, "GET", url, { headers: { "x-admin-key": testKey } });
+        const RealDate = Date;
+        class FixedDate extends RealDate {
+          constructor(...args: any[]) {
+            if (args.length === 0) super(FIXED);
+            else super(...(args as [any]));
+          }
+          static now(): number { return FIXED; }
+        }
+        let ok: { status: number; body: any };
+        (globalThis as any).Date = FixedDate;
+        try {
+          ok = await callRoute(router, "GET", url, { headers: { "x-admin-key": testKey } });
+        } finally {
+          (globalThis as any).Date = RealDate;
+        }
         assertEq(snapshot(), before, "ak3.13: GET with the flag on writes nothing");
-        const rr = await bs.processBookingFollowups(at(realNow));
+        const rr = await bs.processBookingFollowups(at(FIXED));
         assertEq([ok.body?.would_send, ok.body?.booking_refs], [rr.guest_reminders_sent, [fresh.booking_ref]], "ak3.14: route count == what the job then sends");
       }
 

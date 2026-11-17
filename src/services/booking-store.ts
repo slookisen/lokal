@@ -42,6 +42,7 @@ import {
 } from "./gardssalg-attendance-guard";
 import { gardssalgNow } from "./gardssalg-test-clock";
 import { gardssalgNotifyRecipient } from "./gardssalg-notify-address";
+import { archiveProducerBookingMail } from "./gardssalg-booking-crm-archive";
 import {
   emailText,
   fillEmailText,
@@ -816,11 +817,12 @@ ${nbText("producer.new.linksPersonal")}</p>
 
   const textContent = `${nbText("greeting.producer")}\n\n${nbText("producer.new.textLead")}\n${nbText("label.ref")} ${booking.booking_ref}\n${nbText("label.time")} ${slotFormatted}\n${nbText("label.party")} ${booking.party_size}\n${nbText("producer.label.guest")} ${booking.guest_name} (${booking.guest_email}${booking.guest_phone ? ", " + booking.guest_phone : ""})${booking.notes ? `\n${nbText("producer.label.note")} ${booking.notes}` : ""}${hoursRaw ? `\n${nbText("producer.label.hours")} ${hoursRaw}` : ""}\n${respondUrl ? `\n${nbText("producer.new.respondText")}\n${respondUrl}${deadlineFormatted ? `\n${nbText("producer.deadline", { frist: deadlineFormatted })}` : ""}\n` : ""}\n${nbText("producer.new.afterText")}\n${confirmUrl}\n\n${nbText("signoff")}`;
 
-  let sendResult: { success?: boolean; error?: string } | void;
+  const subject = nbText("producer.new.subject", { ref: booking.booking_ref });
+  let sendResult: { success?: boolean; messageId?: string; error?: string } | void;
   try {
     sendResult = await emailService.sendEmail({
       to: producerEmail,
-      subject: nbText("producer.new.subject", { ref: booking.booking_ref }),
+      subject,
       htmlContent,
       textContent,
       replyTo: `kontakt@opplevagent.no`,
@@ -845,6 +847,16 @@ ${nbText("producer.new.linksPersonal")}</p>
     return "failed";
   }
   await record("sent");
+  // O4-5b: file the sent mail in the booking's CRM thread (flag off: no-op; never throws).
+  archiveProducerBookingMail({
+    booking,
+    kind: opts.retry ? "producer_new_retry" : "producer_new",
+    to: producerEmail,
+    subject,
+    textContent,
+    htmlContent,
+    sendResult,
+  });
   return "sent";
 }
 
@@ -1479,7 +1491,7 @@ export async function sendGatedProducerEmail(
     return false;
   }
   const { subject, htmlContent, textContent } = build(provider.epost);
-  await emailService.sendEmail({
+  const sendResult = await emailService.sendEmail({
     to: provider.epost,
     subject,
     htmlContent,
@@ -1491,6 +1503,8 @@ export async function sendGatedProducerEmail(
     from: crmFromHeader("experiences"),
     isTestSend: booking.is_test === 1,
   });
+  // O4-5b: file the sent mail in the booking's CRM thread (flag off: no-op; never throws).
+  archiveProducerBookingMail({ booking, kind, to: provider.epost, subject, textContent, htmlContent, sendResult });
   return true;
 }
 
