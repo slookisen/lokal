@@ -289,6 +289,10 @@ const PACK_EN: Record<string, string> = {
   "guest.expired.bodySuggested": "We are sorry. The suggested time for your request ({ref}, {tid}) was not settled in time, so the request has expired.",
   "receipt.email.subject": "We have received your request — {ref}",
   "receipt.email.body": "Hi {gjest},\n\nWe have received your request to visit {produsent}. The visit is not confirmed yet.\n\nReference: {ref}\nTime you asked for: {tid}\nGuests: {antall}\nYour note: {kommentar}\n\nThe producer has received the request and will reply by {frist}. We will email you when the producer has confirmed, suggested another time or declined. If the producer does not reply by then, the request expires and we will let you know.\n\nYou can check the status at any time here: {statusside}\n\nIf you have questions, reply to this email.\n\nBest regards,\nOpplevagent",
+  // OA-2 B (O4-5): the guest's reminder the day before.
+  "guest.reminder.subject": "Tomorrow: your visit to {produsent} — {ref}",
+  "guest.reminder.body": "Hi {gjest},\n\nThis is a reminder of the visit you have arranged:\n\nPlace: {produsent}, {sted}\nDate and time: {tid}\nGuests: {antall}\nReference: {ref}\n\nIf you cannot come after all, please cancel so that the producer is told: {statusside}\n\nBest regards,\nOpplevagent",
+  "guest.reminder.replyLine": "If you cannot come after all, reply to this email.",
   "cancel.toGuest.subject": "{produsent} has cancelled the visit — {ref}",
   "cancel.toGuest.body": "Hi {gjest},\n\nUnfortunately, {produsent} has had to cancel the visit on {tid}. Reference: {ref}.\n\nReason from the producer: {grunn}\n\nIf you added the visit to your calendar, please delete it yourself. If you would like to try another time, you can send a new request from the profile page: {profilside}\n\nBest regards,\nOpplevagent",
 };

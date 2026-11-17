@@ -52824,6 +52824,25 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-12-opplevagent-o4-epost-og-tekster, O4-5: the guest's
+// reminder the day before a confirmed visit (GARDSSALG_GUEST_REMINDER_ENABLED).
+// Swaps getDb() + env + the mailer — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-12-opplevagent-o4-epost-og-tekster O4-5: påminnelse til gjesten dagen før ──");
+  try {
+    const { runGardssalgGuestReminderO45Tests } = require("../src/services/gardssalg-guest-reminder-o4-5.test") as
+      typeof import("../src/services/gardssalg-guest-reminder-o4-5.test");
+    const r = await runGardssalgGuestReminderO45Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-guest-reminder-o4-5: " + f);
+    console.log(`  gardssalg-guest-reminder-o4-5: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-guest-reminder-o4-5: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // Eierportal bølge 0, T2: the «Mine valg» level preview (GET …/valg?niva=)
 // never writes — on gårdssalg (experiences.db booking_live, gardssalg_content_audit)
 // nor RFB; the preview equals the confirmed apply. Swaps getDb() + env — runSerial.
