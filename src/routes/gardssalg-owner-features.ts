@@ -76,6 +76,7 @@ import {
   requestNotifyAddressConfirmation,
 } from "../services/gardssalg-notify-address";
 import { createGardssalgNotifyAddressRouter } from "./gardssalg-notify-address";
+import { gardssalgTodayLawEnabled, gardssalgTodayTextsEnabled, renderTodayBlock } from "../services/gardssalg-today-texts";
 
 // ─────────────────────────────────────────────────────────────────
 // «Mine valg» for gårdssalg owners — dev-request 2026-10-22-opplevagent-
@@ -712,6 +713,10 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
         booking,
         gardssalgStats: gardssalgOwnerPageStats(provider),
         statsHref: PORTAL_PATH(slug),
+        // O4-4: «Slik virker det i dag» (OA-3 §2) at the top; off: as before.
+        ...(gardssalgTodayTextsEnabled()
+          ? { todayHtml: renderTodayBlock({ bookingOn: Number(provider.booking_live) === 1 && !booking.adminBrake, law: gardssalgTodayLawEnabled() }) }
+          : {}),
       };
       res.setHeader("Cache-Control", "no-store");
       // T9: `?fragment=` → only those regions (same render), after the same gate.

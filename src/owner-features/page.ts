@@ -242,6 +242,8 @@ export interface OwnerPageModel {
   variant?: OwnerPageVariant;
   /** Gårdssalg: the booking.enabled row's check and explanation. */
   booking?: OwnerPageBooking | null;
+  /** O4-4: «Slik virker det i dag» (GARDSSALG_TODAY_TEXTS_ENABLED on only; absent = page as before). */
+  todayHtml?: string | null;
   /** Gårdssalg: the statistics block (instead of `stats`). undefined = none, null = read failed. */
   gardssalgStats?: OwnerPageGardssalgStats | null;
   /** «Se all statistikk» (the Statistikk tab in /selger). */
@@ -1346,7 +1348,7 @@ export function renderOwnerFeaturesPageBody(m: OwnerPageModel): string {
         <div class="ep-form-actions"><a class="ep-btn ep-btn-secondary" href="${esc(back)}">Tilbake til eierportalen</a></div>
         ${jumpNavHtml(m, registry)}
       </div>
-      ${html("statistikk")}
+      ${m.todayHtml ? `${m.todayHtml}\n      ` : ""}${html("statistikk")}
       ${html(OWNER_ANCHOR_LEVEL)}
       ${groups}
       ${html(OWNER_ANCHOR_PLANNED)}
