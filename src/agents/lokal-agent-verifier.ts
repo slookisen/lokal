@@ -1633,6 +1633,26 @@ export const RFB_PARAPLY_EMAIL_DOMAINS: ReadonlySet<string> = new Set([
  * malformed email is never "paraply" (it simply is not an address — that
  * is the junk-email backstop's job, not this one's).
  */
+/**
+ * dev-request 2026-11-17-andrelinje-verifiserte-nedgraderes-etter-berikelse
+ * (S1): the stored agent_knowledge.verified_second_line stamp as it was
+ * BEFORE this evaluation (runVerifierBatch only writes it after this read).
+ * Read here, not via the pick queries, so every pick function and pickFn
+ * feeding runVerifierBatch is covered. Same defensive convention as the
+ * write path in applyVerifierOutcome: column absent (minimal schema) or any
+ * read error -> false.
+ */
+export function readStoredVerifiedSecondLine(db: any, agentId: string): boolean {
+  try {
+    const row = db
+      .prepare(`SELECT verified_second_line FROM agent_knowledge WHERE agent_id = ?`)
+      .get(agentId) as { verified_second_line: number | null } | undefined;
+    return Number(row?.verified_second_line ?? 0) === 1;
+  } catch {
+    return false;
+  }
+}
+
 export function isParaplyRoutedEmail(
   email: string | null | undefined,
   affiliatedUmbrellaDomains: readonly string[] = []
@@ -3239,7 +3259,9 @@ export async function runVerifierBatch(opts: {
       // that can hold an agent back must be clear, otherwise the demotion
       // stands and the judge is not called. Same call + outcome handling as
       // the !gate.passes path below (the terminal branch there only fires on
-      // 'pending_verify', which a gate-passing agent never has).
+      // 'pending_verify', which a gate-passing agent never has). Only for a
+      // row the second line has ALREADY approved (stored
+      // verified_second_line = 1) — no new group is let in this way.
       const priorStatus = agent.verification_status as string | null | undefined;
       const demotedOnlyByCrossSource =
         gate.passes &&
@@ -3254,7 +3276,8 @@ export async function runVerifierBatch(opts: {
         !gate.flags.some((f) => f.startsWith("nace_blacklist") || f === "brreg_konkurs" || f === "brreg_inactive") &&
         priorStatus !== "opt_out" &&
         priorStatus !== "terminal_unconfirmable" &&
-        !isParaplyRoutedEmail(agent.email, affiliatedUmbrellaDomains);
+        !isParaplyRoutedEmail(agent.email, affiliatedUmbrellaDomains) &&
+        readStoredVerifiedSecondLine(db, agent.id);
       if (!gate.passes || demotedOnlyByCrossSource) {
         const secondLine = await computeSecondLineVerification({
           producer_name: agent.name ?? null,

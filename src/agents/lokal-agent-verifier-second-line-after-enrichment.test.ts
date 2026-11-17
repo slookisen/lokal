@@ -14,6 +14,8 @@
  *   AK2 same profile with a guard active -> still demoted, judge not called
  *   AK3 second line does not pass -> status as before
  *   AK4 flag off -> status as before, judge not called
+ *   AK5 same AK1 setup but stored verified_second_line = 0 -> no new path:
+ *       stays review_required/data_insufficient, judge not called
  *
  * Same harness as lokal-agent-verifier-second-line.test.ts (in-memory DB via
  * __setDbForTesting / __initSchemaForTesting, injected judge, no network).
@@ -51,7 +53,7 @@ export function runLokalAgentVerifierSecondLineAfterEnrichmentTests(
   }
 
   return (async () => {
-    const { runVerifierBatch } = require("./lokal-agent-verifier") as typeof import("./lokal-agent-verifier");
+    const { runVerifierBatch, readStoredVerifiedSecondLine } = require("./lokal-agent-verifier") as typeof import("./lokal-agent-verifier");
 
     const prevDb = initMod.getDb();
     const prevFlag = process.env.RFB_SECOND_LINE_VERIFICATION_ENABLED;
@@ -69,7 +71,7 @@ export function runLokalAgentVerifierSecondLineAfterEnrichmentTests(
         `INSERT INTO agent_knowledge
            (agent_id, address, phone, email, website, about, products, field_provenance,
             verification_status, enrichment_status, verified_second_line, verified_second_line_sources)
-         VALUES (?, 'Testveien 1, 2600 Lillehammer', '91234567', ?, ?, ?, ?, ?, ?, 'rich', 1, '["facebook_official_page"]')`,
+         VALUES (?, 'Testveien 1, 2600 Lillehammer', '91234567', ?, ?, ?, ?, ?, ?, 'rich', ?, ?)`,
       );
 
       // A previously second-line-verified profile that enrichment has since
@@ -86,7 +88,9 @@ export function runLokalAgentVerifierSecondLineAfterEnrichmentTests(
         website?: string;
         field_provenance?: Record<string, unknown>;
         status?: string;
+        verifiedSecondLine?: 0 | 1;
       } = {}): void {
+        const vsl = o.verifiedSecondLine ?? 1;
         insertAgent.run(id, "Testgård " + id, o.agentUrl ?? "https://testgard.no", "key-" + id);
         insertKnowledge.run(
           id,
@@ -96,6 +100,8 @@ export function runLokalAgentVerifierSecondLineAfterEnrichmentTests(
           JSON.stringify([{ name: "Egg" }, { name: "Poteter" }, { name: "Honning" }]),
           JSON.stringify(o.field_provenance ?? SINGLE_SOURCE_ADDRESS),
           o.status ?? "verified",
+          vsl,
+          vsl ? '["facebook_official_page"]' : null,
         );
       }
 
@@ -157,6 +163,38 @@ export function runLokalAgentVerifierSecondLineAfterEnrichmentTests(
       {
         const r = await runOne("ak1b", "true", approve);
         assertEq(r.new_verification_status, "verified", "ak1b-1: data_insufficient address verdict -> second line passes -> verified");
+      }
+
+      // ── AK5: never second-line-verified before -> no new path ──────
+      seed("ak5", { verifiedSecondLine: 0 });
+      {
+        const r = await runOne("ak5", "true", approve);
+        assertEq(r.passed, true, "ak5-0: fixture sanity — gate passes");
+        assertEq(r.new_verification_status, "review_required", "ak5-1: verified_second_line=0 -> stays review_required");
+        assertEq(r.verified_second_line, false, "ak5-2: verified_second_line=false");
+        assertEq(judgeCalls, 0, "ak5-3: judge not called");
+        assertEq((r.cross_source_reason as any).second_line, undefined, "ak5-4: no second_line record");
+        assertEq(row("ak5").verified_second_line, 0, "ak5-5: DB verified_second_line stays 0");
+      }
+      seed("ak5b", { verifiedSecondLine: 0, field_provenance: {} });
+      {
+        const r = await runOne("ak5b", "true", approve);
+        assertEq(r.new_verification_status, "data_insufficient", "ak5b-1: verified_second_line=0, zero address sources -> stays data_insufficient");
+        assertEq(judgeCalls, 0, "ak5b-2: judge not called");
+      }
+
+      // readStoredVerifiedSecondLine: column absent -> false (no new path).
+      {
+        const bare = new Database(":memory:");
+        try {
+          bare.exec(`CREATE TABLE agent_knowledge (agent_id TEXT PRIMARY KEY, verification_status TEXT)`);
+          bare.prepare(`INSERT INTO agent_knowledge (agent_id, verification_status) VALUES ('x', 'verified')`).run();
+          assertEq(readStoredVerifiedSecondLine(bare, "x"), false, "ak5c-1: column absent -> false");
+        } finally {
+          bare.close();
+        }
+        assertEq(readStoredVerifiedSecondLine(db, "ak1"), true, "ak5c-2: stored 1 -> true");
+        assertEq(readStoredVerifiedSecondLine(db, "no-such-agent"), false, "ak5c-3: missing row -> false");
       }
 
       // ── AK2: guards keep the demotion; judge never called ────────────
