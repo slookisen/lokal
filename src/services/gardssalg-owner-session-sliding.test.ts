@@ -8,8 +8,11 @@
  *          invalid day 91; at most one renewal write per day; a re-clicked
  *          link never moves the cap anchor; the cookie is re-set on renewal.
  *   rv-*   an expired or revoked row is never revived.
- *   ak2-*  a different address taking the provider revokes the previous
- *          owner's sessions (flag off and on); the same address does not.
+ *   n2-*   at most one renewal write per day; the final < 24 h step onto
+ *          the cap; compare-and-set on expires_at.
+ *   two-*  two addresses at one producer both stay logged in (flag off and on).
+ *   ak2-*  flag on: an ownership change (admin revoke / admin grant) revokes
+ *          the previous owner's sessions and unused links; flag off: nothing.
  *   off-*  flag off: rows, answers and cookie exactly as before.
  *   l1     no token in any log line.
  *
@@ -84,7 +87,7 @@ export function runGardssalgOwnerSessionSlidingTests(opts: { log?: boolean } = {
           (id, navn, slug, vertical, org_nr, brreg_verified, content_source, epost, enrichment_state, verification_status, source, confidence)
         VALUES (@id, @id, @id, 'experiences', @org_nr, 1, NULL, NULL, 'raw', 'pending_verify', 'test-fixture', 'medium')
       `);
-      ["p-ak1", "p-rv", "p-ak2", "p-ak2on", "p-off"].forEach((id, i) => insertProvider.run({ id, org_nr: `91330000${i}` }));
+      ["p-ak1", "p-rv", "p-ak2", "p-n2", "p-two-off", "p-two-on", "p-off"].forEach((id, i) => insertProvider.run({ id, org_nr: `91330000${i}` }));
       let seq = 0;
       const newClaim = (providerId: string, email: string): string => {
         seq++;
@@ -168,23 +171,64 @@ export function runGardssalgOwnerSessionSlidingTests(opts: { log?: boolean } = {
       eq(verify(tRev).valid, false, "rv-3: logged out → invalid");
       eq([sliding.renewGardssalgOwnerSessionOnUse(db, revRow), row(tRev).expires_at], [null, revRow.expires_at], "rv-4: a revoked row is never renewed, even from a read made before the logout");
 
-      // ── AK2: ownership change ─────────────────────────────────────────
-      for (const [mode, prov] of [["off", "p-ak2"], ["on", "p-ak2on"]] as const) {
-        flag(mode === "on" ? "true" : undefined);
-        const a1 = newClaim(prov, "Gammel@Gard.test");
-        const a2 = newClaim(prov, "gammel@gard.test ");
-        claimSvc.verifyClaimToken(a1);
-        claimSvc.verifyClaimToken(a2);
-        ok(verify(a1).valid && verify(a2).valid, `ak2-${mode}-1: the same address logging in again keeps its other sessions`);
-        const b = newClaim(prov, "ny@gard.test");
-        const confirmed = mode === "on" ? claimSvc.confirmClaimToken(b) : claimSvc.verifyClaimToken(b);
-        eq(confirmed.valid, true, `ak2-${mode}-2: a new owner takes the provider`);
-        eq([verify(a1).valid, verify(a2).valid], [false, false], `ak2-${mode}-3: AK2 — the previous owner's sessions are invalid`);
-        eq(verify(b).providerId, prov, `ak2-${mode}-4: the new owner's session is valid`);
-        const audit = db.prepare(`SELECT COUNT(*) AS c FROM gardssalg_content_audit WHERE provider_id = ? AND field_name = 'gardssalg_claim_revoked' AND changed_by = 'ownership_change'`).get(prov) as { c: number };
-        eq(audit.c, 2, `ak2-${mode}-5: each revoked session is audited`);
-        eq(claimSvc.isGardssalgProviderClaimed(prov), true, `ak2-${mode}-6: the provider stays claimed`);
+      // ── N2: renewal edges (flag on) ──────────────────────────────────
+      flag("1");
+      const tN = newClaim("p-n2", "eier@n2.test");
+      claimSvc.verifyClaimToken(tN);
+      advance(tN, 5 * DAY);
+      ok(typeof verify(tN).renewedExpiresAtMs === "number", "n2-1: day 5 → renewed");
+      advance(tN, 23 * 60 * 60 * 1000);
+      eq(verify(tN).renewedExpiresAtMs, undefined, "n2-2: 23 hours later → no write (at most one per day)");
+      advance(tN, 2 * 60 * 60 * 1000);
+      ok(typeof verify(tN).renewedExpiresAtMs === "number", "n2-3: 25 hours after the last write → renewed");
+      // Stored expiry 12 hours short of the cap: the final step onto the cap is written although it is < 24 hours.
+      const now = Date.now();
+      db.prepare(`UPDATE gardssalg_claims SET used_at = ?, expires_at = ? WHERE token = ?`)
+        .run(new Date(now - 61 * DAY).toISOString(), new Date(now + 28.5 * DAY).toISOString(), tN);
+      ok(typeof verify(tN).renewedExpiresAtMs === "number", "n2-4: a step under 24 hours onto the cap is written");
+      near(sinceStart(tN), 90 * DAY, "n2-5: … expiry = the 90-day cap");
+      const stale = { ...row(tN), expires_at: new Date(now + 20 * DAY).toISOString(), used_at: new Date(now - 10 * DAY).toISOString() };
+      const cur = row(tN).expires_at;
+      eq([sliding.renewGardssalgOwnerSessionOnUse(db, stale), row(tN).expires_at], [null, cur], "n2-6: compare-and-set — a stale read never overwrites the stored expiry");
+
+      // ── B1: ordinary logins never revoke (flag off and on) ───────────
+      for (const mode of ["off", "on"] as const) {
+        flag(mode === "on" ? "1" : undefined);
+        const prov = `p-two-${mode}`;
+        const a = newClaim(prov, "a@gard.test");
+        const b = newClaim(prov, "b@gard.test");
+        eq(claimSvc.verifyClaimToken(a).valid, true, `two-${mode}-1: address A logs in`);
+        eq((mode === "on" ? claimSvc.confirmClaimToken(b) : claimSvc.verifyClaimToken(b)).valid, true, `two-${mode}-2: address B at the same producer logs in`);
+        eq(claimSvc.verifyClaimToken(a).valid, true, `two-${mode}-3: A re-clicks its old link`);
+        eq([verify(a).valid, verify(b).valid], [true, true], `two-${mode}-4: both addresses stay logged in`);
+        eq([row(a).revoked_at, row(b).revoked_at], [null, null], `two-${mode}-5: … no row revoked`);
       }
+
+      // ── AK2 / B2: an ownership change (admin levers) ─────────────────
+      flag(undefined);
+      const o0 = newClaim("p-ak2", "gammel@gard.test");
+      claimSvc.verifyClaimToken(o0);
+      eq(sliding.revokeGardssalgOwnerAccessOnOwnershipChange(db, "p-ak2", { changedBy: "admin" }), 0, "ak2-off: flag off → the helper writes nothing (main's behaviour)");
+      flag("1");
+      const oldSess = newClaim("p-ak2", "Gammel@Gard.test");
+      const oldLink = newClaim("p-ak2", "gammel@gard.test");
+      const otherLink = newClaim("p-ak2", "annen@gard.test");
+      claimSvc.verifyClaimToken(oldSess);
+      // Owner removed (POST /admin/gardssalg-claim-revoke runs this in its transaction).
+      eq(sliding.revokeGardssalgOwnerAccessOnOwnershipChange(db, "p-ak2", { changedBy: "admin" }), 4, "ak2-1: owner removed → every live row revoked");
+      eq([verify(o0).valid, verify(oldSess).valid], [false, false], "ak2-2: AK2 — the previous owner's sessions are invalid");
+      eq([claimSvc.verifyClaimToken(oldLink).valid, claimSvc.verifyClaimToken(otherLink).valid], [false, false], "ak2-3: B2 — their unused links no longer log in");
+      // Owner assigned: links issued in between to other addresses are revoked; the new owner's are kept.
+      const between = newClaim("p-ak2", "gammel@gard.test");
+      const mine = newClaim("p-ak2", "Ny@gard.test");
+      const granted = claimSvc.issueAdminGrantedClaimMagicLink("p-ak2", "ny@gard.test");
+      ok(granted.ok, "ak2-4: admin grants the provider to a new address");
+      eq(claimSvc.verifyClaimToken(between).valid, false, "ak2-5: B2 — the previous owner's unused link is revoked on the grant");
+      eq(claimSvc.verifyClaimToken(mine).valid, true, "ak2-6: the new owner's own earlier link is kept");
+      if (granted.ok) eq(claimSvc.verifyClaimToken(granted.claim.token).providerId, "p-ak2", "ak2-7: the granted link logs the new owner in");
+      const audit = db.prepare(`SELECT COUNT(*) AS c FROM gardssalg_content_audit WHERE provider_id = ? AND field_name = 'gardssalg_claim_revoked' AND changed_by = 'admin'`).get("p-ak2") as { c: number };
+      eq(audit.c, 5, "ak2-8: each revoked row is audited");
+      if (granted.ok) tokens.push(granted.claim.token);
 
       // ── flag off: unchanged ───────────────────────────────────────────
       for (const v of [undefined, "false", "0"]) {

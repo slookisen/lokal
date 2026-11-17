@@ -7,6 +7,8 @@
  * logins are not merged.
  *
  *   GARDSSALG_OWNER_SESSION_SLIDING_ENABLED : «1»/«true» = on; default off; read per call.
+ *     NB: with the flag on, the claim-link token is itself the session key
+ *     (cookie value / Bearer) for up to MAX_DAYS (default 90) — treat it so.
  *   GARDSSALG_OWNER_SESSION_IDLE_DAYS       : days without use before the session ends (default 30).
  *   GARDSSALG_OWNER_SESSION_MAX_DAYS        : hard cap in days after the session started (default 90).
  *
@@ -22,6 +24,7 @@
  * that is expired, logged out or revoked is never revived.
  */
 
+import crypto from "crypto";
 import type { getDb } from "../database/db-factory";
 import { parseOwnerSessionTime } from "./owner-session-sliding";
 
@@ -106,29 +109,39 @@ export function gardssalgOwnerSessionCookieMaxAgeMs(db: Db, token: string, nowMs
 }
 
 /**
- * Ownership change (O3-3 AK2): a claim for `providerId` has just been used by
- * `email`. Every other used, unrevoked session row of the same provider
- * that belongs to a different address is revoked, so the previous owner's
- * sessions stop verifying. The new owner's own rows (same address,
- * compared trimmed + lower-cased) are kept. Runs inside the caller's
- * transaction; returns the number of rows revoked. Not flag-gated.
+ * Ownership change (O3-3 AK2: «Økter trekkes når eierskapet skifter»). Called
+ * only from the real ownership-change events — the admin claim-revoke lever
+ * (owner removed) and the admin claim-grant (owner assigned) — never from an
+ * ordinary login: in gårdssalg a claim link IS the owner login, and several
+ * addresses at the same producer are legitimate co-owners.
+ *
+ * Flag on: every live row of the provider — sessions (used = 1) AND unused
+ * login links — whose address is not `keepEmail` (trimmed + lower-cased) is
+ * revoked and audited. Draft (self-register) rows are left to their own
+ * review flow. Flag off: writes nothing, so the admin levers behave exactly
+ * as on main. Runs inside the caller's transaction; returns the count.
  */
-export function revokeOtherOwnersGardssalgSessions(db: Db, providerId: string, keepClaimId: string, email: string): number {
-  const keep = String(email || "").trim().toLowerCase();
-  const others = db.prepare(
-    `SELECT id FROM gardssalg_claims
-      WHERE provider_id = ? AND id != ? AND used = 1 AND revoked_at IS NULL
-        AND LOWER(TRIM(email)) != ?`,
-  ).all(providerId, keepClaimId, keep) as Array<{ id: string }>;
+export function revokeGardssalgOwnerAccessOnOwnershipChange(
+  db: Db,
+  providerId: string,
+  opts: { keepEmail?: string; changedBy: string },
+): number {
+  if (!isGardssalgOwnerSessionSlidingEnabled()) return 0;
+  const keep = String(opts.keepEmail ?? "").trim().toLowerCase();
+  const live = db.prepare(
+    `SELECT id, email FROM gardssalg_claims
+      WHERE provider_id = ? AND revoked_at IS NULL AND COALESCE(draft_mode, 0) = 0`,
+  ).all(providerId) as Array<{ id: string; email: string | null }>;
   let n = 0;
-  for (const o of others) {
+  for (const o of live) {
+    if (keep && String(o.email ?? "").trim().toLowerCase() === keep) continue;
     const r = db.prepare(`UPDATE gardssalg_claims SET revoked_at = datetime('now') WHERE id = ? AND revoked_at IS NULL`).run(o.id);
     if (r.changes === 0) continue;
     n++;
     db.prepare(
       `INSERT INTO gardssalg_content_audit (id, provider_id, field_name, old_value, new_value, changed_by)
-       VALUES (?, ?, 'gardssalg_claim_revoked', ?, 'revoked', 'ownership_change')`,
-    ).run(`gca_${keepClaimId}_${o.id}`, providerId, o.id);
+       VALUES (?, ?, 'gardssalg_claim_revoked', ?, 'revoked', ?)`,
+    ).run(`gca_${crypto.randomUUID()}`, providerId, o.id, opts.changedBy);
   }
   return n;
 }

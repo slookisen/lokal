@@ -451,7 +451,7 @@ import {
   gardssalgNewOwnerSessionLifetimeMs,
   isGardssalgOwnerSessionSlidingEnabled,
   renewGardssalgOwnerSessionOnUse,
-  revokeOtherOwnersGardssalgSessions,
+  revokeGardssalgOwnerAccessOnOwnershipChange,
 } from "./gardssalg-owner-session-sliding";
 
 const VERTICAL = "experiences";
@@ -2357,7 +2357,13 @@ export function issueAdminGrantedClaimMagicLink(providerId: string, email: strin
 
   if (hasActiveNonRevokedClaim(providerId)) return { ok: false, error: "already_claimed" };
 
-  const claim = insertGardssalgClaimRow(providerId, normalized, "manual");
+  // O3-3 AK2 (flag on): assigning a new owner revokes every other address's
+  // still-open login links for the provider before the new link is issued.
+  const db = getDb(VERTICAL);
+  const claim = db.transaction(() => {
+    revokeGardssalgOwnerAccessOnOwnershipChange(db, providerId, { keepEmail: normalized, changedBy: "admin" });
+    return insertGardssalgClaimRow(providerId, normalized, "manual");
+  })();
   return { ok: true, claim };
 }
 
@@ -2452,9 +2458,6 @@ function markClaimUsedAndLockProvider(db: ReturnType<typeof getDb>, claimId: str
       if (row) renewGardssalgOwnerSessionOnUse(db, row, nowMs);
     }
   }
-  // O3-3 AK2: a different address taking the provider ends the previous owner's sessions.
-  const claimed = db.prepare(`SELECT email FROM gardssalg_claims WHERE id = ?`).get(claimId) as { email: string } | undefined;
-  if (claimed) revokeOtherOwnersGardssalgSessions(db, providerId, claimId, claimed.email);
   db.prepare(
     `UPDATE experience_providers SET content_source = 'claim', updated_at = datetime('now')
      WHERE id = ? AND (content_source IS NULL OR content_source NOT IN ('manual', 'claim'))`,

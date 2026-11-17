@@ -43,6 +43,7 @@
  *       used=1 rows are ever revoked
  *   (j) multiple active, non-revoked claims for one provider are ALL
  *       revoked in a single apply call, each with its own audit row
+ *   (k) O3-3, GARDSSALG_OWNER_SESSION_SLIDING_ENABLED on: unused links too
  */
 
 export interface TestSummary {
@@ -360,10 +361,30 @@ export function runOpplevelserGardssalgClaimRevokeTests(
       assertTrue(multiRowsAfter.every((r: any) => typeof r.revoked_at === "string" && r.revoked_at.length > 0), "j3: both claim rows now have revoked_at set");
       assertEq(getAuditRows("revoke-multi").length, 2, "j4: two separate audit rows were written, one per revoked claim");
       assertEq(getProviderRow("revoke-multi").claimed_at, null, "j5: claimed_at reset after the LAST active claim was revoked");
+
+      // ── (k) O3-3 AK2, GARDSSALG_OWNER_SESSION_SLIDING_ENABLED on: an
+      //     unused login link is revoked too (flag off: (i) above, as before)
+      insertProvider.run({
+        id: "revoke-o33", navn: "O33 Gard", slug: "revoke-o33-gard",
+        content_source: "claim", claimed_at: "2026-08-01 10:00:00", created_at: "2026-02-01 00:00:00",
+      });
+      const future = new Date(Date.now() + 86400000).toISOString();
+      for (const [id, used] of [["gsc_o33_s", 1], ["gsc_o33_u", 0]] as const) {
+        insertClaim.run({
+          id, provider_id: "revoke-o33", email: `${id}@o33.no`, email_source: "manual", token: `tok-${id}`, used,
+          used_at: used ? "2026-08-01 10:00:00" : null, revoked_at: null, created_at: "2026-08-01 09:00:00", expires_at: future,
+        });
+      }
+      process.env.GARDSSALG_OWNER_SESSION_SLIDING_ENABLED = "1";
+      const applyO33 = await callRoute(opplevelserRouter, { headers: auth, body: { provider_id: "revoke-o33", apply: true } });
+      delete process.env.GARDSSALG_OWNER_SESSION_SLIDING_ENABLED;
+      assertEq([applyO33.body.revoked.length, applyO33.body.revoked_login_links], [1, 1], "k1: flag on — the session and the unused link are both revoked");
+      assertTrue(getClaimRows("revoke-o33").every((r: any) => !!r.revoked_at), "k2: ...no live row is left for the provider");
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-claim-revoke: unexpected error: " + String(err?.stack || err?.message || err));
     } finally {
+      delete process.env.GARDSSALG_OWNER_SESSION_SLIDING_ENABLED;
       if (emailSvc) {
         emailSvc.isConfigured = origConfigured;
         emailSvc.transporter = origTransporter;
