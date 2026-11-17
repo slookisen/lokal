@@ -48137,6 +48137,25 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-17-andrelinje-verifiserte-nedgraderes-etter-berikelse
+// (S1): second line also attempted when the gate passes but only the
+// cross-source address verdict demotes. Same in-memory DB seam as above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-17 S1: second line after enrichment (gate passes, address-only demotion) ──");
+  try {
+    const { runLokalAgentVerifierSecondLineAfterEnrichmentTests } = require("../src/agents/lokal-agent-verifier-second-line-after-enrichment.test") as
+      typeof import("../src/agents/lokal-agent-verifier-second-line-after-enrichment.test");
+    const sae = await runLokalAgentVerifierSecondLineAfterEnrichmentTests({ log: false });
+    passed += sae.passed;
+    failed += sae.failed;
+    for (const f of sae.failures) failures.push("lokal-agent-verifier-second-line-after-enrichment: " + f);
+    console.log(`  lokal-agent-verifier-second-line-after-enrichment: ${sae.passed} passed, ${sae.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("lokal-agent-verifier-second-line-after-enrichment: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-23-rfb-flere-forstehenvendelser-dommer-bevis-og-
 // kontaktuttrekk (skive 1): own-website evidence for the RFB second-line judge
 // behind RFB_SECOND_LINE_EVIDENCE_ENABLED (default OFF) + the read-only
