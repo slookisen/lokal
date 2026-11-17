@@ -1582,6 +1582,12 @@ export interface BookingFollowupResult {
   expired: number;
   expired_guests_notified: number;
   errors: number;
+  /**
+   * O4-5: guest reminders sent the day before a confirmed visit. Present only
+   * with GARDSSALG_GUEST_REMINDER_ENABLED on, so the result (and the admin
+   * POST response) is unchanged with the flag off.
+   */
+  guest_reminders_sent?: number;
 }
 
 export async function processBookingFollowups(
@@ -1756,6 +1762,13 @@ export async function processBookingFollowups(
     }
   }
 
+  // ── O4-5: the guest's reminder the day before a confirmed visit. Flag off:
+  // no query, no write, no send, and the result keeps its old shape. ──
+  if (gardssalgGuestReminderEnabled()) {
+    result.guest_reminders_sent = 0;
+    await processGuestReminders(now, result);
+  }
+
   return result;
 }
 
@@ -1829,4 +1842,242 @@ export function countBookingFollowupsDue(now: Date = new Date()): BookingFollowu
     }
   }
   return out;
+}
+
+// ─── O4-5: reminder to the guest the day before a confirmed visit ──────────
+// A2A dev-request 2026-11-12-opplevagent-o4-epost-og-tekster, slice O4-5.
+// Behind GARDSSALG_GUEST_REMINDER_ENABLED (off unless exactly "true", read on
+// every call like the other GARDSSALG_* flags). Run by the followup job above
+// (the hourly booking-followups tick in src/index.ts and POST
+// /admin/booking-followups); no scheduler of its own.
+//
+// Who: a visit the PRODUCER HAS CONFIRMED — pre_status 'provider_confirmed'
+// (the producer pressed «Bekreft», or the guest accepted the producer's
+// suggested time) while the post-visit status is still 'reserved'. Never a
+// pending (awaiting_provider), suggested (time_suggested), declined, expired
+// or cancelled booking, never one already resolved after the visit, and never
+// a row whose guest contact the 30-day sweep has cleared.
+//
+// When: «dagen før» (OA-2 B), as the subject says «I morgen» / «Tomorrow».
+// Both must hold at the send moment:
+//   1. the visit's Europe/Oslo calendar date is exactly the day after the
+//      send moment's Europe/Oslo date (calendar arithmetic, so DST-safe), and
+//   2. the visit is still in the future and at most
+//      GUEST_REMINDER_WINDOW_HOURS (24) away.
+// With the hourly tick a visit confirmed in good time gets the reminder about
+// 24 hours before (e.g. 15:00 the day before a 15:00 visit). A visit confirmed
+// later on the day before gets it on the next tick. A visit confirmed on the
+// day itself (or after the last tick of the day before) never gets one: there
+// is no moment at which «I morgen» would be true. A visit that has passed never
+// gets one. No separate minimum lead time: rule 1 already excludes the
+// same-day case the earlier 2-hour bound was for; the only short-lead case left
+// is a visit just after midnight reminded late the evening before, where
+// «I morgen» is still true.
+//
+// Once: guest_reminder_sent_at is claimed with a guarded UPDATE (… IS NULL,
+// plus the confirmed/reserved state) BEFORE the send; only the call whose
+// UPDATE changed the row sends, so two overlapping ticks cannot both send
+// (better-sqlite3 runs synchronously). A send that throws or reports failure
+// releases the claim, so the next tick retries while the window is open.
+//
+// Text: OA-2 B, verbatim, in the O4-2 register (guest.reminder.*). English only
+// with GARDSSALG_EMAIL_EN_ENABLED and guest_lang "en" (guestEmailLang()).
+// The cancel line links the status page only when GARDSSALG_CANCEL_ENABLED is
+// on (that is where the guest cancels); otherwise the guest is asked to reply
+// to the e-mail (reply-to kontakt@opplevagent.no, like every guest e-mail).
+
+export const GUEST_REMINDER_WINDOW_HOURS = 24;
+
+/** Off unless exactly "true", read on every call. */
+export function gardssalgGuestReminderEnabled(): boolean {
+  return process.env.GARDSSALG_GUEST_REMINDER_ENABLED === "true";
+}
+
+// Same rule as gardssalgCancelEnabled() in gardssalg-cancel.ts (which imports
+// this module, so it is not imported here).
+function guestCancelEnabled(): boolean {
+  return process.env.GARDSSALG_CANCEL_ENABLED === "true";
+}
+
+// The slot_at bounds only keep past and far-off visits out of the scan; the
+// exact rule is guestReminderDue(). They compare as text with a margin of a
+// day on each side, which is safe for every slot_at format in the table
+// (ISO with Z from createBooking(), legacy naked Oslo "YYYY-MM-DDTHH:MM", and
+// SQLite "YYYY-MM-DD HH:MM:SS"): all start with the date, and the margin
+// covers the time-zone offset and the ' ' / 'T' separator.
+const GUEST_REMINDER_CANDIDATES_SQL = `
+  SELECT * FROM gardssalg_bookings
+  WHERE status = 'reserved' AND pre_status = 'provider_confirmed'
+    AND guest_reminder_sent_at IS NULL
+    AND slot_at >= ? AND slot_at <= ?
+`;
+
+function guestReminderCandidates(nowMs: number): Record<string, unknown>[] {
+  const day = 24 * 3600_000;
+  return getDb(VERTICAL)
+    .prepare(GUEST_REMINDER_CANDIDATES_SQL)
+    .all(new Date(nowMs - day).toISOString(), new Date(nowMs + (GUEST_REMINDER_WINDOW_HOURS * 3600_000) + 2 * day).toISOString()) as Record<string, unknown>[];
+}
+
+const OSLO_DATE = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "Europe/Oslo", year: "numeric", month: "2-digit", day: "2-digit",
+});
+
+/** The Europe/Oslo calendar date of an instant, "YYYY-MM-DD". */
+export function osloDateOf(ms: number): string {
+  const parts = OSLO_DATE.formatToParts(new Date(ms));
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+  return `${get("year")}-${get("month")}-${get("day")}`;
+}
+
+/** The calendar day after "YYYY-MM-DD" (pure date arithmetic, no time zone). */
+function nextCalendarDay(ymd: string): string {
+  const [y, m, d] = ymd.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10);
+}
+
+type ReminderRow = GardssalgBooking & { guest_reminder_sent_at?: string | null };
+
+function hydrateReminderRow(raw: Record<string, unknown>): ReminderRow {
+  return { ...hydrate(raw), guest_reminder_sent_at: (raw.guest_reminder_sent_at as string | null) ?? null };
+}
+
+/** The visit start in epoch ms (a legacy naked slot is Oslo wall time); NaN when unreadable. */
+function visitStartMs(slot: string | null): number {
+  if (!slot) return NaN;
+  return Date.parse(osloDatetimeLocalToUtcIso(slot) ?? slot);
+}
+
+/**
+ * Whether the job sends the guest reminder for this booking at `nowMs`.
+ * Shared by the job and the dry-run count, so the two cannot disagree.
+ */
+export function guestReminderDue(booking: ReminderRow, nowMs: number): boolean {
+  if (booking.status !== "reserved" || booking.pre_status !== "provider_confirmed") return false;
+  if (booking.guest_reminder_sent_at) return false;
+  if (!booking.guest_email?.trim()) return false;
+  const startMs = visitStartMs(booking.slot_at);
+  if (!Number.isFinite(startMs)) return false;
+  const leadMs = startMs - nowMs;
+  if (leadMs <= 0 || leadMs > GUEST_REMINDER_WINDOW_HOURS * 3600_000) return false;
+  // «I morgen»: the visit's Oslo date is the day after today's Oslo date.
+  return osloDateOf(startMs) === nextCalendarDay(osloDateOf(nowMs));
+}
+
+/** The reminder e-mail (OA-2 B). Values are escaped in the HTML; the status URL is a link there. */
+export function buildGuestReminderEmail(
+  booking: GardssalgBooking,
+): { subject: string; htmlContent: string; textContent: string; lang: EmailLang } {
+  const lang = guestEmailLang(booking);
+  const provider = loadReceiptProvider(booking.provider_id);
+  const statusUrl = guestStatusUrl(booking);
+  // Cancel line only when the guest can cancel on the status page; otherwise
+  // (flag off, or a row without a status link) the reply line.
+  const withCancel = guestCancelEnabled() && !!statusUrl;
+  let body = emailText("guest.reminder.body", lang)
+    .split("\n\n")
+    .map((p) => (!withCancel && p.includes("{statusside}") ? emailText("guest.reminder.replyLine", lang) : p))
+    .join("\n\n");
+  // No address on file: "Sted: {produsent}" rather than a dangling comma.
+  if (!provider.sted) body = body.split("{produsent}, {sted}").join("{produsent}");
+  const raw: Record<string, string> = {
+    gjest: booking.guest_name,
+    produsent: provider.navn,
+    sted: provider.sted,
+    tid: lang === "en" ? slotEn(booking.slot_at) : slotNb(booking.slot_at),
+    antall: String(booking.party_size),
+    ref: booking.booking_ref,
+    statusside: statusUrl ?? "",
+  };
+  const { text, html } = renderEmailBody(body, raw, ["statusside"]);
+  const subject = fillEmailText(emailText("guest.reminder.subject", lang), { produsent: provider.navn, ref: booking.booking_ref });
+  return { subject, htmlContent: html, textContent: text, lang };
+}
+
+/** Sends the reminder; true when the mailer accepted it. */
+export async function sendGuestReminder(booking: GardssalgBooking): Promise<boolean> {
+  const mail = buildGuestReminderEmail(booking);
+  const r = await emailService.sendEmail({
+    to: booking.guest_email,
+    isTestSend: booking.is_test === 1,
+    subject: mail.subject,
+    htmlContent: mail.htmlContent,
+    textContent: mail.textContent,
+    replyTo: "kontakt@opplevagent.no",
+    // Same sender identity as the other guest e-mails (Steg 3 / funn 2).
+    from: crmFromHeader("experiences"),
+  });
+  return r?.success !== false;
+}
+
+async function processGuestReminders(now: Date, result: BookingFollowupResult): Promise<void> {
+  const db = getDb(VERTICAL);
+  const nowMs = now.getTime();
+  const rows = guestReminderCandidates(nowMs);
+  for (const raw of rows) {
+    const booking = hydrateReminderRow(raw);
+    if (!guestReminderDue(booking, nowMs)) continue;
+    const stamp = now.toISOString();
+    try {
+      // Claim BEFORE sending — the guarded UPDATE is the concurrency lock and
+      // re-checks the state the SELECT saw (cancelled or resolved in between
+      // → no claim, no send).
+      const claim = db.prepare(`
+        UPDATE gardssalg_bookings SET guest_reminder_sent_at = ?
+        WHERE booking_id = ? AND guest_reminder_sent_at IS NULL
+          AND status = 'reserved' AND pre_status = 'provider_confirmed'
+      `).run(stamp, booking.booking_id);
+      if (claim.changes !== 1) continue;
+      let sent = false;
+      try {
+        sent = await sendGuestReminder(booking);
+      } catch (err) {
+        db.prepare("UPDATE gardssalg_bookings SET guest_reminder_sent_at = NULL WHERE booking_id = ? AND guest_reminder_sent_at = ?")
+          .run(booking.booking_id, stamp);
+        throw err;
+      }
+      if (sent) {
+        result.guest_reminders_sent = (result.guest_reminders_sent ?? 0) + 1;
+      } else {
+        // Not handed to the mailer: release so the next tick retries.
+        db.prepare("UPDATE gardssalg_bookings SET guest_reminder_sent_at = NULL WHERE booking_id = ? AND guest_reminder_sent_at = ?")
+          .run(booking.booking_id, stamp);
+        result.errors++;
+        console.error(`[booking-previsit] guest reminder not sent for ${booking.booking_ref}; retried next run`);
+      }
+    } catch (err) {
+      result.errors++;
+      console.error(`[booking-previsit] guest reminder failed for ${booking.booking_ref}:`, err);
+    }
+  }
+}
+
+export interface GuestReminderDryRun {
+  /** Whether GARDSSALG_GUEST_REMINDER_ENABLED is on (the job only sends when it is). */
+  enabled: boolean;
+  /** Reminders the job would send now if the flag were on. */
+  would_send: number;
+  booking_refs: string[];
+  window_hours: number;
+  /** The date rule: the visit's Europe/Oslo date is the day after today's. */
+  rule: "oslo_day_before";
+}
+
+// Read-only (no claim, no send): which reminders processBookingFollowups()
+// would send at `now`. Counts regardless of the flag, and says whether it is on.
+export function countGuestRemindersDue(now: Date = new Date()): GuestReminderDryRun {
+  const nowMs = now.getTime();
+  const refs: string[] = [];
+  for (const raw of guestReminderCandidates(nowMs)) {
+    const booking = hydrateReminderRow(raw);
+    if (guestReminderDue(booking, nowMs)) refs.push(booking.booking_ref);
+  }
+  refs.sort();
+  return {
+    enabled: gardssalgGuestReminderEnabled(),
+    would_send: refs.length,
+    booking_refs: refs,
+    window_hours: GUEST_REMINDER_WINDOW_HOURS,
+    rule: "oslo_day_before",
+  };
 }

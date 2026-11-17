@@ -1151,6 +1151,13 @@ export function initExperiencesSchema(db: Database.Database): void {
   // Additive, nullable; existing rows stay NULL (= "nb").
   try { db.exec("ALTER TABLE gardssalg_bookings ADD COLUMN guest_lang TEXT"); } catch { /* already present */ }
 
+  // ─── O4-5: the guest's reminder the day before a confirmed visit (same
+  // dev-request). Stamped by the followup job (processBookingFollowups(),
+  // behind GARDSSALG_GUEST_REMINDER_ENABLED) with a guarded UPDATE before
+  // the send, so a booking gets the reminder at most once. Additive,
+  // nullable; existing rows stay NULL.
+  try { db.exec("ALTER TABLE gardssalg_bookings ADD COLUMN guest_reminder_sent_at TEXT"); } catch { /* already present */ }
+
   // ─── O4-3: the confirmed address for visit requests (same dev-request) ───
   // One row per producer: the confirmed address and the pending single-use
   // link (stored only as its SHA-256 hash). Written only by

@@ -3064,13 +3064,15 @@ if (
       const r = await processBookingFollowups();
       if (
         r.producer_notify_retried || r.reminders_sent || r.reminders_suppressed ||
-        r.expired || r.expired_guests_notified || r.errors
+        r.expired || r.expired_guests_notified || r.errors || r.guest_reminders_sent
       ) {
         console.log(
           `[booking-followups] tick examined=${r.examined} notify_retried=${r.producer_notify_retried} ` +
           `reminders=${r.reminders_sent} ` +
           `suppressed=${r.reminders_suppressed} expired=${r.expired} ` +
-          `guests_notified=${r.expired_guests_notified} errors=${r.errors}`
+          `guests_notified=${r.expired_guests_notified} errors=${r.errors}` +
+          // O4-5: only present with GARDSSALG_GUEST_REMINDER_ENABLED on.
+          (r.guest_reminders_sent !== undefined ? ` guest_reminders=${r.guest_reminders_sent}` : "")
         );
       }
     } catch (err) {

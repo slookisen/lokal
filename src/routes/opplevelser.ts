@@ -971,6 +971,8 @@ import {
   processBookingFollowups,
   // O1-1: read-only dry-run of the same engine
   countBookingFollowupsDue,
+  // O4-5: read-only dry-run of the guest reminder the day before a visit
+  countGuestRemindersDue,
   // slice 1 ("myk åpningstidsvalidering"): the slot-bounds/opening-hours
   // check must judge the SAME canonical UTC instant createBooking() ends up
   // storing — a naked datetime-local slot_at is Oslo wall time, not server-
@@ -34457,6 +34459,25 @@ router.get(
     } catch (err) {
       console.error("[booking-followups] dry-run failed:", err);
       res.status(500).json({ error: "Kunne ikke telle booking-followups" });
+    }
+  },
+);
+
+// ─── GET /api/opplevelser/admin/booking-followups/guest-reminders/dry-run ───
+// O4-5: how many guest reminders (the day before a confirmed visit) the
+// followup job would send right now, with the booking refs. Read-only (no
+// claim, no send), admin-keyed, and answers with the flag off too
+// (`enabled` says whether the job would actually send). Uses the same
+// decision function as processBookingFollowups().
+router.get(
+  "/admin/booking-followups/guest-reminders/dry-run",
+  requireAdmin,
+  (_req: Request, res: Response) => {
+    try {
+      res.json(countGuestRemindersDue());
+    } catch (err) {
+      console.error("[booking-followups] guest reminder dry-run failed:", err);
+      res.status(500).json({ error: "Kunne ikke telle påminnelser til gjester" });
     }
   },
 );

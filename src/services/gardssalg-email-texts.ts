@@ -38,7 +38,7 @@ const producer = (nb: string): EmailTextEntry => ({ nb, en: null, audience: "pro
 // Placeholders: {gjest} {produsent} {ref} {tid} {antall} {kommentar} {frist}
 // {statusside} (URL) {statuslenke} (HTML link) {oversikt} (URL)
 // {alternativlenke} (HTML link) {nytt_tidspunkt} {svarlenke} {profilside}
-// {grunn} {e-post} {lenke}.
+// {grunn} {e-post} {lenke} {sted}.
 export const GARDSSALG_EMAIL_TEXTS = {
   // ── Shared (OA-2 A, «Felles ledetekster») ───────────────────────────────
   "greeting": guest("Hei {gjest},", "Hi {gjest},"),
@@ -177,6 +177,52 @@ export const GARDSSALG_EMAIL_TEXTS = {
   "guest.expired.bodySuggested": guest(
     "Vi beklager — det foreslåtte tidspunktet for reservasjonsforespørselen din ({ref}, {tid}) ble dessverre ikke endelig avklart i tide, så forespørselen er nå utløpt.",
     "We are sorry. The suggested time for your request ({ref}, {tid}) was not settled in time, so the request has expired.",
+  ),
+
+  // ── Guest: reminder the day before a confirmed visit (OA-2 B, O4-5) ─────
+  // Sent once by the followup job (GARDSSALG_GUEST_REMINDER_ENABLED). The
+  // body is the package's text with the cancel line ({statusside}); with
+  // GARDSSALG_CANCEL_ENABLED off that paragraph is replaced by
+  // guest.reminder.replyLine (OA-2 B, last paragraph).
+  "guest.reminder.subject": guest(
+    "I morgen: besøk hos {produsent} — {ref}",
+    "Tomorrow: your visit to {produsent} — {ref}",
+  ),
+  "guest.reminder.body": guest(
+    [
+      "Hei {gjest},",
+      "",
+      "Dette er en påminnelse om besøket du har avtalt:",
+      "",
+      "Sted: {produsent}, {sted}",
+      "Tidspunkt: {tid}",
+      "Antall: {antall}",
+      "Referanse: {ref}",
+      "",
+      "Kan du ikke komme likevel, er det fint om du avlyser, så produsenten får beskjed: {statusside}",
+      "",
+      "Hilsen",
+      "Opplevagent",
+    ].join("\n"),
+    [
+      "Hi {gjest},",
+      "",
+      "This is a reminder of the visit you have arranged:",
+      "",
+      "Place: {produsent}, {sted}",
+      "Date and time: {tid}",
+      "Guests: {antall}",
+      "Reference: {ref}",
+      "",
+      "If you cannot come after all, please cancel so that the producer is told: {statusside}",
+      "",
+      "Best regards,",
+      "Opplevagent",
+    ].join("\n"),
+  ),
+  "guest.reminder.replyLine": guest(
+    "Kan du ikke komme likevel, svarer du på denne e-posten.",
+    "If you cannot come after all, reply to this email.",
   ),
 
   // ── Guest: the producer cancelled (OA-1 §4.2) ───────────────────────────
