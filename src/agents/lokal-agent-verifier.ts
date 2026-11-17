@@ -3231,7 +3231,31 @@ export async function runVerifierBatch(opts: {
       // (gate.passes === false — the exact trigger condition the spec
       // names; an agent that cleared computeKvalitetsGate but got
       // downgraded by a LATER guard above never reaches this branch).
-      if (!gate.passes) {
+      //
+      // dev-request 2026-11-17-andrelinje-verifiserte-nedgraderes-etter-
+      // berikelse (S1): ALSO attempted when the gate passed but the ONLY
+      // thing keeping the agent out of 'verified' is the cross-source
+      // (address — the sole GATING_FIELDS entry) verdict. Every other guard
+      // that can hold an agent back must be clear, otherwise the demotion
+      // stands and the judge is not called. Same call + outcome handling as
+      // the !gate.passes path below (the terminal branch there only fires on
+      // 'pending_verify', which a gate-passing agent never has).
+      const priorStatus = agent.verification_status as string | null | undefined;
+      const demotedOnlyByCrossSource =
+        gate.passes &&
+        agentVerdict !== "pool_eligible" &&
+        (newVerification === "review_required" || newVerification === "data_insufficient") &&
+        inferenceOnlyFields.length === 0 &&
+        !websiteOwnershipUnverified &&
+        coherence.coherent &&
+        corroboratedEmail &&
+        gate.reasons.brreg_active &&
+        gate.reasons.no_wrong_fit &&
+        !gate.flags.some((f) => f.startsWith("nace_blacklist") || f === "brreg_konkurs" || f === "brreg_inactive") &&
+        priorStatus !== "opt_out" &&
+        priorStatus !== "terminal_unconfirmable" &&
+        !isParaplyRoutedEmail(agent.email, affiliatedUmbrellaDomains);
+      if (!gate.passes || demotedOnlyByCrossSource) {
         const secondLine = await computeSecondLineVerification({
           producer_name: agent.name ?? null,
           city: agent.location_city ?? null,
