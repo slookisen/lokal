@@ -6677,7 +6677,8 @@ function initSchema(db: Database.Database): void {
         last_seen TEXT NOT NULL,
         seen_count INTEGER NOT NULL DEFAULT 1,
         matched_agent_id TEXT,
-        matched_at TEXT
+        matched_at TEXT,
+        matched_via TEXT
       );
     `);
   } catch (err) {

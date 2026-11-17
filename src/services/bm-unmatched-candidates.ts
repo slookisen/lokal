@@ -18,7 +18,10 @@
 // with the name alone, over all producer profiles (active or not).
 //
 // A candidate whose slug later matches a profile is stamped `matched_agent_id`
-// / `matched_at` (no delete) and drops out of the default list.
+// / `matched_at` / `matched_via` (no delete) and drops out of the default list.
+// A page suppressed as a known name variant is kept too, already stamped
+// (`matched_via = 'name_variant'`), so it is never on the default list but
+// stays auditable with `include_matched=1` (review B1/N1 on lokal#1590).
 
 import { getDb } from "../database/init";
 import { normaliseNamePruned } from "./brreg-client";
@@ -46,7 +49,8 @@ export function ensureBmUnmatchedCandidatesTable(db: Db): void {
       last_seen TEXT NOT NULL,
       seen_count INTEGER NOT NULL DEFAULT 1,
       matched_agent_id TEXT,
-      matched_at TEXT
+      matched_at TEXT,
+      matched_via TEXT
     );
   `);
 }
@@ -95,16 +99,36 @@ export interface BmCandidateResult {
 }
 
 /**
- * For an `unmatched` record: a known name variant → nothing written; else
- * insert the candidate, or refresh name/city/page/website and `last_seen`
- * (+1 `seen_count`) when the slug is already listed. A row stamped matched
- * earlier is listed again (stamp cleared). Never throws.
+ * For an `unmatched` record: insert the page, or refresh name/city/page/
+ * website and `last_seen` (+1 `seen_count`) when the slug is already there.
+ *   - known name variant → the row is stamped matched (`matched_via =
+ *     'name_variant'`, first stamp kept), so it is not on the default list —
+ *     also when it was listed on an earlier night (review B1).
+ *   - otherwise → listed; a stamp from an earlier night is cleared.
+ * Never throws.
  */
 export function recordBmUnmatchedCandidate(db: Db, record: BmProducerRecord, nowIso: string): BmCandidateResult {
   try {
     const variant = findKnownBmProducerVariant(db, record.name);
-    if (variant) return { outcome: "candidate_known_variant", agentId: variant.agentId };
     ensureBmUnmatchedCandidatesTable(db);
+    if (variant) {
+      db.prepare(
+        `INSERT INTO bm_unmatched_candidates
+           (slug, name, city, source_url, website, first_seen, last_seen, seen_count, matched_agent_id, matched_at, matched_via)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'name_variant')
+         ON CONFLICT(slug) DO UPDATE SET
+           name = excluded.name,
+           city = excluded.city,
+           source_url = excluded.source_url,
+           website = excluded.website,
+           last_seen = excluded.last_seen,
+           seen_count = bm_unmatched_candidates.seen_count + 1,
+           matched_via = CASE WHEN bm_unmatched_candidates.matched_agent_id IS NULL THEN excluded.matched_via ELSE bm_unmatched_candidates.matched_via END,
+           matched_at = CASE WHEN bm_unmatched_candidates.matched_agent_id IS NULL THEN excluded.matched_at ELSE bm_unmatched_candidates.matched_at END,
+           matched_agent_id = COALESCE(bm_unmatched_candidates.matched_agent_id, excluded.matched_agent_id)`,
+      ).run(record.slug, record.name, record.city, record.sourceUrl, record.website, nowIso, nowIso, variant.agentId, nowIso);
+      return { outcome: "candidate_known_variant", agentId: variant.agentId };
+    }
     db.prepare(
       `INSERT INTO bm_unmatched_candidates (slug, name, city, source_url, website, first_seen, last_seen, seen_count)
        VALUES (?, ?, ?, ?, ?, ?, ?, 1)
@@ -116,7 +140,8 @@ export function recordBmUnmatchedCandidate(db: Db, record: BmProducerRecord, now
          last_seen = excluded.last_seen,
          seen_count = bm_unmatched_candidates.seen_count + 1,
          matched_agent_id = NULL,
-         matched_at = NULL`,
+         matched_at = NULL,
+         matched_via = NULL`,
     ).run(record.slug, record.name, record.city, record.sourceUrl, record.website, nowIso, nowIso);
     return { outcome: "candidate_stored" };
   } catch (e: any) {
@@ -124,12 +149,17 @@ export function recordBmUnmatchedCandidate(db: Db, record: BmProducerRecord, now
   }
 }
 
-/** A slug that now matches a profile leaves the list (stamped, not deleted). No-op when not listed. Never throws. */
+/**
+ * A slug the strict matcher now matches leaves the list (stamped
+ * `matched_via = 'profile'`, not deleted; the first stamp is kept). No-op when
+ * not listed. Bookkeeping on the candidate table only — no profile is written,
+ * so it also runs for a matched agent outside the caller's scope (review N4).
+ * Never throws. The table exists at boot (database/init.ts); no DDL here.
+ */
 export function markBmCandidateMatched(db: Db, slug: string, agentId: string, nowIso: string): void {
   try {
-    ensureBmUnmatchedCandidatesTable(db);
     db.prepare(
-      `UPDATE bm_unmatched_candidates SET matched_agent_id = ?, matched_at = ? WHERE slug = ? AND matched_agent_id IS NULL`,
+      `UPDATE bm_unmatched_candidates SET matched_agent_id = ?, matched_at = ?, matched_via = 'profile' WHERE slug = ? AND matched_agent_id IS NULL`,
     ).run(agentId, nowIso, slug);
   } catch {
     /* the harvest result does not depend on this bookkeeping */
@@ -147,6 +177,7 @@ export interface BmCandidateRow {
   seen_count: number;
   matched_agent_id: string | null;
   matched_at: string | null;
+  matched_via: string | null;
 }
 
 /** READ-ONLY list, newest `last_seen` first. `includeMatched` adds the stamped rows. */
@@ -159,7 +190,7 @@ export function listBmUnmatchedCandidates(
   const total = (db.prepare(`SELECT COUNT(*) AS c FROM bm_unmatched_candidates ${where}`).get() as { c: number }).c;
   const candidates = db
     .prepare(
-      `SELECT slug, name, city, source_url, website, first_seen, last_seen, seen_count, matched_agent_id, matched_at
+      `SELECT slug, name, city, source_url, website, first_seen, last_seen, seen_count, matched_agent_id, matched_at, matched_via
        FROM bm_unmatched_candidates ${where}
        ORDER BY last_seen DESC, slug ASC
        LIMIT ?`,

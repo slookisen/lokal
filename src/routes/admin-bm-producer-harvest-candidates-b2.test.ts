@@ -8,7 +8,10 @@
  *      BM page, website, first_seen = last_seen, seen_count 1; counts carry it
  *   c3 apply again: same row, seen_count 2, first_seen unchanged, last_seen moves
  *   c4 a known producer under another spelling (legal suffix, «Gård»/«Gard»,
- *      a different BM city, an inactive profile) → candidate_known_variant, no row
+ *      a different BM city, an inactive profile) → candidate_known_variant,
+ *      kept stamped (matched_via name_variant), never on the default list;
+ *      a candidate listed earlier is stamped once a variant profile exists
+ *      (review B1 on lokal#1590); the first stamp is kept
  *   c5 a matched page is never stored; a listed slug that matches later is
  *      stamped and leaves the default list (include_matched=1 shows it)
  *   c6 the dry-run branch writes no candidate row
@@ -112,6 +115,7 @@ export async function runAdminBmProducerHarvestCandidatesB2Tests(opts: { log?: b
   assertEq(bmCompactName("Kjent-Gård, A/S".replace("A/S", "AS")), bmCompactName("kjent gard"), "c1: punctuation and case are ignored");
   assertEq(bmCompactName("Nyhage Gård") === bmCompactName("Kjent Gård"), false, "c1: different names stay different");
   assertEq(bmCompactName("   "), "", "c1: blank name → empty");
+  assertEq(bmCompactName("Ny hage Gård"), bmCompactName("Nyhage Gard"), "c1: spaces are ignored in the compact form");
 
   const key = process.env.ADMIN_KEY || "bm-candidates-b2-test-key";
   const prevAdminKey = process.env.ADMIN_KEY;
@@ -165,6 +169,8 @@ export async function runAdminBmProducerHarvestCandidatesB2Tests(opts: { log?: b
       assertEq(findKnownBmProducerVariant(db, "Sovende Bigard")?.agentId, "a-sov", "c1: an inactive profile still counts as known");
       assertEq(findKnownBmProducerVariant(db, "Nyhage Gård"), null, "c1: an unknown name has no variant");
       assertEq(findKnownBmProducerVariant(db, ""), null, "c1: an empty name has no variant");
+      assertEq(findKnownBmProducerVariant(db, "  ,. "), null, "c1: a punctuation-only name has no variant");
+      assertEq(findKnownBmProducerVariant(db, "Tre ff Gård")?.agentId, "a-treff", "c1: a split word is the same compact name");
     });
 
     await scenario("c2-c5 apply", async () => {
@@ -173,8 +179,12 @@ export async function runAdminBmProducerHarvestCandidatesB2Tests(opts: { log?: b
       const ny = result(r1.body, "nyhage-gard");
       assertEq([ny?.outcome, ny?.candidate_outcome], ["unmatched", "candidate_stored"], "c2: an unmatched page is stored as a candidate (outcome unchanged)");
       const all1 = rows();
-      assertEq(all1.map((x) => x.slug), ["nyhage-gard"], "c2/c4/c5: only the page with no profile is stored");
-      const n1 = all1[0] ?? {};
+      assertEq(
+        all1.map((x) => [x.slug, x.matched_agent_id, x.matched_via]),
+        [["kjent-gard", "a-kjent", "name_variant"], ["nyhage-gard", null, null], ["sovende-bigard", "a-sov", "name_variant"]],
+        "c2/c4/c5: the page with no profile is listed, variants are kept stamped, the matched page is not stored",
+      );
+      const n1 = all1.find((x) => x.slug === "nyhage-gard") ?? {};
       assertEq(
         [n1.name, n1.city, n1.source_url, n1.website, n1.seen_count, n1.first_seen === n1.last_seen, n1.matched_agent_id],
         ["Nyhage Gård", "Voss", "https://bondensmarked.no/produsenter/nyhage-gard", "https://nyhage.example.no", 1, true, null],
@@ -193,15 +203,15 @@ export async function runAdminBmProducerHarvestCandidatesB2Tests(opts: { log?: b
       // c3 — second night
       db.prepare(`UPDATE bm_unmatched_candidates SET first_seen = '2026-11-01T00:00:00.000Z', last_seen = '2026-11-01T00:00:00.000Z'`).run();
       await harvest({ dry_run: "false", limit: "10", fill_only: "1" });
-      const n2 = rows()[0] ?? {};
-      assertEq([rows().length, n2.seen_count, n2.first_seen, n2.last_seen > "2026-11-01T00:00:00.000Z"], [1, 2, "2026-11-01T00:00:00.000Z", true], "c3: same row, seen_count 2, first_seen kept, last_seen moves");
+      const n2 = rows().find((x) => x.slug === "nyhage-gard") ?? {};
+      assertEq([rows().length - 2, n2.seen_count, n2.first_seen, n2.last_seen > "2026-11-01T00:00:00.000Z"], [1, 2, "2026-11-01T00:00:00.000Z", true], "c3: same row, seen_count 2, first_seen kept, last_seen moves");
 
       // c7 — list
       const l1 = await list();
       assertEq([l1.status, l1.body?.total, l1.body?.candidates?.map((c: any) => c.slug)], [200, 1, ["nyhage-gard"]], "c7: GET lists the candidate");
       assertEq(
         Object.keys(l1.body?.candidates?.[0] ?? {}).sort(),
-        ["city", "first_seen", "last_seen", "matched_agent_id", "matched_at", "name", "seen_count", "slug", "source_url", "website"],
+        ["city", "first_seen", "last_seen", "matched_agent_id", "matched_at", "matched_via", "name", "seen_count", "slug", "source_url", "website"],
         "c7: each row has name, city, page, website, first_seen, last_seen, seen_count",
       );
 
@@ -212,12 +222,48 @@ export async function runAdminBmProducerHarvestCandidatesB2Tests(opts: { log?: b
       db.prepare(`INSERT INTO agent_knowledge (agent_id, website, curated_fields) VALUES ('a-ny', 'https://nyhage.example.no', '{}')`).run();
       const r3 = await harvest({ dry_run: "false", limit: "10", fill_only: "1" });
       assertEq(result(r3.body, "nyhage-gard")?.agent_id, "a-ny", "c5: the slug now matches the new profile");
-      const n3 = rows()[0] ?? {};
-      assertEq([n3.matched_agent_id, typeof n3.matched_at, n3.seen_count], ["a-ny", "string", 2], "c5: the candidate is stamped matched, not deleted");
+      const n3 = rows().find((x) => x.slug === "nyhage-gard") ?? {};
+      assertEq([n3.matched_agent_id, n3.matched_via, typeof n3.matched_at, n3.seen_count], ["a-ny", "profile", "string", 2], "c5: the candidate is stamped matched, not deleted");
       const l2 = await list();
       assertEq([l2.body?.total, l2.body?.candidates?.length], [0, 0], "c5: a matched candidate leaves the default list");
       const l3 = await list({ include_matched: "1" });
-      assertEq([l3.body?.total, l3.body?.include_matched, l3.body?.candidates?.[0]?.matched_agent_id], [1, true, "a-ny"], "c5: include_matched=1 shows it");
+      assertEq(
+        [l3.body?.total, l3.body?.include_matched, (l3.body?.candidates ?? []).find((c: any) => c.slug === "nyhage-gard")?.matched_agent_id],
+        [3, true, "a-ny"],
+        "c5: include_matched=1 shows it (and the stamped variants)",
+      );
+      const kj3 = rows().find((x) => x.slug === "kjent-gard") ?? {};
+      assertEq([kj3.matched_agent_id, kj3.matched_via, kj3.seen_count], ["a-kjent", "name_variant", 3], "c4: a variant row keeps its first stamp over later nights");
+    });
+
+    await scenario("c4 B1 variant appears later", async () => {
+      // night 1: no profile → listed
+      await harvest({ dry_run: "false", limit: "10", fill_only: "1" });
+      assertEq((await list()).body?.candidates?.map((c: any) => c.slug), ["nyhage-gard"], "c4/B1: listed on night 1");
+      // discovery registers it under another spelling and its home city, not the BM city
+      db.prepare(
+        `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, city, is_active) VALUES ('a-ny2', 'Nyhage Gard AS', 'd', 'p', '', '', 'producer', 'k-ny2', 'Bergen', 1)`,
+      ).run();
+      const r2 = await harvest({ dry_run: "false", limit: "10", fill_only: "1" });
+      const ny = result(r2.body, "nyhage-gard");
+      assertEq([ny?.outcome, ny?.candidate_outcome, ny?.candidate_known_agent_id], ["unmatched", "candidate_known_variant", "a-ny2"], "c4/B1: night 2 the page is a known variant");
+      const row = rows().find((x) => x.slug === "nyhage-gard") ?? {};
+      assertEq([row.matched_agent_id, row.matched_via, row.seen_count], ["a-ny2", "name_variant", 2], "c4/B1: the earlier candidate is stamped");
+      assertEq((await list()).body?.total, 0, "c4/B1: a known name in another spelling is not on the list");
+      // the variant profile disappears again (renamed) → the page is listed again, stamp cleared
+      db.prepare(`UPDATE agents SET name = 'Helt Annet Navn' WHERE id = 'a-ny2'`).run();
+      await harvest({ dry_run: "false", limit: "10", fill_only: "1" });
+      const row3 = rows().find((x) => x.slug === "nyhage-gard") ?? {};
+      assertEq([row3.matched_agent_id, row3.matched_via, row3.matched_at], [null, null, null], "c4: an unmatched page with no variant is listed again (stamp cleared)");
+    });
+
+    await scenario("c5 first profile stamp kept", async () => {
+      db.prepare(
+        `INSERT INTO bm_unmatched_candidates (slug, name, city, source_url, website, first_seen, last_seen, seen_count, matched_agent_id, matched_at, matched_via) VALUES ('treff-gard', 'Treff Gård', 'Bostad', 'x', NULL, 't', 't', 1, 'a-first', '2026-11-01T00:00:00.000Z', 'profile')`,
+      ).run();
+      await harvest({ dry_run: "false", limit: "10", fill_only: "1" });
+      const row = rows().find((x) => x.slug === "treff-gard") ?? {};
+      assertEq([row.matched_agent_id, row.matched_at], ["a-first", "2026-11-01T00:00:00.000Z"], "c5: a later match keeps the first stamp");
     });
 
     await scenario("c6 dry-run", async () => {
