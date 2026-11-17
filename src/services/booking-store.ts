@@ -1858,13 +1858,21 @@ export function countBookingFollowupsDue(now: Date = new Date()): BookingFollowu
 // or cancelled booking, never one already resolved after the visit, and never
 // a row whose guest contact the 30-day sweep has cleared.
 //
-// When: the visit starts at most GUEST_REMINDER_WINDOW_HOURS (24) and at
-// least GUEST_REMINDER_MIN_LEAD_HOURS (2) from now. With the hourly tick a
-// visit confirmed in good time gets the reminder 23–24 hours before. A visit
-// confirmed less than 24 hours ahead gets it on the next tick, as long as at
-// least 2 hours are left: closer than that a "reminder" would arrive while the
-// guest may already be on the way and only adds noise to the confirmation
-// they just received. A visit that has passed never gets one.
+// When: «dagen før» (OA-2 B), as the subject says «I morgen» / «Tomorrow».
+// Both must hold at the send moment:
+//   1. the visit's Europe/Oslo calendar date is exactly the day after the
+//      send moment's Europe/Oslo date (calendar arithmetic, so DST-safe), and
+//   2. the visit is still in the future and at most
+//      GUEST_REMINDER_WINDOW_HOURS (24) away.
+// With the hourly tick a visit confirmed in good time gets the reminder about
+// 24 hours before (e.g. 15:00 the day before a 15:00 visit). A visit confirmed
+// later on the day before gets it on the next tick. A visit confirmed on the
+// day itself (or after the last tick of the day before) never gets one: there
+// is no moment at which «I morgen» would be true. A visit that has passed never
+// gets one. No separate minimum lead time: rule 1 already excludes the
+// same-day case the earlier 2-hour bound was for; the only short-lead case left
+// is a visit just after midnight reminded late the evening before, where
+// «I morgen» is still true.
 //
 // Once: guest_reminder_sent_at is claimed with a guarded UPDATE (… IS NULL,
 // plus the confirmed/reserved state) BEFORE the send; only the call whose
@@ -1879,7 +1887,6 @@ export function countBookingFollowupsDue(now: Date = new Date()): BookingFollowu
 // to the e-mail (reply-to kontakt@opplevagent.no, like every guest e-mail).
 
 export const GUEST_REMINDER_WINDOW_HOURS = 24;
-export const GUEST_REMINDER_MIN_LEAD_HOURS = 2;
 
 /** Off unless exactly "true", read on every call. */
 export function gardssalgGuestReminderEnabled(): boolean {
@@ -1892,11 +1899,42 @@ function guestCancelEnabled(): boolean {
   return process.env.GARDSSALG_CANCEL_ENABLED === "true";
 }
 
+// The slot_at bounds only keep past and far-off visits out of the scan; the
+// exact rule is guestReminderDue(). They compare as text with a margin of a
+// day on each side, which is safe for every slot_at format in the table
+// (ISO with Z from createBooking(), legacy naked Oslo "YYYY-MM-DDTHH:MM", and
+// SQLite "YYYY-MM-DD HH:MM:SS"): all start with the date, and the margin
+// covers the time-zone offset and the ' ' / 'T' separator.
 const GUEST_REMINDER_CANDIDATES_SQL = `
   SELECT * FROM gardssalg_bookings
   WHERE status = 'reserved' AND pre_status = 'provider_confirmed'
     AND guest_reminder_sent_at IS NULL
+    AND slot_at >= ? AND slot_at <= ?
 `;
+
+function guestReminderCandidates(nowMs: number): Record<string, unknown>[] {
+  const day = 24 * 3600_000;
+  return getDb(VERTICAL)
+    .prepare(GUEST_REMINDER_CANDIDATES_SQL)
+    .all(new Date(nowMs - day).toISOString(), new Date(nowMs + (GUEST_REMINDER_WINDOW_HOURS * 3600_000) + 2 * day).toISOString()) as Record<string, unknown>[];
+}
+
+const OSLO_DATE = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "Europe/Oslo", year: "numeric", month: "2-digit", day: "2-digit",
+});
+
+/** The Europe/Oslo calendar date of an instant, "YYYY-MM-DD". */
+export function osloDateOf(ms: number): string {
+  const parts = OSLO_DATE.formatToParts(new Date(ms));
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+  return `${get("year")}-${get("month")}-${get("day")}`;
+}
+
+/** The calendar day after "YYYY-MM-DD" (pure date arithmetic, no time zone). */
+function nextCalendarDay(ymd: string): string {
+  const [y, m, d] = ymd.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10);
+}
 
 type ReminderRow = GardssalgBooking & { guest_reminder_sent_at?: string | null };
 
@@ -1921,7 +1959,9 @@ export function guestReminderDue(booking: ReminderRow, nowMs: number): boolean {
   const startMs = visitStartMs(booking.slot_at);
   if (!Number.isFinite(startMs)) return false;
   const leadMs = startMs - nowMs;
-  return leadMs >= GUEST_REMINDER_MIN_LEAD_HOURS * 3600_000 && leadMs <= GUEST_REMINDER_WINDOW_HOURS * 3600_000;
+  if (leadMs <= 0 || leadMs > GUEST_REMINDER_WINDOW_HOURS * 3600_000) return false;
+  // «I morgen»: the visit's Oslo date is the day after today's Oslo date.
+  return osloDateOf(startMs) === nextCalendarDay(osloDateOf(nowMs));
 }
 
 /** The reminder e-mail (OA-2 B). Values are escaped in the HTML; the status URL is a link there. */
@@ -1973,7 +2013,7 @@ export async function sendGuestReminder(booking: GardssalgBooking): Promise<bool
 async function processGuestReminders(now: Date, result: BookingFollowupResult): Promise<void> {
   const db = getDb(VERTICAL);
   const nowMs = now.getTime();
-  const rows = db.prepare(GUEST_REMINDER_CANDIDATES_SQL).all() as Record<string, unknown>[];
+  const rows = guestReminderCandidates(nowMs);
   for (const raw of rows) {
     const booking = hydrateReminderRow(raw);
     if (!guestReminderDue(booking, nowMs)) continue;
@@ -2019,16 +2059,16 @@ export interface GuestReminderDryRun {
   would_send: number;
   booking_refs: string[];
   window_hours: number;
-  min_lead_hours: number;
+  /** The date rule: the visit's Europe/Oslo date is the day after today's. */
+  rule: "oslo_day_before";
 }
 
 // Read-only (no claim, no send): which reminders processBookingFollowups()
 // would send at `now`. Counts regardless of the flag, and says whether it is on.
 export function countGuestRemindersDue(now: Date = new Date()): GuestReminderDryRun {
-  const db = getDb(VERTICAL);
   const nowMs = now.getTime();
   const refs: string[] = [];
-  for (const raw of db.prepare(GUEST_REMINDER_CANDIDATES_SQL).all() as Record<string, unknown>[]) {
+  for (const raw of guestReminderCandidates(nowMs)) {
     const booking = hydrateReminderRow(raw);
     if (guestReminderDue(booking, nowMs)) refs.push(booking.booking_ref);
   }
@@ -2038,6 +2078,6 @@ export function countGuestRemindersDue(now: Date = new Date()): GuestReminderDry
     would_send: refs.length,
     booking_refs: refs,
     window_hours: GUEST_REMINDER_WINDOW_HOURS,
-    min_lead_hours: GUEST_REMINDER_MIN_LEAD_HOURS,
+    rule: "oslo_day_before",
   };
 }

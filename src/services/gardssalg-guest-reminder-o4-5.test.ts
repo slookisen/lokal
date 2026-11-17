@@ -6,10 +6,13 @@
  *
  *   AK1  flag off: the followup job sends no reminder, stamps nothing, and
  *        its result has no guest_reminders_sent field (old shape).
- *   AK2  flag on: exactly one reminder per confirmed visit in the window, also
+ *   AK2  flag on: exactly one reminder per confirmed visit the day before (Oslo
+ *        date of the visit = the day after the tick's, at most 24 h ahead), also
  *        when the job runs twice (and when two runs overlap); none for
  *        pending / suggested / declined / expired / cancelled / resolved /
- *        past bookings; none outside the window (> 24 h ahead, < 2 h ahead).
+ *        past bookings; none for a visit later the same Oslo day, two days ahead
+ *        or > 24 h ahead (DST and legacy naked slots included). A booking
+ *        cancelled during the run (between SELECT and claim) gets nothing.
  *        A failed send releases the claim and is retried.
  *   AK3  GET /admin/booking-followups/guest-reminders/dry-run: 403 without
  *        the admin key; the count equals what the job then sends; the GET
@@ -133,7 +136,9 @@ export function runGardssalgGuestReminderO45Tests(opts: { log?: boolean } = {}):
     const sent: Mail[] = [];
     let failNext = 0;
     let throwNext = 0;
+    let onSend: ((o: any) => void) | null = null;
     emailSvc.sendEmail = async (o: any) => {
+      if (onSend) onSend(o);
       if (throwNext > 0) { throwNext--; throw new Error("mailer exploded"); }
       if (failNext > 0) { failNext--; return { success: false, error: "smtp 451 test" }; }
       sent.push({ to: o.to, subject: o.subject, text: o.textContent, html: o.htmlContent, replyTo: o.replyTo, from: String(o.from || "") });
@@ -190,7 +195,10 @@ export function runGardssalgGuestReminderO45Tests(opts: { log?: boolean } = {}):
       // ── Fixtures: one per case, all relative to NOW ───────────────────────
       const inWindow = mk({ email: "i-vindu@example.no", slotMs: NOW + 23 * H });
       const atEdge = mk({ email: "kant-24@example.no", slotMs: NOW + 24 * H });
-      const lateConfirmed = mk({ email: "sen@example.no", slotMs: NOW + 3 * H });
+      // NOW is 14:00 Oslo (CEST): +3 h is 17:00 the same day — «I morgen» would be false.
+      const sameDay = mk({ email: "samme-dag@example.no", slotMs: NOW + 3 * H });
+      // +34 h is 00:00 Oslo two days ahead.
+      const twoDays = mk({ email: "to-dager@example.no", slotMs: NOW + 34 * H });
       const tooFar = mk({ email: "for-langt@example.no", slotMs: NOW + 24 * H + 60_000 });
       const tooClose = mk({ email: "for-naer@example.no", slotMs: NOW + 2 * H - 60_000 });
       const past = mk({ email: "passert@example.no", slotMs: NOW - 1 * H });
@@ -202,8 +210,8 @@ export function runGardssalgGuestReminderO45Tests(opts: { log?: boolean } = {}):
       const attended = mk({ email: "motte@example.no", slotMs: NOW + 20 * H, status: "confirmed_attended" });
       const swept = mk({ email: "slettet@example.no", slotMs: NOW + 20 * H });
       expDb.prepare("UPDATE gardssalg_bookings SET guest_email = '' WHERE booking_id = ?").run(swept.booking_id);
-      const shouldSend = [inWindow, atEdge, lateConfirmed].map((b) => b.booking_ref).sort();
-      const neverSend = [tooFar, tooClose, past, pending, suggested, declined, expired, cancelled, attended];
+      const shouldSend = [inWindow, atEdge].map((b) => b.booking_ref).sort();
+      const neverSend = [sameDay, twoDays, tooFar, tooClose, past, pending, suggested, declined, expired, cancelled, attended];
 
       // ── AK1: flag off ──────────────────────────────────────────────────────
       {
@@ -234,8 +242,8 @@ export function runGardssalgGuestReminderO45Tests(opts: { log?: boolean } = {}):
         assertEq(ok.body?.enabled, false, "ak3.5: reports the flag as off");
         assertEq(snapshot(), before, "ak3.6: the GET writes nothing");
         const dry = bs.countGuestRemindersDue(at(NOW));
-        assertEq([dry.would_send, dry.booking_refs], [3, shouldSend], "ak3.7: dry-run at NOW: the three confirmed visits in the window");
-        assertEq([dry.window_hours, dry.min_lead_hours], [24, 2], "ak3.8: window 24 h, lower bound 2 h");
+        assertEq([dry.would_send, dry.booking_refs], [2, shouldSend], "ak3.7: dry-run at NOW: the two confirmed visits tomorrow within 24 h");
+        assertEq([dry.window_hours, dry.rule], [24, "oslo_day_before"], "ak3.8: window 24 h, Oslo day-before rule");
         assertEq(snapshot(), before, "ak3.9: the count writes nothing");
       }
 
@@ -246,15 +254,15 @@ export function runGardssalgGuestReminderO45Tests(opts: { log?: boolean } = {}):
         assertEq(dryBefore.enabled, true, "ak3.10: dry-run reports the flag as on");
         // Two overlapping runs: the claim decides, never two sends.
         const [r1, r2] = await Promise.all([bs.processBookingFollowups(at(NOW)), bs.processBookingFollowups(at(NOW))]);
-        assertEq((r1.guest_reminders_sent ?? 0) + (r2.guest_reminders_sent ?? 0), 3, "ak2.1: two overlapping runs send three reminders in total");
-        assertEq(dryBefore.would_send, 3, "ak3.11: the dry-run count equals what the job sent");
-        for (const b of [inWindow, atEdge, lateConfirmed]) {
+        assertEq((r1.guest_reminders_sent ?? 0) + (r2.guest_reminders_sent ?? 0), 2, "ak2.1: two overlapping runs send two reminders in total");
+        assertEq(dryBefore.would_send, 2, "ak3.11: the dry-run count equals what the job sent");
+        for (const b of [inWindow, atEdge]) {
           assertEq(sentTo(b.guest_email), 1, `ak2.2: exactly one reminder to ${b.guest_email}`);
           assertTrue(!!stampOf(b.booking_ref), `ak2.3: guest_reminder_sent_at stamped for ${b.guest_email}`);
         }
         const r3 = await bs.processBookingFollowups(at(NOW));
         assertEq(r3.guest_reminders_sent, 0, "ak2.4: a later run sends nothing again");
-        assertEq(sent.length, 3, "ak2.5: still three e-mails in total");
+        assertEq(sent.length, 2, "ak2.5: still two e-mails in total");
         for (const b of neverSend) {
           assertEq(sentTo(b.guest_email), 0, `ak2.6: no reminder to ${b.guest_email}`);
           assertEq(stampOf(b.booking_ref), null, `ak2.7: nothing stamped for ${b.guest_email}`);
@@ -287,9 +295,51 @@ export function runGardssalgGuestReminderO45Tests(opts: { log?: boolean } = {}):
         await bs.processBookingFollowups(at(NOW));
         assertEq(sentTo("feiler@example.no"), 1, "ak2.16: and never again");
 
+        // N1: cancelled between the candidate SELECT and the claim — the
+        // claim's state guard stops the send.
+        const first = mk({ email: "n1-forst@example.no", slotMs: NOW + 20 * H });
+        const second = mk({ email: "n1-andre@example.no", slotMs: NOW + 20 * H + 60_000 });
+        onSend = (o: any) => {
+          if (o.to === first.guest_email) {
+            expDb.prepare("UPDATE gardssalg_bookings SET status = 'cancelled' WHERE booking_id = ?").run(second.booking_id);
+          }
+        };
+        try {
+          const rn = await bs.processBookingFollowups(at(NOW));
+          assertEq(rn.guest_reminders_sent, 1, "n1.1: only the first is sent");
+        } finally {
+          onSend = null;
+        }
+        assertEq([sentTo(first.guest_email), sentTo(second.guest_email)], [1, 0], "n1.2: the one cancelled during the run gets nothing");
+        assertEq(stampOf(second.booking_ref), null, "n1.3: and is not stamped");
+
+        // Job level, late evening: a visit at 08:00 Oslo is not reminded at
+        // 07:00 Oslo the day before (25 h ahead) but is at 23:30 Oslo.
+        const evening = mk({ email: "kveld@example.no", slotMs: Date.parse("2099-06-15T06:00:00.000Z") });
+        await bs.processBookingFollowups(at(Date.parse("2099-06-14T05:00:00.000Z")));
+        assertEq(sentTo(evening.guest_email), 0, "ak2.17: 07:00 Oslo the day before, 25 h ahead -> not yet");
+        await bs.processBookingFollowups(at(Date.parse("2099-06-14T21:30:00.000Z")));
+        assertEq(sentTo(evening.guest_email), 1, "ak2.18: 23:30 Oslo the day before -> sent");
+
+        // B1: «dagen før» — the visit's Oslo date is the day after the tick's.
+        {
+          const base = { ...inWindow, guest_reminder_sent_at: null };
+          const due = (slot: string, tickIso: string) => bs.guestReminderDue({ ...base, slot_at: slot }, Date.parse(tickIso));
+          assertEq(due("2099-06-11T13:00:00.000Z", "2099-06-11T06:00:00.000Z"), false, "d1: morning tick 08:00, visit 15:00 the same day -> nothing");
+          assertEq(due("2099-06-12T06:00:00.000Z", "2099-06-11T21:30:00.000Z"), true, "d2: tick 23:30, visit 08:00 the next day -> sent");
+          assertEq(due("2099-06-11T21:00:00.000Z", "2099-06-10T22:30:00.000Z"), false, "d3: tick 00:30, visit 23:00 the same day -> nothing (UTC dates differ, Oslo dates do not)");
+          assertEq(due("2099-06-12T22:15:00.000Z", "2099-06-11T21:30:00.000Z"), false, "d4: visit two days ahead in Oslo -> nothing");
+          assertEq(due("2099-06-13T08:00:00.000Z", "2099-06-11T12:00:00.000Z"), false, "d5: visit two days ahead (44 h) -> nothing");
+          assertEq(due("2099-06-11T11:00:00.000Z", "2099-06-11T12:00:00.000Z"), false, "d6: visit passed -> nothing");
+          assertEq(due("2099-10-25T21:00:00.000Z", "2099-10-24T21:30:00.000Z"), true, "d7: DST end: Sat 23:30 CEST, visit Sun 22:00 CET -> sent");
+          assertEq(due("2099-06-12T08:00", "2099-06-11T21:30:00.000Z"), true, "d8: legacy naked slot (Oslo wall time) 08:00 next day -> sent");
+          assertEq(due("2099-06-12T08:00", "2099-06-11T05:00:00.000Z"), false, "d9: legacy naked slot, 25 h ahead -> not yet");
+        }
+
         // AK3 again through the route with the flag on: count == what the job sends, GET writes nothing.
+        // The route uses the real clock: a visit 24 h (less a second) from now is always tomorrow in Oslo.
         const realNow = Date.now();
-        const fresh = mk({ email: "ny@example.no", slotMs: realNow + 12 * H });
+        const fresh = mk({ email: "ny@example.no", slotMs: realNow + 24 * H - 1000 });
         const before = snapshot();
         const ok = await callRoute(router, "GET", url, { headers: { "x-admin-key": testKey } });
         assertEq(snapshot(), before, "ak3.13: GET with the flag on writes nothing");
