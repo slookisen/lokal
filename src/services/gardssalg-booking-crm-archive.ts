@@ -32,6 +32,21 @@
 // Fail-open: every error is caught and logged; filing never changes the
 // send, the booking or the caller's return value.
 //
+// Masking (review r1, B1/B2): the stored copy is NOT byte-identical to the
+// sent mail. Before anything is written, subject / text / HTML are masked:
+//   - every booking token value (respond_token, confirm_token,
+//     guest_decision_token, guest_status_token) is replaced by "[skjult]" —
+//     exact replacement of the row's own values, plus a regex safety net for
+//     the token path segments (/svar/, /bekreft/, /gjestesvar/, /status/<ref>/)
+//     and token-like query parameters. These links act on the producer's
+//     behalf / steer commission, and booking-store never logs confirm_token.
+//   - the guest's name, e-mail, phone and comment (notes) are replaced by
+//     "[skjult]", raw and HTML-escaped, because gardssalg-guest-contact-sweep
+//     clears those booking fields after 30 days and the privacy notice
+//     promises it; a copy in crm_messages would outlive that.
+// The sent mail itself is untouched. raw_metadata carries no token or guest
+// value.
+//
 // Outreach bookkeeping: as in claim-crm-tracking.ts, an out/sent message on a
 // thread without inbound can be recorded by trg_log_cold_outreach_to_sent_log_v2
 // as a cold-outreach touch (when the address matches an rfb agent). These are
@@ -51,8 +66,26 @@ export function gardssalgBookingCrmThreadId(bookingId: string): string {
   return `${GARDSSALG_BOOKING_CRM_THREAD_PREFIX}${bookingId}`;
 }
 
+export const GARDSSALG_BOOKING_CRM_MASK = "[skjult]";
+
+/** The booking fields the archive reads: ids, plus the values it masks. */
+export interface ProducerBookingMailArchiveBooking {
+  booking_id: string;
+  booking_ref: string;
+  provider_id: string;
+  is_test?: number | null;
+  confirm_token?: string | null;
+  respond_token?: string | null;
+  guest_decision_token?: string | null;
+  guest_status_token?: string | null;
+  guest_name?: string | null;
+  guest_email?: string | null;
+  guest_phone?: string | null;
+  notes?: string | null;
+}
+
 export interface ProducerBookingMailArchiveInput {
-  booking: { booking_id: string; booking_ref: string; provider_id: string; is_test?: number | null };
+  booking: ProducerBookingMailArchiveBooking;
   /** What the mail is, e.g. "producer_new", "reminder", "guest-cancel". */
   kind: string;
   /** The producer address the mail was sent to. */
@@ -75,6 +108,64 @@ function providerName(providerId: string): string | null {
   }
 }
 
+// Same escaping as booking-store's escEmailHtml (the producer mails' HTML
+// interpolates guest values through it); kept local to avoid an import cycle.
+function escHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+function escHtmlMinimal(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function escRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Safety net for token links whose value is not the row's own (e.g. a stale
+// token after a re-issue): the path segment after a token route, and any
+// token-like query parameter (?token=, &amp;respond_token=, …).
+const TOKEN_PATH_RE = /(\/kategori\/gardssalg\/(?:svar|bekreft|gjestesvar)\/)[^\s"'<>&?#/]+/g;
+const STATUS_PATH_RE = /(\/kategori\/gardssalg\/status\/[^\s"'<>/?#]+\/)[^\s"'<>&?#/]+/g;
+const TOKEN_QUERY_RE = /([?&](?:amp;)?[A-Za-z0-9_-]*token=)[^&\s"'<>#]+/gi;
+
+/**
+ * Masks the booking's token values and the guest's contact data in one
+ * string (subject, text or HTML). Exact replacement of the booking's own
+ * values (raw, HTML-escaped, and for e-mail lower-cased), in one pass so a
+ * value can never match inside an earlier mask; then the token regexes.
+ */
+export function maskProducerBookingMail(text: string, booking: ProducerBookingMailArchiveBooking): string {
+  const M = GARDSSALG_BOOKING_CRM_MASK;
+  const raw = [
+    booking.confirm_token, booking.respond_token, booking.guest_decision_token, booking.guest_status_token,
+    booking.guest_name, booking.guest_email, booking.guest_email?.toLowerCase(), booking.guest_phone, booking.notes,
+  ];
+  const needles = new Set<string>();
+  for (const v of raw) {
+    if (typeof v !== "string") continue;
+    for (const form of [v, v.trim()]) {
+      if (!form) continue;
+      needles.add(form);
+      needles.add(escHtml(form));
+      needles.add(escHtmlMinimal(form));
+      needles.add(encodeURIComponent(form));
+    }
+  }
+  let out = String(text ?? "");
+  if (needles.size > 0) {
+    const alts = [...needles].sort((a, b) => b.length - a.length).map(escRegExp);
+    out = out.replace(new RegExp(alts.join("|"), "g"), M);
+  }
+  return out
+    .replace(TOKEN_PATH_RE, `$1${M}`)
+    .replace(STATUS_PATH_RE, `$1${M}`)
+    .replace(TOKEN_QUERY_RE, `$1${M}`);
+}
+
 /**
  * Files one producer booking mail in the booking's CRM thread. Never throws.
  * Returns the crm_messages id, or null when the flag is off, the mail was not
@@ -92,6 +183,9 @@ export function archiveProducerBookingMail(input: ProducerBookingMailArchiveInpu
 
     const threadId = gardssalgBookingCrmThreadId(input.booking.booking_id);
     const name = providerName(input.booking.provider_id);
+    const subject = maskProducerBookingMail(input.subject, input.booking);
+    const bodyText = maskProducerBookingMail(input.textContent, input.booking);
+    const bodyHtml = maskProducerBookingMail(input.htmlContent, input.booking);
     const db = getDb();
 
     return db.transaction((): string => {
@@ -105,7 +199,7 @@ export function archiveProducerBookingMail(input: ProducerBookingMailArchiveInpu
           SELECT id FROM crm_messages
           WHERE thread_id = ? AND direction = 'out' AND to_emails = ? AND subject = ? AND body_text = ?
           LIMIT 1
-        `).get(threadId, JSON.stringify([to]), input.subject, input.textContent) as { id: string } | undefined;
+        `).get(threadId, JSON.stringify([to]), subject, bodyText) as { id: string } | undefined;
         if (dup) return dup.id;
       } else {
         const contact = crmService.resolveContact(to, name, "experiences");
@@ -113,16 +207,16 @@ export function archiveProducerBookingMail(input: ProducerBookingMailArchiveInpu
         db.prepare(`
           INSERT INTO crm_threads (id, contact_id, subject, category, severity, assigned_to, status, vertical_id)
           VALUES (?, ?, ?, 'system', 'normal', 'unassigned', 'done', 'experiences')
-        `).run(threadId, contact.id, input.subject);
+        `).run(threadId, contact.id, subject);
       }
 
       const { messageId } = crmService.recordOutboundReply({
         threadId,
         vertical: "experiences",
         toEmails: [to],
-        subject: input.subject,
-        bodyText: input.textContent,
-        bodyHtml: input.htmlContent,
+        subject,
+        bodyText,
+        bodyHtml,
         deliveryStatus: "sent",
         rawMetadata: {
           source: "gardssalg-booking",
