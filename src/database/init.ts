@@ -6661,6 +6661,29 @@ function initSchema(db: Database.Database): void {
     console.error("Migration rfb_enrichment_nightly tables failed:", err);
   }
 
+  // dev-request 2026-11-15-rfb-nattjobb-hull-kontaktuttrekk-bm-og-koer (B2):
+  // Bondens Marked producer pages the harvest could not match to a profile,
+  // kept as candidates for discovery (services/bm-unmatched-candidates.ts,
+  // which also creates the table on first use).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS bm_unmatched_candidates (
+        slug TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        city TEXT,
+        source_url TEXT NOT NULL,
+        website TEXT,
+        first_seen TEXT NOT NULL,
+        last_seen TEXT NOT NULL,
+        seen_count INTEGER NOT NULL DEFAULT 1,
+        matched_agent_id TEXT,
+        matched_at TEXT
+      );
+    `);
+  } catch (err) {
+    console.error("Migration bm_unmatched_candidates failed:", err);
+  }
+
   // dev-request 2026-10-08-serverheng-hovedtraad-oppstart-statistikk-samtaler
   // (slice 1): persisted event-loop stalls / slow requests / slow jobs, so the
   // monitor's evidence survives a restart (services/event-loop-persist.ts).
