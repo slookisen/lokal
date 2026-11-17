@@ -52805,6 +52805,25 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-12-opplevagent-o4-epost-og-tekster, O4-4: «Slik virker
+// det i dag» and the pilot invitation in one register (GARDSSALG_TODAY_TEXTS_ENABLED).
+// Swaps getDb() + env — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-12-opplevagent-o4-epost-og-tekster O4-4: «Slik virker det i dag» og pilottekstene ──");
+  try {
+    const { runGardssalgTodayTextsO44Tests } = require("../src/routes/gardssalg-today-texts-o4-4.test") as
+      typeof import("../src/routes/gardssalg-today-texts-o4-4.test");
+    const r = await runGardssalgTodayTextsO44Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-today-texts-o4-4: " + f);
+    console.log(`  gardssalg-today-texts-o4-4: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-today-texts-o4-4: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // Eierportal bølge 0, T2: the «Mine valg» level preview (GET …/valg?niva=)
 // never writes — on gårdssalg (experiences.db booking_live, gardssalg_content_audit)
 // nor RFB; the preview equals the confirmed apply. Swaps getDb() + env — runSerial.
