@@ -36,6 +36,8 @@ const PRICE_MESSAGE =
 const EXPECTED_LIVE = [
   "visibility.profile", "booking.enabled", "booking.pause", "booking.reminder", "booking.attendance",
   "content.guarantee", "notify.booking_email", "comms.unsubscribe",
+  // O4-3: live behind GARDSSALG_NOTIFY_ADDRESS_CONFIRM_ENABLED (coming_soon at run time while it is off).
+  "contact.booking_email",
 ];
 
 function nextWeekdayDatetimeLocal(targetDow: number, hour: number, minute: number, minDaysAhead = 1): string {
@@ -267,7 +269,7 @@ export function runGardssalgOwnerFeaturesO1aTests(opts: { log?: boolean } = {}):
       assertTrue(b.includes("<h1>Mine valg</h1>") && b.includes("Testgård Sideri"), "p2: the shared «Mine valg» page for the producer");
       assertTrue(!/rett fra bonden/i.test(b), "p3: the page never names Rett fra Bonden");
       assertTrue(b.includes(PRICE_MESSAGE), "p4: the price message, verbatim");
-      const planned = R.filter((e) => e.status === "coming_soon");
+      const planned = R.filter((e) => reg.ownerFeatureStatus(e) === "coming_soon"); // run-time status (O4-3: contact.booking_email is planned while its flag is off)
       assertTrue(b.includes(`Planlagt — si fra hvis du vil ha dette (${planned.length})`), "p5: the «Planlagt» box with its count");
       assertTrue(/<details class="ep-card mv-planned" id="planlagt">/.test(b), "p6: the «Planlagt» box is closed by default");
       assertTrue(planned.every((e) => b.includes(`data-planned-key="${e.key}"`) && !b.includes(`id="valg-${e.key}"`)), "p7: every planned entry is only in the box, never a row in the main view");

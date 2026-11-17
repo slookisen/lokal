@@ -33,6 +33,9 @@ function claimService(): ClaimService {
 function bookingGate(): BookingGate {
   return require("../services/gardssalg-booking-gate") as BookingGate;
 }
+function notifyAddress(): typeof import("../services/gardssalg-notify-address") {
+  return require("../services/gardssalg-notify-address") as typeof import("../services/gardssalg-notify-address");
+}
 function experiencesDb(): any {
   return (require("../database/db-factory") as typeof import("../database/db-factory")).getDb("experiences");
 }
@@ -59,12 +62,34 @@ export const GARDSSALG_BOOKING_ENABLED_ADAPTER: OwnerFeatureStorageAdapter = {
             ? "Booking was stopped by Opplevagent. You cannot switch it back on yourself. Contact kontakt@opplevagent.no."
             : out.block.reason === "pending_review"
             ? SELF_REGISTERED_BOOKING_BLOCKED_EN
+            : out.block.reason === "address_unconfirmed"
+            ? notifyAddress().addressText("addr.required", {}, "en")
             : "Booking cannot be switched on until the profile has an e-mail address the requests can be sent to. Contact kontakt@opplevagent.no.",
         },
       };
     }
     return false;
   },
+};
+
+/**
+ * O4-3 (dev-request 2026-11-12-opplevagent-o4-epost-og-tekster):
+ * contact.booking_email ↔ the address booking requests go to now
+ * (gardssalgNotifyRecipient: experience_providers.epost, or the confirmed
+ * old address while a changed one awaits confirmation). Read only: the
+ * address changes only through the e-mailed confirmation link
+ * (confirmByEmail), never by a direct write.
+ */
+export const GARDSSALG_NOTIFY_ADDRESS_ADAPTER: OwnerFeatureStorageAdapter = {
+  column: "experience_providers.epost (gardssalg_notify_address.confirmed_email)",
+  read: (_db, subjectId) => {
+    const row = experiencesDb().prepare(`SELECT epost FROM experience_providers WHERE id = ?`).get(subjectId) as
+      | { epost: string | null } | undefined;
+    if (!row) return null;
+    const to = notifyAddress().gardssalgNotifyRecipient(subjectId, row.epost);
+    return typeof to === "string" && to.trim() !== "" ? to.trim() : null;
+  },
+  write: () => false,
 };
 
 const SELF_REGISTERED_BOOKING_BLOCKED_EN =
@@ -142,8 +167,12 @@ export function loadGardssalgSubjectFacts(providerId: string): GardssalgSubjectF
     verifiedOwner: svc.isGardssalgProviderClaimed(providerId),
     isTestProvider: Number(row.is_test_provider) === 1,
     conditions: {
+      // O4-3: with GARDSSALG_NOTIFY_ADDRESS_CONFIRM_ENABLED on, the address
+      // must also be confirmed (OA-3 `addr.required`); flag off: as before.
       bookingRequestEmail: gate.hasBookingRequestEmail(row.epost)
-        ? { met: true }
+        ? (notifyAddress().notifyAddressConfirmationMissing(row.id, row.epost)
+          ? { met: false, reason: { no: notifyAddress().addressText("addr.required"), en: notifyAddress().addressText("addr.required", {}, "en") } }
+          : { met: true })
         : {
             met: false,
             reason: {
