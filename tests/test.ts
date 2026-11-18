@@ -55051,3 +55051,24 @@ runSerial(async () => {
     failures.push("o1-7 test clock / dry-run: unexpected error: " + String(err?.message || err));
   }
 });
+
+// G1-1 (Google Connected Apps): /.well-known/google-connected-apps domain
+// verification behind GOOGLE_CONNECTED_APPS_VERIFICATION_ENABLED — 404 when
+// off or misconfigured, 200 {"verification_tokens":[...]} on both hosts when
+// on, never a redirect, and mounted in index.ts before the host gates. Own
+// Express apps, injected env (no env mutation), no DB.
+runSerial(async () => {
+  console.log("\n── G1-1: Google Connected Apps domain-verification route ──");
+  try {
+    const { runGoogleConnectedAppsTests } = require("../src/routes/google-connected-apps.test") as
+      typeof import("../src/routes/google-connected-apps.test");
+    const r = await runGoogleConnectedAppsTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("google-connected-apps: " + f);
+    console.log(`  google-connected-apps: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("google-connected-apps: unexpected error: " + String(err?.message || err));
+  }
+});

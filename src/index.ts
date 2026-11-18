@@ -125,6 +125,7 @@ import stockCheckRoutes from "./routes/stock-check";
 import gardssalgClaimRoutes, { GARDSSALG_CLAIM_PATH_PREFIXES, gardssalgClaimHostGate } from "./routes/gardssalg-claim";
 import resendWebhookRoutes from "./routes/resend-webhook";
 import { createAgentplatformHostGate } from "./routes/agentplatform-site";
+import { googleConnectedAppsVerification } from "./routes/google-connected-apps";
 import adminAgentAuditRoutes from "./routes/admin-agent-audit";
 import adminVerifierReviewQueueRoutes from "./routes/admin-verifier-review-queue";
 import adminDomainCoherenceSweepRoutes from "./routes/admin-domain-coherence";
@@ -344,6 +345,16 @@ app.use(aiCrawlerAllowlist);
 // aiCrawlerAllowlist just above). Absent header → next() immediately, no
 // other effect whatsoever — see middleware/consumer-identity.ts.
 app.use(consumerIdentity);
+
+// ─── /.well-known/google-connected-apps (slice G1-1) ─────────────────────
+// Google Connected Apps domain verification for rettfrabonden.com and
+// opplevagent.no. Behind GOOGLE_CONNECTED_APPS_VERIFICATION_ENABLED (default
+// off → 404). Mounted HERE — before the agentplatform.no, finn-tannlege.com
+// and opplevagent.no host gates, express.static and every router — so the
+// exact path answers 200 directly on both hosts (no 301, no host-gate 404).
+// Any other path/host/method falls straight through. See
+// routes/google-connected-apps.ts.
+app.use(googleConnectedAppsVerification);
 
 // ─── agentplatform.no host routing (company site) ───────────────────────
 // A2A dev-request 2026-10-08-agentplatform-no-paraplyside. The umbrella page
