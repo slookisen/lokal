@@ -48847,6 +48847,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-26-lokal-agent-verifier-snapshot-drift-toleranse (slice 4):
+// mode=snapshot&drift_since returns drift_bound from agent_queue_state_events;
+// queue claims carry meta.read_at.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-26-lokal-agent-verifier-snapshot-drift-toleranse: drift bound ──");
+  try {
+    const { runAdminVerifierClaimCountsDriftBoundTests } =
+      require("../src/routes/admin-verifier-claim-counts-drift-bound.test") as
+        typeof import("../src/routes/admin-verifier-claim-counts-drift-bound.test");
+    const dbd = await runAdminVerifierClaimCountsDriftBoundTests({ log: false });
+    passed += dbd.passed;
+    failed += dbd.failed;
+    for (const f of dbd.failures) failures.push("admin-verifier-claim-counts-drift-bound: " + f);
+    console.log(`  admin-verifier-claim-counts-drift-bound: ${dbd.passed} passed, ${dbd.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-verifier-claim-counts-drift-bound: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-02-experiences-karantene-utgang-match-til-verified: the
 // content-judge sweep's new quarantine-exit promotion transition
 // (needs_review -> verified, gated on judge MATCH + provider brreg_active=1

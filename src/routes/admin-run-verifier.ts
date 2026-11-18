@@ -341,6 +341,9 @@ export async function runVerifierTick(opts: {
   // mismatch: claim DB-wide current-state counts for the snapshot-semantic
   // kinds. Fail-open to the legacy batch tally if the count query throws.
   let snapshotCounts: ReturnType<typeof getSnapshotClaimCounts> | undefined;
+  // Taken BEFORE the reads, so every write during/after them falls at or
+  // after read_at and is inside the probe's drift_bound (slice 4).
+  const snapshotReadAt = new Date().toISOString();
   try {
     snapshotCounts = getSnapshotClaimCounts(getDb());
   } catch (e: any) {
@@ -352,6 +355,7 @@ export async function runVerifierTick(opts: {
     finished_at: batchResult.finished_at,
     results,
     snapshotCounts,
+    snapshotReadAt,
   });
   if (!envelope.evidence) envelope.evidence = [];
 
