@@ -10,6 +10,7 @@ import {
   confirmClaimToken,
   type VerifyClaimResult,
   verifyGardssalgOwnerSessionToken,
+  gardssalgOwnerSessionCookieMaxAge,
   revokeClaimToken,
   updateClaimedProviderProfile,
   releaseClaimedProviderFieldLock,
@@ -231,7 +232,14 @@ export function sessionFromRequest(req: Request): { valid: boolean; providerId?:
   const cookieToken = readSessionCookie(req);
   if (cookieToken) {
     const s = verifyGardssalgOwnerSessionToken(cookieToken);
-    if (s.valid) return s;
+    if (s.valid) {
+      // O3-3: a renewed cookie session gets its cookie re-set to the new expiry.
+      const res = (req as any).res as Response | undefined;
+      if (s.renewedExpiresAtMs && res && !res.headersSent && typeof res.cookie === "function") {
+        setOwnerSessionCookie(res, cookieToken, s.renewedExpiresAtMs - Date.now());
+      }
+      return s;
+    }
   }
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith("Bearer ")) {
@@ -452,14 +460,19 @@ router.get("/kategori/gardssalg/eier/magic-link-verify", generalLimiter, (req: R
 
 /** Session cookie + redirect to the portal after a successful claim — the
  *  same answer the link GET has always given; the O3-2 confirm POST reuses it. */
-function grantOwnerSessionAndRedirect(res: Response, result: VerifyClaimResult) {
-  res.cookie(GARDSSALG_OWNER_SESSION_COOKIE, result.token, {
+function setOwnerSessionCookie(res: Response, token: string, maxAgeMs: number) {
+  res.cookie(GARDSSALG_OWNER_SESSION_COOKIE, token, {
     path: "/",
-    maxAge: 7 * 24 * 60 * 60 * 1000,
+    maxAge: maxAgeMs,
     httpOnly: true,
     secure: true,
     sameSite: "lax",
   });
+}
+
+function grantOwnerSessionAndRedirect(res: Response, result: VerifyClaimResult) {
+  // Flag off: the fixed 7 days as before (O3-3: services/gardssalg-owner-session-sliding.ts).
+  setOwnerSessionCookie(res, result.token!, gardssalgOwnerSessionCookieMaxAge(result.token!));
 
   const provider = getClaimProviderById(result.providerId!);
   const target = provider?.slug ? `/kategori/gardssalg/eier/${encodeURIComponent(provider.slug)}/portal` : "/kategori/gardssalg";

@@ -840,6 +840,7 @@ import {
   deriveOrgLinkedEmailCandidates,
   CATALOG_HIDDEN_REASON_TEST_FIXTURE,
 } from "../services/gardssalg-claim";
+import { revokeGardssalgOwnerAccessOnOwnershipChange } from "../services/gardssalg-owner-session-sliding";
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
 // dev-request 2026-11-01-opplevagent-drikkeprodusent-selvregistrering,
 // skive 3 — the self-registration review queue below.
@@ -11123,6 +11124,7 @@ router.post("/admin/gardssalg-claim-revoke", requireAdmin, (req: Request, res: R
   const batchId = `claim-revoke-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "")}`;
   const revoked: Array<{ claim_id: string; email_masked: string; email_source: string }> = [];
   let claimedAtReset = false;
+  let revokedLinks = 0;
 
   const txn = expDb.transaction(() => {
     for (const claim of activeClaims) {
@@ -11146,6 +11148,10 @@ router.post("/admin/gardssalg-claim-revoke", requireAdmin, (req: Request, res: R
 
       revoked.push({ claim_id: claim.id, email_masked: maskEmail(claim.email), email_source: claim.email_source });
     }
+
+    // O3-3 AK2 (flag on; flag off: 0, as before): the owner is removed, so
+    // every still-open login link of the provider is revoked too.
+    revokedLinks = revokeGardssalgOwnerAccessOnOwnershipChange(expDb, providerId, { changedBy: "admin" });
 
     // A revoked claim resets the owner mark (dev-request 2026-10-22-opplevagent-
     // mine-valg-gardssalg, G1 pt 8): once NO active claim is left on the
@@ -11179,7 +11185,10 @@ router.post("/admin/gardssalg-claim-revoke", requireAdmin, (req: Request, res: R
   });
   txn();
 
-  res.json({ success: true, dry_run: false, provider_id: providerId, revoked, claimed_at_reset: claimedAtReset });
+  res.json({
+    success: true, dry_run: false, provider_id: providerId, revoked, claimed_at_reset: claimedAtReset,
+    ...(revokedLinks > 0 ? { revoked_login_links: revokedLinks } : {}),
+  });
 });
 
 // ─── Gårdssalg self-registration review queue (admin) ───────────────────────
