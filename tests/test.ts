@@ -48884,6 +48884,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-26-lokal-agent-verifier-snapshot-drift-toleranse (slice 5):
+// mode=snapshot&drift_since also returns count_at_read (exact queue count
+// rebuilt as of read_at from agent_queue_state_events); probe uses it with ±2.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-26-lokal-agent-verifier-snapshot-drift-toleranse: count_at_read ──");
+  try {
+    const { runAdminVerifierClaimCountsCountAtReadTests } =
+      require("../src/routes/admin-verifier-claim-counts-count-at-read.test") as
+        typeof import("../src/routes/admin-verifier-claim-counts-count-at-read.test");
+    const car = await runAdminVerifierClaimCountsCountAtReadTests({ log: false });
+    passed += car.passed;
+    failed += car.failed;
+    for (const f of car.failures) failures.push("admin-verifier-claim-counts-count-at-read: " + f);
+    console.log(`  admin-verifier-claim-counts-count-at-read: ${car.passed} passed, ${car.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-verifier-claim-counts-count-at-read: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-02-experiences-karantene-utgang-match-til-verified: the
 // content-judge sweep's new quarantine-exit promotion transition
 // (needs_review -> verified, gated on judge MATCH + provider brreg_active=1

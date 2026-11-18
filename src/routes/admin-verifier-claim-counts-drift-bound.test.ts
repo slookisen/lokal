@@ -114,11 +114,15 @@ export function runAdminVerifierClaimCountsDriftBoundTests(
       const router = mod.default;
       const get = (qs: string) => callRoute(router, `/?${qs}`, { "x-admin-key": testKey });
 
-      // Fixed clock-independent timeline: every logged change is restamped
-      // per phase so drift_since sits deterministically between phases.
-      const T_BEFORE = "2026-11-15 06:00:00.000"; // history before the run's read
-      const READ_AT = "2026-11-15T06:35:12.345Z"; // claim meta.read_at
-      const T_AFTER = "2026-11-15 12:10:00.000"; // writes between read and probe
+      // Deterministic timeline: every logged change is restamped per phase so
+      // drift_since sits between phases. Anchored 8 h before the real clock so
+      // it stays inside the 14-day log retention horizon (slice 5).
+      const BASE_MS = Math.floor(Date.now() / 1000) * 1000 - 8 * 3600_000;
+      const at = (offsetMs: number) => new Date(BASE_MS + offsetMs).toISOString();
+      const asLogged = (iso: string) => iso.slice(0, 23).replace("T", " ");
+      const T_BEFORE = asLogged(at(0)); // history before the run's read
+      const READ_AT = at(35 * 60_000 + 12_345); // claim meta.read_at
+      const T_AFTER = asLogged(at(6 * 3600_000 + 10 * 60_000)); // writes between read and probe
       const stampPhase = (fromId: number, at: string) =>
         db.prepare(`UPDATE agent_queue_state_events SET changed_at = ? WHERE id > ?`).run(at, fromId);
       const maxEventId = () =>
@@ -164,11 +168,11 @@ export function runAdminVerifierClaimCountsDriftBoundTests(
       // Before any post-read write the bound is 0.
       r = await get(`kind=agents_pending_verify&mode=snapshot&drift_since=${READ_AT}`);
       assertEq([r.status, r.body.count, r.body.drift_bound], [200, 625, 0], "dbd-06: no moves since read -> drift_bound 0");
-      assertEq(r.body.drift_since, "2026-11-15 06:35:12", "dbd-07: drift_since echoed normalized like delta-mode since");
+      assertEq(r.body.drift_since, asLogged(READ_AT), "dbd-07: drift_since echoed in changed_at's format, ms kept");
       assertEq(
         Object.keys(r.body),
-        ["success", "kind", "mode", "count", "since", "until", "sample", "drift_since", "drift_bound"],
-        "dbd-08: drift_since adds only drift_since + drift_bound at the end",
+        ["success", "kind", "mode", "count", "since", "until", "sample", "drift_since", "drift_bound", "count_at_read"],
+        "dbd-08: drift_since adds only drift_since + drift_bound + count_at_read at the end",
       );
 
       // ── Phase B (after read, before probe): the failure shape.
@@ -199,9 +203,9 @@ export function runAdminVerifierClaimCountsDriftBoundTests(
       assertEq(mod.snapshotDriftDecision(71, 74, 0).matched, false, "dbd-16: diff 3 with drift_bound 0 fails");
 
       // Earlier drift_since (before phase A) counts phase A too; later one counts nothing.
-      r = await get(`kind=agents_pending_verify&mode=snapshot&drift_since=2026-11-15T05:00:00Z`);
+      r = await get(`kind=agents_pending_verify&mode=snapshot&drift_since=${at(-3600_000)}`);
       assertEq(r.body.drift_bound, 630, "dbd-17: drift_since before the history counts every agent that touched the queue");
-      r = await get(`kind=agents_pending_verify&mode=snapshot&drift_since=2026-11-15T13:00:00Z`);
+      r = await get(`kind=agents_pending_verify&mode=snapshot&drift_since=${at(7 * 3600_000)}`);
       assertEq(r.body.drift_bound, 0, "dbd-18: changes before drift_since are excluded");
 
       r = await get(`kind=agents_review_required&mode=snapshot&drift_since=${READ_AT}`);
@@ -235,12 +239,12 @@ export function runAdminVerifierClaimCountsDriftBoundTests(
       assertEq(r.status, 400, "dbd-26: empty drift_since -> 400");
       r = await get(`kind=http_unreachable&mode=snapshot&drift_since=${READ_AT}`);
       assertEq(r.status, 400, "dbd-27: drift_since on a non-queue kind -> 400");
-      r = await get(`kind=agents_pending_verify&since=${READ_AT}&until=2026-11-15T12:00:00Z&drift_since=${READ_AT}`);
+      r = await get(`kind=agents_pending_verify&since=${READ_AT}&until=${at(6 * 3600_000)}&drift_since=${READ_AT}`);
       assertEq([r.status, "drift_bound" in r.body], [200, false], "dbd-28: delta mode ignores drift_since (response unchanged)");
 
       // Log unreadable -> null (caller falls back to ±2), never a throw.
       const bare = new Database(":memory:");
-      assertEq(mod.getSnapshotDriftBound(bare, "pending_verify", "2026-11-15 06:35:12"), null, "dbd-29: missing event log -> drift_bound null");
+      assertEq(mod.getSnapshotDriftBound(bare, "pending_verify", asLogged(READ_AT)), null, "dbd-29: missing event log -> drift_bound null");
       bare.close();
 
       // ── Envelope: meta.read_at on the three queue claims only.
