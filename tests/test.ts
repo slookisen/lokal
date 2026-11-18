@@ -11704,8 +11704,8 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
 // The homepage AI-logos block previously linked Claude MCP to
 // https://www.npmjs.com/package/lokal-mcp — a raw npm package page that
 // confuses end-users (most can't install MCPs from npm manually). The
-// link now points to our own /teknologi#claude-mcp setup guide which has
-// the Pro/Max Integrations method and the npm fallback.
+// link now opens Claude's add-custom-connector dialog (C1-B1); the
+// /teknologi#claude-mcp setup guide keeps the manual steps and npm fallback.
 //
 // These are source-presence checks against src/routes/seo.ts.
 {
@@ -11728,11 +11728,12 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     "pr53: homepage ai-logos block does NOT link to npmjs.com/package/lokal-mcp"
   );
 
-  // (2) Homepage Claude MCP button uses the localizedPath helper and
-  //     points at the /teknologi#claude-mcp anchor.
+  // (2) Homepage Claude button reads the single Claude link constant
+  //     (C1-B1, dev-request 2026-11-12-rfb-c1-claude-knapp-sporing-gjenkjenning:
+  //     opens Claude's pre-filled add-custom-connector dialog).
   assertTrue(
-    /localizedPath\("\/teknologi", lang\)\}#claude-mcp/.test(aiLogosBlock),
-    "pr53: homepage Claude MCP link uses localizedPath('/teknologi') + #claude-mcp anchor"
+    /href="\$\{escapeHtml\(RFB_CLAUDE_CONNECTOR_URL\)\}"/.test(aiLogosBlock),
+    "pr53: homepage Claude link reads RFB_CLAUDE_CONNECTOR_URL"
   );
 
   // (3) The setup-guide anchor target still exists on /teknologi.
@@ -51916,6 +51917,22 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("rfb-chatgpt-app-link: unexpected error: " + String(err?.message || err));
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── rfb-claude-connector-link: one Use-in-Claude link + current connector guide (C1-B1) ──");
+  try {
+    const { runRfbClaudeConnectorLinkTests } = require("../src/config/rfb-claude-connector-link.test") as
+      typeof import("../src/config/rfb-claude-connector-link.test");
+    const r = await runRfbClaudeConnectorLinkTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-claude-connector-link: " + f);
+    console.log(`  rfb-claude-connector-link: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-claude-connector-link: unexpected error: " + String(err?.message || err));
   }
 });
 

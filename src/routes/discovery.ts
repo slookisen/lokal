@@ -12,7 +12,7 @@
  */
 
 import { Router, Request, Response } from "express";
-import { RFB_CHATGPT_APP_URL } from "../config/distribution-channels";
+import { RFB_CHATGPT_APP_URL, RFB_CLAUDE_CONNECTOR_URL } from "../config/distribution-channels";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { knowledgeService, publicOwnerAboutText } from "../services/knowledge-service";
 import { slugify } from "../utils/slug";
@@ -290,6 +290,10 @@ Content-Type: application/json
 ## ChatGPT-app
 
 ChatGPT app — Rett fra Bonden: ${RFB_CHATGPT_APP_URL}
+
+## Claude
+
+Claude (custom connector, Customize → Connectors → Add custom connector) — Rett fra Bonden: ${RFB_CLAUDE_CONNECTOR_URL}
 
 ## Kontakt
 
