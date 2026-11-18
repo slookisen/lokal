@@ -3495,13 +3495,20 @@ export function buildRunEnvelope(input: {
   // like with like. The batch tally is kept in meta.batch_count. Omitted =
   // legacy batch-scoped values (tests, the standalone runner script).
   snapshotCounts?: Partial<Record<string, number>>;
+  // dev-request 2026-10-26-lokal-agent-verifier-snapshot-drift-toleranse
+  // (slice 4): ISO time taken immediately BEFORE snapshotCounts were read.
+  // The three queue claims carry it as meta.read_at so platform-verifier can
+  // ask claim-counts for drift_bound (queue moves since this read) via
+  // drift_since=<read_at>. Omitted = no read_at (probe keeps fixed +-2).
+  snapshotReadAt?: string;
 }): Record<string, unknown> {
   const r = input.results;
-  const snap = (kind: string, batchValue: number) => {
+  const snap = (kind: string, batchValue: number, withReadAt = false) => {
     const v = input.snapshotCounts?.[kind];
-    return typeof v === "number"
-      ? { value: v, meta: { kind, scope: "snapshot", batch_count: batchValue } }
-      : { value: batchValue, meta: { kind } };
+    if (typeof v !== "number") return { value: batchValue, meta: { kind } };
+    const meta: Record<string, unknown> = { kind, scope: "snapshot", batch_count: batchValue };
+    if (withReadAt && input.snapshotReadAt) meta.read_at = input.snapshotReadAt;
+    return { value: v, meta };
   };
   const verified = r.filter((x) => x.new_verification_status === "verified").length;
   const review = r.filter((x) => x.new_verification_status === "review_required").length;
@@ -3597,9 +3604,9 @@ export function buildRunEnvelope(input: {
       { type: "db_state_change", value: verified, meta: { kind: "agents_verified", agent_ids: verifiedAgentIds } },
       { type: "db_state_change", value: newlyVerified, meta: { kind: "agents_newly_verified" } },
       { type: "db_state_change", value: reverified, meta: { kind: "agents_reverified" } },
-      { type: "db_state_change", ...snap("agents_review_required", review) },
-      { type: "db_state_change", ...snap("agents_pending_verify", pending) },
-      { type: "db_state_change", ...snap("agents_data_insufficient", dataInsufficient) },
+      { type: "db_state_change", ...snap("agents_review_required", review, true) },
+      { type: "db_state_change", ...snap("agents_pending_verify", pending, true) },
+      { type: "db_state_change", ...snap("agents_data_insufficient", dataInsufficient, true) },
       // WHY (dev-request 2026-10-26-lokal-agent-verifier-snapshot-drift-
       // toleranse, slice 3): the controller reads `http_unreachable` as
       // http_unreachable_per_run (threshold 25), but the snapshot value is a

@@ -6,6 +6,7 @@
 //
 //   GET /admin/verifier/claim-counts?kind=<kind>&since=<ISO-8601>&until=<ISO-8601>
 //   GET /admin/verifier/claim-counts?kind=<kind>&mode=snapshot
+//   GET /admin/verifier/claim-counts?kind=<queue kind>&mode=snapshot&drift_since=<ISO-8601>
 //
 // `kind` is a TYPED ALLOWLIST (switch statement below), never passthrough
 // SQL built from the query string. Unknown kind -> 400.
@@ -93,6 +94,28 @@
 // A run that verified >=1 agent always has an event stamped at exactly its
 // own started_at (== since), so any post-deploy run with a non-zero claim is
 // always probed via events. Snapshot mode and every other kind are untouched.
+//
+// Snapshot drift bound (dev-request 2026-10-26-lokal-agent-verifier-snapshot-
+// drift-toleranse, slice 4): the lokal-agent-verifier reads the queue counts
+// (agents_pending_verify / agents_review_required / agents_data_insufficient)
+// at run time and posts the read time as claim meta.read_at; platform-verifier
+// probes 10-12 h later, and real writes move the queues by 3-6 in between. A
+// fixed +-N is the wrong shape (the drift follows the number of writes, not
+// time), and lokal keeps no status history to rebuild the count as of the
+// read time. So mode=snapshot takes an optional `drift_since=<ISO>` (the
+// claim's read_at) and then also returns `drift_bound`: the number of distinct
+// agents that entered or left this kind's queue at or after drift_since,
+// counted from agent_queue_state_events (trigger-fed, see init.ts). Each such
+// agent moves the count by at most 1, so |count_now - count_at_read| <=
+// drift_bound. The probe accepts |count - claim| <= max(2, drift_bound) — see
+// snapshotDriftDecision(). drift_since is normalized exactly like delta-mode
+// since/until (parseSinceUntil, second precision, compared via datetime(...)
+// on both sides); truncating to the second only widens the bound. It is a
+// separate parameter, not `since`, because mode=snapshot has always ignored a
+// supplied since/until and that contract (and every response without
+// drift_since) is unchanged. Only the queue kinds in QUEUE_STATUS_FOR_KIND are
+// supported; any other kind with drift_since -> 400. If the event log cannot
+// be read, drift_bound is null and the caller keeps the fixed +-2 rule.
 //
 // Non-goals (out of scope for this slice — dev-request 2026-08-29-verifier-
 // claim-kind-katalog-gap): outreach_pool_added, lokal_prs_conflict_rebased,
@@ -232,6 +255,54 @@ function buildQuery(
   };
 }
 
+// Snapshot kinds whose count is `a.is_active = 1 AND k.verification_status =
+// <status>`, i.e. fully determined by the two columns the
+// agent_queue_state_events triggers log. Only these support drift_since.
+// Fixed literals; the status is bound as a parameter, never interpolated.
+const QUEUE_STATUS_FOR_KIND: Partial<Record<ClaimKind, string>> = {
+  agents_verified: "verified",
+  agents_review_required: "review_required",
+  agents_pending_verify: "pending_verify",
+  agents_data_insufficient: "data_insufficient",
+};
+
+// Distinct agents with a logged change at/after drift_since where either side
+// of the change was (possibly) in the queue. A NULL is_active means "agent row
+// not visible to the trigger" (e.g. FK cascade order) and is treated as active,
+// which can only widen the bound.
+const DRIFT_BOUND_SQL = `SELECT COUNT(DISTINCT agent_id) AS c
+       FROM agent_queue_state_events
+      WHERE datetime(changed_at) >= datetime(?)
+        AND ((old_status = ? AND COALESCE(old_active, 1) = 1)
+          OR (new_status = ? AND COALESCE(new_active, 1) = 1))`;
+
+export function getSnapshotDriftBound(db: any, status: string, driftSince: string): number | null {
+  try {
+    const row = db.prepare(DRIFT_BOUND_SQL).get(driftSince, status, status) as { c: number } | undefined;
+    return row?.c ?? 0;
+  } catch {
+    return null;
+  }
+}
+
+// The probe's decision rule for the three queue snapshot kinds, as a pure
+// function so it can be tested against the observed failure shape. Without a
+// drift bound (older envelopes without meta.read_at, or the log unreadable)
+// it is the slice-1 fixed +-2 rule.
+export const SNAPSHOT_DRIFT_MIN_TOLERANCE = 2;
+export function snapshotDriftDecision(
+  claimValue: number,
+  count: number,
+  driftBound: number | null | undefined,
+): { matched: boolean; diff: number; tolerance: number } {
+  const diff = Math.abs(count - claimValue);
+  const tolerance =
+    typeof driftBound === "number" && driftBound > SNAPSHOT_DRIFT_MIN_TOLERANCE
+      ? driftBound
+      : SNAPSHOT_DRIFT_MIN_TOLERANCE;
+  return { matched: diff <= tolerance, diff, tolerance };
+}
+
 // agents_verified delta mode (see file-header comment): count/sample from the
 // append-only verifier_verified_events log, one per (agent_id, run_started_at)
 // pair whose run_started_at lies inside [since, until]. Fixed SQL, two bound
@@ -325,6 +396,22 @@ router.get("/", (req: Request, res: Response) => {
   // caller-supplied values are ignored (see buildQuery()/response below).
   let since: string | null = null;
   let until: string | null = null;
+  // drift_since (snapshot mode only, optional): see file-header comment.
+  // Absent -> nothing about the snapshot response changes.
+  let driftSince: string | null = null;
+  let driftStatus: string | null = null;
+  if (mode === "snapshot" && req.query.drift_since !== undefined) {
+    driftStatus = QUEUE_STATUS_FOR_KIND[kind] ?? null;
+    if (driftStatus === null) {
+      res.status(400).json({ success: false, error: `drift_since is not supported for kind: ${kind}` });
+      return;
+    }
+    driftSince = parseSinceUntil(req.query.drift_since);
+    if (driftSince === null) {
+      res.status(400).json({ success: false, error: "drift_since must be a parseable ISO-8601 timestamp" });
+      return;
+    }
+  }
   if (mode === "delta") {
     since = parseSinceUntil(req.query.since);
     if (since === null) {
@@ -403,6 +490,9 @@ router.get("/", (req: Request, res: Response) => {
       since,
       until,
       sample: sampleRows,
+      ...(driftSince !== null && driftStatus !== null
+        ? { drift_since: driftSince, drift_bound: getSnapshotDriftBound(db, driftStatus, driftSince) }
+        : {}),
     });
   } catch (err: any) {
     res.status(500).json({ success: false, error: String(err?.message || err) });
