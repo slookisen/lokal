@@ -44354,6 +44354,9 @@ runSerial(async () => {
   const suites: Array<[string, () => Promise<Summary>]> = [
     ["mcp-lokal-info-and-category-labels", () => (require("../src/routes/mcp-lokal-info-and-category-labels.test") as typeof import("../src/routes/mcp-lokal-info-and-category-labels.test")).runMcpLokalInfoAndCategoryLabelsTests({ log: false })],
     ["rfb-mcp-contract-freeze", () => (require("../src/routes/rfb-mcp-contract-freeze.test") as typeof import("../src/routes/rfb-mcp-contract-freeze.test")).runRfbMcpContractFreezeTests({ log: false })],
+    // dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting (S-A5 RFB-MCP prerequisite):
+    // chatgpt-app-submission.json's lokal_search test cases replayed offline on a fixed fixture.
+    ["rfb-submission-replay", () => (require("../src/routes/rfb-submission-replay.test") as typeof import("../src/routes/rfb-submission-replay.test")).runRfbSubmissionReplayTests({ log: false })],
   ];
   for (const [name, run] of suites) {
     try {
