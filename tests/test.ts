@@ -45327,6 +45327,23 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── dev-request 2026-11-15-rfb-nattjobb-hull-kontaktuttrekk-bm-og-koer: B4 (køene får alder i CS-oppsummeringen) ──");
+  try {
+    const { runCsDigestReviewQueueTests } = require("../src/services/cs-digest-review-queues.test") as
+      typeof import("../src/services/cs-digest-review-queues.test");
+    const rqt = await runCsDigestReviewQueueTests({ log: false });
+    passed += rqt.passed;
+    failed += rqt.failed;
+    for (const f of rqt.failures) failures.push("cs-digest-review-queues: " + f);
+    console.log(`  cs-digest-review-queues: ${rqt.passed} passed, ${rqt.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("cs-digest-review-queues: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ cs-digest-review-queues: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-11-10-cs-paa-serveren: S2 (svarforslag, sendejobb, godkjenningskø, utboks) ──");
   try {
     const { runCsReplyProposalsTests } = require("../src/services/cs-reply-proposals.test") as

@@ -541,6 +541,80 @@ export function watchdogDue(now: Date, lastRunAt: Date | null): boolean {
   return !lastRunAt || now.getTime() - lastRunAt.getTime() >= 55 * 60_000;
 }
 
+// ─── nattjobb B4 (dev-request 2026-11-15-rfb-nattjobb-hull-kontaktuttrekk-bm-og-koer):
+// the two review queues the RFB nightly job feeds get an age in the digest.
+//   org_nr  — agents_org_nr_review_queue (init.ts). No status column: a row is
+//             open until it is handled, which DELETEs it (admin-agents.ts
+//             clearAgentOrgNrReviewQueueEntry; the admin list shows every row).
+//   website — agents_website_review_queue (lazy table, admin-rfb-website-
+//             discovery.ts ensureRfbWebsiteReviewQueueTable). Open = status
+//             'pending', the same filter as GET /admin/rfb-website-review-queue;
+//             applied / rejected / superseded rows are handled.
+// Age = business days (Mon–Fri, same helper and threshold as the gårdssalg
+// self-register queue, O6-2) since the oldest open row's created_at; the
+// upserts keep created_at, so it is when the row first entered the queue.
+// A table that does not exist in this DB gives null ("ukjent"), never a throw.
+export interface ReviewQueueAge {
+  open: number;
+  oldest_created_at: string | null;
+  oldest_business_days: number | null;
+  stale: boolean;
+}
+
+const REVIEW_QUEUES: ReadonlyArray<{ key: "org_nr" | "website"; label: string; sql: string }> = [
+  {
+    key: "org_nr",
+    label: "Org.nr-køen",
+    sql: `SELECT COUNT(*) AS n, MIN(created_at) AS oldest FROM agents_org_nr_review_queue`,
+  },
+  {
+    key: "website",
+    label: "Nettstedkøen",
+    sql: `SELECT COUNT(*) AS n, MIN(created_at) AS oldest FROM agents_website_review_queue WHERE status = ?`,
+  },
+];
+
+export function reviewQueueAges(now: Date = new Date()): { org_nr: ReviewQueueAge | null; website: ReviewQueueAge | null } {
+  const { businessDaysSince, isSelfRegisterQueueRowStale } =
+    require("./gardssalg-self-register") as typeof import("./gardssalg-self-register");
+  const db = getDb();
+  const out: { org_nr: ReviewQueueAge | null; website: ReviewQueueAge | null } = { org_nr: null, website: null };
+  for (const q of REVIEW_QUEUES) {
+    try {
+      const stmt = db.prepare(q.sql);
+      const row = (q.key === "website" ? stmt.get("pending") : stmt.get()) as { n: number; oldest: string | null };
+      const open = Number(row?.n ?? 0);
+      const oldest = open > 0 ? row?.oldest ?? null : null;
+      const days = oldest ? businessDaysSince(oldest, now) : null;
+      out[q.key] = { open, oldest_created_at: oldest, oldest_business_days: days, stale: isSelfRegisterQueueRowStale(days) };
+    } catch {
+      out[q.key] = null; // table missing in this DB (tests, other verticals)
+    }
+  }
+  return out;
+}
+
+/** Digest lines for the two review queues + one finding line per stale queue. */
+export function reviewQueueDigestLines(ages: { org_nr: ReviewQueueAge | null; website: ReviewQueueAge | null }): { lines: string[]; findings: string[] } {
+  const { SELF_REGISTER_QUEUE_STALE_BUSINESS_DAYS } =
+    require("./gardssalg-self-register") as typeof import("./gardssalg-self-register");
+  const lines: string[] = [];
+  const findings: string[] = [];
+  for (const q of REVIEW_QUEUES) {
+    const a = ages[q.key];
+    if (!a) { lines.push(`• ${q.label}: ukjent (tabellen finnes ikke)`); continue; }
+    if (a.open === 0) { lines.push(`• ${q.label}: 0 åpne`); continue; }
+    const days = a.oldest_business_days === null ? "ukjent alder" : `${a.oldest_business_days} virkedag${a.oldest_business_days === 1 ? "" : "er"}`;
+    const date = a.oldest_created_at ? ` (${String(a.oldest_created_at).slice(0, 10)})` : "";
+    const openTxt = `${a.open} ${a.open === 1 ? "åpen" : "åpne"}`;
+    lines.push(`• ${q.label}: ${openTxt}, eldste ${days}${date}${a.stale ? " ⚠" : ""}`);
+    if (a.stale) {
+      findings.push(`FUNN: ${q.label} har en rad som har ventet ${days} (over ${SELF_REGISTER_QUEUE_STALE_BUSINESS_DAYS}) — ${openTxt}.`);
+    }
+  }
+  return { lines, findings };
+}
+
 export function buildDailyDigest(now: Date = new Date()): { subject: string; text: string; counts: Record<string, unknown> } {
   const db = getDb();
   const since = new Date(now.getTime() - 24 * 3600_000).toISOString();
@@ -669,6 +743,13 @@ export function buildDailyDigest(now: Date = new Date()): { subject: string; tex
   } catch {
     // cs_reply_proposals missing (pre-migration DB)
   }
+  // nattjobb B4: org.nr and website review queues with the age of the oldest open row.
+  const queueAges = reviewQueueAges(now);
+  const queueDigest = reviewQueueDigestLines(queueAges);
+  lines.push("");
+  lines.push("GJENNOMGANGSKØER (nattjobben)");
+  lines.push(...queueDigest.lines);
+  lines.push(...queueDigest.findings);
   lines.push("");
   lines.push(`TRENGER SVAR: ${report.counts.threads} (${report.counts.p0} over 24 t, ${report.counts.p1} over 12 t)`);
   for (const t of report.threads.slice().sort((a, b) => b.age_hours - a.age_hours).slice(0, 25)) {
@@ -690,7 +771,8 @@ export function buildDailyDigest(now: Date = new Date()): { subject: string; tex
   return {
     subject,
     text: lines.join("\n"),
-    counts: { inbound, forms, contact_form_rejected: rejected, outbound, needs_reply: report.counts, proposals: proposalCounts },
+    counts: { inbound, forms, contact_form_rejected: rejected, outbound, needs_reply: report.counts, proposals: proposalCounts,
+      review_queues: { ...queueAges, findings: queueDigest.findings } },
   };
 }
 
