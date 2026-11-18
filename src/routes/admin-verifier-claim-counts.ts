@@ -95,27 +95,42 @@
 // own started_at (== since), so any post-deploy run with a non-zero claim is
 // always probed via events. Snapshot mode and every other kind are untouched.
 //
-// Snapshot drift bound (dev-request 2026-10-26-lokal-agent-verifier-snapshot-
-// drift-toleranse, slice 4): the lokal-agent-verifier reads the queue counts
-// (agents_pending_verify / agents_review_required / agents_data_insufficient)
-// at run time and posts the read time as claim meta.read_at; platform-verifier
-// probes 10-12 h later, and real writes move the queues by 3-6 in between. A
-// fixed +-N is the wrong shape (the drift follows the number of writes, not
-// time), and lokal keeps no status history to rebuild the count as of the
-// read time. So mode=snapshot takes an optional `drift_since=<ISO>` (the
-// claim's read_at) and then also returns `drift_bound`: the number of distinct
-// agents that entered or left this kind's queue at or after drift_since,
-// counted from agent_queue_state_events (trigger-fed, see init.ts). Each such
-// agent moves the count by at most 1, so |count_now - count_at_read| <=
-// drift_bound. The probe accepts |count - claim| <= max(2, drift_bound) — see
-// snapshotDriftDecision(). drift_since is normalized exactly like delta-mode
-// since/until (parseSinceUntil, second precision, compared via datetime(...)
-// on both sides); truncating to the second only widens the bound. It is a
-// separate parameter, not `since`, because mode=snapshot has always ignored a
-// supplied since/until and that contract (and every response without
-// drift_since) is unchanged. Only the queue kinds in QUEUE_STATUS_FOR_KIND are
-// supported; any other kind with drift_since -> 400. If the event log cannot
-// be read, drift_bound is null and the caller keeps the fixed +-2 rule.
+// Snapshot drift (dev-request 2026-10-26-lokal-agent-verifier-snapshot-
+// drift-toleranse, slices 4 + 5): the lokal-agent-verifier reads the queue
+// counts (agents_pending_verify / agents_review_required /
+// agents_data_insufficient) at run time and posts the read time as claim
+// meta.read_at; platform-verifier probes 10-12 h later, and real writes move
+// the queues by 3-6 in between. A fixed +-N is the wrong shape (the drift
+// follows the number of writes, not time). Since slice 4 every change to queue
+// membership is logged in agent_queue_state_events (trigger-fed, see init.ts),
+// so mode=snapshot takes an optional `drift_since=<ISO>` (the claim's read_at)
+// and then also returns:
+//   - `count_at_read` (slice 5): the queue count rebuilt as of drift_since.
+//     Start from count_now, take out every agent with a logged change at/after
+//     drift_since that is in the queue now, and add back every such agent
+//     whose EARLIEST change at/after drift_since (MIN(id)) has its old side in
+//     the queue (old_status = <status> AND old_active = 1, the snapshot
+//     count's own predicate; an INSERT has old_status NULL, i.e. not in the
+//     queue). Agents without a
+//     logged change since drift_since are in the queue now iff they were then.
+//     The probe compares the claim to this with +-2 (the +-2 absorbs a write
+//     committed by another connection across the read).
+//   - `drift_bound` (slice 4, kept as diagnostics): distinct agents that
+//     entered or left the queue at/after drift_since. It is a GROSS bound (A
+//     out + B in = net 0 but bound 2) and only the fallback when count_at_read
+//     is null.
+// See snapshotDriftDecision() for the rule. drift_since is normalized to the
+// exact text format the triggers write ("YYYY-MM-DD HH:MM:SS.SSS", UTC, ms
+// kept) and compared as a raw string, so the changed_at index is used and no
+// event from before the read leaks in through rounding. Events older than
+// DRIFT_LOG_RETENTION_DAYS are pruned at boot (init.ts); a drift_since older
+// than that returns count_at_read and drift_bound null, and so does an
+// unreadable log — the caller then keeps the fixed +-2 rule. It is a separate
+// parameter, not `since`, because mode=snapshot has always ignored a supplied
+// since/until and that contract (and every response without drift_since) is
+// unchanged. Only the kinds in QUEUE_STATUS_FOR_KIND (the three queues, plus
+// agents_verified, which no probe uses) are supported; any other kind with
+// drift_since -> 400. In delta mode drift_since is ignored, even when invalid.
 //
 // Non-goals (out of scope for this slice — dev-request 2026-08-29-verifier-
 // claim-kind-katalog-gap): outreach_pool_added, lokal_prs_conflict_rebased,
@@ -159,6 +174,17 @@ function parseSinceUntil(raw: unknown): string | null {
   const d = new Date(raw);
   if (Number.isNaN(d.getTime())) return null;
   return d.toISOString().slice(0, 19).replace("T", " ");
+}
+
+// drift_since: same parse, but kept to the millisecond and in the exact text
+// format agent_queue_state_events.changed_at is written in
+// (strftime('%Y-%m-%d %H:%M:%f','now') -> "YYYY-MM-DD HH:MM:SS.SSS"), so a
+// raw string `changed_at >= ?` is a correct comparison and uses the index.
+function parseDriftSince(raw: unknown): string | null {
+  if (typeof raw !== "string" || !raw.trim()) return null;
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString().slice(0, 23).replace("T", " ");
 }
 
 const KNOWN_KINDS = [
@@ -266,13 +292,22 @@ const QUEUE_STATUS_FOR_KIND: Partial<Record<ClaimKind, string>> = {
   agents_data_insufficient: "data_insufficient",
 };
 
+// Events older than this are pruned at boot (init.ts). A drift_since older
+// than the horizon may miss pruned events, so both derived values are null.
+export const DRIFT_LOG_RETENTION_DAYS = 14;
+export function driftSinceWithinRetention(driftSince: string, nowMs: number = Date.now()): boolean {
+  const t = new Date(driftSince.replace(" ", "T") + "Z").getTime();
+  return !Number.isNaN(t) && t >= nowMs - DRIFT_LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+}
+
 // Distinct agents with a logged change at/after drift_since where either side
 // of the change was (possibly) in the queue. A NULL is_active means "agent row
 // not visible to the trigger" (e.g. FK cascade order) and is treated as active,
-// which can only widen the bound.
+// which can only widen the bound. drift_since is in changed_at's own text
+// format (parseDriftSince), so the raw comparison uses the changed_at index.
 const DRIFT_BOUND_SQL = `SELECT COUNT(DISTINCT agent_id) AS c
        FROM agent_queue_state_events
-      WHERE datetime(changed_at) >= datetime(?)
+      WHERE changed_at >= ?
         AND ((old_status = ? AND COALESCE(old_active, 1) = 1)
           OR (new_status = ? AND COALESCE(new_active, 1) = 1))`;
 
@@ -285,22 +320,83 @@ export function getSnapshotDriftBound(db: any, status: string, driftSince: strin
   }
 }
 
+// count_at_read pieces (see file-header comment):
+//   in_now  = agents with >=1 event at/after drift_since that are in the queue
+//             now — the exact membership predicate of the snapshot count
+//             (agent_knowledge JOIN agents, a.is_active = 1, status);
+//   in_then = agents whose earliest event at/after drift_since (MIN(id)) had
+//             its old side in the queue: old_status = <status> AND
+//             old_active = 1 — the same predicate as the snapshot count
+//             (a NULL is_active or a missing agents row is not counted there).
+//             Unlike DRIFT_BOUND_SQL (which may over-count), no COALESCE: an
+//             agent delete logs the real is_active first (trg_aqse_agents_del
+//             is BEFORE DELETE), so a NULL old_active as the EARLIEST event
+//             only comes from a knowledge row with no agents row (an orphan,
+//             FK off), which the snapshot count never included.
+const COUNT_AT_READ_SQL = `SELECT
+       (SELECT COUNT(*)
+          FROM agent_knowledge k
+          INNER JOIN agents a ON a.id = k.agent_id
+         WHERE a.is_active = 1 AND k.verification_status = ?
+           AND k.agent_id IN (SELECT agent_id FROM agent_queue_state_events WHERE changed_at >= ?)) AS in_now,
+       (SELECT COUNT(*)
+          FROM agent_queue_state_events e
+         WHERE e.id IN (SELECT MIN(id) FROM agent_queue_state_events
+                         WHERE changed_at >= ? GROUP BY agent_id)
+           AND e.old_status = ? AND e.old_active = 1) AS in_then`;
+
+export function getSnapshotCountAtRead(
+  db: any,
+  status: string,
+  driftSince: string,
+  countNow: number,
+): number | null {
+  try {
+    const row = db.prepare(COUNT_AT_READ_SQL).get(status, driftSince, driftSince, status) as
+      | { in_now: number; in_then: number }
+      | undefined;
+    if (!row) return null;
+    return countNow - row.in_now + row.in_then;
+  } catch {
+    return null;
+  }
+}
+
 // The probe's decision rule for the three queue snapshot kinds, as a pure
-// function so it can be tested against the observed failure shape. Without a
-// drift bound (older envelopes without meta.read_at, or the log unreadable)
-// it is the slice-1 fixed +-2 rule.
+// function so it can be tested against the observed failure shape:
+//   1. count_at_read numeric -> |count_at_read - claim| <= 2 (exact rebuild;
+//      a wide drift_bound can no longer hide a real mismatch);
+//   2. else drift_bound numeric -> |count - claim| <= max(2, drift_bound);
+//   3. else (older envelopes without meta.read_at, log unreadable, or
+//      drift_since past the retention horizon) the slice-1 fixed +-2 rule.
 export const SNAPSHOT_DRIFT_MIN_TOLERANCE = 2;
 export function snapshotDriftDecision(
   claimValue: number,
   count: number,
   driftBound: number | null | undefined,
+  countAtRead?: number | null,
 ): { matched: boolean; diff: number; tolerance: number } {
+  if (typeof countAtRead === "number") {
+    const diff = Math.abs(countAtRead - claimValue);
+    return { matched: diff <= SNAPSHOT_DRIFT_MIN_TOLERANCE, diff, tolerance: SNAPSHOT_DRIFT_MIN_TOLERANCE };
+  }
   const diff = Math.abs(count - claimValue);
   const tolerance =
     typeof driftBound === "number" && driftBound > SNAPSHOT_DRIFT_MIN_TOLERANCE
       ? driftBound
       : SNAPSHOT_DRIFT_MIN_TOLERANCE;
   return { matched: diff <= tolerance, diff, tolerance };
+}
+
+function driftFields(db: any, status: string, driftSince: string, countNow: number) {
+  if (!driftSinceWithinRetention(driftSince)) {
+    return { drift_since: driftSince, drift_bound: null, count_at_read: null };
+  }
+  return {
+    drift_since: driftSince,
+    drift_bound: getSnapshotDriftBound(db, status, driftSince),
+    count_at_read: getSnapshotCountAtRead(db, status, driftSince, countNow),
+  };
 }
 
 // agents_verified delta mode (see file-header comment): count/sample from the
@@ -406,7 +502,7 @@ router.get("/", (req: Request, res: Response) => {
       res.status(400).json({ success: false, error: `drift_since is not supported for kind: ${kind}` });
       return;
     }
-    driftSince = parseSinceUntil(req.query.drift_since);
+    driftSince = parseDriftSince(req.query.drift_since);
     if (driftSince === null) {
       res.status(400).json({ success: false, error: "drift_since must be a parseable ISO-8601 timestamp" });
       return;
@@ -491,7 +587,7 @@ router.get("/", (req: Request, res: Response) => {
       until,
       sample: sampleRows,
       ...(driftSince !== null && driftStatus !== null
-        ? { drift_since: driftSince, drift_bound: getSnapshotDriftBound(db, driftStatus, driftSince) }
+        ? driftFields(db, driftStatus, driftSince, countRow?.c ?? 0)
         : {}),
     });
   } catch (err: any) {

@@ -143,6 +143,26 @@ function effectiveVerifyRouteNowMs(): number {
   return verifyRouteNowForTesting ? verifyRouteNowForTesting() : Date.now();
 }
 
+// Snapshot claim counts plus their read time (meta.read_at on the queue
+// claims). read_at is taken BEFORE the reads, so every write during/after them
+// falls at or after read_at: it is inside the probe's drift_bound and is
+// undone by count_at_read (dev-request 2026-10-26-lokal-agent-verifier-
+// snapshot-drift-toleranse, slices 4 + 5). Fail-open: counts undefined if the
+// query throws (the envelope then keeps the legacy batch tally).
+export function readSnapshotClaimCounts(db: any): {
+  snapshotCounts: ReturnType<typeof getSnapshotClaimCounts> | undefined;
+  snapshotReadAt: string;
+} {
+  const snapshotReadAt = new Date().toISOString();
+  let snapshotCounts: ReturnType<typeof getSnapshotClaimCounts> | undefined;
+  try {
+    snapshotCounts = getSnapshotClaimCounts(db);
+  } catch (e: any) {
+    console.error(`[admin/run-verifier] snapshot claim counts failed:`, e?.message || e);
+  }
+  return { snapshotCounts, snapshotReadAt };
+}
+
 // runVerifierTick — the actual verifier-batch-run + stat-computation +
 // envelope-record logic, extracted out of the POST / handler below so it
 // can be called directly from in-process schedulers (dev-request
@@ -340,15 +360,7 @@ export async function runVerifierTick(opts: {
   // dev-request 2026-10-09-lokal-agent-verifier-batch-claim-vs-snapshot-probe-
   // mismatch: claim DB-wide current-state counts for the snapshot-semantic
   // kinds. Fail-open to the legacy batch tally if the count query throws.
-  let snapshotCounts: ReturnType<typeof getSnapshotClaimCounts> | undefined;
-  // Taken BEFORE the reads, so every write during/after them falls at or
-  // after read_at and is inside the probe's drift_bound (slice 4).
-  const snapshotReadAt = new Date().toISOString();
-  try {
-    snapshotCounts = getSnapshotClaimCounts(getDb());
-  } catch (e: any) {
-    console.error(`[admin/run-verifier] snapshot claim counts failed:`, e?.message || e);
-  }
+  const { snapshotCounts, snapshotReadAt } = readSnapshotClaimCounts(getDb());
   const envelope: any = buildRunEnvelope({
     run_id: batchResult.run_id,
     started_at: batchResult.started_at,

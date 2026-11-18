@@ -2591,6 +2591,29 @@ function initSchema(db: Database.Database): void {
   // would skip the DELETE trigger since recursive_triggers is off).
   // Purely observational, no gate reads it. DROP+CREATE every boot so a
   // future edit to a trigger body actually lands.
+  //
+  // Slice 5: claim-counts also rebuilds the exact queue count as of read_at
+  // (count_at_read) from the earliest event per agent after read_at, so each
+  // event's OLD side must be the agent's real prior state. trg_aqse_agents_del
+  // is therefore BEFORE DELETE: with foreign_keys = ON the agent_knowledge row
+  // is removed by ON DELETE CASCADE before any AFTER DELETE trigger on agents
+  // runs (so an AFTER trigger logged nothing), and the cascaded
+  // trg_aqse_knowledge_del sees no agents row (old_active NULL). Likewise an
+  // agents row that did not exist before (INSERT, or the new id of an id
+  // change) logs old_status NULL: that (agent, knowledge) pair was not counted.
+  //
+  // ROLLBACK (review N3): reverting this code does NOT remove the triggers —
+  // they are stored in the SQLite file and keep writing to
+  // agent_queue_state_events. Dropping that table while they exist makes every
+  // INSERT/UPDATE/DELETE on agents/agent_knowledge fail with "no such table".
+  // A rollback must first run
+  //   DROP TRIGGER IF EXISTS trg_aqse_knowledge_ins;
+  //   DROP TRIGGER IF EXISTS trg_aqse_knowledge_upd;
+  //   DROP TRIGGER IF EXISTS trg_aqse_knowledge_del;
+  //   DROP TRIGGER IF EXISTS trg_aqse_agents_ins;
+  //   DROP TRIGGER IF EXISTS trg_aqse_agents_upd;
+  //   DROP TRIGGER IF EXISTS trg_aqse_agents_del;
+  // and only then DROP TABLE agent_queue_state_events.
   try {
     db.exec(`
       CREATE TABLE IF NOT EXISTS agent_queue_state_events (
@@ -2647,7 +2670,7 @@ function initSchema(db: Database.Database): void {
       AFTER INSERT ON agents
       BEGIN
         INSERT INTO agent_queue_state_events (agent_id, old_status, new_status, old_active, new_active)
-        SELECT NEW.id, k.verification_status, k.verification_status, NULL, NEW.is_active
+        SELECT NEW.id, NULL, k.verification_status, NULL, NEW.is_active
           FROM agent_knowledge k WHERE k.agent_id = NEW.id;
       END;
 
@@ -2661,13 +2684,13 @@ function initSchema(db: Database.Database): void {
                CASE WHEN OLD.id IS NEW.id THEN NEW.is_active END
           FROM agent_knowledge k WHERE k.agent_id = OLD.id;
         INSERT INTO agent_queue_state_events (agent_id, old_status, new_status, old_active, new_active)
-        SELECT NEW.id, k.verification_status, k.verification_status, NULL, NEW.is_active
+        SELECT NEW.id, NULL, k.verification_status, NULL, NEW.is_active
           FROM agent_knowledge k WHERE k.agent_id = NEW.id AND OLD.id IS NOT NEW.id;
       END;
 
       DROP TRIGGER IF EXISTS trg_aqse_agents_del;
       CREATE TRIGGER trg_aqse_agents_del
-      AFTER DELETE ON agents
+      BEFORE DELETE ON agents
       BEGIN
         INSERT INTO agent_queue_state_events (agent_id, old_status, new_status, old_active, new_active)
         SELECT OLD.id, k.verification_status, k.verification_status, OLD.is_active, NULL
@@ -2676,6 +2699,17 @@ function initSchema(db: Database.Database): void {
     `);
   } catch (e) {
     console.error(`[migration] agent_queue_state_events log/triggers failed:`, e);
+  }
+  // Retention (slice 5): keep 14 days (DRIFT_LOG_RETENTION_DAYS in
+  // admin-verifier-claim-counts.ts; a drift_since older than that returns
+  // null). Raw string compare in changed_at's own format, so the index is used.
+  try {
+    db.prepare(
+      `DELETE FROM agent_queue_state_events
+        WHERE changed_at < strftime('%Y-%m-%d %H:%M:%f', 'now', '-14 days')`,
+    ).run();
+  } catch (e) {
+    console.error(`[migration] agent_queue_state_events prune failed:`, e);
   }
 
   // ─── dev-request 2026-09-01-rfb-pending-verify-unpark-lever (Daniel Alternativ B,
