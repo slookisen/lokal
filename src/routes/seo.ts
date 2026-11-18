@@ -19,7 +19,7 @@
 
 import { resolveSitemapCacheTtlMs, logSlowSitemap } from "./sitemap-cache-util";
 import express, { Router, Request, Response } from "express";
-import { RFB_CHATGPT_APP_URL } from "../config/distribution-channels";
+import { RFB_CHATGPT_APP_URL, RFB_CLAUDE_CONNECTOR_URL } from "../config/distribution-channels";
 import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { resolveRouteIntent } from "../services/route-intent";
@@ -1915,7 +1915,7 @@ router.get("/", (req: Request, res: Response) => {
           <p class="ai-assist-label">${escapeHtml(t(lang, "home.ai_assist_label"))}</p>
           <div class="ai-assist-btns">
             <a href="${RFB_CHATGPT_APP_URL}" target="_blank" rel="noopener" class="ai-btn ai-chatgpt">ChatGPT</a>
-            <a href="${localizedPath("/teknologi", lang)}#claude-mcp" class="ai-btn ai-claude">Claude</a>
+            <a href="${escapeHtml(RFB_CLAUDE_CONNECTOR_URL)}" target="_blank" rel="noopener" class="ai-btn ai-claude">Claude</a>
           </div>
           <p class="ai-assist-hint">${escapeHtml(t(lang, "home.ai_assist_hint"))} <a href="${localizedPath("/teknologi", lang)}#mcp-oppsett">${escapeHtml(t(lang, "home.ai_assist_setup_link"))}</a></p>
         </div>
@@ -1993,7 +1993,7 @@ ${umbrellaSectionHtml}
           <p>${escapeHtml(t(lang, "home.ai_sec_body"))}</p>
           <div class="ai-logos">
             <a href="${RFB_CHATGPT_APP_URL}" target="_blank" rel="noopener" class="ai-logo">\u{1F4AC} ChatGPT</a>
-            <a href="${localizedPath("/teknologi", lang)}#claude-mcp" class="ai-logo">\u{1F50C} Claude MCP</a>
+            <a href="${escapeHtml(RFB_CLAUDE_CONNECTOR_URL)}" target="_blank" rel="noopener" class="ai-logo">\u{1F50C} Claude</a>
             <a href="https://github.com/slookisen/lokal" target="_blank" rel="noopener" class="ai-logo">\u{2B50} GitHub</a>
           </div>
         </div>
@@ -2631,6 +2631,7 @@ const TECH_CSS = `
   .tech-code .key { color: #7dd3fc; }
   .tech-code .val { color: #86efac; }
   .setup-guide { background: var(--white); border: 1px solid var(--g100); border-radius: var(--r-lg); padding: 28px; margin: 24px 0; }
+  .setup-cta { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; background: var(--charcoal); color: var(--white); border-radius: 10px; font-weight: 600; font-size: 0.9rem; text-decoration: none; }
   .setup-guide h3 { font-size: 1.1rem; font-weight: 700; margin-bottom: 12px; }
   .setup-guide p { font-size: 0.9rem; }
   .setup-guide code { background: #f1f5f9; padding: 2px 8px; border-radius: 4px; font-size: 0.85rem; font-family: "SF Mono", "Fira Code", monospace; color: var(--green-700); }
@@ -2738,15 +2739,17 @@ router.get("/teknologi", (req: Request, res: Response) => {
     </div>
 
     <div id="claude-mcp" class="setup-guide">
-      <h3>&#129520; Claude Desktop (Pro/Max/Team/Enterprise)</h3>
-      <p><strong>Method 1 \u2014 Remote MCP (recommended, no install):</strong></p>
+      <h3>&#129520; Claude</h3>
+      <p><strong>Method 1 \u2014 Custom connector (recommended, no install):</strong></p>
+      <p><a class="setup-cta" href="${escapeHtml(RFB_CLAUDE_CONNECTOR_URL)}" target="_blank" rel="noopener">Use in Claude &#8594;</a> \u2014 opens Claude with the name and address already filled in; just click <strong>Add</strong>. Or do it by hand:</p>
       <div class="setup-steps">
-        <div class="setup-step"><span class="step-n">1</span><div>Open Claude Desktop &rarr; <strong>Settings</strong> &rarr; <strong>Integrations</strong></div></div>
-        <div class="setup-step"><span class="step-n">2</span><div>Click <strong>"Add custom connector"</strong></div></div>
-        <div class="setup-step"><span class="step-n">3</span><div>Paste: <code>https://rettfrabonden.com/mcp</code></div></div>
+        <div class="setup-step"><span class="step-n">1</span><div>In Claude (web or desktop app), open <strong>Customize</strong> &rarr; <strong>Connectors</strong></div></div>
+        <div class="setup-step"><span class="step-n">2</span><div>Click <strong>"+"</strong> and choose <strong>"Add custom connector"</strong></div></div>
+        <div class="setup-step"><span class="step-n">3</span><div>Name: <code>Rett fra Bonden</code> \u2014 URL: <code>https://rettfrabonden.com/mcp</code> \u2014 click <strong>Add</strong></div></div>
         <div class="setup-step"><span class="step-n">4</span><div>Done! Try for example <em>"Find lamb in <span translate="no">Trondheim</span>"</em></div></div>
       </div>
-      <p style="font-size:0.82rem;color:var(--g500);margin-top:14px;"><strong>Method 2 \u2014 Local npm package</strong> (for developers, Claude Code, or Claude Desktop without Pro):</p>
+      <p style="font-size:0.82rem;color:var(--g500);">Free Claude accounts can add one custom connector. On Team and Enterprise plans, an Owner adds the connector for the organisation. Rett fra Bonden is an independent service; it is not made or endorsed by Anthropic.</p>
+      <p style="font-size:0.82rem;color:var(--g500);margin-top:14px;"><strong>Method 2 \u2014 Local npm package</strong> (for developers, Claude Code, or other local MCP clients):</p>
       <div class="setup-steps">
         <div class="setup-step"><span class="step-n">1</span><div>Install <a href="https://nodejs.org" target="_blank">Node.js</a> &rarr; Open Claude Desktop &rarr; Settings &rarr; Developer &rarr; <strong>Edit Config</strong></div></div>
         <div class="setup-step"><span class="step-n">2</span><div>Add:
@@ -2860,15 +2863,17 @@ router.get("/teknologi", (req: Request, res: Response) => {
     </div>
 
     <div id="claude-mcp" class="setup-guide">
-      <h3>&#129520; Claude Desktop (Pro/Max/Team/Enterprise)</h3>
-      <p><strong>Metode 1 \u2014 Remote MCP (anbefalt, ingen installasjon):</strong></p>
+      <h3>&#129520; Claude</h3>
+      <p><strong>Metode 1 \u2014 Egendefinert connector (anbefalt, ingen installasjon):</strong></p>
+      <p><a class="setup-cta" href="${escapeHtml(RFB_CLAUDE_CONNECTOR_URL)}" target="_blank" rel="noopener">Bruk i Claude &#8594;</a> \u2014 \u00e5pner Claude med navn og adresse ferdig utfylt; du trenger bare \u00e5 klikke <strong>Add</strong>. Eller gj\u00f8r det for h\u00e5nd:</p>
       <div class="setup-steps">
-        <div class="setup-step"><span class="step-n">1</span><div>\u00c5pne Claude Desktop &rarr; <strong>Settings</strong> &rarr; <strong>Integrations</strong></div></div>
-        <div class="setup-step"><span class="step-n">2</span><div>Klikk <strong>&laquo;Add custom connector&raquo;</strong></div></div>
-        <div class="setup-step"><span class="step-n">3</span><div>Lim inn: <code>https://rettfrabonden.com/mcp</code></div></div>
-        <div class="setup-step"><span class="step-n">4</span><div>Ferdig! Sp\u00f8r f.eks. <em>&laquo;Finn \u00f8kologisk kj\u00f8tt i Trondheim&raquo;</em></div></div>
+        <div class="setup-step"><span class="step-n">1</span><div>I Claude (nett eller skrivebordsappen), \u00e5pne <strong>Customize</strong> &rarr; <strong>Connectors</strong></div></div>
+        <div class="setup-step"><span class="step-n">2</span><div>Klikk <strong>&laquo;+&raquo;</strong> og velg <strong>&laquo;Add custom connector&raquo;</strong></div></div>
+        <div class="setup-step"><span class="step-n">3</span><div>Navn: <code>Rett fra Bonden</code> \u2014 URL: <code>https://rettfrabonden.com/mcp</code> \u2014 klikk <strong>Add</strong></div></div>
+        <div class="setup-step"><span class="step-n">4</span><div>Ferdig! Sp\u00f8r f.eks. <em>&laquo;Finn lammekj\u00f8tt i Trondheim&raquo;</em></div></div>
       </div>
-      <p style="font-size:0.82rem;color:var(--g500);margin-top:14px;"><strong>Metode 2 \u2014 Lokal npm-pakke</strong> (for utviklere, Claude Code, eller Claude Desktop uten Pro):</p>
+      <p style="font-size:0.82rem;color:var(--g500);">Gratis Claude-kontoer kan legge til \u00e9n egendefinert connector. P\u00e5 Team- og Enterprise-planer legger en Owner til connectoren for hele organisasjonen. Rett fra Bonden er en uavhengig tjeneste og er ikke laget eller anbefalt av Anthropic.</p>
+      <p style="font-size:0.82rem;color:var(--g500);margin-top:14px;"><strong>Metode 2 \u2014 Lokal npm-pakke</strong> (for utviklere, Claude Code eller andre lokale MCP-klienter):</p>
       <div class="setup-steps">
         <div class="setup-step"><span class="step-n">1</span><div>Installer <a href="https://nodejs.org" target="_blank">Node.js</a> &rarr; \u00c5pne Claude Desktop &rarr; Settings &rarr; Developer &rarr; <strong>Edit Config</strong></div></div>
         <div class="setup-step"><span class="step-n">2</span><div>Legg til:
@@ -3238,7 +3243,7 @@ router.get("/guide-mat-ai", (req: Request, res: Response) => {
   <section class="gma-sec">
     <h2>What is this?</h2>
     <p>Rett fra Bonden runs a remote <a href="${teknologiHref}">MCP (Model Context Protocol)</a> server at <code>https://rettfrabonden.com/mcp</code>. Once connected, your AI assistant can search, filter, and read our verified producer catalog directly — the same data that powers <a href="${sokHref}">the search page</a>, but callable as tools inside a conversation.</p>
-    <p>This guide lists the exact tools the server exposes and how to phrase requests to your assistant. For the connection steps themselves (ChatGPT, Claude Desktop, or the <code>lokal-mcp</code> npm package), see <a href="${teknologiHref}#mcp-oppsett">the setup guide on /teknologi</a>.</p>
+    <p>This guide lists the exact tools the server exposes and how to phrase requests to your assistant. For the connection steps themselves (ChatGPT, Claude, or the <code>lokal-mcp</code> npm package), see <a href="${teknologiHref}#mcp-oppsett">the setup guide on /teknologi</a>.</p>
 
     <h2>The tools, exactly as registered</h2>
     <p class="gma-group-label">Search &amp; discovery</p>
@@ -3276,7 +3281,8 @@ router.get("/guide-mat-ai", (req: Request, res: Response) => {
     </div>
 
     <h2>Get started</h2>
-    <p>Full connection steps for ChatGPT, Claude Desktop, and other MCP clients live on our technology page — we keep setup instructions in one place so they stay current.</p>
+    <p>Full connection steps for ChatGPT, Claude, and other MCP clients live on our technology page — we keep setup instructions in one place so they stay current.</p>
+    <p>Using Claude? <a href="${escapeHtml(RFB_CLAUDE_CONNECTOR_URL)}" target="_blank" rel="noopener">Use in Claude</a> opens Claude's "Add custom connector" dialog with Rett fra Bonden already filled in (Customize &rarr; Connectors).</p>
     <p><a class="gma-cta" href="${teknologiHref}#mcp-oppsett">Set up MCP on /teknologi →</a></p>
   </section>
 
@@ -3296,7 +3302,7 @@ router.get("/guide-mat-ai", (req: Request, res: Response) => {
   <section class="gma-sec">
     <h2>Hva er dette?</h2>
     <p>Rett fra Bonden kjører en ekstern <a href="${teknologiHref}">MCP (Model Context Protocol)</a>-server på <code>https://rettfrabonden.com/mcp</code>. Når AI-assistenten din er koblet til, kan den søke, filtrere og lese vårt verifiserte produsentregister direkte — samme data som driver <a href="${sokHref}">søkesiden</a>, men tilgjengelig som verktøy i en samtale.</p>
-    <p>Denne guiden lister verktøyene serveren eksponerer, og hvordan du kan formulere forespørsler til assistenten din. For selve tilkoblingsstegene (ChatGPT, Claude Desktop, eller npm-pakken <code>lokal-mcp</code>), se <a href="${teknologiHref}#mcp-oppsett">oppsettsguiden på /teknologi</a>.</p>
+    <p>Denne guiden lister verktøyene serveren eksponerer, og hvordan du kan formulere forespørsler til assistenten din. For selve tilkoblingsstegene (ChatGPT, Claude eller npm-pakken <code>lokal-mcp</code>), se <a href="${teknologiHref}#mcp-oppsett">oppsettsguiden på /teknologi</a>.</p>
 
     <h2>Verktøyene, slik de faktisk er registrert</h2>
     <p class="gma-group-label">Søk og oppdagelse</p>
@@ -3334,7 +3340,8 @@ router.get("/guide-mat-ai", (req: Request, res: Response) => {
     </div>
 
     <h2>Kom i gang</h2>
-    <p>Fullstendige tilkoblingssteg for ChatGPT, Claude Desktop og andre MCP-klienter finner du på teknologisiden vår — vi holder oppsettsinstruksjonene ett sted slik at de alltid er oppdaterte.</p>
+    <p>Fullstendige tilkoblingssteg for ChatGPT, Claude og andre MCP-klienter finner du på teknologisiden vår — vi holder oppsettsinstruksjonene ett sted slik at de alltid er oppdaterte.</p>
+    <p>Bruker du Claude? <a href="${escapeHtml(RFB_CLAUDE_CONNECTOR_URL)}" target="_blank" rel="noopener">Bruk i Claude</a> åpner Claudes dialog «Add custom connector» med Rett fra Bonden ferdig utfylt (Customize &rarr; Connectors).</p>
     <p><a class="gma-cta" href="${teknologiHref}#mcp-oppsett">Sett opp MCP på /teknologi →</a></p>
   </section>
 

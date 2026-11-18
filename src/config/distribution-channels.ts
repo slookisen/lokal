@@ -41,6 +41,16 @@ const A2A_DESC = "A2A protocol registry listing — direct JSON-RPC at /a2a.";
 // and carries the same literal.
 export const RFB_CHATGPT_APP_URL =
   "https://chatgpt.com/plugins/plugin_asdk_app_6acbf3965a9881918afbcacd99a8e157";
+// Rett fra Bonden in Claude — single source for every "Claude" link on the RFB site (seo.ts
+// homepage buttons + /teknologi#claude-mcp + /guide-mat-ai, discovery.ts llms.txt);
+// src/public/app.html is static and carries the same literal. RFB is not yet published in
+// Claude's connector directory (in review), so this opens Claude's pre-filled "Add custom
+// connector" dialog (name + https://rettfrabonden.com/mcp). Once published, replace it with
+// "https://claude.ai/directory/connectors/rett-fra-bonden" (one line; update app.html too).
+// Deliberately NOT a CHANNELS entry: x-distribution probes expect 200, and claude.ai
+// answers 403 to robots, so a claude.ai probe would always read as broken.
+export const RFB_CLAUDE_CONNECTOR_URL =
+  "https://claude.ai/customize/connectors?modal=add-custom-connector&connectorName=Rett%20fra%20Bonden&connectorUrl=https%3A%2F%2Frettfrabonden.com%2Fmcp";
 const DENTAL_GPT = "https://chatgpt.com/g/g-6a21e79241cc8191a04642bda508e42b-finn-tannlege-i-norge";
 
 const CHANNELS: Record<DistributionVertical, Entry[]> = {
