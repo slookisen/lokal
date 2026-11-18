@@ -15,7 +15,8 @@
  * write-pause (apply throws, tick no-op, mid-file retry); flag off / no PAT =
  * no-op with zero GitHub calls; idempotency (same file never applied twice);
  * routes (403 without key, judge-candidates shape + limit clamp, status);
- * ZERO global fetch / LLM.
+ * slice 3c-4 legacy needs_review rows (review_reason NULL) eligible, other
+ * reasons + synthetic probe not; ZERO global fetch / LLM.
  */
 
 export interface TestSummary {
@@ -424,6 +425,28 @@ export function runDentalTriageJudgementJobTests(opts: { log?: boolean } = {}): 
         assertEq([st.status, st.body.success, st.body.enabled, Array.isArray(st.body.files)], [200, true, false, true], "dtj-6n: status route (flag unset in process -> enabled false)");
         const s2 = job.getDentalTriageJudgementsStatus(db, env, { mainDb });
         assertEq([s2.enabled, s2.token_present, s2.files.length >= 4, s2.last_applied_at !== null], [true, true, true, true], "dtj-6o: status shape");
+      }
+
+      // ── dtj-8: slice 3c-4 — legacy needs_review rows (review_reason NULL). ──
+      {
+        seed({ id: "l-legacy", review_reason: null, review_since: null });
+        seed({ id: "l-other", review_reason: "some_other_reason", review_since: null });
+        seed({ id: "persistence-probe-pr100b", review_reason: null, review_since: null });
+        const sel = job.selectDentalTriageJudgeCandidates(db, 50).rows.map((r) => r.id);
+        assertTrue(sel.includes("l-legacy"), "dtj-8a: legacy NULL row is a judge candidate");
+        assertTrue(!sel.includes("l-other"), "dtj-8b: other non-null review_reason is not a candidate");
+        assertTrue(!sel.includes("persistence-probe-pr100b"), "dtj-8c: synthetic probe is not a candidate");
+        const r = apply([avvis("l-legacy"), avvis("l-other"), avvis("persistence-probe-pr100b")], { runId: "dtj-legacy" });
+        assertTrue(r.ok, "dtj-8d: apply ok");
+        if (r.ok) {
+          assertEq(r.results.map((x) => `${x.agent_id}=${x.result}:${x.reason ?? x.decision}`),
+            ["l-legacy=written:AVVIS", "l-other=rejected:not_eligible", "persistence-probe-pr100b=rejected:not_eligible"],
+            "dtj-8e: legacy row eligible, other reason + probe not_eligible");
+        }
+        const l = rowOf("l-legacy");
+        assertEq([l.verification_status, l.review_reason, l.review_since], ["rejected", null, null], "dtj-8f: legacy AVVIS -> rejected, review state cleared");
+        assertEq(exclusionsBy("dtj-legacy").length, 1, "dtj-8g: one exclusion row for the legacy AVVIS");
+        assertEq([rowOf("l-other").verification_status, rowOf("persistence-probe-pr100b").verification_status], ["needs_review", "needs_review"], "dtj-8h: non-candidates untouched");
       }
 
       assertEq(globalFetchCalls, 0, "dtj-7: ZERO global fetch (no LLM, no other host)");

@@ -15,7 +15,9 @@
  * window); limit + oldest-first ordering; the Verified rule -> verified;
  * dry-run writes nothing; Brreg failure (throw / 5xx) -> undecided, never
  * verified; admin endpoints 403 without key, /run 503 while the flag is off,
- * 423 under the pause.
+ * 423 under the pause. Slice 3c-4: legacy needs_review rows (review_reason
+ * NULL) are candidates (dry-run + real run, review state cleared, re-read
+ * guard), other non-null reasons and the synthetic probe are not.
  */
 
 export interface TestSummary {
@@ -351,6 +353,62 @@ export function runDentalTriageTests(opts: { log?: boolean } = {}): Promise<Test
       db.prepare("UPDATE dental_agents SET verification_status = 'verified' WHERE id = 't-stale'").run();
       assertEq(triage.applyDentalTriageDecision(db, staleRow, staleDecision, new Date().toISOString()), false, "stale: changed row skipped");
       assertEq([rowOf("t-stale").is_inactive, findingsOf("t-stale").length], [0, 0], "stale: no write, no audit row");
+
+      // ── Slice 3c-4: legacy needs_review rows (review_reason NULL) ───────
+      for (const org of ["900000022", "900000023", "900000025"]) {
+        brregBehaviour[org] = () => jsonResponse(410, { organisasjonsnummer: org, slettedato: "2025-01-01" });
+      }
+      brregBehaviour["900000021"] = () => jsonResponse(200, enhet("900000021"));
+      seed({ id: "l-dir", navn: "Legacy Katalog AS", org_nr: "900000021", hjemmeside: "https://legelisten.no/tannlege/legacy",
+        review_reason: null, review_since: null });
+      seed({ id: "l-deleted", navn: "Legacy Slettet AS", org_nr: "900000022", review_reason: null, review_since: null });
+      seed({ id: "l-3b", navn: "Nyere 3b AS", org_nr: "900000023", review_since: "2026-08-03T00:00:00.000Z" });
+      seed({ id: "l-other", navn: "Legacy Annen Grunn AS", org_nr: "900000024", review_reason: "some_other_reason", review_since: null });
+      seed({ id: "persistence-probe-pr100b", navn: "Probe", org_nr: "999999999", review_reason: null, review_since: null });
+      // No review_since on legacy rows: "oldest first" falls back to last_verified_at.
+      db.prepare("UPDATE dental_agents SET last_verified_at = '2026-08-01T00:00:00.000Z' WHERE id = 'l-deleted'").run();
+      db.prepare("UPDATE dental_agents SET last_verified_at = '2026-08-02T00:00:00.000Z' WHERE id = 'l-dir'").run();
+
+      assertEq(triage.pickDentalTriageCandidates(db, 50).map((r) => r.id), ["l-deleted", "l-dir", "l-3b"],
+        "3c-4 pick: legacy NULL rows are candidates, ordered by last_verified_at fallback among 3b rows");
+
+      before = snapshot();
+      const dryLegacy = await triage.computeDentalTriageDryRun({ db, fetchImpl: fakeFetch, env: {} });
+      assertEq(snapshot(), before, "3c-4 dry-run: writes nothing");
+      assertEq(dryLegacy.candidates, 3, "3c-4 dry-run: 3 candidates (2 legacy + 1 slice-3b)");
+      const lmap: Record<string, string> = {};
+      for (const d of [...dryLegacy.decisions, ...dryLegacy.undecided]) lmap[d.id] = d.decision;
+      assertEq([lmap["l-dir"], lmap["l-deleted"], lmap["l-3b"]], ["directory_homepage", "inactive", "inactive"], "3c-4 dry-run: legacy rows decided");
+      assertTrue(!("l-other" in lmap) && !("persistence-probe-pr100b" in lmap), "3c-4 dry-run: other reason + synthetic probe not candidates");
+      const dryLegacyIds = await triage.computeDentalTriageDryRun({ db, fetchImpl: fakeFetch, ids: ["l-dir", "l-other", "persistence-probe-pr100b"] });
+      assertEq(dryLegacyIds.candidates, 1, "3c-4 dry-run ids: only the legacy NULL row");
+      assertEq(dryLegacyIds.not_candidates, ["l-other", "persistence-probe-pr100b"], "3c-4 dry-run ids: other reason + probe are not_candidates");
+
+      // Re-read guard on a NULL row: changed review_reason / review_since -> skipped.
+      seed({ id: "l-stale", navn: "Legacy Endret AS", org_nr: "900000025", review_reason: null, review_since: null });
+      const lStaleRow = triage.pickDentalTriageCandidates(db, 50).find((r) => r.id === "l-stale")!;
+      assertEq([lStaleRow?.review_reason, lStaleRow?.review_since], [null, null], "3c-4 stale: picked with NULL review state");
+      const lStaleDecision = await triage.decideDentalTriage(lStaleRow, { fetchImpl: fakeFetch });
+      assertEq(lStaleDecision.decision, "inactive", "3c-4 stale: decision computed");
+      db.prepare("UPDATE dental_agents SET review_reason = 'wrong_entity_repeat' WHERE id = 'l-stale'").run();
+      assertEq(triage.applyDentalTriageDecision(db, lStaleRow, lStaleDecision, new Date().toISOString()), false, "3c-4 stale: review_reason NULL -> set, skipped");
+      db.prepare("UPDATE dental_agents SET review_reason = NULL, review_since = '2026-09-12T00:00:00.000Z' WHERE id = 'l-stale'").run();
+      assertEq(triage.applyDentalTriageDecision(db, lStaleRow, lStaleDecision, new Date().toISOString()), false, "3c-4 stale: review_since NULL -> set, skipped");
+      assertEq([rowOf("l-stale").is_inactive, findingsOf("l-stale").length], [0, 0], "3c-4 stale: no write, no audit row");
+      db.prepare("UPDATE dental_agents SET verification_status = 'verified' WHERE id = 'l-stale'").run();
+
+      // Real run (flag on): decisions applied to the NULL rows, review state cleared as for 3b rows.
+      const runLegacy = await triage.runDentalTriage({ db, fetchImpl: fakeFetch, pauseBlock: noPause, env: ON });
+      assertEq([runLegacy.candidates, runLegacy.inactive, runLegacy.directory_homepage], [3, 2, 1], "3c-4 run: 3 candidates, 2 inactive, 1 directory");
+      const lDir = rowOf("l-dir");
+      assertEq([lDir.hjemmeside, lDir.directory_url, lDir.enrichment_state, lDir.verification_status, lDir.review_reason, lDir.review_since],
+        [null, "https://legelisten.no/tannlege/legacy", "raw", "pending_verify", null, null], "3c-4 run: legacy directory row moved + review state cleared");
+      assertEq(findingsOf("l-dir").map((f) => f.status), ["directory_homepage"], "3c-4 run: legacy directory audit row");
+      assertEq([rowOf("l-deleted").is_inactive, findingsOf("l-deleted").map((f) => f.status)], [1, ["inactive"]], "3c-4 run: legacy deleted row -> inactive + audit");
+      assertEq([rowOf("l-other").verification_status, rowOf("l-other").review_reason, findingsOf("l-other").length],
+        ["needs_review", "some_other_reason", 0], "3c-4 run: other non-null reason untouched");
+      assertEq([rowOf("persistence-probe-pr100b").verification_status, findingsOf("persistence-probe-pr100b").length],
+        ["needs_review", 0], "3c-4 run: synthetic probe untouched");
 
       // ── Routes ──────────────────────────────────────────────────────────
       const routeMod = require("../routes/admin-dental-triage") as typeof import("../routes/admin-dental-triage");

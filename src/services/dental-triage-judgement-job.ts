@@ -32,7 +32,8 @@
 // file — the queue records a per-file failure and retries it later; items
 // already stored are then not_eligible, so a retry is idempotent); the row
 // exists (else not_found); it is in the 3c triage state — verification_status
-// 'needs_review', review_reason in DENTAL_TRIAGE_REVIEW_REASONS, not
+// 'needs_review', review_reason in DENTAL_TRIAGE_REVIEW_REASONS or NULL
+// (legacy verifier-set needs_review, slice 3c-4), not
 // is_inactive, not a synthetic probe (else not_eligible). Whether 3c-1 could
 // decide the row itself is not this path's concern.
 //
@@ -80,6 +81,7 @@ import { recordExclusion } from "./dental-store";
 import {
   DENTAL_TRIAGE_CANDIDATE_STATE_SQL,
   DENTAL_TRIAGE_CHECK_TYPE,
+  DENTAL_TRIAGE_ORDER_SQL,
   DENTAL_TRIAGE_REVIEW_REASONS,
   DENTAL_TRIAGE_UNDECIDED_RECHECK_DAYS,
   clampDentalTriageLimit,
@@ -497,8 +499,9 @@ export interface DentalTriageJudgeCandidate {
 }
 
 /**
- * Rows in the 3c triage state, those 3c-1 left 'undecided' first, then
- * oldest review_since. A row with an applied judgement (avvis/katalogklasse)
+ * Rows in the 3c triage state (incl. legacy review_reason NULL rows, slice
+ * 3c-4), those 3c-1 left 'undecided' first, then oldest first
+ * (DENTAL_TRIAGE_ORDER_SQL). A row with an applied judgement (avvis/katalogklasse)
  * inside DENTAL_TRIAGE_JUDGEMENT_RECHECK_DAYS is left out, so a corrected
  * class is not re-offered before 3c-1 has had a pass at it. Read-only;
  * `limit` clamped to 1..50.
@@ -524,7 +527,7 @@ export function selectDentalTriageJudgeCandidates(db: Database.Database, rawLimi
                    AND j.status IN ('avvis', 'katalogklasse')
                    AND j.checked_at > datetime('now', ?))
         ORDER BY CASE WHEN t.status = 'undecided' THEN 0 ELSE 1 END ASC,
-                 COALESCE(review_since, '9999') ASC, id ASC
+                 ${DENTAL_TRIAGE_ORDER_SQL} ASC, id ASC
         LIMIT ?`,
     )
     .all(
