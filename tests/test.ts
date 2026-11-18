@@ -52189,6 +52189,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-15-rfb-nattjobb-hull-kontaktuttrekk-bm-og-koer (B3):
+// content_refresh marks a field needs_owner after two misses (60-day hold,
+// counted in preview + envelope) and also takes contacted, verified rows the
+// gate holds from a second outreach. Fresh in-memory DB per block — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-15-rfb-nattjobb-hull (B3): rfb-enrichment-needs-owner ──");
+  try {
+    const { runRfbEnrichmentNeedsOwnerTests } = require("../src/services/rfb-enrichment-needs-owner.test") as
+      typeof import("../src/services/rfb-enrichment-needs-owner.test");
+    const rno = await runRfbEnrichmentNeedsOwnerTests({ log: false });
+    passed += rno.passed;
+    failed += rno.failed;
+    for (const f of rno.failures) failures.push("rfb-enrichment-needs-owner: " + f);
+    console.log(`  rfb-enrichment-needs-owner: ${rno.passed} passed, ${rno.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-enrichment-needs-owner: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-11-15-rfb-nattjobb-hull-kontaktuttrekk-bm-og-koer (B1-2):
 // contact_extraction also takes contact_email-not-in-knowledge rows — own-site
 // proof first, scrape fallback on rejected_not_on_site (knowledge e-mail only),
