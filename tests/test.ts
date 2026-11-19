@@ -55152,3 +55152,24 @@ runSerial(async () => {
     failures.push("google-connected-apps: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-11-15-rfb-adressekonflikt-smal-regel-torrkjoring, G1:
+// GET /admin/address-conflict-breakdown, a READ-ONLY count of the
+// address_conflict / address_uncorroborated cohort (AK1 no writes, AK2
+// sum_of_groups == total). Own in-memory DB; swaps ADMIN_KEY (restored in
+// finally), so runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── G1: adressekonflikt-telling (GET /admin/address-conflict-breakdown) ──");
+  try {
+    const { runAdminAddressConflictBreakdownTests } = require("../src/routes/admin-address-conflict-breakdown.test") as
+      typeof import("../src/routes/admin-address-conflict-breakdown.test");
+    const r = await runAdminAddressConflictBreakdownTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-address-conflict-breakdown: " + f);
+    console.log(`  admin-address-conflict-breakdown: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-address-conflict-breakdown: unexpected error: " + String(err?.message || err));
+  }
+});
