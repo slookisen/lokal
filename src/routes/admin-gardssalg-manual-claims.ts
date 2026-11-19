@@ -5,11 +5,13 @@
 //   POST /:id/approve  { apply?: true, override_reason?, note? }
 //   POST /:id/reject   { apply?: true, note? }
 // Only apply === true writes; anything else is a dry run. An applied approve
-// mails the claimant a login link (never logged or returned).
+// mails the claimant the existing claim login link (never logged or returned);
+// its first click sends the O3-4 welcome mail (OA-4 part 3, its own flag). An
+// applied reject sends the OA-4 part 4 rejection mail (receipt flag).
 
 import { Router, Request, Response } from "express";
 import { requireAdmin } from "./admin-pool-blocker-explain";
-import { decideManualClaim, listManualClaimQueue } from "../services/gardssalg-manual-claims";
+import { decideManualClaim, isManualClaimReceiptEnabled, listManualClaimQueue, sendManualClaimMail } from "../services/gardssalg-manual-claims";
 import { emailService } from "../services/email-service";
 import { maskEmail } from "../services/gardssalg-claim";
 
@@ -37,6 +39,7 @@ function decide(decision: "approve" | "reject") {
       return res.status(status).json({ success: false, error: result.error, domain_rule: result.domain_rule });
     }
     const { loginLink, ...out } = result;
+    if (decision === "reject" && !out.dry_run && isManualClaimReceiptEnabled()) sendManualClaimMail("reject", id, out.claimant_email, out.provider_name || "din profil");
     if (loginLink) {
       const verifyUrl = `${OPPLEVAGENT_BASE_URL}/kategori/gardssalg/eier/magic-link-verify?token=${loginLink.token}`;
       emailService

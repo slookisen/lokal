@@ -17,8 +17,12 @@ import {
 } from "./claim-domain-rule";
 import {
   deriveOrgLinkedEmailCandidatesWithHarvest, getClaimProviderById, grantManualQueueOwnership, hasActiveNonRevokedClaim,
-  isHjemmesideOwnershipVerified, type ClaimProviderRow, type IssuedClaim,
+  isHjemmesideOwnershipVerified, isPlausibleEmailShape, type ClaimProviderRow, type IssuedClaim,
 } from "./gardssalg-claim";
+import { gardssalgVisibleSql } from "./gardssalg-visibility";
+import { emailService } from "./email-service";
+import { crmFromHeader } from "./crm-platform-identity";
+import { MANUAL_CLAIM_TEXTS } from "../routes/gardssalg-claim-texts";
 
 const VERTICAL = "experiences";
 export const MANUAL_CLAIM_AGE_ALARM_BUSINESS_DAYS = 2;
@@ -40,6 +44,12 @@ export function businessDaysBetween(from: Date, to: Date): number {
     t = dayEnd;
   }
   return ms / DAY_MS;
+}
+
+/** The provider, or null when unknown or delisted (same visibility as the claim entry page). */
+function visibleClaimProvider(providerId: string): ClaimProviderRow | null {
+  const ok = getDb(VERTICAL).prepare(`SELECT 1 FROM experience_providers WHERE id = ? AND ${gardssalgVisibleSql("claim")}`).get(providerId);
+  return ok ? getClaimProviderById(providerId) : null;
 }
 
 export type ManualClaimReason = "not_brreg_verified" | "no_org_linked_email";
@@ -79,15 +89,15 @@ interface ManualClaimRow {
 }
 
 export type SubmitManualClaimResult =
-  | { ok: true; id: string; created: boolean; provider: ClaimProviderRow; email: string; name: string }
+  | { ok: true; id: string; created: boolean; provider: ClaimProviderRow; email: string }
   | { ok: false; error: "provider_not_found" | "invalid_input" | "already_claimed" | "self_service_available" | "too_many" };
 
 export async function submitManualClaim(providerId: string, input: Record<string, unknown>, now = new Date()): Promise<SubmitManualClaimResult> {
   const name = typeof input.name === "string" ? input.name.trim().slice(0, 200) : "";
   const email = typeof input.email === "string" ? normalizeEmail(input.email.trim()) : "";
   const message = typeof input.message === "string" ? input.message.trim().slice(0, 2000) : "";
-  if (!name || !email || email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return { ok: false, error: "invalid_input" };
-  const provider = getClaimProviderById(providerId);
+  if (!name || !email || email.length > 254 || !isPlausibleEmailShape(email) || /[,;<>()"'\\]/.test(email)) return { ok: false, error: "invalid_input" };
+  const provider = visibleClaimProvider(providerId);
   if (!provider) return { ok: false, error: "provider_not_found" };
   if (hasActiveNonRevokedClaim(providerId)) return { ok: false, error: "already_claimed" };
   const reason = await manualClaimReason(provider);
@@ -96,7 +106,7 @@ export async function submitManualClaim(providerId: string, input: Record<string
   return db.transaction((): SubmitManualClaimResult => { // dedupe + per-provider cap + insert, atomically
     const open = db.prepare(`SELECT id FROM gardssalg_manual_claims WHERE provider_id = ? AND status = 'pending' AND claimant_email = ?`)
       .get(providerId, email) as { id: string } | undefined;
-    if (open) return { ok: true, id: open.id, created: false, provider, email, name };
+    if (open) return { ok: true, id: open.id, created: false, provider, email };
     const pending = db.prepare(`SELECT COUNT(*) AS n FROM gardssalg_manual_claims WHERE provider_id = ? AND status = 'pending'`).get(providerId) as { n: number };
     if (pending.n >= MANUAL_CLAIM_MAX_PENDING_PER_PROVIDER) return { ok: false, error: "too_many" };
     const id = `gsm_${crypto.randomBytes(8).toString("hex")}`;
@@ -104,12 +114,24 @@ export async function submitManualClaim(providerId: string, input: Record<string
       `INSERT INTO gardssalg_manual_claims (id, provider_id, claimant_name, claimant_email, message, reason, status, created_at)
        VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`,
     ).run(id, providerId, name, email, message || null, reason, now.toISOString());
-    return { ok: true, id, created: true, provider, email, name };
+    return { ok: true, id, created: true, provider, email };
   })();
 }
 
-export function markManualClaimReceiptSent(id: string, now: Date = new Date()): void {
-  getDb(VERTICAL).prepare(`UPDATE gardssalg_manual_claims SET receipt_sent_at = ? WHERE id = ?`).run(now.toISOString(), id);
+/** The OA-4 part 4 receipt / rejection mail to the queue row's address (fire-and-forget; never throws).
+ *  The caller checks isManualClaimReceiptEnabled(). A sent receipt stamps receipt_sent_at. */
+export function sendManualClaimMail(kind: "receipt" | "reject", id: string, to: string, providerName: string): void {
+  const fill = (t: string) => t.split("{produsent}").join(providerName);
+  const text = fill(MANUAL_CLAIM_TEXTS[`claim.manual.${kind}.body`]);
+  const esc = (t: string) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  const html = `<p>${text.split("\n\n").map((p) => esc(p).split("\n").join("<br />")).join("</p><p>")}</p>`;
+  emailService
+    .sendEmail({ to, subject: fill(MANUAL_CLAIM_TEXTS[`claim.manual.${kind}.subject`]), textContent: text, htmlContent: html, replyTo: "kontakt@opplevagent.no", from: crmFromHeader("experiences") })
+    .then((r) => {
+      if (!r.success || r.messageId === "DRY_RUN") return console.error(`[gardssalg-manual-claims] ${kind} mail for ${id} was not sent`);
+      if (kind === "receipt") getDb(VERTICAL).prepare(`UPDATE gardssalg_manual_claims SET receipt_sent_at = ? WHERE id = ?`).run(new Date().toISOString(), id);
+    })
+    .catch((e) => console.error(`[gardssalg-manual-claims] ${kind} mail error:`, e instanceof Error ? e.message : "error"));
 }
 
 /** The pending queue, oldest first, with age per row (AK1). */
@@ -163,7 +185,7 @@ export function decideManualClaim(id: string, decision: "approve" | "reject", op
     const row = db.prepare(`SELECT * FROM gardssalg_manual_claims WHERE id = ?`).get(id) as ManualClaimRow | undefined;
     if (!row) return { ok: false, error: "not_found" };
     if (row.status !== "pending") return { ok: false, error: "not_pending" };
-    const provider = getClaimProviderById(row.provider_id);
+    const provider = visibleClaimProvider(row.provider_id);
     if (!provider) return { ok: false, error: "provider_not_found" };
     const oldValue = ownershipState(row.provider_id);
     const base = { id, decision, provider_id: row.provider_id, old_value: oldValue, claimant_email: row.claimant_email, provider_name: provider.navn };
