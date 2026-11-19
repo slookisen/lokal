@@ -2525,6 +2525,24 @@ export function promoteSelfRegisteredDraftClaim(claimId: string): boolean {
 }
 
 /**
+ * O3-5 (services/gardssalg-manual-claims.ts): an admin-approved manual claim.
+ * The same ownership model as promoteSelfRegisteredDraftClaim(): an owner
+ * row ("manual", used=1, content_source='claim', claimed_at), plus a separate
+ * login-link row to the same address for the route to mail. Other addresses'
+ * open access is revoked first (O3-3, flag-gated). Call inside the approval
+ * transaction; the caller checks hasActiveNonRevokedClaim() first.
+ */
+export function grantManualQueueOwnership(providerId: string, email: string): { ownerClaimId: string; loginLink: IssuedClaim } | null {
+  const normalized = normalizeEmail(email);
+  if (!normalized || !isPlausibleEmailShape(normalized)) return null;
+  const db = getDb(VERTICAL);
+  revokeGardssalgOwnerAccessOnOwnershipChange(db, providerId, { keepEmail: normalized, changedBy: "admin" });
+  const owner = insertGardssalgClaimRow(providerId, normalized, "manual");
+  markClaimUsedAndLockProvider(db, owner.claimId, providerId);
+  return { ownerClaimId: owner.claimId, loginLink: insertGardssalgClaimRow(providerId, normalized, "manual") };
+}
+
+/**
  * Skive 3: the owner login link mailed on approval of a self-registration —
  * an ordinary magic-link row (insertGardssalgClaimRow, email_source
  * 'self_registered') to the address the submitter typed, opened through

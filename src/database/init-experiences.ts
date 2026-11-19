@@ -1367,6 +1367,33 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.log(`[experiences] gardssalg_claims init skipped: ${(e as Error).message}`);
   }
 
+  // ─── gardssalg_manual_claims (O3-5): the admin queue for owner claims without
+  // self-service (services/gardssalg-manual-claims.ts). Additive; may stay on rollback.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS gardssalg_manual_claims (
+        id TEXT PRIMARY KEY,
+        provider_id TEXT NOT NULL REFERENCES experience_providers(id) ON DELETE CASCADE,
+        claimant_name TEXT NOT NULL,
+        claimant_email TEXT NOT NULL,
+        message TEXT,
+        reason TEXT NOT NULL, -- 'not_brreg_verified' | 'no_org_linked_email'
+        status TEXT NOT NULL DEFAULT 'pending', -- 'pending' | 'approved' | 'rejected'
+        created_at TEXT NOT NULL,
+        decided_at TEXT,
+        decision_note TEXT,
+        domain_rule TEXT, -- JSON: the domain rule's outcome at decision time
+        old_value TEXT, -- JSON: the provider's ownership state before the decision
+        granted_claim_id TEXT,
+        receipt_sent_at TEXT
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_manual_claims_status ON gardssalg_manual_claims(status, created_at)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_manual_claims_provider ON gardssalg_manual_claims(provider_id)`);
+  } catch (e) {
+    console.log(`[experiences] gardssalg_manual_claims init skipped: ${(e as Error).message}`);
+  }
+
   // ─── claimed_at (dev-request 2026-08-03-claim-bekreftet-merke-og-innlogging)
   // ────────────────────────────────────────────────────────────────────────
   // Additive, explicit "has this profile ever been claimed" signal — distinct

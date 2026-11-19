@@ -35,3 +35,24 @@ export const CLAIM_CONFIRM_TEXTS = {
   "claim.confirm.notMe": "Dette er ikke meg",
   "claim.confirm.notMe.done": "Ingenting er endret. Du kan lukke siden.",
 } as const;
+
+// Slice O3-5 (manual claim queue): NOT YET APPROVED. Added to the OA-4 pack as
+// «Tillegg fra skive O3-5» for Daniel's approval; shown/sent only behind
+// GARDSSALG_CLAIM_MANUAL_QUEUE_ENABLED (form) and
+// GARDSSALG_CLAIM_MANUAL_QUEUE_RECEIPT_ENABLED (receipt), both default off.
+// `{produsent}` is the provider's name, `{navn}` the claimant's.
+export const MANUAL_CLAIM_TEXTS = {
+  "manualClaim.heading": "Be om å ta over profilen",
+  "manualClaim.intro":
+    "Vi kan ikke bekrefte automatisk at du representerer {produsent}. Send oss navnet og e-postadressen din, så vurderer vi kravet manuelt.",
+  "manualClaim.name": "Navnet ditt",
+  "manualClaim.email": "E-postadressen din",
+  "manualClaim.message": "Hvordan er du knyttet til stedet? (valgfritt)",
+  "manualClaim.button": "Send kravet",
+  "manualClaim.done": "Takk. Vi har fått kravet ditt og svarer deg på e-post.",
+  "manualClaim.invalid": "Fyll inn navnet ditt og en gyldig e-postadresse.",
+  "manualClaim.failed": "Vi kunne ikke ta imot kravet nå. Prøv igjen senere, eller skriv til kontakt@opplevagent.no.",
+  "manualClaim.receipt.subject": "Vi har fått kravet ditt om profilen til {produsent}",
+  "manualClaim.receipt.body":
+    "Hei {navn},\n\nVi har fått kravet ditt om å ta over profilen til {produsent} på Opplevagent. Vi sjekker det manuelt og svarer deg på denne adressen.\n\nHar du ikke sendt dette kravet selv, kan du se bort fra denne e-posten.\n\nHilsen\nOpplevagent",
+} as const;
