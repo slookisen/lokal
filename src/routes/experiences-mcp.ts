@@ -123,8 +123,14 @@ import {
   guestRefEnabled,
   issueGuestRef,
   guestStatusUrl,
+  verifyGuestRef,
+  guestDecisionUrl,
+  previsitExpiryDueMs,
+  osloDatetimeLocalToUtcIso,
+  type GardssalgBooking,
 } from "../services/booking-store";
-import { dropFristSentences, fillOa1, formatOsloInstant } from "../services/gardssalg-honest-receipt";
+import { dropFristSentences, fillOa1, formatOsloInstant, loadReceiptProvider } from "../services/gardssalg-honest-receipt";
+import { getCancelInfo } from "../services/gardssalg-cancel";
 import { producerNotifyAddressStatus } from "../services/gardssalg-booking-followup";
 import { checkGardssalgBookingGuard, duplicateMessage, capReachedMessage } from "../services/gardssalg-booking-caps";
 // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 item 7: one
@@ -159,7 +165,15 @@ import {
 } from "../services/gardssalg-booking-resolve";
 
 import { EXPERIENCES_LIST_HTML, EXPERIENCE_DETAIL_HTML } from "./opplevagent-widgets";
-import { createMcpRateLimiters, MCP_RATE_LIMIT_PROFILES } from "../middleware/mcp-rate-limit";
+import rateLimit from "express-rate-limit";
+import {
+  createMcpRateLimiters,
+  MCP_RATE_LIMIT_PROFILES,
+  googleRangesAwareMax,
+  isSideEffectToolCall,
+  mcpIpKey,
+  sendMcpRateLimited,
+} from "../middleware/mcp-rate-limit";
 import { conversationService, buildRequestMeta, type RequestMeta } from "../services/conversation-service";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
@@ -255,6 +269,24 @@ export const EXPERIENCES_MCP_SIDE_EFFECT_TOOLS: ReadonlySet<string> = MCP_RATE_L
 // consumer key, else per IP), then the book_gardssalg quota. Not
 // jsonRpcLimiter, which /a2a keeps. See middleware/mcp-rate-limit.ts.
 router.use(createMcpRateLimiters({ ...MCP_RATE_LIMIT_PROFILES.experiences, isKnownSession: hasExperiencesMcpSession }).chain);
+
+// O5-2: get_gardssalg_booking gets its own, stricter quota on top of the chain
+// above, built the same way as the chain's side-effect quota (JSON-RPC 429
+// body, IP key, Google-ranges aware) but in a separate bucket, so status
+// lookups and visit requests never use up each other's calls. Skipped for
+// every other request, so nothing else changes.
+export const GARDSSALG_STATUS_LOOKUP_TOOLS: ReadonlySet<string> = new Set(["get_gardssalg_booking"]);
+export const GARDSSALG_STATUS_LOOKUP_LIMIT = { windowMs: 60 * 1000, max: 20 } as const;
+router.use(rateLimit({
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { trustProxy: false, creationStack: false },
+  handler: sendMcpRateLimited,
+  windowMs: GARDSSALG_STATUS_LOOKUP_LIMIT.windowMs,
+  max: googleRangesAwareMax(GARDSSALG_STATUS_LOOKUP_LIMIT.max, mcpIpKey),
+  keyGenerator: mcpIpKey,
+  skip: (req) => !isSideEffectToolCall(req.body, GARDSSALG_STATUS_LOOKUP_TOOLS),
+}));
 
 // ─── Conversation logging (dev-request 2026-07-10-opplevagent-conversation-logging, slice 1) ──
 // Deliberate, narrow exception to this module's content-isolation from the rfb DB:
@@ -610,6 +642,115 @@ export function bookOkMessage(vars: { ref: string; produsent: string; epost: str
       .split("{status_url}").join(vars.statusUrl);
   };
   return `${one("nb")} / ${one("en")}`;
+}
+
+// O5-2 (same dev-request): get_gardssalg_booking, behind
+// GARDSSALG_MCP_STATUS_TOOL_ENABLED (off unless exactly "true"; read when a
+// session's tools are registered). Off: the tool is not registered and
+// tools/list is byte-identical.
+export function gardssalgStatusToolEnabled(): boolean {
+  return process.env.GARDSSALG_MCP_STATUS_TOOL_ENABLED === "true";
+}
+
+export const GetGardssalgBookingInputSchema = {
+  booking_ref: z.string().max(200).describe("booking_ref from the book_gardssalg result."),
+  guest_ref: z.string().max(200).describe("guest_ref from the book_gardssalg result."),
+};
+
+// Verbatim from the approved text package OA-2 §C4 (A2A marketing-drafts/
+// 2026-11-12-opplevagent-tekstpakke-oa-2.md, approved by Daniel 2026-11-15).
+// Do not reword here. Keys are the package's `status.*` keys.
+export const GET_GARDSSALG_BOOKING_TITLE = "Check the status of a visit request";
+export const GET_GARDSSALG_BOOKING_SHORT_TITLE = "Get visit request status";
+export const GET_GARDSSALG_BOOKING_DESCRIPTION =
+  "Use this to look up a visit request made with book_gardssalg. It returns the current status (waiting for the producer, confirmed, new time suggested, declined, expired or cancelled), the agreed or suggested time, the reply deadline, the guest's own status page and, when the producer has suggested a new time, the link where the guest replies. It needs the reference and the guest_ref that book_gardssalg returned. It only reads and never changes the request. If the reference and guest_ref do not match a request, it answers that the request was not found.";
+export const GARDSSALG_STATUS_TEXT = {
+  pending: { nb: "Venter på svar fra {produsent}. Svarfrist: {frist}.", en: "Waiting for a reply from {produsent}. Reply deadline: {frist}." },
+  confirmed: { nb: "Besøket er bekreftet: {tid}.", en: "The visit is confirmed: {tid}." },
+  suggested: {
+    nb: "{produsent} foreslår {nytt_tidspunkt}. Gjesten svarer her: {svarlenke}. Svarfrist: {frist}.",
+    en: "{produsent} suggests {nytt_tidspunkt}. The guest replies here: {svarlenke}. Reply deadline: {frist}.",
+  },
+  declined: { nb: "{produsent} kunne ikke bekrefte forespørselen.", en: "{produsent} could not confirm the request." },
+  expired: { nb: "Forespørselen utløp uten svar.", en: "The request expired without a reply." },
+  cancelledByGuest: { nb: "Avlyst av gjesten {avlyst_tid}.", en: "Cancelled by the guest {avlyst_tid}." },
+  cancelledByProducer: { nb: "Avlyst av produsenten {avlyst_tid}.", en: "Cancelled by the producer {avlyst_tid}." },
+  withdrawnByGuest: { nb: "Trukket av gjesten {avlyst_tid}.", en: "Withdrawn by the guest {avlyst_tid}." },
+  notFound: {
+    nb: "Finner ikke forespørselen. Sjekk referansen, eller åpne statuslenken i e-posten.",
+    en: "The request was not found. Check the reference, or open the status link in the email.",
+  },
+} as const;
+export type GardssalgStatusKey = keyof typeof GARDSSALG_STATUS_TEXT;
+
+/** A status text filled, "norsk / English"; times per language; no deadline -> its sentence is dropped. */
+export function gardssalgStatusText(key: GardssalgStatusKey, vars: (lang: "nb" | "en") => Record<string, string> = () => ({})): string {
+  const one = (lang: "nb" | "en"): string => {
+    const v = vars(lang);
+    const template = "frist" in v && !v.frist ? dropFristSentences(GARDSSALG_STATUS_TEXT[key][lang]) : GARDSSALG_STATUS_TEXT[key][lang];
+    // Split/join, not fillOa1: {nytt_tidspunkt} and {avlyst_tid} have "_".
+    return Object.entries(v).reduce((t, [k, val]) => t.split(`{${k}}`).join(val), template);
+  };
+  return `${one("nb")} / ${one("en")}`;
+}
+
+/** The one answer for every lookup that does not match a request (wrong reference or wrong guest_ref). */
+export function gardssalgBookingNotFoundPayload(): Record<string, unknown> {
+  return { found: false, message: gardssalgStatusText("notFound") };
+}
+
+/** get_gardssalg_booking's result for a verified booking. No guest personal data. */
+export function gardssalgBookingStatusPayload(booking: GardssalgBooking): Record<string, unknown> {
+  const produsent = loadReceiptProvider(booking.provider_id).navn || booking.provider_id;
+  const iso = (slot: string | null): string | null => (slot ? osloDatetimeLocalToUtcIso(slot) ?? slot : null);
+  const at = (slot: string | null, lang: "nb" | "en"): string => formatOsloInstant(iso(slot), lang);
+  let key: GardssalgStatusKey;
+  let fristIso: string | null = null;
+  let replyUrl: string | null = null;
+  let cancelledAt: string | null = null;
+  if (booking.status === "cancelled") {
+    // Only gardssalg-cancel.ts writes 'cancelled', always with cancelled_by.
+    const info = getCancelInfo(booking.booking_id);
+    key = info?.cancelled_by === "producer"
+      ? "cancelledByProducer"
+      : booking.pre_status === "provider_confirmed" ? "cancelledByGuest" : "withdrawnByGuest";
+    cancelledAt = info?.cancelled_at ?? booking.resolved_at;
+  } else if (booking.pre_status === "time_suggested") {
+    key = "suggested";
+    const due = previsitExpiryDueMs(booking);
+    fristIso = Number.isFinite(due) ? new Date(due).toISOString() : null;
+    replyUrl = guestDecisionUrl(booking);
+  } else if (booking.pre_status === "provider_confirmed") {
+    key = "confirmed";
+  } else if (booking.pre_status === "provider_declined") {
+    key = "declined";
+  } else if (booking.pre_status === "expired") {
+    key = "expired";
+  } else {
+    key = "pending";
+    fristIso = booking.respond_token_expires_at;
+  }
+  const message = gardssalgStatusText(key, (lang) => ({
+    produsent,
+    tid: at(booking.slot_at, lang),
+    nytt_tidspunkt: at(booking.suggested_slot_at, lang),
+    svarlenke: replyUrl ?? "",
+    frist: formatOsloInstant(fristIso, lang),
+    avlyst_tid: formatOsloInstant(iso(cancelledAt), lang),
+  }));
+  return {
+    found: true,
+    booking_ref: booking.booking_ref,
+    status: key,
+    message,
+    provider: { navn: produsent },
+    // Agreed time once confirmed, otherwise the requested time.
+    slot_at_local: formatOsloInstant(iso(booking.slot_at), "nb"),
+    ...(key === "suggested" ? { suggested_slot_at_local: formatOsloInstant(iso(booking.suggested_slot_at), "nb") } : {}),
+    ...(fristIso ? { reply_deadline_local: formatOsloInstant(fristIso, "nb") } : {}),
+    status_url: guestStatusUrl(booking),
+    ...(replyUrl ? { reply_url: replyUrl } : {}),
+  };
 }
 
 // ─── Tool registrations ──────────────────────────────────────
@@ -1783,6 +1924,44 @@ export function registerExperienceTools(
       }
     }
   );
+
+  // O5-2: registered last and only with the flag on, so tools/list with the
+  // flag off is byte-identical. Reads only. A wrong reference and a wrong
+  // guest_ref get the same answer and no booking data. Rate limited by
+  // GARDSSALG_STATUS_LOOKUP_LIMIT (router.use above). Logs nothing about the
+  // guest, the reference or the guest_ref.
+  if (gardssalgStatusToolEnabled()) {
+    server.registerTool(
+      "get_gardssalg_booking",
+      {
+        title: GET_GARDSSALG_BOOKING_TITLE,
+        description: GET_GARDSSALG_BOOKING_DESCRIPTION,
+        inputSchema: GetGardssalgBookingInputSchema,
+        annotations: {
+          title: GET_GARDSSALG_BOOKING_SHORT_TITLE,
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          // Closed world: reads Opplevagent's own booking table, sends nothing.
+          openWorldHint: false,
+        },
+      },
+      async ({ booking_ref, guest_ref }) => {
+        try {
+          const booking = verifyGuestRef(booking_ref, guest_ref);
+          try {
+            logExperiencesInteraction({
+              skill: "get_gardssalg_booking",
+              ctx: { clientIdentity: getClientIdentity?.(), requestMeta: getRequestMeta?.() },
+            });
+          } catch { /* fail-open: never affects the tool result */ }
+          return jsonToolResult(booking ? gardssalgBookingStatusPayload(booking) : gardssalgBookingNotFoundPayload());
+        } catch (err: any) {
+          return toolInternalError("get_gardssalg_booking", err);
+        }
+      }
+    );
+  }
 }
 
 // ─── Session management ──────────────────────────────────────
