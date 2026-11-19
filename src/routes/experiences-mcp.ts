@@ -120,7 +120,11 @@ import {
   // checkBookingSlotAllowed() — see that call site's own comment.
   normaliseBookingSlotInput,
   getBookingByRef,
+  guestRefEnabled,
+  issueGuestRef,
+  guestStatusUrl,
 } from "../services/booking-store";
+import { dropFristSentences, fillOa1, formatOsloInstant } from "../services/gardssalg-honest-receipt";
 import { producerNotifyAddressStatus } from "../services/gardssalg-booking-followup";
 import { checkGardssalgBookingGuard, duplicateMessage, capReachedMessage } from "../services/gardssalg-booking-caps";
 // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 item 7: one
@@ -584,6 +588,29 @@ export const BookGardssalgInputSchema = {
     "Set to true only when RETRYING after a previous call to this tool returned outside_hours:true and the requested time should be kept anyway, despite falling outside the producer's stated opening hours. Omit on a first attempt."
   ),
 };
+
+// O5-1 (dev-request 2026-11-12-opplevagent-o5-besok-i-chatgpt-og-assistenter):
+// the book_gardssalg success text behind GARDSSALG_MCP_GUEST_REF_ENABLED.
+// Verbatim from the approved text package OA-2 §C3 key `book.ok` (A2A
+// marketing-drafts/2026-11-12-opplevagent-tekstpakke-oa-2.md, approved by
+// Daniel 2026-11-15). Do not reword here. Placeholders as in OA-1.
+export const BOOK_OK_TEXT = {
+  nb: "Forespørselen er mottatt ({ref}) og venter på svar fra {produsent}. Besøket er ikke bekreftet. Vi sender en kvittering til {e-post} og et varsel til produsenten, som svarer innen {frist}. Status: {status_url}",
+  en: "Request received ({ref}), waiting for a reply from {produsent}. The visit is not confirmed. We are sending a receipt to {e-post} and a notice to the producer, who will reply by {frist}. Status: {status_url}",
+} as const;
+
+/** `book.ok` filled, "norsk / English" like the tool's other result texts. */
+export function bookOkMessage(vars: { ref: string; produsent: string; epost: string; fristIso: string | null; statusUrl: string }): string {
+  const one = (lang: "nb" | "en"): string => {
+    const frist = formatOsloInstant(vars.fristIso, lang);
+    // No answer deadline: drop only the {frist} sentence (OA-1 review N1).
+    const template = frist ? BOOK_OK_TEXT[lang] : dropFristSentences(BOOK_OK_TEXT[lang]);
+    // fillOa1 only matches [a-zæøå-] names, so the OA-2 {status_url} is filled here.
+    return fillOa1(template, { ref: vars.ref, produsent: vars.produsent, "e-post": vars.epost, frist })
+      .split("{status_url}").join(vars.statusUrl);
+  };
+  return `${one("nb")} / ${one("en")}`;
+}
 
 // ─── Tool registrations ──────────────────────────────────────
 
@@ -1665,6 +1692,19 @@ export function registerExperienceTools(
           };
         }
 
+        // O5-1: the guest's secret reference, only with the flag on (flag off:
+        // nothing generated or stored, result byte-identical). Fail-open: a
+        // failure here never fails the already-stored request; the result
+        // then simply has no guest_ref. Never log the reference.
+        let guestRef: string | null = null;
+        if (guestRefEnabled()) {
+          try {
+            guestRef = issueGuestRef(booking.booking_id);
+          } catch {
+            console.error("[book_gardssalg] guest_ref not issued", booking.booking_ref);
+          }
+        }
+
         // Fire-and-forget — the SAME two sends POST /api/opplevelser/book
         // triggers, never blocking the tool response on either.
         sendBookingConfirmation(booking).catch((e) =>
@@ -1689,10 +1729,7 @@ export function registerExperienceTools(
         // resolve its own booking. This tool has no way to confirm a
         // booking — only the PRODUCER's own response (via their emailed
         // respond-link) can do that.
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
+        const result = {
               success: true,
               pending: true,
               status: booking.status,
@@ -1716,7 +1753,29 @@ export function registerExperienceTools(
                 `email has been sent to ${booking.guest_email}; the producer has been notified and will ` +
                 `respond by email (confirm, propose another time, or decline) — the booking only becomes ` +
                 `final once the producer responds, and this tool can never confirm it itself.`,
-            }, null, 2),
+        };
+        // O5-1 (flag on): + guest_ref and the guest's own read-only status page
+        // (the same link the receipt e-mail carries), and the OA-2 `book.ok`
+        // text: the e-mails are being sent, not already sent.
+        const statusUrl = guestRef ? guestStatusUrl(booking) : null;
+        const payload = guestRef && statusUrl
+          ? {
+              ...result,
+              guest_ref: guestRef,
+              status_url: statusUrl,
+              message: bookOkMessage({
+                ref: booking.booking_ref,
+                produsent: providerInfo?.navn || parsed.data.provider_id,
+                epost: booking.guest_email,
+                fristIso: booking.respond_token_expires_at,
+                statusUrl,
+              }),
+            }
+          : result;
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify(payload, null, 2),
           }],
         };
       } catch (err: any) {

@@ -10,6 +10,7 @@
 // Never auto-sends — Daniel (producer) resolves each booking manually
 // via the tokenized confirm URL. No funds move in Phase 2.
 
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { v4 as uuid } from "uuid";
 import { z } from "zod";
 import { getDb } from "../database/db-factory";
@@ -416,6 +417,44 @@ export function getBookingByRef(booking_ref: string): GardssalgBooking | null {
     .prepare("SELECT * FROM gardssalg_bookings WHERE booking_ref = ?")
     .get(booking_ref) as Record<string, unknown> | undefined;
   return row ? hydrate(row) : null;
+}
+
+// ─── O5-1: the guest's secret reference (guest_ref) ─────────────────────────
+// dev-request 2026-11-12-opplevagent-o5-besok-i-chatgpt-og-assistenter. A
+// high-entropy secret handed to the AI assistant in the book_gardssalg result
+// (behind GARDSSALG_MCP_GUEST_REF_ENABLED) so a later slice (O5-2) can let the
+// same conversation read the status. Only its SHA-256 hex is stored
+// (gardssalg_bookings.guest_ref_hash); the reference itself is never stored
+// or logged, and the hash never leaves this module.
+
+export function guestRefEnabled(): boolean {
+  return process.env.GARDSSALG_MCP_GUEST_REF_ENABLED === "true";
+}
+
+function hashGuestRef(guestRef: string): string {
+  return createHash("sha256").update(guestRef, "utf8").digest("hex");
+}
+
+/** Issues a new guest_ref for the booking, stores only its hash, returns the reference. */
+export function issueGuestRef(booking_id: string): string {
+  const guestRef = randomBytes(24).toString("base64url");
+  getDb(VERTICAL)
+    .prepare("UPDATE gardssalg_bookings SET guest_ref_hash = ? WHERE booking_id = ?")
+    .run(hashGuestRef(guestRef), booking_id);
+  return guestRef;
+}
+
+/** booking_ref + guest_ref -> the booking, or null on any mismatch (constant-time hash compare). */
+export function verifyGuestRef(booking_ref: unknown, guest_ref: unknown): GardssalgBooking | null {
+  if (typeof booking_ref !== "string" || !booking_ref || typeof guest_ref !== "string" || !guest_ref) return null;
+  const row = getDb(VERTICAL)
+    .prepare("SELECT * FROM gardssalg_bookings WHERE booking_ref = ?")
+    .get(booking_ref) as Record<string, unknown> | undefined;
+  const stored = typeof row?.guest_ref_hash === "string" ? row.guest_ref_hash : "";
+  if (!row || !/^[0-9a-f]{64}$/.test(stored)) return null;
+  const a = Buffer.from(stored, "hex");
+  const b = Buffer.from(hashGuestRef(guest_ref), "hex");
+  return timingSafeEqual(a, b) ? hydrate(row) : null;
 }
 
 export function getBookingByToken(
@@ -1208,7 +1247,8 @@ function slotNb(slot: string | null): string {
   });
 }
 
-function guestStatusUrl(booking: GardssalgBooking): string | null {
+/** The guest's read-only status page — the same link the guest e-mails carry. */
+export function guestStatusUrl(booking: GardssalgBooking): string | null {
   return booking.guest_status_token
     ? `${APP_URL}/kategori/gardssalg/status/${encodeURIComponent(booking.booking_ref)}/${booking.guest_status_token}`
     : null;

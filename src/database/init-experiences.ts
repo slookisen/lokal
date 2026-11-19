@@ -1158,6 +1158,13 @@ export function initExperiencesSchema(db: Database.Database): void {
   // nullable; existing rows stay NULL.
   try { db.exec("ALTER TABLE gardssalg_bookings ADD COLUMN guest_reminder_sent_at TEXT"); } catch { /* already present */ }
 
+  // ─── O5-1: the guest's secret reference for AI assistants (dev-request
+  // 2026-11-12-opplevagent-o5-besok-i-chatgpt-og-assistenter). Only the
+  // SHA-256 hex of guest_ref is stored, never the reference itself. Written
+  // only by issueGuestRef() in services/booking-store.ts, behind
+  // GARDSSALG_MCP_GUEST_REF_ENABLED. Additive, nullable; existing rows stay NULL.
+  try { db.exec("ALTER TABLE gardssalg_bookings ADD COLUMN guest_ref_hash TEXT"); } catch { /* already present */ }
+
   // ─── O4-3: the confirmed address for visit requests (same dev-request) ───
   // One row per producer: the confirmed address and the pending single-use
   // link (stored only as its SHA-256 hash). Written only by

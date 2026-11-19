@@ -33215,6 +33215,19 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gmbk.failures) failures.push("opplevelser-gardssalg-mcp-booking: " + f);
     console.log(`  opplevelser-gardssalg-mcp-booking: ${gmbk.passed} passed, ${gmbk.failed} failed`);
 
+    // O5-1 (dev-request 2026-11-12-opplevagent-o5-besok-i-chatgpt-og-
+    // assistenter): guest_ref + status_url in the book_gardssalg result behind
+    // GARDSSALG_MCP_GUEST_REF_ENABLED; flag off byte-identical, tools/list
+    // unchanged, guest_ref stored only as a hash and never logged.
+    console.log("\n── opplevelser-gardssalg-mcp-guest-ref-o5-1: guest_ref + status_url behind flag ──");
+    const { runOpplevelserGardssalgMcpGuestRefTests } = require("../src/routes/opplevelser-gardssalg-mcp-guest-ref-o5-1.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-mcp-guest-ref-o5-1.test");
+    const gmgr = await runOpplevelserGardssalgMcpGuestRefTests({ log: false });
+    passed += gmgr.passed;
+    failed += gmgr.failed;
+    for (const f of gmgr.failures) failures.push("opplevelser-gardssalg-mcp-guest-ref-o5-1: " + f);
+    console.log(`  opplevelser-gardssalg-mcp-guest-ref-o5-1: ${gmgr.passed} passed, ${gmgr.failed} failed`);
+
     // dev-request 2026-10-03-booking-avlistet-produsent-bypass: a catalog_hidden=1
     // (delisted) producer is never dispatched to; the test provider has its own
     // is_test_provider identity. Unit matrix + POST /book + book_gardssalg + migration.
