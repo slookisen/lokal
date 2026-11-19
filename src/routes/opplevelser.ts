@@ -871,6 +871,8 @@ import {
   GARDSSALG_OUTREACH_FOLLOWUP_TEMPLATES,
 } from "../services/email-service";
 import { crmService } from "../services/crm-service";
+import { renderGardssalgClaimMagicLink } from "../services/email-service";
+import { archiveGardssalgClaimMail, isGardssalgClaimWelcomeEmailEnabled, GARDSSALG_CLAIM_CRM_LINK_PLACEHOLDER } from "../services/gardssalg-claim-crm-archive";
 import { crmSenderAddress } from "../services/crm-platform-identity";
 // Used by isGardssalgEpostSynthesisPatternMatch() below (AC6 epost-synthesis
 // audit) — re-added after the post@<domain> claim-derivation tier that used
@@ -10997,6 +10999,18 @@ router.post("/admin/gardssalg-claim-grant", requireAdmin, (req: Request, res: Re
     })
     .then((r) => {
       if (!r.success) console.error(`[gardssalg-claim-grant] send failed for ${providerId}: ${r.error}`);
+      // O3-4: with the welcome flag on, the sent claim link is filed in the
+      // producer's CRM thread with a placeholder instead of the link.
+      if (isGardssalgClaimWelcomeEmailEnabled()) {
+        archiveGardssalgClaimMail({
+          kind: "magic_link",
+          providerId,
+          claimId: result.claim.claimId,
+          to: result.claim.email,
+          rendered: renderGardssalgClaimMagicLink(provider.navn || "din profil", GARDSSALG_CLAIM_CRM_LINK_PLACEHOLDER),
+          sendResult: r,
+        });
+      }
     })
     .catch((e) => console.error("[gardssalg-claim-grant] send error:", e));
 

@@ -52801,6 +52801,24 @@ runSerial(async () => {
   }
 });
 
+// A2A dev-request 2026-11-12-opplevagent-o3-eierkrav-og-innlogging, O3-4:
+// «Du er nå eier av profilen» once per completed claim + CRM copy (AK1-AK3).
+runSerial(async () => {
+  console.log("\n── O3-4: velkomst-e-post etter fullført eierkrav ──");
+  try {
+    const { runGardssalgClaimWelcomeO34Tests } = require("../src/routes/gardssalg-claim-welcome-o3-4.test") as
+      typeof import("../src/routes/gardssalg-claim-welcome-o3-4.test");
+    const r = await runGardssalgClaimWelcomeO34Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-claim-welcome-o3-4: " + f);
+    console.log(`  gardssalg-claim-welcome-o3-4: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-claim-welcome-o3-4: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 pkt 4: eid profil —
 // eierens pause / «fjern» / kvalitetsskjul, og admin-spaken på eide rader.
 runSerial(async () => {

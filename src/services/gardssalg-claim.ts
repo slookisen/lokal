@@ -2372,6 +2372,38 @@ export interface VerifyClaimResult {
   valid: boolean;
   providerId?: string;
   token?: string;
+  /** O3-4: set only when THIS call completed a claim — see claimFirstCompletion(). */
+  firstCompletion?: ClaimFirstCompletion;
+}
+
+/** O3-4: the claim a call just completed, for the welcome mail. */
+export interface ClaimFirstCompletion {
+  claimId: string;
+  /** The address the claim was made with (gardssalg_claims.email). */
+  email: string;
+  isTest: boolean;
+}
+
+type ClaimRowForUse = { id: string; provider_id: string; token: string; email: string; used: number; is_test: number | null };
+
+/**
+ * O3-4 (welcome mail): does this use of the claim row complete a claim? Yes
+ * only when the row is still unused (a re-click or second POST is not) AND
+ * this address has never completed a claim on this provider before (every
+ * later login link is a new gardssalg_claims row for the same address, and a
+ * login is not a new takeover). Read inside the caller's transaction BEFORE
+ * markClaimUsedAndLockProvider(), so used 0 -> 1 decides it exactly once.
+ */
+function claimFirstCompletion(db: ReturnType<typeof getDb>, claim: ClaimRowForUse): ClaimFirstCompletion | undefined {
+  if (claim.used !== 0) return undefined;
+  const earlier = db
+    .prepare(
+      `SELECT 1 FROM gardssalg_claims
+        WHERE provider_id = ? AND id <> ? AND used = 1 AND lower(trim(email)) = lower(trim(?)) LIMIT 1`,
+    )
+    .get(claim.provider_id, claim.id, claim.email);
+  if (earlier) return undefined;
+  return { claimId: claim.id, email: claim.email, isTest: claim.is_test === 1 };
 }
 
 /**
@@ -2393,20 +2425,20 @@ export interface VerifyClaimResult {
  */
 export function verifyClaimToken(token: string): VerifyClaimResult {
   const db = getDb(VERTICAL);
-  const claim = db
-    .prepare(
-      `SELECT id, provider_id, token FROM gardssalg_claims
-       WHERE token = ? AND expires_at > datetime('now') AND revoked_at IS NULL
-         AND COALESCE(draft_mode, 0) = 0`,
-    )
-    .get(token) as { id: string; provider_id: string; token: string } | undefined;
-
-  if (!claim) return { valid: false };
-
-  const txn = db.transaction(() => markClaimUsedAndLockProvider(db, claim.id, claim.provider_id));
-  txn();
-
-  return { valid: true, providerId: claim.provider_id, token: claim.token };
+  const txn = db.transaction((): VerifyClaimResult => {
+    const claim = db
+      .prepare(
+        `SELECT id, provider_id, token, email, used, is_test FROM gardssalg_claims
+         WHERE token = ? AND expires_at > datetime('now') AND revoked_at IS NULL
+           AND COALESCE(draft_mode, 0) = 0`,
+      )
+      .get(token) as ClaimRowForUse | undefined;
+    if (!claim) return { valid: false };
+    const firstCompletion = claimFirstCompletion(db, claim);
+    markClaimUsedAndLockProvider(db, claim.id, claim.provider_id);
+    return { valid: true, providerId: claim.provider_id, token: claim.token, ...(firstCompletion ? { firstCompletion } : {}) };
+  });
+  return txn();
 }
 
 // ── O3-2: confirm step (A2A dev-request 2026-11-12-opplevagent-o3-eierkrav-
@@ -2415,7 +2447,7 @@ export function verifyClaimToken(token: string): VerifyClaimResult {
 // and the owner's POST from the confirm page takes ownership
 // (confirmClaimToken). Unlike verifyClaimToken, both require used = 0, so a
 // link works for one confirmation only and a second POST is rejected.
-const UNUSED_CLAIM_SQL = `SELECT id, provider_id, token FROM gardssalg_claims
+const UNUSED_CLAIM_SQL = `SELECT id, provider_id, token, email, used, is_test FROM gardssalg_claims
    WHERE token = ? AND used = 0 AND expires_at > datetime('now') AND revoked_at IS NULL
      AND COALESCE(draft_mode, 0) = 0`;
 
@@ -2430,10 +2462,11 @@ export function peekClaimToken(token: string): { valid: boolean; providerId?: st
 export function confirmClaimToken(token: string): VerifyClaimResult {
   const db = getDb(VERTICAL);
   const txn = db.transaction((): VerifyClaimResult => {
-    const claim = db.prepare(UNUSED_CLAIM_SQL).get(token) as { id: string; provider_id: string; token: string } | undefined;
+    const claim = db.prepare(UNUSED_CLAIM_SQL).get(token) as ClaimRowForUse | undefined;
     if (!claim) return { valid: false };
+    const firstCompletion = claimFirstCompletion(db, claim);
     markClaimUsedAndLockProvider(db, claim.id, claim.provider_id);
-    return { valid: true, providerId: claim.provider_id, token: claim.token };
+    return { valid: true, providerId: claim.provider_id, token: claim.token, ...(firstCompletion ? { firstCompletion } : {}) };
   });
   return txn();
 }

@@ -822,17 +822,43 @@ https://rettfrabonden.com`;
     isTestSend?: boolean;
   }): Promise<{ success: boolean; messageId?: string; error?: string }> {
     const { to, providerName, verifyUrl, isTestSend } = opts;
+    const rendered = renderGardssalgClaimMagicLink(providerName, verifyUrl);
     return await this.sendEmail({
       to,
-      subject: `Logg inn på eierportalen for ${providerName} — Opplevagent`,
-      htmlContent: buildGardssalgClaimMagicLinkHtml(providerName, verifyUrl),
-      textContent: buildGardssalgClaimMagicLinkText(providerName, verifyUrl),
+      subject: rendered.subject,
+      htmlContent: rendered.htmlContent,
+      textContent: rendered.textContent,
       replyTo: "kontakt@opplevagent.no",
       // Steg 3 / funn 2: this mail carries Opplevagent content, so it must READ
       // as Opplevagent in the inbox list. The address stays rettfrabonden.com —
       // Resend verifies one domain — so the display name is what carries it.
       from: crmFromHeader("experiences"),
       isTestSend,
+    });
+  }
+
+  /**
+   * A2A dev-request 2026-11-12-opplevagent-o3-eierkrav-og-innlogging, O3-4:
+   * «Du er nå eier av profilen» to the claimant's address after a completed
+   * claim (flag GARDSSALG_CLAIM_WELCOME_EMAIL_ENABLED in the claim route).
+   * Same transport, From and Reply-To as sendGardssalgClaimMagicLink(). The
+   * mail carries the owner login page, never a token.
+   */
+  async sendGardssalgClaimWelcome(opts: {
+    to: string;
+    providerName: string;
+    loginUrl: string;
+    isTestSend?: boolean;
+  }): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const rendered = buildGardssalgClaimWelcomeEmail(opts.providerName, opts.loginUrl);
+    return await this.sendEmail({
+      to: opts.to,
+      subject: rendered.subject,
+      htmlContent: rendered.htmlContent,
+      textContent: rendered.textContent,
+      replyTo: "kontakt@opplevagent.no",
+      from: crmFromHeader("experiences"),
+      isTestSend: opts.isTestSend,
     });
   }
 
@@ -2081,6 +2107,57 @@ Opplevagent
 kontakt@opplevagent.no
 https://opplevagent.no
 `;
+  return { subject, htmlContent, textContent };
+}
+
+/** The claim magic-link mail as sent; the CRM copy renders it with a
+ *  placeholder instead of the link (O3-4). */
+export function renderGardssalgClaimMagicLink(providerName: string, verifyUrl: string): RenderedGardssalgMail {
+  return {
+    subject: `Logg inn på eierportalen for ${providerName} — Opplevagent`,
+    htmlContent: buildGardssalgClaimMagicLinkHtml(providerName, verifyUrl),
+    textContent: buildGardssalgClaimMagicLinkText(providerName, verifyUrl),
+  };
+}
+
+/**
+ * O3-4: the welcome mail after a completed claim — the Daniel-approved text
+ * (marketing-drafts/2026-11-12-opplevagent-tekstpakke-oa-4.md, part 3)
+ * verbatim. The HTML is derived from the same text: every line escaped, one
+ * <p> per paragraph, the login address as a link.
+ */
+export function buildGardssalgClaimWelcomeEmail(providerName: string, loginUrl: string): RenderedGardssalgMail {
+  const subject = `Du er nå eier av profilen til ${providerName} på Opplevagent`;
+  const textContent = `Hei,
+
+Du har tatt over profilen til ${providerName} på Opplevagent.
+
+Du er logget inn i 7 dager på enheten du brukte nå. Senere logger du inn her: ${loginUrl}
+Der ber du om en innloggingslenke, som kommer på e-post. Du trenger ikke passord.
+
+Som eier kan du:
+- rette opplysningene om stedet og åpningstidene
+- bestemme om stedet skal ta imot forespørsler om besøk
+- svare på forespørsler og se oversikten over dem
+
+Har du ikke tatt over denne profilen selv, svarer du på denne e-posten med en gang, så stopper vi det.
+
+Hilsen
+Opplevagent`;
+  const safeLogin = epEscape(loginUrl);
+  const paragraphs = textContent.split("\n\n").map((para) =>
+    `  <p>${para.split("\n").map((line) => epEscape(line).split(safeLogin).join(`<a href="${safeLogin}">${safeLogin}</a>`)).join("<br />\n")}</p>`,
+  );
+  const htmlContent = `<!DOCTYPE html>
+<html lang="nb">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 24px 20px;">
+${paragraphs.join("\n")}
+</body>
+</html>`;
   return { subject, htmlContent, textContent };
 }
 

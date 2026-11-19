@@ -9,6 +9,7 @@ import {
   peekClaimToken,
   confirmClaimToken,
   type VerifyClaimResult,
+  type ClaimFirstCompletion,
   verifyGardssalgOwnerSessionToken,
   gardssalgOwnerSessionCookieMaxAge,
   revokeClaimToken,
@@ -29,7 +30,8 @@ import {
   type ClaimProviderRow,
 } from "../services/gardssalg-claim";
 import { getGardssalgOwnerStats } from "../services/gardssalg-owner-stats-service";
-import { emailService } from "../services/email-service";
+import { emailService, renderGardssalgClaimMagicLink, buildGardssalgClaimWelcomeEmail } from "../services/email-service";
+import { archiveGardssalgClaimMail, isGardssalgClaimWelcomeEmailEnabled, GARDSSALG_CLAIM_CRM_LINK_PLACEHOLDER } from "../services/gardssalg-claim-crm-archive";
 import { generalLimiter } from "../middleware/security";
 import { ownerBookingEnableBlock, type OwnerBookingBlock } from "../services/gardssalg-booking-gate";
 import { createGardssalgOwnerFeaturesRouter, gardssalgOwnerDashboardOnForSession, gardssalgOwnerFeaturesTabOpen } from "./gardssalg-owner-features";
@@ -384,8 +386,9 @@ function sendClaimLinkPage(res: Response, html: string) {
   return res.status(200).send(html);
 }
 
-/** Mails a claim row's link with the existing claim-link e-mail. Never logs the link. */
-function mailClaimLink(providerId: string, providerName: string, claim: { token: string; email: string; isTest: boolean }): void {
+/** Mails a claim row's link with the existing claim-link e-mail. Never logs the link.
+ *  O3-4 (welcome flag on): the sent mail is filed in the CRM without the link. */
+function mailClaimLink(providerId: string, providerName: string, claim: { token: string; email: string; isTest: boolean; claimId?: string }): void {
   const verifyUrl = `${OPPLEVAGENT_BASE_URL}/kategori/gardssalg/eier/magic-link-verify?token=${claim.token}`;
   emailService
     .sendGardssalgClaimMagicLink({
@@ -398,6 +401,17 @@ function mailClaimLink(providerId: string, providerName: string, claim: { token:
     .then((emailResult) => {
       if (!emailResult.success) {
         console.error(`[gardssalg-claim] Failed to send magic link email for provider ${providerId}`);
+      }
+      if (isGardssalgClaimWelcomeEmailEnabled()) {
+        archiveGardssalgClaimMail({
+          kind: "magic_link",
+          providerId,
+          claimId: claim.claimId,
+          to: claim.email,
+          rendered: renderGardssalgClaimMagicLink(providerName, GARDSSALG_CLAIM_CRM_LINK_PLACEHOLDER),
+          isTest: claim.isTest,
+          sendResult: emailResult,
+        });
       }
     })
     .catch((e) => console.error("[gardssalg-claim] sendGardssalgClaimMagicLink error:", e));
@@ -475,8 +489,46 @@ function grantOwnerSessionAndRedirect(res: Response, result: VerifyClaimResult) 
   setOwnerSessionCookie(res, result.token!, gardssalgOwnerSessionCookieMaxAge(result.token!));
 
   const provider = getClaimProviderById(result.providerId!);
+  if (result.firstCompletion && isGardssalgClaimWelcomeEmailEnabled()) {
+    mailClaimWelcome(result.providerId!, provider, result.firstCompletion);
+  }
   const target = provider?.slug ? `/kategori/gardssalg/eier/${encodeURIComponent(provider.slug)}/portal` : "/kategori/gardssalg";
   return res.redirect(302, target);
+}
+
+// ── O3-4: «Du er nå eier av profilen» after a completed claim (A2A
+// dev-request 2026-11-12-opplevagent-o3-eierkrav-og-innlogging; flag
+// GARDSSALG_CLAIM_WELCOME_EMAIL_ENABLED, default off, read per request) ─────
+// Both claim paths end in grantOwnerSessionAndRedirect() above: the link GET
+// (confirm step off) and the confirm POST (confirm step on). The service sets
+// result.firstCompletion only on the use that completed the claim (row used
+// 0 -> 1, and this address never completed a claim on the provider before),
+// so a re-click, a second POST or a later login link sends nothing. The mail
+// goes only to the address the claim was made with. With the flag on, the
+// sent mail is filed in the producer's CRM thread (fail-open).
+function mailClaimWelcome(providerId: string, provider: ClaimProviderRow | null, done: ClaimFirstCompletion): void {
+  if (!provider?.slug) {
+    console.error(`[gardssalg-claim] welcome mail for provider ${providerId} not sent: no login page (no slug)`);
+    return;
+  }
+  const providerName = provider.navn || "din profil";
+  // The owner login page, where an owner asks for a new login link.
+  const loginUrl = `${OPPLEVAGENT_BASE_URL}/kategori/gardssalg/eier/${encodeURIComponent(provider.slug)}`;
+  emailService
+    .sendGardssalgClaimWelcome({ to: done.email, providerName, loginUrl, isTestSend: done.isTest })
+    .then((sendResult) => {
+      if (!sendResult.success) console.error(`[gardssalg-claim] welcome mail for provider ${providerId} was not sent`);
+      archiveGardssalgClaimMail({
+        kind: "welcome",
+        providerId,
+        claimId: done.claimId,
+        to: done.email,
+        rendered: buildGardssalgClaimWelcomeEmail(providerName, loginUrl),
+        isTest: done.isTest,
+        sendResult,
+      });
+    })
+    .catch((e) => console.error("[gardssalg-claim] welcome mail error:", e instanceof Error ? e.message : "error"));
 }
 
 // ── O3-2: a GET does not grant ownership (A2A dev-request 2026-11-12-
