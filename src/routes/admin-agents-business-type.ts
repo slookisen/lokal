@@ -18,7 +18,10 @@
 //     READ-ONLY candidate list for Daniel's review (never writes, never marks).
 //     Cohort: active, non-umbrella, unmarked agents that are in the outreach
 //     pool (scope=pool) or not yet sent through RFB outreach (scope=uncontacted,
-//     default; includes the pool). Signals: name + about keywords. Sorted by
+//     default; includes the pool), or every active RFB agent (scope=all, slice
+//     E2). Signals: name + about keywords, incl. fish/meat/fruit focus words and
+//     national chain names; each candidate carries suggested_retail_focus and a
+//     Norwegian `reason`; the response has `counts` per suggestion. Sorted by
 //     confidence, highest first. `gardsbutikk` hints lower the confidence — a
 //     producer-run farm shop must NOT be marked retail_shop.
 //
@@ -149,11 +152,53 @@ const ABOUT_SIGNALS: Array<[string, number]> = [
 ];
 const FARM_SHOP_HINTS = ["gårdsbutikk", "gardsbutikk", "gårdsutsalg", "gardsutsalg"];
 
+// dev-request 2026-11-15-rfb-butikkregel-fisk-og-kjott (slice E2): focus words.
+// Substring match (same as the generic shop words above), lowercase. A focus
+// word alone IS a shop signal here (so fish shops / butchers surface in the
+// list), but such a profile is capped at FOCUS_ONLY_MAX_CONFIDENCE: it may be a
+// fisherman or a farm selling its own meat — Daniel judges that in the list.
+type RetailFocus = (typeof RETAIL_FOCUSES)[number];
+const FOCUS_SIGNALS: Array<{ focus: Exclude<RetailFocus, "annet">; label: string; re: RegExp }> = [
+  { focus: "fisk", label: "fiskehandel", re: /fiskehandel/ },
+  { focus: "fisk", label: "fiskebutikk", re: /fiskebutikk/ },
+  { focus: "fisk", label: "fiskeutsalg", re: /fiskeutsalg/ },
+  { focus: "fisk", label: "fiskemottak", re: /fiskemottak/ },
+  { focus: "fisk", label: "sjømat", re: /sjømat/ },
+  { focus: "fisk", label: "skalldyr", re: /skalldyr/ },
+  { focus: "kjott", label: "slakter", re: /slakter/ }, // also slakteri / slakterforretning
+  { focus: "kjott", label: "kjøttbutikk", re: /kjøttbutikk/ },
+  { focus: "kjott", label: "kjøtthandel", re: /kjøtthandel/ },
+  { focus: "kjott", label: "kjøttprodukter", re: /kjøttprodukter/ },
+  { focus: "frukt_gront", label: "frukt og grønt", re: /frukt\s*-?\s*(?:og|&)\s*-?\s*grønt/ },
+  { focus: "frukt_gront", label: "grønnsakshandel", re: /grønnsakshandel/ },
+  { focus: "frukt_gront", label: "grønthandel", re: /grønthandel/ },
+];
+// Name-only: a name ending in a bare "fisk"/"kjøtt" word ("Bofisk", "Lofoten Fisk").
+const NAME_ONLY_FOCUS_SIGNALS: Array<{ focus: Exclude<RetailFocus, "annet">; label: string; re: RegExp }> = [
+  { focus: "fisk", label: "fisk", re: /fisk(?![a-zæøå])/ },
+  { focus: "kjott", label: "kjøtt", re: /kjøtt(?![a-zæøå])/ },
+];
+const FOCUS_NAME_WEIGHT = 0.3;
+const FOCUS_ABOUT_WEIGHT = 0.15;
+const FOCUS_ONLY_MAX_CONFIDENCE = 0.4;
+// Obvious national grocery chains, matched as whole words in the NAME only
+// (an about text saying "selges på Rema 1000" is a producer, not a chain).
+const CHAIN_NAMES = ["rema", "kiwi", "meny", "coop", "spar", "joker", "bunnpris", "extra", "obs", "europris"];
+const CHAIN_WEIGHT = 0.8;
+const FOCUS_LABEL_NO: Record<Exclude<RetailFocus, "annet">, string> = { fisk: "fisk", kjott: "kjøtt", frukt_gront: "frukt/grønt" };
+
+// A digit may end the word ("rema1000"), a letter may not ("sparebank", "obsidian").
+function hasWord(text: string, word: string): boolean {
+  return new RegExp(`(^|[^a-z0-9æøåéü])${word}($|[^a-zæøåéü])`).test(text);
+}
+
 export function classifyRetailSignals(row: { name?: string | null; about?: string | null; categories?: string | null }): {
   confidence: number;
   signals: string[];
   farm_shop_hint: boolean;
   suggested_business_type: "retail_shop" | "cafe" | null;
+  suggested_retail_focus: RetailFocus | null;
+  reason: string;
 } {
   const name = (row.name ?? "").toLowerCase();
   const about = (row.about ?? "").toLowerCase();
@@ -163,23 +208,72 @@ export function classifyRetailSignals(row: { name?: string | null; about?: strin
   for (const [kw, w] of NAME_SIGNALS) if (name.includes(kw)) { signals.push(`name:${kw}`); score += w; }
   for (const [kw, w] of ABOUT_SIGNALS) if (about.includes(kw)) { signals.push(`about:${kw}`); score += w; }
   for (const [kw] of ABOUT_SIGNALS) if (cats.includes(kw)) { signals.push(`category:${kw}`); score += 0.1; }
+  const genericCount = signals.length;
+
+  const chains = CHAIN_NAMES.filter((c) => hasWord(name, c));
+  for (const c of chains) { signals.push(`chain:${c}`); score += CHAIN_WEIGHT; }
+
+  const focusScore: Record<string, number> = {};
+  const focusHits: string[] = [];
+  const addFocus = (field: "name" | "about", f: string, label: string, w: number) => {
+    signals.push(`${field}:${label}`);
+    focusHits.push(`${field === "name" ? "navn" : "om-tekst"} «${label}»`);
+    focusScore[f] = (focusScore[f] ?? 0) + w;
+    score += w;
+  };
+  for (const s of FOCUS_SIGNALS) {
+    if (s.re.test(name)) addFocus("name", s.focus, s.label, FOCUS_NAME_WEIGHT);
+    if (s.re.test(about)) addFocus("about", s.focus, s.label, FOCUS_ABOUT_WEIGHT);
+  }
+  if (!FOCUS_SIGNALS.some((s) => s.re.test(name))) {
+    for (const s of NAME_ONLY_FOCUS_SIGNALS) if (s.re.test(name)) addFocus("name", s.focus, s.label, FOCUS_NAME_WEIGHT);
+  }
+
   const farmHint = FARM_SHOP_HINTS.some((h) => name.includes(h) || about.includes(h));
   if (farmHint) score -= 0.3;
+  const focusOnly = genericCount === 0 && chains.length === 0 && focusHits.length > 0;
+  if (focusOnly) score = Math.min(score, FOCUS_ONLY_MAX_CONFIDENCE);
   const confidence = Math.max(0, Math.min(1, Math.round(score * 100) / 100));
   const cafeOnly = signals.length > 0 && signals.every((s) => /kaf[eé]|café/.test(s));
-  return { confidence, signals, farm_shop_hint: farmHint, suggested_business_type: signals.length === 0 ? null : cafeOnly ? "cafe" : "retail_shop" };
+  const suggested_business_type = signals.length === 0 ? null : cafeOnly ? "cafe" : "retail_shop";
+
+  let suggested_retail_focus: RetailFocus | null = null;
+  let mixedFocus = false;
+  if (suggested_business_type === "retail_shop") {
+    const ranked = Object.entries(focusScore).sort((a, b) => b[1] - a[1]);
+    if (chains.length > 0 || ranked.length === 0) suggested_retail_focus = "annet";
+    else if (ranked.length > 1 && ranked[0][1] === ranked[1][1]) { suggested_retail_focus = "annet"; mixedFocus = true; }
+    else suggested_retail_focus = ranked[0][0] as RetailFocus;
+  }
+
+  const parts: string[] = [];
+  if (chains.length) parts.push(`kjedenavn i navnet (${chains.join(", ")})`);
+  const genericLabels = signals.slice(0, genericCount).map((s) => s.split(":")[1]);
+  if (genericLabels.length) parts.push(`butikk-/kafé-ord: ${Array.from(new Set(genericLabels)).join(", ")}`);
+  if (focusHits.length) {
+    const fl = Object.keys(focusScore).map((f) => FOCUS_LABEL_NO[f as keyof typeof FOCUS_LABEL_NO]).join("/");
+    parts.push(`${fl}-ord: ${focusHits.join(", ")}`);
+  }
+  if (mixedFocus) parts.push("blandet fokus, foreslår annet");
+  if (farmHint) parts.push("gårdsbutikk-hint senker sikkerheten (kan være produsentens egen gårdsbutikk)");
+  if (focusOnly) parts.push("bare fisk/kjøtt/frukt-ord — kan være produsent; vurder «selvstendig / foredler selv»");
+  const reason = parts.length ? parts.join("; ") : "ingen signaler";
+
+  return { confidence, signals, farm_shop_hint: farmHint, suggested_business_type, suggested_retail_focus, reason };
 }
 
 router.get("/classification-dryrun", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
-  const scope = req.query.scope === "pool" ? "pool" : "uncontacted";
+  const scope = req.query.scope === "pool" ? "pool" : req.query.scope === "all" ? "all" : "uncontacted";
   const limitRaw = parseInt(String(req.query.limit ?? ""), 10);
   const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, CLASSIFICATION_DRYRUN_MAX_LIMIT) : 200;
   const db = resolveDb();
   const cohortSql =
     scope === "pool"
       ? `a.id IN (SELECT agent_id FROM outreach_ready_pool)`
-      : `NOT EXISTS (SELECT 1 FROM outreach_sent_log o WHERE o.vertical_id = 'rfb' AND o.agent_id = a.id)`;
+      : scope === "all"
+        ? `a.vertical_id = 'rfb'`
+        : `NOT EXISTS (SELECT 1 FROM outreach_sent_log o WHERE o.vertical_id = 'rfb' AND o.agent_id = a.id)`;
   const rows = db.prepare(
     `SELECT a.id AS agent_id, a.name AS name, k.about AS about, a.categories AS categories,
             EXISTS(SELECT 1 FROM outreach_ready_pool p WHERE p.agent_id = a.id) AS in_pool
@@ -195,12 +289,21 @@ router.get("/classification-dryrun", (req: Request, res: Response) => {
     .sort((a, b) => b.confidence - a.confidence || String(a.name).localeCompare(String(b.name)))
     .slice(0, limit);
 
+  const counts = { suggested_business_type: {} as Record<string, number>, suggested_retail_focus: {} as Record<string, number> };
+  for (const c of candidates) {
+    const bt = c.suggested_business_type ?? "none";
+    const rf = c.suggested_retail_focus ?? "none";
+    counts.suggested_business_type[bt] = (counts.suggested_business_type[bt] ?? 0) + 1;
+    counts.suggested_retail_focus[rf] = (counts.suggested_retail_focus[rf] ?? 0) + 1;
+  }
+
   res.json({
     success: true,
     read_only: true,
     scope,
     scanned: rows.length,
     returned: candidates.length,
+    counts,
     note: "Forslag til gjennomgang. Ingenting er merket. Merking skjer bare via POST /admin/agents/business-type med eksplisitte agentIds.",
     candidates,
   });

@@ -55204,3 +55204,23 @@ runSerial(async () => {
     failures.push("admin-address-conflict-breakdown: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-11-15-rfb-butikkregel-fisk-og-kjott, slice E2: READ-ONLY
+// classification dry-run suggests retail_focus (fisk/kjott/frukt_gront/annet),
+// reason, chain names, scope=all and counts. Own in-memory DB; swaps
+// ADMIN_KEY (restored in finally), so runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── E2: butikk-klassifisering fisk/kjøtt (GET /admin/agents/business-type/classification-dryrun) ──");
+  try {
+    const { runAdminAgentsBusinessTypeE2Tests } = require("../src/routes/admin-agents-business-type-e2.test") as
+      typeof import("../src/routes/admin-agents-business-type-e2.test");
+    const r = await runAdminAgentsBusinessTypeE2Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-agents-business-type-e2: " + f);
+    console.log(`  admin-agents-business-type-e2: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-agents-business-type-e2: unexpected error: " + String(err?.message || err));
+  }
+});
