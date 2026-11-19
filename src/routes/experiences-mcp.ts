@@ -130,7 +130,15 @@ import {
   type GardssalgBooking,
 } from "../services/booking-store";
 import { dropFristSentences, fillOa1, formatOsloInstant, loadReceiptProvider } from "../services/gardssalg-honest-receipt";
-import { getCancelInfo } from "../services/gardssalg-cancel";
+import {
+  getCancelInfo,
+  gardssalgCancelEnabled,
+  guestCancelMode,
+  guestCancel,
+  sendGuestCancelToProducer,
+  CANCEL_REASON_MAX,
+  type GuestCancelMode,
+} from "../services/gardssalg-cancel";
 import { producerNotifyAddressStatus } from "../services/gardssalg-booking-followup";
 import { checkGardssalgBookingGuard, duplicateMessage, capReachedMessage } from "../services/gardssalg-booking-caps";
 // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 item 7: one
@@ -286,6 +294,21 @@ router.use(rateLimit({
   max: googleRangesAwareMax(GARDSSALG_STATUS_LOOKUP_LIMIT.max, mcpIpKey),
   keyGenerator: mcpIpKey,
   skip: (req) => !isSideEffectToolCall(req.body, GARDSSALG_STATUS_LOOKUP_TOOLS),
+}));
+
+// O5-3: cancel_gardssalg_booking gets its own bucket the same way (separate
+// from the status lookups and from book_gardssalg's side-effect quota).
+export const GARDSSALG_CANCEL_TOOLS: ReadonlySet<string> = new Set(["cancel_gardssalg_booking"]);
+export const GARDSSALG_CANCEL_LIMIT = { windowMs: 60 * 1000, max: 10 } as const;
+router.use(rateLimit({
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { trustProxy: false, creationStack: false },
+  handler: sendMcpRateLimited,
+  windowMs: GARDSSALG_CANCEL_LIMIT.windowMs,
+  max: googleRangesAwareMax(GARDSSALG_CANCEL_LIMIT.max, mcpIpKey),
+  keyGenerator: mcpIpKey,
+  skip: (req) => !isSideEffectToolCall(req.body, GARDSSALG_CANCEL_TOOLS),
 }));
 
 // ─── Conversation logging (dev-request 2026-07-10-opplevagent-conversation-logging, slice 1) ──
@@ -750,6 +773,128 @@ export function gardssalgBookingStatusPayload(booking: GardssalgBooking): Record
     ...(fristIso ? { reply_deadline_local: formatOsloInstant(fristIso, "nb") } : {}),
     status_url: guestStatusUrl(booking),
     ...(replyUrl ? { reply_url: replyUrl } : {}),
+  };
+}
+
+// O5-3 (same dev-request): cancel_gardssalg_booking, behind
+// GARDSSALG_MCP_CANCEL_TOOL_ENABLED (off unless exactly "true"; read when a
+// session's tools are registered). The tool is registered only when the O1-5
+// switch GARDSSALG_CANCEL_ENABLED is on as well: the cancellation itself is
+// O1-5's (gardssalg-cancel.ts: the guarded write, the stored reason and time,
+// the producer e-mail), so turning O1-5 off (its rollback) also takes the MCP
+// door away instead of advertising a tool that cannot cancel. Off: the tool
+// is not registered and tools/list is byte-identical.
+export function gardssalgCancelToolEnabled(): boolean {
+  return process.env.GARDSSALG_MCP_CANCEL_TOOL_ENABLED === "true" && gardssalgCancelEnabled();
+}
+
+export const CancelGardssalgBookingInputSchema = {
+  booking_ref: z.string().max(200).describe("booking_ref from the book_gardssalg result."),
+  guest_ref: z.string().max(200).describe("guest_ref from the book_gardssalg result."),
+  reason: z.string().max(CANCEL_REASON_MAX).optional().describe("Optional reason from the guest, passed on to the producer."),
+};
+
+// Verbatim from the approved text package OA-2 §C5 (A2A marketing-drafts/
+// 2026-11-12-opplevagent-tekstpakke-oa-2.md, approved by Daniel 2026-11-15).
+// Do not reword here. Keys are the package's `cancel.*` keys.
+export const CANCEL_GARDSSALG_BOOKING_TITLE = "Cancel a visit request or a confirmed visit";
+export const CANCEL_GARDSSALG_BOOKING_SHORT_TITLE = "Cancel visit request";
+export const CANCEL_GARDSSALG_BOOKING_DESCRIPTION =
+  "Use this when the guest wants to cancel a visit request or a confirmed visit made with book_gardssalg. It needs the reference and the guest_ref that book_gardssalg returned, and takes an optional reason that is passed on to the producer. The producer is told by email. A cancellation cannot be undone; the guest can send a new request afterwards. Cancelling a request that is already cancelled returns the same answer and sends nothing.";
+export const GARDSSALG_CANCEL_TEXT = {
+  ok: { nb: "Avlyst. {produsent} har fått beskjed. Referanse: {ref}.", en: "Cancelled. {produsent} has been told. Reference: {ref}." },
+  okPending: {
+    nb: "Forespørselen er trukket. {produsent} har fått beskjed. Referanse: {ref}.",
+    en: "The request is withdrawn. {produsent} has been told. Reference: {ref}.",
+  },
+  already: {
+    nb: "Forespørselen er allerede avlyst eller trukket. Ingenting er sendt på nytt.",
+    en: "The request is already cancelled or withdrawn. Nothing was sent again.",
+  },
+  notPossible: {
+    nb: "Forespørselen kan ikke avlyses, fordi den er {status}.",
+    en: "The request cannot be cancelled because it is {status}.",
+  },
+} as const;
+export type GardssalgCancelKey = keyof typeof GARDSSALG_CANCEL_TEXT;
+
+// The {status} word in cancel.notPossible. Not in the text package (it names
+// the cases: declined, expired or completed); plain words, Daniel approves
+// the tool texts before the flag is turned on.
+export const GARDSSALG_CANCEL_STATUS_WORD = {
+  declined: { nb: "avslått", en: "declined" },
+  expired: { nb: "utløpt", en: "expired" },
+  completed: { nb: "gjennomført", en: "completed" },
+  closed: { nb: "avsluttet", en: "closed" },
+} as const;
+export type GardssalgCancelStatusWord = keyof typeof GARDSSALG_CANCEL_STATUS_WORD;
+
+/** A cancel.* text filled, "norsk / English". */
+export function gardssalgCancelText(key: GardssalgCancelKey, vars: (lang: "nb" | "en") => Record<string, string> = () => ({})): string {
+  const one = (lang: "nb" | "en"): string =>
+    Object.entries(vars(lang)).reduce((t, [k, val]) => t.split(`{${k}}`).join(val), GARDSSALG_CANCEL_TEXT[key][lang] as string);
+  return `${one("nb")} / ${one("en")}`;
+}
+
+/** Why a booking the guest may not cancel (guestCancelMode() null, not cancelled) cannot be cancelled. */
+export function gardssalgCancelStatusWord(booking: Pick<GardssalgBooking, "status" | "pre_status">): GardssalgCancelStatusWord {
+  if (booking.status === "confirmed_attended") return "completed";
+  if (booking.status !== "reserved") return "closed";
+  if (booking.pre_status === "provider_declined") return "declined";
+  if (booking.pre_status === "expired") return "expired";
+  // A confirmed visit whose time has passed.
+  if (booking.pre_status === "provider_confirmed") return "completed";
+  return "closed";
+}
+
+/** The answer for a booking that is already cancelled (by anyone): same every time, sends nothing. */
+export function gardssalgCancelAlreadyPayload(booking: GardssalgBooking): Record<string, unknown> {
+  return { found: true, booking_ref: booking.booking_ref, cancelled: true, result: "already", message: gardssalgCancelText("already") };
+}
+
+export type GardssalgCancelToolResult = {
+  payload: Record<string, unknown>;
+  /** Set only when this call wrote the cancellation (the caller sends the producer e-mail). */
+  cancelled?: { booking: GardssalgBooking; mode: GuestCancelMode };
+};
+
+/**
+ * cancel_gardssalg_booking's decision for a verified booking. The write is
+ * O1-5's guestCancel() (one guarded UPDATE): only the call that changes the
+ * row gets `cancelled`, so a second call or a race sends nothing.
+ */
+export function gardssalgCancelBooking(booking: GardssalgBooking, reason: unknown, now: Date = new Date()): GardssalgCancelToolResult {
+  if (booking.status === "cancelled") return { payload: gardssalgCancelAlreadyPayload(booking) };
+  const notPossible = (b: GardssalgBooking): GardssalgCancelToolResult => {
+    const word = GARDSSALG_CANCEL_STATUS_WORD[gardssalgCancelStatusWord(b)];
+    return {
+      payload: {
+        found: true,
+        booking_ref: b.booking_ref,
+        cancelled: false,
+        result: "not_possible",
+        message: gardssalgCancelText("notPossible", (lang) => ({ status: word[lang] })),
+      },
+    };
+  };
+  if (!guestCancelMode(booking, now)) return notPossible(booking);
+  const outcome = guestCancel(booking, reason, now);
+  if (!outcome.ok) {
+    // Changed under us (a race): answer from the row as it is now.
+    const current = getBookingByRef(booking.booking_ref) ?? booking;
+    return current.status === "cancelled" ? { payload: gardssalgCancelAlreadyPayload(current) } : notPossible(current);
+  }
+  const produsent = loadReceiptProvider(booking.provider_id).navn || booking.provider_id;
+  const key: GardssalgCancelKey = outcome.mode === "withdraw" ? "okPending" : "ok";
+  return {
+    payload: {
+      found: true,
+      booking_ref: booking.booking_ref,
+      cancelled: true,
+      result: outcome.mode === "withdraw" ? "withdrawn" : "cancelled",
+      message: gardssalgCancelText(key, () => ({ produsent, ref: booking.booking_ref })),
+    },
+    cancelled: { booking: outcome.booking, mode: outcome.mode },
   };
 }
 
@@ -1958,6 +2103,60 @@ export function registerExperienceTools(
           return jsonToolResult(booking ? gardssalgBookingStatusPayload(booking) : gardssalgBookingNotFoundPayload());
         } catch (err: any) {
           return toolInternalError("get_gardssalg_booking", err);
+        }
+      }
+    );
+  }
+
+  // O5-3: registered last and only with GARDSSALG_MCP_CANCEL_TOOL_ENABLED and
+  // GARDSSALG_CANCEL_ENABLED on (gardssalgCancelToolEnabled()), so tools/list
+  // with the flag off is byte-identical. A wrong reference and a wrong
+  // guest_ref get get_gardssalg_booking's not-found answer, write nothing and
+  // send nothing. The cancellation is O1-5's guestCancel(); the producer gets
+  // one e-mail from the call that wrote it. Rate limited by
+  // GARDSSALG_CANCEL_LIMIT (router.use above). Logs nothing about the guest,
+  // the reference, the guest_ref or the reason.
+  if (gardssalgCancelToolEnabled()) {
+    server.registerTool(
+      "cancel_gardssalg_booking",
+      {
+        title: CANCEL_GARDSSALG_BOOKING_TITLE,
+        description: CANCEL_GARDSSALG_BOOKING_DESCRIPTION,
+        inputSchema: CancelGardssalgBookingInputSchema,
+        annotations: {
+          title: CANCEL_GARDSSALG_BOOKING_SHORT_TITLE,
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: true,
+          // Closed world: Opplevagent's own booking table and its own e-mail to the producer.
+          openWorldHint: false,
+        },
+      },
+      async ({ booking_ref, guest_ref, reason }) => {
+        try {
+          // Always verify first (it hashes in every branch), then re-check the
+          // switches: a session registered before a flag went off cancels nothing.
+          const verified = verifyGuestRef(booking_ref, guest_ref);
+          const booking = gardssalgCancelToolEnabled() ? verified : null;
+          try {
+            logExperiencesInteraction({
+              skill: "cancel_gardssalg_booking",
+              ctx: { clientIdentity: getClientIdentity?.(), requestMeta: getRequestMeta?.() },
+            });
+          } catch { /* fail-open: never affects the tool result */ }
+          if (!booking) return jsonToolResult(gardssalgBookingNotFoundPayload());
+          const result = gardssalgCancelBooking(booking, reason);
+          if (result.cancelled) {
+            try {
+              await sendGuestCancelToProducer(result.cancelled.booking, result.cancelled.mode);
+            } catch {
+              // No reference or guest data in the log line.
+              console.error("[booking-cancel] mcp: producer cancel notice failed");
+            }
+          }
+          return jsonToolResult(result.payload);
+        } catch (err: any) {
+          return toolInternalError("cancel_gardssalg_booking", err);
         }
       }
     );
