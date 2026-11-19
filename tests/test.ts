@@ -52832,6 +52832,23 @@ runSerial(async () => {
   }
 });
 
+// A2A dev-request 2026-11-12-opplevagent-o3-eierkrav-og-innlogging, O3-5: manual claim queue + domain rule.
+runSerial(async () => {
+  console.log("\n── O3-5: manuelle eierkrav — adminkø og domeneregel ──");
+  try {
+    const { runGardssalgManualClaimsO35Tests } = require("../src/routes/gardssalg-manual-claims-o3-5.test") as
+      typeof import("../src/routes/gardssalg-manual-claims-o3-5.test");
+    const r = await runGardssalgManualClaimsO35Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-manual-claims-o3-5: " + f);
+    console.log(`  gardssalg-manual-claims-o3-5: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-manual-claims-o3-5: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 pkt 4: eid profil —
 // eierens pause / «fjern» / kvalitetsskjul, og admin-spaken på eide rader.
 runSerial(async () => {

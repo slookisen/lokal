@@ -1061,6 +1061,7 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
           'routes/gardssalg-claim.ts: router.get("/kategori/gardssalg/eier/magic-link-verify", generalLimiter, (req: Request, res: Response) => {',
           'routes/gardssalg-claim.ts: router.post("/api/opplevelser/gardssalg-claim/:providerId/release-field", generalLimiter, express.json(), (req: Request, res: Response) => {',
           'routes/gardssalg-claim.ts: router.post("/api/opplevelser/gardssalg-claim/:providerId/update-profile", generalLimiter, express.json(), (req: Request, res: Response) => {',
+          'routes/gardssalg-claim.ts: router.post("/kategori/gardssalg/eier/:providerId/manuelt-krav", generalLimiter, express.json(), express.urlencoded({ extended: false }),',
           'routes/gardssalg-claim.ts: router.post("/kategori/gardssalg/eier/:providerSlug/logout", generalLimiter, (req: Request, res: Response) => {',
           'routes/seo.ts: router.get("/sok", generalLimiter, async (req: Request, res: Response) => {',
           // POST /kategori/gardssalg/book/:providerSlug (experiences-seo.ts) and POST

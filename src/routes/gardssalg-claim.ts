@@ -36,7 +36,8 @@ import { generalLimiter } from "../middleware/security";
 import { ownerBookingEnableBlock, type OwnerBookingBlock } from "../services/gardssalg-booking-gate";
 import { createGardssalgOwnerFeaturesRouter, gardssalgOwnerDashboardOnForSession, gardssalgOwnerFeaturesTabOpen } from "./gardssalg-owner-features";
 import { wrapGardssalgDashboard } from "../owner-ui/gardssalg-dashboard";
-import { CLAIM_LINK_TEXTS, CLAIM_CONFIRM_TEXTS } from "./gardssalg-claim-texts";
+import { CLAIM_LINK_TEXTS, CLAIM_CONFIRM_TEXTS, MANUAL_CLAIM_TEXTS, MANUAL_CLAIM_FORM_TEXTS_NOT_APPROVED } from "./gardssalg-claim-texts";
+import { isManualClaimQueueEnabled, isManualClaimReceiptEnabled, sendManualClaimMail, submitManualClaim } from "../services/gardssalg-manual-claims";
 
 // ─────────────────────────────────────────────────────────────────
 // GÅRDSSALG PRODUCER OWNER-CLAIM — dev-request 2026-07-21-opplevagent-
@@ -648,7 +649,8 @@ router.get("/kategori/gardssalg/eier/:providerSlug", generalLimiter, async (req:
     }
 
     if (candidates.length === 0) {
-      return res.send(shell("Er dette din bedrift?", `${alert}${manualFallbackBlock()}
+      const manualForm = isManualClaimQueueEnabled() && !isGardssalgProviderClaimed(provider.id) ? manualClaimFormHtml(provider) : "";
+      return res.send(shell("Er dette din bedrift?", `${alert}${manualFallbackBlock()}${manualForm}
         <div class="gc-card"><a href="${escapeHtml(backUrl)}" class="gc-btn gc-btn-secondary">Tilbake til profilen</a></div>`));
     }
 
@@ -819,6 +821,50 @@ router.post(
     }
     if (!redirectBase) return res.status(404).send(notFoundPage());
     return res.redirect(303, `${redirectBase}?status=sent`);
+  },
+);
+
+// ── O3-5: manual claim into the admin queue (services/gardssalg-manual-claims.ts),
+// flag GARDSSALG_CLAIM_MANUAL_QUEUE_ENABLED (default off: the POST falls through,
+// the page is as before). Same answer for a new and an already queued claim. The
+// receipt (GARDSSALG_CLAIM_MANUAL_QUEUE_RECEIPT_ENABLED, default off) goes once,
+// to the address the claimant typed.
+function manualClaimFormHtml(provider: ClaimProviderRow): string {
+  const T = MANUAL_CLAIM_FORM_TEXTS_NOT_APPROVED;
+  return `<div class="gc-card" data-gc-manual-claim="1">
+    <h2>${escapeHtml(T.heading)}</h2>
+    <p>${fillProdusent(T.intro, provider.navn)}</p>
+    <form method="post" action="/kategori/gardssalg/eier/${encodeURIComponent(provider.id)}/manuelt-krav">
+      <div class="gc-field"><label for="gc-mk-name">${escapeHtml(T.name)}</label><input id="gc-mk-name" name="name" required maxlength="200"></div>
+      <div class="gc-field"><label for="gc-mk-email">${escapeHtml(T.email)}</label><input id="gc-mk-email" name="email" type="email" required maxlength="254"></div>
+      <div class="gc-field"><label for="gc-mk-msg">${escapeHtml(T.message)}</label><textarea id="gc-mk-msg" name="message" maxlength="2000"></textarea></div>
+      <div class="gc-form-actions"><button type="submit" class="gc-btn gc-btn-primary">${escapeHtml(T.button)}</button></div>
+    </form>
+  </div>`;
+}
+
+router.post("/kategori/gardssalg/eier/:providerId/manuelt-krav", generalLimiter, express.json(), express.urlencoded({ extended: false }),
+  async (req: Request, res: Response, next: express.NextFunction) => {
+    if (!isManualClaimQueueEnabled()) return next();
+    const wantsJson = (req.headers["content-type"] || "").includes("application/json") || (req.headers.accept || "").includes("application/json");
+    const T = MANUAL_CLAIM_FORM_TEXTS_NOT_APPROVED;
+    let result: Awaited<ReturnType<typeof submitManualClaim>>;
+    try {
+      result = await submitManualClaim(String((req.params as any).providerId || ""), (req.body ?? {}) as Record<string, unknown>);
+    } catch (err) {
+      console.error("[gardssalg-claim] POST manuelt-krav error:", err instanceof Error ? err.message : "error");
+      return wantsJson ? res.status(500).json({ success: false, error: "internal_error" }) : res.status(500).send(shell("Feil", `<div class="gc-card"><h1>Noe gikk galt</h1><p>Prøv igjen senere.</p></div>`));
+    }
+    if (!result.ok) {
+      const status = { provider_not_found: 404, invalid_input: 400, already_claimed: 409, self_service_available: 409, too_many: 429 }[result.error];
+      if (wantsJson) return res.status(status).json({ success: false, error: result.error });
+      if (result.error === "provider_not_found") return res.status(404).send(notFoundPage());
+      const msg = result.error === "invalid_input" ? T.invalid : T.failed;
+      return res.status(status).send(shell(T.heading, `<div class="gc-card"><div class="gc-alert gc-alert-error" role="alert">${escapeHtml(msg)}</div></div>`));
+    }
+    if (result.created && isManualClaimReceiptEnabled()) sendManualClaimMail("receipt", result.id, result.email, result.provider.navn || "din profil");
+    if (wantsJson) return res.json({ success: true });
+    return res.send(shell(T.heading, `<div class="gc-card"><div class="gc-alert gc-alert-ok" role="status">${fillProdusent(MANUAL_CLAIM_TEXTS["claim.manual.receipt.page"], result.provider.navn)}</div></div>`));
   },
 );
 

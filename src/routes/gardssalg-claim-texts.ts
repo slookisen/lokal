@@ -35,3 +35,27 @@ export const CLAIM_CONFIRM_TEXTS = {
   "claim.confirm.notMe": "Dette er ikke meg",
   "claim.confirm.notMe.done": "Ingenting er endret. Du kan lukke siden.",
 } as const;
+
+// Slice O3-5: VERBATIM from the same pack, part 4 (mails behind GARDSSALG_CLAIM_MANUAL_QUEUE_RECEIPT_ENABLED).
+export const MANUAL_CLAIM_TEXTS = {
+  "claim.manual.receipt.page": "Vi har mottatt forespørselen din om å ta over profilen til {produsent}. Vi ser på den og svarer på e-post.",
+  "claim.manual.receipt.subject": "Vi har mottatt forespørselen din — {produsent}",
+  "claim.manual.receipt.body":
+    "Hei,\n\nVi har mottatt forespørselen din om å ta over profilen til {produsent} på Opplevagent.\n\nVi kunne ikke bekrefte den automatisk, så vi ser på den selv. Du hører fra oss på e-post. Det kan hende vi ber om noe som viser at du representerer {produsent}.\n\nDu trenger ikke gjøre noe nå.\n\nHilsen\nOpplevagent",
+  "claim.manual.reject.subject": "Om forespørselen din — {produsent}",
+  "claim.manual.reject.body":
+    "Hei,\n\nVi kunne ikke gi deg tilgang til profilen til {produsent} på Opplevagent ut fra opplysningene vi har.\n\nMener du det er feil, svarer du på denne e-posten og forteller hvordan du er knyttet til {produsent}. Da ser vi på det på nytt.\n\nHilsen\nOpplevagent",
+} as const;
+
+// O3-5 form labels: NOT APPROVED (no text in the pack). Shown only behind
+// GARDSSALG_CLAIM_MANUAL_QUEUE_ENABLED (default off); filed as «Tillegg fra skive O3-5».
+export const MANUAL_CLAIM_FORM_TEXTS_NOT_APPROVED = {
+  heading: "Be om å ta over profilen",
+  intro: "Vi kan ikke bekrefte automatisk at du representerer {produsent}. Send oss navnet og e-postadressen din, så vurderer vi kravet manuelt.",
+  name: "Navnet ditt",
+  email: "E-postadressen din",
+  message: "Hvordan er du knyttet til stedet? (valgfritt)",
+  button: "Send kravet",
+  invalid: "Fyll inn navnet ditt og en gyldig e-postadresse.",
+  failed: "Vi kunne ikke ta imot kravet nå. Prøv igjen senere, eller skriv til kontakt@opplevagent.no.",
+} as const;

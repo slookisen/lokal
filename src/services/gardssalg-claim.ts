@@ -641,7 +641,7 @@ export type OrgLinkedEmailCandidate = {
 // target, NOT full RFC validation (real deliverability is proven at
 // claim-time by the magic-link actually being clicked, same as every other
 // tier here).
-function isPlausibleEmailShape(value: string): boolean {
+export function isPlausibleEmailShape(value: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
 }
 
@@ -2393,13 +2393,16 @@ type ClaimRowForUse = { id: string; provider_id: string; token: string; email: s
  * later login link is a new gardssalg_claims row for the same address, and a
  * login is not a new takeover). Read inside the caller's transaction BEFORE
  * markClaimUsedAndLockProvider(), so used 0 -> 1 decides it exactly once.
+ * O3-5: an admin-approved manual claim's owner row (granted_claim_id) does not
+ * count, so the welcome mail follows the first click of the approval's link.
  */
 function claimFirstCompletion(db: ReturnType<typeof getDb>, claim: ClaimRowForUse): ClaimFirstCompletion | undefined {
   if (claim.used !== 0) return undefined;
   const earlier = db
     .prepare(
       `SELECT 1 FROM gardssalg_claims
-        WHERE provider_id = ? AND id <> ? AND used = 1 AND lower(trim(email)) = lower(trim(?)) LIMIT 1`,
+        WHERE provider_id = ? AND id <> ? AND used = 1 AND lower(trim(email)) = lower(trim(?))
+          AND id NOT IN (SELECT granted_claim_id FROM gardssalg_manual_claims WHERE granted_claim_id IS NOT NULL) LIMIT 1`,
     )
     .get(claim.provider_id, claim.id, claim.email);
   if (earlier) return undefined;
@@ -2522,6 +2525,24 @@ export function promoteSelfRegisteredDraftClaim(claimId: string): boolean {
   db.prepare(`UPDATE gardssalg_claims SET draft_mode = 0 WHERE id = ?`).run(row.id);
   markClaimUsedAndLockProvider(db, row.id, row.provider_id);
   return true;
+}
+
+/**
+ * O3-5 (services/gardssalg-manual-claims.ts): an admin-approved manual claim.
+ * The same ownership model as promoteSelfRegisteredDraftClaim(): an owner
+ * row ("manual", used=1, content_source='claim', claimed_at), plus a separate
+ * login-link row to the same address for the route to mail. Other addresses'
+ * open access is revoked first (O3-3, flag-gated). Call inside the approval
+ * transaction; the caller checks hasActiveNonRevokedClaim() first.
+ */
+export function grantManualQueueOwnership(providerId: string, email: string): { ownerClaimId: string; loginLink: IssuedClaim } | null {
+  const normalized = normalizeEmail(email);
+  if (!normalized || !isPlausibleEmailShape(normalized)) return null;
+  const db = getDb(VERTICAL);
+  revokeGardssalgOwnerAccessOnOwnershipChange(db, providerId, { keepEmail: normalized, changedBy: "admin" });
+  const owner = insertGardssalgClaimRow(providerId, normalized, "manual");
+  markClaimUsedAndLockProvider(db, owner.claimId, providerId);
+  return { ownerClaimId: owner.claimId, loginLink: insertGardssalgClaimRow(providerId, normalized, "manual") };
 }
 
 /**
