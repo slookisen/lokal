@@ -1511,6 +1511,19 @@ console.log("── admin-outreach-candidates (max-touch-vern: mode=second exclu
   console.log(`  admin-outreach-candidates-max-touch-vern: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── reply suppression also matches unlinked CRM contacts by e-mail (svarsperre) ──
+console.log("── admin-outreach-candidates (reply suppression by contact e-mail) ──");
+{
+  const { runAdminOutreachCandidatesReplyByEmailTests } =
+    require("../src/routes/admin-outreach-candidates-reply-by-email.test") as
+      typeof import("../src/routes/admin-outreach-candidates-reply-by-email.test");
+  const r = runAdminOutreachCandidatesReplyByEmailTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("admin-outreach-candidates-reply-by-email: " + f);
+  console.log(`  admin-outreach-candidates-reply-by-email: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── dev-request 2026-08-29-outreach-max-touch-vern: send-time invariant on
 // /threads/:id/send and /compose (Part B). Async (the routes under test are
 // `async` handlers) — registered via runSerial() so it is automatically
