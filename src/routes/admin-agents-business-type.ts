@@ -9,7 +9,7 @@
 //     executes a decision the caller already made. No bulk/automatic mode.
 //       body: { agentIds: string[], business_type: 'producer'|'farm_shop'|
 //               'retail_shop'|'cafe'|null (null clears), retail_focus?:
-//               'frukt_gront'|'fisk'|'annet', reason: string, apply?: bool }
+//               'frukt_gront'|'fisk'|'kjott'|'annet', reason: string, apply?: bool }
 //     retail_focus is REQUIRED for 'retail_shop' and must be absent otherwise.
 //     Rollback: call again with business_type:null (or restore from the audit
 //     rows' old_value).
@@ -53,7 +53,7 @@ function requireAdmin(req: Request, res: Response): boolean {
 }
 
 export const BUSINESS_TYPES = ["producer", "farm_shop", "retail_shop", "cafe"] as const;
-export const RETAIL_FOCUSES = ["frukt_gront", "fisk", "annet"] as const;
+export const RETAIL_FOCUSES = ["frukt_gront", "fisk", "kjott", "annet"] as const;
 export const BUSINESS_TYPE_MAX_AGENTS = 50;
 export const CLASSIFICATION_DRYRUN_MAX_LIMIT = 500;
 
