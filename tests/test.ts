@@ -33255,6 +33255,18 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gmct.failures) failures.push("opplevelser-gardssalg-mcp-cancel-tool-o5-3: " + f);
     console.log(`  opplevelser-gardssalg-mcp-cancel-tool-o5-3: ${gmct.passed} passed, ${gmct.failed} failed`);
 
+    // O5-4 (same dev-request): book_gardssalg preview + shares/privacy/age lines
+    // and the C1/C2 tool texts behind GARDSSALG_MCP_PREVIEW_ENABLED; flag off
+    // tools/list and results byte-identical, preview stores and sends nothing.
+    console.log("\n── opplevelser-gardssalg-mcp-preview-o5-4: book_gardssalg preview behind flag ──");
+    const { runOpplevelserGardssalgMcpPreviewTests } = require("../src/routes/opplevelser-gardssalg-mcp-preview-o5-4.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-mcp-preview-o5-4.test");
+    const gmpv = await runOpplevelserGardssalgMcpPreviewTests({ log: false });
+    passed += gmpv.passed;
+    failed += gmpv.failed;
+    for (const f of gmpv.failures) failures.push("opplevelser-gardssalg-mcp-preview-o5-4: " + f);
+    console.log(`  opplevelser-gardssalg-mcp-preview-o5-4: ${gmpv.passed} passed, ${gmpv.failed} failed`);
+
     // dev-request 2026-10-03-booking-avlistet-produsent-bypass: a catalog_hidden=1
     // (delisted) producer is never dispatched to; the test provider has its own
     // is_test_provider identity. Unit matrix + POST /book + book_gardssalg + migration.
