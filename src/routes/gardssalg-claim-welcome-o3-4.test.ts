@@ -285,6 +285,12 @@ export function runGardssalgClaimWelcomeO34Tests(opts: { log?: boolean } = {}): 
       Object.assign(console, origConsole);
       if (server) await new Promise<void>((resolve) => server.close(() => resolve()));
       archiveMod.__setGardssalgClaimCrmIngestForTesting(null);
+      // The shared per-IP generalLimiter (300/15 min) is process-wide; give the
+      // loopback budget back so later suites in tests/test.ts are not 429'd.
+      try {
+        const { generalLimiter } = require("../middleware/security") as typeof import("../middleware/security");
+        await generalLimiter.resetKey("127.0.0.1");
+      } catch { /* ignore */ }
       emailSvc.isConfigured = origConfigured;
       emailSvc.transporter = origTransporter;
       for (const [k, v] of Object.entries(savedEnv)) {
