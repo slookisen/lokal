@@ -312,6 +312,27 @@
           </div>
         </div>
         <div class="form-group">
+          <label>Hvor selger du? (valgfritt)</label>
+          <input type="text" id="regSalesPlace" maxlength="120" placeholder="F.eks. REKO-ringen i Trondheim, Bondens marked Oslo..." />
+          <p class="form-hint">Har du ikke nettside, er dette nok. Mange selger bare via REKO-ring eller marked.</p>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Nettside (valgfritt)</label>
+            <input type="url" id="regWebsite" placeholder="https://..." />
+          </div>
+          <div class="form-group">
+            <label>Telefon (valgfritt)</label>
+            <input type="tel" id="regPhone" maxlength="40" placeholder="F.eks. 912 34 567" />
+            <p class="form-hint">Kan vises p&aring; profilen din etter godkjenning.</p>
+          </div>
+        </div>
+        <div class="form-group">
+          <label>Organisasjonsnummer (valgfritt)</label>
+          <input type="text" id="regOrgNr" inputmode="numeric" maxlength="11" placeholder="9 siffer" />
+          <p class="form-hint">Har du et org.nr., hjelper det oss &aring; godkjenne profilen raskere.</p>
+        </div>
+        <div class="form-group">
           <label>Hva selger du? (velg minst &eacute;n)</label>
           <div style="display: flex; flex-wrap: wrap; gap: 6px;" id="regCategories">
             <label style="display:flex;align-items:center;gap:4px;background:var(--gray-100);padding:6px 12px;border-radius:20px;font-size:0.88rem;cursor:pointer;"><input type="checkbox" value="vegetables" style="width:auto;"> Gr&oslash;nnsaker</label>
@@ -3158,6 +3179,10 @@
       var city = document.getElementById('regCity').value.trim();
       var email = document.getElementById('regEmail').value.trim();
       var tagsStr = document.getElementById('regTags').value.trim();
+      var website = document.getElementById('regWebsite').value.trim();
+      var phone = document.getElementById('regPhone').value.trim();
+      var orgNr = document.getElementById('regOrgNr').value.replace(/\s+/g, '');
+      var salesPlace = document.getElementById('regSalesPlace').value.trim();
 
       // Get selected categories
       var categories = [];
@@ -3177,6 +3202,13 @@
         return;
       }
 
+      if (orgNr && !/^\d{9}$/.test(orgNr)) {
+        showAlert('regAlert', 'Organisasjonsnummeret må være 9 siffer.', 'error');
+        return;
+      }
+      // A website typed without a scheme ("minogard.no") is still a website.
+      if (website && !/^https?:\/\//i.test(website)) website = 'https://' + website;
+
       var tags = tagsStr ? tagsStr.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : ['local'];
 
       this.disabled = true;
@@ -3194,13 +3226,19 @@
           description: description,
           provider: name,
           contactEmail: email,
-          url: window.location.origin,
           role: 'producer',
           categories: categories,
           tags: tags,
           skills: skills,
-          location: city ? { city: city, lat: 59.91, lng: 10.75 } : undefined
+          // Only the city: coordinates are set later by geocoding the city,
+          // never guessed here (this used to send Oslo for every city).
+          location: city ? { city: city } : undefined
         };
+        // No website → no url. Never our own origin.
+        if (website) body.url = website;
+        if (orgNr) body.orgNr = orgNr;
+        if (phone) body.phone = phone;
+        if (salesPlace) body.salesPlace = salesPlace;
 
         var resp = await fetch(API + '/register', {
           method: 'POST',
@@ -3262,6 +3300,7 @@
                   document.getElementById('regCity').value = '';
                   document.getElementById('regEmail').value = '';
                   document.getElementById('regTags').value = '';
+                  ['regWebsite', 'regPhone', 'regOrgNr', 'regSalesPlace'].forEach(function(id) { document.getElementById(id).value = ''; });
                   document.querySelectorAll('#regCategories input[type="checkbox"]').forEach(function(cb) { cb.checked = false; });
 
                   // Done — skip the manual claim flow
@@ -3296,6 +3335,7 @@
           document.getElementById('regCity').value = '';
           document.getElementById('regEmail').value = '';
           document.getElementById('regTags').value = '';
+          ['regWebsite', 'regPhone', 'regOrgNr', 'regSalesPlace'].forEach(function(id) { document.getElementById(id).value = ''; });
           document.querySelectorAll('#regCategories input[type="checkbox"]').forEach(function(cb) { cb.checked = false; });
 
           // Legacy: populate claim search if element exists

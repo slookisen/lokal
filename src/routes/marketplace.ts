@@ -35,7 +35,8 @@ import { getDb as getVerticalDb } from "../database/db-factory";
 import { findOrgnumberByName } from "../services/brreg-client";
 import { checkBrregNameHitAddress } from "../services/brreg-address-guard";
 import { rfbPlaceMatchEntity, pickRfbPlace, rfbPlacesTextQuery, formatPlacesMatchGuardLog, placesFieldMask, googleRatingFetchEnabled, placesAddressFetchEnabled, withoutPlacesAddressField } from "../services/places-match";
-import { isDisplayablePhone, national8, stripLeadingContactLabel, stripAddressLeadingNoise, looksLikeDateText } from "../services/contact-normalizer";
+import { isDisplayablePhone, national8, stripLeadingContactLabel, stripAddressLeadingNoise, looksLikeDateText, classifyPhoneForWrite } from "../services/contact-normalizer";
+import { validOwnerOrgNr } from "../services/debio-register-client";
 // W40 RFB spot-check write guards (Kvestad Sideri address, Aalan Gård phone).
 import { guardAutoPhoneWrite, recordOwnerRelayPhoneAudit, type PhoneWriteVerdict } from "../services/phone-source-write-guard";
 import {
@@ -571,6 +572,32 @@ router.post("/register", (req: Request, res: Response) => {
       return;
     }
 
+    // dev-request selvregistrering-uten-nettside (F1): the optional
+    // registration-only fields. The schema already validated orgNr (9 digits,
+    // MOD11) and capped phone / salesPlace; the phone gets the same write
+    // guard agent_knowledge.phone uses (shape, not the org.nr, not a date),
+    // checked HERE so a bad number is a 400 instead of a silently blank field.
+    const orgNr = registration.orgNr ? validOwnerOrgNr(registration.orgNr) : null;
+    const phone = registration.phone || null;
+    const salesPlace = registration.salesPlace || null;
+    if (phone && classifyPhoneForWrite(phone, orgNr).rejected) {
+      res.status(400).json({ success: false, error: "Ugyldig telefonnummer" });
+      return;
+    }
+    if (salesPlace && (looksLikeCodeArtifact(salesPlace) || hasInternalNote(salesPlace) || looksLikeThemeSpam(salesPlace))) {
+      res.status(400).json({ success: false, error: "salesPlace rejected" });
+      return;
+    }
+    // The registration pre-check reads a registrant's org.nr from the
+    // `org_nr:<9 digits>` tag and treats it as self-reported (see
+    // services/registration-precheck.ts orgNrTagOfRow / orgNrIsSelfReported).
+    // Deliberately NOT written to agents.org_nr: that column is the audited
+    // admin/Brreg path. Any org_nr: tag the body carried is replaced by the
+    // validated one, so the profile has exactly one.
+    const tags = orgNr
+      ? [...registration.tags.filter((t) => !/^org_nr:/i.test(String(t))), `org_nr:${orgNr}`]
+      : registration.tags;
+
     // Blocklist gate — quietly reject without leaking why.
     const blocked = isBlocked({
       name: registration.name,
@@ -591,7 +618,22 @@ router.post("/register", (req: Request, res: Response) => {
     // caller cannot spoof this) and starts quarantined (`isVetted: false`,
     // i.e. is_vetted=0) until a human approves it via
     // POST /admin/self-registered-review-approve (routes/admin-agents.ts).
-    const agent = marketplaceRegistry.register({ ...registration, origin: "self_registered", isVetted: false });
+    const agent = marketplaceRegistry.register({ ...registration, tags, origin: "self_registered", isVetted: false });
+
+    // F1: phone and «Hvor selger du?» go to the existing agent_knowledge
+    // columns (phone, delivery_options). Best effort — the agent row exists
+    // already, so a failure here is logged, never turned into a 500 that
+    // would make the registrant retry and create a duplicate.
+    if (phone || salesPlace) {
+      try {
+        knowledgeService.upsertKnowledge(agent.id, {
+          ...(phone ? { phone } : {}),
+          ...(salesPlace ? { deliveryOptions: [salesPlace] } : {}),
+        });
+      } catch (err) {
+        console.error(`[register] knowledge write failed for ${agent.id}:`, err);
+      }
+    }
 
     interactionLogger.log("register", {
       agentId: agent.id,
