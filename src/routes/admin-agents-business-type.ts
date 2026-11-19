@@ -169,7 +169,7 @@ const FOCUS_SIGNALS: Array<{ focus: Exclude<RetailFocus, "annet">; label: string
   { focus: "kjott", label: "kjøttbutikk", re: /kjøttbutikk/ },
   { focus: "kjott", label: "kjøtthandel", re: /kjøtthandel/ },
   { focus: "kjott", label: "kjøttprodukter", re: /kjøttprodukter/ },
-  { focus: "frukt_gront", label: "frukt og grønt", re: /frukt\s*-?\s*(?:og|&)\s*grønt/ },
+  { focus: "frukt_gront", label: "frukt og grønt", re: /frukt\s*-?\s*(?:og|&)\s*-?\s*grønt/ },
   { focus: "frukt_gront", label: "grønnsakshandel", re: /grønnsakshandel/ },
   { focus: "frukt_gront", label: "grønthandel", re: /grønthandel/ },
 ];
@@ -187,8 +187,9 @@ const CHAIN_NAMES = ["rema", "kiwi", "meny", "coop", "spar", "joker", "bunnpris"
 const CHAIN_WEIGHT = 0.8;
 const FOCUS_LABEL_NO: Record<Exclude<RetailFocus, "annet">, string> = { fisk: "fisk", kjott: "kjøtt", frukt_gront: "frukt/grønt" };
 
+// A digit may end the word ("rema1000"), a letter may not ("sparebank", "obsidian").
 function hasWord(text: string, word: string): boolean {
-  return new RegExp(`(^|[^a-z0-9æøåéü])${word}($|[^a-z0-9æøåéü])`).test(text);
+  return new RegExp(`(^|[^a-z0-9æøåéü])${word}($|[^a-zæøåéü])`).test(text);
 }
 
 export function classifyRetailSignals(row: { name?: string | null; about?: string | null; categories?: string | null }): {

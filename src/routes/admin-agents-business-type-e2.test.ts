@@ -89,6 +89,26 @@ export async function runAdminAgentsBusinessTypeE2Tests(opts: { log?: boolean } 
   assertTrue(shell.reason.includes("kan være produsent"), "e2-06b: reason sier at det kan være produsent");
   assertTrue(chain.confidence > shell.confidence, "e2-06c: kjede har høyere sikkerhet enn bare fisk-ord");
 
+  // B1: a focus-only profile that would score 0.9 uncapped stays at <= 0.4.
+  const capped = classifyRetailSignals({ name: "Vik Fiskehandel Sjømat", about: "fiskehandel og sjømat" });
+  assertEq([capped.suggested_business_type, capped.suggested_retail_focus], ["retail_shop", "fisk"], "e2-06d: fiskehandel+sjømat -> retail_shop/fisk");
+  assertTrue(capped.confidence <= 0.4 && capped.confidence > 0, "e2-06e: taket for bare fokus-ord holder (<= 0.4) selv med mange treff");
+
+  // N1: tie between two focuses -> annet, "blandet fokus".
+  const tie = classifyRetailSignals({ name: "Fisk og Kjøtt", about: "" });
+  assertEq([tie.suggested_business_type, tie.suggested_retail_focus], ["retail_shop", "annet"], "e2-06f: likt fisk/kjøtt -> annet");
+  assertTrue(tie.reason.includes("blandet fokus"), "e2-06g: reason sier blandet fokus");
+
+  // N2: a digit may end a chain word; a letter may not.
+  const rema = classifyRetailSignals({ name: "Rema1000 Moa", about: "" });
+  assertTrue(rema.signals.includes("chain:rema") && rema.suggested_retail_focus === "annet", "e2-04e: «Rema1000» gir chain:rema");
+  const notChain2 = classifyRetailSignals({ name: "Obsidian Sparebank", about: "" });
+  assertTrue(!notChain2.signals.some((s) => s.startsWith("chain:")), "e2-04f: «Obsidian»/«Sparebank» er ikke kjede");
+
+  // N3: frukt-og-grønt with hyphens on both sides.
+  const fgHyph = classifyRetailSignals({ name: "Bondens Frukt-og-grønt", about: "" });
+  assertEq(fgHyph.suggested_retail_focus, "frukt_gront", "e2-02f: «Frukt-og-grønt» -> frukt_gront");
+
   const farm = classifyRetailSignals({ name: "Nedre Bakke Gård", about: "Vi dyrker poteter og gulrøtter." });
   assertEq([farm.signals.length, farm.suggested_business_type, farm.suggested_retail_focus], [0, null, null], "e2-07: vanlig gård har ingen signaler");
 
@@ -119,6 +139,9 @@ export async function runAdminAgentsBusinessTypeE2Tests(opts: { log?: boolean } 
     add("e2-chain", "Joker Vestbyen", "");
     add("e2-farm", "Øvre Li Gård", "Vi dyrker korn.");
     add("e2-sent", "Kaias Sjømat", "Fersk sjømat."); // has an RFB outreach row
+    // B2: a non-RFB agent with shop words must stay out of scope=all.
+    add("e2-dental", "Tannklinikkens Butikk", "Butikk og dagligvare.");
+    db.prepare(`UPDATE agents SET vertical_id = 'dental' WHERE id = 'e2-dental'`).run();
     db.prepare(`INSERT INTO outreach_sent_log (agent_id, channel, notes, vertical_id) VALUES ('e2-sent', 'email', 'e2-test', 'rfb')`).run();
 
     const H = { "x-admin-key": key };
@@ -135,6 +158,7 @@ export async function runAdminAgentsBusinessTypeE2Tests(opts: { log?: boolean } 
     assertTrue(allIds.includes("e2-sent"), "e2-12: scope=all tar med agent med outreach_sent_log-rad");
     assertTrue(!uncIds.includes("e2-sent"), "e2-13: scope=uncontacted utelater den");
     assertTrue(!allIds.includes("e2-farm"), "e2-14: vanlig gård er ikke kandidat");
+    assertTrue(!allIds.includes("e2-dental"), "e2-14b: scope=all utelater agent fra annen vertikal (dental)");
 
     const byId: Record<string, any> = {};
     for (const c of all.body?.candidates ?? []) byId[c.agent_id] = c;
