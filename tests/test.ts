@@ -33241,6 +33241,20 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gmst.failures) failures.push("opplevelser-gardssalg-mcp-status-tool-o5-2: " + f);
     console.log(`  opplevelser-gardssalg-mcp-status-tool-o5-2: ${gmst.passed} passed, ${gmst.failed} failed`);
 
+    // O5-3 (same dev-request): cancel_gardssalg_booking behind
+    // GARDSSALG_MCP_CANCEL_TOOL_ENABLED (and O1-5's GARDSSALG_CANCEL_ENABLED);
+    // flag off tools/list byte-identical, cancels through O1-5 with one
+    // producer e-mail, idempotent second call, not-found for a wrong pair,
+    // own cancel quota.
+    console.log("\n── opplevelser-gardssalg-mcp-cancel-tool-o5-3: cancel_gardssalg_booking behind flag ──");
+    const { runOpplevelserGardssalgMcpCancelToolTests } = require("../src/routes/opplevelser-gardssalg-mcp-cancel-tool-o5-3.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-mcp-cancel-tool-o5-3.test");
+    const gmct = await runOpplevelserGardssalgMcpCancelToolTests({ log: false });
+    passed += gmct.passed;
+    failed += gmct.failed;
+    for (const f of gmct.failures) failures.push("opplevelser-gardssalg-mcp-cancel-tool-o5-3: " + f);
+    console.log(`  opplevelser-gardssalg-mcp-cancel-tool-o5-3: ${gmct.passed} passed, ${gmct.failed} failed`);
+
     // dev-request 2026-10-03-booking-avlistet-produsent-bypass: a catalog_hidden=1
     // (delisted) producer is never dispatched to; the test provider has its own
     // is_test_provider identity. Unit matrix + POST /book + book_gardssalg + migration.
