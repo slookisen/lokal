@@ -51,7 +51,7 @@ import { isPlausibleNorwayCoord } from "../services/geo-distance";
 import { fylkeEquivalents, normaliseFylke } from "../services/norway-fylke";
 import { outsideNorwayPlace } from "../services/outside-norway";
 import { isDisplayablePhone } from "../services/contact-normalizer";
-import { resolveGardssalgProducerTypeFilter } from "../services/drink-taxonomy";
+import { classifyDrinkSubcategoryFromProducerType, resolveGardssalgProducerTypeFilter } from "../services/drink-taxonomy";
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -665,6 +665,88 @@ export function bookOkMessage(vars: { ref: string; produsent: string; epost: str
       .split("{status_url}").join(vars.statusUrl);
   };
   return `${one("nb")} / ${one("en")}`;
+}
+
+// O5-4 (same dev-request): book_gardssalg `preview`, what is shared with the
+// producer, the privacy link and the age line; plus the C1/C2 tool texts. All
+// behind GARDSSALG_MCP_PREVIEW_ENABLED (off unless exactly "true"; read when a
+// session's tools are registered and again on each call). Off: tools/list and
+// every result are byte-identical. Texts verbatim from the owner-approved
+// O5-4 package (C1/C2/C3); do not reword here.
+export function gardssalgPreviewEnabled(): boolean {
+  return process.env.GARDSSALG_MCP_PREVIEW_ENABLED === "true";
+}
+
+export const DISCOVER_GARDSSALG_TITLE = { off: "Find drink producers to visit for a tasting (gårdssalg)", on: "Find drink producers in Norway that accept visit requests (gårdssalg)" } as const;
+export const DISCOVER_GARDSSALG_LEAD = {
+  off:
+    "Use this to plan a visit or tasting at a Norwegian drink producer (brewery, cidery, winery, distillery, " +
+    "meadery, farm café) and find ones that accept visit requests; it does not sell or order products. " +
+    "It searches opplevagent.no's gårdssalg (farm-sale) vertical of Brreg-registered drink producers to visit (besøk, smaking) ",
+  on:
+    "Use this to plan a visit to a Norwegian drink producer (brewery, cidery, winery, distillery, " +
+    "meadery, farm café) and find ones that accept visit requests; it does not sell or order products. " +
+    "It searches opplevagent.no's gårdssalg (farm-sale) vertical of Brreg-registered drink producers to visit (besøk) ",
+} as const;
+export const BOOK_GARDSSALG_TITLE = { off: "Request a visit or tasting at a drink producer (pending until the producer replies)", on: "Request a visit at a drink producer (pending until the producer replies)" } as const;
+export const BOOK_GARDSSALG_LEAD = {
+  off:
+    "Use this to request a visit or tasting (besøk, smaking) at a Norwegian gårdssalg drink producer found with " +
+    "discover_gardssalg or named by the guest; it sends a visit request and does not sell or order products. ",
+  on:
+    "Use this to request a visit (besøk) at a Norwegian gårdssalg drink producer found with " +
+    "discover_gardssalg or named by the guest; it sends a visit request and does not sell or order products. ",
+} as const;
+/** C2, appended last to book_gardssalg's description with the flag on. */
+export const BOOK_GARDSSALG_PREVIEW_DESCRIPTION_TAIL =
+  "With preview: true the tool runs every check and returns the summary the guest should see, without storing or sending anything. On success the response carries guest_ref and status_url. Keep guest_ref for this conversation: it is needed to check the status or cancel with get_gardssalg_booking and cancel_gardssalg_booking. The response also lists what is shared with the producer and links to the privacy policy.";
+
+export const BookGardssalgPreviewField = {
+  preview: z.boolean().optional().describe(
+    "Set to true to run every check and return the summary the guest should see, without storing or sending anything. Omit to send the request."
+  ),
+};
+
+/** C3 result texts, "norsk / English" in one string. */
+export const BOOK_PREVIEW_TEXTS = {
+  preview: "Forhåndsvisning. Ingenting er sendt ennå. Forespørsel om besøk hos {produsent}, {tid}, {antall} personer. / Preview. Nothing has been sent yet. Visit request to {produsent}, {tid}, {antall} guests.",
+  shares: "Dette deles med produsenten: navn, e-postadresse, telefonnummer hvis det er oppgitt, antall personer, tidspunkt og kommentar. / Shared with the producer: name, email address, phone number if given, number of guests, time and note.",
+  age: "Produsenten kontrollerer alder ved kjøp og servering, og kan ha egen aldersgrense for hele eller deler av besøket. / The producer checks age for any purchase or serving, and may set its own age limit for all or part of the visit.",
+  privacy: "Slik behandler vi personopplysninger: {privacy_url} / How we handle personal data: {privacy_url}",
+} as const;
+
+/**
+ * Alcohol production: a non-empty alcohol_categories, else any producer_type
+ * but a gårdskafé (the gårdssalg vertical is drink producers; an unknown type
+ * counts as drink, as isGardssalgDrinkType() in route-corridor-service.ts).
+ */
+export function gardssalgProducerHasAlcohol(p: { producer_type?: unknown; alcohol_categories?: unknown } | null): boolean {
+  try {
+    const cats = JSON.parse(String(p?.alcohol_categories ?? "[]"));
+    if (Array.isArray(cats) && cats.length > 0) return true;
+  } catch { /* malformed: fall through to the type */ }
+  return classifyDrinkSubcategoryFromProducerType(typeof p?.producer_type === "string" ? p.producer_type : null) !== "gårdskafé";
+}
+
+/** shares + (age) + privacy lines and the structured fields, for preview and success. */
+export function gardssalgPreviewNotices(opts: { hasAlcohol: boolean; guestPhone?: string; notes?: string }) {
+  const privacyUrl = BRAND_ENTITIES.experiences.privacyUrl;
+  const lines = [
+    BOOK_PREVIEW_TEXTS.shares,
+    ...(opts.hasAlcohol ? [BOOK_PREVIEW_TEXTS.age] : []),
+    BOOK_PREVIEW_TEXTS.privacy.split("{privacy_url}").join(privacyUrl),
+  ];
+  const shared = ["guest_name", "guest_email", ...(opts.guestPhone ? ["guest_phone"] : []), "party_size", "slot_at", ...(opts.notes ? ["notes"] : [])];
+  return { lines, privacy_url: privacyUrl, shared_with_producer: shared };
+}
+
+/** C3 `book.preview`, filled; {tid} as «Friday 12 December 2026 at 13:00». */
+export function bookPreviewMessage(vars: { produsent: string; slotAt: string; antall: number }): string {
+  const iso = osloDatetimeLocalToUtcIso(vars.slotAt) ?? vars.slotAt;
+  const [nb, en] = BOOK_PREVIEW_TEXTS.preview.split(" / ");
+  const fill = (t: string, lang: "nb" | "en") =>
+    fillOa1(t, { produsent: vars.produsent, tid: formatOsloInstant(iso, lang), antall: String(vars.antall) });
+  return `${fill(nb, "nb")} / ${fill(en, "en")}`;
 }
 
 // O5-2 (same dev-request): get_gardssalg_booking, behind
@@ -1513,14 +1595,14 @@ export function registerExperienceTools(
   // so discover_experiences/get_experience never surface them. This tool is
   // the dedicated search surface over experience_providers for that
   // vertical, backed by searchGardssalgProviders().
+  // O5-4: C1/C2 tool texts and the `preview` field only with the flag on.
+  const previewTexts = gardssalgPreviewEnabled() ? "on" : "off";
   server.registerTool(
     "discover_gardssalg",
     {
-      title: "Find drink producers to visit for a tasting (gårdssalg)",
+      title: DISCOVER_GARDSSALG_TITLE[previewTexts],
       description:
-        "Use this to plan a visit or tasting at a Norwegian drink producer (brewery, cidery, winery, distillery, " +
-        "meadery, farm café) and find ones that accept visit requests; it does not sell or order products. " +
-        "It searches opplevagent.no's gårdssalg (farm-sale) vertical of Brreg-registered drink producers to visit (besøk, smaking) " +
+        DISCOVER_GARDSSALG_LEAD[previewTexts] +
         "(bryggeri/sideri/vingård/destilleri/mjøderi/gårdskafé/seltzeri). " +
         "Finn norske gårdssalg-produsenter (drikkeprodusenter som selger direkte fra gården) etter fylke, " +
         "kommune og produsenttype. / Filter by county (fylke), municipality (kommune), and producer type. " +
@@ -1661,10 +1743,9 @@ export function registerExperienceTools(
   server.registerTool(
     "book_gardssalg",
     {
-      title: "Request a visit or tasting at a drink producer (pending until the producer replies)",
+      title: BOOK_GARDSSALG_TITLE[previewTexts],
       description:
-        "Use this to request a visit or tasting (besøk, smaking) at a Norwegian gårdssalg drink producer found with " +
-        "discover_gardssalg or named by the guest; it sends a visit request and does not sell or order products. " +
+        BOOK_GARDSSALG_LEAD[previewTexts] +
         "Send inn en reservasjonsforespørsel for et gårdssalg-besøk. " +
         "IMPORTANT: this NEVER creates a confirmed booking — it creates a PENDING request, exactly " +
         "like the producer's own website form. The PRODUCER reviews the request and responds " +
@@ -1692,8 +1773,9 @@ export function registerExperienceTools(
         "On success the response carries the resolved producer (provider.navn) and slot_at_local " +
         "(e.g. 'fredag 23. oktober 2026 kl. 10:00') — read both back to the guest. " +
         "Example: provider_query 'Fjordgard Bryggeri', slot_at '2026-10-23T10:00', requested_weekday 'fredag', " +
-        "party_size 4, guest_name 'Kari Nordmann', guest_email 'kari@example.no'.",
-      inputSchema: BookGardssalgInputSchema,
+        "party_size 4, guest_name 'Kari Nordmann', guest_email 'kari@example.no'." +
+        (previewTexts === "on" ? ` ${BOOK_GARDSSALG_PREVIEW_DESCRIPTION_TAIL}` : ""),
+      inputSchema: previewTexts === "on" ? { ...BookGardssalgInputSchema, ...BookGardssalgPreviewField } : BookGardssalgInputSchema,
       annotations: {
         title: "Request a gårdssalg booking",
         readOnlyHint: false,
@@ -1712,7 +1794,10 @@ export function registerExperienceTools(
         openWorldHint: true,
       },
     },
-    async ({ provider_id, provider_query, requested_weekday, experience_id, slot_at, party_size, guest_name, guest_email, guest_phone, notes, confirm_outside_hours }, extra) => {
+    async ({ provider_id, provider_query, requested_weekday, experience_id, slot_at, party_size, guest_name, guest_email, guest_phone, notes, confirm_outside_hours, ...rest }, extra) => {
+      // O5-4: re-read at call time; off, `preview` is ignored (as today).
+      const previewOn = gardssalgPreviewEnabled();
+      const isPreview = previewOn && (rest as { preview?: unknown }).preview === true;
       // «Vis som offentlig» (dev-request 2026-10-22-opplevagent-mine-valg-
       // gardssalg, O2a) is a read-only admin view of the public surfaces: no
       // visit request is ever created inside it.
@@ -1791,7 +1876,7 @@ export function registerExperienceTools(
         // here. An unknown provider_id falls through the same path (no row
         // -> booking_live undefined -> "not live"), same as the web form.
         const provider = getProviderById(parsed.data.provider_id) as
-          | { navn?: string | null; slug?: string | null; booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null; is_test_provider?: number | null; opening_hours_text?: string | null; claimed_at?: string | null }
+          | { navn?: string | null; slug?: string | null; booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null; is_test_provider?: number | null; opening_hours_text?: string | null; claimed_at?: string | null; producer_type?: string | null; alcohol_categories?: string | null }
           | null;
         // Echoed on every outcome below so the assistant can name the producer
         // it acted on (and link the profile when booking is not activated).
@@ -1949,6 +2034,29 @@ export function registerExperienceTools(
           };
         }
 
+        // O5-4: every check above has passed; preview stops here — no row, no
+        // e-mail, no interaction log. Nothing about the guest is logged.
+        const notices = previewOn
+          ? gardssalgPreviewNotices({ hasAlcohol: gardssalgProducerHasAlcohol(provider), guestPhone: parsed.data.guest_phone, notes: parsed.data.notes })
+          : null;
+        if (isPreview && notices) {
+          return jsonToolResult({
+            success: true,
+            preview: true,
+            sent: false,
+            pending: false,
+            provider: providerInfo,
+            slot_at_local: slotLocal,
+            party_size: parsed.data.party_size,
+            shared_with_producer: notices.shared_with_producer,
+            privacy_url: notices.privacy_url,
+            message: [
+              bookPreviewMessage({ produsent: providerInfo?.navn || parsed.data.provider_id, slotAt: normaliseBookingSlotInput(parsed.data.slot_at), antall: parsed.data.party_size }),
+              ...notices.lines,
+            ].join("\n"),
+          });
+        }
+
         let booking;
         try {
           // "mcp" only stamps the channel column for analytics — createBooking()
@@ -2058,10 +2166,14 @@ export function registerExperienceTools(
               }),
             }
           : result;
+        // O5-4 (flag on): + what is shared, the privacy link, the age line.
+        const finalPayload = notices
+          ? { ...payload, shared_with_producer: notices.shared_with_producer, privacy_url: notices.privacy_url, message: [payload.message, ...notices.lines].join("\n") }
+          : payload;
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify(payload, null, 2),
+            text: JSON.stringify(finalPayload, null, 2),
           }],
         };
       } catch (err: any) {
