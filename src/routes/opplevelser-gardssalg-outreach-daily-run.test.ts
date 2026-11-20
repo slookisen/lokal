@@ -468,8 +468,8 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
       assertEq(prep.status, 200, "h5: daily-prep route still 200 after extraction");
       assertEq(
         Object.keys(prep.body).filter((k) => k !== "refill_hints"),
-        ["generated_at", "candidates", "excluded", "pool", "dry", "missing", "note", "active_contact_email_overrides", "second_line_verified_count", "first_touch_address_not_published_count", "recipient_address_types"],
-        "h6: daily-prep response shape (recipient_address_types appended last, 2026-10-08; first_touch_address_not_published_count added 2026-10-13)",
+        ["generated_at", "candidates", "excluded", "pool", "dry", "missing", "note", "active_contact_email_overrides", "second_line_verified_count", "first_touch_address_not_published_count", "recipient_address_types", "full_suppression_shadow"],
+        "h6: daily-prep response shape (recipient_address_types 2026-10-08; first_touch_address_not_published_count 2026-10-13; full_suppression_shadow appended last 2026-11-20)",
       );
       assertEq(prep.body.pool.daily_cap, 4, "h7: daily-prep still reports the cap");
       assertEq(prep.body.candidates.length, 0, "h8: both providers now in cooldown -> no candidates");

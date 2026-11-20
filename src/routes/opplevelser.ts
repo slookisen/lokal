@@ -14,6 +14,7 @@
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
 import { capFreeText } from "../utils/free-text";
 import { hasContactRetentionMarkers } from "../services/privacy-retention";
+import { loadCrmRepliedEmailVerticals } from "../services/crm-replied-emails";
 // The gårdssalg product-name extractor (moved to its own service, behaviour
 // unchanged — see the re-export next to gardssalgProductSourceText below).
 import {
@@ -19977,6 +19978,11 @@ export type GardssalgOutreachEligibility =
       // reason "hard_bounced" only: the email_bounces row that suppressed it.
       bounce_type?: string;
       bounced_at?: string;
+      // reason "blocklisted" only: which blocklist key matched (dev-request
+      // 2026-11-20-opplevagent-utsending-hele-sperrelista-og-rfb-svar).
+      blocklist_matched_on?: GardssalgBlocklistMatchedOn;
+      // reason "replied_cross_platform" only: the verticals the reply was filed under.
+      reply_verticals?: string[];
     }
   | {
       provider_id: string;
@@ -20097,6 +20103,118 @@ export function gardssalgProducerHasCrmReply(rfbDb: ReturnType<typeof getRfbDb>,
   return retained !== undefined;
 }
 
+// ─── Full suppression (dev-request 2026-11-20-opplevagent-utsending-hele-
+// sperrelista-og-rfb-svar) ─────────────────────────────────────────────────
+//
+// Two extra holds on Opplevagent cold outreach, both able only to hold MORE
+// back, never to let anyone in:
+//   1. blocklist_extended: the whole blocklist, not only the e-mail key —
+//      isBlocked() also with the provider's website, org.nr. and name (as the
+//      other isBlocked() calls in this file do).
+//   2. replied_cross_platform: the recipient address has an inbound CRM
+//      message on ANY vertical, linked to the provider or not (e.g. «fjern» in
+//      an RFB thread). The provider_id-scoped reply guard above stays as is.
+// Behind GARDSSALG_OUTREACH_FULL_SUPPRESSION_ENABLED (default OFF, read at call
+// time). Regardless of the flag a read-only shadow report counts the currently
+// eligible producers that would fall out, so Daniel sees the numbers first.
+export function gardssalgOutreachFullSuppressionEnabled(): boolean {
+  const v = String(process.env.GARDSSALG_OUTREACH_FULL_SUPPRESSION_ENABLED ?? "").trim().toLowerCase();
+  return v === "true" || v === "1" || v === "on";
+}
+
+/** Which blocklist key matched, in report vocabulary («name» = name_normalized). */
+export type GardssalgBlocklistMatchedOn = "email" | "website_domain" | "org_nr" | "name" | "agent_id" | "email_domain";
+
+function gardssalgBlocklistMatchedOn(t: string | undefined): GardssalgBlocklistMatchedOn {
+  return t === "name_normalized" ? "name" : ((t ?? "email") as GardssalgBlocklistMatchedOn);
+}
+
+export const GARDSSALG_FULL_SUPPRESSION_SHADOW_MAX_EXAMPLES = 20;
+
+export type GardssalgFullSuppressionShadowExample = {
+  provider_id: string;
+  provider_name: string | null;
+  /** blocklist_extended only. `name` = the name was the only key that hit (isBlocked checks it last). */
+  matched_on?: GardssalgBlocklistMatchedOn;
+  /** replied_cross_platform only: the verticals the inbound reply was filed under. */
+  reply_verticals?: string[];
+};
+
+export type GardssalgFullSuppressionShadow = {
+  flag_enabled: boolean;
+  /**
+   * Flag OFF: producers that are eligible today and would fall out. Flag ON: producers
+   * actually held back by the new checks in this pass. Counted per reason; one producer
+   * can count under both reasons (flag OFF), `providers_total` counts it once.
+   */
+  counts: {
+    blocklist_extended: number;
+    blocklist_extended_name_only: number;
+    replied_cross_platform: number;
+    providers_total: number;
+  };
+  examples: {
+    blocklist_extended: GardssalgFullSuppressionShadowExample[];
+    replied_cross_platform: GardssalgFullSuppressionShadowExample[];
+  };
+};
+
+export function createGardssalgFullSuppressionShadow(): GardssalgFullSuppressionShadow {
+  return {
+    flag_enabled: gardssalgOutreachFullSuppressionEnabled(),
+    counts: { blocklist_extended: 0, blocklist_extended_name_only: 0, replied_cross_platform: 0, providers_total: 0 },
+    examples: { blocklist_extended: [], replied_cross_platform: [] },
+  };
+}
+
+type GardssalgFullSuppressionHit = {
+  blocklist?: { matched_on: GardssalgBlocklistMatchedOn };
+  replied?: { verticals: string[] };
+};
+
+function recordGardssalgFullSuppressionShadow(
+  shadow: GardssalgFullSuppressionShadow | undefined,
+  providerId: string,
+  providerName: string | null,
+  hit: GardssalgFullSuppressionHit,
+): void {
+  if (!shadow || (!hit.blocklist && !hit.replied)) return;
+  const max = GARDSSALG_FULL_SUPPRESSION_SHADOW_MAX_EXAMPLES;
+  shadow.counts.providers_total++;
+  if (hit.blocklist) {
+    shadow.counts.blocklist_extended++;
+    if (hit.blocklist.matched_on === "name") shadow.counts.blocklist_extended_name_only++;
+    if (shadow.examples.blocklist_extended.length < max) {
+      shadow.examples.blocklist_extended.push({ provider_id: providerId, provider_name: providerName, matched_on: hit.blocklist.matched_on });
+    }
+  }
+  if (hit.replied) {
+    shadow.counts.replied_cross_platform++;
+    if (shadow.examples.replied_cross_platform.length < max) {
+      shadow.examples.replied_cross_platform.push({ provider_id: providerId, provider_name: providerName, reply_verticals: hit.replied.verticals });
+    }
+  }
+}
+
+/**
+ * The extended blocklist check. Callers run it only after the e-mail-only check has
+ * passed, so a hit here is one the old lane missed. Returns the matched key, or null.
+ */
+function gardssalgExtendedBlocklistHit(provider: {
+  email: string;
+  website?: string | null;
+  orgNr?: string | null;
+  name?: string | null;
+}): { matched_on: GardssalgBlocklistMatchedOn } | null {
+  const check = isBlocked({
+    email: provider.email,
+    website: provider.website ?? undefined,
+    orgNr: provider.orgNr ?? undefined,
+    name: provider.name ?? undefined,
+  });
+  return check.blocked ? { matched_on: gardssalgBlocklistMatchedOn(check.matchedBy) } : null;
+}
+
 /**
  * Max cold touches per producer in this lane. dev-request 2026-11-15-opplevagent-fem-henvendelser
  * (A2): 5 (was 2). Only rounds with a template in GARDSSALG_OUTREACH_TEMPLATE_BY_ROUND are
@@ -20212,6 +20330,12 @@ export function computeGardssalgOutreachSendEligibility(
     readinessRows?: ReturnType<typeof computeGardssalgReadinessRows>;
     /** Test seam only; default GARDSSALG_OUTREACH_TEMPLATE_BY_ROUND. */
     templateByRound?: Readonly<Record<number, string>>;
+    /**
+     * Collector for the full-suppression shadow report (dev-request 2026-11-20-
+     * opplevagent-utsending-hele-sperrelista-og-rfb-svar). Read-only reporting; the
+     * eligibility decision itself follows GARDSSALG_OUTREACH_FULL_SUPPRESSION_ENABLED.
+     */
+    fullSuppressionShadow?: GardssalgFullSuppressionShadow;
   },
 ): GardssalgOutreachEligibility[] {
   // Single preflight pass, reused per-provider below — same tiering
@@ -20231,6 +20355,10 @@ export function computeGardssalgOutreachSendEligibility(
   // Built on first use, once per call (not per provider).
   let rfbSendIndex: ReturnType<typeof getRfbSendIndexForOpplevagent> | null = null;
   let roundOptoutStats: ReturnType<typeof computeGardssalgOutreachRoundOptoutStats> | undefined;
+  // Full suppression: the flag is read once per call; the cross-vertical reply
+  // index is built on first use, once per call.
+  const fullSuppression = gardssalgOutreachFullSuppressionEnabled();
+  let repliedEmailVerticals: Map<string, string[]> | null = null;
 
   for (const providerId of providerIds) {
     // G1 point 6: owned profiles never get cold outreach (checked first, so the reason is
@@ -20286,8 +20414,40 @@ export function computeGardssalgOutreachSendEligibility(
 
     const blockCheck = isBlocked({ email });
     if (blockCheck.blocked) {
-      out.push({ provider_id: providerId, eligible: false, status: "skipped", reason: "blocklisted" });
+      out.push({
+        provider_id: providerId,
+        eligible: false,
+        status: "skipped",
+        reason: "blocklisted",
+        blocklist_matched_on: gardssalgBlocklistMatchedOn(blockCheck.matchedBy),
+      });
       continue;
+    }
+
+    // ── Full blocklist (dev-request 2026-11-20-opplevagent-utsending-hele-sperrelista-
+    // og-rfb-svar): website, org.nr. and name too. Flag ON holds the producer back with
+    // the matched key; flag OFF only records it for the shadow report (pendingShadow is
+    // recorded if the producer still ends up eligible below).
+    const pendingShadow: GardssalgFullSuppressionHit = {};
+    const extBlock = gardssalgExtendedBlocklistHit({
+      email,
+      website: providerRow?.hjemmeside,
+      orgNr: providerRow?.org_nr,
+      name: providerRow?.navn,
+    });
+    if (extBlock) {
+      if (fullSuppression) {
+        recordGardssalgFullSuppressionShadow(opts?.fullSuppressionShadow, providerId, providerRow?.navn ?? null, { blocklist: extBlock });
+        out.push({
+          provider_id: providerId,
+          eligible: false,
+          status: "skipped",
+          reason: "blocklisted",
+          blocklist_matched_on: extBlock.matched_on,
+        });
+        continue;
+      }
+      pendingShadow.blocklist = extBlock;
     }
 
     // ── Hard bounce / spam complaint (owner decision 2026-09-29 «1B») ────
@@ -20317,6 +20477,28 @@ export function computeGardssalgOutreachSendEligibility(
     if (gardssalgProducerHasCrmReply(getRfbDb(), providerId)) {
       out.push({ provider_id: providerId, eligible: false, status: "skipped", reason: "replied" });
       continue;
+    }
+
+    // ── Cross-platform reply (dev-request 2026-11-20-opplevagent-utsending-hele-
+    // sperrelista-og-rfb-svar): the address has an inbound CRM message on any vertical,
+    // linked to this provider or not. Case/whitespace-insensitive.
+    repliedEmailVerticals ??= loadCrmRepliedEmailVerticals(getRfbDb());
+    const replyVerticals = repliedEmailVerticals.get(email.trim().toLowerCase());
+    if (replyVerticals) {
+      if (fullSuppression) {
+        recordGardssalgFullSuppressionShadow(opts?.fullSuppressionShadow, providerId, providerRow?.navn ?? null, {
+          replied: { verticals: replyVerticals },
+        });
+        out.push({
+          provider_id: providerId,
+          eligible: false,
+          status: "skipped",
+          reason: "replied_cross_platform",
+          reply_verticals: replyVerticals,
+        });
+        continue;
+      }
+      pendingShadow.replied = { verticals: replyVerticals };
     }
 
     // ── Max-2-touch cap: 'sent' AND 'reserved' rows both count (a reserved
@@ -20424,6 +20606,9 @@ export function computeGardssalgOutreachSendEligibility(
     const crossPrior = crossFound
       ? { sent_at: crossFound.hit.last_sent_at, vertical_id: crossFound.hit.vertical_id }
       : undefined;
+
+    // Flag OFF: eligible today, but the full suppression would hold it back.
+    recordGardssalgFullSuppressionShadow(opts?.fullSuppressionShadow, providerId, providerRow?.navn ?? null, pendingShadow);
 
     out.push({
       provider_id: providerId,
@@ -20638,6 +20823,11 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
     // dev-request 2026-11-15-opplevagent-fem-henvendelser (A2, N3): promise_given /
     // no_template_for_touch / round_stopped_optout_rate (were folded into preflight_no_go).
     let roundRuleCount = 0;
+    // dev-request 2026-11-20-opplevagent-utsending-hele-sperrelista-og-rfb-svar: held
+    // back by a reply on another vertical (flag ON), and the shadow report (always).
+    let repliedCrossPlatformCount = 0;
+    const fullSuppressionShadow = createGardssalgFullSuppressionShadow();
+    const fullSuppression = fullSuppressionShadow.flag_enabled;
 
     type Candidate = { agent_id: string; name: string; email: string; last_sent_at: string | null };
     const survivors: Candidate[] = [];
@@ -20661,8 +20851,10 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
           personal_address: personalAddressCount,
           owner_claimed: ownerClaimedCount,
           round_rule: roundRuleCount,
+          replied_cross_platform: repliedCrossPlatformCount,
         },
         recipient_address_types: countRecipientAddressTypes([]),
+        full_suppression_shadow: fullSuppressionShadow,
       });
 
     if (outreachReadyIds.length === 0) {
@@ -20748,6 +20940,7 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
       // runs last, over the fully-narrowed candidate set.
       const eligibility = computeGardssalgOutreachSendEligibility(expDb, outreachReadyIds, {
         skipRecipientDedupe: true,
+        fullSuppressionShadow,
       });
 
       for (const e of eligibility) {
@@ -20784,6 +20977,8 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
           hardBouncedCount++;
         } else if (e.reason === "replied") {
           repliedCount++;
+        } else if (e.reason === "replied_cross_platform") {
+          repliedCrossPlatformCount++;
         } else if (e.reason === PERSONAL_ADDRESS_REASON) {
           personalAddressCount++;
         } else if (e.reason === "owner_claimed") {
@@ -20820,6 +21015,7 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
       const { results: preflightResults } = computeGardssalgOutreachPreflight(expDb, outreachReadyIds, {
         skipRecipientDedupe: true,
       });
+      let repliedEmailVerticals: Map<string, string[]> | null = null;
 
       for (const pf of preflightResults) {
         if (isGardssalgOwnedForOutreach(expDb, pf.provider_id)) {
@@ -20861,6 +21057,24 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
           blocklistedCount++;
           continue;
         }
+        // Full suppression (dev-request 2026-11-20-opplevagent-utsending-hele-sperrelista-
+        // og-rfb-svar), same rules as computeGardssalgOutreachSendEligibility: flag ON holds
+        // back; flag OFF records the would-be hit if the producer survives below.
+        const pendingShadow: GardssalgFullSuppressionHit = {};
+        const extBlock = gardssalgExtendedBlocklistHit({
+          email,
+          website: providerWebById.get(pf.provider_id)?.hjemmeside,
+          orgNr: providerWebById.get(pf.provider_id)?.org_nr,
+          name: providerWebById.get(pf.provider_id)?.navn ?? pf.name,
+        });
+        if (extBlock) {
+          if (fullSuppression) {
+            recordGardssalgFullSuppressionShadow(fullSuppressionShadow, pf.provider_id, pf.name ?? null, { blocklist: extBlock });
+            blocklistedCount++;
+            continue;
+          }
+          pendingShadow.blocklist = extBlock;
+        }
         const crossHit = crossPlatformIndex.find(
           buildCrossPlatformIdentity({
             email,
@@ -20877,10 +21091,23 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
           repliedCount++;
           continue;
         }
+        repliedEmailVerticals ??= loadCrmRepliedEmailVerticals(rfbDb);
+        const replyVerticals = repliedEmailVerticals.get(email.toLowerCase());
+        if (replyVerticals) {
+          if (fullSuppression) {
+            recordGardssalgFullSuppressionShadow(fullSuppressionShadow, pf.provider_id, pf.name ?? null, {
+              replied: { verticals: replyVerticals },
+            });
+            repliedCrossPlatformCount++;
+            continue;
+          }
+          pendingShadow.replied = { verticals: replyVerticals };
+        }
         if (isHardBounced(email)) {
           hardBouncedCount++;
           continue;
         }
+        recordGardssalgFullSuppressionShadow(fullSuppressionShadow, pf.provider_id, pf.name ?? null, pendingShadow);
         survivors.push({ agent_id: pf.provider_id, name: pf.name ?? "", email, last_sent_at: lastSent });
       }
     }
@@ -20938,7 +21165,12 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
         personal_address: personalAddressCount,
         owner_claimed: ownerClaimedCount,
         round_rule: roundRuleCount,
+        replied_cross_platform: repliedCrossPlatformCount,
       },
+      // dev-request 2026-11-20-opplevagent-utsending-hele-sperrelista-og-rfb-svar:
+      // what the full suppression holds back (flag ON) / would hold back (flag OFF).
+      // provider_id, name and matched key / reply vertical only — no addresses.
+      full_suppression_shadow: fullSuppressionShadow,
       // dev-request 2026-10-08-kryssplattform-karantene-produsent-og-domene:
       // one entry per cross-platform-suppressed provider, with the rule that
       // matched (email | domain | website | org_nr). Bounded at 100.
@@ -21063,6 +21295,8 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
           suppressed_by: elig.suppressed_by,
           cross_platform: elig.cross_platform,
           match: elig.match,
+          blocklist_matched_on: elig.blocklist_matched_on,
+          reply_verticals: elig.reply_verticals,
         });
         continue;
       }
@@ -21116,6 +21350,10 @@ export type GardssalgOutreachSendResultRow = {
   suppressed_by?: string;
   cross_platform?: boolean;
   match?: CrossPlatformMatch;
+  // dev-request 2026-11-20-opplevagent-utsending-hele-sperrelista-og-rfb-svar:
+  // on `blocklisted` / `replied_cross_platform` skips, the key / verticals that matched.
+  blocklist_matched_on?: GardssalgBlocklistMatchedOn;
+  reply_verticals?: string[];
   // Grep 7 (2026-08-19-kursjustering-drikkefunnel-llm-og-supply): the
   // cross-platform cooldown no longer blocks; on ELIGIBLE rows a recent
   // RFB send to the same address is surfaced through these informational
@@ -22013,6 +22251,7 @@ export function computeGardssalgOutreachDailyPrep(expDb: ReturnType<typeof getEx
       refill_hints: { needs_enrichment_count: needsEnrichmentCount },
       active_contact_email_overrides: activeContactEmailOverrides,
       second_line_verified_count: 0,
+      full_suppression_shadow: createGardssalgFullSuppressionShadow(),
     };
     return { response, selected: [] as GardssalgOutreachEligibleRow[] };
   }
@@ -22021,6 +22260,9 @@ export function computeGardssalgOutreachDailyPrep(expDb: ReturnType<typeof getEx
   const readyById = new Map(readyRows.map((r) => [r.id, r]));
 
   let eligibility: GardssalgOutreachEligibility[];
+  // dev-request 2026-11-20-opplevagent-utsending-hele-sperrelista-og-rfb-svar: shadow
+  // report of the full suppression, filled by the eligibility pass below.
+  const fullSuppressionShadow = createGardssalgFullSuppressionShadow();
   try {
     // skipRecipientDedupe: true — PR review fix (MEDIUM finding). The raw
     // preflight go/no-go list must NOT be deduped by recipient email before
@@ -22033,7 +22275,11 @@ export function computeGardssalgOutreachDailyPrep(expDb: ReturnType<typeof getEx
     // cross-candidate batch dedup is deferred. The same-recipient dedup
     // itself now runs further below, AFTER Skive 3, over `afterSkive3` only
     // (see that block's own comment).
-    eligibility = computeGardssalgOutreachSendEligibility(expDb, readyIds, { skipRecipientDedupe: true, readinessRows: rows });
+    eligibility = computeGardssalgOutreachSendEligibility(expDb, readyIds, {
+      skipRecipientDedupe: true,
+      readinessRows: rows,
+      fullSuppressionShadow,
+    });
   } catch (err) {
     throw new GardssalgOutreachDailyPrepError("eligibility", err);
   }
@@ -22060,6 +22306,10 @@ export function computeGardssalgOutreachDailyPrep(expDb: ReturnType<typeof getEx
     // the address of this lane's latest real send to this provider, on
     // own-cooldown and max_touch_reached rows only (reporting, not a filter).
     recipient_email?: string;
+    // dev-request 2026-11-20-opplevagent-utsending-hele-sperrelista-og-rfb-svar:
+    // the blocklist key that matched / the verticals a cross-platform reply came from.
+    blocklist_matched_on?: GardssalgBlocklistMatchedOn;
+    reply_verticals?: string[];
   };
 
   // ── producer_type / naeringskode / hjemmeside / field_provenance /
@@ -22278,6 +22528,8 @@ export function computeGardssalgOutreachDailyPrep(expDb: ReturnType<typeof getEx
       suppressed_by: s.suppressed_by,
       cross_platform: s.cross_platform,
       quarantine_until: s.last_sent_at ? quarantineUntil(s.last_sent_at) : undefined,
+      blocklist_matched_on: s.blocklist_matched_on,
+      reply_verticals: s.reply_verticals,
     });
   }
   // dev-request 2026-10-08-outreach-sendinger-mangler-epost-i-rapport: the
@@ -22400,6 +22652,11 @@ export function computeGardssalgOutreachDailyPrep(expDb: ReturnType<typeof getEx
     // dev-request 2026-10-08-mottakerpolicy-alle-adresser: what kind of
     // address each selected candidate has (reporting only, not a filter).
     recipient_address_types: countRecipientAddressTypes(candidates.map((c) => c.recipient_email)),
+    // dev-request 2026-11-20-opplevagent-utsending-hele-sperrelista-og-rfb-svar:
+    // counts + up to 20 examples per reason (provider_id, name, matched key / reply
+    // vertical — no addresses, no message content) of what the full suppression holds
+    // back (flag ON) or would hold back among today's eligible producers (flag OFF).
+    full_suppression_shadow: fullSuppressionShadow,
   };
   return { response, selected };
 }
