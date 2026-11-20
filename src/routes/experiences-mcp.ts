@@ -188,6 +188,7 @@ import { companyFooterLineHtml } from "../services/company-legal";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 import { tagMcpToolResults } from "../middleware/ai-profile-links";
 import { aiClientFromHeaders, sourceClientLabel } from "../utils/url-utm";
+import { classifyBookGardssalgResult, recordGardssalgFunnelEvent, type GardssalgFunnelOutcome } from "../services/gardssalg-mcp-funnel";
 import { isAsPublicView } from "../services/agent-visibility";
 import { capName } from "../utils/free-text";
 import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
@@ -1083,6 +1084,28 @@ export function registerExperienceTools(
   // experiences / gårdssalg producers a data tool hands the caller, counted
   // with the same rules as rfb (profile-ai-deliveries.ts recordMcpDelivery).
   type ToolExtra = { sessionId?: string; requestInfo?: { headers?: Record<string, string | string[] | undefined> } } | undefined;
+  // F1-1: which AI assistant (session identity, else this call's headers /
+  // initialize client name; the same rule as the profile-link tagging), as a
+  // fixed label or null.
+  const sessionSourceClient = (extra: unknown): string | null => sourceClientLabel(
+    getClientIdentity?.()
+      ?? aiClientFromHeaders((extra as ToolExtra)?.requestInfo?.headers, (server as any).server?.getClientVersion?.()?.name ?? null),
+  );
+  // O5-8: one outcome row per discover_gardssalg / book_gardssalg call (counts
+  // only, services/gardssalg-mcp-funnel.ts). The handler's result is returned
+  // untouched; the write is fail-open.
+  const withFunnelOutcome = <A, E, R>(outcomeOf: (result: R) => GardssalgFunnelOutcome, handler: (args: A, extra: E) => Promise<R>) =>
+    async (args: A, extra: E): Promise<R> => {
+      let result: R;
+      try {
+        result = await handler(args, extra);
+      } catch (err) {
+        try { recordGardssalgFunnelEvent("internal_error", sessionSourceClient(extra)); } catch { /* fail-open */ }
+        throw err;
+      }
+      try { recordGardssalgFunnelEvent(outcomeOf(result), sessionSourceClient(extra)); } catch { /* fail-open */ }
+      return result;
+    };
   const deliver = (tool: string, args: unknown, extra: ToolExtra, profileIds: string[]) => {
     recordMcpDelivery({
       vertical: "experiences",
@@ -1641,7 +1664,7 @@ export function registerExperienceTools(
         openWorldHint: false,
       },
     },
-    async ({ fylke: fylkeAsSent, kommune: kommuneAsSent, producer_type, query, booking_live, lat, lng, radius_km, limit }, extra) => {
+    withFunnelOutcome(() => "search", async ({ fylke: fylkeAsSent, kommune: kommuneAsSent, producer_type, query, booking_live, lat, lng, radius_km, limit }, extra) => {
       // Slice I-Y2: place names, cut as in discover_experiences.
       const fylke = capName(fylkeAsSent);
       const kommune = capName(kommuneAsSent);
@@ -1742,7 +1765,7 @@ export function registerExperienceTools(
         }
         return toolInternalError("discover_gardssalg", err);
       }
-    }
+    }),
   );
 
   // Tool 5: book_gardssalg (dev-request 2026-07-21-mcp-booking-tool, Daniel
@@ -1809,7 +1832,7 @@ export function registerExperienceTools(
         openWorldHint: true,
       },
     },
-    async ({ provider_id, provider_query, requested_weekday, experience_id, slot_at, party_size, guest_name, guest_email, guest_phone, notes, confirm_outside_hours, ...rest }, extra) => {
+    withFunnelOutcome(classifyBookGardssalgResult, async ({ provider_id, provider_query, requested_weekday, experience_id, slot_at, party_size, guest_name, guest_email, guest_phone, notes, confirm_outside_hours, ...rest }, extra) => {
       // O5-4: re-read at call time; off, `preview` is ignored (as today).
       const previewOn = gardssalgPreviewEnabled();
       const isPreview = previewOn && (rest as { preview?: unknown }).preview === true;
@@ -2077,14 +2100,9 @@ export function registerExperienceTools(
           // "mcp" only stamps the channel column for analytics — createBooking()
           // is the exact same function (same DB table, same confirm-token +
           // respond-token issuance) the web form calls; nothing here reimplements it.
-          // F1-1: which AI assistant (session identity, else this call's
-          // headers / initialize client name; the same rule as the profile-link
-          // tagging), stored only as a fixed label.
-          const sourceClient = sourceClientLabel(
-            getClientIdentity?.()
-              ?? aiClientFromHeaders((extra as ToolExtra)?.requestInfo?.headers, (server as any).server?.getClientVersion?.()?.name ?? null),
-          );
-          booking = createBooking(parsed.data, "mcp", { sourceClient });
+          // F1-1: which AI assistant, stored only as a fixed label
+          // (sessionSourceClient above).
+          booking = createBooking(parsed.data, "mcp", { sourceClient: sessionSourceClient(extra) });
         } catch (err: any) {
           console.error("[book_gardssalg] createBooking failed", err);
           return {
@@ -2194,7 +2212,7 @@ export function registerExperienceTools(
       } catch (err: any) {
         return toolInternalError("book_gardssalg", err);
       }
-    }
+    }),
   );
 
   // O5-2: registered last and only with the flag on, so tools/list with the

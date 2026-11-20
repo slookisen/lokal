@@ -1188,6 +1188,22 @@ export function initExperiencesSchema(db: Database.Database): void {
   `);
   db.exec("CREATE INDEX IF NOT EXISTS idx_gardssalg_notify_address_token ON gardssalg_notify_address(token_hash)");
 
+  // ─── O5-8: book_gardssalg / discover_gardssalg outcome log (same
+  // dev-request). One row per MCP call: when, a fixed outcome code
+  // (GARDSSALG_FUNNEL_OUTCOMES in services/gardssalg-mcp-funnel.ts) and the
+  // assistant label (SOURCE_CLIENT_LABELS, NULL when unknown). No guest data,
+  // no booking_ref, no provider_id. The writer prunes rows older than 90
+  // days. Additive.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS gardssalg_mcp_funnel_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      created_at TEXT NOT NULL,
+      outcome TEXT NOT NULL,
+      source_client TEXT
+    )
+  `);
+  db.exec("CREATE INDEX IF NOT EXISTS idx_gardssalg_mcp_funnel_created ON gardssalg_mcp_funnel_events(created_at)");
+
   // ─── listing_url (dev-request 2026-07-12-experiences-enrichment-supply-
   // and-aggregator-hygiene, Daniel's 2026-07-19 decision, step 1) ───────────
   // A chunk of experience_providers.hjemmeside rows carry a DMO/aggregator/

@@ -32332,6 +32332,18 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gbcr.failures) failures.push("opplevelser-gardssalg-bookings-count: " + f);
     console.log(`  opplevelser-gardssalg-bookings-count: ${gbcr.passed} passed, ${gbcr.failed} failed`);
 
+    // O5-8 (dev-request 2026-11-12-opplevagent-o5-besok-i-chatgpt-og-
+    // assistenter): book_gardssalg / discover_gardssalg outcome log and
+    // GET /admin/gardssalg/booking-funnel; tools/list stays byte-identical.
+    console.log("\n── opplevelser-gardssalg-mcp-funnel-o5-8: outcome log + admin booking funnel ──");
+    const { runOpplevelserGardssalgMcpFunnelTests } = require("../src/routes/opplevelser-gardssalg-mcp-funnel-o5-8.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-mcp-funnel-o5-8.test");
+    const gmf = await runOpplevelserGardssalgMcpFunnelTests({ log: false });
+    passed += gmf.passed;
+    failed += gmf.failed;
+    for (const f of gmf.failures) failures.push("opplevelser-gardssalg-mcp-funnel-o5-8: " + f);
+    console.log(`  opplevelser-gardssalg-mcp-funnel-o5-8: ${gmf.passed} passed, ${gmf.failed} failed`);
+
     // O1-1 (R1/R11): booking follow-up after restart — first run 5 min after
     // boot, clock from the registered producer notification, one retry +
     // admin alert for a failed producer e-mail, admin dry-run count.
