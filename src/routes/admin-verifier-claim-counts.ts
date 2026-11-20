@@ -388,6 +388,56 @@ export function snapshotDriftDecision(
   return { matched: diff <= tolerance, diff, tolerance };
 }
 
+// Snapshot-drift slice 6: which snapshot claim kinds the probe compares with
+// drift tolerance, and which still need an exact match. The three queue kinds
+// use snapshotDriftDecision() as above. `http_unreachable` (claim meta kind
+// `http_unreachable_known_total`, endpoint kind `http_unreachable`) is the
+// k.homepage_unreachable_since IS NOT NULL gauge; it moves between the
+// claim's read and the probe 10-12 h later (observed 93 vs 95) and was the
+// only real mismatch in ~26 % of verifier failures.
+//
+// WHY ±2 and not a count_at_read rebuild: the gauge cannot be rebuilt exactly
+// as of read_at from what the DB keeps. No log records changes to
+// homepage_unreachable_since (agent_queue_state_events only logs
+// verification_status and is_active); a clear writes NULL and leaves no trace
+// (agents that left the gauge after the read are invisible); and a re-stamp
+// after the 30-day backoff overwrites the old timestamp, so an agent already
+// in the gauge at read time looks like a new entry. Building that log would
+// need a new table/triggers, out of scope here. So http_unreachable gets the
+// same fixed ±2 the queue kinds use when no count_at_read is available
+// (fallback 3 of snapshotDriftDecision) — not a wider margin, not a
+// lag-scaled margin. drift_bound/count_at_read are never used for it
+// (drift_since stays a 400 for this kind).
+//
+// Every other snapshot kind (brreg_inactive_flagged, agents_domain_incoherent)
+// keeps the exact-match rule, unchanged.
+export const SNAPSHOT_DRIFT_QUEUE_KINDS = [
+  "agents_review_required",
+  "agents_pending_verify",
+  "agents_data_insufficient",
+] as const;
+export const SNAPSHOT_FIXED_TOLERANCE_KINDS = ["http_unreachable"] as const;
+
+// `kind` is the endpoint kind (claim meta kind `http_unreachable_known_total`
+// maps to endpoint kind `http_unreachable`; both are accepted here).
+export function snapshotClaimDecision(
+  kind: string,
+  claimValue: number,
+  count: number,
+  driftBound?: number | null,
+  countAtRead?: number | null,
+): { matched: boolean; diff: number; tolerance: number } {
+  if ((SNAPSHOT_DRIFT_QUEUE_KINDS as readonly string[]).includes(kind)) {
+    return snapshotDriftDecision(claimValue, count, driftBound, countAtRead);
+  }
+  const endpointKind = kind === "http_unreachable_known_total" ? "http_unreachable" : kind;
+  if ((SNAPSHOT_FIXED_TOLERANCE_KINDS as readonly string[]).includes(endpointKind)) {
+    return snapshotDriftDecision(claimValue, count, null, null);
+  }
+  const diff = Math.abs(count - claimValue);
+  return { matched: diff === 0, diff, tolerance: 0 };
+}
+
 function driftFields(db: any, status: string, driftSince: string, countNow: number) {
   if (!driftSinceWithinRetention(driftSince)) {
     return { drift_since: driftSince, drift_bound: null, count_at_read: null };

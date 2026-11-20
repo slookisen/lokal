@@ -49027,6 +49027,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-26-lokal-agent-verifier-snapshot-drift-toleranse (slice 6):
+// http_unreachable snapshot claims use the queue kinds' fixed ±2 fallback
+// (the gauge cannot be rebuilt as of read_at); other non-queue kinds stay exact.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-26-lokal-agent-verifier-snapshot-drift-toleranse: http_unreachable ±2 ──");
+  try {
+    const { runAdminVerifierClaimCountsHttpUnreachableTests } =
+      require("../src/routes/admin-verifier-claim-counts-http-unreachable.test") as
+        typeof import("../src/routes/admin-verifier-claim-counts-http-unreachable.test");
+    const hu = await runAdminVerifierClaimCountsHttpUnreachableTests({ log: false });
+    passed += hu.passed;
+    failed += hu.failed;
+    for (const f of hu.failures) failures.push("admin-verifier-claim-counts-http-unreachable: " + f);
+    console.log(`  admin-verifier-claim-counts-http-unreachable: ${hu.passed} passed, ${hu.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-verifier-claim-counts-http-unreachable: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-02-experiences-karantene-utgang-match-til-verified: the
 // content-judge sweep's new quarantine-exit promotion transition
 // (needs_review -> verified, gated on judge MATCH + provider brreg_active=1
