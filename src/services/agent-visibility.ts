@@ -532,6 +532,27 @@ export function isAwaitingSelfRegisteredReview(row: { origin?: string | null; is
   return row.origin === "self_registered" && row.is_vetted !== 1;
 }
 
+/**
+ * SQL twin of `!isAwaitingSelfRegisteredReview(row)`: true unless the row is a
+ * self-registered profile that is not vetted yet (a NULL origin/is_vetted reads
+ * exactly like the in-memory check: NULL is_vetted is "not 1"). Wrap-safe.
+ */
+export function notAwaitingSelfRegisteredReviewSql(alias?: string): string {
+  return `NOT (COALESCE(${col(alias, "origin")}, '') = 'self_registered' AND COALESCE(${col(alias, "is_vetted")}, 0) != 1)`;
+}
+
+/**
+ * SQL twin of today's quarantine rule (quarantinedToday(row, false)) for jobs
+ * that are not a request: not catalog_hidden (never the request-scoped
+ * as-public exception), RFB vertical, and not a self-registered profile
+ * awaiting review. The owner's pause / visibility choices are deliberately NOT
+ * part of it (temporary owner choices, read per request elsewhere). Wrap-safe
+ * AND-chain. Callers that also need delisted ids apply isDelistedAgentId().
+ */
+export function notQuarantinedSql(alias?: string): string {
+  return `${notCatalogHiddenSql(alias, { asPublic: false })} AND COALESCE(${col(alias, "vertical_id")}, '${RFB_VERTICAL_ID}') = '${RFB_VERTICAL_ID}' AND ${notAwaitingSelfRegisteredReviewSql(alias)}`;
+}
+
 /** Today's quarantine rule (what isQuarantinedFromPublicView() has always answered). */
 function quarantinedToday(row: AgentVisibilityRow, allowCatalogHidden: boolean): boolean {
   const listable = isPubliclyListable(allowCatalogHidden ? { ...row, catalog_hidden: 0 } : row);

@@ -704,6 +704,34 @@ export async function runProfileTranslationsTests(opts: { log?: boolean } = {}):
       try { rfbDb.close(); } catch { /* ignore */ }
     }
 
+    // ─────────── H. rfb collection skips non-public profiles ──────────────
+    // dev-request 2026-11-16-rfb-selvregistrering-spam-profil-eierkrav: an
+    // unvetted self-registered profile (GET /agents/:id/info → «Agent ikke
+    // funnet») was handed out by /collect every run.
+    const prevDbH = initMod.__peekDbForTesting();
+    const hDb = new Database(":memory:");
+    try {
+      initMod.__setDbForTesting(hDb as any);
+      initMod.__initSchemaForTesting(hDb as any);
+      const insH = hDb.prepare(`INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, is_active, origin, is_vetted, catalog_hidden) VALUES (?, ?, ?, ?, ?, ?, 'producer', ?, 1, ?, ?, ?)`);
+      const descH = "Vi selger økologiske grønnsaker og honning fra egen gård. Åpent lørdager 10–15.";
+      insH.run("h-pub", "Solgården", descH, "test", "h1@x.no", "https://h1.no", "kh1", "discovery", 1, 0);
+      insH.run("h-self-ok", "Bjørkely Gård", descH, "test", "h2@x.no", "https://h2.no", "kh2", "self_registered", 1, 0);
+      insH.run("h-self-new", "asdasd", "Take the free online test here and find out more about yourself today.", "test", "h3@x.no", "https://h3.no", "kh3", "self_registered", 0, 0);
+      insH.run("h-hidden", "Skjult gård", descH, "test", "h4@x.no", "https://h4.no", "kh4", "test_fixture", 1, 1);
+      const hIds = (items: Array<{ entity_id: string }>) => [...new Set(items.map((i) => i.entity_id))].sort();
+      eq(hIds(svc.collectSourceItems(hDb as any, "rfb")), ["h-pub", "h-self-ok"],
+        "H1 collect: public + vetted self-registered kept; unvetted self-registered and catalog_hidden skipped");
+      eq(svc.collectSourceItems(hDb as any, "rfb", { entityIds: ["h-self-new"] }).length, 0, "H2 collect by id: unvetted self-registered profile not handed out");
+      const hSession = svc.collectForSession(hDb as any, "rfb", ["en"], 50, { batchId: "h", actor: "t" });
+      eq(hIds(hSession.items), ["h-pub", "h-self-ok"], "H3 session collect (GET /collect) never returns the unvetted self-registered profile");
+      hDb.prepare("UPDATE agents SET is_vetted = 1 WHERE id = 'h-self-new'").run();
+      ok(hIds(svc.collectSourceItems(hDb as any, "rfb")).includes("h-self-new"), "H4 once approved (is_vetted = 1) the profile is collected");
+    } finally {
+      if (prevDbH) initMod.__setDbForTesting(prevDbH);
+      try { hDb.close(); } catch { /* ignore */ }
+    }
+
     // ───────────────────────────── D. opplevagent collection ──────────
     const prevExpPath = process.env.EXPERIENCES_DB_PATH;
     const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
