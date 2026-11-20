@@ -16771,6 +16771,7 @@ import { getDb as getRfbDb } from "../database/init";
 import { storedClientClass } from "../services/traffic-classifier";
 import { restSourceClient } from "../middleware/ai-profile-links";
 import { getDb as getExpDb } from "../database/db-factory";
+import { GARDSSALG_FUNNEL_OUTCOMES, GARDSSALG_FUNNEL_RETENTION_DAYS, getGardssalgBookingFunnel } from "../services/gardssalg-mcp-funnel";
 import { buildCrossPlatformIdentity, type CrossPlatformMatch } from "../services/cross-platform-match";
 import { getRfbSendIndexForOpplevagent } from "../services/outreach-suppression-signals";
 import { recordRun } from "../services/run-ledger";
@@ -34931,6 +34932,37 @@ router.get(
       rows_capped: total > GSB_ROWS_CAP,
       rows,
     });
+  },
+);
+
+// ─── GET /api/opplevelser/admin/gardssalg/booking-funnel?days=30 ────
+// O5-8 «trakt og kilde» (dev-request 2026-11-12-opplevagent-o5-besok-i-
+// chatgpt-og-assistenter): search → attempt → created → confirmed / declined /
+// expired / cancelled, per AI assistant (source_client, NULL = "unknown") and
+// in total, plus the book_gardssalg outcome codes. Counts only — no rows, refs
+// or contact data. `days`: whole number 1..90 (the outcome log keeps 90 days),
+// default 30. See services/gardssalg-mcp-funnel.ts.
+router.get(
+  "/admin/gardssalg/booking-funnel",
+  requireAdmin,
+  (req: Request, res: Response) => {
+    const raw = req.query?.days;
+    let days = 30;
+    if (raw !== undefined) {
+      const s = typeof raw === "string" ? raw.trim() : "";
+      if (!/^\d{1,3}$/.test(s) || Number(s) < 1 || Number(s) > GARDSSALG_FUNNEL_RETENTION_DAYS) {
+        res.status(400).json({ error: `days must be a whole number from 1 to ${GARDSSALG_FUNNEL_RETENTION_DAYS}` });
+        return;
+      }
+      days = Number(s);
+    }
+    try {
+      const funnel = getGardssalgBookingFunnel(getExpDb("experiences"), days);
+      res.json({ success: true, days, since: funnel.since, outcome_codes: GARDSSALG_FUNNEL_OUTCOMES, by_client: funnel.by_client, total: funnel.total });
+    } catch (err) {
+      console.error("[gardssalg/booking-funnel] query failed:", err);
+      res.status(500).json({ error: "Failed to query the booking funnel" });
+    }
   },
 );
 
