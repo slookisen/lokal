@@ -154,6 +154,7 @@ import {
 // — the SAME shared choke point POST /api/opplevelser/book and the no-JS SSR
 // fallback use, never re-derived here.
 import { checkBookingSlotAllowed } from "../services/gardssalg-opening-hours";
+import { gardssalgVisitFacts } from "../services/gardssalg-visit-facts";
 // dev-request 2026-09-16-opplevagent-en-setning-booking-via-ai («book et møte
 // hos X fredag 20. okt kl 10»): name → provider resolution, the requested-
 // weekday guard and the shared honest-outcome payloads, all called BEFORE the
@@ -747,6 +748,16 @@ export function bookPreviewMessage(vars: { produsent: string; slotAt: string; an
   const fill = (t: string, lang: "nb" | "en") =>
     fillOa1(t, { produsent: vars.produsent, tid: formatOsloInstant(iso, lang), antall: String(vars.antall) });
   return `${fill(nb, "nb")} / ${fill(en, "en")}`;
+}
+
+// O5-5 (same dev-request): discover_gardssalg rows carry the producer's own
+// opening hours text and visit description, behind
+// GARDSSALG_MCP_VISIT_FACTS_ENABLED (off unless exactly "true"; read on each
+// call). Off: every row is byte-identical. Only owner-stated, rule-checked
+// text — see services/gardssalg-visit-facts.ts. No tools/list change: the
+// tool declares no outputSchema.
+export function gardssalgVisitFactsEnabled(): boolean {
+  return process.env.GARDSSALG_MCP_VISIT_FACTS_ENABLED === "true";
 }
 
 // O5-2 (same dev-request): get_gardssalg_booking, behind
@@ -1666,6 +1677,7 @@ export function registerExperienceTools(
             ? "Ingen gårdssalg-produsenter funnet med de angitte filtrene. / No gårdssalg producers found matching the given filters."
             : `Fant ${results.length} gårdssalg-produsent(er). / Found ${results.length} gårdssalg producer(s).`;
 
+        const withVisitFacts = gardssalgVisitFactsEnabled();
         const formatted = results.map((row) => {
           // catalog_hidden is never 1 here — searchGardssalgProviders()'s base
           // WHERE clause already excludes those rows entirely — so this call
@@ -1695,6 +1707,9 @@ export function registerExperienceTools(
             // Only present when an origin (lat/lng) was given — mirrors
             // discover_experiences's own ...(hasGeo ? {...} : {}) spread.
             ...(hasGeo ? { distance_km: row.distance_km ?? null } : {}),
+            // O5-5: only with the flag on, and only the fields the producer
+            // stated itself (absent otherwise — never null/empty).
+            ...(withVisitFacts ? gardssalgVisitFacts(row) : {}),
           };
         });
 
