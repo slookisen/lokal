@@ -143,6 +143,10 @@ jobs:
     # excludes it from this gate's own "checks still running" test.
     name: evaluate (${{ matrix.pr_number }})
     runs-on: ubuntu-latest
+    # Must exceed the event-run check-poll budget (EVENT_POLL_BUDGET_MIN = 30 in
+    # step 5) plus API calls and the short merge poll, but stop a hung run long
+    # before the 6 h default.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       max-parallel: 3
@@ -152,7 +156,9 @@ jobs:
       group: fleet-auto-approve-pr-${{ matrix.pr_number }}
       # Event runs keep cancel-in-progress (a newer push/comment supersedes an
       # older evaluation). A sweep run must not cancel an event run that is
-      # mid-way through its full poll budget, so sweep runs queue instead.
+      # mid-way through its full poll budget, so sweep runs queue instead (behind
+      # an event run of up to ~30 min; GitHub keeps at most one pending run per
+      # group, so a newer queued sweep replaces an older queued one).
       cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
     permissions:
       pull-requests: write
@@ -907,13 +913,24 @@ jobs:
             //    historical runs, confirmed empirically), so returning immediately while
             //    checks are still running leaves the PR stuck with nothing to re-evaluate
             //    it (dev-requests/2026-07-20-fleet-auto-approve-gate-race-checks-pending.md;
-            //    PRs #304, #306, #345 all got stuck this way). Wait here up to ~10 minutes
-            //    (15s intervals) and finish the approve+merge in this same run if checks
-            //    land green within that budget.
+            //    PRs #304, #306, #345 all got stuck this way). Wait here up to
+            //    EVENT_POLL_BUDGET_MIN minutes (15s intervals) and finish the
+            //    approve+merge in this same run if checks land green within that budget.
+            //
+            //    The event budget must outlast the slowest required check: fly-deploy.yml's
+            //    "Test-suite determinism gate (3x same SHA)" takes ~18-23 min, so a ~10-min
+            //    budget gave up before it finished on every fleet PR and left each one
+            //    waiting for the 30-min sweep (dev-request 2026-11-18-fleet-gate-
+            //    pollbudsjett-under-determinismeport; lokal#1613). The evaluate job's
+            //    `timeout-minutes` must stay above this budget — asserted by
+            //    scripts/test-fleet-auto-approve-scheduled-reeval.js.
             const POLL_INTERVAL_MS = 15000;
+            const EVENT_POLL_BUDGET_MIN = 30;
             // Sweep runs fire every 30 min, so they get a short budget (~1 min) instead of
-            // stacking 10-minute jobs; event runs keep the full ~10 minutes.
-            const MAX_POLLS = isSweep ? 4 : 40; // 40 sleeps of 15s = ~10 minutes total (41st fetch is a no-sleep final check)
+            // stacking long jobs; event runs get the full EVENT_POLL_BUDGET_MIN.
+            const SWEEP_MAX_POLLS = 4;
+            const EVENT_MAX_POLLS = Math.ceil((EVENT_POLL_BUDGET_MIN * 60 * 1000) / POLL_INTERVAL_MS); // 120 sleeps of 15s = ~30 min (final fetch is a no-sleep check)
+            const MAX_POLLS = isSweep ? SWEEP_MAX_POLLS : EVENT_MAX_POLLS;
             // Self-check race: this very workflow's own check runs (the `resolve-pr`
             // and `evaluate` jobs of fleet-auto-approve.yml, whose check-run `name`
             // defaults to the job's display name since neither sets a custom `name:`)
@@ -974,7 +991,7 @@ jobs:
                 core.info('sweep: checks still running after the short poll budget — next sweep will re-evaluate');
                 return;
               }
-              await note('checks still running after the ~10-minute poll budget. No auto-approve yet — a future comment or push will re-evaluate.');
+              await note(`checks still running after the ~${EVENT_POLL_BUDGET_MIN}-minute poll budget. No auto-approve yet — a future comment or push will re-evaluate.`);
               core.info('checks still incomplete after full poll budget — giving up for this run; a future comment/push will re-evaluate');
               return;
             }
