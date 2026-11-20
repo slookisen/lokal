@@ -32096,6 +32096,18 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gorg.failures) failures.push("opplevelser-gardssalg-outreach-reply-guard-touch-cap: " + f);
     console.log(`  opplevelser-gardssalg-outreach-reply-guard-touch-cap: ${gorg.passed} passed, ${gorg.failed} failed`);
 
+    // dev-request 2026-11-20-opplevagent-utsending-hele-sperrelista-og-rfb-svar: whole
+    // blocklist + cross-platform replies behind GARDSSALG_OUTREACH_FULL_SUPPRESSION_ENABLED,
+    // with the shadow report in daily-prep and the candidates route.
+    console.log("\n── opplevelser-gardssalg-outreach-full-suppression: whole blocklist + cross-platform replies ──");
+    const { runOpplevelserGardssalgOutreachFullSuppressionTests } = require("../src/routes/opplevelser-gardssalg-outreach-full-suppression.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-outreach-full-suppression.test");
+    const gofs = await runOpplevelserGardssalgOutreachFullSuppressionTests({ log: false });
+    passed += gofs.passed;
+    failed += gofs.failed;
+    for (const f of gofs.failures) failures.push("opplevelser-gardssalg-outreach-full-suppression: " + f);
+    console.log(`  opplevelser-gardssalg-outreach-full-suppression: ${gofs.passed} passed, ${gofs.failed} failed`);
+
     // dev-request 2026-11-15-opplevagent-fem-henvendelser, A1: rounds, template
     // per round without fallback, promise_given, ordering and per-round counts.
     console.log("\n── opplevelser-gardssalg-outreach-rounds-a1: rounds + promise_given + no_template_for_touch ──");
