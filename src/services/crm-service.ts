@@ -184,11 +184,17 @@ class CrmService {
    * brand-new contact that hasn't been INSERTed yet (crm_actions.contact_id
    * has an ON DELETE SET NULL FK — logging against a not-yet-existing row
    * would violate it under foreign_keys=ON).
+   *
+   * `opts.noSideEffects` (default false) makes the call strictly read-only:
+   * a blocked platform-name match is still treated as "no match", but no
+   * crm_actions row is written and nothing (incl. the e-mail) is logged to the
+   * console. Used by relinkUnlinkedRfb()'s dry run, which must not write.
    */
   classifyEmail(
     email: string,
     vertical: CrmVertical,
     contactIdForLog: string | null = null,
+    opts: { noSideEffects?: boolean } = {},
   ): { type: ContactType; agentId: string | null; providerId: string | null } {
     const db = getDb();
     const lowerEmail = email.trim().toLowerCase();
@@ -210,6 +216,7 @@ class CrmService {
     // auto-link, per the guard above.
     const blockIfPlatformNameAgent = (agentId: string): boolean => {
       if (!this.isPlatformNameAgent(agentId, vertical)) return false;
+      if (opts.noSideEffects) return true;
       console.warn(
         `[crm] classifyEmail: refusing to auto-link ${lowerEmail} to agent ${agentId} — ` +
           `its name matches the '${vertical}' platform's own display_name ` +
@@ -429,6 +436,101 @@ class CrmService {
       }
     }
     return { evaluated: rows.length, reclassified };
+  }
+
+  /**
+   * One-time relink of existing UNLINKED rfb contacts (svarsperre follow-up to
+   * lokal#1609). A contact that replied while its agent_id was NULL is invisible
+   * to every agent_id-keyed suppression reader; this sweep links every such row
+   * that classifyEmail() now resolves to a producer.
+   *
+   * Candidates use the same rule as resolveContact()'s needsReclassify for rfb:
+   * vertical rfb, agent_id NULL, type not 'vendor'/'marketing' (so 'unknown'
+   * and 'producer' are included). A candidate is "relinkable" only when
+   * classifyEmail() returns a non-null agentId; a type-only outcome (e.g.
+   * unknown -> vendor with no agent) is NOT counted and NOT written here —
+   * that is reclassifyUnknown()'s job.
+   *
+   * dryRun=true performs NO writes: classifyEmail runs with noSideEffects, so
+   * even a blocked platform-name match writes no crm_actions row.
+   * dryRun=false applies everything in ONE transaction: a guarded UPDATE
+   * (`AND agent_id IS NULL`, so a concurrently-linked row is never overwritten)
+   * plus one 'contact_reclassified' crm_actions audit row (actor 'system',
+   * payload.source 'relink_unlinked_rfb') per relinked contact. Idempotent: a
+   * second apply finds no relinkable rows.
+   *
+   * The result carries ids and counts only — no e-mail addresses or names.
+   */
+  relinkUnlinkedRfb(opts: { dryRun: boolean }): {
+    dry_run: boolean;
+    evaluated: number;
+    relinkable: number;
+    relinked: number;
+    with_inbound_reply: number;
+    sample: Array<{ contact_id: string; agent_id: string; type: ContactType }>;
+  } {
+    const db = getDb();
+    const dryRun = opts.dryRun !== false;
+    const run = () => {
+      const rows = db
+        .prepare(
+          `SELECT id, email, type FROM crm_contacts
+            WHERE COALESCE(vertical_id, 'rfb') = 'rfb'
+              AND agent_id IS NULL
+              AND type NOT IN ('vendor', 'marketing')
+            ORDER BY id`,
+        )
+        .all() as Array<{ id: string; email: string; type: ContactType }>;
+      const hasInbound = db.prepare(
+        `SELECT 1 FROM crm_contacts c
+          WHERE c.id = ?
+            AND (c.retention_last_inbound_at IS NOT NULL
+                 OR EXISTS (SELECT 1 FROM crm_threads t
+                              JOIN crm_messages m ON m.thread_id = t.id
+                             WHERE t.contact_id = c.id AND m.direction = 'in'))`,
+      );
+      const update = db.prepare(
+        "UPDATE crm_contacts SET type = ?, agent_id = ?, provider_id = ? WHERE id = ? AND agent_id IS NULL",
+      );
+      let relinkable = 0;
+      let relinked = 0;
+      let withInboundReply = 0;
+      const sample: Array<{ contact_id: string; agent_id: string; type: ContactType }> = [];
+      for (const r of rows) {
+        const c = dryRun
+          ? this.classifyEmail(r.email, "rfb", null, { noSideEffects: true })
+          : this.classifyEmail(r.email, "rfb", r.id);
+        if (!c.agentId) continue;
+        relinkable++;
+        if (hasInbound.get(r.id)) withInboundReply++;
+        if (sample.length < 20) sample.push({ contact_id: r.id, agent_id: c.agentId, type: c.type });
+        if (dryRun) continue;
+        const res = update.run(c.type, c.agentId, c.providerId, r.id);
+        if (res.changes > 0) {
+          relinked++;
+          this.logAction({
+            contactId: r.id,
+            type: "contact_reclassified",
+            actor: "system",
+            payload: {
+              source: "relink_unlinked_rfb",
+              previous_type: r.type,
+              type: c.type,
+              agent_id: c.agentId,
+            },
+          });
+        }
+      }
+      return {
+        dry_run: dryRun,
+        evaluated: rows.length,
+        relinkable,
+        relinked,
+        with_inbound_reply: withInboundReply,
+        sample,
+      };
+    };
+    return dryRun ? run() : db.transaction(run)();
   }
 
   /**

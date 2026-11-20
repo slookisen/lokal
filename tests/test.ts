@@ -1436,6 +1436,21 @@ console.log("\n── crm-service (resolveContact self-healing agent_id link) �
   console.log(`  crm-service-resolve-contact: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── crm-service: one-time relink of unlinked rfb contacts (svarsperre,
+// follow-up to lokal#1609). relinkUnlinkedRfb() + POST
+// /admin/crm/contacts/relink-unlinked: dry run by default, no writes in dry
+// run, audited + idempotent apply, no e-mail addresses in the response.
+console.log("\n── crm-service (relink unlinked rfb contacts) ──");
+{
+  const { runCrmServiceRelinkUnlinkedTests } = require("../src/services/crm-service-relink-unlinked.test") as
+    typeof import("../src/services/crm-service-relink-unlinked.test");
+  const r = runCrmServiceRelinkUnlinkedTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("crm-service-relink-unlinked: " + f);
+  console.log(`  crm-service-relink-unlinked: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── admin-outreach-candidates: belt-and-suspenders CRM-send guard (P0 fix) ──
 // Pins the defense-in-depth fix for the same 2026-07-11 P0 incident: an
 // independent recipient-email check against crm_messages, so a broken
