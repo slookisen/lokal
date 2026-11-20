@@ -29645,6 +29645,29 @@ router.get("/admin/gardssalg-provider-lookup", requireAdmin, (req: Request, res:
 //   ?since=<ISO-8601>  — default: 7 days before now (also the fallback
 //                        for an unparseable value)
 //   ?limit=<int>       — default 10, clamped to [1, 50]
+//   ?include_stored=1  — top up the sample from content already stored when
+//                        the window yields fewer than `limit` providers
+//                        (dev-request slice c, 2026-11-20: an enrichment write
+//                        pause empties the window and blinds the spot-check that
+//                        should judge it). Window providers come first, exactly
+//                        as without the param; the remainder is random providers
+//                        enriched at ANY time (last_enriched_at NOT NULL), not
+//                        hidden from the catalog (catalog_hidden unset/0) and not
+//                        the test provider (is_test_provider unset/0), no
+//                        duplicates — and only providers with CHECKABLE content
+//                        after the same projection below: a non-empty
+//                        about_text / visit_text / opening_hours_text, a
+//                        non-empty products list, or at least one
+//                        enriched_experiences row that survived the per-field
+//                        provenance screen (i.e. still has a judgeable
+//                        description/category/booking_url). That is this
+//                        endpoint's own notion of "something to check"; there is
+//                        no with_fields param here. A SQL pre-filter narrows the
+//                        candidates, the projection decides. Only with this
+//                        param: each provider carries `sample_source: "recent" |
+//                        "stored"` and the response carries
+//                        `sample_source_counts: { recent, stored }`. Off by
+//                        default (response unchanged).
 //
 // Auth: requireAdmin (same X-Admin-Key convention as the rest of this file).
 // Returns: 200 { success, count, providers: [{ id, name, website,
@@ -29728,6 +29751,7 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
     let limit = parseInt((req.query.limit as string) || "10", 10);
     if (!Number.isFinite(limit)) limit = 10;
     limit = Math.min(50, Math.max(1, limit));
+    const includeStored = wantsStoredTopUp(req.query.include_stored);
 
     const rows = expDb
       .prepare(
@@ -29856,7 +29880,8 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
       console.error("[opplevelser] providers/recently-enriched: could not prepare enriched_experiences query", err);
     }
 
-    const providers = rows.map((r) => {
+    type ProviderRow = (typeof rows)[number];
+    const toProvider = (r: ProviderRow) => {
       let products: unknown[] = [];
       if (r.products) {
         try {
@@ -30031,9 +30056,74 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
         field_provenance: null,
         provenance_model: "none",
       };
-    });
+    };
 
-    res.json({ success: true, count: providers.length, providers });
+    const providers = rows.map(toProvider);
+
+    if (!includeStored) {
+      res.json({ success: true, count: providers.length, providers });
+      return;
+    }
+
+    // include_stored=1: top up from stored content (see the param doc above).
+    const nonEmpty = (v: string | null): boolean => typeof v === "string" && v.trim() !== "";
+    const hasCheckableContent = (p: ReturnType<typeof toProvider>): boolean =>
+      nonEmpty(p.about_text) || nonEmpty(p.visit_text) || nonEmpty(p.opening_hours_text) ||
+      p.products.length > 0 || p.enriched_experiences.length > 0;
+    let storedProviders: ReturnType<typeof toProvider>[] = [];
+    const remaining = limit - providers.length;
+    if (remaining > 0) {
+      const exclude = notInClause("p.id", providers.map((p) => p.id));
+      // Over-fetch: the per-field provenance screen in toProvider can still
+      // leave a pre-filtered candidate with nothing judgeable. Bounded at 150
+      // candidates (each costs one bounded enriched_experiences read).
+      const candidateLimit = Math.min(150, remaining * 3);
+      // The EXISTS mirrors expRowsStmt's row filter (enrichment_state,
+      // canonical_id, owner/claim lock) plus "at least one judged field
+      // non-empty"; the provenance half of the screen cannot be expressed in
+      // SQL and is applied by toProvider + hasCheckableContent below.
+      const storedRows = expDb
+        .prepare(
+          `SELECT p.id, p.navn, p.hjemmeside, p.last_enriched_at, p.about_text, p.visit_text,
+                  p.opening_hours_text, p.products, p.content_source, p.content_evidence_url
+             FROM experience_providers p
+            WHERE p.last_enriched_at IS NOT NULL
+              AND COALESCE(p.catalog_hidden, 0) = 0
+              AND COALESCE(p.is_test_provider, 0) = 0
+              ${exclude.sql}
+              AND (
+                COALESCE(TRIM(p.about_text), '') <> ''
+                OR COALESCE(TRIM(p.visit_text), '') <> ''
+                OR COALESCE(TRIM(p.opening_hours_text), '') <> ''
+                OR COALESCE(TRIM(p.products), '') NOT IN ('', '[]')
+                OR EXISTS (
+                  SELECT 1 FROM experiences e
+                   WHERE e.provider_id = p.id
+                     AND e.enrichment_state IN ('enriched', 'verified')
+                     AND e.canonical_id IS NULL
+                     AND (e.content_source IS NULL OR e.content_source NOT IN ('manual','claim'))
+                     AND (COALESCE(TRIM(e.description), '') <> ''
+                          OR COALESCE(TRIM(e.category), '') <> ''
+                          OR COALESCE(TRIM(e.booking_url), '') <> '')
+                )
+              )
+            ORDER BY RANDOM()
+            LIMIT ?`
+        )
+        .all(...exclude.params, candidateLimit) as ProviderRow[];
+      for (const row of storedRows) {
+        if (storedProviders.length >= remaining) break;
+        const projected = toProvider(row);
+        if (hasCheckableContent(projected)) storedProviders.push(projected);
+      }
+    }
+    const merged = mergeSample(providers, storedProviders, limit);
+    res.json({
+      success: true,
+      count: merged.rows.length,
+      providers: merged.rows,
+      sample_source_counts: merged.counts,
+    });
   } catch (err: any) {
     console.error("[opplevelser] providers/recently-enriched failed", err);
     res.status(500).json({ error: "Internal error" });
@@ -41008,6 +41098,7 @@ router.post("/admin/experience-orgnr-job-run", requireAdmin, async (req: Request
 
 import { nameSimilarity } from "../services/name-matcher";
 import { getExperienceFactsProposalsStatus } from "../services/experience-facts-proposals-job";
+import { wantsStoredTopUp, notInClause, mergeSample } from "./recently-enriched-sample";
 
 export const EXPERIENCE_FACTS_CANDIDATES_DEFAULT_LIMIT = 10;
 export const EXPERIENCE_FACTS_CANDIDATES_MAX_LIMIT = 25;

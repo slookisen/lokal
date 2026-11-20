@@ -37496,6 +37496,20 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("opplevelser-providers-recently-enriched: unexpected error: " + String(err?.message || err));
   }
 
+  console.log("\n── orch-pr-20261120-stikkprove-lagret: recently-enriched include_stored=1 top-up (rfb/dental/experiences) ──");
+  try {
+    const { runRecentlyEnrichedIncludeStoredTests } = require("../src/routes/recently-enriched-include-stored.test") as
+      typeof import("../src/routes/recently-enriched-include-stored.test");
+    const ris = await runRecentlyEnrichedIncludeStoredTests({ log: false });
+    passed += ris.passed;
+    failed += ris.failed;
+    for (const f of ris.failures) failures.push("recently-enriched-include-stored: " + f);
+    console.log(`  recently-enriched-include-stored: ${ris.passed} passed, ${ris.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("recently-enriched-include-stored: unexpected error: " + String(err?.message || err));
+  }
+
   // dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-hygiene:
   // GET .../providers/by-hjemmeside (find providers stuck on an aggregator/DMO
   // homepage) + PATCH .../providers/:id/hjemmeside (the correction write path
