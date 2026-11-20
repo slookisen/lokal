@@ -48,13 +48,26 @@
 //               (≥4 letters). Never the registrant-typed profile name, never
 //               page text alone (anyone can point at a page showing a name).
 //               The e-mail domain only counts with MX. Only booleans stored.
+//   junk_content cheap, deterministic, no network (assessJunkContent):
+//               - name_junk: the profile name (generic words like «gård»
+//                 dropped) has no letters, is one letter repeated (≥3),
+//                 a 2-letter unit repeated ≥3 times or a 3-letter unit ≥3
+//                 times («ababab»), or is made only of runs of ≥3
+//                 neighbouring keys on one keyboard row, ≥4 letters long
+//                 («asdasd», «qwerty», «asdf»). Short real names («Bø»,
+//                 «Ås gård», «Li Gård», «Anna») never hit.
+//               - description_link_only: the description carries a link to
+//                 a host that is neither the profile's website nor e-mail
+//                 domain (nor a common social/map host), and apart from the
+//                 link(s) it is ≤ 12 words.
 //   owner_claim the shared customer rule (customer-rule.ts: agents.claimed_at
 //               OR a verified agent_claims row; a revoked claim has status
 //               'revoked', so it never counts). Recorded for the reviewer; not
 //               part of the rule.
 //
-// Rule R2 (R1 + the self-reported org.nr / domain-tie hardening)
-//   avvis      disposable e-mail
+// Rule R3 (R2 + junk content; R2 = R1 + the self-reported org.nr /
+// domain-tie hardening)
+//   avvis      disposable e-mail (alone, and so also with junk content)
 //              OR the Brreg entity for the profile's org.nr is deleted/konkurs
 //              OR an exact duplicate (same org.nr or same contact e-mail) of an
 //                 existing VETTED agent.
@@ -66,8 +79,10 @@
 //              AND no unavailable source
 //              AND, when the entity came from registrant input (self-reported
 //                 org.nr or a name search), a domain tie (see domain_tie).
+//              AND no junk content (junk_content.junk).
 //   spor_forst everything else (any unavailable source, free-mail without
-//              other support, name+place duplicate, under avvikling, …).
+//              other support, name+place duplicate, under avvikling, junk
+//              content, …).
 //
 // Privacy: only org.nr, flags, NACE and kommune are stored from Brreg —
 // never the registered name (an ENK name is a person's name) or any role.
@@ -94,7 +109,7 @@ export function registrationPrecheckEnabled(env: NodeJS.ProcessEnv = process.env
   return env[REGISTRATION_PRECHECK_FLAG] !== "false";
 }
 
-export const REGISTRATION_PRECHECK_RULE_VERSION = "R2" as const;
+export const REGISTRATION_PRECHECK_RULE_VERSION = "R3" as const;
 export const REGISTRATION_PRECHECK_SOURCE_TIMEOUT_MS = 4000;
 export const REGISTRATION_PRECHECK_TOTAL_TIMEOUT_MS = 12000;
 export const REGISTRATION_PRECHECK_DUPLICATE_CAP = 5;
@@ -166,6 +181,17 @@ export interface DomainTieSignal {
   required: boolean;
 }
 
+export interface JunkContentSignal {
+  /** The profile name looks like keyboard mash / no real word. */
+  name_junk: boolean;
+  name_reason: "no_letters" | "repeated" | "keyboard" | null;
+  /** The description is essentially only a link to an unrelated host. */
+  description_link_only: boolean;
+  /** That unrelated host (a public site name, never an address). */
+  description_link_host: string | null;
+  junk: boolean;
+}
+
 export interface RegistrationPrecheck {
   recommendation: PrecheckRecommendation;
   reasons: string[];
@@ -176,6 +202,8 @@ export interface RegistrationPrecheck {
     duplicates: DuplicateSignal;
     domain_tie: DomainTieSignal;
     owner_claim: { confirmed: boolean };
+    /** R3+. Absent in a precheck stored by R1/R2. */
+    junk_content?: JunkContentSignal;
   };
   unavailable_sources: PrecheckSource[];
   rule_version: typeof REGISTRATION_PRECHECK_RULE_VERSION;
@@ -188,6 +216,8 @@ export interface RegistrationPrecheckInput {
   contactEmail: string | null;
   url: string | null;
   city: string | null;
+  /** The profile description (R3 junk-content signal); absent/null = none. */
+  description?: string | null;
   orgNr: string | null;
   /** True when orgNr came from the registrant (`org_nr:` tag), not an audited write. */
   orgNrSelfReported: boolean;
@@ -305,6 +335,109 @@ export function readBrregEnhet(json: unknown): {
     deleted: !!str(e.slettedato),
     konkurs: e.konkurs === true,
     underAvvikling: e.underAvvikling === true || e.underTvangsavviklingEllerTvangsopplosning === true,
+  };
+}
+
+// ─── junk content (R3) ────────────────────────────────────────────────────
+
+const KEYBOARD_ROWS = ["qwertyuiopå", "asdfghjkløæ", "zxcvbnm"];
+
+/** `w` splits into runs of ≥3 neighbouring keys (left→right) on one row. */
+function isKeyboardRuns(w: string): boolean {
+  const n = w.length;
+  const canEnd: boolean[] = new Array(n + 1).fill(false);
+  canEnd[0] = true;
+  for (let i = 0; i < n; i++) {
+    if (!canEnd[i]) continue;
+    for (const row of KEYBOARD_ROWS) {
+      let pos = row.indexOf(w[i]!);
+      if (pos < 0) continue;
+      let j = i + 1;
+      while (j < n && pos + 1 < row.length && row[pos + 1] === w[j]) { pos++; j++; }
+      for (let end = i + 3; end <= j; end++) canEnd[end] = true;
+    }
+  }
+  return canEnd[n]!;
+}
+
+/** `w` is `unit` (length 1–3) repeated: 1 letter ≥3×, 2 or 3 letters ≥3×. */
+function isRepeatedUnit(w: string): boolean {
+  for (const len of [1, 2, 3]) {
+    if (w.length < len * 3 || w.length % len !== 0) continue;
+    const unit = w.slice(0, len);
+    if (unit.repeat(w.length / len) === w) return true;
+  }
+  return false;
+}
+
+/**
+ * Keyboard mash / no-word profile names (see the header). Generic words
+ * («gård», «farm», «AS» …) are dropped first; a name that is only generic
+ * words is not junk.
+ */
+export function junkNameReason(name: string): JunkContentSignal["name_reason"] {
+  const raw = String(name ?? "").normalize("NFKC").toLowerCase();
+  if (!/\p{L}/u.test(raw)) return "no_letters";
+  const tokens = raw.split(/[^\p{L}]+/u).filter(Boolean)
+    .filter((t) => !GENERIC_NAME_TOKENS.has(normaliseName(t).replace(/[^a-z0-9]/g, "")));
+  const w = tokens.join("");
+  if (!w) return null;
+  if (isRepeatedUnit(w)) return "repeated";
+  if (w.length >= 4 && isKeyboardRuns(w)) return "keyboard";
+  return null;
+}
+
+/** Hosts a farm legitimately links to from its own description. */
+const COMMON_LINK_HOSTS: ReadonlySet<string> = new Set([
+  "facebook.com", "fb.com", "fb.me", "instagram.com", "tiktok.com", "youtube.com", "youtu.be", "linkedin.com",
+  "google.com", "goo.gl", "google.no", "vipps.no", "rekoringen.no", "bondensmarked.no", "rettfrabonden.com",
+]);
+const BARE_LINK_TLDS = "com|org|net|no|info|io|biz|xyz|ru|top|site|online|shop|store|app|dev|me|co|se|dk|eu|uk|de";
+// Scheme links, www. links and bare hosts on a common TLD. The lookbehind keeps
+// an e-mail address («post@gard.no») and a mid-word dot out.
+const LINK_RE = new RegExp(
+  String.raw`(?:https?:\/\/[^\s<>"')\]]+|(?<![\p{L}\p{N}.@-])www\.[^\s<>"')\]]+|(?<![\p{L}\p{N}.@-])(?:[\p{L}\p{N}-]+\.)+(?:${BARE_LINK_TLDS})(?![\p{L}\p{N}-])(?:\/[^\s<>"')\]]*)?)`,
+  "giu",
+);
+
+function linkHost(link: string): string | null {
+  const s = link.replace(/^https?:\/\//i, "").split(/[/?#:]/)[0]!.toLowerCase().replace(/\.$/, "");
+  return s ? (registrableDomain(s) ?? s) : null;
+}
+
+/**
+ * The description is essentially only a link to an unrelated host (see the
+ * header): returns that host, or null.
+ */
+export function descriptionLinkOnlyHost(description: string | null | undefined, ownHosts: Array<string | null>): string | null {
+  const text = String(description ?? "");
+  if (!text.trim()) return null;
+  const own = new Set(ownHosts.filter((h): h is string => !!h).map((h) => registrableDomain(h.toLowerCase()) ?? h.toLowerCase()));
+  const links = text.match(LINK_RE) ?? [];
+  let foreign: string | null = null;
+  for (const l of links) {
+    const h = linkHost(l);
+    if (!h || own.has(h) || COMMON_LINK_HOSTS.has(h)) continue;
+    foreign = foreign ?? h;
+  }
+  if (!foreign) return null;
+  const rest = text.replace(LINK_RE, " ").replace(/<[^>]*>/g, " ").replace(/\]\(\s*\)/g, " ");
+  const words = rest.split(/\s+/).filter((t) => /\p{L}/u.test(t));
+  return words.length <= 12 ? foreign : null;
+}
+
+export function assessJunkContent(
+  input: { name: string; description?: string | null },
+  ownHosts: Array<string | null>,
+): JunkContentSignal {
+  const nameReason = junkNameReason(input.name);
+  const host = descriptionLinkOnlyHost(input.description, ownHosts);
+  return {
+    name_junk: nameReason !== null,
+    name_reason: nameReason,
+    description_link_only: host !== null,
+    description_link_host: host,
+    junk: nameReason !== null || host !== null,
   };
 }
 
@@ -444,6 +577,9 @@ export async function assessRegistration(
   domainTie.tied = (ownMail && emailSig.mx === true && domainTie.email_domain === true)
     || (website.answers === true && domainTie.website_domain === true);
 
+  // ── junk content (deterministic, no network) ──
+  const junk = assessJunkContent(input, [host, domain]);
+
   // ── reasons (short, Norwegian) ──
   const reasons: string[] = [];
   if (brreg.status === "unavailable") reasons.push("Brreg: utilgjengelig, ikke sjekket");
@@ -482,9 +618,13 @@ export async function assessRegistration(
   if (tieRequired) {
     reasons.push(domainTie.tied ? "Domene: knyttet til enheten" : "Domene: domenet er ikke knyttet til enheten");
   }
+  if (junk.name_junk) {
+    reasons.push(junk.name_reason === "no_letters" ? "Innhold: navnet har ingen bokstaver" : "Innhold: navnet ser ut som tastaturtull");
+  }
+  if (junk.description_link_only) reasons.push(`Innhold: beskrivelsen er bare en lenke til ${junk.description_link_host}`);
   reasons.push(input.ownerClaimConfirmed ? "Eierkrav: bekreftet" : "Eierkrav: ingen bekreftet");
 
-  // ── rule R2 ──
+  // ── rule R3 ──
   const brregDead = brreg.mode === "org_nr" && brreg.found && (brreg.deleted || brreg.konkurs);
   const avvis = emailSig.domain_type === "disposable" || brregDead || dup.exact_vetted_ids.length > 0;
   const brregMatch = brreg.status === "ok" && brreg.found && brreg.name_match && !brreg.deleted && !brreg.konkurs
@@ -494,7 +634,7 @@ export async function assessRegistration(
   const anyDuplicate = dup.exact_ids.length > 0 || dup.name_place_ids.length > 0;
   const recommendation: PrecheckRecommendation = avvis ? "avvis"
     : brregMatch && contactSupport && !anyDuplicate && unavailableSources.length === 0
-      && (!tieRequired || domainTie.tied) ? "godkjenn"
+      && (!tieRequired || domainTie.tied) && !junk.junk ? "godkjenn"
     : "spor_forst";
 
   return {
@@ -503,6 +643,7 @@ export async function assessRegistration(
     signals: {
       brreg, email: emailSig, website, duplicates: dup, domain_tie: domainTie,
       owner_claim: { confirmed: input.ownerClaimConfirmed },
+      junk_content: junk,
     },
     unavailable_sources: unavailableSources,
     rule_version: REGISTRATION_PRECHECK_RULE_VERSION,
@@ -520,6 +661,7 @@ interface AgentPrecheckRow {
   contact_email: string | null;
   url: string | null;
   city: string | null;
+  description: string | null;
   org_nr: string | null;
   tags: string | null;
   origin: string | null;
@@ -529,7 +671,7 @@ interface AgentPrecheckRow {
 
 function readAgentRow(db: Db, agentId: string): AgentPrecheckRow | undefined {
   return db.prepare(
-    `SELECT id, name, contact_email, url, city, org_nr, tags, origin, is_vetted, claimed_at FROM agents WHERE id = ?`
+    `SELECT id, name, contact_email, url, city, description, org_nr, tags, origin, is_vetted, claimed_at FROM agents WHERE id = ?`
   ).get(agentId) as AgentPrecheckRow | undefined;
 }
 
@@ -623,6 +765,7 @@ export function gatherRegistrationPrecheckInput(db: Db, agentId: string): Regist
     contactEmail: row.contact_email,
     url: row.url,
     city: row.city,
+    description: row.description,
     orgNr,
     orgNrSelfReported,
     duplicates: {
