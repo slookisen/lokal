@@ -751,7 +751,7 @@ export function bookPreviewMessage(vars: { produsent: string; slotAt: string; an
 }
 
 // O5-5 (same dev-request): discover_gardssalg rows carry the producer's own
-// opening hours (text + parsed windows) and visit description, behind
+// opening hours text and visit description, behind
 // GARDSSALG_MCP_VISIT_FACTS_ENABLED (off unless exactly "true"; read on each
 // call). Off: every row is byte-identical. Only owner-stated, rule-checked
 // text — see services/gardssalg-visit-facts.ts. No tools/list change: the

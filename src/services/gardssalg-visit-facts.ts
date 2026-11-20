@@ -6,14 +6,18 @@
  * GARDSSALG_MCP_VISIT_FACTS_ENABLED, read in routes/experiences-mcp.ts):
  *
  *   - opening_hours_text — the producer's own opening-hours text,
- *   - opening_windows    — that text as parsed by parseOpeningHoursText(), the
- *                          SAME parser book_gardssalg's outside_hours check
- *                          uses (services/gardssalg-opening-hours.ts),
  *   - visit_description  — the producer's own visit text (visit_text).
+ *
+ * No parsed opening windows: parseOpeningHoursText() reads one time range and
+ * no negations («Stengt mandag», «unntatt søndag», «lør 11-15» after
+ * «Man-fre 10-16»), so a structured window could state more than the producer
+ * wrote. The row carries the producer's own text only.
  *
  * Only what the producer stated itself: a field is used only when the owner
  * saved it in the claim portal, i.e. field_provenance.owner_locks.<field> is
- * set and was not set by Opplevagent support (locked_by "admin"). Text the
+ * a plain object with no locker (`locked_by` absent, null or undefined). Any
+ * `locked_by` string («admin», «Admin», «system», …) means someone other than
+ * the owner set it. Text the
  * content job scraped or an LLM extracted is never used. There is no
  * owner-stated group-size field on experience_providers, so none is returned.
  *
@@ -25,8 +29,6 @@
  * Pure: no DB access, no logging.
  */
 
-import { getClaimOwnerLocks } from "./gardssalg-claim";
-import { parseOpeningHoursText, type Weekday } from "./gardssalg-opening-hours";
 import { classifyCartItemBan, hasDrinkSigns } from "./cart-item-ban";
 
 export interface GardssalgVisitFactsSource {
@@ -36,24 +38,32 @@ export interface GardssalgVisitFactsSource {
   field_provenance?: string | null;
 }
 
-export interface GardssalgOpeningWindow {
-  days: string[];
-  opens: string;
-  closes: string;
-}
-
 export interface GardssalgVisitFacts {
   opening_hours_text?: string;
-  opening_windows?: GardssalgOpeningWindow[];
   visit_description?: string;
 }
 
-const DAY_CODES: Record<Weekday, string> = { 0: "mon", 1: "tue", 2: "wed", 3: "thu", 4: "fri", 5: "sat", 6: "sun" };
+const isPlainObject = (v: unknown): v is Record<string, unknown> =>
+  v !== null && typeof v === "object" && !Array.isArray(v);
 
-/** True when the owner saved this field in the claim portal (not an admin lock). */
+/**
+ * True when the owner saved this field in the claim portal: the lock is a
+ * plain object without a locker. Fail-closed on anything else (malformed
+ * JSON, a null/string/array lock, any `locked_by` value but null/undefined).
+ */
 function ownerStated(row: GardssalgVisitFactsSource, field: string): boolean {
-  const lock = getClaimOwnerLocks({ field_provenance: row.field_provenance ?? null })[field];
-  return lock !== undefined && lock.locked_by !== "admin";
+  if (!row.field_provenance) return false;
+  let prov: unknown;
+  try {
+    prov = JSON.parse(row.field_provenance);
+  } catch {
+    return false;
+  }
+  if (!isPlainObject(prov) || !isPlainObject(prov.owner_locks)) return false;
+  if (!Object.prototype.hasOwnProperty.call(prov.owner_locks, field)) return false;
+  const lock = prov.owner_locks[field];
+  if (!isPlainObject(lock)) return false;
+  return lock.locked_by === undefined || lock.locked_by === null;
 }
 
 function productNames(raw: string | null | undefined): string[] {
@@ -67,14 +77,33 @@ function productNames(raw: string | null | undefined): string[] {
   }
 }
 
-// Prices: «149 kr», «kr 149», «NOK 200», «149,-», «149 kroner».
-const PRICE_RE = /\d\s*(?:kr\b|kr\.|nok\b|kroner|,-|,–|\.-)|\b(?:kr|nok)\.?\s*\d/i;
-// Strength: any percent figure, «prosent», «vol», «alk.», «abv».
-const STRENGTH_RE = /\d\s*%|%\s*\d|prosent|\bvol\b|\balk\.?\b|\babv\b|alkoholstyrke/i;
+// Prices: «149 kr», «kr 149», «NOK 200», «149,-», «149:-», «149 kroner»,
+// any currency word or sign (NKR, SEK, euro, €, krone), «Pris 150», «Billett 200».
+const PRICE_RE =
+  /\d\s*(?:kr\b|kr\.|nok\b|kroner|,-|,–|\.-|:-)|\b(?:kr|nok|nkr|sek|eur)\.?\s*\d|\bnkr\b|\bsek\b|\beuros?\b|€|\bkrone\b|\b(?:pris|priser|prisen|billett|billetter|billetten)\s*:?\s*(?:kr\.?\s*)?\d/i;
+// Strength: any percent/per-mille figure, «prosent», «pst», «vol», «alk.», «abv».
+const STRENGTH_RE = /\d\s*%|%\s*\d|prosent|\bpst\b|‰|％|\bvol\b|\balk\.?\b|\babv\b|alkoholstyrke/i;
 // Medals/awards, tasting and «free» claims (rule 2 and 6).
 const CLAIM_RE = /medalj|medal|award|prisvinn|kåret|smak|tasting|degust|gratis|\bfree\b/i;
-// A quoted span is treated as a product or brand name.
-const QUOTED_RE = /[«»“”"]/;
+// A quoted span is treated as a product or brand name: any typographic quote
+// mark, or a pair of straight apostrophes around text (a single possessive
+// apostrophe, «Ola's», does not count).
+const QUOTED_RE = /[«»“”"‘’‹›]|(?:^|[\s(\[:;,])'[^'\n]+'(?=$|[\s.,;:!?)\]])/;
+
+/** Test-only: the regex checks, so a test can show a text is caught by hasDrinkSigns alone. */
+export const __visitFactsRegexesForTesting = { PRICE_RE, STRENGTH_RE, CLAIM_RE, QUOTED_RE } as const;
+
+// Norwegian definite suffixes: «Sideren», «Ølet», «Vina», «Ølene» -> stem.
+const DEFINITE_SUFFIX_RE = /(?:ene|en|et|a)$/iu;
+
+function isAlcoholWord(word: string): boolean {
+  if (classifyCartItemBan({ name: word })?.kind === "alcohol") return true;
+  const stem = word.replace(DEFINITE_SUFFIX_RE, "");
+  // A two-letter stem only when it has æ/ø/å («Ølet» -> «Øl»), so a name like
+  // «Ola» is not read as «Ol».
+  const stemOk = stem.length >= 3 || (stem.length === 2 && /[æøå]/iu.test(stem));
+  return stem !== word && stemOk && classifyCartItemBan({ name: stem })?.kind === "alcohol";
+}
 
 /**
  * True when the text may name a product or brand, give a price or a strength,
@@ -85,21 +114,18 @@ export function gardssalgVisitTextLeaksDrink(text: string, products: readonly st
   if (hasDrinkSigns(text, "")) return true;
   const lower = text.toLowerCase();
   if (products.some((p) => lower.includes(p))) return true;
-  // A capitalised drink word («Hardangersider», «Juleøl», «IPA») reads as a
-  // product or brand name; the lower-case generic word («sider», «øl») does not.
+  // A capitalised or all-caps drink word («Hardangersider», «Juleøl», «IPA»,
+  // «SIDER», and definite forms like «Eplesideren», «Vinen») reads as a product
+  // or brand name; the lower-case generic word («sider», «øl») does not.
   for (const word of text.split(/[^\p{L}\d]+/u)) {
     if (!word || word[0] === word[0]!.toLowerCase()) continue;
     try {
-      if (classifyCartItemBan({ name: word })?.kind === "alcohol") return true;
+      if (isAlcoholWord(word)) return true;
     } catch {
       return true;
     }
   }
   return false;
-}
-
-function hhmm(min: number): string {
-  return `${String(Math.floor(min / 60)).padStart(2, "0")}:${String(min % 60).padStart(2, "0")}`;
 }
 
 /**
@@ -113,11 +139,6 @@ export function gardssalgVisitFacts(row: GardssalgVisitFactsSource): GardssalgVi
   const hours = typeof row.opening_hours_text === "string" ? row.opening_hours_text.trim() : "";
   if (hours && ownerStated(row, "opening_hours_text") && !gardssalgVisitTextLeaksDrink(hours, products)) {
     out.opening_hours_text = hours;
-    const parsed = parseOpeningHoursText(hours);
-    if (parsed && parsed.days.size > 0) {
-      const days = [...parsed.days].sort((a, b) => a - b).map((d) => DAY_CODES[d]);
-      out.opening_windows = [{ days, opens: hhmm(parsed.openMin), closes: hhmm(parsed.closeMin) }];
-    }
   }
 
   const visit = typeof row.visit_text === "string" ? row.visit_text.trim() : "";

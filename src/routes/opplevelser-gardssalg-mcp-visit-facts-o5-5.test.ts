@@ -2,8 +2,8 @@
  * opplevelser-gardssalg-mcp-visit-facts-o5-5.test.ts — dev-request
  * 2026-11-12-opplevagent-o5-besok-i-chatgpt-og-assistenter, slice O5-5.
  *
- * discover_gardssalg rows carry the producer's own opening hours (text +
- * parsed windows) and visit description behind
+ * discover_gardssalg rows carry the producer's own opening-hours text and
+ * visit description behind
  * GARDSSALG_MCP_VISIT_FACTS_ENABLED (off):
  *
  *   (ak1) flag off: tools/list equals the golden; the discover result is
@@ -13,6 +13,9 @@
  *         Opplevagent-support lock has none of them; tools/list unchanged.
  *   (ak3) a source text with a product/brand name, a price or a strength
  *         never leaks into the row.
+ *   (b1)  no row ever carries parsed opening windows (the parser reads one
+ *         range and no negations — it would state more than the producer).
+ *   (n2)  only a plain-object lock without a locker counts as owner-stated.
  *
  * Standalone: npx tsx src/routes/opplevelser-gardssalg-mcp-visit-facts-o5-5.test.ts
  * Wired into the gate via tests/test.ts.
@@ -36,7 +39,9 @@ const TOOLS_LIST_GOLDEN_SHA256 = "ca0b5c861ae68df2121db9fa96187301f5c5884546f6db
 const DISCOVER_GOLDEN_SHA256 = "f7b2b45d2ae30c19065be62f8d9a5dbdbdb5292fba76959f83212bb3eefdb5ec";
 
 const TEST_PROVIDER_ID = "0d11485a-c774-4f75-8bca-fd6e6fe19f8c";
+// opening_windows is never emitted (b1); kept here so any reintroduction is caught.
 const VISIT_KEYS = ["opening_hours_text", "opening_windows", "visit_description"];
+const EMITTED_KEYS = ["opening_hours_text", "visit_description"];
 
 function parseJsonRpcBody(text: string, contentType: string | null): any {
   if (contentType && contentType.includes("text/event-stream")) {
@@ -185,14 +190,14 @@ export function runOpplevelserGardssalgMcpVisitFactsTests(opts: { log?: boolean 
       const onText = await discover();
       const t = rowById(onText, TEST_PROVIDER_ID);
       assertEq(t.opening_hours_text, STATED_HOURS, "ak2b: test producer: opening_hours_text as stated");
-      assertEq(t.opening_windows, [{ days: ["sat"], opens: "12:00", closes: "16:00" }], "ak2c: test producer: parsed opening window");
+      assertTrue(!Object.prototype.hasOwnProperty.call(t, "opening_windows"), "ak2c/b1: test producer: no opening_windows key");
       assertEq(t.visit_description, STATED_VISIT, "ak2d: test producer: visit_description as stated");
-      assertEq(Object.keys(t).slice(-3), VISIT_KEYS, "ak2e: visit facts appended after the existing fields");
+      assertEq(Object.keys(t).slice(-2), EMITTED_KEYS, "ak2e: visit facts appended after the existing fields");
       for (const id of ["vf-none", "vf-scraped", "vf-admin", "vf-blank"]) {
         assertEq(visitKeysOf(rowById(onText, id)), [], `ak2f: ${id}: no visit fields (absent, not null)`);
       }
       const hoursOnly = rowById(onText, "vf-hours-only");
-      assertEq(visitKeysOf(hoursOnly), ["opening_hours_text"], "ak2g: unparseable stated hours: text only, no windows; scraped visit text left out");
+      assertEq(visitKeysOf(hoursOnly), ["opening_hours_text"], "ak2g: stated hours text only; scraped visit text left out");
       // Rows minus the visit fields are byte-identical to flag off.
       const stripped = JSON.parse(onText);
       for (const r of stripped.gardssalg_producers) for (const k of VISIT_KEYS) delete r[k];
@@ -201,7 +206,7 @@ export function runOpplevelserGardssalgMcpVisitFactsTests(opts: { log?: boolean 
       // ── (ak3) content rules ─────────────────────────────────────────────
       for (const id of ["vf-product", "vf-brand", "vf-price", "vf-strength", "vf-quoted"]) {
         const r = rowById(onText, id);
-        assertEq(visitKeysOf(r), ["opening_hours_text", "opening_windows"], `ak3: ${id}: visit_description dropped, clean opening hours kept`);
+        assertEq(visitKeysOf(r), ["opening_hours_text"], `ak3: ${id}: visit_description dropped, clean opening hours kept`);
       }
       assertEq(visitKeysOf(rowById(onText, "vf-hours-price")), [], "ak3b: opening hours with a price/tasting claim dropped");
       assertTrue(!/Vfjordbris|Hardangersider|149|4,7|Gamle Vfvik|200,-/.test(JSON.stringify(rowsOf(onText).map((r) => VISIT_KEYS.map((k) => r[k])))), "ak3c: no product/brand name, price or strength in any visit fact");
@@ -214,8 +219,56 @@ export function runOpplevelserGardssalgMcpVisitFactsTests(opts: { log?: boolean 
           .every(Boolean),
         "ak3d: sanitiser flags price, strength, medal, tasting, capitalised drink names and own product names",
       );
+      assertTrue(rowsOf(onText).every((r) => !Object.prototype.hasOwnProperty.call(r, "opening_windows")), "b1: flag on: no row has an opening_windows key");
+
+      // ── (b1) texts the one-range parser would misread: text kept, no windows
+      const B1_TEXTS = ["Stengt mandag. Åpent 10-16", "Åpent alle dager unntatt søndag 10-17", "Lørdag 12-16 og søndag 13-17", "Man-fre 10-16, lør 11-15"];
+      for (const hours of B1_TEXTS) {
+        const facts = vf.gardssalgVisitFacts({ opening_hours_text: hours, field_provenance: ownerLocks("opening_hours_text") });
+        assertEq(facts, { opening_hours_text: hours }, `b1: ${JSON.stringify(hours)}: producer's text only, no opening_windows`);
+      }
+
+      // ── (n2) owner-stated means a plain-object lock with no locker ────────
+      const stated = (prov: unknown): boolean =>
+        "visit_description" in vf.gardssalgVisitFacts({ visit_text: "Omvisning hver fredag.", field_provenance: typeof prov === "string" ? prov : JSON.stringify(prov) });
+      assertTrue(stated({ owner_locks: { visit_text: { locked_at: "2026-11-01" } } }), "n2: lock without locked_by counts");
+      assertTrue(stated({ owner_locks: { visit_text: {} } }), "n2b: empty-object lock counts");
+      assertTrue(stated({ owner_locks: { visit_text: { locked_by: null } } }), "n2c: locked_by null counts");
+      for (const lockedBy of ["admin", "Admin", "system", "owner", ""]) {
+        assertTrue(!stated({ owner_locks: { visit_text: { locked_by: lockedBy } } }), `n2d: locked_by ${JSON.stringify(lockedBy)} does not count`);
+      }
+      for (const lock of [null, "owner", ["x"], 1, true]) {
+        assertTrue(!stated({ owner_locks: { visit_text: lock } }), `n2e: lock value ${JSON.stringify(lock)} does not count`);
+      }
+      assertTrue(!stated({ owner_locks: [{ visit_text: {} }] }), "n2f: owner_locks array does not count");
+      assertTrue(!stated({ owner_locks: { opening_hours_text: {} } }), "n2g: other field's lock does not count");
+      assertTrue(!stated("{not json"), "n2h: malformed provenance does not count");
+      assertTrue(!("visit_description" in vf.gardssalgVisitFacts({ visit_text: "Omvisning hver fredag." })), "n2i: no provenance does not count");
+
+      // ── (n1) extended content filter: each drops the field ───────────────
+      const N1_LEAKS = [
+        "Historien bak ‘Gamle Vfvik’.", "Historien bak 'Gamle Vfvik'.", "Historien bak ‹Gamle Vfvik›.",
+        "Omvisning 149:- per person", "Betal i NKR", "SEK 100 per person", "Omvisning 10 euro", "Betal med €", "Omvisning for en krone",
+        "Pris 150 per person", "Billett 200", "Styrke 5 pst", "0,5 ‰ restsukker", "5％",
+        "Se hvordan SIDER lages", "Se hvordan IPA lages", "Eplesideren modnes i kjelleren", "Vinen fra gården", "Ølet brygges her", "Ølene våre",
+      ];
+      for (const text of N1_LEAKS) {
+        assertTrue(leaks(text), `n1: ${JSON.stringify(text)} flagged`);
+        assertEq(vf.gardssalgVisitFacts({ visit_text: text, field_provenance: ownerLocks("visit_text") }), {}, `n1b: ${JSON.stringify(text)}: field dropped`);
+      }
+      assertTrue(!leaks("Ola's gård har omvisning."), "n1c: a single possessive apostrophe and the name «Ola» pass");
+
+      // ── (n6) mutant killers ─────────────────────────────────────────────
+      const R = vf.__visitFactsRegexesForTesting;
+      const GRATIS = "Omvisning er gratis for barn.";
+      assertTrue(leaks(GRATIS) && !/smak/i.test(GRATIS), "n6: «gratis» without «smak» is flagged");
+      for (const DRINK of ["Omvisning, og du kan kjøpe 33 cl på stedet.", "Ta med en 0,5 l flaske hjem."]) {
+        const otherRegexHit = [R.PRICE_RE, R.STRENGTH_RE, R.CLAIM_RE, R.QUOTED_RE].some((re) => re.test(DRINK));
+        assertTrue(leaks(DRINK) && !otherRegexHit, `n6b: ${JSON.stringify(DRINK)} flagged by hasDrinkSigns alone`);
+      }
+
       assertTrue(
-        [leaks("Omvisning i bryggeriet der vi lager øl og sider."), leaks("Lørdag 12:00-16:00"), leaks("Man-fre 10-16, lør 11-15"), leaks("Etter avtale")]
+        [...B1_TEXTS.map((x) => leaks(x)), leaks("Omvisning i bryggeriet der vi lager øl og sider."), leaks("Lørdag 12:00-16:00"), leaks("Man-fre 10-16, lør 11-15"), leaks("Etter avtale")]
           .every((x) => !x),
         "ak3e: plain visit and opening-hours texts pass",
       );
