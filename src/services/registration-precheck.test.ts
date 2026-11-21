@@ -10,7 +10,8 @@
  *          410, exact vetted duplicate); any unavailable source (Brreg down /
  *          hang, MX down, website 5xx / throw) never yields godkjenn; a
  *          realistic Enhetsregisteret fixture; privacy (no Brreg name, no
- *          page text stored); name matcher; env flag.
+ *          page text stored); name matcher; env flag; junk content (R3:
+ *          keyboard-mash name, link-only description; + disposable → avvis).
  *   db     gatherRegistrationPrecheckInput duplicates + owner claim.
  *   routes GET self-registered-review-queue returns precheck/precheck_at/
  *          age_days (+ org_nr/city) with the old fields first and the same
@@ -29,7 +30,8 @@
 import Database from "better-sqlite3";
 import {
   type RegistrationPrecheckDeps, type RegistrationPrecheckInput, BRREG_ENHET_URL, assessRegistration,
-  domainTiesToName, precheckNameMatches, readBrregEnhet, registrationPrecheckEnabled,
+  assessJunkContent, descriptionLinkOnlyHost, domainTiesToName, junkNameReason, precheckNameMatches, readBrregEnhet,
+  registrationPrecheckEnabled,
 } from "./registration-precheck";
 
 export interface TestSummary {
@@ -189,7 +191,9 @@ export async function runRegistrationPrecheckTests(opts: { log?: boolean } = {})
     const calls: string[] = [];
     const r = await run({}, {}, calls);
     eq(r.recommendation, "godkjenn", "G1: org.nr found + name + own domain MX → godkjenn");
-    eq(r.rule_version, "R2", "G1: rule version (R2 after the self-reported org.nr hardening)");
+    eq(r.rule_version, "R3", "G1: rule version (R3 after the junk-content signal)");
+    eq(r.signals.junk_content, { name_junk: false, name_reason: null, description_link_only: false, description_link_host: null, junk: false },
+      "G1: junk_content signal recorded, clean");
     eq([r.signals.brreg.org_nr_self_reported, r.signals.domain_tie.required, r.signals.domain_tie.tied], [true, true, true],
       "G1: tag org.nr is self-reported; domain tied to the name");
     ok(r.reasons.includes("Brreg: org.nr er selvoppgitt"), "G1: self-reported reason");
@@ -302,6 +306,54 @@ export async function runRegistrationPrecheckTests(opts: { log?: boolean } = {})
   eq((await run({}, { duplicates: { exact_ids: ["v-1"], exact_vetted_ids: ["v-1"], name_place_ids: [] } })).recommendation,
     "avvis", "A5: same org.nr / e-mail as a vetted profile → avvis");
   eq((await run({ brreg: "down" }, { contactEmail: "x@yopmail.com" })).recommendation, "avvis", "A6: disposable wins even with a source down");
+
+  // ── junk content (R3; dev-request 2026-11-16-rfb-selvregistrering-spam-profil-eierkrav) ──
+  for (const [name, reason] of [
+    ["asdasd", "keyboard"], ["qwerty", "keyboard"], ["asdf", "keyboard"], ["Asdasd gård", "keyboard"], ["aaaa", "repeated"],
+    ["ababab", "repeated"], ["1234", "no_letters"], ["!!!", "no_letters"],
+  ] as Array<[string, string]>) eq(junkNameReason(name), reason, `J: name «${name}» → ${reason}`);
+  for (const name of [
+    "Bø", "Ås gård", "Li Gård", "Øvre Ål", "Aa", "Anna", "Otto", "Mama", "Bonbon", "Lilli", "Gård", "Asdal Gård",
+    "Solbakken Gård", "Tyrihans", "Hjelle", "Kjøtt & Fisk AS", "ÆØÅ", "Tre",
+  ]) eq(junkNameReason(name), null, `J: real name «${name}» is not junk`);
+  const ownHosts = ["solbakkengard.no", "solbakkengard.no"];
+  eq(descriptionLinkOnlyHost("Find out if you are a sociopath: https://sociopathtest.org", ownHosts), "sociopathtest.org", "J: English link text to an unrelated host");
+  eq(descriptionLinkOnlyHost('<a href="https://www.sociopathtest.org/">Take the sociopath test</a>', ownHosts), "sociopathtest.org", "J: HTML link");
+  eq(descriptionLinkOnlyHost("[Sociopath test](https://sociopathtest.org)", ownHosts), "sociopathtest.org", "J: Markdown link");
+  eq(descriptionLinkOnlyHost("sociopathtest.org", ownHosts), "sociopathtest.org", "J: bare host");
+  eq(descriptionLinkOnlyHost("Se vår nettside www.solbakkengard.no", ownHosts), null, "J: own website is not junk");
+  eq(descriptionLinkOnlyHost("Se mer på facebook.com/solbakken", ownHosts), null, "J: a common social host is not junk");
+  eq(descriptionLinkOnlyHost("Kontakt post@annet.no for bestilling", ownHosts), null, "J: an e-mail address is not a link");
+  eq(descriptionLinkOnlyHost("Vi selger egg, honning og poteter fra gården vår i Ringsaker. Bestill gjerne via https://bestill.example.org eller ring oss på telefon.", ownHosts),
+    null, "J: a real description with an outside link is not junk (> 12 other words)");
+  eq(descriptionLinkOnlyHost("Vi selger egg. f.eks. 12 stk", ownHosts), null, "J: abbreviation dots are not links");
+  eq(descriptionLinkOnlyHost(null, ownHosts), null, "J: no description");
+  eq(assessJunkContent({ name: "Solbakken Gård", description: "En gård med egne produkter." }, ownHosts).junk, false, "J: clean profile");
+  {
+    const r = await run({}, { name: "asdasd" });
+    eq([r.recommendation, r.signals.junk_content?.name_junk, r.signals.junk_content?.name_reason], ["spor_forst", true, "keyboard"],
+      "J1: keyboard-mash name blocks godkjenn → spor_forst");
+    ok(r.reasons.includes("Innhold: navnet ser ut som tastaturtull"), "J1: reason");
+  }
+  {
+    const r = await run({}, { description: "Take the free sociopath test: https://sociopathtest.org" });
+    eq([r.recommendation, r.signals.junk_content?.description_link_only, r.signals.junk_content?.description_link_host],
+      ["spor_forst", true, "sociopathtest.org"], "J2: link-only description to an unrelated host → spor_forst");
+    ok(r.reasons.includes("Innhold: beskrivelsen er bare en lenke til sociopathtest.org"), "J2: reason");
+  }
+  {
+    const r = await run({}, { description: "Besøk oss på https://solbakkengard.no/om-oss" });
+    eq([r.recommendation, r.signals.junk_content?.junk], ["godkjenn", false], "J3: link to the own website keeps godkjenn");
+  }
+  {
+    // The 2026-11-16 profile's shape: keyboard-mash name, throwaway e-mail, English link text.
+    const r = await run({ brreg: "404", site: "404" }, {
+      name: "asdasd", contactEmail: "x@yopmail.com", url: null, orgNr: null,
+      description: "Are you a sociopath? Take the test at sociopathtest.org",
+    });
+    eq([r.recommendation, r.signals.junk_content?.name_junk, r.signals.junk_content?.description_link_only], ["avvis", true, true],
+      "J4: junk content + disposable e-mail → avvis");
+  }
 
   // ── unavailable sources never godkjenn ──────────────────────────────────
   for (const [label, o, inp, src] of [
