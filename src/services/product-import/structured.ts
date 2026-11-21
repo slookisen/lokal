@@ -24,6 +24,13 @@ import { dropPrice, gateVerdict, isEventShopCategory, markExclVat } from "./rule
 
 export type ProductImportTier = "shopify" | "woocommerce" | "jsonld" | "llm";
 
+/**
+ * Stock status as the site states it in structured form (dev-request
+ * 2026-11-21-rfb-produktimport-lagerstatus-og-fullstendighet, point 3).
+ * "unknown" when the site says nothing usable; the LLM tier never sets it.
+ */
+export type StockStatus = "in_stock" | "out_of_stock" | "unknown";
+
 export interface ProductCandidate {
   name: string;
   price_nok: number | null;
@@ -48,6 +55,13 @@ export interface ProductCandidate {
    * price without the mark (price_text carries it too).
    */
   price_excl_vat?: true;
+  /**
+   * The site's stock status (Shopify variant `available`, Store API
+   * `is_in_stock`, JSON-LD `offers.availability`). Absent = unknown. Only
+   * applied with PRODUCT_IMPORT_STOCK_READ_ENABLED on (the extractor drops
+   * it with the flag off).
+   */
+  stock_status?: StockStatus;
 }
 
 /** A Store API product excluded before it became a candidate. */
@@ -83,6 +97,69 @@ function sameHostUrl(href: unknown, base: string, allowedHosts: ReadonlySet<stri
 
 function isNok(currency: unknown): boolean {
   return currency === undefined || currency === null || currency === "" || String(currency).toUpperCase() === "NOK";
+}
+
+// ── Stock status (PURE) ─────────────────────────────────────────────────────
+
+/**
+ * Flag: "1"/"true" makes the import and the weekly auto-sync apply the site's
+ * stock status (a product the site says is sold out → out_of_stock). Anything
+ * else = off: the status is not even kept on the candidates, so the
+ * behaviour is as before.
+ */
+export const PRODUCT_IMPORT_STOCK_READ_FLAG = "PRODUCT_IMPORT_STOCK_READ_ENABLED";
+export function productImportStockReadEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = env[PRODUCT_IMPORT_STOCK_READ_FLAG];
+  return v === "1" || v === "true";
+}
+
+/** Shopify: sold out iff ≥ 1 variant and every variant has available === false; any true → in stock. */
+export function shopifyStockStatus(variants: unknown[]): StockStatus {
+  let anyFalse = false;
+  let allFalse = variants.length > 0;
+  for (const v of variants) {
+    const a = v && typeof v === "object" ? (v as { available?: unknown }).available : undefined;
+    if (a === true) return "in_stock";
+    if (a === false) anyFalse = true;
+    else allFalse = false;
+  }
+  return allFalse && anyFalse ? "out_of_stock" : "unknown";
+}
+
+/** WooCommerce Store API: `is_in_stock` boolean; anything else → unknown. */
+export function wooStockStatus(p: { is_in_stock?: unknown }): StockStatus {
+  if (p.is_in_stock === true) return "in_stock";
+  if (p.is_in_stock === false) return "out_of_stock";
+  return "unknown";
+}
+
+const SCHEMA_SOLD_OUT = new Set(["outofstock", "soldout", "discontinued"]);
+const SCHEMA_IN_STOCK = new Set(["instock", "limitedavailability", "onlineonly", "instoreonly"]);
+
+/**
+ * One schema.org ItemAvailability value: a full URL (http or https,
+ * schema.org), «schema:InStock» or the bare name. PreOrder, BackOrder and
+ * everything else → unknown.
+ */
+export function schemaAvailabilityStatus(v: unknown): StockStatus {
+  const raw = typeof v === "string" ? v : v && typeof v === "object" && typeof (v as any)["@id"] === "string" ? (v as any)["@id"] : null;
+  if (raw === null) return "unknown";
+  let t = raw.trim();
+  const m = /^https?:\/\/(?:www\.)?schema\.org\/(\w+)\/?$/i.exec(t);
+  if (m) t = m[1]!;
+  else if (/^schema:\w+$/i.test(t)) t = t.slice(7);
+  else if (!/^\w+$/.test(t)) return "unknown";
+  const k = t.toLowerCase();
+  if (SCHEMA_SOLD_OUT.has(k)) return "out_of_stock";
+  if (SCHEMA_IN_STOCK.has(k)) return "in_stock";
+  return "unknown";
+}
+
+/** Several offers: in stock if any is; sold out only if every known one is (and one is known). */
+export function combineStockStatus(statuses: StockStatus[]): StockStatus {
+  if (statuses.includes("in_stock")) return "in_stock";
+  if (statuses.includes("out_of_stock")) return "out_of_stock";
+  return "unknown";
 }
 
 // ── Tier 1: Shopify /products.json ──────────────────────────────────────────
@@ -129,6 +206,7 @@ export function parseShopifyProductsJson(
       raw_price_text: rawPrices.length ? rawPrices.join(" | ") : null,
       pack_size: null,
       rules: [],
+      stock_status: shopifyStockStatus(variants),
     });
   }
   return out;
@@ -208,6 +286,7 @@ export function parseWooStoreProducts(
       raw_price_text,
       pack_size: null,
       rules: [],
+      stock_status: wooStockStatus(p),
     };
     if (verdict === "alcohol") c.rules.push("flag_alcohol");
     // Not purchasable («Les mer», «kontakt oss», no buy button): the Store
@@ -292,8 +371,10 @@ export function parseJsonLdProducts(
       const values: number[] = [];
       const rawPrices: string[] = [];
       let exclVat = false;
+      const stock: StockStatus[] = [];
       for (const offer of offers) {
         if (!offer || typeof offer !== "object") continue;
+        stock.push(schemaAvailabilityStatus(offer.availability));
         const spec = Array.isArray(offer.priceSpecification) ? offer.priceSpecification[0] : offer.priceSpecification;
         const currency = offer.priceCurrency ?? spec?.priceCurrency;
         if (!isNok(currency)) continue;
@@ -333,6 +414,7 @@ export function parseJsonLdProducts(
         raw_price_text: rawPrices.length ? rawPrices.join(" | ") : null,
         pack_size: null,
         rules: [],
+        stock_status: combineStockStatus(stock),
       };
       if (exclVat) markExclVat(c);
       out.push(c);

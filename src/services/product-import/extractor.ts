@@ -36,6 +36,7 @@ import {
   parseJsonLdProducts,
   parseShopifyProductsJson,
   parseWooStoreProducts,
+  productImportStockReadEnabled,
   type ProductCandidate,
   type ProductImportTier,
   type WooExcluded,
@@ -131,6 +132,8 @@ export interface ProductImportDeps {
   /** Passed to fetchPage() for its 429 wait. */
   sleep?: (ms: number) => Promise<void>;
   timeoutMs?: number;
+  /** Read for PRODUCT_IMPORT_STOCK_READ_ENABLED (default process.env). */
+  env?: NodeJS.ProcessEnv;
 }
 
 /** The website's host and its www/non-www twin. PURE. */
@@ -361,6 +364,11 @@ export async function extractProductsFromWebsite(
     if (kept.length === 0) return finish("no_products_found");
     result.tier = tier;
     result.products = dedupeCap(kept);
+    // Flag off: the site's stock status is not carried at all (as before).
+    // The LLM tier never states one (unknown).
+    if (tier === "llm" || !productImportStockReadEnabled(deps.env ?? process.env)) {
+      for (const p of result.products) delete p.stock_status;
+    }
     return finish("ok");
   };
 

@@ -33,7 +33,7 @@ export interface TestSummary {
   failures: string[];
 }
 
-const SAVED_ENV = ["PRODUCT_AUTO_SYNC_ENABLED", "PRODUCT_IMPORT_ENABLED", "OWNER_LOCK_ENFORCE_WRITES"];
+const SAVED_ENV = ["PRODUCT_AUTO_SYNC_ENABLED", "PRODUCT_IMPORT_ENABLED", "OWNER_LOCK_ENFORCE_WRITES", "PRODUCT_IMPORT_STOCK_READ_ENABLED"];
 const DAY = 86_400_000;
 const T0 = Date.UTC(2026, 10, 2, 3, 15, 0); // a Monday, 03:15 UTC (inside the sweep window)
 
@@ -343,6 +343,85 @@ export async function runAutoSyncTests(opts: { log?: boolean } = {}): Promise<Te
       assertEq(fetchCalls.length, fetchesBefore, "job: nothing fetched on the repeated tick");
       const t3 = await as.tickProductAutoSync({ now: new Date(clock + DAY), lastRunAt: t1.lastRunAt }, { ...deps, env });
       assertEq(t3.report?.profiles, 0, "job: next day's sweep finds no profile due (< 7 days)");
+    }
+
+    // ─── stock read (dev-request 2026-11-21 …-lagerstatus…, point 3) ───────
+    // Modelled on solvanggard.com /products.json: «Julegave-sett «Til hund»»
+    // has one variant, available:false (→ sold out); «Bivoksark sett» has
+    // Jul1 false, Jul2/S1/S2 true (→ in stock).
+    {
+      const { normalizeName } = require("../product-catalog-sync") as typeof import("../product-catalog-sync");
+      const stockSite = (host: string): Record<string, FakeRoute> => ({
+        [`https://${host}/robots.txt`]: ROBOTS_OPEN,
+        [`https://${host}/products.json?limit=250`]: {
+          contentType: "application/json",
+          body: JSON.stringify({
+            products: [
+              { title: "Julegave-sett «Til hund»", handle: "julegave-hund", variants: [{ title: "Default Title", price: "299.00", available: false }] },
+              {
+                title: "Bivoksark sett", handle: "bivoksark",
+                variants: ["Jul1", "Jul2", "S1", "S2"].map((t, i) => ({ title: t, price: "149.00", available: i > 0 })),
+              },
+              { title: "Eggekartong", handle: "eggekartong", variants: [{ title: "Default Title", price: "55.00", available: true }] },
+              { title: "Saft", handle: "saft", variants: [{ title: "Default Title", price: "40.00" }] },
+            ],
+          }),
+        },
+      });
+      const stockProducts = () => [
+        owner("Julegave-sett «Til hund»", "kr 299"),
+        owner("Bivoksark sett", "kr 149"),
+        owner("Eggekartong", "kr 55"),
+        owner("Saft", "kr 40"),
+      ];
+      for (const id of ["as-stock", "as-stock-off"]) {
+        addAgent(id, { verified: 1, products: stockProducts() });
+        Object.assign(routes, stockSite(`${id}.no`));
+        runProductCatalogSync(db, { agentId: id });
+        // The owner marked Eggekartong out of stock in the portal (B1).
+        db.prepare(`UPDATE products SET availability = 'out_of_stock', availability_source = 'producer_dashboard', availability_updated_at = '2026-11-01 10:00:00'
+                     WHERE agent_id = ? AND name_norm = ?`).run(id, normalizeName("Eggekartong"));
+      }
+      const avail = (id: string) => Object.fromEntries(
+        (db.prepare(`SELECT name, availability, availability_updated_at FROM products WHERE agent_id = ?`).all(id) as any[])
+          .map((r) => [r.name, [r.availability, r.availability_updated_at]]),
+      );
+      const auditCount = (id: string) =>
+        (db.prepare(`SELECT COUNT(*) AS n FROM agent_knowledge_audit WHERE agent_id = ? AND field_name = 'products.availability'`).get(id) as { n: number }).n;
+
+      // Flag off: no availability change from the site's stock status at all.
+      const offBefore = avail("as-stock-off");
+      const rOff = await as.runAutoSyncForProfile("as-stock-off", { ...deps, env: {} });
+      assertEq(rOff.status, "applied", "stock off: run applied");
+      assertEq(avail("as-stock-off"), offBefore, "stock off: no availability changed (sold-out product stays in stock)");
+      assertEq(auditCount("as-stock-off"), 0, "stock off: no availability audit row");
+      assertEq("sold_out_on_site" in JSON.parse(state("as-stock-off").last_change_summary || "{}"), false, "stock off: summary as before");
+
+      // Flag on.
+      const before = avail("as-stock");
+      const r = await as.runAutoSyncForProfile("as-stock", { ...deps, env: { PRODUCT_IMPORT_STOCK_READ_ENABLED: "1" } });
+      assertEq(r.status, "applied", "stock on: run applied");
+      const after = avail("as-stock");
+      assertEq(after["Julegave-sett «Til hund»"]?.[0], "out_of_stock", "stock on: sold out on the site (all variants false) → out_of_stock");
+      assertTrue(typeof after["Julegave-sett «Til hund»"]?.[1] === "string", "stock on: availability_updated_at set");
+      assertEq(after["Bivoksark sett"], before["Bivoksark sett"], "stock on: mixed variants → in stock, row unchanged");
+      assertEq(after["Eggekartong"], before["Eggekartong"], "stock on: owner's out_of_stock kept although the site says in stock");
+      assertEq(after["Saft"], before["Saft"], "stock on: unknown (no available field) changes nothing");
+      assertEq(auditCount("as-stock"), 1, "stock on: one availability audit row");
+      const note = (db.prepare(`SELECT notes FROM agent_knowledge_audit WHERE agent_id = 'as-stock' AND field_name = 'products.availability'`).get() as any)?.notes ?? "";
+      assertTrue(note.includes("sold out on the website") && note.includes("Til hund"), "stock on: audit note names the product");
+      assertEq(JSON.parse(state("as-stock").last_change_summary || "{}").sold_out_on_site, 1, "stock on: summary counts it");
+      const profile = productsOf("as-stock");
+      assertEq(profile.length, 4, "stock on: nothing removed from the profile");
+
+      // Pure plan: the stock read is opt-in.
+      const sold = { ...((require("./structured") as typeof import("./structured")).parseShopifyProductsJson(
+        stockSite("x.no")["https://x.no/products.json?limit=250"]!.body, "https://x.no", new Set(["x.no"]))[0]!) };
+      const curJ = [{ index: 0, name: sold.name, key: normalizeName(sold.name), price_nok: 299, unit: null, price: "kr 299", source: "owner_manual" }];
+      const pOff = as.planAutoSync([sold], curJ);
+      const pOn = as.planAutoSync([sold], curJ, { stockRead: true });
+      assertEq(pOff.ok && pOff.soldOut.length, 0, "plan: stockRead off → soldOut empty");
+      assertEq(pOn.ok && pOn.soldOut.map((x) => x.name), [sold.name], "plan: stockRead on → sold-out confirmed product listed");
     }
   } catch (err) {
     failed++;

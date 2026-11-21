@@ -39,7 +39,7 @@ export interface TestSummary {
   failures: string[];
 }
 
-const SAVED_ENV = ["PRODUCT_IMPORT_ENABLED", "OWNER_LOCK_ENFORCE_WRITES", "OWNER_VERIFIED_OWNER_GATE_ENABLED"];
+const SAVED_ENV = ["PRODUCT_IMPORT_ENABLED", "OWNER_LOCK_ENFORCE_WRITES", "OWNER_VERIFIED_OWNER_GATE_ENABLED", "PRODUCT_IMPORT_STOCK_READ_ENABLED"];
 const DAY = 86_400_000;
 const T0 = Date.UTC(2026, 9, 30, 10, 0, 0);
 
@@ -572,6 +572,68 @@ export async function runOwnerImportTests(opts: { log?: boolean } = {}): Promise
         "timeout: a late result is not staged");
       const pub = await publishFor("imp-other", t.body.run_id, { candidates: ["x"] });
       assertEq(pub.status, 409, "timeout: a failed run cannot be published");
+    }
+
+    // ─── stock read (dev-request 2026-11-21 …-lagerstatus…, point 3) ───────
+    // Modelled on solvanggard.com /products.json («Til hund»: one variant
+    // available:false; «Bivoksark sett»: Jul1 false, the rest true).
+    {
+      oi.__setOwnerImportDepsForTesting({ fetchImpl, llm, now: () => clock, sleep: async () => undefined, hostIntervalMs: 0 });
+      const { normalizeName } = require("../product-catalog-sync") as typeof import("../product-catalog-sync");
+      for (const id of ["imp-stock", "imp-stock-off"]) {
+        addAgent(id, { verified: 1, products: [
+          { name: "Eggekartong", category: "other", seasonal: false, price: "kr 55", priceUnit: "kr", source: "owner_manual", confirmedAt: "2026-10-01T10:00:00.000Z" },
+        ] });
+        runProductCatalogSync(db, { agentId: id });
+        routes[`https://${id}.no/robots.txt`] = ROBOTS_OPEN;
+        routes[`https://${id}.no/products.json?limit=250`] = {
+          contentType: "application/json",
+          body: JSON.stringify({ products: [
+            { title: "Julegave-sett «Til hund»", handle: "julegave-hund", variants: [{ title: "Default Title", price: "299.00", available: false }] },
+            { title: "Bivoksark sett", handle: "bivoksark", variants: ["Jul1", "Jul2", "S1", "S2"].map((t, i) => ({ title: t, price: "149.00", available: i > 0 })) },
+            { title: "Saft", handle: "saft", variants: [{ title: "Default Title", price: "40.00" }] },
+            { title: "Eggekartong", handle: "eggekartong", variants: [{ title: "Default Title", price: "55.00", available: false }] },
+          ] }),
+        };
+      }
+      const importAll = async (id: string, env: NodeJS.ProcessEnv) => {
+        if (env.PRODUCT_IMPORT_STOCK_READ_ENABLED) process.env.PRODUCT_IMPORT_STOCK_READ_ENABLED = env.PRODUCT_IMPORT_STOCK_READ_ENABLED;
+        else delete process.env.PRODUCT_IMPORT_STOCK_READ_ENABLED;
+        try {
+          const st = oi!.startOwnerFetch(id);
+          if (!st.ok) throw new Error(`stock: fetch for ${id} not started: ${JSON.stringify(st)}`);
+          await oi!.__awaitOwnerFetchForTesting(st.run_id);
+          const cands = db.prepare(`SELECT id, name, stock_status FROM product_import_candidates WHERE run_id = ? ORDER BY position`).all(st.run_id) as any[];
+          const pub = oi!.publishOwnerImport(id, st.run_id, cands.map((c) => ({ id: c.id })), [], { actorEmail: `post@${id}.example.no`, env });
+          return { cands, pub };
+        } finally {
+          delete process.env.PRODUCT_IMPORT_STOCK_READ_ENABLED;
+        }
+      };
+      const avail = (id: string) => Object.fromEntries(
+        (db.prepare(`SELECT name_norm, availability FROM products WHERE agent_id = ? ORDER BY name_norm`).all(id) as any[]).map((r) => [r.name_norm, r.availability]),
+      );
+      const auditCount = (id: string) =>
+        (db.prepare(`SELECT COUNT(*) AS n FROM agent_knowledge_audit WHERE agent_id = ? AND field_name = 'products.availability'`).get(id) as { n: number }).n;
+      const J = normalizeName("Julegave-sett «Til hund»");
+
+      // Flag off: candidates carry no stock status, nothing goes out of stock.
+      const off = await importAll("imp-stock-off", {});
+      assertEq(off.pub.ok, true, "stock off: published");
+      assertEq(off.cands.map((c) => c.stock_status), [null, null, null, null], "stock off: no stock status staged");
+      assertEq(avail("imp-stock-off"), { "bivoksark sett": "in_stock", eggekartong: "in_stock", [J]: "in_stock", saft: "in_stock" },
+        "stock off: no availability change from the site's stock status");
+      assertEq(auditCount("imp-stock-off"), 0, "stock off: no availability audit row");
+
+      // Flag on.
+      const on = await importAll("imp-stock", { PRODUCT_IMPORT_STOCK_READ_ENABLED: "1" });
+      assertEq(on.pub.ok, true, "stock on: published");
+      assertEq(Object.fromEntries(on.cands.map((c) => [c.name, c.stock_status])),
+        { "Julegave-sett «Til hund»": "out_of_stock", "Bivoksark sett": "in_stock", "Saft": null, "Eggekartong": "out_of_stock" },
+        "stock on: candidates staged with the site's stock status (unknown = NULL)");
+      assertEq(avail("imp-stock"), { "bivoksark sett": "in_stock", eggekartong: "out_of_stock", [J]: "out_of_stock", saft: "in_stock" },
+        "stock on: sold out on the site → out_of_stock (new and updated); in stock / unknown as today");
+      assertEq(auditCount("imp-stock"), 1, "stock on: one availability audit row");
     }
   } catch (err) {
     failed++;

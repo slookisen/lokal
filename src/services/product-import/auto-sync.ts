@@ -18,6 +18,19 @@
 //                            'auto_sync') for a later owner approval.
 //   confirmed, not found   → the catalog row is set out of stock (only when
 //                            it was in_stock); the product is never deleted.
+//   confirmed, sold out    → (flag PRODUCT_IMPORT_STOCK_READ_ENABLED only;
+//     on the website         dev-request 2026-11-21-rfb-produktimport-
+//                            lagerstatus-og-fullstendighet, point 3) the same
+//                            write as «not found»: out of stock, only when it
+//                            was in_stock. The website saying «in stock» (or
+//                            nothing) changes nothing: a row that is out of
+//                            stock is never set back in stock here, because
+//                            nothing records per product whether the owner
+//                            or this job set it out of stock (the audit row
+//                            is per run, changed_by 'owner'; the job does
+//                            not write availability_source), and
+//                            availability_updated_at is not refreshed (it
+//                            dates the owner's own stock confirmation).
 //
 // Deviation lock — nothing is applied, nothing staged, the reason is stored:
 //   - the fetch or the extraction fails (any outcome but 'ok', a timeout, a
@@ -39,7 +52,7 @@ import { normalizeName, runProductCatalogSync } from "../product-catalog-sync";
 import { auditOwnerProductChange } from "../owner-orderability";
 import { getJobLastCompletedAt, markJobCompleted, resolveDailyJobLastRunAt } from "../boot-job-gate";
 import { extractProductsFromWebsite, HostPacer, type ProductImportDeps, type ProductImportResult } from "./extractor";
-import type { ProductCandidate } from "./structured";
+import { productImportStockReadEnabled, type ProductCandidate } from "./structured";
 import {
   currentProductsOf,
   diffAgainst,
@@ -224,6 +237,8 @@ export type AutoSyncPlan =
       changes: AutoSyncChange[];
       notFound: CurrentProduct[];
       newCandidates: ProductCandidate[];
+      /** Confirmed products the website states are sold out (stock read on only; else empty). */
+      soldOut: CurrentProduct[];
     }
   | { ok: false; reason: string };
 
@@ -236,7 +251,11 @@ export function isOwnerConfirmed(p: CurrentProduct): boolean {
  * The run's plan against the profile's current products, or the lock reason.
  * PURE: `candidates` are the extractor's products, `current` the profile's.
  */
-export function planAutoSync(candidates: ProductCandidate[], current: CurrentProduct[]): AutoSyncPlan {
+export function planAutoSync(
+  candidates: ProductCandidate[],
+  current: CurrentProduct[],
+  opts: { stockRead?: boolean } = {},
+): AutoSyncPlan {
   // One candidate per name (the first), as the staging / diff key.
   const seen = new Set<string>();
   const cands: ProductCandidate[] = [];
@@ -257,12 +276,14 @@ export function planAutoSync(candidates: ProductCandidate[], current: CurrentPro
   const changes: AutoSyncChange[] = [];
   const newCandidates: ProductCandidate[] = [];
   const deviations: string[] = [];
+  const soldOut: CurrentProduct[] = [];
   cands.forEach((c, i) => {
     const k = diff.kinds[i]!;
     if (k.kind === "new") {
       newCandidates.push(c);
       return;
     }
+    if (opts.stockRead === true && c.stock_status === "out_of_stock" && k.current) soldOut.push(k.current);
     if (k.kind !== "changed") return;
     const cur = k.current!;
     const newPrice = c.price_nok !== null ? c.price_nok : cur.price_nok;
@@ -276,7 +297,7 @@ export function planAutoSync(candidates: ProductCandidate[], current: CurrentPro
     changes.push({ current: cur, candidate: c, new_price_nok: newPrice, new_unit: c.unit ?? cur.unit });
   });
   if (deviations.length) return { ok: false, reason: `price_deviation: ${deviations.join("; ")}`.slice(0, 500) };
-  return { ok: true, confirmed: confirmed.length, changes, notFound: diff.notFound, newCandidates };
+  return { ok: true, confirmed: confirmed.length, changes, notFound: diff.notFound, newCandidates, soldOut };
 }
 
 // ── One profile ────────────────────────────────────────────────────────────
@@ -339,6 +360,7 @@ export async function runAutoSyncForProfile(agentId: string, deps: AutoSyncDeps 
       sleep: deps.sleep,
       now: deps.now,
       timeoutMs: deps.timeoutMs,
+      env: deps.env,
       llmBudget: { cap: llmCap, used: 0 },
       pacer: deps.pacer ?? new HostPacer(deps.hostIntervalMs ?? OWNER_FETCH_HOST_INTERVAL_MS, deps.now, deps.sleep),
     });
@@ -362,9 +384,10 @@ export async function runAutoSyncForProfile(agentId: string, deps: AutoSyncDeps 
   if (failure) return recordBlock(agentId, runId, failure, result, now());
   const list = readCurrentList(agentId).slice();
   const current = currentProductsOf(list);
-  const plan = planAutoSync(result!.products, current);
+  const stockRead = productImportStockReadEnabled(deps.env ?? process.env);
+  const plan = planAutoSync(result!.products, current, { stockRead });
   if (!plan.ok) return recordBlock(agentId, runId, plan.reason, result, now());
-  return applyPlan(agentId, runId, list, plan, result!, now());
+  return applyPlan(agentId, runId, list, plan, result!, now(), stockRead);
 }
 
 function summaryOf(result: ProductImportResult | null): Record<string, unknown> | null {
@@ -423,6 +446,7 @@ function applyPlan(
   plan: Extract<AutoSyncPlan, { ok: true }>,
   result: ProductImportResult,
   nowMs: number,
+  stockRead = false,
 ): AutoSyncProfileResult {
   const db = getDb();
   const nowIso = isoTs(nowMs);
@@ -496,6 +520,7 @@ function applyPlan(
     if (!r.success) console.error("[product-auto-sync] catalog sync failed:", r.error);
   }
   let outOfStock = 0;
+  let soldOutSet = 0;
   db.transaction(() => {
     const setUnit = db.prepare(`UPDATE products SET unit = ?, updated_at = datetime('now') WHERE agent_id = ? AND name_norm = ? AND unit IS NOT ?`);
     for (const ch of plan.changes) {
@@ -512,6 +537,18 @@ function applyPlan(
         `weekly auto-sync: ${outOfStock} product(s) not found on the website set out of stock in run ${runId} (produktimport skive 4-1)`,
       );
     }
+    // Stock read (point 3): sold out on the website → out of stock, the same write.
+    if (stockRead) {
+      const names: string[] = [];
+      for (const p of plan.soldOut) if (setOut.run(agentId, p.key).changes > 0) names.push(p.name);
+      soldOutSet = names.length;
+      if (names.length > 0) {
+        auditOwnerProductChange(
+          db, agentId, "products.availability", "in_stock", "out_of_stock", null,
+          `weekly auto-sync: ${names.length} product(s) sold out on the website set out of stock in run ${runId}: ${names.join(", ")}`.slice(0, 2000),
+        );
+      }
+    }
     db.prepare(
       `UPDATE product_import_runs
           SET status = 'completed', outcome = ?, tier = ?, profiles_done = 1, llm_calls = ?,
@@ -519,13 +556,15 @@ function applyPlan(
         WHERE id = ?`,
     ).run(
       result.outcome, result.tier, result.llm_calls, plan.newCandidates.length, plan.changes.length, plan.notFound.length,
-      plan.changes.length, JSON.stringify({ ...summaryOf(result), catalog_sync, out_of_stock: outOfStock }), nowSql, runId,
+      plan.changes.length,
+      JSON.stringify({ ...summaryOf(result), catalog_sync, out_of_stock: outOfStock, ...(stockRead ? { sold_out_on_site: soldOutSet } : {}) }),
+      nowSql, runId,
     );
     db.prepare(
       `UPDATE product_auto_sync_state
           SET consecutive_blocks = 0, last_success_at = ?, last_change_summary = ?, updated_at = datetime('now')
         WHERE agent_id = ?`,
-    ).run(nowIso, JSON.stringify({ ...changeSummary, out_of_stock: outOfStock }), agentId);
+    ).run(nowIso, JSON.stringify({ ...changeSummary, out_of_stock: outOfStock, ...(stockRead ? { sold_out_on_site: soldOutSet } : {}) }), agentId);
   })();
   return {
     status: "applied",

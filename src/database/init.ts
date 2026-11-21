@@ -7313,6 +7313,18 @@ function initSchema(db: Database.Database): void {
     console.error("Migration product_import outreach columns failed:", err);
   }
 
+  // ─── product_import_candidates.stock_status ─────────────────────────────
+  // dev-request 2026-11-21-rfb-produktimport-lagerstatus-og-fullstendighet,
+  // point 3: the site's stock status of a staged candidate ('in_stock' /
+  // 'out_of_stock'; NULL = unknown or flag PRODUCT_IMPORT_STOCK_READ_ENABLED
+  // off), applied when the owner publishes it. Additive, nullable, idempotent.
+  try {
+    const have = new Set((db.prepare(`PRAGMA table_info(product_import_candidates)`).all() as Array<{ name: string }>).map((c) => c.name));
+    if (!have.has("stock_status")) db.exec(`ALTER TABLE product_import_candidates ADD COLUMN stock_status TEXT`);
+  } catch (err) {
+    console.error("Migration product_import_candidates.stock_status failed:", err);
+  }
+
   // ─── product_import_outreach_events (Skive 3b-2) ────────────────────────
   // Append-only log per outreach recipient (flag PRODUCT_IMPORT_OUTREACH_ENABLED):
   // 'opened' (the signed landing link was opened; detail = the session state),
