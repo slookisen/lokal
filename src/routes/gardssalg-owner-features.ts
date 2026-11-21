@@ -20,8 +20,10 @@ import {
   getBookingByRef, listProviderBookings, isValidSuggestedSlot, visitTimeReached,
   producerRespondConfirm, producerRespondDecline, producerSuggestTime, resolveBooking,
   sendPrevisitConfirmedToGuest, sendPrevisitDeclinedToGuest, sendSuggestionToGuest,
-  type GardssalgBooking,
+  isBookingPaused, type GardssalgBooking,
 } from "../services/booking-store";
+import { gardssalgBookingPausedByOwner, hasBookingRequestEmail } from "../services/gardssalg-booking-gate";
+import { overviewModel, overviewReadiness, renderGardssalgOversikt } from "../owner-features/gardssalg-oversikt";
 import { attendanceNotConfirmedText, attendanceRefusal } from "../services/gardssalg-attendance-guard";
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
 import { gardssalgOwnerDashboardFlagOnFor, gardssalgOwnerDashboardMode, oaOwnerFeaturesEnabled } from "../owner-features/gardssalg";
@@ -191,6 +193,35 @@ export function gardssalgOwnerDashboardOnForSession(
       && gardssalgOwnerDashboardActiveFor(providerId, env) && isGardssalgProviderClaimed(providerId);
   } catch {
     return false;
+  }
+}
+
+// ── O2-3: the «Oversikt» card (owner-features/gardssalg-oversikt.ts) ──────
+// The portal (GET …/portal, routes/gardssalg-claim.ts) puts this card on the
+// page only while gardssalgOwnerDashboardOnForSession() is true. Read only:
+// the owner's own bookings (listProviderBookings, scoped by provider_id) and
+// one experience_providers row; readiness from the existing booking gates.
+// Any read failure → no card (the portal as in O2-1), logged.
+export function gardssalgOversiktHtml(providerId: string, slug: string, now: Date = new Date()): string {
+  try {
+    const row = getVerticalDb("experiences")
+      .prepare(`SELECT booking_live, catalog_hidden, is_test_provider, epost, opening_hours_text FROM experience_providers WHERE id = ?`)
+      .get(providerId) as {
+        booking_live: number | null; catalog_hidden: number | null; is_test_provider: number | null;
+        epost: string | null; opening_hours_text: string | null;
+      } | undefined;
+    if (!row) return "";
+    const readiness = overviewReadiness({
+      switchOn: row.booking_live === 1,
+      bookingGateOpen: !isBookingPaused(row.booking_live, row.catalog_hidden, row.is_test_provider),
+      ownerPaused: gardssalgBookingPausedByOwner(providerId),
+      hasRequestAddress: hasBookingRequestEmail(row.epost),
+      hasOpeningHours: typeof row.opening_hours_text === "string" && row.opening_hours_text.trim() !== "",
+    });
+    return renderGardssalgOversikt(slug, overviewModel(listProviderBookings(providerId), now), readiness);
+  } catch (e) {
+    console.error("[gardssalg-owner-features] Oversikt card failed:", e);
+    return "";
   }
 }
 

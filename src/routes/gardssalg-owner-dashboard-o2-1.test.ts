@@ -222,13 +222,16 @@ export function runGardssalgOwnerDashboardO21Tests(opts: { log?: boolean } = {})
         assertTrue(!/rett fra bonden/i.test(r.body), `AK2h: ${label} never names Rett fra Bonden`);
       }
       // With the shell taken out, the portal and «Mine valg» are the flag-off pages.
+      // O2-3: the portal (Oversikt) also carries the overview card; take it out too.
+      const OVERVIEW_CARD = /<section class="gc-card gs-oversikt"[\s\S]*?<\/section>\n {6}/;
       const unshell = (b: string, slug: string, tab: "oversikt" | "valg") => {
-        const t = b.replace(shellOf(slug, tab) + MAIN_OPEN, "");
+        const t = b.replace(shellOf(slug, tab) + MAIN_OPEN, "").replace(OVERVIEW_CARD, "");
         const i = t.lastIndexOf("</main>");
         return i < 0 ? t : t.slice(0, i) + t.slice(i + "</main>".length);
       };
       assertTrue(!basePortal.body.includes("</main>") && !baseValg.body.includes("</main>"), "AK2i0: the flag-off pages have no </main> of their own");
-      assertEq(unshell(onBodies.portal.body, "o21testgard", "oversikt"), basePortal.body, "AK2i: portal with the shell taken out == the flag-off portal (only the shell added)");
+      assertTrue(OVERVIEW_CARD.test(onBodies.portal.body) && !OVERVIEW_CARD.test(basePortal.body), "AK2i1: the overview card (O2-3) is on the dashboard portal only");
+      assertEq(unshell(onBodies.portal.body, "o21testgard", "oversikt"), basePortal.body, "AK2i: portal with the shell and the overview card taken out == the flag-off portal (only those added)");
       assertEq(unshell(onBodies.valg.body, "o21testgard", "valg"), baseValg.body, "AK2j: «Mine valg» with the shell taken out == the flag-off page (existing content kept)");
       // Empty states (tekstpakke OA-3 1.1, verbatim).
       assertTrue(onBodies.besok.body.includes("<p>«Ta imot besøk» er av. Slå det på under «Mine valg» når du vil ta imot forespørsler.</p>"), "AK2k: «Mine besøk» with booking off → empty.visitsOff verbatim");

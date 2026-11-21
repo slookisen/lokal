@@ -456,7 +456,8 @@ function guestLine(booking: GardssalgBooking): string {
   const name = booking.guest_name ? String(booking.guest_name) : O2_2_EXTRA_TEXTS["visits.guestDeleted"];
   const n = booking.party_size;
   const tpl = n === 1 ? O2_2_EXTRA_TEXTS["visits.guestLine.one"] : GARDSSALG_VISITS_TEXTS["visits.guestLine"];
-  return escapeHtml(tpl.replace("{antall}", String(n))).replace("{gjest}", escapeHtml(name));
+  // Function replacer: a name holding `$&` / `$'` is shown literally (O2-3).
+  return escapeHtml(tpl.replace("{antall}", String(n))).replace("{gjest}", () => escapeHtml(name));
 }
 
 function pageCardHtml(booking: GardssalgBooking, now: Date, path: string, withDeadline: boolean): string {

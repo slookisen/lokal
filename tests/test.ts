@@ -53120,6 +53120,25 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-12-opplevagent-o2-eierdashbord-for-besok, O2-3: the
+// «Oversikt» card — numbers == the admin list GET, own profile only, readiness
+// from the existing booking gates. Swaps getDb() + env — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-12-opplevagent-o2-eierdashbord-for-besok O2-3: «Oversikt» ──");
+  try {
+    const { runGardssalgOwnerDashboardO23Tests } = require("../src/routes/gardssalg-owner-dashboard-o2-3.test") as
+      typeof import("../src/routes/gardssalg-owner-dashboard-o2-3.test");
+    const r = await runGardssalgOwnerDashboardO23Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-owner-dashboard-o2-3: " + f);
+    console.log(`  gardssalg-owner-dashboard-o2-3: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-owner-dashboard-o2-3: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-11-12-opplevagent-o4-epost-og-tekster, O4-3: the owner
 // confirms the address for visit requests (GARDSSALG_NOTIFY_ADDRESS_CONFIRM_ENABLED).
 // Swaps getDb() + env — runSerial.

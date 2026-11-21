@@ -34,7 +34,7 @@ import { emailService, renderGardssalgClaimMagicLink, buildGardssalgClaimWelcome
 import { archiveGardssalgClaimMail, isGardssalgClaimWelcomeEmailEnabled, GARDSSALG_CLAIM_CRM_LINK_PLACEHOLDER } from "../services/gardssalg-claim-crm-archive";
 import { generalLimiter } from "../middleware/security";
 import { ownerBookingEnableBlock, type OwnerBookingBlock } from "../services/gardssalg-booking-gate";
-import { createGardssalgOwnerFeaturesRouter, gardssalgOwnerDashboardOnForSession, gardssalgOwnerFeaturesTabOpen } from "./gardssalg-owner-features";
+import { createGardssalgOwnerFeaturesRouter, gardssalgOversiktHtml, gardssalgOwnerDashboardOnForSession, gardssalgOwnerFeaturesTabOpen } from "./gardssalg-owner-features";
 import { wrapGardssalgDashboard } from "../owner-ui/gardssalg-dashboard";
 import { CLAIM_LINK_TEXTS, CLAIM_CONFIRM_TEXTS, MANUAL_CLAIM_TEXTS, MANUAL_CLAIM_FORM_TEXTS_NOT_APPROVED } from "./gardssalg-claim-texts";
 import { isManualClaimQueueEnabled, isManualClaimReceiptEnabled, sendManualClaimMail, submitManualClaim } from "../services/gardssalg-manual-claims";
@@ -928,6 +928,12 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
         `<button type="submit" form="gc-release-form" class="gc-btn gc-btn-secondary gc-btn-small" name="release_field" value="${field}">La Opplevagent oppdatere dette</button></div>`;
     };
 
+    // O2-1/O2-3 (dev-request 2026-11-12-opplevagent-o2-eierdashbord-for-besok):
+    // with the owner dashboard on, the portal is «Oversikt» — the overview card
+    // goes under the name card. Off = "" and the page exactly as before.
+    const dashboardOn = gardssalgOwnerDashboardOnForSession(provider.id, session);
+    const overviewHtml = dashboardOn ? gardssalgOversiktHtml(provider.id, slug) : "";
+
     const body = `
       <div class="gc-card">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
@@ -940,7 +946,7 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
         ${alert}
         ${locked ? `<div class="gc-alert gc-alert-error" role="alert">Teksten i denne profilen er låst av Opplevagent-support. Kontakt ${CLAIM_MANUAL_FALLBACK_EMAIL} for å endre den. Booking kan du fortsatt slå av og på selv.</div>` : ""}
       </div>
-      ${mineValgCardHtml(slug, provider.id)}<div class="gc-card">
+      ${overviewHtml}${mineValgCardHtml(slug, provider.id)}<div class="gc-card">
         <h2>Profilinformasjon</h2>
         <form id="gc-profile-form" method="post" action="/kategori/gardssalg/eier/${encodeURIComponent(slug)}/save" novalidate>
           <div class="gc-field">
@@ -1073,7 +1079,7 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
     // O2-1 (dev-request 2026-11-12-opplevagent-o2-eierdashbord-for-besok): with
     // the gårdssalg owner dashboard on for this owner, the portal is «Oversikt»
     // inside the shell, sent no-store. Off = the response exactly as before.
-    if (gardssalgOwnerDashboardOnForSession(provider.id, session)) {
+    if (dashboardOn) {
       res.setHeader("Cache-Control", "no-store");
       return res.send(shell(`Eierportal · ${provider.navn}`, wrapGardssalgDashboard(slug, "oversikt", body)));
     }
