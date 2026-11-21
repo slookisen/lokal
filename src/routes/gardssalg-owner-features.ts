@@ -24,6 +24,8 @@ import {
 } from "../services/booking-store";
 import { gardssalgBookingPausedByOwner, hasBookingRequestEmail } from "../services/gardssalg-booking-gate";
 import { overviewModel, overviewReadiness, renderGardssalgOversikt } from "../owner-features/gardssalg-oversikt";
+import { renderGardssalgStatistikk, statistikkModel, type StatistikkAi } from "../owner-features/gardssalg-statistikk";
+import { computeAiDeliveries } from "../services/profile-ai-deliveries-compute";
 import { attendanceNotConfirmedText, attendanceRefusal } from "../services/gardssalg-attendance-guard";
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
 import { gardssalgOwnerDashboardFlagOnFor, gardssalgOwnerDashboardMode, oaOwnerFeaturesEnabled } from "../owner-features/gardssalg";
@@ -164,7 +166,8 @@ export function gardssalgOwnerFeaturesTabOpen(providerId: string, env: NodeJS.Pr
 //   - the portal (Oversikt) and «Mine valg» are shown inside the shell
 //     (owner-ui/gardssalg-dashboard.ts) with the four tabs;
 //   - GET …/besok («Mine besøk») and GET …/statistikk («Statistikk») answer
-//     with a neutral empty state (O2-2 and O2-4 fill them).
+//     with a neutral empty state while there is no request (O2-2 and O2-4
+//     fill them otherwise).
 // Otherwise the portal and «Mine valg» are byte-identical to before and the
 // two new URLs answer 404. Every dashboard response is `no-store`; the GETs
 // read only.
@@ -223,6 +226,26 @@ export function gardssalgOversiktHtml(providerId: string, slug: string, now: Dat
     console.error("[gardssalg-owner-features] Oversikt card failed:", e);
     return "";
   }
+}
+
+// ── O2-4: the «Statistikk» numbers (owner-features/gardssalg-statistikk.ts) ─
+// Read only: every booking row of THIS provider (listProviderBookings, scoped
+// by provider_id, no history cap — the counts cover all requests) and the
+// provider's «Med i AI-søk» count (computeAiDeliveries over
+// profile_ai_deliveries, vertical "experiences", profile_id = provider id,
+// whole counting period). null = no request at all → the empty state
+// (empty.stats). The AI read failing only drops the AI row.
+export function gardssalgStatistikkHtml(providerId: string, now: Date = new Date()): string | null {
+  const bookings = listProviderBookings(providerId, Number.MAX_SAFE_INTEGER);
+  if (bookings.length === 0) return null;
+  let ai: StatistikkAi | null = null;
+  try {
+    const d = computeAiDeliveries(getRfbDb(), "experiences", providerId, null, now.getTime());
+    if (d.countingSince) ai = { total: d.total, countingSince: d.countingSince };
+  } catch (e) {
+    console.error("[gardssalg-owner-features] Statistikk AI count failed:", e);
+  }
+  return renderGardssalgStatistikk(statistikkModel(bookings, now), ai);
 }
 
 /** «Mine besøk» empty-state choice: the booking switch and whether any request exists (read only). */
@@ -651,7 +674,7 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
     try {
       const g = dashboardGate(req);
       if (!g.ok) return g.send(res);
-      const body = renderGardssalgStatsEmpty(CLAIM_MANUAL_FALLBACK_EMAIL);
+      const body = gardssalgStatistikkHtml(g.provider.id) ?? renderGardssalgStatsEmpty(CLAIM_MANUAL_FALLBACK_EMAIL);
       return res.send(shell(`Statistikk · ${g.provider.navn}`, wrapGardssalgDashboard(g.slug, "statistikk", body)));
     } catch (e) {
       return fail("GET statistikk")(res, e);
