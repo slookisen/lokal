@@ -106,6 +106,15 @@ import {
   fetchBmProducerRecord,
   matchBmProducerToCatalog,
 } from "../services/bm-producer-harvest";
+// Slice B2 (dev-request 2026-11-15-rfb-nattjobb-hull-kontaktuttrekk-bm-og-koer):
+// apply-mode keeps unmatched pages as candidates for discovery.
+import {
+  recordBmUnmatchedCandidate,
+  markBmCandidateMatched,
+  listBmUnmatchedCandidates,
+  BmCandidateOutcome,
+  BM_CANDIDATES_MAX_LIMIT,
+} from "../services/bm-unmatched-candidates";
 import {
   isSyntacticallyValidEmail,
   isPlatformOwnedEmailDomain,
@@ -322,6 +331,10 @@ interface ApplyResultItem {
   url_new_value?: string;
   url_final_url?: string;
   url_detail?: string;
+  // Slice B2: only on `unmatched` rows in apply mode.
+  candidate_outcome?: BmCandidateOutcome;
+  candidate_known_agent_id?: string;
+  candidate_detail?: string;
 }
 
 /**
@@ -482,6 +495,35 @@ function applyBmPhone(
 /** Query params that must appear at most once (a repeat would arrive as an array). */
 const BM_HARVEST_SINGLE_PARAMS = ["dry_run", "limit", "offset", "fill_only"] as const;
 
+// ─── GET /admin/bm-producer-harvest/unmatched-candidates (slice B2) ─────────
+//
+// READ-ONLY. Bondens Marked producer pages the apply branch could not match to
+// a profile: name, city, the BM page, website, first_seen, last_seen,
+// seen_count. Newest last_seen first. `limit` default 100, max 500.
+// `include_matched=1` also lists rows that matched a profile later.
+router.get("/unmatched-candidates", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  for (const name of ["limit", "include_matched"]) {
+    const v = (req.query as Record<string, unknown> | undefined)?.[name];
+    if (v !== undefined && typeof v !== "string") {
+      res.status(400).json({ error: `query param '${name}' must be given once, as a plain value`, param: name });
+      return;
+    }
+  }
+  let limit = 100;
+  if (typeof req.query.limit === "string" && /^\d+$/.test(req.query.limit.trim())) {
+    const n = parseInt(req.query.limit.trim(), 10);
+    if (n > 0) limit = Math.min(n, BM_CANDIDATES_MAX_LIMIT);
+  }
+  const includeMatched = parseBmHarvestFillOnly(req.query.include_matched);
+  try {
+    const { total, candidates } = listBmUnmatchedCandidates(getDb(), { limit, includeMatched });
+    res.json({ success: true, total, limit, include_matched: includeMatched, candidates });
+  } catch (err: any) {
+    res.status(500).json({ error: "unmatched-candidates failed", detail: err?.message || String(err) });
+  }
+});
+
 router.get("/", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
@@ -563,10 +605,20 @@ router.get("/", async (req: Request, res: Response) => {
 
         const match = matchBmProducerToCatalog(db, record);
         if (!match) {
-          results.push({ slug, outcome: "unmatched" });
+          // Slice B2: keep the page as a candidate (a known name variant is
+          // not one). Independent of scope_agent_ids: no profile is written.
+          const cand = recordBmUnmatchedCandidate(db, record, new Date().toISOString());
+          results.push({
+            slug,
+            outcome: "unmatched",
+            candidate_outcome: cand.outcome,
+            ...(cand.agentId ? { candidate_known_agent_id: cand.agentId } : {}),
+            ...(cand.detail ? { candidate_detail: cand.detail } : {}),
+          });
           continue;
         }
         const agentId = match.agentId;
+        markBmCandidateMatched(db, slug, agentId, new Date().toISOString());
 
         // scope_agent_ids: a matched agent outside the caller's scope gets no
         // write and no queue proposal of any kind.
@@ -796,6 +848,7 @@ router.get("/", async (req: Request, res: Response) => {
         // url outcomes by slice 5).
         if (r.phone_outcome) acc[r.phone_outcome] = (acc[r.phone_outcome] ?? 0) + 1;
         if (r.url_outcome) acc[r.url_outcome] = (acc[r.url_outcome] ?? 0) + 1;
+        if (r.candidate_outcome) acc[r.candidate_outcome] = (acc[r.candidate_outcome] ?? 0) + 1;
         return acc;
       }, {});
 

@@ -28,7 +28,7 @@
 
 import { readOrderNotificationsOptIn, writeOrderNotificationsOptIn, readOrderNotificationEmailOverride } from "../services/order-opt-in";
 import { readOwnerProfileVisible, writeOwnerProfileVisible } from "../services/owner-pause-store";
-import { GARDSSALG_BOOKING_ENABLED_ADAPTER, GARDSSALG_PROFILE_VISIBLE_ADAPTER } from "./gardssalg-adapters";
+import { GARDSSALG_BOOKING_ENABLED_ADAPTER, GARDSSALG_NOTIFY_ADDRESS_ADAPTER, GARDSSALG_PROFILE_VISIBLE_ADAPTER } from "./gardssalg-adapters";
 import { PRODUCT_WEEKLY_SYNC_ADAPTER, PRODUCT_WEEKLY_SYNC_FLAG } from "./product-weekly-sync";
 import type { ForProdusenterAnchor } from "../routes/rfb-for-produsenter-anchors";
 
@@ -1170,7 +1170,21 @@ export const GARDSSALG_OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     nullable: true,
     default: { owner: null, unclaimed: null },
     outward: true,
-    surfaces: ["email:booking_request"],
+    // O4-3 (dev-request 2026-11-12-opplevagent-o4-epost-og-tekster): live
+    // behind GARDSSALG_NOTIFY_ADDRESS_CONFIRM_ENABLED (liveFlag; off =
+    // coming_soon, the «Planlagt» row exactly as before — whileFlagOff).
+    // The value is where requests go now (adapter, read only); it changes
+    // only through the e-mailed link (confirmByEmail). Surfaces: the request
+    // e-mail's recipient, the confirmation e-mail (OA-3 3.2), the notice to
+    // the old address (3.4) and «Send bekreftelse» in «Mine valg».
+    status: "live",
+    liveFlag: "GARDSSALG_NOTIFY_ADDRESS_CONFIRM_ENABLED",
+    whileFlagOff: { since: GS_SINCE },
+    since: "2026-11-16",
+    devRequest: "2026-11-12-opplevagent-o4-epost-og-tekster",
+    surfaces: ["email:booking_request", "email:address_confirm", "email:address_change_notice", "owner_portal"],
+    storage: GARDSSALG_NOTIFY_ADDRESS_ADAPTER,
+    confirmByEmail: true,
   }),
 
   // ── Besøk og booking ────────────────────────────────────────────────────

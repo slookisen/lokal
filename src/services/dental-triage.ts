@@ -7,7 +7,16 @@
 // {wrong_entity_repeat, dead_homepage_repeat, insufficient_yield_repeat} and a
 // review_since stamp. Nothing drained that state. This job drains the part of
 // it that can be decided DETERMINISTICALLY, with checks that already exist in
-// this codebase:
+// this codebase.
+//
+// Slice 3c-4: the candidate set also includes LEGACY needs_review rows —
+// verification_status='needs_review' with review_reason NULL (the older
+// verifier-set needs_review rows that predate slice 3b's review_reason). Rows
+// with any OTHER non-null review_reason stay out. Such rows usually have no
+// review_since either, so the "oldest first" order falls back to
+// last_verified_at / updated_at / created_at (DENTAL_TRIAGE_ORDER_SQL).
+// Decisions and the review-state clearing are the same for both kinds.
+//
 //
 //   1. inactive  — Brreg says the unit is deleted (slettet: slettedato set or
 //                  HTTP 410). Brreg lookup: fetchBrregAddressEvidence()
@@ -170,9 +179,13 @@ const CANDIDATE_COLUMNS = `id, navn, org_nr, hjemmeside, directory_url, poststed
 
 const REASONS_SQL = DENTAL_TRIAGE_REVIEW_REASONS.map(() => "?").join(", ");
 
-/** The triage state: needs_review from slice 3b, not already closed. */
+/** The triage state: needs_review from slice 3b (review_reason in
+ *  DENTAL_TRIAGE_REVIEW_REASONS) or legacy verifier-set needs_review
+ *  (review_reason NULL, slice 3c-4), not already closed. Any other non-null
+ *  review_reason is NOT a candidate. The placeholders are still exactly the
+ *  DENTAL_TRIAGE_REVIEW_REASONS ones (IS NULL binds nothing). */
 const CANDIDATE_STATE_SQL = `verification_status = 'needs_review'
-          AND review_reason IN (${REASONS_SQL})
+          AND (review_reason IN (${REASONS_SQL}) OR review_reason IS NULL)
           AND (is_inactive IS NULL OR is_inactive = 0)
           AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}`;
 
@@ -181,6 +194,12 @@ const CANDIDATE_STATE_SQL = `verification_status = 'needs_review'
  *  (dental-triage-judgement-job.ts), which re-checks the same state. */
 export const DENTAL_TRIAGE_CANDIDATE_STATE_SQL = CANDIDATE_STATE_SQL;
 
+/** "Oldest first" sort key (slice 3c-4). review_since is set only by slice 3b;
+ *  a legacy needs_review row (review_reason NULL) has none, so it falls back
+ *  to when the verifier last looked at it (last_verified_at), then
+ *  updated_at / created_at. No placeholders; tiebreak on id at the call site. */
+export const DENTAL_TRIAGE_ORDER_SQL = `COALESCE(review_since, last_verified_at, updated_at, created_at, '9999')`;
+
 export function clampDentalTriageLimit(raw: unknown, fallback: number = DENTAL_TRIAGE_MAX_BATCH): number {
   const n = typeof raw === "number" ? raw : typeof raw === "string" && raw.trim() !== "" ? Number(raw) : NaN;
   if (!Number.isFinite(n)) return fallback;
@@ -188,7 +207,8 @@ export function clampDentalTriageLimit(raw: unknown, fallback: number = DENTAL_T
 }
 
 /**
- * Oldest review_since first (id as tiebreaker), up to `limit` (max 50). A row
+ * Oldest first (review_since, else last_verified_at / updated_at / created_at
+ * for legacy rows; id as tiebreaker), up to `limit` (max 50). A row
  * a real run left undecided within DENTAL_TRIAGE_UNDECIDED_RECHECK_DAYS is
  * skipped, so undecided rows cannot starve the rest of the queue.
  */
@@ -204,7 +224,7 @@ export function pickDentalTriageCandidates(db: any, limit: number = DENTAL_TRIAG
                    AND f.check_type = ?
                    AND f.status = 'undecided'
                    AND f.checked_at > datetime('now', ?))
-        ORDER BY COALESCE(review_since, '9999') ASC, id ASC
+        ORDER BY ${DENTAL_TRIAGE_ORDER_SQL} ASC, id ASC
         LIMIT ?`,
     )
     .all(
@@ -225,7 +245,7 @@ function pickDentalTriageByIds(db: any, ids: string[]): DentalTriageCandidateRow
          FROM dental_agents
         WHERE ${CANDIDATE_STATE_SQL}
           AND id IN (${placeholders})
-        ORDER BY COALESCE(review_since, '9999') ASC, id ASC`,
+        ORDER BY ${DENTAL_TRIAGE_ORDER_SQL} ASC, id ASC`,
     )
     .all(...DENTAL_TRIAGE_REVIEW_REASONS, ...ids) as DentalTriageCandidateRow[];
 }

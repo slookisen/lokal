@@ -63,7 +63,9 @@ async function main() {
     !/await github\.rest\.repos\.getCombinedStatusForRef\(/.test(yml));
   check('no unwrapped checks.listForRef call',
     !/await github\.rest\.checks\.listForRef\(/.test(yml));
-  check('poll budget unchanged', /const MAX_POLLS = isSweep \? 4 : 40;/.test(yml));
+  // Budget values themselves are asserted by test-fleet-auto-approve-scheduled-reeval.js
+  // (raised for the determinism gate, dev-request 2026-11-18-fleet-gate-pollbudsjett-under-determinismeport).
+  check('poll budget shape unchanged', /const MAX_POLLS = isSweep \? SWEEP_MAX_POLLS : EVENT_MAX_POLLS;/.test(yml));
   check('poll interval unchanged', /const POLL_INTERVAL_MS = 15000;/.test(yml));
 
   console.log('withRetry5xx (extracted from the workflow)');

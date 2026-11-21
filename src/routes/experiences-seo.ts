@@ -7407,6 +7407,7 @@ ${BROWSE_CSS}
     ${notLive ? pausedContactBlock : `<p class="microcopy">Du betaler ingenting nå — dette er en reservasjon.</p>
     <form class="book-form" method="POST" action="${canonical}" id="book-form">
       <input type="hidden" name="provider_id" value="${escapeHtml(provider.id)}">
+      <input type="hidden" name="lang" value="nb">
       <label for="slot_at">Dato og tid (norsk tid)</label>
       <input id="slot_at" name="slot_at" type="datetime-local" value="${escapeHtml(defaultBookingSlotAtDatetimeLocal())}" autocomplete="off" required>
       <label for="party_size">Antall personer</label>
@@ -7443,7 +7444,8 @@ ${BROWSE_CSS}
       slot_at: String(fd.get("slot_at") || ""),
       party_size: partySize,
       guest_name: String(fd.get("guest_name") || ""),
-      guest_email: String(fd.get("guest_email") || "")
+      guest_email: String(fd.get("guest_email") || ""),
+      lang: String(fd.get("lang") || "nb")
     };
     var phone = String(fd.get("guest_phone") || "").trim();
     if (phone) payload.guest_phone = phone;
@@ -7592,7 +7594,8 @@ router.post(
 
     let booking;
     try {
-      booking = createBooking(parsed.data);
+      // O4-2: the form's `lang` field (this page is Norwegian: "nb").
+      booking = createBooking(parsed.data, undefined, { guestLang: body.lang });
     } catch (err) {
       console.error("[gardssalg-book] createBooking failed", err);
       res.redirect(303, `${backTo}?error=internal`);

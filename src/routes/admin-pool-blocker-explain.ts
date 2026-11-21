@@ -66,7 +66,7 @@ function getAdminKey(): string {
   return process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
 }
 
-function requireAdmin(req: Request, res: Response): boolean {
+export function requireAdmin(req: Request, res: Response): boolean {
   const expected = getAdminKey();
   if (!expected) {
     res.status(503).json({ error: "Admin not configured" });
@@ -165,7 +165,7 @@ function provenanceSourceCounts(raw: string | null): Record<string, number> {
 // already persisted in `agent_knowledge.verification_review_reason`. That
 // makes the reported blocker exactly what the verifier concluded on its
 // last pass, with `stale_as_of` so a caller can see how fresh it is.
-interface VerifierStoredVerdict {
+export interface VerifierStoredVerdict {
   domain_coherence?: { coherent?: boolean; reason?: string } | null;
   email_ownership_unproven?: boolean | null;
   // dev-request 2026-10-01-rfb-verifier-epostdomene-paa-tvers-av-tld: set by
@@ -198,7 +198,7 @@ interface VerifierStoredVerdict {
   [key: string]: unknown;
 }
 
-function parseReviewReason(raw: string | null): VerifierStoredVerdict | null {
+export function parseReviewReason(raw: string | null): VerifierStoredVerdict | null {
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw);
@@ -348,7 +348,7 @@ function withinDays(iso: string | null, days: number, nowMs: number): boolean {
 // object (unconditionally stamped by the verifier for every row it
 // processes) in addition to the new explicit top-level flag, for the same
 // historical-coverage reason.
-function quarantineReasons(
+export function quarantineReasons(
   fieldProvenanceRaw: string | null,
   storedVerdict: VerifierStoredVerdict | null,
 ): string[] {
@@ -410,6 +410,47 @@ function quarantineReasons(
   return reasons;
 }
 
+// contacted_at = MAX(sent_at) of outbound CRM messages to a.contact_email.
+// Slettefrist slice A: messages the 24-month retention job deleted are kept
+// as crm_contacts.retention_last_outbound_at, so the newer of the two is
+// used (same value as before the cleanup). Expects `a` = agents in the outer
+// query. Exported so GET /admin/address-conflict-breakdown selects the same
+// "uncontacted" cohort as this route (dev-request 2026-11-15-rfb-
+// adressekonflikt-smal-regel-torrkjoring, G1). Constant SQL, no user input.
+export function buildContactedAtSql(db: ReturnType<typeof getDb>): string {
+  const liveContactedSql = `(
+             SELECT MAX(m.sent_at)
+             FROM crm_messages m
+             JOIN crm_threads t ON t.id = m.thread_id
+             JOIN crm_contacts c ON c.id = t.contact_id
+             WHERE m.direction = 'out'
+               AND a.contact_email IS NOT NULL AND a.contact_email != ''
+               AND LOWER(c.email) = LOWER(a.contact_email)
+           )`;
+  const retainedContactedSql = `(
+             SELECT MAX(cr.retention_last_outbound_at)
+             FROM crm_contacts cr
+             WHERE a.contact_email IS NOT NULL AND a.contact_email != ''
+               AND LOWER(cr.email) = LOWER(a.contact_email)
+           )`;
+  return hasContactRetentionMarkers(db)
+    ? `(CASE WHEN ${retainedContactedSql} IS NULL THEN ${liveContactedSql}
+             WHEN ${liveContactedSql} IS NULL THEN ${retainedContactedSql}
+             WHEN ${liveContactedSql} >= ${retainedContactedSql} THEN ${liveContactedSql}
+             ELSE ${retainedContactedSql} END)`
+    : liveContactedSql;
+}
+
+// The outreach_ready_pool VIEW's outreach_sent_log exclusion, re-derived 1:1
+// (expects `a` = agents and `k` = agent_knowledge in the outer query). Shared
+// with GET /admin/address-conflict-breakdown for the same reason as above.
+export const ALREADY_SENT_SQL = `EXISTS(
+             SELECT 1 FROM outreach_sent_log o
+             WHERE o.vertical_id = 'rfb'
+               AND (o.agent_id = a.id
+                    OR (o.recipient_email IS NOT NULL AND o.recipient_email = LOWER(k.email)))
+           )`;
+
 router.get("/", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
@@ -451,31 +492,7 @@ router.get("/", (req: Request, res: Response) => {
   // mode=second promise_given set, same helper.
   const promiseGivenEmails = loadRfbPromiseGivenEmails(db);
 
-  // contacted_at = MAX(sent_at) of outbound CRM messages to a.contact_email.
-  // Slettefrist slice A: messages the 24-month retention job deleted are kept
-  // as crm_contacts.retention_last_outbound_at, so the newer of the two is
-  // used (same value as before the cleanup).
-  const liveContactedSql = `(
-             SELECT MAX(m.sent_at)
-             FROM crm_messages m
-             JOIN crm_threads t ON t.id = m.thread_id
-             JOIN crm_contacts c ON c.id = t.contact_id
-             WHERE m.direction = 'out'
-               AND a.contact_email IS NOT NULL AND a.contact_email != ''
-               AND LOWER(c.email) = LOWER(a.contact_email)
-           )`;
-  const retainedContactedSql = `(
-             SELECT MAX(cr.retention_last_outbound_at)
-             FROM crm_contacts cr
-             WHERE a.contact_email IS NOT NULL AND a.contact_email != ''
-               AND LOWER(cr.email) = LOWER(a.contact_email)
-           )`;
-  const contactedAtSql = hasContactRetentionMarkers(db)
-    ? `(CASE WHEN ${retainedContactedSql} IS NULL THEN ${liveContactedSql}
-             WHEN ${liveContactedSql} IS NULL THEN ${retainedContactedSql}
-             WHEN ${liveContactedSql} >= ${retainedContactedSql} THEN ${liveContactedSql}
-             ELSE ${retainedContactedSql} END)`
-    : liveContactedSql;
+  const contactedAtSql = buildContactedAtSql(db);
 
   const stmt = db.prepare(`
     SELECT a.id AS id, a.name AS name, a.umbrella_type AS umbrella_type,
@@ -496,12 +513,7 @@ router.get("/", (req: Request, res: Response) => {
            k.no_yield_streak AS no_yield_streak, k.wrong_entity_streak AS wrong_entity_streak,
            k.last_enrichment_attempt_at AS last_enrichment_attempt_at,
            ${contactedAtSql} AS contacted_at,
-           EXISTS(
-             SELECT 1 FROM outreach_sent_log o
-             WHERE o.vertical_id = 'rfb'
-               AND (o.agent_id = a.id
-                    OR (o.recipient_email IS NOT NULL AND o.recipient_email = LOWER(k.email)))
-           ) AS already_sent,
+           ${ALREADY_SENT_SQL} AS already_sent,
            EXISTS(SELECT 1 FROM outreach_ready_pool p WHERE p.agent_id = a.id) AS in_pool
       FROM agents a
       LEFT JOIN agent_knowledge k ON k.agent_id = a.id

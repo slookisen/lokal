@@ -238,12 +238,13 @@ export function isOwnPlatformHomepage(row: {
 // untouched by this gate, exactly like before). Only 'retail_shop' is gated:
 // a producer's own farm shop ('farm_shop') and ordinary producers (NULL /
 // 'producer') are NEVER affected. `agents.retail_focus` ('frukt_gront' |
-// 'fisk' | 'annet') says what a retail_shop sells.
+// 'fisk' | 'kjott' | 'annet') says what a retail_shop sells.
 //
 // A retail_shop is outreach-eligible ONLY when BOTH hold:
-//   (a) retail_focus = 'frukt_gront'. 'fisk' is deliberately NOT allowed: Daniel
-//       has not answered whether fish shops count (open question in the
-//       dev-request) — it must be added here explicitly once he does.
+//   (a) retail_focus IN ('frukt_gront', 'fisk', 'kjott'). Independent fish
+//       shops ('fisk') and butchers ('kjott') were added by dev-request
+//       2026-11-15-rfb-butikkregel-fisk-og-kjott (slice E1, Daniel-authorized);
+//       'annet' stays OUT. Any further focus must be added here explicitly.
 //   (b) the profile passes the quality gate: about >= 150 chars AND the `about`
 //       field has a 'homepage' provenance record (own site), AND >= 3 products,
 //       AND the about text describes the business as a shop (butikk /
@@ -253,7 +254,7 @@ export function isOwnPlatformHomepage(row: {
 // retail_profile_not_ready (passes a, fails b). `k`/`a` must alias
 // agent_knowledge/agents. WHERE-clause use only; CASE guards make malformed
 // JSON in field_provenance/products fail the gate safely (excluded, no crash).
-export const RETAIL_SHOP_FOCUS_ALLOWED = ["frukt_gront"] as const;
+export const RETAIL_SHOP_FOCUS_ALLOWED = ["frukt_gront", "fisk", "kjott"] as const;
 export const RETAIL_SHOP_MIN_ABOUT_CHARS = 150;
 export const RETAIL_SHOP_MIN_PRODUCTS = 3;
 const RETAIL_SHOP_ABOUT_LIKE = [
@@ -2568,6 +2569,150 @@ function initSchema(db: Database.Database): void {
     // best-effort
   }
 
+  // ─── dev-request 2026-10-26-lokal-agent-verifier-snapshot-drift-toleranse
+  // (slice 4) — append-only log of every change to an agent's queue
+  // membership inputs: agent_knowledge.verification_status and
+  // agents.is_active (the snapshot claim-count query counts
+  // `a.is_active = 1 AND k.verification_status = <X>`). Read by
+  // GET /admin/verifier/claim-counts?mode=snapshot&drift_since=<ISO> to return
+  // `drift_bound`: how many distinct agents entered or left a queue since the
+  // lokal-agent-verifier read its snapshot claim, so platform-verifier's probe
+  // (10-12 h later) can tell real queue movement from a wrong claim.
+  //
+  // WHY triggers, not agent_knowledge.updated_at: several write sites change
+  // verification_status without touching updated_at (e.g. the parking
+  // UPDATEs in lokal-agent-verifier.ts, admin-agents-terminal-repark.ts,
+  // admin-phone-context-gate-retro-scan.ts, the review_required boot
+  // migration), agents.is_active has no timestamp at all, and updated_at is
+  // bumped by unrelated enrichment writes, so it is neither complete nor
+  // queue-specific. Triggers see every write path, including future ones.
+  // One knowledge row per agent (agent_id is the PK), so each agent moves a
+  // queue count by at most 1 net — counting distinct agents is a sound bound.
+  // No INSERT OR REPLACE on agent_knowledge/agents exists in src (REPLACE
+  // would skip the DELETE trigger since recursive_triggers is off).
+  // Purely observational, no gate reads it. DROP+CREATE every boot so a
+  // future edit to a trigger body actually lands.
+  //
+  // Slice 5: claim-counts also rebuilds the exact queue count as of read_at
+  // (count_at_read) from the earliest event per agent after read_at, so each
+  // event's OLD side must be the agent's real prior state. trg_aqse_agents_del
+  // is therefore BEFORE DELETE: with foreign_keys = ON the agent_knowledge row
+  // is removed by ON DELETE CASCADE before any AFTER DELETE trigger on agents
+  // runs (so an AFTER trigger logged nothing), and the cascaded
+  // trg_aqse_knowledge_del sees no agents row (old_active NULL). Likewise an
+  // agents row that did not exist before (INSERT, or the new id of an id
+  // change) logs old_status NULL: that (agent, knowledge) pair was not counted.
+  //
+  // ROLLBACK (review N3): reverting this code does NOT remove the triggers —
+  // they are stored in the SQLite file and keep writing to
+  // agent_queue_state_events. Dropping that table while they exist makes every
+  // INSERT/UPDATE/DELETE on agents/agent_knowledge fail with "no such table".
+  // A rollback must first run
+  //   DROP TRIGGER IF EXISTS trg_aqse_knowledge_ins;
+  //   DROP TRIGGER IF EXISTS trg_aqse_knowledge_upd;
+  //   DROP TRIGGER IF EXISTS trg_aqse_knowledge_del;
+  //   DROP TRIGGER IF EXISTS trg_aqse_agents_ins;
+  //   DROP TRIGGER IF EXISTS trg_aqse_agents_upd;
+  //   DROP TRIGGER IF EXISTS trg_aqse_agents_del;
+  // and only then DROP TABLE agent_queue_state_events.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_queue_state_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        old_status TEXT,
+        new_status TEXT,
+        old_active INTEGER,
+        new_active INTEGER,
+        changed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_agent_queue_state_events_changed
+        ON agent_queue_state_events(changed_at);
+
+      DROP TRIGGER IF EXISTS trg_aqse_knowledge_ins;
+      CREATE TRIGGER trg_aqse_knowledge_ins
+      AFTER INSERT ON agent_knowledge
+      BEGIN
+        INSERT INTO agent_queue_state_events (agent_id, old_status, new_status, old_active, new_active)
+        VALUES (NEW.agent_id, NULL, NEW.verification_status,
+                (SELECT is_active FROM agents WHERE id = NEW.agent_id),
+                (SELECT is_active FROM agents WHERE id = NEW.agent_id));
+      END;
+
+      DROP TRIGGER IF EXISTS trg_aqse_knowledge_upd;
+      CREATE TRIGGER trg_aqse_knowledge_upd
+      AFTER UPDATE OF verification_status, agent_id ON agent_knowledge
+      WHEN OLD.verification_status IS NOT NEW.verification_status OR OLD.agent_id IS NOT NEW.agent_id
+      BEGIN
+        INSERT INTO agent_queue_state_events (agent_id, old_status, new_status, old_active, new_active)
+        VALUES (OLD.agent_id, OLD.verification_status,
+                CASE WHEN OLD.agent_id IS NEW.agent_id THEN NEW.verification_status END,
+                (SELECT is_active FROM agents WHERE id = OLD.agent_id),
+                (SELECT is_active FROM agents WHERE id = OLD.agent_id));
+        INSERT INTO agent_queue_state_events (agent_id, old_status, new_status, old_active, new_active)
+        SELECT NEW.agent_id, NULL, NEW.verification_status,
+               (SELECT is_active FROM agents WHERE id = NEW.agent_id),
+               (SELECT is_active FROM agents WHERE id = NEW.agent_id)
+         WHERE OLD.agent_id IS NOT NEW.agent_id;
+      END;
+
+      DROP TRIGGER IF EXISTS trg_aqse_knowledge_del;
+      CREATE TRIGGER trg_aqse_knowledge_del
+      AFTER DELETE ON agent_knowledge
+      BEGIN
+        INSERT INTO agent_queue_state_events (agent_id, old_status, new_status, old_active, new_active)
+        VALUES (OLD.agent_id, OLD.verification_status, NULL,
+                (SELECT is_active FROM agents WHERE id = OLD.agent_id),
+                (SELECT is_active FROM agents WHERE id = OLD.agent_id));
+      END;
+
+      DROP TRIGGER IF EXISTS trg_aqse_agents_ins;
+      CREATE TRIGGER trg_aqse_agents_ins
+      AFTER INSERT ON agents
+      BEGIN
+        INSERT INTO agent_queue_state_events (agent_id, old_status, new_status, old_active, new_active)
+        SELECT NEW.id, NULL, k.verification_status, NULL, NEW.is_active
+          FROM agent_knowledge k WHERE k.agent_id = NEW.id;
+      END;
+
+      DROP TRIGGER IF EXISTS trg_aqse_agents_upd;
+      CREATE TRIGGER trg_aqse_agents_upd
+      AFTER UPDATE OF is_active, id ON agents
+      WHEN OLD.is_active IS NOT NEW.is_active OR OLD.id IS NOT NEW.id
+      BEGIN
+        INSERT INTO agent_queue_state_events (agent_id, old_status, new_status, old_active, new_active)
+        SELECT OLD.id, k.verification_status, k.verification_status, OLD.is_active,
+               CASE WHEN OLD.id IS NEW.id THEN NEW.is_active END
+          FROM agent_knowledge k WHERE k.agent_id = OLD.id;
+        INSERT INTO agent_queue_state_events (agent_id, old_status, new_status, old_active, new_active)
+        SELECT NEW.id, NULL, k.verification_status, NULL, NEW.is_active
+          FROM agent_knowledge k WHERE k.agent_id = NEW.id AND OLD.id IS NOT NEW.id;
+      END;
+
+      DROP TRIGGER IF EXISTS trg_aqse_agents_del;
+      CREATE TRIGGER trg_aqse_agents_del
+      BEFORE DELETE ON agents
+      BEGIN
+        INSERT INTO agent_queue_state_events (agent_id, old_status, new_status, old_active, new_active)
+        SELECT OLD.id, k.verification_status, k.verification_status, OLD.is_active, NULL
+          FROM agent_knowledge k WHERE k.agent_id = OLD.id;
+      END;
+    `);
+  } catch (e) {
+    console.error(`[migration] agent_queue_state_events log/triggers failed:`, e);
+  }
+  // Retention (slice 5): keep 14 days (DRIFT_LOG_RETENTION_DAYS in
+  // admin-verifier-claim-counts.ts; a drift_since older than that returns
+  // null). Raw string compare in changed_at's own format, so the index is used.
+  try {
+    db.prepare(
+      `DELETE FROM agent_queue_state_events
+        WHERE changed_at < strftime('%Y-%m-%d %H:%M:%f', 'now', '-14 days')`,
+    ).run();
+  } catch (e) {
+    console.error(`[migration] agent_queue_state_events prune failed:`, e);
+  }
+
   // ─── dev-request 2026-09-01-rfb-pending-verify-unpark-lever (Daniel Alternativ B,
   // 2026-09-02) — dedikert ferskhetskolonne for unpark-leverens filter, FRIKOBLET fra
   // agent_knowledge.updated_at (som 3 reviewrunder viste IKKE er et pålitelig
@@ -3145,8 +3290,9 @@ function initSchema(db: Database.Database): void {
            POOL_OWN_PLATFORM_DOMAIN_EXCLUSION_SQL's own comment above. */
         AND ${POOL_OWN_PLATFORM_DOMAIN_EXCLUSION_SQL}
         /* dev-request 2026-10-01-rfb-butikker-i-outreach-poolen: a row marked
-           business_type='retail_shop' is out unless it is a fruit/veg shop
-           with an enriched, shop-describing profile. Producers and
+           business_type='retail_shop' is out unless it is a fruit/veg, fish
+           or meat shop (RETAIL_SHOP_FOCUS_ALLOWED) with an enriched,
+           shop-describing profile. Producers and
            producer-run farm shops (business_type NULL/'producer'/'farm_shop')
            are untouched. See POOL_RETAIL_SHOP_GATE_SQL's comment above. */
         AND ${POOL_RETAIL_SHOP_GATE_SQL}
@@ -6659,6 +6805,30 @@ function initSchema(db: Database.Database): void {
     `);
   } catch (err) {
     console.error("Migration rfb_enrichment_nightly tables failed:", err);
+  }
+
+  // dev-request 2026-11-15-rfb-nattjobb-hull-kontaktuttrekk-bm-og-koer (B2):
+  // Bondens Marked producer pages the harvest could not match to a profile,
+  // kept as candidates for discovery (services/bm-unmatched-candidates.ts,
+  // which also creates the table on first use).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS bm_unmatched_candidates (
+        slug TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        city TEXT,
+        source_url TEXT NOT NULL,
+        website TEXT,
+        first_seen TEXT NOT NULL,
+        last_seen TEXT NOT NULL,
+        seen_count INTEGER NOT NULL DEFAULT 1,
+        matched_agent_id TEXT,
+        matched_at TEXT,
+        matched_via TEXT
+      );
+    `);
+  } catch (err) {
+    console.error("Migration bm_unmatched_candidates failed:", err);
   }
 
   // dev-request 2026-10-08-serverheng-hovedtraad-oppstart-statistikk-samtaler

@@ -9,7 +9,9 @@ import {
   peekClaimToken,
   confirmClaimToken,
   type VerifyClaimResult,
+  type ClaimFirstCompletion,
   verifyGardssalgOwnerSessionToken,
+  gardssalgOwnerSessionCookieMaxAge,
   revokeClaimToken,
   updateClaimedProviderProfile,
   releaseClaimedProviderFieldLock,
@@ -28,12 +30,14 @@ import {
   type ClaimProviderRow,
 } from "../services/gardssalg-claim";
 import { getGardssalgOwnerStats } from "../services/gardssalg-owner-stats-service";
-import { emailService } from "../services/email-service";
+import { emailService, renderGardssalgClaimMagicLink, buildGardssalgClaimWelcomeEmail } from "../services/email-service";
+import { archiveGardssalgClaimMail, isGardssalgClaimWelcomeEmailEnabled, GARDSSALG_CLAIM_CRM_LINK_PLACEHOLDER } from "../services/gardssalg-claim-crm-archive";
 import { generalLimiter } from "../middleware/security";
 import { ownerBookingEnableBlock, type OwnerBookingBlock } from "../services/gardssalg-booking-gate";
 import { createGardssalgOwnerFeaturesRouter, gardssalgOversiktHtml, gardssalgOwnerDashboardOnForSession, gardssalgOwnerFeaturesTabOpen } from "./gardssalg-owner-features";
 import { wrapGardssalgDashboard } from "../owner-ui/gardssalg-dashboard";
-import { CLAIM_LINK_TEXTS, CLAIM_CONFIRM_TEXTS } from "./gardssalg-claim-texts";
+import { CLAIM_LINK_TEXTS, CLAIM_CONFIRM_TEXTS, MANUAL_CLAIM_TEXTS, MANUAL_CLAIM_FORM_TEXTS_NOT_APPROVED } from "./gardssalg-claim-texts";
+import { isManualClaimQueueEnabled, isManualClaimReceiptEnabled, sendManualClaimMail, submitManualClaim } from "../services/gardssalg-manual-claims";
 
 // ─────────────────────────────────────────────────────────────────
 // GÅRDSSALG PRODUCER OWNER-CLAIM — dev-request 2026-07-21-opplevagent-
@@ -231,7 +235,14 @@ export function sessionFromRequest(req: Request): { valid: boolean; providerId?:
   const cookieToken = readSessionCookie(req);
   if (cookieToken) {
     const s = verifyGardssalgOwnerSessionToken(cookieToken);
-    if (s.valid) return s;
+    if (s.valid) {
+      // O3-3: a renewed cookie session gets its cookie re-set to the new expiry.
+      const res = (req as any).res as Response | undefined;
+      if (s.renewedExpiresAtMs && res && !res.headersSent && typeof res.cookie === "function") {
+        setOwnerSessionCookie(res, cookieToken, s.renewedExpiresAtMs - Date.now());
+      }
+      return s;
+    }
   }
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith("Bearer ")) {
@@ -376,8 +387,9 @@ function sendClaimLinkPage(res: Response, html: string) {
   return res.status(200).send(html);
 }
 
-/** Mails a claim row's link with the existing claim-link e-mail. Never logs the link. */
-function mailClaimLink(providerId: string, providerName: string, claim: { token: string; email: string; isTest: boolean }): void {
+/** Mails a claim row's link with the existing claim-link e-mail. Never logs the link.
+ *  O3-4 (welcome flag on): the sent mail is filed in the CRM without the link. */
+function mailClaimLink(providerId: string, providerName: string, claim: { token: string; email: string; isTest: boolean; claimId?: string }): void {
   const verifyUrl = `${OPPLEVAGENT_BASE_URL}/kategori/gardssalg/eier/magic-link-verify?token=${claim.token}`;
   emailService
     .sendGardssalgClaimMagicLink({
@@ -390,6 +402,17 @@ function mailClaimLink(providerId: string, providerName: string, claim: { token:
     .then((emailResult) => {
       if (!emailResult.success) {
         console.error(`[gardssalg-claim] Failed to send magic link email for provider ${providerId}`);
+      }
+      if (isGardssalgClaimWelcomeEmailEnabled()) {
+        archiveGardssalgClaimMail({
+          kind: "magic_link",
+          providerId,
+          claimId: claim.claimId,
+          to: claim.email,
+          rendered: renderGardssalgClaimMagicLink(providerName, GARDSSALG_CLAIM_CRM_LINK_PLACEHOLDER),
+          isTest: claim.isTest,
+          sendResult: emailResult,
+        });
       }
     })
     .catch((e) => console.error("[gardssalg-claim] sendGardssalgClaimMagicLink error:", e));
@@ -452,18 +475,61 @@ router.get("/kategori/gardssalg/eier/magic-link-verify", generalLimiter, (req: R
 
 /** Session cookie + redirect to the portal after a successful claim — the
  *  same answer the link GET has always given; the O3-2 confirm POST reuses it. */
-function grantOwnerSessionAndRedirect(res: Response, result: VerifyClaimResult) {
-  res.cookie(GARDSSALG_OWNER_SESSION_COOKIE, result.token, {
+function setOwnerSessionCookie(res: Response, token: string, maxAgeMs: number) {
+  res.cookie(GARDSSALG_OWNER_SESSION_COOKIE, token, {
     path: "/",
-    maxAge: 7 * 24 * 60 * 60 * 1000,
+    maxAge: maxAgeMs,
     httpOnly: true,
     secure: true,
     sameSite: "lax",
   });
+}
+
+function grantOwnerSessionAndRedirect(res: Response, result: VerifyClaimResult) {
+  // Flag off: the fixed 7 days as before (O3-3: services/gardssalg-owner-session-sliding.ts).
+  setOwnerSessionCookie(res, result.token!, gardssalgOwnerSessionCookieMaxAge(result.token!));
 
   const provider = getClaimProviderById(result.providerId!);
+  if (result.firstCompletion && isGardssalgClaimWelcomeEmailEnabled()) {
+    mailClaimWelcome(result.providerId!, provider, result.firstCompletion);
+  }
   const target = provider?.slug ? `/kategori/gardssalg/eier/${encodeURIComponent(provider.slug)}/portal` : "/kategori/gardssalg";
   return res.redirect(302, target);
+}
+
+// ── O3-4: «Du er nå eier av profilen» after a completed claim (A2A
+// dev-request 2026-11-12-opplevagent-o3-eierkrav-og-innlogging; flag
+// GARDSSALG_CLAIM_WELCOME_EMAIL_ENABLED, default off, read per request) ─────
+// Both claim paths end in grantOwnerSessionAndRedirect() above: the link GET
+// (confirm step off) and the confirm POST (confirm step on). The service sets
+// result.firstCompletion only on the use that completed the claim (row used
+// 0 -> 1, and this address never completed a claim on the provider before),
+// so a re-click, a second POST or a later login link sends nothing. The mail
+// goes only to the address the claim was made with. With the flag on, the
+// sent mail is filed in the producer's CRM thread (fail-open).
+function mailClaimWelcome(providerId: string, provider: ClaimProviderRow | null, done: ClaimFirstCompletion): void {
+  if (!provider?.slug) {
+    console.error(`[gardssalg-claim] welcome mail for provider ${providerId} not sent: no login page (no slug)`);
+    return;
+  }
+  const providerName = provider.navn || "din profil";
+  // The owner login page, where an owner asks for a new login link.
+  const loginUrl = `${OPPLEVAGENT_BASE_URL}/kategori/gardssalg/eier/${encodeURIComponent(provider.slug)}`;
+  emailService
+    .sendGardssalgClaimWelcome({ to: done.email, providerName, loginUrl, isTestSend: done.isTest })
+    .then((sendResult) => {
+      if (!sendResult.success) console.error(`[gardssalg-claim] welcome mail for provider ${providerId} was not sent`);
+      archiveGardssalgClaimMail({
+        kind: "welcome",
+        providerId,
+        claimId: done.claimId,
+        to: done.email,
+        rendered: buildGardssalgClaimWelcomeEmail(providerName, loginUrl),
+        isTest: done.isTest,
+        sendResult,
+      });
+    })
+    .catch((e) => console.error("[gardssalg-claim] welcome mail error:", e instanceof Error ? e.message : "error"));
 }
 
 // ── O3-2: a GET does not grant ownership (A2A dev-request 2026-11-12-
@@ -583,7 +649,8 @@ router.get("/kategori/gardssalg/eier/:providerSlug", generalLimiter, async (req:
     }
 
     if (candidates.length === 0) {
-      return res.send(shell("Er dette din bedrift?", `${alert}${manualFallbackBlock()}
+      const manualForm = isManualClaimQueueEnabled() && !isGardssalgProviderClaimed(provider.id) ? manualClaimFormHtml(provider) : "";
+      return res.send(shell("Er dette din bedrift?", `${alert}${manualFallbackBlock()}${manualForm}
         <div class="gc-card"><a href="${escapeHtml(backUrl)}" class="gc-btn gc-btn-secondary">Tilbake til profilen</a></div>`));
     }
 
@@ -754,6 +821,50 @@ router.post(
     }
     if (!redirectBase) return res.status(404).send(notFoundPage());
     return res.redirect(303, `${redirectBase}?status=sent`);
+  },
+);
+
+// ── O3-5: manual claim into the admin queue (services/gardssalg-manual-claims.ts),
+// flag GARDSSALG_CLAIM_MANUAL_QUEUE_ENABLED (default off: the POST falls through,
+// the page is as before). Same answer for a new and an already queued claim. The
+// receipt (GARDSSALG_CLAIM_MANUAL_QUEUE_RECEIPT_ENABLED, default off) goes once,
+// to the address the claimant typed.
+function manualClaimFormHtml(provider: ClaimProviderRow): string {
+  const T = MANUAL_CLAIM_FORM_TEXTS_NOT_APPROVED;
+  return `<div class="gc-card" data-gc-manual-claim="1">
+    <h2>${escapeHtml(T.heading)}</h2>
+    <p>${fillProdusent(T.intro, provider.navn)}</p>
+    <form method="post" action="/kategori/gardssalg/eier/${encodeURIComponent(provider.id)}/manuelt-krav">
+      <div class="gc-field"><label for="gc-mk-name">${escapeHtml(T.name)}</label><input id="gc-mk-name" name="name" required maxlength="200"></div>
+      <div class="gc-field"><label for="gc-mk-email">${escapeHtml(T.email)}</label><input id="gc-mk-email" name="email" type="email" required maxlength="254"></div>
+      <div class="gc-field"><label for="gc-mk-msg">${escapeHtml(T.message)}</label><textarea id="gc-mk-msg" name="message" maxlength="2000"></textarea></div>
+      <div class="gc-form-actions"><button type="submit" class="gc-btn gc-btn-primary">${escapeHtml(T.button)}</button></div>
+    </form>
+  </div>`;
+}
+
+router.post("/kategori/gardssalg/eier/:providerId/manuelt-krav", generalLimiter, express.json(), express.urlencoded({ extended: false }),
+  async (req: Request, res: Response, next: express.NextFunction) => {
+    if (!isManualClaimQueueEnabled()) return next();
+    const wantsJson = (req.headers["content-type"] || "").includes("application/json") || (req.headers.accept || "").includes("application/json");
+    const T = MANUAL_CLAIM_FORM_TEXTS_NOT_APPROVED;
+    let result: Awaited<ReturnType<typeof submitManualClaim>>;
+    try {
+      result = await submitManualClaim(String((req.params as any).providerId || ""), (req.body ?? {}) as Record<string, unknown>);
+    } catch (err) {
+      console.error("[gardssalg-claim] POST manuelt-krav error:", err instanceof Error ? err.message : "error");
+      return wantsJson ? res.status(500).json({ success: false, error: "internal_error" }) : res.status(500).send(shell("Feil", `<div class="gc-card"><h1>Noe gikk galt</h1><p>Prøv igjen senere.</p></div>`));
+    }
+    if (!result.ok) {
+      const status = { provider_not_found: 404, invalid_input: 400, already_claimed: 409, self_service_available: 409, too_many: 429 }[result.error];
+      if (wantsJson) return res.status(status).json({ success: false, error: result.error });
+      if (result.error === "provider_not_found") return res.status(404).send(notFoundPage());
+      const msg = result.error === "invalid_input" ? T.invalid : T.failed;
+      return res.status(status).send(shell(T.heading, `<div class="gc-card"><div class="gc-alert gc-alert-error" role="alert">${escapeHtml(msg)}</div></div>`));
+    }
+    if (result.created && isManualClaimReceiptEnabled()) sendManualClaimMail("receipt", result.id, result.email, result.provider.navn || "din profil");
+    if (wantsJson) return res.json({ success: true });
+    return res.send(shell(T.heading, `<div class="gc-card"><div class="gc-alert gc-alert-ok" role="status">${fillProdusent(MANUAL_CLAIM_TEXTS["claim.manual.receipt.page"], result.provider.navn)}</div></div>`));
   },
 );
 

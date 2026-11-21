@@ -110,6 +110,12 @@
 // then least recently attempted by that step (rfb_enrichment_nightly_
 // attempts), so a row a step could not help moves to the back and is not
 // re-tried by that step for RFB_ENRICHMENT_RETRY_DAYS.
+// B3 (dev-request 2026-11-15-rfb-nattjobb-hull-kontaktuttrekk-bm-og-koer):
+// content_refresh — and only it — also takes contacted rows that are
+// verified and held from a second outreach by the gate's data-quality check
+// (rfbEnrichmentContactedVerifiedHeld), after every cohort row, same cap; and
+// a field that missed twice on the homepage is marked needs_owner and not
+// taken for 60 days (RFB_ENRICHMENT_NEEDS_OWNER_*).
 //
 // Load and timing guards (serverheng):
 //   • Flag RFB_ENRICHMENT_NIGHTLY_ENABLED ("1"/"true"), default OFF. Off =
@@ -321,6 +327,31 @@ export const RFB_ENRICHMENT_PRODUCTS_NOT_SUPPORTED = "products_not_supported_by_
 /** content_refresh: the product-name model call failed (API/network/timeout/unparseable) / was not started (deadline) — transient, retried next night. */
 export const RFB_ENRICHMENT_PRODUCTS_EXTRACTION_FAILED = "products_extraction_failed";
 export const RFB_ENRICHMENT_PRODUCTS_EXTRACTION_SKIPPED = "products_extraction_skipped";
+
+/**
+ * Slice B3 (dev-request 2026-11-15-rfb-nattjobb-hull-kontaktuttrekk-bm-og-
+ * koer): content_refresh's per-field `needs_owner` marker. Two consecutive
+ * misses on the same field (categories_not_supported_by_homepage /
+ * products_not_supported_by_homepage, counted on stamped attempts only; a
+ * success for that field resets the count) mark that field `needs_owner`:
+ * the homepage cannot fix it, only the owner can. The step does not take the
+ * row for that field for RFB_ENRICHMENT_NEEDS_OWNER_DAYS after the last
+ * miss; when every field it would take the row for is marked, it does not
+ * take the row. Stored in the job's own rotation memory
+ * (rfb_enrichment_nightly_attempts) under one pseudo-step key per field (as
+ * owner_refresh is) — no producer or owner column is written.
+ * last_attempted_at = the last miss, last_outcome = "miss misses=1" /
+ * "needs_owner misses=N" / "cleared misses=0".
+ */
+export const RFB_ENRICHMENT_NEEDS_OWNER = "needs_owner";
+export const RFB_ENRICHMENT_NEEDS_OWNER_DAYS = 60;
+export const RFB_ENRICHMENT_NEEDS_OWNER_MISSES = 2;
+export type RfbEnrichmentNeedsOwnerField = "categories" | "products";
+export const RFB_ENRICHMENT_NEEDS_OWNER_FIELDS: readonly RfbEnrichmentNeedsOwnerField[] = ["categories", "products"];
+/** Pseudo-step key in rfb_enrichment_nightly_attempts for a field's miss counter. */
+export function rfbEnrichmentNeedsOwnerStepKey(field: RfbEnrichmentNeedsOwnerField): string {
+  return `content_refresh:${field}_miss`;
+}
 
 export type RfbEnrichmentStep =
   | "url_check"
@@ -858,7 +889,128 @@ export function readRfbEnrichmentAttempts(db: Db): Map<string, Map<string, numbe
   return out;
 }
 
-function stampAttempt(db: Db, agentId: string, step: RfbEnrichmentStep | typeof OWNER_REFRESH_STEP, at: Date, outcome: string, runId: string): void {
+/** One field's miss counter (B3); `at` = the last miss (ms). */
+export interface RfbEnrichmentNeedsOwnerEntry {
+  misses: number;
+  at: number;
+}
+
+/** agent_id → field → miss counter (B3). */
+export type RfbEnrichmentNeedsOwnerState = Map<string, Partial<Record<RfbEnrichmentNeedsOwnerField, RfbEnrichmentNeedsOwnerEntry>>>;
+
+/** The B3 miss counters. Read-only; a missing table reads as empty. */
+export function readRfbEnrichmentNeedsOwner(db: Db): RfbEnrichmentNeedsOwnerState {
+  const out: RfbEnrichmentNeedsOwnerState = new Map();
+  const keyToField = new Map(RFB_ENRICHMENT_NEEDS_OWNER_FIELDS.map((f) => [rfbEnrichmentNeedsOwnerStepKey(f), f] as const));
+  const keys = [...keyToField.keys()];
+  let rows: Array<{ agent_id: string; step: string; last_attempted_at: string; last_outcome: string | null }> = [];
+  try {
+    rows = db
+      .prepare(
+        `SELECT agent_id, step, last_attempted_at, last_outcome FROM rfb_enrichment_nightly_attempts
+          WHERE step IN (${keys.map(() => "?").join(", ")})`,
+      )
+      .all(...keys) as typeof rows;
+  } catch {
+    return out;
+  }
+  for (const r of rows) {
+    const field = keyToField.get(r.step);
+    const at = Date.parse(r.last_attempted_at);
+    const m = /misses=(\d+)/.exec(r.last_outcome ?? "");
+    if (!field || Number.isNaN(at) || !m) continue;
+    const entry = out.get(r.agent_id) ?? {};
+    entry[field] = { misses: parseInt(m[1], 10), at };
+    out.set(r.agent_id, entry);
+  }
+  return out;
+}
+
+/** The field is marked needs_owner and the marker is younger than 60 days. */
+export function rfbEnrichmentNeedsOwnerActive(e: RfbEnrichmentNeedsOwnerEntry | undefined, nowMs: number): boolean {
+  return (
+    !!e && e.misses >= RFB_ENRICHMENT_NEEDS_OWNER_MISSES && e.at > nowMs - RFB_ENRICHMENT_NEEDS_OWNER_DAYS * 86_400_000
+  );
+}
+
+/** What preview / envelope show: profiles with an active marker (total = distinct profiles). */
+export interface RfbEnrichmentNeedsOwnerSummary {
+  total: number;
+  by_field: Record<RfbEnrichmentNeedsOwnerField, number>;
+  days: number;
+}
+
+export function summarizeRfbEnrichmentNeedsOwner(state: RfbEnrichmentNeedsOwnerState, nowMs: number): RfbEnrichmentNeedsOwnerSummary {
+  const by_field: Record<RfbEnrichmentNeedsOwnerField, number> = { categories: 0, products: 0 };
+  let total = 0;
+  for (const entry of state.values()) {
+    let any = false;
+    for (const f of RFB_ENRICHMENT_NEEDS_OWNER_FIELDS) {
+      if (rfbEnrichmentNeedsOwnerActive(entry[f], nowMs)) {
+        by_field[f]++;
+        any = true;
+      }
+    }
+    if (any) total++;
+  }
+  return { total, by_field, days: RFB_ENRICHMENT_NEEDS_OWNER_DAYS };
+}
+
+/**
+ * Record one field's answer from a stamped content_refresh attempt (B3):
+ * `miss` adds one to the count (the second consecutive one sets — or, after
+ * an expired marker, renews — needs_owner, timestamped `at`); `success`
+ * resets a stored count to 0 (nothing is written for a row that never
+ * missed). Updates `state` too. Returns true when this call newly set the
+ * marker (it was not active before).
+ */
+export function recordRfbEnrichmentNeedsOwnerSignal(
+  db: Db,
+  state: RfbEnrichmentNeedsOwnerState,
+  agentId: string,
+  field: RfbEnrichmentNeedsOwnerField,
+  kind: "miss" | "success",
+  at: Date,
+  runId: string,
+): boolean {
+  const entry = state.get(agentId) ?? {};
+  const prev = entry[field];
+  if (kind === "success") {
+    if (!prev || prev.misses === 0) return false;
+    entry[field] = { misses: 0, at: at.getTime() };
+    state.set(agentId, entry);
+    stampAttempt(db, agentId, rfbEnrichmentNeedsOwnerStepKey(field), at, "cleared misses=0", runId);
+    return false;
+  }
+  const wasActive = rfbEnrichmentNeedsOwnerActive(prev, at.getTime());
+  const misses = (prev?.misses ?? 0) + 1;
+  entry[field] = { misses, at: at.getTime() };
+  state.set(agentId, entry);
+  const marked = misses >= RFB_ENRICHMENT_NEEDS_OWNER_MISSES;
+  stampAttempt(
+    db,
+    agentId,
+    rfbEnrichmentNeedsOwnerStepKey(field),
+    at,
+    `${marked ? RFB_ENRICHMENT_NEEDS_OWNER : "miss"} misses=${misses}`,
+    runId,
+  );
+  return marked && !wasActive;
+}
+
+/** content_refresh's per-field answers for B3 (absent = this attempt said nothing about that field). */
+function rfbEnrichmentNeedsOwnerSignals(
+  out: RfbEnrichmentRowOutcome,
+): Partial<Record<RfbEnrichmentNeedsOwnerField, "miss" | "success">> {
+  const s: Partial<Record<RfbEnrichmentNeedsOwnerField, "miss" | "success">> = {};
+  if (out.categories_corroboration === RFB_ENRICHMENT_CATEGORIES_NOT_SUPPORTED) s.categories = "miss";
+  else if (out.categories_corroboration === "corroborated") s.categories = "success";
+  if (out.product_names === RFB_ENRICHMENT_PRODUCTS_NOT_SUPPORTED) s.products = "miss";
+  else if (out.product_names === RFB_ENRICHMENT_PRODUCTS_REPLACED) s.products = "success";
+  return s;
+}
+
+function stampAttempt(db: Db, agentId: string, step: string, at: Date, outcome: string, runId: string): void {
   try {
     db.prepare(
       `INSERT INTO rfb_enrichment_nightly_attempts (agent_id, step, last_attempted_at, last_outcome, last_run_id)
@@ -957,6 +1109,15 @@ export interface RfbEnrichmentCohort {
   claimPriority?: Map<string, number>;
   /** D4, flag on only: rows admitted although unvetted, because of an open claim. */
   claimPriorityAdmittedUnvetted?: number;
+  /**
+   * B3: rows left out ONLY because they are contacted, that are verified and
+   * held from a second outreach by the gate's data-quality check
+   * (generic_products_only / categories_not_corroborated —
+   * rfbEnrichmentContactedVerifiedHeld). Only content_refresh may take them,
+   * after every cohort row; no other step ever sees them. Still counted as
+   * `contacted` in `excluded`.
+   */
+  contactedHeld?: RfbEnrichmentCohortRow[];
 }
 
 /** What the preview / run report show of the cohort. The claim_priority keys exist only with the D4 flag. */
@@ -1315,6 +1476,7 @@ export async function loadRfbEnrichmentCohort(db: Db, nowMs: number = Date.now()
   const byTier: Record<string, number> = {};
   const claimPriority = openClaims ? new Map<string, number>() : null;
   let admittedUnvetted = 0;
+  const contactedHeld: RfbEnrichmentCohortRow[] = [];
   for (let i = 0; i < base.length; i++) {
     if (i > 0 && i % 200 === 0) await yieldToEventLoop();
     const r = base[i];
@@ -1330,6 +1492,15 @@ export async function loadRfbEnrichmentCohort(db: Db, nowMs: number = Date.now()
     }
     if (reason) {
       excluded[reason]++;
+      // B3: contacted is the ONLY reason (the same check with no contact
+      // signals lets the row in) and the row is verified + held by the gate.
+      if (
+        reason === "contacted" &&
+        cohortExclusionOf(r, optOut, NO_CONTACTED_SIGNALS, false) === null &&
+        rfbEnrichmentContactedVerifiedHeld(r)
+      ) {
+        contactedHeld.push(toCohortRow(r));
+      }
       continue;
     }
     const row = toCohortRow(r);
@@ -1340,12 +1511,37 @@ export async function loadRfbEnrichmentCohort(db: Db, nowMs: number = Date.now()
       if (admitted) admittedUnvetted++;
     }
   }
-  const out: RfbEnrichmentCohort = { rows, considered: base.length, excluded, by_tier: byTier };
+  const out: RfbEnrichmentCohort = { rows, considered: base.length, excluded, by_tier: byTier, contactedHeld };
   if (claimPriority) {
     out.claimPriority = claimPriority;
     out.claimPriorityAdmittedUnvetted = admittedUnvetted;
   }
   return out;
+}
+
+const NO_CONTACTED_SIGNALS: RfbContactedSignals = {
+  crmOutEmails: new Set(),
+  sentAgentIds: new Set(),
+  sentRecipients: new Set(),
+};
+
+/**
+ * B3: a contacted profile that is verified (agent_knowledge.verification_
+ * status = 'verified', what mode=second of /admin/outreach-candidates
+ * requires) and that the gate holds from a second outreach on data quality
+ * only content_refresh can fix: generic_products_only
+ * (productsAreGenericCategoryNames) or categories_not_corroborated
+ * (categoriesLackWebsiteCorroboration) — the same two predicates
+ * admin-outreach-candidates.ts evaluates for its dataQualityHeld list.
+ */
+export function rfbEnrichmentContactedVerifiedHeld(r: {
+  verification_status: string | null;
+  products: string | null;
+  categories: string | null;
+  field_provenance: string | null;
+}): boolean {
+  if (r.verification_status !== "verified") return false;
+  return productsAreGenericCategoryNames(r.products) || categoriesLackWebsiteCorroboration(r.categories, r.field_provenance);
 }
 
 /** The first reason a base row is left out of the cohort (null = in). `ignoreUnvetted`: D4's second look. */
@@ -1444,12 +1640,13 @@ function rfbEnrichmentRowIsThin(r: BaseRow): boolean {
  * job does can contact, claim or curate a producer).
  */
 async function refreshCohortRows(db: Db, cohort: RfbEnrichmentCohort): Promise<void> {
-  const ids = new Set(cohort.rows.map((r) => r.id));
+  const ids = new Set([...cohort.rows, ...(cohort.contactedHeld ?? [])].map((r) => r.id));
   const fresh = db.prepare(baseRowsSql()).all() as BaseRow[];
   await yieldToEventLoop();
   const byId = new Map<string, RfbEnrichmentCohortRow>();
   for (const r of fresh) if (ids.has(r.id)) byId.set(r.id, toCohortRow(r));
   cohort.rows = cohort.rows.map((r) => byId.get(r.id) ?? r);
+  if (cohort.contactedHeld) cohort.contactedHeld = cohort.contactedHeld.map((r) => byId.get(r.id) ?? r);
 }
 
 // ─── Step selection ────────────────────────────────────────────────────────
@@ -1464,6 +1661,8 @@ interface SelectionContext {
   /** B1 step 2: the route's knowledge_gap cohort (contact_email set, not DNS-dead, k.email empty). */
   cxKnowledgeGapIds?: Set<string>;
   pendingQueueAgentIds?: Set<string>;
+  /** B3: content_refresh's per-field miss counters / needs_owner markers. */
+  needsOwner?: RfbEnrichmentNeedsOwnerState;
 }
 
 export interface RfbEnrichmentSelection {
@@ -1475,6 +1674,8 @@ export interface RfbEnrichmentSelection {
   a_url_only?: { eligible: number; selected: number };
   /** contact_extraction only: rows taken by the B1 step 2 path (rfbCxRowTakesKnowledgeGapPath). */
   contact_email_not_in_knowledge?: { eligible: number; selected: number };
+  /** content_refresh only (B3): of eligible/selected, contacted verified rows the gate holds. */
+  contacted_verified_held?: { eligible: number; selected: number };
 }
 
 function parseMs(v: string | null | undefined): number | null {
@@ -1516,7 +1717,14 @@ export function emailDomainWebsiteCandidate(db: Db, r: RfbEnrichmentCohortRow): 
 }
 
 /** true = take it; false = not eligible; a string = would be eligible but is skipped for that reason (counted). */
-function stepEligible(step: RfbEnrichmentStep, r: RfbEnrichmentCohortRow, ctx: SelectionContext): boolean | string {
+function stepEligible(
+  step: RfbEnrichmentStep,
+  r: RfbEnrichmentCohortRow,
+  ctx: SelectionContext,
+  contactedHeld = false,
+): boolean | string {
+  // B3: a contacted-verified-held row is content_refresh's only.
+  if (contactedHeld && step !== "content_refresh") return false;
   switch (step) {
     case "url_check": {
       const url = homepageOf(r);
@@ -1548,13 +1756,23 @@ function stepEligible(step: RfbEnrichmentStep, r: RfbEnrichmentCohortRow, ctx: S
       if (url === "" || isOwnPlatformHomepage({ website: r.k_website, url: r.a_url }) || !rfbEnrichmentSiteAnswers(r)) {
         return false;
       }
-      if (!isContentQualified({ about: r.about, products: r.products }) || productsAreGenericCategoryNames(r.products)) {
-        return true;
-      }
+      // B3: a field marked needs_owner (two misses, < 60 days) is no reason
+      // to take the row; with no other reason left it is skipped (counted).
+      const marks = ctx.needsOwner?.get(r.id);
+      const generic = productsAreGenericCategoryNames(r.products);
+      const productsNeedOwner = generic && rfbEnrichmentNeedsOwnerActive(marks?.products, ctx.nowMs);
+      // Thin content is its own reason, except where the generic products
+      // are the gap (that is the products field) and for a contacted-held
+      // row (taken only for the gate's two fields).
+      const thin = !contactedHeld && !isContentQualified({ about: r.about, products: r.products }) && !generic;
+      if (thin || (generic && !productsNeedOwner)) return true;
       // Content is enough, but the outreach gate holds the row on
       // categories_not_corroborated (agents.categories without a homepage/
       // owner source). Only the producer's own site may corroborate them.
-      if (!categoriesLackWebsiteCorroboration(r.categories, r.field_provenance)) return false;
+      if (!categoriesLackWebsiteCorroboration(r.categories, r.field_provenance)) {
+        return productsNeedOwner ? "skipped_needs_owner" : false;
+      }
+      if (rfbEnrichmentNeedsOwnerActive(marks?.categories, ctx.nowMs)) return "skipped_needs_owner";
       if (rfbEnrichmentHomepageHostExcluded(url)) return "skipped_directory_or_social_host";
       return true;
     }
@@ -1593,8 +1811,12 @@ function buildSelectionContext(
     cxEligibleIds: idSet(db, rfbCxSelectSql(RFB_CX_ELIGIBLE_WHERE)),
     cxKnowledgeGapIds: idSet(db, rfbCxSelectSql(RFB_CX_KNOWLEDGE_GAP_WHERE)),
     pendingQueueAgentIds: idSet(db, `SELECT agent_id AS id FROM agents_website_review_queue WHERE status = 'pending'`),
+    needsOwner: readRfbEnrichmentNeedsOwner(db),
   };
 }
+
+/** B3: contacted-verified-held rows rank behind every cohort row (tiers 0–6). */
+const RFB_ENRICHMENT_HELD_RANK_OFFSET = 100;
 
 /**
  * Rows a step would take now: eligible, not attempted by this step within the
@@ -1608,18 +1830,23 @@ export async function selectRfbEnrichmentStepRows(
   cap: number,
 ): Promise<RfbEnrichmentSelection> {
   const last = ctx.attempts.get(step) ?? new Map<string, number>();
-  const picked: Array<{ row: RfbEnrichmentCohortRow; attemptMs: number; second: number; rank: number }> = [];
+  const picked: Array<{ row: RfbEnrichmentCohortRow; attemptMs: number; second: number; rank: number; held: boolean }> = [];
   const skipped: Record<string, number> = {};
-  for (let i = 0; i < cohort.rows.length; i++) {
+  // B3: content_refresh also looks at the contacted-verified-held rows, after
+  // the cohort's own rows (they rank behind every one of them, same cap).
+  const held = step === "content_refresh" ? (cohort.contactedHeld ?? []) : [];
+  const all = held.length > 0 ? [...cohort.rows, ...held] : cohort.rows;
+  for (let i = 0; i < all.length; i++) {
     if (i > 0 && i % 200 === 0) await yieldToEventLoop();
-    const r = cohort.rows[i];
+    const r = all[i];
+    const isHeld = i >= cohort.rows.length;
     const attemptMs = last.get(r.id) ?? null;
     // D4 (flag on only): a prioritised row's claim newer than this step's
     // last attempt earns ONE fresh attempt inside the retry window.
     const claimMs = cohort.claimPriority?.get(r.id);
     const freshClaim = claimMs !== undefined && attemptMs !== null && attemptMs < claimMs;
     if (attemptMs !== null && attemptMs > ctx.nowMs - ctx.retryMs && !freshClaim) continue;
-    const ok = stepEligible(step, r, ctx);
+    const ok = stepEligible(step, r, ctx, isHeld);
     if (typeof ok === "string") {
       skipped[ok] = (skipped[ok] ?? 0) + 1;
       continue;
@@ -1632,12 +1859,25 @@ export async function selectRfbEnrichmentStepRows(
     // where it can (their org_nr/website gain is unchanged).
     const second = step === "brreg_contact" && trimmed(r.contact_email) !== "" ? 1 : 0;
     // D4: a prioritised row ranks 0, ahead of tiers 1–6 (no priority → its tier, as before).
-    picked.push({ row: r, attemptMs: attemptMs ?? 0, second, rank: claimMs !== undefined ? 0 : r.tier });
+    picked.push({
+      row: r,
+      attemptMs: attemptMs ?? 0,
+      second,
+      rank: isHeld ? RFB_ENRICHMENT_HELD_RANK_OFFSET + r.tier : claimMs !== undefined ? 0 : r.tier,
+      held: isHeld,
+    });
   }
   // Stable sort: cohort order (created_at, id) breaks the remaining ties.
   picked.sort((a, b) => a.rank - b.rank || a.second - b.second || a.attemptMs - b.attemptMs);
-  const rows = picked.slice(0, Math.max(0, cap)).map((p) => p.row);
+  const top = picked.slice(0, Math.max(0, cap));
+  const rows = top.map((p) => p.row);
   const out: RfbEnrichmentSelection = { eligible: picked.length, rows, skipped };
+  if (step === "content_refresh") {
+    out.contacted_verified_held = {
+      eligible: picked.filter((p) => p.held).length,
+      selected: top.filter((p) => p.held).length,
+    };
+  }
   if (step === "url_check") {
     const aOnly = (r: RfbEnrichmentCohortRow) => trimmed(r.k_website) === "";
     out.a_url_only = { eligible: picked.filter((p) => aOnly(p.row)).length, selected: rows.filter(aOnly).length };
@@ -2163,11 +2403,15 @@ export interface RfbEnrichmentPreview {
     a_url_only?: { eligible: number; selected: number };
     /** contact_extraction: of eligible/selected, rows on the B1 step 2 path. */
     contact_email_not_in_knowledge?: { eligible: number; selected: number };
+    /** content_refresh (B3): of eligible/selected, contacted verified rows the gate holds. */
+    contacted_verified_held?: { eligible: number; selected: number };
     note?: string;
     bm?: { offset: number; limit: number; last_total: number | null; cursor_updated_at: string | null };
   }>;
   /** Step 6 — only with OWNER_AUTO_UPDATES_ENABLED (absent otherwise). */
   owner_refresh?: OwnerRefreshPreview;
+  /** B3: profiles whose content_refresh field is marked needs_owner now (active markers). */
+  needs_owner: RfbEnrichmentNeedsOwnerSummary;
   /** B1 step 1: read-only count of cohort rows with contact_email but no knowledge e-mail (counts only). */
   contact_email_not_in_knowledge: RfbContactEmailNotInKnowledge;
 }
@@ -2206,6 +2450,14 @@ export interface RfbEnrichmentNightlyReport {
   preview?: RfbEnrichmentPreview;
   /** Step 6 — only with OWNER_AUTO_UPDATES_ENABLED, in an apply run that reached the steps (absent otherwise). */
   owner_refresh?: OwnerRefreshStepReport;
+  /**
+   * B3: content_refresh's needs_owner markers (active after the step, by
+   * field) and how many it newly set tonight (total = field markers). Only in
+   * an apply run that reached the steps.
+   */
+  needs_owner?: RfbEnrichmentNeedsOwnerSummary & {
+    newly_set: { total: number; categories: number; products: number };
+  };
   envelope_recorded: boolean;
   errors: string[];
 }
@@ -2312,6 +2564,7 @@ export async function buildRfbEnrichmentPreview(db: Db, now: Date): Promise<RfbE
       ...(Object.keys(sel.skipped).length > 0 ? { skipped: sel.skipped } : {}),
       ...(sel.a_url_only ? { a_url_only: sel.a_url_only } : {}),
       ...(sel.contact_email_not_in_knowledge ? { contact_email_not_in_knowledge: sel.contact_email_not_in_knowledge } : {}),
+      ...(sel.contacted_verified_held ? { contacted_verified_held: sel.contacted_verified_held } : {}),
       ...(step === "reverify" ? { note: "plus every row steps 1–4 change tonight (taken first, same cap)" } : {}),
     });
   }
@@ -2341,6 +2594,7 @@ export async function buildRfbEnrichmentPreview(db: Db, now: Date): Promise<RfbE
     cohort: summarizeRfbEnrichmentCohort(cohort),
     steps,
     ...(ownerRefresh ? { owner_refresh: ownerRefresh } : {}),
+    needs_owner: summarizeRfbEnrichmentNeedsOwner(ctx.needsOwner ?? new Map(), now.getTime()),
     contact_email_not_in_knowledge: summarizeRfbContactEmailNotInKnowledge(cohort.rows),
   };
 }
@@ -2588,6 +2842,9 @@ async function runSteps(rc: RunContext): Promise<void> {
   const cohort = await loadRfbEnrichmentCohort(db, now.getTime());
   report.cohort = summarizeRfbEnrichmentCohort(cohort);
   const attempts = readRfbEnrichmentAttempts(db);
+  /** B3: the needs_owner counters (updated in place as content_refresh records misses). */
+  const needsOwner = readRfbEnrichmentNeedsOwner(db);
+  const needsOwnerNew: Record<RfbEnrichmentNeedsOwnerField, number> = { categories: 0, products: 0 };
 
   /** agent_id → the first step that changed it tonight (step 5's work list, in order). */
   const changed = new Map<string, RfbEnrichmentStep>();
@@ -2722,11 +2979,12 @@ async function runSteps(rc: RunContext): Promise<void> {
     const sel = await selectRfbEnrichmentStepRows(step, cohort, buildSelectionContext(db, now.getTime(), attempts), sr.cap);
     sr.eligible = sel.eligible;
     sr.selected = sel.rows.length;
-    if (Object.keys(sel.skipped).length > 0 || sel.a_url_only || sel.contact_email_not_in_knowledge) {
+    if (Object.keys(sel.skipped).length > 0 || sel.a_url_only || sel.contact_email_not_in_knowledge || sel.contacted_verified_held) {
       sr.extra = {
         ...(Object.keys(sel.skipped).length > 0 ? { skipped_before_selection: sel.skipped } : {}),
         ...(sel.a_url_only ? { a_url_only: sel.a_url_only } : {}),
         ...(sel.contact_email_not_in_knowledge ? { contact_email_not_in_knowledge: sel.contact_email_not_in_knowledge } : {}),
+        ...(sel.contacted_verified_held ? { contacted_verified_held: sel.contacted_verified_held } : {}),
       };
     }
     const llmOptional = RFB_ENRICHMENT_LLM_OPTIONAL_STEPS.has(step);
@@ -2741,13 +2999,17 @@ async function runSteps(rc: RunContext): Promise<void> {
     };
     for (const row of sel.rows) {
       await yieldToEventLoop();
-      const perRowLlm = rfbEnrichmentRowLlmCallsMax(step, row);
+      // B3: products marked needs_owner → no product-name call for this row
+      // (it was taken for another field), so no reservation either.
+      const productsNeedOwner =
+        step === "content_refresh" && rfbEnrichmentNeedsOwnerActive(needsOwner.get(row.id)?.products, now.getTime());
+      const perRowLlm = productsNeedOwner ? 0 : rfbEnrichmentRowLlmCallsMax(step, row);
       const stop = stopBefore(step, llmOptional ? 0 : perRowLlm);
       if (stop) {
         sr.stopped_reason = stop;
         break;
       }
-      if (llmOptional && rfbEnrichmentRowWantsProductNames(step, row) && perRowLlm === 0) {
+      if (llmOptional && !productsNeedOwner && rfbEnrichmentRowWantsProductNames(step, row) && perRowLlm === 0) {
         // No API key: the row runs without the product-name call.
         tallyExtra(sr, "product_names", "skipped_no_api_key");
       }
@@ -2794,7 +3056,20 @@ async function runSteps(rc: RunContext): Promise<void> {
       // Only a real per-row outcome enters the rotation memory; a transient
       // one (timeout, 5xx, error, write-pause, missing admin key, the tool's
       // own run-lock) is retried tomorrow, not parked for the retry window.
-      if (!isTransientRfbEnrichmentOutcome(out)) stampAttempt(db, row.id, step, clock(), out.outcome, report.run_id);
+      if (!isTransientRfbEnrichmentOutcome(out)) {
+        stampAttempt(db, row.id, step, clock(), out.outcome, report.run_id);
+        // B3: the per-field miss counters, on stamped attempts only.
+        if (step === "content_refresh") {
+          const signals = rfbEnrichmentNeedsOwnerSignals(out);
+          for (const field of RFB_ENRICHMENT_NEEDS_OWNER_FIELDS) {
+            const kind = signals[field];
+            if (!kind) continue;
+            if (recordRfbEnrichmentNeedsOwnerSignal(db, needsOwner, row.id, field, kind, clock(), report.run_id)) {
+              needsOwnerNew[field]++;
+            }
+          }
+        }
+      }
       if (out.stop) {
         sr.stopped_reason = out.stop;
         if (out.stop === "enrichment_write_paused") writesPaused = true;
@@ -2898,6 +3173,20 @@ async function runSteps(rc: RunContext): Promise<void> {
       rowLlm > 0 ? { productNames: true } : undefined,
     ),
   );
+  // B3: needs_owner counts — active markers after the step, and the ones it set tonight.
+  {
+    const summary = summarizeRfbEnrichmentNeedsOwner(needsOwner, now.getTime());
+    report.needs_owner = {
+      ...summary,
+      newly_set: {
+        total: needsOwnerNew.categories + needsOwnerNew.products,
+        categories: needsOwnerNew.categories,
+        products: needsOwnerNew.products,
+      },
+    };
+    const cr = report.steps.find((s) => s.step === "content_refresh");
+    if (cr) cr.extra = { ...(cr.extra ?? {}), needs_owner: report.needs_owner };
+  }
 
   // 5 — re-verify: tonight's changed rows first, then unreachable-site rows.
   {
@@ -3165,6 +3454,7 @@ function recordEnvelope(
             kind: "rfb_enrichment_totals",
             ...report.totals,
             cohort: report.cohort,
+            ...(report.needs_owner ? { needs_owner: report.needs_owner } : {}),
             deadline_at: report.deadline_at,
             stopped_reason: report.stopped_reason,
           },

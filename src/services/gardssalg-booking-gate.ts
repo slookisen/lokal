@@ -31,6 +31,7 @@ import crypto from "crypto";
 import type Database from "better-sqlite3";
 import { isBookingPaused } from "./booking-store";
 import { gardssalgOwnerBookingPaused } from "../owner-features/gardssalg";
+import { addressText, notifyAddressConfirmationMissing } from "./gardssalg-notify-address";
 
 /** True when the provider has an address a booking request can be sent to.
  *  Same rule the admin lever has always applied (non-empty, trimmed epost). */
@@ -40,7 +41,7 @@ export function hasBookingRequestEmail(epost: string | null | undefined): boolea
 
 // ── Owner enable gate ───────────────────────────────────────────────────────
 
-export type OwnerBookingBlockReason = "admin_brake" | "no_booking_email" | "pending_review";
+export type OwnerBookingBlockReason = "admin_brake" | "no_booking_email" | "pending_review" | "address_unconfirmed";
 
 export interface OwnerBookingBlock {
   reason: OwnerBookingBlockReason;
@@ -76,6 +77,9 @@ export interface OwnerBookingGateRow {
   /** Optional: callers that select it get the pending-review block below.
    *  Callers that do not are unchanged. */
   catalog_hidden_reason?: string | null;
+  /** Optional: callers that select it get the O4-3 confirmed-address rule
+   *  (only with GARDSSALG_NOTIFY_ADDRESS_CONFIRM_ENABLED on). */
+  id?: string | null;
 }
 
 /** Why the owner may not switch booking ON for this row, or null if allowed.
@@ -96,6 +100,13 @@ export function ownerBookingEnableBlock(row: OwnerBookingGateRow): OwnerBookingB
   }
   if (!hasBookingRequestEmail(row.epost)) {
     return { reason: "no_booking_email", message: OWNER_BOOKING_NO_EMAIL_MSG, note: null };
+  }
+  // O4-3 (dev-request 2026-11-12-opplevagent-o4-epost-og-tekster): with
+  // GARDSSALG_NOTIFY_ADDRESS_CONFIRM_ENABLED on, the address must also have
+  // been confirmed from the link e-mailed to it (OA-3 `addr.required`).
+  // Flag off: never blocks (notifyAddressConfirmationMissing is false).
+  if (notifyAddressConfirmationMissing(row.id, row.epost)) {
+    return { reason: "address_unconfirmed", message: addressText("addr.required"), note: null };
   }
   return null;
 }

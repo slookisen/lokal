@@ -1,6 +1,8 @@
 /**
  * init-outreach-pool-retail-gate.test.ts — dev-request
- * 2026-10-01-rfb-butikker-i-outreach-poolen (AC1).
+ * 2026-10-01-rfb-butikker-i-outreach-poolen (AC1), extended by dev-request
+ * 2026-11-15-rfb-butikkregel-fisk-og-kjott (slice E1: 'fisk' and 'kjott'
+ * retail shops are allowed under the same profile gate; 'annet' stays out).
  *
  * outreach_ready_pool VIEW retail gate (POOL_RETAIL_SHOP_GATE_SQL), its pure
  * mirror retailShopPoolBlockers, pool-blocker-explain's named reasons, the
@@ -41,6 +43,10 @@ const ABOUT_SHOP = "Vi er en frukt- og grøntbutikk i hjertet av byen. Vi selger
 const PROV_HOMEPAGE = JSON.stringify({ about: [{ value: "x", source_type: "homepage", fetched_at: "2026-10-01" }] });
 const PROV_OTHER = JSON.stringify({ about: [{ value: "x", source_type: "google_places", fetched_at: "2026-10-01" }] });
 const PRODUCTS3 = JSON.stringify([{ name: "Epler" }, { name: "Pærer" }, { name: "Gulrøtter" }]);
+const ABOUT_FISH_SHOP = "Vi er en uavhengig fiskebutikk ved havna. Vi selger fersk torsk, sei, laks og skalldyr levert direkte fra lokale fiskebåter, og lager egne fiskekaker i butikken vår hver eneste morgen.";
+const ABOUT_MEAT_SHOP = "Vi er en uavhengig kjøttbutikk og slakter i sentrum. Vi selger lam, storfe og gris fra gårder i distriktet, og lager egne pølser og spekemat i butikken vår etter gamle oppskrifter.";
+const PRODUCTS3_FISH = JSON.stringify([{ name: "Torsk" }, { name: "Laks" }, { name: "Fiskekaker" }]);
+const PRODUCTS3_MEAT = JSON.stringify([{ name: "Lammekjøtt" }, { name: "Pølser" }, { name: "Spekeskinke" }]);
 
 export function runInitOutreachPoolRetailGateTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
   const log = opts.log ?? false;
@@ -76,7 +82,21 @@ export function runInitOutreachPoolRetailGateTests(opts: { log?: boolean } = {})
     try {
       // AC1 fixtures
       add("rg-other-focus", { bt: "retail_shop", rf: "annet" });                         // ute: annet fokus
-      add("rg-fish", { bt: "retail_shop", rf: "fisk" });                                  // ute: fisk ikke avklart
+      // dev-request 2026-11-15-rfb-butikkregel-fisk-og-kjott (E1): fisk/kjøtt
+      // med ferdig profil (samme fixture som rg-fg-enriched) er nå INNE.
+      add("rg-fish", { bt: "retail_shop", rf: "fisk" });                                  // inne (AK1)
+      add("rg-meat", { bt: "retail_shop", rf: "kjott" });                                 // inne (AK1)
+      add("rg-fish-own-text", { bt: "retail_shop", rf: "fisk", about: ABOUT_FISH_SHOP, products: PRODUCTS3_FISH });  // inne
+      add("rg-meat-own-text", { bt: "retail_shop", rf: "kjott", about: ABOUT_MEAT_SHOP, products: PRODUCTS3_MEAT }); // inne
+      // Én feil om gangen på en ellers ferdig fisk-/kjøttbutikk (samme regel som frukt/grønt)
+      add("rg-fish-thin", { bt: "retail_shop", rf: "fisk", about: "Liten fiskebutikk.", prov: "{}", products: "[]" });
+      add("rg-fish-no-homepage-prov", { bt: "retail_shop", rf: "fisk", about: ABOUT_FISH_SHOP, products: PRODUCTS3_FISH, prov: PROV_OTHER });
+      add("rg-fish-two-products", { bt: "retail_shop", rf: "fisk", about: ABOUT_FISH_SHOP, products: JSON.stringify([{ name: "Torsk" }, { name: "Laks" }]) });
+      add("rg-fish-not-shop-text", { bt: "retail_shop", rf: "fisk", about: "Vi fisker torsk og sei med egen sjark utenfor kysten, og har gjort det i tre generasjoner. Fangsten leveres til mottaket på kaia samme dag, og alt håndteres med stor omsorg." });
+      add("rg-meat-thin", { bt: "retail_shop", rf: "kjott", about: "Liten kjøttbutikk.", prov: "{}", products: "[]" });
+      add("rg-meat-no-homepage-prov", { bt: "retail_shop", rf: "kjott", about: ABOUT_MEAT_SHOP, products: PRODUCTS3_MEAT, prov: PROV_OTHER });
+      add("rg-meat-two-products", { bt: "retail_shop", rf: "kjott", about: ABOUT_MEAT_SHOP, products: JSON.stringify([{ name: "Lam" }, { name: "Pølser" }]) });
+      add("rg-meat-not-shop-text", { bt: "retail_shop", rf: "kjott", about: "Vi driver med sau og storfe på gården vår i dalen, og har gjort det i tre generasjoner. Dyra går ute på beite hele sommeren og får god tid til å vokse seg store." });
       add("rg-fg-thin", { bt: "retail_shop", rf: "frukt_gront", about: "Liten butikk.", prov: "{}", products: "[]" }); // ute: tynn
       add("rg-fg-enriched", { bt: "retail_shop", rf: "frukt_gront" });                    // inne
       add("rg-farmshop", { bt: "farm_shop" });                                            // inne
@@ -91,11 +111,28 @@ export function runInitOutreachPoolRetailGateTests(opts: { log?: boolean } = {})
 
       const inPool = new Set((db.prepare(`SELECT agent_id FROM outreach_ready_pool`).all() as Array<{ agent_id: string }>).map((r) => r.agent_id));
       assertTrue(!inPool.has("rg-other-focus"), "rg-01: butikk med annet fokus er ute av poolen");
-      assertTrue(!inPool.has("rg-fish"), "rg-02: fisk-fokus regnes ikke som tillatt (Daniels svar ikke gitt)");
+      // Endret i E1 (dev-request 2026-11-15-rfb-butikkregel-fisk-og-kjott): tidligere
+      // forventet rg-02 at fisk var UTE fordi Daniel ikke hadde svart; han har nå
+      // godkjent fisk og kjøtt under samme butikkregel, så fisk med ferdig profil er INNE.
+      assertTrue(inPool.has("rg-fish"), "rg-02: fiskebutikk med ferdig profil er inne (AK1)");
+      assertTrue(inPool.has("rg-meat"), "rg-02b: kjøttbutikk med ferdig profil er inne (AK1)");
+      assertTrue(inPool.has("rg-fish-own-text"), "rg-02c: fiskebutikk med egen fiskebutikk-tekst er inne");
+      assertTrue(inPool.has("rg-meat-own-text"), "rg-02d: kjøttbutikk med egen kjøttbutikk-tekst er inne");
+      assertTrue(!inPool.has("rg-fish-thin"), "rg-02e: fiskebutikk med tynn profil er ute");
+      assertTrue(!inPool.has("rg-fish-no-homepage-prov"), "rg-02f: fiskebutikk uten homepage-proveniens er ute");
+      assertTrue(!inPool.has("rg-fish-two-products"), "rg-02g: fiskebutikk med færre enn 3 produkter er ute");
+      assertTrue(!inPool.has("rg-fish-not-shop-text"), "rg-02h: fisk-tekst som ikke beskriver butikk er ute");
+      assertTrue(!inPool.has("rg-meat-thin"), "rg-02i: kjøttbutikk med tynn profil er ute");
+      assertTrue(!inPool.has("rg-meat-no-homepage-prov"), "rg-02j: kjøttbutikk uten homepage-proveniens er ute");
+      assertTrue(!inPool.has("rg-meat-two-products"), "rg-02k: kjøttbutikk med færre enn 3 produkter er ute");
+      assertTrue(!inPool.has("rg-meat-not-shop-text"), "rg-02l: kjøtt-tekst som ikke beskriver butikk er ute");
       assertTrue(!inPool.has("rg-fg-thin"), "rg-03: frukt/grønt-butikk med tynn profil er ute");
       assertTrue(inPool.has("rg-fg-enriched"), "rg-04: frukt/grønt-butikk med beriket profil er inne");
       assertTrue(inPool.has("rg-farmshop"), "rg-05: produsentens gårdsbutikk er inne");
       assertTrue(inPool.has("rg-plain-producer"), "rg-06: vanlig produsent (umerket) er uberørt");
+      // AK3: profil uten business_type/retail_focus oppfører seg som før
+      // (ingen butikksperre, uansett profilinnhold).
+      assertEq(retailShopPoolBlockers({ business_type: null, retail_focus: null, about: "", products: "[]", field_provenance: "{}" }), [], "rg-06b: umerket profil får ingen butikksperre (AK3)");
       assertTrue(inPool.has("rg-explicit-producer"), "rg-07: business_type=producer er uberørt");
       assertTrue(!inPool.has("rg-fg-no-homepage-prov"), "rg-08: uten homepage-proveniens på om-tekst er ute");
       assertTrue(!inPool.has("rg-fg-two-products"), "rg-09: færre enn 3 produkter er ute");
@@ -113,6 +150,8 @@ export function runInitOutreachPoolRetailGateTests(opts: { log?: boolean } = {})
       assertEq(mismatches, 0, "rg-13: retailShopPoolBlockers er enig med VIEW for alle fixtures");
       assertEq(retailShopPoolBlockers(rows.find((r) => r.id === "rg-other-focus")), ["retail_shop_not_eligible"], "rg-14: navngitt grunn retail_shop_not_eligible");
       assertEq(retailShopPoolBlockers(rows.find((r) => r.id === "rg-fg-thin")), ["retail_profile_not_ready"], "rg-15: navngitt grunn retail_profile_not_ready");
+      assertEq(retailShopPoolBlockers(rows.find((r) => r.id === "rg-meat")), [], "rg-15b: kjøttbutikk med ferdig profil har ingen sperre");
+      assertEq(retailShopPoolBlockers(rows.find((r) => r.id === "rg-fish-thin")), ["retail_profile_not_ready"], "rg-15c: tynn fiskebutikk gir retail_profile_not_ready (ikke not_eligible)");
 
       // pool-blocker-explain navngir sperren
       const ex = await callRoute(explainRouter, { method: "GET", url: "/", headers: { "x-admin-key": key }, query: { agentIds: "rg-other-focus,rg-fg-thin,rg-fg-enriched,rg-farmshop" } });
@@ -128,6 +167,7 @@ export function runInitOutreachPoolRetailGateTests(opts: { log?: boolean } = {})
       const { POOL_RETAIL_SHOP_GATE_SQL } = require("./init") as typeof import("./init");
       const second = new Set((db.prepare(`SELECT a.id FROM agents a INNER JOIN agent_knowledge k ON k.agent_id = a.id WHERE a.id LIKE 'rg-%' AND ${POOL_RETAIL_SHOP_GATE_SQL}`).all() as Array<{ id: string }>).map((r) => r.id));
       assertTrue(!second.has("rg-other-focus") && second.has("rg-fg-enriched") && second.has("rg-farmshop"), "rg-21: POOL_RETAIL_SHOP_GATE_SQL alene gir samme utfall");
+      assertTrue(second.has("rg-fish") && second.has("rg-meat") && !second.has("rg-meat-thin"), "rg-22: POOL_RETAIL_SHOP_GATE_SQL slipper inn ferdig fisk/kjøtt, ikke tynn");
 
       // ── Admin-rute: business-type ──
       const H = { "x-admin-key": key };
@@ -137,6 +177,11 @@ export function runInitOutreachPoolRetailGateTests(opts: { log?: boolean } = {})
       assertEq(noIds.status, 400, "bt-02: mangler agentIds gir 400");
       const noFocus = await callRoute(businessTypeRouter, { method: "POST", url: "/", headers: H, body: { agentIds: ["rg-plain-producer"], business_type: "retail_shop", reason: "t" } });
       assertEq(noFocus.status, 400, "bt-03: retail_shop uten retail_focus gir 400");
+      const meatOk = await callRoute(businessTypeRouter, { method: "POST", url: "/", headers: H, body: { agentIds: ["rg-plain-producer"], business_type: "retail_shop", retail_focus: "kjott", reason: "t" } });
+      assertEq(meatOk.status, 200, "bt-03b: retail_focus=kjott godtas");
+      assertEq(meatOk.body?.counts, { would_set: 1 }, "bt-03c: kjott-tørrkjøring gir would_set");
+      const badFocus = await callRoute(businessTypeRouter, { method: "POST", url: "/", headers: H, body: { agentIds: ["rg-plain-producer"], business_type: "retail_shop", retail_focus: "bakeri", reason: "t" } });
+      assertEq(badFocus.status, 400, "bt-03d: ukjent retail_focus gir fortsatt 400");
       const noReason = await callRoute(businessTypeRouter, { method: "POST", url: "/", headers: H, body: { agentIds: ["rg-plain-producer"], business_type: "cafe" } });
       assertEq(noReason.status, 400, "bt-04: mangler reason gir 400");
 

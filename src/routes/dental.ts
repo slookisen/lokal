@@ -82,6 +82,7 @@ import { emailRevealGuardEnabled, revealEmailFor } from "../services/email-revea
 import { dentalContactFormOnlyIds } from "../services/dental-contact-form-only";
 import { ENRICHMENT_WRITE_PAUSE_HTTP_STATUS } from "../services/enrichment-write-pause";
 import { dentalEnrichmentWritePauseBlock } from "../services/dental-enrichment-write-pause";
+import { wantsStoredTopUp, notInClause, mergeSample } from "./recently-enriched-sample";
 
 const router = Router();
 
@@ -1219,8 +1220,26 @@ router.get(
 //                        Dev-request 2026-10-06-kvalitetsmaling-stikkprove-og-wcr
 //                        slice 2 (W42 sampled rows with nothing to check).
 //
-// dental_agents has no is_active column (unlike rfb's agents table), so
-// there is no activity filter here — just the last_enriched_at window.
+//   ?include_stored=1  — top up the sample from content already stored when
+//                        the window yields fewer than `limit` rows (dev-request
+//                        slice c, 2026-11-20: the dental enrichment write pause
+//                        empties the window, so the spot-check recorded
+//                        insufficient_sample and the pause blinded its own
+//                        follow-up). Window rows come first, exactly as without
+//                        the param; the remainder is random clinics enriched at
+//                        ANY time (last_enriched_at NOT NULL), ALWAYS with a
+//                        checkable field (the with_fields rule), no duplicates,
+//                        and not hidden from the public catalog (the same
+//                        exclusion dental-store's publicOnly listing applies:
+//                        verification_status != 'rejected' and is_inactive
+//                        unset/0). Only with this param: each agent carries
+//                        `sample_source: "recent" | "stored"` and the response
+//                        carries `sample_source_counts: { recent, stored }`.
+//                        Off by default (response unchanged).
+//
+// The window query has no activity filter (unlike rfb's agents.is_active —
+// that is the pre-existing contract and is left untouched); only the stored
+// top-up above excludes rejected/closed clinics.
 //
 // Auth: requireAdmin (same X-Admin-Key convention as the rest of this file).
 // Returns: 200 { success, count, agents: [{ id, name, website,
@@ -1245,9 +1264,9 @@ router.get("/admin/agents/recently-enriched", requireAdmin, (req: Request, res: 
     limit = Math.min(50, Math.max(1, limit));
 
     const withFields = req.query.with_fields === "1";
-    const fieldsClause = withFields
-      ? `AND (COALESCE(TRIM(telefon), '') <> '' OR COALESCE(TRIM(adresse), '') <> '' OR COALESCE(TRIM(om_oss), '') <> '')`
-      : "";
+    const checkableFieldsSql = `AND (COALESCE(TRIM(telefon), '') <> '' OR COALESCE(TRIM(adresse), '') <> '' OR COALESCE(TRIM(om_oss), '') <> '')`;
+    const fieldsClause = withFields ? checkableFieldsSql : "";
+    const includeStored = wantsStoredTopUp(req.query.include_stored);
 
     const rows = db
       .prepare(
@@ -1265,7 +1284,8 @@ router.get("/admin/agents/recently-enriched", requireAdmin, (req: Request, res: 
         field_provenance: string | null;
       }>;
 
-    const agents = rows.map((r) => {
+    type SampleRow = (typeof rows)[number];
+    const toAgent = (r: SampleRow) => {
       let fieldProvenance: Record<string, unknown> = {};
       if (r.field_provenance) {
         try {
@@ -1282,9 +1302,41 @@ router.get("/admin/agents/recently-enriched", requireAdmin, (req: Request, res: 
         last_enriched_at: r.last_enriched_at,
         field_provenance: fieldProvenance,
       };
-    });
+    };
 
-    res.json({ success: true, count: agents.length, agents });
+    const agents = rows.map(toAgent);
+
+    if (!includeStored) {
+      res.json({ success: true, count: agents.length, agents });
+      return;
+    }
+
+    // include_stored=1: top up from stored content (see the param doc above).
+    let storedAgents: ReturnType<typeof toAgent>[] = [];
+    const remaining = limit - agents.length;
+    if (remaining > 0) {
+      const exclude = notInClause("id", agents.map((a) => a.id));
+      const storedRows = db
+        .prepare(
+          `SELECT id, navn, hjemmeside, last_enriched_at, field_provenance
+             FROM dental_agents
+            WHERE last_enriched_at IS NOT NULL
+              AND verification_status != 'rejected'
+              AND (is_inactive IS NULL OR is_inactive = 0)
+              ${checkableFieldsSql} ${exclude.sql}
+            ORDER BY RANDOM()
+            LIMIT ?`
+        )
+        .all(...exclude.params, remaining) as SampleRow[];
+      storedAgents = storedRows.map(toAgent);
+    }
+    const merged = mergeSample(agents, storedAgents, limit);
+    res.json({
+      success: true,
+      count: merged.rows.length,
+      agents: merged.rows,
+      sample_source_counts: merged.counts,
+    });
   } catch (err: any) {
     console.error("[tannlege] agents/recently-enriched failed", err);
     res.status(500).json({ error: "Internal error" });

@@ -92,9 +92,41 @@ check('concurrency group is per matrix PR', /group: fleet-auto-approve-pr-\$\{\{
 check('event runs keep cancel-in-progress',
   /cancel-in-progress: \$\{\{ github\.event_name != 'schedule' && github\.event_name != 'workflow_dispatch' \}\}/.test(evaluateBlock));
 check('PR_NUMBER env comes from matrix', /PR_NUMBER: \$\{\{ matrix\.pr_number \}\}/.test(evaluateBlock));
-check('poll budget shorter on sweep, 40 on events', /const MAX_POLLS = isSweep \? 4 : 40;/.test(evaluateBlock));
+// Poll budget (dev-request 2026-11-18-fleet-gate-pollbudsjett-under-determinismeport):
+// the event budget must outlast fly-deploy.yml's ~18-23 min determinism gate, and
+// the evaluate job's timeout-minutes must stay above it.
+check('MAX_POLLS picks sweep vs event budget',
+  /const MAX_POLLS = isSweep \? SWEEP_MAX_POLLS : EVENT_MAX_POLLS;/.test(evaluateBlock));
+const sweepPollsM = evaluateBlock.match(/const SWEEP_MAX_POLLS = (\d+);/);
+check('sweep poll budget unchanged (4)', sweepPollsM && parseInt(sweepPollsM[1], 10) === 4, sweepPollsM ? sweepPollsM[1] : 'missing');
+const intervalM = evaluateBlock.match(/const POLL_INTERVAL_MS = (\d+);/);
+const budgetMinM = evaluateBlock.match(/const EVENT_POLL_BUDGET_MIN = (\d+);/);
+const eventPollsLine = evaluateBlock.match(/const EVENT_MAX_POLLS = ([^;]+);/);
+check('POLL_INTERVAL_MS found', !!intervalM);
+check('EVENT_POLL_BUDGET_MIN found', !!budgetMinM);
+check('EVENT_MAX_POLLS found', !!eventPollsLine);
+const pollIntervalMs = intervalM ? parseInt(intervalM[1], 10) : NaN;
+const eventBudgetMin = budgetMinM ? parseInt(budgetMinM[1], 10) : NaN;
+let eventMaxPolls = NaN;
+if (intervalM && budgetMinM && eventPollsLine) {
+  // eslint-disable-next-line no-new-func
+  eventMaxPolls = new Function('POLL_INTERVAL_MS', 'EVENT_POLL_BUDGET_MIN', `return ${eventPollsLine[1]};`)(pollIntervalMs, eventBudgetMin);
+}
+const effectiveEventMin = (eventMaxPolls * pollIntervalMs) / 60000;
+check('event poll budget >= 25 minutes (covers the determinism gate)',
+  eventBudgetMin >= 25 && effectiveEventMin >= 25, `declared ${eventBudgetMin} min, effective ${effectiveEventMin} min`);
+check('EVENT_MAX_POLLS is derived from EVENT_POLL_BUDGET_MIN (matches declared minutes)',
+  Math.abs(effectiveEventMin - eventBudgetMin) < 0.5, `effective ${effectiveEventMin} vs declared ${eventBudgetMin}`);
+const timeoutM = evaluateBlock.match(/^    timeout-minutes: (\d+)\s*$/m);
+check('evaluate has job-level timeout-minutes', !!timeoutM);
+const timeoutMin = timeoutM ? parseInt(timeoutM[1], 10) : NaN;
+check('evaluate timeout-minutes exceeds event poll budget with margin (>= budget + 10)',
+  timeoutMin >= effectiveEventMin + 10, `timeout ${timeoutMin} vs budget ${effectiveEventMin}`);
+check('evaluate timeout-minutes well below the 6 h default (<= 90)', timeoutMin <= 90, `timeout ${timeoutMin}`);
+check('no stale hardcoded ~10-minute budget text in evaluate',
+  !/~10-minute poll budget|~10 minutes total|full ~10 minutes/.test(evaluateBlock));
 check('sweep suppresses the checks-still-running note',
-  /if \(isSweep\) \{[\s\S]{0,200}core\.info\('sweep: checks still running[\s\S]{0,120}return;\s*\}\s*\n\s*await note\('checks still running after the ~10-minute poll budget/.test(evaluateBlock));
+  /if \(isSweep\) \{[\s\S]{0,200}core\.info\('sweep: checks still running[\s\S]{0,120}return;\s*\}\s*\n\s*await note\(`checks still running after the ~\$\{EVENT_POLL_BUDGET_MIN\}-minute poll budget/.test(evaluateBlock));
 check('dirty guard uses noteOnce on all triggers',
   /if \(freshDecision === 'dirty'\) \{\s*\n(\s*\/\/.*\n)*\s*await noteOnce\('this PR conflicts with main/.test(evaluateBlock));
 check('mergeable null triggers one refetch after ~3s',

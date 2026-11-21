@@ -125,6 +125,7 @@ import stockCheckRoutes from "./routes/stock-check";
 import gardssalgClaimRoutes, { GARDSSALG_CLAIM_PATH_PREFIXES, gardssalgClaimHostGate } from "./routes/gardssalg-claim";
 import resendWebhookRoutes from "./routes/resend-webhook";
 import { createAgentplatformHostGate } from "./routes/agentplatform-site";
+import { googleConnectedAppsVerification } from "./routes/google-connected-apps";
 import adminAgentAuditRoutes from "./routes/admin-agent-audit";
 import adminVerifierReviewQueueRoutes from "./routes/admin-verifier-review-queue";
 import adminDomainCoherenceSweepRoutes from "./routes/admin-domain-coherence";
@@ -166,6 +167,8 @@ import adminOwnerGateImpactRoutes from "./routes/admin-owner-gate-impact";
 import adminRfbWebsiteDiscoveryRoutes from "./routes/admin-rfb-website-discovery";
 import adminRfbBrregSelfSufficiencyRoutes from "./routes/admin-rfb-brreg-selfsufficiency";
 import adminPoolBlockerExplainRoutes from "./routes/admin-pool-blocker-explain";
+import adminAddressConflictBreakdownRoutes from "./routes/admin-address-conflict-breakdown";
+import adminGardssalgManualClaimsRoutes from "./routes/admin-gardssalg-manual-claims";
 import adminHomepageProvenanceCohortRoutes from "./routes/admin-homepage-provenance-cohort";
 import adminDodBulkRoutes from "./routes/admin-dod-bulk";
 import adminRfbContactExtractionRoutes from "./routes/admin-rfb-contact-extraction";
@@ -344,6 +347,16 @@ app.use(aiCrawlerAllowlist);
 // aiCrawlerAllowlist just above). Absent header → next() immediately, no
 // other effect whatsoever — see middleware/consumer-identity.ts.
 app.use(consumerIdentity);
+
+// ─── /.well-known/google-connected-apps (slice G1-1) ─────────────────────
+// Google Connected Apps domain verification for rettfrabonden.com and
+// opplevagent.no. Behind GOOGLE_CONNECTED_APPS_VERIFICATION_ENABLED (default
+// off → 404). Mounted HERE — before the agentplatform.no, finn-tannlege.com
+// and opplevagent.no host gates, express.static and every router — so the
+// exact path answers 200 directly on both hosts (no 301, no host-gate 404).
+// Any other path/host/method falls straight through. See
+// routes/google-connected-apps.ts.
+app.use(googleConnectedAppsVerification);
 
 // ─── agentplatform.no host routing (company site) ───────────────────────
 // A2A dev-request 2026-10-08-agentplatform-no-paraplyside. The umbrella page
@@ -1287,6 +1300,14 @@ app.use("/admin", adminLimiter, adminRfbBrregSelfSufficiencyRoutes);
 // homepage-provenance-batch auto-select leg blocks a given agent, with the
 // same predicates production uses. GET /admin/pool-blocker-explain.
 app.use("/admin/pool-blocker-explain", adminLimiter, adminPoolBlockerExplainRoutes);
+// dev-request 2026-11-15-rfb-adressekonflikt-smal-regel-torrkjoring, G1:
+// READ-ONLY count of the address_conflict / address_uncorroborated
+// quarantine cohort by postnummer/kommune agreement and source pair, with
+// examples. GET /admin/address-conflict-breakdown.
+app.use("/admin/address-conflict-breakdown", adminLimiter, adminAddressConflictBreakdownRoutes);
+// O3-5 (dev-request 2026-11-12-opplevagent-o3-eierkrav-og-innlogging): the admin
+// queue for gårdssalg owner claims without self-service. Writes dry-run by default.
+app.use("/admin/gardssalg-manual-claims", adminLimiter, adminGardssalgManualClaimsRoutes);
 // dev-request 2026-08-10-rfb-hjemmesidejakt-full-loype, Skive 3 follow-up:
 // READ-ONLY, paginated listing of the agent IDs POST /admin/homepage-
 // provenance-batch's default auto-select would pick next (identical
@@ -3064,13 +3085,15 @@ if (
       const r = await processBookingFollowups();
       if (
         r.producer_notify_retried || r.reminders_sent || r.reminders_suppressed ||
-        r.expired || r.expired_guests_notified || r.errors
+        r.expired || r.expired_guests_notified || r.errors || r.guest_reminders_sent
       ) {
         console.log(
           `[booking-followups] tick examined=${r.examined} notify_retried=${r.producer_notify_retried} ` +
           `reminders=${r.reminders_sent} ` +
           `suppressed=${r.reminders_suppressed} expired=${r.expired} ` +
-          `guests_notified=${r.expired_guests_notified} errors=${r.errors}`
+          `guests_notified=${r.expired_guests_notified} errors=${r.errors}` +
+          // O4-5: only present with GARDSSALG_GUEST_REMINDER_ENABLED on.
+          (r.guest_reminders_sent !== undefined ? ` guest_reminders=${r.guest_reminders_sent}` : "")
         );
       }
     } catch (err) {

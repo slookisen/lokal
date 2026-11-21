@@ -140,6 +140,8 @@ export interface OwnerPageBooking {
   maxPartySize: number;
   /** «Les mer» (/for-tilbydere#besok) — only when that page is published. */
   readMoreUrl: string | null;
+  /** O4-3: the address-confirmation block (GARDSSALG_NOTIFY_ADDRESS_CONFIRM_ENABLED on only; absent = as before). */
+  addressConfirmHtml?: string | null;
 }
 
 /** Gårdssalg statistics block (the portal's own GET …/stats numbers). */
@@ -240,6 +242,8 @@ export interface OwnerPageModel {
   variant?: OwnerPageVariant;
   /** Gårdssalg: the booking.enabled row's check and explanation. */
   booking?: OwnerPageBooking | null;
+  /** O4-4: «Slik virker det i dag» (GARDSSALG_TODAY_TEXTS_ENABLED on only; absent = page as before). */
+  todayHtml?: string | null;
   /** Gårdssalg: the statistics block (instead of `stats`). undefined = none, null = read failed. */
   gardssalgStats?: OwnerPageGardssalgStats | null;
   /** «Se all statistikk» (the Statistikk tab in /selger). */
@@ -572,7 +576,7 @@ function bookingCheckHtml(m: OwnerPageModel): string {
   } else {
     check = `<p class="mv-check" data-booking-check="ok">Forespørsler sendes til <strong>${esc(b.requestEmail)}</strong>. Er adressen feil? <a href="${esc(b.fixHref)}">Si fra</a>.</p>`;
   }
-  return check + price;
+  return check + (b.addressConfirmHtml ?? "") + price;
 }
 
 /** Gårdssalg (O1 principle 4): «Slik fungerer det», read from booking-store as built. */
@@ -1344,7 +1348,7 @@ export function renderOwnerFeaturesPageBody(m: OwnerPageModel): string {
         <div class="ep-form-actions"><a class="ep-btn ep-btn-secondary" href="${esc(back)}">Tilbake til eierportalen</a></div>
         ${jumpNavHtml(m, registry)}
       </div>
-      ${html("statistikk")}
+      ${m.todayHtml ? `${m.todayHtml}\n      ` : ""}${html("statistikk")}
       ${html(OWNER_ANCHOR_LEVEL)}
       ${groups}
       ${html(OWNER_ANCHOR_PLANNED)}

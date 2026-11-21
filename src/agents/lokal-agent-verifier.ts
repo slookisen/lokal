@@ -1633,6 +1633,26 @@ export const RFB_PARAPLY_EMAIL_DOMAINS: ReadonlySet<string> = new Set([
  * malformed email is never "paraply" (it simply is not an address — that
  * is the junk-email backstop's job, not this one's).
  */
+/**
+ * dev-request 2026-11-17-andrelinje-verifiserte-nedgraderes-etter-berikelse
+ * (S1): the stored agent_knowledge.verified_second_line stamp as it was
+ * BEFORE this evaluation (runVerifierBatch only writes it after this read).
+ * Read here, not via the pick queries, so every pick function and pickFn
+ * feeding runVerifierBatch is covered. Same defensive convention as the
+ * write path in applyVerifierOutcome: column absent (minimal schema) or any
+ * read error -> false.
+ */
+export function readStoredVerifiedSecondLine(db: any, agentId: string): boolean {
+  try {
+    const row = db
+      .prepare(`SELECT verified_second_line FROM agent_knowledge WHERE agent_id = ?`)
+      .get(agentId) as { verified_second_line: number | null } | undefined;
+    return Number(row?.verified_second_line ?? 0) === 1;
+  } catch {
+    return false;
+  }
+}
+
 export function isParaplyRoutedEmail(
   email: string | null | undefined,
   affiliatedUmbrellaDomains: readonly string[] = []
@@ -3231,7 +3251,34 @@ export async function runVerifierBatch(opts: {
       // (gate.passes === false — the exact trigger condition the spec
       // names; an agent that cleared computeKvalitetsGate but got
       // downgraded by a LATER guard above never reaches this branch).
-      if (!gate.passes) {
+      //
+      // dev-request 2026-11-17-andrelinje-verifiserte-nedgraderes-etter-
+      // berikelse (S1): ALSO attempted when the gate passed but the ONLY
+      // thing keeping the agent out of 'verified' is the cross-source
+      // (address — the sole GATING_FIELDS entry) verdict. Every other guard
+      // that can hold an agent back must be clear, otherwise the demotion
+      // stands and the judge is not called. Same call + outcome handling as
+      // the !gate.passes path below (the terminal branch there only fires on
+      // 'pending_verify', which a gate-passing agent never has). Only for a
+      // row the second line has ALREADY approved (stored
+      // verified_second_line = 1) — no new group is let in this way.
+      const priorStatus = agent.verification_status as string | null | undefined;
+      const demotedOnlyByCrossSource =
+        gate.passes &&
+        agentVerdict !== "pool_eligible" &&
+        (newVerification === "review_required" || newVerification === "data_insufficient") &&
+        inferenceOnlyFields.length === 0 &&
+        !websiteOwnershipUnverified &&
+        coherence.coherent &&
+        corroboratedEmail &&
+        gate.reasons.brreg_active &&
+        gate.reasons.no_wrong_fit &&
+        !gate.flags.some((f) => f.startsWith("nace_blacklist") || f === "brreg_konkurs" || f === "brreg_inactive") &&
+        priorStatus !== "opt_out" &&
+        priorStatus !== "terminal_unconfirmable" &&
+        !isParaplyRoutedEmail(agent.email, affiliatedUmbrellaDomains) &&
+        readStoredVerifiedSecondLine(db, agent.id);
+      if (!gate.passes || demotedOnlyByCrossSource) {
         const secondLine = await computeSecondLineVerification({
           producer_name: agent.name ?? null,
           city: agent.location_city ?? null,
@@ -3448,13 +3495,20 @@ export function buildRunEnvelope(input: {
   // like with like. The batch tally is kept in meta.batch_count. Omitted =
   // legacy batch-scoped values (tests, the standalone runner script).
   snapshotCounts?: Partial<Record<string, number>>;
+  // dev-request 2026-10-26-lokal-agent-verifier-snapshot-drift-toleranse
+  // (slice 4): ISO time taken immediately BEFORE snapshotCounts were read.
+  // The three queue claims carry it as meta.read_at so platform-verifier can
+  // ask claim-counts for drift_bound (queue moves since this read) via
+  // drift_since=<read_at>. Omitted = no read_at (probe keeps fixed +-2).
+  snapshotReadAt?: string;
 }): Record<string, unknown> {
   const r = input.results;
-  const snap = (kind: string, batchValue: number) => {
+  const snap = (kind: string, batchValue: number, withReadAt = false) => {
     const v = input.snapshotCounts?.[kind];
-    return typeof v === "number"
-      ? { value: v, meta: { kind, scope: "snapshot", batch_count: batchValue } }
-      : { value: batchValue, meta: { kind } };
+    if (typeof v !== "number") return { value: batchValue, meta: { kind } };
+    const meta: Record<string, unknown> = { kind, scope: "snapshot", batch_count: batchValue };
+    if (withReadAt && input.snapshotReadAt) meta.read_at = input.snapshotReadAt;
+    return { value: v, meta };
   };
   const verified = r.filter((x) => x.new_verification_status === "verified").length;
   const review = r.filter((x) => x.new_verification_status === "review_required").length;
@@ -3550,9 +3604,9 @@ export function buildRunEnvelope(input: {
       { type: "db_state_change", value: verified, meta: { kind: "agents_verified", agent_ids: verifiedAgentIds } },
       { type: "db_state_change", value: newlyVerified, meta: { kind: "agents_newly_verified" } },
       { type: "db_state_change", value: reverified, meta: { kind: "agents_reverified" } },
-      { type: "db_state_change", ...snap("agents_review_required", review) },
-      { type: "db_state_change", ...snap("agents_pending_verify", pending) },
-      { type: "db_state_change", ...snap("agents_data_insufficient", dataInsufficient) },
+      { type: "db_state_change", ...snap("agents_review_required", review, true) },
+      { type: "db_state_change", ...snap("agents_pending_verify", pending, true) },
+      { type: "db_state_change", ...snap("agents_data_insufficient", dataInsufficient, true) },
       // WHY (dev-request 2026-10-26-lokal-agent-verifier-snapshot-drift-
       // toleranse, slice 3): the controller reads `http_unreachable` as
       // http_unreachable_per_run (threshold 25), but the snapshot value is a

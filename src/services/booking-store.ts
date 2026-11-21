@@ -10,6 +10,7 @@
 // Never auto-sends — Daniel (producer) resolves each booking manually
 // via the tokenized confirm URL. No funds move in Phase 2.
 
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { v4 as uuid } from "uuid";
 import { z } from "zod";
 import { getDb } from "../database/db-factory";
@@ -32,6 +33,7 @@ import {
   buildConfirmedIcs,
   loadReceiptProvider,
   oa1Text,
+  formatOsloInstant,
   CONFIRMED_ICS_CONTENT_TYPE,
 } from "./gardssalg-honest-receipt";
 import {
@@ -40,6 +42,17 @@ import {
   deadlineAfterSuggestion,
 } from "./gardssalg-attendance-guard";
 import { gardssalgNow } from "./gardssalg-test-clock";
+import { gardssalgNotifyRecipient } from "./gardssalg-notify-address";
+import { archiveProducerBookingMail } from "./gardssalg-booking-crm-archive";
+import {
+  emailText,
+  fillEmailText,
+  guestEmailLang,
+  normaliseGuestLang,
+  renderEmailBody,
+  type EmailLang,
+  type GardssalgEmailKey,
+} from "./gardssalg-email-texts";
 
 const VERTICAL = "experiences";
 const APP_URL = process.env.APP_URL || "https://opplevagent.no";
@@ -190,6 +203,12 @@ export interface GardssalgBooking {
   notify_retried_at: string | null;
   /** F1-1: AI assistant label (SOURCE_CLIENT_LABELS) or null. */
   source_client: string | null;
+  /**
+   * O4-2: the guest's language, "nb" or "en". NULL on rows created before
+   * the column (= "nb"). Only decides the guest e-mails, and only with
+   * GARDSSALG_EMAIL_EN_ENABLED (guestEmailLang()).
+   */
+  guest_lang?: EmailLang | null;
 }
 
 export const BookingInputSchema = z.object({
@@ -286,6 +305,7 @@ function hydrate(row: Record<string, unknown>): GardssalgBooking {
     notify_failed_at:         (row.notify_failed_at as string | null) ?? null,
     notify_retried_at:        (row.notify_retried_at as string | null) ?? null,
     source_client:            (row.source_client as string | null) ?? null,
+    guest_lang:               row.guest_lang == null ? null : normaliseGuestLang(row.guest_lang),
   };
 }
 
@@ -306,6 +326,10 @@ function hydrate(row: Record<string, unknown>): GardssalgBooking {
 // there is no field name a public caller could smuggle to reach this. Only an
 // admin-gated call site passes it.
 //
+// `opts.guestLang` (O4-2) is the guest's language from the web form or the
+// REST API: "en" or "nb", anything else (and a caller that passes nothing,
+// such as the book_gardssalg MCP tool) is stored as "nb".
+//
 // `opts.sourceClient` (dev-request 2026-11-12-f1, F1-1) is the AI assistant
 // the booking came from, set by the MCP tool and by the REST route for an
 // ai_search caller. Only a value in SOURCE_CLIENT_LABELS is stored; anything
@@ -313,7 +337,7 @@ function hydrate(row: Record<string, unknown>): GardssalgBooking {
 export function createBooking(
   input: BookingInput,
   source: string = "opplevagent",
-  opts: { isTest?: boolean; sourceClient?: string | null } = {},
+  opts: { isTest?: boolean; sourceClient?: string | null; guestLang?: unknown } = {},
 ): GardssalgBooking {
   const db = getDb(VERTICAL);
 
@@ -365,6 +389,7 @@ export function createBooking(
     notify_failed_at:         null,
     notify_retried_at:        null,
     source_client:            isSourceClientLabel(opts.sourceClient) ? opts.sourceClient : null,
+    guest_lang:               normaliseGuestLang(opts.guestLang),
   };
 
   db.prepare(`
@@ -373,13 +398,13 @@ export function createBooking(
       guest_name, guest_email, guest_phone, booking_ref, confirm_token,
       source, status, commission_rate, notes, created_at,
       pre_status, respond_token, respond_token_expires_at, guest_status_token,
-      is_test, source_client
+      is_test, source_client, guest_lang
     ) VALUES (
       @booking_id, @experience_id, @provider_id, @slot_at, @party_size,
       @guest_name, @guest_email, @guest_phone, @booking_ref, @confirm_token,
       @source, @status, @commission_rate, @notes, @created_at,
       @pre_status, @respond_token, @respond_token_expires_at, @guest_status_token,
-      @is_test, @source_client
+      @is_test, @source_client, @guest_lang
     )
   `).run(booking);
 
@@ -392,6 +417,58 @@ export function getBookingByRef(booking_ref: string): GardssalgBooking | null {
     .prepare("SELECT * FROM gardssalg_bookings WHERE booking_ref = ?")
     .get(booking_ref) as Record<string, unknown> | undefined;
   return row ? hydrate(row) : null;
+}
+
+// ─── O5-1: the guest's secret reference (guest_ref) ─────────────────────────
+// dev-request 2026-11-12-opplevagent-o5-besok-i-chatgpt-og-assistenter. A
+// high-entropy secret handed to the AI assistant in the book_gardssalg result
+// (behind GARDSSALG_MCP_GUEST_REF_ENABLED) so a later slice (O5-2) can let the
+// same conversation read the status. Only its SHA-256 hex is stored
+// (gardssalg_bookings.guest_ref_hash); the reference itself is never stored
+// or logged, and the hash never leaves this module.
+
+export function guestRefEnabled(): boolean {
+  return process.env.GARDSSALG_MCP_GUEST_REF_ENABLED === "true";
+}
+
+// An object, so a test can observe that verifyGuestRef() hashes in every
+// branch (O5-1 review N3).
+export const guestRefHasher = {
+  hash(guestRef: string): string {
+    return createHash("sha256").update(guestRef, "utf8").digest("hex");
+  },
+};
+const hashGuestRef = (guestRef: string): string => guestRefHasher.hash(guestRef);
+
+// Compared against when the row or its hash is missing, so an unknown
+// reference costs the same hash + compare as a known one (O5-1 review N3).
+const DUMMY_GUEST_REF_HASH = "0".repeat(64);
+
+/** Issues a new guest_ref for the booking, stores only its hash, returns the reference. */
+export function issueGuestRef(booking_id: string): string {
+  const guestRef = randomBytes(24).toString("base64url");
+  getDb(VERTICAL)
+    .prepare("UPDATE gardssalg_bookings SET guest_ref_hash = ? WHERE booking_id = ?")
+    .run(hashGuestRef(guestRef), booking_id);
+  return guestRef;
+}
+
+/**
+ * booking_ref + guest_ref -> the booking, or null on any mismatch. Always
+ * hashes the given guest_ref and runs one constant-time compare, also when
+ * the row or its hash is missing (then against a dummy hash), so the time
+ * taken does not tell whether a reference exists (O5-1 review N3).
+ */
+export function verifyGuestRef(booking_ref: unknown, guest_ref: unknown): GardssalgBooking | null {
+  if (typeof booking_ref !== "string" || !booking_ref || typeof guest_ref !== "string" || !guest_ref) return null;
+  const row = getDb(VERTICAL)
+    .prepare("SELECT * FROM gardssalg_bookings WHERE booking_ref = ?")
+    .get(booking_ref) as Record<string, unknown> | undefined;
+  const stored = typeof row?.guest_ref_hash === "string" && /^[0-9a-f]{64}$/.test(row.guest_ref_hash) ? row.guest_ref_hash : null;
+  const a = Buffer.from(stored ?? DUMMY_GUEST_REF_HASH, "hex");
+  const b = Buffer.from(hashGuestRef(guest_ref), "hex");
+  const match = timingSafeEqual(a, b);
+  return match && row && stored ? hydrate(row) : null;
 }
 
 export function getBookingByToken(
@@ -551,6 +628,15 @@ function escEmailHtml(s: string): string {
     .replace(/'/g, "&#39;");
 }
 
+// O4-2: every sentence below comes from the text register
+// (gardssalg-email-texts.ts); only markup and layout stay here.
+function nbText(key: GardssalgEmailKey, vars?: Record<string, string>): string {
+  const t = emailText(key, "nb");
+  return vars ? fillEmailText(t, vars) : t;
+}
+const partyNb = (n: number): string => nbText(n > 1 ? "party.many" : "party.one", { antall: String(n) });
+const signoffHtml = (): string => nbText("signoff").replace("\n", "<br>");
+
 // ─── ICS + confirmation email — shared by every booking entry point ────────
 // Lives here (not in a route file) so both POST /api/opplevelser/book
 // (opplevelser.ts) and the gårdssalg SSR reservation form's no-JS fallback
@@ -611,27 +697,28 @@ export async function sendBookingConfirmation(booking: GardssalgBooking): Promis
     ? `${APP_URL}/kategori/gardssalg/status/${encodeURIComponent(booking.booking_ref)}/${booking.guest_status_token}`
     : null;
 
+  // The legacy receipt is not translated (text package OA-2 A): always Norwegian.
   const htmlContent = `
-<p>Hei ${escEmailHtml(booking.guest_name)},</p>
-<p>Din påmelding er registrert! Her er din bekreftelse:</p>
+<p>${nbText("greeting", { gjest: escEmailHtml(booking.guest_name) })}</p>
+<p>${nbText("receipt.legacy.lead")}</p>
 <table style="border-collapse:collapse;font-family:sans-serif">
-  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Bookingref:</td><td>${booking.booking_ref}</td></tr>
-  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Dato/tid:</td><td>${slotFormatted}</td></tr>
-  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Antall:</td><td>${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</td></tr>
-  ${booking.notes ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">Din kommentar:</td><td>${escEmailHtml(booking.notes)}</td></tr>` : ""}
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">${nbText("label.ref")}</td><td>${booking.booking_ref}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">${nbText("label.time")}</td><td>${slotFormatted}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">${nbText("label.party")}</td><td>${partyNb(booking.party_size)}</td></tr>
+  ${booking.notes ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">${nbText("label.note")}</td><td>${escEmailHtml(booking.notes)}</td></tr>` : ""}
 </table>
-<p>Produsenten er varslet om forespørselen og svarer på e-post — du får beskjed så snart reservasjonen er bekreftet eller besvart.</p>
-${statusUrl ? `<p>Du kan når som helst se gjeldende status her: <a href="${statusUrl}">statusside for reservasjonen</a>.</p>` : ""}
-<p>En kalenderinvitasjon (ICS) er vedlagt denne e-posten.</p>
-<p>Spørsmål? Svar på denne e-posten.</p>
-<p>Hilsen<br>Opplevagent</p>
+<p>${nbText("receipt.legacy.notified")}</p>
+${statusUrl ? `<p>${nbText("receipt.legacy.status", { statuslenke: `<a href="${statusUrl}">${nbText("footer.statusLinkText")}</a>` })}</p>` : ""}
+<p>${nbText("receipt.legacy.ics")}</p>
+<p>${nbText("receipt.legacy.questions")}</p>
+<p>${signoffHtml()}</p>
   `.trim();
 
-  const textContent = `Hei ${booking.guest_name},\n\nDin påmelding er registrert.\nBookingref: ${booking.booking_ref}\nDato/tid: ${slotFormatted}\nAntall: ${booking.party_size}${booking.notes ? `\nDin kommentar: ${booking.notes}` : ""}\n\nProdusenten er varslet om forespørselen og svarer på e-post — du får beskjed så snart reservasjonen er bekreftet eller besvart.${statusUrl ? `\nStatus for reservasjonen: ${statusUrl}` : ""}\n\nHilsen\nOpplevagent`;
+  const textContent = `${nbText("greeting", { gjest: booking.guest_name })}\n\n${nbText("receipt.legacy.textLead")}\n${nbText("label.ref")} ${booking.booking_ref}\n${nbText("label.time")} ${slotFormatted}\n${nbText("label.party")} ${booking.party_size}${booking.notes ? `\n${nbText("label.note")} ${booking.notes}` : ""}\n\n${nbText("receipt.legacy.notified")}${statusUrl ? `\n${nbText("receipt.legacy.statusText", { statusside: statusUrl })}` : ""}\n\n${nbText("signoff")}`;
 
   await emailService.sendEmail({
     to: booking.guest_email,
-    subject: `Bekreftelse på påmelding — ${booking.booking_ref}`,
+    subject: nbText("receipt.legacy.subject", { ref: booking.booking_ref }),
     htmlContent,
     textContent,
     replyTo: `kontakt@opplevagent.no`,
@@ -656,12 +743,13 @@ ${statusUrl ? `<p>Du kan når som helst se gjeldende status her: <a href="${stat
 
 // O1-2: the honest receipt (text package OA-1 §1.2), never the legacy one
 // with the flag on. The provider row is read before the first await.
+// O4-2: in the guest's language (guestEmailLang()).
 async function sendHonestReceipt(booking: GardssalgBooking): Promise<void> {
   const provider = loadReceiptProvider(booking.provider_id);
   const mail = buildHonestReceiptEmail(
     booking,
     { producerName: provider.navn, statusUrl: guestStatusUrl(booking) },
-    "nb",
+    guestEmailLang(booking),
   );
   await emailService.sendEmail({
     to: booking.guest_email,
@@ -710,6 +798,8 @@ export async function sendProducerNotification(
   // Resolve the DB handle NOW (same tick as the caller): the send resolves
   // later, and a late getDb() could open a different database.
   const db = getDb(VERTICAL);
+  // O4-3: the confirmed address while a changed one awaits confirmation (flag off: unchanged).
+  producerEmail = gardssalgNotifyRecipient(booking.provider_id, producerEmail);
   const record = (outcome: ProducerNotifyOutcome, reason?: string) =>
     recordProducerNotifyOutcome(db, booking, outcome, { retry: opts.retry, reason });
   if (!producerEmail || !producerEmail.trim()) {
@@ -755,35 +845,37 @@ export async function sendProducerNotification(
   // param doc comment).
   const hoursRaw = openingHoursText && openingHoursText.trim() ? openingHoursText.trim() : null;
 
+  // Producer e-mails are always Norwegian (text package OA-2 A).
   const htmlContent = `
-<p>Hei,</p>
-<p>Du har fått en ny reservasjonsforespørsel via Opplevagent:</p>
+<p>${nbText("greeting.producer")}</p>
+<p>${nbText("producer.new.lead")}</p>
 <table style="border-collapse:collapse;font-family:sans-serif">
-  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Bookingref:</td><td>${booking.booking_ref}</td></tr>
-  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Dato/tid:</td><td>${slotFormatted}</td></tr>
-  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Antall:</td><td>${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</td></tr>
-  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Gjest:</td><td>${escEmailHtml(booking.guest_name)}</td></tr>
-  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">E-post:</td><td>${escEmailHtml(booking.guest_email)}</td></tr>
-  ${booking.guest_phone ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">Telefon:</td><td>${escEmailHtml(booking.guest_phone)}</td></tr>` : ""}
-  ${booking.notes ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">Kommentar fra gjesten:</td><td>${escEmailHtml(booking.notes)}</td></tr>` : ""}
-  ${hoursRaw ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">Dine oppgitte åpningstider:</td><td>${escEmailHtml(hoursRaw)}</td></tr>` : ""}
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">${nbText("label.ref")}</td><td>${booking.booking_ref}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">${nbText("label.time")}</td><td>${slotFormatted}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">${nbText("label.party")}</td><td>${partyNb(booking.party_size)}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">${nbText("producer.label.guest")}</td><td>${escEmailHtml(booking.guest_name)}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">${nbText("producer.label.email")}</td><td>${escEmailHtml(booking.guest_email)}</td></tr>
+  ${booking.guest_phone ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">${nbText("producer.label.phone")}</td><td>${escEmailHtml(booking.guest_phone)}</td></tr>` : ""}
+  ${booking.notes ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">${nbText("producer.label.note")}</td><td>${escEmailHtml(booking.notes)}</td></tr>` : ""}
+  ${hoursRaw ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">${nbText("producer.label.hours")}</td><td>${escEmailHtml(hoursRaw)}</td></tr>` : ""}
 </table>
-${respondUrl ? `<p><strong>Svar på forespørselen:</strong></p>
-<p><a href="${respondUrl}" style="display:inline-block;background:#1d4e46;color:#ffffff;text-decoration:none;font-weight:700;padding:12px 22px;border-radius:8px">Åpne svarsiden</a></p>
-<p>Der kan du bekrefte, foreslå et nytt tidspunkt eller avslå.${deadlineFormatted ? ` Svarfrist: <strong>${deadlineFormatted}</strong> — uten svar innen fristen utløper forespørselen automatisk og gjesten får beskjed.` : ""}</p>` : ""}
-<p>Spørsmål fra gjesten kan besvares direkte — gjestens e-post står over.</p>
-<p>Etter besøket: <a href="${confirmUrl}">bekreft oppmøte eller ikke-oppmøte her</a>.<br>
-Lenkene er personlige for denne reservasjonen — ikke del dem videre.</p>
-<p>Hilsen<br>Opplevagent</p>
+${respondUrl ? `<p><strong>${nbText("producer.new.respondHeading")}</strong></p>
+<p><a href="${respondUrl}" style="display:inline-block;background:#1d4e46;color:#ffffff;text-decoration:none;font-weight:700;padding:12px 22px;border-radius:8px">${nbText("producer.new.respondButton")}</a></p>
+<p>${nbText("producer.new.respondChoices")}${deadlineFormatted ? ` ${nbText("producer.deadline", { frist: `<strong>${deadlineFormatted}</strong>` })}` : ""}</p>` : ""}
+<p>${nbText("producer.new.guestQuestions")}</p>
+<p>${nbText("producer.new.after", { lenke: `<a href="${confirmUrl}">${nbText("producer.new.afterLinkText")}</a>` })}<br>
+${nbText("producer.new.linksPersonal")}</p>
+<p>${signoffHtml()}</p>
   `.trim();
 
-  const textContent = `Hei,\n\nDu har fått en ny reservasjonsforespørsel via Opplevagent.\nBookingref: ${booking.booking_ref}\nDato/tid: ${slotFormatted}\nAntall: ${booking.party_size}\nGjest: ${booking.guest_name} (${booking.guest_email}${booking.guest_phone ? ", " + booking.guest_phone : ""})${booking.notes ? `\nKommentar fra gjesten: ${booking.notes}` : ""}${hoursRaw ? `\nDine oppgitte åpningstider: ${hoursRaw}` : ""}\n${respondUrl ? `\nSvar på forespørselen (bekreft / foreslå nytt tidspunkt / avslå):\n${respondUrl}${deadlineFormatted ? `\nSvarfrist: ${deadlineFormatted} — uten svar innen fristen utløper forespørselen automatisk og gjesten får beskjed.` : ""}\n` : ""}\nEtter besøket: bekreft oppmøte her (personlig lenke, ikke del videre):\n${confirmUrl}\n\nHilsen\nOpplevagent`;
+  const textContent = `${nbText("greeting.producer")}\n\n${nbText("producer.new.textLead")}\n${nbText("label.ref")} ${booking.booking_ref}\n${nbText("label.time")} ${slotFormatted}\n${nbText("label.party")} ${booking.party_size}\n${nbText("producer.label.guest")} ${booking.guest_name} (${booking.guest_email}${booking.guest_phone ? ", " + booking.guest_phone : ""})${booking.notes ? `\n${nbText("producer.label.note")} ${booking.notes}` : ""}${hoursRaw ? `\n${nbText("producer.label.hours")} ${hoursRaw}` : ""}\n${respondUrl ? `\n${nbText("producer.new.respondText")}\n${respondUrl}${deadlineFormatted ? `\n${nbText("producer.deadline", { frist: deadlineFormatted })}` : ""}\n` : ""}\n${nbText("producer.new.afterText")}\n${confirmUrl}\n\n${nbText("signoff")}`;
 
-  let sendResult: { success?: boolean; error?: string } | void;
+  const subject = nbText("producer.new.subject", { ref: booking.booking_ref });
+  let sendResult: { success?: boolean; messageId?: string; error?: string } | void;
   try {
     sendResult = await emailService.sendEmail({
       to: producerEmail,
-      subject: `Ny reservasjon — ${booking.booking_ref}`,
+      subject,
       htmlContent,
       textContent,
       replyTo: `kontakt@opplevagent.no`,
@@ -808,6 +900,16 @@ Lenkene er personlige for denne reservasjonen — ikke del dem videre.</p>
     return "failed";
   }
   await record("sent");
+  // O4-5b: file the sent mail in the booking's CRM thread (flag off: no-op; never throws).
+  archiveProducerBookingMail({
+    booking,
+    kind: opts.retry ? "producer_new_retry" : "producer_new",
+    to: producerEmail,
+    subject,
+    textContent,
+    htmlContent,
+    sendResult,
+  });
   return "sent";
 }
 
@@ -1159,7 +1261,13 @@ function slotNb(slot: string | null): string {
   });
 }
 
-function guestStatusUrl(booking: GardssalgBooking): string | null {
+/** The guest's one-shot link for answering a suggested time (the suggestion e-mail's link). */
+export function guestDecisionUrl(booking: GardssalgBooking): string | null {
+  return booking.guest_decision_token ? `${APP_URL}/kategori/gardssalg/gjestesvar/${booking.guest_decision_token}` : null;
+}
+
+/** The guest's read-only status page — the same link the guest e-mails carry. */
+export function guestStatusUrl(booking: GardssalgBooking): string | null {
   return booking.guest_status_token
     ? `${APP_URL}/kategori/gardssalg/status/${encodeURIComponent(booking.booking_ref)}/${booking.guest_status_token}`
     : null;
@@ -1167,8 +1275,43 @@ function guestStatusUrl(booking: GardssalgBooking): string | null {
 
 const statusFooterHtml = (booking: GardssalgBooking): string => {
   const u = guestStatusUrl(booking);
-  return u ? `<p>Se gjeldende status når som helst: <a href="${u}">statusside for reservasjonen</a>.</p>` : "";
+  return u ? `<p>${nbText("footer.status", { statuslenke: `<a href="${u}">${nbText("footer.statusLinkText")}</a>` })}</p>` : "";
 };
+
+// O4-2: English guest e-mails (GARDSSALG_EMAIL_EN_ENABLED and guest_lang
+// "en", see guestEmailLang()). Built in the layout of text package OA-2 A
+// from the register's English texts: paragraphs joined by a blank line, the
+// ones that do not apply (null) left out, URLs shown as links in the HTML.
+const enText = (key: GardssalgEmailKey): string => emailText(key, "en");
+
+function slotEn(slot: string | null): string {
+  if (!slot) return "";
+  return formatOsloInstant(osloDatetimeLocalToUtcIso(slot) ?? slot, "en");
+}
+
+function englishGuestMail(
+  booking: GardssalgBooking,
+  subjectKey: GardssalgEmailKey,
+  paragraphs: Array<string | null>,
+  vars: Record<string, string> = {},
+): { subject: string; htmlContent: string; textContent: string } {
+  const raw: Record<string, string> = {
+    gjest: booking.guest_name,
+    produsent: loadReceiptProvider(booking.provider_id).navn,
+    ref: booking.booking_ref,
+    tid: slotEn(booking.slot_at),
+    antall: String(booking.party_size),
+    statusside: guestStatusUrl(booking) ?? "",
+    oversikt: `${APP_URL}/kategori/gardssalg`,
+    ...vars,
+  };
+  const body = paragraphs.filter((p): p is string => !!p).join("\n\n");
+  const { text, html } = renderEmailBody(body, raw, ["statusside", "oversikt", "svarlenke"]);
+  return { subject: fillEmailText(enText(subjectKey), { ref: booking.booking_ref }), htmlContent: html, textContent: text };
+}
+
+const enStatusFooter = (booking: GardssalgBooking): string | null =>
+  guestStatusUrl(booking) ? enText("footer.status") : null;
 
 // Guest: the producer confirmed (directly, or via the guest accepting a
 // suggested time — pass acceptedSuggestion to word it accordingly).
@@ -1176,10 +1319,11 @@ export async function sendPrevisitConfirmedToGuest(
   booking: GardssalgBooking,
   acceptedSuggestion = false,
 ): Promise<void> {
+  const lang = guestEmailLang(booking);
   const slotFormatted = slotNb(booking.slot_at);
   const lead = acceptedSuggestion
-    ? "Du har akseptert det nye tidspunktet — reservasjonen er nå bekreftet:"
-    : "Gode nyheter — produsenten har bekreftet reservasjonen din:";
+    ? nbText("guest.confirmed.leadAccepted")
+    : nbText("guest.confirmed.lead");
   // O1-2 (R4): with GARDSSALG_HONEST_RECEIPT_ENABLED the calendar file comes
   // HERE — on the producer's confirmation, and as a new file when the guest
   // accepted a new time — with the producer's address as LOCATION. Flag off:
@@ -1188,33 +1332,47 @@ export async function sendPrevisitConfirmedToGuest(
   let icsAttachment: { filename: string; content: string; contentType: string } | null = null;
   if (honestReceiptEnabled()) {
     const provider = loadReceiptProvider(booking.provider_id);
-    icsLine = oa1Text(acceptedSuggestion ? "confirmed.newTimeIcsLine" : "confirmed.icsLine", "nb");
+    icsLine = oa1Text(acceptedSuggestion ? "confirmed.newTimeIcsLine" : "confirmed.icsLine", lang);
     icsAttachment = {
       filename: `gardssalg-${booking.booking_ref}.ics`,
       content: buildConfirmedIcs(
         booking,
         { producerName: provider.navn, sted: provider.sted, statusUrl: guestStatusUrl(booking) },
-        "nb",
+        lang,
       ),
       contentType: CONFIRMED_ICS_CONTENT_TYPE,
     };
   }
+  const mail = lang === "en"
+    ? englishGuestMail(booking, "guest.confirmed.subject", [
+      enText("greeting"),
+      enText(acceptedSuggestion ? "guest.confirmed.leadAccepted" : "guest.confirmed.lead"),
+      `${enText("label.ref")} {ref}\n${enText("label.time")} {tid}\n${enText("label.party")} {antall}`,
+      icsLine || null,
+      enStatusFooter(booking),
+      enText("signoff"),
+    ])
+    : {
+      subject: nbText("guest.confirmed.subject", { ref: booking.booking_ref }),
+      htmlContent: `
+<p>${nbText("greeting", { gjest: escEmailHtml(booking.guest_name) })}</p>
+<p>${lead}</p>
+<table style="border-collapse:collapse;font-family:sans-serif">
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">${nbText("label.ref")}</td><td>${booking.booking_ref}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">${nbText("label.time")}</td><td>${slotFormatted}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">${nbText("label.party")}</td><td>${partyNb(booking.party_size)}</td></tr>
+</table>${icsLine ? `\n<p>${escEmailHtml(icsLine)}</p>` : ""}
+<p>${nbText("guest.confirmed.welcome")}</p>
+${statusFooterHtml(booking)}
+<p>${signoffHtml()}</p>`.trim(),
+      textContent: `${nbText("greeting", { gjest: booking.guest_name })}\n\n${nbText(acceptedSuggestion ? "guest.confirmed.textLeadAccepted" : "guest.confirmed.textLead")}\n${nbText("label.ref")} ${booking.booking_ref}\n${nbText("label.time")} ${slotFormatted}\n${nbText("label.party")} ${booking.party_size}${icsLine ? `\n\n${icsLine}` : ""}${guestStatusUrl(booking) ? `\n${nbText("footer.statusText", { statusside: guestStatusUrl(booking)! })}` : ""}\n\n${nbText("signoff")}`,
+    };
   await emailService.sendEmail({
     to: booking.guest_email,
     isTestSend: booking.is_test === 1,
-    subject: `Reservasjonen er bekreftet — ${booking.booking_ref}`,
-    htmlContent: `
-<p>Hei ${escEmailHtml(booking.guest_name)},</p>
-<p>${lead}</p>
-<table style="border-collapse:collapse;font-family:sans-serif">
-  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Bookingref:</td><td>${booking.booking_ref}</td></tr>
-  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Dato/tid:</td><td>${slotFormatted}</td></tr>
-  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Antall:</td><td>${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</td></tr>
-</table>${icsLine ? `\n<p>${escEmailHtml(icsLine)}</p>` : ""}
-<p>Velkommen! Produsenten registrerer oppmøtet etter besøket.</p>
-${statusFooterHtml(booking)}
-<p>Hilsen<br>Opplevagent</p>`.trim(),
-    textContent: `Hei ${booking.guest_name},\n\n${acceptedSuggestion ? "Du har akseptert det nye tidspunktet — reservasjonen er nå bekreftet." : "Produsenten har bekreftet reservasjonen din."}\nBookingref: ${booking.booking_ref}\nDato/tid: ${slotFormatted}\nAntall: ${booking.party_size}${icsLine ? `\n\n${icsLine}` : ""}${guestStatusUrl(booking) ? `\nStatus: ${guestStatusUrl(booking)}` : ""}\n\nHilsen\nOpplevagent`,
+    subject: mail.subject,
+    htmlContent: mail.htmlContent,
+    textContent: mail.textContent,
     replyTo: "kontakt@opplevagent.no",
     // Steg 3 / funn 2: this mail carries Opplevagent content, so it must READ
     // as Opplevagent in the inbox list. The address stays rettfrabonden.com —
@@ -1229,17 +1387,30 @@ ${statusFooterHtml(booking)}
 export async function sendPrevisitDeclinedToGuest(booking: GardssalgBooking): Promise<void> {
   const slotFormatted = slotNb(booking.slot_at);
   const alternatives = `${APP_URL}/kategori/gardssalg`;
+  const vars = { ref: booking.booking_ref, tid: slotFormatted };
+  const mail = guestEmailLang(booking) === "en"
+    ? englishGuestMail(booking, "guest.declined.subject", [
+      enText("greeting"),
+      enText("guest.declined.body"),
+      enText("guest.alternatives"),
+      enText("signoff"),
+    ])
+    : {
+      subject: nbText("guest.declined.subject", { ref: booking.booking_ref }),
+      htmlContent: `
+<p>${nbText("greeting", { gjest: escEmailHtml(booking.guest_name) })}</p>
+<p>${nbText("guest.declined.body", vars)}</p>
+<p>${nbText("guest.alternatives", { alternativlenke: `<a href="${alternatives}">${nbText("guest.alternativesLinkText")}</a>` })}</p>
+${statusFooterHtml(booking)}
+<p>${signoffHtml()}</p>`.trim(),
+      textContent: `${nbText("greeting", { gjest: booking.guest_name })}\n\n${nbText("guest.declined.body", vars)}\n${nbText("guest.alternativesText", { oversikt: alternatives })}\n\n${nbText("signoff")}`,
+    };
   await emailService.sendEmail({
     to: booking.guest_email,
     isTestSend: booking.is_test === 1,
-    subject: `Reservasjonen kunne dessverre ikke bekreftes — ${booking.booking_ref}`,
-    htmlContent: `
-<p>Hei ${escEmailHtml(booking.guest_name)},</p>
-<p>Vi beklager — reservasjonsforespørselen din (${booking.booking_ref}, ${slotFormatted}) kunne dessverre ikke bekreftes av produsenten denne gangen.</p>
-<p>Det finnes flere produsenter som tar imot besøk: <a href="${alternatives}">se alternative tilbydere her</a>.</p>
-${statusFooterHtml(booking)}
-<p>Hilsen<br>Opplevagent</p>`.trim(),
-    textContent: `Hei ${booking.guest_name},\n\nVi beklager — reservasjonsforespørselen din (${booking.booking_ref}, ${slotFormatted}) kunne dessverre ikke bekreftes av produsenten denne gangen.\nSe alternative tilbydere: ${alternatives}\n\nHilsen\nOpplevagent`,
+    subject: mail.subject,
+    htmlContent: mail.htmlContent,
+    textContent: mail.textContent,
     replyTo: "kontakt@opplevagent.no",
     // Steg 3 / funn 2: this mail carries Opplevagent content, so it must READ
     // as Opplevagent in the inbox list. The address stays rettfrabonden.com —
@@ -1251,23 +1422,38 @@ ${statusFooterHtml(booking)}
 // Guest: the producer suggested a new time — carries the guest's one-shot
 // decision link. The producer's respond/confirm tokens must NEVER appear here.
 export async function sendSuggestionToGuest(booking: GardssalgBooking): Promise<void> {
-  if (!booking.guest_decision_token || !booking.suggested_slot_at) return;
-  const decisionUrl = `${APP_URL}/kategori/gardssalg/gjestesvar/${booking.guest_decision_token}`;
+  const decisionUrl = guestDecisionUrl(booking);
+  if (!decisionUrl || !booking.suggested_slot_at) return;
   const originalFormatted = slotNb(booking.slot_at);
   const suggestedFormatted = slotNb(booking.suggested_slot_at);
+  const mail = guestEmailLang(booking) === "en"
+    ? englishGuestMail(booking, "guest.suggestion.subject", [
+      enText("greeting"),
+      enText("guest.suggestion.lead"),
+      "{nytt_tidspunkt}",
+      enText("guest.suggestion.reply"),
+      enText("guest.suggestion.personal"),
+      enStatusFooter(booking),
+      enText("signoff"),
+    ], { nytt_tidspunkt: slotEn(booking.suggested_slot_at), svarlenke: decisionUrl })
+    : {
+      subject: nbText("guest.suggestion.subject", { ref: booking.booking_ref }),
+      htmlContent: `
+<p>${nbText("greeting", { gjest: escEmailHtml(booking.guest_name) })}</p>
+<p>${nbText("guest.suggestion.lead", { tid: originalFormatted })}</p>
+<p style="font-size:1.05rem;font-weight:bold">${suggestedFormatted}</p>
+<p>${nbText("guest.suggestion.reply", { svarlenke: `<a href="${decisionUrl}">${nbText("guest.suggestion.replyLinkText")}</a>` })}</p>
+<p>${nbText("guest.suggestion.personal", { ref: booking.booking_ref })}</p>
+${statusFooterHtml(booking)}
+<p>${signoffHtml()}</p>`.trim(),
+      textContent: `${nbText("greeting", { gjest: booking.guest_name })}\n\n${nbText("guest.suggestion.lead", { tid: originalFormatted })}\n${suggestedFormatted}\n\n${nbText("guest.suggestion.replyText")}\n${decisionUrl}\n\n${nbText("signoff")}`,
+    };
   await emailService.sendEmail({
     to: booking.guest_email,
     isTestSend: booking.is_test === 1,
-    subject: `Produsenten foreslår et nytt tidspunkt — ${booking.booking_ref}`,
-    htmlContent: `
-<p>Hei ${escEmailHtml(booking.guest_name)},</p>
-<p>Produsenten kan dessverre ikke ta imot besøket ${originalFormatted}, men foreslår i stedet:</p>
-<p style="font-size:1.05rem;font-weight:bold">${suggestedFormatted}</p>
-<p><a href="${decisionUrl}">Svar på forslaget her</a> — du kan akseptere det nye tidspunktet eller avslå.</p>
-<p>Lenken er personlig for denne reservasjonen (${booking.booking_ref}) — ikke del den videre.</p>
-${statusFooterHtml(booking)}
-<p>Hilsen<br>Opplevagent</p>`.trim(),
-    textContent: `Hei ${booking.guest_name},\n\nProdusenten kan dessverre ikke ta imot besøket ${originalFormatted}, men foreslår i stedet:\n${suggestedFormatted}\n\nAksepter eller avslå forslaget her (personlig lenke):\n${decisionUrl}\n\nHilsen\nOpplevagent`,
+    subject: mail.subject,
+    htmlContent: mail.htmlContent,
+    textContent: mail.textContent,
     replyTo: "kontakt@opplevagent.no",
     // Steg 3 / funn 2: this mail carries Opplevagent content, so it must READ
     // as Opplevagent in the inbox list. The address stays rettfrabonden.com —
@@ -1283,20 +1469,31 @@ ${statusFooterHtml(booking)}
 export async function sendPrevisitExpiredToGuest(booking: GardssalgBooking): Promise<void> {
   const slotFormatted = slotNb(booking.slot_at);
   const alternatives = `${APP_URL}/kategori/gardssalg`;
-  const reasonHtml = booking.suggested_slot_at
-    ? `Vi beklager — det foreslåtte tidspunktet for reservasjonsforespørselen din (${booking.booking_ref}, ${slotFormatted}) ble dessverre ikke endelig avklart i tide, så forespørselen er nå utløpt.`
-    : `Vi beklager — produsenten har dessverre ikke besvart reservasjonsforespørselen din (${booking.booking_ref}, ${slotFormatted}) i tide, så den er nå utløpt.`;
+  const reasonKey: GardssalgEmailKey = booking.suggested_slot_at ? "guest.expired.bodySuggested" : "guest.expired.body";
+  const reasonHtml = nbText(reasonKey, { ref: booking.booking_ref, tid: slotFormatted });
+  const mail = guestEmailLang(booking) === "en"
+    ? englishGuestMail(booking, "guest.expired.subject", [
+      enText("greeting"),
+      enText(reasonKey),
+      enText("guest.alternatives"),
+      enText("signoff"),
+    ])
+    : {
+      subject: nbText("guest.expired.subject", { ref: booking.booking_ref }),
+      htmlContent: `
+<p>${nbText("greeting", { gjest: escEmailHtml(booking.guest_name) })}</p>
+<p>${reasonHtml}</p>
+<p>${nbText("guest.alternatives", { alternativlenke: `<a href="${alternatives}">${nbText("guest.alternativesLinkText")}</a>` })}</p>
+${statusFooterHtml(booking)}
+<p>${signoffHtml()}</p>`.trim(),
+      textContent: `${nbText("greeting", { gjest: booking.guest_name })}\n\n${reasonHtml}\n${nbText("guest.alternativesText", { oversikt: alternatives })}\n\n${nbText("signoff")}`,
+    };
   await emailService.sendEmail({
     to: booking.guest_email,
     isTestSend: booking.is_test === 1,
-    subject: `Forespørselen utløp uten svar — ${booking.booking_ref}`,
-    htmlContent: `
-<p>Hei ${escEmailHtml(booking.guest_name)},</p>
-<p>${reasonHtml}</p>
-<p>Det finnes flere produsenter som tar imot besøk: <a href="${alternatives}">se alternative tilbydere her</a>.</p>
-${statusFooterHtml(booking)}
-<p>Hilsen<br>Opplevagent</p>`.trim(),
-    textContent: `Hei ${booking.guest_name},\n\n${reasonHtml}\nSe alternative tilbydere: ${alternatives}\n\nHilsen\nOpplevagent`,
+    subject: mail.subject,
+    htmlContent: mail.htmlContent,
+    textContent: mail.textContent,
     replyTo: "kontakt@opplevagent.no",
     // Steg 3 / funn 2: this mail carries Opplevagent content, so it must READ
     // as Opplevagent in the inbox list. The address stays rettfrabonden.com —
@@ -1328,7 +1525,8 @@ function getProviderDispatchRow(provider_id: string): {
     .get(provider_id) as
     | { navn: string | null; epost: string | null; booking_live: number | null; catalog_hidden: number | null; is_test_provider: number | null }
     | undefined;
-  return row ?? null;
+  // O4-3: the confirmed address while a changed one awaits confirmation (flag off: unchanged).
+  return row ? { ...row, epost: gardssalgNotifyRecipient(provider_id, row.epost) ?? null } : null;
 }
 
 // Exported for O1-5 (gardssalg-cancel.ts): the producer's cancellation notice
@@ -1352,7 +1550,7 @@ export async function sendGatedProducerEmail(
     return false;
   }
   const { subject, htmlContent, textContent } = build(provider.epost);
-  await emailService.sendEmail({
+  const sendResult = await emailService.sendEmail({
     to: provider.epost,
     subject,
     htmlContent,
@@ -1364,6 +1562,8 @@ export async function sendGatedProducerEmail(
     from: crmFromHeader("experiences"),
     isTestSend: booking.is_test === 1,
   });
+  // O4-5b: file the sent mail in the booking's CRM thread (flag off: no-op; never throws).
+  archiveProducerBookingMail({ booking, kind, to: provider.epost, subject, textContent, htmlContent, sendResult });
   return true;
 }
 
@@ -1379,26 +1579,26 @@ export async function sendPrevisitReminderToProducer(booking: GardssalgBooking):
     ? slotNb(booking.respond_token_expires_at)
     : null;
   const deadlineHtml = deadlineFormatted
-    ? `Svarfrist: <strong>${deadlineFormatted}</strong> — uten svar innen fristen utløper forespørselen automatisk og gjesten får beskjed.`
-    : `Uten svar utløper forespørselen automatisk og gjesten får beskjed.`;
+    ? nbText("producer.deadline", { frist: `<strong>${deadlineFormatted}</strong>` })
+    : nbText("producer.deadlineNone");
   const deadlineText = deadlineFormatted
-    ? `Svarfrist: ${deadlineFormatted} — uten svar innen fristen utløper forespørselen automatisk og gjesten får beskjed.`
-    : `Uten svar utløper forespørselen automatisk og gjesten får beskjed.`;
+    ? nbText("producer.deadline", { frist: deadlineFormatted })
+    : nbText("producer.deadlineNone");
   return sendGatedProducerEmail(booking, "reminder", () => ({
-    subject: `Påminnelse: ubesvart reservasjonsforespørsel — ${booking.booking_ref}`,
+    subject: nbText("producer.reminder.subject", { ref: booking.booking_ref }),
     htmlContent: `
-<p>Hei,</p>
-<p>En reservasjonsforespørsel venter fortsatt på svar fra deg:</p>
+<p>${nbText("greeting.producer")}</p>
+<p>${nbText("producer.reminder.lead")}</p>
 <table style="border-collapse:collapse;font-family:sans-serif">
-  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Bookingref:</td><td>${booking.booking_ref}</td></tr>
-  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Dato/tid:</td><td>${slotFormatted}</td></tr>
-  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Antall:</td><td>${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</td></tr>
-  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Gjest:</td><td>${escEmailHtml(booking.guest_name)}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">${nbText("label.ref")}</td><td>${booking.booking_ref}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">${nbText("label.time")}</td><td>${slotFormatted}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">${nbText("label.party")}</td><td>${partyNb(booking.party_size)}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">${nbText("producer.label.guest")}</td><td>${escEmailHtml(booking.guest_name)}</td></tr>
 </table>
-<p><a href="${respondUrl}">Svar her: bekreft, foreslå nytt tidspunkt eller avslå</a>.</p>
+<p><a href="${respondUrl}">${nbText("producer.reminder.linkText")}</a>.</p>
 <p>${deadlineHtml}</p>
-<p>Hilsen<br>Opplevagent</p>`.trim(),
-    textContent: `Hei,\n\nEn reservasjonsforespørsel venter fortsatt på svar fra deg.\nBookingref: ${booking.booking_ref}\nDato/tid: ${slotFormatted}\nAntall: ${booking.party_size}\nGjest: ${booking.guest_name}\n\nSvar her (bekreft / foreslå nytt tidspunkt / avslå):\n${respondUrl}\n\n${deadlineText}\n\nHilsen\nOpplevagent`,
+<p>${signoffHtml()}</p>`.trim(),
+    textContent: `${nbText("greeting.producer")}\n\n${nbText("producer.reminder.textLead")}\n${nbText("label.ref")} ${booking.booking_ref}\n${nbText("label.time")} ${slotFormatted}\n${nbText("label.party")} ${booking.party_size}\n${nbText("producer.label.guest")} ${booking.guest_name}\n\n${nbText("producer.reminder.respondText")}\n${respondUrl}\n\n${deadlineText}\n\n${nbText("signoff")}`,
   }));
 }
 
@@ -1409,23 +1609,21 @@ export async function sendGuestDecisionToProducer(
 ): Promise<boolean> {
   const slotFormatted = slotNb(booking.slot_at);
   return sendGatedProducerEmail(booking, accepted ? "guest-accept" : "guest-decline", () => ({
-    subject: accepted
-      ? `Gjesten aksepterte det nye tidspunktet — ${booking.booking_ref}`
-      : `Gjesten avslo det nye tidspunktet — ${booking.booking_ref}`,
+    subject: nbText(accepted ? "producer.guestAccepted.subject" : "producer.guestDeclined.subject", { ref: booking.booking_ref }),
     htmlContent: accepted
       ? `
-<p>Hei,</p>
-<p>Gjesten ${escEmailHtml(booking.guest_name)} har akseptert det nye tidspunktet for reservasjon ${booking.booking_ref}.</p>
-<p>Avtalt tidspunkt er nå: <strong>${slotFormatted}</strong>.</p>
-<p>Bekreft oppmøte etter besøket via lenken i den opprinnelige e-posten.</p>
-<p>Hilsen<br>Opplevagent</p>`.trim()
+<p>${nbText("greeting.producer")}</p>
+<p>${nbText("producer.guestAccepted.body", { gjest: escEmailHtml(booking.guest_name), ref: booking.booking_ref })}</p>
+<p>${nbText("producer.guestAccepted.time", { tid: `<strong>${slotFormatted}</strong>` })}</p>
+<p>${nbText("producer.guestAccepted.attendance")}</p>
+<p>${signoffHtml()}</p>`.trim()
       : `
-<p>Hei,</p>
-<p>Gjesten ${escEmailHtml(booking.guest_name)} kunne dessverre ikke på det foreslåtte tidspunktet, og reservasjonsforespørselen ${booking.booking_ref} er avsluttet.</p>
-<p>Hilsen<br>Opplevagent</p>`.trim(),
+<p>${nbText("greeting.producer")}</p>
+<p>${nbText("producer.guestDeclined.body", { gjest: escEmailHtml(booking.guest_name), ref: booking.booking_ref })}</p>
+<p>${signoffHtml()}</p>`.trim(),
     textContent: accepted
-      ? `Hei,\n\nGjesten ${booking.guest_name} har akseptert det nye tidspunktet for reservasjon ${booking.booking_ref}.\nAvtalt tidspunkt er nå: ${slotFormatted}.\n\nHilsen\nOpplevagent`
-      : `Hei,\n\nGjesten ${booking.guest_name} kunne dessverre ikke på det foreslåtte tidspunktet, og reservasjonsforespørselen ${booking.booking_ref} er avsluttet.\n\nHilsen\nOpplevagent`,
+      ? `${nbText("greeting.producer")}\n\n${nbText("producer.guestAccepted.body", { gjest: booking.guest_name, ref: booking.booking_ref })}\n${nbText("producer.guestAccepted.time", { tid: slotFormatted })}\n\n${nbText("signoff")}`
+      : `${nbText("greeting.producer")}\n\n${nbText("producer.guestDeclined.body", { gjest: booking.guest_name, ref: booking.booking_ref })}\n\n${nbText("signoff")}`,
   }));
 }
 
@@ -1457,6 +1655,12 @@ export interface BookingFollowupResult {
   expired: number;
   expired_guests_notified: number;
   errors: number;
+  /**
+   * O4-5: guest reminders sent the day before a confirmed visit. Present only
+   * with GARDSSALG_GUEST_REMINDER_ENABLED on, so the result (and the admin
+   * POST response) is unchanged with the flag off.
+   */
+  guest_reminders_sent?: number;
 }
 
 export async function processBookingFollowups(
@@ -1631,6 +1835,13 @@ export async function processBookingFollowups(
     }
   }
 
+  // ── O4-5: the guest's reminder the day before a confirmed visit. Flag off:
+  // no query, no write, no send, and the result keeps its old shape. ──
+  if (gardssalgGuestReminderEnabled()) {
+    result.guest_reminders_sent = 0;
+    await processGuestReminders(now, result);
+  }
+
   return result;
 }
 
@@ -1704,4 +1915,242 @@ export function countBookingFollowupsDue(now: Date = new Date()): BookingFollowu
     }
   }
   return out;
+}
+
+// ─── O4-5: reminder to the guest the day before a confirmed visit ──────────
+// A2A dev-request 2026-11-12-opplevagent-o4-epost-og-tekster, slice O4-5.
+// Behind GARDSSALG_GUEST_REMINDER_ENABLED (off unless exactly "true", read on
+// every call like the other GARDSSALG_* flags). Run by the followup job above
+// (the hourly booking-followups tick in src/index.ts and POST
+// /admin/booking-followups); no scheduler of its own.
+//
+// Who: a visit the PRODUCER HAS CONFIRMED — pre_status 'provider_confirmed'
+// (the producer pressed «Bekreft», or the guest accepted the producer's
+// suggested time) while the post-visit status is still 'reserved'. Never a
+// pending (awaiting_provider), suggested (time_suggested), declined, expired
+// or cancelled booking, never one already resolved after the visit, and never
+// a row whose guest contact the 30-day sweep has cleared.
+//
+// When: «dagen før» (OA-2 B), as the subject says «I morgen» / «Tomorrow».
+// Both must hold at the send moment:
+//   1. the visit's Europe/Oslo calendar date is exactly the day after the
+//      send moment's Europe/Oslo date (calendar arithmetic, so DST-safe), and
+//   2. the visit is still in the future and at most
+//      GUEST_REMINDER_WINDOW_HOURS (24) away.
+// With the hourly tick a visit confirmed in good time gets the reminder about
+// 24 hours before (e.g. 15:00 the day before a 15:00 visit). A visit confirmed
+// later on the day before gets it on the next tick. A visit confirmed on the
+// day itself (or after the last tick of the day before) never gets one: there
+// is no moment at which «I morgen» would be true. A visit that has passed never
+// gets one. No separate minimum lead time: rule 1 already excludes the
+// same-day case the earlier 2-hour bound was for; the only short-lead case left
+// is a visit just after midnight reminded late the evening before, where
+// «I morgen» is still true.
+//
+// Once: guest_reminder_sent_at is claimed with a guarded UPDATE (… IS NULL,
+// plus the confirmed/reserved state) BEFORE the send; only the call whose
+// UPDATE changed the row sends, so two overlapping ticks cannot both send
+// (better-sqlite3 runs synchronously). A send that throws or reports failure
+// releases the claim, so the next tick retries while the window is open.
+//
+// Text: OA-2 B, verbatim, in the O4-2 register (guest.reminder.*). English only
+// with GARDSSALG_EMAIL_EN_ENABLED and guest_lang "en" (guestEmailLang()).
+// The cancel line links the status page only when GARDSSALG_CANCEL_ENABLED is
+// on (that is where the guest cancels); otherwise the guest is asked to reply
+// to the e-mail (reply-to kontakt@opplevagent.no, like every guest e-mail).
+
+export const GUEST_REMINDER_WINDOW_HOURS = 24;
+
+/** Off unless exactly "true", read on every call. */
+export function gardssalgGuestReminderEnabled(): boolean {
+  return process.env.GARDSSALG_GUEST_REMINDER_ENABLED === "true";
+}
+
+// Same rule as gardssalgCancelEnabled() in gardssalg-cancel.ts (which imports
+// this module, so it is not imported here).
+function guestCancelEnabled(): boolean {
+  return process.env.GARDSSALG_CANCEL_ENABLED === "true";
+}
+
+// The slot_at bounds only keep past and far-off visits out of the scan; the
+// exact rule is guestReminderDue(). They compare as text with a margin of a
+// day on each side, which is safe for every slot_at format in the table
+// (ISO with Z from createBooking(), legacy naked Oslo "YYYY-MM-DDTHH:MM", and
+// SQLite "YYYY-MM-DD HH:MM:SS"): all start with the date, and the margin
+// covers the time-zone offset and the ' ' / 'T' separator.
+const GUEST_REMINDER_CANDIDATES_SQL = `
+  SELECT * FROM gardssalg_bookings
+  WHERE status = 'reserved' AND pre_status = 'provider_confirmed'
+    AND guest_reminder_sent_at IS NULL
+    AND slot_at >= ? AND slot_at <= ?
+`;
+
+function guestReminderCandidates(nowMs: number): Record<string, unknown>[] {
+  const day = 24 * 3600_000;
+  return getDb(VERTICAL)
+    .prepare(GUEST_REMINDER_CANDIDATES_SQL)
+    .all(new Date(nowMs - day).toISOString(), new Date(nowMs + (GUEST_REMINDER_WINDOW_HOURS * 3600_000) + 2 * day).toISOString()) as Record<string, unknown>[];
+}
+
+const OSLO_DATE = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "Europe/Oslo", year: "numeric", month: "2-digit", day: "2-digit",
+});
+
+/** The Europe/Oslo calendar date of an instant, "YYYY-MM-DD". */
+export function osloDateOf(ms: number): string {
+  const parts = OSLO_DATE.formatToParts(new Date(ms));
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+  return `${get("year")}-${get("month")}-${get("day")}`;
+}
+
+/** The calendar day after "YYYY-MM-DD" (pure date arithmetic, no time zone). */
+function nextCalendarDay(ymd: string): string {
+  const [y, m, d] = ymd.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10);
+}
+
+type ReminderRow = GardssalgBooking & { guest_reminder_sent_at?: string | null };
+
+function hydrateReminderRow(raw: Record<string, unknown>): ReminderRow {
+  return { ...hydrate(raw), guest_reminder_sent_at: (raw.guest_reminder_sent_at as string | null) ?? null };
+}
+
+/** The visit start in epoch ms (a legacy naked slot is Oslo wall time); NaN when unreadable. */
+function visitStartMs(slot: string | null): number {
+  if (!slot) return NaN;
+  return Date.parse(osloDatetimeLocalToUtcIso(slot) ?? slot);
+}
+
+/**
+ * Whether the job sends the guest reminder for this booking at `nowMs`.
+ * Shared by the job and the dry-run count, so the two cannot disagree.
+ */
+export function guestReminderDue(booking: ReminderRow, nowMs: number): boolean {
+  if (booking.status !== "reserved" || booking.pre_status !== "provider_confirmed") return false;
+  if (booking.guest_reminder_sent_at) return false;
+  if (!booking.guest_email?.trim()) return false;
+  const startMs = visitStartMs(booking.slot_at);
+  if (!Number.isFinite(startMs)) return false;
+  const leadMs = startMs - nowMs;
+  if (leadMs <= 0 || leadMs > GUEST_REMINDER_WINDOW_HOURS * 3600_000) return false;
+  // «I morgen»: the visit's Oslo date is the day after today's Oslo date.
+  return osloDateOf(startMs) === nextCalendarDay(osloDateOf(nowMs));
+}
+
+/** The reminder e-mail (OA-2 B). Values are escaped in the HTML; the status URL is a link there. */
+export function buildGuestReminderEmail(
+  booking: GardssalgBooking,
+): { subject: string; htmlContent: string; textContent: string; lang: EmailLang } {
+  const lang = guestEmailLang(booking);
+  const provider = loadReceiptProvider(booking.provider_id);
+  const statusUrl = guestStatusUrl(booking);
+  // Cancel line only when the guest can cancel on the status page; otherwise
+  // (flag off, or a row without a status link) the reply line.
+  const withCancel = guestCancelEnabled() && !!statusUrl;
+  let body = emailText("guest.reminder.body", lang)
+    .split("\n\n")
+    .map((p) => (!withCancel && p.includes("{statusside}") ? emailText("guest.reminder.replyLine", lang) : p))
+    .join("\n\n");
+  // No address on file: "Sted: {produsent}" rather than a dangling comma.
+  if (!provider.sted) body = body.split("{produsent}, {sted}").join("{produsent}");
+  const raw: Record<string, string> = {
+    gjest: booking.guest_name,
+    produsent: provider.navn,
+    sted: provider.sted,
+    tid: lang === "en" ? slotEn(booking.slot_at) : slotNb(booking.slot_at),
+    antall: String(booking.party_size),
+    ref: booking.booking_ref,
+    statusside: statusUrl ?? "",
+  };
+  const { text, html } = renderEmailBody(body, raw, ["statusside"]);
+  const subject = fillEmailText(emailText("guest.reminder.subject", lang), { produsent: provider.navn, ref: booking.booking_ref });
+  return { subject, htmlContent: html, textContent: text, lang };
+}
+
+/** Sends the reminder; true when the mailer accepted it. */
+export async function sendGuestReminder(booking: GardssalgBooking): Promise<boolean> {
+  const mail = buildGuestReminderEmail(booking);
+  const r = await emailService.sendEmail({
+    to: booking.guest_email,
+    isTestSend: booking.is_test === 1,
+    subject: mail.subject,
+    htmlContent: mail.htmlContent,
+    textContent: mail.textContent,
+    replyTo: "kontakt@opplevagent.no",
+    // Same sender identity as the other guest e-mails (Steg 3 / funn 2).
+    from: crmFromHeader("experiences"),
+  });
+  return r?.success !== false;
+}
+
+async function processGuestReminders(now: Date, result: BookingFollowupResult): Promise<void> {
+  const db = getDb(VERTICAL);
+  const nowMs = now.getTime();
+  const rows = guestReminderCandidates(nowMs);
+  for (const raw of rows) {
+    const booking = hydrateReminderRow(raw);
+    if (!guestReminderDue(booking, nowMs)) continue;
+    const stamp = now.toISOString();
+    try {
+      // Claim BEFORE sending — the guarded UPDATE is the concurrency lock and
+      // re-checks the state the SELECT saw (cancelled or resolved in between
+      // → no claim, no send).
+      const claim = db.prepare(`
+        UPDATE gardssalg_bookings SET guest_reminder_sent_at = ?
+        WHERE booking_id = ? AND guest_reminder_sent_at IS NULL
+          AND status = 'reserved' AND pre_status = 'provider_confirmed'
+      `).run(stamp, booking.booking_id);
+      if (claim.changes !== 1) continue;
+      let sent = false;
+      try {
+        sent = await sendGuestReminder(booking);
+      } catch (err) {
+        db.prepare("UPDATE gardssalg_bookings SET guest_reminder_sent_at = NULL WHERE booking_id = ? AND guest_reminder_sent_at = ?")
+          .run(booking.booking_id, stamp);
+        throw err;
+      }
+      if (sent) {
+        result.guest_reminders_sent = (result.guest_reminders_sent ?? 0) + 1;
+      } else {
+        // Not handed to the mailer: release so the next tick retries.
+        db.prepare("UPDATE gardssalg_bookings SET guest_reminder_sent_at = NULL WHERE booking_id = ? AND guest_reminder_sent_at = ?")
+          .run(booking.booking_id, stamp);
+        result.errors++;
+        console.error(`[booking-previsit] guest reminder not sent for ${booking.booking_ref}; retried next run`);
+      }
+    } catch (err) {
+      result.errors++;
+      console.error(`[booking-previsit] guest reminder failed for ${booking.booking_ref}:`, err);
+    }
+  }
+}
+
+export interface GuestReminderDryRun {
+  /** Whether GARDSSALG_GUEST_REMINDER_ENABLED is on (the job only sends when it is). */
+  enabled: boolean;
+  /** Reminders the job would send now if the flag were on. */
+  would_send: number;
+  booking_refs: string[];
+  window_hours: number;
+  /** The date rule: the visit's Europe/Oslo date is the day after today's. */
+  rule: "oslo_day_before";
+}
+
+// Read-only (no claim, no send): which reminders processBookingFollowups()
+// would send at `now`. Counts regardless of the flag, and says whether it is on.
+export function countGuestRemindersDue(now: Date = new Date()): GuestReminderDryRun {
+  const nowMs = now.getTime();
+  const refs: string[] = [];
+  for (const raw of guestReminderCandidates(nowMs)) {
+    const booking = hydrateReminderRow(raw);
+    if (guestReminderDue(booking, nowMs)) refs.push(booking.booking_ref);
+  }
+  refs.sort();
+  return {
+    enabled: gardssalgGuestReminderEnabled(),
+    would_send: refs.length,
+    booking_refs: refs,
+    window_hours: GUEST_REMINDER_WINDOW_HOURS,
+    rule: "oslo_day_before",
+  };
 }
