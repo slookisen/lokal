@@ -1163,6 +1163,86 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
       });
       expDb.prepare(`DELETE FROM experience_providers WHERE id LIKE 'q-%'`).run();
       expDb.prepare(`DELETE FROM experience_outreach_sent_log WHERE provider_id LIKE 'q-%'`).run();
+
+      // ══ (r) dev-request 2026-10-08-outreach-sendinger-mangler-epost-i-rapport:
+      // a producer already mailed in rounds 1-3 whose round 4 has no template
+      // shows up as no_template_for_touch; that row carries the latest REAL
+      // send's recipient_email + last_sent_at (is_test sends ignored). A
+      // no_template_for_touch row without any real send gets neither key.
+      // Reporting only: reasons and counts stay what eligibility says. ════
+      const rFixture = (id: string, orgNr: string, epost: string) =>
+        insertProviderRaw.run({
+          id, navn: `R ${id}`, org_nr: orgNr, kommune: "Voss",
+          rfb_seed_source: "rfb-seed", producer_type: "sideri",
+          epost, telefon: null, hjemmeside: null,
+          about_text: REALISTIC_ABOUT_TEXT, visit_text: null, opening_hours_text: null,
+          products: "Sider", content_source: "provider_site",
+          booking_live: 0, catalog_hidden: 0, slug: `${id}-gard`, field_provenance: JSON.stringify(qSecondLine),
+          brreg_verified: 1, antall_ansatte: 3, naeringskode: null,
+        });
+      const rLog = (providerId: string, to: string, daysAgo: number, template: string | null, isTest: 0 | 1): string => {
+        const at = new Date(Date.now() - daysAgo * 86400_000).toISOString();
+        expDb
+          .prepare(
+            `INSERT INTO experience_outreach_sent_log (provider_id, recipient_email, sent_at, channel, is_test, template)
+             VALUES (?, ?, ?, 'email', ?, ?)`,
+          )
+          .run(providerId, to, at, isTest, template);
+        return at;
+      };
+      // r-01: rounds 1-3 sent (round 3 to a changed address), newest is a test send.
+      rFixture("r-01-round4", "500000001", "post@r01-fixture.no");
+      rLog("r-01-round4", "gammel@r01-fixture.no", 300, "personal-v4", 0);
+      rLog("r-01-round4", "gammel@r01-fixture.no", 200, "personal-v5-round2", 0);
+      const r01LastAt = rLog("r-01-round4", "post@r01-fixture.no", 100, "personal-v5-round3", 0);
+      rLog("r-01-round4", "test@example.invalid", 90, "personal-v5-round3", 1);
+      // r-02: never really sent (only a test send); round 1 made template-less below.
+      rFixture("r-02-nosend", "500000002", "post@r02-fixture.no");
+      rLog("r-02-nosend", "test@example.invalid", 10, "personal-v4", 1);
+      const byRound = opplevelserModule.GARDSSALG_OUTREACH_TEMPLATE_BY_ROUND as Record<number, string>;
+      const round1Template = byRound[1];
+      delete byRound[1];
+      try {
+        await withDailyCapEnv("10", async () => {
+          const r = await callRoute(opplevelserRouter, { headers: auth });
+          assertEq(r.status, 200, "r0: daily-prep -> 200");
+          const rExcl = new Map((r.body.excluded as any[]).map((e) => [e.provider_id, e]));
+          const row1: any = rExcl.get("r-01-round4");
+          assertEq(row1?.reason, "no_template_for_touch", "r1: 3 real sends, round 4 has no template -> no_template_for_touch");
+          assertEq(
+            [row1?.recipient_email, row1?.last_sent_at],
+            ["post@r01-fixture.no", r01LastAt],
+            "r2: row carries recipient_email + last_sent_at of the latest real send",
+          );
+          assertTrue(row1?.recipient_email !== "test@example.invalid", "r3: an is_test send is never reported as the recipient");
+          assertEq(row1?.quarantine_until, undefined, "r4: no quarantine_until on a round-rule row");
+          const row2: any = rExcl.get("r-02-nosend");
+          assertEq(row2?.reason, "no_template_for_touch", "r5: no real send, round 1 template-less -> no_template_for_touch");
+          assertEq(
+            Object.keys(row2 ?? {}).filter((k) => row2[k] !== undefined).sort(),
+            ["name", "provider_id", "reason"],
+            "r6: a no_template_for_touch row without a real send gets no recipient_email/last_sent_at",
+          );
+          // AC2: counts unchanged — excluded reasons agree with eligibility, totals agree.
+          const elig = opplevelserModule.computeGardssalgOutreachSendEligibility(expDb, ["r-01-round4", "r-02-nosend"], {
+            skipRecipientDedupe: true,
+          });
+          assertEq(
+            elig.map((e: any) => (e.eligible ? "eligible" : e.reason)),
+            ["no_template_for_touch", "no_template_for_touch"],
+            "r7: eligibility gives the same reasons the excluded rows show",
+          );
+          assertEq(r.body.pool.excluded_total, (r.body.excluded as any[]).length, "r8: pool.excluded_total = excluded rows");
+          assertTrue(
+            !(r.body.candidates as any[]).some((c) => c.provider_id.startsWith("r-")),
+            "r9: neither r-fixture is a candidate",
+          );
+        });
+      } finally {
+        byRound[1] = round1Template;
+      }
+      expDb.prepare(`DELETE FROM experience_providers WHERE id LIKE 'r-%'`).run();
+      expDb.prepare(`DELETE FROM experience_outreach_sent_log WHERE provider_id LIKE 'r-%'`).run();
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-outreach-daily-prep: unexpected error: " + String(err?.stack || err?.message || err));

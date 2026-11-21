@@ -22305,7 +22305,9 @@ export function computeGardssalgOutreachDailyPrep(expDb: ReturnType<typeof getEx
     address_published?: boolean;
     // dev-request 2026-10-08-outreach-sendinger-mangler-epost-i-rapport:
     // the address of this lane's latest real send to this provider, on
-    // own-cooldown and max_touch_reached rows only (reporting, not a filter).
+    // own-cooldown, max_touch_reached and round-rule rows (promise_given /
+    // no_template_for_touch / round_stopped_optout_rate) whose provider has a
+    // real send (reporting, not a filter).
     recipient_email?: string;
     // dev-request 2026-11-20-opplevagent-utsending-hele-sperrelista-og-rfb-svar:
     // the blocklist key that matched / the verticals a cross-platform reply came from.
@@ -22541,9 +22543,12 @@ export function computeGardssalgOutreachDailyPrep(expDb: ReturnType<typeof getEx
   //   which is what the cooldown check matched on), so last_sent_at and
   //   recipient_email always describe one send, also when the address is
   //   shared with another provider.
-  // - max_touch_reached: the provider's latest send-log row (the cap counts
-  //   per provider), plus its sent_at as last_sent_at. Set after
-  //   quarantine_until above, so these rows get none: the cap is no quarantine.
+  // - max_touch_reached and the round-rule reasons (promise_given /
+  //   no_template_for_touch / round_stopped_optout_rate): the provider's
+  //   latest send-log row (the cap and the rounds count per provider), plus
+  //   its sent_at as last_sent_at. Set after quarantine_until above, so these
+  //   rows get none: neither the cap nor a round rule is a quarantine. A
+  //   provider with no real send keeps the row exactly as it was (no keys).
   // Reserved rows (notes = 'reserved', send outcome unknown) count, as they do
   // for cooldown and the cap. Cross-platform cooldown rows are not this
   // lane's sends and stay unchanged.
@@ -22559,11 +22564,17 @@ export function computeGardssalgOutreachDailyPrep(expDb: ReturnType<typeof getEx
       WHERE provider_id = ? AND is_test = 0
       ORDER BY sent_at DESC, id DESC LIMIT 1`,
   );
+  const latestOwnSendReasons = new Set([
+    "max_touch_reached",
+    "promise_given",
+    "no_template_for_touch",
+    "round_stopped_optout_rate",
+  ]);
   for (const row of excluded) {
     if (row.reason === "cooldown_suppressed" && !row.cross_platform && row.last_sent_at) {
       const hit = cooldownSendStmt.get(row.provider_id, row.last_sent_at) as { recipient_email: string } | undefined;
       if (hit) row.recipient_email = hit.recipient_email;
-    } else if (row.reason === "max_touch_reached" || row.reason === "promise_given") {
+    } else if (latestOwnSendReasons.has(row.reason)) {
       const last = latestOwnSendStmt.get(row.provider_id) as { recipient_email: string; sent_at: string } | undefined;
       if (!last) continue;
       row.recipient_email = last.recipient_email;
