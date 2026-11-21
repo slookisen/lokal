@@ -55308,6 +55308,30 @@ runSerial(async () => {
   }
 });
 
+// dev-request selvregistrering-uten-nettside, slice F1: the public POST
+// /register accepts a producer without a website (no own-origin url) and
+// without coordinates (no Oslo 59.91/10.75 for every city); optional org.nr
+// (MOD11, → `org_nr:` tag for the pre-check), phone and «Hvor selger du?»;
+// plus the read-only dry-run selection for already-stored bad rows. Own
+// in-memory DB pinned on getDb(), swaps REGISTRATION_PRECHECK_ENABLED /
+// REGISTRATION_CONFIRMATION_EMAIL_ENABLED (restored in finally) — runSerial,
+// tail position.
+runSerial(async () => {
+  console.log("\n── F1: selvregistrering uten nettside ──");
+  try {
+    const { runSelvregUtenNettsideTests } = require("../src/routes/marketplace-selvreg-uten-nettside.test") as
+      typeof import("../src/routes/marketplace-selvreg-uten-nettside.test");
+    const r = await runSelvregUtenNettsideTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("selvreg-uten-nettside: " + f);
+    console.log(`  selvreg-uten-nettside: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("selvreg-uten-nettside: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-11-15-rfb-adressekonflikt-smal-regel-torrkjoring, G1:
 // GET /admin/address-conflict-breakdown, a READ-ONLY count of the
 // address_conflict / address_uncorroborated cohort (AK1 no writes, AK2

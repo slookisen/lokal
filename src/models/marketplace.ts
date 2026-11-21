@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { validOwnerOrgNr } from "../services/debio-register-client";
 
 // ─── Agent Marketplace Models ─────────────────────────────────
 // These models power Lokal as a REGISTRY — the discovery layer
@@ -21,7 +22,17 @@ export const AgentRegistrationSchema = z.object({
   contactEmail: z.string().email(),
 
   // A2A standard fields
-  url: z.string().url(), // Agent's service endpoint
+  // Agent's service endpoint / the producer's own website.
+  // dev-request selvregistrering-uten-nettside (F1): OPTIONAL. A REKO-ring or
+  // market seller often has no website, and the /selger form used to fill the
+  // gap with our own origin. Missing or "" = "no known website" — the same
+  // convention AdminRegistrationSchema and every `url` reader already use
+  // (NULLIF(TRIM(a.url), ''), `agent.url || …`). When present it must be an
+  // http(s) URL.
+  url: z.union([
+    z.literal(""),
+    z.string().url().refine((v) => /^https?:\/\//i.test(v), { message: "url must be an http(s) URL" }),
+  ]).default(""),
   version: z.string().default("1.0.0"),
   capabilities: z.object({
     streaming: z.boolean().default(false),
@@ -49,17 +60,35 @@ export const AgentRegistrationSchema = z.object({
   ]),
 
   // Location (for geo-matching)
+  // F1: lat/lng are optional — a registrant may give only a city. The row is
+  // then stored with city and NULL coordinates, and the agents geocode
+  // worker (services/agents-geocode-worker.ts, Tier B) places it from the
+  // city through the hardened Kartverket lookup. Never fabricate coordinates
+  // (the /selger form used to send Oslo's 59.91/10.75 for every city).
   location: z.object({
-    lat: z.number().min(-90).max(90),
-    lng: z.number().min(-180).max(180),
+    lat: z.number().min(-90).max(90).optional(),
+    lng: z.number().min(-180).max(180).optional(),
     city: z.string(),
     radiusKm: z.number().optional(), // Service radius
+  }).refine((l) => (l.lat === undefined) === (l.lng === undefined), {
+    message: "lat and lng must be given together",
   }).optional(),
 
   // Lokal-specific metadata
   categories: z.array(z.string()).default([]), // ["vegetables", "fruit", "dairy"]
   tags: z.array(z.string()).default([]),       // ["organic", "seasonal", "budget"]
   languages: z.array(z.string()).default(["no"]), // ISO 639-1
+
+  // F1 (selvregistrering uten nettside) — optional registration-only inputs.
+  // Not stored on the agent row as such: POST /register turns orgNr into the
+  // `org_nr:<9 digits>` tag the registration pre-check reads as a
+  // self-reported org.nr, and writes phone / salesPlace to agent_knowledge
+  // (phone, delivery_options). Omitted from RegisteredAgentSchema below.
+  orgNr: z.string().refine((v) => validOwnerOrgNr(v) !== null, {
+    message: "orgNr must be a valid 9-digit Norwegian organisation number",
+  }).optional(),
+  phone: z.string().trim().min(1).max(40).optional(),
+  salesPlace: z.string().trim().min(1).max(120).optional(),
 });
 
 export type AgentRegistration = z.infer<typeof AgentRegistrationSchema>;
@@ -126,7 +155,20 @@ export type AdminRegistration = z.infer<typeof AdminRegistrationSchema>;
 
 // ─── Registered Agent (stored in registry) ────────────────────
 
-export const RegisteredAgentSchema = AgentRegistrationSchema.extend({
+export const RegisteredAgentSchema = AgentRegistrationSchema.omit({
+  orgNr: true,
+  phone: true,
+  salesPlace: true,
+}).extend({
+  // A stored agent's `location` exists only when it has coordinates
+  // (marketplace-registry rowToAgent), so lat/lng stay required here even
+  // though the registration input may omit them (F1).
+  location: z.object({
+    lat: z.number().min(-90).max(90),
+    lng: z.number().min(-180).max(180),
+    city: z.string(),
+    radiusKm: z.number().optional(),
+  }).optional(),
   id: z.string().uuid(),
   apiKey: z.string(), // For authentication
   registeredAt: z.string().datetime(),
