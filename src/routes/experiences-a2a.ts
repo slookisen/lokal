@@ -857,7 +857,7 @@ router.get("/a2a", (_req: Request, res: Response) => {
 
 // ─── POST /a2a — JSON-RPC 2.0 dispatcher ─────────────────────
 // «Klikk fra AI-svar» slice 3: profile links in the answer are tagged for AI (utm_medium=a2a).
-router.post("/a2a", bookGardssalgLimiter, aiProfileLinksJson("a2a"), (req: Request, res: Response) => {
+router.post("/a2a", aiProfileLinksJson("a2a"), bookGardssalgLimiter, (req: Request, res: Response) => {
   const body = req.body && typeof req.body === "object" ? req.body : null;
   if (!body) {
     res.status(400).json(rpcErr(null, -32700, "Parse error: body must be JSON. Set Content-Type: application/json."));
