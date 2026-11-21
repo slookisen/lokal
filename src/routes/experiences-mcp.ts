@@ -51,7 +51,7 @@ import { isPlausibleNorwayCoord } from "../services/geo-distance";
 import { fylkeEquivalents, normaliseFylke } from "../services/norway-fylke";
 import { outsideNorwayPlace } from "../services/outside-norway";
 import { isDisplayablePhone } from "../services/contact-normalizer";
-import { resolveGardssalgProducerTypeFilter } from "../services/drink-taxonomy";
+import { classifyDrinkSubcategoryFromProducerType, resolveGardssalgProducerTypeFilter } from "../services/drink-taxonomy";
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -123,8 +123,22 @@ import {
   guestRefEnabled,
   issueGuestRef,
   guestStatusUrl,
+  verifyGuestRef,
+  guestDecisionUrl,
+  previsitExpiryDueMs,
+  osloDatetimeLocalToUtcIso,
+  type GardssalgBooking,
 } from "../services/booking-store";
-import { dropFristSentences, fillOa1, formatOsloInstant } from "../services/gardssalg-honest-receipt";
+import { dropFristSentences, fillOa1, formatOsloInstant, loadReceiptProvider } from "../services/gardssalg-honest-receipt";
+import {
+  getCancelInfo,
+  gardssalgCancelEnabled,
+  guestCancelMode,
+  guestCancel,
+  sendGuestCancelToProducer,
+  CANCEL_REASON_MAX,
+  type GuestCancelMode,
+} from "../services/gardssalg-cancel";
 import { producerNotifyAddressStatus } from "../services/gardssalg-booking-followup";
 import { checkGardssalgBookingGuard, duplicateMessage, capReachedMessage } from "../services/gardssalg-booking-caps";
 // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 item 7: one
@@ -140,6 +154,7 @@ import {
 // — the SAME shared choke point POST /api/opplevelser/book and the no-JS SSR
 // fallback use, never re-derived here.
 import { checkBookingSlotAllowed } from "../services/gardssalg-opening-hours";
+import { gardssalgVisitFacts } from "../services/gardssalg-visit-facts";
 // dev-request 2026-09-16-opplevagent-en-setning-booking-via-ai («book et møte
 // hos X fredag 20. okt kl 10»): name → provider resolution, the requested-
 // weekday guard and the shared honest-outcome payloads, all called BEFORE the
@@ -159,12 +174,21 @@ import {
 } from "../services/gardssalg-booking-resolve";
 
 import { EXPERIENCES_LIST_HTML, EXPERIENCE_DETAIL_HTML } from "./opplevagent-widgets";
-import { createMcpRateLimiters, MCP_RATE_LIMIT_PROFILES } from "../middleware/mcp-rate-limit";
+import rateLimit from "express-rate-limit";
+import {
+  createMcpRateLimiters,
+  MCP_RATE_LIMIT_PROFILES,
+  googleRangesAwareMax,
+  isSideEffectToolCall,
+  mcpIpKey,
+  sendMcpRateLimited,
+} from "../middleware/mcp-rate-limit";
 import { conversationService, buildRequestMeta, type RequestMeta } from "../services/conversation-service";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 import { tagMcpToolResults } from "../middleware/ai-profile-links";
 import { aiClientFromHeaders, sourceClientLabel } from "../utils/url-utm";
+import { classifyBookGardssalgResult, recordGardssalgFunnelEvent, type GardssalgFunnelOutcome } from "../services/gardssalg-mcp-funnel";
 import { isAsPublicView } from "../services/agent-visibility";
 import { capName } from "../utils/free-text";
 import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
@@ -255,6 +279,39 @@ export const EXPERIENCES_MCP_SIDE_EFFECT_TOOLS: ReadonlySet<string> = MCP_RATE_L
 // consumer key, else per IP), then the book_gardssalg quota. Not
 // jsonRpcLimiter, which /a2a keeps. See middleware/mcp-rate-limit.ts.
 router.use(createMcpRateLimiters({ ...MCP_RATE_LIMIT_PROFILES.experiences, isKnownSession: hasExperiencesMcpSession }).chain);
+
+// O5-2: get_gardssalg_booking gets its own, stricter quota on top of the chain
+// above, built the same way as the chain's side-effect quota (JSON-RPC 429
+// body, IP key, Google-ranges aware) but in a separate bucket, so status
+// lookups and visit requests never use up each other's calls. Skipped for
+// every other request, so nothing else changes.
+export const GARDSSALG_STATUS_LOOKUP_TOOLS: ReadonlySet<string> = new Set(["get_gardssalg_booking"]);
+export const GARDSSALG_STATUS_LOOKUP_LIMIT = { windowMs: 60 * 1000, max: 20 } as const;
+router.use(rateLimit({
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { trustProxy: false, creationStack: false },
+  handler: sendMcpRateLimited,
+  windowMs: GARDSSALG_STATUS_LOOKUP_LIMIT.windowMs,
+  max: googleRangesAwareMax(GARDSSALG_STATUS_LOOKUP_LIMIT.max, mcpIpKey),
+  keyGenerator: mcpIpKey,
+  skip: (req) => !isSideEffectToolCall(req.body, GARDSSALG_STATUS_LOOKUP_TOOLS),
+}));
+
+// O5-3: cancel_gardssalg_booking gets its own bucket the same way (separate
+// from the status lookups and from book_gardssalg's side-effect quota).
+export const GARDSSALG_CANCEL_TOOLS: ReadonlySet<string> = new Set(["cancel_gardssalg_booking"]);
+export const GARDSSALG_CANCEL_LIMIT = { windowMs: 60 * 1000, max: 10 } as const;
+router.use(rateLimit({
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { trustProxy: false, creationStack: false },
+  handler: sendMcpRateLimited,
+  windowMs: GARDSSALG_CANCEL_LIMIT.windowMs,
+  max: googleRangesAwareMax(GARDSSALG_CANCEL_LIMIT.max, mcpIpKey),
+  keyGenerator: mcpIpKey,
+  skip: (req) => !isSideEffectToolCall(req.body, GARDSSALG_CANCEL_TOOLS),
+}));
 
 // ─── Conversation logging (dev-request 2026-07-10-opplevagent-conversation-logging, slice 1) ──
 // Deliberate, narrow exception to this module's content-isolation from the rfb DB:
@@ -612,6 +669,329 @@ export function bookOkMessage(vars: { ref: string; produsent: string; epost: str
   return `${one("nb")} / ${one("en")}`;
 }
 
+// O5-4 (same dev-request): book_gardssalg `preview`, what is shared with the
+// producer, the privacy link and the age line; plus the C1/C2 tool texts. All
+// behind GARDSSALG_MCP_PREVIEW_ENABLED (off unless exactly "true"; read when a
+// session's tools are registered and again on each call). Off: tools/list and
+// every result are byte-identical. Texts verbatim from the owner-approved
+// O5-4 package (C1/C2/C3); do not reword here.
+export function gardssalgPreviewEnabled(): boolean {
+  return process.env.GARDSSALG_MCP_PREVIEW_ENABLED === "true";
+}
+
+export const DISCOVER_GARDSSALG_TITLE = { off: "Find drink producers to visit for a tasting (gårdssalg)", on: "Find drink producers in Norway that accept visit requests (gårdssalg)" } as const;
+export const DISCOVER_GARDSSALG_LEAD = {
+  off:
+    "Use this to plan a visit or tasting at a Norwegian drink producer (brewery, cidery, winery, distillery, " +
+    "meadery, farm café) and find ones that accept visit requests; it does not sell or order products. " +
+    "It searches opplevagent.no's gårdssalg (farm-sale) vertical of Brreg-registered drink producers to visit (besøk, smaking) ",
+  on:
+    "Use this to plan a visit to a Norwegian drink producer (brewery, cidery, winery, distillery, " +
+    "meadery, farm café) and find ones that accept visit requests; it does not sell or order products. " +
+    "It searches opplevagent.no's gårdssalg (farm-sale) vertical of Brreg-registered drink producers to visit (besøk) ",
+} as const;
+export const BOOK_GARDSSALG_TITLE = { off: "Request a visit or tasting at a drink producer (pending until the producer replies)", on: "Request a visit at a drink producer (pending until the producer replies)" } as const;
+export const BOOK_GARDSSALG_LEAD = {
+  off:
+    "Use this to request a visit or tasting (besøk, smaking) at a Norwegian gårdssalg drink producer found with " +
+    "discover_gardssalg or named by the guest; it sends a visit request and does not sell or order products. ",
+  on:
+    "Use this to request a visit (besøk) at a Norwegian gårdssalg drink producer found with " +
+    "discover_gardssalg or named by the guest; it sends a visit request and does not sell or order products. ",
+} as const;
+/** C2, appended last to book_gardssalg's description with the flag on. */
+export const BOOK_GARDSSALG_PREVIEW_DESCRIPTION_TAIL =
+  "With preview: true the tool runs every check and returns the summary the guest should see, without storing or sending anything. On success the response carries guest_ref and status_url. Keep guest_ref for this conversation: it is needed to check the status or cancel with get_gardssalg_booking and cancel_gardssalg_booking. The response also lists what is shared with the producer and links to the privacy policy.";
+
+export const BookGardssalgPreviewField = {
+  preview: z.boolean().optional().describe(
+    "Set to true to run every check and return the summary the guest should see, without storing or sending anything. Omit to send the request."
+  ),
+};
+
+/** C3 result texts, "norsk / English" in one string. */
+export const BOOK_PREVIEW_TEXTS = {
+  preview: "Forhåndsvisning. Ingenting er sendt ennå. Forespørsel om besøk hos {produsent}, {tid}, {antall} personer. / Preview. Nothing has been sent yet. Visit request to {produsent}, {tid}, {antall} guests.",
+  shares: "Dette deles med produsenten: navn, e-postadresse, telefonnummer hvis det er oppgitt, antall personer, tidspunkt og kommentar. / Shared with the producer: name, email address, phone number if given, number of guests, time and note.",
+  age: "Produsenten kontrollerer alder ved kjøp og servering, og kan ha egen aldersgrense for hele eller deler av besøket. / The producer checks age for any purchase or serving, and may set its own age limit for all or part of the visit.",
+  privacy: "Slik behandler vi personopplysninger: {privacy_url} / How we handle personal data: {privacy_url}",
+} as const;
+
+/**
+ * Alcohol production: a non-empty alcohol_categories, else any producer_type
+ * but a gårdskafé (the gårdssalg vertical is drink producers; an unknown type
+ * counts as drink, as isGardssalgDrinkType() in route-corridor-service.ts).
+ */
+export function gardssalgProducerHasAlcohol(p: { producer_type?: unknown; alcohol_categories?: unknown } | null): boolean {
+  try {
+    const cats = JSON.parse(String(p?.alcohol_categories ?? "[]"));
+    if (Array.isArray(cats) && cats.length > 0) return true;
+  } catch { /* malformed: fall through to the type */ }
+  return classifyDrinkSubcategoryFromProducerType(typeof p?.producer_type === "string" ? p.producer_type : null) !== "gårdskafé";
+}
+
+/** shares + (age) + privacy lines and the structured fields, for preview and success. */
+export function gardssalgPreviewNotices(opts: { hasAlcohol: boolean; guestPhone?: string; notes?: string }) {
+  const privacyUrl = BRAND_ENTITIES.experiences.privacyUrl;
+  const lines = [
+    BOOK_PREVIEW_TEXTS.shares,
+    ...(opts.hasAlcohol ? [BOOK_PREVIEW_TEXTS.age] : []),
+    BOOK_PREVIEW_TEXTS.privacy.split("{privacy_url}").join(privacyUrl),
+  ];
+  const shared = ["guest_name", "guest_email", ...(opts.guestPhone ? ["guest_phone"] : []), "party_size", "slot_at", ...(opts.notes ? ["notes"] : [])];
+  return { lines, privacy_url: privacyUrl, shared_with_producer: shared };
+}
+
+/** C3 `book.preview`, filled; {tid} as «Friday 12 December 2026 at 13:00». */
+export function bookPreviewMessage(vars: { produsent: string; slotAt: string; antall: number }): string {
+  const iso = osloDatetimeLocalToUtcIso(vars.slotAt) ?? vars.slotAt;
+  const [nb, en] = BOOK_PREVIEW_TEXTS.preview.split(" / ");
+  const fill = (t: string, lang: "nb" | "en") =>
+    fillOa1(t, { produsent: vars.produsent, tid: formatOsloInstant(iso, lang), antall: String(vars.antall) });
+  return `${fill(nb, "nb")} / ${fill(en, "en")}`;
+}
+
+// O5-5 (same dev-request): discover_gardssalg rows carry the producer's own
+// opening hours text and visit description, behind
+// GARDSSALG_MCP_VISIT_FACTS_ENABLED (off unless exactly "true"; read on each
+// call). Off: every row is byte-identical. Only owner-stated, rule-checked
+// text — see services/gardssalg-visit-facts.ts. No tools/list change: the
+// tool declares no outputSchema.
+export function gardssalgVisitFactsEnabled(): boolean {
+  return process.env.GARDSSALG_MCP_VISIT_FACTS_ENABLED === "true";
+}
+
+// O5-2 (same dev-request): get_gardssalg_booking, behind
+// GARDSSALG_MCP_STATUS_TOOL_ENABLED (off unless exactly "true"; read when a
+// session's tools are registered). Off: the tool is not registered and
+// tools/list is byte-identical.
+export function gardssalgStatusToolEnabled(): boolean {
+  return process.env.GARDSSALG_MCP_STATUS_TOOL_ENABLED === "true";
+}
+
+export const GetGardssalgBookingInputSchema = {
+  booking_ref: z.string().max(200).describe("booking_ref from the book_gardssalg result."),
+  guest_ref: z.string().max(200).describe("guest_ref from the book_gardssalg result."),
+};
+
+// Verbatim from the approved text package OA-2 §C4 (A2A marketing-drafts/
+// 2026-11-12-opplevagent-tekstpakke-oa-2.md, approved by Daniel 2026-11-15).
+// Do not reword here. Keys are the package's `status.*` keys.
+export const GET_GARDSSALG_BOOKING_TITLE = "Check the status of a visit request";
+export const GET_GARDSSALG_BOOKING_SHORT_TITLE = "Get visit request status";
+export const GET_GARDSSALG_BOOKING_DESCRIPTION =
+  "Use this to look up a visit request made with book_gardssalg. It returns the current status (waiting for the producer, confirmed, new time suggested, declined, expired or cancelled), the agreed or suggested time, the reply deadline, the guest's own status page and, when the producer has suggested a new time, the link where the guest replies. It needs the reference and the guest_ref that book_gardssalg returned. It only reads and never changes the request. If the reference and guest_ref do not match a request, it answers that the request was not found.";
+export const GARDSSALG_STATUS_TEXT = {
+  pending: { nb: "Venter på svar fra {produsent}. Svarfrist: {frist}.", en: "Waiting for a reply from {produsent}. Reply deadline: {frist}." },
+  confirmed: { nb: "Besøket er bekreftet: {tid}.", en: "The visit is confirmed: {tid}." },
+  suggested: {
+    nb: "{produsent} foreslår {nytt_tidspunkt}. Gjesten svarer her: {svarlenke}. Svarfrist: {frist}.",
+    en: "{produsent} suggests {nytt_tidspunkt}. The guest replies here: {svarlenke}. Reply deadline: {frist}.",
+  },
+  declined: { nb: "{produsent} kunne ikke bekrefte forespørselen.", en: "{produsent} could not confirm the request." },
+  expired: { nb: "Forespørselen utløp uten svar.", en: "The request expired without a reply." },
+  cancelledByGuest: { nb: "Avlyst av gjesten {avlyst_tid}.", en: "Cancelled by the guest {avlyst_tid}." },
+  cancelledByProducer: { nb: "Avlyst av produsenten {avlyst_tid}.", en: "Cancelled by the producer {avlyst_tid}." },
+  withdrawnByGuest: { nb: "Trukket av gjesten {avlyst_tid}.", en: "Withdrawn by the guest {avlyst_tid}." },
+  notFound: {
+    nb: "Finner ikke forespørselen. Sjekk referansen, eller åpne statuslenken i e-posten.",
+    en: "The request was not found. Check the reference, or open the status link in the email.",
+  },
+} as const;
+export type GardssalgStatusKey = keyof typeof GARDSSALG_STATUS_TEXT;
+
+/** A status text filled, "norsk / English"; times per language; no deadline -> its sentence is dropped. */
+export function gardssalgStatusText(key: GardssalgStatusKey, vars: (lang: "nb" | "en") => Record<string, string> = () => ({})): string {
+  const one = (lang: "nb" | "en"): string => {
+    const v = vars(lang);
+    const template = "frist" in v && !v.frist ? dropFristSentences(GARDSSALG_STATUS_TEXT[key][lang]) : GARDSSALG_STATUS_TEXT[key][lang];
+    // Split/join, not fillOa1: {nytt_tidspunkt} and {avlyst_tid} have "_".
+    return Object.entries(v).reduce((t, [k, val]) => t.split(`{${k}}`).join(val), template);
+  };
+  return `${one("nb")} / ${one("en")}`;
+}
+
+/** The one answer for every lookup that does not match a request (wrong reference or wrong guest_ref). */
+export function gardssalgBookingNotFoundPayload(): Record<string, unknown> {
+  return { found: false, message: gardssalgStatusText("notFound") };
+}
+
+/** get_gardssalg_booking's result for a verified booking. No guest personal data. */
+export function gardssalgBookingStatusPayload(booking: GardssalgBooking): Record<string, unknown> {
+  const produsent = loadReceiptProvider(booking.provider_id).navn || booking.provider_id;
+  const iso = (slot: string | null): string | null => (slot ? osloDatetimeLocalToUtcIso(slot) ?? slot : null);
+  const at = (slot: string | null, lang: "nb" | "en"): string => formatOsloInstant(iso(slot), lang);
+  let key: GardssalgStatusKey;
+  let fristIso: string | null = null;
+  let replyUrl: string | null = null;
+  let cancelledAt: string | null = null;
+  if (booking.status === "cancelled") {
+    // Only gardssalg-cancel.ts writes 'cancelled', always with cancelled_by.
+    const info = getCancelInfo(booking.booking_id);
+    key = info?.cancelled_by === "producer"
+      ? "cancelledByProducer"
+      : booking.pre_status === "provider_confirmed" ? "cancelledByGuest" : "withdrawnByGuest";
+    cancelledAt = info?.cancelled_at ?? booking.resolved_at;
+  } else if (booking.pre_status === "time_suggested") {
+    key = "suggested";
+    const due = previsitExpiryDueMs(booking);
+    fristIso = Number.isFinite(due) ? new Date(due).toISOString() : null;
+    replyUrl = guestDecisionUrl(booking);
+  } else if (booking.pre_status === "provider_confirmed") {
+    key = "confirmed";
+  } else if (booking.pre_status === "provider_declined") {
+    key = "declined";
+  } else if (booking.pre_status === "expired") {
+    key = "expired";
+  } else {
+    key = "pending";
+    fristIso = booking.respond_token_expires_at;
+  }
+  const message = gardssalgStatusText(key, (lang) => ({
+    produsent,
+    tid: at(booking.slot_at, lang),
+    nytt_tidspunkt: at(booking.suggested_slot_at, lang),
+    svarlenke: replyUrl ?? "",
+    frist: formatOsloInstant(fristIso, lang),
+    avlyst_tid: formatOsloInstant(iso(cancelledAt), lang),
+  }));
+  return {
+    found: true,
+    booking_ref: booking.booking_ref,
+    status: key,
+    message,
+    provider: { navn: produsent },
+    // Agreed time once confirmed, otherwise the requested time.
+    slot_at_local: formatOsloInstant(iso(booking.slot_at), "nb"),
+    ...(key === "suggested" ? { suggested_slot_at_local: formatOsloInstant(iso(booking.suggested_slot_at), "nb") } : {}),
+    ...(fristIso ? { reply_deadline_local: formatOsloInstant(fristIso, "nb") } : {}),
+    status_url: guestStatusUrl(booking),
+    ...(replyUrl ? { reply_url: replyUrl } : {}),
+  };
+}
+
+// O5-3 (same dev-request): cancel_gardssalg_booking, behind
+// GARDSSALG_MCP_CANCEL_TOOL_ENABLED (off unless exactly "true"; read when a
+// session's tools are registered). The tool is registered only when the O1-5
+// switch GARDSSALG_CANCEL_ENABLED is on as well: the cancellation itself is
+// O1-5's (gardssalg-cancel.ts: the guarded write, the stored reason and time,
+// the producer e-mail), so turning O1-5 off (its rollback) also takes the MCP
+// door away instead of advertising a tool that cannot cancel. Off: the tool
+// is not registered and tools/list is byte-identical.
+export function gardssalgCancelToolEnabled(): boolean {
+  return process.env.GARDSSALG_MCP_CANCEL_TOOL_ENABLED === "true" && gardssalgCancelEnabled();
+}
+
+export const CancelGardssalgBookingInputSchema = {
+  booking_ref: z.string().max(200).describe("booking_ref from the book_gardssalg result."),
+  guest_ref: z.string().max(200).describe("guest_ref from the book_gardssalg result."),
+  reason: z.string().max(CANCEL_REASON_MAX).optional().describe("Optional reason from the guest, passed on to the producer."),
+};
+
+// Verbatim from the approved text package OA-2 §C5 (A2A marketing-drafts/
+// 2026-11-12-opplevagent-tekstpakke-oa-2.md, approved by Daniel 2026-11-15).
+// Do not reword here. Keys are the package's `cancel.*` keys.
+export const CANCEL_GARDSSALG_BOOKING_TITLE = "Cancel a visit request or a confirmed visit";
+export const CANCEL_GARDSSALG_BOOKING_SHORT_TITLE = "Cancel visit request";
+export const CANCEL_GARDSSALG_BOOKING_DESCRIPTION =
+  "Use this when the guest wants to cancel a visit request or a confirmed visit made with book_gardssalg. It needs the reference and the guest_ref that book_gardssalg returned, and takes an optional reason that is passed on to the producer. The producer is told by email. A cancellation cannot be undone; the guest can send a new request afterwards. Cancelling a request that is already cancelled returns the same answer and sends nothing.";
+export const GARDSSALG_CANCEL_TEXT = {
+  ok: { nb: "Avlyst. {produsent} har fått beskjed. Referanse: {ref}.", en: "Cancelled. {produsent} has been told. Reference: {ref}." },
+  okPending: {
+    nb: "Forespørselen er trukket. {produsent} har fått beskjed. Referanse: {ref}.",
+    en: "The request is withdrawn. {produsent} has been told. Reference: {ref}.",
+  },
+  already: {
+    nb: "Forespørselen er allerede avlyst eller trukket. Ingenting er sendt på nytt.",
+    en: "The request is already cancelled or withdrawn. Nothing was sent again.",
+  },
+  notPossible: {
+    nb: "Forespørselen kan ikke avlyses, fordi den er {status}.",
+    en: "The request cannot be cancelled because it is {status}.",
+  },
+} as const;
+export type GardssalgCancelKey = keyof typeof GARDSSALG_CANCEL_TEXT;
+
+// The {status} word in cancel.notPossible. Not in the text package (it names
+// the cases: declined, expired or completed); plain words, Daniel approves
+// the tool texts before the flag is turned on.
+export const GARDSSALG_CANCEL_STATUS_WORD = {
+  declined: { nb: "avslått", en: "declined" },
+  expired: { nb: "utløpt", en: "expired" },
+  completed: { nb: "gjennomført", en: "completed" },
+  closed: { nb: "avsluttet", en: "closed" },
+} as const;
+export type GardssalgCancelStatusWord = keyof typeof GARDSSALG_CANCEL_STATUS_WORD;
+
+/** A cancel.* text filled, "norsk / English". */
+export function gardssalgCancelText(key: GardssalgCancelKey, vars: (lang: "nb" | "en") => Record<string, string> = () => ({})): string {
+  const one = (lang: "nb" | "en"): string =>
+    Object.entries(vars(lang)).reduce((t, [k, val]) => t.split(`{${k}}`).join(val), GARDSSALG_CANCEL_TEXT[key][lang] as string);
+  return `${one("nb")} / ${one("en")}`;
+}
+
+/** Why a booking the guest may not cancel (guestCancelMode() null, not cancelled) cannot be cancelled. */
+export function gardssalgCancelStatusWord(booking: Pick<GardssalgBooking, "status" | "pre_status">): GardssalgCancelStatusWord {
+  if (booking.status === "confirmed_attended") return "completed";
+  if (booking.status !== "reserved") return "closed";
+  if (booking.pre_status === "provider_declined") return "declined";
+  if (booking.pre_status === "expired") return "expired";
+  // A confirmed visit whose time has passed.
+  if (booking.pre_status === "provider_confirmed") return "completed";
+  return "closed";
+}
+
+/** The answer for a booking that is already cancelled (by anyone): same every time, sends nothing. */
+export function gardssalgCancelAlreadyPayload(booking: GardssalgBooking): Record<string, unknown> {
+  return { found: true, booking_ref: booking.booking_ref, cancelled: true, result: "already", message: gardssalgCancelText("already") };
+}
+
+export type GardssalgCancelToolResult = {
+  payload: Record<string, unknown>;
+  /** Set only when this call wrote the cancellation (the caller sends the producer e-mail). */
+  cancelled?: { booking: GardssalgBooking; mode: GuestCancelMode };
+};
+
+/**
+ * cancel_gardssalg_booking's decision for a verified booking. The write is
+ * O1-5's guestCancel() (one guarded UPDATE): only the call that changes the
+ * row gets `cancelled`, so a second call or a race sends nothing.
+ */
+export function gardssalgCancelBooking(booking: GardssalgBooking, reason: unknown, now: Date = new Date()): GardssalgCancelToolResult {
+  if (booking.status === "cancelled") return { payload: gardssalgCancelAlreadyPayload(booking) };
+  const notPossible = (b: GardssalgBooking): GardssalgCancelToolResult => {
+    const word = GARDSSALG_CANCEL_STATUS_WORD[gardssalgCancelStatusWord(b)];
+    return {
+      payload: {
+        found: true,
+        booking_ref: b.booking_ref,
+        cancelled: false,
+        result: "not_possible",
+        message: gardssalgCancelText("notPossible", (lang) => ({ status: word[lang] })),
+      },
+    };
+  };
+  if (!guestCancelMode(booking, now)) return notPossible(booking);
+  const outcome = guestCancel(booking, reason, now);
+  if (!outcome.ok) {
+    // Changed under us (a race): answer from the row as it is now.
+    const current = getBookingByRef(booking.booking_ref) ?? booking;
+    return current.status === "cancelled" ? { payload: gardssalgCancelAlreadyPayload(current) } : notPossible(current);
+  }
+  const produsent = loadReceiptProvider(booking.provider_id).navn || booking.provider_id;
+  const key: GardssalgCancelKey = outcome.mode === "withdraw" ? "okPending" : "ok";
+  return {
+    payload: {
+      found: true,
+      booking_ref: booking.booking_ref,
+      cancelled: true,
+      result: outcome.mode === "withdraw" ? "withdrawn" : "cancelled",
+      message: gardssalgCancelText(key, () => ({ produsent, ref: booking.booking_ref })),
+    },
+    cancelled: { booking: outcome.booking, mode: outcome.mode },
+  };
+}
+
 // ─── Tool registrations ──────────────────────────────────────
 
 // Uniform JSON-in-text tool result for book_gardssalg's honest non-success
@@ -688,6 +1068,440 @@ function toolInternalError(tool: string, err: unknown) {
   return mcpToolInternalErrorResult("experiences-mcp", EXPERIENCES_MCP_INTERNAL_ERROR_TEXT, tool, err);
 }
 
+// ─── book_gardssalg: the one booking chain for MCP and A2A ──────────────────
+// O5-7 (dev-request 2026-11-12-opplevagent-o5-besok-i-chatgpt-og-assistenter):
+// the body of the book_gardssalg tool, moved here unchanged so the A2A
+// `book_gardssalg` skill (experiences-a2a.ts) runs the very same controls,
+// caps, texts and outcome logging. Only the two transport-bound pieces come
+// from the caller: which assistant it is (stored as source_client) and the
+// interaction log row (MCP: source "mcp"; A2A: source "a2a").
+export type BookGardssalgArgs = {
+  provider_id?: string;
+  provider_query?: string;
+  requested_weekday?: string;
+  experience_id?: string;
+  slot_at: string;
+  party_size: number;
+  guest_name: string;
+  guest_email: string;
+  guest_phone?: string;
+  notes?: string;
+  confirm_outside_hours?: boolean;
+  preview?: boolean;
+};
+
+export type BookGardssalgCallCtx = {
+  /** The assistant's fixed source_client label, or null. */
+  sourceClient: () => string | null;
+  /** One interaction log row for a created request (fail-open at the call site). */
+  logInteraction: (bookingRef: string) => void;
+};
+
+export type BookGardssalgToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
+
+/** The loose input schema of the tool as registered now (with `preview` only while the O5-4 flag is on). */
+export function bookGardssalgInputShape(): Record<string, z.ZodTypeAny> {
+  return gardssalgPreviewEnabled() ? { ...BookGardssalgInputSchema, ...BookGardssalgPreviewField } : BookGardssalgInputSchema;
+}
+
+export async function runBookGardssalg(
+  { provider_id, provider_query, requested_weekday, experience_id, slot_at, party_size, guest_name, guest_email, guest_phone, notes, confirm_outside_hours, ...rest }: BookGardssalgArgs,
+  ctx: BookGardssalgCallCtx,
+): Promise<BookGardssalgToolResult> {
+  // O5-4: re-read at call time; off, `preview` is ignored (as today).
+  const previewOn = gardssalgPreviewEnabled();
+  const isPreview = previewOn && (rest as { preview?: unknown }).preview === true;
+  // «Vis som offentlig» (dev-request 2026-10-22-opplevagent-mine-valg-
+  // gardssalg, O2a) is a read-only admin view of the public surfaces: no
+  // visit request is ever created inside it.
+  if (isAsPublicView()) {
+    return jsonToolResult({ success: false, reason: "as_public_read_only", message: "The as-public view is read-only; no visit request was sent." }, true);
+  }
+  try {
+    // ─── Step 0 (dev-request 2026-09-16-opplevagent-en-setning-booking-
+    // via-ai): «hos X» → provider_id. provider_id, when given, wins
+    // untouched (existing callers unaffected). Otherwise provider_query
+    // is resolved to exactly ONE producer or answered honestly — never a
+    // guess between candidates, never a booking on a 'none'.
+    let resolvedProviderId = typeof provider_id === "string" && provider_id.trim() ? provider_id.trim() : "";
+    let resolvedFromQuery: string | null = null;
+    if (!resolvedProviderId) {
+      const pq = typeof provider_query === "string" ? provider_query.trim() : "";
+      if (!pq) return jsonToolResult(providerQueryMissingPayload(), true);
+      const resolution = resolveGardssalgProviderByQuery(pq, { surface: "mcp" });
+      if (resolution.kind === "none") return jsonToolResult(providerNotFoundPayload(pq));
+      if (resolution.kind === "ambiguous") return jsonToolResult(providerAmbiguousPayload(pq, resolution.candidates));
+      resolvedProviderId = resolution.provider.id;
+      resolvedFromQuery = pq;
+    }
+
+    // ─── Step 0b: the stated weekday («fredag») must agree with slot_at
+    // in Europe/Oslo — otherwise answer with the nearest matching dates
+    // and create nothing. Runs on the RAW slot_at (naked local or ISO).
+    const weekdayCheck = checkRequestedWeekday(slot_at, requested_weekday);
+    if (!weekdayCheck.ok) {
+      return weekdayCheck.reason === "unknown_weekday"
+        ? jsonToolResult(unknownWeekdayPayload(weekdayCheck.requested_weekday), true)
+        : jsonToolResult(weekdayMismatchPayload(weekdayCheck.mismatch));
+    }
+
+    // Build a candidate object matching BookingInput's own field names
+    // and hand it straight to BookingInputSchema.safeParse() — the SAME
+    // zod schema POST /api/opplevelser/book runs. This is the ONLY place
+    // the actual business rules (email format, party_size 1-50, string
+    // length caps, …) are enforced; BookGardssalgInputSchema above is
+    // deliberately loose so those rules are never duplicated/forked.
+    const candidate: Record<string, unknown> = {
+      provider_id: resolvedProviderId,
+      slot_at,
+      party_size,
+      guest_name,
+      guest_email,
+    };
+    if (experience_id) candidate.experience_id = experience_id;
+    if (guest_phone) candidate.guest_phone = guest_phone;
+    if (notes) candidate.notes = notes;
+    if (confirm_outside_hours) candidate.confirm_outside_hours = confirm_outside_hours;
+
+    const parsed = BookingInputSchema.safeParse(candidate);
+    if (!parsed.success) {
+      const issues = parsed.error.issues
+        .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
+        .join("; ");
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            success: false,
+            pending: false,
+            error: "invalid_input",
+            message: `Ugyldig forespørsel: ${issues}. / Invalid request: ${issues}.`,
+          }, null, 2),
+        }],
+        isError: true,
+      };
+    }
+
+    // ─── Same gate as POST /api/opplevelser/book (dark-launch-stop) ───
+    // Only booking_live=1 producers, AND (for real, non-hidden providers)
+    // only while BOOKING_DISPATCH_ENABLED="true" globally — see
+    // isBookingPaused() in services/booking-store.ts, never re-derived
+    // here. An unknown provider_id falls through the same path (no row
+    // -> booking_live undefined -> "not live"), same as the web form.
+    const provider = getProviderById(parsed.data.provider_id) as
+      | { navn?: string | null; slug?: string | null; booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null; is_test_provider?: number | null; opening_hours_text?: string | null; claimed_at?: string | null; producer_type?: string | null; alcohol_categories?: string | null }
+      | null;
+    // Echoed on every outcome below so the assistant can name the producer
+    // it acted on (and link the profile when booking is not activated).
+    // Never epost/telefon — those never leave the server here.
+    const providerInfo = provider
+      ? {
+          id: parsed.data.provider_id,
+          navn: String(provider.navn ?? ""),
+          profile_url: gardssalgProfileUrl(provider.slug ?? null),
+          ...(resolvedFromQuery ? { resolved_from_query: resolvedFromQuery } : {}),
+        }
+      : null;
+    const slotLocal = formatSlotOslo(parsed.data.slot_at);
+    if (isBookingPaused(provider?.booking_live ?? null, provider?.catalog_hidden ?? null, provider?.is_test_provider ?? null)) {
+      // Owned profile that is off: "tar ikke imot forespørsler nå", not
+      // "ikke aktivert ennå" (G1 item 7). Never-claimed: unchanged copy.
+      const notTaking = gardssalgNotTakingRequestsText(provider?.claimed_at ?? null);
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            success: false,
+            pending: false,
+            rejected: true,
+            reason: "not_live",
+            provider: providerInfo,
+            message:
+              (providerInfo?.navn ? `${providerInfo.navn}: ` : "") +
+              (notTaking ? notTaking.no : BOOKING_NOT_ACTIVATED_MSG) +
+              (providerInfo?.profile_url ? ` Gjesten kan ta kontakt via profilsiden: ${providerInfo.profile_url}.` : "") +
+              (notTaking ? ` / ${notTaking.en}` : " / Booking is not activated for this producer yet.") +
+              (providerInfo?.profile_url ? ` The guest can get in touch via the profile page: ${providerInfo.profile_url}.` : ""),
+          }, null, 2),
+        }],
+      };
+    }
+
+    // «Mine valg» booking.pause (dev-request 2026-10-22-opplevagent-mine-
+    // valg-gardssalg O1a): the owner's seasonal pause — same not-taking
+    // line as above (G1 item 7). Off unless OA_OWNER_FEATURES_ENABLED and
+    // the producer is allowlisted.
+    if (gardssalgBookingPausedByOwner(parsed.data.provider_id)) {
+      const t = GARDSSALG_NOT_TAKING_REQUESTS_TEXT;
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            success: false,
+            pending: false,
+            rejected: true,
+            reason: "owner_paused",
+            provider: providerInfo,
+            message:
+              (providerInfo?.navn ? `${providerInfo.navn}: ` : "") + t.no +
+              (providerInfo?.profile_url ? ` Gjesten kan ta kontakt via profilsiden: ${providerInfo.profile_url}.` : "") +
+              ` / ${t.en}` +
+              (providerInfo?.profile_url ? ` The guest can get in touch via the profile page: ${providerInfo.profile_url}.` : ""),
+          }, null, 2),
+        }],
+      };
+    }
+
+    // ─── dev-request 2026-07-14-booking-flyt-v1, slice 1 ("myk åpnings-
+    // tidsvalidering") — the SAME shared choke point POST /api/
+    // opplevelser/book and the no-JS SSR fallback use. HARD-rejects a
+    // past/too-far-ahead slot; SOFTLY warns (still success:false, but not
+    // an MCP error — the agent is expected to retry with
+    // confirm_outside_hours:true if it still wants that time) when the
+    // slot falls outside the provider's stated opening_hours_text.
+    const slotCheck = checkBookingSlotAllowed(
+      { opening_hours_text: provider?.opening_hours_text ?? null },
+      { slot_at: normaliseBookingSlotInput(parsed.data.slot_at), confirm_outside_hours: parsed.data.confirm_outside_hours },
+    );
+    if (!slotCheck.ok) {
+      const body = slotCheck.body as {
+        error?: string;
+        outside_hours?: boolean;
+        opening_hours_text?: string | null;
+        message?: string;
+      };
+      if (body.outside_hours) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              pending: false,
+              outside_hours: true,
+              provider: providerInfo,
+              slot_at_local: slotLocal,
+              opening_hours_text: body.opening_hours_text ?? null,
+              message:
+                (body.message ?? "") +
+                " / The requested time falls outside the producer's stated opening hours. " +
+                "Retry this tool with confirm_outside_hours: true if you still want that exact time.",
+            }, null, 2),
+          }],
+        };
+      }
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            success: false,
+            pending: false,
+            rejected: true,
+            reason: "slot_bounds",
+            provider: providerInfo,
+            slot_at_local: slotLocal,
+            message: `${body.error ?? "Ugyldig tidspunkt."} / The requested time is invalid — it must be in the future and within the booking window.`,
+          }, null, 2),
+        }],
+        isError: true,
+      };
+    }
+
+    // O1-3 (G6/G7): duplicate guard + request caps, behind
+    // GARDSSALG_BOOKING_CAP_ENABLED (flag off → always "ok", no DB read).
+    // Either outcome: no new row and no e-mail.
+    const guard = checkGardssalgBookingGuard(parsed.data);
+    if (guard.kind === "duplicate") {
+      const existing = getBookingByRef(guard.booking_ref);
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            success: true,
+            pending: true,
+            duplicate: true,
+            status: existing?.status ?? "reserved",
+            booking_ref: guard.booking_ref,
+            provider: providerInfo,
+            slot_at_local: existing ? formatSlotOslo(existing.slot_at) : slotLocal,
+            message: `${duplicateMessage(guard.booking_ref, "no")} / ${duplicateMessage(guard.booking_ref, "en")}`,
+          }, null, 2),
+        }],
+      };
+    }
+    if (guard.kind === "cap_reached") {
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            success: false,
+            pending: false,
+            cap_reached: true,
+            reason: "cap_reached",
+            cap: guard.cap,
+            limit: guard.limit,
+            provider: providerInfo,
+            slot_at_local: slotLocal,
+            message: `${capReachedMessage(guard.cap, "no", providerInfo?.navn)} / ${capReachedMessage(guard.cap, "en", providerInfo?.navn)}`,
+          }, null, 2),
+        }],
+      };
+    }
+
+    // O5-4: every check above has passed; preview stops here — no row, no
+    // e-mail, no interaction log. Nothing about the guest is logged.
+    const notices = previewOn
+      ? gardssalgPreviewNotices({ hasAlcohol: gardssalgProducerHasAlcohol(provider), guestPhone: parsed.data.guest_phone, notes: parsed.data.notes })
+      : null;
+    if (isPreview && notices) {
+      return jsonToolResult({
+        success: true,
+        preview: true,
+        sent: false,
+        pending: false,
+        provider: providerInfo,
+        slot_at_local: slotLocal,
+        party_size: parsed.data.party_size,
+        shared_with_producer: notices.shared_with_producer,
+        privacy_url: notices.privacy_url,
+        message: [
+          bookPreviewMessage({ produsent: providerInfo?.navn || parsed.data.provider_id, slotAt: normaliseBookingSlotInput(parsed.data.slot_at), antall: parsed.data.party_size }),
+          ...notices.lines,
+        ].join("\n"),
+      });
+    }
+
+    let booking;
+    try {
+      // "mcp" only stamps the channel column for analytics — createBooking()
+      // is the exact same function (same DB table, same confirm-token +
+      // respond-token issuance) the web form calls; nothing here reimplements it.
+      // F1-1: which AI assistant, stored only as a fixed label
+      // (sessionSourceClient above).
+      booking = createBooking(parsed.data, "mcp", { sourceClient: ctx.sourceClient() });
+    } catch (err: any) {
+      console.error("[book_gardssalg] createBooking failed", err);
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            success: false,
+            pending: false,
+            error: "internal_error",
+            message: "Kunne ikke opprette påmelding. / Could not create the booking request.",
+          }, null, 2),
+        }],
+        isError: true,
+      };
+    }
+
+    // O5-1: the guest's secret reference, only with the flag on (flag off:
+    // nothing generated or stored, result byte-identical). Fail-open: a
+    // failure here never fails the already-stored request; the result
+    // then simply has no guest_ref. Never log the reference.
+    let guestRef: string | null = null;
+    if (guestRefEnabled()) {
+      try {
+        guestRef = issueGuestRef(booking.booking_id);
+      } catch {
+        console.error("[book_gardssalg] guest_ref not issued", booking.booking_ref);
+      }
+    }
+
+    // Fire-and-forget — the SAME two sends POST /api/opplevelser/book
+    // triggers, never blocking the tool response on either.
+    sendBookingConfirmation(booking).catch((e) =>
+      console.error("[book_gardssalg] confirmation email failed", booking.booking_ref, e),
+    );
+    sendProducerNotification(booking, provider?.epost ?? null, provider?.opening_hours_text ?? null).catch((e) =>
+      console.error("[book_gardssalg] producer notification failed", booking.booking_ref, e),
+    );
+
+    try {
+      ctx.logInteraction(booking.booking_ref);
+    } catch { /* fail-open: never affects the tool result */ }
+
+    // NB: deliberately NEVER returns confirm_token/confirm_url — exactly
+    // like POST /api/opplevelser/book's own response (see that handler's
+    // comment): that credential belongs to the PRODUCER's attendance-
+    // resolution flow, and handing it to the calling agent would let it
+    // resolve its own booking. This tool has no way to confirm a
+    // booking — only the PRODUCER's own response (via their emailed
+    // respond-link) can do that.
+    const result = {
+          success: true,
+          pending: true,
+          status: booking.status,
+          booking_ref: booking.booking_ref,
+          source: booking.source,
+          confirmation_required: true,
+          // dev-request 2026-09-16: what was booked, in words the assistant
+          // can read straight back to the guest.
+          provider: providerInfo,
+          slot_at_local: slotLocal,
+          party_size: booking.party_size,
+          // O1-1 (R11): same field as POST /api/opplevelser/book.
+          producer_notification: { status: producerNotifyAddressStatus(provider?.epost) },
+          message:
+            `Produsent: ${providerInfo?.navn || parsed.data.provider_id} · Tidspunkt: ${slotLocal} · ${booking.party_size} person(er). ` +
+            `Reservasjonsforespørsel mottatt (${booking.booking_ref}) — status: PENDING/AVVENTER. ` +
+            `En bekreftelse på forespørselen er sendt til ${booking.guest_email}; produsenten er varslet ` +
+            `og svarer på e-post (bekrefter, foreslår nytt tidspunkt eller avslår) — reservasjonen blir ` +
+            `IKKE endelig før produsenten har svart. / ` +
+            `Reservation request received (${booking.booking_ref}) — status: PENDING. A confirmation ` +
+            `email has been sent to ${booking.guest_email}; the producer has been notified and will ` +
+            `respond by email (confirm, propose another time, or decline) — the booking only becomes ` +
+            `final once the producer responds, and this tool can never confirm it itself.`,
+    };
+    // O5-1 (flag on): + guest_ref and the guest's own read-only status page
+    // (the same link the receipt e-mail carries), and the OA-2 `book.ok`
+    // text: the e-mails are being sent, not already sent.
+    const statusUrl = guestRef ? guestStatusUrl(booking) : null;
+    const payload = guestRef && statusUrl
+      ? {
+          ...result,
+          guest_ref: guestRef,
+          status_url: statusUrl,
+          message: bookOkMessage({
+            ref: booking.booking_ref,
+            produsent: providerInfo?.navn || parsed.data.provider_id,
+            epost: booking.guest_email,
+            fristIso: booking.respond_token_expires_at,
+            statusUrl,
+          }),
+        }
+      : result;
+    // O5-4 (flag on): + what is shared, the privacy link, the age line.
+    const finalPayload = notices
+      ? { ...payload, shared_with_producer: notices.shared_with_producer, privacy_url: notices.privacy_url, message: [payload.message, ...notices.lines].join("\n") }
+      : payload;
+    return {
+      content: [{
+        type: "text" as const,
+        text: JSON.stringify(finalPayload, null, 2),
+      }],
+    };
+  } catch (err: any) {
+    return toolInternalError("book_gardssalg", err);
+  }
+}
+
+/**
+ * runBookGardssalg plus the O5-8 outcome row, as the MCP tool's
+ * withFunnelOutcome wrapper writes it: one row per call, fail-open, the result
+ * returned untouched.
+ */
+export async function runBookGardssalgWithFunnelOutcome(args: BookGardssalgArgs, ctx: BookGardssalgCallCtx): Promise<BookGardssalgToolResult> {
+  let result: BookGardssalgToolResult;
+  try {
+    result = await runBookGardssalg(args, ctx);
+  } catch (err) {
+    try { recordGardssalgFunnelEvent("internal_error", ctx.sourceClient()); } catch { /* fail-open */ }
+    throw err;
+  }
+  try { recordGardssalgFunnelEvent(classifyBookGardssalgResult(result), ctx.sourceClient()); } catch { /* fail-open */ }
+  return result;
+}
+
 export function registerExperienceTools(
   server: McpServer,
   getClientIdentity?: () => string | undefined,
@@ -704,6 +1518,28 @@ export function registerExperienceTools(
   // experiences / gårdssalg producers a data tool hands the caller, counted
   // with the same rules as rfb (profile-ai-deliveries.ts recordMcpDelivery).
   type ToolExtra = { sessionId?: string; requestInfo?: { headers?: Record<string, string | string[] | undefined> } } | undefined;
+  // F1-1: which AI assistant (session identity, else this call's headers /
+  // initialize client name; the same rule as the profile-link tagging), as a
+  // fixed label or null.
+  const sessionSourceClient = (extra: unknown): string | null => sourceClientLabel(
+    getClientIdentity?.()
+      ?? aiClientFromHeaders((extra as ToolExtra)?.requestInfo?.headers, (server as any).server?.getClientVersion?.()?.name ?? null),
+  );
+  // O5-8: one outcome row per discover_gardssalg / book_gardssalg call (counts
+  // only, services/gardssalg-mcp-funnel.ts). The handler's result is returned
+  // untouched; the write is fail-open.
+  const withFunnelOutcome = <A, E, R>(outcomeOf: (result: R) => GardssalgFunnelOutcome, handler: (args: A, extra: E) => Promise<R>) =>
+    async (args: A, extra: E): Promise<R> => {
+      let result: R;
+      try {
+        result = await handler(args, extra);
+      } catch (err) {
+        try { recordGardssalgFunnelEvent("internal_error", sessionSourceClient(extra)); } catch { /* fail-open */ }
+        throw err;
+      }
+      try { recordGardssalgFunnelEvent(outcomeOf(result), sessionSourceClient(extra)); } catch { /* fail-open */ }
+      return result;
+    };
   const deliver = (tool: string, args: unknown, extra: ToolExtra, profileIds: string[]) => {
     recordMcpDelivery({
       vertical: "experiences",
@@ -1227,14 +2063,14 @@ export function registerExperienceTools(
   // so discover_experiences/get_experience never surface them. This tool is
   // the dedicated search surface over experience_providers for that
   // vertical, backed by searchGardssalgProviders().
+  // O5-4: C1/C2 tool texts and the `preview` field only with the flag on.
+  const previewTexts = gardssalgPreviewEnabled() ? "on" : "off";
   server.registerTool(
     "discover_gardssalg",
     {
-      title: "Find drink producers to visit for a tasting (gårdssalg)",
+      title: DISCOVER_GARDSSALG_TITLE[previewTexts],
       description:
-        "Use this to plan a visit or tasting at a Norwegian drink producer (brewery, cidery, winery, distillery, " +
-        "meadery, farm café) and find ones that accept visit requests; it does not sell or order products. " +
-        "It searches opplevagent.no's gårdssalg (farm-sale) vertical of Brreg-registered drink producers to visit (besøk, smaking) " +
+        DISCOVER_GARDSSALG_LEAD[previewTexts] +
         "(bryggeri/sideri/vingård/destilleri/mjøderi/gårdskafé/seltzeri). " +
         "Finn norske gårdssalg-produsenter (drikkeprodusenter som selger direkte fra gården) etter fylke, " +
         "kommune og produsenttype. / Filter by county (fylke), municipality (kommune), and producer type. " +
@@ -1262,7 +2098,7 @@ export function registerExperienceTools(
         openWorldHint: false,
       },
     },
-    async ({ fylke: fylkeAsSent, kommune: kommuneAsSent, producer_type, query, booking_live, lat, lng, radius_km, limit }, extra) => {
+    withFunnelOutcome(() => "search", async ({ fylke: fylkeAsSent, kommune: kommuneAsSent, producer_type, query, booking_live, lat, lng, radius_km, limit }, extra) => {
       // Slice I-Y2: place names, cut as in discover_experiences.
       const fylke = capName(fylkeAsSent);
       const kommune = capName(kommuneAsSent);
@@ -1298,6 +2134,7 @@ export function registerExperienceTools(
             ? "Ingen gårdssalg-produsenter funnet med de angitte filtrene. / No gårdssalg producers found matching the given filters."
             : `Fant ${results.length} gårdssalg-produsent(er). / Found ${results.length} gårdssalg producer(s).`;
 
+        const withVisitFacts = gardssalgVisitFactsEnabled();
         const formatted = results.map((row) => {
           // catalog_hidden is never 1 here — searchGardssalgProviders()'s base
           // WHERE clause already excludes those rows entirely — so this call
@@ -1327,6 +2164,9 @@ export function registerExperienceTools(
             // Only present when an origin (lat/lng) was given — mirrors
             // discover_experiences's own ...(hasGeo ? {...} : {}) spread.
             ...(hasGeo ? { distance_km: row.distance_km ?? null } : {}),
+            // O5-5: only with the flag on, and only the fields the producer
+            // stated itself (absent otherwise — never null/empty).
+            ...(withVisitFacts ? gardssalgVisitFacts(row) : {}),
           };
         });
 
@@ -1359,7 +2199,7 @@ export function registerExperienceTools(
         }
         return toolInternalError("discover_gardssalg", err);
       }
-    }
+    }),
   );
 
   // Tool 5: book_gardssalg (dev-request 2026-07-21-mcp-booking-tool, Daniel
@@ -1375,10 +2215,9 @@ export function registerExperienceTools(
   server.registerTool(
     "book_gardssalg",
     {
-      title: "Request a visit or tasting at a drink producer (pending until the producer replies)",
+      title: BOOK_GARDSSALG_TITLE[previewTexts],
       description:
-        "Use this to request a visit or tasting (besøk, smaking) at a Norwegian gårdssalg drink producer found with " +
-        "discover_gardssalg or named by the guest; it sends a visit request and does not sell or order products. " +
+        BOOK_GARDSSALG_LEAD[previewTexts] +
         "Send inn en reservasjonsforespørsel for et gårdssalg-besøk. " +
         "IMPORTANT: this NEVER creates a confirmed booking — it creates a PENDING request, exactly " +
         "like the producer's own website form. The PRODUCER reviews the request and responds " +
@@ -1406,8 +2245,9 @@ export function registerExperienceTools(
         "On success the response carries the resolved producer (provider.navn) and slot_at_local " +
         "(e.g. 'fredag 23. oktober 2026 kl. 10:00') — read both back to the guest. " +
         "Example: provider_query 'Fjordgard Bryggeri', slot_at '2026-10-23T10:00', requested_weekday 'fredag', " +
-        "party_size 4, guest_name 'Kari Nordmann', guest_email 'kari@example.no'.",
-      inputSchema: BookGardssalgInputSchema,
+        "party_size 4, guest_name 'Kari Nordmann', guest_email 'kari@example.no'." +
+        (previewTexts === "on" ? ` ${BOOK_GARDSSALG_PREVIEW_DESCRIPTION_TAIL}` : ""),
+      inputSchema: previewTexts === "on" ? { ...BookGardssalgInputSchema, ...BookGardssalgPreviewField } : BookGardssalgInputSchema,
       annotations: {
         title: "Request a gårdssalg booking",
         readOnlyHint: false,
@@ -1426,363 +2266,107 @@ export function registerExperienceTools(
         openWorldHint: true,
       },
     },
-    async ({ provider_id, provider_query, requested_weekday, experience_id, slot_at, party_size, guest_name, guest_email, guest_phone, notes, confirm_outside_hours }, extra) => {
-      // «Vis som offentlig» (dev-request 2026-10-22-opplevagent-mine-valg-
-      // gardssalg, O2a) is a read-only admin view of the public surfaces: no
-      // visit request is ever created inside it.
-      if (isAsPublicView()) {
-        return jsonToolResult({ success: false, reason: "as_public_read_only", message: "The as-public view is read-only; no visit request was sent." }, true);
-      }
-      try {
-        // ─── Step 0 (dev-request 2026-09-16-opplevagent-en-setning-booking-
-        // via-ai): «hos X» → provider_id. provider_id, when given, wins
-        // untouched (existing callers unaffected). Otherwise provider_query
-        // is resolved to exactly ONE producer or answered honestly — never a
-        // guess between candidates, never a booking on a 'none'.
-        let resolvedProviderId = typeof provider_id === "string" && provider_id.trim() ? provider_id.trim() : "";
-        let resolvedFromQuery: string | null = null;
-        if (!resolvedProviderId) {
-          const pq = typeof provider_query === "string" ? provider_query.trim() : "";
-          if (!pq) return jsonToolResult(providerQueryMissingPayload(), true);
-          const resolution = resolveGardssalgProviderByQuery(pq, { surface: "mcp" });
-          if (resolution.kind === "none") return jsonToolResult(providerNotFoundPayload(pq));
-          if (resolution.kind === "ambiguous") return jsonToolResult(providerAmbiguousPayload(pq, resolution.candidates));
-          resolvedProviderId = resolution.provider.id;
-          resolvedFromQuery = pq;
-        }
-
-        // ─── Step 0b: the stated weekday («fredag») must agree with slot_at
-        // in Europe/Oslo — otherwise answer with the nearest matching dates
-        // and create nothing. Runs on the RAW slot_at (naked local or ISO).
-        const weekdayCheck = checkRequestedWeekday(slot_at, requested_weekday);
-        if (!weekdayCheck.ok) {
-          return weekdayCheck.reason === "unknown_weekday"
-            ? jsonToolResult(unknownWeekdayPayload(weekdayCheck.requested_weekday), true)
-            : jsonToolResult(weekdayMismatchPayload(weekdayCheck.mismatch));
-        }
-
-        // Build a candidate object matching BookingInput's own field names
-        // and hand it straight to BookingInputSchema.safeParse() — the SAME
-        // zod schema POST /api/opplevelser/book runs. This is the ONLY place
-        // the actual business rules (email format, party_size 1-50, string
-        // length caps, …) are enforced; BookGardssalgInputSchema above is
-        // deliberately loose so those rules are never duplicated/forked.
-        const candidate: Record<string, unknown> = {
-          provider_id: resolvedProviderId,
-          slot_at,
-          party_size,
-          guest_name,
-          guest_email,
-        };
-        if (experience_id) candidate.experience_id = experience_id;
-        if (guest_phone) candidate.guest_phone = guest_phone;
-        if (notes) candidate.notes = notes;
-        if (confirm_outside_hours) candidate.confirm_outside_hours = confirm_outside_hours;
-
-        const parsed = BookingInputSchema.safeParse(candidate);
-        if (!parsed.success) {
-          const issues = parsed.error.issues
-            .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
-            .join("; ");
-          return {
-            content: [{
-              type: "text" as const,
-              text: JSON.stringify({
-                success: false,
-                pending: false,
-                error: "invalid_input",
-                message: `Ugyldig forespørsel: ${issues}. / Invalid request: ${issues}.`,
-              }, null, 2),
-            }],
-            isError: true,
-          };
-        }
-
-        // ─── Same gate as POST /api/opplevelser/book (dark-launch-stop) ───
-        // Only booking_live=1 producers, AND (for real, non-hidden providers)
-        // only while BOOKING_DISPATCH_ENABLED="true" globally — see
-        // isBookingPaused() in services/booking-store.ts, never re-derived
-        // here. An unknown provider_id falls through the same path (no row
-        // -> booking_live undefined -> "not live"), same as the web form.
-        const provider = getProviderById(parsed.data.provider_id) as
-          | { navn?: string | null; slug?: string | null; booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null; is_test_provider?: number | null; opening_hours_text?: string | null; claimed_at?: string | null }
-          | null;
-        // Echoed on every outcome below so the assistant can name the producer
-        // it acted on (and link the profile when booking is not activated).
-        // Never epost/telefon — those never leave the server here.
-        const providerInfo = provider
-          ? {
-              id: parsed.data.provider_id,
-              navn: String(provider.navn ?? ""),
-              profile_url: gardssalgProfileUrl(provider.slug ?? null),
-              ...(resolvedFromQuery ? { resolved_from_query: resolvedFromQuery } : {}),
-            }
-          : null;
-        const slotLocal = formatSlotOslo(parsed.data.slot_at);
-        if (isBookingPaused(provider?.booking_live ?? null, provider?.catalog_hidden ?? null, provider?.is_test_provider ?? null)) {
-          // Owned profile that is off: "tar ikke imot forespørsler nå", not
-          // "ikke aktivert ennå" (G1 item 7). Never-claimed: unchanged copy.
-          const notTaking = gardssalgNotTakingRequestsText(provider?.claimed_at ?? null);
-          return {
-            content: [{
-              type: "text" as const,
-              text: JSON.stringify({
-                success: false,
-                pending: false,
-                rejected: true,
-                reason: "not_live",
-                provider: providerInfo,
-                message:
-                  (providerInfo?.navn ? `${providerInfo.navn}: ` : "") +
-                  (notTaking ? notTaking.no : BOOKING_NOT_ACTIVATED_MSG) +
-                  (providerInfo?.profile_url ? ` Gjesten kan ta kontakt via profilsiden: ${providerInfo.profile_url}.` : "") +
-                  (notTaking ? ` / ${notTaking.en}` : " / Booking is not activated for this producer yet.") +
-                  (providerInfo?.profile_url ? ` The guest can get in touch via the profile page: ${providerInfo.profile_url}.` : ""),
-              }, null, 2),
-            }],
-          };
-        }
-
-        // «Mine valg» booking.pause (dev-request 2026-10-22-opplevagent-mine-
-        // valg-gardssalg O1a): the owner's seasonal pause — same not-taking
-        // line as above (G1 item 7). Off unless OA_OWNER_FEATURES_ENABLED and
-        // the producer is allowlisted.
-        if (gardssalgBookingPausedByOwner(parsed.data.provider_id)) {
-          const t = GARDSSALG_NOT_TAKING_REQUESTS_TEXT;
-          return {
-            content: [{
-              type: "text" as const,
-              text: JSON.stringify({
-                success: false,
-                pending: false,
-                rejected: true,
-                reason: "owner_paused",
-                provider: providerInfo,
-                message:
-                  (providerInfo?.navn ? `${providerInfo.navn}: ` : "") + t.no +
-                  (providerInfo?.profile_url ? ` Gjesten kan ta kontakt via profilsiden: ${providerInfo.profile_url}.` : "") +
-                  ` / ${t.en}` +
-                  (providerInfo?.profile_url ? ` The guest can get in touch via the profile page: ${providerInfo.profile_url}.` : ""),
-              }, null, 2),
-            }],
-          };
-        }
-
-        // ─── dev-request 2026-07-14-booking-flyt-v1, slice 1 ("myk åpnings-
-        // tidsvalidering") — the SAME shared choke point POST /api/
-        // opplevelser/book and the no-JS SSR fallback use. HARD-rejects a
-        // past/too-far-ahead slot; SOFTLY warns (still success:false, but not
-        // an MCP error — the agent is expected to retry with
-        // confirm_outside_hours:true if it still wants that time) when the
-        // slot falls outside the provider's stated opening_hours_text.
-        const slotCheck = checkBookingSlotAllowed(
-          { opening_hours_text: provider?.opening_hours_text ?? null },
-          { slot_at: normaliseBookingSlotInput(parsed.data.slot_at), confirm_outside_hours: parsed.data.confirm_outside_hours },
-        );
-        if (!slotCheck.ok) {
-          const body = slotCheck.body as {
-            error?: string;
-            outside_hours?: boolean;
-            opening_hours_text?: string | null;
-            message?: string;
-          };
-          if (body.outside_hours) {
-            return {
-              content: [{
-                type: "text" as const,
-                text: JSON.stringify({
-                  success: false,
-                  pending: false,
-                  outside_hours: true,
-                  provider: providerInfo,
-                  slot_at_local: slotLocal,
-                  opening_hours_text: body.opening_hours_text ?? null,
-                  message:
-                    (body.message ?? "") +
-                    " / The requested time falls outside the producer's stated opening hours. " +
-                    "Retry this tool with confirm_outside_hours: true if you still want that exact time.",
-                }, null, 2),
-              }],
-            };
-          }
-          return {
-            content: [{
-              type: "text" as const,
-              text: JSON.stringify({
-                success: false,
-                pending: false,
-                rejected: true,
-                reason: "slot_bounds",
-                provider: providerInfo,
-                slot_at_local: slotLocal,
-                message: `${body.error ?? "Ugyldig tidspunkt."} / The requested time is invalid — it must be in the future and within the booking window.`,
-              }, null, 2),
-            }],
-            isError: true,
-          };
-        }
-
-        // O1-3 (G6/G7): duplicate guard + request caps, behind
-        // GARDSSALG_BOOKING_CAP_ENABLED (flag off → always "ok", no DB read).
-        // Either outcome: no new row and no e-mail.
-        const guard = checkGardssalgBookingGuard(parsed.data);
-        if (guard.kind === "duplicate") {
-          const existing = getBookingByRef(guard.booking_ref);
-          return {
-            content: [{
-              type: "text" as const,
-              text: JSON.stringify({
-                success: true,
-                pending: true,
-                duplicate: true,
-                status: existing?.status ?? "reserved",
-                booking_ref: guard.booking_ref,
-                provider: providerInfo,
-                slot_at_local: existing ? formatSlotOslo(existing.slot_at) : slotLocal,
-                message: `${duplicateMessage(guard.booking_ref, "no")} / ${duplicateMessage(guard.booking_ref, "en")}`,
-              }, null, 2),
-            }],
-          };
-        }
-        if (guard.kind === "cap_reached") {
-          return {
-            content: [{
-              type: "text" as const,
-              text: JSON.stringify({
-                success: false,
-                pending: false,
-                cap_reached: true,
-                reason: "cap_reached",
-                cap: guard.cap,
-                limit: guard.limit,
-                provider: providerInfo,
-                slot_at_local: slotLocal,
-                message: `${capReachedMessage(guard.cap, "no", providerInfo?.navn)} / ${capReachedMessage(guard.cap, "en", providerInfo?.navn)}`,
-              }, null, 2),
-            }],
-          };
-        }
-
-        let booking;
-        try {
-          // "mcp" only stamps the channel column for analytics — createBooking()
-          // is the exact same function (same DB table, same confirm-token +
-          // respond-token issuance) the web form calls; nothing here reimplements it.
-          // F1-1: which AI assistant (session identity, else this call's
-          // headers / initialize client name; the same rule as the profile-link
-          // tagging), stored only as a fixed label.
-          const sourceClient = sourceClientLabel(
-            getClientIdentity?.()
-              ?? aiClientFromHeaders((extra as ToolExtra)?.requestInfo?.headers, (server as any).server?.getClientVersion?.()?.name ?? null),
-          );
-          booking = createBooking(parsed.data, "mcp", { sourceClient });
-        } catch (err: any) {
-          console.error("[book_gardssalg] createBooking failed", err);
-          return {
-            content: [{
-              type: "text" as const,
-              text: JSON.stringify({
-                success: false,
-                pending: false,
-                error: "internal_error",
-                message: "Kunne ikke opprette påmelding. / Could not create the booking request.",
-              }, null, 2),
-            }],
-            isError: true,
-          };
-        }
-
-        // O5-1: the guest's secret reference, only with the flag on (flag off:
-        // nothing generated or stored, result byte-identical). Fail-open: a
-        // failure here never fails the already-stored request; the result
-        // then simply has no guest_ref. Never log the reference.
-        let guestRef: string | null = null;
-        if (guestRefEnabled()) {
-          try {
-            guestRef = issueGuestRef(booking.booking_id);
-          } catch {
-            console.error("[book_gardssalg] guest_ref not issued", booking.booking_ref);
-          }
-        }
-
-        // Fire-and-forget — the SAME two sends POST /api/opplevelser/book
-        // triggers, never blocking the tool response on either.
-        sendBookingConfirmation(booking).catch((e) =>
-          console.error("[book_gardssalg] confirmation email failed", booking.booking_ref, e),
-        );
-        sendProducerNotification(booking, provider?.epost ?? null, provider?.opening_hours_text ?? null).catch((e) =>
-          console.error("[book_gardssalg] producer notification failed", booking.booking_ref, e),
-        );
-
-        try {
-          logExperiencesInteraction({
-            skill: "book_gardssalg",
-            queryText: booking.booking_ref,
-            ctx: { clientIdentity: getClientIdentity?.(), requestMeta: getRequestMeta?.() },
-          });
-        } catch { /* fail-open: never affects the tool result */ }
-
-        // NB: deliberately NEVER returns confirm_token/confirm_url — exactly
-        // like POST /api/opplevelser/book's own response (see that handler's
-        // comment): that credential belongs to the PRODUCER's attendance-
-        // resolution flow, and handing it to the calling agent would let it
-        // resolve its own booking. This tool has no way to confirm a
-        // booking — only the PRODUCER's own response (via their emailed
-        // respond-link) can do that.
-        const result = {
-              success: true,
-              pending: true,
-              status: booking.status,
-              booking_ref: booking.booking_ref,
-              source: booking.source,
-              confirmation_required: true,
-              // dev-request 2026-09-16: what was booked, in words the assistant
-              // can read straight back to the guest.
-              provider: providerInfo,
-              slot_at_local: slotLocal,
-              party_size: booking.party_size,
-              // O1-1 (R11): same field as POST /api/opplevelser/book.
-              producer_notification: { status: producerNotifyAddressStatus(provider?.epost) },
-              message:
-                `Produsent: ${providerInfo?.navn || parsed.data.provider_id} · Tidspunkt: ${slotLocal} · ${booking.party_size} person(er). ` +
-                `Reservasjonsforespørsel mottatt (${booking.booking_ref}) — status: PENDING/AVVENTER. ` +
-                `En bekreftelse på forespørselen er sendt til ${booking.guest_email}; produsenten er varslet ` +
-                `og svarer på e-post (bekrefter, foreslår nytt tidspunkt eller avslår) — reservasjonen blir ` +
-                `IKKE endelig før produsenten har svart. / ` +
-                `Reservation request received (${booking.booking_ref}) — status: PENDING. A confirmation ` +
-                `email has been sent to ${booking.guest_email}; the producer has been notified and will ` +
-                `respond by email (confirm, propose another time, or decline) — the booking only becomes ` +
-                `final once the producer responds, and this tool can never confirm it itself.`,
-        };
-        // O5-1 (flag on): + guest_ref and the guest's own read-only status page
-        // (the same link the receipt e-mail carries), and the OA-2 `book.ok`
-        // text: the e-mails are being sent, not already sent.
-        const statusUrl = guestRef ? guestStatusUrl(booking) : null;
-        const payload = guestRef && statusUrl
-          ? {
-              ...result,
-              guest_ref: guestRef,
-              status_url: statusUrl,
-              message: bookOkMessage({
-                ref: booking.booking_ref,
-                produsent: providerInfo?.navn || parsed.data.provider_id,
-                epost: booking.guest_email,
-                fristIso: booking.respond_token_expires_at,
-                statusUrl,
-              }),
-            }
-          : result;
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify(payload, null, 2),
-          }],
-        };
-      } catch (err: any) {
-        return toolInternalError("book_gardssalg", err);
-      }
-    }
+    withFunnelOutcome(classifyBookGardssalgResult, async (args, extra) => runBookGardssalg(args, {
+      sourceClient: () => sessionSourceClient(extra),
+      logInteraction: (bookingRef) => logExperiencesInteraction({
+        skill: "book_gardssalg",
+        queryText: bookingRef,
+        ctx: { clientIdentity: getClientIdentity?.(), requestMeta: getRequestMeta?.() },
+      }),
+    })),
   );
+
+  // O5-2: registered last and only with the flag on, so tools/list with the
+  // flag off is byte-identical. Reads only. A wrong reference and a wrong
+  // guest_ref get the same answer and no booking data. Rate limited by
+  // GARDSSALG_STATUS_LOOKUP_LIMIT (router.use above). Logs nothing about the
+  // guest, the reference or the guest_ref.
+  if (gardssalgStatusToolEnabled()) {
+    server.registerTool(
+      "get_gardssalg_booking",
+      {
+        title: GET_GARDSSALG_BOOKING_TITLE,
+        description: GET_GARDSSALG_BOOKING_DESCRIPTION,
+        inputSchema: GetGardssalgBookingInputSchema,
+        annotations: {
+          title: GET_GARDSSALG_BOOKING_SHORT_TITLE,
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          // Closed world: reads Opplevagent's own booking table, sends nothing.
+          openWorldHint: false,
+        },
+      },
+      async ({ booking_ref, guest_ref }) => {
+        try {
+          const booking = verifyGuestRef(booking_ref, guest_ref);
+          try {
+            logExperiencesInteraction({
+              skill: "get_gardssalg_booking",
+              ctx: { clientIdentity: getClientIdentity?.(), requestMeta: getRequestMeta?.() },
+            });
+          } catch { /* fail-open: never affects the tool result */ }
+          return jsonToolResult(booking ? gardssalgBookingStatusPayload(booking) : gardssalgBookingNotFoundPayload());
+        } catch (err: any) {
+          return toolInternalError("get_gardssalg_booking", err);
+        }
+      }
+    );
+  }
+
+  // O5-3: registered last and only with GARDSSALG_MCP_CANCEL_TOOL_ENABLED and
+  // GARDSSALG_CANCEL_ENABLED on (gardssalgCancelToolEnabled()), so tools/list
+  // with the flag off is byte-identical. A wrong reference and a wrong
+  // guest_ref get get_gardssalg_booking's not-found answer, write nothing and
+  // send nothing. The cancellation is O1-5's guestCancel(); the producer gets
+  // one e-mail from the call that wrote it. Rate limited by
+  // GARDSSALG_CANCEL_LIMIT (router.use above). Logs nothing about the guest,
+  // the reference, the guest_ref or the reason.
+  if (gardssalgCancelToolEnabled()) {
+    server.registerTool(
+      "cancel_gardssalg_booking",
+      {
+        title: CANCEL_GARDSSALG_BOOKING_TITLE,
+        description: CANCEL_GARDSSALG_BOOKING_DESCRIPTION,
+        inputSchema: CancelGardssalgBookingInputSchema,
+        annotations: {
+          title: CANCEL_GARDSSALG_BOOKING_SHORT_TITLE,
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: true,
+          // Closed world: Opplevagent's own booking table and its own e-mail to the producer.
+          openWorldHint: false,
+        },
+      },
+      async ({ booking_ref, guest_ref, reason }) => {
+        try {
+          // Always verify first (it hashes in every branch), then re-check the
+          // switches: a session registered before a flag went off cancels nothing.
+          const verified = verifyGuestRef(booking_ref, guest_ref);
+          const booking = gardssalgCancelToolEnabled() ? verified : null;
+          try {
+            logExperiencesInteraction({
+              skill: "cancel_gardssalg_booking",
+              ctx: { clientIdentity: getClientIdentity?.(), requestMeta: getRequestMeta?.() },
+            });
+          } catch { /* fail-open: never affects the tool result */ }
+          if (!booking) return jsonToolResult(gardssalgBookingNotFoundPayload());
+          const result = gardssalgCancelBooking(booking, reason);
+          if (result.cancelled) {
+            try {
+              await sendGuestCancelToProducer(result.cancelled.booking, result.cancelled.mode);
+            } catch {
+              // No reference or guest data in the log line.
+              console.error("[booking-cancel] mcp: producer cancel notice failed");
+            }
+          }
+          return jsonToolResult(result.payload);
+        } catch (err: any) {
+          return toolInternalError("cancel_gardssalg_booking", err);
+        }
+      }
+    );
+  }
 }
 
 // ─── Session management ──────────────────────────────────────

@@ -238,12 +238,13 @@ export function isOwnPlatformHomepage(row: {
 // untouched by this gate, exactly like before). Only 'retail_shop' is gated:
 // a producer's own farm shop ('farm_shop') and ordinary producers (NULL /
 // 'producer') are NEVER affected. `agents.retail_focus` ('frukt_gront' |
-// 'fisk' | 'annet') says what a retail_shop sells.
+// 'fisk' | 'kjott' | 'annet') says what a retail_shop sells.
 //
 // A retail_shop is outreach-eligible ONLY when BOTH hold:
-//   (a) retail_focus = 'frukt_gront'. 'fisk' is deliberately NOT allowed: Daniel
-//       has not answered whether fish shops count (open question in the
-//       dev-request) — it must be added here explicitly once he does.
+//   (a) retail_focus IN ('frukt_gront', 'fisk', 'kjott'). Independent fish
+//       shops ('fisk') and butchers ('kjott') were added by dev-request
+//       2026-11-15-rfb-butikkregel-fisk-og-kjott (slice E1, Daniel-authorized);
+//       'annet' stays OUT. Any further focus must be added here explicitly.
 //   (b) the profile passes the quality gate: about >= 150 chars AND the `about`
 //       field has a 'homepage' provenance record (own site), AND >= 3 products,
 //       AND the about text describes the business as a shop (butikk /
@@ -253,7 +254,7 @@ export function isOwnPlatformHomepage(row: {
 // retail_profile_not_ready (passes a, fails b). `k`/`a` must alias
 // agent_knowledge/agents. WHERE-clause use only; CASE guards make malformed
 // JSON in field_provenance/products fail the gate safely (excluded, no crash).
-export const RETAIL_SHOP_FOCUS_ALLOWED = ["frukt_gront"] as const;
+export const RETAIL_SHOP_FOCUS_ALLOWED = ["frukt_gront", "fisk", "kjott"] as const;
 export const RETAIL_SHOP_MIN_ABOUT_CHARS = 150;
 export const RETAIL_SHOP_MIN_PRODUCTS = 3;
 const RETAIL_SHOP_ABOUT_LIKE = [
@@ -3289,8 +3290,9 @@ function initSchema(db: Database.Database): void {
            POOL_OWN_PLATFORM_DOMAIN_EXCLUSION_SQL's own comment above. */
         AND ${POOL_OWN_PLATFORM_DOMAIN_EXCLUSION_SQL}
         /* dev-request 2026-10-01-rfb-butikker-i-outreach-poolen: a row marked
-           business_type='retail_shop' is out unless it is a fruit/veg shop
-           with an enriched, shop-describing profile. Producers and
+           business_type='retail_shop' is out unless it is a fruit/veg, fish
+           or meat shop (RETAIL_SHOP_FOCUS_ALLOWED) with an enriched,
+           shop-describing profile. Producers and
            producer-run farm shops (business_type NULL/'producer'/'farm_shop')
            are untouched. See POOL_RETAIL_SHOP_GATE_SQL's comment above. */
         AND ${POOL_RETAIL_SHOP_GATE_SQL}

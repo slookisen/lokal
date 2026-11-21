@@ -431,9 +431,18 @@ export function guestRefEnabled(): boolean {
   return process.env.GARDSSALG_MCP_GUEST_REF_ENABLED === "true";
 }
 
-function hashGuestRef(guestRef: string): string {
-  return createHash("sha256").update(guestRef, "utf8").digest("hex");
-}
+// An object, so a test can observe that verifyGuestRef() hashes in every
+// branch (O5-1 review N3).
+export const guestRefHasher = {
+  hash(guestRef: string): string {
+    return createHash("sha256").update(guestRef, "utf8").digest("hex");
+  },
+};
+const hashGuestRef = (guestRef: string): string => guestRefHasher.hash(guestRef);
+
+// Compared against when the row or its hash is missing, so an unknown
+// reference costs the same hash + compare as a known one (O5-1 review N3).
+const DUMMY_GUEST_REF_HASH = "0".repeat(64);
 
 /** Issues a new guest_ref for the booking, stores only its hash, returns the reference. */
 export function issueGuestRef(booking_id: string): string {
@@ -444,17 +453,22 @@ export function issueGuestRef(booking_id: string): string {
   return guestRef;
 }
 
-/** booking_ref + guest_ref -> the booking, or null on any mismatch (constant-time hash compare). */
+/**
+ * booking_ref + guest_ref -> the booking, or null on any mismatch. Always
+ * hashes the given guest_ref and runs one constant-time compare, also when
+ * the row or its hash is missing (then against a dummy hash), so the time
+ * taken does not tell whether a reference exists (O5-1 review N3).
+ */
 export function verifyGuestRef(booking_ref: unknown, guest_ref: unknown): GardssalgBooking | null {
   if (typeof booking_ref !== "string" || !booking_ref || typeof guest_ref !== "string" || !guest_ref) return null;
   const row = getDb(VERTICAL)
     .prepare("SELECT * FROM gardssalg_bookings WHERE booking_ref = ?")
     .get(booking_ref) as Record<string, unknown> | undefined;
-  const stored = typeof row?.guest_ref_hash === "string" ? row.guest_ref_hash : "";
-  if (!row || !/^[0-9a-f]{64}$/.test(stored)) return null;
-  const a = Buffer.from(stored, "hex");
+  const stored = typeof row?.guest_ref_hash === "string" && /^[0-9a-f]{64}$/.test(row.guest_ref_hash) ? row.guest_ref_hash : null;
+  const a = Buffer.from(stored ?? DUMMY_GUEST_REF_HASH, "hex");
   const b = Buffer.from(hashGuestRef(guest_ref), "hex");
-  return timingSafeEqual(a, b) ? hydrate(row) : null;
+  const match = timingSafeEqual(a, b);
+  return match && row && stored ? hydrate(row) : null;
 }
 
 export function getBookingByToken(
@@ -1247,6 +1261,11 @@ function slotNb(slot: string | null): string {
   });
 }
 
+/** The guest's one-shot link for answering a suggested time (the suggestion e-mail's link). */
+export function guestDecisionUrl(booking: GardssalgBooking): string | null {
+  return booking.guest_decision_token ? `${APP_URL}/kategori/gardssalg/gjestesvar/${booking.guest_decision_token}` : null;
+}
+
 /** The guest's read-only status page — the same link the guest e-mails carry. */
 export function guestStatusUrl(booking: GardssalgBooking): string | null {
   return booking.guest_status_token
@@ -1403,8 +1422,8 @@ ${statusFooterHtml(booking)}
 // Guest: the producer suggested a new time — carries the guest's one-shot
 // decision link. The producer's respond/confirm tokens must NEVER appear here.
 export async function sendSuggestionToGuest(booking: GardssalgBooking): Promise<void> {
-  if (!booking.guest_decision_token || !booking.suggested_slot_at) return;
-  const decisionUrl = `${APP_URL}/kategori/gardssalg/gjestesvar/${booking.guest_decision_token}`;
+  const decisionUrl = guestDecisionUrl(booking);
+  if (!decisionUrl || !booking.suggested_slot_at) return;
   const originalFormatted = slotNb(booking.slot_at);
   const suggestedFormatted = slotNb(booking.suggested_slot_at);
   const mail = guestEmailLang(booking) === "en"

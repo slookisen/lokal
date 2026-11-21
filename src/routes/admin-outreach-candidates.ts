@@ -8,7 +8,8 @@
 //           because the VIEW itself excludes all previously-contacted agents,
 //           making mode=second impossible if we only query the VIEW.
 //        2. cooldown / contacted (outreach_sent_log)
-//        3. not replied (crm_contacts → crm_threads → crm_messages direction='in')
+//        3. not replied (crm_contacts → crm_threads → crm_messages direction='in';
+//           matched by agent_id AND by contact e-mail, see loadRfbRepliedContactEmails)
 //        4. not opted-out (crm_contacts.status != 'active' OR
 //                          agent_knowledge.verification_status = 'opt_out')
 //        5. not a customer (customerRuleSql: claimed_at OR a verified agent_claims row)
@@ -347,6 +348,59 @@ export interface OutreachCandidatesResult {
 }
 
 /** ?cooldown_days → integer ≥ 1, default 60 (unchanged route semantics). */
+/** True when crm_contacts carries the vertical_id column (added by a later migration). */
+function crmContactsHasVerticalColumn(db: ReturnType<typeof getDb>): boolean {
+  try {
+    const cols = (db.prepare(`PRAGMA table_info(crm_contacts)`).all() as Array<{ name: string }>).map((c) => c.name);
+    return cols.includes("vertical_id");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Normalized (LOWER(TRIM())) e-mails of RFB crm_contacts that have replied:
+ * an inbound crm_messages row through crm_threads, or — once the 24-month
+ * retention job deleted the messages — retention_last_inbound_at set.
+ * Keyed by e-mail, NOT agent_id, so a reply on a contact row that was never
+ * (or only later) linked to the producer still counts. Same vertical only:
+ * a contact in another vertical (e.g. experiences) with the same address is
+ * a different relationship and does not suppress RFB outreach. Rows from
+ * before the vertical_id migration are RFB (COALESCE(…,'rfb'), the same
+ * default the schema uses). Read once per run (serverheng slice 5 pattern).
+ */
+export function loadRfbRepliedContactEmails(db: ReturnType<typeof getDb>): Set<string> {
+  const out = new Set<string>();
+  const verticalFilter = crmContactsHasVerticalColumn(db) ? "AND COALESCE(c.vertical_id, 'rfb') = 'rfb'" : "";
+  for (const r of db
+    .prepare(
+      `SELECT DISTINCT LOWER(TRIM(c.email)) AS e
+         FROM crm_messages m
+         JOIN crm_threads t ON t.id = m.thread_id
+         JOIN crm_contacts c ON c.id = t.contact_id
+        WHERE m.direction = 'in'
+          AND c.email IS NOT NULL
+          ${verticalFilter}`,
+    )
+    .all() as Array<{ e: string | null }>) {
+    if (r.e) out.add(r.e);
+  }
+  if (hasContactRetentionMarkers(db)) {
+    for (const r of db
+      .prepare(
+        `SELECT DISTINCT LOWER(TRIM(c.email)) AS e
+           FROM crm_contacts c
+          WHERE c.retention_last_inbound_at IS NOT NULL
+            AND c.email IS NOT NULL
+            ${verticalFilter}`,
+      )
+      .all() as Array<{ e: string | null }>) {
+      if (r.e) out.add(r.e);
+    }
+  }
+  return out;
+}
+
 export function parseOutreachCandidatesCooldownDays(raw: unknown): number {
   return Math.max(1, parseInt(String(raw ?? "60"), 10) || 60);
 }
@@ -595,9 +649,19 @@ export function computeOutreachCandidates(
       `).all() as Array<{ e: string | null }>) {
         if (r.e !== null) hardBouncedEmails.add(r.e);
       }
+      // Reply suppression by e-mail (svarsperre): a reply can sit on a
+      // crm_contacts row whose agent_id is still NULL (linked later, or never),
+      // which the agent_id-keyed has_replied column above cannot see. Resolve
+      // once per run the normalized e-mails of RFB contacts with an inbound
+      // message (or a retention reply marker) and OR them into has_replied.
+      // This can only hold MORE rows back, never let one in.
+      const repliedEmails = loadRfbRepliedContactEmails(db);
       for (const row of rows) {
         row.views_count = viewsByAgent.get(row.agent_id) ?? 0;
         row.is_hard_bounced = row.email_norm !== null && hardBouncedEmails.has(row.email_norm) ? 1 : 0;
+        if (row.has_replied !== 1 && row.email_norm !== null && repliedEmails.has(row.email_norm)) {
+          row.has_replied = 1;
+        }
       }
     }
 

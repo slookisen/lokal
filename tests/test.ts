@@ -1436,6 +1436,21 @@ console.log("\n── crm-service (resolveContact self-healing agent_id link) �
   console.log(`  crm-service-resolve-contact: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── crm-service: one-time relink of unlinked rfb contacts (svarsperre,
+// follow-up to lokal#1609). relinkUnlinkedRfb() + POST
+// /admin/crm/contacts/relink-unlinked: dry run by default, no writes in dry
+// run, audited + idempotent apply, no e-mail addresses in the response.
+console.log("\n── crm-service (relink unlinked rfb contacts) ──");
+{
+  const { runCrmServiceRelinkUnlinkedTests } = require("../src/services/crm-service-relink-unlinked.test") as
+    typeof import("../src/services/crm-service-relink-unlinked.test");
+  const r = runCrmServiceRelinkUnlinkedTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("crm-service-relink-unlinked: " + f);
+  console.log(`  crm-service-relink-unlinked: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── admin-outreach-candidates: belt-and-suspenders CRM-send guard (P0 fix) ──
 // Pins the defense-in-depth fix for the same 2026-07-11 P0 incident: an
 // independent recipient-email check against crm_messages, so a broken
@@ -1509,6 +1524,19 @@ console.log("── admin-outreach-candidates (max-touch-vern: mode=second exclu
   failed += r.failed;
   for (const f of r.failures) failures.push("admin-outreach-candidates-max-touch-vern: " + f);
   console.log(`  admin-outreach-candidates-max-touch-vern: ${r.passed} passed, ${r.failed} failed`);
+}
+
+// ── reply suppression also matches unlinked CRM contacts by e-mail (svarsperre) ──
+console.log("── admin-outreach-candidates (reply suppression by contact e-mail) ──");
+{
+  const { runAdminOutreachCandidatesReplyByEmailTests } =
+    require("../src/routes/admin-outreach-candidates-reply-by-email.test") as
+      typeof import("../src/routes/admin-outreach-candidates-reply-by-email.test");
+  const r = runAdminOutreachCandidatesReplyByEmailTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("admin-outreach-candidates-reply-by-email: " + f);
+  console.log(`  admin-outreach-candidates-reply-by-email: ${r.passed} passed, ${r.failed} failed`);
 }
 
 // ── dev-request 2026-08-29-outreach-max-touch-vern: send-time invariant on
@@ -32068,6 +32096,18 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gorg.failures) failures.push("opplevelser-gardssalg-outreach-reply-guard-touch-cap: " + f);
     console.log(`  opplevelser-gardssalg-outreach-reply-guard-touch-cap: ${gorg.passed} passed, ${gorg.failed} failed`);
 
+    // dev-request 2026-11-20-opplevagent-utsending-hele-sperrelista-og-rfb-svar: whole
+    // blocklist + cross-platform replies behind GARDSSALG_OUTREACH_FULL_SUPPRESSION_ENABLED,
+    // with the shadow report in daily-prep and the candidates route.
+    console.log("\n── opplevelser-gardssalg-outreach-full-suppression: whole blocklist + cross-platform replies ──");
+    const { runOpplevelserGardssalgOutreachFullSuppressionTests } = require("../src/routes/opplevelser-gardssalg-outreach-full-suppression.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-outreach-full-suppression.test");
+    const gofs = await runOpplevelserGardssalgOutreachFullSuppressionTests({ log: false });
+    passed += gofs.passed;
+    failed += gofs.failed;
+    for (const f of gofs.failures) failures.push("opplevelser-gardssalg-outreach-full-suppression: " + f);
+    console.log(`  opplevelser-gardssalg-outreach-full-suppression: ${gofs.passed} passed, ${gofs.failed} failed`);
+
     // dev-request 2026-11-15-opplevagent-fem-henvendelser, A1: rounds, template
     // per round without fallback, promise_given, ordering and per-round counts.
     console.log("\n── opplevelser-gardssalg-outreach-rounds-a1: rounds + promise_given + no_template_for_touch ──");
@@ -32303,6 +32343,31 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += gbcr.failed;
     for (const f of gbcr.failures) failures.push("opplevelser-gardssalg-bookings-count: " + f);
     console.log(`  opplevelser-gardssalg-bookings-count: ${gbcr.passed} passed, ${gbcr.failed} failed`);
+
+    // O5-8 (dev-request 2026-11-12-opplevagent-o5-besok-i-chatgpt-og-
+    // assistenter): book_gardssalg / discover_gardssalg outcome log and
+    // GET /admin/gardssalg/booking-funnel; tools/list stays byte-identical.
+    console.log("\n── opplevelser-gardssalg-mcp-funnel-o5-8: outcome log + admin booking funnel ──");
+    const { runOpplevelserGardssalgMcpFunnelTests } = require("../src/routes/opplevelser-gardssalg-mcp-funnel-o5-8.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-mcp-funnel-o5-8.test");
+    const gmf = await runOpplevelserGardssalgMcpFunnelTests({ log: false });
+    passed += gmf.passed;
+    failed += gmf.failed;
+    for (const f of gmf.failures) failures.push("opplevelser-gardssalg-mcp-funnel-o5-8: " + f);
+    console.log(`  opplevelser-gardssalg-mcp-funnel-o5-8: ${gmf.passed} passed, ${gmf.failed} failed`);
+
+    // O5-7: POST /api/opplevelser/book in the OpenAPI document, and
+    // book_gardssalg as an A2A task through the MCP tool's own chain (same
+    // row, same e-mails, same payload, same outcome rows, own quota bucket);
+    // tools/list stays byte-identical.
+    console.log("\n── experiences-a2a-book-gardssalg-o5-7: OpenAPI booking path + A2A booking task ──");
+    const { runExperiencesA2aBookGardssalgTests } = require("../src/routes/experiences-a2a-book-gardssalg-o5-7.test") as
+      typeof import("../src/routes/experiences-a2a-book-gardssalg-o5-7.test");
+    const eabg = await runExperiencesA2aBookGardssalgTests({ log: false });
+    passed += eabg.passed;
+    failed += eabg.failed;
+    for (const f of eabg.failures) failures.push("experiences-a2a-book-gardssalg-o5-7: " + f);
+    console.log(`  experiences-a2a-book-gardssalg-o5-7: ${eabg.passed} passed, ${eabg.failed} failed`);
 
     // O1-1 (R1/R11): booking follow-up after restart — first run 5 min after
     // boot, clock from the registered producer notification, one retry +
@@ -33227,6 +33292,58 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += gmgr.failed;
     for (const f of gmgr.failures) failures.push("opplevelser-gardssalg-mcp-guest-ref-o5-1: " + f);
     console.log(`  opplevelser-gardssalg-mcp-guest-ref-o5-1: ${gmgr.passed} passed, ${gmgr.failed} failed`);
+
+    // O5-2 (same dev-request): get_gardssalg_booking behind
+    // GARDSSALG_MCP_STATUS_TOOL_ENABLED; flag off tools/list byte-identical,
+    // one not-found answer for any wrong pair, verifyGuestRef always hashes
+    // (O5-1 review N3), lookup quota.
+    console.log("\n── opplevelser-gardssalg-mcp-status-tool-o5-2: get_gardssalg_booking behind flag ──");
+    const { runOpplevelserGardssalgMcpStatusToolTests } = require("../src/routes/opplevelser-gardssalg-mcp-status-tool-o5-2.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-mcp-status-tool-o5-2.test");
+    const gmst = await runOpplevelserGardssalgMcpStatusToolTests({ log: false });
+    passed += gmst.passed;
+    failed += gmst.failed;
+    for (const f of gmst.failures) failures.push("opplevelser-gardssalg-mcp-status-tool-o5-2: " + f);
+    console.log(`  opplevelser-gardssalg-mcp-status-tool-o5-2: ${gmst.passed} passed, ${gmst.failed} failed`);
+
+    // O5-3 (same dev-request): cancel_gardssalg_booking behind
+    // GARDSSALG_MCP_CANCEL_TOOL_ENABLED (and O1-5's GARDSSALG_CANCEL_ENABLED);
+    // flag off tools/list byte-identical, cancels through O1-5 with one
+    // producer e-mail, idempotent second call, not-found for a wrong pair,
+    // own cancel quota.
+    console.log("\n── opplevelser-gardssalg-mcp-cancel-tool-o5-3: cancel_gardssalg_booking behind flag ──");
+    const { runOpplevelserGardssalgMcpCancelToolTests } = require("../src/routes/opplevelser-gardssalg-mcp-cancel-tool-o5-3.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-mcp-cancel-tool-o5-3.test");
+    const gmct = await runOpplevelserGardssalgMcpCancelToolTests({ log: false });
+    passed += gmct.passed;
+    failed += gmct.failed;
+    for (const f of gmct.failures) failures.push("opplevelser-gardssalg-mcp-cancel-tool-o5-3: " + f);
+    console.log(`  opplevelser-gardssalg-mcp-cancel-tool-o5-3: ${gmct.passed} passed, ${gmct.failed} failed`);
+
+    // O5-4 (same dev-request): book_gardssalg preview + shares/privacy/age lines
+    // and the C1/C2 tool texts behind GARDSSALG_MCP_PREVIEW_ENABLED; flag off
+    // tools/list and results byte-identical, preview stores and sends nothing.
+    console.log("\n── opplevelser-gardssalg-mcp-preview-o5-4: book_gardssalg preview behind flag ──");
+    const { runOpplevelserGardssalgMcpPreviewTests } = require("../src/routes/opplevelser-gardssalg-mcp-preview-o5-4.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-mcp-preview-o5-4.test");
+    const gmpv = await runOpplevelserGardssalgMcpPreviewTests({ log: false });
+    passed += gmpv.passed;
+    failed += gmpv.failed;
+    for (const f of gmpv.failures) failures.push("opplevelser-gardssalg-mcp-preview-o5-4: " + f);
+    console.log(`  opplevelser-gardssalg-mcp-preview-o5-4: ${gmpv.passed} passed, ${gmpv.failed} failed`);
+
+    // O5-5 (same dev-request): discover_gardssalg rows carry the producer's own
+    // opening hours + visit description behind GARDSSALG_MCP_VISIT_FACTS_ENABLED;
+    // flag off rows and tools/list byte-identical, content rules (no product,
+    // brand, price or strength).
+    console.log("\n── opplevelser-gardssalg-mcp-visit-facts-o5-5: discover_gardssalg visit facts behind flag ──");
+    const { runOpplevelserGardssalgMcpVisitFactsTests } = require("../src/routes/opplevelser-gardssalg-mcp-visit-facts-o5-5.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-mcp-visit-facts-o5-5.test");
+    const gmvf = await runOpplevelserGardssalgMcpVisitFactsTests({ log: false });
+    passed += gmvf.passed;
+    failed += gmvf.failed;
+    for (const f of gmvf.failures) failures.push("opplevelser-gardssalg-mcp-visit-facts-o5-5: " + f);
+    console.log(`  opplevelser-gardssalg-mcp-visit-facts-o5-5: ${gmvf.passed} passed, ${gmvf.failed} failed`);
 
     // dev-request 2026-10-03-booking-avlistet-produsent-bypass: a catalog_hidden=1
     // (delisted) producer is never dispatched to; the test provider has its own
@@ -37402,6 +37519,20 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
   } catch (err: any) {
     failed++;
     failures.push("opplevelser-providers-recently-enriched: unexpected error: " + String(err?.message || err));
+  }
+
+  console.log("\n── orch-pr-20261120-stikkprove-lagret: recently-enriched include_stored=1 top-up (rfb/dental/experiences) ──");
+  try {
+    const { runRecentlyEnrichedIncludeStoredTests } = require("../src/routes/recently-enriched-include-stored.test") as
+      typeof import("../src/routes/recently-enriched-include-stored.test");
+    const ris = await runRecentlyEnrichedIncludeStoredTests({ log: false });
+    passed += ris.passed;
+    failed += ris.failed;
+    for (const f of ris.failures) failures.push("recently-enriched-include-stored: " + f);
+    console.log(`  recently-enriched-include-stored: ${ris.passed} passed, ${ris.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("recently-enriched-include-stored: unexpected error: " + String(err?.message || err));
   }
 
   // dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-hygiene:
@@ -48921,6 +49052,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-26-lokal-agent-verifier-snapshot-drift-toleranse (slice 6):
+// http_unreachable snapshot claims use the queue kinds' fixed ±2 fallback
+// (the gauge cannot be rebuilt as of read_at); other non-queue kinds stay exact.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-26-lokal-agent-verifier-snapshot-drift-toleranse: http_unreachable ±2 ──");
+  try {
+    const { runAdminVerifierClaimCountsHttpUnreachableTests } =
+      require("../src/routes/admin-verifier-claim-counts-http-unreachable.test") as
+        typeof import("../src/routes/admin-verifier-claim-counts-http-unreachable.test");
+    const hu = await runAdminVerifierClaimCountsHttpUnreachableTests({ log: false });
+    passed += hu.passed;
+    failed += hu.failed;
+    for (const f of hu.failures) failures.push("admin-verifier-claim-counts-http-unreachable: " + f);
+    console.log(`  admin-verifier-claim-counts-http-unreachable: ${hu.passed} passed, ${hu.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-verifier-claim-counts-http-unreachable: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-02-experiences-karantene-utgang-match-til-verified: the
 // content-judge sweep's new quarantine-exit promotion transition
 // (needs_review -> verified, gated on judge MATCH + provider brreg_active=1
@@ -52801,6 +52952,41 @@ runSerial(async () => {
   }
 });
 
+// A2A dev-request 2026-11-12-opplevagent-o3-eierkrav-og-innlogging, O3-4:
+// «Du er nå eier av profilen» once per completed claim + CRM copy (AK1-AK3).
+runSerial(async () => {
+  console.log("\n── O3-4: velkomst-e-post etter fullført eierkrav ──");
+  try {
+    const { runGardssalgClaimWelcomeO34Tests } = require("../src/routes/gardssalg-claim-welcome-o3-4.test") as
+      typeof import("../src/routes/gardssalg-claim-welcome-o3-4.test");
+    const r = await runGardssalgClaimWelcomeO34Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-claim-welcome-o3-4: " + f);
+    console.log(`  gardssalg-claim-welcome-o3-4: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-claim-welcome-o3-4: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// A2A dev-request 2026-11-12-opplevagent-o3-eierkrav-og-innlogging, O3-5: manual claim queue + domain rule.
+runSerial(async () => {
+  console.log("\n── O3-5: manuelle eierkrav — adminkø og domeneregel ──");
+  try {
+    const { runGardssalgManualClaimsO35Tests } = require("../src/routes/gardssalg-manual-claims-o3-5.test") as
+      typeof import("../src/routes/gardssalg-manual-claims-o3-5.test");
+    const r = await runGardssalgManualClaimsO35Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-manual-claims-o3-5: " + f);
+    console.log(`  gardssalg-manual-claims-o3-5: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-manual-claims-o3-5: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 pkt 4: eid profil —
 // eierens pause / «fjern» / kvalitetsskjul, og admin-spaken på eide rader.
 runSerial(async () => {
@@ -55143,5 +55329,46 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("selvreg-uten-nettside: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-11-15-rfb-adressekonflikt-smal-regel-torrkjoring, G1:
+// GET /admin/address-conflict-breakdown, a READ-ONLY count of the
+// address_conflict / address_uncorroborated cohort (AK1 no writes, AK2
+// sum_of_groups == total). Own in-memory DB; swaps ADMIN_KEY (restored in
+// finally), so runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── G1: adressekonflikt-telling (GET /admin/address-conflict-breakdown) ──");
+  try {
+    const { runAdminAddressConflictBreakdownTests } = require("../src/routes/admin-address-conflict-breakdown.test") as
+      typeof import("../src/routes/admin-address-conflict-breakdown.test");
+    const r = await runAdminAddressConflictBreakdownTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-address-conflict-breakdown: " + f);
+    console.log(`  admin-address-conflict-breakdown: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-address-conflict-breakdown: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-11-15-rfb-butikkregel-fisk-og-kjott, slice E2: READ-ONLY
+// classification dry-run suggests retail_focus (fisk/kjott/frukt_gront/annet),
+// reason, chain names, scope=all and counts. Own in-memory DB; swaps
+// ADMIN_KEY (restored in finally), so runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── E2: butikk-klassifisering fisk/kjøtt (GET /admin/agents/business-type/classification-dryrun) ──");
+  try {
+    const { runAdminAgentsBusinessTypeE2Tests } = require("../src/routes/admin-agents-business-type-e2.test") as
+      typeof import("../src/routes/admin-agents-business-type-e2.test");
+    const r = await runAdminAgentsBusinessTypeE2Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-agents-business-type-e2: " + f);
+    console.log(`  admin-agents-business-type-e2: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-agents-business-type-e2: unexpected error: " + String(err?.message || err));
   }
 });

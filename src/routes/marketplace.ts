@@ -82,6 +82,7 @@ import { invalidateAgentGeocode } from "../services/agent-geocode-reset";
 import { scheduleRegistrationConfirmation } from "../services/registration-confirmation";
 // dev-request 2026-11-10-rfb-registreringer-og-eierkrav-folges-opp (S2).
 import { scheduleRegistrationPrecheck } from "../services/registration-precheck";
+import { wantsStoredTopUp, notInClause, mergeSample } from "./recently-enriched-sample";
 import {
   publicFieldChoices, publicFieldChoicesForMany, withoutHiddenContact, withoutHiddenFields, publicAgentInfo,
   withoutHiddenCoordinates, hidesPrices, hidesTrust, type PublicFieldChoices,
@@ -6104,6 +6105,18 @@ router.get("/admin/agents/dump", (req: Request, res: Response) => {
 //                        Dev-request 2026-10-06-kvalitetsmaling-stikkprove-og-wcr
 //                        slice 2: W41/W42 spot-checks sampled enriched-but-empty
 //                        rows and got checked=0.
+//   ?include_stored=1  — top up the sample from content already stored when
+//                        the window yields fewer than `limit` rows (dev-request
+//                        slice c, 2026-11-20: a write pause empties the window
+//                        and blinds the spot-check that should judge it).
+//                        Window rows come first, exactly as without the param;
+//                        the remainder is random agents enriched at ANY time
+//                        (last_enriched_at NOT NULL), is_active = 1, and ALWAYS
+//                        with a checkable field (the with_fields rule), no
+//                        duplicates. Only with this param: each agent carries
+//                        `sample_source: "recent" | "stored"` and the response
+//                        carries `sample_source_counts: { recent, stored }`.
+//                        Off by default (response unchanged).
 //
 // Random-sampled (ORDER BY RANDOM()) rather than deterministic — the
 // point is a spot-check, not the same agents every run.
@@ -6137,9 +6150,9 @@ router.get("/admin/agents/recently-enriched", (req: Request, res: Response) => {
     limit = Math.min(50, Math.max(1, limit));
 
     const withFields = req.query.with_fields === "1";
-    const fieldsClause = withFields
-      ? `AND (COALESCE(TRIM(k.phone), '') <> '' OR COALESCE(TRIM(k.address), '') <> '' OR COALESCE(TRIM(k.about), '') <> '')`
-      : "";
+    const checkableFieldsSql = `AND (COALESCE(TRIM(k.phone), '') <> '' OR COALESCE(TRIM(k.address), '') <> '' OR COALESCE(TRIM(k.about), '') <> '')`;
+    const fieldsClause = withFields ? checkableFieldsSql : "";
+    const includeStored = wantsStoredTopUp(req.query.include_stored);
 
     const rows = db.prepare(`
       SELECT a.id as id, a.name as name, a.url as website,
@@ -6152,7 +6165,7 @@ router.get("/admin/agents/recently-enriched", (req: Request, res: Response) => {
       LIMIT ?
     `).all(since, limit) as any[];
 
-    const agents = rows.map((r) => {
+    const toAgent = (r: any) => {
       let fieldProvenance: Record<string, unknown> = {};
       if (r.field_provenance) {
         try {
@@ -6178,9 +6191,42 @@ router.get("/admin/agents/recently-enriched", (req: Request, res: Response) => {
         last_enriched_at: r.last_enriched_at,
         field_provenance: fieldProvenance,
       };
-    });
+    };
 
-    res.json({ success: true, count: agents.length, agents });
+    const agents = rows.map(toAgent);
+
+    if (!includeStored) {
+      res.json({ success: true, count: agents.length, agents });
+      return;
+    }
+
+    // include_stored=1: top up from stored content. Same filters as the window
+    // query except the `since` bound — and the checkable-fields rule is always
+    // on, since a stored row with nothing to check would only re-create the
+    // checked=0 this top-up exists to remove.
+    let storedAgents: ReturnType<typeof toAgent>[] = [];
+    const remaining = limit - agents.length;
+    if (remaining > 0) {
+      const exclude = notInClause("a.id", agents.map((a) => String(a.id)));
+      const storedRows = db.prepare(`
+        SELECT a.id as id, a.name as name, a.url as website,
+               a.city as location_city,
+               k.last_enriched_at as last_enriched_at, k.field_provenance as field_provenance
+        FROM agents a
+        JOIN agent_knowledge k ON k.agent_id = a.id
+        WHERE k.last_enriched_at IS NOT NULL AND a.is_active = 1 ${checkableFieldsSql} ${exclude.sql}
+        ORDER BY RANDOM()
+        LIMIT ?
+      `).all(...exclude.params, remaining) as any[];
+      storedAgents = storedRows.map(toAgent);
+    }
+    const merged = mergeSample(agents, storedAgents, limit);
+    res.json({
+      success: true,
+      count: merged.rows.length,
+      agents: merged.rows,
+      sample_source_counts: merged.counts,
+    });
   } catch (err: any) {
     res.status(500).json({ error: "recently-enriched fetch failed", detail: err?.message ?? String(err) });
   }

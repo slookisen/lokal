@@ -1188,6 +1188,22 @@ export function initExperiencesSchema(db: Database.Database): void {
   `);
   db.exec("CREATE INDEX IF NOT EXISTS idx_gardssalg_notify_address_token ON gardssalg_notify_address(token_hash)");
 
+  // ─── O5-8: book_gardssalg / discover_gardssalg outcome log (same
+  // dev-request). One row per MCP call: when, a fixed outcome code
+  // (GARDSSALG_FUNNEL_OUTCOMES in services/gardssalg-mcp-funnel.ts) and the
+  // assistant label (SOURCE_CLIENT_LABELS, NULL when unknown). No guest data,
+  // no booking_ref, no provider_id. The writer prunes rows older than 90
+  // days. Additive.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS gardssalg_mcp_funnel_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      created_at TEXT NOT NULL,
+      outcome TEXT NOT NULL,
+      source_client TEXT
+    )
+  `);
+  db.exec("CREATE INDEX IF NOT EXISTS idx_gardssalg_mcp_funnel_created ON gardssalg_mcp_funnel_events(created_at)");
+
   // ─── listing_url (dev-request 2026-07-12-experiences-enrichment-supply-
   // and-aggregator-hygiene, Daniel's 2026-07-19 decision, step 1) ───────────
   // A chunk of experience_providers.hjemmeside rows carry a DMO/aggregator/
@@ -1365,6 +1381,33 @@ export function initExperiencesSchema(db: Database.Database): void {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_claims_created ON gardssalg_claims(provider_id, created_at)`);
   } catch (e) {
     console.log(`[experiences] gardssalg_claims init skipped: ${(e as Error).message}`);
+  }
+
+  // ─── gardssalg_manual_claims (O3-5): the admin queue for owner claims without
+  // self-service (services/gardssalg-manual-claims.ts). Additive; may stay on rollback.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS gardssalg_manual_claims (
+        id TEXT PRIMARY KEY,
+        provider_id TEXT NOT NULL REFERENCES experience_providers(id) ON DELETE CASCADE,
+        claimant_name TEXT NOT NULL,
+        claimant_email TEXT NOT NULL,
+        message TEXT,
+        reason TEXT NOT NULL, -- 'not_brreg_verified' | 'no_org_linked_email'
+        status TEXT NOT NULL DEFAULT 'pending', -- 'pending' | 'approved' | 'rejected'
+        created_at TEXT NOT NULL,
+        decided_at TEXT,
+        decision_note TEXT,
+        domain_rule TEXT, -- JSON: the domain rule's outcome at decision time
+        old_value TEXT, -- JSON: the provider's ownership state before the decision
+        granted_claim_id TEXT,
+        receipt_sent_at TEXT
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_manual_claims_status ON gardssalg_manual_claims(status, created_at)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_manual_claims_provider ON gardssalg_manual_claims(provider_id)`);
+  } catch (e) {
+    console.log(`[experiences] gardssalg_manual_claims init skipped: ${(e as Error).message}`);
   }
 
   // ─── claimed_at (dev-request 2026-08-03-claim-bekreftet-merke-og-innlogging)

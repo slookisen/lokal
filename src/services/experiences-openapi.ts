@@ -256,6 +256,82 @@ export function getExperiencesOpenapi(): object {
           },
         },
       },
+      // O5-7: the booking route the book_gardssalg MCP tool and the npm stdio
+      // server map onto. Describes POST /api/opplevelser/book as it is in
+      // routes/opplevelser.ts; field rules are BookingInputSchema's
+      // (services/booking-store.ts).
+      "/api/opplevelser/book": {
+        post: {
+          operationId: "bookGardssalgVisit",
+          summary: "Request a gårdssalg visit (pending until the producer replies)",
+          description:
+            "Sends a visit REQUEST to a gårdssalg (farm-sale drink producer). It never creates a confirmed booking: " +
+            "the request stays pending until the producer answers by e-mail (confirms, suggests another time or " +
+            "declines). No payment is taken; the visit is paid on arrival. Give `provider_id` (the `id` of a " +
+            "GardssalgProducer) or `provider_query` (the producer's name); a name that matches no producer or " +
+            "several gives `not_found` or the candidates, and no request is created. Only producers whose " +
+            "`booking.live` is true take requests. The same request can be sent as the MCP tool `book_gardssalg` " +
+            "or as the A2A skill `book_gardssalg` on POST /a2a.",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/GardssalgBookingRequest" },
+                examples: {
+                  byName: {
+                    summary: "One sentence: by producer name, with the weekday check",
+                    value: {
+                      provider_query: "Fjordgard Bryggeri",
+                      slot_at: "2026-10-23T10:00",
+                      requested_weekday: "fredag",
+                      party_size: 4,
+                      guest_name: "Kari Nordmann",
+                      guest_email: "kari@example.no",
+                    },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            "201": {
+              description: "Request created (status `reserved`, pending the producer's reply).",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      success: { type: "boolean", enum: [true] },
+                      booking_ref: { type: "string" },
+                      status: { type: "string" },
+                      source: { type: "string" },
+                      provider: { $ref: "#/components/schemas/GardssalgBookingProvider" },
+                      slot_at_local: { type: "string", description: "The requested time in words, Europe/Oslo." },
+                      party_size: { type: "integer" },
+                      producer_notification: {
+                        type: "object",
+                        properties: { status: { type: "string", description: "`queued` = the producer e-mail is being sent; `not_live` = the producer has no address on file." } },
+                      },
+                      guest_token: { type: "string", description: "The guest's own token for the confirmation page." },
+                      message: { type: "string" },
+                    },
+                  },
+                },
+              },
+            },
+            "200": {
+              description:
+                "No new request: the producer was not found or the name matched several (`candidates`), the weekday " +
+                "did not match `slot_at` (`weekday_mismatch`), booking is paused (`paused`), the time is outside " +
+                "the stated opening hours (`outside_hours`, resend with `confirm_outside_hours: true` to keep it), " +
+                "the same request already exists (`duplicate`) or a request cap is reached (`cap_reached`).",
+              content: { "application/json": { schema: { type: "object", properties: { success: { type: "boolean" } } } } },
+            },
+            "400": { description: "Invalid request (missing provider, invalid fields, unknown weekday, or a time in the past / too far ahead)." },
+            "500": { description: "The request could not be created." },
+          },
+        },
+      },
       "/api/opplevelser/{id}": {
         get: {
           operationId: "getExperience",
@@ -293,7 +369,14 @@ export function getExperiencesOpenapi(): object {
                   properties: {
                     jsonrpc: { type: "string", enum: ["2.0"] },
                     method: { type: "string", enum: ["message/send", "tasks/send"] },
-                    params: { type: "object" },
+                    params: {
+                      type: "object",
+                      description:
+                        "`message` (text and/or a DataPart). For a gårdssalg visit request, name the skill " +
+                        "`book_gardssalg` (`skillId`, `metadata.skillId` or `message.metadata.skillId`) and send the " +
+                        "GardssalgBookingRequest fields as the message's DataPart; the answer is the same as the " +
+                        "MCP tool `book_gardssalg`.",
+                    },
                     id: { type: ["string", "number"] },
                   },
                 },
@@ -301,6 +384,31 @@ export function getExperiencesOpenapi(): object {
                   discover: {
                     summary: "Discover experiences by county and weather",
                     value: { jsonrpc: "2.0", method: "message/send", params: { message: { text: "hva kan vi finne på i Oslo når det regner" } }, id: "1" },
+                  },
+                  bookGardssalg: {
+                    summary: "Request a gårdssalg visit (skill book_gardssalg)",
+                    value: {
+                      jsonrpc: "2.0",
+                      method: "message/send",
+                      params: {
+                        skillId: "book_gardssalg",
+                        message: {
+                          role: "user",
+                          parts: [{
+                            kind: "data",
+                            data: {
+                              provider_query: "Fjordgard Bryggeri",
+                              slot_at: "2026-10-23T10:00",
+                              requested_weekday: "fredag",
+                              party_size: 4,
+                              guest_name: "Kari Nordmann",
+                              guest_email: "kari@example.no",
+                            },
+                          }],
+                        },
+                      },
+                      id: "2",
+                    },
                   },
                 },
               },
@@ -383,6 +491,38 @@ export function getExperiencesOpenapi(): object {
                 "provider's exact street address (precise). 'kommune' = a municipality centroid (approximate — " +
                 "do not present distance_km as exact for these rows). Only present when lat/lng were given.",
             },
+          },
+        },
+        GardssalgBookingRequest: {
+          type: "object",
+          description:
+            "A gårdssalg visit request — the body of `POST /api/opplevelser/book`, the arguments of the MCP tool " +
+            "`book_gardssalg` and the DataPart of the A2A skill `book_gardssalg`. One of `provider_id` or `provider_query` is required.",
+          required: ["slot_at", "party_size", "guest_name", "guest_email"],
+          properties: {
+            provider_id: { type: "string", minLength: 1, description: "The producer's `id` (GardssalgProducer.id). Wins over `provider_query`." },
+            provider_query: { type: "string", maxLength: 200, description: "The producer's name, optionally with a place, resolved to exactly one producer." },
+            requested_weekday: { type: "string", maxLength: 20, description: "The weekday the guest said (e.g. «fredag»); a `slot_at` on another weekday gives `weekday_mismatch` and no request." },
+            experience_id: { type: "string", description: "Optional experience UUID for a specific listed experience." },
+            slot_at: { type: "string", minLength: 1, description: "Requested visit time, Europe/Oslo, `YYYY-MM-DDTHH:MM`." },
+            party_size: { type: "integer", minimum: 1, maximum: 50 },
+            guest_name: { type: "string", minLength: 1, maxLength: 200, description: "The guest's own name." },
+            guest_email: { type: "string", format: "email", description: "The guest's own e-mail; receives a receipt with a read-only status link." },
+            guest_phone: { type: "string", maxLength: 30 },
+            notes: { type: "string", maxLength: 500, description: "Free-text note to the producer." },
+            confirm_outside_hours: { type: "boolean", description: "Only on a resend after `outside_hours`, to keep that time." },
+            lang: { type: "string", enum: ["nb", "en"], description: "REST only: the language of the guest's e-mails (default nb)." },
+          },
+        },
+        GardssalgBookingProvider: {
+          type: "object",
+          nullable: true,
+          description: "The producer a request was sent to.",
+          properties: {
+            id: { type: "string" },
+            navn: { type: "string" },
+            profile_url: { type: "string", nullable: true },
+            resolved_from_query: { type: "string", description: "Only when found by `provider_query`." },
           },
         },
         GardssalgProducer: {

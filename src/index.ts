@@ -167,6 +167,8 @@ import adminOwnerGateImpactRoutes from "./routes/admin-owner-gate-impact";
 import adminRfbWebsiteDiscoveryRoutes from "./routes/admin-rfb-website-discovery";
 import adminRfbBrregSelfSufficiencyRoutes from "./routes/admin-rfb-brreg-selfsufficiency";
 import adminPoolBlockerExplainRoutes from "./routes/admin-pool-blocker-explain";
+import adminAddressConflictBreakdownRoutes from "./routes/admin-address-conflict-breakdown";
+import adminGardssalgManualClaimsRoutes from "./routes/admin-gardssalg-manual-claims";
 import adminHomepageProvenanceCohortRoutes from "./routes/admin-homepage-provenance-cohort";
 import adminDodBulkRoutes from "./routes/admin-dod-bulk";
 import adminRfbContactExtractionRoutes from "./routes/admin-rfb-contact-extraction";
@@ -1298,6 +1300,14 @@ app.use("/admin", adminLimiter, adminRfbBrregSelfSufficiencyRoutes);
 // homepage-provenance-batch auto-select leg blocks a given agent, with the
 // same predicates production uses. GET /admin/pool-blocker-explain.
 app.use("/admin/pool-blocker-explain", adminLimiter, adminPoolBlockerExplainRoutes);
+// dev-request 2026-11-15-rfb-adressekonflikt-smal-regel-torrkjoring, G1:
+// READ-ONLY count of the address_conflict / address_uncorroborated
+// quarantine cohort by postnummer/kommune agreement and source pair, with
+// examples. GET /admin/address-conflict-breakdown.
+app.use("/admin/address-conflict-breakdown", adminLimiter, adminAddressConflictBreakdownRoutes);
+// O3-5 (dev-request 2026-11-12-opplevagent-o3-eierkrav-og-innlogging): the admin
+// queue for gårdssalg owner claims without self-service. Writes dry-run by default.
+app.use("/admin/gardssalg-manual-claims", adminLimiter, adminGardssalgManualClaimsRoutes);
 // dev-request 2026-08-10-rfb-hjemmesidejakt-full-loype, Skive 3 follow-up:
 // READ-ONLY, paginated listing of the agent IDs POST /admin/homepage-
 // provenance-batch's default auto-select would pick next (identical

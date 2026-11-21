@@ -8,6 +8,14 @@
  *   message/send  — natural-language or structured experience discovery
  *   tasks/send    — backward-compat alias for older A2A clients (<0.3)
  *
+ * Skill `book_gardssalg` (O5-7): a message/send (or tasks/send) that names
+ * skillId "book_gardssalg" (params.skillId, params.metadata.skillId or
+ * params.message.metadata.skillId) and carries the booking fields as message
+ * data runs the book_gardssalg MCP tool's own chain
+ * (experiences-mcp.ts runBookGardssalgWithFunnelOutcome): same validation,
+ * gates, caps, texts and O5-8 outcome row, and the same side-effect quota
+ * numbers in an A2A bucket of its own.
+ *
  * Intentionally does NOT implement tasks/get, tasks/list, or
  * agent/authenticatedExtendedCard: experience discovery is stateless
  * (request/response) so task-lifecycle methods add no value in v0.1.
@@ -72,6 +80,12 @@ import { rpcInternalErrorReply } from "../utils/internal-error";
 // catalog_hidden arg is needed. One shared note source (dev-request
 // 2026-10-22-opplevagent-mine-valg-gardssalg, G1 item 7).
 import { gardssalgBookingStatus } from "../services/gardssalg-booking-gate";
+import rateLimit from "express-rate-limit";
+import { MCP_RATE_LIMIT_PROFILES, googleRangesAwareMax, sendMcpRateLimited } from "../middleware/mcp-rate-limit";
+import { aiClientFromHeaders, sourceClientLabel } from "../utils/url-utm";
+// Types only: the router itself is require()d on use (it starts a session
+// timer when loaded), as mcp-tool-manifest.ts does.
+import type { BookGardssalgArgs } from "./experiences-mcp";
 
 export { parseExperiencesIntent };
 
@@ -722,6 +736,81 @@ export function handleExperiencesMessageSend(
   }
 }
 
+// ─── book_gardssalg skill (O5-7) ─────────────────────────────
+
+/** The A2A skill id of a gårdssalg visit request: the MCP tool's own name. */
+export const A2A_BOOK_GARDSSALG_SKILL = "book_gardssalg";
+
+/** The skill id a message/send names (params.skillId, params.metadata.skillId or message.metadata.skillId), as in a2a.ts. */
+export function requestedExperiencesSkillId(params: unknown): string | undefined {
+  const p = params && typeof params === "object" ? (params as any) : undefined;
+  const id = p?.skillId ?? p?.metadata?.skillId ?? p?.message?.metadata?.skillId;
+  return typeof id === "string" && id.trim() ? id.trim() : undefined;
+}
+
+/** Whether a JSON-RPC body is a book_gardssalg call (message/send or tasks/send naming the skill). */
+export function isA2aBookGardssalgCall(body: unknown): boolean {
+  if (!body || typeof body !== "object") return false;
+  const b = body as Record<string, unknown>;
+  return (b.method === "message/send" || b.method === "tasks/send") && requestedExperiencesSkillId(b.params) === A2A_BOOK_GARDSSALG_SKILL;
+}
+
+/**
+ * A book_gardssalg message/send: the booking fields come as message data
+ * (a DataPart, or message.data), are read with the tool's own loose input
+ * schema, and go to the tool's own chain. The answer carries the tool's JSON
+ * payload unchanged as a DataPart and its `message` as a TextPart. Nothing
+ * about the guest is logged here: the interaction row holds the booking
+ * reference only, as the MCP tool's does.
+ */
+export async function handleExperiencesBookGardssalg(
+  params: unknown,
+  id: unknown,
+  ctx: { requestMeta?: RequestMeta; headers?: Record<string, string | string[] | undefined> } = {},
+): Promise<object> {
+  const p = params && typeof params === "object" ? (params as Record<string, unknown>) : {};
+  if (!p.message) return rpcErr(id, -32602, "Invalid params: 'message' required");
+  const data = a2aMessageData(p.message);
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return rpcErr(id, -32602, "Invalid params: book_gardssalg needs the booking fields as message data (a DataPart).");
+  }
+  const mcp = require("./experiences-mcp") as typeof import("./experiences-mcp");
+  const args = z.object(mcp.bookGardssalgInputShape()).safeParse(data);
+  if (!args.success) {
+    const issues = args.error.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`).join("; ");
+    return rpcErr(id, -32602, `Invalid params: ${issues}`);
+  }
+  const sourceClient = sourceClientLabel(aiClientFromHeaders(ctx.headers, null));
+  try {
+    const result = await mcp.runBookGardssalgWithFunnelOutcome(args.data as BookGardssalgArgs, {
+      sourceClient: () => sourceClient,
+      logInteraction: (bookingRef) => logExperiencesInteraction({ skill: A2A_BOOK_GARDSSALG_SKILL, queryText: bookingRef, ctx: { requestMeta: ctx.requestMeta } }),
+    });
+    let payload: Record<string, unknown> | null = null;
+    try {
+      const parsed = JSON.parse(String(result.content?.[0]?.text ?? ""));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) payload = parsed as Record<string, unknown>;
+    } catch { /* the tool's internal-error text is not JSON */ }
+    // The tool already logged the error; the answer is JSON-RPC's generic one.
+    if (!payload) return rpcErr(id, -32603, "Internal error");
+    const text = typeof payload.message === "string" ? payload.message : null;
+    return rpcOk(id, {
+      taskId: `gardssalg-book-${Date.now()}`,
+      status: { state: result.isError ? "failed" : "completed", timestamp: new Date().toISOString() },
+      artifacts: [
+        {
+          artifactId: "gardssalg-book-result",
+          name: "gardssalg-book-result",
+          parts: [...(text ? [{ kind: "text", text }] : []), { kind: "data", data: payload }],
+        },
+      ],
+      metadata: { skill: A2A_BOOK_GARDSSALG_SKILL },
+    });
+  } catch (err: unknown) {
+    return rpcInternalError(id, "message/send (book_gardssalg)", err);
+  }
+}
+
 /** Experience and gårdssalg ids in a message/send answer (discover lists or the single experience). */
 export function experiencesAnswerProfileIds(answer: unknown): string[] {
   const ids: string[] = [];
@@ -744,6 +833,23 @@ export function experiencesAnswerProfileIds(answer: unknown): string[] {
 // See module docstring for why this is done here rather than in index.ts.
 router.use(jsonRpcLimiter);
 
+// O5-7: book_gardssalg's side-effect quota, the MCP profile's own numbers and
+// key (MCP_RATE_LIMIT_PROFILES.experiences.sideEffect), in a bucket of its own
+// for /a2a. Skipped for every other request. Mounted as middleware on the
+// dispatcher route itself (not as a route of its own), so findRouteHandler()
+// in the «Mine valg» switch probe still reaches the dispatcher.
+const BOOK_GARDSSALG_QUOTA = MCP_RATE_LIMIT_PROFILES.experiences.sideEffect;
+const bookGardssalgLimiter = rateLimit({
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { trustProxy: false, creationStack: false },
+  handler: sendMcpRateLimited,
+  windowMs: BOOK_GARDSSALG_QUOTA.windowMs,
+  max: googleRangesAwareMax(BOOK_GARDSSALG_QUOTA.max, BOOK_GARDSSALG_QUOTA.keyGenerator),
+  keyGenerator: BOOK_GARDSSALG_QUOTA.keyGenerator,
+  skip: (req) => !isA2aBookGardssalgCall(req.body),
+});
+
 // ─── GET /a2a — health check & agent card ────────────────────
 router.get("/a2a", (_req: Request, res: Response) => {
   res.json(getExperiencesAgentCard(safeHonestCatalogCount("experiences")));
@@ -751,7 +857,7 @@ router.get("/a2a", (_req: Request, res: Response) => {
 
 // ─── POST /a2a — JSON-RPC 2.0 dispatcher ─────────────────────
 // «Klikk fra AI-svar» slice 3: profile links in the answer are tagged for AI (utm_medium=a2a).
-router.post("/a2a", aiProfileLinksJson("a2a"), (req: Request, res: Response) => {
+router.post("/a2a", aiProfileLinksJson("a2a"), bookGardssalgLimiter, (req: Request, res: Response) => {
   const body = req.body && typeof req.body === "object" ? req.body : null;
   if (!body) {
     res.status(400).json(rpcErr(null, -32700, "Parse error: body must be JSON. Set Content-Type: application/json."));
@@ -773,6 +879,14 @@ router.post("/a2a", aiProfileLinksJson("a2a"), (req: Request, res: Response) => 
       case "message/send":
       case "tasks/send": { // Backward-compat alias for older A2A clients (<0.3)
         const requestMeta = buildRequestMeta(req);
+        if (requestedExperiencesSkillId(params) === A2A_BOOK_GARDSSALG_SKILL) {
+          // A visit request is no lookup: not an AI-search count, no delivery row.
+          (res.locals ||= {}).a2aCountable = false;
+          handleExperiencesBookGardssalg(params, id, { requestMeta, headers: req.headers })
+            .then((result) => res.json(result))
+            .catch((err: unknown) => res.json(rpcInternalError(id, "POST /a2a (book_gardssalg)", err)));
+          break;
+        }
         const result = handleExperiencesMessageSend(params, id, { requestMeta });
         (res.locals ||= {}).a2aCountable = a2aRequestCountable(hashIP(req.ip || "unknown"), requestMeta, params, result);
         // «Med i AI-svar»: the experiences / producers in a countable answer, once per profile.

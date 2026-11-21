@@ -2068,6 +2068,23 @@ router.post("/contacts/reclassify-unknown", (_req, res) => {
   res.json(result);
 });
 
+// ─── POST /admin/crm/contacts/relink-unlinked ────────────────
+// One-time relink of unlinked rfb contacts that classifyEmail() now resolves
+// to a producer (svarsperre, follow-up to lokal#1609). DRY RUN BY DEFAULT:
+// writes happen only when dry_run=false is given explicitly (query or JSON
+// body, string "false" or boolean false) AND the body has confirm: "relink".
+// Anything else returns counts only. The response has ids and counts, no
+// e-mail addresses or names.
+router.post("/contacts/relink-unlinked", (req, res) => {
+  const body = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
+  const isFalse = (v: unknown) => v === false || v === "false";
+  const rawDryRun = body.dry_run !== undefined ? body.dry_run : (req.query as Record<string, unknown> | undefined)?.dry_run;
+  const explicitApply = isFalse(rawDryRun);
+  const confirmed = body.confirm === "relink";
+  const result = crmService.relinkUnlinkedRfb({ dryRun: !(explicitApply && confirmed) });
+  res.json(result);
+});
+
 // ─── POST /admin/crm/marketing/dedupe-legacy-threads ─────────
 // One-off (idempotent) cleanup for the e16/e17 dual-ingest bug
 // where marketing-agent produced both `marketing-e<N>-<id>` (wrong)
