@@ -35,7 +35,7 @@ import { extractProductsFromWebsite, HostPacer, type ProductImportDeps, type Pro
 import { ownerFlagEnabledFor, ownerFlagMode, type OwnerFlagMode } from "../../owner-features/owner-flag-mode";
 import { isSubjectAllowedForOwnerFeatures } from "../../owner-features/allowlist";
 import { PRODUCT_IMPORT_DRYRUN_CONCURRENCY, PRODUCT_IMPORT_DRYRUN_HOST_INTERVAL_MS } from "./dry-run";
-import { currentProductsOf, diffAgainst, producerTypesOf, profileWebsite, publishBlockReason, readCurrentList } from "./owner-import";
+import { currentProductsOf, diffAgainst, producerTypesOf, profileWebsite, publishBlockReason, readCurrentList, storedStockStatus } from "./owner-import";
 
 export const PRODUCT_IMPORT_OUTREACH_FLAG = "PRODUCT_IMPORT_OUTREACH_ENABLED";
 export const PRODUCT_IMPORT_OUTREACH_LLM_ACCURACY_ENV = "PRODUCT_IMPORT_OUTREACH_LLM_ACCURACY";
@@ -253,8 +253,8 @@ function stageOutreach(r: Recipient, result: ProductImportResult, llmIncluded: b
   const insert = db.prepare(
     `INSERT INTO product_import_candidates
        (id, run_id, agent_id, position, name, name_norm, price_nok, price_text, unit, price_is_from, price_excl_vat,
-        pack_size, tier, source_url, rules_json, fetched_at, status, reject_reason, diff_kind, old_price_nok, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        pack_size, tier, source_url, rules_json, fetched_at, status, reject_reason, diff_kind, old_price_nok, created_at, stock_status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const rejectedBy: Record<string, number> = {};
   db.transaction(() => {
@@ -265,7 +265,7 @@ function stageOutreach(r: Recipient, result: ProductImportResult, llmIncluded: b
       insert.run(
         `pic-${randomUUID()}`, r.runId, r.agentId, pos++, p.name, normalizeName(p.name), p.price_nok, p.price_text ?? "", p.unit,
         p.price_is_from ? 1 : 0, p.price_excl_vat ? 1 : 0, p.pack_size ?? null, p.tier, p.source_url ?? null,
-        JSON.stringify(p.rules ?? []), fetchedAt, x.status, x.reason, x.kind, x.old, finished,
+        JSON.stringify(p.rules ?? []), fetchedAt, x.status, x.reason, x.kind, x.old, finished, storedStockStatus(p),
       );
     }
     // The extractor's own exclusions (services/events) are audited as rejected rows too.
@@ -273,7 +273,7 @@ function stageOutreach(r: Recipient, result: ProductImportResult, llmIncluded: b
       rejectedBy[e.reason] = (rejectedBy[e.reason] ?? 0) + 1;
       insert.run(
         `pic-${randomUUID()}`, r.runId, r.agentId, pos++, e.name, normalizeName(e.name), null, e.raw_price_text ?? "", null,
-        0, 0, null, e.tier, e.source_url ?? null, "[]", fetchedAt, "rejected", e.reason, null, null, finished,
+        0, 0, null, e.tier, e.source_url ?? null, "[]", fetchedAt, "rejected", e.reason, null, null, finished, null,
       );
     }
     const countNew = rows.filter((x) => x.status === "eligible" && x.kind === "new").length;

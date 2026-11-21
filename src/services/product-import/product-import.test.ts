@@ -1095,6 +1095,85 @@ export function runProductImportTests(opts: { log?: boolean } = {}): Promise<Tes
       assertEq(slept, [1000], "pacing: www twin shares the host slot; other host not delayed");
     }
 
+    // ── Stock status (dev-request 2026-11-21 …-lagerstatus…, point 3) ─────
+    {
+      const st = require("./structured") as typeof import("./structured");
+      const hosts = ex.allowedHostsFor("gard.no");
+      // Shopify, modelled on solvanggard.com /products.json.
+      const shop = st.parseShopifyProductsJson(JSON.stringify({ products: [
+        { title: "Julegave-sett «Til hund»", handle: "hund", variants: [{ title: "Default Title", price: "299.00", available: false }] },
+        { title: "Bivoksark sett", handle: "bivoks", variants: [
+          { title: "Jul1", price: "149.00", available: false }, { title: "Jul2", price: "149.00", available: true },
+          { title: "S1", price: "149.00", available: true }, { title: "S2", price: "149.00", available: true },
+        ] },
+        { title: "Saft", handle: "saft", variants: [{ title: "Default Title", price: "40.00" }] },
+        { title: "Honning", handle: "honning", variants: [{ title: "A", price: "90.00", available: false }, { title: "B", price: "90.00", available: false }] },
+        { title: "Ost", handle: "ost", variants: [{ title: "A", price: "90.00", available: false }, { title: "B", price: "90.00" }] },
+        { title: "Kjøtt", handle: "kjott", variants: [] },
+      ] }), "https://gard.no", hosts);
+      assertEq(shop.map((c) => c.stock_status), ["out_of_stock", "in_stock", "unknown", "out_of_stock", "unknown", "unknown"],
+        "stock shopify: only variant false → sold out; mixed → in stock; no field → unknown; all false → sold out; false + missing → unknown; no variants → unknown");
+
+      // WooCommerce Store API.
+      const woo = st.parseWooStoreProducts(JSON.stringify([
+        { name: "Lammelår", permalink: "https://gard.no/p/lam", is_in_stock: false, prices: { price: "25000", currency_code: "NOK", currency_minor_unit: 2 } },
+        { name: "Egg", permalink: "https://gard.no/p/egg", is_in_stock: true, prices: { price: "6000", currency_code: "NOK", currency_minor_unit: 2 } },
+        { name: "Poteter", permalink: "https://gard.no/p/pot", prices: { price: "3000", currency_code: "NOK", currency_minor_unit: 2 } },
+        { name: "Gulrøtter", permalink: "https://gard.no/p/gul", is_in_stock: "false", prices: { price: "3000", currency_code: "NOK", currency_minor_unit: 2 } },
+      ]), "https://gard.no", hosts);
+      assertEq(woo.map((c) => [c.name, c.stock_status]), [["Lammelår", "out_of_stock"], ["Egg", "in_stock"], ["Poteter", "unknown"], ["Gulrøtter", "unknown"]],
+        "stock woo: is_in_stock false → sold out, true → in stock, missing / non-boolean → unknown");
+
+      // JSON-LD offers.availability.
+      const ldStock = (offers: unknown) => st.parseJsonLdProducts(
+        `<script type="application/ld+json">${JSON.stringify({ "@type": "Product", name: "Vare", offers })}</script>`, "https://gard.no/p", hosts,
+      )[0]?.stock_status;
+      const offer = (availability?: unknown) => ({ "@type": "Offer", price: "100", priceCurrency: "NOK", ...(availability === undefined ? {} : { availability }) });
+      const cases: Array<[unknown, string]> = [
+        ["https://schema.org/OutOfStock", "out_of_stock"],
+        ["http://schema.org/OutOfStock", "out_of_stock"],
+        ["https://schema.org/SoldOut", "out_of_stock"],
+        ["http://schema.org/Discontinued", "out_of_stock"],
+        ["OutOfStock", "out_of_stock"],
+        ["schema:SoldOut", "out_of_stock"],
+        ["https://schema.org/InStock", "in_stock"],
+        ["http://schema.org/InStock", "in_stock"],
+        ["https://schema.org/LimitedAvailability", "in_stock"],
+        ["https://schema.org/OnlineOnly", "in_stock"],
+        ["InStoreOnly", "in_stock"],
+        ["https://schema.org/PreOrder", "unknown"],
+        ["https://schema.org/BackOrder", "unknown"],
+        ["https://example.com/OutOfStock", "unknown"],
+        ["utsolgt", "unknown"],
+        [42, "unknown"],
+        [undefined, "unknown"],
+      ];
+      for (const [a, want] of cases) assertEq(ldStock(offer(a)), want, `stock jsonld: ${JSON.stringify(a)} → ${want}`);
+      assertEq(ldStock([offer("https://schema.org/OutOfStock"), offer("https://schema.org/InStock")]), "in_stock", "stock jsonld: offers array, one in stock → in stock");
+      assertEq(ldStock([offer("https://schema.org/OutOfStock"), offer("http://schema.org/SoldOut")]), "out_of_stock", "stock jsonld: offers array, all sold out → sold out");
+      assertEq(ldStock([offer("https://schema.org/OutOfStock"), offer("https://schema.org/PreOrder"), offer()]), "out_of_stock", "stock jsonld: offers array, every known one sold out → sold out");
+      assertEq(ldStock([offer("https://schema.org/PreOrder"), offer()]), "unknown", "stock jsonld: offers array, none known → unknown");
+      assertEq(ldStock(undefined), "unknown", "stock jsonld: no offers → unknown");
+
+      // The extractor keeps the status only with the flag on (off = as before).
+      const fx = () => makeFetch({
+        "https://lager.no/robots.txt": { body: "User-agent: *\nDisallow:\n", contentType: "text/plain" },
+        "https://lager.no/products.json?limit=250": {
+          contentType: "application/json",
+          body: JSON.stringify({ products: [{ title: "Julegave-sett", handle: "jg", variants: [{ title: "Default Title", price: "299.00", available: false }] }] }),
+        },
+      });
+      robots.__clearRobotsCacheForTesting();
+      const rOff = await ex.extractProductsFromWebsite("https://lager.no", { fetchImpl: fx().impl, llm: noLlm, env: {} });
+      robots.__clearRobotsCacheForTesting();
+      const rOn = await ex.extractProductsFromWebsite("https://lager.no", { fetchImpl: fx().impl, llm: noLlm, env: { PRODUCT_IMPORT_STOCK_READ_ENABLED: "1" } });
+      assertEq(["stock_status" in (rOff.products[0] ?? {}), rOn.products[0]?.stock_status], [false, "out_of_stock"],
+        "stock extractor: flag off → no stock_status on the candidate; flag on → kept");
+      assertEq([st.productImportStockReadEnabled({}), st.productImportStockReadEnabled({ PRODUCT_IMPORT_STOCK_READ_ENABLED: "yes" }),
+        st.productImportStockReadEnabled({ PRODUCT_IMPORT_STOCK_READ_ENABLED: "1" }), st.productImportStockReadEnabled({ PRODUCT_IMPORT_STOCK_READ_ENABLED: "true" })],
+        [false, false, true, true], "stock flag: default off; 1/true on");
+    }
+
     // ── AC1 + flag: the dry-run endpoint ───────────────────────────────────
     const prevAdminKey = process.env.ADMIN_KEY;
     const prevAnalyticsKey = process.env.ANALYTICS_ADMIN_KEY;

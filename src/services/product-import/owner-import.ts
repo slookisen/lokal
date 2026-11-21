@@ -50,6 +50,7 @@ import { auditOwnerProductChange } from "../owner-orderability";
 import { ownerFlagEnabledFor, ownerFlagMode } from "../../owner-features/owner-flag-mode";
 import { extractProductsFromWebsite, HostPacer, type ProductImportDeps, type ProductImportResult } from "./extractor";
 import { canonicalUnit, detectPriceUnit, normalizeProductName, PRODUCT_IMPORT_MAX_PRODUCTS, type ProductUnit } from "./normalize";
+import { productImportStockReadEnabled, type ProductCandidate } from "./structured";
 
 export const PRODUCT_IMPORT_FLAG = "PRODUCT_IMPORT_ENABLED";
 export const OWNER_FETCH_DAILY_LIMIT = 3;
@@ -328,6 +329,11 @@ async function runOwnerFetch(runId: string, agentId: string, website: string, de
   }
 }
 
+/** The candidate's stock status as stored (product_import_candidates.stock_status): NULL = unknown. */
+export function storedStockStatus(p: Pick<ProductCandidate, "stock_status">): "in_stock" | "out_of_stock" | null {
+  return p.stock_status === "in_stock" || p.stock_status === "out_of_stock" ? p.stock_status : null;
+}
+
 function stageCandidates(runId: string, agentId: string, result: ProductImportResult, fetchedAtIso: string, finishedSql: string): void {
   const db = getDb();
   const current = currentProductsOf(readCurrentList(agentId));
@@ -338,8 +344,8 @@ function stageCandidates(runId: string, agentId: string, result: ProductImportRe
   const insert = db.prepare(
     `INSERT INTO product_import_candidates
        (id, run_id, agent_id, position, name, name_norm, price_nok, price_text, unit, price_is_from, price_excl_vat,
-        pack_size, tier, source_url, rules_json, fetched_at, status, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+        pack_size, tier, source_url, rules_json, fetched_at, status, created_at, stock_status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
   );
   db.transaction(() => {
     const st = db.prepare(`SELECT status FROM product_import_runs WHERE id = ?`).get(runId) as { status: string } | undefined;
@@ -348,7 +354,7 @@ function stageCandidates(runId: string, agentId: string, result: ProductImportRe
       insert.run(
         `pic-${randomUUID()}`, runId, agentId, i, p.name, normalizeName(p.name), p.price_nok, p.price_text ?? "", p.unit,
         p.price_is_from ? 1 : 0, p.price_excl_vat ? 1 : 0, p.pack_size ?? null, p.tier, p.source_url ?? null,
-        JSON.stringify(p.rules ?? []), fetchedAtIso, finishedSql,
+        JSON.stringify(p.rules ?? []), fetchedAtIso, finishedSql, storedStockStatus(p),
       );
     });
     const summary = {
@@ -433,6 +439,8 @@ interface CandidateRow {
   status: string;
   reject_reason: string | null;
   published_at: string | null;
+  /** Only read by publish (point 3 stock read); NULL = unknown. */
+  stock_status?: string | null;
 }
 
 interface RunRow {
@@ -616,6 +624,44 @@ export function getOwnerImportOverview(agentId: string, nowMs: number = (testDep
 
 // ── Publish ────────────────────────────────────────────────────────────────
 
+/**
+ * Stock read (dev-request 2026-11-21-rfb-produktimport-lagerstatus-og-
+ * fullstendighet, point 3; flag PRODUCT_IMPORT_STOCK_READ_ENABLED): a
+ * published product the site said was sold out gets availability
+ * 'out_of_stock' on its catalog row, with one audit row. In stock / unknown →
+ * the row is left as the catalog sync made it. Runs after the catalog sync
+ * (which creates the row and never writes availability).
+ */
+function applySoldOutOnPublish(
+  agentId: string,
+  runId: string,
+  toPublish: Array<{ entry: ProductInfo; key: string; soldOut: boolean }>,
+  actorEmail: string | null,
+): void {
+  const sold = toPublish.filter((t) => t.soldOut);
+  if (sold.length === 0) return;
+  const db = getDb();
+  try {
+    db.transaction(() => {
+      const setOut = db.prepare(
+        `UPDATE products SET availability = 'out_of_stock', availability_updated_at = datetime('now'), updated_at = datetime('now')
+          WHERE agent_id = ? AND name_norm = ? AND availability IS NOT 'out_of_stock'`,
+      );
+      const names: string[] = [];
+      for (const t of sold) {
+        const key = currentProductsOf([t.entry])[0]?.key ?? t.key;
+        if (setOut.run(agentId, key).changes > 0) names.push(t.entry.name);
+      }
+      if (names.length > 0) {
+        auditOwnerProductChange(db, agentId, "products.availability", null, "out_of_stock", actorEmail,
+          `import: ${names.length} published product(s) sold out on the website set out of stock in run ${runId}: ${names.join(", ")}`.slice(0, 2000));
+      }
+    })();
+  } catch (err) {
+    console.error("[product-import] sold-out stock read after publish failed:", err instanceof Error ? err.message : err);
+  }
+}
+
 export interface PublishSelection {
   id: string;
   name?: unknown;
@@ -671,6 +717,8 @@ export function publishOwnerImport(
     mode?: ImportRunMode;
     /** Extra writes that must commit or roll back with the publish (Skive 4a: the weekly-sync box). */
     inTransaction?: () => void;
+    /** Read for PRODUCT_IMPORT_STOCK_READ_ENABLED (default process.env). */
+    env?: NodeJS.ProcessEnv;
   } = { actorEmail: null },
 ): PublishResult {
   const db = getDb();
@@ -696,7 +744,7 @@ export function publishOwnerImport(
     ? (db
         .prepare(
           `SELECT id, run_id, agent_id, position, name, name_norm, price_nok, price_text, unit, price_is_from, price_excl_vat,
-                  pack_size, tier, source_url, rules_json, fetched_at, status, reject_reason, published_at
+                  pack_size, tier, source_url, rules_json, fetched_at, status, reject_reason, published_at, stock_status
              FROM product_import_candidates
             WHERE run_id = ? AND agent_id = ? AND id IN (${ids.map(() => "?").join(",")})`,
         )
@@ -777,7 +825,7 @@ export function publishOwnerImport(
 
   const published: Array<{ id: string; name: string; action: "added" | "updated" }> = [];
   const rejected: Array<{ id: string; name: string; reason: PublishBlockReason; message: string }> = [];
-  const toPublish: Array<{ id: string; entry: ProductInfo; replaceIndex: number | null; key: string }> = [];
+  const toPublish: Array<{ id: string; entry: ProductInfo; replaceIndex: number | null; key: string; soldOut: boolean }> = [];
   for (const f of finals) {
     const key = normalizeName(f.name);
     const cur = byKey.get(key) ?? null;
@@ -814,7 +862,7 @@ export function publishOwnerImport(
       delete entry.price;
       delete entry.priceUnit;
     }
-    toPublish.push({ id: f.row.id, entry, replaceIndex: cur ? cur.index : null, key });
+    toPublish.push({ id: f.row.id, entry, replaceIndex: cur ? cur.index : null, key, soldOut: f.row.stock_status === "out_of_stock" });
     published.push({ id: f.row.id, name: f.name, action: cur ? "updated" : "added" });
   }
 
@@ -896,6 +944,7 @@ export function publishOwnerImport(
       catalog_sync = "failed";
       console.error("[product-import] catalog sync after publish failed:", r.error);
     }
+    if (productImportStockReadEnabled(opts.env ?? process.env)) applySoldOutOnPublish(agentId, runId, toPublish, opts.actorEmail);
   }
   return { ok: true, published, rejected, removed: removedNames, not_removed: notRemoved, catalog_sync };
 }
