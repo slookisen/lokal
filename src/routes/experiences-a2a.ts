@@ -835,9 +835,11 @@ router.use(jsonRpcLimiter);
 
 // O5-7: book_gardssalg's side-effect quota, the MCP profile's own numbers and
 // key (MCP_RATE_LIMIT_PROFILES.experiences.sideEffect), in a bucket of its own
-// for /a2a. Skipped for every other request.
+// for /a2a. Skipped for every other request. Mounted as middleware on the
+// dispatcher route itself (not as a route of its own), so findRouteHandler()
+// in the «Mine valg» switch probe still reaches the dispatcher.
 const BOOK_GARDSSALG_QUOTA = MCP_RATE_LIMIT_PROFILES.experiences.sideEffect;
-router.post("/a2a", rateLimit({
+const bookGardssalgLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   validate: { trustProxy: false, creationStack: false },
@@ -846,7 +848,7 @@ router.post("/a2a", rateLimit({
   max: googleRangesAwareMax(BOOK_GARDSSALG_QUOTA.max, BOOK_GARDSSALG_QUOTA.keyGenerator),
   keyGenerator: BOOK_GARDSSALG_QUOTA.keyGenerator,
   skip: (req) => !isA2aBookGardssalgCall(req.body),
-}));
+});
 
 // ─── GET /a2a — health check & agent card ────────────────────
 router.get("/a2a", (_req: Request, res: Response) => {
@@ -855,7 +857,7 @@ router.get("/a2a", (_req: Request, res: Response) => {
 
 // ─── POST /a2a — JSON-RPC 2.0 dispatcher ─────────────────────
 // «Klikk fra AI-svar» slice 3: profile links in the answer are tagged for AI (utm_medium=a2a).
-router.post("/a2a", aiProfileLinksJson("a2a"), (req: Request, res: Response) => {
+router.post("/a2a", bookGardssalgLimiter, aiProfileLinksJson("a2a"), (req: Request, res: Response) => {
   const body = req.body && typeof req.body === "object" ? req.body : null;
   if (!body) {
     res.status(400).json(rpcErr(null, -32700, "Parse error: body must be JSON. Set Content-Type: application/json."));
