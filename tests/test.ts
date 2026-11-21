@@ -55372,3 +55372,27 @@ runSerial(async () => {
     failures.push("admin-agents-business-type-e2: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-11-15-rfb-selvregistrering-uten-nettside, slice F2:
+// GET self-registered-review-queue gains has_org_nr / phone / sales_place /
+// email_confirmed / has_description / product_count / daniel_review and
+// daniel_review_ready_count; POST self-registered-review-approve answers 409
+// org_nr_missing_requires_daniel for a no-org.nr agent unless
+// danielApproved: true. Own in-memory DB pinned on getDb(), swaps ADMIN_KEY
+// and the indexnow-service cache entry (restored in finally) — runSerial,
+// tail position.
+runSerial(async () => {
+  console.log("\n── F2: godkjenning uten org.nr (Daniel-kø) ──");
+  try {
+    const { runSelvregDanielReviewF2Tests } = require("../src/routes/selvreg-daniel-review-f2.test") as
+      typeof import("../src/routes/selvreg-daniel-review-f2.test");
+    const r = await runSelvregDanielReviewF2Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("selvreg-daniel-review-f2: " + f);
+    console.log(`  selvreg-daniel-review-f2: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("selvreg-daniel-review-f2: unexpected error: " + String(err?.message || err));
+  }
+});

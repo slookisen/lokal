@@ -487,9 +487,10 @@ export async function runMarketplaceQuarantineGatesTests(opts: { log?: boolean }
 
       // The real approval.
       pingCalls = [];
+      // F2: Mikhailo has no org.nr, so only a Daniel-approved release passes.
       const rApprove = await invokeHandler(reviewApproveHandler, makeReq({
         headers: { "x-admin-key": SUITE_ADMIN_KEY_LOCAL },
-        body: { agentId: mikhailoId },
+        body: { agentId: mikhailoId, danielApproved: true },
       }));
       assertEq(rApprove.status, 200, "c9: approve succeeds for the queued self_registered agent");
       assertEq(rApprove.body?.isVetted, true, "c10: response reports isVetted:true");
