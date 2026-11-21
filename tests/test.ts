@@ -32356,6 +32356,19 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gmf.failures) failures.push("opplevelser-gardssalg-mcp-funnel-o5-8: " + f);
     console.log(`  opplevelser-gardssalg-mcp-funnel-o5-8: ${gmf.passed} passed, ${gmf.failed} failed`);
 
+    // O5-7: POST /api/opplevelser/book in the OpenAPI document, and
+    // book_gardssalg as an A2A task through the MCP tool's own chain (same
+    // row, same e-mails, same payload, same outcome rows, own quota bucket);
+    // tools/list stays byte-identical.
+    console.log("\n── experiences-a2a-book-gardssalg-o5-7: OpenAPI booking path + A2A booking task ──");
+    const { runExperiencesA2aBookGardssalgTests } = require("../src/routes/experiences-a2a-book-gardssalg-o5-7.test") as
+      typeof import("../src/routes/experiences-a2a-book-gardssalg-o5-7.test");
+    const eabg = await runExperiencesA2aBookGardssalgTests({ log: false });
+    passed += eabg.passed;
+    failed += eabg.failed;
+    for (const f of eabg.failures) failures.push("experiences-a2a-book-gardssalg-o5-7: " + f);
+    console.log(`  experiences-a2a-book-gardssalg-o5-7: ${eabg.passed} passed, ${eabg.failed} failed`);
+
     // O1-1 (R1/R11): booking follow-up after restart — first run 5 min after
     // boot, clock from the registered producer notification, one retry +
     // admin alert for a failed producer e-mail, admin dry-run count.
