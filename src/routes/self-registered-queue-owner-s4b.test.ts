@@ -143,7 +143,7 @@ export async function runSelfRegisteredQueueOwnerS4bTests(opts: { log?: boolean 
     eq([byId("rejected-claim").owner_confirmed, byId("rejected-claim").owner_label], [false, null], "rejected/code_sent claims only → not confirmed");
     eq([byId("plain-old").owner_confirmed, byId("plain-old").owner_label], [false, null], "no claim → not confirmed");
     eq([q.body.count, q.body.owner_confirmed_count], [8, 2], "count unchanged (all queued rows); owner_confirmed_count = 2");
-    eq(Object.keys(q.body), ["count", "owner_confirmed_count", "entries"], "response: owner_confirmed_count next to count");
+    eq(Object.keys(q.body), ["count", "owner_confirmed_count", "daniel_review_ready_count", "entries"], "response: owner_confirmed_count next to count (F2: daniel_review_ready_count after it)");
     eq(Object.keys(entries[0]).slice(0, 5), ["id", "name", "contact_email", "url", "created_at"], "entry: original fields first");
     ok(["org_nr", "city", "precheck", "precheck_at", "age_days"].every((k) => k in entries[0]), "entry: S2 fields kept");
     ok(!ids.includes("vetted-owned") && !ids.includes("discovery-owned"), "filter: vetted / non-self_registered owners never appear");

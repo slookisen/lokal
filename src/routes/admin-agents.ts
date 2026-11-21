@@ -36,6 +36,9 @@ import {
   normalizeEnrichmentVertical,
 } from "../services/enrichment-write-pause";
 import { slugify } from "../utils/slug";
+import {
+  computeDanielReview, countKnowledgeProducts, hasDescriptionOf, hasOrgNr, phoneOf, salesPlaceOf,
+} from "../services/selvreg-daniel-review";
 import { catalogHiddenIdExclusionSql } from "../services/agent-visibility";
 // POST /:id/slug-alias below (dev-request 2026-09-03-rfb-korrigering-navn-
 // sted-kategorier, Mål 1): reuses the SAME insertAgentSlugAlias helper that
@@ -2456,15 +2459,20 @@ router.get("/self-registered-review-queue", (req: Request, res: Response) => {
   const rows = db.prepare(
     `SELECT a.id, a.name, a.contact_email, a.url, a.created_at, a.org_nr, a.city,
             p.registration_precheck, p.registration_precheck_at,
-            CASE WHEN ${customerRuleSql("a")} THEN 1 ELSE 0 END AS owned
+            CASE WHEN ${customerRuleSql("a")} THEN 1 ELSE 0 END AS owned,
+            a.tags, a.description, k.about, k.phone, k.delivery_options, k.products,
+            (SELECT COUNT(*) FROM products pr WHERE pr.agent_id = a.id) AS product_rows
        FROM agents a
        LEFT JOIN agent_registration_precheck p ON p.agent_id = a.id
+       LEFT JOIN agent_knowledge k ON k.agent_id = a.id
       WHERE a.origin = 'self_registered' AND a.is_vetted = 0
       ORDER BY owned DESC, a.created_at ASC, a.id ASC`
   ).all() as Array<{
     id: string; name: string; contact_email: string; url: string; created_at: string | null;
     org_nr: string | null; city: string | null; registration_precheck: string | null; registration_precheck_at: string | null;
     owned: number;
+    tags: string | null; description: string | null; about: string | null; phone: string | null;
+    delivery_options: string | null; products: string | null; product_rows: number;
   }>;
   const nowMs = Date.now();
   const entries = rows.map((r) => {
@@ -2477,11 +2485,51 @@ router.get("/self-registered-review-queue", (req: Request, res: Response) => {
       org_nr: r.org_nr, city: r.city,
       precheck, precheck_at: r.registration_precheck_at, age_days: ageDaysSince(r.created_at, nowMs),
       owner_confirmed: r.owned === 1, owner_label: r.owned === 1 ? "eier bekreftet" : null,
+      ...danielReviewFields(r),
     };
   });
   const ownerConfirmedCount = entries.filter((e) => e.owner_confirmed).length;
-  res.json({ count: entries.length, owner_confirmed_count: ownerConfirmedCount, entries });
+  const danielReviewReadyCount = entries.filter((e) => e.daniel_review?.ready === true).length;
+  res.json({
+    count: entries.length, owner_confirmed_count: ownerConfirmedCount,
+    daniel_review_ready_count: danielReviewReadyCount, entries,
+  });
 });
+
+// F2 (dev-request 2026-11-15-rfb-selvregistrering-uten-nettside): the
+// «godkjenning uten org.nr» fields of one queue entry (services/
+// selvreg-daniel-review.ts). The customer-service routine may only release a
+// profile it finds in Brønnøysund; a profile with no org.nr goes to Daniel
+// instead, and `daniel_review` says whether it is ready for him.
+//
+// email_confirmed: the registration flow has no e-mail confirmation step of
+// its own (the S1 confirmation mail, services/registration-confirmation.ts,
+// has no link to click), so the only signal that the owner controls the
+// address is the shared owner rule already exposed as `owner_confirmed`
+// (customerRuleSql: claimed_at set — stamped when an owner claim is granted —
+// OR a verified agent_claims row, i.e. the owner entered the code mailed to
+// the address, or an admin approved the claim). Same value, own key.
+//
+// product_count: agent_knowledge.products (the JSON list the owner portal
+// and enrichment write; the source of truth) and the products table synced
+// from it (product-catalog-sync.ts) — the larger of the two counts, so a
+// product counted in either place is not missed.
+function danielReviewFields(r: {
+  org_nr: string | null; tags: string | null; owned: number; description: string | null; about: string | null;
+  phone: string | null; delivery_options: string | null; products: string | null; product_rows: number;
+}) {
+  const hasOrg = hasOrgNr(r.org_nr, r.tags);
+  const phone = phoneOf(r.phone);
+  const salesPlace = salesPlaceOf(r.delivery_options);
+  const emailConfirmed = r.owned === 1;
+  const hasDescription = hasDescriptionOf(r.description, r.about);
+  const productCount = Math.max(countKnowledgeProducts(r.products), Number(r.product_rows) || 0);
+  return {
+    has_org_nr: hasOrg, phone, sales_place: salesPlace, email_confirmed: emailConfirmed,
+    has_description: hasDescription, product_count: productCount,
+    daniel_review: computeDanielReview({ hasOrgNr: hasOrg, emailConfirmed, phone, salesPlace, hasDescription, productCount }),
+  };
+}
 
 /** Whole days since an SQLite/ISO timestamp (SQLite's "YYYY-MM-DD HH:MM:SS" is UTC), or null. */
 export function ageDaysSince(createdAt: string | null | undefined, nowMs: number): number | null {
@@ -2550,11 +2598,12 @@ router.post("/self-registered-precheck", async (req: Request, res: Response) => 
 // POST flips is_vetted to 1 for exactly one agent, then — and ONLY then —
 // pings IndexNow for its /produsent/<slug> page, using the EXACT URL
 // convention the old (now-removed) registration-time ping in routes/
-// marketplace.ts used. Body: { agentId }.
+// marketplace.ts used. Body: { agentId, danielApproved? }
+// (F2: danielApproved: true is required when the agent has no org.nr).
 router.post("/self-registered-review-approve", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
-  const body = (req.body ?? {}) as { agentId?: unknown };
+  const body = (req.body ?? {}) as { agentId?: unknown; danielApproved?: unknown };
   const agentId = typeof body.agentId === "string" ? body.agentId.trim() : "";
   if (!agentId) {
     res.status(400).json({ error: "Requires { agentId }" });
@@ -2563,8 +2612,10 @@ router.post("/self-registered-review-approve", (req: Request, res: Response) => 
 
   const db = getDb();
   const agent = db.prepare(
-    `SELECT id, name, origin, is_vetted FROM agents WHERE id = ?`
-  ).get(agentId) as { id: string; name: string; origin: string; is_vetted: number } | undefined;
+    `SELECT id, name, origin, is_vetted, org_nr, tags FROM agents WHERE id = ?`
+  ).get(agentId) as {
+    id: string; name: string; origin: string; is_vetted: number; org_nr: string | null; tags: string | null;
+  } | undefined;
 
   if (!agent) {
     res.status(404).json({ error: "Agent not found" });
@@ -2580,6 +2631,15 @@ router.post("/self-registered-review-approve", (req: Request, res: Response) => 
   }
   if (agent.is_vetted === 1) {
     res.json({ success: true, agentId, isVetted: true, alreadyVetted: true });
+    return;
+  }
+  // F2 (dev-request 2026-11-15-rfb-selvregistrering-uten-nettside): without
+  // an org.nr the routine cannot find the business in Brønnøysund, so only
+  // Daniel releases such a profile — the caller must say so with
+  // `danielApproved: true` (exactly the boolean). Profiles with an org.nr
+  // (agents.org_nr or a valid `org_nr:` tag) are unchanged.
+  if (!hasOrgNr(agent.org_nr, agent.tags) && body.danielApproved !== true) {
+    res.status(409).json({ error: "org_nr_missing_requires_daniel" });
     return;
   }
 
