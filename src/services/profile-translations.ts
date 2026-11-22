@@ -63,6 +63,7 @@
 import { createHash } from "crypto";
 import type Database from "better-sqlite3";
 import { isJunkDescription, looksTruncatedMidWord } from "./description-quality";
+import { isDelistedAgentId, notQuarantinedSql } from "./agent-visibility";
 
 // ─── Types ───────────────────────────────────────────────────────────────
 
@@ -305,7 +306,11 @@ function pushIf(items: SourceItem[], spec: TranslationFieldSpec, entityId: strin
  * Enumerate every translatable (entity, field) on a platform from its OWN
  * database handle. Only rows that are publicly visible today are included —
  * a hidden/unpublished row must not gain a translation before it gains a
- * Norwegian page.
+ * Norwegian page. RFB: active producers that pass the same quarantine rule
+ * GET /agents/:id/info answers «Agent ikke funnet» on (notQuarantinedSql:
+ * not catalog_hidden, RFB vertical, not a self-registered profile awaiting
+ * review — dev-request 2026-11-16-rfb-selvregistrering-spam-profil-eierkrav)
+ * and not a delisted id.
  */
 export function collectSourceItems(
   db: Database.Database,
@@ -324,11 +329,14 @@ export function collectSourceItems(
            FROM agents a
            LEFT JOIN agent_knowledge k ON k.agent_id = a.id
           WHERE a.is_active = 1 AND a.role = 'producer'
+            AND ${notQuarantinedSql("a")}
           ORDER BY a.id`,
       )
       .all() as Array<{ id: string; name: string; description: string | null; about: string | null }>;
     for (const r of rows) {
       if (idSet && !idSet.has(String(r.id))) continue;
+      // Same "not found" answer GET /agents/:id/info gives a delisted id.
+      if (isDelistedAgentId(String(r.id))) continue;
       for (const spec of specs) {
         pushIf(items, spec, String(r.id), String(r.name || ""), (r as any)[spec.field]);
       }
