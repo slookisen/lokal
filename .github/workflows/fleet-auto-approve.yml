@@ -350,6 +350,29 @@ jobs:
               return;
             }
 
+            // 1.6. MERGE: DANIEL is a HARD STOP too (dev-request
+            //      2026-11-22-fleet-gate-respekterer-daniels-merge). Signals: label
+            //      exactly "daniels-merge", or PR body line 1 starting with
+            //      "**MERGE: DANIEL**". "**MERGE: GATEN**" does not stop.
+            const DANIELS_MERGE_LABEL = 'daniels-merge';
+            const DANIELS_MERGE_FIRST_LINE_RE = /^\*\*MERGE: DANIEL\*\*/;
+            function isMarkedDanielsMerge(p) {
+              if (!p) return false;
+              const labels = Array.isArray(p.labels) ? p.labels : [];
+              const hasLabel = labels.some((l) => {
+                const name = typeof l === 'string' ? l : (l && l.name) || '';
+                return String(name).trim().toLowerCase() === DANIELS_MERGE_LABEL;
+              });
+              if (hasLabel) return true;
+              const firstLine = String(p.body || '').split(/\r?\n/)[0].replace(/^\s+/, '');
+              return DANIELS_MERGE_FIRST_LINE_RE.test(firstLine);
+            }
+            if (isMarkedDanielsMerge(pr)) {
+              await note('PR er merket MERGE: DANIEL. Venter på Daniel.');
+              core.info('MERGE: DANIEL (label daniels-merge or body line 1) — no-op');
+              return;
+            }
+
             // 2. Protected paths — never auto-approve if the diff touches these,
             //    regardless of any verdict comment. Self-protecting: this workflow
             //    file itself can never approve a PR that edits workflows.
