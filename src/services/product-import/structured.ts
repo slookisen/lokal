@@ -155,10 +155,15 @@ export function schemaAvailabilityStatus(v: unknown): StockStatus {
   return "unknown";
 }
 
-/** Several offers: in stock if any is; sold out only if every known one is (and one is known). */
+/**
+ * Several offers, the same rule as shopifyStockStatus: in stock if any is;
+ * sold out only if there is ≥ 1 offer and EVERY offer is explicitly sold out.
+ * Sold out mixed with unknown (PreOrder, missing, unparseable) → unknown —
+ * a false «utsolgt» is never undone by the weekly sync, so fail safe.
+ */
 export function combineStockStatus(statuses: StockStatus[]): StockStatus {
   if (statuses.includes("in_stock")) return "in_stock";
-  if (statuses.includes("out_of_stock")) return "out_of_stock";
+  if (statuses.length > 0 && statuses.every((s) => s === "out_of_stock")) return "out_of_stock";
   return "unknown";
 }
 
@@ -374,10 +379,13 @@ export function parseJsonLdProducts(
       const stock: StockStatus[] = [];
       for (const offer of offers) {
         if (!offer || typeof offer !== "object") continue;
-        stock.push(schemaAvailabilityStatus(offer.availability));
         const spec = Array.isArray(offer.priceSpecification) ? offer.priceSpecification[0] : offer.priceSpecification;
         const currency = offer.priceCurrency ?? spec?.priceCurrency;
         if (!isNok(currency)) continue;
+        // Availability only from the offers the price logic accepts (NOK). No
+        // accepted offer → stock stays empty → combineStockStatus gives unknown
+        // (fail safe: never a sold-out mark from a non-NOK offer).
+        stock.push(schemaAvailabilityStatus(offer.availability));
         const vatIncl = spec?.valueAddedTaxIncluded ?? offer.valueAddedTaxIncluded;
         if (vatIncl === false || vatIncl === "false" || vatIncl === "False") exclVat = true;
         if (hasType(offer, "AggregateOffer")) {

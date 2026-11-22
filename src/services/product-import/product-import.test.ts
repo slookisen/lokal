@@ -1151,7 +1151,18 @@ export function runProductImportTests(opts: { log?: boolean } = {}): Promise<Tes
       for (const [a, want] of cases) assertEq(ldStock(offer(a)), want, `stock jsonld: ${JSON.stringify(a)} → ${want}`);
       assertEq(ldStock([offer("https://schema.org/OutOfStock"), offer("https://schema.org/InStock")]), "in_stock", "stock jsonld: offers array, one in stock → in stock");
       assertEq(ldStock([offer("https://schema.org/OutOfStock"), offer("http://schema.org/SoldOut")]), "out_of_stock", "stock jsonld: offers array, all sold out → sold out");
-      assertEq(ldStock([offer("https://schema.org/OutOfStock"), offer("https://schema.org/PreOrder"), offer()]), "out_of_stock", "stock jsonld: offers array, every known one sold out → sold out");
+      // N1 (PR #1621 review): same rule as Shopify — sold out only if EVERY offer is explicitly sold out.
+      assertEq(ldStock([offer("https://schema.org/OutOfStock"), offer("https://schema.org/PreOrder"), offer()]), "unknown", "stock jsonld: offers array, sold out + PreOrder + missing → unknown");
+      assertEq(ldStock([offer("https://schema.org/OutOfStock"), offer()]), "unknown", "stock jsonld: [OutOfStock, missing] → unknown");
+      assertEq(ldStock([offer("https://schema.org/OutOfStock"), offer("https://schema.org/PreOrder")]), "unknown", "stock jsonld: [OutOfStock, PreOrder] → unknown");
+      assertEq(ldStock([offer("https://schema.org/OutOfStock"), offer("https://schema.org/OutOfStock")]), "out_of_stock", "stock jsonld: [OutOfStock, OutOfStock] → sold out");
+      assertEq(ldStock([offer("https://schema.org/OutOfStock")]), "out_of_stock", "stock jsonld: [OutOfStock] (array of one) → sold out");
+      assertEq(ldStock(offer("https://schema.org/OutOfStock")), "out_of_stock", "stock jsonld: single OutOfStock offer → sold out");
+      // Availability only from offers the price logic accepts (NOK).
+      const eurOffer = (availability: string) => ({ "@type": "Offer", price: "10", priceCurrency: "EUR", availability });
+      assertEq(ldStock([eurOffer("https://schema.org/OutOfStock"), offer()]), "unknown", "stock jsonld: non-NOK OutOfStock + NOK unknown → unknown");
+      assertEq(ldStock([eurOffer("https://schema.org/OutOfStock"), offer("https://schema.org/InStock")]), "in_stock", "stock jsonld: non-NOK OutOfStock + NOK InStock → in stock");
+      assertEq(ldStock([eurOffer("https://schema.org/OutOfStock")]), "unknown", "stock jsonld: only a non-NOK OutOfStock offer → unknown (never a false sold out)");
       assertEq(ldStock([offer("https://schema.org/PreOrder"), offer()]), "unknown", "stock jsonld: offers array, none known → unknown");
       assertEq(ldStock(undefined), "unknown", "stock jsonld: no offers → unknown");
 
