@@ -528,8 +528,8 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     faqAnchor: "oppdatering",
     label: t("Hold produktene oppdatert fra nettsiden", "Keep products updated from my website"),
     description: t(
-      "Vi sjekker nettsiden din hver uke. Varer du har bekreftet, får ny pris automatisk. Nye varer venter til du godkjenner dem, og store avvik stopper oppdateringen.",
-      "We check your website every week. Items you have confirmed get the new price automatically. New items wait for your approval, and large deviations stop the update.",
+      "Vi sjekker nettsiden din hver uke. Varer du har bekreftet, får ny pris automatisk, og vi kan merke dem som utsolgt når nettsiden sier at de er utsolgt. Nye varer venter til du godkjenner dem, og store avvik stopper oppdateringen.",
+      "We check your website every week. Items you have confirmed get the new price automatically, and we may mark them as sold out when your website says they are sold out. New items wait for your approval, and large deviations stop the update.",
     ),
     default: { owner: false, unclaimed: false },
     requires: ["verifiedOwner", "isVerifiedBadge"],
