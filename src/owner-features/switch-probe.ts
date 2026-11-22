@@ -1225,7 +1225,10 @@ function t14aAddressReader(surface: string): SurfaceReader {
       const full = LIST_SURFACES.has(surface) ? vals.some(Boolean) : vals.length > 0 && vals.every(Boolean);
       const place = vals.length > 0 && vals.every((x) => !x);
       const detail = `gateadresse ${Object.entries(eps).map(([k, x]) => `${k}=${x ? "ja" : "nei"}`).join(", ")}${v.street ? "" : ` (${T14A_FIELD_HINT.address})`}`;
-      return { endpoints: { full: full && !!v.street, place: place && !!v.street }, detail };
+      const endpoints = { full: full && !!v.street, place: place && !!v.street };
+      // Why «full» may not show here: no street address at all, or the fixture not on this surface.
+      const hint = endpoints.full ? undefined : v.street ? `gateadressen vises ikke på ${surface} (testprodusenten er kanskje ikke på flaten)` : T14A_FIELD_HINT.address;
+      return { endpoints, detail, ...(hint ? { unobservableHint: hint } : {}) };
     });
   };
 }
@@ -1796,6 +1799,17 @@ async function probeChoice(c: Ctx, e: OwnerFeatureEntry, baseline: OwnerFeatureV
   const dirs = choiceDirections(e, baseline);
   const surfaces = e.surfaces.filter((s) => c.readers[caseId(e.key, s)]);
   for (const s of e.surfaces) if (!c.readers[caseId(e.key, s)]) missingReaderRows(c, e, s, dirs);
+  // T14a (contact.address): a surface that cannot show the starting option's
+  // effect in the starting state (its reader says why: no street address, the
+  // fixture not on that surface) proves nothing either way → NOT_OBSERVABLE,
+  // never PASS and no false FAIL. A reader that throws here stays a FAIL below.
+  const unobservable = new Map<string, string>();
+  if (typeof baseline === "string") {
+    for (const s of surfaces) {
+      const ref = (await readSafe(c.readers[caseId(e.key, s)], c.readerCtx)).obs;
+      if (ref && ref.unobservableHint && ref.endpoints[baseline] !== true) unobservable.set(s, `${ref.unobservableHint} (${describe(ref)})`);
+    }
+  }
   for (const d of dirs) {
     const value = d.slice("value:".length);
     const before = maxAuditId(c.db, c.agentId);
@@ -1805,6 +1819,15 @@ async function probeChoice(c: Ctx, e: OwnerFeatureEntry, baseline: OwnerFeatureV
     const logged = w.kind === "ok" && w.changed ? changeLogged(c, e.key, value, before) : w.kind === "ok" ? null : false;
     c.afterFlip?.(e.key, d);
     for (const s of surfaces) {
+      const why = unobservable.get(s);
+      if (why && w.kind === "ok" && logged !== false) {
+        pushRow(c, {
+          key: e.key, surface: s, direction: d, pass: false, notObservable: why,
+          observed: `ikke observerbar: ${why}`, expected: `effekten av «${value}»`,
+          ms_to_effect: null, write_status: status, change_logged: logged, discriminating: false, reason: why,
+        });
+        continue;
+      }
       const r = await awaitChoiceEffect(c, c.readers[caseId(e.key, s)], value, t0);
       const writeOk = w.kind === "ok";
       pushRow(c, {

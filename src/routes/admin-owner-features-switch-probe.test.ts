@@ -481,6 +481,23 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
         `obs-20: a reader that throws at the baseline re-check → FAIL «leser feilet», not NOT_OBSERVABLE (${lf.map((x) => `${x.direction}:${x.result}:${x.reason}`).join(" | ")})`);
       assertEq([f2.not_observable, f2.ready_for_daniel_test, f2.restored], [0, false, true], "obs-21: 0 not observable, not ready, restored");
       assertEq(rawState(FIX), before, "obs-22: restored byte-identical");
+
+      // (g) T14a: a fixture without a street address → contact.address (a choice) is NOT_OBSERVABLE
+      // on every surface, with the reason — never PASS, and no false FAIL.
+      const addr = (db.prepare("SELECT address FROM agent_knowledge WHERE agent_id = ?").get(FIX) as { address: string | null }).address;
+      db.prepare("UPDATE agent_knowledge SET address = NULL WHERE agent_id = ?").run(FIX);
+      let g: Awaited<ReturnType<typeof probe.runSwitchProbe>>;
+      try {
+        g = await probe.runSwitchProbe(FIX, { db, maxWaitMs: 0 });
+      } finally {
+        db.prepare("UPDATE agent_knowledge SET address = ? WHERE agent_id = ?").run(addr, FIX);
+      }
+      const ga = g!.rows.filter((x) => x.key === "contact.address");
+      assertTrue(ga.length === 16 && ga.every((x) => x.result === "NOT_OBSERVABLE" && /ingen gateadresse/.test(x.reason || "") && x.discriminating === false && x.ms_to_effect === null),
+        `obs-23 (T14a): no street address → contact.address NOT_OBSERVABLE on all 8 surfaces × 2 options, with the reason (${ga.map((x) => `${x.surface}:${x.direction}:${x.result}`).join(",")})`);
+      assertEq([g!.rows.filter((x) => x.key === "contact.address" && x.result === "FAIL").length, g!.ready_for_daniel_test, g!.restored], [0, false, true],
+        "obs-24 (T14a): no false FAIL, not ready, restored");
+      assertEq(rawState(FIX), before, "obs-25: restored byte-identical");
     }
 
     // ═══ Flags off: the rows that depend on them FAIL ═════════════════════
