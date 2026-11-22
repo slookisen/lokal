@@ -57,7 +57,9 @@ import {
   readAgentSnapshot,
   computeFillPlan,
   applyMergeWrites,
+  countHistoryToMove,
   MAP_POINT_FIELDS,
+  type HistoryMoveCounts,
 } from "../routes/admin-agents-duplicate-merge";
 
 // The flag lives in claim-action-link.ts (it also gates the D2 link).
@@ -95,6 +97,11 @@ export interface ClaimMergeApproveSuccess {
   geocodeReset: boolean;
   /** Open claims (pending_review / code_sent) left on the duplicate. */
   duplicateOpenClaims: number;
+  /** Dry-run: the duplicate's CRM contact / outreach history that would move
+   *  to the survivor (duplicate-merge core, moveAgentHistory). */
+  wouldMoveHistory?: HistoryMoveCounts;
+  /** Apply: the history that moved. */
+  historyMoved?: HistoryMoveCounts;
   /** Apply only: the approval result (address for the login mail). */
   approved?: { email: string; isVerified: boolean };
 }
@@ -171,13 +178,13 @@ export function runClaimMergeApprove(input: {
         geocodeReset: !!plan.geocodeReset,
         duplicateOpenClaims,
       };
-      if (!apply) return base;
+      if (!apply) return { ...base, wouldMoveHistory: countHistoryToMove(db, duplicateId) };
 
-      applyMergeWrites(db, survivor, duplicate, plan, reason, batchTag);
+      const { historyMoved } = applyMergeWrites(db, survivor, duplicate, plan, reason, batchTag);
       const approved = applyClaimApprove(claimId);
       // Throwing rolls back the merge writes above together with the approval.
       if (!approved.ok) throw new ApproveRefused(approved.error);
-      return { ...base, approved: { email: approved.email, isVerified: approved.isVerified } };
+      return { ...base, historyMoved, approved: { email: approved.email, isVerified: approved.isVerified } };
     })();
   } catch (err) {
     if (err instanceof ApproveRefused) {

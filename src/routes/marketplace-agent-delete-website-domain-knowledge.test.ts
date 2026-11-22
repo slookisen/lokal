@@ -188,6 +188,47 @@ export async function runMarketplaceAgentDeleteWebsiteDomainKnowledgeTests(
       assertEq(websiteRowCount("url-plus-vipps"), 1, "url-plus-vipps: only the agents.url domain written");
       assertEq(blocklistRowsFor("website_domain", "vipps.no").length, 0, "url-plus-vipps: vipps.no not blocklisted");
     }
+    // ── AK6 (dev-request 2026-11-22-rfb-dubletter-samme-nettsted-
+    //    sammenslaaing-og-utsending, point 6): another ACTIVE profile on the
+    //    same website → no website_domain row for that domain. ──
+    // Survivor shares the domain via agents.url (different spelling).
+    {
+      insertAgent({ id: "ak6-surv-url", name: "Felles Gård", email: "post@ak6-surv-url.no", url: "https://delt-dom.no" });
+      const r = await run({ id: "ak6-dup-url", url: "https://www.delt-dom.no/om", kw: "http://delt-dom.no" });
+      assertEq(blocklistRowsFor("website_domain", "delt-dom.no").length, 0, "ak6-dup-url: domain shared with an active profile NOT blocklisted");
+      assertEq(websiteRowCount("ak6-dup-url"), 0, "ak6-dup-url: no website_domain row written");
+      assertEq(blocklistRowsFor("agent_id", "ak6-dup-url").length, 1, "ak6-dup-url: agent_id still blocklisted");
+      assertEq(blocklistRowsFor("email", normalizeEmail("post@ak6-dup-url-mail.no")).length, 1, "ak6-dup-url: email still blocklisted (not shared)");
+      assertTrue(!(r.body?.blocklist?.rows || []).some((x: any) => x.identifier_type === "website_domain"), "ak6-dup-url: response carries no website_domain row");
+      assertTrue(!!readAgent("ak6-surv-url"), "ak6-dup-url: survivor untouched");
+    }
+    // Survivor shares the domain only via agent_knowledge.website.
+    {
+      insertAgent({ id: "ak6-surv-kw", name: "Kunnskap Gård", email: "post@ak6-surv-kw.no", url: "", knowledgeWebsite: "https://kdelt-dom.no/" });
+      await run({ id: "ak6-dup-kw", url: "https://kdelt-dom.no" });
+      assertEq(blocklistRowsFor("website_domain", "kdelt-dom.no").length, 0, "ak6-dup-kw: domain shared via survivor's agent_knowledge.website NOT blocklisted");
+    }
+    // Two sources, only one shared → only the unshared domain is blocklisted.
+    {
+      insertAgent({ id: "ak6-surv-mix", name: "Blandet Gård", email: "post@ak6-surv-mix.no", url: "https://mix-delt.no" });
+      await run({ id: "ak6-dup-mix", url: "https://mix-delt.no", kw: "https://mix-egen.no" });
+      assertEq(blocklistRowsFor("website_domain", "mix-delt.no").length, 0, "ak6-dup-mix: shared agents.url domain NOT blocklisted");
+      assertEq(blocklistRowsFor("website_domain", "mix-egen.no").length, 1, "ak6-dup-mix: own knowledge domain still blocklisted");
+      assertEq(websiteRowCount("ak6-dup-mix"), 1, "ak6-dup-mix: exactly one website_domain row");
+    }
+    // Another profile on the domain that is INACTIVE (e.g. already merged) does
+    // not count → the domain is blocklisted as before.
+    {
+      insertAgent({ id: "ak6-inactive", name: "Gammel Gård", email: "post@ak6-inactive.no", url: "https://inaktiv-dom.no", isActive: false });
+      await run({ id: "ak6-dup-inactive", url: "https://inaktiv-dom.no" });
+      assertEq(blocklistRowsFor("website_domain", "inaktiv-dom.no").length, 1, "ak6-dup-inactive: inactive sharer does not protect the domain");
+    }
+    // Sole profile on its domain → unchanged behaviour.
+    {
+      await run({ id: "ak6-sole", url: "https://eneste-dom.no" });
+      assertEq(blocklistRowsFor("website_domain", "eneste-dom.no").length, 1, "ak6-sole: sole profile's domain still blocklisted");
+      assertEq(websiteRowCount("ak6-sole"), 1, "ak6-sole: exactly one website_domain row");
+    }
     // skipBlocklist=1 -> nothing written.
     {
       const r = await run({ id: "kw-skip", url: "", kw: "https://skip-dom.no", query: { skipBlocklist: "1" } });

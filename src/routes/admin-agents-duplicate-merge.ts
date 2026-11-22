@@ -440,12 +440,149 @@ export function isAlreadyMergedPair(survivor: AgentSnapshot, duplicate: AgentSna
   return !survivor.isActive || duplicate.mergedInto !== null;
 }
 
+// ── Contact / outreach history (dev-request
+//    2026-11-22-rfb-dubletter-samme-nettsted-sammenslaaing-og-utsending,
+//    point 2) ─────────────────────────────────────────────────────────────
+//
+// The outreach reply-block and the send/cooldown gates read per-agent history
+// by agent_id (admin-outreach-candidates.ts has_replied / is_opted_out:
+// crm_contacts.agent_id → crm_threads.contact_id → crm_messages; the
+// outreach_ready_pool VIEW and the second-touch cooldown: outreach_sent_log
+// .agent_id; the RFB marketing job's follow-up threading: rfb_marketing_send
+// _ledger.agent_id). A merge that only deactivates the duplicate leaves that
+// history on the dead row, so the surviving profile looks "never contacted /
+// never replied" and gets a follow-up after the farm already answered (real
+// incident: the reply sat on a contact still pointing at a merged profile).
+// The merge therefore re-points that history duplicate → survivor in the SAME
+// transaction as the deactivation:
+//
+//   crm_contacts.agent_id            duplicate → survivor
+//   crm_threads                      no agent column — threads hang off
+//                                    crm_threads.contact_id, so they follow
+//                                    their contact automatically; counted and
+//                                    audited, never updated themselves
+//   outreach_sent_log.agent_id       duplicate → survivor
+//   rfb_marketing_send_ledger.agent_id duplicate → survivor (when the table exists)
+//
+// Conflict rule: none of these UNIQUE constraints includes the agent column
+// (crm_contacts is UNIQUE(email, vertical_id); rfb_marketing_send_ledger is
+// UNIQUE(day, recipient_email); outreach_sent_log has none), so re-pointing
+// can never collide. When the survivor already has its own rows (e.g. its own
+// contact under another address), the survivor's rows are left exactly as
+// they are and the duplicate's rows are added next to them — a union. No row
+// is ever deleted or folded into another, so no reply, opt-out (contact
+// status) or send is lost and every move is reversible from the audit rows.
+//
+// Audit: one agent_knowledge_audit row per table that actually moved
+// (field_name `merge_moved:<table>`, on the DUPLICATE's id like the 'merge'
+// row, old_value = duplicate_id, new_value = survivor_id, notes = JSON with
+// count + moved ids). Rollback = UPDATE <table> SET agent_id = old_value
+// WHERE id IN (notes.ids); threads follow their contacts.
+
+/** Per-table counts of the history a merge moves (or would move). */
+export interface HistoryMoveCounts {
+  crm_contacts: number;
+  crm_threads: number;
+  outreach_sent_log: number;
+  rfb_marketing_send_ledger: number;
+}
+
+function tableExists(db: ReturnType<typeof getDb>, name: string): boolean {
+  return !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(name);
+}
+
+interface HistoryRows {
+  crm_contacts: string[];
+  crm_threads: string[];
+  outreach_sent_log: number[];
+  rfb_marketing_send_ledger: number[];
+}
+
+function readDuplicateHistory(db: ReturnType<typeof getDb>, duplicateId: string): HistoryRows {
+  const ids = <T>(sql: string): T[] => (db.prepare(sql).all(duplicateId) as Array<{ id: T }>).map((r) => r.id);
+  return {
+    crm_contacts: ids<string>(`SELECT id FROM crm_contacts WHERE agent_id = ? ORDER BY id`),
+    crm_threads: ids<string>(
+      `SELECT t.id AS id FROM crm_threads t JOIN crm_contacts c ON c.id = t.contact_id WHERE c.agent_id = ? ORDER BY t.id`,
+    ),
+    outreach_sent_log: ids<number>(`SELECT id FROM outreach_sent_log WHERE agent_id = ? ORDER BY id`),
+    rfb_marketing_send_ledger: tableExists(db, "rfb_marketing_send_ledger")
+      ? ids<number>(`SELECT id FROM rfb_marketing_send_ledger WHERE agent_id = ? ORDER BY id`)
+      : [],
+  };
+}
+
+function countsOf(rows: HistoryRows): HistoryMoveCounts {
+  return {
+    crm_contacts: rows.crm_contacts.length,
+    crm_threads: rows.crm_threads.length,
+    outreach_sent_log: rows.outreach_sent_log.length,
+    rfb_marketing_send_ledger: rows.rfb_marketing_send_ledger.length,
+  };
+}
+
+/** Dry-run: what moveAgentHistory would move. Reads only. */
+export function countHistoryToMove(db: ReturnType<typeof getDb>, duplicateId: string): HistoryMoveCounts {
+  return countsOf(readDuplicateHistory(db, duplicateId));
+}
+
+/**
+ * Re-points the duplicate's contact / outreach history onto the survivor (see
+ * the block comment above for tables, conflict rule and audit). Caller owns
+ * the surrounding transaction. Returns what moved.
+ */
+export function moveAgentHistory(
+  db: ReturnType<typeof getDb>,
+  survivorId: string,
+  duplicateId: string,
+  reason: string,
+  batchTag: string,
+): HistoryMoveCounts {
+  const rows = readDuplicateHistory(db, duplicateId);
+  if (rows.crm_contacts.length > 0) {
+    db.prepare(`UPDATE crm_contacts SET agent_id = ? WHERE agent_id = ?`).run(survivorId, duplicateId);
+  }
+  if (rows.outreach_sent_log.length > 0) {
+    db.prepare(`UPDATE outreach_sent_log SET agent_id = ? WHERE agent_id = ?`).run(survivorId, duplicateId);
+  }
+  if (rows.rfb_marketing_send_ledger.length > 0) {
+    db.prepare(`UPDATE rfb_marketing_send_ledger SET agent_id = ? WHERE agent_id = ?`).run(survivorId, duplicateId);
+  }
+
+  const audit = db.prepare(
+    `INSERT INTO agent_knowledge_audit
+       (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
+     VALUES (?, ?, ?, ?, ?, 'system', NULL, datetime('now'), ?)`,
+  );
+  for (const table of ["crm_contacts", "crm_threads", "outreach_sent_log", "rfb_marketing_send_ledger"] as const) {
+    const moved = rows[table] as Array<string | number>;
+    if (moved.length === 0) continue;
+    audit.run(
+      randomUUID(),
+      duplicateId,
+      `merge_moved:${table}`,
+      duplicateId,
+      survivorId,
+      JSON.stringify({
+        batch: batchTag,
+        reason,
+        table,
+        column: table === "crm_threads" ? "contact_id (follows crm_contacts, not updated)" : "agent_id",
+        count: moved.length,
+        ids: moved,
+      }),
+    );
+  }
+  return countsOf(rows);
+}
+
 // ── Writes ───────────────────────────────────────────────────────────────
 
 /**
  * Performs the actual writes for one pair (agents.contact_email fill,
  * agent_knowledge fill/create + provenance append, audit rows, and the
- * mandatory duplicate deactivation + merge-decision audit row). Caller is
+ * mandatory duplicate deactivation + merge-decision audit row, and the
+ * contact / outreach history move — moveAgentHistory). Caller is
  * responsible for the surrounding transaction and the fresh claimed/curated
  * re-check.
  */
@@ -456,7 +593,7 @@ export function applyMergeWrites(
   plan: MergePlan,
   reason: string,
   batchTag: string,
-): { fieldsFilled: string[] } {
+): { fieldsFilled: string[]; historyMoved: HistoryMoveCounts } {
   const fieldsFilled: string[] = [];
 
   const contactFill = plan.fillable.find((f) => f.table === "agents" && f.field === "contact_email");
@@ -540,6 +677,11 @@ export function applyMergeWrites(
     invalidateAgentGeocode(db, survivor.id);
   }
 
+  // The duplicate's CRM contact / outreach history goes with the merge, so the
+  // survivor inherits "has replied / was contacted / opted out" (see the
+  // history block comment above moveAgentHistory).
+  const historyMoved = moveAgentHistory(db, survivor.id, duplicate.id, reason, batchTag);
+
   // Mandatory, independent of whether any field above was fillable: the
   // caller's decision to merge this pair is executed regardless.
   db.prepare(`UPDATE agents SET is_active = 0, merged_into = ? WHERE id = ?`).run(survivor.id, duplicate.id);
@@ -549,7 +691,7 @@ export function applyMergeWrites(
      VALUES (?, ?, 'merge', ?, ?, 'system', NULL, datetime('now'), ?)`,
   ).run(randomUUID(), duplicate.id, duplicate.id, survivor.id, reason);
 
-  return { fieldsFilled };
+  return { fieldsFilled, historyMoved };
 }
 
 type PairOutcome =
@@ -566,6 +708,8 @@ interface PairResult {
   outcome: PairOutcome;
   fieldsFilled?: string[];
   detail?: string;
+  /** would_merge: history that would move; merged: history that moved. */
+  history?: HistoryMoveCounts;
 }
 
 /**
@@ -597,6 +741,7 @@ function planMergePair(
     outcome: "would_merge",
     fieldsFilled: plan.fillable.map((f) => f.field),
     detail: curatedDetail(plan.curatedSkipped),
+    history: countHistoryToMove(db, duplicateId),
   };
 }
 
@@ -624,9 +769,9 @@ function applyMergePair(
       if (isAlreadyMergedPair(survivor, duplicate)) return { outcome: "skipped_already_merged" };
 
       const plan = computeFillPlan(survivor, duplicate);
-      const { fieldsFilled } = applyMergeWrites(db, survivor, duplicate, plan, reason, batchTag);
+      const { fieldsFilled, historyMoved } = applyMergeWrites(db, survivor, duplicate, plan, reason, batchTag);
 
-      return { outcome: "merged", fieldsFilled, detail: curatedDetail(plan.curatedSkipped) };
+      return { outcome: "merged", fieldsFilled, detail: curatedDetail(plan.curatedSkipped), history: historyMoved };
     });
     return tx();
   } catch (e: any) {
@@ -642,6 +787,10 @@ interface ResultItem {
   allow_claimed_survivor?: true;
   fields_filled?: string[];
   detail?: string;
+  /** Dry-run (would_merge only): contact / outreach history that would move. */
+  would_move?: HistoryMoveCounts;
+  /** Apply (merged only): contact / outreach history that moved. */
+  moved?: HistoryMoveCounts;
 }
 
 /** Dry-run by default: only an explicit truthy form (true, 1, "1", "true" in
@@ -742,6 +891,7 @@ router.post("/", (req: Request, res: Response) => {
         ...echo,
         ...(plan.fieldsFilled ? { fields_filled: plan.fieldsFilled } : {}),
         ...(plan.detail ? { detail: plan.detail } : {}),
+        ...(plan.history ? { would_move: plan.history } : {}),
       });
       continue;
     }
@@ -754,6 +904,7 @@ router.post("/", (req: Request, res: Response) => {
       ...echo,
       ...(applied.fieldsFilled ? { fields_filled: applied.fieldsFilled } : {}),
       ...(applied.detail ? { detail: applied.detail } : {}),
+      ...(applied.history ? { moved: applied.history } : {}),
     });
   }
 
