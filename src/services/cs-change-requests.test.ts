@@ -23,6 +23,12 @@
  *   cqo1-cqo6  opening hours (RFB): text written as a one-item list, locked,
  *              verified on the public card; day-and-time text; CR/LF and tab;
  *              clear; limits.
+ *   cqp1-cqp12 products (RFB, dev-request 2026-11-22-cs-endringsforesporsel-
+ *              kan-fjerne-og-rette-varer): remove / rename a named product —
+ *              the rest of the list unchanged, lock on products, verified on
+ *              card and page; unknown name, owner / import products, an
+ *              owner-locked list, a name collision → refused, nothing written;
+ *              the listing shows action and product in plain text.
  *   cqr8-cqr18 second re-review: an Opplevagent removal through the REAL
  *              visibility route blocklists only the plan (never an e-mail,
  *              org.nr or site another active profile uses) and verifies on
@@ -138,6 +144,8 @@ export function runCsChangeRequestsTests(opts: { log?: boolean } = {}): Promise<
           }
           // As the real write path: openingHours is stored only when it is a list.
           if (Array.isArray(body.openingHours)) db.prepare("UPDATE agent_knowledge SET opening_hours = ? WHERE agent_id = ?").run(JSON.stringify(body.openingHours), decodeURIComponent(m[1]));
+          // As mergeKnowledge: a products list replaces the stored one.
+          if (Array.isArray(body.products)) db.prepare("UPDATE agent_knowledge SET products = ? WHERE agent_id = ?").run(JSON.stringify(body.products), decodeURIComponent(m[1]));
           return res(200, { success: true });
         }
         m = /^\/api\/marketplace\/agents\/([^/?]+)\/description$/.exec(path);
@@ -180,20 +188,27 @@ export function runCsChangeRequestsTests(opts: { log?: boolean } = {}): Promise<
         let m = /^\/api\/marketplace\/agents\/([^/]+)\/card$/.exec(path);
         if (m && cardDown) return r(503, "");
         if (m) {
-          const a = db.prepare(`SELECT a.id, a.name, k.phone, k.about, k.address, k.opening_hours FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id WHERE a.id = ?`).get(decodeURIComponent(m[1])) as any;
+          const a = db.prepare(`SELECT a.id, a.name, k.phone, k.about, k.address, k.opening_hours, k.products FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id WHERE a.id = ?`).get(decodeURIComponent(m[1])) as any;
           if (!a) return r(404, "{}");
           // As the real card: the stored opening hours list, when there is one.
-          const { opening_hours: oh, ...rest } = a;
+          const { opening_hours: oh, products: pr, ...rest } = a;
           const hours = oh ? JSON.parse(oh) : [];
-          const card = Array.isArray(hours) && hours.length ? { ...rest, openingHours: hours } : rest;
+          const prods = pr ? JSON.parse(pr) : [];
+          const card0 = Array.isArray(hours) && hours.length ? { ...rest, openingHours: hours } : rest;
+          // As the real card: products by name (and category / price) when there are any.
+          const card = Array.isArray(prods) && prods.length
+            ? { ...card0, products: prods.map((p: any) => (typeof p === "string" ? { name: p } : { name: p.name, category: p.category, price: p.price })) }
+            : card0;
           return r(200, JSON.stringify(staleSurface ? { id: a.id, name: a.name, phone: "22 22 22 22", about: "Gammel tekst om gården" } : card));
         }
         m = /^\/produsent\/(.+)$/.exec(path);
         if (m) {
-          const a = (db.prepare(`SELECT a.id, a.name, a.is_active, a.catalog_hidden, k.phone, k.about, k.opening_hours FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id`).all() as any[]).find((x) => slugify(x.name) === decodeURIComponent(m![1]));
+          const a = (db.prepare(`SELECT a.id, a.name, a.is_active, a.catalog_hidden, k.phone, k.about, k.opening_hours, k.products FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id`).all() as any[]).find((x) => slugify(x.name) === decodeURIComponent(m![1]));
           if (!a || a.is_active !== 1) return r(404, "Ikke funnet");
           const hoursText = a.opening_hours ? openingHoursText(JSON.parse(a.opening_hours)) : "";
-          return r(200, staleSurface ? `<h1>${a.name}</h1><p>22 22 22 22</p><p>Gammel tekst om gården</p>` : `<h1>${a.name}</h1><p>${a.phone}</p><p>${a.about}</p><p>${hoursText}</p>`);
+          const prods = a.products ? JSON.parse(a.products) : [];
+          const prodHtml = Array.isArray(prods) && prods.length ? `<ul>${prods.map((p: any) => `<li>${typeof p === "string" ? p : p.name}</li>`).join("")}</ul>` : "";
+          return r(200, staleSurface ? `<h1>${a.name}</h1><p>22 22 22 22</p><p>Gammel tekst om gården</p>` : `<h1>${a.name}</h1><p>${a.phone}</p><p>${a.about}</p><p>${hoursText}</p>${prodHtml}`);
         }
         if (path.startsWith("/api/marketplace/search")) {
           const rows = db.prepare("SELECT id, name FROM agents WHERE is_active = 1 AND COALESCE(catalog_hidden, 0) = 0").all();
@@ -591,6 +606,195 @@ export function runCsChangeRequestsTests(opts: { log?: boolean } = {}): Promise<
           cq.openingHoursComparable(JSON.stringify(["Onsdag", "Fredag"])),
         ], [null, "", "Onsdag", dayRows, "Lørdag 10–14", JSON.stringify(["Onsdag", "Fredag"])],
           "cqo6: only a one-item text list (or plain text) compares as text; day rows stay their raw JSON");
+      }
+
+      // ── cqp1-cqp12: products (Daniel 2026-11-22: CS removes and renames products itself) ──
+      {
+        mkAgent("ag-p", "Varegården", "post@varegarden.no", "https://varegarden.no");
+        const original = [
+          { name: "Gressfôra kjøtt", category: "meat", seasonal: false, price: "250/kg", priceUnit: "kr" },
+          { name: "grønnsaksandeler", category: "other", seasonal: false },
+          { name: "potet", category: "vegetables", seasonal: true, months: [8, 9] },
+          { source: "enrichment", name: "egg", category: "eggs", seasonal: false },
+        ];
+        const setProducts = (id: string, list: unknown) => db.prepare("UPDATE agent_knowledge SET products = ? WHERE agent_id = ?").run(JSON.stringify(list), id);
+        const productsOf = (id: string) => JSON.parse((db.prepare("SELECT products FROM agent_knowledge WHERE agent_id = ?").get(id) as any).products);
+        const rawProducts = (id: string) => (db.prepare("SELECT products FROM agent_knowledge WHERE agent_id = ?").get(id) as any).products as string;
+        const countRows = () => (db.prepare("SELECT COUNT(*) AS n FROM cs_change_requests").get() as any).n as number;
+        setProducts("ag-p", original);
+        const rawBefore = rawProducts("ag-p");
+        const tP = mkThread("rfb", "post@varegarden.no");
+        const pCreate = (products: unknown, extra: Record<string, unknown> = {}, targetId = "ag-p", requesterEmail = "post@varegarden.no", threadId: string | null = tP) =>
+          create({ targetId, threadId, requesterEmail, products, ...extra } as any) as any;
+        const knowledgePuts = (id: string) => calls.filter((c) => c.method === "PUT" && c.path === `/api/marketplace/agents/${id}/knowledge`).length;
+
+        // AK1: remove one named product.
+        const p1 = pCreate([{ action: "remove", name: "grønnsaksandeler" }]);
+        ok(p1.ok && !p1.dryRun && p1.request.status === "queued", "cqp1a: a request to remove a named product is queued");
+        await cq.runCsChangeRequests(deps());
+        const p1row = R(p1.request.id);
+        eq([p1row.status, productsOf("ag-p")], ["verified", [original[0], original[2], original[3]]],
+          "cqp1 (AK1): the named product is gone, every other product is stored exactly as before, status verified");
+        ok(calls.some((c) => /ag-p\/curated-fields$/.test(c.path) && c.body.field === "products" && c.body.meta?.by === "rfb-customer-service"),
+          "cqp1b (AK1): products is locked (curated-fields, field products)");
+        const p1put = calls.filter((c) => c.path === "/api/marketplace/agents/ag-p/knowledge").pop();
+        eq([Array.isArray(p1put?.body?.products), p1put?.body?.products?.length, p1put?.body?.dataSource], [true, 3, "owner"], "cqp1c: the WHOLE list is written back (a list replaces the stored one)");
+        const p1snap = JSON.parse(p1row.snapshot ?? "{}");
+        eq(p1snap.products?.old, rawBefore, "cqp1d: the snapshot keeps the old list exactly as stored (rollback)");
+        const p1verify = JSON.parse(p1row.steps).filter((x: any) => x.step === "verify").pop();
+        eq(p1verify?.detail?.fields?.["vare «grønnsaksandeler» fjernes"], "fjernet_fra_siden", "cqp1e: verification read the page and the card: the product is gone");
+
+        // AK2: unknown name → refused with a reason, nothing written.
+        {
+          const n0 = countRows();
+          const puts0 = knowledgePuts("ag-p");
+          const before = rawProducts("ag-p");
+          const p2 = pCreate([{ action: "remove", name: "andelslandbruk" }]);
+          const p2dry = pCreate([{ action: "remove", name: "Egg" }], { apply: false });
+          await cq.runCsChangeRequests(deps());
+          eq([p2.ok, p2.status, p2.error, p2.detail?.reason, p2.detail?.stored_names?.includes("egg"), p2dry.error],
+            [false, 422, "product_not_found", "ukjent_vare", true, "product_not_found"],
+            "cqp2 (AK2): an unknown name (also one that differs only in case) is refused with a reason and the stored names");
+          eq([countRows() - n0, knowledgePuts("ag-p") - puts0, rawProducts("ag-p") === before], [0, 0, true], "cqp2b (AK2): nothing is written — no request row, no knowledge write, list unchanged");
+        }
+
+        // Rename happy path: the product keeps every other field.
+        const p4 = pCreate([{ action: "rename", name: "potet", newName: "Potet (gulløye)" }]);
+        await cq.runCsChangeRequests(deps());
+        eq([R(p4.request.id).status, productsOf("ag-p")], ["verified", [original[0], { ...original[2], name: "Potet (gulløye)" }, original[3]]],
+          "cqp4: rename → same product with the new name (category, months kept), the others unchanged, verified");
+        const p4verify = JSON.parse(R(p4.request.id).steps).filter((x: any) => x.step === "verify").pop();
+        eq(p4verify?.detail?.fields?.["vare «potet» → «Potet (gulløye)»"], "nytt_navn_vises_offentlig", "cqp4b: the new name shows on card and page, the old one is off the card");
+
+        // Rename collision.
+        {
+          const before = rawProducts("ag-p");
+          const p5 = pCreate([{ action: "rename", name: "Potet (gulløye)", newName: "EGG" }]);
+          eq([p5.ok, p5.error, p5.detail?.reason, rawProducts("ag-p") === before], [false, "product_name_taken", "navnet_finnes_alt", true],
+            "cqp5: a new name another product already has (any case) is refused, nothing written");
+        }
+
+        // Validation.
+        {
+          const n0 = countRows();
+          const st = (x: any) => x.status;
+          eq([
+            st(pCreate([{ action: "add", name: "Honning" }])),
+            st(pCreate([{ action: "rename", name: "egg", newName: "egg" }])),
+            st(pCreate([{ action: "remove", name: " " }])),
+            st(pCreate([{ action: "rename", name: "egg" }])),
+            st(pCreate([{ action: "remove", name: "egg" }, { action: "remove", name: "egg" }])),
+            st(pCreate([{ action: "remove", name: "x".repeat(201) }])),
+            st(pCreate([])),
+            st(pCreate("egg")),
+            st(pCreate([{ action: "remove", name: "egg" }], { kind: "removal" })),
+            st(cq.createChangeRequest({ vertical: "experiences", targetId: "ep-1", threadId: null, requesterEmail: "hei@siderivest.no", kind: "profile_update", createdBy: "claude", apply: false, products: [{ action: "remove", name: "Sider" }] } as any, { env: ON })),
+            st(pCreate(undefined, { changes: { products: "egg" } })),
+          ], [400, 400, 400, 400, 400, 400, 400, 400, 400, 422, 422],
+            "cqp6: no adding, a rename needs a different newName, names are non-empty and at most 200, no repeats, a list, profile_update and RFB only");
+          eq(countRows(), n0, "cqp6b: none of them filed a request");
+        }
+
+        // AK3: products from the product import / the owner cannot be changed.
+        {
+          mkAgent("ag-po", "Eiergården", "post@eiergarden.no", "https://eiergarden.no");
+          const imported = { name: "Lammelår", category: "meat", seasonal: false, price: "275/kg", source: "owner_import", sourceUrl: "https://eiergarden.no/butikk", fetchedAt: "2026-11-01T10:00:00Z", confirmedAt: "2026-11-02T10:00:00Z" };
+          const scraped = { name: "Ull", category: "other", seasonal: false };
+          setProducts("ag-po", [imported, scraped]);
+          const before = rawProducts("ag-po");
+          const tPo = mkThread("rfb", "post@eiergarden.no");
+          const po = (products: unknown) => pCreate(products, {}, "ag-po", "post@eiergarden.no", tPo);
+          const n0 = countRows();
+          const a = po([{ action: "remove", name: "Lammelår" }]);
+          const b = po([{ action: "rename", name: "Lammelår", newName: "Lammelår (frossen)" }]);
+          const c = po([{ action: "remove", name: "Ull" }]);
+          eq([a.status, a.error, a.detail?.route_to, a.detail?.why, b.error, c.error, c.detail?.why],
+            [422, "product_owner_controlled", "daniel", "source:owner_import", "product_owner_controlled", "product_owner_controlled", "varelista_har_varer_fra_eier"],
+            "cqp3 (AK3): an imported product can be neither removed nor renamed, and a list holding one is not rewritten — refused for Daniel");
+          // An owner-set row in the product catalog (portal «Legg til vare» / stock).
+          mkAgent("ag-pc", "Kataloggården", "post@kataloggarden.no", "https://kataloggarden.no");
+          setProducts("ag-pc", [{ name: "Honning", category: "honey", seasonal: false }, { name: "Sylteøy", category: "other", seasonal: false }]);
+          db.prepare("INSERT INTO products (id, agent_id, name, name_norm, source, availability_source) VALUES ('pr-1', 'ag-pc', 'Honning', 'honning', 'enrichment', 'producer_dashboard')").run();
+          const tPc = mkThread("rfb", "post@kataloggarden.no");
+          const d = pCreate([{ action: "remove", name: "Honning" }], {}, "ag-pc", "post@kataloggarden.no", tPc);
+          // The owner saved the whole list in the portal (owner lock on products).
+          mkAgent("ag-pl", "Låsgården", "post@lasgarden.no", "https://lasgarden.no");
+          setProducts("ag-pl", [{ name: "Ost", category: "dairy", seasonal: false }]);
+          db.prepare("UPDATE agent_knowledge SET curated_fields = ? WHERE agent_id = 'ag-pl'").run(JSON.stringify({ products: { locked_at: "2026-11-01T00:00:00Z", by: "owner" } }));
+          const tPl = mkThread("rfb", "post@lasgarden.no");
+          const e = pCreate([{ action: "remove", name: "Ost" }], {}, "ag-pl", "post@lasgarden.no", tPl);
+          eq([d.error, d.detail?.why, e.error, e.detail?.why], ["product_owner_controlled", "katalog_lager:producer_dashboard", "product_owner_controlled", "varelista_laast_av_eier"],
+            "cqp3b (AK3): a product the owner set in the portal's catalog, and a list the owner locked, are refused for Daniel");
+          eq([countRows() - n0, rawProducts("ag-po") === before, knowledgePuts("ag-po") + knowledgePuts("ag-pc") + knowledgePuts("ag-pl")], [0, true, 0], "cqp3c (AK3): nothing written");
+          // The sylteøy on the catalog farm is still CS's to remove.
+          const f = pCreate([{ action: "remove", name: "Sylteøy" }], {}, "ag-pc", "post@kataloggarden.no", tPc);
+          await cq.runCsChangeRequests(deps());
+          eq([f.ok && R(f.request.id).status, productsOf("ag-pc").map((x: any) => x.name)], ["verified", ["Honning"]], "cqp3d: a scraped product beside an owner catalog row is removed");
+        }
+
+        // The list changed between filing and execution: fails with nothing written.
+        {
+          mkAgent("ag-pm", "Mellomgården", "post@mellomgarden.no", "https://mellomgarden.no");
+          setProducts("ag-pm", [{ name: "Rips", category: "berries", seasonal: true }, { name: "Solbær", category: "berries", seasonal: true }]);
+          const tPm = mkThread("rfb", "post@mellomgarden.no");
+          const g = pCreate([{ action: "remove", name: "Rips" }], {}, "ag-pm", "post@mellomgarden.no", tPm);
+          setProducts("ag-pm", [{ name: "Solbær", category: "berries", seasonal: true }, { name: "Rips", category: "berries", seasonal: true, source: "owner_manual", confirmedAt: "2026-11-22T10:00:00Z" }]);
+          const before = rawProducts("ag-pm");
+          await cq.runCsChangeRequests(deps());
+          const gr = R(g.request.id);
+          eq([gr.status, String(gr.status_reason).startsWith("varer: product_owner_controlled"), knowledgePuts("ag-pm"), rawProducts("ag-pm") === before],
+            ["failed", true, 0, true], "cqp7: a list the owner changed after filing is re-checked at execution: failed with the reason, nothing written");
+        }
+
+        // A product change beside a field change, and a stale surface.
+        {
+          staleSurface = true;
+          const h = pCreate([{ action: "remove", name: "egg" }], { changes: { about: "Vi selger kjøtt og poteter" } });
+          await cq.runCsChangeRequests(deps());
+          const stale = R(h.request.id).status;
+          staleSurface = false;
+          await cq.runCsChangeRequests(deps());
+          const hr = R(h.request.id);
+          eq([stale, hr.status, productsOf("ag-p").map((x: any) => x.name), (db.prepare("SELECT about FROM agent_knowledge WHERE agent_id = 'ag-p'").get() as any).about],
+            ["executed", "verified", ["Gressfôra kjøtt", "Potet (gulløye)"], "Vi selger kjøtt og poteter"],
+            "cqp8: products and a field in one request; not yet on the public card → stays executed, verified once it shows");
+          eq(JSON.parse(hr.changes), { about: "Vi selger kjøtt og poteter", products: [{ action: "remove", name: "egg" }] }, "cqp8b: the ops are stored in changes under products");
+        }
+
+        // A list the write path would change (a price in another product's name) is not written.
+        {
+          mkAgent("ag-pn", "Prisgården", "post@prisgarden.no", "https://prisgarden.no");
+          setProducts("ag-pn", [{ name: "Lammelår – kr 275/kg", category: "meat", seasonal: false }, { name: "Ull", category: "other", seasonal: false }]);
+          const tPn = mkThread("rfb", "post@prisgarden.no");
+          const before = rawProducts("ag-pn");
+          const i = pCreate([{ action: "remove", name: "Ull" }], {}, "ag-pn", "post@prisgarden.no", tPn);
+          await cq.runCsChangeRequests(deps());
+          eq([R(i.request.id).status, String(R(i.request.id).status_reason).includes("skrivestien_ville_endret_andre_varer"), knowledgePuts("ag-pn"), rawProducts("ag-pn") === before], ["failed", true, 0, true],
+            "cqp9: a write that would also change another product (price parsed out of its name) fails before anything is written");
+        }
+
+        // AK4: the listing shows the action and the product in plain text.
+        {
+          const prevKey2 = process.env.ADMIN_KEY;
+          process.env.ADMIN_KEY = "test-admin-key";
+          try {
+            const q = await call("GET", "/change-requests?limit=500");
+            const item = q.body.items.find((x: any) => x.id === p1.request.id);
+            const item4 = q.body.items.find((x: any) => x.id === p4.request.id);
+            eq([item?.changes_text, item4?.changes_text], [["fjern vare «grønnsaksandeler»"], ["endre navn på vare «potet» til «Potet (gulløye)»"]],
+              "cqp10 (AK4): GET /admin/cs/change-requests shows the action and the product in plain text");
+            const one = await call("GET", `/change-requests/${p1.request.id}`);
+            eq(one.body?.request?.changes_text, ["fjern vare «grønnsaksandeler»"], "cqp10b (AK4): so does GET /change-requests/:id");
+            const dry = await call("POST", "/change-requests", { vertical: "rfb", targetId: "ag-p", threadId: tP, requesterEmail: "post@varegarden.no", kind: "profile_update", products: [{ action: "remove", name: "Potet (gulløye)" }] });
+            eq([dry.status, dry.body?.dryRun, dry.body?.plan?.products?.text, dry.body?.plan?.products?.after], [200, true, ["fjern vare «Potet (gulløye)»"], ["Gressfôra kjøtt"]],
+              "cqp11: POST through the route is a dry run by default and shows the list after the change");
+            const bad = await call("POST", "/change-requests", { vertical: "rfb", targetId: "ag-p", threadId: tP, requesterEmail: "post@varegarden.no", kind: "profile_update", products: [{ action: "remove", name: "x", extra: 1 }] });
+            eq(bad.status, 400, "cqp11b: an unknown key in a product op is refused by the route");
+          } finally {
+            if (prevKey2 === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = prevKey2;
+          }
+          eq(cq.describeChanges(JSON.stringify({ phone: "900 11 222", about: "" })), ["phone: «900 11 222»", "tøm about"], "cqp12: field changes read as before in plain text");
+        }
       }
     } catch (err: any) {
       failed++;

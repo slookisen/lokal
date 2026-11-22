@@ -36,6 +36,10 @@ import { marketplaceRegistry } from "./marketplace-registry";
 import { recordRun } from "./run-ledger";
 import { EnvelopeBuilder } from "../types/run-envelope";
 import type { CrmVertical } from "./crm-service";
+import { knowledgeService, stampProductSources, OWNER_PRODUCT_SOURCES, type ProductInfo } from "./knowledge-service";
+import { normalizeName } from "./product-catalog-sync";
+import { gateOrganicProductsForWrite, hasValidDebioStatus, organicClaimGateEnabled } from "./description-quality";
+import { readDebioVerified } from "./debio-approval";
 
 export const CS_CHANGE_REQUESTS_FLAG = "CS_CHANGE_REQUESTS_ENABLED";
 export function csChangeRequestsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -130,6 +134,241 @@ const NOT_RENDERED: Record<ChangeVertical, readonly string[]> = { rfb: ["email"]
 
 export function supportedFields(vertical: ChangeVertical): string[] {
   return Object.keys(vertical === "rfb" ? RFB_FIELDS : EXP_FIELDS);
+}
+
+// ─── Products (RFB): remove or rename a named product ────────────────
+// dev-request 2026-11-22-cs-endringsforesporsel-kan-fjerne-og-rette-varer
+// (slookisen/A2A). A profile_update may carry `products`: a list of
+//   { action: "remove", name }            — the product goes
+//   { action: "rename", name, newName }   — same product, new name
+// `name` is the product's exact stored name. The server reads the stored
+// list, applies the ops, and writes the WHOLE list back (a list in a
+// knowledge write replaces the stored one), so every other product is kept
+// exactly as stored. No adding: a new product needs a source.
+//
+// A product the owner stated (source owner_manual / owner_import /
+// owner_auto_sync, an owner confirmation, an owner-set row in the product
+// catalog) is not CS's to change: such a request is refused, for Daniel.
+// So is any request on a list the owner locked, or a list that carries owner
+// products at all — the admin write path would restamp those as enrichment.
+//
+// The ops are stored in `changes` under the key `products`; the old list is
+// kept in the snapshot (`snapshot.products.old`) so the change can be undone.
+
+export type ProductAction = "remove" | "rename";
+export interface ProductOp {
+  action: ProductAction;
+  name: string;
+  newName?: string;
+}
+export const PRODUCT_NAME_MAX = 200;
+export const PRODUCT_OPS_MAX = 10;
+
+/** Who to send a refused product request to. */
+const PRODUCTS_TO_DANIEL = "daniel";
+
+type ProductPlanError = { ok: false; status: number; error: string; detail: Record<string, unknown> };
+
+/** Shape check of the request's product ops (types, non-empty, lengths, no repeats). */
+export function validateProductOps(raw: unknown): { ok: true; ops: ProductOp[] } | ProductPlanError {
+  const bad = (detail: Record<string, unknown>): ProductPlanError => ({ ok: false, status: 400, error: "invalid_products", detail });
+  if (!Array.isArray(raw) || raw.length === 0) return bad({ reason: "products må være en ikke-tom liste" });
+  if (raw.length > PRODUCT_OPS_MAX) return bad({ reason: `høyst ${PRODUCT_OPS_MAX} endringer på varer per forespørsel` });
+  const ops: ProductOp[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < raw.length; i++) {
+    const o = raw[i] as Record<string, unknown> | null;
+    if (!o || typeof o !== "object" || Array.isArray(o)) return bad({ index: i, reason: "hver endring er et objekt" });
+    const action = o.action;
+    if (action !== "remove" && action !== "rename") return bad({ index: i, reason: "action er remove eller rename (å legge til varer er ikke med)" });
+    const name = o.name;
+    if (typeof name !== "string" || name.trim() === "" || name.length > PRODUCT_NAME_MAX) return bad({ index: i, reason: `name er varens lagrede navn (1–${PRODUCT_NAME_MAX} tegn)` });
+    if (seen.has(name)) return bad({ index: i, reason: "samme vare to ganger i én forespørsel" });
+    seen.add(name);
+    if (action === "remove") {
+      if (o.newName !== undefined) return bad({ index: i, reason: "newName hører bare til rename" });
+      ops.push({ action, name });
+      continue;
+    }
+    const newName = o.newName;
+    if (typeof newName !== "string" || newName.trim() === "" || newName.length > PRODUCT_NAME_MAX) return bad({ index: i, reason: `newName er det nye navnet (1–${PRODUCT_NAME_MAX} tegn)` });
+    if (newName !== newName.trim() || /[\u0000-\u001f\u007f]/.test(newName)) return bad({ index: i, reason: "newName uten mellomrom i endene og uten linjeskift" });
+    if (newName === name) return bad({ index: i, reason: "newName er det samme som name" });
+    ops.push({ action, name, newName });
+  }
+  return { ok: true, ops };
+}
+
+function productNameOf(p: unknown): string | null {
+  if (typeof p === "string") return p;
+  if (p && typeof p === "object" && typeof (p as { name?: unknown }).name === "string") return (p as { name: string }).name;
+  return null;
+}
+
+/** Owner provenance on a stored product entry (its own source / confirmation). */
+function ownerProvenance(p: unknown): string | null {
+  if (!p || typeof p !== "object") return null;
+  const o = p as { source?: unknown; confirmedAt?: unknown };
+  if (typeof o.source === "string" && (OWNER_PRODUCT_SOURCES as readonly string[]).includes(o.source)) return `source:${o.source}`;
+  if (typeof o.confirmedAt === "string" && o.confirmedAt) return "bekreftet_av_eier";
+  return null;
+}
+
+export interface ProductState {
+  /** agent_knowledge.products as stored (raw JSON text). */
+  raw: string | null;
+  /** The parsed list, or null when it is not a readable list. */
+  list: unknown[] | null;
+  /** curated_fields.products.by === "owner": the owner saved the list in the portal. */
+  ownerLockedList: boolean;
+  /** name_norm → why, for product-catalog rows the owner (or import) set. Null when the catalog could not be read. */
+  ownerCatalog: Map<string, string> | null;
+}
+
+export function loadProductState(agentId: string): ProductState {
+  const db = getDb();
+  const row = db.prepare("SELECT products, curated_fields FROM agent_knowledge WHERE agent_id = ?").get(agentId) as { products: string | null; curated_fields: string | null } | undefined;
+  const raw = row?.products ?? null;
+  let list: unknown[] | null = null;
+  try {
+    const v = JSON.parse(raw ?? "[]");
+    list = Array.isArray(v) ? v : null;
+  } catch {
+    list = null;
+  }
+  let ownerLockedList = false;
+  try {
+    const cf = JSON.parse(row?.curated_fields ?? "{}");
+    ownerLockedList = !!cf && typeof cf === "object" && (cf as { products?: { by?: unknown } | null }).products?.by === "owner";
+  } catch {
+    ownerLockedList = false;
+  }
+  let ownerCatalog: Map<string, string> | null = new Map();
+  try {
+    const rows = db
+      .prepare(
+        `SELECT name_norm, source, availability_source, owner_confirmed_at FROM products
+          WHERE agent_id = ?
+            AND (source IN ('owner', 'owner_manual', 'owner_import', 'owner_auto_sync')
+                 OR availability_source IN ('producer_dashboard', 'admin_producer_confirmed')
+                 OR owner_confirmed_at IS NOT NULL)`,
+      )
+      .all(agentId) as Array<{ name_norm: string; source: string | null; availability_source: string | null; owner_confirmed_at: string | null }>;
+    for (const r of rows) {
+      const why = r.source && r.source !== "enrichment" ? `katalog_source:${r.source}` : r.availability_source && r.availability_source !== "enrichment" ? `katalog_lager:${r.availability_source}` : "katalog_bekreftet_av_eier";
+      ownerCatalog.set(r.name_norm, why);
+    }
+  } catch {
+    ownerCatalog = null; // cannot tell → refused (fail closed)
+  }
+  return { raw, list, ownerLockedList, ownerCatalog };
+}
+
+/** Apply the ops to a stored list. PURE apart from what `state` carries. */
+export function planProductOps(state: ProductState, ops: ProductOp[]): { ok: true; next: unknown[] } | ProductPlanError {
+  const toDaniel = (why: string, extra: Record<string, unknown> = {}): ProductPlanError => ({
+    ok: false,
+    status: 422,
+    error: "product_owner_controlled",
+    detail: { reason: "varer_satt_av_eier_eller_produktimport", why, route_to: PRODUCTS_TO_DANIEL, ...extra },
+  });
+  if (!state.list) return { ok: false, status: 422, error: "products_unreadable", detail: { reason: "varelista_kan_ikke_leses", route_to: PRODUCTS_TO_DANIEL } };
+  if (state.ownerLockedList) return toDaniel("varelista_laast_av_eier");
+  if (!state.ownerCatalog) return toDaniel("produktkatalogen_kunne_ikke_leses");
+  const ownerCatalog = state.ownerCatalog;
+  // The target itself first (the clearer reason), then the rest of the list.
+  for (const op of ops) {
+    const hits = state.list.filter((p) => productNameOf(p) === op.name);
+    if (hits.length === 0) {
+      return {
+        ok: false,
+        status: 422,
+        error: "product_not_found",
+        detail: { reason: "ukjent_vare", name: op.name, stored_names: state.list.map(productNameOf).filter((n): n is string => n !== null).slice(0, 100) },
+      };
+    }
+    if (hits.length > 1) return { ok: false, status: 422, error: "product_name_ambiguous", detail: { reason: "flere_varer_med_samme_navn", name: op.name } };
+    const prov = ownerProvenance(hits[0]) ?? ownerCatalog.get(normalizeName(op.name)) ?? null;
+    if (prov) return toDaniel(prov, { name: op.name });
+  }
+  const ownerOthers = state.list.map((p) => (ownerProvenance(p) ? productNameOf(p) : null)).filter((n): n is string => n !== null);
+  if (ownerOthers.length > 0) return toDaniel("varelista_har_varer_fra_eier", { owner_products: ownerOthers.slice(0, 50) });
+
+  let next: unknown[] = [...state.list];
+  for (const op of ops) {
+    const i = next.findIndex((p) => productNameOf(p) === op.name);
+    if (i < 0) return { ok: false, status: 422, error: "product_not_found", detail: { reason: "ukjent_vare", name: op.name } };
+    if (op.action === "remove") {
+      next = next.filter((_, j) => j !== i);
+      continue;
+    }
+    const newName = op.newName!;
+    const taken = next.some((p, j) => j !== i && normalizeName(productNameOf(p) ?? "") === normalizeName(newName));
+    if (taken) return { ok: false, status: 422, error: "product_name_taken", detail: { reason: "navnet_finnes_alt", name: op.name, newName } };
+    const cur = next[i];
+    next = next.map((p, j) => (j !== i ? p : typeof cur === "string" ? newName : { ...(cur as object), name: newName }));
+  }
+  return { ok: true, next };
+}
+
+/**
+ * What the admin knowledge write would store for this list (price parsing,
+ * provenance stamping, the organic gate). The plan is written only when that
+ * is the list itself — a write that would also change another product is
+ * refused before anything is written.
+ */
+function productsAsWritten(agentId: string, next: unknown[]): { ok: true; stored: unknown[] } | { ok: false; why: string } {
+  let out = next as ProductInfo[];
+  try {
+    if (organicClaimGateEnabled() && !hasValidDebioStatus(readDebioVerified(getDb(), agentId))) {
+      const g = gateOrganicProductsForWrite(out);
+      if (!g.ok) return { ok: false, why: `okologiporten_avviser:${g.field}` };
+      out = g.products;
+    }
+    if (out.length) {
+      out = (knowledgeService as unknown as { normalizeProducts(p: ProductInfo[]): ProductInfo[] }).normalizeProducts(out);
+      out = stampProductSources(out, false, new Date().toISOString());
+    }
+  } catch (e: any) {
+    return { ok: false, why: `skrivestien_avviser:${String(e?.message ?? e).slice(0, 200)}` };
+  }
+  return { ok: true, stored: out };
+}
+
+/** The same JSON value, whatever the order of object keys (the write path may reorder a product's keys). */
+function sameJson(a: unknown, b: unknown): boolean {
+  const canon = (v: unknown): unknown =>
+    Array.isArray(v)
+      ? v.map(canon)
+      : v && typeof v === "object"
+        ? Object.fromEntries(Object.keys(v as object).sort().map((k) => [k, canon((v as Record<string, unknown>)[k])]))
+        : v;
+  return JSON.stringify(canon(a)) === JSON.stringify(canon(b));
+}
+
+/** A stored `changes` value split into the field changes and the product ops. */
+export function readChanges(raw: string | null | undefined): { fields: Record<string, string>; products: ProductOp[] } {
+  let v: Record<string, unknown> = {};
+  try {
+    const p = JSON.parse(raw || "{}");
+    if (p && typeof p === "object" && !Array.isArray(p)) v = p;
+  } catch {
+    v = {};
+  }
+  const { products, ...rest } = v;
+  const fields: Record<string, string> = {};
+  for (const [k, val] of Object.entries(rest)) if (typeof val === "string") fields[k] = val;
+  return { fields, products: Array.isArray(products) ? (products as ProductOp[]) : [] };
+}
+
+/** The request's changes in plain text, one line each («fjern vare «x»», «about: «…»»). */
+export function describeChanges(raw: string | null | undefined): string[] {
+  const { fields, products } = readChanges(raw);
+  const clip = (s: string) => (s.length > 200 ? `${s.slice(0, 200)}…` : s);
+  return [
+    ...Object.entries(fields).map(([k, v]) => (v.trim() === "" ? `tøm ${k}` : `${k}: «${clip(v)}»`)),
+    ...products.map((o) => (o.action === "remove" ? `fjern vare «${o.name}»` : `endre navn på vare «${o.name}» til «${o.newName ?? ""}»`)),
+  ];
 }
 
 // ─── Transport seams (self-HTTP to the server's own routes) ──────────
@@ -239,7 +478,7 @@ export function getChangeRequest(id: string): ChangeRequestRow | null {
   return (getDb().prepare("SELECT * FROM cs_change_requests WHERE id = ?").get(id) as ChangeRequestRow | undefined) ?? null;
 }
 
-export function listChangeRequests(opts: { status?: string; threadId?: string; limit?: number } = {}): Array<ChangeRequestRow & { age_hours: number }> {
+export function listChangeRequests(opts: { status?: string; threadId?: string; limit?: number } = {}): Array<ChangeRequestRow & { age_hours: number; changes_text: string[] }> {
   const where: string[] = [];
   const params: unknown[] = [];
   if (opts.status === "open") where.push("status IN ('approval_needed', 'queued', 'executing', 'executed', 'hidden', 'deleting')");
@@ -259,7 +498,7 @@ export function listChangeRequests(opts: { status?: string; threadId?: string; l
           ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY created_at DESC LIMIT ${limit}`,
       )
       .all(...params) as Array<ChangeRequestRow & { age_hours: number }>
-  ).map((r) => ({ ...r, age_hours: Math.round(Number(r.age_hours) * 10) / 10 }));
+  ).map((r) => ({ ...r, age_hours: Math.round(Number(r.age_hours) * 10) / 10, changes_text: describeChanges(r.changes) }));
 }
 
 function addStep(id: string, step: string, ok: boolean, detail?: unknown, now: Date = new Date()): void {
@@ -413,6 +652,8 @@ export interface CreateChangeRequestInput {
   requesterEmail: string;
   kind: ChangeKind;
   changes?: Record<string, string>;
+  /** RFB only: remove / rename named products (see «Products» above). */
+  products?: unknown;
   evidence?: { messageId?: string | null; quote?: string | null } | null;
   createdBy: "claude" | "daniel";
   apply?: boolean;
@@ -429,9 +670,21 @@ export function createChangeRequest(input: CreateChangeRequestInput, deps: { env
   const target = loadTarget(input.vertical, input.targetId);
   if (!target) return { ok: false, status: 404, error: "target_not_found" };
   const changes = input.changes ?? {};
+  let productOps: ProductOp[] = [];
+  let productsAfter: unknown[] | null = null;
+  if (input.products !== undefined && input.products !== null) {
+    if (input.kind !== "profile_update") return { ok: false, status: 400, error: "products_only_in_profile_update" };
+    if (input.vertical !== "rfb") return { ok: false, status: 422, error: "products_rfb_only" };
+    const v = validateProductOps(input.products);
+    if (!v.ok) return v;
+    productOps = v.ops;
+    const plan = planProductOps(loadProductState(target.id), productOps);
+    if (!plan.ok) return plan;
+    productsAfter = plan.next;
+  }
   if (input.kind === "profile_update") {
     const keys = Object.keys(changes);
-    if (keys.length === 0) return { ok: false, status: 400, error: "no_changes" };
+    if (keys.length === 0 && productOps.length === 0) return { ok: false, status: 400, error: "no_changes" };
     const allowed = supportedFields(input.vertical);
     const unsupported = keys.filter((k) => !allowed.includes(k));
     if (unsupported.length) return { ok: false, status: 422, error: "unsupported_fields", detail: { unsupported, supported: allowed } };
@@ -467,6 +720,9 @@ export function createChangeRequest(input: CreateChangeRequestInput, deps: { env
     target: { id: target.id, name: target.name },
     kind: input.kind,
     changes: input.kind === "profile_update" ? changes : undefined,
+    products: productOps.length
+      ? { ops: productOps, text: describeChanges(JSON.stringify({ products: productOps })), after: (productsAfter ?? []).map(productNameOf) }
+      : undefined,
     authority: auth.authority,
     would_be: status,
     reason,
@@ -499,7 +755,7 @@ export function createChangeRequest(input: CreateChangeRequestInput, deps: { env
       input.threadId,
       blocklist.normalizeEmail(input.requesterEmail),
       input.kind,
-      JSON.stringify(changes),
+      JSON.stringify(productOps.length ? { ...changes, products: productOps } : changes),
       input.evidence ? JSON.stringify(input.evidence) : null,
       auth.authority,
       status,
@@ -627,6 +883,9 @@ interface Surfaces {
   /** Every surface answered 2xx — only then can a value's absence mean anything. */
   ok: boolean;
   statuses: Record<string, number>;
+  /** RFB: the profile page alone, and the card as parsed JSON (null when it is not JSON). */
+  page?: string;
+  card?: any;
 }
 
 async function surfaces(vertical: ChangeVertical, target: Target, deps: ExecDeps): Promise<Surfaces> {
@@ -636,7 +895,13 @@ async function surfaces(vertical: ChangeVertical, target: Target, deps: ExecDeps
     const page = await fetchPublic(`/produsent/${encodeURIComponent(slugify(target.name))}`, "rettfrabonden.com").catch(() => null);
     const cs = card?.status ?? 0;
     const ps = page?.status ?? 0;
-    return { text: `${card?.body ?? ""}\n${page?.body ?? ""}`, ok: okStatus(cs) && okStatus(ps), statuses: { card: cs, page: ps } };
+    let cardJson: any = null;
+    try {
+      cardJson = card?.body ? JSON.parse(card.body) : null;
+    } catch {
+      cardJson = null;
+    }
+    return { text: `${card?.body ?? ""}\n${page?.body ?? ""}`, ok: okStatus(cs) && okStatus(ps), statuses: { card: cs, page: ps }, page: page?.body ?? "", card: cardJson };
   }
   const page = target.slug ? await fetchPublic(`/kategori/gardssalg/produsent/${encodeURIComponent(target.slug)}`, "opplevagent.no").catch(() => null) : null;
   const ps = page?.status ?? 0;
@@ -671,7 +936,7 @@ async function executeProfileUpdate(r: ChangeRequestRow, deps: ExecDeps): Promis
   const call = deps.adminCall ?? defaultAdminCall;
   // Claim it: a cancel/reject that lands from here on finds it «executing».
   if (!setStatus(r.id, "executing", null, {}, now, "queued")) return;
-  const changes = JSON.parse(r.changes || "{}") as Record<string, string>;
+  const { fields: changes, products: productOps } = readChanges(r.changes);
   const target = loadTarget(r.vertical, r.target_id);
   if (!target) {
     addStep(r.id, "load_target", false, "profilen finnes ikke lenger", now);
@@ -680,9 +945,36 @@ async function executeProfileUpdate(r: ChangeRequestRow, deps: ExecDeps): Promis
   }
   // A re-run after an interrupted attempt keeps the FIRST attempt's old
   // values: by now the database may already hold the new ones.
-  const prior = parseJson<Record<string, { old: string | null }>>(r.snapshot);
-  const snapshot: Record<string, { old: string | null }> = {};
+  const prior = parseJson<Record<string, { old: string | null; new?: unknown }>>(r.snapshot);
+  // Products: planned against the list as stored NOW, before anything is
+  // written. A list that changed since the request was filed (a product gone,
+  // an owner product added) fails here with nothing written.
+  let productsNext: unknown[] | null = null;
+  let productsOld: string | null = null;
+  if (productOps.length > 0) {
+    const fail = (reason: string, detail: unknown) => {
+      addStep(r.id, "plan_products", false, detail, now);
+      setStatus(r.id, "failed", `varer: ${reason}`.slice(0, 500), {}, now, "executing");
+    };
+    if (r.vertical !== "rfb") return fail("products_rfb_only", { error: "products_rfb_only" });
+    const state = loadProductState(r.target_id);
+    let plan: ReturnType<typeof planProductOps> = planProductOps(state, productOps);
+    // The first attempt already wrote the list: write the same list again.
+    if (!plan.ok && prior?.products && Array.isArray(prior.products.new) && sameJson(state.list, prior.products.new)) plan = { ok: true, next: prior.products.new };
+    if (!plan.ok) return fail(`${plan.error} ${JSON.stringify(plan.detail)}`, { error: plan.error, ...plan.detail });
+    const written = productsAsWritten(r.target_id, plan.next);
+    if (!written.ok || !sameJson(written.stored, plan.next)) {
+      const why = written.ok ? "skrivestien_ville_endret_andre_varer" : written.why;
+      return fail(`${why} (sendes til Daniel)`, { error: "write_path_would_change_list", why, route_to: PRODUCTS_TO_DANIEL });
+    }
+    productsNext = plan.next;
+    productsOld = prior?.products ? prior.products.old : state.raw;
+    addStep(r.id, "plan_products", true, { ops: productOps, before: state.list?.length ?? 0, after: productsNext.length }, now);
+  }
+  const snapshot: Record<string, { old: string | null; new?: unknown }> = {};
   for (const f of Object.keys(changes)) snapshot[f] = prior && f in prior ? prior[f] : { old: dbValue(r.vertical, r.target_id, f) };
+  // The old list, exactly as stored, is what a rollback writes back.
+  if (productsNext) snapshot.products = { old: productsOld, new: productsNext };
   getDb().prepare("UPDATE cs_change_requests SET snapshot = ? WHERE id = ?").run(JSON.stringify(snapshot), r.id);
   const evidence = (() => {
     try {
@@ -705,6 +997,7 @@ async function executeProfileUpdate(r: ChangeRequestRow, deps: ExecDeps): Promis
       else if (m.route === "patch") patch[m.key] = v;
       else know[m.key] = rfbKnowledgeValue(f, v);
     }
+    if (productsNext) know.products = productsNext;
     if (changes.phone !== undefined) {
       know.owner_relay_evidence = { channel: "email", ref: evidence.messageId ?? r.thread_id ?? r.id, received_at: r.created_at };
     }
@@ -726,6 +1019,10 @@ async function executeProfileUpdate(r: ChangeRequestRow, deps: ExecDeps): Promis
       for (const f of Object.keys(changes)) {
         const res = await call("POST", `/api/marketplace/admin/agents/${encodeURIComponent(r.target_id)}/curated-fields`, { field: RFB_FIELDS[f].lock, meta }).catch(FAILED_CALL);
         addStep(r.id, `lock_${RFB_FIELDS[f].lock}`, okStatus(res.status), { status: res.status }, now);
+      }
+      if (productsNext) {
+        const res = await call("POST", `/api/marketplace/admin/agents/${encodeURIComponent(r.target_id)}/curated-fields`, { field: "products", meta }).catch(FAILED_CALL);
+        addStep(r.id, "lock_products", okStatus(res.status), { status: res.status }, now);
       }
     }
     try {
@@ -759,8 +1056,8 @@ async function executeProfileUpdate(r: ChangeRequestRow, deps: ExecDeps): Promis
 
 export async function verifyProfileUpdate(r: ChangeRequestRow, deps: ExecDeps): Promise<boolean> {
   const now = deps.now ?? new Date();
-  const changes = JSON.parse(r.changes || "{}") as Record<string, string>;
-  const snapshot = JSON.parse(r.snapshot || "{}") as Record<string, { old: string | null }>;
+  const { fields: changes, products: productOps } = readChanges(r.changes);
+  const snapshot = JSON.parse(r.snapshot || "{}") as Record<string, { old: string | null; new?: unknown }>;
   const target = loadTarget(r.vertical, r.target_id);
   if (!target) {
     setStatus(r.id, "verify_failed", "profil_mangler", {}, now, "executed");
@@ -805,6 +1102,11 @@ export async function verifyProfileUpdate(r: ChangeRequestRow, deps: ExecDeps): 
       all = false;
     }
   }
+  if (productOps.length > 0) {
+    const p = verifyProducts(r.target_id, productOps, snapshot.products?.new, s);
+    Object.assign(results, p.results);
+    all = all && p.ok;
+  }
   addStep(r.id, "verify", all, { surfaces: s.statuses, fields: results }, now);
   if (all) {
     setStatus(r.id, "verified", null, { verified_at: now.toISOString() }, now, "executed");
@@ -812,6 +1114,57 @@ export async function verifyProfileUpdate(r: ChangeRequestRow, deps: ExecDeps): 
   }
   if (windowOver) setStatus(r.id, "verify_failed", `ikke synlig etter ${VERIFY_WINDOW_HOURS} t: ${JSON.stringify(results)}`.slice(0, 500), {}, now, "executed");
   return false;
+}
+
+/**
+ * Products: the stored list is exactly the planned one (so no other product
+ * changed), the public card lists the new name and not the old, and the
+ * profile page shows a new name and no longer shows a removed or old one.
+ * When the old name is also part of the profile's remaining text (another
+ * product's name, the about text), the page cannot tell, and the card alone
+ * decides — the result says so.
+ */
+function verifyProducts(agentId: string, ops: ProductOp[], expected: unknown, s: Surfaces): { ok: boolean; results: Record<string, string> } {
+  const results: Record<string, string> = {};
+  const state = loadProductState(agentId);
+  const stored = Array.isArray(expected) && sameJson(state.list, expected);
+  const cardNames = new Set<string>(
+    (Array.isArray(s.card?.products) ? s.card.products : []).map((p: unknown) => normalizeName(productNameOf(p) ?? "")),
+  );
+  const k = getDb()
+    .prepare("SELECT a.description, k.about, k.specialties, k.seasonality FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id WHERE a.id = ?")
+    .get(agentId) as { description: string | null; about: string | null; specialties: string | null; seasonality: string | null } | undefined;
+  const otherText = normText(
+    [k?.description, k?.about, k?.specialties, k?.seasonality, ...(state.list ?? []).map((p) => productNameOf(p) ?? "")].filter(Boolean).join(" \n "),
+  );
+  const page = s.page ?? "";
+  const goneFromPage = (name: string): string | null => {
+    if (otherText.includes(normText(name))) return "kortet"; // the page cannot tell
+    return valueShows("products", name, page) ? null : "siden";
+  };
+  let ok = true;
+  for (const op of ops) {
+    const key = op.action === "remove" ? `vare «${op.name}» fjernes` : `vare «${op.name}» → «${op.newName}»`;
+    if (!stored) {
+      results[key] = "ikke_lagret";
+      ok = false;
+      continue;
+    }
+    const oldOnCard = cardNames.has(normalizeName(op.name));
+    const gone = goneFromPage(op.name);
+    if (op.action === "remove") {
+      const done = !oldOnCard && gone !== null;
+      results[key] = done ? (gone === "kortet" ? "fjernet (kortet; navnet står ellers i profilen)" : "fjernet_fra_siden") : "vises_fortsatt";
+      ok = ok && done;
+      continue;
+    }
+    const newOnCard = cardNames.has(normalizeName(op.newName!));
+    const newOnPage = valueShows("products", op.newName!, page);
+    const done = newOnCard && newOnPage && !oldOnCard && gone !== null;
+    results[key] = done ? "nytt_navn_vises_offentlig" : !newOnCard || !newOnPage ? "ikke_synlig_ennaa" : "gammelt_navn_vises_fortsatt";
+    ok = ok && done;
+  }
+  return { ok, results };
 }
 
 /** Every blocklist row a removal of this target could add — ours AND the Opplevagent visibility route's own (org_nr, e-post, nettside). */
