@@ -1203,8 +1203,18 @@ function t14aFieldReader(field: T14aField, surface: string): SurfaceReader {
   return async (ctx) => {
     const { runAsPublicView } = require("../services/agent-visibility") as typeof import("../services/agent-visibility");
     return runAsPublicView(async () => {
-      const endpoints = await t14aFieldEndpoints(ctx, field, surface, fixtureFieldValues(ctx));
-      const hint = Object.values(endpoints).some(Boolean) ? undefined : T14A_FIELD_HINT[field];
+      const v = fixtureFieldValues(ctx);
+      const endpoints = await t14aFieldEndpoints(ctx, field, surface, v);
+      // The hint blames the fixture, so it is only given when the fixture value is
+      // really missing (B3): a fixture that HAS the value and still shows nothing is a FAIL.
+      // Exceptions that depend on data, not on the switch: the stats fields, and the
+      // price on the front-page cards (only a price in a product name reaches them).
+      const fixtureLacksValue = field === "phone" ? v.phoneDigits === null
+        // Prices: the front-page cards (only a price in a product name reaches them) and the shopping
+        // feed when the fixture is not in it at all (acp_csv names no fixture row) are structural.
+        : field === "prices" ? v.prices.length === 0 || surface === "listing_html" || (surface === "acp_feed" && endpoints.acp_csv === false)
+        : true;
+      const hint = Object.values(endpoints).some(Boolean) || !fixtureLacksValue ? undefined : T14A_FIELD_HINT[field];
       return { endpoints, requireAll: !LIST_SURFACES.has(surface), ...(hint ? { unobservableHint: hint } : {}) };
     });
   };
@@ -1226,8 +1236,9 @@ function t14aAddressReader(surface: string): SurfaceReader {
       const place = vals.length > 0 && vals.every((x) => !x);
       const detail = `gateadresse ${Object.entries(eps).map(([k, x]) => `${k}=${x ? "ja" : "nei"}`).join(", ")}${v.street ? "" : ` (${T14A_FIELD_HINT.address})`}`;
       const endpoints = { full: full && !!v.street, place: place && !!v.street };
-      // Why «full» may not show here: no street address at all, or the fixture not on this surface.
-      const hint = endpoints.full ? undefined : v.street ? `gateadressen vises ikke på ${surface} (testprodusenten er kanskje ikke på flaten)` : T14A_FIELD_HINT.address;
+      // Only «no street address at all» is a fixture reason (B3): with a street address a
+      // surface that does not show it under «full» is a FAIL, never «not observable».
+      const hint = endpoints.full || v.street ? undefined : T14A_FIELD_HINT.address;
       return { endpoints, detail, ...(hint ? { unobservableHint: hint } : {}) };
     });
   };
@@ -1699,7 +1710,9 @@ async function probeSwitch(c: Ctx, e: OwnerFeatureEntry, baseline: OwnerFeatureV
     for (const s of surfaces) {
       const def = c.readers[caseId(e.key, s)];
       let ref = (await readSafe(def, c.readerCtx)).obs;
-      if (isVisibilitySurface(s) && ref && !anyEndpoint(ref)) {
+      // A T14a reader names a fixture reason (hint) only when the fixture value is missing (B3):
+      // without one, a value that should show and does not is a FAIL below, not «not observable».
+      if (isVisibilitySurface(s) && ref && !anyEndpoint(ref) && (!(e.key in T14A_FIELD_KEYS) || ref.unobservableHint)) {
         // Not seen at the first read: give it the normal wait before calling it unobservable.
         const again = await awaitEffect(c, def, true, null, Date.now());
         if (again.obs) ref = again.obs;

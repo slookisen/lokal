@@ -498,6 +498,45 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       assertEq([g!.rows.filter((x) => x.key === "contact.address" && x.result === "FAIL").length, g!.ready_for_daniel_test, g!.restored], [0, false, true],
         "obs-24 (T14a): no false FAIL, not ready, restored");
       assertEq(rawState(FIX), before, "obs-25: restored byte-identical");
+
+      // (h) B3: the fixture HAS a street address and a phone, but the enforcement hides them
+      // although the owner chose «full» / left the phone on (a real hide-bug). The reader must
+      // not blame the fixture: contact.address and contact.phone rows are FAIL, not NOT_OBSERVABLE.
+      const kn = db.prepare("SELECT phone, address FROM agent_knowledge WHERE agent_id = ?").get(FIX) as { phone: string | null; address: string | null };
+      assertTrue(!!kn.address && String(kn.phone || "").replace(/\D+/g, "").length >= 8, "obs-26 (B3): the fixture has a street address and a phone");
+      // A real hide-bug: every public surface loses the fixture's street address and phone (the
+      // fixture's own stored values stay, so the reader knows the fixture HAS them): knowledge
+      // reads through the shared db handle come back without address / phone.
+      const dbAny = db as any;
+      const realPrepare = dbAny.prepare;
+      dbAny.prepare = (sql: string) => {
+        const st = realPrepare.call(db, sql);
+        if (!/agent_knowledge/i.test(sql) || /^\s*SELECT phone, address, products FROM agent_knowledge WHERE agent_id = \?\s*$/i.test(sql)) return st;
+        const strip = (r: any) => (r && typeof r === "object" && ("address" in r || "phone" in r) ? { ...r, address: null, phone: null } : r);
+        return new Proxy(st, {
+          get(t, k) {
+            const v = (t as any)[k];
+            if (k === "get") return (...a: any[]) => strip(v.apply(t, a));
+            if (k === "all") return (...a: any[]) => (v.apply(t, a) as any[]).map(strip);
+            return typeof v === "function" ? v.bind(t) : v;
+          },
+        });
+      };
+      let h: Awaited<ReturnType<typeof probe.runSwitchProbe>>;
+      try {
+        h = await probe.runSwitchProbe(FIX, { db, maxWaitMs: 0 });
+      } finally {
+        dbAny.prepare = realPrepare;
+      }
+      const ha = h!.rows.filter((x) => x.key === "contact.address");
+      const hp = h!.rows.filter((x) => x.key === "contact.phone");
+      assertTrue(ha.length === 16 && ha.every((x) => x.result !== "NOT_OBSERVABLE") && ha.some((x) => x.result === "FAIL"),
+        `obs-27 (B3): street address present but hidden → contact.address FAIL, never NOT_OBSERVABLE (${ha.map((x) => `${x.surface}:${x.direction}:${x.result}`).join(",")})`);
+      assertTrue(ha.filter((x) => x.surface !== "listing_html" && x.surface !== "mcp_search" && x.direction === "value:full").every((x) => x.result === "FAIL") ,
+        "obs-27b (B3): the single-object surfaces FAIL the «full» row");
+      assertTrue(hp.length > 0 && hp.every((x) => x.result !== "NOT_OBSERVABLE") && hp.some((x) => x.result === "FAIL"),
+        `obs-28 (B3): phone present but hidden → contact.phone FAIL, not NOT_OBSERVABLE (${hp.map((x) => `${x.surface}:${x.direction}:${x.result}`).join(",")})`);
+      assertEq([h!.restored, rawState(FIX)], [true, before], "obs-29 (B3): restored byte-identical");
     }
 
     // ═══ Flags off: the rows that depend on them FAIL ═════════════════════
