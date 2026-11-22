@@ -7,8 +7,10 @@
  *             OWNER_FEATURES_ALLOWED_SUBJECTS → every surface byte-identical
  *             to the run before any choice was stored (profile HTML, lokal_info,
  *             lokal_search, /card, /vcard, /info, /search, ACP feeds); no DB
- *             query for the lookup. With the real registry (keys still
- *             coming_soon) a stored owner choice has no effect.
+ *             query for the lookup. With the keys coming_soon (the registry
+ *             before T14a) a stored owner choice has no effect; with the real
+ *             registry (T14a: live) a profile without a stored choice — owner
+ *             or unclaimed — renders byte-identically.
  *   matrix    AC12/AC23: per enforced key × declared surface, default → off →
  *             on again, the field present / absent / present. A neighbour
  *             producer outside the allowlist is never affected.
@@ -491,7 +493,8 @@ export async function runOwnerFeaturesS2cTests(opts: { log?: boolean } = {}): Pr
       MATRIX["contact.phone"].surfaces.mcp_search.lokal_find_offers = removed;
       for (const key of enforce.ENFORCED_OWNER_FEATURE_KEYS) {
         const e = reg.getOwnerFeature(key);
-        assertEq(e.status, "coming_soon", `status-1: ${key} stays coming_soon until the S2d switch probe`);
+        // T14a (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 8 (1)): the S2c flip is done.
+        assertEq(e.status, "live", `status-1: ${key} is live (T14a)`);
         assertEq(e.default.owner, MATRIX[key].on, `status-2: ${key} owner default is the shown value`);
       }
     }
@@ -526,6 +529,9 @@ export async function runOwnerFeaturesS2cTests(opts: { log?: boolean } = {}): Pr
 
     const LIVE = reg.OWNER_FEATURE_REGISTRY.map((e) =>
       (enforce.ENFORCED_OWNER_FEATURE_KEYS as readonly string[]).includes(e.key) ? { ...e, status: "live" as const } : e);
+    // The registry as S2c-1 shipped it (every enforced key coming_soon), for the «no effect yet» gate.
+    const SOON = reg.OWNER_FEATURE_REGISTRY.map((e) =>
+      (enforce.ENFORCED_OWNER_FEATURE_KEYS as readonly string[]).includes(e.key) ? { ...e, status: "coming_soon" as const } : e);
     const setChoice = (key: string, value: unknown) => {
       const r = rs.setOwnerFeatureValue("rfb", ENF_ID, key, value, { actor: "owner" }, { db, registry: LIVE });
       if (r.kind !== "ok") throw new Error(`setOwnerFeatureValue(${key}) → ${r.kind}`);
@@ -561,8 +567,32 @@ export async function runOwnerFeaturesS2cTests(opts: { log?: boolean } = {}): Pr
       setEnv(ALLOW_ENV, `rfb:${TWIN_ID}`);
       sameSnapshot(baseline, await snapshot(ENF_ID), "gate-4: enforce on, another subject allowlisted");
       setEnv(ALLOW_ENV, `rfb:${ENF_ID}`);
+      enforce.__setEnforceRegistryForTesting(SOON);
+      sameSnapshot(baseline, await snapshot(ENF_ID), "gate-5: enforce on + allowlisted, keys coming_soon → owner choice has no effect");
+      // T14a: the real registry (keys live) with NO stored choice renders exactly as before
+      // the flip — for the owner and for an unclaimed profile, both allowlisted.
       enforce.__setEnforceRegistryForTesting(null);
-      sameSnapshot(baseline, await snapshot(ENF_ID), "gate-5: enforce on + allowlisted, real registry (coming_soon) → owner choice has no effect yet");
+      clearChoices();
+      setEnv(ALLOW_ENV, `rfb:${ENF_ID},rfb:${TWIN_ID}`);
+      assertEq(reg.getOwnerFeature("contact.phone").status, "live", "gate-5b: the real registry has the keys live");
+      sameSnapshot(baseline, await snapshot(ENF_ID), "gate-5b: enforce on + allowlisted, real registry (live), no stored choice → byte-identical");
+      const twinClaim = db.prepare("SELECT claimed_at FROM agents WHERE id = ?").get(TWIN_ID) as { claimed_at: string | null };
+      db.prepare("UPDATE agents SET claimed_at = NULL WHERE id = ?").run(TWIN_ID);
+      db.prepare("UPDATE agent_claims SET status = 'pending' WHERE agent_id = ?").run(TWIN_ID);
+      try {
+        const seg = rs.resolveOwnerFeatures("rfb", TWIN_ID, { db }).subject.segment;
+        assertEq(seg, "unclaimed", "gate-5c: the neighbour is now an unclaimed profile");
+        const unclaimedLive = await snapshot(TWIN_ID);
+        enforce.__setEnforceRegistryForTesting(SOON);
+        const unclaimedSoon = await snapshot(TWIN_ID);
+        enforce.__setEnforceRegistryForTesting(null);
+        sameSnapshot(unclaimedSoon, unclaimedLive, "gate-5c: an unclaimed allowlisted profile: keys live = keys coming_soon (unchanged)");
+      } finally {
+        db.prepare("UPDATE agents SET claimed_at = ? WHERE id = ?").run(twinClaim.claimed_at, TWIN_ID);
+        db.prepare("UPDATE agent_claims SET status = 'verified' WHERE agent_id = ?").run(TWIN_ID);
+      }
+      setEnv(ALLOW_ENV, `rfb:${ENF_ID}`);
+      hideEverything();
       enforce.__setEnforceRegistryForTesting(LIVE);
       const hidden = await snapshot(ENF_ID);
       assertTrue(hidden.profile_html !== baseline.profile_html && hidden.lokal_info !== baseline.lokal_info,
@@ -598,11 +628,11 @@ export async function runOwnerFeaturesS2cTests(opts: { log?: boolean } = {}): Pr
 
     // Admin lock takes effect even while the keys are coming_soon.
     {
-      enforce.__setEnforceRegistryForTesting(null);
+      enforce.__setEnforceRegistryForTesting(SOON);
       clearChoices();
       db.prepare(`INSERT INTO owner_feature_settings (vertical, subject_id, key, value_json, set_by, admin_locked, set_at)
                   VALUES ('rfb', ?, 'contact.phone', 'false', 'admin', 1, ?)`).run(ENF_ID, new Date().toISOString());
-      assertEq(await state(MATRIX["contact.phone"].surfaces.mcp_info.lokal_info, ENF_ID), "absent", "admin-1: an admin lock hides the phone with the real registry");
+      assertEq(await state(MATRIX["contact.phone"].surfaces.mcp_info.lokal_info, ENF_ID), "absent", "admin-1: an admin lock hides the phone with the keys coming_soon");
       clearChoices();
       enforce.__setEnforceRegistryForTesting(LIVE);
     }

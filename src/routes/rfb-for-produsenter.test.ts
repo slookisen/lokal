@@ -256,7 +256,11 @@ export async function runRfbForProdusenterTests(opts: { log?: boolean } = {}): P
       const e = OWNER_FEATURE_REGISTRY.find((x) => x.key === k && x.verticals.includes("rfb"));
       return e ? ownerFeatureStatus(e) : undefined;
     };
-    for (const k of ["products.import", "orders.pause", "orders.pickup_times", "notify.report", "stats.public_counts", "contact.phone", "contact.email_mode", "contact.address", "auto.updates", "payments.prepay", "orders.auto_confirm"]) {
+    // T14a (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 8 (1)) made stats.public_counts,
+    // contact.phone and contact.address live. The #statistikk / #personvern answers that call hiding
+    // them «planlagt» are rewritten with the text pools (T14c, no text change in T14a): FUNN in the
+    // T14a report. The pin below keeps guarding the keys that are still planned.
+    for (const k of ["products.import", "orders.pause", "orders.pickup_times", "notify.report", "contact.email_mode", "auto.updates", "payments.prepay", "orders.auto_confirm"]) {
       assertTrue(status(k) === "coming_soon", `truth: ${k} is coming_soon (page says «planlagt» / does not offer it) — rewrite the text when it goes live`);
     }
     for (const k of ["orders.enabled", "visibility.profile", "products.stock_check", "orders.reminder", "notify.order_email", "auto.guarantee", "comms.unsubscribe"]) {

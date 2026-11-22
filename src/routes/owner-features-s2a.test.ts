@@ -71,7 +71,10 @@ const S2A_LIVE = ["orders.enabled", "orders.reminder", "auto.guarantee", "notify
   // dev-request 2026-11-01-rfb-hold-profilen-oppdatert (coming_soon at run time until OWNER_AUTO_UPDATES_ENABLED).
   "auto.updates",
   // Produktimport skive 4-2b (coming_soon at run time until PRODUCT_AUTO_SYNC_ENABLED).
-  "products.weekly_sync"];
+  "products.weekly_sync",
+  // T14a (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 8 (1)): the eleven already enforced choices.
+  "visibility.ai_assistants", "visibility.search_engines", "visibility.shopping_feeds", "visibility.english", "visibility.leaderboard",
+  "contact.phone", "contact.address", "products.show_prices", "stats.public_counts", "stats.public_search_terms", "stats.public_trust"];
 
 function seedProducer(db: Database.Database, id: string, o: { claimed: boolean; isVerified: boolean }): void {
   db.prepare(
@@ -238,7 +241,7 @@ export async function runOwnerFeaturesS2aTests(opts: { log?: boolean } = {}): Pr
         if (e.consent) assertEq([e.default.owner, e.default.unclaimed].filter((d) => d === true).length, 0, `registry: consent entry ${e.key} defaults off`);
       }
       assertEq(reg.OWNER_FEATURE_REGISTRY.filter((e) => e.status === "live").map((e) => e.key).sort(), [...S2A_LIVE].sort(),
-        "registry: live set is exactly the S2a five + S2e visibility.profile, orders.email, comms.news + B2 products.stock_check + auto.updates + products.weekly_sync (behind their flags)");
+        "registry: live set is exactly the S2a five + S2e visibility.profile, orders.email, comms.news + B2 products.stock_check + auto.updates + products.weekly_sync (behind their flags) + the T14a eleven");
       const g = (k: string) => reg.getOwnerFeature(k);
       assertEq(g("orders.enabled").storage?.column, "agents.order_notifications_opt_in", "registry: orders.enabled adapter column");
       assertEq([g("orders.enabled").type, g("orders.enabled").default], ["switch", { owner: false, unclaimed: false }], "registry: orders.enabled switch, off for both segments");
@@ -406,11 +409,11 @@ export async function runOwnerFeaturesS2aTests(opts: { log?: boolean } = {}): Pr
     assertEq([fk["orders.reminder"].value, fk["orders.reminder"].source], [false, "locked"], "GET: orders.reminder off while orders off");
     assertEq([fk["auto.guarantee"].value, fk["auto.guarantee"].source, fk["auto.guarantee"].reason.no],
       [true, "locked", "Dette er et løfte fra Rett fra Bonden og kan ikke slås av."], "GET: guarantee on, locked, Norwegian reason");
-    assertEq([fk["visibility.leaderboard"].status, fk["visibility.leaderboard"].value, fk["visibility.leaderboard"].changeable], ["coming_soon", true, false], "GET: coming_soon entry shows its default, not changeable");
+    assertEq([fk["notify.milestones"].status, fk["notify.milestones"].value, fk["notify.milestones"].changeable], ["coming_soon", true, false], "GET: coming_soon entry shows its default, not changeable");
     assertEq(fk["orders.daily_cap"].advanced, true, "GET: advanced flag");
 
     // 409s with Norwegian reason; nothing written.
-    const c1 = await put(OWNED_ID, "visibility.leaderboard", { value: false });
+    const c1 = await put(OWNED_ID, "notify.milestones", { value: false });
     assertEq([c1.status, c1.body?.error, c1.body?.reason, c1.body?.reason_en], [409, "coming_soon", "Kommer snart.", "Coming soon."], "PUT: coming_soon → 409");
     const c2 = await put(OWNED_ID, "auto.guarantee", { value: false });
     assertEq([c2.status, c2.body?.error], [409, "guarantee"], "PUT: guarantee → 409");

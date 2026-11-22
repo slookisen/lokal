@@ -43,6 +43,12 @@
 //                                 owner refresh's own decision (read-only)
 //            email:outreach       avmeld unsubscribeHeaderValues() — the header
 //                                 decision a cold send uses; nothing is sent
+//            T14a keys            the same public route handlers / MCP tools,
+//                                 as-public: the fixture's own phone, street
+//                                 address, prices, stats tiles (threshold
+//                                 forced to 0), search terms, trust score;
+//                                 indexable page / sitemap; the /en page
+//                                 (t14aReaders)
 //   restore  the fixture's stored choices (owner_feature_settings rows, the
 //            adapter columns, the pause row, the level choice, the first-login
 //            answer) are snapshotted first and restored exactly in `finally`;
@@ -143,6 +149,21 @@ export const SWITCH_PROBE_ENV_FLAGS = [
  * S4-2a): with the flag off the key is not really live in this environment,
  * so the row is FAIL with that reason.
  */
+/** T14a (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 8 (1)): key × surface of the eleven choices. */
+const T14A_PROBE_CASES: readonly string[] = [
+  ...["mcp_search", "mcp_info", "llms", "a2a"].map((s) => `visibility.ai_assistants × ${s}`),
+  ...["profile_html", "sitemap"].map((s) => `visibility.search_engines × ${s}`),
+  "visibility.shopping_feeds × acp_feed",
+  ...["profile_html", "json_ld", "sitemap"].map((s) => `visibility.english × ${s}`),
+  "visibility.leaderboard × leaderboard",
+  ...["contact.phone", "contact.address"].flatMap((k) =>
+    ["profile_html", "json_ld", "listing_html", "mcp_search", "mcp_info", "rest_card", "vcard", "a2a"].map((s) => `${k} × ${s}`)),
+  ...["profile_html", "json_ld", "listing_html", "mcp_search", "mcp_info", "rest_card", "vcard", "acp_feed", "a2a"].map((s) => `products.show_prices × ${s}`),
+  "stats.public_counts × profile_html",
+  "stats.public_search_terms × profile_html",
+  ...["rest_card", "vcard", "mcp_info", "a2a"].map((s) => `stats.public_trust × ${s}`),
+];
+
 export const SWITCH_PROBE_FLAG_DEPENDENCIES: Readonly<Record<string, string>> = {
   "auto.guarantee × job:knowledge_write": "OWNER_LOCK_ENFORCE_WRITES",
   "comms.unsubscribe × email:outreach": "OUTREACH_UNSUBSCRIBE_ENABLED",
@@ -157,6 +178,9 @@ export const SWITCH_PROBE_FLAG_DEPENDENCIES: Readonly<Record<string, string>> = 
   // with the flag on (liveEntries reads the run-time status).
   // products.weekly_sync (produktimport skive 4-2b) likewise: its liveFlag is
   // PRODUCT_AUTO_SYNC_ENABLED.
+  // T14a: the eleven already enforced choices take effect only with
+  // OWNER_FEATURES_ENFORCE (enforce.ts / the visibility lookup).
+  ...Object.fromEntries(T14A_PROBE_CASES.map((id) => [id, "OWNER_FEATURES_ENFORCE"])),
 };
 const FLAG_OFF_REASON = "flag off in this environment";
 
@@ -925,6 +949,359 @@ function visibilityUnobservableHint(ctx: ProbeReaderContext, surface: string): s
   }
 }
 
+// ── T14a: the eleven already enforced choices (dev-request 2026-10-30-rfb-
+// eierportal-testrunde-1, punkt 8 (1)) ─────────────────────────────────────
+// visibility.ai_assistants / .shopping_feeds / .leaderboard hide the fixture
+// on their surfaces, so they reuse the presence reader above. The others have
+// their own meaning per surface: search_engines = the page is indexable and
+// listed in the sitemap; english = the /en page, its hreflang and its sitemap
+// alternate; the S2c-1 field keys = the fixture's own phone / street address /
+// prices / stats / trust score on the public surface (read as-public, from the
+// fixture's own agent_knowledge values — nothing is written). A fixture that
+// has no such value cannot show it in the starting state: the probe then calls
+// the surface NOT_OBSERVABLE with the hint, never PASS.
+
+/** The fixture's own public field values (read-only). */
+interface FixtureFieldValues {
+  phoneDigits: string | null;
+  street: string | null;
+  prices: string[];
+}
+
+function fixtureFieldValues(ctx: ProbeReaderContext): FixtureFieldValues {
+  const { parseProductPrice } = require("../services/knowledge-service") as typeof import("../services/knowledge-service");
+  const k = ctx.db.prepare(`SELECT phone, address, products FROM agent_knowledge WHERE agent_id = ?`).get(ctx.fixture.id) as
+    | { phone: string | null; address: string | null; products: string | null } | undefined;
+  const digits = String(k?.phone || "").replace(/\D+/g, "");
+  let products: unknown[] = [];
+  try { const p = JSON.parse(k?.products || "[]"); if (Array.isArray(p)) products = p; } catch { products = []; }
+  const prices = products
+    .map((p) => (p && typeof p === "object" ? parseProductPrice(p as any).price : null))
+    .filter((x): x is string => typeof x === "string" && /\d/.test(x));
+  return {
+    phoneDigits: digits.length >= 8 ? digits.slice(-8) : null,
+    street: String(k?.address || "").trim() || null,
+    prices: [...new Set(prices)],
+  };
+}
+
+/** The T14a field keys and what they show. */
+type T14aField = "phone" | "address" | "prices" | "public_counts" | "public_search_terms" | "public_trust";
+const T14A_FIELD_KEYS: Record<string, T14aField> = {
+  "contact.phone": "phone",
+  "contact.address": "address",
+  "products.show_prices": "prices",
+  "stats.public_counts": "public_counts",
+  "stats.public_search_terms": "public_search_terms",
+  "stats.public_trust": "public_trust",
+};
+
+/** The surfaces each T14a field key is read on (= its registry surfaces). */
+const T14A_FIELD_SURFACES: Record<T14aField, string[]> = {
+  phone: ["profile_html", "json_ld", "listing_html", "mcp_search", "mcp_info", "rest_card", "vcard", "a2a"],
+  address: ["profile_html", "json_ld", "listing_html", "mcp_search", "mcp_info", "rest_card", "vcard", "a2a"],
+  prices: ["profile_html", "json_ld", "listing_html", "mcp_search", "mcp_info", "rest_card", "vcard", "acp_feed", "a2a"],
+  public_counts: ["profile_html"],
+  public_search_terms: ["profile_html"],
+  public_trust: ["rest_card", "vcard", "mcp_info", "a2a"],
+};
+
+const T14A_FIELD_HINT: Record<T14aField, string> = {
+  phone: "testprodusenten har ikke noe telefonnummer i agent_knowledge.phone",
+  address: "testprodusenten har ingen gateadresse i agent_knowledge.address",
+  prices: "testprodusenten har ingen produkter med pris i agent_knowledge.products (på forsiden: bare en pris i produktnavnet, på et av de tre øverste kortene for eide profiler)",
+  public_counts: "statistikkflisene vises ikke på profilsiden selv med terskel 0",
+  public_search_terms: "testprodusenten har ingen søkeord (samtaler) som profilsiden kan vise",
+  public_trust: "testprodusenten har ingen tillitsscore",
+};
+
+/** The page / list / tool readings the T14a readers share, as-public. */
+function t14aReads(ctx: ProbeReaderContext) {
+  const kit = visKit(ctx);
+  const f = ctx.fixture;
+  const call = (h: string, path: string, o: Parameters<typeof probeReq>[2] = {}, lang?: string) => {
+    const req = probeReq(ctx, path, o);
+    if (lang) req.lang = lang;
+    return invokeHandler(ctx, kit.handlers[h], req);
+  };
+  const text = (r: HandlerResult) => (typeof r.body === "string" ? r.body : JSON.stringify(r.body ?? ""));
+  const json = (x: unknown) => JSON.stringify(x ?? null);
+  const pageRes = (lang?: string) => call("produsent", `/produsent/${f.slug}`, { params: { slug: f.slug } }, lang);
+  const ldOf = (html: string) => [...html.matchAll(LD_RE)].map((m) => m[1]).join("\n");
+  const visible = (html: string) => html.replace(LD_RE, "").replace(/<!--[\s\S]*?-->/g, "");
+  const hasName = (s: string) => s.includes(f.name) || s.includes(htmlEscape(f.name));
+  const isPage = (r: HandlerResult) => r.status === 200 && hasName(text(r)) && !text(r).includes("Midlertidig pause");
+  const homeCard = async () => {
+    const h = text(await call("home", "/"));
+    const at = h.indexOf(`<a href="/produsent/${f.slug}" class="pc pc-`);
+    return at < 0 ? "" : h.slice(at, h.indexOf("</a>", at));
+  };
+  const cityNode = async () => {
+    if (!f.citySlug) return undefined;
+    const html = text(await call("city", `/${f.citySlug}`, { params: { city: f.citySlug } }));
+    const found: any[] = [];
+    const walk = (x: any) => {
+      if (Array.isArray(x)) x.forEach(walk);
+      else if (x && typeof x === "object") {
+        if (x["@type"] === "LocalBusiness" && x.name === f.name) found.push(x);
+        Object.values(x).forEach(walk);
+      }
+    };
+    for (const m of html.matchAll(LD_RE)) { try { walk(JSON.parse(m[1])); } catch { /* not JSON */ } }
+    return found[0];
+  };
+  const searchBlock = async () => {
+    const t = await kit.tool("lokal_search", { query: f.name });
+    return t.includes(`**1. ${f.name}**`) ? t : "";
+  };
+  const restSearch = async () =>
+    ((await call("search", "/api/marketplace/search", { query: { q: f.name, heleNorge: "true" } })).body?.results ?? []).find((r: any) => r?.agent?.id === f.id);
+  const findOffer = async () => {
+    if (!f.productName || f.lat === null || f.lng === null) return undefined;
+    const t = await kit.tool("lokal_find_offers", { items: [f.productName.toLowerCase()], lat: f.lat, lng: f.lng });
+    let parsed: any;
+    try { parsed = JSON.parse(t); } catch { return undefined; }
+    return (Array.isArray(parsed) ? parsed : [parsed]).flatMap((x: any) => x?.offers ?? []).find((o: any) => o?.producer?.agent_id === f.id);
+  };
+  const lokalInfo = () => kit.tool("lokal_info", { agentId: f.id });
+  const resource = async () => {
+    const r = await kit.resource("producer-detail", new URL(`lokal://producers/${f.id}`));
+    try { return JSON.parse(String(r?.contents?.[0]?.text ?? "")); } catch { return undefined; }
+  };
+  const card = async () => (await call("card", `/api/marketplace/agents/${f.id}/card`, { params: { id: f.id } })).body;
+  const info = async () => (await call("info", `/api/marketplace/agents/${f.id}/info`, { params: { id: f.id } })).body;
+  const vcard = async () => text(await call("vcard", `/api/marketplace/agents/${f.id}/vcard`, { params: { id: f.id } }));
+  const a2aInfo = async () =>
+    (await call("a2a", "/a2a", { method: "POST", body: { jsonrpc: "2.0", id: 1, method: "agent/info", params: { agentId: f.id } } })).body?.result?.artifacts?.[0];
+  const feedItems = async () => {
+    const out: any[] = [];
+    for (let page = 0, offset = 0; page < FEED_MAX_PAGES; page++, offset += FEED_PAGE_LIMIT) {
+      const q: Record<string, string> = { limit: String(FEED_PAGE_LIMIT), offset: String(offset) };
+      if (f.city) q.city = f.city;
+      const b = (await call("feed", "/api/marketplace/catalog/feed", { query: q })).body;
+      const items: any[] = b?.items ?? [];
+      out.push(...items.filter((i: any) => i?.seller?.agent_id === f.id));
+      if (items.length < FEED_PAGE_LIMIT || offset + items.length >= Number(b?.total ?? 0)) break;
+    }
+    return out;
+  };
+  const acpCsv = async () => text(await call("acp", "/api/marketplace/catalog/acp-feed.csv"));
+  return { kit, f, text, json, pageRes, ldOf, visible, isPage, homeCard, cityNode, searchBlock, restSearch, findOffer, lokalInfo, resource, card, info, vcard, a2aInfo, feedItems, acpCsv };
+}
+
+/** Per endpoint of one surface: does the field show for the fixture right now? */
+async function t14aFieldEndpoints(ctx: ProbeReaderContext, field: T14aField, surface: string, v: FixtureFieldValues): Promise<Record<string, boolean>> {
+  const r = t14aReads(ctx);
+  const squash = (s: string) => s.replace(/[\s .\-]/g, "");
+  const eps: Record<string, () => Promise<boolean>> = {};
+  if (field === "phone") {
+    const d = v.phoneDigits;
+    const has = (s: string) => !!d && squash(s).includes(d);
+    const contactPhone = (x: any) => !!d && has(String(x?.contact?.phone ?? ""));
+    switch (surface) {
+      case "profile_html": eps.produsent = async () => has(r.visible(r.text(await r.pageRes()))); break;
+      case "json_ld": eps.produsent_jsonld = async () => r.ldOf(r.text(await r.pageRes())).includes('"telephone"'); break;
+      case "listing_html":
+        eps.home_cards = async () => has(await r.homeCard());
+        eps.city_jsonld = async () => has(String((await r.cityNode())?.telephone ?? ""));
+        break;
+      case "mcp_search":
+        eps.lokal_search = async () => (await r.searchBlock()).includes("📞");
+        eps.rest_search = async () => contactPhone(await r.restSearch());
+        eps.lokal_find_offers = async () => has(String((await r.findOffer())?.producer?.phone ?? ""));
+        break;
+      case "mcp_info":
+        eps.lokal_info = async () => (await r.lokalInfo()).includes("📞");
+        eps.mcp_resource = async () => has(String((await r.resource())?.knowledge?.phone ?? ""));
+        break;
+      case "rest_card":
+        eps.card = async () => contactPhone(await r.card());
+        eps.info = async () => has(String((await r.info())?.data?.knowledge?.phone ?? ""));
+        break;
+      case "vcard": eps.vcard = async () => (await r.vcard()).includes("\r\nTEL;"); break;
+      case "a2a": eps.agent_info = async () => has(r.json(await r.a2aInfo())); break;
+    }
+  } else if (field === "address") {
+    const st = v.street;
+    const has = (s: string) => !!st && s.includes(st);
+    switch (surface) {
+      case "profile_html": eps.produsent = async () => has(r.visible(r.text(await r.pageRes()))); break;
+      case "json_ld": eps.produsent_jsonld = async () => { const ld = r.ldOf(r.text(await r.pageRes())); return ld.includes('"streetAddress"') && has(ld); }; break;
+      case "listing_html":
+        eps.home_cards = async () => has(await r.homeCard());
+        eps.city_jsonld = async () => has(String((await r.cityNode())?.address?.streetAddress ?? ""));
+        break;
+      case "mcp_search":
+        eps.lokal_search = async () => has(await r.searchBlock());
+        eps.rest_search = async () => has(String((await r.restSearch())?.contact?.address ?? ""));
+        break;
+      case "mcp_info":
+        eps.lokal_info = async () => has(await r.lokalInfo());
+        eps.mcp_resource = async () => has(String((await r.resource())?.knowledge?.address ?? ""));
+        break;
+      case "rest_card":
+        eps.card = async () => has(String((await r.card())?.contact?.address ?? ""));
+        eps.info = async () => has(String((await r.info())?.data?.knowledge?.address ?? ""));
+        break;
+      case "vcard": eps.vcard = async () => has(await r.vcard()); break;
+      case "a2a": eps.agent_info = async () => has(r.json(await r.a2aInfo())); break;
+    }
+  } else if (field === "prices") {
+    const has = (s: string) => v.prices.length > 0 && v.prices.some((p) => s.includes(p));
+    switch (surface) {
+      case "profile_html": eps.produsent = async () => r.visible(r.text(await r.pageRes())).includes('class="prod-price"'); break;
+      case "json_ld": eps.produsent_jsonld = async () => { const ld = r.ldOf(r.text(await r.pageRes())); return ld.includes('"makesOffer"') && ld.includes('"price"'); }; break;
+      // Only a price written into a product name reaches the front-page card (the city JSON-LD carries none).
+      case "listing_html": eps.home_cards = async () => has(await r.homeCard()); break;
+      // lokal_find_offers keeps the price by design (the order path), so it is not read here.
+      case "mcp_search":
+        eps.lokal_search = async () => has(await r.searchBlock());
+        eps.rest_search = async () => has(r.json((await r.restSearch())?.products));
+        break;
+      case "mcp_info":
+        eps.lokal_info = async () => has(await r.lokalInfo());
+        eps.mcp_resource = async () => has(r.json((await r.resource())?.knowledge?.products));
+        break;
+      case "rest_card":
+        eps.card = async () => has(r.json((await r.card())?.products));
+        eps.info = async () => has(r.json((await r.info())?.data?.knowledge?.products));
+        break;
+      case "vcard": eps.vcard = async () => has(await r.vcard()); break;
+      case "acp_feed":
+        eps.feed = async () => (await r.feedItems()).some((i: any) => typeof i?.price?.amount === "number");
+        eps.acp_csv = async () => (await r.acpCsv()).includes(`/produsent/${r.f.slug},`);
+        break;
+      case "a2a": eps.agent_info = async () => has(r.json(await r.a2aInfo())); break;
+    }
+  } else if (field === "public_counts") {
+    // The tiles also follow the public threshold (S2f); forced to 0 here, so only the switch decides.
+    const th = require("../services/public-stats-threshold") as typeof import("../services/public-stats-threshold");
+    if (surface === "profile_html") {
+      eps.produsent = async () => th.runWithPublicStatsMinViews(0, async () => r.visible(r.text(await r.pageRes())).includes('class="pf-stat" data-stat="human"'));
+    }
+  } else if (field === "public_search_terms") {
+    if (surface === "profile_html") eps.produsent = async () => r.visible(r.text(await r.pageRes())).includes("Hva folk søker etter");
+  } else if (field === "public_trust") {
+    switch (surface) {
+      case "rest_card":
+        eps.card = async () => typeof (await r.card())?.["x-lokal"]?.trustScore === "number";
+        eps.info = async () => typeof (await r.info())?.data?.agent?.trustScore === "number";
+        break;
+      case "vcard": eps.vcard = async () => (await r.vcard()).includes("X-LOKAL-TRUST-SCORE"); break;
+      case "mcp_info": eps.mcp_resource = async () => typeof (await r.resource())?.agent?.trustScore === "number"; break;
+      case "a2a": eps.agent_info = async () => r.json(await r.a2aInfo()).includes('"trustScore"'); break;
+    }
+  }
+  if (Object.keys(eps).length === 0) throw new Error(`no T14a reader for ${field} × ${surface}`);
+  const out: Record<string, boolean> = {};
+  for (const [name, fn] of Object.entries(eps)) out[name] = await fn();
+  return out;
+}
+
+/** A T14a switch field (contact.phone, products.show_prices, stats.*): the field shown / gone. */
+function t14aFieldReader(field: T14aField, surface: string): SurfaceReader {
+  return async (ctx) => {
+    const { runAsPublicView } = require("../services/agent-visibility") as typeof import("../services/agent-visibility");
+    return runAsPublicView(async () => {
+      const endpoints = await t14aFieldEndpoints(ctx, field, surface, fixtureFieldValues(ctx));
+      const hint = Object.values(endpoints).some(Boolean) ? undefined : T14A_FIELD_HINT[field];
+      return { endpoints, requireAll: !LIST_SURFACES.has(surface), ...(hint ? { unobservableHint: hint } : {}) };
+    });
+  };
+}
+
+/**
+ * contact.address (choice): one endpoint per option — `full` = the street
+ * address is shown (every endpoint of a single-object surface, one of a list
+ * surface), `place` = it is shown nowhere on the surface.
+ */
+function t14aAddressReader(surface: string): SurfaceReader {
+  return async (ctx) => {
+    const { runAsPublicView } = require("../services/agent-visibility") as typeof import("../services/agent-visibility");
+    return runAsPublicView(async () => {
+      const v = fixtureFieldValues(ctx);
+      const eps = await t14aFieldEndpoints(ctx, "address", surface, v);
+      const vals = Object.values(eps);
+      const full = LIST_SURFACES.has(surface) ? vals.some(Boolean) : vals.length > 0 && vals.every(Boolean);
+      const place = vals.length > 0 && vals.every((x) => !x);
+      const detail = `gateadresse ${Object.entries(eps).map(([k, x]) => `${k}=${x ? "ja" : "nei"}`).join(", ")}${v.street ? "" : ` (${T14A_FIELD_HINT.address})`}`;
+      return { endpoints: { full: full && !!v.street, place: place && !!v.street }, detail };
+    });
+  };
+}
+
+/** visibility.search_engines and visibility.english: their own meaning per surface. */
+function t14aVisibilityReader(key: "visibility.search_engines" | "visibility.english", surface: string): SurfaceReader {
+  return async (ctx) => {
+    const { runAsPublicView } = require("../services/agent-visibility") as typeof import("../services/agent-visibility");
+    return runAsPublicView(async () => {
+      const r = t14aReads(ctx);
+      const slug = r.f.slug;
+      const eps: Record<string, () => Promise<boolean>> = {};
+      if (key === "visibility.search_engines") {
+        if (surface === "profile_html") {
+          eps.produsent_indexable = async () => {
+            const res = await r.pageRes();
+            return r.isPage(res) && !r.text(res).includes('<meta name="robots" content="noindex">') && res.headers["x-robots-tag"] === undefined;
+          };
+        } else if (surface === "sitemap") {
+          eps.sitemap_xml = async () => r.kit.buildSitemapXml().includes(`/produsent/${slug}</loc>`);
+        }
+      } else if (surface === "profile_html") {
+        eps.produsent_en = async () => r.isPage(await r.pageRes("en"));
+        eps.produsent_hreflang = async () => r.text(await r.pageRes()).includes(`hreflang="en" href="https://rettfrabonden.com/en/produsent/${slug}"`);
+      } else if (surface === "json_ld") {
+        eps.produsent_en_jsonld = async () => {
+          const res = await r.pageRes("en");
+          return res.status === 200 && r.ldOf(r.text(res)).includes(`"name":"${jsonInner(r.f.name)}"`);
+        };
+      } else if (surface === "sitemap") {
+        eps.sitemap_en = async () => r.kit.buildSitemapXml().includes(`/en/produsent/${slug}</loc>`);
+      }
+      if (Object.keys(eps).length === 0) throw new Error(`no T14a reader for ${key} × ${surface}`);
+      const endpoints: Record<string, boolean> = {};
+      for (const [name, fn] of Object.entries(eps)) endpoints[name] = await fn();
+      return { endpoints, requireAll: true };
+    });
+  };
+}
+
+/** The T14a readers, keyed like OWNER_FEATURE_MATRIX_CASES (key × surface). */
+function t14aReaders(): Record<string, SurfaceReaderDef> {
+  const out: Record<string, SurfaceReaderDef> = {};
+  const heavy = (s: string) => (HEAVY_SURFACES.has(s) ? { pollMs: HEAVY_POLL_MS } : {});
+  const presence: Array<[string, string[]]> = [
+    ["visibility.ai_assistants", ["mcp_search", "mcp_info", "llms", "a2a"]],
+    ["visibility.shopping_feeds", ["acp_feed"]],
+    ["visibility.leaderboard", ["leaderboard"]],
+  ];
+  for (const [key, surfaces] of presence) {
+    for (const s of surfaces) out[caseId(key, s)] = { read: visibilityReader(s), observe: `${s} som offentlig: testprodusenten vist / borte`, ...heavy(s) };
+  }
+  for (const s of ["profile_html", "sitemap"]) {
+    out[caseId("visibility.search_engines", s)] = {
+      read: t14aVisibilityReader("visibility.search_engines", s),
+      observe: s === "profile_html" ? "profilsiden som offentlig: indekserbar (ingen noindex) / noindex" : "sitemap.xml har profilen / ikke",
+      ...heavy(s),
+    };
+  }
+  for (const s of ["profile_html", "json_ld", "sitemap"]) {
+    out[caseId("visibility.english", s)] = {
+      read: t14aVisibilityReader("visibility.english", s),
+      observe: `${s} som offentlig: den engelske profilen (/en, hreflang, sitemap) finnes / ikke`,
+      ...heavy(s),
+    };
+  }
+  for (const [key, field] of Object.entries(T14A_FIELD_KEYS)) {
+    for (const s of T14A_FIELD_SURFACES[field]) {
+      out[caseId(key, s)] = field === "address"
+        ? { read: t14aAddressReader(s), observe: `${s} som offentlig: full adresse (full) / bare sted (place)`, ...heavy(s) }
+        : { read: t14aFieldReader(field, s), observe: `${s} som offentlig: feltet (${field}) vist / borte`, ...heavy(s) };
+    }
+  }
+  return out;
+}
+
 function recipientDecision(ctx: ProbeReaderContext): { eligible: boolean; detail: string } {
   const { resolveOrderNotificationRecipient } = require("../services/order-notify-service") as typeof import("../services/order-notify-service");
   const r = resolveOrderNotificationRecipient(ctx.fixture.id);
@@ -1092,6 +1469,8 @@ export function defaultSwitchProbeReaders(): Record<string, SurfaceReaderDef> {
       ...(HEAVY_SURFACES.has(s) ? { pollMs: HEAVY_POLL_MS } : {}),
     };
   }
+  // T14a: the eleven already enforced choices.
+  Object.assign(out, t14aReaders());
   return out;
 }
 

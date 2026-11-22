@@ -6,9 +6,10 @@
  *   gate      OWNER_FEATURES_ENFORCE off, or the profile not in
  *             OWNER_FEATURES_ALLOWED_SUBJECTS → every surface byte-identical to
  *             the run before any choice was stored, the shared SQL fragments
- *             unchanged, and no query for the lookup. With the real registry
- *             (keys still coming_soon) a stored owner choice has no effect; an
- *             admin lock does.
+ *             unchanged, and no query for the lookup. With the keys
+ *             coming_soon (before T14a) a stored owner choice has no effect;
+ *             an admin lock does. With the real registry (T14a: live) and no
+ *             stored choice, byte-identical.
  *   matrix    AC12/AC23: per key × declared surface × endpoint, default → off →
  *             on again: the profile present / gone / present. Every endpoint of
  *             a surface the key does NOT declare stays present (the key does
@@ -372,10 +373,11 @@ export async function runOwnerFeaturesS2c2Tests(opts: { log?: boolean } = {}): P
       }
       assertEq(missing, [], "coverage-1: every visibility key has a probe for each declared surface");
       // S2e (side v2): visibility.profile is the /eier pause card moved into
-      // «Mine valg», so it is live; the other five stay coming_soon.
+      // «Mine valg», so it is live; T14a made the other five live.
       assertEq(reg.getOwnerFeature("visibility.profile").status, "live", "status-0: visibility.profile is live (S2e, the pause)");
       for (const key of VIS_KEYS) {
-        if (key !== "visibility.profile") assertEq(reg.getOwnerFeature(key).status, "coming_soon", `status-1: ${key} stays coming_soon until the S2d switch probe`);
+        // T14a (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 8 (1)): the other five are live too.
+        assertEq(reg.getOwnerFeature(key).status, "live", `status-1: ${key} is live`);
         assertEq(reg.getOwnerFeature(key).default, { owner: true, unclaimed: true }, `status-2: ${key} defaults to shown for both segments`);
       }
       assertEq(reg.getOwnerFeature("visibility.profile").storage?.column, "owner_profile_pause", "registry-1: visibility.profile is stored as the owner pause");
@@ -486,6 +488,11 @@ export async function runOwnerFeaturesS2c2Tests(opts: { log?: boolean } = {}): P
       setEnv(ALLOW_ENV, `rfb:${ENF_ID}`);
       vis.__setVisibilityRegistryForTesting(SOON);
       sameSnapshot(baseline, await snapshot(ENF_ID), "gate-5: enforce on + allowlisted, keys coming_soon → owner choices have no effect yet");
+      // T14a: the real registry (keys live) and NO stored choice → byte-identical to before the flip.
+      vis.__setVisibilityRegistryForTesting(null);
+      clearChoices(ENF_ID);
+      sameSnapshot(baseline, await snapshot(ENF_ID), "gate-5b: enforce on + allowlisted, real registry (live), no stored choice → byte-identical");
+      hideEverything(ENF_ID);
       vis.__setVisibilityRegistryForTesting(LIVE);
       const hidden = await snapshot(ENF_ID);
       assertTrue(hidden.page_no !== baseline.page_no && hidden.lokal_info !== baseline.lokal_info && hidden.sitemap !== baseline.sitemap,
@@ -586,7 +593,7 @@ export async function runOwnerFeaturesS2c2Tests(opts: { log?: boolean } = {}): P
       db.prepare(`INSERT INTO owner_feature_settings (vertical, subject_id, key, value_json, set_by, admin_locked, set_at)
                   VALUES ('rfb', ?, 'visibility.ai_assistants', 'false', 'admin', 1, ?)`).run(ENF_ID, new Date().toISOString());
       clearRegistryCaches();
-      assertEq(await state(PRESENCE.mcp_info.lokal_info, ENF_ID), "absent", "admin-1: an admin lock hides the profile from AI with the real registry");
+      assertEq(await state(PRESENCE.mcp_info.lokal_info, ENF_ID), "absent", "admin-1: an admin lock hides the profile from AI with the keys coming_soon");
       assertEq(await state(PRESENCE.profile_html.produsent, ENF_ID), "shown", "admin-2: …and leaves the web page");
       clearChoices(ENF_ID);
       vis.__setVisibilityRegistryForTesting(LIVE);
