@@ -10,6 +10,7 @@ import {
   approveChangeRequest,
   cancelChangeRequest,
   createChangeRequest,
+  describeChanges,
   getChangeRequest,
   listChangeRequests,
   rejectChangeRequest,
@@ -37,6 +38,12 @@ const createSchema = z.object({
   requesterEmail: z.string().email(),
   kind: z.enum(["profile_update", "removal"]),
   changes: z.record(z.string(), z.string().max(4000)).optional(),
+  // RFB: remove / rename named products; checked in full by the service.
+  products: z
+    .array(z.object({ action: z.enum(["remove", "rename"]), name: z.string().max(200), newName: z.string().max(200).optional() }).strict())
+    .min(1)
+    .max(10)
+    .optional(),
   evidence: z.object({ messageId: z.string().max(200).nullable().optional(), quote: z.string().max(2000).nullable().optional() }).nullable().optional(),
   createdBy: z.enum(["claude", "daniel"]).default("claude"),
   apply: z.boolean().default(false),
@@ -64,7 +71,7 @@ router.get("/change-requests/:id", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
   const r = getChangeRequest(String(req.params.id));
   if (!r) return res.status(404).json({ error: "not_found" });
-  res.json({ request: r });
+  res.json({ request: { ...r, changes_text: describeChanges(r.changes) } });
 });
 
 router.post("/change-requests/:id/approve", (req: Request, res: Response) => {

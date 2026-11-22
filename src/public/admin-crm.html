@@ -1124,7 +1124,8 @@ const CHANGE_STATUS_LABEL = {
 function renderChangeRequest(c) {
   const id = escapeHtml(c.id);
   let changes = '';
-  try { const ch = JSON.parse(c.changes || '{}'); changes = Object.entries(ch).map(([k, v]) => `${escapeHtml(k)}: «${escapeHtml(v)}»`).join('<br>'); } catch (e) { changes = ''; }
+  if (Array.isArray(c.changes_text)) changes = c.changes_text.map((t) => escapeHtml(t)).join('<br>');
+  else try { const ch = JSON.parse(c.changes || '{}'); changes = Object.entries(ch).map(([k, v]) => `${escapeHtml(k)}: «${escapeHtml(v)}»`).join('<br>'); } catch (e) { changes = ''; }
   const buttons = c.status === 'approval_needed'
     ? `<button class="btn-secondary" data-action="rejectChange" data-id="${id}">Avvis</button>
        <button class="btn-primary" data-action="approveChange" data-id="${id}">Godkjenn og utfør</button>`
