@@ -4641,8 +4641,29 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
         // A shared platform host (facebook.com, a shop or booking platform)
         // is never blocklisted either, from either source: one producer's
         // removal must not block every other page on that host.
+        //
+        // Survivor-website guard (dev-request 2026-11-22-rfb-dubletter-samme-
+        // nettsted-sammenslaaing-og-utsending, point 6 — the email/name guards
+        // above, one identifier over): deleting one of several profiles on the
+        // SAME website must not blocklist that domain while another ACTIVE
+        // profile still uses it, or the surviving producer is suppressed by its
+        // own site. The deleted row is already gone from `agents` (deleteAll()
+        // above), so every remaining is_active=1 row is a different agent. Its
+        // domain comes from agents.url or agent_knowledge.website, normalized
+        // with the same normalizeDomain() blocklistAdd() writes website_domain
+        // rows with. Only the website identifier is skipped; agent_id/name/
+        // email are handled exactly as before.
+        const activeDomains = new Set<string>();
+        for (const row of db.prepare(
+          "SELECT a.url AS url, k.website AS website FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id WHERE a.is_active = 1"
+        ).all() as Array<{ url: string | null; website: string | null }>) {
+          for (const site of [row.url, row.website]) {
+            const d = site ? blocklistNormalizeDomain(site) : null;
+            if (d) activeDomains.add(d);
+          }
+        }
         const usableDomain = (d: string | null | undefined): boolean =>
-          !!d && !BLOCKLIST_PROTECTED_DOMAINS.has(d) && !isHostedPlatformHost(d);
+          !!d && !BLOCKLIST_PROTECTED_DOMAINS.has(d) && !isHostedPlatformHost(d) && !activeDomains.has(d);
         const registryUrl: string | undefined = fromRegistry?.url || undefined;
         const knowledgeDomain = blocklistNormalizeDomain(knowledgeWebsite);
         const knowledgeUsable = usableDomain(knowledgeDomain);

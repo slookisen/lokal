@@ -444,6 +444,35 @@ export async function runAdminAgentsClaimMergeApproveTests(opts: { log?: boolean
       eq([input?.siblings.length, input?.profile.orgNr], [expected.length, "977777777"], "sib: claim assessment sees the same siblings + org.nr");
     }
 
+    // ══ AK2 (dev-request 2026-11-22-rfb-dubletter-samme-nettsted-
+    //    sammenslaaing-og-utsending, point 2): the shared merge core also
+    //    carries the duplicate's CRM contact + outreach history here ═══════
+    {
+      const surv = agent("h-surv", { orgNr: "988888888" });
+      const dup = agent("h-dup", { orgNr: "988888888" });
+      db.prepare(`INSERT INTO crm_contacts (id, type, agent_id, email, vertical_id) VALUES ('h-contact', 'producer', ?, 'gard@h-dup.example.test', 'rfb')`).run(dup);
+      db.prepare(`INSERT INTO crm_threads (id, contact_id, subject) VALUES ('h-thread', 'h-contact', 'Svar')`).run();
+      db.prepare(`INSERT INTO crm_messages (id, thread_id, direction, from_email) VALUES ('h-msg', 'h-thread', 'in', 'gard@h-dup.example.test')`).run();
+      db.prepare(`INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at) VALUES (?, 'gard@h-dup.example.test', datetime('now', '-30 days'))`).run(dup);
+      const claimId = queuedClaim(surv);
+      const contactAgent = () => (db.prepare("SELECT agent_id FROM crm_contacts WHERE id = 'h-contact'").get() as any).agent_id;
+      const sentLogAgents = () => (db.prepare("SELECT agent_id FROM outreach_sent_log WHERE recipient_email = 'gard@h-dup.example.test'").all() as any[]).map((r) => r.agent_id);
+
+      const dry = await call({ claimId, duplicateId: dup });
+      eq(dry.body?.wouldMoveHistory, { crm_contacts: 1, crm_threads: 1, outreach_sent_log: 1, rfb_marketing_send_ledger: 0 },
+        "AK2 claim-merge dry: wouldMoveHistory reports the history that would move");
+      eq([contactAgent(), sentLogAgents()], [dup, [dup]], "AK2 claim-merge dry: nothing moved");
+
+      const res = await call({ claimId, duplicateId: dup, apply: true });
+      eq(res.status, 200, "AK2 claim-merge apply: 200");
+      eq(res.body?.historyMoved, { crm_contacts: 1, crm_threads: 1, outreach_sent_log: 1, rfb_marketing_send_ledger: 0 },
+        "AK2 claim-merge apply: historyMoved reports what moved");
+      eq([contactAgent(), sentLogAgents()], [surv, [surv]], "AK2 claim-merge apply: contact + sent-log now on the survivor");
+      eq(audit(dup).filter((r) => String(r.field_name).startsWith("merge_moved:")).map((r) => r.field_name),
+        ["merge_moved:crm_contacts", "merge_moved:crm_threads", "merge_moved:outreach_sent_log"],
+        "AK2 claim-merge apply: one audit row per moved table");
+    }
+
     // ══ dm: duplicate-merge (no G8 option) ignores G8 fields ══════════════
     {
       const dm = require("./admin-agents-duplicate-merge") as typeof import("./admin-agents-duplicate-merge");

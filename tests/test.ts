@@ -43630,6 +43630,28 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-22-rfb-dubletter-samme-nettsted-sammenslaaing-og-utsending
+// (point 2 / AK2): the duplicate-merge carries the duplicate's CRM contact +
+// outreach history (crm_contacts, threads via contact, outreach_sent_log,
+// rfb_marketing_send_ledger) onto the survivor, checked against the real
+// outreach gate. Pins its own in-memory DB as the getDb() singleton for the
+// (synchronous) run and restores it — runSerial keeps it from interleaving.
+runSerial(async () => {
+  console.log("\n── admin-agents-duplicate-merge-history: merge carries contact + outreach history ──");
+  try {
+    const { runAdminAgentsDuplicateMergeHistoryTests } = require("../src/routes/admin-agents-duplicate-merge-history.test") as
+      typeof import("../src/routes/admin-agents-duplicate-merge-history.test");
+    const dmh = runAdminAgentsDuplicateMergeHistoryTests({ log: false });
+    passed += dmh.passed;
+    failed += dmh.failed;
+    for (const f of dmh.failures) failures.push("duplicate-merge-history: " + f);
+    console.log(`  duplicate-merge-history: ${dmh.passed} passed, ${dmh.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("duplicate-merge-history: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // POST /admin/agents/deactivate — standalone-row catalog-hygiene deactivate
 // lever (dev-request 2026-08-10-rfb-hjemmesidejakt-full-loype, Skive 8).
 // Deactivates (is_active=0 only, merged_into untouched) one or more
