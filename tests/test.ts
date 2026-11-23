@@ -51517,6 +51517,17 @@ runSerial(async () => {
   console.log(`  rfb-tekstrettinger-20261106: ${tr.passed} passed, ${tr.failed} failed`);
 });
 
+runSerial(async () => {
+  console.log("\n── selger: product without category ──");
+  const { runRfbSelgerCatUndefinedTests } = require("../src/routes/rfb-selger-cat-undefined.test") as
+    typeof import("../src/routes/rfb-selger-cat-undefined.test");
+  const cr = runRfbSelgerCatUndefinedTests();
+  passed += cr.passed;
+  failed += cr.failed;
+  for (const f of cr.failures) failures.push("rfb-selger-cat-undefined: " + f);
+  console.log(`  rfb-selger-cat-undefined: ${cr.passed} passed, ${cr.failed} failed`);
+});
+
 // dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post, K1–K3: the same
 // claimant gets the same claim back (code_already_sent, no new code), «Send
 // koden på nytt» (same code, same farm address, once, ≥ 10 min, platform cap),
