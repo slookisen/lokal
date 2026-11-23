@@ -491,14 +491,16 @@ function tableExists(db: ReturnType<typeof getDb>, name: string): boolean {
   return !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(name);
 }
 
-interface HistoryRows {
+/** The duplicate's history row ids per table (exported for the old-merge
+ *  backfill, admin-agents-merge-history-backfill.ts). */
+export interface HistoryRows {
   crm_contacts: string[];
   crm_threads: string[];
   outreach_sent_log: number[];
   rfb_marketing_send_ledger: number[];
 }
 
-function readDuplicateHistory(db: ReturnType<typeof getDb>, duplicateId: string): HistoryRows {
+export function readDuplicateHistory(db: ReturnType<typeof getDb>, duplicateId: string): HistoryRows {
   const ids = <T>(sql: string): T[] => (db.prepare(sql).all(duplicateId) as Array<{ id: T }>).map((r) => r.id);
   return {
     crm_contacts: ids<string>(`SELECT id FROM crm_contacts WHERE agent_id = ? ORDER BY id`),

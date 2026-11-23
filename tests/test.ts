@@ -43652,6 +43652,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-22-rfb-dubletter-samme-nettsted-sammenslaaing-og-utsending
+// (points 1 and 3): GET /admin/agents/duplicate-groups (read-only detector)
+// and POST /admin/agents/merge-history-backfill (old merges' history to the
+// final survivor). Own in-memory DB through the routes' seams.
+runSerial(async () => {
+  console.log("\n── admin-agents-duplicate-groups + merge-history-backfill ──");
+  try {
+    const { runAdminAgentsDuplicateGroupsBackfillTests } = require("../src/routes/admin-agents-duplicate-groups-backfill.test") as
+      typeof import("../src/routes/admin-agents-duplicate-groups-backfill.test");
+    const dgb = runAdminAgentsDuplicateGroupsBackfillTests({ log: false });
+    passed += dgb.passed;
+    failed += dgb.failed;
+    for (const f of dgb.failures) failures.push("duplicate-groups-backfill: " + f);
+    console.log(`  duplicate-groups-backfill: ${dgb.passed} passed, ${dgb.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("duplicate-groups-backfill: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // POST /admin/agents/deactivate — standalone-row catalog-hygiene deactivate
 // lever (dev-request 2026-08-10-rfb-hjemmesidejakt-full-loype, Skive 8).
 // Deactivates (is_active=0 only, merged_into untouched) one or more
