@@ -174,6 +174,10 @@ import {
 } from "../services/gardssalg-booking-resolve";
 
 import { EXPERIENCES_LIST_HTML, EXPERIENCE_DETAIL_HTML } from "./opplevagent-widgets";
+import {
+  GARDSSALG_BOOKING_CARD_HTML, GARDSSALG_BOOKING_CARD_URI, GARDSSALG_LIST_CARD_HTML, GARDSSALG_LIST_CARD_URI,
+  buildGardssalgBookingCard, buildGardssalgListCard, cardBadgeForStatusKey, gardssalgCardsEnabled,
+} from "./gardssalg-cards";
 import rateLimit from "express-rate-limit";
 import {
   createMcpRateLimiters,
@@ -1050,6 +1054,102 @@ function registerWidgetResource(
       contents: [{ uri, mimeType: WIDGET_MIME_TYPE, text: html, _meta: meta }],
     }),
   );
+}
+
+// O5-6 (dev-request 2026-11-12-opplevagent-o5-besok-i-chatgpt-og-assistenter):
+// the two gårdssalg cards (gardssalg-cards.ts), registered only while
+// GARDSSALG_MCP_CARDS_ENABLED is on. Same CSP as the experience cards (they
+// load nothing), but WITHOUT `ui.domain`: Claude accepts only its own
+// `<hash>.claudemcpcontent.com` there and shows an error instead of the card
+// for any other value; the standard says to leave it out to get the host's
+// default sandbox. ChatGPT's dedicated origin (required for a submission with
+// UI) goes in its own alias `openai/widgetDomain`, which other hosts ignore.
+function registerCardResource(server: McpServer, name: string, uri: string, html: string, widgetDescription: string): void {
+  const meta = {
+    ui: {
+      prefersBorder: true,
+      csp: { connectDomains: [] as string[], resourceDomains: [] as string[] },
+    },
+    "openai/widgetDescription": widgetDescription,
+    "openai/widgetPrefersBorder": true,
+    "openai/widgetDomain": WIDGET_DOMAIN,
+    "openai/widgetCSP": {
+      connect_domains: [] as string[],
+      resource_domains: [] as string[],
+      redirect_domains: [WIDGET_DOMAIN],
+    },
+  };
+  server.registerResource(
+    name,
+    uri,
+    { title: "Opplevagent", description: widgetDescription, mimeType: WIDGET_MIME_TYPE, _meta: meta },
+    async () => ({
+      contents: [{ uri, mimeType: WIDGET_MIME_TYPE, text: html, _meta: meta }],
+    }),
+  );
+}
+
+/** A gårdssalg tool's `_meta` pointing at its card (O5-6, flag on only). */
+function cardToolMeta(uri: string) {
+  return { _meta: { ui: { resourceUri: uri }, "openai/outputTemplate": uri } };
+}
+
+/** {nb, en} time in words for a stored slot ('YYYY-MM-DDTHH:MM' Oslo or ISO). */
+function cardTime(slot: string | null): { nb: string; en: string } {
+  const iso = slot ? osloDatetimeLocalToUtcIso(slot) ?? slot : null;
+  return { nb: formatOsloInstant(iso, "nb"), en: formatOsloInstant(iso, "en") };
+}
+
+/** The booking card for a stored request; the badge is get_gardssalg_booking's status. */
+function bookingCardFor(booking: GardssalgBooking, statusKey: unknown, producer: string, statusUrl: unknown) {
+  const status = cardBadgeForStatusKey(String(statusKey));
+  if (!status) return null;
+  return buildGardssalgBookingCard({
+    preview: false,
+    producer,
+    status,
+    time: cardTime(booking.slot_at),
+    partySize: booking.party_size,
+    bookingRef: booking.booking_ref,
+    statusUrl,
+  });
+}
+
+/**
+ * book_gardssalg's MCP result plus the O5-6 card. The text content is left
+ * byte-identical; structuredContent is that same payload plus `card`. Only a
+ * preview, a stored request and a duplicate get a card; every other outcome
+ * is returned untouched (the text answers it). runBookGardssalg itself (shared
+ * with the A2A skill) is not changed.
+ */
+export function withGardssalgBookingCard(result: BookGardssalgToolResult, args: BookGardssalgArgs): BookGardssalgToolResult & { structuredContent?: Record<string, unknown> } {
+  let p: any;
+  try {
+    p = JSON.parse(String(result?.content?.[0]?.text ?? ""));
+  } catch {
+    return result;
+  }
+  if (!p || typeof p !== "object" || result.isError || p.success !== true) return result;
+  const producer = String(p.provider?.navn || args.provider_id || "");
+  let card = null;
+  if (p.preview === true) {
+    if (!producer || typeof p.party_size !== "number") return result;
+    card = buildGardssalgBookingCard({
+      preview: true,
+      producer,
+      status: null,
+      time: cardTime(normaliseBookingSlotInput(args.slot_at)),
+      partySize: p.party_size,
+      bookingRef: null,
+      statusUrl: null,
+      previewLines: String(p.message ?? "").split("\n").slice(1),
+    });
+  } else if (typeof p.booking_ref === "string") {
+    const booking = getBookingByRef(p.booking_ref);
+    if (!booking) return result;
+    card = bookingCardFor(booking, gardssalgBookingStatusPayload(booking).status, producer || booking.provider_id, p.status_url);
+  }
+  return card ? { ...result, structuredContent: { ...p, card } } : result;
 }
 
 /**
@@ -2065,6 +2165,11 @@ export function registerExperienceTools(
   // vertical, backed by searchGardssalgProviders().
   // O5-4: C1/C2 tool texts and the `preview` field only with the flag on.
   const previewTexts = gardssalgPreviewEnabled() ? "on" : "off";
+  // O5-6: the cards only for a session registered with the flag on (its
+  // tools/list then names the card), and only while the flag is still on.
+  // Off: tools/list, resources/list and every result are byte-identical.
+  const cardsOn = gardssalgCardsEnabled();
+  const cardsNow = (): boolean => cardsOn && gardssalgCardsEnabled();
   server.registerTool(
     "discover_gardssalg",
     {
@@ -2097,6 +2202,7 @@ export function registerExperienceTools(
         // same kind of read-only DB lookup as list_experience_categories.)
         openWorldHint: false,
       },
+      ...(cardsOn ? cardToolMeta(GARDSSALG_LIST_CARD_URI) : {}),
     },
     withFunnelOutcome(() => "search", async ({ fylke: fylkeAsSent, kommune: kommuneAsSent, producer_type, query, booking_live, lat, lng, radius_km, limit }, extra) => {
       // Slice I-Y2: place names, cut as in discover_experiences.
@@ -2189,6 +2295,8 @@ export function registerExperienceTools(
         deliver("discover_gardssalg", filter, extra, results.map((row) => row.id));
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+          // O5-6: the whole payload plus the list card's own fields.
+          ...(cardsNow() ? { structuredContent: { ...result, card: buildGardssalgListCard(formatted) } } : {}),
         };
       } catch (err: any) {
         // Defensive: DB not open or other failure -> graceful degradation
@@ -2265,15 +2373,25 @@ export function registerExperienceTools(
         // outside the app is open-world, whatever the record it writes.
         openWorldHint: true,
       },
+      ...(cardsOn ? cardToolMeta(GARDSSALG_BOOKING_CARD_URI) : {}),
     },
-    withFunnelOutcome(classifyBookGardssalgResult, async (args, extra) => runBookGardssalg(args, {
-      sourceClient: () => sessionSourceClient(extra),
-      logInteraction: (bookingRef) => logExperiencesInteraction({
-        skill: "book_gardssalg",
-        queryText: bookingRef,
-        ctx: { clientIdentity: getClientIdentity?.(), requestMeta: getRequestMeta?.() },
-      }),
-    })),
+    withFunnelOutcome(classifyBookGardssalgResult, async (args, extra) => {
+      const result = await runBookGardssalg(args, {
+        sourceClient: () => sessionSourceClient(extra),
+        logInteraction: (bookingRef) => logExperiencesInteraction({
+          skill: "book_gardssalg",
+          queryText: bookingRef,
+          ctx: { clientIdentity: getClientIdentity?.(), requestMeta: getRequestMeta?.() },
+        }),
+      });
+      // O5-6: + the booking card (text untouched). Fail-open: no card on error.
+      if (!cardsNow()) return result;
+      try {
+        return withGardssalgBookingCard(result, args);
+      } catch {
+        return result;
+      }
+    }),
   );
 
   // O5-2: registered last and only with the flag on, so tools/list with the
@@ -2296,6 +2414,7 @@ export function registerExperienceTools(
           // Closed world: reads Opplevagent's own booking table, sends nothing.
           openWorldHint: false,
         },
+        ...(cardsOn ? cardToolMeta(GARDSSALG_BOOKING_CARD_URI) : {}),
       },
       async ({ booking_ref, guest_ref }) => {
         try {
@@ -2306,7 +2425,13 @@ export function registerExperienceTools(
               ctx: { clientIdentity: getClientIdentity?.(), requestMeta: getRequestMeta?.() },
             });
           } catch { /* fail-open: never affects the tool result */ }
-          return jsonToolResult(booking ? gardssalgBookingStatusPayload(booking) : gardssalgBookingNotFoundPayload());
+          if (!booking) return jsonToolResult(gardssalgBookingNotFoundPayload());
+          const payload = gardssalgBookingStatusPayload(booking);
+          // O5-6: + the booking card (text untouched).
+          const card = cardsNow()
+            ? bookingCardFor(booking, payload.status, String((payload.provider as { navn?: unknown } | undefined)?.navn || booking.provider_id), payload.status_url)
+            : null;
+          return card ? { ...jsonToolResult(payload), structuredContent: { ...payload, card } } : jsonToolResult(payload);
         } catch (err: any) {
           return toolInternalError("get_gardssalg_booking", err);
         }
@@ -2366,6 +2491,15 @@ export function registerExperienceTools(
         }
       }
     );
+  }
+
+  // O5-6: the two card resources, listed last and only with the flag on, so
+  // resources/list with the flag off is byte-identical.
+  if (cardsOn) {
+    registerCardResource(server, "gardssalg-producers", GARDSSALG_LIST_CARD_URI, GARDSSALG_LIST_CARD_HTML,
+      "A list of the gårdssalg producers the assistant just found: name, type of place, municipality and whether it takes visit requests, with a Request a visit button and a link to the profile page. The assistant should summarise briefly rather than repeat every producer.");
+    registerCardResource(server, "gardssalg-booking", GARDSSALG_BOOKING_CARD_URI, GARDSSALG_BOOKING_CARD_HTML,
+      "A summary of one visit request: producer, time, number of guests, status and a link to the guest's status page. In a preview it shows what will be sent, and to whom; nothing has been sent.");
   }
 }
 
