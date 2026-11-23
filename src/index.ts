@@ -150,6 +150,8 @@ import adminAgentsFacebookTierShadowRoutes from "./routes/admin-agents-facebook-
 import adminDrinkCoverageRoutes from "./routes/admin-drink-coverage";
 import adminEnrichmentWritePauseRoutes from "./routes/admin-enrichment-write-pause";
 import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-merge";
+import adminAgentsDuplicateGroupsRoutes from "./routes/admin-agents-duplicate-groups";
+import adminAgentsMergeHistoryBackfillRoutes from "./routes/admin-agents-merge-history-backfill";
 import adminAgentsProductsTabCleanupRoutes from "./routes/admin-agents-products-tab-cleanup";
 import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
 import ownerPreviewRoutes, { ownerPreviewAdminRouter } from "./routes/owner-preview";
@@ -1020,6 +1022,13 @@ app.use("/admin/enrichment-write-pause", adminLimiter, adminEnrichmentWritePause
 // (dev-request duplicate-merge lever). Same ordering rule as the siblings
 // above — mount BEFORE /admin/agents.
 app.use("/admin/agents/duplicate-merge", adminLimiter, adminAgentsDuplicateMergeRoutes);
+// GET /admin/agents/duplicate-groups — READ-ONLY groups of active RFB profiles
+// sharing a website domain, org.nr. or e-mail (hashed), and POST
+// /admin/agents/merge-history-backfill — moves contact/outreach history left on
+// old merged profiles to the final survivor, dry-run default (dev-request
+// 2026-11-22-rfb-dubletter-samme-nettsted, points 1 and 3). Mount BEFORE /admin/agents.
+app.use("/admin/agents/duplicate-groups", adminLimiter, adminAgentsDuplicateGroupsRoutes);
+app.use("/admin/agents/merge-history-backfill", adminLimiter, adminAgentsMergeHistoryBackfillRoutes);
 // POST /admin/agents/products-tab-cleanup (dev-request 2026-11-10-rfb-bakke-
 // rydding-dublett-og-innlimte-varer, S2): splits pasted tab-separated product
 // rows, one profile per call, dry-run default. Mount BEFORE /admin/agents.
