@@ -141,6 +141,9 @@ export function runOpplevelserGardssalgMcpCardsTests(opts: { log?: boolean; prin
       require.resolve("../database/db-factory"),
       require.resolve("../services/experience-store"),
       require.resolve("../services/booking-store"),
+      require.resolve("../services/gardssalg-honest-receipt"),
+      require.resolve("../services/gardssalg-cancel"),
+      require.resolve("../services/gardssalg-booking-caps"),
       require.resolve("./experiences-mcp"),
     ];
     const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
