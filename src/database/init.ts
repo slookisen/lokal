@@ -6305,6 +6305,34 @@ function initSchema(db: Database.Database): void {
     db.exec(`ALTER TABLE agents ADD COLUMN contact_form_only INTEGER NOT NULL DEFAULT 0`);
   } catch { /* already exists — expected */ }
 
+  // ─── dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S5-1 ──────────────
+  // Segment B («bekreftet, ikke eier») as a field: a producer who answered
+  // positively in a customer-service thread (CS buckets B1/B2) but has not
+  // claimed the profile. One row = marked; no row = NULL. owner_interest is
+  // 'confirmed_positive' (CHECK + zod in the route); owner_interest_at =
+  // ISO-8601 UTC; owner_interest_thread = free-text CS thread reference
+  // (≤ 300 chars, enforced in the route). A side table on purpose, not new
+  // `agents` columns: widening `agents` tips SQLite's planner off
+  // idx_agents_geo for the unordered public scans (name-search-fts.test.ts's
+  // plan check), which changes the order of discover/find-match answers —
+  // same reason as agent_registration_precheck / owner_profile_pause above.
+  // Admin-only: the only writer and reader is routes/admin-owner-interest.ts.
+  // No public surface, outreach, e-mail or customerRuleSql() reads it.
+  // Additive, brand-new table, idempotent. Rollback: stop writing (the table
+  // may stay, or DROP TABLE agent_owner_interest).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_owner_interest (
+        agent_id TEXT NOT NULL PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+        owner_interest TEXT NOT NULL CHECK (owner_interest IN ('confirmed_positive')),
+        owner_interest_at TEXT NOT NULL,
+        owner_interest_thread TEXT CHECK (owner_interest_thread IS NULL OR length(owner_interest_thread) <= 300)
+      )
+    `);
+  } catch (err) {
+    console.error("Migration agent_owner_interest failed:", err);
+  }
+
   // ─── dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S1b punkt 6 ───────
   // Owner pause (visibility.profile = false). One row = paused; pause_until
   // 'YYYY-MM-DD' (optional) = the pause ends that UTC day. Its own table, not
