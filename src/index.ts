@@ -153,6 +153,7 @@ import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-mer
 import adminAgentsProductsTabCleanupRoutes from "./routes/admin-agents-products-tab-cleanup";
 import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
 import ownerPreviewRoutes, { ownerPreviewAdminRouter } from "./routes/owner-preview";
+import adminOwnerReportPreviewRoutes from "./routes/admin-owner-report-preview";
 import adminOwnerInterestRoutes, { ownerInterestListRouter as adminOwnerInterestListRoutes } from "./routes/admin-owner-interest";
 import adminAgentsBusinessTypeRoutes from "./routes/admin-agents-business-type";
 import adminTestProducerRoutes from "./routes/admin-test-producer";
@@ -1083,6 +1084,9 @@ app.use("/admin/agents/:id/owner-interest", adminLimiter, adminOwnerInterestRout
 app.use("/admin/owner-interest", adminLimiter, adminOwnerInterestListRoutes);
 // POST /admin/agents/:id/preview-link — mints the S5-2 preview link (writes nothing).
 app.use("/admin/agents/:id/preview-link", adminLimiter, ownerPreviewAdminRouter);
+// GET /admin/agents/:id/owner-report-preview — S5-3 monthly owner report e-mail
+// template preview (read only, sends nothing). Mount BEFORE /admin/agents.
+app.use("/admin/agents/:id/owner-report-preview", adminLimiter, adminOwnerReportPreviewRoutes);
 app.use("/admin/agents", adminLimiter, adminAgentsRoutes);
 app.use("/admin/outreach-ready-pool", adminLimiter, adminOutreachPoolRoutes);
 // orch-pr-20260614-3: suppression-gate candidates endpoint + sent-log backfill import
