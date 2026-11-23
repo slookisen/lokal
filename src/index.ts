@@ -152,6 +152,7 @@ import adminEnrichmentWritePauseRoutes from "./routes/admin-enrichment-write-pau
 import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-merge";
 import adminAgentsProductsTabCleanupRoutes from "./routes/admin-agents-products-tab-cleanup";
 import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
+import ownerPreviewRoutes, { ownerPreviewAdminRouter } from "./routes/owner-preview";
 import adminOwnerInterestRoutes, { ownerInterestListRouter as adminOwnerInterestListRoutes } from "./routes/admin-owner-interest";
 import adminAgentsBusinessTypeRoutes from "./routes/admin-agents-business-type";
 import adminTestProducerRoutes from "./routes/admin-test-producer";
@@ -407,6 +408,12 @@ app.use("/", resendWebhookRoutes);
 // OUTREACH_UNSUBSCRIBE_ENABLED. Mounted here so no host gate can swallow the
 // one-click POST. See routes/avmeld.ts.
 app.use("/", avmeldRoutes);
+
+// ─── GET /forhandsvis/:token — read-only preview link for segment B (S5-2,
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere). 404 unless
+// OWNER_PREVIEW_LINKS_ENABLED. GET changes nothing and is not logged as a page
+// view (analytics skipPaths). See routes/owner-preview.ts.
+app.use("/", ownerPreviewRoutes);
 
 // ─── POST /webhooks/stripe-connect (prepayment, A2A dev-request
 // 2026-10-09-rfb-forhandsbetaling-stripe-connect) ───────────────────────
@@ -1074,6 +1081,8 @@ app.use("/admin/owner-gate-impact", adminLimiter, adminOwnerGateImpactRoutes);
 // 2026-10-22-rfb-mine-valg-eierbrytere, S5-1). Mount BEFORE /admin/agents.
 app.use("/admin/agents/:id/owner-interest", adminLimiter, adminOwnerInterestRoutes);
 app.use("/admin/owner-interest", adminLimiter, adminOwnerInterestListRoutes);
+// POST /admin/agents/:id/preview-link — mints the S5-2 preview link (writes nothing).
+app.use("/admin/agents/:id/preview-link", adminLimiter, ownerPreviewAdminRouter);
 app.use("/admin/agents", adminLimiter, adminAgentsRoutes);
 app.use("/admin/outreach-ready-pool", adminLimiter, adminOutreachPoolRoutes);
 // orch-pr-20260614-3: suppression-gate candidates endpoint + sent-log backfill import
