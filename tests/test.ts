@@ -55496,3 +55496,22 @@ runSerial(async () => {
     failures.push("owner-preview: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S5-3: monthly owner report
+// e-mail template + admin-only preview GET /admin/agents/:id/owner-report-preview.
+// Own in-memory DB via the route's seam; env set and restored in finally — runSerial, tail.
+runSerial(async () => {
+  console.log("\n── S5-3: månedsrapport til eier (mal + admin-forhåndsvisning) ──");
+  try {
+    const { runOwnerReportPreviewTests } = require("../src/routes/admin-owner-report-preview.test") as
+      typeof import("../src/routes/admin-owner-report-preview.test");
+    const r = await runOwnerReportPreviewTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-report-preview: " + f);
+    console.log(`  owner-report-preview: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-report-preview: unexpected error: " + String(err?.message || err));
+  }
+});
