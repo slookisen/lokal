@@ -152,6 +152,7 @@ import adminEnrichmentWritePauseRoutes from "./routes/admin-enrichment-write-pau
 import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-merge";
 import adminAgentsProductsTabCleanupRoutes from "./routes/admin-agents-products-tab-cleanup";
 import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
+import adminOwnerInterestRoutes, { ownerInterestListRouter as adminOwnerInterestListRoutes } from "./routes/admin-owner-interest";
 import adminAgentsBusinessTypeRoutes from "./routes/admin-agents-business-type";
 import adminTestProducerRoutes from "./routes/admin-test-producer";
 import adminOrderStatsRoutes, { adminOrderPageRouter } from "./routes/admin-order-stats";
@@ -1068,6 +1069,11 @@ app.use("/admin/agents/duplicate-slugs", adminLimiter, adminAgentsDuplicateSlugs
 // GET /admin/owner-gate-impact — READ-ONLY count of who OWNER_VERIFIED_OWNER_GATE_ENABLED
 // would stop (dev-request 2026-11-06-rfb-krav-for-portal-og-okter-ved-eierskifte, point 1).
 app.use("/admin/owner-gate-impact", adminLimiter, adminOwnerGateImpactRoutes);
+// POST /admin/agents/:id/owner-interest + GET /admin/owner-interest — segment B
+// («bekreftet, ikke eier») as an admin-only field (dev-request
+// 2026-10-22-rfb-mine-valg-eierbrytere, S5-1). Mount BEFORE /admin/agents.
+app.use("/admin/agents/:id/owner-interest", adminLimiter, adminOwnerInterestRoutes);
+app.use("/admin/owner-interest", adminLimiter, adminOwnerInterestListRoutes);
 app.use("/admin/agents", adminLimiter, adminAgentsRoutes);
 app.use("/admin/outreach-ready-pool", adminLimiter, adminOutreachPoolRoutes);
 // orch-pr-20260614-3: suppression-gate candidates endpoint + sent-log backfill import

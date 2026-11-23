@@ -55456,3 +55456,24 @@ runSerial(async () => {
     failures.push("selvreg-daniel-review-f2: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S5-1: segment B
+// («bekreftet, ikke eier») as an admin-only field — POST
+// /admin/agents/:id/owner-interest + GET /admin/owner-interest. Own in-memory
+// DB via the route's seam; sets ADMIN_KEY only when none exists (restored in
+// finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── S5-1: segment B som felt (owner-interest) ──");
+  try {
+    const { runAdminOwnerInterestTests } = require("../src/routes/admin-owner-interest.test") as
+      typeof import("../src/routes/admin-owner-interest.test");
+    const r = await runAdminOwnerInterestTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-owner-interest: " + f);
+    console.log(`  admin-owner-interest: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-owner-interest: unexpected error: " + String(err?.message || err));
+  }
+});
