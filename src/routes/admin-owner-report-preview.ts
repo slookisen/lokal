@@ -11,8 +11,9 @@
 //   403 without X-Admin-Key, 404 unknown agent.
 //
 // Read only: no INSERT/UPDATE/DELETE, no e-mail, no page-view row (/admin/ is
-// in the analytics skipPaths). There is no public route, no job and no
-// sending path; `would_send` is information only.
+// in the analytics skipPaths). There is no job and no sending path;
+// `would_send` is information only. The only public route is the report's
+// unsubscribe (S5-4, routes/rapport-avmeld.ts).
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
@@ -113,8 +114,8 @@ router.get("/", (req: Request, res: Response) => {
     },
     unsubscribe: {
       path: OWNER_REPORT_UNSUB_PATH,
-      route_live: false,
-      note: "The one-click unsubscribe route is not built yet; it must exist before any send.",
+      route_live: true,
+      note: "GET /rapport-avmeld/:token confirms; POST (or the RFC 8058 one-click body) sets notify.report = off.",
     },
     notify_report: report.notifyReport,
     notify_report_status: report.notifyReportStatus,

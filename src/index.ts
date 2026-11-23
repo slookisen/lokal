@@ -121,6 +121,7 @@ import ownerBetaRoutes from "./routes/owner-beta";
 import ownerOrdersRoutes from "./routes/owner-orders";
 import buyerOrderCardRoutes from "./routes/buyer-order-card";
 import avmeldRoutes from "./routes/avmeld";
+import rapportAvmeldRoutes from "./routes/rapport-avmeld";
 import stockCheckRoutes from "./routes/stock-check";
 import gardssalgClaimRoutes, { GARDSSALG_CLAIM_PATH_PREFIXES, gardssalgClaimHostGate } from "./routes/gardssalg-claim";
 import resendWebhookRoutes from "./routes/resend-webhook";
@@ -409,6 +410,14 @@ app.use("/", resendWebhookRoutes);
 // OUTREACH_UNSUBSCRIBE_ENABLED. Mounted here so no host gate can swallow the
 // one-click POST. See routes/avmeld.ts.
 app.use("/", avmeldRoutes);
+
+// ─── /rapport-avmeld/:token — unsubscribe from the monthly owner report (S5-4,
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere). No flag: the link is in
+// every report, and an unsubscribe link must never 404. GET confirms only;
+// POST / RFC 8058 one-click sets notify.report = off. Mounted beside /avmeld
+// so no host gate can swallow the one-click POST. Not a page view (analytics
+// skipPaths). See routes/rapport-avmeld.ts.
+app.use("/", rapportAvmeldRoutes);
 
 // ─── GET /forhandsvis/:token — read-only preview link for segment B (S5-2,
 // dev-request 2026-10-22-rfb-mine-valg-eierbrytere). 404 unless

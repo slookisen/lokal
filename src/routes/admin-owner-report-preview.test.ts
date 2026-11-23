@@ -213,9 +213,16 @@ export async function runOwnerReportPreviewTests(opts: { log?: boolean } = {}): 
     // ── would_send reasons ───────────────────────────────────────────────
     const plainR = buildOwnerMonthlyReport(db as any, "rp-plain", oct!, { nowMs: NOW })!;
     ok(plainR.wouldSend === false && plainR.wouldSendReason === "not_owner", "would_send: not an owner → false, not_owner");
-    // notify.report is coming_soon today, so a stored value is not applied (the default is):
+    // notify.report is coming_soon today. S5-4: a stored «off» (the entry's
+    // recipientOptOut) is still honoured — an unsubscribe is never ignored.
     const offToday = buildOwnerMonthlyReport(db as any, "rp-off", oct!, { nowMs: NOW })!;
-    ok(offToday.notifyReportStatus === "coming_soon" && offToday.notifyReport === "monthly", "would_send: coming_soon entry → default monthly applies");
+    ok(offToday.notifyReportStatus === "coming_soon" && offToday.notifyReport === "off" && offToday.wouldSendReason === "notify_report_off",
+      "would_send: coming_soon entry with a stored «off» → off honoured (S5-4)");
+    // Any other stored value is not applied while coming_soon (the default is).
+    db.prepare(`UPDATE owner_feature_settings SET value_json = '"quarterly"' WHERE subject_id = 'rp-off'`).run();
+    const qToday = buildOwnerMonthlyReport(db as any, "rp-off", oct!, { nowMs: NOW })!;
+    ok(qToday.notifyReport === "monthly" && qToday.wouldSend === true, "would_send: coming_soon entry with a stored «quarterly» → default monthly applies");
+    db.prepare(`UPDATE owner_feature_settings SET value_json = '"off"' WHERE subject_id = 'rp-off'`).run();
     // With the entry live, the owner's «off» is honoured (information only).
     const liveRegistry = ownerFeatureRegistryFor("rfb").map((e) => (e.key === "notify.report" ? { ...e, status: "live" as const, liveFlag: undefined } : e));
     const offR = buildOwnerMonthlyReport(db as any, "rp-off", oct!, { nowMs: NOW, registry: liveRegistry })!;
@@ -269,7 +276,7 @@ export async function runOwnerReportPreviewTests(opts: { log?: boolean } = {}): 
     ok(j.status === 200 && j.body?.month === "2026-10" && j.body?.agent_id === "rp-a", "route: JSON 200 for the month");
     ok(typeof j.body?.subject === "string" && typeof j.body?.text === "string" && typeof j.body?.html === "string", "route: JSON carries subject/text/html");
     ok(j.body?.metrics?.clicks?.value === 3 && j.body?.would_send === true && j.body?.sending === "none", "route: numbers, would_send, sending none");
-    ok(j.body?.unsubscribe?.route_live === false && typeof j.body?.links?.unsubscribe === "string", "route: unsubscribe link + route_live false");
+    ok(j.body?.unsubscribe?.route_live === true && typeof j.body?.links?.unsubscribe === "string", "route: unsubscribe link + route_live true (S5-4)");
     ok(j.headers["cache-control"] === "no-store", "route: no-store");
     const d = await call(base);
     ok(d.status === 200 && d.body?.month === defaultReportMonth(), "route: default month = previous Oslo month");
@@ -278,7 +285,7 @@ export async function runOwnerReportPreviewTests(opts: { log?: boolean } = {}): 
     const t = await call(`${base}?month=2026-10&format=text`);
     ok(t.status === 200 && String(t.headers["content-type"]).startsWith("text/plain") && t.text.startsWith("Hei!"), "route: format=text serves the plain text");
     const offJ = await call("/admin/agents/rp-off/owner-report-preview?month=2026-10");
-    ok(offJ.status === 200 && offJ.body?.notify_report_status === "coming_soon" && offJ.body?.notify_report === "monthly",
+    ok(offJ.status === 200 && offJ.body?.notify_report_status === "coming_soon" && offJ.body?.notify_report === "off",
       "route: JSON reports notify.report value and its coming_soon status");
     const plainJ = await call("/admin/agents/rp-plain/owner-report-preview?month=2026-10");
     ok(plainJ.body?.would_send === false && plainJ.body?.reason === "not_owner", "route: non-owner → would_send false");
