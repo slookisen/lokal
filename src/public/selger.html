@@ -1113,7 +1113,7 @@
         cat_vegetables: 'Gr\u00f8nnsaker', cat_fruit: 'Frukt', cat_berries: 'B\u00e6r',
         cat_dairy: 'Meieri', cat_eggs: 'Egg', cat_meat: 'Kj\u00f8tt',
         cat_fish: 'Fisk', cat_bread: 'Br\u00f8d', cat_honey: 'Honning',
-        cat_herbs: 'Urter', cat_other: 'Annet',
+        cat_herbs: 'Urter', cat_other: 'Annet', cat_none: 'Uten kategori',
         all_year: 'Hele \u00e5ret', seasonal: 'Sesongbasert', yes: 'Ja', no: 'Nei',
         no_results: 'Ingen agenter funnet. Pr\u00f8v et annet s\u00f8k.',
         searching: 'S\u00f8ker...',
@@ -1181,7 +1181,7 @@
         cat_vegetables: 'Vegetables', cat_fruit: 'Fruit', cat_berries: 'Berries',
         cat_dairy: 'Dairy', cat_eggs: 'Eggs', cat_meat: 'Meat',
         cat_fish: 'Fish', cat_bread: 'Bread', cat_honey: 'Honey',
-        cat_herbs: 'Herbs', cat_other: 'Other',
+        cat_herbs: 'Herbs', cat_other: 'Other', cat_none: 'No category',
         all_year: 'All year', seasonal: 'Seasonal', yes: 'Yes', no: 'No',
         no_results: 'No agents found. Try a different search.',
         searching: 'Searching...',
@@ -1200,6 +1200,12 @@
     };
 
     function t(key) { return i18n[state.lang][key] || key; }
+    // Category label for the owner's product list: readable fallback for a missing
+    // category, the raw value (never "cat_<x>") for an untranslated one.
+    function productCategoryLabel(c) {
+      if (c === undefined || c === null || String(c).trim() === '') return i18n[state.lang].cat_none;
+      return i18n[state.lang]['cat_' + c] || String(c);
+    }
 
     function applyLang() {
       document.querySelectorAll('[data-i18n]').forEach(function(el) {
@@ -2581,7 +2587,7 @@
 
         var metaSpan = document.createElement('span');
         metaSpan.className = 'product-meta';
-        var metaParts = [t('cat_' + p.category) || p.category];
+        var metaParts = [productCategoryLabel(p.category)];
         if (p.organic) metaParts.push('\u2705 ' + t('organic_label'));
         if (p.seasonal) metaParts.push('\ud83c\udf43 ' + t('seasonal'));
         metaSpan.textContent = ' \u2022 ' + metaParts.join(' \u2022 ');
