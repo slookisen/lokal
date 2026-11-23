@@ -316,6 +316,16 @@ export interface OwnerFeatureEntry {
    * shows `description` (the text the owner page already shows).
    */
   sellerFaq?: LocalizedText;
+  /**
+   * S5-4: the value a recipient's one-click unsubscribe link sets
+   * (notify.report → "off", /rapport-avmeld/:token). Written only through
+   * setOwnerFeatureValue with `{ recipientOptOut: true }`, which accepts
+   * exactly this value and nothing else, and is allowed even while the entry
+   * is coming_soon. A stored value equal to it is honoured while coming_soon
+   * (the resolver otherwise answers the default), so an unsubscribe is never
+   * ignored. Must be a visible option (`choice`) or false (`switch`).
+   */
+  recipientOptOut?: OwnerFeatureValue;
 }
 
 export const OWNER_FEATURE_GROUPS: Array<{ key: OwnerFeatureGroup; label: LocalizedText }> = [
@@ -808,6 +818,8 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     default: { owner: "monthly", unclaimed: "monthly" },
     outward: true,
     surfaces: ["email:owner_monthly_report"],
+    // S5-4: the report's one-click unsubscribe (/rapport-avmeld/:token).
+    recipientOptOut: "off",
   }),
   entry({
     key: "notify.milestones", group: "notify", type: "switch",

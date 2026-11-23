@@ -55535,3 +55535,22 @@ runSerial(async () => {
     failures.push("owner-report-preview: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S5-4: /rapport-avmeld/:token,
+// the monthly owner report's unsubscribe (notify.report = off, also while coming_soon).
+// Own in-memory DB via the route's seam; env set and restored in finally — runSerial, tail.
+runSerial(async () => {
+  console.log("\n── S5-4: avmelding fra månedsrapporten (/rapport-avmeld) ──");
+  try {
+    const { runRapportAvmeldTests } = require("../src/routes/rapport-avmeld.test") as
+      typeof import("../src/routes/rapport-avmeld.test");
+    const r = await runRapportAvmeldTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rapport-avmeld: " + f);
+    console.log(`  rapport-avmeld: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rapport-avmeld: unexpected error: " + String(err?.message || err));
+  }
+});

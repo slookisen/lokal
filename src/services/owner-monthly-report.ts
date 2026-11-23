@@ -28,9 +28,13 @@
 //
 // Unsubscribe: a stateless signed token for this agent with its OWN purpose
 // string (avmeld-service.serverSignatureFor), so neither an /avmeld token nor
-// an S5-2 preview token validates as one and vice versa. The route that will
-// consume it (`/rapport-avmeld/:token` → notify.report = off) is NOT built in
-// this slice; the preview says so (`unsubscribe.route_live: false`).
+// an S5-2 preview token validates as one and vice versa. S5-4: the route that
+// consumes it is live — `/rapport-avmeld/:token` (routes/rapport-avmeld.ts):
+// GET confirms only, POST (or the RFC 8058 one-click body) sets
+// notify.report = off through recordOwnerReportUnsubscribe below, also while
+// the entry is coming_soon (registry `recipientOptOut`), and this builder then
+// answers would_send false / notify_report_off. The preview says so
+// (`unsubscribe.route_live: true`).
 
 import crypto from "crypto";
 import type Database from "better-sqlite3";
@@ -42,7 +46,7 @@ import { aiDeliveriesCountingSince } from "./profile-ai-deliveries-compute";
 import { isAnalyticsRollupReadEnabled } from "./analytics-rollup-boundary";
 import { LEGACY_AGENT_VIEW_SOURCE } from "../database/analytics-sql";
 import { getOwnerFeature, ownerFeatureRegistryFor, ownerFeatureStatus, type OwnerFeatureEntry, type OwnerFeatureStatus } from "../owner-features/registry";
-import { featureValue } from "../owner-features/resolve";
+import { featureValue, setOwnerFeatureValue, type SetOwnerFeatureResult } from "../owner-features/resolve";
 import { ownerPlannedAnchor, ownerRowAnchor } from "../owner-features/anchors";
 import { slugify } from "../utils/slug";
 
@@ -150,6 +154,26 @@ export function verifyOwnerReportUnsubToken(token: string): string | null {
   const parts = Buffer.from(payload.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8").split("\n");
   if (parts.length !== 2 || parts[0] !== "ru1" || !parts[1]) return null;
   return parts[1];
+}
+
+/** The value the report's unsubscribe link sets (registry notify.report.recipientOptOut). */
+export const OWNER_REPORT_OFF_VALUE = "off";
+
+/**
+ * S5-4: a recipient's unsubscribe — sets the RFB owner feature notify.report
+ * to "off" (one owner_feature_audit row when it changed, actor system,
+ * detail «rapport-avmeld»). Idempotent. Never touches the profile or the
+ * outreach suppression (email_bounces). Only ever writes "off".
+ */
+export function recordOwnerReportUnsubscribe(db: Db, agentId: string): SetOwnerFeatureResult {
+  return setOwnerFeatureValue(
+    "rfb",
+    agentId,
+    "notify.report",
+    OWNER_REPORT_OFF_VALUE,
+    { actor: "system", detail: "rapport-avmeld" },
+    { db, recipientOptOut: true },
+  );
 }
 
 // ── Metrics ─────────────────────────────────────────────────────────────────
@@ -372,7 +396,7 @@ export interface OwnerMonthlyReport extends OwnerMonthlyReportEmail {
   mineValgUrl: string;
   unsubscribeUrl: string | null;
   notifyReport: string | null;
-  /** The entry's run-time status (coming_soon = owners cannot change it yet; the default applies). */
+  /** The entry's run-time status (coming_soon = owners cannot change it yet; the default applies, except a recipient's unsubscribe). */
   notifyReportStatus: OwnerFeatureStatus;
   isOwner: boolean;
   wouldSend: boolean;

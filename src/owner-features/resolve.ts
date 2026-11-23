@@ -373,6 +373,13 @@ class Resolver {
     return { value: s.value, source: s.set_by === "owner" ? "owner" : "admin" };
   }
 
+  /** S5-4: the stored row when it holds the entry's recipient opt-out value, else undefined. */
+  storedRecipientOptOut(e: OwnerFeatureEntry): { value: OwnerFeatureValue; source: OwnerFeatureSource } | undefined {
+    if (e.recipientOptOut === undefined || e.storage) return undefined;
+    const x = this.explicitValue(e);
+    return x && sameValue(x.value, e.recipientOptOut) ? x : undefined;
+  }
+
   /** First unmet requirement's reason, or null when all are met. */
   unmetRequirement(e: OwnerFeatureEntry): LocalizedText | null {
     for (const r of e.requires) {
@@ -412,7 +419,14 @@ class Resolver {
     const s = this.stored.get(e.key);
     if (s && s.admin_locked) return fixed(s.value, "admin", "admin_locked", this.reasonAdmin());
     // 3. not changeable / requirements (a liveFlag entry with its flag off is coming_soon)
-    if (ownerFeatureStatus(e, this.env) === "coming_soon") return fixed(d, "default", "coming_soon", REASON_COMING_SOON);
+    //    S5-4: a stored recipient opt-out (entry.recipientOptOut) is honoured
+    //    while coming_soon; any other stored value is not (the default applies).
+    if (ownerFeatureStatus(e, this.env) === "coming_soon") {
+      const optOut = this.storedRecipientOptOut(e);
+      return optOut
+        ? fixed(optOut.value, optOut.source, "coming_soon", REASON_COMING_SOON)
+        : fixed(d, "default", "coming_soon", REASON_COMING_SOON);
+    }
     if (this.subject.segment === "unclaimed" && e.default.unclaimed === null) {
       return fixed(null, "locked", "not_applicable", REASON_NOT_APPLICABLE);
     }
@@ -645,6 +659,16 @@ export type SetOwnerFeatureResult =
   | { kind: "invalid_value"; reason: LocalizedText }
   | { kind: "ok"; changed: boolean; feature: ResolvedOwnerFeature };
 
+/** S5-4: setOwnerFeatureValue options; `recipientOptOut` only for /rapport-avmeld. */
+export interface SetOwnerFeatureOptions extends OwnerFeatureOptions {
+  recipientOptOut?: boolean;
+}
+
+const REASON_NOT_RECIPIENT_OPT_OUT: LocalizedText = {
+  no: "Avmeldingslenken kan bare slå dette av.",
+  en: "The unsubscribe link can only switch this off.",
+};
+
 /**
  * The owner sets one key. Runs in one transaction: re-resolve, check, write
  * (owner_feature_settings row, or the adapter column), and exactly one
@@ -652,6 +676,12 @@ export type SetOwnerFeatureResult =
  * Turning a key to its off value is allowed even when a requirement is unmet
  * (an owner can always drop a duty); every other block → `blocked`.
  * The caller has already checked ownership (isVerifiedOwner) and the allowlist.
+ *
+ * S5-4: `opts.recipientOptOut` (only the /rapport-avmeld route) writes the
+ * entry's `recipientOptOut` value and nothing else — any other value, or an
+ * entry without one, is `invalid_value` before anything is read or written.
+ * It is allowed while the entry is coming_soon (the only extra block it
+ * passes); kill switch and admin lock still block.
  */
 export function setOwnerFeatureValue(
   vertical: OwnerFeatureVertical,
@@ -659,13 +689,18 @@ export function setOwnerFeatureValue(
   key: string,
   rawValue: unknown,
   actor: { actor: "owner" | "admin" | "cs" | "system"; detail?: string | null; consent?: OwnerConsentStamp | null },
-  opts: OwnerFeatureOptions = {},
+  opts: SetOwnerFeatureOptions = {},
 ): SetOwnerFeatureResult {
   const registry = opts.registry ?? ownerFeatureRegistryFor(vertical);
   const e = findOwnerFeature(key, registry);
   if (!e) return { kind: "unknown_key" };
+  const optOutWrite = opts.recipientOptOut === true;
+  if (optOutWrite && (e.recipientOptOut === undefined || e.storage || e.confirmByEmail || !sameValue(rawValue as OwnerFeatureValue, e.recipientOptOut))) {
+    return { kind: "invalid_value", reason: REASON_NOT_RECIPIENT_OPT_OUT };
+  }
   const db = opts.db ?? getDb();
-  const ropts: OwnerFeatureOptions = { ...opts, db, registry };
+  const { recipientOptOut: _ro, ...baseOpts } = opts;
+  const ropts: OwnerFeatureOptions = { ...baseOpts, db, registry };
   // S2e: never a direct write, not even to the off value (the confirmation
   // flow owns the column).
   if (e.confirmByEmail) {
@@ -678,7 +713,7 @@ export function setOwnerFeatureValue(
     const r = makeResolver(vertical, subjectId, ropts);
     if (!r.subject.exists) return { kind: "not_found" };
     const before = r.resolve(key);
-    if (before.block && before.block !== "requirement_not_met") {
+    if (before.block && before.block !== "requirement_not_met" && !(optOutWrite && before.block === "coming_soon")) {
       return { kind: "blocked", block: before.block, reason: before.reason ?? REASON_COMING_SOON };
     }
     const v = validateOwnerFeatureValue(e, rawValue);
@@ -687,7 +722,7 @@ export function setOwnerFeatureValue(
     // No-op: compare with the explicit value (or the default when none).
     const x = r.explicitValue(e);
     const current = x ? x.value : d;
-    if (!sameValue(v.value, offValue(e, d))) {
+    if (!optOutWrite && !sameValue(v.value, offValue(e, d))) {
       // T10: an `enableRequires` condition only stops switching ON — a value
       // that is already on is never refused (or changed) because of it.
       const unmet = r.unmetRequirement(e) ?? (sameValue(current, v.value) ? null : r.unmetEnableRequirement(e));
