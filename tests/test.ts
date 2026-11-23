@@ -55477,3 +55477,22 @@ runSerial(async () => {
     failures.push("admin-owner-interest: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S5-2: read-only preview link
+// for segment B — POST /admin/agents/:id/preview-link + GET /forhandsvis/:token.
+// Own in-memory DB via the route's seam; env restored in finally — runSerial, tail.
+runSerial(async () => {
+  console.log("\n── S5-2: forhåndsvisning for segment B (forhandsvis) ──");
+  try {
+    const { runOwnerPreviewTests } = require("../src/routes/owner-preview.test") as
+      typeof import("../src/routes/owner-preview.test");
+    const r = await runOwnerPreviewTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-preview: " + f);
+    console.log(`  owner-preview: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-preview: unexpected error: " + String(err?.message || err));
+  }
+});
