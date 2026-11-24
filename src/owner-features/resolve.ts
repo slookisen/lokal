@@ -659,7 +659,7 @@ export type SetOwnerFeatureResult =
   | { kind: "invalid_value"; reason: LocalizedText }
   | { kind: "ok"; changed: boolean; feature: ResolvedOwnerFeature };
 
-/** S5-4: setOwnerFeatureValue options; `recipientOptOut` only for /rapport-avmeld and (S5-5) /milepael-avmeld. */
+/** S5-4: setOwnerFeatureValue options; `recipientOptOut` only for /rapport-avmeld, (S5-5) /milepael-avmeld and (S5-6) /endring-avmeld. */
 export interface SetOwnerFeatureOptions extends OwnerFeatureOptions {
   recipientOptOut?: boolean;
 }
@@ -677,7 +677,7 @@ const REASON_NOT_RECIPIENT_OPT_OUT: LocalizedText = {
  * (an owner can always drop a duty); every other block → `blocked`.
  * The caller has already checked ownership (isVerifiedOwner) and the allowlist.
  *
- * S5-4: `opts.recipientOptOut` (only the /rapport-avmeld and /milepael-avmeld routes) writes the
+ * S5-4: `opts.recipientOptOut` (only the /rapport-avmeld, /milepael-avmeld and /endring-avmeld routes) writes the
  * entry's `recipientOptOut` value and nothing else — any other value, or an
  * entry without one, is `invalid_value` before anything is read or written.
  * It is allowed while the entry is coming_soon (the only extra block it

@@ -319,7 +319,8 @@ export interface OwnerFeatureEntry {
   /**
    * S5-4: the value a recipient's one-click unsubscribe link sets
    * (notify.report → "off", /rapport-avmeld/:token; S5-5: notify.milestones
-   * → false, /milepael-avmeld/:token). RFB only. Written only through
+   * → false, /milepael-avmeld/:token; S5-6: notify.changes → false,
+   * /endring-avmeld/:token). RFB only. Written only through
    * setOwnerFeatureValue with `{ recipientOptOut: true }`, which accepts
    * exactly this value and nothing else, and is allowed even while the entry
    * is coming_soon. A stored value equal to it is honoured while coming_soon
@@ -839,6 +840,8 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     default: { owner: true, unclaimed: true },
     outward: true,
     surfaces: ["email:owner_changes"],
+    // S5-6: the daily change digest's one-click unsubscribe (/endring-avmeld/:token).
+    recipientOptOut: false,
   }),
 
   // ── Hjelp med å holde profilen oppdatert ────────────────────────────────

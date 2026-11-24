@@ -55585,3 +55585,23 @@ runSerial(async () => {
     failures.push("owner-milestone-preview: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S5-6: daily change-digest owner
+// e-mail template + admin-only preview GET /admin/agents/:id/owner-changes-preview and
+// its unsubscribe /endring-avmeld/:token (notify.changes = false).
+// Own in-memory DB via the routes' seams; env set and restored in finally — runSerial, tail.
+runSerial(async () => {
+  console.log("\n── S5-6: endringsvarsel til eier (mal + admin-forhåndsvisning + avmelding) ──");
+  try {
+    const { runOwnerChangesPreviewTests } = require("../src/routes/admin-owner-changes-preview.test") as
+      typeof import("../src/routes/admin-owner-changes-preview.test");
+    const r = await runOwnerChangesPreviewTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-changes-preview: " + f);
+    console.log(`  owner-changes-preview: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-changes-preview: unexpected error: " + String(err?.message || err));
+  }
+});
