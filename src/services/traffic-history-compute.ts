@@ -50,10 +50,21 @@ type Db = Database.Database;
  * Bump when a summary's numbers change meaning; rows of an older version are
  * recomputed while their raw days exist (planHistoryItems, and the prune's
  * ensureTrafficHistoryForDaySync), and kept as they are once those are gone.
- * 4: aiLookups (dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S0).
- * 5: aiAgents (vendor × purpose, G2-S2). Rows stored at version 4 have no
- *    aiAgents, so they are recomputed while their raw days exist.
- * 6: scraper burst rule (traffic-classifier.ts SCRAPER_BURST_VIEWS: >=10 page
+ *
+ * Changelog — one line per version, with the merge date on main and the PR.
+ * Reports cite this list when `version` changes (GET /admin/analytics/history);
+ * add a line here with every bump.
+ * 1: 2026-10-13 (62b9a1e) — first stored history beyond the 60-day raw window.
+ * 2: 2026-10-19 (lokal#1077) — AI click sources: host matching, new AI hosts,
+ *    UTM allowlist, classifyAiClickSource, human filter in the UTM widget.
+ * 3: 2026-10-21 (lokal#1211) — Claude-SearchBot counted as ai_crawler (was
+ *    ai_search); bot sessions get storedClientClass retroactively.
+ * 4: 2026-10-22 (lokal#1226) — aiLookups (dev-request
+ *    2026-10-22-statistikk-samme-tall-12-mnd, S0).
+ * 5: 2026-10-25 (lokal#1244) — aiAgents (vendor × purpose, G2-S2). Rows stored
+ *    at version 4 have no aiAgents, so they are recomputed while their raw
+ *    days exist.
+ * 6: 2026-11-15 (lokal#1554) — scraper burst rule (traffic-classifier.ts SCRAPER_BURST_VIEWS: >=10 page
  *    views within 60 s). Sessions move from human to scraper; totals are
  *    unchanged. Days still in the raw rows are recomputed at version 6; days
  *    already pruned keep version 5, and traffic-alerts.ts flags any compared
