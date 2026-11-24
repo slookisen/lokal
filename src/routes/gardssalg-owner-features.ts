@@ -477,7 +477,7 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
     return { ok: true, text, undoBatchId: undoable && undoable.id === batch.id ? batch.id : null };
   }
 
-  function variantFor(slug: string): OwnerPageVariant {
+  function variantFor(slug: string, inDashboard = false): OwnerPageVariant {
     return {
       vertical: VERTICAL,
       platformName: "Opplevagent",
@@ -489,6 +489,9 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
       statusKeys: GARDSSALG_OWNER_PAGE_STATUS_KEYS,
       revealKey: "booking.enabled",
       pauseResumeDate: false,
+      // Slice 7 (dev-request 2026-11-24-opplevagent-eierdashbord-lyst-tema-og-
+      // testfunn): in the dashboard shell the menu leads back to «Oversikt».
+      ...(inDashboard ? { hideBack: true } : {}),
     };
   }
 
@@ -756,11 +759,13 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
           : {}),
       };
 
+      // O2-1: inside the dashboard shell when it is on; off = as before.
+      const inDashboard = gardssalgOwnerDashboardActiveFor(provider.id);
       const model: OwnerPageModel = {
         agent: { id: provider.id, name: String(provider.navn || "") },
         resolved,
         registry,
-        variant: variantFor(slug),
+        variant: variantFor(slug, inDashboard),
         level: currentOwnerLevel(VERTICAL, provider.id, resolved, { registry }),
         showIntro: false,
         notice,
@@ -791,9 +796,9 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
       // Lyst tema (2026-11-24): the shared page CSS carries RFB's dark block;
       // the gårdssalg page gets the light-only copy, RFB's stays as it is.
       const body = renderOwnerFeaturesPageBody(model).replace(`<style>${OWNER_PAGE_CSS}</style>`, () => `<style>${OWNER_PAGE_CSS_LIGHT}</style>`);
-      // O2-1: inside the dashboard shell when it is on; off = as before.
-      const pageHtml = gardssalgOwnerDashboardActiveFor(provider.id) ? wrapGardssalgDashboard(slug, "valg", body) : body;
-      return res.send(shell(`Mine valg · ${provider.navn}`, `${pageHtml}<style>${GARDSSALG_PAGE_CSS}</style>`));
+      // Slice 7: in the shell, no text on the page is smaller than 13px.
+      const pageHtml = inDashboard ? wrapGardssalgDashboard(slug, "valg", body) : body;
+      return res.send(shell(`Mine valg · ${provider.navn}`, `${pageHtml}<style>${GARDSSALG_PAGE_CSS}</style>${inDashboard ? `<style>${GARDSSALG_DASHBOARD_MIN_TEXT_CSS}</style>` : ""}`));
     } catch (e) {
       return fail("GET valg")(res, e);
     }
@@ -1075,4 +1080,16 @@ export const GARDSSALG_PAGE_CSS = `
   .mv-level[aria-current="true"] { border-color: #0f5a50; box-shadow: inset 0 0 0 1px #0f5a50; }
   .mv-confirm { border-color: #0f5a50; }
   @media (max-width: 480px) { .ep-card { padding: 18px 14px; } .ep-card h1 { font-size: 1.25rem; } }
+`;
+
+/**
+ * Slice 7 (dev-request 2026-11-24-opplevagent-eierdashbord-lyst-tema-og-
+ * testfunn): «Mine valg» inside the gårdssalg dashboard shell has no text
+ * under 13px. Appended after every other style on that page only, so the
+ * same selectors win; the shared CSS (Rett fra Bonden's included) and the
+ * page outside the shell are unchanged.
+ */
+export const GARDSSALG_DASHBOARD_MIN_TEXT_CSS = `
+  .mv-badge, .mv-stat small, .ep-audit-meta, .gc-field .gc-hint, .gc-stat-label, .ow-nav-badge { font-size: 0.8125rem; }
+  @media (max-width: 899.98px) { .ow-nav-item, .ow-more > summary { font-size: 0.8125rem; } }
 `;

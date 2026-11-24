@@ -35,7 +35,7 @@ import { archiveGardssalgClaimMail, isGardssalgClaimWelcomeEmailEnabled, GARDSSA
 import { generalLimiter } from "../middleware/security";
 import { ownerBookingEnableBlock, type OwnerBookingBlock } from "../services/gardssalg-booking-gate";
 import { createGardssalgOwnerFeaturesRouter, gardssalgOversiktHtml, gardssalgOwnerDashboardOnForSession, gardssalgOwnerFeaturesTabOpen } from "./gardssalg-owner-features";
-import { wrapGardssalgDashboard } from "../owner-ui/gardssalg-dashboard";
+import { gardssalgDashboardPath, wrapGardssalgDashboard } from "../owner-ui/gardssalg-dashboard";
 import { CLAIM_LINK_TEXTS, CLAIM_CONFIRM_TEXTS, MANUAL_CLAIM_TEXTS, MANUAL_CLAIM_FORM_TEXTS_NOT_APPROVED } from "./gardssalg-claim-texts";
 import { isManualClaimQueueEnabled, isManualClaimReceiptEnabled, sendManualClaimMail, submitManualClaim } from "../services/gardssalg-manual-claims";
 
@@ -619,6 +619,17 @@ router.get("/kategori/gardssalg/eier/:providerSlug", generalLimiter, async (req:
     const slug = String((req.params as any).providerSlug || "");
     const provider = getClaimProviderBySlug(slug);
     if (!provider) return res.status(404).send(notFoundPage());
+
+    // Slice 5 (dev-request 2026-11-24-opplevagent-eierdashbord-lyst-tema-og-
+    // testfunn): the logged-in owner of THIS profile, with the owner dashboard
+    // on, goes straight to «Oversikt» instead of «Er dette din bedrift?».
+    // Same session helper and dashboard gate as the portal itself; anyone
+    // else (no or invalid session, another profile's owner, dashboard off)
+    // gets the claim page exactly as before. Checked before the address
+    // harvest, so the redirect costs the producer's website nothing.
+    if (gardssalgOwnerDashboardOnForSession(provider.id, sessionFromRequest(req))) {
+      return res.redirect(302, gardssalgDashboardPath(slug, "oversikt"));
+    }
 
     // Must mirror issueClaimMagicLink()'s own derivation exactly — otherwise
     // this page could show the "send me a link" form for a provider whose

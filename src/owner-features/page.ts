@@ -118,6 +118,11 @@ export interface OwnerPageVariant {
   pagePath: (tail: string) => string;
   /** «Tilbake til eierportalen». */
   backHref: string;
+  /**
+   * Gårdssalg dashboard shell: the menu already leads back to «Oversikt», so
+   * the page drops its «Tilbake til eierportalen» button. Unset = the button.
+   */
+  hideBack?: boolean;
   groups: Array<{ key: OwnerFeatureGroup; label: LocalizedText }>;
   levels: readonly OwnerLevel[];
   /** «Slik er du nå» keys (only the built ones show). */
@@ -1403,8 +1408,8 @@ export function renderOwnerFeaturesPageBody(m: OwnerPageModel): string {
       <div class="ep-card">
         <h1>Mine valg</h1>
         <p><strong>${esc(m.agent.name)}</strong>. Endringer lagres med en gang, og du kan angre den siste.</p>
-        <div class="ep-form-actions"><a class="ep-btn ep-btn-secondary" href="${esc(back)}">Tilbake til eierportalen</a></div>
-        ${jumpNavHtml(m, registry)}
+        ${m.variant?.hideBack ? "" : `<div class="ep-form-actions"><a class="ep-btn ep-btn-secondary" href="${esc(back)}">Tilbake til eierportalen</a></div>
+        `}${jumpNavHtml(m, registry)}
       </div>
       ${m.todayHtml ? `${m.todayHtml}\n      ` : ""}${html("statistikk")}
       ${html(OWNER_ANCHOR_LEVEL)}
