@@ -274,6 +274,22 @@ export function runGardssalgOwnerDashboardO24Tests(opts: { log?: boolean } = {})
       const card = (/<section class="gc-card gs-statistikk"[\s\S]*?<\/section>/.exec(a.body) || [""])[0];
       assertTrue(card !== "" && !/\bkr\b|%|vol\.|alkohol|smak|pris/i.test(card), "t4: no price, strength, tasting or product words");
 
+      // ── AK7 (dev-request 2026-11-24-…-testfunn, slice 6): label left, number right ─
+      {
+        const css = st.GARDSSALG_STATS_CSS;
+        const rule = (sel: string) => (new RegExp(`(?:^|\\n)${sel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} \\{([^}]*)\\}`).exec(css) || ["", ""])[1];
+        assertTrue(a.body.includes(`<style>${css}</style>`), "AK7a: the «Statistikk» page carries the number-table CSS");
+        assertTrue(/width:\s*100%/.test(rule(".gs-st-tall")) && /border-collapse:\s*collapse/.test(rule(".gs-st-tall")), "AK7b: both tables fill the card (width 100%), so the columns line up");
+        assertTrue(/text-align:\s*left/.test(rule(".gs-st-tall th")), "AK7c: the label cell is left-aligned");
+        assertTrue(/text-align:\s*right/.test(rule(".gs-st-tall td")) && /white-space:\s*nowrap/.test(rule(".gs-st-tall td")), "AK7d: the number cell is right-aligned and never wraps");
+        assertTrue(/padding-right:\s*1\d+px/.test(rule(".gs-st-tall th")) && /padding-left:\s*1\d+px/.test(rule(".gs-st-tall td")), "AK7e: a gap between label and number");
+        assertTrue(/overflow-wrap:\s*anywhere/.test(rule(".gs-st-tall th")), "AK7f: a long label (the AI row) wraps inside its own cell");
+        const widths = [...css.matchAll(/(?:^|[;{\s])(?:min-)?width:\s*(\d+)px/g)].map((m) => Number(m[1]));
+        assertTrue(widths.every((w) => w <= 390) && !/table-layout:\s*fixed/.test(css), "AK7g: no fixed width above 390 px, no fixed table layout (no horizontal scroll at 390 px)");
+        assertTrue(!/prefers-color-scheme/.test(css), "AK7h: no dark-mode rule added");
+        assertEq((card.match(/<table class="gs-st-tall"/g) || []).length, 2, "AK7i: both tables (requests and AI) use the same aligned layout");
+      }
+
       // ── pure model: the mapping ───────────────────────────────────────
       {
         const m = st.statistikkModel(store.listProviderBookings("o24-a", Number.MAX_SAFE_INTEGER), new Date());

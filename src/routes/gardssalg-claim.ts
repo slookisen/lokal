@@ -935,6 +935,10 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
     // goes under the name card. Off = "" and the page exactly as before.
     const dashboardOn = gardssalgOwnerDashboardOnForSession(provider.id, session);
     const overviewHtml = dashboardOn ? gardssalgOversiktHtml(provider.id, slug) : "";
+    // Slice 4 (dev-request 2026-11-24-opplevagent-eierdashbord-lyst-tema-og-
+    // testfunn): with the dashboard on, the numbers live in «Statistikk» only —
+    // «Oversikt» drops the old stats box (and its fetch), which showed «Med i
+    // AI-søk» twice with labels unlike the tab's. Off = the box as before.
 
     const body = `
       <div class="gc-card">
@@ -990,14 +994,14 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
         <form id="gc-release-form" method="post" action="${releaseAction}"></form>
       </div>
       ${mineValg && ownerControlsVisibility(visibilityState) ? mineValgMovedCardHtml(slug) : visibilityCardHtml(slug, visibilityState)}
-      <div class="gc-card">
+      ${dashboardOn ? "" : `<div class="gc-card">
         <h2>Statistikk</h2>
         <div id="gc-stats" class="gc-stats"><div class="gc-stat"><div class="gc-stat-num">…</div><div class="gc-stat-label">Laster</div></div></div>
         <p id="gc-stats-note" style="margin-top:12px;color:#737373;font-size:0.82rem;"></p>
       </div>
-      <script>
+      `}<script>
       (function () {
-        fetch("/api/opplevelser/gardssalg-claim/${encodeURIComponent(provider.id)}/stats", { credentials: "same-origin" })
+        ${dashboardOn ? "" : `fetch("/api/opplevelser/gardssalg-claim/${encodeURIComponent(provider.id)}/stats", { credentials: "same-origin" })
           .then(function (r) { return r.json(); })
           .then(function (j) {
             var el = document.getElementById("gc-stats");
@@ -1021,7 +1025,7 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
               note.textContent = "Ikke tilgjengelig ennå: " + j.stats.notAvailable.join(", ") + ".";
             }
           }).catch(function () {});
-
+`}
         var gcDescribeSaveOutcome = ${describeSaveOutcome.toString()};
 
         var form = document.getElementById("gc-profile-form");
