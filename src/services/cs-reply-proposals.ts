@@ -902,6 +902,51 @@ export function rejectProposal(id: string, reason: string, actor: "daniel" | "cl
   return { ok: true };
 }
 
+/**
+ * Daniel answered the thread himself (POST /admin/crm/threads/:id/send) —
+ * dev-request 2026-11-23-crm-send-dobbeltsending-og-tydelig-kvittering,
+ * point 3. Unsent proposals on THAT thread that are still waiting (worker
+ * queue or approval queue) are now stale: mark them `superseded` with the
+ * same `allerede_besvart` reason evaluateProposal() uses, and release their
+ * outbox rows the same way createReplyProposal() does. Proposals already
+ * approved/sending/sent/failed/rejected, and every other thread, are left
+ * alone. Returns the ids that were superseded.
+ */
+export function supersedePendingProposalsForThread(
+  threadId: string,
+  opts: { actor: "daniel" | "claude"; crmMessageId?: string | null; now?: Date },
+): string[] {
+  const db = getDb();
+  const ts = nowIso(opts.now ?? new Date());
+  const detail = `eget svar sendt i tråden${opts.crmMessageId ? ` (${opts.crmMessageId})` : ""}`;
+  const superseded: string[] = [];
+  const tx = db.transaction(() => {
+    const open = db
+      .prepare(`SELECT id, outbox_id FROM cs_reply_proposals WHERE thread_id = ? AND status IN ('pending', 'approval_needed')`)
+      .all(threadId) as Array<{ id: string; outbox_id: string | null }>;
+    for (const o of open) {
+      if (o.outbox_id) db.prepare(`UPDATE crm_outbox SET status = 'superseded' WHERE id = ? AND status IN ('pending', 'processing', 'failed')`).run(o.outbox_id);
+      const r = db
+        .prepare(
+          `UPDATE cs_reply_proposals SET status = 'superseded', block_reason = 'allerede_besvart', block_detail = ?, updated_at = ?
+            WHERE id = ? AND status IN ('pending', 'approval_needed')`,
+        )
+        .run(detail, ts, o.id);
+      if (r.changes > 0) superseded.push(o.id);
+    }
+  });
+  tx();
+  if (superseded.length > 0) {
+    crmService.logAction({
+      threadId,
+      type: "proposal_superseded",
+      actor: opts.actor,
+      payload: { proposalIds: superseded, reason: "allerede_besvart", crmMessageId: opts.crmMessageId ?? null },
+    });
+  }
+  return superseded;
+}
+
 export interface ProposalListItem extends ProposalRow {
   thread_subject: string | null;
   contact_name: string | null;

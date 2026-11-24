@@ -105,6 +105,20 @@ const VENDOR_DOMAINS = new Set([
   "intercom.com", "linear.app", "notion.so", "atlassian.com",
 ]);
 
+/**
+ * Normalization the double-send guard compares on: Unicode NFC, CRLF/CR to
+ * LF, every whitespace run collapsed to one space, trimmed. Two bodies that
+ * only differ in invisible spacing are the same reply.
+ */
+export function normalizeOutboundBody(text: string): string {
+  return String(text ?? "").normalize("NFC").replace(/\r\n?/g, "\n").replace(/\s+/g, " ").trim();
+}
+
+/** Recipient set as a comparable key: lower-cased, trimmed, de-duplicated, sorted. */
+export function normalizeRecipients(emails: string[]): string {
+  return Array.from(new Set(emails.map((e) => String(e).trim().toLowerCase()).filter(Boolean))).sort().join(",");
+}
+
 class CrmService {
   // ─── Contacts ───────────────────────────────────────────────
 
@@ -883,22 +897,48 @@ class CrmService {
    * not a soft warning: there is no legitimate reason to send the exact same
    * reply twice within `windowSeconds`, so there is nothing for a human to
    * weigh — this is closer to a validation error than a judgment call.
+   *
+   * Widened by dev-request 2026-11-23-crm-send-dobbeltsending-og-tydelig-
+   * kvittering (point 2): the match is now the NORMALIZED subject+body
+   * (whitespace / line endings, see normalizeOutboundBody) to the same
+   * recipient set, not byte-identical subject+body, inside a 10-minute
+   * window; failed attempts no longer count — a failed send must stay
+   * retryable. A changed subject still counts as a deliberate new reply
+   * (the escape hatch the 409 has always named).
    */
-  findRecentIdenticalOutbound(
+  findRecentDuplicateOutbound(
     threadId: string,
+    toEmails: string[],
     subject: string,
     bodyText: string,
-    windowSeconds = 30,
-  ): { id: string; received_at: string } | null {
+    windowSeconds = 600,
+  ): { id: string; received_at: string; delivery_status: string } | null {
     const db = getDb();
-    const row = db.prepare(`
-      SELECT id, received_at FROM crm_messages
+    // Only rows that went out or are on their way: a 'failed' attempt must
+    // stay retryable with the same text. The in-flight resend_send
+    // reservation ('queued') is what makes this guard race-safe — see the
+    // reservation comment in POST /threads/:id/send.
+    const rows = db.prepare(`
+      SELECT id, received_at, delivery_status, to_emails, subject, body_text FROM crm_messages
       WHERE thread_id = ? AND direction = 'out'
-        AND subject = ? AND body_text = ?
+        AND delivery_status IN ('sent', 'queued', 'draft_in_gmail')
         AND received_at >= datetime('now', '-' || ? || ' seconds')
-      ORDER BY received_at DESC LIMIT 1
-    `).get(threadId, subject, bodyText, windowSeconds) as { id: string; received_at: string } | undefined;
-    return row ?? null;
+      ORDER BY received_at DESC
+    `).all(threadId, windowSeconds) as Array<{
+      id: string; received_at: string; delivery_status: string; to_emails: string | null; subject: string | null; body_text: string | null;
+    }>;
+    const wantSubject = normalizeOutboundBody(subject);
+    const wantBody = normalizeOutboundBody(bodyText);
+    const wantTo = normalizeRecipients(toEmails);
+    for (const r of rows) {
+      if (normalizeOutboundBody(r.body_text ?? "") !== wantBody) continue;
+      if (normalizeOutboundBody(r.subject ?? "") !== wantSubject) continue;
+      let stored: unknown = [];
+      try { stored = JSON.parse(r.to_emails ?? "[]"); } catch { stored = []; }
+      if (normalizeRecipients(Array.isArray(stored) ? stored.map(String) : []) !== wantTo) continue;
+      return { id: r.id, received_at: r.received_at, delivery_status: r.delivery_status };
+    }
+    return null;
   }
 
   // ─── Compose a brand-new outbound thread ──────────────────
