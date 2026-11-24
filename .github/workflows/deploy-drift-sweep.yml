@@ -5,26 +5,55 @@
 # the merge land within its ~12 s poll and dispatches it. An auto-merge that
 # lands later never deploys (lokal#1569 / #1578, 2026-11-16).
 #
-# Every 5 min this compares main's head with prod's /health.git_sha and, when
-# main is strictly ahead (compare status `ahead`) for longer than the grace
-# period in scripts/deploy-drift.js (GRACE_MINUTES = 10 → worst case ~15 min),
-# with no fly-deploy run underway or already done for that sha, dispatches
-# fly-deploy.yml on main. workflow_dispatch is the documented exception that
-# GITHUB_TOKEN may trigger. Never deploys backwards: behind/diverged → no-op.
+# The sweep compares main's head with prod's /health.git_sha and, when main is
+# strictly ahead (compare status `ahead`) for longer than the grace period in
+# scripts/deploy-drift.js (GRACE_MINUTES = 10), with no fly-deploy run underway
+# or already done for that sha, dispatches fly-deploy.yml on main.
+# workflow_dispatch is the documented exception that GITHUB_TOKEN may trigger.
+# Never deploys backwards: behind/diverged → no-op.
+#
+# Triggers:
+#   - workflow_run (completed) of "Fly Deploy" and "Fleet auto-approve" — the
+#     primary, event-driven path. PR CI ("Fly Deploy" on pull_request) finishing
+#     is what lets GitHub's auto-merge land; a gate run finishing is when
+#     auto-merge got enabled. Those completions fire workflow_run even though
+#     the later GITHUB_TOKEN merge itself fires nothing. In this mode the run
+#     does a cheap pre-check and exits within seconds when prod == main and no
+#     open PR into main has auto-merge enabled. Otherwise it re-evaluates every
+#     POLL_SECONDS (60 s), for at most MAX_WAIT_MINUTES (18), while main is
+#     ahead but within grace or (for ≤ AUTO_MERGE_WAIT_MINUTES = 7) while prod
+#     == main and an auto-merge PR is still open; it stops at the first
+#     `dispatch` (dispatched once, exactly as before) or any terminal no-op. So
+#     a merge that lands outside the gate window is dispatched ~GRACE + 1 min
+#     after it lands, without depending on cron. Logic: shouldKeepWaiting().
+#   - schedule (*/5) — backstop only; GitHub drops most scheduled runs (≈3/day
+#     observed), so it is not relied upon. Evaluates once.
+#   - workflow_dispatch — manual, evaluates once.
+# No redeploy loop: a fly-deploy run the sweep dispatched completing triggers
+# the sweep again, which then sees prod == main (exit) or a completed deploy run
+# for main's head (terminal no-op, never redispatched). The sweep does not list
+# itself as a workflow_run source.
+# Concurrency: one group, no cancel-in-progress — GitHub keeps one running and
+# one pending run, extra events coalesce. A waiting run never blocks a needed
+# dispatch: it re-reads main each poll and dispatches itself once grace passes;
+# the pending run re-checks fresh state when it starts.
 #
 # Rollbacks: if main's head was ever deployed (push or workflow_dispatch run
 # of fly-deploy.yml, any conclusion) and prod still reports an older commit,
 # the sweep assumes a failure or a Fly-level rollback (`fly releases rollback`
 # / `fly deploy --image`) and only warns — it never redeploys over it.
 # Pause switch: set repo variable DEPLOY_DRIFT_SWEEP_DISABLED=true (Settings →
-# Variables → Actions) and the sweep exits without calling any API; delete the
-# variable or set it to anything else to resume.
+# Variables → Actions) and the sweep exits without calling any API, for every
+# trigger; delete the variable or set it to anything else to resume.
 # Decision logic + tests: scripts/deploy-drift.js, tests/deploy-drift.test.ts.
 # dev-request 2026-11-16-fleet-gate-dispatch-sen-automerge.
 
 name: Deploy drift sweep
 
 on:
+  workflow_run:
+    workflows: ["Fly Deploy", "Fleet auto-approve"]
+    types: [completed]
   schedule:
     - cron: '*/5 * * * *'
   workflow_dispatch:
@@ -32,6 +61,7 @@ on:
 permissions:
   actions: write
   contents: read
+  pull-requests: read   # list open PRs into main with auto-merge enabled (workflow_run mode)
 
 concurrency:
   group: deploy-drift-sweep
@@ -40,7 +70,8 @@ concurrency:
 jobs:
   sweep:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # workflow_run mode waits up to MAX_WAIT_MINUTES (18) plus API time.
+    timeout-minutes: 22
     steps:
       - name: Pause switch
         id: pause
@@ -67,9 +98,16 @@ jobs:
         with:
           script: |
             const path = require('path');
-            const { decideDeployDrift, parseHealth, GRACE_MINUTES } =
-              require(path.join(process.env.GITHUB_WORKSPACE, 'scripts', 'deploy-drift.js'));
+            const {
+              decideDeployDrift, parseHealth, countPendingAutoMerge, shouldKeepWaiting,
+              GRACE_MINUTES, POLL_SECONDS,
+            } = require(path.join(process.env.GITHUB_WORKSPACE, 'scripts', 'deploy-drift.js'));
             const { owner, repo } = context.repo;
+            const eventDriven = context.eventName === 'workflow_run';
+            if (eventDriven) {
+              const up = context.payload.workflow_run || {};
+              core.info(`triggered by workflow_run: "${up.name}" #${up.run_number} (${up.event}, ${up.conclusion})`);
+            }
 
             const bail = async (what, e) => {
               const line = `Deploy drift sweep: **noop** — ${what} failed: ${e.message} — fail closed`;
@@ -77,61 +115,100 @@ jobs:
               await core.summary.addRaw(line + '\n').write();
             };
 
-            let head;
-            try {
-              ({ data: head } = await github.rest.repos.getCommit({ owner, repo, ref: 'main' }));
-            } catch (e) {
-              await bail('getCommit(main)', e);
-              return;
-            }
-            const mainSha = head.sha;
-            const mainCommittedAt = head.commit?.committer?.date || null;
-
-            let health;
-            try {
-              const res = await fetch('https://rettfrabonden.com/health', {
-                signal: AbortSignal.timeout(10000),
-                headers: { accept: 'application/json' },
-              });
-              health = res.ok ? parseHealth(await res.text()) : { ok: false, error: `/health HTTP ${res.status}` };
-            } catch (e) {
-              health = { ok: false, error: `/health fetch failed: ${e.message}` };
-            }
-
-            let compareStatus = null;
-            if (health.ok && health.sha !== mainSha) {
+            // One evaluation. Returns { decision } or { failed: true } (already reported).
+            const evaluate = async () => {
+              let head;
               try {
-                const { data } = await github.rest.repos.compareCommitsWithBasehead({
-                  owner, repo, basehead: `${health.sha}...${mainSha}`, per_page: 1,
-                });
-                compareStatus = data.status;
+                ({ data: head } = await github.rest.repos.getCommit({ owner, repo, ref: 'main' }));
               } catch (e) {
-                core.warning(`compare ${health.sha}...${mainSha} failed: ${e.message}`);
+                await bail('getCommit(main)', e);
+                return { failed: true };
               }
-            }
+              const mainSha = head.sha;
+              const mainCommittedAt = head.commit?.committer?.date || null;
 
-            const runsById = new Map();
-            const listRuns = async (params) => {
-              const { data } = await github.rest.actions.listWorkflowRuns({
-                owner, repo, workflow_id: 'fly-deploy.yml', per_page: 50, ...params,
-              });
-              for (const r of data.workflow_runs) runsById.set(r.id, r);
+              let health;
+              try {
+                const res = await fetch('https://rettfrabonden.com/health', {
+                  signal: AbortSignal.timeout(10000),
+                  headers: { accept: 'application/json' },
+                });
+                health = res.ok ? parseHealth(await res.text()) : { ok: false, error: `/health HTTP ${res.status}` };
+              } catch (e) {
+                health = { ok: false, error: `/health fetch failed: ${e.message}` };
+              }
+
+              // prod == main (or /health unusable) is decided before compare/runs
+              // are consulted — skip those API calls (cheap pre-check).
+              const needsMore = health.ok && health.sha !== mainSha;
+
+              let compareStatus = null;
+              if (needsMore) {
+                try {
+                  const { data } = await github.rest.repos.compareCommitsWithBasehead({
+                    owner, repo, basehead: `${health.sha}...${mainSha}`, per_page: 1,
+                  });
+                  compareStatus = data.status;
+                } catch (e) {
+                  core.warning(`compare ${health.sha}...${mainSha} failed: ${e.message}`);
+                }
+              }
+
+              let runs = [];
+              if (needsMore) {
+                const runsById = new Map();
+                const listRuns = async (params) => {
+                  const { data } = await github.rest.actions.listWorkflowRuns({
+                    owner, repo, workflow_id: 'fly-deploy.yml', per_page: 50, ...params,
+                  });
+                  for (const r of data.workflow_runs) runsById.set(r.id, r);
+                };
+                try {
+                  await listRuns({ branch: 'main' });
+                  await listRuns({ head_sha: mainSha });
+                } catch (e) {
+                  await bail('listWorkflowRuns(fly-deploy.yml)', e);
+                  return { failed: true };
+                }
+                runs = [...runsById.values()].map((r) => ({
+                  event: r.event, status: r.status, conclusion: r.conclusion,
+                  head_sha: r.head_sha, updated_at: r.updated_at,
+                }));
+              }
+
+              return {
+                decision: decideDeployDrift({
+                  mainSha, mainCommittedAt, health, compareStatus, runs, now: new Date(),
+                }),
+              };
             };
-            try {
-              await listRuns({ branch: 'main' });
-              await listRuns({ head_sha: mainSha });
-            } catch (e) {
-              await bail('listWorkflowRuns(fly-deploy.yml)', e);
-              return;
-            }
-            const runs = [...runsById.values()].map((r) => ({
-              event: r.event, status: r.status, conclusion: r.conclusion,
-              head_sha: r.head_sha, updated_at: r.updated_at,
-            }));
 
-            const decision = decideDeployDrift({
-              mainSha, mainCommittedAt, health, compareStatus, runs, now: new Date(),
-            });
+            // Open PRs into main with auto-merge enabled (only needed while prod == main).
+            const pendingAutoMerge = async () => {
+              try {
+                const pulls = await github.paginate(github.rest.pulls.list, {
+                  owner, repo, state: 'open', base: 'main', per_page: 100,
+                });
+                return countPendingAutoMerge(pulls);
+              } catch (e) {
+                core.warning(`pulls.list failed: ${e.message} — treating as no pending auto-merge`);
+                return 0;
+              }
+            };
+
+            const startedAt = new Date();
+            let decision;
+            for (let attempt = 1; ; attempt++) {
+              const r = await evaluate();
+              if (r.failed) return;
+              decision = r.decision;
+              if (!eventDriven) break;
+              const pending = decision.code === 'in_sync' ? await pendingAutoMerge() : 0;
+              const ctl = shouldKeepWaiting(decision, { pendingAutoMerge: pending, startedAt, now: new Date() });
+              core.info(`#${attempt}: ${decision.action}/${decision.code} — ${decision.reason} → ${ctl.wait ? 'wait' : 'stop'}: ${ctl.reason}`);
+              if (!ctl.wait) break;
+              await new Promise((res) => setTimeout(res, POLL_SECONDS * 1000));
+            }
 
             if (decision.action === 'dispatch') {
               try {
@@ -146,6 +223,7 @@ jobs:
               }
             }
 
-            const line = `Deploy drift sweep (grace ${GRACE_MINUTES} min): **${decision.action}** — ${decision.reason}`;
+            const mode = eventDriven ? `workflow_run, ${((Date.now() - startedAt.getTime()) / 60000).toFixed(1)} min` : context.eventName;
+            const line = `Deploy drift sweep (grace ${GRACE_MINUTES} min, ${mode}): **${decision.action}** — ${decision.reason}`;
             if (decision.level === 'warning') core.warning(line); else core.info(line);
             await core.summary.addRaw(line + '\n').write();

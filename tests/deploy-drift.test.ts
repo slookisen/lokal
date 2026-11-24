@@ -13,7 +13,15 @@
 const drift = require("../scripts/deploy-drift.js") as {
   GRACE_MINUTES: number;
   parseHealth: (text: unknown) => { ok: boolean; sha?: string; error?: string };
-  decideDeployDrift: (input: Record<string, unknown>) => { action: string; reason: string; level: string };
+  MAX_WAIT_MINUTES: number;
+  AUTO_MERGE_WAIT_MINUTES: number;
+  POLL_SECONDS: number;
+  decideDeployDrift: (input: Record<string, unknown>) => { action: string; reason: string; level: string; code: string };
+  countPendingAutoMerge: (pulls: unknown) => number;
+  shouldKeepWaiting: (
+    decision: { action: string; code?: string } | null,
+    ctx: Record<string, unknown>,
+  ) => { wait: boolean; reason: string };
 };
 
 export interface TestSummary {
@@ -68,7 +76,8 @@ export function runDeployDriftTests(opts: { log?: boolean } = {}): TestSummary {
     }
   }
 
-  // Grace + cron interval must stay within the 15-min detection budget.
+  // Grace + cron interval must stay within the 15-min detection budget (cron is
+  // now only a backstop; the event-driven path is bounded by MAX_WAIT_MINUTES).
   assertTrue(drift.GRACE_MINUTES + 5 <= 15, "GRACE_MINUTES + 5-min cron <= 15 min");
 
   // parseHealth
@@ -171,6 +180,76 @@ export function runDeployDriftTests(opts: { log?: boolean } = {}): TestSummary {
   expectAction(base({ health: drift.parseHealth("not json") }), "noop", "health non-JSON → noop");
   expectAction(base({ mainCommittedAt: null }), "noop", "unknown commit date → noop");
   expectAction(base({ mainSha: "" }), "noop", "unknown main sha → noop");
+
+  // decision codes (stable tags consumed by shouldKeepWaiting)
+  const code = (over: Record<string, unknown>) => drift.decideDeployDrift(base(over)).code;
+  assertTrue(code({ health: { ok: true, sha: MAIN } }) === "in_sync", "code: prod == main → in_sync");
+  assertTrue(code({ mainCommittedAt: minsAgo(3) }) === "within_grace", "code: ahead within grace → within_grace");
+  assertTrue(code({}) === "dispatch", "code: dispatch → dispatch");
+  assertTrue(code({ compareStatus: "diverged" }) === "not_ahead", "code: diverged → not_ahead");
+  assertTrue(code({ compareStatus: "behind" }) === "not_ahead", "code: behind → not_ahead");
+  assertTrue(code({ health: { ok: false, error: "x" } }) === "health_unusable", "code: health error → health_unusable");
+  assertTrue(
+    code({ runs: [{ event: "workflow_dispatch", status: "in_progress", conclusion: null, head_sha: MAIN }] }) === "deploy_underway",
+    "code: run in progress → deploy_underway",
+  );
+  assertTrue(
+    code({ runs: [{ event: "push", status: "completed", conclusion: "success", head_sha: MAIN, updated_at: minsAgo(60) }] }) === "head_already_deployed",
+    "code: head deployed once, prod older → head_already_deployed",
+  );
+
+  // countPendingAutoMerge
+  assertTrue(drift.countPendingAutoMerge(null) === 0, "countPendingAutoMerge: null → 0");
+  assertTrue(
+    drift.countPendingAutoMerge([
+      { state: "open", auto_merge: { merge_method: "squash" }, base: { ref: "main" } },
+      { state: "open", auto_merge: null, base: { ref: "main" } },
+      { state: "open", auto_merge: { merge_method: "squash" }, base: { ref: "intl-staging" } },
+      { state: "closed", auto_merge: { merge_method: "squash" }, base: { ref: "main" } },
+    ]) === 1,
+    "countPendingAutoMerge: only open auto-merge PRs into main count",
+  );
+
+  // shouldKeepWaiting — event-driven loop control
+  const T0 = NOW.getTime();
+  const at = (m: number) => new Date(T0 + m * 60000);
+  const wait = (over: Record<string, unknown>, ctx: Record<string, unknown>) =>
+    drift.shouldKeepWaiting(drift.decideDeployDrift(base(over)), { startedAt: at(0), now: at(0), pendingAutoMerge: 0, ...ctx }).wait;
+  assertTrue(drift.MAX_WAIT_MINUTES <= 18, "MAX_WAIT_MINUTES <= 18");
+  assertTrue(
+    drift.AUTO_MERGE_WAIT_MINUTES + drift.GRACE_MINUTES + drift.POLL_SECONDS / 60 <= drift.MAX_WAIT_MINUTES,
+    "a merge landing inside the auto-merge wait still fits grace + one poll under the cap",
+  );
+  assertTrue(!wait({ health: { ok: true, sha: MAIN } }, {}), "pre-check: prod == main, no auto-merge PR → exit immediately");
+  assertTrue(wait({ health: { ok: true, sha: MAIN } }, { pendingAutoMerge: 2 }), "prod == main + open auto-merge PR → wait");
+  assertTrue(
+    !wait({ health: { ok: true, sha: MAIN } }, { pendingAutoMerge: 1, now: at(drift.AUTO_MERGE_WAIT_MINUTES) }),
+    "prod == main + auto-merge PR past auto-merge wait budget → stop",
+  );
+  assertTrue(wait({ mainCommittedAt: minsAgo(3) }, {}), "within grace → wait");
+  assertTrue(wait({ mainCommittedAt: minsAgo(3) }, { now: at(10) }), "within grace at 10 min elapsed → still wait");
+  assertTrue(!wait({ mainCommittedAt: minsAgo(3) }, { now: at(17.5) }), "within grace but cap reached → stop");
+  assertTrue(!wait({}, {}), "dispatch → stop (caller dispatches once)");
+  assertTrue(!wait({ compareStatus: "diverged" }, { pendingAutoMerge: 3 }), "diverged → stop (never deploy backwards)");
+  assertTrue(!wait({ compareStatus: null }, {}), "compare unavailable → stop (fail closed)");
+  assertTrue(!wait({ health: { ok: false, error: "/health HTTP 503" } }, { pendingAutoMerge: 1 }), "health fetch failure → stop (fail closed)");
+  assertTrue(
+    !wait({ runs: [{ event: "workflow_dispatch", status: "in_progress", conclusion: null, head_sha: MAIN }] }, {}),
+    "deploy underway → stop (its completion re-triggers the sweep)",
+  );
+  assertTrue(
+    !wait({ runs: [{ event: "workflow_dispatch", status: "completed", conclusion: "success", head_sha: MAIN, updated_at: minsAgo(60) }] }, {}),
+    "head already deployed (possible rollback) → stop",
+  );
+  assertTrue(
+    !wait({ runs: [{ event: "push", status: "completed", conclusion: "failure", head_sha: MAIN, updated_at: minsAgo(20) }] }, {}),
+    "head deploy failed → stop (no loop)",
+  );
+  assertTrue(!drift.shouldKeepWaiting(null, { startedAt: at(0), now: at(0) }).wait, "no decision → stop");
+  assertTrue(
+    !drift.shouldKeepWaiting({ action: "noop", code: "within_grace" }, { startedAt: "x", now: at(0) }).wait,
+    "unknown clock → stop",
+  );
 
   return { passed, failed, failures };
 }

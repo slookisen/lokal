@@ -1294,7 +1294,7 @@ jobs:
                     // PR's deploy will NOT self-trigger from here — the
                     // scheduled deploy-drift-sweep.yml (main vs /health.git_sha)
                     // dispatches it after its grace period.
-                    await note('approved; auto-merge enabled but not confirmed merged within ~12s. If/when it lands, fly-deploy.yml will NOT auto-dispatch for this PR (no push/check_suite event fires for a GITHUB_TOKEN-authored merge) — deploy-drift-sweep.yml (every 5 min) dispatches it once main has been ahead of prod\'s /health.git_sha for >10 min.');
+                    await note('approved; auto-merge enabled but not confirmed merged within ~12s. If/when it lands, fly-deploy.yml will NOT auto-dispatch for this PR (no push/check_suite event fires for a GITHUB_TOKEN-authored merge) — deploy-drift-sweep.yml (triggered when PR CI or this gate completes; waits up to ~18 min, plus a 5-min cron backstop) dispatches it once main has been ahead of prod\'s /health.git_sha for >10 min.');
                   }
                 } catch (autoMergeErr) {
                   await note(`approved, but could not merge or enable auto-merge (${autoMergeErr.message}) — merge manually.`);
