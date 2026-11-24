@@ -16,7 +16,9 @@
 // The `auto.*` switches with a public effect have their own off-set helpers
 // on the same gate: auto.debio (debioSwitchOffAgentIds) and, «Mine valg»
 // S3-1, auto.affiliations (affiliationsSwitchOffAgentIds: no affiliations
-// card and no JSON-LD memberOf on the producer page).
+// card and no JSON-LD memberOf on the producer page). S3-2: with the key
+// live, the owner hides single affiliations (affiliationsPerItemEnabled,
+// affiliationsPageMode).
 //
 // List surfaces resolve all their allowlisted subjects with one query
 // (resolveOwnerFeatureKeysForSubjects). A failed lookup for an allowlisted
@@ -24,7 +26,7 @@
 
 import { ownerFeatureAllowedRfbIds } from "./feature-tiers";
 import { resolveOwnerFeatureKeysForSubjects, type ResolvedOwnerFeature } from "./resolve";
-import type { OwnerFeatureEntry, OwnerFeatureKey } from "./registry";
+import { OWNER_FEATURE_REGISTRY, ownerFeatureStatus, type OwnerFeatureEntry, type OwnerFeatureKey } from "./registry";
 import { isProductHeader, isProductNoise, parseProductPrice, productPriceText } from "../services/knowledge-service";
 
 export const OWNER_FEATURES_ENFORCE_ENV = "OWNER_FEATURES_ENFORCE";
@@ -194,6 +196,37 @@ export function publicAgentInfo<T extends { agent: any; knowledge: any }>(info: 
 
 
 /**
+ * The allowlisted subjects among `agentIds` when the gate is open
+ * (OWNER_FEATURES_ENFORCE on AND the `mine_valg` owner feature); [] = gate
+ * shut (no DB read for the resolution itself).
+ */
+function gatedSubjectIds(agentIds: Iterable<string>, env: NodeJS.ProcessEnv, db: any): string[] {
+  if (!ownerFeaturesEnforceOn(env)) return [];
+  const allowed = new Set(ownerFeatureAllowedRfbIds("mine_valg", { env, db }));
+  if (allowed.size === 0) return [];
+  return [...new Set(agentIds)].filter((id) => typeof id === "string" && allowed.has(id));
+}
+
+/**
+ * The agents among `ids` whose switch `key` resolves to false. A failed
+ * lookup counts every id as off (fail closed) and logs `<key> lookup failed`.
+ */
+function switchOffIds(ids: string[], key: OwnerFeatureKey, env: NodeJS.ProcessEnv, db: any): Set<string> {
+  const out = new Set<string>();
+  if (ids.length === 0) return out;
+  try {
+    const resolved = resolveOwnerFeatureKeysForSubjects("rfb", ids, [key], {
+      db, env, registry: registryOverride ?? undefined,
+    });
+    for (const [id, byKey] of resolved) if (byKey[key]?.value === false) out.add(id);
+  } catch (err) {
+    console.error(`[owner-features] ${key} lookup failed, treating the switch as off:`, err);
+    for (const id of ids) out.add(id);
+  }
+  return out;
+}
+
+/**
  * Økologi S1 (A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-
  * og-tekstrevisjon, S1.7): the agents among `agentIds` whose `auto.debio`
  * switch is off — no organic display at all for them (the register sync
@@ -204,23 +237,10 @@ export function publicAgentInfo<T extends { agent: any; knowledge: any }>(info: 
  */
 export function debioSwitchOffAgentIds(agentIds: Iterable<string>, opts: EnforceOptions = {}): Set<string> {
   const env = opts.env ?? process.env;
-  const out = new Set<string>();
-  if (!ownerFeaturesEnforceOn(env)) return out;
-  const allowed = new Set(ownerFeatureAllowedRfbIds("mine_valg", { env, db: opts.db }));
-  if (allowed.size === 0) return out;
-  const ids = [...new Set(agentIds)].filter((id) => typeof id === "string" && allowed.has(id));
-  if (ids.length === 0) return out;
-  try {
-    const resolved = resolveOwnerFeatureKeysForSubjects("rfb", ids, ["auto.debio"], {
-      db: opts.db, env, registry: registryOverride ?? undefined,
-    });
-    for (const [id, byKey] of resolved) if (byKey["auto.debio"]?.value === false) out.add(id);
-  } catch (err) {
-    console.error("[owner-features] auto.debio lookup failed, treating the switch as off:", err);
-    for (const id of ids) out.add(id);
-  }
-  return out;
+  return switchOffIds(gatedSubjectIds(agentIds, env, opts.db), "auto.debio", env, opts.db);
 }
+
+const AFFILIATIONS_KEY = "auto.affiliations" as const satisfies OwnerFeatureKey;
 
 /**
  * «Mine valg» S3-1: the agents among `agentIds` whose `auto.affiliations`
@@ -230,20 +250,41 @@ export function debioSwitchOffAgentIds(agentIds: Iterable<string>, opts: Enforce
  */
 export function affiliationsSwitchOffAgentIds(agentIds: Iterable<string>, opts: EnforceOptions = {}): Set<string> {
   const env = opts.env ?? process.env;
-  const out = new Set<string>();
-  if (!ownerFeaturesEnforceOn(env)) return out;
-  const allowed = new Set(ownerFeatureAllowedRfbIds("mine_valg", { env, db: opts.db }));
-  if (allowed.size === 0) return out;
-  const ids = [...new Set(agentIds)].filter((id) => typeof id === "string" && allowed.has(id));
-  if (ids.length === 0) return out;
-  try {
-    const resolved = resolveOwnerFeatureKeysForSubjects("rfb", ids, ["auto.affiliations"], {
-      db: opts.db, env, registry: registryOverride ?? undefined,
-    });
-    for (const [id, byKey] of resolved) if (byKey["auto.affiliations"]?.value === false) out.add(id);
-  } catch (err) {
-    console.error("[owner-features] auto.affiliations lookup failed, treating the switch as off:", err);
-    for (const id of ids) out.add(id);
-  }
-  return out;
+  return switchOffIds(gatedSubjectIds(agentIds, env, opts.db), AFFILIATIONS_KEY, env, opts.db);
+}
+
+/** Is the `auto.affiliations` entry live (the registry override in tests)? Registry only, no DB. */
+function affiliationsKeyLive(env: NodeJS.ProcessEnv): boolean {
+  const e = (registryOverride ?? OWNER_FEATURE_REGISTRY).find((x) => x.key === AFFILIATIONS_KEY);
+  return !!e && ownerFeatureStatus(e, env) === "live";
+}
+
+/**
+ * «Mine valg» S3-2: may the owner hide single affiliations, and does the
+ * producer page honour it? The S3-1 gate (OWNER_FEATURES_ENFORCE AND the
+ * profile in the `mine_valg` allowlist) AND `auto.affiliations` live. Reads
+ * no setting (the allowlist only); false outside the gate.
+ */
+export function affiliationsPerItemEnabled(agentId: string, opts: EnforceOptions = {}): boolean {
+  const env = opts.env ?? process.env;
+  if (!agentId) return false;
+  if (gatedSubjectIds([agentId], env, opts.db).length === 0) return false;
+  return affiliationsKeyLive(env);
+}
+
+/**
+ * What the producer page shows of its affiliations (forward direction):
+ *   as_before          gate shut, or the key not live: the query as before;
+ *   none               the switch is off (S3-1), or the lookup failed (fail closed);
+ *   hide_owner_hidden  S3-2: shown, minus the rows the owner hid.
+ * One lookup; outside the gate no DB read for it.
+ */
+export type AffiliationsPageMode = "as_before" | "none" | "hide_owner_hidden";
+
+export function affiliationsPageMode(agentId: string, opts: EnforceOptions = {}): AffiliationsPageMode {
+  const env = opts.env ?? process.env;
+  const ids = agentId ? gatedSubjectIds([agentId], env, opts.db) : [];
+  if (ids.length === 0) return "as_before";
+  if (switchOffIds(ids, AFFILIATIONS_KEY, env, opts.db).has(agentId)) return "none";
+  return affiliationsKeyLive(env) ? "hide_owner_hidden" : "as_before";
 }

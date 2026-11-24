@@ -62,6 +62,9 @@ export interface OwnerAuditField {
 
 const L = OWNER_PORTAL_FORM_LABELS;
 
+/** «Mine valg» S3-2: the field_name of an owner hiding / showing one affiliation. */
+export const OWNER_AFFILIATION_HIDDEN_FIELD = "affiliations.hidden";
+
 /**
  * THE table: every agent_knowledge_audit field_name the owner's log may show.
  * Keys are the field_name values the writers really store (grep
@@ -107,6 +110,8 @@ export const OWNER_AUDIT_FIELDS: Readonly<Record<string, OwnerAuditField>> = {
   "products.added": { label: "Ny vare", kind: "text" },
   "products.imported": { label: "Varer hentet fra nettsiden", kind: "text" },
   "products.removed": { label: "Varer fjernet", kind: "text" },
+  // «Mine valg» S3-2: one affiliation hidden (new value = its name) or shown again (old value = its name).
+  [OWNER_AFFILIATION_HIDDEN_FIELD]: { label: "Skjult tilknytning", kind: "text" },
 };
 
 /** The field names the log shows (the SQL filter of readOwnerAuditFeed). */

@@ -4317,6 +4317,18 @@ function initSchema(db: Database.Database): void {
     console.warn("[init][pr-64] status-CHECK widening skipped:", e instanceof Error ? e.message : String(e));
   }
 
+  // «Mine valg» S3-2: the owner hides one affiliation from the producer page
+  // (owner_hidden_at = when; NULL = shown). Additive and nullable, after the
+  // PR-58/PR-64 rebuilds above so a rebuild can never drop it on this boot.
+  try {
+    const cols = db.prepare("PRAGMA table_info(agent_affiliations)").all() as Array<{ name: string }>;
+    if (!cols.some(c => c.name === "owner_hidden_at")) {
+      db.exec("ALTER TABLE agent_affiliations ADD COLUMN owner_hidden_at TEXT");
+    }
+  } catch (e) {
+    console.warn("[init][mine-valg-s3-2] owner_hidden_at migration skipped:", e instanceof Error ? e.message : String(e));
+  }
+
   // 5.11.A1.4 — Optional partial index on umbrella agents (umbrella_type IS NOT NULL)
   // Speeds up "list all umbrellas" queries. Partial-index pattern matches PR-23's
   // is_active filter so it stays cheap.
