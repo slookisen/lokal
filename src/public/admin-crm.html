@@ -167,6 +167,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .compose .send-row{display:flex;justify-content:space-between;margin-top:14px;flex-wrap:wrap;gap:8px}
 .compose .modes{display:flex;gap:14px;font-size:12px;color:var(--text-dim);align-items:center}
 .compose .modes input[type=radio]{margin:0}
+.compose .send-receipt{margin-top:10px;padding:8px 12px;border:1px solid var(--accent);border-radius:6px;font-size:12px}
+.compose .send-receipt.error{border-color:var(--danger);color:var(--danger)}
 .btn-primary{padding:8px 18px;background:var(--accent);color:#000;border:none;border-radius:6px;font-weight:600;cursor:pointer;font-size:13px}
 .btn-primary:disabled{opacity:0.5;cursor:wait}
 .btn-secondary{padding:8px 14px;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;cursor:pointer;font-size:12px}
@@ -870,6 +872,7 @@ async function selectThread(id) {
           </div>
           <button class="btn-primary" data-action="sendReply" data-id="${t.id}" id="sendBtn">Send</button>
         </div>
+        ${renderSendReceipt(t.id)}
       </div>
 
       <div class="notes-section">
@@ -940,33 +943,120 @@ async function saveThreadNotes(id) {
   catch (e) { toast(e.message, true); }
 }
 
-async function sendReply(threadId) {
-  const to = document.getElementById('composeTo').value.trim();
-  const subject = document.getElementById('composeSubject').value.trim();
-  const body = document.getElementById('composeBody').value.trim();
-  const mode = document.querySelector('input[name=sendMode]:checked').value;
-  if (!to || !subject || !body) { toast('Fyll inn alle felter', true); return; }
-  if (mode === 'resend_send' && !confirm(`Sende e-post nå til ${to}?\n\nDenne kan ikke trekkes tilbake.`)) return;
+// ─── Svar fra tråd: én sending per trykk (dev-request
+// 2026-11-23-crm-send-dobbeltsending-og-tydelig-kvittering, punkt 1) ───
+// The block between the reply-send-core markers is pure (no DOM) so
+// src/routes/admin-crm-reply-send.test.ts can run it in isolation.
+// <reply-send-core>
+function formatSendReceipt(mode, to, when) {
+  const hh = String(when.getHours()).padStart(2, '0');
+  const mm = String(when.getMinutes()).padStart(2, '0');
+  return mode === 'resend_send'
+    ? `Sendt ${hh}:${mm} til ${to}`
+    : `Lagt i kø ${hh}:${mm} som Gmail-utkast til ${to}`;
+}
 
-  const btn = document.getElementById('sendBtn');
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span>';
+function describeSendError(err) {
+  const raw = String((err && err.message) || err || 'ukjent feil');
+  const m = raw.match(/^(\d{3}): ([\s\S]*)$/);
+  let body = null;
+  if (m) { try { body = JSON.parse(m[2]); } catch (_) { body = null; } }
+  if (body && body.error === 'duplicate_send') {
+    return `Ikke sendt: samme tekst til samme mottaker er allerede sendt i denne tråden (${body.duplicateMessageId || 'ukjent id'}). Endre teksten hvis du vil sende et nytt svar.`;
+  }
+  if (body && (body.error || body.detail)) {
+    return `Ikke sendt (${m[1]}): ${[body.error, body.detail].filter(Boolean).join(' — ')}`;
+  }
+  return `Ikke sendt: ${raw}`;
+}
+
+// One press = at most one confirm() and one POST. `inFlight` holds thread
+// ids with a send on its way; any second call for that thread (a re-dispatched
+// event, a double click) returns 'busy' without a dialog or a request.
+async function runReplySend(threadId, input, deps) {
+  if (deps.inFlight.has(threadId)) return { status: 'busy' };
+  if (!input.to || !input.subject || !input.body) return { status: 'invalid' };
+  // Lock BEFORE the dialog, so nothing can re-enter while it is open.
+  deps.inFlight.add(threadId);
   try {
-    const r = await api('/threads/' + threadId + '/send', {
-      method: 'POST',
-      body: JSON.stringify({
-        intent: mode,
-        toEmails: [to],
-        subject,
-        bodyText: body,
+    if (input.mode === 'resend_send' && !deps.confirm(`Sende e-post nå til ${input.to}?\n\nDenne kan ikke trekkes tilbake.`)) {
+      return { status: 'cancelled' };
+    }
+    deps.lock();
+    try {
+      const result = await deps.post('/threads/' + threadId + '/send', {
+        intent: input.mode,
+        toEmails: [input.to],
+        subject: input.subject,
+        bodyText: input.body,
         createdBy: 'daniel',
-      })
-    });
-    toast(mode === 'resend_send' ? 'Sendt!' : 'Lagt i kø — agent oppretter draft ved neste kjøring');
-    document.getElementById('composeBody').value = '';
-    refresh();
-  } catch (e) { toast(e.message, true); }
-  finally { btn.disabled = false; btn.textContent = 'Send'; }
+      });
+      return { status: 'sent', result, receipt: formatSendReceipt(input.mode, input.to, deps.now()) };
+    } catch (e) {
+      return { status: 'error', error: describeSendError(e) };
+    } finally {
+      deps.unlock();
+    }
+  } finally {
+    deps.inFlight.delete(threadId);
+  }
+}
+// </reply-send-core>
+
+const replySendsInFlight = new Set();
+const sendReceipts = {}; // threadId -> { ok, text } — survives the thread re-render
+
+function renderSendReceipt(threadId) {
+  const r = sendReceipts[threadId];
+  if (!r) return '<div class="send-receipt" id="sendReceipt" style="display:none"></div>';
+  return `<div class="send-receipt${r.ok ? '' : ' error'}" id="sendReceipt" role="status">${escapeHtml(r.text)}</div>`;
+}
+
+function setReplyFormLocked(locked) {
+  ['composeTo', 'composeSubject', 'composeBody', 'sendBtn'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.disabled = locked;
+  });
+  document.querySelectorAll('input[name=sendMode]').forEach(r => { r.disabled = locked; });
+  const btn = document.getElementById('sendBtn');
+  if (btn) {
+    if (locked) btn.innerHTML = '<span class="spinner"></span>';
+    else btn.textContent = 'Send';
+  }
+}
+
+async function sendReply(threadId) {
+  const input = {
+    to: document.getElementById('composeTo').value.trim(),
+    subject: document.getElementById('composeSubject').value.trim(),
+    body: document.getElementById('composeBody').value.trim(),
+    mode: document.querySelector('input[name=sendMode]:checked').value,
+  };
+  const out = await runReplySend(threadId, input, {
+    inFlight: replySendsInFlight,
+    confirm: msg => confirm(msg),
+    post: (path, payload) => api(path, { method: 'POST', body: JSON.stringify(payload) }),
+    lock: () => setReplyFormLocked(true),
+    unlock: () => setReplyFormLocked(false),
+    now: () => new Date(),
+  });
+  if (out.status === 'invalid') { toast('Fyll inn alle felter', true); return; }
+  if (out.status !== 'sent' && out.status !== 'error') return; // busy / cancelled
+  if (out.status === 'error') {
+    sendReceipts[threadId] = { ok: false, text: out.error };
+    const el = document.getElementById('sendReceipt');
+    if (el) { el.className = 'send-receipt error'; el.textContent = out.error; el.style.display = ''; }
+    toast(out.error, true);
+    return;
+  }
+  sendReceipts[threadId] = { ok: true, text: out.receipt };
+  toast(out.receipt);
+  const bodyEl = document.getElementById('composeBody');
+  if (bodyEl) bodyEl.value = '';
+  // Re-render the thread so the sent message shows in it (with the receipt),
+  // then refresh the lists/KPIs around it.
+  if (activeThreadId === threadId) await selectThread(threadId);
+  refresh();
 }
 
 function escapeHtml(s) {
@@ -1416,12 +1506,21 @@ const ACTIONS = {
   markDoneFromAwait: id => markDoneFromAwait(id),
 };
 
+// <dispatch-core>
+// Actions that are meant to run on blur (autosave of note fields). Root cause
+// of the 2026-11-23 double confirm dialog: the capture-phase blur listener
+// below dispatched EVERY data-action element on blur — including the Send
+// button. confirm() takes focus from the button → blur → sendReply() ran a
+// second time and showed the dialog again after OK. Only these may fire on blur.
+const BLUR_ACTIONS = new Set(['saveContactNotes', 'saveThreadNotes', 'search']);
+
 function dispatchAction(e, eventType) {
   let el = e.target;
   // Walk up to find element with data-action (handles clicks on child nodes)
   while (el && el !== document.body && !el.dataset.action) el = el.parentElement;
   if (!el || !el.dataset.action) return;
   const action = el.dataset.action;
+  if (eventType === 'blur' && !BLUR_ACTIONS.has(action)) return;
   const fn = ACTIONS[action];
   if (!fn) return;
   const id = el.dataset.id;
@@ -1434,6 +1533,7 @@ function dispatchAction(e, eventType) {
     fn(id, undefined, el);
   }
 }
+// </dispatch-core>
 
 document.body.addEventListener('click', e => dispatchAction(e, 'click'));
 document.body.addEventListener('change', e => dispatchAction(e, 'change'));

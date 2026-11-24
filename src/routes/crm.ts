@@ -51,8 +51,10 @@ import {
   getProposal,
   listProposals,
   rejectProposal,
+  supersedePendingProposalsForThread,
   type ProposalStatus,
 } from "../services/cs-reply-proposals";
+import { unwrapGoogleRedirectLinks } from "../utils/unwrap-google-redirect";
 import { isPilotForwardCopy } from "../services/inbound-email-webhook";
 
 // ─── Admin auth (matches the fleet-wide admin-route pattern, e.g.
@@ -160,11 +162,14 @@ const ingestSchema = z.object({
 
 // ─── Double-send guard window (steg 1.3, dev-request
 // 2026-08-09-cs-rutine-to-plattformer-og-tradhistorikk) ────────────────────
-// See crmService.findRecentIdenticalOutbound() for the finding and the
-// hard-reject-on-exact-duplicate rationale. 30s comfortably covers a
-// double-click/double-submit (the observed incident was 4s apart) without
-// being long enough to ever catch a human re-reading and re-sending later.
-const DUPLICATE_SEND_WINDOW_SECONDS = 30;
+// See crmService.findRecentDuplicateOutbound() for the finding and the
+// hard-reject-on-duplicate rationale. Widened from 30s to 10 min by dev-request
+// 2026-11-23-crm-send-dobbeltsending-og-tydelig-kvittering: the 2026-11-23
+// incident was a confirm dialog re-appearing after a send that had already
+// gone out — a re-press there, a network retry or a second tab can all land
+// well past 30s. Only the same (normalized) subject+body to the same recipients
+// is refused, so a deliberate different reply is never blocked.
+const DUPLICATE_SEND_WINDOW_SECONDS = 10 * 60;
 
 // A subject that's empty (after trimming) or that trims to NOTHING but a
 // reply/svar prefix ("Re:" / "Sv:", case-insensitive) is contentless — see
@@ -420,7 +425,13 @@ router.post("/threads/:id/notes", (req, res) => {
 router.post("/threads/:id/send", async (req, res) => {
   const parsed = sendSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
-  const { intent, toEmails, ccEmails, subject, bodyText, bodyHtml, replyToMessageId, createdBy, fromDisplayName } = parsed.data;
+  const { intent, toEmails, ccEmails, subject, bodyHtml, replyToMessageId, createdBy, fromDisplayName } = parsed.data;
+  // Gmail redirect links pasted from Gmail (https://www.google.com/url?q=…)
+  // go out as the link they point to — dev-request
+  // 2026-11-23-crm-send-dobbeltsending-og-tydelig-kvittering, point 4. Done
+  // first so the lint, the duplicate guard, the stored message and the sent
+  // mail all see the same text.
+  const bodyText = unwrapGoogleRedirectLinks(parsed.data.bodyText);
   const threadId = req.params.id;
 
   // Look up contact for logging
@@ -473,21 +484,22 @@ router.post("/threads/:id/send", async (req, res) => {
   }
 
   // ─── Double-send guard ────────────────────────────────────────
-  // Hard reject on a byte-identical subject+body sent to this same thread
-  // within DUPLICATE_SEND_WINDOW_SECONDS. See
-  // crmService.findRecentIdenticalOutbound() for the finding this is based
-  // on and why identical-content is the line, not merely "recent".
-  const duplicate = crmService.findRecentIdenticalOutbound(threadId, subject, bodyText, DUPLICATE_SEND_WINDOW_SECONDS);
+  // Hard reject on the same normalized subject+body to the same recipients, sent or
+  // queued on this same thread within DUPLICATE_SEND_WINDOW_SECONDS. See
+  // crmService.findRecentDuplicateOutbound() for the finding this is based
+  // on and why identical content is the line, not merely "recent".
+  const duplicate = crmService.findRecentDuplicateOutbound(threadId, toEmails, subject, bodyText, DUPLICATE_SEND_WINDOW_SECONDS);
   if (duplicate) {
     return res.status(409).json({
       error: "duplicate_send",
       detail:
-        `identical subject+body already sent on this thread at ${duplicate.received_at} ` +
-        `(crm_messages ${duplicate.id}) — refusing to send the same reply twice within ` +
-        `${DUPLICATE_SEND_WINDOW_SECONDS}s. If this is genuinely a second, deliberate reply, ` +
-        `change the subject or body and resend.`,
+        `the same reply to the same recipient is already ${duplicate.delivery_status} on this thread ` +
+        `(${duplicate.received_at}, crm_messages ${duplicate.id}) — refusing to send it again within ` +
+        `${DUPLICATE_SEND_WINDOW_SECONDS / 60} min. If this is genuinely a second, deliberate reply, ` +
+        `change the subject or text and resend.`,
       duplicateMessageId: duplicate.id,
       duplicateAt: duplicate.received_at,
+      duplicateStatus: duplicate.delivery_status,
     });
   }
 
@@ -578,6 +590,20 @@ router.post("/threads/:id/send", async (req, res) => {
         // above) — flip it from 'queued' to the real outcome instead of
         // inserting a second row.
         crmService.updateMessageDeliveryStatus(reserved.messageId, "sent");
+        // Point 3 of the same dev-request: Daniel's own reply makes the
+        // routine's still-unsent proposals on THIS thread stale — they leave
+        // the approval queue (needs-reply stops counting them).
+        // The mail is already out: a failure here must never turn this into
+        // a reported send failure (the outer catch would flip the row to
+        // 'failed' and invite a re-send), so it is contained.
+        let supersededProposals: string[] = [];
+        if (createdBy === "daniel") {
+          try {
+            supersededProposals = supersedePendingProposalsForThread(threadId, { actor: "daniel", crmMessageId: reserved.messageId });
+          } catch (err: any) {
+            console.error("[crm] superseding pending reply proposals failed:", err?.message ?? err);
+          }
+        }
         crmService.logAction({
           threadId,
           contactId: thread.contact_id,
@@ -588,7 +614,10 @@ router.post("/threads/:id/send", async (req, res) => {
             ...(fromDisplayName !== undefined ? { fromDisplayName } : {}),
           },
         });
-        return res.json({ success: true, outboxId: queued.id, messageId: result.messageId, internalMessageId: reserved.messageId, channel: "resend_smtp" });
+        return res.json({
+          success: true, outboxId: queued.id, messageId: result.messageId, internalMessageId: reserved.messageId, channel: "resend_smtp",
+          sentTo: toEmails, supersededProposals,
+        });
       } else {
         crmService.markOutboxResult(queued.id, "failed", undefined, result.error || "send failed");
         // Flip the reserved row to 'failed' (no sent_at) — matches

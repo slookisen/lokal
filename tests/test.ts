@@ -46154,6 +46154,48 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-23-crm-send-dobbeltsending-og-tydelig-kvittering —
+// POST /threads/:id/send: 10-min normalized double-send guard (AC2), own
+// reply supersedes the routine's pending proposals (AC3), Gmail redirect
+// links unwrapped before sending (AC4). Own in-memory DB, same pattern as
+// crm-send-message-history just above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-23-crm-send-dobbeltsending: server-side dobbeltsperre, superseded, Gmail-lenker ──");
+  try {
+    const { runCrmSendDobbeltsperreTests } = require("../src/routes/crm-send-dobbeltsperre.test") as
+      typeof import("../src/routes/crm-send-dobbeltsperre.test");
+    const r = await runCrmSendDobbeltsperreTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("crm-send-dobbeltsperre: " + f);
+    console.log(`  crm-send-dobbeltsperre: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-send-dobbeltsperre: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ crm-send-dobbeltsperre: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+// Same dev-request, AC1 — admin-crm.html thread reply: one press = one
+// confirm() = one POST, receipt shown; blur no longer re-dispatches buttons
+// (the root cause). Executes the page's marked pure blocks in a vm sandbox;
+// no DB, no shared module state.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-23-crm-send-dobbeltsending: admin-CRM svar-knapp (AC1) ──");
+  try {
+    const { runAdminCrmReplySendTests } = require("../src/routes/admin-crm-reply-send.test") as
+      typeof import("../src/routes/admin-crm-reply-send.test");
+    const r = await runAdminCrmReplySendTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-crm-reply-send: " + f);
+    console.log(`  admin-crm-reply-send: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-crm-reply-send: unexpected error: " + String(err?.message || err));
+  }
+});
+
 runSerial(async () => {
   console.log("\n── dev-request 2026-07-27-crm-plattformadskillelse: steg 5 (retro-tagging, dry-run + godkjenningsgate) ──");
   try {
