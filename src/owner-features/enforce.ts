@@ -13,6 +13,11 @@
 // `coming_soon` keeps its default (shown) — only an admin lock or the status
 // flip after the S2d switch probe makes a choice take effect.
 //
+// The `auto.*` switches with a public effect have their own off-set helpers
+// on the same gate: auto.debio (debioSwitchOffAgentIds) and, «Mine valg»
+// S3-1, auto.affiliations (affiliationsSwitchOffAgentIds: no affiliations
+// card and no JSON-LD memberOf on the producer page).
+//
 // List surfaces resolve all their allowlisted subjects with one query
 // (resolveOwnerFeatureKeysForSubjects). A failed lookup for an allowlisted
 // subject hides the enforced fields (fail closed) and logs.
@@ -212,6 +217,32 @@ export function debioSwitchOffAgentIds(agentIds: Iterable<string>, opts: Enforce
     for (const [id, byKey] of resolved) if (byKey["auto.debio"]?.value === false) out.add(id);
   } catch (err) {
     console.error("[owner-features] auto.debio lookup failed, treating the switch as off:", err);
+    for (const id of ids) out.add(id);
+  }
+  return out;
+}
+
+/**
+ * «Mine valg» S3-1: the agents among `agentIds` whose `auto.affiliations`
+ * switch is off — the producer page shows no affiliations card and its
+ * JSON-LD no memberOf. Same gate and fail-closed rule as
+ * debioSwitchOffAgentIds.
+ */
+export function affiliationsSwitchOffAgentIds(agentIds: Iterable<string>, opts: EnforceOptions = {}): Set<string> {
+  const env = opts.env ?? process.env;
+  const out = new Set<string>();
+  if (!ownerFeaturesEnforceOn(env)) return out;
+  const allowed = new Set(ownerFeatureAllowedRfbIds("mine_valg", { env, db: opts.db }));
+  if (allowed.size === 0) return out;
+  const ids = [...new Set(agentIds)].filter((id) => typeof id === "string" && allowed.has(id));
+  if (ids.length === 0) return out;
+  try {
+    const resolved = resolveOwnerFeatureKeysForSubjects("rfb", ids, ["auto.affiliations"], {
+      db: opts.db, env, registry: registryOverride ?? undefined,
+    });
+    for (const [id, byKey] of resolved) if (byKey["auto.affiliations"]?.value === false) out.add(id);
+  } catch (err) {
+    console.error("[owner-features] auto.affiliations lookup failed, treating the switch as off:", err);
     for (const id of ids) out.add(id);
   }
   return out;
