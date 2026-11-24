@@ -53824,6 +53824,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere S3-3: the owner's
+// auto.categories switch in the salgskanal sweep (no auto placement, auto rows
+// removed, untouched on a failed lookup) and on the producer page (auto rows
+// not counted); gate, coming_soon, off → on. Swaps getDb() and env — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S3-3: «Plasser meg i salgskanaler automatisk» ──");
+  try {
+    const { runOwnerFeaturesS33Tests } = require("../src/routes/owner-features-s3-3.test") as
+      typeof import("../src/routes/owner-features-s3-3.test");
+    const r = await runOwnerFeaturesS33Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-features-s3-3: " + f);
+    console.log(`  owner-features-s3-3: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-features-s3-3: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2d-1 (AC21): optional
 // owner_email on POST /admin/test-producer arms the fixture's owner login
 // (agent_knowledge.email + claimed_at, fixture-pinned); magic link → «Mine

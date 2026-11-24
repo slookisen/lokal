@@ -27,7 +27,7 @@ import { productAutoSyncEnabled } from "../services/product-import/auto-sync";
 import { knowledgeService, productPriceText, parseProductPrice, OWNER_PRODUCT_SOURCES, ownerWroteAbout, publicOwnerAboutText } from "../services/knowledge-service";
 import { catalogNameNorm, softStockByNameNorm, stockSoftExpiryBuyerText, type SoftStockFields } from "../services/stock-soft-expiry";
 import { containsOrganicClaim, dropOrganicSentences } from "../services/organic-claims";
-import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenFields, hidesAddress, hidesPrices, debioSwitchOffAgentIds, affiliationsPageMode } from "../owner-features/enforce";
+import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenFields, hidesAddress, hidesPrices, debioSwitchOffAgentIds, affiliationsPageMode, categoriesSwitchOffAgentIds } from "../owner-features/enforce";
 import { producerAffiliationRows } from "../services/producer-affiliations";
 import { debioApprovalText, debioProcessText, debioRegisterSyncEnabled, finnokoSearchUrl, readDebioStatusRow } from "../services/debio-approval";
 import { publicCountsShown } from "../services/public-stats-threshold";
@@ -7261,8 +7261,15 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     }
     let hasDirectSaleSignal = false;
     try {
+      // «Mine valg» S3-3: with the owner's auto.categories switch off (or its
+      // lookup failed — fail closed, logged), only 'manual' channel rows count,
+      // without waiting for the next sweep. Outside the gate: no lookup, the
+      // query as before.
+      const categoriesOff = categoriesSwitchOffAgentIds([agent.id]).has(agent.id);
       hasDirectSaleSignal = !!getDb()
-        .prepare("SELECT 1 FROM agent_salgskanal WHERE agent_id = ? LIMIT 1")
+        .prepare(categoriesOff
+          ? "SELECT 1 FROM agent_salgskanal WHERE agent_id = ? AND source = 'manual' LIMIT 1"
+          : "SELECT 1 FROM agent_salgskanal WHERE agent_id = ? LIMIT 1")
         .get(agent.id);
     } catch (e) {
       console.error(`[seo] /produsent/${slug} agent_salgskanal lookup failed:`, e);

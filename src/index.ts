@@ -2114,7 +2114,7 @@ if (process.env.RFB_DISABLE_SALGSKANAL_SYNC !== "1") {
       console.log(
         `[salgskanal-sync] examined=${result.examined} matched_total=${result.matched_total} ` +
         `upserted=${result.upserted} refreshed=${result.refreshed} removed_stale=${result.removed_stale} ` +
-        `errors=${result.errors.length}`,
+        `removed_switch_off=${result.removed_switch_off} errors=${result.errors.length}`,
       );
       if (result.errors.length > 0) {
         for (const e of result.errors) console.warn(`[salgskanal-sync] ${e}`);
