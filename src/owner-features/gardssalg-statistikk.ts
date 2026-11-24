@@ -140,7 +140,24 @@ function periodText(dateText: string): string {
   return fill(GARDSSALG_STATS_TEXTS["stats.period"], "dato", dateText);
 }
 
-/** The «Statistikk» card as an HTML fragment. Pure. */
+/**
+ * Layout of the two number tables (slice 6, dev-request 2026-11-24-
+ * opplevagent-eierdashbord-lyst-tema-og-testfunn): each table fills the card,
+ * the label (th) is left-aligned and may wrap, the number (td) is
+ * right-aligned in a narrow column that never wraps, with a gap between them.
+ * Both tables use the same columns, so the AI table lines up with the first
+ * one instead of wrapping skewed. No fixed width — fits 390 px without
+ * horizontal scroll. Scoped to .gs-st-tall (gårdssalg «Statistikk» only),
+ * light-only like the rest of the gårdssalg pages.
+ */
+export const GARDSSALG_STATS_CSS = [
+  ".gs-st-tall { width: 100%; max-width: 100%; border-collapse: collapse; margin: 8px 0; }",
+  ".gs-st-tall th, .gs-st-tall td { padding: 8px 0; border-bottom: 1px solid #f0ede2; vertical-align: top; }",
+  ".gs-st-tall th { text-align: left; font-weight: 400; padding-right: 16px; overflow-wrap: anywhere; }",
+  ".gs-st-tall td { text-align: right; width: 1%; white-space: nowrap; padding-left: 16px; font-weight: 700; font-variant-numeric: tabular-nums; }",
+].join("\n");
+
+/** The «Statistikk» card as an HTML fragment (its table CSS first). Pure. */
 export function renderGardssalgStatistikk(model: StatistikkModel, ai: StatistikkAi | null): string {
   const T = GARDSSALG_STATS_TEXTS;
   const firstMs = createdAtMs(model.firstRequestAt);
@@ -162,7 +179,8 @@ export function renderGardssalgStatistikk(model: StatistikkModel, ai: Statistikk
     </table>
     <p class="gs-st-hjelp">${escapeHtml(T["stats.aiHelp"])}</p>${aiPeriod}`;
   }
-  return `<section class="gc-card gs-statistikk" data-gardssalg-statistikk="1" aria-labelledby="gs-st-tittel">
+  return `<style>${GARDSSALG_STATS_CSS}</style>
+  <section class="gc-card gs-statistikk" data-gardssalg-statistikk="1" aria-labelledby="gs-st-tittel">
     <h1>${escapeHtml(GARDSSALG_DASHBOARD_TEXTS["tab.stats"])}</h1>
     <h2 id="gs-st-tittel">${escapeHtml(T["stats.heading"])}</h2>
     <table class="gs-st-tall" data-stats-requests="1">

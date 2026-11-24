@@ -206,6 +206,7 @@ export function runGardssalgOwnerDashboardO23Tests(opts: { log?: boolean } = {})
         const off = await portal("o23agard", "o23-a");
         assertEq(off.status, 200, "f1: flag off → the portal opens");
         assertTrue(!off.body.includes("gs-oversikt") && !off.body.includes(T["overview.waiting.many"].slice(4)), "f2: flag off → no overview card");
+        assertTrue(off.body.includes(`<div id="gc-stats" class="gc-stats">`) && off.body.includes("<h2>Statistikk</h2>") && off.body.includes("/stats\", { credentials"), "AK5-off: flag off → the portal keeps its old stats box and fetch (unchanged)");
         setFlag("pilot");
         const otherList = await portal("o23cgard", "o23-c");
         assertTrue(otherList.status === 200 && !otherList.body.includes("gs-oversikt"), "f3: pilot, profile off the list → no card");
@@ -229,6 +230,18 @@ export function runGardssalgOwnerDashboardO23Tests(opts: { log?: boolean } = {})
       assertTrue(cb.includes(`<strong>${T["overview.waiting.one"]}</strong>`), "AK1h: overview.waiting.one for B");
       assertTrue(ca.includes(`Nærmeste svarfrist: ${formatSlotOslo(iso(6))}`), "AK1i: the nearest deadline (the soonest of the three)");
       assertEq(refsOf(ca), ["GS-A-C2", "GS-A-C1"], "AK1j: A's upcoming confirmed visits, soonest first");
+
+      // ── AK5 (dev-request 2026-11-24-…-testfunn, slice 4): «Oversikt» has no stats box ─
+      for (const [who, page] of [["A", a1.body], ["B", b1.body]] as const) {
+        assertTrue(!page.includes(`id="gc-stats"`) && !page.includes(`id="gc-stats-note"`) && !page.includes(`class="gc-stat"`),
+          `AK5a: ${who} — no statistics box on «Oversikt»`);
+        assertTrue(!page.includes("<h2>Statistikk</h2>"), `AK5b: ${who} — no «Statistikk» card heading on «Oversikt» (the tab is in the menu)`);
+        assertTrue(!/gardssalg-claim\/[^"]+\/stats"/.test(page), `AK5c: ${who} — the portal no longer fetches the old stats endpoint`);
+        assertTrue(!page.includes("Med i AI-søk") && !page.includes("AI-søk ("), `AK5d: ${who} — no «Med i AI-søk» / «AI-søk» tile on «Oversikt»`);
+        const h2s = [...page.matchAll(/<h2[^>]*>([^<]*)<\/h2>/g)].map((m) => m[1]);
+        assertEq(h2s.length, new Set(h2s).size, `AK5e: ${who} — no card heading appears twice on «Oversikt» (${h2s.join(" | ")})`);
+        assertTrue(page.includes(`href="/kategori/gardssalg/eier/${who === "A" ? "o23agard" : "o23bgard"}/statistikk"`), `AK5f: ${who} — the numbers are one tab away («Statistikk» link)`);
+      }
 
       // ── (o) ownership: two profiles ────────────────────────────────────
       assertEq(refsOf(cb), ["GS-B-C1"], "o1: B's card lists only B's visit");

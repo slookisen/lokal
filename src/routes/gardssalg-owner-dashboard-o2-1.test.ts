@@ -260,7 +260,14 @@ export function runGardssalgOwnerDashboardO21Tests(opts: { log?: boolean } = {})
       };
       assertTrue(!basePortal.body.includes("</main>") && !baseValg.body.includes("</main>"), "AK2i0: the flag-off pages have no </main> of their own");
       assertTrue(OVERVIEW_CARD.test(onBodies.portal.body) && !OVERVIEW_CARD.test(basePortal.body), "AK2i1: the overview card (O2-3) is on the dashboard portal only");
-      assertEq(unshell(onBodies.portal.body, "o21testgard", "oversikt"), basePortal.body, "AK2i: portal with the shell and the overview card taken out == the flag-off portal (only those added)");
+      // Slice 4 (dev-request 2026-11-24-opplevagent-eierdashbord-lyst-tema-og-testfunn):
+      // «Oversikt» drops the flag-off portal's old stats box and its fetch.
+      const OLD_STATS_BOX = /<div class="gc-card">\n {8}<h2>Statistikk<\/h2>[\s\S]*?<p id="gc-stats-note"[^>]*><\/p>\n {6}<\/div>\n {6}/;
+      const OLD_STATS_FETCH = /fetch\("\/api\/opplevelser\/gardssalg-claim\/[^"]+\/stats"[\s\S]*?\}\)\.catch\(function \(\) \{\}\);\n/;
+      assertTrue(OLD_STATS_BOX.test(basePortal.body) && OLD_STATS_FETCH.test(basePortal.body), "AK2i2: the flag-off portal keeps its stats box and fetch");
+      assertTrue(!OLD_STATS_BOX.test(onBodies.portal.body) && !OLD_STATS_FETCH.test(onBodies.portal.body), "AK2i3: the dashboard portal («Oversikt») has neither");
+      assertEq(unshell(onBodies.portal.body, "o21testgard", "oversikt"), basePortal.body.replace(OLD_STATS_BOX, "").replace(OLD_STATS_FETCH, ""),
+        "AK2i: portal with the shell and the overview card taken out == the flag-off portal without its old stats box (only those changed)");
       assertEq(unshell(onBodies.valg.body, "o21testgard", "valg"), baseValg.body, "AK2j: «Mine valg» with the shell taken out == the flag-off page (existing content kept)");
       // Empty states (tekstpakke OA-3 1.1, verbatim).
       assertTrue(onBodies.besok.body.includes("<p>«Ta imot besøk» er av. Slå det på under «Mine valg» når du vil ta imot forespørsler.</p>"), "AK2k: «Mine besøk» with booking off → empty.visitsOff verbatim");
