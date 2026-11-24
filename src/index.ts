@@ -158,6 +158,7 @@ import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
 import ownerPreviewRoutes, { ownerPreviewAdminRouter } from "./routes/owner-preview";
 import adminOwnerReportPreviewRoutes from "./routes/admin-owner-report-preview";
 import adminOwnerMilestonePreviewRoutes from "./routes/admin-owner-milestone-preview";
+import adminOwnerChangesPreviewRoutes from "./routes/admin-owner-changes-preview";
 import adminOwnerInterestRoutes, { ownerInterestListRouter as adminOwnerInterestListRoutes } from "./routes/admin-owner-interest";
 import adminAgentsBusinessTypeRoutes from "./routes/admin-agents-business-type";
 import adminTestProducerRoutes from "./routes/admin-test-producer";
@@ -420,7 +421,8 @@ app.use("/", avmeldRoutes);
 // POST / RFC 8058 one-click sets notify.report = off. Mounted beside /avmeld
 // so no host gate can swallow the one-click POST. Not a page view (analytics
 // skipPaths). See routes/rapport-avmeld.ts. S5-5: the same router also serves
-// /milepael-avmeld/:token (the milestone e-mail; notify.milestones = false).
+// /milepael-avmeld/:token (the milestone e-mail; notify.milestones = false)
+// and S5-6 /endring-avmeld/:token (the daily change digest; notify.changes = false).
 app.use("/", rapportAvmeldRoutes);
 
 // ─── GET /forhandsvis/:token — read-only preview link for segment B (S5-2,
@@ -1110,6 +1112,9 @@ app.use("/admin/agents/:id/owner-report-preview", adminLimiter, adminOwnerReport
 // GET /admin/agents/:id/owner-milestone-preview — S5-5 milestone e-mail template
 // preview (read only, sends nothing). Mount BEFORE /admin/agents.
 app.use("/admin/agents/:id/owner-milestone-preview", adminLimiter, adminOwnerMilestonePreviewRoutes);
+// GET /admin/agents/:id/owner-changes-preview — S5-6 daily change digest template
+// preview (read only, sends nothing). Mount BEFORE /admin/agents.
+app.use("/admin/agents/:id/owner-changes-preview", adminLimiter, adminOwnerChangesPreviewRoutes);
 app.use("/admin/agents", adminLimiter, adminAgentsRoutes);
 app.use("/admin/outreach-ready-pool", adminLimiter, adminOutreachPoolRoutes);
 // orch-pr-20260614-3: suppression-gate candidates endpoint + sent-log backfill import

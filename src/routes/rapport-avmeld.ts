@@ -28,6 +28,14 @@
 //                                 row, actor system / «milepael-avmeld»), also
 //                                 while coming_soon; idempotent; RFC 8058.
 // A report token never validates on /milepael-avmeld and vice versa.
+//
+// S5-6: the same pattern for the daily change digest (services/
+// owner-changes-digest.ts, purpose owner-changes-unsub-v1):
+//   GET  /endring-avmeld/:token  confirmation page only.
+//   POST /endring-avmeld/:token  sets notify.changes = false (one audit row,
+//                                actor system / «endring-avmeld»), also while
+//                                coming_soon; idempotent; RFC 8058.
+// No token of the three routes validates on another.
 
 import express, { Router, Request, Response } from "express";
 import rateLimit from "express-rate-limit";
@@ -42,6 +50,11 @@ import {
   recordOwnerMilestoneUnsubscribe,
   verifyOwnerMilestoneUnsubToken,
 } from "../services/owner-milestone-email";
+import {
+  ownerMineValgChangesUrl,
+  recordOwnerChangesUnsubscribe,
+  verifyOwnerChangesUnsubToken,
+} from "../services/owner-changes-digest";
 import type { SetOwnerFeatureResult } from "../owner-features/resolve";
 
 const router = Router();
@@ -56,14 +69,19 @@ function resolveDb(): ReturnType<typeof getDb> {
   return dbOverrideForTesting ?? getDb();
 }
 
-const rapportAvmeldLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 60,
-  standardHeaders: true,
-  legacyHeaders: false,
-  validate: { trustProxy: false },
-  message: "For mange forsøk. Prøv igjen om litt.",
-});
+// One bucket per unsubscribe route (S5-6): 60 requests a minute per client on
+// each of /rapport-avmeld, /milepael-avmeld and /endring-avmeld, so one owner
+// e-mail's links never use up another's allowance.
+function makeAvmeldLimiter() {
+  return rateLimit({
+    windowMs: 60 * 1000,
+    max: 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+    validate: { trustProxy: false },
+    message: "For mange forsøk. Prøv igjen om litt.",
+  });
+}
 
 const CONTACT = "kontakt@rettfrabonden.com";
 
@@ -145,7 +163,25 @@ const MILESTONES: UnsubKind = {
   conflict: "så stopper vi e-postene om milepæler for deg",
 };
 
+// S5-6: the daily change digest (notify.changes = false).
+const CHANGES: UnsubKind = {
+  path: "/endring-avmeld/:token",
+  log: "endring-avmeld",
+  verify: verifyOwnerChangesUnsubToken,
+  record: recordOwnerChangesUnsubscribe,
+  mineValgUrl: ownerMineValgChangesUrl,
+  title: "E-post om endringer",
+  question: "Vil du slutte å få e-post om endringer på profilen?",
+  confirm: "Bekreft, så sender vi ikke flere e-poster om endringer på profilen din på Rett fra Bonden.",
+  button: "Ikke send flere e-poster om endringer",
+  doneTitle: "Du får ikke flere e-poster om endringer",
+  done: "Vi sender ikke flere e-poster om endringer på profilen din på Rett fra Bonden.",
+  again: "Vil du ha e-post om endringer igjen",
+  conflict: "så stopper vi e-postene om endringer for deg",
+};
+
 function mountUnsubscribe(k: UnsubKind): void {
+  const rapportAvmeldLimiter = makeAvmeldLimiter();
   const mineValgLine = (agentId: string) =>
     `<p>${esc(k.again)}, kan du endre det i <a href="${esc(k.mineValgUrl(agentId))}">«Mine valg»</a>.</p>`;
 
@@ -192,5 +228,6 @@ ${mineValgLine(agentId)}`));
 
 mountUnsubscribe(REPORT);
 mountUnsubscribe(MILESTONES);
+mountUnsubscribe(CHANGES);
 
 export default router;
