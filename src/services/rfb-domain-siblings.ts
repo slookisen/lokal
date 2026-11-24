@@ -15,8 +15,12 @@
 // never a key — many unrelated farms live there. Only active, non-merged,
 // non-umbrella RFB profiles are siblings; a profile is never its own sibling.
 //
+//   • the pre-registration duplicate lookup (point 5, at the end of this
+//     file): POST /admin/agents/register and the self-registration pre-check.
+//
 // READ-ONLY: SELECTs only (isBlocked() is a read as well).
 
+import { domainToUnicode } from "url";
 import type { getDb } from "../database/init";
 import { isBlocked } from "./blocklist-service";
 import { isFreeMailDomain, isHostedPlatformHost, registrableDomain, websiteHost } from "./claim-domain-rule";
@@ -311,4 +315,139 @@ export function recordSiblingDomainShadow(
   } else {
     shadow.truncated = true;
   }
+}
+
+// ── Pre-registration lookup on website domain / org.nr / e-mail ─────────────
+//
+// dev-request 2026-11-22-rfb-dubletter-samme-nettsted-sammenslaaing-og-
+// utsending, point 5 ("Oppdagelsen"). On 2026-11-22 "Geiranger Sjokolade AS"
+// was registered next to the existing "Geiranger Sjokolade Fjordnær" on the
+// same website: the name checks (0.78 < 0.90) never saw it. POST
+// /admin/agents/register (rfb) and the self-registration pre-check also look
+// up the candidate's website domain (websiteDomainKey of agents.url or
+// agent_knowledge.website), org.nr in the agents.org_nr column and e-mail
+// address (agents.contact_email or agent_knowledge.email) among the ACTIVE
+// RFB profiles (activeRfbProfileWhereSql). READ-ONLY: SELECTs only.
+
+/** The A2A-required placeholder contact e-mail; never a match key. */
+export const RFB_PLACEHOLDER_CONTACT_EMAIL = "kontakt@rettfrabonden.com";
+
+export type RegisterDomainEmailMatchKind = "org_nr" | "website_domain" | "email";
+export const REGISTER_DOMAIN_EMAIL_MATCH_ORDER: readonly RegisterDomainEmailMatchKind[] = ["org_nr", "website_domain", "email"];
+
+export interface RegisterDomainEmailCandidate {
+  url?: unknown;
+  /** A string or a JSON number (123456789); only the digits count, exactly 9. */
+  org_nr?: unknown;
+  email?: unknown;
+}
+
+/** 9-digit org.nr from a string or finite number (non-digits dropped), else null. */
+export function orgNrDigits(v: unknown): string | null {
+  const s = typeof v === "string" ? v : typeof v === "number" && Number.isFinite(v) ? String(v) : null;
+  if (s === null) return null;
+  const d = s.replace(/\D/g, "");
+  return /^\d{9}$/.test(d) ? d : null;
+}
+
+/** Trimmed lower-case e-mail, or null when empty, not an address, or the placeholder. */
+export function siblingEmailKey(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const e = v.trim().toLowerCase();
+  if (!e || !e.includes("@") || e === RFB_PLACEHOLDER_CONTACT_EMAIL) return null;
+  return e;
+}
+
+function likeEscape(s: string): string {
+  return s.replace(/[\\%_]/g, (c) => `\\${c}`);
+}
+
+/**
+ * Every active RFB profile (other than `excludeId`) that shares the
+ * candidate's org.nr (agents.org_nr column), website domain or e-mail, per
+ * kind, each list sorted by id. A profile can appear under several kinds.
+ *
+ * The website domain is computed in JS (websiteDomainKey), so SQL only
+ * prefilters: rows whose url/website contains the domain (or its Unicode
+ * form for an IDN) as a substring, then confirmed with websiteDomainKey.
+ */
+export function findRfbDomainEmailSiblings(
+  db: Db,
+  candidate: RegisterDomainEmailCandidate,
+  excludeId = "",
+): Record<RegisterDomainEmailMatchKind, string[]> {
+  const out: Record<RegisterDomainEmailMatchKind, string[]> = { org_nr: [], website_domain: [], email: [] };
+  const active = activeRfbProfileWhereSql("a");
+
+  const orgNr = orgNrDigits(candidate.org_nr);
+  if (orgNr) {
+    const rows = db
+      .prepare(
+        `SELECT a.id AS id FROM agents a
+          WHERE a.id <> ? AND ${active}
+            AND a.org_nr IS NOT NULL AND REPLACE(TRIM(a.org_nr), ' ', '') = ?
+          ORDER BY a.id`,
+      )
+      .all(excludeId, orgNr) as Array<{ id: string }>;
+    out.org_nr = rows.map((r) => r.id);
+  }
+
+  const domain = websiteDomainKey(candidate.url);
+  if (domain) {
+    const needles = new Set<string>([domain]);
+    if (domain.includes("xn--")) {
+      const uni = domainToUnicode(domain);
+      if (uni) needles.add(uni);
+    }
+    const ids = new Set<string>();
+    for (const needle of needles) {
+      const like = `%${likeEscape(needle)}%`;
+      const rows = db
+        .prepare(
+          `SELECT a.id AS id, a.url AS url, k.website AS k_website
+             FROM agents a
+             LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+            WHERE a.id <> ? AND ${active}
+              AND (a.url LIKE ? ESCAPE '\\' OR k.website LIKE ? ESCAPE '\\')`,
+        )
+        .all(excludeId, like, like) as Array<{ id: string; url: string | null; k_website: string | null }>;
+      for (const r of rows) {
+        if (websiteDomainKey(r.url) === domain || websiteDomainKey(r.k_website) === domain) ids.add(r.id);
+      }
+    }
+    out.website_domain = [...ids].sort();
+  }
+
+  const email = siblingEmailKey(candidate.email);
+  if (email) {
+    const rows = db
+      .prepare(
+        `SELECT DISTINCT a.id AS id
+           FROM agents a
+           LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+          WHERE a.id <> ? AND ${active}
+            AND (LOWER(TRIM(a.contact_email)) = ? OR LOWER(TRIM(k.email)) = ?)
+          ORDER BY a.id`,
+      )
+      .all(excludeId, email, email) as Array<{ id: string }>;
+    out.email = rows.map((r) => r.id);
+  }
+  return out;
+}
+
+/**
+ * POST /admin/agents/register (rfb): the first active RFB profile sharing the
+ * candidate's org.nr (column), website domain or e-mail — kind order org_nr →
+ * website_domain → email, lowest id within a kind — or null. Reads only.
+ */
+export function findRegisterDomainEmailMatch(
+  db: Db,
+  candidate: RegisterDomainEmailCandidate,
+): { existingId: string; match: RegisterDomainEmailMatchKind } | null {
+  const hits = findRfbDomainEmailSiblings(db, candidate);
+  for (const kind of REGISTER_DOMAIN_EMAIL_MATCH_ORDER) {
+    const id = hits[kind][0];
+    if (id) return { existingId: id, match: kind };
+  }
+  return null;
 }

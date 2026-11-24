@@ -51862,6 +51862,27 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-22-rfb-dubletter-samme-nettsted-sammenslaaing-og-
+// utsending, point 5 (AK5): POST /admin/agents/register (rfb, always on)
+// refuses a candidate sharing the website domain, org.nr (column) or e-mail
+// with an ACTIVE RFB profile (Geiranger case). Pins getDb() to its own
+// in-memory DB, sets env (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dubletter point 5: register website-domain / org.nr / e-mail dedup ──");
+  try {
+    const { runAdminAgentsRegisterDomainDedupTests } = require("../src/routes/admin-agents-register-domain-dedup.test") as
+      typeof import("../src/routes/admin-agents-register-domain-dedup.test");
+    const dd = await runAdminAgentsRegisterDomainDedupTests({ log: false });
+    passed += dd.passed;
+    failed += dd.failed;
+    for (const f of dd.failures) failures.push("register-domain-dedup: " + f);
+    console.log(`  register-domain-dedup: ${dd.passed} passed, ${dd.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("register-domain-dedup: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice
 // B2b-2: after a B2b-1 auto-approval the farm's known address (as before the
 // approval) gets «Ny eier registrert for <profil>» when it exists, differs

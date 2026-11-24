@@ -42,6 +42,14 @@
 //   duplicates  other RFB agents (not this one, not merged) with the same
 //               org.nr or the same contact e-mail ("exact"), or the same
 //               normalised name in the same city ("possible"). ≤ 5 ids each.
+//               Also "possible" (domain_email_ids, dev-request 2026-11-22-
+//               rfb-dubletter-samme-nettsted-sammenslaaing-og-utsending
+//               point 5): an ACTIVE RFB profile on the same registrable
+//               website domain or with the same e-mail (agents.contact_email
+//               or agent_knowledge.email), via findRfbDomainEmailSiblings
+//               (rfb-domain-siblings.ts). Hosted platforms, free-mail and
+//               the placeholder address never count. It only pushes the
+//               recommendation to spor_forst, never to avvis on its own.
 //   domain_tie  the own e-mail domain or the website domain plausibly ties to
 //               the Brreg entity: the registrable domain's label (normalised,
 //               æøå folded) starts or ends with a non-generic Brreg-name token
@@ -101,6 +109,7 @@ import {
 } from "./claim-assessment";
 import { emailDomain, isFreeMailDomain, isProbeableDomain, registrableDomain, websiteHost } from "./claim-domain-rule";
 import { customerRuleSql } from "./customer-rule";
+import { findRfbDomainEmailSiblings } from "./rfb-domain-siblings";
 
 /** Env flag (read at call time). ON unless exactly "false". */
 export const REGISTRATION_PRECHECK_FLAG = "REGISTRATION_PRECHECK_ENABLED";
@@ -169,6 +178,13 @@ export interface DuplicateSignal {
   exact_vetted_ids: string[];
   /** Same normalised name and same city. */
   name_place_ids: string[];
+  /**
+   * Same registrable website domain (websiteDomainKey of agents.url /
+   * agent_knowledge.website) or same e-mail (agents.contact_email /
+   * agent_knowledge.email) as an ACTIVE RFB profile, not already in
+   * exact_ids (dubletter point 5). Absent in a precheck stored before it.
+   */
+  domain_email_ids?: string[];
 }
 
 export interface DomainTieSignal {
@@ -615,6 +631,8 @@ export async function assessRegistration(
   const exactUnvetted = dup.exact_ids.filter((id) => !dup.exact_vetted_ids.includes(id));
   if (exactUnvetted.length) reasons.push(`Mulig duplikat: samme org.nr eller e-post som ${exactUnvetted.length} ikke-godkjent(e) profil(er)`);
   if (dup.name_place_ids.length) reasons.push(`Mulig duplikat: ${dup.name_place_ids.length} profil(er) med samme navn og sted`);
+  const domainEmailIds = dup.domain_email_ids ?? [];
+  if (domainEmailIds.length) reasons.push(`Mulig duplikat: ${domainEmailIds.length} aktiv(e) profil(er) med samme nettsteddomene eller e-post`);
   if (tieRequired) {
     reasons.push(domainTie.tied ? "Domene: knyttet til enheten" : "Domene: domenet er ikke knyttet til enheten");
   }
@@ -631,7 +649,7 @@ export async function assessRegistration(
     && !brreg.under_avvikling;
   const contactSupport = (emailSig.domain_type === "own" && emailSig.mx === true)
     || (website.answers === true && website.name_on_page === true);
-  const anyDuplicate = dup.exact_ids.length > 0 || dup.name_place_ids.length > 0;
+  const anyDuplicate = dup.exact_ids.length > 0 || dup.name_place_ids.length > 0 || domainEmailIds.length > 0;
   const recommendation: PrecheckRecommendation = avvis ? "avvis"
     : brregMatch && contactSupport && !anyDuplicate && unavailableSources.length === 0
       && (!tieRequired || domainTie.tied) && !junk.junk ? "godkjenn"
@@ -752,6 +770,15 @@ export function gatherRegistrationPrecheckInput(db: Db, agentId: string): Regist
     }
   }
 
+  // Possible: an active RFB profile on the same website domain or with the
+  // same e-mail (contact_email / agent_knowledge.email), dubletter point 5.
+  // org.nr is left to `exact` above (same column/tag rule, incl. inactive).
+  const siblings = findRfbDomainEmailSiblings(db, { url: row.url, email: row.contact_email }, agentId);
+  const domainEmail = [...new Set([...siblings.website_domain, ...siblings.email])]
+    .filter((id) => !exact.has(id))
+    .sort()
+    .slice(0, cap);
+
   // The shared customer rule (claimed_at OR a verified claim), same as the
   // review queue. Revoking a claim sets status = 'revoked' (and restores /
   // clears claimed_at), so a revoked claim never counts here.
@@ -772,6 +799,7 @@ export function gatherRegistrationPrecheckInput(db: Db, agentId: string): Regist
       exact_ids: exactIds.slice(0, cap),
       exact_vetted_ids: exactIds.filter((id) => exact.get(id)).slice(0, cap),
       name_place_ids: namePlace,
+      domain_email_ids: domainEmail,
     },
     ownerClaimConfirmed,
   };

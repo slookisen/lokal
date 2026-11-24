@@ -432,7 +432,7 @@ export async function runOrganicClaimGateS3bTests(opts: { log?: boolean } = {}):
     {
       const post = findHandler(adminAgentsRouter, "/register", "post");
       let n = 0;
-      const call = (o: Record<string, unknown>) => invoke(post, { body: { name: `Register Gard ${++n}`, url: `https://reg${n}.example.no`, city: "Valdres", vertical_id: "rfb", ...o } });
+      const call = (o: Record<string, unknown>) => invoke(post, { body: { name: `Register Gard ${++n}`, url: `https://register-gard-${n}.no`, city: "Valdres", vertical_id: "rfb", ...o } });
       flag(false);
       let r = await call({ description: ORGANIC_DESC, tags: ["organic", "gårdsutsalg"], categories: ["vegetables", "organic"] });
       assertEq(r.status, 201, "reg-off-1: flag off → registered");
