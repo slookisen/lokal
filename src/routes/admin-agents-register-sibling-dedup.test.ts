@@ -8,7 +8,9 @@
  *   D3.1  flag on: phone match, address+postal match, org.nr in the column
  *         only → duplicate:true, the right match kind and existing_id, no
  *         new agents/agent_knowledge row
- *   D3.2  flag off → all three register as before; flag on + experiences →
+ *   D3.2  flag off → phone/address register as before (the org.nr column
+ *         case is refused by the always-on dedup 4, dubletter point 5);
+ *         flag on + experiences →
  *         no new dedup; no match → created; suffix-only phone and an
  *         address without a digit are not matches; deterministic existing_id
  *
@@ -86,7 +88,9 @@ export async function runAdminAgentsRegisterSiblingDedupTests(opts: { log?: bool
     } = {}): string {
       db.prepare(`INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, city, org_nr, tags, vertical_id)
                   VALUES (?, ?, 'En gård.', 'test', 'kontakt@rettfrabonden.com', ?, 'producer', ?, ?, ?, ?, ?)`)
-        .run(id, o.name ?? `Gård ${id}`, `https://${id}.example.test`, `key-${id}`, o.city ?? "Bø",
+        // Each fixture on its own registrable domain, so the always-on RFB
+        // website-domain dedup (dedup 4) never fires between them.
+        .run(id, o.name ?? `Gård ${id}`, `https://${id}.no`, `key-${id}`, o.city ?? "Bø",
           o.orgNr ?? null, o.tags ?? "[]", o.vertical ?? "rfb");
       if (o.knowledge) {
         const cols = Object.keys(o.knowledge);
@@ -115,10 +119,10 @@ export async function runAdminAgentsRegisterSiblingDedupTests(opts: { log?: bool
     const orgSib = agent("d3-org", { name: "Orgnr Gard", city: "Ål", orgNr: "988777666" });
     agent("d3-exp", { name: "Opplevelse", city: "Bø", vertical: "experiences", knowledge: { phone: "+47 455 66 777" } });
 
-    const phoneBody = { name: "Ny Gard A", url: "https://a.example.test", city: "Seljord", vertical_id: "rfb", phone: "90011222" };
-    const addrBody = { name: "Ny Gard B", url: "https://b.example.test", city: "Seljord", vertical_id: "rfb",
+    const phoneBody = { name: "Ny Gard A", url: "https://d3-cand-a.no", city: "Seljord", vertical_id: "rfb", phone: "90011222" };
+    const addrBody = { name: "Ny Gard B", url: "https://d3-cand-b.no", city: "Seljord", vertical_id: "rfb",
       phone: "41122334", address: "Storvegen 12", postal_code: "3570" };
-    const orgBody = { name: "Ny Gard C", url: "https://c.example.test", city: "Seljord", vertical_id: "rfb", org_nr: "988777666" };
+    const orgBody = { name: "Ny Gard C", url: "https://d3-cand-c.no", city: "Seljord", vertical_id: "rfb", org_nr: "988777666" };
 
     // ══ D3.1 flag on ══════════════════════════════════════════════════════
     process.env.REGISTER_SIBLING_DEDUP_ENABLED = "true";
@@ -161,7 +165,7 @@ export async function runAdminAgentsRegisterSiblingDedupTests(opts: { log?: bool
       removeAgent(rfbVsExp.body.agent_id ?? rfbVsExp.body.id);
 
       const n0 = count("agents");
-      const none = await register({ name: "Helt Ny Gard", url: "https://n.example.test", city: "Seljord", vertical_id: "rfb",
+      const none = await register({ name: "Helt Ny Gard", url: "https://d3-cand-n.no", city: "Seljord", vertical_id: "rfb",
         phone: "93344556", address: "Bakkevegen 3", postal_code: "3840", org_nr: "911222333" });
       eq([none.status, none.body?.success, count("agents")], [201, true, n0 + 1], "D3.2: no match → created as before");
       const noneRow = db.prepare("SELECT * FROM agents WHERE name = 'Helt Ny Gard'").get() as any;
@@ -170,17 +174,17 @@ export async function runAdminAgentsRegisterSiblingDedupTests(opts: { log?: bool
       removeAgent(noneRow.id);
 
       const n1 = count("agents");
-      const suffix = await register({ ...phoneBody, name: "Suffix Gard", phone: "11222" });
+      const suffix = await register({ ...phoneBody, name: "Suffix Gard", url: "https://d3-cand-s1.no", phone: "11222" });
       eq([suffix.status, suffix.body?.success], [201, true], "D3.2: phone that only shares a suffix (11222) → not a match");
-      const suffix8 = await register({ ...phoneBody, name: "Suffix Gard 2", phone: "+47 400 11 222" });
+      const suffix8 = await register({ ...phoneBody, name: "Suffix Gard 2", url: "https://d3-cand-s2.no", phone: "+47 400 11 222" });
       eq([suffix8.status, suffix8.body?.success], [201, true], "D3.2: different 8-digit number with the same tail → not a match");
       eq(count("agents"), n1 + 2, "D3.2: both created");
 
       agent("d3-nodigit", { name: "Ingen Siffer", knowledge: { address: "Storvegen", postal_code: "3570" } });
-      const nd = await register({ name: "Nodigit Ny", url: "https://nd.example.test", city: "Seljord", vertical_id: "rfb",
+      const nd = await register({ name: "Nodigit Ny", url: "https://d3-cand-nd.no", city: "Seljord", vertical_id: "rfb",
         address: "Storvegen", postal_code: "3570" });
       eq([nd.status, nd.body?.success], [201, true], "D3.2: address without a digit → not a match");
-      const otherPostal = await register({ ...addrBody, name: "Annen Post", postal_code: "3580" });
+      const otherPostal = await register({ ...addrBody, name: "Annen Post", url: "https://d3-cand-op.no", postal_code: "3580" });
       eq([otherPostal.status, otherPostal.body?.success], [201, true], "D3.2: same street address, other postal code → not a match");
 
       // Deterministic existing_id: two phone siblings → the smaller id.
@@ -201,10 +205,19 @@ export async function runAdminAgentsRegisterSiblingDedupTests(opts: { log?: bool
         (db as any).prepare = (sql: string) => { sqls.push(sql); return origPrepare(sql); };
         let r: { status: number; body: any };
         try { r = await register(body); } finally { (db as any).prepare = origPrepare; }
-        eq(sqls.some((q) => /a\.id <> \?|k\.agent_id <> \?/.test(q)), false,
+        // claimSiblingsForRow's queries ("a.id <> ? AND COALESCE(a.vertical_id" /
+        // "k.agent_id <> ?"); the always-on dedup 4 query is not one of them.
+        eq(sqls.some((q) => /a\.id <> \? AND COALESCE\(a\.vertical_id|k\.agent_id <> \?/.test(q)), false,
           `D3.2: flag ${off ?? "unset"}, ${label} case → no sibling-rule query`);
-        eq([r.status, r.body?.success, r.body?.duplicate, count("agents")], [201, true, undefined, n + 1],
-          `D3.2: flag ${off ?? "unset"}, ${label} case → new profile as today`);
+        if (label === "org_nr") {
+          // dubletter point 5: the agents.org_nr column match is always on
+          // for rfb (dedup 4, rfb-domain-siblings.ts), flag or not.
+          eq([r.status, r.body?.duplicate, r.body?.existing_id, r.body?.match, count("agents")], [200, true, orgSib, "org_nr", n],
+            `D3.2: flag ${off ?? "unset"}, org_nr case → refused by the always-on dedup 4`);
+        } else {
+          eq([r.status, r.body?.success, r.body?.duplicate, count("agents")], [201, true, undefined, n + 1],
+            `D3.2: flag ${off ?? "unset"}, ${label} case → new profile as today`);
+        }
         const id = r.body?.agent_id ?? r.body?.id;
         if (id) removeAgent(id);
       }

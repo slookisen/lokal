@@ -128,6 +128,7 @@ import {
 import { readDebioVerified } from "../services/debio-approval";
 // The claim admin queue (decision 11=A) — see GET /claim-review-queue below.
 import { knowledgeService, findRegisterSiblingMatch } from "../services/knowledge-service";
+import { findRegisterDomainEmailMatch, RFB_PLACEHOLDER_CONTACT_EMAIL } from "../services/rfb-domain-siblings";
 // D3b (POST /register duplicate fill): the shared "is customer / owner-locked"
 // rule (agents.claimed_at set OR a verified agent_claims row) — one definition.
 import { customerRuleSql } from "../services/customer-rule";
@@ -414,9 +415,15 @@ router.get("/", (req: Request, res: Response) => {
 //   1. org_nr tag match  → { success: false, duplicate: true, existing_id }
 //      (skipped when org_nr is absent — nothing to match on)
 //   2. name+city match   → { success: false, duplicate: true, existing_id }
-//   3. Insert new agent with trust_score 0.3 (lower than owner-claimed 0.5)
-//   (D3: a third sibling check behind REGISTER_SIBLING_DEDUP_ENABLED; D3b:
-//   with REGISTER_DUPLICATE_FILL_ENABLED, rfb, any duplicate hit also fills
+//   3. (D3) sibling check behind REGISTER_SIBLING_DEDUP_ENABLED, rfb only:
+//      org.nr / phone / street address → { ..., match }
+//   4. (rfb only, always on) website domain / org.nr column / e-mail of an
+//      ACTIVE RFB profile (findRegisterDomainEmailMatch, rfb-domain-
+//      siblings.ts; dubletter point 5) → { ..., match: "org_nr" |
+//      "website_domain" | "email" }. Hosted platforms / aggregators /
+//      free-mail domains and the placeholder e-mail never match.
+//   5. Insert new agent with trust_score 0.3 (lower than owner-claimed 0.5)
+//   (D3b: with REGISTER_DUPLICATE_FILL_ENABLED, rfb, any duplicate hit also fills
 //   empty email/website on the existing profile and adds `filled: string[]`
 //   to the response — see fillRegisterDuplicateContact above this route.)
 //
@@ -463,7 +470,7 @@ router.get("/", (req: Request, res: Response) => {
 //     protects a POPULATED value — this path is a pure ADD by construction
 //     (the isPureAdd shortcut), so the curated lock is the only rule left.
 //   - no valid http(s) source_url (body source_url, else body url) → nothing.
-export const REGISTER_PLACEHOLDER_CONTACT_EMAIL = "kontakt@rettfrabonden.com";
+export const REGISTER_PLACEHOLDER_CONTACT_EMAIL = RFB_PLACEHOLDER_CONTACT_EMAIL; // "kontakt@rettfrabonden.com"
 
 export function registerDuplicateFillEnabled(): boolean {
   return process.env.REGISTER_DUPLICATE_FILL_ENABLED === "true";
@@ -825,6 +832,38 @@ router.post("/register", async (req: Request, res: Response) => {
           match: sibling.match,
           message: `Agent matching an existing RFB profile on ${sibling.match} already exists`,
           ...duplicateFillExtra(db, sibling.existingId),
+        });
+        return;
+      }
+    }
+
+    // ── Dedup 4: website domain / org.nr column / e-mail (rfb, always on) ──
+    // dev-request 2026-11-22-rfb-dubletter-samme-nettsted-sammenslaaing-og-
+    // utsending, point 5: "Geiranger Sjokolade AS" was registered next to the
+    // active "Geiranger Sjokolade Fjordnær" on the same website because only
+    // names were compared. Refuse a new RFB profile when an ACTIVE RFB
+    // profile has the same org.nr in agents.org_nr, the same registrable
+    // website domain (agents.url or agent_knowledge.website, via
+    // websiteDomainKey — hosted platforms, aggregators and free-mail never
+    // count) or the same e-mail (agents.contact_email or
+    // agent_knowledge.email; the placeholder never counts). Order org_nr →
+    // website_domain → email, lowest id first. No flag: it only refuses,
+    // reads only, and runs before the Brreg lookup and the INSERT, so a hit
+    // writes nothing (except the D3b fill when that flag is on).
+    if (vertical_id === "rfb") {
+      const hit = findRegisterDomainEmailMatch(db, {
+        url,
+        org_nr: (req.body as { org_nr?: unknown }).org_nr,
+        email: trimmedEmail,
+      });
+      if (hit) {
+        res.json({
+          success: false,
+          duplicate: true,
+          existing_id: hit.existingId,
+          match: hit.match,
+          message: `Agent matching an existing RFB profile on ${hit.match} already exists`,
+          ...duplicateFillExtra(db, hit.existingId),
         });
         return;
       }

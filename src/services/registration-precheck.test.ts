@@ -293,6 +293,15 @@ export async function runRegistrationPrecheckTests(opts: { log?: boolean } = {})
     "spor_forst", "S10: exact duplicate of an UNVETTED profile → spor_forst");
   eq((await run({ search: [brregEnhet({ navn: "Solbakken Gård AS", konkurs: true })] }, { orgNr: null })).recommendation,
     "spor_forst", "S11: the only name-search hit is konkurs → spor_forst (not avvis)");
+  {
+    // dubletter point 5: same website domain / e-mail as an active RFB profile.
+    eq((await run({})).recommendation, "godkjenn", "S12: baseline (no duplicate) → godkjenn");
+    const r = await run({}, { duplicates: { exact_ids: [], exact_vetted_ids: [], name_place_ids: [], domain_email_ids: ["dd-1", "dd-2"] } });
+    eq(r.recommendation, "spor_forst", "S12: same website domain / e-mail as an active profile → spor_forst (never godkjenn, not avvis)");
+    ok(r.reasons.includes("Mulig duplikat: 2 aktiv(e) profil(er) med samme nettsteddomene eller e-post"), "S12: reason");
+    eq((await run({}, { duplicates: { exact_ids: [], exact_vetted_ids: [], name_place_ids: [] } })).recommendation, "godkjenn",
+      "S12: a stored-before input without domain_email_ids still reads as no duplicate");
+  }
 
   // ── avvis ───────────────────────────────────────────────────────────────
   {
@@ -468,6 +477,38 @@ export async function runRegistrationPrecheckTests(opts: { log?: boolean } = {})
     eq(rp.gatherRegistrationPrecheckInput(db as any, "self-a")!.orgNrSelfReported, true, "gather: audit table missing → self-reported (fail closed)");
     db.exec(auditSql);
     db.prepare(`UPDATE agents SET tags = '[]', org_nr = ? WHERE id = 'self-a'`).run(ORG);
+
+    // ── gather: website domain / e-mail siblings (dubletter point 5) ──
+    // The fixtures above all share example.test; these use their own domains
+    // and are removed again so the route checks below see the same rows.
+    {
+      const PH = "kontakt@rettfrabonden.com";
+      const ddIds = ["dd-self", "dd-site", "dd-kmail", "dd-inactive", "dd-exact", "dd-fb1", "dd-fb2"];
+      insert("dd-self", { name: "Geiranger Sjokolade AS", email: "post@geirangersjokolade.no", url: "https://geirangersjokolade.no/om-oss", city: "Stranda" });
+      insert("dd-site", { name: "Geiranger Sjokolade Fjordnær", origin: "discovery", vetted: 1, email: PH, url: "https://www.geirangersjokolade.no", city: "Geiranger" });
+      insert("dd-kmail", { name: "Kmail Gard", origin: "discovery", vetted: 1, email: PH, url: "https://dd-kmail.no", city: "Hamar" });
+      db.prepare(`INSERT INTO agent_knowledge (agent_id, email) VALUES ('dd-kmail', ' POST@GeirangerSjokolade.no')`).run();
+      insert("dd-inactive", { name: "Nedlagt", origin: "discovery", vetted: 1, email: PH, url: "https://geirangersjokolade.no", city: "Oslo" });
+      db.prepare(`UPDATE agents SET is_active = 0 WHERE id = 'dd-inactive'`).run();
+      insert("dd-exact", { name: "Eksakt", origin: "discovery", vetted: 0, email: "post@geirangersjokolade.no", url: "https://dd-exact.no", city: "Bergen" });
+      insert("dd-fb1", { name: "Fb En", email: PH, url: "https://www.facebook.com/fb1", city: "Bodø" });
+      insert("dd-fb2", { name: "Fb To", origin: "discovery", vetted: 1, email: PH, url: "https://www.facebook.com/fb2", city: "Tromsø" });
+
+      const dbSnap = JSON.stringify([db.prepare("SELECT * FROM agents ORDER BY rowid").all(), db.prepare("SELECT * FROM agent_knowledge ORDER BY rowid").all()]);
+      const gd = rp.gatherRegistrationPrecheckInput(db as any, "dd-self")!;
+      eq(gd.duplicates.domain_email_ids, ["dd-kmail", "dd-site"],
+        "gather: same website domain (dd-site) + same agent_knowledge.email (dd-kmail); inactive excluded; self excluded");
+      eq(gd.duplicates.exact_ids, ["dd-exact"], "gather: the same contact_email stays an exact duplicate, not repeated in domain_email_ids");
+      eq(rp.gatherRegistrationPrecheckInput(db as any, "dd-fb1")!.duplicates.domain_email_ids, [],
+        "gather: hosted platform url and the placeholder e-mail never count");
+      eq(JSON.stringify([db.prepare("SELECT * FROM agents ORDER BY rowid").all(), db.prepare("SELECT * FROM agent_knowledge ORDER BY rowid").all()]),
+        dbSnap, "gather: reads only");
+
+      for (const id of ddIds) {
+        db.prepare("DELETE FROM agent_knowledge WHERE agent_id = ?").run(id);
+        db.prepare("DELETE FROM agents WHERE id = ?").run(id);
+      }
+    }
 
     // ── routes ──
     for (const p of ["../routes/marketplace", "../routes/admin-agents"]) delete require.cache[require.resolve(p)];
