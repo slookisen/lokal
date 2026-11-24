@@ -9,6 +9,13 @@
  *       requests are exactly what they were (no extra fetch).
  *   D4  summarizeDryRun: per-platform breakdown (owned / unowned) and
  *       no-hit reason counts; a stored row without diagnostics → unknown.
+ *   D5  slice 2 — ReDoS hardening: every changed scanner finishes a ~200 KB
+ *       hostile string in < 200 ms; discoverProductLinks / scanAnchorTags
+ *       give exactly the old regex's links, order and rejects.
+ *   D6  slice 2 — a mere mention of WooCommerce / Mystore in body text is no
+ *       fingerprint; an asset path, handle, class or generator tag is.
+ *   D7  slice 2 — an LLM call that failed (infra_failure / invalid_json /
+ *       not_array) → `llm_failed`, counted by the dry-run summary.
  *
  * No network: an injected fake fetch; the LLM is an injected function.
  */
@@ -271,6 +278,173 @@ export function runSiteDiagnosticsTests(opts: { log?: boolean } = {}): Promise<T
     );
     assertEq([sdSum.pagination_hint_sites, sdSum.no_hit_with_price_text], [1, 1], "D4 summary: pagination hints and no-hit sites with price text");
     assertEq(sum.profiles_total, 5, "D4 summary: the existing fields are still there");
+
+    // ── D5: ReDoS hardening (linear time) + link-scanner parity ────────────
+    const HOSTILE = 200_000;
+    const fast = (label: string, f: () => unknown) => {
+      const t0 = Date.now();
+      f();
+      const ms = Date.now() - t0;
+      assertEq(ms < 200 ? "fast" : `${ms} ms`, "fast", `D5 < 200 ms on ~200 KB: ${label}`);
+    };
+    const hostAllowed = ex.allowedHostsFor("garden.no");
+    const rep = (unit: string) => unit.repeat(Math.ceil(HOSTILE / unit.length));
+    fast("links: unclosed <a href=\"x\" repeated", () => ex.discoverProductLinks(rep('<a href="x"'), "https://garden.no/", hostAllowed, 8));
+    fast("links: <a href=\"x\" + spaces, no >", () => ex.discoverProductLinks('<a href="x"' + " ".repeat(HOSTILE), "https://garden.no/", hostAllowed, 8));
+    fast("links: <a <a href=… with a far >", () => ex.discoverProductLinks(rep('<a <a <a href="x" href="" ') + ">", "https://garden.no/", hostAllowed, 8));
+    fast("links: anchors never closed by </a>", () => ex.discoverProductLinks(rep('<a href="/produkter">x'), "https://garden.no/", hostAllowed, 8));
+    fast("pageTextOf: unclosed <script repeated", () => ex.pageTextOf(rep("<script")));
+    fast("pageTextOf: unclosed <!-- repeated", () => ex.pageTextOf(rep("<!--")));
+    fast("pageTextOf: < with no >", () => ex.pageTextOf(rep("<")));
+    fast("pageTextOf: <br with no >", () => ex.pageTextOf(rep("<br")));
+    fast("pageTextOf: whitespace run with no newline", () => ex.pageTextOf(rep("\r\f ")));
+    fast("price text: long run of digit groups", () => sd.hasNokPriceText(rep("111 ")));
+    fast("price text: long digit run", () => sd.hasNokPriceText("1".repeat(HOSTILE)));
+    fast("platform: <meta name=\"generator\" repeated without >", () => sd.detectSitePlatform({ html: rep('<meta name="generator"') }));
+    fast("platform: <meta repeated without >", () => sd.detectSitePlatform({ html: rep("<meta ") }));
+    fast("platform: unclosed class= / id=wc- / mystore href", () =>
+      sd.detectSitePlatform({ html: rep('class="') + rep('id="wc-') + rep('href="//a.mystore.no/') }),
+    );
+
+    // Old anchor regex, kept here as the reference the scanner must equal.
+    const OLD_ANCHOR = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]{0,160}?)<\/a>/gi;
+    const PARITY_PAGE = [
+      "<!doctype html><html><head><title>Gården</title></head><body>",
+      '<nav><a href="/">Hjem</a> <A HREF="/Produkter/">Produkter</A> <a class="x" href=\'/prisliste\' title="Priser">Se <b>prisliste</b></a>',
+      '<a href="/nettbutikk?kat=kjott&amp;side=1">Nettbutikk</a> <a href="#top">Til toppen</a> <a href="mailto:post@garden.no">E-post</a>',
+      '<a href="https://www.garden.no/vare/honning-250g">Honning 250 g</a> <a href="https://andre.no/butikk">Annen butikk</a>',
+      '<a data-href="/feil" href="/sortiment">Vårt sortiment</a> <a href="/bilder/produkt.jpg">Bilde</a> <a href="/om-oss">Om oss</a>',
+      '<a href="/gårdsbutikk">Gårdsbutikk</a> <a href="/p%C3%A5melding">påmelding</a> <a href="/shop" >Shop</a>',
+      '<a href="/bestill">',
+      "x".repeat(170),
+      '</a> <a href="/kjøp">Kjøp her</a> <a href="/salg"\n>Salg</a>',
+      '<a href="/meny">Meny <a href="/varer">Varer</a> <a href="">tom</a> <a href="/produkter/">Produkter igjen</a>',
+      '<abbr href="/produkt-abbr">x</abbr> <a\nhref="/pris">Pris</a> <a href="/product?id=1&amp;x=2">Product</a>',
+      "</body></html>",
+    ].join("");
+    // Captured from the regex implementation before slice 2.
+    assertEq(
+      ex.discoverProductLinks(PARITY_PAGE, "https://garden.no/", hostAllowed, 20),
+      {
+        links: [
+          "https://garden.no/pris",
+          "https://garden.no/prisliste",
+          "https://garden.no/meny",
+          "https://garden.no/product?id=1&x=2",
+          "https://garden.no/produkter/",
+          "https://garden.no/Produkter/",
+          "https://garden.no/sortiment",
+          "https://www.garden.no/vare/honning-250g",
+          "https://garden.no/g%C3%A5rdsbutikk",
+          "https://garden.no/kj%C3%B8p",
+          "https://garden.no/nettbutikk?kat=kjott&side=1",
+          "https://garden.no/shop",
+          "https://garden.no/salg",
+        ],
+        rejected: ["https://andre.no/butikk"],
+      },
+      "D5 parity: discoverProductLinks gives the same links, ranking and rejects as before",
+    );
+    assertEq(
+      ex.discoverProductLinks(PARITY_PAGE, "https://garden.no/", hostAllowed, 5).links,
+      ["https://garden.no/pris", "https://garden.no/prisliste", "https://garden.no/meny", "https://garden.no/product?id=1&x=2", "https://garden.no/produkter/"],
+      "D5 parity: the cap keeps the top-ranked links",
+    );
+    const parityCases = [
+      PARITY_PAGE,
+      '<a href="a>b" title="t">x</a>',
+      "<a href=\"x' href='y\">t</a>",
+      '<a href="/a" <a href="/b">t</a></a>',
+      '<a href="/a">' + "y".repeat(161) + '</a><a href="/b">' + "y".repeat(160) + "</a>",
+      '<a href="/a"><a href="/b">t</A>',
+      '<a href="" href="/c">t</a><a href="/d" href="">u</a>',
+      '<a href="/unclosed>no close <a href="/next">n</a>',
+    ];
+    for (const [i, html] of parityCases.entries()) {
+      assertEq(
+        ex.scanAnchorTags(html),
+        [...html.matchAll(OLD_ANCHOR)].map((m) => ({ href: m[1], text: m[2] })),
+        `D5 parity: scanAnchorTags equals the old anchor regex (case ${i})`,
+      );
+    }
+    assertEq(
+      ex.pageTextOf('<p>Honning<br>kr 120</p><script>x<y</script><!-- c --><style>a{}</style>\n \r\n<div\n class="a">Egg  60,-</div> <b'),
+      "Honning\nkr 120\nEgg 60,-\n<b",
+      "D5 parity: pageTextOf output unchanged (blocks, tags, whitespace runs, unclosed tail)",
+    );
+
+    // ── D6: mentions in body text are no fingerprint ───────────────────────
+    const platformCases: Array<[string, string, string]> = [
+      ["plain", HTML("", `${FILLER}<p>Vi bruker WooCommerce i nettbutikken vår.</p>`), "WooCommerce mentioned in text"],
+      ["plain", HTML("", `${FILLER}<p>Bestill på gardsbutikk.mystore.no eller mystore.no</p>`), "mystore.no mentioned in text"],
+      ["plain", HTML("", `${FILLER}<a href="https://www.mystore.no/">Laget med Mystore</a>`), "a plain link to mystore.no"],
+      ["woocommerce", HTML("<link rel='stylesheet' id='woocommerce-layout-css' href='/x/layout.css'>", FILLER), "woocommerce style handle"],
+      ["woocommerce", HTML("<script id='wc-add-to-cart-js' src='/x/add-to-cart.min.js'></script>", FILLER), "wc- script handle"],
+      ["woocommerce", `<html><body class="home page woocommerce-js">${FILLER}</body></html>`, "woocommerce body class"],
+      ["woocommerce", HTML('<meta name="generator" content="WooCommerce 8.9.1">', FILLER), "WooCommerce generator meta"],
+      ["mystore", HTML("", `${FILLER}<img src="https://gard.mystore.no/uploads/egg.jpg">`), "image served from a mystore.no host"],
+      ["mystore", HTML('<script src="//cdn.mystore.no/js/app.js"></script>', FILLER), "script from the mystore CDN"],
+      ["mystore", HTML('<meta name="generator" content="Mystore">', FILLER), "Mystore generator meta"],
+      ["wordpress", HTML('<meta name="generator" content="WordPress 6.6">', FILLER), "WordPress generator meta"],
+      ["webflow", HTML('<meta name="generator" content="Webflow">', FILLER), "Webflow generator meta"],
+      ["plain", HTML('<meta name="description" content="Vi lagde siden i Wix.com">', FILLER), "Wix.com in a non-generator meta"],
+    ];
+    for (const [want, html, label] of platformCases) {
+      assertEq(sd.detectSitePlatform({ html }), want, `D6 platform: ${label} → ${want}`);
+    }
+    assertEq(
+      sd.generatorMetaTexts('<meta charset="utf-8"><META NAME="Generator" CONTENT="Wix.com Website Builder"><meta name="x">'),
+      ['" CONTENT="Wix.com Website Builder"'],
+      "D6 generatorMetaTexts: only generator tags, the text after the word",
+    );
+    assertEq(
+      ["NOK 1 250", "kr 12 500 000", "12.500,50 kr", "60,-", "Tlf 22 33 44 55"].map(sd.hasNokPriceText),
+      [true, true, true, true, false],
+      "D6 price text: capped digit runs still see normal prices",
+    );
+
+    // ── D7: LLM failure is its own reason ──────────────────────────────────
+    assertEq(
+      ["infra_failure", "invalid_json", "not_array", "sentinel", "ok"].map((st) =>
+        sd.diagnoseNoHit({ outcome: "no_products_found", llm_status: st, has_price_text: true }),
+      ),
+      ["llm_failed", "llm_failed", "llm_failed", "prices_on_page_not_extracted", "prices_on_page_not_extracted"],
+      "D7 reasons: a failed LLM call → llm_failed; the model's own no-products answer is not a failure",
+    );
+    assertEq(
+      sd.diagnoseNoHit({ outcome: "no_products_found", llm_status: "infra_failure", excluded_count: 1, has_price_text: false }),
+      "excluded_by_rules",
+      "D7 reasons: a rule exclusion is still named first",
+    );
+    robots.__clearRobotsCacheForTesting();
+    try {
+      const page = HTML("", `${FILLER}<p>Honning 250 g kr 120</p>`);
+      for (const [label, llm, status] of [
+        ["throws", async () => { throw new Error("upstream 500"); }, "infra_failure"],
+        ["not JSON", async () => ({ text: "Beklager, jeg kan ikke" }), "invalid_json"],
+      ] as const) {
+        const f = makeFetch({ "https://diag-llm.no/robots.txt": ROBOTS_OPEN, "https://diag-llm.no/": { body: page } });
+        robots.__clearRobotsCacheForTesting();
+        const r = await ex.extractProductsFromWebsite("https://diag-llm.no", { fetchImpl: f.impl, llm, sleep });
+        assertEq(
+          [r.outcome, r.tier, r.products.length, r.llm_status, r.llm_calls, r.diagnostics?.no_hit_reason, r.diagnostics?.has_price_text],
+          ["no_products_found", null, 0, status, 1, "llm_failed", true],
+          `D7 extractor: LLM ${label} → outcome unchanged, reason llm_failed`,
+        );
+      }
+    } finally {
+      robots.__clearRobotsCacheForTesting();
+    }
+    const sum2 = dry.summarizeDryRun([
+      { agent_id: "1", agent_name: "a", website: "a", is_owned: 0, result: base({ llm_status: "infra_failure", diagnostics: { site_platform: "plain", no_hit_reason: "llm_failed", has_price_text: true, has_pagination_hint: false, pages_seen: 1 } }) },
+      { agent_id: "2", agent_name: "b", website: "b", is_owned: 1, result: base({ llm_status: "invalid_json", diagnostics: { site_platform: "wordpress", no_hit_reason: "llm_failed", has_price_text: false, has_pagination_hint: false, pages_seen: 2 } }) },
+      { agent_id: "3", agent_name: "c", website: "c", is_owned: 0, result: base({ diagnostics: { site_platform: "wix", no_hit_reason: "no_price_text", has_price_text: false, has_pagination_hint: false, pages_seen: 1 } }) },
+    ]);
+    assertEq(
+      sum2.site_diagnostics.no_hit_reason_counts,
+      { llm_failed: 2, no_price_text: 1 },
+      "D7 summary: llm_failed counted apart from the price reasons",
+    );
 
     return { passed, failed, failures };
   })();
