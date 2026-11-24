@@ -20,6 +20,14 @@
 // secret all get the same neutral 404 page. The token is never logged and
 // never echoed on the pages; noindex, no-store, no-referrer. Not a page view
 // (/rapport-avmeld/ is in the analytics skipPaths).
+//
+// S5-5: the same pattern for the milestone e-mail (services/
+// owner-milestone-email.ts, purpose owner-milestone-unsub-v1):
+//   GET  /milepael-avmeld/:token  confirmation page only.
+//   POST /milepael-avmeld/:token  sets notify.milestones = false (one audit
+//                                 row, actor system / «milepael-avmeld»), also
+//                                 while coming_soon; idempotent; RFC 8058.
+// A report token never validates on /milepael-avmeld and vice versa.
 
 import express, { Router, Request, Response } from "express";
 import rateLimit from "express-rate-limit";
@@ -29,6 +37,12 @@ import {
   recordOwnerReportUnsubscribe,
   verifyOwnerReportUnsubToken,
 } from "../services/owner-monthly-report";
+import {
+  ownerMineValgMilestonesUrl,
+  recordOwnerMilestoneUnsubscribe,
+  verifyOwnerMilestoneUnsubToken,
+} from "../services/owner-milestone-email";
+import type { SetOwnerFeatureResult } from "../owner-features/resolve";
 
 const router = Router();
 
@@ -77,52 +91,106 @@ function notFound(res: Response): Response {
 <p>Lenken virker ikke. Skriv til <a href="mailto:${CONTACT}">${CONTACT}</a>, så hjelper vi deg.</p>`));
 }
 
-function mineValgLine(agentId: string): string {
-  return `<p>Vil du ha rapporten igjen, kan du endre det i <a href="${esc(ownerMineValgReportUrl(agentId))}">«Mine valg»</a>.</p>`;
-}
-
 function agentExists(agentId: string): boolean {
   return !!resolveDb().prepare("SELECT 1 FROM agents WHERE id = ?").get(agentId);
 }
 
-router.get("/rapport-avmeld/:token", rapportAvmeldLimiter, (req: Request, res: Response) => {
-  noStore(res);
-  const agentId = verifyOwnerReportUnsubToken(String(req.params.token || ""));
-  try {
-    if (!agentId || !agentExists(agentId)) return notFound(res);
-  } catch (err) {
-    console.error("[rapport-avmeld] lookup failed:", err instanceof Error ? err.message : "error");
-    return res.status(500).send(page("Feil", `<h1>Noe gikk galt</h1><p>Prøv igjen senere.</p>`));
-  }
-  // Read-only: shows the confirmation form, writes nothing.
-  return res.status(200).send(page("Rapport om profilen", `<h1>Vil du slutte å få rapporten?</h1>
-<p>Bekreft, så sender vi ikke flere rapporter om profilen din på Rett fra Bonden. Profilen din blir ikke endret eller slettet.</p>
-<form method="post" action=""><button type="submit">Ikke send flere rapporter</button></form>
-${mineValgLine(agentId)}`));
-});
+/** One owner e-mail's unsubscribe: its path, token check, write and wording. */
+interface UnsubKind {
+  path: string;
+  log: string;
+  verify: (token: string) => string | null;
+  record: (db: ReturnType<typeof getDb>, agentId: string) => SetOwnerFeatureResult;
+  mineValgUrl: (agentId: string) => string;
+  title: string;
+  question: string;
+  confirm: string;
+  button: string;
+  doneTitle: string;
+  done: string;
+  again: string;
+  conflict: string;
+}
 
-router.post("/rapport-avmeld/:token", rapportAvmeldLimiter, express.urlencoded({ extended: false }), (req: Request, res: Response) => {
-  noStore(res);
-  // The form button and the RFC 8058 one-click body (List-Unsubscribe=One-Click) do the same.
-  const agentId = verifyOwnerReportUnsubToken(String(req.params.token || ""));
-  if (!agentId) return notFound(res);
-  let result: ReturnType<typeof recordOwnerReportUnsubscribe>;
-  try {
-    result = recordOwnerReportUnsubscribe(resolveDb(), agentId);
-  } catch (err) {
-    console.error("[rapport-avmeld] write failed:", err instanceof Error ? err.message : "error");
-    return res.status(500).send(page("Feil", `<h1>Noe gikk galt</h1><p>Prøv igjen senere.</p>`));
-  }
-  if (result.kind === "not_found" || result.kind === "unknown_key") return notFound(res);
-  if (result.kind !== "ok") {
-    // Kill switch or admin lock: say so plainly; nothing was changed.
-    console.error(`[rapport-avmeld] not recorded: ${result.kind}${result.kind === "blocked" ? `/${result.block}` : ""}`);
-    return res.status(409).send(page("Ikke registrert", `<h1>Vi kunne ikke registrere avmeldingen</h1>
-<p>Skriv til <a href="mailto:${CONTACT}">${CONTACT}</a>, så stopper vi rapportene for deg.</p>`));
-  }
-  return res.status(200).send(page("Avmeldt", `<h1>Du får ikke flere rapporter</h1>
-<p>Vi sender ikke flere rapporter om profilen din på Rett fra Bonden. Profilen din er ikke endret eller slettet.</p>
+const REPORT: UnsubKind = {
+  path: "/rapport-avmeld/:token",
+  log: "rapport-avmeld",
+  verify: verifyOwnerReportUnsubToken,
+  record: recordOwnerReportUnsubscribe,
+  mineValgUrl: ownerMineValgReportUrl,
+  title: "Rapport om profilen",
+  question: "Vil du slutte å få rapporten?",
+  confirm: "Bekreft, så sender vi ikke flere rapporter om profilen din på Rett fra Bonden.",
+  button: "Ikke send flere rapporter",
+  doneTitle: "Du får ikke flere rapporter",
+  done: "Vi sender ikke flere rapporter om profilen din på Rett fra Bonden.",
+  again: "Vil du ha rapporten igjen",
+  conflict: "så stopper vi rapportene for deg",
+};
+
+// S5-5: the milestone e-mail (notify.milestones = false).
+const MILESTONES: UnsubKind = {
+  path: "/milepael-avmeld/:token",
+  log: "milepael-avmeld",
+  verify: verifyOwnerMilestoneUnsubToken,
+  record: recordOwnerMilestoneUnsubscribe,
+  mineValgUrl: ownerMineValgMilestonesUrl,
+  title: "E-post om milepæler",
+  question: "Vil du slutte å få e-post om milepæler?",
+  confirm: "Bekreft, så sender vi ikke flere e-poster om milepæler for profilen din på Rett fra Bonden.",
+  button: "Ikke send flere e-poster om milepæler",
+  doneTitle: "Du får ikke flere e-poster om milepæler",
+  done: "Vi sender ikke flere e-poster om milepæler for profilen din på Rett fra Bonden.",
+  again: "Vil du ha e-post om milepæler igjen",
+  conflict: "så stopper vi e-postene om milepæler for deg",
+};
+
+function mountUnsubscribe(k: UnsubKind): void {
+  const mineValgLine = (agentId: string) =>
+    `<p>${esc(k.again)}, kan du endre det i <a href="${esc(k.mineValgUrl(agentId))}">«Mine valg»</a>.</p>`;
+
+  router.get(k.path, rapportAvmeldLimiter, (req: Request, res: Response) => {
+    noStore(res);
+    const agentId = k.verify(String(req.params.token || ""));
+    try {
+      if (!agentId || !agentExists(agentId)) return notFound(res);
+    } catch (err) {
+      console.error(`[${k.log}] lookup failed:`, err instanceof Error ? err.message : "error");
+      return res.status(500).send(page("Feil", `<h1>Noe gikk galt</h1><p>Prøv igjen senere.</p>`));
+    }
+    // Read-only: shows the confirmation form, writes nothing.
+    return res.status(200).send(page(k.title, `<h1>${esc(k.question)}</h1>
+<p>${esc(k.confirm)} Profilen din blir ikke endret eller slettet.</p>
+<form method="post" action=""><button type="submit">${esc(k.button)}</button></form>
 ${mineValgLine(agentId)}`));
-});
+  });
+
+  router.post(k.path, rapportAvmeldLimiter, express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+    noStore(res);
+    // The form button and the RFC 8058 one-click body (List-Unsubscribe=One-Click) do the same.
+    const agentId = k.verify(String(req.params.token || ""));
+    if (!agentId) return notFound(res);
+    let result: SetOwnerFeatureResult;
+    try {
+      result = k.record(resolveDb(), agentId);
+    } catch (err) {
+      console.error(`[${k.log}] write failed:`, err instanceof Error ? err.message : "error");
+      return res.status(500).send(page("Feil", `<h1>Noe gikk galt</h1><p>Prøv igjen senere.</p>`));
+    }
+    if (result.kind === "not_found" || result.kind === "unknown_key") return notFound(res);
+    if (result.kind !== "ok") {
+      // Kill switch or admin lock: say so plainly; nothing was changed.
+      console.error(`[${k.log}] not recorded: ${result.kind}${result.kind === "blocked" ? `/${result.block}` : ""}`);
+      return res.status(409).send(page("Ikke registrert", `<h1>Vi kunne ikke registrere avmeldingen</h1>
+<p>Skriv til <a href="mailto:${CONTACT}">${CONTACT}</a>, ${esc(k.conflict)}.</p>`));
+    }
+    return res.status(200).send(page("Avmeldt", `<h1>${esc(k.doneTitle)}</h1>
+<p>${esc(k.done)} Profilen din er ikke endret eller slettet.</p>
+${mineValgLine(agentId)}`));
+  });
+}
+
+mountUnsubscribe(REPORT);
+mountUnsubscribe(MILESTONES);
 
 export default router;

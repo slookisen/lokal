@@ -132,28 +132,43 @@ function b64url(buf: Buffer): string {
   return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-/** null when no server secret is configured (fail closed) or the id is unusable. */
-export function makeOwnerReportUnsubToken(agentId: string): string | null {
+/**
+ * A stateless signed token «<tag>\n<agentId>» under its own HMAC purpose.
+ * null when no server secret is configured (fail closed) or the id is
+ * unusable. Shared by the report (ru1) and the milestone e-mail (S5-5, mu1);
+ * each purpose string makes the other's tokens invalid.
+ */
+export function makeOwnerAgentToken(purpose: string, tag: string, agentId: string): string | null {
   if (!agentId || agentId.includes("\n") || agentId.length > 200) return null;
-  const payload = b64url(Buffer.from(`ru1\n${agentId}`, "utf8"));
-  const sig = serverSignatureFor(OWNER_REPORT_UNSUB_PURPOSE, payload);
+  const payload = b64url(Buffer.from(`${tag}\n${agentId}`, "utf8"));
+  const sig = serverSignatureFor(purpose, payload);
   return sig ? `${payload}.${sig}` : null;
 }
 
-/** The agent id the token was signed for, or null when it is not a report-unsubscribe token. */
-export function verifyOwnerReportUnsubToken(token: string): string | null {
+/** The agent id a makeOwnerAgentToken(purpose, tag, …) token was signed for, or null. */
+export function verifyOwnerAgentToken(purpose: string, tag: string, token: string): string | null {
   if (typeof token !== "string" || token.length > 600) return null;
   const dot = token.indexOf(".");
   if (dot <= 0 || dot === token.length - 1) return null;
   const payload = token.slice(0, dot);
-  const expectedSig = serverSignatureFor(OWNER_REPORT_UNSUB_PURPOSE, payload);
+  const expectedSig = serverSignatureFor(purpose, payload);
   if (!expectedSig) return null;
   const given = Buffer.from(token.slice(dot + 1), "utf8");
   const expected = Buffer.from(expectedSig, "utf8");
   if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return null;
   const parts = Buffer.from(payload.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8").split("\n");
-  if (parts.length !== 2 || parts[0] !== "ru1" || !parts[1]) return null;
+  if (parts.length !== 2 || parts[0] !== tag || !parts[1]) return null;
   return parts[1];
+}
+
+/** null when no server secret is configured (fail closed) or the id is unusable. */
+export function makeOwnerReportUnsubToken(agentId: string): string | null {
+  return makeOwnerAgentToken(OWNER_REPORT_UNSUB_PURPOSE, "ru1", agentId);
+}
+
+/** The agent id the token was signed for, or null when it is not a report-unsubscribe token. */
+export function verifyOwnerReportUnsubToken(token: string): string | null {
+  return verifyOwnerAgentToken(OWNER_REPORT_UNSUB_PURPOSE, "ru1", token);
 }
 
 /** The value the report's unsubscribe link sets (registry notify.report.recipientOptOut). */
@@ -194,7 +209,12 @@ function tableExists(db: Db, name: string): boolean {
   return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
 }
 
-function readViews(db: Db, agentId: string, path: string, m: ReportMonth, nowMs: number): MonthMetric | null {
+/**
+ * People's profile page views for agentId/path over the UTC days m.from..m.to
+ * (see the header for the sources). null = no source covers the range.
+ * Exported for the S5-5 milestone e-mail (cumulative total). Read only.
+ */
+export function readProfileViews(db: Db, agentId: string, path: string, m: { from: string; to: string }, nowMs: number): MonthMetric | null {
   const rawFrom = profileYearRawFrom(db, nowMs);
   let value = 0;
   let firstCovered: string | null = null;
@@ -253,7 +273,7 @@ function readClicks(db: Db, agentId: string, m: ReportMonth): MonthMetrics["clic
 /** All three numbers for one producer and one month. Read only. */
 export function readMonthMetrics(db: Db, agentId: string, path: string, m: ReportMonth, nowMs: number): MonthMetrics {
   return {
-    views: readViews(db, agentId, path, m, nowMs),
+    views: readProfileViews(db, agentId, path, m, nowMs),
     aiSearches: readAiSearches(db, agentId, m),
     clicks: readClicks(db, agentId, m),
   };
@@ -277,17 +297,17 @@ export interface OwnerMonthlyReportInput {
   unsubscribeUrl: string | null;
 }
 
-function esc(s: unknown): string {
+export function esc(s: unknown): string {
   return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
-function nbNum(n: number): string {
+export function nbNum(n: number): string {
   const v = Number.isFinite(n) ? Math.max(0, Math.round(n)) : 0;
   return String(v).replace(/\B(?=(\d{3})+(?!\d))/g, " ");
 }
 
 /** Strip control characters / newlines from a header value (the subject). */
-function headerSafe(s: string): string {
+export function headerSafe(s: string): string {
   return s.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
@@ -403,19 +423,29 @@ export interface OwnerMonthlyReport extends OwnerMonthlyReportEmail {
   wouldSendReason: WouldSendReason;
 }
 
-function publicBase(): string {
+export function ownerEmailPublicBase(): string {
   return (process.env.APP_URL || "https://rettfrabonden.com").replace(/\/+$/, "");
 }
 
+/** «Mine valg» for one RFB agent, anchored at the row (live) or the planned list (coming_soon) of `key`. */
+export function ownerMineValgUrlFor(agentId: string, key: string): string {
+  const entry = getOwnerFeature(key, ownerFeatureRegistryFor("rfb"));
+  const anchor = ownerFeatureStatus(entry) === "live" ? ownerRowAnchor(key) : ownerPlannedAnchor(key);
+  return `${ownerEmailPublicBase()}/eier/${encodeURIComponent(agentId)}/valg#${anchor}`;
+}
+
 export function ownerMineValgReportUrl(agentId: string): string {
-  const entry = getOwnerFeature("notify.report", ownerFeatureRegistryFor("rfb"));
-  const anchor = ownerFeatureStatus(entry) === "live" ? ownerRowAnchor("notify.report") : ownerPlannedAnchor("notify.report");
-  return `${publicBase()}/eier/${encodeURIComponent(agentId)}/valg#${anchor}`;
+  return ownerMineValgUrlFor(agentId, "notify.report");
+}
+
+/** The agent's public profile path (the key the raw page-view rows use). */
+export function ownerProfilePath(producerName: string): string {
+  return `/produsent/${slugify(producerName)}`;
 }
 
 export function ownerReportUnsubscribeUrl(agentId: string): string | null {
   const token = makeOwnerReportUnsubToken(agentId);
-  return token ? `${publicBase()}${OWNER_REPORT_UNSUB_PATH}${token}` : null;
+  return token ? `${ownerEmailPublicBase()}${OWNER_REPORT_UNSUB_PATH}${token}` : null;
 }
 
 /**
@@ -436,7 +466,7 @@ export function buildOwnerMonthlyReport(
   if (!row) return null;
 
   const producerName = String(row.name ?? "");
-  const path = `/produsent/${slugify(producerName)}`;
+  const path = ownerProfilePath(producerName);
   const metrics = readMonthMetrics(db, agentId, path, month, nowMs);
   const prevMonth = monthOfString(previousMonth(month.month));
   const previous = readMonthMetrics(db, agentId, path, prevMonth, nowMs);

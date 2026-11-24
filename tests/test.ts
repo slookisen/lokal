@@ -55565,3 +55565,23 @@ runSerial(async () => {
     failures.push("rapport-avmeld: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S5-5: milestone owner e-mail
+// template + admin-only preview GET /admin/agents/:id/owner-milestone-preview and
+// its unsubscribe /milepael-avmeld/:token (notify.milestones = false).
+// Own in-memory DB via the routes' seams; env set and restored in finally — runSerial, tail.
+runSerial(async () => {
+  console.log("\n── S5-5: milepæl-e-post til eier (mal + admin-forhåndsvisning + avmelding) ──");
+  try {
+    const { runOwnerMilestonePreviewTests } = require("../src/routes/admin-owner-milestone-preview.test") as
+      typeof import("../src/routes/admin-owner-milestone-preview.test");
+    const r = await runOwnerMilestonePreviewTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-milestone-preview: " + f);
+    console.log(`  owner-milestone-preview: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-milestone-preview: unexpected error: " + String(err?.message || err));
+  }
+});

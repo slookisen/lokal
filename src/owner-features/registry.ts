@@ -318,7 +318,8 @@ export interface OwnerFeatureEntry {
   sellerFaq?: LocalizedText;
   /**
    * S5-4: the value a recipient's one-click unsubscribe link sets
-   * (notify.report → "off", /rapport-avmeld/:token). Written only through
+   * (notify.report → "off", /rapport-avmeld/:token; S5-5: notify.milestones
+   * → false, /milepael-avmeld/:token). RFB only. Written only through
    * setOwnerFeatureValue with `{ recipientOptOut: true }`, which accepts
    * exactly this value and nothing else, and is allowed even while the entry
    * is coming_soon. A stored value equal to it is honoured while coming_soon
@@ -828,6 +829,8 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     default: { owner: true, unclaimed: true },
     outward: true,
     surfaces: ["email:owner_milestone"],
+    // S5-5: the milestone e-mail's one-click unsubscribe (/milepael-avmeld/:token).
+    recipientOptOut: false,
   }),
   entry({
     key: "notify.changes", group: "notify", type: "switch",
