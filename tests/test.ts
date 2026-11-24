@@ -1539,6 +1539,22 @@ console.log("── admin-outreach-candidates (reply suppression by contact e-ma
   console.log(`  admin-outreach-candidates-reply-by-email: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── dev-request 2026-11-22-rfb-dubletter-samme-nettsted-sammenslaaing-og-utsending,
+// point 4: the outreach gate holds a profile whose same-domain sibling replied /
+// opted out / is blocklisted / was sent to inside the cooldown, behind
+// RFB_OUTREACH_SIBLING_DOMAIN_HOLD_ENABLED, with the sibling_domain_shadow report.
+console.log("── admin-outreach-candidates (sibling-domain hold + shadow) ──");
+{
+  const { runAdminOutreachCandidatesSiblingDomainTests } =
+    require("../src/routes/admin-outreach-candidates-sibling-domain.test") as
+      typeof import("../src/routes/admin-outreach-candidates-sibling-domain.test");
+  const r = runAdminOutreachCandidatesSiblingDomainTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("admin-outreach-candidates-sibling-domain: " + f);
+  console.log(`  admin-outreach-candidates-sibling-domain: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── dev-request 2026-08-29-outreach-max-touch-vern: send-time invariant on
 // /threads/:id/send and /compose (Part B). Async (the routes under test are
 // `async` handlers) — registered via runSerial() so it is automatically

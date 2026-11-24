@@ -1398,6 +1398,12 @@ export interface RfbMarketingGateSummary {
   };
   dedupe_suppressed_count: unknown;
   gate_integrity_violations: unknown;
+  /**
+   * dev-request 2026-11-22 point 4: the gate's sibling-domain shadow report
+   * (counts + up to 20 examples, no addresses), whether or not
+   * RFB_OUTREACH_SIBLING_DOMAIN_HOLD_ENABLED enforces it.
+   */
+  sibling_domain_shadow: unknown;
 }
 
 export interface RfbMarketingHeldEntry {
@@ -1501,6 +1507,7 @@ function summarizeGate(r: OutreachCandidatesResult): RfbMarketingGateSummary {
     },
     dedupe_suppressed_count: r.dedupe_suppressed_count ?? null,
     gate_integrity_violations: r.gate_integrity_violations ?? null,
+    sibling_domain_shadow: r.sibling_domain_shadow ?? null,
   };
 }
 

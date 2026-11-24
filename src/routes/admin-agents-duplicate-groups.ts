@@ -43,13 +43,8 @@
 import { Router, Request, Response } from "express";
 import { createHash } from "crypto";
 import { getDb } from "../database/init";
-import {
-  emailDomain,
-  isFreeMailDomain,
-  isHostedPlatformHost,
-  registrableDomain,
-  websiteHost,
-} from "../services/claim-domain-rule";
+import { emailDomain, isFreeMailDomain } from "../services/claim-domain-rule";
+import { activeRfbProfileWhereSql, websiteDomainKey } from "../services/rfb-domain-siblings";
 import { normalizeEmail } from "../services/blocklist-service";
 import { isSingleEmailAddress } from "../services/knowledge-service";
 
@@ -93,17 +88,9 @@ const KEY_TYPES: readonly DuplicateKeyType[] = ["domain", "orgnr", "email"];
 
 // ── Pure key helpers (exported for tests) ───────────────────────────────────
 
-/** The grouping domain of a website value, or null when it is no key
- *  (unparseable, a hosted platform / aggregator, or a free-mail/ISP domain). */
-export function websiteDomainKey(website: unknown): string | null {
-  const host = websiteHost(website);
-  if (!host) return null;
-  if (isHostedPlatformHost(host)) return null;
-  const reg = registrableDomain(host);
-  if (!reg) return null;
-  if (isHostedPlatformHost(reg) || isFreeMailDomain(reg)) return null;
-  return reg;
-}
+/** The grouping domain of a website value — shared with the outreach gate's
+ *  sibling hold, see services/rfb-domain-siblings.ts. Re-exported for tests. */
+export { websiteDomainKey };
 
 /** A 9-digit org.nr. with whitespace stripped, or null. */
 export function orgNrKey(v: unknown): string | null {
@@ -184,10 +171,7 @@ function loadActiveRfbProfiles(db: ReturnType<typeof getDb>): ProfileRow[] {
               k.postal_code AS k_postal_code
          FROM agents a
          LEFT JOIN agent_knowledge k ON k.agent_id = a.id
-        WHERE COALESCE(a.is_active, 1) = 1
-          AND (a.merged_into IS NULL OR a.merged_into = '')
-          AND COALESCE(a.vertical_id, 'rfb') = 'rfb'
-          AND a.umbrella_type IS NULL
+        WHERE ${activeRfbProfileWhereSql("a")}
         ORDER BY a.id`,
     )
     .all() as ProfileRow[];

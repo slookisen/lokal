@@ -943,7 +943,12 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
     );
     assertEq(gate.data_quality_held?.count, 2, "AC4: data_quality_held.count");
     const keys = Object.keys(gate);
-    assertEq(keys[keys.length - 1], "data_quality_held", "AC4: the new field is the LAST key (existing order unchanged)");
+    // sibling_domain_shadow (dev-request 2026-11-22 point 4) was appended after it on 2026-11-24.
+    assertEq(
+      keys.slice(keys.indexOf("recipient_address_types")),
+      ["recipient_address_types", "data_quality_held", "sibling_domain_shadow"],
+      "AC4: the new field follows recipient_address_types (existing order unchanged; only later fields appended)",
+    );
     assertEq(
       [gate.suppressed_counts.generic_products_only, gate.suppressed_counts.categories_not_corroborated],
       [1, 1],
