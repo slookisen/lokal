@@ -242,7 +242,7 @@ export function ownerWroteAbout(agentId: string): boolean {
 }
 
 /** The producer has a valid Debio status (debioStatusShown). Tolerant: no row / error = false. */
-function debioStatusShownFor(agentId: string): boolean {
+export function debioStatusShownFor(agentId: string): boolean {
   try {
     const db = getDb();
     const agent = db.prepare("SELECT id, debio_verified FROM agents WHERE id = ?").get(agentId) as { id?: unknown; debio_verified?: unknown } | undefined;

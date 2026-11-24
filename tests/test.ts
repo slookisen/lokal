@@ -10173,8 +10173,12 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
   );
 
   // Test 2.13: SQL queries use only A1 schema (no new tables/columns required)
+  // «Mine valg» S3-2: the forward query moved to services/producer-affiliations.ts
+  // (shared with the owner's list); seo.ts calls producerAffiliationRows().
+  const affSrc = require("fs").readFileSync("src/services/producer-affiliations.ts", "utf8");
   assertTrue(
-    /FROM agent_affiliations aff[\s\S]{0,200}INNER JOIN agents a ON a\.id = aff\.umbrella_id[\s\S]{0,200}WHERE aff\.producer_id = \?/.test(seoSrc),
+    /producerAffiliationRows\(umbDb, agent\.id,/.test(seoSrc) &&
+    /FROM agent_affiliations aff[\s\S]{0,200}INNER JOIN agents a ON a\.id = aff\.umbrella_id[\s\S]{0,200}WHERE aff\.producer_id = \?/.test(affSrc),
     "phase5.11-a2: forward query uses agent_affiliations + agents JOIN, gated to status='active'"
   );
 
@@ -53797,6 +53801,26 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("owner-features-s3-1: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere S3-2: the owner hides
+// single affiliations in «Mine valg» (agent_affiliations.owner_hidden_at),
+// honoured on the producer page and its memberOf; gate, refusals, change log,
+// migration. Swaps getDb() and env — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S3-2: skjul enkelt-tilknytninger ──");
+  try {
+    const { runOwnerFeaturesS32Tests } = require("../src/routes/owner-features-s3-2.test") as
+      typeof import("../src/routes/owner-features-s3-2.test");
+    const r = await runOwnerFeaturesS32Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-features-s3-2: " + f);
+    console.log(`  owner-features-s3-2: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-features-s3-2: unexpected error: " + String(err?.message || err));
   }
 });
 

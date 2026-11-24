@@ -95,6 +95,9 @@ export const OWNER_PAGE_PAUSE_KEY = "visibility.profile";
 export const OWNER_PAGE_ORDER_EMAIL_KEY = "orders.email";
 /** T7: the consent row whose question stands at the top of its group. */
 export const OWNER_PAGE_NEWS_KEY = "comms.news";
+/** S3-2: the switch row (or, while it is not built, its group card) that carries the per-affiliation list. */
+export const OWNER_PAGE_AFFILIATIONS_KEY = "auto.affiliations";
+export const OWNER_PAGE_AFFILIATIONS_GROUP = "auto";
 /** Heading of the planned box; the count is appended as « (N)». */
 export const OWNER_PAGE_PLANNED_TITLE = "Planlagt — si fra hvis du vil ha dette";
 
@@ -248,6 +251,20 @@ export interface OwnerPageModel {
   gardssalgStats?: OwnerPageGardssalgStats | null;
   /** «Se all statistikk» (the Statistikk tab in /selger). */
   statsHref?: string;
+  /**
+   * «Mine valg» S3-2: the affiliations the producer page shows (hidden ones
+   * included, so they can be shown again). Unset/null = no list (gate shut).
+   */
+  affiliations?: OwnerPageAffiliations | null;
+}
+
+/** S3-2: the owner's per-affiliation list. */
+export interface OwnerPageAffiliations {
+  items: Array<{ umbrellaId: string; name: string; hidden: boolean }>;
+  /** auto.affiliations is off: the profile shows none of them now. */
+  switchOff: boolean;
+  /** auto.affiliations is locked by Rett fra Bonden: no buttons. */
+  locked?: boolean;
 }
 
 // ── S2f: «Dette har profilen gjort for deg» ─────────────────────────────────
@@ -440,6 +457,8 @@ interface RenderCtx {
   confirmPlaced: boolean;
   /** T8 (RFB page only): the level status from the switches; null = none / gårdssalg. */
   levelStatus: OwnerLevelStatus | null;
+  /** S3-2: the affiliation list has been placed (in its row, else at the end of its group card). */
+  affiliationsPlaced?: boolean;
 }
 
 /** T5: the notice, when it belongs at element `id` and is not placed yet. */
@@ -546,6 +565,10 @@ function rowExtraHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeat
     const day = formatDate(m.newsAnswer.at);
     return `<p class="mv-desc" data-news-answer="${esc(m.newsAnswer.answer)}">${esc(m.newsAnswer.answer === "yes" ? `Du sa ja ${day}.` : `Du sa nei ${day}.`)}</p>`;
   }
+  if (!m.variant && e.key === OWNER_PAGE_AFFILIATIONS_KEY && m.affiliations) {
+    ctx.affiliationsPlaced = true;
+    return affiliationsListHtml(m, `gruppe-${e.group}`);
+  }
   if (e.key === OWNER_PAGE_ORDER_EMAIL_KEY) {
     const oe = m.orderEmail;
     if (!oe) return "";
@@ -555,6 +578,36 @@ function rowExtraHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeat
       (oe.enabled ? `<p class="mv-desc">Vi sender en lenke til den nye adressen. Bestillinger går til den gamle adressen til lenken er brukt.</p>` : "");
   }
   return "";
+}
+
+/**
+ * «Mine valg» S3-2: each affiliation the producer page shows, with «Skjul» /
+ * «Vis igjen» (POST /valg/tilknytning). A hidden one stays in the list.
+ */
+function affiliationsListHtml(m: OwnerPageModel, swap: string): string {
+  const a = m.affiliations;
+  if (!a) return "";
+  const off = a.switchOff
+    ? `<p class="mv-check mv-check-missing" data-affiliations-off="1">«Vis tilknytninger» er slått av, så profilen viser ingen tilknytninger nå.</p>`
+    : "";
+  const locked = a.locked ? `<p class="mv-reason">Tilknytningene er låst av Rett fra Bonden og kan ikke endres her nå.</p>` : "";
+  if (a.items.length === 0) {
+    return `<div class="mv-affs" data-affiliations="0">${off}<p class="mv-desc">Profilen viser ingen tilknytninger nå.</p></div>`;
+  }
+  const rows = a.items.map((it) => {
+    const inner = `<input type="hidden" name="umbrella_id" value="${esc(it.umbrellaId)}">` +
+      `<input type="hidden" name="hidden" value="${it.hidden ? "0" : "1"}">` +
+      `<button type="submit" class="ep-btn ep-btn-secondary" aria-label="${esc(`${it.hidden ? "Vis igjen" : "Skjul"}: ${it.name}`)}">${it.hidden ? "Vis igjen" : "Skjul"}</button>`;
+    return `<li class="mv-item" data-umbrella-id="${esc(it.umbrellaId)}" data-hidden="${it.hidden ? "1" : "0"}">
+            <div class="mv-item-text"><strong>${esc(it.name)}</strong><p class="mv-desc">${it.hidden ? "Skjult på profilen" : "Vises på profilen"}</p></div>
+            <div class="mv-item-ctl">${a.locked ? "" : rowForm(m, "/tilknytning", swap, inner)}</div>
+          </li>`;
+  }).join("");
+  return `<div class="mv-affs" data-affiliations="${a.items.length}">
+          <h3>Tilknytninger på profilen</h3>
+          ${off}${locked}<p class="mv-desc">Skjul en tilknytning du ikke vil ha på profilen. Den forsvinner fra profilsiden og fra det søkemotorer og AI-tjenester leser der.</p>
+          <ul class="mv-list">${rows}</ul>
+        </div>`;
 }
 
 /**
@@ -765,6 +818,9 @@ function groupRegions(ctx: RenderCtx, registry: OwnerFeatureEntry[]): OwnerPageR
       ? `<p class="mv-note">${hidden.length} valg til vises når du slår på «${esc(reveal.label.no)}».</p>`
       : "";
     // T7: the group subtitles, and the news question at the top of «comms» (RFB page only).
+    // S3-2: the affiliation list, when its row is not on the page (the key not built yet).
+    const affs = !m.variant && g.key === OWNER_PAGE_AFFILIATIONS_GROUP && m.affiliations && !ctx.affiliationsPlaced
+      ? (ctx.affiliationsPlaced = true, affiliationsListHtml(m, swap)) : "";
     const note = m.variant ? "" : g.key === "comms" ? OWNER_COMMS_GROUP_NOTE : g.key === "notify" ? OWNER_NOTIFY_GROUP_NOTE : "";
     return { id: swap, html: `<section class="ep-card mv-group" id="${esc(swap)}" data-group="${esc(g.key)}" aria-labelledby="mv-h-${esc(g.key)}">
         <details class="mv-fold" open>
@@ -774,7 +830,7 @@ function groupRegions(ctx: RenderCtx, registry: OwnerFeatureEntry[]): OwnerPageR
           ${g.key === "comms" ? newsQuestionHtml(m, swap) : ""}
           ${basic ? `<ul class="mv-list">${basic}</ul>` : ""}
           ${adv ? `<details class="mv-more"${advOpen ? " open" : ""}><summary>Flere valg</summary><ul class="mv-list">${adv}</ul></details>` : ""}
-          ${hiddenNote}
+          ${hiddenNote}${affs}
         </details>
       </section>` };
   });
@@ -1262,6 +1318,8 @@ ${OWNER_TOKEN_CSS}  .mv-page, .mv-page * { overflow-wrap: anywhere; }
   .mv-toast.mv-toast-inline { position: static; box-shadow: none; margin-top: 8px; }
   .mv-pager { align-items: center; }
   .mv-group-note { margin: 0 0 8px; }
+  .mv-affs { margin-top: 8px; }
+  .mv-affs h3 { font-size: 0.95rem; margin: 8px 0 0; }
   .mv-question { margin: 4px 0 12px; padding: 12px 14px; border: 1px solid var(--ow-border); border-radius: 10px; }
   .mv-question h3 { font-size: 1rem; margin: 0 0 6px; }
   .mv-question p { margin: 6px 0 0; }

@@ -26,8 +26,9 @@ import { resolveRouteIntent } from "../services/route-intent";
 import { productAutoSyncEnabled } from "../services/product-import/auto-sync";
 import { knowledgeService, productPriceText, parseProductPrice, OWNER_PRODUCT_SOURCES, ownerWroteAbout, publicOwnerAboutText } from "../services/knowledge-service";
 import { catalogNameNorm, softStockByNameNorm, stockSoftExpiryBuyerText, type SoftStockFields } from "../services/stock-soft-expiry";
-import { containsOrganicClaim, isOrganicClaimUmbrella, dropOrganicSentences } from "../services/organic-claims";
-import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenFields, hidesAddress, hidesPrices, debioSwitchOffAgentIds, affiliationsSwitchOffAgentIds } from "../owner-features/enforce";
+import { containsOrganicClaim, dropOrganicSentences } from "../services/organic-claims";
+import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenFields, hidesAddress, hidesPrices, debioSwitchOffAgentIds, affiliationsPageMode } from "../owner-features/enforce";
+import { producerAffiliationRows } from "../services/producer-affiliations";
 import { debioApprovalText, debioProcessText, debioRegisterSyncEnabled, finnokoSearchUrl, readDebioStatusRow } from "../services/debio-approval";
 import { publicCountsShown } from "../services/public-stats-threshold";
 import { emailRevealGuardEnabled, isCcBotUserAgent, revealEmailFor } from "../services/email-reveal-guard";
@@ -6286,31 +6287,25 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     };
     // «Mine valg» S3-1: the owner's auto.affiliations switch off → no
     // affiliations card and no memberOf (forward direction only; the query
-    // is skipped).
-    const affiliationsSwitchOff = !isUmbrella && affiliationsSwitchOffAgentIds([agent.id]).has(agent.id);
+    // is skipped). S3-2: with the key live, the rows the owner hid are left
+    // out (same query plus `owner_hidden_at IS NULL`); outside the gate the
+    // query is the one from before. A failed lookup → none (fail closed).
+    const affiliationsMode = isUmbrella ? "as_before" : affiliationsPageMode(agent.id);
     let affiliations: Affiliation[] = [];
     if (!isUmbrella) {
       try {
-        const rows = affiliationsSwitchOff ? [] : umbDb.prepare(`
-          SELECT a.id AS umbrella_id, a.name AS umbrella_name, a.umbrella_type, aff.labels,
-                 aff.status, aff.source
-          FROM agent_affiliations aff
-          INNER JOIN agents a ON a.id = aff.umbrella_id
-          WHERE aff.producer_id = ?
-            AND a.is_active = 1
-            AND (aff.status = 'active'
-              OR (aff.status = 'pending_confirmation' AND aff.source = 'inferred'))
-          ORDER BY a.name ASC
-        `).all(agent.id) as any[];
         // Økologi S0 fix-up (review B2): an inactive umbrella (the Debio
         // umbrella was set is_active = 0 on 2026-07-06, its affiliation rows
         // kept) is no chip — same rule as MCP lokal_get_producer_affiliations.
         // Without a valid Debio status no certification-type umbrella and no
         // umbrella or label carrying an organic word (organic-claims.ts) is
         // shown either: «Debio (antatt — ikke bekreftet)» is an organic claim.
-        const organicShown = info?.agent.debioVerified === true;
-        const shownRows = organicShown ? rows : rows.filter((r) =>
-          !isOrganicClaimUmbrella({ umbrella_type: r.umbrella_type, name: r.umbrella_name, labels: r.labels }));
+        // The selection lives in services/producer-affiliations.ts (shared
+        // with the owner's list in «Mine valg»).
+        const shownRows = affiliationsMode === "none" ? [] : producerAffiliationRows(umbDb, agent.id, {
+          organicShown: info?.agent.debioVerified === true,
+          ownerHidden: affiliationsMode === "hide_owner_hidden" ? "exclude" : "ignore",
+        });
         affiliations = shownRows.map(r => ({
           umbrella_id: r.umbrella_id,
           umbrella_name: r.umbrella_name,

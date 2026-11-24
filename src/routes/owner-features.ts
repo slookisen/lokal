@@ -37,7 +37,7 @@ import {
   OWNER_NEWS_ANSWER_TEXT, OWNER_NEWS_CONSENT_VERSION, OWNER_NEWS_PLACEMENTS, OWNER_NEWS_PLACEMENT_OVERVIEW, OWNER_NEWS_PLACEMENT_QUESTION, OWNER_NEWS_PLACEMENT_ROW,
   type OwnerNewsPlacement,
 } from "../owner-features/news-consent";
-import { formatOwnerFeatureValue, ownerPageStatsFrom, renderOwnerFeaturesPageBody, renderOwnerFeaturesPageFragment, type OwnerPageModel, type OwnerPageNotice, type OwnerPageStats } from "../owner-features/page";
+import { OWNER_PAGE_AFFILIATIONS_GROUP, OWNER_PAGE_AFFILIATIONS_KEY, type OwnerPageAffiliations, formatOwnerFeatureValue, ownerPageStatsFrom, renderOwnerFeaturesPageBody, renderOwnerFeaturesPageFragment, type OwnerPageModel, type OwnerPageNotice, type OwnerPageStats } from "../owner-features/page";
 import { OWNER_FRAGMENT_HEADER } from "../owner-ui/enhance";
 import { ownerDashboardActiveFor, ownerItemsPagePath, ownerShellStatsHref, ownerStatsPagePath, renderOwnerShellStart } from "../owner-ui/shell";
 import { ownerOverviewNewsBack, type OwnerOverviewNewsResult } from "../owner-ui/overview";
@@ -59,6 +59,10 @@ import { OWNER_PAUSE_TABLE } from "../services/agent-visibility";
 import { orderReminderHours, orderAutocancelHours } from "../services/order-followups";
 import { isOrderCapNoticeEnabled, isOrderCapV2Enabled } from "../services/order-cap-notice";
 import { isBuyerReceiptsEnabled } from "../services/order-receipt-service";
+import { OWNER_AFFILIATION_HIDDEN_FIELD } from "./owner-audit-log";
+import { affiliationsPerItemEnabled, affiliationsSwitchOffAgentIds, debioSwitchOffAgentIds } from "../owner-features/enforce";
+import { producerAffiliationRows } from "../services/producer-affiliations";
+import { debioStatusShownFor } from "../services/knowledge-service";
 
 // ─────────────────────────────────────────────────────────────────
 // «Mine valg» owner API — dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2a
@@ -342,6 +346,9 @@ const PAGE_MESSAGES: Record<string, { ok: boolean; text: string }> = {
   ordre_epost_grense: { ok: false, text: "For mange forsøk. Prøv igjen om en time." },
   ordre_epost_feil: { ok: false, text: "Klarte ikke å sende bekreftelsen. Prøv igjen senere." },
   ordre_epost_av: { ok: false, text: "Adressen for bestillinger kan ikke endres her nå." },
+  // S3-2: one affiliation hidden / shown again.
+  tilknytning_skjult: { ok: true, text: "Tilknytningen er skjult. Den vises ikke lenger på profilen din." },
+  tilknytning_vist: { ok: true, text: "Tilknytningen vises igjen på profilen din." },
 };
 
 /** S2e: requestOwnerOrderEmailChange error → page message. */
@@ -467,6 +474,48 @@ function isNewsBatch(agentId: string, batchId: number): boolean {
   return keys.length === 1 && keys[0] === "comms.news";
 }
 
+// ─────────────────────────────────────────────────────────────────
+// «Mine valg» S3-2 — the owner hides single affiliations
+// ─────────────────────────────────────────────────────────────────
+// Gate: affiliationsPerItemEnabled (OWNER_FEATURES_ENFORCE AND the mine_valg
+// allowlist AND auto.affiliations live). Outside it the page shows no list
+// and POST /valg/tilknytning answers 404 without writing. The list is the
+// producer page's own selection (services/producer-affiliations.ts) with the
+// hidden rows included, so a hidden one can be shown again.
+
+/** The selection the producer page uses: organic-claim umbrellas only with a valid Debio status (and auto.debio not off). */
+function ownerAffiliationRows(db: any, agentId: string) {
+  const organicShown = !debioSwitchOffAgentIds([agentId], { db }).has(agentId) && debioStatusShownFor(agentId);
+  return producerAffiliationRows(db, agentId, { organicShown, ownerHidden: "include" });
+}
+
+/** The page's list; null = gate shut (no list) or the read failed (logged). */
+function ownerPageAffiliations(db: any, agentId: string, resolved: { byKey: Record<string, ResolvedOwnerFeature> }): OwnerPageAffiliations | null {
+  if (!affiliationsPerItemEnabled(agentId, { db })) return null;
+  try {
+    const items = ownerAffiliationRows(db, agentId).map((r) => ({
+      umbrellaId: String(r.umbrella_id), name: String(r.umbrella_name || ""), hidden: !!r.owner_hidden_at,
+    }));
+    const r = resolved.byKey[OWNER_PAGE_AFFILIATIONS_KEY];
+    // What the producer page does (enforce.ts, same gate): the switch off → none shown.
+    return { items, switchOff: affiliationsSwitchOffAgentIds([agentId], { db }).has(agentId), locked: affiliationsLocked(r) };
+  } catch (e) {
+    console.error("[owner-features] affiliation list read failed:", e);
+    return null;
+  }
+}
+
+/** An admin lock (or the kill switch) on auto.affiliations also locks the single rows, as /valg/sett refuses a locked key. */
+function affiliationsLocked(r: ResolvedOwnerFeature | undefined): boolean {
+  return !!r && (r.block === "admin_locked" || r.block === "killswitch");
+}
+
+/** Where the list stands: the switch row once it is built, else its group card. */
+function affiliationsAnchor(): string {
+  const e = findOwnerFeature(OWNER_PAGE_AFFILIATIONS_KEY);
+  return e && ownerFeatureStatus(e) !== "coming_soon" ? ownerRowAnchor(e.key) : `gruppe-${OWNER_PAGE_AFFILIATIONS_GROUP}`;
+}
+
 router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
   try {
     const g = pageGate(req);
@@ -563,6 +612,7 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
       stats: ownerPageStats(agent.id, String(agent.name || ""), db),
       // T15d: with the Statistikk page (dashboard active), «Se all statistikk» goes there.
       statsHref: dashboard && ownerStatsPageActiveFor(agentId, true) ? ownerStatsPagePath(agent.id) : ownerStatsHref(agent.id),
+      affiliations: ownerPageAffiliations(db, agentId, resolved),
     };
     res.setHeader("Cache-Control", "no-store");
     // T9: `?fragment=` → only those regions (same render), after the same gate; a GET writes nothing.
@@ -815,6 +865,55 @@ router.post("/eier/:agentId/valg/ordre-epost", express.urlencoded({ extended: fa
   } catch (e: any) {
     console.error("[owner-features] POST valg/ordre-epost failed:", e);
     return backTo(res, String(req.params.agentId || ""), "melding=ordre_epost_feil", anchor);
+  }
+});
+
+router.post("/eier/:agentId/valg/tilknytning", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+  const anchor = affiliationsAnchor();
+  try {
+    const g = pageGate(req);
+    if (!g.ok) return g.send(res);
+    const guard = pageWriteGuard(req, g.token, anchor);
+    if (guard) return guard(res);
+    const agentId = g.agentId;
+    const db = getDb();
+    const notFoundPage = simplePage(404, "Fant ikke siden", `<h1>Fant ikke siden</h1>`);
+    if (!affiliationsPerItemEnabled(agentId, { db })) return notFoundPage(res);
+    const body = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
+    const umbrellaId = typeof body.umbrella_id === "string" ? body.umbrella_id : "";
+    const hide = body.hidden === "1" ? true : body.hidden === "0" ? false : null;
+    if (hide === null) return backTo(res, agentId, "melding=ugyldig", anchor);
+    if (affiliationsLocked(resolveOwnerFeatures(VERTICAL, agentId).byKey[OWNER_PAGE_AFFILIATIONS_KEY])) {
+      return backTo(res, agentId, `melding=sperret&nokkel=${encodeURIComponent(OWNER_PAGE_AFFILIATIONS_KEY)}`, anchor);
+    }
+    // Only a row the producer page shows (or would show, when hidden) — never another producer's row.
+    const row = umbrellaId ? ownerAffiliationRows(db, agentId).find((r) => r.umbrella_id === umbrellaId) : undefined;
+    if (!row) return notFoundPage(res);
+    const changed = db.transaction(() => {
+      const now = new Date().toISOString();
+      const r = db.prepare(
+        hide
+          ? `UPDATE agent_affiliations SET owner_hidden_at = ? WHERE producer_id = ? AND umbrella_id = ? AND owner_hidden_at IS NULL`
+          : `UPDATE agent_affiliations SET owner_hidden_at = NULL WHERE producer_id = ? AND umbrella_id = ? AND owner_hidden_at IS NOT NULL`,
+      ).run(...(hide ? [now, agentId, umbrellaId] : [agentId, umbrellaId]));
+      if (r.changes === 0) return false;
+      // The owner's «Endringslogg» (routes/owner-audit-log.ts OWNER_AUDIT_FIELDS["affiliations.hidden"]).
+      const name = String(row.umbrella_name || umbrellaId);
+      db.prepare(
+        `INSERT INTO agent_knowledge_audit
+         (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
+         VALUES (?, ?, ?, ?, ?, 'owner', ?, ?, ?)`,
+      ).run(`audit_${crypto.randomBytes(8).toString("hex")}`, agentId, OWNER_AFFILIATION_HIDDEN_FIELD,
+        hide ? null : name, hide ? name : null, sessionEmail(g.token), now,
+        `owner ${hide ? "hid" : "showed again"} affiliation ${umbrellaId} in «Mine valg» (S3-2)`);
+      return true;
+    })();
+    if (!changed) return backTo(res, agentId, "melding=ingen_endring", anchor);
+    console.log(`[owner-features] owner ${hide ? "hid" : "showed"} affiliation ${umbrellaId} for agent ${agentId} (page)`);
+    return backTo(res, agentId, `melding=${hide ? "tilknytning_skjult" : "tilknytning_vist"}`, anchor);
+  } catch (e: any) {
+    console.error("[owner-features] POST valg/tilknytning failed:", e);
+    return backTo(res, String(req.params.agentId || ""), "melding=feil", anchor);
   }
 });
 
