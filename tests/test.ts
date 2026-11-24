@@ -55760,3 +55760,22 @@ runSerial(async () => {
     failures.push("owner-changes-preview: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-11-24-rfb-vareopphenting-til-alle-eiere, slice 1: site
+// platform + no-hit reason diagnostics on the product-import result and the
+// dry-run summary (measurement only). Fake fetch / LLM, no DB — runSerial, tail.
+runSerial(async () => {
+  console.log("\n── 2026-11-24 vareopphenting S1: plattform + årsak uten treff (måling) ──");
+  try {
+    const { runSiteDiagnosticsTests } = require("../src/services/product-import/site-diagnostics.test") as
+      typeof import("../src/services/product-import/site-diagnostics.test");
+    const r = await runSiteDiagnosticsTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("site-diagnostics: " + f);
+    console.log(`  site-diagnostics: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("site-diagnostics: unexpected error: " + String(err?.message || err));
+  }
+});

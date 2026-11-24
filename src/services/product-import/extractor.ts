@@ -54,9 +54,11 @@ import {
 import { PRODUCT_IMPORT_MAX_PRODUCTS, productNameKey } from "./normalize";
 import { applyCandidateRules, dropPrice, type ExcludedCandidate } from "./rules";
 import { anchorLlmCandidates, isBlogPostPage } from "./association";
+import { buildSiteDiagnostics, type SiteDiagnostics } from "./site-diagnostics";
 
 export type { ProductCandidate, ProductImportTier } from "./structured";
 export type { ExcludedCandidate } from "./rules";
+export type { SiteDiagnostics } from "./site-diagnostics";
 
 export const PRODUCT_IMPORT_USER_AGENT = "Lokal-RFB-Scraper/1.0 (+https://rettfrabonden.com)";
 /** Requests per profile, robots.txt excluded (spec: "maks ~8 sider"). */
@@ -92,6 +94,12 @@ export interface ProductImportResult {
   llm_status: LlmStatus;
   grounding: { llm_candidates: number; names_rejected: number; prices_rejected: number };
   duration_ms: number;
+  /**
+   * Measurement only (dev-request 2026-11-24, slice 1): platform + no-hit
+   * reason, from pages already fetched. Read by the dry-run report; never
+   * shown to owners. Absent on results stored before it existed.
+   */
+  diagnostics?: SiteDiagnostics;
 }
 
 /** Shared per-run LLM budget (the dry run's total cap). */
@@ -268,8 +276,20 @@ export async function extractProductsFromWebsite(
     grounding: { llm_candidates: 0, names_rejected: 0, prices_rejected: 0 },
     duration_ms: 0,
   };
+  // Pages already read (homepage + product pages) and the structured tier
+  // that answered — the diagnostics' only inputs; no request is added.
+  const seenPages: Array<{ html: string; text: string }> = [];
+  let structuredTier: ProductImportTier | null = null;
   const finish = (outcome: ProductImportOutcome): ProductImportResult => {
     result.outcome = outcome;
+    result.diagnostics = buildSiteDiagnostics({
+      outcome,
+      tier: result.tier,
+      structuredTier,
+      llm_status: result.llm_status,
+      excluded_count: result.excluded.length,
+      pages: seenPages,
+    });
     result.duration_ms = Math.max(0, now() - started);
     return result;
   };
@@ -359,6 +379,7 @@ export async function extractProductsFromWebsite(
   // falls through to the HTML/LLM tiers, which only see names and would
   // bring the same events back (and spend an LLM call).
   const done = (tier: ProductImportTier, items: ProductCandidate[]): ProductImportResult => {
+    if (tier === "shopify" || tier === "woocommerce") structuredTier = tier;
     const { kept, excluded } = applyCandidateRules(items);
     result.excluded.push(...excluded);
     if (kept.length === 0) return finish("no_products_found");
@@ -415,6 +436,7 @@ export async function extractProductsFromWebsite(
     if (r.ok) productPages.push({ url: r.finalUrl, html: r.html, text: pageTextOf(r.html) });
   }
   pages.push(...productPages);
+  seenPages.push(...pages);
 
   // ── Tier 3: JSON-LD ───────────────────────────────────────────────────────
   const ld: ProductCandidate[] = [];
