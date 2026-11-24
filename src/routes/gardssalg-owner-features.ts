@@ -59,6 +59,7 @@ import {
   undoOwnerChange,
 } from "../owner-features/changes";
 import {
+  OWNER_PAGE_CSS,
   formatOwnerFeatureValue,
   renderOwnerFeaturesPageBody,
   renderOwnerFeaturesPageFragment,
@@ -75,12 +76,16 @@ import {
   parseOwnerFragmentParam, withOwnerFragment,
 } from "../owner-features/anchors";
 import { OWNER_FRAGMENT_HEADER } from "../owner-ui/enhance";
+import { lightOnlyCss } from "../owner-ui/light-only";
 import {
   gardssalgNotifyAddressConfirmEnabled, gardssalgNotifyRecipient, notifyAddressState, renderNotifyAddressBlock,
   requestNotifyAddressConfirmation,
 } from "../services/gardssalg-notify-address";
 import { createGardssalgNotifyAddressRouter } from "./gardssalg-notify-address";
 import { gardssalgTodayLawEnabled, gardssalgTodayTextsEnabled, renderTodayBlock } from "../services/gardssalg-today-texts";
+
+/** «Mine valg»'s shared CSS without its dark block (gårdssalg is light only). */
+export const OWNER_PAGE_CSS_LIGHT = lightOnlyCss(OWNER_PAGE_CSS);
 
 // ─────────────────────────────────────────────────────────────────
 // «Mine valg» for gårdssalg owners — dev-request 2026-10-22-opplevagent-
@@ -783,7 +788,9 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
         res.setHeader("Content-Type", "text/html; charset=utf-8");
         return res.send(html);
       }
-      const body = renderOwnerFeaturesPageBody(model);
+      // Lyst tema (2026-11-24): the shared page CSS carries RFB's dark block;
+      // the gårdssalg page gets the light-only copy, RFB's stays as it is.
+      const body = renderOwnerFeaturesPageBody(model).replace(`<style>${OWNER_PAGE_CSS}</style>`, () => `<style>${OWNER_PAGE_CSS_LIGHT}</style>`);
       // O2-1: inside the dashboard shell when it is on; off = as before.
       const pageHtml = gardssalgOwnerDashboardActiveFor(provider.id) ? wrapGardssalgDashboard(slug, "valg", body) : body;
       return res.send(shell(`Mine valg · ${provider.navn}`, `${pageHtml}<style>${GARDSSALG_PAGE_CSS}</style>`));
@@ -1041,7 +1048,8 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
  * The shared page uses the RFB portal's ep-* classes and forest green; on
  * opplevagent.no the gårdssalg shell (gc-*, teal #0f5a50) carries it, so the
  * same classes get the Opplevagent colours here. Appended after the page's
- * own CSS so it wins; dark mode keeps the page's dark palette.
+ * own CSS so it wins. Light only (lyst tema, 2026-11-24): no dark block here,
+ * and the shared page CSS is swapped for its light-only copy (lightOnlyCss).
  */
 export const GARDSSALG_PAGE_CSS = `
   .ep-card { background: #fff; border: 1px solid #e5e0d3; border-radius: 10px; padding: 24px 20px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
@@ -1067,14 +1075,4 @@ export const GARDSSALG_PAGE_CSS = `
   .mv-level[aria-current="true"] { border-color: #0f5a50; box-shadow: inset 0 0 0 1px #0f5a50; }
   .mv-confirm { border-color: #0f5a50; }
   @media (max-width: 480px) { .ep-card { padding: 18px 14px; } .ep-card h1 { font-size: 1.25rem; } }
-  @media (prefers-color-scheme: dark) {
-    body { background: #0f1614; color: #e6ece9; }
-    .ep-card { background: #16211e; border-color: #2a3a35; box-shadow: none; }
-    .ep-card h1, .ep-card h2, .mv-check, .mv-always, .mv-asked, .mv-stat strong, .mv-more summary, .mv-explain-box summary, .mv-fold-summary::after { color: #9fd6cb; }
-    .mv-check-missing { color: #f5c27a; }
-    .ep-btn-primary { background: #1f7a6c; color: #fff; }
-    .ep-btn-secondary { background: transparent; color: #bfe6de; border-color: #6fb3a6; }
-    .mv-badge-new { background: #1d3d37; color: #bfe6de; }
-    .mv-level[aria-current="true"] { border-color: #6fb3a6; box-shadow: inset 0 0 0 1px #6fb3a6; }
-  }
 `;

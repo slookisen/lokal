@@ -514,12 +514,6 @@ export const MINE_BESOK_PAGE_CSS = `
   .mine-besok-side .besok-melding { border-radius: 8px; padding: 10px 12px; margin: 0 0 14px; }
   .mine-besok-side .besok-melding-ok { background: #e8f4ec; border: 1px solid #bcd9c5; color: #1d5a30; }
   .mine-besok-side .besok-melding-feil { background: #fdf3e7; border: 1px solid #f0d4ae; color: #7a5218; }
-  @media (prefers-color-scheme: dark) {
-    .mine-besok-side .besok-kort { background: #16211e; border-color: #2a3a35; color: #e6ece9; }
-    .mine-besok-side .besok-btn-primary { background: #1f7a6c; border-color: #1f7a6c; }
-    .mine-besok-side .besok-btn-secondary { background: transparent; color: #bfe6de; border-color: #6fb3a6; }
-    .mine-besok-side .besok-kort a { color: #9fd6cb; }
-  }
 `;
 
 /**

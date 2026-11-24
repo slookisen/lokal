@@ -260,6 +260,7 @@ export function sessionFromRequest(req: Request): { valid: boolean; providerId?:
 // even apply here; this page just never registers one).
 // ─────────────────────────────────────────────────────────────────
 const SHELL_CSS = `
+  :root { color-scheme: light; }
   *, *::before, *::after { box-sizing: border-box; }
   body { margin: 0; background: #f4f1ea; color: #1a1a1a; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; }
   a { color: #0f5a50; }
@@ -306,6 +307,7 @@ function shell(title: string, body: string): string {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="robots" content="noindex,nofollow">
+  <meta name="color-scheme" content="light">
   <title>${escapeHtml(title)} — Opplevagent</title>
   <style>${SHELL_CSS}</style>
 </head>
