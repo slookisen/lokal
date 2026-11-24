@@ -221,6 +221,35 @@ export function runGardssalgOwnerDashboardO21Tests(opts: { log?: boolean } = {})
         assertTrue(!/\son[a-z]+=/i.test(r.body.slice(r.body.indexOf('class="ow-skip"'), r.body.indexOf("</nav>"))), `AK2g: ${label} — no inline event handler in the shell`);
         assertTrue(!/rett fra bonden/i.test(r.body), `AK2h: ${label} never names Rett fra Bonden`);
       }
+      // ── Lyst tema (dev-request 2026-11-24-opplevagent-eierdashbord-lyst-tema-og-testfunn, skive 1) ──
+      // Every gårdssalg owner page is light whatever the browser theme: no
+      // dark-scheme rule anywhere in the response, and the page says light.
+      const DARK = /prefers-color-scheme\s*:\s*dark/i;
+      const lightPage = (b: string) => !DARK.test(b) && b.includes('<meta name="color-scheme" content="light">') && /:root \{ color-scheme: light; \}/.test(b) && !/color-scheme\s*:\s*light\s+dark/i.test(b);
+      for (const [label, tab] of onPages) {
+        assertTrue(lightPage(onBodies[tab].body), `LT1: pilot → ${label} has no dark-scheme rule and declares color-scheme light`);
+      }
+      assertTrue(lightPage(basePortal.body), "LT2: flag off → the portal is light only");
+      assertTrue(lightPage(baseValg.body), "LT3: flag off → «Mine valg» is light only");
+      const claimPage = await get("/kategori/gardssalg/eier/o21testgard");
+      assertEq(claimPage.status, 200, "LT4a: the claim page answers 200");
+      assertTrue(lightPage(claimPage.body), "LT4b: the claim page is light only");
+      assertTrue(!DARK.test(besok.MINE_BESOK_PAGE_CSS), "LT5: «Mine besøk» cards carry no dark-scheme rule");
+      {
+        const fo = require("./gardssalg-owner-features") as typeof import("./gardssalg-owner-features");
+        const pg = require("../owner-features/page") as typeof import("../owner-features/page");
+        const lo = require("../owner-ui/light-only") as typeof import("../owner-ui/light-only");
+        assertTrue(!DARK.test(fo.GARDSSALG_PAGE_CSS), "LT6: the gårdssalg page CSS has no dark block");
+        assertTrue(!DARK.test(fo.OWNER_PAGE_CSS_LIGHT) && fo.OWNER_PAGE_CSS_LIGHT.includes(".mv-page"), "LT7: the light copy of the shared page CSS keeps the page rules and drops every dark block");
+        assertTrue(DARK.test(pg.OWNER_PAGE_CSS), "LT8: RFB's shared page CSS still has its dark block (unchanged)");
+        assertTrue(!baseValg.body.includes(pg.OWNER_PAGE_CSS) && baseValg.body.includes(fo.OWNER_PAGE_CSS_LIGHT), "LT9: «Mine valg» carries the light copy, not RFB's CSS");
+        // lightOnlyCss: nested braces, spacing variants, an unbalanced block, light dark → light.
+        assertEq(lo.lightOnlyCss("a{x:1}@media (prefers-color-scheme: dark) { :root { y:2 } .b { z:3 } }c{w:4}"), "a{x:1}c{w:4}", "LT10a: a nested dark block is removed whole");
+        assertEq(lo.lightOnlyCss("@media(prefers-color-scheme:dark){a{b:c}}d{e:f}"), "d{e:f}", "LT10b: no-space spelling is removed too");
+        assertEq(lo.lightOnlyCss("a{b:c}@media (prefers-color-scheme: dark) { d { e:f }"), "a{b:c}", "LT10c: an unbalanced dark block is cut to the end");
+        assertEq(lo.lightOnlyCss(":root { color-scheme: light dark; --x: 1; }"), ":root { color-scheme: light; --x: 1; }", "LT10d: color-scheme light dark → light");
+        assertEq(lo.lightOnlyCss("@media (max-width: 480px) { a { b: c } }"), "@media (max-width: 480px) { a { b: c } }", "LT10e: other media blocks are kept");
+      }
       // With the shell taken out, the portal and «Mine valg» are the flag-off pages.
       // O2-3: the portal (Oversikt) also carries the overview card; take it out too.
       const OVERVIEW_CARD = /<section class="gc-card gs-oversikt"[\s\S]*?<\/section>\n {6}/;
