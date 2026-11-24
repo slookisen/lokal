@@ -18,7 +18,9 @@
 // S3-1, auto.affiliations (affiliationsSwitchOffAgentIds: no affiliations
 // card and no JSON-LD memberOf on the producer page). S3-2: with the key
 // live, the owner hides single affiliations (affiliationsPerItemEnabled,
-// affiliationsPageMode).
+// affiliationsPageMode). S3-3, auto.categories (categoriesSwitchOffAgentIds
+// for the producer page, categoriesSweepSwitchState for the salgskanal
+// sweep: no automatic sales-channel placement).
 //
 // List surfaces resolve all their allowlisted subjects with one query
 // (resolveOwnerFeatureKeysForSubjects). A failed lookup for an allowlisted
@@ -212,18 +214,31 @@ function gatedSubjectIds(agentIds: Iterable<string>, env: NodeJS.ProcessEnv, db:
  * lookup counts every id as off (fail closed) and logs `<key> lookup failed`.
  */
 function switchOffIds(ids: string[], key: OwnerFeatureKey, env: NodeJS.ProcessEnv, db: any): Set<string> {
-  const out = new Set<string>();
-  if (ids.length === 0) return out;
+  const { off, error } = resolveSwitchOff(ids, key, env, db);
+  if (error !== null) {
+    console.error(`[owner-features] ${key} lookup failed, treating the switch as off:`, error);
+    for (const id of ids) off.add(id);
+  }
+  return off;
+}
+
+/**
+ * One batched resolution of switch `key` for `ids`: the ids resolving to
+ * false, or the error when the lookup threw (then `off` is empty and the
+ * caller decides what a failure means). No DB read for an empty `ids`.
+ */
+function resolveSwitchOff(ids: string[], key: OwnerFeatureKey, env: NodeJS.ProcessEnv, db: any): { off: Set<string>; error: unknown | null } {
+  const off = new Set<string>();
+  if (ids.length === 0) return { off, error: null };
   try {
     const resolved = resolveOwnerFeatureKeysForSubjects("rfb", ids, [key], {
       db, env, registry: registryOverride ?? undefined,
     });
-    for (const [id, byKey] of resolved) if (byKey[key]?.value === false) out.add(id);
+    for (const [id, byKey] of resolved) if (byKey[key]?.value === false) off.add(id);
+    return { off, error: null };
   } catch (err) {
-    console.error(`[owner-features] ${key} lookup failed, treating the switch as off:`, err);
-    for (const id of ids) out.add(id);
+    return { off: new Set<string>(), error: err ?? new Error("lookup failed") };
   }
-  return out;
 }
 
 /**
@@ -287,4 +302,43 @@ export function affiliationsPageMode(agentId: string, opts: EnforceOptions = {})
   if (ids.length === 0) return "as_before";
   if (switchOffIds(ids, AFFILIATIONS_KEY, env, opts.db).has(agentId)) return "none";
   return affiliationsKeyLive(env) ? "hide_owner_hidden" : "as_before";
+}
+
+const CATEGORIES_KEY = "auto.categories" as const satisfies OwnerFeatureKey;
+
+/**
+ * «Mine valg» S3-3: the agents among `agentIds` whose `auto.categories`
+ * switch («Plasser meg i salgskanaler automatisk») is off — the producer page
+ * counts none of their `source='auto'` agent_salgskanal rows. Same gate and
+ * fail-closed rule as affiliationsSwitchOffAgentIds.
+ */
+export function categoriesSwitchOffAgentIds(agentIds: Iterable<string>, opts: EnforceOptions = {}): Set<string> {
+  const env = opts.env ?? process.env;
+  return switchOffIds(gatedSubjectIds(agentIds, env, opts.db), CATEGORIES_KEY, env, opts.db);
+}
+
+/**
+ * What the salgskanal sweep (job:salgskanal_matcher) may do with each
+ * profile, «Mine valg» S3-3:
+ *   off     the switch is off: no auto placement, its `auto` rows go;
+ *   failed  gated profiles whose lookup threw: leave their rows untouched
+ *           this run (never delete on a failed lookup);
+ *   error   the failure message (null when the lookup succeeded).
+ * Ids in neither set are swept as before. One batched lookup for the whole
+ * sweep; outside the gate (enforce off / not allowlisted) no DB read for it.
+ */
+export interface CategoriesSweepSwitchState {
+  off: Set<string>;
+  failed: Set<string>;
+  error: string | null;
+}
+
+export function categoriesSweepSwitchState(agentIds: Iterable<string>, opts: EnforceOptions = {}): CategoriesSweepSwitchState {
+  const env = opts.env ?? process.env;
+  const ids = gatedSubjectIds(agentIds, env, opts.db);
+  const { off, error } = resolveSwitchOff(ids, CATEGORIES_KEY, env, opts.db);
+  if (error === null) return { off, failed: new Set<string>(), error: null };
+  console.error(`[owner-features] ${CATEGORIES_KEY} lookup failed, the salgskanal sweep leaves ${ids.length} gated profile(s) untouched:`, error);
+  const msg = error instanceof Error ? error.message : String(error);
+  return { off: new Set<string>(), failed: new Set(ids), error: msg };
 }

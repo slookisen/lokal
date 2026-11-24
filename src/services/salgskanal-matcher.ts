@@ -365,7 +365,17 @@ export function matchSalgskanalCategories(
 // Runnable on demand (a future admin route) or on a periodic scheduler
 // tick (src/index.ts) — see the dev-request's work item 2 ("kjøres som
 // backfill + løpende (cron eller on-write)").
+//
+// «Mine valg» S3-3 (A2A dev-request 2026-10-22-rfb-mine-valg-eierbrytere):
+// the owner's `auto.categories` switch. For a profile inside the gate
+// (OWNER_FEATURES_ENFORCE on AND in the `mine_valg` allowlist) whose switch
+// is off, the sweep places it in no channel: no new 'auto' rows, no refresh,
+// and its existing 'auto' rows are deleted (removed_switch_off). If the
+// switch lookup fails, the gated profiles' rows are left untouched this run
+// (logged, recorded in errors). 'manual' rows are never touched. Outside the
+// gate the sweep is as before (one batched gate check, no DB read for it).
 import { getDb } from "../database/init";
+import { categoriesSweepSwitchState } from "../owner-features/enforce";
 
 export type SalgskanalSweepResult = {
   examined: number;
@@ -373,6 +383,8 @@ export type SalgskanalSweepResult = {
   upserted: number;
   refreshed: number;
   removed_stale: number;
+  /** «Mine valg» S3-3: 'auto' rows deleted because the profile's auto.categories switch is off. */
+  removed_switch_off: number;
   by_category: Record<SalgskanalCategorySlug, number>;
   errors: string[];
 };
@@ -398,6 +410,7 @@ function parseJsonArray(raw: string | null): string[] {
 export function runSalgskanalSweep(opts?: {
   db?: ReturnType<typeof getDb>;
   nowIso?: string;
+  env?: NodeJS.ProcessEnv;
 }): SalgskanalSweepResult {
   const db = opts?.db ?? getDb();
   const now = opts?.nowIso ?? new Date().toISOString();
@@ -408,6 +421,7 @@ export function runSalgskanalSweep(opts?: {
     upserted: 0,
     refreshed: 0,
     removed_stale: 0,
+    removed_switch_off: 0,
     by_category: {
       selvplukk: 0,
       hjemlevering: 0,
@@ -431,6 +445,14 @@ export function runSalgskanalSweep(opts?: {
   }
   result.examined = producers.length;
 
+  // «Mine valg» S3-3: one batched auto.categories check for the whole sweep.
+  const switchState = categoriesSweepSwitchState(producers.map((p) => p.id), { db, env: opts?.env });
+  if (switchState.error !== null) {
+    result.errors.push(
+      `auto.categories lookup failed, ${switchState.failed.size} gated profile(s) left untouched: ${switchState.error}`,
+    );
+  }
+
   const selectExisting = db.prepare(
     "SELECT category_slug, source FROM agent_salgskanal WHERE agent_id = ?"
   );
@@ -447,8 +469,22 @@ export function runSalgskanalSweep(opts?: {
   const deleteStaleAuto = db.prepare(
     "DELETE FROM agent_salgskanal WHERE agent_id = ? AND category_slug = ? AND source = 'auto'"
   );
+  const deleteSwitchOffAuto = switchState.off.size > 0
+    ? db.prepare("DELETE FROM agent_salgskanal WHERE agent_id = ? AND source = 'auto'")
+    : null;
 
   for (const p of producers) {
+    // Lookup failed for this gated profile: leave its rows as they are.
+    if (switchState.failed.has(p.id)) continue;
+    if (deleteSwitchOffAuto && switchState.off.has(p.id)) {
+      // Switch off: no automatic placement; drop its 'auto' rows (never 'manual').
+      try {
+        result.removed_switch_off += Number(deleteSwitchOffAuto.run(p.id).changes) || 0;
+      } catch (e) {
+        result.errors.push(`switch-off removal failed for agent ${p.id}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      continue;
+    }
     let verdicts: SalgskanalCategoryMatch[];
     try {
       verdicts = matchSalgskanalCategories({
