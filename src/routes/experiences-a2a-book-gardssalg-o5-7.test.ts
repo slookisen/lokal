@@ -249,7 +249,9 @@ export function runExperiencesA2aBookGardssalgTests(opts: { log?: boolean } = {}
           const val = row[k];
           if (typeof val === "string" && val) s = s.split(val).join(`<${k}>`);
         }
-        return s;
+        // The ICS DTSTAMP is the send time to the second; the two calls can fall
+        // on either side of a second boundary (determinism gate, lokal#1646).
+        return s.replace(/DTSTAMP:\d{8}T\d{6}Z/g, "DTSTAMP:<send_time>");
       };
       assertEq(a2aMails.length, mcpMails.length, "ak2.8: same number of e-mails");
       assertTrue(mcpMails.length >= 2, "ak2.9: guest receipt and producer notice sent");
