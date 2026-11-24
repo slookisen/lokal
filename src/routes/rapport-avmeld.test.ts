@@ -82,8 +82,8 @@ export async function runRapportAvmeldTests(opts: { log?: boolean } = {}): Promi
     ok(entry.recipientOptOut === "off" && visibleOwnerFeatureOptions(entry).some((o) => o.value === "off"),
       "registry: notify.report declares recipientOptOut «off», a visible option");
     ok(ownerFeatureStatus(entry) === "coming_soon", "registry: notify.report is coming_soon (the edge case this slice covers)");
-    ok(registry.filter((e) => e.recipientOptOut !== undefined).map((e) => e.key).join(",") === "notify.report",
-      "registry: only notify.report declares a recipient opt-out");
+    ok(registry.filter((e) => e.recipientOptOut !== undefined).map((e) => e.key).join(",") === "notify.report,notify.milestones",
+      "registry: only notify.report and (S5-5) notify.milestones declare a recipient opt-out");
 
     // ── The write option (service level) ─────────────────────────────────
     const audits = (id: string) =>
@@ -102,7 +102,7 @@ export async function runRapportAvmeldTests(opts: { log?: boolean } = {}): Promi
     const live = registry.map((e) => (e.key === "notify.report" ? { ...e, status: "live" as const } : e));
     ok(setOwnerFeatureValue("rfb", "ra-c", "notify.report", "monthly", actor, { db, registry: live, recipientOptOut: true }).kind === "invalid_value",
       "option: a non-off value is refused even with the entry live");
-    ok(setOwnerFeatureValue("rfb", "ra-c", "notify.milestones", false, actor, { db, recipientOptOut: true }).kind === "invalid_value",
+    ok(setOwnerFeatureValue("rfb", "ra-c", "notify.changes", false, actor, { db, recipientOptOut: true }).kind === "invalid_value",
       "option: an entry without recipientOptOut is refused");
     ok(setOwnerFeatureValue("rfb", "ra-c", "comms.news", false, actor, { db, recipientOptOut: true }).kind === "invalid_value",
       "option: another key's off value is refused");
