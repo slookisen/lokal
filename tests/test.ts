@@ -53717,6 +53717,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere S3-1: the owner's
+// auto.affiliations switch on the producer page (affiliations card) and its
+// JSON-LD (memberOf); gate, coming_soon and fail-closed. Swaps getDb() and
+// env — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S3-1: «Vis tilknytninger» på produsentsiden ──");
+  try {
+    const { runOwnerFeaturesS31Tests } = require("../src/routes/owner-features-s3-1.test") as
+      typeof import("../src/routes/owner-features-s3-1.test");
+    const r = await runOwnerFeaturesS31Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-features-s3-1: " + f);
+    console.log(`  owner-features-s3-1: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-features-s3-1: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2d-1 (AC21): optional
 // owner_email on POST /admin/test-producer arms the fixture's owner login
 // (agent_knowledge.email + claimed_at, fixture-pinned); magic link → «Mine

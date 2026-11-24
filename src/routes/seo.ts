@@ -27,7 +27,7 @@ import { productAutoSyncEnabled } from "../services/product-import/auto-sync";
 import { knowledgeService, productPriceText, parseProductPrice, OWNER_PRODUCT_SOURCES, ownerWroteAbout, publicOwnerAboutText } from "../services/knowledge-service";
 import { catalogNameNorm, softStockByNameNorm, stockSoftExpiryBuyerText, type SoftStockFields } from "../services/stock-soft-expiry";
 import { containsOrganicClaim, isOrganicClaimUmbrella, dropOrganicSentences } from "../services/organic-claims";
-import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenFields, hidesAddress, hidesPrices, debioSwitchOffAgentIds } from "../owner-features/enforce";
+import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenFields, hidesAddress, hidesPrices, debioSwitchOffAgentIds, affiliationsSwitchOffAgentIds } from "../owner-features/enforce";
 import { debioApprovalText, debioProcessText, debioRegisterSyncEnabled, finnokoSearchUrl, readDebioStatusRow } from "../services/debio-approval";
 import { publicCountsShown } from "../services/public-stats-threshold";
 import { emailRevealGuardEnabled, isCcBotUserAgent, revealEmailFor } from "../services/email-reveal-guard";
@@ -6284,10 +6284,14 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       status: string;   // 'active' | 'pending_confirmation'
       source: string;   // 'self_claimed' | 'scraped' | 'admin' | 'umbrella_confirmed' | 'inferred'
     };
+    // «Mine valg» S3-1: the owner's auto.affiliations switch off → no
+    // affiliations card and no memberOf (forward direction only; the query
+    // is skipped).
+    const affiliationsSwitchOff = !isUmbrella && affiliationsSwitchOffAgentIds([agent.id]).has(agent.id);
     let affiliations: Affiliation[] = [];
     if (!isUmbrella) {
       try {
-        const rows = umbDb.prepare(`
+        const rows = affiliationsSwitchOff ? [] : umbDb.prepare(`
           SELECT a.id AS umbrella_id, a.name AS umbrella_name, a.umbrella_type, aff.labels,
                  aff.status, aff.source
           FROM agent_affiliations aff
