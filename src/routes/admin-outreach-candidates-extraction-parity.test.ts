@@ -181,9 +181,9 @@ export function runAdminOutreachCandidatesExtractionParityTests(opts: { log?: bo
       [
         "success", "mode", "cooldown_days", "count", "candidates", "dedupe_by_email", "dedupe_suppressed_count",
         "dedupe_email_collision_groups", "gate_integrity_violations", "suppressed_counts", "cross_platform_cooldown",
-        "max_touch_suppressed", "recipient_address_types", "data_quality_held",
+        "max_touch_suppressed", "recipient_address_types", "data_quality_held", "sibling_domain_shadow",
       ],
-      "p2: 200 body key order unchanged (recipient_address_types appended 2026-10-08, data_quality_held appended last 2026-10-11)",
+      "p2: 200 body key order unchanged (recipient_address_types appended 2026-10-08, data_quality_held 2026-10-11, sibling_domain_shadow appended last 2026-11-24)",
     );
     assertEq(
       first.candidates.map((c: any) => c.agent_id),

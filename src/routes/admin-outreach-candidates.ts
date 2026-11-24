@@ -62,6 +62,14 @@ import {
   OUTREACH_MAX_TOUCH_VERN_DEFAULT_THRESHOLD,
 } from "../services/outreach-max-touch-vern";
 import { loadRfbPromiseGivenEmails } from "../services/rfb-outreach-promise";
+import {
+  buildRfbSiblingDomainIndex,
+  createSiblingDomainShadow,
+  recordSiblingDomainShadow,
+  rfbOutreachSiblingDomainHoldEnabled,
+  type RfbSiblingDomainIndex,
+  type SiblingHoldReason,
+} from "../services/rfb-domain-siblings";
 
 import { isCategoryWord } from "./seo";
 import { CATEGORY_LABEL_NO } from "./admin-knowledge";
@@ -623,6 +631,10 @@ export function computeOutreachCandidates(
     // emails are read ONCE per run (one GROUP BY each + one Set), not by a
     // correlated subquery per pool row. Same predicates as before, so the
     // per-row values are identical. Rows are only patched when present.
+    let repliedEmailsForSiblings: Set<string> = new Set();
+    // Addresses that asked for removal (complaint / unsubscribe), from the same
+    // single email_bounces scan — read by the sibling hold (point 4) below.
+    const removalEmailsForSiblings = new Set<string>();
     {
       const viewsByAgent = new Map<string, number>();
       for (const r of db.prepare(`
@@ -643,11 +655,16 @@ export function computeOutreachCandidates(
       }
       const hardBouncedEmails = new Set<string>();
       for (const r of db.prepare(`
-        SELECT DISTINCT LOWER(TRIM(email)) AS e
+        SELECT LOWER(TRIM(email)) AS e,
+               MAX(CASE WHEN bounce_type IN ('complaint', 'unsubscribe') THEN 1 ELSE 0 END) AS removal
         FROM email_bounces
         WHERE bounce_type IN ('hard', 'complaint', 'unsubscribe')
-      `).all() as Array<{ e: string | null }>) {
-        if (r.e !== null) hardBouncedEmails.add(r.e);
+        GROUP BY LOWER(TRIM(email))
+      `).all() as Array<{ e: string | null; removal: number }>) {
+        if (r.e !== null) {
+          hardBouncedEmails.add(r.e);
+          if (r.removal === 1) removalEmailsForSiblings.add(r.e);
+        }
       }
       // Reply suppression by e-mail (svarsperre): a reply can sit on a
       // crm_contacts row whose agent_id is still NULL (linked later, or never),
@@ -656,6 +673,7 @@ export function computeOutreachCandidates(
       // message (or a retention reply marker) and OR them into has_replied.
       // This can only hold MORE rows back, never let one in.
       const repliedEmails = loadRfbRepliedContactEmails(db);
+      repliedEmailsForSiblings = repliedEmails;
       for (const row of rows) {
         row.views_count = viewsByAgent.get(row.agent_id) ?? 0;
         row.is_hard_bounced = row.email_norm !== null && hardBouncedEmails.has(row.email_norm) ? 1 : 0;
@@ -796,6 +814,44 @@ export function computeOutreachCandidates(
     // the identical check instead of a parallel reimplementation. Pure
     // extraction — same SQL, same cutoff, same shape.
     const recentlyEmailedAddresses = getRecentlyEmailedAddresses(db, cooldownDays);
+
+    // ── dev-request 2026-11-22-rfb-dubletter-samme-nettsted-sammenslaaing-og-
+    // utsending, point 4: the gate sees the whole group ─────────────────────
+    // A profile is held back when ANOTHER active RFB profile on the same
+    // registrable website domain has replied, opted out / is blocklisted, or
+    // was sent to inside cooldown_days (services/rfb-domain-siblings.ts —
+    // same domain rule as GET /admin/agents/duplicate-groups; hosted
+    // platforms and free-mail domains never group). The index is built once
+    // per pass.
+    //
+    // SHADOW FIRST: enforcement sits behind RFB_OUTREACH_SIBLING_DOMAIN_HOLD_
+    // ENABLED (default OFF, read per call). Flag off ⇒ the candidate list is
+    // unchanged; sibling_domain_shadow (always returned) counts the profiles
+    // that pass every OTHER suppression and that this rule holds / would hold,
+    // with up to 20 examples (ids, name, domain, reason — never an address).
+    // It can only REMOVE candidates. If the index cannot be built the gate
+    // carries on without it and the shadow says `unavailable: true`.
+    const siblingHoldEnabled = rfbOutreachSiblingDomainHoldEnabled();
+    const siblingShadow = createSiblingDomainShadow(siblingHoldEnabled);
+    let siblingIndex: RfbSiblingDomainIndex | null = null;
+    try {
+      siblingIndex = buildRfbSiblingDomainIndex(db, {
+        cooldownDays,
+        repliedEmails: repliedEmailsForSiblings,
+        removalEmails: removalEmailsForSiblings,
+        recentlyEmailedAddresses,
+      });
+      siblingShadow.shared_domains = siblingIndex.shared_domains;
+    } catch (err) {
+      siblingShadow.unavailable = true;
+      console.error("[outreach-candidates] sibling-domain index failed (gate continues without it):", err);
+    }
+    const siblingDomainCounts: Record<SiblingHoldReason, number> = {
+      replied: 0,
+      opted_out: 0,
+      blocklisted: 0,
+      recently_sent: 0,
+    };
 
     // ── Step 3: separate candidates from suppressed ───────────────────────────
     // Internal working shape carries the dedupe tiebreak fields (views_count,
@@ -974,6 +1030,13 @@ export function computeOutreachCandidates(
       const suppressedForPromiseGiven =
         promiseGivenEmails !== null && promiseGivenEmails.has(row.email.trim().toLowerCase());
 
+      // Point 4 (sibling hold) — see the index construction above.
+      const siblingHit = siblingIndex
+        ? siblingIndex.lookup({ agent_id: row.agent_id, website: row.website, agent_url: row.agent_url })
+        : null;
+      const suppressedForSiblingDomain = siblingHoldEnabled && siblingHit !== null;
+      if (suppressedForSiblingDomain && siblingHit) siblingDomainCounts[siblingHit.reason]++;
+
       if (suppressedForContacted) contactedOrCooldownCount++;
       if (suppressedForReplied) repliedCount++;
       if (suppressedForOptOut) optedOutCount++;
@@ -1003,7 +1066,8 @@ export function computeOutreachCandidates(
           suppressedForCrossPlatform ||
           suppressedForMaxTouch ||
           suppressedForPromiseGiven ||
-          suppressedForPersonalAddress;
+          suppressedForPersonalAddress ||
+          suppressedForSiblingDomain;
         if (!otherReason) {
           const reasons: string[] = [];
           if (suppressedForGenericProducts) reasons.push("generic_products_only");
@@ -1029,6 +1093,11 @@ export function computeOutreachCandidates(
         !suppressedForPersonalAddress &&
         !suppressedForGenericProducts
       ) {
+        if (siblingHit) {
+          // Otherwise a candidate: this is exactly what the sibling hold changes.
+          recordSiblingDomainShadow(siblingShadow, row, siblingHit);
+          if (suppressedForSiblingDomain) continue;
+        }
         candidates.push({
           agent_id: row.agent_id,
           name: row.name,
@@ -1183,6 +1252,14 @@ export function computeOutreachCandidates(
         personal_address: personalAddressCount,
         // dev-request 2026-10-08-outreach-sperre-generiske-produkter
         generic_products_only: genericProductsOnlyCount,
+        // dev-request 2026-11-22 point 4: another active RFB profile on the same
+        // website domain replied / opted out / is blocklisted / was sent to in
+        // the cooldown. Counted only while RFB_OUTREACH_SIBLING_DOMAIN_HOLD_ENABLED
+        // is on (it suppresses nothing otherwise — see sibling_domain_shadow).
+        sibling_domain_replied: siblingDomainCounts.replied,
+        sibling_domain_opted_out: siblingDomainCounts.opted_out,
+        sibling_domain_blocklisted: siblingDomainCounts.blocklisted,
+        sibling_domain_recently_sent: siblingDomainCounts.recently_sent,
       },
       // 4e proper: the count alone would still leave "hvorfor" unanswered, so
       // the suppressing platform is named per producer. Bounded at 100 so a wide
@@ -1254,6 +1331,9 @@ export function computeOutreachCandidates(
         truncated: dataQualityHeld.length > dataQualityHeldCap,
         producers: dataQualityHeld.slice(0, dataQualityHeldCap),
       },
+      // dev-request 2026-11-22 point 4: shadow report of the sibling hold,
+      // returned regardless of the flag. Appended last — existing key order unchanged.
+      sibling_domain_shadow: siblingShadow,
     };
 }
 
