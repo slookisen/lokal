@@ -162,20 +162,44 @@ export function isAllowedHost(url: string, allowed: ReadonlySet<string>): boolea
   }
 }
 
-/** Visible text with entities DECODED (grounding needs the real characters). PURE. */
+/**
+ * `s.replace(re, rep)` for a global `re` whose every match ends at the end
+ * of an occurrence of `closer` (a literal, or a global regex). The regex only runs up to the end
+ * of the LAST `closer`: a tail where no match can end — an unclosed
+ * `<script`, a run of `<` with no `>` — is otherwise rescanned from every
+ * start position (quadratic, blocks the event loop on hostile HTML). The
+ * result is identical to the plain replace. PURE.
+ */
+function replaceUpToLastCloser(s: string, re: RegExp, rep: string, closer: RegExp | string): string {
+  let end = -1;
+  if (typeof closer === "string") {
+    const i = s.lastIndexOf(closer);
+    if (i >= 0) end = i + closer.length;
+  } else {
+    for (const m of s.matchAll(closer)) end = m.index! + m[0].length;
+  }
+  if (end < 0) return s;
+  return s.slice(0, end).replace(re, rep) + s.slice(end);
+}
+
+/** Visible text with entities DECODED (grounding needs the real characters). PURE. Linear time. */
 export function pageTextOf(html: string): string {
-  const stripped = html
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
-    .replace(/<!--[\s\S]*?-->/g, " ")
-    .replace(/<(br|\/p|\/div|\/li|\/h[1-6]|\/tr|\/td)\b[^>]*>/gi, "\n")
-    .replace(/<[^>]+>/g, " ");
-  return decodeHtmlEntities(stripped)
-    .replace(/[ \t ]+/g, " ")
-    .replace(/\s*\n\s*/g, "\n")
-    .replace(/\n{2,}/g, "\n")
-    .trim();
+  let stripped = replaceUpToLastCloser(html, /<script[\s\S]*?<\/script>/gi, " ", /<\/script>/gi);
+  stripped = replaceUpToLastCloser(stripped, /<style[\s\S]*?<\/style>/gi, " ", /<\/style>/gi);
+  stripped = replaceUpToLastCloser(stripped, /<noscript[\s\S]*?<\/noscript>/gi, " ", /<\/noscript>/gi);
+  stripped = replaceUpToLastCloser(stripped, /<!--[\s\S]*?-->/g, " ", "-->");
+  stripped = replaceUpToLastCloser(stripped, /<(br|\/p|\/div|\/li|\/h[1-6]|\/tr|\/td)\b[^>]*>/gi, "\n", ">");
+  stripped = replaceUpToLastCloser(stripped, /<[^>]+>/g, " ", ">");
+  return (
+    decodeHtmlEntities(stripped)
+      .replace(/[ \t ]+/g, " ")
+      // A whitespace run holding a newline becomes one newline (was
+      // /\s*\n\s*/g — same result, without the quadratic backtracking on a
+      // long run with no newline in it).
+      .replace(/\s+/g, (ws) => (ws.includes("\n") ? "\n" : ws))
+      .replace(/\n{2,}/g, "\n")
+      .trim()
+  );
 }
 
 const PRODUCT_LINK_PATTERNS: ReadonlyArray<{ re: RegExp; score: number }> = [
@@ -184,6 +208,112 @@ const PRODUCT_LINK_PATTERNS: ReadonlyArray<{ re: RegExp; score: number }> = [
   { re: /nettbutikk|butikk|shop|bestill|kjøp|handle/i, score: 2 },
   { re: /meny|utsalg|gårdsbutikk|salg/i, score: 1 },
 ];
+
+// Bounds of one anchor tag for scanAnchorTags (chars). A tag beyond them
+// (never seen on a real page) is skipped instead of rescanned.
+const ANCHOR_HEAD_MAX_CHARS = 2000; // between "<a" and "href="
+const ANCHOR_HREF_MAX_CHARS = 2000; // the href value
+const ANCHOR_TAIL_MAX_CHARS = 2000; // the href's closing quote → ">"
+const ANCHOR_CLOSE_RE = /[\s\S]{0,160}?<\/a>/iy; // link text (≤160 chars) up to "</a>"
+
+/**
+ * The `<a … href="…" …>text</a>` anchors of a page, in document order:
+ * the matches of
+ *   /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]{0,160}?)<\/a>/gi
+ * (the last usable href= in the tag; link text up to the first `</a>`
+ * within 160 chars; scanning resumes after that `</a>`), computed in linear
+ * time — that regex backtracks quadratically on hostile HTML (an unclosed
+ * `<a href="x"` repeated: 20 KB took 7.6 s). The only difference: a tag
+ * whose head, href or tail exceeds the bounds above is skipped. PURE.
+ */
+export function scanAnchorTags(html: string): Array<{ href: string; text: string }> {
+  const out: Array<{ href: string; text: string }> = [];
+  const hrefAt: number[] = [];
+  for (const m of html.matchAll(/href=["']/gi)) hrefAt.push(m.index!);
+  if (hrefAt.length === 0) return out;
+
+  // Whether the href= at `p` closes into an anchor depends only on the text
+  // from `p` on, so each one is tried once.
+  type Hit = { href: string; text: string; end: number };
+  const tried = new Map<number, Hit | null>();
+  const closeAt = new Map<number, { text: string; end: number } | null>();
+  const tryHref = (p: number, firstGt: number): Hit | null => {
+    const memo = tried.get(p);
+    if (memo !== undefined) return memo;
+    let hit: Hit | null = null;
+    const v = p + 6; // after `href="`
+    let q = v;
+    const qMax = Math.min(html.length, v + ANCHOR_HREF_MAX_CHARS + 1);
+    while (q < qMax) {
+      const c = html.charCodeAt(q);
+      if (c === 34 || c === 39) break; // " or '
+      q++;
+    }
+    if (q > v && q < qMax) {
+      // The tag's ">" is the next one after the closing quote: the anchor's
+      // first ">" unless the href value runs past it.
+      let gt: number;
+      if (q < firstGt) gt = firstGt;
+      else {
+        const g = html.slice(q + 1, q + 2 + ANCHOR_TAIL_MAX_CHARS).indexOf(">");
+        gt = g < 0 ? -1 : q + 1 + g;
+      }
+      if (gt >= 0 && gt - (q + 1) <= ANCHOR_TAIL_MAX_CHARS) {
+        let close = closeAt.get(gt);
+        if (close === undefined) {
+          ANCHOR_CLOSE_RE.lastIndex = gt + 1;
+          const m = ANCHOR_CLOSE_RE.exec(html);
+          close = m ? { text: m[0].slice(0, -4), end: gt + 1 + m[0].length } : null;
+          closeAt.set(gt, close);
+        }
+        if (close) hit = { href: html.slice(v, q), text: close.text, end: close.end };
+      }
+    }
+    tried.set(p, hit);
+    return hit;
+  };
+  // Index of the first href= at or after `pos`.
+  const firstHrefFrom = (pos: number): number => {
+    let lo = 0;
+    let hi = hrefAt.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (hrefAt[mid]! < pos) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  };
+  // Next ">" at or after `from`; `from` only grows, so the scan is linear.
+  let gtAt = -2;
+  const nextGt = (from: number): number => {
+    if (gtAt === -1 || gtAt >= from) return gtAt;
+    gtAt = html.indexOf(">", from);
+    return gtAt;
+  };
+
+  const openRe = /<a\b/gi;
+  let m: RegExpExecArray | null;
+  while ((m = openRe.exec(html)) !== null) {
+    const lo = m.index + 2;
+    const firstGt = nextGt(lo);
+    if (firstGt < 0) break; // no ">" left: no later anchor can close either
+    const hi = Math.min(firstGt, lo + ANCHOR_HEAD_MAX_CHARS + 1);
+    let hit: Hit | null = null;
+    // Greedy [^>]* in the regex: the LAST href= in the tag that works.
+    for (let i = firstHrefFrom(hi) - 1; i >= 0 && hrefAt[i]! >= lo; i--) {
+      hit = tryHref(hrefAt[i]!, firstGt);
+      if (hit) break;
+    }
+    if (hit) {
+      out.push({ href: hit.href, text: hit.text });
+      openRe.lastIndex = hit.end;
+    } else if (hi === firstGt) {
+      // Every later "<a" before this ">" sees a subset of the same href=s.
+      openRe.lastIndex = firstGt + 1;
+    }
+  }
+  return out;
+}
 
 /** Same-host links that look like product / price pages, ranked. PURE. */
 export function discoverProductLinks(
@@ -200,8 +330,8 @@ export function discoverProductLinks(
   }
   const scored = new Map<string, number>();
   const rejected = new Set<string>();
-  for (const m of html.matchAll(/<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]{0,160}?)<\/a>/gi)) {
-    const rawHref = decodeHtmlEntities(m[1]!);
+  for (const a of scanAnchorTags(html)) {
+    const rawHref = decodeHtmlEntities(a.href);
     if (rawHref.startsWith("#") || /^(mailto|tel|javascript):/i.test(rawHref)) continue;
     let abs: URL;
     try {
@@ -212,7 +342,7 @@ export function discoverProductLinks(
     if (abs.protocol !== "http:" && abs.protocol !== "https:") continue;
     abs.hash = "";
     if (/\.(jpe?g|png|gif|webp|svg|pdf|zip|mp4|css|js)$/i.test(abs.pathname)) continue;
-    const linkText = m[2]!.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    const linkText = a.text.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
     let path = abs.pathname;
     try {
       path = decodeURIComponent(path);
