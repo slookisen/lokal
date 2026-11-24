@@ -24,7 +24,10 @@ name: Fleet auto-approve
 # lokal#1401 was APPROVED 2026-11-05T02:52Z, the gate gave up at 03:03Z and
 # never looked again until the PR had gone stale against main. On a sweep run,
 # `resolve-pr` lists open, non-draft fleet PRs that carry a trusted
-# REVIEW-VERDICT: APPROVED comment and no github-actions[bot] approval on their
+# REVIEW-VERDICT: APPROVED comment (or, without one, a supervisor-inbox review
+# doc on A2A main whose Reviewed-head matches their head — verdict lookup
+# fallback, dev-request 2026-11-22-fleet-gate-leser-verdikt-uten-kommentar)
+# and no github-actions[bot] approval on their
 # current head SHA (max 10, oldest first), and `evaluate` runs as a matrix over
 # them with every existing gate unchanged. Sweep runs use a shorter poll budget,
 # skip silently when GitHub has not computed mergeability yet, and never re-post
@@ -70,6 +73,8 @@ jobs:
       - name: Resolve PR number(s) for this event
         id: resolve
         uses: actions/github-script@v7
+        env:
+          A2A_READ_PAT: ${{ secrets.A2A_READ_PAT }}
         with:
           script: |
             let prNumber = null;
@@ -105,6 +110,66 @@ jobs:
             const verdictRe = /^REVIEW-VERDICT:\s*APPROVED\s*—\s*(\S+)/m;
             const SWEEP_MAX_PRS = 10;
 
+            // Verdict lookup fallback (dev-request 2026-11-22-fleet-gate-leser-verdikt-
+            // uten-kommentar): a fleet PR with no REVIEW-VERDICT comment is still a
+            // candidate when slookisen/A2A main has supervisor-inbox/<date>-orchestrator-
+            // pr-<N>-review[-r<k>].md (newest lokal verdict for that PR) whose
+            // Reviewed-head matches the PR's current head. The
+            // evaluate job re-checks all of this and runs every gate. The helpers are
+            // copies of the ones in the evaluate job — keep identical (asserted by
+            // scripts/test-fleet-auto-approve-verdict-lookup.js).
+            function lookupVerdictCandidates(names, prNum) {
+              if (!Array.isArray(names) || !Number.isInteger(prNum) || prNum <= 0) return [];
+              const re = new RegExp(`^(\\d{4}-\\d{2}-\\d{2})-orchestrator-pr-${prNum}-review(?:-r(\\d+))?\\.md$`);
+              const hits = [];
+              for (const n of names) {
+                const m = typeof n === 'string' ? n.match(re) : null;
+                if (m) hits.push({ name: n, date: m[1], round: m[2] ? parseInt(m[2], 10) : 0 });
+              }
+              hits.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : b.round - a.round));
+              return hits.map((h) => h.name);
+            }
+            function isLokalVerdictDocFor(docText, prNum) {
+              const first = String(docText || '').replace(/^\uFEFF/, '').split(/\r?\n/)[0];
+              return /\bVERDICT:/i.test(first)
+                && new RegExp(`PR[- ]?#?${prNum}\\b`, 'i').test(first)
+                && first.includes('(slookisen/lokal)');
+            }
+            function reviewedHeadMatch(docText, headSha) {
+              const m = String(docText || '').match(/^Reviewed-head:(.*)$/mi);
+              if (!m) return { ok: false, reviewed: null, reason: 'the review doc has no Reviewed-head line' };
+              const reviewed = m[1].trim().toLowerCase();
+              if (!/^[0-9a-f]{7,40}$/.test(reviewed)) {
+                return { ok: false, reviewed, reason: `Reviewed-head "${m[1].trim()}" is not a 7-40 character hex SHA` };
+              }
+              const head = String(headSha || '').toLowerCase();
+              if (!/^[0-9a-f]{40}$/.test(head)) return { ok: false, reviewed, reason: 'the PR head SHA is unknown' };
+              if (!head.startsWith(reviewed)) {
+                return { ok: false, reviewed, reason: `the verdict applies to a different head (Reviewed-head ${reviewed}, PR head ${head})` };
+              }
+              return { ok: true, reviewed, reason: '' };
+            }
+            const a2aContents = async (relPath, accept) => {
+              const resp = await fetch(`https://api.github.com/repos/slookisen/A2A/contents/${relPath}?ref=main`, {
+                headers: { Authorization: `token ${process.env.A2A_READ_PAT}`, Accept: accept },
+              });
+              if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+              return resp;
+            };
+            let inboxNames = null;
+            const listInboxOnce = async () => {
+              if (inboxNames !== null) return inboxNames;
+              inboxNames = [];
+              if (!process.env.A2A_READ_PAT) return inboxNames;
+              try {
+                const listing = await (await a2aContents('supervisor-inbox', 'application/vnd.github+json')).json();
+                if (Array.isArray(listing)) inboxNames = listing.map((e) => e && e.name).filter((n) => typeof n === 'string');
+              } catch (e) {
+                core.warning(`verdict lookup: could not list slookisen/A2A supervisor-inbox: ${e.message}`);
+              }
+              return inboxNames;
+            };
+
             const open = await github.paginate(github.rest.pulls.list, {
               owner, repo, state: 'open', sort: 'created', direction: 'asc', per_page: 100,
             });
@@ -120,7 +185,29 @@ jobs:
               const hasVerdict = comments.some(
                 c => c.user && FLEET_IDENTITIES.includes(c.user.login) && verdictRe.test(c.body || '')
               );
-              if (!hasVerdict) continue;
+              if (!hasVerdict) {
+                // Newest lokal doc for this PR wins; docs for an A2A PR with the same
+                // number are skipped. A fetch error stops the lookup (no fallback to
+                // an older doc).
+                let file = null;
+                let docText = '';
+                try {
+                  for (const cand of lookupVerdictCandidates(await listInboxOnce(), p.number)) {
+                    const text = await (await a2aContents(`supervisor-inbox/${cand}`, 'application/vnd.github.raw+json')).text();
+                    if (isLokalVerdictDocFor(text, p.number)) { file = cand; docText = text; break; }
+                  }
+                } catch (e) {
+                  core.warning(`#${p.number}: verdict lookup could not fetch a review doc: ${e.message}`);
+                  continue;
+                }
+                if (!file) continue;
+                const head = reviewedHeadMatch(docText, p.head.sha);
+                if (!head.ok) {
+                  core.info(`#${p.number}: no verdict comment; supervisor-inbox/${file} not usable — ${head.reason}`);
+                  continue;
+                }
+                core.info(`#${p.number}: no verdict comment, but supervisor-inbox/${file} matches head ${p.head.sha}`);
+              }
               const reviews = await github.paginate(github.rest.pulls.listReviews, {
                 owner, repo, pull_number: p.number, per_page: 100,
               });
@@ -837,11 +924,115 @@ jobs:
             const verdictComment = [...comments].reverse().find(
               c => c.user && FLEET_IDENTITIES.includes(c.user.login) && verdictRe.test(c.body || '')
             );
-            if (!verdictComment) {
-              core.info('no REVIEW-VERDICT: APPROVED comment from the trusted fleet account yet — waiting');
-              return;
+            // 4a. Verdict lookup fallback (dev-request 2026-11-22-fleet-gate-leser-
+            //     verdikt-uten-kommentar). Used ONLY when no trusted verdict comment
+            //     exists: the gate itself looks in slookisen/A2A main for
+            //     supervisor-inbox/<YYYY-MM-DD>-orchestrator-pr-<N>-review[-r<k>].md
+            //     (exact PR number; newest date, then round, wins; first line must be
+            //     a slookisen/lokal verdict). The doc counts only if its
+            //     Reviewed-head matches this PR's current head (checked after the
+            //     fetch below), and it then goes through exactly the same doc checks
+            //     as a comment-referenced doc. Every later gate is unchanged.
+            //     Helpers are identical copies of the resolve-pr sweep's (asserted by
+            //     scripts/test-fleet-auto-approve-verdict-lookup.js).
+            function lookupVerdictCandidates(names, prNum) {
+              if (!Array.isArray(names) || !Number.isInteger(prNum) || prNum <= 0) return [];
+              const re = new RegExp(`^(\\d{4}-\\d{2}-\\d{2})-orchestrator-pr-${prNum}-review(?:-r(\\d+))?\\.md$`);
+              const hits = [];
+              for (const n of names) {
+                const m = typeof n === 'string' ? n.match(re) : null;
+                if (m) hits.push({ name: n, date: m[1], round: m[2] ? parseInt(m[2], 10) : 0 });
+              }
+              hits.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : b.round - a.round));
+              return hits.map((h) => h.name);
             }
-            const rawRef = verdictComment.body.match(verdictRe)[1];
+            function isLokalVerdictDocFor(docText, prNum) {
+              const first = String(docText || '').replace(/^\uFEFF/, '').split(/\r?\n/)[0];
+              return /\bVERDICT:/i.test(first)
+                && new RegExp(`PR[- ]?#?${prNum}\\b`, 'i').test(first)
+                && first.includes('(slookisen/lokal)');
+            }
+            function reviewedHeadMatch(docText, headSha) {
+              const m = String(docText || '').match(/^Reviewed-head:(.*)$/mi);
+              if (!m) return { ok: false, reviewed: null, reason: 'the review doc has no Reviewed-head line' };
+              const reviewed = m[1].trim().toLowerCase();
+              if (!/^[0-9a-f]{7,40}$/.test(reviewed)) {
+                return { ok: false, reviewed, reason: `Reviewed-head "${m[1].trim()}" is not a 7-40 character hex SHA` };
+              }
+              const head = String(headSha || '').toLowerCase();
+              if (!/^[0-9a-f]{40}$/.test(head)) return { ok: false, reviewed, reason: 'the PR head SHA is unknown' };
+              if (!head.startsWith(reviewed)) {
+                return { ok: false, reviewed, reason: `the verdict applies to a different head (Reviewed-head ${reviewed}, PR head ${head})` };
+              }
+              return { ok: true, reviewed, reason: '' };
+            }
+            let rawRef;
+            let verdictSource = 'comment';
+            if (verdictComment) {
+              rawRef = verdictComment.body.match(verdictRe)[1];
+            } else {
+              if (!process.env.A2A_READ_PAT) {
+                core.info('no REVIEW-VERDICT: APPROVED comment from the trusted fleet account yet (verdict lookup needs A2A_READ_PAT) — waiting');
+                return;
+              }
+              let inboxNames = [];
+              try {
+                const listing = await withRetry5xx(async () => {
+                  const resp = await fetch('https://api.github.com/repos/slookisen/A2A/contents/supervisor-inbox?ref=main', {
+                    headers: {
+                      Authorization: `token ${process.env.A2A_READ_PAT}`,
+                      Accept: 'application/vnd.github+json',
+                    },
+                  });
+                  if (!resp.ok) {
+                    const err = new Error(`HTTP ${resp.status}`);
+                    err.status = resp.status;
+                    throw err;
+                  }
+                  return resp.json();
+                }, { label: 'A2A supervisor-inbox listing', log: (m) => core.warning(m) });
+                if (Array.isArray(listing)) inboxNames = listing.map((e) => e && e.name).filter((n) => typeof n === 'string');
+              } catch (e) {
+                core.warning(`verdict lookup: could not list slookisen/A2A supervisor-inbox: ${e.message} — waiting`);
+                return;
+              }
+              // Walk candidates newest first (date, then -r<round>). Docs whose first
+              // line is not a lokal verdict for this PR (e.g. an A2A PR with the same
+              // number) are skipped; the first lokal doc wins even if it is not
+              // APPROVED — never fall back to an older one. A fetch error waits.
+              let lookupFile = null;
+              for (const cand of lookupVerdictCandidates(inboxNames, prNumber)) {
+                let candText;
+                try {
+                  candText = await withRetry5xx(async () => {
+                    const resp = await fetch(`https://api.github.com/repos/slookisen/A2A/contents/supervisor-inbox/${cand}?ref=main`, {
+                      headers: {
+                        Authorization: `token ${process.env.A2A_READ_PAT}`,
+                        Accept: 'application/vnd.github.raw+json',
+                      },
+                    });
+                    if (!resp.ok) {
+                      const err = new Error(`HTTP ${resp.status}`);
+                      err.status = resp.status;
+                      throw err;
+                    }
+                    return resp.text();
+                  }, { label: `A2A supervisor-inbox/${cand}`, log: (m) => core.warning(m) });
+                } catch (e) {
+                  core.warning(`verdict lookup: could not fetch supervisor-inbox/${cand}: ${e.message} — waiting`);
+                  return;
+                }
+                if (isLokalVerdictDocFor(candText, prNumber)) { lookupFile = cand; break; }
+                core.info(`verdict lookup: supervisor-inbox/${cand} is not a lokal verdict for PR #${prNumber} — skipped`);
+              }
+              if (!lookupFile) {
+                core.info('no REVIEW-VERDICT: APPROVED comment from the trusted fleet account and no review doc found by lookup yet — waiting');
+                return;
+              }
+              rawRef = `supervisor-inbox/${lookupFile}`;
+              verdictSource = 'lookup';
+              core.info(`no verdict comment; verdict lookup found ${rawRef}`);
+            }
             // Only a bare "supervisor-inbox/<safe-filename>.md" path is accepted — reject
             // anything that looks like a URL, an absolute path, or a path-traversal attempt.
             const pathRe = /^supervisor-inbox\/[A-Za-z0-9_.-]+\.md$/;
@@ -873,6 +1064,18 @@ jobs:
               await note(`could not fetch review doc "${rawRef}": ${e.message}. No auto-approve.`);
               core.info('review doc fetch failed — no-op');
               return;
+            }
+
+            // 4b. A lookup-found doc is usable only for the head it reviewed.
+            if (verdictSource === 'lookup') {
+              const head = isLokalVerdictDocFor(docText, prNumber)
+                ? reviewedHeadMatch(docText, pr.head.sha)
+                : { ok: false, reason: 'its first line is not a slookisen/lokal verdict for this PR' };
+              if (!head.ok) {
+                await note(`no REVIEW-VERDICT comment; review doc "${rawRef}" found by lookup is not usable: ${head.reason}. Waiting for a review of the current head.`);
+                core.info(`verdict lookup doc not usable (${head.reason}) — waiting`);
+                return;
+              }
             }
 
             // needs_daniel, third and last place the fleet records it (Slice B,
@@ -1028,7 +1231,7 @@ jobs:
             await github.rest.pulls.createReview({
               owner, repo, pull_number: prNumber,
               event: 'APPROVE',
-              body: `Auto-approved: independent fleet code-reviewer verdict confirmed at slookisen/A2A:${rawRef}, all status checks green, no protected-path or size-cap violation. Branch-protection required-approval satisfied by a distinct identity (github-actions[bot] != ${pr.user.login}).`,
+              body: `Auto-approved: independent fleet code-reviewer verdict confirmed at slookisen/A2A:${rawRef} (verdict source: ${verdictSource === 'lookup' ? `A2A lookup (${rawRef})` : 'comment'}), all status checks green, no protected-path or size-cap violation. Branch-protection required-approval satisfied by a distinct identity (github-actions[bot] != ${pr.user.login}).`,
             });
 
             // Merge + trigger deploy.
