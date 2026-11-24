@@ -18,6 +18,8 @@
  *                                   side-by-side for one entity (verified +
  *                                   published, ignores the serve flag)
  *   GET  /audit?platform=&id=       status history of one row
+ *   (GET /status also returns orphan_drafts: draft rows whose source is gone
+ *    or junk, which /collect never hands out - read-only.)
  *   POST /run                       {platform, langs?, limit?, dry_run?, entity_ids?}
  *                                   collect → translate → review → verify.
  *                                   Gated by PROFILE_TRANSLATIONS_ENABLED
@@ -87,6 +89,7 @@ import {
   listTranslationAudit,
   getPublishedProfileTranslations,
   collectSourceItems,
+  summarizeOrphanDrafts,
   PROFILE_TRANSLATION_FIELDS,
   collectForSession,
   submitSessionTranslation,
@@ -201,6 +204,8 @@ router.get("/status", (req: Request, res: Response) => {
       pairs_total: pairs,
       counts,
       coverage: perLang,
+      // Drafts /collect can never hand out (source hidden/gone or junk) - expected, not stuck.
+      orphan_drafts: summarizeOrphanDrafts(db, platform, items),
     });
   } catch (e: any) {
     return res.status(500).json({ error: String(e?.message || e) });

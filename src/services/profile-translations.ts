@@ -1480,6 +1480,56 @@ export function sweepStaleTranslations(
   return { checked: rows.length, stale: stale.length, unpublished: act.length, ids: act.map((x) => x.row.id), missing_source: missingSource };
 }
 
+// --- Orphan drafts (no LLM, read-only) ------------------------------------
+//
+// dev-request 2026-11-24-translation-rfb-drafted-rows-not-collected: the stale
+// sweep moves a row back to draft when its Norwegian source changed OR
+// disappeared (the profile was hidden, quarantined, delisted or its text no
+// longer passes the source filter). A draft whose source is gone can never be
+// planned again - planTranslationBatch only walks collectSourceItems() - so it
+// sits in the draft queue forever and looked like a /collect bug from the
+// routine's side. That is the intended outcome (no English page for a profile
+// that has no Norwegian page), so the fix is to NAME these rows, not to hand
+// them out: /status reports them, split from the drafts /collect can still
+// return. Nothing is written.
+
+export interface OrphanDraftSummary {
+  /** Draft rows whose source item is not in the live (public) source set. */
+  source_gone: number;
+  /** Draft rows whose live source is skipped by the planner as junk. */
+  source_junk: number;
+  by_lang: Record<string, number>;
+  /** Up to 200 row ids, oldest updated_at first. */
+  ids: number[];
+}
+
+export function summarizeOrphanDrafts(
+  db: Database.Database,
+  platform: TranslationPlatform,
+  liveItems?: SourceItem[],
+): OrphanDraftSummary {
+  const items = liveItems ?? collectSourceItems(db, platform);
+  const liveText = new Map<string, string>();
+  for (const item of items) liveText.set([item.entity_type, item.entity_id, item.field].join(" | "), item.text);
+  const rows = db
+    .prepare(
+      `SELECT id, entity_type, entity_id, field, lang FROM profile_translations
+        WHERE platform = ? AND status = 'draft'
+        ORDER BY updated_at ASC, id ASC`,
+    )
+    .all(platform) as Array<{ id: number; entity_type: string; entity_id: string; field: string; lang: string }>;
+  const out: OrphanDraftSummary = { source_gone: 0, source_junk: 0, by_lang: {}, ids: [] };
+  for (const r of rows) {
+    const text = liveText.get([r.entity_type, r.entity_id, r.field].join(" | "));
+    if (text === undefined) out.source_gone++;
+    else if (isJunkSource(text)) out.source_junk++;
+    else continue;
+    out.by_lang[r.lang] = (out.by_lang[r.lang] || 0) + 1;
+    if (out.ids.length < 200) out.ids.push(r.id);
+  }
+  return out;
+}
+
 // --- Owner-authored translations ------------------------------------------
 
 export interface OwnerTranslationView {

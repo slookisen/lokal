@@ -618,7 +618,23 @@ export async function runProfileTranslationsTests(opts: { log?: boolean } = {}):
       rfbDb.prepare("UPDATE agents SET is_active = 0 WHERE id = ?").run("a1");
       const f11 = svc.sweepStaleTranslations(rfbDb as any, "rfb", { dryRun: true, batchId: "s5", actor: "t" });
       ok(f11.missing_source > f11before.missing_source, "F11 a vanished source counts as missing_source", { before: f11before.missing_source, after: f11.missing_source });
+      // dev-request 2026-11-24-translation-rfb-drafted-rows-not-collected: a draft
+      // whose producer is no longer public is never handed out by /collect, and
+      // /status names it as an orphan draft instead of leaving it looking stuck.
+      const f11c = await callRoute(router, { url: "/collect?platform=rfb&langs=sv&limit=200", headers: H });
+      ok(f11c.status === 200 && !f11c.body.items.some((i: any) => i.id === eDesc.id), "F11b /collect does not hand out a draft whose profile is hidden", f11c.body.items);
+      const f11o = svc.summarizeOrphanDrafts(rfbDb as any, "rfb");
+      ok(f11o.ids.includes(eDesc.id) && f11o.source_gone >= 1 && (f11o.by_lang.sv || 0) >= 1, "F11c summarizeOrphanDrafts counts it as source_gone", f11o);
+      const f11s = await callRoute(router, { url: "/status?platform=rfb", headers: H });
+      ok(f11s.status === 200 && f11s.body.orphan_drafts && f11s.body.orphan_drafts.ids.includes(eDesc.id), "F11d GET /status returns orphan_drafts with the row id", f11s.body.orphan_drafts);
       rfbDb.prepare("UPDATE agents SET is_active = 1 WHERE id = ?").run("a1");
+      const f11r = svc.summarizeOrphanDrafts(rfbDb as any, "rfb");
+      ok(!f11r.ids.includes(eDesc.id), "F11e back in public: the draft is no longer an orphan", f11r);
+      // a draft whose live source is planner junk is an orphan too (source_junk)
+      rfbDb.prepare("UPDATE agents SET description = ? WHERE id = ?").run("Oppdaget via brreg-nace-discovery", "a1");
+      const f11j = svc.summarizeOrphanDrafts(rfbDb as any, "rfb");
+      ok(f11j.ids.includes(eDesc.id) && f11j.source_junk >= 1, "F11f a junk live source counts as source_junk", f11j);
+      rfbDb.prepare("UPDATE agents SET description = ? WHERE id = ?").run("Vi selger nå også epler og plommer fra egen hage i Bø.", "a1");
 
       // auto-republish policy
       delete process.env.PROFILE_TRANSLATIONS_AUTO_REPUBLISH_ENABLED;
