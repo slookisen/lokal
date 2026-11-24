@@ -128,6 +128,54 @@ function median(xs: number[]): number {
 
 const share = (n: number, d: number): number => (d > 0 ? Math.round((n / d) * 1000) / 1000 : 0);
 
+interface PlatformStats {
+  sites: number;
+  ok: number;
+  priced: number;
+  owned: { sites: number; ok: number; priced: number };
+  unowned: { sites: number; ok: number; priced: number };
+}
+
+/**
+ * Per-platform and per-no-hit-reason tallies (dev-request 2026-11-24,
+ * slice 1), read from each result's optional `diagnostics`. A row stored
+ * before diagnostics existed counts as platform `unknown` and, when not ok,
+ * reason `unknown`. PURE.
+ */
+export function summarizeSiteDiagnostics(rows: DryRunResultRow[]) {
+  const by_platform: Record<string, PlatformStats> = {};
+  const no_hit_reason_counts: Record<string, number> = {};
+  let pagination_hint_sites = 0;
+  let no_hit_with_price_text = 0;
+  for (const r of rows) {
+    const d = r.result.diagnostics;
+    const platform = d?.site_platform ?? "unknown";
+    const ok = r.result.outcome === "ok" ? 1 : 0;
+    const priced = (r.result.products ?? []).some((p) => p.price_nok !== null) ? 1 : 0;
+    const s = (by_platform[platform] ??= {
+      sites: 0,
+      ok: 0,
+      priced: 0,
+      owned: { sites: 0, ok: 0, priced: 0 },
+      unowned: { sites: 0, ok: 0, priced: 0 },
+    });
+    const half = r.is_owned === 1 ? s.owned : s.unowned;
+    s.sites++;
+    s.ok += ok;
+    s.priced += priced;
+    half.sites++;
+    half.ok += ok;
+    half.priced += priced;
+    if (d?.has_pagination_hint) pagination_hint_sites++;
+    if (!ok) {
+      const reason = d?.no_hit_reason ?? "unknown";
+      no_hit_reason_counts[reason] = (no_hit_reason_counts[reason] ?? 0) + 1;
+      if (d?.has_price_text) no_hit_with_price_text++;
+    }
+  }
+  return { by_platform, no_hit_reason_counts, pagination_hint_sites, no_hit_with_price_text };
+}
+
 /** Every number the measurement report needs, from the per-profile rows. PURE. */
 export function summarizeDryRun(rows: DryRunResultRow[]) {
   const count = (pred: (r: DryRunResultRow) => boolean) => rows.filter(pred).length;
@@ -211,6 +259,7 @@ export function summarizeDryRun(rows: DryRunResultRow[]) {
       max: durations.length ? Math.max(...durations) : 0,
     },
     by_ownership: { owned: byOwnership(1), unowned: byOwnership(0) },
+    site_diagnostics: summarizeSiteDiagnostics(rows),
   };
 }
 
@@ -504,6 +553,7 @@ export function getDryRun(runId: string, opts: { includeCandidates?: boolean } =
       rejected_urls: parsed.rejected_urls,
       robots_skipped: parsed.robots_skipped,
       excluded: parsed.excluded ?? [],
+      diagnostics: parsed.diagnostics ?? null,
       ...(opts.includeCandidates === false ? {} : { candidates: parsed.products ?? [] }),
     };
   });
