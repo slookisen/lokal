@@ -16,6 +16,9 @@
  *   cw53-cw56  second review: one-time problems are itemized before a thread
  *              backlog and only itemized keys are recorded; a forward stuck in
  *              pending is alerted; a digest retry gets its own ledger row.
+ *   cw58-cw74  cs-kjopere slice 2: every kjoper_svar sent in the last 24 h is
+ *              in the digest with its full text (newest first, capped at 20
+ *              replies / ~30 000 chars with a left-out line).
  *
  * Standalone:
  *   node node_modules/tsx/dist/cli.mjs src/services/cs-watchdog.test.ts
@@ -290,6 +293,65 @@ export function runCsWatchdogTests(opts: { log?: boolean } = {}): Promise<TestSu
           if (prevAdmin === undefined) delete process.env.ADMIN_NOTIFICATION_EMAIL;
           else process.env.ADMIN_NOTIFICATION_EMAIL = prevAdmin;
         }
+      }
+
+      // ── cs-kjopere slice 2: sent buyer replies with full text in the digest ──
+      {
+        const bNow = new Date("2026-11-22T06:30:00Z"); // 07:30 Oslo
+        const insP = db.prepare(
+          `INSERT INTO cs_reply_proposals (id, thread_id, vertical, kind, to_email, subject, body_text, created_by, status, sent_at, sent_mode, created_at, updated_at)
+           VALUES (?, ?, 'rfb', ?, ?, ?, ?, 'cs-routine', ?, ?, ?, ?, ?)`,
+        );
+        const addP = (id: string, kind: string, status: string, hoursAgo: number | null, mode: string | null, body: string) => {
+          const at = hoursAgo === null ? null : hoursBefore(bNow, hoursAgo);
+          insP.run(id, `thr-${id}`, kind, `${id}@kjoper.no`, `Emne ${id}`, body, status, at, mode, hoursBefore(bNow, 30), hoursBefore(bNow, 1));
+        };
+        const empty = cw.buildDailyDigest(bNow);
+        ok(empty.text.includes("KJØPERSVAR SENDT SISTE DØGN (0)\nIngen kjøpersvar sendt siste døgn."), "cw58: no buyer reply sent → one line says so");
+        eq(empty.counts.kjoper_svar_sent, 0, "cw58b: …and the count is 0");
+
+        const fullText = "Hei Kari!\nTakk for spørsmålet. Gården har åpent lørdag 10–14.\n\nVennlig hilsen\nRett fra Bonden";
+        addP("kj-new", "kjoper_svar", "sent", 2, "auto", fullText);
+        addP("kj-appr", "kjoper_svar", "sent", 5, "approved", "Godkjent svar fra køen.");
+        addP("kj-old", "kjoper_svar", "sent", 25, "auto", "GAMMELT-SVAR-UTENFOR-DØGNET");
+        addP("kj-wait", "kjoper_svar", "approval_needed", null, null, "VENTER-PÅ-GODKJENNING");
+        addP("kj-pend", "kjoper_svar", "pending", null, null, "IKKE-SENDT-ENNÅ");
+        addP("kj-fail", "kjoper_svar", "failed", null, null, "FEILET-SVAR");
+        addP("an-sent", "faq", "sent", 1, "auto", "ANNEN-TYPE-SENDT");
+        const d1 = cw.buildDailyDigest(bNow);
+        ok(d1.text.includes("KJØPERSVAR SENDT SISTE DØGN (2)"), "cw59: heading counts the two buyer replies sent in the last 24 h");
+        ok(d1.text.includes(fullText), "cw60: the full body text is in the digest, line breaks and æøå intact");
+        ok(d1.text.includes("2026-11-22 05:30 · [Rett fra Bonden] tråd thr-kj-new · til kj-new@kjoper.no · sendt automatisk"),
+          "cw61: per reply: Oslo sent time, platform, thread id, recipient and that it was autosent");
+        ok(d1.text.includes("tråd thr-kj-appr") && d1.text.includes("sendt av Daniel fra godkjenningskøen") && d1.text.includes("Godkjent svar fra køen."),
+          "cw62: a reply Daniel sent from the queue is shown as such");
+        ok(d1.text.indexOf("thr-kj-new") < d1.text.indexOf("thr-kj-appr"), "cw63: newest first");
+        ok(!d1.text.includes("GAMMELT-SVAR-UTENFOR-DØGNET"), "cw64: a buyer reply sent more than 24 h ago is not shown");
+        ok(!["VENTER-PÅ-GODKJENNING", "IKKE-SENDT-ENNÅ", "FEILET-SVAR"].some((t) => d1.text.includes(t)), "cw65: unsent buyer replies (approval_needed / pending / failed) are not shown");
+        ok(!d1.text.includes("ANNEN-TYPE-SENDT"), "cw66: a sent reply of another kind is not shown");
+        eq([d1.counts.kjoper_svar_sent, d1.counts.kjoper_svar_shown, d1.counts.kjoper_svar_omitted], [2, 2, 0], "cw67: counts carry kjoper_svar_sent");
+
+        // cap: at most 20 replies shown fully, the rest one line with the admin CRM link
+        db.prepare("DELETE FROM cs_reply_proposals").run();
+        for (let i = 0; i < 23; i++) addP(`kj-cap-${String(i).padStart(2, "0")}`, "kjoper_svar", "sent", 1 + i * 0.5, "auto", `Svartekst nummer ${i} slutt.`);
+        const d2 = cw.buildDailyDigest(bNow);
+        ok(d2.text.includes("KJØPERSVAR SENDT SISTE DØGN (23)"), "cw68: the heading counts all 23 sent");
+        ok(d2.text.includes("Svartekst nummer 0 slutt.") && d2.text.includes("Svartekst nummer 19 slutt.") && !d2.text.includes("Svartekst nummer 20 slutt."),
+          "cw69: the 20 newest are shown in full, older ones are left out");
+        ok(d2.text.includes("… og 3 eldre kjøpersvar er ikke tatt med her") && d2.text.includes("/admin-crm.html"), "cw70: one line says how many were left out and where to see them");
+        eq([d2.counts.kjoper_svar_sent, d2.counts.kjoper_svar_shown, d2.counts.kjoper_svar_omitted], [23, 20, 3], "cw71: counts sent/shown/omitted");
+
+        // cap by size: ~30 000 chars of body text
+        db.prepare("DELETE FROM cs_reply_proposals").run();
+        for (let i = 0; i < 4; i++) addP(`kj-big-${i}`, "kjoper_svar", "sent", 1 + i, "auto", `START-${i} ` + "x".repeat(9_000));
+        const d3 = cw.buildDailyDigest(bNow);
+        ok(d3.text.includes("START-0") && d3.text.includes("START-2") && !d3.text.includes("START-3"), "cw72: replies past ~30 000 chars of body text are left out");
+        ok(d3.text.includes("… og 1 eldre kjøpersvar er ikke tatt med her"), "cw73: …and counted in the left-out line");
+        db.prepare("DELETE FROM cs_reply_proposals").run();
+        addP("kj-huge", "kjoper_svar", "sent", 1, "auto", "HUGE " + "y".repeat(40_000));
+        const d4 = cw.buildDailyDigest(bNow);
+        ok(d4.text.includes("HUGE ") && d4.text.includes("teksten er kortet ned her") && d4.text.length < 40_000, "cw74: one reply longer than the cap is shown cut, never dropped");
+        db.prepare("DELETE FROM cs_reply_proposals").run();
       }
     } catch (err: any) {
       failed++;

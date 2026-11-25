@@ -23,7 +23,7 @@ import { computeNeedsReply, NeedsReplyReport } from "./crm-needs-reply";
 import { recordRun } from "./run-ledger";
 import { EnvelopeBuilder } from "../types/run-envelope";
 import { getJobLastCompletedAt, markJobCompleted } from "./boot-job-gate";
-import { parkPendingWhenAutosendOff, recoverExpiredLeases } from "./cs-reply-proposals";
+import { BUYER_REPLY_KIND, parkPendingWhenAutosendOff, recoverExpiredLeases } from "./cs-reply-proposals";
 import { failedReplyDeliveries } from "./crm-delivery-status";
 import { contactRejectionsSince } from "./contact-form-cs";
 
@@ -615,6 +615,81 @@ export function reviewQueueDigestLines(ages: { org_nr: ReviewQueueAge | null; we
   return { lines, findings };
 }
 
+// ─── cs-kjopere slice 2: Daniel sees the buyer replies ─────────────────
+// Every kjoper_svar proposal that was actually sent (status 'sent', stamped
+// with sent_at when the relay accepted it) in the 24 h before `now` is shown
+// with its full body text, newest first. Capped so the e-mail stays a sane
+// size: at most BUYER_DIGEST_MAX_REPLIES replies and BUYER_DIGEST_MAX_CHARS
+// characters of body text; the rest is one line pointing to the admin CRM.
+export const BUYER_DIGEST_MAX_REPLIES = 20;
+export const BUYER_DIGEST_MAX_CHARS = 30_000;
+
+/** "YYYY-MM-DD HH:MM" in Europe/Oslo; the raw value when it is not a date. */
+export function osloDateTime(value: string | null | undefined): string {
+  const d = new Date(String(value ?? ""));
+  if (!value || Number.isNaN(d.getTime())) return String(value ?? "ukjent tid");
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/Oslo", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).formatToParts(d);
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "00";
+  return `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")}`;
+}
+
+export interface BuyerRepliesDigest {
+  lines: string[];
+  sent: number;
+  shown: number;
+  omitted: number;
+}
+
+export function buyerRepliesDigest(now: Date = new Date()): BuyerRepliesDigest | null {
+  const since = new Date(now.getTime() - 24 * 3600_000).toISOString();
+  let rows: Array<{ id: string; thread_id: string; vertical: string; to_email: string; subject: string; body_text: string; sent_at: string; sent_mode: string | null }>;
+  try {
+    rows = getDb()
+      .prepare(
+        `SELECT id, thread_id, vertical, to_email, subject, body_text, sent_at, sent_mode FROM cs_reply_proposals
+          WHERE status = 'sent' AND kind = ? AND sent_at IS NOT NULL
+            AND julianday(sent_at) >= julianday(?) AND julianday(sent_at) <= julianday(?)
+          ORDER BY julianday(sent_at) DESC, id DESC`,
+      )
+      .all(BUYER_REPLY_KIND, since, now.toISOString()) as typeof rows;
+  } catch {
+    return null; // cs_reply_proposals missing (pre-migration DB)
+  }
+  const lines: string[] = [];
+  lines.push(`KJØPERSVAR SENDT SISTE DØGN (${rows.length})`);
+  if (rows.length === 0) {
+    lines.push("Ingen kjøpersvar sendt siste døgn.");
+    return { lines, sent: 0, shown: 0, omitted: 0 };
+  }
+  let chars = 0;
+  let shown = 0;
+  for (const r of rows) {
+    const body = String(r.body_text ?? "").replace(/\r\n?/g, "\n").trimEnd();
+    const len = Array.from(body).length;
+    if (shown >= BUYER_DIGEST_MAX_REPLIES) break;
+    if (shown > 0 && chars + len > BUYER_DIGEST_MAX_CHARS) break;
+    // A single reply longer than the whole cap is shown cut, so the newest one is never dropped.
+    const text = len > BUYER_DIGEST_MAX_CHARS
+      ? Array.from(body).slice(0, BUYER_DIGEST_MAX_CHARS).join("") + "\n[… teksten er kortet ned her — se hele i admin-CRM]"
+      : body;
+    chars += Math.min(len, BUYER_DIGEST_MAX_CHARS);
+    shown++;
+    const how = r.sent_mode === "auto" ? "sendt automatisk" : r.sent_mode === "approved" ? "sendt av Daniel fra godkjenningskøen" : `sendt (${r.sent_mode ?? "ukjent måte"})`;
+    lines.push("");
+    lines.push(`— ${osloDateTime(r.sent_at)} · [${platformName(r.vertical)}] tråd ${r.thread_id} · til ${r.to_email} · ${how}`);
+    lines.push(`Emne: ${r.subject}`);
+    lines.push(text);
+  }
+  const omitted = rows.length - shown;
+  if (omitted > 0) {
+    lines.push("");
+    lines.push(`… og ${omitted} eldre kjøpersvar er ikke tatt med her (e-posten ville blitt for lang). Se dem i ${adminCrmUrl()}`);
+  }
+  return { lines, sent: rows.length, shown, omitted };
+}
+
 export function buildDailyDigest(now: Date = new Date()): { subject: string; text: string; counts: Record<string, unknown> } {
   const db = getDb();
   const since = new Date(now.getTime() - 24 * 3600_000).toISOString();
@@ -763,6 +838,11 @@ export function buildDailyDigest(now: Date = new Date()): { subject: string; tex
   }
   lines.push("");
   lines.push(`FEIL: ${report.counts.forward_failed} videresending(er) til Gmail feilet, ${report.counts.crm_register_errors_7d} e-post ikke registrert i CRM siste 7 døgn.`);
+  const buyer = buyerRepliesDigest(now);
+  if (buyer) {
+    lines.push("");
+    lines.push(...buyer.lines);
+  }
   lines.push("");
   lines.push(`Alt som venter: ${adminCrmUrl()}`);
   lines.push("— Daglig oppsummering fra serveren (CS_DAILY_DIGEST_ENABLED)");
@@ -772,6 +852,7 @@ export function buildDailyDigest(now: Date = new Date()): { subject: string; tex
     subject,
     text: lines.join("\n"),
     counts: { inbound, forms, contact_form_rejected: rejected, outbound, needs_reply: report.counts, proposals: proposalCounts,
+      kjoper_svar_sent: buyer?.sent ?? 0, kjoper_svar_shown: buyer?.shown ?? 0, kjoper_svar_omitted: buyer?.omitted ?? 0,
       review_queues: { ...queueAges, findings: queueDigest.findings } },
   };
 }
