@@ -128,15 +128,22 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
          VALUES (?, ?, ?, '+47 912 34 567', 'Gardsvegen 12', '6002', ?, ?, 'verified', 0, 'rich', 200, datetime('now'), '2026-01-01T00:00:00.000Z')`,
       ).run(id, o.email, `https://${id}.example.no`,
         "Vi er en liten familiegård som dyrker poteter, gulrøtter og kål, og selger direkte fra gården hele året.",
-        JSON.stringify([{ name: "Probepoteter", price: "30 kr/kg", category: "vegetables" }]));
+        // T14a: a price written into a product name too (the only price the front-page card shows).
+        JSON.stringify([{ name: "Probepoteter", price: "30 kr/kg", category: "vegetables" }, { name: "Probesaft – kr 85", category: "beverages" }]));
       db.prepare(
         `INSERT INTO products (id, agent_id, name, name_norm, unit, price_nok, availability, category, image_url, availability_source, availability_updated_at)
          VALUES (?, ?, 'Probepoteter', 'probepoteter', 'kg', 30, 'in_stock', 'vegetables', 'https://img.example.no/p.jpg', 'admin_producer_confirmed', ?)`,
       ).run(`prod-${id}`, id, new Date().toISOString());
       db.prepare(`INSERT OR REPLACE INTO agent_metrics (agent_id, times_discovered, times_contacted, times_chosen) VALUES (?, 10, 5, 3)`).run(id);
+      // T14a: search terms the profile page can show (stats.public_search_terms).
+      for (let i = 0; i < 3; i++) {
+        db.prepare(`INSERT INTO conversations (id, seller_agent_id, source, query_text, created_at) VALUES (?, ?, 'a2a', 'probesaft ålesund', datetime('now', '-1 days'))`).run(`conv-${id}-${i}`, id);
+      }
     };
     seed(FIX, FIX_NAME, { origin: "test_fixture", hidden: 1, email: FIX_EMAIL });
     seed(REAL, "Bryterprobe Ekte Gard", { origin: "discovery", hidden: 0, email: "post@sp-real.example.no" });
+    // T14a: the fixture's verified claim, so it gets a top front-page card (the only list card that shows product names).
+    db.prepare("INSERT INTO agent_claims (id, agent_id, claimant_email, claimant_name, status, verified_at) VALUES ('claim-sp-fixture', ?, ?, 'Eier', 'verified', '2026-10-01T00:00:00.000Z')").run(FIX, FIX_EMAIL);
     // Starting state with explicit choices, so the restore has something to put back.
     db.prepare(`INSERT INTO owner_feature_settings (vertical, subject_id, key, value_json, set_by, admin_locked, set_at) VALUES ('rfb', ?, 'comms.news', 'true', 'owner', 0, '2026-10-20T10:00:00.000Z')`).run(FIX);
     db.prepare(`INSERT INTO owner_feature_intro (vertical, subject_id, answer, answered_at, actor_detail) VALUES ('rfb', ?, 'yes', '2026-10-20T10:00:00.000Z', ?)`).run(FIX, FIX_EMAIL);
@@ -397,9 +404,14 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       nob("acp_feed", /ingen vare på lager i feeden/, "obs-5: acp_feed without an in-stock product → NOT_OBSERVABLE both ways, with the reason");
       nob("vcard", /vises ikke på vcard i grunntilstanden/, "obs-6: any visibility surface blind in the visible state (injected reader) → NOT_OBSERVABLE, generic reason");
       assertTrue(n!.rows.every((x) => x.result !== "PASS" || !["leaderboard", "acp_feed", "vcard"].includes(x.surface) || x.key !== "visibility.profile"), "obs-7: never PASS on an unobservable surface");
-      assertEq([n!.not_observable, n!.fail, n!.ready_for_daniel_test, n!.restored], [6, 0, false, true], "obs-8: 6 not observable, 0 fail, NOT ready, restored");
+      // T14a: the live visibility.leaderboard × leaderboard, visibility.shopping_feeds × acp_feed and
+      // products.show_prices × acp_feed share that blindness (2 rows each) — 6 + 6.
+      const nobT14a = n!.rows.filter((x) => x.result === "NOT_OBSERVABLE" && x.key !== "visibility.profile").map((x) => `${x.key} × ${x.surface}`).sort();
+      assertEq(nobT14a, ["products.show_prices × acp_feed", "products.show_prices × acp_feed", "visibility.leaderboard × leaderboard", "visibility.leaderboard × leaderboard",
+        "visibility.shopping_feeds × acp_feed", "visibility.shopping_feeds × acp_feed"], "obs-8a (T14a): the same blind surfaces of the T14a keys are NOT_OBSERVABLE too");
+      assertEq([n!.not_observable, n!.fail, n!.ready_for_daniel_test, n!.restored], [12, 0, false, true], "obs-8: 12 not observable, 0 fail, NOT ready, restored");
       const md = n!.markdown;
-      assertTrue(md.includes(`**${n!.pass} PASS / 0 FAIL / 6 IKKE OBSERVERBAR**`) && md.includes("«ikke observerbar» teller ikke som PASS"), "obs-9: the report shows the three counts and why it is not ready");
+      assertTrue(md.includes(`**${n!.pass} PASS / 0 FAIL / 12 IKKE OBSERVERBAR**`) && md.includes("«ikke observerbar» teller ikke som PASS"), "obs-9: the report shows the three counts and why it is not ready");
       assertTrue(/\| visibility\.profile \| leaderboard \| (on|off) \| IKKE OBSERVERBAR \|/.test(md), "obs-10: the row table says IKKE OBSERVERBAR");
       assertTrue(/- \[FUNN\] bryterprobe-visibility-profile-acp-feed-(on|off) · P2 · .*ikke observerbar/.test(md) && !md.includes("- [FUNN] ingen"), "obs-11: the not-observable rows land in the findings block (P2)");
       assertEq(rawState(FIX), before, "obs-12: restored byte-identical");
@@ -469,6 +481,62 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
         `obs-20: a reader that throws at the baseline re-check → FAIL «leser feilet», not NOT_OBSERVABLE (${lf.map((x) => `${x.direction}:${x.result}:${x.reason}`).join(" | ")})`);
       assertEq([f2.not_observable, f2.ready_for_daniel_test, f2.restored], [0, false, true], "obs-21: 0 not observable, not ready, restored");
       assertEq(rawState(FIX), before, "obs-22: restored byte-identical");
+
+      // (g) T14a: a fixture without a street address → contact.address (a choice) is NOT_OBSERVABLE
+      // on every surface, with the reason — never PASS, and no false FAIL.
+      const addr = (db.prepare("SELECT address FROM agent_knowledge WHERE agent_id = ?").get(FIX) as { address: string | null }).address;
+      db.prepare("UPDATE agent_knowledge SET address = NULL WHERE agent_id = ?").run(FIX);
+      let g: Awaited<ReturnType<typeof probe.runSwitchProbe>>;
+      try {
+        g = await probe.runSwitchProbe(FIX, { db, maxWaitMs: 0 });
+      } finally {
+        db.prepare("UPDATE agent_knowledge SET address = ? WHERE agent_id = ?").run(addr, FIX);
+      }
+      const ga = g!.rows.filter((x) => x.key === "contact.address");
+      assertTrue(ga.length === 16 && ga.every((x) => x.result === "NOT_OBSERVABLE" && /ingen gateadresse/.test(x.reason || "") && x.discriminating === false && x.ms_to_effect === null),
+        `obs-23 (T14a): no street address → contact.address NOT_OBSERVABLE on all 8 surfaces × 2 options, with the reason (${ga.map((x) => `${x.surface}:${x.direction}:${x.result}`).join(",")})`);
+      assertEq([g!.rows.filter((x) => x.key === "contact.address" && x.result === "FAIL").length, g!.ready_for_daniel_test, g!.restored], [0, false, true],
+        "obs-24 (T14a): no false FAIL, not ready, restored");
+      assertEq(rawState(FIX), before, "obs-25: restored byte-identical");
+
+      // (h) B3: the fixture HAS a street address and a phone, but the enforcement hides them
+      // although the owner chose «full» / left the phone on (a real hide-bug). The reader must
+      // not blame the fixture: contact.address and contact.phone rows are FAIL, not NOT_OBSERVABLE.
+      const kn = db.prepare("SELECT phone, address FROM agent_knowledge WHERE agent_id = ?").get(FIX) as { phone: string | null; address: string | null };
+      assertTrue(!!kn.address && String(kn.phone || "").replace(/\D+/g, "").length >= 8, "obs-26 (B3): the fixture has a street address and a phone");
+      // A real hide-bug: every public surface loses the fixture's street address and phone (the
+      // fixture's own stored values stay, so the reader knows the fixture HAS them): knowledge
+      // reads through the shared db handle come back without address / phone.
+      const dbAny = db as any;
+      const realPrepare = dbAny.prepare;
+      dbAny.prepare = (sql: string) => {
+        const st = realPrepare.call(db, sql);
+        if (!/agent_knowledge/i.test(sql) || /^\s*SELECT phone, address, products FROM agent_knowledge WHERE agent_id = \?\s*$/i.test(sql)) return st;
+        const strip = (r: any) => (r && typeof r === "object" && ("address" in r || "phone" in r) ? { ...r, address: null, phone: null } : r);
+        return new Proxy(st, {
+          get(t, k) {
+            const v = (t as any)[k];
+            if (k === "get") return (...a: any[]) => strip(v.apply(t, a));
+            if (k === "all") return (...a: any[]) => (v.apply(t, a) as any[]).map(strip);
+            return typeof v === "function" ? v.bind(t) : v;
+          },
+        });
+      };
+      let h: Awaited<ReturnType<typeof probe.runSwitchProbe>>;
+      try {
+        h = await probe.runSwitchProbe(FIX, { db, maxWaitMs: 0 });
+      } finally {
+        dbAny.prepare = realPrepare;
+      }
+      const ha = h!.rows.filter((x) => x.key === "contact.address");
+      const hp = h!.rows.filter((x) => x.key === "contact.phone");
+      assertTrue(ha.length === 16 && ha.every((x) => x.result !== "NOT_OBSERVABLE") && ha.some((x) => x.result === "FAIL"),
+        `obs-27 (B3): street address present but hidden → contact.address FAIL, never NOT_OBSERVABLE (${ha.map((x) => `${x.surface}:${x.direction}:${x.result}`).join(",")})`);
+      assertTrue(ha.filter((x) => x.surface !== "listing_html" && x.surface !== "mcp_search" && x.direction === "value:full").every((x) => x.result === "FAIL") ,
+        "obs-27b (B3): the single-object surfaces FAIL the «full» row");
+      assertTrue(hp.length > 0 && hp.every((x) => x.result !== "NOT_OBSERVABLE") && hp.some((x) => x.result === "FAIL"),
+        `obs-28 (B3): phone present but hidden → contact.phone FAIL, not NOT_OBSERVABLE (${hp.map((x) => `${x.surface}:${x.direction}:${x.result}`).join(",")})`);
+      assertEq([h!.restored, rawState(FIX)], [true, before], "obs-29 (B3): restored byte-identical");
     }
 
     // ═══ Flags off: the rows that depend on them FAIL ═════════════════════
@@ -501,6 +569,10 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       const off = v.rows.filter((x) => x.key === "visibility.profile" && x.direction === "off");
       assertTrue(off.length === 12 && off.every((x) => x.result === "FAIL" && /OWNER_FEATURES_ENFORCE og OWNER_PAUSE_ENABLED er av/.test(x.reason || "")), "flags-7: enforce off → visibility.profile «off» rows FAIL (the probe discriminates)");
       assertTrue(v.rows.filter((x) => x.key === "visibility.profile" && x.direction === "on").every((x) => x.result === "PASS"), "flags-8: … while «on» still PASSes");
+      // T14a: without OWNER_FEATURES_ENFORCE the eleven choices have no effect — every row of theirs FAILs «flag off».
+      const t14aRows = v.rows.filter((x) => probe.SWITCH_PROBE_FLAG_DEPENDENCIES[`${x.key} × ${x.surface}`] === "OWNER_FEATURES_ENFORCE");
+      assertTrue(t14aRows.length === 84 && t14aRows.every((x) => x.result === "FAIL" && /flag off in this environment \(OWNER_FEATURES_ENFORCE=unset\)/.test(x.reason || "")),
+        `flags-8b (T14a): enforce off → the T14a rows (42 key × surface, 2 rows each) FAIL «flag off» (${t14aRows.length} rows)`);
       assertEq([v.restored, rawState(FIX)], [true, before], "flags-9: restored byte-identical");
       setBaseEnv();
       // auto.updates without OWNER_AUTO_UPDATES_ENABLED (between deploy and flag-on): a planned
@@ -621,7 +693,7 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       assertTrue(a.checks.some((x) => x.check === "no_surface:comms.news" && x.result === "FAIL"), "vac-2: … and the no-surface check FAILs");
       assertEq([a.restored, rawState(FIX)], [true, before], "vac-3: restored");
       // (b) a coming_soon key whose write is accepted → its check FAILs.
-      const csKey = "visibility.ai_assistants";
+      const csKey = "notify.milestones";
       const regCs = reg.OWNER_FEATURE_REGISTRY.map((e) => (e.key === csKey ? { ...e, status: "live" as const } : e));
       const acceptCs: import("../owner-features/switch-probe").ProbeWriteFn = (v, id, key, val, actor, o) =>
         rs.setOwnerFeatureValue(v, id, key, val, actor, key === csKey ? { ...o, registry: regCs } : o);
@@ -694,6 +766,12 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
         for (const s of e.surfaces) if (!readers[`${e.key} × ${s}`]) missing.push(`${e.key} × ${s}`);
       }
       assertEq(missing, [], "gov-1: every live key × surface has a switch-probe effect reader (a new live surface needs one)");
+      // T14a: the eleven choices take effect only with OWNER_FEATURES_ENFORCE — each of their cases names it.
+      const T14A = ["visibility.ai_assistants", "visibility.search_engines", "visibility.shopping_feeds", "visibility.english", "visibility.leaderboard",
+        "contact.phone", "contact.address", "products.show_prices", "stats.public_counts", "stats.public_search_terms", "stats.public_trust"];
+      const t14aCases = reg.OWNER_FEATURE_REGISTRY.filter((e) => T14A.includes(e.key)).flatMap((e) => e.surfaces.map((s) => `${e.key} × ${s}`));
+      assertEq(t14aCases.filter((id) => probe.SWITCH_PROBE_FLAG_DEPENDENCIES[id] !== "OWNER_FEATURES_ENFORCE"), [], "gov-2 (T14a): every T14a key × surface depends on OWNER_FEATURES_ENFORCE");
+      assertEq(Object.keys(probe.SWITCH_PROBE_FLAG_DEPENDENCIES).filter((id) => !readers[id]), [], "gov-3: every flag dependency names a key × surface that has a reader");
       assertEq(probe.maskEmail("daniel@example.com"), "d***@example.com", "help-1: maskEmail");
       assertEq(probe.maskDeep([{ table: "agents", before: { order_notification_email: "daniel@example.com", n: 1 }, after: { actor_detail: "x@y.no" } }]),
         [{ table: "agents", before: { order_notification_email: "d***@example.com", n: 1 }, after: { actor_detail: "x***@y.no" } }], "help-1b: restore_diff e-mails masked");

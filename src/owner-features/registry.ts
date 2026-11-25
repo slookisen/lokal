@@ -444,6 +444,10 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     default: { owner: true, unclaimed: true },
     requires: ["visibility.profile"],
     confirmOff: t("AI-assistenter vil ikke lenger kunne anbefale deg.", "AI assistants will no longer be able to recommend you."),
+    // T14a (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 8 (1)): live;
+    // enforced through owner-features/visibility.ts OWNER_VISIBILITY_KEYS (services/agent-visibility.ts).
+    status: "live",
+    since: "2026-11-22",
     surfaces: ["mcp_search", "mcp_info", "llms", "a2a"],
   }),
   entry({
@@ -452,6 +456,10 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     description: t("Søkemotorer kan vise profilsiden din i søkeresultater.", "Search engines can show your profile page in search results."),
     default: { owner: true, unclaimed: true },
     requires: ["visibility.profile"],
+    // T14a (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 8 (1)): live;
+    // enforced through owner-features/visibility.ts OWNER_VISIBILITY_KEYS (services/agent-visibility.ts).
+    status: "live",
+    since: "2026-11-22",
     surfaces: ["profile_html", "sitemap"],
   }),
   entry({
@@ -461,6 +469,10 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     default: { owner: true, unclaimed: true },
     requires: ["visibility.profile"],
     devRequest: "2026-09-08-produktfeed-gmc-acp-og-vipps-ucp",
+    // T14a (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 8 (1)): live;
+    // enforced through owner-features/visibility.ts OWNER_VISIBILITY_KEYS (services/agent-visibility.ts).
+    status: "live",
+    since: "2026-11-22",
     surfaces: ["acp_feed"],
   }),
   entry({
@@ -469,6 +481,10 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     description: t("Profilen vises også på engelsk (maskinoversatt). Du kan rette teksten selv.", "Your profile is also shown in English (machine-translated). You can correct the text yourself."),
     default: { owner: true, unclaimed: true },
     requires: ["visibility.profile"],
+    // T14a (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 8 (1)): live;
+    // enforced through owner-features/visibility.ts OWNER_VISIBILITY_KEYS (services/agent-visibility.ts).
+    status: "live",
+    since: "2026-11-22",
     surfaces: ["profile_html", "json_ld", "sitemap"],
   }),
   entry({
@@ -478,6 +494,10 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     default: { owner: true, unclaimed: true },
     requires: ["visibility.profile"],
     advanced: true,
+    // T14a (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 8 (1)): live;
+    // enforced through owner-features/visibility.ts OWNER_VISIBILITY_KEYS (services/agent-visibility.ts).
+    status: "live",
+    since: "2026-11-22",
     surfaces: ["leaderboard"],
   }),
 
@@ -488,6 +508,10 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     label: t("Vis telefonnummer", "Show phone number"),
     description: t("Telefonnummeret ditt vises på profilen og for AI-assistenter.", "Your phone number is shown on your profile and to AI assistants."),
     default: { owner: true, unclaimed: true },
+    // T14a (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 8 (1)): live;
+    // enforced through owner-features/enforce.ts ENFORCED_OWNER_FEATURE_KEYS.
+    status: "live",
+    since: "2026-11-22",
     surfaces: PROFILE_FIELD_SURFACES,
   }),
   entry({
@@ -514,6 +538,10 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
       { value: "place", label: t("Bare sted", "Place only") },
     ],
     default: { owner: "full", unclaimed: "full" },
+    // T14a (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 8 (1)): live;
+    // enforced through owner-features/enforce.ts ENFORCED_OWNER_FEATURE_KEYS.
+    status: "live",
+    since: "2026-11-22",
     surfaces: PROFILE_FIELD_SURFACES,
   }),
 
@@ -563,6 +591,10 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     label: t("Vis priser", "Show prices"),
     description: t("Prisene dine vises på profilen, for AI-assistenter og i produktfeeder.", "Your prices are shown on your profile, to AI assistants and in product feeds."),
     default: { owner: true, unclaimed: true },
+    // T14a (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 8 (1)): live;
+    // enforced through owner-features/enforce.ts ENFORCED_OWNER_FEATURE_KEYS.
+    status: "live",
+    since: "2026-11-22",
     surfaces: ["profile_html", "json_ld", "listing_html", "mcp_search", "mcp_info", "rest_card", "vcard", "acp_feed", "a2a"],
   }),
   // B2 (dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier):
@@ -942,6 +974,10 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
       "Your profile shows how many have seen it, from 20 page views by people in the last 12 months. You always see your own numbers.",
     ),
     default: { owner: true, unclaimed: true },
+    // T14a (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 8 (1)): live;
+    // enforced through owner-features/enforce.ts ENFORCED_OWNER_FEATURE_KEYS.
+    status: "live",
+    since: "2026-11-22",
     surfaces: ["profile_html"],
   }),
   entry({
@@ -949,6 +985,10 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     label: t("Vis hva folk søker etter", "Show what people search for"),
     description: t("Profilen viser søkeord som førte folk hit.", "Your profile shows search terms that led people here."),
     default: { owner: true, unclaimed: true },
+    // T14a (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 8 (1)): live;
+    // enforced through owner-features/enforce.ts ENFORCED_OWNER_FEATURE_KEYS.
+    status: "live",
+    since: "2026-11-22",
     surfaces: ["profile_html"],
   }),
   entry({
@@ -958,7 +998,13 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     default: { owner: true, unclaimed: true },
     advanced: true,
     devRequest: "2026-09-03-rfb-trust-score-offentlig-visning",
-    surfaces: ["profile_html", "rest_card", "vcard", "mcp_info", "a2a"],
+    // T14a (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 8 (1)): live;
+    // enforced through owner-features/enforce.ts ENFORCED_OWNER_FEATURE_KEYS.
+    status: "live",
+    since: "2026-11-22",
+    // T14a: no profile_html — the profile page never renders a trust score
+    // (only the card, vCard, MCP resource and A2A info carry it).
+    surfaces: ["rest_card", "vcard", "mcp_info", "a2a"],
   }),
   entry({
     key: "stats.share_partner", group: "stats", type: "switch",

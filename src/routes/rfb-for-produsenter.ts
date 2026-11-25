@@ -123,13 +123,32 @@ function flagGatedOff(e: OwnerFeatureEntry, f: ForProdusenterFacts): boolean {
 }
 
 /**
+ * T14a (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 8 (1)): the
+ * eleven choices flipped to `live` in T14a stay OUT of this public page's
+ * lists (the «i dag» list, its FAQPage JSON-LD and the demo, where they stay
+ * under «Planlagt») until T14c lands Daniel-approved text: the #personvern
+ * and #statistikk answers still call hiding phone, address and the numbers
+ * «planlagt», and stats.public_trust's description is not yet true for the
+ * profile page. Remove a key here in the same PR that rewrites its text
+ * (rfb-for-produsenter.test.ts fails while a listed key's answer still says
+ * «planlagt»).
+ */
+export const FOR_PRODUSENTER_PUBLIC_LIST_PENDING: readonly string[] = [
+  "visibility.ai_assistants", "visibility.search_engines", "visibility.shopping_feeds", "visibility.english", "visibility.leaderboard",
+  "contact.phone", "contact.address", "products.show_prices",
+  "stats.public_counts", "stats.public_search_terms", "stats.public_trust",
+];
+
+/**
  * The «Mine valg» entries an RFB owner can use (live/beta), in registry
  * order — minus a live entry whose effect is still planned for everyone
- * (products.stock_check while the stock-check reminder is «planlagt»).
+ * (products.stock_check while the stock-check reminder is «planlagt») and
+ * the T14a keys whose public text is pending (FOR_PRODUSENTER_PUBLIC_LIST_PENDING).
  */
 export function liveRfbOwnerChoices(facts?: ForProdusenterFacts, registry: OwnerFeatureEntry[] = OWNER_FEATURE_REGISTRY): OwnerFeatureEntry[] {
   return registry
-    .filter((e) => e.verticals.includes("rfb") && ownerFeatureStatus(e) !== "coming_soon" && !(facts && flagGatedOff(e, facts)))
+    .filter((e) => e.verticals.includes("rfb") && ownerFeatureStatus(e) !== "coming_soon" && !(facts && flagGatedOff(e, facts))
+      && !FOR_PRODUSENTER_PUBLIC_LIST_PENDING.includes(e.key))
     // The text as it applies now (auto.guarantee follows OWNER_AUTO_UPDATES_ENABLED).
     .map((e) => ownerFeatureEntryForEnv(e));
 }

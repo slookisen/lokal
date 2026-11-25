@@ -68,6 +68,14 @@
  *                             PRODUCT_AUTO_SYNC_ENABLED on): skipped (mode_off)
  *                             → taken (weekly) → skipped → taken; an
  *                             is_verified = 0 owner → 409, nothing written
+ *   T14a (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 8 (1)):
+ *   the eleven already enforced choices × each declared surface, on the rich
+ *                             owned producer (OWNER_FEATURES_ENFORCE on): the
+ *                             same endpoints as owner-features-s2c(2).test.ts,
+ *                             the field / the producer shown (default, no
+ *                             stored choice) → shown → gone → shown;
+ *                             contact.address full → place → full; a key that
+ *                             requires visibility.profile: paused → PUT on 409
  * Kinds:
  *   switch     default → on → off → on again; the effect follows each step;
  *              plus an unmet requirement → 409, nothing written, no effect.
@@ -102,6 +110,38 @@ export interface OwnerFeatureMatrixCase {
   /** How the effect is observed (for the log / review). */
   observe: string;
 }
+
+/**
+ * T14a: key × surface of the eleven choices S2c-1 / S2c-2 already enforce,
+ * observed on the real public surface for the owned rich producer (field
+ * present / gone, or the producer present / gone).
+ */
+const T14A_OBSERVE: Array<{ key: string; kind: MatrixKind; surfaces: string[]; observe: string }> = [
+  { key: "visibility.ai_assistants", kind: "switch", surfaces: ["mcp_search", "mcp_info", "llms", "a2a"],
+    observe: "the MCP tools / REST search / llms.txt / A2A list the producer vs not (the web page stays)" },
+  { key: "visibility.search_engines", kind: "switch", surfaces: ["profile_html", "sitemap"],
+    observe: "/produsent/:slug indexable (no noindex meta / X-Robots-Tag) and in sitemap.xml vs noindex and not listed" },
+  { key: "visibility.shopping_feeds", kind: "switch", surfaces: ["acp_feed"],
+    observe: "catalog /feed items + /acp-feed.csv rows of the producer vs none" },
+  { key: "visibility.english", kind: "switch", surfaces: ["profile_html", "json_ld", "sitemap"],
+    observe: "the /en profile page, its JSON-LD, the hreflang link and the sitemap alternate vs none (302 to the Norwegian page)" },
+  { key: "visibility.leaderboard", kind: "switch", surfaces: ["leaderboard"],
+    observe: "/api/leaderboard lists the producer vs not" },
+  { key: "contact.phone", kind: "switch", surfaces: ["profile_html", "json_ld", "listing_html", "mcp_search", "mcp_info", "rest_card", "vcard", "a2a"],
+    observe: "the phone number on the surface vs gone" },
+  { key: "contact.address", kind: "choice", surfaces: ["profile_html", "json_ld", "listing_html", "mcp_search", "mcp_info", "rest_card", "vcard", "a2a"],
+    observe: "«Full adresse og kartnål» (full): street, postal code (and coordinates) on the surface vs «Bare sted» (place): gone" },
+  { key: "products.show_prices", kind: "switch", surfaces: ["profile_html", "json_ld", "listing_html", "mcp_search", "mcp_info", "rest_card", "vcard", "acp_feed", "a2a"],
+    observe: "the product prices on the surface vs gone (products kept)" },
+  { key: "stats.public_counts", kind: "switch", surfaces: ["profile_html"],
+    observe: "/produsent/:slug: the public stats tiles (over the threshold) vs none" },
+  { key: "stats.public_search_terms", kind: "switch", surfaces: ["profile_html"],
+    observe: "/produsent/:slug: «Hva folk søker etter» with the visitors' terms vs none" },
+  { key: "stats.public_trust", kind: "switch", surfaces: ["rest_card", "vcard", "mcp_info", "a2a"],
+    observe: "the trust score in /card, /info, the vCard, the MCP producer resource and A2A agent/info vs gone" },
+];
+const T14A_MATRIX_CASES: OwnerFeatureMatrixCase[] = T14A_OBSERVE.flatMap((x) =>
+  x.surfaces.map((surface) => ({ key: x.key, surface, kind: x.kind, observe: `${x.observe} (${surface})` })));
 
 /** The coverage map: one case per live key × declared surface. */
 export const OWNER_FEATURE_MATRIX_CASES: readonly OwnerFeatureMatrixCase[] = [
@@ -162,6 +202,8 @@ export const OWNER_FEATURE_MATRIX_CASES: readonly OwnerFeatureMatrixCase[] = [
   // Produktimport skive 4-2b: the weekly product auto-sync (products.weekly_sync ↔ product_sync_mode).
   { key: "products.weekly_sync", surface: "job:product_weekly_sync", kind: "switch",
     observe: "dueAutoSyncProfiles() / autoSyncSkipReason(): the weekly job takes the profile (mode weekly) vs skips it (mode_off)" },
+  // T14a (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 8 (1)): the eleven already enforced choices.
+  ...T14A_MATRIX_CASES,
 ];
 
 export const MATRIX_STEPS = ["default", "on", "off", "on_again"] as const;
@@ -189,6 +231,12 @@ const SAVED_ENV = [
 
 /** S2e: the visibility.profile producer — the same rich profile shape as owner-features-s2c2.test.ts. */
 const VIS_NAME = "Pausematrise Gard Eier";
+/** T14a: the producer's field values, as owner-features-s2c.test.ts seeds them. */
+const T14A_PHONE = "+47 912 34 567";
+const T14A_STREET = "Gardsvegen 12";
+const T14A_PRICE = "30 kr/kg";
+const T14A_NAME_PRICE = "kr 85";
+const T14A_TERM = "rabarbrasaft hamar";
 
 export async function runOwnerFeatureMatrixTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
   const log = opts.log ?? false;
@@ -399,12 +447,25 @@ export async function runOwnerFeatureMatrixTests(opts: { log?: boolean } = {}): 
          VALUES (?, ?, ?, '+47 912 34 567', 'Gardsvegen 12', '0150', ?, ?, 'verified', 0, 'rich', 200, datetime('now'), '2026-01-01T00:00:00.000Z')`,
       ).run(VIS_ID, emailOf(VIS_ID), `https://${VIS_ID}.example.no`,
         "Vi er en liten familiegård som dyrker poteter, gulrøtter og kål, og selger direkte fra gården hele året.",
-        JSON.stringify([{ name: "Listepoteter", price: "30 kr/kg", category: "vegetables" }]));
+        // T14a: also a price written into a product name (what the top front-page card shows).
+        JSON.stringify([{ name: "Listepoteter", price: "30 kr/kg", category: "vegetables" }, { name: `Rabarbrasaft – ${T14A_NAME_PRICE}`, category: "beverages" }]));
       db.prepare(
         `INSERT INTO products (id, agent_id, name, name_norm, unit, price_nok, availability, category, image_url)
          VALUES (?, ?, 'Listepoteter', 'listepoteter', 'kg', 30, 'in_stock', 'vegetables', 'https://img.example.no/p.jpg')`,
       ).run(`prod-${VIS_ID}`, VIS_ID);
       db.prepare(`INSERT OR REPLACE INTO agent_metrics (agent_id, times_discovered, times_contacted, times_chosen) VALUES (?, 10, 5, 3)`).run(VIS_ID);
+      // T14a: a verified claim (a top front-page card), visitors' search terms and
+      // 20 people's page views (the public stats threshold, PUBLIC_STATS_MIN_VIEWS).
+      db.prepare("INSERT INTO agent_claims (id, agent_id, claimant_email, claimant_name, status, verified_at) VALUES (?, ?, ?, 'Eier', 'verified', '2026-10-01T00:00:00.000Z')")
+        .run(`claim-${VIS_ID}`, VIS_ID, emailOf(VIS_ID));
+      for (let i = 0; i < 3; i++) {
+        db.prepare(`INSERT INTO conversations (id, seller_agent_id, source, query_text, created_at) VALUES (?, ?, 'a2a', ?, datetime('now', '-1 days'))`).run(`conv-${VIS_ID}-${i}`, VIS_ID, T14A_TERM);
+      }
+      db.prepare("INSERT INTO analytics_agent_views (agent_id, agent_name, created_at, traffic_category, is_owner) VALUES (?, ?, datetime('now', '-30 days'), 'human', 0)").run(VIS_ID, VIS_NAME);
+      for (let i = 0; i < 20; i++) {
+        db.prepare(`INSERT INTO analytics_page_views (path, session_id, is_owner, created_at) VALUES (?, ?, 0, datetime('now', '-2 days'))`)
+          .run(`/produsent/${(require("../utils/slug") as typeof import("../utils/slug")).slugify(VIS_NAME)}`, `iphash${VIS_ID}${i}:Mozilla/5.0 (Macintosh) Chrome/120`);
+      }
       tokens[VIS_ID] = `tok-${VIS_ID}`;
       db.prepare("INSERT INTO magic_links (id, email, token, agent_id, used, created_at, expires_at) VALUES (?, ?, ?, ?, 1, ?, ?)")
         .run(`mlsess_${VIS_ID}`, emailOf(VIS_ID), tokens[VIS_ID], VIS_ID, new Date().toISOString(), new Date(Date.now() + 86_400_000).toISOString());
@@ -475,7 +536,7 @@ export async function runOwnerFeatureMatrixTests(opts: { log?: boolean } = {}): 
     // The same endpoints, per registry surface, as owner-features-s2c2.test.ts
     // (PRESENCE): a probe returns markers of THIS producer being there.
     type VisProbe = (id: string) => Promise<boolean[]>;
-    let visKit: { probes: Record<string, Record<string, VisProbe>>; clear: () => void } | null = null;
+    let visKit: { probes: Record<string, Record<string, VisProbe>>; clear: () => void; t14a: Record<string, Record<string, VisProbe>> } | null = null;
     const getVisKit = () => {
       if (visKit) return visKit;
       const { slugify } = require("../utils/slug") as typeof import("../utils/slug");
@@ -499,10 +560,10 @@ export async function runOwnerFeatureMatrixTests(opts: { log?: boolean } = {}): 
         registerPrompt() { /* no-op */ },
       } as any, () => "test-client", () => undefined);
       const toolText = async (name: string, args: any) => String((await tools.get(name)!(args))?.content?.[0]?.text ?? "");
-      const visReq = (o: { params?: Record<string, string>; query?: Record<string, string>; body?: any }): any => ({
+      const visReq = (o: { params?: Record<string, string>; query?: Record<string, string>; body?: any; lang?: string }): any => ({
         method: "GET", url: "/", path: "/", originalUrl: "/",
         params: o.params || {}, body: o.body, query: o.query || {}, headers: {}, cookies: {},
-        ip: "127.0.0.1", lang: "no", protocol: "https", hostname: "rettfrabonden.com",
+        ip: "127.0.0.1", lang: o.lang ?? "no", protocol: "https", hostname: "rettfrabonden.com",
         get(name: string) { return name.toLowerCase() === "host" ? "rettfrabonden.com" : undefined; },
       });
       const VH = {
@@ -598,7 +659,136 @@ export async function runOwnerFeatureMatrixTests(opts: { log?: boolean } = {}): 
         marketplaceRegistry._statsCacheTime = 0;
         seoMod.__resetSitemapCacheForTesting();
       };
-      visKit = { probes, clear };
+      // ── T14a: per key × surface, the endpoints that show the choice's effect for THIS producer ──
+      // Field markers as in owner-features-s2c.test.ts (only the endpoints that render the field
+      // today; lokal_find_offers keeps the price by design and is not read for prices).
+      const LD_STRIP = (html: string) => html.replace(LD_RE, "").replace(/<!--[\s\S]*?-->/g, "");
+      const pageRes = (lang = "no") => invoke(VH.produsent, visReq({ params: { slug }, lang }));
+      const visible = async () => LD_STRIP(await page());
+      const jsonLd = async () => jsonLdOf(await page());
+      const json = (x: unknown) => JSON.stringify(x ?? null);
+      const homeCard = async () => {
+        const h = String((await invoke(VH.home, visReq({}))).body ?? "");
+        const at = h.indexOf(`<a href="/produsent/${slug}" class="pc pc-`);
+        return at < 0 ? "" : h.slice(at, h.indexOf("</a>", at));
+      };
+      const searchBlock = async () => { const t = await toolText("lokal_search", { query: VIS_NAME }); return t.includes(`**1. ${VIS_NAME}**`) ? t : ""; };
+      const compactBlock = async () => listBlock(await toolText("lokal_search", { query: "listepoteter" }));
+      const discoverBlock = async () => listBlock(await toolText("lokal_discover", { categories: ["vegetables"] }));
+      const restSearch = async (id: string) => ((await invoke(VH.search, visReq({ query: { q: VIS_NAME, heleNorge: "true" } }))).body?.results ?? []).find((r: any) => r.agent?.id === id);
+      const restDiscover = async (id: string) => ((await invoke(VH.discover, visReq({ body: { categories: ["vegetables"] } }))).body?.results ?? []).find((r: any) => r.agent?.id === id);
+      const lokalInfo = (id: string) => toolText("lokal_info", { agentId: id });
+      const resource = async (id: string) => {
+        const r = await resources.get("producer-detail")!(new URL(`lokal://producers/${id}`));
+        try { return JSON.parse(String(r?.contents?.[0]?.text ?? "")); } catch { return undefined; }
+      };
+      const card = async (id: string) => (await invoke(VH.card, visReq({ params: { id } }))).body;
+      const restInfo = async (id: string) => (await invoke(VH.info, visReq({ params: { id } }))).body;
+      const vcard = async (id: string) => String((await invoke(VH.vcard, visReq({ params: { id } }))).body ?? "");
+      const a2aInfo = async (id: string) => (await a2aCall({ method: "agent/info", params: { agentId: id } })).body?.result?.artifacts?.[0];
+      const feedItem = async (id: string) => ((await invoke(VH.feed, visReq({}))).body?.items ?? []).find((i: any) => i.seller?.agent_id === id);
+      const sitemapXml = () => seoMod.buildSitemapXml();
+      const enUrl = `https://rettfrabonden.com/en/produsent/${slug}`;
+      const presence = (surface: string) => probes[surface];
+      const t14a: Record<string, Record<string, VisProbe>> = {
+        "visibility.search_engines × profile_html": {
+          // Indexable: no noindex meta and no X-Robots-Tag (the full page itself stays, see «page_kept»).
+          produsent_indexable: async () => { const r = await pageRes(); const h = String(r.body ?? ""); return [!h.includes('<meta name="robots" content="noindex">'), r.headers["x-robots-tag"] === undefined]; },
+        },
+        "visibility.search_engines × sitemap": presence("sitemap"),
+        "visibility.english × profile_html": {
+          produsent_en: async () => { const r = await pageRes("en"); return [r.status === 200 && isProfilePage(String(r.body ?? ""))]; },
+          produsent_hreflang: async () => { const h = await page(); return [h.includes(`hreflang="en" href="${enUrl}"`), h.includes(`<a href="${enUrl}" hreflang="en"`)]; },
+        },
+        "visibility.english × json_ld": { produsent_en: async () => [jsonLdOf(String((await pageRes("en")).body ?? "")).includes(`"name":"${VIS_NAME}"`)] },
+        "visibility.english × sitemap": { sitemap_xml: async () => [sitemapXml().includes(`/en/produsent/${slug}</loc>`), sitemapXml().includes(`hreflang="en" href="${enUrl}"`)] },
+        "contact.phone × profile_html": { produsent: async () => { const h = await visible(); return [h.includes("912 34 567"), h.includes("tel:+4791234567")]; } },
+        "contact.phone × json_ld": { produsent: async () => [(await jsonLd()).includes('"telephone"')] },
+        "contact.phone × listing_html": {
+          home_cards: async () => [(await homeCard()).includes("912 34 567")],
+          city_jsonld: async () => [(await cityNode())?.telephone === T14A_PHONE],
+        },
+        "contact.phone × mcp_search": {
+          lokal_search_detail: async () => [(await searchBlock()).includes("📞")],
+          lokal_search_compact: async () => [(await compactBlock()).includes("📞")],
+          lokal_discover: async () => [(await discoverBlock()).includes("📞")],
+          rest_search: async (id) => [(await restSearch(id))?.contact?.phone === T14A_PHONE],
+          rest_discover: async (id) => [(await restDiscover(id))?.contact?.phone === T14A_PHONE],
+          lokal_find_offers: async (id) => [(await findOffer(id))?.producer?.phone === T14A_PHONE],
+        },
+        "contact.phone × mcp_info": {
+          lokal_info: async (id) => [(await lokalInfo(id)).includes("📞")],
+          mcp_resource: async (id) => [(await resource(id))?.knowledge?.phone === T14A_PHONE],
+        },
+        "contact.phone × rest_card": {
+          card: async (id) => [(await card(id))?.contact?.phone === T14A_PHONE],
+          info: async (id) => [(await restInfo(id))?.data?.knowledge?.phone === T14A_PHONE],
+        },
+        "contact.phone × vcard": { vcard: async (id) => [(await vcard(id)).includes("\r\nTEL;")] },
+        "contact.phone × a2a": { agent_info: async (id) => [json(await a2aInfo(id)).includes(T14A_PHONE)] },
+        "contact.address × profile_html": { produsent: async () => { const h = await visible(); return [h.includes(T14A_STREET), h.includes("0150")]; } },
+        "contact.address × json_ld": { produsent: async () => { const ld = await jsonLd(); return [ld.includes('"streetAddress"'), ld.includes('"GeoCoordinates"'), ld.includes(T14A_STREET)]; } },
+        "contact.address × listing_html": {
+          home_cards: async () => { const c = await homeCard(); return [c.includes(T14A_STREET), c.includes("0150")]; },
+          city_jsonld: async () => { const n = await cityNode(); return [n?.address?.streetAddress === T14A_STREET, !!n?.geo]; },
+        },
+        "contact.address × mcp_search": {
+          lokal_search_detail: async () => [(await searchBlock()).includes(T14A_STREET)],
+          lokal_search_compact: async () => [(await compactBlock()).includes(T14A_STREET)],
+          lokal_discover: async () => [(await discoverBlock()).includes(T14A_STREET)],
+          rest_search: async (id) => [(await restSearch(id))?.contact?.address === T14A_STREET],
+          rest_discover: async (id) => { const c = (await restDiscover(id))?.contact; return [c?.address === T14A_STREET, c?.postalCode === "0150"]; },
+        },
+        "contact.address × mcp_info": {
+          lokal_info: async (id) => [(await lokalInfo(id)).includes(T14A_STREET)],
+          mcp_resource: async (id) => { const k = (await resource(id))?.knowledge; return [k?.address === T14A_STREET, k?.postalCode === "0150"]; },
+        },
+        "contact.address × rest_card": {
+          card: async (id) => { const c = await card(id); return [c?.contact?.address === T14A_STREET, c?.contact?.postalCode === "0150", String(c?.links?.googleMaps).includes("Gardsvegen")]; },
+          info: async (id) => { const k = (await restInfo(id))?.data?.knowledge; return [k?.address === T14A_STREET, k?.postalCode === "0150"]; },
+        },
+        "contact.address × vcard": { vcard: async (id) => { const v = await vcard(id); return [v.includes(T14A_STREET), v.includes("0150")]; } },
+        "contact.address × a2a": { agent_info: async (id) => { const t = json(await a2aInfo(id)); return [t.includes(T14A_STREET), t.includes("0150")]; } },
+        "products.show_prices × profile_html": { produsent: async () => { const h = await visible(); return [h.includes('class="prod-price"'), h.includes(T14A_PRICE), h.includes(T14A_NAME_PRICE)]; } },
+        "products.show_prices × json_ld": { produsent: async () => { const ld = await jsonLd(); return [ld.includes('"price"'), ld.includes('"makesOffer"')]; } },
+        "products.show_prices × listing_html": { home_cards: async () => [(await homeCard()).includes(T14A_NAME_PRICE)] },
+        "products.show_prices × mcp_search": {
+          lokal_search_detail: async () => { const t = await searchBlock(); return [t.includes(T14A_PRICE), t.includes(T14A_NAME_PRICE)]; },
+          lokal_search_compact: async () => { const t = await compactBlock(); return [t.includes(T14A_PRICE), t.includes(T14A_NAME_PRICE)]; },
+          lokal_discover: async () => { const t = await discoverBlock(); return [t.includes(T14A_PRICE), t.includes(T14A_NAME_PRICE)]; },
+          rest_search: async (id) => { const p = (await restSearch(id))?.products; return [!!p?.some((x: any) => x.price === T14A_PRICE), !!p?.some((x: any) => x.price === T14A_NAME_PRICE)]; },
+        },
+        "products.show_prices × mcp_info": {
+          lokal_info: async (id) => { const t = await lokalInfo(id); return [t.includes(T14A_PRICE), t.includes(T14A_NAME_PRICE)]; },
+          mcp_resource: async (id) => { const t = json((await resource(id))?.knowledge?.products); return [t.includes(T14A_PRICE), t.includes(T14A_NAME_PRICE)]; },
+        },
+        "products.show_prices × rest_card": {
+          card: async (id) => { const c = json((await card(id))?.products); return [c.includes(T14A_PRICE), c.includes(T14A_NAME_PRICE)]; },
+          info: async (id) => { const k = json((await restInfo(id))?.data?.knowledge?.products); return [k.includes(T14A_PRICE), k.includes(T14A_NAME_PRICE)]; },
+        },
+        "products.show_prices × vcard": { vcard: async (id) => { const v = await vcard(id); return [v.includes(`(${T14A_PRICE})`), v.includes(T14A_NAME_PRICE)]; } },
+        "products.show_prices × acp_feed": {
+          feed: async (id) => [(await feedItem(id))?.price?.amount === 30],
+          acp_csv: async (id) => [String((await invoke(VH.acp, visReq({}))).body ?? "").includes(`prod-${id}`)],
+        },
+        "products.show_prices × a2a": { agent_info: async (id) => { const t = json(await a2aInfo(id)); return [t.includes(T14A_PRICE), t.includes(T14A_NAME_PRICE)]; } },
+        "stats.public_counts × profile_html": {
+          produsent: async () => { const h = await visible(); return [h.includes('class="pf-stat" data-stat="human"'), h.includes('class="pf-stat" data-stat="ai"'), h.includes('class="pf-stat" data-stat="aiDeliveries"'), h.includes("Profilvisninger")]; },
+        },
+        "stats.public_search_terms × profile_html": { produsent: async () => { const h = await visible(); return [h.includes(T14A_TERM), h.includes("Hva folk søker etter")]; } },
+        "stats.public_trust × rest_card": {
+          card: async (id) => [typeof (await card(id))?.["x-lokal"]?.trustScore === "number"],
+          info: async (id) => [typeof (await restInfo(id))?.data?.agent?.trustScore === "number"],
+        },
+        "stats.public_trust × vcard": { vcard: async (id) => [(await vcard(id)).includes("X-LOKAL-TRUST-SCORE")] },
+        "stats.public_trust × mcp_info": { mcp_resource: async (id) => [typeof (await resource(id))?.agent?.trustScore === "number"] },
+        "stats.public_trust × a2a": { agent_info: async (id) => [json(await a2aInfo(id)).includes('"trustScore"')] },
+      };
+      // ai_assistants / shopping_feeds / leaderboard hide the producer on their surfaces: the presence probes.
+      for (const s of ["mcp_search", "mcp_info", "llms", "a2a"]) t14a[`visibility.ai_assistants × ${s}`] = presence(s);
+      t14a["visibility.shopping_feeds × acp_feed"] = presence("acp_feed");
+      t14a["visibility.leaderboard × leaderboard"] = presence("leaderboard");
+      visKit = { probes, clear, t14a };
       return visKit;
     };
     function seoRouterOf(seoMod: any): any { return seoMod.default; }
@@ -957,6 +1147,72 @@ export async function runOwnerFeatureMatrixTests(opts: { log?: boolean } = {}): 
     for (const c of OWNER_FEATURE_MATRIX_CASES) {
       if (c.key === "visibility.profile") runners[matrixCaseId(c)] = visibilityProfileRunner;
     }
+
+    // ── T14a: the eleven already enforced choices, through PUT, on the rich owned producer ──
+    // default (shown, no stored choice) → on → off (gone) → on again, with
+    // OWNER_FEATURES_ENFORCE on. contact.address is a choice: full → place → full.
+    // A visibility key that requires visibility.profile: with the profile paused,
+    // PUT on → 409 requirement_not_met, nothing written (checked once per key).
+    const t14aRequiresChecked = new Set<string>();
+    const t14aRunner = async (c: OwnerFeatureMatrixCase) => {
+      const kit = getVisKit();
+      const L = matrixCaseId(c);
+      const eps = kit.t14a[L];
+      assertTrue(!!eps && Object.keys(eps).length > 0, `${L}: the surface has probes`);
+      if (!eps) return;
+      const on: unknown = c.kind === "choice" ? "full" : true;
+      const off: unknown = c.kind === "choice" ? "place" : false;
+      const putValue = async (value: unknown, label: string) => {
+        featuresMod.__resetOwnerFeaturesRateLimitForTesting();
+        const r = await put(VIS_ID, c.key, value);
+        assertEq([r.status, r.body?.feature?.value], [200, value], `${label}: PUT ${c.key}=${JSON.stringify(value)} → 200`);
+      };
+      process.env.OWNER_FEATURES_ENFORCE = "1";
+      try {
+        const expect = async (shown: boolean, s: MatrixStep) => {
+          for (const [ep, probe] of Object.entries(eps)) {
+            kit.clear();
+            const m = await probe(VIS_ID);
+            const st = m.every(Boolean) ? "shown" : m.some(Boolean) ? "mixed" : "absent";
+            assertEq(st, shown ? "shown" : "absent", `${L} [${s}]: ${ep} → ${shown ? "shown" : "gone"}`);
+          }
+          // The choice does exactly what it says: the profile itself stays on its web page.
+          if (c.surface === "profile_html" || c.surface === "json_ld") {
+            kit.clear();
+            assertEq((await kit.probes.profile_html.produsent(VIS_ID)).every(Boolean), true, `${L} [${s}]: the Norwegian profile page is still the full profile`);
+          }
+          const f = resolved(VIS_ID, c.key);
+          assertEq([f.value, f.changeable], [shown ? on : off, true], `${L} [${s}]: resolved ${JSON.stringify(shown ? on : off)}, changeable`);
+        };
+        db.prepare("DELETE FROM owner_feature_settings WHERE subject_id = ? AND key = ?").run(VIS_ID, c.key);
+        assertEq(resolved(VIS_ID, c.key).source, "default", `${L} [default]: no stored choice (source default)`);
+        await expect(true, "default"); step(c, "default");
+        await putValue(on, `${L} [on]`);
+        await expect(true, "on"); step(c, "on");
+        await putValue(off, `${L} [off]`);
+        await expect(false, "off"); step(c, "off");
+        await putValue(on, `${L} [on_again]`);
+        await expect(true, "on_again"); step(c, "on_again");
+        const e = reg.getOwnerFeature(c.key);
+        if (e.requires.includes("visibility.profile") && !t14aRequiresChecked.has(c.key)) {
+          t14aRequiresChecked.add(c.key);
+          await putValue(off, `${L} [requires]`);
+          await switchTo(VIS_ID, "visibility.profile", false, `${L} [requires] profile`);
+          featuresMod.__resetOwnerFeaturesRateLimitForTesting();
+          const a0 = auditRows(VIS_ID, c.key);
+          const r = await put(VIS_ID, c.key, true);
+          assertEq([r.status, r.body?.error, auditRows(VIS_ID, c.key) - a0], [409, "requirement_not_met", 0], `${L} [requires]: profile paused → PUT on → 409 requirement_not_met, nothing written`);
+          await switchTo(VIS_ID, "visibility.profile", true, `${L} [requires] profile back`);
+          await putValue(on, `${L} [requires] back on`);
+        }
+      } finally {
+        delete process.env.OWNER_FEATURES_ENFORCE;
+        db.prepare("DELETE FROM owner_profile_pause WHERE agent_id = ?").run(VIS_ID);
+        db.prepare("DELETE FROM owner_feature_settings WHERE subject_id = ? AND key = ?").run(VIS_ID, c.key);
+        kit.clear();
+      }
+    };
+    for (const c of T14A_MATRIX_CASES) runners[matrixCaseId(c)] = t14aRunner;
 
     // S2e: orders.email — the order address through «Mine valg» (confirmation flow).
     runners["orders.email × email:order_notification"] = async (c) => {

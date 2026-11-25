@@ -319,8 +319,8 @@ export async function runOwnerFeaturesT5AnchorsTests(opts: { log?: boolean } = {
       assertTrue(toastIn(await follow(OWNED_ID, loc(noop)), "valg-orders.enabled"), "r26: …message in the row");
       const inv = await post(H.sett, OWNED_ID, { key: "orders.enabled", value: "kanskje", confirmed: "1" });
       assertEq(loc(inv), P(OWNED_ID, "?melding=ugyldig&ved=valg-orders.enabled#valg-orders.enabled"), "r27: invalid value → the row");
-      const cs = await post(H.sett, OWNED_ID, { key: "visibility.leaderboard", value: "false", confirmed: "1" });
-      assertEq(loc(cs), P(OWNED_ID, "?melding=sperret&nokkel=visibility.leaderboard&ved=valg-visibility.leaderboard#valg-visibility.leaderboard"), "r28: refused (planned key) → its anchor");
+      const cs = await post(H.sett, OWNED_ID, { key: "notify.milestones", value: "false", confirmed: "1" });
+      assertEq(loc(cs), P(OWNED_ID, "?melding=sperret&nokkel=notify.milestones&ved=valg-notify.milestones#valg-notify.milestones"), "r28: refused (planned key) → its anchor");
       const unk = await post(H.sett, OWNED_ID, { key: "nope.key", value: "x" });
       assertEq(loc(unk), P(OWNED_ID, "?melding=ugyldig#mv-toast-slot"), "r29: unknown key → the message slot (no row exists)");
       const pUnk = await follow(OWNED_ID, loc(unk));

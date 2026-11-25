@@ -290,7 +290,7 @@ export async function runOwnerFeaturesS2bTests(opts: { log?: boolean } = {}): Pr
       const ctl = b.indexOf(`<div class="mv-item-ctl">`, i);
       return b.slice(i, b.indexOf("</div>\n        </li>", ctl));
     };
-    assertTrue(!b0.includes(`data-key="visibility.leaderboard"`) && b0.includes(`data-planned-key="visibility.leaderboard"`),
+    assertTrue(!b0.includes(`data-key="notify.milestones"`) && b0.includes(`data-planned-key="notify.milestones"`),
       "page (S2e): a coming_soon entry is not a row in the main view; it is in «Planlagt»");
     assertTrue(!b0.includes("Kommer snart") && !/disabled aria-disabled/.test(b0), "page (S2e): no grey «Kommer snart» switches");
     assertTrue(row(b0, "auto.guarantee").includes("Alltid"), "page: guarantee shows «Alltid»");
@@ -298,7 +298,11 @@ export async function runOwnerFeaturesS2bTests(opts: { log?: boolean } = {}): Pr
     assertTrue(row(b0, "orders.enabled").includes(`name="value" value="true"`) && row(b0, "orders.enabled").includes("Slå på"), "page: live switch offers «Slå på»");
     assertTrue(!b0.includes(`data-key="orders.email"`), "page: orders.* rows hidden while orders are off");
     assertTrue(b0.includes("valg til vises når du slår på «Ta imot bestillinger»"), "page: hidden-rows note");
-    assertTrue(!b0.includes("Flere valg"), "page (S2e): no «Flere valg» while no advanced entry is built");
+    // T14a: visibility.leaderboard and stats.public_trust (advanced) are live, so «Flere valg» holds them as rows.
+    const liveAdvanced = reg.OWNER_FEATURE_REGISTRY.filter((e) => e.advanced && e.status === "live").map((e) => e.key);
+    assertEq(liveAdvanced, ["visibility.leaderboard", "stats.public_trust"], "page (T14a): the live advanced entries");
+    assertTrue(b0.includes("Flere valg") && liveAdvanced.every((k) => b0.includes(`data-key="${k}"`) && !b0.includes(`data-planned-key="${k}"`)),
+      "page (T14a): «Flere valg» shows the live advanced entries as rows, not in «Planlagt»");
     assertTrue(b0.includes("Slik er du nå") && b0.includes("Hvor aktiv vil du være?"), "page: levels + status line");
     // T8: the level that applies is computed from the switches — a default owner stands on «Minst mulig».
     assertTrue(b0.includes(`aria-current="true" data-level="minst_mulig"`) && b0.includes("Du står på standardvalgene. Du trenger ikke gjøre noe.") && !b0.includes("Du har ikke valgt nivå ennå"),
@@ -361,9 +365,9 @@ export async function runOwnerFeaturesS2bTests(opts: { log?: boolean } = {}): Pr
       "level (T8): a single switch gives «Valgene dine passer med …», never «Du valgte» (only the owner's level choice does)");
     const noop = await post(H.sett, OWNED_ID, { key: "orders.enabled", value: "true", confirmed: "1" });
     assertEq([loc(noop).includes("melding=ingen_endring"), audits(OWNED_ID).length, batches(OWNED_ID).length], [true, 1, 1], "switch: no-op writes nothing");
-    const cs = await post(H.sett, OWNED_ID, { key: "visibility.leaderboard", value: "false", confirmed: "1" });
-    assertEq([loc(cs), audits(OWNED_ID).length, settingsRows(OWNED_ID)], [`/eier/${OWNED_ID}/valg?melding=sperret&nokkel=visibility.leaderboard&ved=valg-visibility.leaderboard#valg-visibility.leaderboard`, 1, 0], "switch: coming_soon blocked, nothing written");
-    assertTrue(html(await page(OWNED_ID, { melding: "sperret", nokkel: "visibility.leaderboard" })).includes("Kan ikke endres: Kommer snart."), "switch: blocked message with Norwegian reason");
+    const cs = await post(H.sett, OWNED_ID, { key: "notify.milestones", value: "false", confirmed: "1" });
+    assertEq([loc(cs), audits(OWNED_ID).length, settingsRows(OWNED_ID)], [`/eier/${OWNED_ID}/valg?melding=sperret&nokkel=notify.milestones&ved=valg-notify.milestones#valg-notify.milestones`, 1, 0], "switch: coming_soon blocked, nothing written");
+    assertTrue(html(await page(OWNED_ID, { melding: "sperret", nokkel: "notify.milestones" })).includes("Kan ikke endres: Kommer snart."), "switch: blocked message with Norwegian reason");
     const inv = await post(H.sett, OWNED_ID, { key: "orders.enabled", value: "kanskje", confirmed: "1" });
     assertEq([loc(inv).includes("melding=ugyldig"), audits(OWNED_ID).length], [true, 1], "switch: invalid value → message, nothing written");
     // Undo the single change.

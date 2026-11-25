@@ -256,8 +256,65 @@ export async function runRfbForProdusenterTests(opts: { log?: boolean } = {}): P
       const e = OWNER_FEATURE_REGISTRY.find((x) => x.key === k && x.verticals.includes("rfb"));
       return e ? ownerFeatureStatus(e) : undefined;
     };
-    for (const k of ["products.import", "orders.pause", "orders.pickup_times", "notify.report", "stats.public_counts", "contact.phone", "contact.email_mode", "contact.address", "auto.updates", "payments.prepay", "orders.auto_confirm"]) {
+    for (const k of ["products.import", "orders.pause", "orders.pickup_times", "notify.report", "contact.email_mode", "auto.updates", "payments.prepay", "orders.auto_confirm"]) {
       assertTrue(status(k) === "coming_soon", `truth: ${k} is coming_soon (page says «planlagt» / does not offer it) — rewrite the text when it goes live`);
+    }
+    // T14a (dev-request 2026-10-30-rfb-eierportal-testrunde-1, punkt 8 (1)): stats.public_counts,
+    // contact.phone and contact.address are live, but the page's answers still call hiding them
+    // «planlagt». A key whose answer says «planlagt» must NOT be in the public list (the «i dag» list,
+    // its FAQPage JSON-LD, the demo's live rows) — rewrite the answer (T14c) in the PR that lists it.
+    const assertEq = (actual: unknown, expected: unknown, label: string) =>
+      assertTrue(JSON.stringify(actual) === JSON.stringify(expected), `${label} (got ${JSON.stringify(actual)})`);
+    const PLANNED_ANSWERS: Array<{ q: string; keys: string[] }> = [
+      { q: "Kan jeg skjule telefon, e-post eller adresse?", keys: ["contact.phone", "contact.email_mode", "contact.address"] },
+      { q: "Can I hide my phone, e-mail or address?", keys: ["contact.phone", "contact.email_mode", "contact.address"] },
+      { q: "Kan jeg skjule tallene på profilen?", keys: ["stats.public_counts"] },
+      { q: "Can I hide the numbers on my profile?", keys: ["stats.public_counts"] },
+    ];
+    const contradictions = (listed: string[], pairs: Array<{ q: string; a: string }>): string[] =>
+      PLANNED_ANSWERS.flatMap(({ q, keys }) => {
+        const a = pairs.find((x) => x.q === q)?.a ?? "";
+        return /planlagt|planned/i.test(a) ? keys.filter((k) => listed.includes(k)).map((k) => `${k} listed while «${q}» says planned`) : [];
+      });
+    const ldPairsOf = (o: any) => ((o?.mainEntity ?? []) as any[]).map((e) => ({ q: String(e.name), a: String(e.acceptedAnswer?.text ?? "") }));
+    const allStates = (st: "for_alle" | "i_pilot" | "planlagt") => ({ mine_valg: st, varer: st, kanseller: st, lagerpaminnelse: st, myk_utlop: st });
+    const factVariants = [factsNow0(), ...(["for_alle", "i_pilot", "planlagt"] as const).map((st) => ({ ...factsNow0(), pilot: allStates(st) }))];
+    function factsNow0() { return mod.currentForProdusenterFacts(); }
+    for (const [fi, fv] of factVariants.entries()) {
+      for (const lang of ["no", "en"] as const) {
+        const pg = mod.renderForProdusenterPage(lang, "https://x/for-produsenter", fv, { env: { FOR_PRODUSENTER_DEMO_ENABLED: "1" } });
+        const listed = [...pg.content.matchAll(/data-demo-key="([^"]+)"/g)].map((m) => m[1]).concat(mod.liveRfbOwnerChoices(fv).map((e) => e.key));
+        const pairs = ldPairsOf(pg.jsonLd);
+        assertTrue(PLANNED_ANSWERS.some(({ q }) => pairs.some((x) => x.q === q)), `truth (T14a) ${lang} facts#${fi}: the «planlagt» answers are on the page (the pin is not vacuous)`);
+        assertEq(contradictions(listed, pairs), [], `truth (T14a) ${lang} facts#${fi}: no listed choice whose answer still says «planlagt»`);
+      }
+    }
+    // The checker itself fails on a contradiction.
+    assertEq(contradictions(["contact.phone"], [{ q: "Kan jeg skjule telefon, e-post eller adresse?", a: "… er planlagt." }]),
+      ["contact.phone listed while «Kan jeg skjule telefon, e-post eller adresse?» says planned"], "truth (T14a): the checker reports a listed key whose answer says «planlagt»");
+    // The pending list is narrow: exactly the eleven T14a keys, each live in the registry.
+    assertEq([...mod.FOR_PRODUSENTER_PUBLIC_LIST_PENDING].sort(), ["contact.address", "contact.phone", "products.show_prices", "stats.public_counts", "stats.public_search_terms", "stats.public_trust",
+      "visibility.ai_assistants", "visibility.english", "visibility.leaderboard", "visibility.search_engines", "visibility.shopping_feeds"], "T14a: the pending list is exactly the eleven T14a keys");
+    assertTrue(mod.FOR_PRODUSENTER_PUBLIC_LIST_PENDING.every((k) => status(k) === "live"), "T14a: every pending key is live (drop it from the list once its text lands)");
+    // Byte-identity: the page (HTML + FAQPage JSON-LD, NO and EN, demo off and on) equals the page
+    // rendered against the registry before the flip (the eleven keys coming_soon).
+    {
+      const PRE = OWNER_FEATURE_REGISTRY.map((e) => (mod.FOR_PRODUSENTER_PUBLIC_LIST_PENDING.includes(e.key) && e.verticals.includes("rfb") ? { ...e, status: "coming_soon" as const } : e));
+      for (const [fi, fv] of factVariants.entries()) {
+        for (const lang of ["no", "en"] as const) {
+          for (const demo of ["", "1"]) {
+            const env = { FOR_PRODUSENTER_DEMO_ENABLED: demo };
+            const now = mod.renderForProdusenterPage(lang, "https://x/for-produsenter", fv, { env });
+            const pre = mod.renderForProdusenterPage(lang, "https://x/for-produsenter", fv, { env, registry: PRE });
+            assertTrue(now.content === pre.content && JSON.stringify(now.jsonLd) === JSON.stringify(pre.jsonLd) && now.title === pre.title && now.description === pre.description,
+              `T14a byte-identity ${lang} facts#${fi} demo=${demo || "off"}: HTML and JSON-LD equal the pre-flip page`);
+          }
+        }
+      }
+      // B2: stats.public_trust's description (not yet true for the profile page) never reaches the public page.
+      const trust = OWNER_FEATURE_REGISTRY.find((e) => e.key === "stats.public_trust")!;
+      const both = no.body + en.body;
+      assertTrue(!both.includes(trust.description.no) && !both.includes(trust.description.en), "T14a: stats.public_trust's description is not on the public page");
     }
     for (const k of ["orders.enabled", "visibility.profile", "products.stock_check", "orders.reminder", "notify.order_email", "auto.guarantee", "comms.unsubscribe"]) {
       assertTrue(status(k) === "live", `truth: ${k} is live (page describes it as available)`);
