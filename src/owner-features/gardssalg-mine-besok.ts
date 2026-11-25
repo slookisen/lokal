@@ -34,7 +34,7 @@ import {
   type GardssalgBooking,
 } from "../services/booking-store";
 import { formatSlotOslo } from "../services/gardssalg-booking-resolve";
-import { GARDSSALG_DASHBOARD_TEXTS, gardssalgDashboardHelpHtml } from "../owner-ui/gardssalg-dashboard";
+import { GARDSSALG_DASHBOARD_TEXTS } from "../owner-ui/gardssalg-dashboard";
 import { ATTENDANCE_STATUS_WORD } from "../services/gardssalg-attendance-guard";
 
 export type MineBesokAction = "bekreft" | "foresla" | "avsla" | "attended" | "no_show";
@@ -234,12 +234,12 @@ ${sectionHtml("besok-tidligere", "Tidligere", tidligere, "Ingen tidligere besøk
 //              are in the owner's e-mail until O2-2.
 export type MineBesokEmptyState = "off" | "none" | "pending";
 
-export function renderGardssalgMineBesokEmpty(state: MineBesokEmptyState, contactEmail: string): string {
+export function renderGardssalgMineBesokEmpty(state: MineBesokEmptyState): string {
   const T = GARDSSALG_DASHBOARD_TEXTS;
   const line = state === "off" ? T["empty.visitsOff"] : state === "none" ? T["empty.visits"] : null;
   return `<div class="gc-card" data-gardssalg-empty="besok" data-state="${state}">
     <h1>${escapeHtml(T["tab.visits"])}</h1>
-    ${line ? `<p>${escapeHtml(line)}</p>\n    ` : ""}<p>${gardssalgDashboardHelpHtml(contactEmail)}</p>
+    ${line ? `<p>${escapeHtml(line)}</p>` : ""}
   </div>`;
 }
 

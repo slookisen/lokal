@@ -53319,6 +53319,24 @@ runSerial(async () => {
   }
 });
 
+// «Hjelpelinjen»: help.contact exactly once on all four dashboard tabs.
+// Swaps getDb() + env — runSerial.
+runSerial(async () => {
+  console.log("\n── gårdssalg-dashbord: hjelpelinjen på alle fire faner ──");
+  try {
+    const { runGardssalgOwnerDashboardHjelpelinjeTests } = require("../src/routes/gardssalg-owner-dashboard-hjelpelinje.test") as
+      typeof import("../src/routes/gardssalg-owner-dashboard-hjelpelinje.test");
+    const r = await runGardssalgOwnerDashboardHjelpelinjeTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-owner-dashboard-hjelpelinje: " + f);
+    console.log(`  gardssalg-owner-dashboard-hjelpelinje: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-owner-dashboard-hjelpelinje: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-11-24-opplevagent-eierdashbord-lyst-tema-og-testfunn,
 // slices 5, 7, 8: the claim page sends the logged-in owner to «Oversikt»,
 // «Mine valg» in the shell (no back button, no text under 13px), the lock
