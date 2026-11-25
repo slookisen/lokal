@@ -24,6 +24,8 @@
  * or forge the prompt's own delimiter tags.
  */
 
+import { describeJudgeHttpError } from "./judge-error-body";
+
 export const ABOUT_COMPARISON_JUDGE_MODEL = "claude-haiku-4-5";
 export const ABOUT_COMPARISON_BETTER_TOKEN = "BEDRE";
 export const ABOUT_COMPARISON_NOT_BETTER_TOKEN = "IKKE_BEDRE";
@@ -124,7 +126,9 @@ export async function judgeAboutBetterThanStored(
     }
     return { ok: false, reasoning: "nettverksfeil under dommer-kall" };
   }
-  if (!response.ok) return { ok: false, reasoning: `dommer-API svarte status ${response.status}` };
+  if (!response.ok) {
+    return { ok: false, reasoning: `dommer-API svarte status ${await describeJudgeHttpError("judgeAboutComparison", response, io?.signal)}` };
+  }
 
   let result: any;
   try {

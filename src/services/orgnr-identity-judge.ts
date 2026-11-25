@@ -30,6 +30,8 @@
 // just a different (Norwegian) prompt, because this is a different
 // judgment.
 
+import { describeJudgeHttpError } from "./judge-error-body";
+
 export interface OrgnrIdentityJudgeVerdict {
   approved: boolean;
   reason?: string;
@@ -114,7 +116,7 @@ Ved minste tvil, svar ${ORGNR_JUDGE_REJECT_TOKEN}.`;
   }
 
   if (!response.ok) {
-    return { approved: false, reason: `dommer-API svarte status ${response.status} — avvist fail-closed` };
+    return { approved: false, reason: `dommer-API svarte status ${await describeJudgeHttpError("judgeOrgnrIdentity", response)} — avvist fail-closed` };
   }
 
   let result: any;

@@ -30,6 +30,7 @@
 // verdict; this module never touches the DB).
 
 import type { DentalCatalogClass } from "./dental-catalog-class";
+import { describeJudgeHttpError } from "./judge-error-body";
 
 export type DentalSonnetVerdictClass = DentalCatalogClass | "not_a_clinic";
 
@@ -127,7 +128,7 @@ Ved minste tvil, svar ukjent.`;
   }
 
   if (!response.ok) {
-    return { verdict_class: "ukjent", reason: `dommer-API svarte status ${response.status} — ukjent fail-closed` };
+    return { verdict_class: "ukjent", reason: `dommer-API svarte status ${await describeJudgeHttpError("judgeDentalCatalogClass", response)} — ukjent fail-closed` };
   }
 
   let result: any;

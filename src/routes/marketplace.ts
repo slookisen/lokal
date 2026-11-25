@@ -83,6 +83,7 @@ import { scheduleRegistrationConfirmation } from "../services/registration-confi
 // dev-request 2026-11-10-rfb-registreringer-og-eierkrav-folges-opp (S2).
 import { scheduleRegistrationPrecheck } from "../services/registration-precheck";
 import { wantsStoredTopUp, notInClause, mergeSample } from "./recently-enriched-sample";
+import { describeJudgeHttpError } from "../services/judge-error-body";
 import {
   publicFieldChoices, publicFieldChoicesForMany, withoutHiddenContact, withoutHiddenFields, publicAgentInfo,
   withoutHiddenCoordinates, hidesPrices, hidesTrust, type PublicFieldChoices,
@@ -8124,7 +8125,7 @@ Ved minste tvil, svar ${RFB_CONTACT_JUDGE_REJECT_TOKEN}.`;
   }
 
   if (!response.ok) {
-    return { approved: false, reason: `dommer-API svarte status ${response.status} — avvist fail-closed` };
+    return { approved: false, reason: `dommer-API svarte status ${await describeJudgeHttpError("judgeRfbContactCandidate", response)} — avvist fail-closed` };
   }
 
   let result: any;
