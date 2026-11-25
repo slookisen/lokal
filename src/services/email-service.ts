@@ -120,6 +120,10 @@ const CONTACT_FORM_PLATFORM_LABELS: Record<"rfb" | "experiences" | "dental", str
   dental: "Finn-tannlege",
 };
 const CONTACT_FORM_COPY_SUBJECT_MAX = 150;
+// cs-kjopere slice 2: the copy tells Daniel the CS routine answers simple
+// questions itself (all three platforms share the same CS flow) and that only
+// cases that need him come to the approval queue.
+const CONTACT_FORM_CS_FLOW_LINE = "CS-rutinen svarer selv på enkle spørsmål. Trenger saken deg, kommer den i godkjenningskøen.";
 // C0 + DEL + C1 controls (CR/LF among them) and the Unicode line/paragraph separators.
 const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g;
 // Bidi embedding/override/isolate marks: they can make a subject display reversed.
@@ -1736,6 +1740,7 @@ ${this.brand} | ${getConfig().domain}`;
         '',
         opts.message,
         '',
+        CONTACT_FORM_CS_FLOW_LINE,
         `CRM-tråd: ${opts.threadId}`,
         'Svar på denne e-posten går rett til avsenderen. Svaret havner ikke av seg selv i CRM-tråden.',
       ].join('\n');

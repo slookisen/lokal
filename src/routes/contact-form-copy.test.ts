@@ -45,6 +45,7 @@ const ADMIN_MAIL = "admin@plattform.example.test";
 const ENV_KEYS = ["NODE_ENV", "ADMIN_NOTIFICATION_EMAIL"] as const;
 const OK_BODY = { success: true, message: "Takk! Vi svarer så snart vi kan." };
 const STUB_ERR = "stub-smtp-feil";
+const CS_FLOW_LINE = "CS-rutinen svarer selv på enkle spørsmål. Trenger saken deg, kommer den i godkjenningskøen.";
 const FINAL_LINE = "Svar på denne e-posten går rett til avsenderen. Svaret havner ikke av seg selv i CRM-tråden.";
 const CONTROL_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
@@ -178,9 +179,10 @@ export async function runContactFormCopyTests(opts: { log?: boolean } = {}): Pro
         "",
         MSG,
         "",
+        CS_FLOW_LINE,
         `CRM-tråd: ${t?.id}`,
         FINAL_LINE,
-      ].join("\n"), "a-10: body = Plattform/Navn/E-post/Emne, the message as given, the CRM thread id and the reply note");
+      ].join("\n"), "a-10: body = Plattform/Navn/E-post/Emne, the message as given, the CS-flow line, the CRM thread id and the reply note");
       assertTrue(["Kari Nordmann", "kari@example.no", MSG, String(t?.id)].every((s) => String(m.textContent).includes(s)),
         "a-11: the body carries name, e-mail, message and thread id");
       assertEq([m.omitAgentHeader, m.redactRecipientInLogs, m.logSubjectAs], [true, true, "[Kontaktskjema · Rett fra Bonden]"],
@@ -323,6 +325,8 @@ export async function runContactFormCopyTests(opts: { log?: boolean } = {}): Pro
         assertEq([r.status, t?.vertical_id, sent[0]?.subject, String(sent[0]?.textContent ?? "").split("\n")[0]],
           [200, vertical, `[Kontaktskjema · ${label}] Plattformtest`, `Plattform: ${label}`],
           `g-01 (${tag}): ${vertical} → «${label}» in subject and body`);
+        assertTrue(String(sent[0]?.textContent ?? "").includes(`\n${CS_FLOW_LINE}\nCRM-tråd: `),
+          `g-02 (${tag}): the CS-flow line stands right before «CRM-tråd:» on every platform`);
       }
     }
 
