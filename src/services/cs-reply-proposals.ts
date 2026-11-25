@@ -218,12 +218,21 @@ function parseIdList(raw: string | null | undefined): string[] {
 const RFB_SITE_ROOTS = new Set(["https://rettfrabonden.com", "https://rettfrabonden.com/", "rettfrabonden.com", "rettfrabonden.com/"]);
 const RFB_PROFILE_PREFIX = "https://rettfrabonden.com/produsent/";
 
-const SCHEME_URL_RE = /\bhttps?:\/\/[^\s<>"'`]+/gi;
-const WWW_URL_RE = /(?<![\w./@-])www\.[^\s<>"'`]+/gi;
-/** A bare domain a mail client would auto-link («gardx.no», «gardx.no/butikk»). Lowercase TLD from a short list. */
-const BARE_DOMAIN_RE = /(?<![\w./@:-])(?:[A-Za-z0-9æøåÆØÅ-]{2,}\.)+(?:no|com|net|org|se|dk|fi|is|de|eu|uk|io|info|biz|shop|app|farm|online|site|store|nu|me|co)(?:\/[^\s<>"'`]*)?(?![A-Za-z0-9-])/g;
-const EMAIL_RE = /[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g;
-const HREF_RE = /\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi;
+/** Any «scheme://…» in text (http, https, ftp, …): every one is a link. */
+const SCHEME_URL_RE = /(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s<>"'`]+/g;
+const WWW_URL_RE = /(?<![\p{L}\p{N}./@-])www\.[^\s<>"'`]+/giu;
+/**
+ * A bare domain a mail client may auto-link («gardx.no», «Evil.No», «evil.xyz/kjop»):
+ * labels of 2+ letters/digits, an alphabetic TLD of 2–24, any case. Digits-only
+ * endings («kl. 10.30») and one-letter labels («f.eks.», «bl.a.») never match.
+ */
+const BARE_DOMAIN_RE = /(?<![\p{L}\p{N}./@:-])(?:[\p{L}\p{N}-]{2,}\.)+\p{L}{2,24}(?:\/[^\s<>"'`]*)?(?![\p{L}\p{N}-])/gu;
+/** Norwegian abbreviations that look like a bare domain. */
+const NOT_A_DOMAIN = new Set(["pr.stk", "pr.stykk", "pr.kg", "pr.liter", "pr.pk", "ca.kl"]);
+/** Real e-mail addresses (only stripped AFTER scheme URLs are taken, so «https://x@evil.no» stays a link). */
+const EMAIL_RE = /[\p{L}\p{N}._%+-]+@[\p{L}\p{N}-]+(?:\.[\p{L}\p{N}-]+)+/gu;
+/** HTML attributes that carry a URL. */
+const URL_ATTR_RE = /\b(href|src|srcset|background)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi;
 const TRAILING_PUNCT_RE = /[.,;:!?»”’'")\]]+$/;
 
 function decodeHtmlEntities(s: string): string {
@@ -239,34 +248,45 @@ function decodeHtmlEntities(s: string): string {
 }
 
 /**
- * Every link in a reply: http(s) URLs, «www.» hosts and bare domains a mail
- * client would auto-link in the text, and every href value (any scheme,
- * relative ones included) in the HTML. Unique, in order of appearance.
+ * Every link in a reply: any «scheme://» URL, «www.» hosts and bare domains
+ * a mail client may auto-link in the text and the HTML's visible text, and
+ * every href / src / srcset / background value (any scheme, relative ones
+ * included) in the HTML. Unique, in order of appearance.
  */
 export function extractLinks(bodyText: string | null | undefined, bodyHtml?: string | null): string[] {
   const found: string[] = [];
+  const push = (l: string) => {
+    const c = l.replace(TRAILING_PUNCT_RE, "");
+    if (c) found.push(c);
+  };
   const scan = (raw: string) => {
-    const noEmails = raw.replace(EMAIL_RE, " ");
-    const schemeLinks = noEmails.match(SCHEME_URL_RE) ?? [];
-    const rest1 = noEmails.replace(SCHEME_URL_RE, " ");
-    const wwwLinks = rest1.match(WWW_URL_RE) ?? [];
+    // Order matters: scheme URLs first (a «user@host» inside one must not be
+    // mistaken for an e-mail address), then e-mail addresses are dropped, then
+    // www and bare domains are looked for in what is left.
+    for (const l of raw.match(SCHEME_URL_RE) ?? []) push(l);
+    const rest1 = raw.replace(SCHEME_URL_RE, " ").replace(EMAIL_RE, " ");
+    for (const l of rest1.match(WWW_URL_RE) ?? []) push(l);
     const rest2 = rest1.replace(WWW_URL_RE, " ");
-    const bare = rest2.match(BARE_DOMAIN_RE) ?? [];
-    for (const l of [...schemeLinks, ...wwwLinks, ...bare]) {
-      const c = l.replace(TRAILING_PUNCT_RE, "");
-      if (c) found.push(c);
+    for (const l of rest2.match(BARE_DOMAIN_RE) ?? []) {
+      if (!NOT_A_DOMAIN.has(l.replace(TRAILING_PUNCT_RE, "").toLowerCase())) push(l);
     }
   };
   if (bodyText) scan(bodyText);
   if (bodyHtml) {
-    HREF_RE.lastIndex = 0;
+    URL_ATTR_RE.lastIndex = 0;
     let m: RegExpExecArray | null;
-    while ((m = HREF_RE.exec(bodyHtml))) {
-      const v = decodeHtmlEntities((m[1] ?? m[2] ?? m[3] ?? "").trim());
-      found.push(v);
+    while ((m = URL_ATTR_RE.exec(bodyHtml))) {
+      const v = decodeHtmlEntities((m[2] ?? m[3] ?? m[4] ?? "").trim());
+      if (m[1].toLowerCase() === "srcset") {
+        for (const part of v.split(",")) {
+          const u = part.trim().split(/\s+/)[0];
+          if (u) found.push(u);
+        }
+      } else {
+        found.push(v);
+      }
     }
-    const visible = decodeHtmlEntities(bodyHtml.replace(/<[^>]*>/g, " "));
-    scan(visible);
+    scan(decodeHtmlEntities(bodyHtml.replace(/<[^>]*>/g, " ")));
   }
   return Array.from(new Set(found));
 }
@@ -279,6 +299,9 @@ export interface LinkProblem {
 function whyNotAllowed(url: string): string {
   if (url.startsWith("/")) return "ikke en full adresse";
   const hasScheme = /^[a-z][a-z0-9+.-]*:/i.test(url);
+  // «https://rettfrabonden.com@evil.no/…»: the part before @ is a user name, the host is evil.no.
+  const authority = url.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "").split(/[/?#]/)[0];
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(url) && authority.includes("@")) return "brukernavn i adressen";
   let u: URL;
   try {
     u = new URL(hasScheme ? url : `https://${url}`);
@@ -309,7 +332,7 @@ function whyNotAllowed(url: string): string {
 export function checkBuyerReplyLinks(bodyText: string | null | undefined, bodyHtml?: string | null): LinkProblem[] {
   const problems: LinkProblem[] = [];
   for (const url of extractLinks(bodyText, bodyHtml)) {
-    if (RFB_SITE_ROOTS.has(url)) continue;
+    if (RFB_SITE_ROOTS.has(url) || (!/^[a-z][a-z0-9+.-]*:/i.test(url) && RFB_SITE_ROOTS.has(url.toLowerCase()))) continue;
     if (!isValidRfbProfileUrl(url)) {
       problems.push({ url, why: whyNotAllowed(url) });
       continue;
@@ -998,6 +1021,8 @@ function applyEdits(p: ProposalRow, edits: ProposalEdits, ts: string): void {
     ts,
     p.id,
   );
+  // Changing the kind AWAY from kjoper_svar leaves the mark: the thread did
+  // come in as a buyer question, and case_type is never cleared here.
   if (edits.kind === BUYER_REPLY_KIND) markBuyerCase(p.thread_id);
 }
 

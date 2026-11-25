@@ -25,7 +25,7 @@
  *              names (never a bounce, never our own address).
  *   crx13-crx14 a kept copy the server logged as an auto-reply is no person;
  *              the reply subject drops «(fra …)» with parentheses in it.
- *   ks1-ks14   «kjoper_svar»: own flag (default off), the link check (only
+ *   ks1-ks17   «kjoper_svar»: own flag (default off), the link check (only
  *              live public profiles on rettfrabonden.com), the thread's
  *              buyer mark, other kinds unchanged, Daniel's Send not gated.
  *   cr42-cr52  routes, /outbox/:id/result validation, needs-reply + watchdog +
@@ -472,6 +472,26 @@ export function runCsReplyProposalsTests(opts: { log?: boolean } = {}): Promise<
             else process.env.OWNER_PAUSE_ENABLED = prevPause;
           }
         }
+        // Review B1: a user name in the address (the host is the part after @).
+        await linkCase("ks15: «https://rettfrabonden.com@evil.no/…» is held (user name, host evil.no)", "Se https://rettfrabonden.com@evil.no/produsent/x", "https://rettfrabonden.com@evil.no/produsent/x");
+        await linkCase("ks15b: «http://kontakt@evil.no/kjop» is held", "Se http://kontakt@evil.no/kjop", "http://kontakt@evil.no/kjop");
+        await linkCase("ks15c: a user-name URL in the HTML's visible text is held", `Se ${urlOk}`, "https://ola@evil.no", `<p>Se ${urlOk}</p><p>https://ola@evil.no</p>`);
+        ok(rp.checkBuyerReplyLinks("Se https://ola@evil.no", null)[0]?.why === "brukernavn i adressen", "ks15d: …with the reason «brukernavn i adressen»");
+        // Review N1: bare domains in any case, any alphabetic TLD.
+        await linkCase("ks16: «Evil.No» (mixed case) is held", `Se ${urlOk} eller Evil.No`, "Evil.No");
+        await linkCase("ks16b: «GARDSBUTIKK.NO» is held", "Se GARDSBUTIKK.NO for mer.", "GARDSBUTIKK.NO");
+        await linkCase("ks16c: «evil.xyz/kjop» is held", "Bestill på evil.xyz/kjop.", "evil.xyz/kjop");
+        eq(rp.extractLinks("Se evil.ru og evil.ai.", null), ["evil.ru", "evil.ai"], "ks16d: «evil.ru» and «evil.ai» count as links");
+        eq(
+          rp.checkBuyerReplyLinks(`Åpent kl. 10.30, f.eks. egg, bl.a. 50 kr pr.stk. Skriv til post@rettfrabonden.com. Hilsen RETTFRABONDEN.COM og ${urlOk}.`, null),
+          [],
+          "ks16e: «kl. 10.30», «f.eks.», «bl.a.», «pr.stk», a signature e-mail, the root in capitals and a valid profile are no problem",
+        );
+        // Review N2: other schemes in text, URL attributes in HTML.
+        await linkCase("ks17: an «ftp://» address in the text is held", "Prislisten: ftp://files.example.no/priser.pdf", "ftp://files.example.no/priser.pdf");
+        await linkCase("ks17b: an <img src> to another domain is held", `Se ${urlOk}`, "https://img.example.com/a.png", `<p>Se ${urlOk}</p><img src="https://img.example.com/a.png">`);
+        await linkCase("ks17c: an srcset entry to another domain is held", `Se ${urlOk}`, "https://b.example.com/2.png", `<p>Se ${urlOk}</p><img srcset="${urlOk} 1x, https://b.example.com/2.png 2x">`);
+        await linkCase("ks17d: a background attribute to another domain is held", `Se ${urlOk}`, "https://bg.example.com/b.jpg", `<table><tr><td background="https://bg.example.com/b.jpg">Se ${urlOk}</td></tr></table>`);
         eq(rp.checkBuyerReplyLinks("Hilsen Rett fra Bonden — rettfrabonden.com. Skriv til kontakt@rettfrabonden.com eller ola.nord@gard.no.", null), [], "ks11: the site root mentioned in a signature and e-mail addresses are no problem");
         // Daniel pressing Send is his own decision: the buyer gates are automatic-path only.
         {
