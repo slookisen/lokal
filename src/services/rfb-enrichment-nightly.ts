@@ -265,6 +265,7 @@ import {
   emailDomain,
   isParaplyRoutedEmail,
   getAffiliatedUmbrellaDomains,
+  newSecondLineJudgeRunState,
 } from "../agents/lokal-agent-verifier";
 
 type Db = ReturnType<typeof getDb>;
@@ -2075,6 +2076,13 @@ export interface RfbEnrichmentReverifyOutcome {
   next: string | null;
   error?: boolean;
   detail?: string;
+  // dev-request 2026-11-25-dommerfeil-skal-ikke-nedgradere-verifiserte-
+  // profiler (punkt 4): the second-line judge had no verdict for this row
+  // (infra failure), or the run had given up on it (judge_unavailable).
+  // judge_error: the judge's reason text on an infra failure.
+  judge_infra_failure?: boolean;
+  judge_unavailable?: boolean;
+  judge_error?: string;
 }
 
 export interface RfbEnrichmentBmArgs {
@@ -2137,6 +2145,7 @@ export function createDefaultRfbEnrichmentExecutors(
   productNameExtractor: HcrProductNamesExtractor = rfbEnrichmentProductNameExtractor,
 ): RfbEnrichmentExecutors {
   let wdState: { existing: Set<string>; proposed: Set<string>; counters: RfbWdFallbackCounters } | null = null;
+  const judgeRunState = newSecondLineJudgeRunState();
   return {
     async urlCheck(row) {
       if (!row.has_knowledge) return { outcome: "no_knowledge_row", written: false, changed: false };
@@ -2333,10 +2342,26 @@ export function createDefaultRfbEnrichmentExecutors(
     },
 
     async reverify(agentId) {
-      const r = await runVerifierBatch({ agentIds: [agentId], brregLookup: resolveBrregLookup, batchSize: 1 });
+      const r = await runVerifierBatch({
+        agentIds: [agentId],
+        brregLookup: resolveBrregLookup,
+        batchSize: 1,
+        // One tracker for the whole night's step 5, so three infra failures in
+        // a row stop the judge for the rest of it (not per single-agent batch).
+        secondLineJudgeRunState: judgeRunState,
+      });
       const v = r.results[0];
       if (!v) return { outcome: "not_found", prior: null, next: null };
-      return { outcome: v.new_verification_status, prior: v.prior_verification_status ?? null, next: v.new_verification_status };
+      const sl = v.cross_source_reason?.second_line as { judge_reason?: unknown } | undefined;
+      return {
+        outcome: v.new_verification_status,
+        prior: v.prior_verification_status ?? null,
+        next: v.new_verification_status,
+        ...(v.second_line_judge_infra_failure
+          ? { judge_infra_failure: true, judge_error: typeof sl?.judge_reason === "string" ? sl.judge_reason : "(ingen feiltekst)" }
+          : {}),
+        ...(v.second_line_judge_unavailable ? { judge_unavailable: true } : {}),
+      };
     },
   };
 }
@@ -3210,6 +3235,11 @@ async function runSteps(rc: RunContext): Promise<void> {
       const byTransition: Record<string, number> = {};
       const stepReports = new Map(report.steps.map((s) => [s.step, s]));
       let terminal = 0;
+      // dev-request 2026-11-25-dommerfeil-skal-ikke-nedgradere-verifiserte-
+      // profiler (punkt 4): second-line judge outage in this step.
+      let judgeInfraFailures = 0;
+      let judgeUnavailable = 0;
+      let judgeFirstError: string | null = null;
       for (const w of take) {
         await yieldToEventLoop();
         const stop = stopBefore(step, perRowLlm);
@@ -3249,14 +3279,32 @@ async function runSteps(rc: RunContext): Promise<void> {
           if (origin && !out.error) origin.re_verified++;
           if (origin && newlyVerified) origin.new_verified++;
           if (origin && newlyInPool) origin.new_in_pool++;
-        } else if (!out.error) {
+        } else if (!out.error && !out.judge_infra_failure && !out.judge_unavailable) {
+          // A judge outage is not an attempt on the row: no stamp, so the
+          // row is not held back for the retry window because of it.
           stampAttempt(db, w.id, step, clock(), out.outcome, report.run_id);
         }
+        if (out.judge_infra_failure) {
+          judgeInfraFailures++;
+          if (judgeFirstError === null) judgeFirstError = out.judge_error ?? "(ingen feiltekst)";
+        }
+        if (out.judge_unavailable) judgeUnavailable++;
         sr.changed_agent_ids.push(w.id);
         sr.rows.push({ agent_id: w.id, outcome: key, detail: `${w.source}${newlyInPool ? " +pool" : ""}${out.detail ? ` ${out.detail}` : ""}`.slice(0, 200) });
       }
       sr.rejected = 0;
-      sr.extra = { by_transition: byTransition, new_terminal_unconfirmable: terminal, changed_tonight: changed.size };
+      sr.extra = {
+        by_transition: byTransition,
+        new_terminal_unconfirmable: terminal,
+        changed_tonight: changed.size,
+        ...(judgeInfraFailures > 0 || judgeUnavailable > 0
+          ? {
+              judge_infra_failures: judgeInfraFailures,
+              judge_unavailable: judgeUnavailable,
+              judge_first_error: judgeFirstError ? judgeFirstError.slice(0, 500) : null,
+            }
+          : {}),
+      };
     }
     finishStep(sr, t0, llmBefore);
   }
@@ -3372,8 +3420,17 @@ function recordEnvelope(
   }
   const finishedAt = clock().toISOString();
   const stepsRan = report.steps.some((s) => s.attempted > 0);
+  // dev-request 2026-11-25-dommerfeil-skal-ikke-nedgradere-verifiserte-
+  // profiler (punkt 4): a second-line judge outage in step 5 makes the run
+  // partial too (count + first error are in that step's claim meta.extra).
+  const judgeOutage = report.steps.some(
+    (s) => Number(s.extra?.judge_infra_failures ?? 0) > 0 || Number(s.extra?.judge_unavailable ?? 0) > 0,
+  );
   const troubled =
-    report.errors.length > 0 || report.stopped_reason !== null || report.steps.some((s) => s.errors > 0 || s.stopped_reason !== null);
+    report.errors.length > 0 ||
+    report.stopped_reason !== null ||
+    judgeOutage ||
+    report.steps.some((s) => s.errors > 0 || s.stopped_reason !== null);
   const status = report.errors.some((e) => e.startsWith("run aborted")) && !stepsRan ? "failed" : troubled ? "partial" : "completed";
   const llmCalls = meter.calls;
   const short: Record<RfbEnrichmentStep, string> = {

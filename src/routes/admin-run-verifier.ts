@@ -13,7 +13,15 @@
 // All endpoints require X-Admin-Key.
 
 import { Router, Request, Response } from "express";
-import { runVerifierBatch, buildRunEnvelope, pickReviewQueueBatch, pickBatchBiased, resolveBrregLookup } from "../agents/lokal-agent-verifier";
+import {
+  runVerifierBatch,
+  buildRunEnvelope,
+  pickReviewQueueBatch,
+  pickBatchBiased,
+  resolveBrregLookup,
+  SECOND_LINE_INFRA_FAILURE_SELECTOR,
+  selectSecondLineInfraFailureIds,
+} from "../agents/lokal-agent-verifier";
 import { recordRun, acquireLock } from "../services/run-ledger";
 import { getSnapshotClaimCounts } from "./admin-verifier-claim-counts";
 
@@ -43,6 +51,26 @@ function parseAgentIds(req: Request): string[] | undefined {
   ids = ids.filter((v) => v.length > 0);
   return ids.length > 0 ? ids : undefined;
 }
+
+// dev-request 2026-11-25-dommerfeil-skal-ikke-nedgradere-verifiserte-
+// profiler (punkt 5): optional `select` (body or query). The only value is
+// SECOND_LINE_INFRA_FAILURE_SELECTOR ("second_line_infra_failure"): the rows
+// whose last stored second-line result had a judge infra failure or
+// judge_unavailable. Dry run by default — only an explicit dry_run=false
+// (false / "false" / "0" / 0) runs the verifier on them.
+function parseSelect(req: Request): string | undefined {
+  const raw = req.body && req.body.select !== undefined ? req.body.select : req.query.select;
+  if (raw === undefined || raw === null || String(raw).trim() === "") return undefined;
+  return String(raw).trim();
+}
+
+function isExplicitNoDryRun(req: Request): boolean {
+  const raw = req.body && req.body.dry_run !== undefined ? req.body.dry_run : req.query.dry_run;
+  return raw === false || raw === 0 || raw === "false" || raw === "0";
+}
+
+/** Max agent ids echoed in a selector dry-run response. */
+export const RUN_VERIFIER_SELECT_DRY_RUN_IDS_MAX = 50;
 
 function requireAdmin(req: Request, res: Response): boolean {
   const expected = getAdminKey();
@@ -419,8 +447,49 @@ export async function runVerifierTick(opts: {
 //   not the 22:00-06:00 UTC window check. Default off; every existing
 //   caller (including plain force=1) is unaffected unless it opts in.
 //   Returns: { success, run_id, results, skipped?: boolean, reason? }
+//   select=second_line_infra_failure (body or query): re-run the rows whose
+//   last second-line result was a judge infra failure / judge_unavailable.
+//   Dry run by default ({matched, would_process, agent_ids}); dry_run=false
+//   runs them (normal window/force/tick-lock rules apply).
 router.post("/", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
+
+  // dev-request 2026-11-25-dommerfeil-skal-ikke-nedgradere-verifiserte-
+  // profiler (punkt 5): `select` resolves to an explicit agentIds list. The
+  // dry run (default) is read-only, so it is answered before the window gate.
+  const select = parseSelect(req);
+  let selectedIds: string[] | undefined;
+  if (select !== undefined) {
+    if (select !== SECOND_LINE_INFRA_FAILURE_SELECTOR) {
+      res.status(400).json({ success: false, error: `unknown select '${select}'`, allowed: [SECOND_LINE_INFRA_FAILURE_SELECTOR] });
+      return;
+    }
+    if (parseAgentIds(req)) {
+      res.status(400).json({ success: false, error: "select and agentIds cannot be combined" });
+      return;
+    }
+    const ids = selectSecondLineInfraFailureIds(getDb());
+    const selBatchRaw = (req.body && req.body.batchSize) || req.query.batchSize;
+    const selBatch = Math.min(Math.max(parseInt(String(selBatchRaw ?? (process.env.VERIFY_BATCH_SIZE ?? "30")), 10) || 30, 1), 100);
+    if (!isExplicitNoDryRun(req)) {
+      res.json({
+        success: true,
+        dry_run: true,
+        select,
+        matched: ids.length,
+        would_process: Math.min(ids.length, selBatch),
+        agent_ids: ids.slice(0, RUN_VERIFIER_SELECT_DRY_RUN_IDS_MAX),
+        hint: "POST again with dry_run=false (and force=1 outside 22-06 UTC) to re-verify them",
+      });
+      return;
+    }
+    if (ids.length === 0) {
+      // Never fall through with an empty id list: that would run the normal picker.
+      res.json({ success: true, dry_run: false, select, matched: 0, processed: 0 });
+      return;
+    }
+    selectedIds = ids.slice(0, selBatch);
+  }
 
   const now = new Date();
   const hourUTC = now.getUTCHours();
@@ -482,7 +551,7 @@ router.post("/", async (req: Request, res: Response) => {
   // gate-felt: optional explicit id filter — see parseAgentIds/runVerifierTick/
   // runVerifierBatch doc comments. Default undefined; every existing caller
   // that doesn't pass this is byte-for-byte unaffected.
-  const agentIds = parseAgentIds(req);
+  const agentIds = selectedIds ?? parseAgentIds(req);
 
   try {
     // S5c: this synchronous route (unlike the cron tick and /sweep) has a
@@ -543,6 +612,7 @@ router.post("/", async (req: Request, res: Response) => {
       bias_growth: tick.bias_growth,
       truncated: tick.truncated,
       not_processed: tick.not_processed,
+      ...(selectedIds ? { select, dry_run: false, selected: selectedIds.length } : {}),
     });
   } catch (err: any) {
     res.status(500).json({

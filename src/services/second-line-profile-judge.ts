@@ -45,6 +45,81 @@ import { noteLlmCall } from "./llm-call-meter";
 export interface SecondLineProfileJudgeVerdict {
   approved: boolean;
   reason?: string;
+  /**
+   * dev-request 2026-11-25-dommerfeil-skal-ikke-nedgradere-verifiserte-
+   * profiler (punkt 1): set ONLY when no model verdict was obtained (missing
+   * API key, network error, non-2xx response, unparseable JSON, response
+   * without a text block). Still `approved: false` (fail-closed), but the
+   * verifier can tell an infrastructure failure apart from a real AVVIS and
+   * keep an already second-line-verified profile as it is. Absent on real
+   * verdicts (GODKJENN, AVVIS and an ambiguous model answer). Same contract
+   * as contact-candidate-judge.ts's ContactCandidateJudgeVerdict.infraFailure.
+   */
+  infraFailure?: true;
+}
+
+// ─── Judge health tracker (dev-request 2026-11-25-dommerfeil-skal-ikke-
+//     nedgradere-verifiserte-profiler, punkt 4) ─────────────────────────────
+// In-memory, per process: how many judge calls IN A ROW ended in an
+// infrastructure failure. Any call that got a model verdict resets it. /health
+// reads secondLineJudgeHealthWarning() — a warning once the most recent
+// SECOND_LINE_JUDGE_HEALTH_WARN_AFTER calls have all failed. Never persisted:
+// a restart clears it, and the first call after that sets it again if the API
+// is still down.
+export const SECOND_LINE_JUDGE_HEALTH_WARN_AFTER = 3;
+
+interface SecondLineJudgeHealthState {
+  consecutive_infra_failures: number;
+  last_infra_error: string | null;
+  last_infra_failure_at: string | null;
+  last_success_at: string | null;
+}
+
+const judgeHealth: SecondLineJudgeHealthState = {
+  consecutive_infra_failures: 0,
+  last_infra_error: null,
+  last_infra_failure_at: null,
+  last_success_at: null,
+};
+
+function noteJudgeOutcome(verdict: SecondLineProfileJudgeVerdict): SecondLineProfileJudgeVerdict {
+  const at = new Date().toISOString();
+  if (verdict.infraFailure) {
+    judgeHealth.consecutive_infra_failures += 1;
+    judgeHealth.last_infra_error = verdict.reason ?? null;
+    judgeHealth.last_infra_failure_at = at;
+  } else {
+    judgeHealth.consecutive_infra_failures = 0;
+    judgeHealth.last_success_at = at;
+  }
+  return verdict;
+}
+
+/** Snapshot of the in-memory judge health tracker (read-only copy). */
+export function getSecondLineJudgeHealth(): Readonly<SecondLineJudgeHealthState> {
+  return { ...judgeHealth };
+}
+
+/**
+ * The /health warning text when the most recent judge calls have all failed
+ * (≥ SECOND_LINE_JUDGE_HEALTH_WARN_AFTER infrastructure failures in a row),
+ * else null. Cleared by the first call that gets a model verdict.
+ */
+export function secondLineJudgeHealthWarning(): string | null {
+  if (judgeHealth.consecutive_infra_failures < SECOND_LINE_JUDGE_HEALTH_WARN_AFTER) return null;
+  // No API error text here: /health is public. The text is in the server log,
+  // the run envelope and the profile's stored verdict.
+  return (
+    `Second-line judge unavailable: last ${judgeHealth.consecutive_infra_failures} calls failed ` +
+    `(infra), latest at ${judgeHealth.last_infra_failure_at ?? "?"}`
+  );
+}
+
+export function __resetSecondLineJudgeHealthForTesting(): void {
+  judgeHealth.consecutive_infra_failures = 0;
+  judgeHealth.last_infra_error = null;
+  judgeHealth.last_infra_failure_at = null;
+  judgeHealth.last_success_at = null;
 }
 
 const SECOND_LINE_JUDGE_APPROVE_TOKEN = "GODKJENN";
@@ -247,12 +322,19 @@ function fencedEvidenceBlockFor(items: readonly { source_url: string; content_ex
  * verification line. Direct fetch to https://api.anthropic.com/v1/messages,
  * ANTHROPIC_API_KEY from env, model claude-haiku-4-5 — same call shape as
  * judgeContactCandidate. ANY doubt or failure resolves to "does not pass
- * second line"; never throws, never silently approves.
+ * second line"; never throws, never silently approves. A failure with no
+ * model verdict carries `infraFailure: true` (dev-request 2026-11-25-
+ * dommerfeil-skal-ikke-nedgradere-verifiserte-profiler) and every call
+ * updates the in-memory health tracker above.
  */
 export async function judgeSecondLineProfile(params: SecondLineProfileJudgeParams): Promise<SecondLineProfileJudgeVerdict> {
+  return noteJudgeOutcome(await callSecondLineJudge(params));
+}
+
+async function callSecondLineJudge(params: SecondLineProfileJudgeParams): Promise<SecondLineProfileJudgeVerdict> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
-    return { approved: false, reason: "ANTHROPIC_API_KEY mangler — avvist fail-closed" };
+    return { approved: false, reason: "ANTHROPIC_API_KEY mangler — avvist fail-closed", infraFailure: true };
   }
 
   const prompt = buildSecondLineJudgePrompt(params);
@@ -274,24 +356,38 @@ export async function judgeSecondLineProfile(params: SecondLineProfileJudgeParam
       }),
     });
   } catch {
-    return { approved: false, reason: "nettverksfeil under dommer-kall — avvist fail-closed" };
+    return { approved: false, reason: "nettverksfeil under dommer-kall — avvist fail-closed", infraFailure: true };
   }
 
   if (!response.ok) {
-    return { approved: false, reason: `dommer-API svarte status ${response.status} — avvist fail-closed` };
+    // Same pattern as contact-candidate-judge.ts (lokal#755): the first 300
+    // chars of the API's own error body go into the reason and the log, so an
+    // outage (e.g. a 400 for spent credit) can be read without a DB dig.
+    let bodySnippet = "";
+    try {
+      bodySnippet = String(await response.text()).slice(0, 300);
+    } catch {
+      bodySnippet = "(kunne ikke lese respons-body)";
+    }
+    console.error(`[judgeSecondLineProfile] non-ok response: status=${response.status} body=${bodySnippet}`);
+    return {
+      approved: false,
+      reason: `dommer-API svarte status ${response.status} — avvist fail-closed — ${bodySnippet}`,
+      infraFailure: true,
+    };
   }
 
   let result: any;
   try {
     result = await response.json();
   } catch {
-    return { approved: false, reason: "ikke-parsbar JSON fra dommer-API — avvist fail-closed" };
+    return { approved: false, reason: "ikke-parsbar JSON fra dommer-API — avvist fail-closed", infraFailure: true };
   }
 
   const contentArr = Array.isArray(result?.content) ? result.content : [];
   const text = contentArr.find((c: any) => c?.type === "text")?.text;
   if (typeof text !== "string") {
-    return { approved: false, reason: "uventet svarformat fra dommer-API — avvist fail-closed" };
+    return { approved: false, reason: "uventet svarformat fra dommer-API — avvist fail-closed", infraFailure: true };
   }
 
   const lines = text.trim().split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);

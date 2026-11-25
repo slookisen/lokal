@@ -231,6 +231,7 @@ import { syncDebioVerifications } from "./services/debio-verification-service";
 import { syncDebioRegister, debioRegisterSyncEnabled, enforceDebioRegisterFreshness } from "./services/debio-register-sync";
 import { syncDebioCertDetails, debioCertDetailSyncEnabled } from "./services/debio-cert-detail-sync";
 import { runSalgskanalSweep } from "./services/salgskanal-matcher";
+import { secondLineJudgeHealthWarning } from "./services/second-line-profile-judge";
 
 // Seed-knowledge loaded dynamically — only used if DB is empty
 let seedKnowledge: (() => void) | undefined;
@@ -879,6 +880,12 @@ app.get("/health", (_req, res) => {
     // maaler-ikke-skrivesti: a failing write path must not read as a healthy day.
     const writePath = getWritePathHealth(db);
     if (!writePath.ok) { status = "critical"; warnings.push(`DB write path failing: ${writePath.error}`); }
+
+    // dev-request 2026-11-25-dommerfeil-skal-ikke-nedgradere-verifiserte-
+    // profiler (punkt 4): the most recent second-line judge calls all failed
+    // (in-memory tracker in the judge module; cleared by the next success).
+    const judgeWarning = secondLineJudgeHealthWarning();
+    if (judgeWarning) { if (status !== "critical") status = "warning"; warnings.push(judgeWarning); }
 
     const responseMs = Date.now() - startMs;
 

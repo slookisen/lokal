@@ -220,6 +220,11 @@ function secondLineView(
   reasons: unknown;
   sources: string[];
   judge_reason: string | null;
+  // dev-request 2026-11-25-dommerfeil-skal-ikke-nedgradere-verifiserte-
+  // profiler (punkt 4): the judge gave no verdict (infra failure) / was not
+  // called because the run had given up on it. false for older verdicts.
+  infra_failure: boolean;
+  judge_unavailable: boolean;
   as_of: string | null;
 } | null {
   const sl = v?.second_line;
@@ -231,6 +236,8 @@ function secondLineView(
     reasons: o.reasons ?? null,
     sources: Array.isArray(o.sources) ? (o.sources as unknown[]).filter((x): x is string => typeof x === "string") : [],
     judge_reason: typeof o.judge_reason === "string" ? o.judge_reason : null,
+    infra_failure: o.infra_failure === true,
+    judge_unavailable: o.judge_unavailable === true,
     as_of: asOf,
   };
 }

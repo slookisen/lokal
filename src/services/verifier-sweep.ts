@@ -36,8 +36,10 @@ import {
   resolveBrregLookup,
   countOutreachPoolAdded,
   OUTREACH_POOL_ADDED_DETAIL,
+  newSecondLineJudgeRunState,
+  secondLineJudgeOutageClaim,
 } from "../agents/lokal-agent-verifier";
-import type { VerifierResult, BrregFn } from "../agents/lokal-agent-verifier";
+import type { VerifierResult, BrregFn, SecondLineJudgeRunState } from "../agents/lokal-agent-verifier";
 import { getDb } from "../database/init";
 import { recordRun } from "./run-ledger";
 
@@ -88,6 +90,12 @@ export interface SweepJobState {
   // orchestrator-pr-16: website-ownership unverified (homepage name-mismatch)
   // surfaced by Guard #1 at crawl time; counted here when the flag is present.
   website_ownership_unverified: number;
+  // dev-request 2026-11-25-dommerfeil-skal-ikke-nedgradere-verifiserte-
+  // profiler (punkt 4): second-line judge outage across the whole sweep (one
+  // tracker shared by every chunk). >0 makes the sweep's envelope `partial`.
+  judge_infra_failures: number;
+  judge_unavailable: number;
+  judge_first_error: string | null;
 }
 
 // ─── Singleton state ─────────────────────────────────────────────────────────
@@ -115,6 +123,9 @@ let _sweepJob: SweepJobState = {
   thin_content: 0,
   inference_only_field: 0,
   website_ownership_unverified: 0,
+  judge_infra_failures: 0,
+  judge_unavailable: 0,
+  judge_first_error: null,
 };
 
 /**
@@ -203,6 +214,7 @@ export interface StartSweepOpts {
     db?: any;
     agentIds?: string[];
     brregLookup?: BrregFn | null;
+    secondLineJudgeRunState?: SecondLineJudgeRunState;
   }) => Promise<{ run_id: string; started_at: string; finished_at: string; results: VerifierResult[] }>;
   /**
    * Injectable sleep — defaults to defaultSleep. Pass `() => Promise.resolve()`
@@ -292,7 +304,12 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
     thin_content: 0,
     inference_only_field: 0,
     website_ownership_unverified: 0,
+    judge_infra_failures: 0,
+    judge_unavailable: 0,
+    judge_first_error: null,
   };
+  // One judge outage tracker for the whole sweep, so "three in a row" spans chunks.
+  const judgeRunState = newSecondLineJudgeRunState();
 
   // ── Background loop (fire-and-forget) ──────────────────────────────────────
   // NOT awaited — the loop runs after startSweep() returns. This is the key
@@ -324,7 +341,7 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
 
         const chunkAgentIds = agentIds ? agentIds.slice(idCursor, idCursor + chunkSize) : undefined;
 
-        let chunkResult: Awaited<ReturnType<typeof runVerifierBatch>>;
+        let chunkResult: Awaited<ReturnType<typeof runBatchFn>>;
         try {
           chunkResult = chunkAgentIds
             ? await runBatchFn({
@@ -333,12 +350,14 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
                 agentIds: chunkAgentIds,
                 db,
                 brregLookup,
+                secondLineJudgeRunState: judgeRunState,
               })
             : await runBatchFn({
                 batchSize: chunkSize,
                 pickFn: pickPendingVerifyBatch,
                 db,
                 brregLookup,
+                secondLineJudgeRunState: judgeRunState,
               });
           // Advance the cursor only after a successful chunk, so a failed
           // chunk (caught below) is retried on the same slice of ids rather
@@ -395,6 +414,16 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
         _sweepJob.thin_content += results.filter((r) => r.flags.includes("thin_content")).length;
         _sweepJob.inference_only_field += results.filter((r) => r.flags.some((f) => f.startsWith("inference_only_field"))).length;
         _sweepJob.website_ownership_unverified += results.filter((r) => r.flags.includes("website_ownership_unverified")).length;
+        for (const r of results) {
+          if (r.second_line_judge_infra_failure) {
+            _sweepJob.judge_infra_failures++;
+            if (_sweepJob.judge_first_error === null) {
+              const sl = r.cross_source_reason?.second_line as { judge_reason?: unknown } | undefined;
+              _sweepJob.judge_first_error = typeof sl?.judge_reason === "string" ? sl.judge_reason : "(ingen feiltekst)";
+            }
+          }
+          if (r.second_line_judge_unavailable) _sweepJob.judge_unavailable++;
+        }
         _sweepJob.lastChunkAt = new Date().toISOString();
 
         console.log(
@@ -421,6 +450,11 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
       // Record a summary run-envelope so the orchestrator's daily rollup
       // can see the bulk sweep in the runs ledger.
       try {
+        const judgeOutageClaim = secondLineJudgeOutageClaim({
+          infra_failures: _sweepJob.judge_infra_failures,
+          judge_unavailable: _sweepJob.judge_unavailable,
+          first_error: _sweepJob.judge_first_error,
+        });
         const fakeEnvelope = {
           run_id: jobId,
           vertical: "rfb",
@@ -428,8 +462,8 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
           trigger_source: "manual" as const,
           started_at: startedAt,
           finished_at: _sweepJob.finishedAt,
-          status: "completed" as const,
-          claims: buildSweepRunEnvelopeClaims(_sweepJob),
+          status: judgeOutageClaim ? ("partial" as const) : ("completed" as const),
+          claims: [...buildSweepRunEnvelopeClaims(_sweepJob), ...(judgeOutageClaim ? [judgeOutageClaim] : [])],
           evidence: [],
           notes: `Bulk pending_verify sweep: processed ${_sweepJob.processed} agents, ${_sweepJob.verified} verified, ${_sweepJob.still_pending} still_pending`,
         };

@@ -838,6 +838,34 @@ export async function runAdminPoolBlockerExplainTests(opts: { log?: boolean } = 
         }),
         "pbe-sl",
       );
+      // dev-request 2026-11-25-dommerfeil-skal-ikke-nedgradere-verifiserte-
+      // profiler (punkt 4): a stored judge infra failure is shown as such.
+      insertAgent({
+        id: "pbe-slinfra",
+        name: "Dommerfeil-gard",
+        website: "https://slinfra.example",
+        about: "Gard i test.",
+        verificationStatus: "verified",
+        enrichmentStatus: "rich",
+        email: "post@slinfra.example",
+        urlLastStatus: 200,
+        urlLastProbed: nowIso,
+      });
+      testDb.prepare(
+        `UPDATE agent_knowledge SET verification_review_reason = ? WHERE agent_id = ?`,
+      ).run(
+        JSON.stringify({
+          second_line: {
+            attempted: true,
+            passes: false,
+            reasons: { has_accepted_source: true },
+            sources: ["facebook_official_page"],
+            judge_reason: "dommer-API svarte status 400 — avvist fail-closed — {\"error\":\"x\"}",
+            infra_failure: true,
+          },
+        }),
+        "pbe-slinfra",
+      );
       insertAgent({
         id: "pbe-term",
         name: "Terminal-gard",
@@ -864,7 +892,7 @@ export async function runAdminPoolBlockerExplainTests(opts: { log?: boolean } = 
         urlLastProbed: nowIso,
       });
 
-      const r = await callExplain({ agentIds: "pbe-sl,pbe-term,pbe-nosl" });
+      const r = await callExplain({ agentIds: "pbe-sl,pbe-term,pbe-nosl,pbe-slinfra" });
       const sl = r.body.agents.find((x: any) => x.agent_id === "pbe-sl");
       const term = r.body.agents.find((x: any) => x.agent_id === "pbe-term");
       const nosl = r.body.agents.find((x: any) => x.agent_id === "pbe-nosl");
@@ -878,6 +906,10 @@ export async function runAdminPoolBlockerExplainTests(opts: { log?: boolean } = 
       assertEq(term.terminal_reason, "brreg_konkurs", "c5-8: terminal row shows terminal_reason");
       assertEq(term.second_line, null, "c5-9: second_line null when no stored second line");
       assertEq(nosl.second_line, null, "c5-10: verified row without verdict -> second_line null");
+      const slinfra = r.body.agents.find((x: any) => x.agent_id === "pbe-slinfra");
+      assertEq(sl.second_line.infra_failure, false, "c5-11: real judge verdict -> second_line.infra_failure false");
+      assertEq(slinfra.second_line.infra_failure, true, "c5-12: stored judge infra failure -> second_line.infra_failure true");
+      assertTrue(/status 400/.test(slinfra.second_line.judge_reason), "c5-13: judge_reason shown next to infra_failure");
       assertEq(nosl.terminal_reason, null, "c5-11: verified row without verdict -> terminal_reason null");
     }
   } catch (err: any) {
