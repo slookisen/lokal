@@ -31,6 +31,7 @@ import { readOwnerProfileVisible, writeOwnerProfileVisible } from "../services/o
 import { GARDSSALG_BOOKING_ENABLED_ADAPTER, GARDSSALG_NOTIFY_ADDRESS_ADAPTER, GARDSSALG_PROFILE_VISIBLE_ADAPTER } from "./gardssalg-adapters";
 import { PRODUCT_WEEKLY_SYNC_ADAPTER, PRODUCT_WEEKLY_SYNC_FLAG } from "./product-weekly-sync";
 import type { ForProdusenterAnchor } from "../routes/rfb-for-produsenter-anchors";
+import type { ForProdusenterFacts } from "./today-facts";
 
 export const OWNER_FEATURE_KEYS = [
   // Hvem kan finne deg
@@ -258,6 +259,13 @@ export interface OwnerFeatureEntry {
   /** Global emergency brake: env name; "1"/"true" forces the entry off for everyone. */
   killSwitch?: string;
   status: OwnerFeatureStatus;
+  /**
+   * What the platform does TODAY for a planned choice, shown as «I dag:» under
+   * its row in «Planlagt» (page + owner API `today`). Computed from the facts
+   * the platform has now; NEVER the choice's default value. Only allowed on
+   * `coming_soon` entries (registry-governance rule).
+   */
+  today?: (facts: ForProdusenterFacts) => LocalizedText;
   /**
    * Env flag a `live` entry needs: while it is not "1"/"true" the entry
    * behaves exactly as `coming_soon` at run time (resolver, «Mine valg»,
