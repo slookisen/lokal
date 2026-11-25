@@ -253,8 +253,9 @@ export function runGardssalgOwnerDashboardO21Tests(opts: { log?: boolean } = {})
       // With the shell taken out, the portal and «Mine valg» are the flag-off pages.
       // O2-3: the portal (Oversikt) also carries the overview card; take it out too.
       const OVERVIEW_CARD = /<section class="gc-card gs-oversikt"[\s\S]*?<\/section>\n {6}/;
+      const HELP_P = /<p data-gardssalg-help="1">[\s\S]*?<\/p>(?=<\/main>)/;
       const unshell = (b: string, slug: string, tab: "oversikt" | "valg") => {
-        const t = b.replace(shellOf(slug, tab) + MAIN_OPEN, "").replace(OVERVIEW_CARD, "");
+        const t = b.replace(shellOf(slug, tab) + MAIN_OPEN, "").replace(OVERVIEW_CARD, "").replace(HELP_P, "");
         const i = t.lastIndexOf("</main>");
         return i < 0 ? t : t.slice(0, i) + t.slice(i + "</main>".length);
       };
@@ -280,13 +281,15 @@ export function runGardssalgOwnerDashboardO21Tests(opts: { log?: boolean } = {})
       assertTrue(onBodies.besok.body.includes("<p>«Ta imot besøk» er av. Slå det på under «Mine valg» når du vil ta imot forespørsler.</p>"), "AK2k: «Mine besøk» with booking off → empty.visitsOff verbatim");
       assertTrue(onBodies.besok.body.includes('data-state="off"'), "AK2l: «Mine besøk» state off");
       assertTrue(onBodies.statistikk.body.includes("Det er ingen tall å vise ennå."), "AK2m: «Statistikk» → empty.stats verbatim");
-      assertTrue(onBodies.statistikk.body.includes("Trenger du hjelp? Skriv til <a href=\"mailto:"), "AK2n: help.contact with the contact address");
+      for (const tab of ["portal", "besok", "valg", "statistikk"] as const) {
+        assertEq(onBodies[tab].body.split("Trenger du hjelp? Skriv til <a href=\"mailto:kontakt@opplevagent.no\">kontakt@opplevagent.no</a>.").length - 1, 1, `AK2n: /${tab} shows help.contact once, with the contact address`);
+      }
       expDb.prepare(`UPDATE experience_providers SET booking_live = 1 WHERE id = 'o21-test'`).run();
       const besokOn = await get(url("o21testgard", "besok"), cookie("tok21-test"));
       assertTrue(besokOn.body.includes("Du har ingen forespørsler ennå. Når noen ber om besøk, får du e-post, og forespørselen dukker opp her.") && besokOn.body.includes('data-state="none"'), "AK2o: booking on, no request → empty.visits verbatim");
       expDb.prepare(`UPDATE experience_providers SET booking_live = 0 WHERE id = 'o21-test'`).run();
-      const pendingHtml = besok.renderGardssalgMineBesokEmpty("pending", "kontakt@example.no");
-      assertTrue(!pendingHtml.includes("ingen forespørsler") && !pendingHtml.includes("er av") && pendingHtml.includes("Trenger du hjelp?"), "AK2p: requests exist → no untrue «ingen forespørsler» line, only the help line");
+      const pendingHtml = besok.renderGardssalgMineBesokEmpty("pending");
+      assertTrue(!pendingHtml.includes("ingen forespørsler") && !pendingHtml.includes("er av") && !pendingHtml.includes("Trenger du hjelp?"), "AK2p: requests exist → no untrue «ingen forespørsler» line (the help line is the shell's)");
       assertEq(dash.GARDSSALG_DASHBOARD_TEXTS["tab.visits"], "Mine besøk", "AK2q: tab texts from tekstpakke OA-3");
 
       // ── AK3: pilot, a profile off the list → 404 ──────────────────────

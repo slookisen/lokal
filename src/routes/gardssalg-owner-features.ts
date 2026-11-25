@@ -583,12 +583,12 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
       const bookings = listProviderBookings(g.provider.id);
       const now = new Date();
       const body = bookings.length === 0
-        ? renderGardssalgMineBesokEmpty(mineBesokEmptyState(g.provider), CLAIM_MANUAL_FALLBACK_EMAIL)
+        ? renderGardssalgMineBesokEmpty(mineBesokEmptyState(g.provider))
         : renderGardssalgMineBesokPage(bookings, now, {
           actionPath: BESOK_PATH(g.slug, "/handling"),
           notice: besokNotice(g.provider, req.query as Record<string, unknown>, now),
         });
-      return res.send(shell(`Mine besøk · ${g.provider.navn}`, wrapGardssalgDashboard(g.slug, "besok", body)));
+      return res.send(shell(`Mine besøk · ${g.provider.navn}`, wrapGardssalgDashboard(g.slug, "besok", body, CLAIM_MANUAL_FALLBACK_EMAIL)));
     } catch (e) {
       return fail("GET besok")(res, e);
     }
@@ -682,8 +682,8 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
     try {
       const g = dashboardGate(req);
       if (!g.ok) return g.send(res);
-      const body = gardssalgStatistikkHtml(g.provider.id) ?? renderGardssalgStatsEmpty(CLAIM_MANUAL_FALLBACK_EMAIL);
-      return res.send(shell(`Statistikk · ${g.provider.navn}`, wrapGardssalgDashboard(g.slug, "statistikk", body)));
+      const body = gardssalgStatistikkHtml(g.provider.id) ?? renderGardssalgStatsEmpty();
+      return res.send(shell(`Statistikk · ${g.provider.navn}`, wrapGardssalgDashboard(g.slug, "statistikk", body, CLAIM_MANUAL_FALLBACK_EMAIL)));
     } catch (e) {
       return fail("GET statistikk")(res, e);
     }
@@ -797,7 +797,7 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
       // the gårdssalg page gets the light-only copy, RFB's stays as it is.
       const body = renderOwnerFeaturesPageBody(model).replace(`<style>${OWNER_PAGE_CSS}</style>`, () => `<style>${OWNER_PAGE_CSS_LIGHT}</style>`);
       // Slice 7: in the shell, no text on the page is smaller than 13px.
-      const pageHtml = inDashboard ? wrapGardssalgDashboard(slug, "valg", body) : body;
+      const pageHtml = inDashboard ? wrapGardssalgDashboard(slug, "valg", body, CLAIM_MANUAL_FALLBACK_EMAIL) : body;
       return res.send(shell(`Mine valg · ${provider.navn}`, `${pageHtml}<style>${GARDSSALG_PAGE_CSS}</style>${inDashboard ? `<style>${GARDSSALG_DASHBOARD_MIN_TEXT_CSS}</style>` : ""}`));
     } catch (e) {
       return fail("GET valg")(res, e);

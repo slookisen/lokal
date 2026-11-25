@@ -1103,7 +1103,7 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
     // inside the shell, sent no-store. Off = the response exactly as before.
     if (dashboardOn) {
       res.setHeader("Cache-Control", "no-store");
-      return res.send(shell(`Eierportal · ${provider.navn}`, wrapGardssalgDashboard(slug, "oversikt", body)));
+      return res.send(shell(`Eierportal · ${provider.navn}`, wrapGardssalgDashboard(slug, "oversikt", body, CLAIM_MANUAL_FALLBACK_EMAIL)));
     }
     return res.send(shell(`Eierportal · ${provider.navn}`, body));
   } catch (err) {

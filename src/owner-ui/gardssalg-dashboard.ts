@@ -91,9 +91,13 @@ export function renderGardssalgDashboardStart(slug: string, current: GardssalgDa
   </nav>`;
 }
 
-/** The page body inside the shell: the menu, then <main id="innhold">. */
-export function wrapGardssalgDashboard(slug: string, current: GardssalgDashboardTab, body: string): string {
-  return `${renderGardssalgDashboardStart(slug, current)}${OWNER_SHELL_MAIN_OPEN}${body}</main>`;
+/**
+ * The page body inside the shell: the menu, then <main id="innhold"> with the
+ * page and, last, «Trenger du hjelp? …» exactly once (the single place the
+ * help line is rendered, so every tab has it and none has it twice).
+ */
+export function wrapGardssalgDashboard(slug: string, current: GardssalgDashboardTab, body: string, contactEmail: string): string {
+  return `${renderGardssalgDashboardStart(slug, current)}${OWNER_SHELL_MAIN_OPEN}${body}<p data-gardssalg-help="1">${gardssalgDashboardHelpHtml(contactEmail)}</p></main>`;
 }
 
 /** «Trenger du hjelp? Skriv til …» with the address as a mailto link. */
@@ -103,11 +107,10 @@ export function gardssalgDashboardHelpHtml(contactEmail: string): string {
 }
 
 /** «Statistikk» in O2-1: the neutral empty state (the numbers come in O2-4). */
-export function renderGardssalgStatsEmpty(contactEmail: string): string {
+export function renderGardssalgStatsEmpty(): string {
   const T = GARDSSALG_DASHBOARD_TEXTS;
   return `<div class="gc-card" data-gardssalg-empty="statistikk">
     <h1>${esc(T["tab.stats"])}</h1>
     <p>${esc(T["empty.stats"])}</p>
-    <p>${gardssalgDashboardHelpHtml(contactEmail)}</p>
   </div>`;
 }
