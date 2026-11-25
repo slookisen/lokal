@@ -29,6 +29,13 @@
  *              card and page; unknown name, owner / import products, an
  *              owner-locked list, a name collision → refused, nothing written;
  *              the listing shows action and product in plain text.
+ *   cqa1-cqa15 add (dev-request 2026-11-25-cs-endringsforesporsel-kan-legge-
+ *              til-varer): add with source owner_reported, the rest byte for
+ *              byte; remove + add in one request; dry run; undo from the
+ *              snapshot; refusals with nothing written; organic gate; never
+ *              restamped / overwritten by scraped catalog input; CS may change
+ *              its own owner_reported products, owner sources still to Daniel;
+ *              an add of an owner catalog product → Daniel; catalog defence.
  *   cqr8-cqr18 second re-review: an Opplevagent removal through the REAL
  *              visibility route blocklists only the plan (never an e-mail,
  *              org.nr or site another active profile uses) and verifies on
@@ -691,7 +698,7 @@ export function runCsChangeRequestsTests(opts: { log?: boolean } = {}): Promise<
             st(cq.createChangeRequest({ vertical: "experiences", targetId: "ep-1", threadId: null, requesterEmail: "hei@siderivest.no", kind: "profile_update", createdBy: "claude", apply: false, products: [{ action: "remove", name: "Sider" }] } as any, { env: ON })),
             st(pCreate(undefined, { changes: { products: "egg" } })),
           ], [400, 400, 400, 400, 400, 400, 400, 400, 400, 422, 422],
-            "cqp6: no adding, a rename needs a different newName, names are non-empty and at most 200, no repeats, a list, profile_update and RFB only");
+            "cqp6: an add needs a category, a rename needs a different newName, names are non-empty and at most 200, no repeats, a list, profile_update and RFB only");
           eq(countRows(), n0, "cqp6b: none of them filed a request");
         }
 
@@ -794,6 +801,274 @@ export function runCsChangeRequestsTests(opts: { log?: boolean } = {}): Promise<
             if (prevKey2 === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = prevKey2;
           }
           eq(cq.describeChanges(JSON.stringify({ phone: "900 11 222", about: "" })), ["phone: «900 11 222»", "tøm about"], "cqp12: field changes read as before in plain text");
+        }
+
+        // ── cqa1-cqa12: add (dev-request 2026-11-25-cs-endringsforesporsel-kan-legge-til-varer) ──
+        {
+          const ks = require("./knowledge-service") as typeof import("./knowledge-service");
+          const catalog = require("./product-catalog-sync") as typeof import("./product-catalog-sync");
+          const catalogRow = (agentId: string, nameNorm: string) =>
+            db.prepare("SELECT name, price_nok, category, source FROM products WHERE agent_id = ? AND name_norm = ?").get(agentId, nameNorm) as any;
+
+          // AK1: add one product; the others are stored byte for byte as before.
+          mkAgent("ag-a", "Nyvaregården", "post@leggtil.no", "https://leggtil.no");
+          const aOrig = [
+            { name: "Gressfôra kjøtt", category: "meat", seasonal: false, price: "250/kg", priceUnit: "kr" },
+            { source: "enrichment", name: "egg", category: "eggs", seasonal: false },
+          ];
+          setProducts("ag-a", aOrig);
+          const tA = mkThread("rfb", "post@leggtil.no");
+          const aCreate = (products: unknown, extra: Record<string, unknown> = {}) => pCreate(products, extra, "ag-a", "post@leggtil.no", tA);
+          const a1 = aCreate([{ action: "add", name: "Honning", category: "honey", price: "kr 120", unit: "glass" }, { action: "add", name: "Syltetøy", category: "preserves" }]);
+          ok(a1.ok && !a1.dryRun && a1.request.status === "queued", "cqa1a: a request to add products is queued");
+          await cq.runCsChangeRequests(deps());
+          const a1row = R(a1.request.id);
+          const aList = productsOf("ag-a");
+          eq([a1row.status, aList.length], ["verified", 4], "cqa1 (AK1): added and verified on card and page");
+          eq(aList.slice(0, 2).map((p: unknown) => JSON.stringify(p)), aOrig.map((p) => JSON.stringify(p)), "cqa1b (AK1): every other product is stored byte for byte as before");
+          eq(aList.slice(2), [
+            { name: "Honning", category: "honey", seasonal: false, price: "kr 120", unit: "glass", source: "owner_reported", reportedVia: `cs_change_request:${a1.request.id}` },
+            { name: "Syltetøy", category: "preserves", seasonal: false, source: "owner_reported", reportedVia: `cs_change_request:${a1.request.id}` },
+          ], "cqa1c (AK1): right name and category, source owner_reported with the request id; the price verbatim, and none when the owner gave none");
+          ok(calls.some((c) => /ag-a\/curated-fields$/.test(c.path) && c.body.field === "products" && c.body.meta?.by === "rfb-customer-service"),
+            "cqa1d (AK3): products is locked after the add (the lock enrichment honours)");
+          const a1verify = JSON.parse(a1row.steps).filter((x: any) => x.step === "verify").pop();
+          eq(a1verify?.detail?.fields?.["vare «Honning» legges til"], "ny_vare_vises_offentlig", "cqa1e: verification read the new product on card and page");
+          eq(cq.describeChanges(a1row.changes), ["legg til vare «Honning» (honey, pris «kr 120», enhet «glass»)", "legg til vare «Syltetøy» (preserves, uten pris)"],
+            "cqa1f: the listing shows the add in plain text");
+          // The real admin write path (non-owner upsertKnowledge) stores the planned list unchanged.
+          {
+            ks.knowledgeService.upsertKnowledge("ag-a", { products: aList, dataSource: "owner" } as any);
+            const canon = (list: any[]) => list.map((p) => JSON.stringify(Object.fromEntries(Object.keys(p).sort().map((k) => [k, p[k]]))));
+            eq(canon(productsOf("ag-a")), canon(aList), "cqa1g (AK3): the admin knowledge write keeps owner_reported (not restamped to enrichment)");
+          }
+
+          // AK1: remove + add in one request («bytt ut lista»), dry run first.
+          mkAgent("ag-s", "Byttegården", "post@byttegarden.no", "https://byttegarden.no");
+          const sOrig = [{ name: "Ved", category: "other", seasonal: false }, { name: "Poteter", category: "vegetables", seasonal: true, months: [8, 9] }];
+          setProducts("ag-s", sOrig);
+          const sRawBefore = rawProducts("ag-s");
+          const tS = mkThread("rfb", "post@byttegarden.no");
+          const sOps = [
+            { action: "remove", name: "Ved" },
+            { action: "remove", name: "Poteter" },
+            { action: "add", name: "Geitost", category: "dairy" },
+            { action: "add", name: "Eplemost", category: "beverages" },
+          ];
+          {
+            const n0 = countRows();
+            const dry = pCreate(sOps, { apply: false }, "ag-s", "post@byttegarden.no", tS);
+            eq([dry.ok, dry.dryRun, dry.plan?.products?.after, dry.plan?.products?.added?.map((p: any) => [p.name, p.category, p.source]), countRows() - n0, rawProducts("ag-s") === sRawBefore],
+              [true, true, ["Geitost", "Eplemost"], [["Geitost", "dairy", "owner_reported"], ["Eplemost", "beverages", "owner_reported"]], 0, true],
+              "cqa2a: the dry run (the default) shows the list as it will be and writes nothing");
+          }
+          const s1 = pCreate(sOps, {}, "ag-s", "post@byttegarden.no", tS);
+          await cq.runCsChangeRequests(deps());
+          const s1row = R(s1.request.id);
+          eq([s1row.status, productsOf("ag-s").map((p: any) => [p.name, p.category, p.source])], ["verified", [["Geitost", "dairy", "owner_reported"], ["Eplemost", "beverages", "owner_reported"]]],
+            "cqa2 (AK1): remove + add in one request gives the new list");
+          // AK5: undo with the snapshot.
+          {
+            const snap = JSON.parse(s1row.snapshot ?? "{}");
+            eq(snap.products?.old, sRawBefore, "cqa3 (AK5): the snapshot keeps the old list exactly as stored");
+            db.prepare("UPDATE agent_knowledge SET products = ? WHERE agent_id = 'ag-s'").run(snap.products.old);
+            eq([rawProducts("ag-s") === sRawBefore, productsOf("ag-s")], [true, sOrig], "cqa3b (AK5): writing the snapshot back gives the old list");
+          }
+
+          // A name a later add brings back (remove + add with another category) verifies.
+          {
+            mkAgent("ag-r", "Omgården", "post@omgarden.no", "https://omgarden.no");
+            setProducts("ag-r", [{ name: "Sylteøy", category: "other", seasonal: false }]);
+            const tR = mkThread("rfb", "post@omgarden.no");
+            const r1 = pCreate([{ action: "remove", name: "Sylteøy" }, { action: "add", name: "Sylteøy", category: "preserves" }], {}, "ag-r", "post@omgarden.no", tR);
+            await cq.runCsChangeRequests(deps());
+            const rv = JSON.parse(R(r1.request.id).steps).filter((x: any) => x.step === "verify").pop();
+            eq([R(r1.request.id).status, productsOf("ag-r").map((p: any) => [p.name, p.category, p.source]), rv?.detail?.fields?.["vare «Sylteøy» fjernes"]],
+              ["verified", [["Sylteøy", "preserves", "owner_reported"]], "erstattet_av_ny_vare"],
+              "cqa4: remove «x» + add «x» (new category) → one product, verified");
+          }
+
+          // AK2: refused, nothing written.
+          {
+            const n0 = countRows();
+            const puts0 = knowledgePuts("ag-a");
+            const before = rawProducts("ag-a");
+            const add = (o: Record<string, unknown>) => ({ action: "add", name: "Gardskunst", category: "other", ...o });
+            const dup = aCreate([add({ name: "Egg" })]);
+            const dupAfterOther = aCreate([{ action: "remove", name: "Syltetøy" }, add({ name: "honning" })]);
+            const st = (x: any) => [x.status, x.error];
+            eq([dup.status, dup.error, dup.detail?.reason, dupAfterOther.error], [422, "product_name_taken", "navnet_finnes_alt", "product_name_taken"],
+              "cqa5 (AK2): a name already in the list (any case) → product_name_taken");
+            const eleven = Array.from({ length: 11 }, (_, i) => add({ name: `Vare ${i + 1}` }));
+            const unknownCat = aCreate([add({ category: "kosmetikk" })]);
+            eq([
+              st(unknownCat),
+              st(aCreate([add({ category: undefined })])),
+              st(aCreate([add({ name: "" })])),
+              st(aCreate([add({ name: " Gardskunst" })])),
+              st(aCreate([add({ name: "Gard\nskunst" })])),
+              st(aCreate([add({ name: "x".repeat(201) })])),
+              st(aCreate(eleven)),
+              st(aCreate([add({ price: "gratis" })])),
+              st(aCreate([add({ price: "" })])),
+              st(aCreate([add({ price: 120 })])),
+              st(aCreate([add({ unit: "" })])),
+              st(aCreate([add({ name: "Honning – kr 120" })])),
+              st(aCreate([add({ name: "HONNING" })])),
+              st(aCreate([add({ newName: "x" })])),
+              st(aCreate([add({}), add({ name: "gardskunst" })])),
+              st(aCreate([{ action: "remove", name: "egg", category: "eggs" }])),
+            ], [
+              ...Array.from({ length: 16 }, () => [400, "invalid_products"]),
+            ], "cqa6 (AK2): unknown or missing category, empty / untrimmed / control-char / too long name, more than 10 ops, a price that is no price, an empty unit, a price or header in the name, stray fields, a repeated add → 400");
+            ok(Array.isArray(unknownCat.detail?.categories) && unknownCat.detail.categories.includes("honey"), "cqa6b: an unknown category is answered with the allowed list");
+            eq([countRows() - n0, knowledgePuts("ag-a") - puts0, rawProducts("ag-a") === before], [0, 0, true], "cqa6c (AK2): nothing is written — no request row, no knowledge write, list unchanged");
+          }
+
+          // Organic gate: an organic product of a producer without a valid Debio status is refused.
+          {
+            const prevGate = process.env.RFB_ORGANIC_CLAIM_GATE;
+            process.env.RFB_ORGANIC_CLAIM_GATE = "1";
+            try {
+              const n0 = countRows();
+              const before = rawProducts("ag-a");
+              const o1 = aCreate([{ action: "add", name: "Økologisk lammekjøtt", category: "meat" }]);
+              eq([o1.status, o1.error, o1.detail?.route_to, countRows() - n0, rawProducts("ag-a") === before], [422, "write_path_would_change_list", "daniel", 0, true],
+                "cqa7: the organic gate applies to new products: refused for Daniel, nothing written");
+            } finally {
+              if (prevGate === undefined) delete process.env.RFB_ORGANIC_CLAIM_GATE; else process.env.RFB_ORGANIC_CLAIM_GATE = prevGate;
+            }
+          }
+
+          // The route: add with its fields passes the strict schema; >10 ops and stray keys are refused.
+          {
+            const prevKey3 = process.env.ADMIN_KEY;
+            process.env.ADMIN_KEY = "test-admin-key";
+            try {
+              const dry = await call("POST", "/change-requests", { vertical: "rfb", targetId: "ag-a", threadId: tA, requesterEmail: "post@leggtil.no", kind: "profile_update", products: [{ action: "add", name: "Gardskunst", category: "other", price: "fra kr 200", unit: "stk" }] });
+              eq([dry.status, dry.body?.dryRun, dry.body?.plan?.products?.after?.slice(-1), dry.body?.plan?.products?.added?.[0]?.price], [200, true, ["Gardskunst"], "fra kr 200"],
+                "cqa8: POST through the route: add is a dry run by default and shows the list after");
+              const bad = await call("POST", "/change-requests", { vertical: "rfb", targetId: "ag-a", threadId: tA, requesterEmail: "post@leggtil.no", kind: "profile_update", products: [{ action: "add", name: "Gardskunst", category: "other", seasonal: true }] });
+              const many = await call("POST", "/change-requests", { vertical: "rfb", targetId: "ag-a", threadId: tA, requesterEmail: "post@leggtil.no", kind: "profile_update", products: Array.from({ length: 11 }, (_, i) => ({ action: "add", name: `V${i}`, category: "other" })) });
+              eq([bad.status, many.status], [400, 400], "cqa8b: an unknown key in an add op, and more than 10 ops, are refused by the route");
+            } finally {
+              if (prevKey3 === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = prevKey3;
+            }
+          }
+
+          // AK3: never restamped, never overwritten by enrichment input in the catalog.
+          {
+            const now = "2026-11-25T12:00:00.000Z";
+            const rep = { name: "Honning", category: "honey", seasonal: false, price: "kr 120", source: "owner_reported" as const, reportedVia: "cs_change_request:chg-1" };
+            const [kept, confirmed, forged] = ks.stampProductSources([rep, { ...rep, confirmedAt: now }, { ...rep, reportedVia: "enrichment-run" }], false, now);
+            eq([kept === rep, confirmed, forged.source], [true, rep, "enrichment"],
+              "cqa9 (AK3): stampProductSources off the owner path keeps owner_reported (drops a confirmation); without a CS reportedVia it is enrichment");
+            const [owned] = ks.stampProductSources([rep], true, now);
+            eq(owned, { name: "Honning", category: "honey", seasonal: false, price: "kr 120", source: "owner_manual", confirmedAt: now }, "cqa9b: the owner saving it in the portal makes it owner_manual");
+            ok(!(ks.OWNER_PRODUCT_SOURCES as readonly string[]).includes("owner_reported") && (ks.PRODUCT_SOURCES as readonly string[]).includes("owner_reported"),
+              "cqa9c: owner_reported is a product source, not one of the owner sources CS must leave alone");
+
+            mkAgent("ag-ac", "Kataloggården to", "post@katalog2.no", "https://katalog2.no");
+            setProducts("ag-ac", [rep, { name: "Egg", category: "eggs", seasonal: false, price: "kr 50" }]);
+            catalog.runProductCatalogSync(db, { agentId: "ag-ac" });
+            eq(catalogRow("ag-ac", "honning"), { name: "Honning", price_nok: 120, category: "honey", source: "owner_reported" }, "cqa10 (AK3): the catalog sync writes source owner_reported (not enrichment)");
+            // Scraped input for the same product (no source, another price and category).
+            setProducts("ag-ac", [{ name: "Honning", category: "other", seasonal: false, price: "kr 300" }, { name: "Egg", category: "eggs", seasonal: false, price: "kr 60" }]);
+            catalog.runProductCatalogSync(db, { agentId: "ag-ac" });
+            eq([catalogRow("ag-ac", "honning"), catalogRow("ag-ac", "egg")?.price_nok], [{ name: "Honning", price_nok: 120, category: "honey", source: "owner_reported" }, 60],
+              "cqa10b (AK3): scraped input never overwrites an owner_reported catalog row (an enrichment row still updates)");
+            // The owner's own word (owner_reported again) still updates it.
+            setProducts("ag-ac", [{ ...rep, price: "kr 140" }]);
+            catalog.runProductCatalogSync(db, { agentId: "ag-ac" });
+            eq(catalogRow("ag-ac", "honning")?.price_nok, 140, "cqa10c: a new owner_reported price updates the row");
+          }
+
+          // AK4: CS may later rename / remove an owner_reported product; owner sources and a locked list still go to Daniel.
+          {
+            catalog.runProductCatalogSync(db, { agentId: "ag-a" }); // the catalog now has owner_reported rows for ag-a
+            const ren = aCreate([{ action: "rename", name: "Honning", newName: "Lynghonning" }]);
+            await cq.runCsChangeRequests(deps());
+            const renamed = productsOf("ag-a").find((p: any) => p.name === "Lynghonning");
+            eq([R(ren.request.id).status, renamed?.source, renamed?.price], ["verified", "owner_reported", "kr 120"], "cqa11 (AK4): CS renames an owner_reported product (source and price kept)");
+            const rem = aCreate([{ action: "remove", name: "Lynghonning" }, { action: "remove", name: "egg" }]);
+            await cq.runCsChangeRequests(deps());
+            eq([R(rem.request.id).status, productsOf("ag-a").map((p: any) => p.name)], ["verified", ["Gressfôra kjøtt", "Syltetøy"]],
+              "cqa11b (AK4): CS removes an owner_reported product, and owner_reported products do not block the rest of the list");
+
+            mkAgent("ag-am", "Manuellgården", "post@manuell.no", "https://manuell.no");
+            setProducts("ag-am", [{ name: "Ost", category: "dairy", seasonal: false, source: "owner_manual", confirmedAt: "2026-11-01T00:00:00Z" }, { name: "Ull", category: "other", seasonal: false }]);
+            const tAm = mkThread("rfb", "post@manuell.no");
+            const am = (products: unknown) => pCreate(products, {}, "ag-am", "post@manuell.no", tAm);
+            const m1 = am([{ action: "remove", name: "Ost" }]);
+            const m2 = am([{ action: "add", name: "Smør", category: "dairy" }]);
+            const tPo2 = mkThread("rfb", "post@eiergarden.no");
+            const i1 = pCreate([{ action: "add", name: "Lammeskank", category: "meat" }], {}, "ag-po", "post@eiergarden.no", tPo2);
+            const i2 = pCreate([{ action: "rename", name: "Lammelår", newName: "Lammelår (fersk)" }], {}, "ag-po", "post@eiergarden.no", tPo2);
+            const tPl2 = mkThread("rfb", "post@lasgarden.no");
+            const l1 = pCreate([{ action: "add", name: "Smør", category: "dairy" }], {}, "ag-pl", "post@lasgarden.no", tPl2);
+            const sum = (x: any) => [x.status, x.error, x.detail?.route_to, x.detail?.why];
+            eq([sum(m1), sum(m2), sum(i1), sum(i2), sum(l1)], [
+              [422, "product_owner_controlled", "daniel", "source:owner_manual"],
+              [422, "product_owner_controlled", "daniel", "varelista_har_varer_fra_eier"],
+              [422, "product_owner_controlled", "daniel", "varelista_har_varer_fra_eier"],
+              [422, "product_owner_controlled", "daniel", "source:owner_import"],
+              [422, "product_owner_controlled", "daniel", "varelista_laast_av_eier"],
+            ], "cqa12 (AK4): owner_manual / owner_import products, a list holding them and an owner-locked list still go to Daniel — also for add");
+          }
+
+          // B1: an add of a name the owner set in the catalog (portal «Legg til vare» / stock) goes to Daniel.
+          {
+            mkAgent("ag-ab", "Portalgården", "post@portalgarden.no", "https://portalgarden.no");
+            setProducts("ag-ab", [{ name: "Ull", category: "other", seasonal: false }]);
+            db.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, category, source, availability_source) VALUES ('pr-ab1', 'ag-ab', 'Smør', 'smør', 150, 'dairy', 'owner', 'producer_dashboard')").run();
+            const tAb = mkThread("rfb", "post@portalgarden.no");
+            const n0 = countRows();
+            const before = rawProducts("ag-ab");
+            const b1 = pCreate([{ action: "add", name: "Smør", category: "dairy", price: "kr 90" }], {}, "ag-ab", "post@portalgarden.no", tAb);
+            const b2 = pCreate([{ action: "add", name: "smør", category: "other" }], { apply: false }, "ag-ab", "post@portalgarden.no", tAb);
+            await cq.runCsChangeRequests(deps());
+            eq([b1.status, b1.error, b1.detail?.route_to, b1.detail?.why, b1.detail?.name, b2.error, countRows() - n0, rawProducts("ag-ab") === before],
+              [422, "product_owner_controlled", "daniel", "katalog_source:owner", "Smør", "product_owner_controlled", 0, true],
+              "cqa13 (B1): an add of a product the owner added in the portal (only in the catalog) is refused for Daniel, nothing written");
+            catalog.runProductCatalogSync(db, { agentId: "ag-ab" });
+            eq(catalogRow("ag-ab", "smør"), { name: "Smør", price_nok: 150, category: "dairy", source: "owner" }, "cqa13b (B1): the owner's catalog price stays");
+          }
+
+          // Defence in depth: incoming owner_reported never overwrites what the owner set in the catalog.
+          {
+            mkAgent("ag-ad", "Forsvarsgården", "post@forsvar.no", "https://forsvar.no");
+            const ins = db.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, category, source, availability_source, owner_confirmed_at) VALUES (?, 'ag-ad', ?, ?, ?, 'dairy', ?, ?, ?)");
+            ins.run("pr-d1", "Smør", "smør", 150, "owner", "enrichment", null);
+            ins.run("pr-d2", "Ost", "ost", 150, "owner_manual", "enrichment", null);
+            ins.run("pr-d3", "Rømme", "rømme", 150, "enrichment", "producer_dashboard", null);
+            ins.run("pr-d4", "Fløte", "fløte", 150, "enrichment", "admin_producer_confirmed", null);
+            ins.run("pr-d5", "Kefir", "kefir", 150, "enrichment", "enrichment", "2026-11-01T00:00:00Z");
+            ins.run("pr-d6", "Myse", "myse", 150, "enrichment", "enrichment", null);
+            const rep = (name: string) => ({ name, category: "other", seasonal: false, price: "kr 90", source: "owner_reported", reportedVia: "cs_change_request:chg-x" });
+            setProducts("ag-ad", ["Smør", "Ost", "Rømme", "Fløte", "Kefir", "Myse"].map(rep));
+            catalog.runProductCatalogSync(db, { agentId: "ag-ad" });
+            const pr = (n: string) => { const r = catalogRow("ag-ad", n); return [r?.price_nok, r?.source]; };
+            eq([pr("smør"), pr("ost"), pr("rømme"), pr("fløte"), pr("kefir"), pr("myse")],
+              [[150, "owner"], [150, "owner_manual"], [150, "enrichment"], [150, "enrichment"], [150, "enrichment"], [90, "owner_reported"]],
+              "cqa14: the catalog sync never lets owner_reported replace an owner row, owner stock, an admin-confirmed price or an owner confirmation (an enrichment row still updates)");
+          }
+
+          // N2: an added product not yet on the public surfaces stays executed.
+          {
+            mkAgent("ag-av", "Ventegården", "post@ventegarden.no", "https://ventegarden.no");
+            setProducts("ag-av", []);
+            const tAv = mkThread("rfb", "post@ventegarden.no");
+            const v1 = pCreate([{ action: "add", name: "Rabarbra", category: "vegetables" }], {}, "ag-av", "post@ventegarden.no", tAv);
+            staleSurface = true;
+            await cq.runCsChangeRequests(deps());
+            staleSurface = false;
+            const vStale = R(v1.request.id);
+            const vStep = JSON.parse(vStale.steps).filter((x: any) => x.step === "verify").pop();
+            eq([vStale.status, vStep?.detail?.fields?.["vare «Rabarbra» legges til"]], ["executed", "ikke_synlig_ennaa"],
+              "cqa15: an add stored but not yet on card / page stays executed (ikke_synlig_ennaa)");
+            await cq.runCsChangeRequests(deps());
+            eq(R(v1.request.id).status, "verified", "cqa15b: verified once it shows");
+          }
         }
       }
     } catch (err: any) {

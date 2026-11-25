@@ -57,7 +57,7 @@
 
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
-import { parseProductPrice, productPriceText, isProductHeader, isProductNoise, PRODUCT_SOURCES, OWNER_PRODUCT_SOURCES, type ProductSource } from "./knowledge-service";
+import { parseProductPrice, productPriceText, isProductHeader, isProductNoise, PRODUCT_SOURCES, OWNER_PRODUCT_SOURCES, OWNER_STATED_SOURCES, type ProductSource } from "./knowledge-service";
 
 // ─── Price string → numeric NOK ──────────────────────────────────────────
 // Parses "kr 275/kg", "kr 275", "275" → 275.0; null if unparseable.
@@ -167,11 +167,26 @@ export function runProductCatalogSync(db?: any, opts: { agentId?: string } = {})
   // protected regardless of where the incoming price comes from. A price the
   // owner supplied themselves (owner_manual / owner_import / owner_auto_sync) is
   // the owner's only route to change price_nok, so it updates as before.
-  const ownerSourceList = OWNER_PRODUCT_SOURCES.map((s) => `'${s}'`).join(", ");
+  // dev-request 2026-11-25-cs-endringsforesporsel-kan-legge-til-varer: an
+  // `owner_reported` product (the owner told customer service) is the owner's
+  // word too: as incoming it updates like the owner sources, and a row it
+  // wrote ('owner_reported') keeps its price, category and provenance against
+  // scraped input, like a B1 'owner' row.
+  const ownerSourceList = OWNER_STATED_SOURCES.map((s) => `'${s}'`).join(", ");
   const scrapedIncoming = `(excluded.source IS NULL OR excluded.source NOT IN (${ownerSourceList}))`;
+  // Defence in depth: incoming owner_reported (customer service, on the
+  // owner's word by e-mail) never replaces what the owner set themselves — a
+  // row with an owner source, owner-confirmed stock or price, or an owner
+  // confirmation. cs-change-requests refuses such an add already.
+  const ownerRowSources = ["owner", ...OWNER_PRODUCT_SOURCES].map((s) => `'${s}'`).join(", ");
+  const reportedOverOwnerRow = `(excluded.source = 'owner_reported'
+                            AND (products.source IN (${ownerRowSources})
+                                 OR products.availability_source IN ('producer_dashboard', 'admin_producer_confirmed')
+                                 OR products.owner_confirmed_at IS NOT NULL))`;
   const keepOwnerPrice = `(products.availability_source = 'admin_producer_confirmed'
+                        OR ${reportedOverOwnerRow}
                         OR (${scrapedIncoming}
-                            AND (products.availability_source = 'producer_dashboard' OR products.source = 'owner')))`;
+                            AND (products.availability_source = 'producer_dashboard' OR products.source IN ('owner', 'owner_reported'))))`;
   const newPrice = `CASE WHEN ${keepOwnerPrice} THEN products.price_nok
                         WHEN excluded.price_nok IS NOT NULL THEN excluded.price_nok ELSE products.price_nok END`;
   const newCategory = `CASE WHEN ${keepOwnerPrice} THEN products.category

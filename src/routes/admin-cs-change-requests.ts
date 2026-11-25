@@ -38,9 +38,21 @@ const createSchema = z.object({
   requesterEmail: z.string().email(),
   kind: z.enum(["profile_update", "removal"]),
   changes: z.record(z.string(), z.string().max(4000)).optional(),
-  // RFB: remove / rename named products; checked in full by the service.
+  // RFB: remove / rename / add named products; checked in full by the service.
   products: z
-    .array(z.object({ action: z.enum(["remove", "rename"]), name: z.string().max(200), newName: z.string().max(200).optional() }).strict())
+    .array(
+      z
+        .object({
+          action: z.enum(["remove", "rename", "add"]),
+          name: z.string().max(200),
+          newName: z.string().max(200).optional(),
+          // add only (dev-request 2026-11-25-cs-endringsforesporsel-kan-legge-til-varer)
+          category: z.string().max(40).optional(),
+          price: z.string().max(100).optional(),
+          unit: z.string().max(40).optional(),
+        })
+        .strict(),
+    )
     .min(1)
     .max(10)
     .optional(),

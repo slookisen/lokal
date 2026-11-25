@@ -36,8 +36,19 @@ import { marketplaceRegistry } from "./marketplace-registry";
 import { recordRun } from "./run-ledger";
 import { EnvelopeBuilder } from "../types/run-envelope";
 import type { CrmVertical } from "./crm-service";
-import { knowledgeService, stampProductSources, OWNER_PRODUCT_SOURCES, type ProductInfo } from "./knowledge-service";
-import { normalizeName } from "./product-catalog-sync";
+import {
+  knowledgeService,
+  stampProductSources,
+  OWNER_PRODUCT_SOURCES,
+  OWNER_REPORTED_SOURCE,
+  CS_REPORTED_VIA_PREFIX,
+  parseProductPrice,
+  isProductHeader,
+  isProductNoise,
+  type ProductInfo,
+} from "./knowledge-service";
+import { normalizeName, parsePriceNok } from "./product-catalog-sync";
+import { PLATFORM_CATEGORIES } from "./search-enrich";
 import { gateOrganicProductsForWrite, hasValidDebioStatus, organicClaimGateEnabled } from "./description-quality";
 import { readDebioVerified } from "./debio-approval";
 
@@ -144,25 +155,48 @@ export function supportedFields(vertical: ChangeVertical): string[] {
 // `name` is the product's exact stored name. The server reads the stored
 // list, applies the ops, and writes the WHOLE list back (a list in a
 // knowledge write replaces the stored one), so every other product is kept
-// exactly as stored. No adding: a new product needs a source.
+// exactly as stored.
+//
+// dev-request 2026-11-25-cs-endringsforesporsel-kan-legge-til-varer adds
+//   { action: "add", name, category, price?, unit? } — a product the owner
+// named in the e-mail. Its source is `owner_reported` (the owner told CS),
+// with `reportedVia: "cs_change_request:<id>"` (the request row holds the
+// sender). The category is one of the platform categories (PLATFORM_CATEGORIES,
+// the list enrichment and admin knowledge use); a price is stored only when
+// the owner gave one, verbatim, and must read as a price (parsePriceNok, the
+// catalog's parser of the stored price text). Ops of all three kinds mix and
+// run in order, so «replace the list» is remove + add in one request.
 //
 // A product the owner stated (source owner_manual / owner_import /
 // owner_auto_sync, an owner confirmation, an owner-set row in the product
 // catalog) is not CS's to change: such a request is refused, for Daniel.
 // So is any request on a list the owner locked, or a list that carries owner
 // products at all — the admin write path would restamp those as enrichment.
+// An `owner_reported` product is CS's own entry on the owner's word: CS may
+// remove or rename it later, and it does not block the list.
 //
 // The ops are stored in `changes` under the key `products`; the old list is
 // kept in the snapshot (`snapshot.products.old`) so the change can be undone.
 
-export type ProductAction = "remove" | "rename";
+export type ProductAction = "remove" | "rename" | "add";
 export interface ProductOp {
   action: ProductAction;
   name: string;
   newName?: string;
+  /** add only: a platform category (PLATFORM_CATEGORIES). */
+  category?: string;
+  /** add only: the owner's price text, verbatim. */
+  price?: string;
+  /** add only: the owner's unit, verbatim. */
+  unit?: string;
 }
 export const PRODUCT_NAME_MAX = 200;
 export const PRODUCT_OPS_MAX = 10;
+export const PRODUCT_PRICE_MAX = 100;
+export const PRODUCT_UNIT_MAX = 40;
+/** The categories an added product may have: the platform's own list. */
+export const PRODUCT_CATEGORIES: readonly string[] = PLATFORM_CATEGORIES;
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
 
 /** Who to send a refused product request to. */
 const PRODUCTS_TO_DANIEL = "daniel";
@@ -176,13 +210,24 @@ export function validateProductOps(raw: unknown): { ok: true; ops: ProductOp[] }
   if (raw.length > PRODUCT_OPS_MAX) return bad({ reason: `høyst ${PRODUCT_OPS_MAX} endringer på varer per forespørsel` });
   const ops: ProductOp[] = [];
   const seen = new Set<string>();
+  const added = new Set<string>();
   for (let i = 0; i < raw.length; i++) {
     const o = raw[i] as Record<string, unknown> | null;
     if (!o || typeof o !== "object" || Array.isArray(o)) return bad({ index: i, reason: "hver endring er et objekt" });
     const action = o.action;
-    if (action !== "remove" && action !== "rename") return bad({ index: i, reason: "action er remove eller rename (å legge til varer er ikke med)" });
+    if (action !== "remove" && action !== "rename" && action !== "add") return bad({ index: i, reason: "action er remove, rename eller add" });
     const name = o.name;
-    if (typeof name !== "string" || name.trim() === "" || name.length > PRODUCT_NAME_MAX) return bad({ index: i, reason: `name er varens lagrede navn (1–${PRODUCT_NAME_MAX} tegn)` });
+    if (typeof name !== "string" || name.trim() === "" || name.length > PRODUCT_NAME_MAX) return bad({ index: i, reason: `name er varens navn (1–${PRODUCT_NAME_MAX} tegn)` });
+    if (action === "add") {
+      const v = validateAddOp(o, name);
+      if (typeof v === "string") return bad({ index: i, reason: v, ...(v.startsWith("category") ? { categories: PRODUCT_CATEGORIES } : {}) });
+      const key = normalizeName(name);
+      if (added.has(key)) return bad({ index: i, reason: "samme nye vare to ganger i én forespørsel" });
+      added.add(key);
+      ops.push(v);
+      continue;
+    }
+    for (const k of ["category", "price", "unit"]) if (o[k] !== undefined) return bad({ index: i, reason: `${k} hører bare til add` });
     if (seen.has(name)) return bad({ index: i, reason: "samme vare to ganger i én forespørsel" });
     seen.add(name);
     if (action === "remove") {
@@ -192,11 +237,59 @@ export function validateProductOps(raw: unknown): { ok: true; ops: ProductOp[] }
     }
     const newName = o.newName;
     if (typeof newName !== "string" || newName.trim() === "" || newName.length > PRODUCT_NAME_MAX) return bad({ index: i, reason: `newName er det nye navnet (1–${PRODUCT_NAME_MAX} tegn)` });
-    if (newName !== newName.trim() || /[\u0000-\u001f\u007f]/.test(newName)) return bad({ index: i, reason: "newName uten mellomrom i endene og uten linjeskift" });
+    if (newName !== newName.trim() || CONTROL_CHARS.test(newName)) return bad({ index: i, reason: "newName uten mellomrom i endene og uten linjeskift" });
     if (newName === name) return bad({ index: i, reason: "newName er det samme som name" });
     ops.push({ action, name, newName });
   }
   return { ok: true, ops };
+}
+
+/** An add op's fields, or the reason it is refused. */
+function validateAddOp(o: Record<string, unknown>, name: string): ProductOp | string {
+  if (o.newName !== undefined) return "newName hører bare til rename";
+  if (name !== name.trim() || CONTROL_CHARS.test(name)) return "name uten mellomrom i endene og uten linjeskift";
+  // The write path and every reader would read such a name as something else:
+  // a section header («HONNING»), a note / divider, or a name with its price.
+  if (isProductHeader(name) || isProductNoise(name)) return "name leses som en overskrift eller merknad, ikke en vare";
+  const parsed = parseProductPrice({ name } as ProductInfo);
+  if (parsed.price !== null || parsed.cleanName !== name) return "name inneholder en pris — prisen går i price";
+  const category = o.category;
+  if (typeof category !== "string" || !PRODUCT_CATEGORIES.includes(category)) return `category er en av plattformens kategorier: ${PRODUCT_CATEGORIES.join(", ")}`;
+  const op: ProductOp = { action: "add", name, category };
+  if (o.price !== undefined) {
+    const price = o.price;
+    if (typeof price !== "string" || price.trim() === "" || price !== price.trim() || price.length > PRODUCT_PRICE_MAX || CONTROL_CHARS.test(price)) {
+      return `price er eierens pris som tekst (1–${PRODUCT_PRICE_MAX} tegn, uten mellomrom i endene)`;
+    }
+    if (parsePriceNok(price) === null) return "price kan ikke leses som en pris (for eksempel «kr 120», «250/kg»)";
+    op.price = price;
+  }
+  if (o.unit !== undefined) {
+    const unit = o.unit;
+    if (typeof unit !== "string" || unit.trim() === "" || unit !== unit.trim() || unit.length > PRODUCT_UNIT_MAX || CONTROL_CHARS.test(unit)) {
+      return `unit er eierens enhet som tekst (1–${PRODUCT_UNIT_MAX} tegn, uten mellomrom i endene)`;
+    }
+    op.unit = unit;
+  }
+  return op;
+}
+
+/** The product entry an add op stores: only what the owner gave, with its source. */
+export function addedProductEntry(op: ProductOp, reportedVia: string): ProductInfo {
+  return {
+    name: op.name,
+    category: op.category!,
+    seasonal: false,
+    ...(op.price !== undefined ? { price: op.price } : {}),
+    ...(op.unit !== undefined ? { unit: op.unit } : {}),
+    source: OWNER_REPORTED_SOURCE,
+    reportedVia,
+  };
+}
+
+/** `reportedVia` for the products a change request adds. */
+export function reportedViaFor(requestId: string): string {
+  return `${CS_REPORTED_VIA_PREFIX}${requestId}`;
 }
 
 function productNameOf(p: unknown): string | null {
@@ -264,8 +357,11 @@ export function loadProductState(agentId: string): ProductState {
   return { raw, list, ownerLockedList, ownerCatalog };
 }
 
-/** Apply the ops to a stored list. PURE apart from what `state` carries. */
-export function planProductOps(state: ProductState, ops: ProductOp[]): { ok: true; next: unknown[] } | ProductPlanError {
+/**
+ * Apply the ops, in order, to a stored list. PURE apart from what `state`
+ * carries. `reportedVia` is stamped on the products an add creates.
+ */
+export function planProductOps(state: ProductState, ops: ProductOp[], reportedVia: string): { ok: true; next: unknown[] } | ProductPlanError {
   const toDaniel = (why: string, extra: Record<string, unknown> = {}): ProductPlanError => ({
     ok: false,
     status: 422,
@@ -278,6 +374,15 @@ export function planProductOps(state: ProductState, ops: ProductOp[]): { ok: tru
   const ownerCatalog = state.ownerCatalog;
   // The target itself first (the clearer reason), then the rest of the list.
   for (const op of ops) {
+    if (op.action === "add") {
+      // No stored target; the list name is checked in order below. A product
+      // the owner added in the portal («Legg til vare») or set stock / price
+      // for lives only in the catalog: an add of that name is the owner's
+      // product, for Daniel (never a second, CS-written price for it).
+      const prov = ownerCatalog.get(normalizeName(op.name));
+      if (prov) return toDaniel(prov, { name: op.name });
+      continue;
+    }
     const hits = state.list.filter((p) => productNameOf(p) === op.name);
     if (hits.length === 0) {
       return {
@@ -296,6 +401,14 @@ export function planProductOps(state: ProductState, ops: ProductOp[]): { ok: tru
 
   let next: unknown[] = [...state.list];
   for (const op of ops) {
+    if (op.action === "add") {
+      const key = normalizeName(op.name);
+      if (next.some((p) => normalizeName(productNameOf(p) ?? "") === key)) {
+        return { ok: false, status: 422, error: "product_name_taken", detail: { reason: "navnet_finnes_alt", name: op.name } };
+      }
+      next = [...next, addedProductEntry(op, reportedVia)];
+      continue;
+    }
     const i = next.findIndex((p) => productNameOf(p) === op.name);
     if (i < 0) return { ok: false, status: 422, error: "product_not_found", detail: { reason: "ukjent_vare", name: op.name } };
     if (op.action === "remove") {
@@ -367,7 +480,13 @@ export function describeChanges(raw: string | null | undefined): string[] {
   const clip = (s: string) => (s.length > 200 ? `${s.slice(0, 200)}…` : s);
   return [
     ...Object.entries(fields).map(([k, v]) => (v.trim() === "" ? `tøm ${k}` : `${k}: «${clip(v)}»`)),
-    ...products.map((o) => (o.action === "remove" ? `fjern vare «${o.name}»` : `endre navn på vare «${o.name}» til «${o.newName ?? ""}»`)),
+    ...products.map((o) =>
+      o.action === "remove"
+        ? `fjern vare «${o.name}»`
+        : o.action === "add"
+          ? `legg til vare «${o.name}» (${[o.category ?? "", o.price !== undefined ? `pris «${o.price}»` : "uten pris", ...(o.unit !== undefined ? [`enhet «${o.unit}»`] : [])].join(", ")})`
+          : `endre navn på vare «${o.name}» til «${o.newName ?? ""}»`,
+    ),
   ];
 }
 
@@ -670,6 +789,8 @@ export function createChangeRequest(input: CreateChangeRequestInput, deps: { env
   const target = loadTarget(input.vertical, input.targetId);
   if (!target) return { ok: false, status: 404, error: "target_not_found" };
   const changes = input.changes ?? {};
+  // The id comes first: an added product names the request it came with.
+  const id = `chg-${randomUUID()}`;
   let productOps: ProductOp[] = [];
   let productsAfter: unknown[] | null = null;
   if (input.products !== undefined && input.products !== null) {
@@ -678,8 +799,18 @@ export function createChangeRequest(input: CreateChangeRequestInput, deps: { env
     const v = validateProductOps(input.products);
     if (!v.ok) return v;
     productOps = v.ops;
-    const plan = planProductOps(loadProductState(target.id), productOps);
+    const plan = planProductOps(loadProductState(target.id), productOps, reportedViaFor(id));
     if (!plan.ok) return plan;
+    // A new product passes the write path's gates (the organic gate, price
+    // parsing) unchanged, or the request is refused now — the dry run shows
+    // the list as it will be stored. (Re-checked at execution.)
+    if (productOps.some((o) => o.action === "add")) {
+      const written = productsAsWritten(target.id, plan.next);
+      if (!written.ok || !sameJson(written.stored, plan.next)) {
+        const why = written.ok ? "skrivestien_ville_endret_varer" : written.why;
+        return { ok: false, status: 422, error: "write_path_would_change_list", detail: { reason: why, route_to: PRODUCTS_TO_DANIEL } };
+      }
+    }
     productsAfter = plan.next;
   }
   if (input.kind === "profile_update") {
@@ -721,7 +852,13 @@ export function createChangeRequest(input: CreateChangeRequestInput, deps: { env
     kind: input.kind,
     changes: input.kind === "profile_update" ? changes : undefined,
     products: productOps.length
-      ? { ops: productOps, text: describeChanges(JSON.stringify({ products: productOps })), after: (productsAfter ?? []).map(productNameOf) }
+      ? {
+          ops: productOps,
+          text: describeChanges(JSON.stringify({ products: productOps })),
+          after: (productsAfter ?? []).map(productNameOf),
+          // The new products exactly as they will be stored.
+          added: (productsAfter ?? []).filter((p) => !!p && typeof p === "object" && (p as ProductInfo).reportedVia === reportedViaFor(id)),
+        }
       : undefined,
     authority: auth.authority,
     would_be: status,
@@ -738,7 +875,6 @@ export function createChangeRequest(input: CreateChangeRequestInput, deps: { env
   };
   if (!input.apply) return { ok: true, dryRun: true, plan };
 
-  const id = `chg-${randomUUID()}`;
   const ts = now.toISOString();
   getDb()
     .prepare(
@@ -958,7 +1094,7 @@ async function executeProfileUpdate(r: ChangeRequestRow, deps: ExecDeps): Promis
     };
     if (r.vertical !== "rfb") return fail("products_rfb_only", { error: "products_rfb_only" });
     const state = loadProductState(r.target_id);
-    let plan: ReturnType<typeof planProductOps> = planProductOps(state, productOps);
+    let plan: ReturnType<typeof planProductOps> = planProductOps(state, productOps, reportedViaFor(r.id));
     // The first attempt already wrote the list: write the same list again.
     if (!plan.ok && prior?.products && Array.isArray(prior.products.new) && sameJson(state.list, prior.products.new)) plan = { ok: true, next: prior.products.new };
     if (!plan.ok) return fail(`${plan.error} ${JSON.stringify(plan.detail)}`, { error: plan.error, ...plan.detail });
@@ -1142,19 +1278,29 @@ function verifyProducts(agentId: string, ops: ProductOp[], expected: unknown, s:
     if (otherText.includes(normText(name))) return "kortet"; // the page cannot tell
     return valueShows("products", name, page) ? null : "siden";
   };
+  // A name a later add brings back (remove «x» + add «x» with a new category)
+  // stays on the card and the page: the stored list alone decides for it.
+  const readded = new Set(ops.filter((o) => o.action === "add").map((o) => normalizeName(o.name)));
   let ok = true;
   for (const op of ops) {
-    const key = op.action === "remove" ? `vare «${op.name}» fjernes` : `vare «${op.name}» → «${op.newName}»`;
+    const key = op.action === "remove" ? `vare «${op.name}» fjernes` : op.action === "add" ? `vare «${op.name}» legges til` : `vare «${op.name}» → «${op.newName}»`;
     if (!stored) {
       results[key] = "ikke_lagret";
       ok = false;
       continue;
     }
-    const oldOnCard = cardNames.has(normalizeName(op.name));
-    const gone = goneFromPage(op.name);
+    if (op.action === "add") {
+      const done = cardNames.has(normalizeName(op.name)) && valueShows("products", op.name, page);
+      results[key] = done ? "ny_vare_vises_offentlig" : "ikke_synlig_ennaa";
+      ok = ok && done;
+      continue;
+    }
+    const oldReadded = readded.has(normalizeName(op.name));
+    const oldOnCard = !oldReadded && cardNames.has(normalizeName(op.name));
+    const gone = oldReadded ? "kortet" : goneFromPage(op.name);
     if (op.action === "remove") {
       const done = !oldOnCard && gone !== null;
-      results[key] = done ? (gone === "kortet" ? "fjernet (kortet; navnet står ellers i profilen)" : "fjernet_fra_siden") : "vises_fortsatt";
+      results[key] = done ? (oldReadded ? "erstattet_av_ny_vare" : gone === "kortet" ? "fjernet (kortet; navnet står ellers i profilen)" : "fjernet_fra_siden") : "vises_fortsatt";
       ok = ok && done;
       continue;
     }
