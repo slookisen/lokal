@@ -174,7 +174,17 @@ export function runProductCatalogSync(db?: any, opts: { agentId?: string } = {})
   // scraped input, like a B1 'owner' row.
   const ownerSourceList = OWNER_STATED_SOURCES.map((s) => `'${s}'`).join(", ");
   const scrapedIncoming = `(excluded.source IS NULL OR excluded.source NOT IN (${ownerSourceList}))`;
+  // Defence in depth: incoming owner_reported (customer service, on the
+  // owner's word by e-mail) never replaces what the owner set themselves — a
+  // row with an owner source, owner-confirmed stock or price, or an owner
+  // confirmation. cs-change-requests refuses such an add already.
+  const ownerRowSources = ["owner", ...OWNER_PRODUCT_SOURCES].map((s) => `'${s}'`).join(", ");
+  const reportedOverOwnerRow = `(excluded.source = 'owner_reported'
+                            AND (products.source IN (${ownerRowSources})
+                                 OR products.availability_source IN ('producer_dashboard', 'admin_producer_confirmed')
+                                 OR products.owner_confirmed_at IS NOT NULL))`;
   const keepOwnerPrice = `(products.availability_source = 'admin_producer_confirmed'
+                        OR ${reportedOverOwnerRow}
                         OR (${scrapedIncoming}
                             AND (products.availability_source = 'producer_dashboard' OR products.source IN ('owner', 'owner_reported'))))`;
   const newPrice = `CASE WHEN ${keepOwnerPrice} THEN products.price_nok

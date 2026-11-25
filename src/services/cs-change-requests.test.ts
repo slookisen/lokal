@@ -29,12 +29,13 @@
  *              card and page; unknown name, owner / import products, an
  *              owner-locked list, a name collision → refused, nothing written;
  *              the listing shows action and product in plain text.
- *   cqa1-cqa12 add (dev-request 2026-11-25-cs-endringsforesporsel-kan-legge-
+ *   cqa1-cqa15 add (dev-request 2026-11-25-cs-endringsforesporsel-kan-legge-
  *              til-varer): add with source owner_reported, the rest byte for
  *              byte; remove + add in one request; dry run; undo from the
  *              snapshot; refusals with nothing written; organic gate; never
  *              restamped / overwritten by scraped catalog input; CS may change
- *              its own owner_reported products, owner sources still to Daniel.
+ *              its own owner_reported products, owner sources still to Daniel;
+ *              an add of an owner catalog product → Daniel; catalog defence.
  *   cqr8-cqr18 second re-review: an Opplevagent removal through the REAL
  *              visibility route blocklists only the plan (never an e-mail,
  *              org.nr or site another active profile uses) and verifies on
@@ -1013,6 +1014,60 @@ export function runCsChangeRequestsTests(opts: { log?: boolean } = {}): Promise<
               [422, "product_owner_controlled", "daniel", "source:owner_import"],
               [422, "product_owner_controlled", "daniel", "varelista_laast_av_eier"],
             ], "cqa12 (AK4): owner_manual / owner_import products, a list holding them and an owner-locked list still go to Daniel — also for add");
+          }
+
+          // B1: an add of a name the owner set in the catalog (portal «Legg til vare» / stock) goes to Daniel.
+          {
+            mkAgent("ag-ab", "Portalgården", "post@portalgarden.no", "https://portalgarden.no");
+            setProducts("ag-ab", [{ name: "Ull", category: "other", seasonal: false }]);
+            db.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, category, source, availability_source) VALUES ('pr-ab1', 'ag-ab', 'Smør', 'smør', 150, 'dairy', 'owner', 'producer_dashboard')").run();
+            const tAb = mkThread("rfb", "post@portalgarden.no");
+            const n0 = countRows();
+            const before = rawProducts("ag-ab");
+            const b1 = pCreate([{ action: "add", name: "Smør", category: "dairy", price: "kr 90" }], {}, "ag-ab", "post@portalgarden.no", tAb);
+            const b2 = pCreate([{ action: "add", name: "smør", category: "other" }], { apply: false }, "ag-ab", "post@portalgarden.no", tAb);
+            await cq.runCsChangeRequests(deps());
+            eq([b1.status, b1.error, b1.detail?.route_to, b1.detail?.why, b1.detail?.name, b2.error, countRows() - n0, rawProducts("ag-ab") === before],
+              [422, "product_owner_controlled", "daniel", "katalog_source:owner", "Smør", "product_owner_controlled", 0, true],
+              "cqa13 (B1): an add of a product the owner added in the portal (only in the catalog) is refused for Daniel, nothing written");
+            catalog.runProductCatalogSync(db, { agentId: "ag-ab" });
+            eq(catalogRow("ag-ab", "smør"), { name: "Smør", price_nok: 150, category: "dairy", source: "owner" }, "cqa13b (B1): the owner's catalog price stays");
+          }
+
+          // Defence in depth: incoming owner_reported never overwrites what the owner set in the catalog.
+          {
+            mkAgent("ag-ad", "Forsvarsgården", "post@forsvar.no", "https://forsvar.no");
+            const ins = db.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, category, source, availability_source, owner_confirmed_at) VALUES (?, 'ag-ad', ?, ?, ?, 'dairy', ?, ?, ?)");
+            ins.run("pr-d1", "Smør", "smør", 150, "owner", "enrichment", null);
+            ins.run("pr-d2", "Ost", "ost", 150, "owner_manual", "enrichment", null);
+            ins.run("pr-d3", "Rømme", "rømme", 150, "enrichment", "producer_dashboard", null);
+            ins.run("pr-d4", "Fløte", "fløte", 150, "enrichment", "admin_producer_confirmed", null);
+            ins.run("pr-d5", "Kefir", "kefir", 150, "enrichment", "enrichment", "2026-11-01T00:00:00Z");
+            ins.run("pr-d6", "Myse", "myse", 150, "enrichment", "enrichment", null);
+            const rep = (name: string) => ({ name, category: "other", seasonal: false, price: "kr 90", source: "owner_reported", reportedVia: "cs_change_request:chg-x" });
+            setProducts("ag-ad", ["Smør", "Ost", "Rømme", "Fløte", "Kefir", "Myse"].map(rep));
+            catalog.runProductCatalogSync(db, { agentId: "ag-ad" });
+            const pr = (n: string) => { const r = catalogRow("ag-ad", n); return [r?.price_nok, r?.source]; };
+            eq([pr("smør"), pr("ost"), pr("rømme"), pr("fløte"), pr("kefir"), pr("myse")],
+              [[150, "owner"], [150, "owner_manual"], [150, "enrichment"], [150, "enrichment"], [150, "enrichment"], [90, "owner_reported"]],
+              "cqa14: the catalog sync never lets owner_reported replace an owner row, owner stock, an admin-confirmed price or an owner confirmation (an enrichment row still updates)");
+          }
+
+          // N2: an added product not yet on the public surfaces stays executed.
+          {
+            mkAgent("ag-av", "Ventegården", "post@ventegarden.no", "https://ventegarden.no");
+            setProducts("ag-av", []);
+            const tAv = mkThread("rfb", "post@ventegarden.no");
+            const v1 = pCreate([{ action: "add", name: "Rabarbra", category: "vegetables" }], {}, "ag-av", "post@ventegarden.no", tAv);
+            staleSurface = true;
+            await cq.runCsChangeRequests(deps());
+            staleSurface = false;
+            const vStale = R(v1.request.id);
+            const vStep = JSON.parse(vStale.steps).filter((x: any) => x.step === "verify").pop();
+            eq([vStale.status, vStep?.detail?.fields?.["vare «Rabarbra» legges til"]], ["executed", "ikke_synlig_ennaa"],
+              "cqa15: an add stored but not yet on card / page stays executed (ikke_synlig_ennaa)");
+            await cq.runCsChangeRequests(deps());
+            eq(R(v1.request.id).status, "verified", "cqa15b: verified once it shows");
           }
         }
       }

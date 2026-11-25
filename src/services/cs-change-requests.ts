@@ -361,7 +361,7 @@ export function loadProductState(agentId: string): ProductState {
  * Apply the ops, in order, to a stored list. PURE apart from what `state`
  * carries. `reportedVia` is stamped on the products an add creates.
  */
-export function planProductOps(state: ProductState, ops: ProductOp[], reportedVia: string = reportedViaFor("pending")): { ok: true; next: unknown[] } | ProductPlanError {
+export function planProductOps(state: ProductState, ops: ProductOp[], reportedVia: string): { ok: true; next: unknown[] } | ProductPlanError {
   const toDaniel = (why: string, extra: Record<string, unknown> = {}): ProductPlanError => ({
     ok: false,
     status: 422,
@@ -374,7 +374,15 @@ export function planProductOps(state: ProductState, ops: ProductOp[], reportedVi
   const ownerCatalog = state.ownerCatalog;
   // The target itself first (the clearer reason), then the rest of the list.
   for (const op of ops) {
-    if (op.action === "add") continue; // no stored target; the name is checked in order below
+    if (op.action === "add") {
+      // No stored target; the list name is checked in order below. A product
+      // the owner added in the portal («Legg til vare») or set stock / price
+      // for lives only in the catalog: an add of that name is the owner's
+      // product, for Daniel (never a second, CS-written price for it).
+      const prov = ownerCatalog.get(normalizeName(op.name));
+      if (prov) return toDaniel(prov, { name: op.name });
+      continue;
+    }
     const hits = state.list.filter((p) => productNameOf(p) === op.name);
     if (hits.length === 0) {
       return {
