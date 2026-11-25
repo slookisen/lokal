@@ -268,7 +268,14 @@ export function runGardssalgOwnerDashboardO21Tests(opts: { log?: boolean } = {})
       assertTrue(!OLD_STATS_BOX.test(onBodies.portal.body) && !OLD_STATS_FETCH.test(onBodies.portal.body), "AK2i3: the dashboard portal («Oversikt») has neither");
       assertEq(unshell(onBodies.portal.body, "o21testgard", "oversikt"), basePortal.body.replace(OLD_STATS_BOX, "").replace(OLD_STATS_FETCH, ""),
         "AK2i: portal with the shell and the overview card taken out == the flag-off portal without its old stats box (only those changed)");
-      assertEq(unshell(onBodies.valg.body, "o21testgard", "valg"), baseValg.body, "AK2j: «Mine valg» with the shell taken out == the flag-off page (existing content kept)");
+      // Slice 7 (same dev-request): in the shell «Mine valg» drops its
+      // «Tilbake til eierportalen» button and appends the 13px-minimum CSS.
+      const BACK_BUTTON = `<div class="ep-form-actions"><a class="ep-btn ep-btn-secondary" href="/kategori/gardssalg/eier/o21testgard/portal">Tilbake til eierportalen</a></div>\n        `;
+      const MIN_TEXT_STYLE = `<style>${(require("./gardssalg-owner-features") as typeof import("./gardssalg-owner-features")).GARDSSALG_DASHBOARD_MIN_TEXT_CSS}</style>`;
+      assertTrue(baseValg.body.includes(BACK_BUTTON) && !onBodies.valg.body.includes(BACK_BUTTON), "AK2j0: the back button is on the flag-off «Mine valg» only");
+      assertTrue(onBodies.valg.body.includes(MIN_TEXT_STYLE) && !baseValg.body.includes(MIN_TEXT_STYLE), "AK2j1: the 13px-minimum CSS is on the dashboard «Mine valg» only");
+      assertEq(unshell(onBodies.valg.body, "o21testgard", "valg").replace(MIN_TEXT_STYLE, ""), baseValg.body.replace(BACK_BUTTON, ""),
+        "AK2j: «Mine valg» with the shell and the min-size CSS taken out == the flag-off page without its back button (only those changed)");
       // Empty states (tekstpakke OA-3 1.1, verbatim).
       assertTrue(onBodies.besok.body.includes("<p>«Ta imot besøk» er av. Slå det på under «Mine valg» når du vil ta imot forespørsler.</p>"), "AK2k: «Mine besøk» with booking off → empty.visitsOff verbatim");
       assertTrue(onBodies.besok.body.includes('data-state="off"'), "AK2l: «Mine besøk» state off");

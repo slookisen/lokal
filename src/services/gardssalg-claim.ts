@@ -2568,10 +2568,12 @@ export interface OwnerSession {
   renewedExpiresAtMs?: number;
 }
 
-export function verifyGardssalgOwnerSessionToken(token: string | undefined | null): OwnerSession {
+export function verifyGardssalgOwnerSessionToken(token: string | undefined | null, opts: { renew?: boolean } = {}): OwnerSession {
   if (!token) return { valid: false };
   const db = getDb(VERTICAL);
-  const sliding = isGardssalgOwnerSessionSlidingEnabled();
+  // renew: false = read only (no O3-3 renewal UPDATE), for a page that only
+  // needs to know whose session it is. Default: renewed by use, as before.
+  const sliding = opts.renew !== false && isGardssalgOwnerSessionSlidingEnabled();
   const claim = db
     .prepare(
       `SELECT provider_id${sliding ? ", used_at, created_at, expires_at" : ""} FROM gardssalg_claims

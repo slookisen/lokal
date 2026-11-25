@@ -53306,6 +53306,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-24-opplevagent-eierdashbord-lyst-tema-og-testfunn,
+// slices 5, 7, 8: the claim page sends the logged-in owner to «Oversikt»,
+// «Mine valg» in the shell (no back button, no text under 13px), the lock
+// box only on a locked profile. Swaps getDb() + env — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-24-opplevagent-eierdashbord-lyst-tema-og-testfunn: skive 5, 7, 8 ──");
+  try {
+    const { runGardssalgOwnerDashboardTestfunnTests } = require("../src/routes/gardssalg-owner-dashboard-testfunn.test") as
+      typeof import("../src/routes/gardssalg-owner-dashboard-testfunn.test");
+    const r = await runGardssalgOwnerDashboardTestfunnTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-owner-dashboard-testfunn: " + f);
+    console.log(`  gardssalg-owner-dashboard-testfunn: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-owner-dashboard-testfunn: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-11-12-opplevagent-o4-epost-og-tekster, O4-3: the owner
 // confirms the address for visit requests (GARDSSALG_NOTIFY_ADDRESS_CONFIRM_ENABLED).
 // Swaps getDb() + env — runSerial.

@@ -34,8 +34,8 @@ import { emailService, renderGardssalgClaimMagicLink, buildGardssalgClaimWelcome
 import { archiveGardssalgClaimMail, isGardssalgClaimWelcomeEmailEnabled, GARDSSALG_CLAIM_CRM_LINK_PLACEHOLDER } from "../services/gardssalg-claim-crm-archive";
 import { generalLimiter } from "../middleware/security";
 import { ownerBookingEnableBlock, type OwnerBookingBlock } from "../services/gardssalg-booking-gate";
-import { createGardssalgOwnerFeaturesRouter, gardssalgOversiktHtml, gardssalgOwnerDashboardOnForSession, gardssalgOwnerFeaturesTabOpen } from "./gardssalg-owner-features";
-import { wrapGardssalgDashboard } from "../owner-ui/gardssalg-dashboard";
+import { createGardssalgOwnerFeaturesRouter, gardssalgOversiktHtml, gardssalgOwnerDashboardActiveFor, gardssalgOwnerDashboardOnForSession, gardssalgOwnerFeaturesTabOpen } from "./gardssalg-owner-features";
+import { gardssalgDashboardPath, wrapGardssalgDashboard } from "../owner-ui/gardssalg-dashboard";
 import { CLAIM_LINK_TEXTS, CLAIM_CONFIRM_TEXTS, MANUAL_CLAIM_TEXTS, MANUAL_CLAIM_FORM_TEXTS_NOT_APPROVED } from "./gardssalg-claim-texts";
 import { isManualClaimQueueEnabled, isManualClaimReceiptEnabled, sendManualClaimMail, submitManualClaim } from "../services/gardssalg-manual-claims";
 
@@ -231,10 +231,10 @@ function readSessionCookie(req: Request): string | undefined {
   return parsed[GARDSSALG_OWNER_SESSION_COOKIE];
 }
 
-export function sessionFromRequest(req: Request): { valid: boolean; providerId?: string; token?: string } {
+export function sessionFromRequest(req: Request, opts: { renew?: boolean } = {}): { valid: boolean; providerId?: string; token?: string } {
   const cookieToken = readSessionCookie(req);
   if (cookieToken) {
-    const s = verifyGardssalgOwnerSessionToken(cookieToken);
+    const s = verifyGardssalgOwnerSessionToken(cookieToken, opts);
     if (s.valid) {
       // O3-3: a renewed cookie session gets its cookie re-set to the new expiry.
       const res = (req as any).res as Response | undefined;
@@ -246,7 +246,7 @@ export function sessionFromRequest(req: Request): { valid: boolean; providerId?:
   }
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith("Bearer ")) {
-    const s = verifyGardssalgOwnerSessionToken(authHeader.substring(7));
+    const s = verifyGardssalgOwnerSessionToken(authHeader.substring(7), opts);
     if (s.valid) return s;
   }
   return { valid: false };
@@ -619,6 +619,22 @@ router.get("/kategori/gardssalg/eier/:providerSlug", generalLimiter, async (req:
     const slug = String((req.params as any).providerSlug || "");
     const provider = getClaimProviderBySlug(slug);
     if (!provider) return res.status(404).send(notFoundPage());
+
+    // Slice 5 (dev-request 2026-11-24-opplevagent-eierdashbord-lyst-tema-og-
+    // testfunn): the logged-in owner of THIS profile, with the owner dashboard
+    // on, goes straight to «Oversikt» instead of «Er dette din bedrift?».
+    // Same session helper and dashboard gate as the portal itself; anyone
+    // else (no or invalid session, another profile's owner, dashboard off)
+    // gets the claim page exactly as before. The session is read only when
+    // the dashboard is on for this profile, and read only (renew: false — no
+    // renewal UPDATE, no Set-Cookie); the portal renews it as before. Checked
+    // before the address harvest, so the redirect costs the website nothing.
+    if (gardssalgOwnerDashboardActiveFor(provider.id)
+      && gardssalgOwnerDashboardOnForSession(provider.id, sessionFromRequest(req, { renew: false }))) {
+      res.setHeader("Cache-Control", "private, no-store");
+      res.setHeader("Vary", "Cookie");
+      return res.redirect(302, gardssalgDashboardPath(slug, "oversikt"));
+    }
 
     // Must mirror issueClaimMagicLink()'s own derivation exactly — otherwise
     // this page could show the "send me a link" form for a provider whose
