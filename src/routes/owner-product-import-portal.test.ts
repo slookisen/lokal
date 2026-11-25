@@ -546,8 +546,8 @@ export async function runOwnerProductImportPortalTests(opts: { log?: boolean } =
       const rid2 = runIdFrom(f2, "pi-down");
       await oi.__awaitOwnerFetchForTesting(rid2);
       const h2 = html(await pageFor("pi-down", rid2));
-      assertTrue(h2.includes("Fant ingen produkter med pris på nettsiden. Legg dem inn selv.") && h2.includes("Vi fikk ikke kontakt med nettsiden"),
-        "zero: unreachable site → «Vi fikk ikke kontakt med nettsiden»");
+      assertTrue(h2.includes("Fant ingen produkter med pris på nettsiden. Legg dem inn selv.") && h2.includes("Vi fikk ikke åpnet ") && h2.includes("Sjekk at adressen under «Nettside» er riktig, og prøv igjen."),
+        "zero: unreachable site → «Vi fikk ikke åpnet {domene}…»");
     }
 
     // ─── 503: global cap → «prøv igjen» ─────────────────────────────────────
