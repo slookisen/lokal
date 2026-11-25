@@ -374,6 +374,35 @@ function isTicked(c: PreviewCandidate, form: FormState | null): boolean {
   return form ? form.selected.has(c.id) : !c.publish_blocked;
 }
 
+/** Badge on rows read from plain page text (LLM layer); structured layers are never marked. */
+export const LLM_BADGE_NB = "Sjekk prisen";
+export const LLM_EXPLAIN_NB =
+  "Noen av varene har vi lest fra vanlig tekst på nettsiden din, ikke fra en nettbutikk. De er merket «Sjekk prisen». Se over navn, pris og enhet før du publiserer.";
+const llmExplainHtml = (p: Pick<Preview, "new" | "changed">): string =>
+  [...p.new, ...p.changed].some((c) => c.llm) ? `<p class="ep-audit-meta" data-llm-explain="1">${escapeHtml(LLM_EXPLAIN_NB)}</p>` : "";
+
+/** Hostname of the site for owner-facing texts (raw text minus scheme/path when unparseable). Not escaped. */
+function siteDomain(website: string | null | undefined): string {
+  const raw = (website ?? "").trim();
+  try {
+    const h = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`).hostname;
+    if (h) return h;
+  } catch { /* fall through */ }
+  return raw.replace(/^https?:\/\//i, "").split("/")[0] ?? raw;
+}
+
+/** Reason text for the «found nothing» view by outcome (owner-approved wording); null = keep today's text. Domain is HTML-escaped; result is HTML. */
+export function importNothingFoundReasonHtml(outcome: string | null | undefined, website: string | null | undefined): string | null {
+  const d = escapeHtml(siteDomain(website));
+  if (outcome === "no_products_found")
+    return `Vi fant ingen varer med pris på ${d}. Det ser ut til at nettsiden ikke viser priser. Du kan legge inn varene selv her, eller legge prisene på nettsiden og prøve igjen.`;
+  if (typeof outcome === "string" && outcome.startsWith("fetch_failed"))
+    return `Vi fikk ikke åpnet ${d}. Sjekk at adressen under «Nettside» er riktig, og prøv igjen.`;
+  if (outcome === "js_unreadable")
+    return `Vi klarte ikke å lese varene på ${d}, fordi siden lastes på en måte vi ikke kan lese ennå. Du kan legge inn varene selv her.`;
+  return null;
+}
+
 function candidateRowHtml(
   c: PreviewCandidate,
   kind: "new" | "changed",
@@ -406,6 +435,7 @@ function candidateRowHtml(
   }
   if (c.price_excl_vat) notes.push(`<div class="ep-lock" data-excl-vat="1">Prisen på nettsiden er oppgitt ekskl. mva. Sjekk at det er prisen kundene skal betale.</div>`);
   if (c.price_is_from) notes.push(`<div class="ep-audit-meta" data-from-price="1">Nettsiden oppgir en «fra»-pris.</div>`);
+  if (c.llm) notes.push(`<div class="ep-audit-meta" data-llm-badge="1"><strong>${LLM_BADGE_NB}</strong></div>`);
   if (c.llm) notes.push(`<div class="ep-audit-meta" data-llm="1">Funnet ved å lese teksten på siden. Sjekk navn og pris ekstra nøye.</div>`);
   if (c.publish_blocked_text) notes.push(`<div class="ep-alert ep-alert-error" role="note" data-blocked="${escapeHtml(String(c.publish_blocked))}">${escapeHtml(c.publish_blocked_text)}</div>`);
   if (showFetchedAt && fetchedDateText(c.fetched_at)) {
@@ -473,14 +503,15 @@ export function renderImportPreviewPage(
     ? `<a class="ep-btn ep-btn-primary" href="/eier/${id}/portal#${ORDERABILITY_ANCHOR}">Legg inn varer selv</a>`
     : "";
   if (p.status !== "completed" || totalCandidates === 0) {
-    const explain = productImportOutcomeTextNb(p.outcome);
+    const reasonHtml = importNothingFoundReasonHtml(p.outcome, p.website);
+    const explain = reasonHtml ? null : productImportOutcomeTextNb(p.outcome);
     // failed / interrupted / timed-out runs stage nothing, so this is the
     // zero-result screen for every non-completed run too.
     const title = "Fant ingen produkter med pris på nettsiden. Legg dem inn selv.";
     return `${head}
       <div class="ep-card" data-import-status="${escapeHtml(p.status)}" data-import-zero="1"${p.outcome ? ` data-import-outcome="${escapeHtml(p.outcome)}"` : ""}>
         <p><strong>${escapeHtml(title)}</strong></p>
-        ${explain ? `<p data-outcome-text="1">${escapeHtml(explain)}</p>` : ""}
+        ${reasonHtml ? `<p data-outcome-text="1" data-outcome-reason="1">${reasonHtml}</p>` : explain ? `<p data-outcome-text="1">${escapeHtml(explain)}</p>` : ""}
         <p>${addYourself} <a class="ep-btn ep-btn-secondary" href="${back}">Tilbake til portalen</a></p>
       </div>`;
   }
@@ -532,6 +563,7 @@ export function renderImportPreviewPage(
       .join("");
     return `${head}
       <div class="ep-card" data-import-status="completed" data-outreach-list="1">
+        ${llmExplainHtml(p)}
         <p>Vi fant disse varene på nettsiden din. Alle er krysset av. Rett navn, pris eller enhet om noe er feil, og fjern krysset for varer du ikke vil ha med. Varene du har i profilen i dag, beholdes.</p>
         <form method="post" action="${escapeHtml(v.actionHref)}">
           ${hidden}
@@ -566,6 +598,7 @@ export function renderImportPreviewPage(
   return `${head}
       <div class="ep-card" data-import-status="completed" data-import-select-root="1">
         <p><span data-valg-lead="1">${escapeHtml(lead)}</span> Varene du har i dag, beholdes med mindre du krysser av for å fjerne dem.</p>
+        ${llmExplainHtml(p)}
         <form method="post" action="${self}/publiser">
           ${bulkBar}
           ${section("Nye produkter", 'data-section="new"', "", newRows, "Ingen nye produkter.")}

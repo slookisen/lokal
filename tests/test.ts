@@ -54687,6 +54687,22 @@ runSerial(async () => {
   }
 });
 
+runSerial(async () => {
+  console.log("\n── produktimport punkt 3+5: «Sjekk prisen» og årsakstekst ──");
+  try {
+    const { runOwnerProductImportMarkingTests } = require("../src/routes/owner-product-import-marking.test") as
+      typeof import("../src/routes/owner-product-import-marking.test");
+    const r = await runOwnerProductImportMarkingTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-product-import-marking: " + f);
+    console.log(`  owner-product-import-marking: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-product-import-marking: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // Produktimport skive 3b-1: outreach pre-extraction (admin only) — flag-gated
 // POST /admin/product-import/prepare + GET report (JSON / Norwegian md);
 // controls (category label, alcohol, duplicate/unchanged, unanchored price,
