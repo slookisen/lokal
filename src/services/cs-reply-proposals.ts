@@ -39,6 +39,9 @@ import { containsMojibake } from "./search-enrich";
 import { classifyForwardCopy, forwardCopyMarker, forwardOriginalSender, forwardSuffix, inboundLogAutomatedKind, isOurPlatformAddress, readInboundHeaders } from "./cs-inbound";
 import { recordRun } from "./run-ledger";
 import { EnvelopeBuilder } from "../types/run-envelope";
+import { marketplaceRegistry } from "./marketplace-registry";
+import { hasProducerPage, isProfileOwnerHidden } from "./agent-visibility";
+import { isValidRfbProfileUrl } from "./rfb-outreach-template";
 
 export const CS_AUTOSEND_FLAG = "CS_AUTOSEND_ENABLED";
 export function csAutosendEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -55,6 +58,7 @@ export const REPLY_KINDS = [
   "fjernet",
   "eierkrav_info",
   "kontakt_kvittering",
+  "kjoper_svar",
   "annet",
 ] as const;
 export type ReplyKind = (typeof REPLY_KINDS)[number];
@@ -71,6 +75,26 @@ export function autosendKinds(env: NodeJS.ProcessEnv = process.env): ReplyKind[]
     .split(",")
     .map((s) => s.trim())
     .filter((s): s is ReplyKind => isReplyKind(s) && s !== "annet");
+}
+
+/**
+ * «kjoper_svar» — an answer to a buyer («where can I buy X»). It goes out on
+ * its own only when CS_AUTOSEND_ENABLED is on AND this flag is on (default
+ * OFF, set by Daniel). Listing it in CS_AUTOSEND_KINDS is not enough.
+ */
+export const BUYER_REPLY_KIND: ReplyKind = "kjoper_svar";
+export const CS_KJOPER_SVAR_AUTOSEND_FLAG = "CS_KJOPER_SVAR_AUTOSEND_ENABLED";
+export function csKjoperSvarAutosendEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = env[CS_KJOPER_SVAR_AUTOSEND_FLAG];
+  return v === "1" || v === "true";
+}
+const KJOPER_SVAR_FLAG_OFF_DETAIL = `${CS_KJOPER_SVAR_AUTOSEND_FLAG} er av — kjøpersvaret venter på Daniel`;
+
+/** crm_threads.case_type for a thread that got a buyer answer (counted on its own). */
+export const BUYER_CASE_TYPE = "kjoper";
+
+function markBuyerCase(threadId: string): void {
+  getDb().prepare(`UPDATE crm_threads SET case_type = ? WHERE id = ?`).run(BUYER_CASE_TYPE, threadId);
 }
 
 /** Kinds whose whole point is to confirm a change: they need at least one linked, verified change request. */
@@ -186,6 +210,126 @@ function parseIdList(raw: string | null | undefined): string[] {
   } catch {
     return [];
   }
+}
+
+// ─── Buyer-reply link check ───────────────────────────────────────────
+
+/** The only non-profile link a buyer reply may carry: the site root (also as a bare mention, e.g. in a signature). */
+const RFB_SITE_ROOTS = new Set(["https://rettfrabonden.com", "https://rettfrabonden.com/", "rettfrabonden.com", "rettfrabonden.com/"]);
+const RFB_PROFILE_PREFIX = "https://rettfrabonden.com/produsent/";
+
+const SCHEME_URL_RE = /\bhttps?:\/\/[^\s<>"'`]+/gi;
+const WWW_URL_RE = /(?<![\w./@-])www\.[^\s<>"'`]+/gi;
+/** A bare domain a mail client would auto-link («gardx.no», «gardx.no/butikk»). Lowercase TLD from a short list. */
+const BARE_DOMAIN_RE = /(?<![\w./@:-])(?:[A-Za-z0-9æøåÆØÅ-]{2,}\.)+(?:no|com|net|org|se|dk|fi|is|de|eu|uk|io|info|biz|shop|app|farm|online|site|store|nu|me|co)(?:\/[^\s<>"'`]*)?(?![A-Za-z0-9-])/g;
+const EMAIL_RE = /[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g;
+const HREF_RE = /\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi;
+const TRAILING_PUNCT_RE = /[.,;:!?»”’'")\]]+$/;
+
+function decodeHtmlEntities(s: string): string {
+  return s
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&");
+}
+
+/**
+ * Every link in a reply: http(s) URLs, «www.» hosts and bare domains a mail
+ * client would auto-link in the text, and every href value (any scheme,
+ * relative ones included) in the HTML. Unique, in order of appearance.
+ */
+export function extractLinks(bodyText: string | null | undefined, bodyHtml?: string | null): string[] {
+  const found: string[] = [];
+  const scan = (raw: string) => {
+    const noEmails = raw.replace(EMAIL_RE, " ");
+    const schemeLinks = noEmails.match(SCHEME_URL_RE) ?? [];
+    const rest1 = noEmails.replace(SCHEME_URL_RE, " ");
+    const wwwLinks = rest1.match(WWW_URL_RE) ?? [];
+    const rest2 = rest1.replace(WWW_URL_RE, " ");
+    const bare = rest2.match(BARE_DOMAIN_RE) ?? [];
+    for (const l of [...schemeLinks, ...wwwLinks, ...bare]) {
+      const c = l.replace(TRAILING_PUNCT_RE, "");
+      if (c) found.push(c);
+    }
+  };
+  if (bodyText) scan(bodyText);
+  if (bodyHtml) {
+    HREF_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = HREF_RE.exec(bodyHtml))) {
+      const v = decodeHtmlEntities((m[1] ?? m[2] ?? m[3] ?? "").trim());
+      found.push(v);
+    }
+    const visible = decodeHtmlEntities(bodyHtml.replace(/<[^>]*>/g, " "));
+    scan(visible);
+  }
+  return Array.from(new Set(found));
+}
+
+export interface LinkProblem {
+  url: string;
+  why: string;
+}
+
+function whyNotAllowed(url: string): string {
+  if (url.startsWith("/")) return "ikke en full adresse";
+  const hasScheme = /^[a-z][a-z0-9+.-]*:/i.test(url);
+  let u: URL;
+  try {
+    u = new URL(hasScheme ? url : `https://${url}`);
+  } catch {
+    return "ugyldig adresse";
+  }
+  if (u.protocol !== "https:" && u.protocol !== "http:") return "ikke en nettadresse";
+  if (u.hostname !== "rettfrabonden.com") return u.hostname.endsWith("rettfrabonden.com") ? "bruk https://rettfrabonden.com/produsent/…" : "annet domene";
+  if (!hasScheme || u.protocol !== "https:") return "bruk https://rettfrabonden.com/produsent/…";
+  return "ikke en profilside på rettfrabonden.com";
+}
+
+/**
+ * The buyer-reply link rule. A link may only be
+ *   • the site root https://rettfrabonden.com (with or without «/»), or
+ *   • a producer profile in its canonical form https://rettfrabonden.com/produsent/<slug>
+ *     (isValidRfbProfileUrl: https, that exact host, [a-z0-9-] slug, no
+ *     trailing slash, no query, no fragment),
+ * (a bare «rettfrabonden.com» mention, e.g. in a signature, counts as the root;
+ * any other bare or «www.» address is a link and fails),
+ * and the profile must exist and be public: the slug resolves to an active
+ * agent the way GET /produsent/:slug finds it (getAgentBySlugIncludingUmbrellas:
+ * agents.is_active = 1, slugify(name)), that agent has a public page
+ * (hasProducerPage: role/umbrella_type, is_vetted, catalog_hidden,
+ * vertical_id = rfb, origin) and the owner has not paused or hidden it
+ * (isProfileOwnerHidden). DB lookups only — never a network call.
+ */
+export function checkBuyerReplyLinks(bodyText: string | null | undefined, bodyHtml?: string | null): LinkProblem[] {
+  const problems: LinkProblem[] = [];
+  for (const url of extractLinks(bodyText, bodyHtml)) {
+    if (RFB_SITE_ROOTS.has(url)) continue;
+    if (!isValidRfbProfileUrl(url)) {
+      problems.push({ url, why: whyNotAllowed(url) });
+      continue;
+    }
+    const slug = url.slice(RFB_PROFILE_PREFIX.length);
+    const agent = marketplaceRegistry.getAgentBySlugIncludingUmbrellas(slug);
+    if (!agent) {
+      problems.push({ url, why: "ukjent, inaktiv eller slettet profil" });
+      continue;
+    }
+    const row = getDb()
+      .prepare(`SELECT role, umbrella_type, is_vetted, catalog_hidden, vertical_id, origin FROM agents WHERE id = ?`)
+      .get(agent.id) as Parameters<typeof hasProducerPage>[0];
+    if (!hasProducerPage(row)) {
+      problems.push({ url, why: "skjult profil" });
+      continue;
+    }
+    if (isProfileOwnerHidden(getDb(), agent.id)) problems.push({ url, why: "profilen er satt på pause av eieren" });
+  }
+  return problems;
 }
 
 // ─── Thread facts ─────────────────────────────────────────────────────
@@ -351,7 +495,11 @@ export function createReplyProposal(input: CreateProposalInput, deps: { now?: Da
   const id = `rp-${randomUUID()}`;
   const ts = nowIso(now);
   const autosend = csAutosendEnabled(env);
-  const status: ProposalStatus = autosend ? "pending" : "approval_needed";
+  // A buyer answer with its own flag off goes straight to the queue (the worker would park it anyway).
+  const buyerHeld = autosend && input.kind === BUYER_REPLY_KIND && !csKjoperSvarAutosendEnabled(env);
+  const status: ProposalStatus = autosend && !buyerHeld ? "pending" : "approval_needed";
+  const blockReason = !autosend ? "autosending_av" : buyerHeld ? "kjoper_svar_autosending_av" : null;
+  const blockDetail = !autosend ? `${CS_AUTOSEND_FLAG} er av — forslaget venter på Daniel` : buyerHeld ? KJOPER_SVAR_FLAG_OFF_DETAIL : null;
 
   const superseded: string[] = [];
   const tx = db.transaction(() => {
@@ -385,11 +533,13 @@ export function createReplyProposal(input: CreateProposalInput, deps: { now?: Da
       input.evidence === undefined ? null : JSON.stringify(input.evidence),
       input.createdBy,
       status,
-      autosend ? null : "autosending_av",
-      autosend ? null : `${CS_AUTOSEND_FLAG} er av — forslaget venter på Daniel`,
+      blockReason,
+      blockDetail,
       ts,
       ts,
     );
+    // The thread is a buyer case from the moment a buyer answer is proposed for it.
+    if (input.kind === BUYER_REPLY_KIND) markBuyerCase(thread.id);
   });
   tx();
   crmService.logAction({
@@ -417,7 +567,8 @@ export type Evaluation =
 /**
  * Every gate, read-only. `auto` is the worker; `approved` is Daniel pressing
  * Send — that skips the gates that exist only to make Daniel look (kind,
- * change wording in the text, quotas, recipient ≠ thread contact) but keeps
+ * the buyer-answer flag and link check, change wording in the text, quotas,
+ * recipient ≠ thread contact) but keeps
  * the hard ones (thread, recipient never our own address, a newer customer
  * message unless explicitly acknowledged, linked changes verified and on this
  * thread, branding, encoding, duplicate, bounce/complaint, live transport).
@@ -463,6 +614,14 @@ export function evaluateProposal(
     return stop("ny_melding_etter_forslag", "kunden har skrevet igjen etter at forslaget ble laget");
   }
 
+  // Buyer answers: own flag, and every link must be a live public profile.
+  // Automatic path only — Daniel pressing Send has read the text himself,
+  // like the other gates that exist only to make him look.
+  if (mode === "auto" && p.kind === BUYER_REPLY_KIND) {
+    if (!csKjoperSvarAutosendEnabled(env)) return stop("kjoper_svar_autosending_av", KJOPER_SVAR_FLAG_OFF_DETAIL);
+    const bad = checkBuyerReplyLinks(p.body_text, p.body_html);
+    if (bad.length > 0) return stop("lenke_ugyldig", `ugyldig lenke i kjøpersvaret: ${bad.map((b) => `${b.url} (${b.why})`).join(", ")}`);
+  }
   if (mode === "auto" && !autosendKinds(env).includes(p.kind as ReplyKind)) {
     return stop("kind_krever_godkjenning", `type «${p.kind}» sendes ikke automatisk`);
   }
@@ -839,6 +998,7 @@ function applyEdits(p: ProposalRow, edits: ProposalEdits, ts: string): void {
     ts,
     p.id,
   );
+  if (edits.kind === BUYER_REPLY_KIND) markBuyerCase(p.thread_id);
 }
 
 const EDITABLE: ProposalStatus[] = ["pending", "approval_needed"];
