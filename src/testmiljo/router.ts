@@ -16,16 +16,18 @@
  * the database are offered: a verified claim on RFB, a used and unrevoked
  * claim on gårdssalg.
  *
- * Three independent conditions must hold for any of this to answer:
+ * Independent conditions that must all hold for any of this to answer:
  *   1. mountTestmiljo() only mounts the router when isTestmiljo() is true at boot
  *      (and the process refuses to start with TESTMILJO set in production);
  *   2. every request re-checks isTestmiljo();
- *   3. every request must come from this machine (loopback TCP peer).
+ *   3. every request must come from this machine (loopback TCP peer);
+ *   4. the Host header must be localhost or one of the three local site names;
+ *   5. a POST must not be marked cross-site or same-site by the browser.
  */
 
 import express, { type Express, type NextFunction, type Request, type Response, Router } from "express";
 import { isLoopbackAddress, isTestmiljo } from "./guard";
-import { LOCAL_SITES, localOrigin, siteByKey, splitHostPort } from "./hosts";
+import { LOCAL_SITES, isLocalHostName, localOrigin, siteByKey, splitHostPort } from "./hosts";
 import { clearOutbox, getOutboxMail, listOutbox, outboxFile, type OutboxMail } from "./outbox";
 import { outboundAttempts } from "./outbound-guard";
 
@@ -278,6 +280,15 @@ export function createTestmiljoRouter(deps: TestmiljoDeps = defaultTestmiljoDeps
   router.use((req: Request, res: Response, next: NextFunction) => {
     if (!isTestmiljo()) return res.status(404).type("text/plain").send("Not found");
     if (!isLoopbackAddress(req.socket?.remoteAddress)) return res.status(403).type("text/plain").send("The test environment only answers this machine.");
+    // A page on another site may reach this machine's loopback through the
+    // tester's browser. Two cheap answers: the Host must be one of the local
+    // names (a rebound DNS name is not), and a write must come from these
+    // pages themselves (Sec-Fetch-Site, sent by every current browser).
+    if (!isLocalHostName(splitHostPort(req.headers.host).hostname)) return res.status(403).type("text/plain").send("Unknown host name for the test environment.");
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      const fetchSite = String(req.headers["sec-fetch-site"] ?? "");
+      if (fetchSite !== "" && fetchSite !== "same-origin" && fetchSite !== "none") return res.status(403).type("text/plain").send("Cross-site request refused.");
+    }
     res.setHeader("Content-Security-Policy", PAGE_CSP);
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("X-Robots-Tag", "noindex, nofollow");

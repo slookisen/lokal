@@ -48,6 +48,12 @@ export function prodHostFor(hostname: string): string | null {
   return LOCAL_SITES.find((site) => site.localHost === h)?.prodHost ?? null;
 }
 
+/** localhost, a loopback literal, or one of the three local site names. Nothing else is the test environment. */
+export function isLocalHostName(hostname: string): boolean {
+  const h = hostname.trim().toLowerCase();
+  return h === "localhost" || h === "127.0.0.1" || h === "[::1]" || LOCAL_SITES.some((site) => site.localHost === h);
+}
+
 export function localOrigin(site: LocalSite, port: string): string {
   return `http://${site.localHost}${port ? `:${port}` : ""}`;
 }

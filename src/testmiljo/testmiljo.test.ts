@@ -15,8 +15,9 @@
  *   x1-x4   outbox: capture, list, read, clear; EmailService uses it in the
  *           test environment and is unchanged outside it.
  *   r1-r9   /testmiljo pages over a real HTTP server: 404 when off, 403 for a
- *           non-loopback peer, owner list, login redirect per site, refusals,
- *           outbox pages, nothing mounted when off.
+ *           non-loopback peer, a foreign Host or a cross-site write, owner
+ *           list, login redirect per site, refusals, outbox pages, nothing
+ *           mounted when off.
  *   d1-d4   the real dependencies against in-memory databases: owners are
  *           read from verified claims, and login issues an ordinary unused
  *           login link (no session is written directly).
@@ -277,11 +278,11 @@ export async function runTestmiljoTests(opts: { log?: boolean } = {}): Promise<T
       const server = http.createServer(app);
       await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
       const port = (server.address() as net.AddressInfo).port;
-      const call = (method: string, urlPath: string, form?: Record<string, string>): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }> =>
+      const call = (method: string, urlPath: string, form?: Record<string, string>, extraHeaders: Record<string, string> = {}): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }> =>
         new Promise((resolve, reject) => {
           const payload = form ? new URLSearchParams(form).toString() : "";
           const req = http.request(
-            { host: "127.0.0.1", port, method, path: urlPath, headers: { Host: "rettfrabonden.localhost:4310", ...(form ? { "Content-Type": "application/x-www-form-urlencoded", "Content-Length": Buffer.byteLength(payload) } : {}) } },
+            { host: "127.0.0.1", port, method, path: urlPath, headers: { Host: "rettfrabonden.localhost:4310", ...(form ? { "Content-Type": "application/x-www-form-urlencoded", "Content-Length": Buffer.byteLength(payload) } : {}), ...extraHeaders } },
             (res) => { let body = ""; res.setEncoding("utf8"); res.on("data", (c) => (body += c)); res.on("end", () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body })); },
           );
           req.on("error", reject);
@@ -299,6 +300,14 @@ export async function runTestmiljoTests(opts: { log?: boolean } = {}): Promise<T
           (routerMod.createTestmiljoRouter(deps) as any).handle({ method: "GET", url: "/", headers: { host: "rettfrabonden.localhost:4310" }, socket: { remoteAddress: "10.0.0.9" } }, res, () => resolve({ status: 0, nexted: true }));
         });
         assertEq(remote, { status: 403, nexted: false }, "r2 a request that does not come from this machine is refused");
+        const rebound = await call("GET", "/testmiljo", undefined, { Host: "rebound.attacker.example:4310" });
+        const lookalike = await call("GET", "/testmiljo", undefined, { Host: "evil.opplevagent.localhost:4310" });
+        const crossPost = await call("POST", "/testmiljo/logg-inn", { site: "rfb", id: "rfb-1" }, { "Sec-Fetch-Site": "cross-site" });
+        const sameSitePost = await call("POST", "/testmiljo/logg-inn", { site: "rfb", id: "rfb-1" }, { "Sec-Fetch-Site": "same-site" });
+        const crossGet = await call("GET", "/testmiljo", undefined, { "Sec-Fetch-Site": "cross-site" });
+        const plainLocalhost = await call("GET", "/testmiljo", undefined, { Host: "localhost:4310" });
+        assertEq([rebound.status, lookalike.status, crossPost.status, sameSitePost.status, crossGet.status, plainLocalhost.status, issued.length], [403, 403, 403, 403, 200, 200, 0],
+          "r2 a Host that is not a local name, or a write another site started, is refused; reading from a followed link is not");
 
         const start = await call("GET", "/testmiljo");
         assertTrue(start.status === 200 && start.body.includes("Solgården &lt;b&gt;") && !start.body.includes("Solgården <b>") && start.body.includes("eier@solgarden.invalid") && start.body.includes("Fjordsider") && start.body.includes('name="id" value="gs-1"'),
