@@ -146,3 +146,38 @@ export function currentForProdusenterFacts(env: NodeJS.ProcessEnv = process.env)
     pilot: currentPilotStates(env),
   };
 }
+
+// ─── T14b-h: fail-safe «I dag» ──────────────────────────────────────────────
+// A broken `today` (or facts computation) must never break «Mine valg» or the
+// owner API: the line / key is simply omitted, and the problem is logged once
+// per key per process.
+const warnedTodayKeys = new Set<string>();
+function warnTodayOnce(key: string, err: unknown): void {
+  if (warnedTodayKeys.has(key)) return;
+  warnedTodayKeys.add(key);
+  try { console.warn(`[owner-features] today omitted for ${key}: ${String((err as any)?.message || err)}`); } catch { /* never throw */ }
+}
+
+/** Test hook: forget which keys were already warned about. */
+export function __resetTodayWarningsForTesting(): void { warnedTodayKeys.clear(); }
+
+/** The facts, or null if computing them throws (logged once under «(facts)»). `compute` is injectable for tests. */
+export function safeTodayFacts(compute: () => ForProdusenterFacts = () => currentForProdusenterFacts()): ForProdusenterFacts | null {
+  try { return compute(); } catch (err) { warnTodayOnce("(facts)", err); return null; }
+}
+
+/** `entry.today(facts)` if it yields {no,en} strings; otherwise null (logged once per key). Never throws. */
+export function safeTodayText(
+  entry: { key: string; today?: (facts: ForProdusenterFacts) => { no: string; en: string } },
+  facts: ForProdusenterFacts | null,
+): { no: string; en: string } | null {
+  if (!entry.today || !facts) return null;
+  try {
+    const t = entry.today(facts);
+    if (!t || typeof t.no !== "string" || typeof t.en !== "string") {
+      warnTodayOnce(entry.key, "today() returned no {no,en} strings");
+      return null;
+    }
+    return t;
+  } catch (err) { warnTodayOnce(entry.key, err); return null; }
+}

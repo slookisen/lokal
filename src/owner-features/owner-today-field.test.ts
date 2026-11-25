@@ -8,12 +8,16 @@
  *      the API carries `today` {no,en}; other rows are unchanged.
  *   c  governance (checkTodayGovernance): real registry passes; the rule is proven to
  *      bite on synthetic entries (today on a live entry, 241-char text, bad text).
+ *   d  T14b-h: governance also covers the gårdssalg registry (+ a gårdssalg-shaped live
+ *      entry with `today` FAILS).
+ *   e  T14b-h: fail-safe — a throwing / malformed `today`, or failing facts, omits the
+ *      line / key exactly as if absent, warns once per key, never throws.
  *
  * Standalone: npx tsx src/owner-features/owner-today-field.test.ts
  */
 
 import Database from "better-sqlite3";
-import { OWNER_FEATURE_REGISTRY, type OwnerFeatureEntry } from "./registry";
+import { OWNER_FEATURE_REGISTRY, GARDSSALG_OWNER_FEATURE_REGISTRY, type OwnerFeatureEntry } from "./registry";
 import type { ForProdusenterFacts } from "./today-facts";
 
 export interface TestSummary { passed: number; failed: number; failures: string[] }
@@ -141,6 +145,56 @@ export async function runOwnerTodayFieldTests(opts: { log?: boolean } = {}): Pro
     ok(checkTodayGovernance([bad("Maks {hours} timer")], facts).length > 0, "c-13: text containing { FAILS");
     const fl = { ...good, key: "fx.flip", today: (f: ForProdusenterFacts) => ({ no: f.orderCapV2On ? "Grense per kjøper." : "Grense {x}", en: "ok" }) } as OwnerFeatureEntry;
     ok(checkTodayGovernance([fl], facts).length > 0, "c-14: a violation that appears only under flipped facts FAILS");
+
+    // ── d: gårdssalg registry governance (T14b-h) ───────────────────────────
+    const gsProblems = checkTodayGovernance(GARDSSALG_OWNER_FEATURE_REGISTRY, facts);
+    ok(gsProblems.length === 0, `d-01: gårdssalg registry obeys the today rules ${gsProblems.join("; ")}`);
+    const gsLive = GARDSSALG_OWNER_FEATURE_REGISTRY.find((e) => e.status === "live");
+    ok(!!gsLive, "d-02: a live gårdssalg entry exists to clone");
+    const gsBad = { ...gsLive!, key: "fx.gs.live", today: () => ({ no: "Vi sender bekreftelse.", en: "We send a confirmation." }) } as OwnerFeatureEntry;
+    ok(checkTodayGovernance([gsBad], facts).some((p) => p.startsWith("fx.gs.live: today is only allowed on coming_soon")), "d-03: today on a live gårdssalg-shaped entry FAILS");
+
+    // ── e: fail-safe rendering (T14b-h) ─────────────────────────────────────
+    const warns: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...a: any[]) => { warns.push(a.map(String).join(" ")); };
+    try {
+      tf.__resetTodayWarningsForTesting();
+      const plainReg = OWNER_FEATURE_REGISTRY.map((e) => (e.key === planned.key ? ({ ...planned, today: undefined } as OwnerFeatureEntry) : e));
+      const plainHtml = pg.renderOwnerFeaturesPageBody(model(plainReg));
+      const plainApi = apiJson(plainReg);
+      const variants: Array<[string, any]> = [
+        ["throws", () => { throw new Error("boom"); }],
+        ["returns null", () => null],
+        ["returns a string", () => "I dag"],
+        ["returns {no} only", () => ({ no: "x" })],
+        ["returns non-string no", () => ({ no: 5, en: "x" })],
+      ];
+      for (const [i, [label, fn]] of variants.entries()) {
+        const broken = OWNER_FEATURE_REGISTRY.map((e) => (e.key === planned.key ? ({ ...planned, today: fn } as OwnerFeatureEntry) : e));
+        let h = "", a = "", threw = false;
+        try { h = pg.renderOwnerFeaturesPageBody(model(broken)); a = apiJson(broken); } catch { threw = true; }
+        ok(!threw, `e-0${i + 1}a: today ${label}: no throw`);
+        ok(h === plainHtml && !h.includes("mv-today"), `e-0${i + 1}b: today ${label}: page equals the render without today`);
+        ok(a === plainApi && !JSON.parse(a).some((r: any) => "today" in r), `e-0${i + 1}c: today ${label}: API lacks the today key`);
+      }
+      ok(warns.filter((w) => w.includes(planned.key)).length === 1,
+        "e-10: the same key warns only once per process");
+      ok(warns.some((w) => w.includes(planned.key) && w.includes("boom")), "e-11: the warning names the registry key and the error");
+
+      // facts computation failing
+      tf.__resetTodayWarningsForTesting();
+      warns.length = 0;
+      ok(tf.safeTodayFacts(() => { throw new Error("facts-boom"); }) === null, "e-12: safeTodayFacts returns null when computing throws");
+      tf.safeTodayFacts(() => { throw new Error("facts-boom"); });
+      ok(warns.length === 1 && warns[0].includes("facts-boom"), "e-13: facts failure is logged once");
+      ok(tf.safeTodayText(withToday, null) === null, "e-14: no facts -> today omitted (page/API then render as without today)");
+      ok(tf.safeTodayText(withToday, facts)?.no === todayText.no, "e-15: a healthy today passes through safeTodayText");
+      // The page and API call currentForProdusenterFacts() directly (no injection point
+      // without production-code contortions), so facts failure is covered at helper level.
+    } finally {
+      console.warn = origWarn;
+    }
   } catch (err: any) {
     ok(false, "unexpected error: " + String(err?.stack || err));
   } finally {
