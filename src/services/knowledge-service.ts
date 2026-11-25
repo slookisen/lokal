@@ -297,13 +297,40 @@ export interface ProductInfo {
   sourceUrl?: string;   // page the price was read from (import / auto-sync)
   fetchedAt?: string;   // ISO time the price was read from sourceUrl
   confirmedAt?: string; // ISO time the owner last saved/confirmed the product
+  // dev-request 2026-11-25-cs-endringsforesporsel-kan-legge-til-varer: an
+  // `owner_reported` product (the owner told customer service) carries the
+  // change request it came with, «cs_change_request:<id>» (the request row
+  // holds the sender), and the unit the owner gave, if any.
+  reportedVia?: string;
+  unit?: string;
 }
 
-/** Who stated a product: the owner (by hand, by import, by weekly sync) or enrichment. */
-export type ProductSource = "owner_manual" | "owner_import" | "owner_auto_sync" | "enrichment";
-export const PRODUCT_SOURCES: readonly ProductSource[] = ["owner_manual", "owner_import", "owner_auto_sync", "enrichment"];
-/** The owner-stated sources: a profile shows a date line for these. */
+/**
+ * Who stated a product: the owner (by hand, by import, by weekly sync), the
+ * owner through customer service (`owner_reported`), or enrichment.
+ */
+export type ProductSource = "owner_manual" | "owner_import" | "owner_auto_sync" | "owner_reported" | "enrichment";
+export const PRODUCT_SOURCES: readonly ProductSource[] = ["owner_manual", "owner_import", "owner_auto_sync", "owner_reported", "enrichment"];
+/**
+ * The owner-stated sources: a profile shows a date line for these. Not
+ * `owner_reported`: that product was written by customer service on the
+ * owner's word, so CS may still change it (cs-change-requests.ts), and it
+ * has no owner confirmation date.
+ */
 export const OWNER_PRODUCT_SOURCES: readonly ProductSource[] = ["owner_manual", "owner_import", "owner_auto_sync"];
+/** The owner told customer service (a CS change request added the product). */
+export const OWNER_REPORTED_SOURCE = "owner_reported" as const;
+/**
+ * Every source that is the owner's word: the owner sources plus
+ * `owner_reported`. The product catalog sync treats these as owner data
+ * (a scraped price never replaces them).
+ */
+export const OWNER_STATED_SOURCES: readonly ProductSource[] = [...OWNER_PRODUCT_SOURCES, OWNER_REPORTED_SOURCE];
+/** `reportedVia` of an owner_reported product: the change request it came with. */
+export const CS_REPORTED_VIA_PREFIX = "cs_change_request:";
+export function isCsReportedVia(v: unknown): v is string {
+  return typeof v === "string" && v.length > CS_REPORTED_VIA_PREFIX.length && v.length <= 200 && v.startsWith(CS_REPORTED_VIA_PREFIX) && !/\s/.test(v);
+}
 
 /**
  * Stamps the provenance of a products list before it is stored (skive 2).
@@ -313,15 +340,26 @@ export const OWNER_PRODUCT_SOURCES: readonly ProductSource[] = ["owner_manual", 
  * keeps its source, URL and fetch date). Any other path cannot claim an owner
  * source or an owner confirmation: such a value becomes `enrichment` and
  * `confirmedAt` is dropped. A product with none of these fields is returned
- * as is, so enrichment writes store byte for byte what they did.
+ * as is, so enrichment writes store byte for byte what they did. The one
+ * exception off the owner path is `owner_reported` with a CS change-request
+ * `reportedVia` (the admin write customer service uses): it keeps its source.
  */
 export function stampProductSources(products: ProductInfo[], ownerPath: boolean, nowIso: string): ProductInfo[] {
   return products.map((p) => {
     if (!p || typeof p !== "object") return p;
     if (ownerPath) {
       if (p.source === "owner_import" || p.source === "owner_auto_sync") return { ...p, confirmedAt: nowIso };
-      const { sourceUrl: _u, fetchedAt: _f, ...rest } = p;
+      // An owner_reported product the owner saves in the portal is now their own (owner_manual).
+      const { sourceUrl: _u, fetchedAt: _f, reportedVia: _r, ...rest } = p;
       return { ...rest, source: "owner_manual", confirmedAt: nowIso };
+    }
+    // owner_reported (customer service wrote what the owner told it, on this
+    // non-owner path) keeps its source, as long as it names the change
+    // request it came with; it never carries an owner confirmation.
+    if (p.source === OWNER_REPORTED_SOURCE && isCsReportedVia(p.reportedVia)) {
+      if (p.confirmedAt === undefined) return p;
+      const { confirmedAt: _c, ...rest } = p;
+      return rest;
     }
     if (p.source === undefined && p.confirmedAt === undefined) return p;
     const { confirmedAt: _c, source, ...rest } = p;
