@@ -66,7 +66,7 @@ import {
   stockCheckOn, soonExpiringItems, confirmStockCheckItems, formatStockCheckDate, type StockCheckItem,
 } from "../services/stock-check-reminder";
 import {
-  getOwnerImportOverview, productImportEnabledFor, profileWebsite, OWNER_FETCH_BUSY_MESSAGE, OWNER_FETCH_DAILY_LIMIT_MESSAGE,
+  getOwnerImportOverview, productImportEnabledFor, profileWebsite, siteDomain, productImportOfferDismissed, productImportStartedBefore, OWNER_FETCH_BUSY_MESSAGE, OWNER_FETCH_DAILY_LIMIT_MESSAGE,
   OWNER_FETCH_RUNNING_MESSAGE, OWNER_IMPORT_NO_WEBSITE_MESSAGE,
 } from "../services/product-import/owner-import";
 import { autoSyncStatusView, importPageAutoSyncChoice, type AutoSyncStatusView } from "../services/product-import/auto-sync";
@@ -2285,6 +2285,14 @@ function renderOwnerPortalPage(req: Request, res: Response, addForm: OwnerItemsA
       productImportCard = "";
     }
 
+    let productImportOfferCard = "";
+    try {
+      productImportOfferCard = productImportOfferCardHtml(agentId, session, agent.is_verified);
+    } catch (e) {
+      console.error("[owner-portal] product import offer card failed:", e instanceof Error ? e.message : "error");
+      productImportOfferCard = "";
+    }
+
     const ownerFeaturesCardHtml = hasOwnerFeatures ? ownerFeaturesEntryCardHtml(agentId) : "";
 
     // beta-for-alle S3: the beta card on the regular owner page — only with
@@ -2442,7 +2450,7 @@ function renderOwnerPortalPage(req: Request, res: Response, addForm: OwnerItemsA
         <p>Rediger profilinformasjonen din. Endringer logges og er synlige for support.</p>
         ${alert}
       </div>`;
-    const body = `${topCardHtml}${overviewHtml}
+    const body = `${productImportOfferCard}${topCardHtml}${overviewHtml}
 
       <div class="ep-card"${dashboard ? ` id="${OWNER_SHELL_PROFILE_ANCHOR}"` : ""}>
         <h2>Profilinformasjon</h2>${dashboard ? `
@@ -3765,6 +3773,37 @@ export function productImportCardVisible(agentId: string, session: { valid: bool
   if (agentIsVerified !== 1) return false;
   if (!isVerifiedOwner(agentId, session)) return false;
   return !!profileWebsite(agentId);
+}
+
+/** Offer card texts (owner-approved verbatim, daniel-responses/2026-11-25-live-brief-svar-eiertekster-og-tre-saker.md, point 4). */
+export const PRODUCT_IMPORT_OFFER_TITLE = "Hent varene dine fra nettsiden din";
+export const PRODUCT_IMPORT_OFFER_BUTTON = "Hent produkter fra nettsiden min";
+export const PRODUCT_IMPORT_OFFER_DISMISS = "Ikke nå";
+export const productImportOfferTextHtml = (website: string | null | undefined): string =>
+  `Vi kan lese varer og priser fra ${escapeHtml(siteDomain(website))} og legge dem klare til deg. Du ser alt først og velger selv hva som publiseres. Ingenting hentes før du trykker.`;
+
+/**
+ * Offer card at the top of the portal: same requirements as the import card (productImportCardVisible), and only until
+ * the owner has pressed «Ikke nå» or started an import. Pure read; the button posts to the existing «hent» route.
+ */
+export function productImportOfferCardHtml(agentId: string, session: { valid: boolean; agentId?: string }, agentIsVerified: number): string {
+  if (!productImportCardVisible(agentId, session, agentIsVerified)) return "";
+  if (productImportOfferDismissed(agentId) || productImportStartedBefore(agentId)) return "";
+  const id = encodeURIComponent(agentId);
+  return `<div class="ep-card" data-product-import-offer="1">
+        <h2>${PRODUCT_IMPORT_OFFER_TITLE}</h2>
+        <p>${productImportOfferTextHtml(profileWebsite(agentId))}</p>
+        <div class="ep-form-actions">
+          <form method="post" action="/eier/${id}/produktimport/hent" style="margin:0;">
+            <button type="submit" class="ep-btn ep-btn-primary">${PRODUCT_IMPORT_OFFER_BUTTON}</button>
+          </form>
+          <form method="post" action="/eier/${id}/produktimport/ikke-na" style="margin:0;">
+            <button type="submit" class="ep-btn ep-btn-secondary">${PRODUCT_IMPORT_OFFER_DISMISS}</button>
+          </form>
+        </div>
+      </div>
+
+      `;
 }
 
 type ImportOverview = ReturnType<typeof getOwnerImportOverview>;
