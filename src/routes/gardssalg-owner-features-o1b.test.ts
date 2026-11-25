@@ -7,8 +7,8 @@
  *       «Bekreftet oppmøte regnes med i provisjonsgrunnlaget» are gone; the
  *       attendance page says neutrally that attendance is registered; never
  *       «Rett fra Bonden». Public text: NOT behind the owner-features flag.
- *   (n) portal, tab NOT open (flag off, or allowlisted but not the test
- *       producer): the booking checkbox and the pause card are there and the
+ *   (n) portal, tab NOT open (flag off, or not allowlisted; O2-5: an
+ *       allowlisted real producer has the tab open): the booking checkbox and the pause card are there and the
  *       markup around them is exactly as before; the old write paths work.
  *   (y) portal, tab open (principle 7, «Én bryter, ett sted»): no checkbox,
  *       no pause card, a pointer to «Mine valg»; the profile text fields
@@ -192,7 +192,11 @@ export function runGardssalgOwnerFeaturesO1bTests(opts: { log?: boolean } = {}):
       process.env.OWNER_FEATURES_ALLOWED_SUBJECTS = "gardssalg:o1b-test,gardssalg:o1b-real";
       delete process.env.OA_OWNER_FEATURES_ENABLED;
       const realOff = await req("GET", portal("ektegard"), cookie("tok-real"));
-      assertEq(realOn.body, realOff.body, "n9: allowlisted but not the test producer → portal byte-identical to flag off");
+      // O2-5: the test-producer lock is gone — an allowlisted real producer
+      // has the tab open, so its portal moves booking + pause to «Mine valg».
+      assertTrue(realOn.body !== realOff.body && realOn.body.includes('data-mine-valg="1"') && realOn.body.includes("data-moved-to-mine-valg")
+        && !realOn.body.includes('id="f-booking"') && realOn.body.includes('href="/kategori/gardssalg/eier/ektegard/valg"'),
+        "n9: O2-5 — allowlisted real producer (flag on) → the tab is open: «Mine valg» card + pointer, no booking checkbox");
       assertEq(realNotListed.body, realOff.body, "n10: not allowlisted (flag on) → portal byte-identical to flag off");
 
       // Old write paths work as before while the tab is not open.

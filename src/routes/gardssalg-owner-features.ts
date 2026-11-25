@@ -107,8 +107,9 @@ export const OWNER_PAGE_CSS_LIGHT = lightOnlyCss(OWNER_PAGE_CSS);
 // Order of checks on every call (nothing is read or written before they pass):
 //   1. OA_OWNER_FEATURES_ENABLED off → 404 (flag off = today's behaviour);
 //   2. the producer row (the portal's own slug/id lookup) → 404;
-//   3. the allowlist OWNER_FEATURES_ALLOWED_SUBJECTS (`gardssalg:<id>`) and,
-//      until Daniel's pilot GO, experience_providers.is_test_provider = 1 → 404;
+//   3. the allowlist OWNER_FEATURES_ALLOWED_SUBJECTS (`gardssalg:<id>`) → 404
+//      (since slice O2-5 of dev-request 2026-11-12-opplevagent-o2-eierdashbord-
+//      for-besok the allowlist alone decides; there is no test-producer lock);
 //   4. the portal's owner session (oa_owner_session cookie or Bearer, the
 //      SAME sessionFromRequest) → 401;
 //   5. the session belongs to this producer → 403;
@@ -146,27 +147,19 @@ export interface GardssalgOwnerFeaturesDeps {
   sessionFromRequest: (req: Request) => { valid: boolean; providerId?: string; token?: string };
 }
 
-/** Is this producer row the test producer? (is_test_provider = 1) */
-function isTestProvider(providerId: string): boolean {
-  try {
-    const row = getVerticalDb("experiences")
-      .prepare(`SELECT is_test_provider FROM experience_providers WHERE id = ?`)
-      .get(providerId) as { is_test_provider: number | null } | undefined;
-    return Number(row?.is_test_provider) === 1;
-  } catch {
-    return false;
-  }
-}
-
-/** The tab is open for this producer: flag on, allowlisted, the test producer (O1a). */
+/**
+ * The tab is open for this producer: flag on and allowlisted (O1a). Since
+ * O2-5 the shared allowlist alone decides — the old test-producer lock
+ * (experience_providers.is_test_provider = 1) is gone.
+ */
 export function gardssalgOwnerFeaturesTabOpen(providerId: string, env: NodeJS.ProcessEnv = process.env): boolean {
-  return oaOwnerFeaturesEnabled(env) && isSubjectAllowedForOwnerFeatures(VERTICAL, providerId, env) && isTestProvider(providerId);
+  return oaOwnerFeaturesEnabled(env) && isSubjectAllowedForOwnerFeatures(VERTICAL, providerId, env);
 }
 
 // ── O2-1: the gårdssalg owner dashboard shell ─────────────────────────────
 // dev-request 2026-11-12-opplevagent-o2-eierdashbord-for-besok, slice O2-1.
 // GARDSSALG_OWNER_DASHBOARD_ENABLED (off | pilot | 1, owner-features/
-// gardssalg.ts) AND — until slice O2-5 — the test producer only, AND a
+// gardssalg.ts; pilot = the shared allowlist, `gardssalg:<id>`) AND a
 // verified owner session for this producer with a live claim. Then:
 //   - the portal (Oversikt) and «Mine valg» are shown inside the shell
 //     (owner-ui/gardssalg-dashboard.ts) with the four tabs;
@@ -177,10 +170,14 @@ export function gardssalgOwnerFeaturesTabOpen(providerId: string, env: NodeJS.Pr
 // two new URLs answer 404. Every dashboard response is `no-store`; the GETs
 // read only.
 
-/** The dashboard's flag gate for this producer: the flag mode, the allowlist (pilot) and the test-producer lock (until O2-5). */
+/**
+ * The dashboard's flag gate for this producer: the flag mode and the
+ * allowlist (pilot). Since O2-5 there is no test-producer lock — the flag
+ * modes and OWNER_FEATURES_ALLOWED_SUBJECTS alone decide.
+ */
 export function gardssalgOwnerDashboardActiveFor(providerId: string, env: NodeJS.ProcessEnv = process.env): boolean {
   try {
-    return gardssalgOwnerDashboardFlagOnFor(providerId, env) && isTestProvider(providerId);
+    return gardssalgOwnerDashboardFlagOnFor(providerId, env);
   } catch {
     return false;
   }
@@ -497,7 +494,7 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
 
   // ── O2-1: «Mine besøk» and «Statistikk» in the dashboard shell ─────────
   // Order of checks (nothing is read before they pass): flag off → 404;
-  // the producer row → 404; allowlist (pilot) and the test producer → 404;
+  // the producer row → 404; not allowlisted (pilot) → 404;
   // no session → 401; another producer's session or no live claim → 403.
   type DashboardGate =
     | { ok: true; provider: ClaimProviderRow; slug: string; token: string }
@@ -850,7 +847,7 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
   // ── O4-3: «Send bekreftelse» for the address requests go to ───────────
   // POST …/valg/adresse — flag GARDSSALG_NOTIFY_ADDRESS_CONFIRM_ENABLED off:
   // this route does not exist (falls through exactly as before). Then the
-  // page's own checks (pageGate: flag, allowlist, test producer, session,
+  // page's own checks (pageGate: flag, allowlist, session,
   // claim; writeGuard: Origin + per-session cap) and 303 back to the
   // «Ta imot besøk» row, where the block shows the new state (addr.sent).
   router.post(

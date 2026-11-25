@@ -13,10 +13,12 @@
  *        «Mine valg» and «Statistikk» answer 200 with the four tabs (one
  *        <nav>, one aria-current on the right tab).
  *   AK3  pilot → a gårdssalg profile off the list gets 404 on the dashboard
- *        URLs (and no shell on its portal); the test-producer lock holds in
- *        every mode (an allowlisted real producer → 404).
+ *        URLs (and no shell on its portal). O2-5: the test-producer lock is
+ *        gone — an allowlisted real producer with its own session gets the
+ *        dashboard (200), a real producer off the list → 404, and a real
+ *        producer's session never opens another real producer's dashboard.
  *   AK4  every dashboard response is `Cache-Control: no-store`.
- *   (1)  flag "1" → all (no allowlist needed), the lock still applies.
+ *   (1)  flag "1" → all (no allowlist needed), real producers included (O2-5).
  *   (g)  no session → 401, another producer → 403; the GETs write nothing.
  *   (t)  texts verbatim from tekstpakke OA-3 1.1; no «Rett fra Bonden».
  *
@@ -62,7 +64,7 @@ export function runGardssalgOwnerDashboardO21Tests(opts: { log?: boolean } = {})
     delete process.env[FLAG];
     // «Mine valg» is open for the test producer, as in prod for the pilot.
     process.env.OA_OWNER_FEATURES_ENABLED = "1";
-    const ALLOW = "gardssalg:o21-test,gardssalg:o21-real";
+    const ALLOW = "gardssalg:o21-test,gardssalg:o21-real,gardssalg:o21-real2";
     process.env.OWNER_FEATURES_ALLOWED_SUBJECTS = ALLOW;
 
     const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([
@@ -135,11 +137,13 @@ export function runGardssalgOwnerDashboardO21Tests(opts: { log?: boolean } = {})
       mk("o21-test", "Testgård Dashbord", "o21testgard", "918100001");
       mk("o21-other", "Annen Testgård", "o21annengard", "918100002"); // test producer, NOT on the list
       mk("o21-real", "Ekte Gård", "o21ektegard", "918100003", { is_test_provider: null }); // on the list, not the test producer
+      mk("o21-real2", "Andre Ekte Gård", "o21andreekte", "918100004", { is_test_provider: 0 }); // on the list, real
+      mk("o21-real3", "Tredje Ekte Gård", "o21tredjeekte", "918100005", { is_test_provider: 0 }); // real, NOT on the list
       const claimRow = expDb.prepare(
         `INSERT INTO gardssalg_claims (id, provider_id, email, email_source, token, used, created_at, expires_at)
          VALUES (?, ?, ?, 'verified_domain_address', ?, 1, datetime('now'), datetime('now','+7 days'))`,
       );
-      for (const [pid, tok] of [["o21-test", "tok21-test"], ["o21-other", "tok21-other"], ["o21-real", "tok21-real"]]) {
+      for (const [pid, tok] of [["o21-test", "tok21-test"], ["o21-other", "tok21-other"], ["o21-real", "tok21-real"], ["o21-real2", "tok21-real2"], ["o21-real3", "tok21-real3"]]) {
         claimRow.run(`gsc_${pid}`, pid, `eier@${pid}.example.no`, tok);
       }
 
@@ -295,8 +299,25 @@ export function runGardssalgOwnerDashboardO21Tests(opts: { log?: boolean } = {})
       // ── AK3: pilot, a profile off the list → 404 ──────────────────────
       for (const tab of ["besok", "statistikk"] as const) {
         assertEq((await get(url("o21annengard", tab), cookie("tok21-other"))).status, 404, `AK3a: pilot, not on the list → /${tab} 404`);
-        assertEq((await get(url("o21ektegard", tab), cookie("tok21-real"))).status, 404, `AK3b: pilot, on the list but not the test producer → /${tab} 404 (lock until O2-5)`);
+        const real = await get(url("o21ektegard", tab), cookie("tok21-real"));
+        assertTrue(real.status === 200 && tabsIn(real.body).length === 4, `AK3b: O2-5 — pilot, a real producer on the list with its own session → /${tab} 200 with the four tabs`);
+        assertEq(real.headers["cache-control"], "no-store", `AK3b2: O2-5 — the real producer's /${tab} is no-store`);
+        assertEq((await get(url("o21tredjeekte", tab), cookie("tok21-real3"))).status, 404, `AK3b3: O2-5 — pilot, a real producer NOT on the list → /${tab} 404`);
         assertEq((await get(url("finnesikke", tab), cookie("tok21-test"))).status, 404, `AK3c: unknown slug → /${tab} 404`);
+        // Cross-owner: two real allowlisted producers, each only its own dashboard.
+        assertEq((await get(url("o21andreekte", tab), cookie("tok21-real"))).status, 403, `AK3e: O2-5 — real producer A's session on real producer B's /${tab} → 403`);
+        assertEq((await get(url("o21ektegard", tab), cookie("tok21-real2"))).status, 403, `AK3f: O2-5 — real producer B's session on real producer A's /${tab} → 403`);
+        assertEq((await get(url("o21testgard", tab), cookie("tok21-real"))).status, 403, `AK3g: O2-5 — a real producer's session on the test producer's /${tab} → 403`);
+        assertEq((await get(url("o21tredjeekte", tab), cookie("tok21-real"))).status, 404, `AK3h: O2-5 — a real producer's session on an off-list producer's /${tab} → 404`);
+      }
+      {
+        const realPortalPilot = await get(url("o21ektegard", "portal"), cookie("tok21-real"));
+        assertTrue(realPortalPilot.status === 200 && hasShell(realPortalPilot.body), "AK3i: O2-5 — pilot, the allowlisted real producer's portal carries the shell");
+        assertTrue(realPortalPilot.body.includes("Ekte Gård") && !realPortalPilot.body.includes("Andre Ekte Gård") && !realPortalPilot.body.includes("Testgård Dashbord"), "AK3j: O2-5 — the real producer's portal names only itself");
+        const crossPortal = await get(url("o21andreekte", "portal"), cookie("tok21-real"));
+        assertTrue(!hasShell(crossPortal.body) && !crossPortal.body.includes("besok@o21andreekte.example.no"), "AK3k: O2-5 — A's session on B's portal → no shell and none of B's owner data");
+        const offPortal = await get(url("o21tredjeekte", "portal"), cookie("tok21-real3"));
+        assertTrue(offPortal.status === 200 && !hasShell(offPortal.body), "AK3l: O2-5 — pilot, a real producer off the list → its portal has no shell");
       }
       const otherPortal = await get(url("o21annengard", "portal"), cookie("tok21-other"));
       assertTrue(otherPortal.status === 200 && !hasShell(otherPortal.body), "AK3d: pilot, not on the list → its portal has no shell");
@@ -316,14 +337,17 @@ export function runGardssalgOwnerDashboardO21Tests(opts: { log?: boolean } = {})
       for (const tab of ["besok", "statistikk", "portal", "valg"] as const) await get(url("o21testgard", tab), cookie("tok21-test"));
       assertEq([changes(expDb), changes(rfbDb)], before, "g3: the dashboard GETs write nothing (both databases)");
 
-      // ── (1) flag "1": all, the lock still applies ─────────────────────
+      // ── (1) flag "1": all, real producers included (O2-5) ─────────────
       setFlag("1");
       process.env.OWNER_FEATURES_ALLOWED_SUBJECTS = "";
       const all = await get(url("o21annengard", "besok"), cookie("tok21-other"));
       assertTrue(all.status === 200 && tabsIn(all.body).length === 4, "a1: flag 1 → a test producer off the list gets the dashboard (all)");
-      assertEq((await get(url("o21ektegard", "besok"), cookie("tok21-real"))).status, 404, "a2: flag 1 → a real producer still 404 (test-producer lock until O2-5)");
-      const realPortal = await get(url("o21ektegard", "portal"), cookie("tok21-real"));
-      assertTrue(realPortal.status === 200 && !hasShell(realPortal.body), "a3: flag 1 → a real producer's portal has no shell");
+      const realAll = await get(url("o21tredjeekte", "besok"), cookie("tok21-real3"));
+      assertTrue(realAll.status === 200 && tabsIn(realAll.body).length === 4, "a2: O2-5 — flag 1 → a real producer with its own session gets the dashboard (no list needed)");
+      const realPortal = await get(url("o21tredjeekte", "portal"), cookie("tok21-real3"));
+      assertTrue(realPortal.status === 200 && hasShell(realPortal.body), "a3: O2-5 — flag 1 → a real producer's portal carries the shell");
+      assertEq((await get(url("o21ektegard", "statistikk"), cookie("tok21-real3"))).status, 403, "a4: O2-5 — flag 1 → a real producer's session on another real producer's dashboard → 403");
+      assertEq((await get(url("o21ektegard", "besok"))).status, 401, "a5: flag 1 → no session → 401");
       process.env.OWNER_FEATURES_ALLOWED_SUBJECTS = ALLOW;
 
       // ── (t) the shell's own text and content rules ────────────────────
