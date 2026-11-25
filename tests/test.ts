@@ -48450,6 +48450,28 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-25-dommerfeil-skal-ikke-nedgradere-verifiserte-profiler
+// (AK1–AK6): a second-line judge infra failure keeps a second-line-verified
+// profile verified, never approves a new one, is not a no-progress attempt,
+// stops judge calls after 3 in a row (run `partial`), /health warning, and
+// POST /admin/run-verifier select=second_line_infra_failure. Same in-memory
+// DB seam as the two suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-25: second-line judge infra failure does not demote verified profiles ──");
+  try {
+    const { runLokalAgentVerifierSecondLineInfraFailureTests } = require("../src/agents/lokal-agent-verifier-second-line-infra-failure.test") as
+      typeof import("../src/agents/lokal-agent-verifier-second-line-infra-failure.test");
+    const sif = await runLokalAgentVerifierSecondLineInfraFailureTests({ log: false });
+    passed += sif.passed;
+    failed += sif.failed;
+    for (const f of sif.failures) failures.push("lokal-agent-verifier-second-line-infra-failure: " + f);
+    console.log(`  lokal-agent-verifier-second-line-infra-failure: ${sif.passed} passed, ${sif.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("lokal-agent-verifier-second-line-infra-failure: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-23-rfb-flere-forstehenvendelser-dommer-bevis-og-
 // kontaktuttrekk (skive 1): own-website evidence for the RFB second-line judge
 // behind RFB_SECOND_LINE_EVIDENCE_ENABLED (default OFF) + the read-only

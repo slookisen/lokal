@@ -143,6 +143,12 @@ export interface VerifierResult {
   // 5): which slot pickBatchBiased gave this row. Only set when the row came
   // from pickBatchBiased; absent for every other picker.
   pick_slot?: VerifierPickSlot;
+  // dev-request 2026-11-25-dommerfeil-skal-ikke-nedgradere-verifiserte-
+  // profiler: the second-line judge returned no model verdict for this row
+  // (infra failure), or was not called because the run had given up on it
+  // (judge_unavailable). Absent otherwise. See runVerifierBatch.
+  second_line_judge_infra_failure?: boolean;
+  second_line_judge_unavailable?: boolean;
 }
 
 // dev-request 2026-11-15-verifier-timelane-ny-verifisering-gap: the single
@@ -570,6 +576,35 @@ export function pickByIds(db: any, ids: string[]): any[] {
         WHERE a.id IN (${placeholders})${hidden}`
     )
     .all(...ids);
+}
+
+// dev-request 2026-11-25-dommerfeil-skal-ikke-nedgradere-verifiserte-
+// profiler (punkt 5): POST /admin/run-verifier `select` value for rows whose
+// LAST stored second-line result had no judge verdict (infra_failure) or was
+// skipped because the run had given up on the judge (judge_unavailable).
+// Read from agent_knowledge.verification_review_reason (the persisted
+// cross_source_reason JSON) — no new column. RFB scope, same as pickBatch;
+// catalog-hidden rows are excluded by pickByIds when the run starts.
+export const SECOND_LINE_INFRA_FAILURE_SELECTOR = "second_line_infra_failure";
+
+export function selectSecondLineInfraFailureIds(db: any): string[] {
+  try {
+    const rows = db
+      .prepare(
+        `SELECT a.id
+           FROM agents a
+     INNER JOIN agent_knowledge k ON k.agent_id = a.id
+          WHERE ${RFB_VERIFIER_SCOPE_SQL}
+            AND json_valid(k.verification_review_reason)
+            AND (json_extract(k.verification_review_reason, '$.second_line.infra_failure') = 1
+                 OR json_extract(k.verification_review_reason, '$.second_line.judge_unavailable') = 1)
+       ORDER BY k.last_verified_at ASC, a.id ASC`
+      )
+      .all() as Array<{ id: string }>;
+    return rows.map((r) => r.id);
+  } catch {
+    return [];
+  }
 }
 
 // PR-27: Re-process review_required + data_insufficient agents first.
@@ -1275,6 +1310,12 @@ export function applyVerifierOutcome(
     // those columns are simply never touched then.
     verified_second_line?: boolean;
     second_line_sources?: string[];
+    // dev-request 2026-11-25-dommerfeil-skal-ikke-nedgradere-verifiserte-
+    // profiler (punkt 3): the second-line judge had an infrastructure failure
+    // (or was unavailable) for this row — an outage is not a no-progress
+    // attempt, so the pending_verify no-progress counter / parking block
+    // below is skipped entirely (neither incremented nor reset).
+    skip_no_progress_tracking?: boolean;
   }
 ): void {
   if (outcome.url_last_probed !== undefined || outcome.url_last_status !== undefined) {
@@ -1368,72 +1409,74 @@ export function applyVerifierOutcome(
   // in marketplace.ts. Best-effort — same as the sweep_processed_at block
   // above, the columns may be absent in minimal test-harness schemas that
   // build agent_knowledge without running full init().
-  try {
-    if (outcome.new_verification_status === "pending_verify") {
-      db.prepare(
-        `UPDATE agent_knowledge SET pending_verify_no_progress_count = pending_verify_no_progress_count + 1 WHERE agent_id = ?`
-      ).run(agentId);
-      // Stamp when not yet parked — or RE-STAMP when the 30-day backoff has
-      // already expired and the re-probe still made no progress. Without
-      // the re-stamp, the stale timestamp keeps satisfying the exclusion
-      // clause's `<= now-30d` forever, so a still-unresolvable agent would
-      // revert to being selected every sweep after its first backoff cycle
-      // (the exact PR #248 review blocker in the homepage-parking
-      // precedent — must not repeat it here).
-      //
-      // The eligibility check itself is done entirely in SQL (no JS
-      // Date.parse/Date.now() round-trip): a JS-side re-read-then-compare
-      // of the SQL-native "YYYY-MM-DD HH:MM:SS" (no timezone marker)
-      // string is interpreted as LOCAL time by Date.parse per ECMA-262,
-      // while the write side (datetime('now')) and pickPendingVerifyBatch's
-      // read side (datetime('now','-30 days')) are both UTC-native — under
-      // a UTC-behind timezone that JS-side comparison could judge a
-      // SQL-already-expired row as "not yet expired" and silently skip the
-      // re-stamp. Keeping the whole comparison SQL-native (matching
-      // stampParking() in admin-domain-coherence.ts) avoids the mismatch.
-      // Observability only (dev-request 2026-10-27-parkering-released-reparked-
-      // tellere): log a 'reparked' event BEFORE the re-stamp, using the exact
-      // same SQL-native predicate as the UPDATE below but restricted to rows
-      // that were ALREADY parked (first-time park, parked_since NULL, is not
-      // a repark). Own try/catch so a missing events table can never block
-      // the re-stamp itself.
-      try {
+  if (!outcome.skip_no_progress_tracking) {
+    try {
+      if (outcome.new_verification_status === "pending_verify") {
         db.prepare(
-          `INSERT INTO pending_verify_parking_events (agent_id, kind)
-           SELECT agent_id, 'reparked' FROM agent_knowledge
+          `UPDATE agent_knowledge SET pending_verify_no_progress_count = pending_verify_no_progress_count + 1 WHERE agent_id = ?`
+        ).run(agentId);
+        // Stamp when not yet parked — or RE-STAMP when the 30-day backoff has
+        // already expired and the re-probe still made no progress. Without
+        // the re-stamp, the stale timestamp keeps satisfying the exclusion
+        // clause's `<= now-30d` forever, so a still-unresolvable agent would
+        // revert to being selected every sweep after its first backoff cycle
+        // (the exact PR #248 review blocker in the homepage-parking
+        // precedent — must not repeat it here).
+        //
+        // The eligibility check itself is done entirely in SQL (no JS
+        // Date.parse/Date.now() round-trip): a JS-side re-read-then-compare
+        // of the SQL-native "YYYY-MM-DD HH:MM:SS" (no timezone marker)
+        // string is interpreted as LOCAL time by Date.parse per ECMA-262,
+        // while the write side (datetime('now')) and pickPendingVerifyBatch's
+        // read side (datetime('now','-30 days')) are both UTC-native — under
+        // a UTC-behind timezone that JS-side comparison could judge a
+        // SQL-already-expired row as "not yet expired" and silently skip the
+        // re-stamp. Keeping the whole comparison SQL-native (matching
+        // stampParking() in admin-domain-coherence.ts) avoids the mismatch.
+        // Observability only (dev-request 2026-10-27-parkering-released-reparked-
+        // tellere): log a 'reparked' event BEFORE the re-stamp, using the exact
+        // same SQL-native predicate as the UPDATE below but restricted to rows
+        // that were ALREADY parked (first-time park, parked_since NULL, is not
+        // a repark). Own try/catch so a missing events table can never block
+        // the re-stamp itself.
+        try {
+          db.prepare(
+            `INSERT INTO pending_verify_parking_events (agent_id, kind)
+             SELECT agent_id, 'reparked' FROM agent_knowledge
+              WHERE agent_id = ?
+                AND pending_verify_no_progress_count >= 3
+                AND pending_verify_parked_since IS NOT NULL
+                AND pending_verify_parked_since <= datetime('now','-30 days')`
+          ).run(agentId);
+        } catch {
+          // events table absent (minimal test schema) — skip.
+        }
+        db.prepare(
+          `UPDATE agent_knowledge
+              SET pending_verify_parked_since = datetime('now')
             WHERE agent_id = ?
               AND pending_verify_no_progress_count >= 3
-              AND pending_verify_parked_since IS NOT NULL
-              AND pending_verify_parked_since <= datetime('now','-30 days')`
+              AND (pending_verify_parked_since IS NULL OR pending_verify_parked_since <= datetime('now','-30 days'))`
         ).run(agentId);
-      } catch {
-        // events table absent (minimal test schema) — skip.
-      }
-      db.prepare(
-        `UPDATE agent_knowledge
-            SET pending_verify_parked_since = datetime('now')
-          WHERE agent_id = ?
-            AND pending_verify_no_progress_count >= 3
-            AND (pending_verify_parked_since IS NULL OR pending_verify_parked_since <= datetime('now','-30 days'))`
-      ).run(agentId);
-    } else {
-      // Observability only: 'released' event, only when the row was actually
-      // parked before (never-parked rows must not count). Own try/catch.
-      try {
+      } else {
+        // Observability only: 'released' event, only when the row was actually
+        // parked before (never-parked rows must not count). Own try/catch.
+        try {
+          db.prepare(
+            `INSERT INTO pending_verify_parking_events (agent_id, kind)
+             SELECT agent_id, 'released' FROM agent_knowledge
+              WHERE agent_id = ? AND pending_verify_parked_since IS NOT NULL`
+          ).run(agentId);
+        } catch {
+          // events table absent (minimal test schema) — skip.
+        }
         db.prepare(
-          `INSERT INTO pending_verify_parking_events (agent_id, kind)
-           SELECT agent_id, 'released' FROM agent_knowledge
-            WHERE agent_id = ? AND pending_verify_parked_since IS NOT NULL`
+          `UPDATE agent_knowledge SET pending_verify_no_progress_count = 0, pending_verify_parked_since = NULL WHERE agent_id = ?`
         ).run(agentId);
-      } catch {
-        // events table absent (minimal test schema) — skip.
       }
-      db.prepare(
-        `UPDATE agent_knowledge SET pending_verify_no_progress_count = 0, pending_verify_parked_since = NULL WHERE agent_id = ?`
-      ).run(agentId);
+    } catch {
+      // pending_verify parking columns not present in this DB — skip.
     }
-  } catch {
-    // pending_verify parking columns not present in this DB — skip.
   }
 
   // dev-request 2026-08-23-rfb-andrelinje-verifisering-lav-terskel
@@ -1813,6 +1856,14 @@ export interface SecondLineGateResult {
   };
   sources: string[];
   judge_reason?: string;
+  // dev-request 2026-11-25-dommerfeil-skal-ikke-nedgradere-verifiserte-
+  // profiler: the judge was called but returned no model verdict
+  // (verdict.infraFailure) — `passes` is false, but not because of the profile.
+  judge_infra_failure?: boolean;
+  // ...or the judge was NOT called because this run already saw
+  // SECOND_LINE_JUDGE_MAX_CONSECUTIVE_INFRA_FAILURES infra failures in a row
+  // (input.judgeUnavailable). Only set when the deterministic checks held.
+  judge_unavailable?: boolean;
 }
 
 // ─── dev-request 2026-10-23-rfb-flere-forstehenvendelser-dommer-bevis-og-
@@ -1942,6 +1993,11 @@ export async function computeSecondLineVerification(input: {
     evidence?: readonly SecondLineEvidenceItem[];
     fenceEvidence?: boolean;
   }) => Promise<SecondLineProfileJudgeVerdict>;
+  // dev-request 2026-11-25-dommerfeil-skal-ikke-nedgradere-verifiserte-
+  // profiler (punkt 4): the caller's run has given up on the judge. When the
+  // deterministic checks hold, neither evidence nor the judge is fetched and
+  // the result carries judge_unavailable: true (passes stays false).
+  judgeUnavailable?: boolean;
 }): Promise<SecondLineGateResult> {
   const nace_brreg_ok = input.gate_reasons.no_wrong_fit && input.gate_reasons.brreg_active;
 
@@ -1962,7 +2018,9 @@ export async function computeSecondLineVerification(input: {
 
   let judge_approved = false;
   let judge_reason: string | undefined;
-  if (deterministicOk) {
+  let judge_infra_failure = false;
+  const judge_unavailable = deterministicOk && !!input.judgeUnavailable;
+  if (deterministicOk && !judge_unavailable) {
     const judgeFn = input.judgeFn ?? judgeSecondLineProfile;
     let evidence: readonly SecondLineEvidenceItem[] = input.evidence ?? [];
     if (evidence.length === 0 && input.evidenceFn) {
@@ -1983,6 +2041,7 @@ export async function computeSecondLineVerification(input: {
     });
     judge_approved = verdict.approved;
     judge_reason = verdict.reason;
+    judge_infra_failure = !verdict.approved && verdict.infraFailure === true;
   }
 
   return {
@@ -1990,6 +2049,8 @@ export async function computeSecondLineVerification(input: {
     reasons: { nace_brreg_ok, email_present, email_not_junk, email_not_paraply, has_accepted_source, judge_approved },
     sources,
     judge_reason,
+    ...(judge_infra_failure ? { judge_infra_failure: true } : {}),
+    ...(judge_unavailable ? { judge_unavailable: true } : {}),
   };
 }
 
@@ -2714,6 +2775,31 @@ export async function computeFieldSpotCheck(
 
 // Main loop. Caller (Fly Machine job, test, or manual) provides a
 // brregLookup function (or null to skip Brreg).
+// ─── dev-request 2026-11-25-dommerfeil-skal-ikke-nedgradere-verifiserte-
+//     profiler (punkt 4): per-run judge outage tracking ───────────────────
+// After this many second-line judge infra failures IN A ROW within one run,
+// the run stops calling the judge; every later row that would need it is
+// marked judge_unavailable instead (same status handling as an infra
+// failure, no API call).
+export const SECOND_LINE_JUDGE_MAX_CONSECUTIVE_INFRA_FAILURES = 3;
+
+export interface SecondLineJudgeRunState {
+  /** Infra failures in a row (reset by any model verdict). */
+  consecutive_infra_failures: number;
+  /** All infra failures this run. */
+  infra_failures: number;
+  /** Rows that needed the judge after the run gave up on it. */
+  judge_unavailable: number;
+  /** The first infra failure's reason text this run. */
+  first_error: string | null;
+  /** True once consecutive_infra_failures reached the max. */
+  gave_up: boolean;
+}
+
+export function newSecondLineJudgeRunState(): SecondLineJudgeRunState {
+  return { consecutive_infra_failures: 0, infra_failures: 0, judge_unavailable: 0, first_error: null, gave_up: false };
+}
+
 export async function runVerifierBatch(opts: {
   batchSize?: number;
   brregLookup?: BrregFn | null;
@@ -2775,11 +2861,22 @@ export async function runVerifierBatch(opts: {
   deadlineAt?: number;
   // Clock for the deadline check (test seam). Defaults to Date.now.
   nowMs?: () => number;
+  // dev-request 2026-11-25-dommerfeil-skal-ikke-nedgradere-verifiserte-
+  // profiler (punkt 4): the judge outage tracker for this run. A caller that
+  // runs the verifier one agent at a time as part of a bigger run (the
+  // nightly re-verify step) passes ONE state for all its calls, so "three in
+  // a row" counts across them. Omitted = a fresh state for this batch.
+  secondLineJudgeRunState?: SecondLineJudgeRunState;
 }): Promise<{
   run_id: string;
   started_at: string;
   finished_at: string;
   results: VerifierResult[];
+  // dev-request 2026-11-25-dommerfeil-skal-ikke-nedgradere-verifiserte-
+  // profiler: the judge outage tracker as it stood when the batch ended.
+  // Optional only so injected test doubles (verifier-sweep's runBatch) need
+  // not return it; the real function always does.
+  second_line_judge?: SecondLineJudgeRunState;
   // S5c: true when deadlineAt stopped the loop before every candidate ran.
   truncated?: boolean;
   // S5c: candidates never started because of deadlineAt.
@@ -2824,6 +2921,7 @@ export async function runVerifierBatch(opts: {
   }
 
   const results: VerifierResult[] = [];
+  const judgeRun = opts.secondLineJudgeRunState ?? newSecondLineJudgeRunState();
   const nowMs = opts.nowMs ?? Date.now;
   let startedCount = 0;
   let truncated = false;
@@ -3244,6 +3342,11 @@ export async function runVerifierBatch(opts: {
     // ═══════════════════════════════════════════════════════════════════
     let verifiedSecondLine = false;
     let secondLineSources: string[] = [];
+    // dev-request 2026-11-25-dommerfeil-skal-ikke-nedgradere-verifiserte-
+    // profiler: set when the second line failed ONLY because the judge had no
+    // verdict (infra failure) or was given up on for this run.
+    let judgeInfraFailure = false;
+    let judgeUnavailable = false;
     if (secondLineEnabled) {
       const affiliatedUmbrellaDomains = getAffiliatedUmbrellaDomains(db, agent.id);
 
@@ -3294,6 +3397,7 @@ export async function runVerifierBatch(opts: {
           },
           affiliated_umbrella_domains: affiliatedUmbrellaDomains,
           judgeFn: opts.secondLineJudgeFn,
+          judgeUnavailable: judgeRun.gave_up,
           ...(secondLineEvidenceEnabled
             ? {
                 evidenceFn: (sources: readonly string[]) =>
@@ -3304,12 +3408,35 @@ export async function runVerifierBatch(opts: {
               }
             : {}),
         });
+        judgeInfraFailure = secondLine.judge_infra_failure === true;
+        judgeUnavailable = secondLine.judge_unavailable === true;
+        const slr = secondLine.reasons;
+        const judgeCalled =
+          !judgeUnavailable && slr.nace_brreg_ok && slr.email_present && slr.email_not_junk && slr.email_not_paraply && slr.has_accepted_source;
+        if (judgeInfraFailure) {
+          judgeRun.infra_failures += 1;
+          judgeRun.consecutive_infra_failures += 1;
+          if (judgeRun.first_error === null) judgeRun.first_error = secondLine.judge_reason ?? "(ingen feiltekst)";
+          if (!judgeRun.gave_up && judgeRun.consecutive_infra_failures >= SECOND_LINE_JUDGE_MAX_CONSECUTIVE_INFRA_FAILURES) {
+            judgeRun.gave_up = true;
+            console.error(
+              `[verifier] second-line judge: ${judgeRun.consecutive_infra_failures} infra failures in a row — ` +
+              `no more judge calls this run (first error: ${judgeRun.first_error})`,
+            );
+          }
+        } else if (judgeUnavailable) {
+          judgeRun.judge_unavailable += 1;
+        } else if (judgeCalled) {
+          judgeRun.consecutive_infra_failures = 0;
+        }
         (crossSourceResults as Record<string, unknown>).second_line = {
           attempted: true,
           passes: secondLine.passes,
           reasons: secondLine.reasons,
           sources: secondLine.sources,
           judge_reason: secondLine.judge_reason,
+          ...(judgeInfraFailure ? { infra_failure: true } : {}),
+          ...(judgeUnavailable ? { judge_unavailable: true } : {}),
         };
         if (secondLine.passes) {
           verifiedSecondLine = true;
@@ -3318,6 +3445,23 @@ export async function runVerifierBatch(opts: {
           console.log(
             `[verifier] ${agent.id} (${agent.name ?? "?"}) second-line verified (sources: ${secondLine.sources.join(", ") || "none"})`,
           );
+        } else if (judgeInfraFailure || judgeUnavailable) {
+          // dev-request 2026-11-25-dommerfeil-skal-ikke-nedgradere-
+          // verifiserte-profiler (punkt 2+3): every deterministic second-line
+          // check held; only the judge's verdict is missing. A row the second
+          // line ALREADY approved (verified now, stored verified_second_line =
+          // 1) keeps 'verified' — no status transition, and the stored
+          // sources stay as they are (verifiedSecondLine stays false, so
+          // applyVerifierOutcome does not rewrite them). Every other row keeps
+          // the first-line result exactly as today: never approved on an
+          // outage. The no-progress counter is skipped below for both.
+          if (priorStatus === "verified" && readStoredVerifiedSecondLine(db, agent.id)) {
+            newVerification = "verified";
+            console.log(
+              `[verifier] ${agent.id} (${agent.name ?? "?"}) second-line judge ${judgeUnavailable ? "unavailable" : "infra failure"} — ` +
+              `stays verified (stored verified_second_line=1)`,
+            );
+          }
         } else if (
           process.env.RFB_TERMINAL_UNCONFIRMABLE_ENABLED === "true" &&
           !secondLine.reasons.has_accepted_source &&
@@ -3408,6 +3552,7 @@ export async function runVerifierBatch(opts: {
       url_last_status: probeResult ? probeResult.status : null,
       verified_second_line: verifiedSecondLine,
       second_line_sources: secondLineSources,
+      ...(judgeInfraFailure || judgeUnavailable ? { skip_no_progress_tracking: true } : {}),
     });
 
     results.push({
@@ -3430,6 +3575,8 @@ export async function runVerifierBatch(opts: {
       email_ownership_unproven: emailOwnershipUnproven,
       email_ownership_report_only: emailOwnershipReportOnly,
       verified_second_line: verifiedSecondLine,
+      ...(judgeInfraFailure ? { second_line_judge_infra_failure: true } : {}),
+      ...(judgeUnavailable ? { second_line_judge_unavailable: true } : {}),
       agent_name: agent.name ?? null,
       prior_verification_status: agent.verification_status,
       ...(agent.pick_slot ? { pick_slot: agent.pick_slot as VerifierPickSlot } : {}),
@@ -3441,6 +3588,7 @@ export async function runVerifierBatch(opts: {
     started_at: startedAt,
     finished_at: new Date().toISOString(),
     results,
+    second_line_judge: { ...judgeRun },
     truncated,
     not_processed: candidates.length - startedCount,
   };
@@ -3480,6 +3628,50 @@ function sortedCounts(counts: Record<string, number>): Record<string, number> {
   const out: Record<string, number> = {};
   for (const k of Object.keys(counts).sort()) out[k] = counts[k];
   return out;
+}
+
+// dev-request 2026-11-25-dommerfeil-skal-ikke-nedgradere-verifiserte-
+// profiler (punkt 4): the run-ledger claim for a second-line judge outage.
+// Emitted (and the run marked `partial`) only when the run saw at least one
+// infra failure or judge_unavailable row; a run without one is unchanged.
+export const SECOND_LINE_JUDGE_INFRA_FAILURE_CLAIM_KIND = "second_line_judge_infra_failure";
+
+export function secondLineJudgeOutageClaim(input: {
+  infra_failures: number;
+  judge_unavailable: number;
+  first_error: string | null;
+  agent_ids?: string[];
+}): { type: "custom"; value: number; meta: Record<string, unknown> } | null {
+  if (input.infra_failures <= 0 && input.judge_unavailable <= 0) return null;
+  return {
+    type: "custom",
+    value: input.infra_failures,
+    meta: {
+      kind: SECOND_LINE_JUDGE_INFRA_FAILURE_CLAIM_KIND,
+      infra_failures: input.infra_failures,
+      judge_unavailable: input.judge_unavailable,
+      first_error: input.first_error ? input.first_error.slice(0, 500) : null,
+      ...(input.agent_ids ? { agent_ids: input.agent_ids } : {}),
+    },
+  };
+}
+
+/** Judge outage totals for a set of results, in run order (first error = first infra-failure row's judge_reason). */
+export function summarizeSecondLineJudgeOutage(results: VerifierResult[]): {
+  infra_failures: number;
+  judge_unavailable: number;
+  first_error: string | null;
+  agent_ids: string[];
+} {
+  const infra = results.filter((x) => x.second_line_judge_infra_failure);
+  const unavailable = results.filter((x) => x.second_line_judge_unavailable);
+  const firstSl = infra[0]?.cross_source_reason?.second_line as { judge_reason?: unknown } | undefined;
+  return {
+    infra_failures: infra.length,
+    judge_unavailable: unavailable.length,
+    first_error: infra.length > 0 ? (typeof firstSl?.judge_reason === "string" ? firstSl.judge_reason : "(ingen feiltekst)") : null,
+    agent_ids: claimAgentIds([...infra, ...unavailable]),
+  };
 }
 
 export function buildRunEnvelope(input: {
@@ -3591,6 +3783,11 @@ export function buildRunEnvelope(input: {
   const reviewRequiredPromoted = r.filter(
     (x) => x.prior_verification_status === "review_required" && x.new_verification_status === "verified"
   ).length;
+  // dev-request 2026-11-25-dommerfeil-skal-ikke-nedgradere-verifiserte-
+  // profiler (punkt 4): a judge outage makes the run `partial` and adds one
+  // claim with the count and the first error text. Absent otherwise.
+  const judgeOutage = summarizeSecondLineJudgeOutage(r);
+  const judgeOutageClaim = secondLineJudgeOutageClaim(judgeOutage);
 
   return {
     run_id: input.run_id,
@@ -3599,7 +3796,7 @@ export function buildRunEnvelope(input: {
     trigger_source: "cron",
     started_at: input.started_at,
     finished_at: input.finished_at,
-    status: "completed",
+    status: judgeOutageClaim ? "partial" : "completed",
     claims: [
       { type: "db_state_change", value: verified, meta: { kind: "agents_verified", agent_ids: verifiedAgentIds } },
       { type: "db_state_change", value: newlyVerified, meta: { kind: "agents_newly_verified" } },
@@ -3674,12 +3871,17 @@ export function buildRunEnvelope(input: {
       { type: "db_state_change", value: reviewRequiredReevaluated, meta: { kind: "review_required_reevaluated" } },
       { type: "db_state_change", value: reviewRequiredPromoted, meta: { kind: "review_required_promoted" } },
       ...pickSlotClaims(r),
+      ...(judgeOutageClaim ? [judgeOutageClaim] : []),
       ...(input.reportPath
         ? [{ type: "file_deployed", value: input.reportPath, meta: { kind: "hourly_report" } }]
         : []),
     ],
     next_suggested: ["platform-verifier"],
-    notes: `Verified ${r.length} agents, ${verified} passed kvalitets-gate, ${newlyEligible} added to outreach_ready_pool`,
+    notes:
+      `Verified ${r.length} agents, ${verified} passed kvalitets-gate, ${newlyEligible} added to outreach_ready_pool` +
+      (judgeOutageClaim
+        ? `; second-line judge outage: ${judgeOutage.infra_failures} infra failures, ${judgeOutage.judge_unavailable} judge_unavailable`
+        : ""),
   };
 }
 
