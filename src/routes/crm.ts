@@ -2205,6 +2205,104 @@ router.get("/marketing/batch-report", (_req, res) => {
   }
 });
 
+// ─── GET /admin/crm/messages ─────────────────────────────────
+// dev-request 2026-11-25-platform-verifier-crm-messages-endpoint-mangler.
+// Read-only probe for the platform-verifier: rows by message time window
+// (COALESCE(sent_at, received_at), inclusive), direction (default 'out'),
+// thread vertical and delivery_status. `total` = exact COUNT(*) for the
+// filters (what the verifier compares), independent of `limit`. No bodies,
+// snippets, raw_metadata or e-mail addresses in the output.
+// Strict params: unknown values are 400, never silently ignored.
+const ISO_8601_RE = /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/i;
+const MESSAGE_DELIVERY_STATUSES = ["sent", "queued", "draft_in_gmail", "failed"] as const;
+
+/** Parse an ISO-8601 timestamp to a canonical UTC ISO string; null if invalid.
+ *  A timestamp without an offset is read as UTC (the DB stores UTC). */
+function parseIsoTimestamp(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const s = raw.trim();
+  if (!s || !ISO_8601_RE.test(s)) return null;
+  let norm = s.replace(" ", "T");
+  if (norm.includes("T") && !/(?:Z|[+-]\d{2}:?\d{2})$/i.test(norm)) norm += "Z";
+  const ms = Date.parse(norm);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+
+router.get("/messages", (req, res) => {
+  try {
+    const since = parseIsoTimestamp(req.query.since);
+    if (!since) {
+      res.status(400).json({ error: "invalid_since", detail: "since is required and must be an ISO-8601 timestamp" });
+      return;
+    }
+    let until: string | undefined;
+    if (req.query.until !== undefined && req.query.until !== "") {
+      const u = parseIsoTimestamp(req.query.until);
+      if (!u) {
+        res.status(400).json({ error: "invalid_until", detail: "until must be an ISO-8601 timestamp" });
+        return;
+      }
+      if (Date.parse(u) < Date.parse(since)) {
+        res.status(400).json({ error: "invalid_window", detail: "until must not be before since" });
+        return;
+      }
+      until = u;
+    }
+
+    const directionRaw = req.query.direction === undefined || req.query.direction === "" ? "out" : req.query.direction;
+    if (directionRaw !== "in" && directionRaw !== "out") {
+      res.status(400).json({ error: "invalid_direction", detail: "direction must be 'in' or 'out'" });
+      return;
+    }
+    const direction = directionRaw as "in" | "out";
+
+    let vertical: CrmVertical | undefined;
+    if (req.query.vertical !== undefined && req.query.vertical !== "") {
+      if (!isCrmVertical(req.query.vertical)) {
+        res.status(400).json({ error: "invalid_vertical", detail: `vertical must be one of ${CRM_VERTICALS.join(", ")}` });
+        return;
+      }
+      vertical = req.query.vertical;
+    }
+
+    let deliveryStatus: (typeof MESSAGE_DELIVERY_STATUSES)[number] | undefined;
+    if (req.query.delivery_status !== undefined && req.query.delivery_status !== "") {
+      const ds = req.query.delivery_status;
+      if (typeof ds !== "string" || !(MESSAGE_DELIVERY_STATUSES as readonly string[]).includes(ds)) {
+        res.status(400).json({ error: "invalid_delivery_status", detail: `delivery_status must be one of ${MESSAGE_DELIVERY_STATUSES.join(", ")}` });
+        return;
+      }
+      deliveryStatus = ds as (typeof MESSAGE_DELIVERY_STATUSES)[number];
+    }
+
+    const limitParsed = parseInt(String(req.query.limit ?? ""), 10);
+    const limit = Math.min(Number.isFinite(limitParsed) && limitParsed > 0 ? limitParsed : 500, 2000);
+
+    const { total, messages } = crmService.listMessagesInWindow({
+      since, until, direction, vertical, deliveryStatus, limit,
+    });
+
+    res.json({
+      success: true,
+      total,
+      count: messages.length,
+      truncated: total > messages.length,
+      messages,
+      filters: {
+        since,
+        until: until ?? null,
+        direction,
+        vertical: vertical ?? null,
+        delivery_status: deliveryStatus ?? null,
+        limit,
+      },
+      generated_at: new Date().toISOString(),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "messages_query_failed", detail: err.message });
+  }
+});
+
 // ─── GET /admin/crm/sent-log ─────────────────────────────────
 // Phase 4.10c — list outbound messages for the Sendt-logg dashboard.
 // Filters: ?since_hours=24|168|720|all, ?channel=resend_smtp|gmail_draft|all,

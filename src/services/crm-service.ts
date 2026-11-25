@@ -1672,6 +1672,84 @@ class CrmService {
   }
 
   /**
+   * dev-request 2026-11-25-platform-verifier-crm-messages-endpoint-mangler —
+   * read-only window count/list behind GET /admin/crm/messages. The
+   * platform-verifier counts outbound rows (direction='out') whose own time
+   * falls inside a run's [started_at, finished_at] for one vertical, and
+   * compares with the run's claim. `total` is an exact COUNT(*) for the
+   * filters, independent of `limit`.
+   *
+   * Message time = COALESCE(sent_at, received_at). Both sides are wrapped in
+   * datetime(...) for the same reason as listSentMessages() above: the column
+   * mixes SQLite's 'YYYY-MM-DD HH:MM:SS' and JS ISO 'T…Z' with ms, and a raw
+   * string compare between the two is wrong. datetime() works at whole-second
+   * precision, so the bounds are inclusive at the second. Vertical filters on
+   * the thread (crm_threads.vertical_id). No contact join (contact-less rows
+   * count too) and no body/snippet/address columns are selected.
+   */
+  listMessagesInWindow(opts: {
+    since: string;
+    until?: string;
+    direction: "in" | "out";
+    vertical?: CrmVertical;
+    deliveryStatus?: "sent" | "queued" | "draft_in_gmail" | "failed";
+    limit?: number;
+  }): {
+    total: number;
+    messages: Array<{
+      message_id: string;
+      thread_id: string;
+      direction: "in" | "out";
+      vertical: string;
+      sent_at: string | null;
+      received_at: string | null;
+      delivery_status: string;
+      subject: string | null;
+    }>;
+  } {
+    const db = getDb();
+    const limit = Math.max(1, Math.min(opts.limit ?? 500, 2000));
+    const where: string[] = [
+      "m.direction = ?",
+      "datetime(COALESCE(m.sent_at, m.received_at)) >= datetime(?)",
+    ];
+    const params: unknown[] = [opts.direction, opts.since];
+    if (opts.until) {
+      where.push("datetime(COALESCE(m.sent_at, m.received_at)) <= datetime(?)");
+      params.push(opts.until);
+    }
+    if (opts.vertical) {
+      where.push("t.vertical_id = ?");
+      params.push(opts.vertical);
+    }
+    if (opts.deliveryStatus) {
+      where.push("m.delivery_status = ?");
+      params.push(opts.deliveryStatus);
+    }
+    const fromWhere = `
+      FROM crm_messages m
+      JOIN crm_threads t ON t.id = m.thread_id
+      WHERE ${where.join(" AND ")}
+    `;
+    const totalRow = db.prepare(`SELECT COUNT(*) AS n ${fromWhere}`).get(...params) as { n: number };
+    const messages = db.prepare(`
+      SELECT
+        m.id              AS message_id,
+        m.thread_id,
+        m.direction,
+        t.vertical_id     AS vertical,
+        m.sent_at,
+        m.received_at,
+        m.delivery_status,
+        m.subject
+      ${fromWhere}
+      ORDER BY datetime(COALESCE(m.sent_at, m.received_at)) ASC, m.id ASC
+      LIMIT ?
+    `).all(...params, limit) as any[];
+    return { total: Number(totalRow?.n ?? 0), messages };
+  }
+
+  /**
    * Cross-tab summary for the dashboard header.
    */
   getDashboardSummary(vertical?: CrmVertical): any {

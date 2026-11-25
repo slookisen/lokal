@@ -55884,3 +55884,23 @@ runSerial(async () => {
     failures.push("site-diagnostics: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-11-25-platform-verifier-crm-messages-endpoint-mangler:
+// read-only GET /admin/crm/messages (window/direction/vertical count for the
+// platform-verifier). Pins its own in-memory DB via __pinInMemoryDbForTesting()
+// (restored in finally) — runSerial, tail.
+runSerial(async () => {
+  console.log("\n── 2026-11-25 verifier-probe: GET /admin/crm/messages (vindu/retning/vertikal) ──");
+  try {
+    const { runCrmMessagesWindowTests } = require("../src/routes/crm-messages-window.test") as
+      typeof import("../src/routes/crm-messages-window.test");
+    const r = await runCrmMessagesWindowTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("crm-messages-window: " + f);
+    console.log(`  crm-messages-window: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-messages-window: unexpected error: " + String(err?.message || err));
+  }
+});
