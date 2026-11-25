@@ -63,7 +63,7 @@ import { OWNER_AFFILIATION_HIDDEN_FIELD } from "./owner-audit-log";
 import { affiliationsPerItemEnabled, affiliationsSwitchOffAgentIds, debioSwitchOffAgentIds } from "../owner-features/enforce";
 import { producerAffiliationRows } from "../services/producer-affiliations";
 import { debioStatusShownFor } from "../services/knowledge-service";
-import { currentForProdusenterFacts } from "../owner-features/today-facts";
+import { safeTodayFacts, safeTodayText } from "../owner-features/today-facts";
 
 // ─────────────────────────────────────────────────────────────────
 // «Mine valg» owner API — dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2a
@@ -121,6 +121,7 @@ function gate(req: Request): Gate {
 export function featureJson(entry: OwnerFeatureEntry, r: ResolvedOwnerFeature, subject: OwnerFeatureSubject) {
   // A liveFlag entry with its flag off: the pre-live default / options / since.
   const e = ownerFeatureEntryForEnv(entry);
+  const todayText = e.today ? safeTodayText(e, safeTodayFacts()) : null;
   return {
     key: e.key,
     group: e.group,
@@ -132,7 +133,7 @@ export function featureJson(entry: OwnerFeatureEntry, r: ResolvedOwnerFeature, s
     ...(e.nullable ? { nullable: true } : {}),
     label: e.label,
     description: e.description,
-    ...(e.today ? { today: e.today(currentForProdusenterFacts()) } : {}),
+    ...(todayText ? { today: todayText } : {}),
     status: ownerFeatureStatus(e),
     advanced: e.advanced,
     consent: e.consent,

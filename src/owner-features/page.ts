@@ -77,7 +77,7 @@ import { OWNER_ENHANCE_SCRIPT, OWNER_STATUS_CSS, OWNER_STATUS_HTML } from "../ow
 import { OWNER_COMMS_GROUP_NOTE, OWNER_NEWS_CONSENT_TEXT, OWNER_NEWS_PLACEMENT_QUESTION, OWNER_NOTIFY_GROUP_NOTE } from "./news-consent";
 import { stockSoftExpiryActiveFor } from "../services/stock-soft-expiry";
 import { OWNER_ORDER_LIMITS_HEADING, ownerAutocancelLine, ownerOrderLimitLines, type OrderLimitsConfig } from "./order-texts";
-import { currentForProdusenterFacts } from "./today-facts";
+import { safeTodayFacts, safeTodayText } from "./today-facts";
 
 /** Entries that need this key on are shown only when it is on (spec «Grensesnitt»). */
 export const OWNER_PAGE_REVEAL_KEY = "orders.enabled";
@@ -850,15 +850,16 @@ function plannedHtml(ctx: RenderCtx, registry: OwnerFeatureEntry[]): string {
   const groupLabel = new Map(pageGroups(m).map((g) => [g.key as string, g.label.no] as const));
   const interest = m.interest ?? new Set<string>();
   // T14b: facts are computed once per render, and only when some planned entry has a `today`.
-  const todayFacts = planned.some((e) => e.today) ? currentForProdusenterFacts() : null;
+  const todayFacts = planned.some((e) => e.today) ? safeTodayFacts() : null;
   const rows = planned.map((e) => {
+    const todayText = safeTodayText(e, todayFacts);
     const asked = interest.has(e.key);
     const ctl = asked
       ? `<span class="mv-state mv-asked">Du har sagt fra</span>`
       : rowForm(m, "/interesse", "planlagt",
           `<input type="hidden" name="key" value="${esc(e.key)}"><button type="submit" class="ep-btn ep-btn-secondary">Gi meg beskjed</button>`);
     return `<li class="mv-item mv-item-planned" id="${esc(ownerPlannedAnchor(e.key))}" data-planned-key="${esc(e.key)}">
-          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong> <span class="mv-badge">${esc(groupLabel.get(e.group) ?? "")}</span><p class="mv-desc">${esc(ownerFeatureEntryForEnv(e).description.no)}</p>${e.today && todayFacts ? `<p class="mv-today"><strong>I dag:</strong> ${esc(e.today(todayFacts).no)}</p>` : ""}</div>
+          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong> <span class="mv-badge">${esc(groupLabel.get(e.group) ?? "")}</span><p class="mv-desc">${esc(ownerFeatureEntryForEnv(e).description.no)}</p>${todayText ? `<p class="mv-today"><strong>I dag:</strong> ${esc(todayText.no)}</p>` : ""}</div>
           <div class="mv-item-ctl">${ctl}</div>${noticeAtHtml(ctx, ownerPlannedAnchor(e.key))}
         </li>`;
   }).join("");
