@@ -67,6 +67,7 @@ import type Database from "better-sqlite3";
 import { parseContentFieldEvidence, PUBLISH_GATE_SQL } from "./experience-store";
 import { fetchPage, visibleTextOf, type FetchPageOptions } from "./fetch-page";
 import { summarizeAbout } from "./search-enrich";
+import { describeJudgeHttpError } from "./judge-error-body";
 // Reused, not reinvented (dev-request 2026-09-14-opplevagent-falske-
 // karantener-doede-sider-gjenopprett, spec item 1): the SAME hostname-list
 // "parked domain" classification dental_agents.hjemmeside cleanup already
@@ -348,7 +349,7 @@ Ved minste tvil, svar ${JUDGE_MISMATCH_TOKEN}.`;
   }
 
   if (!response.ok) {
-    return { ok: false, reasoning: `dommer-API svarte status ${response.status} — avvist fail-closed` };
+    return { ok: false, reasoning: `dommer-API svarte status ${await describeJudgeHttpError("judgeExperienceContent", response)} — avvist fail-closed` };
   }
 
   let result: any;

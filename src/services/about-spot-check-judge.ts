@@ -57,6 +57,7 @@
 
 import { createHash } from "crypto";
 import { extractMetaDescriptions, decodeHtmlEntities } from "./search-enrich";
+import { describeJudgeHttpError } from "./judge-error-body";
 
 export const ABOUT_SPOT_CHECK_JUDGE_MODEL = "claude-haiku-4-5";
 
@@ -291,7 +292,7 @@ export async function judgeAboutAgainstPages(
   }
 
   if (!response.ok) {
-    return { ok: false, failure: "error", reason: `dommer-API svarte status ${response.status}` };
+    return { ok: false, failure: "error", reason: `dommer-API svarte status ${await describeJudgeHttpError("judgeAboutSpotCheck", response, signal)}` };
   }
 
   let result: any;

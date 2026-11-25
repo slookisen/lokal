@@ -349,7 +349,7 @@ export async function runAdminFieldSpotCheckAboutJudgeTests(opts: { log?: boolea
     assertEq([r.body?.status, r.body?.judge], ["unverifiable", "deterministic"],
       "aj-err-01: judge HTTP 500 on a paraphrase-only failure -> unverifiable (not counted as mismatch)");
     assertEq(r.body?.judge_failure, "error", "aj-err-01b: judge_failure 'error' is machine-readable in the response");
-    assertTrue(/^LLM judge unavailable \(error: dommer-API svarte status 500\); the deterministic failure is on paraphrase grounds only — all 4 facts \(vinstra, gudbrandsdalen, uppigard, skoe\) appear on the fetched pages/.test(String(r.body?.reason)),
+    assertTrue(/^LLM judge unavailable \(error: dommer-API svarte status 500: \{"error":\{"type":"api_error"\}\}\); the deterministic failure is on paraphrase grounds only — all 4 facts \(vinstra, gudbrandsdalen, uppigard, skoe\) appear on the fetched pages/.test(String(r.body?.reason)),
       "aj-err-02: reason says why it is unverifiable and names the facts", String(r.body?.reason));
 
     r = await spotCheck("aj-borgund-fab", "about", { kind: "status", status: 500 });

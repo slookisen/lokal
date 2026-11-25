@@ -11,6 +11,8 @@
  * byte-identical to before (no timeout).
  */
 
+import { describeJudgeHttpError } from "./judge-error-body";
+
 export interface RfbJudgeVerdict {
   approved: boolean;
   reasoning: string;
@@ -89,7 +91,7 @@ Ved minste tvil, svar ${RFB_JUDGE_REJECT_TOKEN}.`;
   }
 
   if (!response.ok) {
-    return { approved: false, reasoning: `dommer-API svarte status ${response.status} — ${RFB_JUDGE_INFRA_FAILURE_SUFFIX}` };
+    return { approved: false, reasoning: `dommer-API svarte status ${await describeJudgeHttpError("judgeRfbAbout", response, io?.signal)} — ${RFB_JUDGE_INFRA_FAILURE_SUFFIX}` };
   }
 
   let result: any;

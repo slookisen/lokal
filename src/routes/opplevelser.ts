@@ -14752,7 +14752,7 @@ Ved minste tvil, svar ${GARDSSALG_PRODUCER_TYPE_UKLASSIFISERT}. Finn ALDRI på e
   }
 
   if (!response.ok) {
-    return { type: null, raw: `klassifiserer-API svarte status ${response.status} — avvist fail-closed` };
+    return { type: null, raw: `klassifiserer-API svarte status ${await describeJudgeHttpError("judgeGardssalgProducerType", response)} — avvist fail-closed` };
   }
 
   let result: any;
@@ -35579,7 +35579,7 @@ Ved minste tvil, svar ${GARDSSALG_JUDGE_REJECT_TOKEN}.`;
   }
 
   if (!response.ok) {
-    return { approved: false, reasoning: `dommer-API svarte status ${response.status} — avvist fail-closed` };
+    return { approved: false, reasoning: `dommer-API svarte status ${await describeJudgeHttpError("judgeGardssalgAboutCandidate", response)} — avvist fail-closed` };
   }
 
   let result: any;
@@ -36273,7 +36273,7 @@ Ved minste tvil, svar ${GARDSSALG_JUDGE_REJECT_TOKEN}.`;
   }
 
   if (!response.ok) {
-    return { approved: false, reasoning: `dommer-API svarte status ${response.status} — avvist fail-closed` };
+    return { approved: false, reasoning: `dommer-API svarte status ${await describeJudgeHttpError("judgeGardssalgVisitCandidateWithSource", response)} — avvist fail-closed` };
   }
 
   let result: any;
@@ -37474,7 +37474,7 @@ export async function judgeExperienceDescriptionCandidate(
   }
 
   if (!response.ok) {
-    return { approved: false, reasoning: `dommer-API svarte status ${response.status} — avvist fail-closed` };
+    return { approved: false, reasoning: `dommer-API svarte status ${await describeJudgeHttpError("judgeExperienceDescriptionCandidate", response)} — avvist fail-closed` };
   }
 
   let result: any;
@@ -41142,6 +41142,7 @@ router.post("/admin/experience-orgnr-job-run", requireAdmin, async (req: Request
 import { nameSimilarity } from "../services/name-matcher";
 import { getExperienceFactsProposalsStatus } from "../services/experience-facts-proposals-job";
 import { wantsStoredTopUp, notInClause, mergeSample } from "./recently-enriched-sample";
+import { describeJudgeHttpError } from "../services/judge-error-body";
 
 export const EXPERIENCE_FACTS_CANDIDATES_DEFAULT_LIMIT = 10;
 export const EXPERIENCE_FACTS_CANDIDATES_MAX_LIMIT = 25;

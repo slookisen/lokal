@@ -36843,6 +36843,22 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental-catalog-class-judge: unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-11-25-dommerfeil-skal-ikke-nedgradere-verifiserte-profiler
+  //    (spec point 6): non-2xx judge reasons carry the API's error text ──
+  console.log("\n── dev-request 2026-11-25-dommerfeil (punkt 6): judge-error-body ──");
+  try {
+    const { runJudgeErrorBodyTests } = require("../src/services/judge-error-body.test") as
+      typeof import("../src/services/judge-error-body.test");
+    const jeb = await runJudgeErrorBodyTests({ log: false });
+    passed += jeb.passed;
+    failed += jeb.failed;
+    for (const f of jeb.failures) failures.push("judge-error-body: " + f);
+    console.log(`  judge-error-body: ${jeb.passed} passed, ${jeb.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("judge-error-body: unexpected error: " + String(err?.message || err));
+  }
+
   console.log("\n── dev-request 2026-09-02-dental-catalog-class-triage (slice 1c): admin-dental-catalog-class-sonnet-sample ──");
   try {
     const { runAdminDentalCatalogClassSonnetSampleTests } = require("../src/routes/admin-dental-catalog-class-sonnet-sample.test") as
