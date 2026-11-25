@@ -55904,3 +55904,26 @@ runSerial(async () => {
     failures.push("crm-messages-window: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-11-25-testmiljo-lokal-kopi-med-testdata-foer-prodsetting
+// (points 2, 3, 4): the local test environment's switch, local host names,
+// outbound guard, e-mail outbox and /testmiljo pages. Sets and restores
+// TESTMILJO, pins its own in-memory RFB DB and resets the db-factory handles
+// (restored in finally), and briefly wraps net.Socket.prototype.connect —
+// runSerial, tail.
+runSerial(async () => {
+  console.log("
+── 2026-11-25 testmiljø: bryter, adresser, utgående sperre, e-postfangst, innlogging ──");
+  try {
+    const { runTestmiljoTests } = require("../src/testmiljo/testmiljo.test") as
+      typeof import("../src/testmiljo/testmiljo.test");
+    const r = await runTestmiljoTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("testmiljo: " + f);
+    console.log(`  testmiljo: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("testmiljo: unexpected error: " + String(err?.message || err));
+  }
+});

@@ -1,4 +1,6 @@
 import nodemailer, { Transporter } from 'nodemailer';
+import { isTestmiljo } from '../testmiljo/guard';
+import { createOutboxTransport } from '../testmiljo/outbox';
 import { slugify } from "../utils/slug";
 import { getConfig } from "../config/vertical-config";
 // dev-request 2026-07-26-booking-test-send-guard — per-transaction test-mode
@@ -309,6 +311,13 @@ export class EmailService {
   }
 
   private setupTransporter(): boolean {
+    // Testmiljø (src/testmiljo): never SMTP. Every send is captured in the local
+    // outbox and gets a real-looking message id, so flows that treat DRY_RUN as
+    // "not sent" run to the end. isTestmiljo() is false in production.
+    if (isTestmiljo()) {
+      this.transporter = createOutboxTransport() as unknown as Transporter;
+      return true;
+    }
     const smtpHost = process.env.SMTP_HOST;
     const smtpPort = process.env.SMTP_PORT;
     const smtpUser = process.env.SMTP_USER;
