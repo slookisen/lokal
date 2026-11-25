@@ -37997,6 +37997,19 @@ const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
     failed++;
     failures.push("owner-tekstpakke-b2: unexpected error: " + String(err?.message || err));
   }
+  // Slice T14b: optional «I dag» field on planned owner-feature entries (infrastructure, no texts).
+  try {
+    const { runOwnerTodayFieldTests } = require("../src/owner-features/owner-today-field.test") as
+      typeof import("../src/owner-features/owner-today-field.test");
+    const otf = await runOwnerTodayFieldTests({ log: false });
+    passed += otf.passed;
+    failed += otf.failed;
+    for (const f of otf.failures) failures.push("owner-today-field: " + f);
+    console.log(`  owner-today-field: ${otf.passed} passed, ${otf.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-today-field: unexpected error: " + String(err?.message || err));
+  }
   // Owner pages style fixes F-a, F-c, F-d, F-e, F-f (375 px browser test, CSS only) — pure renders.
   try {
     const { runOwnerStyleFixesFTests } = require("../src/routes/owner-style-fixes-f.test") as
