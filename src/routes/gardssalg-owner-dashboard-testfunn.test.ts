@@ -25,13 +25,19 @@ export interface TestSummary {
 }
 
 const FLAG = "GARDSSALG_OWNER_DASHBOARD_ENABLED";
+const SLIDING = "GARDSSALG_OWNER_SESSION_SLIDING_ENABLED";
 const LOCK_BOX = "Teksten i denne profilen er låst av Opplevagent-support.";
 const BACK_BUTTON = "Tilbake til eierportalen";
 
 /** Every font-size in px a page can end up with (later rules with the same selector win). */
 export function smallFontSizes(html: string, minPx: number): string[] {
+  // em is taken against the 16px root (the page sets no other base size);
+  // keywords at the browsers' 16px-medium table.
+  const KEYWORDS: Record<string, number> = { "xx-small": 9, "x-small": 10, small: 13, smaller: 16 * 0.833 };
   const toPx = (v: string): number | null => {
-    const m = /^\s*([\d.]+)\s*(px|rem)\s*$/i.exec(v);
+    const k = v.trim().toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(KEYWORDS, k)) return KEYWORDS[k];
+    const m = /^\s*([\d.]+)\s*(px|rem|em)\s*$/i.exec(v);
     if (!m) return null;
     return m[2].toLowerCase() === "px" ? Number(m[1]) : Number(m[1]) * 16;
   };
@@ -84,7 +90,7 @@ export function runGardssalgOwnerDashboardTestfunnTests(opts: { log?: boolean } 
   }
 
   return (async () => {
-    const ENV_KEYS = ["EXPERIENCES_DB_PATH", "OA_OWNER_FEATURES_ENABLED", "OWNER_FEATURES_ALLOWED_SUBJECTS", "BOOKING_DISPATCH_ENABLED", FLAG];
+    const ENV_KEYS = ["EXPERIENCES_DB_PATH", "OA_OWNER_FEATURES_ENABLED", "OWNER_FEATURES_ALLOWED_SUBJECTS", "BOOKING_DISPATCH_ENABLED", FLAG, SLIDING];
     const prevEnv: Record<string, string | undefined> = {};
     for (const k of ENV_KEYS) prevEnv[k] = process.env[k];
     process.env.EXPERIENCES_DB_PATH = ":memory:";
@@ -203,6 +209,44 @@ export function runGardssalgOwnerDashboardTestfunnTests(opts: { log?: boolean } 
       assertEq([offList.status, offList.body], [200, anonOff.body], "S5l: pilot, the profile off the allowlist → the claim page, byte-identical");
       process.env.OWNER_FEATURES_ALLOWED_SUBJECTS = ALLOW;
       assertEq((await get(claimUrl("finnesikke"), cookie("toktf-a"))).status, 404, "S5m: unknown slug → 404 as before");
+
+      // ── S5 with O3-3 sliding sessions on: the claim page renews nothing ──
+      process.env[SLIDING] = "1";
+      const expiresOf = (pid: string) => (expDb.prepare(`SELECT expires_at FROM gardssalg_claims WHERE provider_id = ?`).get(pid) as { expires_at: string }).expires_at;
+      const changes = () => (expDb.prepare("SELECT total_changes() AS n").get() as { n: number }).n;
+      const headerView = (h: any) => ({ cc: h["cache-control"] ?? null, vary: h["vary"] ?? null, setCookie: h["set-cookie"] ?? null });
+      setFlag(undefined);
+      const anonSlideOff = await get(claimUrl("tfagard"));
+      {
+        const [expA, n0] = [expiresOf("tf-a"), changes()];
+        const r = await get(claimUrl("tfagard"), cookie("toktf-a"));
+        assertEq([r.status, r.body], [200, anonOff.body], "S5n: sliding on, flag off, the owner's own cookie → the claim page, byte-identical");
+        assertEq(r.headers["set-cookie"] ?? null, null, "S5o: sliding on, flag off, the owner's own cookie → no Set-Cookie");
+        assertEq([expiresOf("tf-a"), changes()], [expA, n0], "S5p: sliding on, flag off → expires_at unchanged, nothing written");
+        assertEq(headerView(r.headers), headerView(anonSlideOff.headers), "S5q: sliding on, flag off → headers as for an anonymous visitor");
+      }
+      setFlag("pilot");
+      const anonSlideOn = await get(claimUrl("tfagard"));
+      {
+        const [expA, expB, n0] = [expiresOf("tf-a"), expiresOf("tf-b"), changes()];
+        const r = await get(claimUrl("tfagard"), cookie("toktf-b"));
+        assertEq([r.status, r.body], [200, anonOff.body], "S5r: sliding on, pilot, another profile's owner → the claim page, byte-identical");
+        assertEq(r.headers["set-cookie"] ?? null, null, "S5s: sliding on, pilot, another profile's owner → no Set-Cookie (their session is not renewed here)");
+        assertEq([expiresOf("tf-a"), expiresOf("tf-b"), changes()], [expA, expB, n0], "S5t: sliding on, pilot, another profile's owner → both profiles' expires_at unchanged, nothing written");
+        assertEq(headerView(r.headers), headerView(anonSlideOn.headers), "S5u: sliding on, pilot, another profile's owner → headers as for an anonymous visitor");
+        assertEq(headerView(anonSlideOn.headers), headerView(anonSlideOff.headers), "S5v: the claim page's 200 headers do not depend on the flag");
+      }
+      {
+        const [expA, n0] = [expiresOf("tf-a"), changes()];
+        const r = await get(claimUrl("tfagard"), cookie("toktf-a"));
+        assertEq([r.status, r.headers.location], [302, "/kategori/gardssalg/eier/tfagard/portal"], "S5w: sliding on, pilot, the owner → 302 to «Oversikt»");
+        // Express's res.redirect() appends «Accept» to Vary (content negotiation of its body).
+        assertEq(headerView(r.headers), { cc: "private, no-store", vary: "Cookie, Accept", setCookie: null }, "S5x: the 302 is private, no-store, Vary: Cookie (+ Express's Accept), and sets no cookie");
+        assertEq([expiresOf("tf-a"), changes()], [expA, n0], "S5y: the redirect itself renews nothing (read-only session check)");
+        const p = await get("/kategori/gardssalg/eier/tfagard/portal", cookie("toktf-a"));
+        assertTrue(p.status === 200 && Array.isArray(p.headers["set-cookie"]) && expiresOf("tf-a") !== expA, "S5z: the portal still renews the session as before (control: renewal is observable here)");
+      }
+      delete process.env[SLIDING];
 
       // ── S7: «Mine valg» in the shell ──────────────────────────────────
       setFlag(undefined);
