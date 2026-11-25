@@ -55912,8 +55912,7 @@ runSerial(async () => {
 // (restored in finally), and briefly wraps net.Socket.prototype.connect —
 // runSerial, tail.
 runSerial(async () => {
-  console.log("
-── 2026-11-25 testmiljø: bryter, adresser, utgående sperre, e-postfangst, innlogging ──");
+  console.log("\n── 2026-11-25 testmiljø: bryter, adresser, utgående sperre, e-postfangst, innlogging ──");
   try {
     const { runTestmiljoTests } = require("../src/testmiljo/testmiljo.test") as
       typeof import("../src/testmiljo/testmiljo.test");
