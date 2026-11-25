@@ -3529,6 +3529,19 @@ function initSchema(db: Database.Database): void {
     console.error("Migration cs_reply_proposals failed:", err);
   }
 
+  // ─── crm_threads.case_type: a buyer case («kjoper») ──
+  // Set when a «kjoper_svar» reply proposal is made for the thread, so buyer
+  // cases can be counted on their own. Neither crm_contacts.type nor
+  // crm_threads.category fits (both have CHECK lists without a buyer value,
+  // and widening them means a table rebuild). Nullable, no CHECK: the value
+  // vocabulary lives in code (cs-reply-proposals.ts BUYER_CASE_TYPE). Runs
+  // after the crm_threads B3 rebuild above, so that rebuild never drops it.
+  try {
+    db.exec(`ALTER TABLE crm_threads ADD COLUMN case_type TEXT`);
+  } catch {
+    // Column already exists — expected after first migration
+  }
+
   // ─── CS på serveren, S3: Resend's delivery verdict per CRM message ──
   // Side table instead of new crm_messages.delivery_status values: widening
   // that CHECK would mean rebuilding crm_messages and its triggers.

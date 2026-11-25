@@ -25,6 +25,9 @@
  *              names (never a bounce, never our own address).
  *   crx13-crx14 a kept copy the server logged as an auto-reply is no person;
  *              the reply subject drops «(fra …)» with parentheses in it.
+ *   ks1-ks17   «kjoper_svar»: own flag (default off), the link check (only
+ *              live public profiles on rettfrabonden.com), the thread's
+ *              buyer mark, other kinds unchanged, Daniel's Send not gated.
  *   cr42-cr52  routes, /outbox/:id/result validation, needs-reply + watchdog +
  *              digest integration.
  *
@@ -386,6 +389,130 @@ export function runCsReplyProposalsTests(opts: { log?: boolean } = {}): Promise<
         };
         const r = await rp.processProposal(id, { env: ON, sendRaw: slowFail, liveTransport: true });
         eq([r.reason, P(id).status], ["lease_lost", "failed"], "crx8: a late transport failure after the lease was lost does not re-queue the proposal");
+      }
+
+      // ── kjoper_svar: own flag, link check, buyer mark ───────────────
+      {
+        const { slugify } = require("../utils/slug") as typeof import("../utils/slug");
+        const KON = { CS_AUTOSEND_ENABLED: "1", CS_KJOPER_SVAR_AUTOSEND_ENABLED: "1" } as unknown as NodeJS.ProcessEnv;
+        const insAgent = db.prepare(
+          `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, is_active, catalog_hidden, vertical_id, origin, is_vetted)
+           VALUES (?, ?, 'Gård med egg og poteter.', 'test', ?, 'https://x.example.no', 'producer', ?, ?, ?, ?, 'discovery', ?)`,
+        );
+        const seed = (id: string, name: string, o: { active?: number; hidden?: number; vertical?: string; vetted?: number } = {}) => {
+          insAgent.run(id, name, `${id}@x.example.no`, `key-${id}`, o.active ?? 1, o.hidden ?? 0, o.vertical ?? "rfb", o.vetted ?? 1);
+          return `https://rettfrabonden.com/produsent/${slugify(name)}`;
+        };
+        const urlOk = seed("ks-ok", "Kjopetest Aktiv Gard");
+        const urlHidden = seed("ks-hidden", "Kjopetest Skjult Gard", { hidden: 1 });
+        const urlInactive = seed("ks-inactive", "Kjopetest Inaktiv Gard", { active: 0 });
+        const urlUnvetted = seed("ks-unvetted", "Kjopetest Uvurdert Gard", { vetted: 0 });
+        const urlDental = seed("ks-dental", "Kjopetest Tannklinikk", { vertical: "dental" });
+        const urlPaused = seed("ks-paused", "Kjopetest Pause Gard");
+        const urlDeleted = seed("ks-deleted", "Kjopetest Slettet Gard");
+        db.prepare("DELETE FROM agents WHERE id = 'ks-deleted'").run();
+        const urlUnknown = "https://rettfrabonden.com/produsent/finnes-ikke-gard";
+        let kn = 0;
+        const buyer = (body: string, env: NodeJS.ProcessEnv = KON, extra: Partial<Parameters<typeof rp.createReplyProposal>[0]> = {}) => {
+          const t = mkThread();
+          const c = rp.createReplyProposal({ threadId: t.id, kind: "kjoper_svar", bodyText: `${body}\n\nVennlig hilsen (${++kn})`, createdBy: "claude", ...extra }, { env });
+          return { t, c, id: c.ok ? c.proposal.id : "" };
+        };
+        const caseType = (threadId: string) => (db.prepare("SELECT case_type FROM crm_threads WHERE id = ?").get(threadId) as any)?.case_type ?? null;
+
+        // AK1: flag on + a valid link → sent in the same thread
+        {
+          const { t, c, id } = buyer(`Hei! Du kan kjøpe egg hos ${urlOk} — se også https://rettfrabonden.com/ for flere.`);
+          eq(c.ok && c.proposal.status, "pending", "ks1: flag on → the buyer answer waits for the worker (pending)");
+          sends.length = 0;
+          const r = await rp.processProposal(id, deps({ env: KON }));
+          eq([r.outcome, P(id).status, P(id).sent_mode, sends.length, sends[0]?.to, sends[0]?.inReplyToMessageId], ["sent", "sent", "auto", 1, t.email, P(id).in_reply_to], "ks2: flag on + link to an active public profile → sent automatically, in the same thread (In-Reply-To)");
+          eq(caseType(t.id), "kjoper", "ks3: the thread is marked as a buyer case (crm_threads.case_type = 'kjoper')");
+        }
+        // AK1: flag off → approval queue with the flag reason (also when the kinds env lists it)
+        {
+          const { t, c } = buyer(`Du kan kjøpe egg hos ${urlOk}.`, ON);
+          eq(c.ok && [c.proposal.status, c.proposal.block_reason], ["approval_needed", "kjoper_svar_autosending_av"], "ks4: own flag off → straight to the approval queue");
+          ok(c.ok && String(c.proposal.block_detail).includes("CS_KJOPER_SVAR_AUTOSEND_ENABLED er av"), "ks4b: …with a Norwegian reason naming the flag");
+          eq(caseType(t.id), "kjoper", "ks4c: …and the thread is still marked as a buyer case");
+          const p2 = buyer(`Prøv ${urlOk}.`);
+          const r = await rp.processProposal(p2.id, deps({ env: { ...ON, CS_AUTOSEND_KINDS: "kjoper_svar,takk" } }));
+          eq([r.outcome, r.reason, P(p2.id).status], ["approval_needed", "kjoper_svar_autosending_av", "approval_needed"], "ks5: flag off at send time → not sent, even with kjoper_svar in CS_AUTOSEND_KINDS");
+        }
+        {
+          const { c } = buyer(`Du kan kjøpe egg hos ${urlOk}.`, { CS_KJOPER_SVAR_AUTOSEND_ENABLED: "1" } as unknown as NodeJS.ProcessEnv);
+          eq(c.ok && [c.proposal.status, c.proposal.block_reason], ["approval_needed", "autosending_av"], "ks6: own flag on but CS_AUTOSEND_ENABLED off → approval queue (both flags needed)");
+        }
+        // AK2: invalid links → approval queue, the URL named
+        const linkCase = async (label: string, body: string, url: string, html: string | null = null) => {
+          const { id } = buyer(body, KON, html ? { bodyHtml: html } : {});
+          sends.length = 0;
+          const r = await rp.processProposal(id, deps({ env: KON }));
+          ok(r.outcome === "approval_needed" && r.reason === "lenke_ugyldig" && String(P(id).block_detail).includes(url) && P(id).status === "approval_needed" && sends.length === 0,
+            `${label} (got ${r.outcome}/${r.reason}: ${P(id).block_detail})`);
+        };
+        await linkCase("ks7: link to a hidden profile → lenke_ugyldig, URL named", `Se ${urlHidden}`, urlHidden);
+        await linkCase("ks8: link to an inactive profile → lenke_ugyldig", `Se ${urlInactive}`, urlInactive);
+        await linkCase("ks8b: link to a deleted profile → lenke_ugyldig", `Se ${urlDeleted}`, urlDeleted);
+        await linkCase("ks9: link to an unknown slug → lenke_ugyldig", `Se ${urlUnknown}`, urlUnknown);
+        await linkCase("ks10: link to another domain → lenke_ugyldig", `Se ${urlOk} og https://gardsbutikk.example.no/egg`, "https://gardsbutikk.example.no/egg");
+        await linkCase("ks10b: a bare www address → lenke_ugyldig", "Se www.gardsbutikk.no for åpningstider.", "www.gardsbutikk.no");
+        await linkCase("ks10c: another domain only in an HTML href → lenke_ugyldig", `Se ${urlOk}`, "https://annen.example.com/x", `<p>Se <a href="https://annen.example.com/x">${urlOk}</a></p>`);
+        await linkCase("ks10d: a non-profile page on our domain → lenke_ugyldig", "Søk selv på https://rettfrabonden.com/sok?q=egg", "https://rettfrabonden.com/sok?q=egg");
+        await linkCase("ks10e: a not-yet-vetted profile → lenke_ugyldig", `Se ${urlUnvetted}`, urlUnvetted);
+        await linkCase("ks10f: a non-RFB row in agents → lenke_ugyldig", `Se ${urlDental}`, urlDental);
+        {
+          const prevPause = process.env.OWNER_PAUSE_ENABLED;
+          process.env.OWNER_PAUSE_ENABLED = "1";
+          try {
+            db.prepare("INSERT INTO owner_profile_pause (agent_id, paused_at, pause_until) VALUES ('ks-paused', datetime('now'), NULL)").run();
+            await linkCase("ks10g: a profile the owner has paused → lenke_ugyldig", `Se ${urlPaused}`, urlPaused);
+          } finally {
+            if (prevPause === undefined) delete process.env.OWNER_PAUSE_ENABLED;
+            else process.env.OWNER_PAUSE_ENABLED = prevPause;
+          }
+        }
+        // Review B1: a user name in the address (the host is the part after @).
+        await linkCase("ks15: «https://rettfrabonden.com@evil.no/…» is held (user name, host evil.no)", "Se https://rettfrabonden.com@evil.no/produsent/x", "https://rettfrabonden.com@evil.no/produsent/x");
+        await linkCase("ks15b: «http://kontakt@evil.no/kjop» is held", "Se http://kontakt@evil.no/kjop", "http://kontakt@evil.no/kjop");
+        await linkCase("ks15c: a user-name URL in the HTML's visible text is held", `Se ${urlOk}`, "https://ola@evil.no", `<p>Se ${urlOk}</p><p>https://ola@evil.no</p>`);
+        ok(rp.checkBuyerReplyLinks("Se https://ola@evil.no", null)[0]?.why === "brukernavn i adressen", "ks15d: …with the reason «brukernavn i adressen»");
+        // Review N1: bare domains in any case, any alphabetic TLD.
+        await linkCase("ks16: «Evil.No» (mixed case) is held", `Se ${urlOk} eller Evil.No`, "Evil.No");
+        await linkCase("ks16b: «GARDSBUTIKK.NO» is held", "Se GARDSBUTIKK.NO for mer.", "GARDSBUTIKK.NO");
+        await linkCase("ks16c: «evil.xyz/kjop» is held", "Bestill på evil.xyz/kjop.", "evil.xyz/kjop");
+        eq(rp.extractLinks("Se evil.ru og evil.ai.", null), ["evil.ru", "evil.ai"], "ks16d: «evil.ru» and «evil.ai» count as links");
+        eq(
+          rp.checkBuyerReplyLinks(`Åpent kl. 10.30, f.eks. egg, bl.a. 50 kr pr.stk. Skriv til post@rettfrabonden.com. Hilsen RETTFRABONDEN.COM og ${urlOk}.`, null),
+          [],
+          "ks16e: «kl. 10.30», «f.eks.», «bl.a.», «pr.stk», a signature e-mail, the root in capitals and a valid profile are no problem",
+        );
+        // Review N2: other schemes in text, URL attributes in HTML.
+        await linkCase("ks17: an «ftp://» address in the text is held", "Prislisten: ftp://files.example.no/priser.pdf", "ftp://files.example.no/priser.pdf");
+        await linkCase("ks17b: an <img src> to another domain is held", `Se ${urlOk}`, "https://img.example.com/a.png", `<p>Se ${urlOk}</p><img src="https://img.example.com/a.png">`);
+        await linkCase("ks17c: an srcset entry to another domain is held", `Se ${urlOk}`, "https://b.example.com/2.png", `<p>Se ${urlOk}</p><img srcset="${urlOk} 1x, https://b.example.com/2.png 2x">`);
+        await linkCase("ks17d: a background attribute to another domain is held", `Se ${urlOk}`, "https://bg.example.com/b.jpg", `<table><tr><td background="https://bg.example.com/b.jpg">Se ${urlOk}</td></tr></table>`);
+        eq(rp.checkBuyerReplyLinks("Hilsen Rett fra Bonden — rettfrabonden.com. Skriv til kontakt@rettfrabonden.com eller ola.nord@gard.no.", null), [], "ks11: the site root mentioned in a signature and e-mail addresses are no problem");
+        // Daniel pressing Send is his own decision: the buyer gates are automatic-path only.
+        {
+          const { id } = buyer(`Se https://gardsbutikk.example.no/egg`, ON);
+          sends.length = 0;
+          const ap = await rp.approveProposal(id, {}, deps({ env: ON }));
+          eq([ap.ok && ap.result.outcome, sends.length], ["sent", 1], "ks12: Daniel's Send from the queue is not stopped by the buyer flag or link check");
+        }
+        // Other kinds: unchanged by the new flag and link check.
+        {
+          const t = mkThread();
+          const c = rp.createReplyProposal({ threadId: t.id, kind: "faq", bodyText: "Se https://gardsbutikk.example.no/faq for svar.", createdBy: "claude" }, { env: ON });
+          const r = c.ok ? await rp.processProposal(c.proposal.id, deps({ env: ON })) : null;
+          eq([c.ok && c.proposal.status, r?.outcome, caseType(t.id)], ["pending", "sent", null], "ks13: «faq» with the buyer flag off and a foreign link is sent as before, thread not marked");
+        }
+        {
+          const t = mkThread();
+          const c = rp.createReplyProposal({ threadId: t.id, kind: "annet", bodyText: "Et spørsmål om kjøp.", createdBy: "claude" }, { env: OFF });
+          if (c.ok) rp.editProposal(c.proposal.id, { kind: "kjoper_svar" }, "daniel");
+          eq(caseType(t.id), "kjoper", "ks14: changing a proposal's kind to kjoper_svar marks the thread as a buyer case");
+        }
       }
 
       // ── routes ───────────────────────────────────────────────────────
