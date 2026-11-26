@@ -11,8 +11,9 @@
  * every insert names real columns, so a renamed column fails the seed loudly.
  *
  * Safety: never reads prod or the network. Refuses to run when NODE_ENV is
- * "production" or FLY_APP_NAME / FLY_MACHINE_ID is set, and refuses any target
- * file whose directory is not named `.testmiljo`.
+ * "production" or FLY_APP_NAME / FLY_MACHINE_ID is set, refuses any target
+ * file that is not directly in `<repo>/.testmiljo/` (or in a `.testmiljo/`
+ * under the OS temp dir, for the tests), and refuses symlinked target files.
  *
  * Deterministic: fixed ids, fixed created_at stamps (SEED_BASE), and visit /
  * order times relative to the UTC day the seed runs (so "upcoming" stays
@@ -25,6 +26,7 @@
  */
 
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import type BetterSqlite3 from "better-sqlite3";
 
@@ -56,26 +58,88 @@ export function refuseReason(env: NodeJS.ProcessEnv = process.env): string | nul
   return null;
 }
 
-/** Throws unless `p` is a file directly inside a directory named `.testmiljo`. */
+/**
+ * Realpath of `p`, also when `p` (or a tail of it) does not exist yet: the
+ * deepest existing ancestor is resolved and the missing tail appended.
+ */
+export function realpathLoose(p: string): string {
+  const resolved = path.resolve(p);
+  const tail: string[] = [];
+  let cur = resolved;
+  for (;;) {
+    try {
+      return path.join(fs.realpathSync(cur), ...tail);
+    } catch {
+      const up = path.dirname(cur);
+      if (up === cur) return resolved;
+      tail.unshift(path.basename(cur));
+      cur = up;
+    }
+  }
+}
+
+/** True when `child` is `parent` itself or lies below it (both already absolute/real). */
+function isWithin(child: string, parent: string): boolean {
+  const rel = path.relative(parent, child);
+  return rel === "" || (!!rel && !rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+/** SQLite sidecar files that belong to a database file. */
+export const DB_SIDECARS = ["-wal", "-shm", "-journal"] as const;
+
+/** Throws when `p` exists as a symlink (a broken symlink included). */
+export function assertNotSymlink(p: string): void {
+  let st: fs.Stats | null = null;
+  try {
+    st = fs.lstatSync(p);
+  } catch {
+    return; // does not exist
+  }
+  if (st.isSymbolicLink()) {
+    throw new Error(`${p} er en symbolsk lenke — testmiljøet følger ikke lenker. Avbryter.`);
+  }
+}
+
+/**
+ * Throws unless `dir` is an allowed `.testmiljo` directory: the repo's own
+ * `<REPO_ROOT>/.testmiljo`, or a `.testmiljo` directory inside the OS temp dir
+ * that is not somewhere else inside the repo (the tests seed into
+ * `mkdtemp(...)/.testmiljo`). Compared by realpath, so a symlinked parent
+ * cannot point the guard elsewhere. Returns the resolved (non-real) path.
+ */
+export function assertTestmiljoDir(dir: string): string {
+  const resolved = path.resolve(dir);
+  const real = realpathLoose(resolved);
+  const outside = new Error(`Mappen ${resolved} er ikke en godkjent ${TESTMILJO_DIR_NAME}/-mappe — avbryter.`);
+  if (path.basename(resolved) !== TESTMILJO_DIR_NAME || path.basename(real) !== TESTMILJO_DIR_NAME) throw outside;
+  if (real === realpathLoose(DEFAULT_DIR)) return resolved;
+  const realTmp = realpathLoose(os.tmpdir());
+  if (isWithin(real, realTmp) && real !== realTmp && !isWithin(real, realpathLoose(REPO_ROOT))) return resolved;
+  throw outside;
+}
+
+/**
+ * Throws unless `p` is a file directly inside an allowed `.testmiljo`
+ * directory (see assertTestmiljoDir), and neither it nor its SQLite sidecar
+ * files exist as symlinks.
+ */
 export function assertInsideTestmiljo(p: string): string {
   if (!p || p === ":memory:") throw new Error(`Ugyldig databasesti: «${p}»`);
   const resolved = path.resolve(p);
-  const parent = path.dirname(resolved);
-  let realParent = parent;
   try {
-    realParent = fs.realpathSync(parent);
+    assertTestmiljoDir(path.dirname(resolved));
   } catch {
-    // parent does not exist yet — the resolved name is what will be created
-  }
-  if (path.basename(parent) !== TESTMILJO_DIR_NAME || path.basename(realParent) !== TESTMILJO_DIR_NAME) {
     throw new Error(`Databasestien ${resolved} ligger utenfor en ${TESTMILJO_DIR_NAME}/-mappe — avbryter.`);
   }
+  assertNotSymlink(resolved);
+  for (const suffix of DB_SIDECARS) assertNotSymlink(resolved + suffix);
   return resolved;
 }
 
 function removeDbFiles(p: string): void {
-  for (const suffix of ["", "-wal", "-shm", "-journal"]) {
+  for (const suffix of ["", ...DB_SIDECARS]) {
     const f = p + suffix;
+    assertNotSymlink(f);
     if (fs.existsSync(f)) fs.rmSync(f, { force: true });
   }
 }
