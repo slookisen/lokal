@@ -10,7 +10,7 @@ i stedet for å sendes.
 | Kommando | Hva den gjør |
 |---|---|
 | `npm run testmiljo` | Bygger testdata i `.testmiljo/` hvis en database mangler, og starter appen på port 3100 med innstillingene i `testmiljo.env`. Åpne <http://rettfrabonden.localhost:3100/testmiljo>. Ctrl+C stopper. |
-| `npm run testmiljo:nullstill` | Sletter databasene i `.testmiljo/` og bygger dem på nytt (starter ikke appen). |
+| `npm run testmiljo:nullstill` | Sletter databasene og de fangede e-postene i `.testmiljo/` og bygger testdataene på nytt (starter ikke appen). Stopp appen først. |
 
 Fungerer på Windows og Linux (ren node/tsx, ingen bash). `.testmiljo/` er i
 `.gitignore`.

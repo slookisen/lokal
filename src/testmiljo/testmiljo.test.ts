@@ -16,8 +16,9 @@
  *   o1-o6   outbound guard: a non-loopback connection is refused before DNS
  *           (net, tls, http and https; global fetch too when run standalone,
  *           since the suite stubs fetch), loopback passes, uninstall restores.
- *   x1-x4   outbox: capture, list, read, clear; EmailService uses it in the
- *           test environment and is unchanged outside it.
+ *   x1-x5   outbox: capture, list, read, clear; EmailService uses it in the
+ *           test environment and is unchanged outside it; the launcher's reset
+ *           removes the outbox file the app writes.
  *   r1-r9   /testmiljo pages over a real HTTP server: 404 when off, 403 for a
  *           non-loopback peer, a foreign Host, a proxy header or a cross-site
  *           write, owner
@@ -333,6 +334,22 @@ export async function runTestmiljoTests(opts: { log?: boolean; realFetch?: boole
       const dry = await outside.sendRaw({ to: "eier@gard.invalid", subject: "Utenfor", textContent: "Hei" });
       assertTrue(dry.messageId === "DRY_RUN" && !outside.isLiveTransport() && outbox.listOutbox(outboxPath).length === 0, "x4 outside it, an unconfigured EmailService is the same dry-run as before");
       restoreEnv();
+    }
+
+    {
+      const launch = require("../../scripts/testmiljo/launch") as typeof import("../../scripts/testmiljo/launch");
+      const resetDir = path.join(tmpDir, ".testmiljo");
+      fs.mkdirSync(resetDir, { recursive: true });
+      const resetDb = path.join(resetDir, "lokal.db");
+      const written = outbox.outboxFile({ DB_PATH: resetDb });
+      await outbox.createOutboxTransport(() => written).sendMail({ from: "a@b.invalid", to: "c@d.invalid", subject: "Før nullstilling", text: "T" });
+      const before = fs.existsSync(written);
+      launch.removeOutbox(resetDb);
+      launch.removeOutbox(resetDb); // nothing left to remove: no error
+      let refusedOutside = false;
+      try { launch.removeOutbox(path.join(tmpDir, "lokal.db")); } catch { refusedOutside = true; }
+      assertEq([launch.outboxFileBeside(resetDb) === written, before, fs.existsSync(written), refusedOutside], [true, true, false, true],
+        "x5 the launcher's reset removes the very file the app writes, and only inside a .testmiljo folder");
     }
 
     // ── r: the /testmiljo pages ───────────────────────────────────────

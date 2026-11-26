@@ -8,8 +8,8 @@
  * gets a real-looking message id back. That matters: many flows treat the
  * unconfigured transport's "DRY_RUN" id as "not sent" and stop there.
  *
- * The file lives beside DB_PATH, so resetting the test environment (which
- * deletes that directory) empties the outbox too.
+ * The file lives beside DB_PATH. The launcher's reset (npm run
+ * testmiljo:nullstill) removes it together with the databases.
  *
  * Read at /testmiljo/epost (src/testmiljo/router.ts).
  */
