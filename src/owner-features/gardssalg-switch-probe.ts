@@ -1047,6 +1047,24 @@ const notifyRecipientSync = (ctx: GardssalgProbeReaderContext): GardssalgSurface
   return { endpoints: { recipient: tag !== "ingen" }, detail: `mottaker ${tag}`, requireAll: true };
 };
 
+/**
+ * Slice 2 of dev-request 2026-11-26-opplevagent-eier-endrer-adresse-selv:
+ * contact.address_edit × owner_portal — the owner's part of the address
+ * form's gate (gardssalgOwnerAddressEditSwitchOn, the reader the card and
+ * both POST routes use). The form also needs GARDSSALG_OWNER_ADDRESS_EDIT_
+ * ENABLED for the producer; that flag is Daniel's and is only reported in
+ * the detail, so the switch shows its effect while the flag is off too.
+ */
+const addressEditSwitchSync = (ctx: GardssalgProbeReaderContext): GardssalgSurfaceObservation => {
+  const g = require("./gardssalg") as typeof import("./gardssalg");
+  const on = g.gardssalgOwnerAddressEditSwitchOn(ctx.fixture.id, ctx.env);
+  const flag = g.gardssalgOwnerAddressEditOnFor(ctx.fixture.id, ctx.env);
+  return {
+    endpoints: { address_form_switch: on }, requireAll: true,
+    detail: `eierens bryter: ${on ? "på" : "av"}; flagget for produsenten: ${flag ? "på" : "av"} (adressekortet vises ${on && flag ? "" : "ikke "}nå)`,
+  };
+};
+
 const syncReader = (fn: (ctx: GardssalgProbeReaderContext) => GardssalgSurfaceObservation, observe: string): GardssalgSurfaceReaderDef => ({ read: fn, sync: fn, observe });
 
 const VISIBILITY_SURFACES = ["profile_html", "listing_html", "mcp_search", "mcp_info", "rest_card", "sitemap", "a2a"];
@@ -1085,6 +1103,7 @@ export function defaultGardssalgSwitchProbeReaders(): Record<string, GardssalgSu
   for (const s of ["email:booking_request", "email:address_confirm", "email:address_change_notice", "owner_portal"]) {
     out[caseId("contact.booking_email", s)] = syncReader(notifyRecipientSync, "gardssalgNotifyRecipient: mottakeren av forespørslene (endres bare med bekreftelseslenken)");
   }
+  out[caseId("contact.address_edit", "owner_portal")] = syncReader(addressEditSwitchSync, "gardssalgOwnerAddressEditSwitchOn: adresseskjemaet på eiersiden og de to POST-rutene åpne / stengt (flagget vises i detaljen)");
   out[caseId("comms.unsubscribe", "email:outreach")] = syncReader(outreachSync, "unsubscribeHeaderValues(…, experiences): kald e-post får List-Unsubscribe");
   return out;
 }

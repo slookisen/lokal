@@ -39,7 +39,7 @@ import { gardssalgDashboardPath, wrapGardssalgDashboard } from "../owner-ui/gard
 import { CLAIM_LINK_TEXTS, CLAIM_CONFIRM_TEXTS, MANUAL_CLAIM_TEXTS, MANUAL_CLAIM_FORM_TEXTS_NOT_APPROVED } from "./gardssalg-claim-texts";
 import { isManualClaimQueueEnabled, isManualClaimReceiptEnabled, sendManualClaimMail, submitManualClaim } from "../services/gardssalg-manual-claims";
 import {
-  gardssalgOwnerAddressEditOnFor, saveGardssalgOwnerAddress, ownerAddressMessage, OWNER_ADDRESS_STREET_MAX, OWNER_ADDRESS_POSTSTED_MAX,
+  gardssalgOwnerAddressEditOpenFor, saveGardssalgOwnerAddress, ownerAddressMessage, OWNER_ADDRESS_STREET_MAX, OWNER_ADDRESS_POSTSTED_MAX,
   type OwnerAddressError, type OwnerAddressOutcome,
 } from "../services/gardssalg-owner-address";
 import { poststedForPostnummer } from "../services/norway-postnummer";
@@ -1242,10 +1242,10 @@ const OWNER_ADDRESS_ERRORS: readonly OwnerAddressError[] = [
   "poststed_ugyldig", "poststed_passer_ikke", "postboks", "adresse_ugyldig", "kartoppslag_feilet", "laast", "ikke_tilgang", "feil",
 ];
 
-/** The address card is on for this producer: the flag (mode / allowlist) and a live claim. Never throws. */
+/** The address card is on for this producer: the flag (mode / allowlist), the owner's switch and a live claim. Never throws. */
 function ownerAddressEditOpen(providerId: string): boolean {
   try {
-    return gardssalgOwnerAddressEditOnFor(providerId) && isGardssalgProviderClaimed(providerId);
+    return gardssalgOwnerAddressEditOpenFor(providerId) && isGardssalgProviderClaimed(providerId);
   } catch {
     return false;
   }
@@ -1325,9 +1325,11 @@ function ownerAddressCardHtml(slug: string, provider: ClaimProviderRow, q: Recor
 }
 
 const ownerAddressFlagGate = (req: Request, _res: Response, next: (arg?: unknown) => void) => {
-  // Flag off for every producer: the route does not exist (falls through exactly as before).
+  // Flag off for the producer, or the owner switched contact.address_edit
+  // off in «Mine valg» (slice 2): the route does not exist (falls through
+  // exactly as before, 404), nothing read or written.
   const id = String((req.params as any).providerId || "") || (getClaimProviderBySlug(String((req.params as any).providerSlug || ""))?.id ?? "");
-  return gardssalgOwnerAddressEditOnFor(id) ? next() : next("route");
+  return gardssalgOwnerAddressEditOpenFor(id) ? next() : next("route");
 };
 
 router.post(

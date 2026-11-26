@@ -107,3 +107,28 @@ export function gardssalgOwnerAddressEditOnFor(providerId: string | null | undef
   if (mode === "pilot") return isSubjectAllowedForOwnerFeatures("gardssalg", providerId, env);
   return false;
 }
+
+/**
+ * Slice 2 (review point N5 of lokal#1675): the owner's own switch
+ * contact.address_edit in «Mine valg» (live). While the gårdssalg owner
+ * choices do not apply (OA_OWNER_FEATURES_ENABLED off, or the producer not
+ * allowlisted) nobody can have switched it, so the owner default (on) holds
+ * without any lookup — the same rule as booking.pause above. A lookup error
+ * while the choice applies counts as off (no address form, no write: the
+ * safe side) and is logged.
+ */
+export function gardssalgOwnerAddressEditSwitchOn(providerId: string | null | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (!providerId) return false;
+  if (!gardssalgOwnerFeaturesActive(providerId, env)) return true;
+  try {
+    return gardssalgFeatureOn(providerId, "contact.address_edit", { env });
+  } catch (e) {
+    console.error(`[owner-features] contact.address_edit lookup failed for gardssalg ${providerId}:`, e);
+    return false;
+  }
+}
+
+/** The address form is open for this producer: the flag lets it in AND the owner's switch is on. */
+export function gardssalgOwnerAddressEditOpenFor(providerId: string | null | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
+  return gardssalgOwnerAddressEditOnFor(providerId, env) && gardssalgOwnerAddressEditSwitchOn(providerId, env);
+}

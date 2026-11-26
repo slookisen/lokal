@@ -27,7 +27,11 @@
 // Flag GARDSSALG_OWNER_ADDRESS_EDIT_ENABLED (default off): off → the portal
 // shows no address form and the address POST routes do not exist (404).
 // "pilot" → only `gardssalg:<id>` on OWNER_FEATURES_ALLOWED_SUBJECTS;
-// "1"/"true" → every claimed profile. Read per request.
+// "1"/"true" → every claimed profile. Read per request. Slice 2: the
+// owner's own switch contact.address_edit («Mine valg»; coming_soon until
+// the prod switch probe passes, so the owner default «on» holds) is read too
+// (gardssalgOwnerAddressEditOpenFor): switched off → no form, both POST
+// routes 404, nothing written.
 
 import { getDb as getRfbDb } from "../database/init";
 import { getDb as getVerticalDb } from "../database/db-factory";
@@ -40,7 +44,10 @@ import { isPlausibleNorwayCoord } from "./geo-distance";
 import { OWNER_PORTAL_ADDRESS_SOURCE } from "./gardssalg-owner-portal-write";
 
 // The flag lives with the other gårdssalg owner flags (owner-features/gardssalg.ts).
-export { GARDSSALG_OWNER_ADDRESS_EDIT_ENV, gardssalgOwnerAddressEditMode, gardssalgOwnerAddressEditOnFor } from "../owner-features/gardssalg";
+export {
+  GARDSSALG_OWNER_ADDRESS_EDIT_ENV, gardssalgOwnerAddressEditMode, gardssalgOwnerAddressEditOnFor,
+  gardssalgOwnerAddressEditSwitchOn, gardssalgOwnerAddressEditOpenFor,
+} from "../owner-features/gardssalg";
 
 /** The owner-feature registry key of this function (owner-features/registry.ts). */
 export const GARDSSALG_OWNER_ADDRESS_EDIT_KEY = "contact.address_edit";
