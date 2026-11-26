@@ -40,10 +40,33 @@ export function isCredentialName(name: string): boolean {
   return upper.split(/[^A-Z0-9]+/).some((part) => CREDENTIAL_PARTS.has(part));
 }
 
+/**
+ * Inherited variables the app may see: only what node/tsx needs to run on Linux, macOS and
+ * Windows. An ALLOWLIST rather than a deny-list (review N3 of lokal#1664): a deny-list on
+ * credential-looking names let non-credential-looking secrets/URLs slip through
+ * (GSC_SERVICE_ACCOUNT_JSON, SENTRY_DSN, RENDER_WORKER_URL, LOKAL_API_URL). Anything the app
+ * must have comes from testmiljo.env (applied after, always wins). NODE_OPTIONS is
+ * deliberately absent (it can preload code). Matching is case-insensitive (Windows).
+ */
+const INHERIT_NAMES = new Set([
+  "PATH", "PATHEXT", "HOME", "USER", "USERNAME", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TZ",
+  "TERM", "COLORTERM", "NO_COLOR", "FORCE_COLOR", "TMPDIR", "TMP", "TEMP", "SYSTEMROOT",
+  "SYSTEMDRIVE", "WINDIR", "COMSPEC", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+  "PROGRAMFILES", "PROGRAMFILES(X86)", "COMMONPROGRAMFILES", "HOMEDRIVE", "HOMEPATH",
+  "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "OS", "NODE_EXTRA_CA_CERTS", "CI",
+]);
+const INHERIT_PREFIXES = ["LC_", "TSX_"];
+export function isInheritedName(name: string): boolean {
+  const upper = name.toUpperCase();
+  // Allowlist AND not credential-looking (defence in depth).
+  if (isCredentialName(name)) return false;
+  return INHERIT_NAMES.has(upper) || INHERIT_PREFIXES.some((p) => upper.startsWith(p));
+}
+
 export function buildAppEnv(parent: NodeJS.ProcessEnv, fileEnv: Record<string, string>): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(parent)) {
-    if (!isCredentialName(k)) env[k] = v;
+    if (v !== undefined && isInheritedName(k)) env[k] = v;
   }
   // DB paths and anything else set by the shell are overridden by the file.
   delete env.DB_PATH;
