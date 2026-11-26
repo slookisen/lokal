@@ -54726,6 +54726,22 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── produktimport punkt 4: tilbudskort øverst i portalen ──");
+  try {
+    const { runOwnerProductImportOfferTests } = require("../src/routes/owner-product-import-offer.test") as
+      typeof import("../src/routes/owner-product-import-offer.test");
+    const r = await runOwnerProductImportOfferTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-product-import-offer: " + f);
+    console.log(`  owner-product-import-offer: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-product-import-offer: unexpected error: " + String(err?.message || err));
+  }
+});
+
+runSerial(async () => {
   console.log("\n── produktimport punkt 3+5: «Sjekk prisen» og årsakstekst ──");
   try {
     const { runOwnerProductImportMarkingTests } = require("../src/routes/owner-product-import-marking.test") as

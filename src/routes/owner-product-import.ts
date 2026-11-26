@@ -35,6 +35,7 @@
 
 import express, { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
+import { siteDomain, dismissProductImportOffer } from "../services/product-import/owner-import";
 import { isCrossSiteWrite } from "../middleware/same-origin-write";
 import {
   formatImportRunTime,
@@ -274,6 +275,22 @@ router.post("/eier/:agentId/produktimport/hent", express.urlencoded({ extended: 
   }
 });
 
+/**
+ * «Ikke nå» on the offer card shown at the top of the portal (dev-request 2026-11-24-rfb-vareopphenting-til-alle-eiere,
+ * point 4). Same session + same-origin guard as «Hent»; stores the dismissal for the profile and returns to the portal.
+ * Starts no fetch and changes nothing else.
+ */
+router.post("/eier/:agentId/produktimport/ikke-na", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+  const auth = ownerImportPageAuth(req, res, { write: true });
+  if (!auth.ok) return;
+  try {
+    dismissProductImportOffer(auth.agentId);
+  } catch (err) {
+    console.error("[owner-product-import] POST ikke-na error:", err instanceof Error ? err.message : "error");
+  }
+  return res.redirect(303, `/eier/${encodeURIComponent(auth.agentId)}/portal`);
+});
+
 export type Preview = NonNullable<ReturnType<typeof getOwnerImportPreview>>;
 type PreviewCandidate = Preview["new"][number];
 type PreviewChanged = Preview["changed"][number];
@@ -380,16 +397,6 @@ export const LLM_EXPLAIN_NB =
   "Noen av varene har vi lest fra vanlig tekst på nettsiden din, ikke fra en nettbutikk. De er merket «Sjekk prisen». Se over navn, pris og enhet før du publiserer.";
 const llmExplainHtml = (p: Pick<Preview, "new" | "changed">): string =>
   [...p.new, ...p.changed].some((c) => c.llm) ? `<p class="ep-audit-meta" data-llm-explain="1">${escapeHtml(LLM_EXPLAIN_NB)}</p>` : "";
-
-/** Hostname of the site for owner-facing texts (raw text minus scheme/path when unparseable). Not escaped. */
-function siteDomain(website: string | null | undefined): string {
-  const raw = (website ?? "").trim();
-  try {
-    const h = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`).hostname;
-    if (h) return h;
-  } catch { /* fall through */ }
-  return raw.replace(/^https?:\/\//i, "").split("/")[0] ?? raw;
-}
 
 /** Reason text for the «found nothing» view by outcome (owner-approved wording); null = keep today's text. Domain is HTML-escaped; result is HTML. */
 export function importNothingFoundReasonHtml(outcome: string | null | undefined, website: string | null | undefined): string | null {

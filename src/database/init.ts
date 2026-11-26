@@ -7482,6 +7482,20 @@ function initSchema(db: Database.Database): void {
     console.error("Migration owner_beta_enrollment failed:", err);
   }
 
+  // ─── product_import_offer_dismissed (dev-request 2026-11-24-rfb-vareopphenting-til-alle-eiere, point 4) ──
+  // One row per profile whose owner pressed «Ikke nå» on the offer card at the top of the portal. Additive,
+  // brand-new table; INSERT OR IGNORE keeps it idempotent. dismissed_at is ISO-8601.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS product_import_offer_dismissed (
+        agent_id TEXT PRIMARY KEY,
+        dismissed_at TEXT NOT NULL
+      )
+    `);
+  } catch (err) {
+    console.error("Migration product_import_offer_dismissed failed:", err);
+  }
+
   // ─── S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok ──────────────
   // agents_name_fts (FTS5 trigram over agents.name) + its three sync triggers,
   // populated here only when empty or out of step with agents (one INSERT …

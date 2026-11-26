@@ -131,6 +131,33 @@ export function profileWebsite(agentId: string): string | null {
   return row && row.website ? row.website : null;
 }
 
+/** Hostname of the site for owner-facing texts (raw text minus scheme/path when unparseable). Not escaped. */
+export function siteDomain(website: string | null | undefined): string {
+  const raw = (website ?? "").trim();
+  try {
+    const h = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`).hostname;
+    if (h) return h;
+  } catch { /* fall through */ }
+  return raw.replace(/^https?:\/\//i, "").split("/")[0] ?? raw;
+}
+
+/**
+ * The offer card at the top of the portal (dev-request 2026-11-24-rfb-vareopphenting-til-alle-eiere, point 4) is
+ * dismissed per profile: one row in product_import_offer_dismissed. «Started an import» needs no row; any
+ * owner_fetch run of the profile counts (product_import_runs).
+ */
+export function productImportOfferDismissed(agentId: string): boolean {
+  return !!getDb().prepare(`SELECT 1 FROM product_import_offer_dismissed WHERE agent_id = ?`).get(agentId);
+}
+
+export function dismissProductImportOffer(agentId: string): void {
+  getDb().prepare(`INSERT OR IGNORE INTO product_import_offer_dismissed (agent_id, dismissed_at) VALUES (?, ?)`).run(agentId, new Date().toISOString());
+}
+
+export function productImportStartedBefore(agentId: string): boolean {
+  return !!getDb().prepare(`SELECT 1 FROM product_import_runs WHERE mode = 'owner_fetch' AND agent_id = ? LIMIT 1`).get(agentId);
+}
+
 /** How many owner fetches this profile started in the UTC day of `nowMs` (from the run table). */
 export function ownerFetchesToday(agentId: string, nowMs: number): number {
   const { start, end } = utcDayBounds(nowMs);
