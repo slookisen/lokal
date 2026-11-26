@@ -36,7 +36,7 @@
  *   2. Wired into the gate: tests/test.ts calls runTestmiljoCiTests().
  */
 
-import { spawn, type ChildProcess } from "child_process";
+import { spawn, spawnSync, type ChildProcess } from "child_process";
 import * as fs from "fs";
 import * as http from "http";
 import * as net from "net";
@@ -134,10 +134,25 @@ function baseEnv(parent: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 }
 
 /** spawn() failures that mean «this platform cannot start a child process», not «the app is broken». */
-function cannotSpawn(err: unknown): boolean {
+export function cannotSpawn(err: unknown): boolean {
   const code = (err as NodeJS.ErrnoException | undefined)?.code;
   return code === "EPERM" || code === "EACCES" || code === "EAGAIN" || code === "ENOSYS" || code === "ENOMEM";
 }
+
+/**
+ * What a failed spawn means for this test:
+ *   "skip"  — this machine cannot start child processes at all (local run only);
+ *   "fail"  — the same, but in CI (CI is set, as GitHub Actions does): a skip
+ *             there would turn the AK6 guard off silently, so it is a failure;
+ *   "error" — any other spawn failure: a failure, like any other.
+ */
+export function spawnFailureVerdict(err: unknown, env: NodeJS.ProcessEnv = process.env): "skip" | "fail" | "error" {
+  if (!cannotSpawn(err)) return "error";
+  return (env.CI ?? "").trim() !== "" ? "fail" : "skip";
+}
+
+/** A stderr line that is Node's own warning (its wording depends on the Node version, not only on the app). */
+const NODE_WARNING_RE = /^\(node:\d+\) (?:\[[A-Z0-9]+\] )?\w*Warning:/;
 
 interface RunResult { code: number | null; stdout: string; stderr: string; spawnError?: NodeJS.ErrnoException }
 
@@ -249,18 +264,60 @@ function readOwners(dir: string): SeededOwners {
   }
 }
 
+/** Kill the child and everything it started, now (synchronous: usable from an exit handler). */
+function killTree(child: ChildProcess, sig: NodeJS.Signals): void {
+  if (!child.pid) return;
+  try {
+    if (process.platform === "win32") {
+      // No process groups on Windows: taskkill /T takes the tsx grandchild too.
+      spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+    } else {
+      // POSIX: the whole group — tsx runs the app in a grandchild process.
+      process.kill(-child.pid, sig);
+    }
+  } catch {
+    try { child.kill(sig); } catch { /* already gone */ }
+  }
+}
+
+/**
+ * While the test owns a temp dir and (later) a detached app, an interrupted
+ * run (Ctrl-C, SIGTERM, process.exit elsewhere) must not leave either
+ * behind: the app is in its own process group, so it does not get the
+ * terminal's SIGINT, and `finally` does not run when this process dies of a
+ * signal. These handlers kill the group and remove the dir synchronously.
+ * Returns the function that removes them again (called in `finally`).
+ */
+function installEmergencyCleanup(tmpRoot: string, getChild: () => ChildProcess | null): () => void {
+  const cleanup = () => {
+    const child = getChild();
+    if (child && child.exitCode === null && child.signalCode === null) killTree(child, "SIGKILL");
+    try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* best effort */ }
+  };
+  const onSignal = (sig: NodeJS.Signals) => {
+    cleanup();
+    remove();
+    // Re-raise: with our handler gone the default action ends the process
+    // (unless someone else listens; then exit with the conventional code).
+    if (process.listenerCount(sig) === 0) process.kill(process.pid, sig);
+    else process.exit(sig === "SIGINT" ? 130 : 143);
+  };
+  const onExit = () => cleanup();
+  process.once("exit", onExit);
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
+  const remove = () => {
+    process.removeListener("exit", onExit);
+    process.removeListener("SIGINT", onSignal);
+    process.removeListener("SIGTERM", onSignal);
+  };
+  return remove;
+}
+
 function stopChild(child: ChildProcess): Promise<void> {
   return new Promise((resolve) => {
     if (child.exitCode !== null || child.signalCode !== null) return resolve();
-    const kill = (sig: NodeJS.Signals) => {
-      try {
-        // POSIX: the whole group — tsx runs the app in a grandchild process.
-        if (process.platform !== "win32" && child.pid) process.kill(-child.pid, sig);
-        else child.kill(sig);
-      } catch {
-        try { child.kill(sig); } catch { /* already gone */ }
-      }
-    };
+    const kill = (sig: NodeJS.Signals) => killTree(child, sig);
     const hard = setTimeout(() => kill("SIGKILL"), 5_000);
     const done = setTimeout(resolve, 10_000);
     child.once("exit", () => {
@@ -295,15 +352,44 @@ export async function runTestmiljoCiTests(opts: { log?: boolean } = {}): Promise
   const dir = path.join(tmpRoot, ".testmiljo");
   fs.mkdirSync(dir);
   let child: ChildProcess | null = null;
-  const output: Array<{ stream: "stdout" | "stderr"; line: string }> = [];
+  let output: Array<{ stream: "stdout" | "stderr"; line: string }> = [];
+  const removeEmergencyCleanup = installEmergencyCleanup(tmpRoot, () => child);
+
+  /** A spawn that failed: skip (locally, platform cannot spawn), else a failure. Returns true when the run must stop. */
+  const spawnFailed = (what: string, err: NodeJS.ErrnoException): boolean => {
+    const verdict = spawnFailureVerdict(err);
+    if (verdict === "skip") {
+      // The one allowed skip: this machine cannot start a child process at all, and this is not CI.
+      console.log(`  testmiljo-ci: SKIPPED — cannot spawn ${what} here (${err.code}: ${err.message})`);
+    } else {
+      check(false, verdict === "fail" ? `tmci-0: cannot spawn ${what} in CI (a skip would switch this guard off)` : `tmci-0: spawning ${what} failed`, `${err.code}: ${err.message}`);
+    }
+    return true;
+  };
 
   try {
+    // ── 0. The skip rule itself (pure) ──────────────────────────────────
+    const eagain = Object.assign(new Error("spawn EAGAIN"), { code: "EAGAIN" });
+    check(
+      spawnFailureVerdict(eagain, {}) === "skip" &&
+        spawnFailureVerdict(eagain, { CI: "true" }) === "fail" &&
+        spawnFailureVerdict(Object.assign(new Error("x"), { code: "EPERM" }), { CI: "1" }) === "fail" &&
+        spawnFailureVerdict(Object.assign(new Error("x"), { code: "ENOENT" }), {}) === "error" &&
+        spawnFailureVerdict(eagain, { CI: "" }) === "skip",
+      "tmci-0: cannot-spawn is a skip only outside CI; in CI (CI set) it is a failure",
+    );
+    check(
+      NODE_WARNING_RE.test("(node:123) [DEP0040] DeprecationWarning: The `punycode` module is deprecated.") &&
+        NODE_WARNING_RE.test("(node:9) Warning: something") &&
+        !NODE_WARNING_RE.test("[owner-portal] GET /eier failed: TypeError: x"),
+      "tmci-0: Node's own warnings on stderr are recognised (for the failure hint)",
+    );
+
     // ── 1. Seed ─────────────────────────────────────────────────────────
     const env0 = { ...baseEnv(process.env), NODE_ENV: "development" };
     const seed = await runSeed(dir, env0);
     if (seed.spawnError && cannotSpawn(seed.spawnError)) {
-      // The one allowed skip: this platform cannot start a child process at all.
-      console.log(`  testmiljo-ci: SKIPPED — cannot spawn a child process here (${seed.spawnError.code}: ${seed.spawnError.message})`);
+      spawnFailed("the seed", seed.spawnError);
       return { passed, failed, failures };
     }
     check(seed.code === 0, "tmci-1: the seed builds all three databases", `exit ${seed.code}\n${tail(seed.stderr || seed.stdout)}`);
@@ -313,71 +399,83 @@ export async function runTestmiljoCiTests(opts: { log?: boolean } = {}): Promise
     check(owners.rfb.length > 0 && owners.gardssalg.length > 0, "tmci-2: the seed has RFB and gårdssalg owners", `rfb ${owners.rfb.length}, gårdssalg ${owners.gardssalg.length}`);
 
     // ── 2. Start the app ────────────────────────────────────────────────
-    const port = await freePort();
-    const fileEnv = parseEnvFile(fs.readFileSync(ENV_FILE, "utf8"));
-    Object.assign(fileEnv, {
-      PORT: String(port),
-      HOST: "127.0.0.1",
-      BASE_URL: `http://${RFB_HOST}:${port}`,
-      DB_PATH: path.join(dir, "lokal.db"),
-      DENTAL_DB_PATH: path.join(dir, "dental.db"),
-      EXPERIENCES_DB_PATH: path.join(dir, "experiences.db"),
-      TESTMILJO: "1",
-      // The owner dashboards (off in testmiljo.env), for the seeded owners only.
-      OWNER_DASHBOARD_ENABLED: "1",
-      OWNER_ORDERABILITY_PORTAL_ENABLED: "1",
-      OA_OWNER_FEATURES_ENABLED: "1",
-      GARDSSALG_OWNER_DASHBOARD_ENABLED: "pilot",
-      OWNER_FEATURES_ALLOWED_SUBJECTS: [...owners.rfb.map((o) => `rfb:${o.id}`), ...owners.gardssalg.map((o) => `gardssalg:${o.id}`)].join(","),
-    });
-    const appEnv = buildAppEnv(baseEnv(process.env), fileEnv);
-
-    let spawnErr: NodeJS.ErrnoException | null = null;
+    // freePort() closes its probe before the app binds, so another process
+    // can take the port in between: one retry on a fresh port for EADDRINUSE.
+    let port = 0;
+    let healthy = false;
     let exited: string | null = null;
-    try {
-      child = spawn(process.execPath, [tsxCli(), APP], {
-        cwd: REPO_ROOT,
-        env: appEnv,
-        stdio: ["ignore", "pipe", "pipe"],
-        detached: process.platform !== "win32",
+    const allOutput = () => output.map((o) => `[${o.stream}] ${o.line}`).join("\n");
+    for (let attempt = 1; attempt <= 2 && !healthy; attempt++) {
+      port = await freePort();
+      output = [];
+      exited = null;
+      const fileEnv = parseEnvFile(fs.readFileSync(ENV_FILE, "utf8"));
+      Object.assign(fileEnv, {
+        PORT: String(port),
+        HOST: "127.0.0.1",
+        BASE_URL: `http://${RFB_HOST}:${port}`,
+        DB_PATH: path.join(dir, "lokal.db"),
+        DENTAL_DB_PATH: path.join(dir, "dental.db"),
+        EXPERIENCES_DB_PATH: path.join(dir, "experiences.db"),
+        TESTMILJO: "1",
+        // The owner dashboards (off in testmiljo.env), for the seeded owners only.
+        OWNER_DASHBOARD_ENABLED: "1",
+        OWNER_ORDERABILITY_PORTAL_ENABLED: "1",
+        OA_OWNER_FEATURES_ENABLED: "1",
+        GARDSSALG_OWNER_DASHBOARD_ENABLED: "pilot",
+        OWNER_FEATURES_ALLOWED_SUBJECTS: [...owners.rfb.map((o) => `rfb:${o.id}`), ...owners.gardssalg.map((o) => `gardssalg:${o.id}`)].join(","),
       });
-    } catch (err) {
-      spawnErr = err as NodeJS.ErrnoException;
-    }
-    if (spawnErr || !child) {
-      if (cannotSpawn(spawnErr)) {
-        console.log(`  testmiljo-ci: SKIPPED — cannot spawn the app here (${spawnErr?.code}: ${spawnErr?.message})`);
+      const appEnv = buildAppEnv(baseEnv(process.env), fileEnv);
+
+      let spawnErr: NodeJS.ErrnoException | null = null;
+      try {
+        child = spawn(process.execPath, [tsxCli(), APP], {
+          cwd: REPO_ROOT,
+          env: appEnv,
+          stdio: ["ignore", "pipe", "pipe"],
+          detached: process.platform !== "win32",
+        });
+      } catch (err) {
+        spawnErr = err as NodeJS.ErrnoException;
+      }
+      if (spawnErr || !child) {
+        spawnFailed("the app", spawnErr ?? Object.assign(new Error("spawn returned nothing"), { code: "UNKNOWN" }));
         return { passed, failed, failures };
       }
-      throw spawnErr ?? new Error("spawn returned nothing");
-    }
-    for (const stream of ["stdout", "stderr"] as const) {
-      let buf = "";
-      child[stream]!.setEncoding("utf8");
-      child[stream]!.on("data", (d: string) => {
-        buf += d;
-        const lines = buf.split(/\r?\n/);
-        buf = lines.pop() ?? "";
-        for (const line of lines) output.push({ stream, line });
-      });
-      child[stream]!.on("end", () => {
-        if (buf) output.push({ stream, line: buf });
-      });
-    }
-    child.on("error", (err) => (exited = `spawn error: ${String(err)}`));
-    child.on("exit", (code, sig) => (exited = `exit ${code ?? ""}${sig ? ` signal ${sig}` : ""}`));
-
-    const allOutput = () => output.map((o) => `[${o.stream}] ${o.line}`).join("\n");
-    let healthy = false;
-    const deadline = Date.now() + BOOT_TIMEOUT_MS;
-    while (!healthy && !exited && Date.now() < deadline) {
-      try {
-        const h = await request(port, "127.0.0.1", "/health");
-        healthy = h.status === 200;
-      } catch {
-        /* not listening yet */
+      const proc: ChildProcess = child;
+      const sink = output;
+      for (const stream of ["stdout", "stderr"] as const) {
+        let buf = "";
+        proc[stream]!.setEncoding("utf8");
+        proc[stream]!.on("data", (d: string) => {
+          buf += d;
+          const lines = buf.split(/\r?\n/);
+          buf = lines.pop() ?? "";
+          for (const line of lines) sink.push({ stream, line });
+        });
+        proc[stream]!.on("end", () => {
+          if (buf) sink.push({ stream, line: buf });
+        });
       }
-      if (!healthy) await new Promise((r) => setTimeout(r, 250));
+      proc.on("error", (err) => { if (child === proc) exited = `spawn error: ${String(err)}`; });
+      proc.on("exit", (code, sig) => { if (child === proc) exited = `exit ${code ?? ""}${sig ? ` signal ${sig}` : ""}`; });
+
+      const deadline = Date.now() + BOOT_TIMEOUT_MS;
+      while (!healthy && !exited && Date.now() < deadline) {
+        try {
+          const h = await request(port, "127.0.0.1", "/health");
+          healthy = h.status === 200;
+        } catch {
+          /* not listening yet */
+        }
+        if (!healthy) await new Promise((r) => setTimeout(r, 250));
+      }
+      if (!healthy && attempt === 1 && exited && output.some((o) => o.line.includes("EADDRINUSE"))) {
+        if (log) console.log(`  testmiljo-ci: port ${port} was taken before the app bound it; retrying on a new port`);
+        await stopChild(proc);
+        child = null;
+        continue;
+      }
     }
     check(healthy, "tmci-3: the app starts on the seeded databases and /health answers 200", `${exited ?? "timeout"}\n${tail(allOutput())}`);
     if (!healthy) return { passed, failed, failures };
@@ -459,7 +557,11 @@ export async function runTestmiljoCiTests(opts: { log?: boolean } = {}): Promise
     // ── 4. No error lines ───────────────────────────────────────────────
     await new Promise((r) => setTimeout(r, 300)); // let the last log lines arrive
     const errors = output.filter((o) => isErrorLine(o.line, o.stream));
-    check(errors.length === 0, "tmci-5: the app wrote no error lines while serving the pages", errors.slice(0, 20).map((o) => `[${o.stream}] ${o.line}`).join("\n"));
+    const nodeWarnings = errors.filter((o) => o.stream === "stderr" && NODE_WARNING_RE.test(o.line));
+    const hint = nodeWarnings.length
+      ? `\nHINT: ${nodeWarnings.length} of these are Node's own warnings (e.g. a DeprecationWarning). They can come from the Node version running the suite, not from an app change; check the Node version before hunting for an app bug.\n`
+      : "";
+    check(errors.length === 0, "tmci-5: the app wrote no error lines while serving the pages", hint + errors.slice(0, 20).map((o) => `[${o.stream}] ${o.line}`).join("\n"));
     check(!exited, "tmci-6: the app is still running after the last page", exited ?? "");
 
     if (log) {
@@ -472,6 +574,7 @@ export async function runTestmiljoCiTests(opts: { log?: boolean } = {}): Promise
   } finally {
     if (child) await stopChild(child);
     fs.rmSync(tmpRoot, { recursive: true, force: true });
+    removeEmergencyCleanup();
   }
 
   return { passed, failed, failures };
