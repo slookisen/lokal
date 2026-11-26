@@ -120,9 +120,10 @@ forblir kommende).
   `COMMONPROGRAMFILES`, `HOMEDRIVE`, `HOMEPATH`, `NUMBER_OF_PROCESSORS`,
   `PROCESSOR_ARCHITECTURE`, `OS`, `NODE_EXTRA_CA_CERTS`, `CI`, `TSX_TSCONFIG_PATH` og
   `TSX_DISABLE_CACHE`, og alle som begynner med `LC_`. Store og små bokstaver spiller
-  ingen rolle. Navn som ser ut som hemmeligheter (`…KEY`, `…TOKEN`, `…SECRET`,
-  `…PASS…`, `…PAT`, `SMTP_*`, `FLY_*`, `DATABASE_URL`) slippes aldri gjennom, selv om
-  de skulle stå på listen. Alt annet fra skallet når ikke appen. `testmiljo.env`
+  ingen rolle. Navn som ser ut som hemmeligheter slippes aldri gjennom, selv om
+  de skulle stå på listen: et navn med en del som `KEY`, `APIKEY`, `TOKEN`, `SECRET`,
+  `PASS`, `PASSWORD`, `PAT` eller `CREDENTIAL(S)`, hvor som helst i navnet, og
+  `SMTP_*`, `FLY_*` og `DATABASE_URL`. Alt annet fra skallet når ikke appen. `testmiljo.env`
   legges på etterpå og vinner over en arvet verdi. Et flagg du setter i skallet,
   kommer derfor ikke til appen: endre det i `testmiljo.env` i stedet (i din egen
   kopi, uten å committe den, for en engangstest). LLM-kall, SMTP og betalings-API-er
@@ -149,7 +150,7 @@ forblir kommende).
   `TESTMILJO_ALLOW_OUTBOUND` i `testmiljo.env`.
 - Handlingstokens og agentnøkler i testdataene er faste, lesbare tekster, for
   eksempel `testmiljo-agent-<n>`, `testmiljo-ordre-<n>`, `testmiljo-claim-<n>` og
-  `testmiljo-svar-<n>`. De er oppdiktede og finnes bare i den lokale databasen. De
+  `testmiljo-svar-<tilstand>`. De er oppdiktede og finnes bare i den lokale databasen. De
   er ikke gyldige i prod. Bruk dem aldri andre steder.
 
 ## Øyeblikksbilder
