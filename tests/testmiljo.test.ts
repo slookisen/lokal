@@ -303,12 +303,13 @@ export async function runTestmiljoTests(opts: { log?: boolean } = {}): Promise<T
       const linked = await runSeed(["--dir", linkDir, "--rfb", path.join(linkDir, "lenke.db")], {});
       check(linked.code !== 0 && fs.readFileSync(realTarget, "utf8") === "", "tm-g9: the seed refuses a symlinked target and leaves the link target untouched", `exit ${linked.code}`);
 
-      // N8: a name that is .testmiljo but resolves to a real directory with another name.
+      // N8, step 1 (tm-g15a): a real directory whose basename is not .testmiljo is refused.
       const plainRoot = fs.mkdtempSync(path.join(os.tmpdir(), "testmiljo-vanlig-"));
       extraRoots.push(plainRoot);
       const plainReal = path.join(plainRoot, "data");
       fs.mkdirSync(plainReal);
       check(throws(() => seed.assertTestmiljoDir(plainReal), /ikke en godkjent/), "tm-g15a: guard refuses a real directory not named .testmiljo");
+      // N8, step 2 (tm-g15): a path named .testmiljo that resolves to that other-named real directory is refused too.
       const aliasRoot = fs.mkdtempSync(path.join(os.tmpdir(), "testmiljo-alias-"));
       extraRoots.push(aliasRoot);
       const alias = path.join(aliasRoot, ".testmiljo");
@@ -453,6 +454,17 @@ export async function runTestmiljoTests(opts: { log?: boolean } = {}): Promise<T
     );
     check(["com10", "lpt0", "con1", "konsoll", "nul-x"].every((n) => !throws(() => snap.validateSnapshotName(n))), "tm-s30: names that only resemble reserved ones are accepted");
     check(fs.readdirSync(path.join(dir, "oyeblikk")).sort().join(",") === "med-outbox,rundtur,under-kjoring,wal-stoppet", "tm-s15: refused names create nothing", fs.readdirSync(path.join(dir, "oyeblikk")).join(","));
+    // N1: a reserved-name directory made directly on disk (bypassing validation) is not listed.
+    {
+      const reservedDir = path.join(dir, "oyeblikk", "nul");
+      fs.mkdirSync(reservedDir);
+      try {
+        const listed = snap.listSnapshots(dir);
+        check(!listed.includes("nul") && listed.includes("rundtur"), "tm-s32: listSnapshots skips a reserved-name directory but lists normal snapshots", listed.join(","));
+      } finally {
+        fs.rmSync(reservedDir, { recursive: true, force: true });
+      }
+    }
     check(throws(() => snap.restoreSnapshot(dir, "finnes-ikke", dbPaths), /finnes ikke/), "tm-s16: hent refuses a missing snapshot");
     fs.rmSync(path.join(dir, "oyeblikk", "under-kjoring", "dental.db"));
     check(throws(() => snap.restoreSnapshot(dir, "under-kjoring", dbPaths), /ufullstendig/), "tm-s17: hent refuses an incomplete snapshot");

@@ -61,4 +61,4 @@ mcp-server/node_modules/
 
 # Local test environment (npm run testmiljo) — seeded, invented data; rebuilt
 # with `npm run testmiljo:nullstill`. Never repo content.
-.testmiljo/
+.testmiljo
