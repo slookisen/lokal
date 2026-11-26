@@ -54,8 +54,11 @@ const INHERIT_NAMES = new Set([
   "SYSTEMDRIVE", "WINDIR", "COMSPEC", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
   "PROGRAMFILES", "PROGRAMFILES(X86)", "COMMONPROGRAMFILES", "HOMEDRIVE", "HOMEPATH",
   "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "OS", "NODE_EXTRA_CA_CERTS", "CI",
+  // The only TSX_* variables the tsx package reads (besides TSX_DEBUG): listed by name, no open prefix (review N4).
+  "TSX_TSCONFIG_PATH", "TSX_DISABLE_CACHE",
 ]);
-const INHERIT_PREFIXES = ["LC_", "TSX_"];
+// Only locale variables are inherited by prefix; TSX_* is deliberately NOT a prefix.
+const INHERIT_PREFIXES = ["LC_"];
 export function isInheritedName(name: string): boolean {
   const upper = name.toUpperCase();
   // Allowlist AND not credential-looking (defence in depth).

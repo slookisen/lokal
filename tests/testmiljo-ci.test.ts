@@ -154,6 +154,8 @@ export function spawnFailureVerdict(err: unknown, env: NodeJS.ProcessEnv = proce
 /** A stderr line that is Node's own warning (its wording depends on the Node version, not only on the app). */
 const NODE_WARNING_RE = /^\(node:\d+\) (?:\[[A-Z0-9]+\] )?\w*Warning:/;
 
+const SEED_TIMEOUT_MS = 120_000;
+
 interface RunResult { code: number | null; stdout: string; stderr: string; spawnError?: NodeJS.ErrnoException }
 
 function runSeed(dir: string, env: NodeJS.ProcessEnv): Promise<RunResult> {
@@ -168,8 +170,13 @@ function runSeed(dir: string, env: NodeJS.ProcessEnv): Promise<RunResult> {
     let stderr = "";
     child.stdout!.on("data", (d) => (stdout += d));
     child.stderr!.on("data", (d) => (stderr += d));
-    child.on("error", (err) => resolve({ code: -1, stdout, stderr: stderr + String(err), spawnError: err as NodeJS.ErrnoException }));
-    child.on("close", (code) => resolve({ code, stdout, stderr }));
+    // N6 (review of #1673): a hung seed must not hang all of `npm test` silently.
+    const timer = setTimeout(() => {
+      killTree(child, "SIGKILL");
+      resolve({ code: -1, stdout, stderr: stderr + `\nseed.ts timed out after ${SEED_TIMEOUT_MS / 1000} s and was killed` });
+    }, SEED_TIMEOUT_MS);
+    child.on("error", (err) => { clearTimeout(timer); resolve({ code: -1, stdout, stderr: stderr + String(err), spawnError: err as NodeJS.ErrnoException }); });
+    child.on("close", (code) => { clearTimeout(timer); resolve({ code, stdout, stderr }); });
   });
 }
 
