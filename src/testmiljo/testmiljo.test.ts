@@ -6,8 +6,9 @@
  *
  * Covers:
  *   g1-g9   the switch: off by default, on only for TESTMILJO=1 outside
- *           production, boot refused in production / wrong value / with mail
- *           credentials / without own database files / on a network listen
+ *           production; in production the variable is ignored and logged and
+ *           never stops boot; outside it, boot is refused for a wrong value /
+ *           mail credentials / no own database files / a network listen
  *           address; loopback check.
  *   s1-s3   wiring: the boot check is the first import of src/index.ts; the
  *           rate limiters are skipped in the test environment only; the
@@ -106,10 +107,43 @@ export async function runTestmiljoTests(opts: { log?: boolean; realFetch?: boole
     assertTrue(!guard.isTestmiljo({}) && guard.testmiljoBootProblems({}).length === 0 && throws({ NODE_ENV: "production", FLY_APP_NAME: "lokal" }) === "",
       "g1 unset: off, and production boots untouched");
     assertTrue(guard.isTestmiljo({ TESTMILJO: "1", ...dbs }) && throws({ TESTMILJO: "1", ...dbs }) === "", "g2 TESTMILJO=1 with own databases: on, boot allowed");
-    assertTrue(!guard.isTestmiljo({ TESTMILJO: "1", NODE_ENV: "production", ...dbs }) && /production/.test(throws({ TESTMILJO: "1", NODE_ENV: "production", ...dbs })),
-      "g3 NODE_ENV=production: off, boot refused");
-    for (const fly of ["FLY_APP_NAME", "FLY_MACHINE_ID", "FLY_ALLOC_ID"]) {
-      assertTrue(!guard.isTestmiljo({ TESTMILJO: "1", [fly]: "x", ...dbs }) && throws({ TESTMILJO: "1", [fly]: "x", ...dbs }) !== "", `g4 ${fly} set: off, boot refused`);
+    for (const production of [{ NODE_ENV: "production" }, { FLY_APP_NAME: "x" }, { FLY_MACHINE_ID: "x" }, { FLY_ALLOC_ID: "x" }]) {
+      for (const value of ["1", "true", "0"]) {
+        // Everything that would refuse a local boot is present too: production still starts.
+        const env: NodeJS.ProcessEnv = { TESTMILJO: value, SMTP_HOST: "smtp.example", HOST: "0.0.0.0", ...production };
+        assertTrue(!guard.isTestmiljo(env) && throws(env) === "" && guard.testmiljoBootProblems(env).length === 0 && /IGNORED/.test(String(guard.testmiljoProductionNotice(env))),
+          `g3 ${Object.keys(production)[0]} with TESTMILJO=${value}: off, boot not refused, and the notice says it is ignored`);
+      }
+    }
+    assertEq([guard.testmiljoProductionNotice({ NODE_ENV: "production", FLY_APP_NAME: "lokal" }), guard.testmiljoProductionNotice({ TESTMILJO: "1", ...dbs }), guard.testmiljoProductionNotice({})],
+      [null, null, null], "g4 no notice without the variable, or outside production");
+    {
+      // boot.ts itself, as production would load it with the variable set.
+      const bootPath = require.resolve("./boot");
+      const connectBefore = net.Socket.prototype.connect;
+      const errorSpy = console.error;
+      const logSpy = console.log;
+      const errors: string[] = [];
+      const logs: string[] = [];
+      let threw = "";
+      delete require.cache[bootPath];
+      process.env.TESTMILJO = "1";
+      process.env.NODE_ENV = "production";
+      delete process.env.HOST;
+      console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
+      console.log = (...args: unknown[]) => { logs.push(args.map(String).join(" ")); };
+      try {
+        require("./boot");
+      } catch (err) {
+        threw = String((err as Error).message);
+      } finally {
+        console.error = errorSpy;
+        console.log = logSpy;
+        delete require.cache[bootPath];
+        restoreEnv();
+      }
+      assertEq([threw, errors.length, /TESTMILJO is set in production and is IGNORED/.test(errors[0] ?? ""), logs.length, net.Socket.prototype.connect === connectBefore, process.env.HOST === savedEnv.HOST],
+        ["", 1, true, 0, true, true], "g4 booted in production with the variable set: one error line, no throw, nothing installed");
     }
     for (const value of ["true", "0", "on", "yes"]) {
       assertTrue(!guard.isTestmiljo({ TESTMILJO: value, ...dbs }) && /exactly/.test(throws({ TESTMILJO: value, ...dbs })), `g5 TESTMILJO=${value}: off, boot refused (not silently ignored)`);
@@ -141,10 +175,23 @@ export async function runTestmiljoTests(opts: { log?: boolean; realFetch?: boole
       // it imports first, pulls in outbound-guard). An eager import of an app
       // module from any of them would move that module, and what it imports,
       // ahead of its usual place in production's boot order.
-      const eager = ["boot.ts", "guard.ts", "hosts.ts", "outbound-guard.ts", "outbox.ts", "router.ts"].flatMap((file) =>
-        fs.readFileSync(path.join(__dirname, file), "utf8").split(/\r?\n/)
-          .filter((line) => /^import\b/.test(line) && !/^import type\b/.test(line) && /from\s+["']\.\.\//.test(line))
-          .map((line) => `${file}: ${line}`));
+      const EAGER_APP_IMPORT = [
+        /^import\s+(?!type\b)(?:[^;'"]*?\sfrom\s+)?["']\.\.\//m, // named, default, namespace, multi-line and side-effect imports
+        /^import\s+\w+\s*=\s*require\(\s*["']\.\.\//m,
+        /^export\s+(?!type\b)(?:\*|\{[^}]*\})[^;'"]*?\sfrom\s+["']\.\.\//m,
+        /^(?:const|let|var)\s[^\n;]*=\s*require\(\s*["']\.\.\//m, // a require at column 0 runs at import
+      ];
+      const sources = fs.readdirSync(__dirname).filter((file) => file.endsWith(".ts") && !file.endsWith(".test.ts") && !file.endsWith(".d.ts")).sort();
+      const eager = sources.filter((file) => {
+        const text = fs.readFileSync(path.join(__dirname, file), "utf8");
+        return EAGER_APP_IMPORT.some((pattern) => pattern.test(text));
+      });
+      const wouldCatch = ['import { a } from "../x";', 'import {\n  a,\n  b,\n} from "../x";', 'import "../x";', 'import x = require("../x");', 'export { a } from "../x";', 'export * from "../x";', 'const x = require("../x");', 'import d, { type T } from "../x";']
+        .map((sample) => EAGER_APP_IMPORT.some((pattern) => pattern.test(sample)));
+      const wouldAllow = ['import type { A } from "../x";', 'import { a } from "./x";', 'import fs from "fs";', '  const { a } = require("../x");', 'export function f() {\n  return require("../x");\n}', 'export type { A } from "../x";']
+        .map((sample) => EAGER_APP_IMPORT.some((pattern) => pattern.test(sample)));
+      assertEq([sources.includes("router.ts") && sources.includes("boot.ts") && sources.length >= 6, wouldCatch, wouldAllow],
+        [true, wouldCatch.map(() => true), wouldAllow.map(() => false)], "s3 the scan reads every module in the folder and tells eager app imports from lazy and type-only ones");
       assertEq(eager, [], "s3 the modules index.ts imports from src/testmiljo import no app module eagerly");
     }
     {

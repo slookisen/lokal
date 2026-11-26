@@ -86,10 +86,12 @@ forblir kommende).
   slått av i `testmiljo.env`. Admin-sider svarer «Admin not configured» (ingen
   admin-nøkkel i testmiljøet).
 - Koden i `src/testmiljo/` virker bare når `TESTMILJO=1` og miljøet ikke er
-  produksjon (`NODE_ENV=production` eller en Fly-variabel). Appen nekter å
-  starte med `TESTMILJO` satt i produksjon, med en annen verdi enn `1`, med
-  e-postlegitimasjon i miljøet, uten egne databasestier, eller med en `HOST` som
-  åpner porten mot nettverket.
+  produksjon (`NODE_ENV=production` eller en Fly-variabel). Settes `TESTMILJO`
+  i produksjon, ignoreres den, og oppstarten skriver én feillinje i loggen.
+  Den stopper ikke appen der.
+- Lokalt nekter appen å starte ved feil oppsett: en annen verdi enn `1`,
+  e-postlegitimasjon i miljøet, manglende egne databasestier, eller en `HOST`
+  som åpner porten mot nettverket.
 - `/testmiljo` svarer bare denne maskinen, bare på de lokale navnene, ikke
   gjennom en tunnel eller mellomtjener, og ikke på skriving fra et annet nettsted.
 - Ikke publiser port 3100 (ngrok, portvideresending i editoren og lignende).
