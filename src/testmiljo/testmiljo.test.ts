@@ -151,8 +151,11 @@ export async function runTestmiljoTests(opts: { log?: boolean; realFetch?: boole
       const burst = async (): Promise<string> => {
         try { await rfbClaimRequestLimiter.resetKey("127.0.0.1"); } catch { /* ignore */ }
         const codes: number[] = [];
-        for (let i = 0; i < 12; i++) codes.push(await hit());
-        try { await rfbClaimRequestLimiter.resetKey("127.0.0.1"); } catch { /* ignore */ }
+        try {
+          for (let i = 0; i < 12; i++) codes.push(await hit());
+        } finally {
+          try { await rfbClaimRequestLimiter.resetKey("127.0.0.1"); } catch { /* ignore */ }
+        }
         return `${codes.filter((c) => c === 200).length} ok, ${codes.filter((c) => c === 429).length} limited`;
       };
       try {
@@ -210,7 +213,8 @@ export async function runTestmiljoTests(opts: { log?: boolean; realFetch?: boole
       res.setHeader("Location", "https://opplevagent.no/kategori/gardssalg/eier/x/portal");
       res.setHeader("X-Other", "https://opplevagent.no/");
       res.send('<a href="https://rettfrabonden.com/">x</a>');
-      assertTrue(nexted && req.headers["x-forwarded-host"] === "opplevagent.no", "h4 the local name reaches the app as the production host; a client-sent X-Forwarded-Host is dropped");
+      assertTrue(nexted && req.headers["x-forwarded-host"] === "opplevagent.no" && req.headers[hosts.CLIENT_FORWARDED_HOST_MARK] === "1",
+        "h4 the local name reaches the app as the production host; a client-sent X-Forwarded-Host is dropped and marked");
       assertEq([res.headers["location"], res.headers["x-other"], res.body],
         ["http://opplevagent.localhost:4310/kategori/gardssalg/eier/x/portal", "https://opplevagent.no/", '<a href="http://rettfrabonden.localhost:4310/">x</a>'],
         "h4 Location and HTML are rewritten, other headers are not");
@@ -219,7 +223,8 @@ export async function runTestmiljoTests(opts: { log?: boolean; realFetch?: boole
       json.res.send('{"url":"https://rettfrabonden.com/p"}');
       assertEq(json.res.body, '{"url":"https://rettfrabonden.com/p"}', "h4 JSON bodies are left alone");
       const plain = runHost("localhost:4310", "/");
-      assertTrue(plain.nexted && plain.req.headers["x-forwarded-host"] === undefined, "h4 plain localhost is not mapped");
+      assertTrue(plain.nexted && plain.req.headers["x-forwarded-host"] === undefined && plain.req.headers[hosts.CLIENT_FORWARDED_HOST_MARK] === undefined && json.req.headers[hosts.CLIENT_FORWARDED_HOST_MARK] === undefined,
+        "h4 plain localhost is not mapped, and an ordinary request carries no mark");
     }
     {
       const sw = runHost("rettfrabonden.localhost:4310", "/sw.js");
@@ -376,11 +381,12 @@ export async function runTestmiljoTests(opts: { log?: boolean; realFetch?: boole
         assertEq([rebound.status, lookalike.status, crossPost.status, sameSitePost.status, crossGet.status, plainLocalhost.status, issued.length], [403, 403, 403, 403, 200, 200, 0],
           "r2 a Host that is not a local name, or a write another site started, is refused; reading from a followed link is not");
         const tunnelled = [];
-        for (const header of ["X-Forwarded-For", "Forwarded", "X-Real-IP", "Via"]) {
+        const proxyHeaders = ["X-Forwarded-For", "Forwarded", "X-Real-IP", "Via", "X-Forwarded-Proto", "X-Forwarded-Port", "X-Original-Host", "CF-Connecting-IP", "True-Client-IP", hosts.CLIENT_FORWARDED_HOST_MARK];
+        for (const header of proxyHeaders) {
           tunnelled.push((await call("GET", "/testmiljo/epost", undefined, { Host: "localhost:4310", [header]: "203.0.113.9" })).status);
           tunnelled.push((await call("POST", "/testmiljo/logg-inn", { site: "rfb", id: "rfb-1" }, { [header]: "203.0.113.9" })).status);
         }
-        assertEq([tunnelled, issued.length], [[403, 403, 403, 403, 403, 403, 403, 403], 0], "r2 a request that came through a proxy or tunnel is refused, read or write");
+        assertEq([tunnelled, issued.length], [proxyHeaders.flatMap(() => [403, 403]), 0], "r2 a request that came through a proxy or tunnel is refused, read or write");
         const foreignOrigin = await call("POST", "/testmiljo/logg-inn", { site: "rfb", id: "rfb-1" }, { Origin: "https://evil.example" });
         const otherLocalOrigin = await call("POST", "/testmiljo/logg-inn", { site: "rfb", id: "rfb-1" }, { Origin: "http://opplevagent.localhost:4310" });
         const badOrigin = await call("POST", "/testmiljo/logg-inn", { site: "rfb", id: "rfb-1" }, { Origin: "not a url" });
@@ -428,7 +434,7 @@ export async function runTestmiljoTests(opts: { log?: boolean; realFetch?: boole
         const one = await call("GET", `/testmiljo/epost/${withHtml.id}`);
         const textOne = await call("GET", `/testmiljo/epost/${textOnly.id}`);
         const sandbox = /<iframe title="E-posten" sandbox="([^"]*)" srcdoc="/.exec(one.body)?.[1] ?? "MISSING";
-        assertTrue(one.status === 200 && sandbox !== "MISSING" && !/allow-scripts|allow-same-origin/.test(sandbox) && one.body.includes("Ren tekst"),
+        assertTrue(one.status === 200 && sandbox === "allow-top-navigation-by-user-activation" && one.body.includes("Ren tekst"),
           "r7 one e-mail shows its headers, the text version, and the HTML in a frame that cannot run script or read this origin");
         assertTrue(one.body.includes("&lt;a href=&quot;https://opplevagent.no/x&quot;&gt;Bekreft&lt;/a&gt;&lt;script&gt;alert(1)&lt;/script&gt;") && !one.body.includes("<script>") && one.headers["content-security-policy"] === undefined,
           "r7 the e-mail's HTML is only ever inside the frame's escaped srcdoc");
@@ -459,16 +465,19 @@ export async function runTestmiljoTests(opts: { log?: boolean; realFetch?: boole
       // A fresh db-factory with the services bound to it (see tests/module-cache.ts):
       // earlier blocks may have left copies of gardssalg-claim bound to another
       // db-factory, whose in-memory database is not the one seeded below.
+      const prevExperiences = process.env.EXPERIENCES_DB_PATH;
+      let restoreDb: (() => void) | null = null;
+      let swappedFactory: typeof import("../database/db-factory") | null = null;
       const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([
         require.resolve("../database/db-factory"), require.resolve("../services/gardssalg-claim"),
         require.resolve("../services/experience-store"), require.resolve("../services/booking-store"), require.resolve("../services/blocklist-service"),
       ]);
-      const prevExperiences = process.env.EXPERIENCES_DB_PATH;
-      process.env.EXPERIENCES_DB_PATH = ":memory:";
-      const initMod = require("../database/init") as typeof import("../database/init");
-      const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
-      const restoreDb = initMod.__pinInMemoryDbForTesting();
       try {
+        process.env.EXPERIENCES_DB_PATH = ":memory:";
+        const initMod = require("../database/init") as typeof import("../database/init");
+        const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+        swappedFactory = dbFactory;
+        restoreDb = initMod.__pinInMemoryDbForTesting();
         const db = initMod.__peekDbForTesting()!;
         const insertAgent = db.prepare(`INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, categories)
                                         VALUES (?, ?, 'Testprodusent', 'test', ?, 'https://example.test', 'producer', ?, '["vegetables"]')`);
@@ -508,8 +517,8 @@ export async function runTestmiljoTests(opts: { log?: boolean; realFetch?: boole
         assertTrue(typeof gsToken === "string" && gsToken.length >= 32 && gsRow?.provider_id === "tm-gs-owned" && gsRow?.email === "eier@fjordsider.invalid" && gsRow?.used === 0,
           "d4 gårdssalg login issues an ordinary unused login link");
       } finally {
-        restoreDb();
-        try { dbFactory.__resetDbFactoryForTesting(); } catch { /* best effort */ }
+        if (restoreDb) restoreDb();
+        try { swappedFactory?.__resetDbFactoryForTesting(); } catch { /* best effort */ }
         if (prevExperiences === undefined) delete process.env.EXPERIENCES_DB_PATH;
         else process.env.EXPERIENCES_DB_PATH = prevExperiences;
         restoreModuleCache();

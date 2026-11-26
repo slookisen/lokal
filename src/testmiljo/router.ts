@@ -37,7 +37,7 @@
 
 import express, { type Express, type NextFunction, type Request, type Response, Router } from "express";
 import { isLoopbackAddress, isTestmiljo } from "./guard";
-import { LOCAL_SITES, isLocalHostName, localOrigin, siteByKey, splitHostPort, type LocalSite } from "./hosts";
+import { CLIENT_FORWARDED_HOST_MARK, LOCAL_SITES, isLocalHostName, localOrigin, siteByKey, splitHostPort, type LocalSite } from "./hosts";
 import { clearOutbox, getOutboxMail, listOutbox, outboxFile, type OutboxMail } from "./outbox";
 import { outboundAttempts } from "./outbound-guard";
 
@@ -269,12 +269,13 @@ ${rows}
 
 /**
  * The e-mail's HTML as the srcdoc of a sandboxed frame. The sandbox has no
- * allow-scripts and no allow-same-origin: nothing in a captured e-mail can run
- * or read this origin. A click on a link may open it in the whole window.
+ * allow-scripts, allow-same-origin, allow-forms or allow-popups: nothing in a
+ * captured e-mail can run, read this origin or open a window. The one thing it
+ * may do is take the whole window to a link you click.
  */
 function mailFrame(mail: OutboxMail): string {
   const body = mail.html ?? `<pre style="white-space:pre-wrap;font:15px/1.5 system-ui,sans-serif">${esc(mail.text ?? "")}</pre>`;
-  return `<iframe title="E-posten" sandbox="allow-top-navigation-by-user-activation allow-popups allow-popups-to-escape-sandbox" srcdoc="${esc(`<base target="_top">${body}`)}"></iframe>`;
+  return `<iframe title="E-posten" sandbox="allow-top-navigation-by-user-activation" srcdoc="${esc(`<base target="_top">${body}`)}"></iframe>`;
 }
 
 function mailPage(mail: OutboxMail): string {
@@ -311,7 +312,15 @@ ${mail.text ? `<section><h2>Tekstversjonen</h2><pre>${esc(mail.text)}</pre></sec
   );
 }
 
-const PROXY_HEADERS = ["x-forwarded-for", "forwarded", "x-real-ip", "via"] as const;
+/**
+ * Headers a tunnel or reverse proxy adds and a browser never sends.
+ * X-Forwarded-Host is not listed by name: the hosts middleware sets it for the
+ * local site names, and marks a request that arrived with one of its own.
+ */
+const PROXY_HEADERS: readonly string[] = [
+  "x-forwarded-for", "forwarded", "x-real-ip", "via", "x-forwarded-proto", "x-forwarded-port", "x-original-host",
+  "cf-connecting-ip", "true-client-ip", CLIENT_FORWARDED_HOST_MARK,
+];
 
 /**
  * For a write without Sec-Fetch-Site (an old browser, or not a browser). No

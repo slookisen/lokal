@@ -55905,6 +55905,28 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-25-testmiljo-froedata, slice 1: local test environment.
+// Seeds three temp `.testmiljo/` DBs twice through the real CLI (child
+// processes, so this process's DB singletons are never touched): identical row
+// counts per table (AK5), refusal with NODE_ENV=production / FLY_APP_NAME /
+// FLY_MACHINE_ID / a target outside .testmiljo/, every e-mail on .invalid, and
+// the launcher's credential stripping. Temp dir removed in finally — runSerial, tail.
+runSerial(async () => {
+  console.log("\n── 2026-11-25 testmiljø S1: frødata (seed + oppstart) ──");
+  try {
+    const { runTestmiljoTests } = require("./testmiljo.test") as
+      typeof import("./testmiljo.test");
+    const r = await runTestmiljoTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("testmiljo: " + f);
+    console.log(`  testmiljo: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("testmiljo: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-11-25-testmiljo-lokal-kopi-med-testdata-foer-prodsetting
 // (points 2, 3, 4): the local test environment's switch, local host names,
 // outbound guard, e-mail outbox and /testmiljo pages. Sets and restores
@@ -55919,10 +55941,10 @@ runSerial(async () => {
     const r = await runTestmiljoTests({ log: false });
     passed += r.passed;
     failed += r.failed;
-    for (const f of r.failures) failures.push("testmiljo: " + f);
-    console.log(`  testmiljo: ${r.passed} passed, ${r.failed} failed`);
+    for (const f of r.failures) failures.push("testmiljo-app: " + f);
+    console.log(`  testmiljo-app: ${r.passed} passed, ${r.failed} failed`);
   } catch (err: any) {
     failed++;
-    failures.push("testmiljo: unexpected error: " + String(err?.message || err));
+    failures.push("testmiljo-app: unexpected error: " + String(err?.message || err));
   }
 });

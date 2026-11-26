@@ -11,7 +11,9 @@
     "start": "tsx src/index.ts",
     "build": "tsc --noEmit && node scripts/build-dist.js",
     "start:prod": "node --enable-source-maps dist/index.js",
-    "test": "tsx tests/test.ts"
+    "test": "tsx tests/test.ts",
+    "testmiljo": "tsx scripts/testmiljo/launch.ts",
+    "testmiljo:nullstill": "tsx scripts/testmiljo/launch.ts --nullstill"
   },
   "keywords": [],
   "author": "",

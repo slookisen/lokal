@@ -92,6 +92,13 @@ export const SELF_REMOVING_SERVICE_WORKER =
   "var keys=await caches.keys();for(var i=0;i<keys.length;i++){await caches.delete(keys[i]);}" +
   "await self.registration.unregister();})());});";
 
+/**
+ * Set on a request that arrived with its own X-Forwarded-Host. A browser never
+ * sends that header; a tunnel or reverse proxy does. The header itself is
+ * replaced below, so the /testmiljo router reads this mark instead.
+ */
+export const CLIENT_FORWARDED_HOST_MARK = "x-testmiljo-client-forwarded-host";
+
 function isHtml(res: Response): boolean {
   const type = res.getHeader("Content-Type");
   return type === undefined || String(type).toLowerCase().includes("text/html");
@@ -103,8 +110,10 @@ export function testmiljoHostMiddleware(): RequestHandler {
     if (!isTestmiljo()) return next();
     const { hostname, port } = splitHostPort(req.headers.host);
     const prodHost = prodHostFor(hostname);
+    const clientSentForwardedHost = req.headers["x-forwarded-host"] !== undefined;
     delete req.headers["x-forwarded-host"];
     if (prodHost) req.headers["x-forwarded-host"] = prodHost;
+    if (clientSentForwardedHost) req.headers[CLIENT_FORWARDED_HOST_MARK] = "1";
 
     if (req.path === "/sw.js") {
       res.setHeader("Content-Type", "application/javascript; charset=utf-8");

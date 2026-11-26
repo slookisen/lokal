@@ -58,3 +58,7 @@ mcp-server/node_modules/
 # Claude Code harness worktree scratch checkouts — never repo content.
 # These previously landed as orphaned gitlinks (see PR #352).
 .claude/worktrees/
+
+# Local test environment (npm run testmiljo) — seeded, invented data; rebuilt
+# with `npm run testmiljo:nullstill`. Never repo content.
+.testmiljo/
