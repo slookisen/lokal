@@ -8,7 +8,11 @@
  *       NODE_ENV=production, with FLY_APP_NAME / FLY_MACHINE_ID set, and for a
  *       target outside a `.testmiljo/` directory;
  *   (c) every seeded e-mail address ends in `.invalid`.
- * Plus: the launcher drops credential-looking variables and keeps PATH.
+ * Plus: the launcher drops credential-looking variables, keeps PATH and
+ * refuses DB paths outside .testmiljo/; the path guard accepts only the
+ * repo's own .testmiljo/ (or one under the OS temp dir) and refuses symlinks;
+ * snapshots (scripts/testmiljo/snapshot.ts) round-trip, refuse while a -wal
+ * file exists, refuse bad names and refuse in production.
  *
  * The seed runs as a child process (the real CLI, through tsx), so it never
  * touches this process's DB singletons. Temp dirs are removed in `finally`.
@@ -32,6 +36,7 @@ export interface TestSummary {
 
 const REPO_ROOT = path.resolve(__dirname, "..");
 const SEED = path.join(REPO_ROOT, "scripts", "testmiljo", "seed.ts");
+const SNAPSHOT = path.join(REPO_ROOT, "scripts", "testmiljo", "snapshot.ts");
 
 function tsxCli(): string {
   const pkgPath = require.resolve("tsx/package.json", { paths: [REPO_ROOT] });
@@ -42,7 +47,20 @@ function tsxCli(): string {
 
 interface RunResult { code: number | null; stdout: string; stderr: string }
 
+function throws(fn: () => unknown, re?: RegExp): boolean {
+  try {
+    fn();
+    return false;
+  } catch (err) {
+    return re ? re.test((err as Error).message) : true;
+  }
+}
+
 function runSeed(args: string[], envOver: Record<string, string | undefined>): Promise<RunResult> {
+  return runScript(SEED, args, envOver);
+}
+
+function runScript(script: string, args: string[], envOver: Record<string, string | undefined>): Promise<RunResult> {
   const env: NodeJS.ProcessEnv = { ...process.env };
   // The suite sets NODE_ENV=test; FLY_* must not leak in from a CI shell.
   delete env.FLY_APP_NAME;
@@ -52,7 +70,7 @@ function runSeed(args: string[], envOver: Record<string, string | undefined>): P
     else env[k] = v;
   }
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [tsxCli(), SEED, ...args], { cwd: REPO_ROOT, env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(process.execPath, [tsxCli(), script, ...args], { cwd: REPO_ROOT, env, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (d) => (stdout += d));
@@ -73,7 +91,7 @@ function countsFromOutput(stdout: string): Counts | null {
 function countsFromFiles(dir: string): Counts {
   const out: Counts = {};
   for (const [key, file] of [["rfb", "lokal.db"], ["dental", "dental.db"], ["experiences", "experiences.db"]]) {
-    const db = new Database(path.join(dir, file), { readonly: true });
+    const db = new Database(path.join(dir, file), { fileMustExist: true }); // read-write: a read-only one leaves -wal/-shm on WAL DBs
     try {
       const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as Array<{ name: string }>;
       out[key] = {};
@@ -138,6 +156,15 @@ export async function runTestmiljoTests(opts: { log?: boolean } = {}): Promise<T
   };
 
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "testmiljo-test-"));
+  const extraRoots: string[] = [];
+  /** A further accepted `<tmpdir>/<mkdtemp>/.testmiljo` (the guard wants a direct child of tmpdir). */
+  const extraTestmiljo = (prefix: string): string => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    extraRoots.push(root);
+    const d = path.join(root, ".testmiljo");
+    fs.mkdirSync(d);
+    return d;
+  };
   try {
     const dir = path.join(tmpRoot, ".testmiljo");
 
@@ -219,11 +246,205 @@ export async function runTestmiljoTests(opts: { log?: boolean } = {}): Promise<T
       "tm-l3: launcher DB paths resolve into .testmiljo/ (shell DB_PATH ignored)",
     );
     check(fileEnv.NODE_ENV !== "production" && !Object.keys(fileEnv).some((k) => launch.isCredentialName(k)), "tm-l4: testmiljo.env holds no credential-named keys and is not production");
+    for (const bad of ["data/lokal.db", path.join(tmpRoot, "elsewhere", "lokal.db"), "foo/.testmiljo/lokal.db"]) {
+      check(
+        throws(() => launch.buildAppEnv({ PATH: "/usr/bin" }, { ...fileEnv, DB_PATH: bad })),
+        `tm-l5: launcher refuses a testmiljo.env DB_PATH outside .testmiljo/ (${bad})`,
+      );
+    }
+
+    // Path guard (N1): only <repo>/.testmiljo or a .testmiljo under the OS temp dir.
+    /* eslint-disable @typescript-eslint/no-var-requires */
+    const seed = require("../scripts/testmiljo/seed") as typeof import("../scripts/testmiljo/seed");
+    /* eslint-enable @typescript-eslint/no-var-requires */
+    check(throws(() => seed.assertInsideTestmiljo(path.join(REPO_ROOT, "foo", ".testmiljo", "x.db"))), "tm-g1: guard refuses <repo>/foo/.testmiljo/x.db (not the repo's own .testmiljo)");
+    check(throws(() => seed.assertInsideTestmiljo(path.join(path.parse(REPO_ROOT).root, "srv", "app", ".testmiljo", "x.db"))), "tm-g2: guard refuses a .testmiljo/ outside the repo and the temp dir");
+    check(throws(() => seed.assertInsideTestmiljo(path.join(tmpRoot, "x.db"))), "tm-g3: guard refuses a temp dir that is not named .testmiljo");
+    check(!throws(() => seed.assertInsideTestmiljo(path.join(REPO_ROOT, ".testmiljo", "x.db"))), "tm-g4: guard accepts <repo>/.testmiljo/x.db");
+    check(!throws(() => seed.assertInsideTestmiljo(path.join(dir, "x.db"))), "tm-g5: guard accepts <tmp>/…/.testmiljo/x.db");
+    check(throws(() => seed.assertInsideTestmiljo(path.join(tmpRoot, "dypere", ".testmiljo", "x.db"))), "tm-g10: guard refuses a .testmiljo/ nested deeper than <tmpdir>/<one dir>/");
+    {
+      const saved = { TMPDIR: process.env.TMPDIR, TEMP: process.env.TEMP, TMP: process.env.TMP };
+      const fsRoot = path.parse(REPO_ROOT).root;
+      try {
+        process.env.TMPDIR = fsRoot;
+        process.env.TEMP = fsRoot;
+        process.env.TMP = fsRoot;
+        const tmpNow = os.tmpdir();
+        check(
+          path.dirname(path.resolve(tmpNow)) !== path.resolve(tmpNow) || throws(() => seed.assertInsideTestmiljo(path.join(fsRoot, "srv", ".testmiljo", "x.db"))),
+          "tm-g11: guard refuses the temp-dir exception when TMPDIR is the filesystem root",
+          `tmpdir=${tmpNow}`,
+        );
+      } finally {
+        for (const [k, v] of Object.entries(saved)) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      }
+    }
+
+    // Path guard (N2): a symlinked DB file (or sidecar), broken links included.
+    const linkDir = extraTestmiljo("testmiljo-lenker-");
+    const realTarget = path.join(tmpRoot, "ekte.db");
+    fs.writeFileSync(realTarget, "");
+    let canLink = true;
+    try {
+      fs.symlinkSync(realTarget, path.join(linkDir, "lenke.db"));
+      fs.symlinkSync(path.join(tmpRoot, "finnes-ikke.db"), path.join(linkDir, "brutt.db"));
+      fs.symlinkSync(realTarget, path.join(linkDir, "wal.db-wal"));
+    } catch {
+      canLink = false;
+    }
+    if (canLink) {
+      check(throws(() => seed.assertInsideTestmiljo(path.join(linkDir, "lenke.db"))), "tm-g6: guard refuses a symlinked DB file");
+      check(throws(() => seed.assertInsideTestmiljo(path.join(linkDir, "brutt.db"))), "tm-g7: guard refuses a broken symlink");
+      check(throws(() => seed.assertInsideTestmiljo(path.join(linkDir, "wal.db"))), "tm-g8: guard refuses a DB whose -wal sidecar is a symlink");
+      const linked = await runSeed(["--dir", linkDir, "--rfb", path.join(linkDir, "lenke.db")], {});
+      check(linked.code !== 0 && fs.readFileSync(realTarget, "utf8") === "", "tm-g9: the seed refuses a symlinked target and leaves the link target untouched", `exit ${linked.code}`);
+    } else if (log) {
+      console.log("  skip tm-g6..g9: symlinks cannot be created here (Windows without privilege?)");
+    }
+
+    // Snapshots (lagre / hent).
+    /* eslint-disable @typescript-eslint/no-var-requires */
+    const snap = require("../scripts/testmiljo/snapshot") as typeof import("../scripts/testmiljo/snapshot");
+    /* eslint-enable @typescript-eslint/no-var-requires */
+    const dbPaths = seed.defaultPaths(dir);
+    const outbox = path.join(dir, "outbox.jsonl");
+    const agentName = () => {
+      // read-write: a read-only connection leaves -wal/-shm behind on a WAL database
+      const db = new Database(dbPaths.rfb, { fileMustExist: true });
+      try {
+        return (db.prepare("SELECT name FROM agents WHERE id = ?").get("00000000-0000-4000-8001-000000000001") as { name: string }).name;
+      } finally {
+        db.close();
+      }
+    };
+    const before = countsFromFiles(dir);
+    const nameBefore = agentName();
+    const meta = snap.saveSnapshot(dir, "rundtur", dbPaths);
+    check(JSON.stringify(meta.counts) === JSON.stringify(before), "tm-s1: lagre records the same row counts as the live DBs");
+    check(snap.listSnapshots(dir).includes("rundtur") && !meta.outbox, "tm-s2: the snapshot is listed (no outbox.jsonl yet)");
+    {
+      const db = new Database(dbPaths.rfb);
+      db.prepare("UPDATE agents SET name = 'Endret navn' WHERE id = ?").run("00000000-0000-4000-8001-000000000001");
+      db.prepare("DELETE FROM products WHERE agent_id = ?").run("00000000-0000-4000-8001-000000000004");
+      db.close();
+      const ddb = new Database(dbPaths.dental);
+      ddb.prepare("DELETE FROM dental_agents").run();
+      ddb.close();
+    }
+    fs.writeFileSync(outbox, '{"to":"x@y.invalid"}\n');
+    check(agentName() === "Endret navn" && JSON.stringify(countsFromFiles(dir)) !== JSON.stringify(before), "tm-s3: the mutation changed the live DBs");
+    snap.restoreSnapshot(dir, "rundtur", dbPaths);
+    check(JSON.stringify(countsFromFiles(dir)) === JSON.stringify(before), "tm-s4: hent restores the row counts of every table in all three DBs");
+    check(agentName() === nameBefore, "tm-s5: hent restores the mutated row");
+    check(!fs.existsSync(outbox), "tm-s6: hent removes an outbox.jsonl the snapshot did not have");
+    check(fs.readdirSync(dir).every((f) => !f.includes(".hent-")) && fs.readdirSync(path.join(dir, "oyeblikk")).every((f) => !f.startsWith(".")), "tm-s7: no temp files left behind");
+
+    fs.writeFileSync(outbox, '{"to":"a@b.invalid"}\n');
+    check(snap.saveSnapshot(dir, "med-outbox", dbPaths).outbox, "tm-s8: lagre includes outbox.jsonl when it exists");
+    fs.rmSync(outbox);
+    snap.restoreSnapshot(dir, "med-outbox", dbPaths);
+    check(fs.existsSync(outbox) && fs.readFileSync(outbox, "utf8") === '{"to":"a@b.invalid"}\n', "tm-s9: hent puts outbox.jsonl back");
+
+    // While a WAL writer (the app) has the DB open: lagre is consistent, hent refuses.
+    {
+      const live = new Database(dbPaths.rfb);
+      try {
+        live.pragma("journal_mode = WAL");
+        live.prepare("UPDATE agents SET name = 'Kun i WAL' WHERE id = ?").run("00000000-0000-4000-8001-000000000001");
+        check(fs.existsSync(dbPaths.rfb + "-wal"), "tm-s10: the app-like connection runs in WAL mode (-wal file exists)");
+        let msg = "";
+        try {
+          snap.restoreSnapshot(dir, "rundtur", dbPaths);
+        } catch (e) {
+          msg = (e as Error).message;
+        }
+        check(/stopp appen først/.test(msg), "tm-s11: hent refuses while a -wal file exists («stopp appen først»)", msg);
+        snap.saveSnapshot(dir, "under-kjoring", dbPaths);
+        const copy = new Database(path.join(dir, "oyeblikk", "under-kjoring", "rfb.db"), { readonly: true });
+        try {
+          const row = copy.prepare("SELECT name FROM agents WHERE id = ?").get("00000000-0000-4000-8001-000000000001") as { name: string };
+          check(row.name === "Kun i WAL", "tm-s12: lagre while the app runs captures committed WAL content");
+        } finally {
+          copy.close();
+        }
+      } finally {
+        live.close();
+      }
+    }
+    check(agentName() === "Kun i WAL", "tm-s13: hent refused → live DB left as it was");
+
+    // B1: the app leaves the DBs in WAL mode; stopped app → lagre → hent must work.
+    for (const key of ["rfb", "dental", "experiences"] as const) {
+      const db = new Database(dbPaths[key]);
+      db.pragma("journal_mode = WAL");
+      db.close();
+    }
+    const sidecars = () =>
+      (["rfb", "dental", "experiences"] as const).flatMap((k) => ["-wal", "-shm"].map((s) => dbPaths[k] + s)).filter((f) => fs.existsSync(f));
+    check(sidecars().length === 0, "tm-s25: WAL-mode DBs with all connections closed have no -wal/-shm", sidecars().join(","));
+    snap.saveSnapshot(dir, "wal-stoppet", dbPaths);
+    check(sidecars().length === 0, "tm-s26: lagre on WAL-mode DBs leaves no -wal/-shm behind", sidecars().map((f) => path.basename(f)).join(","));
+    check(!throws(() => snap.restoreSnapshot(dir, "wal-stoppet", dbPaths)), "tm-s27: stopped app → lagre → hent succeeds on WAL-mode DBs");
+    check(agentName() === "Kun i WAL" && sidecars().length === 0, "tm-s28: the WAL round trip keeps the data and leaves no sidecars", sidecars().join(","));
+
+    // Invalid names, missing / incomplete snapshots, symlinks, production.
+    const badNames = ["../x", "..", "a/b", "a\\b", "a.b", "A", "", "-a", "a b", "x".repeat(41)];
+    check(badNames.every((n) => throws(() => snap.saveSnapshot(dir, n, dbPaths)) && throws(() => snap.restoreSnapshot(dir, n, dbPaths))), "tm-s14: invalid snapshot names are refused by lagre and hent");
+    check(fs.readdirSync(path.join(dir, "oyeblikk")).sort().join(",") === "med-outbox,rundtur,under-kjoring,wal-stoppet", "tm-s15: refused names create nothing", fs.readdirSync(path.join(dir, "oyeblikk")).join(","));
+    check(throws(() => snap.restoreSnapshot(dir, "finnes-ikke", dbPaths), /finnes ikke/), "tm-s16: hent refuses a missing snapshot");
+    fs.rmSync(path.join(dir, "oyeblikk", "under-kjoring", "dental.db"));
+    check(throws(() => snap.restoreSnapshot(dir, "under-kjoring", dbPaths), /ufullstendig/), "tm-s17: hent refuses an incomplete snapshot");
+    // The other DB exists and sits in another accepted .testmiljo/: only the same-folder rule refuses it.
+    const otherDir = extraTestmiljo("testmiljo-annen-");
+    fs.copyFileSync(dbPaths.dental, path.join(otherDir, "dental.db"));
+    check(!throws(() => seed.assertInsideTestmiljo(path.join(otherDir, "dental.db"))), "tm-s18a: the other folder is itself an accepted .testmiljo/");
+    check(
+      throws(() => snap.saveSnapshot(dir, "feil-mappe", { ...dbPaths, dental: path.join(otherDir, "dental.db") }), /ligger ikke i/) &&
+        !fs.existsSync(path.join(dir, "oyeblikk", "feil-mappe")),
+      "tm-s18: lagre refuses DB paths that are not in the given .testmiljo/",
+    );
+    if (canLink) {
+      const symSnapDir = extraTestmiljo("testmiljo-lenket-oyeblikk-");
+      fs.symlinkSync(path.join(dir, "oyeblikk"), path.join(symSnapDir, "oyeblikk"), "dir");
+      check(throws(() => snap.listSnapshots(symSnapDir)) && throws(() => snap.restoreSnapshot(symSnapDir, "rundtur", seed.defaultPaths(symSnapDir))), "tm-s19: a symlinked oyeblikk/ directory is refused");
+
+      // A symlinked outbox.jsonl: lagre does not follow it, hent writes nothing.
+      fs.rmSync(outbox, { force: true });
+      fs.writeFileSync(realTarget, '{"lenket":true}\n');
+      fs.symlinkSync(realTarget, outbox);
+      check(
+        throws(() => snap.saveSnapshot(dir, "lenket-outbox", dbPaths), /symbolsk lenke/) && !fs.existsSync(path.join(dir, "oyeblikk", "lenket-outbox")),
+        "tm-s23: lagre refuses a symlinked outbox.jsonl",
+      );
+      const nameNow = agentName();
+      check(
+        throws(() => snap.restoreSnapshot(dir, "rundtur", dbPaths), /symbolsk lenke/) && agentName() === nameNow && fs.lstatSync(outbox).isSymbolicLink(),
+        "tm-s24: hent refuses a symlinked outbox.jsonl before touching any database",
+      );
+      fs.rmSync(outbox, { force: true });
+    }
+    const prodEnv = { NODE_ENV: "production" } as NodeJS.ProcessEnv;
+    check(
+      throws(() => snap.saveSnapshot(dir, "prod", dbPaths, prodEnv), /NODE_ENV=production/) &&
+        throws(() => snap.restoreSnapshot(dir, "rundtur", dbPaths, prodEnv), /NODE_ENV=production/) &&
+        throws(() => snap.saveSnapshot(dir, "fly", dbPaths, { FLY_APP_NAME: "lokal" } as NodeJS.ProcessEnv), /FLY_APP_NAME/) &&
+        !fs.existsSync(path.join(dir, "oyeblikk", "prod")),
+      "tm-s20: lagre/hent refuse in production (nothing written)",
+    );
+    const cliProd = await runScript(SNAPSHOT, ["lagre", "prod"], { NODE_ENV: "production" });
+    check(cliProd.code !== 0 && /NODE_ENV=production/.test(cliProd.stderr), "tm-s21: the snapshot CLI refuses with NODE_ENV=production", `exit ${cliProd.code}`);
+    const cliBad = await runScript(SNAPSHOT, ["hent", "../x"], {});
+    check(cliBad.code !== 0 && /Ugyldig navn/.test(cliBad.stderr), "tm-s22: the snapshot CLI refuses a name with a path in it", `exit ${cliBad.code}`);
   } catch (err) {
     failed++;
     failures.push("unexpected error: " + String((err as Error)?.stack || err));
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
+    for (const r of extraRoots) fs.rmSync(r, { recursive: true, force: true });
   }
 
   return { passed, failed, failures };

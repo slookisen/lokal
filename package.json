@@ -13,7 +13,9 @@
     "start:prod": "node --enable-source-maps dist/index.js",
     "test": "tsx tests/test.ts",
     "testmiljo": "tsx scripts/testmiljo/launch.ts",
-    "testmiljo:nullstill": "tsx scripts/testmiljo/launch.ts --nullstill"
+    "testmiljo:nullstill": "tsx scripts/testmiljo/launch.ts --nullstill",
+    "testmiljo:lagre": "tsx scripts/testmiljo/snapshot.ts lagre",
+    "testmiljo:hent": "tsx scripts/testmiljo/snapshot.ts hent"
   },
   "keywords": [],
   "author": "",
