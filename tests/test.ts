@@ -55964,3 +55964,28 @@ runSerial(async () => {
     failures.push("testmiljo-app: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-11-25-testmiljo-lokal-kopi-med-testdata-foer-prodsetting,
+// point 7 («Vedlikehold i CI», AK6): seeds a temp `.testmiljo/`, starts the
+// real app as a child process (testmiljo.env via launch.ts's buildAppEnv, on a
+// free 127.0.0.1 port, TESTMILJO=1, owner-dashboard flags for the seeded
+// owners only) and fetches every main page of the three sites and, logged in
+// through /testmiljo, every owner page: all 200, no error lines in the app's
+// output. Child processes only (this process's DB singletons untouched); the
+// child's process group is killed and the temp dir removed in finally —
+// runSerial, tail.
+runSerial(async () => {
+  console.log("\n── 2026-11-26 testmiljø pkt 7: frødata + oppstart + alle sider (CI) ──");
+  try {
+    const { runTestmiljoCiTests } = require("./testmiljo-ci.test") as
+      typeof import("./testmiljo-ci.test");
+    const r = await runTestmiljoCiTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("testmiljo-ci: " + f);
+    console.log(`  testmiljo-ci: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("testmiljo-ci: unexpected error: " + String(err?.message || err));
+  }
+});
