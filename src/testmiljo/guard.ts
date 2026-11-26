@@ -8,10 +8,14 @@
  * that logs you in as an owner without the e-mailed link, an outbox that
  * captures e-mail instead of sending it, and local host names for the three
  * sites. Every one of them asks isTestmiljo(), and isTestmiljo() is false in
- * production whatever TESTMILJO says. On top of that the server refuses to
- * start when TESTMILJO is set in a production-like environment
- * (assertTestmiljoBootSafe, called first thing from src/testmiljo/boot.ts), so
- * a mis-set variable is loud instead of silently half-honoured.
+ * production whatever TESTMILJO says.
+ *
+ * TESTMILJO set in production is ignored, and boot.ts logs one error line
+ * saying so. It does not stop the process: a mistyped secret must not take
+ * three sites down (Daniel, 2026-11-26). On a developer machine a wrong
+ * set-up does refuse to start (assertTestmiljoBootSafe, called first thing
+ * from src/testmiljo/boot.ts): a value other than 1, mail credentials present,
+ * no own database files, or a network listen address.
  *
  * No imports from the rest of the app: this module is loaded before anything
  * else and must stay free of side effects.
@@ -41,16 +45,23 @@ export function isTestmiljo(env: Env = process.env): boolean {
 }
 
 /**
- * Reasons this process must not start, or [] when it may. Empty whenever
- * TESTMILJO is unset, so production boot is unaffected.
+ * TESTMILJO set in production: the line boot.ts logs. null otherwise. The
+ * variable has no effect there; this only makes the mistake visible.
+ */
+export function testmiljoProductionNotice(env: Env = process.env): string | null {
+  if (!testmiljoVariableSet(env) || !isProductionLike(env)) return null;
+  return "[testmiljo] TESTMILJO is set in production and is IGNORED: the test environment is off. Unset the variable.";
+}
+
+/**
+ * Reasons this process must not start, or [] when it may. Always empty when
+ * TESTMILJO is unset and always empty in production, so production boot never
+ * depends on this variable.
  */
 export function testmiljoBootProblems(env: Env = process.env): string[] {
   if (!testmiljoVariableSet(env)) return [];
+  if (isProductionLike(env)) return [];
   const problems: string[] = [];
-  if (isProductionLike(env)) {
-    problems.push("TESTMILJO is set in a production environment (NODE_ENV=production or a Fly machine). Unset it.");
-    return problems;
-  }
   if ((env[TESTMILJO_ENV] ?? "").trim() !== "1") {
     problems.push('TESTMILJO must be exactly "1" to turn the test environment on. Any other value is refused rather than ignored.');
     return problems;

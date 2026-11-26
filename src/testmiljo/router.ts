@@ -25,7 +25,7 @@
  *
  * Independent conditions that must all hold for any of this to answer:
  *   1. mountTestmiljo() only mounts the router when isTestmiljo() is true at boot
- *      (and the process refuses to start with TESTMILJO set in production);
+ *      (false in production, where TESTMILJO is ignored);
  *   2. every request re-checks isTestmiljo();
  *   3. every request must come from this machine (loopback TCP peer);
  *   4. the Host header must be localhost or one of the three local site names;

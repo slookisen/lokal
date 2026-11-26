@@ -1,5 +1,6 @@
-// Testmiljø boot check. MUST stay the first import: it refuses to start when
-// TESTMILJO is set in production, before any other module reads the environment.
+// Testmiljø boot check. MUST stay the first import, so it runs before any other
+// module reads the environment. In production TESTMILJO is ignored (and logged);
+// a wrong local set-up refuses to start.
 import "./testmiljo/boot";
 import express from "express";
 import { isTestmiljo } from "./testmiljo/guard";
