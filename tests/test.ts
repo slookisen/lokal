@@ -55989,3 +55989,21 @@ runSerial(async () => {
     failures.push("testmiljo-ci: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-11-26-app-listen-feil-ignoreres: a busy port must make the real
+// app exit non-zero with a clear error line, not print the banner and hang.
+runSerial(async () => {
+  console.log("\n── 2026-11-26 app.listen-feil: opptatt port gir exit != 0 ──");
+  try {
+    const { runListenErrorTests } = require("./listen-error.test") as
+      typeof import("./listen-error.test");
+    const r = await runListenErrorTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("listen-error: " + f);
+    console.log(`  listen-error: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("listen-error: unexpected error: " + String(err?.message || err));
+  }
+});
