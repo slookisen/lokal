@@ -12,6 +12,12 @@
  *          point): nothing changes, a Norwegian message.
  *   ak3-*  flag off (and pilot without the allowlist): no form on the portal,
  *          both POST routes 404, nothing written.
+ *   sw-*   slice 2 (review N5 of lokal#1675): the card and both POSTs read
+ *          the owner's switch contact.address_edit. Still coming_soon: owner
+ *          default (on), owner write refused, stored «off» ignored. With the
+ *          entry live (simulated in-process): off → no card, both POSTs 404,
+ *          nothing written; on again → back. The gårdssalg switch probe has
+ *          its reader (contact.address_edit × owner_portal).
  *   ak4-*  the registry entry (contact.address_edit): coming_soon, default on
  *          for owner, «Gjelder ikke» for unclaimed, no outward send; the
  *          governance shape and matrix rules pass.
@@ -350,6 +356,75 @@ export function runGardssalgOwnerAddressTests(opts: { log?: boolean } = {}): Pro
       }
       assertTrue(capped, `cap-1: more than ${claimRoutes.GARDSSALG_OWNER_ADDRESS_SAVES_PER_MINUTE} saves a minute on one session → 429`);
       claimRoutes.__resetGardssalgOwnerAddressRateLimitForTesting();
+
+      // ══ SW — slice 2: the owner's switch contact.address_edit ═══════════
+      // Flag "1"; the gårdssalg owner choices apply (OA_OWNER_FEATURES_ENABLED
+      // + allowlist). The entry is coming_soon (it flips to live after the
+      // prod switch probe, registry rule 5): the resolver gives the owner
+      // default (on), an owner write is refused, a stored «off» is ignored.
+      // Then the same reader with the entry live (simulated in this process
+      // only): off → no card, both POSTs 404 (as flag off), nothing
+      // written; on again → back.
+      const rs = require("../owner-features/resolve") as typeof import("../owner-features/resolve");
+      const regMod = require("../owner-features/registry") as typeof import("../owner-features/registry");
+      const swEntry = regMod.GARDSSALG_OWNER_FEATURE_REGISTRY.find((x) => x.key === "contact.address_edit")!;
+      process.env.OA_OWNER_FEATURES_ENABLED = "1";
+      process.env.OWNER_FEATURES_ALLOWED_SUBJECTS = "gardssalg:oa-a";
+      reset("oa-a");
+      geoAnswer = { lat: 59.9226, lon: 10.7339, confidence: "exact" };
+      assertEq(swEntry.status, "coming_soon", "sw-0: contact.address_edit is still coming_soon (live only after the prod probe)");
+      assertEq(rs.gardssalgFeatureOn("oa-a", "contact.address_edit"), true, "sw-1: coming_soon → the owner default (on)");
+      const swDefault = await req("GET", portal("gard-a"), cookie("tok-a"));
+      assertTrue(swDefault.body.includes('data-owner-address="1"'), "sw-2: switch at its default (on) → the card is on the portal");
+      const swRefused = rs.setOwnerFeatureValue("gardssalg", "oa-a", "contact.address_edit", false, { actor: "owner" });
+      assertEq([swRefused.kind, (swRefused as any).block], ["blocked", "coming_soon"], "sw-3: coming_soon → the owner cannot switch it off yet (blocked)");
+      rfbDb.prepare(
+        `INSERT INTO owner_feature_settings (vertical, subject_id, key, value_json, set_by, set_at) VALUES ('gardssalg', 'oa-a', 'contact.address_edit', 'false', 'owner', datetime('now'))`,
+      ).run();
+      assertEq(addrMod.gardssalgOwnerAddressEditOpenFor("oa-a"), true, "sw-3b: coming_soon → a stored «off» is ignored, the form stays open");
+      rfbDb.prepare(`DELETE FROM owner_feature_settings WHERE vertical = 'gardssalg' AND subject_id = 'oa-a' AND key = 'contact.address_edit'`).run();
+      const probe = require("../owner-features/gardssalg-switch-probe") as typeof import("../owner-features/gardssalg-switch-probe");
+      const swReader = probe.defaultGardssalgSwitchProbeReaders()["contact.address_edit × owner_portal"];
+      assertTrue(!!swReader && !!swReader.sync, "sw-4: the gårdssalg switch probe has an effect reader for contact.address_edit × owner_portal (ready for the prod run)");
+      const prevStatus = swEntry.status;
+      (swEntry as any).status = "live";
+      try {
+        const swSet = rs.setOwnerFeatureValue("gardssalg", "oa-a", "contact.address_edit", false, { actor: "owner" });
+        assertEq(swSet.kind, "ok", "sw-5 (simulated live): the owner switches contact.address_edit off");
+        assertEq([addrMod.gardssalgOwnerAddressEditSwitchOn("oa-a"), addrMod.gardssalgOwnerAddressEditOpenFor("oa-a"), addrMod.gardssalgOwnerAddressEditOnFor("oa-a")],
+          [false, false, true], "sw-6 (simulated live): switch off → the form is closed although the flag lets the producer in");
+        const swA = auditCount("oa-a");
+        const swL = logCount("oa-a");
+        const swGeo = geoCalls.length;
+        const swOffPortal = await req("GET", portal("gard-a"), cookie("tok-a"));
+        assertTrue(swOffPortal.status === 200 && !swOffPortal.body.includes("data-owner-address") && !swOffPortal.body.includes('id="gc-address-form"'),
+          "sw-7 (simulated live): switch off → the portal opens without the address card");
+        const swOffForm = await postForm("gard-a", "tok-a", "Universitetsgata 2", "0164", "Oslo");
+        const swOffApi = await postJson("oa-a", "tok-a", { street: "Universitetsgata 2", postnummer: "0164", poststed: "Oslo" });
+        assertEq([swOffForm.status, swOffApi.status], [404, 404], "sw-8 (simulated live): switch off → the form POST and the JSON POST answer 404 (as flag off)");
+        assertEq(geoCalls.length, swGeo, "sw-9 (simulated live): switch off → no map lookup");
+        nothingChanged("oa-a", swA, swL, "sw-10 (simulated live)");
+        const otherOn = await req("GET", portal("gard-b"), cookie("tok-b"));
+        assertTrue(otherOn.body.includes('data-owner-address="1"'), "sw-11 (simulated live): another producer's card is untouched by oa-a's switch");
+        if (swReader?.sync) {
+          const ctx = { lokalDb: rfbDb, expDb, env: process.env, adminKey: "", fixture: { id: "oa-a" } as any, created: new Map() } as any;
+          assertEq(swReader.sync(ctx).endpoints.address_form_switch, false, "sw-12 (simulated live): the probe reader sees the switch off");
+        }
+        process.env.OA_OWNER_FEATURES_ENABLED = "0";
+        assertEq(addrMod.gardssalgOwnerAddressEditOpenFor("oa-a"), true, "sw-13 (simulated live): owner choices not applying → the owner default (on), as booking.pause");
+        process.env.OA_OWNER_FEATURES_ENABLED = "1";
+        assertEq(rs.setOwnerFeatureValue("gardssalg", "oa-a", "contact.address_edit", true, { actor: "owner" }).kind, "ok", "sw-14 (simulated live): the owner switches it on again");
+        const swBack = await req("GET", portal("gard-a"), cookie("tok-a"));
+        assertTrue(swBack.body.includes('data-owner-address="1"'), "sw-15 (simulated live): switch on again → the card is back");
+        const swBackApi = await postJson("oa-a", "tok-a", { street: "Universitetsgata 2", postnummer: "0164", poststed: "Oslo" });
+        assertEq([swBackApi.status, five(row("oa-a"))], [200, ["Universitetsgata 2", "0164", "Oslo", 59.9226, 10.7339]], "sw-16 (simulated live): switch on again → the JSON POST saves the address");
+      } finally {
+        (swEntry as any).status = prevStatus;
+        rfbDb.prepare(`DELETE FROM owner_feature_settings WHERE vertical = 'gardssalg' AND subject_id = 'oa-a' AND key = 'contact.address_edit'`).run();
+      }
+      reset("oa-a");
+      process.env.OA_OWNER_FEATURES_ENABLED = "0";
+      delete process.env.OWNER_FEATURES_ALLOWED_SUBJECTS;
 
       // ══ AK4 — the registry entry ═════════════════════════════════════════
       const reg = require("../owner-features/registry") as typeof import("../owner-features/registry");

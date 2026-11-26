@@ -1238,8 +1238,15 @@ export const GARDSSALG_OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   // point follows; services/gardssalg-owner-address.ts). A key of its own:
   // contact.address is how MUCH of the address is shown (full / place), this
   // is who may CHANGE it. Built behind GARDSSALG_OWNER_ADDRESS_EDIT_ENABLED
-  // (default off); coming_soon until the testmiljø review and the flag in
-  // prod (Daniel). No outward send. Unclaimed: «Gjelder ikke».
+  // (default off; the flag in prod is Daniel's). Slice 2 (review N5 of
+  // lokal#1675): the card and both POST routes already read the owner's
+  // switch (owner-features/gardssalg.ts gardssalgOwnerAddressEditSwitchOn,
+  // featureOn; off → no card, both POSTs 404 like the flag-off path,
+  // nothing written) and the gårdssalg switch probe has its reader. Still
+  // coming_soon: it flips to live only after the probe is 100 % PASS in
+  // prod (protocols/owner-feature-registry.md rule 5). While coming_soon the
+  // resolver gives the owner default (on) and an owner write is refused.
+  // No outward send. Unclaimed: «Gjelder ikke».
   gsEntry({
     key: "contact.address_edit", group: "contact", type: "switch",
     label: t("Endre adressen selv", "Change the address yourself"),
