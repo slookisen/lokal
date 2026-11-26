@@ -34,6 +34,7 @@
 // profile. Flag PRODUCT_IMPORT_ENABLED ("1"/"true"; "pilot" = allowlisted owners only; default off).
 
 import { randomUUID } from "crypto";
+import { domainToUnicode } from "url";
 import { getDb } from "../../database/init";
 import { classifyCartItemBan } from "../cart-item-ban";
 import { isCategoryLabel } from "../../utils/category-label";
@@ -131,12 +132,12 @@ export function profileWebsite(agentId: string): string | null {
   return row && row.website ? row.website : null;
 }
 
-/** Hostname of the site for owner-facing texts (raw text minus scheme/path when unparseable). Not escaped. */
+/** Hostname of the site for owner-facing texts, shown in Unicode (æøå, not xn--). Raw text minus scheme/path when unparseable. Not escaped. */
 export function siteDomain(website: string | null | undefined): string {
   const raw = (website ?? "").trim();
   try {
     const h = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`).hostname;
-    if (h) return h;
+    if (h) return domainToUnicode(h) || h;
   } catch { /* fall through */ }
   return raw.replace(/^https?:\/\//i, "").split("/")[0] ?? raw;
 }
@@ -565,6 +566,8 @@ function runStatusJson(run: RunRow) {
     created_at: run.created_at,
     finished_at: run.finished_at,
     excluded: Array.isArray(summary?.excluded) ? summary!.excluded : [],
+    /** The LLM step's status from the stored run summary (null on older runs). */
+    llm_status: typeof summary?.llm_status === "string" ? summary.llm_status : null,
     log: {
       count_new: run.count_new,
       count_changed: run.count_changed,

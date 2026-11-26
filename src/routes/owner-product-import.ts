@@ -398,11 +398,24 @@ export const LLM_EXPLAIN_NB =
 const llmExplainHtml = (p: Pick<Preview, "new" | "changed">): string =>
   [...p.new, ...p.changed].some((c) => c.llm) ? `<p class="ep-audit-meta" data-llm-explain="1">${escapeHtml(LLM_EXPLAIN_NB)}</p>` : "";
 
+const NO_PRODUCTS_LLM_UNRELIABLE = new Set(["budget_exhausted", "invalid_json", "not_array", "infra_failure"]);
+
 /** Reason text for the «found nothing» view by outcome (owner-approved wording); null = keep today's text. Domain is HTML-escaped; result is HTML. */
-export function importNothingFoundReasonHtml(outcome: string | null | undefined, website: string | null | undefined): string | null {
-  const d = escapeHtml(siteDomain(website));
-  if (outcome === "no_products_found")
+export function importNothingFoundReasonHtml(
+  outcome: string | null | undefined,
+  website: string | null | undefined,
+  /** excluded: candidates the rules removed; llmStatus: the run's LLM status. Both optional (older callers / runs). */
+  extra: { excluded?: number; llmStatus?: string | null } = {},
+): string | null {
+  const domain = siteDomain(website);
+  if (!domain) return null; // no derivable domain: keep today's generic text, never «på .»
+  const d = escapeHtml(domain);
+  if (outcome === "no_products_found") {
+    // Not a true «site shows no prices» when products were found but filtered out, or the LLM step did not give a clean answer.
+    if ((extra.excluded ?? 0) > 0) return null;
+    if (extra.llmStatus && NO_PRODUCTS_LLM_UNRELIABLE.has(extra.llmStatus)) return null;
     return `Vi fant ingen varer med pris på ${d}. Det ser ut til at nettsiden ikke viser priser. Du kan legge inn varene selv her, eller legge prisene på nettsiden og prøve igjen.`;
+  }
   if (typeof outcome === "string" && outcome.startsWith("fetch_failed"))
     return `Vi fikk ikke åpnet ${d}. Sjekk at adressen under «Nettside» er riktig, og prøv igjen.`;
   if (outcome === "js_unreadable")
@@ -510,7 +523,7 @@ export function renderImportPreviewPage(
     ? `<a class="ep-btn ep-btn-primary" href="/eier/${id}/portal#${ORDERABILITY_ANCHOR}">Legg inn varer selv</a>`
     : "";
   if (p.status !== "completed" || totalCandidates === 0) {
-    const reasonHtml = importNothingFoundReasonHtml(p.outcome, p.website);
+    const reasonHtml = importNothingFoundReasonHtml(p.outcome, p.website, { excluded: p.excluded.length, llmStatus: p.llm_status });
     const explain = reasonHtml ? null : productImportOutcomeTextNb(p.outcome);
     // failed / interrupted / timed-out runs stage nothing, so this is the
     // zero-result screen for every non-completed run too.
