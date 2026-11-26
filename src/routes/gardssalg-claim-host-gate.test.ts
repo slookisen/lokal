@@ -216,6 +216,10 @@ export async function runGardssalgClaimHostGateTests(opts: { log?: boolean } = {
       ["w18", "post", "/kategori/gardssalg/eier/magic-link-confirm"],
       // O3-5: manual claim into the admin queue (flag GARDSSALG_CLAIM_MANUAL_QUEUE_ENABLED).
       ["w19", "post", "/kategori/gardssalg/eier/:providerId/manuelt-krav"],
+      // dev-request 2026-11-26-opplevagent-eier-endrer-adresse-selv: the owner's address
+      // (flag GARDSSALG_OWNER_ADDRESS_EDIT_ENABLED).
+      ["w20", "post", "/kategori/gardssalg/eier/:providerSlug/adresse"],
+      ["w21", "post", "/api/opplevelser/gardssalg-claim/:providerId/update-address"],
     ];
     for (const [id, method, routePath] of wired) {
       const label = `${method.toUpperCase()} ${routePath}`;
@@ -231,7 +235,7 @@ export async function runGardssalgClaimHostGateTests(opts: { log?: boolean } = {
 
     // ── g1-g3: scope ────────────────────────────────────────────────────
     const all = routeLabels(claimRouter);
-    assertEq(all.length, wired.length, `g1: the claim router has exactly the ${wired.length} routes above (a new one must be added to w1-w19)`);
+    assertEq(all.length, wired.length, `g1: the claim router has exactly the ${wired.length} routes above (a new one must be added to w1-w21)`);
     assertEq(routeLabels(claimRouter, generalLimiter), all, "g2: every claim route chains generalLimiter, and none is router-wide");
     assertTrue(!claimRouter.stack.some((l) => !l.route && l.handle === generalLimiter),
       "g2b: no router-wide generalLimiter (an unmatched /api/opplevelser/gardssalg-claim/* path is counted once, by the \"/api\" mount)");
@@ -255,8 +259,8 @@ export async function runGardssalgClaimHostGateTests(opts: { log?: boolean } = {
           if (!ac2LimitersFor(sample).includes("general")) uncounted.push(sample);
         }
       }
-      assertTrue(checked === 19 && uncounted.length === 0,
-        `a1: ac2LimitersFor counts all 19 route-level generalLimiter paths on the claim router as general (checked ${checked}, uncounted ${JSON.stringify(uncounted)})`);
+      assertTrue(checked === 21 && uncounted.length === 0,
+        `a1: ac2LimitersFor counts all 21 route-level generalLimiter paths on the claim router as general (checked ${checked}, uncounted ${JSON.stringify(uncounted)})`);
     }
 
     // ── i1-i5: index.ts order (source inspection) ───────────────────────

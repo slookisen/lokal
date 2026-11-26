@@ -23,7 +23,8 @@
  *
  * The owner dashboards are behind flags that testmiljo.env does not set
  * (OWNER_DASHBOARD_ENABLED, OWNER_ORDERABILITY_PORTAL_ENABLED,
- * OA_OWNER_FEATURES_ENABLED, GARDSSALG_OWNER_DASHBOARD_ENABLED and the
+ * OA_OWNER_FEATURES_ENABLED, GARDSSALG_OWNER_DASHBOARD_ENABLED,
+ * GARDSSALG_OWNER_ADDRESS_EDIT_ENABLED and the
  * OWNER_FEATURES_ALLOWED_SUBJECTS allowlist). This test sets them in the
  * child's env only, with the seeded owners' ids read from the seeded files.
  *
@@ -420,6 +421,8 @@ export async function runTestmiljoCiTests(opts: { log?: boolean } = {}): Promise
       OWNER_ORDERABILITY_PORTAL_ENABLED: "1",
       OA_OWNER_FEATURES_ENABLED: "1",
       GARDSSALG_OWNER_DASHBOARD_ENABLED: "pilot",
+      // dev-request 2026-11-26-opplevagent-eier-endrer-adresse-selv: the owner's address form on the portal.
+      GARDSSALG_OWNER_ADDRESS_EDIT_ENABLED: "pilot",
       OWNER_FEATURES_ALLOWED_SUBJECTS: [...owners.rfb.map((o) => `rfb:${o.id}`), ...owners.gardssalg.map((o) => `gardssalg:${o.id}`)].join(","),
     });
     const appEnv = buildAppEnv(baseEnv(process.env), fileEnv);
@@ -540,7 +543,9 @@ export async function runTestmiljoCiTests(opts: { log?: boolean } = {}): Promise
       const base = `/kategori/gardssalg/eier/${encodeURIComponent(owner.slug)}`;
       for (const t of GARDSSALG_TABS) {
         // The dashboard shell (GARDSSALG_OWNER_DASHBOARD_ENABLED) links to all four tabs.
-        await expect200(OA_HOST, base + t, cookie, GARDSSALG_TABS.map((x) => `href="${base}${x}"`));
+        // The portal («Oversikt») carries the owner's address form (GARDSSALG_OWNER_ADDRESS_EDIT_ENABLED).
+        const extra = t === "/portal" ? ['id="gc-address-form"', `action="${base}/adresse"`] : [];
+        await expect200(OA_HOST, base + t, cookie, [...GARDSSALG_TABS.map((x) => `href="${base}${x}"`), ...extra]);
       }
     }
 

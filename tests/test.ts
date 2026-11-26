@@ -53261,6 +53261,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-26-opplevagent-eier-endrer-adresse-selv, slice 1: the
+// owner changes street, postnummer and poststed on the gårdssalg owner portal
+// (map point with it, stubbed lookup), behind GARDSSALG_OWNER_ADDRESS_EDIT_ENABLED;
+// the owner lock for every other writer unchanged. Swaps getDb() + env — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-26-opplevagent-eier-endrer-adresse-selv: eieren endrer adressen selv ──");
+  try {
+    const { runGardssalgOwnerAddressTests } = require("../src/routes/gardssalg-owner-address.test") as
+      typeof import("../src/routes/gardssalg-owner-address.test");
+    const r = await runGardssalgOwnerAddressTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-owner-address: " + f);
+    console.log(`  gardssalg-owner-address: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-owner-address: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, O2a: owner login on
 // the gårdssalg test producer (POST /admin/gardssalg/test-provider
 // owner_email), its fixture hidden state (catalog_hidden_reason='test_fixture')

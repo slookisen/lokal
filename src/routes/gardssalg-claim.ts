@@ -38,6 +38,15 @@ import { createGardssalgOwnerFeaturesRouter, gardssalgOversiktHtml, gardssalgOwn
 import { gardssalgDashboardPath, wrapGardssalgDashboard } from "../owner-ui/gardssalg-dashboard";
 import { CLAIM_LINK_TEXTS, CLAIM_CONFIRM_TEXTS, MANUAL_CLAIM_TEXTS, MANUAL_CLAIM_FORM_TEXTS_NOT_APPROVED } from "./gardssalg-claim-texts";
 import { isManualClaimQueueEnabled, isManualClaimReceiptEnabled, sendManualClaimMail, submitManualClaim } from "../services/gardssalg-manual-claims";
+import {
+  gardssalgOwnerAddressEditOnFor, saveGardssalgOwnerAddress, ownerAddressMessage, OWNER_ADDRESS_STREET_MAX, OWNER_ADDRESS_POSTSTED_MAX,
+  type OwnerAddressError, type OwnerAddressOutcome,
+} from "../services/gardssalg-owner-address";
+import { poststedForPostnummer } from "../services/norway-postnummer";
+import { isCrossSiteWrite, writeGuardRefusedBody, WRITE_GUARD_REFUSED_TITLE, WRITE_GUARD_CONTACT_OPPLEVAGENT } from "../middleware/same-origin-write";
+import { SlidingWindowCap } from "../services/a2a-traffic-classifier";
+import { getDb as getVerticalDb } from "../database/db-factory";
+import crypto from "crypto";
 
 // ─────────────────────────────────────────────────────────────────
 // GÅRDSSALG PRODUCER OWNER-CLAIM — dev-request 2026-07-21-opplevagent-
@@ -1008,7 +1017,7 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
           <div id="gc-save-status" aria-live="polite"></div>
         </form>
         <form id="gc-release-form" method="post" action="${releaseAction}"></form>
-      </div>
+      </div>${ownerAddressCardHtml(slug, provider, req.query as Record<string, unknown>)}
       ${mineValg && ownerControlsVisibility(visibilityState) ? mineValgMovedCardHtml(slug) : visibilityCardHtml(slug, visibilityState)}
       ${dashboardOn ? "" : `<div class="gc-card">
         <h2>Statistikk</h2>
@@ -1197,6 +1206,209 @@ router.post(
     if (!outcome.ok && outcome.error === "booking_blocked") return res.redirect(303, `${base}?status=booking_blocked`);
     if (!outcome.ok) return res.redirect(303, `${base}?status=error`);
     return res.redirect(303, `${base}?status=saved`);
+  },
+);
+
+// ─────────────────────────────────────────────────────────────────
+// The owner changes the address — dev-request 2026-11-26-opplevagent-eier-
+// endrer-adresse-selv (slookisen/A2A), slice 1. Behind
+// GARDSSALG_OWNER_ADDRESS_EDIT_ENABLED (off | pilot | 1, default off;
+// services/gardssalg-owner-address.ts):
+//   flag off for the producer → no card on the portal, and both POST routes
+//   fall through (next('route') → 404), nothing read or written.
+// Then, before anything is written: the producer row (404); the owner
+// session (401 / the login page); the session is this producer's (403); a
+// live claim (403); the same-origin write check (isCrossSiteWrite, 403); a
+// per-session cap on saves (each save is one map lookup; 429 / «for mange»).
+// The save itself (saveGardssalgOwnerAddress): the address-unit rules and
+// the map lookup of the CS address writing, then the one-unit writer with
+// the owner-portal context — adresse, postnummer, poststed, lat, lon
+// together or not at all, with the owner as the source. The owner lock for
+// every other writer is unchanged.
+//   POST /kategori/gardssalg/eier/:providerSlug/adresse              form, 303 back to the card
+//   POST /api/opplevelser/gardssalg-claim/:providerId/update-address  JSON
+// ─────────────────────────────────────────────────────────────────
+
+/** Saves per session token per minute (each one is a map lookup). */
+export const GARDSSALG_OWNER_ADDRESS_SAVES_PER_MINUTE = 10;
+const ownerAddressCap = new SlidingWindowCap(GARDSSALG_OWNER_ADDRESS_SAVES_PER_MINUTE, 60 * 1000);
+
+export function __resetGardssalgOwnerAddressRateLimitForTesting(): void {
+  ownerAddressCap.reset();
+}
+
+const OWNER_ADDRESS_ERRORS: readonly OwnerAddressError[] = [
+  "gate_mangler", "gate_for_lang", "gate_ugyldig", "postnummer_ugyldig", "postnummer_ukjent", "poststed_mangler",
+  "poststed_ugyldig", "poststed_passer_ikke", "postboks", "adresse_ugyldig", "kartoppslag_feilet", "laast", "ikke_tilgang", "feil",
+];
+
+/** The address card is on for this producer: the flag (mode / allowlist) and a live claim. Never throws. */
+function ownerAddressEditOpen(providerId: string): boolean {
+  try {
+    return gardssalgOwnerAddressEditOnFor(providerId) && isGardssalgProviderClaimed(providerId);
+  } catch {
+    return false;
+  }
+}
+
+function ownerAddressCapHit(token: string): boolean {
+  const key = crypto.createHash("sha256").update(token).digest("hex");
+  if (ownerAddressCap.isOver(key)) return true;
+  ownerAddressCap.record(key);
+  return false;
+}
+
+function claimSessionEmail(token: string | undefined): string | null {
+  if (!token) return null;
+  try {
+    const r = getVerticalDb("experiences").prepare(`SELECT email FROM gardssalg_claims WHERE token = ?`).get(token) as { email: string | null } | undefined;
+    return r?.email ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** The message for the card from the 303's query (`adresse=<code>`, `pn=` for the register words). */
+function ownerAddressNotice(q: Record<string, unknown>): { ok: boolean; text: string } | null {
+  const code = typeof q.adresse === "string" ? q.adresse : "";
+  if (!code) return null;
+  if (code === "lagret") return { ok: true, text: ownerAddressMessage({ ok: true, changed: true, address: { adresse: "", postnummer: "", poststed: "" } }, CLAIM_MANUAL_FALLBACK_EMAIL) };
+  if (code === "uendret") return { ok: true, text: ownerAddressMessage({ ok: true, changed: false, address: { adresse: "", postnummer: "", poststed: "" } }, CLAIM_MANUAL_FALLBACK_EMAIL) };
+  if (code === "for_mange") return { ok: false, text: "For mange forsøk på kort tid. Vent et minutt og prøv igjen. Ingenting er lagret." };
+  if (!(OWNER_ADDRESS_ERRORS as readonly string[]).includes(code)) return null;
+  const pn = typeof q.pn === "string" && /^\d{4}$/.test(q.pn) ? q.pn : undefined;
+  const register = pn && code === "poststed_passer_ikke" ? poststedForPostnummer(pn) ?? undefined : undefined;
+  return { ok: false, text: ownerAddressMessage({ ok: false, error: code as OwnerAddressError, postnummer: pn, registerPoststed: register }, CLAIM_MANUAL_FALLBACK_EMAIL) };
+}
+
+/** The «Adresse» card on the portal; "" (the portal exactly as before) while the flag is off for the producer. */
+function ownerAddressCardHtml(slug: string, provider: ClaimProviderRow, q: Record<string, unknown>): string {
+  if (!ownerAddressEditOpen(provider.id)) return "";
+  const p = (getVerticalDb("experiences")
+    .prepare(`SELECT adresse, postnummer, poststed FROM experience_providers WHERE id = ?`)
+    .get(provider.id) as { adresse: string | null; postnummer: string | null; poststed: string | null } | undefined)
+    ?? { adresse: null, postnummer: null, poststed: null };
+  const locked = provider.content_source === "manual";
+  const notice = ownerAddressNotice(q);
+  // After a refused save the form shows what the owner wrote (`g`/`pn`/`ps`), not the stored address.
+  const back = notice && !notice.ok;
+  const val = (k: string, stored: string | null | undefined, max: number) =>
+    escapeHtml((back && typeof q[k] === "string" ? String(q[k]) : String(stored ?? "")).slice(0, max));
+  const dis = locked ? " disabled" : "";
+  const alert = notice
+    ? `<div class="gc-alert ${notice.ok ? "gc-alert-ok" : "gc-alert-error"}" role="${notice.ok ? "status" : "alert"}">${escapeHtml(notice.text)}</div>`
+    : "";
+  return `
+      <div class="gc-card" id="adresse" data-owner-address="1">
+        <h2>Adresse</h2>
+        <p>Adressen vises på profilen din og bestemmer hvor du står på kartet. Når du lagrer, slår vi opp det nye stedet på kartet. Finner vi det ikke, lagres ingenting.</p>
+        ${alert}${locked ? `<div class="gc-alert gc-alert-error" role="alert">Adressen er låst av Opplevagent-support. Skriv til ${CLAIM_MANUAL_FALLBACK_EMAIL} for å endre den.</div>` : ""}
+        <form id="gc-address-form" method="post" action="/kategori/gardssalg/eier/${encodeURIComponent(slug)}/adresse" novalidate>
+          <div class="gc-field">
+            <label for="f-gate">Gateadresse</label>
+            <input id="f-gate" name="gate" type="text" autocomplete="address-line1" maxlength="${OWNER_ADDRESS_STREET_MAX}" value="${val("g", p.adresse, OWNER_ADDRESS_STREET_MAX)}"${dis}>
+            <div class="gc-hint">Gatenavn og nummer, for eksempel «Gardsvegen 12».</div>
+          </div>
+          <div class="gc-field">
+            <label for="f-postnummer">Postnummer</label>
+            <input id="f-postnummer" name="postnummer" type="text" inputmode="numeric" autocomplete="postal-code" maxlength="4" value="${val("pn", p.postnummer, 4)}"${dis}>
+          </div>
+          <div class="gc-field">
+            <label for="f-poststed">Poststed</label>
+            <input id="f-poststed" name="poststed" type="text" autocomplete="address-level2" maxlength="${OWNER_ADDRESS_POSTSTED_MAX}" value="${val("ps", p.poststed, OWNER_ADDRESS_POSTSTED_MAX)}"${dis}>
+          </div>
+          <div class="gc-form-actions">
+            <button type="submit" class="gc-btn gc-btn-primary"${dis}>Lagre adressen</button>
+          </div>
+        </form>
+      </div>`;
+}
+
+const ownerAddressFlagGate = (req: Request, _res: Response, next: (arg?: unknown) => void) => {
+  // Flag off for every producer: the route does not exist (falls through exactly as before).
+  const id = String((req.params as any).providerId || "") || (getClaimProviderBySlug(String((req.params as any).providerSlug || ""))?.id ?? "");
+  return gardssalgOwnerAddressEditOnFor(id) ? next() : next("route");
+};
+
+router.post(
+  "/kategori/gardssalg/eier/:providerSlug/adresse",
+  generalLimiter,
+  ownerAddressFlagGate,
+  express.urlencoded({ extended: false }),
+  async (req: Request, res: Response) => {
+    res.setHeader("Cache-Control", "no-store");
+    const slug = String((req.params as any).providerSlug || "");
+    const base = `/kategori/gardssalg/eier/${encodeURIComponent(slug)}/portal`;
+    try {
+      const provider = getClaimProviderBySlug(slug);
+      if (!provider) return res.status(404).send(notFoundPage());
+      const session = sessionFromRequest(req);
+      if (!session.valid || !session.token) return res.redirect(303, `/kategori/gardssalg/eier/${encodeURIComponent(slug)}`);
+      if (session.providerId !== provider.id || !isGardssalgProviderClaimed(provider.id)) {
+        return res.status(403).send(shell("Ingen tilgang", `<div class="gc-card"><h1>Ingen tilgang</h1><p>Du har ikke tilgang til denne produsenten.</p></div>`));
+      }
+      if (isCrossSiteWrite(req)) {
+        return res.status(403).send(shell(WRITE_GUARD_REFUSED_TITLE, `<div class="gc-card">${writeGuardRefusedBody({
+          contact: WRITE_GUARD_CONTACT_OPPLEVAGENT, backHref: base, backLabel: "Tilbake til eiersiden",
+        })}</div>`));
+      }
+      const b = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
+      const keep = (o: OwnerAddressOutcome) => {
+        const pn = typeof b.postnummer === "string" ? b.postnummer.slice(0, 4) : "";
+        const q = new URLSearchParams({ adresse: o.ok ? (o.changed ? "lagret" : "uendret") : o.error });
+        if (!o.ok) {
+          q.set("g", typeof b.gate === "string" ? b.gate.slice(0, OWNER_ADDRESS_STREET_MAX) : "");
+          q.set("pn", pn);
+          q.set("ps", typeof b.poststed === "string" ? b.poststed.slice(0, OWNER_ADDRESS_POSTSTED_MAX) : "");
+        }
+        return res.redirect(303, `${base}?${q.toString()}#adresse`);
+      };
+      if (ownerAddressCapHit(session.token)) return res.redirect(303, `${base}?adresse=for_mange#adresse`);
+      const out = await saveGardssalgOwnerAddress(
+        provider.id,
+        { street: b.gate, postnummer: b.postnummer, poststed: b.poststed },
+        { sessionToken: session.token, actorDetail: claimSessionEmail(session.token) },
+      );
+      return keep(out);
+    } catch (err) {
+      console.error("[gardssalg-claim] POST adresse error:", err);
+      return res.redirect(303, `${base}?adresse=feil#adresse`);
+    }
+  },
+);
+
+router.post(
+  "/api/opplevelser/gardssalg-claim/:providerId/update-address",
+  generalLimiter,
+  ownerAddressFlagGate,
+  express.json(),
+  async (req: Request, res: Response) => {
+    res.setHeader("Cache-Control", "no-store");
+    const { providerId } = req.params as any;
+    try {
+      const session = sessionFromRequest(req);
+      if (!session.valid || !session.token) return res.status(401).json({ success: false, error: "session_invalid", message: "Din sesjon er utløpt. Logg inn på nytt." });
+      if (session.providerId !== providerId) return res.status(403).json({ success: false, error: "forbidden", message: "Du har ikke tilgang til denne produsenten." });
+      if (!getClaimProviderById(providerId)) return res.status(404).json({ success: false, error: "provider_not_found" });
+      if (!isGardssalgProviderClaimed(providerId)) return res.status(403).json({ success: false, error: "forbidden", message: "Du har ikke tilgang til denne produsenten." });
+      if (isCrossSiteWrite(req)) return res.status(403).json({ success: false, error: "cross_site_write", message: "Endringen ble ikke lagret. Gå tilbake til eiersiden og prøv igjen." });
+      if (ownerAddressCapHit(session.token)) {
+        return res.status(429).json({ success: false, error: "too_many", message: "For mange forsøk på kort tid. Vent et minutt og prøv igjen. Ingenting er lagret." });
+      }
+      const b = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
+      const out = await saveGardssalgOwnerAddress(
+        providerId,
+        { street: b.street, postnummer: b.postnummer, poststed: b.poststed },
+        { sessionToken: session.token, actorDetail: claimSessionEmail(session.token) },
+      );
+      const message = ownerAddressMessage(out, CLAIM_MANUAL_FALLBACK_EMAIL);
+      if (out.ok) return res.json({ success: true, changed: out.changed, address: out.address, message });
+      const status = out.error === "laast" ? 409 : out.error === "ikke_tilgang" ? 403 : out.error === "kartoppslag_feilet" ? 422 : out.error === "feil" ? 500 : 400;
+      return res.status(status).json({ success: false, error: out.error, message });
+    } catch (err) {
+      console.error("[gardssalg-claim] POST update-address error:", err);
+      return res.status(500).json({ success: false, error: "feil", message: "Klarte ikke å lagre adressen. Prøv igjen." });
+    }
   },
 );
 

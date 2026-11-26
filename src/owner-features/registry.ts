@@ -112,6 +112,7 @@ export const GARDSSALG_OWNER_FEATURE_KEYS = [
   "contact.phone",
   "contact.email_mode",
   "contact.address",
+  "contact.address_edit",
   "contact.booking_email",
   // Besøk og booking
   "booking.enabled",
@@ -1231,6 +1232,25 @@ export const GARDSSALG_OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     ],
     default: { owner: "full", unclaimed: "full" },
     surfaces: GS_PROFILE_FIELD_SURFACES,
+  }),
+  // dev-request 2026-11-26-opplevagent-eier-endrer-adresse-selv, slice 1: the
+  // owner writes street, postnummer and poststed on the owner portal (the map
+  // point follows; services/gardssalg-owner-address.ts). A key of its own:
+  // contact.address is how MUCH of the address is shown (full / place), this
+  // is who may CHANGE it. Built behind GARDSSALG_OWNER_ADDRESS_EDIT_ENABLED
+  // (default off); coming_soon until the testmiljø review and the flag in
+  // prod (Daniel). No outward send. Unclaimed: «Gjelder ikke».
+  gsEntry({
+    key: "contact.address_edit", group: "contact", type: "switch",
+    label: t("Endre adressen selv", "Change the address yourself"),
+    description: t(
+      "Du kan rette gateadresse, postnummer og poststed på eiersiden. Kartpunktet flyttes samtidig.",
+      "You can correct the street address, postcode and town on the owner page. The map point moves with it.",
+    ),
+    default: { owner: true, unclaimed: null },
+    since: "2026-11-26",
+    devRequest: "2026-11-26-opplevagent-eier-endrer-adresse-selv",
+    surfaces: ["owner_portal"],
   }),
   gsEntry({
     key: "contact.booking_email", group: "contact", type: "email",

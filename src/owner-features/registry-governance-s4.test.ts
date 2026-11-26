@@ -615,7 +615,8 @@ export async function runRegistryGovernanceS4Tests(opts: { log?: boolean } = {})
     const gsKeys = GARDSSALG_OWNER_FEATURE_KEYS as readonly string[];
     const gsGroups = GARDSSALG_OWNER_FEATURE_GROUPS.map((g) => g.key as string);
     const gsShape = checkEntryShape(GARDSSALG_OWNER_FEATURE_REGISTRY, gsKeys, gsGroups);
-    assertTrue(GARDSSALG_OWNER_FEATURE_REGISTRY.length === 34, `gardssalg: the registry has the 34 Vedlegg A entries (${GARDSSALG_OWNER_FEATURE_REGISTRY.length})`);
+    // 34 Vedlegg A entries + contact.address_edit (dev-request 2026-11-26-opplevagent-eier-endrer-adresse-selv).
+    assertTrue(GARDSSALG_OWNER_FEATURE_REGISTRY.length === 35, `gardssalg: the registry has the 34 Vedlegg A entries + contact.address_edit (${GARDSSALG_OWNER_FEATURE_REGISTRY.length})`);
     assertTrue(gsShape.length === 0, `gardssalg rule 1: all ${GARDSSALG_OWNER_FEATURE_REGISTRY.length} entries have NO+EN texts, group, default per segment, valid status`, gsShape);
     const gsVertical = GARDSSALG_OWNER_FEATURE_REGISTRY.filter((e) => e.verticals.length !== 1 || e.verticals[0] !== "gardssalg").map((e) => e.key);
     assertTrue(gsVertical.length === 0, "gardssalg: every entry has verticals [\"gardssalg\"]", gsVertical);
