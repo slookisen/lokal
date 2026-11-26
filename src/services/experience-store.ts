@@ -28,6 +28,7 @@ import { gardssalgVisibleSql, type GardssalgSurface } from "./gardssalg-visibili
 // below for why.
 import { validatePhoneForWrite } from "./contact-normalizer";
 import { verifyOwnerRequest, type OwnerRequestContext } from "./cs-owner-request";
+import { verifyOwnerPortalWrite, type OwnerPortalWriteContext } from "./gardssalg-owner-portal-write";
 import { isPlausibleNorwayCoord } from "./geo-distance";
 // dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep 5b:
 // the shared LLM-judge + deterministic-backstop gate (mirrors lokal#655's
@@ -7434,7 +7435,8 @@ export type GardssalgSetAddressUnitResult =
   | { ok: false; reason: "invalid_postnummer" }
   | { ok: false; reason: "implausible_coordinate" }
   | { ok: false; reason: "defective_value"; defect_type: GardssalgDefectType | null }
-  | { ok: false; reason: "owner_request_invalid"; detail: string };
+  | { ok: false; reason: "owner_request_invalid"; detail: string }
+  | { ok: false; reason: "owner_portal_invalid"; detail: string };
 
 /**
  * dev-request 2026-11-26-cs-endring-som-eier-opplevagent, §2: write a
@@ -7454,6 +7456,12 @@ export type GardssalgSetAddressUnitResult =
  *      is given AND verifyOwnerRequest() confirms it against the
  *      cs_change_requests row (cs-owner-request.ts). An unverifiable owner
  *      context is refused outright, never downgraded to a normal write.
+ *      Or (dev-request 2026-11-26-opplevagent-eier-endrer-adresse-selv)
+ *      `opts.ownerPortal` — the owner's own save on the owner portal — AND
+ *      verifyOwnerPortalWrite() confirms the session token belongs to this
+ *      provider and the row is not content_source='manual' (gardssalg-
+ *      owner-portal-write.ts). Same rule: unverifiable = refused. The two
+ *      contexts together are refused. Every other writer meets the lock.
  *   2. Non-blank street, postnummer and poststed; postnummer is 4 digits.
  *   3. classifyGardssalgAddressDefect on the street line (same as
  *      applyGardssalgSetAddress).
@@ -7471,7 +7479,7 @@ export function applyGardssalgSetAddressUnit(
   providerId: string,
   unit: { street: string; postnummer: string; poststed: string; lat: number; lon: number; confidence?: string | null },
   source: string,
-  opts: { ownerRequest?: OwnerRequestContext } = {}
+  opts: { ownerRequest?: OwnerRequestContext; ownerPortal?: OwnerPortalWriteContext } = {}
 ): GardssalgSetAddressUnitResult {
   const db = getDb(VERTICAL);
   const row = db
@@ -7494,11 +7502,21 @@ export function applyGardssalgSetAddressUnit(
   const postnummer = (unit.postnummer ?? "").trim();
   const poststed = (unit.poststed ?? "").trim();
 
-  // Gate 1 — owner lock (or the verified owner's own request).
-  if (opts.ownerRequest) {
+  // Gate 1 — owner lock (or the verified owner's own request / own save).
+  let changedBy: "admin" | "owner" = "admin";
+  let batchId: string | null = null;
+  if (opts.ownerRequest && opts.ownerPortal) {
+    return { ok: false, reason: "owner_portal_invalid", detail: "two_owner_contexts" };
+  } else if (opts.ownerRequest) {
     const check = verifyOwnerRequest(opts.ownerRequest, providerId, { field: "address", unit: { street, postnummer, poststed } });
     if (!check.ok) return { ok: false, reason: "owner_request_invalid", detail: check.reason };
     source = check.source;
+  } else if (opts.ownerPortal) {
+    const check = verifyOwnerPortalWrite(opts.ownerPortal, providerId);
+    if (!check.ok) return { ok: false, reason: "owner_portal_invalid", detail: check.reason };
+    source = check.source;
+    changedBy = "owner";
+    batchId = "owner-portal";
   } else {
     for (const col of ["adresse", "postnummer", "poststed"]) {
       if (isGardssalgFieldOwnerLocked(row, col)) return { ok: false, reason: "owner_locked", field: col };
@@ -7528,7 +7546,7 @@ export function applyGardssalgSetAddressUnit(
   const audit = db.prepare(
     `INSERT INTO gardssalg_content_audit
        (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
-     VALUES (@id, @provider_id, @field_name, @old_value, @new_value, @source_url, NULL, 'admin', datetime('now'))`
+     VALUES (@id, @provider_id, @field_name, @old_value, @new_value, @source_url, @batch_id, @changed_by, datetime('now'))`
   );
   db.transaction(() => {
     db.prepare(
@@ -7552,7 +7570,7 @@ export function applyGardssalgSetAddressUnit(
       ["postnummer", row.postnummer, postnummer],
       ["poststed", row.poststed, poststed],
     ] as const) {
-      audit.run({ id: uuid(), provider_id: providerId, field_name: col, old_value: oldV, new_value: newV, source_url: source });
+      audit.run({ id: uuid(), provider_id: providerId, field_name: col, old_value: oldV, new_value: newV, source_url: source, batch_id: batchId, changed_by: changedBy });
     }
   })();
 

@@ -83,3 +83,27 @@ export function gardssalgOwnerDashboardFlagOnFor(providerId: string | null | und
   if (mode === "pilot") return isSubjectAllowedForOwnerFeatures("gardssalg", providerId, env);
   return false;
 }
+
+// ─── The owner's address form (dev-request 2026-11-26-opplevagent-eier-
+// endrer-adresse-selv, slice 1) ─────────────────────────────────────────────
+// GARDSSALG_OWNER_ADDRESS_EDIT_ENABLED reads the same three modes as the
+// dashboard flag above: "1"/"true" → every claimed producer; "pilot" → only
+// `gardssalg:<provider id>` on OWNER_FEATURES_ALLOWED_SUBJECTS; anything else
+// → off (default): no address form on the portal, the POST routes 404.
+// Used by services/gardssalg-owner-address.ts and routes/gardssalg-claim.ts.
+
+export const GARDSSALG_OWNER_ADDRESS_EDIT_ENV = "GARDSSALG_OWNER_ADDRESS_EDIT_ENABLED";
+
+/** PURE: the mode of GARDSSALG_OWNER_ADDRESS_EDIT_ENABLED. */
+export function gardssalgOwnerAddressEditMode(env: NodeJS.ProcessEnv = process.env): OwnerFlagMode {
+  return ownerFlagMode(GARDSSALG_OWNER_ADDRESS_EDIT_ENV, env);
+}
+
+/** PURE: the flag lets this producer in (all → yes; pilot → allowlisted; off → no). */
+export function gardssalgOwnerAddressEditOnFor(providerId: string | null | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (!providerId) return false;
+  const mode = gardssalgOwnerAddressEditMode(env);
+  if (mode === "all") return true;
+  if (mode === "pilot") return isSubjectAllowedForOwnerFeatures("gardssalg", providerId, env);
+  return false;
+}

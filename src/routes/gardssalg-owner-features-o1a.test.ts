@@ -165,7 +165,8 @@ export function runGardssalgOwnerFeaturesO1aTests(opts: { log?: boolean } = {}):
 
       // ── (g) registry ──────────────────────────────────────────────────
       const R = reg.GARDSSALG_OWNER_FEATURE_REGISTRY;
-      assertEq(R.length, 34, "g1: 34 gårdssalg entries (Vedlegg A)");
+      // 34 Vedlegg A entries + contact.address_edit (dev-request 2026-11-26-opplevagent-eier-endrer-adresse-selv).
+      assertEq(R.length, 35, "g1: 35 gårdssalg entries (Vedlegg A + contact.address_edit)");
       assertEq(R.map((e) => e.key), [...reg.GARDSSALG_OWNER_FEATURE_KEYS], "g2: registry order == GARDSSALG_OWNER_FEATURE_KEYS");
       assertTrue(R.every((e) => JSON.stringify(e.verticals) === JSON.stringify(["gardssalg"])), "g3: every entry has verticals [gardssalg]");
       assertTrue(R.every((e) => e.label.no && e.label.en && e.description.no && e.description.en), "g4: NO+EN label and description on every entry");
@@ -314,7 +315,7 @@ export function runGardssalgOwnerFeaturesO1aTests(opts: { log?: boolean } = {}):
       const pBrake = await req("GET", page("bremsegard"), cookie("tok-br"));
       assertTrue(pBrake.body.includes('data-booking-check="admin_brake"') && pBrake.body.includes("klage fra gjest"), "p21: admin brake → «stanset av Opplevagent» with the reason");
       const apiGet = JSON.parse((await req("GET", api("o1-test"), cookie("tok-test"))).body);
-      assertTrue(apiGet.success && apiGet.features.length === 34, "p22: GET features lists the 34 entries");
+      assertTrue(apiGet.success && apiGet.features.length === 35, "p22: GET features lists the 35 entries");
       assertTrue(apiGet.features.filter((f: any) => f.status === "coming_soon").every((f: any) => f.value === null), "p23: API: no value on a planned entry");
 
       // ── (w) writes ────────────────────────────────────────────────────
