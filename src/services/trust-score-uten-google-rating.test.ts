@@ -111,6 +111,13 @@ const RATED_HIGH = "a1b00000-0000-4000-8000-000000000002";     // Google 4.9 / 2
 const RATED_LOW = "a1b00000-0000-4000-8000-000000000003";      // Google 1.2 / 2371 (v2 community 0.05)
 const RATED_NO_COUNT = "a1b00000-0000-4000-8000-000000000004"; // Google 4.3 / NULL (v2 community 0.5)
 const SEEDED_COUNT = "2371";
+/**
+ * The seeded count as a value of its own: not part of a longer token. A bare
+ * includes("2371") also hit random UUIDs in the answer (a clinic id
+ * 623711de-… turned main red on 2026-11-26, Fly Deploy run 4212).
+ */
+const SEEDED_COUNT_RE = new RegExp(`(?<![0-9A-Za-z-])${SEEDED_COUNT}(?![0-9A-Za-z])`);
+const mentionsSeededCount = (json: string): boolean => SEEDED_COUNT_RE.test(json);
 
 const SEED: Array<{ id: string; name: string; rating: number | null; count: number | null; tripadvisor: number | null; external: string }> = [
   { id: UNRATED, name: "Uvurdert Gård A1b", rating: null, count: null, tripadvisor: null, external: "[]" },
@@ -266,7 +273,7 @@ export async function runTrustScoreUtenGoogleRatingTests(opts: { log?: boolean }
           assertEq(r.body?.data?.score, base, `P2 ${s.id}: the breakdown's score is the unrated agent's`);
           const json = JSON.stringify(r.body);
           assertEq(ratingPaths(r.body), [], `P3 ${s.id}: no rating key in the answer`);
-          assertTrue(!json.includes("Google") && !json.includes(SEEDED_COUNT) && !/anmeldelse/.test(json),
+          assertTrue(!json.includes("Google") && !mentionsSeededCount(json) && !/anmeldelse/.test(json),
             `P3 ${s.id}: no «Google», no seeded count (${SEEDED_COUNT}) and no «anmeldelser» (also no invented 0) anywhere in the answer`);
           if (s.rating !== null) {
             const details = Object.values(r.body?.data?.signals ?? {}).map((x: any) => String(x?.detail ?? "")).join(" | ");
@@ -403,10 +410,14 @@ export async function runTrustScoreUtenGoogleRatingTests(opts: { log?: boolean }
           mobil: isDisplayablePhone(row.mobil as string | null) ? row.mobil : null,
         };
       };
+      assertEq(
+        ['{"rating_count":2371}', '"2371 anmeldelser"', '{"n":"2371"}', '{"id":"623711de-a1b0-4000-8000-000000000001"}', '{"id":"a1b00000-2371-4000-8000-0000000023710"}'].map(mentionsSeededCount),
+        [true, true, true, false, false],
+        "R0: the seeded-count check matches the count as a value, not inside a UUID");
       const noRating = (body: unknown, label: string) => {
         assertEq(ratingPaths(body), [], `${label}: no rating, rating_count or rating_source key`);
         const json = JSON.stringify(body);
-        assertTrue(!json.includes(SEEDED_COUNT) && !json.includes("google_places|"), `${label}: neither the seeded count nor the rating source is passed on`);
+        assertTrue(!mentionsSeededCount(json) && !json.includes("google_places|"), `${label}: neither the seeded count nor the rating source is passed on`);
       };
 
       await section("R: GET /api/tannlege/agents", async () => {
