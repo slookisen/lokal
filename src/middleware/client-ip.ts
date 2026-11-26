@@ -124,6 +124,22 @@ export function resolveClientIpConfig(
 
 // ─── Fly-Client-IP derivation ───────────────────────────────────────────
 
+/**
+ * Headers a reverse proxy or tunnel adds to a request and a browser never
+ * sends. The local test environment (src/testmiljo/router.ts) refuses a
+ * request that carries one: behind a tunnel every visitor looks like this
+ * machine. Listed here so this file stays the only one in src/ that names
+ * X-Forwarded-For (client-ip.test.ts T14). Nothing in production calls this.
+ */
+export const PROXY_ADDED_HEADERS: readonly string[] = [
+  "x-forwarded-for", "forwarded", "x-real-ip", "via", "x-forwarded-proto", "x-forwarded-port", "x-original-host",
+  "cf-connecting-ip", "true-client-ip",
+];
+
+export function carriesProxyHeaders(headers: Readonly<Record<string, unknown>> | null | undefined): boolean {
+  return !!headers && PROXY_ADDED_HEADERS.some((name) => headers[name] !== undefined);
+}
+
 export type FlyClientIpFallback = "missing" | "invalid" | "non_public";
 
 /**

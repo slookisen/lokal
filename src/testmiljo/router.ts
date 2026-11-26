@@ -30,12 +30,15 @@
  *   3. every request must come from this machine (loopback TCP peer);
  *   4. the Host header must be localhost or one of the three local site names;
  *   5. the request must not carry a proxy's forwarding header (a tunnel that
- *      publishes the port would add one);
- *   6. a POST must not be marked cross-site or same-site by the browser, and
- *      when the browser sends no such mark, its Origin must be this host.
+ *      publishes the port would add one; the list is in middleware/client-ip.ts);
+ *   6. a POST must pass the app's own same-origin write guard
+ *      (middleware/same-origin-write.ts): not marked cross-site or same-site
+ *      by the browser, and a named Origin must be this host.
  */
 
 import express, { type Express, type NextFunction, type Request, type Response, Router } from "express";
+import { carriesProxyHeaders } from "../middleware/client-ip";
+import { isCrossSiteWrite } from "../middleware/same-origin-write";
 import { isLoopbackAddress, isTestmiljo } from "./guard";
 import { CLIENT_FORWARDED_HOST_MARK, LOCAL_SITES, isLocalHostName, localOrigin, siteByKey, splitHostPort, type LocalSite } from "./hosts";
 import { clearOutbox, getOutboxMail, listOutbox, outboxFile, type OutboxMail } from "./outbox";
@@ -312,31 +315,6 @@ ${mail.text ? `<section><h2>Tekstversjonen</h2><pre>${esc(mail.text)}</pre></sec
   );
 }
 
-/**
- * Headers a tunnel or reverse proxy adds and a browser never sends.
- * X-Forwarded-Host is not listed by name: the hosts middleware sets it for the
- * local site names, and marks a request that arrived with one of its own.
- */
-const PROXY_HEADERS: readonly string[] = [
-  "x-forwarded-for", "forwarded", "x-real-ip", "via", "x-forwarded-proto", "x-forwarded-port", "x-original-host",
-  "cf-connecting-ip", "true-client-ip", CLIENT_FORWARDED_HOST_MARK,
-];
-
-/**
- * For a write without Sec-Fetch-Site (an old browser, or not a browser). No
- * Origin, or the opaque "null" a no-referrer form post sends, says nothing and
- * is let through; a named Origin must be this very host and port.
- */
-function originIsThisHost(origin: string | undefined, host: string | undefined): boolean {
-  const value = (origin ?? "").trim().toLowerCase();
-  if (value === "" || value === "null") return true;
-  try {
-    return new URL(value).host === (host ?? "").trim().toLowerCase();
-  } catch {
-    return false;
-  }
-}
-
 export function createTestmiljoRouter(deps: TestmiljoDeps = defaultTestmiljoDeps()): Router {
   const router = Router();
 
@@ -349,15 +327,13 @@ export function createTestmiljoRouter(deps: TestmiljoDeps = defaultTestmiljoDeps
     // pages themselves (Sec-Fetch-Site, sent by every current browser).
     if (!isLocalHostName(splitHostPort(req.headers.host).hostname)) return res.status(403).type("text/plain").send("Unknown host name for the test environment.");
     // A tunnel or reverse proxy on this machine makes every visitor look like
-    // loopback, and may rewrite Host. It also adds a forwarding header.
-    if (PROXY_HEADERS.some((name) => req.headers[name] !== undefined)) return res.status(403).type("text/plain").send("The test environment does not answer through a proxy or tunnel.");
-    if (req.method !== "GET" && req.method !== "HEAD") {
-      const fetchSite = String(req.headers["sec-fetch-site"] ?? "");
-      if (fetchSite !== "") {
-        if (fetchSite !== "same-origin" && fetchSite !== "none") return res.status(403).type("text/plain").send("Cross-site request refused.");
-      } else if (!originIsThisHost(req.headers.origin, req.headers.host)) {
-        return res.status(403).type("text/plain").send("Cross-site request refused.");
-      }
+    // loopback, and may rewrite Host. It also adds a forwarding header, or
+    // arrives with an X-Forwarded-Host of its own (marked by hosts.ts).
+    if (carriesProxyHeaders(req.headers) || req.headers[CLIENT_FORWARDED_HOST_MARK] !== undefined) {
+      return res.status(403).type("text/plain").send("The test environment does not answer through a proxy or tunnel.");
+    }
+    if (req.method !== "GET" && req.method !== "HEAD" && isCrossSiteWrite(req, "/testmiljo")) {
+      return res.status(403).type("text/plain").send("Cross-site request refused.");
     }
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("X-Robots-Tag", "noindex, nofollow");

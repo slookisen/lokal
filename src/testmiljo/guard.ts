@@ -86,7 +86,7 @@ export function assertTestmiljoBootSafe(env: Env = process.env): void {
   throw new Error(`[testmiljo] refusing to start:\n  - ${problems.join("\n  - ")}`);
 }
 
-/** The TCP peer is this machine. Reads the socket, never X-Forwarded-For. */
+/** The TCP peer is this machine. Reads the socket, never a forwarding header. */
 export function isLoopbackAddress(address: string | undefined | null): boolean {
   if (!address) return false;
   const a = address.trim().toLowerCase();
