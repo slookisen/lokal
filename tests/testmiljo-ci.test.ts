@@ -352,7 +352,7 @@ export async function runTestmiljoCiTests(opts: { log?: boolean } = {}): Promise
   const dir = path.join(tmpRoot, ".testmiljo");
   fs.mkdirSync(dir);
   let child: ChildProcess | null = null;
-  let output: Array<{ stream: "stdout" | "stderr"; line: string }> = [];
+  const output: Array<{ stream: "stdout" | "stderr"; line: string }> = [];
   const removeEmergencyCleanup = installEmergencyCleanup(tmpRoot, () => child);
 
   /** A spawn that failed: skip (locally, platform cannot spawn), else a failure. Returns true when the run must stop. */
@@ -399,83 +399,73 @@ export async function runTestmiljoCiTests(opts: { log?: boolean } = {}): Promise
     check(owners.rfb.length > 0 && owners.gardssalg.length > 0, "tmci-2: the seed has RFB and gårdssalg owners", `rfb ${owners.rfb.length}, gårdssalg ${owners.gardssalg.length}`);
 
     // ── 2. Start the app ────────────────────────────────────────────────
-    // freePort() closes its probe before the app binds, so another process
-    // can take the port in between: one retry on a fresh port for EADDRINUSE.
-    let port = 0;
+    // One boot attempt. A failed boot is red, and `finally` stops the child.
+    // (No retry on a fresh port: src/index.ts does not surface a listen
+    // error, so an EADDRINUSE is not visible here to retry on.)
+    const port = await freePort();
     let healthy = false;
     let exited: string | null = null;
     const allOutput = () => output.map((o) => `[${o.stream}] ${o.line}`).join("\n");
-    for (let attempt = 1; attempt <= 2 && !healthy; attempt++) {
-      port = await freePort();
-      output = [];
-      exited = null;
-      const fileEnv = parseEnvFile(fs.readFileSync(ENV_FILE, "utf8"));
-      Object.assign(fileEnv, {
-        PORT: String(port),
-        HOST: "127.0.0.1",
-        BASE_URL: `http://${RFB_HOST}:${port}`,
-        DB_PATH: path.join(dir, "lokal.db"),
-        DENTAL_DB_PATH: path.join(dir, "dental.db"),
-        EXPERIENCES_DB_PATH: path.join(dir, "experiences.db"),
-        TESTMILJO: "1",
-        // The owner dashboards (off in testmiljo.env), for the seeded owners only.
-        OWNER_DASHBOARD_ENABLED: "1",
-        OWNER_ORDERABILITY_PORTAL_ENABLED: "1",
-        OA_OWNER_FEATURES_ENABLED: "1",
-        GARDSSALG_OWNER_DASHBOARD_ENABLED: "pilot",
-        OWNER_FEATURES_ALLOWED_SUBJECTS: [...owners.rfb.map((o) => `rfb:${o.id}`), ...owners.gardssalg.map((o) => `gardssalg:${o.id}`)].join(","),
+    const fileEnv = parseEnvFile(fs.readFileSync(ENV_FILE, "utf8"));
+    Object.assign(fileEnv, {
+      PORT: String(port),
+      HOST: "127.0.0.1",
+      BASE_URL: `http://${RFB_HOST}:${port}`,
+      DB_PATH: path.join(dir, "lokal.db"),
+      DENTAL_DB_PATH: path.join(dir, "dental.db"),
+      EXPERIENCES_DB_PATH: path.join(dir, "experiences.db"),
+      TESTMILJO: "1",
+      // The owner dashboards (off in testmiljo.env), for the seeded owners only.
+      OWNER_DASHBOARD_ENABLED: "1",
+      OWNER_ORDERABILITY_PORTAL_ENABLED: "1",
+      OA_OWNER_FEATURES_ENABLED: "1",
+      GARDSSALG_OWNER_DASHBOARD_ENABLED: "pilot",
+      OWNER_FEATURES_ALLOWED_SUBJECTS: [...owners.rfb.map((o) => `rfb:${o.id}`), ...owners.gardssalg.map((o) => `gardssalg:${o.id}`)].join(","),
+    });
+    const appEnv = buildAppEnv(baseEnv(process.env), fileEnv);
+
+    let spawnErr: NodeJS.ErrnoException | null = null;
+    try {
+      child = spawn(process.execPath, [tsxCli(), APP], {
+        cwd: REPO_ROOT,
+        env: appEnv,
+        stdio: ["ignore", "pipe", "pipe"],
+        detached: process.platform !== "win32",
       });
-      const appEnv = buildAppEnv(baseEnv(process.env), fileEnv);
+    } catch (err) {
+      spawnErr = err as NodeJS.ErrnoException;
+    }
+    if (spawnErr || !child) {
+      spawnFailed("the app", spawnErr ?? Object.assign(new Error("spawn returned nothing"), { code: "UNKNOWN" }));
+      return { passed, failed, failures };
+    }
+    const proc: ChildProcess = child;
+    const sink = output;
+    for (const stream of ["stdout", "stderr"] as const) {
+      let buf = "";
+      proc[stream]!.setEncoding("utf8");
+      proc[stream]!.on("data", (d: string) => {
+        buf += d;
+        const lines = buf.split(/\r?\n/);
+        buf = lines.pop() ?? "";
+        for (const line of lines) sink.push({ stream, line });
+      });
+      proc[stream]!.on("end", () => {
+        if (buf) sink.push({ stream, line: buf });
+      });
+    }
+    proc.on("error", (err) => (exited = `spawn error: ${String(err)}`));
+    proc.on("exit", (code, sig) => (exited = `exit ${code ?? ""}${sig ? ` signal ${sig}` : ""}`));
 
-      let spawnErr: NodeJS.ErrnoException | null = null;
+    const deadline = Date.now() + BOOT_TIMEOUT_MS;
+    while (!healthy && !exited && Date.now() < deadline) {
       try {
-        child = spawn(process.execPath, [tsxCli(), APP], {
-          cwd: REPO_ROOT,
-          env: appEnv,
-          stdio: ["ignore", "pipe", "pipe"],
-          detached: process.platform !== "win32",
-        });
-      } catch (err) {
-        spawnErr = err as NodeJS.ErrnoException;
+        const h = await request(port, "127.0.0.1", "/health");
+        healthy = h.status === 200;
+      } catch {
+        /* not listening yet */
       }
-      if (spawnErr || !child) {
-        spawnFailed("the app", spawnErr ?? Object.assign(new Error("spawn returned nothing"), { code: "UNKNOWN" }));
-        return { passed, failed, failures };
-      }
-      const proc: ChildProcess = child;
-      const sink = output;
-      for (const stream of ["stdout", "stderr"] as const) {
-        let buf = "";
-        proc[stream]!.setEncoding("utf8");
-        proc[stream]!.on("data", (d: string) => {
-          buf += d;
-          const lines = buf.split(/\r?\n/);
-          buf = lines.pop() ?? "";
-          for (const line of lines) sink.push({ stream, line });
-        });
-        proc[stream]!.on("end", () => {
-          if (buf) sink.push({ stream, line: buf });
-        });
-      }
-      proc.on("error", (err) => { if (child === proc) exited = `spawn error: ${String(err)}`; });
-      proc.on("exit", (code, sig) => { if (child === proc) exited = `exit ${code ?? ""}${sig ? ` signal ${sig}` : ""}`; });
-
-      const deadline = Date.now() + BOOT_TIMEOUT_MS;
-      while (!healthy && !exited && Date.now() < deadline) {
-        try {
-          const h = await request(port, "127.0.0.1", "/health");
-          healthy = h.status === 200;
-        } catch {
-          /* not listening yet */
-        }
-        if (!healthy) await new Promise((r) => setTimeout(r, 250));
-      }
-      if (!healthy && attempt === 1 && exited && output.some((o) => o.line.includes("EADDRINUSE"))) {
-        if (log) console.log(`  testmiljo-ci: port ${port} was taken before the app bound it; retrying on a new port`);
-        await stopChild(proc);
-        child = null;
-        continue;
-      }
+      if (!healthy) await new Promise((r) => setTimeout(r, 250));
     }
     check(healthy, "tmci-3: the app starts on the seeded databases and /health answers 200", `${exited ?? "timeout"}\n${tail(allOutput())}`);
     if (!healthy) return { passed, failed, failures };
