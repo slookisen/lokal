@@ -57,7 +57,8 @@ export function buildAppEnv(parent: NodeJS.ProcessEnv, fileEnv: Record<string, s
   return env;
 }
 
-function tsxCli(): string {
+/** Path of the tsx CLI script (run with process.execPath, so no shell or .cmd shim is needed). */
+export function tsxCli(): string {
   const pkgPath = require.resolve("tsx/package.json", { paths: [REPO_ROOT] });
   const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8")) as { bin: string | Record<string, string> };
   const bin = typeof pkg.bin === "string" ? pkg.bin : pkg.bin.tsx;
