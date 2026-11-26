@@ -5,7 +5,6 @@
  *   POST /testmiljo/logg-inn        issue a login link for the chosen owner and follow it
  *   GET  /testmiljo/epost           the outbox: e-mail the app would have sent
  *   GET  /testmiljo/epost/:id       one e-mail
- *   GET  /testmiljo/epost/:id/html  its HTML body alone (shown in a frame)
  *   POST /testmiljo/epost/tom       empty the outbox
  *
  * Logging in does not write a session itself. It calls the same exported
@@ -16,18 +15,29 @@
  * the database are offered: a verified claim on RFB, a used and unrevoked
  * claim on gårdssalg.
  *
+ * The pages live under the app's one content-security policy (security.ts);
+ * nothing here overrides it. Two consequences shape the pages:
+ *   - form-action 'self': you log in to a site from that site's own local
+ *     name, so the form and the redirect after it stay on one origin. The
+ *     other site is one link away.
+ *   - an e-mail's HTML is shown in a sandboxed srcdoc frame: no script runs
+ *     in it, whatever the captured e-mail contains.
+ *
  * Independent conditions that must all hold for any of this to answer:
  *   1. mountTestmiljo() only mounts the router when isTestmiljo() is true at boot
  *      (and the process refuses to start with TESTMILJO set in production);
  *   2. every request re-checks isTestmiljo();
  *   3. every request must come from this machine (loopback TCP peer);
  *   4. the Host header must be localhost or one of the three local site names;
- *   5. a POST must not be marked cross-site or same-site by the browser.
+ *   5. the request must not carry a proxy's forwarding header (a tunnel that
+ *      publishes the port would add one);
+ *   6. a POST must not be marked cross-site or same-site by the browser, and
+ *      when the browser sends no such mark, its Origin must be this host.
  */
 
 import express, { type Express, type NextFunction, type Request, type Response, Router } from "express";
 import { isLoopbackAddress, isTestmiljo } from "./guard";
-import { LOCAL_SITES, isLocalHostName, localOrigin, siteByKey, splitHostPort } from "./hosts";
+import { LOCAL_SITES, isLocalHostName, localOrigin, siteByKey, splitHostPort, type LocalSite } from "./hosts";
 import { clearOutbox, getOutboxMail, listOutbox, outboxFile, type OutboxMail } from "./outbox";
 import { outboundAttempts } from "./outbound-guard";
 
@@ -88,6 +98,12 @@ export function defaultTestmiljoDeps(): TestmiljoDeps {
     },
   };
 }
+
+/** The two sites that have owners, and where their login link is verified. */
+const OWNER_SITES: ReadonlyArray<{ key: "rfb" | "opplevagent"; heading: string; verifyPath: string }> = [
+  { key: "rfb", heading: "Rett fra Bonden", verifyPath: "/magic-link-verify" },
+  { key: "opplevagent", heading: "Opplevagent, gårdssalg", verifyPath: "/kategori/gardssalg/eier/magic-link-verify" },
+];
 
 function esc(value: unknown): string {
   return String(value ?? "")
@@ -169,9 +185,26 @@ function safeOwners(load: () => TestOwner[]): { owners: TestOwner[]; error: stri
   }
 }
 
-function startPage(deps: TestmiljoDeps, port: string): string {
-  const rfb = safeOwners(deps.rfbOwners);
-  const gardssalg = safeOwners(deps.gardssalgOwners);
+/** The local site this request's Host names, or null for plain localhost. */
+function requestSite(hostname: string): LocalSite | null {
+  return LOCAL_SITES.find((site) => site.localHost === hostname.trim().toLowerCase()) ?? null;
+}
+
+function ownerSection(deps: TestmiljoDeps, here: LocalSite | null, port: string): string {
+  return OWNER_SITES.map((ownerSite) => {
+    const site = siteByKey(ownerSite.key)!;
+    if (here?.key !== ownerSite.key) {
+      const there = `${localOrigin(site, port)}/testmiljo`;
+      return `<h3>${esc(ownerSite.heading)}</h3>
+<p>Du logger inn fra plattformens egen adresse: <a href="${esc(there)}">${esc(there)}</a></p>`;
+    }
+    const { owners, error } = safeOwners(ownerSite.key === "rfb" ? deps.rfbOwners : deps.gardssalgOwners);
+    return `<h3>${esc(ownerSite.heading)}</h3>
+${error ? `<p class="blocked">Kunne ikke lese eierne: ${esc(error)}</p>` : ownerTable(ownerSite.key, owners)}`;
+  }).join("\n");
+}
+
+function startPage(deps: TestmiljoDeps, hostname: string, port: string): string {
   const mails = listOutbox();
   const attempts = outboundAttempts();
   const sites = LOCAL_SITES.map((site) => `<li><a href="${esc(localOrigin(site, port))}/">${esc(site.label)}</a> <span class="muted">${esc(localOrigin(site, port))}</span></li>`).join("\n");
@@ -192,10 +225,7 @@ ${sites}
 <section>
 <h2>Logg inn som eier</h2>
 <p class="muted">Du logges inn gjennom den vanlige innloggingen, bare uten e-posten.</p>
-<h3>Rett fra Bonden</h3>
-${rfb.error ? `<p class="blocked">Kunne ikke lese eierne: ${esc(rfb.error)}</p>` : ownerTable("rfb", rfb.owners)}
-<h3>Opplevagent, gårdssalg</h3>
-${gardssalg.error ? `<p class="blocked">Kunne ikke lese eierne: ${esc(gardssalg.error)}</p>` : ownerTable("opplevagent", gardssalg.owners)}
+${ownerSection(deps, requestSite(hostname), port)}
 </section>
 <section>
 <h2>E-post</h2>
@@ -237,6 +267,16 @@ ${rows}
   );
 }
 
+/**
+ * The e-mail's HTML as the srcdoc of a sandboxed frame. The sandbox has no
+ * allow-scripts and no allow-same-origin: nothing in a captured e-mail can run
+ * or read this origin. A click on a link may open it in the whole window.
+ */
+function mailFrame(mail: OutboxMail): string {
+  const body = mail.html ?? `<pre style="white-space:pre-wrap;font:15px/1.5 system-ui,sans-serif">${esc(mail.text ?? "")}</pre>`;
+  return `<iframe title="E-posten" sandbox="allow-top-navigation-by-user-activation allow-popups allow-popups-to-escape-sandbox" srcdoc="${esc(`<base target="_top">${body}`)}"></iframe>`;
+}
+
 function mailPage(mail: OutboxMail): string {
   const meta: Array<[string, string | undefined]> = [
     ["Tid", osloTime(mail.at)],
@@ -265,14 +305,28 @@ ${rows}
 <section>
 <h2>Slik ser den ut</h2>
 <p class="muted">Lenkene peker til testmiljøet. I den ekte e-posten peker de til domenet i prod.</p>
-<iframe title="E-posten" src="/testmiljo/epost/${esc(mail.id)}/html"></iframe>
+${mailFrame(mail)}
 </section>
 ${mail.text ? `<section><h2>Tekstversjonen</h2><pre>${esc(mail.text)}</pre></section>` : ""}`,
   );
 }
 
-const PAGE_CSP = "default-src 'self'; style-src 'unsafe-inline'; img-src 'self' data:; frame-src 'self'; form-action 'self' http://*.localhost:*; base-uri 'none'";
-const MAIL_BODY_CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src * data:; font-src *";
+const PROXY_HEADERS = ["x-forwarded-for", "forwarded", "x-real-ip", "via"] as const;
+
+/**
+ * For a write without Sec-Fetch-Site (an old browser, or not a browser). No
+ * Origin, or the opaque "null" a no-referrer form post sends, says nothing and
+ * is let through; a named Origin must be this very host and port.
+ */
+function originIsThisHost(origin: string | undefined, host: string | undefined): boolean {
+  const value = (origin ?? "").trim().toLowerCase();
+  if (value === "" || value === "null") return true;
+  try {
+    return new URL(value).host === (host ?? "").trim().toLowerCase();
+  } catch {
+    return false;
+  }
+}
 
 export function createTestmiljoRouter(deps: TestmiljoDeps = defaultTestmiljoDeps()): Router {
   const router = Router();
@@ -285,11 +339,17 @@ export function createTestmiljoRouter(deps: TestmiljoDeps = defaultTestmiljoDeps
     // names (a rebound DNS name is not), and a write must come from these
     // pages themselves (Sec-Fetch-Site, sent by every current browser).
     if (!isLocalHostName(splitHostPort(req.headers.host).hostname)) return res.status(403).type("text/plain").send("Unknown host name for the test environment.");
+    // A tunnel or reverse proxy on this machine makes every visitor look like
+    // loopback, and may rewrite Host. It also adds a forwarding header.
+    if (PROXY_HEADERS.some((name) => req.headers[name] !== undefined)) return res.status(403).type("text/plain").send("The test environment does not answer through a proxy or tunnel.");
     if (req.method !== "GET" && req.method !== "HEAD") {
       const fetchSite = String(req.headers["sec-fetch-site"] ?? "");
-      if (fetchSite !== "" && fetchSite !== "same-origin" && fetchSite !== "none") return res.status(403).type("text/plain").send("Cross-site request refused.");
+      if (fetchSite !== "") {
+        if (fetchSite !== "same-origin" && fetchSite !== "none") return res.status(403).type("text/plain").send("Cross-site request refused.");
+      } else if (!originIsThisHost(req.headers.origin, req.headers.host)) {
+        return res.status(403).type("text/plain").send("Cross-site request refused.");
+      }
     }
-    res.setHeader("Content-Security-Policy", PAGE_CSP);
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("X-Robots-Tag", "noindex, nofollow");
     next();
@@ -297,30 +357,34 @@ export function createTestmiljoRouter(deps: TestmiljoDeps = defaultTestmiljoDeps
   router.use(express.urlencoded({ extended: false }));
 
   router.get("/", (req: Request, res: Response) => {
-    const { port } = splitHostPort(req.headers.host);
-    res.send(startPage(deps, port));
+    const { hostname, port } = splitHostPort(req.headers.host);
+    res.send(startPage(deps, hostname, port));
   });
 
   router.post("/logg-inn", (req: Request, res: Response) => {
     const siteKey = String(req.body?.site ?? "");
     const id = String(req.body?.id ?? "");
-    const { port } = splitHostPort(req.headers.host);
-    const site = siteByKey(siteKey);
-    if (!site || (site.key !== "rfb" && site.key !== "opplevagent")) {
+    const { hostname, port } = splitHostPort(req.headers.host);
+    const ownerSite = OWNER_SITES.find((candidate) => candidate.key === siteKey);
+    if (!ownerSite) {
       return res.status(400).send(page("Feil", `<section><h1>Ukjent plattform</h1><p><a href="/testmiljo">Tilbake</a></p></section>`));
     }
-    const owners = site.key === "rfb" ? deps.rfbOwners() : deps.gardssalgOwners();
+    // The cookie the verify route sets belongs to that site's own name.
+    if (requestSite(hostname)?.key !== ownerSite.key) {
+      const there = `${localOrigin(siteByKey(ownerSite.key)!, port)}/testmiljo`;
+      return res.status(400).send(page("Feil", `<section><h1>Feil adresse</h1><p>Logg inn på ${esc(ownerSite.heading)} fra <a href="${esc(there)}">${esc(there)}</a>.</p></section>`));
+    }
+    const owners = ownerSite.key === "rfb" ? deps.rfbOwners() : deps.gardssalgOwners();
     const owner = owners.find((candidate) => candidate.id === id);
     if (!owner) {
       return res.status(404).send(page("Feil", `<section><h1>Fant ikke eieren</h1><p>Bare eiere som finnes i databasen, kan velges.</p><p><a href="/testmiljo">Tilbake</a></p></section>`));
     }
-    const token = site.key === "rfb" ? deps.issueRfbLogin(owner.id, owner.email) : deps.issueGardssalgLogin(owner.id, owner.email);
+    const token = ownerSite.key === "rfb" ? deps.issueRfbLogin(owner.id, owner.email) : deps.issueGardssalgLogin(owner.id, owner.email);
     if (!token) {
       return res.status(500).send(page("Feil", `<section><h1>Kunne ikke lage innloggingslenke</h1><p><a href="/testmiljo">Tilbake</a></p></section>`));
     }
-    const verifyPath = site.key === "rfb" ? "/magic-link-verify" : "/kategori/gardssalg/eier/magic-link-verify";
-    console.log(`[testmiljo] login as owner of ${site.key}:${owner.id}`);
-    return res.redirect(303, `${localOrigin(site, port)}${verifyPath}?token=${encodeURIComponent(token)}`);
+    console.log(`[testmiljo] login as owner of ${ownerSite.key}:${owner.id}`);
+    return res.redirect(303, `${ownerSite.verifyPath}?token=${encodeURIComponent(token)}`);
   });
 
   router.get("/epost", (_req: Request, res: Response) => {
@@ -336,15 +400,6 @@ export function createTestmiljoRouter(deps: TestmiljoDeps = defaultTestmiljoDeps
     const mail = getOutboxMail(String(req.params.id));
     if (!mail) return res.status(404).send(page("E-post", `<section><h1>Fant ikke e-posten</h1><p><a href="/testmiljo/epost">Tilbake til listen</a></p></section>`));
     res.send(mailPage(mail));
-  });
-
-  router.get("/epost/:id/html", (req: Request, res: Response) => {
-    const mail = getOutboxMail(String(req.params.id));
-    if (!mail) return res.status(404).type("text/plain").send("Not found");
-    res.setHeader("Content-Security-Policy", MAIL_BODY_CSP);
-    // Links open in the whole window, not inside the frame.
-    const body = mail.html ?? `<pre style="white-space:pre-wrap;font:15px/1.5 system-ui,sans-serif">${esc(mail.text ?? "")}</pre>`;
-    res.type("text/html").send(`<base target="_top">${body}`);
   });
 
   return router;

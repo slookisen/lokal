@@ -5,7 +5,8 @@
  *
  *   1. TESTMILJO set where it must not be (production, wrong value, mail
  *      credentials present, no own database files): throw, the process exits.
- *   2. Test environment on: block outbound connections (outbound-guard.ts).
+ *   2. Test environment on: listen on this machine only (HOST defaults to
+ *      127.0.0.1) and block outbound connections (outbound-guard.ts).
  *
  * With TESTMILJO unset this does nothing at all.
  */
@@ -16,6 +17,7 @@ import { installOutboundGuard, parseAllowList } from "./outbound-guard";
 assertTestmiljoBootSafe();
 
 if (isTestmiljo()) {
+  if (!(process.env.HOST ?? "").trim()) process.env.HOST = "127.0.0.1";
   const allow = parseAllowList(process.env.TESTMILJO_ALLOW_OUTBOUND);
   installOutboundGuard({ allow, log: (message) => console.warn(message) });
   console.log(

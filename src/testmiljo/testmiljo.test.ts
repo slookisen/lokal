@@ -5,19 +5,25 @@
  * (points 2, 3 and 4; AK3 and AK4).
  *
  * Covers:
- *   g1-g8   the switch: off by default, on only for TESTMILJO=1 outside
+ *   g1-g9   the switch: off by default, on only for TESTMILJO=1 outside
  *           production, boot refused in production / wrong value / with mail
- *           credentials / without own database files; loopback check.
+ *           credentials / without own database files / on a network listen
+ *           address; loopback check.
+ *   s1-s2   wiring: the boot check is the first import of src/index.ts; the
+ *           rate limiters are skipped in the test environment only.
  *   h1-h6   local host names: mapping, production URLs rewritten in Location
  *           and HTML only, self-removing service worker, no effect when off.
  *   o1-o6   outbound guard: a non-loopback connection is refused before DNS
- *           (raw socket and global fetch), loopback passes, uninstall restores.
+ *           (net, tls, http and https; global fetch too when run standalone,
+ *           since the suite stubs fetch), loopback passes, uninstall restores.
  *   x1-x4   outbox: capture, list, read, clear; EmailService uses it in the
  *           test environment and is unchanged outside it.
  *   r1-r9   /testmiljo pages over a real HTTP server: 404 when off, 403 for a
- *           non-loopback peer, a foreign Host or a cross-site write, owner
- *           list, login redirect per site, refusals, outbox pages, nothing
- *           mounted when off.
+ *           non-loopback peer, a foreign Host, a proxy header or a cross-site
+ *           write, owner
+ *           list per site, same-origin login redirect, refusals, outbox pages
+ *           with the e-mail in a sandboxed frame, no policy header of its
+ *           own, nothing mounted when off.
  *   d1-d4   the real dependencies against in-memory databases: owners are
  *           read from verified claims, and login issues an ordinary unused
  *           login link (no session is written directly).
@@ -28,9 +34,11 @@
 
 import fs from "fs";
 import http from "http";
+import https from "https";
 import net from "net";
 import os from "os";
 import path from "path";
+import tls from "tls";
 
 export interface TestSummary {
   passed: number;
@@ -40,10 +48,10 @@ export interface TestSummary {
 
 const ENV_KEYS = [
   "TESTMILJO", "NODE_ENV", "FLY_APP_NAME", "FLY_MACHINE_ID", "FLY_ALLOC_ID", "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS",
-  "DB_PATH", "DENTAL_DB_PATH", "EXPERIENCES_DB_PATH", "EMAIL_FORCE_DRY_RUN", "TESTMILJO_RATE_LIMITS",
+  "DB_PATH", "DENTAL_DB_PATH", "EXPERIENCES_DB_PATH", "EMAIL_FORCE_DRY_RUN", "TESTMILJO_RATE_LIMITS", "HOST",
 ] as const;
 
-export async function runTestmiljoTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
+export async function runTestmiljoTests(opts: { log?: boolean; realFetch?: boolean } = {}): Promise<TestSummary> {
   const log = opts.log ?? false;
   let passed = 0;
   let failed = 0;
@@ -114,6 +122,54 @@ export async function runTestmiljoTests(opts: { log?: boolean } = {}): Promise<T
     }
     assertEq(["127.0.0.1", "127.8.9.10", "::1", "::ffff:127.0.0.1", "10.0.0.5", "192.168.1.20", "fdaa:0:1::3", "::ffff:10.0.0.5", "", undefined].map((a) => guard.isLoopbackAddress(a)),
       [true, true, true, true, false, false, false, false, false, false], "g8 loopback addresses only");
+
+    for (const host of ["0.0.0.0", "::", "192.168.1.20", "minmaskin.lan"]) {
+      assertTrue(/HOST=/.test(throws({ TESTMILJO: "1", HOST: host, ...dbs })), `g9 HOST=${host}: boot refused`);
+    }
+    assertEq(["127.0.0.1", "localhost", "::1", ""].map((host) => throws({ TESTMILJO: "1", HOST: host, ...dbs })), ["", "", "", ""], "g9 a loopback or unset HOST: boot allowed");
+
+    // ── s: wiring ─────────────────────────────────────────────────────
+    {
+      const indexSource = fs.readFileSync(path.join(__dirname, "..", "index.ts"), "utf8");
+      const firstImport = indexSource.split(/\r?\n/).find((line) => /^import\b/.test(line));
+      assertEq(firstImport, 'import "./testmiljo/boot";', "s1 the boot check is the first import of src/index.ts");
+    }
+    {
+      const express = require("express") as typeof import("express");
+      const { rfbClaimRequestLimiter } = require("../middleware/security") as typeof import("../middleware/security");
+      const app = express();
+      app.get("/limited", rfbClaimRequestLimiter, (_req: any, res: any) => res.send("ok"));
+      const server = http.createServer(app);
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+      const port = (server.address() as net.AddressInfo).port;
+      const hit = (): Promise<number> =>
+        new Promise((resolve, reject) => {
+          const req = http.request({ host: "127.0.0.1", port, method: "GET", path: "/limited", agent: false }, (res) => { res.resume(); res.on("end", () => resolve(res.statusCode ?? 0)); });
+          req.on("error", reject);
+          req.end();
+        });
+      const burst = async (): Promise<string> => {
+        try { await rfbClaimRequestLimiter.resetKey("127.0.0.1"); } catch { /* ignore */ }
+        const codes: number[] = [];
+        for (let i = 0; i < 12; i++) codes.push(await hit());
+        try { await rfbClaimRequestLimiter.resetKey("127.0.0.1"); } catch { /* ignore */ }
+        return `${codes.filter((c) => c === 200).length} ok, ${codes.filter((c) => c === 429).length} limited`;
+      };
+      try {
+        enterTestmiljo(tmpDir);
+        const inTest = await burst();
+        process.env.TESTMILJO_RATE_LIMITS = "on";
+        const inTestKept = await burst();
+        delete process.env.TESTMILJO;
+        delete process.env.TESTMILJO_RATE_LIMITS;
+        const outside = await burst();
+        assertEq([inTest, inTestKept, outside], ["12 ok, 0 limited", "10 ok, 2 limited", "10 ok, 2 limited"],
+          "s2 the limiters are skipped in the test environment, kept with TESTMILJO_RATE_LIMITS=on, and unchanged outside it");
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        restoreEnv();
+      }
+    }
 
     // ── h: local host names ───────────────────────────────────────────
     assertEq(["rettfrabonden.localhost", "opplevagent.localhost", "finn-tannlege.localhost", "OPPLEVAGENT.localhost", "localhost", "opplevagent.no", "evil.opplevagent.localhost"].map(hosts.prodHostFor),
@@ -199,20 +255,31 @@ export async function runTestmiljoTests(opts: { log?: boolean } = {}): Promise<T
       try {
         await new Promise<void>((resolve) => local.listen(0, "127.0.0.1", () => resolve()));
         const localPort = (local.address() as net.AddressInfo).port;
-        const blockedCode = await new Promise<string>((resolve) => {
-          const socket = net.connect({ host: "blocked.example.invalid", port: 443 });
-          socket.on("error", (err: any) => resolve(String(err?.code)));
-          socket.on("connect", () => { socket.destroy(); resolve("CONNECTED"); });
-        });
-        const fetchCode = await fetch("http://fetch.example.invalid/x").then(() => "FETCHED", (err: any) => String(err?.cause?.code ?? err?.code));
-        const loopbackResult = await new Promise<string>((resolve) => {
-          const socket = net.connect({ host: "127.0.0.1", port: localPort });
-          socket.on("error", (err: any) => resolve(String(err?.code)));
-          socket.on("connect", () => { socket.destroy(); resolve("CONNECTED"); });
-        });
-        assertEq([blockedCode, fetchCode, loopbackResult], ["ETESTMILJO_BLOCKED", "ETESTMILJO_BLOCKED", "CONNECTED"], "o5 a raw socket and global fetch are refused before DNS; this machine is reachable");
+        const viaSocket = (connect: () => net.Socket): Promise<string> =>
+          new Promise<string>((resolve) => {
+            const socket = connect();
+            socket.on("error", (err: any) => resolve(String(err?.code)));
+            socket.on("connect", () => { socket.destroy(); resolve("CONNECTED"); });
+          });
+        const viaRequest = (mod: typeof http | typeof https, url: string): Promise<string> =>
+          new Promise<string>((resolve) => {
+            const req = mod.request(url, { agent: false }, (res) => { res.resume(); resolve("RESPONDED"); });
+            req.on("error", (err: any) => resolve(String(err?.code)));
+            req.end();
+          });
+        const rawCode = await viaSocket(() => net.connect({ host: "raw.example.invalid", port: 443 }));
+        const tlsCode = await viaSocket(() => tls.connect({ host: "tls.example.invalid", port: 443 }));
+        const httpCode = await viaRequest(http, "http://http.example.invalid/x");
+        const httpsCode = await viaRequest(https, "https://https.example.invalid/x");
+        const loopbackResult = await viaSocket(() => net.connect({ host: "127.0.0.1", port: localPort }));
+        assertEq([rawCode, tlsCode, httpCode, httpsCode, loopbackResult], ["ETESTMILJO_BLOCKED", "ETESTMILJO_BLOCKED", "ETESTMILJO_BLOCKED", "ETESTMILJO_BLOCKED", "CONNECTED"],
+          "o5 net, tls, http and https are refused before DNS; this machine is reachable");
         const seen = outbound.outboundAttempts().map((a) => `${a.host}:${a.allowed}`).sort();
-        assertEq(seen, ["blocked.example.invalid:false", "fetch.example.invalid:false"], "o5 refused hosts are recorded, loopback is not");
+        assertEq(seen, ["http.example.invalid:false", "https.example.invalid:false", "raw.example.invalid:false", "tls.example.invalid:false"], "o5 refused hosts are recorded, loopback is not");
+        if (opts.realFetch) {
+          const fetchCode = await fetch("http://fetch.example.invalid/x").then(() => "FETCHED", (err: any) => String(err?.cause?.code ?? err?.code));
+          assertEq(fetchCode, "ETESTMILJO_BLOCKED", "o5 (standalone only) global fetch is refused too");
+        }
       } finally {
         uninstall();
         await new Promise<void>((resolve) => local.close(() => resolve()));
@@ -308,43 +375,68 @@ export async function runTestmiljoTests(opts: { log?: boolean } = {}): Promise<T
         const plainLocalhost = await call("GET", "/testmiljo", undefined, { Host: "localhost:4310" });
         assertEq([rebound.status, lookalike.status, crossPost.status, sameSitePost.status, crossGet.status, plainLocalhost.status, issued.length], [403, 403, 403, 403, 200, 200, 0],
           "r2 a Host that is not a local name, or a write another site started, is refused; reading from a followed link is not");
+        const tunnelled = [];
+        for (const header of ["X-Forwarded-For", "Forwarded", "X-Real-IP", "Via"]) {
+          tunnelled.push((await call("GET", "/testmiljo/epost", undefined, { Host: "localhost:4310", [header]: "203.0.113.9" })).status);
+          tunnelled.push((await call("POST", "/testmiljo/logg-inn", { site: "rfb", id: "rfb-1" }, { [header]: "203.0.113.9" })).status);
+        }
+        assertEq([tunnelled, issued.length], [[403, 403, 403, 403, 403, 403, 403, 403], 0], "r2 a request that came through a proxy or tunnel is refused, read or write");
+        const foreignOrigin = await call("POST", "/testmiljo/logg-inn", { site: "rfb", id: "rfb-1" }, { Origin: "https://evil.example" });
+        const otherLocalOrigin = await call("POST", "/testmiljo/logg-inn", { site: "rfb", id: "rfb-1" }, { Origin: "http://opplevagent.localhost:4310" });
+        const badOrigin = await call("POST", "/testmiljo/logg-inn", { site: "rfb", id: "rfb-1" }, { Origin: "not a url" });
+        assertEq([foreignOrigin.status, otherLocalOrigin.status, badOrigin.status, issued.length], [403, 403, 403, 0], "r2 without Sec-Fetch-Site, a write whose Origin is not this host is refused");
+        const ownOrigin = await call("POST", "/testmiljo/logg-inn", { site: "rfb", id: "rfb-1" }, { Origin: "http://rettfrabonden.localhost:4310" });
+        const nullOrigin = await call("POST", "/testmiljo/logg-inn", { site: "rfb", id: "rfb-1" }, { Origin: "null", "Sec-Fetch-Site": "same-origin" });
+        assertEq([ownOrigin.status, nullOrigin.status, issued.length], [303, 303, 2], "r2 this host's own Origin, and the opaque Origin of a same-origin form post, are let through");
+        issued.length = 0;
 
         const start = await call("GET", "/testmiljo");
-        assertTrue(start.status === 200 && start.body.includes("Solgården &lt;b&gt;") && !start.body.includes("Solgården <b>") && start.body.includes("eier@solgarden.invalid") && start.body.includes("Fjordsider") && start.body.includes('name="id" value="gs-1"'),
-          "r3 the start page lists the owners of both sites, escaped");
-        assertTrue(start.body.includes("http://opplevagent.localhost:4310/") && start.body.includes("http://finn-tannlege.localhost:4310/") && /form-action 'self' http:\/\/\*\.localhost:\*/.test(String(start.headers["content-security-policy"])) && start.headers["cache-control"] === "no-store",
-          "r3 it links the three local sites on the request's port and sets its own policy");
+        const onOpplevagent = await call("GET", "/testmiljo", undefined, { Host: "opplevagent.localhost:4310" });
+        const onLocalhost = await call("GET", "/testmiljo", undefined, { Host: "localhost:4310" });
+        assertTrue(start.status === 200 && start.body.includes("Solgården &lt;b&gt;") && !start.body.includes("Solgården <b>") && start.body.includes("eier@solgarden.invalid") && start.body.includes('name="id" value="rfb-1"'),
+          "r3 on a site's own name the start page lists that site's owners, escaped");
+        assertTrue(!start.body.includes('value="gs-1"') && start.body.includes('href="http://opplevagent.localhost:4310/testmiljo"') && start.body.includes("http://finn-tannlege.localhost:4310/")
+          && onOpplevagent.body.includes('name="id" value="gs-1"') && !onOpplevagent.body.includes('value="rfb-1"') && onOpplevagent.body.includes('href="http://rettfrabonden.localhost:4310/testmiljo"')
+          && !onLocalhost.body.includes('action="/testmiljo/logg-inn"'),
+          "r3 the other site's owners are one link away, and plain localhost offers links only");
+        assertEq([start.headers["content-security-policy"], start.headers["cache-control"]], [undefined, "no-store"], "r3 the pages set no policy header of their own");
 
         const rfbLogin = await call("POST", "/testmiljo/logg-inn", { site: "rfb", id: "rfb-1" });
-        const gsLogin = await call("POST", "/testmiljo/logg-inn", { site: "opplevagent", id: "gs-1" });
+        const gsLogin = await call("POST", "/testmiljo/logg-inn", { site: "opplevagent", id: "gs-1" }, { Host: "opplevagent.localhost:4310" });
         assertEq([rfbLogin.status, rfbLogin.headers.location, gsLogin.status, gsLogin.headers.location],
-          [303, "http://rettfrabonden.localhost:4310/magic-link-verify?token=tok%20rfb%2F1", 303, "http://opplevagent.localhost:4310/kategori/gardssalg/eier/magic-link-verify?token=tok-gs-1"],
-          "r4 logging in issues a link and follows it on the right site's ordinary verify route");
+          [303, "/magic-link-verify?token=tok%20rfb%2F1", 303, "/kategori/gardssalg/eier/magic-link-verify?token=tok-gs-1"],
+          "r4 logging in issues a link and follows it to the site's ordinary verify route, on the same origin");
         assertEq(issued, ["rfb:rfb-1:eier@solgarden.invalid", "gs:gs-1:besok@fjordsider.invalid"], "r4 the link is issued for the listed owner's own address");
 
         issued.length = 0;
         const unknownOwner = await call("POST", "/testmiljo/logg-inn", { site: "rfb", id: "someone-else" });
-        const crossSite = await call("POST", "/testmiljo/logg-inn", { site: "opplevagent", id: "rfb-1" });
+        const otherSitesOwner = await call("POST", "/testmiljo/logg-inn", { site: "rfb", id: "gs-1" });
+        const wrongHost = await call("POST", "/testmiljo/logg-inn", { site: "opplevagent", id: "gs-1" });
+        const fromLocalhost = await call("POST", "/testmiljo/logg-inn", { site: "rfb", id: "rfb-1" }, { Host: "localhost:4310" });
         const dental = await call("POST", "/testmiljo/logg-inn", { site: "dental", id: "rfb-1" });
         const noSite = await call("POST", "/testmiljo/logg-inn", { id: "rfb-1" });
-        assertEq([unknownOwner.status, crossSite.status, dental.status, noSite.status, issued.length], [404, 404, 400, 400, 0], "r5 an id that is not a listed owner of that site, or an unknown site, issues nothing");
+        assertEq([unknownOwner.status, otherSitesOwner.status, wrongHost.status, fromLocalhost.status, dental.status, noSite.status, issued.length], [404, 404, 400, 400, 400, 400, 0],
+          "r5 an id that is not a listed owner of that site, another site's name, or an unknown site, issues nothing");
+        assertTrue(wrongHost.body.includes('href="http://opplevagent.localhost:4310/testmiljo"'), "r5 a login from the wrong name points to the right one");
 
         const transport = outbox.createOutboxTransport();
-        await transport.sendMail({ from: "a@b.invalid", to: "eier@gard.invalid", subject: "Besøk <script>", text: "Ren tekst", html: '<p>Hei</p><a href="https://opplevagent.no/x">Bekreft</a>' });
+        await transport.sendMail({ from: "a@b.invalid", to: "eier@gard.invalid", subject: "Besøk <script>", text: "Ren tekst", html: '<p>Hei</p><a href="https://opplevagent.no/x">Bekreft</a><script>alert(1)</script>' });
         await transport.sendMail({ from: "a@b.invalid", to: "eier@gard.invalid", subject: "Bare tekst", text: "Linje <1>" });
         const [textOnly, withHtml] = outbox.listOutbox();
         const list = await call("GET", "/testmiljo/epost");
         assertTrue(list.status === 200 && list.body.includes("Besøk &lt;script&gt;") && !list.body.includes("<script>") && list.body.includes(`/testmiljo/epost/${withHtml.id}`), "r6 the outbox page lists captured e-mail, escaped");
         const one = await call("GET", `/testmiljo/epost/${withHtml.id}`);
-        const body = await call("GET", `/testmiljo/epost/${withHtml.id}/html`);
-        const textBody = await call("GET", `/testmiljo/epost/${textOnly.id}/html`);
-        assertTrue(one.status === 200 && one.body.includes(`src="/testmiljo/epost/${withHtml.id}/html"`) && one.body.includes("Ren tekst"), "r7 one e-mail shows its headers, a frame for the HTML and the text version");
-        assertTrue(body.status === 200 && body.body.includes('<a href="https://opplevagent.no/x">Bekreft</a>') && /default-src 'none'/.test(String(body.headers["content-security-policy"])) && !/script-src/.test(String(body.headers["content-security-policy"])),
-          "r7 the HTML body is served alone under a policy that runs no script");
-        assertTrue(textBody.body.includes("Linje &lt;1&gt;"), "r7 a text-only e-mail is shown escaped");
+        const textOne = await call("GET", `/testmiljo/epost/${textOnly.id}`);
+        const sandbox = /<iframe title="E-posten" sandbox="([^"]*)" srcdoc="/.exec(one.body)?.[1] ?? "MISSING";
+        assertTrue(one.status === 200 && sandbox !== "MISSING" && !/allow-scripts|allow-same-origin/.test(sandbox) && one.body.includes("Ren tekst"),
+          "r7 one e-mail shows its headers, the text version, and the HTML in a frame that cannot run script or read this origin");
+        assertTrue(one.body.includes("&lt;a href=&quot;https://opplevagent.no/x&quot;&gt;Bekreft&lt;/a&gt;&lt;script&gt;alert(1)&lt;/script&gt;") && !one.body.includes("<script>") && one.headers["content-security-policy"] === undefined,
+          "r7 the e-mail's HTML is only ever inside the frame's escaped srcdoc");
+        assertTrue(textOne.body.includes("Linje &amp;lt;1&amp;gt;") && textOne.body.includes("<pre>Linje &lt;1&gt;</pre>"), "r7 a text-only e-mail is shown escaped, in the frame and as text");
+        const noHtmlRoute = await call("GET", `/testmiljo/epost/${withHtml.id}/html`);
         const missing = await call("GET", "/testmiljo/epost/ffffffffffffffff");
         const cleared = await call("POST", "/testmiljo/epost/tom");
-        assertEq([missing.status, cleared.status, cleared.headers.location, outbox.listOutbox().length], [404, 303, "/testmiljo/epost", 0], "r8 unknown id is a 404; emptying the outbox works");
+        assertEq([missing.status, noHtmlRoute.status, cleared.status, cleared.headers.location, outbox.listOutbox().length], [404, 404, 303, "/testmiljo/epost", 0], "r8 unknown id is a 404, there is no separate HTML route; emptying the outbox works");
       } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));
         outbox.clearOutbox();
@@ -364,12 +456,18 @@ export async function runTestmiljoTests(opts: { log?: boolean } = {}): Promise<T
 
     // ── d: the real dependencies, in-memory databases ─────────────────
     {
+      // A fresh db-factory with the services bound to it (see tests/module-cache.ts):
+      // earlier blocks may have left copies of gardssalg-claim bound to another
+      // db-factory, whose in-memory database is not the one seeded below.
+      const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([
+        require.resolve("../database/db-factory"), require.resolve("../services/gardssalg-claim"),
+        require.resolve("../services/experience-store"), require.resolve("../services/booking-store"), require.resolve("../services/blocklist-service"),
+      ]);
+      const prevExperiences = process.env.EXPERIENCES_DB_PATH;
+      process.env.EXPERIENCES_DB_PATH = ":memory:";
       const initMod = require("../database/init") as typeof import("../database/init");
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
       const restoreDb = initMod.__pinInMemoryDbForTesting();
-      const prevExperiences = process.env.EXPERIENCES_DB_PATH;
-      process.env.EXPERIENCES_DB_PATH = ":memory:";
-      dbFactory.__resetDbFactoryForTesting();
       try {
         const db = initMod.__peekDbForTesting()!;
         const insertAgent = db.prepare(`INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, categories)
@@ -411,9 +509,10 @@ export async function runTestmiljoTests(opts: { log?: boolean } = {}): Promise<T
           "d4 gårdssalg login issues an ordinary unused login link");
       } finally {
         restoreDb();
+        try { dbFactory.__resetDbFactoryForTesting(); } catch { /* best effort */ }
         if (prevExperiences === undefined) delete process.env.EXPERIENCES_DB_PATH;
         else process.env.EXPERIENCES_DB_PATH = prevExperiences;
-        dbFactory.__resetDbFactoryForTesting();
+        restoreModuleCache();
       }
     }
   } catch (err: any) {
@@ -428,7 +527,7 @@ export async function runTestmiljoTests(opts: { log?: boolean } = {}): Promise<T
 }
 
 if (require.main === module) {
-  runTestmiljoTests({ log: true }).then((r) => {
+  runTestmiljoTests({ log: true, realFetch: true }).then((r) => {
     console.log(`\ntestmiljo: ${r.passed} passed, ${r.failed} failed`);
     for (const f of r.failures) console.log(f);
     process.exit(r.failed ? 1 : 0);

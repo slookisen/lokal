@@ -11,6 +11,10 @@
  * The check runs on the host name as given, before any DNS lookup. DNS queries
  * themselves (dns.resolveMx and the like) are not TCP and are not blocked.
  *
+ * Main thread only: a worker thread has its own copy of `net` and is not
+ * covered. The app's two workers only read SQLite, and the launcher's
+ * testmiljo.env switches the off-thread stats worker off.
+ *
  * Only ever installed from src/testmiljo/boot.ts when isTestmiljo() is true.
  */
 

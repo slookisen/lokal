@@ -65,7 +65,18 @@ export function testmiljoBootProblems(env: Env = process.env): string[] {
   for (const key of ["DB_PATH", "DENTAL_DB_PATH", "EXPERIENCES_DB_PATH"]) {
     if (!set(env[key])) problems.push(`${key} is not set. The test environment needs its own database files.`);
   }
+  // src/index.ts listens on HOST (default 0.0.0.0). boot.ts defaults it to
+  // 127.0.0.1 here; a value that opens the port to the network is refused.
+  if (set(env.HOST) && !isLoopbackBindHost(env.HOST ?? "")) {
+    problems.push(`HOST=${(env.HOST ?? "").trim()} would open the test environment to the network. Leave it unset or use 127.0.0.1.`);
+  }
   return problems;
+}
+
+/** A listen address that only this machine can reach. */
+export function isLoopbackBindHost(host: string): boolean {
+  const h = host.trim().toLowerCase();
+  return h === "localhost" || h === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
 }
 
 /** Throws with every reason when the process must not start. */

@@ -15,6 +15,12 @@
  * redirect or a form in a page keeps you inside the test environment, and no
  * production code path has to know it is being tested.
  *
+ * The rewrite is best effort, not a fence. It covers Location headers and HTML
+ * sent with res.send(). It does not touch JSON, Buffers, static files under
+ * public/, URL-encoded URLs (next=https%3A%2F%2F…) or URLs built in inline
+ * script, so a link can still lead to production. The address bar tells you
+ * where you are; nothing the test environment holds follows you there.
+ *
  * Browsers resolve every *.localhost name to this machine without a hosts
  * file, and treat it as a secure context, so the Secure session cookies stick
  * over plain http.
