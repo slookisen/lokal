@@ -91,7 +91,7 @@ function countsFromOutput(stdout: string): Counts | null {
 function countsFromFiles(dir: string): Counts {
   const out: Counts = {};
   for (const [key, file] of [["rfb", "lokal.db"], ["dental", "dental.db"], ["experiences", "experiences.db"]]) {
-    const db = new Database(path.join(dir, file), { readonly: true });
+    const db = new Database(path.join(dir, file), { fileMustExist: true }); // read-write: a read-only one leaves -wal/-shm on WAL DBs
     try {
       const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as Array<{ name: string }>;
       out[key] = {};
@@ -156,6 +156,15 @@ export async function runTestmiljoTests(opts: { log?: boolean } = {}): Promise<T
   };
 
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "testmiljo-test-"));
+  const extraRoots: string[] = [];
+  /** A further accepted `<tmpdir>/<mkdtemp>/.testmiljo` (the guard wants a direct child of tmpdir). */
+  const extraTestmiljo = (prefix: string): string => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    extraRoots.push(root);
+    const d = path.join(root, ".testmiljo");
+    fs.mkdirSync(d);
+    return d;
+  };
   try {
     const dir = path.join(tmpRoot, ".testmiljo");
 
@@ -253,10 +262,30 @@ export async function runTestmiljoTests(opts: { log?: boolean } = {}): Promise<T
     check(throws(() => seed.assertInsideTestmiljo(path.join(tmpRoot, "x.db"))), "tm-g3: guard refuses a temp dir that is not named .testmiljo");
     check(!throws(() => seed.assertInsideTestmiljo(path.join(REPO_ROOT, ".testmiljo", "x.db"))), "tm-g4: guard accepts <repo>/.testmiljo/x.db");
     check(!throws(() => seed.assertInsideTestmiljo(path.join(dir, "x.db"))), "tm-g5: guard accepts <tmp>/…/.testmiljo/x.db");
+    check(throws(() => seed.assertInsideTestmiljo(path.join(tmpRoot, "dypere", ".testmiljo", "x.db"))), "tm-g10: guard refuses a .testmiljo/ nested deeper than <tmpdir>/<one dir>/");
+    {
+      const saved = { TMPDIR: process.env.TMPDIR, TEMP: process.env.TEMP, TMP: process.env.TMP };
+      const fsRoot = path.parse(REPO_ROOT).root;
+      try {
+        process.env.TMPDIR = fsRoot;
+        process.env.TEMP = fsRoot;
+        process.env.TMP = fsRoot;
+        const tmpNow = os.tmpdir();
+        check(
+          path.dirname(path.resolve(tmpNow)) !== path.resolve(tmpNow) || throws(() => seed.assertInsideTestmiljo(path.join(fsRoot, "srv", ".testmiljo", "x.db"))),
+          "tm-g11: guard refuses the temp-dir exception when TMPDIR is the filesystem root",
+          `tmpdir=${tmpNow}`,
+        );
+      } finally {
+        for (const [k, v] of Object.entries(saved)) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      }
+    }
 
     // Path guard (N2): a symlinked DB file (or sidecar), broken links included.
-    const linkDir = path.join(tmpRoot, "lenker", ".testmiljo");
-    fs.mkdirSync(linkDir, { recursive: true });
+    const linkDir = extraTestmiljo("testmiljo-lenker-");
     const realTarget = path.join(tmpRoot, "ekte.db");
     fs.writeFileSync(realTarget, "");
     let canLink = true;
@@ -284,7 +313,8 @@ export async function runTestmiljoTests(opts: { log?: boolean } = {}): Promise<T
     const dbPaths = seed.defaultPaths(dir);
     const outbox = path.join(dir, "outbox.jsonl");
     const agentName = () => {
-      const db = new Database(dbPaths.rfb, { readonly: true });
+      // read-write: a read-only connection leaves -wal/-shm behind on a WAL database
+      const db = new Database(dbPaths.rfb, { fileMustExist: true });
       try {
         return (db.prepare("SELECT name FROM agents WHERE id = ?").get("00000000-0000-4000-8001-000000000001") as { name: string }).name;
       } finally {
@@ -347,19 +377,55 @@ export async function runTestmiljoTests(opts: { log?: boolean } = {}): Promise<T
     }
     check(agentName() === "Kun i WAL", "tm-s13: hent refused → live DB left as it was");
 
+    // B1: the app leaves the DBs in WAL mode; stopped app → lagre → hent must work.
+    for (const key of ["rfb", "dental", "experiences"] as const) {
+      const db = new Database(dbPaths[key]);
+      db.pragma("journal_mode = WAL");
+      db.close();
+    }
+    const sidecars = () =>
+      (["rfb", "dental", "experiences"] as const).flatMap((k) => ["-wal", "-shm"].map((s) => dbPaths[k] + s)).filter((f) => fs.existsSync(f));
+    check(sidecars().length === 0, "tm-s25: WAL-mode DBs with all connections closed have no -wal/-shm", sidecars().join(","));
+    snap.saveSnapshot(dir, "wal-stoppet", dbPaths);
+    check(sidecars().length === 0, "tm-s26: lagre on WAL-mode DBs leaves no -wal/-shm behind", sidecars().map((f) => path.basename(f)).join(","));
+    check(!throws(() => snap.restoreSnapshot(dir, "wal-stoppet", dbPaths)), "tm-s27: stopped app → lagre → hent succeeds on WAL-mode DBs");
+    check(agentName() === "Kun i WAL" && sidecars().length === 0, "tm-s28: the WAL round trip keeps the data and leaves no sidecars", sidecars().join(","));
+
     // Invalid names, missing / incomplete snapshots, symlinks, production.
     const badNames = ["../x", "..", "a/b", "a\\b", "a.b", "A", "", "-a", "a b", "x".repeat(41)];
     check(badNames.every((n) => throws(() => snap.saveSnapshot(dir, n, dbPaths)) && throws(() => snap.restoreSnapshot(dir, n, dbPaths))), "tm-s14: invalid snapshot names are refused by lagre and hent");
-    check(fs.readdirSync(path.join(dir, "oyeblikk")).sort().join(",") === "med-outbox,rundtur,under-kjoring", "tm-s15: refused names create nothing", fs.readdirSync(path.join(dir, "oyeblikk")).join(","));
+    check(fs.readdirSync(path.join(dir, "oyeblikk")).sort().join(",") === "med-outbox,rundtur,under-kjoring,wal-stoppet", "tm-s15: refused names create nothing", fs.readdirSync(path.join(dir, "oyeblikk")).join(","));
     check(throws(() => snap.restoreSnapshot(dir, "finnes-ikke", dbPaths), /finnes ikke/), "tm-s16: hent refuses a missing snapshot");
     fs.rmSync(path.join(dir, "oyeblikk", "under-kjoring", "dental.db"));
     check(throws(() => snap.restoreSnapshot(dir, "under-kjoring", dbPaths), /ufullstendig/), "tm-s17: hent refuses an incomplete snapshot");
-    check(throws(() => snap.saveSnapshot(dir, "feil-mappe", { ...dbPaths, dental: path.join(linkDir, "dental.db") })), "tm-s18: lagre refuses DB paths outside the given .testmiljo/");
+    // The other DB exists and sits in another accepted .testmiljo/: only the same-folder rule refuses it.
+    const otherDir = extraTestmiljo("testmiljo-annen-");
+    fs.copyFileSync(dbPaths.dental, path.join(otherDir, "dental.db"));
+    check(!throws(() => seed.assertInsideTestmiljo(path.join(otherDir, "dental.db"))), "tm-s18a: the other folder is itself an accepted .testmiljo/");
+    check(
+      throws(() => snap.saveSnapshot(dir, "feil-mappe", { ...dbPaths, dental: path.join(otherDir, "dental.db") }), /ligger ikke i/) &&
+        !fs.existsSync(path.join(dir, "oyeblikk", "feil-mappe")),
+      "tm-s18: lagre refuses DB paths that are not in the given .testmiljo/",
+    );
     if (canLink) {
-      const symSnapDir = path.join(tmpRoot, "lenket-oyeblikk", ".testmiljo");
-      fs.mkdirSync(symSnapDir, { recursive: true });
+      const symSnapDir = extraTestmiljo("testmiljo-lenket-oyeblikk-");
       fs.symlinkSync(path.join(dir, "oyeblikk"), path.join(symSnapDir, "oyeblikk"), "dir");
       check(throws(() => snap.listSnapshots(symSnapDir)) && throws(() => snap.restoreSnapshot(symSnapDir, "rundtur", seed.defaultPaths(symSnapDir))), "tm-s19: a symlinked oyeblikk/ directory is refused");
+
+      // A symlinked outbox.jsonl: lagre does not follow it, hent writes nothing.
+      fs.rmSync(outbox, { force: true });
+      fs.writeFileSync(realTarget, '{"lenket":true}\n');
+      fs.symlinkSync(realTarget, outbox);
+      check(
+        throws(() => snap.saveSnapshot(dir, "lenket-outbox", dbPaths), /symbolsk lenke/) && !fs.existsSync(path.join(dir, "oyeblikk", "lenket-outbox")),
+        "tm-s23: lagre refuses a symlinked outbox.jsonl",
+      );
+      const nameNow = agentName();
+      check(
+        throws(() => snap.restoreSnapshot(dir, "rundtur", dbPaths), /symbolsk lenke/) && agentName() === nameNow && fs.lstatSync(outbox).isSymbolicLink(),
+        "tm-s24: hent refuses a symlinked outbox.jsonl before touching any database",
+      );
+      fs.rmSync(outbox, { force: true });
     }
     const prodEnv = { NODE_ENV: "production" } as NodeJS.ProcessEnv;
     check(
@@ -378,6 +444,7 @@ export async function runTestmiljoTests(opts: { log?: boolean } = {}): Promise<T
     failures.push("unexpected error: " + String((err as Error)?.stack || err));
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
+    for (const r of extraRoots) fs.rmSync(r, { recursive: true, force: true });
   }
 
   return { passed, failed, failures };

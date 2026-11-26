@@ -161,7 +161,10 @@ export function saveSnapshot(
     const files = {} as SnapshotMeta["files"];
     for (const key of DB_KEYS) {
       const dest = path.join(work, snapshotFileName(key));
-      const db = openDb(paths[key], true);
+      // Read-write on purpose: VACUUM INTO does not modify the source, but a
+      // read-only connection to a WAL database leaves -wal/-shm behind on
+      // close, which would then make `hent` refuse («stopp appen først»).
+      const db = openDb(paths[key], false);
       try {
         db.prepare("VACUUM INTO ?").run(dest);
       } finally {
@@ -244,6 +247,8 @@ function atomicCopy(src: string, dest: string): void {
 /**
  * Restores snapshot `name` over the three databases. Refuses while any
  * database has a -wal / -shm / -journal file (the app is probably running).
+ * Each file is replaced atomically on its own; the three together are not one
+ * atomic step, so a failure midway is reported and `hent` should be rerun.
  */
 export function restoreSnapshot(
   testmiljoDir: string,
@@ -256,6 +261,9 @@ export function restoreSnapshot(
   const paths = checkDbPaths(testmiljoDir, dbPaths);
   const { dir, meta } = readSnapshot(testmiljoDir, name);
 
+  // Every check before the first write: no symlinked outbox target either.
+  const outboxDest = path.join(path.resolve(testmiljoDir), OUTBOX_FILE);
+  assertNotSymlink(outboxDest);
   const busy: string[] = [];
   for (const key of DB_KEYS) {
     for (const suffix of DB_SIDECARS) {
@@ -263,18 +271,29 @@ export function restoreSnapshot(
     }
   }
   if (busy.length) {
-    throw new Error(`Appen ser ut til å kjøre (${busy.join(", ")} finnes) — stopp appen først, og prøv igjen.`);
+    throw new Error(
+      `Appen ser ut til å kjøre (${busy.join(", ")} finnes) — stopp appen først, og prøv igjen. ` +
+        "(hent bytter hver database atomisk for seg, ikke alle tre samlet, så appen må være stoppet.)",
+    );
   }
 
-  for (const key of DB_KEYS) {
-    assertNotSymlink(paths[key]);
-    atomicCopy(path.join(dir, snapshotFileName(key)), paths[key]);
-  }
-  const outboxDest = path.join(path.resolve(testmiljoDir), OUTBOX_FILE);
-  if (meta.outbox) {
-    atomicCopy(path.join(dir, OUTBOX_FILE), outboxDest);
-  } else if (existsNoLink(outboxDest)) {
-    fs.rmSync(outboxDest, { force: true });
+  const done: string[] = [];
+  try {
+    for (const key of DB_KEYS) {
+      assertNotSymlink(paths[key]);
+      atomicCopy(path.join(dir, snapshotFileName(key)), paths[key]);
+      done.push(path.basename(paths[key]));
+    }
+    if (meta.outbox) {
+      atomicCopy(path.join(dir, OUTBOX_FILE), outboxDest);
+    } else if (existsNoLink(outboxDest)) {
+      fs.rmSync(outboxDest, { force: true });
+    }
+  } catch (err) {
+    throw new Error(
+      `hent stoppet underveis (${(err as Error).message}). Hver fil byttes atomisk for seg, ikke alle tre samlet: ` +
+        `${done.length ? done.join(", ") + " er allerede hentet" : "ingen filer er byttet"} — kjør hent på nytt.`,
+    );
   }
   return meta;
 }
@@ -305,6 +324,9 @@ function main(argv: string[]): number {
   if (!name) {
     const have = listSnapshots(dir);
     console.error(`[testmiljo:${mode}] bruk: npm run testmiljo:${mode} -- <navn>`);
+    if (mode === "hent") {
+      console.error("  hent bytter hver database for seg (atomisk per fil, ikke samlet for alle tre) — stopp appen først.");
+    }
     console.error(have.length ? `  øyeblikk som finnes: ${have.join(", ")}` : "  ingen øyeblikk er lagret ennå");
     return 1;
   }
@@ -315,6 +337,7 @@ function main(argv: string[]): number {
   } else {
     const meta = restoreSnapshot(dir, name, paths);
     console.log(`[testmiljo:hent] hentet øyeblikket «${meta.name}» (lagret ${meta.created})`);
+    console.log("  hver database ble byttet atomisk for seg (ikke samlet for alle tre)");
   }
   return 0;
 }

@@ -102,9 +102,9 @@ export function assertNotSymlink(p: string): void {
 
 /**
  * Throws unless `dir` is an allowed `.testmiljo` directory: the repo's own
- * `<REPO_ROOT>/.testmiljo`, or a `.testmiljo` directory inside the OS temp dir
- * that is not somewhere else inside the repo (the tests seed into
- * `mkdtemp(...)/.testmiljo`). Compared by realpath, so a symlinked parent
+ * `<REPO_ROOT>/.testmiljo`, or `<tmpdir>/<one dir>/.testmiljo` (mkdtemp style,
+ * what the tests use) when that is not inside the repo and the OS temp dir is
+ * not the filesystem root (TMPDIR=/ would otherwise allow anything). Compared by realpath, so a symlinked parent
  * cannot point the guard elsewhere. Returns the resolved (non-real) path.
  */
 export function assertTestmiljoDir(dir: string): string {
@@ -114,7 +114,9 @@ export function assertTestmiljoDir(dir: string): string {
   if (path.basename(resolved) !== TESTMILJO_DIR_NAME || path.basename(real) !== TESTMILJO_DIR_NAME) throw outside;
   if (real === realpathLoose(DEFAULT_DIR)) return resolved;
   const realTmp = realpathLoose(os.tmpdir());
-  if (isWithin(real, realTmp) && real !== realTmp && !isWithin(real, realpathLoose(REPO_ROOT))) return resolved;
+  const tmpIsRoot = path.dirname(realTmp) === realTmp;
+  const parent = path.dirname(real);
+  if (!tmpIsRoot && path.dirname(parent) === realTmp && !isWithin(real, realpathLoose(REPO_ROOT))) return resolved;
   throw outside;
 }
 
