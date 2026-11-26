@@ -30,6 +30,10 @@
  *   d1-d4   the real dependencies against in-memory databases: owners are
  *           read from verified claims, and login issues an ordinary unused
  *           login link (no session is written directly).
+ *   f1-f5   the flag file (point 2, «flaggfilen»): testmiljo.env sets each
+ *           key once, lists every feature flag the app code reads, and has
+ *           fly.toml [env]'s value for each flag set there, except the
+ *           listed network/timer jobs (FLAG_FILE_PROD_EXCEPTIONS).
  *
  * Standalone: npx tsx src/testmiljo/testmiljo.test.ts
  * Wired into tests/test.ts via runTestmiljoTests().
@@ -53,6 +57,100 @@ const ENV_KEYS = [
   "TESTMILJO", "NODE_ENV", "FLY_APP_NAME", "FLY_MACHINE_ID", "FLY_ALLOC_ID", "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS",
   "DB_PATH", "DENTAL_DB_PATH", "EXPERIENCES_DB_PATH", "EMAIL_FORCE_DRY_RUN", "TESTMILJO_RATE_LIMITS", "HOST",
 ] as const;
+
+// ── The flag file (f1-f5) ──────────────────────────────────────────────────
+
+/**
+ * A feature-flag name: on/off switches (`*_ENABLED`, `*_DISABLED`, `ENABLE_*`,
+ * `RFB_DISABLE_*`, `*_LIVE`, `*_PAUSED`, `*_GATE`, `*_SYNC`, `*_OVERRIDE`,
+ * `*_DRY_RUN`, `*_ENFORCE*`, `SKIP_*`), modes (`*_MODE`) and the owner-feature
+ * and pilot lists (`OWNER_FEATURE(S)_*`, `*_ALLOWED_*`).
+ */
+const FLAG_NAME_RE = /(_ENABLED|_DISABLED|_LIVE|_PAUSED|_GATE|_MODE|_SYNC|_OVERRIDE|_DRY_RUN)$|_ENFORCE(_|$)|^(ENABLE|DISABLE|SKIP)_|_DISABLE_|^OWNER_FEATURES?_|_ALLOWED_/;
+
+/** Flag-type switches whose names do not follow the patterns above (each must still be read in src). */
+export const FLAG_FILE_EXTRA_FLAGS = [
+  "ANALYTICS_ROLLUP_READ", "BRREG_VERIFY_ON_REGISTER", "DENTAL_PUBLIC_CATALOG_CLASS_FILTER", "DENTAL_REPEAT_PARK_TO_REVIEW",
+  "GARDSSALG_OUTREACH_EXCLUDE_OWNED", "OPPLEVAGENT_PLACEHOLDER_NOINDEX", "RFB_NAME_FTS", "TRIGGER_REQUIRE_SIGNATURE",
+  "WRITE_GUARD_FETCH_METADATA",
+] as const;
+
+/** Upper-case string literals that match FLAG_NAME_RE but are not environment variables. */
+const NOT_ENV_LITERALS = new Set([
+  "SERVICE_DISABLED", // a Google API error reason (services/search-console-fetch.ts)
+]);
+
+/**
+ * Flags fly.toml [env] sets that testmiljo.env deliberately sets otherwise.
+ * Only network / LLM / timer jobs belong here.
+ */
+export const FLAG_FILE_PROD_EXCEPTIONS: Record<string, string> = {
+  RFB_ENRICHMENT_NIGHTLY_ENABLED: "nightly enrichment fetches web pages and calls an LLM",
+  VERIFIER_SCHEDULER_ENABLED: "the verifier fetches producers' websites on a timer",
+  CATALOG_SYNC_SCHEDULER_ENABLED: "the catalog sync fetches web shops on a timer",
+  INDEXNOW_SYNC_ENABLED: "pings IndexNow (search engines) on a timer",
+  RFB_WD_HEADLESS_FALLBACK_ENABLED: "starts a headless browser against websites (child process, outside the outbound guard)",
+  HOMEPAGE_PROVENANCE_HEADLESS_FALLBACK_ENABLED: "starts a headless browser against websites (child process, outside the outbound guard)",
+  RFB_SECOND_LINE_VERIFICATION_ENABLED: "the second-line check calls an LLM",
+  GS_SECOND_LINE_VERIFICATION_ENABLED: "the gårdssalg second-line check calls an LLM",
+};
+
+/**
+ * Every feature-flag name the app code reads: `process.env.X`, `env.X`,
+ * `env["X"]`, and names held in string literals (a name constant such as
+ * `const OWNER_PAUSE_FLAG = "OWNER_PAUSE_ENABLED"`, or a helper call such as
+ * `ownerFlagMode("PRODUCT_IMPORT_ENABLED")`). src/**\/*.ts without tests.
+ */
+export function extractCodeFlags(srcDir: string): Set<string> {
+  const found = new Set<string>();
+  const patterns = [/\benv\.([A-Z][A-Z0-9_]+)\b/g, /\benv\[\s*["'`]([A-Z][A-Z0-9_]+)["'`]\s*\]/g, /["'`]([A-Z][A-Z0-9_]+)["'`]/g];
+  const walk = (dir: string): void => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, entry.name);
+      if (entry.isDirectory()) { if (entry.name !== "node_modules") walk(p); continue; }
+      if (!entry.name.endsWith(".ts") || entry.name.endsWith(".test.ts") || entry.name.endsWith(".d.ts")) continue;
+      const text = fs.readFileSync(p, "utf8");
+      for (const re of patterns) {
+        re.lastIndex = 0;
+        let m: RegExpExecArray | null;
+        while ((m = re.exec(text))) if (FLAG_NAME_RE.test(m[1]) && !NOT_ENV_LITERALS.has(m[1])) found.add(m[1]);
+      }
+      for (const name of FLAG_FILE_EXTRA_FLAGS) if (new RegExp(`\\b${name}\\b`).test(text)) found.add(name);
+    }
+  };
+  walk(srcDir);
+  return found;
+}
+
+/** testmiljo.env as KEY=VALUE (the launcher's rules), plus every key set more than once. */
+export function parseFlagFile(text: string): { values: Record<string, string>; duplicates: string[] } {
+  const values: Record<string, string> = {};
+  const duplicates: string[] = [];
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq <= 0) continue;
+    const key = line.slice(0, eq).trim();
+    if (key in values) duplicates.push(key);
+    values[key] = line.slice(eq + 1).trim();
+  }
+  return { values, duplicates };
+}
+
+/** fly.toml's [env] table: `KEY = 'value'` / `KEY = "value"` lines. */
+export function parseFlyEnv(toml: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  let inEnv = false;
+  for (const raw of toml.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line.startsWith("[")) { inEnv = line === "[env]"; continue; }
+    if (!inEnv || !line || line.startsWith("#")) continue;
+    const m = /^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:'([^']*)'|"([^"]*)")/.exec(line);
+    if (m) out[m[1]] = m[2] ?? m[3] ?? "";
+  }
+  return out;
+}
 
 export async function runTestmiljoTests(opts: { log?: boolean; realFetch?: boolean } = {}): Promise<TestSummary> {
   const log = opts.log ?? false;
@@ -599,6 +697,31 @@ export async function runTestmiljoTests(opts: { log?: boolean; realFetch?: boole
         else process.env.EXPERIENCES_DB_PATH = prevExperiences;
         restoreModuleCache();
       }
+    }
+
+    // ── f: the flag file (testmiljo.env lists every feature flag) ─────
+    {
+      const repoRoot = path.resolve(__dirname, "..", "..");
+      const flagFile = parseFlagFile(fs.readFileSync(path.join(repoRoot, "testmiljo.env"), "utf8"));
+      const codeFlags = extractCodeFlags(path.join(repoRoot, "src"));
+      const fly = parseFlyEnv(fs.readFileSync(path.join(repoRoot, "fly.toml"), "utf8"));
+
+      assertEq(flagFile.duplicates, [], "f1 testmiljo.env sets each key once");
+      assertTrue(
+        codeFlags.size > 150 &&
+          ["OWNER_DASHBOARD_ENABLED", "OWNER_PAUSE_ENABLED", "RFB_DISABLE_AUTO_PRUNE", "ENABLE_DENTAL", "OWNER_FEATURES_ALLOWED_SUBJECTS", "PAYMENTS_ALLOWED_AGENT_IDS", "OWNER_FEATURE_TIERS"]
+            .every((f) => codeFlags.has(f)) &&
+          !codeFlags.has("SERVICE_DISABLED") && !codeFlags.has("TESTMILJO"),
+        `f2 the extraction finds flags read directly, through a name constant and through a helper (found ${codeFlags.size})`,
+      );
+      assertEq([...codeFlags].filter((f) => !(f in flagFile.values)).sort(), [],
+        "f3 every feature flag the app code reads is a key in testmiljo.env (a PR adding a flag adds it there)");
+      const mismatches = Object.entries(fly)
+        .filter(([k, v]) => codeFlags.has(k) && !(k in FLAG_FILE_PROD_EXCEPTIONS) && flagFile.values[k] !== v)
+        .map(([k, v]) => `${k}: fly.toml '${v}', testmiljo.env '${flagFile.values[k] ?? "(missing)"}'`);
+      assertEq(mismatches, [], "f4 every flag fly.toml [env] sets has the same value in testmiljo.env, unless it is a listed exception");
+      const staleExceptions = Object.keys(FLAG_FILE_PROD_EXCEPTIONS).filter((k) => !(k in fly) || flagFile.values[k] === fly[k]);
+      assertEq(staleExceptions, [], "f5 every exception is a flag fly.toml [env] sets and testmiljo.env really sets otherwise");
     }
   } catch (err: any) {
     failed++;
