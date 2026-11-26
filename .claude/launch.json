@@ -1,0 +1,14 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "testmiljo",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "testmiljo"
+      ],
+      "port": 3100
+    }
+  ]
+}

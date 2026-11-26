@@ -4,8 +4,9 @@
  *   npm run testmiljo             seeds .testmiljo/ if a database is missing,
  *                                 then starts the app (tsx src/index.ts) with
  *                                 the settings in testmiljo.env (port 3100).
- *   npm run testmiljo:nullstill   deletes the .testmiljo/ databases and
- *                                 seeds them again (does not start the app).
+ *   npm run testmiljo:nullstill   deletes the .testmiljo/ databases and the
+ *                                 captured e-mail, and seeds the databases
+ *                                 again (does not start the app).
  *
  * Refuses to run when NODE_ENV=production or FLY_APP_NAME / FLY_MACHINE_ID is
  * set, and when a database path in testmiljo.env is outside .testmiljo/.
@@ -63,6 +64,19 @@ function tsxCli(): string {
   return path.join(path.dirname(pkgPath), bin);
 }
 
+/**
+ * The e-mail outbox (src/testmiljo/outbox.ts) is a file beside the main
+ * database. A reset that left it behind would show e-mail about data that no
+ * longer exists.
+ */
+export function outboxFileBeside(dbPath: string): string {
+  return path.join(path.dirname(dbPath), "outbox.jsonl");
+}
+
+export function removeOutbox(dbPath: string): void {
+  fs.rmSync(assertInsideTestmiljo(outboxFileBeside(dbPath)), { force: true });
+}
+
 function dbFiles(env: NodeJS.ProcessEnv): string[] {
   return [env.DB_PATH!, env.DENTAL_DB_PATH!, env.EXPERIENCES_DB_PATH!];
 }
@@ -94,6 +108,7 @@ function main(): void {
     // The seed deletes and rebuilds each file itself (inside .testmiljo/ only).
     console.log("[testmiljo] nullstiller: sletter og bygger testdatabasene på nytt");
     runSeed(env);
+    removeOutbox(env.DB_PATH!);
     return;
   }
 

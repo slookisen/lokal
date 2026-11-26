@@ -1,4 +1,20 @@
-import rateLimit, { ipKeyGenerator } from "express-rate-limit";
+import baseRateLimit, { ipKeyGenerator, type Options as RateLimitOptions } from "express-rate-limit";
+import { isTestmiljo } from "../testmiljo/guard";
+
+// Testmiljø (src/testmiljo): every local request comes from 127.0.0.1, so a tester
+// would hit the per-IP ceilings (10 owner logins an hour) within minutes. The
+// limiters below are skipped there unless TESTMILJO_RATE_LIMITS=on. isTestmiljo()
+// is false in production, so nothing changes there.
+function testmiljoSkipsRateLimits(): boolean {
+  return isTestmiljo() && process.env.TESTMILJO_RATE_LIMITS !== "on";
+}
+function rateLimit(options: Partial<RateLimitOptions>): ReturnType<typeof baseRateLimit> {
+  const ownSkip = options.skip;
+  return baseRateLimit({
+    ...options,
+    skip: (req, res) => testmiljoSkipsRateLimits() || (ownSkip ? ownSkip(req, res) : false),
+  });
+}
 import helmet from "helmet";
 import { Request, Response, NextFunction } from "express";
 

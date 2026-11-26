@@ -1,4 +1,10 @@
+// Testmiljø boot check. MUST stay the first import: it refuses to start when
+// TESTMILJO is set in production, before any other module reads the environment.
+import "./testmiljo/boot";
 import express from "express";
+import { isTestmiljo } from "./testmiljo/guard";
+import { testmiljoHostMiddleware } from "./testmiljo/hosts";
+import { mountTestmiljo } from "./testmiljo/router";
 import cors from "cors";
 import path from "path";
 import { getDb, closeDb } from "./database/init";
@@ -284,6 +290,10 @@ installClientIp(app, resolveClientIpConfig(process.env));
 // the host gates, the vertical resolution and analytics read req.hostname /
 // req.protocol. CLIENT_HEADERS_NORMALIZE=off is the rollback; off Fly = no-op.
 installClientHeaders(app, resolveClientHeadersConfig(process.env));
+// Testmiljø only (src/testmiljo/hosts.ts): rettfrabonden.localhost, opplevagent.localhost and
+// finn-tannlege.localhost reach the three sites; production URLs in pages and redirects
+// are pointed back at those names. Not mounted outside the test environment.
+if (isTestmiljo()) app.use(testmiljoHostMiddleware());
 
 // ─── Event-loop stall monitor (dev-request 2026-09-19-prod-event-loop-stall-
 // mcp-unhealthy) ────────────────────────────────────────────────
@@ -440,6 +450,13 @@ app.use("/", ownerPreviewRoutes);
 // Stripe signature (STRIPE_CONNECT_WEBHOOK_SECRET; unset → 503). Mounts
 // nothing unless PAYMENTS_ENABLED=1 (routes/payments.ts).
 mountPaymentWebhook(app);
+
+// ─── Testmiljø pages (dev-request 2026-11-25-testmiljo-lokal-kopi-med-testdata-
+// foer-prodsetting) ─────────────────────────────────────────────────────────
+// /testmiljo: log in as a seeded owner without the e-mail, and read the e-mail
+// the app would have sent. Ahead of the host gates so it answers on all three
+// local host names. Mounts nothing unless isTestmiljo() (src/testmiljo/guard.ts).
+mountTestmiljo(app);
 
 // ─── Gårdssalg owner-claim host gate (dev-request 2026-10-17-
 // integrasjonstest-oppfolging, I-U) ───────────────────────────────────────
