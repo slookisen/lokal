@@ -302,6 +302,53 @@ export async function runTestmiljoTests(opts: { log?: boolean } = {}): Promise<T
       check(throws(() => seed.assertInsideTestmiljo(path.join(linkDir, "wal.db"))), "tm-g8: guard refuses a DB whose -wal sidecar is a symlink");
       const linked = await runSeed(["--dir", linkDir, "--rfb", path.join(linkDir, "lenke.db")], {});
       check(linked.code !== 0 && fs.readFileSync(realTarget, "utf8") === "", "tm-g9: the seed refuses a symlinked target and leaves the link target untouched", `exit ${linked.code}`);
+
+      // N8: a name that is .testmiljo but resolves to a real directory with another name.
+      const plainRoot = fs.mkdtempSync(path.join(os.tmpdir(), "testmiljo-vanlig-"));
+      extraRoots.push(plainRoot);
+      const plainReal = path.join(plainRoot, "data");
+      fs.mkdirSync(plainReal);
+      check(throws(() => seed.assertTestmiljoDir(plainReal), /ikke en godkjent/), "tm-g15a: guard refuses a real directory not named .testmiljo");
+      const aliasRoot = fs.mkdtempSync(path.join(os.tmpdir(), "testmiljo-alias-"));
+      extraRoots.push(aliasRoot);
+      const alias = path.join(aliasRoot, ".testmiljo");
+      fs.symlinkSync(plainReal, alias, "dir");
+      check(throws(() => seed.assertTestmiljoDir(alias), /ikke en godkjent/), "tm-g15: guard refuses a .testmiljo whose real directory has another basename");
+
+      // N9: the .testmiljo directory itself is a symlink (to another accepted .testmiljo/).
+      const linkTarget = extraTestmiljo("testmiljo-maal-");
+      const linkRoot = fs.mkdtempSync(path.join(os.tmpdir(), "testmiljo-lenket-mappe-"));
+      extraRoots.push(linkRoot);
+      const linkedDir = path.join(linkRoot, ".testmiljo");
+      fs.symlinkSync(linkTarget, linkedDir, "dir");
+      check(throws(() => seed.assertInsideTestmiljo(path.join(linkedDir, "lokal.db")), /symbolsk lenke/), "tm-g12: guard refuses a .testmiljo/ directory that is a symlink");
+      const linkedSeed = await runSeed(["--dir", linkedDir], {});
+      check(
+        linkedSeed.code !== 0 && /symbolsk lenke/.test(linkedSeed.stderr) && fs.readdirSync(linkTarget).length === 0,
+        "tm-g13: the seed refuses a symlinked .testmiljo/ and writes nothing through it",
+        `exit ${linkedSeed.code}`,
+      );
+      // The repo's own <repo>/.testmiljo as a symlink — only when it does not exist yet.
+      let repoLinked = false;
+      try {
+        fs.lstatSync(seed.DEFAULT_DIR);
+      } catch {
+        try {
+          fs.symlinkSync(linkTarget, seed.DEFAULT_DIR, "dir");
+          repoLinked = true;
+        } catch {
+          // cannot create it here
+        }
+      }
+      if (repoLinked) {
+        try {
+          check(throws(() => seed.assertInsideTestmiljo(path.join(seed.DEFAULT_DIR, "lokal.db")), /symbolsk lenke/), "tm-g14: guard refuses <repo>/.testmiljo when it is a symlink");
+        } finally {
+          fs.unlinkSync(seed.DEFAULT_DIR);
+        }
+      } else if (log) {
+        console.log("  skip tm-g14: <repo>/.testmiljo already exists");
+      }
     } else if (log) {
       console.log("  skip tm-g6..g9: symlinks cannot be created here (Windows without privilege?)");
     }
@@ -394,6 +441,17 @@ export async function runTestmiljoTests(opts: { log?: boolean } = {}): Promise<T
     // Invalid names, missing / incomplete snapshots, symlinks, production.
     const badNames = ["../x", "..", "a/b", "a\\b", "a.b", "A", "", "-a", "a b", "x".repeat(41)];
     check(badNames.every((n) => throws(() => snap.saveSnapshot(dir, n, dbPaths)) && throws(() => snap.restoreSnapshot(dir, n, dbPaths))), "tm-s14: invalid snapshot names are refused by lagre and hent");
+    const reserved = ["con", "prn", "aux", "nul", ...[1, 2, 3, 4, 5, 6, 7, 8, 9].flatMap((n) => [`com${n}`, `lpt${n}`])];
+    check(
+      reserved.every(
+        (n) =>
+          throws(() => snap.validateSnapshotName(n), /reservert i Windows/) &&
+          throws(() => snap.saveSnapshot(dir, n, dbPaths), /reservert i Windows/) &&
+          throws(() => snap.restoreSnapshot(dir, n, dbPaths), /reservert i Windows/),
+      ),
+      "tm-s29: Windows reserved device names are refused by lagre and hent",
+    );
+    check(["com10", "lpt0", "con1", "konsoll", "nul-x"].every((n) => !throws(() => snap.validateSnapshotName(n))), "tm-s30: names that only resemble reserved ones are accepted");
     check(fs.readdirSync(path.join(dir, "oyeblikk")).sort().join(",") === "med-outbox,rundtur,under-kjoring,wal-stoppet", "tm-s15: refused names create nothing", fs.readdirSync(path.join(dir, "oyeblikk")).join(","));
     check(throws(() => snap.restoreSnapshot(dir, "finnes-ikke", dbPaths), /finnes ikke/), "tm-s16: hent refuses a missing snapshot");
     fs.rmSync(path.join(dir, "oyeblikk", "under-kjoring", "dental.db"));
@@ -426,6 +484,21 @@ export async function runTestmiljoTests(opts: { log?: boolean } = {}): Promise<T
         "tm-s24: hent refuses a symlinked outbox.jsonl before touching any database",
       );
       fs.rmSync(outbox, { force: true });
+
+      // N7: a file inside a snapshot that is a symlink → refused as a link (not only «ufullstendig»).
+      const snapFile = path.join(dir, "oyeblikk", "rundtur", "rfb.db");
+      const moved = path.join(tmpRoot, "rundtur-rfb.db");
+      fs.renameSync(snapFile, moved);
+      fs.symlinkSync(moved, snapFile);
+      const nameBeforeLink = agentName();
+      check(
+        throws(() => snap.readSnapshot(dir, "rundtur"), /symbolsk lenke/) &&
+          throws(() => snap.restoreSnapshot(dir, "rundtur", dbPaths), /symbolsk lenke/) &&
+          agentName() === nameBeforeLink,
+        "tm-s31: readSnapshot/hent refuse a snapshot whose file is a symlink",
+      );
+      fs.unlinkSync(snapFile);
+      fs.renameSync(moved, snapFile);
     }
     const prodEnv = { NODE_ENV: "production" } as NodeJS.ProcessEnv;
     check(

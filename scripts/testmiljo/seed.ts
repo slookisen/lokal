@@ -122,8 +122,8 @@ export function assertTestmiljoDir(dir: string): string {
 
 /**
  * Throws unless `p` is a file directly inside an allowed `.testmiljo`
- * directory (see assertTestmiljoDir), and neither it nor its SQLite sidecar
- * files exist as symlinks.
+ * directory (see assertTestmiljoDir) that is not itself a symlink, and
+ * neither it nor its SQLite sidecar files exist as symlinks.
  */
 export function assertInsideTestmiljo(p: string): string {
   if (!p || p === ":memory:") throw new Error(`Ugyldig databasesti: «${p}»`);
@@ -133,6 +133,8 @@ export function assertInsideTestmiljo(p: string): string {
   } catch {
     throw new Error(`Databasestien ${resolved} ligger utenfor en ${TESTMILJO_DIR_NAME}/-mappe — avbryter.`);
   }
+  // Same rule as snapshot.ts: the .testmiljo directory itself may not be a link.
+  assertNotSymlink(path.dirname(resolved));
   assertNotSymlink(resolved);
   for (const suffix of DB_SIDECARS) assertNotSymlink(resolved + suffix);
   return resolved;

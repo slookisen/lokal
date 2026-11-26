@@ -39,6 +39,8 @@ export const SNAPSHOT_DIR_NAME = "oyeblikk";
 export const OUTBOX_FILE = "outbox.jsonl";
 export const META_FILE = "meta.json";
 const NAME_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
+/** Windows device names: a folder with one of these names cannot be created or opened there. */
+const RESERVED_RE = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/;
 const DB_KEYS: Array<keyof SeedPaths> = ["rfb", "dental", "experiences"];
 
 export interface SnapshotMeta {
@@ -54,6 +56,11 @@ export function validateSnapshotName(name: string): string {
   if (typeof name !== "string" || !NAME_RE.test(name)) {
     throw new Error(
       `Ugyldig navn på øyeblikk: «${name}». Bruk små bokstaver a–z, tall og bindestrek (maks 40 tegn, ikke bindestrek først).`,
+    );
+  }
+  if (RESERVED_RE.test(name)) {
+    throw new Error(
+      `Ugyldig navn på øyeblikk: «${name}». Navnet er reservert i Windows (con, prn, aux, nul, com1–com9, lpt1–lpt9) — velg et annet navn.`,
     );
   }
   return name;
@@ -91,7 +98,7 @@ export function listSnapshots(testmiljoDir: string): string[] {
   if (!fs.existsSync(root)) return [];
   return fs
     .readdirSync(root, { withFileTypes: true })
-    .filter((e) => e.isDirectory() && NAME_RE.test(e.name))
+    .filter((e) => e.isDirectory() && NAME_RE.test(e.name) && !RESERVED_RE.test(e.name))
     .map((e) => e.name)
     .sort();
 }
