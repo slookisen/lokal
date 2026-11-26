@@ -1682,7 +1682,10 @@ const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
 // Bind to 0.0.0.0 — required for Docker/Fly.io (localhost won't work in containers)
 const HOST = process.env.HOST || "0.0.0.0";
-app.listen(Number(PORT), HOST, async () => {
+app.listen(Number(PORT), HOST, async (listenErr?: Error) => {
+  // Express 5 hands a listen failure (EADDRINUSE/EACCES) to this callback; do not run the banner or startup work then.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  if ((require("./listen-error") as typeof import("./listen-error")).handleListenError(listenErr, HOST, PORT)) return;
   console.log(`\n🥬 Lokal API v0.11.0 running at ${BASE_URL}`);
   console.log(`   💾 Database: SQLite (persistent)`);
   console.log(`   🔒 Security: Helmet + Rate limiting + Input sanitization`);
