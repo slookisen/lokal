@@ -13129,6 +13129,12 @@ router.post("/admin/gardssalg-set-content-field", requireAdmin, (req: Request, r
       res.status(400).json({ error: "value_required" });
       return;
     }
+    if (result.reason === "owner_request_invalid") {
+      // Unreachable over HTTP: this route never passes an owner context (the
+      // owner's own CS change request is in-process only, cs-owner-request.ts).
+      res.status(409).json({ error: "owner_locked" });
+      return;
+    }
     // defect_type is surfaced so the caller can act on it (regenerate a
     // longer about_text vs. strip UI chrome are different fixes) rather than
     // guessing why a value was refused.

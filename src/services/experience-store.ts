@@ -27,6 +27,8 @@ import { gardssalgVisibleSql, type GardssalgSurface } from "./gardssalg-visibili
 // second phone-shape check for this vertical — see applyGardssalgSetContactPhone
 // below for why.
 import { validatePhoneForWrite } from "./contact-normalizer";
+import { verifyOwnerRequest, type OwnerRequestContext } from "./cs-owner-request";
+import { isPlausibleNorwayCoord } from "./geo-distance";
 // dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep 5b:
 // the shared LLM-judge + deterministic-backstop gate (mirrors lokal#655's
 // marketplace.ts pattern) that now stands in front of every contact-field
@@ -6826,7 +6828,8 @@ export type GardssalgSetContentFieldResult =
   | { ok: false; reason: "provider_not_found" }
   | { ok: false; reason: "owner_locked" }
   | { ok: false; reason: "value_required" }
-  | { ok: false; reason: "defective_value"; defect_type: GardssalgDefectType | null };
+  | { ok: false; reason: "defective_value"; defect_type: GardssalgDefectType | null }
+  | { ok: false; reason: "owner_request_invalid"; detail: string };
 
 /**
  * Write ONE gårdssalg CONTENT field (about_text / visit_text /
@@ -6901,7 +6904,8 @@ export function applyGardssalgSetContentField(
   providerId: string,
   field: GardssalgQualityFieldName,
   value: string,
-  source: string
+  source: string,
+  opts: { ownerRequest?: OwnerRequestContext } = {}
 ): GardssalgSetContentFieldResult {
   const db = getDb(VERTICAL);
   // All three content columns listed EXPLICITLY — `field` never reaches SQL
@@ -6924,8 +6928,14 @@ export function applyGardssalgSetContentField(
     | undefined;
   if (!row) return { ok: false, reason: "provider_not_found" };
 
-  // Gate 1 — owner lock, on the FRESH row (see doc comment).
-  if (isGardssalgFieldOwnerLocked(row, field)) return { ok: false, reason: "owner_locked" };
+  // Gate 1 — owner lock, on the FRESH row (see doc comment). The owner's own
+  // CS change request (cs-owner-request.ts, never an HTTP parameter) passes
+  // it only after the request row itself is verified; gates 2-3 still apply.
+  if (opts.ownerRequest) {
+    const check = verifyOwnerRequest(opts.ownerRequest, providerId, { field, value });
+    if (!check.ok) return { ok: false, reason: "owner_request_invalid", detail: check.reason };
+    source = check.source;
+  } else if (isGardssalgFieldOwnerLocked(row, field)) return { ok: false, reason: "owner_locked" };
 
   const trimmed = value.trim();
   // Gate 2 — non-blank. MUST run before the classifier: classifyGardssalgFieldDefect
@@ -7411,11 +7421,155 @@ export function applyGardssalgSetAddress(
   return { ok: true, old_value: oldValue, new_value: trimmed };
 }
 
+export type GardssalgSetAddressUnitResult =
+  | {
+      ok: true;
+      old: { adresse: string | null; postnummer: string | null; poststed: string | null; lat: number | null; lon: number | null };
+      new: { adresse: string; postnummer: string; poststed: string; lat: number; lon: number };
+      source: string;
+    }
+  | { ok: false; reason: "provider_not_found" }
+  | { ok: false; reason: "owner_locked"; field: string }
+  | { ok: false; reason: "value_required" }
+  | { ok: false; reason: "invalid_postnummer" }
+  | { ok: false; reason: "implausible_coordinate" }
+  | { ok: false; reason: "defective_value"; defect_type: GardssalgDefectType | null }
+  | { ok: false; reason: "owner_request_invalid"; detail: string };
+
+/**
+ * dev-request 2026-11-26-cs-endring-som-eier-opplevagent, §2: write a
+ * gårdssalg provider's address as ONE unit — `adresse` (street line),
+ * `postnummer`, `poststed` and the map point `lat`/`lon` — in one
+ * transaction, or nothing at all. Used by the CS change-request executor
+ * (cs-change-requests.ts), which parses the owner's «Gate 1, 0164 Sted»
+ * (opplevagent-address-unit.ts) and geocodes it with the same Kartverket
+ * lookup the geocode worker uses BEFORE calling this. Not an HTTP route:
+ * POST /admin/gardssalg-set-address (applyGardssalgSetAddress above) is
+ * unchanged.
+ *
+ * Gates, all before any write (a refusal leaves no column change and no
+ * audit row):
+ *   1. Owner lock on each of adresse/postnummer/poststed
+ *      (isGardssalgFieldOwnerLocked, fresh row) — unless `opts.ownerRequest`
+ *      is given AND verifyOwnerRequest() confirms it against the
+ *      cs_change_requests row (cs-owner-request.ts). An unverifiable owner
+ *      context is refused outright, never downgraded to a normal write.
+ *   2. Non-blank street, postnummer and poststed; postnummer is 4 digits.
+ *   3. classifyGardssalgAddressDefect on the street line (same as
+ *      applyGardssalgSetAddress).
+ *   4. A plausible Norwegian coordinate (isPlausibleNorwayCoord) — a failed
+ *      or nonsensical geocode never lands half an address.
+ *
+ * Writes: the five columns + geocode_source='kartverket' and
+ * geocode_confidence; field_provenance.{adresse,postnummer,poststed} (read-
+ * modify-write, other keys kept); one gardssalg_content_audit row per
+ * address column (adresse/postnummer/poststed are all in
+ * GARDSSALG_ROLLBACKABLE_FIELDS). The old values of all five columns are
+ * returned so the caller keeps them in its own snapshot for rollback.
+ */
+export function applyGardssalgSetAddressUnit(
+  providerId: string,
+  unit: { street: string; postnummer: string; poststed: string; lat: number; lon: number; confidence?: string | null },
+  source: string,
+  opts: { ownerRequest?: OwnerRequestContext } = {}
+): GardssalgSetAddressUnitResult {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(`SELECT id, adresse, postnummer, poststed, lat, lon, content_source, field_provenance FROM experience_providers WHERE id = ?`)
+    .get(providerId) as
+    | {
+        id: string;
+        adresse: string | null;
+        postnummer: string | null;
+        poststed: string | null;
+        lat: number | null;
+        lon: number | null;
+        content_source: string | null;
+        field_provenance: string | null;
+      }
+    | undefined;
+  if (!row) return { ok: false, reason: "provider_not_found" };
+
+  const street = (unit.street ?? "").trim();
+  const postnummer = (unit.postnummer ?? "").trim();
+  const poststed = (unit.poststed ?? "").trim();
+
+  // Gate 1 — owner lock (or the verified owner's own request).
+  if (opts.ownerRequest) {
+    const check = verifyOwnerRequest(opts.ownerRequest, providerId, { field: "address", unit: { street, postnummer, poststed } });
+    if (!check.ok) return { ok: false, reason: "owner_request_invalid", detail: check.reason };
+    source = check.source;
+  } else {
+    for (const col of ["adresse", "postnummer", "poststed"]) {
+      if (isGardssalgFieldOwnerLocked(row, col)) return { ok: false, reason: "owner_locked", field: col };
+    }
+  }
+  // Gate 2 — all three parts present.
+  if (!street || !postnummer || !poststed) return { ok: false, reason: "value_required" };
+  if (!/^\d{4}$/.test(postnummer)) return { ok: false, reason: "invalid_postnummer" };
+  // Gate 3 — objective defect on the street line.
+  const defect = classifyGardssalgAddressDefect(street);
+  if (defect.defective) return { ok: false, reason: "defective_value", defect_type: defect.type };
+  // Gate 4 — a real Norwegian map point, or nothing.
+  if (!isPlausibleNorwayCoord(unit.lat, unit.lon)) return { ok: false, reason: "implausible_coordinate" };
+
+  let provenance: Record<string, unknown> = {};
+  if (row.field_provenance) {
+    try {
+      const parsed = JSON.parse(row.field_provenance);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) provenance = parsed as Record<string, unknown>;
+    } catch {
+      /* malformed existing JSON -> treat as empty rather than clobber the write */
+    }
+  }
+  const at = new Date().toISOString();
+  for (const col of ["adresse", "postnummer", "poststed"]) provenance[col] = { source_url: source, fetched_at: at };
+
+  const audit = db.prepare(
+    `INSERT INTO gardssalg_content_audit
+       (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+     VALUES (@id, @provider_id, @field_name, @old_value, @new_value, @source_url, NULL, 'admin', datetime('now'))`
+  );
+  db.transaction(() => {
+    db.prepare(
+      `UPDATE experience_providers
+          SET adresse = @adresse, postnummer = @postnummer, poststed = @poststed,
+              lat = @lat, lon = @lon, geocode_source = 'kartverket', geocode_confidence = @confidence,
+              field_provenance = @field_provenance
+        WHERE id = @id`
+    ).run({
+      id: providerId,
+      adresse: street,
+      postnummer,
+      poststed,
+      lat: unit.lat,
+      lon: unit.lon,
+      confidence: unit.confidence ?? "high",
+      field_provenance: JSON.stringify(provenance),
+    });
+    for (const [col, oldV, newV] of [
+      ["adresse", row.adresse, street],
+      ["postnummer", row.postnummer, postnummer],
+      ["poststed", row.poststed, poststed],
+    ] as const) {
+      audit.run({ id: uuid(), provider_id: providerId, field_name: col, old_value: oldV, new_value: newV, source_url: source });
+    }
+  })();
+
+  return {
+    ok: true,
+    old: { adresse: row.adresse, postnummer: row.postnummer, poststed: row.poststed, lat: row.lat, lon: row.lon },
+    new: { adresse: street, postnummer, poststed, lat: unit.lat, lon: unit.lon },
+    source,
+  };
+}
+
 export type GardssalgSetProviderNameResult =
   | { ok: true; old_value: string | null; new_value: string }
   | { ok: false; reason: "provider_not_found" }
   | { ok: false; reason: "owner_locked" }
-  | { ok: false; reason: "value_required" };
+  | { ok: false; reason: "value_required" }
+  | { ok: false; reason: "owner_request_invalid"; detail: string };
 
 /**
  * Write a gårdssalg provider's display name (`navn` — drives h1/page-title/
@@ -7460,7 +7614,8 @@ export type GardssalgSetProviderNameResult =
 export function applyGardssalgSetProviderName(
   providerId: string,
   value: string,
-  source: string
+  source: string,
+  opts: { ownerRequest?: OwnerRequestContext } = {}
 ): GardssalgSetProviderNameResult {
   const db = getDb(VERTICAL);
   const row = db
@@ -7470,8 +7625,14 @@ export function applyGardssalgSetProviderName(
     | undefined;
   if (!row) return { ok: false, reason: "provider_not_found" };
 
-  // Gate 1 — owner lock, on the FRESH row (see doc comment above).
-  if (isGardssalgFieldOwnerLocked(row, "navn")) return { ok: false, reason: "owner_locked" };
+  // Gate 1 — owner lock, on the FRESH row (see doc comment above). The
+  // owner's own CS change request (cs-owner-request.ts, never an HTTP
+  // parameter) passes it only after the request row itself is verified.
+  if (opts.ownerRequest) {
+    const check = verifyOwnerRequest(opts.ownerRequest, providerId, { field: "name", value });
+    if (!check.ok) return { ok: false, reason: "owner_request_invalid", detail: check.reason };
+    source = check.source;
+  } else if (isGardssalgFieldOwnerLocked(row, "navn")) return { ok: false, reason: "owner_locked" };
 
   const trimmed = value.trim();
   // Gate 2 — non-blank.
@@ -10953,6 +11114,25 @@ export function isGardssalgFieldOwnerLocked(
     return false;
   }
   return false;
+}
+
+/**
+ * Why isGardssalgFieldOwnerLocked() says this field is locked, in words the
+ * CS dry run can show (dev-request 2026-11-26-cs-endring-som-eier-
+ * opplevagent, §3), or null when it is not locked. The boolean always comes
+ * from isGardssalgFieldOwnerLocked itself, so the two can never disagree.
+ */
+export function gardssalgOwnerLockReason(
+  providerRow: { content_source: string | null; field_provenance?: string | null },
+  fieldName: string
+): string | null {
+  if (!isGardssalgFieldOwnerLocked(providerRow, fieldName)) return null;
+  if (GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS.has(fieldName) && gardssalgFieldHasOwnerLock(providerRow, fieldName)) {
+    return `owner_locks.${fieldName}`;
+  }
+  if (providerRow.content_source === "manual") return "content_source=manual";
+  if (providerRow.content_source === "claim") return "eier-overtatt profil (content_source=claim)";
+  return "owner_locked";
 }
 
 const GARDSSALG_LOCK_CHANGED_BY = "admin";
