@@ -22,7 +22,7 @@
  *   2. Wired into the gate: tests/test.ts calls runTestmiljoTests().
  */
 
-import { spawn } from "child_process";
+import { spawn, spawnSync } from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -36,6 +36,7 @@ export interface TestSummary {
 
 const REPO_ROOT = path.resolve(__dirname, "..");
 const SEED = path.join(REPO_ROOT, "scripts", "testmiljo", "seed.ts");
+const CHILD_TIMEOUT_MS = 120_000;
 const SNAPSHOT = path.join(REPO_ROOT, "scripts", "testmiljo", "snapshot.ts");
 
 function tsxCli(): string {
@@ -75,8 +76,16 @@ function runScript(script: string, args: string[], envOver: Record<string, strin
     let stderr = "";
     child.stdout.on("data", (d) => (stdout += d));
     child.stderr.on("data", (d) => (stderr += d));
-    child.on("close", (code) => resolve({ code, stdout, stderr }));
-    child.on("error", (err) => resolve({ code: -1, stdout, stderr: stderr + String(err) }));
+    // N6 (review of #1673): a hung child must not hang all of `npm test` silently.
+    const timer = setTimeout(() => {
+      try {
+        if (process.platform === "win32" && child.pid) spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+        else child.kill("SIGKILL");
+      } catch { /* already gone */ }
+      resolve({ code: -1, stdout, stderr: stderr + `\n${path.basename(script)} timed out after ${CHILD_TIMEOUT_MS / 1000} s and was killed` });
+    }, CHILD_TIMEOUT_MS);
+    child.on("close", (code) => { clearTimeout(timer); resolve({ code, stdout, stderr }); });
+    child.on("error", (err) => { clearTimeout(timer); resolve({ code: -1, stdout, stderr: stderr + String(err) }); });
   });
 }
 
@@ -265,8 +274,20 @@ export async function runTestmiljoTests(opts: { log?: boolean } = {}): Promise<T
     check(!n3.GSC_SERVICE_ACCOUNT_JSON && !n3.SENTRY_DSN && !n3.RENDER_WORKER_URL && !n3.LOKAL_API_URL, "tm-l6: launcher drops GSC_SERVICE_ACCOUNT_JSON, SENTRY_DSN, RENDER_WORKER_URL, LOKAL_API_URL");
     check(!n3.FOO_BAR_URL && !n3.NODE_OPTIONS, "tm-l7: launcher drops an unknown variable (FOO_BAR_URL) and NODE_OPTIONS");
     check(n3.PATH === "/usr/bin" && n3.Path === "C:\\Windows" && n3.SystemRoot === "C:\\Windows" && n3.LC_ALL === "C.UTF-8" && n3.CI === "true", "tm-l8: launcher passes PATH, Path, SystemRoot, LC_*, CI");
-    check(n3.FROM_FILE === "yes" && n3.NODE_ENV === fileEnv.NODE_ENV, "tm-l9: testmiljo.env values still reach the app and win over inherited ones");
-    check(!launch.isInheritedName("API_KEY") && launch.isInheritedName("LC_CTYPE"), "tm-l10: a credential-looking name is never inherited");
+    check(n3.FROM_FILE === "yes" && n3.NODE_ENV === fileEnv.NODE_ENV, "tm-l9a: testmiljo.env values reach the app and NODE_ENV is not inherited");
+    // N5 (review of #1673): an INHERITED name (TZ) set in both parent and file — the file value must win.
+    const order = launch.buildAppEnv({ PATH: "/usr/bin", TZ: "America/New_York" }, { ...fileEnv, TZ: "Europe/Oslo" });
+    check(order.TZ === "Europe/Oslo", "tm-l9: testmiljo.env wins over an inherited value (TZ in both parent and file)");
+    check(launch.buildAppEnv({ TZ: "America/New_York" }, fileEnv).TZ === "America/New_York", "tm-l9b: without a file value the inherited TZ is passed through");
+    // N1/N4 (review of #1673): names that DO match the allowlist but look like credentials are still dropped.
+    check(
+      !launch.isInheritedName("LC_SECRET") && !launch.isInheritedName("LC_API_KEY") && !launch.isInheritedName("TSX_TOKEN") && launch.isInheritedName("LC_CTYPE"),
+      "tm-l10: an allowlist-matching but credential-looking name (LC_SECRET, LC_API_KEY, TSX_TOKEN) is never inherited; LC_CTYPE is",
+    );
+    check(
+      !launch.isInheritedName("TSX_FOO") && !launch.isInheritedName("TSX_NODE_OPTIONS") && launch.isInheritedName("TSX_TSCONFIG_PATH"),
+      "tm-l11: TSX_* is no open prefix: arbitrary TSX_ names are dropped, the concrete TSX_TSCONFIG_PATH is passed",
+    );
 
     // Path guard (N1): only <repo>/.testmiljo or a .testmiljo under the OS temp dir.
     /* eslint-disable @typescript-eslint/no-var-requires */
