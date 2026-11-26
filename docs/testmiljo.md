@@ -54,6 +54,29 @@ Tjeneren får ikke koble til noe utenfor maskinen. Forsøk vises nederst på
 vareopphenting mot, legger du verten i `TESTMILJO_ALLOW_OUTBOUND` i
 `testmiljo.env`. Sperren gjelder hovedprosessen, ikke arbeidertråder.
 
+## Funksjonsflagg (flaggfilen)
+
+Alle funksjonsflagg for testmiljøet settes i én fil: `testmiljo.env` i roten
+av repoet. Prod leser den aldri, og testmiljøet leser ikke prod.
+
+- **Regelen:** hvert flagg har verdien det har i prod. Unntaket er
+  bakgrunnsjobber som går mot nettet, kaller en språkmodell, sender e-post
+  eller skriver om data på timer. De er av her selv om de er på i prod, og hver
+  slik linje er merket `# prod: … — off here because …`.
+- **Prod-verdien** er bare kjent for flagg som står i `fly.toml` under `[env]`.
+  Flagg som ikke står der, er enten ikke satt i prod eller satt som en
+  Fly-hemmelighet, som repoet ikke ser. De har kodens standardverdi, skrevet ut.
+- **«UNDER TEST»-blokken** nederst slår på det som prøves ut. Nå er det
+  eierdashbordene for de oppdiktede eierne: Rett fra Bonden-eierportalen og
+  gårdssalg-dashbordet med adresseskjemaet, med
+  `OWNER_FEATURES_ALLOWED_SUBJECTS` satt til eiernes faste id-er fra seedingen.
+  Du trenger ikke sette noe selv for å se dem.
+- **Nytt flagg:** `npm test` feiler hvis koden leser et flagg som ikke står i
+  `testmiljo.env`, eller hvis et flagg fra `fly.toml [env]` har en annen verdi
+  der uten å stå på unntakslisten i testen (`FLAG_FILE_PROD_EXCEPTIONS` i
+  `src/testmiljo/testmiljo.test.ts`, med en grunn). En PR som legger til et
+  flagg, legger det også inn i `testmiljo.env`.
+
 ## Hva som ligger i testdataene
 
 Alle e-postadresser er på `.invalid`-domener, alle navn er oppdiktet

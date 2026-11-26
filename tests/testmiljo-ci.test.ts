@@ -21,12 +21,13 @@
  * (a new NOT NULL column, a renamed column, a page that throws on seeded
  * data) turns this red.
  *
- * The owner dashboards are behind flags that testmiljo.env does not set
- * (OWNER_DASHBOARD_ENABLED, OWNER_ORDERABILITY_PORTAL_ENABLED,
- * OA_OWNER_FEATURES_ENABLED, GARDSSALG_OWNER_DASHBOARD_ENABLED,
- * GARDSSALG_OWNER_ADDRESS_EDIT_ENABLED and the
- * OWNER_FEATURES_ALLOWED_SUBJECTS allowlist). This test sets them in the
- * child's env only, with the seeded owners' ids read from the seeded files.
+ * The owner dashboards are behind flags (OWNER_DASHBOARD_ENABLED,
+ * OWNER_ORDERABILITY_PORTAL_ENABLED, OA_OWNER_FEATURES_ENABLED,
+ * GARDSSALG_OWNER_DASHBOARD_ENABLED, GARDSSALG_OWNER_ADDRESS_EDIT_ENABLED and
+ * the OWNER_FEATURES_ALLOWED_SUBJECTS allowlist) that testmiljo.env turns on
+ * in its «UNDER TEST» block. The app gets them from the file as it is (so the
+ * flag file itself is what is tested), and tmci-2b checks that the file's
+ * allowlist names exactly the owners read from the seeded files.
  *
  * Nothing touches this process's DB singletons: the seed and the app are
  * child processes; the seeded files are only read here. The child (its whole
@@ -415,6 +416,15 @@ export async function runTestmiljoCiTests(opts: { log?: boolean } = {}): Promise
     let exited: string | null = null;
     const allOutput = () => output.map((o) => `[${o.stream}] ${o.line}`).join("\n");
     const fileEnv = parseEnvFile(fs.readFileSync(ENV_FILE, "utf8"));
+    // The owner dashboards are on through testmiljo.env's «UNDER TEST» block,
+    // whose allowlist must name exactly the seeded owners (fixed ids).
+    const seededSubjects = [...owners.rfb.map((o) => `rfb:${o.id}`), ...owners.gardssalg.map((o) => `gardssalg:${o.id}`)].sort();
+    const fileSubjects = (fileEnv.OWNER_FEATURES_ALLOWED_SUBJECTS || "").split(",").map((s) => s.trim()).filter(Boolean).sort();
+    check(
+      JSON.stringify(fileSubjects) === JSON.stringify(seededSubjects),
+      "tmci-2b: testmiljo.env's OWNER_FEATURES_ALLOWED_SUBJECTS lists exactly the seeded owners",
+      `file ${fileSubjects.join(",")} — seed ${seededSubjects.join(",")}`,
+    );
     Object.assign(fileEnv, {
       PORT: String(port),
       HOST: "127.0.0.1",
@@ -423,14 +433,6 @@ export async function runTestmiljoCiTests(opts: { log?: boolean } = {}): Promise
       DENTAL_DB_PATH: path.join(dir, "dental.db"),
       EXPERIENCES_DB_PATH: path.join(dir, "experiences.db"),
       TESTMILJO: "1",
-      // The owner dashboards (off in testmiljo.env), for the seeded owners only.
-      OWNER_DASHBOARD_ENABLED: "1",
-      OWNER_ORDERABILITY_PORTAL_ENABLED: "1",
-      OA_OWNER_FEATURES_ENABLED: "1",
-      GARDSSALG_OWNER_DASHBOARD_ENABLED: "pilot",
-      // dev-request 2026-11-26-opplevagent-eier-endrer-adresse-selv: the owner's address form on the portal.
-      GARDSSALG_OWNER_ADDRESS_EDIT_ENABLED: "pilot",
-      OWNER_FEATURES_ALLOWED_SUBJECTS: [...owners.rfb.map((o) => `rfb:${o.id}`), ...owners.gardssalg.map((o) => `gardssalg:${o.id}`)].join(","),
     });
     const appEnv = buildAppEnv(baseEnv(process.env), fileEnv);
 
