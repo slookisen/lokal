@@ -50,6 +50,20 @@ export async function runOwnerProductImportMarkingTests(opts: { log?: boolean } 
     ok(m.importNothingFoundReasonHtml("ok", "https://gard.no") === null && m.importNothingFoundReasonHtml(null, "https://gard.no") === null, "ok / null → null");
     const evil = m.importNothingFoundReasonHtml("fetch_failed:dns", "<b>x&y") ?? "";
     ok(!evil.includes("<b>") && evil.includes("&lt;b&gt;") && evil.includes("&amp;y"), "unparseable site text is HTML-escaped");
+    // N1: only say «nettsiden viser ikke priser» when it is true
+    ok(m.importNothingFoundReasonHtml("no_products_found", "https://gard.no", { excluded: 2 }) === null, "N1: excluded>0 → null");
+    for (const st of ["infra_failure", "invalid_json", "not_array", "budget_exhausted"])
+      ok(m.importNothingFoundReasonHtml("no_products_found", "https://gard.no", { llmStatus: st }) === null, `N1: llm ${st} → null`);
+    ok(m.importNothingFoundReasonHtml("no_products_found", "https://gard.no", { excluded: 0, llmStatus: "sentinel" }) === NOPRICE, "N1: genuine no-products keeps text");
+    ok(m.importNothingFoundReasonHtml("no_products_found", "https://gard.no", { excluded: 0, llmStatus: "not_needed" }) === NOPRICE, "N1: not_needed keeps text");
+    ok(m.importNothingFoundReasonHtml("fetch_failed:dns", "https://gard.no", { excluded: 3, llmStatus: "infra_failure" }) === NOOPEN, "N1: other outcomes unaffected");
+    // N2: Unicode domain, still escaped
+    const uni = m.importNothingFoundReasonHtml("fetch_failed:dns", "https://xn--grdsbutikk-15a.no/") ?? "";
+    ok(uni.includes("gårdsbutikk.no") && !uni.includes("xn--"), "N2: punycode shown as Unicode");
+    ok((require("../services/product-import/owner-import") as typeof import("../services/product-import/owner-import")).siteDomain("https://xn--gr-yia.no") === "går.no", "N2: siteDomain returns Unicode");
+    // N3: no derivable domain → null
+    for (const w of ["", "   ", null, undefined, "https://"])
+      ok(m.importNothingFoundReasonHtml("no_products_found", w as string | null) === null && m.importNothingFoundReasonHtml("fetch_failed:dns", w as string | null) === null, `N3: empty website ${JSON.stringify(w)} → null`);
     for (const o of ["no_products_found", "fetch_failed:dns", "js_unreadable", "ok"]) {
       ok(!zero(o, "https://gard.no/").includes("uten pris"), `no «uten pris» text in zero view (${o})`);
       ok(!zero(o, "https://gard.no/").includes("Varer funnet, men"), `no unapproved «Varer funnet, men…» (${o})`);
