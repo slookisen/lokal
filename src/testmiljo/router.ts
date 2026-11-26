@@ -37,8 +37,6 @@
  */
 
 import express, { type Express, type NextFunction, type Request, type Response, Router } from "express";
-import { carriesProxyHeaders } from "../middleware/client-ip";
-import { isCrossSiteWrite } from "../middleware/same-origin-write";
 import { isLoopbackAddress, isTestmiljo } from "./guard";
 import { CLIENT_FORWARDED_HOST_MARK, LOCAL_SITES, isLocalHostName, localOrigin, siteByKey, splitHostPort, type LocalSite } from "./hosts";
 import { clearOutbox, getOutboxMail, listOutbox, outboxFile, type OutboxMail } from "./outbox";
@@ -61,7 +59,12 @@ export interface TestmiljoDeps {
   issueGardssalgLogin(providerId: string, email: string): string | null;
 }
 
-/** The real thing. Modules are required lazily so that importing this file stays cheap. */
+/**
+ * The real thing. App modules are required lazily, here and in the guard
+ * below: src/index.ts imports this file near the top, and an eager import
+ * would evaluate database and middleware modules ahead of their usual place in
+ * production's boot order. (Pinned by testmiljo.test.ts s3.)
+ */
 export function defaultTestmiljoDeps(): TestmiljoDeps {
   return {
     rfbOwners() {
@@ -329,6 +332,8 @@ export function createTestmiljoRouter(deps: TestmiljoDeps = defaultTestmiljoDeps
     // A tunnel or reverse proxy on this machine makes every visitor look like
     // loopback, and may rewrite Host. It also adds a forwarding header, or
     // arrives with an X-Forwarded-Host of its own (marked by hosts.ts).
+    const { carriesProxyHeaders } = require("../middleware/client-ip") as typeof import("../middleware/client-ip");
+    const { isCrossSiteWrite } = require("../middleware/same-origin-write") as typeof import("../middleware/same-origin-write");
     if (carriesProxyHeaders(req.headers) || req.headers[CLIENT_FORWARDED_HOST_MARK] !== undefined) {
       return res.status(403).type("text/plain").send("The test environment does not answer through a proxy or tunnel.");
     }

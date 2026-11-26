@@ -92,6 +92,9 @@ forblir kommende).
   åpner porten mot nettverket.
 - `/testmiljo` svarer bare denne maskinen, bare på de lokale navnene, ikke
   gjennom en tunnel eller mellomtjener, og ikke på skriving fra et annet nettsted.
+- Ikke publiser port 3100 (ngrok, portvideresending i editoren og lignende).
+  Sjekkene over kjenner igjen de vanlige tunnelene, men ikke en som skriver om
+  `Host` uten å legge til noe. Bak en slik tunnel ser alle ut som denne maskinen.
 - Hastighetsgrensene per IP hoppes over i testmiljøet, siden alle lokale kall
   kommer fra 127.0.0.1. `TESTMILJO_RATE_LIMITS=on` beholder dem.
 

@@ -55930,8 +55930,8 @@ runSerial(async () => {
 // dev-request 2026-11-25-testmiljo-lokal-kopi-med-testdata-foer-prodsetting
 // (points 2, 3, 4): the local test environment's switch, local host names,
 // outbound guard, e-mail outbox and /testmiljo pages. Sets and restores
-// TESTMILJO, pins its own in-memory RFB DB and resets the db-factory handles
-// (restored in finally), and briefly wraps net.Socket.prototype.connect —
+// TESTMILJO, pins its own in-memory RFB DB, swaps in its own db-factory copy
+// (both restored in finally), and briefly wraps net.Socket.prototype.connect —
 // runSerial, tail.
 runSerial(async () => {
   console.log("\n── 2026-11-25 testmiljø: bryter, adresser, utgående sperre, e-postfangst, innlogging ──");

@@ -9,8 +9,9 @@
  *           production, boot refused in production / wrong value / with mail
  *           credentials / without own database files / on a network listen
  *           address; loopback check.
- *   s1-s2   wiring: the boot check is the first import of src/index.ts; the
- *           rate limiters are skipped in the test environment only.
+ *   s1-s3   wiring: the boot check is the first import of src/index.ts; the
+ *           rate limiters are skipped in the test environment only; the
+ *           modules src/index.ts imports from here load no app module.
  *   h1-h6   local host names: mapping, production URLs rewritten in Location
  *           and HTML only, self-removing service worker, no effect when off.
  *   o1-o6   outbound guard: a non-loopback connection is refused before DNS
@@ -134,6 +135,17 @@ export async function runTestmiljoTests(opts: { log?: boolean; realFetch?: boole
       const indexSource = fs.readFileSync(path.join(__dirname, "..", "index.ts"), "utf8");
       const firstImport = indexSource.split(/\r?\n/).find((line) => /^import\b/.test(line));
       assertEq(firstImport, 'import "./testmiljo/boot";', "s1 the boot check is the first import of src/index.ts");
+    }
+    {
+      // src/index.ts imports guard, hosts and router near its top (boot, which
+      // it imports first, pulls in outbound-guard). An eager import of an app
+      // module from any of them would move that module, and what it imports,
+      // ahead of its usual place in production's boot order.
+      const eager = ["boot.ts", "guard.ts", "hosts.ts", "outbound-guard.ts", "outbox.ts", "router.ts"].flatMap((file) =>
+        fs.readFileSync(path.join(__dirname, file), "utf8").split(/\r?\n/)
+          .filter((line) => /^import\b/.test(line) && !/^import type\b/.test(line) && /from\s+["']\.\.\//.test(line))
+          .map((line) => `${file}: ${line}`));
+      assertEq(eager, [], "s3 the modules index.ts imports from src/testmiljo import no app module eagerly");
     }
     {
       const express = require("express") as typeof import("express");
