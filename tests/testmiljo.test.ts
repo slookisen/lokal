@@ -253,6 +253,21 @@ export async function runTestmiljoTests(opts: { log?: boolean } = {}): Promise<T
       );
     }
 
+    // N3 (review of #1664): inherited env is an allowlist, not a deny-list.
+    const n3 = launch.buildAppEnv(
+      {
+        PATH: "/usr/bin", Path: "C:\\Windows", SystemRoot: "C:\\Windows", LC_ALL: "C.UTF-8", CI: "true",
+        GSC_SERVICE_ACCOUNT_JSON: "{}", SENTRY_DSN: "https://x@sentry.io/1", RENDER_WORKER_URL: "https://w", LOKAL_API_URL: "https://api",
+        FOO_BAR_URL: "https://foo", NODE_OPTIONS: "--require /x.js", NODE_ENV: "production",
+      },
+      { ...fileEnv, FROM_FILE: "yes" },
+    );
+    check(!n3.GSC_SERVICE_ACCOUNT_JSON && !n3.SENTRY_DSN && !n3.RENDER_WORKER_URL && !n3.LOKAL_API_URL, "tm-l6: launcher drops GSC_SERVICE_ACCOUNT_JSON, SENTRY_DSN, RENDER_WORKER_URL, LOKAL_API_URL");
+    check(!n3.FOO_BAR_URL && !n3.NODE_OPTIONS, "tm-l7: launcher drops an unknown variable (FOO_BAR_URL) and NODE_OPTIONS");
+    check(n3.PATH === "/usr/bin" && n3.Path === "C:\\Windows" && n3.SystemRoot === "C:\\Windows" && n3.LC_ALL === "C.UTF-8" && n3.CI === "true", "tm-l8: launcher passes PATH, Path, SystemRoot, LC_*, CI");
+    check(n3.FROM_FILE === "yes" && n3.NODE_ENV === fileEnv.NODE_ENV, "tm-l9: testmiljo.env values still reach the app and win over inherited ones");
+    check(!launch.isInheritedName("API_KEY") && launch.isInheritedName("LC_CTYPE"), "tm-l10: a credential-looking name is never inherited");
+
     // Path guard (N1): only <repo>/.testmiljo or a .testmiljo under the OS temp dir.
     /* eslint-disable @typescript-eslint/no-var-requires */
     const seed = require("../scripts/testmiljo/seed") as typeof import("../scripts/testmiljo/seed");
