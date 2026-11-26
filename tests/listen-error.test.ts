@@ -4,11 +4,11 @@
  * 1. Unit: handleListenError() logs one line and exits 1 on an error, nothing on success.
  * 2. Real app: started on a port a net.Server already holds. It must exit
  *    non-zero within a time limit, stderr carries the "[startup] listen failed"
- *    line and stdout never says "running at". Hard timeout, child killed in finally.
+ *    line and stdout never says "running at". Hard timeout; the app's whole process group is killed on timeout and in finally.
  *
  * Standalone: npx tsx tests/listen-error.test.ts. Gate: tests/test.ts.
  */
-import { spawn, type ChildProcess } from "child_process";
+import { spawn, spawnSync, type ChildProcess } from "child_process";
 import * as fs from "fs";
 import * as net from "net";
 import * as os from "os";
@@ -21,6 +21,20 @@ export interface TestSummary { passed: number; failed: number; failures: string[
 const REPO_ROOT = path.resolve(__dirname, "..");
 const APP = path.join(REPO_ROOT, "src", "index.ts");
 const HARD_TIMEOUT_MS = 90_000;
+
+/** Kill the child and everything it started (tsx runs the app in a grandchild). Same pattern as testmiljo-ci's killTree. */
+function killTree(child: ChildProcess, sig: NodeJS.Signals): void {
+  if (!child.pid) return;
+  try {
+    if (process.platform === "win32") {
+      spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+    } else {
+      process.kill(-child.pid, sig); // the whole process group (child is spawned detached)
+    }
+  } catch {
+    try { child.kill(sig); } catch { /* already gone (ESRCH) */ }
+  }
+}
 
 export async function runListenErrorTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
   let passed = 0, failed = 0;
@@ -39,6 +53,9 @@ export async function runListenErrorTests(opts: { log?: boolean } = {}): Promise
     const l2: string[] = []; const c2: number[] = [];
     const r2 = handleListenError(undefined, "h", 1, (c) => c2.push(c), (l) => l2.push(l));
     check(r2 === false && c2.length === 0 && l2.length === 0, "listen-3: no error -> nothing happens");
+    const l3: string[] = []; const c3: number[] = [];
+    const r3 = handleListenError("boom" as unknown as Error, "h", 1, (c) => c3.push(c), (l) => l3.push(l));
+    check(r3 === true && c3.length === 1 && c3[0] === 1 && l3.length === 1 && l3[0].includes("boom"), "listen-3b: non-Error value is logged and exits 1", l3.join("|"));
   }
 
   // ── 2. real app on a busy port ──
@@ -60,12 +77,19 @@ export async function runListenErrorTests(opts: { log?: boolean } = {}): Promise
     });
     let stdout = "", stderr = "";
     const result = await new Promise<{ code: number | null; timedOut: boolean }>((resolve) => {
-      child = spawn(process.execPath, [tsxCli(), APP], { cwd: REPO_ROOT, env, stdio: ["ignore", "pipe", "pipe"] });
+      child = spawn(process.execPath, [tsxCli(), APP], { cwd: REPO_ROOT, env, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
       child.stdout!.on("data", (d) => (stdout += d));
       child.stderr!.on("data", (d) => (stderr += d));
       child.on("error", (e) => { stderr += String(e); resolve({ code: -1, timedOut: false }); });
       child.on("close", (code) => resolve({ code, timedOut: false }));
-      timer = setTimeout(() => { child?.kill("SIGKILL"); resolve({ code: null, timedOut: true }); }, HARD_TIMEOUT_MS);
+      timer = setTimeout(() => {
+        if (child) {
+          killTree(child, "SIGKILL");
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+        }
+        resolve({ code: null, timedOut: true }); // do not wait for 'close': pipes may stay open
+      }, HARD_TIMEOUT_MS);
     });
     check(!result.timedOut, "listen-4: app exits on its own when the port is busy (no living process)");
     check(result.code !== null && result.code !== 0, "listen-5: exit code is non-zero", String(result.code));
@@ -75,7 +99,7 @@ export async function runListenErrorTests(opts: { log?: boolean } = {}): Promise
     failed++; failures.push("unexpected error: " + String((err as Error)?.stack || err));
   } finally {
     if (timer) clearTimeout(timer);
-    if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    if (child) { killTree(child, "SIGKILL"); child.stdout?.destroy(); child.stderr?.destroy(); } // whole group, even if the tsx parent already exited
     await new Promise<void>((r) => blocker.close(() => r()));
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
