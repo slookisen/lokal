@@ -13,8 +13,10 @@
  *        `Referrer-Policy: no-referrer`); a foreign Origin and Sec-Fetch-Site
  *        cross-site are refused (403) as on the RFB owner pages.
  *   (f)  flag off → GET and POST 404, the POST exactly as before (falls
- *        through); pilot with a profile off the list → 404; a real
- *        (non-test) producer → 404; no session → 401; another producer's
+ *        through); pilot with a profile off the list → 404 (a real producer
+ *        off the list too); O2-5: a real (non-test) producer on the list
+ *        with its own session sees and answers its own requests, never
+ *        another real producer's; no session → 401; another producer's
  *        session → 403. `no-store` on every response; a GET writes nothing.
  *   (t)  texts from tekstpakke OA-3 1.2 verbatim; no «Avlys» (O1-5); plain
  *        POST forms without JavaScript; no price, product or strength.
@@ -61,7 +63,7 @@ export function runGardssalgOwnerDashboardO22Tests(opts: { log?: boolean } = {})
     delete process.env[FLAG];
     delete process.env.WRITE_GUARD_FETCH_METADATA;
     process.env.OA_OWNER_FEATURES_ENABLED = "1";
-    const ALLOW = "gardssalg:o22-a,gardssalg:o22-b,gardssalg:o22-real";
+    const ALLOW = "gardssalg:o22-a,gardssalg:o22-b,gardssalg:o22-real,gardssalg:o22-real2";
     process.env.OWNER_FEATURES_ALLOWED_SUBJECTS = ALLOW;
 
     const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([
@@ -119,11 +121,13 @@ export function runGardssalgOwnerDashboardO22Tests(opts: { log?: boolean } = {})
       mkProvider("o22-b", "Testgård B", "o22bgard", "918200002");
       mkProvider("o22-c", "Testgård C", "o22cgard", "918200003"); // test producer, NOT on the list
       mkProvider("o22-real", "Ekte Gård", "o22ektegard", "918200004", null); // on the list, not the test producer
+      mkProvider("o22-real2", "Andre Ekte Gård", "o22andreekte", "918200006", 0); // on the list, real
+      mkProvider("o22-real3", "Tredje Ekte Gård", "o22tredjeekte", "918200007", 0); // real, NOT on the list
       const claimRow = expDb.prepare(
         `INSERT INTO gardssalg_claims (id, provider_id, email, email_source, token, used, created_at, expires_at)
          VALUES (?, ?, ?, 'verified_domain_address', ?, 1, datetime('now'), datetime('now','+7 days'))`,
       );
-      for (const pid of ["o22-a", "o22-b", "o22-c", "o22-real"]) claimRow.run(`gsc_${pid}`, pid, `eier@${pid}.example.no`, `tok22-${pid}`);
+      for (const pid of ["o22-a", "o22-b", "o22-c", "o22-real", "o22-real2", "o22-real3"]) claimRow.run(`gsc_${pid}`, pid, `eier@${pid}.example.no`, `tok22-${pid}`);
 
       const now = Date.now();
       const iso = (offsetHours: number) => new Date(now + offsetHours * HOUR).toISOString();
@@ -166,6 +170,8 @@ export function runGardssalgOwnerDashboardO22Tests(opts: { log?: boolean } = {})
       // Profile C (off the list) and the real producer
       mkBooking("GS-C-PEND", "o22-c");
       mkBooking("GS-R-PEND", "o22-real");
+      mkBooking("GS-R2-PEND", "o22-real2");
+      mkBooking("GS-R3-PEND", "o22-real3");
 
       const row = (ref: string) => expDb.prepare(`SELECT * FROM gardssalg_bookings WHERE booking_ref = ?`).get(ref) as any;
       const changes = () => [(expDb.prepare("SELECT total_changes() AS n").get() as any).n, (rfbDb.prepare("SELECT total_changes() AS n").get() as any).n];
@@ -261,14 +267,27 @@ export function runGardssalgOwnerDashboardO22Tests(opts: { log?: boolean } = {})
         assertEq(offList.status, 404, "f9: pilot, profile off the list → POST 404");
         assertEq(offList.headers["cache-control"], "no-store", "f10: that 404 is no-store");
         assertEq((await request("GET", page("o22cgard"), cookie("o22-c"))).status, 404, "f11: pilot, profile off the list → GET 404");
-        assertEq((await post("o22ektegard", "o22-real", { ref: "GS-R-PEND", action: "bekreft" })).status, 404, "f12: real producer on the list → POST 404 (test-producer lock until O2-5)");
+        // O2-5: the test-producer lock is gone. A real producer on the list
+        // opens its own «Mine besøk» (it answers its own request further down).
+        const realOwn = await request("GET", page("o22ektegard"), cookie("o22-real"));
+        assertEq([realOwn.status, realOwn.headers["cache-control"]], [200, "no-store"], "f12: O2-5 — real producer on the list, own session → GET 200 no-store");
+        assertEq([...realOwn.body.matchAll(/data-booking-ref="([^"]+)"/g)].map((m) => m[1]), ["GS-R-PEND"], "f12b: O2-5 — the real producer's page lists exactly its own request");
+        assertTrue(!realOwn.body.includes("GS-R2-") && !realOwn.body.includes("GS-A-") && !realOwn.body.includes("Gjest GS-R2"), "f12c: O2-5 — nothing of another producer's on the real producer's page");
+        // Cross-owner between two real producers on the list.
+        assertEq((await request("GET", page("o22andreekte"), cookie("o22-real"))).status, 403, "f12d: O2-5 — real A's session on real B's «Mine besøk» → GET 403");
+        assertEq((await post("o22andreekte", "o22-real", { ref: "GS-R2-PEND", action: "bekreft" })).status, 403, "f12e: O2-5 — real A's session posting on real B's page → 403");
+        assertEq((await post("o22ektegard", "o22-real", { ref: "GS-R2-PEND", action: "bekreft" })).status, 404, "f12f: O2-5 — real A posts B's request through A's own page → 404");
+        assertEq((await post("o22ektegard", "o22-real2", { ref: "GS-R-PEND", action: "bekreft" })).status, 403, "f12g: O2-5 — real B's session on real A's page → 403");
+        // A real producer off the list stays out.
+        assertEq((await request("GET", page("o22tredjeekte"), cookie("o22-real3"))).status, 404, "f12h: O2-5 — pilot, real producer off the list → GET 404");
+        assertEq((await post("o22tredjeekte", "o22-real3", { ref: "GS-R3-PEND", action: "bekreft" })).status, 404, "f12i: O2-5 — pilot, real producer off the list → POST 404");
         const noSession = await request("POST", action("o22agard"), browserForm, form({ ref: "GS-A-PEND", action: "bekreft" }));
         assertEq(noSession.status, 401, "f13: no session → POST 401");
         assertEq(noSession.headers["cache-control"], "no-store", "f14: that 401 is no-store");
         assertEq((await post("o22agard", "o22-b", { ref: "GS-A-PEND", action: "bekreft" })).status, 403, "f15: B's session on A's page → POST 403");
         assertEq((await post("o22agard", "o22-a", { ref: "GS-FINNES-IKKE", action: "bekreft" })).status, 404, "f16: unknown request → 404");
         assertEq((await post("o22agard", "o22-a", { action: "bekreft" })).status, 404, "f17: no ref → 404");
-        assertEq([row("GS-C-PEND").pre_status, row("GS-R-PEND").pre_status, row("GS-A-PEND").pre_status], ["awaiting_provider", "awaiting_provider", "awaiting_provider"], "f18: refused POSTs changed no status");
+        assertEq([row("GS-C-PEND").pre_status, row("GS-R-PEND").pre_status, row("GS-R2-PEND").pre_status, row("GS-R3-PEND").pre_status, row("GS-A-PEND").pre_status], ["awaiting_provider", "awaiting_provider", "awaiting_provider", "awaiting_provider", "awaiting_provider"], "f18: refused POSTs changed no status");
         assertEq(changes(), ch, "f19: refused POSTs wrote nothing");
       }
 
@@ -439,6 +458,11 @@ export function runGardssalgOwnerDashboardO22Tests(opts: { log?: boolean } = {})
       // ── B can act on B's own request ───────────────────────────────────
       await act("AK1m B confirms its own", "GS-B-PEND", { action: "bekreft" }, "bekreftet", true, "o22-b", "o22bgard");
       assertEq(row("GS-B-PEND").pre_status, "provider_confirmed", "AK1m: B's own request confirmed");
+
+      // ── O2-5: a real (non-test) producer on the list acts on its own ───
+      await act("R1 real producer confirms its own", "GS-R-PEND", { action: "bekreft" }, "bekreftet", true, "o22-real", "o22ektegard");
+      assertEq(row("GS-R-PEND").pre_status, "provider_confirmed", "R1: O2-5 — the real producer's own request confirmed");
+      assertEq(row("GS-R2-PEND").pre_status, "awaiting_provider", "R2: O2-5 — the other real producer's request untouched");
 
       // ── GET writes nothing (with every message variant) ───────────────
       {

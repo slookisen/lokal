@@ -1114,7 +1114,7 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
 
 // «Mine valg» tab (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg,
 // O1a): a link card, only while the tab is open for this producer
-// (OA_OWNER_FEATURES_ENABLED + allowlist + test producer). Otherwise nothing
+// (OA_OWNER_FEATURES_ENABLED + allowlist). Otherwise nothing
 // is added and the portal is exactly as before.
 function mineValgCardHtml(slug: string, providerId: string): string {
   if (!gardssalgOwnerFeaturesTabOpen(providerId)) return "";
@@ -1126,7 +1126,7 @@ function mineValgCardHtml(slug: string, providerId: string): string {
 }
 
 // O1b (v2 principle 7, «Én bryter, ett sted»): while the «Mine valg» tab is
-// open for this producer (flag + allowlist + test producer, the same check as
+// open for this producer (flag + allowlist, the same check as
 // the tab itself, plus the live claim the tab requires), «Ta imot besøk»
 // (booking.enabled ↔ booking_live) and the profile pause (visibility.profile)
 // are chosen there only. The portal then shows no booking checkbox and no

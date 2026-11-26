@@ -6,8 +6,10 @@
  *   (g) registry: 34 gårdssalg entries (Vedlegg A), vertical, NO+EN, both
  *       segments, the live set, shared RFB key names, two levels;
  *   (f) flag + allowlist: OA_OWNER_FEATURES_ENABLED off → 404 and the portal
- *       unchanged; not allowlisted / not the test producer → 404; no session
- *       → 401; another producer's session → 403;
+ *       unchanged; not allowlisted → 404 (O2-5: an allowlisted real producer
+ *       gets the tab, a real producer off the list does not); no session
+ *       → 401; another producer's session → 403 (also between two real
+ *       producers);
  *   (p) the page from the shared component: real choices only, the closed
  *       «Planlagt» box, no value on planned entries, the price message
  *       verbatim, the visit explanation with the code's timings, the
@@ -84,7 +86,7 @@ export function runGardssalgOwnerFeaturesO1aTests(opts: { log?: boolean } = {}):
     for (const k of ENV_KEYS) prevEnv[k] = process.env[k];
     process.env.EXPERIENCES_DB_PATH = ":memory:";
     delete process.env.OA_OWNER_FEATURES_ENABLED;
-    process.env.OWNER_FEATURES_ALLOWED_SUBJECTS = "gardssalg:o1-test,gardssalg:o1-noemail,gardssalg:o1-real,gardssalg:o1-brake";
+    process.env.OWNER_FEATURES_ALLOWED_SUBJECTS = "gardssalg:o1-test,gardssalg:o1-noemail,gardssalg:o1-real,gardssalg:o1-brake,gardssalg:o1-real2";
     process.env.BOOKING_DISPATCH_ENABLED = "true";
 
     const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([
@@ -149,13 +151,15 @@ export function runGardssalgOwnerFeaturesO1aTests(opts: { log?: boolean } = {}):
       mk("o1-test", "Testgård Sideri", "testgard", "918000001");
       mk("o1-noemail", "Uten Epost Gård", "utenepost", "918000002", { epost: null });
       mk("o1-real", "Ekte Gård", "ektegard", "918000003", { is_test_provider: null });
+      mk("o1-real2", "Andre Ekte Gård", "andreekte", "918000006", { is_test_provider: 0 }); // on the list, real
+      mk("o1-real3", "Tredje Ekte Gård", "tredjeekte", "918000007", { is_test_provider: 0 }); // real, NOT on the list
       mk("o1-other", "Annen Gård", "annengard", "918000004");
       mk("o1-brake", "Bremsegård", "bremsegard", "918000005", { brake_at: "2026-10-20 10:00:00", brake_note: "klage fra gjest" });
       const claimRow = expDb.prepare(
         `INSERT INTO gardssalg_claims (id, provider_id, email, email_source, token, used, created_at, expires_at)
          VALUES (?, ?, ?, 'verified_domain_address', ?, 1, datetime('now'), datetime('now','+7 days'))`,
       );
-      for (const [pid, tok] of [["o1-test", "tok-test"], ["o1-noemail", "tok-ne"], ["o1-real", "tok-real"], ["o1-other", "tok-other"], ["o1-brake", "tok-br"]]) {
+      for (const [pid, tok] of [["o1-test", "tok-test"], ["o1-noemail", "tok-ne"], ["o1-real", "tok-real"], ["o1-other", "tok-other"], ["o1-brake", "tok-br"], ["o1-real2", "tok-real2"], ["o1-real3", "tok-real3"]]) {
         claimRow.run(`gsc_${pid}`, pid, `eier@${pid}.no`, tok);
       }
 
@@ -241,7 +245,25 @@ export function runGardssalgOwnerFeaturesO1aTests(opts: { log?: boolean } = {}):
 
       process.env.OA_OWNER_FEATURES_ENABLED = "true";
       assertEq((await req("GET", page("annengard"), cookie("tok-other"))).status, 404, "f9: not allowlisted → 404");
-      assertEq((await req("GET", page("ektegard"), cookie("tok-real"))).status, 404, "f10: allowlisted but not the test producer → 404 (O1a: test producer only)");
+      {
+        // O2-5: the test-producer lock is gone — the allowlist alone decides.
+        const realPage = await req("GET", page("ektegard"), cookie("tok-real"));
+        assertEq(realPage.status, 200, "f10: O2-5 — allowlisted real producer with its own session → «Mine valg» 200");
+        assertTrue(realPage.body.includes("<h1>Mine valg</h1>") && realPage.body.includes("Ekte Gård") && !realPage.body.includes("Andre Ekte Gård") && !realPage.body.includes("Testgård Sideri"), "f10b: O2-5 — the real producer's page is its own");
+        assertEq(realPage.headers["cache-control"], "no-store", "f10c: O2-5 — the real producer's page is no-store");
+        assertEq((await req("GET", api("o1-real"), cookie("tok-real"))).status, 200, "f10d: O2-5 — the real producer's own API → 200");
+        assertEq((await req("GET", page("tredjeekte"), cookie("tok-real3"))).status, 404, "f10e: O2-5 — real producer off the list → 404");
+        assertEq((await req("GET", api("o1-real3"), cookie("tok-real3"))).status, 404, "f10f: O2-5 — real producer off the list → API 404");
+        // Cross-owner between two real producers on the list.
+        const r2Before = bookingLive("o1-real2");
+        const settingsBefore = settingsRows();
+        assertEq((await req("GET", page("andreekte"), cookie("tok-real"))).status, 403, "f10g: O2-5 — real A's session on real B's «Mine valg» → 403");
+        assertEq((await req("GET", api("o1-real2"), cookie("tok-real"))).status, 403, "f10h: O2-5 — real A's session on real B's API → 403");
+        assertEq((await req("POST", page("andreekte", "/sett"), { ...form, ...cookie("tok-real") }, "key=booking.enabled&value=true&confirmed=1")).status, 403, "f10i: O2-5 — real A writes on real B's page → 403");
+        assertEq((await req("PUT", api("o1-real2", "/booking.enabled"), { ...json, ...cookie("tok-real") }, JSON.stringify({ value: true }))).status, 403, "f10j: O2-5 — real A PUTs on real B's API → 403");
+        assertEq((await req("GET", page("ektegard"), cookie("tok-real2"))).status, 403, "f10k: O2-5 — real B's session on real A's «Mine valg» → 403");
+        assertEq([bookingLive("o1-real2"), settingsRows()], [r2Before, settingsBefore], "f10l: O2-5 — the refused cross-owner calls wrote nothing");
+      }
       assertEq((await req("GET", page("testgard"))).status, 401, "f11: no session → 401");
       assertEq((await req("GET", page("testgard"), cookie("tok-other"))).status, 403, "f12: another producer's session → 403 (non-owner rejected)");
       assertEq((await req("GET", api("o1-test"), cookie("tok-other"))).status, 403, "f13: API with another producer's session → 403");
@@ -260,7 +282,9 @@ export function runGardssalgOwnerFeaturesO1aTests(opts: { log?: boolean } = {}):
       assertTrue(profileForm(portalOn.body).length > 0, "f16a: the profile form is there with the tab open");
       assertEq(profileForm(portalOn.body), profileForm(portalOff.body), "f16b: with the tab open the profile text fields are exactly as with the flag off (O1b: booking checkbox and pause card moved to «Mine valg»)");
       const portalReal = await req("GET", "/kategori/gardssalg/eier/ektegard/portal", cookie("tok-real"));
-      assertTrue(portalReal.status === 200 && !portalReal.body.includes("data-mine-valg"), "f17: a real producer's portal gets no link");
+      assertTrue(portalReal.status === 200 && portalReal.body.includes('href="/kategori/gardssalg/eier/ektegard/valg"'), "f17: O2-5 — an allowlisted real producer's portal links to its own «Mine valg»");
+      const portalReal3 = await req("GET", "/kategori/gardssalg/eier/tredjeekte/portal", cookie("tok-real3"));
+      assertTrue(portalReal3.status === 200 && !portalReal3.body.includes("data-mine-valg"), "f17b: O2-5 — a real producer off the list gets no link");
 
       // ── (p) the page ──────────────────────────────────────────────────
       const p = await req("GET", page("testgard"), cookie("tok-test"));

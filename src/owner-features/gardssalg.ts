@@ -11,8 +11,9 @@
 //                                      so today's behaviour is unchanged.
 //   OWNER_FEATURES_ALLOWED_SUBJECTS    the shared allowlist (owner-features/
 //                                      allowlist.ts), `gardssalg:<provider id>`.
-// The tab itself is in addition limited to the test producer
-// (experience_providers.is_test_provider = 1) until Daniel's pilot GO.
+// Since slice O2-5 (dev-request 2026-11-12-opplevagent-o2-eierdashbord-for-
+// besok) the flag and the allowlist alone decide who gets the tab; the old
+// test-producer lock (experience_providers.is_test_provider = 1) is gone.
 //
 // Readers here (featureOn, governance S4 rule 2): booking.pause — a new
 // visit request is refused with «tar ikke imot forespørsler nå» on every
@@ -62,9 +63,10 @@ export function gardssalgOwnerBookingPaused(providerId: string | null | undefine
 //                         OWNER_FEATURES_ALLOWED_SUBJECTS
 //   anything else → off   (default) — no dashboard, the owner pages exactly
 //                         as before.
-// This is the flag part only. The dashboard additionally stays limited to the
-// test producer in code until slice O2-5, and needs a verified owner session
-// (routes/gardssalg-owner-features.ts gardssalgOwnerDashboardActiveFor).
+// This is the flag part only. Since slice O2-5 there is no test-producer lock
+// in code: the mode and the allowlist alone decide, and the dashboard still
+// needs a verified owner session for this producer with a live claim
+// (routes/gardssalg-owner-features.ts gardssalgOwnerDashboardOnForSession).
 
 export const GARDSSALG_OWNER_DASHBOARD_ENABLED_ENV = "GARDSSALG_OWNER_DASHBOARD_ENABLED";
 
