@@ -51,6 +51,16 @@ import { normalizeName, parsePriceNok } from "./product-catalog-sync";
 import { PLATFORM_CATEGORIES } from "./search-enrich";
 import { gateOrganicProductsForWrite, hasValidDebioStatus, organicClaimGateEnabled } from "./description-quality";
 import { readDebioVerified } from "./debio-approval";
+import {
+  applyGardssalgSetAddressUnit,
+  applyGardssalgSetContentField,
+  applyGardssalgSetProviderName,
+  gardssalgOwnerLockReason,
+} from "./experience-store";
+import { OWNER_REQUEST_AUTHORITIES } from "./cs-owner-request";
+import { parseAddressUnit } from "./opplevagent-address-unit";
+import { geocodeOne } from "./dental-geocode-worker";
+import { isPlausibleNorwayCoord } from "./geo-distance";
 
 export const CS_CHANGE_REQUESTS_FLAG = "CS_CHANGE_REQUESTS_ENABLED";
 export function csChangeRequestsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -126,14 +136,86 @@ export function openingHoursComparable(raw: string | null): string | null {
   return raw;
 }
 
-const EXP_FIELDS: Record<string, { path: string; body: (v: string) => Record<string, unknown>; lock?: string; column: string; max: number }> = {
-  name: { path: "gardssalg-set-provider-name", body: (v) => ({ value: v }), column: "navn", max: 200 },
-  email: { path: "gardssalg-set-contact-email", body: (v) => ({ email: v, force: false }), column: "epost", max: 254 },
-  phone: { path: "gardssalg-set-contact-phone", body: (v) => ({ phone: v }), column: "telefon", max: 40 },
-  address: { path: "gardssalg-set-address", body: (v) => ({ value: v }), column: "adresse", max: 300 },
-  about_text: { path: "gardssalg-set-content-field", body: (v) => ({ field: "about_text", value: v }), lock: "about_text", column: "about_text", max: 4000 },
-  visit_text: { path: "gardssalg-set-content-field", body: (v) => ({ field: "visit_text", value: v }), lock: "visit_text", column: "visit_text", max: 4000 },
-  opening_hours_text: { path: "gardssalg-set-content-field", body: (v) => ({ field: "opening_hours_text", value: v }), lock: "opening_hours_text", column: "opening_hours_text", max: 1000 },
+// `ownerLock`: the columns whose owner lock (isGardssalgFieldOwnerLocked) the
+// field's writer checks. The e-mail and phone writers have no owner lock, so
+// they have none and always go through the admin route as before. A field
+// with an owner lock on an owner-claimed profile is written as the owner's
+// own write when the request has the owner's authority (see «The owner's own
+// request on Opplevagent» below). `address` is always written in-process as
+// one unit (street + postnummer + poststed + map point).
+const EXP_FIELDS: Record<string, { path: string; body: (v: string) => Record<string, unknown>; lock?: string; ownerLock: readonly string[]; column: string; max: number }> = {
+  name: { path: "gardssalg-set-provider-name", body: (v) => ({ value: v }), ownerLock: ["navn"], column: "navn", max: 200 },
+  email: { path: "gardssalg-set-contact-email", body: (v) => ({ email: v, force: false }), ownerLock: [], column: "epost", max: 254 },
+  phone: { path: "gardssalg-set-contact-phone", body: (v) => ({ phone: v }), ownerLock: [], column: "telefon", max: 40 },
+  address: { path: "gardssalg-set-address", body: (v) => ({ value: v }), ownerLock: ["adresse", "postnummer", "poststed"], column: "adresse", max: 300 },
+  about_text: { path: "gardssalg-set-content-field", body: (v) => ({ field: "about_text", value: v }), lock: "about_text", ownerLock: ["about_text"], column: "about_text", max: 4000 },
+  visit_text: { path: "gardssalg-set-content-field", body: (v) => ({ field: "visit_text", value: v }), lock: "visit_text", ownerLock: ["visit_text"], column: "visit_text", max: 4000 },
+  opening_hours_text: { path: "gardssalg-set-content-field", body: (v) => ({ field: "opening_hours_text", value: v }), lock: "opening_hours_text", ownerLock: ["opening_hours_text"], column: "opening_hours_text", max: 1000 },
+};
+
+// ─── The owner's own request on Opplevagent ──────────────────────────
+// dev-request 2026-11-26-cs-endring-som-eier-opplevagent (slookisen/A2A).
+// RFB writes a change request with dataSource "owner", so the owner lock
+// lets the owner's own request through. On Opplevagent the admin routes
+// refuse an owner-claimed row with owner_locked, so a field that is owner-
+// locked is written IN-PROCESS by the store writer with an owner-request
+// context (cs-owner-request.ts) — only when:
+//   - the request's authority is registered_email / own_domain (checkAuthority
+//     at filing; a Daniel approval does not count), and
+//   - checkAuthority still holds right before the writes (the profile's
+//     registered address or domain may have changed since), and
+//   - the store writer itself confirms the cs_change_requests row (executing,
+//     this provider, this field and value, owner authority).
+// There is no admin parameter for this: no HTTP caller can reach it.
+// Every other writer still meets the owner lock unchanged.
+
+export type ExpFieldCheck = "ok" | "owner_request" | `locked: ${string}`;
+
+interface ExpLockRow {
+  content_source: string | null;
+  field_provenance: string | null;
+}
+
+function readExpLockRow(providerId: string): ExpLockRow | null {
+  try {
+    return (
+      (getVerticalDb("experiences").prepare("SELECT content_source, field_provenance FROM experience_providers WHERE id = ?").get(providerId) as ExpLockRow | undefined) ?? null
+    );
+  } catch {
+    return null;
+  }
+}
+
+/** The first owner-lock reason on the field's columns, or null. */
+function expLockReason(row: ExpLockRow | null, field: string): string | null {
+  const m = EXP_FIELDS[field];
+  if (!row || !m) return null;
+  for (const col of m.ownerLock) {
+    const why = gardssalgOwnerLockReason(row, col);
+    if (why) return `${col}: ${why}`;
+  }
+  return null;
+}
+
+/** Will each field's write go through: ok, as the owner's own request, or stopped by a lock. */
+export function expFieldChecks(providerId: string, fields: string[], ownerAuthority: boolean): Record<string, ExpFieldCheck> {
+  const row = readExpLockRow(providerId);
+  const out: Record<string, ExpFieldCheck> = {};
+  for (const f of fields) {
+    const why = expLockReason(row, f);
+    out[f] = !why ? "ok" : ownerAuthority ? "owner_request" : `locked: ${why}`;
+  }
+  return out;
+}
+
+/** The map point for an address unit, or null when the lookup did not find a Norwegian point. */
+export type AddressGeocoder = (a: { street: string; postnummer: string; poststed: string }) => Promise<{ lat: number; lon: number; confidence: string } | null>;
+
+/** The same Kartverket adresse-API ladder the Opplevagent geocode worker uses (geocodeOne). */
+export const defaultAddressGeocoder: AddressGeocoder = async ({ street, postnummer, poststed }) => {
+  const r = await geocodeOne(street, postnummer, poststed);
+  if (r.confidence === "no_match" || !isPlausibleNorwayCoord(r.lat, r.lng)) return null;
+  return { lat: r.lat, lon: r.lng, confidence: r.confidence };
 };
 
 /**
@@ -823,6 +905,20 @@ export function createChangeRequest(input: CreateChangeRequestInput, deps: { env
       const max = (input.vertical === "rfb" ? RFB_FIELDS[k]?.max : EXP_FIELDS[k]?.max) ?? 1000;
       if (typeof changes[k] !== "string" || changes[k].length > max) return { ok: false, status: 400, error: "invalid_value", detail: { field: k, max } };
     }
+    // Opplevagent address: one unit (street, postnummer, poststed), checked now
+    // so the dry run shows what will be stored. The map point is looked up at
+    // execution; a failed lookup fails the request with nothing written.
+    if (input.vertical === "experiences" && changes.address !== undefined) {
+      const a = parseAddressUnit(changes.address);
+      if (!a.ok) {
+        return {
+          ok: false,
+          status: 422,
+          error: "invalid_address",
+          detail: { field: "address", reason: a.reason, expected: "gate og husnummer, postnummer og poststed, f.eks. «Universitetsgata 2, 0164 Oslo»" },
+        };
+      }
+    }
   }
   const auth = checkAuthority({
     vertical: input.vertical,
@@ -844,13 +940,34 @@ export function createChangeRequest(input: CreateChangeRequestInput, deps: { env
   // (removals only: several open profile updates for one profile are fine)
   if (open && input.apply && input.kind === "removal") return { ok: false, status: 409, error: "open_request_exists", detail: open };
   const jobOn = csChangeRequestsEnabled(env);
-  const status: ChangeStatus = auth.ok && jobOn ? "queued" : "approval_needed";
-  const reason = !auth.ok ? auth.reason : jobOn ? null : "endringsjobben_er_av";
+  // Opplevagent: will each field's write go through (ok), go through as the
+  // owner's own request (owner_request), or be stopped by an owner lock? A
+  // field that would be stopped sends the request to Daniel, with the reason.
+  const fieldChecks =
+    input.vertical === "experiences" && input.kind === "profile_update"
+      ? expFieldChecks(target.id, Object.keys(changes), auth.ok && OWNER_REQUEST_AUTHORITIES.includes(auth.authority))
+      : null;
+  const lockedFields = fieldChecks ? Object.entries(fieldChecks).filter(([, c]) => c.startsWith("locked")) : [];
+  const lockReason = lockedFields.length ? `låst: ${lockedFields.map(([f, c]) => `${f} (${c.slice("locked: ".length)})`).join("; ")}`.slice(0, 500) : null;
+  const status: ChangeStatus = auth.ok && jobOn && !lockReason ? "queued" : "approval_needed";
+  const reason = !auth.ok ? auth.reason : lockReason ? lockReason : jobOn ? null : "endringsjobben_er_av";
+  const addressUnit = input.vertical === "experiences" && changes.address !== undefined ? parseAddressUnit(changes.address) : null;
   const plan = {
     vertical: input.vertical,
     target: { id: target.id, name: target.name },
     kind: input.kind,
     changes: input.kind === "profile_update" ? changes : undefined,
+    fields: fieldChecks ?? undefined,
+    address_unit:
+      addressUnit && addressUnit.ok
+        ? {
+            adresse: addressUnit.street,
+            postnummer: addressUnit.postnummer,
+            poststed: addressUnit.poststed,
+            ...(addressUnit.ignored.length ? { ikke_lagret: addressUnit.ignored, note: "Navn/linjer foran gateadressen lagres ikke i adressen (navnet står i profilens navn)." } : {}),
+            kartpunkt: "slås opp i Kartverket ved utføring; finnes det ikke, skrives ingenting",
+          }
+        : undefined,
     products: productOps.length
       ? {
           ops: productOps,
@@ -980,6 +1097,8 @@ export interface ExecDeps {
   adminCall?: AdminCall;
   publicFetch?: PublicFetch;
   env?: NodeJS.ProcessEnv;
+  /** Opplevagent address: the map-point lookup (default: Kartverket, as the geocode worker). */
+  geocode?: AddressGeocoder;
 }
 
 function normText(s: string): string {
@@ -1067,6 +1186,31 @@ function okStatus(s: number): boolean {
 
 const FAILED_CALL = (e: any): HttpResult => ({ status: 0, body: String(e?.message ?? e), json: null, location: null });
 
+/**
+ * The owner's own request, right before the writes: authority registered_email
+ * or own_domain at filing (a Daniel approval rewrites it to «approved», which
+ * does not count), and checkAuthority still says so now.
+ */
+function ownerAuthorityHolds(r: ChangeRequestRow, target: Target, evidenceMessageId: string | null): { ok: boolean; reason: string | null; authority: string } {
+  if (!OWNER_REQUEST_AUTHORITIES.includes(r.authority)) return { ok: false, reason: `fullmakt_${r.authority}`, authority: r.authority };
+  const now = checkAuthority({ vertical: r.vertical, target, requesterEmail: r.requester_email, threadId: r.thread_id, evidenceMessageId, kind: r.kind });
+  if (!now.ok || !OWNER_REQUEST_AUTHORITIES.includes(now.authority)) return { ok: false, reason: `fullmakt_holder_ikke_lenger: ${now.reason ?? now.authority}`, authority: now.authority };
+  return { ok: true, reason: null, authority: now.authority };
+}
+
+/** The address columns and map point of an Opplevagent provider, as stored. */
+function expAddressColumns(providerId: string): Record<string, unknown> | null {
+  try {
+    return (
+      (getVerticalDb("experiences")
+        .prepare("SELECT adresse, postnummer, poststed, lat, lon, geocode_source, geocode_confidence FROM experience_providers WHERE id = ?")
+        .get(providerId) as Record<string, unknown> | undefined) ?? null
+    );
+  } catch {
+    return null;
+  }
+}
+
 async function executeProfileUpdate(r: ChangeRequestRow, deps: ExecDeps): Promise<void> {
   const now = deps.now ?? new Date();
   const call = deps.adminCall ?? defaultAdminCall;
@@ -1107,8 +1251,41 @@ async function executeProfileUpdate(r: ChangeRequestRow, deps: ExecDeps): Promis
     productsOld = prior?.products ? prior.products.old : state.raw;
     addStep(r.id, "plan_products", true, { ops: productOps, before: state.list?.length ?? 0, after: productsNext.length }, now);
   }
-  const snapshot: Record<string, { old: string | null; new?: unknown }> = {};
+  // Opplevagent address: parsed and looked up on the map BEFORE anything is
+  // written. A value that does not parse, an unknown postnummer or a lookup
+  // that finds no Norwegian point fails the whole request with nothing
+  // written (no half address).
+  let addressPlan: { street: string; postnummer: string; poststed: string; lat: number; lon: number; confidence: string } | null = null;
+  if (r.vertical === "experiences" && changes.address !== undefined) {
+    const a = parseAddressUnit(changes.address);
+    if (!a.ok) {
+      addStep(r.id, "plan_address", false, { reason: a.reason }, now);
+      setStatus(r.id, "failed", `adresse: ${a.reason} (ingenting skrevet)`.slice(0, 500), {}, now, "executing");
+      return;
+    }
+    let geo: Awaited<ReturnType<AddressGeocoder>> = null;
+    try {
+      geo = await (deps.geocode ?? defaultAddressGeocoder)({ street: a.street, postnummer: a.postnummer, poststed: a.poststed });
+    } catch (e: any) {
+      geo = null;
+      addStep(r.id, "geocode_error", false, String(e?.message ?? e).slice(0, 300), now);
+    }
+    if (!geo || !isPlausibleNorwayCoord(geo.lat, geo.lon)) {
+      addStep(r.id, "geocode", false, { street: a.street, postnummer: a.postnummer, poststed: a.poststed, found: geo }, now);
+      setStatus(r.id, "failed", `adresse: kartoppslaget fant ikke «${a.street}, ${a.postnummer} ${a.poststed}» (ingenting skrevet)`.slice(0, 500), {}, now, "executing");
+      return;
+    }
+    addressPlan = { street: a.street, postnummer: a.postnummer, poststed: a.poststed, lat: geo.lat, lon: geo.lon, confidence: geo.confidence };
+    addStep(r.id, "geocode", true, { ...addressPlan, ikke_lagret: a.ignored }, now);
+  }
+  const snapshot: Record<string, { old: string | null; new?: unknown; old_columns?: unknown }> = {};
   for (const f of Object.keys(changes)) snapshot[f] = prior && f in prior ? prior[f] : { old: dbValue(r.vertical, r.target_id, f) };
+  if (addressPlan) {
+    // All four columns (and the map point) as they were, for rollback; a
+    // re-run keeps the first attempt's old values.
+    const was = prior?.address as { old: string | null; old_columns?: unknown } | undefined;
+    snapshot.address = { old: was ? was.old : dbValue(r.vertical, r.target_id, "address"), old_columns: was?.old_columns ?? expAddressColumns(r.target_id), new: addressPlan };
+  }
   // The old list, exactly as stored, is what a rollback writes back.
   if (productsNext) snapshot.products = { old: productsOld, new: productsNext };
   getDb().prepare("UPDATE cs_change_requests SET snapshot = ? WHERE id = ?").run(JSON.stringify(snapshot), r.id);
@@ -1167,14 +1344,35 @@ async function executeProfileUpdate(r: ChangeRequestRow, deps: ExecDeps): Promis
       /* cache refreshes on its own within 60 s */
     }
   } else {
+    // The owner's own request: owner authority at filing AND still now.
+    const ownerAuthority = ownerAuthorityHolds(r, target, evidence.messageId ?? null);
+    addStep(r.id, "owner_authority", ownerAuthority.ok, ownerAuthority, now);
+    const ownerCtx = ownerAuthority.ok ? { ownerRequest: { changeRequestId: r.id } } : {};
     for (const [f, v] of Object.entries(changes)) {
       const m = EXP_FIELDS[f];
-      const res = await call("POST", `/api/opplevelser/admin/${m.path}`, { provider_id: r.target_id, source, ...m.body(v) }).catch(FAILED_CALL);
-      const ok = okStatus(res.status) && res.json?.success !== false && !res.json?.error;
-      addStep(r.id, `write_${f}`, ok, { status: res.status, response: res.json ?? res.body.slice(0, 300) }, now);
-      if (!ok) {
-        failures.push(`${f}: HTTP ${res.status}${res.json?.error ? ` ${res.json.error}` : ""}`);
+      const lock = expLockReason(readExpLockRow(r.target_id), f);
+      const asOwner = !!lock && ownerAuthority.ok;
+      if (f === "address" && addressPlan) {
+        const res = applyGardssalgSetAddressUnit(r.target_id, addressPlan, source, asOwner ? ownerCtx : {});
+        addStep(r.id, "write_address", res.ok, { mode: asOwner ? "owner_request" : "admin", lock, result: res }, now);
+        if (!res.ok) failures.push(`address: ${res.reason}${"field" in res ? ` ${res.field}` : ""}${"detail" in res ? ` ${res.detail}` : ""}${lock && !asOwner ? ` (${lock})` : ""}`);
         continue;
+      }
+      if (asOwner && (f === "name" || f === "about_text" || f === "visit_text" || f === "opening_hours_text")) {
+        const res = f === "name" ? applyGardssalgSetProviderName(r.target_id, v, source, ownerCtx) : applyGardssalgSetContentField(r.target_id, f, v, source, ownerCtx);
+        addStep(r.id, `write_${f}`, res.ok, { mode: "owner_request", lock, result: res }, now);
+        if (!res.ok) {
+          failures.push(`${f}: ${res.reason}${"detail" in res ? ` ${res.detail}` : ""}${"defect_type" in res ? ` ${res.defect_type}` : ""}`);
+          continue;
+        }
+      } else {
+        const res = await call("POST", `/api/opplevelser/admin/${m.path}`, { provider_id: r.target_id, source, ...m.body(v) }).catch(FAILED_CALL);
+        const ok = okStatus(res.status) && res.json?.success !== false && !res.json?.error;
+        addStep(r.id, `write_${f}`, ok, { status: res.status, response: res.json ?? res.body.slice(0, 300) }, now);
+        if (!ok) {
+          failures.push(`${f}: HTTP ${res.status}${res.json?.error ? ` ${res.json.error}` : ""}${lock ? ` (${lock})` : ""}`);
+          continue;
+        }
       }
       if (m.lock) {
         const l = await call("POST", "/api/opplevelser/admin/gardssalg-set-field-lock", { provider_id: r.target_id, field: m.lock, lock: true, source }).catch(FAILED_CALL);
@@ -1210,6 +1408,12 @@ export async function verifyProfileUpdate(r: ChangeRequestRow, deps: ExecDeps): 
   const results: Record<string, string> = {};
   let all = true;
   for (const [f, v] of Object.entries(changes)) {
+    if (r.vertical === "experiences" && f === "address") {
+      const a = verifyAddressUnit(r.target_id, v, snapshot.address?.new, s.text);
+      results[f] = a.result;
+      all = all && a.ok;
+      continue;
+    }
     const stored = dbValue(r.vertical, r.target_id, f) ?? "";
     const inDb =
       stored === v ||
@@ -1250,6 +1454,55 @@ export async function verifyProfileUpdate(r: ChangeRequestRow, deps: ExecDeps): 
   }
   if (windowOver) setStatus(r.id, "verify_failed", `ikke synlig etter ${VERIFY_WINDOW_HOURS} t: ${JSON.stringify(results)}`.slice(0, 500), {}, now, "executed");
   return false;
+}
+
+/** Every JSON-LD streetAddress on a page. */
+export function jsonLdStreetAddresses(html: string): string[] {
+  const out: string[] = [];
+  const walk = (v: unknown): void => {
+    if (Array.isArray(v)) return v.forEach(walk);
+    if (!v || typeof v !== "object") return;
+    for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
+      if (k === "streetAddress" && typeof x === "string") out.push(x);
+      else walk(x);
+    }
+  };
+  const re = /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    try {
+      walk(JSON.parse(m[1]));
+    } catch {
+      /* not JSON: ignored */
+    }
+  }
+  return out;
+}
+
+/**
+ * Opplevagent address: all four columns and the map point are stored as
+ * planned, and the public page shows the new street — in its JSON-LD
+ * PostalAddress.streetAddress and in the page text.
+ */
+function verifyAddressUnit(providerId: string, value: string, planned: unknown, page: string): { ok: boolean; result: string } {
+  const a = parseAddressUnit(value);
+  if (!a.ok) return { ok: false, result: `ugyldig_adresse:${a.reason}` };
+  const row = expAddressColumns(providerId) as { adresse: string | null; postnummer: string | null; poststed: string | null; lat: number | null; lon: number | null } | null;
+  const p = (planned ?? {}) as { lat?: number; lon?: number };
+  const stored =
+    !!row &&
+    row.adresse === a.street &&
+    row.postnummer === a.postnummer &&
+    row.poststed === a.poststed &&
+    typeof p.lat === "number" &&
+    typeof p.lon === "number" &&
+    row.lat === p.lat &&
+    row.lon === p.lon;
+  if (!stored) return { ok: false, result: "ikke_lagret" };
+  const inLd = jsonLdStreetAddresses(page).some((x) => normText(x) === normText(a.street));
+  const onPage = valueShows("address", a.street, page);
+  if (inLd && onPage) return { ok: true, result: "vises_offentlig (side og JSON-LD streetAddress)" };
+  return { ok: false, result: inLd ? "ikke_synlig_ennaa (siden)" : "ikke_synlig_ennaa (JSON-LD streetAddress)" };
 }
 
 /**

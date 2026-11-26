@@ -149,6 +149,18 @@ export function shownPostnummer(pnr: string | null | undefined): string | null {
   return value === "" || value === PLACEHOLDER_POSTNUMMER ? null : pnr;
 }
 
+/**
+ * The official poststed (as Posten writes it, upper case) for a postnummer,
+ * or null for a malformed or unknown one. Used by the Opplevagent address
+ * unit (opplevagent-address-unit.ts) to refuse a postnummer that does not
+ * exist or does not belong to the place written with it.
+ */
+export function poststedForPostnummer(pnr: string): string | null {
+  const value = typeof pnr === "string" ? pnr.trim() : "";
+  if (!/^\d{4}$/.test(value)) return null;
+  return load().byPostnummer.get(value)?.poststed ?? null;
+}
+
 /** Every postnummer in a kommune, sorted; [] for an unknown kommunenummer. */
 export function postnumreForKommune(kommunenummer: string): string[] {
   return [...(load().byKommune.get((kommunenummer || "").trim()) ?? [])];

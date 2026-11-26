@@ -48,6 +48,12 @@
  *   cqr19-cqr21 cancel never exposes an earlier removal; a row someone else
  *              adds meanwhile is neither cleaned up nor removed by cancel;
  *              an old cs_change_requests table gets blocklist_plan.
+ *   cse1-cse28 dev-request 2026-11-26-cs-endring-som-eier-opplevagent: the
+ *              owner's own request on an owner-claimed Opplevagent profile
+ *              (AK1), nothing written without the owner's authority, other
+ *              writers and the admin route still owner_locked, a forged owner
+ *              context refused (AK2), the dry run reports locks (AK3), a
+ *              failed map lookup writes nothing (AK4); address as one unit.
  *
  * Standalone:
  *   node node_modules/tsx/dist/cli.mjs src/services/cs-change-requests.test.ts
@@ -225,7 +231,10 @@ export function runCsChangeRequestsTests(opts: { log?: boolean } = {}): Promise<
         if (m && host === "opplevagent.no") {
           const p = exp.prepare("SELECT * FROM experience_providers WHERE slug = ?").get(decodeURIComponent(m[1])) as any;
           if (!p || p.catalog_hidden === 1) return r(404, "Ikke funnet");
-          return r(200, `<h1>${p.navn}</h1><p>${p.about_text ?? ""}</p>`);
+          // As the real page: the address line and LocalBusiness JSON-LD (streetAddress = adresse).
+          const ld = { "@context": "https://schema.org", "@type": "LocalBusiness", name: p.navn, address: { "@type": "PostalAddress", streetAddress: p.adresse || undefined, addressLocality: p.poststed || undefined, addressCountry: "NO" } };
+          const addr = [p.adresse, [p.postnummer, p.poststed].filter(Boolean).join(" ")].filter(Boolean).join(", ");
+          return r(200, `<h1>${p.navn}</h1><p>${p.about_text ?? ""}</p>${addr ? `<p>${addr}</p>` : ""}<script type="application/ld+json">${JSON.stringify(ld)}</script>`);
         }
         if (path.startsWith("/api/opplevelser/discover")) {
           const rows = exp.prepare("SELECT id, slug FROM experience_providers WHERE COALESCE(catalog_hidden, 0) = 0").all();
@@ -1070,6 +1079,170 @@ export function runCsChangeRequestsTests(opts: { log?: boolean } = {}): Promise<
             eq(R(v1.request.id).status, "verified", "cqa15b: verified once it shows");
           }
         }
+      }
+
+      // ── dev-request 2026-11-26-cs-endring-som-eier-opplevagent ───────
+      // The owner's own request on an owner-claimed Opplevagent profile;
+      // address as one unit (street, postnummer, poststed, map point); the
+      // dry run reports locks. The geocoder is stubbed (no outbound calls).
+      {
+        const store = require("./experience-store") as typeof import("./experience-store");
+        const au = require("./opplevagent-address-unit") as typeof import("./opplevagent-address-unit");
+        const geoCalls: Array<{ street: string; postnummer: string; poststed: string }> = [];
+        let geoAnswer: { lat: number; lon: number; confidence: string } | null = { lat: 59.9155, lon: 10.7351, confidence: "high" };
+        const geocode: import("./cs-change-requests").AddressGeocoder = async (a) => { geoCalls.push(a); return geoAnswer; };
+        const gdeps = () => deps({ geocode });
+        const OWNER_LOCKS = JSON.stringify({ owner_locks: { about_text: { locked_at: "2026-11-01T00:00:00Z", by: "owner" } } });
+        const mkExp = (id: string, navn: string, epost: string, site: string, slug: string, contentSource: string | null, fp: string | null = null) => {
+          exp.prepare(
+            `INSERT INTO experience_providers (id, navn, epost, hjemmeside, slug, content_source, adresse, postnummer, poststed, lat, lon, about_text, field_provenance)
+             VALUES (?, ?, ?, ?, ?, ?, 'Gamleveien 1', '0150', 'Oslo', 59.9100, 10.7500, 'Gammel tekst om bryggeriet', ?)`,
+          ).run(id, navn, epost, site, slug, contentSource, fp);
+        };
+        mkExp("ep-own", "Ølsmia Test", "post@olsmia.no", "https://olsmia.no", "olsmia-test--own", "claim", OWNER_LOCKS);
+        mkExp("ep-man", "Manuellgården", "post@manuellgarden.no", "https://manuellgarden.no", "manuellgarden--man", "manual");
+        const cols = (id: string) => exp.prepare("SELECT adresse, postnummer, poststed, lat, lon FROM experience_providers WHERE id = ?").get(id) as any;
+        const auditFor = (id: string) => exp.prepare("SELECT field_name, new_value, source_url FROM gardssalg_content_audit WHERE provider_id = ? ORDER BY rowid").all(id) as any[];
+        const expCreate = (targetId: string, from: string, thread: string | null, changes: Record<string, string>, apply = true) =>
+          cq.createChangeRequest({ vertical: "experiences", targetId, threadId: thread, requesterEmail: from, kind: "profile_update", createdBy: "claude", apply, changes }, { env: ON }) as any;
+
+        // parse: one unit, venue name tolerated, refusals.
+        const pu = (v: string) => { const x = au.parseAddressUnit(v); return x.ok ? [x.street, x.postnummer, x.poststed, x.ignored] : x.reason; };
+        eq([pu("Universitetsgata 2, 0164 Oslo"), pu("Rebel, Universitetsgata 2, 0164 Oslo, Norge"), pu("Universitetsgata 2 0164 Oslo")],
+          [["Universitetsgata 2", "0164", "Oslo", []], ["Universitetsgata 2", "0164", "Oslo", ["Rebel"]], ["Universitetsgata 2", "0164", "Oslo", []]],
+          "cse1: «gate, postnummer poststed» is one unit; a leading venue name is not stored in adresse; a trailing «Norge» is dropped");
+        eq([pu("Universitetsgata 2"), pu("Postboks 12, 0164 Oslo"), pu("Universitetsgata 2, 9999 Oslo"), pu("Universitetsgata 2, 0164 Bergen")],
+          ["adresse_mangler_postnummer_og_poststed", "postboks_er_ikke_besoksadresse", "postnummer_ukjent:9999", "poststed_passer_ikke_postnummer:0164=OSLO"],
+          "cse2: no postnummer, a post box, an unknown postnummer, a place that is not the postnummer's → refused");
+
+        // AK3 (+ dry run of the owner path): what each field's write will do.
+        const tOwn = mkThread("experiences", "post@olsmia.no");
+        const tNabo = mkThread("experiences", "naboen@example.no");
+        const dOwn = expCreate("ep-own", "post@olsmia.no", tOwn, { address: "Rebel, Universitetsgata 2, 0164 Oslo", email: "post@olsmia.no" }, false);
+        eq([dOwn.plan.would_be, dOwn.plan.fields, dOwn.plan.address_unit?.adresse, dOwn.plan.address_unit?.postnummer, dOwn.plan.address_unit?.ikke_lagret],
+          ["queued", { address: "owner_request", email: "ok" }, "Universitetsgata 2", "0164", ["Rebel"]],
+          "cse3: dry run from the registered address on an owner-claimed profile → address owner_request, e-mail ok, queued; the unit and the dropped venue name shown");
+        const dNabo = expCreate("ep-own", "naboen@example.no", tNabo, { address: "Universitetsgata 2, 0164 Oslo", name: "Ølsmia" }, false);
+        ok(dNabo.plan.would_be === "approval_needed" && String(dNabo.plan.fields?.address).startsWith("locked: adresse: eier-overtatt profil")
+          && String(dNabo.plan.fields?.name).startsWith("locked: navn:") && dNabo.plan.reason === "avsender_ikke_profilens_adresse",
+          `cse4 (AK3): a field that would be stopped says locked: <reason> and would_be approval_needed, not queued (got ${JSON.stringify(dNabo.plan.fields)} ${dNabo.plan.would_be})`);
+        const dPlain = expCreate("ep-1", "hei@siderivest.no", mkThread("experiences", "hei@siderivest.no"), { about_text: "Velkommen til sideriet vårt" }, false);
+        eq([dPlain.plan.fields, dPlain.plan.would_be], [{ about_text: "ok" }, "queued"], "cse5: a field no lock stops → ok");
+        eq([expCreate("ep-own", "post@olsmia.no", tOwn, { address: "Universitetsgata 2, 9999 Oslo" }, false).error, expCreate("ep-own", "post@olsmia.no", tOwn, { address: "Universitetsgata 2" }, false).detail?.reason],
+          ["invalid_address", "adresse_mangler_postnummer_og_poststed"], "cse6: an invalid address unit is refused already in the dry run");
+
+        // AK4: the map lookup fails → nothing of the four columns (or the point) changes.
+        const before = cols("ep-own");
+        const nAudit = auditFor("ep-own").length;
+        geoAnswer = null;
+        const f1 = expCreate("ep-own", "post@olsmia.no", tOwn, { address: "Universitetsgata 2, 0164 Oslo" });
+        await cq.runCsChangeRequests(gdeps());
+        eq([R(f1.request.id).status, cols("ep-own"), auditFor("ep-own").length], ["failed", before, nAudit],
+          "cse7 (AK4): failed map lookup → request failed, adresse/postnummer/poststed/lat/lon unchanged, no audit row");
+        ok(String(R(f1.request.id).status_reason).includes("kartoppslaget fant ikke"), "cse7b: the reason says the map lookup found nothing");
+        geoAnswer = { lat: 0, lon: 0, confidence: "high" };
+        const f2 = expCreate("ep-own", "post@olsmia.no", tOwn, { address: "Universitetsgata 2, 0164 Oslo", name: "Ølsmia Bryggeri" });
+        await cq.runCsChangeRequests(gdeps());
+        eq([R(f2.request.id).status, cols("ep-own"), (exp.prepare("SELECT navn FROM experience_providers WHERE id = 'ep-own'").get() as any).navn], ["failed", before, "Ølsmia Test"],
+          "cse8 (AK4): a point outside Norway counts as a failed lookup — nothing written, not even the other field");
+
+        // AK1: the owner's own address change → verified, all four columns and the point changed.
+        geoAnswer = { lat: 59.9155, lon: 10.7351, confidence: "high" };
+        const nCalls = calls.length;
+        const a1 = expCreate("ep-own", "post@olsmia.no", tOwn, { address: "Universitetsgata 2, 0164 Oslo" });
+        eq([a1.request.status, a1.request.authority], ["queued", "registered_email"], "cse9: filed from the registered address → queued");
+        await cq.runCsChangeRequests(gdeps());
+        const a1r = R(a1.request.id);
+        eq([a1r.status, cols("ep-own")], ["verified", { adresse: "Universitetsgata 2", postnummer: "0164", poststed: "Oslo", lat: 59.9155, lon: 10.7351 }],
+          "cse10 (AK1): address change from the registered e-mail on an owner-claimed profile → verified; street, postnummer, poststed and map point changed");
+        const src1 = `owner-request via cs-change-request ${a1.request.id}`;
+        const aud1 = auditFor("ep-own").filter((x) => x.source_url === src1);
+        eq(aud1.map((x) => [x.field_name, x.new_value]), [["adresse", "Universitetsgata 2"], ["postnummer", "0164"], ["poststed", "Oslo"]],
+          "cse11: one audit row per address column, source «owner-request via cs-change-request <id>»");
+        const fp1 = JSON.parse((exp.prepare("SELECT field_provenance FROM experience_providers WHERE id = 'ep-own'").get() as any).field_provenance);
+        ok(fp1.adresse?.source_url === src1 && fp1.postnummer?.source_url === src1 && fp1.poststed?.source_url === src1 && !!fp1.owner_locks?.about_text,
+          "cse12: field_provenance for adresse/postnummer/poststed says owner-request; the owner's own locks are kept");
+        const snap1 = JSON.parse(a1r.snapshot!).address;
+        eq([snap1.old, snap1.old_columns?.adresse, snap1.old_columns?.postnummer, snap1.old_columns?.poststed, snap1.old_columns?.lat, snap1.old_columns?.lon, snap1.new?.lat],
+          ["Gamleveien 1", "Gamleveien 1", "0150", "Oslo", 59.91, 10.75, 59.9155], "cse13: the snapshot keeps all old columns and the old point (rollback)");
+        const vStep = JSON.parse(a1r.steps).filter((x: any) => x.step === "verify").pop();
+        ok(String(vStep?.detail?.fields?.address).includes("JSON-LD"), "cse14: verified on the public page's JSON-LD streetAddress");
+        ok(!calls.slice(nCalls).some((c) => c.path.endsWith("gardssalg-set-address")), "cse15: the owner path never calls the admin address route");
+        eq(geoCalls[geoCalls.length - 1], { street: "Universitetsgata 2", postnummer: "0164", poststed: "Oslo" }, "cse16: the map point is looked up for exactly the unit");
+
+        // Owner path for the other locked fields: name (claim row) and about_text (owner_locks).
+        const aboutNew = "Ølsmia er et lite bryggeri på Grünerløkka i Oslo. Vi brygger øl i små batcher og tar imot besøk til smaking i bryggeriet.";
+        const n1 = expCreate("ep-own", "post@olsmia.no", tOwn, { name: "Ølsmia Bryggeri", about_text: aboutNew });
+        await cq.runCsChangeRequests(gdeps());
+        const n1r = R(n1.request.id);
+        const row1 = exp.prepare("SELECT navn, about_text FROM experience_providers WHERE id = 'ep-own'").get() as any;
+        eq([n1r.status, row1.navn, row1.about_text], ["verified", "Ølsmia Bryggeri", aboutNew], "cse17: name and an owner-locked about_text from the owner → written as the owner's own, verified");
+        eq(auditFor("ep-own").filter((x) => x.source_url === `owner-request via cs-change-request ${n1.request.id}`).map((x) => x.field_name), ["navn", "about_text"],
+          "cse18: their audit rows say owner-request via cs-change-request <id>");
+        ok(calls.some((c) => c.path.endsWith("gardssalg-set-field-lock") && c.body.provider_id === "ep-own" && c.body.field === "about_text"), "cse19: the content field is locked after the write, as before");
+
+        // AK2: without the owner's authority nothing is written.
+        const beforeNabo = cols("ep-own");
+        const x1 = expCreate("ep-own", "naboen@example.no", tNabo, { address: "Storgata 1, 0155 Oslo" });
+        eq([x1.request.status, x1.request.status_reason], ["approval_needed", "avsender_ikke_profilens_adresse"], "cse20 (AK2): wrong sender → approval queue");
+        crm.crmService.ingestThread({ threadId: "kontakt-cse-1", subject: "[Kontaktskjema] ny adresse", category: "innkommende", messages: [{ messageId: "kontakt-cse-1-in", direction: "in", fromEmail: "post@olsmia.no", sentAt: ago(1) }] }, "post@olsmia.no", "experiences");
+        const x2 = expCreate("ep-own", "post@olsmia.no", "kontakt-cse-1", { address: "Storgata 1, 0155 Oslo" });
+        eq([x2.request.status, x2.request.status_reason], ["approval_needed", "kontaktskjema"], "cse21 (AK2): the contact form → approval queue");
+        await cq.runCsChangeRequests(gdeps());
+        eq(cols("ep-own"), beforeNabo, "cse22 (AK2): neither is written");
+        // Even approved by Daniel, a request without the owner's authority meets the lock.
+        cq.approveChangeRequest(x1.request.id);
+        await cq.runCsChangeRequests(gdeps());
+        const x1r = R(x1.request.id);
+        const x1w = JSON.parse(x1r.steps).find((x: any) => x.step === "write_address");
+        eq([x1r.status, x1w?.detail?.mode, x1w?.detail?.result?.reason, cols("ep-own")], ["failed", "admin", "owner_locked", beforeNabo],
+          "cse23 (AK2): an approved request without owner authority is written as admin and stopped by owner_locked; nothing changed");
+        // The enrichment write path and the plain admin writer still meet the lock.
+        eq(store.applyGardssalgProviderAddress("ep-own", { adresse: "Storgata 1", postnummer: "0155", poststed: "Oslo" }, "https://example.no/kontakt"), [],
+          "cse24 (AK2): enrichment's address writer writes nothing on an owner-claimed row");
+        const ownRow = exp.prepare("SELECT content_source, field_provenance FROM experience_providers WHERE id = 'ep-own'").get() as any;
+        eq([store.isGardssalgFieldOwnerLocked(ownRow, "adresse"), (store.applyGardssalgSetAddress("ep-own", "Storgata 1", "admin-test") as any).reason, cols("ep-own")],
+          [true, "owner_locked", beforeNabo], "cse25 (AK2): adresse stays owner_locked for every other writer");
+        // A forged owner context: the writer checks the request row itself.
+        const unit = { street: "Storgata 1", postnummer: "0155", poststed: "Oslo", lat: 59.91, lon: 10.75 };
+        const forge = (id: string) => store.applyGardssalgSetAddressUnit("ep-own", unit, "x", { ownerRequest: { changeRequestId: id } }) as any;
+        db.prepare("UPDATE cs_change_requests SET status = 'executing' WHERE id = ?").run(x1.request.id); // approved, being executed
+        const fApproved = forge(x1.request.id).detail;
+        db.prepare("UPDATE cs_change_requests SET status = 'failed' WHERE id = ?").run(x1.request.id);
+        const fDone = forge(a1.request.id).detail; // owner authority, but not being executed
+        db.prepare("UPDATE cs_change_requests SET status = 'executing' WHERE id = ?").run(a1.request.id);
+        const fValue = forge(a1.request.id).detail; // a different address than the request asked for
+        const fOther = (store.applyGardssalgSetAddressUnit("ep-man", { ...unit, street: "Universitetsgata 2", postnummer: "0164" }, "x", { ownerRequest: { changeRequestId: a1.request.id } }) as any).detail;
+        db.prepare("UPDATE cs_change_requests SET status = 'verified' WHERE id = ?").run(a1.request.id);
+        eq([fApproved, forge("chg-finnes-ikke").detail, fDone, fValue, fOther, cols("ep-own")],
+          ["owner_request_no_owner_authority", "owner_request_not_found", "owner_request_not_executing", "owner_request_value_mismatch", "owner_request_wrong_target", beforeNabo],
+          "cse26 (AK2): an owner context is only honoured for a real executing request with owner authority, for this provider and value");
+        // A direct admin HTTP call cannot use the owner path.
+        {
+          const prevKey = process.env.ADMIN_KEY;
+          process.env.ADMIN_KEY = prevKey || "cse-admin-key";
+          try {
+            const router = (require("../routes/opplevelser") as typeof import("../routes/opplevelser")).default as any;
+            const callRoute = (url: string, body: any) => new Promise<{ status: number; body: any }>((resolve) => {
+              const req: any = { method: "POST", url, originalUrl: url, path: url, query: {}, headers: { "x-admin-key": process.env.ADMIN_KEY }, body, get() { return undefined; } };
+              const res: any = { statusCode: 200, status(c: number) { this.statusCode = c; return this; }, json(p: any) { resolve({ status: this.statusCode, body: p }); return this; } };
+              router.handle(req, res, (err?: any) => resolve({ status: 500, body: { error: String(err) } }));
+            });
+            db.prepare("UPDATE cs_change_requests SET status = 'executing' WHERE id = ?").run(a1.request.id);
+            const smuggle = { ownerRequest: { changeRequestId: a1.request.id }, owner_request: true, change_request_id: a1.request.id, dataSource: "owner" };
+            const h1 = await callRoute("/admin/gardssalg-set-address", { provider_id: "ep-own", value: "Universitetsgata 2", source: src1, ...smuggle });
+            const h2 = await callRoute("/admin/gardssalg-set-provider-name", { provider_id: "ep-own", value: "Kapret navn", source: src1, ...smuggle });
+            db.prepare("UPDATE cs_change_requests SET status = 'verified' WHERE id = ?").run(a1.request.id);
+            eq([h1.status, h1.body?.error, h2.status, h2.body?.error, (exp.prepare("SELECT navn FROM experience_providers WHERE id = 'ep-own'").get() as any).navn],
+              [409, "owner_locked", 409, "owner_locked", "Ølsmia Bryggeri"], "cse27 (AK2): a direct admin HTTP call with owner-path fields in the body is still owner_locked");
+          } finally {
+            if (prevKey === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = prevKey;
+          }
+        }
+        // content_source 'manual' locks every field; the owner's request goes through the same narrow path.
+        const m1 = expCreate("ep-man", "post@manuellgarden.no", mkThread("experiences", "post@manuellgarden.no"), { address: "Universitetsgata 2, 0164 Oslo" });
+        await cq.runCsChangeRequests(gdeps());
+        eq([R(m1.request.id).status, cols("ep-man").adresse], ["verified", "Universitetsgata 2"], "cse28: on a content_source=manual profile the owner's own address change → verified");
       }
     } catch (err: any) {
       failed++;
