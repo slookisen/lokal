@@ -544,6 +544,61 @@ export function computeRfbMarketingGuardrailMetrics(db: Db, now: Date): RfbMarke
   };
 }
 
+/**
+ * dev-request 2026-11-26-innsyn-i-levering-…-kontrollkopier, point 4: «antall levert»
+ * for the RFB outreach. Resend reports a delivery seconds to minutes AFTER a send, so a
+ * run cannot count its own sends at its end; each run reports the sends of the EARLIER
+ * runs in the last RFB_MARKETING_BOUNCE_LOOKBACK_HOURS (ledger rows 'sent', reserved
+ * before `before` = this run's start), with Resend's verdict per send read from
+ * crm_message_delivery through the compose outbox row (crm_outbox.crm_message_id).
+ * Seed copies have no ledger row, so they are never counted. Measurement only.
+ */
+export interface RfbMarketingDeliveryCounts {
+  window_hours: number;
+  window_since: string;
+  window_until: string;
+  sent: number;
+  delivered: number;
+  soft_bounced: number;
+  bounced: number;
+  complained: number;
+  no_verdict: number;
+}
+
+export function computeRfbMarketingDeliveryCounts(db: Db, before: Date): RfbMarketingDeliveryCounts {
+  const since = new Date(before.getTime() - RFB_MARKETING_BOUNCE_LOOKBACK_HOURS * 3600_000);
+  const out: RfbMarketingDeliveryCounts = {
+    window_hours: RFB_MARKETING_BOUNCE_LOOKBACK_HOURS,
+    window_since: since.toISOString(),
+    window_until: before.toISOString(),
+    sent: 0,
+    delivered: 0,
+    soft_bounced: 0,
+    bounced: 0,
+    complained: 0,
+    no_verdict: 0,
+  };
+  const rows = db
+    .prepare(
+      `SELECT d.status AS status
+         FROM rfb_marketing_send_ledger l
+         LEFT JOIN crm_outbox o ON o.id = l.outbox_id
+         LEFT JOIN crm_message_delivery d ON d.crm_message_id = o.crm_message_id
+        WHERE l.status = 'sent'
+          AND datetime(l.reserved_at) >= datetime(?) AND datetime(l.reserved_at) < datetime(?)`,
+    )
+    .all(since.toISOString(), before.toISOString()) as Array<{ status: string | null }>;
+  for (const r of rows) {
+    out.sent += 1;
+    if (r.status === "delivered" || r.status === "soft_bounced" || r.status === "bounced" || r.status === "complained") {
+      out[r.status] += 1;
+    } else {
+      out.no_verdict += 1;
+    }
+  }
+  return out;
+}
+
 export interface RfbMarketingHealthSignal {
   red: boolean;
   reasons: string[];
@@ -1805,6 +1860,14 @@ async function runRfbMarketingDailyGuarded(opts: {
         );
       } catch (err) {
         console.error("[rfb-marketing-daily] guardrail metrics not computed (non-fatal):", err);
+      }
+      // Point 4 (dev-request 2026-11-26-innsyn-i-levering): delivered count for the
+      // earlier runs' sends (see computeRfbMarketingDeliveryCounts). Non-fatal.
+      try {
+        const dc = computeRfbMarketingDeliveryCounts(db, new Date(startedAt));
+        guardrailClaims.push({ type: "custom", value: dc.delivered, meta: { kind: "rfb_marketing_delivered", lane: "rfb-marketing", ...dc } });
+      } catch (err) {
+        console.error("[rfb-marketing-daily] delivery counts not computed (non-fatal):", err);
       }
       try {
         recordRun({

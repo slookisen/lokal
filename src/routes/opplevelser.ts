@@ -22811,6 +22811,12 @@ interface GardssalgV4MeasurementRow {
   claimed: boolean;
   replied: boolean;
   unsubscribed: boolean;
+  /**
+   * Resend's verdict for this send's CRM message (crm_message_delivery, fed by the
+   * webhook): 'delivered' | 'soft_bounced' | 'bounced' | 'complained', or null while
+   * none has arrived (dev-request 2026-11-26-innsyn-i-levering, point 4).
+   */
+  delivery: string | null;
 }
 
 /**
@@ -22860,12 +22866,23 @@ export function computeGardssalgV4Measurement(
   // LIKE (not json_extract): raw_metadata may hold malformed JSON on old rows.
   const msgs = rfbDb
     .prepare(
-      `SELECT sent_at, to_emails, raw_metadata FROM crm_messages
+      `SELECT id, sent_at, to_emails, raw_metadata FROM crm_messages
         WHERE direction = 'out' AND (raw_metadata LIKE '%"template"%personal-v4%' OR raw_metadata LIKE '%"touch_round"%')
           AND datetime(sent_at) >= datetime(?)
         ORDER BY sent_at ASC, rowid ASC`,
     )
-    .all(cutoff.toISOString()) as Array<{ sent_at: string; to_emails: string | null; raw_metadata: string | null }>;
+    .all(cutoff.toISOString()) as Array<{ id: string; sent_at: string; to_emails: string | null; raw_metadata: string | null }>;
+  // Point 4 (dev-request 2026-11-26-innsyn-i-levering): Resend's verdict per send. Only
+  // the lane's own CRM messages are read, so a seed copy (never filed) is never counted.
+  const deliveryStmt = (() => {
+    try {
+      return rfbDb.prepare(`SELECT status FROM crm_message_delivery WHERE crm_message_id = ?`);
+    } catch {
+      return null; // pre-migration DB: no verdicts
+    }
+  })();
+  const deliveryOf = (id: string): string | null =>
+    (deliveryStmt?.get(id) as { status: string } | undefined)?.status ?? null;
 
   const providerStmt = expDb.prepare(`SELECT slug, claimed_at FROM experience_providers WHERE id = ?`);
   const claimStmt = expDb.prepare(
@@ -22908,6 +22925,7 @@ export function computeGardssalgV4Measurement(
       claimed: !!provider?.claimed_at,
       replied,
       unsubscribed,
+      delivery: deliveryOf(m.id),
     };
     if (isV4) sends.push(row);
     if (round !== undefined) roundRows.push({ round, row, fjern: fjernReply });
@@ -22926,12 +22944,15 @@ export function computeGardssalgV4Measurement(
   const summarise = (t: string) => summariseRows(sends.filter((s) => s.template === t));
   // Per round: sends, replies, «fjern»/unsubscribes (`unsubscribed` as above, plus «fjern»
   // alone as `fjern`) and takeovers (`claimed`), with the template names seen in the round.
-  const byRound: Record<string, ReturnType<typeof summariseRows> & { fjern: number; templates: string[] }> = {};
+  const byRound: Record<string, ReturnType<typeof summariseRows> & { fjern: number; delivered: number; templates: string[] }> = {};
   for (const r of Array.from(new Set(roundRows.map((x) => x.round))).sort((a, b) => a - b)) {
     const rows = roundRows.filter((x) => x.round === r);
     byRound[String(r)] = {
       ...summariseRows(rows.map((x) => x.row)),
       fjern: rows.filter((x) => x.fjern).length,
+      // Point 4 (dev-request 2026-11-26-innsyn-i-levering): Resend reported «delivered»
+      // (a later bounce/complaint outranks it, so such a send is not counted here).
+      delivered: rows.filter((x) => x.row.delivery === "delivered").length,
       templates: Array.from(new Set(rows.map((x) => x.row.template))).sort(),
     };
   }

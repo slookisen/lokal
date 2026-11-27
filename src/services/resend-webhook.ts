@@ -214,9 +214,22 @@ export function processResendWebhookEvent(svixId: string, event: any): ResendWeb
       console.warn(`[resend-webhook] send attribution failed (bounce recorded without it): ${err?.message ?? err}`);
     }
   }
+  // dev-request 2026-11-26-innsyn-i-levering (point 4): the exact link first — the
+  // Message-ID we sent, echoed by Resend as data.message_id. When it names one of our
+  // outbound CRM messages, that is the message for the delivery AND the verdict; the
+  // recipient + time (+ subject) heuristics below are only the fallback for events
+  // without it. Read-only, best effort.
+  let exactCrmMessageId: string | null = null;
+  if (email) {
+    try {
+      exactCrmMessageId = resolveCrmMessageByMessageId(data?.message_id, email);
+    } catch (err: any) {
+      console.warn(`[resend-webhook] message-id lookup failed (falling back to recipient + time): ${err?.message ?? err}`);
+    }
+  }
   // Same best-effort, read-only rule for a delivery's CRM message.
-  let deliveryCrmMessageId: string | null = null;
-  if (email && outcome === "delivery_recorded") {
+  let deliveryCrmMessageId: string | null = exactCrmMessageId;
+  if (email && outcome === "delivery_recorded" && !deliveryCrmMessageId) {
     try {
       const acceptedAt = [data?.created_at, event?.created_at].map((v) => parseDbTime(v)).find((t) => Number.isFinite(t));
       deliveryCrmMessageId = resolveDeliveryCrmMessage(email, new Date(acceptedAt ?? Date.now()));
@@ -226,8 +239,8 @@ export function processResendWebhookEvent(svixId: string, event: any): ResendWeb
   }
   // S3 (CS på serveren): which CRM message a bounce / complaint / soft bounce
   // belongs to — same recipient + time rule as a delivery. Read-only, best effort.
-  let verdictCrmMessageId: string | null = null;
-  if (email && outcome !== "ambiguous_recipient") {
+  let verdictCrmMessageId: string | null = exactCrmMessageId;
+  if (email && outcome !== "ambiguous_recipient" && !verdictCrmMessageId) {
     try {
       const acceptedAt = [data?.created_at, event?.created_at].map((v) => parseDbTime(v)).find((t) => Number.isFinite(t));
       verdictCrmMessageId = resolveVerdictCrmMessage(email, new Date(acceptedAt ?? Date.now()), data?.subject);
@@ -432,6 +445,9 @@ export function resolveBounceSendAttribution(email: string, acceptedAt: Date): B
 // than DELIVERY_ATTRIBUTION_LOOKBACK_DAYS before it. Short lookback: Resend
 // reports a delivery seconds to minutes after acceptance, so anything older
 // is not this mail. NULL when none fits.
+// Since dev-request 2026-11-26-innsyn-i-levering (point 4) this and
+// resolveVerdictCrmMessage are only the FALLBACK: processResendWebhookEvent first
+// links by data.message_id (resolveCrmMessageByMessageId, below).
 export const DELIVERY_ATTRIBUTION_LOOKBACK_DAYS = 7;
 const DELIVERY_CANDIDATE_LIMIT = 500;
 
@@ -491,8 +507,30 @@ export function resolveDeliveryCrmMessage(email: string, acceptedAt: Date): stri
  * ambiguous → null (no verdict recorded rather than a wrong one).
  */
 export const VERDICT_AMBIGUITY_MS = 10 * 60_000;
+// RFC 2047 encoded-words (=?UTF-8?Q?G=C3=A5rdssalg?=), as nodemailer writes a
+// non-ASCII Subject on the wire. If a webhook ever reports the header undecoded, the
+// subject comparison must still see the same text as the stored subject (point 4).
+const ENCODED_WORD = /=\?([^?\s]+)\?([bBqQ])\?([^?\s]*)\?=/g;
+function decodeEncodedWords(s: string): string {
+  if (!s.includes("=?")) return s;
+  // Whitespace between two adjacent encoded-words is not part of the text.
+  const joined = s.replace(/(\?=)\s+(?==\?)/g, "$1");
+  return joined.replace(ENCODED_WORD, (whole, charset: string, enc: string, text: string) => {
+    const cs = charset.toLowerCase().split("*")[0];
+    if (cs !== "utf-8" && cs !== "utf8" && cs !== "iso-8859-1" && cs !== "latin1" && cs !== "us-ascii") return whole;
+    try {
+      const buf =
+        enc.toLowerCase() === "b"
+          ? Buffer.from(text, "base64")
+          : Buffer.from(text.replace(/_/g, " ").replace(/=([0-9A-Fa-f]{2})/g, (_m, h: string) => String.fromCharCode(parseInt(h, 16))), "latin1");
+      return buf.toString(cs === "utf-8" || cs === "utf8" ? "utf8" : "latin1");
+    } catch {
+      return whole;
+    }
+  });
+}
 function normSubject(s: unknown): string {
-  return typeof s === "string" ? s.replace(/\s+/g, " ").trim().toLowerCase() : "";
+  return typeof s === "string" ? decodeEncodedWords(s).normalize("NFC").replace(/\s+/g, " ").trim().toLowerCase() : "";
 }
 export function resolveVerdictCrmMessage(email: string, acceptedAt: Date, subject: unknown): string | null {
   const hi = acceptedAt.getTime() + BOUNCE_ATTRIBUTION_CLOCK_SLACK_MS;
@@ -519,6 +557,39 @@ export function resolveVerdictCrmMessage(email: string, acceptedAt: Date, subjec
   if (cands.length === 0) return null;
   if (cands.length > 1 && Math.abs(parseDbTime(cands[0].sent_at) - parseDbTime(cands[1].sent_at)) < VERDICT_AMBIGUITY_MS) return null;
   return cands[0].id;
+}
+
+/**
+ * dev-request 2026-11-26-innsyn-i-levering-…-kontrollkopier, point 4: the exact link.
+ * Resend's event carries data.message_id — the Message-ID header of the mail as we
+ * handed it to the SMTP relay (nodemailer generates it; sendEmail/sendRaw return it).
+ * Both outreach jobs already keep that id:
+ *   • the Opplevagent gårdssalg send files it AS crm_messages.id (ingestThread);
+ *   • a compose / reply send (the RFB daily job, POST /admin/crm/compose,
+ *     /threads/:id/send) keeps it in crm_outbox.result_id, next to crm_message_id.
+ * Returns the outbound crm_messages.id whose recipients include `email`, or null
+ * (no id in the event, or none of ours — e.g. a seed copy, whose Message-ID is
+ * stored nowhere). Read-only; throws only on a DB error.
+ */
+export function resolveCrmMessageByMessageId(messageIdRaw: unknown, email: string): string | null {
+  if (typeof messageIdRaw !== "string") return null;
+  const bare = messageIdRaw.trim().replace(/^<|>$/g, "");
+  if (!bare || bare.length > 998 || !bare.includes("@")) return null;
+  const forms = [`<${bare}>`, bare];
+  const db = getDb();
+  const byId = db.prepare(`SELECT id, to_emails FROM crm_messages WHERE id = ? AND direction = 'out'`);
+  const byOutbox = db.prepare(
+    `SELECT m.id, m.to_emails FROM crm_outbox o JOIN crm_messages m ON m.id = o.crm_message_id
+      WHERE o.result_id = ? AND m.direction = 'out'
+      ORDER BY o.processed_at DESC LIMIT 1`,
+  );
+  for (const f of forms) {
+    for (const stmt of [byId, byOutbox]) {
+      const r = stmt.get(f) as { id: string; to_emails: string | null } | undefined;
+      if (r && parseRecipientList(r.to_emails).includes(email)) return r.id;
+    }
+  }
+  return null;
 }
 
 export interface EmailDeliveryEvent {

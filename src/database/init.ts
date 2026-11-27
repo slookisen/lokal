@@ -3558,6 +3558,10 @@ function initSchema(db: Database.Database): void {
       );
       CREATE INDEX IF NOT EXISTS idx_crm_message_delivery_status ON crm_message_delivery(status, updated_at);
     `);
+    // dev-request 2026-11-26-innsyn-i-levering (point 4): the Resend webhook links an
+    // event to its CRM message by the Message-ID we sent (data.message_id), which a
+    // compose / reply send keeps in crm_outbox.result_id.
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_crm_outbox_result_id ON crm_outbox(result_id)`);
   } catch (err) {
     console.error("Migration crm_message_delivery failed:", err);
   }
