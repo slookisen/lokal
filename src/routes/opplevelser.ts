@@ -870,7 +870,9 @@ import {
   GARDSSALG_OUTREACH_REPLY_TO,
   isGardssalgOutreachTemplate,
   GARDSSALG_OUTREACH_FOLLOWUP_TEMPLATES,
+  GardssalgOutreachSeedModel,
 } from "../services/email-service";
+import { resolveOutreachSeedRecipients, sendOutreachSeedCopies, type OutreachSeedCopyResult } from "../services/outreach-seed-copies";
 import { crmService } from "../services/crm-service";
 import { renderGardssalgClaimMagicLink } from "../services/email-service";
 import { archiveGardssalgClaimMail, isGardssalgClaimWelcomeEmailEnabled, GARDSSALG_CLAIM_CRM_LINK_PLACEHOLDER } from "../services/gardssalg-claim-crm-archive";
@@ -21288,6 +21290,8 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
     // remaining ELIGIBLE ids are reported as skipped with that reason (still
     // one row per unique id); ineligible ids keep their own skip reason.
     let notAttemptedReason: string | null = null;
+    // Seed copies: the first real send of this call is the model (see onSent).
+    let seedModel: GardssalgOutreachSeedModel | null = null;
     for (const elig of eligibility) {
       if (!elig.eligible) {
         // NO-GO / skipped: no send attempt. `reason`/`preflight_reason`/
@@ -21329,13 +21333,24 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
         template,
         isTest,
         source: "gardssalg-outreach-pilot-send",
+        onSent: (m) => {
+          if (!seedModel) seedModel = m;
+        },
       });
       results.push(row);
       notAttemptedReason = gardssalgOutreachBatchStopReason(row);
     }
 
     const summary = summariseGardssalgOutreachSendResults(results);
-    res.json({ dry_run: !apply, results, summary });
+    // Seed copies only for a real (apply, non-test) call; the key is present only
+    // when OUTREACH_SEED_RECIPIENTS is set, so the response is otherwise unchanged.
+    const seedCopies = apply && !isTest ? await sendGardssalgOutreachRunSeedCopies(seedModel) : null;
+    res.json({
+      dry_run: !apply,
+      results,
+      summary,
+      ...(seedCopies ? { seed_copies_sent: seedCopies.sent, seed_copies_failed: seedCopies.failed } : {}),
+    });
   } catch (err) {
     console.error("[gardssalg-outreach-pilot-send] failed:", err);
     res.status(500).json({ error: "Internal error" });
@@ -21532,7 +21547,18 @@ function parseSentLogTimestamp(raw: string): Date {
 export async function sendGardssalgOutreachToEligibleProvider(
   expDb: ReturnType<typeof getExpDb>,
   elig: GardssalgOutreachEligibleRow,
-  opts: { template: GardssalgOutreachTemplate; isTest: boolean; source: string },
+  opts: {
+    template: GardssalgOutreachTemplate;
+    isTest: boolean;
+    source: string;
+    /**
+     * Seed copies (dev-request 2026-11-26-…-kontrollkopier, point 3): called once
+     * after a successful REAL (non-test) send with the exact inputs the mail was
+     * rendered from, so the run can send identical seed copies afterwards. Never
+     * changes this function's result; a throw from it is swallowed.
+     */
+    onSent?: (model: GardssalgOutreachSeedModel) => void;
+  },
 ): Promise<GardssalgOutreachSendResultRow> {
   const { template, isTest } = opts;
   const providerId = elig.provider_id;
@@ -21778,6 +21804,19 @@ export async function sendGardssalgOutreachToEligibleProvider(
         });
       }
     }
+    if (!isTest && opts.onSent) {
+      try {
+        opts.onSent({
+          providerName,
+          profileUrl,
+          template,
+          ...(renderCtx ? { ctx: renderCtx } : {}),
+          ...(inReplyToMessageId ? { inReplyToMessageId } : {}),
+        });
+      } catch {
+        // seed-copy bookkeeping only — never affects the real send's result
+      }
+    }
     return {
       provider_id: providerId,
       status: "sent",
@@ -21822,6 +21861,24 @@ export function summariseGardssalgOutreachSendResults(results: GardssalgOutreach
     else if (r.status === "error") summary.error++;
   }
   return summary;
+}
+
+/**
+ * Seed copies for one gårdssalg outreach run (dev-request 2026-11-26-innsyn-i-
+ * levering-dmarc-leveringsstatus-og-kontrollkopier, point 3). `model` is the run's
+ * first real send (null when nothing real was sent → no copies). Returns null when
+ * OUTREACH_SEED_RECIPIENTS has no valid address, so the caller can leave its report
+ * exactly as before. Never throws; never writes; logs counts only.
+ */
+export async function sendGardssalgOutreachRunSeedCopies(
+  model: GardssalgOutreachSeedModel | null,
+): Promise<OutreachSeedCopyResult | null> {
+  const recipients = resolveOutreachSeedRecipients();
+  if (recipients.length === 0) return null;
+  if (!model) return { sent: 0, failed: 0 };
+  return await sendOutreachSeedCopies("gardssalg-outreach", recipients, (to) =>
+    emailService.sendGardssalgOutreachSeedCopy(to, model),
+  );
 }
 
 // ─── GET /api/opplevelser/admin/gardssalg-outreach-daily-prep ─────────────
@@ -23218,6 +23275,13 @@ export interface GardssalgOutreachDailyRunReport {
   recipient_address_types: Record<RecipientAddressType, number>;
   results: GardssalgOutreachSendResultRow[];
   summary: { sent: number; would_send: number; skipped: number; error: number; total: number };
+  /**
+   * Seed copies (dev-request 2026-11-26-…-kontrollkopier, point 3): counts only,
+   * never addresses. Present only on an apply run that reached the send loop while
+   * OUTREACH_SEED_RECIPIENTS is set; absent otherwise (report unchanged).
+   */
+  seed_copies_sent?: number;
+  seed_copies_failed?: number;
   // Incident 2026-09-27/28 (sent_log reserve-before-send), derived from
   // `results` so every return path carries them (empty/0/false on a skip):
   //   errors — one compact entry per `error` row AND per `sent` row whose
@@ -23346,8 +23410,10 @@ async function runGardssalgOutreachDailyOnce(
     candidates?: GardssalgOutreachDailyRunReport["candidates"];
     results?: GardssalgOutreachSendResultRow[];
     autosvar_apply?: GardssalgAutosvarApplyResult | null;
+    seed_copies?: OutreachSeedCopyResult | null;
   }): GardssalgOutreachDailyRunReport => {
     const results = partial.results ?? [];
+    const seedCopies = partial.seed_copies ?? null;
     const report: GardssalgOutreachDailyRunReport = {
       run_id: runId,
       agent: GARDSSALG_OUTREACH_DAILY_AGENT,
@@ -23367,6 +23433,7 @@ async function runGardssalgOutreachDailyOnce(
       results,
       sent_by_round: countGardssalgOutreachSentByRound(partial.candidates ?? [], results),
       summary: results.length > 0 ? summariseGardssalgOutreachSendResults(results) : empty,
+      ...(seedCopies ? { seed_copies_sent: seedCopies.sent, seed_copies_failed: seedCopies.failed } : {}),
       errors: results
         .filter((r) => r.status === "error" || r.log_recorded === false)
         .map((r) => ({ provider_id: r.provider_id, status: r.status, reason: r.reason ?? "unknown" })),
@@ -23479,6 +23546,17 @@ async function runGardssalgOutreachDailyOnce(
               value: report.candidates.length,
               meta: { kind: "gardssalg_outreach_recipient_address_types", counts: report.recipient_address_types },
             },
+            // dev-request 2026-11-26-…-kontrollkopier: seed copies, counts only.
+            // Only when OUTREACH_SEED_RECIPIENTS is set — otherwise the claims are unchanged.
+            ...(seedCopies
+              ? [
+                  {
+                    type: "custom" as const,
+                    value: seedCopies.sent,
+                    meta: { kind: "outreach_seed_copies_sent", lane: "gardssalg-outreach", failed: seedCopies.failed },
+                  },
+                ]
+              : []),
           ],
           evidence: [{ claim_idx: 0, ids: sentIds }],
           notes,
@@ -23607,6 +23685,8 @@ async function runGardssalgOutreachDailyOnce(
   // og stopper resten av DENNE kjøringen, ikke først neste. Samme pause og
   // kvitteringsmekanisme (bounce_ack_max_id) som førsjekken over.
   let midBatchBounces: GardssalgOutreachBounceHit[] = [];
+  // Seed copies: the first real send of this run is the model (see onSent).
+  let seedModel: GardssalgOutreachSeedModel | null = null;
   for (const elig of selected) {
     if (!opts.apply) {
       results.push({ provider_id: elig.provider_id, status: "would_send" });
@@ -23640,11 +23720,17 @@ async function runGardssalgOutreachDailyOnce(
       template: elig.template,
       isTest: false,
       source: "gardssalg-outreach-daily-run",
+      onSent: (m) => {
+        if (!seedModel) seedModel = m;
+      },
     });
     results.push(row);
     notAttemptedReason = gardssalgOutreachBatchStopReason(row);
   }
+  // Seed copies (apply runs only; a dry run sends nothing). Never fatal.
+  const seedCopies = opts.apply ? await sendGardssalgOutreachRunSeedCopies(seedModel) : null;
   return finish({
+    seed_copies: seedCopies,
     skipped_reason: null,
     sent_today_before: sentToday,
     budget,
