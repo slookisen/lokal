@@ -784,6 +784,197 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
         assertEq(n3.skipped_reason, "paused", "n13: next run is paused until a human lifts it");
         delete process.env.DAILY_PREP_MAX_CANDIDATES;
       }
+
+      // ── (o) dev-request 2026-11-26-innsyn-i-levering-dmarc-leveringsstatus-og-
+      // kontrollkopier, point 3 (AK3/AK4): seed copies. With OUTREACH_SEED_RECIPIENTS
+      // set, a real run sends ONE copy of its first real mail to each seed address —
+      // same From/Reply-To/subject/text/headers — and the copies touch no send log,
+      // CRM row, daily cap, cooldown or measurement. Without it: no copies, report
+      // and envelope exactly as before. The pilot-send route does the same. ──
+      {
+        const prevSeeds = process.env.OUTREACH_SEED_RECIPIENTS;
+        const prevUnsub = process.env.OUTREACH_UNSUBSCRIBE_ENABLED;
+        process.env.DAILY_PREP_MAX_CANDIDATES = "20";
+        process.env.OUTREACH_UNSUBSCRIBE_ENABLED = "1";
+        const avmeld = require("../services/avmeld-service") as typeof import("../services/avmeld-service");
+        const SEED_A = "seed.one@kontroll-test.example";
+        const SEED_B = "seed-two@kontroll-test.example";
+        let oSeq = 0;
+        const mkO = (id: string): string => {
+          oSeq += 1;
+          const email = `post@${id}.no`;
+          insertProvider.run({
+            id: `prov-${id}`, navn: `Gård ${id}`, org_nr: `40000000${oSeq}`, kommune: "Voss", producer_type: "sideri",
+            epost: email, hjemmeside: `https://${id}.no`, about_text: REALISTIC_ABOUT_TEXT, products: "Sider",
+            slug: id, field_provenance: withBrregEmail(VERIFIED_PROVENANCE, email, `40000000${oSeq}`),
+          });
+          return email;
+        };
+        const tableCount = (t: string) => (rfbDb.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get() as { n: number }).n;
+        const seedRowsAnywhere = () =>
+          (expDb
+            .prepare(`SELECT COUNT(*) AS n FROM experience_outreach_sent_log WHERE LOWER(recipient_email) LIKE '%kontroll-test.example%'`)
+            .get() as { n: number }).n +
+          (rfbDb.prepare(`SELECT COUNT(*) AS n FROM crm_contacts WHERE LOWER(email) LIKE '%kontroll-test.example%'`).get() as { n: number }).n +
+          (rfbDb.prepare(`SELECT COUNT(*) AS n FROM crm_messages WHERE to_emails LIKE '%kontroll-test.example%'`).get() as { n: number }).n +
+          (rfbDb.prepare(`SELECT COUNT(*) AS n FROM email_bounces WHERE LOWER(email) LIKE '%kontroll-test.example%'`).get() as { n: number }).n;
+        const claimsOf = (runId: string) =>
+          JSON.parse(runsFor().filter((r) => r.run_id === runId)[0]?.claims ?? "[]") as Array<{ type: string; value: number; meta?: Record<string, any> }>;
+        const headersWithoutUnsub = (h: Record<string, string> | undefined) => {
+          const { ["List-Unsubscribe"]: _a, ["List-Unsubscribe-Post"]: _b, ...rest } = h ?? {};
+          return rest;
+        };
+        const tokenEmail = (headerValue: string | undefined) => {
+          const m = /\/avmeld\/([^>]+)>$/.exec(headerValue ?? "");
+          return m ? avmeld.verifyUnsubscribeToken(m[1])?.email ?? null : null;
+        };
+        // Earlier sections spent today's cap (clamped to 10): move their sent_log
+        // rows one day back (still inside the cooldown, so nobody is re-sent).
+        const shiftSentLogBack = () => expDb.prepare(`UPDATE experience_outreach_sent_log SET sent_at = datetime(replace(substr(sent_at, 1, 19), 'T', ' '), '-1 day')`).run();
+        setGardssalgOutreachLanePaused(expDb, { paused: false, by: "test-suite", reason: null });
+
+        try {
+          // Drain what (n) left eligible, so each run below has only its own producers.
+          delete process.env.OUTREACH_SEED_RECIPIENTS;
+          shiftSentLogBack();
+          await runGardssalgOutreachDaily({ apply: true, trigger: "manual" });
+          shiftSentLogBack();
+          // o1-o4 (AK4): no secret → no copies; report and envelope carry no seed field.
+          delete process.env.OUTREACH_SEED_RECIPIENTS;
+          mkO("o-uten-a");
+          const before0 = sent.length;
+          const o0 = await runGardssalgOutreachDaily({ apply: true, trigger: "manual" });
+          assertEq([o0.summary.sent, sent.length - before0], [1, 1], "o1 (AK4): no secret -> only the real mail left the transporter");
+          assertEq(
+            ["seed_copies_sent" in o0, "seed_copies_failed" in o0],
+            [false, false],
+            "o2 (AK4): no secret -> report has no seed field (unchanged shape)",
+          );
+          assertTrue(
+            claimsOf(o0.run_id).every((c) => c.meta?.kind !== "outreach_seed_copies_sent"),
+            "o3 (AK4): no secret -> envelope claims unchanged (no seed claim)",
+          );
+          process.env.OUTREACH_SEED_RECIPIENTS = "  ,ikke-en-adresse, ";
+          mkO("o-uten-b");
+          const beforeInvalid = sent.length;
+          const oInvalid = await runGardssalgOutreachDaily({ apply: true, trigger: "manual" });
+          assertEq(
+            [oInvalid.summary.sent, sent.length - beforeInvalid, "seed_copies_sent" in oInvalid],
+            [1, 1, false],
+            "o4 (AK4): a secret with no valid address behaves as no secret",
+          );
+
+          // o5-o20 (AK3): two seed addresses (plus junk and a case-duplicate).
+          process.env.OUTREACH_SEED_RECIPIENTS = ` Seed.One@Kontroll-Test.example ,ugyldig,${SEED_B}, seed.one@kontroll-test.example`;
+          shiftSentLogBack();
+          const realA = mkO("o-med-a");
+          const realB = mkO("o-med-b");
+          const dryBefore = await runGardssalgOutreachDaily({ apply: false, trigger: "manual" });
+          const beforeSent = sent.length;
+          const sentLogBefore = sentLogCount();
+          const contactsBefore = tableCount("crm_contacts");
+          const messagesBefore = tableCount("crm_messages");
+          const o1 = await runGardssalgOutreachDaily({ apply: true, trigger: "manual" });
+          const wire = sent.slice(beforeSent);
+          assertEq(dryBefore.results.length, 2, "o5: dry run with seeds set lists only the two producers");
+          assertEq([o1.summary.sent, o1.summary.error], [2, 0], "o6 (AK3): both real mails sent");
+          assertEq(wire.length, 4, "o7 (AK3): 2 real mails + 2 seed copies left the transporter");
+          assertEq(wire.slice(0, 2).map((m) => String(m.to)), [realA, realB], "o8: the real mails went first, to the producers");
+          assertEq(wire.slice(2).map((m) => String(m.to)), [SEED_A, SEED_B], "o9 (AK3): one copy per seed address (trimmed, lowercased, deduped, junk dropped)");
+          const model = wire[0];
+          for (const [i, copy] of wire.slice(2).entries()) {
+            assertEq(
+              [copy.from, copy.replyTo, copy.subject, copy.text, copy.html, copy.textEncoding],
+              [model.from, model.replyTo, model.subject, model.text, model.html, model.textEncoding],
+              `o10.${i} (AK3): copy has the first real mail's From/Reply-To/subject/text/(no) HTML`,
+            );
+            assertEq(headersWithoutUnsub(copy.headers), headersWithoutUnsub(model.headers), `o11.${i} (AK3): copy carries the same headers`);
+            assertEq(
+              [copy.headers?.["List-Unsubscribe-Post"], tokenEmail(copy.headers?.["List-Unsubscribe"])],
+              [model.headers?.["List-Unsubscribe-Post"], String(copy.to)],
+              `o12.${i}: List-Unsubscribe is present like the real mail's, but signed for the seed address (never a producer)`,
+            );
+            assertTrue(!/\[TEST\]|test/i.test(String(copy.subject)), `o13.${i}: no test marking in the copy's subject`);
+          }
+          assertEq(tokenEmail(model.headers?.["List-Unsubscribe"]), realA, "o14: the real mail's own token is unchanged (producer's address)");
+          assertEq([o1.seed_copies_sent, o1.seed_copies_failed], [2, 0], "o15 (AK3): report counts the copies");
+          const o1Claims = claimsOf(o1.run_id);
+          const seedClaim = o1Claims.find((c) => c.meta?.kind === "outreach_seed_copies_sent");
+          assertEq([seedClaim?.value, seedClaim?.meta?.failed], [2, 0], "o16 (AK3): envelope claims carry the count");
+          assertTrue(!JSON.stringify(o1Claims).includes("kontroll-test.example") && !JSON.stringify(o1).includes("kontroll-test.example"), "o17: no seed address in claims or report");
+          assertEq(o1Claims[0].value, 2, "o18 (AK3): emails_sent counts only the real mails");
+          assertEq(o1.sent_by_round, { "1": 2 }, "o19 (AK3): measurement (sent_by_round) counts only the real mails");
+          assertEq(
+            [sentLogCount() - sentLogBefore, tableCount("crm_contacts") - contactsBefore, tableCount("crm_messages") - messagesBefore, seedRowsAnywhere()],
+            [2, 2, 2, 0],
+            "o20 (AK3): send log, CRM contacts and CRM messages grow only by the real mails; no seed address anywhere",
+          );
+          const dryAfter = await runGardssalgOutreachDaily({ apply: false, trigger: "manual" });
+          assertEq(dryAfter.sent_today_before - dryBefore.sent_today_before, 2, "o21 (AK3): daily cap consumed only by the 2 real mails");
+          assertEq(sent.length - beforeSent, 4, "o22: a dry run with seeds set sends no copy");
+
+          // o23-o25: a run with no real send sends no copy; a failing copy never fails the run.
+          const beforeNone = sent.length;
+          const oNone = await runGardssalgOutreachDaily({ apply: true, trigger: "manual" });
+          assertEq([oNone.skipped_reason, sent.length - beforeNone], ["no_candidates", 0], "o23: nothing real sent -> no copy");
+          mkO("o-feil");
+          const okSendMail = emailSvc.transporter.sendMail;
+          emailSvc.transporter = {
+            sendMail: async (mo: Record<string, any>) => {
+              if (String(mo.to).includes("kontroll-test.example")) throw new Error(`smtp refused ${String(mo.to)}`);
+              return okSendMail(mo);
+            },
+          };
+          const oFail = await runGardssalgOutreachDaily({ apply: true, trigger: "manual" });
+          emailSvc.transporter = { sendMail: okSendMail };
+          assertEq(
+            [oFail.summary.sent, oFail.summary.error, oFail.seed_copies_sent, oFail.seed_copies_failed, runsFor().find((r) => r.run_id === oFail.run_id)?.status],
+            [1, 0, 0, 2, "completed"],
+            "o24: failing copies are counted, the real run is unaffected",
+          );
+
+          // o25-o27: the pilot-send route sends the same copies (key only when seeds are set).
+          mkO("o-pilot");
+          const beforePilot = sent.length;
+          const pilot = await callRoute(opplevelserRouter, {
+            method: "POST",
+            url: "/admin/gardssalg-outreach-pilot-send",
+            headers: auth,
+            body: { provider_ids: ["prov-o-pilot"], apply: true },
+          });
+          const pilotWire = sent.slice(beforePilot);
+          assertEq(
+            [pilot.status, pilot.body.summary?.sent, pilot.body.seed_copies_sent, pilotWire.map((m) => String(m.to))],
+            [200, 1, 2, ["post@o-pilot.no", SEED_A, SEED_B]],
+            "o25: pilot-send apply -> real mail + one copy per seed address",
+          );
+          assertEq(
+            [pilotWire[1].subject, pilotWire[1].text, pilotWire[1].from, pilotWire[1].replyTo],
+            [pilotWire[0].subject, pilotWire[0].text, pilotWire[0].from, pilotWire[0].replyTo],
+            "o26: pilot-send copy is identical to its real mail",
+          );
+          delete process.env.OUTREACH_SEED_RECIPIENTS;
+          mkO("o-pilot-uten");
+          const beforePilot2 = sent.length;
+          const pilot2 = await callRoute(opplevelserRouter, {
+            method: "POST",
+            url: "/admin/gardssalg-outreach-pilot-send",
+            headers: auth,
+            body: { provider_ids: ["prov-o-pilot-uten"], apply: true },
+          });
+          assertEq(
+            [pilot2.body.summary?.sent, sent.length - beforePilot2, "seed_copies_sent" in pilot2.body],
+            [1, 1, false],
+            "o27 (AK4): pilot-send without the secret -> no copy, response unchanged",
+          );
+        } finally {
+          if (prevSeeds === undefined) delete process.env.OUTREACH_SEED_RECIPIENTS;
+          else process.env.OUTREACH_SEED_RECIPIENTS = prevSeeds;
+          if (prevUnsub === undefined) delete process.env.OUTREACH_UNSUBSCRIBE_ENABLED;
+          else process.env.OUTREACH_UNSUBSCRIBE_ENABLED = prevUnsub;
+          delete process.env.DAILY_PREP_MAX_CANDIDATES;
+        }
+      }
     } catch (err) {
       failed++;
       failures.push(`✗ harness error: ${err instanceof Error ? err.stack || err.message : String(err)}`);

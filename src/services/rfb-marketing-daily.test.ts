@@ -2039,6 +2039,131 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq([wTransport.calls[0].inReplyToMessageId, wTransport.calls[0].subject], [undefined, "Har vi riktig info om Dryrun Gård?"], "v9: AC4 unusable first Message-ID → new mail, subject A, no threading header");
       assertEq(wr.results[0].threaded, false, "v10: result row says not threaded");
     }
+
+    // ── (y) dev-request 2026-11-26-innsyn-i-levering-dmarc-leveringsstatus-og-
+    // kontrollkopier, point 3 (AK3/AK4): seed copies. The same run twice on
+    // identical fresh databases — once without OUTREACH_SEED_RECIPIENTS, once with
+    // two addresses: the copies add exactly two transport calls (identical to the
+    // run's first real mail apart from To and the seed-signed unsubscribe token)
+    // and change no table, cap, CRM row, ledger row or measurement. ──
+    {
+      const avmeld = require("./avmeld-service") as typeof import("./avmeld-service");
+      const prevSeeds = process.env.OUTREACH_SEED_RECIPIENTS;
+      const prevUnsub = process.env.OUTREACH_UNSUBSCRIBE_ENABLED;
+      const SEED_A = "seed.one@kontroll-test.example";
+      const SEED_B = "seed-two@kontroll-test.example";
+      const tokenEmail = (v: string | undefined) => {
+        const m = /\/avmeld\/([^>]+)>$/.exec(v ?? "");
+        return m ? avmeld.verifyUnsubscribeToken(m[1])?.email ?? null : null;
+      };
+      const snapshot = () => ({
+        counts: counts(),
+        cap: db.prepare(`SELECT * FROM outreach_daily_send_cap ORDER BY rowid`).all(),
+        ledger: ledger().map((l) => [l.recipient_email, l.status, l.touch]),
+        osl: db.prepare(`SELECT recipient_email FROM outreach_sent_log ORDER BY id`).all(),
+        contacts: db.prepare(`SELECT email FROM crm_contacts ORDER BY rowid`).all(),
+        messages: db.prepare(`SELECT to_emails, subject FROM crm_messages ORDER BY rowid`).all(),
+      });
+      const scenario = async (seeds: string | undefined, transport = makeTransport()) => {
+        freshDb();
+        seedProducer("y-1", "Ysteri Gård", "post@ysteri.gard-test.no");
+        seedProducer("y-2", "Ylvis Gård", "post@ylvis.gard-test.no");
+        setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "5" });
+        if (seeds === undefined) delete process.env.OUTREACH_SEED_RECIPIENTS;
+        else process.env.OUTREACH_SEED_RECIPIENTS = seeds;
+        const now = new Date("2026-12-01T08:20:00.000Z");
+        const report = await run(true, { transport, now });
+        const claims = JSON.parse(runsRows()[0]?.claims ?? "[]") as Array<{ type: string; value: number; meta?: Record<string, any> }>;
+        return { report, claims, calls: transport.calls, snap: snapshot() };
+      };
+      try {
+        process.env.OUTREACH_UNSUBSCRIBE_ENABLED = "1";
+        const without = await scenario(undefined);
+        const withSeeds = await scenario(`Seed.One@Kontroll-Test.example, ugyldig , ${SEED_B},seed.one@kontroll-test.example`);
+        assertEq([without.report.summary.sent, without.calls.length], [2, 2], "y1 (AK4): no secret → only the 2 real mails");
+        assertEq(["seed_copies_sent" in without.report, "seed_copies_failed" in without.report], [false, false], "y2 (AK4): no secret → report has no seed field");
+        assertTrue(without.claims.every((c) => c.meta?.kind !== "outreach_seed_copies_sent"), "y3 (AK4): no secret → envelope claims unchanged");
+        assertEq(withSeeds.report.summary, without.report.summary, "y4 (AK3): run summary (measurement) identical with and without seeds");
+        assertEq(withSeeds.calls.length, 4, "y5 (AK3): 2 real mails + one copy per seed address");
+        assertEq(withSeeds.calls.slice(2).map((c) => c.to), [SEED_A, SEED_B], "y6 (AK3): copies go to the trimmed, lowercased, deduped seed list");
+        const model = withSeeds.calls[0];
+        for (const [i, copy] of withSeeds.calls.slice(2).entries()) {
+          assertEq(
+            [copy.from, copy.replyTo, copy.subject, copy.textContent, copy.htmlContent, copy.inReplyToMessageId, copy.listUnsubscribePost, copy.cc],
+            [model.from, model.replyTo, model.subject, model.textContent, model.htmlContent, model.inReplyToMessageId, model.listUnsubscribePost, model.cc],
+            `y7.${i} (AK3): copy = first real mail (From, Reply-To, subject, text, html, threading, one-click)`,
+          );
+          assertEq([tokenEmail(copy.listUnsubscribe), copy.redactRecipientInLogs], [copy.to, true], `y8.${i}: unsubscribe token signed for the seed address; recipient redacted in logs`);
+        }
+        assertEq(tokenEmail(model.listUnsubscribe), "post@ysteri.gard-test.no", "y9: the real mail's token is the producer's own");
+        assertEq(withSeeds.snap, without.snap, "y10 (AK3): CRM contacts/messages, outbox, sent_log, ledger, daily cap and lane identical with and without seeds");
+        assertEq([withSeeds.report.seed_copies_sent, withSeeds.report.seed_copies_failed], [2, 0], "y11 (AK3): report counts the copies");
+        const seedClaim = withSeeds.claims.find((c) => c.meta?.kind === "outreach_seed_copies_sent");
+        assertEq([seedClaim?.value, seedClaim?.meta?.lane, seedClaim?.meta?.failed], [2, "rfb-marketing", 0], "y12 (AK3): envelope claim carries the count");
+        assertEq(withSeeds.claims.filter((c) => c.meta?.kind !== "outreach_seed_copies_sent").length, without.claims.length, "y13: every other claim is still there");
+        assertEq(withSeeds.claims[0].value, 2, "y14: emails_sent counts only the real mails");
+        assertTrue(!JSON.stringify(withSeeds.claims).includes("kontroll-test.example") && !JSON.stringify(withSeeds.report).includes("kontroll-test.example"), "y15: no seed address in claims or report");
+
+        // y16: a failing copy never fails the run.
+        const flaky = makeTransport();
+        const flakySend = flaky.sendRaw;
+        flaky.sendRaw = async (o: any) => {
+          if (String(o.to).includes("kontroll-test.example")) throw new Error("smtp down");
+          return flakySend(o);
+        };
+        const failing = await scenario(`${SEED_A},${SEED_B}`, flaky);
+        assertEq(
+          [failing.report.summary.sent, failing.report.stopped_reason, failing.report.errors, failing.report.seed_copies_sent, failing.report.seed_copies_failed, runsRows()[0]?.status],
+          [2, null, [], 0, 2, "completed"],
+          "y16: copies that throw are counted as failed; the real run is unaffected",
+        );
+
+        // y17: nothing really sent → no copy; y18: a dry run never sends a copy.
+        freshDb();
+        setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "5" });
+        process.env.OUTREACH_SEED_RECIPIENTS = SEED_A;
+        const empty = makeTransport();
+        const er = await run(true, { transport: empty });
+        assertEq([er.skipped_reason, empty.calls.length, er.seed_copies_sent], ["no_candidates", 0, 0], "y17: no real send → no copy");
+        seedProducer("y-3", "Yr Gård", "post@yr.gard-test.no");
+        const dryT = makeTransport();
+        const dr = await run(false, { transport: dryT });
+        assertEq([dr.summary.would_send, dryT.calls.length, "seed_copies_sent" in dr], [1, 0, false], "y18: dry run → no copy, no seed field");
+
+        // y19: default transport (emailService.sendRaw): identical wire envelope, recipient redacted.
+        freshDb();
+        seedProducer("y-4", "Wire Seed Gård", "post@wireseed.gard-test.no");
+        setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "1" });
+        process.env.OUTREACH_SEED_RECIPIENTS = SEED_A;
+        const mails: Array<Record<string, any>> = [];
+        emailSvc.isConfigured = true;
+        emailSvc.transporter = {
+          sendMail: async (m: Record<string, any>) => {
+            mails.push(m);
+            return { messageId: `stub-seed-${mails.length}` };
+          },
+        };
+        try {
+          const r = await daily.runRfbMarketingDaily({ apply: true, trigger: "manual", deps: { healthProbe: healthy } });
+          assertEq([r.summary.sent, mails.length, r.seed_copies_sent], [1, 2, 1], "y19: default transport → real mail + 1 copy");
+          const strip = (m: Record<string, any>) => {
+            const { to: _to, headers, ...rest } = m;
+            const { ["List-Unsubscribe"]: _lu, ...h } = headers ?? {};
+            return { ...rest, headers: h };
+          };
+          assertEq(strip(mails[1]), strip(mails[0]), "y20 (AK3): on the wire the copy equals the real mail except To and the unsubscribe token");
+          assertEq([mails[1].to, "redactRecipientInLogs" in mails[1]], [SEED_A, false], "y21: copy addressed to the seed; the log flag never reaches the wire");
+        } finally {
+          emailSvc.isConfigured = origConfigured;
+          emailSvc.transporter = origTransporter;
+        }
+      } finally {
+        if (prevSeeds === undefined) delete process.env.OUTREACH_SEED_RECIPIENTS;
+        else process.env.OUTREACH_SEED_RECIPIENTS = prevSeeds;
+        if (prevUnsub === undefined) delete process.env.OUTREACH_UNSUBSCRIBE_ENABLED;
+        else process.env.OUTREACH_UNSUBSCRIBE_ENABLED = prevUnsub;
+      }
+    }
   } catch (err) {
     failed++;
     failures.push(`rfb-marketing-daily: unexpected error: ${err instanceof Error ? err.stack || err.message : String(err)}`);

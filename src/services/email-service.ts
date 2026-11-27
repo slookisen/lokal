@@ -1016,15 +1016,22 @@ https://rettfrabonden.com`;
     to: string,
     providerName: string,
     profileUrl: string,
-    opts: {
-      isTestSend?: boolean;
-      template?: GardssalgOutreachTemplate;
-      /** v4 render context (subject arm, {eier_url}, {måned}, first subject). */
-      ctx?: GardssalgOutreachRenderCtx;
-      /** Message-ID of the first mail; set on the v4 follow-up so it threads. */
-      inReplyToMessageId?: string;
-    } = {},
+    opts: GardssalgOutreachSendOpts = {},
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    return await this.sendEmail(this.buildGardssalgOutreachEmailOptions(to, providerName, profileUrl, opts));
+  }
+
+  /**
+   * The exact EmailOptions sendGardssalgOutreach() hands to sendEmail(). Split out
+   * (no behaviour change) so a seed copy (sendGardssalgOutreachSeedCopy) is built by
+   * the same code as the real mail.
+   */
+  buildGardssalgOutreachEmailOptions(
+    to: string,
+    providerName: string,
+    profileUrl: string,
+    opts: GardssalgOutreachSendOpts = {},
+  ): EmailOptions {
     // dev-request 2026-08-15-outreach-ab-standard-vs-personlig-drikke:
     // opts.template selects the rendered draft ("standard" HTML template vs
     // the RFB-style plain-text "personal" variant; since 2026-10-22 also the
@@ -1037,7 +1044,7 @@ https://rettfrabonden.com`;
     // no template text changes. Behind OUTREACH_UNSUBSCRIBE_ENABLED (the /avmeld route's
     // own flag), so a header never points at a 404; none when off or no server secret.
     const unsub = unsubscribeHeaderValues(to, "experiences");
-    return await this.sendEmail({
+    return {
       to,
       subject: rendered.subject,
       ...(rendered.html !== undefined ? { htmlContent: rendered.html } : {}),
@@ -1050,7 +1057,28 @@ https://rettfrabonden.com`;
       isTestSend: opts.isTestSend,
       ...(opts.inReplyToMessageId ? { inReplyToMessageId: opts.inReplyToMessageId } : {}),
       ...(unsub ? { listUnsubscribe: unsub.listUnsubscribe, listUnsubscribePost: unsub.listUnsubscribePost } : {}),
+    };
+  }
+
+  /**
+   * Seed copy (dev-request 2026-11-26-innsyn-i-levering-…-kontrollkopier, point 3):
+   * the same mail sendGardssalgOutreach() sent to a producer, rendered from the same
+   * inputs, to one seed address. Same From, Reply-To, subject, body, HTML-or-not,
+   * In-Reply-To/References and X-Lokal-Agent; the List-Unsubscribe token is signed
+   * for the seed address itself (present only when the real mail had one), so it
+   * cannot suppress a producer. Never a test send (no subject marking). The seed
+   * address is never logged. Nothing is written anywhere.
+   */
+  async sendGardssalgOutreachSeedCopy(
+    seedTo: string,
+    model: GardssalgOutreachSeedModel,
+  ): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const options = this.buildGardssalgOutreachEmailOptions(seedTo, model.providerName, model.profileUrl, {
+      template: model.template,
+      ctx: model.ctx,
+      ...(model.inReplyToMessageId ? { inReplyToMessageId: model.inReplyToMessageId } : {}),
     });
+    return await this.sendEmail({ ...options, isTestSend: false, redactRecipientInLogs: true });
   }
 
   /**
@@ -1091,10 +1119,19 @@ https://rettfrabonden.com`;
     listUnsubscribe?: string;
     /** List-Unsubscribe-Post header value (RFC 8058 one-click); needs listUnsubscribe. */
     listUnsubscribePost?: string;
+    /**
+     * Seed copies (outreach-seed-copies.ts): `to` is logged as "[redacted]" and
+     * addresses inside error messages are masked. Not a mail header. Omitted/false
+     * leaves the logging unchanged.
+     */
+    redactRecipientInLogs?: boolean;
   }): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const redact = options.redactRecipientInLogs === true;
+    const logTo = (to: string) => (redact ? "[redacted]" : to);
+    const logErr = (msg: string) => (redact ? maskEmails(msg) : msg);
     // See isEmailForceDryRun()'s doc comment above sendEmail() — same rule.
     if (!this.isConfigured || (this.transporter === this.envTransporter && isEmailForceDryRun())) {
-      logger.info('DRY RUN: Would send raw email', { to: options.to, subject: options.subject });
+      logger.info('DRY RUN: Would send raw email', { to: logTo(options.to), subject: options.subject });
       return { success: true, messageId: 'DRY_RUN' };
     }
     try {
@@ -1120,11 +1157,11 @@ https://rettfrabonden.com`;
       if (options.cc) mailOptions.cc = options.cc;
       if (options.htmlContent) mailOptions.html = options.htmlContent;
       const info = await this.transporter.sendMail(mailOptions);
-      logger.info('Raw email sent', { to: options.to, subject: options.subject, messageId: info.messageId as string });
+      logger.info('Raw email sent', { to: logTo(options.to), subject: options.subject, messageId: info.messageId as string });
       return { success: true, messageId: info.messageId as string };
     } catch (error) {
-      logger.error('Failed to send raw email', { to: options.to, error: error instanceof Error ? error.message : String(error) });
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+      logger.error('Failed to send raw email', { to: logTo(options.to), error: logErr(error instanceof Error ? error.message : String(error)) });
+      return { success: false, error: logErr(error instanceof Error ? error.message : 'Unknown error') };
     }
   }
 
@@ -2441,6 +2478,25 @@ export function cleanOutreachProviderName(raw: string): string {
 }
 
 export type GardssalgOutreachSubjectArm = "A" | "B";
+
+/** Options for EmailService.sendGardssalgOutreach(). */
+export interface GardssalgOutreachSendOpts {
+  isTestSend?: boolean;
+  template?: GardssalgOutreachTemplate;
+  /** v4 render context (subject arm, {eier_url}, {måned}, first subject). */
+  ctx?: GardssalgOutreachRenderCtx;
+  /** Message-ID of the first mail; set on the v4 follow-up so it threads. */
+  inReplyToMessageId?: string;
+}
+
+/** What a seed copy needs to re-render a run's real gårdssalg outreach mail exactly. */
+export interface GardssalgOutreachSeedModel {
+  providerName: string;
+  profileUrl: string;
+  template: GardssalgOutreachTemplate;
+  ctx?: GardssalgOutreachRenderCtx;
+  inReplyToMessageId?: string;
+}
 
 export interface GardssalgOutreachRenderCtx {
   /** Subject arm for text E; alternates every first mail. Default "A". */

@@ -150,6 +150,8 @@ import { MEMORY_THRESHOLDS } from "./memory-thresholds";
 import { markJobCompleted, resolveDailyJobLastRunAt } from "./boot-job-gate";
 import { emailService } from "./email-service";
 import { recordRun } from "./run-ledger";
+import { resolveOutreachSeedRecipients, sendOutreachSeedCopies, type OutreachSeedCopyResult } from "./outreach-seed-copies";
+import { unsubscribeHeaderValues } from "./avmeld-service";
 import { marketplaceRegistry } from "./marketplace-registry";
 import { knowledgeService } from "./knowledge-service";
 import { classifyAboutCheapBar, meetsAboutQualityBar } from "./search-enrich";
@@ -1468,6 +1470,45 @@ export interface RfbMarketingDailyRunReport {
   };
   envelope_recorded: boolean;
   errors: string[];
+  /**
+   * Seed copies (dev-request 2026-11-26-…-kontrollkopier, point 3): counts only,
+   * never addresses. Present only on an apply run that reached the send loop while
+   * OUTREACH_SEED_RECIPIENTS is set; absent otherwise (report unchanged).
+   */
+  seed_copies_sent?: number;
+  seed_copies_failed?: number;
+}
+
+/** The exact sendRaw options of one real RFB outreach mail (a seed copy's model). */
+type RfbSendRawOptions = Parameters<NonNullable<ComposeDeps["sendRaw"]>>[0];
+
+/**
+ * Seed copies for one RFB outreach run (dev-request 2026-11-26-innsyn-i-levering-
+ * dmarc-leveringsstatus-og-kontrollkopier, point 3). `model` is the sendRaw options
+ * of the run's first real send (null → no copies). Each copy is the same options
+ * with `to` set to the seed address and, when the real mail carried
+ * List-Unsubscribe, a token signed for the seed address (never a producer's). Sent
+ * on the same transport, bypassing compose: no CRM, outbox, ledger, sent_log or cap
+ * write. Returns null when OUTREACH_SEED_RECIPIENTS has no valid address. Never throws.
+ */
+export async function sendRfbMarketingRunSeedCopies(
+  model: RfbSendRawOptions | null,
+  sendRaw?: ComposeDeps["sendRaw"],
+): Promise<OutreachSeedCopyResult | null> {
+  const recipients = resolveOutreachSeedRecipients();
+  if (recipients.length === 0) return null;
+  if (!model) return { sent: 0, failed: 0 };
+  const transport = sendRaw ?? ((o: RfbSendRawOptions) => emailService.sendRaw(o));
+  return await sendOutreachSeedCopies("rfb-marketing", recipients, (to) => {
+    const { listUnsubscribe: _lu, listUnsubscribePost: _lup, ...rest } = model;
+    const unsub = model.listUnsubscribe ? unsubscribeHeaderValues(to) : null;
+    return transport({
+      ...rest,
+      to,
+      ...(unsub ? { listUnsubscribe: unsub.listUnsubscribe, listUnsubscribePost: unsub.listUnsubscribePost } : {}),
+      redactRecipientInLogs: true,
+    });
+  });
 }
 
 export interface RfbMarketingDailyDeps {
@@ -1647,9 +1688,11 @@ async function runRfbMarketingDailyGuarded(opts: {
     results?: RfbMarketingResultRow[];
     held?: RfbMarketingHeldEntry[];
     homepage_refresh?: RfbMarketingRefreshSummary | null;
+    seed_copies?: OutreachSeedCopyResult | null;
   }): RfbMarketingDailyRunReport => {
     const results = partial.results ?? [];
     const held = partial.held ?? [];
+    const seedCopies = partial.seed_copies ?? null;
     let lane: RfbMarketingLaneState | null = null;
     try {
       lane = getRfbMarketingLaneState(db);
@@ -1689,6 +1732,7 @@ async function runRfbMarketingDailyGuarded(opts: {
       summary: summarizeResults(results),
       envelope_recorded: false,
       errors,
+      ...(seedCopies ? { seed_copies_sent: seedCopies.sent, seed_copies_failed: seedCopies.failed } : {}),
     };
 
     // Envelope: real runs only (a dry run leaves no trace), never when the
@@ -1844,6 +1888,17 @@ async function runRfbMarketingDailyGuarded(opts: {
               meta: { kind: "rfb_marketing_gate_summary", gate: report.gate },
             },
             ...guardrailClaims,
+            // dev-request 2026-11-26-…-kontrollkopier: seed copies, counts only.
+            // Only when OUTREACH_SEED_RECIPIENTS is set — otherwise the claims are unchanged.
+            ...(seedCopies
+              ? [
+                  {
+                    type: "custom" as const,
+                    value: seedCopies.sent,
+                    meta: { kind: "outreach_seed_copies_sent", lane: "rfb-marketing", failed: seedCopies.failed },
+                  },
+                ]
+              : []),
           ],
           evidence: [
             {
@@ -2044,8 +2099,19 @@ async function runRfbMarketingDailyGuarded(opts: {
     return row;
   };
   const gate: NonNullable<RfbMarketingDailyRunReport["gate"]> = { cooldown_days: cooldownDays, first: null, second: null };
+  // Seed copies: the sendRaw options of this run's first real send, and the result.
+  let seedModel: RfbSendRawOptions | null = null;
+  let lastSendOptions: RfbSendRawOptions | null = null;
+  let seedCopies: OutreachSeedCopyResult | null = null;
+  const baseSendRaw: NonNullable<ComposeDeps["sendRaw"]> = deps.sendRaw ?? ((o) => emailService.sendRaw(o));
+  // Same transport as before; only remembers what it was handed (seed-copy model).
+  const capturingSendRaw: NonNullable<ComposeDeps["sendRaw"]> = (o) => {
+    lastSendOptions = o;
+    return baseSendRaw(o);
+  };
   const done = (skipped: RfbMarketingDailyRunSkipReason | null) =>
     finish({
+      seed_copies: seedCopies,
       ...budgetInfo,
       social_proof: socialProof,
       gate,
@@ -2335,7 +2401,7 @@ async function runRfbMarketingDailyGuarded(opts: {
             vertical: "rfb",
           },
           {
-            sendRaw: deps.sendRaw,
+            sendRaw: capturingSendRaw,
             // dev-request 2026-10-22-rfb-utsending-v4 (endring 4, 6): sent in
             // Daniel's name (address and Reply-To unchanged); the follow-up
             // replies in the first mail's thread; the CRM row records the
@@ -2386,6 +2452,7 @@ async function runRfbMarketingDailyGuarded(opts: {
         ledgerStatus = "sent";
         row.status = "sent";
         committed += 1;
+        if (!seedModel && lastSendOptions) seedModel = lastSendOptions;
         if (outcome.postSendError) {
           row.post_send_error = outcome.postSendError;
           errors.push(`post-send bookkeeping failed for ${cand.agent_id} (e-mail WAS sent): ${outcome.postSendError}`);
@@ -2501,6 +2568,9 @@ async function runRfbMarketingDailyGuarded(opts: {
       console.error("[rfb-marketing-daily] data-quality held (mode=second, budget used) failed (non-fatal):", errMessage(err));
     }
   }
+
+  // Seed copies (apply runs only; a dry run sends nothing). Never fatal.
+  if (opts.apply) seedCopies = await sendRfbMarketingRunSeedCopies(seedModel, deps.sendRaw);
 
   const actionable = results.some((r) => r.status !== "skipped");
   const gateReturned = (gate.first?.count ?? 0) + (gate.second?.count ?? 0);
