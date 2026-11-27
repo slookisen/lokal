@@ -573,3 +573,71 @@ export function summarizeDmarcReports(days: number, now: Date = new Date()): {
     by_reporter: byReporter.map((r) => ({ ...r, reporter: noAt(r.reporter) })),
   };
 }
+
+// ─── Daily digest line (point 2: «Varsel ved feil») ───────────────────────
+//
+// The CS daily digest (cs-watchdog.ts buildDailyDigest) gets ONE line when
+// messages from our own sendings failed DMARC in the last 24 h, per submitter.
+//
+// Window column: received_at (when WE stored the report), not date_begin/
+// date_end. A report covers the reporter's previous day and arrives hours to
+// a day after that period ends, so a window on the period would make the
+// 07:00 digest miss most reports (their period ended > 24 h before they
+// arrive) or count one twice on consecutive days. received_at gives each
+// report exactly one digest: the first one after it came in. It is SQLite
+// datetime('now') UTC («YYYY-MM-DD HH:MM:SS»), compared via julianday.
+//
+// Reviewer N5 (#1682): anyone can mail an aggregate report, so the numbers
+// are «as reported», never verified. The submitter name is attacker-controlled
+// text: it is sanitized again for display (no control/line-separator/bidi
+// characters, ≤ 60 chars) and at most DMARC_DIGEST_MAX_REPORTERS are named,
+// so a forged report cannot add lines to the digest or flood it.
+
+export const DMARC_DIGEST_MAX_REPORTERS = 5;
+export const DMARC_DIGEST_REPORTER_MAX_CHARS = 60;
+
+/** A submitter name safe for one line of the digest. */
+export function digestReporterName(s: string): string {
+  let t = sanitizeReporterOrg(String(s ?? ""))
+    // C1 controls, line/paragraph separators, bidi overrides/isolates, zero-width chars.
+    .replace(/[\u0080-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069\u200b-\u200f\ufeff]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const chars = Array.from(t);
+  if (chars.length > DMARC_DIGEST_REPORTER_MAX_CHARS) t = chars.slice(0, DMARC_DIGEST_REPORTER_MAX_CHARS - 1).join("").trimEnd() + "…";
+  return t || "ukjent innsender";
+}
+
+/** DMARC failures (sum of dmarc_fail) in reports received in the 24 h before `now`, per submitter, most first. Throws on a DB error. */
+export function dmarcFailuresLast24h(now: Date = new Date()): { total: number; by_reporter: Array<{ reporter: string; fail: number }> } {
+  const since = new Date(now.getTime() - 24 * 3600_000).toISOString();
+  const rows = getDb()
+    .prepare(
+      `SELECT reporter_org AS reporter, COALESCE(SUM(dmarc_fail),0) AS fail
+         FROM dmarc_aggregate_reports
+        WHERE julianday(received_at) >= julianday(?) AND julianday(received_at) <= julianday(?) AND dmarc_fail > 0
+        GROUP BY reporter_org`,
+    )
+    .all(since, now.toISOString()) as Array<{ reporter: string; fail: number }>;
+  // Two raw names can sanitize to the same display name: merge them.
+  const merged = new Map<string, number>();
+  for (const r of rows) {
+    const name = digestReporterName(r.reporter);
+    merged.set(name, (merged.get(name) ?? 0) + Number(r.fail || 0));
+  }
+  const by = [...merged.entries()]
+    .map(([reporter, fail]) => ({ reporter, fail }))
+    .filter((r) => r.fail > 0)
+    .sort((a, b) => b.fail - a.fail || a.reporter.localeCompare(b.reporter));
+  return { total: by.reduce((a, r) => a + r.fail, 0), by_reporter: by };
+}
+
+/** The one digest line, or null when nothing failed. Worded «as reported» — the reports are not verified. */
+export function dmarcDigestLine(f: { total: number; by_reporter: Array<{ reporter: string; fail: number }> }): string | null {
+  if (!f || f.total <= 0) return null;
+  const shown = f.by_reporter.slice(0, DMARC_DIGEST_MAX_REPORTERS).map((r) => `${r.reporter} ${r.fail}`);
+  const rest = f.by_reporter.slice(DMARC_DIGEST_MAX_REPORTERS);
+  if (rest.length > 0) shown.push(`andre ${rest.reduce((a, r) => a + r.fail, 0)}`);
+  const what = f.total === 1 ? "1 melding" : `${f.total} meldinger`;
+  return `DMARC: ${what} fra våre utsendinger besto ikke DMARC siste døgn ifølge mottatte rapporter (${shown.join(", ")}).`;
+}

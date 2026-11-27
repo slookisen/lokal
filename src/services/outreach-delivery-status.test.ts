@@ -309,14 +309,14 @@ export function runOutreachDeliveryStatusTests(opts: { log?: boolean } = {}): Pr
       // B2: consecutive runs get touching, non-overlapping windows (from the previous
       // rfb-marketing-daily run's start), so each send is counted by exactly one run.
       {
-        const addRun = (id: string, hoursAgo: number) =>
+        const addRun = (id: string, hoursAgo: number, startedAt: Date = new Date(Date.now() - hoursAgo * 3600_000)) =>
           rfbDb
             .prepare(`INSERT INTO runs (run_id, vertical, agent, trigger_source, started_at, status) VALUES (?, 'rfb', ?, 'cron', ?, 'completed')`)
-            .run(id, rfbDaily.RFB_MARKETING_DAILY_AGENT, new Date(Date.now() - hoursAgo * 3600_000).toISOString());
+            .run(id, rfbDaily.RFB_MARKETING_DAILY_AGENT, startedAt.toISOString());
         addRun("od-run-1", 30);
         const r2Start = new Date(Date.now() - 15 * 3600_000);
         const r2 = rfbDaily.computeRfbMarketingDeliveryCounts(rfbDb as any, r2Start);
-        addRun("od-run-2", 15);
+        addRun("od-run-2", 15, r2Start); // same instant as r2Start (no second Date.now())
         const r3 = rfbDaily.computeRfbMarketingDeliveryCounts(rfbDb as any, new Date(Date.now() - 60_000));
         eq(
           [r2.window_from, r2.sent, r2.delivered, r3.window_from, r3.window_since === r2Start.toISOString(), r3.sent, r3.delivered],
