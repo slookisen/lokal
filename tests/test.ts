@@ -45663,6 +45663,23 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── dev-request 2026-11-26-innsyn-i-levering: point 2 (DMARC-feil i den daglige oppsummeringen) ──");
+  try {
+    const { runDmarcDigestTests } = require("../src/services/dmarc-digest.test") as
+      typeof import("../src/services/dmarc-digest.test");
+    const dd = await runDmarcDigestTests({ log: false });
+    passed += dd.passed;
+    failed += dd.failed;
+    for (const f of dd.failures) failures.push("dmarc-digest: " + f);
+    console.log(`  dmarc-digest: ${dd.passed} passed, ${dd.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dmarc-digest: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ dmarc-digest: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-11-10-cs-paa-serveren: S5 (kontaktskjema: kvittering, avviste innsendinger) ──");
   try {
     const { runContactFormCsTests } = require("../src/services/contact-form-cs.test") as

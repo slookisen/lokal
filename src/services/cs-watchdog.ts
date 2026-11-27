@@ -26,6 +26,7 @@ import { getJobLastCompletedAt, markJobCompleted } from "./boot-job-gate";
 import { BUYER_REPLY_KIND, parkPendingWhenAutosendOff, recoverExpiredLeases } from "./cs-reply-proposals";
 import { failedReplyDeliveries } from "./crm-delivery-status";
 import { contactRejectionsSince } from "./contact-form-cs";
+import { dmarcDigestLine, dmarcFailuresLast24h } from "./dmarc-reports";
 
 export const CS_WATCHDOG_FLAG = "CS_WATCHDOG_ENABLED";
 export const CS_DAILY_DIGEST_FLAG = "CS_DAILY_DIGEST_ENABLED";
@@ -838,6 +839,18 @@ export function buildDailyDigest(now: Date = new Date()): { subject: string; tex
   }
   lines.push("");
   lines.push(`FEIL: ${report.counts.forward_failed} videresending(er) til Gmail feilet, ${report.counts.crm_register_errors_7d} e-post ikke registrert i CRM siste 7 døgn.`);
+  // dev-request 2026-11-26-innsyn-i-levering, point 2: one line when messages
+  // from our sendings failed DMARC in the last 24 h (dmarc-reports.ts). No
+  // failures → no line, body unchanged. A failing query never stops the digest.
+  let dmarcFail: number | null = null;
+  try {
+    const f = dmarcFailuresLast24h(now);
+    dmarcFail = f.total;
+    const line = dmarcDigestLine(f);
+    if (line) lines.push(line);
+  } catch (e: any) {
+    console.error("[cs-daily-digest] DMARC failure query failed — digest goes out without the DMARC line:", String(e?.message ?? e));
+  }
   const buyer = buyerRepliesDigest(now);
   if (buyer) {
     lines.push("");
@@ -853,7 +866,7 @@ export function buildDailyDigest(now: Date = new Date()): { subject: string; tex
     text: lines.join("\n"),
     counts: { inbound, forms, contact_form_rejected: rejected, outbound, needs_reply: report.counts, proposals: proposalCounts,
       kjoper_svar_sent: buyer?.sent ?? 0, kjoper_svar_shown: buyer?.shown ?? 0, kjoper_svar_omitted: buyer?.omitted ?? 0,
-      review_queues: { ...queueAges, findings: queueDigest.findings } },
+      review_queues: { ...queueAges, findings: queueDigest.findings }, dmarc_fail: dmarcFail },
   };
 }
 
