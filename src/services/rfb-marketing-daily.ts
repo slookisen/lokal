@@ -544,6 +544,86 @@ export function computeRfbMarketingGuardrailMetrics(db: Db, now: Date): RfbMarke
   };
 }
 
+/**
+ * dev-request 2026-11-26-innsyn-i-levering-…-kontrollkopier, point 4: «antall levert»
+ * for the RFB outreach. Resend reports a delivery seconds to minutes AFTER a send, so a
+ * run cannot count its own sends at its end; each run reports the sends of the EARLIER
+ * run(s): ledger rows 'sent' reserved in [window_since, window_until), where
+ * window_until = `before` (this run's start) and window_since = the start of the
+ * previous rfb-marketing-daily run in the run ledger (`runs`, agent
+ * RFB_MARKETING_DAILY_AGENT, started before `before`). The windows of consecutive runs
+ * therefore touch but never overlap, so every send is counted by exactly one run and
+ * the claims can be summed. Without a previous run the window falls back to
+ * RFB_MARKETING_BOUNCE_LOOKBACK_HOURS (window_from 'fallback_lookback'). Resend's
+ * verdict per send is read from crm_message_delivery through the compose outbox row
+ * (crm_outbox.crm_message_id). Seed copies have no ledger row, so they are never
+ * counted. Measurement only. A verdict that arrives after the next run has started is
+ * not counted (deliveries arrive within minutes; counted as no_verdict).
+ */
+export interface RfbMarketingDeliveryCounts {
+  window_from: "previous_run" | "fallback_lookback";
+  window_since: string;
+  window_until: string;
+  sent: number;
+  delivered: number;
+  soft_bounced: number;
+  bounced: number;
+  complained: number;
+  no_verdict: number;
+}
+
+/** Start of the latest rfb-marketing-daily run that started before `before`, or null. */
+function previousRfbMarketingRunStart(db: Db, before: Date): Date | null {
+  try {
+    const row = db
+      .prepare(
+        `SELECT started_at FROM runs
+          WHERE agent = ? AND julianday(started_at) < julianday(?)
+          ORDER BY julianday(started_at) DESC LIMIT 1`,
+      )
+      .get(RFB_MARKETING_DAILY_AGENT, before.toISOString()) as { started_at: string } | undefined;
+    const t = row ? Date.parse(row.started_at) : NaN;
+    return Number.isFinite(t) ? new Date(t) : null;
+  } catch {
+    return null; // no run ledger: fall back
+  }
+}
+
+export function computeRfbMarketingDeliveryCounts(db: Db, before: Date): RfbMarketingDeliveryCounts {
+  const prev = previousRfbMarketingRunStart(db, before);
+  const since = prev ?? new Date(before.getTime() - RFB_MARKETING_BOUNCE_LOOKBACK_HOURS * 3600_000);
+  const out: RfbMarketingDeliveryCounts = {
+    window_from: prev ? "previous_run" : "fallback_lookback",
+    window_since: since.toISOString(),
+    window_until: before.toISOString(),
+    sent: 0,
+    delivered: 0,
+    soft_bounced: 0,
+    bounced: 0,
+    complained: 0,
+    no_verdict: 0,
+  };
+  const rows = db
+    .prepare(
+      `SELECT d.status AS status
+         FROM rfb_marketing_send_ledger l
+         LEFT JOIN crm_outbox o ON o.id = l.outbox_id
+         LEFT JOIN crm_message_delivery d ON d.crm_message_id = o.crm_message_id
+        WHERE l.status = 'sent'
+          AND julianday(l.reserved_at) >= julianday(?) AND julianday(l.reserved_at) < julianday(?)`,
+    )
+    .all(since.toISOString(), before.toISOString()) as Array<{ status: string | null }>;
+  for (const r of rows) {
+    out.sent += 1;
+    if (r.status === "delivered" || r.status === "soft_bounced" || r.status === "bounced" || r.status === "complained") {
+      out[r.status] += 1;
+    } else {
+      out.no_verdict += 1;
+    }
+  }
+  return out;
+}
+
 export interface RfbMarketingHealthSignal {
   red: boolean;
   reasons: string[];
@@ -1805,6 +1885,14 @@ async function runRfbMarketingDailyGuarded(opts: {
         );
       } catch (err) {
         console.error("[rfb-marketing-daily] guardrail metrics not computed (non-fatal):", err);
+      }
+      // Point 4 (dev-request 2026-11-26-innsyn-i-levering): delivered count for the
+      // earlier runs' sends (see computeRfbMarketingDeliveryCounts). Non-fatal.
+      try {
+        const dc = computeRfbMarketingDeliveryCounts(db, new Date(startedAt));
+        guardrailClaims.push({ type: "custom", value: dc.delivered, meta: { kind: "rfb_marketing_delivered", lane: "rfb-marketing", ...dc } });
+      } catch (err) {
+        console.error("[rfb-marketing-daily] delivery counts not computed (non-fatal):", err);
       }
       try {
         recordRun({

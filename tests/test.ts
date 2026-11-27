@@ -45629,6 +45629,23 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── dev-request 2026-11-26-innsyn-i-levering: point 4 (levert per utsending, AK5) ──");
+  try {
+    const { runOutreachDeliveryStatusTests } = require("../src/services/outreach-delivery-status.test") as
+      typeof import("../src/services/outreach-delivery-status.test");
+    const ods = await runOutreachDeliveryStatusTests({ log: false });
+    passed += ods.passed;
+    failed += ods.failed;
+    for (const f of ods.failures) failures.push("outreach-delivery-status: " + f);
+    console.log(`  outreach-delivery-status: ${ods.passed} passed, ${ods.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("outreach-delivery-status: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ outreach-delivery-status: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-11-10-cs-paa-serveren: S5 (kontaktskjema: kvittering, avviste innsendinger) ──");
   try {
     const { runContactFormCsTests } = require("../src/services/contact-form-cs.test") as
