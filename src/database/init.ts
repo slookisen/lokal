@@ -3482,6 +3482,42 @@ function initSchema(db: Database.Database): void {
     console.error("Migration idx_crm_outbox_result_id_norm failed:", err);
   }
 
+  // ─── dmarc_aggregate_reports (dev-request 2026-11-26-innsyn-i-levering-
+  // dmarc-leveringsstatus-og-kontrollkopier, point 1) ───────────────────────
+  // One row per DMARC aggregate report about rettfrabonden.com /
+  // opplevagent.no (services/dmarc-reports.ts). UNIQUE(reporter_org,
+  // report_id): the same report received twice is stored once. Sums only —
+  // no e-mail address (report_metadata/email is never read) and no source IPs.
+  // report_date = UTC date of date_begin (the per-day key of the summary).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS dmarc_aggregate_reports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        reporter_org TEXT NOT NULL,
+        report_id TEXT NOT NULL,
+        policy_domain TEXT NOT NULL,
+        date_begin TEXT NOT NULL,
+        date_end TEXT NOT NULL,
+        report_date TEXT NOT NULL,
+        record_count INTEGER NOT NULL DEFAULT 0,
+        message_count INTEGER NOT NULL DEFAULT 0,
+        dkim_aligned_pass INTEGER NOT NULL DEFAULT 0,
+        dkim_aligned_fail INTEGER NOT NULL DEFAULT 0,
+        spf_aligned_pass INTEGER NOT NULL DEFAULT 0,
+        spf_aligned_fail INTEGER NOT NULL DEFAULT 0,
+        dmarc_pass INTEGER NOT NULL DEFAULT 0,
+        dmarc_fail INTEGER NOT NULL DEFAULT 0,
+        container TEXT,
+        inbound_log_id TEXT,
+        received_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(reporter_org, report_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_dmarc_aggregate_reports_date ON dmarc_aggregate_reports(report_date);
+    `);
+  } catch (err) {
+    console.error("Migration dmarc_aggregate_reports failed:", err);
+  }
+
   // ─── CS på serveren, S2: reply proposals (dev-request 2026-11-10-cs-paa-serveren) ──
   // The CS routine writes proposals; the server sends them (or parks them in
   // the approval queue with the reason). No CHECK constraints on purpose: the
