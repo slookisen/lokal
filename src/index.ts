@@ -183,6 +183,7 @@ import adminRfbWebsiteDiscoveryRoutes from "./routes/admin-rfb-website-discovery
 import adminRfbBrregSelfSufficiencyRoutes from "./routes/admin-rfb-brreg-selfsufficiency";
 import adminPoolBlockerExplainRoutes from "./routes/admin-pool-blocker-explain";
 import adminAddressConflictBreakdownRoutes from "./routes/admin-address-conflict-breakdown";
+import adminDmarcReportsRoutes from "./routes/admin-dmarc-reports";
 import adminGardssalgManualClaimsRoutes from "./routes/admin-gardssalg-manual-claims";
 import adminHomepageProvenanceCohortRoutes from "./routes/admin-homepage-provenance-cohort";
 import adminDodBulkRoutes from "./routes/admin-dod-bulk";
@@ -1377,6 +1378,10 @@ app.use("/admin/pool-blocker-explain", adminLimiter, adminPoolBlockerExplainRout
 // quarantine cohort by postnummer/kommune agreement and source pair, with
 // examples. GET /admin/address-conflict-breakdown.
 app.use("/admin/address-conflict-breakdown", adminLimiter, adminAddressConflictBreakdownRoutes);
+// dev-request 2026-11-26-innsyn-i-levering-dmarc-leveringsstatus-og-kontrollkopier,
+// point 1: READ-ONLY sums of the stored DMARC aggregate reports per day and per
+// submitter. GET /admin/dmarc-reports/summary?days=N.
+app.use("/admin/dmarc-reports", adminLimiter, adminDmarcReportsRoutes);
 // O3-5 (dev-request 2026-11-12-opplevagent-o3-eierkrav-og-innlogging): the admin
 // queue for gårdssalg owner claims without self-service. Writes dry-run by default.
 app.use("/admin/gardssalg-manual-claims", adminLimiter, adminGardssalgManualClaimsRoutes);

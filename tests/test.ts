@@ -45646,6 +45646,23 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── dev-request 2026-11-26-innsyn-i-levering: point 1 (DMARC-rapportene leses, AK1+AK2) ──");
+  try {
+    const { runDmarcReportsTests } = require("../src/services/dmarc-reports.test") as
+      typeof import("../src/services/dmarc-reports.test");
+    const dmr = await runDmarcReportsTests({ log: false });
+    passed += dmr.passed;
+    failed += dmr.failed;
+    for (const f of dmr.failures) failures.push("dmarc-reports: " + f);
+    console.log(`  dmarc-reports: ${dmr.passed} passed, ${dmr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dmarc-reports: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ dmarc-reports: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-11-10-cs-paa-serveren: S5 (kontaktskjema: kvittering, avviste innsendinger) ──");
   try {
     const { runContactFormCsTests } = require("../src/services/contact-form-cs.test") as

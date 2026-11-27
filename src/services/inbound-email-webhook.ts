@@ -49,6 +49,7 @@ import {
   registerInboundInCrm,
   updateInboundLog,
 } from "./cs-inbound";
+import { ingestDmarcAttachmentsFromInbound } from "./dmarc-reports";
 
 export const INBOUND_FETCH_TIMEOUT_MS = 8000;
 
@@ -278,6 +279,28 @@ export async function handleInboundEmailWebhook(req: Request, res: Response, dep
           console.error("[Inbound] CRM registration failed:", regErr);
           try { updateInboundLog(logId, { crm_status: "error", crm_error: String(regErr?.message ?? regErr).slice(0, 500) }); } catch { /* nothing more to do */ }
         }
+      }
+    }
+
+    // ── DMARC aggregate reports (innsyn-i-levering, point 1) ────────
+    // A machine report's gzip/zip attachment is read and its sums stored;
+    // anything else is left alone. Its own try: never affects the forward.
+    if (automated.kind === "report" && !pilot) {
+      try {
+        const results = await ingestDmarcAttachmentsFromInbound({
+          emailId: typeof emailId === "string" && emailId ? emailId : null,
+          data,
+          fetched,
+          inboundLogId: logId,
+          resendKey,
+          fetchImpl,
+          timeoutMs: deps.timeoutMs ?? INBOUND_FETCH_TIMEOUT_MS,
+        });
+        for (const r of results) {
+          console.log(`[Inbound] DMARC attachment ${r.filename}: ${r.status}${r.reason ? ` (${r.reason})` : ""}`);
+        }
+      } catch (dmarcErr) {
+        console.warn("[Inbound] DMARC report ingest failed:", dmarcErr);
       }
     }
 

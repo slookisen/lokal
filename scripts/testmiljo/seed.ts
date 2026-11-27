@@ -400,6 +400,35 @@ function seedRfb(db: BetterSqlite3.Database): void {
       line_total: total,
     });
   });
+
+  // DMARC aggregate reports (dev-request 2026-11-26-innsyn-i-levering, point 1):
+  // two invented reports from the last days, so GET /admin/dmarc-reports/summary
+  // shows sums per day and per submitter in the test environment.
+  const dmarcSeed: Array<[string, string, string, number, number, number, number, number]> = [
+    // reporter_org, report_id, policy_domain, days ago, messages, dkim pass, spf pass, dmarc pass
+    ["google.com", "testmiljo-dmarc-1", "rettfrabonden.com", 1, 12, 11, 10, 11],
+    ["Enterprise Outlook", "testmiljo-dmarc-2", "opplevagent.no", 2, 5, 5, 4, 5],
+  ];
+  for (const [org, reportId, domain, ago, msgs, dkimPass, spfPass, dmarcPass] of dmarcSeed) {
+    const begin = isoFromToday(-ago, 0);
+    insert(db, "dmarc_aggregate_reports", {
+      reporter_org: org,
+      report_id: reportId,
+      policy_domain: domain,
+      date_begin: begin,
+      date_end: new Date(Date.parse(begin) + 86399000).toISOString(),
+      report_date: begin.slice(0, 10),
+      record_count: 2,
+      message_count: msgs,
+      dkim_aligned_pass: dkimPass,
+      dkim_aligned_fail: msgs - dkimPass,
+      spf_aligned_pass: spfPass,
+      spf_aligned_fail: msgs - spfPass,
+      dmarc_pass: dmarcPass,
+      dmarc_fail: msgs - dmarcPass,
+      container: "gzip",
+    });
+  }
 }
 
 // ── Opplevagent gårdssalg ───────────────────────────────────────────────
