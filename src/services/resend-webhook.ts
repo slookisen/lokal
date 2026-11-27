@@ -573,23 +573,28 @@ export function resolveVerdictCrmMessage(email: string, acceptedAt: Date, subjec
  */
 export function resolveCrmMessageByMessageId(messageIdRaw: unknown, email: string): string | null {
   if (typeof messageIdRaw !== "string") return null;
-  const bare = messageIdRaw.trim().replace(/^<|>$/g, "");
-  if (!bare || bare.length > 998 || !bare.includes("@")) return null;
-  const forms = [`<${bare}>`, bare];
+  // Normalised as cs-inbound.ts matches Message-IDs: lower-case, without <>.
+  const norm = messageIdRaw.trim().replace(/[<>]/g, "").toLowerCase();
+  if (!norm || norm.length > 998 || !norm.includes("@")) return null;
   const db = getDb();
+  // crm_messages.id is the primary key: look the usual stored spellings up exactly
+  // (as sent, and lower-cased), with and without <>.
+  const raw = messageIdRaw.trim().replace(/[<>]/g, "");
+  const idForms = Array.from(new Set([`<${raw}>`, raw, `<${norm}>`, norm]));
   const byId = db.prepare(`SELECT id, to_emails FROM crm_messages WHERE id = ? AND direction = 'out'`);
+  // Same expression as idx_crm_outbox_result_id_norm (init.ts, cs-inbound), so the lookup is indexed.
   const byOutbox = db.prepare(
     `SELECT m.id, m.to_emails FROM crm_outbox o JOIN crm_messages m ON m.id = o.crm_message_id
-      WHERE o.result_id = ? AND m.direction = 'out'
+      WHERE LOWER(REPLACE(REPLACE(o.result_id,'<',''),'>','')) = ? AND m.direction = 'out'
       ORDER BY o.processed_at DESC LIMIT 1`,
   );
-  for (const f of forms) {
-    for (const stmt of [byId, byOutbox]) {
-      const r = stmt.get(f) as { id: string; to_emails: string | null } | undefined;
-      if (r && parseRecipientList(r.to_emails).includes(email)) return r.id;
-    }
+  const ok = (r: { id: string; to_emails: string | null } | undefined): string | null =>
+    r && parseRecipientList(r.to_emails).includes(email) ? r.id : null;
+  for (const f of idForms) {
+    const hit = ok(byId.get(f) as { id: string; to_emails: string | null } | undefined);
+    if (hit) return hit;
   }
-  return null;
+  return ok(byOutbox.get(norm) as { id: string; to_emails: string | null } | undefined);
 }
 
 export interface EmailDeliveryEvent {

@@ -18,6 +18,10 @@
  *   od9-od12  RFB: delivered → status + computeRfbMarketingDeliveryCounts; a bounce
  *             outranks a later «delivered»; this run's own sends are outside the count
  *   od12b     data.message_id links where the subject heuristic alone finds nothing
+ *   od8b/od8c N1/N3 gårdssalg: linked via crm_messages.id with a differing subject; an
+ *             upper-case Message-ID without <> matches
+ *   od12c     B2: consecutive RFB runs count non-overlapping windows
+ *   od12d     N3 RFB: upper-case Message-ID without <> matches crm_outbox.result_id
  *   od13-od15 non-outreach / no message_id: the recipient + time path is unchanged;
  *             an RFC 2047-encoded subject still matches; a message_id whose CRM
  *             message went to another address is not trusted
@@ -204,6 +208,8 @@ export function runOutreachDeliveryStatusTests(opts: { log?: boolean } = {}): Pr
       };
       const g1 = mk("od-g1");
       const g2 = mk("od-g2");
+      const g3 = mk("od-g3");
+      const g4 = mk("od-g4");
       const prep = m.computeGardssalgOutreachDailyPrep(expDb);
       const sendG = async (providerId: string) => {
         const elig = prep.selected.find((s) => s.provider_id === providerId)!;
@@ -241,6 +247,20 @@ export function runOutreachDeliveryStatusTests(opts: { log?: boolean } = {}): Pr
       meas = m.computeGardssalgV4Measurement(expDb, rfbDb as any, { days: 28 });
       eq([meas.by_round["1"]?.delivered, meas.sends.map((s) => s.delivery).sort()], [1, ["complained", "delivered"]], "od8: the complained send is not counted as delivered");
 
+      // N1: a gårdssalg event whose subject differs from the stored one is linked by
+      // crm_messages.id = data.message_id (the subject heuristic alone finds nothing).
+      await sendG("od-g3");
+      const w3 = wire.find((w) => w.to === g3)!;
+      const msg3 = (rfbDb.prepare(`SELECT id FROM crm_messages WHERE thread_id = ? AND direction = 'out'`).get("opplevagent-outreach-od-g3") as { id: string }).id;
+      await webhook("email.delivered", g3, { message_id: w3.messageId, subject: "Et helt annet emne" });
+      eq([msg3 === w3.messageId, verdict(msg3)], [true, "delivered"], "od8b: gårdssalg — a differing subject is still linked via crm_messages.id = message_id");
+      // N3: Message-ID compared lower-case and without <> (as cs-inbound.ts does).
+      await sendG("od-g4");
+      const w4 = wire.find((w) => w.to === g4)!;
+      const msg4 = (rfbDb.prepare(`SELECT id FROM crm_messages WHERE thread_id = ? AND direction = 'out'`).get("opplevagent-outreach-od-g4") as { id: string }).id;
+      await webhook("email.delivered", g4, { message_id: w4.messageId.replace(/[<>]/g, "").toUpperCase(), subject: "Et helt annet emne" });
+      eq(verdict(msg4), "delivered", "od8c: gårdssalg — an upper-case Message-ID without <> still matches");
+
       // ── RFB outreach (rfb-marketing-daily sends through executeCompose) ──
       const rfbSend = async (to: string) => {
         const outcome = await crmRoute.executeCompose(
@@ -258,14 +278,14 @@ export function runOutreachDeliveryStatusTests(opts: { log?: boolean } = {}): Pr
         const msgId = (rfbDb.prepare(`SELECT id FROM crm_messages WHERE thread_id = ? AND direction = 'out'`).get(b.threadId) as { id: string }).id;
         return { outboxId: b.outboxId as string, threadId: b.threadId as string, messageId: b.messageId as string, crmMessageId: msgId };
       };
-      const ledger = (to: string, outboxId: string, threadId: string, messageId: string, hoursAgo: number) => {
+      const ledger = (to: string, outboxId: string, threadId: string, messageId: string, hoursAgo: number, status = "sent") => {
         const at = new Date(Date.now() - hoursAgo * 3600_000);
         rfbDb
           .prepare(
             `INSERT INTO rfb_marketing_send_ledger (day, run_id, agent_id, recipient_email, touch, status, reserved_at, updated_at, thread_id, outbox_id, message_id)
-             VALUES (?, 'od-run', 'od-agent', ?, 'first', 'sent', ?, ?, ?, ?, ?)`,
+             VALUES (?, 'od-run', 'od-agent', ?, 'first', ?, ?, ?, ?, ?, ?)`,
           )
-          .run(at.toISOString().slice(0, 10) + `-${to}`, to, at.toISOString(), at.toISOString(), threadId, outboxId, messageId);
+          .run(at.toISOString().slice(0, 10) + `-${to}`, to, status, at.toISOString(), at.toISOString(), threadId, outboxId, messageId);
       };
       const a = await rfbSend("rfb-a@gard-test.no");
       const b = await rfbSend("rfb-b@gard-test.no");
@@ -273,6 +293,8 @@ export function runOutreachDeliveryStatusTests(opts: { log?: boolean } = {}): Pr
       ledger("rfb-a@gard-test.no", a.outboxId, a.threadId, a.messageId, 20);
       ledger("rfb-b@gard-test.no", b.outboxId, b.threadId, b.messageId, 20);
       ledger("rfb-c@gard-test.no", c.outboxId, c.threadId, c.messageId, 0.01); // this run's own send
+      // N2: a 'failed' ledger row (pointing at a delivered message) is never counted.
+      ledger("rfb-f@gard-test.no", a.outboxId, a.threadId, a.messageId, 20, "failed");
       await webhook("email.delivered", "rfb-a@gard-test.no", { message_id: a.messageId, subject: "Hei fra Rett fra Bonden — synlig for kundene dine?" });
       eq(verdict(a.crmMessageId), "delivered", "od9: the RFB outreach CRM message is «delivered»");
       await webhook("email.bounced", "rfb-b@gard-test.no", { message_id: b.messageId, bounce: { type: "Permanent", subType: "General" } });
@@ -280,9 +302,33 @@ export function runOutreachDeliveryStatusTests(opts: { log?: boolean } = {}): Pr
       eq(verdict(b.crmMessageId), "bounced", "od10: a bounce outranks a later «delivered»");
       await webhook("email.delivered", "rfb-c@gard-test.no", { message_id: c.messageId });
       const counts = rfbDaily.computeRfbMarketingDeliveryCounts(rfbDb as any, new Date(Date.now() - 60_000));
-      eq([counts.sent, counts.delivered, counts.bounced, counts.no_verdict], [2, 1, 1, 0], "od11: the RFB count covers the earlier runs' sends: 1 delivered, 1 bounced");
+      eq([counts.window_from, counts.sent, counts.delivered, counts.bounced, counts.no_verdict], ["fallback_lookback", 2, 1, 1, 0], "od11: without a previous run: the 48h fallback — 1 delivered, 1 bounced; the 'failed' ledger row is not counted");
       const all = rfbDaily.computeRfbMarketingDeliveryCounts(rfbDb as any, new Date(Date.now() + 60_000));
       eq([all.sent, all.delivered], [3, 2], "od12: a send inside the window is counted once its delivery has arrived");
+
+      // B2: consecutive runs get touching, non-overlapping windows (from the previous
+      // rfb-marketing-daily run's start), so each send is counted by exactly one run.
+      {
+        const addRun = (id: string, hoursAgo: number) =>
+          rfbDb
+            .prepare(`INSERT INTO runs (run_id, vertical, agent, trigger_source, started_at, status) VALUES (?, 'rfb', ?, 'cron', ?, 'completed')`)
+            .run(id, rfbDaily.RFB_MARKETING_DAILY_AGENT, new Date(Date.now() - hoursAgo * 3600_000).toISOString());
+        addRun("od-run-1", 30);
+        const r2Start = new Date(Date.now() - 15 * 3600_000);
+        const r2 = rfbDaily.computeRfbMarketingDeliveryCounts(rfbDb as any, r2Start);
+        addRun("od-run-2", 15);
+        const r3 = rfbDaily.computeRfbMarketingDeliveryCounts(rfbDb as any, new Date(Date.now() - 60_000));
+        eq(
+          [r2.window_from, r2.sent, r2.delivered, r3.window_from, r3.window_since === r2Start.toISOString(), r3.sent, r3.delivered],
+          ["previous_run", 2, 1, "previous_run", true, 0, 0],
+          "od12c: run 2 counts the sends after run 1's start; run 3 starts at run 2's start and does not count them again",
+        );
+      }
+
+      // N3 (outbox path): RFB Message-ID upper-case and without <>.
+      const h = await rfbSend("rfb-h@gard-test.no");
+      await webhook("email.delivered", "rfb-h@gard-test.no", { message_id: h.messageId.replace(/[<>]/g, "").toUpperCase(), subject: "Et helt annet emne" });
+      eq(verdict(h.crmMessageId), "delivered", "od12d: RFB — an upper-case Message-ID without <> matches crm_outbox.result_id");
 
       // The recipient + time + subject heuristic alone misses an event whose subject
       // differs from the stored one; the exact data.message_id link does not.
@@ -304,9 +350,12 @@ export function runOutreachDeliveryStatusTests(opts: { log?: boolean } = {}): Pr
       const reply2 = crm.crmService.recordOutboundReply({ threadId: "od-cs", vertical: "rfb", toEmails: ["kunde2@x-test.no"], subject: "Re: Gårdssalg på Voss", bodyText: "Svar", deliveryStatus: "sent", sentAt: new Date(Date.now() - 3600_000).toISOString() }).messageId;
       await webhook("email.delivered", "kunde2@x-test.no", { subject: "=?UTF-8?Q?Re:_G=C3=A5rdssalg_p=C3=A5?= =?UTF-8?Q?_Voss?=" });
       eq(verdict(reply2), "delivered", "od14: an RFC 2047-encoded subject matches the stored subject");
-      const n = verdictCount();
-      await webhook("email.delivered", "annen@x-test.no", { message_id: w1.messageId });
-      eq(verdictCount(), n, "od15: a message_id whose CRM message went to another address is not trusted");
+      // B1: e (od12b) has no verdict yet; its Message-ID on an event for ANOTHER address
+      // must not give it one.
+      eq(verdict(e.crmMessageId), undefined, "od15a: precondition — e has no verdict");
+      await webhook("email.delivered", "annen@x-test.no", { message_id: e.messageId });
+      const evRow = rfbDb.prepare(`SELECT crm_message_id FROM email_delivery_events WHERE email = 'annen@x-test.no'`).get() as { crm_message_id: string | null } | undefined;
+      eq([verdict(e.crmMessageId), evRow ? evRow.crm_message_id : "missing"], [undefined, null], "od15: a message_id whose CRM message went to another address is not trusted");
     } catch (err) {
       failed++;
       failures.push(`✗ outreach-delivery-status suite threw: ${(err as Error)?.stack ?? err}`);
