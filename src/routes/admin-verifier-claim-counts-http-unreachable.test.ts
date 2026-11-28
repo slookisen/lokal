@@ -14,8 +14,11 @@
  *     directions) -> match; off by 3 -> mismatch; the 93/95 shape matches;
  *     the claim meta kind alias behaves the same; a drift_bound/count_at_read
  *     passed in is ignored (no wider margin).
- *   - Non-queue exact kinds (brreg_inactive_flagged, agents_domain_incoherent)
- *     still require an exact match (off by 1 -> mismatch).
+ *   - brreg_inactive_flagged: fixed ±1 (dev-request
+ *     2026-11-27-lokal-agent-verifier-brreg-inactive-flagged-toleranse): off
+ *     by 1 (both directions, incl. the observed 2/3) -> match; off by 2 ->
+ *     mismatch; drift args never widen it.
+ *   - agents_domain_incoherent still requires an exact match.
  *   - Queue kinds still route to snapshotDriftDecision unchanged.
  *   - Endpoint: http_unreachable snapshot response keys unchanged; a clear and
  *     a new park after the read move the count by 2 and the decision matches;
@@ -118,9 +121,15 @@ export function runAdminVerifierClaimCountsHttpUnreachableTests(opts: { log?: bo
         "hu-08: drift_bound/count_at_read passed in are ignored for http_unreachable (no wider margin)",
       );
 
-      // Non-queue exact kinds are unchanged.
-      assertEq(d("brreg_inactive_flagged", 10, 10), { matched: true, diff: 0, tolerance: 0 }, "hu-09: brreg_inactive_flagged exact -> match");
-      assertEq(d("brreg_inactive_flagged", 10, 11), { matched: false, diff: 1, tolerance: 0 }, "hu-10: brreg_inactive_flagged off by 1 -> mismatch (exact required)");
+      // brreg_inactive_flagged: fixed ±1.
+      assertEq(d("brreg_inactive_flagged", 10, 10), { matched: true, diff: 0, tolerance: 1 }, "hu-09: brreg_inactive_flagged exact -> match");
+      assertEq(d("brreg_inactive_flagged", 10, 11), { matched: true, diff: 1, tolerance: 1 }, "hu-10: brreg_inactive_flagged count off by +1 -> match (±1)");
+      assertEq(d("brreg_inactive_flagged", 2, 3), { matched: true, diff: 1, tolerance: 1 }, "hu-10b: claim 2 vs snapshot 3 (observed failure) -> match");
+      assertEq(d("brreg_inactive_flagged", 11, 10), { matched: true, diff: 1, tolerance: 1 }, "hu-10c: claim > count by 1 -> match");
+      assertEq(d("brreg_inactive_flagged", 10, 12), { matched: false, diff: 2, tolerance: 1 }, "hu-10d: off by +2 -> mismatch");
+      assertEq(d("brreg_inactive_flagged", 12, 10), { matched: false, diff: 2, tolerance: 1 }, "hu-10e: off by -2 -> mismatch");
+      assertEq(d("brreg_inactive_flagged", 10, 15, 50, 10), { matched: false, diff: 5, tolerance: 1 }, "hu-10f: drift_bound/count_at_read never widen brreg_inactive_flagged");
+      // agents_domain_incoherent keeps exact match.
       assertEq(d("agents_domain_incoherent", 7, 9), { matched: false, diff: 2, tolerance: 0 }, "hu-11: agents_domain_incoherent off by 2 -> mismatch (exact required)");
       assertEq(d("agents_domain_incoherent", 7, 7, 50, 7).matched, true, "hu-12: agents_domain_incoherent exact -> match");
       assertEq(d("agents_domain_incoherent", 7, 8, 50, 7).matched, false, "hu-13: drift args never widen an exact kind");

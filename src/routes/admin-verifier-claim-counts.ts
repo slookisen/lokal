@@ -409,14 +409,23 @@ export function snapshotDriftDecision(
 // lag-scaled margin. drift_bound/count_at_read are never used for it
 // (drift_since stays a 400 for this kind).
 //
-// Every other snapshot kind (brreg_inactive_flagged, agents_domain_incoherent)
-// keeps the exact-match rule, unchanged.
+// `brreg_inactive_flagged` gets a fixed ±1 (dev-request
+// 2026-11-27-lokal-agent-verifier-brreg-inactive-flagged-toleranse): 8
+// consecutive verifier runs failed on claim 2 vs snapshot 3 when one new
+// inactive flag landed overnight between the read and the probe. Same shape
+// as http_unreachable: fixed margin, drift_bound/count_at_read never used,
+// drift_since stays a 400 for this kind. A diff of 2 or more is a mismatch.
+//
+// Every other snapshot kind (agents_domain_incoherent) keeps the exact-match
+// rule, unchanged.
 export const SNAPSHOT_DRIFT_QUEUE_KINDS = [
   "agents_review_required",
   "agents_pending_verify",
   "agents_data_insufficient",
 ] as const;
 export const SNAPSHOT_FIXED_TOLERANCE_KINDS = ["http_unreachable"] as const;
+export const SNAPSHOT_FIXED_TOLERANCE_ONE_KINDS = ["brreg_inactive_flagged"] as const;
+const SNAPSHOT_FIXED_TOLERANCE_ONE = 1;
 
 // `kind` is the endpoint kind (claim meta kind `http_unreachable_known_total`
 // maps to endpoint kind `http_unreachable`; both are accepted here).
@@ -435,6 +444,9 @@ export function snapshotClaimDecision(
     return snapshotDriftDecision(claimValue, count, null, null);
   }
   const diff = Math.abs(count - claimValue);
+  if ((SNAPSHOT_FIXED_TOLERANCE_ONE_KINDS as readonly string[]).includes(kind)) {
+    return { matched: diff <= SNAPSHOT_FIXED_TOLERANCE_ONE, diff, tolerance: SNAPSHOT_FIXED_TOLERANCE_ONE };
+  }
   return { matched: diff === 0, diff, tolerance: 0 };
 }
 
